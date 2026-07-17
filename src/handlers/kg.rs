@@ -295,8 +295,6 @@ pub async fn entity_get_by_alias(
     headers: axum::http::HeaderMap,
     Query(p): Query<EntityByAliasQuery>,
 ) -> impl IntoResponse {
-    #[cfg(not(feature = "sal"))]
-    let _ = &headers;
     let alias = p.alias.trim();
     if alias.is_empty() {
         return (
@@ -318,6 +316,21 @@ pub async fn entity_get_by_alias(
             Json(json!({"error": crate::errors::msg::invalid("namespace", e)})),
         )
             .into_response();
+    }
+
+    // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the #947 visibility mask below. Under `enforce`, a shared-key `Claimed`
+    // caller forging `X-Agent-Id: <victim>` cannot resolve the victim's
+    // private entity by alias. Inert for zero-config deployments. (This gate
+    // also makes `headers` used in every build, so the former non-sal
+    // `let _ = &headers;` suppression is no longer needed.)
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "entity_get_by_alias",
+    ) {
+        return resp;
     }
 
     // v0.7.0 ARCH-2 followup (FX-C2-batch3) — postgres-backed daemons
@@ -536,6 +549,20 @@ pub async fn kg_timeline(
             Json(json!({"error": format!("invalid until: {e}")})),
         )
             .into_response();
+    }
+
+    // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the #944 caller-vs-source-owner check below. Under `enforce`, a
+    // shared-key `Claimed` caller forging `X-Agent-Id: <victim>` cannot read
+    // the victim's private temporal-graph timeline. Inert for zero-config
+    // deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        crate::OP_KG_TIMELINE,
+    ) {
+        return resp;
     }
 
     // #944 SECURITY-high (Track A QC sweep, 2026-05-20) —
@@ -815,6 +842,20 @@ pub async fn kg_invalidate(
             .into_response();
     }
 
+    // #2125 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the #938 caller-vs-source-owner check below. Under `enforce`, a
+    // shared-key `Claimed` caller forging `X-Agent-Id: <victim>` cannot forge
+    // temporal-graph state (`valid_until = now()`) on the victim's
+    // `:supersedes`/`:contradicts` edges. Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "kg_invalidate",
+    ) {
+        return resp;
+    }
+
     // #938 SECURITY-high (Track A QC sweep, 2026-05-20) —
     // caller-vs-source-memory-owner gate. Pre-fix any HTTP caller
     // could forge temporal-graph state by invalidating another
@@ -1025,6 +1066,20 @@ pub async fn kg_find_paths(
             .into_response();
     }
 
+    // #2133 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the #910 caller-keyed path-traversal visibility filter below. Under
+    // `enforce`, a shared-key `Claimed` caller forging `X-Agent-Id: <victim>`
+    // cannot enumerate the victim's private KG path topology. Inert for
+    // zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "kg_find_paths",
+    ) {
+        return resp;
+    }
+
     // #910 SAL-level — resolve the caller so the trait method's
     // visibility filter (path-traversal flavour) sees the right
     // principal. Header-only authentication on this POST surface;
@@ -1193,6 +1248,19 @@ pub async fn kg_query(
     headers: HeaderMap,
     Json(body): Json<KgQueryBody>,
 ) -> impl IntoResponse {
+    // #2133 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the #910 caller-keyed scope=private visibility filter below. Under
+    // `enforce`, a shared-key `Claimed` caller forging `X-Agent-Id: <victim>`
+    // cannot enumerate the victim's private KG target topology by walking from
+    // a public source row. Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "kg_query",
+    ) {
+        return resp;
+    }
     // #910 (security-medium, 2026-05-19) — resolve the caller via the
     // `X-Agent-Id` header so the scope=private visibility filter
     // below has a known principal to compare `metadata.agent_id`

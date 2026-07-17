@@ -7166,7 +7166,7 @@ impl PostgresStore {
                 {
                     Ok(rows) => Ok(rows),
                     Err(err) if is_age_runtime_failure(&err) => {
-                        warn_age_fallback("kg_timeline", source_id, &err);
+                        warn_age_fallback(crate::OP_KG_TIMELINE, source_id, &err);
                         self.kg_timeline_cte(source_id, since, until, limit).await
                     }
                     Err(err) => Err(err),
@@ -16475,7 +16475,7 @@ impl MemoryStore for PostgresStore {
                 && owner != ctx.effective_principal()
             {
                 return Err(StoreError::PermissionDenied {
-                    action: "clear_namespace_standard".to_string(),
+                    action: crate::OP_CLEAR_NAMESPACE_STANDARD.to_string(),
                     target: namespace.to_string(),
                     reason: format!("caller does not own this namespace standard (owner: {owner})"),
                 });
@@ -16485,7 +16485,7 @@ impl MemoryStore for PostgresStore {
             .bind(namespace)
             .execute(&self.pool)
             .await
-            .map_err(|e| to_store_err("clear_namespace_standard", e))?
+            .map_err(|e| to_store_err(crate::OP_CLEAR_NAMESPACE_STANDARD, e))?
             .rows_affected();
         Ok(rows_affected > 0)
     }
@@ -22349,7 +22349,7 @@ impl MemoryStore for PostgresStore {
                 {
                     Ok(rows) => Ok(rows),
                     Err(err) if is_age_runtime_failure(&err) => {
-                        warn_age_fallback("kg_timeline", source_id, &err);
+                        warn_age_fallback(crate::OP_KG_TIMELINE, source_id, &err);
                         self.kg_timeline_cte(source_id, since, until, limit).await
                     }
                     Err(err) => Err(err),

@@ -268,6 +268,20 @@ pub async fn consolidate_memories(
     ) {
         return resp;
     }
+    // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the caller-scoped source reads/consumption below. Consolidation reads
+    // the source rows through the #910 caller-keyed visibility filter and
+    // hard-DELETE-merges them, so under `enforce` a shared-key `Claimed`
+    // caller forging `X-Agent-Id: <victim>` could otherwise read + consume the
+    // victim's private rows; refuse it here. Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "consolidate_memories",
+    ) {
+        return resp;
+    }
     // v0.7.0 L7 — materialize the summary up front so the downstream
     // validation + storage paths see a concrete `&str`. When the caller
     // supplied one, use it verbatim; when absent, ask the LLM (matching
@@ -886,6 +900,21 @@ pub async fn load_family_handler(
             Json(json!({"error": e.to_string()})),
         )
             .into_response();
+    }
+
+    // #2137 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the caller is resolved from `X-Agent-Id` for the `scope=private`
+    // family-tagged read below. Pre-fix, a shared-transport-key caller forging
+    // `X-Agent-Id: <victim>` resolved `caller=victim` and read the victim's
+    // private family-tagged content (memory_smart_load wraps this handler, so
+    // both routes are closed here). Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "load_family",
+    ) {
+        return resp;
     }
 
     let k_raw = body.k.unwrap_or(20);

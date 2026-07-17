@@ -71,8 +71,6 @@ pub async fn detect_contradictions(
     headers: axum::http::HeaderMap,
     Query(q): Query<ContradictionsQuery>,
 ) -> impl IntoResponse {
-    #[cfg(not(feature = "sal"))]
-    let _ = &headers;
     if q.topic.is_none() && q.namespace.is_none() {
         return (
             StatusCode::BAD_REQUEST,
@@ -89,6 +87,22 @@ pub async fn detect_contradictions(
         )
             .into_response();
     }
+
+    // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the #947 visibility post-filter below. Under `enforce`, a shared-key
+    // `Claimed` caller forging `X-Agent-Id: <victim>` cannot enumerate the
+    // victim's private contradiction candidates. Inert for zero-config
+    // deployments. (This gate also makes `headers` used in every build, so the
+    // former non-sal `let _ = &headers;` suppression is no longer needed.)
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "detect_contradictions",
+    ) {
+        return resp;
+    }
+
     // v0.6.2 (S40): raise to `MAX_BULK_SIZE` so a detect-contradictions
     // sweep over a bulk-populated namespace isn't silently capped at 200.
     let limit = q.limit.unwrap_or(50).min(MAX_BULK_SIZE);
@@ -683,8 +697,6 @@ pub async fn check_duplicate(
     headers: axum::http::HeaderMap,
     Json(body): Json<CheckDuplicateBody>,
 ) -> impl IntoResponse {
-    #[cfg(not(feature = "sal"))]
-    let _ = &headers;
     if let Err(e) = validate::validate_title(&body.title) {
         return (
             StatusCode::BAD_REQUEST,
@@ -714,6 +726,22 @@ pub async fn check_duplicate(
             .into_response();
     }
     let threshold = body.threshold.unwrap_or(db::DUPLICATE_THRESHOLD_DEFAULT);
+
+    // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the #947 nearest-duplicate visibility mask below. Under `enforce`, a
+    // shared-key `Claimed` caller forging `X-Agent-Id: <victim>` cannot probe
+    // whether their input matches the victim's private memory (existence +
+    // similarity oracle). Inert for zero-config deployments. (This gate also
+    // makes `headers` used in every build, so the former non-sal
+    // `let _ = &headers;` suppression is no longer needed.)
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "check_duplicate",
+    ) {
+        return resp;
+    }
 
     // v0.7.0 SAL-routing batch-4 (FX-C2) — postgres-backed daemons
     // route through the canonical `MemoryStore::check_duplicate_with_text`

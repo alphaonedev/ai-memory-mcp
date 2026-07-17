@@ -4538,7 +4538,7 @@ async fn http_session_start_rejects_invalid_agent_id() {
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/session/start", axum_post(session_start))
-        .with_state(state);
+        .with_state(test_app_state(state));
     let body = serde_json::json!({"agent_id": "bad agent id with spaces"});
     let resp = app
         .oneshot(
@@ -4559,7 +4559,7 @@ async fn http_session_start_stamps_session_id() {
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/session/start", axum_post(session_start))
-        .with_state(state);
+        .with_state(test_app_state(state));
     let body = serde_json::json!({});
     let resp = app
         .oneshot(
@@ -8496,7 +8496,7 @@ async fn h8b_session_start_with_valid_agent_id_echoes() {
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/session/start", axum_post(session_start))
-        .with_state(state);
+        .with_state(test_app_state(state));
 
     let body = serde_json::json!({"agent_id": "alice"});
     let resp = app
@@ -8564,7 +8564,7 @@ async fn h8b_session_start_namespace_filter() {
 
     let app = Router::new()
         .route("/api/v1/session/start", axum_post(session_start))
-        .with_state(state);
+        .with_state(test_app_state(state));
     // v0.7.0 #1420 — pass agent_id=alice so the post-list visibility
     // filter admits the seeded alice-owned rows. Pre-#1420 the test
     // ran without a caller and the un-filtered db::list returned
@@ -8599,7 +8599,7 @@ async fn h8b_session_start_returns_session_id_without_agent() {
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/session/start", axum_post(session_start))
-        .with_state(state);
+        .with_state(test_app_state(state));
     let body = serde_json::json!({});
     let resp = app
         .oneshot(
@@ -8668,7 +8668,7 @@ async fn h8b_session_start_preloads_recent_context() {
 
     let app = Router::new()
         .route("/api/v1/session/start", axum_post(session_start))
-        .with_state(state);
+        .with_state(test_app_state(state));
     // v0.7.0 #1420 — pass agent_id=alice so the post-list visibility
     // filter admits the seeded alice-owned row.
     let body = serde_json::json!({"limit": 50, "agent_id": "alice"});
@@ -12895,7 +12895,7 @@ async fn http_session_start_with_namespace_returns_session_id() {
     let _ = insert_test_memory(&state, "session-ns", "row").await;
     let app = Router::new()
         .route("/api/v1/session/start", axum_post(session_start))
-        .with_state(state);
+        .with_state(test_app_state(state));
     let body = serde_json::json!({"namespace": "session-ns", "limit": 5, "agent_id": "ai:tester"});
     let resp = app
         .oneshot(

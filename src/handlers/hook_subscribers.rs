@@ -19,11 +19,11 @@ use crate::identity::sentinels;
 use crate::models::{Memory, Tier};
 use crate::validate;
 
+use super::AppState;
 #[cfg(feature = "sal")]
 use super::StorageBackend;
 #[cfg(feature = "sal")]
 use super::store_err_to_response;
-use super::{AppState, Db};
 use super::{fanout_or_pending, list_namespaces, resolve_caller_agent_id};
 
 /// Marker tag on namespace-standard rows (#1558 batch 6).
@@ -44,6 +44,20 @@ pub async fn get_inbox(
     headers: HeaderMap,
     Query(q): Query<InboxQuery>,
 ) -> impl IntoResponse {
+    // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the inbox read below. The self-asserted `X-Agent-Id` selects the
+    // `_inbox/<owner>` namespace, so under `enforce` a shared-key `Claimed`
+    // caller forging `X-Agent-Id: <victim>` (owner == victim) would otherwise
+    // read the victim's inbox; refuse it here. Inert for zero-config
+    // deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "get_inbox",
+    ) {
+        return resp;
+    }
     // #901 (security-high, 2026-05-19) — sibling of #874. The pre-#901
     // path TRUSTED `?agent_id=` query as identity, allowing any caller
     // to read any agent's inbox by passing `?agent_id=victim`. Header
@@ -274,6 +288,25 @@ async fn set_namespace_standard_inner(
     body: NamespaceStandardBody,
     headers: Option<&HeaderMap>,
 ) -> axum::response::Response {
+    // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the #929 caller-vs-recorded-owner mutation check below. A namespace
+    // standard is the governance policy gating EVERY downstream write into the
+    // namespace, and mutation is authorized by `recorded_owner == caller`; so
+    // under `enforce` a shared-key `Claimed` caller forging
+    // `X-Agent-Id: <victim>` (caller == recorded_owner == victim) could
+    // otherwise rewrite the victim's namespace policy. Refuse it here. Inert
+    // for zero-config deployments (both public entry points — path + qs forms
+    // — route through this inner helper).
+    if let Some(h) = headers
+        && let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+            &app.enrolled_agent_keys,
+            app.http_identity_mode,
+            h,
+            "set_namespace_standard",
+        )
+    {
+        return resp;
+    }
     // #913 (security-medium / SOC2, 2026-05-19) — admin governance audit.
     // `set_namespace_standard` mutates the governance policy that gates
     // EVERY downstream write into the namespace; the chain entry must be
@@ -1038,6 +1071,26 @@ async fn clear_namespace_standard_inner(
     ns: &str,
     headers: Option<&HeaderMap>,
 ) -> axum::response::Response {
+    // #2131 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the #929 caller-vs-recorded-owner clear check below. Sibling of the
+    // set_namespace_standard gate: clearing a namespace standard DELETES the
+    // governance policy gating EVERY downstream write into the namespace, and
+    // clear is authorized by `recorded_owner == caller`; so under `enforce` a
+    // shared-key `Claimed` caller forging `X-Agent-Id: <victim>` (caller ==
+    // recorded_owner == victim) could otherwise DISARM governance over the
+    // victim's whole namespace by deleting its `namespace_meta` row. Refuse it
+    // here. Inert for zero-config deployments (both public entry points — path
+    // + qs forms — route through this inner helper).
+    if let Some(h) = headers
+        && let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+            &app.enrolled_agent_keys,
+            app.http_identity_mode,
+            h,
+            crate::OP_CLEAR_NAMESPACE_STANDARD,
+        )
+    {
+        return resp;
+    }
     // #913 (security-medium / SOC2, 2026-05-19) — admin governance audit.
     // Clearing a namespace standard removes the governance policy that
     // gates downstream writes; the chain entry MUST land before the
@@ -1126,7 +1179,7 @@ pub struct SessionStartBody {
 }
 
 pub async fn session_start(
-    State(state): State<Db>,
+    State(app): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<SessionStartBody>,
 ) -> impl IntoResponse {
@@ -1139,6 +1192,22 @@ pub async fn session_start(
             Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
         )
             .into_response();
+    }
+    // #2135 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the session-start read resolves + applies its `scope=private` visibility
+    // filter. Pre-fix, a shared-transport-key caller forging `X-Agent-Id:
+    // <victim>` (or `agent_id` body) resolved `caller=victim` and read the
+    // victim's private memory content out of `handle_session_start`. Requires
+    // the enrolled-keys map, hence the `State<AppState>` signature (was
+    // `State<Db>`, which cannot reach `enrolled_agent_keys`). Inert for
+    // zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "session_start",
+    ) {
+        return resp;
     }
     let header_agent_id = headers
         .get(crate::HEADER_AGENT_ID)
@@ -1175,7 +1244,7 @@ pub async fn session_start(
     if let Some(l) = body.limit {
         params["limit"] = json!(l);
     }
-    let lock = state.lock().await;
+    let lock = app.db.lock().await;
     let result = crate::mcp::handle_session_start(&lock.0, &params, None, Some(&caller));
     drop(lock);
     match result {

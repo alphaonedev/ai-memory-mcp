@@ -408,6 +408,21 @@ pub async fn create_link(
             .into_response();
     }
 
+    // #2125 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the caller-vs-source-owner write check below. Under `enforce`, a
+    // shared-transport-key `Claimed` caller forging `X-Agent-Id: <victim>`
+    // (so caller == source_owner == victim) is refused 403 before it can
+    // create a cross-tenant `:supersedes`/`:contradicts` edge on the
+    // victim's memory. Inert for zero-config deployments (no enrolled keys).
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "create_link",
+    ) {
+        return resp;
+    }
+
     // v0.7.0 Wave-3 — Postgres-backed daemons take the SAL trait
     // dispatch path. The trait's `link_signed` returns the resolved
     // `attest_level` so the wire response carries the same byte shape
@@ -801,6 +816,19 @@ pub async fn delete_link(
             .into_response();
     }
 
+    // #2125 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the caller-vs-endpoint-owner destructive delete below. Under `enforce`,
+    // a shared-key `Claimed` caller forging `X-Agent-Id: <victim>` cannot
+    // sever the victim's typed-graph edges. Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "delete_link",
+    ) {
+        return resp;
+    }
+
     // #913 (security-medium / SOC2, 2026-05-19) — admin/destructive
     // action audit. Link delete mutates the graph topology; emit the
     // forensic-chain entry BEFORE the storage write so the audit trail
@@ -931,6 +959,19 @@ pub async fn get_links(
             Json(json!({"error": e.to_string()})),
         )
             .into_response();
+    }
+
+    // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the #959 visibility post-filter below. Under `enforce`, a shared-key
+    // `Claimed` caller forging `X-Agent-Id: <victim>` cannot enumerate the
+    // victim's private link topology. Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "get_links",
+    ) {
+        return resp;
     }
 
     // #959 SECURITY-medium (Track A QC sweep, 2026-05-20) — resolve
@@ -1133,6 +1174,19 @@ pub async fn get_lineage(
             .into_response();
     }
     let max_depth = q.max_depth.unwrap_or(db::LINEAGE_MAX_DEPTH);
+
+    // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the root-visibility gate below. Under `enforce`, a shared-key `Claimed`
+    // caller forging `X-Agent-Id: <victim>` cannot walk the victim's private
+    // derivation lineage. Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "get_lineage",
+    ) {
+        return resp;
+    }
 
     // Caller resolution + root-visibility gate (the #959/#910 post-filter
     // family `get_links` rides, applied to the walk ROOT).
