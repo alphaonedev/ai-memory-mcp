@@ -321,7 +321,18 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // wired into `insert` / `update_with_expected_version` /
     // `update_with_archive_on_supersede`, plus their in-module regression
     // tests, land storage/mod.rs at 24_948; ceiling 25_050 (+102).
-    ("src/storage/mod.rs", 25_050),
+    // 2026-07-17 (#1802 R-05 S1) — REDUCED 25_050 → 24_450: the doctor /
+    // observability probe region (~678 LOC: is_namespace_standard ..
+    // doctor_reflection_totals_by_namespace) moved verbatim to the new
+    // src/storage/doctor.rs submodule (itemized re-export shim keeps every
+    // `crate::storage::*` / `crate::db::*` path stable). mod.rs lands at
+    // 24_351; ceiling 24_450 (+99). Per the QUAL-10 shrink rule: "when a
+    // file's LOC SHRINKS (a refactor split), the ceiling falls".
+    ("src/storage/mod.rs", 24_450),
+    // 2026-07-17 (#1802 R-05 S1) — NEW submodule extracted from
+    // storage/mod.rs (doctor / observability probes). Measured 698;
+    // ceiling 800 (+102).
+    ("src/storage/doctor.rs", 800),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
