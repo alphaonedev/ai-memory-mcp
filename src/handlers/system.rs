@@ -77,7 +77,7 @@ pub async fn get_capabilities(
             // triple drives the `models.*` block so it matches the
             // boot banner + the live LLM client wiring, not the
             // compiled tier preset.
-            app.resolved_models.as_ref(),
+            app.resolved_models.current().as_ref(),
             None,
             embedder_loaded,
             Some(conn),
@@ -92,7 +92,7 @@ pub async fn get_capabilities(
         ),
         _ => crate::mcp::handle_capabilities_with_conn(
             app.tier_config.as_ref(),
-            app.resolved_models.as_ref(),
+            app.resolved_models.current().as_ref(),
             None,
             embedder_loaded,
             Some(conn),

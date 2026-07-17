@@ -136,7 +136,9 @@ fn build_llm_router(llm_url: Option<&str>) -> (axum::Router, NamedTempFile, Db) 
         // `validate_agent_id`, so it cannot leak into a real deployment.
         admin_agent_ids: Arc::new(vec!["*".to_string()]),
         rule_cache: Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
-        resolved_models: Arc::new(ai_memory::config::ResolvedModels::default()),
+        resolved_models: Arc::new(ai_memory::reload::Swappable::new(
+            ai_memory::config::ResolvedModels::default(),
+        )),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
         enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),

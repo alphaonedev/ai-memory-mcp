@@ -3594,86 +3594,15 @@ pub fn run_mcp_server(
     // preset. The provenance fields on `ResolvedLlm` (`source`,
     // `api_key_source`) surface in the startup banner so the operator
     // can see WHICH layer won.
-    let resolved_llm = app_config.resolve_llm(None, None, None);
-    // v1.0.0 #1963 (R68/D14) — inference-plane egress gate. When the
-    // operator selected AI_MEMORY_INFERENCE_EGRESS=deny (or loopback-only
-    // against an external vendor), refuse to construct the outbound LLM
-    // client so no memory content can be POSTed to the vendor, and emit a
-    // best-effort signed refusal. Default `allow` → no-op.
-    let llm_egress_refused = match crate::egress::evaluate_inference_egress(
-        crate::egress::InferenceEgressMode::resolve(),
-        crate::egress::EgressClass::InferenceLlm,
-        &resolved_llm.base_url,
-    ) {
-        crate::egress::EgressDecision::Refuse {
-            class,
-            target,
-            reason,
-        } => {
-            eprintln!(
-                "ai-memory: LLM DISABLED by inference-plane egress gate \
-                 (target={target}); {reason} (#1963)"
-            );
-            let db_path =
-                app_config.effective_db(std::path::Path::new(crate::daemon_runtime::DEFAULT_DB));
-            crate::egress::refuse_inference_egress_audited(&db_path, class, &target, &reason);
-            true
-        }
-        crate::egress::EgressDecision::Allow => false,
-    };
-    let llm: Option<Arc<OllamaClient>> = if llm_egress_refused
-        || (tier_config.llm_model.is_none()
-            && resolved_llm.source == crate::config::ConfigSource::CompiledDefault)
-    {
-        // Keyword tier with no operator config, OR the egress gate refused
-        // the outbound target: LLM intentionally disabled.
-        None
-    } else {
-        match OllamaClient::build_from_resolved(&resolved_llm) {
-            Ok(Some(client)) => {
-                eprintln!(
-                    "ai-memory: LLM ready (backend={}, model={}, source={}, key_source={})",
-                    resolved_llm.backend,
-                    resolved_llm.model,
-                    resolved_llm.source.as_str(),
-                    resolved_llm.api_key_source.as_str(),
-                );
-                // For ollama backends, exercise the legacy ensure_model
-                // pull step so first-run UX (model not on disk) still
-                // emits the pull-progress hint. Backend identifier comes
-                // from `crate::llm::BACKEND_OLLAMA` per the PR10 vendor-
-                // monoculture lint gate (issue #1174).
-                if resolved_llm.backend == crate::llm::BACKEND_OLLAMA {
-                    if let Err(e) = client.ensure_model() {
-                        eprintln!("ai-memory: model pull failed: {e} (LLM features disabled)");
-                        None
-                    } else {
-                        Some(Arc::new(client))
-                    }
-                } else {
-                    Some(Arc::new(client))
-                }
-            }
-            Ok(None) => {
-                eprintln!(
-                    "ai-memory: LLM disabled — resolver returned no client \
-                     (backend={}, source={})",
-                    resolved_llm.backend,
-                    resolved_llm.source.as_str(),
-                );
-                None
-            }
-            Err(e) => {
-                eprintln!(
-                    "ai-memory: LLM init failed (backend={}, source={}): {e} \
-                     (LLM features disabled)",
-                    resolved_llm.backend,
-                    resolved_llm.source.as_str(),
-                );
-                None
-            }
-        }
-    };
+    // v1.0.0 #2166 — resolve + build the `[llm]` client through the shared
+    // helper so the MCP boot path and the between-request config-mtime
+    // reload path (in the stdio loop below) can never drift. The helper
+    // re-runs the #1963 inference-plane egress gate, honours the
+    // no-preset-tier short-circuit, and emits the operator-facing boot
+    // banners (`verbose_banner = true`). Kept `mut` so a live config.toml
+    // `[llm]` change can hot-swap it WITHOUT restarting the MCP process.
+    let mut llm: Option<Arc<OllamaClient>> =
+        crate::reload::resolve_and_build_mcp_llm(app_config, &tier_config, db_path, true);
 
     // --- Initialize embedder (semantic tier and above) ---
     //
@@ -3927,7 +3856,10 @@ pub fn run_mcp_server(
     // `dispatch_memory_capabilities` so `memory_capabilities.models.*`
     // reports the same backend / model the boot banner emits and the
     // live LLM client was built from.
-    let resolved_models = app_config.resolve_models();
+    // Kept `mut` so the between-request config-mtime reload (#2166) can
+    // refresh the `[llm]` slice in lockstep with a client hot-swap, so
+    // `memory_capabilities.models.llm` never lies about the active model.
+    let mut resolved_models = app_config.resolve_models();
 
     // Captured from the MCP `initialize` handshake's `clientInfo.name`.
     // Used by `crate::identity` to synthesize an `ai:<client>@<host>:pid-<pid>`
@@ -3962,6 +3894,24 @@ pub fn run_mcp_server(
     // [`MCP_MAX_LINE_BYTES`]: on overrun we emit a `-32700` parse error,
     // drain the rest of the offending line so the next request lines up
     // on a fresh boundary, and continue the loop.
+    // v1.0.0 #2166 — lazy config-mtime reload state for the `[llm]`
+    // hot-swap. Between JSON-RPC requests (the stdio loop is single-
+    // threaded, so the swap point is race-free by construction) we stat
+    // config.toml; when its mtime changes we validate-then-swap the
+    // `[llm]` client. NO SIGHUP on the stdio child — a HUP would collide
+    // with parent-exit orphan semantics. Disabled under
+    // `AI_MEMORY_NO_CONFIG` so tests stay hermetic.
+    let reload_config_path: Option<std::path::PathBuf> =
+        if std::env::var("AI_MEMORY_NO_CONFIG").is_ok() {
+            None
+        } else {
+            crate::config::AppConfig::config_path()
+        };
+    let mut last_config_mtime: Option<std::time::SystemTime> = reload_config_path
+        .as_ref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok());
+
     let mut stdin_locked = stdin.lock();
     let mut line_buf: Vec<u8> = Vec::with_capacity(8192);
     loop {
@@ -4079,6 +4029,40 @@ pub fn run_mcp_server(
         // Notifications have no id — no response expected per JSON-RPC spec
         if req.id.is_none() || req.id == Some(Value::Null) {
             continue;
+        }
+
+        // v1.0.0 #2166 — lazy `[llm]` hot-swap. Between requests, when
+        // config.toml's mtime changed, validate-then-swap the `[llm]`
+        // client + refresh the `models.llm` capability surface. On a
+        // parse/validate failure the CURRENT client is KEPT (a typo'd
+        // config never swaps in the compiled-default model). Single-
+        // threaded stdio makes this rebuild race-free by construction.
+        if let Some(cfg_path) = reload_config_path.as_ref() {
+            let current_mtime = std::fs::metadata(cfg_path)
+                .ok()
+                .and_then(|m| m.modified().ok());
+            if current_mtime.is_some() && current_mtime != last_config_mtime {
+                last_config_mtime = current_mtime;
+                match crate::config::AppConfig::try_load_from(cfg_path) {
+                    Ok(new_cfg) => {
+                        llm = crate::reload::resolve_and_build_mcp_llm(
+                            &new_cfg,
+                            &tier_config,
+                            db_path,
+                            false,
+                        );
+                        resolved_models =
+                            crate::reload::refresh_llm_model_surface(&resolved_models, &new_cfg);
+                        tracing::info!(
+                            "MCP config.toml changed — [llm] client hot-swapped (#2166)"
+                        );
+                    }
+                    Err(e) => tracing::warn!(
+                        "MCP config.toml changed but parse/validate FAILED — keeping current \
+                         [llm] client (#2166): {e:#}"
+                    ),
+                }
+            }
         }
 
         let resolved_ttl = app_config.effective_ttl();

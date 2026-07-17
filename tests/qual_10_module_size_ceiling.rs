@@ -900,7 +900,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // CPU-scaled tri-state default + env_tristate_usize + the M2 TLS-bind
     // resolvers (allow_plaintext_nonloopback / require_tls) land config.rs at
     // 12_742; ceiling 12_850 (+108).
-    ("src/config.rs", 12_850),
+    // 2026-07-17 (#2166): the validate-before-swap `AppConfig::try_load` +
+    // `try_load_from` Result-returning loaders (the hot-swap reload path
+    // that PROPAGATES parse/validate errors instead of swallowing them to
+    // default()) land config.rs at 12_897; ceiling 12_850 -> 12_950 (+53).
+    ("src/config.rs", 12_950),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the
