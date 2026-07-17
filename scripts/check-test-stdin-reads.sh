@@ -86,13 +86,18 @@
 #   scripts/check-test-stdin-reads.sh --self-test
 #     - injects contrived violations (a plain test read, a same-file
 #       sibling of the helper, a bare `stdin()` call after
-#       `use std::io::stdin;`, and a `#[cfg(test)]`-gated fn placed ABOVE
-#       `mod tests {}`), verifies the gate catches all of them, verifies
-#       the sanctioned helper line and a `.stdin(` builder call are NOT
-#       flagged, then cleans up. Proves the gate is load-bearing AND that
-#       the narrow carve-out did not over-widen (pm-v3.2 NO FAIL MISSION
-#       closure discipline; issue #2120 residual-vector hardening).
-#       Exit 0 on PASS.
+#       `use std::io::stdin;`, a `#[cfg(test)]`-gated fn placed ABOVE
+#       `mod tests {}`, a `#[cfg(all(test, unix))]`-gated fn in the same
+#       position (#2143), a `#[cfg(test)] mod` whose unbalanced `"}"`
+#       string literal would otherwise truncate the range early (#2144),
+#       an item-renaming `use std::io::stdin as input;` import (#2145),
+#       and a fn-pointer `let f = std::io::stdin;` binding (#2145)),
+#       verifies the gate catches all of them, verifies the sanctioned
+#       helper line and a `.stdin(` builder call are NOT flagged, then
+#       cleans up. Proves the gate is load-bearing AND that the narrow
+#       carve-out did not over-widen (pm-v3.2 NO FAIL MISSION closure
+#       discipline; issue #2120 + #2143/#2144/#2145 residual-vector
+#       hardening). Exit 0 on PASS.
 
 set -euo pipefail
 
@@ -110,6 +115,22 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # takes a `Stdio`; it configures a spawned subprocess's stdin, it never
 # touches our-process stdin).
 STDIN_PATTERN='(^|[^A-Za-z0-9_.])stdin[[:space:]]*\('
+
+# A second, PAREN-LESS signal (issue #2145): STDIN_PATTERN requires the
+# call paren adjacent to the `stdin` token, so an item-renaming import
+# (`use std::io::stdin as input;` then `input()`) or a fn-pointer binding
+# (`let f = std::io::stdin;` then `f()`) — both of which survive
+# `cargo fmt --check`, so the CI fmt gate does not normalize them away —
+# evade it entirely. Both surviving forms necessarily spell the qualified
+# path token `io::stdin` WITHOUT an adjacent `(` (that's what makes them
+# evade STDIN_PATTERN); a paren-less `io::stdin` token has essentially no
+# legitimate use in test-reachable code (the sanctioned helper calls it
+# WITH parens and is carved out anyway), so this pattern flags the
+# `use`/`let` acquisition line itself rather than the later call site.
+# The excluded trailing class explicitly excludes `(` so a normal
+# `io::stdin()` / `std::io::stdin()` call is never double-matched here —
+# STDIN_PATTERN alone already covers it.
+STDIN_TOKEN_PATTERN='(^|[^A-Za-z0-9_.])io::stdin([^A-Za-z0-9_(]|$)'
 
 # find_test_boundary <file>
 # Echoes the line number of the first `mod tests {` (or `pub mod tests {`,
@@ -158,11 +179,11 @@ helper_ranges () {
 }
 
 # cfg_test_ranges <file>
-# Echoes one `start:end` line-range per `#[cfg(test)]`-attributed ITEM in
-# the file (issue #2120 finding 2). Each range starts at the `#[cfg(test)]`
-# attribute line and extends only over THAT item — a brace-balanced scan
-# for a block-bodied item (`fn`/`mod`/`impl`/`struct { ... }`), or through
-# the first statement-terminating `;` for a no-body item (`mod foo;`,
+# Echoes one `start:end` line-range per test-cfg-attributed ITEM in the
+# file (issue #2120 finding 2). Each range starts at the attribute line
+# and extends only over THAT item — a brace-balanced scan for a
+# block-bodied item (`fn`/`mod`/`impl`/`struct { ... }`), or through the
+# first statement-terminating `;` for a no-body item (`mod foo;`,
 # `use ...;`, a tuple-struct `struct Foo(..);`). This is deliberately
 # ITEM-scoped rather than a single from-here-to-EOF cutoff: a
 # `#[cfg(test)]`-gated single-line `use` or module DECLARATION (no body)
@@ -172,23 +193,47 @@ helper_ranges () {
 # production line between it and `mod tests {}` as test-reachable —
 # false-positiving on `src/mcp/mod.rs`'s real `io::stdin()` production
 # read loop was caught during this fix's repo-wide verification run.
-# Stacked attribute lines directly following `#[cfg(test)]` (e.g. a
-# `#[test]` line before the fn signature) are skipped while scanning for
-# the item's opening brace / terminating semicolon.
+# Stacked attribute lines directly following the trigger attribute (e.g.
+# a `#[test]` line before the fn signature) are skipped while scanning
+# for the item's opening brace / terminating semicolon.
+#
+# The trigger admits any cfg predicate containing the bare `test` token —
+# not just the literal `#[cfg(test)]` spelling — so `#[cfg(all(test, ...))]`
+# and `#[cfg(any(test, ...))]` items are exactly as test-reachable as a
+# bare `#[cfg(test)]` item (issue #2143): the repo carries live
+# `#[cfg(all(test, feature = "sal"))]` and `#[cfg(all(test, unix))]` sites
+# today, and the pre-fix trigger anchored SOLELY on the literal
+# `#[cfg(test)]` spelling left both un-gated. `#[cfg(not(test))]` is
+# deliberately NOT matched — that predicate selects the opposite of test
+# builds, so an item gated by it is never test-reachable.
 cfg_test_ranges () {
     local f="$1"
     awk '
     {
         line = $0
-        if (!active && line ~ /^[[:space:]]*#\[cfg\(test\)\]/) {
+        if (!active && line ~ /^[[:space:]]*#\[cfg\((test[,)]|(all|any)\([^)]*[( ,]?test[,)])/) {
             active = 1; start = NR; depth = 0; opened = 0
         }
         if (active) {
             if (opened == 0 && NR != start && line ~ /^[[:space:]]*#\[/) {
                 # stacked attribute line before the item itself — skip
             } else {
-                o = gsub(/\{/, "{", line); depth += o; if (o > 0) opened = 1
-                c = gsub(/\}/, "}", line); depth -= c
+                # Strip string literals and line comments before
+                # brace-counting (issue #2144): an unbalanced brace
+                # inside a string literal (e.g. `const X: &str = "}";`,
+                # a `write!`/`format!` escape fragment, a partial-JSON
+                # fixture) would otherwise close the range early,
+                # silently un-gating everything below it in the same
+                # item — a fail-SILENT bypass (contrast `helper_ranges`,
+                # whose equivalent lexical limitation fails LOUD by
+                # narrowing its carve-out instead of widening it). This
+                # is a conservative strip — it does not handle escaped
+                # quotes — but it removes the entire realistic class.
+                counted = line
+                gsub(/"[^"]*"/, "", counted)
+                sub(/\/\/.*$/, "", counted)
+                o = gsub(/\{/, "{", counted); depth += o; if (o > 0) opened = 1
+                c = gsub(/\}/, "}", counted); depth -= c
                 if (opened == 1) {
                     if (depth <= 0) { print start":"NR; active = 0 }
                 } else if (line ~ /;[[:space:]]*(\/\/.*)?$/) {
@@ -220,18 +265,24 @@ line_in_ranges () {
 }
 
 # scan_test_lines <file>
-# Emits "<repo-relative-file>:<lineno>:<content>" for STDIN_PATTERN
-# matches in TEST-reachable code — at or below the file's `mod tests {}`
-# boundary, OR inside any item-scoped `#[cfg(test)]` range (issue #2120
-# finding 2) — skipping comment/doc-comment lines and any match inside a
-# sanctioned `with_stdin_lines` helper body.
+# Emits "<repo-relative-file>:<lineno>:<content>" for STDIN_PATTERN or
+# STDIN_TOKEN_PATTERN matches in TEST-reachable code — at or below the
+# file's `mod tests {}` boundary, OR inside any item-scoped test-cfg
+# range (issue #2120 finding 2; widened by issue #2143) — skipping
+# comment/doc-comment lines and any match inside a sanctioned
+# `with_stdin_lines` helper body.
 scan_test_lines () {
     local f="$1"
     local boundary
     boundary=$(find_test_boundary "$f")
     local rel="${f#"${ROOT}/"}"
     local matches
-    matches="$(grep -En "$STDIN_PATTERN" "$f" 2>/dev/null || true)"
+    matches="$(
+        {
+            grep -En "$STDIN_PATTERN" "$f" 2>/dev/null || true
+            grep -En "$STDIN_TOKEN_PATTERN" "$f" 2>/dev/null || true
+        } | sort -t: -k1,1n -u
+    )"
     [[ -z "$matches" ]] && return 0
     local cfg_ranges
     cfg_ranges="$(cfg_test_ranges "$f")"
@@ -287,7 +338,30 @@ if [[ "${1:-}" == "--self-test" ]]; then
     # in-file boundary heuristic is actually exercised; it is not
     # `mod`-included anywhere so cargo never compiles it.
     probe4="${ROOT}/src/.stdin_gate_cfg_boundary_probe.rs"
-    for p in "$probe1" "$probe2" "$probe3" "$probe4"; do
+    # Case 5 (#2143): a `#[cfg(all(test, unix))]`-gated fn placed ABOVE
+    # the file's first `mod tests {` — the composed-predicate sibling of
+    # probe4's bare `#[cfg(test)]`; must be caught by the widened
+    # cfg_test_ranges trigger. Lives under src/ for the same reason as
+    # probe4 (exercises the in-file boundary heuristic; never
+    # `mod`-included so cargo never compiles it).
+    probe5="${ROOT}/src/.stdin_gate_cfg_all_probe.rs"
+    # Case 6 (#2144): a `#[cfg(test)] mod` whose body contains an
+    # unbalanced-brace string literal (`"}"`) ABOVE the stdin read — the
+    # naive brace-count in cfg_test_ranges would close the range at that
+    # string, silently un-gating the read below it. No `mod tests {}` in
+    # the file, so the item-scoped #[cfg(test)] range is the ONLY signal
+    # that can catch it.
+    probe6="${ROOT}/src/.stdin_gate_string_brace_probe.rs"
+    # Case 7 (#2145 form 1): an item-renaming import
+    # (`use std::io::stdin as input;`) — the paren-anchored STDIN_PATTERN
+    # never sees `input(`, so only the paren-less STDIN_TOKEN_PATTERN over
+    # the qualified `io::stdin` token catches the import line itself.
+    probe7="${ROOT}/tests/.stdin_gate_alias_import_probe.rs"
+    # Case 8 (#2145 form 2): a fn-pointer binding (`let f =
+    # std::io::stdin;`) — same evasion shape as case 7, a paren-less
+    # `io::stdin` token with no adjacent call.
+    probe8="${ROOT}/tests/.stdin_gate_fn_pointer_probe.rs"
+    for p in "$probe1" "$probe2" "$probe3" "$probe4" "$probe5" "$probe6" "$probe7" "$probe8"; do
         if [[ -e "$p" ]]; then
             echo "ERROR: self-test scratch file already exists: $p" >&2
             echo "(cleanup may have failed in a prior run — remove manually)" >&2
@@ -349,13 +423,68 @@ mod tests {
     // `#[cfg(test)]` attribute line.
 }
 EOF
+    cat > "$probe5" <<'EOF'
+// CONTRIVED VIOLATION for scripts/check-test-stdin-reads.sh --self-test.
+// Exercises issue #2143: a #[cfg(all(test, unix))]-gated fn placed ABOVE
+// the file's first `mod tests {` must be exactly as test-reachable as a
+// bare #[cfg(test)] item.
+#[cfg(all(test, unix))]
+fn contrived_cfg_all_reads_stdin() {
+    let mut buf = String::new();
+    let _ = std::io::stdin().read_line(&mut buf);
+}
+
+mod tests {
+    // Padding so `mod tests {` is not the first test marker in the
+    // file — the fn above it must still be caught via the earlier
+    // `#[cfg(all(test, unix))]` attribute line.
+}
+EOF
+    cat > "$probe6" <<'EOF'
+// CONTRIVED VIOLATION for scripts/check-test-stdin-reads.sh --self-test.
+// Exercises issue #2144: an unbalanced-brace string literal ("}") inside
+// a #[cfg(test)] mod must NOT silently truncate the item's cfg_test_ranges
+// range before the stdin read below it.
+#[cfg(test)]
+mod sneaky {
+    const X: &str = "}";
+    fn contrived_string_brace_reads_stdin() {
+        let mut buf = String::new();
+        let _ = std::io::stdin().read_line(&mut buf);
+    }
+}
+EOF
+    cat > "$probe7" <<'EOF'
+// CONTRIVED VIOLATION for scripts/check-test-stdin-reads.sh --self-test.
+// Exercises issue #2145 form 1: an item-renaming import survives
+// `cargo fmt --check`, so `use std::io::stdin as input;` then `input()`
+// evades the paren-anchored STDIN_PATTERN entirely.
+use std::io::stdin as input;
+#[test]
+fn contrived_alias_import_reads_stdin() {
+    let mut buf = String::new();
+    let _ = input().read_line(&mut buf);
+}
+EOF
+    cat > "$probe8" <<'EOF'
+// CONTRIVED VIOLATION for scripts/check-test-stdin-reads.sh --self-test.
+// Exercises issue #2145 form 2: a fn-pointer binding survives
+// `cargo fmt --check`, so `let f = std::io::stdin;` then `f()` evades the
+// paren-anchored STDIN_PATTERN entirely.
+#[test]
+fn contrived_fn_pointer_reads_stdin() {
+    let f = std::io::stdin;
+    let mut buf = String::new();
+    let _ = f().read_line(&mut buf);
+}
+EOF
     set +e
     gate_output="$("$0" 2>&1)"
     gate_exit=$?
     set -e
-    rm -f "$probe1" "$probe2" "$probe3" "$probe4"
+    rm -f "$probe1" "$probe2" "$probe3" "$probe4" "$probe5" "$probe6" "$probe7" "$probe8"
     printf '%s\n' "$gate_output"
-    # PASS requires: non-zero exit, ALL FOUR probe violations reported,
+    # PASS requires: non-zero exit, ALL EIGHT probe violations reported,
     # and the sanctioned helper line + the benign builder call NOT
     # reported.
     ok=1
@@ -364,6 +493,10 @@ EOF
     printf '%s' "$gate_output" | grep -q 'sibling_reads_real_stdin\|\.stdin_gate_sibling_probe\.rs' || ok=0
     printf '%s' "$gate_output" | grep -q 'contrived_bare_stdin_after_import\|\.stdin_gate_bare_import_probe\.rs' || ok=0
     printf '%s' "$gate_output" | grep -q 'contrived_cfg_gated_reads_stdin\|\.stdin_gate_cfg_boundary_probe\.rs' || ok=0
+    printf '%s' "$gate_output" | grep -q 'contrived_cfg_all_reads_stdin\|\.stdin_gate_cfg_all_probe\.rs' || ok=0
+    printf '%s' "$gate_output" | grep -q 'contrived_string_brace_reads_stdin\|\.stdin_gate_string_brace_probe\.rs' || ok=0
+    printf '%s' "$gate_output" | grep -q 'use std::io::stdin as input\|\.stdin_gate_alias_import_probe\.rs' || ok=0
+    printf '%s' "$gate_output" | grep -q 'let f = std::io::stdin\|\.stdin_gate_fn_pointer_probe\.rs' || ok=0
     if printf '%s' "$gate_output" | grep -q '_sanctioned'; then
         echo "" >&2
         echo "Test-stdin gate self-test: FAIL (carve-out over-widened: the sanctioned helper line was flagged)" >&2
@@ -376,7 +509,7 @@ EOF
     fi
     if (( ok == 1 )); then
         echo ""
-        echo "Test-stdin gate self-test: PASS (caught all four contrived violations, spared the sanctioned helper + benign builder call; exit=${gate_exit})"
+        echo "Test-stdin gate self-test: PASS (caught all eight contrived violations, spared the sanctioned helper + benign builder call; exit=${gate_exit})"
         exit 0
     else
         echo "" >&2
