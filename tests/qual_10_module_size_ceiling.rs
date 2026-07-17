@@ -763,7 +763,17 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // closed on the last un-gated pg update surface) land the file at
     // 27_152. Growth is two security gates on existing write paths, not new
     // surface. 27_250 = 27_152 + 98 headroom; far under the 1.5x cap.
-    ("src/store/postgres.rs", 27_250),
+    // 2026-07-17 (#2178 + #2179) — bumped 27_250 → 27_600: the pg
+    // embedding-space provenance parity fixes — `store_with_embedding` now
+    // stamps `embedding_space` atomically on the INSERT + DO-UPDATE arm
+    // (#2178, closes the lying-stamp cross-space score path), the dim-
+    // migration NULL path clears the stamp with the vector, and the §5/§6 pg
+    // adoption/census/heal twins (`adopt_legacy_embedding_space` +
+    // `distinct_embedding_spaces` + `embedding_space_boot_maintenance`,
+    // #2179) close the postgres silent-recall-outage. All are data-integrity
+    // parity with the proven sqlite path, not new surface. File lands at
+    // 27_501; 27_600 = 27_501 + 99 headroom; far under the 1.5x cap.
+    ("src/store/postgres.rs", 27_600),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

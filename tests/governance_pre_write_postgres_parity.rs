@@ -273,7 +273,7 @@ async fn postgres_store_with_embedding_fires_hook_and_refuses() {
     let embedding: Vec<f32> = vec![0.1; 384];
 
     let err = pg
-        .store_with_embedding(&ctx, &mem, Some(&embedding))
+        .store_with_embedding(&ctx, &mem, Some(&embedding), Some("test-space#none"))
         .await
         .expect_err("Refuse verdict MUST surface on the embed write path");
 

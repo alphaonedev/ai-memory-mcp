@@ -109,7 +109,7 @@ async fn store_with_embedding_then_update_embedding_roundtrip() {
     let dim = usize::try_from(dim_i32).unwrap_or(384);
     let vec: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.001).collect();
     let returned = store
-        .store_with_embedding(&ctx, &m, Some(&vec))
+        .store_with_embedding(&ctx, &m, Some(&vec), Some("test-space#none"))
         .await
         .expect("store_with_embedding");
     assert_eq!(returned, id);

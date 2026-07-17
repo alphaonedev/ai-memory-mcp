@@ -732,11 +732,20 @@ pub trait MemoryStore: Send + Sync {
     /// fall back to plain `store` and ignore the vector; the
     /// PostgresStore overrides this to bind the vector into the
     /// INSERT. Default implementation forwards to `store`.
+    /// #2167 — `space` is the fingerprint of the embedding space the
+    /// supplied `_embedding` lives in (the LIVE embedder's
+    /// [`crate::embeddings::Embed::space_fingerprint`]). It travels in the
+    /// SAME call as the vector so an adapter that persists the vector stamps
+    /// its provenance atomically — a stored vector can never end up with a
+    /// stale / absent stamp (the §2 same-statement rule; the write-side twin
+    /// of the recall `AND embedding_space = $fp` gate). `space` MUST be
+    /// `Some` whenever `_embedding` is `Some`; `None` clears both.
     async fn store_with_embedding(
         &self,
         ctx: &CallerContext,
         memory: &Memory,
         _embedding: Option<&[f32]>,
+        _space: Option<&str>,
     ) -> StoreResult<String> {
         self.store(ctx, memory).await
     }
@@ -4057,7 +4066,7 @@ mod tests {
         let mem = dummy_memory("with-emb");
         // The default body forwards to `store` (ignoring the vector).
         let id = s
-            .store_with_embedding(&ctx, &mem, Some(&[0.1_f32, 0.2, 0.3]))
+            .store_with_embedding(&ctx, &mem, Some(&[0.1_f32, 0.2, 0.3]), Some("test#none"))
             .await
             .expect("store_with_embedding default");
         assert_eq!(id, "with-emb");
@@ -5591,7 +5600,7 @@ mod tests {
         );
         // store_with_embedding default forwards to store (Err here).
         assert!(
-            dp.store_with_embedding(&ctx, &mem, Some(&[0.1]))
+            dp.store_with_embedding(&ctx, &mem, Some(&[0.1]), Some("test#none"))
                 .await
                 .is_err()
         );

@@ -142,7 +142,7 @@ async fn store_with_embedding_reflection_with_metadata_entity_id_populates_menti
 
     let ctx = CallerContext::for_agent("ai:i1383-test".to_string());
     let id = store
-        .store_with_embedding(&ctx, &mem, None)
+        .store_with_embedding(&ctx, &mem, None, None)
         .await
         .expect("store_with_embedding");
 
