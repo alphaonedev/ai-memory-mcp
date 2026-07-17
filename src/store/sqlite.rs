@@ -2527,7 +2527,7 @@ mod tests {
 
         let m = test_memory("def-emb", "store_with_embedding default forwards to store");
         let id = store
-            .store_with_embedding(&ctx, &m, Some(&[0.1f32, 0.2, 0.3]))
+            .store_with_embedding(&ctx, &m, Some(&[0.1f32, 0.2, 0.3]), Some("test#none"))
             .await
             .expect("store_with_embedding default");
         assert_eq!(id, m.id);

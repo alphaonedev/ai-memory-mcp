@@ -5191,6 +5191,30 @@ pub async fn bootstrap_serve(
     #[cfg(not(feature = "sal"))]
     let storage_backend = crate::handlers::StorageBackend::Sqlite;
 
+    // v1.0.0 #2167 §5/§6 pg twin — on a POSTGRES-backed daemon the sqlite
+    // boot-maintenance above ran against the LOCAL (empty) sqlite file, so
+    // the postgres corpus was never adopted/censused: every pre-v84 legacy
+    // row is `embedding_space NULL` and the S4 recall predicate excludes it
+    // PERMANENTLY with no signal and no heal (#2179). Run the postgres twins
+    // here — now that `build_store_handle` has returned the typed store —
+    // against the actual pg corpus, in the same load-bearing adopt→census
+    // order, [G1]/[G2]-guarded identically to the sqlite path. Synchronous
+    // (awaited before the router serves) so the first post-upgrade recall is
+    // identical to pre-v84 (the §5 no-nuke proof obligation), on BOTH
+    // backends. The serve-boot backfill sweep (spawned below) heals any
+    // [G1]/[G2]-blocked NULL-space rows by re-embedding from durable text.
+    #[cfg(feature = "sal-postgres")]
+    if matches!(storage_backend, crate::handlers::StorageBackend::Postgres)
+        && let Some(emb) = embedder_arc.as_ref()
+        && let Some(pg) = store_handle
+            .as_any()
+            .downcast_ref::<crate::store::postgres::PostgresStore>()
+    {
+        let active_fp = emb.space_fingerprint();
+        pg.embedding_space_boot_maintenance(&active_fp, emb.dim())
+            .await;
+    }
+
     // v0.7.0 Track D #933 — federation push DLQ sink. Resolved here
     // (after `build_store_handle` returns the typed store) so the
     // `broadcast_store_quorum` fanout can land DLQ rows on per-peer

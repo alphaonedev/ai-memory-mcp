@@ -124,7 +124,7 @@ async fn pg_store_refuses_missing_why_trace_under_enforce() {
     // store_with_embedding — the primary create-with-embedding hot path.
     let no_wt_e = pg_mem(&format!("se-{run}"), &ns, "no wt embed", "alice", None);
     let err = store
-        .store_with_embedding(&ctx, &no_wt_e, None)
+        .store_with_embedding(&ctx, &no_wt_e, None, None)
         .await
         .expect_err("store_with_embedding must refuse under enforce");
     assert!(is_permission_denied(&err), "got {err:?}");
@@ -926,6 +926,7 @@ async fn sqlite_store_family_stamps_substrate_why_trace_for_system_2124() {
             &system,
             &pg_mem("sq-2124-e", "ns/2124", "sys embed", "ai:c", None),
             None,
+            None,
         )
         .await
         .expect("store_with_embedding");
@@ -987,6 +988,7 @@ async fn pg_store_family_stamps_substrate_why_trace_for_system_2124() {
             &system,
             &pg_mem(&format!("e-{run}"), &ns, "sys embed", "ai:c", None),
             None,
+            None,
         )
         .await
         .expect("pg store_with_embedding (system) is exempt");
@@ -1030,6 +1032,7 @@ async fn pg_store_family_stamps_substrate_why_trace_for_system_2124() {
             .store_with_embedding(
                 &tenant,
                 &pg_mem(&format!("te-{run}"), &ns, "tenant embed", "t", None),
+                None,
                 None,
             )
             .await
