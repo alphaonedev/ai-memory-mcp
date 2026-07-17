@@ -107,7 +107,7 @@ pub(crate) async fn maybe_auto_tag(
     if app.tier_config.llm_model.is_none() {
         return Vec::new();
     }
-    let llm_arc = app.llm.clone();
+    let llm_arc = app.llm.current();
     if llm_arc.is_none() {
         return Vec::new();
     }
@@ -198,7 +198,7 @@ async fn maybe_detect_conflicts(
     {
         return Vec::new();
     }
-    let llm_arc = app.llm.clone();
+    let llm_arc = app.llm.current();
     if llm_arc.is_none() {
         return Vec::new();
     }
@@ -377,7 +377,7 @@ mod cov897_tests {
             storage_backend: StorageBackend::Sqlite,
             #[cfg(feature = "sal")]
             store,
-            llm: Arc::new(None),
+            llm: Arc::new(crate::reload::SwappableLlm::new(None)),
             auto_tag_model: Arc::new(None),
             llm_call_timeout: std::time::Duration::from_secs(30),
             replay_cache: Arc::new(crate::identity::replay::ReplayCache::default()),
@@ -390,7 +390,9 @@ mod cov897_tests {
             deferred_audit_queue: Arc::new(None),
             admin_agent_ids: Arc::new(Vec::new()),
             rule_cache: std::sync::Arc::new(crate::governance::rule_cache::RuleCache::new()),
-            resolved_models: std::sync::Arc::new(crate::config::ResolvedModels::default()),
+            resolved_models: std::sync::Arc::new(crate::reload::Swappable::new(
+                crate::config::ResolvedModels::default(),
+            )),
             runtime: crate::runtime_context::RuntimeContext::global_arc(),
             max_page_size: crate::handlers::MAX_BULK_SIZE,
             enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),

@@ -721,6 +721,7 @@ pub mod quotas;
 // agents call the MCP tool; both route through the canonical
 // `recover_from_transcript` handler in this module.
 pub mod recover;
+pub mod reload;
 pub mod replication;
 pub mod reranker;
 pub mod revisions;
