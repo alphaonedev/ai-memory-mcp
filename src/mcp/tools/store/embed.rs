@@ -70,7 +70,9 @@ pub(super) fn store_source_embedding(
     };
     match embed_result {
         Ok(embedding) => {
-            if let Err(e) = db::set_embedding(conn, actual_id, &embedding) {
+            if let Err(e) =
+                db::set_embedding(conn, actual_id, &embedding, &embedder.space_fingerprint())
+            {
                 tracing::warn!("failed to store embedding for {}: {}", actual_id, e);
             }
             // Add to HNSW index for fast ANN search.

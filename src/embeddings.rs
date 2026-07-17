@@ -253,6 +253,18 @@ pub trait Embed: Send + Sync {
     fn is_degraded(&self) -> bool {
         false
     }
+
+    /// #2167 — the [`EmbeddingSpace`] fingerprint of the vectors this
+    /// embedder produces. Exposed on the `dyn Embed` interface so the
+    /// trait-generic backfill sweep ([`crate::store::run_embedding_backfill_on_store`],
+    /// [`crate::mcp::run_embedding_backfill_with_batch_size`]) can stamp the
+    /// live space without a concrete `Embedder`. The production [`Embedder`]
+    /// overrides it with the real fingerprint (§0.3); the default here is a
+    /// stable sentinel that whole-value-compares distinctly (a mock embedder's
+    /// vectors are never scored against a live query in production).
+    fn space_fingerprint(&self) -> EmbeddingSpace {
+        EmbeddingSpace::mint("mock-embedder")
+    }
 }
 
 /// Semantic embedding engine supporting multiple backends.
@@ -1158,6 +1170,11 @@ impl Embed for Embedder {
 
     fn is_degraded(&self) -> bool {
         Self::is_degraded(self)
+    }
+
+    fn space_fingerprint(&self) -> EmbeddingSpace {
+        // Delegate to the inherent method (§0.3).
+        Self::space_fingerprint(self)
     }
 }
 

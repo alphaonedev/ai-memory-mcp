@@ -412,6 +412,10 @@ fn insert_create_with_quota(
     >,
     mem: &Memory,
     embedding: &Option<Vec<f32>>,
+    // #2167 — the live embedder's space fingerprint, stamped alongside the
+    // vector. `None` when embeddings are disabled (then `embedding` is `None`
+    // too, so it is never read).
+    space: Option<&crate::embeddings::EmbeddingSpace>,
 ) -> Result<String, axum::response::Response> {
     // v0.7.0 Round-2 F7 — per-agent quota gate. Round-1 evidence: 500
     // HTTP stores from a single agent_id incremented zero rows in
@@ -510,7 +514,8 @@ fn insert_create_with_quota(
             // semantic search. HNSW index warm-up happens after the
             // lock drops in the orchestrator.
             if let Some(vec) = embedding.as_ref()
-                && let Err(e) = db::set_embedding(&lock.0, &actual_id, vec)
+                && let Some(sp) = space
+                && let Err(e) = db::set_embedding(&lock.0, &actual_id, vec, sp)
             {
                 tracing::warn!("failed to store embedding for {actual_id}: {e}");
             }
@@ -1473,7 +1478,14 @@ pub async fn create_memory(
     }
 
     // Stage 5 — quota + insert.
-    let actual_id = match insert_create_with_quota(&lock, &mem, &embedding) {
+    // #2167 — resolve the live embedder's space so the inline embedding write
+    // stamps its provenance atomically.
+    let create_space = app
+        .embedder
+        .as_ref()
+        .as_ref()
+        .map(|e| e.space_fingerprint());
+    let actual_id = match insert_create_with_quota(&lock, &mem, &embedding, create_space.as_ref()) {
         Ok(id) => id,
         Err(resp) => return resp,
     };

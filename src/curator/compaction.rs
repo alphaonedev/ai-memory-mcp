@@ -1046,9 +1046,21 @@ mod tests {
                 5,
             );
             crate::db::insert(&conn, &m1).unwrap();
-            crate::db::set_embedding(&conn, &m1.id, &[1.0, 0.0]).unwrap();
+            crate::db::set_embedding(
+                &conn,
+                &m1.id,
+                &[1.0, 0.0],
+                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            )
+            .unwrap();
             crate::db::insert(&conn, &m2).unwrap();
-            crate::db::set_embedding(&conn, &m2.id, &[0.0, 1.0]).unwrap();
+            crate::db::set_embedding(
+                &conn,
+                &m2.id,
+                &[0.0, 1.0],
+                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            )
+            .unwrap();
 
             let pass = ConsolidationPass::new(&store, &llm, false);
             let clusters = pass.cluster(&[m1, m2]).await;
@@ -1123,8 +1135,20 @@ mod tests {
             // #1774 — both sides need a stored embedding to clear the cosine
             // gate; attach aligned vectors (cosine = 1.0) so the dup pair
             // clusters (the un-embedded path no longer merges).
-            crate::db::set_embedding(conn, &m1.id, &[1.0, 0.0]).unwrap();
-            crate::db::set_embedding(conn, &m2.id, &[1.0, 0.0]).unwrap();
+            crate::db::set_embedding(
+                conn,
+                &m1.id,
+                &[1.0, 0.0],
+                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            )
+            .unwrap();
+            crate::db::set_embedding(
+                conn,
+                &m2.id,
+                &[1.0, 0.0],
+                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            )
+            .unwrap();
             vec![m1, m2]
         }
 
@@ -1293,10 +1317,34 @@ mod tests {
                 crate::db::insert(&conn, m).unwrap();
             }
             // Aligned embeddings within each namespace → cosine gate passes.
-            crate::db::set_embedding(&conn, &a1.id, &[1.0, 0.0]).unwrap();
-            crate::db::set_embedding(&conn, &a2.id, &[1.0, 0.0]).unwrap();
-            crate::db::set_embedding(&conn, &b1.id, &[0.0, 1.0]).unwrap();
-            crate::db::set_embedding(&conn, &b2.id, &[0.0, 1.0]).unwrap();
+            crate::db::set_embedding(
+                &conn,
+                &a1.id,
+                &[1.0, 0.0],
+                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            )
+            .unwrap();
+            crate::db::set_embedding(
+                &conn,
+                &a2.id,
+                &[1.0, 0.0],
+                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            )
+            .unwrap();
+            crate::db::set_embedding(
+                &conn,
+                &b1.id,
+                &[0.0, 1.0],
+                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            )
+            .unwrap();
+            crate::db::set_embedding(
+                &conn,
+                &b2.id,
+                &[0.0, 1.0],
+                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            )
+            .unwrap();
 
             let cands = vec![a1, a2, b1, b2];
 

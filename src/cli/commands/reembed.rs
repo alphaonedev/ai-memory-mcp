@@ -179,7 +179,9 @@ pub(crate) fn run_reembed_live(
         if embedded.entries.is_empty() {
             continue;
         }
-        outcome.reembedded += db::set_embeddings_batch_reembed(conn, &embedded.entries)?;
+        // #2167 — RE-STAMP every replaced vector with the reembed TARGET space.
+        outcome.reembedded +=
+            db::set_embeddings_batch_reembed(conn, &embedded.entries, &emb.space_fingerprint())?;
     }
     Ok(outcome)
 }
@@ -414,7 +416,13 @@ mod tests {
         let id_a = seed(&conn, "plan-a", "a-1", "content");
         seed(&conn, "plan-a", "a-2", "content");
         seed(&conn, "plan-b", "b-1", "content");
-        db::set_embedding(&conn, &id_a, &[0.1, 0.2]).unwrap();
+        db::set_embedding(
+            &conn,
+            &id_a,
+            &[0.1, 0.2],
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
 
         let all = build_plan(&conn, None, "model-x (8-dim, remote)", 8, "openrouter").unwrap();
         assert_eq!(
@@ -447,7 +455,13 @@ mod tests {
         let mut conn = test_conn();
         let id_old = seed(&conn, "live-ns", "old", "already embedded");
         let id_new = seed(&conn, "live-ns", "new", "never embedded");
-        db::set_embedding(&conn, &id_old, &[0.1, 0.2, 0.3, 0.4]).unwrap();
+        db::set_embedding(
+            &conn,
+            &id_old,
+            &[0.1, 0.2, 0.3, 0.4],
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
 
         let emb = FixedDimEmbedder {
             dim: 8,
@@ -481,7 +495,13 @@ mod tests {
         let mut conn = test_conn();
         let id_in = seed(&conn, "ns-in", "in", "inside the filter");
         let id_out = seed(&conn, "ns-out", "out", "outside the filter");
-        db::set_embedding(&conn, &id_out, &[0.9, 0.8]).unwrap();
+        db::set_embedding(
+            &conn,
+            &id_out,
+            &[0.9, 0.8],
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
 
         let emb = FixedDimEmbedder {
             dim: 4,
@@ -509,7 +529,13 @@ mod tests {
         let id_ok_a = seed(&conn, "fb-ns", "ok-a", "healthy");
         let id_bad = seed(&conn, "fb-ns", "bad", MARKER);
         let id_ok_b = seed(&conn, "fb-ns", "ok-b", "healthy");
-        db::set_embedding(&conn, &id_bad, &[0.7, 0.7]).unwrap();
+        db::set_embedding(
+            &conn,
+            &id_bad,
+            &[0.7, 0.7],
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
 
         let emb = FixedDimEmbedder {
             dim: 4,

@@ -240,7 +240,13 @@ fn set_embeddings_batch_rolls_back_on_dim_mismatch() {
 
     // Establish the namespace dim at 4 via a successful single-row write.
     let v4: Vec<f32> = vec![0.1, 0.2, 0.3, 0.4];
-    db::set_embedding(&conn, &m_a.id, &v4).expect("seed dim");
+    db::set_embedding(
+        &conn,
+        &m_a.id,
+        &v4,
+        &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+    )
+    .expect("seed dim");
 
     // Batch tries to write a 4-dim and an 8-dim into the same
     // namespace — must fail without committing either pair.
@@ -248,6 +254,7 @@ fn set_embeddings_batch_rolls_back_on_dim_mismatch() {
     let err = db::set_embeddings_batch(
         &mut conn,
         &[(m_b.id.clone(), v4.clone()), (m_a.id.clone(), v8)],
+        &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
     )
     .expect_err("dim mismatch should bubble");
     let msg = format!("{err:#}");
@@ -291,7 +298,13 @@ fn bench_pre_fix_per_row_baseline() {
     for (id, title, content) in &unembedded {
         let text = format!("{title} {content}");
         if let Ok(v) = emb.embed(&text)
-            && db::set_embedding(&conn, id, &v).is_ok()
+            && db::set_embedding(
+                &conn,
+                id,
+                &v,
+                &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+            )
+            .is_ok()
         {
             ok += 1;
         }

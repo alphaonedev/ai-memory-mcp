@@ -370,9 +370,13 @@ pub(super) async fn sync_push_via_store(
                     });
                 match clean_shipped {
                     Some((vector, model)) => {
+                        // #2167 §2-EXC — SHIPPED vector stamps the sender's
+                        // CLAIMED space (`mint(se.model)`); recall excludes it
+                        // unless it equals the active space (degraded-not-wrong).
+                        let claimed_space = crate::embeddings::EmbeddingSpace::mint(&model);
                         if let Err(e) = app
                             .store
-                            .update_embedding(&ctx, &applied_id, Some(&vector))
+                            .update_embedding(&ctx, &applied_id, Some(&vector), &claimed_space)
                             .await
                         {
                             tracing::warn!(
@@ -826,7 +830,12 @@ fn spawn_deferred_embedding_refresh_via_store(
                     continue;
                 }
             };
-            if let Err(e) = store.update_embedding(&ctx, &id, Some(&vec)).await {
+            // #2167 — LOCAL re-embed lands in the receiver's ACTIVE space.
+            let space = match embedder.as_ref().as_ref() {
+                Some(e) => e.space_fingerprint(),
+                None => return,
+            };
+            if let Err(e) = store.update_embedding(&ctx, &id, Some(&vec), &space).await {
                 tracing::warn!(
                     "sync_push (postgres): deferred update_embedding failed for {id}: {e}"
                 );

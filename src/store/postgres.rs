@@ -14404,11 +14404,16 @@ impl MemoryStore for PostgresStore {
         _ctx: &CallerContext,
         id: &str,
         embedding: Option<&[f32]>,
+        space: &crate::embeddings::EmbeddingSpace,
     ) -> StoreResult<()> {
         let emb_pgvec = embedding.map(|v| pgvector::Vector::from(v.to_vec()));
-        sqlx::query("UPDATE memories SET embedding = $2 WHERE id = $1")
+        // #2167 — vector + space travel together; a None (cleared) embedding
+        // NULLs the space stamp too (no vector, no provenance).
+        let space_val: Option<&str> = embedding.map(|_| space.as_str());
+        sqlx::query("UPDATE memories SET embedding = $2, embedding_space = $3 WHERE id = $1")
             .bind(id)
             .bind(emb_pgvec)
+            .bind(space_val)
             .execute(&self.pool)
             .await
             .map_err(|e| to_store_err("update_embedding", e))?;
@@ -14471,6 +14476,7 @@ impl MemoryStore for PostgresStore {
         &self,
         _ctx: &CallerContext,
         entries: &[(String, Vec<f32>)],
+        space: &crate::embeddings::EmbeddingSpace,
     ) -> StoreResult<usize> {
         if entries.is_empty() {
             return Ok(0);
@@ -14481,14 +14487,19 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("begin set_embeddings_batch tx", e))?;
         let mut written = 0usize;
+        // #2167 — one space stamps the whole batch (live-minted in one process).
+        let space_str = space.as_str();
         for (id, vec) in entries {
             let emb_pgvec = pgvector::Vector::from(vec.clone());
-            let res = sqlx::query("UPDATE memories SET embedding = $2 WHERE id = $1")
-                .bind(id)
-                .bind(emb_pgvec)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("set_embeddings_batch update", e))?;
+            let res = sqlx::query(
+                "UPDATE memories SET embedding = $2, embedding_space = $3 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(emb_pgvec)
+            .bind(space_str)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("set_embeddings_batch update", e))?;
             written += usize::try_from(res.rows_affected()).unwrap_or(0);
         }
         tx.commit()
@@ -26334,7 +26345,12 @@ mod tests {
         let dim_usize = usize::try_from(dim.unwrap_or(384)).unwrap_or(384);
         let vec = vec![0.0_f32; dim_usize];
         store
-            .update_embedding(&ctx, &id, Some(&vec))
+            .update_embedding(
+                &ctx,
+                &id,
+                Some(&vec),
+                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            )
             .await
             .expect("update_embedding");
         // Re-fetch to verify the vector landed (column is non-NULL).

@@ -74,7 +74,13 @@ fn seed_with_embedding(
         ..ai_memory::models::Memory::default()
     };
     let stored_id = db::insert(conn, &mem).expect("db::insert");
-    db::set_embedding(conn, &stored_id, embedding).expect("db::set_embedding");
+    db::set_embedding(
+        conn,
+        &stored_id,
+        embedding,
+        &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+    )
+    .expect("db::set_embedding");
     stored_id
 }
 

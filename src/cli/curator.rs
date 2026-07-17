@@ -2283,8 +2283,20 @@ mod tests {
         db::insert(&conn, &m1).unwrap();
         db::insert(&conn, &m2).unwrap();
         // Aligned embeddings → cosine gate passes (same ns).
-        db::set_embedding(&conn, &m1.id, &[1.0, 0.0]).unwrap();
-        db::set_embedding(&conn, &m2.id, &[1.0, 0.0]).unwrap();
+        db::set_embedding(
+            &conn,
+            &m1.id,
+            &[1.0, 0.0],
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
+        db::set_embedding(
+            &conn,
+            &m2.id,
+            &[1.0, 0.0],
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
     }
 
     #[cfg(feature = "sal")]

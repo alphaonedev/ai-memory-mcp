@@ -592,7 +592,11 @@ async fn set_embeddings_batch_empty_is_noop_and_writes_vectors() {
 
     // Empty entries → early-return 0, no transaction opened.
     let zero = store
-        .set_embeddings_batch(&ctx, &[])
+        .set_embeddings_batch(
+            &ctx,
+            &[],
+            &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+        )
         .await
         .expect("set_embeddings_batch empty");
     assert_eq!(zero, 0);
@@ -610,7 +614,11 @@ async fn set_embeddings_batch_empty_is_noop_and_writes_vectors() {
         .unwrap_or(384);
     let vec: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.0005).collect();
     let written = store
-        .set_embeddings_batch(&ctx, &[(id.clone(), vec)])
+        .set_embeddings_batch(
+            &ctx,
+            &[(id.clone(), vec)],
+            &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+        )
         .await
         .expect("set_embeddings_batch write");
     assert_eq!(written, 1, "one row's embedding written");
@@ -619,7 +627,11 @@ async fn set_embeddings_batch_empty_is_noop_and_writes_vectors() {
     // scan-and-write count==0 path).
     let ghost_vec: Vec<f32> = (0..dim).map(|_| 0.1_f32).collect();
     let ghost = store
-        .set_embeddings_batch(&ctx, &[(uid("ghost"), ghost_vec)])
+        .set_embeddings_batch(
+            &ctx,
+            &[(uid("ghost"), ghost_vec)],
+            &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+        )
         .await
         .expect("set_embeddings_batch ghost");
     assert_eq!(ghost, 0, "missing id contributes zero rows_affected");
