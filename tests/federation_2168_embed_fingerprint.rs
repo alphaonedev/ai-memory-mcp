@@ -131,7 +131,7 @@ fn build_receiver(embedder: Option<Embedder>) -> Receiver {
         store: Arc::new(
             ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"),
         ),
-        llm: Arc::new(None),
+        llm: Arc::new(ai_memory::reload::SwappableLlm::new(None)),
         auto_tag_model: Arc::new(None),
         llm_call_timeout: Duration::from_secs(30),
         replay_cache: Arc::new(ai_memory::identity::replay::ReplayCache::default()),
@@ -144,7 +144,9 @@ fn build_receiver(embedder: Option<Embedder>) -> Receiver {
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(Vec::new()),
         rule_cache: Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
-        resolved_models: Arc::new(ai_memory::config::ResolvedModels::default()),
+        resolved_models: Arc::new(ai_memory::reload::Swappable::new(
+            ai_memory::config::ResolvedModels::default(),
+        )),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
         enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
