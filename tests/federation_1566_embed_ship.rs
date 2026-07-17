@@ -347,6 +347,11 @@ async fn shipped_vector_stored_directly_without_receiver_embed() {
     let ollama = mock_ollama_embed(768, 0.5, Duration::ZERO).await;
     let embedder = build_ollama_embedder(&ollama.uri());
     let dim = embedder.dim();
+    // #2168 — the shipped model must fingerprint-MATCH the receiver's
+    // configured embedder or the fingerprint gate defers a local re-embed
+    // (covered by the #2168 suite). A well-behaved peer on the same model
+    // ships its `model_description()`, which is exactly this value.
+    let model_desc = embedder.model_description();
     let rx = build_receiver(Some(embedder));
 
     let mem = sample_memory("ship-direct-1");
@@ -360,7 +365,7 @@ async fn shipped_vector_stored_directly_without_receiver_embed() {
     let shipped_vec: Vec<f32> = vec![1.0_f32 / (dim as f32).sqrt(); dim];
     let shipped = vec![ShippedEmbedding::new(
         mem.id.clone(),
-        "sender-model".to_string(),
+        model_desc.clone(),
         shipped_vec.clone(),
     )];
     let body = push_body(std::slice::from_ref(&mem), Some(&shipped));
@@ -610,6 +615,10 @@ async fn non_normalized_shipped_vector_is_stored_normalized_1584() {
     let ollama = mock_ollama_embed(768, 0.5, Duration::ZERO).await;
     let embedder = build_ollama_embedder(&ollama.uri());
     let dim = embedder.dim();
+    // #2168 — ship the receiver's own model fingerprint so the
+    // fingerprint gate accepts the vector; this test isolates the #1584
+    // normalization behaviour, not the #2168 fingerprint gate.
+    let model_desc = embedder.model_description();
     let rx = build_receiver(Some(embedder));
 
     let mem = sample_memory("ship-bignorm-1584");
@@ -619,7 +628,7 @@ async fn non_normalized_shipped_vector_is_stored_normalized_1584() {
     let shipped_vec: Vec<f32> = vec![5.0_f32; dim];
     let shipped = vec![ShippedEmbedding::new(
         mem.id.clone(),
-        "non-normalized-peer".to_string(),
+        model_desc.clone(),
         shipped_vec,
     )];
     let body = push_body(std::slice::from_ref(&mem), Some(&shipped));
