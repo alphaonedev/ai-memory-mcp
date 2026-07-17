@@ -325,7 +325,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // shared embedding-UPDATE + set_embedding/batch/reembed signatures + the
     // in-module test-call threading land storage/mod.rs at 25_133; ceiling
     // 25_150 (+17 headroom). Additive per-row provenance write path.
-    ("src/storage/mod.rs", 25_150),
+    // 2026-07-17 (#2167 S4+S5): the recall-core space gate (comparator
+    // threading on 3 sqlite sites + FTS/linear-scan/HNSW SELECT columns +
+    // space/unverified counters + aggregated WARN) + the §5 boot adoption /
+    // §6 census / embedding_space_boot_maintenance helpers land
+    // storage/mod.rs at 25_504; ceiling 25_650 (+146 headroom).
+    ("src/storage/mod.rs", 25_650),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress

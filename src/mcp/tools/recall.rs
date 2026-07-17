@@ -1196,6 +1196,10 @@ pub fn handle_recall_dto(
                         }
                     }
                 };
+                // v1.0.0 #2167 §3 — the active embedder fingerprint gates
+                // every stored vector so recall never scores a foreign or
+                // unverified embedding space.
+                let mcp_active_space = emb.space_fingerprint();
                 let (results, outcome, telemetry) = db::recall_hybrid_with_telemetry(
                     conn,
                     context,
@@ -1221,6 +1225,8 @@ pub fn handle_recall_dto(
                     source_uri_prefix.as_deref(),
                     // v0.8.0 #1720 A3 — owner-keyed visibility caller.
                     caller,
+                    // v1.0.0 #2167 §3 — active embedder fingerprint gate.
+                    Some(mcp_active_space.as_str()),
                 )
                 .map_err(|e| e.to_string())?;
                 let results = crate::cli::recall::apply_form4_recall_filters(

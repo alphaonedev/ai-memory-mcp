@@ -16292,6 +16292,14 @@ impl MemoryStore for PostgresStore {
                        OR COALESCE(metadata->>'scope', 'private') <> 'private'
                        OR metadata->>'agent_id' = $9
                    )
+                   -- v1.0.0 #2167 §3.4 — the embedding-space gate as a SQL
+                   -- predicate: a stored vector is scored ONLY when its
+                   -- provenance token equals the active fingerprint ($10).
+                   -- SQL `NULL = $10` is false, so NULL (unverified) rows
+                   -- are excluded for free — matching the sqlite comparator
+                   -- exactly. A foreign-space (same-dim model swap) vector
+                   -- is structurally never an ANN candidate.
+                   AND embedding_space = $10
                    {lifecycle_vis}
                  ORDER BY embedding <=> $1
                  LIMIT $8",
@@ -16307,6 +16315,7 @@ impl MemoryStore for PostgresStore {
             .bind(filter.until)
             .bind(ann_pool)
             .bind(caller_opt)
+            .bind(filter.active_embedding_space.as_ref())
             .fetch_all(&self.pool)
             .await
             .map_err(|e| to_store_err("recall_hybrid semantic pool", e))?;

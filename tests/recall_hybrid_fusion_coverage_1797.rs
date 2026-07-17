@@ -119,6 +119,7 @@ fn repro_1797_keyword_vs_hybrid_with_owner_caller() {
         false,
         None,
         Some("agent-x"),
+        None,
     )
     .expect("hybrid recall ok");
 
@@ -183,6 +184,7 @@ fn repro_1797_orthogonal_query_embedding_low_cosine() {
         false,
         None,
         Some("agent-x"),
+        None,
     )
     .expect("hybrid recall ok");
     eprintln!(
@@ -251,6 +253,7 @@ fn repro_1797_boot_warmed_index_missing_new_memory() {
         false,
         None,
         Some("agent-x"),
+        None,
     )
     .expect("hybrid recall ok");
     eprintln!(
@@ -300,6 +303,7 @@ fn repro_1797_budget_zero_returns_nothing() {
         false,
         None,
         Some("agent-x"),
+        None,
     )
     .expect("hybrid recall ok");
     // budget_tokens=Some(0) is the documented "return nothing" path. The HTTP
@@ -345,6 +349,7 @@ fn repro_1797_caller_none_operator() {
         None,
         &scoring,
         false,
+        None,
         None,
         None,
     )

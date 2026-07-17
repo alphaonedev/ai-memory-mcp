@@ -818,6 +818,10 @@ impl MemoryStore for SqliteStore {
                 // direct db::recall call.
                 None,
                 vis_caller,
+                // v1.0.0 #2167 §3 — the active embedder fingerprint from
+                // the recall Filter gates every stored vector so recall
+                // never scores a foreign / unverified embedding space.
+                filter.active_embedding_space.as_deref(),
             )
             .map_err(box_err)?
             .0

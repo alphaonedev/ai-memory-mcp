@@ -5686,6 +5686,9 @@ pub fn recall_with_telemetry(
         hnsw_candidates: 0,
         blend_weight_avg: 0.0,
         embedding_dim_mismatch: 0,
+        // v1.0.0 #2167 — keyword-only recall never runs the space gate.
+        embedding_space_mismatch: 0,
+        embedding_unverified_space: 0,
     };
     Ok((results, outcome, telemetry))
 }
@@ -12822,8 +12825,17 @@ pub fn get_embedding(conn: &Connection, id: &str) -> Result<Option<Vec<f32>>> {
 /// simply absent from the map (never an error): the caller falls back to the
 /// HNSW distance-derived cosine for a missing id, matching the pre-batch
 /// per-hit `get_embedding` error/None arm.
-pub fn get_embeddings_many(conn: &Connection, ids: &[String]) -> Result<HashMap<String, Vec<f32>>> {
-    let mut out: HashMap<String, Vec<f32>> = HashMap::with_capacity(ids.len());
+///
+/// v1.0.0 #2167 — the value carries the row's `embedding_space`
+/// provenance token (`None` = SQL NULL) alongside the decoded vector so
+/// the #1692 HNSW-hit recompute site (§3.2) can gate every candidate
+/// through [`crate::embeddings::Embedder::cosine_similarity_space_checked`]
+/// in the same single-round-trip the #1910 batch already pays.
+pub fn get_embeddings_many(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<HashMap<String, (Vec<f32>, Option<String>)>> {
+    let mut out: HashMap<String, (Vec<f32>, Option<String>)> = HashMap::with_capacity(ids.len());
     if ids.is_empty() {
         return Ok(out);
     }
@@ -12833,18 +12845,24 @@ pub fn get_embeddings_many(conn: &Connection, ids: &[String]) -> Result<HashMap<
             .take(chunk.len())
             .collect::<Vec<_>>()
             .join(",");
-        let sql = format!("SELECT id, embedding FROM memories WHERE id IN ({placeholders})");
+        let sql = format!(
+            "SELECT id, embedding, embedding_space FROM memories WHERE id IN ({placeholders})"
+        );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })?;
         for r in rows {
-            let (id, bytes) = r?;
+            let (id, bytes, space) = r?;
             if let Some(bytes) = bytes
                 && !bytes.is_empty()
                 && let Ok(floats) = crate::embeddings::decode_embedding_blob(&bytes)
             {
-                out.insert(id, floats);
+                out.insert(id, (floats, space));
             }
         }
     }
@@ -13293,6 +13311,210 @@ pub fn distinct_embedding_dims(conn: &Connection, namespace: Option<&str>) -> Re
     }
 }
 
+/// v1.0.0 #2167 §6 — corpus census over the per-row `embedding_space`
+/// provenance token (schema v84). Mirrors [`distinct_embedding_dims`]:
+/// returns each distinct `embedding_space` value present among
+/// embedded rows paired with its row count, `NULL` (legacy/unverified)
+/// carried as `None`. The boot census (§6) diffs this against the
+/// active fingerprint to WARN on a heterogeneous corpus and name the
+/// heal commands; `ai-memory doctor` prints it as a table. Ordered so
+/// the output is deterministic.
+///
+/// # Errors
+///
+/// Bubbles the rusqlite error from the aggregate query.
+pub fn distinct_embedding_spaces(
+    conn: &Connection,
+    namespace: Option<&str>,
+) -> Result<Vec<(Option<String>, u64)>> {
+    let collect = |stmt: &mut rusqlite::Statement<'_>,
+                   params: &[&dyn rusqlite::ToSql]|
+     -> Result<Vec<(Option<String>, u64)>> {
+        let rows = stmt.query_map(params, |r| {
+            let space: Option<String> = r.get(0)?;
+            let count: i64 = r.get(1)?;
+            Ok((space, count))
+        })?;
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|(space, count)| (space, u64::try_from(count).unwrap_or(0)))
+            .collect())
+    };
+    if let Some(ns) = namespace {
+        let mut stmt = conn.prepare(
+            "SELECT embedding_space, COUNT(*) AS c FROM memories \
+             WHERE embedding IS NOT NULL AND namespace = ?1 \
+             GROUP BY embedding_space ORDER BY embedding_space IS NOT NULL, embedding_space",
+        )?;
+        collect(&mut stmt, &[&ns])
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT embedding_space, COUNT(*) AS c FROM memories \
+             WHERE embedding IS NOT NULL \
+             GROUP BY embedding_space ORDER BY embedding_space IS NOT NULL, embedding_space",
+        )?;
+        collect(&mut stmt, &[])
+    }
+}
+
+/// v1.0.0 #2167 §5 — one-time boot ADOPTION of legacy NULL-space rows.
+///
+/// Stamps `embedding_space = <active_fp>` onto every embedded row that
+/// carries NO provenance yet (`embedding_space IS NULL`) AND whose
+/// dimensionality matches the active embedder (`embedding_dim =
+/// <active_dim>`), on both `memories` and `archived_memories`. Returns
+/// the number of `memories` rows stamped.
+///
+/// **The rule is guarded (§5 safety proof — both guards required):**
+/// - **[G1]** the caller invokes this ONLY when
+///   [`crate::hnsw::strict_embed_model_match_enabled`] is OFF (a strict
+///   operator demands explicit `reembed --stamp-only` attestation, so
+///   auto-adoption never runs).
+/// - **[G2]** NO differently-stamped row exists: if ANY embedded row
+///   already carries a NON-NULL `embedding_space` that differs from
+///   `active_fp`, the corpus has demonstrated multi-space history and
+///   this function REFUSES (returns `Ok(0)`, stamps nothing) — those
+///   NULL rows stay `UnverifiedSpace`-excluded until `reembed`.
+///
+/// Why safe (preserve this proof — it is the §5 invariant):
+/// 1. **No-nuke:** first post-upgrade boot with unchanged config stamps
+///    every dim-matching row → recall identical to pre-v84.
+/// 2. **Post-swap catch:** after a same-dim model swap, [G2] sees the
+///    now-differently-stamped rows and blocks re-adoption; §3 excludes
+///    the foreign rows; §6 census WARNs.
+/// 3. **Monotone detectability:** only writes NULL→fp, never overwrites
+///    a stamp, so any recorded provenance survives forever.
+/// 4. **Residual window bounded:** adoption mis-stamps ONLY when NO
+///    provenance exists on either side (the pre-v84 permanent status
+///    quo); it converts that permanently-undetectable state into a
+///    one-shot, loudly-logged assumption, healable by `reembed`.
+/// 5. **Mixed-history refusal [G2]:** where the corpus proves
+///    multi-space history, refuse and stay fail-closed.
+///
+/// Idempotent + marker-free: post-adoption `{embedding NOT NULL, space
+/// NULL}` is structurally empty (every write funnel stamps; §8 restore
+/// NULLs the vector together with the stamp), so re-runs are no-ops.
+///
+/// # Errors
+///
+/// Bubbles the rusqlite error from the guard probe or the UPDATE.
+pub fn adopt_legacy_embedding_space(
+    conn: &Connection,
+    active_fp: &str,
+    active_dim: usize,
+) -> Result<usize> {
+    // [G2] — refuse if any embedded row already carries a DIFFERENT
+    // stamp (a corpus with demonstrated multi-space history never
+    // auto-adopts; its NULL rows stay excluded until explicit
+    // attestation).
+    let mismatched: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memories \
+         WHERE embedding_space IS NOT NULL AND embedding_space != ?1)",
+        params![active_fp],
+        |r| r.get(0),
+    )?;
+    if mismatched != 0 {
+        tracing::warn!(
+            active_space = %active_fp,
+            "embedding-space adoption REFUSED: corpus has demonstrated multi-space \
+             history ([G2]); NULL-space rows stay excluded until `ai-memory reembed` \
+             or `ai-memory reembed --stamp-only`"
+        );
+        return Ok(0);
+    }
+    let dim_i64 = i64::try_from(active_dim).unwrap_or(i64::MAX);
+    // Stamp NULL→fp for dim-matching embedded rows on BOTH tables. The
+    // archived twin keeps archive→restore round-trips in-space lossless.
+    let stamped = conn.execute(
+        "UPDATE memories SET embedding_space = ?1 \
+         WHERE embedding IS NOT NULL AND embedding_space IS NULL AND embedding_dim = ?2",
+        params![active_fp, dim_i64],
+    )?;
+    let _archived = conn.execute(
+        "UPDATE archived_memories SET embedding_space = ?1 \
+         WHERE embedding IS NOT NULL AND embedding_space IS NULL AND embedding_dim = ?2",
+        params![active_fp, dim_i64],
+    )?;
+    if stamped > 0 {
+        tracing::warn!(
+            adopted_rows = stamped,
+            space = %active_fp,
+            "embedding-space adoption stamped {stamped} legacy NULL-space row(s) with the \
+             active fingerprint (§5 one-time boot adoption)"
+        );
+    } else {
+        tracing::info!(
+            space = %active_fp,
+            "embedding-space adoption ran: no legacy NULL-space dim-matching rows to stamp"
+        );
+    }
+    Ok(stamped)
+}
+
+/// v1.0.0 #2167 §5 + §6 — the shared boot maintenance run at every
+/// site that constructs an [`crate::embeddings::Embedder`] with DB
+/// access (daemon serve boot, MCP `run_mcp_server` init, CLI recall).
+/// Runs in the load-bearing ORDER embedder→adopt→census (the caller
+/// seeds the vector index AFTER this returns):
+/// 1. **§5 adoption** — unless strict mode
+///    ([`crate::hnsw::strict_embed_model_match_enabled`], [G1]) is on,
+///    stamp legacy NULL-space dim-matching rows with `active_fp` (the
+///    [G2]-guarded [`adopt_legacy_embedding_space`]).
+/// 2. **§6 census** — diff [`distinct_embedding_spaces`] against
+///    `active_fp`; emit ONE loud WARN naming the per-space counts + the
+///    heal commands when any non-active / NULL space carries rows.
+///
+/// Best-effort + idempotent: it swallows errors into a WARN (a
+/// read-only / locked DB makes it a no-op, never an abort — recall then
+/// treats NULL/foreign rows as excluded, which is safe + degraded).
+pub fn embedding_space_boot_maintenance(conn: &Connection, active_fp: &str, active_dim: usize) {
+    // §5 adoption — [G1] strict off.
+    if crate::hnsw::strict_embed_model_match_enabled() {
+        tracing::info!(
+            active_space = %active_fp,
+            "#2167: strict embed-model-match mode ON — skipping legacy NULL-space adoption \
+             ([G1]); attest with `ai-memory reembed --stamp-only` or heal with `ai-memory reembed`"
+        );
+    } else if let Err(e) = adopt_legacy_embedding_space(conn, active_fp, active_dim) {
+        tracing::warn!(
+            err = %e,
+            "#2167: embedding-space boot adoption failed (best-effort); legacy NULL-space \
+             rows stay excluded from semantic recall until reembed"
+        );
+    }
+    // §6 census — loud WARN on any heterogeneity.
+    match distinct_embedding_spaces(conn, None) {
+        Ok(census) => {
+            let mut reembed_pending: u64 = 0;
+            let mut foreign_or_null: Vec<String> = Vec::new();
+            for (space, count) in &census {
+                let is_active = space.as_deref() == Some(active_fp);
+                if !is_active {
+                    reembed_pending = reembed_pending.saturating_add(*count);
+                    let label = space.as_deref().unwrap_or("<null/unverified>");
+                    foreign_or_null.push(format!("{label}={count}"));
+                }
+            }
+            if reembed_pending > 0 {
+                tracing::warn!(
+                    active_space = %active_fp,
+                    reembed_pending,
+                    census = %foreign_or_null.join(", "),
+                    "#2167 embedding-space census: {reembed_pending} embedded row(s) are NOT in \
+                     the active space [{}] — they are excluded from semantic scoring (still \
+                     keyword-recallable). Heal with `ai-memory reembed` (re-derive from text) or \
+                     `ai-memory reembed --stamp-only` (attest matching-dim rows)",
+                    foreign_or_null.join(", ")
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(err = %e, "#2167: embedding-space boot census query failed");
+        }
+    }
+}
+
 /// #1579 B3 — count of rows carrying a stored embedding. Cheap probe
 /// (no blob decode, no row materialisation) used by the CLI recall
 /// path to decide whether a one-shot invocation should pay the HNSW
@@ -13313,10 +13535,24 @@ pub fn count_embedded_memories(conn: &Connection) -> Result<i64> {
 /// malformed are logged and skipped (the alternative — bailing the entire
 /// HNSW build — would take the whole semantic-search surface offline for one
 /// corrupt row).
-pub fn get_all_embeddings(conn: &Connection) -> Result<Vec<(String, Vec<f32>)>> {
-    let mut stmt =
-        conn.prepare("SELECT id, embedding FROM memories WHERE embedding IS NOT NULL")?;
-    let rows = stmt.query_map([], |row| {
+///
+/// v1.0.0 #2167 §3.3 layer 1 — the HNSW seed set is filtered to the
+/// ACTIVE embedding space in SQL (`AND embedding_space = ?1`): a
+/// foreign-fingerprint vector never enters the ANN index in the first
+/// place, so it can never be an ANN candidate. NULL-space rows are also
+/// excluded (SQL `NULL = ?1` is false) — after §5 boot adoption a
+/// dim-matching NULL row would already have been stamped active, so a
+/// surviving NULL row is a genuinely-unverified vector that must not be
+/// indexed. The §1 partial index keeps this cheap.
+pub fn get_all_embeddings(
+    conn: &Connection,
+    active_space: &str,
+) -> Result<Vec<(String, Vec<f32>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, embedding FROM memories \
+         WHERE embedding IS NOT NULL AND embedding_space = ?1",
+    )?;
+    let rows = stmt.query_map(params![active_space], |row| {
         let id: String = row.get(0)?;
         let bytes: Vec<u8> = row.get(1)?;
         Ok((id, bytes))
@@ -13377,6 +13613,8 @@ pub fn recall_hybrid(
     source_uri_prefix: Option<&str>,
     // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
     caller: Option<&str>,
+    // v1.0.0 #2167 §3 — active embedder space fingerprint. See [`recall`].
+    active_space: Option<&str>,
 ) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
     let (results, outcome, _telemetry) = recall_hybrid_with_telemetry(
         conn,
@@ -13396,6 +13634,7 @@ pub fn recall_hybrid(
         include_archived,
         source_uri_prefix,
         caller,
+        active_space,
     )?;
     Ok((results, outcome))
 }
@@ -13426,6 +13665,8 @@ pub fn recall_hybrid_precomputed_hnsw(
     source_uri_prefix: Option<&str>,
     // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
     caller: Option<&str>,
+    // v1.0.0 #2167 §3 — active embedder space fingerprint. See [`recall`].
+    active_space: Option<&str>,
 ) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
     let (results, outcome, _telemetry) = recall_hybrid_with_telemetry_precomputed_hnsw(
         conn,
@@ -13445,6 +13686,7 @@ pub fn recall_hybrid_precomputed_hnsw(
         include_archived,
         source_uri_prefix,
         caller,
+        active_space,
     )?;
     Ok((results, outcome))
 }
@@ -13594,7 +13836,7 @@ fn fts_keyword_phase(
     since: Option<&str>,
     until: Option<&str>,
     limit: usize,
-) -> Result<Vec<(Memory, f64, Option<Vec<u8>>)>> {
+) -> Result<Vec<(Memory, f64, Option<Vec<u8>>, Option<String>)>> {
     // #1909 — same unclamped public `limit`; guard the multiply against
     // overflow (panic in overflow-checks builds, silent wrap in release).
     let fts_limit = limit.saturating_mul(3).max(30);
@@ -13611,6 +13853,12 @@ fn fts_keyword_phase(
                 -- so the embedding index is unchanged; row_to_memory + the
                 -- fts_score read are by-name and unaffected.
                 m.encrypted_envelope,
+                -- v1.0.0 #2167 — the per-row embedding_space provenance
+                -- token (positional index 27, read by row.get(27)); the
+                -- fusion stage gates the inline cosine through
+                -- cosine_similarity_space_checked. Appended AFTER
+                -- encrypted_envelope so the embedding index 25 is unchanged.
+                m.embedding_space,
                 (fts.rank * -1) + (m.priority * 0.5) + (MIN(m.access_count, 50) * 0.1)
                 + (m.confidence * 2.0)
                 + (CASE m.tier WHEN 'long' THEN 3.0 WHEN 'mid' THEN 1.0 ELSE 0.0 END)
@@ -13644,18 +13892,21 @@ fn fts_keyword_phase(
     // is small: the optional fragments expand to a handful of variants).
     let mut fts_stmt = conn.prepare_cached(&fts_sql)?;
     let fts_row_handler =
-        |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Memory, f64, Option<Vec<u8>>)> {
+        |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Memory, f64, Option<Vec<u8>>, Option<String>)> {
             let mem = row_to_memory(row)?;
             let fts_score: f64 = row.get("fts_score")?;
             // Index 25 = `m.embedding` (the SELECT list above places it
             // after `confidence_decayed_at`). Pull as `Option<Vec<u8>>`
             // so legacy rows without embeddings surface as `None`.
             let embedding_bytes: Option<Vec<u8>> = row.get(25)?;
-            Ok((mem, fts_score, embedding_bytes))
+            // v1.0.0 #2167 — index 27 = `m.embedding_space` (after
+            // `m.encrypted_envelope` at 26). `None` = SQL NULL (unverified).
+            let embedding_space: Option<String> = row.get(27)?;
+            Ok((mem, fts_score, embedding_bytes, embedding_space))
         };
     let (vis_p, vis_t, vis_u, vis_o) = prep.prefixes.clone();
     let caller = prep.caller.as_deref();
-    let rows: Vec<(Memory, f64, Option<Vec<u8>>)> =
+    let rows: Vec<(Memory, f64, Option<Vec<u8>>, Option<String>)> =
         if let Some(ref uri_param) = prep.source_uri_like_param {
             fts_stmt
                 .query_map(
@@ -13793,6 +14044,18 @@ fn semantic_phase(
     // disagrees with `query_embedding` (embedder-model switch). Accumulated
     // across the whole recall and surfaced via telemetry + an aggregated warn.
     dim_mismatch_count: &mut usize,
+    // v1.0.0 #2167 §3 — the active embedder's space fingerprint. `Some(fp)`
+    // gates every stored vector through `cosine_similarity_space_checked`;
+    // `None` (no live embedder / keyword-only) skips the space axis (the dim
+    // gate still applies) — semantic scoring is moot without an active space.
+    active_space: Option<&str>,
+    // v1.0.0 #2167 §3.2 — bumped when a stored vector is VERIFIED in a
+    // different space than the active one (excluded from semantic scoring).
+    space_mismatch_count: &mut usize,
+    // v1.0.0 #2167 §3.2 — bumped when a stored vector has NO provenance
+    // token (NULL post-adoption), or (HNSW site) its row-side vector cannot
+    // be re-verified. Excluded from semantic scoring.
+    unverified_space_count: &mut usize,
 ) -> Result<usize> {
     let mut hnsw_candidates_count: usize = 0;
     let now = prep.now.as_str();
@@ -13871,26 +14134,50 @@ fn semantic_phase(
             // dims differ (after an embedder swap): a wrong-but-finite cosine
             // that the >0.2 gate lets through, ranking garbage while
             // `dim_mismatch_count` stays 0. Recompute against the stored
-            // embedding with the checked comparator (the same #1584-guarded
-            // path the FTS + linear-scan branches use) and count + skip a
-            // dimension mismatch instead of trusting `hit.distance`. For a
-            // same-dim hit the checked cosine equals `1.0 - hit.distance`
-            // (both reduce to the dot product), so valid hits are unchanged.
-            let cosine = match stored_embeddings.get(&id) {
-                Some(stored) => match crate::embeddings::Embedder::cosine_similarity_checked(
+            // embedding (the same #1584-guarded path the FTS + linear-scan
+            // branches use) and count + skip instead of trusting `hit.distance`.
+            //
+            // v1.0.0 #2167 §3.2 site 3 + §3.3 layer 3 (defensive post-filter):
+            // when an active space is known, gate every ANN hit row-side
+            // through `cosine_similarity_space_checked` — even a vector that
+            // somehow entered the graph in a foreign space can never be scored
+            // or returned. `_ = cosine;` — the HNSW distance-derived cosine is
+            // NEVER trusted; the row-side recompute is authoritative.
+            let _ = cosine;
+            let Some((stored, stored_space)) = stored_embeddings.get(&id) else {
+                // #1692 residual (§3.2 site 3): the row is absent from the
+                // batch (vector deleted since the index was built, or an
+                // undecodable blob). An index hit whose row-side vector cannot
+                // be re-verified is an unverifiable comparison — exactly what
+                // the invariant forbids. DELETE the pre-#2167 fall-back to
+                // `hit.distance`; exclude + count instead.
+                *unverified_space_count += 1;
+                continue;
+            };
+            let comparison = if let Some(active) = active_space {
+                crate::embeddings::Embedder::cosine_similarity_space_checked(
                     query_embedding,
                     stored,
-                ) {
-                    crate::embeddings::CosineComparison::Comparable(c) => f64::from(c),
-                    crate::embeddings::CosineComparison::DimensionMismatch { .. } => {
-                        *dim_mismatch_count += 1;
-                        continue;
-                    }
-                },
-                // Legacy row with no stored embedding (or an undecodable blob):
-                // fall back to the HNSW distance-derived cosine rather than
-                // dropping — same arm the per-hit `get_embedding` None/Err took.
-                None => cosine,
+                    active,
+                    stored_space.as_deref(),
+                )
+            } else {
+                crate::embeddings::Embedder::cosine_similarity_checked(query_embedding, stored)
+            };
+            let cosine = match comparison {
+                crate::embeddings::CosineComparison::Comparable(c) => f64::from(c),
+                crate::embeddings::CosineComparison::DimensionMismatch { .. } => {
+                    *dim_mismatch_count += 1;
+                    continue;
+                }
+                crate::embeddings::CosineComparison::SpaceMismatch { .. } => {
+                    *space_mismatch_count += 1;
+                    continue;
+                }
+                crate::embeddings::CosineComparison::UnverifiedSpace => {
+                    *unverified_space_count += 1;
+                    continue;
+                }
             };
             if let Some(ns) = namespace {
                 if prep.hierarchy_active {
@@ -13965,7 +14252,7 @@ fn semantic_phase(
         "SELECT id, tier, namespace, title, content, tags, priority,
                 confidence, source, access_count, created_at, updated_at,
                 last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, embedding,
-                encrypted_envelope
+                encrypted_envelope, embedding_space
          FROM memories
          WHERE embedding IS NOT NULL
            AND (?1 IS NULL OR namespace = ?1)
@@ -13988,17 +14275,22 @@ fn semantic_phase(
     );
     // #1579 B6 — same prepare_cached treatment as the FTS branch above.
     let mut sem_stmt = conn.prepare_cached(&sem_sql)?;
-    let sem_row_handler = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Memory, Option<Vec<u8>>)> {
-        let mem = row_to_memory(row)?;
-        // v0.7.x Form 6 — `memory_kind` was inserted between
-        // `reflection_depth` and `embedding` in the SELECT list
-        // above; `embedding` sits at zero-based index 17.
-        let emb_bytes: Option<Vec<u8>> = row.get(17)?;
-        Ok((mem, emb_bytes))
-    };
+    let sem_row_handler =
+        |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Memory, Option<Vec<u8>>, Option<String>)> {
+            let mem = row_to_memory(row)?;
+            // v0.7.x Form 6 — `memory_kind` was inserted between
+            // `reflection_depth` and `embedding` in the SELECT list
+            // above; `embedding` sits at zero-based index 17.
+            let emb_bytes: Option<Vec<u8>> = row.get(17)?;
+            // v1.0.0 #2167 — `embedding_space` appended AFTER
+            // `encrypted_envelope` (index 18) so the pinned `row.get(17)`
+            // for `embedding` stays valid; read positionally at index 19.
+            let emb_space: Option<String> = row.get(19)?;
+            Ok((mem, emb_bytes, emb_space))
+        };
     let (vis_p, vis_t, vis_u, vis_o) = prep.prefixes.clone();
     let caller = prep.caller.as_deref();
-    let sem_results: Vec<(Memory, Option<Vec<u8>>)> =
+    let sem_results: Vec<(Memory, Option<Vec<u8>>, Option<String>)> =
         if let Some(ref uri_param) = prep.source_uri_like_param {
             sem_stmt
                 .query_map(
@@ -14037,7 +14329,7 @@ fn semantic_phase(
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-    for (mem, emb_bytes) in sem_results {
+    for (mem, emb_bytes, emb_space) in sem_results {
         if scored.contains_key(&mem.id) {
             continue;
         }
@@ -14054,18 +14346,38 @@ fn semantic_phase(
                 );
                 continue;
             };
-            let cosine =
-                match crate::embeddings::Embedder::cosine_similarity_checked(query_embedding, &emb)
-                {
-                    crate::embeddings::CosineComparison::Comparable(c) => f64::from(c),
-                    crate::embeddings::CosineComparison::DimensionMismatch { .. } => {
-                        // v0.7.0 H7 — stored embedding came from a different
-                        // embedder model; counted (not silently dropped) so the
-                        // aggregated warn + telemetry can flag the model switch.
-                        *dim_mismatch_count += 1;
-                        continue;
-                    }
-                };
+            // v1.0.0 #2167 §3.2 site 2 — space→dim→score gate on the
+            // linear-scan branch. A foreign / unverified vector is skipped
+            // + counted (never scored); it stays keyword-recallable via the
+            // FTS branch.
+            let comparison = if let Some(active) = active_space {
+                crate::embeddings::Embedder::cosine_similarity_space_checked(
+                    query_embedding,
+                    &emb,
+                    active,
+                    emb_space.as_deref(),
+                )
+            } else {
+                crate::embeddings::Embedder::cosine_similarity_checked(query_embedding, &emb)
+            };
+            let cosine = match comparison {
+                crate::embeddings::CosineComparison::Comparable(c) => f64::from(c),
+                crate::embeddings::CosineComparison::DimensionMismatch { .. } => {
+                    // v0.7.0 H7 — stored embedding came from a different
+                    // embedder model; counted (not silently dropped) so the
+                    // aggregated warn + telemetry can flag the model switch.
+                    *dim_mismatch_count += 1;
+                    continue;
+                }
+                crate::embeddings::CosineComparison::SpaceMismatch { .. } => {
+                    *space_mismatch_count += 1;
+                    continue;
+                }
+                crate::embeddings::CosineComparison::UnverifiedSpace => {
+                    *unverified_space_count += 1;
+                    continue;
+                }
+            };
             if cosine > crate::RECALL_COSINE_GATE {
                 scored.insert(mem.id.clone(), (mem, 0.0, cosine));
                 hnsw_candidates_count += 1;
@@ -14183,6 +14495,8 @@ fn assemble_recall_telemetry(
     hnsw_candidates: usize,
     blend_weights: &[f64],
     embedding_dim_mismatch: usize,
+    embedding_space_mismatch: usize,
+    embedding_unverified_space: usize,
 ) -> crate::models::RecallTelemetry {
     let blend_weight_avg = if blend_weights.is_empty() {
         0.0
@@ -14196,6 +14510,8 @@ fn assemble_recall_telemetry(
         hnsw_candidates,
         blend_weight_avg,
         embedding_dim_mismatch,
+        embedding_space_mismatch,
+        embedding_unverified_space,
     }
 }
 
@@ -14225,6 +14541,8 @@ pub fn recall_hybrid_with_telemetry(
     source_uri_prefix: Option<&str>,
     // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
     caller: Option<&str>,
+    // v1.0.0 #2167 §3 — active embedder space fingerprint. See [`recall`].
+    active_space: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -14249,6 +14567,7 @@ pub fn recall_hybrid_with_telemetry(
         include_archived,
         source_uri_prefix,
         caller,
+        active_space,
     )
 }
 
@@ -14289,6 +14608,8 @@ pub fn recall_hybrid_with_telemetry_precomputed_hnsw(
     source_uri_prefix: Option<&str>,
     // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
     caller: Option<&str>,
+    // v1.0.0 #2167 §3 — active embedder space fingerprint. See [`recall`].
+    active_space: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -14313,6 +14634,7 @@ pub fn recall_hybrid_with_telemetry_precomputed_hnsw(
         include_archived,
         source_uri_prefix,
         caller,
+        active_space,
     )
 }
 
@@ -14343,6 +14665,10 @@ fn recall_hybrid_with_telemetry_inner(
     source_uri_prefix: Option<&str>,
     // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
     caller: Option<&str>,
+    // v1.0.0 #2167 §3 — the live embedder's space fingerprint (`Some` for
+    // a semantic recall, `None` for keyword-only / no embedder). Gates the
+    // FTS + semantic branches through `cosine_similarity_space_checked`.
+    active_space: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -14383,7 +14709,12 @@ fn recall_hybrid_with_telemetry_inner(
     // disagrees with the active model's `query_embedding` across BOTH the
     // FTS branch (here) and the semantic linear-scan branch (below).
     let mut dim_mismatch_count: usize = 0;
-    for (mem, fts_score, embedding_bytes) in fts_results {
+    // v1.0.0 #2167 §3.2 — space-provenance counters, accumulated across
+    // the FTS branch (here) + the semantic phase (below) exactly like
+    // `dim_mismatch_count`.
+    let mut space_mismatch_count: usize = 0;
+    let mut unverified_space_count: usize = 0;
+    for (mem, fts_score, embedding_bytes, embedding_space) in fts_results {
         if fts_score > max_fts_score {
             max_fts_score = fts_score;
         }
@@ -14393,19 +14724,44 @@ fn recall_hybrid_with_telemetry_inner(
         let cosine = match embedding_bytes {
             Some(bytes) if !bytes.is_empty() => {
                 match crate::embeddings::decode_embedding_blob(&bytes) {
-                    Ok(emb) => match crate::embeddings::Embedder::cosine_similarity_checked(
-                        query_embedding,
-                        &emb,
-                    ) {
-                        crate::embeddings::CosineComparison::Comparable(c) => f64::from(c),
-                        crate::embeddings::CosineComparison::DimensionMismatch { .. } => {
-                            // v0.7.0 H7 — embedder-model switch: count the
-                            // stale-dimension row instead of letting it score a
-                            // silent 0.0 cosine. FTS keyword score still applies.
-                            dim_mismatch_count += 1;
-                            0.0
+                    // v1.0.0 #2167 §3.2 site 1 — the FTS branch is the
+                    // degraded-not-invisible guarantee: a space/dim-excluded
+                    // row keeps its FTS keyword score and stays recallable,
+                    // its semantic cosine forced to 0.0 + counted. Never a
+                    // `continue` (that would make the row invisible).
+                    Ok(emb) => {
+                        let comparison = if let Some(active) = active_space {
+                            crate::embeddings::Embedder::cosine_similarity_space_checked(
+                                query_embedding,
+                                &emb,
+                                active,
+                                embedding_space.as_deref(),
+                            )
+                        } else {
+                            crate::embeddings::Embedder::cosine_similarity_checked(
+                                query_embedding,
+                                &emb,
+                            )
+                        };
+                        match comparison {
+                            crate::embeddings::CosineComparison::Comparable(c) => f64::from(c),
+                            crate::embeddings::CosineComparison::DimensionMismatch { .. } => {
+                                // v0.7.0 H7 — embedder-model switch: count the
+                                // stale-dimension row instead of letting it score
+                                // a silent 0.0. FTS keyword score still applies.
+                                dim_mismatch_count += 1;
+                                0.0
+                            }
+                            crate::embeddings::CosineComparison::SpaceMismatch { .. } => {
+                                space_mismatch_count += 1;
+                                0.0
+                            }
+                            crate::embeddings::CosineComparison::UnverifiedSpace => {
+                                unverified_space_count += 1;
+                                0.0
+                            }
                         }
-                    },
+                    }
                     Err(_) => {
                         tracing::warn!(
                             memory_id = %mem.id,
@@ -14440,6 +14796,9 @@ fn recall_hybrid_with_telemetry_inner(
         source_uri_prefix,
         &mut scored,
         &mut dim_mismatch_count,
+        active_space,
+        &mut space_mismatch_count,
+        &mut unverified_space_count,
     )?;
 
     // v0.7.0 H7 — de-silence embedder-model switches. A non-zero count means
@@ -14454,6 +14813,21 @@ fn recall_hybrid_with_telemetry_inner(
             "recall skipped {dim_mismatch_count} stored embedding(s) with mismatched \
              dimensionality — the embedder model appears to have changed; re-embed the \
              affected memories to restore their semantic recall signal"
+        );
+    }
+    // v1.0.0 #2167 §3.2 site 4 — de-silence embedding-SPACE mismatches
+    // (a same-dim model swap the dim gate cannot catch) + unverified
+    // (NULL-provenance) rows. One aggregated WARN per recall naming the
+    // active fingerprint + the heal commands (M-LOG-STRUCTURED).
+    if space_mismatch_count > 0 || unverified_space_count > 0 {
+        tracing::warn!(
+            space_mismatch_count,
+            unverified_space_count,
+            active_space = active_space.unwrap_or("<none>"),
+            "recall excluded {space_mismatch_count} foreign-space + {unverified_space_count} \
+             unverified stored embedding(s) from semantic scoring (they remain \
+             keyword-recallable) — run `ai-memory reembed` to re-derive them under the active \
+             embedding space, or `ai-memory reembed --stamp-only` to attest matching-dim rows"
         );
     }
 
@@ -14477,6 +14851,8 @@ fn recall_hybrid_with_telemetry_inner(
         hnsw_candidates_count,
         &blend_weights,
         dim_mismatch_count,
+        space_mismatch_count,
+        unverified_space_count,
     );
 
     Ok((budgeted, outcome, telemetry))
