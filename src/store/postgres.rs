@@ -4606,7 +4606,7 @@ impl PostgresStore {
                     (id, tier, namespace, title, content, tags, priority, confidence,
                      source, access_count, created_at, updated_at, last_accessed_at,
                      expires_at, archived_at, archive_reason, metadata,
-                     embedding, embedding_dim, original_tier, original_expires_at,
+                     embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                      reflection_depth, atomised_into, atom_of, memory_kind,
                      entity_id, persona_version, citations, source_uri, source_span,
                      confidence_source, confidence_signals, confidence_decayed_at,
@@ -4614,7 +4614,7 @@ impl PostgresStore {
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, NOW(), $2, metadata,
-                        embedding, embedding_dim, tier, expires_at,
+                        embedding, embedding_dim, embedding_space, tier, expires_at,
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
@@ -5000,7 +5000,7 @@ impl PostgresStore {
                 (id, tier, namespace, title, content, tags, priority, confidence,
                  source, access_count, created_at, updated_at, last_accessed_at,
                  expires_at, archived_at, archive_reason, metadata,
-                 embedding, embedding_dim, original_tier, original_expires_at,
+                 embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                  reflection_depth, atomised_into, atom_of, memory_kind,
                  entity_id, persona_version, citations, source_uri, source_span,
                  confidence_source, confidence_signals, confidence_decayed_at,
@@ -5008,7 +5008,7 @@ impl PostgresStore {
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, NOW(), 'superseded', metadata,
-                    embedding, embedding_dim, tier, expires_at,
+                    embedding, embedding_dim, embedding_space, tier, expires_at,
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
@@ -14688,7 +14688,7 @@ impl MemoryStore for PostgresStore {
                     (id, tier, namespace, title, content, tags, priority, confidence,
                      source, access_count, created_at, updated_at, last_accessed_at,
                      expires_at, archived_at, archive_reason, metadata,
-                     embedding, embedding_dim, original_tier, original_expires_at,
+                     embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                      reflection_depth, atomised_into, atom_of, memory_kind,
                      entity_id, persona_version, citations, source_uri, source_span,
                      confidence_source, confidence_signals, confidence_decayed_at,
@@ -14696,7 +14696,7 @@ impl MemoryStore for PostgresStore {
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, NOW(), $2, metadata,
-                        embedding, embedding_dim, tier, expires_at,
+                        embedding, embedding_dim, embedding_space, tier, expires_at,
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
@@ -17445,7 +17445,7 @@ impl MemoryStore for PostgresStore {
                     id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, archived_at, archive_reason, metadata,
-                    embedding, embedding_dim, original_tier, original_expires_at,
+                    embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                     -- #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
@@ -17455,7 +17455,7 @@ impl MemoryStore for PostgresStore {
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
                        expires_at, $4::timestamptz, 'forget', metadata,
-                       embedding, embedding_dim, tier, expires_at,
+                       embedding, embedding_dim, embedding_space, tier, expires_at,
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
@@ -19577,7 +19577,7 @@ impl MemoryStore for PostgresStore {
                     id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, archived_at, archive_reason, metadata,
-                    embedding, embedding_dim, original_tier, original_expires_at,
+                    embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                     -- #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
@@ -19587,7 +19587,7 @@ impl MemoryStore for PostgresStore {
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
                        expires_at, $1::timestamptz, 'ttl_expired', metadata,
-                       embedding, embedding_dim, tier, expires_at,
+                       embedding, embedding_dim, embedding_space, tier, expires_at,
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
@@ -19728,7 +19728,7 @@ impl MemoryStore for PostgresStore {
                         id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, archived_at, archive_reason, metadata,
-                        embedding, embedding_dim, original_tier, original_expires_at,
+                        embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
@@ -19737,7 +19737,7 @@ impl MemoryStore for PostgresStore {
                     SELECT id, tier, namespace, title, content, tags, priority, confidence,
                            source, access_count, created_at, updated_at, last_accessed_at,
                            expires_at, now(), 'size_gc', metadata,
-                           embedding, embedding_dim, tier, expires_at,
+                           embedding, embedding_dim, embedding_space, tier, expires_at,
                            reflection_depth, atomised_into, atom_of, memory_kind,
                            entity_id, persona_version, citations, source_uri, source_span,
                            confidence_source, confidence_signals, confidence_decayed_at,
@@ -19903,7 +19903,7 @@ impl MemoryStore for PostgresStore {
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
-                expires_at, metadata, embedding, embedding_dim,
+                expires_at, metadata, embedding, embedding_dim, embedding_space,
                 reflection_depth, atomised_into, atom_of, memory_kind,
                 entity_id, persona_version, citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
@@ -19913,7 +19913,22 @@ impl MemoryStore for PostgresStore {
             SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                    tags, priority, confidence, source, access_count, created_at,
                    $1::timestamptz, last_accessed_at, original_expires_at, metadata,
-                   embedding, embedding_dim,
+                   -- v1.0.0 #2167 (S8) restore/migrate HEAL (postgres twin):
+                   -- keep the archived vector ONLY when its space matches the
+                   -- live active space ($5); a foreign- or NULL-space vector
+                   -- has its whole trio NULLed so the boot backfill re-embeds
+                   -- from the durable text under the LIVE space (self-heal).
+                   -- $5 NULL (no active embedder in this process) keeps any
+                   -- STAMPED vector but still drops an unverifiable NULL one.
+                   CASE WHEN embedding_space IS NOT NULL
+                             AND ($5::text IS NULL OR embedding_space = $5)
+                        THEN embedding ELSE NULL END,
+                   CASE WHEN embedding_space IS NOT NULL
+                             AND ($5::text IS NULL OR embedding_space = $5)
+                        THEN embedding_dim ELSE NULL END,
+                   CASE WHEN embedding_space IS NOT NULL
+                             AND ($5::text IS NULL OR embedding_space = $5)
+                        THEN embedding_space ELSE NULL END,
                    COALESCE(reflection_depth, 0),
                    atomised_into,
                    atom_of,
@@ -19934,6 +19949,9 @@ impl MemoryStore for PostgresStore {
         .bind(id)
         .bind(&restored_cid.cid)
         .bind(&restored_cid.genesis)
+        // v1.0.0 #2167 (S8) — $5: the process-wide active-space fp (NULL when
+        // this process resolved no embedder) driving the restore heal above.
+        .bind(crate::embeddings::active_embedding_space())
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("archive_restore insert", e))?;
@@ -20088,7 +20106,7 @@ impl MemoryStore for PostgresStore {
                     id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, archived_at, archive_reason, metadata,
-                    embedding, embedding_dim, original_tier, original_expires_at,
+                    embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                     -- #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
@@ -20098,7 +20116,7 @@ impl MemoryStore for PostgresStore {
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
                        expires_at, $1::timestamptz, $2::text, metadata,
-                       embedding, embedding_dim, tier, expires_at,
+                       embedding, embedding_dim, embedding_space, tier, expires_at,
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,

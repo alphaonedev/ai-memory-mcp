@@ -4885,6 +4885,12 @@ pub async fn bootstrap_serve(
         // read-only / locked DB degrades to a skipped WARN, never an error
         // (recall then treats those rows as excluded — safe, degraded).
         let active_fp = emb.space_fingerprint();
+        // v1.0.0 #2167 (S8) — seed the process-wide active-space so the
+        // archive-RESTORE heal can classify a restored row's carried space
+        // (active → keep vector; foreign/NULL → NULL the trio → backfill
+        // re-embeds). Seeded here (not only at census) so restore works
+        // even when the boot-maintenance DB open below fails.
+        crate::embeddings::set_active_embedding_space(Some(active_fp.clone()));
         match db::open(db_path) {
             Ok(boot_conn) => {
                 db::embedding_space_boot_maintenance(&boot_conn, &active_fp, emb.dim());

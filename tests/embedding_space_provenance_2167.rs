@@ -167,13 +167,24 @@ fn t_inv_1_semantic_never_scores_foreign_or_null_space() {
     let ids: std::collections::HashSet<&str> = results.iter().map(|(m, _)| m.id.as_str()).collect();
     assert_eq!(
         ids,
-        [a1.as_str(), a2.as_str(), a3.as_str()].into_iter().collect(),
+        [a1.as_str(), a2.as_str(), a3.as_str()]
+            .into_iter()
+            .collect(),
         "semantic recall must return ONLY active-space rows; got {ids:?}"
     );
     // Counts reconcile with the seeded population.
-    assert_eq!(tel.embedding_space_mismatch, 2, "2 foreign-space rows excluded + counted");
-    assert_eq!(tel.embedding_unverified_space, 1, "1 NULL-space row excluded + counted");
-    assert_eq!(tel.embedding_dim_mismatch, 1, "1 cross-dim active row excluded + counted");
+    assert_eq!(
+        tel.embedding_space_mismatch, 2,
+        "2 foreign-space rows excluded + counted"
+    );
+    assert_eq!(
+        tel.embedding_unverified_space, 1,
+        "1 NULL-space row excluded + counted"
+    );
+    assert_eq!(
+        tel.embedding_dim_mismatch, 1,
+        "1 cross-dim active row excluded + counted"
+    );
 }
 
 #[test]
@@ -184,7 +195,11 @@ fn t_inv_1_foreign_row_stays_keyword_recallable_degraded_not_invisible() {
     let qe = [1.0_f32, 0.0, 0.0, 0.0];
 
     // A foreign-space row whose CONTENT matches the FTS query.
-    let fid = db::insert(&conn, &make_memory("kubernetes readiness probe", "kubernetes readiness")).unwrap();
+    let fid = db::insert(
+        &conn,
+        &make_memory("kubernetes readiness probe", "kubernetes readiness"),
+    )
+    .unwrap();
     db::set_embedding(&conn, &fid, &qe, &foreign).unwrap();
 
     let (results, tel) = recall(&conn, "kubernetes readiness", &qe, Some(&active));
@@ -210,7 +225,10 @@ fn t_inv_1_none_active_skips_gate_legacy_dim_only() {
     let fid = seed_embedded(&conn, "foreign scored when active none", &qe, &foreign);
     let (results, tel) = recall(&conn, "zzznoftshitzzz", &qe, None);
     let ids: Vec<&str> = results.iter().map(|(m, _)| m.id.as_str()).collect();
-    assert!(ids.contains(&fid.as_str()), "None active -> no space gate -> row scored");
+    assert!(
+        ids.contains(&fid.as_str()),
+        "None active -> no space gate -> row scored"
+    );
     assert_eq!(tel.embedding_space_mismatch, 0);
     assert_eq!(tel.embedding_unverified_space, 0);
 }
@@ -232,7 +250,11 @@ fn t_funnel_set_embedding_stamps_active_space() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(stamped.as_deref(), Some(fp.as_str()), "vector + space stamped together");
+    assert_eq!(
+        stamped.as_deref(),
+        Some(fp.as_str()),
+        "vector + space stamped together"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -252,7 +274,11 @@ fn adoption_a_stamps_null_dim_matching_rows() {
     let stamped = db::adopt_legacy_embedding_space(&conn, &active, 4).unwrap();
     assert_eq!(stamped, 2, "no-nuke: both dim-matching NULL rows adopted");
     let census = db::distinct_embedding_spaces(&conn, None).unwrap();
-    assert_eq!(census, vec![(Some(active), 2)], "corpus is now homogeneous-active");
+    assert_eq!(
+        census,
+        vec![(Some(active), 2)],
+        "corpus is now homogeneous-active"
+    );
 }
 
 #[test]
@@ -261,7 +287,12 @@ fn adoption_d_g2_refuses_on_mixed_history() {
     let active = embedding_space_fingerprint("nomic-embed-text");
     let foreign = embedding_space_fingerprint("granite-embedding");
     // A row already stamped in a DIFFERENT space proves multi-space history.
-    seed_embedded(&conn, "foreign stamped", &[1.0_f32, 0.0, 0.0, 0.0], &foreign);
+    seed_embedded(
+        &conn,
+        "foreign stamped",
+        &[1.0_f32, 0.0, 0.0, 0.0],
+        &foreign,
+    );
     // A NULL row that adoption would otherwise stamp.
     let nid = seed_embedded(&conn, "null candidate", &[0.0_f32, 1.0, 0.0, 0.0], &active);
     null_out_space(&conn, &nid);
@@ -275,7 +306,10 @@ fn adoption_d_g2_refuses_on_mixed_history() {
             |r| r.get(0),
         )
         .unwrap();
-    assert!(still_null.is_none(), "the NULL row stays excluded until reembed");
+    assert!(
+        still_null.is_none(),
+        "the NULL row stays excluded until reembed"
+    );
 }
 
 #[test]
@@ -284,7 +318,12 @@ fn adoption_e_g1_strict_disables_adoption() {
     // must NOT stamp under strict.
     let (conn, _p) = fresh_db();
     let active = embedding_space_fingerprint("nomic-embed-text");
-    let nid = seed_embedded(&conn, "null under strict", &[1.0_f32, 0.0, 0.0, 0.0], &active);
+    let nid = seed_embedded(
+        &conn,
+        "null under strict",
+        &[1.0_f32, 0.0, 0.0, 0.0],
+        &active,
+    );
     null_out_space(&conn, &nid);
 
     ai_memory::hnsw::set_strict_embed_model_match_for_test(Some(true));
@@ -298,7 +337,10 @@ fn adoption_e_g1_strict_disables_adoption() {
             |r| r.get(0),
         )
         .unwrap();
-    assert!(still_null.is_none(), "[G1] strict: adoption disabled, NULL row untouched");
+    assert!(
+        still_null.is_none(),
+        "[G1] strict: adoption disabled, NULL row untouched"
+    );
 }
 
 #[test]
@@ -320,5 +362,195 @@ fn adoption_dim_mismatch_row_not_stamped() {
             |r| r.get(0),
         )
         .unwrap();
-    assert!(bad_space.is_none(), "the non-active-dim NULL row stays excluded");
+    assert!(
+        bad_space.is_none(),
+        "the non-active-dim NULL row stays excluded"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T-restore (§8) — archive→restore HEAL. The archive path carries the
+// `embedding_space` stamp; on restore, an active-space vector round-trips
+// INTACT (no re-embed), while a foreign- or NULL-space vector has its whole
+// embedding trio NULLed so the `embedding IS NULL` backfill re-embeds it from
+// the durable text under the LIVE space = SELF-HEAL. These tests drive the
+// process-wide active-space global (`set_active_embedding_space`), so they
+// serialize on a shared lock (the global is shared across the parallel test
+// threads).
+// ---------------------------------------------------------------------------
+
+/// Serializes the S8 tests that mutate the process-wide active-space global.
+static ACTIVE_SPACE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Read a live row's `(embedding_present, embedding_space)` via raw SQL.
+fn row_emb_state(conn: &rusqlite::Connection, id: &str) -> (bool, Option<String>) {
+    conn.query_row(
+        "SELECT embedding IS NOT NULL, embedding_space FROM memories WHERE id = ?1",
+        rusqlite::params![id],
+        |r| Ok((r.get::<_, bool>(0)?, r.get::<_, Option<String>>(1)?)),
+    )
+    .unwrap()
+}
+
+#[test]
+fn t_restore_active_space_row_round_trips_intact() {
+    let _guard = ACTIVE_SPACE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (conn, _p) = fresh_db();
+    let active = embedding_space_fingerprint("nomic-embed-text");
+    ai_memory::embeddings::set_active_embedding_space(Some(active.clone()));
+
+    let qe = [1.0_f32, 0.0, 0.0, 0.0];
+    let id = seed_embedded(&conn, "active round trip", &qe, &active);
+
+    // Archive (carries the stamp) then restore (heal keeps active vectors).
+    assert!(db::archive_memory(&conn, &id, Some("test")).unwrap());
+    assert!(db::restore_archived(&conn, &id).unwrap());
+
+    let (present, space) = row_emb_state(&conn, &id);
+    assert!(
+        present,
+        "active-space vector must restore INTACT (no re-embed)"
+    );
+    assert_eq!(
+        space.as_deref(),
+        Some(active.as_str()),
+        "space stamp preserved"
+    );
+    // Not a backfill target — no needless re-embed on a homogeneous corpus.
+    let pending: Vec<String> = db::get_unembedded_ids(&conn)
+        .unwrap()
+        .into_iter()
+        .map(|(i, _, _)| i)
+        .collect();
+    assert!(
+        !pending.contains(&id),
+        "active-space restore must NOT need re-embed"
+    );
+    // And it is semantic-recallable under the active space.
+    let (results, _tel) = recall(&conn, "zzznoftshitzzz", &qe, Some(&active));
+    assert!(
+        results.iter().any(|(m, _)| m.id == id),
+        "restored active-space row is semantic-recallable"
+    );
+
+    ai_memory::embeddings::set_active_embedding_space(None);
+}
+
+#[test]
+fn t_restore_foreign_space_row_nulled_then_backfill_reheals() {
+    let _guard = ACTIVE_SPACE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (conn, _p) = fresh_db();
+    let active = embedding_space_fingerprint("nomic-embed-text");
+    let foreign = embedding_space_fingerprint("granite-embedding"); // same dim, other space
+    assert_ne!(active, foreign);
+    ai_memory::embeddings::set_active_embedding_space(Some(active.clone()));
+
+    let qe = [1.0_f32, 0.0, 0.0, 0.0];
+    let id = seed_embedded(&conn, "foreign restore", &qe, &foreign);
+
+    assert!(db::archive_memory(&conn, &id, Some("test")).unwrap());
+    assert!(db::restore_archived(&conn, &id).unwrap());
+
+    // Heal: foreign vector + dim + space all NULLed.
+    let (present, space) = row_emb_state(&conn, &id);
+    assert!(!present, "foreign-space vector must be NULLed on restore");
+    assert!(
+        space.is_none(),
+        "foreign-space stamp NULLed with the vector"
+    );
+    // It IS a backfill target -> self-heal path is live.
+    let pending: Vec<String> = db::get_unembedded_ids(&conn)
+        .unwrap()
+        .into_iter()
+        .map(|(i, _, _)| i)
+        .collect();
+    assert!(
+        pending.contains(&id),
+        "foreign restore must become a backfill target"
+    );
+
+    // Simulate the backfill re-embedding it under the LIVE space -> recallable.
+    db::set_embedding(&conn, &id, &qe, &active).unwrap();
+    let (results, _tel) = recall(&conn, "zzznoftshitzzz", &qe, Some(&active));
+    assert!(
+        results.iter().any(|(m, _)| m.id == id),
+        "after re-embed the healed row is semantic-recallable under the active space"
+    );
+
+    ai_memory::embeddings::set_active_embedding_space(None);
+}
+
+#[test]
+fn t_restore_null_space_legacy_vector_nulled_then_backfill() {
+    // A legacy archived row (vector present, space NULL) restores with its
+    // unverifiable vector NULLed so backfill re-derives provenance.
+    let _guard = ACTIVE_SPACE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (conn, _p) = fresh_db();
+    let active = embedding_space_fingerprint("nomic-embed-text");
+    ai_memory::embeddings::set_active_embedding_space(Some(active.clone()));
+
+    let qe = [1.0_f32, 0.0, 0.0, 0.0];
+    let id = seed_embedded(&conn, "legacy null restore", &qe, &active);
+    null_out_space(&conn, &id); // vector present, provenance NULL
+
+    assert!(db::archive_memory(&conn, &id, Some("test")).unwrap());
+    assert!(db::restore_archived(&conn, &id).unwrap());
+
+    let (present, space) = row_emb_state(&conn, &id);
+    assert!(!present, "unverifiable NULL-space vector NULLed on restore");
+    assert!(space.is_none());
+    let pending: Vec<String> = db::get_unembedded_ids(&conn)
+        .unwrap()
+        .into_iter()
+        .map(|(i, _, _)| i)
+        .collect();
+    assert!(
+        pending.contains(&id),
+        "NULL-space restore becomes a backfill target"
+    );
+
+    ai_memory::embeddings::set_active_embedding_space(None);
+}
+
+#[test]
+fn t_restore_none_active_keeps_stamped_drops_unverified() {
+    // No active embedder in this process (keyword-only / CLI): a STAMPED
+    // vector rides through verbatim, but a NULL-provenance vector is still
+    // dropped (never re-introduce an unverifiable vector as valid).
+    let _guard = ACTIVE_SPACE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (conn, _p) = fresh_db();
+    let stamped_space = embedding_space_fingerprint("nomic-embed-text");
+    ai_memory::embeddings::set_active_embedding_space(None);
+
+    let qe = [1.0_f32, 0.0, 0.0, 0.0];
+    let stamped = seed_embedded(&conn, "stamped none-active", &qe, &stamped_space);
+    let legacy = seed_embedded(&conn, "legacy none-active", &qe, &stamped_space);
+    null_out_space(&conn, &legacy);
+
+    for id in [&stamped, &legacy] {
+        assert!(db::archive_memory(&conn, id, Some("test")).unwrap());
+        assert!(db::restore_archived(&conn, id).unwrap());
+    }
+
+    let (s_present, s_space) = row_emb_state(&conn, &stamped);
+    assert!(
+        s_present,
+        "None-active: a STAMPED vector rides through verbatim"
+    );
+    assert_eq!(s_space.as_deref(), Some(stamped_space.as_str()));
+
+    let (l_present, l_space) = row_emb_state(&conn, &legacy);
+    assert!(
+        !l_present,
+        "None-active: an unverifiable NULL-space vector is still NULLed"
+    );
+    assert!(l_space.is_none());
 }

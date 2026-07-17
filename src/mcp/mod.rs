@@ -3749,6 +3749,10 @@ pub fn run_mcp_server(
                 // space on newly-embedded rows) so the census reflects the
                 // fully-stamped corpus; the index seed (below) then filters
                 // to the active space.
+                // v1.0.0 #2167 (S8) — seed the process-wide active-space so
+                // the archive-RESTORE heal classifies restored rows against
+                // this process's live model.
+                crate::embeddings::set_active_embedding_space(Some(emb.space_fingerprint()));
                 db::embedding_space_boot_maintenance(&conn, &emb.space_fingerprint(), emb.dim());
                 Some(emb)
             }

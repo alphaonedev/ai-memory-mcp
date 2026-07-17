@@ -143,6 +143,46 @@ pub fn embedding_space_fingerprint(model: &str) -> String {
     format!("{id}#{scheme}")
 }
 
+/// v1.0.0 #2167 (S8 restore/migrate heal) — the process-wide ACTIVE
+/// embedding-space fingerprint, seeded once at every embedder-construction
+/// boot site (serve / mcp) from the resolved model, alongside the §5
+/// adoption + §6 census. Read by the archive-RESTORE heal
+/// ([`crate::storage::restore_archived`] /
+/// [`crate::storage::restore_archived_for_caller`] /
+/// `PostgresStore::archive_restore`) to classify a restored row's carried
+/// `embedding_space`:
+/// - space == active → the vector restores INTACT (no perf regression /
+///   no needless re-embed on a homogeneous corpus);
+/// - space != active OR (vector present but space NULL) → the whole
+///   embedding trio (`embedding`/`embedding_dim`/`embedding_space`) is
+///   NULLed so the existing `list_unembedded` backfill re-embeds the row
+///   from the durable text under the LIVE space = SELF-HEAL.
+///
+/// `None` (unseeded: a keyword-only process, or a CLI verb that resolved no
+/// embedder) makes the heal carry any STAMPED vector verbatim, but STILL
+/// NULLs a vector with NO provenance (`embedding_space IS NULL`) — an
+/// unverifiable vector is never re-introduced as valid. Degrade, never
+/// corrupt (North Star).
+static ACTIVE_EMBEDDING_SPACE: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Seed (or clear, with `None`) the process-wide active embedding-space
+/// fingerprint. Idempotent; the last writer wins. Called at every boot
+/// site that resolves an embedder, and by tests. A poisoned lock is
+/// tolerated (the seed is best-effort — a failed seed degrades the restore
+/// heal to its `None` posture, which is still safe).
+pub fn set_active_embedding_space(space: Option<String>) {
+    if let Ok(mut guard) = ACTIVE_EMBEDDING_SPACE.write() {
+        *guard = space;
+    }
+}
+
+/// Read the process-wide active embedding-space fingerprint (`None` when
+/// unseeded). See [`set_active_embedding_space`].
+#[must_use]
+pub fn active_embedding_space() -> Option<String> {
+    ACTIVE_EMBEDDING_SPACE.read().ok().and_then(|g| g.clone())
+}
+
 #[cfg(test)]
 mod space_fingerprint_2168_tests {
     use super::embedding_space_fingerprint;
