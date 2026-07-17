@@ -2164,11 +2164,14 @@ impl MemoryStore for SqliteStore {
         _ctx: &CallerContext,
         id: &str,
         embedding: Option<&[f32]>,
+        space: &crate::embeddings::EmbeddingSpace,
     ) -> StoreResult<()> {
         let conn = self.state.lock().await;
         match embedding {
-            Some(vec) => db::set_embedding(&conn, id, vec).map_err(box_err),
-            None => db::set_embedding(&conn, id, &[]).map_err(box_err),
+            // #2167 — vector + space stamped atomically; a cleared embedding
+            // NULLs the space too (empty-vector path in `set_embedding`).
+            Some(vec) => db::set_embedding(&conn, id, vec, space).map_err(box_err),
+            None => db::set_embedding(&conn, id, &[], space).map_err(box_err),
         }
     }
 
@@ -2544,7 +2547,11 @@ mod tests {
             .expect("list_unembedded default");
         assert!(unembedded.is_empty(), "default list_unembedded is empty");
         let written = store
-            .set_embeddings_batch(&ctx, &[(m.id.clone(), vec![0.4f32, 0.5])])
+            .set_embeddings_batch(
+                &ctx,
+                &[(m.id.clone(), vec![0.4f32, 0.5])],
+                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            )
             .await
             .expect("set_embeddings_batch default");
         assert_eq!(
@@ -4012,7 +4019,12 @@ mod tests {
         // first established dim, so a fresh store accepts any dim.
         let vec = vec![0.1_f32, 0.2, 0.3, 0.4];
         store
-            .update_embedding(&ctx, &id, Some(&vec))
+            .update_embedding(
+                &ctx,
+                &id,
+                Some(&vec),
+                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            )
             .await
             .expect("update_embedding");
         // Verify by re-reading the column. We deliberately read via

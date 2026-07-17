@@ -352,7 +352,13 @@ fn b6a_get_unembedded_ids_batch_is_bounded_and_drains() {
     // Embedding the fetched rows removes them from the predicate, so
     // the drain loop converges without an OFFSET.
     for (id, _, _) in &batch {
-        db::set_embedding(&conn, id, &[0.1_f32, 0.2, 0.3]).expect("set embedding");
+        db::set_embedding(
+            &conn,
+            id,
+            &[0.1_f32, 0.2, 0.3],
+            &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .expect("set embedding");
     }
     let rest = db::get_unembedded_ids_batch(&conn, 100).expect("rest fetch");
     assert_eq!(rest.len(), 4, "embedded rows must drop out of the scan");

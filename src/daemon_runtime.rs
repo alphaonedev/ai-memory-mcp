@@ -8188,7 +8188,13 @@ mod tests {
             lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
-        db::set_embedding(&conn, &id, &[1.0, 0.0, 0.0]).unwrap();
+        db::set_embedding(
+            &conn,
+            &id,
+            &[1.0, 0.0, 0.0],
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
         let idx = build_vector_index(&conn, true).expect("populated index");
         assert!(
             idx.len() >= 1,
@@ -8244,7 +8250,13 @@ mod tests {
             let id = db::insert(&conn, &mem).unwrap();
             let mut v = [0.0_f32; 3];
             v[i] = 1.0;
-            db::set_embedding(&conn, &id, &v).unwrap();
+            db::set_embedding(
+                &conn,
+                &id,
+                &v,
+                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            )
+            .unwrap();
             expected_ids.push(id);
         }
         drop(conn);
@@ -9696,7 +9708,13 @@ decision = "allow"
         let inserted_id = db::insert(&conn, &mem).unwrap();
         // Write a real-length embedding (384 dims of f32).
         let vec_data: Vec<f32> = (0..384).map(|i| i as f32 * 0.001).collect();
-        db::set_embedding(&conn, &inserted_id, &vec_data).unwrap();
+        db::set_embedding(
+            &conn,
+            &inserted_id,
+            &vec_data,
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
         let idx = build_vector_index(&conn, true);
         assert!(idx.is_some());
     }

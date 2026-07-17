@@ -1205,7 +1205,13 @@ mod tests {
         // ≈ 1.0) to the in-ns pair.
         for m in [&a, &b, &c] {
             db::insert(&conn, m).unwrap();
-            db::set_embedding(&conn, &m.id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
+            db::set_embedding(
+                &conn,
+                &m.id,
+                &synth_emb(&[1.0, 0.0, 0.0, 0.0]),
+                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            )
+            .unwrap();
         }
         let clusters = find_consolidation_clusters(&conn, &[a, b, c]);
         // ns1 should cluster a+b; ns2 has only one memory so no cluster.
@@ -1267,8 +1273,20 @@ mod tests {
         db::insert(&conn, &a).unwrap();
         db::insert(&conn, &b).unwrap();
         // Orthogonal 4-d embeddings: cosine sim = 0.
-        db::set_embedding(&conn, &a.id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
-        db::set_embedding(&conn, &b.id, &synth_emb(&[0.0, 1.0, 0.0, 0.0])).unwrap();
+        db::set_embedding(
+            &conn,
+            &a.id,
+            &synth_emb(&[1.0, 0.0, 0.0, 0.0]),
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
+        db::set_embedding(
+            &conn,
+            &b.id,
+            &synth_emb(&[0.0, 1.0, 0.0, 0.0]),
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
 
         let clusters = find_consolidation_clusters(&conn, &[a, b]);
         assert!(
@@ -1296,8 +1314,20 @@ mod tests {
         db::insert(&conn, &c).unwrap();
         db::insert(&conn, &d).unwrap();
         // Nearly-identical embeddings: cosine sim ≈ 1.0.
-        db::set_embedding(&conn, &c.id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
-        db::set_embedding(&conn, &d.id, &synth_emb(&[0.99, 0.1, 0.0, 0.0])).unwrap();
+        db::set_embedding(
+            &conn,
+            &c.id,
+            &synth_emb(&[1.0, 0.0, 0.0, 0.0]),
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
+        db::set_embedding(
+            &conn,
+            &d.id,
+            &synth_emb(&[0.99, 0.1, 0.0, 0.0]),
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
 
         let clusters2 = find_consolidation_clusters(&conn, &[c, d]);
         assert_eq!(
@@ -1639,7 +1669,13 @@ mod tests {
         // sides to clear the cosine gate; attach aligned vectors (cosine
         // ≈ 1.0) so the deploy cluster forms.
         for id in ["ma", "mb"] {
-            db::set_embedding(&conn, id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
+            db::set_embedding(
+                &conn,
+                id,
+                &synth_emb(&[1.0, 0.0, 0.0, 0.0]),
+                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            )
+            .unwrap();
         }
 
         let candidates = vec![
@@ -1730,8 +1766,20 @@ mod tests {
         db::insert(&conn, &b).unwrap();
         // #1774 — attach aligned embeddings (cosine ≈ 1.0) so the cosine
         // gate is cleared and the pair clusters.
-        db::set_embedding(&conn, &a.id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
-        db::set_embedding(&conn, &b.id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
+        db::set_embedding(
+            &conn,
+            &a.id,
+            &synth_emb(&[1.0, 0.0, 0.0, 0.0]),
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
+        db::set_embedding(
+            &conn,
+            &b.id,
+            &synth_emb(&[1.0, 0.0, 0.0, 0.0]),
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
 
         let llm = StubLlm::new("LLM-generated consolidated summary");
         let candidates = vec![a, b];
@@ -1765,8 +1813,20 @@ mod tests {
         db::insert(&conn, &b).unwrap();
         // #1774 — attach aligned embeddings (cosine ≈ 1.0) so the cosine
         // gate is cleared and consolidation produces a rollback entry.
-        db::set_embedding(&conn, &a.id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
-        db::set_embedding(&conn, &b.id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
+        db::set_embedding(
+            &conn,
+            &a.id,
+            &synth_emb(&[1.0, 0.0, 0.0, 0.0]),
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
+        db::set_embedding(
+            &conn,
+            &b.id,
+            &synth_emb(&[1.0, 0.0, 0.0, 0.0]),
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
 
         let llm = StubLlm::new("mock summary result");
         let candidates = vec![a, b];
@@ -2193,7 +2253,13 @@ mod tests {
         // sides to clear the cosine gate; attach aligned vectors (cosine ≈ 1.0)
         // so the deploy cluster forms in the dry-run report.
         for id in ["ma", "mb"] {
-            db::set_embedding(&conn, id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
+            db::set_embedding(
+                &conn,
+                id,
+                &synth_emb(&[1.0, 0.0, 0.0, 0.0]),
+                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            )
+            .unwrap();
         }
         let candidates = vec![
             m_a.clone(),
@@ -2263,7 +2329,13 @@ mod tests {
         // (cosine ≈ 1.0) so every near-duplicate pair clears the cosine gate.
         for m in &candidates {
             db::insert(&conn, m).unwrap();
-            db::set_embedding(&conn, &m.id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
+            db::set_embedding(
+                &conn,
+                &m.id,
+                &synth_emb(&[1.0, 0.0, 0.0, 0.0]),
+                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            )
+            .unwrap();
         }
         let clusters = find_consolidation_clusters(&conn, &candidates);
         assert!(!clusters.is_empty());

@@ -395,7 +395,7 @@ pub(super) fn handle_update(
             if let Some(ref m) = mem {
                 let text = crate::embeddings::embedding_document(&m.title, &m.content);
                 if let Ok(embedding) = emb.embed(&text) {
-                    let _ = db::set_embedding(conn, new_id, &embedding);
+                    let _ = db::set_embedding(conn, new_id, &embedding, &emb.space_fingerprint());
                     if let Some(idx) = vector_index {
                         idx.remove(new_id);
                         idx.insert(new_id.clone(), embedding);
@@ -471,7 +471,7 @@ pub(super) fn handle_update(
         if let Some(ref m) = mem {
             let text = crate::embeddings::embedding_document(&m.title, &m.content);
             if let Ok(embedding) = emb.embed(&text) {
-                let _ = db::set_embedding(conn, &resolved_id, &embedding);
+                let _ = db::set_embedding(conn, &resolved_id, &embedding, &emb.space_fingerprint());
                 if let Some(idx) = vector_index {
                     idx.remove(&resolved_id);
                     idx.insert(resolved_id.clone(), embedding);

@@ -819,7 +819,13 @@ fn seed_with_embedding(
     embedding: &[f32],
 ) -> String {
     let id = seed_existing(conn, title, content, namespace);
-    db::set_embedding(conn, &id, embedding).expect("set_embedding");
+    db::set_embedding(
+        conn,
+        &id,
+        embedding,
+        &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+    )
+    .expect("set_embedding");
     id
 }
 

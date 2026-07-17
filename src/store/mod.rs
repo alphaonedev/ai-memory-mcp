@@ -763,11 +763,17 @@ pub trait MemoryStore: Send + Sync {
     /// them. Default implementation is a no-op for adapters that
     /// don't store embeddings inline (sqlite — embeddings live in a
     /// side table).
+    /// #2167 — `space` is the [`crate::embeddings::EmbeddingSpace`] the
+    /// `embedding` was minted under; it is stamped in the SAME statement as
+    /// the vector (M-PARAMETER-CONSISTENCY) so a row can never hold a vector
+    /// from one space and a stamp from another. A `None` embedding NULLs the
+    /// stamp with the vector.
     async fn update_embedding(
         &self,
         _ctx: &CallerContext,
         _id: &str,
         _embedding: Option<&[f32]>,
+        _space: &crate::embeddings::EmbeddingSpace,
     ) -> StoreResult<()> {
         Ok(())
     }
@@ -813,10 +819,13 @@ pub trait MemoryStore: Send + Sync {
         &self,
         ctx: &CallerContext,
         entries: &[(String, Vec<f32>)],
+        space: &crate::embeddings::EmbeddingSpace,
     ) -> StoreResult<usize> {
         let mut written = 0usize;
         for (id, vec) in entries {
-            self.update_embedding(ctx, id, Some(vec)).await?;
+            // #2167 — all vectors in a batch share ONE space (minted by the
+            // live embedder in one process).
+            self.update_embedding(ctx, id, Some(vec), space).await?;
             written += 1;
         }
         Ok(written)
@@ -3754,7 +3763,9 @@ pub async fn run_embedding_backfill_on_store(
             .zip(embeddings)
             .map(|((id, _, _), v)| (id.clone(), v))
             .collect();
-        let written = match store.set_embeddings_batch(ctx, &entries).await {
+        // #2167 — stamp every backfilled vector with the LIVE embedder's space.
+        let space = emb.space_fingerprint();
+        let written = match store.set_embeddings_batch(ctx, &entries, &space).await {
             Ok(n) => n,
             Err(e) => {
                 tracing::warn!(
@@ -4045,9 +4056,14 @@ mod tests {
     async fn default_update_embedding_is_noop() {
         let s = MinimalStore;
         let ctx = CallerContext::for_agent("alice");
-        s.update_embedding(&ctx, "any", Some(&[0.5_f32]))
-            .await
-            .expect("noop");
+        s.update_embedding(
+            &ctx,
+            "any",
+            Some(&[0.5_f32]),
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .await
+        .expect("noop");
     }
 
     #[tokio::test]
@@ -4931,6 +4947,7 @@ mod tests {
             &self,
             _ctx: &CallerContext,
             _entries: &[(String, Vec<f32>)],
+            _space: &crate::embeddings::EmbeddingSpace,
         ) -> StoreResult<usize> {
             Ok(self.written_per_chunk)
         }
@@ -4964,7 +4981,11 @@ mod tests {
             ("b".to_string(), vec![0.2_f32]),
         ];
         let written = s
-            .set_embeddings_batch(&ctx, &entries)
+            .set_embeddings_batch(
+                &ctx,
+                &entries,
+                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            )
             .await
             .expect("default batch write");
         assert_eq!(written, 2, "default body reports one row per entry");
@@ -5565,6 +5586,13 @@ mod tests {
         );
         // list_unembedded default = empty; update_embedding default = Ok.
         assert!(dp.list_unembedded(&ctx, 8).await.unwrap().is_empty());
-        dp.update_embedding(&ctx, "x", None).await.unwrap();
+        dp.update_embedding(
+            &ctx,
+            "x",
+            None,
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .await
+        .unwrap();
     }
 }

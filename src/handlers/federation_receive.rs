@@ -705,9 +705,15 @@ fn spawn_deferred_embedding_refresh(app: &AppState, rows: Vec<(String, String)>)
                     continue;
                 }
             };
+            // #2167 — this is a LOCAL re-embed (the shipped vector was
+            // rejected/absent), so it lands in the receiver's ACTIVE space.
+            let space = match embedder.as_ref().as_ref() {
+                Some(e) => e.space_fingerprint(),
+                None => return,
+            };
             {
                 let lock = db.lock().await;
-                if let Err(e) = db::set_embedding(&lock.0, &id, &vec) {
+                if let Err(e) = db::set_embedding(&lock.0, &id, &vec, &space) {
                     tracing::warn!("sync_push: set_embedding failed for {id}: {e}");
                     continue;
                 }
@@ -1518,7 +1524,13 @@ pub async fn sync_push(
                     });
                 match clean_shipped {
                     Some((vector, model)) => {
-                        match db::set_embedding(&lock.0, &actual_id, &vector) {
+                        // #2167 §2-EXC — a SHIPPED vector is stamped with the
+                        // sender's CLAIMED space (`mint(se.model)`), NOT the
+                        // receiver's. Recall then excludes it unless it equals
+                        // the active space (degraded-not-wrong); a foreign
+                        // shipped vector heals via deferred/boot re-embed.
+                        let claimed_space = crate::embeddings::EmbeddingSpace::mint(&model);
+                        match db::set_embedding(&lock.0, &actual_id, &vector, &claimed_space) {
                             Ok(()) => hnsw_updates.push((actual_id, vector)),
                             Err(e) => {
                                 tracing::warn!(

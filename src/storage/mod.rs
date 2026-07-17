@@ -12598,12 +12598,15 @@ pub fn dim_violations(conn: &Connection) -> Result<u64> {
 /// declared dim), shared by [`set_embedding`], [`set_embeddings_batch`]
 /// and [`set_embeddings_batch_reembed`] so the write shape cannot
 /// drift between the checked and replace-semantics writers.
+/// #2167 — the vector, its declared dim, AND its embedding-space provenance
+/// token travel together in ONE statement (M-PARAMETER-CONSISTENCY), so a row
+/// can never hold a vector from one space and a stamp from another.
 const SQL_UPDATE_EMBEDDING_WITH_DIM: &str =
-    "UPDATE memories SET embedding = ?1, embedding_dim = ?2 WHERE id = ?3";
+    "UPDATE memories SET embedding = ?1, embedding_dim = ?2, embedding_space = ?3 WHERE id = ?4";
 /// Degenerate empty-vector sibling of [`SQL_UPDATE_EMBEDDING_WITH_DIM`]
-/// (legacy parity: empty embeddings persist with `embedding_dim = NULL`).
-const SQL_UPDATE_EMBEDDING_NULL_DIM: &str =
-    "UPDATE memories SET embedding = ?1, embedding_dim = NULL WHERE id = ?2";
+/// (legacy parity: empty embeddings persist with `embedding_dim = NULL`; the
+/// space stamp is NULLed too — no vector, no provenance).
+const SQL_UPDATE_EMBEDDING_NULL_DIM: &str = "UPDATE memories SET embedding = ?1, embedding_dim = NULL, embedding_space = NULL WHERE id = ?2";
 
 /// Store an embedding vector for a memory.
 ///
@@ -12618,7 +12621,12 @@ const SQL_UPDATE_EMBEDDING_NULL_DIM: &str =
 /// Returns [`EmbeddingDimMismatch`] (boxed via anyhow) when the embedding's
 /// dimensionality differs from what the namespace established, or the
 /// underlying SQLite error on failure.
-pub fn set_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> Result<()> {
+pub fn set_embedding(
+    conn: &Connection,
+    id: &str,
+    embedding: &[f32],
+    space: &crate::embeddings::EmbeddingSpace,
+) -> Result<()> {
     // Resolve namespace + check the dim invariant before mutating.
     let namespace: Option<String> = conn
         .query_row(
@@ -12631,7 +12639,7 @@ pub fn set_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> Result<(
     if attempted == 0 {
         // Empty embeddings are a degenerate case — earlier code accepted
         // them; preserve that to avoid breaking legacy tests but skip the
-        // dim check.
+        // dim check. The space stamp is NULLed with the (absent) vector.
         let bytes = crate::embeddings::encode_embedding_blob(embedding);
         conn.execute(SQL_UPDATE_EMBEDDING_NULL_DIM, params![bytes, id])?;
         return Ok(());
@@ -12649,7 +12657,11 @@ pub fn set_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> Result<(
     }
     let bytes = crate::embeddings::encode_embedding_blob(embedding);
     let dim_i64 = i64::try_from(attempted).unwrap_or(i64::MAX);
-    conn.execute(SQL_UPDATE_EMBEDDING_WITH_DIM, params![bytes, dim_i64, id])?;
+    // #2167 — vector + dim + space stamped atomically in one statement.
+    conn.execute(
+        SQL_UPDATE_EMBEDDING_WITH_DIM,
+        params![bytes, dim_i64, space.as_str(), id],
+    )?;
     Ok(())
 }
 
@@ -12691,6 +12703,7 @@ pub fn set_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> Result<(
 pub fn set_embeddings_batch(
     conn: &mut Connection,
     entries: &[(String, Vec<f32>)],
+    space: &crate::embeddings::EmbeddingSpace,
 ) -> Result<usize> {
     if entries.is_empty() {
         return Ok(0);
@@ -12763,7 +12776,9 @@ pub fn set_embeddings_batch(
             }
             let bytes = crate::embeddings::encode_embedding_blob(embedding);
             let dim_i64 = i64::try_from(attempted).unwrap_or(i64::MAX);
-            rows_updated += update.execute(params![bytes, dim_i64, id])?;
+            // #2167 — all vectors in a batch are minted by the live embedder
+            // in one process, so ONE space stamps the whole batch.
+            rows_updated += update.execute(params![bytes, dim_i64, space.as_str(), id])?;
         }
 
         drop(update);
@@ -13085,6 +13100,7 @@ pub fn get_memory_texts_batch(
 pub fn set_embeddings_batch_reembed(
     conn: &mut Connection,
     entries: &[(String, Vec<f32>)],
+    space: &crate::embeddings::EmbeddingSpace,
 ) -> Result<usize> {
     if entries.is_empty() {
         return Ok(0);
@@ -13101,7 +13117,11 @@ pub fn set_embeddings_batch_reembed(
                 rows_updated += update_empty.execute(params![bytes, id])?;
             } else {
                 let dim_i64 = i64::try_from(embedding.len()).unwrap_or(i64::MAX);
-                rows_updated += update.execute(params![bytes, dim_i64, id])?;
+                // #2167 — RE-STAMP the target fingerprint atomically as the
+                // sanctioned G4-bypass replaces each vector (§7): interruption
+                // is safe by construction (only consistently-stamped rows are
+                // scorable at every intermediate state).
+                rows_updated += update.execute(params![bytes, dim_i64, space.as_str(), id])?;
             }
         }
     }
@@ -18917,8 +18937,20 @@ mod tests {
         let _id2 = insert(&conn, &make_memory("cov2", "cov", Tier::Long, 5)).unwrap();
         let _id3 = insert(&conn, &make_memory("cov3", "cov", Tier::Long, 5)).unwrap();
         // Embed only two of the four rows.
-        set_embedding(&conn, &id0, &[0.1_f32; 8]).unwrap();
-        set_embedding(&conn, &id1, &[0.2_f32; 8]).unwrap();
+        set_embedding(
+            &conn,
+            &id0,
+            &[0.1_f32; 8],
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
+        set_embedding(
+            &conn,
+            &id1,
+            &[0.2_f32; 8],
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
 
         let cov = recall_index_coverage(&conn).unwrap();
         assert_eq!(cov.total_rows, 4);
@@ -18939,8 +18971,20 @@ mod tests {
         let b = sized_memory("b", "ev", Tier::Long, 9, 2000);
         insert(&conn, &a).unwrap();
         insert(&conn, &b).unwrap();
-        set_embedding(&conn, &a.id, &[0.1_f32; 8]).unwrap();
-        set_embedding(&conn, &b.id, &[0.2_f32; 8]).unwrap();
+        set_embedding(
+            &conn,
+            &a.id,
+            &[0.1_f32; 8],
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
+        set_embedding(
+            &conn,
+            &b.id,
+            &[0.2_f32; 8],
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
 
         let before = recall_index_coverage(&conn).unwrap();
         assert_eq!(before.total_rows, 2);
@@ -19268,7 +19312,13 @@ mod tests {
         let id = insert(&conn, &mem).unwrap();
 
         let emb = vec![0.1f32, 0.2, 0.3, 0.4];
-        set_embedding(&conn, &id, &emb).unwrap();
+        set_embedding(
+            &conn,
+            &id,
+            &emb,
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
 
         let got = get_embedding(&conn, &id).unwrap().unwrap();
         assert_eq!(got.len(), 4);
@@ -19306,7 +19356,13 @@ mod tests {
         );
 
         // Embedded rows leave the unembedded predicate.
-        set_embedding(&conn, &ids[0], &[0.1, 0.2]).unwrap();
+        set_embedding(
+            &conn,
+            &ids[0],
+            &[0.1, 0.2],
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
         let after = get_unembedded_ids_batch_after(&conn, None, 10).unwrap();
         assert_eq!(after.len(), 4);
         assert!(after.iter().all(|(id, _, _)| id != &ids[0]));
@@ -19337,7 +19393,13 @@ mod tests {
         }
         // An already-embedded row MUST still be scanned — reembed
         // replaces existing vectors, it is not a backfill.
-        set_embedding(&conn, &ns_a_ids[0], &[0.5, 0.5]).unwrap();
+        set_embedding(
+            &conn,
+            &ns_a_ids[0],
+            &[0.5, 0.5],
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
 
         let all = get_memory_texts_batch(&conn, None, None, 100).unwrap();
         assert_eq!(all.len(), 5, "unfiltered scan sees every live row");
@@ -19362,11 +19424,21 @@ mod tests {
         let id1 = insert(&conn, &make_memory("dim-est", "reembed-dim", Tier::Long, 5)).unwrap();
         let id2 = insert(&conn, &make_memory("dim-mig", "reembed-dim", Tier::Long, 5)).unwrap();
         // Establish a 4-dim namespace.
-        set_embedding(&conn, &id1, &[0.1, 0.2, 0.3, 0.4]).unwrap();
+        set_embedding(
+            &conn,
+            &id1,
+            &[0.1, 0.2, 0.3, 0.4],
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
 
         // The checked writer enforces the established dim…
-        let refused =
-            set_embeddings_batch(&mut conn, &[(id2.clone(), vec![0.1_f32; 8])]).unwrap_err();
+        let refused = set_embeddings_batch(
+            &mut conn,
+            &[(id2.clone(), vec![0.1_f32; 8])],
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap_err();
         assert!(
             refused.downcast_ref::<EmbeddingDimMismatch>().is_some(),
             "checked writer must refuse the dim change: {refused}"
@@ -19377,7 +19449,12 @@ mod tests {
             (id1.clone(), vec![0.9_f32; 8]),
             (id2.clone(), vec![0.8_f32; 8]),
         ];
-        let written = set_embeddings_batch_reembed(&mut conn, &entries).unwrap();
+        let written = set_embeddings_batch_reembed(
+            &mut conn,
+            &entries,
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
         assert_eq!(written, 2);
         assert_eq!(get_embedding(&conn, &id1).unwrap().unwrap().len(), 8);
         assert_eq!(get_embedding(&conn, &id2).unwrap().unwrap().len(), 8);
@@ -19391,10 +19468,19 @@ mod tests {
         let n = set_embeddings_batch_reembed(
             &mut conn,
             &[("no-such-id".to_string(), vec![0.1_f32; 8])],
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
         )
         .unwrap();
         assert_eq!(n, 0);
-        assert_eq!(set_embeddings_batch_reembed(&mut conn, &[]).unwrap(), 0);
+        assert_eq!(
+            set_embeddings_batch_reembed(
+                &mut conn,
+                &[],
+                &crate::embeddings::EmbeddingSpace::mint("test-space")
+            )
+            .unwrap(),
+            0
+        );
     }
 
     // -----------------------------------------------------------------
@@ -19570,7 +19656,13 @@ mod tests {
         let id_a = insert(&conn, &make_memory("c-a", "cov-a", Tier::Long, 5)).unwrap();
         insert(&conn, &make_memory("c-b", "cov-a", Tier::Long, 5)).unwrap();
         insert(&conn, &make_memory("c-c", "cov-b", Tier::Long, 5)).unwrap();
-        set_embedding(&conn, &id_a, &[0.1, 0.2]).unwrap();
+        set_embedding(
+            &conn,
+            &id_a,
+            &[0.1, 0.2],
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
 
         assert_eq!(embedding_coverage(&conn, None).unwrap(), (3, 1));
         assert_eq!(embedding_coverage(&conn, Some("cov-a")).unwrap(), (2, 1));
@@ -19586,11 +19678,28 @@ mod tests {
         let id_a = insert(&conn, &make_memory("d-a", "dims-a", Tier::Long, 5)).unwrap();
         let id_b = insert(&conn, &make_memory("d-b", "dims-b", Tier::Long, 5)).unwrap();
         let id_c = insert(&conn, &make_memory("d-c", "dims-b", Tier::Long, 5)).unwrap();
-        set_embedding(&conn, &id_a, &[0.1, 0.2]).unwrap();
-        set_embedding(&conn, &id_b, &[0.1; 8]).unwrap();
+        set_embedding(
+            &conn,
+            &id_a,
+            &[0.1, 0.2],
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
+        set_embedding(
+            &conn,
+            &id_b,
+            &[0.1; 8],
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
         // Mixed dims inside ONE namespace only arise mid-migration —
         // land them via the reembed writer.
-        set_embeddings_batch_reembed(&mut conn, &[(id_c, vec![0.2_f32; 4])]).unwrap();
+        set_embeddings_batch_reembed(
+            &mut conn,
+            &[(id_c, vec![0.2_f32; 4])],
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
 
         assert_eq!(distinct_embedding_dims(&conn, None).unwrap(), vec![2, 4, 8]);
         assert_eq!(
@@ -19614,7 +19723,13 @@ mod tests {
     ) -> String {
         let mem = make_memory(title, ns, Tier::Long, 5);
         let id = insert(conn, &mem).unwrap();
-        set_embedding(conn, &id, embedding).unwrap();
+        set_embedding(
+            conn,
+            &id,
+            embedding,
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
         id
     }
 
@@ -19697,7 +19812,13 @@ mod tests {
         let mut mem = make_memory("expired", "ns", Tier::Short, 5);
         mem.expires_at = Some((chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339());
         let id = insert(&conn, &mem).unwrap();
-        set_embedding(&conn, &id, &[1.0, 0.0, 0.0]).unwrap();
+        set_embedding(
+            &conn,
+            &id,
+            &[1.0, 0.0, 0.0],
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
 
         let q = vec![1.0_f32, 0.0, 0.0];
         let r = check_duplicate(&conn, &q, None, 0.85).unwrap();

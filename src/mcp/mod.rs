@@ -3197,7 +3197,9 @@ pub fn run_embedding_backfill_with_batch_size(
             continue;
         }
 
-        match db::set_embeddings_batch(conn, &embedded.entries) {
+        // #2167 — stamp the live embedder's space on every backfilled vector.
+        let space = emb.space_fingerprint();
+        match db::set_embeddings_batch(conn, &embedded.entries, &space) {
             Ok(n) => ok += n,
             Err(e) => {
                 // #1595 — a chunk-level write fault (e.g. one row
@@ -3210,7 +3212,7 @@ pub fn run_embedding_backfill_with_batch_size(
                     embedded.entries.len()
                 );
                 for (id, v) in &embedded.entries {
-                    match db::set_embedding(conn, id, v) {
+                    match db::set_embedding(conn, id, v, &space) {
                         Ok(()) => ok += 1,
                         Err(e) => {
                             eprintln!("ai-memory: backfill skipped row {id}: {e} (#1595)");
@@ -15432,7 +15434,13 @@ mod backfill_resilience_1595_tests {
         let mut conn = db::open(std::path::Path::new(":memory:")).unwrap();
         // Establish a 4-dim namespace so the 8-dim writes are refused.
         let est = seed(&conn, "established", "already embedded");
-        db::set_embedding(&conn, &est, &[0.1, 0.2, 0.3, 0.4]).unwrap();
+        db::set_embedding(
+            &conn,
+            &est,
+            &[0.1, 0.2, 0.3, 0.4],
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
         seed(&conn, "new-a", "needs embedding");
         seed(&conn, "new-b", "needs embedding");
 

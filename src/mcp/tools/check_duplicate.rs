@@ -276,7 +276,13 @@ mod tests {
         let text = format!("{title} {content}");
         let embedding = emb.embed(&text).unwrap();
         let id = db::insert(&conn, &mem).unwrap();
-        db::set_embedding(&conn, &id, &embedding).unwrap();
+        db::set_embedding(
+            &conn,
+            &id,
+            &embedding,
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
 
         let resp = handle_check_duplicate(
             &conn,
@@ -307,7 +313,13 @@ mod tests {
         let text = format!("{title} {content}");
         let embedding = emb.embed(&text).unwrap();
         let id = db::insert(&conn, &mem).unwrap();
-        db::set_embedding(&conn, &id, &embedding).unwrap();
+        db::set_embedding(
+            &conn,
+            &id,
+            &embedding,
+            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+        )
+        .unwrap();
 
         let resp = handle_check_duplicate(
             &conn,
