@@ -443,21 +443,70 @@ async fn reflect_key_bound_matching_body_agent_id_passes() {
     );
 }
 
-/// Zero-enrollment inert path for the forged-body vector: with no per-agent
-/// keys enrolled, the identity GATE is dormant — but the header-authoritative
-/// body binding still refuses a divergent body id (the same #874-class
-/// posture `handle_replay_http` enforces regardless of enrollment). The
-/// point of this test is that the refusal is the binding, NOT the per-agent
-/// identity gate (which stays inert).
+/// Seed one minimal Observation row so a zero-enrollment reflect has a real
+/// source to synthesise over (mirrors the `seed_observation` fixture in
+/// `tests/issue_1317_http_reflect_wire_layer_preserves_caller_metadata.rs`).
+fn seed_observation(db_path: &std::path::Path, namespace: &str, title: &str) -> String {
+    use ai_memory::models::{ConfidenceSource, LifecycleState, Memory, MemoryKind, Tier};
+    let conn = ai_memory::db::open(db_path).expect("db::open for seed");
+    let now = chrono::Utc::now().to_rfc3339();
+    let mem = Memory {
+        cid: None,
+        id: uuid::Uuid::new_v4().to_string(),
+        tier: Tier::Mid,
+        namespace: namespace.to_string(),
+        title: title.to_string(),
+        content: format!("issue-2156 fixture observation: {title}"),
+        tags: vec![],
+        priority: 5,
+        confidence: 1.0,
+        source: "api".to_string(),
+        access_count: 0,
+        created_at: now.clone(),
+        updated_at: now,
+        last_accessed_at: None,
+        expires_at: None,
+        metadata: serde_json::json!({"agent_id": VICTIM}),
+        reflection_depth: 0,
+        memory_kind: MemoryKind::Observation,
+        entity_id: None,
+        persona_version: None,
+        citations: Vec::new(),
+        source_uri: None,
+        source_span: None,
+        confidence_source: ConfidenceSource::CallerProvided,
+        confidence_signals: None,
+        confidence_decayed_at: None,
+        version: 1,
+        lifecycle_state: LifecycleState::Open,
+    };
+    ai_memory::db::insert(&conn, &mem).expect("insert observation")
+}
+
+/// #2156 (Fable round-3 BLOCKING regression on cfc157d7): with ZERO per-agent
+/// keys enrolled the #2140 body-`agent_id` binding must be INERT — a reflect
+/// supplying `agent_id` only in the BODY with NO `X-Agent-Id` header (the
+/// shipped, header-optional #1317 wire contract and the PR's own
+/// "inert out of the box" guarantee) PASSES THROUGH to the substrate and
+/// succeeds, byte-identical to pre-#2140. The binding gates on the SAME
+/// enrollment condition (`enrolled_agent_keys.is_empty()`) that keeps
+/// `enforce_idor_identity` dormant, so there is no second, divergent notion
+/// of "enrolled". The predecessor test
+/// (`reflect_zero_enrollment_gate_inert_body_binding_still_refuses`) encoded
+/// the breaking behavior — asserting refusal under zero enrollment — and was
+/// inverted here; the enforce+enrolled #2140 closure is pinned by
+/// `reflect_forged_body_agent_id_is_refused_under_enforce` above.
 #[tokio::test]
-async fn reflect_zero_enrollment_gate_inert_body_binding_still_refuses() {
+async fn reflect_zero_enrollment_body_binding_is_inert_and_preserves_1317() {
     use serde_json::json;
     let _dir = fresh_dir();
-    let (router, _f) = build_router_zero_enroll(HttpIdentityMode::Enforce);
+    let (router, f) = build_router_zero_enroll(HttpIdentityMode::Enforce);
+    let src_id = seed_observation(f.path(), "ns-2156-inert", "src-observation-2156");
     let body = json!({
-        "source_ids": ["mem-victim-0001"],
-        "title": "t",
-        "content": "c",
+        "source_ids": [src_id],
+        "title": "reflection-2156-zero-enrollment",
+        "content": "synthesised reflection via the header-optional #1317 path",
+        "namespace": "ns-2156-inert",
         "agent_id": VICTIM,
     });
     let resp = router
@@ -465,7 +514,7 @@ async fn reflect_zero_enrollment_gate_inert_body_binding_still_refuses() {
             "POST",
             "/api/v1/memory_reflect",
             SHARED_KEY,
-            None,
+            None, // NO X-Agent-Id header — the #1317 header-optional contract
             Some(&body),
         ))
         .await
@@ -473,14 +522,29 @@ async fn reflect_zero_enrollment_gate_inert_body_binding_still_refuses() {
     let status = resp.status();
     let text = body_text(resp).await;
     assert!(
+        !text.contains("agent_id_body_header_mismatch"),
+        "#2156: the body binding must be INERT with zero per-agent keys \
+         enrolled — the #1317 body-only agent_id path must not be refused \
+         as a header mismatch (body={text})"
+    );
+    assert!(
         !text.contains("attested_identity_required"),
         "#2140: the per-agent identity gate must stay inert with zero \
          enrollment (body={text})"
     );
     assert_eq!(
         status,
-        StatusCode::BAD_REQUEST,
-        "#2140: the header-authoritative body binding still refuses a forged \
-         body agent_id even with zero enrollment (got {status}, body={text})"
+        StatusCode::OK,
+        "#2156/#1317: a header-less body-agent_id reflect must pass through \
+         and succeed under zero enrollment (got {status}, body={text})"
+    );
+    let resp_json: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    assert!(
+        resp_json
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "#1317: the pass-through reflect must return the canonical {{id}} \
+         envelope (body={text})"
     );
 }

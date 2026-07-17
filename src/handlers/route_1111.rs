@@ -179,23 +179,32 @@ pub async fn handle_reflect_http(
     // IGNORED (both the postgres `parse_reflect_input` branch and the sqlite
     // `handle_reflect` branch read `body.agent_id`), so a caller could read a
     // victim's private sources AND forge a reflection AUTHORED as the victim
-    // via the body alone — a vector the header-keyed gate above does not close.
-    // Bind the effective principal HEADER-AUTHORITATIVELY (the body `agent_id`
-    // is only a refinement that MUST match), the same posture
-    // `handle_replay_http` / the #874 `resolve_http_agent_id` chain enforce for
-    // every other body-vs-header identity conflict, then OVERRIDE the body
-    // `agent_id` with the bound caller so no downstream branch can honor a
-    // divergent body id. A body `agent_id` that disagrees with the
-    // authenticated header is refused here.
-    let body_agent = body.get("agent_id").and_then(Value::as_str);
-    let caller = match crate::handlers::parity::resolve_caller_agent_id(body_agent, &headers, None)
-    {
-        Ok(id) => id,
-        Err(e) => return err_response(e),
-    };
+    // via the body alone — a vector the header-keyed gate above does not close
+    // (its anonymous carve-out admits the no-header caller). Bind the
+    // effective principal HEADER-AUTHORITATIVELY (the body `agent_id` is only
+    // a refinement that MUST match), then OVERRIDE the body `agent_id` with
+    // the bound caller so no downstream branch can honor a divergent body id.
+    //
+    // #2156 — the binding is gated on the SAME enrollment condition the
+    // `enforce_idor_identity` gate above short-circuits on
+    // (`enforce_for_request`'s `enrolled.is_empty()` check): with ZERO
+    // per-agent keys enrolled the binding is INERT and the body passes
+    // through unchanged, preserving the shipped #1317 header-optional
+    // contract (body-only `agent_id`, no `X-Agent-Id` header, zero-config
+    // deployment) and the PR's inert-out-of-the-box guarantee. Under an
+    // enrolled posture the binding stays ACTIVE and still refuses the #2140
+    // no-header + body-`agent_id:<victim>` forge vector.
     let mut body = body;
-    if let Some(obj) = body.as_object_mut() {
-        obj.insert("agent_id".to_string(), Value::String(caller));
+    if !app.enrolled_agent_keys.is_empty() {
+        let body_agent = body.get("agent_id").and_then(Value::as_str);
+        let caller =
+            match crate::handlers::parity::resolve_caller_agent_id(body_agent, &headers, None) {
+                Ok(id) => id,
+                Err(e) => return err_response(e),
+            };
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("agent_id".to_string(), Value::String(caller));
+        }
     }
     // #1924 (CWE-288) — consult the PRE-REFLECT enforcement gate before the
     // reflection write (HTTP parity with the MCP gate). INERT by default.
