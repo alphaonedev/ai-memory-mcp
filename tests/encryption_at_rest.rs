@@ -574,7 +574,7 @@ fn get_memory_texts_batch_decrypts_encrypted_rows_1779() {
     )
     .expect("persist orphan envelope");
 
-    let rows = db::get_memory_texts_batch(&conn, None, None, 100).expect("texts batch");
+    let rows = db::get_memory_texts_batch(&conn, None, None, 100, None).expect("texts batch");
     let by_id: std::collections::HashMap<String, String> =
         rows.into_iter().map(|(id, _t, c)| (id, c)).collect();
 

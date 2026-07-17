@@ -13093,6 +13093,7 @@ pub fn get_memory_texts_batch(
     namespace: Option<&str>,
     after_id: Option<&str>,
     limit: usize,
+    exclude_space: Option<&str>,
 ) -> Result<Vec<(String, String, String)>> {
     // #1779 — also pull `encrypted_envelope` + `metadata` so at-rest-encrypted
     // rows (where `content` holds the empty placeholder and the plaintext lives
@@ -13102,41 +13103,118 @@ pub fn get_memory_texts_batch(
     // corpus-wide. A row whose envelope fails to decrypt (e.g. key absent) is
     // SKIPPED with a WARN rather than embedded as a degraded placeholder —
     // mirrors the #1593 fail-loud-skip embedder posture.
-    let raw = match (namespace, after_id) {
-        (Some(ns), Some(after)) => {
-            let mut stmt = conn.prepare_cached(
-                "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
-                 WHERE namespace = ?1 AND id > ?2 ORDER BY id LIMIT ?3",
-            )?;
-            let rows = stmt.query_map(params![ns, after, limit], embeddable_row_mapper)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        }
-        (Some(ns), None) => {
-            let mut stmt = conn.prepare_cached(
-                "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
-                 WHERE namespace = ?1 ORDER BY id LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(params![ns, limit], embeddable_row_mapper)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        }
-        (None, Some(after)) => {
-            let mut stmt = conn.prepare_cached(
-                "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
-                 WHERE id > ?1 ORDER BY id LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(params![after, limit], embeddable_row_mapper)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        }
-        (None, None) => {
-            let mut stmt = conn.prepare_cached(
-                "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
-                 ORDER BY id LIMIT ?1",
-            )?;
-            let rows = stmt.query_map(params![limit], embeddable_row_mapper)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        }
-    };
+    //
+    // #2167 S7 — `exclude_space` (Some when `reembed --skip-current-space`):
+    // `embedding_space IS NOT ?` is SQLite's null-safe `IS DISTINCT FROM`, so a
+    // resumed sweep skips rows ALREADY at the target space while still re-
+    // embedding every foreign / NULL / non-target row (the incremental heal).
+    // Built as ordered positional binds (dynamic predicate set → not
+    // `prepare_cached`, which is fine on the batched reembed sweep).
+    let mut sql = String::from(
+        "SELECT id, title, content, encrypted_envelope, metadata FROM memories WHERE 1 = 1",
+    );
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(ns) = namespace {
+        sql.push_str(" AND namespace = ?");
+        binds.push(Box::new(ns.to_string()));
+    }
+    if let Some(after) = after_id {
+        sql.push_str(" AND id > ?");
+        binds.push(Box::new(after.to_string()));
+    }
+    if let Some(space) = exclude_space {
+        sql.push_str(" AND embedding_space IS NOT ?");
+        binds.push(Box::new(space.to_string()));
+    }
+    sql.push_str(" ORDER BY id LIMIT ?");
+    binds.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
+    let mut stmt = conn.prepare(&sql)?;
+    let bind_refs: Vec<&dyn rusqlite::ToSql> =
+        binds.iter().map(std::convert::AsRef::as_ref).collect();
+    let rows = stmt.query_map(bind_refs.as_slice(), embeddable_row_mapper)?;
+    let raw = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(resolve_embeddable_rows(raw))
+}
+
+/// v1.0.0 #2167 §5/§7 — outcome of `reembed --stamp-only`, the explicit
+/// operator attestation path that stamps embedded NULL-space rows with the
+/// active fingerprint WITHOUT re-embedding.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StampOnlyReport {
+    /// Rows stamped `NULL → active_fp`.
+    pub stamped: usize,
+    /// The DISTINCT dims of embedded NULL-space rows that do NOT match the
+    /// active dim; non-empty ⇒ the attestation was REFUSED (stamped = 0).
+    pub refused_dims: Vec<i64>,
+}
+
+/// v1.0.0 #2167 §5/§7 — `reembed --stamp-only`: attest that the embedded
+/// NULL-space rows are ALREADY the active model, stamping
+/// `embedding_space = <active_fp>` WITHOUT re-embedding.
+///
+/// This is the strict-mode / [G2]-blocked operator's ONLY unattested-to-
+/// attested path (auto-adoption [`adopt_legacy_embedding_space`] refuses in
+/// those postures). It is fail-closed: it REFUSES (stamps NOTHING, returns
+/// the offending dims) unless the FULL dim census of embedded NULL-space
+/// rows matches `active_dim` — a mixed-dim NULL population cannot be safely
+/// attested to one space. On success it stamps every embedded NULL-space row
+/// whose dim matches. Scope is the LIVE corpus (`memories`); archived rows
+/// self-heal on restore (§8).
+///
+/// # Errors
+///
+/// Bubbles the rusqlite error from the census probe or the UPDATE.
+pub fn stamp_embedding_space_attested(
+    conn: &Connection,
+    namespace: Option<&str>,
+    active_fp: &str,
+    active_dim: usize,
+) -> Result<StampOnlyReport> {
+    let active_dim_i64 = i64::try_from(active_dim).unwrap_or(i64::MAX);
+    // Census the dims of embedded NULL-space rows (a NULL embedding_dim on an
+    // embedded row is itself a mismatch → treated as refusal via COALESCE(-1)).
+    let mut census = conn.prepare(&format!(
+        "SELECT DISTINCT COALESCE(embedding_dim, -1) FROM memories \
+         WHERE embedding IS NOT NULL AND embedding_space IS NULL{}",
+        if namespace.is_some() {
+            " AND namespace = ?1"
+        } else {
+            ""
+        }
+    ))?;
+    let dims: Vec<i64> = match namespace {
+        Some(ns) => census
+            .query_map(params![ns], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<_>>()?,
+        None => census
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<_>>()?,
+    };
+    let refused_dims: Vec<i64> = dims.into_iter().filter(|&d| d != active_dim_i64).collect();
+    if !refused_dims.is_empty() {
+        return Ok(StampOnlyReport {
+            stamped: 0,
+            refused_dims,
+        });
+    }
+    let stamped = match namespace {
+        Some(ns) => conn.execute(
+            "UPDATE memories SET embedding_space = ?1 \
+             WHERE embedding IS NOT NULL AND embedding_space IS NULL \
+               AND embedding_dim = ?2 AND namespace = ?3",
+            params![active_fp, active_dim_i64, ns],
+        )?,
+        None => conn.execute(
+            "UPDATE memories SET embedding_space = ?1 \
+             WHERE embedding IS NOT NULL AND embedding_space IS NULL \
+               AND embedding_dim = ?2",
+            params![active_fp, active_dim_i64],
+        )?,
+    };
+    Ok(StampOnlyReport {
+        stamped,
+        refused_dims: Vec::new(),
+    })
 }
 
 /// #1598 — REPLACE-semantics sibling of [`set_embeddings_batch`] for
@@ -19820,16 +19898,17 @@ mod tests {
         )
         .unwrap();
 
-        let all = get_memory_texts_batch(&conn, None, None, 100).unwrap();
+        let all = get_memory_texts_batch(&conn, None, None, 100, None).unwrap();
         assert_eq!(all.len(), 5, "unfiltered scan sees every live row");
 
-        let ns_a = get_memory_texts_batch(&conn, Some("reembed-a"), None, 100).unwrap();
+        let ns_a = get_memory_texts_batch(&conn, Some("reembed-a"), None, 100, None).unwrap();
         assert_eq!(ns_a.len(), 3);
         assert_eq!(ns_a[0].0, ns_a_ids[0], "embedded row still scanned");
 
-        let first = get_memory_texts_batch(&conn, Some("reembed-a"), None, 1).unwrap();
+        let first = get_memory_texts_batch(&conn, Some("reembed-a"), None, 1, None).unwrap();
         let cursor = first[0].0.clone();
-        let rest = get_memory_texts_batch(&conn, Some("reembed-a"), Some(&cursor), 100).unwrap();
+        let rest =
+            get_memory_texts_batch(&conn, Some("reembed-a"), Some(&cursor), 100, None).unwrap();
         assert_eq!(rest.len(), 2);
         assert!(rest.iter().all(|(id, _, _)| id.as_str() > cursor.as_str()));
     }
