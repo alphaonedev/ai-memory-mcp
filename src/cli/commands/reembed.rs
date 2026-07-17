@@ -420,7 +420,7 @@ mod tests {
             &conn,
             &id_a,
             &[0.1, 0.2],
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
 
@@ -459,7 +459,7 @@ mod tests {
             &conn,
             &id_old,
             &[0.1, 0.2, 0.3, 0.4],
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
 
@@ -499,7 +499,7 @@ mod tests {
             &conn,
             &id_out,
             &[0.9, 0.8],
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
 
@@ -533,7 +533,7 @@ mod tests {
             &conn,
             &id_bad,
             &[0.7, 0.7],
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
 

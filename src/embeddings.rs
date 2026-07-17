@@ -107,13 +107,34 @@ const PREFIX_SCHEME_NOMIC_TASK_V1: &str = "nomic-task-v1";
 /// NEVER collide, so the gate can produce a false MISMATCH (→ a safe
 /// local re-embed) but NEVER a false MATCH (→ corruption): degrade, never
 /// corrupt (#2168 CORE INVARIANT). M-STRONG-TYPES-GUARD.
+//
+// #2167 GENERALISATION (shared SSOT for federation-gate + per-row write-stamp +
+// recall-gate + adoption): the body below keeps #2168's prose-strip AND adds
+// the #2167 daemon-native family-fold + `:latest`-strip so every spelling of
+// the two native families collapses to one id (snake wire form `nomic_embed_v15`,
+// shortname `all-minilm`, Ollama tag, HF id). The prefix is derived from the
+// FOLDED (canonical) id so `nomic_embed_v15` (underscore — misses the
+// hyphenated `nomic-embed` needle) still yields `nomic-task-v1` via its fold.
 #[must_use]
 pub fn embedding_space_fingerprint(model: &str) -> String {
-    let id = model
+    // 1. Strip #2168's model_description() prose suffix (`"id (prose)"` → id).
+    let bare = model
         .split_once(" (")
         .map_or(model, |(head, _)| head)
-        .trim()
-        .to_ascii_lowercase();
+        .trim();
+    // 2. Fold the two daemon-native families to their canonical HF id; else
+    //    lowercase + strip ONE trailing `:latest` (Ollama's implicit default;
+    //    any other tag e.g. `:v1.5` is version-meaningful and kept).
+    let id = if let Some(known) = crate::config::EmbeddingModel::from_canonical_id(bare) {
+        known.hf_model_id().to_ascii_lowercase()
+    } else {
+        let lowered = bare.to_ascii_lowercase();
+        lowered
+            .strip_suffix(":latest")
+            .unwrap_or(&lowered)
+            .to_string()
+    };
+    // 3. Prefix from the CANONICAL (post-fold) id via the live embed predicate.
     let scheme = if Embedder::model_requires_nomic_prefix(&id) {
         PREFIX_SCHEME_NOMIC_TASK_V1
     } else {
@@ -136,7 +157,10 @@ mod space_fingerprint_2168_tests {
         let prose = embedding_space_fingerprint("nomic-embed-text (768-dim, remote)");
         let bare = embedding_space_fingerprint("nomic-embed-text");
         assert_eq!(prose, bare, "prose suffix must not change the fingerprint");
-        assert_eq!(prose, "nomic-embed-text#nomic-task-v1");
+        // #2167 generalisation: the daemon-native nomic family FOLDS to its
+        // canonical HF id (so every spelling — Ollama tag, snake wire form,
+        // HF id — collapses to one space).
+        assert_eq!(prose, "nomic-ai/nomic-embed-text-v1.5#nomic-task-v1");
     }
 
     /// Two DIFFERENT 768-dim models (the exact #2168 attack: a
@@ -160,7 +184,9 @@ mod space_fingerprint_2168_tests {
     fn local_minilm_differs_from_nomic() {
         let minilm = embedding_space_fingerprint("all-MiniLM-L6-v2 (384-dim, local)");
         let nomic = embedding_space_fingerprint("nomic-embed-text (768-dim, remote)");
-        assert_eq!(minilm, "all-minilm-l6-v2#none");
+        // #2167 generalisation: the daemon-native MiniLM family folds to its
+        // canonical HF id.
+        assert_eq!(minilm, "sentence-transformers/all-minilm-l6-v2#none");
         assert_ne!(minilm, nomic);
     }
 
@@ -366,16 +392,16 @@ pub trait Embed: Send + Sync {
         false
     }
 
-    /// #2167 — the [`EmbeddingSpace`] fingerprint of the vectors this
-    /// embedder produces. Exposed on the `dyn Embed` interface so the
-    /// trait-generic backfill sweep ([`crate::store::run_embedding_backfill_on_store`],
+    /// #2167 — the [`embedding_space_fingerprint`] of the vectors this embedder
+    /// produces, exposed on the `dyn Embed` interface so the trait-generic
+    /// backfill sweep ([`crate::store::run_embedding_backfill_on_store`],
     /// [`crate::mcp::run_embedding_backfill_with_batch_size`]) can stamp the
     /// live space without a concrete `Embedder`. The production [`Embedder`]
-    /// overrides it with the real fingerprint (§0.3); the default here is a
-    /// stable sentinel that whole-value-compares distinctly (a mock embedder's
-    /// vectors are never scored against a live query in production).
-    fn space_fingerprint(&self) -> EmbeddingSpace {
-        EmbeddingSpace::mint("mock-embedder")
+    /// overrides it (delegating to its inherent #2168 `space_fingerprint`); the
+    /// default here is a stable sentinel (a mock embedder's vectors are never
+    /// scored against a live query in production).
+    fn space_fingerprint(&self) -> String {
+        embedding_space_fingerprint("mock-embedder")
     }
 }
 
@@ -416,131 +442,6 @@ pub enum Embedder {
         degraded: Arc<std::sync::atomic::AtomicBool>,
     },
 }
-
-/// v1.0.0 #2167/#2168 — THE canonical embedding-space fingerprint function
-/// (single SSOT shared by the federation inbound gate (#2168), the per-row
-/// write stamp (S3), the recall gate (S4), and boot adoption (S5)). If any of
-/// those guards used a different canonicalisation, "same vector space" would be
-/// judged differently by two guards → a false-accept / false-reject mismatch.
-/// There is exactly ONE such function.
-///
-/// Produces `"<canonical_model_id>#<prefix_scheme>"`,
-/// `prefix_scheme ∈ {"none", "nomic-task-v1"}`. Steps:
-/// 1. **Prose-strip** (#2168 wire-tolerance): a federated `ShippedEmbedding.model`
-///    carries `model_description()` prose (`"nomic-embed-text-v1.5 (768-dim, …)"`),
-///    so keep only the token before the first `" ("`.
-/// 2. `trim()`.
-/// 3. **Family-fold** (#2167 robustness generalised INTO the one function): fold
-///    the two daemon-native families via
-///    [`crate::config::EmbeddingModel::from_canonical_id`] →
-///    [`crate::config::EmbeddingModel::hf_model_id`] so every spelling (snake
-///    wire form, shortname, Ollama tag, HF id) collapses to one id.
-/// 4. Otherwise (arbitrary API model) lowercase and strip ONE trailing
-///    `":latest"` (M-DOCUMENTED-MAGIC: Ollama's implicit untagged default; any
-///    other tag e.g. `":v1.5"` is version-meaningful and kept).
-/// 5. All tokens lowercased — one casing rule everywhere.
-/// 6. `prefix_scheme = "nomic-task-v1"` iff
-///    [`Embedder::model_requires_nomic_prefix`] (the SAME predicate the live
-///    embed path applies), else `"none"` — persisted as an explicit token so
-///    predicate drift is itself caught as a mismatch (#1520 b″).
-///
-/// **Deliberately conservative** (over-distinguishing yields DEGRADED recall,
-/// never WRONG). Do NOT add fuzzy folding.
-///
-/// NOTE (rebase onto merged #2168): this is the GENERALISED body — it keeps
-/// #2168's prose-strip AND adds the #2167 family-fold. On rebase, collapse the
-/// duplicate definition by keeping THIS body so both guards share it.
-#[must_use]
-pub fn embedding_space_fingerprint(model: &str) -> String {
-    // 1. Strip the model_description() prose suffix (`"id (prose)"` → `"id"`).
-    let bare = model.split(" (").next().unwrap_or(model);
-    let trimmed = bare.trim();
-    let canonical_model_id =
-        if let Some(known) = crate::config::EmbeddingModel::from_canonical_id(trimmed) {
-            known.hf_model_id().to_ascii_lowercase()
-        } else {
-            let lowered = trimmed.to_ascii_lowercase();
-            lowered
-                .strip_suffix(":latest")
-                .unwrap_or(&lowered)
-                .to_string()
-        };
-    // Prefix from the CANONICAL (post-fold) id via the live embed predicate
-    // (§0.2). Computing it on the folded id (not the raw form) is load-bearing:
-    // the snake wire form `nomic_embed_v15` has an UNDERSCORE, so
-    // `model_requires_nomic_prefix` (needle `"nomic-embed"`, hyphen) would miss
-    // it — but its canonical fold `nomic-ai/nomic-embed-text-v1.5` matches. The
-    // predicate lowercases + substring-matches so any surviving spelling works.
-    let prefix_scheme = if Embedder::model_requires_nomic_prefix(&canonical_model_id) {
-        EMBEDDING_PREFIX_SCHEME_NOMIC_V1
-    } else {
-        EMBEDDING_PREFIX_SCHEME_NONE
-    };
-    format!("{canonical_model_id}#{prefix_scheme}")
-}
-
-/// v1.0.0 #2167 — identity token of the vector space a stored embedding
-/// lives in: `"<canonical_model_id>#<prefix_scheme>"` where
-/// `prefix_scheme ∈ {"none", "nomic-task-v1"}`. Compared only as a WHOLE
-/// value (never substring-matched) so a vector written under a different
-/// embedding space (e.g. a same-dim model swap) is never scored against a
-/// live query — worst case DEGRADED recall, never WRONG (see #2167).
-///
-/// A typed newtype carrier over the [`embedding_space_fingerprint`] SSOT
-/// (M-STRONG-TYPES-GUARD / api-newtype-safety / type-no-stringly): every
-/// minted value routes through the ONE canonicalisation, so a stamp and a gate
-/// can never disagree on "same space".
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct EmbeddingSpace(String);
-
-impl EmbeddingSpace {
-    /// Mint the canonical space fingerprint for `raw_model_id` by delegating to
-    /// the [`embedding_space_fingerprint`] SSOT.
-    #[must_use]
-    pub fn mint(raw_model_id: &str) -> Self {
-        Self(embedding_space_fingerprint(raw_model_id))
-    }
-
-    /// The whole minted token (`"<canonical_model_id>#<prefix_scheme>"`).
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for EmbeddingSpace {
-    // M-PUBLIC-DISPLAY: the token IS the user-readable identity.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::str::FromStr for EmbeddingSpace {
-    type Err = String;
-
-    /// Parse a persisted `"<id>#<scheme>"` token (row hydration + tests).
-    /// Accepts any token with two non-empty `#`-separated halves and wraps it
-    /// VERBATIM (the stored value was already minted). Deliberately does NOT
-    /// re-canonicalise or restrict the scheme vocabulary so a future
-    /// `prefix_scheme` hydrates as DEGRADED rather than crashing the read
-    /// (conv-fromstr-parsing / api-parse-dont-validate).
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.split_once('#') {
-            Some((id, scheme)) if !id.is_empty() && !scheme.is_empty() => Ok(Self(s.to_string())),
-            _ => Err(format!(
-                "invalid embedding_space token {s:?}: expected \
-                 \"<canonical_model_id>#<prefix_scheme>\" with non-empty halves"
-            )),
-        }
-    }
-}
-
-/// #2167 §0.2 — `prefix_scheme` token for a symmetric (no task-prefix)
-/// embed model. M-DOCUMENTED-MAGIC.
-const EMBEDDING_PREFIX_SCHEME_NONE: &str = "none";
-/// #2167 §0.2 — `prefix_scheme` token for the nomic-style asymmetric
-/// task-prefix family (`search_query:` / `search_document:`).
-const EMBEDDING_PREFIX_SCHEME_NOMIC_V1: &str = "nomic-task-v1";
 
 /// v0.7.0 H7 — dimension-aware outcome of a recall-time cosine comparison
 /// between a live query embedding and a stored embedding whose producing
@@ -878,23 +779,6 @@ impl Embedder {
         model_name
             .to_ascii_lowercase()
             .contains(NOMIC_MODEL_FAMILY_NEEDLE)
-    }
-
-    /// v1.0.0 #2167 §0.3 — the [`EmbeddingSpace`] fingerprint of the vectors
-    /// THIS embedder produces. Every live write stamps this alongside the
-    /// vector (§2) and recall compares it whole against each stored row's
-    /// `embedding_space` (§3). `Local` is always MiniLM; `Ollama` mints from
-    /// the resolved `model_name` (covers Ollama-native AND OpenAI-compatible
-    /// remotes, whose `model_name` is the post-`canonicalise_embedding_model`
-    /// `[embeddings].model`).
-    #[must_use]
-    pub fn space_fingerprint(&self) -> EmbeddingSpace {
-        match self {
-            Self::Local { .. } => {
-                EmbeddingSpace::mint(crate::config::EmbeddingModel::MiniLmL6V2.hf_model_id())
-            }
-            Self::Ollama { model_name, .. } => EmbeddingSpace::mint(model_name),
-        }
     }
 
     /// v0.7.0 F6 — generate an embedding and report the outcome.
@@ -1321,9 +1205,9 @@ impl Embed for Embedder {
         Self::is_degraded(self)
     }
 
-    fn space_fingerprint(&self) -> EmbeddingSpace {
-        // Delegate to the inherent method (§0.3).
-        Self::space_fingerprint(self)
+    fn space_fingerprint(&self) -> String {
+        // Delegate to the inherent #2168 method (returns the SSOT fingerprint).
+        Embedder::space_fingerprint(self)
     }
 }
 
@@ -1470,9 +1354,8 @@ pub fn decoded_dim(bytes: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
 
-    // ---- #2167 §0 — EmbeddingSpace fingerprint minting ----
+    // ---- #2167 §0 — embedding_space_fingerprint minting ----
 
     #[test]
     fn embedding_space_compiled_default_pins() {
@@ -1480,11 +1363,11 @@ mod tests {
         // test-visible act (issue table row b′). These two literals ARE the
         // tier-preset defaults' fingerprints.
         assert_eq!(
-            EmbeddingSpace::mint("sentence-transformers/all-MiniLM-L6-v2").as_str(),
+            embedding_space_fingerprint("sentence-transformers/all-MiniLM-L6-v2"),
             "sentence-transformers/all-minilm-l6-v2#none"
         );
         assert_eq!(
-            EmbeddingSpace::mint("nomic-ai/nomic-embed-text-v1.5").as_str(),
+            embedding_space_fingerprint("nomic-ai/nomic-embed-text-v1.5"),
             "nomic-ai/nomic-embed-text-v1.5#nomic-task-v1"
         );
     }
@@ -1499,11 +1382,7 @@ mod tests {
             "all-minilm",
             "sentence-transformers/all-MiniLM-L6-v2",
         ] {
-            assert_eq!(
-                EmbeddingSpace::mint(spelling).as_str(),
-                minilm,
-                "{spelling}"
-            );
+            assert_eq!(embedding_space_fingerprint(spelling), minilm, "{spelling}");
         }
         let nomic = "nomic-ai/nomic-embed-text-v1.5#nomic-task-v1";
         for spelling in [
@@ -1512,7 +1391,7 @@ mod tests {
             "nomic-embed-text-v1.5",
             "nomic-ai/nomic-embed-text-v1.5",
         ] {
-            assert_eq!(EmbeddingSpace::mint(spelling).as_str(), nomic, "{spelling}");
+            assert_eq!(embedding_space_fingerprint(spelling), nomic, "{spelling}");
         }
     }
 
@@ -1520,16 +1399,16 @@ mod tests {
     fn embedding_space_api_model_lowercases_and_strips_latest() {
         // Arbitrary API model: lowercase + strip ONE trailing ":latest".
         assert_eq!(
-            EmbeddingSpace::mint("Google/Gemini-Embedding-2").as_str(),
+            embedding_space_fingerprint("Google/Gemini-Embedding-2"),
             "google/gemini-embedding-2#none"
         );
         assert_eq!(
-            EmbeddingSpace::mint("some-embed:LATEST").as_str(),
+            embedding_space_fingerprint("some-embed:LATEST"),
             "some-embed#none"
         );
         // A version-meaningful tag is preserved.
         assert_eq!(
-            EmbeddingSpace::mint("some-embed:v1.5").as_str(),
+            embedding_space_fingerprint("some-embed:v1.5"),
             "some-embed:v1.5#none"
         );
     }
@@ -1556,44 +1435,13 @@ mod tests {
     }
 
     #[test]
-    fn embedding_space_mint_delegates_to_ssot() {
-        // The newtype is a carrier over the ONE canonicalisation: mint's string
-        // MUST equal the SSOT function's for every form (so write-stamp,
-        // recall-gate, adoption, and the #2168 federation-gate all agree).
-        for model in [
-            "nomic-embed-text",
-            "nomic-embed-text-v1.5 (768-dim, ~270 MB)",
-            "sentence-transformers/all-MiniLM-L6-v2",
-            "all-minilm",
-            "google/gemini-embedding-2",
-            "SomeModel:LATEST",
-        ] {
-            assert_eq!(
-                EmbeddingSpace::mint(model).as_str(),
-                embedding_space_fingerprint(model),
-                "mint must delegate to the SSOT for {model}"
-            );
-        }
-    }
-
-    #[test]
     fn embedding_space_over_distinguishes_conservatively() {
         // §0.1 step 5 — two remote spellings that survive the fold mint
         // DIFFERENT fingerprints (the safe DEGRADED-not-WRONG direction).
         assert_ne!(
-            EmbeddingSpace::mint("google/gemini-embedding-2"),
-            EmbeddingSpace::mint("gemini-embedding-2")
+            embedding_space_fingerprint("google/gemini-embedding-2"),
+            embedding_space_fingerprint("gemini-embedding-2")
         );
-    }
-
-    #[test]
-    fn embedding_space_from_str_roundtrip_and_rejects_malformed() {
-        let s = EmbeddingSpace::mint("nomic-embed-text");
-        let parsed = EmbeddingSpace::from_str(s.as_str()).expect("roundtrip");
-        assert_eq!(parsed, s);
-        assert!(EmbeddingSpace::from_str("no-separator").is_err());
-        assert!(EmbeddingSpace::from_str("#none").is_err());
-        assert!(EmbeddingSpace::from_str("id#").is_err());
     }
 
     #[test]

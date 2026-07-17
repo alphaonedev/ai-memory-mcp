@@ -244,7 +244,7 @@ fn set_embeddings_batch_rolls_back_on_dim_mismatch() {
         &conn,
         &m_a.id,
         &v4,
-        &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+        &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
     )
     .expect("seed dim");
 
@@ -254,7 +254,7 @@ fn set_embeddings_batch_rolls_back_on_dim_mismatch() {
     let err = db::set_embeddings_batch(
         &mut conn,
         &[(m_b.id.clone(), v4.clone()), (m_a.id.clone(), v8)],
-        &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+        &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
     )
     .expect_err("dim mismatch should bubble");
     let msg = format!("{err:#}");
@@ -302,7 +302,7 @@ fn bench_pre_fix_per_row_baseline() {
                 &conn,
                 id,
                 &v,
-                &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+                &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
             )
             .is_ok()
         {

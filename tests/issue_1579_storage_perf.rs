@@ -356,7 +356,7 @@ fn b6a_get_unembedded_ids_batch_is_bounded_and_drains() {
             &conn,
             id,
             &[0.1_f32, 0.2, 0.3],
-            &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+            &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
         )
         .expect("set embedding");
     }

@@ -2111,14 +2111,14 @@ mod tests {
             &conn,
             &m_a.id,
             &[1.0, 0.0],
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
         db::set_embedding(
             &conn,
             &m_b.id,
             &[1.0, 0.0],
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
 
@@ -2605,14 +2605,14 @@ mod consolidation_pass_tests_1746 {
             conn,
             &m1.id,
             &[1.0, 0.0],
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
         crate::db::set_embedding(
             conn,
             &m2.id,
             &[1.0, 0.0],
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
         vec![m1, m2]

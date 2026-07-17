@@ -119,7 +119,7 @@ async fn store_with_embedding_then_update_embedding_roundtrip() {
             &ctx,
             &id,
             None,
-            &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+            &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
         )
         .await
         .expect("clear embedding");
@@ -129,7 +129,7 @@ async fn store_with_embedding_then_update_embedding_roundtrip() {
             &ctx,
             &id,
             Some(&vec2),
-            &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+            &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
         )
         .await
         .expect("reset embedding");

@@ -1050,7 +1050,7 @@ mod tests {
                 &conn,
                 &m1.id,
                 &[1.0, 0.0],
-                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
             )
             .unwrap();
             crate::db::insert(&conn, &m2).unwrap();
@@ -1058,7 +1058,7 @@ mod tests {
                 &conn,
                 &m2.id,
                 &[0.0, 1.0],
-                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
             )
             .unwrap();
 
@@ -1139,14 +1139,14 @@ mod tests {
                 conn,
                 &m1.id,
                 &[1.0, 0.0],
-                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
             )
             .unwrap();
             crate::db::set_embedding(
                 conn,
                 &m2.id,
                 &[1.0, 0.0],
-                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
             )
             .unwrap();
             vec![m1, m2]
@@ -1321,28 +1321,28 @@ mod tests {
                 &conn,
                 &a1.id,
                 &[1.0, 0.0],
-                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
             )
             .unwrap();
             crate::db::set_embedding(
                 &conn,
                 &a2.id,
                 &[1.0, 0.0],
-                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
             )
             .unwrap();
             crate::db::set_embedding(
                 &conn,
                 &b1.id,
                 &[0.0, 1.0],
-                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
             )
             .unwrap();
             crate::db::set_embedding(
                 &conn,
                 &b2.id,
                 &[0.0, 1.0],
-                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
             )
             .unwrap();
 

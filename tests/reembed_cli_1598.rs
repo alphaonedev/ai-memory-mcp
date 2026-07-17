@@ -94,7 +94,7 @@ fn seed_embedded(conn: &rusqlite::Connection, title: &str, content: &str) -> Str
         conn,
         &id,
         &[0.5_f32; SEED_DIM],
-        &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+        &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
     )
     .expect("seed embedding must land");
     id

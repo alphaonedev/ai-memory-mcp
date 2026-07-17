@@ -415,7 +415,7 @@ pub(super) async fn sync_push_via_store(
                         // #2167 §2-EXC — SHIPPED vector stamps the sender's
                         // CLAIMED space (`mint(se.model)`); recall excludes it
                         // unless it equals the active space (degraded-not-wrong).
-                        let claimed_space = crate::embeddings::EmbeddingSpace::mint(&model);
+                        let claimed_space = crate::embeddings::embedding_space_fingerprint(&model);
                         if let Err(e) = app
                             .store
                             .update_embedding(&ctx, &applied_id, Some(&vector), &claimed_space)

@@ -8192,7 +8192,7 @@ mod tests {
             &conn,
             &id,
             &[1.0, 0.0, 0.0],
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
         let idx = build_vector_index(&conn, true).expect("populated index");
@@ -8254,7 +8254,7 @@ mod tests {
                 &conn,
                 &id,
                 &v,
-                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
             )
             .unwrap();
             expected_ids.push(id);
@@ -9712,7 +9712,7 @@ decision = "allow"
             &conn,
             &inserted_id,
             &vec_data,
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
         let idx = build_vector_index(&conn, true);

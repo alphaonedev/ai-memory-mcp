@@ -1571,7 +1571,7 @@ pub async fn sync_push(
                         // receiver's. Recall then excludes it unless it equals
                         // the active space (degraded-not-wrong); a foreign
                         // shipped vector heals via deferred/boot re-embed.
-                        let claimed_space = crate::embeddings::EmbeddingSpace::mint(&model);
+                        let claimed_space = crate::embeddings::embedding_space_fingerprint(&model);
                         match db::set_embedding(&lock.0, &actual_id, &vector, &claimed_space) {
                             Ok(()) => hnsw_updates.push((actual_id, vector)),
                             Err(e) => {
