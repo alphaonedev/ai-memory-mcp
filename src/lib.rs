@@ -386,8 +386,10 @@ pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 79;
 /// `ai-memory epoch-apply <manifest.json>` verify-only epoch-freeze
 /// consumer, bumping 86 → 87; v1.0.0 [P1][R45] #1955 added `Stop` for
 /// the `ai-memory stop [--resume] [--status]` substrate record-stop
-/// actuator, bumping 87 → 88.)
-pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 88;
+/// actuator, bumping 87 → 88; v1.0.0 #1978 added `Watch` for the
+/// `ai-memory watch [--once|--daemon]` L3 substrate poll-based
+/// filesystem-watcher capture daemon, bumping 88 → 89.)
+pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 89;
 
 /// Variants in `pub enum Command` that COMPILE under `--features sal`
 /// (or `sal-postgres`, which implies sal in `Cargo.toml`). Equals the
@@ -403,8 +405,10 @@ pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 88;
 /// lifecycle), bumping 86 → 87; v0.9.0 §25.3 S1 #1870 added
 /// `ModelAttest`, bumping 87 → 88; v0.9.0 §25.3 S5 #1878 added
 /// `EpochApply`, bumping 88 → 89; v1.0.0 [P1][R45] #1955 added `Stop`
-/// (substrate record-stop actuator), bumping 89 → 90.
-pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 90;
+/// (substrate record-stop actuator), bumping 89 → 90; v1.0.0 #1978
+/// added `Watch` (L3 substrate poll-based filesystem-watcher capture
+/// daemon), bumping 90 → 91.
+pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 91;
 
 // ---------------------------------------------------------------------------
 // ARCH-10 (FX-C4-batch2, 2026-05-26) — minimal FFI self-identification
