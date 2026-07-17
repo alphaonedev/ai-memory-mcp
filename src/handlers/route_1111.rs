@@ -118,6 +118,19 @@ pub async fn handle_smart_load_http(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // #2137 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the caller is resolved from `X-Agent-Id` for the forwarded load_family
+    // read (smart_load wraps load_family). Pre-fix, a shared-transport-key
+    // caller forging `X-Agent-Id: <victim>` read the victim's private
+    // family-tagged content. Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "smart_load",
+    ) {
+        return resp;
+    }
     // #1555 — resolve the caller from headers so the forwarded load_family read
     // applies the scope=private visibility filter (the always-on intent loader
     // must not surface another tenant's private family-tagged rows). Reuses the
@@ -147,9 +160,52 @@ pub async fn handle_smart_load_http(
 /// has a daemon keypair on disk (matching the MCP behaviour).
 pub async fn handle_reflect_http(
     State(app): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // #2140 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate. Under
+    // `enforce`, a shared-transport-key caller forging `X-Agent-Id: <victim>`
+    // is refused before the reflection is written or the victim's private
+    // source memories are read. Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "reflect",
+    ) {
+        return resp;
+    }
+    // #2140 — reflect trusted the BODY `agent_id` with the request headers
+    // IGNORED (both the postgres `parse_reflect_input` branch and the sqlite
+    // `handle_reflect` branch read `body.agent_id`), so a caller could read a
+    // victim's private sources AND forge a reflection AUTHORED as the victim
+    // via the body alone — a vector the header-keyed gate above does not close
+    // (its anonymous carve-out admits the no-header caller). Bind the
+    // effective principal HEADER-AUTHORITATIVELY (the body `agent_id` is only
+    // a refinement that MUST match), then OVERRIDE the body `agent_id` with
+    // the bound caller so no downstream branch can honor a divergent body id.
+    //
+    // #2156 — the binding is gated on the SAME enrollment condition the
+    // `enforce_idor_identity` gate above short-circuits on
+    // (`enforce_for_request`'s `enrolled.is_empty()` check): with ZERO
+    // per-agent keys enrolled the binding is INERT and the body passes
+    // through unchanged, preserving the shipped #1317 header-optional
+    // contract (body-only `agent_id`, no `X-Agent-Id` header, zero-config
+    // deployment) and the PR's inert-out-of-the-box guarantee. Under an
+    // enrolled posture the binding stays ACTIVE and still refuses the #2140
+    // no-header + body-`agent_id:<victim>` forge vector.
+    let mut body = body;
+    if !app.enrolled_agent_keys.is_empty() {
+        let body_agent = body.get("agent_id").and_then(Value::as_str);
+        let caller =
+            match crate::handlers::parity::resolve_caller_agent_id(body_agent, &headers, None) {
+                Ok(id) => id,
+                Err(e) => return err_response(e),
+            };
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("agent_id".to_string(), Value::String(caller));
+        }
+    }
     // #1924 (CWE-288) — consult the PRE-REFLECT enforcement gate before the
     // reflection write (HTTP parity with the MCP gate). INERT by default.
     if let Some(resp) = crate::handlers::create::http_pre_event_gate(
@@ -479,6 +535,19 @@ pub async fn handle_replay_http(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the substrate ownership gate `handle_replay` applies to the forwarded
+    // caller. Under `enforce`, a shared-key `Claimed` caller forging
+    // `X-Agent-Id: <victim>` cannot replay the victim's memory operations.
+    // Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "replay",
+    ) {
+        return resp;
+    }
     // Resolve caller id so the substrate ownership gate has a
     // header-attributed principal. Mirror the inbox handler.
     let body_agent = body.get("agent_id").and_then(Value::as_str);
@@ -511,6 +580,19 @@ pub async fn handle_subscription_replay_http(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the substrate ownership gate `handle_subscription_replay` applies. Under
+    // `enforce`, a shared-key `Claimed` caller forging `X-Agent-Id: <victim>`
+    // cannot replay the victim's webhook deliveries. Inert for zero-config
+    // deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "subscription_replay",
+    ) {
+        return resp;
+    }
     let body_agent = body.get("agent_id").and_then(Value::as_str);
     let caller = match crate::handlers::parity::resolve_caller_agent_id(body_agent, &headers, None)
     {
@@ -536,6 +618,19 @@ pub async fn handle_subscription_dlq_list_http(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the substrate ownership gate `handle_subscription_dlq_list` applies.
+    // Under `enforce`, a shared-key `Claimed` caller forging
+    // `X-Agent-Id: <victim>` cannot list the victim's dead-lettered webhook
+    // deliveries. Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "subscription_dlq_list",
+    ) {
+        return resp;
+    }
     let body_agent = body.get("agent_id").and_then(Value::as_str);
     let caller = match crate::handlers::parity::resolve_caller_agent_id(body_agent, &headers, None)
     {

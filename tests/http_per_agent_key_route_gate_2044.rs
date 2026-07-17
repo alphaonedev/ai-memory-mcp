@@ -281,13 +281,17 @@ async fn m1_2093_is_admin_caller_trusted_refuses_shared_key_admin_under_enforce(
 }
 
 #[tokio::test]
-async fn m1_2093_purge_archive_shared_key_admin_does_not_403_but_downgrades() {
-    // Route-level pin for the DESTRUCTIVE surface (DELETE /api/v1/archive). The
-    // predicate DOWNGRADES (not 403s), so a forged shared-key admin gets a normal
-    // 200 that ran in CALLER scope (no cross-tenant purge) — the security
-    // property is the absence of the admin bypass, pinned directly above. Here we
-    // assert the route stays functional (no crash / no spurious 403) under the
-    // new gate.
+async fn m1_2132_purge_archive_shared_key_forge_is_403_under_enforce() {
+    // #2132 (supersedes the earlier #2093 pin that asserted 200). The #2093
+    // `is_admin_caller_trusted` downgrade only closes the ADMIN-BYPASS vector;
+    // it did NOT close the NON-admin caller-scope forge — a shared-key caller
+    // forging `X-Agent-Id: <victim>` (is_admin=false) hits
+    // `purge_archive_for_caller(caller=victim)` and PERMANENTLY DELETES the
+    // victim's archived rows. That is the identical IDOR gated on
+    // archive_by_ids/restore_archive, and purge is the most destructive; the
+    // pre-#2132 test PINNED the vulnerable 200. purge_archive now carries the
+    // #2044 `enforce_idor_identity` gate, so a forged shared-key named
+    // principal is refused 403 BEFORE the caller-scoped DELETE.
     let _dir = fresh_dir();
     let (router, _app, _f) = build_enforce_router();
     let req = Request::builder()
@@ -300,8 +304,31 @@ async fn m1_2093_purge_archive_shared_key_admin_does_not_403_but_downgrades() {
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
+        StatusCode::FORBIDDEN,
+        "#2132: a shared-key caller forging a named X-Agent-Id on the \
+         destructive purge_archive surface must be refused 403 under enforce \
+         (the caller-scope forge is a real IDOR, not a benign downgrade)"
+    );
+}
+
+#[tokio::test]
+async fn m1_2132_purge_archive_key_attested_admin_passes() {
+    // The legitimately key-bound admin/owner path still works: alice's enrolled
+    // per-agent key binds X-Agent-Id=alice, the gate sees KeyAuthenticated, and
+    // the caller-scoped purge proceeds (200).
+    let _dir = fresh_dir();
+    let (router, _app, _f) = build_enforce_router();
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/api/v1/archive?older_than_days=3650")
+        .header("x-api-key", ALICE_KEY)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
         StatusCode::OK,
-        "#2093: purge_archive downgrades a forged shared-key admin to caller \
-         scope (200, caller-scoped purge), it does not 403"
+        "#2132: alice's enrolled per-agent key must pass the purge_archive \
+         identity gate (key-attested caller-scoped purge)"
     );
 }

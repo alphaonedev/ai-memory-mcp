@@ -9,6 +9,12 @@ use crate::validate;
 use crate::visibility::is_visible_to_caller;
 use serde_json::{Value, json};
 
+/// The `mode` / read-surface tag for `memory_session_start` — SSOT for the
+/// literal so the read-governance gate kind, the response `mode` field, and
+/// the HTTP IDOR endpoint label share one site (pm-v3.1 no-hardcoded-literal
+/// discipline; the hardcoded-literal ratchet flagged the third occurrence).
+pub(crate) const SESSION_START_MODE: &str = "session_start";
+
 /// MCP / HTTP entry point for `memory_session_start`.
 ///
 /// `caller` is the resolved caller's agent_id (HTTP: via
@@ -46,7 +52,7 @@ pub(crate) fn handle_session_start(
         // Bind the surface name once (the gate kind + the refusal action
         // share it) so the literal lives on a single site — pm-v3.1
         // no-hardcoded-duplication discipline.
-        let surface = "session_start";
+        let surface = SESSION_START_MODE;
         let actor = caller
             .or_else(|| params["agent_id"].as_str())
             .unwrap_or_default();
@@ -104,7 +110,7 @@ pub(crate) fn handle_session_start(
     let mut response = json!({
         "memories": memories,
         "count": memories.len(),
-        "mode": "session_start",
+        "mode": SESSION_START_MODE,
     });
 
     if let Some(llm_client) = llm

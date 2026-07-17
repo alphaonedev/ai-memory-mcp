@@ -383,6 +383,23 @@ pub async fn quota_status_handler(
     headers: HeaderMap,
     Json(body): Json<QuotaStatusBody>,
 ) -> impl IntoResponse {
+    // #2138 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the per-agent quota read. The pre-#2138 `agent_id == caller` check below
+    // compared TWO self-asserted values (`body.agent_id` vs the `X-Agent-Id`
+    // header), so a shared-transport-key caller forging `X-Agent-Id: <victim>`
+    // AND `body.agent_id: <victim>` satisfied the equality and read the
+    // victim's quota row. Binding the caller to a server-held per-agent key
+    // refuses the forged `Claimed` named principal under `enforce`; the
+    // key-attested owner still reads their own row. Inert for zero-config
+    // deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "quota_status",
+    ) {
+        return resp;
+    }
     // #909 (security-medium, 2026-05-19) — sibling of #874/#901/#905/#907.
     // The pre-#909 path accepted `body.agent_id` with no authn binding —
     // any caller could probe `POST /api/v1/quota/status {agent_id:"alice"}`

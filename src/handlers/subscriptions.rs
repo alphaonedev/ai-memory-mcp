@@ -586,6 +586,18 @@ pub async fn unsubscribe(
     headers: HeaderMap,
     Query(q): Query<UnsubscribeQuery>,
 ) -> impl IntoResponse {
+    // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the caller-scoped subscription delete below. Under `enforce`, a
+    // shared-key `Claimed` caller forging `X-Agent-Id: <victim>` cannot delete
+    // the victim's webhook subscriptions. Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "unsubscribe",
+    ) {
+        return resp;
+    }
     // v0.7.0 Wave-3 Continuation 5 (Bucket B / S33) — postgres-backed
     // daemons resolve subscriptions through the SAL `_subscriptions/
     // <agent_id>` namespace mirror that `subscribe` / `list_subscriptions`
@@ -775,6 +787,19 @@ pub async fn list_subscriptions(
     headers: HeaderMap,
     Query(q): Query<ListSubscriptionsQuery>,
 ) -> impl IntoResponse {
+    // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the caller-scoped subscription listing below. Under `enforce`, a
+    // shared-key `Claimed` caller forging `X-Agent-Id: <victim>` cannot
+    // enumerate the victim's webhook subscriptions (target URLs, secrets
+    // metadata). Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "list_subscriptions",
+    ) {
+        return resp;
+    }
     // #872 / #874 (security-high/medium, 2026-05-18) — authenticate
     // the caller via X-Agent-Id header (NOT the `?agent_id=` query
     // string, which is trivially spoofable and was the bypass surface
