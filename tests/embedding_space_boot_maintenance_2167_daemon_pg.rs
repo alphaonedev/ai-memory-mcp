@@ -65,11 +65,14 @@ fn serve_args(url: &str) -> ServeArgs {
 
 /// An `AppConfig` whose resolved embedder is an OFFLINE `openai-compatible`
 /// remote embedder (built `new_remote`, no model load / no network at boot).
-/// `tier = semantic` enables the embedder; the explicit `dim` is required for an
-/// API backend whose model is not in the known-dims table.
+/// `tier = autonomous` enables both the embedder AND the cross-encoder
+/// reranker load path (`new_neural()` degrades to lexical offline / on load
+/// failure — no network hang), so the serve-boot exercises that block too; the
+/// explicit `dim` is required for an API backend whose model is not in the
+/// known-dims table.
 fn app_config_with_offline_api_embedder() -> AppConfig {
     AppConfig {
-        tier: Some("semantic".to_string()),
+        tier: Some("autonomous".to_string()),
         embeddings: Some(EmbeddingsSection {
             backend: Some("openai-compatible".to_string()),
             base_url: Some("http://127.0.0.1:1".to_string()),
