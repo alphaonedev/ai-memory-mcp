@@ -95,8 +95,11 @@ p.lede{color:var(--text-muted);font-size:1.05rem;max-width:780px;margin-bottom:2
 .hero .value-card p strong{color:#fff}
 @media(max-width:720px){.hero .value-split{grid-template-columns:1fr}}
 .hero .aud-row{display:flex;flex-wrap:wrap;justify-content:center;gap:.5rem;margin:0 auto 2rem;max-width:920px}
-.hero .aud-chip{font-family:var(--font-mono);font-size:.68rem;letter-spacing:.04em;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:999px;padding:.35rem .75rem;background:rgba(0,0,0,.35)}
-.hero .aud-chip b{color:#fff;font-weight:600}
+.hero a.aud-chip,.hero .aud-chip{font-family:var(--font-mono);font-size:.68rem;letter-spacing:.04em;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:999px;padding:.4rem .85rem;background:rgba(0,0,0,.35);text-decoration:none;display:inline-flex;align-items:center;gap:.35rem;transition:border-color .15s,color .15s,background .15s,filter .15s}
+.hero a.aud-chip b,.hero .aud-chip b{color:#fff;font-weight:600}
+.hero a.aud-chip:hover{border-color:var(--p1);color:var(--text);background:rgba(110,231,255,.08);filter:none}
+.hero a.aud-chip:hover b{color:var(--p1)}
+.hero a.aud-chip:focus-visible{outline:2px solid var(--p1);outline-offset:2px}
 .hero .claims-head{font-family:var(--font-mono);font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;color:var(--text-dim);margin:0 auto 1rem}
 .hero .claims-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:.75rem;max-width:1100px;margin:0 auto 1.5rem;text-align:left}
 @media(max-width:980px){.hero .claims-grid{grid-template-columns:repeat(2,1fr)}}
@@ -455,12 +458,28 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
       </div>
     </div>
 
-    <div class="aud-row" aria-label="Built for four audiences">
-      <span class="aud-chip"><b>1</b> End users</span>
-      <span class="aud-chip"><b>2</b> C-level / risk</span>
-      <span class="aud-chip"><b>3</b> Engineers &amp; architects</span>
-      <span class="aud-chip"><b>4</b> Cybersecurity</span>
-    </div>
+    <nav class="aud-row" aria-label="Built for four audiences — jump to role pages">
+      <a class="aud-chip" href="for-everyone.html" title="Non-technical end users — plain-language tour">
+        <b>1</b> End users
+      </a>
+      <a class="aud-chip" href="audience/decision-maker.html" title="C-level / risk / procurement — decision-maker brief">
+        <b>2</b> C-level / risk
+      </a>
+      <a class="aud-chip" href="audience/developer.html" title="Software engineers &amp; architects — developer deep-dive">
+        <b>3</b> Engineers &amp; architects
+      </a>
+      <a class="aud-chip" href="compliance/index.html" title="Cybersecurity experts — compliance &amp; security mapping">
+        <b>4</b> Cybersecurity
+      </a>
+    </nav>
+    <p style="color:var(--text-dim);font-size:.72rem;font-family:var(--font-mono);margin:-1.25rem auto 1.75rem;max-width:920px;line-height:1.5">
+      Also:
+      <a href="audience/operator.html" style="color:var(--p1)">operator / SME deploy</a>
+      &middot;
+      <a href="reviews/FABLE-5-NORTH-STAR-9-CLAIMS-PLAIN-ENGLISH-AUDIENCES.md" style="color:var(--p1)">9-claim plain English (all 4 audiences)</a>
+      &middot;
+      <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/SECURITY.md" style="color:var(--p1)">SECURITY.md threat model</a>
+    </p>
 
     <p class="claims-head">Nine audited claims &mdash; present as product capability today</p>
     <div class="claims-grid" role="list" aria-label="Nine audited north-star claims">
