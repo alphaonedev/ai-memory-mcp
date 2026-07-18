@@ -91,13 +91,13 @@ fn template_matchers_are_illustrative_never_real_operations() {
     // refuse NOTHING real. Every matcher value is a deliberately-fake token, and
     // must NOT collide with operations the substrate itself performs (writing
     // /tmp, spawning cargo) — those would be a false-positive footgun.
-    let t = template();
-    let rules = t.get("rules").and_then(Value::as_array).expect("rules");
-
     // Tokens that would indicate a REAL (dangerous-to-bless) matcher.
     const FORBIDDEN_REAL: &[&str] = &["/tmp", "/var/tmp", "cargo", "/usr", "/etc", "/home"];
     // Tokens that mark a value as deliberately illustrative/fake.
     const ILLUSTRATIVE: &[&str] = &["example", "invalid", "forbidden"];
+
+    let t = template();
+    let rules = t.get("rules").and_then(Value::as_array).expect("rules");
 
     for r in rules {
         let id = r.get("id").and_then(Value::as_str).unwrap_or("?");
