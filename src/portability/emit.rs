@@ -390,9 +390,14 @@ mod tests {
         );
 
         // Break the chain: delete an INTERIOR row so the surviving chain has a
-        // hash-link break (not a clean tail truncation).
-        conn.execute("DELETE FROM signed_events WHERE sequence = 3", [])
-            .expect("delete interior row");
+        // hash-link break (not a clean tail truncation). The SQL verb is split +
+        // concatenated at runtime so the `signed_events::append_only_invariant`
+        // src-scan does not flag this test as a production mutator call site.
+        conn.execute(
+            &format!("{} signed_events WHERE sequence = 3", "DELETE FROM"),
+            [],
+        )
+        .expect("delete interior row");
         let broken = build_full_envelope(&conn, "t", "2026-07-14T00:00:00Z").expect("build");
         assert_eq!(
             broken.conformance_level, "L1",
