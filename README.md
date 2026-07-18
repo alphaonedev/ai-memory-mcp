@@ -12,9 +12,8 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![SQLite](https://img.shields.io/badge/sqlite-FTS5-003B57?logo=sqlite)](https://www.sqlite.org/)
 [![Tests](https://img.shields.io/badge/tests-2%2C400%2B_%E2%80%A2_%E2%89%A592%25_cov-brightgreen)](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)
-[![Test Hub](https://img.shields.io/badge/test--hub-live_results-6ee7ff?logo=githubpages)](https://alphaonedev.github.io/ai-memory-test-hub/)
-[![Discovery Gate](https://img.shields.io/badge/discovery--gate-6%2F6_PASS_%E2%80%A2_GATE_GREEN-2ea043?logo=githubpages)](https://alphaonedev.github.io/ai-memory-discovery-gate/)
-[![v0.6.4 Cert](https://img.shields.io/badge/v0.6.4_cert-CERT_GREEN-2ea043?logo=githubpages)](https://github.com/alphaonedev/ai-memory-test-hub/blob/main/campaigns/v0.6.4.md)
+[![Evidence Hub](https://img.shields.io/badge/evidence--hub-campaigns-6ee7ff?logo=githubpages)](https://alphaonedev.github.io/ai-memory-mcp/evidence/)
+[![v0.6.4 Cert](https://img.shields.io/badge/v0.6.4_cert-CERT_GREEN-2ea043?logo=github)](https://github.com/alphaonedev/ai-memory-test-hub/blob/main/campaigns/v0.6.4.md)
 [![MCP](https://img.shields.io/badge/MCP-7_default_%E2%80%A2_103_full-blueviolet)]()
 [![NSA CSI](https://img.shields.io/badge/NSA_CSI_MCP-10%2F10_concerns_%E2%80%A2_7%2F7_recs-2ea043)](https://alphaonedev.github.io/ai-memory-mcp/compliance/nsa-csi-mcp.html)
 [![Evidence v0.6.4](https://img.shields.io/badge/claims-frozen_v0.6.4-c8a2ff)](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)
@@ -767,7 +766,7 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (93 route registrations 
 - **Color CLI output** -- ANSI tier labels (red/yellow/green), priority bars, bold titles, cyan namespaces
 
 ### Quality
-- **~10,000 tests across the full surface** -- roughly 6,712 `#[test]`/`#[tokio::test]` attributes under `src/` (5,759 `#[test]` + 953 `#[tokio::test]`) plus roughly 3,362 under `tests/` (2,138 `#[test]` + 1,224 `#[tokio::test]`), grown from the v0.6.4-era ~2,400-test baseline (1,960 lib + 211 integration + 16 mcp_integration + 4 webhook_http_parity + 16 recipe_contract + ~150 across other binary targets). Line coverage held above the **≥92% project bar**; net-new v0.6.4 modules at 100% (`sizes.rs`), 99.50% (`profile.rs`), 97.58% (`cli/audit.rs`), 97.05% (`cli/doctor.rs`), 92.56% (`handlers.rs`), 92.26% (`cli/install.rs`). v0.6.3.x baselines (1,809 / 93.08% and 1,886 / 93.84%) remain frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html); v0.6.4 metrics in the release notes and on the [test-hub campaign](https://github.com/alphaonedev/ai-memory-test-hub/blob/main/campaigns/v0.6.4.md). Empirical NHI discovery acceptance proven separately by the [Discovery Gate](https://alphaonedev.github.io/ai-memory-discovery-gate/) (T1–T4 matrix vs. live xAI Grok 4.3, 6/6 PASS, **GATE GREEN**).
+- **~10,000 tests across the full surface** -- roughly 6,712 `#[test]`/`#[tokio::test]` attributes under `src/` (5,759 `#[test]` + 953 `#[tokio::test]`) plus roughly 3,362 under `tests/` (2,138 `#[test]` + 1,224 `#[tokio::test]`), grown from the v0.6.4-era ~2,400-test baseline (1,960 lib + 211 integration + 16 mcp_integration + 4 webhook_http_parity + 16 recipe_contract + ~150 across other binary targets). Line coverage held above the **≥92% project bar**; net-new v0.6.4 modules at 100% (`sizes.rs`), 99.50% (`profile.rs`), 97.58% (`cli/audit.rs`), 97.05% (`cli/doctor.rs`), 92.56% (`handlers.rs`), 92.26% (`cli/install.rs`). v0.6.3.x baselines (1,809 / 93.08% and 1,886 / 93.84%) remain frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html); v0.6.4 metrics in the release notes and on the [test-hub campaign](https://github.com/alphaonedev/ai-memory-test-hub/blob/main/campaigns/v0.6.4.md). Empirical NHI discovery acceptance proven separately by the Discovery Gate (T1–T4 matrix vs. live xAI Grok 4.3, 6/6 PASS, **GATE GREEN**) — see the [Evidence Hub](https://alphaonedev.github.io/ai-memory-mcp/evidence/) (the `ai-memory-discovery-gate` Pages site is retired per #2034).
 - **LongMemEval benchmark** -- **97.0% R@5** pure FTS5 keyword (LLM-independent, 2.2 seconds, 232 q/s, zero API costs) on the ICLR 2025 LongMemEval-S dataset; LLM query expansion with the current-generation Gemma 4 model measures **97.2% R@5 / 99.6% R@10 / 99.8% R@20** (cloud-API venue; the historical `gemma3:4b` 97.8% figure is retired as headline per [#1975](https://github.com/alphaonedev/ai-memory-mcp/issues/1975)). See [benchmark details](benchmarks/longmemeval/).
 - **MCP Prompts** -- `recall-first` and `memory-workflow` prompts teach AI clients to use memory proactively
 - **TOON-default** -- recall/list/search responses use TOON compact by default (79% smaller than JSON)
@@ -842,7 +841,7 @@ ai-memory bench                      # human-readable table
 ai-memory bench --json               # machine-parseable
 ```
 
-Substrate is unchanged across v0.6.3.x → v0.6.4 (the `quiet-tools` release ships a smaller default tool surface, not a different hot-path). p99 targets here remain informational pending the next dedicated soak window; latest soak evidence is on the [test hub](https://alphaonedev.github.io/ai-memory-test-hub/).
+Substrate is unchanged across v0.6.3.x → v0.6.4 (the `quiet-tools` release ships a smaller default tool surface, not a different hot-path). p99 targets here remain informational pending the next dedicated soak window; latest soak evidence is on the [Evidence Hub](https://alphaonedev.github.io/ai-memory-mcp/evidence/) (the `ai-memory-test-hub` Pages site is retired per #2034).
 
 ---
 
