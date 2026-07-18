@@ -404,6 +404,17 @@ mod tests {
     use super::*;
 
     fn fresh() -> Connection {
+        // #2159 — `db::open` reads process-global env (e.g.
+        // `AI_MEMORY_REQUIRE_ROLLBACK_CHECK`, consulted by the open-time
+        // rollback-evidence check). Another test in the same `--lib`
+        // process (e.g. `security_profile::tests::asi_hard_*`) mutates
+        // that var under the shared `crate::config::test_env_lock`
+        // cohort; without also holding it here, a parallel-scheduled open
+        // can observe the var mid-mutation and spuriously refuse to open
+        // an in-memory DB (no pinnable off-table head anchor). Serialise
+        // against every env-mutating test in the crate, not just this
+        // module's own tests.
+        let _guard = crate::config::test_env_lock();
         crate::storage::open(std::path::Path::new(":memory:")).expect("open in-memory db")
     }
 

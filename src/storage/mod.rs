@@ -22154,8 +22154,19 @@ mod tests {
         let _gate = lock_permissions_mode_for_test();
         override_active_permissions_mode_for_test(PermissionsMode::Enforce);
         clear_active_permission_rules_for_test();
+        // #2165 — this rule used to be namespace_pattern "**" (matching
+        // EVERY namespace). Since `_gate` only serialises against other
+        // `lock_permissions_mode_for_test()` holders, a sibling test that
+        // does NOT take that lock (e.g. storage::tests::ck_trigger_* /
+        // create_link_* success-path tests) could interleave with THIS
+        // test's live Enforce+Deny window under parallel `cargo test --lib`
+        // scheduling and see its own unrelated link create wrongly refused.
+        // Scoping the pattern to this test's own "a3-fed" namespace (the
+        // only namespace this test writes into) preserves full coverage —
+        // peer_attested still bypasses a namespace-matching Deny — while
+        // eliminating collateral denial of every other storage test.
         set_active_permission_rules(vec![PermissionRule {
-            namespace_pattern: "**".to_string(),
+            namespace_pattern: "a3-fed".to_string(),
             op: "memory_link".to_string(),
             agent_pattern: "*".to_string(),
             decision: RuleDecision::Deny,
@@ -25188,6 +25199,18 @@ mod tests {
         // The CHECK trigger fires on UPDATE as well as INSERT — a
         // post-hoc UPDATE that flips an unsigned row to self_signed
         // without supplying signature bytes must be refused.
+        //
+        // #2165 — same shared-state race as
+        // `ck_trigger_admits_unsigned_with_null_signature`: this test's
+        // `create_link_signed(...).unwrap()` seed-write is equally exposed
+        // to `a3_create_link_inbound_peer_attested_bypasses_governance`'s
+        // transient global deny-all-links rule. Hold the same gate.
+        let _gate = crate::config::lock_permissions_mode_for_test();
+        crate::config::override_active_permissions_mode_for_test(
+            crate::config::PermissionsMode::Off,
+        );
+        crate::permissions::clear_active_permission_rules_for_test();
+
         let conn = test_db();
         let s = make_memory("ck-upd-src", "test", Tier::Long, 5);
         let t = make_memory("ck-upd-tgt", "test", Tier::Long, 5);
@@ -25211,6 +25234,21 @@ mod tests {
         // peer_attested — the unsigned path with NULL signature
         // (the v0.6.4 default) must still admit. Negative-control
         // test pinning the trigger's narrow scope.
+        //
+        // #2165 — `a3_create_link_inbound_peer_attested_bypasses_governance`
+        // installs a process-wide `**`/`memory_link`/Deny rule under
+        // `lock_permissions_mode_for_test()` for the duration of its body.
+        // Without holding the same gate here, a parallel `cargo test --lib`
+        // scheduler can interleave this test's `create_link_signed` call
+        // inside that window and see the unsigned create wrongly refused.
+        // Pin mode to Off + clear rules so we observe a clean baseline
+        // (either pre- or post-a3, never mid-a3).
+        let _gate = crate::config::lock_permissions_mode_for_test();
+        crate::config::override_active_permissions_mode_for_test(
+            crate::config::PermissionsMode::Off,
+        );
+        crate::permissions::clear_active_permission_rules_for_test();
+
         let conn = test_db();
         let s = make_memory("ck-unsigned-src", "test", Tier::Long, 5);
         let t = make_memory("ck-unsigned-tgt", "test", Tier::Long, 5);
