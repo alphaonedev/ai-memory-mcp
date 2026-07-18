@@ -104,7 +104,7 @@
     "longmemeval_r_at_20_smart": 0.998,
     "longmemeval_dataset": "ICLR 2025 LongMemEval-S (500 questions, 6 categories)",
     "ship_gate_evidence_url": "https://alphaonedev.github.io/ai-memory-mcp/evidence.html",
-    "discovery_gate_url": "https://alphaonedev.github.io/ai-memory-discovery-gate/",
+    "discovery_gate_url": "https://alphaonedev.github.io/ai-memory-mcp/evidence/",
     "a2a_gate_status": "48/48 PASS across 4 channels (mTLS verified)"
   },
   "compliance_evidence": {
