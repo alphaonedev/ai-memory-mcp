@@ -330,7 +330,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // space/unverified counters + aggregated WARN) + the §5 boot adoption /
     // §6 census / embedding_space_boot_maintenance helpers land
     // storage/mod.rs at 25_504; ceiling 25_650 (+146 headroom).
-    ("src/storage/mod.rs", 25_850), /* 2026-07-18 #2035 v85 archive→restore valid_from/valid_until column threading + round-trip unit test (25_760) */
+    // 2026-07-18 combined (#2181 embedding-space gating + #2165 test-isolation):
+    // the `get_embedding_with_space` helper + `proactive_conflict_check`
+    // `embedding_space` predicate (#2181, #2167 residual) PLUS the
+    // ck_trigger_* / a3-fed permissions-race test comments (#2165) land
+    // storage/mod.rs at 25_738; ceiling 25_650 -> 25_850. Then #2035 v85
+    // archive->restore valid_from/valid_until column threading + round-trip
+    // unit test added ~65 LOC on top of the merge.
+    ("src/storage/mod.rs", 25_900),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -773,7 +780,9 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // #2179) close the postgres silent-recall-outage. All are data-integrity
     // parity with the proven sqlite path, not new surface. File lands at
     // 27_501; 27_600 = 27_501 + 99 headroom; far under the 1.5x cap.
-    ("src/store/postgres.rs", 27_600),
+    // 2026-07-18 #2035 v85 migrate_v85 + MIGRATION_V85 const + archive/restore
+    // valid_from/valid_until threading land it at 27_639; ceiling 27_700.
+    ("src/store/postgres.rs", 27_700),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

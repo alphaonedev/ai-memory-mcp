@@ -8,17 +8,17 @@ layout: doc
 ## 🎯 Current release · **v0.9.0** (`secure-default hardening`) · ≥92% line coverage (ratchet pinned in [`.coverage-baseline`](../.coverage-baseline))
 
 [![Release](https://img.shields.io/badge/release-v0.9.0-brightgreen?logo=github)](https://github.com/alphaonedev/ai-memory-mcp/releases/tag/v0.9.0)
-[![A2A Gate](https://img.shields.io/badge/A2A_gate-9%2F9_green-brightgreen)](https://alphaonedev.github.io/ai-memory-ai2ai-gate/)
-[![Ship Gate](https://img.shields.io/badge/ship_gate-green-brightgreen)](https://alphaonedev.github.io/ai-memory-ship-gate/)
 [![crates.io](https://img.shields.io/crates/v/ai-memory)](https://crates.io/crates/ai-memory)
 
 **v0.6.3** cleared the a2a-gate certification bar (three consecutive full-testbook green runs across three agent frameworks and three transport modes — **324 passing scenarios**, zero partial greens); **v0.7.0** layers on the attested-cortex epic (Ed25519 attestation, 25-event hook pipeline, postgres+AGE first-class backend, schema v57). Full release notes: [`v0.7.0/release-notes.md`](v0.7.0/release-notes.html).
 
 **📦 [Release v0.9.0](https://github.com/alphaonedev/ai-memory-mcp/releases/tag/v0.9.0)** ·
-**📊 [A2A gate (umbrella spec)](https://alphaonedev.github.io/ai-memory-ai2ai-gate/)** ·
-**🚢 [Ship gate](https://alphaonedev.github.io/ai-memory-ship-gate/)** ·
-**📖 [AI-NHI insights](https://alphaonedev.github.io/ai-memory-ai2ai-gate/insights/)** ·
-**🐳 [Reproduce locally](https://alphaonedev.github.io/ai-memory-ai2ai-gate/local-docker-mesh/)**
+**🧪 [Evidence Hub (campaigns)](evidence/)** ·
+**📊 [Frozen Claims](evidence.html)**
+
+> The v0.6.x-era A2A-gate / Ship-gate GitHub Pages sites (`ai-memory-ai2ai-gate`,
+> `ai-memory-ship-gate`) are retired as of the v1.0.0 docs consolidation
+> (#2034) — their evidence is indexed on the [Evidence Hub](evidence/) above.
 
 </div>
 
