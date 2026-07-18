@@ -244,6 +244,7 @@ mod tests {
                 mean: 0.55,
                 buckets: [0, 0, 1, 0, 1, 1, 0, 0, 0, 0],
                 consumption_utility: Some(0.75),
+                consume_access_divergence: None,
             }],
         };
         let s = render_table(&r);
@@ -268,6 +269,7 @@ mod tests {
                 mean: 0.5,
                 buckets: [0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
                 consumption_utility: None,
+                consume_access_divergence: None,
             }],
         };
         let s = render_table(&r);

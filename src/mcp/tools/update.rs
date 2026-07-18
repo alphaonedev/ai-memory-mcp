@@ -29,6 +29,24 @@ pub struct UpdateRequest {
     #[serde(default)]
     pub content: Option<String>,
 
+    #[schemars(
+        description = "#1974 patch: raw text appended to the end of current content (verbatim, no separator). Mutually exclusive with `content` and `content_replace_*`; empty is rejected."
+    )]
+    #[serde(default)]
+    pub content_append: Option<String>,
+
+    #[schemars(
+        description = "#1974 patch: substring to replace in current content. MUST occur exactly once (0 or >1 matches → typed error, never a silent first-match). Requires `content_replace_to`; mutually exclusive with `content`/`content_append`."
+    )]
+    #[serde(default)]
+    pub content_replace_from: Option<String>,
+
+    #[schemars(
+        description = "#1974 patch: replacement text for the unique `content_replace_from` match (may be empty = deletion). Requires `content_replace_from`."
+    )]
+    #[serde(default)]
+    pub content_replace_to: Option<String>,
+
     #[serde(default)]
     pub tier: Option<String>,
 
@@ -152,7 +170,9 @@ pub(super) fn handle_update(
         return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
     };
     let title = params["title"].as_str();
-    let content = params["content"].as_str();
+    // #1974 — the full-replacement `content`; the opt-in patch primitive
+    // (assembled below) takes precedence and is mutually exclusive with it.
+    let raw_content = params["content"].as_str();
     let tier = params["tier"].as_str().and_then(Tier::from_str);
     let namespace = params["namespace"].as_str();
     let tags: Option<Vec<String>> = params["tags"].as_array().map(|a| {
@@ -175,7 +195,46 @@ pub(super) fn handle_update(
     // underlying storage::update_with_expected_version refuses the
     // mutation with a typed VersionConflict envelope if the stored
     // row's `version` no longer matches.
-    let expected_version = params["expected_version"].as_i64();
+    let mut expected_version = params["expected_version"].as_i64();
+    // #1974 — opt-in content patch primitive. Assemble the FULL replacement
+    // content from the CURRENT stored content plus a single append XOR
+    // unique-match replace op, then thread the result through the SAME
+    // `validate_content` (empty-reject + secret-screen of the RESULT, below)
+    // and version-gated CAS a full-content update takes — so the patch is a
+    // pre-step, not a new write path. The read pins the version the content
+    // was assembled against and threads it as `expected_version` (TOCTOU
+    // fail-close: a concurrent write between the read and the CAS surfaces as
+    // a VersionConflict); a caller-supplied `expected_version` must agree
+    // with the observed version, else it is rejected here before any write.
+    let patch = crate::content_patch::ContentPatch {
+        append: params[param_names::CONTENT_APPEND].as_str(),
+        replace_from: params[param_names::CONTENT_REPLACE_FROM].as_str(),
+        replace_to: params[param_names::CONTENT_REPLACE_TO].as_str(),
+    };
+    let patched_content: Option<String> = if patch.is_active() {
+        if raw_content.is_some() {
+            return Err("content cannot be combined with content_append/content_replace_* (full replacement and patch are mutually exclusive)".into());
+        }
+        let current = db::get(conn, &resolved_id)
+            .map_err(|e| e.to_string())?
+            .ok_or(crate::errors::msg::MEMORY_NOT_FOUND)?;
+        if let Some(expected) = expected_version
+            && expected != current.version
+        {
+            return Err(conflict_or_string(&anyhow::Error::new(VersionConflict {
+                id: resolved_id.clone(),
+                expected,
+                current: current.version,
+            })));
+        }
+        expected_version = Some(current.version);
+        Some(patch.apply(&current.content).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+    // The patched result (when present) is the effective content for the
+    // rest of the flow — validation, re-embed, and the CAS all see it.
+    let content: Option<&str> = patched_content.as_deref().or(raw_content);
     // v0.8.0 Pillar 2 (#1709) — optional lifecycle transition target.
     // An explicit, non-parseable value is REJECTED here (naming the valid
     // set); the legality of a parseable transition (current → requested)
@@ -1356,6 +1415,286 @@ mod tests {
         assert_eq!(
             db::get(&conn, &id).unwrap().unwrap().lifecycle_state,
             LifecycleState::Open
+        );
+    }
+
+    // ---- #1974 content patch primitive (append / unique-match replace) ----
+
+    fn patch_conn_with(content: &str) -> (rusqlite::Connection, String) {
+        let conn = fresh_conn();
+        let mut mem = make_mem("patch");
+        mem.content = content.to_string();
+        let id = db::insert(&conn, &mem).expect("ins");
+        (conn, id)
+    }
+
+    #[test]
+    fn content_append_concatenates_onto_current() {
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
+        let (conn, id) = patch_conn_with("base");
+        let out = handle_update(
+            &conn,
+            &json!({"id": id, "content_append": " tail"}),
+            None,
+            None,
+            None,
+        )
+        .expect("append ok");
+        assert_eq!(out["memory"]["content"].as_str(), Some("base tail"));
+        // Auto-captured version threaded → CAS bumped 1 → 2.
+        assert_eq!(out["memory"]["version"].as_i64(), Some(2));
+    }
+
+    #[test]
+    fn content_append_empty_rejected() {
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
+        let (conn, id) = patch_conn_with("base");
+        let err = handle_update(
+            &conn,
+            &json!({"id": id, "content_append": ""}),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("content_append must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn content_replace_unique_ok() {
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
+        let (conn, id) = patch_conn_with("alpha beta gamma");
+        let out = handle_update(
+            &conn,
+            &json!({"id": id, "content_replace_from": "beta", "content_replace_to": "BETA"}),
+            None,
+            None,
+            None,
+        )
+        .expect("replace ok");
+        assert_eq!(out["memory"]["content"].as_str(), Some("alpha BETA gamma"));
+    }
+
+    #[test]
+    fn content_replace_not_found_errors() {
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
+        let (conn, id) = patch_conn_with("alpha beta");
+        let err = handle_update(
+            &conn,
+            &json!({"id": id, "content_replace_from": "zzz", "content_replace_to": "x"}),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("not found in current content"), "got: {err}");
+        // Fail-closed: no bytes changed.
+        let after = db::get(&conn, &id).unwrap().unwrap();
+        assert_eq!(after.content, "alpha beta");
+        assert_eq!(after.version, 1);
+    }
+
+    #[test]
+    fn content_replace_multiple_errors_no_write() {
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
+        let (conn, id) = patch_conn_with("x x x");
+        let err = handle_update(
+            &conn,
+            &json!({"id": id, "content_replace_from": "x", "content_replace_to": "y"}),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("matched 3 times"), "got: {err}");
+        // No partial write: the row is unchanged (fail-closed on non-unique).
+        let after = db::get(&conn, &id).unwrap().unwrap();
+        assert_eq!(after.content, "x x x");
+        assert_eq!(after.version, 1);
+    }
+
+    #[test]
+    fn content_and_patch_mutually_exclusive() {
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
+        let (conn, id) = patch_conn_with("base");
+        let err = handle_update(
+            &conn,
+            &json!({"id": id, "content": "full", "content_append": " tail"}),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn append_plus_replace_is_rejected() {
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
+        let (conn, id) = patch_conn_with("a b");
+        let err = handle_update(
+            &conn,
+            &json!({
+                "id": id,
+                "content_append": " tail",
+                "content_replace_from": "a",
+                "content_replace_to": "z",
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn empty_patched_result_rejected() {
+        // Replacing the entire content with "" assembles an empty result,
+        // which validate_content refuses (proves the RESULT is re-validated,
+        // not the fragment).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
+        let (conn, id) = patch_conn_with("solo");
+        let err = handle_update(
+            &conn,
+            &json!({"id": id, "content_replace_from": "solo", "content_replace_to": ""}),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("content cannot be empty"), "got: {err}");
+        // Fail-closed: the original bytes survive the refused delete-to-empty.
+        assert_eq!(db::get(&conn, &id).unwrap().unwrap().content, "solo");
+    }
+
+    #[test]
+    fn patch_version_fail_close_on_stale_expected() {
+        // A caller-supplied expected_version that disagrees with the observed
+        // version is refused BEFORE any write (TOCTOU fail-close).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
+        let (conn, id) = patch_conn_with("base"); // version == 1
+        let err = handle_update(
+            &conn,
+            &json!({"id": id, "content_append": " tail", "expected_version": 999}),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("conflict"), "got: {err}");
+        let after = db::get(&conn, &id).unwrap().unwrap();
+        assert_eq!(after.content, "base", "no write on version conflict");
+    }
+
+    #[test]
+    fn patch_matching_expected_version_succeeds() {
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
+        let (conn, id) = patch_conn_with("base"); // version == 1
+        let out = handle_update(
+            &conn,
+            &json!({"id": id, "content_append": " tail", "expected_version": 1}),
+            None,
+            None,
+            None,
+        )
+        .expect("matching version ok");
+        assert_eq!(out["memory"]["content"].as_str(), Some("base tail"));
+    }
+
+    #[test]
+    fn patch_preserves_all_non_content_fields() {
+        // Data-integrity: a content patch mutates ONLY the durable TEXT; every
+        // other field (tags, priority, namespace, confidence, provenance
+        // agent_id) is preserved byte-for-byte — identical to what a full
+        // `content` replacement does.
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
+        let (conn, id) = patch_conn_with("keep-fields");
+        let before = db::get(&conn, &id).unwrap().unwrap();
+        let out = handle_update(
+            &conn,
+            &json!({"id": id, "content_append": " +"}),
+            None,
+            None,
+            None,
+        )
+        .expect("append ok");
+        assert_eq!(out["memory"]["content"].as_str(), Some("keep-fields +"));
+        let after = db::get(&conn, &id).unwrap().unwrap();
+        assert_eq!(after.tags, before.tags);
+        assert_eq!(after.priority, before.priority);
+        assert_eq!(after.namespace, before.namespace);
+        assert!((after.confidence - before.confidence).abs() < f64::EPSILON);
+        assert_eq!(after.tier, before.tier);
+        assert_eq!(
+            after.metadata.get("agent_id"),
+            before.metadata.get("agent_id"),
+            "immutable provenance agent_id preserved across patch"
+        );
+    }
+
+    #[test]
+    fn patch_leaves_genesis_cid_consistent() {
+        // #1825 — the content-id is a GENESIS/immutable content-address that
+        // sits ALONGSIDE the UUID; the in-place update path (which the patch
+        // threads through) does NOT re-stamp it, so the stored cid stays a
+        // stable reference and its cid_genesis pre-image stays consistent (no
+        // corruption). This asserts the patch inherits that behaviour exactly.
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
+        let (conn, id) = patch_conn_with("genesis body");
+        let cid_before = db::get(&conn, &id).unwrap().unwrap().cid;
+        assert!(cid_before.is_some(), "insert stamps a genesis cid");
+        handle_update(
+            &conn,
+            &json!({"id": id, "content_append": " edit"}),
+            None,
+            None,
+            None,
+        )
+        .expect("append ok");
+        let after = db::get(&conn, &id).unwrap().unwrap();
+        assert_eq!(after.content, "genesis body edit");
+        assert_eq!(
+            after.cid, cid_before,
+            "genesis cid is stable across an in-place content patch"
+        );
+    }
+
+    #[test]
+    fn patch_snapshots_prior_content_for_undo() {
+        // #1727 composition: a content-changing patch archives the prior
+        // content under archive_reason='in_place_edit' (because it threads
+        // through the SAME update_with_expected_version path), so undo-edit
+        // can recover the pre-patch text — the durable prior TEXT is never
+        // lost. Verified via the archive snapshot slot (encryption off in
+        // tests → content column holds plaintext).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
+        let (conn, id) = patch_conn_with("original");
+        handle_update(
+            &conn,
+            &json!({"id": id, "content_replace_from": "original", "content_replace_to": "revised"}),
+            None,
+            None,
+            None,
+        )
+        .expect("replace ok");
+        assert_eq!(db::get(&conn, &id).unwrap().unwrap().content, "revised");
+        // The pre-patch content is retrievable from the in_place_edit snapshot.
+        let snapshot_content: Option<String> = conn
+            .query_row(
+                "SELECT content FROM archived_memories \
+                 WHERE id = ?1 AND archive_reason = ?2",
+                rusqlite::params![id, crate::models::field_names::ARCHIVE_REASON_IN_PLACE_EDIT],
+                |r| r.get(0),
+            )
+            .ok();
+        assert_eq!(
+            snapshot_content.as_deref(),
+            Some("original"),
+            "prior TEXT preserved in in_place_edit snapshot for undo"
         );
     }
 }

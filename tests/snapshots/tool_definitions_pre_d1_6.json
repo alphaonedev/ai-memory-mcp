@@ -872,6 +872,18 @@
           "content": {
             "type": "string"
           },
+          "content_append": {
+            "description": "#1974 patch: raw text appended to the end of current content (verbatim, no separator). Mutually exclusive with `content` and `content_replace_*`; empty is rejected.",
+            "type": "string"
+          },
+          "content_replace_from": {
+            "description": "#1974 patch: substring to replace in current content. MUST occur exactly once (0 or >1 matches → typed error, never a silent first-match). Requires `content_replace_to`; mutually exclusive with `content`/`content_append`.",
+            "type": "string"
+          },
+          "content_replace_to": {
+            "description": "#1974 patch: replacement text for the unique `content_replace_from` match (may be empty = deletion). Requires `content_replace_from`.",
+            "type": "string"
+          },
           "edit_source": {
             "default": "human",
             "description": "#888 'human'=in-place; 'llm'/'hook'=archive+supersede.",
