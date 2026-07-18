@@ -555,7 +555,12 @@ pub async fn update_memory(
                     match emb.embed(&text) {
                         Ok(vec) => {
                             if let Some(ref l) = lock_opt
-                                && let Err(e) = db::set_embedding(&l.0, &resolved_id, &vec)
+                                && let Err(e) = db::set_embedding(
+                                    &l.0,
+                                    &resolved_id,
+                                    &vec,
+                                    &emb.space_fingerprint(),
+                                )
                             {
                                 tracing::warn!(
                                     "failed to refresh embedding for {resolved_id}: {e}"

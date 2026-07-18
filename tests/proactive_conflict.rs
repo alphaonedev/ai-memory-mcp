@@ -78,7 +78,13 @@ fn make_mem(title: &str, content: &str, ns: &str) -> Memory {
 /// then `db::set_embedding`.
 fn insert_with_embedding(conn: &rusqlite::Connection, mem: &Memory, embedding: &[f32]) -> String {
     let id = db::insert(conn, mem).expect("insert");
-    db::set_embedding(conn, &id, embedding).expect("set_embedding");
+    db::set_embedding(
+        conn,
+        &id,
+        embedding,
+        &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
+    )
+    .expect("set_embedding");
     id
 }
 

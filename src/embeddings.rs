@@ -107,19 +107,80 @@ const PREFIX_SCHEME_NOMIC_TASK_V1: &str = "nomic-task-v1";
 /// NEVER collide, so the gate can produce a false MISMATCH (→ a safe
 /// local re-embed) but NEVER a false MATCH (→ corruption): degrade, never
 /// corrupt (#2168 CORE INVARIANT). M-STRONG-TYPES-GUARD.
+//
+// #2167 GENERALISATION (shared SSOT for federation-gate + per-row write-stamp +
+// recall-gate + adoption): the body below keeps #2168's prose-strip AND adds
+// the #2167 daemon-native family-fold + `:latest`-strip so every spelling of
+// the two native families collapses to one id (snake wire form `nomic_embed_v15`,
+// shortname `all-minilm`, Ollama tag, HF id). The prefix is derived from the
+// FOLDED (canonical) id so `nomic_embed_v15` (underscore — misses the
+// hyphenated `nomic-embed` needle) still yields `nomic-task-v1` via its fold.
 #[must_use]
 pub fn embedding_space_fingerprint(model: &str) -> String {
-    let id = model
+    // 1. Strip #2168's model_description() prose suffix (`"id (prose)"` → id).
+    let bare = model
         .split_once(" (")
         .map_or(model, |(head, _)| head)
-        .trim()
-        .to_ascii_lowercase();
+        .trim();
+    // 2. Fold the two daemon-native families to their canonical HF id; else
+    //    lowercase + strip ONE trailing `:latest` (Ollama's implicit default;
+    //    any other tag e.g. `:v1.5` is version-meaningful and kept).
+    let id = if let Some(known) = crate::config::EmbeddingModel::from_canonical_id(bare) {
+        known.hf_model_id().to_ascii_lowercase()
+    } else {
+        let lowered = bare.to_ascii_lowercase();
+        lowered
+            .strip_suffix(":latest")
+            .unwrap_or(&lowered)
+            .to_string()
+    };
+    // 3. Prefix from the CANONICAL (post-fold) id via the live embed predicate.
     let scheme = if Embedder::model_requires_nomic_prefix(&id) {
         PREFIX_SCHEME_NOMIC_TASK_V1
     } else {
         PREFIX_SCHEME_NONE
     };
     format!("{id}#{scheme}")
+}
+
+/// v1.0.0 #2167 (S8 restore/migrate heal) — the process-wide ACTIVE
+/// embedding-space fingerprint, seeded once at every embedder-construction
+/// boot site (serve / mcp) from the resolved model, alongside the §5
+/// adoption + §6 census. Read by the archive-RESTORE heal
+/// ([`crate::storage::restore_archived`] /
+/// [`crate::storage::restore_archived_for_caller`] /
+/// `PostgresStore::archive_restore`) to classify a restored row's carried
+/// `embedding_space`:
+/// - space == active → the vector restores INTACT (no perf regression /
+///   no needless re-embed on a homogeneous corpus);
+/// - space != active OR (vector present but space NULL) → the whole
+///   embedding trio (`embedding`/`embedding_dim`/`embedding_space`) is
+///   NULLed so the existing `list_unembedded` backfill re-embeds the row
+///   from the durable text under the LIVE space = SELF-HEAL.
+///
+/// `None` (unseeded: a keyword-only process, or a CLI verb that resolved no
+/// embedder) makes the heal carry any STAMPED vector verbatim, but STILL
+/// NULLs a vector with NO provenance (`embedding_space IS NULL`) — an
+/// unverifiable vector is never re-introduced as valid. Degrade, never
+/// corrupt (North Star).
+static ACTIVE_EMBEDDING_SPACE: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Seed (or clear, with `None`) the process-wide active embedding-space
+/// fingerprint. Idempotent; the last writer wins. Called at every boot
+/// site that resolves an embedder, and by tests. A poisoned lock is
+/// tolerated (the seed is best-effort — a failed seed degrades the restore
+/// heal to its `None` posture, which is still safe).
+pub fn set_active_embedding_space(space: Option<String>) {
+    if let Ok(mut guard) = ACTIVE_EMBEDDING_SPACE.write() {
+        *guard = space;
+    }
+}
+
+/// Read the process-wide active embedding-space fingerprint (`None` when
+/// unseeded). See [`set_active_embedding_space`].
+#[must_use]
+pub fn active_embedding_space() -> Option<String> {
+    ACTIVE_EMBEDDING_SPACE.read().ok().and_then(|g| g.clone())
 }
 
 #[cfg(test)]
@@ -136,7 +197,10 @@ mod space_fingerprint_2168_tests {
         let prose = embedding_space_fingerprint("nomic-embed-text (768-dim, remote)");
         let bare = embedding_space_fingerprint("nomic-embed-text");
         assert_eq!(prose, bare, "prose suffix must not change the fingerprint");
-        assert_eq!(prose, "nomic-embed-text#nomic-task-v1");
+        // #2167 generalisation: the daemon-native nomic family FOLDS to its
+        // canonical HF id (so every spelling — Ollama tag, snake wire form,
+        // HF id — collapses to one space).
+        assert_eq!(prose, "nomic-ai/nomic-embed-text-v1.5#nomic-task-v1");
     }
 
     /// Two DIFFERENT 768-dim models (the exact #2168 attack: a
@@ -160,7 +224,9 @@ mod space_fingerprint_2168_tests {
     fn local_minilm_differs_from_nomic() {
         let minilm = embedding_space_fingerprint("all-MiniLM-L6-v2 (384-dim, local)");
         let nomic = embedding_space_fingerprint("nomic-embed-text (768-dim, remote)");
-        assert_eq!(minilm, "all-minilm-l6-v2#none");
+        // #2167 generalisation: the daemon-native MiniLM family folds to its
+        // canonical HF id.
+        assert_eq!(minilm, "sentence-transformers/all-minilm-l6-v2#none");
         assert_ne!(minilm, nomic);
     }
 
@@ -365,6 +431,18 @@ pub trait Embed: Send + Sync {
     fn is_degraded(&self) -> bool {
         false
     }
+
+    /// #2167 — the [`embedding_space_fingerprint`] of the vectors this embedder
+    /// produces, exposed on the `dyn Embed` interface so the trait-generic
+    /// backfill sweep ([`crate::store::run_embedding_backfill_on_store`],
+    /// [`crate::mcp::run_embedding_backfill_with_batch_size`]) can stamp the
+    /// live space without a concrete `Embedder`. The production [`Embedder`]
+    /// overrides it (delegating to its inherent #2168 `space_fingerprint`); the
+    /// default here is a stable sentinel (a mock embedder's vectors are never
+    /// scored against a live query in production).
+    fn space_fingerprint(&self) -> String {
+        embedding_space_fingerprint("mock-embedder")
+    }
 }
 
 /// Semantic embedding engine supporting multiple backends.
@@ -416,7 +494,17 @@ pub enum Embedder {
 /// with no operator-visible signal. This enum preserves the same `0.0`
 /// numerical fallback at the call site but lets recall *count and surface*
 /// the mismatch instead of swallowing it.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// v1.0.0 #2167 — the space-identity axis extends this: a stored vector
+/// may share the query's DIMENSION yet live in a DIFFERENT vector space
+/// (a same-dim model swap), which the dim gate alone cannot catch. The
+/// two new variants let [`Embedder::cosine_similarity_space_checked`]
+/// exclude foreign / unverified rows from semantic scoring while recall
+/// counts and surfaces them (degraded, never wrong). `Copy` is dropped
+/// because [`CosineComparison::SpaceMismatch`] carries an owned space
+/// token (M-ERRORS-CANONICAL-STRUCTS — the `DimensionMismatch`
+/// precedent shape is preserved).
+#[derive(Debug, Clone, PartialEq)]
 pub enum CosineComparison {
     /// Both vectors share dimensionality; carries the cosine score.
     Comparable(f32),
@@ -429,6 +517,19 @@ pub enum CosineComparison {
         /// Dimensionality of the stored embedding (legacy model).
         stored_dim: usize,
     },
+    /// v1.0.0 #2167 — the stored vector is VERIFIED in a DIFFERENT
+    /// embedding space than the live query embedder's (its
+    /// `embedding_space` token != the active fingerprint). NEVER scored;
+    /// remains keyword/FTS-recallable. Carries the stored space token so
+    /// telemetry / the heal WARN can name the offending fingerprint.
+    SpaceMismatch {
+        /// The stored row's `embedding_space` token (`<id>#<scheme>`).
+        stored_space: String,
+    },
+    /// v1.0.0 #2167 — the stored vector has NO provenance token
+    /// (`embedding_space IS NULL` after §5 adoption). NEVER scored;
+    /// remains keyword/FTS-recallable.
+    UnverifiedSpace,
 }
 
 impl Embedder {
@@ -1028,6 +1129,54 @@ impl Embedder {
         CosineComparison::Comparable(Self::cosine_similarity(query, stored))
     }
 
+    /// v1.0.0 #2167 ★ — fingerprint-gated recall comparison. The load-
+    /// bearing correctness primitive: a stored row is scored **only
+    /// when** its `embedding_space` token equals the live embedder's
+    /// `active` fingerprint EXACTLY. Foreign AND NULL (unverified) rows
+    /// are excluded from semantic scoring — but callers keep them
+    /// keyword/FTS-recallable (degraded, never wrong, never invisible).
+    ///
+    /// The check ORDER is load-bearing (M-DOCUMENTED-MAGIC):
+    /// 1. **space identity** — a Verified-but-foreign row is
+    ///    [`CosineComparison::SpaceMismatch`]; a NULL row is
+    ///    [`CosineComparison::UnverifiedSpace`]. Neither is scored.
+    /// 2. **dim** (defense-in-depth) — a Verified-active row whose
+    ///    vector length nonetheless disagrees is corrupt →
+    ///    [`CosineComparison::DimensionMismatch`].
+    /// 3. **score** — [`CosineComparison::Comparable`].
+    ///
+    /// `stored_space` is the raw column value (`None` = SQL NULL). This
+    /// never substring-matches: the fingerprint is compared as a whole
+    /// value (api-newtype-safety intent, over the shared-String SSOT).
+    #[must_use]
+    pub fn cosine_similarity_space_checked(
+        query: &[f32],
+        stored: &[f32],
+        active: &str,
+        stored_space: Option<&str>,
+    ) -> CosineComparison {
+        // (1) space identity — the fail-closed gate.
+        match stored_space {
+            None => return CosineComparison::UnverifiedSpace,
+            Some(s) if s != active => {
+                return CosineComparison::SpaceMismatch {
+                    stored_space: s.to_string(),
+                };
+            }
+            Some(_) => {}
+        }
+        // (2) dim — defense-in-depth; a same-space vector whose length
+        // disagrees is corrupt, not merely foreign.
+        if query.len() != stored.len() {
+            return CosineComparison::DimensionMismatch {
+                query_dim: query.len(),
+                stored_dim: stored.len(),
+            };
+        }
+        // (3) score.
+        CosineComparison::Comparable(Self::cosine_similarity(query, stored))
+    }
+
     /// Fuse a primary query embedding with a secondary context embedding via
     /// weighted linear combination (v0.6.0.0 contextual recall).
     ///
@@ -1165,6 +1314,11 @@ impl Embed for Embedder {
 
     fn is_degraded(&self) -> bool {
         Self::is_degraded(self)
+    }
+
+    fn space_fingerprint(&self) -> String {
+        // Delegate to the inherent #2168 method (returns the SSOT fingerprint).
+        Embedder::space_fingerprint(self)
     }
 }
 
@@ -1311,6 +1465,95 @@ pub fn decoded_dim(bytes: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- #2167 §0 — embedding_space_fingerprint minting ----
+
+    #[test]
+    fn embedding_space_compiled_default_pins() {
+        // §0.4 — a future default-model change becomes a deliberate,
+        // test-visible act (issue table row b′). These two literals ARE the
+        // tier-preset defaults' fingerprints.
+        assert_eq!(
+            embedding_space_fingerprint("sentence-transformers/all-MiniLM-L6-v2"),
+            "sentence-transformers/all-minilm-l6-v2#none"
+        );
+        assert_eq!(
+            embedding_space_fingerprint("nomic-ai/nomic-embed-text-v1.5"),
+            "nomic-ai/nomic-embed-text-v1.5#nomic-task-v1"
+        );
+    }
+
+    #[test]
+    fn embedding_space_folds_known_family_spellings() {
+        // Every spelling of the two daemon-native families folds to ONE token.
+        let minilm = "sentence-transformers/all-minilm-l6-v2#none";
+        for spelling in [
+            "mini_lm_l6_v2",
+            "all-MiniLM-L6-v2",
+            "all-minilm",
+            "sentence-transformers/all-MiniLM-L6-v2",
+        ] {
+            assert_eq!(embedding_space_fingerprint(spelling), minilm, "{spelling}");
+        }
+        let nomic = "nomic-ai/nomic-embed-text-v1.5#nomic-task-v1";
+        for spelling in [
+            "nomic_embed_v15",
+            "nomic-embed-text",
+            "nomic-embed-text-v1.5",
+            "nomic-ai/nomic-embed-text-v1.5",
+        ] {
+            assert_eq!(embedding_space_fingerprint(spelling), nomic, "{spelling}");
+        }
+    }
+
+    #[test]
+    fn embedding_space_api_model_lowercases_and_strips_latest() {
+        // Arbitrary API model: lowercase + strip ONE trailing ":latest".
+        assert_eq!(
+            embedding_space_fingerprint("Google/Gemini-Embedding-2"),
+            "google/gemini-embedding-2#none"
+        );
+        assert_eq!(
+            embedding_space_fingerprint("some-embed:LATEST"),
+            "some-embed#none"
+        );
+        // A version-meaningful tag is preserved.
+        assert_eq!(
+            embedding_space_fingerprint("some-embed:v1.5"),
+            "some-embed:v1.5#none"
+        );
+    }
+
+    #[test]
+    fn embedding_space_strips_shipped_prose_suffix() {
+        // #2168 wire-tolerance: a federated ShippedEmbedding.model carries
+        // model_description() prose. The SSOT strips it so a prose-suffixed
+        // shipped model and its bare id mint the SAME fingerprint — the
+        // stamp(#2167 §2-EXC) and the gate(#2168) can never disagree.
+        assert_eq!(
+            embedding_space_fingerprint("nomic-embed-text-v1.5 (768-dim, ~270 MB)"),
+            embedding_space_fingerprint("nomic-embed-text-v1.5"),
+        );
+        assert_eq!(
+            embedding_space_fingerprint("sentence-transformers/all-MiniLM-L6-v2 (384-dim, ~90 MB)"),
+            "sentence-transformers/all-minilm-l6-v2#none",
+        );
+        // An arbitrary API model with prose still strips + lowercases.
+        assert_eq!(
+            embedding_space_fingerprint("Gemini-Embedding-2 (3072-dim)"),
+            "gemini-embedding-2#none",
+        );
+    }
+
+    #[test]
+    fn embedding_space_over_distinguishes_conservatively() {
+        // §0.1 step 5 — two remote spellings that survive the fold mint
+        // DIFFERENT fingerprints (the safe DEGRADED-not-WRONG direction).
+        assert_ne!(
+            embedding_space_fingerprint("google/gemini-embedding-2"),
+            embedding_space_fingerprint("gemini-embedding-2")
+        );
+    }
 
     #[test]
     fn cosine_similarity_identical() {
@@ -1546,9 +1789,9 @@ mod tests {
         let plain = Embedder::cosine_similarity(&a, &b);
         match Embedder::cosine_similarity_checked(&a, &b) {
             CosineComparison::Comparable(c) => assert!((c - plain).abs() < 1e-6),
-            CosineComparison::DimensionMismatch { .. } => {
-                panic!("equal-length vectors must compare as Comparable")
-            }
+            // `cosine_similarity_checked` (the dim-only comparator) never
+            // produces the #2167 space variants.
+            other => panic!("equal-length vectors must compare as Comparable, got {other:?}"),
         }
     }
 
@@ -1567,8 +1810,8 @@ mod tests {
                 assert_eq!(query_dim, 5);
                 assert_eq!(stored_dim, 3);
             }
-            CosineComparison::Comparable(_) => {
-                panic!("differing-length vectors must report DimensionMismatch")
+            other => {
+                panic!("differing-length vectors must report DimensionMismatch, got {other:?}")
             }
         }
     }

@@ -184,7 +184,13 @@ fn recall_telemetry_reports_embedding_dimension_mismatch() {
     );
     let id = ai_memory::db::insert(&conn, &mem).expect("insert");
     let stored_embedding = vec![0.5_f32; STORED_EMBED_DIM];
-    ai_memory::db::set_embedding(&conn, &id, &stored_embedding).expect("set_embedding");
+    ai_memory::db::set_embedding(
+        &conn,
+        &id,
+        &stored_embedding,
+        &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
+    )
+    .expect("set_embedding");
 
     let scoring = ResolvedScoring::default();
     // Active embedder produces ACTIVE_QUERY_DIM vectors — a different
@@ -208,7 +214,8 @@ fn recall_telemetry_reports_embedding_dimension_mismatch() {
         &scoring,
         false,
         None,
-        None, // #1720 caller
+        None, // #1720 caller,
+        None,
     )
     .expect("recall_hybrid_with_telemetry");
 
@@ -232,7 +239,13 @@ fn recall_telemetry_reports_no_mismatch_when_dimensions_agree() {
     );
     let id = ai_memory::db::insert(&conn, &mem).expect("insert");
     let stored_embedding = vec![0.5_f32; EMBED_DIM];
-    ai_memory::db::set_embedding(&conn, &id, &stored_embedding).expect("set_embedding");
+    ai_memory::db::set_embedding(
+        &conn,
+        &id,
+        &stored_embedding,
+        &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
+    )
+    .expect("set_embedding");
 
     let scoring = ResolvedScoring::default();
     let query_embedding = vec![0.5_f32; EMBED_DIM];
@@ -254,7 +267,8 @@ fn recall_telemetry_reports_no_mismatch_when_dimensions_agree() {
         &scoring,
         false,
         None,
-        None, // #1720 caller
+        None, // #1720 caller,
+        None,
     )
     .expect("recall_hybrid_with_telemetry");
 

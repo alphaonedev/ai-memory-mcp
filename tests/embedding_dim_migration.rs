@@ -318,7 +318,7 @@ async fn http_write_path_accepts_768_after_auto_migrate() {
     let ctx = CallerContext::for_agent("issue-877-test");
     let embedding: Vec<f32> = vec![0.0_f32; 768];
     store
-        .store_with_embedding(&ctx, &mem, Some(&embedding))
+        .store_with_embedding(&ctx, &mem, Some(&embedding), Some("test-space#none"))
         .await
         .expect("768-dim insert must succeed after auto-migrate");
 
@@ -399,7 +399,7 @@ async fn list_survives_embedding_dim_alter_without_cached_plan_503_1881() {
         };
         let embedding: Vec<f32> = vec![0.1_f32; 384];
         store
-            .store_with_embedding(&ctx, &mem, Some(&embedding))
+            .store_with_embedding(&ctx, &mem, Some(&embedding), Some("test-space#none"))
             .await
             .expect("seed 384-dim row");
     }
@@ -647,7 +647,7 @@ async fn migrate_embedding_dim_refuses_when_embeddings_exist_without_force() {
     let ctx = CallerContext::for_agent("issue-1781-test");
     let embedding: Vec<f32> = vec![0.25_f32; 384];
     store
-        .store_with_embedding(&ctx, &mem, Some(&embedding))
+        .store_with_embedding(&ctx, &mem, Some(&embedding), Some("test-space#none"))
         .await
         .expect("seed 384-dim embedding");
 

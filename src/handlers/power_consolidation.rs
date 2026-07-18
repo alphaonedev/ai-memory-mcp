@@ -936,6 +936,8 @@ pub async fn load_family_handler(
             since: None,
             until: None,
             limit: MAX_BULK_SIZE,
+            // #2167 — load_family listing never runs the recall space gate.
+            active_embedding_space: None,
         };
         // QC P1 fix (2026-05-20): load_family lists every memory in
         // the namespace tagged with a `family` metadata field. With

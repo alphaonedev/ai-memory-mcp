@@ -703,7 +703,7 @@ pub(crate) fn handle_store(
         if content_changed && let Some(emb) = embedder {
             let text = crate::embeddings::embedding_document(&mem.title, &mem.content);
             if let Ok(embedding) = emb.embed(&text) {
-                let _ = db::set_embedding(conn, &dup.id, &embedding);
+                let _ = db::set_embedding(conn, &dup.id, &embedding, &emb.space_fingerprint());
                 if let Some(idx) = vector_index {
                     idx.remove(&dup.id);
                     idx.insert(dup.id.clone(), embedding);

@@ -362,10 +362,14 @@ pub(crate) fn run_with_embedder(
     // the semantic phase linear-scans the embedding column). The
     // cheap COUNT probe avoids even decoding the blobs when the
     // build is going to be skipped.
-    let vector_index = if embedder.is_some()
+    // v1.0.0 #2167 §3.3 layer 1 — the CLI-local HNSW seed set is filtered
+    // to the active embedder's space (foreign vectors never enter the
+    // graph). `None` when there is no embedder (keyword-only).
+    let cli_active_space: Option<String> = embedder.as_ref().map(|e| e.space_fingerprint());
+    let vector_index = if let Some(active) = cli_active_space.as_deref()
         && db::count_embedded_memories(conn).is_ok_and(should_build_cli_hnsw)
     {
-        match db::get_all_embeddings(conn) {
+        match db::get_all_embeddings(conn, active) {
             Ok(entries) if !entries.is_empty() => Some(hnsw::VectorIndex::build(entries)),
             _ => Some(hnsw::VectorIndex::empty()),
         }
@@ -430,6 +434,8 @@ pub(crate) fn run_with_embedder(
                     args.include_archived,
                     args.source_uri_prefix.as_deref(),
                     vis_caller.as_deref(),
+                    // v1.0.0 #2167 §3 — active embedder fingerprint gate.
+                    cli_active_space.as_deref(),
                 )?;
                 if let Some(ref ce) = reranker {
                     (

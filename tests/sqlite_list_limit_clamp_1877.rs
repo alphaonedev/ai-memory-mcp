@@ -42,6 +42,7 @@ async fn sqlite_list_clamps_limit_to_list_max_limit_1877() {
         since: None,
         until: None,
         limit: 5000, // > LIST_MAX_LIMIT
+        active_embedding_space: None,
     };
 
     let rows = store.list(&ctx, &filter).await.expect("list");

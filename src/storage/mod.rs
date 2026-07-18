@@ -17,6 +17,9 @@ use std::path::Path;
 
 // ── #1558 batch 6 — file-local SQL SSOT (pm-v3.1 hardcoded-literal gate) ──
 const SQL_DELETE_MEMORY_BY_ID: &str = "DELETE FROM memories WHERE id = ?1";
+/// Reused dynamic-query namespace-filter fragment (pm-v3.1 no-scattered-literals
+/// gate — one named const referenced by the `list` + `reembed` keyset builders).
+const SQL_FRAGMENT_AND_NAMESPACE_EQ: &str = " AND namespace = ?";
 const SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID: &str =
     "DELETE FROM namespace_meta WHERE standard_id = ?1";
 const SQL_MEMORY_EXISTS_COUNT: &str = "SELECT COUNT(*) > 0 FROM memories WHERE id = ?1";
@@ -3253,7 +3256,7 @@ pub(crate) fn archive_memory_no_tx(
              (id, tier, namespace, title, content, tags, priority, confidence,
               source, access_count, created_at, updated_at, last_accessed_at,
               expires_at, archived_at, archive_reason, metadata,
-              embedding, embedding_dim, original_tier, original_expires_at,
+              embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
@@ -3261,7 +3264,7 @@ pub(crate) fn archive_memory_no_tx(
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, ?1, ?2, metadata,
-                    embedding, embedding_dim, tier, expires_at,
+                    embedding, embedding_dim, embedding_space, tier, expires_at,
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
@@ -3340,7 +3343,7 @@ pub(crate) fn archive_memory_insert_only(conn: &Connection, id: &str, reason: &s
          (id, tier, namespace, title, content, tags, priority, confidence,
           source, access_count, created_at, updated_at, last_accessed_at,
           expires_at, archived_at, archive_reason, metadata,
-          embedding, embedding_dim, original_tier, original_expires_at,
+          embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
           reflection_depth, atomised_into, atom_of, memory_kind,
           entity_id, persona_version, citations, source_uri, source_span,
           confidence_source, confidence_signals, confidence_decayed_at,
@@ -3348,7 +3351,7 @@ pub(crate) fn archive_memory_insert_only(conn: &Connection, id: &str, reason: &s
          SELECT id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
                 expires_at, ?1, ?2, metadata,
-                embedding, embedding_dim, tier, expires_at,
+                embedding, embedding_dim, embedding_space, tier, expires_at,
                 reflection_depth, atomised_into, atom_of, memory_kind,
                 entity_id, persona_version, citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
@@ -3694,7 +3697,7 @@ pub fn archive_memory_for_caller(
              (id, tier, namespace, title, content, tags, priority, confidence,
               source, access_count, created_at, updated_at, last_accessed_at,
               expires_at, archived_at, archive_reason, metadata,
-              embedding, embedding_dim, original_tier, original_expires_at,
+              embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
@@ -3702,7 +3705,7 @@ pub fn archive_memory_for_caller(
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, ?1, ?2, metadata,
-                    embedding, embedding_dim, tier, expires_at,
+                    embedding, embedding_dim, embedding_space, tier, expires_at,
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
@@ -4315,7 +4318,7 @@ pub fn forget(
                      (id, tier, namespace, title, content, tags, priority, confidence,
                       source, access_count, created_at, updated_at, last_accessed_at,
                       expires_at, archived_at, archive_reason, metadata,
-                      embedding, embedding_dim, original_tier, original_expires_at,
+                      embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
@@ -4323,7 +4326,7 @@ pub fn forget(
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?4, 'forget', metadata,
-                            embedding, embedding_dim, tier, expires_at,
+                            embedding, embedding_dim, embedding_space, tier, expires_at,
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
@@ -4344,7 +4347,7 @@ pub fn forget(
                      (id, tier, namespace, title, content, tags, priority, confidence,
                       source, access_count, created_at, updated_at, last_accessed_at,
                       expires_at, archived_at, archive_reason, metadata,
-                      embedding, embedding_dim, original_tier, original_expires_at,
+                      embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
@@ -4352,7 +4355,7 @@ pub fn forget(
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?3, 'forget', metadata,
-                            embedding, embedding_dim, tier, expires_at,
+                            embedding, embedding_dim, embedding_space, tier, expires_at,
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
@@ -4777,7 +4780,7 @@ pub fn forget_for_caller(
                      (id, tier, namespace, title, content, tags, priority, confidence,
                       source, access_count, created_at, updated_at, last_accessed_at,
                       expires_at, archived_at, archive_reason, metadata,
-                      embedding, embedding_dim, original_tier, original_expires_at,
+                      embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
@@ -4785,7 +4788,7 @@ pub fn forget_for_caller(
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?4, 'forget', metadata,
-                            embedding, embedding_dim, tier, expires_at,
+                            embedding, embedding_dim, embedding_space, tier, expires_at,
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
@@ -4809,7 +4812,7 @@ pub fn forget_for_caller(
                      (id, tier, namespace, title, content, tags, priority, confidence,
                       source, access_count, created_at, updated_at, last_accessed_at,
                       expires_at, archived_at, archive_reason, metadata,
-                      embedding, embedding_dim, original_tier, original_expires_at,
+                      embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
@@ -4817,7 +4820,7 @@ pub fn forget_for_caller(
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?3, 'forget', metadata,
-                            embedding, embedding_dim, tier, expires_at,
+                            embedding, embedding_dim, embedding_space, tier, expires_at,
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
@@ -5001,7 +5004,7 @@ pub fn build_list_query(
     let mut sql = String::from(SQL_LIST_BASE);
     let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(now.to_string())];
     if let Some(ns) = namespace {
-        sql.push_str(" AND namespace = ?");
+        sql.push_str(SQL_FRAGMENT_AND_NAMESPACE_EQ);
         params_vec.push(Box::new(ns.to_string()));
     }
     if let Some(t) = tier {
@@ -5686,6 +5689,9 @@ pub fn recall_with_telemetry(
         hnsw_candidates: 0,
         blend_weight_avg: 0.0,
         embedding_dim_mismatch: 0,
+        // v1.0.0 #2167 — keyword-only recall never runs the space gate.
+        embedding_space_mismatch: 0,
+        embedding_unverified_space: 0,
     };
     Ok((results, outcome, telemetry))
 }
@@ -7886,14 +7892,27 @@ pub fn check_duplicate(
     // cosine pass happens in Rust because SQLite has no native vector
     // op. We only pull rows with non-NULL embeddings — anything missing
     // an embedding can't be a near-duplicate by this definition.
+    //
+    // v1.0.0 #2167 §9 — a dup-check must NEVER match across embedding spaces:
+    // comparing the live query vector against a foreign-space (same-dim model
+    // swap) or NULL-provenance stored vector is a meaningless cosine that
+    // could produce a FALSE duplicate verdict (silent merge/skip of a distinct
+    // memory = corruption). Gate the candidate pool on the process-wide active
+    // space (`embeddings::active_embedding_space`, the space of the embedder
+    // that produced `query_embedding`); the nullable `IS NULL OR =` form keeps
+    // legacy dim-only behavior when no active space is seeded. (The content-
+    // hash exact-match short-circuit in `check_duplicate_with_text` stays
+    // space-agnostic — identical content IS a duplicate regardless of space.)
+    let active_space = crate::embeddings::active_embedding_space();
     let rows: Vec<(String, String, String, Vec<u8>)> = if let Some(ns) = namespace {
         let mut stmt = conn.prepare(
             "SELECT id, title, namespace, embedding FROM memories
              WHERE embedding IS NOT NULL
                AND (expires_at IS NULL OR expires_at > ?1)
-               AND namespace = ?2",
+               AND namespace = ?2
+               AND (?3 IS NULL OR embedding_space = ?3)",
         )?;
-        let mapped = stmt.query_map(params![now, ns], |row| {
+        let mapped = stmt.query_map(params![now, ns, active_space], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -7906,9 +7925,10 @@ pub fn check_duplicate(
         let mut stmt = conn.prepare(
             "SELECT id, title, namespace, embedding FROM memories
              WHERE embedding IS NOT NULL
-               AND (expires_at IS NULL OR expires_at > ?1)",
+               AND (expires_at IS NULL OR expires_at > ?1)
+               AND (?2 IS NULL OR embedding_space = ?2)",
         )?;
-        let mapped = stmt.query_map(params![now], |row| {
+        let mapped = stmt.query_map(params![now, active_space], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -11044,7 +11064,7 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                      (id, tier, namespace, title, content, tags, priority, confidence,
                       source, access_count, created_at, updated_at, last_accessed_at,
                       expires_at, archived_at, archive_reason, metadata,
-                      embedding, embedding_dim, original_tier, original_expires_at,
+                      embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
@@ -11052,7 +11072,7 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?1, 'ttl_expired', metadata,
-                            embedding, embedding_dim, tier, expires_at,
+                            embedding, embedding_dim, embedding_space, tier, expires_at,
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
@@ -11551,7 +11571,7 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
             "INSERT INTO memories
              (id, tier, namespace, title, content, tags, priority, confidence,
               source, access_count, created_at, updated_at, last_accessed_at,
-              expires_at, metadata, embedding, embedding_dim,
+              expires_at, metadata, embedding, embedding_dim, embedding_space,
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
@@ -11560,7 +11580,23 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
              SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                     tags, priority, confidence, source, access_count, created_at,
                     ?1, last_accessed_at, original_expires_at, metadata,
-                    embedding, embedding_dim,
+                    -- v1.0.0 #2167 (S8) restore/migrate HEAL: keep the
+                    -- archived vector ONLY when its space matches the live
+                    -- active space (?5). A foreign- or NULL-space vector has
+                    -- its whole trio NULLed so the `list_unembedded` backfill
+                    -- re-embeds from the durable text under the LIVE space
+                    -- (self-heal, degrade-never-corrupt). ?5 NULL (no active
+                    -- embedder in this process) keeps any STAMPED vector but
+                    -- still drops an unverifiable NULL-space one.
+                    CASE WHEN embedding_space IS NOT NULL
+                              AND (?5 IS NULL OR embedding_space = ?5)
+                         THEN embedding ELSE NULL END,
+                    CASE WHEN embedding_space IS NOT NULL
+                              AND (?5 IS NULL OR embedding_space = ?5)
+                         THEN embedding_dim ELSE NULL END,
+                    CASE WHEN embedding_space IS NOT NULL
+                              AND (?5 IS NULL OR embedding_space = ?5)
+                         THEN embedding_space ELSE NULL END,
                     COALESCE(reflection_depth, 0),
                     atomised_into,
                     atom_of,
@@ -11576,7 +11612,15 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
                     encrypted_envelope,
                     ?3, ?4
              FROM archived_memories WHERE id = ?2",
-            params![now, id, cid_stamp.cid, cid_stamp.genesis],
+            params![
+                now,
+                id,
+                cid_stamp.cid,
+                cid_stamp.genesis,
+                // v1.0.0 #2167 (S8) — ?5: the process-wide active-space fp
+                // (None → NULL) driving the restore heal above.
+                crate::embeddings::active_embedding_space(),
+            ],
         )?;
         // #1771 — re-insert the preserved edge graph (both-endpoints-exist,
         // idempotent). Edges whose other endpoint is permanently gone are
@@ -11696,7 +11740,7 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
             "INSERT INTO memories
              (id, tier, namespace, title, content, tags, priority, confidence,
               source, access_count, created_at, updated_at, last_accessed_at,
-              expires_at, metadata, embedding, embedding_dim,
+              expires_at, metadata, embedding, embedding_dim, embedding_space,
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
@@ -11705,7 +11749,23 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
              SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                     tags, priority, confidence, source, access_count, created_at,
                     ?1, last_accessed_at, original_expires_at, metadata,
-                    embedding, embedding_dim,
+                    -- v1.0.0 #2167 (S8) restore/migrate HEAL: keep the
+                    -- archived vector ONLY when its space matches the live
+                    -- active space (?5). A foreign- or NULL-space vector has
+                    -- its whole trio NULLed so the `list_unembedded` backfill
+                    -- re-embeds from the durable text under the LIVE space
+                    -- (self-heal, degrade-never-corrupt). ?5 NULL (no active
+                    -- embedder in this process) keeps any STAMPED vector but
+                    -- still drops an unverifiable NULL-space one.
+                    CASE WHEN embedding_space IS NOT NULL
+                              AND (?5 IS NULL OR embedding_space = ?5)
+                         THEN embedding ELSE NULL END,
+                    CASE WHEN embedding_space IS NOT NULL
+                              AND (?5 IS NULL OR embedding_space = ?5)
+                         THEN embedding_dim ELSE NULL END,
+                    CASE WHEN embedding_space IS NOT NULL
+                              AND (?5 IS NULL OR embedding_space = ?5)
+                         THEN embedding_space ELSE NULL END,
                     COALESCE(reflection_depth, 0),
                     atomised_into,
                     atom_of,
@@ -11721,7 +11781,15 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
                     encrypted_envelope,
                     ?3, ?4
              FROM archived_memories WHERE id = ?2",
-            params![now, id, cid_stamp.cid, cid_stamp.genesis],
+            params![
+                now,
+                id,
+                cid_stamp.cid,
+                cid_stamp.genesis,
+                // v1.0.0 #2167 (S8) — ?5: the process-wide active-space fp
+                // (None → NULL) driving the restore heal above.
+                crate::embeddings::active_embedding_space(),
+            ],
         )?;
         // #1771 — re-insert the preserved edge graph (both-endpoints-exist,
         // idempotent). See [`restore_archived`] for the contract.
@@ -12598,12 +12666,15 @@ pub fn dim_violations(conn: &Connection) -> Result<u64> {
 /// declared dim), shared by [`set_embedding`], [`set_embeddings_batch`]
 /// and [`set_embeddings_batch_reembed`] so the write shape cannot
 /// drift between the checked and replace-semantics writers.
+/// #2167 — the vector, its declared dim, AND its embedding-space provenance
+/// token travel together in ONE statement (M-PARAMETER-CONSISTENCY), so a row
+/// can never hold a vector from one space and a stamp from another.
 const SQL_UPDATE_EMBEDDING_WITH_DIM: &str =
-    "UPDATE memories SET embedding = ?1, embedding_dim = ?2 WHERE id = ?3";
+    "UPDATE memories SET embedding = ?1, embedding_dim = ?2, embedding_space = ?3 WHERE id = ?4";
 /// Degenerate empty-vector sibling of [`SQL_UPDATE_EMBEDDING_WITH_DIM`]
-/// (legacy parity: empty embeddings persist with `embedding_dim = NULL`).
-const SQL_UPDATE_EMBEDDING_NULL_DIM: &str =
-    "UPDATE memories SET embedding = ?1, embedding_dim = NULL WHERE id = ?2";
+/// (legacy parity: empty embeddings persist with `embedding_dim = NULL`; the
+/// space stamp is NULLed too — no vector, no provenance).
+const SQL_UPDATE_EMBEDDING_NULL_DIM: &str = "UPDATE memories SET embedding = ?1, embedding_dim = NULL, embedding_space = NULL WHERE id = ?2";
 
 /// Store an embedding vector for a memory.
 ///
@@ -12618,7 +12689,7 @@ const SQL_UPDATE_EMBEDDING_NULL_DIM: &str =
 /// Returns [`EmbeddingDimMismatch`] (boxed via anyhow) when the embedding's
 /// dimensionality differs from what the namespace established, or the
 /// underlying SQLite error on failure.
-pub fn set_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> Result<()> {
+pub fn set_embedding(conn: &Connection, id: &str, embedding: &[f32], space: &str) -> Result<()> {
     // Resolve namespace + check the dim invariant before mutating.
     let namespace: Option<String> = conn
         .query_row(
@@ -12631,7 +12702,7 @@ pub fn set_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> Result<(
     if attempted == 0 {
         // Empty embeddings are a degenerate case — earlier code accepted
         // them; preserve that to avoid breaking legacy tests but skip the
-        // dim check.
+        // dim check. The space stamp is NULLed with the (absent) vector.
         let bytes = crate::embeddings::encode_embedding_blob(embedding);
         conn.execute(SQL_UPDATE_EMBEDDING_NULL_DIM, params![bytes, id])?;
         return Ok(());
@@ -12649,7 +12720,11 @@ pub fn set_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> Result<(
     }
     let bytes = crate::embeddings::encode_embedding_blob(embedding);
     let dim_i64 = i64::try_from(attempted).unwrap_or(i64::MAX);
-    conn.execute(SQL_UPDATE_EMBEDDING_WITH_DIM, params![bytes, dim_i64, id])?;
+    // #2167 — vector + dim + space stamped atomically in one statement.
+    conn.execute(
+        SQL_UPDATE_EMBEDDING_WITH_DIM,
+        params![bytes, dim_i64, space, id],
+    )?;
     Ok(())
 }
 
@@ -12691,6 +12766,7 @@ pub fn set_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> Result<(
 pub fn set_embeddings_batch(
     conn: &mut Connection,
     entries: &[(String, Vec<f32>)],
+    space: &str,
 ) -> Result<usize> {
     if entries.is_empty() {
         return Ok(0);
@@ -12763,7 +12839,9 @@ pub fn set_embeddings_batch(
             }
             let bytes = crate::embeddings::encode_embedding_blob(embedding);
             let dim_i64 = i64::try_from(attempted).unwrap_or(i64::MAX);
-            rows_updated += update.execute(params![bytes, dim_i64, id])?;
+            // #2167 — all vectors in a batch are minted by the live embedder
+            // in one process, so ONE space stamps the whole batch.
+            rows_updated += update.execute(params![bytes, dim_i64, space, id])?;
         }
 
         drop(update);
@@ -12812,8 +12890,17 @@ pub fn get_embedding(conn: &Connection, id: &str) -> Result<Option<Vec<f32>>> {
 /// simply absent from the map (never an error): the caller falls back to the
 /// HNSW distance-derived cosine for a missing id, matching the pre-batch
 /// per-hit `get_embedding` error/None arm.
-pub fn get_embeddings_many(conn: &Connection, ids: &[String]) -> Result<HashMap<String, Vec<f32>>> {
-    let mut out: HashMap<String, Vec<f32>> = HashMap::with_capacity(ids.len());
+///
+/// v1.0.0 #2167 — the value carries the row's `embedding_space`
+/// provenance token (`None` = SQL NULL) alongside the decoded vector so
+/// the #1692 HNSW-hit recompute site (§3.2) can gate every candidate
+/// through [`crate::embeddings::Embedder::cosine_similarity_space_checked`]
+/// in the same single-round-trip the #1910 batch already pays.
+pub fn get_embeddings_many(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<HashMap<String, (Vec<f32>, Option<String>)>> {
+    let mut out: HashMap<String, (Vec<f32>, Option<String>)> = HashMap::with_capacity(ids.len());
     if ids.is_empty() {
         return Ok(out);
     }
@@ -12823,18 +12910,24 @@ pub fn get_embeddings_many(conn: &Connection, ids: &[String]) -> Result<HashMap<
             .take(chunk.len())
             .collect::<Vec<_>>()
             .join(",");
-        let sql = format!("SELECT id, embedding FROM memories WHERE id IN ({placeholders})");
+        let sql = format!(
+            "SELECT id, embedding, embedding_space FROM memories WHERE id IN ({placeholders})"
+        );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })?;
         for r in rows {
-            let (id, bytes) = r?;
+            let (id, bytes, space) = r?;
             if let Some(bytes) = bytes
                 && !bytes.is_empty()
                 && let Ok(floats) = crate::embeddings::decode_embedding_blob(&bytes)
             {
-                out.insert(id, floats);
+                out.insert(id, (floats, space));
             }
         }
     }
@@ -13017,6 +13110,7 @@ pub fn get_memory_texts_batch(
     namespace: Option<&str>,
     after_id: Option<&str>,
     limit: usize,
+    exclude_space: Option<&str>,
 ) -> Result<Vec<(String, String, String)>> {
     // #1779 — also pull `encrypted_envelope` + `metadata` so at-rest-encrypted
     // rows (where `content` holds the empty placeholder and the plaintext lives
@@ -13026,41 +13120,118 @@ pub fn get_memory_texts_batch(
     // corpus-wide. A row whose envelope fails to decrypt (e.g. key absent) is
     // SKIPPED with a WARN rather than embedded as a degraded placeholder —
     // mirrors the #1593 fail-loud-skip embedder posture.
-    let raw = match (namespace, after_id) {
-        (Some(ns), Some(after)) => {
-            let mut stmt = conn.prepare_cached(
-                "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
-                 WHERE namespace = ?1 AND id > ?2 ORDER BY id LIMIT ?3",
-            )?;
-            let rows = stmt.query_map(params![ns, after, limit], embeddable_row_mapper)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        }
-        (Some(ns), None) => {
-            let mut stmt = conn.prepare_cached(
-                "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
-                 WHERE namespace = ?1 ORDER BY id LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(params![ns, limit], embeddable_row_mapper)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        }
-        (None, Some(after)) => {
-            let mut stmt = conn.prepare_cached(
-                "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
-                 WHERE id > ?1 ORDER BY id LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(params![after, limit], embeddable_row_mapper)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        }
-        (None, None) => {
-            let mut stmt = conn.prepare_cached(
-                "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
-                 ORDER BY id LIMIT ?1",
-            )?;
-            let rows = stmt.query_map(params![limit], embeddable_row_mapper)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        }
-    };
+    //
+    // #2167 S7 — `exclude_space` (Some when `reembed --skip-current-space`):
+    // `embedding_space IS NOT ?` is SQLite's null-safe `IS DISTINCT FROM`, so a
+    // resumed sweep skips rows ALREADY at the target space while still re-
+    // embedding every foreign / NULL / non-target row (the incremental heal).
+    // Built as ordered positional binds (dynamic predicate set → not
+    // `prepare_cached`, which is fine on the batched reembed sweep).
+    let mut sql = String::from(
+        "SELECT id, title, content, encrypted_envelope, metadata FROM memories WHERE 1 = 1",
+    );
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(ns) = namespace {
+        sql.push_str(SQL_FRAGMENT_AND_NAMESPACE_EQ);
+        binds.push(Box::new(ns.to_string()));
+    }
+    if let Some(after) = after_id {
+        sql.push_str(" AND id > ?");
+        binds.push(Box::new(after.to_string()));
+    }
+    if let Some(space) = exclude_space {
+        sql.push_str(" AND embedding_space IS NOT ?");
+        binds.push(Box::new(space.to_string()));
+    }
+    sql.push_str(" ORDER BY id LIMIT ?");
+    binds.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
+    let mut stmt = conn.prepare(&sql)?;
+    let bind_refs: Vec<&dyn rusqlite::ToSql> =
+        binds.iter().map(std::convert::AsRef::as_ref).collect();
+    let rows = stmt.query_map(bind_refs.as_slice(), embeddable_row_mapper)?;
+    let raw = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(resolve_embeddable_rows(raw))
+}
+
+/// v1.0.0 #2167 §5/§7 — outcome of `reembed --stamp-only`, the explicit
+/// operator attestation path that stamps embedded NULL-space rows with the
+/// active fingerprint WITHOUT re-embedding.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StampOnlyReport {
+    /// Rows stamped `NULL → active_fp`.
+    pub stamped: usize,
+    /// The DISTINCT dims of embedded NULL-space rows that do NOT match the
+    /// active dim; non-empty ⇒ the attestation was REFUSED (stamped = 0).
+    pub refused_dims: Vec<i64>,
+}
+
+/// v1.0.0 #2167 §5/§7 — `reembed --stamp-only`: attest that the embedded
+/// NULL-space rows are ALREADY the active model, stamping
+/// `embedding_space = <active_fp>` WITHOUT re-embedding.
+///
+/// This is the strict-mode / [G2]-blocked operator's ONLY unattested-to-
+/// attested path (auto-adoption [`adopt_legacy_embedding_space`] refuses in
+/// those postures). It is fail-closed: it REFUSES (stamps NOTHING, returns
+/// the offending dims) unless the FULL dim census of embedded NULL-space
+/// rows matches `active_dim` — a mixed-dim NULL population cannot be safely
+/// attested to one space. On success it stamps every embedded NULL-space row
+/// whose dim matches. Scope is the LIVE corpus (`memories`); archived rows
+/// self-heal on restore (§8).
+///
+/// # Errors
+///
+/// Bubbles the rusqlite error from the census probe or the UPDATE.
+pub fn stamp_embedding_space_attested(
+    conn: &Connection,
+    namespace: Option<&str>,
+    active_fp: &str,
+    active_dim: usize,
+) -> Result<StampOnlyReport> {
+    let active_dim_i64 = i64::try_from(active_dim).unwrap_or(i64::MAX);
+    // Census the dims of embedded NULL-space rows (a NULL embedding_dim on an
+    // embedded row is itself a mismatch → treated as refusal via COALESCE(-1)).
+    let mut census = conn.prepare(&format!(
+        "SELECT DISTINCT COALESCE(embedding_dim, -1) FROM memories \
+         WHERE embedding IS NOT NULL AND embedding_space IS NULL{}",
+        if namespace.is_some() {
+            " AND namespace = ?1"
+        } else {
+            ""
+        }
+    ))?;
+    let dims: Vec<i64> = match namespace {
+        Some(ns) => census
+            .query_map(params![ns], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<_>>()?,
+        None => census
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<_>>()?,
+    };
+    let refused_dims: Vec<i64> = dims.into_iter().filter(|&d| d != active_dim_i64).collect();
+    if !refused_dims.is_empty() {
+        return Ok(StampOnlyReport {
+            stamped: 0,
+            refused_dims,
+        });
+    }
+    let stamped = match namespace {
+        Some(ns) => conn.execute(
+            "UPDATE memories SET embedding_space = ?1 \
+             WHERE embedding IS NOT NULL AND embedding_space IS NULL \
+               AND embedding_dim = ?2 AND namespace = ?3",
+            params![active_fp, active_dim_i64, ns],
+        )?,
+        None => conn.execute(
+            "UPDATE memories SET embedding_space = ?1 \
+             WHERE embedding IS NOT NULL AND embedding_space IS NULL \
+               AND embedding_dim = ?2",
+            params![active_fp, active_dim_i64],
+        )?,
+    };
+    Ok(StampOnlyReport {
+        stamped,
+        refused_dims: Vec::new(),
+    })
 }
 
 /// #1598 — REPLACE-semantics sibling of [`set_embeddings_batch`] for
@@ -13085,6 +13256,7 @@ pub fn get_memory_texts_batch(
 pub fn set_embeddings_batch_reembed(
     conn: &mut Connection,
     entries: &[(String, Vec<f32>)],
+    space: &str,
 ) -> Result<usize> {
     if entries.is_empty() {
         return Ok(0);
@@ -13101,7 +13273,11 @@ pub fn set_embeddings_batch_reembed(
                 rows_updated += update_empty.execute(params![bytes, id])?;
             } else {
                 let dim_i64 = i64::try_from(embedding.len()).unwrap_or(i64::MAX);
-                rows_updated += update.execute(params![bytes, dim_i64, id])?;
+                // #2167 — RE-STAMP the target fingerprint atomically as the
+                // sanctioned G4-bypass replaces each vector (§7): interruption
+                // is safe by construction (only consistently-stamped rows are
+                // scorable at every intermediate state).
+                rows_updated += update.execute(params![bytes, dim_i64, space, id])?;
             }
         }
     }
@@ -13278,6 +13454,210 @@ pub fn distinct_embedding_dims(conn: &Connection, namespace: Option<&str>) -> Re
     }
 }
 
+/// v1.0.0 #2167 §6 — corpus census over the per-row `embedding_space`
+/// provenance token (schema v84). Mirrors [`distinct_embedding_dims`]:
+/// returns each distinct `embedding_space` value present among
+/// embedded rows paired with its row count, `NULL` (legacy/unverified)
+/// carried as `None`. The boot census (§6) diffs this against the
+/// active fingerprint to WARN on a heterogeneous corpus and name the
+/// heal commands; `ai-memory doctor` prints it as a table. Ordered so
+/// the output is deterministic.
+///
+/// # Errors
+///
+/// Bubbles the rusqlite error from the aggregate query.
+pub fn distinct_embedding_spaces(
+    conn: &Connection,
+    namespace: Option<&str>,
+) -> Result<Vec<(Option<String>, u64)>> {
+    let collect = |stmt: &mut rusqlite::Statement<'_>,
+                   params: &[&dyn rusqlite::ToSql]|
+     -> Result<Vec<(Option<String>, u64)>> {
+        let rows = stmt.query_map(params, |r| {
+            let space: Option<String> = r.get(0)?;
+            let count: i64 = r.get(1)?;
+            Ok((space, count))
+        })?;
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|(space, count)| (space, u64::try_from(count).unwrap_or(0)))
+            .collect())
+    };
+    if let Some(ns) = namespace {
+        let mut stmt = conn.prepare(
+            "SELECT embedding_space, COUNT(*) AS c FROM memories \
+             WHERE embedding IS NOT NULL AND namespace = ?1 \
+             GROUP BY embedding_space ORDER BY embedding_space IS NOT NULL, embedding_space",
+        )?;
+        collect(&mut stmt, &[&ns])
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT embedding_space, COUNT(*) AS c FROM memories \
+             WHERE embedding IS NOT NULL \
+             GROUP BY embedding_space ORDER BY embedding_space IS NOT NULL, embedding_space",
+        )?;
+        collect(&mut stmt, &[])
+    }
+}
+
+/// v1.0.0 #2167 §5 — one-time boot ADOPTION of legacy NULL-space rows.
+///
+/// Stamps `embedding_space = <active_fp>` onto every embedded row that
+/// carries NO provenance yet (`embedding_space IS NULL`) AND whose
+/// dimensionality matches the active embedder (`embedding_dim =
+/// <active_dim>`), on both `memories` and `archived_memories`. Returns
+/// the number of `memories` rows stamped.
+///
+/// **The rule is guarded (§5 safety proof — both guards required):**
+/// - **[G1]** the caller invokes this ONLY when
+///   [`crate::hnsw::strict_embed_model_match_enabled`] is OFF (a strict
+///   operator demands explicit `reembed --stamp-only` attestation, so
+///   auto-adoption never runs).
+/// - **[G2]** NO differently-stamped row exists: if ANY embedded row
+///   already carries a NON-NULL `embedding_space` that differs from
+///   `active_fp`, the corpus has demonstrated multi-space history and
+///   this function REFUSES (returns `Ok(0)`, stamps nothing) — those
+///   NULL rows stay `UnverifiedSpace`-excluded until `reembed`.
+///
+/// Why safe (preserve this proof — it is the §5 invariant):
+/// 1. **No-nuke:** first post-upgrade boot with unchanged config stamps
+///    every dim-matching row → recall identical to pre-v84.
+/// 2. **Post-swap catch:** after a same-dim model swap, [G2] sees the
+///    now-differently-stamped rows and blocks re-adoption; §3 excludes
+///    the foreign rows; §6 census WARNs.
+/// 3. **Monotone detectability:** only writes NULL→fp, never overwrites
+///    a stamp, so any recorded provenance survives forever.
+/// 4. **Residual window bounded:** adoption mis-stamps ONLY when NO
+///    provenance exists on either side (the pre-v84 permanent status
+///    quo); it converts that permanently-undetectable state into a
+///    one-shot, loudly-logged assumption, healable by `reembed`.
+/// 5. **Mixed-history refusal [G2]:** where the corpus proves
+///    multi-space history, refuse and stay fail-closed.
+///
+/// Idempotent + marker-free: post-adoption `{embedding NOT NULL, space
+/// NULL}` is structurally empty (every write funnel stamps; §8 restore
+/// NULLs the vector together with the stamp), so re-runs are no-ops.
+///
+/// # Errors
+///
+/// Bubbles the rusqlite error from the guard probe or the UPDATE.
+pub fn adopt_legacy_embedding_space(
+    conn: &Connection,
+    active_fp: &str,
+    active_dim: usize,
+) -> Result<usize> {
+    // [G2] — refuse if any embedded row already carries a DIFFERENT
+    // stamp (a corpus with demonstrated multi-space history never
+    // auto-adopts; its NULL rows stay excluded until explicit
+    // attestation).
+    let mismatched: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memories \
+         WHERE embedding_space IS NOT NULL AND embedding_space != ?1)",
+        params![active_fp],
+        |r| r.get(0),
+    )?;
+    if mismatched != 0 {
+        tracing::warn!(
+            active_space = %active_fp,
+            "embedding-space adoption REFUSED: corpus has demonstrated multi-space \
+             history ([G2]); NULL-space rows stay excluded until `ai-memory reembed` \
+             or `ai-memory reembed --stamp-only`"
+        );
+        return Ok(0);
+    }
+    let dim_i64 = i64::try_from(active_dim).unwrap_or(i64::MAX);
+    // Stamp NULL→fp for dim-matching embedded rows on BOTH tables. The
+    // archived twin keeps archive→restore round-trips in-space lossless.
+    let stamped = conn.execute(
+        "UPDATE memories SET embedding_space = ?1 \
+         WHERE embedding IS NOT NULL AND embedding_space IS NULL AND embedding_dim = ?2",
+        params![active_fp, dim_i64],
+    )?;
+    let _archived = conn.execute(
+        "UPDATE archived_memories SET embedding_space = ?1 \
+         WHERE embedding IS NOT NULL AND embedding_space IS NULL AND embedding_dim = ?2",
+        params![active_fp, dim_i64],
+    )?;
+    if stamped > 0 {
+        tracing::warn!(
+            adopted_rows = stamped,
+            space = %active_fp,
+            "embedding-space adoption stamped {stamped} legacy NULL-space row(s) with the \
+             active fingerprint (§5 one-time boot adoption)"
+        );
+    } else {
+        tracing::info!(
+            space = %active_fp,
+            "embedding-space adoption ran: no legacy NULL-space dim-matching rows to stamp"
+        );
+    }
+    Ok(stamped)
+}
+
+/// v1.0.0 #2167 §5 + §6 — the shared boot maintenance run at every
+/// site that constructs an [`crate::embeddings::Embedder`] with DB
+/// access (daemon serve boot, MCP `run_mcp_server` init, CLI recall).
+/// Runs in the load-bearing ORDER embedder→adopt→census (the caller
+/// seeds the vector index AFTER this returns):
+/// 1. **§5 adoption** — unless strict mode
+///    ([`crate::hnsw::strict_embed_model_match_enabled`], [G1]) is on,
+///    stamp legacy NULL-space dim-matching rows with `active_fp` (the
+///    [G2]-guarded [`adopt_legacy_embedding_space`]).
+/// 2. **§6 census** — diff [`distinct_embedding_spaces`] against
+///    `active_fp`; emit ONE loud WARN naming the per-space counts + the
+///    heal commands when any non-active / NULL space carries rows.
+///
+/// Best-effort + idempotent: it swallows errors into a WARN (a
+/// read-only / locked DB makes it a no-op, never an abort — recall then
+/// treats NULL/foreign rows as excluded, which is safe + degraded).
+pub fn embedding_space_boot_maintenance(conn: &Connection, active_fp: &str, active_dim: usize) {
+    // §5 adoption — [G1] strict off.
+    if crate::hnsw::strict_embed_model_match_enabled() {
+        tracing::info!(
+            active_space = %active_fp,
+            "#2167: strict embed-model-match mode ON — skipping legacy NULL-space adoption \
+             ([G1]); attest with `ai-memory reembed --stamp-only` or heal with `ai-memory reembed`"
+        );
+    } else if let Err(e) = adopt_legacy_embedding_space(conn, active_fp, active_dim) {
+        tracing::warn!(
+            err = %e,
+            "#2167: embedding-space boot adoption failed (best-effort); legacy NULL-space \
+             rows stay excluded from semantic recall until reembed"
+        );
+    }
+    // §6 census — loud WARN on any heterogeneity.
+    match distinct_embedding_spaces(conn, None) {
+        Ok(census) => {
+            let mut reembed_pending: u64 = 0;
+            let mut foreign_or_null: Vec<String> = Vec::new();
+            for (space, count) in &census {
+                let is_active = space.as_deref() == Some(active_fp);
+                if !is_active {
+                    reembed_pending = reembed_pending.saturating_add(*count);
+                    let label = space.as_deref().unwrap_or("<null/unverified>");
+                    foreign_or_null.push(format!("{label}={count}"));
+                }
+            }
+            if reembed_pending > 0 {
+                tracing::warn!(
+                    active_space = %active_fp,
+                    reembed_pending,
+                    census = %foreign_or_null.join(", "),
+                    "#2167 embedding-space census: {reembed_pending} embedded row(s) are NOT in \
+                     the active space [{}] — they are excluded from semantic scoring (still \
+                     keyword-recallable). Heal with `ai-memory reembed` (re-derive from text) or \
+                     `ai-memory reembed --stamp-only` (attest matching-dim rows)",
+                    foreign_or_null.join(", ")
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(err = %e, "#2167: embedding-space boot census query failed");
+        }
+    }
+}
+
 /// #1579 B3 — count of rows carrying a stored embedding. Cheap probe
 /// (no blob decode, no row materialisation) used by the CLI recall
 /// path to decide whether a one-shot invocation should pay the HNSW
@@ -13298,10 +13678,24 @@ pub fn count_embedded_memories(conn: &Connection) -> Result<i64> {
 /// malformed are logged and skipped (the alternative — bailing the entire
 /// HNSW build — would take the whole semantic-search surface offline for one
 /// corrupt row).
-pub fn get_all_embeddings(conn: &Connection) -> Result<Vec<(String, Vec<f32>)>> {
-    let mut stmt =
-        conn.prepare("SELECT id, embedding FROM memories WHERE embedding IS NOT NULL")?;
-    let rows = stmt.query_map([], |row| {
+///
+/// v1.0.0 #2167 §3.3 layer 1 — the HNSW seed set is filtered to the
+/// ACTIVE embedding space in SQL (`AND embedding_space = ?1`): a
+/// foreign-fingerprint vector never enters the ANN index in the first
+/// place, so it can never be an ANN candidate. NULL-space rows are also
+/// excluded (SQL `NULL = ?1` is false) — after §5 boot adoption a
+/// dim-matching NULL row would already have been stamped active, so a
+/// surviving NULL row is a genuinely-unverified vector that must not be
+/// indexed. The §1 partial index keeps this cheap.
+pub fn get_all_embeddings(
+    conn: &Connection,
+    active_space: &str,
+) -> Result<Vec<(String, Vec<f32>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, embedding FROM memories \
+         WHERE embedding IS NOT NULL AND embedding_space = ?1",
+    )?;
+    let rows = stmt.query_map(params![active_space], |row| {
         let id: String = row.get(0)?;
         let bytes: Vec<u8> = row.get(1)?;
         Ok((id, bytes))
@@ -13362,6 +13756,8 @@ pub fn recall_hybrid(
     source_uri_prefix: Option<&str>,
     // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
     caller: Option<&str>,
+    // v1.0.0 #2167 §3 — active embedder space fingerprint. See [`recall`].
+    active_space: Option<&str>,
 ) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
     let (results, outcome, _telemetry) = recall_hybrid_with_telemetry(
         conn,
@@ -13381,6 +13777,7 @@ pub fn recall_hybrid(
         include_archived,
         source_uri_prefix,
         caller,
+        active_space,
     )?;
     Ok((results, outcome))
 }
@@ -13411,6 +13808,8 @@ pub fn recall_hybrid_precomputed_hnsw(
     source_uri_prefix: Option<&str>,
     // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
     caller: Option<&str>,
+    // v1.0.0 #2167 §3 — active embedder space fingerprint. See [`recall`].
+    active_space: Option<&str>,
 ) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
     let (results, outcome, _telemetry) = recall_hybrid_with_telemetry_precomputed_hnsw(
         conn,
@@ -13430,6 +13829,7 @@ pub fn recall_hybrid_precomputed_hnsw(
         include_archived,
         source_uri_prefix,
         caller,
+        active_space,
     )?;
     Ok((results, outcome))
 }
@@ -13579,7 +13979,7 @@ fn fts_keyword_phase(
     since: Option<&str>,
     until: Option<&str>,
     limit: usize,
-) -> Result<Vec<(Memory, f64, Option<Vec<u8>>)>> {
+) -> Result<Vec<(Memory, f64, Option<Vec<u8>>, Option<String>)>> {
     // #1909 — same unclamped public `limit`; guard the multiply against
     // overflow (panic in overflow-checks builds, silent wrap in release).
     let fts_limit = limit.saturating_mul(3).max(30);
@@ -13596,6 +13996,12 @@ fn fts_keyword_phase(
                 -- so the embedding index is unchanged; row_to_memory + the
                 -- fts_score read are by-name and unaffected.
                 m.encrypted_envelope,
+                -- v1.0.0 #2167 — the per-row embedding_space provenance
+                -- token (positional index 27, read by row.get(27)); the
+                -- fusion stage gates the inline cosine through
+                -- cosine_similarity_space_checked. Appended AFTER
+                -- encrypted_envelope so the embedding index 25 is unchanged.
+                m.embedding_space,
                 (fts.rank * -1) + (m.priority * 0.5) + (MIN(m.access_count, 50) * 0.1)
                 + (m.confidence * 2.0)
                 + (CASE m.tier WHEN 'long' THEN 3.0 WHEN 'mid' THEN 1.0 ELSE 0.0 END)
@@ -13629,18 +14035,21 @@ fn fts_keyword_phase(
     // is small: the optional fragments expand to a handful of variants).
     let mut fts_stmt = conn.prepare_cached(&fts_sql)?;
     let fts_row_handler =
-        |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Memory, f64, Option<Vec<u8>>)> {
+        |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Memory, f64, Option<Vec<u8>>, Option<String>)> {
             let mem = row_to_memory(row)?;
             let fts_score: f64 = row.get("fts_score")?;
             // Index 25 = `m.embedding` (the SELECT list above places it
             // after `confidence_decayed_at`). Pull as `Option<Vec<u8>>`
             // so legacy rows without embeddings surface as `None`.
             let embedding_bytes: Option<Vec<u8>> = row.get(25)?;
-            Ok((mem, fts_score, embedding_bytes))
+            // v1.0.0 #2167 — index 27 = `m.embedding_space` (after
+            // `m.encrypted_envelope` at 26). `None` = SQL NULL (unverified).
+            let embedding_space: Option<String> = row.get(27)?;
+            Ok((mem, fts_score, embedding_bytes, embedding_space))
         };
     let (vis_p, vis_t, vis_u, vis_o) = prep.prefixes.clone();
     let caller = prep.caller.as_deref();
-    let rows: Vec<(Memory, f64, Option<Vec<u8>>)> =
+    let rows: Vec<(Memory, f64, Option<Vec<u8>>, Option<String>)> =
         if let Some(ref uri_param) = prep.source_uri_like_param {
             fts_stmt
                 .query_map(
@@ -13778,6 +14187,18 @@ fn semantic_phase(
     // disagrees with `query_embedding` (embedder-model switch). Accumulated
     // across the whole recall and surfaced via telemetry + an aggregated warn.
     dim_mismatch_count: &mut usize,
+    // v1.0.0 #2167 §3 — the active embedder's space fingerprint. `Some(fp)`
+    // gates every stored vector through `cosine_similarity_space_checked`;
+    // `None` (no live embedder / keyword-only) skips the space axis (the dim
+    // gate still applies) — semantic scoring is moot without an active space.
+    active_space: Option<&str>,
+    // v1.0.0 #2167 §3.2 — bumped when a stored vector is VERIFIED in a
+    // different space than the active one (excluded from semantic scoring).
+    space_mismatch_count: &mut usize,
+    // v1.0.0 #2167 §3.2 — bumped when a stored vector has NO provenance
+    // token (NULL post-adoption), or (HNSW site) its row-side vector cannot
+    // be re-verified. Excluded from semantic scoring.
+    unverified_space_count: &mut usize,
 ) -> Result<usize> {
     let mut hnsw_candidates_count: usize = 0;
     let now = prep.now.as_str();
@@ -13856,26 +14277,50 @@ fn semantic_phase(
             // dims differ (after an embedder swap): a wrong-but-finite cosine
             // that the >0.2 gate lets through, ranking garbage while
             // `dim_mismatch_count` stays 0. Recompute against the stored
-            // embedding with the checked comparator (the same #1584-guarded
-            // path the FTS + linear-scan branches use) and count + skip a
-            // dimension mismatch instead of trusting `hit.distance`. For a
-            // same-dim hit the checked cosine equals `1.0 - hit.distance`
-            // (both reduce to the dot product), so valid hits are unchanged.
-            let cosine = match stored_embeddings.get(&id) {
-                Some(stored) => match crate::embeddings::Embedder::cosine_similarity_checked(
+            // embedding (the same #1584-guarded path the FTS + linear-scan
+            // branches use) and count + skip instead of trusting `hit.distance`.
+            //
+            // v1.0.0 #2167 §3.2 site 3 + §3.3 layer 3 (defensive post-filter):
+            // when an active space is known, gate every ANN hit row-side
+            // through `cosine_similarity_space_checked` — even a vector that
+            // somehow entered the graph in a foreign space can never be scored
+            // or returned. `_ = cosine;` — the HNSW distance-derived cosine is
+            // NEVER trusted; the row-side recompute is authoritative.
+            let _ = cosine;
+            let Some((stored, stored_space)) = stored_embeddings.get(&id) else {
+                // #1692 residual (§3.2 site 3): the row is absent from the
+                // batch (vector deleted since the index was built, or an
+                // undecodable blob). An index hit whose row-side vector cannot
+                // be re-verified is an unverifiable comparison — exactly what
+                // the invariant forbids. DELETE the pre-#2167 fall-back to
+                // `hit.distance`; exclude + count instead.
+                *unverified_space_count += 1;
+                continue;
+            };
+            let comparison = if let Some(active) = active_space {
+                crate::embeddings::Embedder::cosine_similarity_space_checked(
                     query_embedding,
                     stored,
-                ) {
-                    crate::embeddings::CosineComparison::Comparable(c) => f64::from(c),
-                    crate::embeddings::CosineComparison::DimensionMismatch { .. } => {
-                        *dim_mismatch_count += 1;
-                        continue;
-                    }
-                },
-                // Legacy row with no stored embedding (or an undecodable blob):
-                // fall back to the HNSW distance-derived cosine rather than
-                // dropping — same arm the per-hit `get_embedding` None/Err took.
-                None => cosine,
+                    active,
+                    stored_space.as_deref(),
+                )
+            } else {
+                crate::embeddings::Embedder::cosine_similarity_checked(query_embedding, stored)
+            };
+            let cosine = match comparison {
+                crate::embeddings::CosineComparison::Comparable(c) => f64::from(c),
+                crate::embeddings::CosineComparison::DimensionMismatch { .. } => {
+                    *dim_mismatch_count += 1;
+                    continue;
+                }
+                crate::embeddings::CosineComparison::SpaceMismatch { .. } => {
+                    *space_mismatch_count += 1;
+                    continue;
+                }
+                crate::embeddings::CosineComparison::UnverifiedSpace => {
+                    *unverified_space_count += 1;
+                    continue;
+                }
             };
             if let Some(ns) = namespace {
                 if prep.hierarchy_active {
@@ -13950,7 +14395,7 @@ fn semantic_phase(
         "SELECT id, tier, namespace, title, content, tags, priority,
                 confidence, source, access_count, created_at, updated_at,
                 last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, embedding,
-                encrypted_envelope
+                encrypted_envelope, embedding_space
          FROM memories
          WHERE embedding IS NOT NULL
            AND (?1 IS NULL OR namespace = ?1)
@@ -13973,17 +14418,22 @@ fn semantic_phase(
     );
     // #1579 B6 — same prepare_cached treatment as the FTS branch above.
     let mut sem_stmt = conn.prepare_cached(&sem_sql)?;
-    let sem_row_handler = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Memory, Option<Vec<u8>>)> {
-        let mem = row_to_memory(row)?;
-        // v0.7.x Form 6 — `memory_kind` was inserted between
-        // `reflection_depth` and `embedding` in the SELECT list
-        // above; `embedding` sits at zero-based index 17.
-        let emb_bytes: Option<Vec<u8>> = row.get(17)?;
-        Ok((mem, emb_bytes))
-    };
+    let sem_row_handler =
+        |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Memory, Option<Vec<u8>>, Option<String>)> {
+            let mem = row_to_memory(row)?;
+            // v0.7.x Form 6 — `memory_kind` was inserted between
+            // `reflection_depth` and `embedding` in the SELECT list
+            // above; `embedding` sits at zero-based index 17.
+            let emb_bytes: Option<Vec<u8>> = row.get(17)?;
+            // v1.0.0 #2167 — `embedding_space` appended AFTER
+            // `encrypted_envelope` (index 18) so the pinned `row.get(17)`
+            // for `embedding` stays valid; read positionally at index 19.
+            let emb_space: Option<String> = row.get(19)?;
+            Ok((mem, emb_bytes, emb_space))
+        };
     let (vis_p, vis_t, vis_u, vis_o) = prep.prefixes.clone();
     let caller = prep.caller.as_deref();
-    let sem_results: Vec<(Memory, Option<Vec<u8>>)> =
+    let sem_results: Vec<(Memory, Option<Vec<u8>>, Option<String>)> =
         if let Some(ref uri_param) = prep.source_uri_like_param {
             sem_stmt
                 .query_map(
@@ -14022,7 +14472,7 @@ fn semantic_phase(
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-    for (mem, emb_bytes) in sem_results {
+    for (mem, emb_bytes, emb_space) in sem_results {
         if scored.contains_key(&mem.id) {
             continue;
         }
@@ -14039,18 +14489,38 @@ fn semantic_phase(
                 );
                 continue;
             };
-            let cosine =
-                match crate::embeddings::Embedder::cosine_similarity_checked(query_embedding, &emb)
-                {
-                    crate::embeddings::CosineComparison::Comparable(c) => f64::from(c),
-                    crate::embeddings::CosineComparison::DimensionMismatch { .. } => {
-                        // v0.7.0 H7 — stored embedding came from a different
-                        // embedder model; counted (not silently dropped) so the
-                        // aggregated warn + telemetry can flag the model switch.
-                        *dim_mismatch_count += 1;
-                        continue;
-                    }
-                };
+            // v1.0.0 #2167 §3.2 site 2 — space→dim→score gate on the
+            // linear-scan branch. A foreign / unverified vector is skipped
+            // + counted (never scored); it stays keyword-recallable via the
+            // FTS branch.
+            let comparison = if let Some(active) = active_space {
+                crate::embeddings::Embedder::cosine_similarity_space_checked(
+                    query_embedding,
+                    &emb,
+                    active,
+                    emb_space.as_deref(),
+                )
+            } else {
+                crate::embeddings::Embedder::cosine_similarity_checked(query_embedding, &emb)
+            };
+            let cosine = match comparison {
+                crate::embeddings::CosineComparison::Comparable(c) => f64::from(c),
+                crate::embeddings::CosineComparison::DimensionMismatch { .. } => {
+                    // v0.7.0 H7 — stored embedding came from a different
+                    // embedder model; counted (not silently dropped) so the
+                    // aggregated warn + telemetry can flag the model switch.
+                    *dim_mismatch_count += 1;
+                    continue;
+                }
+                crate::embeddings::CosineComparison::SpaceMismatch { .. } => {
+                    *space_mismatch_count += 1;
+                    continue;
+                }
+                crate::embeddings::CosineComparison::UnverifiedSpace => {
+                    *unverified_space_count += 1;
+                    continue;
+                }
+            };
             if cosine > crate::RECALL_COSINE_GATE {
                 scored.insert(mem.id.clone(), (mem, 0.0, cosine));
                 hnsw_candidates_count += 1;
@@ -14168,6 +14638,8 @@ fn assemble_recall_telemetry(
     hnsw_candidates: usize,
     blend_weights: &[f64],
     embedding_dim_mismatch: usize,
+    embedding_space_mismatch: usize,
+    embedding_unverified_space: usize,
 ) -> crate::models::RecallTelemetry {
     let blend_weight_avg = if blend_weights.is_empty() {
         0.0
@@ -14181,6 +14653,8 @@ fn assemble_recall_telemetry(
         hnsw_candidates,
         blend_weight_avg,
         embedding_dim_mismatch,
+        embedding_space_mismatch,
+        embedding_unverified_space,
     }
 }
 
@@ -14210,6 +14684,8 @@ pub fn recall_hybrid_with_telemetry(
     source_uri_prefix: Option<&str>,
     // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
     caller: Option<&str>,
+    // v1.0.0 #2167 §3 — active embedder space fingerprint. See [`recall`].
+    active_space: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -14234,6 +14710,7 @@ pub fn recall_hybrid_with_telemetry(
         include_archived,
         source_uri_prefix,
         caller,
+        active_space,
     )
 }
 
@@ -14274,6 +14751,8 @@ pub fn recall_hybrid_with_telemetry_precomputed_hnsw(
     source_uri_prefix: Option<&str>,
     // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
     caller: Option<&str>,
+    // v1.0.0 #2167 §3 — active embedder space fingerprint. See [`recall`].
+    active_space: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -14298,6 +14777,7 @@ pub fn recall_hybrid_with_telemetry_precomputed_hnsw(
         include_archived,
         source_uri_prefix,
         caller,
+        active_space,
     )
 }
 
@@ -14328,6 +14808,10 @@ fn recall_hybrid_with_telemetry_inner(
     source_uri_prefix: Option<&str>,
     // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
     caller: Option<&str>,
+    // v1.0.0 #2167 §3 — the live embedder's space fingerprint (`Some` for
+    // a semantic recall, `None` for keyword-only / no embedder). Gates the
+    // FTS + semantic branches through `cosine_similarity_space_checked`.
+    active_space: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -14368,7 +14852,12 @@ fn recall_hybrid_with_telemetry_inner(
     // disagrees with the active model's `query_embedding` across BOTH the
     // FTS branch (here) and the semantic linear-scan branch (below).
     let mut dim_mismatch_count: usize = 0;
-    for (mem, fts_score, embedding_bytes) in fts_results {
+    // v1.0.0 #2167 §3.2 — space-provenance counters, accumulated across
+    // the FTS branch (here) + the semantic phase (below) exactly like
+    // `dim_mismatch_count`.
+    let mut space_mismatch_count: usize = 0;
+    let mut unverified_space_count: usize = 0;
+    for (mem, fts_score, embedding_bytes, embedding_space) in fts_results {
         if fts_score > max_fts_score {
             max_fts_score = fts_score;
         }
@@ -14378,19 +14867,44 @@ fn recall_hybrid_with_telemetry_inner(
         let cosine = match embedding_bytes {
             Some(bytes) if !bytes.is_empty() => {
                 match crate::embeddings::decode_embedding_blob(&bytes) {
-                    Ok(emb) => match crate::embeddings::Embedder::cosine_similarity_checked(
-                        query_embedding,
-                        &emb,
-                    ) {
-                        crate::embeddings::CosineComparison::Comparable(c) => f64::from(c),
-                        crate::embeddings::CosineComparison::DimensionMismatch { .. } => {
-                            // v0.7.0 H7 — embedder-model switch: count the
-                            // stale-dimension row instead of letting it score a
-                            // silent 0.0 cosine. FTS keyword score still applies.
-                            dim_mismatch_count += 1;
-                            0.0
+                    // v1.0.0 #2167 §3.2 site 1 — the FTS branch is the
+                    // degraded-not-invisible guarantee: a space/dim-excluded
+                    // row keeps its FTS keyword score and stays recallable,
+                    // its semantic cosine forced to 0.0 + counted. Never a
+                    // `continue` (that would make the row invisible).
+                    Ok(emb) => {
+                        let comparison = if let Some(active) = active_space {
+                            crate::embeddings::Embedder::cosine_similarity_space_checked(
+                                query_embedding,
+                                &emb,
+                                active,
+                                embedding_space.as_deref(),
+                            )
+                        } else {
+                            crate::embeddings::Embedder::cosine_similarity_checked(
+                                query_embedding,
+                                &emb,
+                            )
+                        };
+                        match comparison {
+                            crate::embeddings::CosineComparison::Comparable(c) => f64::from(c),
+                            crate::embeddings::CosineComparison::DimensionMismatch { .. } => {
+                                // v0.7.0 H7 — embedder-model switch: count the
+                                // stale-dimension row instead of letting it score
+                                // a silent 0.0. FTS keyword score still applies.
+                                dim_mismatch_count += 1;
+                                0.0
+                            }
+                            crate::embeddings::CosineComparison::SpaceMismatch { .. } => {
+                                space_mismatch_count += 1;
+                                0.0
+                            }
+                            crate::embeddings::CosineComparison::UnverifiedSpace => {
+                                unverified_space_count += 1;
+                                0.0
+                            }
                         }
-                    },
+                    }
                     Err(_) => {
                         tracing::warn!(
                             memory_id = %mem.id,
@@ -14425,6 +14939,9 @@ fn recall_hybrid_with_telemetry_inner(
         source_uri_prefix,
         &mut scored,
         &mut dim_mismatch_count,
+        active_space,
+        &mut space_mismatch_count,
+        &mut unverified_space_count,
     )?;
 
     // v0.7.0 H7 — de-silence embedder-model switches. A non-zero count means
@@ -14439,6 +14956,21 @@ fn recall_hybrid_with_telemetry_inner(
             "recall skipped {dim_mismatch_count} stored embedding(s) with mismatched \
              dimensionality — the embedder model appears to have changed; re-embed the \
              affected memories to restore their semantic recall signal"
+        );
+    }
+    // v1.0.0 #2167 §3.2 site 4 — de-silence embedding-SPACE mismatches
+    // (a same-dim model swap the dim gate cannot catch) + unverified
+    // (NULL-provenance) rows. One aggregated WARN per recall naming the
+    // active fingerprint + the heal commands (M-LOG-STRUCTURED).
+    if space_mismatch_count > 0 || unverified_space_count > 0 {
+        tracing::warn!(
+            space_mismatch_count,
+            unverified_space_count,
+            active_space = active_space.unwrap_or("<none>"),
+            "recall excluded {space_mismatch_count} foreign-space + {unverified_space_count} \
+             unverified stored embedding(s) from semantic scoring (they remain \
+             keyword-recallable) — run `ai-memory reembed` to re-derive them under the active \
+             embedding space, or `ai-memory reembed --stamp-only` to attest matching-dim rows"
         );
     }
 
@@ -14462,6 +14994,8 @@ fn recall_hybrid_with_telemetry_inner(
         hnsw_candidates_count,
         &blend_weights,
         dim_mismatch_count,
+        space_mismatch_count,
+        unverified_space_count,
     );
 
     Ok((budgeted, outcome, telemetry))
@@ -18917,8 +19451,20 @@ mod tests {
         let _id2 = insert(&conn, &make_memory("cov2", "cov", Tier::Long, 5)).unwrap();
         let _id3 = insert(&conn, &make_memory("cov3", "cov", Tier::Long, 5)).unwrap();
         // Embed only two of the four rows.
-        set_embedding(&conn, &id0, &[0.1_f32; 8]).unwrap();
-        set_embedding(&conn, &id1, &[0.2_f32; 8]).unwrap();
+        set_embedding(
+            &conn,
+            &id0,
+            &[0.1_f32; 8],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
+        set_embedding(
+            &conn,
+            &id1,
+            &[0.2_f32; 8],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
 
         let cov = recall_index_coverage(&conn).unwrap();
         assert_eq!(cov.total_rows, 4);
@@ -18939,8 +19485,20 @@ mod tests {
         let b = sized_memory("b", "ev", Tier::Long, 9, 2000);
         insert(&conn, &a).unwrap();
         insert(&conn, &b).unwrap();
-        set_embedding(&conn, &a.id, &[0.1_f32; 8]).unwrap();
-        set_embedding(&conn, &b.id, &[0.2_f32; 8]).unwrap();
+        set_embedding(
+            &conn,
+            &a.id,
+            &[0.1_f32; 8],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
+        set_embedding(
+            &conn,
+            &b.id,
+            &[0.2_f32; 8],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
 
         let before = recall_index_coverage(&conn).unwrap();
         assert_eq!(before.total_rows, 2);
@@ -19268,7 +19826,13 @@ mod tests {
         let id = insert(&conn, &mem).unwrap();
 
         let emb = vec![0.1f32, 0.2, 0.3, 0.4];
-        set_embedding(&conn, &id, &emb).unwrap();
+        set_embedding(
+            &conn,
+            &id,
+            &emb,
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
 
         let got = get_embedding(&conn, &id).unwrap().unwrap();
         assert_eq!(got.len(), 4);
@@ -19306,7 +19870,13 @@ mod tests {
         );
 
         // Embedded rows leave the unembedded predicate.
-        set_embedding(&conn, &ids[0], &[0.1, 0.2]).unwrap();
+        set_embedding(
+            &conn,
+            &ids[0],
+            &[0.1, 0.2],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
         let after = get_unembedded_ids_batch_after(&conn, None, 10).unwrap();
         assert_eq!(after.len(), 4);
         assert!(after.iter().all(|(id, _, _)| id != &ids[0]));
@@ -19337,18 +19907,25 @@ mod tests {
         }
         // An already-embedded row MUST still be scanned — reembed
         // replaces existing vectors, it is not a backfill.
-        set_embedding(&conn, &ns_a_ids[0], &[0.5, 0.5]).unwrap();
+        set_embedding(
+            &conn,
+            &ns_a_ids[0],
+            &[0.5, 0.5],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
 
-        let all = get_memory_texts_batch(&conn, None, None, 100).unwrap();
+        let all = get_memory_texts_batch(&conn, None, None, 100, None).unwrap();
         assert_eq!(all.len(), 5, "unfiltered scan sees every live row");
 
-        let ns_a = get_memory_texts_batch(&conn, Some("reembed-a"), None, 100).unwrap();
+        let ns_a = get_memory_texts_batch(&conn, Some("reembed-a"), None, 100, None).unwrap();
         assert_eq!(ns_a.len(), 3);
         assert_eq!(ns_a[0].0, ns_a_ids[0], "embedded row still scanned");
 
-        let first = get_memory_texts_batch(&conn, Some("reembed-a"), None, 1).unwrap();
+        let first = get_memory_texts_batch(&conn, Some("reembed-a"), None, 1, None).unwrap();
         let cursor = first[0].0.clone();
-        let rest = get_memory_texts_batch(&conn, Some("reembed-a"), Some(&cursor), 100).unwrap();
+        let rest =
+            get_memory_texts_batch(&conn, Some("reembed-a"), Some(&cursor), 100, None).unwrap();
         assert_eq!(rest.len(), 2);
         assert!(rest.iter().all(|(id, _, _)| id.as_str() > cursor.as_str()));
     }
@@ -19362,11 +19939,21 @@ mod tests {
         let id1 = insert(&conn, &make_memory("dim-est", "reembed-dim", Tier::Long, 5)).unwrap();
         let id2 = insert(&conn, &make_memory("dim-mig", "reembed-dim", Tier::Long, 5)).unwrap();
         // Establish a 4-dim namespace.
-        set_embedding(&conn, &id1, &[0.1, 0.2, 0.3, 0.4]).unwrap();
+        set_embedding(
+            &conn,
+            &id1,
+            &[0.1, 0.2, 0.3, 0.4],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
 
         // The checked writer enforces the established dim…
-        let refused =
-            set_embeddings_batch(&mut conn, &[(id2.clone(), vec![0.1_f32; 8])]).unwrap_err();
+        let refused = set_embeddings_batch(
+            &mut conn,
+            &[(id2.clone(), vec![0.1_f32; 8])],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap_err();
         assert!(
             refused.downcast_ref::<EmbeddingDimMismatch>().is_some(),
             "checked writer must refuse the dim change: {refused}"
@@ -19377,7 +19964,12 @@ mod tests {
             (id1.clone(), vec![0.9_f32; 8]),
             (id2.clone(), vec![0.8_f32; 8]),
         ];
-        let written = set_embeddings_batch_reembed(&mut conn, &entries).unwrap();
+        let written = set_embeddings_batch_reembed(
+            &mut conn,
+            &entries,
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
         assert_eq!(written, 2);
         assert_eq!(get_embedding(&conn, &id1).unwrap().unwrap().len(), 8);
         assert_eq!(get_embedding(&conn, &id2).unwrap().unwrap().len(), 8);
@@ -19391,10 +19983,19 @@ mod tests {
         let n = set_embeddings_batch_reembed(
             &mut conn,
             &[("no-such-id".to_string(), vec![0.1_f32; 8])],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
         assert_eq!(n, 0);
-        assert_eq!(set_embeddings_batch_reembed(&mut conn, &[]).unwrap(), 0);
+        assert_eq!(
+            set_embeddings_batch_reembed(
+                &mut conn,
+                &[],
+                &crate::embeddings::embedding_space_fingerprint("test-space")
+            )
+            .unwrap(),
+            0
+        );
     }
 
     // -----------------------------------------------------------------
@@ -19570,7 +20171,13 @@ mod tests {
         let id_a = insert(&conn, &make_memory("c-a", "cov-a", Tier::Long, 5)).unwrap();
         insert(&conn, &make_memory("c-b", "cov-a", Tier::Long, 5)).unwrap();
         insert(&conn, &make_memory("c-c", "cov-b", Tier::Long, 5)).unwrap();
-        set_embedding(&conn, &id_a, &[0.1, 0.2]).unwrap();
+        set_embedding(
+            &conn,
+            &id_a,
+            &[0.1, 0.2],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
 
         assert_eq!(embedding_coverage(&conn, None).unwrap(), (3, 1));
         assert_eq!(embedding_coverage(&conn, Some("cov-a")).unwrap(), (2, 1));
@@ -19586,11 +20193,28 @@ mod tests {
         let id_a = insert(&conn, &make_memory("d-a", "dims-a", Tier::Long, 5)).unwrap();
         let id_b = insert(&conn, &make_memory("d-b", "dims-b", Tier::Long, 5)).unwrap();
         let id_c = insert(&conn, &make_memory("d-c", "dims-b", Tier::Long, 5)).unwrap();
-        set_embedding(&conn, &id_a, &[0.1, 0.2]).unwrap();
-        set_embedding(&conn, &id_b, &[0.1; 8]).unwrap();
+        set_embedding(
+            &conn,
+            &id_a,
+            &[0.1, 0.2],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
+        set_embedding(
+            &conn,
+            &id_b,
+            &[0.1; 8],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
         // Mixed dims inside ONE namespace only arise mid-migration —
         // land them via the reembed writer.
-        set_embeddings_batch_reembed(&mut conn, &[(id_c, vec![0.2_f32; 4])]).unwrap();
+        set_embeddings_batch_reembed(
+            &mut conn,
+            &[(id_c, vec![0.2_f32; 4])],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
 
         assert_eq!(distinct_embedding_dims(&conn, None).unwrap(), vec![2, 4, 8]);
         assert_eq!(
@@ -19614,7 +20238,13 @@ mod tests {
     ) -> String {
         let mem = make_memory(title, ns, Tier::Long, 5);
         let id = insert(conn, &mem).unwrap();
-        set_embedding(conn, &id, embedding).unwrap();
+        set_embedding(
+            conn,
+            &id,
+            embedding,
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
         id
     }
 
@@ -19697,7 +20327,13 @@ mod tests {
         let mut mem = make_memory("expired", "ns", Tier::Short, 5);
         mem.expires_at = Some((chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339());
         let id = insert(&conn, &mem).unwrap();
-        set_embedding(&conn, &id, &[1.0, 0.0, 0.0]).unwrap();
+        set_embedding(
+            &conn,
+            &id,
+            &[1.0, 0.0, 0.0],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
 
         let q = vec![1.0_f32, 0.0, 0.0];
         let r = check_duplicate(&conn, &q, None, 0.85).unwrap();

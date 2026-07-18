@@ -818,6 +818,10 @@ impl MemoryStore for SqliteStore {
                 // direct db::recall call.
                 None,
                 vis_caller,
+                // v1.0.0 #2167 §3 — the active embedder fingerprint from
+                // the recall Filter gates every stored vector so recall
+                // never scores a foreign / unverified embedding space.
+                filter.active_embedding_space.as_deref(),
             )
             .map_err(box_err)?
             .0
@@ -2164,11 +2168,14 @@ impl MemoryStore for SqliteStore {
         _ctx: &CallerContext,
         id: &str,
         embedding: Option<&[f32]>,
+        space: &str,
     ) -> StoreResult<()> {
         let conn = self.state.lock().await;
         match embedding {
-            Some(vec) => db::set_embedding(&conn, id, vec).map_err(box_err),
-            None => db::set_embedding(&conn, id, &[]).map_err(box_err),
+            // #2167 — vector + space stamped atomically; a cleared embedding
+            // NULLs the space too (empty-vector path in `set_embedding`).
+            Some(vec) => db::set_embedding(&conn, id, vec, space).map_err(box_err),
+            None => db::set_embedding(&conn, id, &[], space).map_err(box_err),
         }
     }
 
@@ -2520,7 +2527,7 @@ mod tests {
 
         let m = test_memory("def-emb", "store_with_embedding default forwards to store");
         let id = store
-            .store_with_embedding(&ctx, &m, Some(&[0.1f32, 0.2, 0.3]))
+            .store_with_embedding(&ctx, &m, Some(&[0.1f32, 0.2, 0.3]), Some("test#none"))
             .await
             .expect("store_with_embedding default");
         assert_eq!(id, m.id);
@@ -2544,7 +2551,11 @@ mod tests {
             .expect("list_unembedded default");
         assert!(unembedded.is_empty(), "default list_unembedded is empty");
         let written = store
-            .set_embeddings_batch(&ctx, &[(m.id.clone(), vec![0.4f32, 0.5])])
+            .set_embeddings_batch(
+                &ctx,
+                &[(m.id.clone(), vec![0.4f32, 0.5])],
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
+            )
             .await
             .expect("set_embeddings_batch default");
         assert_eq!(
@@ -4012,7 +4023,12 @@ mod tests {
         // first established dim, so a fresh store accepts any dim.
         let vec = vec![0.1_f32, 0.2, 0.3, 0.4];
         store
-            .update_embedding(&ctx, &id, Some(&vec))
+            .update_embedding(
+                &ctx,
+                &id,
+                Some(&vec),
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
+            )
             .await
             .expect("update_embedding");
         // Verify by re-reading the column. We deliberately read via

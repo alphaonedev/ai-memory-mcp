@@ -435,13 +435,18 @@ fn daemon_build_vector_index_present_and_absent() {
 
     // No embedder → no index.
     assert!(
-        ai_memory::daemon_runtime::build_vector_index(&conn, false).is_none(),
+        ai_memory::daemon_runtime::build_vector_index(&conn, None).is_none(),
         "keyword-only deployment needs no vector index"
     );
 
     // Embedder present, empty DB → empty (but Some) index.
-    let idx = ai_memory::daemon_runtime::build_vector_index(&conn, true)
-        .expect("embedder-present empty DB yields an empty index");
+    let idx = ai_memory::daemon_runtime::build_vector_index(
+        &conn,
+        Some(&ai_memory::embeddings::embedding_space_fingerprint(
+            "test-space",
+        )),
+    )
+    .expect("embedder-present empty DB yields an empty index");
     assert_eq!(idx.len(), 0, "fresh DB → empty index");
 }
 

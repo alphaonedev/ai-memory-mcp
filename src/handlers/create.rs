@@ -412,6 +412,10 @@ fn insert_create_with_quota(
     >,
     mem: &Memory,
     embedding: &Option<Vec<f32>>,
+    // #2167 — the live embedder's space fingerprint, stamped alongside the
+    // vector. `None` when embeddings are disabled (then `embedding` is `None`
+    // too, so it is never read).
+    space: Option<&str>,
 ) -> Result<String, axum::response::Response> {
     // v0.7.0 Round-2 F7 — per-agent quota gate. Round-1 evidence: 500
     // HTTP stores from a single agent_id incremented zero rows in
@@ -510,7 +514,8 @@ fn insert_create_with_quota(
             // semantic search. HNSW index warm-up happens after the
             // lock drops in the orchestrator.
             if let Some(vec) = embedding.as_ref()
-                && let Err(e) = db::set_embedding(&lock.0, &actual_id, vec)
+                && let Some(sp) = space
+                && let Err(e) = db::set_embedding(&lock.0, &actual_id, vec, sp)
             {
                 tracing::warn!("failed to store embedding for {actual_id}: {e}");
             }
@@ -903,10 +908,19 @@ async fn create_memory_postgres(
     // populated; otherwise `recall_hybrid` filters every row out via
     // `WHERE embedding IS NOT NULL`.
     let embedding_text = crate::embeddings::embedding_document(&mem.title, &mem.content);
-    let embedding: Option<Vec<f32>> = match app.embedder.as_ref().as_ref() {
-        None => None,
-        Some(emb) => emb.embed(&embedding_text).ok(),
-    };
+    // #2167 — the vector and its embedding-space fingerprint are computed
+    // together and travel together into `store_with_embedding`, so the
+    // pgvector row's `embedding_space` provenance is stamped atomically with
+    // the vector (never a stale/absent stamp). `None`/`None` when there is no
+    // embedder or the embed call fails — no vector, no stamp.
+    let (embedding, embedding_space): (Option<Vec<f32>>, Option<String>) =
+        match app.embedder.as_ref().as_ref() {
+            None => (None, None),
+            Some(emb) => match emb.embed(&embedding_text) {
+                Ok(v) => (Some(v), Some(emb.space_fingerprint())),
+                Err(_) => (None, None),
+            },
+        };
 
     // v0.7.0 Wave-3 Continuation 3 (Phase 20) — governance walk on
     // writes. Postgres branch enforces the same inheritance chain +
@@ -990,9 +1004,12 @@ async fn create_memory_postgres(
     // arm so the Track D Docker probe can distinguish "federation never
     // wired into AppState" from "federation wired but emitted zero peer
     // requests".
-    let store_fut = app
-        .store
-        .store_with_embedding(&ctx, &mem, embedding.as_deref());
+    let store_fut = app.store.store_with_embedding(
+        &ctx,
+        &mem,
+        embedding.as_deref(),
+        embedding_space.as_deref(),
+    );
     let (id, quorum_outcome) = match app.federation.as_ref() {
         Some(fed) => {
             tracing::debug!(
@@ -1473,7 +1490,15 @@ pub async fn create_memory(
     }
 
     // Stage 5 — quota + insert.
-    let actual_id = match insert_create_with_quota(&lock, &mem, &embedding) {
+    // #2167 — resolve the live embedder's space so the inline embedding write
+    // stamps its provenance atomically.
+    let create_space = app
+        .embedder
+        .as_ref()
+        .as_ref()
+        .map(|e| e.space_fingerprint());
+    let actual_id = match insert_create_with_quota(&lock, &mem, &embedding, create_space.as_deref())
+    {
         Ok(id) => id,
         Err(resp) => return resp,
     };
