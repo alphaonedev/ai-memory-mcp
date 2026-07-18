@@ -1,0 +1,61 @@
+# Copyright 2026 AlphaOne LLC
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-memory-anthropic-shim"
+version = "0.1.0"
+description = "Record each Anthropic Messages turn to ai-memory (Direct-API SDK shim)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "AlphaOne LLC" }]
+keywords = ["ai-memory", "mcp", "memory", "anthropic", "claude", "llm", "shim"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+# `anthropic` is a PEER dependency: the caller brings their own client. It is
+# intentionally NOT a hard runtime dependency — the shim only touches duck-typed
+# attributes on the instance you pass to `wrap()`, and the `anthropic` extra
+# below documents the pairing for tooling.
+dependencies = []
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.39"]
+dev = [
+    "pytest>=8.0",
+    "anthropic>=0.39",
+    "mypy>=1.8",
+    "ruff>=0.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/alphaonedev/ai-memory-mcp"
+Source = "https://github.com/alphaonedev/ai-memory-mcp"
+Issues = "https://github.com/alphaonedev/ai-memory-mcp/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ai_memory_anthropic_shim*"]
+
+[tool.setuptools.package-data]
+ai_memory_anthropic_shim = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
