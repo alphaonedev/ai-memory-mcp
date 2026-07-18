@@ -8,9 +8,12 @@
 //! (unverified) vector is excluded from semantic scoring while staying
 //! keyword-recallable. Plus the §5 boot-adoption [G1]/[G2] rule.
 //!
-//! sqlite path here; the postgres twin rides `sal-postgres`
-//! (`#[ignore]` + `--include-ignored`) — see the pg `<=>` predicate +
-//! its site-count pin.
+//! sqlite path here; the postgres twin
+//! (`tests/embedding_space_provenance_2167_pg.rs`) rides `sal-postgres`
+//! and self-skips when `AI_MEMORY_TEST_POSTGRES_URL` is unset (the
+//! coverage-correct SKIP-IF-URL convention — see that file's header for
+//! why it is deliberately NOT `#[ignore]`). See also the pg `<=>`
+//! predicate + its site-count pin.
 //!
 //! Run: `AI_MEMORY_NO_CONFIG=1 cargo test --test embedding_space_provenance_2167`
 
@@ -19,11 +22,67 @@ use ai_memory::embeddings::embedding_space_fingerprint;
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use serde_json::json;
 
-/// Serialises the tests that flip the process-wide strict
-/// embed-model-match flag (`set_strict_embed_model_match_for_test`) so a
-/// concurrent test never observes another's mid-test strict window (the
-/// flag is a process-global atomic). #2182.
-static STRICT_FLAG_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Coordinates access to the process-wide strict embed-model-match flag
+/// (`set_strict_embed_model_match_for_test`, a process-global atomic).
+///
+/// #2189 — the flip-vs-flip hazard the #2182 `Mutex` closed was only half
+/// the problem: a plain mutex still let a NON-flipping reader (any test
+/// that calls `db::embedding_space_boot_maintenance`, the sole production
+/// reader of the flag, or that reads embedding-space state via recall /
+/// adoption) run CONCURRENTLY with a flipper and observe a torn
+/// `Some(true)` strict window → adoption unexpectedly skipped → spurious
+/// failure (an intermittent test is a real bug, per the #1724 lesson).
+///
+/// An `RwLock` closes the flip-vs-read hazard while keeping parallelism
+/// for the non-flipping majority: a flipper takes the EXCLUSIVE `write`
+/// lock for its ENTIRE strict window (via [`StrictFlagSession`], which
+/// also restores the flag to `None` on drop — panic-safe), and every
+/// reader takes a SHARED `read` lock (via [`strict_flag_read`]). Readers
+/// still run concurrently with each other; only the flipper serialises
+/// against them, so no reader can ever observe a half-flipped flag.
+static STRICT_FLAG_GUARD: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// RAII exclusive strict-flag session (#2189). Holds the `STRICT_FLAG_GUARD`
+/// WRITE lock for the whole test — excluding every shared reader for the
+/// full duration the flag may be flipped — and GUARANTEES the flag is
+/// restored to `None` on drop, even on a panicking unwind, so a torn
+/// `Some(true)` window can never leak to a concurrent reader. The test
+/// toggles the flag with `set_strict_embed_model_match_for_test` INSIDE
+/// the session (a test may flip ON, assert, then flip OFF and assert the
+/// lax path — all while holding the exclusive lock).
+struct StrictFlagSession {
+    _guard: std::sync::RwLockWriteGuard<'static, ()>,
+}
+
+impl StrictFlagSession {
+    fn acquire() -> Self {
+        Self {
+            // Recover from a prior flipper that panicked mid-session: the
+            // flag itself is restored by that session's Drop, so the
+            // poisoned `()` payload carries no torn state.
+            _guard: STRICT_FLAG_GUARD
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        }
+    }
+}
+
+impl Drop for StrictFlagSession {
+    fn drop(&mut self) {
+        ai_memory::hnsw::set_strict_embed_model_match_for_test(None);
+    }
+}
+
+/// Shared-read guard (#2189) held by every non-flipping test that reads
+/// embedding-space state the strict flag can influence (boot maintenance /
+/// adoption / recall). It never runs concurrently with a
+/// [`StrictFlagSession`] write window, but DOES run concurrently with
+/// other readers (`RwLock` read parallelism preserved).
+fn strict_flag_read() -> std::sync::RwLockReadGuard<'static, ()> {
+    STRICT_FLAG_GUARD
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 // ---------------------------------------------------------------------------
 // pg `<=>` site-count PIN (§3.4/§9) — every postgres query that consumes the
@@ -182,6 +241,9 @@ fn recall(
 
 #[test]
 fn t_inv_1_semantic_never_scores_foreign_or_null_space() {
+    // #2189 — shared read guard: never run concurrently with a strict-flag
+    // flipper's write window, so this test can't observe a half-flipped flag.
+    let _strict_read = strict_flag_read();
     let (conn, _p) = fresh_db();
     let active = embedding_space_fingerprint("nomic-embed-text"); // dim-agnostic token
     let foreign = embedding_space_fingerprint("granite-embedding"); // same dim, DIFFERENT space
@@ -232,6 +294,7 @@ fn t_inv_1_semantic_never_scores_foreign_or_null_space() {
 
 #[test]
 fn t_inv_1_foreign_row_stays_keyword_recallable_degraded_not_invisible() {
+    let _strict_read = strict_flag_read(); // #2189 flip-vs-read guard
     let (conn, _p) = fresh_db();
     let active = embedding_space_fingerprint("nomic-embed-text");
     let foreign = embedding_space_fingerprint("granite-embedding");
@@ -259,6 +322,7 @@ fn t_inv_1_foreign_row_stays_keyword_recallable_degraded_not_invisible() {
 
 #[test]
 fn t_inv_1_none_active_skips_gate_legacy_dim_only() {
+    let _strict_read = strict_flag_read(); // #2189 flip-vs-read guard
     // With no active fingerprint (keyword-only / no embedder) the space
     // gate is skipped — pre-#2167 dim-only behavior. A same-dim foreign
     // row IS scored (no space to gate against).
@@ -282,6 +346,7 @@ fn t_inv_1_none_active_skips_gate_legacy_dim_only() {
 
 #[test]
 fn t_funnel_set_embedding_stamps_active_space() {
+    let _strict_read = strict_flag_read(); // #2189 flip-vs-read guard
     let (conn, _p) = fresh_db();
     let fp = embedding_space_fingerprint("nomic-embed-text");
     let id = db::insert(&conn, &make_memory("funnel", "body")).unwrap();
@@ -306,6 +371,9 @@ fn t_funnel_set_embedding_stamps_active_space() {
 
 #[test]
 fn adoption_a_stamps_null_dim_matching_rows() {
+    // #2189 — adoption is the flag's [G1]-gated family; hold the shared
+    // read lock so a flipper's strict window can't skip adoption mid-test.
+    let _strict_read = strict_flag_read();
     let (conn, _p) = fresh_db();
     let active = embedding_space_fingerprint("nomic-embed-text");
     // Two embedded rows with NULL provenance at the active dim (4).
@@ -326,6 +394,7 @@ fn adoption_a_stamps_null_dim_matching_rows() {
 
 #[test]
 fn adoption_d_g2_refuses_on_mixed_history() {
+    let _strict_read = strict_flag_read(); // #2189 flip-vs-read guard
     let (conn, _p) = fresh_db();
     let active = embedding_space_fingerprint("nomic-embed-text");
     let foreign = embedding_space_fingerprint("granite-embedding");
@@ -369,10 +438,10 @@ fn adoption_e_g1_strict_disables_adoption() {
     );
     null_out_space(&conn, &nid);
 
-    let _strict = STRICT_FLAG_GUARD.lock().unwrap();
+    let _session = StrictFlagSession::acquire();
     ai_memory::hnsw::set_strict_embed_model_match_for_test(Some(true));
     db::embedding_space_boot_maintenance(&conn, &active, 4);
-    ai_memory::hnsw::set_strict_embed_model_match_for_test(None);
+    // `_session` drop restores the flag to None at end of scope.
 
     let still_null: Option<String> = conn
         .query_row(
@@ -389,6 +458,7 @@ fn adoption_e_g1_strict_disables_adoption() {
 
 #[test]
 fn adoption_dim_mismatch_row_not_stamped() {
+    let _strict_read = strict_flag_read(); // #2189 flip-vs-read guard
     // A NULL row at a NON-active dim is never adopted (it is a genuinely
     // different-space vector; only reembed can heal it).
     let (conn, _p) = fresh_db();
@@ -441,6 +511,10 @@ fn t_restore_active_space_row_round_trips_intact() {
     let _guard = ACTIVE_SPACE_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // #2189 flip-vs-read guard. Lock order is always ACTIVE_SPACE then
+    // STRICT (a strict-flag flipper never takes ACTIVE_SPACE), so the two
+    // process-global guards can't deadlock.
+    let _strict_read = strict_flag_read();
     let (conn, _p) = fresh_db();
     let active = embedding_space_fingerprint("nomic-embed-text");
     ai_memory::embeddings::set_active_embedding_space(Some(active.clone()));
@@ -487,6 +561,10 @@ fn t_restore_foreign_space_row_nulled_then_backfill_reheals() {
     let _guard = ACTIVE_SPACE_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // #2189 flip-vs-read guard. Lock order is always ACTIVE_SPACE then
+    // STRICT (a strict-flag flipper never takes ACTIVE_SPACE), so the two
+    // process-global guards can't deadlock.
+    let _strict_read = strict_flag_read();
     let (conn, _p) = fresh_db();
     let active = embedding_space_fingerprint("nomic-embed-text");
     let foreign = embedding_space_fingerprint("granite-embedding"); // same dim, other space
@@ -535,6 +613,10 @@ fn t_restore_null_space_legacy_vector_nulled_then_backfill() {
     let _guard = ACTIVE_SPACE_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // #2189 flip-vs-read guard. Lock order is always ACTIVE_SPACE then
+    // STRICT (a strict-flag flipper never takes ACTIVE_SPACE), so the two
+    // process-global guards can't deadlock.
+    let _strict_read = strict_flag_read();
     let (conn, _p) = fresh_db();
     let active = embedding_space_fingerprint("nomic-embed-text");
     ai_memory::embeddings::set_active_embedding_space(Some(active.clone()));
@@ -570,6 +652,10 @@ fn t_restore_none_active_keeps_stamped_drops_unverified() {
     let _guard = ACTIVE_SPACE_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // #2189 flip-vs-read guard. Lock order is always ACTIVE_SPACE then
+    // STRICT (a strict-flag flipper never takes ACTIVE_SPACE), so the two
+    // process-global guards can't deadlock.
+    let _strict_read = strict_flag_read();
     let (conn, _p) = fresh_db();
     let stamped_space = embedding_space_fingerprint("nomic-embed-text");
     ai_memory::embeddings::set_active_embedding_space(None);
@@ -651,6 +737,7 @@ fn recall_with_index(
 
 #[test]
 fn t_inv_hnsw_poisoned_index_never_scores_foreign_or_gone_row_2182() {
+    let _strict_read = strict_flag_read(); // #2189 flip-vs-read guard
     let (conn, _p) = fresh_db();
     let active = embedding_space_fingerprint("nomic-embed-text");
     let foreign = embedding_space_fingerprint("granite-embedding"); // same dim, other space
@@ -710,6 +797,7 @@ fn t_inv_hnsw_poisoned_index_never_scores_foreign_or_gone_row_2182() {
 
 #[test]
 fn t_hnsw_boot_seeds_active_space_rows_only_2182() {
+    let _strict_read = strict_flag_read(); // #2189 flip-vs-read guard
     let (conn, _p) = fresh_db();
     let active = embedding_space_fingerprint("nomic-embed-text");
     let foreign = embedding_space_fingerprint("granite-embedding");
@@ -740,6 +828,7 @@ fn t_hnsw_boot_seeds_active_space_rows_only_2182() {
 
 #[test]
 fn t_inv_3_kill_mid_reembed_leaves_only_consistently_stamped_rows_2182() {
+    let _strict_read = strict_flag_read(); // #2189 flip-vs-read guard
     let (conn, _p) = fresh_db();
     let space_a = embedding_space_fingerprint("nomic-embed-text");
     let space_b = embedding_space_fingerprint("granite-embedding"); // the reembed target
@@ -807,7 +896,10 @@ fn t_strict_disables_adoption_null_row_excluded_from_recall_2182() {
     let nid = seed_embedded(&conn, "strict null recall", &qe, &active);
     null_out_space(&conn, &nid);
 
-    let _strict = STRICT_FLAG_GUARD.lock().unwrap();
+    // Exclusive session: holds the write lock across BOTH the strict-ON
+    // and strict-OFF halves so no reader observes either toggle, and
+    // restores None on drop. #2189.
+    let _session = StrictFlagSession::acquire();
 
     // Strict ON → adoption skipped ([G1]); the row stays NULL-space and is
     // excluded from semantic recall (UnverifiedSpace).
@@ -833,5 +925,52 @@ fn t_strict_disables_adoption_null_row_excluded_from_recall_2182() {
     assert!(
         ids.contains(&nid.as_str()),
         "lax: the NULL-space row is adopted into the active space + recallable; got {ids:?}"
+    );
+}
+
+/// #2189 regression — the `StrictFlagSession` RAII guard is the load-bearing
+/// half of the flip-vs-read fix: it MUST restore the process-global strict
+/// flag to `None` on drop EVEN when the flipping test panics mid-window, so
+/// a torn `Some(true)` window can never leak past the failed test into a
+/// concurrent reader (which now holds a shared read lock the session's write
+/// lock excludes). Without the RAII restore, a panic between the manual
+/// `set(Some(true))` and `set(None)` would strand the flag ON. This pins
+/// both that contract and the flag's default-OFF baseline.
+#[test]
+fn strict_flag_session_restores_flag_on_drop_even_on_panic_2189() {
+    // Baseline: with no session engaged, the strict flag reads OFF.
+    {
+        let _r = strict_flag_read();
+        assert!(
+            !ai_memory::hnsw::strict_embed_model_match_enabled(),
+            "#2189 baseline: the process-global strict flag defaults OFF"
+        );
+    }
+
+    // A session that flips ON and then PANICS mid-window: the unwind must
+    // run `StrictFlagSession::drop`, which restores the flag to None. The
+    // panic also poisons the RwLock; `strict_flag_read` recovers via
+    // `into_inner` so no later reader/flipper is bricked by the poison.
+    let outcome = std::panic::catch_unwind(|| {
+        let _session = StrictFlagSession::acquire();
+        ai_memory::hnsw::set_strict_embed_model_match_for_test(Some(true));
+        assert!(
+            ai_memory::hnsw::strict_embed_model_match_enabled(),
+            "the session engaged strict mode before the injected panic"
+        );
+        panic!("simulated mid-flip failure");
+    });
+    assert!(
+        outcome.is_err(),
+        "the injected panic must propagate to the caller"
+    );
+
+    // Drop ran on the unwind → the flag is back OFF for the next reader.
+    let _r = strict_flag_read();
+    assert!(
+        !ai_memory::hnsw::strict_embed_model_match_enabled(),
+        "#2189: StrictFlagSession::drop MUST restore the strict flag to None \
+         on a panicking unwind so no concurrent reader observes a leaked \
+         Some(true) window"
     );
 }
