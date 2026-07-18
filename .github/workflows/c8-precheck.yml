@@ -177,6 +177,29 @@ jobs:
         # process stdin in a #[test]; the gate must reject it.
         run: bash scripts/check-test-stdin-reads.sh --self-test
 
+  migration-ladder-gate:
+    # v1.0.0 guardrail-D (2x5-vote decision memory b682c76a) — fail-closed
+    # migration-ladder-uniqueness gate. Structurally prevents the silent
+    # migration-ladder-collision class: a PR built on an OLD base adding
+    # `migrations/postgres/0041_v82_*.sql` while release already carries
+    # `0041_v84_*.sql` (the #2036-vs-#2192 shape) produces ZERO git conflict,
+    # git silently keeps BOTH files, and a corrupted/ambiguous ladder ships
+    # fleet-wide. HARD-BLOCKS a duplicate numeric prefix / duplicate schema
+    # version / ladder gap / cross-adapter tip disagreement / orphan file.
+    name: Migration-ladder-uniqueness gate (guardrail-D)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run migration-ladder gate
+        run: bash scripts/check-migration-ladder.sh
+      - name: Self-test the gate (regression evidence)
+        # --self-test plants the EXACT #2036/#2192 same-prefix-different-name
+        # collision AND a same-version-two-arms case in a throwaway copy UNDER
+        # the repo and confirms the gate rejects BOTH, plus a clean control —
+        # proving the gate is load-bearing (pm-v3.2 NO FAIL MISSION discipline).
+        run: bash scripts/check-migration-ladder.sh --self-test
+
   test-env-lock-gate:
     # Issue #2146 — the grep-gate half of issue #2127's Fix section,
     # not delivered by PR #2142 (Fable pre-merge audit of #2142).
