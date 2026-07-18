@@ -162,13 +162,17 @@ fn both_merge_orders_converge_to_identical_rows() {
     let (_tmp1, conn1) = fresh_db();
     let id1 = storage::insert(&conn1, &a_open).expect("node1 seed A");
     storage::merge_inbound(&conn1, &b_closed).expect("node1 merge B");
-    let row1 = db::get(&conn1, &id1).expect("node1 get").expect("node1 row");
+    let row1 = db::get(&conn1, &id1)
+        .expect("node1 get")
+        .expect("node1 row");
 
     // Node 2 holds B (closed), receives A (open) — the REVERSE order.
     let (_tmp2, conn2) = fresh_db();
     let id2 = storage::insert(&conn2, &b_closed).expect("node2 seed B");
     storage::merge_inbound(&conn2, &a_open).expect("node2 merge A");
-    let row2 = db::get(&conn2, &id2).expect("node2 get").expect("node2 row");
+    let row2 = db::get(&conn2, &id2)
+        .expect("node2 get")
+        .expect("node2 row");
 
     // IDENTICAL final rows (full serialized shape), incl. valid_until.
     assert_eq!(
@@ -184,7 +188,10 @@ fn both_merge_orders_converge_to_identical_rows() {
     // including valid_from/valid_until, must be byte-identical.
     let strip_vv = |row: &Memory| {
         let mut v = serde_json::to_value(row).expect("row serialises");
-        if let Some(meta) = v.get_mut("metadata").and_then(serde_json::Value::as_object_mut) {
+        if let Some(meta) = v
+            .get_mut("metadata")
+            .and_then(serde_json::Value::as_object_mut)
+        {
             meta.remove("version_vector");
         }
         v
