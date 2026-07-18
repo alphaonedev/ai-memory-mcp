@@ -148,6 +148,41 @@ impl std::fmt::Display for AttestLevel {
 /// helpers exist because the column is read as a `String` in many
 /// call sites that are not deserialising through serde (e.g.
 /// `rusqlite::Row::get`).
+///
+/// # ⚠️ FOOTGUN: `DerivedFrom` (`derived_from`) vs `DerivesFrom`
+/// (`derives_from`) — NOT duplicates, OPPOSITE directions ([#2055])
+///
+/// These two variants differ by a single character (`derived` vs
+/// `derives`) and are trivially confused by anyone authoring links,
+/// reading a KG traversal, or reasoning about the [`Self::LINEAGE`]
+/// trio — but they carry **opposite cardinalities and opposite
+/// authorship**:
+///
+/// | Variant | Wire slug | Cardinality | Produced by | Direction |
+/// |---|---|---|---|---|
+/// | [`Self::DerivedFrom`] | `derived_from` | **N → 1** (many sources, one result) | consolidation-merge | `source_id` = the merged memory, `target_id` = a source it absorbed |
+/// | [`Self::DerivesFrom`] | `derives_from` | **1 → N** (one source, many results) | atomisation-split | `source_id` = an atom, `target_id` = the parent it was split from |
+///
+/// Worked example — consolidating memories A + B into C, then
+/// atomising C into atoms X + Y, emits exactly these four edges:
+///
+/// ```text
+/// C --derived_from--> A     (consolidation: C ABSORBED A)
+/// C --derived_from--> B     (consolidation: C ABSORBED B)
+/// X --derives_from--> C     (atomisation: X was SPLIT OUT of C)
+/// Y --derives_from--> C     (atomisation: Y was SPLIT OUT of C)
+/// ```
+///
+/// Neither variant is a duplicate of the other and **NEITHER MAY BE
+/// RENAMED**: both wire slugs are persisted in `memory_links.relation`,
+/// enumerated in the SQL-side CHECK constraint
+/// (`crate::validate::VALID_RELATIONS`), and serialized over the wire —
+/// a rename is a breaking migration + wire change (tracked separately;
+/// coordinate with any future v1.x follow-up before touching either
+/// spelling). When authoring a link, read the table above rather than
+/// pattern-matching on the variant name's prefix.
+///
+/// [#2055]: https://github.com/alphaonedev/ai-memory-mcp/issues/2055
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryLinkRelation {
@@ -213,6 +248,13 @@ impl MemoryLinkRelation {
     /// to reject with a typed error or fall back to a default. The
     /// canonical strings are the SQL-side CHECK constraint membership
     /// list — keep this list in sync with the migration.
+    ///
+    /// ⚠️ Authoring a link by hand (e.g. `MemoryLinkRelation::from_str("derived_from")`)?
+    /// Double-check you want `"derived_from"` and not `"derives_from"` —
+    /// see the FOOTGUN section of [`MemoryLinkRelation`]'s type-level doc
+    /// comment before picking one; the names differ by a single character
+    /// but point in OPPOSITE directions (`derived_from` = N→1
+    /// consolidation-merge, `derives_from` = 1→N atomisation-split).
     #[must_use]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
