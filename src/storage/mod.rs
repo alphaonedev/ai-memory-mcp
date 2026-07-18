@@ -8330,22 +8330,49 @@ pub fn proactive_conflict_check_candidates(
     let placeholders = std::iter::repeat_n("?", candidate_ids.len())
         .collect::<Vec<_>>()
         .join(",");
+    // v1.0.0 #2167 §9 (#2188 defense-in-depth) — the ANN-routed candidate
+    // pool re-reads each row's blob and recomputes EXACT cosine in
+    // `proactive_conflict_verdict`, so it is a row-side cosine consumer
+    // exactly like the scan fallback (`proactive_conflict_check`),
+    // `check_duplicate`, and both clusterers. The #2181 rationale ("the
+    // index only holds active-space vectors post-#2167") gates index
+    // MEMBERSHIP, not the ROW the verdict re-reads — a candidate id can
+    // resolve to a row whose `embedding_space` drifted from the index
+    // snapshot (a concurrent out-of-process `ai-memory reembed` re-stamps
+    // rows to a NEW space while a live daemon still holds the OLD active
+    // fingerprint + OLD index vectors). Cosining the OLD-space query
+    // against a freshly re-embedded NEW-space row is a meaningless
+    // cross-space cosine that could surface a FALSE 409 advisory. Apply
+    // the SAME nullable gate the scan fallback got so every row-side
+    // cosine consumer is uniformly fail-closed against a cross-space
+    // score; the `?N IS NULL OR =` form keeps legacy dim-only behavior
+    // when no active space is seeded.
+    let active_space = crate::embeddings::active_embedding_space();
     let sql = format!(
         "SELECT id, title, content, embedding FROM memories
          WHERE id IN ({placeholders})
            AND embedding IS NOT NULL
            AND (expires_at IS NULL OR expires_at > ?{p_now})
-           AND namespace = ?{p_ns}",
+           AND namespace = ?{p_ns}
+           AND (?{p_space} IS NULL OR embedding_space = ?{p_space})",
         p_now = candidate_ids.len() + 1,
         p_ns = candidate_ids.len() + 2,
+        p_space = candidate_ids.len() + 3,
     );
     let mut stmt = conn.prepare(&sql)?;
-    let bind_iter = candidate_ids
+    // Heterogeneous bind types (candidate ids + now + namespace are
+    // TEXT; active_space is TEXT-or-NULL) — materialise to typed
+    // `rusqlite::types::Value` so the nullable space param binds SQL NULL
+    // when no active space is seeded (rather than the empty string).
+    let mut binds: Vec<rusqlite::types::Value> = candidate_ids
         .iter()
-        .map(String::as_str)
-        .chain([now.as_str(), mem.namespace.as_str()]);
+        .map(|s| rusqlite::types::Value::Text(s.clone()))
+        .collect();
+    binds.push(rusqlite::types::Value::Text(now));
+    binds.push(rusqlite::types::Value::Text(mem.namespace.clone()));
+    binds.push(active_space.map_or(rusqlite::types::Value::Null, rusqlite::types::Value::Text));
     let rows: Vec<(String, String, String, Vec<u8>)> = stmt
-        .query_map(rusqlite::params_from_iter(bind_iter), |row| {
+        .query_map(rusqlite::params_from_iter(binds), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
