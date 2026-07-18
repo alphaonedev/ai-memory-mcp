@@ -309,6 +309,13 @@ const MIGRATION_V80_LINEAGE_CUSTODY_REVOCATION: &str =
 const MIGRATION_V81_LINEAGE_RECOVERY_QUORUM: &str =
     include_str!("../../migrations/postgres/0040_v81_lineage_recovery_quorum.sql");
 
+/// v84 (#2167, v1.0.0) — embedding vector-space provenance (postgres twin of
+/// the sqlite v84 arm). Purely additive: ADD COLUMN IF NOT EXISTS for
+/// `embedding_space` on `memories` + `archived_memories` (NULL =
+/// legacy/unverified) + the ladder-owned partial index. No rewrite.
+const MIGRATION_V84_EMBEDDING_SPACE: &str =
+    include_str!("../../migrations/postgres/0041_v84_embedding_space.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -667,7 +674,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       idempotent, replay-safe DDL batch (the v74 precedent). Purely
 //       additive, no full-table rebuild → no trigger recreation.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 83;
+const CURRENT_SCHEMA_VERSION: i32 = 84;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1257,6 +1264,212 @@ impl PostgresStore {
         &self.pool
     }
 
+    /// v1.0.0 #2167 §5 pg twin — one-time boot ADOPTION of legacy
+    /// NULL-space rows on a postgres-backed corpus. The exact twin of the
+    /// sqlite [`crate::storage::adopt_legacy_embedding_space`]; without it a
+    /// postgres fleet upgraded to v84 would PERMANENTLY exclude its entire
+    /// pre-existing embedded corpus from semantic recall (every legacy row
+    /// is `embedding_space NULL`, which the S4 recall predicate `AND
+    /// embedding_space = $fp` drops) with no heal and no operator signal.
+    ///
+    /// Stamps `embedding_space = active_fp` onto every embedded row that
+    /// carries NO provenance yet (`embedding_space IS NULL`) AND whose
+    /// dimensionality matches the active embedder, on both `memories` and
+    /// `archived_memories`. Returns the number of `memories` rows stamped.
+    ///
+    /// **The §5 guards are preserved EXACTLY (a weakened guard = silent
+    /// adoption of a foreign vector = corruption):**
+    /// - **[G1]** the caller (`embedding_space_boot_maintenance`) invokes
+    ///   this ONLY when [`crate::hnsw::strict_embed_model_match_enabled`] is
+    ///   OFF — a strict operator demands explicit `reembed --stamp-only`
+    ///   attestation, so auto-adoption never runs.
+    /// - **[G2]** if ANY embedded row already carries a NON-NULL
+    ///   `embedding_space` that differs from `active_fp`, the corpus has
+    ///   demonstrated multi-space history and this REFUSES (returns
+    ///   `Ok(0)`, stamps nothing) — those NULL rows stay excluded until
+    ///   `reembed` (which re-derives them from the durable text).
+    ///
+    /// **Dim gate — `vector_dims(embedding)`, NOT the `embedding_dim`
+    /// column.** pgvector stores every vector in the column's declared
+    /// dimension, and legacy rows may carry a NULL `embedding_dim` scalar
+    /// even with a valid vector — gating on that nullable column would
+    /// WRONGLY exclude legacy rows from the no-nuke stamp (the exact defect
+    /// #2179 describes). `vector_dims(embedding)` reads the authoritative
+    /// per-row dimensionality, so a genuine same-dim swap-back corpus is
+    /// still [G2]-protected while a homogeneous legacy corpus is fully
+    /// adopted.
+    ///
+    /// Monotone (NULL→fp only, never overwrites a stamp), idempotent
+    /// (post-adoption `{embedding NOT NULL, space NULL}` shrinks toward
+    /// empty), best-effort at the call site.
+    ///
+    /// # Errors
+    ///
+    /// Bubbles the sqlx error from the [G2] guard probe or either UPDATE.
+    pub async fn adopt_legacy_embedding_space(
+        &self,
+        active_fp: &str,
+        active_dim: usize,
+    ) -> StoreResult<usize> {
+        // [G2] — refuse if any embedded row already carries a DIFFERENT
+        // stamp (a corpus with demonstrated multi-space history never
+        // auto-adopts; its NULL rows stay excluded until explicit
+        // attestation). Byte-for-byte the sqlite [G2] EXISTS probe.
+        let mismatched: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM memories \
+             WHERE embedding_space IS NOT NULL AND embedding_space != $1)",
+        )
+        .bind(active_fp)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("adopt_legacy_embedding_space g2 probe", e))?;
+        if mismatched {
+            tracing::warn!(
+                active_space = %active_fp,
+                "embedding-space adoption REFUSED (pg): corpus has demonstrated multi-space \
+                 history ([G2]); NULL-space rows stay excluded until `ai-memory reembed` \
+                 (re-derive from text)"
+            );
+            return Ok(0);
+        }
+        let dim_i32 = i32::try_from(active_dim).unwrap_or(i32::MAX);
+        // Stamp NULL→fp for dim-matching embedded rows on BOTH tables. The
+        // archived twin keeps archive→restore round-trips in-space lossless.
+        let stamped = sqlx::query(
+            "UPDATE memories SET embedding_space = $1 \
+             WHERE embedding IS NOT NULL AND embedding_space IS NULL \
+               AND vector_dims(embedding) = $2",
+        )
+        .bind(active_fp)
+        .bind(dim_i32)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("adopt_legacy_embedding_space memories", e))?
+        .rows_affected();
+        let _archived = sqlx::query(
+            "UPDATE archived_memories SET embedding_space = $1 \
+             WHERE embedding IS NOT NULL AND embedding_space IS NULL \
+               AND vector_dims(embedding) = $2",
+        )
+        .bind(active_fp)
+        .bind(dim_i32)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("adopt_legacy_embedding_space archived", e))?;
+        let stamped = usize::try_from(stamped).unwrap_or(usize::MAX);
+        if stamped > 0 {
+            tracing::warn!(
+                adopted_rows = stamped,
+                space = %active_fp,
+                "embedding-space adoption (pg) stamped {stamped} legacy NULL-space row(s) with \
+                 the active fingerprint (§5 one-time boot adoption)"
+            );
+        } else {
+            tracing::info!(
+                space = %active_fp,
+                "embedding-space adoption (pg) ran: no legacy NULL-space dim-matching rows to stamp"
+            );
+        }
+        Ok(stamped)
+    }
+
+    /// v1.0.0 #2167 §6 pg twin — distinct embedding-space census over the
+    /// embedded `memories` corpus (mirrors the sqlite
+    /// [`crate::storage::distinct_embedding_spaces`]). Returns `(space,
+    /// count)` pairs (NULL space = legacy/unverified) ordered NULL-first.
+    ///
+    /// # Errors
+    ///
+    /// Bubbles the sqlx error from the aggregate query.
+    pub async fn distinct_embedding_spaces(&self) -> StoreResult<Vec<(Option<String>, u64)>> {
+        let rows = sqlx::query(
+            "SELECT embedding_space, COUNT(*) AS c FROM memories \
+             WHERE embedding IS NOT NULL \
+             GROUP BY embedding_space \
+             ORDER BY embedding_space IS NOT NULL, embedding_space",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("distinct_embedding_spaces", e))?;
+        rows.iter()
+            .map(|r| {
+                let space: Option<String> = r
+                    .try_get("embedding_space")
+                    .map_err(|e| to_store_err("read census space", e))?;
+                let count: i64 = r
+                    .try_get("c")
+                    .map_err(|e| to_store_err("read census count", e))?;
+                Ok((space, u64::try_from(count).unwrap_or(0)))
+            })
+            .collect()
+    }
+
+    /// v1.0.0 #2167 §5 + §6 pg twin — the shared boot maintenance run at the
+    /// pg-backed `serve` boot site (the postgres equivalent of the sqlite
+    /// [`crate::storage::embedding_space_boot_maintenance`]). Runs
+    /// adopt→census in the load-bearing order; best-effort + idempotent (it
+    /// swallows errors into a WARN — a transient DB fault degrades to a
+    /// skipped heal, never an abort; recall then treats NULL/foreign rows as
+    /// excluded, which is safe + degraded).
+    /// 1. **§5 adoption** — unless strict mode
+    ///    ([`crate::hnsw::strict_embed_model_match_enabled`], [G1]) is on,
+    ///    stamp legacy NULL-space dim-matching rows with `active_fp` (the
+    ///    [G2]-guarded [`Self::adopt_legacy_embedding_space`]).
+    /// 2. **§6 census** — diff [`Self::distinct_embedding_spaces`] against
+    ///    `active_fp`; emit ONE loud WARN naming the per-space counts + the
+    ///    heal command when any non-active / NULL space carries rows, so a
+    ///    postgres fleet upgrade is NEVER a silent semantic-recall outage.
+    pub async fn embedding_space_boot_maintenance(&self, active_fp: &str, active_dim: usize) {
+        // §5 adoption — [G1] strict off.
+        if crate::hnsw::strict_embed_model_match_enabled() {
+            tracing::info!(
+                active_space = %active_fp,
+                "#2167 (pg): strict embed-model-match mode ON — skipping legacy NULL-space \
+                 adoption ([G1]); attest with `ai-memory reembed --stamp-only` or heal with \
+                 `ai-memory reembed`"
+            );
+        } else if let Err(e) = self
+            .adopt_legacy_embedding_space(active_fp, active_dim)
+            .await
+        {
+            tracing::warn!(
+                err = %e,
+                "#2167 (pg): embedding-space boot adoption failed (best-effort); legacy \
+                 NULL-space rows stay excluded from semantic recall until reembed"
+            );
+        }
+        // §6 census — loud WARN on any heterogeneity.
+        match self.distinct_embedding_spaces().await {
+            Ok(census) => {
+                let mut reembed_pending: u64 = 0;
+                let mut foreign_or_null: Vec<String> = Vec::new();
+                for (space, count) in &census {
+                    let is_active = space.as_deref() == Some(active_fp);
+                    if !is_active {
+                        reembed_pending = reembed_pending.saturating_add(*count);
+                        let label = space.as_deref().unwrap_or("<null/unverified>");
+                        foreign_or_null.push(format!("{label}={count}"));
+                    }
+                }
+                if reembed_pending > 0 {
+                    tracing::warn!(
+                        active_space = %active_fp,
+                        reembed_pending,
+                        census = %foreign_or_null.join(", "),
+                        "#2167 embedding-space census (pg): {reembed_pending} embedded row(s) are \
+                         NOT in the active space [{}] — they are excluded from semantic scoring \
+                         (still keyword-recallable). The serve-boot backfill re-embeds NULL-space \
+                         rows from durable text; heal foreign-stamped rows with `ai-memory reembed`",
+                        foreign_or_null.join(", ")
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "#2167 (pg): embedding-space boot census query failed");
+            }
+        }
+    }
+
     /// Run schema migrations on the connection. Called after bootstrap schema
     /// is loaded. Reads the current schema_version, then applies all pending
     /// migrations in a transaction per version step (matching SQLite behavior
@@ -1570,8 +1783,11 @@ impl PostgresStore {
         if current_version < 82 {
             self.migrate_v82().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 83 {
             self.migrate_v83().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v84().await?;
         }
 
         Ok(())
@@ -4040,7 +4256,9 @@ impl PostgresStore {
         .await
         .map_err(|e| to_store_err("v83 index agent_api_keys", e))?;
 
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // Stamp the LITERAL arm version, not CURRENT_SCHEMA_VERSION — v84
+        // now sits at the ladder head, so v83 must record exactly 83.
+        record_schema_version(&mut tx, 83).await?;
 
         tx.commit()
             .await
@@ -4050,6 +4268,34 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v83 applied (#2044: agent_api_keys per-agent \
              principal-binding table)"
+        );
+        Ok(())
+    }
+
+    /// v84 (#2167, v1.0.0) — embedding vector-space provenance. Adds the
+    /// per-row `embedding_space TEXT` column (NULL = legacy/unverified) to
+    /// `memories` + `archived_memories` + the ladder-owned partial index, so
+    /// the recall SQL predicate `AND embedding_space = $fp` can never score a
+    /// vector from a different embedding space. Purely additive
+    /// (`ADD COLUMN IF NOT EXISTS`), no rewrite.
+    async fn migrate_v84(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v84 ddl tx", e))?;
+        sqlx::raw_sql(MIGRATION_V84_EMBEDDING_SPACE)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v84 embedding-space", e))?;
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v84 migration", e))?;
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v84 applied (#2167: embedding_space provenance \
+             column on memories + archived_memories)"
         );
         Ok(())
     }
@@ -4566,7 +4812,7 @@ impl PostgresStore {
                     (id, tier, namespace, title, content, tags, priority, confidence,
                      source, access_count, created_at, updated_at, last_accessed_at,
                      expires_at, archived_at, archive_reason, metadata,
-                     embedding, embedding_dim, original_tier, original_expires_at,
+                     embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                      reflection_depth, atomised_into, atom_of, memory_kind,
                      entity_id, persona_version, citations, source_uri, source_span,
                      confidence_source, confidence_signals, confidence_decayed_at,
@@ -4574,7 +4820,7 @@ impl PostgresStore {
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, NOW(), $2, metadata,
-                        embedding, embedding_dim, tier, expires_at,
+                        embedding, embedding_dim, embedding_space, tier, expires_at,
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
@@ -4960,7 +5206,7 @@ impl PostgresStore {
                 (id, tier, namespace, title, content, tags, priority, confidence,
                  source, access_count, created_at, updated_at, last_accessed_at,
                  expires_at, archived_at, archive_reason, metadata,
-                 embedding, embedding_dim, original_tier, original_expires_at,
+                 embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                  reflection_depth, atomised_into, atom_of, memory_kind,
                  entity_id, persona_version, citations, source_uri, source_span,
                  confidence_source, confidence_signals, confidence_decayed_at,
@@ -4968,7 +5214,7 @@ impl PostgresStore {
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, NOW(), 'superseded', metadata,
-                    embedding, embedding_dim, tier, expires_at,
+                    embedding, embedding_dim, embedding_space, tier, expires_at,
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
@@ -5665,14 +5911,25 @@ impl PostgresStore {
         // operator MUST re-embed after the migration. We don't TRUNCATE
         // because the memory rows themselves remain valid — only the
         // vector column is invalidated.
-        sqlx::query("UPDATE memories SET embedding = NULL WHERE embedding IS NOT NULL")
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("null memories.embedding", e))?;
-        sqlx::query("UPDATE archived_memories SET embedding = NULL WHERE embedding IS NOT NULL")
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("null archived_memories.embedding", e))?;
+        // #2167 — the provenance stamp travels WITH the vector: clearing
+        // the vector clears its `embedding_space` in the same statement, so
+        // a dim migration never leaves an orphan stamp on a NULL-embedding
+        // row (an orphan stamp would falsely trip the §5 [G2] adoption
+        // guard and block the whole legacy corpus from being adopted).
+        sqlx::query(
+            "UPDATE memories SET embedding = NULL, embedding_space = NULL \
+             WHERE embedding IS NOT NULL",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("null memories.embedding", e))?;
+        sqlx::query(
+            "UPDATE archived_memories SET embedding = NULL, embedding_space = NULL \
+             WHERE embedding IS NOT NULL",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("null archived_memories.embedding", e))?;
 
         // Alter the column types. pgvector's type allows ALTER COLUMN
         // TYPE between two `vector(N)` declarations even when rows are
@@ -14131,6 +14388,7 @@ impl MemoryStore for PostgresStore {
         ctx: &CallerContext,
         memory: &Memory,
         embedding: Option<&[f32]>,
+        space: Option<&str>,
     ) -> StoreResult<String> {
         self.gate_record_stop()?;
         // v0.8.1 W1 (#1821 / gap G29) — credential REDACT backstop (postgres
@@ -14181,6 +14439,11 @@ impl MemoryStore for PostgresStore {
                 detail: serialize_err("tags", e),
             })?;
         let emb_pgvec = embedding.map(|v| pgvector::Vector::from(v.to_vec()));
+        // #2167 — the vector's provenance stamp travels in the SAME
+        // statement as the vector (the §2 same-statement rule). Stamp
+        // `space` ONLY when a vector is actually written, so a NULL
+        // embedding never lands a lying `embedding_space`.
+        let emb_space: Option<&str> = embedding.and_then(|_| space);
         // #1608 — Form-4 / Form-5 / QW-2 column parity with `store()`
         // and `apply_remote_memory`. Pre-#1608 this INSERT listed only
         // 19 columns, so the embed-before-store hot path (the HTTP
@@ -14244,12 +14507,12 @@ impl MemoryStore for PostgresStore {
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version, embedding,
                 mentioned_entity_id, lifecycle_state,
-                cid, cid_genesis
+                cid, cid_genesis, embedding_space
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                       $18, $19, $20,
                       $21, $22, $23,
                       $24, $25, $26,
-                      $27, $28, $29, $30)
+                      $27, $28, $29, $30, $31)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 tier = CASE
@@ -14299,6 +14562,16 @@ impl MemoryStore for PostgresStore {
                 entity_id = COALESCE(memories.entity_id, EXCLUDED.entity_id),
                 persona_version = COALESCE(memories.persona_version, EXCLUDED.persona_version),
                 embedding = COALESCE(EXCLUDED.embedding, memories.embedding),
+                -- #2167 — the stamp travels WITH the vector on the upsert-
+                -- merge arm too: when the incoming vector replaces the
+                -- stored one, its space replaces the stored stamp; when the
+                -- incoming vector is NULL (COALESCE keeps the old vector),
+                -- the old stamp is kept. A same-dim model swap-back can
+                -- therefore never leave a stamp attesting a foreign vector.
+                embedding_space = CASE
+                    WHEN EXCLUDED.embedding IS NOT NULL THEN EXCLUDED.embedding_space
+                    ELSE memories.embedding_space
+                END,
                 -- #1383 — preserve a previously-extracted attribution
                 -- if EXCLUDED is NULL (sqlite parity).
                 mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
@@ -14342,6 +14615,7 @@ impl MemoryStore for PostgresStore {
         .bind(memory.lifecycle_state.as_str())
         .bind(&embed_cid.cid)
         .bind(&embed_cid.genesis)
+        .bind(emb_space)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory_with_embedding", e))?
@@ -14364,23 +14638,46 @@ impl MemoryStore for PostgresStore {
         _ctx: &CallerContext,
         id: &str,
         embedding: Option<&[f32]>,
+        space: &str,
     ) -> StoreResult<()> {
         let emb_pgvec = embedding.map(|v| pgvector::Vector::from(v.to_vec()));
-        sqlx::query("UPDATE memories SET embedding = $2 WHERE id = $1")
+        // #2167 — vector + space travel together; a None (cleared) embedding
+        // NULLs the space stamp too (no vector, no provenance).
+        let space_val: Option<&str> = embedding.map(|_| space);
+        sqlx::query("UPDATE memories SET embedding = $2, embedding_space = $3 WHERE id = $1")
             .bind(id)
             .bind(emb_pgvec)
+            .bind(space_val)
             .execute(&self.pool)
             .await
             .map_err(|e| to_store_err("update_embedding", e))?;
         Ok(())
     }
 
-    /// #1579 A4 — bounded NULL-embedding scan for the serve-boot
-    /// backfill sweep. Oldest-first so the sweep replays the v29
-    /// dim-migration damage in insertion order; the `LIMIT` keeps each
-    /// pass bounded (F5.6 semantics — the sweep loop in
-    /// [`crate::store::run_embedding_backfill_on_store`] re-scans
-    /// until empty).
+    /// #1579 A4 — bounded scan of rows the serve-boot backfill sweep must
+    /// (re-)embed. Oldest-first so the sweep replays the v29 dim-migration
+    /// damage in insertion order; the `LIMIT` keeps each pass bounded (F5.6
+    /// semantics — the sweep loop in
+    /// [`crate::store::run_embedding_backfill_on_store`] re-scans until
+    /// empty).
+    ///
+    /// #2167 §5/§6 pg HEAL — the predicate also targets rows that carry a
+    /// vector with NO provenance (`embedding IS NOT NULL AND embedding_space
+    /// IS NULL`). These are legacy NULL-space rows the boot [`§5 adoption`]
+    /// could NOT stamp (strict [G1], or [G2] refused on a multi-space
+    /// corpus, or a non-active dim). They are excluded from semantic recall
+    /// by the S4 gate; the ONLY heal on postgres is to re-derive the vector
+    /// from the durable text under the LIVE embedder — which
+    /// [`crate::store::run_embedding_backfill_on_store`] does, then stamps
+    /// the fresh vector with the active space via `set_embeddings_batch`.
+    /// Re-embedding from durable text is always safe (the text is the source
+    /// of truth), and the write moves the row into the active space so the
+    /// scan is monotone (each NULL-space row heals in one pass, never
+    /// re-scanned). This is the pg twin of the sqlite reembed/heal path —
+    /// without it a post-v84 postgres corpus that [G1]/[G2] blocked from
+    /// adoption would be PERMANENTLY excluded from semantic recall.
+    ///
+    /// [`§5 adoption`]: PostgresStore::adopt_legacy_embedding_space
     async fn list_unembedded(
         &self,
         ctx: &CallerContext,
@@ -14402,6 +14699,7 @@ impl MemoryStore for PostgresStore {
         let rows = sqlx::query(
             "SELECT id, title, content FROM memories \
               WHERE embedding IS NULL \
+                 OR (embedding IS NOT NULL AND embedding_space IS NULL) \
               ORDER BY created_at ASC \
               LIMIT $1",
         )
@@ -14431,6 +14729,7 @@ impl MemoryStore for PostgresStore {
         &self,
         _ctx: &CallerContext,
         entries: &[(String, Vec<f32>)],
+        space: &str,
     ) -> StoreResult<usize> {
         if entries.is_empty() {
             return Ok(0);
@@ -14441,14 +14740,19 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("begin set_embeddings_batch tx", e))?;
         let mut written = 0usize;
+        // #2167 — one space stamps the whole batch (live-minted in one process).
+        let space_str = space;
         for (id, vec) in entries {
             let emb_pgvec = pgvector::Vector::from(vec.clone());
-            let res = sqlx::query("UPDATE memories SET embedding = $2 WHERE id = $1")
-                .bind(id)
-                .bind(emb_pgvec)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("set_embeddings_batch update", e))?;
+            let res = sqlx::query(
+                "UPDATE memories SET embedding = $2, embedding_space = $3 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(emb_pgvec)
+            .bind(space_str)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("set_embeddings_batch update", e))?;
             written += usize::try_from(res.rows_affected()).unwrap_or(0);
         }
         tx.commit()
@@ -14637,7 +14941,7 @@ impl MemoryStore for PostgresStore {
                     (id, tier, namespace, title, content, tags, priority, confidence,
                      source, access_count, created_at, updated_at, last_accessed_at,
                      expires_at, archived_at, archive_reason, metadata,
-                     embedding, embedding_dim, original_tier, original_expires_at,
+                     embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                      reflection_depth, atomised_into, atom_of, memory_kind,
                      entity_id, persona_version, citations, source_uri, source_span,
                      confidence_source, confidence_signals, confidence_decayed_at,
@@ -14645,7 +14949,7 @@ impl MemoryStore for PostgresStore {
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, NOW(), $2, metadata,
-                        embedding, embedding_dim, tier, expires_at,
+                        embedding, embedding_dim, embedding_space, tier, expires_at,
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
@@ -16241,6 +16545,14 @@ impl MemoryStore for PostgresStore {
                        OR COALESCE(metadata->>'scope', 'private') <> 'private'
                        OR metadata->>'agent_id' = $9
                    )
+                   -- v1.0.0 #2167 §3.4 — the embedding-space gate as a SQL
+                   -- predicate: a stored vector is scored ONLY when its
+                   -- provenance token equals the active fingerprint ($10).
+                   -- SQL `NULL = $10` is false, so NULL (unverified) rows
+                   -- are excluded for free — matching the sqlite comparator
+                   -- exactly. A foreign-space (same-dim model swap) vector
+                   -- is structurally never an ANN candidate.
+                   AND embedding_space = $10
                    {lifecycle_vis}
                  ORDER BY embedding <=> $1
                  LIMIT $8",
@@ -16256,6 +16568,7 @@ impl MemoryStore for PostgresStore {
             .bind(filter.until)
             .bind(ann_pool)
             .bind(caller_opt)
+            .bind(filter.active_embedding_space.as_ref())
             .fetch_all(&self.pool)
             .await
             .map_err(|e| to_store_err("recall_hybrid semantic pool", e))?;
@@ -17385,7 +17698,7 @@ impl MemoryStore for PostgresStore {
                     id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, archived_at, archive_reason, metadata,
-                    embedding, embedding_dim, original_tier, original_expires_at,
+                    embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                     -- #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
@@ -17395,7 +17708,7 @@ impl MemoryStore for PostgresStore {
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
                        expires_at, $4::timestamptz, 'forget', metadata,
-                       embedding, embedding_dim, tier, expires_at,
+                       embedding, embedding_dim, embedding_space, tier, expires_at,
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
@@ -19517,7 +19830,7 @@ impl MemoryStore for PostgresStore {
                     id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, archived_at, archive_reason, metadata,
-                    embedding, embedding_dim, original_tier, original_expires_at,
+                    embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                     -- #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
@@ -19527,7 +19840,7 @@ impl MemoryStore for PostgresStore {
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
                        expires_at, $1::timestamptz, 'ttl_expired', metadata,
-                       embedding, embedding_dim, tier, expires_at,
+                       embedding, embedding_dim, embedding_space, tier, expires_at,
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
@@ -19668,7 +19981,7 @@ impl MemoryStore for PostgresStore {
                         id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, archived_at, archive_reason, metadata,
-                        embedding, embedding_dim, original_tier, original_expires_at,
+                        embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
@@ -19677,7 +19990,7 @@ impl MemoryStore for PostgresStore {
                     SELECT id, tier, namespace, title, content, tags, priority, confidence,
                            source, access_count, created_at, updated_at, last_accessed_at,
                            expires_at, now(), 'size_gc', metadata,
-                           embedding, embedding_dim, tier, expires_at,
+                           embedding, embedding_dim, embedding_space, tier, expires_at,
                            reflection_depth, atomised_into, atom_of, memory_kind,
                            entity_id, persona_version, citations, source_uri, source_span,
                            confidence_source, confidence_signals, confidence_decayed_at,
@@ -19843,7 +20156,7 @@ impl MemoryStore for PostgresStore {
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
-                expires_at, metadata, embedding, embedding_dim,
+                expires_at, metadata, embedding, embedding_dim, embedding_space,
                 reflection_depth, atomised_into, atom_of, memory_kind,
                 entity_id, persona_version, citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
@@ -19853,7 +20166,22 @@ impl MemoryStore for PostgresStore {
             SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                    tags, priority, confidence, source, access_count, created_at,
                    $1::timestamptz, last_accessed_at, original_expires_at, metadata,
-                   embedding, embedding_dim,
+                   -- v1.0.0 #2167 (S8) restore/migrate HEAL (postgres twin):
+                   -- keep the archived vector ONLY when its space matches the
+                   -- live active space ($5); a foreign- or NULL-space vector
+                   -- has its whole trio NULLed so the boot backfill re-embeds
+                   -- from the durable text under the LIVE space (self-heal).
+                   -- $5 NULL (no active embedder in this process) keeps any
+                   -- STAMPED vector but still drops an unverifiable NULL one.
+                   CASE WHEN embedding_space IS NOT NULL
+                             AND ($5::text IS NULL OR embedding_space = $5)
+                        THEN embedding ELSE NULL END,
+                   CASE WHEN embedding_space IS NOT NULL
+                             AND ($5::text IS NULL OR embedding_space = $5)
+                        THEN embedding_dim ELSE NULL END,
+                   CASE WHEN embedding_space IS NOT NULL
+                             AND ($5::text IS NULL OR embedding_space = $5)
+                        THEN embedding_space ELSE NULL END,
                    COALESCE(reflection_depth, 0),
                    atomised_into,
                    atom_of,
@@ -19874,6 +20202,9 @@ impl MemoryStore for PostgresStore {
         .bind(id)
         .bind(&restored_cid.cid)
         .bind(&restored_cid.genesis)
+        // v1.0.0 #2167 (S8) — $5: the process-wide active-space fp (NULL when
+        // this process resolved no embedder) driving the restore heal above.
+        .bind(crate::embeddings::active_embedding_space())
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("archive_restore insert", e))?;
@@ -20028,7 +20359,7 @@ impl MemoryStore for PostgresStore {
                     id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, archived_at, archive_reason, metadata,
-                    embedding, embedding_dim, original_tier, original_expires_at,
+                    embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                     -- #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
@@ -20038,7 +20369,7 @@ impl MemoryStore for PostgresStore {
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
                        expires_at, $1::timestamptz, $2::text, metadata,
-                       embedding, embedding_dim, tier, expires_at,
+                       embedding, embedding_dim, embedding_space, tier, expires_at,
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
@@ -22242,6 +22573,15 @@ impl MemoryStore for PostgresStore {
         // `namespace=None`) with a non-null embedding, ordered by
         // cosine ascending (= most similar first), limit 1.
         let emb_pgvec = pgvector::Vector::from(query_embedding.to_vec());
+        // v1.0.0 #2167 §3.4/§9 — a dup-check must NEVER match across embedding
+        // spaces: comparing the live query vector against a foreign-space
+        // (same-dim model swap) stored vector is a meaningless cosine that
+        // could produce a FALSE duplicate verdict (silent merge/skip of a
+        // distinct memory = corruption). Gate on the process-wide active space
+        // (`embeddings::active_embedding_space`, the space of the embedder that
+        // produced `query_embedding`). The nullable-safe `IS NULL OR =` form
+        // preserves legacy dim-only behavior when no active space is seeded.
+        let active_space = crate::embeddings::active_embedding_space();
         let nearest_row = if let Some(ns) = namespace {
             sqlx::query(
                 "SELECT id, title, namespace,
@@ -22250,12 +22590,14 @@ impl MemoryStore for PostgresStore {
                  WHERE embedding IS NOT NULL
                    AND namespace = $2
                    AND (expires_at IS NULL OR expires_at > $3)
+                   AND ($4::text IS NULL OR embedding_space = $4)
                  ORDER BY embedding <=> $1
                  LIMIT 1",
             )
             .bind(&emb_pgvec)
             .bind(ns)
             .bind(now_dt)
+            .bind(active_space.as_ref())
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| to_store_err("check_duplicate_with_text cosine", e))?
@@ -22266,11 +22608,13 @@ impl MemoryStore for PostgresStore {
                  FROM memories
                  WHERE embedding IS NOT NULL
                    AND (expires_at IS NULL OR expires_at > $2)
+                   AND ($3::text IS NULL OR embedding_space = $3)
                  ORDER BY embedding <=> $1
                  LIMIT 1",
             )
             .bind(&emb_pgvec)
             .bind(now_dt)
+            .bind(active_space.as_ref())
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| to_store_err("check_duplicate_with_text cosine", e))?
@@ -26009,7 +26353,7 @@ mod tests {
         // MiniLM default the AGE test harness provisions).
         let embedding = vec![0.5_f32; 384];
         let id = store
-            .store_with_embedding(&ctx, &mem, Some(&embedding))
+            .store_with_embedding(&ctx, &mem, Some(&embedding), Some("test-space#none"))
             .await
             .expect("store_with_embedding");
 
@@ -26294,7 +26638,12 @@ mod tests {
         let dim_usize = usize::try_from(dim.unwrap_or(384)).unwrap_or(384);
         let vec = vec![0.0_f32; dim_usize];
         store
-            .update_embedding(&ctx, &id, Some(&vec))
+            .update_embedding(
+                &ctx,
+                &id,
+                Some(&vec),
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
+            )
             .await
             .expect("update_embedding");
         // Re-fetch to verify the vector landed (column is non-NULL).

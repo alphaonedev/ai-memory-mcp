@@ -418,6 +418,7 @@ async fn b2_search_still_returns_matches_through_sal() {
         since: None,
         until: None,
         limit: 10,
+        active_embedding_space: None,
     };
     let hits = store
         .search(&ctx, "substrate recall", &filter)

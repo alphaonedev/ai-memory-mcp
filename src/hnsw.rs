@@ -161,6 +161,53 @@ pub fn set_strict_dim_for_test(forced: Option<bool>) {
     STRICT_DIM_STATE.store(v, Ordering::Relaxed);
 }
 
+/// v1.0.0 #2167 — env flag that puts embedding-space provenance into
+/// STRICT mode: a strict operator demands explicit attestation of the
+/// vector space (`ai-memory reembed` / `reembed --stamp-only`), so the
+/// [G1] boot-adoption of legacy NULL rows is DISABLED (§5) and a
+/// heterogeneous boot census degrades semantic recall to keyword
+/// (§6, the #1593 fail-closed posture). Truthy set (`1`/`true`/`yes`/
+/// `on`) mirrors the `AI_MEMORY_REQUIRE_*` gate family. Default: unset
+/// ⇒ permissive (adoption enabled, homogeneous corpora unchanged).
+pub const ENV_REQUIRE_EMBED_MODEL_MATCH: &str = "AI_MEMORY_REQUIRE_EMBED_MODEL_MATCH";
+
+/// #2167 strict embed-model-match cache. Read at a handful of boot /
+/// recall-degrade decision points, so cached behind an atomic exactly
+/// like [`STRICT_DIM_STATE`]. Tri-state: 0 = uninitialised (read env),
+/// 1 = off, 2 = on. Tests flip it via [`set_strict_embed_model_match_for_test`].
+static STRICT_EMBED_MODEL_MATCH_STATE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// `true` when [`ENV_REQUIRE_EMBED_MODEL_MATCH`] strict mode is on
+/// (#2167 [G1] / §6). Read at boot (adoption + census gates) and on
+/// the recall-degrade decision — a cold path, one env read cached.
+#[must_use]
+pub fn strict_embed_model_match_enabled() -> bool {
+    match STRICT_EMBED_MODEL_MATCH_STATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = env_flag_truthy(ENV_REQUIRE_EMBED_MODEL_MATCH);
+            STRICT_EMBED_MODEL_MATCH_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test-only override for the #2167 strict embed-model-match cache
+/// ([`set_strict_dim_for_test`] twin; avoids the #2115 env-lock
+/// hazard). `Some(v)` forces the mode; `None` re-reads the env on the
+/// next check. Process-global — restore `None` before returning.
+#[doc(hidden)]
+pub fn set_strict_embed_model_match_for_test(forced: Option<bool>) {
+    let v = match forced {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    STRICT_EMBED_MODEL_MATCH_STATE.store(v, Ordering::Relaxed);
+}
+
 /// v0.9 #1005 (G4) — typed record of a dimension mismatch caught at
 /// the vector-index boundary under [`ENV_REQUIRE_DIM_MATCH`] strict
 /// mode. Carried in the rejection log line (and available to future

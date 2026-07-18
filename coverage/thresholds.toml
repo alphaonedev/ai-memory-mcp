@@ -261,7 +261,7 @@ min_line_coverage = 90.0
 "mcp/tools/expand_query.rs" = 90   # tier D, measured 100.00 (raised materially in L0.7-6)
 
 # ----- Tier E (target >=90%, wire/IO — documented exceptions per coverage/policy.md) -----
-"daemon_runtime.rs"        = 86    # RECALIBRATED 2026-06-12 to measured 86.58% (floor=measured-0.5) after the cov_ga2 GA backfill campaign (~358 behavioral tests, +1pp from historical 85.88); residual is structural (fault-injection Err=>500 arms / LLM bodies / embedder-gated / #519 dead-code / SSE stream) — see coverage/policy.md §"GA-2026-06-12 recalibration". Ratchet up toward 90 post-ship.
+"daemon_runtime.rs"        = 86    # RECALIBRATED 2026-06-12 to measured 86.58% (floor=measured-0.5) after the cov_ga2 GA backfill campaign (~358 behavioral tests, +1pp from historical 85.88); residual is structural (fault-injection Err=>500 arms / LLM bodies / embedder-gated / #519 dead-code / SSE stream) — see coverage/policy.md §"GA-2026-06-12 recalibration". Ratchet up toward 90 post-ship. 2026-07-18 #2167: HELD at 86 (not lowered) — the family-embedding precompute + boot-open Err arm are now unit-tested (extracted helpers) instead of exempted.
 "embeddings.rs"            = 90    # tier E, measured 96.16 post-C5
 "handlers/mod.rs"          = 90    # tier E, measured 98.67
 "handlers/transport.rs"    = 90    # tier E, measured 94.97 post-#1148 profile recalibration (was 95.54/95) — PARTIAL EXCEPTION: listener integration (see coverage/policy.md)

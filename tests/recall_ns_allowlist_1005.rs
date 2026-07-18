@@ -157,6 +157,7 @@ fn recall_tiny_ns(
         false,
         None,
         None,
+        None,
     )
     .expect("recall_hybrid ok");
     results.into_iter().map(|(m, _)| m.id).collect()

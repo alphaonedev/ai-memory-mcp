@@ -321,7 +321,16 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // wired into `insert` / `update_with_expected_version` /
     // `update_with_archive_on_supersede`, plus their in-module regression
     // tests, land storage/mod.rs at 24_948; ceiling 25_050 (+102).
-    ("src/storage/mod.rs", 25_050),
+    // 2026-07-17 (#2167 S3): the embedding_space provenance stamp on the
+    // shared embedding-UPDATE + set_embedding/batch/reembed signatures + the
+    // in-module test-call threading land storage/mod.rs at 25_133; ceiling
+    // 25_150 (+17 headroom). Additive per-row provenance write path.
+    // 2026-07-17 (#2167 S4+S5): the recall-core space gate (comparator
+    // threading on 3 sqlite sites + FTS/linear-scan/HNSW SELECT columns +
+    // space/unverified counters + aggregated WARN) + the §5 boot adoption /
+    // §6 census / embedding_space_boot_maintenance helpers land
+    // storage/mod.rs at 25_504; ceiling 25_650 (+146 headroom).
+    ("src/storage/mod.rs", 25_650),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -754,7 +763,17 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // closed on the last un-gated pg update surface) land the file at
     // 27_152. Growth is two security gates on existing write paths, not new
     // surface. 27_250 = 27_152 + 98 headroom; far under the 1.5x cap.
-    ("src/store/postgres.rs", 27_250),
+    // 2026-07-17 (#2178 + #2179) — bumped 27_250 → 27_600: the pg
+    // embedding-space provenance parity fixes — `store_with_embedding` now
+    // stamps `embedding_space` atomically on the INSERT + DO-UPDATE arm
+    // (#2178, closes the lying-stamp cross-space score path), the dim-
+    // migration NULL path clears the stamp with the vector, and the §5/§6 pg
+    // adoption/census/heal twins (`adopt_legacy_embedding_space` +
+    // `distinct_embedding_spaces` + `embedding_space_boot_maintenance`,
+    // #2179) close the postgres silent-recall-outage. All are data-integrity
+    // parity with the proven sqlite path, not new surface. File lands at
+    // 27_501; 27_600 = 27_501 + 99 headroom; far under the 1.5x cap.
+    ("src/store/postgres.rs", 27_600),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -1076,7 +1095,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // coverage tests (bind/revoke × json/non-json + empty-token error) to clear
     // the daemon_runtime.rs per-module COVERAGE floor. Combined with #2045 L6
     // this lands daemon_runtime.rs at 10_676; ceiling 10_500 → 10_750.
-    ("src/daemon_runtime.rs", 10_750), /* 2026-07-12 #1963 inference-egress gate at build_llm_client/build_embedder (9_999) */
+    ("src/daemon_runtime.rs", 10_850), /* 2026-07-17 #2167 extract run_sqlite_embedding_space_boot_maintenance helper + both-open-arms unit test to cover the boot-open Err arm (10_783) */
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
@@ -1166,7 +1185,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // lands the file at 5_300; ceiling 5_360 (+60 headroom).
     // 2026-07-15 (#2024): v82 skill retire/delete migration arm lands the
     // file at 5_372; ceiling 5_400 (+28 headroom). Additive migration only.
-    ("src/storage/migrations.rs", 5_400),
+    // 2026-07-17 (#2167 S1): the v84 embedding_space migration arm + SCHEMA
+    // column doc land migrations.rs at 5_446; ceiling 5_450 (+4 headroom).
+    // Additive ALTER-ADD-COLUMN migration only.
+    ("src/storage/migrations.rs", 5_450),
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.

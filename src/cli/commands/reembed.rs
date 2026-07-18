@@ -54,6 +54,11 @@ pub const EXIT_NO_EMBEDDER: i32 = 2;
 /// failed (502-equivalent — dead endpoint, bad key, unknown dim).
 pub const EXIT_EMBEDDER_INIT_FAILED: i32 = 3;
 
+/// #2167 §7 — exit code when `reembed --stamp-only` REFUSES because the
+/// embedded NULL-space dim census does not match the active dim (a mixed-dim
+/// population cannot be safely attested to one space; fail-closed).
+pub const EXIT_STAMP_REFUSED: i32 = 4;
+
 /// CLI args for `ai-memory reembed`.
 #[derive(Args, Debug, Clone)]
 pub struct ReembedArgs {
@@ -78,6 +83,31 @@ pub struct ReembedArgs {
     /// on a live run) instead of the human-readable lines.
     #[arg(long)]
     pub json: bool,
+
+    /// #2167 §7 — ATTEST that the embedded rows are already the active
+    /// model, stamping `embedding_space = <active_fp>` WITHOUT re-embedding.
+    /// REFUSES (writes nothing, exits 4) unless the full dim census of
+    /// embedded NULL-space rows matches the active dim. The strict-mode /
+    /// [G2]-blocked operator's explicit unattested→attested path.
+    #[arg(long)]
+    pub stamp_only: bool,
+
+    /// #2167 §7 — only re-embed rows NOT already in the active space
+    /// (`embedding_space IS DISTINCT FROM <target>`): the incremental heal /
+    /// resume-after-interruption sweep. Default OFF (a full-corpus re-derive
+    /// from text is the guaranteed-correct path).
+    #[arg(long)]
+    pub skip_current_space: bool,
+
+    /// #2167 §7 — inter-batch sleep in milliseconds (rate-limit / pacing
+    /// primitive for fleet-orchestrated chunked runs). Default 0.
+    #[arg(long)]
+    pub sleep_ms: Option<u64>,
+
+    /// #2167 §7 — stop after re-embedding (or scanning) this many rows
+    /// (fleet chunked-run primitive). Default: unlimited.
+    #[arg(long)]
+    pub max_rows: Option<usize>,
 }
 
 /// Dry-run migration plan — what the sweep WOULD touch plus the
@@ -156,12 +186,31 @@ pub(crate) fn run_reembed_live(
     emb: &dyn Embed,
     namespace: Option<&str>,
     batch_size: usize,
+    pacing: ReembedPacing,
     out: &mut CliOutput<'_>,
 ) -> Result<ReembedOutcome> {
     let mut outcome = ReembedOutcome::default();
     let mut cursor: Option<String> = None;
+    // #2167 S7 — --skip-current-space threads the TARGET space into the scan
+    // so an already-migrated prefix is skipped (resume / incremental heal).
+    let target_fp = emb.space_fingerprint();
+    let exclude_space = pacing.skip_current_space.then_some(target_fp.as_str());
     loop {
-        let chunk = db::get_memory_texts_batch(conn, namespace, cursor.as_deref(), batch_size)?;
+        // #2167 S7 --max-rows: shrink the final batch so the scan stops on the
+        // exact row budget (fleet chunked-run pacing primitive).
+        let remaining = pacing.max_rows.map_or(batch_size, |cap| {
+            cap.saturating_sub(outcome.total).min(batch_size)
+        });
+        if remaining == 0 {
+            break;
+        }
+        let chunk = db::get_memory_texts_batch(
+            conn,
+            namespace,
+            cursor.as_deref(),
+            remaining,
+            exclude_space,
+        )?;
         if chunk.is_empty() {
             break;
         }
@@ -176,12 +225,30 @@ pub(crate) fn run_reembed_live(
             )?;
         }
         outcome.skipped += embedded.skipped.len();
-        if embedded.entries.is_empty() {
-            continue;
+        if !embedded.entries.is_empty() {
+            // #2167 — RE-STAMP every replaced vector with the reembed TARGET space.
+            outcome.reembedded +=
+                db::set_embeddings_batch_reembed(conn, &embedded.entries, &target_fp)?;
         }
-        outcome.reembedded += db::set_embeddings_batch_reembed(conn, &embedded.entries)?;
+        // #2167 S7 --sleep-ms: pace between batches (thundering-herd guard for
+        // fleet-orchestrated sweeps). Sync CLI context → std sleep.
+        if pacing.sleep_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(pacing.sleep_ms));
+        }
     }
     Ok(outcome)
+}
+
+/// #2167 §7 — the rate-limit / pacing / resume knobs threaded into
+/// [`run_reembed_live`] (fleet-orchestration primitives, #2169).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ReembedPacing {
+    /// Inter-batch sleep (ms); 0 = no sleep.
+    pub(crate) sleep_ms: u64,
+    /// Stop after this many scanned rows; `None` = unlimited.
+    pub(crate) max_rows: Option<usize>,
+    /// Skip rows already in the target space (resume / incremental heal).
+    pub(crate) skip_current_space: bool,
 }
 
 /// `ai-memory reembed` dispatch entry. Resolves the embedder through
@@ -286,6 +353,51 @@ pub async fn cmd_reembed(
         )?;
     }
 
+    // #2167 §7 — --stamp-only: ATTEST (no re-embed). Fail-closed on a
+    // mixed-dim NULL-space population. Takes precedence over the re-embed
+    // sweep and its --dry-run.
+    if args.stamp_only {
+        let active_fp = embedder.space_fingerprint();
+        let report = db::stamp_embedding_space_attested(&conn, ns, &active_fp, target_dim)?;
+        if !report.refused_dims.is_empty() {
+            writeln!(
+                out.stderr,
+                "reembed --stamp-only: REFUSED — embedded NULL-space rows carry dims \
+                 {:?} that differ from the active dim {target_dim}; a mixed-dim NULL \
+                 population cannot be attested to one space. Re-embed instead \
+                 (`ai-memory reembed`).",
+                report.refused_dims
+            )?;
+            return Ok(EXIT_STAMP_REFUSED);
+        }
+        tracing::warn!(
+            active_space = %active_fp,
+            stamped = report.stamped,
+            "reembed --stamp-only: ATTESTED {} NULL-space row(s) as the active space \
+             WITHOUT re-embedding (operator attestation)",
+            report.stamped
+        );
+        if args.json {
+            writeln!(
+                out.stdout,
+                "{}",
+                serde_json::to_string(&json!({
+                    "stamped": report.stamped,
+                    "active_space": active_fp,
+                    "target_dim": target_dim,
+                }))?
+            )?;
+        } else {
+            writeln!(
+                out.stdout,
+                "reembed --stamp-only: stamped {} NULL-space row(s) as '{active_fp}' \
+                 (no re-embed)",
+                report.stamped
+            )?;
+        }
+        return Ok(0);
+    }
+
     if args.dry_run {
         if args.json {
             writeln!(
@@ -318,8 +430,13 @@ pub async fn cmd_reembed(
     }
 
     let batch_size = resolve_batch_size(args.batch, resolved.backfill_batch as usize);
+    let pacing = ReembedPacing {
+        sleep_ms: args.sleep_ms.unwrap_or(0),
+        max_rows: args.max_rows,
+        skip_current_space: args.skip_current_space,
+    };
     let started = std::time::Instant::now();
-    let outcome = run_reembed_live(&mut conn, &embedder, ns, batch_size, out)?;
+    let outcome = run_reembed_live(&mut conn, &embedder, ns, batch_size, pacing, out)?;
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     if args.json {
@@ -414,7 +531,13 @@ mod tests {
         let id_a = seed(&conn, "plan-a", "a-1", "content");
         seed(&conn, "plan-a", "a-2", "content");
         seed(&conn, "plan-b", "b-1", "content");
-        db::set_embedding(&conn, &id_a, &[0.1, 0.2]).unwrap();
+        db::set_embedding(
+            &conn,
+            &id_a,
+            &[0.1, 0.2],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
 
         let all = build_plan(&conn, None, "model-x (8-dim, remote)", 8, "openrouter").unwrap();
         assert_eq!(
@@ -447,7 +570,13 @@ mod tests {
         let mut conn = test_conn();
         let id_old = seed(&conn, "live-ns", "old", "already embedded");
         let id_new = seed(&conn, "live-ns", "new", "never embedded");
-        db::set_embedding(&conn, &id_old, &[0.1, 0.2, 0.3, 0.4]).unwrap();
+        db::set_embedding(
+            &conn,
+            &id_old,
+            &[0.1, 0.2, 0.3, 0.4],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
 
         let emb = FixedDimEmbedder {
             dim: 8,
@@ -456,7 +585,15 @@ mod tests {
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
-        let outcome = run_reembed_live(&mut conn, &emb, Some("live-ns"), 1, &mut out).unwrap();
+        let outcome = run_reembed_live(
+            &mut conn,
+            &emb,
+            Some("live-ns"),
+            1,
+            ReembedPacing::default(),
+            &mut out,
+        )
+        .unwrap();
 
         assert_eq!(
             outcome,
@@ -481,7 +618,13 @@ mod tests {
         let mut conn = test_conn();
         let id_in = seed(&conn, "ns-in", "in", "inside the filter");
         let id_out = seed(&conn, "ns-out", "out", "outside the filter");
-        db::set_embedding(&conn, &id_out, &[0.9, 0.8]).unwrap();
+        db::set_embedding(
+            &conn,
+            &id_out,
+            &[0.9, 0.8],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
 
         let emb = FixedDimEmbedder {
             dim: 4,
@@ -490,7 +633,15 @@ mod tests {
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
-        let outcome = run_reembed_live(&mut conn, &emb, Some("ns-in"), 16, &mut out).unwrap();
+        let outcome = run_reembed_live(
+            &mut conn,
+            &emb,
+            Some("ns-in"),
+            16,
+            ReembedPacing::default(),
+            &mut out,
+        )
+        .unwrap();
 
         assert_eq!(outcome.total, 1);
         assert_eq!(outcome.reembedded, 1);
@@ -509,7 +660,13 @@ mod tests {
         let id_ok_a = seed(&conn, "fb-ns", "ok-a", "healthy");
         let id_bad = seed(&conn, "fb-ns", "bad", MARKER);
         let id_ok_b = seed(&conn, "fb-ns", "ok-b", "healthy");
-        db::set_embedding(&conn, &id_bad, &[0.7, 0.7]).unwrap();
+        db::set_embedding(
+            &conn,
+            &id_bad,
+            &[0.7, 0.7],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
 
         let emb = FixedDimEmbedder {
             dim: 4,
@@ -518,7 +675,15 @@ mod tests {
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
-        let outcome = run_reembed_live(&mut conn, &emb, Some("fb-ns"), 16, &mut out).unwrap();
+        let outcome = run_reembed_live(
+            &mut conn,
+            &emb,
+            Some("fb-ns"),
+            16,
+            ReembedPacing::default(),
+            &mut out,
+        )
+        .unwrap();
 
         assert_eq!(
             outcome,
@@ -577,7 +742,119 @@ mod tests {
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
-        let outcome = run_reembed_live(&mut conn, &emb, None, 16, &mut out).unwrap();
+        let outcome = run_reembed_live(
+            &mut conn,
+            &emb,
+            None,
+            16,
+            ReembedPacing::default(),
+            &mut out,
+        )
+        .unwrap();
         assert_eq!(outcome, ReembedOutcome::default());
+    }
+
+    /// #2167 §7 — `--skip-current-space` skips rows ALREADY at the target
+    /// space and re-embeds only foreign / NULL / non-target rows.
+    #[test]
+    fn skip_current_space_only_reembeds_non_target_2167() {
+        let emb = FixedDimEmbedder {
+            dim: 4,
+            poison_marker: None,
+        };
+        let target = emb.space_fingerprint();
+        let foreign = crate::embeddings::embedding_space_fingerprint("some-other-model");
+        let mut conn = test_conn();
+        let at_target = seed(&conn, "sk", "already", "at target space");
+        let at_foreign = seed(&conn, "sk", "foreign", "wrong space");
+        db::set_embedding(&conn, &at_target, &[0.1, 0.2, 0.3, 0.4], &target).unwrap();
+        db::set_embedding(&conn, &at_foreign, &[0.5, 0.6, 0.7, 0.8], &foreign).unwrap();
+
+        let (mut so, mut se) = (std::io::sink(), std::io::sink());
+        let mut out = CliOutput::from_std(&mut so, &mut se);
+        let pacing = ReembedPacing {
+            skip_current_space: true,
+            ..ReembedPacing::default()
+        };
+        let outcome = run_reembed_live(&mut conn, &emb, Some("sk"), 16, pacing, &mut out).unwrap();
+        // Only the foreign-space row is re-embedded; the target-space row is
+        // skipped from the SCAN entirely (not counted in total).
+        assert_eq!(outcome.total, 1, "target-space row excluded from the scan");
+        assert_eq!(outcome.reembedded, 1);
+        // Both rows now carry the target space.
+        let (sp, _): (Option<String>, ()) = conn
+            .query_row(
+                "SELECT embedding_space, 1 FROM memories WHERE id = ?1",
+                rusqlite::params![at_foreign],
+                |r| Ok((r.get(0)?, ())),
+            )
+            .unwrap();
+        assert_eq!(sp.as_deref(), Some(target.as_str()));
+    }
+
+    /// #2167 §7 — `--max-rows` stops the sweep on the exact row budget.
+    #[test]
+    fn max_rows_caps_the_sweep_2167() {
+        let emb = FixedDimEmbedder {
+            dim: 4,
+            poison_marker: None,
+        };
+        let mut conn = test_conn();
+        for i in 0..5 {
+            seed(&conn, "cap", &format!("row {i}"), "body");
+        }
+        let (mut so, mut se) = (std::io::sink(), std::io::sink());
+        let mut out = CliOutput::from_std(&mut so, &mut se);
+        let pacing = ReembedPacing {
+            max_rows: Some(2),
+            ..ReembedPacing::default()
+        };
+        let outcome = run_reembed_live(&mut conn, &emb, Some("cap"), 16, pacing, &mut out).unwrap();
+        assert_eq!(outcome.total, 2, "sweep stops at the --max-rows budget");
+        assert_eq!(outcome.reembedded, 2);
+    }
+
+    /// #2167 §7 — `--stamp-only` attests a homogeneous-dim NULL-space
+    /// population, and REFUSES a mixed-dim one (fail-closed).
+    #[test]
+    fn stamp_only_attests_homogeneous_refuses_mixed_2167() {
+        let conn = test_conn();
+        let fp = crate::embeddings::embedding_space_fingerprint("nomic-embed-text");
+        // Two embedded NULL-space rows at the SAME dim (4).
+        let a = seed(&conn, "st", "a", "aa");
+        let b = seed(&conn, "st", "b", "bb");
+        for id in [&a, &b] {
+            db::set_embedding(&conn, id, &[0.1, 0.2, 0.3, 0.4], &fp).unwrap();
+            conn.execute(
+                "UPDATE memories SET embedding_space = NULL WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        }
+        let ok = db::stamp_embedding_space_attested(&conn, Some("st"), &fp, 4).unwrap();
+        assert_eq!(ok.stamped, 2, "homogeneous-dim NULL rows are stamped");
+        assert!(ok.refused_dims.is_empty());
+
+        // Now add a NULL-space row at a DIFFERENT dim -> refusal. Written by
+        // raw SQL to bypass `set_embedding`'s per-namespace dim guard (a
+        // genuinely mixed-dim NULL population is the case stamp-only refuses).
+        let c = seed(&conn, "st", "c", "cc");
+        let blob2 = crate::embeddings::encode_embedding_blob(&[0.9, 0.8]);
+        conn.execute(
+            "UPDATE memories SET embedding = ?1, embedding_dim = 2, embedding_space = NULL \
+             WHERE id = ?2",
+            rusqlite::params![blob2, c],
+        )
+        .unwrap();
+        let refused = db::stamp_embedding_space_attested(&conn, Some("st"), &fp, 4).unwrap();
+        assert_eq!(
+            refused.stamped, 0,
+            "mixed-dim population is REFUSED, nothing stamped"
+        );
+        assert_eq!(
+            refused.refused_dims,
+            vec![2],
+            "the offending dim is surfaced"
+        );
     }
 }

@@ -172,7 +172,9 @@ pub(super) fn handle_consolidate(
         let text = format!("{title} {summary}");
         match emb.embed(&text) {
             Ok(embedding) => {
-                if let Err(e) = db::set_embedding(conn, &new_id, &embedding) {
+                if let Err(e) =
+                    db::set_embedding(conn, &new_id, &embedding, &emb.space_fingerprint())
+                {
                     tracing::warn!(
                         "failed to store embedding for consolidated {}: {}",
                         &new_id,

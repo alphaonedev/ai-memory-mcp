@@ -331,7 +331,7 @@ pub(super) fn apply_synthesis_updates_and_deletes(
         if content_changed && let Some(emb) = embedder {
             let text = crate::embeddings::embedding_document(&target.title, &merged_content);
             if let Ok(embedding) = emb.embed(&text) {
-                let _ = db::set_embedding(conn, cand_id, &embedding);
+                let _ = db::set_embedding(conn, cand_id, &embedding, &emb.space_fingerprint());
                 if vector_index.is_some() {
                     // #1700 — defer the in-memory index swap until after COMMIT.
                     deferred_index_ops.push((cand_id.to_string(), embedding));

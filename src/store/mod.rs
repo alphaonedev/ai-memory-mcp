@@ -655,6 +655,17 @@ pub struct Filter {
     pub since: Option<chrono::DateTime<chrono::Utc>>,
     pub until: Option<chrono::DateTime<chrono::Utc>>,
     pub limit: usize,
+    /// v1.0.0 #2167 §3 — the live embedder's space fingerprint for a
+    /// semantic `recall_hybrid`. `Some(fp)` gates every stored vector
+    /// against `fp` so recall never scores a vector from a different
+    /// embedding space (sqlite via `cosine_similarity_space_checked`;
+    /// postgres via the `AND embedding_space = $fp` SQL predicate).
+    /// `None` = keyword-only / no active embedder (gate skipped —
+    /// semantic scoring is moot without an active space). Threaded via
+    /// `Filter` (not a new positional trait param) so the many existing
+    /// `recall_hybrid` call sites that build a `Filter` are unchanged.
+    /// Set ONLY on the recall path; ignored by `list` / `search`.
+    pub active_embedding_space: Option<String>,
 }
 
 /// The core trait. Every backend implements this; ai-memory's HTTP /
@@ -721,11 +732,20 @@ pub trait MemoryStore: Send + Sync {
     /// fall back to plain `store` and ignore the vector; the
     /// PostgresStore overrides this to bind the vector into the
     /// INSERT. Default implementation forwards to `store`.
+    /// #2167 — `space` is the fingerprint of the embedding space the
+    /// supplied `_embedding` lives in (the LIVE embedder's
+    /// [`crate::embeddings::Embed::space_fingerprint`]). It travels in the
+    /// SAME call as the vector so an adapter that persists the vector stamps
+    /// its provenance atomically — a stored vector can never end up with a
+    /// stale / absent stamp (the §2 same-statement rule; the write-side twin
+    /// of the recall `AND embedding_space = $fp` gate). `space` MUST be
+    /// `Some` whenever `_embedding` is `Some`; `None` clears both.
     async fn store_with_embedding(
         &self,
         ctx: &CallerContext,
         memory: &Memory,
         _embedding: Option<&[f32]>,
+        _space: Option<&str>,
     ) -> StoreResult<String> {
         self.store(ctx, memory).await
     }
@@ -763,11 +783,17 @@ pub trait MemoryStore: Send + Sync {
     /// them. Default implementation is a no-op for adapters that
     /// don't store embeddings inline (sqlite — embeddings live in a
     /// side table).
+    /// #2167 — `space` is the embedding-space fingerprint the
+    /// `embedding` was minted under; it is stamped in the SAME statement as
+    /// the vector (M-PARAMETER-CONSISTENCY) so a row can never hold a vector
+    /// from one space and a stamp from another. A `None` embedding NULLs the
+    /// stamp with the vector.
     async fn update_embedding(
         &self,
         _ctx: &CallerContext,
         _id: &str,
         _embedding: Option<&[f32]>,
+        _space: &str,
     ) -> StoreResult<()> {
         Ok(())
     }
@@ -813,10 +839,13 @@ pub trait MemoryStore: Send + Sync {
         &self,
         ctx: &CallerContext,
         entries: &[(String, Vec<f32>)],
+        space: &str,
     ) -> StoreResult<usize> {
         let mut written = 0usize;
         for (id, vec) in entries {
-            self.update_embedding(ctx, id, Some(vec)).await?;
+            // #2167 — all vectors in a batch share ONE space (minted by the
+            // live embedder in one process).
+            self.update_embedding(ctx, id, Some(vec), space).await?;
             written += 1;
         }
         Ok(written)
@@ -3754,7 +3783,9 @@ pub async fn run_embedding_backfill_on_store(
             .zip(embeddings)
             .map(|((id, _, _), v)| (id.clone(), v))
             .collect();
-        let written = match store.set_embeddings_batch(ctx, &entries).await {
+        // #2167 — stamp every backfilled vector with the LIVE embedder's space.
+        let space = emb.space_fingerprint();
+        let written = match store.set_embeddings_batch(ctx, &entries, &space).await {
             Ok(n) => n,
             Err(e) => {
                 tracing::warn!(
@@ -4035,7 +4066,7 @@ mod tests {
         let mem = dummy_memory("with-emb");
         // The default body forwards to `store` (ignoring the vector).
         let id = s
-            .store_with_embedding(&ctx, &mem, Some(&[0.1_f32, 0.2, 0.3]))
+            .store_with_embedding(&ctx, &mem, Some(&[0.1_f32, 0.2, 0.3]), Some("test#none"))
             .await
             .expect("store_with_embedding default");
         assert_eq!(id, "with-emb");
@@ -4045,9 +4076,14 @@ mod tests {
     async fn default_update_embedding_is_noop() {
         let s = MinimalStore;
         let ctx = CallerContext::for_agent("alice");
-        s.update_embedding(&ctx, "any", Some(&[0.5_f32]))
-            .await
-            .expect("noop");
+        s.update_embedding(
+            &ctx,
+            "any",
+            Some(&[0.5_f32]),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .await
+        .expect("noop");
     }
 
     #[tokio::test]
@@ -4931,6 +4967,7 @@ mod tests {
             &self,
             _ctx: &CallerContext,
             _entries: &[(String, Vec<f32>)],
+            _space: &str,
         ) -> StoreResult<usize> {
             Ok(self.written_per_chunk)
         }
@@ -4964,7 +5001,11 @@ mod tests {
             ("b".to_string(), vec![0.2_f32]),
         ];
         let written = s
-            .set_embeddings_batch(&ctx, &entries)
+            .set_embeddings_batch(
+                &ctx,
+                &entries,
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
+            )
             .await
             .expect("default batch write");
         assert_eq!(written, 2, "default body reports one row per entry");
@@ -5559,12 +5600,19 @@ mod tests {
         );
         // store_with_embedding default forwards to store (Err here).
         assert!(
-            dp.store_with_embedding(&ctx, &mem, Some(&[0.1]))
+            dp.store_with_embedding(&ctx, &mem, Some(&[0.1]), Some("test#none"))
                 .await
                 .is_err()
         );
         // list_unembedded default = empty; update_embedding default = Ok.
         assert!(dp.list_unembedded(&ctx, 8).await.unwrap().is_empty());
-        dp.update_embedding(&ctx, "x", None).await.unwrap();
+        dp.update_embedding(
+            &ctx,
+            "x",
+            None,
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .await
+        .unwrap();
     }
 }

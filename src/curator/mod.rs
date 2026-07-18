@@ -2107,8 +2107,20 @@ mod tests {
         db::insert(&conn, &m_b).unwrap();
         // #1774 — both sides need a stored embedding to clear the cosine gate;
         // attach aligned vectors (cosine = 1.0) so the dup pair clusters.
-        db::set_embedding(&conn, &m_a.id, &[1.0, 0.0]).unwrap();
-        db::set_embedding(&conn, &m_b.id, &[1.0, 0.0]).unwrap();
+        db::set_embedding(
+            &conn,
+            &m_a.id,
+            &[1.0, 0.0],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
+        db::set_embedding(
+            &conn,
+            &m_b.id,
+            &[1.0, 0.0],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
 
         let cfg = CuratorConfig {
             include_namespaces: vec!["smart".to_string()],
@@ -2589,8 +2601,20 @@ mod consolidation_pass_tests_1746 {
         // #1774 — both sides need a stored embedding to clear the cosine gate;
         // attach aligned vectors (cosine = 1.0) so the dup pair clusters (the
         // un-embedded path no longer merges).
-        crate::db::set_embedding(conn, &m1.id, &[1.0, 0.0]).unwrap();
-        crate::db::set_embedding(conn, &m2.id, &[1.0, 0.0]).unwrap();
+        crate::db::set_embedding(
+            conn,
+            &m1.id,
+            &[1.0, 0.0],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
+        crate::db::set_embedding(
+            conn,
+            &m2.id,
+            &[1.0, 0.0],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
         vec![m1, m2]
     }
 

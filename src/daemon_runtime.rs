@@ -3008,12 +3008,15 @@ pub async fn build_llm_client(
 /// When the embedder is present but the DB is empty (or query errors),
 /// returns `Some(VectorIndex::empty())` so write paths can populate it
 /// in-place.
+///
+/// v1.0.0 #2167 §3.3 layer 1 — `active_space` is the live embedder's
+/// space fingerprint; `None` means no embedder (keyword-only) → no
+/// index. `Some(fp)` filters the seed set to the active space in SQL so
+/// a foreign-fingerprint vector never enters the ANN graph.
 #[must_use]
-pub fn build_vector_index(conn: &Connection, embedder_present: bool) -> Option<VectorIndex> {
-    if !embedder_present {
-        return None;
-    }
-    match db::get_all_embeddings(conn) {
+pub fn build_vector_index(conn: &Connection, active_space: Option<&str>) -> Option<VectorIndex> {
+    let active = active_space?;
+    match db::get_all_embeddings(conn, active) {
         Ok(entries) if !entries.is_empty() => Some(hnsw::VectorIndex::build(entries)),
         _ => Some(hnsw::VectorIndex::empty()),
     }
@@ -3024,7 +3027,12 @@ pub fn build_vector_index(conn: &Connection, embedder_present: bool) -> Option<V
 /// loader thread never touches the request-serving connection;
 /// failures degrade to "no warm-up" with a WARN (the daemon keeps
 /// serving keyword/FTS recall — the pre-#1579 failure posture).
-pub(crate) fn load_boot_index_entries(db_path: &Path) -> Option<Vec<(String, Vec<f32>)>> {
+pub(crate) fn load_boot_index_entries(
+    db_path: &Path,
+    // v1.0.0 #2167 §3.3 layer 1 — the active embedder fingerprint; the
+    // boot seed set is filtered to it in SQL.
+    active_space: &str,
+) -> Option<Vec<(String, Vec<f32>)>> {
     let conn = match db::open(db_path) {
         Ok(c) => c,
         Err(e) => {
@@ -3036,7 +3044,7 @@ pub(crate) fn load_boot_index_entries(db_path: &Path) -> Option<Vec<(String, Vec
             return None;
         }
     };
-    match db::get_all_embeddings(&conn) {
+    match db::get_all_embeddings(&conn, active_space) {
         Ok(entries) => Some(entries),
         Err(e) => {
             tracing::warn!(
@@ -3071,13 +3079,16 @@ pub(crate) fn load_boot_index_entries(db_path: &Path) -> Option<Vec<(String, Vec
 /// time-to-semantic-ready in the daemon log.
 pub fn spawn_vector_index_boot_load(
     db_path: std::path::PathBuf,
+    // v1.0.0 #2167 §3.3 layer 1 — the active embedder space fingerprint,
+    // owned so it can move into the boot thread; filters the seed set.
+    active_space: String,
     // v0.9 #1005 — the shared seam type: boxed [`crate::hnsw::VectorSearchIndex`]
     // (today always the default HNSW backend) behind the AppState mutex.
     vector_index: Arc<tokio::sync::Mutex<Option<Box<dyn crate::hnsw::VectorSearchIndex>>>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        let Some(entries) = load_boot_index_entries(&db_path) else {
+        let Some(entries) = load_boot_index_entries(&db_path, &active_space) else {
             return;
         };
         if entries.is_empty() {
@@ -3298,6 +3309,99 @@ fn spawn_postgres_fold_loop_if_enabled(
             interval,
             crate::observations::gc::ttl_days(),
         ));
+    }
+}
+
+/// v1.0.0 #2167 (S5/S6) — open a private boot connection and run the sqlite
+/// embedding-space adoption/census (`db::embedding_space_boot_maintenance`).
+/// Split out of `bootstrap_serve` (mirrors `spawn_postgres_fold_loop_if_enabled`)
+/// so the db-open FAILURE arm — a read-only / locked / unopenable DB at boot —
+/// is unit-tested. Best-effort by design: a failed open degrades to a skipped
+/// WARN, NEVER an error (recall then treats legacy NULL-space rows as excluded
+/// — safe, degraded — until `reembed` heals them). The active-space is seeded
+/// separately at the call site so archive-RESTORE classification works even
+/// when this open fails.
+fn run_sqlite_embedding_space_boot_maintenance(
+    db_path: &std::path::Path,
+    active_fp: &str,
+    active_dim: usize,
+) {
+    match db::open(db_path) {
+        Ok(boot_conn) => {
+            db::embedding_space_boot_maintenance(&boot_conn, active_fp, active_dim);
+        }
+        Err(e) => {
+            tracing::warn!(
+                err = %e,
+                "#2167: could not open DB for embedding-space adoption/census at boot; \
+                 legacy NULL-space rows stay excluded until reembed"
+            );
+        }
+    }
+}
+
+/// The B3 family-descriptor embedding cache shape (`Arc<RwLock<Option<…>>>`)
+/// threaded through `bootstrap_serve` + `AppState`.
+type FamilyEmbeddingsCache =
+    Arc<tokio::sync::RwLock<Option<Vec<(crate::profile::Family, Vec<f32>)>>>>;
+
+/// v0.7.0 B3-fix2 — spawn the family-descriptor embedding precompute onto
+/// `task_handles` when the operator opted in (`enabled` resolves from
+/// `AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS=1` at the call site). Split out of
+/// `bootstrap_serve` (mirrors `spawn_postgres_fold_loop_if_enabled` /
+/// `run_sqlite_embedding_space_boot_maintenance`) so the async precompute body
+/// — the two-phase "compute outside, commit inside" lock discipline (H1) — is
+/// unit-tested WITHOUT a full serve boot. Taking `enabled: bool` (not reading
+/// the env internally) keeps the test env-var-free + deterministic. The
+/// disabled arm is the default and a no-op beyond a debug log.
+fn spawn_family_embedding_precompute_if_enabled(
+    task_handles: &mut Vec<JoinHandle<()>>,
+    enabled: bool,
+    family_embeddings: &FamilyEmbeddingsCache,
+    embedder_arc: &Arc<Option<Embedder>>,
+) {
+    if enabled {
+        let cache = family_embeddings.clone();
+        let embedder_for_task = embedder_arc.clone();
+        task_handles.push(tokio::spawn(async move {
+            // H1 (v0.7.0 round-2) lock-discipline: the slow embed calls run in
+            // a `spawn_blocking` closure holding NO lock; only after the whole
+            // batch is computed do we take the write lock ONCE to swap in the
+            // populated `Some(Vec)` — readers see `None` or the full vector,
+            // never a half-built one.
+            let computed = tokio::task::spawn_blocking(move || {
+                AppState::precompute_family_embeddings(
+                    embedder_for_task
+                        .as_ref()
+                        .as_ref()
+                        .map(|e| e as &dyn crate::embeddings::Embed),
+                )
+            })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "B3: family-descriptor precompute task panicked; \
+                     family_embeddings will stay empty",
+                );
+                Vec::new()
+            });
+            if !computed.is_empty() {
+                tracing::info!(
+                    "B3: pre-computed {} family-descriptor embeddings (async)",
+                    computed.len(),
+                );
+            }
+            // Single-shot commit: the write lock is acquired ONCE here.
+            *cache.write().await = Some(computed);
+        }));
+    } else {
+        tracing::debug!(
+            "B3: family-descriptor precompute disabled \
+             (AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS != 1); \
+             best_family_match will return None until B2 wires \
+             the smart loader and the gate is flipped on"
+        );
     }
 }
 
@@ -4865,9 +4969,27 @@ pub async fn bootstrap_serve(
                 index_limits.vector_index_hard_fail_at_cap,
             )
         })));
-    if embedder.is_some() {
-        let _boot_index_loader =
-            spawn_vector_index_boot_load(db_path.to_path_buf(), Arc::clone(&vector_index_state));
+    if let Some(emb) = embedder.as_ref() {
+        // v1.0.0 #2167 — boot ORDER is load-bearing (§3.3): embedder →
+        // §5 adoption → §6 census → vector-index seed. Adoption stamps
+        // legacy NULL-space rows so the seed filter (`AND embedding_space
+        // = active`) does not drop them; the census WARNs on any residual
+        // foreign/NULL space. Best-effort over a private connection — a
+        // read-only / locked DB degrades to a skipped WARN, never an error
+        // (recall then treats those rows as excluded — safe, degraded).
+        let active_fp = emb.space_fingerprint();
+        // v1.0.0 #2167 (S8) — seed the process-wide active-space so the
+        // archive-RESTORE heal can classify a restored row's carried space
+        // (active → keep vector; foreign/NULL → NULL the trio → backfill
+        // re-embeds). Seeded here (not only at census) so restore works
+        // even when the boot-maintenance DB open below fails.
+        crate::embeddings::set_active_embedding_space(Some(active_fp.clone()));
+        run_sqlite_embedding_space_boot_maintenance(db_path, &active_fp, emb.dim());
+        let _boot_index_loader = spawn_vector_index_boot_load(
+            db_path.to_path_buf(),
+            active_fp,
+            Arc::clone(&vector_index_state),
+        );
     }
 
     // v0.7.0 L5 — build the LLM client for autonomy-hook capable tiers
@@ -5028,76 +5150,17 @@ pub async fn bootstrap_serve(
         ));
     }
 
-    if std::env::var("AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS")
-        .ok()
-        .as_deref()
-        == Some("1")
-    {
-        let cache = family_embeddings.clone();
-        let embedder_for_task = embedder_arc.clone();
-        task_handles.push(tokio::spawn(async move {
-            // ----------------------------------------------------------------
-            // H1 (v0.7.0 round-2) — lock-discipline for the family-embedding
-            // precompute:
-            //
-            //   1. The slow `Embedder::embed(descriptor)` calls run inside a
-            //      `spawn_blocking` closure that holds NO lock on
-            //      `family_embeddings`. Each (Family, Vec<f32>) pair is
-            //      collected into a local `Vec` owned by the blocking task.
-            //   2. Only AFTER the entire batch is computed do we take
-            //      `family_embeddings.write().await` exactly ONCE to swap
-            //      the populated `Some(Vec)` into the cache.
-            //
-            // Why: the prior shape that acquired the write lock before each
-            // embed call would have parked every concurrent `try_read()`
-            // reader for the duration of an ML inference round trip — up
-            // to seconds on a cold runner. Concurrent recall handlers that
-            // call `AppState::best_family_match` would be forced into the
-            // no-cache fallback even when the embedder was fully operational.
-            //
-            // The two-phase shape below is the canonical "compute outside,
-            // commit inside" lock pattern: readers see either `None`
-            // (precompute not yet finished) or the fully-populated
-            // `Some(Vec)` — never a half-built vector.
-            // ----------------------------------------------------------------
-            let computed = tokio::task::spawn_blocking(move || {
-                // No lock held during embed calls — pairs are accumulated
-                // into a local Vec returned to the async caller below.
-                AppState::precompute_family_embeddings(
-                    embedder_for_task
-                        .as_ref()
-                        .as_ref()
-                        .map(|e| e as &dyn crate::embeddings::Embed),
-                )
-            })
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    error = %e,
-                    "B3: family-descriptor precompute task panicked; \
-                     family_embeddings will stay empty",
-                );
-                Vec::new()
-            });
-            if !computed.is_empty() {
-                tracing::info!(
-                    "B3: pre-computed {} family-descriptor embeddings (async)",
-                    computed.len(),
-                );
-            }
-            // Single-shot commit: write lock acquired ONCE here and
-            // released immediately after the swap. No embedder calls run
-            // under this lock.
-            *cache.write().await = Some(computed);
-        }));
-    } else {
-        tracing::debug!(
-            "B3: family-descriptor precompute disabled \
-             (AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS != 1); \
-             best_family_match will return None until B2 wires \
-             the smart loader and the gate is flipped on"
-        );
-    }
+    let precompute_family_embeddings_enabled =
+        std::env::var("AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS")
+            .ok()
+            .as_deref()
+            == Some("1");
+    spawn_family_embedding_precompute_if_enabled(
+        &mut task_handles,
+        precompute_family_embeddings_enabled,
+        &family_embeddings,
+        &embedder_arc,
+    );
 
     // v0.7.0 Wave-3 — resolve the polymorphic `MemoryStore` handle from
     // the operator's `--store-url` (when set) or build a `SqliteStore`
@@ -5150,6 +5213,30 @@ pub async fn bootstrap_serve(
     .context("build SAL store handle")?;
     #[cfg(not(feature = "sal"))]
     let storage_backend = crate::handlers::StorageBackend::Sqlite;
+
+    // v1.0.0 #2167 §5/§6 pg twin — on a POSTGRES-backed daemon the sqlite
+    // boot-maintenance above ran against the LOCAL (empty) sqlite file, so
+    // the postgres corpus was never adopted/censused: every pre-v84 legacy
+    // row is `embedding_space NULL` and the S4 recall predicate excludes it
+    // PERMANENTLY with no signal and no heal (#2179). Run the postgres twins
+    // here — now that `build_store_handle` has returned the typed store —
+    // against the actual pg corpus, in the same load-bearing adopt→census
+    // order, [G1]/[G2]-guarded identically to the sqlite path. Synchronous
+    // (awaited before the router serves) so the first post-upgrade recall is
+    // identical to pre-v84 (the §5 no-nuke proof obligation), on BOTH
+    // backends. The serve-boot backfill sweep (spawned below) heals any
+    // [G1]/[G2]-blocked NULL-space rows by re-embedding from durable text.
+    #[cfg(feature = "sal-postgres")]
+    if matches!(storage_backend, crate::handlers::StorageBackend::Postgres)
+        && let Some(emb) = embedder_arc.as_ref()
+        && let Some(pg) = store_handle
+            .as_any()
+            .downcast_ref::<crate::store::postgres::PostgresStore>()
+    {
+        let active_fp = emb.space_fingerprint();
+        pg.embedding_space_boot_maintenance(&active_fp, emb.dim())
+            .await;
+    }
 
     // v0.7.0 Track D #933 — federation push DLQ sink. Resolved here
     // (after `build_store_handle` returns the typed store) so the
@@ -7637,19 +7724,78 @@ mod tests {
     fn test_build_vector_index_no_embedder_returns_none() {
         let env = TestEnv::fresh();
         let conn = db::open(&env.db_path).unwrap();
-        assert!(build_vector_index(&conn, false).is_none());
+        assert!(build_vector_index(&conn, None).is_none());
     }
 
     #[test]
     fn test_build_vector_index_empty_db_returns_empty_index() {
         let env = TestEnv::fresh();
         let conn = db::open(&env.db_path).unwrap();
-        let idx = build_vector_index(&conn, true);
+        let idx = build_vector_index(
+            &conn,
+            Some(&crate::embeddings::embedding_space_fingerprint(
+                "test-space",
+            )),
+        );
         assert!(
             idx.is_some(),
             "empty DB with embedder must yield empty index"
         );
         assert_eq!(idx.unwrap().len(), 0);
+    }
+
+    // #2167 (S5/S6) — the extracted sqlite embedding-space boot-maintenance
+    // helper degrades a db-open FAILURE to a skipped WARN (never an error /
+    // panic) so a read-only / locked / unopenable DB at boot cannot brick the
+    // daemon; legacy NULL-space rows stay excluded until reembed. Exercises
+    // BOTH the Ok (opens + runs adoption/census) and Err (open fails) arms.
+    #[test]
+    fn run_sqlite_embedding_space_boot_maintenance_covers_both_open_arms() {
+        let fp = crate::embeddings::embedding_space_fingerprint("test-space");
+        // Ok arm: a fresh temp DB opens cleanly, boot-maintenance runs. The
+        // db::open here also CREATES the file at `env.db_path`.
+        let env = TestEnv::fresh();
+        run_sqlite_embedding_space_boot_maintenance(&env.db_path, &fp, 768);
+        // Err arm: a path whose parent component is now a FILE (`env.db_path`)
+        // fails to open (ENOTDIR); the helper must swallow it into a WARN and
+        // return normally — the #2167 fail-safe posture.
+        let unopenable = env.db_path.join("nested-under-a-file.db");
+        run_sqlite_embedding_space_boot_maintenance(&unopenable, &fp, 768);
+    }
+
+    // B3 (#1691 sibling) — the family-descriptor precompute helper spawns the
+    // async "compute outside, commit inside" body only when enabled. A `None`
+    // embedder makes `precompute_family_embeddings` return empty FAST (no
+    // network / no model load) while still driving the full async body, so
+    // both the enabled (spawn + commit) and disabled (no-op) arms are covered
+    // deterministically without a serve boot.
+    #[tokio::test]
+    async fn spawn_family_embedding_precompute_if_enabled_runs_async_body_and_commits() {
+        let cache: FamilyEmbeddingsCache = Arc::new(tokio::sync::RwLock::new(None));
+        let embedder: Arc<Option<Embedder>> = Arc::new(None);
+        let mut handles: Vec<JoinHandle<()>> = Vec::new();
+        spawn_family_embedding_precompute_if_enabled(&mut handles, true, &cache, &embedder);
+        assert_eq!(
+            handles.len(),
+            1,
+            "enabled=true spawns exactly one precompute task"
+        );
+        // Await the spawned task so the async body fully executes, then confirm
+        // the single-shot commit landed (Some(empty) for a None embedder).
+        handles
+            .pop()
+            .unwrap()
+            .await
+            .expect("precompute task joins cleanly");
+        assert!(
+            cache.read().await.is_some(),
+            "the async body commits Some(_) into the family-embeddings cache"
+        );
+
+        // disabled=false: the else arm (debug log) — no task spawned.
+        let mut none_handles: Vec<JoinHandle<()>> = Vec::new();
+        spawn_family_embedding_precompute_if_enabled(&mut none_handles, false, &cache, &embedder);
+        assert!(none_handles.is_empty(), "disabled path spawns no task");
     }
 
     // ----- spawn_gc_loop / spawn_wal_checkpoint_loop --------------------
@@ -8232,8 +8378,20 @@ mod tests {
             lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
-        db::set_embedding(&conn, &id, &[1.0, 0.0, 0.0]).unwrap();
-        let idx = build_vector_index(&conn, true).expect("populated index");
+        db::set_embedding(
+            &conn,
+            &id,
+            &[1.0, 0.0, 0.0],
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
+        let idx = build_vector_index(
+            &conn,
+            Some(&crate::embeddings::embedding_space_fingerprint(
+                "test-space",
+            )),
+        )
+        .expect("populated index");
         assert!(
             idx.len() >= 1,
             "expected non-empty index, got len={}",
@@ -8288,7 +8446,13 @@ mod tests {
             let id = db::insert(&conn, &mem).unwrap();
             let mut v = [0.0_f32; 3];
             v[i] = 1.0;
-            db::set_embedding(&conn, &id, &v).unwrap();
+            db::set_embedding(
+                &conn,
+                &id,
+                &v,
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
+            )
+            .unwrap();
             expected_ids.push(id);
         }
         drop(conn);
@@ -8297,7 +8461,11 @@ mod tests {
         // mutex — exactly what `serve` now constructs before binding.
         let state: Arc<Mutex<Option<Box<dyn hnsw::VectorSearchIndex>>>> =
             Arc::new(Mutex::new(Some(Box::new(hnsw::VectorIndex::empty()) as _)));
-        let handle = spawn_vector_index_boot_load(env.db_path.clone(), Arc::clone(&state));
+        let handle = spawn_vector_index_boot_load(
+            env.db_path.clone(),
+            crate::embeddings::embedding_space_fingerprint("test-space"),
+            Arc::clone(&state),
+        );
 
         // Readiness: the state is immediately lockable (no long-held
         // guard) — a request-path access during warm-up must not
@@ -9740,8 +9908,19 @@ decision = "allow"
         let inserted_id = db::insert(&conn, &mem).unwrap();
         // Write a real-length embedding (384 dims of f32).
         let vec_data: Vec<f32> = (0..384).map(|i| i as f32 * 0.001).collect();
-        db::set_embedding(&conn, &inserted_id, &vec_data).unwrap();
-        let idx = build_vector_index(&conn, true);
+        db::set_embedding(
+            &conn,
+            &inserted_id,
+            &vec_data,
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
+        )
+        .unwrap();
+        let idx = build_vector_index(
+            &conn,
+            Some(&crate::embeddings::embedding_space_fingerprint(
+                "test-space",
+            )),
+        );
         assert!(idx.is_some());
     }
 

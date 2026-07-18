@@ -77,7 +77,13 @@ fn archive_preserves_embedding_and_tier_on_restore() {
 
     // Set an embedding so we can verify it round-trips through the archive.
     let embedding: Vec<f32> = (0..8).map(|i| (i as f32) * 0.125).collect();
-    db::set_embedding(&conn, &mem.id, &embedding).expect("set embedding");
+    db::set_embedding(
+        &conn,
+        &mem.id,
+        &embedding,
+        &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
+    )
+    .expect("set embedding");
 
     // Archive it.
     let moved = db::archive_memory(&conn, &mem.id, Some("p2-test")).expect("archive");
@@ -135,13 +141,24 @@ fn mixed_dim_write_rejected_after_first_dim_established() {
 
     // First write establishes the namespace dim at 4.
     let v4 = vec![0.1_f32, 0.2, 0.3, 0.4];
-    db::set_embedding(&conn, &m_a.id, &v4).expect("first write succeeds");
+    db::set_embedding(
+        &conn,
+        &m_a.id,
+        &v4,
+        &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
+    )
+    .expect("first write succeeds");
 
     // Second write into the SAME namespace at a different dim must fail
     // with the typed EmbeddingDimMismatch error (G4).
     let v8: Vec<f32> = (0..8).map(|i| (i as f32) * 0.1).collect();
-    let err = db::set_embedding(&conn, &m_b.id, &v8)
-        .expect_err("second write at different dim must error");
+    let err = db::set_embedding(
+        &conn,
+        &m_b.id,
+        &v8,
+        &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
+    )
+    .expect_err("second write at different dim must error");
     let msg = err.to_string();
     assert!(
         msg.contains("dim mismatch")
@@ -152,7 +169,13 @@ fn mixed_dim_write_rejected_after_first_dim_established() {
     );
 
     // Same dim should still succeed.
-    db::set_embedding(&conn, &m_b.id, &v4).expect("matching dim succeeds");
+    db::set_embedding(
+        &conn,
+        &m_b.id,
+        &v4,
+        &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
+    )
+    .expect("matching dim succeeds");
 
     // dim_violations stat reports zero on a clean v17 store.
     assert_eq!(
@@ -324,7 +347,13 @@ fn fresh_db_reports_zero_dim_violations() {
     let m = make_memory("clean", "stats/test", Tier::Long);
     db::insert(&conn, &m).expect("insert");
     let v = vec![0.0_f32; 16];
-    db::set_embedding(&conn, &m.id, &v).expect("set embedding");
+    db::set_embedding(
+        &conn,
+        &m.id,
+        &v,
+        &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
+    )
+    .expect("set embedding");
 
     let stats = db::stats(&conn, Path::new(":memory:")).expect("stats");
     assert_eq!(
