@@ -760,6 +760,44 @@ pub fn boxed_default_index(capacity: usize, hard_fail_at_cap: bool) -> Box<dyn V
     Box::new(VectorIndex::empty_with_capacity(capacity, hard_fail_at_cap))
 }
 
+/// v1.0.0 #1860 — backend-RESOLVING funnel: the single seam the daemon
+/// boot path calls. Default build: identical to
+/// [`boxed_default_index`]. Under the OFF-by-default `vectorlite`
+/// feature it first offers the boot to the opt-in vectorlite backend
+/// ([`crate::vectorlite::boxed_from_env`]), which selects itself ONLY
+/// when the operator set `AI_MEMORY_VECTORLITE_EXTENSION` AND the
+/// extension loads + smoke-verifies — any failure falls closed to the
+/// default backend here (degrade, never corrupt; the ANN index is a
+/// derived artifact either way).
+#[must_use]
+pub fn boxed_configured_index(
+    capacity: usize,
+    hard_fail_at_cap: bool,
+) -> Box<dyn VectorSearchIndex> {
+    #[cfg(feature = "vectorlite")]
+    if let Some(idx) = crate::vectorlite::boxed_from_env(capacity, hard_fail_at_cap) {
+        return idx;
+    }
+    boxed_default_index(capacity, hard_fail_at_cap)
+}
+
+/// v1.0.0 #1860 — the `Arc`-shaped twin of [`boxed_configured_index`]
+/// for the MCP stdio boot path (which shares its index with the warm
+/// thread via `Arc<dyn VectorSearchIndex>`). Same resolution + same
+/// fail-closed fallback; both funnels share
+/// `crate::vectorlite::from_env` so the semantics cannot drift.
+#[must_use]
+pub fn arc_configured_index(
+    capacity: usize,
+    hard_fail_at_cap: bool,
+) -> std::sync::Arc<dyn VectorSearchIndex> {
+    #[cfg(feature = "vectorlite")]
+    if let Some(idx) = crate::vectorlite::from_env(capacity, hard_fail_at_cap) {
+        return std::sync::Arc::new(idx);
+    }
+    std::sync::Arc::new(VectorIndex::empty_with_capacity(capacity, hard_fail_at_cap))
+}
+
 impl VectorIndex {
     /// Shared constructor body — every public constructor funnels
     /// through here so the `IndexState` field set cannot drift
