@@ -506,7 +506,13 @@ CREATE TABLE IF NOT EXISTS archived_memories (
     -- v1.0.0 (#2167, schema v84) — embedding-space provenance mirror so
     -- archive → restore preserves the stamp within one space and NULLs a
     -- foreign-space vector on cross-space restore (§8). Nullable.
-    embedding_space       TEXT
+    embedding_space       TEXT,
+    -- v1.0.0 (#2035, schema v85) — #1834 claim-bitemporal VALID-time mirror
+    -- (RFC3339 TEXT, matching memories.valid_from/valid_until) so archiving a
+    -- memory and later restoring it no longer DROPS the claim-validity
+    -- interval. Nullable on legacy archived rows (archived pre-v85).
+    valid_from            TEXT,
+    valid_until           TEXT
 );
 
 CREATE INDEX IF NOT EXISTS archived_memories_namespace_idx  ON archived_memories (namespace);
