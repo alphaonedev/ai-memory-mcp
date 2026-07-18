@@ -562,6 +562,9 @@ pub mod color;
 /// caller-provided `confidence` field.
 pub mod confidence;
 pub mod config;
+/// #1974 — content patch primitive (append / unique-match replace) for
+/// `memory_update`: pure read-modify-write assembly shared across surfaces.
+pub mod content_patch;
 /// v0.8.0 Pillar 1 (#1722) — coordination-substrate `signed_events`
 /// observability. The single shared writer that appends a
 /// tamper-evident `coordination.<op>` audit row to the append-only chain
