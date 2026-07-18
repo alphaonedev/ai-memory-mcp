@@ -951,11 +951,13 @@ but new public operations live on the trait.
 
 ### Lint gates (issue #1174 PR10 — pm-v3.1 vendor-monoculture + SECS_PER_*)
 
-Six script-based lint gates run in CI alongside the four cargo gates
-(fmt / clippy / test / audit). All are HARD-BLOCK and are wired into
-`.github/workflows/c8-precheck.yml` as six separate jobs (`c8-precheck`,
-`vendor-literal-gate`, `l3-boundary-gate`, `hardcoded-literal-gate`,
-`docs-vs-ssot-drift`, `cloud-init-ascii-gate`).
+Seven numbered script-based lint gates run in CI alongside the four
+cargo gates (fmt / clippy / test / audit) and the two test-guard jobs
+(`test-stdin-gate` #1989, `test-env-lock-gate` #2146). All are
+HARD-BLOCK and are wired into `.github/workflows/c8-precheck.yml`
+(`c8-precheck`, `vendor-literal-gate`, `l3-boundary-gate`,
+`hardcoded-literal-gate`, `docs-vs-ssot-drift`, `cloud-init-ascii-gate`,
+`migration-ladder-gate`, plus the two test-guard jobs above).
 
 **0. Hardcoded-literal duplication ratchet (pm-v3.1)** —
 `scripts/check-hardcoded-literals.sh`. The mechanical enforcement of the
@@ -1085,6 +1087,38 @@ substrate — a silent provisioning failure only visible on SSH
 triage. HARD-BLOCKS any non-ASCII byte in `infra/do-hive/*.tpl`.
 `--self-test` plants the exact #1880 em-dash byte in a tmpdir
 template and confirms the gate rejects it.
+
+**6. Migration-ladder-uniqueness gate** (v1.0.0 guardrail-D, 2x5-vote
+`b682c76a`) — `scripts/check-migration-ladder.sh`. Structurally
+prevents the SILENT migration-ladder-collision class. Migration SQL
+is loaded by `include_str!` at explicit paths in
+`src/storage/migrations.rs` (sqlite) + `src/store/postgres.rs`
+(postgres) with NO uniqueness enforcement: a PR built on an OLD base
+can add `migrations/postgres/0041_v82_archived_valid_time.sql` (#2036)
+while release already carries `migrations/postgres/0041_v84_embedding_space.sql`
+— SAME numeric prefix, DIFFERENT filename ⇒ ZERO git conflict, git
+silently keeps BOTH, and a corrupted/ambiguous ladder ships fleet-wide
+(probe-guarded ALTERs make the double-apply a silent no-op — not
+fail-closed). #2192 renumbered the collider to `0042_v85_*`; this gate
+keeps the class from ever re-landing silently. HARD-BLOCKS any of:
+(a) two files in `migrations/<backend>/` sharing a 4-digit prefix (the
+#2036/#2192 shape); (b) two ladder ARMS declaring the same schema
+version (`if version < N {` in migrations.rs, `migrate_vN` /
+`if current_version < N {` in postgres.rs); (c) a gap (outside the
+documented `KNOWN_PREFIX_GAPS` — currently `sqlite:48`) or a
+non-monotonic arm jump; (d) cross-adapter disagreement (the two
+`CURRENT_SCHEMA_VERSION` consts, the highest-prefix file's `vNN` tag,
+and the postgres `migrate_vN` tip must all agree); (e) an orphan
+migration file (on disk, referenced nowhere under `src/`, not on
+`LADDER_EXEMPT_FILES`) or an `include_str!` arm referencing a missing
+file. `--self-test` plants the EXACT #2036/#2192 same-prefix-different-name
+collision AND a same-version-two-arms case in a throwaway copy UNDER
+the repo (never system `/tmp`) and confirms the gate rejects both.
+The `cargo test` twin `tests/migration_ladder_integrity.rs` re-asserts
+the same invariants (prefix-uniqueness, gap-free sequence, `MIGRATION_LADDER`
+monotonicity, cross-adapter tip agreement) so a collision fails even
+if the shell gate is bypassed. Data-integrity guardrail (North Star:
+degrade — a loud non-zero exit — never corrupt the ladder).
 
 ## Prime directive (operator-set, 2026-05-17)
 
