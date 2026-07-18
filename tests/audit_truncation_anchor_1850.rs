@@ -34,9 +34,11 @@ use std::sync::{Mutex, OnceLock};
 
 use ai_memory::governance::audit as forensic;
 use ai_memory::signed_events::{
-    SignedEvent, TruncationCheck, append_signed_event, payload_hash, verify_audit_trail,
+    HeadHashCheck, SignedEvent, TruncationCheck, append_signed_event, canonical_chain_bytes,
+    payload_hash, verify_audit_trail,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
+use sha2::{Digest, Sha256};
 
 /// Process-global serialisation for the shared forensic SINK.
 fn forensic_lock() -> &'static Mutex<()> {
@@ -188,8 +190,10 @@ fn intact_chain_with_current_watermark_is_not_detected() {
     for i in 0..5 {
         append_row(&conn, format!("payload-{i}").as_bytes());
     }
-    forensic::record_audit_watermark(5, "anchor-hash-head-5");
-    forensic::flush_blocking();
+    // v1.0.0 #1873 — anchor the REAL head hash (a fake hash would now trip the
+    // head-hash mismatch check on an intact chain). The truncation-lane
+    // assertion below is unchanged.
+    anchor_real_head(&conn);
 
     let report = verify_audit_trail(&conn, None).expect("verify");
     assert_eq!(report.head_sequence, 5);
@@ -197,6 +201,11 @@ fn intact_chain_with_current_watermark_is_not_detected() {
         report.truncation,
         TruncationCheck::NotDetected,
         "in-DB head >= anchored head → no truncation evidence; report={report:?}"
+    );
+    assert_eq!(
+        report.head_hash,
+        HeadHashCheck::NotDetected,
+        "an intact chain vs its real anchor hash must match; report={report:?}"
     );
     assert!(report.is_clean(), "report={report:?}");
 
@@ -287,4 +296,133 @@ fn watermark_is_payload_only_and_canonical_bytes_unchanged() {
             .and_then(serde_json::Value::as_i64),
         Some(42)
     );
+}
+
+// -----------------------------------------------------------------
+// v1.0.0 #1873 (CWE-354) — audit-head HASH anchor: a SAME-LENGTH suffix
+// rewrite (recomputed prev_hash, equal row count) that the seq-only
+// TruncationCheck + the chain-intact walk both miss on an unsigned daemon.
+// -----------------------------------------------------------------
+
+/// Read the surviving head row, recompute its canonical hash EXACTLY as the
+/// verifier does (`SHA-256(canonical_chain_bytes(head))` → lowercase hex), and
+/// anchor that REAL hash into the off-table forensic watermark. Returns the
+/// head sequence. (The truncation tests above anchor a FAKE hash because they
+/// only exercise the sequence compare; the head-hash lane needs the real one.)
+fn anchor_real_head(conn: &Connection) -> i64 {
+    let (seq, hash_hex) = conn
+        .query_row(
+            "SELECT id, agent_id, event_type, payload_hash, signature, attest_level, \
+                    timestamp, sequence, cause_hash \
+             FROM signed_events ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| {
+                let ev = SignedEvent {
+                    id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    event_type: row.get(2)?,
+                    payload_hash: row.get(3)?,
+                    signature: row.get(4)?,
+                    attest_level: row.get(5)?,
+                    timestamp: row.get(6)?,
+                    sequence: row.get(7)?,
+                    cause_hash: row.get::<_, Option<Vec<u8>>>(8)?,
+                    prev_hash: Vec::new(),
+                };
+                let mut h = Sha256::new();
+                h.update(canonical_chain_bytes(&ev));
+                Ok((ev.sequence, hex::encode(h.finalize())))
+            },
+        )
+        .expect("read head row");
+    forensic::record_audit_watermark(seq, &hash_hex);
+    forensic::flush_blocking();
+    seq
+}
+
+#[test]
+fn same_length_head_rewrite_is_head_hash_mismatch() {
+    let _g = forensic_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fdir = fresh_dir("d-forensic");
+    let ddir = fresh_dir("d-db");
+    forensic::init(fdir.path(), None).expect("forensic init");
+    let (_path, conn) = open_db(ddir.path());
+    for i in 0..5 {
+        append_row(&conn, format!("payload-{i}").as_bytes());
+    }
+    let head_seq = anchor_real_head(&conn);
+
+    // Baseline: a clean chain with a REAL anchor → head hash matches.
+    let clean = verify_audit_trail(&conn, None).expect("verify clean");
+    assert_eq!(
+        clean.head_hash,
+        HeadHashCheck::NotDetected,
+        "clean chain vs its real anchor must match; report={clean:?}"
+    );
+    assert!(clean.is_clean(), "clean baseline; report={clean:?}");
+
+    // SAME-LENGTH rewrite: flip the HEAD row's payload_hash in place. Row count
+    // and every sequence are unchanged, and nothing links FROM the head, so the
+    // chain walk stays intact and the seq-only truncation check reads clean —
+    // ONLY the head-hash anchor catches it.
+    conn.execute(
+        "UPDATE signed_events SET payload_hash = ?1 WHERE sequence = ?2",
+        params![vec![0xFFu8; 32], head_seq],
+    )
+    .expect("rewrite head payload in place");
+
+    let report = verify_audit_trail(&conn, None).expect("verify rewritten");
+    assert_eq!(
+        report.head_sequence, head_seq,
+        "same-length rewrite leaves the head sequence + row count unchanged; report={report:?}"
+    );
+    assert!(
+        report.chain_intact,
+        "nothing links from the head, so the chain walk stays intact; report={report:?}"
+    );
+    assert_eq!(
+        report.truncation,
+        TruncationCheck::NotDetected,
+        "the seq-only truncation check cannot see a same-length rewrite; report={report:?}"
+    );
+    match &report.head_hash {
+        HeadHashCheck::Mismatch { chain, .. } => assert_eq!(chain, "signed_events"),
+        other => panic!("expected head_hash Mismatch, got {other:?}; report={report:?}"),
+    }
+    assert!(
+        !report.is_clean(),
+        "a head-hash mismatch (same-length rewrite) must dirty is_clean → exit-1; report={report:?}"
+    );
+
+    forensic::shutdown();
+}
+
+#[test]
+fn head_hash_withholds_when_no_anchor() {
+    let _g = forensic_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fdir = fresh_dir("e-forensic");
+    let ddir = fresh_dir("e-db");
+    forensic::init(fdir.path(), None).expect("forensic init");
+    let (_path, conn) = open_db(ddir.path());
+    for i in 0..3 {
+        append_row(&conn, format!("p-{i}").as_bytes());
+    }
+    // No watermark recorded → the head-hash check withholds (never a false
+    // alarm on a deployment without a forensic anchor).
+    let report = verify_audit_trail(&conn, None).expect("verify");
+    assert_eq!(
+        report.head_hash,
+        HeadHashCheck::Unknown,
+        "no anchor → withhold; report={report:?}"
+    );
+    assert!(
+        report.is_clean(),
+        "withhold keeps a clean report clean; report={report:?}"
+    );
+
+    forensic::shutdown();
 }
