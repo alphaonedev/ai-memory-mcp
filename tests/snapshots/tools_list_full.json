@@ -909,6 +909,24 @@
               "null"
             ]
           },
+          "content_append": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "content_replace_from": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "content_replace_to": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "edit_source": {
             "type": [
               "string",
