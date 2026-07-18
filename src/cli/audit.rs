@@ -59,6 +59,13 @@ pub enum AuditAction {
     /// the next `db::open`. The operator signature is the ONLY
     /// discriminator (at the byte level a DR restore IS a rollback).
     RestoreAttest(RestoreAttestArgs),
+    /// v1.0.0 #2004 (spec §5.3) — the crypto-agility RE-ANCHOR ceremony.
+    /// Countersign the CURRENT `signed_events` chain head under the enrolled
+    /// suite and persist it as a signed `re_anchor` checkpoint, so enabling a
+    /// stronger / PQ suite later causes zero record rewrites and every
+    /// pre-break record stays attributable. Signed by the DISTINCT off-daemon
+    /// audit-witness custody key (opt-in — a no-op when none is enrolled).
+    ReAnchor(ReAnchorArgs),
 }
 
 #[derive(Args)]
@@ -145,6 +152,14 @@ pub struct RestoreAttestArgs {
     pub json: bool,
 }
 
+/// v1.0.0 #2004 — arguments for `ai-memory audit re-anchor`.
+#[derive(Args)]
+pub struct ReAnchorArgs {
+    /// Emit a JSON summary instead of the human-readable line.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// `ai-memory audit` entry point. Returns the desired process exit
 /// code so the caller can surface a non-zero status from the top-level
 /// dispatch without panicking.
@@ -156,6 +171,109 @@ pub fn run(args: AuditArgs, app_config: &AppConfig, out: &mut CliOutput<'_>) -> 
         AuditAction::Path => run_path(audit_dir.as_deref(), app_config, out),
         AuditAction::Show(s) => run_show(&s, app_config, out),
         AuditAction::RestoreAttest(r) => run_restore_attest(&r, app_config, out),
+        AuditAction::ReAnchor(r) => run_re_anchor(&r, app_config, out),
+    }
+}
+
+/// v1.0.0 #2004 (spec §5.3) — the crypto-agility re-anchor ceremony. Reads the
+/// current `signed_events` head, countersigns it under the enrolled suite with
+/// the audit-witness custody key, and persists a signed `re_anchor` checkpoint
+/// (both backends). The freshly-persisted anchor is then self-verified via the
+/// read-back path (K1-pinned to the enrolled witness pubkey) so the operator
+/// sees the ceremony round-trip, not just a write.
+fn run_re_anchor(
+    args: &ReAnchorArgs,
+    app_config: &AppConfig,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
+    use anyhow::Context;
+    let db_path = app_config.effective_db(std::path::Path::new("ai-memory.db"));
+    let conn = crate::db::open(&db_path)
+        .with_context(|| format!("audit re-anchor: open db at {}", db_path.display()))?;
+    let Some(cp) =
+        crate::signed_events::emit_reanchor_ceremony(&conn).context("emit re-anchor ceremony")?
+    else {
+        writeln!(
+            out.stderr,
+            "re-anchor: no ceremony emitted — enrol an audit-witness signing key \
+             (AI_MEMORY_WITNESS_KEY_DIR) and ensure the signed_events chain is non-empty"
+        )?;
+        return Ok(0);
+    };
+    // Self-verify the persisted anchor against the OUT-OF-BAND enrolled witness
+    // pubkey (K1) — the same read-back a fresh verifier performs. THREE-STATE,
+    // fail-closed: a verify FAILURE (e.g. enrolment drift where the enrolled
+    // pubkey does not match the custody signing key) MUST be distinguishable
+    // from "no pubkey enrolled to pin against", and MUST surface a non-zero
+    // exit so the operator sees a persisted-but-unverifiable anchor, not a
+    // silent "ok". A green ceremony that persists an anchor no verifier can
+    // K1-check would defeat the module's own contract.
+    let readback = match crate::governance::audit::load_enrolled_witness_pubkey()? {
+        Some(vk) => match crate::governance::audit::verify_reanchor_checkpoint(&cp, &vk) {
+            Ok(_) => ReadBack::Pass,
+            Err(e) => ReadBack::Fail(e),
+        },
+        None => ReadBack::NoPin,
+    };
+    let exit = if matches!(readback, ReadBack::Fail(_)) {
+        1
+    } else {
+        0
+    };
+    if args.json {
+        let mut obj = serde_json::json!({
+            "status": if exit == 0 { "ok" } else { "verify_failed" },
+            "checkpoint_id": cp.id,
+            "namespace": cp.namespace,
+            "verified": matches!(readback, ReadBack::Pass),
+            "readback": readback.machine_tag(),
+        });
+        if let ReadBack::Fail(e) = &readback {
+            obj["error"] = serde_json::Value::String(e.tag().to_string());
+        }
+        writeln!(out.stdout, "{obj}")?;
+    } else {
+        let line = match &readback {
+            ReadBack::Pass => "PASS".to_string(),
+            ReadBack::NoPin => {
+                "unverified (no enrolled witness pubkey — set AI_MEMORY_WITNESS_PUBKEY to K1-pin)"
+                    .to_string()
+            }
+            ReadBack::Fail(e) => format!(
+                "FAILED ({}) — the persisted anchor did NOT verify against the enrolled \
+                 witness pubkey; check AI_MEMORY_WITNESS_PUBKEY matches the custody signing key",
+                e.tag()
+            ),
+        };
+        writeln!(
+            out.stdout,
+            "re-anchor {}: crypto-agility ceremony anchor {} recorded (namespace {}); \
+             read-back verify: {line}",
+            if exit == 0 { "OK" } else { "WARN" },
+            cp.id,
+            cp.namespace
+        )?;
+    }
+    Ok(exit)
+}
+
+/// Three-state disposition of the `audit re-anchor` self-verify read-back.
+/// Distinguishes a genuine K1 PASS, an absent enrolled pubkey (nothing to pin
+/// against — not a failure), and an actual verify FAILURE (fail-closed, exit 1).
+enum ReadBack {
+    Pass,
+    NoPin,
+    Fail(crate::governance::audit::ReAnchorCheckpointError),
+}
+
+impl ReadBack {
+    /// Stable machine-readable tag for the JSON `readback` field.
+    fn machine_tag(&self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::NoPin => "no_enrolled_pubkey",
+            Self::Fail(_) => "fail",
+        }
     }
 }
 
@@ -1618,6 +1736,161 @@ mod restore_attest_1946_tests {
         let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
         assert_eq!(v["status"], "ok");
         assert_eq!(v["gap"], 3);
+        clear_witness_env();
+    }
+}
+
+/// v1.0.0 #2004 — CLI-verb coverage for the `run_re_anchor` self-verify
+/// read-back (the FIX-1 operator-visibility contract). The read-back is
+/// THREE-STATE and fail-closed: a verify FAILURE (enrolment drift — the
+/// enrolled `AI_MEMORY_WITNESS_PUBKEY` does not match the custody signing key
+/// that produced the anchor) MUST surface a NON-ZERO exit + a visible FAILED
+/// line, never a silent `ok` blamed on a "missing pubkey". Witness env vars
+/// are process-global → serialised on the crate key-dir env lock.
+#[cfg(test)]
+mod reanchor_ceremony_2004_cli_tests {
+    use super::*;
+    use crate::cli::test_utils::TestEnv;
+    use crate::governance::audit as witness;
+
+    fn cfg_for(env: &TestEnv) -> AppConfig {
+        AppConfig {
+            db: Some(env.db_path.display().to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn clear_witness_env() {
+        unsafe {
+            std::env::remove_var(witness::WITNESS_KEY_DIR_ENV);
+            std::env::remove_var(witness::WITNESS_PUBKEY_ENV);
+        }
+    }
+
+    /// Append `n` unsigned `signed_events` rows to the TestEnv db so the
+    /// re-anchor ceremony has a non-empty chain head to countersign.
+    fn append_rows(db_path: &std::path::Path, n: usize) {
+        let conn = crate::db::open(db_path).expect("open db");
+        for i in 0..n {
+            let ev = crate::signed_events::SignedEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                agent_id: "alice".to_string(),
+                event_type: "memory_link.created".to_string(),
+                payload_hash: crate::signed_events::payload_hash(format!("p-{i}").as_bytes()),
+                signature: None,
+                attest_level: "unsigned".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                ..crate::signed_events::SignedEvent::default()
+            };
+            crate::signed_events::append_signed_event(&conn, &ev).expect("append");
+        }
+    }
+
+    /// Enrol a witness signing key in `dir` and set the custody-dir env; the
+    /// K1 pubkey env is set SEPARATELY by the caller (so the drift case can
+    /// pin a DIFFERENT key than the one that signs).
+    fn enrol_signing_key(dir: &std::path::Path) -> crate::identity::keypair::AgentKeypair {
+        let kp = crate::identity::keypair::generate(witness::WITNESS_KEY_LABEL).expect("gen");
+        crate::identity::keypair::save(&kp, dir).expect("save");
+        unsafe {
+            std::env::set_var(witness::WITNESS_KEY_DIR_ENV, dir);
+        }
+        kp
+    }
+
+    #[test]
+    fn re_anchor_readback_pass_exits_zero() {
+        let _g = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_witness_env();
+        let mut env = TestEnv::fresh();
+        append_rows(&env.db_path, 2);
+        let kdir = tempfile::tempdir().expect("kdir");
+        let kp = enrol_signing_key(kdir.path());
+        // K1 pins the SAME key that signs → PASS.
+        unsafe {
+            std::env::set_var(witness::WITNESS_PUBKEY_ENV, kp.public_base64());
+        }
+        let cfg = cfg_for(&env);
+        let code = {
+            let mut out = env.output();
+            run_re_anchor(&ReAnchorArgs { json: false }, &cfg, &mut out).expect("run")
+        };
+        assert_eq!(code, 0, "PASS read-back must exit 0: {}", env.stdout_str());
+        assert!(
+            env.stdout_str().contains("PASS"),
+            "expected PASS line: {}",
+            env.stdout_str()
+        );
+        clear_witness_env();
+    }
+
+    #[test]
+    fn re_anchor_enrolment_drift_fails_closed_nonzero() {
+        let _g = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_witness_env();
+        let mut env = TestEnv::fresh();
+        append_rows(&env.db_path, 2);
+        let kdir = tempfile::tempdir().expect("kdir");
+        let _signer = enrol_signing_key(kdir.path());
+        // ENROLMENT DRIFT: pin a DIFFERENT key than the custody signer. The
+        // persisted anchor's resolver_pubkey is the signer's, so the K1 pin
+        // fails — the ceremony persisted but is NOT verifiable.
+        let other = crate::identity::keypair::generate("someone-else").expect("gen");
+        unsafe {
+            std::env::set_var(witness::WITNESS_PUBKEY_ENV, other.public_base64());
+        }
+        let cfg = cfg_for(&env);
+        let code = {
+            let mut out = env.output();
+            run_re_anchor(&ReAnchorArgs { json: true }, &cfg, &mut out).expect("run")
+        };
+        assert_eq!(
+            code,
+            1,
+            "enrolment drift must fail closed (exit 1): {}",
+            env.stdout_str()
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(env.stdout_str().trim()).expect("json summary");
+        assert_eq!(v["status"], "verify_failed");
+        assert_eq!(v["verified"], false);
+        assert_eq!(v["readback"], "fail");
+        assert_eq!(v["error"], "reanchor_checkpoint_pubkey_not_enrolled");
+        clear_witness_env();
+    }
+
+    #[test]
+    fn re_anchor_no_enrolled_pubkey_is_no_pin_not_fail() {
+        let _g = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_witness_env();
+        let mut env = TestEnv::fresh();
+        append_rows(&env.db_path, 2);
+        let kdir = tempfile::tempdir().expect("kdir");
+        // Enrol a signing key (so the ceremony emits) but leave the K1 pubkey
+        // env UNSET and remove the custody `.pub` so nothing is pinnable.
+        let _signer = enrol_signing_key(kdir.path());
+        std::fs::remove_file(
+            kdir.path()
+                .join(format!("{}.pub", witness::WITNESS_KEY_LABEL)),
+        )
+        .expect("remove pub");
+        let cfg = cfg_for(&env);
+        let code = {
+            let mut out = env.output();
+            run_re_anchor(&ReAnchorArgs { json: true }, &cfg, &mut out).expect("run")
+        };
+        assert_eq!(code, 0, "no-pin is not a failure: {}", env.stdout_str());
+        let v: serde_json::Value =
+            serde_json::from_str(env.stdout_str().trim()).expect("json summary");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["verified"], false);
+        assert_eq!(v["readback"], "no_enrolled_pubkey");
         clear_witness_env();
     }
 }
