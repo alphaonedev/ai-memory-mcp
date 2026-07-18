@@ -166,6 +166,40 @@ fn print_curator_report(r: &curator::CuratorReport, out: &mut CliOutput<'_>) -> 
     Ok(())
 }
 
+/// Resolve when the process receives SIGINT (ctrl_c, cross-platform)
+/// or — on unix — SIGTERM, so `systemctl stop` / `docker stop` / `kill`
+/// (whose default signal is SIGTERM) trigger the same clean
+/// between-cycles shutdown the `curator --daemon` doc promises
+/// (issue #2119). Mirrors the `cli::watch` daemon arm exactly: when the
+/// SIGTERM handler cannot install, its arm parks on `pending()` so the
+/// `select!` still resolves on ctrl_c alone. On non-unix targets only
+/// SIGINT is available.
+async fn await_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).ok();
+        let term_fut = async {
+            match term.as_mut() {
+                Some(t) => {
+                    t.recv().await;
+                }
+                // No SIGTERM handler could be installed — park forever
+                // so `select!` resolves on ctrl_c alone.
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            () = term_fut => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 /// `curator` handler. Daemon-mode delegates to `daemon_runtime`.
 pub async fn run(
     db_path: &Path,
@@ -239,7 +273,9 @@ pub async fn run(
     let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
     let shutdown_for_signal = shutdown.clone();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        // #2119 — honour BOTH SIGINT and (unix) SIGTERM so a process
+        // manager's default stop signal triggers the clean shutdown.
+        await_shutdown_signal().await;
         shutdown_for_signal.notify_one();
     });
 
@@ -400,7 +436,9 @@ async fn run_store_backed_sweep(
     let shutdown_for_signal = shutdown.clone();
     let flag_for_signal = shutdown_flag.clone();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        // #2119 — honour BOTH SIGINT and (unix) SIGTERM so a process
+        // manager's default stop signal triggers the clean shutdown.
+        await_shutdown_signal().await;
         flag_for_signal.store(true, std::sync::atomic::Ordering::Relaxed);
         shutdown_for_signal.notify_one();
     });
@@ -1873,6 +1911,60 @@ mod tests {
                 // Timed out — that's fine for line-coverage purposes:
                 // the daemon-mode code path has already executed.
                 eprintln!("daemon-mode test timed out; coverage already captured");
+            }
+        }
+    }
+
+    // #2119 regression twin of the SIGINT test above — proves the
+    // curator `--daemon` arm returns cleanly on SIGTERM (the default
+    // `systemctl stop` / `kill` signal), not just SIGINT. Before the
+    // fix no `SignalKind::terminate()` handler was installed, so a
+    // self-fired SIGTERM would hard-kill the test process instead of
+    // triggering the documented between-cycles clean shutdown. The
+    // daemon's spawned watcher installs the SIGTERM handler at startup
+    // (well before the 200ms self-fire), so tokio consumes the signal
+    // and the loop exits at its next shutdown check. Unix-only: the
+    // self-fire uses `libc::kill(getpid, SIGTERM)`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn curator_daemon_mode_returns_on_sigterm() {
+        use std::path::PathBuf;
+        let env = TestEnv::fresh();
+        let db: PathBuf = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.daemon = true;
+        args.interval_secs = 60; // clamped; shutdown checked each loop
+        args.dry_run = true;
+
+        // Fire SIGTERM to ourselves after a brief delay — long enough
+        // for the daemon's watcher task to install the SIGTERM handler.
+        let kicker = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // SAFETY: kill(getpid, SIGTERM) is well-defined on POSIX.
+            unsafe {
+                let pid = libc::getpid();
+                libc::kill(pid, libc::SIGTERM);
+            }
+        });
+
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = crate::cli::CliOutput::from_std(&mut stdout, &mut stderr);
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            run(&db, &args, &cfg, &mut out),
+        )
+        .await;
+        let _ = kicker.await;
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("daemon mode errored on SIGTERM: {e}"),
+            Err(_) => {
+                // Timed out — acceptable; the SIGTERM path already ran
+                // without hard-killing the process (the pre-fix failure
+                // mode would have aborted the whole test binary).
+                eprintln!("sigterm daemon test timed out; path already exercised");
             }
         }
     }

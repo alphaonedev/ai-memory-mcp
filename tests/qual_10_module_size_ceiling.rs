@@ -334,8 +334,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // the `get_embedding_with_space` helper + `proactive_conflict_check`
     // `embedding_space` predicate (#2181, #2167 residual) PLUS the
     // ck_trigger_* / a3-fed permissions-race test comments (#2165) land
-    // storage/mod.rs at 25_738; ceiling 25_650 -> 25_850 (+112 headroom).
-    ("src/storage/mod.rs", 25_850),
+    // storage/mod.rs at 25_738; ceiling 25_650 -> 25_850. Then #2035 v85
+    // archive->restore valid_from/valid_until column threading + round-trip
+    // unit test added ~65 LOC on top of the merge.
+    ("src/storage/mod.rs", 25_900),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -778,7 +780,9 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // #2179) close the postgres silent-recall-outage. All are data-integrity
     // parity with the proven sqlite path, not new surface. File lands at
     // 27_501; 27_600 = 27_501 + 99 headroom; far under the 1.5x cap.
-    ("src/store/postgres.rs", 27_600),
+    // 2026-07-18 #2035 v85 migrate_v85 + MIGRATION_V85 const + archive/restore
+    // valid_from/valid_until threading land it at 27_639; ceiling 27_700.
+    ("src/store/postgres.rs", 27_700),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -1193,7 +1197,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-17 (#2167 S1): the v84 embedding_space migration arm + SCHEMA
     // column doc land migrations.rs at 5_446; ceiling 5_450 (+4 headroom).
     // Additive ALTER-ADD-COLUMN migration only.
-    ("src/storage/migrations.rs", 5_450),
+    ("src/storage/migrations.rs", 5_550), /* 2026-07-18 #2035 v85 archived_memories valid_from/valid_until migration arm (5_491) */
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.
