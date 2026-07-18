@@ -957,6 +957,121 @@ fn sweep_backfills_recall_outcome_from_ledger_1706() {
     );
 }
 
+/// v1.0.0 §11.5 (#1707) — the calibrate sweep reports the consume-vs-access
+/// divergence evidence the #1707 conditional gate requires. A consumed
+/// candidate with a high `access_count` and an unconsumed sibling with a low
+/// one must surface as `consume_access_divergence` with the per-bucket means
+/// (the collinearity tell), observe-only — `recall()` is untouched.
+#[test]
+fn divergence_stat_reports_consume_vs_access_1707() {
+    let (_tmp, conn) = fresh_db();
+    let consumed_mem = fixture_memory("ns-1707", "consumed-candidate");
+    let unconsumed_mem = fixture_memory("ns-1707", "unconsumed-candidate");
+    let consumer = fixture_memory("ns-1707", "consumer");
+    db::insert(&conn, &consumed_mem).expect("insert consumed");
+    db::insert(&conn, &unconsumed_mem).expect("insert unconsumed");
+    db::insert(&conn, &consumer).expect("insert consumer");
+
+    // Known access_counts: consumed row is high-access, unconsumed is low —
+    // the collinearity scenario the gate tests for.
+    conn.execute(
+        "UPDATE memories SET access_count = ?1 WHERE id = ?2",
+        rusqlite::params![50_i64, consumed_mem.id],
+    )
+    .expect("set consumed access_count");
+    conn.execute(
+        "UPDATE memories SET access_count = ?1 WHERE id = ?2",
+        rusqlite::params![4_i64, unconsumed_mem.id],
+    )
+    .expect("set unconsumed access_count");
+
+    let s = ConfidenceSignals::default();
+    observe(
+        &conn,
+        &consumed_mem.id,
+        "ns-1707",
+        "user",
+        0.9,
+        0.5,
+        &s,
+        None,
+    )
+    .expect("observe c");
+    observe(
+        &conn,
+        &unconsumed_mem.id,
+        "ns-1707",
+        "user",
+        0.9,
+        0.5,
+        &s,
+        None,
+    )
+    .expect("observe u");
+
+    observations::record_recall(
+        &conn,
+        "r-1707",
+        &[
+            Candidate {
+                memory_id: &consumed_mem.id,
+                retriever: "hybrid",
+                rank: 1,
+                score: 0.9,
+            },
+            Candidate {
+                memory_id: &unconsumed_mem.id,
+                retriever: "hybrid",
+                rank: 2,
+                score: 0.8,
+            },
+        ],
+    )
+    .expect("record_recall");
+    observations::mark_consumed(&conn, "r-1707", &[consumed_mem.id.as_str()], &consumer.id)
+        .expect("mark_consumed");
+
+    // The sweep backfills recall_outcome then computes the divergence.
+    let report = calibrate_from_shadow(&conn, 30, Utc::now()).expect("calibrate");
+    let baseline = report
+        .baselines
+        .iter()
+        .find(|b| b.namespace == "ns-1707" && b.source == "user")
+        .expect("ns-1707/user baseline");
+    let div = baseline
+        .consume_access_divergence
+        .as_ref()
+        .expect("divergence present when rows are judged");
+    assert_eq!(div.consumed_count, 1);
+    assert_eq!(div.unconsumed_count, 1);
+    assert!((div.mean_access_consumed.expect("consumed mean") - 50.0).abs() < 1e-6);
+    assert!((div.mean_access_unconsumed.expect("unconsumed mean") - 4.0).abs() < 1e-6);
+    // Collinearity tell: consumed rows carry systematically higher access.
+    assert!(div.mean_access_consumed.unwrap() > div.mean_access_unconsumed.unwrap());
+}
+
+/// v1.0.0 §11.5 (#1707) — cold-start / no-ledger honesty: when no shadow row
+/// has a correlated ledger entry, the divergence stat is `None` (not a
+/// misleading zero), mirroring `consumption_utility`.
+#[test]
+fn divergence_stat_none_without_ledger_correlation_1707() {
+    let (_tmp, conn) = fresh_db();
+    let m = fixture_memory("ns-1707b", "u-1");
+    db::insert(&conn, &m).expect("ins");
+    let s = ConfidenceSignals::default();
+    // Observed but never recalled/consumed ⇒ recall_outcome stays NULL.
+    observe(&conn, &m.id, "ns-1707b", "user", 0.9, 0.5, &s, None).expect("observe");
+
+    let report = calibrate_from_shadow(&conn, 30, Utc::now()).expect("calibrate");
+    let baseline = report
+        .baselines
+        .iter()
+        .find(|b| b.namespace == "ns-1707b")
+        .expect("baseline");
+    assert!(baseline.consume_access_divergence.is_none());
+    assert!(baseline.consumption_utility.is_none());
+}
+
 /// #1706 item 4 — on a DB where the `recall_observations` ledger is
 /// absent, the sweep skips the consumption-utility backfill with a WARN
 /// and does not error. Exercised through the public
@@ -969,7 +1084,10 @@ fn calibrate_from_shadow_skips_gracefully_when_ledger_table_absent_1706() {
     let path = dir.path().join("no-ledger.db");
     let conn = rusqlite::Connection::open(&path).expect("open bare conn");
     conn.execute_batch(
-        "CREATE TABLE memories (id TEXT PRIMARY KEY);
+        // `access_count` is a core `memories` column in every real deployment
+        // (the #1707 divergence JOIN reads it); the bare fixture carries it so
+        // it stays representative while still omitting `recall_observations`.
+        "CREATE TABLE memories (id TEXT PRIMARY KEY, access_count INTEGER NOT NULL DEFAULT 0);
          CREATE TABLE confidence_shadow_observations (
              id INTEGER PRIMARY KEY AUTOINCREMENT,
              memory_id TEXT NOT NULL,
