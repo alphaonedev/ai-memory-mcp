@@ -12581,9 +12581,11 @@ pub fn merge_inbound(conn: &Connection, inbound: &Memory) -> Result<String> {
 /// `(title, namespace)`, not `id`). The UPDATE is keyed on `id`, so it
 /// also rewrites `title` / `namespace` when the merge picked the remote's
 /// (a LWW visibility edit) without tripping the `(title, namespace)`
-/// dedup path. Writes all 27 logical columns + the denormalised
-/// `mentioned_entity_id` (re-derived from the merged row, same as the
-/// `insert` / `insert_if_newer` chokepoints).
+/// dedup path. Writes all 29 logical columns (incl. the #1834 / #2207
+/// `valid_from` / `valid_until` VALID-time interval so a peer's claim-close
+/// replicates by id) + the denormalised `mentioned_entity_id` (re-derived
+/// from the merged row, same as the `insert` / `insert_if_newer`
+/// chokepoints).
 ///
 /// Because this writer bypasses those chokepoints, the secret screen +
 /// pre-write governance hook + inbound why_trace gate run in its ONLY
@@ -12669,8 +12671,10 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
             mentioned_entity_id = ?25,
             version = ?26,
             lifecycle_state = ?27,
-            encrypted_envelope = ?28
-         WHERE id = ?29",
+            encrypted_envelope = ?28,
+            valid_from = ?29,
+            valid_until = ?30
+         WHERE id = ?31",
         params![
             mem.tier.as_str(),
             mem.namespace,
@@ -12700,6 +12704,15 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
             mem.version,
             mem.lifecycle_state.as_str(),
             merge_encrypted_envelope,
+            // #2207 — the #1834 claim-bitemporal VALID-time interval. The
+            // same-`id` federation merge lane MUST persist the merged
+            // `valid_until` (newer-wins in `merge_memory`, so a peer that
+            // CLOSED a claim replicates the close by id and replicas
+            // converge). `valid_from` is local-immutable in `merge_memory`
+            // (matches the `(title, namespace)` upsert arms' genesis-wins
+            // rule); carrying it verbatim here is a no-op overwrite.
+            mem.valid_from,
+            mem.valid_until,
             mem.id,
         ],
     )?;

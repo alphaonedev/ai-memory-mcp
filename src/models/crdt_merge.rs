@@ -498,8 +498,25 @@ pub fn merge_memory(local: &Memory, remote: &Memory) -> Memory {
         // `cid`/`cid_genesis` untouched, so this carried value is
         // informational). `federation_merge_preserves_local_cid`.
         cid: local.cid.clone(),
+        // #1834 claim-bitemporal VALID-time (#2207 fix): `valid_from` is the
+        // genesis assertion instant — LOCAL-wins (immutable), matching the
+        // `(title, namespace)` upsert arms' `valid_from = memories.valid_from`
+        // rule and the fact that no UPDATE SET list ever rewrites it.
+        // `valid_until` is caller-CLOSABLE, so it MUST resolve NEWER-WINS by
+        // the same `(updated_at, attest_rank, id)` LWW tiebreak the rest of the
+        // row uses — otherwise a peer that CLOSED a claim (newer `updated_at`,
+        // `valid_until = Some(T)`) would merge to the local OPEN value (`None`)
+        // and replicas would DIVERGE on VALID-time (a `valid_at` recall on the
+        // receiver would keep returning the closed claim as still-asserted).
+        // `prefer_non_null_else_lww` also preserves a close against a stale
+        // remote reopen-to-`None` (present beats absent), so a close is sticky.
         valid_from: local.valid_from.clone(),
-        valid_until: local.valid_until.clone(),
+        valid_until: prefer_non_null_else_lww(
+            local,
+            remote,
+            &local.valid_until,
+            &remote.valid_until,
+        ),
         // `tier` — max durability (short < mid < long); never downgrade.
         tier: merge_tier(&local.tier, &remote.tier),
         // `namespace` — LWW by updated_at (tiebreak id).
@@ -683,6 +700,45 @@ mod tests {
     /// PartialEq derive).
     fn as_json(m: &Memory) -> Value {
         serde_json::to_value(m).expect("Memory serialises")
+    }
+
+    /// #2207 — the #1834 claim-bitemporal `valid_until` MUST resolve so a
+    /// peer that CLOSED a claim wins by id: a remote-newer close (present
+    /// `valid_until`, newer `updated_at`) replaces the local OPEN value
+    /// (`None`); a stale remote open (`None`, older `updated_at`) does NOT
+    /// clobber a fresher local close; `valid_from` stays LOCAL-immutable.
+    #[test]
+    fn merge_memory_valid_until_close_wins_and_valid_from_local() {
+        // (a) remote-newer close wins over local open.
+        let mut local = base("a", "2026-06-16T00:00:00+00:00");
+        local.valid_from = Some("2026-06-01T00:00:00+00:00".into());
+        local.valid_until = None; // open
+        let mut remote = base("a", "2026-06-16T09:00:00+00:00");
+        remote.valid_from = Some("2026-06-02T00:00:00+00:00".into()); // must be ignored
+        remote.valid_until = Some("2026-06-10T00:00:00+00:00".into()); // closed
+        let merged = merge_memory(&local, &remote);
+        assert_eq!(
+            merged.valid_until.as_deref(),
+            Some("2026-06-10T00:00:00+00:00"),
+            "a peer's newer close must win (replicates by id)"
+        );
+        assert_eq!(
+            merged.valid_from.as_deref(),
+            Some("2026-06-01T00:00:00+00:00"),
+            "valid_from is LOCAL-immutable (genesis-wins, like the upsert arm)"
+        );
+
+        // (b) a stale remote open must NOT reopen a fresher local close.
+        let mut local_closed = base("a", "2026-06-16T09:00:00+00:00");
+        local_closed.valid_until = Some("2026-06-10T00:00:00+00:00".into());
+        let mut stale_open = base("a", "2026-06-16T00:00:00+00:00");
+        stale_open.valid_until = None;
+        let merged_b = merge_memory(&local_closed, &stale_open);
+        assert_eq!(
+            merged_b.valid_until.as_deref(),
+            Some("2026-06-10T00:00:00+00:00"),
+            "a stale open must not clobber a fresher local close (close is sticky)"
+        );
     }
 
     #[test]

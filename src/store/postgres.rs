@@ -16378,7 +16378,8 @@ impl MemoryStore for PostgresStore {
                 memory_kind = $17, citations = $18, source_uri = $19,
                 source_span = $20, confidence_source = $21, confidence_signals = $22,
                 confidence_decayed_at = $23, entity_id = $24, persona_version = $25,
-                version = $26, mentioned_entity_id = $27, lifecycle_state = $28
+                version = $26, mentioned_entity_id = $27, lifecycle_state = $28,
+                valid_from = $29, valid_until = $30
              WHERE id = $1",
         )
         .bind(&merged.id)
@@ -16409,6 +16410,15 @@ impl MemoryStore for PostgresStore {
         .bind(merged.version)
         .bind(mentioned_entity_id.as_deref())
         .bind(merged.lifecycle_state.as_str())
+        // #2207 — the #1834 claim-bitemporal VALID-time interval (TEXT
+        // RFC3339). The same-`id` federation merge lane MUST persist the
+        // merged `valid_until` so a peer that CLOSED a claim replicates the
+        // close by id (newer-wins in `merge_memory`) → replicas converge on
+        // VALID-time. `valid_from` is local-immutable in `merge_memory`; the
+        // verbatim overwrite is a no-op (matches the `apply_remote_memory`
+        // upsert arm's `valid_from = memories.valid_from` genesis-wins rule).
+        .bind(merged.valid_from.as_deref())
+        .bind(merged.valid_until.as_deref())
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("merge_inbound full-row update", e))?;
