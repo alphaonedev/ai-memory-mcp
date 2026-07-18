@@ -40,6 +40,7 @@ use rusqlite::types::{Value, ValueRef};
 
 use super::store::{ERASURE_TRACE_TARGET, ErasureStore};
 use super::{ENV_ERASURE_DIR, erasure_cold_tier_enabled, resolve_erasure_params};
+use crate::models::field_names::ARCHIVED_AT;
 
 /// Max archived rows bundled per gc tick — the pacing bound. Backlogs
 /// drain monotonically (oldest-first) across ticks instead of in one blast.
@@ -177,7 +178,7 @@ fn bundle_is_current(store: &ErasureStore, id: &str, archived_at: Option<&str>) 
     // Read just the manifest via get()? That would verify shards too —
     // too costly per tick. Compare the manifest meta stamp instead.
     match store.get_manifest_meta(id) {
-        Some(meta) => meta.get("archived_at").and_then(|v| v.as_str()) == archived_at,
+        Some(meta) => meta.get(ARCHIVED_AT).and_then(|v| v.as_str()) == archived_at,
         None => false,
     }
 }
@@ -211,7 +212,7 @@ fn archived_row_payload(conn: &Connection, id: &str) -> Result<(Vec<u8>, serde_j
                 PAYLOAD_KEY_B64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b)
             }),
         };
-        if name == "archived_at" {
+        if name == ARCHIVED_AT {
             archived_at_meta = v.clone();
         }
         columns.insert(name.clone(), v);
@@ -222,7 +223,7 @@ fn archived_row_payload(conn: &Connection, id: &str) -> Result<(Vec<u8>, serde_j
         PAYLOAD_KEY_COLUMNS: columns,
     });
     let meta = serde_json::json!({
-        "archived_at": archived_at_meta,
+        ARCHIVED_AT: archived_at_meta,
         PAYLOAD_KEY_SCHEMA_VERSION: crate::storage::current_schema_version_for_tests(),
     });
     Ok((serde_json::to_vec(&payload)?, meta))
