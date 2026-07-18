@@ -245,7 +245,14 @@ pub fn build_full_envelope(
             by_class.insert(name.into(), level.as_str().into());
         }
     };
-    note("signed_events", signed_events.is_empty(), signed_level);
+    // Reuse the audit-chain name SSOT rather than a fresh `"signed_events"`
+    // literal (pm-v3.1 hardcoded-literal gate; same precedent as
+    // `export_scope::OMITTED_SIGNED_CLASSES`).
+    note(
+        crate::signed_events::WITNESS_CHAIN_SIGNED_EVENTS,
+        signed_events.is_empty(),
+        signed_level,
+    );
     note(
         "memory_revisions",
         memory_revisions.is_empty(),

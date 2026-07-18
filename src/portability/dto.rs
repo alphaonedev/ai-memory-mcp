@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::governance::rules_store::Rule;
 use crate::identity::lineage::{CustodyClass, LineageReason, LineageRecord};
+use crate::portability::hex_bytes::HexBytes;
 use crate::portability::read::{ForgetTombstone, LineageExport, RevisionRow};
 use crate::revisions::{RecordKind, RevisionLeaf};
 use crate::signed_events::SignedEvent;
@@ -61,25 +62,15 @@ pub struct SignedEventDto {
     pub id: String,
     pub agent_id: String,
     pub event_type: String,
-    #[serde(with = "crate::portability::hex_bytes::required")]
-    pub payload_hash: Vec<u8>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::portability::hex_bytes::optional"
-    )]
-    pub signature: Option<Vec<u8>>,
+    pub payload_hash: HexBytes,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<HexBytes>,
     pub attest_level: String,
     pub timestamp: String,
-    #[serde(with = "crate::portability::hex_bytes::required")]
-    pub prev_hash: Vec<u8>,
+    pub prev_hash: HexBytes,
     pub sequence: i64,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::portability::hex_bytes::optional"
-    )]
-    pub cause_hash: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause_hash: Option<HexBytes>,
 }
 
 impl From<&SignedEvent> for SignedEventDto {
@@ -88,13 +79,13 @@ impl From<&SignedEvent> for SignedEventDto {
             id: e.id.clone(),
             agent_id: e.agent_id.clone(),
             event_type: e.event_type.clone(),
-            payload_hash: e.payload_hash.clone(),
-            signature: e.signature.clone(),
+            payload_hash: HexBytes(e.payload_hash.clone()),
+            signature: e.signature.clone().map(HexBytes),
             attest_level: e.attest_level.clone(),
             timestamp: e.timestamp.clone(),
-            prev_hash: e.prev_hash.clone(),
+            prev_hash: HexBytes(e.prev_hash.clone()),
             sequence: e.sequence,
-            cause_hash: e.cause_hash.clone(),
+            cause_hash: e.cause_hash.clone().map(HexBytes),
         }
     }
 }
@@ -105,13 +96,13 @@ impl From<SignedEventDto> for SignedEvent {
             id: d.id,
             agent_id: d.agent_id,
             event_type: d.event_type,
-            payload_hash: d.payload_hash,
-            signature: d.signature,
+            payload_hash: d.payload_hash.0,
+            signature: d.signature.map(|h| h.0),
             attest_level: d.attest_level,
             timestamp: d.timestamp,
-            prev_hash: d.prev_hash,
+            prev_hash: d.prev_hash.0,
             sequence: d.sequence,
-            cause_hash: d.cause_hash,
+            cause_hash: d.cause_hash.map(|h| h.0),
         }
     }
 }
@@ -132,14 +123,9 @@ pub struct RevisionDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
     pub created_at: String,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::portability::hex_bytes::optional"
-    )]
-    pub signature: Option<Vec<u8>>,
-    #[serde(with = "crate::portability::hex_bytes::required")]
-    pub prev_hash: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<HexBytes>,
+    pub prev_hash: HexBytes,
     pub sequence: i64,
 }
 
@@ -153,8 +139,8 @@ impl From<&RevisionRow> for RevisionDto {
             namespace: r.leaf.namespace.clone(),
             agent_id: r.leaf.agent_id.clone(),
             created_at: r.leaf.created_at.clone(),
-            signature: r.leaf.signature.clone(),
-            prev_hash: r.prev_hash.clone(),
+            signature: r.leaf.signature.clone().map(HexBytes),
+            prev_hash: HexBytes(r.prev_hash.clone()),
             sequence: r.sequence,
         }
     }
@@ -177,9 +163,9 @@ impl RevisionDto {
                 namespace: self.namespace,
                 agent_id: self.agent_id,
                 created_at: self.created_at,
-                signature: self.signature,
+                signature: self.signature.map(|h| h.0),
             },
-            prev_hash: self.prev_hash,
+            prev_hash: self.prev_hash.0,
             sequence: self.sequence,
         })
     }
@@ -196,12 +182,8 @@ pub struct ForgetTombstoneDto {
     pub forgotten_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::portability::hex_bytes::optional"
-    )]
-    pub signature: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<HexBytes>,
 }
 
 impl From<&ForgetTombstone> for ForgetTombstoneDto {
@@ -211,7 +193,7 @@ impl From<&ForgetTombstone> for ForgetTombstoneDto {
             namespace: t.namespace.clone(),
             forgotten_at: t.forgotten_at.clone(),
             agent_id: t.agent_id.clone(),
-            signature: t.signature.clone(),
+            signature: t.signature.clone().map(HexBytes),
         }
     }
 }
@@ -223,7 +205,7 @@ impl From<ForgetTombstoneDto> for ForgetTombstone {
             namespace: d.namespace,
             forgotten_at: d.forgotten_at,
             agent_id: d.agent_id,
-            signature: d.signature,
+            signature: d.signature.map(|h| h.0),
         }
     }
 }
@@ -244,24 +226,18 @@ pub struct LineageDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_pubkey_b64: Option<String>,
     pub not_before: String,
-    #[serde(with = "crate::portability::hex_bytes::required")]
-    pub prev_record_hash: Vec<u8>,
+    pub prev_record_hash: HexBytes,
     /// [`CustodyClass`] wire slug (`software-file` default).
     pub custody_class: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suspected_compromise_from_seq: Option<u64>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::portability::hex_bytes::optional"
-    )]
-    pub guardian_set_id: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardian_set_id: Option<HexBytes>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_threshold: Option<u64>,
     /// The detached Ed25519 signature over the record's canonical bytes
     /// (always present — stored ALONGSIDE the record, not signed-in).
-    #[serde(with = "crate::portability::hex_bytes::required")]
-    pub signature: Vec<u8>,
+    pub signature: HexBytes,
 }
 
 impl From<&LineageExport> for LineageDto {
@@ -275,12 +251,12 @@ impl From<&LineageExport> for LineageDto {
             successor_pubkey_b64: r.successor_pubkey_b64.clone(),
             recovery_pubkey_b64: r.recovery_pubkey_b64.clone(),
             not_before: r.not_before.clone(),
-            prev_record_hash: r.prev_record_hash.clone(),
+            prev_record_hash: HexBytes(r.prev_record_hash.clone()),
             custody_class: r.custody_class.as_str().to_string(),
             suspected_compromise_from_seq: r.suspected_compromise_from_seq,
-            guardian_set_id: r.guardian_set_id.clone(),
+            guardian_set_id: r.guardian_set_id.clone().map(HexBytes),
             recovery_threshold: r.recovery_threshold,
-            signature: l.signature.clone(),
+            signature: HexBytes(l.signature.clone()),
         }
     }
 }
@@ -306,13 +282,13 @@ impl LineageDto {
                 successor_pubkey_b64: self.successor_pubkey_b64,
                 recovery_pubkey_b64: self.recovery_pubkey_b64,
                 not_before: self.not_before,
-                prev_record_hash: self.prev_record_hash,
+                prev_record_hash: self.prev_record_hash.0,
                 custody_class,
                 suspected_compromise_from_seq: self.suspected_compromise_from_seq,
-                guardian_set_id: self.guardian_set_id,
+                guardian_set_id: self.guardian_set_id.map(|h| h.0),
                 recovery_threshold: self.recovery_threshold,
             },
-            signature: self.signature,
+            signature: self.signature.0,
         })
     }
 }
@@ -330,12 +306,8 @@ pub struct ModelAttestationDto {
     pub model_family: String,
     pub attest_level: String,
     pub agent_id: String,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::portability::hex_bytes::optional"
-    )]
-    pub signature: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<HexBytes>,
     pub created_at: String,
 }
 
@@ -349,7 +321,7 @@ impl From<&ModelAttestation> for ModelAttestationDto {
             model_family: m.model_family.clone(),
             attest_level: m.attest_level.clone(),
             agent_id: m.agent_id.clone(),
-            signature: m.signature.clone(),
+            signature: m.signature.clone().map(HexBytes),
             created_at: m.created_at.clone(),
         }
     }
@@ -365,7 +337,7 @@ impl From<ModelAttestationDto> for ModelAttestation {
             model_family: d.model_family,
             attest_level: d.attest_level,
             agent_id: d.agent_id,
-            signature: d.signature,
+            signature: d.signature.map(|h| h.0),
             created_at: d.created_at,
         }
     }
@@ -385,12 +357,8 @@ pub struct GovernanceRuleDto {
     pub created_by: String,
     pub created_at: i64,
     pub enabled: bool,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "crate::portability::hex_bytes::optional"
-    )]
-    pub signature: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<HexBytes>,
     pub attest_level: String,
 }
 
@@ -406,7 +374,7 @@ impl From<&Rule> for GovernanceRuleDto {
             created_by: r.created_by.clone(),
             created_at: r.created_at,
             enabled: r.enabled,
-            signature: r.signature.clone(),
+            signature: r.signature.clone().map(HexBytes),
             attest_level: r.attest_level.clone(),
         }
     }
@@ -424,7 +392,7 @@ impl From<GovernanceRuleDto> for Rule {
             created_by: d.created_by,
             created_at: d.created_at,
             enabled: d.enabled,
-            signature: d.signature,
+            signature: d.signature.map(|h| h.0),
             attest_level: d.attest_level,
         }
     }

@@ -170,7 +170,7 @@ fn apply_all_classes(conn: &Connection, env: &ExportEnvelope) -> Result<ImportRe
                 t.namespace,
                 t.forgotten_at,
                 t.agent_id,
-                t.signature
+                t.signature.as_ref().map(|h| h.0.as_slice())
             ],
         )
         .with_context(|| format!("import forget_tombstone for memory {}", t.memory_id))?;
@@ -303,7 +303,7 @@ fn apply_all_classes(conn: &Connection, env: &ExportEnvelope) -> Result<ImportRe
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 record.agent_id,
-                i64::try_from(record.epoch).context("lineage epoch exceeds i64")?,
+                i64::try_from(record.epoch).context("import: agent_lineage epoch exceeds i64")?,
                 record.reason.as_str(),
                 record.predecessor_pubkey_b64,
                 record.successor_pubkey_b64,
@@ -509,7 +509,8 @@ mod tests {
         let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
         // Tamper an INTERIOR row's payload_hash: the next row's `prev_hash` was
         // computed over the ORIGINAL bytes, so the imported chain no longer links.
-        env.signed_events[1].payload_hash = vec![0xba, 0xad];
+        env.signed_events[1].payload_hash =
+            crate::portability::hex_bytes::HexBytes(vec![0xba, 0xad]);
 
         let dst = fresh_conn("tamper-dst-");
         let err = import_full_envelope(&dst, &env).expect_err("tampered bundle must be rejected");

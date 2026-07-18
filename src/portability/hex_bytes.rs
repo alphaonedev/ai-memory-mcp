@@ -17,13 +17,21 @@
 //! class (a per-field ad-hoc attribute would risk an export-hex / import-number
 //! asymmetry that silently corrupts the round-trip).
 //!
+//! ## The [`HexBytes`] newtype (one type, no scattered `with = …` attribute)
+//!
+//! Every byte field on the export DTOs is a [`HexBytes`] (required) or an
+//! `Option<HexBytes>` (present-only). The newtype OWNS its hex `Serialize` /
+//! `Deserialize` impls, so a DTO field never repeats a
+//! `#[serde(with = "…hex_bytes…")]` path literal — the encoding lives in exactly
+//! one place and both directions are symmetric by construction.
+//!
 //! ## `None` vs `Some(empty)` (the present-only cliff)
 //!
-//! Several byte fields are `Option<Vec<u8>>` and PRESENT-ONLY: a `signed_events`
+//! Several byte fields are `Option<HexBytes>` and PRESENT-ONLY: a `signed_events`
 //! row on the unsigned daemon has `signature = None`; the v73 `cause_hash` is
 //! `None` for an unbound cause and contributes ZERO bytes to the chain-hash
 //! fold. Conflating `None` with `Some(empty)` would break both the chain
-//! recompute and the per-row signature check, so the [`optional`] codec maps
+//! recompute and the per-row signature check, so an `Option<HexBytes>` field maps
 //! `None` ⇒ absent (omitted) and `Some(v)` ⇒ a hex string (`Some(empty)` ⇒
 //! `""`), never the same wire shape — pair it with
 //! `#[serde(default, skip_serializing_if = "Option::is_none")]`.
@@ -89,60 +97,41 @@ impl std::fmt::Display for HexDecodeError {
 
 impl std::error::Error for HexDecodeError {}
 
-/// `#[serde(with = "…")]` module for a REQUIRED `Vec<u8>` field ⇄ hex string.
-pub mod required {
-    use serde::{Deserialize, Deserializer, Serializer};
+/// A `Vec<u8>` byte field that serializes as a lowercase-hex STRING (never
+/// serde's default JSON number array), so the signed record classes cross the
+/// export envelope byte-preserved. The newtype owns its own `Serialize` /
+/// `Deserialize`, so a DTO field carries NO `#[serde(with = …)]` path literal.
+///
+/// Use `HexBytes` for a REQUIRED byte field and `Option<HexBytes>` (paired with
+/// `#[serde(default, skip_serializing_if = "Option::is_none")]`) for a
+/// PRESENT-ONLY one: `None` ⇒ the field is OMITTED (absent ⇒ `None` on read);
+/// `Some(HexBytes(v))` ⇒ a hex string, so `Some(HexBytes(empty))` ⇒ `""` and is
+/// NEVER conflated with `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HexBytes(pub Vec<u8>);
 
-    /// Serialize `bytes` as a lowercase-hex string.
-    ///
-    /// # Errors
-    /// Propagates the serializer's error.
-    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&super::encode(bytes))
-    }
-
-    /// Deserialize a hex string back to bytes.
-    ///
-    /// # Errors
-    /// The value is not a string, or not valid hex.
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        super::decode(&s).map_err(serde::de::Error::custom)
+impl From<Vec<u8>> for HexBytes {
+    fn from(v: Vec<u8>) -> Self {
+        Self(v)
     }
 }
 
-/// `#[serde(with = "…")]` module for an OPTIONAL `Option<Vec<u8>>` field.
-///
-/// Pair with `#[serde(default, skip_serializing_if = "Option::is_none")]`:
-/// `None` ⇒ the field is OMITTED (absent ⇒ `None` on read); `Some(v)` ⇒ a hex
-/// string, so `Some(empty)` ⇒ `""` and is NEVER conflated with `None`.
-pub mod optional {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    /// Serialize `Some(bytes)` as a hex string, `None` as null.
-    ///
-    /// # Errors
-    /// Propagates the serializer's error.
-    pub fn serialize<S: Serializer>(
-        opt: &Option<Vec<u8>>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        match opt {
-            Some(bytes) => serializer.serialize_some(&super::encode(bytes)),
-            None => serializer.serialize_none(),
-        }
+impl From<HexBytes> for Vec<u8> {
+    fn from(h: HexBytes) -> Self {
+        h.0
     }
+}
 
-    /// Deserialize an optional hex string back to `Option<Vec<u8>>`.
-    ///
-    /// # Errors
-    /// A present value is not a string, or not valid hex.
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<Vec<u8>>, D::Error> {
-        let opt = Option::<String>::deserialize(deserializer)?;
-        opt.map(|s| super::decode(&s).map_err(serde::de::Error::custom))
-            .transpose()
+impl serde::Serialize for HexBytes {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&encode(&self.0))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for HexBytes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = <String as serde::Deserialize>::deserialize(deserializer)?;
+        decode(&s).map(HexBytes).map_err(serde::de::Error::custom)
     }
 }
 
@@ -184,31 +173,31 @@ mod tests {
         assert_eq!(decode("DEADBEEF").unwrap(), vec![0xde, 0xad, 0xbe, 0xef]);
     }
 
-    // The load-bearing property: the `required` + `optional` codecs are
-    // symmetric AND distinguish None / Some(empty) / Some(bytes) through a
-    // real serde round-trip on a struct that mirrors the export-DTO shape.
+    // The load-bearing property: the `HexBytes` newtype (required) + an
+    // `Option<HexBytes>` (present-only) are symmetric AND distinguish None /
+    // Some(empty) / Some(bytes) through a real serde round-trip on a struct that
+    // mirrors the export-DTO shape.
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     struct Sample {
-        #[serde(with = "required")]
-        head: Vec<u8>,
-        #[serde(default, skip_serializing_if = "Option::is_none", with = "optional")]
-        sig: Option<Vec<u8>>,
+        head: HexBytes,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sig: Option<HexBytes>,
     }
 
     #[test]
-    fn serde_with_modules_round_trip_and_preserve_bytes() {
+    fn newtype_round_trips_and_preserves_bytes() {
         for sample in [
             Sample {
-                head: vec![0x01, 0x02, 0x03],
-                sig: Some(vec![0xaa, 0xbb]),
+                head: HexBytes(vec![0x01, 0x02, 0x03]),
+                sig: Some(HexBytes(vec![0xaa, 0xbb])),
             },
             Sample {
-                head: vec![0xff; 32],
+                head: HexBytes(vec![0xff; 32]),
                 sig: None,
             },
             Sample {
-                head: vec![],
-                sig: Some(vec![]),
+                head: HexBytes(vec![]),
+                sig: Some(HexBytes(vec![])),
             },
         ] {
             let json = serde_json::to_string(&sample).expect("serialize");
@@ -225,12 +214,12 @@ mod tests {
     #[test]
     fn none_and_some_empty_are_distinct_on_the_wire() {
         let none = Sample {
-            head: vec![0x00],
+            head: HexBytes(vec![0x00]),
             sig: None,
         };
         let some_empty = Sample {
-            head: vec![0x00],
-            sig: Some(vec![]),
+            head: HexBytes(vec![0x00]),
+            sig: Some(HexBytes(vec![])),
         };
         let none_json = serde_json::to_string(&none).unwrap();
         let some_empty_json = serde_json::to_string(&some_empty).unwrap();
@@ -252,7 +241,7 @@ mod tests {
             serde_json::from_str::<Sample>(&some_empty_json)
                 .unwrap()
                 .sig,
-            Some(vec![])
+            Some(HexBytes(vec![]))
         );
     }
 }
