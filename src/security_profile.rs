@@ -339,11 +339,20 @@ pub fn enforce_at_boot() -> Result<(SecurityPosture, Vec<PinReport>)> {
 mod tests {
     use super::*;
 
-    /// Process-wide guard: these tests mutate `AI_MEMORY_*` env vars, which
-    /// races with any other test that reads them. Serialise them.
-    fn env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    /// Serialize env mutations against every other `AI_MEMORY_*`-mutating
+    /// test in the crate, not just this module's own tests (#2159, residual
+    /// of the #1998→#2115→#2127 env-isolation class). A module-local mutex
+    /// only covers this module's own `--test-threads>1` races; it still
+    /// races the shared `test_env_lock` cohort in `src/embeddings.rs` /
+    /// `src/reranker.rs` / `src/config.rs` / `src/cli/commands/config.rs` /
+    /// `src/cli/rules.rs` / `src/recover/transcript_paths.rs`, so this
+    /// delegates to the single crate-canonical
+    /// [`crate::config::test_env_lock`]. Every knob this module pins
+    /// (including `AI_MEMORY_REQUIRE_ROLLBACK_CHECK`) is a process-global
+    /// env var a concurrently-running test elsewhere in the `--lib` binary
+    /// (e.g. `routines::tests`) can observe mid-mutation without this.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::config::test_env_lock()
     }
 
     /// Clear every knob env var + the profile selector so a test starts
@@ -357,6 +366,22 @@ mod tests {
             for (env, _) in pinned_knobs() {
                 std::env::remove_var(env);
             }
+        }
+    }
+
+    /// RAII guard: on drop, clears every knob + the profile selector.
+    /// Installed immediately after the entry-state `clear_all()` in every
+    /// test below so a mid-test panic (an `assert!`/`unwrap()` failure)
+    /// still restores the baseline instead of leaking a pinned knob (e.g.
+    /// `AI_MEMORY_REQUIRE_ROLLBACK_CHECK=1`) into whatever test runs next
+    /// in the same `--lib` process (#2159). Must be declared AFTER the
+    /// `env_lock()` guard in each test so it drops (and clears) BEFORE the
+    /// lock releases.
+    struct KnobsGuard;
+    impl Drop for KnobsGuard {
+        fn drop(&mut self) {
+            // SAFETY: constructed only while the caller holds `env_lock()`.
+            unsafe { clear_all() };
         }
     }
 
@@ -383,8 +408,9 @@ mod tests {
 
     #[test]
     fn standard_posture_is_a_noop() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe { clear_all() };
+        let _cleanup = KnobsGuard;
         let (posture, reports) = enforce_at_boot().unwrap();
         assert_eq!(posture, SecurityPosture::Standard);
         assert!(reports.is_empty(), "standard posture must pin nothing");
@@ -392,14 +418,16 @@ mod tests {
         for (env, _) in pinned_knobs() {
             assert!(std::env::var(env).is_err(), "{env} must remain unset");
         }
-        unsafe { clear_all() };
     }
 
     #[test]
     fn asi_hard_pins_every_unset_knob() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe {
             clear_all();
+        }
+        let _cleanup = KnobsGuard;
+        unsafe {
             std::env::set_var(ENV_SECURITY_PROFILE, "asi-hard");
         }
         let (posture, reports) = enforce_at_boot().unwrap();
@@ -419,14 +447,16 @@ mod tests {
             "asi-hard must pin PRAGMA synchronous to FULL"
         );
         assert!(is_asi_hard());
-        unsafe { clear_all() };
     }
 
     #[test]
     fn asi_hard_accepts_already_compliant_values() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe {
             clear_all();
+        }
+        let _cleanup = KnobsGuard;
+        unsafe {
             std::env::set_var(ENV_SECURITY_PROFILE, "asi-hard");
             // Operator already set the hard value (and a STRONGER one for
             // synchronous) — must be accepted, not refused.
@@ -446,14 +476,16 @@ mod tests {
         assert_eq!(sync.action, PinAction::AlreadyCompliant);
         // EXTRA (stronger than FULL) is preserved, not overwritten.
         assert_eq!(std::env::var("AI_MEMORY_DB_SYNCHRONOUS").unwrap(), "EXTRA");
-        unsafe { clear_all() };
     }
 
     #[test]
     fn asi_hard_refuses_a_loosening_override() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe {
             clear_all();
+        }
+        let _cleanup = KnobsGuard;
+        unsafe {
             std::env::set_var(ENV_SECURITY_PROFILE, "asi-hard");
             // Attempt to DISABLE the credential screen under asi-hard.
             std::env::set_var("AI_MEMORY_SECRET_SCREEN_MODE", "off");
@@ -464,20 +496,21 @@ mod tests {
             msg.contains("asi-hard") && msg.contains("AI_MEMORY_SECRET_SCREEN_MODE"),
             "refusal must name the posture + knob: {msg}"
         );
-        unsafe { clear_all() };
     }
 
     #[test]
     fn asi_hard_refuses_a_falsy_boolean_override() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         unsafe {
             clear_all();
+        }
+        let _cleanup = KnobsGuard;
+        unsafe {
             std::env::set_var(ENV_SECURITY_PROFILE, "asi-hard");
             std::env::set_var("AI_MEMORY_REQUIRE_WITNESS", "0");
         }
         let err = enforce_at_boot().unwrap_err();
         assert!(format!("{err}").contains("AI_MEMORY_REQUIRE_WITNESS"));
-        unsafe { clear_all() };
     }
 
     #[test]
