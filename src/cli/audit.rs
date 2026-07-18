@@ -187,12 +187,23 @@ fn run_re_anchor(
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
     use anyhow::Context;
-    let db_path = app_config.effective_db(std::path::Path::new("ai-memory.db"));
+    let db_path = app_config.effective_db(std::path::Path::new(crate::daemon_runtime::DEFAULT_DB));
     let conn = crate::db::open(&db_path)
         .with_context(|| format!("audit re-anchor: open db at {}", db_path.display()))?;
     let Some(cp) =
         crate::signed_events::emit_reanchor_ceremony(&conn).context("emit re-anchor ceremony")?
     else {
+        // Opt-in no-op (no enrolled witness signing key, or an empty chain).
+        // The disposition is still made EXPLICIT on stdout in JSON mode — an
+        // automation invoking `--json` must never have to distinguish
+        // "skipped" from "crashed before printing" by an empty stdout.
+        if args.json {
+            let obj = serde_json::json!({
+                "status": "skipped",
+                "reason": "no_witness_key_or_empty_chain",
+            });
+            writeln!(out.stdout, "{obj}")?;
+        }
         writeln!(
             out.stderr,
             "re-anchor: no ceremony emitted — enrol an audit-witness signing key \
@@ -223,7 +234,7 @@ fn run_re_anchor(
     if args.json {
         let mut obj = serde_json::json!({
             "status": if exit == 0 { "ok" } else { "verify_failed" },
-            "checkpoint_id": cp.id,
+            crate::cli::JSON_KEY_CHECKPOINT_ID: cp.id,
             "namespace": cp.namespace,
             "verified": matches!(readback, ReadBack::Pass),
             "readback": readback.machine_tag(),
@@ -260,6 +271,13 @@ fn run_re_anchor(
 /// Three-state disposition of the `audit re-anchor` self-verify read-back.
 /// Distinguishes a genuine K1 PASS, an absent enrolled pubkey (nothing to pin
 /// against — not a failure), and an actual verify FAILURE (fail-closed, exit 1).
+///
+/// `NoPin` is DEFENSIVE in the current shared-custody layout: an emitted
+/// ceremony implies `keypair::load` succeeded, which requires the same
+/// `<label>.pub` the pubkey fallback reads, so post-emit the pin always
+/// resolves (env or file). The variant is kept fail-safe against a future
+/// divergence of the two loaders (e.g. a PQ key in separate custody) — if it
+/// ever fires, the operator sees "unverified", never a silent `ok`.
 enum ReadBack {
     Pass,
     NoPin,
@@ -289,7 +307,7 @@ fn run_restore_attest(
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
     use anyhow::{Context, bail};
-    let db_path = app_config.effective_db(std::path::Path::new("ai-memory.db"));
+    let db_path = app_config.effective_db(std::path::Path::new(crate::daemon_runtime::DEFAULT_DB));
     let conn = crate::db::open(&db_path)
         .with_context(|| format!("audit restore-attest: open db at {}", db_path.display()))?;
     let db_head: i64 = conn
@@ -367,7 +385,7 @@ fn run_restore_attest(
 
 /// v0.6.4-009 — print rows from the `audit_log` SQLite table.
 fn run_show(args: &ShowArgs, app_config: &AppConfig, out: &mut CliOutput<'_>) -> Result<i32> {
-    let db_path = app_config.effective_db(std::path::Path::new("ai-memory.db"));
+    let db_path = app_config.effective_db(std::path::Path::new(crate::daemon_runtime::DEFAULT_DB));
     let conn = crate::db::open(&db_path)?;
     let rows = crate::db::list_capability_expansions(&conn, args.limit, args.agent_id.as_deref())?;
     if args.json {
@@ -1863,8 +1881,16 @@ mod reanchor_ceremony_2004_cli_tests {
         clear_witness_env();
     }
 
+    /// Removing the custody `.pub` disables the SIGNING-key load itself
+    /// (`keypair::load` reads the `.pub` first), so the ceremony is an
+    /// explicit opt-in NO-OP — never a half-emitted anchor with nothing to
+    /// pin against. The `--json` disposition must still be machine-readable
+    /// (an explicit `skipped`, never an empty stdout), and the stderr
+    /// guidance must name the enrolment lever. This is also why
+    /// `ReadBack::NoPin` is defensive-unreachable post-emit: any emitted
+    /// ceremony implies a loadable `.pub`, which the K1 fallback pin reads.
     #[test]
-    fn re_anchor_no_enrolled_pubkey_is_no_pin_not_fail() {
+    fn re_anchor_missing_custody_pub_is_explicit_skip_not_fail() {
         let _g = crate::identity::keypair::key_dir_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1872,8 +1898,9 @@ mod reanchor_ceremony_2004_cli_tests {
         let mut env = TestEnv::fresh();
         append_rows(&env.db_path, 2);
         let kdir = tempfile::tempdir().expect("kdir");
-        // Enrol a signing key (so the ceremony emits) but leave the K1 pubkey
-        // env UNSET and remove the custody `.pub` so nothing is pinnable.
+        // Enrol custody, then remove the `.pub`: the signer load now fails,
+        // so NO ceremony emits (fail-safe — nothing is persisted that a
+        // verifier could not K1-check).
         let _signer = enrol_signing_key(kdir.path());
         std::fs::remove_file(
             kdir.path()
@@ -1885,12 +1912,32 @@ mod reanchor_ceremony_2004_cli_tests {
             let mut out = env.output();
             run_re_anchor(&ReAnchorArgs { json: true }, &cfg, &mut out).expect("run")
         };
-        assert_eq!(code, 0, "no-pin is not a failure: {}", env.stdout_str());
+        assert_eq!(
+            code,
+            0,
+            "opt-in no-op is not a failure: {}",
+            env.stdout_str()
+        );
         let v: serde_json::Value =
             serde_json::from_str(env.stdout_str().trim()).expect("json summary");
-        assert_eq!(v["status"], "ok");
-        assert_eq!(v["verified"], false);
-        assert_eq!(v["readback"], "no_enrolled_pubkey");
+        assert_eq!(v["status"], "skipped");
+        assert_eq!(v["reason"], "no_witness_key_or_empty_chain");
+        assert!(
+            env.stderr_str().contains("AI_MEMORY_WITNESS_KEY_DIR"),
+            "stderr must name the enrolment lever: {}",
+            env.stderr_str()
+        );
+        // No checkpoint was persisted — the checkpoints table has no
+        // re-anchor row (fail-safe: skipped means SKIPPED).
+        let conn = crate::db::open(&env.db_path).expect("open db");
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM checkpoints WHERE condition_type = ?1",
+                [crate::models::ConditionType::ReAnchor.as_str()],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(n, 0, "no anchor may persist when the ceremony skipped");
         clear_witness_env();
     }
 }
