@@ -36,6 +36,57 @@
 
 ---
 
+## Final Verdict Table — 7/7 (maximal truth)
+
+> **Read this table first.** It is the clean SSOT after **21 executed** adversarial agents + CodeGraph. Detail and ballots follow below.
+
+### A. Aggregate claim
+
+| Question | Maximal-truth answer | Panel basis |
+|----------|----------------------|-------------|
+| **Do all 7 north-star properties exist in shipped code *today*?** | **YES — 7/7 in kind** | 20/21 agents; Wave 3: 0 clean kills of “criteria missing” |
+| **Is every default install max-strength on all 7?** | **NO** | 16× `7/7_CONDITIONAL`; B1 zero-config path |
+| **Can hardened + capture-disciplined deploy approach max under these 7 words?** | **YES** | B2 (capture discipline) + B3 (asi-hard / enrolled keys) |
+| **Is “7/7 right now” a lie (properties absent)?** | **NO** | Only A2 rejects (continuity *completeness*, not total absence of store/recover) |
+| **Is “7/7 right now” an over-claim if read as absolute always-on perfection?** | **YES** | Majority CONDITIONAL |
+| **Is the north-star objective aligned with the product?** | **YES** | Moonshot + ROADMAP + Executive Brief + code |
+| **Harder “perfect constitution” checklists (e.g. Fable 27-req) complete?** | **Out of band** | Different standard; not this 7-point star |
+
+**One-line aggregate:**  
+**7/7 present as capability. 3/7 unconditional YES. 4/7 YES_COND (posture). 0/7 missing.**
+
+### B. Per-criterion final verdict
+
+| # | North-star criterion | Final status | In kind *right now*? | Max strength needs | Maximal-truth one-liner |
+|---|----------------------|--------------|----------------------|--------------------|-------------------------|
+| **1** | Endpoint-resident | **YES** | **Yes** | — | Local-first process on operator hardware; not lab-cloud-required |
+| **2** | Continuity | **YES_COND** | **Yes** (machinery) | Store-first + capture_turn + recover; L3 still deferred | Session death / model swap survivable **if** the vault was written |
+| **3** | Integrity | **YES_COND** | **Yes** (machinery) | Enrolled keys; attested writes; fail-closed federation where required | History hard to quietly rewrite; strength scales with crypto posture |
+| **4** | Multi-vendor | **YES** | **Yes** | — | Not married at API/config; Ollama default is a dial, not a lock |
+| **5** | Multi-agent | **YES_COND** | **Yes** (machinery) | Signed handoffs; enrollment; use of actions/leases/signals/checkpoints | Fleet physics shipped; local “proof” often claimed until hardened |
+| **6** | Sovereign | **YES_COND** | **Yes** (deployable) | Private bind + api_key; inference egress deny/loopback when air-gapped | Org-owned / air-gap **capable**; not automatic if cognition still hits public LLMs |
+| **7** | Honest scope | **YES** | **Yes** | Keep public claims bound to brief + ROADMAP §1/§2.3/§4 | Vault + notary + rulebook — not the brain, not an ASI kill switch |
+
+### C. How to say it in public (clean language)
+
+| Say this | Don’t say this |
+|----------|----------------|
+| “ai-memory’s seven-point north star is **shipped as product capability** — endpoint memory with continuity, integrity, multi-vendor, multi-agent, sovereignty, and honest scope.” | “Every install is max-strength perfect on all seven with zero config.” |
+| “Four of seven **harden with operator posture** (capture, keys, federation, egress).” | “We are the ASI kill switch / the brain / default chat memory for everyone.” |
+| “Remaining work **deepens** the star (defaults, packaging, L3 capture, local actor crypto) — it does **not** invent the category.” | “7/7 is future tense only.” |
+
+### D. Panel ballot snapshot
+
+| Ballot | Count | Share |
+|--------|------:|------:|
+| `7/7_YES` | 4 | 19% |
+| `7/7_CONDITIONAL` | 16 | 76% |
+| `NOT_7/7` | 1 | 5% |
+
+**Majority verdict:** **7/7_CONDITIONAL** (presence yes; max strength posture-dependent).
+
+---
+
 ## 1. Execution ledger (proof of multi-agent run)
 
 | Wave | Lens | subagent_id (prefix) | Tool calls | Duration | VOTE |
@@ -202,11 +253,27 @@
 
 ## 7. Final verdict (orchestrator, after 21 agents)
 
-1. **As capability delivery of the seven-point north star: TRUE — 7/7 in kind** (panel majority + wave-3 zero clean kills).  
+> **Canonical clean table:** see **[Final Verdict Table — 7/7](#final-verdict-table--77-maximal-truth)** at the top of this document (sections A–D).
+
+### 7.1 Five true sentences
+
+1. **As capability delivery of the seven-point north star: TRUE — 7/7 in kind** (panel majority + wave-3 zero clean kills of “criteria missing”).  
 2. **As “every dial maxed on every default install”: FALSE.**  
 3. **As “the objective is aligned and present-tense real”: TRUE.**  
 4. **As contradiction of harder perfect-constitution checklists: FALSE** — different standard.  
 5. **Method honesty:** this revision used **21 real explore subagents** with CodeGraph/code evidence; prior single-author lens draft is superseded.
+
+### 7.2 Compact final verdict (repeat SSOT)
+
+| Dimension | Verdict |
+|-----------|---------|
+| **7/7 in kind** | **PASS** |
+| **7/7 max default install** | **FAIL** (expected; not the claim) |
+| **7/7 hardened path** | **PASS under seven’s wording** |
+| **Missing criteria** | **0** |
+| **Unconditional YES** | **1, 4, 7** |
+| **Conditional YES** | **2, 3, 5, 6** |
+| **Panel majority ballot** | **7/7_CONDITIONAL** |
 
 **Penultimate line for the biologic operator:**
 
@@ -228,7 +295,8 @@
 | Date | Change |
 |------|--------|
 | 2026-07-18 | v1: initial doc (later admitted: single-author multi-lens, CodeGraph real) |
-| 2026-07-18 | **v2 (this file):** **21 executed explore subagents** (3 waves × 7), CodeGraph/code evidence, full ledger of subagent_ids + votes; supersedes method of v1 |
+| 2026-07-18 | **v2:** **21 executed explore subagents** (3 waves × 7), CodeGraph/code evidence, full ledger of subagent_ids + votes; supersedes method of v1 |
+| 2026-07-18 | **v3:** Add **Final Verdict Table — 7/7 (maximal truth)** (aggregate + per-criterion + public language + ballot snapshot) for clean communication |
 
 ---
 
