@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Direct-API SDK shims — Anthropic + OpenAI, Python + TypeScript** ([#1390](https://github.com/alphaonedev/ai-memory-mcp/issues/1390), 2×5-agent vote `4d3ea1c5` / verdicts `ba769de5`). Four thin wrapper packages under `clients/` for callers who use a vendor SDK directly in their own scripts (no host harness writing a recoverable transcript, so #1389 recovery-on-boot cannot reach them). Each wraps the caller's client and records every turn to ai-memory via `memory_capture_turn` (MCP stdio, RFC-0001) before returning the response:
+  - `clients/anthropic-shim-py` → PyPI `ai-memory-anthropic-shim` (wraps `messages.create`); `clients/openai-shim-py` → PyPI `ai-memory-openai-shim` (wraps `chat.completions.create`).
+  - `clients/anthropic-shim-ts` → npm `@alphaone/ai-memory-anthropic-shim`; `clients/openai-shim-ts` → npm `@alphaone/ai-memory-openai-shim`.
+  - **Non-wedging (fail-open on the capture lane, never on the caller's call).** Capture + extraction are fully guarded: a substrate failure or an unexpected response shape emits a stderr WARN and returns the vendor response **unchanged**, never propagating into the caller's `create()`. Args + response are forwarded verbatim (pass-through / opaque), so the GA contract is not coupled to SDK internals. `stream=True` records the request turn only and passes the stream through untouched. `anthropic` / `openai` (`@anthropic-ai/sdk` / `openai`) are **optional peer deps** — the shim duck-types the passed client and never imports the vendor SDK.
+  - **Publish is operator-gated.** A `workflow_dispatch`-only workflow (`.github/workflows/publish-sdk-shims.yml`, no tag trigger) publishes each package behind a protected GitHub Environment (PyPI OIDC Trusted Publishing; npm `--provenance --access public`); the literal publish act requires operator registry credentials.
+
 ### Changed
 
 - **`ai-memory export` de-silenced: it is a convenience view, not the portability path** ([#1944](https://github.com/alphaonedev/ai-memory-mcp/issues/1944), B_WARN de-silencing, 2×5-agent vote `woaiwndla` / `4d3ea1c5`). The JSON `ai-memory export` command (and its HTTP sibling `GET`-admin export) emits `{memories, links, count, exported_at}` — a **memories + links CONVENIENCE view** that silently omitted the substrate's tamper-evidence + governance spine (governance rules, the append-only revision log, forget tombstones, derivation lineage, per-write attestations, the signed-events audit chain). It now announces that scope instead of dropping it silently:

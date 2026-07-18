@@ -1,0 +1,150 @@
+name: publish-sdk-shims
+
+# Manual-only publish for the four Direct-API SDK shim packages (issue #1390):
+#   PyPI: ai-memory-anthropic-shim, ai-memory-openai-shim
+#   npm:  @alphaone/ai-memory-anthropic-shim, @alphaone/ai-memory-openai-shim
+#
+# Auth mirrors publish-sdks.yml:
+# - PyPI: pypa/gh-action-pypi-publish via OIDC Trusted Publishing (`id-token:
+#   write`, no long-lived token). Each PyPI project must have a Trusted
+#   Publisher configured pointing at this workflow file + the `pypi-publish`
+#   environment.
+# - npm: `npm publish --provenance --access public` with `id-token: write`
+#   plus an automation token (`secrets.NPM_TOKEN`) scoped to the `npm-publish`
+#   environment.
+#
+# Every job runs inside a protected GitHub Environment so a maintainer must
+# approve each publish. There is DELIBERATELY no `push:`/tag trigger — the
+# operator dispatches this manually with the registry credentials in place.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Which shim package(s) to publish"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - pypi
+          - npm
+          - anthropic-shim-py
+          - openai-shim-py
+          - anthropic-shim-ts
+          - openai-shim-ts
+
+permissions: {}
+
+jobs:
+  publish-anthropic-shim-py:
+    if: ${{ github.event.inputs.target == 'all' || github.event.inputs.target == 'pypi' || github.event.inputs.target == 'anthropic-shim-py' }}
+    name: publish ai-memory-anthropic-shim to PyPI
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-publish
+      url: https://pypi.org/project/ai-memory-anthropic-shim/
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: build wheel + sdist
+        working-directory: clients/anthropic-shim-py
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+      - name: publish via PyPI Trusted Publisher (OIDC)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: clients/anthropic-shim-py/dist
+          print-hash: true
+          # Re-runs must not fail when the version is already on PyPI —
+          # the upload is idempotent, not an error.
+          skip-existing: true
+
+  publish-openai-shim-py:
+    if: ${{ github.event.inputs.target == 'all' || github.event.inputs.target == 'pypi' || github.event.inputs.target == 'openai-shim-py' }}
+    name: publish ai-memory-openai-shim to PyPI
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-publish
+      url: https://pypi.org/project/ai-memory-openai-shim/
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: build wheel + sdist
+        working-directory: clients/openai-shim-py
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+      - name: publish via PyPI Trusted Publisher (OIDC)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: clients/openai-shim-py/dist
+          print-hash: true
+          skip-existing: true
+
+  publish-anthropic-shim-ts:
+    if: ${{ github.event.inputs.target == 'all' || github.event.inputs.target == 'npm' || github.event.inputs.target == 'anthropic-shim-ts' }}
+    name: publish @alphaone/ai-memory-anthropic-shim to npm
+    runs-on: ubuntu-latest
+    environment:
+      name: npm-publish
+      url: https://www.npmjs.com/package/@alphaone/ai-memory-anthropic-shim
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org/"
+      - name: install + build
+        working-directory: clients/anthropic-shim-ts
+        run: |
+          npm ci
+          npm run build
+      # Auth via the npm automation token (env-scoped secret on the
+      # npm-publish environment). id-token:write still enables --provenance.
+      - name: publish to npm (token auth + provenance)
+        working-directory: clients/anthropic-shim-ts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public
+
+  publish-openai-shim-ts:
+    if: ${{ github.event.inputs.target == 'all' || github.event.inputs.target == 'npm' || github.event.inputs.target == 'openai-shim-ts' }}
+    name: publish @alphaone/ai-memory-openai-shim to npm
+    runs-on: ubuntu-latest
+    environment:
+      name: npm-publish
+      url: https://www.npmjs.com/package/@alphaone/ai-memory-openai-shim
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org/"
+      - name: install + build
+        working-directory: clients/openai-shim-ts
+        run: |
+          npm ci
+          npm run build
+      - name: publish to npm (token auth + provenance)
+        working-directory: clients/openai-shim-ts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public
