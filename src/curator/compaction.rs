@@ -197,17 +197,26 @@ impl<'a> ConsolidationPass<'a> {
     /// Each cluster element is a `MemoryId` (the memory's `id` field).
     async fn cluster(&self, memories: &[Memory]) -> Vec<Vec<MemoryId>> {
         let mut embeddings: Vec<Option<Vec<f32>>> = Vec::with_capacity(memories.len());
+        // v1.0.0 #2167 (#2181) — carry each row's `embedding_space`
+        // provenance alongside its vector so a cross-space pair is never
+        // clustered/merged as a near-duplicate.
+        let mut spaces: Vec<Option<String>> = Vec::with_capacity(memories.len());
         for m in memories {
             // Best-effort: a fetch error degrades that row to "no embedding"
             // (which, per #1774, blocks the merge for its pairs), never aborts
             // the sweep.
-            let emb = self
+            let fetched = self
                 .store
-                .get_embedding(&self.ctx, &m.id)
+                .get_embedding_with_space(&self.ctx, &m.id)
                 .await
                 .ok()
                 .flatten();
+            let (emb, space) = match fetched {
+                Some((v, s)) => (Some(v), s),
+                None => (None, None),
+            };
             embeddings.push(emb);
+            spaces.push(space);
         }
         // #1750 — use the operator-resolved cosine gate (defaults to the
         // autonomy-matched 0.75); the Jaccard pre-filter + max_cluster_size keep
@@ -216,7 +225,7 @@ impl<'a> ConsolidationPass<'a> {
             cosine_threshold: f64::from(self.cosine_threshold),
             ..ConsolidationClustering::new()
         }
-        .cluster_memories(memories, &embeddings)
+        .cluster_memories(memories, &embeddings, &spaces)
     }
 
     /// A cluster is eligible when it has ≥ 2 members, all share the same

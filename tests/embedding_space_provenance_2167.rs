@@ -19,6 +19,12 @@ use ai_memory::embeddings::embedding_space_fingerprint;
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use serde_json::json;
 
+/// Serialises the tests that flip the process-wide strict
+/// embed-model-match flag (`set_strict_embed_model_match_for_test`) so a
+/// concurrent test never observes another's mid-test strict window (the
+/// flag is a process-global atomic). #2182.
+static STRICT_FLAG_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // ---------------------------------------------------------------------------
 // pg `<=>` site-count PIN (§3.4/§9) — every postgres query that consumes the
 // pgvector cosine operator MUST carry the `embedding_space` gate, so a future
@@ -363,6 +369,7 @@ fn adoption_e_g1_strict_disables_adoption() {
     );
     null_out_space(&conn, &nid);
 
+    let _strict = STRICT_FLAG_GUARD.lock().unwrap();
     ai_memory::hnsw::set_strict_embed_model_match_for_test(Some(true));
     db::embedding_space_boot_maintenance(&conn, &active, 4);
     ai_memory::hnsw::set_strict_embed_model_match_for_test(None);
@@ -590,4 +597,241 @@ fn t_restore_none_active_keeps_stamped_drops_unverified() {
         "None-active: an unverifiable NULL-space vector is still NULLed"
     );
     assert!(l_space.is_none());
+}
+
+// ===========================================================================
+// #2182 — spec §10 test-gap closures. Each is NON-VACUOUS (would FAIL on
+// pre-#2167 code, where the HNSW path trusted `hit.distance`,
+// `get_all_embeddings` was space-blind, and no strict/space column existed).
+// ===========================================================================
+
+/// [`recall`] but routed through an explicit in-memory HNSW index (the
+/// §3.3 layer-3 defensive post-filter path), so a deliberately POISONED
+/// index can be proven never to leak a foreign / vanished vector into the
+/// scored set.
+#[allow(clippy::too_many_arguments)]
+fn recall_with_index(
+    conn: &rusqlite::Connection,
+    context: &str,
+    query_emb: &[f32],
+    active: Option<&str>,
+    index: &dyn ai_memory::hnsw::VectorSearchIndex,
+) -> (Vec<(Memory, f64)>, ai_memory::models::RecallTelemetry) {
+    let scoring = ai_memory::config::ResolvedScoring::default();
+    let (results, _outcome, telemetry) = db::recall_hybrid_with_telemetry(
+        conn,
+        context,
+        query_emb,
+        Some("test"),
+        50,
+        None,
+        None,
+        None,
+        Some(index), // #2182 — HNSW-routed semantic path (not linear scan)
+        ai_memory::SECS_PER_HOUR,
+        ai_memory::SECS_PER_DAY,
+        None,
+        None,
+        &scoring,
+        false,
+        None,
+        None,
+        active,
+    )
+    .expect("recall_hybrid_with_telemetry (indexed)");
+    (results, telemetry)
+}
+
+// ---------------------------------------------------------------------------
+// T-INV via the HNSW-recompute path with a POISONED index (§3.3 layer 3 +
+// the deleted #1692 None-arm). A foreign-space vector force-inserted into
+// the graph is NEVER scored on `hit.distance`; an index hit whose row-side
+// vector has since vanished is excluded, never trusted.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t_inv_hnsw_poisoned_index_never_scores_foreign_or_gone_row_2182() {
+    let (conn, _p) = fresh_db();
+    let active = embedding_space_fingerprint("nomic-embed-text");
+    let foreign = embedding_space_fingerprint("granite-embedding"); // same dim, other space
+    assert_ne!(active, foreign);
+    let qe = [1.0_f32, 0.0, 0.0, 0.0];
+
+    // Two legitimate active-space rows (cosine 1.0 → the ONLY scorable set).
+    let a1 = seed_embedded(&conn, "active idx one", &qe, &active);
+    let a2 = seed_embedded(&conn, "active idx two", &qe, &active);
+    // A foreign-space row with an IDENTICAL vector — its HNSW distance is a
+    // perfect ~0 (would rank #1 on `hit.distance`), so only the row-side
+    // space post-filter can exclude it. This is the poison.
+    let f1 = seed_embedded(&conn, "foreign idx poison", &qe, &foreign);
+    // An active-space row whose vector we DELETE after the index is built —
+    // an index hit whose row-side vector is gone (the #1692 None-arm).
+    let g1 = seed_embedded(&conn, "gone idx row", &qe, &active);
+
+    // Build the index over ALL FOUR ids (the foreign + soon-gone rows are
+    // deliberately present — a poisoned graph).
+    let idx = ai_memory::hnsw::VectorIndex::build(vec![
+        (a1.clone(), qe.to_vec()),
+        (a2.clone(), qe.to_vec()),
+        (f1.clone(), qe.to_vec()),
+        (g1.clone(), qe.to_vec()),
+    ]);
+    // Now vanish g1's row-side vector (index still holds its id).
+    conn.execute(
+        "UPDATE memories SET embedding = NULL WHERE id = ?1",
+        rusqlite::params![g1],
+    )
+    .unwrap();
+
+    // No FTS hit → the HNSW semantic branch is the ONLY source of results.
+    let (results, tel) = recall_with_index(&conn, "zzznoftshitzzz", &qe, Some(&active), &idx);
+    let ids: std::collections::HashSet<&str> = results.iter().map(|(m, _)| m.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [a1.as_str(), a2.as_str()].into_iter().collect(),
+        "poisoned HNSW index must score ONLY active-space rows with a live vector; got {ids:?}"
+    );
+    assert_eq!(
+        tel.embedding_space_mismatch, 1,
+        "the foreign-space index hit is excluded on the row-side space post-filter, \
+         never scored on hit.distance"
+    );
+    assert_eq!(
+        tel.embedding_unverified_space, 1,
+        "the index hit whose row-side vector vanished is excluded (deleted #1692 None-arm), \
+         never falls back to hit.distance"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T-hnsw-boot — the boot index seed (`get_all_embeddings`) admits ONLY
+// active-space rows, so a foreign / NULL vector can never enter the graph.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t_hnsw_boot_seeds_active_space_rows_only_2182() {
+    let (conn, _p) = fresh_db();
+    let active = embedding_space_fingerprint("nomic-embed-text");
+    let foreign = embedding_space_fingerprint("granite-embedding");
+    let qe = [1.0_f32, 0.0, 0.0, 0.0];
+
+    let a1 = seed_embedded(&conn, "boot active", &qe, &active);
+    seed_embedded(&conn, "boot foreign", &qe, &foreign);
+    let n1 = seed_embedded(&conn, "boot null", &qe, &active);
+    null_out_space(&conn, &n1);
+
+    let entries = db::get_all_embeddings(&conn, &active).unwrap();
+    let ids: std::collections::HashSet<&str> = entries.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [a1.as_str()].into_iter().collect(),
+        "the boot HNSW seed must include ONLY active-space rows (foreign + NULL excluded); \
+         got {ids:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T-INV-3 — a reembed killed at an arbitrary batch boundary leaves every
+// intermediate state with only consistently-stamped scorable rows: the
+// per-row re-stamp is a single statement (vector + space together), so a
+// vector never co-exists with a stale / NULL space, and a not-yet-migrated
+// row is space-excluded rather than scored against the new query.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t_inv_3_kill_mid_reembed_leaves_only_consistently_stamped_rows_2182() {
+    let (conn, _p) = fresh_db();
+    let space_a = embedding_space_fingerprint("nomic-embed-text");
+    let space_b = embedding_space_fingerprint("granite-embedding"); // the reembed target
+    let qe = [1.0_f32, 0.0, 0.0, 0.0];
+
+    // Corpus fully in space A.
+    let r1 = seed_embedded(&conn, "reembed r1", &qe, &space_a);
+    let r2 = seed_embedded(&conn, "reembed r2", &qe, &space_a);
+    let r3 = seed_embedded(&conn, "reembed r3", &qe, &space_a);
+
+    // A reembed to space B, KILLED after r1+r2 (r3 never re-stamped). Each
+    // per-row write is one statement stamping vector + space together.
+    db::set_embedding(&conn, &r1, &qe, &space_b).unwrap();
+    db::set_embedding(&conn, &r2, &qe, &space_b).unwrap();
+
+    // Invariant: NO intermediate state ever has a vector without a matching
+    // space (the structural safety of the per-row single-statement re-stamp).
+    let orphan: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL AND embedding_space IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        orphan, 0,
+        "kill-mid-reembed: a vector never co-exists with a NULL space"
+    );
+
+    // With the new active space (B), ONLY the migrated rows are scorable; the
+    // not-yet-migrated r3 (still space A) is space-excluded, never scored on
+    // its stale-space vector against the B-space query.
+    let (results, tel) = recall(&conn, "zzznoftshitzzz", &qe, Some(&space_b));
+    let ids: std::collections::HashSet<&str> = results.iter().map(|(m, _)| m.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [r1.as_str(), r2.as_str()].into_iter().collect(),
+        "only the reembedded (space-B) rows are scorable mid-migration; got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&r3.as_str()),
+        "the not-yet-migrated space-A row (r3) must NOT be scored against the new-space query"
+    );
+    assert_eq!(
+        tel.embedding_space_mismatch, 1,
+        "the not-yet-migrated space-A row is space-excluded, not scored"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T-strict — the AI_MEMORY_REQUIRE_EMBED_MODEL_MATCH ([G1]) strict path,
+// end-to-end through recall: strict DISABLES boot adoption, so a legacy
+// NULL-space (dim-matching) row stays unverified + excluded from semantic
+// recall; with strict OFF the same boot maintenance adopts it and it becomes
+// recallable. (The §6 strict recall-WITHHOLD itself is a tracked S6 residual;
+// this pins the adoption-gate behavior that IS live.)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t_strict_disables_adoption_null_row_excluded_from_recall_2182() {
+    let (conn, _p) = fresh_db();
+    let active = embedding_space_fingerprint("nomic-embed-text");
+    let qe = [1.0_f32, 0.0, 0.0, 0.0];
+    // A legacy embedded row with NO provenance, dim-matching the active space.
+    let nid = seed_embedded(&conn, "strict null recall", &qe, &active);
+    null_out_space(&conn, &nid);
+
+    let _strict = STRICT_FLAG_GUARD.lock().unwrap();
+
+    // Strict ON → adoption skipped ([G1]); the row stays NULL-space and is
+    // excluded from semantic recall (UnverifiedSpace).
+    ai_memory::hnsw::set_strict_embed_model_match_for_test(Some(true));
+    db::embedding_space_boot_maintenance(&conn, &active, 4);
+    let (res_strict, tel_strict) = recall(&conn, "zzznoftshitzzz", &qe, Some(&active));
+    assert!(
+        res_strict.is_empty(),
+        "strict [G1]: an un-adopted NULL-space row is excluded from semantic recall; got {:?}",
+        res_strict.iter().map(|(m, _)| &m.id).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        tel_strict.embedding_unverified_space, 1,
+        "strict: the NULL-space row is counted as unverified (excluded)"
+    );
+
+    // Strict OFF → the SAME boot maintenance now adopts the row into the
+    // active space, and it becomes semantically recallable.
+    ai_memory::hnsw::set_strict_embed_model_match_for_test(None);
+    db::embedding_space_boot_maintenance(&conn, &active, 4);
+    let (res_lax, _) = recall(&conn, "zzznoftshitzzz", &qe, Some(&active));
+    let ids: std::collections::HashSet<&str> = res_lax.iter().map(|(m, _)| m.id.as_str()).collect();
+    assert!(
+        ids.contains(&nid.as_str()),
+        "lax: the NULL-space row is adopted into the active space + recallable; got {ids:?}"
+    );
 }
