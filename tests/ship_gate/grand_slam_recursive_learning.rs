@@ -336,7 +336,20 @@ async fn sg_rl_1_curator_reflection_pass_typed_kind_and_audit_chain() {
     );
 
     // Every persisted reflection carries the typed enum + reflects_on edges.
-    let all = db::list(&conn, Some(ns), None, 100, 0, None, None, None, None, None).expect("list");
+    let all = db::list(
+        &conn,
+        Some(ns),
+        None,
+        100,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("list");
     let reflections: Vec<&Memory> = all
         .iter()
         .filter(|m| m.memory_kind == MemoryKind::Reflection)

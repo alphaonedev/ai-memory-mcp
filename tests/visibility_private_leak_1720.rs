@@ -145,6 +145,7 @@ fn do_recall(conn: &rusqlite::Connection, caller: Option<&str>) -> Vec<(Memory, 
         false,
         None,
         caller,
+        None, // #1834 valid_at
     )
     .expect("recall ok");
     results
@@ -433,6 +434,7 @@ fn do_hybrid(
         None,
         caller,
         None,
+        None, // #1834 valid_at
     )
     .expect("recall_hybrid ok");
     results

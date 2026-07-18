@@ -97,6 +97,7 @@ fn expected_version_match_succeeds_and_bumps() {
         None,
         None,
         Some(1),
+        None, // #1834 valid_until
     )
     .expect("update must succeed with matching expected_version");
     assert!(found);
@@ -125,6 +126,7 @@ fn expected_version_mismatch_returns_conflict_envelope() {
         None,
         None,
         Some(1),
+        None, // #1834 valid_until
     )
     .expect("first update must succeed");
     // Second caller still believes the stored version is 1 (the
@@ -146,6 +148,7 @@ fn expected_version_mismatch_returns_conflict_envelope() {
         None,
         None,
         Some(1),
+        None, // #1834 valid_until
     )
     .expect_err("second update must fail with VersionConflict");
     let vc = err
@@ -187,6 +190,7 @@ fn two_concurrent_updates_produce_exactly_one_winner() {
         None,
         None,
         Some(baseline.version),
+        None, // #1834 valid_until
     );
     // Caller B writes with the SAME expected_version=1 — loses.
     let outcome_b = db::update_with_expected_version(
@@ -203,6 +207,7 @@ fn two_concurrent_updates_produce_exactly_one_winner() {
         None,
         None,
         Some(baseline.version),
+        None, // #1834 valid_until
     );
 
     let a_ok = outcome_a.is_ok();
@@ -252,6 +257,7 @@ fn expected_version_against_missing_row_returns_not_found_not_conflict() {
         None,
         None,
         Some(1),
+        None, // #1834 valid_until
     )
     .expect("missing row must be Ok((false, _)), not a CONFLICT error");
     assert!(!found, "missing row reports found=false");
@@ -320,6 +326,7 @@ fn version_conflict_is_downcastable_from_anyhow_chain() {
         None,
         None,
         Some(1),
+        None, // #1834 valid_until
     )
     .expect("first wins");
     let err = db::update_with_expected_version(
@@ -336,6 +343,7 @@ fn version_conflict_is_downcastable_from_anyhow_chain() {
         None,
         None,
         Some(1),
+        None, // #1834 valid_until
     )
     .expect_err("stale expected_version");
     let vc = err
@@ -387,6 +395,7 @@ fn legacy_update_helper_still_bumps_version_so_followup_gate_observes_it() {
         None,
         None,
         Some(1),
+        None, // #1834 valid_until
     )
     .expect_err("gate must reject stale expected_version");
     let vc = err

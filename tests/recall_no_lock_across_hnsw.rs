@@ -145,6 +145,7 @@ fn fx4_recall_hybrid_precomputed_hits_matches_legacy_with_index() {
         None,
         None, // #1720 caller,
         None,
+        None, // #1834 valid_at
     )
     .expect("legacy recall ok");
 
@@ -171,6 +172,7 @@ fn fx4_recall_hybrid_precomputed_hits_matches_legacy_with_index() {
         None,
         None, // #1720 caller,
         None,
+        None, // #1834 valid_at
     )
     .expect("precomputed-hnsw recall ok");
 
@@ -234,6 +236,7 @@ fn fx4_recall_hybrid_precomputed_empty_hits_falls_back_to_keyword_results() {
         None,
         None, // #1720 caller,
         None,
+        None, // #1834 valid_at
     )
     .expect("recall with empty hits ok");
     // The keyword phase finds "gamma content" via FTS5 even though

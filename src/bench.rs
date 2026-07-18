@@ -536,6 +536,7 @@ fn run_verified_recall(conn: &Connection, config: &BenchConfig) -> Result<Operat
             false,
             None,
             None,
+            None,
         )?;
         for _ in &results {
             let _ = crate::identity::verify::verify_write(&keypair.public, &probe, &sig);
@@ -558,6 +559,7 @@ fn run_verified_recall(conn: &Connection, config: &BenchConfig) -> Result<Operat
             None,
             None,
             false,
+            None,
             None,
             None,
         )?;
@@ -646,6 +648,7 @@ fn run_recall_hot(conn: &Connection, config: &BenchConfig) -> Result<OperationRe
             false,
             None,
             None, // #1720 — bench has no identity; trust-all
+            None,
         )?;
     }
     let mut samples = Vec::with_capacity(config.iterations);
@@ -667,6 +670,7 @@ fn run_recall_hot(conn: &Connection, config: &BenchConfig) -> Result<OperationRe
             false,
             None,
             None, // #1720 — bench has no identity; trust-all
+            None,
         )?;
         samples.push(start.elapsed());
     }
@@ -715,6 +719,7 @@ fn run_recall_rerank_hot(conn: &Connection, config: &BenchConfig) -> Result<Oper
             false,
             None,
             None, // #1720 — bench has no identity; trust-all
+            None,
         )?;
         let _ = reranker.rerank(warmup_query, results);
     }
@@ -738,6 +743,7 @@ fn run_recall_rerank_hot(conn: &Connection, config: &BenchConfig) -> Result<Oper
             false,
             None,
             None, // #1720 — bench has no identity; trust-all
+            None,
         )?;
         let _ = reranker.rerank(&query, results);
         samples.push(start.elapsed());
@@ -920,6 +926,8 @@ fn synth_memory(namespace: &str, i: usize, prefix: &str) -> Memory {
     let now = chrono::Utc::now().to_rfc3339();
     Memory {
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
+        valid_from: None,
+        valid_until: None,
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Long,
         namespace: namespace.to_string(),

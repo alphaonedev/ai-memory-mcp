@@ -151,6 +151,8 @@ fn config(peers: Vec<PeerEndpoint>, w: usize, ack_timeout_ms: u64) -> Federation
 fn fixture_memory(id: &str) -> Memory {
     Memory {
         cid: None,
+        valid_from: None,
+        valid_until: None,
         id: id.to_string(),
         tier: Tier::Mid,
         namespace: "cov-sync-arms".to_string(),

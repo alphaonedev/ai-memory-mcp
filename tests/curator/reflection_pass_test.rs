@@ -240,6 +240,7 @@ async fn ac1_thirty_observations_yield_three_reflections_at_depth_one() {
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .expect("db::list");
     let reflections: Vec<&Memory> = all_in_ns
@@ -325,6 +326,7 @@ async fn ac2_refuses_when_proposed_depth_exceeds_max_depth() {
             None,
             None,
             None,
+            None, // #1834 valid_at (no as-of)
         )
         .unwrap();
         for r in reflections
@@ -485,6 +487,7 @@ async fn ac3_chain_pass_yields_depth_2_when_substrate_allows() {
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .unwrap();
     let depth1: &Memory = all
@@ -567,6 +570,7 @@ async fn ac4_reflects_on_edges_are_verifiable() {
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .unwrap();
 
@@ -657,6 +661,7 @@ async fn dry_run_produces_proposals_without_persisting() {
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .unwrap();
     let r_count = all

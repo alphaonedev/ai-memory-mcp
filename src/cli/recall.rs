@@ -35,6 +35,10 @@ pub struct RecallArgs {
     pub since: Option<String>,
     #[arg(long)]
     pub until: Option<String>,
+    /// #1834 claim-bitemporal as-of: RFC3339 point in valid-time. Returns only
+    /// claims asserted to hold at this instant (valid_from/valid_until window).
+    #[arg(long)]
+    pub valid_at: Option<String>,
     /// Feature tier for recall: keyword, semantic, smart, autonomous
     #[arg(long, short = 'T')]
     pub tier: Option<String>,
@@ -179,6 +183,10 @@ pub fn run(
     // #151: validate --as-agent namespace
     if let Some(ref a) = args.as_agent {
         validate::validate_namespace(a)?;
+    }
+    // v1.0.0 #1834 — RFC3339-validate --valid-at at the CLI entry.
+    if let Some(ref v) = args.valid_at {
+        validate::validate_valid_at(v)?;
     }
     let mut conn = db::open(db_path)?;
     let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
@@ -436,6 +444,8 @@ pub(crate) fn run_with_embedder(
                     vis_caller.as_deref(),
                     // v1.0.0 #2167 §3 — active embedder fingerprint gate.
                     cli_active_space.as_deref(),
+                    // v1.0.0 #1834 — claim-bitemporal AS-OF instant.
+                    args.valid_at.as_deref(),
                 )?;
                 if let Some(ref ce) = reranker {
                     (
@@ -467,6 +477,7 @@ pub(crate) fn run_with_embedder(
                     args.include_archived,
                     args.source_uri_prefix.as_deref(),
                     vis_caller.as_deref(),
+                    args.valid_at.as_deref(),
                 )?;
                 (results, outcome, "keyword")
             }
@@ -487,6 +498,7 @@ pub(crate) fn run_with_embedder(
             args.include_archived,
             args.source_uri_prefix.as_deref(),
             vis_caller.as_deref(),
+            args.valid_at.as_deref(),
         )?;
         (results, outcome, "keyword")
     };
@@ -626,6 +638,7 @@ mod tests {
             tags: None,
             since: None,
             until: None,
+            valid_at: None,
             tier: Some("keyword".to_string()),
             as_agent: None,
             budget_tokens: None,
@@ -896,6 +909,8 @@ mod tests {
             let now = chrono::Utc::now().to_rfc3339();
             let mem = crate::models::Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: crate::models::Tier::Mid,
                 namespace: "test".to_string(),
@@ -1341,6 +1356,8 @@ limit = 25
         let mut conn = db::open(&db).unwrap();
         let mut mem = crate::models::Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: crate::models::Tier::Mid,
             namespace: "test".to_string(),
