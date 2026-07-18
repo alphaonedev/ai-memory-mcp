@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 84).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 85).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -864,7 +864,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 84;
+const CURRENT_SCHEMA_VERSION: i64 = 85;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -3565,7 +3565,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             }
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 83 {
             // v83 (#2044, v1.0.0) — per-agent api-key principal binding (H1
             // IDOR + M1 admin spoof). Additive `CREATE TABLE IF NOT EXISTS
             // agent_api_keys` + index. Replay-safe (IF NOT EXISTS) and no
@@ -3575,7 +3575,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             conn.execute_batch(MIGRATION_V83_SQLITE)?;
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 84 {
             // v84 (#2167, v1.0.0) — embedding vector-space provenance. Adds the
             // per-row `embedding_space TEXT` column (NULL = legacy/unverified)
             // to `memories` AND `archived_memories` so recall can never score a
@@ -3622,6 +3622,51 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                  ON memories(embedding_space) WHERE embedding_space IS NOT NULL",
                 [],
             )?;
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v85 (#2035, v1.0.0) — archive→restore lossless round-trip for the
+            // #1834 claim-bitemporal VALID-time. Adds `valid_from` + `valid_until`
+            // (RFC3339 TEXT) to `archived_memories` so a memory archived via GC
+            // eviction (archive_on_gc), explicit `forget`, or the in_place_edit
+            // supersede snapshot — and later restored — no longer DROPS the
+            // claim-validity interval (both columns already live on `memories`
+            // since v79). Additive, NO full-table rebuild → the v63/v65
+            // trigger-drop hazard does not arise. Mirrors the v49/#1025
+            // archive-column-parity precedent and the v84 embedding_space probe
+            // shape (SQLite has no `ADD COLUMN IF NOT EXISTS`, so probe each
+            // column; `archived_memories` is guarded by a table-presence probe
+            // because a partial-schema fixture may stamp a version without it —
+            // the v68/v80/v84 precedent). Canonical DDL:
+            // migrations/sqlite/0069_v85_archived_valid_time.sql.
+            let has_archive_table: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'archived_memories')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if has_archive_table {
+                let has_valid_from = conn
+                    .prepare("SELECT valid_from FROM archived_memories LIMIT 0")
+                    .is_ok();
+                if !has_valid_from {
+                    conn.execute(
+                        "ALTER TABLE archived_memories ADD COLUMN valid_from TEXT",
+                        [],
+                    )?;
+                }
+                let has_valid_until = conn
+                    .prepare("SELECT valid_until FROM archived_memories LIMIT 0")
+                    .is_ok();
+                if !has_valid_until {
+                    conn.execute(
+                        "ALTER TABLE archived_memories ADD COLUMN valid_until TEXT",
+                        [],
+                    )?;
+                }
+            }
         }
 
         conn.execute("DELETE FROM schema_version", [])?;

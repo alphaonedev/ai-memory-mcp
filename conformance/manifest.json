@@ -292,7 +292,7 @@
     }
   ],
   "license": "CC0-1.0",
-  "schema_version": 84,
+  "schema_version": 85,
   "spec": "ai-memory/portability/v2",
   "spec_doc": "docs/spec/PORTABILITY-V2.md",
   "vectors": [
