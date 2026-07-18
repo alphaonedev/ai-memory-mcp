@@ -107,6 +107,27 @@ const PREFIX_SCHEME_NOMIC_TASK_V1: &str = "nomic-task-v1";
 /// NEVER collide, so the gate can produce a false MISMATCH (→ a safe
 /// local re-embed) but NEVER a false MATCH (→ corruption): degrade, never
 /// corrupt (#2168 CORE INVARIANT). M-STRONG-TYPES-GUARD.
+///
+/// **[#2177] The `#<prefix_scheme>` axis is MODEL-IMPLIED, not an
+/// independently transmitted wire value.** Both sides (the receiver's own
+/// fingerprint AND its canonicalisation of the shipped `model` string) call
+/// the SAME [`Embedder::model_requires_nomic_prefix`] predicate against the
+/// (folded) model id — the scheme is a pure function of the id, computed
+/// locally, never read off the wire. This is intentional and is what keeps
+/// the gate wire-back-compat with zero wire changes across DIFFERENT model
+/// ids. The residual: it CANNOT discriminate two peers on the SAME model id
+/// whose binaries apply DIFFERENT prefix behaviour (e.g. a future release
+/// that starts sending `task_type` for a role-asymmetric model this
+/// predicate doesn't yet know about, or any future edit to the
+/// `model_requires_nomic_prefix` table) — such a divergence would silently
+/// mint the SAME fingerprint on both sides today. Promoting an explicit
+/// `prefix_scheme` field onto the wire (`ShippedEmbedding`, additive +
+/// `#[serde(default)]`) so a sender can assert its scheme independently of
+/// the receiver's local derivation is DEFERRED to v1.x (tracked by #2177);
+/// until then, this function is the SSOT for the implication and
+/// `space_fingerprint_2168_tests::prefix_scheme_is_derived_from_model_id_2177`
+/// pins it so a future change to the predicate can't silently drift this
+/// axis without the test catching it.
 //
 // #2167 GENERALISATION (shared SSOT for federation-gate + per-row write-stamp +
 // recall-gate + adoption): the body below keeps #2168's prose-strip AND adds
@@ -248,6 +269,55 @@ mod space_fingerprint_2168_tests {
             embedding_space_fingerprint("  Nomic-Embed-Text (768-dim, remote)  "),
             embedding_space_fingerprint("nomic-embed-text"),
         );
+    }
+
+    /// **[#2177]** Pins the model→prefix-scheme implication explicitly:
+    /// the `#<scheme>` half of the fingerprint is NOT an independently
+    /// transmitted axis — it is always exactly
+    /// `super::Embedder::model_requires_nomic_prefix(<canonical id>)`
+    /// re-derived from the fingerprint's own id half. This test fails the
+    /// moment a future change makes the fingerprint compute the scheme via
+    /// a DIFFERENT code path than the local embed-prefix decision (the
+    /// prose in [`super::embedding_space_fingerprint`] documents WHY this
+    /// coupling exists and what the deferred v1.x explicit-field follow-up
+    /// looks like).
+    #[test]
+    fn prefix_scheme_is_derived_from_model_id_2177() {
+        let cases = [
+            // (input, expect nomic-task-v1 scheme)
+            ("nomic-embed-text", true),
+            ("nomic-embed-text-v1.5", true),
+            ("nomic-ai/nomic-embed-text-v1.5", true),
+            ("granite-embedding", false),
+            ("bge-base-en-v1.5", false),
+            ("all-MiniLM-L6-v2", false),
+            ("sentence-transformers/all-MiniLM-L6-v2", false),
+        ];
+        for (model, expect_nomic_scheme) in cases {
+            let fp = embedding_space_fingerprint(model);
+            let (id, scheme) = fp
+                .split_once('#')
+                .unwrap_or_else(|| panic!("fingerprint {fp:?} missing '#' separator"));
+            // The scheme axis must equal a FRESH call of the same
+            // #1520 predicate against the fingerprint's own (canonical,
+            // post-fold) id — i.e. the scheme is model-IMPLIED, never an
+            // independently-set value.
+            let recomputed = super::Embedder::model_requires_nomic_prefix(id);
+            assert_eq!(
+                recomputed, expect_nomic_scheme,
+                "model={model} id={id} scheme={scheme}"
+            );
+            let expected_scheme = if recomputed {
+                super::PREFIX_SCHEME_NOMIC_TASK_V1
+            } else {
+                super::PREFIX_SCHEME_NONE
+            };
+            assert_eq!(
+                scheme, expected_scheme,
+                "model={model}: fingerprint scheme must equal \
+                 model_requires_nomic_prefix(id) — the axis is model-implied (#2177)"
+            );
+        }
     }
 }
 
