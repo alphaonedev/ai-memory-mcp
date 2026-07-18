@@ -417,6 +417,84 @@ fn a5_1579_candidates_path_applies_namespace_and_liveness_filters() {
     );
 }
 
+/// #2188 defense-in-depth — the ANN-routed candidate pool re-reads each
+/// row's blob and recomputes EXACT cosine in `proactive_conflict_verdict`,
+/// so it is a row-side cosine consumer exactly like the #2181 scan
+/// fallback, `check_duplicate`, and both clusterers. A candidate id that
+/// resolves to a FOREIGN-space row (reachable via a concurrent
+/// out-of-process `ai-memory reembed`'s stale-active window) must NEVER be
+/// scored: cosining the active-space query against a foreign-space vector
+/// is a meaningless cross-space score that could surface a FALSE 409
+/// advisory on a legitimate write. This pins the row-side `embedding_space`
+/// gate the candidate re-read gained so it matches the scan path's
+/// fail-closed posture.
+#[test]
+fn embedding_space_2188_candidates_path_excludes_foreign_space_row() {
+    let conn = fresh_conn();
+    let emb = vec![1.0_f32, 0.0];
+
+    // Seed the process-wide active space to the SAME fingerprint every
+    // `insert_with_embedding` row carries, so ONLY a deliberately
+    // foreign-stamped row is excluded (any parallel test's rows, all
+    // stamped "test-space", still match the gate and are unaffected).
+    let active_fp = ai_memory::embeddings::embedding_space_fingerprint("test-space");
+    ai_memory::embeddings::set_active_embedding_space(Some(active_fp));
+
+    // A genuine near-duplicate (identical vector, shared vocabulary,
+    // differing content) that WOULD 409 — but stamped in a FOREIGN space
+    // (the same-dim model-swap fingerprint a concurrent reembed writes).
+    let foreign = make_mem("shared-fact", "the answer is 42", "ns-mine");
+    let foreign_id = db::insert(&conn, &foreign).expect("insert");
+    db::set_embedding(
+        &conn,
+        &foreign_id,
+        &emb,
+        &ai_memory::embeddings::embedding_space_fingerprint("foreign-space"),
+    )
+    .expect("set_embedding foreign space");
+
+    let mut incoming = make_mem("shared-fact-new", "the answer is 43", "ns-mine");
+    incoming.id = uuid::Uuid::new_v4().to_string();
+
+    // Force-feed the foreign-space row id as an ANN candidate: the
+    // row-side `embedding_space` gate must drop it BEFORE scoring.
+    let verdict = proactive_conflict_check_candidates(
+        &conn,
+        &incoming,
+        &emb,
+        std::slice::from_ref(&foreign_id),
+    )
+    .expect("candidates ok");
+
+    // Positive control: re-stamp the SAME row into the ACTIVE space and
+    // confirm it DOES 409 — proving the gate excludes on SPACE, not on
+    // some incidental property of the row.
+    db::set_embedding(
+        &conn,
+        &foreign_id,
+        &emb,
+        &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
+    )
+    .expect("restamp active space");
+    let control =
+        proactive_conflict_check_candidates(&conn, &incoming, &emb, &[foreign_id]).expect("ok");
+
+    // Restore the process-global BEFORE asserting so a failed assertion
+    // can't leak the seeded space into a parallel test.
+    ai_memory::embeddings::set_active_embedding_space(None);
+
+    assert!(
+        verdict.is_none(),
+        "#2188: a foreign-space candidate row must never be cosine-scored \
+         (cross-space score could surface a FALSE 409 advisory)"
+    );
+    assert!(
+        control.is_some(),
+        "#2188 control: the SAME row re-stamped into the active space MUST \
+         still 409 — the gate excludes on embedding_space, not the row"
+    );
+}
+
 /// Dispatch: an index that is NOT fully searchable (the async-boot
 /// warm window — entries seeded but no graph swapped in) must be
 /// bypassed in favour of the bounded scan, which still finds a recent

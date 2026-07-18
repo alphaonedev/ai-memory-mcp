@@ -524,3 +524,277 @@ async fn pg_boot_maintenance_census_reports_heterogeneity_2179() {
 
     let _ = store.forget(&ctx, Some(&ns), None, None, true).await;
 }
+
+// ---------------------------------------------------------------------------
+// #2190 — live-pg twins for the #2183(b) knob-ON widened `list_unembedded`
+// arm + the #2181 pg `get_embedding_with_space` override. The sqlite unit
+// tests exist (`tests/embedding_space_provenance_2167.rs`); these exercise
+// the pg-ONLY paths the Postgres feature gate runs. Convention matches the
+// rest of this file (SKIP-IF-URL-UNSET, deliberately NOT `#[ignore]` — see
+// the module header for the coverage-correctness rationale): the CI Postgres
+// gate AND the coverage job both set `AI_MEMORY_TEST_POSTGRES_URL`, so these
+// EXECUTE under both and cleanly skip on a node with no pg routing.
+// ---------------------------------------------------------------------------
+
+/// The opt-in heal knob env var (mirrors the private
+/// `store::postgres::PG_HEAL_FOREIGN_SPACE_ENV` SSOT — kept as a local test
+/// literal because that const is not exported).
+const ENV_PG_HEAL: &str = "AI_MEMORY_PG_HEAL_FOREIGN_SPACE";
+
+/// Serialises the two process-globals the `list_unembedded` widened arm
+/// reads — the `AI_MEMORY_PG_HEAL_FOREIGN_SPACE` env knob and the
+/// `active_embedding_space()` process-global — so a sibling test never
+/// observes a torn heal window (the #1799 env-serialisation discipline).
+static PG_HEAL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The id-set the admin backfill sweep would re-embed. A large cap so the
+/// freshly-created fixture rows (created_at-newest, ASC-ordered LAST in the
+/// global sweep) are never truncated out of the page.
+async fn unembedded_ids(
+    store: &PostgresStore,
+    admin: &CallerContext,
+) -> std::collections::HashSet<String> {
+    store
+        .list_unembedded(admin, 100_000)
+        .await
+        .expect("list_unembedded")
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect()
+}
+
+/// #2190 / #2183(b) — the OPT-IN `AI_MEMORY_PG_HEAL_FOREIGN_SPACE` knob widens
+/// the pg `list_unembedded` backfill scan to include FOREIGN-stamped rows (the
+/// post-same-dim-model-swap heal gap that [G2] refuses to adopt and that has
+/// no `ai-memory reembed` heal path on postgres). Pins: knob OFF → the foreign
+/// row is NOT swept (byte-identical legacy); knob ON + a seeded active
+/// fingerprint → the foreign row IS swept while the ACTIVE row is not, and
+/// NULL-space + NULL-embedding rows are swept in BOTH modes; knob ON but
+/// UNSEEDED fingerprint never widens; and a `set_embeddings_batch` re-stamp
+/// makes the healed row LEAVE the scan (monotone → the sweep terminates).
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // intentional: serialise the env + active-space globals
+async fn pg_heal_foreign_space_knob_widens_scan_2183() {
+    let Some(store) = live_pg().await else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _lock = PG_HEAL_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let owner = "ai:2183heal-pg";
+    let ctx = CallerContext::for_agent(owner);
+    let admin = CallerContext::for_admin(owner);
+    let ns = format!("space2183heal-{}", uuid::Uuid::new_v4());
+    let active = embedding_space_fingerprint("nomic-embed-text");
+    let foreign = embedding_space_fingerprint("granite-embedding"); // same dim, other space
+    assert_ne!(active, foreign);
+    let dim = pg_dim(&store).await;
+    let vec = unit_vec(dim);
+
+    // Four rows: active-stamped, foreign-stamped, NULL-space (legacy), and
+    // NULL-embedding.
+    let active_id = uuid::Uuid::new_v4().to_string();
+    let foreign_id = uuid::Uuid::new_v4().to_string();
+    let null_space_id = uuid::Uuid::new_v4().to_string();
+    let null_emb_id = uuid::Uuid::new_v4().to_string();
+    for (id, title) in [
+        (&active_id, "active"),
+        (&foreign_id, "foreign"),
+        (&null_space_id, "legacy-null-space"),
+        (&null_emb_id, "null-embedding"),
+    ] {
+        store
+            .store(&ctx, &mem(id, &ns, title, owner))
+            .await
+            .expect("store");
+    }
+    store
+        .update_embedding(&ctx, &active_id, Some(&vec), &active)
+        .await
+        .expect("stamp active");
+    store
+        .update_embedding(&ctx, &foreign_id, Some(&vec), &foreign)
+        .await
+        .expect("stamp foreign");
+    store
+        .update_embedding(&ctx, &null_space_id, Some(&vec), &active)
+        .await
+        .expect("embed legacy");
+    sqlx::query("UPDATE memories SET embedding_space = NULL WHERE id = $1")
+        .bind(&null_space_id)
+        .execute(store.pool())
+        .await
+        .expect("simulate legacy NULL space");
+    // `null_emb_id` keeps embedding NULL (never embedded).
+
+    // Phase A — knob OFF (byte-identical legacy always-on predicate).
+    // SAFETY: edition-2024 env mutation serialised by PG_HEAL_ENV_LOCK.
+    unsafe { std::env::remove_var(ENV_PG_HEAL) };
+    ai_memory::embeddings::set_active_embedding_space(None);
+    let off = unembedded_ids(&store, &admin).await;
+
+    // Phase B — knob ON but UNSEEDED fingerprint: must NOT widen.
+    unsafe { std::env::set_var(ENV_PG_HEAL, "1") };
+    ai_memory::embeddings::set_active_embedding_space(None);
+    let on_unseeded = unembedded_ids(&store, &admin).await;
+
+    // Phase C — knob ON + seeded active fingerprint: widen to foreign rows.
+    ai_memory::embeddings::set_active_embedding_space(Some(active.clone()));
+    let on_seeded = unembedded_ids(&store, &admin).await;
+
+    // Phase D — heal the foreign row (re-embed under the ACTIVE space) and
+    // confirm it LEAVES the scan (monotone; the backfill sweep terminates).
+    store
+        .set_embeddings_batch(&admin, &[(foreign_id.clone(), vec.clone())], &active)
+        .await
+        .expect("re-stamp foreign row under active space");
+    let on_after_heal = unembedded_ids(&store, &admin).await;
+
+    // Restore the process-globals BEFORE asserting so a failed assert can't
+    // leak either global into a sibling test.
+    unsafe { std::env::remove_var(ENV_PG_HEAL) };
+    ai_memory::embeddings::set_active_embedding_space(None);
+    let _ = store.forget(&ctx, Some(&ns), None, None, true).await;
+
+    // Phase A asserts — knob OFF.
+    assert!(
+        !off.contains(&foreign_id),
+        "knob OFF: a foreign-stamped row must NOT be swept (byte-identical legacy)"
+    );
+    assert!(
+        !off.contains(&active_id),
+        "knob OFF: an active-stamped embedded row is never unembedded"
+    );
+    assert!(
+        off.contains(&null_space_id),
+        "knob OFF: a NULL-space embedded row is always swept (the [G1]/[G2] gap)"
+    );
+    assert!(
+        off.contains(&null_emb_id),
+        "knob OFF: a NULL-embedding row is always swept"
+    );
+
+    // Phase B asserts — ON but unseeded fingerprint never widens.
+    assert!(
+        !on_unseeded.contains(&foreign_id),
+        "knob ON + UNSEEDED fingerprint must NOT widen the scan to foreign rows"
+    );
+    assert!(
+        on_unseeded.contains(&null_space_id) && on_unseeded.contains(&null_emb_id),
+        "knob ON + unseeded: the always-on NULL-space/NULL-embedding sweep still holds"
+    );
+
+    // Phase C asserts — ON + seeded widens to foreign, not active.
+    assert!(
+        on_seeded.contains(&foreign_id),
+        "knob ON + seeded active fingerprint: the foreign-stamped row MUST be swept for heal"
+    );
+    assert!(
+        !on_seeded.contains(&active_id),
+        "knob ON: the ACTIVE-space row must NEVER be swept (it needs no heal)"
+    );
+    assert!(
+        on_seeded.contains(&null_space_id) && on_seeded.contains(&null_emb_id),
+        "knob ON: NULL-space + NULL-embedding rows are still swept"
+    );
+
+    // Phase D asserts — monotone.
+    assert!(
+        !on_after_heal.contains(&foreign_id),
+        "#2183 monotone: a re-stamped (healed) row must LEAVE the scan so the sweep terminates"
+    );
+}
+
+/// #2190 / #2181 — the pg `get_embedding_with_space` override returns the REAL
+/// per-row space (the curator `ConsolidationPass` cross-space merge guard
+/// depends on it): a stamped row yields `Some((vec, Some(space)))`, a
+/// NULL-space legacy row yields `Some((vec, None))`, and a NULL-embedding row
+/// collapses the outer Option to `None` (matching `get_embedding`).
+#[tokio::test]
+async fn pg_get_embedding_with_space_returns_real_space_2181() {
+    let Some(store) = live_pg().await else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let owner = "ai:2181gews-pg";
+    let ctx = CallerContext::for_agent(owner);
+    let ns = format!("space2181gews-{}", uuid::Uuid::new_v4());
+    let active = embedding_space_fingerprint("nomic-embed-text");
+    let dim = pg_dim(&store).await;
+    let vec = unit_vec(dim);
+
+    // (1) Stamped row → Some((vec, Some(active))).
+    let stamped_id = uuid::Uuid::new_v4().to_string();
+    store
+        .store(&ctx, &mem(&stamped_id, &ns, "stamped", owner))
+        .await
+        .expect("store stamped");
+    store
+        .update_embedding(&ctx, &stamped_id, Some(&vec), &active)
+        .await
+        .expect("stamp");
+
+    // (2) NULL-space legacy row → Some((vec, None)).
+    let null_space_id = uuid::Uuid::new_v4().to_string();
+    store
+        .store(&ctx, &mem(&null_space_id, &ns, "legacy-null-space", owner))
+        .await
+        .expect("store legacy");
+    store
+        .update_embedding(&ctx, &null_space_id, Some(&vec), &active)
+        .await
+        .expect("embed legacy");
+    sqlx::query("UPDATE memories SET embedding_space = NULL WHERE id = $1")
+        .bind(&null_space_id)
+        .execute(store.pool())
+        .await
+        .expect("null the space");
+
+    // (3) NULL-embedding row → None.
+    let null_emb_id = uuid::Uuid::new_v4().to_string();
+    store
+        .store(&ctx, &mem(&null_emb_id, &ns, "null-embedding", owner))
+        .await
+        .expect("store null-emb");
+
+    let stamped = store
+        .get_embedding_with_space(&ctx, &stamped_id)
+        .await
+        .expect("gews stamped");
+    let legacy = store
+        .get_embedding_with_space(&ctx, &null_space_id)
+        .await
+        .expect("gews legacy");
+    let null_emb = store
+        .get_embedding_with_space(&ctx, &null_emb_id)
+        .await
+        .expect("gews null-emb");
+
+    let _ = store.forget(&ctx, Some(&ns), None, None, true).await;
+
+    let (svec, sspace) = stamped.expect("stamped row exists + has an embedding");
+    assert_eq!(
+        svec.len(),
+        dim,
+        "stamped vector round-trips at the fixture dim"
+    );
+    assert_eq!(
+        sspace.as_deref(),
+        Some(active.as_str()),
+        "stamped row must carry its REAL per-row space"
+    );
+
+    let (lvec, lspace) = legacy.expect("legacy row exists + has an embedding");
+    assert_eq!(lvec.len(), dim, "legacy vector round-trips");
+    assert!(
+        lspace.is_none(),
+        "a NULL-space (legacy) row must yield None for the space, not the empty string"
+    );
+
+    assert!(
+        null_emb.is_none(),
+        "a NULL-embedding row must collapse the outer Option to None (matching get_embedding)"
+    );
+}
