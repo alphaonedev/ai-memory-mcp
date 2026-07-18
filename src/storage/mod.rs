@@ -8190,11 +8190,28 @@ pub fn proactive_conflict_check(
     // rationale and the advisory-miss contract. The unbounded
     // full-namespace decode+scan this replaces was the P2-measured
     // write-throughput collapse (0.3-1.7 rps under the HTTP mutex).
+    //
+    // v1.0.0 #2167 §9 (#2181) — like `check_duplicate`, the proactive
+    // conflict scan must NEVER cosine the live query vector against a
+    // foreign-space (same-dim model swap) or NULL-provenance stored
+    // vector: a meaningless cross-space cosine could surface a FALSE 409
+    // conflict advisory on a legitimate write (degrade/availability, not
+    // corruption, but posture-inconsistent with the S9 rationale that
+    // gated `check_duplicate` for exactly this reason). Gate the scan
+    // fallback pool on the process-wide active space (the space of the
+    // embedder that produced `query_embedding`); the nullable
+    // `?N IS NULL OR =` form keeps legacy dim-only behavior when no active
+    // space is seeded (keyword-only / no embedder). The ANN-routed path
+    // (`proactive_conflict_check_candidates`) is already effectively gated
+    // because the in-memory index only holds active-space vectors
+    // post-#2167 (`get_all_embeddings` seeds active-space rows only).
+    let active_space = crate::embeddings::active_embedding_space();
     let mut stmt = conn.prepare(
         "SELECT id, title, content, embedding FROM memories
          WHERE embedding IS NOT NULL
            AND (expires_at IS NULL OR expires_at > ?1)
            AND namespace = ?2
+           AND (?4 IS NULL OR embedding_space = ?4)
          ORDER BY updated_at DESC
          LIMIT ?3",
     )?;
@@ -8203,7 +8220,8 @@ pub fn proactive_conflict_check(
             params![
                 now,
                 &mem.namespace,
-                i64::try_from(PROACTIVE_CONFLICT_SCAN_LIMIT).unwrap_or(i64::MAX)
+                i64::try_from(PROACTIVE_CONFLICT_SCAN_LIMIT).unwrap_or(i64::MAX),
+                active_space
             ],
             |row| {
                 Ok((
@@ -12873,6 +12891,40 @@ pub fn get_embedding(conn: &Connection, id: &str) -> Result<Option<Vec<f32>>> {
         Some(bytes) if !bytes.is_empty() => {
             let floats = crate::embeddings::decode_embedding_blob(&bytes)?;
             Ok(Some(floats))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// v1.0.0 #2167 (#2181) — [`get_embedding`] plus the row's
+/// `embedding_space` provenance token (`None` = SQL NULL / unverified).
+///
+/// Used by the stored-vs-stored clustering paths
+/// (`autonomy::find_consolidation_clusters`, the curator
+/// `ConsolidationPass`) so a destructive near-duplicate MERGE decision is
+/// never taken on a cross-space cosine: two stored vectors are comparable
+/// only when both carry the SAME non-NULL space. A row with no embedding,
+/// or a blob that fails to decode, is `None` (blocks the merge for its
+/// pair, matching the #1774 missing-embedding-blocks-merge posture).
+///
+/// # Errors
+///
+/// Bubbles the rusqlite error from the row read or a blob-decode error.
+pub fn get_embedding_with_space(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<(Vec<f32>, Option<String>)>> {
+    let result: Option<(Option<Vec<u8>>, Option<String>)> = conn
+        .query_row(
+            "SELECT embedding, embedding_space FROM memories WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+    match result {
+        Some((Some(bytes), space)) if !bytes.is_empty() => {
+            let floats = crate::embeddings::decode_embedding_blob(&bytes)?;
+            Ok(Some((floats, space)))
         }
         _ => Ok(None),
     }
