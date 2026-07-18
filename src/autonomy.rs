@@ -355,11 +355,14 @@ pub(crate) fn find_consolidation_clusters(
             }
             let mut cluster = vec![group[i].clone()];
             used[i] = true;
-            // Cache the seed memory's embedding (looked up once per
-            // outer-loop iteration). `None` means "embedding missing
-            // for this memory" — per #1774 a missing embedding on
-            // either side blocks the merge for that pair.
-            let seed_emb = db::get_embedding(conn, &group[i].id).ok().flatten();
+            // Cache the seed memory's embedding + its `embedding_space`
+            // provenance (looked up once per outer-loop iteration). `None`
+            // means "embedding missing for this memory" — per #1774 a
+            // missing embedding on either side blocks the merge for that
+            // pair.
+            let seed_emb = db::get_embedding_with_space(conn, &group[i].id)
+                .ok()
+                .flatten();
             for j in (i + 1)..group.len() {
                 if used[j] {
                     continue;
@@ -374,16 +377,32 @@ pub(crate) fn find_consolidation_clusters(
                 }
                 // Stage 2 — cosine primary, when embeddings exist
                 // for both sides of the pair.
-                let pair_emb = db::get_embedding(conn, &group[j].id).ok().flatten();
+                let pair_emb = db::get_embedding_with_space(conn, &group[j].id)
+                    .ok()
+                    .flatten();
                 let matches_cluster = match (seed_emb.as_ref(), pair_emb.as_ref()) {
-                    (Some(a), Some(b)) => {
+                    // v1.0.0 #2167 (#2181) — a stored-vs-stored cosine is
+                    // meaningful ONLY when both vectors share the SAME
+                    // non-NULL embedding space. A mixed-space corpus (a
+                    // same-dim model swap, or NULL-provenance legacy rows)
+                    // must never be clustered/merged as a near-duplicate:
+                    // the cosine would be a meaningless cross-space number
+                    // feeding a destructive MERGE. This extends the #1774
+                    // missing-embedding-blocks-merge posture to
+                    // mismatched-space-blocks-merge (degrade-never-corrupt
+                    // applies to merge decisions too).
+                    (Some((a, space_a)), Some((b, space_b)))
+                        if space_a.is_some() && space_a == space_b =>
+                    {
                         let cos = f64::from(crate::embeddings::Embedder::cosine_similarity(a, b));
                         cos >= CONSOLIDATE_COSINE_THRESHOLD
                     }
                     // #1774 (5-agent vote 4d3ea1c5) — at least one side
-                    // has no embedding, so there is no cosine value. A
-                    // destructive merge is never decided on Jaccard
-                    // lexical overlap alone: the pair does NOT cluster.
+                    // has no embedding (or, #2181, the two carry
+                    // different / NULL spaces), so there is no trustworthy
+                    // cosine value. A destructive merge is never decided on
+                    // Jaccard lexical overlap alone: the pair does NOT
+                    // cluster.
                     _ => false,
                 };
                 if matches_cluster {

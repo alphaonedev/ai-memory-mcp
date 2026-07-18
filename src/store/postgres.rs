@@ -1327,8 +1327,9 @@ impl PostgresStore {
             tracing::warn!(
                 active_space = %active_fp,
                 "embedding-space adoption REFUSED (pg): corpus has demonstrated multi-space \
-                 history ([G2]); NULL-space rows stay excluded until `ai-memory reembed` \
-                 (re-derive from text)"
+                 history ([G2]). NULL-space rows self-heal on the serve-boot backfill (re-derived \
+                 from durable text); heal the FOREIGN-stamped rows with the opt-in \
+                 AI_MEMORY_PG_HEAL_FOREIGN_SPACE=1 knob (the `ai-memory reembed` CLI is sqlite-only)"
             );
             return Ok(0);
         }
@@ -1425,8 +1426,10 @@ impl PostgresStore {
             tracing::info!(
                 active_space = %active_fp,
                 "#2167 (pg): strict embed-model-match mode ON — skipping legacy NULL-space \
-                 adoption ([G1]); attest with `ai-memory reembed --stamp-only` or heal with \
-                 `ai-memory reembed`"
+                 adoption ([G1]). On postgres, NULL-space rows still self-heal via the serve-boot \
+                 backfill (re-derived from durable text); heal FOREIGN-stamped rows with the \
+                 opt-in AI_MEMORY_PG_HEAL_FOREIGN_SPACE=1 knob (the `ai-memory reembed` CLI is \
+                 sqlite-only)"
             );
         } else if let Err(e) = self
             .adopt_legacy_embedding_space(active_fp, active_dim)
@@ -1452,14 +1455,25 @@ impl PostgresStore {
                     }
                 }
                 if reembed_pending > 0 {
+                    // v1.0.0 #2183 — HONEST heal guidance: `ai-memory reembed`
+                    // is sqlite-only and does NOT operate on a postgres corpus,
+                    // so it is NOT named here. NULL-space rows self-heal via the
+                    // serve-boot backfill (which re-derives them from durable
+                    // text and stamps the active space). FOREIGN-stamped rows
+                    // (a same-dim model swap) heal via the opt-in, paced
+                    // `AI_MEMORY_PG_HEAL_FOREIGN_SPACE=1` knob, which widens the
+                    // same backfill sweep to re-derive them too.
                     tracing::warn!(
                         active_space = %active_fp,
                         reembed_pending,
                         census = %foreign_or_null.join(", "),
                         "#2167 embedding-space census (pg): {reembed_pending} embedded row(s) are \
                          NOT in the active space [{}] — they are excluded from semantic scoring \
-                         (still keyword-recallable). The serve-boot backfill re-embeds NULL-space \
-                         rows from durable text; heal foreign-stamped rows with `ai-memory reembed`",
+                         (still keyword-recallable). NULL-space rows self-heal on the serve-boot \
+                         backfill (re-derived from durable text). To heal FOREIGN-stamped rows \
+                         (after a same-dim model swap), set AI_MEMORY_PG_HEAL_FOREIGN_SPACE=1 so \
+                         the paced backfill sweep re-derives them too (the `ai-memory reembed` CLI \
+                         is sqlite-only and does NOT run on postgres)",
                         foreign_or_null.join(", ")
                     );
                 }
@@ -11811,6 +11825,30 @@ const NS_FILTER_SARGABLE: &str = "namespace = $1";
 /// Scan (the #1473 defect).
 const NS_FILTER_OPTIONAL: &str = "($1::text IS NULL OR namespace = $1)";
 
+/// v1.0.0 #2167 (#2183) — env knob for the OPT-IN postgres FOREIGN-space
+/// heal. When truthy, the serve-boot embedding-backfill sweep's
+/// `list_unembedded` scan ALSO returns rows stamped with a non-active
+/// `embedding_space` (the post-same-dim-model-swap state [G2] refuses to
+/// auto-adopt), so they are re-derived from durable text under the live
+/// embedder and re-stamped into the active space. Default OFF
+/// (byte-identical): re-embedding a large foreign corpus is a paced,
+/// opt-in operation — not a silent boot cost. The `ai-memory reembed` CLI
+/// is sqlite-only; this is the postgres-native heal path.
+const PG_HEAL_FOREIGN_SPACE_ENV: &str = "AI_MEMORY_PG_HEAL_FOREIGN_SPACE";
+
+/// Resolve the opt-in [`PG_HEAL_FOREIGN_SPACE_ENV`] knob (default `false`).
+/// Truthy tokens: `1`/`true`/`yes`/`on` (case-insensitive, trimmed) —
+/// mirrors the direct-read boolean-knob grammar used across the federation
+/// knobs.
+fn pg_heal_foreign_space_enabled() -> bool {
+    std::env::var(PG_HEAL_FOREIGN_SPACE_ENV).is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 /// Exclusive upper bound for a byte-ordered prefix range: the smallest
 /// string strictly greater than every string starting with `prefix`.
 ///
@@ -14696,17 +14734,52 @@ impl MemoryStore for PostgresStore {
             return Ok(Vec::new());
         }
         let cap: i64 = i64::try_from(limit).unwrap_or(LIST_FALLBACK_LIMIT_I64);
-        let rows = sqlx::query(
-            "SELECT id, title, content FROM memories \
-              WHERE embedding IS NULL \
-                 OR (embedding IS NOT NULL AND embedding_space IS NULL) \
-              ORDER BY created_at ASC \
-              LIMIT $1",
-        )
-        .bind(cap)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| to_store_err("list_unembedded", e))?;
+        // v1.0.0 #2167 (#2183) — the always-on predicate re-embeds
+        // NULL-embedding and NULL-space rows (the [G1]/[G2]-blocked legacy
+        // adoption gap). The OPT-IN `AI_MEMORY_PG_HEAL_FOREIGN_SPACE` knob
+        // additionally re-derives rows stamped with a FOREIGN (non-active)
+        // space — the post-same-dim-model-swap state that [G2] correctly
+        // refuses to adopt and that has no other heal path on postgres (the
+        // `ai-memory reembed` CLI is sqlite-only). Re-deriving from the
+        // durable text under the LIVE embedder is always safe, and
+        // `set_embeddings_batch` re-stamps the fresh vector with the active
+        // space, so each foreign row heals in ONE pass and leaves the set
+        // (monotone; the sweep terminates). Default OFF (byte-identical):
+        // re-embedding a large foreign corpus is a paced, opt-in operation
+        // (batched by `AI_MEMORY_EMBED_BACKFILL_BATCH`), not a silent boot
+        // cost / thundering-herd. Gated on a KNOWN active fingerprint so an
+        // unseeded (keyword-only) process never widens the scan.
+        let active_space = crate::embeddings::active_embedding_space();
+        let rows = if let (true, Some(active_fp)) =
+            (pg_heal_foreign_space_enabled(), active_space.as_deref())
+        {
+            sqlx::query(
+                "SELECT id, title, content FROM memories \
+                  WHERE embedding IS NULL \
+                     OR (embedding IS NOT NULL AND embedding_space IS NULL) \
+                     OR (embedding IS NOT NULL AND embedding_space IS NOT NULL \
+                         AND embedding_space <> $2) \
+                  ORDER BY created_at ASC \
+                  LIMIT $1",
+            )
+            .bind(cap)
+            .bind(active_fp)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("list_unembedded", e))?
+        } else {
+            sqlx::query(
+                "SELECT id, title, content FROM memories \
+                  WHERE embedding IS NULL \
+                     OR (embedding IS NOT NULL AND embedding_space IS NULL) \
+                  ORDER BY created_at ASC \
+                  LIMIT $1",
+            )
+            .bind(cap)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("list_unembedded", e))?
+        };
         rows.iter()
             .map(|r| {
                 Ok((
@@ -22401,6 +22474,26 @@ impl MemoryStore for PostgresStore {
                 .await
                 .map_err(|e| to_store_err("get_embedding", e))?;
         Ok(v.flatten().map(|vec| vec.to_vec()))
+    }
+
+    async fn get_embedding_with_space(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<(Vec<f32>, Option<String>)>> {
+        // v1.0.0 #2167 (#2181) — the stored vector PLUS its `embedding_space`
+        // provenance token so the curator `ConsolidationPass` never merges a
+        // cross-space pair (mismatched-space-blocks-merge). The outer Option
+        // is "row exists?"; a NULL embedding collapses to `None` (matching
+        // `get_embedding`). `embedding_space` is carried verbatim (`None` =
+        // SQL NULL / unverified).
+        let row: Option<(Option<pgvector::Vector>, Option<String>)> =
+            sqlx::query_as("SELECT embedding, embedding_space FROM memories WHERE id = $1 LIMIT 1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err("get_embedding_with_space", e))?;
+        Ok(row.and_then(|(emb, space)| emb.map(|vec| (vec.to_vec(), space))))
     }
 
     async fn next_versioned_title(&self, base_title: &str, namespace: &str) -> StoreResult<String> {
