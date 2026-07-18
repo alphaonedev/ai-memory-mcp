@@ -81,6 +81,14 @@ fn app_config_with_offline_api_embedder() -> AppConfig {
     }
 }
 
+/// A default `AppConfig` (no `tier`, no `[embeddings]` section) — the
+/// keyword-only posture. `build_embedder` resolves NO model in this shape
+/// (`resolve_embedder_model` / the tier preset both come back `None`), so
+/// `embedder_arc.as_ref()` is `None` at the `#2179` boot-maintenance guard.
+fn app_config_keyword_only() -> AppConfig {
+    AppConfig::default()
+}
+
 /// The daemon boot block runs `embedding_space_boot_maintenance` against the pg
 /// corpus when the store is Postgres AND an embedder is configured. Booting the
 /// full `bootstrap_serve` path with both conditions true executes the downcast +
@@ -118,6 +126,111 @@ async fn daemon_bootstrap_runs_pg_embedding_space_boot_maintenance_2179() {
     );
 
     // Stop the spawned background workers so the test tears down cleanly.
+    for handle in boot.task_handles {
+        handle.abort();
+    }
+}
+
+/// Guard-false arm (b): the store IS Postgres but NO embedder is configured
+/// (`embedder_arc.as_ref()` is `None`). The `#2179` boot-maintenance `if`
+/// short-circuits on the second `let`-chain condition and the block is
+/// SKIPPED — no downcast, no `embedding_space_boot_maintenance` call. Boot
+/// must still succeed cleanly (keyword-only postgres daemon is a supported
+/// posture) so this exercises the guard's false branch without disturbing
+/// startup.
+#[tokio::test]
+async fn daemon_bootstrap_skips_pg_boot_maintenance_when_no_embedder_configured() {
+    let Some(url) = pg_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile for local db");
+    let path = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+
+    let args = serve_args(&url);
+    let cfg = app_config_keyword_only();
+
+    let result = bootstrap_serve(&path, &args, &cfg).await;
+
+    let boot = result.expect(
+        "bootstrap_serve must boot a postgres-backed loopback daemon with NO embedder \
+         configured (keyword-only posture) — the #2179 boot-maintenance block must be \
+         skipped, not error, on the embedder-absent guard arm",
+    );
+    assert!(
+        matches!(
+            boot.app_state.storage_backend,
+            ai_memory::handlers::StorageBackend::Postgres
+        ),
+        "the daemon must still be postgres-backed — only the embedder is absent"
+    );
+    assert!(
+        boot.app_state.embedder.is_none(),
+        "keyword-only AppConfig must resolve to no embedder, so the #2179 guard's \
+         `let Some(emb) = embedder_arc.as_ref()` arm is FALSE"
+    );
+
+    for handle in boot.task_handles {
+        handle.abort();
+    }
+}
+
+/// Guard-false arm (a): the daemon is SQLITE-backed (no `store_url`) even
+/// though an embedder IS configured. `matches!(storage_backend, Postgres)`
+/// is false, so the `#2179` boot-maintenance `if` short-circuits on the
+/// FIRST condition and the block is skipped — no downcast attempted at all
+/// (the sqlite `store_handle` is not a `PostgresStore`). Requires
+/// `AI_MEMORY_TEST_POSTGRES_URL` only because this file is gated
+/// `#[cfg(feature = "sal-postgres")]` at the module level; the test itself
+/// does not touch postgres.
+#[tokio::test]
+async fn daemon_bootstrap_skips_pg_boot_maintenance_on_sqlite_backend() {
+    if pg_url().is_none() {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    }
+
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile for local db");
+    let path = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+
+    let args = ServeArgs {
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        tls_cert: None,
+        tls_key: None,
+        mtls_allowlist: None,
+        shutdown_grace_secs: 30,
+        quorum_writes: 0,
+        quorum_peers: vec![],
+        quorum_timeout_ms: 2000,
+        quorum_client_cert: None,
+        quorum_client_key: None,
+        quorum_ca_cert: None,
+        catchup_interval_secs: 30,
+        federation_identity: None,
+        store_url: None,
+    };
+    let cfg = app_config_with_offline_api_embedder();
+
+    let result = bootstrap_serve(&path, &args, &cfg).await;
+
+    let boot = result.expect(
+        "bootstrap_serve must boot a sqlite-backed loopback daemon with an embedder \
+         configured — the #2179 boot-maintenance block must be skipped (not error) on \
+         the non-postgres guard arm",
+    );
+    assert!(
+        matches!(
+            boot.app_state.storage_backend,
+            ai_memory::handlers::StorageBackend::Sqlite
+        ),
+        "no store_url must resolve to the sqlite backend, so the #2179 guard's \
+         `matches!(storage_backend, Postgres)` arm is FALSE"
+    );
+
     for handle in boot.task_handles {
         handle.abort();
     }
