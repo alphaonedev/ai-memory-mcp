@@ -118,9 +118,12 @@
 #       position (#2143), a `#[cfg(test)] mod` whose unbalanced `"}"`
 #       string literal would otherwise truncate the range early (#2144),
 #       an item-renaming `use std::io::stdin as input;` import (#2145),
-#       a fn-pointer `let f = std::io::stdin;` binding (#2145), and a
+#       a fn-pointer `let f = std::io::stdin;` binding (#2145), a
 #       GROUPED item-renaming `use std::io::{stdin as input, Write};`
-#       import (#2151)), verifies the gate catches all of them, verifies
+#       import (#2151), and a hard-TAB-indented MULTILINE grouped
+#       item-renaming import (#2162 -- the `\tstdin as inp,` line whose
+#       leading TAB the pre-fix `[{ ,]` preceding-char class missed)),
+#       verifies the gate catches all of them, verifies
 #       the sanctioned helper line and a `.stdin(` builder call are NOT
 #       flagged, verifies the #2152 negative-brace-balance WARN fires on
 #       a multi-line raw string whose body drives the count negative,
@@ -169,16 +172,32 @@ STDIN_TOKEN_PATTERN='(^|[^A-Za-z0-9_.])io::stdin([^A-Za-z0-9_(]|$)'
 # appears and the grouped form evades STDIN_TOKEN_PATTERN even though
 # it is the exact same `stdin as` evasion shape #2145 closed for the
 # single-import spelling (`use std::io::stdin as input;` IS caught,
-# because `io::stdin` survives unbroken there). `rustfmt` does not
-# split or rejoin a grouped `use` item's contents, so this evasion
-# survives the CI fmt gate exactly like #2145's other forms. Anchoring
-# directly on the `stdin as` token (preceded by start-of-line, `{`,
-# space, or comma — the positions a `use`-item name can occupy) covers
-# BOTH the plain and grouped spellings in one pattern; `stdin as` has
-# no legitimate non-import use in this codebase (verified against the
+# because `io::stdin` survives unbroken there). The SINGLE-LINE grouped
+# spelling (`use std::io::{stdin as input, Write};`) survives the CI
+# fmt gate unchanged, so anchoring on the `stdin as` token is required.
+# (Correction, issue #2162 Finding 2: an earlier note here claimed
+# "rustfmt does not split or rejoin a grouped `use` item's contents";
+# that is empirically FALSE — rustfmt DOES rejoin a short MULTILINE
+# grouped import onto one line. That normalizes toward the caught
+# single-line spelling, so it is in the SAFE direction, but the note
+# was wrong and is corrected here.) Anchoring directly on the `stdin
+# as` token (preceded by start-of-line, `{`, a BLANK — space or TAB —
+# or comma, the positions a `use`-item name can occupy) covers BOTH
+# the plain and grouped spellings in one pattern; `stdin as` has no
+# legitimate non-import use in this codebase (verified against the
 # real tree at authorship — a bare `stdin` identifier being `as`-cast
 # is not a shape this codebase exhibits).
-STDIN_ALIAS_PATTERN='(^|[{ ,])stdin[[:space:]]+as[[:space:]]'
+#
+# Issue #2162 Finding 1: the preceding-char class was `[{ ,]` — space
+# but NOT TAB — so a hard-TAB-indented multiline grouped alias line
+# (`\tstdin as inp,`) evaded the gate. rustfmt rewrites that multiline
+# form to the single-line grouping (which the class already caught via
+# `{`), so the evasion was fmt-gate-shielded and non-blocking; the
+# widened POSIX `[:blank:]` class (space + TAB) now catches the
+# tab-indented spelling directly, belt-and-braces, with no new
+# false-positive surface (a blank-preceded `stdin as` is still an
+# import item name).
+STDIN_ALIAS_PATTERN='(^|[{[:blank:],])stdin[[:space:]]+as[[:space:]]'
 
 # find_test_boundary <file>
 # Echoes the line number of the first `mod tests {` (or `pub mod tests {`,
@@ -443,7 +462,13 @@ if [[ "${1:-}" == "--self-test" ]]; then
     # truncated early, same as the documented #2152 residual) -- only
     # the WARN text is asserted, which is the honest scope of this fix.
     probe10="${ROOT}/src/.stdin_gate_multiline_negative_depth_probe.rs"
-    for p in "$probe1" "$probe2" "$probe3" "$probe4" "$probe5" "$probe6" "$probe7" "$probe8" "$probe9" "$probe10"; do
+    # Case 11 (#2162): a hard-TAB-indented MULTILINE grouped item-renaming
+    # import. The pre-fix STDIN_ALIAS_PATTERN preceding-char class `[{ ,]`
+    # covered space but NOT tab, so `\tstdin as inp,` on its own line
+    # evaded the gate. Lives under tests/ (test-code-from-line-1) so the
+    # import line is unconditionally test-reachable.
+    probe11="${ROOT}/tests/.stdin_gate_tab_grouped_alias_import_probe.rs"
+    for p in "$probe1" "$probe2" "$probe3" "$probe4" "$probe5" "$probe6" "$probe7" "$probe8" "$probe9" "$probe10" "$probe11"; do
         if [[ -e "$p" ]]; then
             echo "ERROR: self-test scratch file already exists: $p" >&2
             echo "(cleanup may have failed in a prior run — remove manually)" >&2
@@ -599,17 +624,39 @@ mod sneaky_ml_negative_probe {
     }
 }
 EOF
+    # Built with printf so the indent is a genuine hard TAB byte (a
+    # `<<'EOF'` heredoc's leading whitespace could be normalized by an
+    # editor / formatter and silently defeat the probe).
+    {
+        printf '%s\n' "// CONTRIVED VIOLATION for scripts/check-test-stdin-reads.sh --self-test."
+        printf '%s\n' "// Exercises issue #2162: a hard-TAB-indented MULTILINE grouped"
+        printf '%s\n' "// item-renaming import evades the space-only STDIN_ALIAS_PATTERN"
+        printf '%s\n' "// preceding-char class -- the leading TAB before \`stdin as\` is not"
+        printf '%s\n' "// \`{\`, space, or comma. rustfmt would rejoin this to the caught"
+        printf '%s\n' "// single-line spelling, so the evasion is fmt-gate-shielded; the"
+        printf '%s\n' "// widened \`[{[:blank:],]\` class catches it directly regardless."
+        printf '%s\n' "use std::io::{"
+        printf '\t%s\n' "stdin as inp,"
+        printf '%s\n' "    Write,"
+        printf '%s\n' "};"
+        printf '%s\n' "#[test]"
+        printf '%s\n' "fn contrived_tab_grouped_alias_import_reads_stdin() {"
+        printf '%s\n' "    let mut buf = String::new();"
+        printf '%s\n' "    let _ = inp().read_line(&mut buf);"
+        printf '%s\n' "    let _ = Write::flush(&mut std::io::stdout());"
+        printf '%s\n' "}"
+    } > "$probe11"
     set +e
     gate_output="$("$0" 2>&1)"
     gate_exit=$?
     set -e
-    rm -f "$probe1" "$probe2" "$probe3" "$probe4" "$probe5" "$probe6" "$probe7" "$probe8" "$probe9" "$probe10"
+    rm -f "$probe1" "$probe2" "$probe3" "$probe4" "$probe5" "$probe6" "$probe7" "$probe8" "$probe9" "$probe10" "$probe11"
     printf '%s\n' "$gate_output"
-    # PASS requires: non-zero exit, NINE probe violations reported (the
-    # tenth, #2152's negative-depth probe, is asserted via its loud WARN
-    # instead -- its stdin read is deliberately NOT expected caught, see
-    # the probe10 comment above), and the sanctioned helper line + the
-    # benign builder call NOT reported.
+    # PASS requires: non-zero exit, TEN probe violations reported (the
+    # #2152 negative-depth probe is asserted via its loud WARN instead --
+    # its stdin read is deliberately NOT expected caught, see the probe10
+    # comment above), and the sanctioned helper line + the benign builder
+    # call NOT reported.
     ok=1
     (( gate_exit != 0 )) || ok=0
     printf '%s' "$gate_output" | grep -q '\.stdin_gate_probe\.rs' || ok=0
@@ -621,6 +668,7 @@ EOF
     printf '%s' "$gate_output" | grep -q 'use std::io::stdin as input\|\.stdin_gate_alias_import_probe\.rs' || ok=0
     printf '%s' "$gate_output" | grep -q 'let f = std::io::stdin\|\.stdin_gate_fn_pointer_probe\.rs' || ok=0
     printf '%s' "$gate_output" | grep -q 'stdin as input\|\.stdin_gate_grouped_alias_import_probe\.rs' || ok=0
+    printf '%s' "$gate_output" | grep -q '\.stdin_gate_tab_grouped_alias_import_probe\.rs' || ok=0
     printf '%s' "$gate_output" | grep -q 'brace-balance went NEGATIVE.*stdin_gate_multiline_negative_depth_probe' || ok=0
     if printf '%s' "$gate_output" | grep -q '_sanctioned'; then
         echo "" >&2
@@ -634,7 +682,7 @@ EOF
     fi
     if (( ok == 1 )); then
         echo ""
-        echo "Test-stdin gate self-test: PASS (caught nine contrived violations + fired the #2152 negative-depth WARN, spared the sanctioned helper + benign builder call; exit=${gate_exit})"
+        echo "Test-stdin gate self-test: PASS (caught ten contrived violations + fired the #2152 negative-depth WARN, spared the sanctioned helper + benign builder call; exit=${gate_exit})"
         exit 0
     else
         echo "" >&2
