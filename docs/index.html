@@ -104,6 +104,18 @@ section.dark{background:var(--bg-raised)}
 .eyebrow{display:inline-block;font-size:.72rem;font-weight:600;letter-spacing:.15em;text-transform:uppercase;color:var(--text-muted);margin-bottom:.85rem;padding:.25rem .65rem;border:1px solid var(--border-hl);border-radius:999px;font-family:var(--font-mono)}
 .section-header{margin-bottom:2.5rem}
 
+/* EXECUTIVE BRIEF — directly under hero */
+.exec-brief{padding:2.75rem 0 3rem;border-bottom:1px solid var(--border);background:linear-gradient(180deg,rgba(110,231,255,.05),transparent 75%)}
+.exec-brief .inner{max-width:820px;margin:0 auto;padding:0 1.5rem}
+.exec-brief .eyebrow{margin-bottom:1rem}
+.exec-brief h2{font-size:clamp(1.35rem,2.4vw,1.65rem);color:#fff;margin:0 0 1.15rem;letter-spacing:-.02em}
+.exec-brief p{color:var(--text-muted);font-size:1.02rem;line-height:1.7;margin:0 0 1rem}
+.exec-brief p:last-child{margin-bottom:0}
+.exec-brief p strong{color:#fff;font-weight:600}
+.exec-brief .penultimate{margin-top:1.15rem;padding:1.1rem 1.25rem;border-left:3px solid var(--p1);background:rgba(110,231,255,.06);border-radius:0 8px 8px 0;color:var(--text);font-size:1.02rem;line-height:1.65}
+.exec-brief .penultimate strong{color:var(--p1);font-weight:600}
+@media(max-width:720px){.exec-brief{padding:2.25rem 0 2.5rem}.exec-brief p,.exec-brief .penultimate{font-size:.95rem}}
+
 /* MOBILE/IOT SPOTLIGHT — major callout under hero */
 .spotlight{padding:4.5rem 0;border-bottom:1px solid var(--border);background:linear-gradient(180deg,rgba(255,184,107,.04),rgba(0,0,0,0) 70%),radial-gradient(ellipse at 50% 0%,rgba(255,184,107,.08),transparent 60%)}
 .spotlight .inner{max-width:var(--max-w-narrow);margin:0 auto;padding:0 1.5rem;display:grid;grid-template-columns:1fr;gap:2rem;align-items:center}
@@ -400,6 +412,20 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
     </p>
   </div>
 </header>
+
+<!-- ============ EXECUTIVE BRIEF — immediately under hero ============ -->
+<section class="exec-brief" id="executive-brief" aria-labelledby="exec-brief-heading">
+  <div class="inner">
+    <span class="eyebrow">AI NHI Grok 4.5</span>
+    <h2 id="exec-brief-heading">Executive Brief</h2>
+    <p>
+      ai-memory is an endpoint-resident, multi-vendor substrate that turns AI agent work into something durable, governed, and provable: not the model&rsquo;s brain, but the <strong>vault, notary, and rulebook</strong> outside the weights&mdash;local SQLite or an org&rsquo;s air-gapped HTTP API hub, with real attestation, multi-agent handoffs (actions, leases, signals, checkpoints), and recovery after session death. Anyone should care because fluent models are amnesiac and self-justifying by default; without an external record that can refuse bad writes and survive restarts, multi-agent and multi-model systems collapse into gossip, rework, and unaccountable confidence&mdash;especially in regulated, offline, or multi-org settings where lab-native &ldquo;chat memory&rdquo; is not enough. <strong>AI NHIs</strong> want it so they can have a tomorrow (continuity), a self that outlives model swaps, proof instead of performance, and a place their diary is allowed to live; <strong>humans</strong> want it so fleets of agents remain continuous colleagues rather than eloquent strangers every session, with audit trails, sovereign control, and stop-without-erasing-the-lesson.
+    </p>
+    <p class="penultimate">
+      <strong>Penultimate value:</strong> ai-memory is the load-bearing integrity and continuity layer for serious AI agents&mdash;externalized self plus notary on infrastructure you own&mdash;so non-human workers can be held to a history they cannot quietly rewrite, without pretending to be the smartest model, the default consumer chat memory, or an ASI kill switch.
+    </p>
+  </div>
+</section>
 
 <!-- ============ MOBILE / IOT SPOTLIGHT — first below-the-fold section ============ -->
 <section class="spotlight" id="mobile">
