@@ -47,6 +47,19 @@ impl From<OnConflict> for ConflictMode {
     }
 }
 
+/// v1.0.0 #2006 — arguments for `ai-memory export`.
+#[derive(Args, Default)]
+pub struct ExportArgs {
+    /// Emit the FULL Portability-v2 integrity envelope — every signed record
+    /// class (audit chain, revisions, tombstones, lineage, attestations,
+    /// governance rules + trust anchors) byte-preserved and re-verifiable at
+    /// import, with a computed `conformance_level` (L1/L2/L3) marker. This is
+    /// the integrity portability path. Without `--full`, `export` stays the
+    /// memories+links convenience view.
+    #[arg(long, default_value_t = false)]
+    pub full: bool,
+}
+
 #[derive(Args)]
 pub struct ImportArgs {
     /// Trust `metadata.agent_id` in imported JSON (default: restamp with caller's id).
@@ -107,10 +120,28 @@ pub struct MineArgs {
 /// The full integrity-complete exporter defers to v1.x (see
 /// `docs/spec/PORTABILITY-V2.md` §V2-7). The serialization core
 /// (`db::export_all` / `db::export_links`) is deliberately untouched.
-pub fn export(db_path: &Path, out: &mut CliOutput<'_>) -> Result<()> {
+pub fn export(db_path: &Path, args: &ExportArgs, out: &mut CliOutput<'_>) -> Result<()> {
     use crate::export_scope;
     use crate::models::field_names;
     let conn = db::open(db_path)?;
+
+    // v1.0.0 #2006 — the integrity portability path. `--full` emits the full
+    // Portability-v2 envelope (every signed record class byte-preserved +
+    // re-verifiable, spec `docs/spec/PORTABILITY-V2.md`) with a COMPUTED
+    // `conformance_level` marker. This IS the portability path, so it does NOT
+    // emit the scope-limiting stderr WARN the convenience view carries. The
+    // memories are still screened by `build_full_envelope` (same
+    // confidentiality boundary).
+    if args.full {
+        let envelope = crate::portability::emit::build_full_envelope(
+            &conn,
+            "ai-memory",
+            &Utc::now().to_rfc3339(),
+        )?;
+        writeln!(out.stdout, "{}", serde_json::to_string_pretty(&envelope)?)?;
+        return Ok(());
+    }
+
     let memories = db::export_all(&conn)?;
     // v1.0.0 Gate-3 (#1838/G28 + #1844) — unify the export confidentiality
     // boundary with the HTTP admin sibling (`handlers::admin::export_memories`).
@@ -171,6 +202,20 @@ pub(crate) fn import_from_str(
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     let data: serde_json::Value = serde_json::from_str(payload)?;
+
+    // v1.0.0 #2006 — a v2 integrity envelope carries `spec_version`. Route it to
+    // the full byte-preserving, re-verifying importer (a faithful round-trip:
+    // preserves every field VERBATIM, so no agent-id restamp — the integrity
+    // guarantee IS verbatim preservation). A v1 payload (memories+links, no
+    // `spec_version`) stays on the L1 path below, UNCHANGED.
+    if data.get("spec_version").is_some() {
+        let envelope: crate::portability::emit::ExportEnvelope = serde_json::from_value(data)?;
+        let conn = db::open(db_path)?;
+        let report = crate::portability::import::import_full_envelope(&conn, &envelope)?;
+        writeln!(out.stdout, "{}", serde_json::to_string_pretty(&report)?)?;
+        return Ok(());
+    }
+
     let memories: Vec<models::Memory> =
         serde_json::from_value(data.get("memories").cloned().unwrap_or_default())?;
     let links: Vec<models::MemoryLink> =
@@ -497,7 +542,7 @@ mod tests {
         let _ = seed_memory(&db, "ns-init", "init", "init");
         {
             let mut out = env.output();
-            export(&db, &mut out).unwrap();
+            export(&db, &ExportArgs::default(), &mut out).unwrap();
         }
         let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
         assert!(v["memories"].is_array());
@@ -519,7 +564,7 @@ mod tests {
         drop(conn);
         {
             let mut out = env.output();
-            export(&db, &mut out).unwrap();
+            export(&db, &ExportArgs::default(), &mut out).unwrap();
         }
         let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
         let mems = v["memories"].as_array().unwrap();
@@ -535,7 +580,7 @@ mod tests {
         let _ = seed_memory(&db, "ns", "x", "y");
         {
             let mut out = env.output();
-            export(&db, &mut out).unwrap();
+            export(&db, &ExportArgs::default(), &mut out).unwrap();
         }
         // Pretty-printed JSON has at least one newline + 2-space indent.
         let s = env.stdout_str();
@@ -549,7 +594,7 @@ mod tests {
         let mut buf = Vec::<u8>::new();
         let mut errbuf = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut buf, &mut errbuf);
-        export(db_path, &mut out).unwrap();
+        export(db_path, &ExportArgs::default(), &mut out).unwrap();
         String::from_utf8(buf).unwrap()
     }
 
