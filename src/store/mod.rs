@@ -3143,6 +3143,33 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// v1.0.0 #2167 (#2181) — [`Self::get_embedding`] plus the row's
+    /// `embedding_space` provenance token (`None` = SQL NULL / unverified).
+    ///
+    /// The curator `ConsolidationPass` reads this so a destructive
+    /// near-duplicate MERGE is never decided on a cross-space cosine: two
+    /// stored vectors are comparable only when both carry the SAME non-NULL
+    /// space (a same-dim model swap, or a NULL-provenance legacy row, must
+    /// block the merge — the #1774 missing-embedding-blocks-merge posture
+    /// extended to mismatched-space-blocks-merge).
+    ///
+    /// The default impl delegates to [`Self::get_embedding`] and reports the
+    /// space as `None` (unverified) — a backend that does not override this
+    /// therefore blocks every merge, the fail-closed (degrade-never-corrupt)
+    /// default. `SqliteStore` and `PostgresStore` override it to return the
+    /// real stored space.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn get_embedding_with_space(
+        &self,
+        ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<(Vec<f32>, Option<String>)>> {
+        Ok(self.get_embedding(ctx, id).await?.map(|v| (v, None)))
+    }
+
     /// Pick a title that does not collide with an existing
     /// `(title, namespace)` row by appending `(2)`, `(3)`, ... up to
     /// the substrate's hard cap. Used by `on_conflict='version'`.
