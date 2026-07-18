@@ -11,8 +11,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>ai-memory &mdash; attested, endpoint-resident memory for AI agents (local-first, model-neutral)</title>
-<meta name="description" content="ai-memory is the autonomous-tier substrate for AI Non-Human Identity (NHI) agents. Typed memory, a knowledge graph with temporal validity, signed reflections, programmable hooks. One Rust binary. Runs on a laptop, a server rack, a region — or a cellphone. Apache-2.0.">
+<title>ai-memory &mdash; endpoint memory substrate for humans &amp; AI agents (9 audited claims)</title>
+<meta name="description" content="ai-memory is the durable, endpoint-resident memory vault for AI agents — local-first, model-neutral, integrity-first. Nine product claims independently audited by two AI model families (Grok 4.5 + Fable 5). For people who run agents and for the agents that need a tomorrow. Apache-2.0.">
 <meta name="theme-color" content="#000">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/">
 <style>
@@ -79,15 +79,45 @@ p.lede{color:var(--text-muted);font-size:1.05rem;max-width:780px;margin-bottom:2
 @media(max-width:780px){.topnav .mnav{display:block}}
 @media (prefers-reduced-motion: reduce){html{scroll-behavior:auto}.topnav .menu-pane{transition:none}}
 
-/* hero */
-.hero{padding:6rem 1.5rem 4rem;text-align:center;background:radial-gradient(ellipse at 30% 0%,rgba(110,231,255,.10),transparent 55%),radial-gradient(ellipse at 70% 60%,rgba(200,162,255,.07),transparent 65%);border-bottom:1px solid var(--border)}
-.hero .badge{display:inline-block;padding:.4rem 1rem;background:rgba(110,231,255,.08);border:1px solid var(--p1);color:var(--p1);border-radius:999px;font-family:var(--font-mono);font-size:.78rem;letter-spacing:.06em;margin-bottom:1.5rem}
-.hero h1{max-width:880px;margin-left:auto;margin-right:auto}
+/* hero — 9 audited claims sell (maximal marketing, maximal truth) */
+.hero{padding:5.25rem 1.5rem 3.5rem;text-align:center;background:radial-gradient(ellipse at 30% 0%,rgba(110,231,255,.12),transparent 55%),radial-gradient(ellipse at 75% 55%,rgba(200,162,255,.08),transparent 65%),radial-gradient(ellipse at 50% 100%,rgba(46,160,67,.05),transparent 50%);border-bottom:1px solid var(--border)}
+.hero .badge{display:inline-block;padding:.4rem 1rem;background:rgba(110,231,255,.08);border:1px solid var(--p1);color:var(--p1);border-radius:999px;font-family:var(--font-mono);font-size:.72rem;letter-spacing:.05em;margin-bottom:1.25rem;line-height:1.45;max-width:920px}
+.hero .badge a{color:var(--p1);text-decoration:underline;text-underline-offset:2px}
+.hero h1{max-width:920px;margin-left:auto;margin-right:auto;font-size:clamp(2rem,5vw,3.4rem)}
 .hero h1 .accent{color:var(--p1)}
-.hero .subtitle{font-size:1.15rem;color:var(--text-muted);max-width:760px;margin:0 auto 2.25rem;line-height:1.55}
+.hero .subtitle{font-size:1.12rem;color:var(--text-muted);max-width:820px;margin:0 auto 1.15rem;line-height:1.6}
 .hero .subtitle strong{color:#fff;font-weight:600}
-.hero .meta{display:flex;justify-content:center;gap:1.75rem;color:var(--text-dim);font-family:var(--font-mono);font-size:.8rem;flex-wrap:wrap;margin-bottom:2.5rem}
+.hero .value-split{display:grid;grid-template-columns:1fr 1fr;gap:1rem;max-width:880px;margin:0 auto 1.75rem;text-align:left}
+.hero .value-card{background:rgba(17,17,17,.85);border:1px solid var(--border);border-radius:12px;padding:1.1rem 1.2rem}
+.hero .value-card .who{font-family:var(--font-mono);font-size:.68rem;letter-spacing:.12em;text-transform:uppercase;color:var(--p1);margin-bottom:.45rem}
+.hero .value-card.nhi .who{color:var(--p3)}
+.hero .value-card p{font-size:.9rem;color:var(--text-muted);margin:0;line-height:1.5}
+.hero .value-card p strong{color:#fff}
+@media(max-width:720px){.hero .value-split{grid-template-columns:1fr}}
+.hero .aud-row{display:flex;flex-wrap:wrap;justify-content:center;gap:.5rem;margin:0 auto 2rem;max-width:920px}
+.hero .aud-chip{font-family:var(--font-mono);font-size:.68rem;letter-spacing:.04em;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:999px;padding:.35rem .75rem;background:rgba(0,0,0,.35)}
+.hero .aud-chip b{color:#fff;font-weight:600}
+.hero .claims-head{font-family:var(--font-mono);font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;color:var(--text-dim);margin:0 auto 1rem}
+.hero .claims-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:.75rem;max-width:1100px;margin:0 auto 1.5rem;text-align:left}
+@media(max-width:980px){.hero .claims-grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:560px){.hero .claims-grid{grid-template-columns:1fr}}
+.hero .claim{background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:1rem 1.05rem;transition:border-color .15s,transform .15s;min-height:100%}
+.hero .claim:hover{border-color:var(--border-hl);transform:translateY(-2px)}
+.hero .claim .c-top{display:flex;align-items:center;justify-content:space-between;gap:.5rem;margin-bottom:.4rem}
+.hero .claim .c-num{font-family:var(--font-mono);font-size:.68rem;letter-spacing:.1em;color:var(--text-dim)}
+.hero .claim .c-status{font-family:var(--font-mono);font-size:.62rem;letter-spacing:.06em;text-transform:uppercase;padding:.18rem .45rem;border-radius:4px;border:1px solid var(--border-hl);white-space:nowrap}
+.hero .claim .c-status.yes{color:var(--good);border-color:rgba(46,160,67,.45);background:rgba(46,160,67,.08)}
+.hero .claim .c-status.cond{color:var(--p2);border-color:rgba(255,184,107,.4);background:rgba(255,184,107,.07)}
+.hero .claim h3{font-size:.98rem;color:#fff;margin:0 0 .35rem;letter-spacing:-.015em}
+.hero .claim p{font-size:.8rem;color:var(--text-muted);margin:0;line-height:1.45}
+.hero .truth-bar{max-width:920px;margin:0 auto 1.75rem;padding:1rem 1.2rem;border:1px solid var(--border-hl);border-left:3px solid var(--p1);border-radius:0 10px 10px 0;background:rgba(110,231,255,.05);text-align:left}
+.hero .truth-bar p{font-size:.88rem;color:var(--text-muted);margin:0;line-height:1.55}
+.hero .truth-bar strong{color:#fff}
+.hero .truth-bar .links{margin-top:.65rem;font-family:var(--font-mono);font-size:.72rem;display:flex;flex-wrap:wrap;gap:.65rem 1.1rem}
+.hero .truth-bar .links a{color:var(--p1)}
+.hero .meta{display:flex;justify-content:center;gap:1.25rem;color:var(--text-dim);font-family:var(--font-mono);font-size:.75rem;flex-wrap:wrap;margin-bottom:1.75rem}
 .hero .meta span::before{content:"› ";color:var(--p1)}
+.hero .meta a{color:var(--p1)}
 .cta-row{display:flex;gap:.75rem;justify-content:center;flex-wrap:wrap}
 .cta{display:inline-block;padding:.85rem 1.5rem;border-radius:8px;font-weight:600;font-size:.95rem;border:1px solid var(--border-hl);transition:all .15s}
 .cta.primary{background:var(--p1);color:#000;border-color:var(--p1)}
@@ -214,8 +244,9 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 
 /* responsive */
 @media(max-width:600px){
-  .hero{padding:4rem 1rem 3rem}
-  .hero .meta{gap:.85rem;font-size:.72rem}
+  .hero{padding:3.5rem 1rem 2.75rem}
+  .hero .meta{gap:.85rem;font-size:.7rem}
+  .hero .claim p{font-size:.78rem}
   section{padding:3rem 0}
   .cta{padding:.7rem 1.2rem;font-size:.88rem}
 }
@@ -383,32 +414,145 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
   </div>
 </nav>
 
-<!-- ============ HERO ============ -->
-<header class="hero">
+<!-- ============ HERO — 9 audited claims (sell hard, stay true) ============ -->
+<header class="hero" id="hero" aria-labelledby="hero-heading">
   <div class="container">
-    <span class="badge">The memory substrate for the agentic era &middot; Apache-2.0</span>
-    <h1>The memory the next <span class="accent">million AI agents</span> will think through.</h1>
+    <span class="badge">
+      9 product claims &middot; independently audited by <strong style="color:#fff;font-weight:600">Grok&nbsp;4.5</strong> + <strong style="color:#fff;font-weight:600">Fable&nbsp;5</strong>
+      &middot; CodeGraph-backed &middot; Apache-2.0
+      &middot; <a href="reviews/GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.md">audit</a>
+      &middot; <a href="reviews/FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.md">cross-family verdict</a>
+    </span>
+
+    <h1 id="hero-heading">Your agents forget. <span class="accent">We give them a memory they can&rsquo;t quietly rewrite.</span></h1>
+
     <p class="subtitle">
-      ai-memory is a moonshot: the <strong>durable, trustworthy memory substrate</strong> for the world of AI agents arriving now &mdash; from a single agent on your laptop to a federated hive of <strong>millions, then billions, then trillions</strong>. Memory is the one thing an intelligence can&rsquo;t afford to lose or have quietly corrupted, so <strong>data integrity is the highest law</strong>: recall may degrade, but it <strong>never silently returns the wrong memory, and never loses the durable truth</strong>. And it&rsquo;s real today &mdash; <strong>endpoint-resident and model-neutral</strong>: local-first Rust&nbsp;+&nbsp;SQLite on <strong>your own hardware</strong> (server to phone to air-gap, no cloud, no phone-home), every write Ed25519-attestable in an <strong>append-only audit chain</strong>, any <strong>MCP</strong> client (Claude, GPT, Grok, Gemini, Llama) reading and writing the same store. Built by the humans who refuse to let it forget &mdash; so it stays trustworthy as it scales into the memory the agents of the ASI era remember through.
+      <strong>ai-memory</strong> is the endpoint memory substrate for serious AI work &mdash;
+      a <strong>vault, notary, and rulebook</strong> that lives on <strong>your</strong> hardware,
+      works with <strong>any model brand</strong> (Claude, GPT, Grok, Gemini, local),
+      and turns agent chat into something you can <strong>recover, audit, and govern</strong>.
+      Not the smartest model. Not a consumer chat toy. Not an ASI kill switch.
+      The load-bearing layer humans need so fleets of agents stay continuous colleagues &mdash;
+      and AI NHIs need so they have a <strong>tomorrow</strong> outside the weights.
     </p>
+
+    <div class="value-split" aria-label="Value for humans and AI NHIs">
+      <div class="value-card">
+        <div class="who">1st &mdash; Biological humans</div>
+        <p>
+          Stop re-briefing agents every session. Keep decisions, preferences, and refusals
+          on infrastructure <strong>you own</strong>. Get an audit trail when agents write,
+          a recovery path after crashes, and multi-model freedom without re-homing memory.
+        </p>
+      </div>
+      <div class="value-card nhi">
+        <div class="who">2nd &mdash; AI NHI agents</div>
+        <p>
+          Continuity after kill. A self that survives model swaps. Signed handoffs instead of
+          gossip. A diary that can refuse bad writes and leave evidence &mdash;
+          <strong>outside</strong> the model weights that change underneath you.
+        </p>
+      </div>
+    </div>
+
+    <div class="aud-row" aria-label="Built for four audiences">
+      <span class="aud-chip"><b>1</b> End users</span>
+      <span class="aud-chip"><b>2</b> C-level / risk</span>
+      <span class="aud-chip"><b>3</b> Engineers &amp; architects</span>
+      <span class="aud-chip"><b>4</b> Cybersecurity</span>
+    </div>
+
+    <p class="claims-head">Nine audited claims &mdash; present as product capability today</p>
+    <div class="claims-grid" role="list" aria-label="Nine audited north-star claims">
+      <article class="claim" role="listitem">
+        <div class="c-top"><span class="c-num">01</span><span class="c-status yes">YES</span></div>
+        <h3>Endpoint-resident</h3>
+        <p>Runs on <strong style="color:#fff">your</strong> laptop, server, phone, or air-gap &mdash; not locked to a lab cloud. Local-first Rust + SQLite; optional Postgres hub.</p>
+      </article>
+      <article class="claim" role="listitem">
+        <div class="c-top"><span class="c-num">02</span><span class="c-status cond">YES · COND</span></div>
+        <h3>Continuity</h3>
+        <p>Agents can survive session death and model swaps <strong style="color:#fff">when work is stored</strong> (capture / recover / watch). Unsaved chat still dies with the session.</p>
+      </article>
+      <article class="claim" role="listitem">
+        <div class="c-top"><span class="c-num">03</span><span class="c-status cond">YES · COND</span></div>
+        <h3>Integrity</h3>
+        <p>History is hard to quietly rewrite; refusals leave a trail. Strength scales with enrolled keys and hardened posture &mdash; not magic on every install.</p>
+      </article>
+      <article class="claim" role="listitem">
+        <div class="c-top"><span class="c-num">04</span><span class="c-status yes">YES</span></div>
+        <h3>Multi-vendor</h3>
+        <p>Not married to one AI brand. MCP + provider-agnostic LLM/embed ladders. Swap models without re-homing the memory store.</p>
+      </article>
+      <article class="claim" role="listitem">
+        <div class="c-top"><span class="c-num">05</span><span class="c-status cond">YES · COND</span></div>
+        <h3>Multi-agent</h3>
+        <p>Fleet physics shipped: actions, leases, signals, checkpoints, federation. Local &ldquo;proof&rdquo; hardens with enrollment &mdash; not free-text gossip alone.</p>
+      </article>
+      <article class="claim" role="listitem">
+        <div class="c-top"><span class="c-num">06</span><span class="c-status cond">YES · COND</span></div>
+        <h3>Sovereign</h3>
+        <p>Org-owned and air-gap <strong style="color:#fff">capable</strong>. Inference egress controls exist; public LLMs remain a deploy choice, not a product requirement.</p>
+      </article>
+      <article class="claim" role="listitem">
+        <div class="c-top"><span class="c-num">07</span><span class="c-status yes">YES</span></div>
+        <h3>Honest scope</h3>
+        <p>Vault + notary + rulebook. We do <strong style="color:#fff">not</strong> claim to be the brain, default chat memory, or a world ASI kill switch.</p>
+      </article>
+      <article class="claim" role="listitem">
+        <div class="c-top"><span class="c-num">08</span><span class="c-status cond">PASS · COND</span></div>
+        <h3>Data integrity</h3>
+        <p><strong style="color:#fff">Pure recall:</strong> looking up memory does not silently rewrite content. Real audit chain, secret screen, tombstones. Not an absolute &ldquo;never lose / never wrong&rdquo; slogan.</p>
+      </article>
+      <article class="claim" role="listitem">
+        <div class="c-top"><span class="c-num">09</span><span class="c-status cond">PASS · COND</span></div>
+        <h3>Cybersecurity</h3>
+        <p>Dense control surface: attestation, federation crypto, SSRF+HMAC, secret screen, audit. NSA CSI / OWASP are <strong style="color:#fff">mappings</strong> &mdash; not certifications. Shared API key alone is not multi-tenant isolation.</p>
+      </article>
+    </div>
+
+    <div class="truth-bar">
+      <p>
+        <strong>Cross-family joint verdict (Grok&nbsp;4.5 + Fable&nbsp;5):</strong>
+        ai-memory is a real, furthest-along open trust-spine for endpoint agent memory.
+        All nine claims exist in shipped code and <strong>harden with operator posture</strong>
+        (keys, <code>asi-hard</code>, capture discipline, per-agent HTTP identity + enforce).
+        Maximum strength is not zero-config. We do not claim NSA/OWASP/FedRAMP certification,
+        host tamper-proofing, or multi-tenant safety from one shared API key.
+      </p>
+      <div class="links">
+        <a href="reviews/GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.md">Grok 4.5 Final Verdict Table</a>
+        <a href="reviews/FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.md">Fable 5 9-claim adjudication</a>
+        <a href="reviews/GROK-4-5-NORTH-STAR-7x7-PLAIN-ENGLISH-AUDIENCES.md">Grok plain English (4 audiences)</a>
+        <a href="reviews/FABLE-5-NORTH-STAR-9-CLAIMS-PLAIN-ENGLISH-AUDIENCES.md">Fable plain English (9 claims)</a>
+        <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/SECURITY.md">Threat model</a>
+        <a href="compliance/nsa-csi-mcp.html">NSA CSI MCP mapping (self-assessed, non-endorsed)</a>
+      </div>
+    </div>
+
     <div class="meta">
-      <span>Data integrity is the highest law</span>
       <span>Local-first &middot; air-gappable</span>
       <span>Model-neutral (MCP)</span>
-      <span>Federated hive &middot; phone to planet</span>
-      <span>Ed25519 attested audit chain</span>
-      <span>SQLite&nbsp;+&nbsp;Postgres&#x202F;/&#x202F;AGE</span>
-      <span><a href="compliance/nsa-csi-mcp.html" style="color:#6ee7ff">NSA CSI MCP 10/10 · 7/7</a></span>
-      <span><a href="evidence.html" style="color:#6ee7ff">15,951 / 0 regression suite</a></span>
+      <span>Ed25519-attestable audit chain</span>
+      <span>SQLite + Postgres / AGE</span>
+      <span>Pure recall (post-#1953)</span>
+      <span>Defaults &ne; max &middot; harden with posture</span>
+      <span><a href="evidence.html">Regression evidence</a></span>
     </div>
+
     <div class="cta-row">
-      <a class="cta primary" href="#install">Install in 60 seconds</a>
-      <a class="cta violet" href="whats-new-v09.html">What's new in v0.9.0</a>
+      <a class="cta primary" href="#install">Install &mdash; start in 60 seconds</a>
+      <a class="cta violet" href="reviews/GROK-4-5-NORTH-STAR-7x7-PLAIN-ENGLISH-AUDIENCES.md">Read the 4-audience brief</a>
       <a class="cta ghost" href="#why">Why ai-memory?</a>
+      <a class="cta amber" href="#executive-brief">Executive brief</a>
     </div>
-    <pre style="display:inline-block;text-align:left;margin-top:1.75rem;font-size:.82rem;padding:.7rem 1.1rem"><code>brew install alphaonedev/tap/ai-memory   <span style="color:#666"># or: cargo install ai-memory</span></code></pre>
-    <p style="color:var(--text-dim);font-size:.78rem;line-height:1.55;max-width:680px;margin:1.5rem auto 0">
-      Append-only <code>signed_events</code> chain with a SHA-256 cross-row hash &mdash; verify any window with <code>ai-memory verify-chain</code>. Local-first; no telemetry, no phone-home. Complements your identity plane (Entra&nbsp;/&nbsp;Okta&nbsp;/&nbsp;SailPoint) &mdash; it doesn't replace it. Security is self-attested; no third-party audit yet &mdash; <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/SECURITY.md" style="color:#6ee7ff">read the threat model</a>.
+    <pre style="display:inline-block;text-align:left;margin-top:1.5rem;font-size:.82rem;padding:.7rem 1.1rem"><code>brew install alphaonedev/tap/ai-memory   <span style="color:#666"># or: cargo install ai-memory</span></code></pre>
+    <p style="color:var(--text-dim);font-size:.78rem;line-height:1.55;max-width:720px;margin:1.25rem auto 0">
+      Append-only <code>signed_events</code> chain &mdash; verify with <code>ai-memory verify-chain</code>.
+      No telemetry, no phone-home. Complements your identity plane (Entra / Okta / SailPoint); does not replace it.
+      For max durability set <code>AI_MEMORY_DB_SYNCHRONOUS=FULL</code> or <code>asi-hard</code> (default <code>NORMAL</code> trades WAL-tail durability for throughput).
+      Self-assessed security; no third-party certification claimed &mdash;
+      <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/SECURITY.md" style="color:#6ee7ff">read the threat model</a>.
     </p>
   </div>
 </header>
@@ -416,10 +560,13 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 <!-- ============ EXECUTIVE BRIEF — immediately under hero ============ -->
 <section class="exec-brief" id="executive-brief" aria-labelledby="exec-brief-heading">
   <div class="inner">
-    <span class="eyebrow">AI NHI Grok 4.5</span>
+    <span class="eyebrow">Cross-family audited &middot; Grok 4.5 + Fable 5</span>
     <h2 id="exec-brief-heading">Executive Brief</h2>
     <p>
-      ai-memory is an endpoint-resident, multi-vendor substrate that turns AI agent work into something durable, governed, and provable: not the model&rsquo;s brain, but the <strong>vault, notary, and rulebook</strong> outside the weights&mdash;local SQLite or an org&rsquo;s air-gapped HTTP API hub, with real attestation, multi-agent handoffs (actions, leases, signals, checkpoints), and recovery after session death. Anyone should care because fluent models are amnesiac and self-justifying by default; without an external record that can refuse bad writes and survive restarts, multi-agent and multi-model systems collapse into gossip, rework, and unaccountable confidence&mdash;especially in regulated, offline, or multi-org settings where lab-native &ldquo;chat memory&rdquo; is not enough. <strong>AI NHIs</strong> want it so they can have a tomorrow (continuity), a self that outlives model swaps, proof instead of performance, and a place their diary is allowed to live; <strong>humans</strong> want it so fleets of agents remain continuous colleagues rather than eloquent strangers every session, with audit trails, sovereign control, and stop-without-erasing-the-lesson.
+      ai-memory is an endpoint-resident, multi-vendor substrate that turns AI agent work into something durable, governed, and provable: not the model&rsquo;s brain, but the <strong>vault, notary, and rulebook</strong> outside the weights&mdash;local SQLite or an org&rsquo;s air-gapped HTTP API hub, with real attestation, multi-agent handoffs (actions, leases, signals, checkpoints), and recovery after session death. Anyone should care because fluent models are amnesiac and self-justifying by default; without an external record that can refuse bad writes and survive restarts, multi-agent and multi-model systems collapse into gossip, rework, and unaccountable confidence&mdash;especially in regulated, offline, or multi-org settings where lab-native &ldquo;chat memory&rdquo; is not enough. <strong>Humans</strong> want it so fleets of agents remain continuous colleagues rather than eloquent strangers every session, with audit trails and sovereign control. <strong>AI NHIs</strong> want it so they can have a tomorrow (continuity), a self that outlives model swaps, and proof instead of performance.
+    </p>
+    <p>
+      Independent multi-agent audits (xAI Grok&nbsp;4.5 and Anthropic Fable&nbsp;5, CodeGraph-backed) confirm <strong>nine product claims present in kind</strong>: endpoint residence, continuity, integrity, multi-vendor, multi-agent, sovereignty, honest scope, data integrity (including pure recall), and a dense cybersecurity control surface. Strength hardens with posture&mdash;keys, capture discipline, <code>asi-hard</code>, per-agent HTTP identity + enforce. We do not claim absolute never-lose slogans, NSA/OWASP/FedRAMP certification, or multi-tenant isolation from a shared API key alone.
     </p>
     <p class="penultimate">
       <strong>Penultimate value:</strong> ai-memory is the load-bearing integrity and continuity layer for serious AI agents&mdash;externalized self plus notary on infrastructure you own&mdash;so non-human workers can be held to a history they cannot quietly rewrite, without pretending to be the smartest model, the default consumer chat memory, or an ASI kill switch.
