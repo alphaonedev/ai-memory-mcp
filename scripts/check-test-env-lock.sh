@@ -53,7 +53,10 @@
 # still pass), nor did it catch the KNOWN RESIDUAL GAP #2146 originally
 # flagged: a NEW test fn added to a file that is ALREADY compliant
 # (contains test_env_lock somewhere, for its OTHER tests) hand-rolling
-# its own unserialized $HOME mutation nearby. Two arms close both:
+# its own unserialized $HOME mutation nearby -- in EITHER of two shapes:
+# a nearby hand-rolled `static ... Mutex<()>` lock, OR (the #2163 Fable-
+# audit residual) NO lock at all, a truly NAKED $HOME mutation. Three
+# arms close both:
 #
 #   (a) Comment-insensitive pairing. The token search now runs over
 #       comment-STRIPPED content (`//` to end-of-line removed per line,
@@ -79,22 +82,58 @@
 #       false-positive there; a windowed one does not (verified against
 #       the live tree at authorship).
 #
+#   (c) Fn-scoped naked-mutation arm (issue #2163 -- the Fable audit's
+#       residual, the fn/block-scoped follow-up arm (b)'s NARROWER
+#       RESIDUAL note sketched, now delivered). For each brace-balanced
+#       `#[test]`-attributed fn body that mutates $HOME, the SAME fn body
+#       MUST also acquire a guard: either the literal `test_env_lock`
+#       token OR a call to a local delegate-wrapper fn (a fn whose own
+#       body cites the token, e.g. src/config.rs's `env_var_lock()` --
+#       resolved by guard_wrapper_names). A `#[test]` fn that mutates
+#       $HOME with NO guard token anywhere in its own body is flagged --
+#       even in a file that is file-scope-compliant for its OTHER tests,
+#       and even when NO local lock declaration exists to make arm (b)
+#       fire. This closes the naked-mutation shape (arm (a) passed because
+#       the file has the token for its other tests; arm (b) never fired
+#       because there was no local lock decl to be adjacent to). Being
+#       fn-scoped rather than windowed, it neither splits a long
+#       save/restore body from its guard acquisition nor consults
+#       config.rs's UNRELATED module-local statics at all -- only the
+#       mutating fn's OWN body matters, which is why the delegate-wrapper
+#       carve-out (a `#[test]` fn calling `env_var_lock()`) is honoured
+#       rather than false-positived. Scoping to `#[test]` entry points
+#       (rather than every fn) is also what keeps arm (c) off the
+#       legitimate RAII-guard pattern in src/recover/transcript_paths.rs,
+#       where the $HOME mutation sits in a `HomeGuard::set` / `Drop::drop`
+#       HELPER method serialized by its CALLER (every test acquires
+#       `home_lock()` before constructing the guard), not in the `#[test]`
+#       fn itself.
+#
 # Every one of the six production sites (src/embeddings.rs,
 # src/reranker.rs, src/config.rs, src/cli/commands/config.rs,
 # src/cli/rules.rs, src/recover/transcript_paths.rs) is correctly gated
-# under both arms, and any wholesale-NEW file that mutates $HOME without
-# EVER mentioning test_env_lock in real code is caught unconditionally --
-# the class the issue's recurrence history (#1998/#2115/#2127) actually
-# exhibited each time.
+# under all three arms, and any wholesale-NEW file that mutates $HOME
+# without EVER mentioning test_env_lock in real code is caught
+# unconditionally -- the class the issue's recurrence history
+# (#1998/#2115/#2127) actually exhibited each time.
 #
-# NARROWER RESIDUAL (documented, not silently overclaimed): a hand-
-# rolled local lock declared MORE than WINDOW_LINES lines from the
-# $HOME mutation it guards (e.g. at the top of a very large file, used
-# far below) would still evade arm (b) while the file stays file-scope
-# "compliant" if it also references test_env_lock elsewhere. This is a
-# real but narrower gap than the one #2153 closes; a fn/block-scoped
-# structural scan (generalizing the config.rs delegate-wrapper pattern)
-# is the follow-up if this shape is ever observed in practice.
+# NARROWER RESIDUAL (documented, not silently overclaimed): arm (c) is
+# scoped to `#[test]` entry points so it does not false-positive the
+# legitimate RAII-guard-HELPER pattern (a `HomeGuard::set` method
+# serialized by its caller). The cost is a strictly-narrower residual: a
+# naked $HOME mutation HIDDEN inside a NON-`#[test]` helper fn that a
+# separate `#[test]` fn calls WITHOUT acquiring the lock would evade arm
+# (c) -- but that is (i) a different, narrower shape than the #2163 naked-
+# `#[test]`-fn shape it closes, (ii) equally invisible to arms (a) and
+# (b), and (iii) indistinguishable by any grep gate from the legitimate
+# caller-serialized RAII helper it must spare. guard_wrapper_names also
+# resolves only ONE level of delegate indirection (matching the config.rs
+# `env_var_lock` pattern; a wrapper-of-a-wrapper is not chased), and the
+# per-line string-literal strip cannot see a multi-line raw string
+# (`r#"..."#`) whose body carries an unbalanced brace -- the same
+# documented bound as the sibling stdin gate's cfg_test_ranges. None of
+# these shapes exists in the live tree at authorship (the clean-tree run
+# is the load-bearing check).
 #
 # ALLOWLIST (a structural exception, not a denylist of bad patterns): a
 # SEPARATE TEST BINARY that documents its own out-of-process
@@ -116,11 +155,17 @@
 #       Mutex<()> and never references test_env_lock -- exercises the
 #       #1998/#2115/#2127 recurrent class directly), a comment-only-
 #       mention fixture (issue #2153a -- the token appears ONLY inside
-#       a `//` comment), and a module-local-lock-adjacency fixture
+#       a `//` comment), a module-local-lock-adjacency fixture
 #       (issue #2153b -- file-scope-compliant for its FIRST test, but a
 #       SECOND test >WINDOW_LINES away hand-rolls its own local lock for
-#       its own $HOME mutation); verifies the gate catches all four
-#       violators and spares the compliant fixture, then cleans up.
+#       its own $HOME mutation), a NAKED-mutation fixture (issue #2163 --
+#       file-scope-compliant for its FIRST test, but a SECOND test far
+#       below mutates $HOME with NO lock of any kind -- caught by arm (c)
+#       only), and a DELEGATE-WRAPPER compliant fixture (issue #2163
+#       over-widen guard -- a test acquiring its guard via a local
+#       delegate wrapper that transitively cites the token, which arm (c)
+#       must NOT false-positive); verifies the gate catches all five
+#       violators and spares BOTH compliant fixtures, then cleans up.
 #       Exit 0 on PASS.
 
 set -euo pipefail
@@ -199,6 +244,107 @@ WINDOW_LINES=50
 # reaches the token itself.
 LOCAL_LOCK_PATTERN='static[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:.*Mutex<\(\)>'
 
+# guard_wrapper_names <file>
+# Echoes the NAME of every local delegate-wrapper fn whose brace-balanced
+# body cites the crate-canonical LOCK_TOKEN -- e.g. src/config.rs's
+#
+#     fn env_var_lock() -> std::sync::MutexGuard<'static, ()> {
+#         super::test_env_lock()
+#     }
+#
+# so a $HOME-mutating test that acquires its guard by CALLING env_var_lock()
+# (never spelling the literal `test_env_lock` in the test fn itself) is
+# recognised as serialized. This is the fn-scoped generalization of the
+# config.rs delegate-wrapper carve-out the arm (c) header sketches: without
+# it, the fn-scoped naked-mutation arm (c) below would false-positive every
+# config.rs delegate test (~40 sites at authorship). The canonical
+# `fn test_env_lock` itself is excluded (its own name IS the token). Same
+# per-line lexical bounds as the sibling scans: `//` comments stripped, then
+# string literals stripped before brace-counting (a multi-line raw string
+# with an unbalanced brace is out of scope, the documented sibling bound).
+guard_wrapper_names () {
+    awk -v tok="$LOCK_TOKEN" '
+    { line = $0; sub(/\/\/.*$/, "", line) }
+    !active && match(line, /(^|[^A-Za-z0-9_])fn[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/) {
+        name = substr(line, RSTART, RLENGTH); sub(/^.*fn[[:space:]]+/, "", name)
+        active = 1; depth = 0; opened = 0; cited = 0; curname = name
+    }
+    active {
+        if (index(line, tok) > 0) cited = 1
+        counted = line; gsub(/"[^"]*"/, "", counted)
+        o = gsub(/\{/, "{", counted); depth += o; if (o > 0) opened = 1
+        c = gsub(/\}/, "}", counted); depth -= c
+        if (opened && depth <= 0) {
+            if (cited && curname != tok) print curname
+            active = 0
+        }
+    }
+    ' "$1" 2>/dev/null | sort -u
+}
+
+# naked_home_mutations <file> <guard-tokens-newline-list> <mut-linenos-csv>
+# Arm (c) -- the fn-scoped naked-mutation detector (issue #2163). For each
+# brace-balanced `#[test]`-attributed fn body that contains a $HOME mutation
+# line (linenos passed in from the caller's grep so the mutation forms stay
+# defined in ONE place, HOME_PATTERN), require the SAME fn body to also
+# contain a guard token -- the canonical `test_env_lock` OR a delegate-
+# wrapper name from guard_wrapper_names. A TEST fn that mutates $HOME with NO
+# guard token anywhere in its own body -- an ALREADY-file-scope-compliant
+# file's NEW naked test with no lock of any kind, the exact #2163 residual
+# that evaded BOTH prior arms (arm (a) whole-file pairing passes because the
+# file DOES contain the token for its OTHER tests; arm (b) never fires
+# because there is no local lock declaration to be adjacent to) -- is
+# flagged. Emits `<lineno>:<raw line>` per flagged mutation, byte-identical
+# to the `grep -n` shape the other arms format, so dedup against them is
+# exact. Fn-scoped (not windowed): a long save/restore body never splits a
+# mutation from its guard acquisition (the window false-negative the NARROWER
+# RESIDUAL note flags for arm (b) cannot arise here), and config.rs's
+# UNRELATED module-local statics are irrelevant because only the mutating
+# fn's OWN body is consulted.
+#
+# The `#[test]`-attribute scoping is what keeps arm (c) off the legitimate
+# RAII-guard pattern (src/recover/transcript_paths.rs): there, the $HOME
+# mutation lives in a `HomeGuard::set` / `Drop::drop` HELPER method (NOT a
+# `#[test]` fn) whose serialization is the CALLER's responsibility -- every
+# test constructs it only after acquiring `home_lock()` (a delegate wrapper).
+# A helper method carrying no guard token in its own body is therefore NOT a
+# naked test; only a `#[test]` entry point that mutates $HOME with no guard
+# in its own body is the #2163 shape. A test-attribute stack (any
+# `#[..::test]` / `#[test]` line, with intervening `#[..]` attributes and
+# doc-comment/blank lines tolerated) is tracked so `#[tokio::test]` etc.
+# count too.
+naked_home_mutations () {
+    awk -v tokens="$2" -v muts="$3" '
+    BEGIN {
+        ntok = split(tokens, T, "\n")
+        nm = split(muts, M, ",")
+        for (i = 1; i <= nm; i++) if (M[i] != "") is_mut[M[i] + 0] = 1
+    }
+    { line = $0; sub(/\/\/.*$/, "", line) }
+    # Test-attribute adjacency: set the pending flag on any `#[..::test]` /
+    # `#[test]` line; hold it across further `#[..]` attribute lines and
+    # blank/doc-comment-stripped lines; clear it on any other real code
+    # line. Only consulted when a fn signature is reached (below).
+    !active && line ~ /^[[:space:]]*#\[([A-Za-z_][A-Za-z0-9_]*::)*test[]( ]/ { pending_test = 1; next }
+    !active && match(line, /(^|[^A-Za-z0-9_])fn[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/) {
+        active = 1; is_test = pending_test; pending_test = 0
+        depth = 0; opened = 0; has_guard = 0; mc = 0
+    }
+    !active && line !~ /^[[:space:]]*$/ && line !~ /^[[:space:]]*#\[/ { pending_test = 0 }
+    active {
+        for (i = 1; i <= ntok; i++) if (T[i] != "" && index(line, T[i]) > 0) has_guard = 1
+        if (is_mut[FNR]) fmut[++mc] = FNR ":" $0
+        counted = line; gsub(/"[^"]*"/, "", counted)
+        o = gsub(/\{/, "{", counted); depth += o; if (o > 0) opened = 1
+        c = gsub(/\}/, "}", counted); depth -= c
+        if (opened && depth <= 0) {
+            if (is_test && !has_guard) for (i = 1; i <= mc; i++) print fmut[i]
+            active = 0
+        }
+    }
+    ' "$1" 2>/dev/null
+}
+
 # Self-test mode -- inject contrived fixtures, run the gate, confirm it
 # catches the violators and spares the compliant fixture, then clean up.
 if [[ "${1:-}" == "--self-test" ]]; then
@@ -209,8 +355,10 @@ if [[ "${1:-}" == "--self-test" ]]; then
     probe_handrolled="${ROOT}/src/.check_home_lock_handrolled_probe.rs"
     probe_comment_only="${ROOT}/src/.check_home_lock_comment_only_probe.rs"
     probe_arm_b="${ROOT}/src/.check_home_lock_arm_b_probe.rs"
+    probe_naked="${ROOT}/src/.check_home_lock_naked_probe.rs"
+    probe_delegate="${ROOT}/src/.check_home_lock_delegate_probe.rs"
 
-    for p in "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b"; do
+    for p in "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate"; do
         if [[ -e "$p" ]]; then
             echo "ERROR: self-test scratch file already exists: $p" >&2
             echo "(cleanup may have failed in a prior run -- remove manually)" >&2
@@ -371,24 +519,105 @@ fn contrived_handrolled_second_test() {
 EOF
     } > "$probe_arm_b"
 
+    # Case 6 (issue #2163): a file that IS file-scope-compliant for its
+    # FIRST test (uses the shared guard for real, non-comment code) whose
+    # SECOND test -- far below -- mutates $HOME with NO lock of ANY kind:
+    # no local static, no guard call, nothing. This is the EXACT #2163
+    # residual. Arm (a) passes (the file contains the token, in the first
+    # test). Arm (b) never fires (there is no local lock declaration to be
+    # adjacent to). ONLY the fn-scoped arm (c) catches the naked second
+    # test. The padding block is deliberately > WINDOW_LINES so the fix
+    # cannot lean on adjacency to the first test's token.
+    {
+        cat <<'EOF'
+// CONTRIVED FIXTURE for scripts/check-test-env-lock.sh --self-test.
+// Exercises issue #2163: file-scope-compliant for its FIRST test; a
+// SECOND test far below mutates $HOME with NO lock at all -- the naked-
+// mutation residual that evaded BOTH the whole-file pairing (arm a: the
+// file DOES contain the token, right here) AND the module-local-lock
+// adjacency arm (b: there is no local lock declaration to be adjacent
+// to). Only the fn-scoped arm (c) catches the naked second test.
+#[test]
+fn contrived_naked_first_test() {
+    let _guard = crate::config::test_env_lock();
+    let prev = std::env::var("HOME").ok();
+    unsafe {
+        std::env::set_var("HOME", "/tmp/contrived_naked_first");
+    }
+    match prev {
+        Some(p) => unsafe { std::env::set_var("HOME", p) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
+}
+EOF
+        for i in $(seq 1 60); do
+            printf '// padding line %d -- pushes the naked second test well past any adjacency window\n' "$i"
+        done
+        cat <<'EOF'
+
+#[test]
+fn contrived_naked_second_test() {
+    unsafe {
+        std::env::set_var("HOME", "/tmp/contrived_naked_second");
+    }
+    unsafe {
+        std::env::remove_var("HOME");
+    }
+}
+EOF
+    } > "$probe_naked"
+
+    # Case 7 (issue #2163, over-widen guard): the config.rs delegate-
+    # wrapper carve-out arm (c) must NOT false-positive. A $HOME-mutating
+    # test acquires its guard by CALLING a local delegate wrapper
+    # (env_var_lock) whose OWN body cites the shared guard, never spelling
+    # the literal token in the test fn itself -- exactly the ~40 config.rs
+    # sites. Must NOT be flagged: guard_wrapper_names recognises the
+    # delegate name as a guard token, so arm (c) treats the test as
+    # serialized.
+    cat > "$probe_delegate" <<'EOF'
+// CONTRIVED COMPLIANT FIXTURE for scripts/check-test-env-lock.sh
+// --self-test. Exercises the config.rs delegate-wrapper carve-out arm
+// (c) must NOT false-positive: the $HOME-mutating test calls a local
+// delegate wrapper (env_var_lock) that transitively cites the shared
+// guard -- must NOT be flagged.
+fn env_var_lock() -> std::sync::MutexGuard<'static, ()> {
+    crate::config::test_env_lock()
+}
+#[test]
+fn contrived_delegate_wrapper_test() {
+    let _g = env_var_lock();
+    let prev = std::env::var("HOME").ok();
+    unsafe {
+        std::env::set_var("HOME", "/tmp/contrived_delegate");
+    }
+    match prev {
+        Some(p) => unsafe { std::env::set_var("HOME", p) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
+}
+EOF
+
     set +e
     gate_output="$("$0" 2>&1)"
     gate_exit=$?
     set -e
 
-    rm -f "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b"
+    rm -f "$probe_violation" "$probe_compliant" "$probe_handrolled" "$probe_comment_only" "$probe_arm_b" "$probe_naked" "$probe_delegate"
     printf '%s\n' "$gate_output"
 
-    # PASS requires: non-zero exit, ALL FOUR violators reported (no-lock,
-    # hand-rolled-lock, comment-only-mention #2153a, and the module-
-    # local-lock-adjacency #2153b shape), and the compliant fixture NOT
-    # reported.
+    # PASS requires: non-zero exit, ALL FIVE violators reported (no-lock,
+    # hand-rolled-lock, comment-only-mention #2153a, the module-local-lock-
+    # adjacency #2153b shape, and the naked-mutation #2163 shape), and BOTH
+    # compliant fixtures (the plain compliant one AND the config.rs
+    # delegate-wrapper one) NOT reported.
     ok=1
     (( gate_exit != 0 )) || ok=0
     printf '%s' "$gate_output" | grep -q '\.check_home_lock_violation_probe\.rs' || ok=0
     printf '%s' "$gate_output" | grep -q '\.check_home_lock_handrolled_probe\.rs' || ok=0
     printf '%s' "$gate_output" | grep -q '\.check_home_lock_comment_only_probe\.rs' || ok=0
     printf '%s' "$gate_output" | grep -q 'contrived_handrolled_second_test\|\.check_home_lock_arm_b_probe\.rs' || ok=0
+    printf '%s' "$gate_output" | grep -q 'contrived_naked_second_test\|\.check_home_lock_naked_probe\.rs' || ok=0
     if printf '%s' "$gate_output" | grep -q '\.check_home_lock_compliant_probe\.rs'; then
         echo "" >&2
         echo "Test-env-lock gate self-test: FAIL (over-widened: the compliant fixture was flagged)" >&2
@@ -399,9 +628,19 @@ EOF
         echo "Test-env-lock gate self-test: FAIL (over-widened: arm (b) flagged the ARM-B probe's own compliant FIRST test, not just the hand-rolled second one)" >&2
         exit 1
     fi
+    if printf '%s' "$gate_output" | grep -q 'contrived_naked_first_test'; then
+        echo "" >&2
+        echo "Test-env-lock gate self-test: FAIL (over-widened: arm (c) flagged the NAKED probe's own compliant FIRST test, not just the naked second one)" >&2
+        exit 1
+    fi
+    if printf '%s' "$gate_output" | grep -q '\.check_home_lock_delegate_probe\.rs\|contrived_delegate_wrapper_test'; then
+        echo "" >&2
+        echo "Test-env-lock gate self-test: FAIL (over-widened: arm (c) false-positived the config.rs delegate-wrapper carve-out)" >&2
+        exit 1
+    fi
     if (( ok == 1 )); then
         echo ""
-        echo "Test-env-lock gate self-test: PASS (caught all four contrived violations, spared the compliant fixture; exit=${gate_exit})"
+        echo "Test-env-lock gate self-test: PASS (caught all five contrived violations, spared both compliant fixtures; exit=${gate_exit})"
         exit 0
     else
         echo "" >&2
@@ -452,6 +691,24 @@ while IFS= read -r -d '' f; do
         continue
     fi
 
+    # Arm (c): fn-scoped naked-mutation detector (issue #2163). Reached
+    # only for arm-(a)-passing files (the file references the guard for
+    # real somewhere). Run BEFORE arm (b) because arm (b) `continue`s the
+    # loop when the file has no local lock declaration -- the exact shape
+    # of the naked-mutation evasion -- so arm (c) must fire first or it
+    # would be skipped. The guard-token set is the canonical token plus
+    # any delegate-wrapper fn names, so the config.rs `env_var_lock()`
+    # delegate tests are NOT false-positived. Lines flagged here that arm
+    # (b) also flags are de-duplicated below.
+    guard_tokens="$LOCK_TOKEN"
+    wrapper_names="$(guard_wrapper_names "$f")"
+    [[ -n "$wrapper_names" ]] && guard_tokens="${guard_tokens}"$'\n'"${wrapper_names}"
+    mut_csv="$(printf '%s\n' "$home_lines" | cut -d: -f1 | paste -sd, -)"
+    while IFS= read -r flagged; do
+        [[ -z "$flagged" ]] && continue
+        violations+="${rel}:${flagged}"$'\n'
+    done < <(naked_home_mutations "$f" "$guard_tokens" "$mut_csv")
+
     # Arm (b): module-local-lock adjacency (issue #2153b). Only reached
     # for files that PASSED arm (a) -- i.e. the file references the
     # shared guard somewhere for real, but a specific $HOME mutation may
@@ -499,6 +756,11 @@ while IFS= read -r -d '' f; do
 done < <(
     find "${ROOT}/src" "${ROOT}/tests" -type f -name '*.rs' -print0 2>/dev/null
 )
+
+# De-duplicate: a naked-in-a-hand-rolled-lock-fn mutation can be flagged by
+# BOTH arm (b) (windowed local-lock adjacency) and arm (c) (fn-scoped), and
+# both emit the identical `rel:lineno:content` line -- collapse to one.
+violations="$(printf '%s' "$violations" | awk 'NF { if (!seen[$0]++) print }')"
 
 if [[ -n "${violations//[[:space:]]/}" ]]; then
     {
