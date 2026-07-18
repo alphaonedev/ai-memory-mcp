@@ -79,6 +79,10 @@ coverage/*.profdata
 # local gate/run logs (never commit)
 /.local-runs-*
 
+# migration-ladder gate --self-test scratch (mktemp'd under the repo root per
+# the no-/tmp hard rule; trap-cleaned, but ignore in case a run is killed).
+/.migration-ladder-selftest.*
+
 # CycloneDX SBOM (#1973, v1.0) — `cargo cyclonedx` drops this at the repo
 # root when run locally to verify the release.yml SBOM step. It is a
 # release-time artifact generated fresh per tag in CI and attached to the
