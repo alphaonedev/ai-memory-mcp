@@ -149,11 +149,23 @@ impl ConsolidationClustering {
 
     /// Partition `memories` into consolidation clusters. `embeddings` aligns
     /// 1:1 to `memories` (`embeddings[i]` is the stored vector for
-    /// `memories[i]`, or `None`). Only groups with ≥ 2 members are returned.
+    /// `memories[i]`, or `None`); `spaces` aligns 1:1 the same way
+    /// (`spaces[i]` is the `embedding_space` provenance token of
+    /// `memories[i]`, `None` = SQL NULL / unverified). Only groups with ≥ 2
+    /// members are returned.
+    ///
+    /// v1.0.0 #2167 (#2181) — a stored-vs-stored cosine is trusted ONLY when
+    /// both vectors carry the SAME non-NULL space. A mixed-space corpus (a
+    /// same-dim model swap, or NULL-provenance legacy rows) must never be
+    /// merged as a near-duplicate on a meaningless cross-space cosine — the
+    /// #1774 missing-embedding-blocks-merge posture extended to
+    /// mismatched-space-blocks-merge (degrade-never-corrupt applies to the
+    /// destructive MERGE decision too).
     pub(crate) fn cluster_memories(
         &self,
         memories: &[Memory],
         embeddings: &[Option<Vec<f32>>],
+        spaces: &[Option<String>],
     ) -> Vec<Vec<MemoryId>> {
         // Group by namespace (carrying the original index so the aligned
         // `embeddings` slice is addressable); never merge across namespace
@@ -186,8 +198,14 @@ impl ConsolidationClustering {
                     }
                     let j = idxs[b];
                     let jac = jaccard_similarity(&memories[i].content, &memories[j].content);
+                    // #2167 (#2181) — the cosine counts ONLY when both stored
+                    // vectors share the SAME non-NULL embedding space; a
+                    // mismatched / NULL-space pair yields `None` (blocks the
+                    // merge, exactly as a missing embedding does).
                     let cos = match (embeddings[i].as_ref(), embeddings[j].as_ref()) {
-                        (Some(x), Some(y)) => Some(f64::from(Embedder::cosine_similarity(x, y))),
+                        (Some(x), Some(y)) if spaces[i].is_some() && spaces[i] == spaces[j] => {
+                            Some(f64::from(Embedder::cosine_similarity(x, y)))
+                        }
                         _ => None,
                     };
                     if pair_merges(jac, self.jaccard_threshold, cos, self.cosine_threshold) {
@@ -408,6 +426,13 @@ mod tests {
         vec![Some(vec![1.0_f32, 0.0]); n]
     }
 
+    /// #2167 (#2181) — `n` rows all stamped to the SAME non-NULL embedding
+    /// space, so the space gate never blocks a merge (for tests whose
+    /// subject is namespace/cap/cosine logic, not the space contract).
+    fn same_space(n: usize) -> Vec<Option<String>> {
+        vec![Some("nomic-embed-text#none".to_string()); n]
+    }
+
     #[test]
     fn clusters_no_stored_vectors_do_not_merge_1774() {
         // #1774 — un-embedded corpus: even near-identical (high-Jaccard)
@@ -419,7 +444,7 @@ mod tests {
             make_memory("b", "ns", dup),
             make_memory("c", "ns", "completely different unrelated content here"),
         ];
-        let clusters = strategy.cluster_memories(&mems, &no_embs(3));
+        let clusters = strategy.cluster_memories(&mems, &no_embs(3), &same_space(3));
         assert!(
             clusters.is_empty(),
             "un-embedded pairs must not merge on Jaccard alone; got {clusters:?}"
@@ -436,12 +461,14 @@ mod tests {
         let mems = [make_memory("a", "ns", dup), make_memory("b", "ns", dup)];
         let orthogonal = vec![Some(vec![1.0_f32, 0.0]), Some(vec![0.0_f32, 1.0])];
         assert!(
-            strategy.cluster_memories(&mems, &orthogonal).is_empty(),
+            strategy
+                .cluster_memories(&mems, &orthogonal, &same_space(2))
+                .is_empty(),
             "cosine gate must block keyword-overlapping but vector-dissimilar pair"
         );
         // Same content, IDENTICAL vectors (cos=1.0 ≥ 0.75) → merge.
         let aligned = vec![Some(vec![1.0_f32, 0.0]), Some(vec![1.0_f32, 0.0])];
-        let clusters = strategy.cluster_memories(&mems, &aligned);
+        let clusters = strategy.cluster_memories(&mems, &aligned, &same_space(2));
         assert_eq!(clusters.len(), 1);
         assert_eq!(clusters[0].len(), 2);
     }
@@ -455,7 +482,7 @@ mod tests {
         let dup = "kubernetes rolling canary deploy strategy kubernetes deploy";
         let mems = [make_memory("a", "ns", dup), make_memory("b", "ns", dup)];
         let embs = vec![Some(vec![1.0_f32, 0.0]), None];
-        let clusters = strategy.cluster_memories(&mems, &embs);
+        let clusters = strategy.cluster_memories(&mems, &embs, &same_space(2));
         assert!(
             clusters.is_empty(),
             "missing-vector pair must NOT merge; got {clusters:?}"
@@ -467,7 +494,7 @@ mod tests {
         let strategy = ConsolidationClustering::new();
         let dup = "kubernetes rolling canary deploy strategy";
         let mems = [make_memory("a", "ns1", dup), make_memory("b", "ns2", dup)];
-        let clusters = strategy.cluster_memories(&mems, &no_embs(2));
+        let clusters = strategy.cluster_memories(&mems, &no_embs(2), &same_space(2));
         assert!(
             clusters.is_empty(),
             "cross-ns must not cluster; got {clusters:?}"
@@ -482,7 +509,7 @@ mod tests {
             make_memory("a", "_curator", dup),
             make_memory("b", "_curator", dup),
         ];
-        let clusters = strategy.cluster_memories(&mems, &no_embs(2));
+        let clusters = strategy.cluster_memories(&mems, &no_embs(2), &same_space(2));
         assert!(clusters.is_empty(), "reserved ns must be skipped");
     }
 
@@ -499,7 +526,8 @@ mod tests {
         // Aligned stored vectors (cosine = 1.0) so pairs actually merge
         // post-#1774 — this test's subject is the size cap, not the
         // missing-vector contract.
-        let clusters = strategy.cluster_memories(&mems, &aligned_embs(mems.len()));
+        let clusters =
+            strategy.cluster_memories(&mems, &aligned_embs(mems.len()), &same_space(mems.len()));
         assert!(
             !clusters.is_empty(),
             "expected clusters to exercise the cap"
@@ -512,7 +540,7 @@ mod tests {
     #[test]
     fn clusters_empty_input_returns_empty() {
         let strategy = ConsolidationClustering::new();
-        assert!(strategy.cluster_memories(&[], &[]).is_empty());
+        assert!(strategy.cluster_memories(&[], &[], &[]).is_empty());
     }
 
     #[test]
@@ -532,8 +560,61 @@ mod tests {
         ];
         // Aligned stored vectors (cosine = 1.0) so all three pairs merge
         // post-#1774 — this test's subject is the `used[b]` skip branch.
-        let clusters = strategy.cluster_memories(&mems, &aligned_embs(3));
+        let clusters = strategy.cluster_memories(&mems, &aligned_embs(3), &same_space(3));
         assert_eq!(clusters.len(), 1);
         assert_eq!(clusters[0].len(), 3);
+    }
+
+    #[test]
+    fn clusters_mismatched_space_does_not_merge_2181() {
+        // #2167 (#2181) THE SPACE GATE: identical (high-Jaccard) content AND
+        // IDENTICAL stored vectors (cos=1.0 ≥ 0.75), but the two rows carry
+        // DIFFERENT embedding spaces (a same-dim model swap). The cosine is a
+        // meaningless cross-space number and must NOT drive a destructive
+        // merge — the pair does NOT cluster.
+        let strategy = ConsolidationClustering::new();
+        let dup = "kubernetes rolling canary deploy strategy kubernetes deploy";
+        let mems = [make_memory("a", "ns", dup), make_memory("b", "ns", dup)];
+        let aligned = vec![Some(vec![1.0_f32, 0.0]), Some(vec![1.0_f32, 0.0])];
+        let spaces = vec![
+            Some("nomic-embed-text#nomic-task-v1".to_string()),
+            Some("granite-embedding#none".to_string()),
+        ];
+        assert!(
+            strategy
+                .cluster_memories(&mems, &aligned, &spaces)
+                .is_empty(),
+            "cross-space pair must NOT merge even at cosine 1.0 (#2181)"
+        );
+        // Control: SAME space → the identical-vector pair DOES merge, proving
+        // the block above is the space gate and not some other cause.
+        let clusters = strategy.cluster_memories(&mems, &aligned, &same_space(2));
+        assert_eq!(clusters.len(), 1, "same-space identical vectors must merge");
+    }
+
+    #[test]
+    fn clusters_null_space_does_not_merge_2181() {
+        // #2167 (#2181) — a NULL-provenance (unverified) space on either side
+        // blocks the merge: an unverifiable vector is never the basis for a
+        // destructive consolidation (degrade-never-corrupt).
+        let strategy = ConsolidationClustering::new();
+        let dup = "kubernetes rolling canary deploy strategy kubernetes deploy";
+        let mems = [make_memory("a", "ns", dup), make_memory("b", "ns", dup)];
+        let aligned = vec![Some(vec![1.0_f32, 0.0]), Some(vec![1.0_f32, 0.0])];
+        // Both NULL.
+        assert!(
+            strategy
+                .cluster_memories(&mems, &aligned, &[None, None])
+                .is_empty(),
+            "NULL-space pair must NOT merge (#2181)"
+        );
+        // One side NULL, one stamped.
+        let mixed = vec![Some("nomic-embed-text#none".to_string()), None];
+        assert!(
+            strategy
+                .cluster_memories(&mems, &aligned, &mixed)
+                .is_empty(),
+            "one-NULL-space pair must NOT merge (#2181)"
+        );
     }
 }
