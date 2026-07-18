@@ -789,7 +789,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 27_501; 27_600 = 27_501 + 99 headroom; far under the 1.5x cap.
     // 2026-07-18 #2035 v85 migrate_v85 + MIGRATION_V85 const + archive/restore
     // valid_from/valid_until threading land it at 27_639; ceiling 27_700.
-    ("src/store/postgres.rs", 27_700),
+    // 2026-07-18 (#1873): the pg verify_audit_trail twin's audit-head hash-anchor
+    // recompute (signed_events head-row canonical hash + memory_revisions
+    // head-row recompute + parse-dual + fold, K3 parity with sqlite) lands
+    // postgres.rs at 27_762; ceiling 27_820 (+58 headroom).
+    ("src/store/postgres.rs", 27_820),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
