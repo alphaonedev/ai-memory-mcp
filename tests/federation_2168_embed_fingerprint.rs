@@ -322,6 +322,81 @@ async fn foreign_model_shipped_vector_not_stored_verbatim_deferred_2168() {
 }
 
 // ---------------------------------------------------------------------------
+// 1b. Empty/degenerate model string, SAME dim → deferred local re-embed;
+//     the empty-string wire value NEVER short-circuits into a false MATCH
+//     (#2176, [#2168 Fable audit] regression-hardening follow-up).
+//
+//     `embedding_space_fingerprint("")` canonicalises to `"#none"`, which
+//     can never equal the receiver's own fingerprint (its `id` half is
+//     always non-empty — `model_description()` always names a real model),
+//     so the only accepting path is exact equality with the receiver's
+//     derived fingerprint. This pins that degenerate-wire-value disposition
+//     as a regression proof rather than leaving it to code-reading: a
+//     future refactor that special-cases an absent/empty model string as
+//     "legacy sender, accept" would be caught here.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_model_string_shipped_vector_not_stored_verbatim_deferred_2176() {
+    let _g = env_lock();
+    // SAFETY: env mutation under env_lock for the test's duration.
+    unsafe {
+        std::env::set_var(REQUIRE_SIG_ENV, "0");
+    }
+    // Receiver runs nomic-768; its local re-embed returns the distinctive
+    // LOCAL_REEMBED_FILL vector.
+    let ollama = mock_ollama_embed(768, LOCAL_REEMBED_FILL, Duration::ZERO).await;
+    let embedder = build_nomic_embedder(&ollama.uri());
+    let dim = embedder.dim();
+    let rx = build_receiver(Some(embedder));
+
+    let mem = sample_memory("empty-model-1");
+    // A SAME-DIMENSION (768) unit-norm vector shipped with an EMPTY
+    // `model` string — the degenerate/absent-fingerprint wire value.
+    // Passes the dim + #1584 norm gates; must still fail the #2168
+    // fingerprint gate (fingerprint("") = "#none" != the receiver's
+    // non-empty nomic fingerprint).
+    let empty_model_vec = unit_norm_fill(dim);
+    let shipped = vec![ShippedEmbedding::new(
+        mem.id.clone(),
+        String::new(),
+        empty_model_vec.clone(),
+    )];
+    let body = push_body(std::slice::from_ref(&mem), &shipped);
+    let (status, v) = post_push(&rx.router, serde_json::to_vec(&body).unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "push must be acked: {v}");
+    // CRDT-safe: the row still lands even though its degenerate-model
+    // vector is refused.
+    assert_eq!(v["applied"], 1, "row must land (CRDT convergence): {v}");
+
+    // The deferred local re-embed lands the receiver's OWN vector.
+    let stored = wait_for_embedding(&rx.db, &mem.id, Duration::from_secs(10))
+        .await
+        .expect("deferred local re-embed must populate the row");
+    assert_eq!(stored.len(), dim, "stored vector is receiver-dim");
+
+    // INVARIANT: the stored embedding is the LOCAL re-embed, never the
+    // empty-model shipped vector.
+    assert!(
+        (stored[0] - LOCAL_REEMBED_FILL).abs() < 1e-6,
+        "stored[0] must be the LOCAL re-embed fill, got {}",
+        stored[0]
+    );
+    assert_ne!(
+        stored, empty_model_vec,
+        "an empty-model-string shipped vector must NEVER be stored verbatim (#2176/#2168)"
+    );
+    assert!(
+        embed_calls(&ollama).await >= 1,
+        "empty-model fingerprint mismatch must trigger the deferred local re-embed"
+    );
+
+    unsafe {
+        std::env::remove_var(REQUIRE_SIG_ENV);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 2. Matching model → stored verbatim (no #1566 perf regression).
 // ---------------------------------------------------------------------------
 
