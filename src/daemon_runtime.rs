@@ -3312,6 +3312,34 @@ fn spawn_postgres_fold_loop_if_enabled(
     }
 }
 
+/// v1.0.0 #2167 (S5/S6) — open a private boot connection and run the sqlite
+/// embedding-space adoption/census (`db::embedding_space_boot_maintenance`).
+/// Split out of `bootstrap_serve` (mirrors `spawn_postgres_fold_loop_if_enabled`)
+/// so the db-open FAILURE arm — a read-only / locked / unopenable DB at boot —
+/// is unit-tested. Best-effort by design: a failed open degrades to a skipped
+/// WARN, NEVER an error (recall then treats legacy NULL-space rows as excluded
+/// — safe, degraded — until `reembed` heals them). The active-space is seeded
+/// separately at the call site so archive-RESTORE classification works even
+/// when this open fails.
+fn run_sqlite_embedding_space_boot_maintenance(
+    db_path: &std::path::Path,
+    active_fp: &str,
+    active_dim: usize,
+) {
+    match db::open(db_path) {
+        Ok(boot_conn) => {
+            db::embedding_space_boot_maintenance(&boot_conn, active_fp, active_dim);
+        }
+        Err(e) => {
+            tracing::warn!(
+                err = %e,
+                "#2167: could not open DB for embedding-space adoption/census at boot; \
+                 legacy NULL-space rows stay excluded until reembed"
+            );
+        }
+    }
+}
+
 /// Cluster G (#767) — `spawn_gc_loop` variant that takes an explicit
 /// shadow-observation retention window. Used by `bootstrap_serve` so
 /// the operator-tunable `[confidence] shadow_retention_days` from
@@ -4891,18 +4919,7 @@ pub async fn bootstrap_serve(
         // re-embeds). Seeded here (not only at census) so restore works
         // even when the boot-maintenance DB open below fails.
         crate::embeddings::set_active_embedding_space(Some(active_fp.clone()));
-        match db::open(db_path) {
-            Ok(boot_conn) => {
-                db::embedding_space_boot_maintenance(&boot_conn, &active_fp, emb.dim());
-            }
-            Err(e) => {
-                tracing::warn!(
-                    err = %e,
-                    "#2167: could not open DB for embedding-space adoption/census at boot; \
-                     legacy NULL-space rows stay excluded until reembed"
-                );
-            }
-        }
+        run_sqlite_embedding_space_boot_maintenance(db_path, &active_fp, emb.dim());
         let _boot_index_loader = spawn_vector_index_boot_load(
             db_path.to_path_buf(),
             active_fp,
@@ -7719,6 +7736,25 @@ mod tests {
             "empty DB with embedder must yield empty index"
         );
         assert_eq!(idx.unwrap().len(), 0);
+    }
+
+    // #2167 (S5/S6) — the extracted sqlite embedding-space boot-maintenance
+    // helper degrades a db-open FAILURE to a skipped WARN (never an error /
+    // panic) so a read-only / locked / unopenable DB at boot cannot brick the
+    // daemon; legacy NULL-space rows stay excluded until reembed. Exercises
+    // BOTH the Ok (opens + runs adoption/census) and Err (open fails) arms.
+    #[test]
+    fn run_sqlite_embedding_space_boot_maintenance_covers_both_open_arms() {
+        let fp = crate::embeddings::embedding_space_fingerprint("test-space");
+        // Ok arm: a fresh temp DB opens cleanly, boot-maintenance runs. The
+        // db::open here also CREATES the file at `env.db_path`.
+        let env = TestEnv::fresh();
+        run_sqlite_embedding_space_boot_maintenance(&env.db_path, &fp, 768);
+        // Err arm: a path whose parent component is now a FILE (`env.db_path`)
+        // fails to open (ENOTDIR); the helper must swallow it into a WARN and
+        // return normally — the #2167 fail-safe posture.
+        let unopenable = env.db_path.join("nested-under-a-file.db");
+        run_sqlite_embedding_space_boot_maintenance(&unopenable, &fp, 768);
     }
 
     // ----- spawn_gc_loop / spawn_wal_checkpoint_loop --------------------
