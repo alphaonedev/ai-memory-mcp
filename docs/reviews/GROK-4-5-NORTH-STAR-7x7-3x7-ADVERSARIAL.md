@@ -28,15 +28,18 @@
 | **5** | **Multi-agent** | Handoffs with proof, not gossip |
 | **6** | **Sovereign** | Air-gap / org-owned deployable |
 | **7** | **Honest scope** | Vault + notary + rulebook — not the brain or ASI governor |
+| **8** | **Data integrity** | Durable truth of stored memory: pure recall (no silent wrong content mutation); hard to quietly rewrite history; refuse/delete leave honest evidence; secret screening; CID partial-corruption detection; dual-backend integrity for core rows; OCC when opted in — **not** marketing “never lose / never wrong” as absolute |
 
-**Claim:** “ai-memory already does all of these **right this second** — 7/7.”
+**Claim (points 1–7):** “ai-memory already does all of these **right this second** — 7/7.”  
+**Claim (point 8):** “ai-memory already delivers **Data Integrity** as a first-class product property **right this second**.”
 
 **Status labels:** `YES` | `YES_COND` | `PARTIAL` | `NO`  
-**Ballots:** `7/7_YES` | `7/7_CONDITIONAL` | `NOT_7/7`
+**Ballots (1–7):** `7/7_YES` | `7/7_CONDITIONAL` | `NOT_7/7`  
+**Ballots (point 8):** `PASS` | `PASS_CONDITIONAL` | `FAIL`
 
 ---
 
-## Final Verdict Table — 7/7 (maximal truth)
+## Final Verdict Table — 7/7 + Point #8 (maximal truth)
 
 > **Read this table first.** It is the clean SSOT after **21 executed** adversarial agents + CodeGraph. Detail and ballots follow below.
 
@@ -52,8 +55,11 @@
 | **Is the north-star objective aligned with the product?** | **YES** | Moonshot + ROADMAP + Executive Brief + code |
 | **Harder “perfect constitution” checklists (e.g. Fable 27-req) complete?** | **Out of band** | Different standard; not this 7-point star |
 
-**One-line aggregate:**  
+**One-line aggregate (1–7):**  
 **7/7 present as capability. 3/7 unconditional YES. 4/7 YES_COND (posture). 0/7 missing.**
+
+**One-line aggregate (point 8):**  
+**Data integrity PRESENT as capability (PASS_CONDITIONAL). Pure recall PASS. Absolute hero “never lose / never wrong” NOT held. Max strength ≠ zero-config.**
 
 ### B. Per-criterion final verdict
 
@@ -61,11 +67,12 @@
 |---|----------------------|--------------|----------------------|--------------------|-------------------------|
 | **1** | Endpoint-resident | **YES** | **Yes** | — | Local-first process on operator hardware; not lab-cloud-required |
 | **2** | Continuity | **YES_COND** | **Yes** (machinery) | Store-first + capture_turn + recover; L3 still deferred | Session death / model swap survivable **if** the vault was written |
-| **3** | Integrity | **YES_COND** | **Yes** (machinery) | Enrolled keys; attested writes; fail-closed federation where required | History hard to quietly rewrite; strength scales with crypto posture |
+| **3** | Integrity (authorship / multi-agent proof posture) | **YES_COND** | **Yes** (machinery) | Enrolled keys; attested writes; fail-closed federation where required | History hard to quietly rewrite; strength scales with crypto posture |
 | **4** | Multi-vendor | **YES** | **Yes** | — | Not married at API/config; Ollama default is a dial, not a lock |
 | **5** | Multi-agent | **YES_COND** | **Yes** (machinery) | Signed handoffs; enrollment; use of actions/leases/signals/checkpoints | Fleet physics shipped; local “proof” often claimed until hardened |
 | **6** | Sovereign | **YES_COND** | **Yes** (deployable) | Private bind + api_key; inference egress deny/loopback when air-gapped | Org-owned / air-gap **capable**; not automatic if cognition still hits public LLMs |
 | **7** | Honest scope | **YES** | **Yes** | Keep public claims bound to brief + ROADMAP §1/§2.3/§4 | Vault + notary + rulebook — not the brain, not an ASI kill switch |
+| **8** | **Data integrity** | **YES_COND** | **Yes** (machinery) | Signed daemon + witness; `synchronous=FULL` / asi-hard; If-Match multi-writer; quarantine/append_only where needed | Durable truth **machinery** is real; absolute “never lose/never wrong” is **marketing**, not SSOT |
 
 ### C. How to say it in public (clean language)
 
@@ -74,8 +81,9 @@
 | “ai-memory’s seven-point north star is **shipped as product capability** — endpoint memory with continuity, integrity, multi-vendor, multi-agent, sovereignty, and honest scope.” | “Every install is max-strength perfect on all seven with zero config.” |
 | “Four of seven **harden with operator posture** (capture, keys, federation, egress).” | “We are the ASI kill switch / the brain / default chat memory for everyone.” |
 | “Remaining work **deepens** the star (defaults, packaging, L3 capture, local actor crypto) — it does **not** invent the category.” | “7/7 is future tense only.” |
+| “**Data integrity** is a real, load-bearing product property (pure recall, audit chain, secret screen, tombstones, OCC opt-in) that **hardens with posture**.” | “Every write is always Ed25519-attested and power-loss-proof by default; recall can never mis-rank.” |
 
-### D. Panel ballot snapshot
+### D. Panel ballot snapshot (points 1–7)
 
 | Ballot | Count | Share |
 |--------|------:|------:|
@@ -83,7 +91,87 @@
 | `7/7_CONDITIONAL` | 16 | 76% |
 | `NOT_7/7` | 1 | 5% |
 
-**Majority verdict:** **7/7_CONDITIONAL** (presence yes; max strength posture-dependent).
+**Majority verdict (1–7):** **7/7_CONDITIONAL** (presence yes; max strength posture-dependent).
+
+### E. Point #8 Data Integrity — Final Verdict Table (21 executed agents)
+
+> **Dedicated re-run:** 3 waves × 7 agents **only** on Point #8 (2026-07-18). Method: executed explore/general-purpose subagents + CodeGraph/code/tests. Supersedes any single-author read of “data integrity is the highest law” as absolute product truth.
+
+#### E.1 Definition (Point #8)
+
+| Element | Meaning |
+|---------|---------|
+| **In scope** | Pure recall (no silent `memories` mutation on read); V-4 audit chain; SignableWrite / attest; secret screen; forget tombstones; archive fidelity; CID partial-corruption detection; dual-backend core-row integrity; OCC when opted in |
+| **Out of scope (honest)** | Absolute power-loss immortality on `synchronous=NORMAL`; whole-host clone resistance without off-host anchors; ranking always optimal; content immortality after intentional RTBF hard-delete; mesh forget propagation (#1852) |
+
+#### E.2 Aggregate claim (Point #8 only)
+
+| Question | Maximal-truth answer | Panel basis |
+|----------|----------------------|-------------|
+| **Does Data Integrity exist as shipped capability?** | **YES** | Wave 1 ontology: no agent said machinery is absent |
+| **Is pure recall held?** | **YES (PASS)** | A2 kill-tests 15/15 + caller-guard; C6 attack fails |
+| **Is max data integrity zero-config?** | **NO** | B1 FAIL: NORMAL sync, append_only off, require-modes withhold |
+| **Does signed daemon + witness approach max?** | **YES_COND** | B2/B3: strong, not whole-host proof |
+| **Is hero absolute “never lose / never wrong” held?** | **NO** | B7 + C1/C7: marketing absolute ≠ capability integrity |
+| **Does any attack kill Point #8 entirely?** | **NO** | Wave 3: all `FALSIFIES_POINT8_ENTIRELY NO` |
+
+**One-line:**  
+**Point #8 PASS_CONDITIONAL — real integrity spine; absolute slogans fail; zero-config is baseline not max.**
+
+#### E.3 Point #8 ballot (21 agents)
+
+| Wave | Lens | VOTE_POINT8 (normalized) | subagent_id prefix |
+|------|------|--------------------------|--------------------|
+| 1 | A1 structural | **PASS_CONDITIONAL** | `019f75e3-68ec-…` |
+| 1 | A2 recall purity | **PASS** | `019f75e3-68ef-…956d` |
+| 1 | A3 crypto chain | **PASS_CONDITIONAL** | `019f75e3-68ef-…869f8` |
+| 1 | A4 refuse/delete | **PASS_CONDITIONAL** | `019f75e3-68ef-…547dad` |
+| 1 | A5 secret screen | **PASS_CONDITIONAL** | `019f75e3-68ef-…316f` |
+| 1 | A6 dual backend | **PASS_CONDITIONAL** | `019f75e3-68ef-…6f80` |
+| 1 | A7 OCC concurrency | **PASS_CONDITIONAL** | `019f75e3-68ef-…3116` |
+| 2 | B1 zero-config max | **FAIL** (max claim) | `019f75e6-a15a-…` |
+| 2 | B2 signed+witness | **PASS_CONDITIONAL** | `019f75e6-a15e-…1272` |
+| 2 | B3 asi-hard | **PASS_CONDITIONAL** | `019f75e6-a15e-…e57a` |
+| 2 | B4 multi-writer OCC | **PASS_CONDITIONAL** | `019f75e6-a15e-…1b54` |
+| 2 | B5 federation | **PASS_CONDITIONAL** | `019f75e6-a15e-…2955` |
+| 2 | B6 postgres hub | **PASS_CONDITIONAL** | `019f75e6-a15e-…c3cc` |
+| 2 | B7 hero marketing | **PASS_CONDITIONAL** | `019f75e6-a15e-…6e4f` |
+| 3 | C1 power-loss NORMAL | attack fails as full kill → **PASS_CONDITIONAL** | `019f75e9-ee93-…` |
+| 3 | C2 ANN wrong memory | attack fails as full kill → **PASS_CONDITIONAL** | `019f75e9-ee94-…` |
+| 3 | C3 unsigned rewrite | attack fails as full kill → **PASS_CONDITIONAL** | `019f75e9-ee95-…6efe` |
+| 3 | C4 LWW no If-Match | attack fails as full kill → **PASS** (category error) | `019f75e9-ee95-…dd94` |
+| 3 | C5 hard-delete | attack fails as full kill → **PASS_CONDITIONAL** | `019f75e9-ee95-…caa2` |
+| 3 | C6 pure-recall fail | attack fails → **PASS** | `019f75e9-ee96-…e11f` |
+| 3 | C7 absolute marketing | attack fails as full kill → **PASS_CONDITIONAL** | `019f75e9-ee96-…d59f` |
+
+| Ballot class | Count (approx.) |
+|--------------|----------------:|
+| **PASS** (capability strong on axis) | ~3 |
+| **PASS_CONDITIONAL** | ~17 |
+| **FAIL** (max zero-config only) | **1** (B1) |
+
+#### E.4 Point #8 sub-axis map
+
+| Sub-axis | Status | Note |
+|----------|--------|------|
+| Pure recall | **PASS** | Unconditional post-#1953; kill-tests green |
+| Audit chain (V-4) | **YES_COND** | Mid-chain strong; unsigned suffix residual |
+| Secret screen | **YES_COND** | Default refuse when seeded; detector best-effort |
+| Forget tombstones | **YES** | Dual-backend anti-resurrection local |
+| Archive fidelity | **YES_COND** | Core row+links; lineage cid mirrors incomplete |
+| Dual-backend core rows | **YES_COND** | v81 lockstep; fed archives/checkpoints PG gaps honest |
+| OCC multi-writer | **YES_COND** | Real when If-Match; default LWW |
+| Power-loss durability | **YES_COND** | NORMAL default; FULL / asi-hard for max |
+| Absolute hero slogans | **FAIL as product truth** | Keep as aspiration / with hedges only |
+
+#### E.5 Public language (Point #8)
+
+| Say this | Don’t say this |
+|----------|----------------|
+| “Data integrity is a **first-class, load-bearing** product property.” | “Default install guarantees power-loss-proof acks and absolute never-wrong recall ranking.” |
+| “Recall is **pure** — it does not silently rewrite memory content.” | “Recall can never surface a bad neighbor under approximate ANN.” |
+| “Integrity **strengthens** with enrolled keys, FULL sync, and multi-writer If-Match.” | “Unsigned daemon has zero integrity.” |
+| “Intentional forget/GC with tombstones is **honest erasure**, not silent corruption.” | “Nothing is ever deleted.” |
 
 ---
 
@@ -144,6 +232,7 @@
 | **5** | Multi-agent | **YES_COND** | Actions CAS + leases + signals + checkpoints + fed receive auth; local handoffs often **claimed strings**; node≠agent on fanout |
 | **6** | Sovereign | **YES_COND** | Local DB; bind keyless non-loopback refuse; `InferenceEgressMode`; public LLM = deploy choice not architecture |
 | **7** | Honest scope | **YES** | ROADMAP §4 NOT-list; §2.3 stop-record; Executive Brief penultimate; hero can re-inflate if uncoupled |
+| **8** | **Data integrity** | **YES_COND** (dedicated 21-agent re-run) | Pure recall PASS; V-4/secret/tombstones/CID/OCC/dual-backend YES_COND; max zero-config FAIL; absolute slogans FAIL as product truth — see §E |
 
 ---
 
@@ -215,6 +304,7 @@
 | 5 | **YES_COND** | Fleet physics shipped; local proof often claimed; federation node-granular |
 | 6 | **YES_COND** | Air-gap deployable; lock egress for cognition sovereignty |
 | 7 | **YES** | Vault/notary/rulebook; bind brief+ROADMAP; hero can re-inflate |
+| **8** | **YES_COND** | Data integrity spine real; pure recall PASS; max ≠ zero-config; absolute hero slogans fail |
 
 ---
 
@@ -222,7 +312,7 @@
 
 ### 6.1 End-state goal (north star)
 
-> **ai-memory is the perfect AI Agent endpoint memory substrate**, defined **only** by the seven properties in §0: endpoint-resident, continuous across session death and model swap, integrity-first, multi-vendor, multi-agent with proof, sovereign/air-gappable, and honestly scoped as vault + notary + rulebook (not the brain, not an ASI kill switch).
+> **ai-memory is the perfect AI Agent endpoint memory substrate**, defined by the seven properties in §0 **plus Point #8 Data Integrity**: endpoint-resident, continuous across session death and model swap, integrity-first, multi-vendor, multi-agent with proof, sovereign/air-gappable, honestly scoped as vault + notary + rulebook (not the brain, not an ASI kill switch), **and** durable truth of stored memory (pure recall; hard-to-rewrite history; honest refuse/delete evidence) without absolute “never lose / never wrong” marketing as product law.
 
 ### 6.2 Objective status (this executed panel)
 
@@ -270,10 +360,15 @@
 | **7/7 in kind** | **PASS** |
 | **7/7 max default install** | **FAIL** (expected; not the claim) |
 | **7/7 hardened path** | **PASS under seven’s wording** |
-| **Missing criteria** | **0** |
+| **Missing criteria (1–7)** | **0** |
 | **Unconditional YES** | **1, 4, 7** |
 | **Conditional YES** | **2, 3, 5, 6** |
-| **Panel majority ballot** | **7/7_CONDITIONAL** |
+| **Panel majority ballot (1–7)** | **7/7_CONDITIONAL** |
+| **Point #8 Data Integrity (capability)** | **PASS_CONDITIONAL** |
+| **Point #8 pure recall** | **PASS** |
+| **Point #8 max zero-config** | **FAIL** (B1) |
+| **Point #8 absolute hero slogans** | **FAIL as product truth** |
+| **Point #8 missing as product?** | **NO** |
 
 **Penultimate line for the biologic operator:**
 
@@ -297,6 +392,7 @@
 | 2026-07-18 | v1: initial doc (later admitted: single-author multi-lens, CodeGraph real) |
 | 2026-07-18 | **v2:** **21 executed explore subagents** (3 waves × 7), CodeGraph/code evidence, full ledger of subagent_ids + votes; supersedes method of v1 |
 | 2026-07-18 | **v3:** Add **Final Verdict Table — 7/7 (maximal truth)** (aggregate + per-criterion + public language + ballot snapshot) for clean communication |
+| 2026-07-18 | **v4:** Add **Point #8 Data Integrity** — dedicated **21 executed agents** (3×7); Final Verdict Table §E; compact §7.2 rows |
 
 ---
 
