@@ -1,0 +1,465 @@
+<!--
+  Copyright 2026 AlphaOne LLC
+  SPDX-License-Identifier: Apache-2.0
+  Audience page: cybersecurity SMEs — CISO / security architecture / IR / compliance.
+  Grounded in cross-family 9-claim audits (Grok 4.5 + Fable 5) + SECURITY.md.
+  Maximal marketing language is banned here; maximal truthfulness is the product.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>ai-memory for cybersecurity &mdash; control surface, data integrity, honest threat model</title>
+<meta name="description" content="Full-spectrum security and data-integrity brief for cybersecurity experts: attestation, pure recall, three crypto legs, federation, multi-tenant reality, NSA CSI / OWASP mapping (non-endorsed), hardened posture. Cross-family audited. Not a certification claim.">
+<link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/audience/cybersecurity.html">
+<meta name="theme-color" content="#0a0a0a">
+<style>
+:root{--bg:#0a0a0a;--panel:#121212;--border:#262626;--border-hi:#3a3a3a;--text:#f5f5f5;--muted:#9a9a9a;--dim:#6b6b6b;--accent:#6ee7ff;--warn:#ffb86b;--good:#7cd992;--bad:#f85149;--violet:#c8a2ff;--code-bg:#161616;--font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;--font-mono:"SF Mono","JetBrains Mono","Cascadia Code",Consolas,monospace;--w-mid:880px;--w-wide:1080px}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--text);font-family:var(--font-sans);line-height:1.65;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+code,pre{font-family:var(--font-mono);font-size:.88rem}
+code{background:var(--code-bg);padding:.1em .35em;border-radius:3px;color:#d4d4d4}
+pre{background:var(--code-bg);border:1px solid var(--border);border-radius:6px;padding:1rem 1.15rem;overflow-x:auto;line-height:1.55;margin:1rem 0}
+.wrap-mid{max-width:var(--w-mid);margin:0 auto;padding:0 1.5rem}
+.topnav{border-bottom:1px solid var(--border);position:sticky;top:0;background:rgba(10,10,10,.92);backdrop-filter:blur(8px);z-index:50}
+.topnav .row{display:flex;align-items:center;justify-content:space-between;padding:1rem 1.5rem;max-width:var(--w-wide);margin:0 auto;font-size:.9rem;flex-wrap:wrap;gap:.75rem}
+.topnav .brand{color:var(--text);font-weight:600}
+.topnav .links{display:flex;gap:1.15rem;flex-wrap:wrap}
+.topnav .links a{color:var(--muted)}
+.topnav .links a:hover{color:var(--text);text-decoration:none}
+.crumb{padding:1.25rem 1.5rem 0;max-width:var(--w-mid);margin:0 auto;color:var(--dim);font-size:.82rem;font-family:var(--font-mono)}
+.crumb a{color:var(--muted)}
+.hero{padding:3rem 0 2.25rem}
+.hero .eyebrow{font-family:var(--font-mono);font-size:.72rem;letter-spacing:.18em;color:var(--accent);text-transform:uppercase;margin-bottom:1rem}
+.hero h1{font-size:clamp(1.85rem,4vw,2.35rem);font-weight:700;letter-spacing:-.025em;line-height:1.15;margin-bottom:1.15rem}
+.hero .lede{font-size:1.08rem;color:var(--muted);max-width:720px;line-height:1.65}
+.hero .lede strong{color:var(--text);font-weight:600}
+.badge-row{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:1.35rem}
+.badge{font-family:var(--font-mono);font-size:.68rem;letter-spacing:.04em;padding:.35rem .7rem;border-radius:999px;border:1px solid var(--border-hi);color:var(--muted)}
+.badge.good{color:var(--good);border-color:rgba(124,217,146,.4);background:rgba(124,217,146,.07)}
+.badge.warn{color:var(--warn);border-color:rgba(255,184,107,.4);background:rgba(255,184,107,.07)}
+.badge.bad{color:var(--bad);border-color:rgba(248,81,73,.4);background:rgba(248,81,73,.07)}
+section{padding:2.75rem 0;border-top:1px solid var(--border)}
+.eyebrow-h2{font-family:var(--font-mono);font-size:.7rem;letter-spacing:.18em;color:var(--dim);text-transform:uppercase;margin-bottom:.5rem}
+h2{font-size:1.45rem;font-weight:700;letter-spacing:-.015em;margin-bottom:1rem}
+h3{font-size:1.05rem;font-weight:600;margin:1.6rem 0 .55rem;color:var(--text)}
+p{color:var(--muted);margin-bottom:1rem;max-width:720px}
+p strong{color:var(--text)}
+ul,ol{color:var(--muted);margin:0 0 1rem 1.35rem;max-width:720px}
+li{margin-bottom:.4rem}
+.cmp{width:100%;border-collapse:collapse;margin:1.25rem 0;font-size:.88rem}
+.cmp th,.cmp td{padding:.7rem .85rem;border-bottom:1px solid var(--border);text-align:left;vertical-align:top}
+.cmp th{background:var(--panel);color:var(--muted);font-weight:600;font-size:.72rem;text-transform:uppercase;letter-spacing:.08em}
+.cmp td:first-child{color:var(--text);font-weight:600;min-width:8.5rem}
+.cmp .yes{color:var(--good)}
+.cmp .no{color:var(--bad)}
+.cmp .meh{color:var(--warn)}
+.callout{border-left:3px solid var(--accent);padding:1rem 1.2rem;background:rgba(110,231,255,.05);border-radius:0 8px 8px 0;margin:1.35rem 0;font-size:.92rem;color:var(--muted);max-width:760px}
+.callout.warn{border-left-color:var(--warn);background:rgba(255,184,107,.06)}
+.callout.bad{border-left-color:var(--bad);background:rgba(248,81,73,.06)}
+.callout.good{border-left-color:var(--good);background:rgba(124,217,146,.06)}
+.callout strong{color:var(--text)}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin:1.25rem 0}
+@media(max-width:720px){.grid-2{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:1.15rem 1.2rem}
+.card h4{font-size:.82rem;font-family:var(--font-mono);letter-spacing:.08em;text-transform:uppercase;color:var(--accent);margin-bottom:.45rem}
+.card.amber h4{color:var(--warn)}
+.card.violet h4{color:var(--violet)}
+.card.green h4{color:var(--good)}
+.card p{font-size:.88rem;margin:0;max-width:none}
+.legs{display:grid;grid-template-columns:repeat(3,1fr);gap:.85rem;margin:1.25rem 0}
+@media(max-width:820px){.legs{grid-template-columns:1fr}}
+.leg{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:1.1rem 1.15rem;border-top:3px solid var(--accent)}
+.leg.l2{border-top-color:var(--good)}
+.leg.l3{border-top-color:var(--violet)}
+.leg .n{font-family:var(--font-mono);font-size:.7rem;color:var(--dim);letter-spacing:.1em;margin-bottom:.35rem}
+.leg h4{font-size:1rem;color:var(--text);margin-bottom:.4rem}
+.leg p{font-size:.84rem;margin:0;max-width:none}
+.leg .st{display:inline-block;margin-top:.65rem;font-family:var(--font-mono);font-size:.68rem;padding:.2rem .45rem;border-radius:4px;border:1px solid var(--border-hi)}
+.leg .st.yes{color:var(--good);border-color:rgba(124,217,146,.45)}
+.leg .st.cond{color:var(--warn);border-color:rgba(255,184,107,.45)}
+.baseline{counter-reset:bl;list-style:none;margin:1rem 0 1rem 0;padding:0;max-width:760px}
+.baseline li{counter-increment:bl;position:relative;padding:.75rem .9rem .75rem 2.75rem;margin-bottom:.5rem;background:var(--panel);border:1px solid var(--border);border-radius:8px;color:var(--muted);font-size:.9rem}
+.baseline li::before{content:counter(bl);position:absolute;left:.75rem;top:.75rem;width:1.4rem;height:1.4rem;border-radius:50%;background:rgba(110,231,255,.12);color:var(--accent);font-family:var(--font-mono);font-size:.72rem;display:flex;align-items:center;justify-content:center}
+.baseline li strong{color:var(--text)}
+.ban-list{list-style:none;margin:1rem 0;padding:0;max-width:760px}
+.ban-list li{padding:.7rem .95rem;margin-bottom:.45rem;border:1px solid rgba(248,81,73,.3);background:rgba(248,81,73,.05);border-radius:8px;color:var(--muted);font-size:.9rem}
+.ban-list li::before{content:"✕ ";color:var(--bad);font-weight:700}
+.ban-list li strong{color:var(--text)}
+.next{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.6rem;margin:1.5rem 0}
+.next a{display:block;padding:.85rem 1rem;background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.9rem;transition:border-color .15s}
+.next a:hover{border-color:var(--accent);text-decoration:none}
+.next a .desc{display:block;color:var(--muted);font-size:.78rem;margin-top:.2rem;font-weight:400}
+footer{padding:3rem 0;border-top:1px solid var(--border);color:var(--dim);font-size:.82rem;text-align:center}
+footer a{color:var(--muted)}
+.toc{display:flex;flex-wrap:wrap;gap:.5rem .9rem;margin:1rem 0 0;font-family:var(--font-mono);font-size:.72rem}
+.toc a{color:var(--muted)}
+.toc a:hover{color:var(--accent)}
+</style>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="row">
+    <a class="brand" href="../">ai-memory</a>
+    <div class="links">
+      <a href="../#install">Install</a>
+      <a href="../for-everyone.html">Everyone</a>
+      <a href="decision-maker.html">Decision</a>
+      <a href="developer.html">Developer</a>
+      <a href="operator.html">Operator</a>
+      <a href="cybersecurity.html" style="color:var(--text)">Cybersecurity</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<div class="crumb"><a href="../">ai-memory</a> &nbsp;/&nbsp; audience &nbsp;/&nbsp; cybersecurity</div>
+
+<header class="hero wrap-mid">
+  <div class="eyebrow">For CISO · security architecture · IR · compliance · procurement</div>
+  <h1>Security &amp; data integrity &mdash; the full spectrum, without the theater.</h1>
+  <p class="lede">
+    ai-memory is an <strong>endpoint-resident memory substrate</strong> with a dense, code-backed control surface:
+    content attestation, pure recall, secret screening, federation crypto, SSRF-guarded webhooks,
+    audit hash chains, and a hardened <code>asi-hard</code> posture.
+    Independent multi-agent audits (xAI <strong>Grok&nbsp;4.5</strong> + Anthropic <strong>Fable&nbsp;5</strong>, CodeGraph-backed)
+    scored Point&nbsp;#8 Data Integrity and Point&nbsp;#9 Cybersecurity as
+    <strong>PASS_CONDITIONAL</strong> &mdash; real machinery, posture-dependent max strength.
+  </p>
+  <div class="badge-row" aria-label="Honest status badges">
+    <span class="badge good">#8 Data integrity · PASS_COND</span>
+    <span class="badge good">#9 Cybersecurity · PASS_COND</span>
+    <span class="badge good">Pure recall · PASS</span>
+    <span class="badge warn">Defaults ≠ max</span>
+    <span class="badge bad">Shared API key ≠ multi-tenant isolation</span>
+    <span class="badge warn">Mapping · not certified</span>
+  </div>
+  <nav class="toc" aria-label="On this page">
+    <a href="#verdict">Verdict</a>
+    <a href="#integrity">Data integrity</a>
+    <a href="#crypto-legs">3 crypto legs</a>
+    <a href="#controls">Control matrix</a>
+    <a href="#multi-tenant">Multi-tenant truth</a>
+    <a href="#threats">Threat model</a>
+    <a href="#baseline">Hardened baseline</a>
+    <a href="#claims">Banned claims</a>
+    <a href="#refs">References</a>
+  </nav>
+</header>
+
+<section class="wrap-mid" id="verdict">
+  <div class="eyebrow-h2">Cross-family joint verdict</div>
+  <h2>Dense real controls. Not certified. Not host-proof. Not zero-config max.</h2>
+  <div class="callout good">
+    <strong>What you can rely on:</strong> a shipped trust spine for agent memory &mdash;
+    append-only audit chain, surface-scoped attestation, pure recall (reads do not silently rewrite content),
+    secret screening (refuse default when seeded), federation signature gates, webhook SSRF + HMAC,
+    forget tombstones, and an operator-pinable hardened profile.
+  </div>
+  <div class="callout warn">
+    <strong>What max requires:</strong> enrolled keys, <code>AI_MEMORY_SECURITY_PROFILE=asi-hard</code> (or equivalent pins),
+    TLS/mTLS, capture discipline, and &mdash; for multi-tenant HTTP &mdash;
+    <strong>per-agent API keys enrolled + <code>AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce</code></strong>.
+    The brew-install default is intentionally operable, not procurement-max.
+  </div>
+  <div class="callout bad">
+    <strong>What we never claim:</strong> NSA / OWASP / FedRAMP / SOC2 / ISO product certification;
+    host-root tamper-proofing; multi-tenant isolation from a shared API key alone;
+    absolute &ldquo;never lose data / never wrong memory.&rdquo;
+  </div>
+  <p>
+    Full ballots and CodeGraph anchors:
+    <a href="../reviews/GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.md">Grok Final Verdict §E–§F</a> ·
+    <a href="../reviews/FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.md">Fable 9-claim adjudication</a>.
+  </p>
+</section>
+
+<section class="wrap-mid" id="integrity">
+  <div class="eyebrow-h2">Point #8 · Data integrity</div>
+  <h2>Durable truth machinery &mdash; pure recall hard-passed.</h2>
+  <p>
+    Data integrity here means: stored agent memory stays trustworthy under real operations.
+    It is <strong>not</strong> a slogan that nothing can ever go wrong.
+  </p>
+  <table class="cmp">
+    <thead><tr><th>Sub-axis</th><th>Status</th><th>Security-relevant note</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Pure recall</td>
+        <td class="yes">PASS</td>
+        <td>Recall does not mutate memory <em>content</em>. Access ladders fold from an append-only observations ledger (post-#1953). Kill-tests green across panels.</td>
+      </tr>
+      <tr>
+        <td>Embedding-space integrity</td>
+        <td class="yes">Stronger at v84</td>
+        <td>Same-dim model-swap silent-wrong-neighbor class closed by default via <code>embedding_space</code> provenance + space-checked cosine (Fable §3.3).</td>
+      </tr>
+      <tr>
+        <td>Audit chain (V-4)</td>
+        <td class="meh">YES_COND</td>
+        <td>Cross-row <code>prev_hash</code> detects mid-chain edits. Forge-evidence + tail truncation need enrolled keys / witness / off-host sink.</td>
+      </tr>
+      <tr>
+        <td>Secret screen</td>
+        <td class="yes">YES_COND</td>
+        <td>Credential detectors (PEM, cloud keys, GitHub tokens, JWTs…). Default refuse when seeded; federation degrades refuse→redact to preserve CRDT convergence.</td>
+      </tr>
+      <tr>
+        <td>Forget / tombstones</td>
+        <td class="yes">YES</td>
+        <td>Intentional erasure with signed forget tombstones blocking LWW resurrection on federation receive.</td>
+      </tr>
+      <tr>
+        <td>OCC / multi-writer</td>
+        <td class="meh">YES_COND</td>
+        <td>If-Match optimistic concurrency is opt-in; default LWW can clobber concurrent writers.</td>
+      </tr>
+      <tr>
+        <td>Power-loss durability</td>
+        <td class="meh">Residual</td>
+        <td>Default <code>PRAGMA synchronous=NORMAL</code> can lose acked WAL tail on hard power cut (consistent, not torn). Set <code>AI_MEMORY_DB_SYNCHRONOUS=FULL</code> or <code>asi-hard</code>. Not integrity-absence.</td>
+      </tr>
+      <tr>
+        <td>Absolute slogans</td>
+        <td class="no">FAIL as product truth</td>
+        <td>&ldquo;Never lose / never wrong&rdquo; is marketing, not SSOT. ANN ranking remains approximate.</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="wrap-mid" id="crypto-legs">
+  <div class="eyebrow-h2">Point #9 · Three crypto-communication legs</div>
+  <h2>How the product actually encrypts and authenticates paths.</h2>
+  <div class="legs">
+    <div class="leg">
+      <div class="n">LEG 1</div>
+      <h4>Client ↔ daemon</h4>
+      <p>API key auth; TLS / optional mTLS for <code>serve</code>. Non-loopback keyless bind refused. Plain HTTP on loopback remains an operator choice.</p>
+      <span class="st cond">YES · CONDITIONAL</span>
+    </div>
+    <div class="leg l2">
+      <div class="n">LEG 2</div>
+      <h4>Federation peer ↔ peer</h4>
+      <p>Envelope signature, nonce anti-replay, peer enrollment, write/signal/transition/checkpoint attestation. Strict defaults on v1.0.0-line.</p>
+      <span class="st yes">YES · STRONG DEFAULTS</span>
+    </div>
+    <div class="leg l3">
+      <div class="n">LEG 3</div>
+      <h4>Daemon ↔ webhook</h4>
+      <p>Fail-closed SSRF guard (private ranges / DNS). Mandatory HMAC on subscription dispatch. Loopback webhooks opt-in for tests only.</p>
+      <span class="st yes">YES</span>
+    </div>
+  </div>
+  <h3>Content attestation (SignableWrite)</h3>
+  <div class="grid-2">
+    <div class="card">
+      <h4>HTTP direct</h4>
+      <p>Unsigned store on network surface is fail-closed by default (<code>WriteSurface::HttpDirect</code>). Forged signatures rejected unconditionally.</p>
+    </div>
+    <div class="card amber">
+      <h4>MCP / CLI</h4>
+      <p>Operator-as-actor by design: unsigned writes land as <code>claimed</code>. Parent process owns MCP stdio trust. Not network multi-tenant AuthN.</p>
+    </div>
+  </div>
+</section>
+
+<section class="wrap-mid" id="controls">
+  <div class="eyebrow-h2">Control objectives</div>
+  <h2>Default strength vs hardened production.</h2>
+  <table class="cmp">
+    <thead><tr><th>Control objective</th><th>Product support</th><th>Default</th><th>Hardened</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Data residency</td>
+        <td>Local SQLite; self-hosted <code>serve</code></td>
+        <td class="yes">Strong</td>
+        <td class="yes">Strong</td>
+      </tr>
+      <tr>
+        <td>HTTP authentication</td>
+        <td>API key; non-loopback keyless refuse</td>
+        <td class="meh">Medium–strong if obeyed</td>
+        <td class="yes">Key + TLS/mTLS</td>
+      </tr>
+      <tr>
+        <td>Per-tenant isolation (HTTP)</td>
+        <td>Per-agent API keys; attested-identity mode</td>
+        <td class="no">FAIL (shared key)</td>
+        <td class="yes">Keys enrolled + <code>enforce</code></td>
+      </tr>
+      <tr>
+        <td>Write attestation</td>
+        <td><code>SignableWrite</code> + surface scope</td>
+        <td class="meh">HTTP required; MCP/CLI claimed</td>
+        <td class="yes">Signed + bound keys</td>
+      </tr>
+      <tr>
+        <td>Audit tamper-evidence</td>
+        <td>V-4 chain + witness / roles</td>
+        <td class="meh">Hash chain; withhold modes</td>
+        <td class="yes">Enrolled witness + off-host sink</td>
+      </tr>
+      <tr>
+        <td>Federation trust</td>
+        <td>Sig / nonce / enrollment / write-sig lanes</td>
+        <td class="yes">Strict-by-default (v1.0-line)</td>
+        <td class="yes">+ fingerprint pin</td>
+      </tr>
+      <tr>
+        <td>Inference egress</td>
+        <td><code>AI_MEMORY_INFERENCE_EGRESS</code></td>
+        <td class="meh"><code>allow</code></td>
+        <td class="yes"><code>loopback-only</code> / <code>deny</code></td>
+      </tr>
+      <tr>
+        <td>Secret screening</td>
+        <td>refuse / redact / off</td>
+        <td class="yes">refuse when seeded</td>
+        <td class="yes">refuse + asi-hard</td>
+      </tr>
+      <tr>
+        <td>Hardened pin set</td>
+        <td><code>asi-hard</code> security profile</td>
+        <td class="meh">Off</td>
+        <td class="yes">Pins fail-closed family</td>
+      </tr>
+      <tr>
+        <td>Supply chain</td>
+        <td>cargo audit / SBOM surfaces</td>
+        <td class="meh">CI discipline</td>
+        <td class="meh">Org pipeline (no SLSA product claim)</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="wrap-mid" id="multi-tenant">
+  <div class="eyebrow-h2">The #1 operational finding</div>
+  <h2>Shared API key is not a tenant boundary.</h2>
+  <div class="callout bad">
+    <strong>Default (shared api_key + client-asserted <code>X-Agent-Id</code>):</strong>
+    cross-tenant read/mutate of <code>scope=private</code> rows and admin spoofing are in scope for a hostile multi-tenant model.
+    Do <strong>not</strong> sell or deploy this as SaaS-style agent isolation.
+  </div>
+  <div class="callout good">
+    <strong>Hardened isolation path:</strong> enroll per-agent API keys
+    (<code>ai-memory agents bind-api-key</code> / <code>agent_api_keys</code> table) and set
+    <code>AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce</code>.
+    Principal binds to a server-held secret; mismatched identity gets <code>403</code>.
+  </div>
+  <div class="callout warn">
+    <strong>Foot-gun (Fable §3.2):</strong> setting <code>enforce</code> <em>without</em> enrolling per-agent keys
+    can leave the binding apparatus inert. Treat enrollment + enforce as a pair.
+  </div>
+  <p>
+    MCP stdio is a different trust domain: the parent process is the operator.
+    Network multi-tenant AuthN is the HTTP daemon + edge identity injection — not the chat host channel.
+  </p>
+</section>
+
+<section class="wrap-mid" id="threats">
+  <div class="eyebrow-h2">Threat model (panel-aligned)</div>
+  <h2>Realistic outcomes, not fantasy defenses.</h2>
+  <table class="cmp">
+    <thead><tr><th>Threat</th><th>Realistic outcome</th></tr></thead>
+    <tbody>
+      <tr><td>Shared-key multi-tenant spoof via <code>X-Agent-Id</code></td><td class="no">Default: full cross-tenant risk. Closed only under enrolled keys + enforce.</td></tr>
+      <tr><td>Unsigned mid-chain rewrite (no keys)</td><td class="meh">Often detectable via hash chain; whole-suffix rewrite harder without signatures.</td></tr>
+      <tr><td>Host / root compromise, imaged DB + anchors</td><td class="no">Outside product absolute claims. Tamper-<strong>evidence</strong>, not tamper-proof.</td></tr>
+      <tr><td>Federation replay</td><td class="yes">Nonce + sig binding; enrollment gates when enabled.</td></tr>
+      <tr><td>Forgotten content re-enters via LWW</td><td class="yes">Forget tombstones block resurrection on receive path when live.</td></tr>
+      <tr><td>Secret material in store content</td><td class="yes">Screen refuse/redact; best-effort detectors, not perfect DLP.</td></tr>
+      <tr><td>Webhook SSRF to cloud metadata</td><td class="yes">Fail-closed SSRF + mandatory HMAC.</td></tr>
+      <tr><td>&ldquo;Air-gapped vault&rdquo; + public LLM</td><td class="meh">Cognitive content still leaves host unless egress deny/loopback.</td></tr>
+      <tr><td>Same-dim embed model swap → wrong neighbors</td><td class="yes">Closed by default at v84 space provenance.</td></tr>
+      <tr><td>Power cut under NORMAL sync</td><td class="meh">Bounded consistent tail-loss possible; FULL / asi-hard closes.</td></tr>
+      <tr><td>MCP host malware</td><td class="meh">Parent trust model — harden the host; don&rsquo;t treat MCP as multi-tenant AuthN.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="wrap-mid" id="baseline">
+  <div class="eyebrow-h2">Recommended production baseline</div>
+  <h2>Ten moves that actually raise the floor.</h2>
+  <ol class="baseline">
+    <li><strong>Never</strong> run multi-tenant HTTP on a shared API key alone — enroll per-agent keys + <code>enforce</code>.</li>
+    <li>Enroll signing / audit / witness keys; verify trails with enrolled-key paths.</li>
+    <li>Set <code>AI_MEMORY_SECURITY_PROFILE=asi-hard</code> for regulated fleets (know residual knobs not in the pin set).</li>
+    <li>Front non-loopback with <strong>TLS</strong>; mTLS for federation where peers are fixed.</li>
+    <li>Keep federation sig / nonce / enrollment / write-sig requirements on; avoid permanent rollout escapes.</li>
+    <li>Set <code>AI_MEMORY_INFERENCE_EGRESS=loopback-only</code> or <code>deny</code> when data must not leave the host for inference.</li>
+    <li>Set <code>AI_MEMORY_DB_SYNCHRONOUS=FULL</code> when every acked write must survive power loss.</li>
+    <li>Treat MCP/CLI as operator-as-actor; put network multi-tenant at the HTTP edge.</li>
+    <li>Operate capture/store policy so continuity is real (saved work survives session death).</li>
+    <li>Quote only kill-list-compliant language in RFPs — mapping, not certification.</li>
+  </ol>
+  <pre><code># Illustrative hardened env (not a complete policy document)
+export AI_MEMORY_SECURITY_PROFILE=asi-hard
+export AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce
+export AI_MEMORY_DB_SYNCHRONOUS=FULL
+export AI_MEMORY_INFERENCE_EGRESS=loopback-only
+# + enroll per-agent API keys and audit/witness keys before go-live</code></pre>
+</section>
+
+<section class="wrap-mid" id="claims">
+  <div class="eyebrow-h2">Claims discipline</div>
+  <h2>Procurement language that will not get you in trouble.</h2>
+  <table class="cmp">
+    <thead><tr><th>Say this</th><th>Never say this</th></tr></thead>
+    <tbody>
+      <tr><td class="yes">Mapped to NSA CSI MCP guidance; controls structurally addressed; <strong>no NSA endorsement</strong></td><td class="no">NSA-certified / NSA-approved</td></tr>
+      <tr><td class="yes">OWASP-relevant defenses shipped (SSRF, secrets, injection hygiene, AuthZ machinery)</td><td class="no">OWASP Top 10 certified / ASVS L2</td></tr>
+      <tr><td class="yes">FedRAMP/IL5 authorization <strong>path</strong> (if that is your roadmap language)</td><td class="no">FedRAMP-certified deployments (false present-tense)</td></tr>
+      <tr><td class="yes">With per-agent keys + enforce, HTTP isolation binds to server-held secrets</td><td class="no">One API key isolates all agents safely</td></tr>
+      <tr><td class="yes">Pure recall: looking up memory does not silently rewrite content</td><td class="no">Never lose data / never wrong memory / forever</td></tr>
+      <tr><td class="yes">Vault + notary + rulebook for agent memory</td><td class="no">ASI kill switch / the brain / world actuator control</td></tr>
+    </tbody>
+  </table>
+  <ul class="ban-list">
+    <li><strong>Certification theater</strong> — green shields without non-endorsement text fail adversary review.</li>
+    <li><strong>Default-as-max</strong> — brew install is not asi-hard; document the delta.</li>
+    <li><strong>Host-proof claims</strong> — OSS estimable evidence; clone of DB + local anchors remains residual.</li>
+  </ul>
+</section>
+
+<section class="wrap-mid" id="refs">
+  <div class="eyebrow-h2">Primary references</div>
+  <h2>Load-bearing docs for your security review.</h2>
+  <div class="next">
+    <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/SECURITY.md">SECURITY.md<span class="desc">Threat model &amp; security policy</span></a>
+    <a href="../compliance/nsa-csi-mcp.html">NSA CSI MCP mapping<span class="desc">Self-assessed structural map · non-endorsed</span></a>
+    <a href="../compliance/">Compliance hub<span class="desc">Procurement evidence index</span></a>
+    <a href="../reviews/FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.md">Fable 5 adjudication<span class="desc">Cross-family 9-claim re-audit</span></a>
+    <a href="../reviews/GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.md">Grok 4.5 Final Verdict<span class="desc">§E Data integrity · §F Cybersecurity</span></a>
+    <a href="../reviews/FABLE-5-NORTH-STAR-9-CLAIMS-PLAIN-ENGLISH-AUDIENCES.md">Plain English (cyber section)<span class="desc">SME translation of the 9 claims</span></a>
+    <a href="../deploy/asi-hard.env">asi-hard template<span class="desc">Hardened env example</span></a>
+    <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/PERFORMANCE.md">PERFORMANCE.md<span class="desc">Power-loss durability disclosure</span></a>
+  </div>
+  <p style="margin-top:1.5rem">
+    Sibling audience pages:
+    <a href="../for-everyone.html">End users</a> ·
+    <a href="decision-maker.html">C-level</a> ·
+    <a href="developer.html">Engineers</a> ·
+    <a href="operator.html">Operators</a>
+  </p>
+</section>
+
+<footer>
+  <div class="wrap-mid">
+    <p>ai-memory &middot; cybersecurity audience brief &middot; maximal truthfulness over maximal marketing</p>
+    <p style="margin-top:.5rem">
+      <a href="../">Home</a> ·
+      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a> ·
+      Apache-2.0 · AlphaOne LLC
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>
