@@ -551,6 +551,8 @@ pub mod background;
 // future MCP `memory_checkpoint_*` handlers over a bare rusqlite Connection.
 pub mod checkpoints;
 pub mod cli;
+// v1.0.0 #1830 (TRACT-gap G16) — durability-model disclosure anchor (no erasure
+// cold tier; the deliberate absent-variant is the machine-checked gap record).
 pub mod color;
 /// v0.7.0 Form 5 (issue #758) — auto-confidence + shadow-mode +
 /// freshness-decay + calibration tooling. Closes the FORM 5 PARTIAL
@@ -568,6 +570,7 @@ pub mod config;
 pub mod coordination_audit;
 pub mod curator;
 pub mod daemon_runtime;
+pub mod durability;
 // v0.7.0 L0.5-3 — module renamed from `db` → `storage` as part of
 // the flat-to-modular refactor. The `pub use storage as db;` shim
 // below preserves every `crate::db::*` path across the codebase
