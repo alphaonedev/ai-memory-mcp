@@ -161,6 +161,27 @@ default-workload gate) and uploads `bench-results-10k.json` with the
 artifact set. The run fails when any operation's measured p95 exceeds
 its scale budget by more than the published 10% tolerance.
 
+### Baseline regression guard (#1987)
+
+Beyond the **absolute** p95 budget gates above, `bench.yml` carries an
+**advisory** relative-regression step (`ai-memory bench --baseline
+performance/baseline.json --regression-threshold 50`). It compares each
+run against the committed baseline and reports per-operation deltas to the
+job summary; it **never fails the build** — a shared-runner p95 at a tight
+threshold is a flake generator, so it stays advisory until a soak proves a
+< 1% false-positive rate across ≥ 20 runs (ruling `d6a366ea`).
+
+`performance/baseline.json` must be captured **on the CI runner class it
+gates** (`ubuntu-latest`), not a dev machine. The committed file ships as a
+dev **bootstrap** (`bootstrap: true`), which makes the advisory step
+self-skip (a dev-vs-CI compare is pure hardware noise). To capture a real
+baseline, run the **regenerate-baseline** `workflow_dispatch` job (Bench
+workflow): it takes a **median-of-3** on `ubuntu-latest`, self-describes
+the runner class + binary rev, and uploads the result for an operator to
+commit as `performance/baseline.json` with `bootstrap: false` — which
+activates the advisory compare. **Refresh every minor release** (a baseline
+older than one minor should be regenerated).
+
 ## Verified-path benchmarks (#1961 / R23-R7)
 
 The default bench workload times the *plain* hot paths — `memory_store`

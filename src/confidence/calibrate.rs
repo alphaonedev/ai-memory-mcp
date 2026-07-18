@@ -53,12 +53,16 @@
 //!    buckets fold into 10 stack-allocated counters via the same
 //!    single pass.
 //!
-//! The denormalised `source` column (also schema v40) eliminates the
-//! join with `memories` entirely — orphan observation rows whose
+//! The denormalised `source` column (also schema v40) removed the
+//! grouping join with `memories` — orphan observation rows whose
 //! source memory has been CASCADE-deleted continue to surface in the
 //! report under their stamped `source` value, which is the audit-
 //! honest behaviour (the calibration sample was real; the source
-//! memory's later deletion doesn't unmake the observation).
+//! memory's later deletion doesn't unmake the observation). Pass 1
+//! does carry a read-only **`LEFT JOIN memories`** for the v1.0.0 §11.5
+//! (#1707) consume-vs-access divergence evidence (`access_count`); it is
+//! a LEFT join with `COALESCE(access_count, 0)`, so orphan rows still
+//! surface (as access 0) and the orphan-tolerant contract above holds.
 
 use anyhow::Result;
 use chrono::{Duration, Utc};
@@ -68,6 +72,10 @@ use serde::Serialize;
 /// Default sweep window. The Form 5 brief calls for 30 days; tunable
 /// per call via the CLI `--days N` flag and the MCP `days` parameter.
 pub const DEFAULT_WINDOW_DAYS: i64 = 30;
+
+/// `tracing` target for this module's shadow-mode calibration logs. One
+/// named const referenced at every emit site (pm-v3.1 no-scattered-literal).
+const LOG_TARGET: &str = "confidence.calibrate";
 
 /// One per-(namespace, source) row in the calibration report.
 ///
@@ -101,6 +109,40 @@ pub struct PerSourceBaseline {
     /// This is the future #1707/#C live-wire decision's evidence base,
     /// not a ranking input.
     pub consumption_utility: Option<f64>,
+    /// v1.0.0 §11.5 (#1707) — the shadow-divergence evidence the #1707
+    /// conditional gate requires ("execute the live recall-utility term
+    /// ONLY IF consume-rate diverges meaningfully from the existing
+    /// `access_count` usage proxy, else close won't-do"). **SHADOW MODE —
+    /// logged only, never consulted by [`crate::storage::recall`].**
+    /// `None` when the window has no judged (ledger-correlated) row.
+    pub consume_access_divergence: Option<ConsumeAccessDivergence>,
+}
+
+/// v1.0.0 §11.5 (#1707) — measured evidence for whether the recall-usage
+/// consume signal carries information the recall blend's existing
+/// `MIN(access_count, 50) * 0.1` usage proxy does not.
+///
+/// The #1707 gate ships the live recall-utility term ONLY IF this shows a
+/// meaningful divergence; otherwise the signal is redundant and #1707 is
+/// closed won't-do. The two `mean_access_*` fields are the collinearity
+/// tell: when `consumed` rows carry a systematically higher `access_count`
+/// than `unconsumed` rows (`mean_access_consumed` >> `mean_access_unconsumed`),
+/// the consume signal tracks the access proxy and adds no new ranking
+/// information. Paired with a low `consumed_count / (consumed + unconsumed)`
+/// (sparsity), that is the "does-not-diverge → close won't-do" branch.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ConsumeAccessDivergence {
+    /// Rows this window whose correlated ledger entry marked the memory
+    /// consumed (`recall_outcome = 'consumed'`).
+    pub consumed_count: u64,
+    /// Rows judged-but-not-consumed (`recall_outcome = 'unconsumed'`).
+    pub unconsumed_count: u64,
+    /// Mean `memories.access_count` across the consumed rows; `None` when
+    /// `consumed_count == 0`.
+    pub mean_access_consumed: Option<f64>,
+    /// Mean `memories.access_count` across the unconsumed rows; `None` when
+    /// `unconsumed_count == 0`.
+    pub mean_access_unconsumed: Option<f64>,
 }
 
 /// Top-level calibration report emitted by the sweep.
@@ -140,7 +182,7 @@ pub fn calibrate_from_shadow(
     let backfilled = crate::confidence::shadow::backfill_recall_outcomes(conn)?;
     if backfilled > 0 {
         tracing::info!(
-            target: "confidence.calibrate",
+            target: LOG_TARGET,
             backfilled,
             "shadow sweep: backfilled recall_outcome from the recall_observations ledger"
         );
@@ -150,16 +192,26 @@ pub fn calibrate_from_shadow(
     // entirely in SQL. The denormalised `source` column (schema v40)
     // lets us avoid the INNER JOIN against `memories` that
     // pre-Cluster-G code carried.
+    // v1.0.0 §11.5 (#1707) — the same offline pass also LEFT JOINs
+    // `memories` to sum `access_count` across the consumed vs unconsumed
+    // rows, so the report carries the consume-vs-access divergence evidence
+    // the #1707 gate requires. Still SHADOW MODE (log/report only); the JOIN
+    // is read-only and `crate::storage::recall` is untouched.
     let mut stmt = conn.prepare(
-        "SELECT namespace, source, COUNT(*), AVG(derived_confidence),
-                SUM(CASE WHEN recall_outcome = 'consumed' THEN 1 ELSE 0 END),
-                SUM(CASE WHEN recall_outcome IS NOT NULL THEN 1 ELSE 0 END)
-         FROM confidence_shadow_observations
-         WHERE observed_at >= ?1
-         GROUP BY namespace, source
-         ORDER BY namespace, source",
+        "SELECT o.namespace, o.source, COUNT(*), AVG(o.derived_confidence),
+                SUM(CASE WHEN o.recall_outcome = 'consumed' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN o.recall_outcome IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN o.recall_outcome = 'consumed'
+                         THEN COALESCE(m.access_count, 0) ELSE 0 END),
+                SUM(CASE WHEN o.recall_outcome = 'unconsumed'
+                         THEN COALESCE(m.access_count, 0) ELSE 0 END)
+         FROM confidence_shadow_observations o
+         LEFT JOIN memories m ON m.id = o.memory_id
+         WHERE o.observed_at >= ?1
+         GROUP BY o.namespace, o.source
+         ORDER BY o.namespace, o.source",
     )?;
-    let groups: Vec<(String, String, i64, f64, i64, i64)> = stmt
+    let groups: Vec<(String, String, i64, f64, i64, i64, i64, i64)> = stmt
         .query_map(params![since.as_str()], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -168,6 +220,8 @@ pub fn calibrate_from_shadow(
                 row.get::<_, f64>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -188,7 +242,17 @@ pub fn calibrate_from_shadow(
     )?;
 
     let mut baselines: Vec<PerSourceBaseline> = Vec::with_capacity(groups.len());
-    for (namespace, source, count_i64, mean, consumed_i64, judged_i64) in groups {
+    for (
+        namespace,
+        source,
+        count_i64,
+        mean,
+        consumed_i64,
+        judged_i64,
+        access_consumed_i64,
+        access_unconsumed_i64,
+    ) in groups
+    {
         if count_i64 <= 0 {
             continue;
         }
@@ -243,7 +307,7 @@ pub fn calibrate_from_shadow(
             // reads this. Evidence for the future #1707/#C live-wire
             // decision, not a ranking input.
             tracing::info!(
-                target: "confidence.calibrate",
+                target: LOG_TARGET,
                 namespace = %namespace,
                 source = %source,
                 consumption_utility = cu,
@@ -251,6 +315,40 @@ pub fn calibrate_from_shadow(
                 "shadow consumption utility (SHADOW MODE — not consulted by recall())"
             );
         }
+
+        // v1.0.0 §11.5 (#1707) — the consume-vs-access divergence evidence.
+        // `unconsumed = judged - consumed` (the SQL split is exhaustive over
+        // `recall_outcome IS NOT NULL`). Means are `None` when their bucket
+        // is empty (honest "no evidence", never a misleading 0.0).
+        let consume_access_divergence = if judged_i64 > 0 {
+            let consumed_count = consumed_i64.max(0) as u64;
+            let unconsumed_count = (judged_i64 - consumed_i64).max(0) as u64;
+            let mean_access_consumed =
+                (consumed_count > 0).then(|| access_consumed_i64 as f64 / consumed_count as f64);
+            let mean_access_unconsumed = (unconsumed_count > 0)
+                .then(|| access_unconsumed_i64 as f64 / unconsumed_count as f64);
+            // Log the divergence tell: sparsity + the collinearity ratio.
+            // A low consumed share AND consumed-rows-carry-higher-access is
+            // the "does-not-diverge → close won't-do" signal the gate names.
+            tracing::info!(
+                target: LOG_TARGET,
+                namespace = %namespace,
+                source = %source,
+                consumed = consumed_count,
+                unconsumed = unconsumed_count,
+                mean_access_consumed = mean_access_consumed.unwrap_or(f64::NAN),
+                mean_access_unconsumed = mean_access_unconsumed.unwrap_or(f64::NAN),
+                "shadow consume-vs-access divergence (SHADOW MODE — #1707 gate evidence, not consulted by recall())"
+            );
+            Some(ConsumeAccessDivergence {
+                consumed_count,
+                unconsumed_count,
+                mean_access_consumed,
+                mean_access_unconsumed,
+            })
+        } else {
+            None
+        };
 
         baselines.push(PerSourceBaseline {
             namespace,
@@ -260,6 +358,7 @@ pub fn calibrate_from_shadow(
             mean,
             buckets,
             consumption_utility,
+            consume_access_divergence,
         });
     }
     drop(median_stmt);

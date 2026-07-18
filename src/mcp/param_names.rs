@@ -64,6 +64,13 @@ pub const CONDITION_TYPE: &str = "condition_type";
 pub const CONFIDENCE: &str = crate::models::field_names::CONFIDENCE;
 pub const CONSUMED: &str = "consumed";
 pub const CONTENT: &str = "content";
+// #1974 — opt-in content patch primitive on `memory_update`. A single
+// append XOR unique-match replace op that assembles the full replacement
+// content from the current stored content (mutually exclusive with the
+// full-replacement `content`).
+pub const CONTENT_APPEND: &str = "content_append";
+pub const CONTENT_REPLACE_FROM: &str = "content_replace_from";
+pub const CONTENT_REPLACE_TO: &str = "content_replace_to";
 pub const CONTEXT: &str = "context";
 pub const CORRELATION_ID: &str = crate::models::field_names::CORRELATION_ID;
 pub const CREATED_AT: &str = crate::models::field_names::CREATED_AT;
@@ -218,6 +225,9 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     CONFIDENCE,
     CONSUMED,
     CONTENT,
+    CONTENT_APPEND,
+    CONTENT_REPLACE_FROM,
+    CONTENT_REPLACE_TO,
     CONTEXT,
     CREATED_AT,
     CREATED_BY,
@@ -347,9 +357,11 @@ mod tests {
         // lifecycle params for memory_skill_retire).
         // v1.0.0 #2122 — 127 -> 128: WHY_TRACE (covenant clause-1 rationale
         // param on memory_notify / memory_share).
+        // v1.0.0 #1974 — 128 -> 131: CONTENT_APPEND + CONTENT_REPLACE_FROM +
+        //   CONTENT_REPLACE_TO (memory_update content patch primitive).
         assert_eq!(
             ALL_PARAM_NAMES.len(),
-            128,
+            131,
             "MCP param-name SSOT census drifted from v0.7.0 baseline"
         );
     }
