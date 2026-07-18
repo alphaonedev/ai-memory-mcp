@@ -111,6 +111,18 @@ hmac = "0.12"
 # form). Introduced ONLY as the cid address function; the inner content
 # digest + the whole audit spine stay on `sha2`.
 blake3 = "1.5"
+# v1.0.0 #2064 (TRACT-gap G16, #1830) — Reed-Solomon erasure coding for the
+# opt-in archive cold-tier redundancy layer (`src/erasure`). OPERATOR-
+# AUTHORIZED dependency (2026-07-18, sole-authority rule): the #1830 2x5
+# adversarial vote (4d3ea1c5) UNANIMOUSLY rejected hand-rolling a GF(2^8)
+# codec (a codec bug corrupts the cold tier irrecoverably), so the vetted
+# crate IS the design. Vetting evidence (recorded in the introducing PR):
+# crates.io since 2023-11, 1.77M downloads (670k recent), maintained
+# (3.1.0 2025-10-14), MIT AND BSD-3-Clause (Apache-2.0-compatible), zero
+# RustSec advisories, MSRV 1.82 <= our 1.96. O(n log n) Leopard-RS
+# (GF(2^16)) with SIMD on x86-64 + AArch64; the shard on-disk format is
+# this crate's codec format (resolves the vote's T4 freeze concern).
+reed-solomon-simd = "3.1"
 # v0.7.0 (issue #654 MVP attestation) — hex-encode the SHA-256 of model
 # weight files for `src/inference::AttestedWeights`. Already pulled in
 # transitively via several other crates; promoted to a direct dep so

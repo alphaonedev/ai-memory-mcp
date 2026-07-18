@@ -337,7 +337,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // storage/mod.rs at 25_738; ceiling 25_650 -> 25_850. Then #2035 v85
     // archive->restore valid_from/valid_until column threading + round-trip
     // unit test added ~65 LOC on top of the merge.
-    ("src/storage/mod.rs", 25_900),
+    //
+    // 2026-07-18 — bumped 25_900 → 26_000 by #2064 (erasure cold tier):
+    // the purge funnels collect bundle ids + remove bundles (destruction
+    // intent flows through the redundancy layer) and the two restore
+    // funnels gain the reconstruct-on-read fallback (~85 LOC; 25_924 at
+    // the bump). Growth is justified: wiring on existing funnels only —
+    // the erasure subsystem itself lives in the new src/erasure/ modules.
+    ("src/storage/mod.rs", 26_000),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress

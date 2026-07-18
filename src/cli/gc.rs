@@ -34,6 +34,24 @@ pub fn run_gc(
         )?;
     }
     let count = db::gc(&conn, app_config.effective_archive_on_gc())?;
+    // #2064 — erasure cold-tier sweep (no-op when disabled). This is the
+    // bundling trigger for CLI-only (no-daemon) topologies, mirroring the
+    // fold-before-gc precedent above. Informational output goes to stderr
+    // so `--json` stdout stays a single JSON document.
+    match crate::erasure::archive_sync::gc_tick(&conn) {
+        Ok(r) if r.bundled > 0 || r.failed > 0 => {
+            writeln!(
+                out.stderr,
+                "ai-memory: erasure cold tier bundled {} archived rows ({} failed)",
+                r.bundled, r.failed
+            )?;
+        }
+        Ok(_) => {}
+        Err(e) => writeln!(
+            out.stderr,
+            "ai-memory: erasure cold-tier sweep failed: {e:#}"
+        )?,
+    }
     if json_out {
         writeln!(
             out.stdout,

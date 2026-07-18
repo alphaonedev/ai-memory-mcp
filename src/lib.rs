@@ -571,6 +571,9 @@ pub mod coordination_audit;
 pub mod curator;
 pub mod daemon_runtime;
 pub mod durability;
+// v1.0.0 #2064 (TRACT-gap G16, #1830) — opt-in erasure-coded archive
+// cold-tier redundancy layer (operator-authorized reed-solomon-simd dep).
+pub mod erasure;
 // v0.7.0 L0.5-3 — module renamed from `db` → `storage` as part of
 // the flat-to-modular refactor. The `pub use storage as db;` shim
 // below preserves every `crate::db::*` path across the codebase
