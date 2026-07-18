@@ -45,9 +45,10 @@ use ai_memory::governance::audit as witness;
 use ai_memory::models::ConditionType;
 use ai_memory::signed_events::{
     CauseBinding, HeadHashCheck, SignedEvent, TruncationCheck, WitnessCheck, append_signed_event,
-    force_emit_audit_head_witness, payload_hash, verify_audit_trail,
+    canonical_chain_bytes, force_emit_audit_head_witness, payload_hash, verify_audit_trail,
 };
 use rusqlite::{Connection, params};
+use sha2::{Digest, Sha256};
 
 /// Process-global serialisation for the witness ENV + throttle static.
 fn env_lock() -> &'static Mutex<()> {
@@ -662,6 +663,100 @@ mod postgres_parity {
             .ok();
         clear_witness_env();
     }
+
+    /// v1.0.0 #2203 F2 (CWE-354) — the pg head-hash test the gap that hid the
+    /// bug LACKED. The pg append chokepoint anchors the head hash from the
+    /// in-memory NANOSECOND `Utc::now()`, while the verifier recomputes from the
+    /// MICRO-precision `TIMESTAMPTZ` readback — before the fix the two differed on
+    /// nearly every row → a FALSE `HeadHashCheck::Mismatch` on a CLEAN pg chain.
+    /// This drives the REAL pg append path (`emit_spawn_audit` → nanosecond ts),
+    /// forces a REAL off-table watermark, and asserts the clean chain reads
+    /// `NotDetected`; a real same-length rewrite of the anchored (head) row then
+    /// reads `Mismatch` (#2202, at the anchored sequence). No enrolled witness —
+    /// the forensic-watermark lane is the #1873 headline.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — live postgres"]
+    async fn pg_head_hash_clean_chain_not_detected_and_rewrite_mismatch() {
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let fdir = fresh_dir("pg-hh-forensic");
+        // Live forensic sink so `maybe_record_audit_watermark` writes and
+        // `last_audit_watermark` reads (process-global; torn down at the end).
+        witness::init(fdir.path(), None).expect("forensic init");
+
+        let base_seq: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) FROM signed_events")
+                .fetch_one(pg.pool())
+                .await
+                .expect("read base head");
+
+        // Drive the REAL pg append path until a watermark is anchored. Each
+        // `emit_spawn_audit` stamps `Utc::now()` (nanoseconds) — the exact F2 skew
+        // surface — and appends through `pg_append_signed_event_with_chain`.
+        let mut anchored: Option<i64> = None;
+        for i in 0..300 {
+            pg.emit_spawn_audit(&format!("argv0-{i}"), "1822-f2-headhash")
+                .await;
+            if let Some((seq, _)) = witness::last_audit_watermark() {
+                anchored = Some(seq); // fired on the just-appended head → anchored == head
+                break;
+            }
+        }
+        let Some(anchored) = anchored else {
+            eprintln!("skip: no watermark fired within 300 pg appends (shared-DB throttle state)");
+            sqlx::query("DELETE FROM signed_events WHERE sequence > $1")
+                .bind(base_seq)
+                .execute(pg.pool())
+                .await
+                .ok();
+            witness::shutdown();
+            return;
+        };
+
+        // CLEAN chain: the anchored row survives intact → the micros-readback
+        // recompute MATCHES the anchor (also micros, post-#2203) → NotDetected.
+        let report = pg.verify_audit_trail(None).await.expect("pg verify clean");
+        assert_eq!(
+            report.head_hash,
+            HeadHashCheck::NotDetected,
+            "a CLEAN pg chain must read NotDetected — the #2203 anchor/recompute precision \
+             skew (nanos vs micros) is fixed; report={report:?}"
+        );
+        assert!(report.is_clean(), "clean pg chain; report={report:?}");
+
+        // SAME-LENGTH rewrite of the anchored (head) row → the at-anchored-seq
+        // recompute differs from the anchor → Mismatch (#2202 on pg).
+        sqlx::query("UPDATE signed_events SET payload_hash = $1 WHERE sequence = $2")
+            .bind(vec![0x11u8; 32])
+            .bind(anchored)
+            .execute(pg.pool())
+            .await
+            .expect("rewrite anchored row");
+        let report2 = pg
+            .verify_audit_trail(None)
+            .await
+            .expect("pg verify rewritten");
+        match &report2.head_hash {
+            HeadHashCheck::Mismatch { chain, .. } => assert_eq!(chain, "signed_events"),
+            other => {
+                panic!("expected pg head_hash Mismatch after rewrite, got {other:?}; {report2:?}")
+            }
+        }
+        assert!(
+            !report2.is_clean(),
+            "rewrite must dirty; report={report2:?}"
+        );
+
+        // Cleanup: delete our tail rows (removes the tamper + the appended rows),
+        // and tear down the process-global forensic sink so no watermark leaks.
+        sqlx::query("DELETE FROM signed_events WHERE sequence > $1")
+            .bind(base_seq)
+            .execute(pg.pool())
+            .await
+            .ok();
+        witness::shutdown();
+    }
 }
 
 // ── (#1873) witness-anchor head-hash lane: SAME-LENGTH suffix rewrite ──
@@ -763,6 +858,187 @@ fn witness_memory_revisions_same_length_rewrite_is_head_hash_mismatch() {
         !report.is_clean(),
         "a memory_revisions same-length rewrite must dirty; report={report:?}"
     );
+
+    clear_witness_env();
+}
+
+// ── (#2202) witness head-hash lane: rewrite BELOW the head after appends ──
+// The #1873 residual-1 the equal-sequence gate missed also applies to the
+// witness lane: after the witness binds head W the daemon appends more rows, so
+// db_head > W and the equal-sequence gate never consults the witnessed head
+// hash. The at-anchored-sequence compare (#2202) catches it. The witness
+// anchor is consumed through the K1 pin + signature gate (#2203 F3), which the
+// enrolled+force-emitted checkpoint satisfies.
+
+/// Recompute + write `signed_events` row `seq`'s `prev_hash` from its
+/// predecessor's canonical bytes (the faithful whole-suffix-rewrite step that
+/// keeps the chain walk intact so only the head-hash anchor convicts).
+fn relink_prev_hash(conn: &Connection, seq: i64) {
+    let prev_hash: Vec<u8> = conn
+        .query_row(
+            "SELECT id, agent_id, event_type, payload_hash, signature, attest_level, \
+                    timestamp, sequence, cause_hash \
+             FROM signed_events WHERE sequence = ?1",
+            params![seq - 1],
+            |row| {
+                let ev = SignedEvent {
+                    id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    event_type: row.get(2)?,
+                    payload_hash: row.get(3)?,
+                    signature: row.get(4)?,
+                    attest_level: row.get(5)?,
+                    timestamp: row.get(6)?,
+                    sequence: row.get(7)?,
+                    cause_hash: row.get::<_, Option<Vec<u8>>>(8)?,
+                    prev_hash: Vec::new(),
+                };
+                let mut h = Sha256::new();
+                h.update(canonical_chain_bytes(&ev));
+                Ok(h.finalize().to_vec())
+            },
+        )
+        .expect("read predecessor row");
+    conn.execute(
+        "UPDATE signed_events SET prev_hash = ?1 WHERE sequence = ?2",
+        params![prev_hash, seq],
+    )
+    .expect("relink prev_hash");
+}
+
+/// (PASSIVE) — witness binds signed head W (=5); the daemon appends 3 rows
+/// (`db_head` = 8 > W); a same-length whole-suffix rewrite then spans row W. The
+/// equal-sequence gate skips the witnessed hash (8 != 5) → clean; the
+/// at-anchored-seq compare recomputes row W and convicts.
+#[test]
+fn witness_signed_events_rewrite_below_head_after_appends_is_head_hash_mismatch() {
+    let _g = lock();
+    let kdir = fresh_dir("j-keys");
+    let ddir = fresh_dir("j-db");
+    let _kp = enrol_witness(kdir.path());
+    let (_path, conn) = open_db(ddir.path());
+
+    append_rows(&conn, 5);
+    for i in 0..3 {
+        append_rev_leaf(&conn, &format!("mem-{i}"));
+    }
+    force_emit_audit_head_witness(&conn); // binds signed head = 5
+    let anchored = 5i64;
+    // Daemon appends 3 more signed rows AFTER the witness → db_head = 8.
+    append_rows(&conn, 3);
+
+    // Baseline: the witnessed row (5) is intact → MATCHES its witnessed hash
+    // even though the head (8) has moved past it (the #2202 at-anchored-seq
+    // compare; the equal-sequence gate returned Unknown here).
+    let base = verify_audit_trail(&conn, None).expect("verify baseline");
+    assert_eq!(base.head_sequence, 8, "base={base:?}");
+    assert_eq!(base.head_hash, HeadHashCheck::NotDetected, "base={base:?}");
+    assert!(base.is_clean(), "base={base:?}");
+
+    // SAME-LENGTH rewrite of the WITNESSED signed_events row + relink.
+    conn.execute(
+        "UPDATE signed_events SET payload_hash = ?1 WHERE sequence = ?2",
+        params![vec![0xEEu8; 32], anchored],
+    )
+    .expect("rewrite witnessed row payload in place");
+    relink_prev_hash(&conn, anchored + 1);
+
+    let report = verify_audit_trail(&conn, None).expect("verify rewritten");
+    assert!(report.chain_intact, "report={report:?}");
+    assert_eq!(
+        report.witness,
+        WitnessCheck::NotDetected,
+        "db_head (8) >= witnessed (5) → the seq-only witness reads clean; report={report:?}"
+    );
+    match &report.head_hash {
+        HeadHashCheck::Mismatch { chain, .. } => assert_eq!(chain, "signed_events"),
+        other => panic!("expected signed_events head-hash Mismatch, got {other:?}; {report:?}"),
+    }
+    assert!(!report.is_clean(), "report={report:?}");
+
+    clear_witness_env();
+}
+
+/// (ACTIVE) — even at head == witnessed W, rewrite row W and append ONE linked
+/// row → head = W+1, so the equal-sequence gate withholds. The at-anchored-seq
+/// compare convicts.
+#[test]
+fn witness_signed_events_rewrite_then_append_one_row_is_head_hash_mismatch() {
+    let _g = lock();
+    let kdir = fresh_dir("l-keys");
+    let ddir = fresh_dir("l-db");
+    let _kp = enrol_witness(kdir.path());
+    let (_path, conn) = open_db(ddir.path());
+
+    append_rows(&conn, 5);
+    force_emit_audit_head_witness(&conn); // binds signed head = 5, head == W
+    let anchored = 5i64;
+
+    conn.execute(
+        "UPDATE signed_events SET payload_hash = ?1 WHERE sequence = ?2",
+        params![vec![0xDDu8; 32], anchored],
+    )
+    .expect("rewrite witnessed head row in place");
+    append_row(&conn, b"attacker-appended-linked-row"); // head → 6
+
+    let report = verify_audit_trail(&conn, None).expect("verify");
+    assert_eq!(report.head_sequence, anchored + 1, "report={report:?}");
+    assert!(report.chain_intact, "report={report:?}");
+    assert_eq!(
+        report.witness,
+        WitnessCheck::NotDetected,
+        "report={report:?}"
+    );
+    match &report.head_hash {
+        HeadHashCheck::Mismatch { chain, .. } => assert_eq!(chain, "signed_events"),
+        other => panic!("expected signed_events head-hash Mismatch, got {other:?}; {report:?}"),
+    }
+    assert!(!report.is_clean(), "report={report:?}");
+
+    clear_witness_env();
+}
+
+/// (PASSIVE, revisions lane) — witness binds `memory_revisions` head W (=4); more
+/// revision leaves are appended (rev `db_head` = 7 > W); a same-length rewrite of
+/// the witnessed revision row is caught only at the anchored sequence.
+#[test]
+fn witness_memory_revisions_rewrite_below_head_after_appends_is_head_hash_mismatch() {
+    let _g = lock();
+    let kdir = fresh_dir("m-keys");
+    let ddir = fresh_dir("m-db");
+    let _kp = enrol_witness(kdir.path());
+    let (_path, conn) = open_db(ddir.path());
+
+    append_rows(&conn, 3);
+    for i in 0..4 {
+        append_rev_leaf(&conn, &format!("mem-{i}"));
+    }
+    force_emit_audit_head_witness(&conn); // binds memory_revisions head = 4
+    let anchored_rev = 4i64;
+    // Append 3 more revision leaves AFTER the witness → rev db_head = 7.
+    for i in 4..7 {
+        append_rev_leaf(&conn, &format!("mem-{i}"));
+    }
+
+    let base = verify_audit_trail(&conn, None).expect("verify baseline");
+    assert_eq!(base.head_hash, HeadHashCheck::NotDetected, "base={base:?}");
+
+    // SAME-LENGTH rewrite of the WITNESSED memory_revisions row (flip a field
+    // its canonical bytes commit — `namespace`).
+    conn.execute(
+        "UPDATE memory_revisions SET namespace = 'tampered' WHERE sequence = ?1",
+        params![anchored_rev],
+    )
+    .expect("rewrite witnessed memory_revisions row in place");
+
+    let report = verify_audit_trail(&conn, None).expect("verify rewritten");
+    match &report.head_hash {
+        HeadHashCheck::Mismatch { chain, .. } => assert_eq!(chain, "memory_revisions"),
+        other => {
+            panic!("expected memory_revisions head-hash Mismatch, got {other:?}; {report:?}")
+        }
+    }
+    assert!(!report.is_clean(), "report={report:?}");
 
     clear_witness_env();
 }

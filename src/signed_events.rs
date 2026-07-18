@@ -867,6 +867,54 @@ fn read_chain_head(conn: &Connection) -> Result<(i64, [u8; 32])> {
     }
 }
 
+/// v1.0.0 #2202 (CWE-354) — recompute `SHA-256(canonical_chain_bytes(row))` as
+/// lowercase hex for the SURVIVING `signed_events` row at `sequence`, or `None`
+/// when no row survives there (a gap the monotonic-sequence scan already
+/// surfaces → the head-hash lane withholds `Unknown`).
+///
+/// This is the #1873 "compare AT the anchored sequence" primitive: the anchored
+/// row's canonical hash is STABLE under later appends (`canonical_chain_bytes`
+/// deliberately excludes `prev_hash`, and rows are append-immutable), so
+/// comparing an off-table / witness anchor against this recompute whenever
+/// `anchored_seq <= db_head` can NEVER false-positive on a clean chain — yet it
+/// convicts a same-length whole-suffix rewrite that spans the anchored row even
+/// after the daemon has appended past the watermark (the steady state) or the
+/// attacker appended one linked row to push the head past the anchor. Shared by
+/// the forensic-watermark + witness lanes on both backends (K3 parity).
+fn recompute_signed_row_hash_at(conn: &Connection, sequence: i64) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    let event: Option<SignedEvent> = conn
+        .query_row(
+            "SELECT id, agent_id, event_type, payload_hash, signature, attest_level, \
+                    timestamp, sequence, cause_hash \
+             FROM signed_events \
+             WHERE sequence = ?1 \
+             LIMIT 1",
+            params![sequence],
+            |row| {
+                Ok(SignedEvent {
+                    id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    event_type: row.get(2)?,
+                    payload_hash: row.get(3)?,
+                    signature: row.get(4)?,
+                    attest_level: row.get(5)?,
+                    timestamp: row.get(6)?,
+                    sequence: row.get(7)?,
+                    cause_hash: row.get::<_, Option<Vec<u8>>>(8)?,
+                    prev_hash: Vec::new(), // not part of the canonical bytes
+                })
+            },
+        )
+        .optional()
+        .context("recompute_signed_row_hash_at: read row at sequence")?;
+    Ok(event.map(|ev| {
+        let mut hasher = Sha256::new();
+        hasher.update(canonical_chain_bytes(&ev));
+        hex_lower(hasher.finalize().as_slice())
+    }))
+}
+
 /// Outcome of a [`verify_chain`] pass over the `signed_events` table.
 ///
 /// `rows_checked` counts every row the verifier walked.
@@ -1740,6 +1788,33 @@ pub fn compute_witness_verdict(
     WitnessCheck::NotDetected
 }
 
+/// v1.0.0 #1873 F3 (#2203) — the witness dual head, extracted ONLY when the
+/// latest witness checkpoint passes the SAME K1 pin + signature gate
+/// [`compute_witness_verdict`] enforces, so the head-hash lane can never trust a
+/// FORGED in-DB checkpoint to mint a false `Mismatch` (or an unearned
+/// `NotDetected`). Returns `None` — the head-hash lane then withholds
+/// (`Unknown`) — when there is no anchor, no out-of-band pin to anchor the
+/// pubkey, the K1 pin fails, or the signature is invalid. Mirrors the pin-FIRST
+/// discipline of [`compute_witness_verdict`]; shared by both backends (K3 parity).
+#[must_use]
+pub fn verified_witness_dual_head(
+    latest_witness: Option<&crate::models::Checkpoint>,
+    enrolled_pubkey: Option<&ed25519_dalek::VerifyingKey>,
+) -> Option<crate::governance::audit::WitnessDualHead> {
+    let cp = latest_witness?;
+    // No out-of-band pin → cannot cryptographically anchor the pubkey → withhold
+    // (mirrors `compute_witness_verdict`'s `enrolled_pubkey.is_none()` withhold).
+    let expected = enrolled_pubkey?;
+    // K1 pin FIRST, then signature self-consistency over the canonical resolution.
+    if cp.resolver_pubkey.as_slice() != expected.to_bytes().as_slice() {
+        return None;
+    }
+    if !crate::checkpoints::verify(cp) {
+        return None;
+    }
+    crate::governance::audit::parse_witness_dual_head(cp)
+}
+
 /// Cause-binding verdict (#1822 K2). `rows_without_cause == 0` →
 /// [`CauseBinding::NotDetected`]; otherwise [`CauseBinding::Detected`] under
 /// require-mode (fail-closed) or [`CauseBinding::Unknown`] (withhold) by
@@ -2144,52 +2219,69 @@ pub fn verify_audit_trail(conn: &Connection, since: Option<&str>) -> Result<Audi
 
     // v1.0.0 #1873 (CWE-354) — audit-head HASH-anchor check. The seq-only
     // `truncation` + `witness` verdicts above miss a SAME-LENGTH suffix rewrite
-    // on an unsigned daemon (recomputed `prev_hash`, equal row count). Recompute
-    // the surviving head-row canonical hashes and compare them against EVERY
-    // anchor that records a head hash at the SAME sequence: the #1850 forensic
-    // watermark (signed_events) + the #1822 dual-chain WITNESS (signed_events
-    // AND memory_revisions). Each comparison is meaningful ONLY at equal
-    // sequence (a lower head is a truncation, surfaced above; a higher head is a
-    // stale anchor). Shared `read_chain_head`/`read_revision_chain_head` +
-    // `hex_lower` recompute + the pure `fold_head_hash_verdicts` → the postgres
-    // twin computes an identical verdict (K3 parity). See [`HeadHashCheck`] for
-    // the interior-row / sub-interval / #1930 bounds.
+    // on an unsigned daemon (recomputed `prev_hash`, equal row count). For every
+    // anchor that records a head hash — the #1850 forensic watermark
+    // (signed_events) + the #1822 dual-chain WITNESS (signed_events AND
+    // memory_revisions) — recompute the canonical hash of the SURVIVING ROW AT
+    // THE ANCHORED SEQUENCE and compare whenever `anchored_seq <= db_head`
+    // (#2202). Comparing AT the anchored sequence — not only when it is still the
+    // head — convicts a rewrite spanning the anchored row even after the daemon
+    // has appended past the watermark (the steady state ~63/64 of the time) or
+    // the attacker appended one linked row to push the head past the anchor.
+    // `canonical_chain_bytes` excludes `prev_hash` and rows are append-immutable,
+    // so the anchored row's hash is stable under later appends and this can never
+    // false-positive; `anchored_seq > db_head` stays withheld (the truncation /
+    // witness lanes own that) and a missing row at the anchored sequence (a gap
+    // surfaced above) → `None` → withhold. F3 (#2203): the witness anchor is
+    // consumed ONLY THROUGH the K1 pin + signature gate
+    // (`verified_witness_dual_head`) so a forged in-DB checkpoint can't mint a
+    // false verdict. `recompute_signed_row_hash_at` /
+    // `revisions::recompute_revision_row_hash_at` + the pure
+    // `fold_head_hash_verdicts` → the postgres twin computes an identical verdict
+    // (K3 parity). See [`HeadHashCheck`] for the interior-row / sub-interval /
+    // #1930 bounds.
     let head_hash = {
-        let recomputed_signed = read_chain_head(conn).ok().map(|(_, d)| hex_lower(&d));
-        let witness_dual = latest_witness
-            .as_ref()
-            .and_then(crate::governance::audit::parse_witness_dual_head);
+        let witness_dual =
+            verified_witness_dual_head(latest_witness.as_ref(), enrolled_pubkey.as_ref());
         let mut verdicts: Vec<HeadHashCheck> = Vec::new();
-        // (a) forensic watermark → signed_events head.
+        // (a) forensic watermark → signed_events row AT the anchored sequence.
         if let Some((anchored_head, anchored_hash)) =
             crate::governance::audit::last_audit_watermark()
-            && head_sequence == anchored_head
+            && anchored_head > 0
+            && anchored_head <= head_sequence
         {
+            let recomputed = recompute_signed_row_hash_at(conn, anchored_head)
+                .ok()
+                .flatten();
             verdicts.push(compute_head_hash_verdict(
                 Some(&anchored_hash),
-                recomputed_signed.as_deref(),
+                recomputed.as_deref(),
                 CHAIN_SIGNED_EVENTS,
             ));
         }
-        // (b) witness dual anchor → signed_events + memory_revisions heads.
+        // (b) witness dual anchor → signed_events + memory_revisions rows AT the
+        //     anchored sequences.
         if let Some(dual) = witness_dual {
-            if head_sequence == dual.signed_head_sequence {
+            if dual.signed_head_sequence > 0 && dual.signed_head_sequence <= head_sequence {
+                let recomputed = recompute_signed_row_hash_at(conn, dual.signed_head_sequence)
+                    .ok()
+                    .flatten();
                 verdicts.push(compute_head_hash_verdict(
                     Some(&dual.signed_head_hash),
-                    recomputed_signed.as_deref(),
+                    recomputed.as_deref(),
                     CHAIN_SIGNED_EVENTS,
                 ));
             }
-            let rev = crate::revisions::read_revision_chain_head(conn)
+            if dual.revisions_head_sequence > 0 && dual.revisions_head_sequence <= revisions_head {
+                let recomputed = crate::revisions::recompute_revision_row_hash_at(
+                    conn,
+                    dual.revisions_head_sequence,
+                )
                 .ok()
-                .map(|(seq, d)| (seq, hex_lower(&d)));
-            if let Some((rev_seq, rev_hash)) = rev
-                && rev_seq > 0
-                && rev_seq == dual.revisions_head_sequence
-            {
+                .flatten();
                 verdicts.push(compute_head_hash_verdict(
                     Some(&dual.revisions_head_hash),
-                    Some(rev_hash.as_str()),
+                    recomputed.as_deref(),
                     CHAIN_MEMORY_REVISIONS,
                 ));
             }

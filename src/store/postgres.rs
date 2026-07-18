@@ -10489,6 +10489,18 @@ async fn pg_append_signed_event_with_chain_in_tx(
     use crate::signed_events::{ZERO_HASH, canonical_chain_bytes};
     use sha2::{Digest, Sha256};
 
+    // v1.0.0 #2203 (CWE-354) — normalize the anchor-side timestamp to the
+    // MICROSECOND precision postgres durably stores in TIMESTAMPTZ BEFORE it is
+    // hashed into the #1850 watermark / #1822 witness head anchor. The verify-side
+    // recompute (and every chain walk) reads the row back as microseconds, so
+    // hashing the in-memory `Utc::now()` NANOSECOND value here would make the
+    // anchored hash differ from the recomputed hash on essentially every row → a
+    // false `HeadHashCheck::Mismatch` on a CLEAN pg chain (the #2203 K3 parity
+    // break). Truncate ONCE and use it for BOTH the column bind and the
+    // `head_view` canonical bytes so anchor-hash == readback-recompute-hash by
+    // construction (mirrors the `link_internal` G3 truncate-before-sign discipline).
+    let timestamp = truncate_to_microseconds(timestamp);
+
     // Read the chain head — including its cause_hash so the next row's
     // prev_hash commits to the head's present-only cause fold (v73).
     let head: Option<(
@@ -10744,6 +10756,92 @@ type PgSignedEventWalkRow = (
     i64,
     Option<Vec<u8>>,
 );
+
+/// v1.0.0 #2202 (CWE-354) — postgres twin of
+/// `signed_events::recompute_signed_row_hash_at`. Recompute the canonical hash of
+/// the SURVIVING `signed_events` row AT `sequence` (lowercase hex), or `None`
+/// when no row survives there (a gap → the head-hash lane withholds) or the read
+/// errors (`.ok()` degrade → withhold, never a false alarm). The timestamp is read
+/// back as the micro-precision `TIMESTAMPTZ` that the #2203-normalized anchor also
+/// hashes, so a clean pg chain matches.
+async fn pg_recompute_signed_row_hash_at(pool: &PgPool, sequence: i64) -> Option<String> {
+    use crate::signed_events::{SignedEvent, canonical_chain_bytes};
+    use sha2::{Digest, Sha256};
+    let row: Option<PgSignedEventWalkRow> = sqlx::query_as(
+        "SELECT id, agent_id, event_type, payload_hash, signature, attest_level, \
+                timestamp, prev_hash, sequence, cause_hash \
+         FROM signed_events WHERE sequence = $1 LIMIT 1",
+    )
+    .bind(sequence)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    row.map(
+        |(id, agent, etype, ph, sig, attest, ts, _prev, seq, cause)| {
+            let event = SignedEvent {
+                id,
+                agent_id: agent,
+                event_type: etype,
+                payload_hash: ph,
+                signature: sig,
+                attest_level: attest,
+                timestamp: ts.to_rfc3339(),
+                prev_hash: Vec::new(),
+                sequence: seq,
+                cause_hash: cause,
+            };
+            let mut h = Sha256::new();
+            h.update(canonical_chain_bytes(&event));
+            crate::signed_events::hex_lower(h.finalize().as_slice())
+        },
+    )
+}
+
+/// v1.0.0 #2202 (CWE-354) — postgres twin of
+/// `revisions::recompute_revision_row_hash_at`. Recompute the canonical hash of
+/// the SURVIVING `memory_revisions` row AT `sequence` (lowercase hex), or `None`
+/// when absent / unknown-kind / read error → the head-hash lane withholds.
+async fn pg_recompute_revision_row_hash_at(pool: &PgPool, sequence: i64) -> Option<String> {
+    use crate::revisions::{RevisionLeaf, canonical_revision_chain_bytes};
+    use sha2::{Digest, Sha256};
+    type RevRow = (
+        String,
+        String,
+        String,
+        Option<i64>,
+        String,
+        Option<String>,
+        String,
+        Option<Vec<u8>>,
+    );
+    let row: Option<RevRow> = sqlx::query_as(
+        "SELECT id, memory_id, kind, prior_version, namespace, agent_id, created_at, \
+                signature \
+         FROM memory_revisions WHERE sequence = $1 LIMIT 1",
+    )
+    .bind(sequence)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    row.and_then(|(id, memory_id, kind, prior, ns, agent, created_at, sig)| {
+        let kind = crate::revisions::RecordKind::from_str_opt(&kind)?;
+        let leaf = RevisionLeaf {
+            id,
+            memory_id,
+            kind,
+            prior_version: prior,
+            namespace: ns,
+            agent_id: agent,
+            created_at,
+            signature: sig,
+        };
+        let mut h = Sha256::new();
+        h.update(canonical_revision_chain_bytes(&leaf, sequence));
+        Some(crate::signed_events::hex_lower(h.finalize().as_slice()))
+    })
+}
 
 impl PostgresStore {
     /// v0.9.0 G5b (#1822, item 10 / GATE K3) — POSTGRES `verify_audit_trail`
@@ -11056,121 +11154,58 @@ impl PostgresStore {
         // an IDENTICAL verdict to sqlite (K3 parity).
         let rollback = crate::governance::audit::compute_rollback_verdict_for_report(head_sequence);
 
-        // v1.0.0 #1873 (CWE-354) — audit-head HASH-anchor check (postgres twin
-        // of the sqlite `head_hash`). Recompute the surviving signed_events head
-        // row's canonical hash (mirrors the append-time head_view + sqlite
-        // `read_chain_head`, so the pg watermark anchor and this recompute
-        // agree) and feed it to the SHARED `compute_head_hash_verdict` under the
-        // SAME equal-sequence gate → IDENTICAL verdict to sqlite (K3).
-        let recomputed_head_hex: Option<String> = {
-            let row: Option<PgSignedEventWalkRow> = sqlx::query_as(
-                "SELECT id, agent_id, event_type, payload_hash, signature, attest_level, \
-                        timestamp, prev_hash, sequence, cause_hash \
-                 FROM signed_events ORDER BY COALESCE(sequence, 0) DESC, ctid DESC LIMIT 1",
-            )
-            .fetch_optional(&self.pool)
-            .await
-            .ok()
-            .flatten();
-            row.map(
-                |(id, agent, etype, ph, sig, attest, ts, _prev, seq, cause)| {
-                    let event = SignedEvent {
-                        id,
-                        agent_id: agent,
-                        event_type: etype,
-                        payload_hash: ph,
-                        signature: sig,
-                        attest_level: attest,
-                        timestamp: ts.to_rfc3339(),
-                        prev_hash: Vec::new(),
-                        sequence: seq,
-                        cause_hash: cause,
-                    };
-                    let mut h = Sha256::new();
-                    h.update(canonical_chain_bytes(&event));
-                    crate::signed_events::hex_lower(h.finalize().as_slice())
-                },
-            )
-        };
-        // Recompute the memory_revisions head-row canonical hash for the
-        // witness lane (the pg twin of `read_revision_chain_head`).
-        let recomputed_rev_hex: Option<(i64, String)> = {
-            use crate::revisions::{RevisionLeaf, canonical_revision_chain_bytes};
-            type RevHeadRow = (
-                String,
-                String,
-                String,
-                Option<i64>,
-                String,
-                Option<String>,
-                String,
-                Option<Vec<u8>>,
-                i64,
-            );
-            let row: Option<RevHeadRow> = sqlx::query_as(
-                "SELECT id, memory_id, kind, prior_version, namespace, agent_id, created_at, \
-                        signature, sequence \
-                 FROM memory_revisions ORDER BY sequence DESC LIMIT 1",
-            )
-            .fetch_optional(&self.pool)
-            .await
-            .ok()
-            .flatten();
-            row.and_then(
-                |(id, memory_id, kind, prior, ns, agent, created_at, sig, seq)| {
-                    let kind = crate::revisions::RecordKind::from_str_opt(&kind)?;
-                    let leaf = RevisionLeaf {
-                        id,
-                        memory_id,
-                        kind,
-                        prior_version: prior,
-                        namespace: ns,
-                        agent_id: agent,
-                        created_at,
-                        signature: sig,
-                    };
-                    let mut h = Sha256::new();
-                    h.update(canonical_revision_chain_bytes(&leaf, seq));
-                    Some((
-                        seq,
-                        crate::signed_events::hex_lower(h.finalize().as_slice()),
-                    ))
-                },
-            )
-        };
-        // Fold every head-hash anchor (forensic watermark + witness dual for
-        // BOTH chains) at equal sequence → IDENTICAL verdict to sqlite via the
-        // SHARED `fold_head_hash_verdicts` (K3 parity).
+        // v1.0.0 #1873 (CWE-354) — audit-head HASH-anchor check (postgres twin of
+        // the sqlite `head_hash`, #2202). For every anchor that records a head hash
+        // — the #1850 forensic watermark (signed_events) + the #1822 witness dual
+        // anchor (signed_events AND memory_revisions) — recompute the canonical hash
+        // of the SURVIVING ROW AT THE ANCHORED SEQUENCE and compare whenever
+        // `anchored_seq <= db_head` (not only when it is still the head), so a
+        // same-length whole-suffix rewrite spanning the anchored row is caught even
+        // after the daemon appended past the watermark or the attacker appended one
+        // linked row. The recompute reads the row back at the micro-precision the
+        // #2203-normalized append-side anchor also hashes, so a CLEAN pg chain
+        // matches → IDENTICAL verdict to sqlite via the SHARED
+        // `compute_head_hash_verdict` + `fold_head_hash_verdicts` (K3). F3 (#2203):
+        // the witness anchor is consumed ONLY THROUGH the K1 pin + signature gate
+        // (`verified_witness_dual_head`).
         let head_hash = {
-            let witness_dual = witness_cp
-                .as_ref()
-                .and_then(crate::governance::audit::parse_witness_dual_head);
+            let witness_dual = crate::signed_events::verified_witness_dual_head(
+                witness_cp.as_ref(),
+                enrolled.as_ref(),
+            );
             let mut verdicts: Vec<crate::signed_events::HeadHashCheck> = Vec::new();
             if let Some((anchored_head, anchored_hash)) =
                 crate::governance::audit::last_audit_watermark()
-                && head_sequence == anchored_head
+                && anchored_head > 0
+                && anchored_head <= head_sequence
             {
+                let recomputed = pg_recompute_signed_row_hash_at(&self.pool, anchored_head).await;
                 verdicts.push(crate::signed_events::compute_head_hash_verdict(
                     Some(&anchored_hash),
-                    recomputed_head_hex.as_deref(),
+                    recomputed.as_deref(),
                     crate::signed_events::CHAIN_SIGNED_EVENTS,
                 ));
             }
             if let Some(dual) = witness_dual {
-                if head_sequence == dual.signed_head_sequence {
+                if dual.signed_head_sequence > 0 && dual.signed_head_sequence <= head_sequence {
+                    let recomputed =
+                        pg_recompute_signed_row_hash_at(&self.pool, dual.signed_head_sequence)
+                            .await;
                     verdicts.push(crate::signed_events::compute_head_hash_verdict(
                         Some(&dual.signed_head_hash),
-                        recomputed_head_hex.as_deref(),
+                        recomputed.as_deref(),
                         crate::signed_events::CHAIN_SIGNED_EVENTS,
                     ));
                 }
-                if let Some((rev_seq, rev_hash)) = &recomputed_rev_hex
-                    && *rev_seq > 0
-                    && *rev_seq == dual.revisions_head_sequence
+                if dual.revisions_head_sequence > 0
+                    && dual.revisions_head_sequence <= revisions_head
                 {
+                    let recomputed =
+                        pg_recompute_revision_row_hash_at(&self.pool, dual.revisions_head_sequence)
+                            .await;
                     verdicts.push(crate::signed_events::compute_head_hash_verdict(
                         Some(&dual.revisions_head_hash),
-                        Some(rev_hash.as_str()),
+                        recomputed.as_deref(),
                         crate::signed_events::CHAIN_MEMORY_REVISIONS,
                     ));
                 }
