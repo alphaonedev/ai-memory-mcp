@@ -1,0 +1,53 @@
+{
+  "_schema": "ai-memory bench --json baseline (#1987)",
+  "_note": "BOOTSTRAP baseline generated on a DEV machine \u2014 NOT the CI runner class. The p95 numbers are placeholders so the CI compare step is wired + schema-valid; bootstrap:true makes the advisory CI step SKIP the comparison (a dev-vs-ubuntu-latest compare is pure hardware noise). Run the regenerate-baseline workflow_dispatch job on ubuntu-latest for a real median-of-3 baseline, commit it with bootstrap:false, then the advisory compare activates. Refresh every minor release.",
+  "bootstrap": true,
+  "runner_class": "local-dev-bootstrap",
+  "generated_at_binary_rev": "f5697a95",
+  "regression_threshold_pct_default": 50,
+  "iterations": 200,
+  "warmup": 20,
+  "scale": null,
+  "results": [
+    {
+      "operation": "store_no_embedding",
+      "label": "memory_store (no embedding)",
+      "measured_p95_ms": 0.19113469999999996
+    },
+    {
+      "operation": "search_fts",
+      "label": "memory_search (FTS5)",
+      "measured_p95_ms": 0.44111674999999995
+    },
+    {
+      "operation": "recall_hot",
+      "label": "memory_recall (hot, depth=1)",
+      "measured_p95_ms": 1.5253473499999999
+    },
+    {
+      "operation": "recall_rerank_hot",
+      "label": "memory_recall (rerank stage, depth=1)",
+      "measured_p95_ms": 1.8469375499999998
+    },
+    {
+      "operation": "kg_query_depth1",
+      "label": "memory_kg_query (depth=1)",
+      "measured_p95_ms": 0.45441795
+    },
+    {
+      "operation": "kg_query_depth3",
+      "label": "memory_kg_query (depth=3)",
+      "measured_p95_ms": 0.5271624500000001
+    },
+    {
+      "operation": "kg_query_depth5",
+      "label": "memory_kg_query (depth=5)",
+      "measured_p95_ms": 0.56339215
+    },
+    {
+      "operation": "kg_timeline",
+      "label": "memory_kg_timeline",
+      "measured_p95_ms": 0.029518799999999998
+    }
+  ]
+}
