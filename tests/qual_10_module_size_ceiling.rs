@@ -330,7 +330,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // space/unverified counters + aggregated WARN) + the §5 boot adoption /
     // §6 census / embedding_space_boot_maintenance helpers land
     // storage/mod.rs at 25_504; ceiling 25_650 (+146 headroom).
-    ("src/storage/mod.rs", 25_650),
+    ("src/storage/mod.rs", 25_750), /* 2026-07-18 #2165 test-isolation comments on the ck_trigger_* / a3-fed permissions-race fix (25_686) */
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
