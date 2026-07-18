@@ -3340,6 +3340,71 @@ fn run_sqlite_embedding_space_boot_maintenance(
     }
 }
 
+/// The B3 family-descriptor embedding cache shape (`Arc<RwLock<Option<…>>>`)
+/// threaded through `bootstrap_serve` + `AppState`.
+type FamilyEmbeddingsCache =
+    Arc<tokio::sync::RwLock<Option<Vec<(crate::profile::Family, Vec<f32>)>>>>;
+
+/// v0.7.0 B3-fix2 — spawn the family-descriptor embedding precompute onto
+/// `task_handles` when the operator opted in (`enabled` resolves from
+/// `AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS=1` at the call site). Split out of
+/// `bootstrap_serve` (mirrors `spawn_postgres_fold_loop_if_enabled` /
+/// `run_sqlite_embedding_space_boot_maintenance`) so the async precompute body
+/// — the two-phase "compute outside, commit inside" lock discipline (H1) — is
+/// unit-tested WITHOUT a full serve boot. Taking `enabled: bool` (not reading
+/// the env internally) keeps the test env-var-free + deterministic. The
+/// disabled arm is the default and a no-op beyond a debug log.
+fn spawn_family_embedding_precompute_if_enabled(
+    task_handles: &mut Vec<JoinHandle<()>>,
+    enabled: bool,
+    family_embeddings: &FamilyEmbeddingsCache,
+    embedder_arc: &Arc<Option<Embedder>>,
+) {
+    if enabled {
+        let cache = family_embeddings.clone();
+        let embedder_for_task = embedder_arc.clone();
+        task_handles.push(tokio::spawn(async move {
+            // H1 (v0.7.0 round-2) lock-discipline: the slow embed calls run in
+            // a `spawn_blocking` closure holding NO lock; only after the whole
+            // batch is computed do we take the write lock ONCE to swap in the
+            // populated `Some(Vec)` — readers see `None` or the full vector,
+            // never a half-built one.
+            let computed = tokio::task::spawn_blocking(move || {
+                AppState::precompute_family_embeddings(
+                    embedder_for_task
+                        .as_ref()
+                        .as_ref()
+                        .map(|e| e as &dyn crate::embeddings::Embed),
+                )
+            })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "B3: family-descriptor precompute task panicked; \
+                     family_embeddings will stay empty",
+                );
+                Vec::new()
+            });
+            if !computed.is_empty() {
+                tracing::info!(
+                    "B3: pre-computed {} family-descriptor embeddings (async)",
+                    computed.len(),
+                );
+            }
+            // Single-shot commit: the write lock is acquired ONCE here.
+            *cache.write().await = Some(computed);
+        }));
+    } else {
+        tracing::debug!(
+            "B3: family-descriptor precompute disabled \
+             (AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS != 1); \
+             best_family_match will return None until B2 wires \
+             the smart loader and the gate is flipped on"
+        );
+    }
+}
+
 /// Cluster G (#767) — `spawn_gc_loop` variant that takes an explicit
 /// shadow-observation retention window. Used by `bootstrap_serve` so
 /// the operator-tunable `[confidence] shadow_retention_days` from
@@ -5085,76 +5150,17 @@ pub async fn bootstrap_serve(
         ));
     }
 
-    if std::env::var("AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS")
-        .ok()
-        .as_deref()
-        == Some("1")
-    {
-        let cache = family_embeddings.clone();
-        let embedder_for_task = embedder_arc.clone();
-        task_handles.push(tokio::spawn(async move {
-            // ----------------------------------------------------------------
-            // H1 (v0.7.0 round-2) — lock-discipline for the family-embedding
-            // precompute:
-            //
-            //   1. The slow `Embedder::embed(descriptor)` calls run inside a
-            //      `spawn_blocking` closure that holds NO lock on
-            //      `family_embeddings`. Each (Family, Vec<f32>) pair is
-            //      collected into a local `Vec` owned by the blocking task.
-            //   2. Only AFTER the entire batch is computed do we take
-            //      `family_embeddings.write().await` exactly ONCE to swap
-            //      the populated `Some(Vec)` into the cache.
-            //
-            // Why: the prior shape that acquired the write lock before each
-            // embed call would have parked every concurrent `try_read()`
-            // reader for the duration of an ML inference round trip — up
-            // to seconds on a cold runner. Concurrent recall handlers that
-            // call `AppState::best_family_match` would be forced into the
-            // no-cache fallback even when the embedder was fully operational.
-            //
-            // The two-phase shape below is the canonical "compute outside,
-            // commit inside" lock pattern: readers see either `None`
-            // (precompute not yet finished) or the fully-populated
-            // `Some(Vec)` — never a half-built vector.
-            // ----------------------------------------------------------------
-            let computed = tokio::task::spawn_blocking(move || {
-                // No lock held during embed calls — pairs are accumulated
-                // into a local Vec returned to the async caller below.
-                AppState::precompute_family_embeddings(
-                    embedder_for_task
-                        .as_ref()
-                        .as_ref()
-                        .map(|e| e as &dyn crate::embeddings::Embed),
-                )
-            })
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    error = %e,
-                    "B3: family-descriptor precompute task panicked; \
-                     family_embeddings will stay empty",
-                );
-                Vec::new()
-            });
-            if !computed.is_empty() {
-                tracing::info!(
-                    "B3: pre-computed {} family-descriptor embeddings (async)",
-                    computed.len(),
-                );
-            }
-            // Single-shot commit: write lock acquired ONCE here and
-            // released immediately after the swap. No embedder calls run
-            // under this lock.
-            *cache.write().await = Some(computed);
-        }));
-    } else {
-        tracing::debug!(
-            "B3: family-descriptor precompute disabled \
-             (AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS != 1); \
-             best_family_match will return None until B2 wires \
-             the smart loader and the gate is flipped on"
-        );
-    }
+    let precompute_family_embeddings_enabled =
+        std::env::var("AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS")
+            .ok()
+            .as_deref()
+            == Some("1");
+    spawn_family_embedding_precompute_if_enabled(
+        &mut task_handles,
+        precompute_family_embeddings_enabled,
+        &family_embeddings,
+        &embedder_arc,
+    );
 
     // v0.7.0 Wave-3 — resolve the polymorphic `MemoryStore` handle from
     // the operator's `--store-url` (when set) or build a `SqliteStore`
@@ -7755,6 +7761,41 @@ mod tests {
         // return normally — the #2167 fail-safe posture.
         let unopenable = env.db_path.join("nested-under-a-file.db");
         run_sqlite_embedding_space_boot_maintenance(&unopenable, &fp, 768);
+    }
+
+    // B3 (#1691 sibling) — the family-descriptor precompute helper spawns the
+    // async "compute outside, commit inside" body only when enabled. A `None`
+    // embedder makes `precompute_family_embeddings` return empty FAST (no
+    // network / no model load) while still driving the full async body, so
+    // both the enabled (spawn + commit) and disabled (no-op) arms are covered
+    // deterministically without a serve boot.
+    #[tokio::test]
+    async fn spawn_family_embedding_precompute_if_enabled_runs_async_body_and_commits() {
+        let cache: FamilyEmbeddingsCache = Arc::new(tokio::sync::RwLock::new(None));
+        let embedder: Arc<Option<Embedder>> = Arc::new(None);
+        let mut handles: Vec<JoinHandle<()>> = Vec::new();
+        spawn_family_embedding_precompute_if_enabled(&mut handles, true, &cache, &embedder);
+        assert_eq!(
+            handles.len(),
+            1,
+            "enabled=true spawns exactly one precompute task"
+        );
+        // Await the spawned task so the async body fully executes, then confirm
+        // the single-shot commit landed (Some(empty) for a None embedder).
+        handles
+            .pop()
+            .unwrap()
+            .await
+            .expect("precompute task joins cleanly");
+        assert!(
+            cache.read().await.is_some(),
+            "the async body commits Some(_) into the family-embeddings cache"
+        );
+
+        // disabled=false: the else arm (debug log) — no task spawned.
+        let mut none_handles: Vec<JoinHandle<()>> = Vec::new();
+        spawn_family_embedding_precompute_if_enabled(&mut none_handles, false, &cache, &embedder);
+        assert!(none_handles.is_empty(), "disabled path spawns no task");
     }
 
     // ----- spawn_gc_loop / spawn_wal_checkpoint_loop --------------------
