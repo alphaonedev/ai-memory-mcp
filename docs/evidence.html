@@ -158,11 +158,6 @@ footer a{color:var(--text-muted)}
         <div class="menu-pane">
           <a href="evidence.html" class="current">Frozen Claims</a>
           <a href="evidence/">Evidence Hub (campaigns)</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/">Test Hub</a>
-          <a href="https://alphaonedev.github.io/ai-memory-a2a-v0.6.3.1/">v0.6.3.1 A2A (live)</a>
-          <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/">v0.6.3 evidence (historical)</a>
-          <a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship Gate</a>
-          <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A Gate</a>
           <a href="performance.html">Performance budgets</a>
           <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
@@ -182,10 +177,8 @@ footer a{color:var(--text-muted)}
       No other page invents its own counts. If a number on another page disagrees with this page, this page is correct and the other is a bug — please <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/new">file an issue</a>.
     </p>
     <div style="display:flex;justify-content:center;gap:.75rem;flex-wrap:wrap;margin-top:1.75rem">
-      <a href="https://alphaonedev.github.io/ai-memory-test-hub/" style="display:inline-block;padding:.65rem 1.25rem;border:1px solid var(--p1);color:var(--p1);background:rgba(110,231,255,.06);border-radius:6px;font-family:var(--font-mono);font-size:.9rem;font-weight:600;text-decoration:none">🧪 Live test-hub →</a>
-      <a href="https://alphaonedev.github.io/ai-memory-test-hub/releases/v0.6.3/" style="display:inline-block;padding:.65rem 1.25rem;border:1px solid var(--p2);color:var(--p2);background:rgba(255,184,107,.06);border-radius:6px;font-family:var(--font-mono);font-size:.9rem;font-weight:600;text-decoration:none">📊 v0.6.3 release evidence (historical) →</a>
-      <a href="https://alphaonedev.github.io/ai-memory-ship-gate/" style="display:inline-block;padding:.65rem 1.25rem;border:1px solid var(--text-muted);color:var(--text-muted);border-radius:6px;font-family:var(--font-mono);font-size:.9rem;text-decoration:none">🚢 ship-gate</a>
-      <a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/" style="display:inline-block;padding:.65rem 1.25rem;border:1px solid var(--text-muted);color:var(--text-muted);border-radius:6px;font-family:var(--font-mono);font-size:.9rem;text-decoration:none">🤝 A2A-gate</a>
+      <a href="evidence/" style="display:inline-block;padding:.65rem 1.25rem;border:1px solid var(--p1);color:var(--p1);background:rgba(110,231,255,.06);border-radius:6px;font-family:var(--font-mono);font-size:.9rem;font-weight:600;text-decoration:none">🧪 Evidence Hub (campaigns) →</a>
+      <a href="performance.html" style="display:inline-block;padding:.65rem 1.25rem;border:1px solid var(--text-muted);color:var(--text-muted);border-radius:6px;font-family:var(--font-mono);font-size:.9rem;text-decoration:none">📊 Performance budgets</a>
     </div>
   </div>
 </section>
@@ -302,8 +295,8 @@ footer a{color:var(--text-muted)}
     <table class="facts">
       <thead><tr><th>Certification</th><th>Status</th><th>Authority</th></tr></thead>
       <tbody>
-        <tr><td>A2A-Certified (internal)</td><td class="num">Yes</td><td class="src"><a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A gate</a> · v0.6.2 + v0.6.3 — last full 4-phase cell run; not re-run at v0.7.0/v0.8.x/v0.9.0, see currency note below</td></tr>
-        <tr><td>Ship-Gate (internal)</td><td class="num">Yes</td><td class="src"><a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship gate</a> · 9/9 cert + 5/5 channels green at v0.6.2 cut — last full 4-phase cell run; not re-run at v0.7.0/v0.8.x/v0.9.0, see currency note below</td></tr>
+        <tr><td>A2A-Certified (internal)</td><td class="num">Yes</td><td class="src"><a href="https://github.com/alphaonedev/ai-memory-ai2ai-gate">A2A gate</a> (repo, Pages site retired per #2034) · v0.6.2 + v0.6.3 — last full 4-phase cell run; not re-run at v0.7.0/v0.8.x/v0.9.0, see currency note below</td></tr>
+        <tr><td>Ship-Gate (internal)</td><td class="num">Yes</td><td class="src"><a href="https://github.com/alphaonedev/ai-memory-ship-gate">Ship gate</a> (repo, Pages site retired per #2034) · 9/9 cert + 5/5 channels green at v0.6.2 cut — last full 4-phase cell run; not re-run at v0.7.0/v0.8.x/v0.9.0, see currency note below</td></tr>
         <tr><td>SOC 2</td><td class="num">No</td><td class="src">No third-party audit. Do not represent.</td></tr>
         <tr><td>ISO 27001</td><td class="num">No</td><td class="src">No third-party audit. Do not represent.</td></tr>
         <tr><td>FedRAMP</td><td class="num">No</td><td class="src">No authorization. Do not represent.</td></tr>
@@ -312,9 +305,13 @@ footer a{color:var(--text-muted)}
     </table>
 
     <div class="callout">
-      <strong>Ship-Gate / A2A-Gate currency note (#1938 Gate-0 W3, 2026-07-11).</strong>
-      The linked Ship-Gate and A2A-Gate pages are separate GitHub Pages sites
-      (<code>ai-memory-ship-gate</code>, <code>ai-memory-ai2ai-gate</code> repos) whose
+      <strong>Ship-Gate / A2A-Gate currency note (#1938 Gate-0 W3, 2026-07-11;
+      Pages-retirement update #2034).</strong>
+      Ship-Gate and A2A-Gate were previously separate GitHub Pages sites
+      (<code>ai-memory-ship-gate</code>, <code>ai-memory-ai2ai-gate</code> repos);
+      those Pages sites are retired as of the v1.0.0 docs consolidation
+      (#2034) — the certification rows above now cite the source repos
+      directly instead of the retired Pages URLs. Their
       last full 4-phase cell run is the v0.6.2/v0.6.3 cut cited above — neither was
       re-run as a full 4-phase cell for v0.7.0, v0.8.0, v0.8.1, or v0.9.0.
       <strong>v0.9.0 shipped under a one-time recorded descope of the 4-phase
