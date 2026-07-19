@@ -331,6 +331,49 @@ ai-memory audit restore-attest
 ai-memory audit restore-attest --sign
 ```
 
+### `ai-memory audit re-anchor [--json]`
+
+**[#2004, v1.0.0]** The **crypto-agility re-anchor ceremony** for
+**sqlite-endpoint chains**. Per-record post-quantum signatures are
+forbidden (spec §2.4 — arithmetically incompatible with endpoint
+budgets), so PQ strength binds at **checkpoint granularity**: this
+command countersigns the CURRENT `signed_events` chain head — "the
+new-suite key has seen prior head `H` at sequence `N`" — under the
+enrolled suite (the FROZEN `re-anchor/v1` format), and persists it as a
+signed `re_anchor` checkpoint. Enabling a stronger / PQ suite on a live
+corpus later then causes **zero** write failures and **zero** record
+rewrites, and every pre-break record stays attributable across the suite
+boundary.
+
+> **Backend scope (honest):** the verb operates on the **local sqlite**
+> database it opens (`chain sqlite:signed_events` — the db path + chain
+> are printed on every disposition). A **postgres**-backed deployment
+> maintains its own `signed_events` chain, and that chain has **no
+> re-anchor twin yet** — running this verb on a pg deployment anchors
+> only the local sqlite file, NOT the pg chain. The pg ceremony twin is
+> tracked as [#2217](https://github.com/alphaonedev/ai-memory-mcp/issues/2217).
+
+The countersignature is produced by the **distinct off-daemon
+audit-witness custody key** (the same K1-pinnable custody as the #1822
+witness anchor), so the ceremony is opt-in: with no witness custody
+enrolled (`AI_MEMORY_WITNESS_KEY_DIR`) it is an explicit `skipped`
+no-op — but an **enrolled key that fails to load** (corrupt /
+half-enrolled / public-only custody) is a ceremony **failure** (exit 1,
+reason `witness_key_unloadable`), never a silent skip. The persisted
+anchor is **reloaded from the database** and self-verified via the
+read-back path (K1-pinned to `AI_MEMORY_WITNESS_PUBKEY`) so the operator
+sees the true persisted round-trip, not just a write. A universal
+per-signed-class `suite_tag` is deferred to v1.x; today the only
+enrolled suite is Ed25519-SHA256 (no suite rotation is operationally
+possible yet — see the claims discipline: "crypto-agile" remains a
+banned public claim until R75 completes).
+
+```bash
+# Countersign + anchor the current head (loads the witness key from
+# AI_MEMORY_WITNESS_KEY_DIR; verifies against AI_MEMORY_WITNESS_PUBKEY).
+ai-memory audit re-anchor
+```
+
 ### `ai-memory logs tail [--follow]`
 
 Tail and (optionally) stream operational logs. Accepts the global

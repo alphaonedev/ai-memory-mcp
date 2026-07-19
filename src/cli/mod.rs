@@ -106,3 +106,12 @@ pub mod test_utils;
 // Convenience re-export so callers can `use ai_memory::cli::CliOutput`
 // without a deeper path.
 pub use io_writer::CliOutput;
+
+/// Shared CLI JSON-report key naming the checkpoint a command persisted or
+/// verified (`epoch-apply`, `audit re-anchor`). Named per the pm-v3.1
+/// no-hardcoded-literals gate. DELIBERATELY DISTINCT from the frozen
+/// `canonical_cbor_checkpoint_resolution` CBOR key in
+/// [`crate::identity::sign`] — the signed-bytes wire format must never
+/// couple to a CLI report key (renaming a report field must not be able to
+/// break frozen signed bytes).
+pub(crate) const JSON_KEY_CHECKPOINT_ID: &str = "checkpoint_id";
