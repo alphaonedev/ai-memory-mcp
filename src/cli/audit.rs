@@ -253,6 +253,31 @@ fn run_re_anchor(
             )?;
             return Ok(1);
         }
+        // v1.0.0 #2242 — the pre-countersign verify found the chain DIRTY:
+        // the ceremony REFUSES rather than blessing tampered history with a
+        // fresh signed anchor. Distinct reason + non-zero exit (the #2214 F4
+        // discipline: a refusal is a FAILURE the operator must see, never a
+        // skip). Nothing was persisted.
+        fail @ ReAnchorOutcome::RefusedChainDirty(detail) => {
+            let reason = fail.reason_tag().unwrap_or_default();
+            if args.json {
+                let obj = serde_json::json!({
+                    "status": "error",
+                    "reason": reason,
+                    "detail": detail,
+                    "db": db_path.display().to_string(),
+                    "chain": REANCHOR_CHAIN_LABEL,
+                });
+                writeln!(out.stdout, "{obj}")?;
+            }
+            writeln!(
+                out.stderr,
+                "re-anchor REFUSED ({reason}): the signed_events chain FAILED verification \
+                 BEFORE countersigning ({detail}); run `ai-memory verify-audit-trail` to \
+                 triage the tamper evidence — nothing was persisted"
+            )?;
+            return Ok(1);
+        }
     }
     let ReAnchorOutcome::Anchored(cp) = outcome else {
         unreachable!("non-Anchored outcomes returned above");
