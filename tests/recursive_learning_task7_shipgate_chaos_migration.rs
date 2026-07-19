@@ -872,6 +872,8 @@ async fn federation_apply_remote_link_round_trips_reflects_on_edge() {
         valid_from: None,
         valid_until: None,
         attest_level: None,
+        source_cid: None,
+        target_cid: None,
     };
     store
         .apply_remote_link(&ctx, &link, "unsigned")

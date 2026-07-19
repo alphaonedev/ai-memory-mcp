@@ -1299,15 +1299,23 @@ pub fn handle_recall_dto(
                 );
                 let memories = scored_memories(results, conn);
                 record_recall_observations(
-                    conn, &recall_id, &memories, "hybrid", caller, namespace,
+                    conn,
+                    &recall_id,
+                    &memories,
+                    crate::models::RECALL_MODE_HYBRID,
+                    caller,
+                    namespace,
                 );
                 let mut resp = json!({
                     "recall_id": recall_id,
                     "memories": memories,
                     "count": memories.len(),
-                    "mode": "hybrid",
+                    "mode": crate::models::RECALL_MODE_HYBRID,
                 });
                 decorate_budget(&mut resp, &outcome);
+                // NB: `meta.recall_mode` is a DELIBERATELY separate telemetry
+                // vocabulary (e.g. "keyword_only" vs the mode field "keyword");
+                // left as a literal so the two lanes stay decoupled (#1839).
                 attach_meta(&mut resp, "hybrid", &telemetry);
                 if confidence_tier_filter.is_some() {
                     insert_confidence_filter_meta(&mut resp, confidence_filtered_out);
@@ -1368,14 +1376,22 @@ pub fn handle_recall_dto(
         session_tracker,
     );
     let memories = scored_memories(results, conn);
-    record_recall_observations(conn, &recall_id, &memories, "keyword", caller, namespace);
+    record_recall_observations(
+        conn,
+        &recall_id,
+        &memories,
+        crate::models::RECALL_MODE_KEYWORD,
+        caller,
+        namespace,
+    );
     let mut resp = json!({
         "recall_id": recall_id,
         "memories": memories,
         "count": memories.len(),
-        "mode": "keyword",
+        "mode": crate::models::RECALL_MODE_KEYWORD,
     });
     decorate_budget(&mut resp, &outcome);
+    // `keyword_only` is the separate telemetry-lane label — left literal (#1839).
     attach_meta(&mut resp, "keyword_only", &telemetry);
     if confidence_tier_filter.is_some() {
         insert_confidence_filter_meta(&mut resp, confidence_filtered_out);

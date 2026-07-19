@@ -81,13 +81,19 @@ pub fn resolve_transcript(host: HostKind, cwd: &Path) -> Result<Option<PathBuf>,
 /// `$HOME/.claude/projects/-<cwd-encoded>/*.jsonl`. The cwd
 /// encoding replaces `/` with `-` and prefixes a leading `-`.
 fn claude_code_candidates(cwd: &Path) -> Vec<PathBuf> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return Vec::new();
-    };
+    claude_code_dir(cwd)
+        .map(|d| list_jsonl_in(&d))
+        .unwrap_or_default()
+}
+
+/// The Claude Code transcript directory for `cwd` — the parent that the
+/// [`watch_dirs`] fs-notify watch subscribes to. `None` when `$HOME` is
+/// unset.
+fn claude_code_dir(cwd: &Path) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let cwd_str = cwd.to_string_lossy();
     let encoded = format!("-{}", cwd_str.replace('/', "-"));
-    let project_dir = home.join(".claude").join("projects").join(&encoded);
-    list_jsonl_in(&project_dir)
+    Some(home.join(".claude").join("projects").join(&encoded))
 }
 
 /// Codex CLI candidate set. The exact location is host-version
@@ -95,21 +101,47 @@ fn claude_code_candidates(cwd: &Path) -> Vec<PathBuf> {
 /// set. A full per-version sweep lands as a v0.7.0 implementation
 /// slice (#1389 acceptance criterion §C).
 fn codex_candidates(_cwd: &Path) -> Vec<PathBuf> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return Vec::new();
-    };
-    let sessions = home.join(".codex").join("sessions");
-    list_jsonl_in(&sessions)
+    codex_dir().map(|d| list_jsonl_in(&d)).unwrap_or_default()
+}
+
+/// The Codex CLI transcript directory — the parent [`watch_dirs`]
+/// subscribes to. `None` when `$HOME` is unset.
+fn codex_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    Some(home.join(".codex").join("sessions"))
 }
 
 /// Gemini CLI candidate set. Same as Codex — to be confirmed by
 /// the implementation slice. Stub returns the most-likely path.
 fn gemini_candidates(_cwd: &Path) -> Vec<PathBuf> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return Vec::new();
-    };
-    let sessions = home.join(".config").join("gemini").join("sessions");
-    list_jsonl_in(&sessions)
+    gemini_dir().map(|d| list_jsonl_in(&d)).unwrap_or_default()
+}
+
+/// The Gemini CLI transcript directory — the parent [`watch_dirs`]
+/// subscribes to. `None` when `$HOME` is unset.
+fn gemini_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    Some(home.join(".config").join("gemini").join("sessions"))
+}
+
+/// Parent transcript directories the L3 watcher (#1978 `fs-notify` path)
+/// subscribes to for a host — the SAME per-host directories the
+/// [`resolve_transcript`] candidate walk scans, so the event-driven watch
+/// set and the poll resolver can never drift apart. Reuses the
+/// vendor-keyed `*_dir` builders above (this file is the allowlisted
+/// vendor-literal carve-out; see `scripts/check-vendor-literals.sh`).
+/// Returns an empty vec when `$HOME` is unset (nothing to watch).
+#[must_use]
+pub fn watch_dirs(host: HostKind, cwd: &Path) -> Vec<PathBuf> {
+    match host {
+        HostKind::Auto => [claude_code_dir(cwd), codex_dir(), gemini_dir()]
+            .into_iter()
+            .flatten()
+            .collect(),
+        HostKind::ClaudeCode => claude_code_dir(cwd).into_iter().collect(),
+        HostKind::Codex => codex_dir().into_iter().collect(),
+        HostKind::Gemini => gemini_dir().into_iter().collect(),
+    }
 }
 
 /// List every `*.jsonl` (or `*.json`) file in a directory, swallowing

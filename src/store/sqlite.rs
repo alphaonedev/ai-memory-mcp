@@ -599,6 +599,11 @@ impl MemoryStore for SqliteStore {
                     // unchanged). `None` + skip_serializing_if keeps
                     // pre-v0.7 receivers unaware of the new field.
                     attest_level: None,
+                    // #2215 — the SAL migrate list projection does not
+                    // surface the lineage cid mirror (selective, like
+                    // `attest_level`); `None` keeps the wire unchanged.
+                    source_cid: None,
+                    target_cid: None,
                 })
             })
             .map_err(box_err)?;
@@ -3017,6 +3022,8 @@ mod tests {
             observed_by: None,
             signature: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         store.link(&ctx, &link).await.expect("link insert");
         let listed = store.list_links(None).await.expect("list_links");
@@ -3078,6 +3085,8 @@ mod tests {
                     observed_by: None,
                     signature: None,
                     attest_level: None,
+                    source_cid: None,
+                    target_cid: None,
                 },
             )
             .await
@@ -3096,6 +3105,8 @@ mod tests {
                     observed_by: None,
                     signature: None,
                     attest_level: None,
+                    source_cid: None,
+                    target_cid: None,
                 },
             )
             .await
@@ -3208,6 +3219,8 @@ mod tests {
             observed_by: None,
             signature: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         let attest = store
             .link_signed(&ctx, &link, None)
@@ -3298,6 +3311,8 @@ mod tests {
             observed_by: None,
             signature: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         // attest_level threads through; "unsigned" is the safe default.
         store
@@ -3710,6 +3725,8 @@ mod tests {
             observed_by: None,
             signature: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         store.link(&ctx, &link).await.expect("insert link");
         let report = store
@@ -3746,6 +3763,8 @@ mod tests {
             observed_by: None,
             signature: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         store.link(&ctx, &link).await.expect("link");
         let report = store
@@ -4284,6 +4303,8 @@ mod tests {
             valid_from: None,
             valid_until: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         store.link(&ctx, &link).await.expect("create link");
         let row = store
@@ -4479,6 +4500,8 @@ mod tests {
             observed_by: Some("alice".to_string()),
             attest_level: Some("unsigned".to_string()),
             signature: None,
+            source_cid: None,
+            target_cid: None,
         };
         store.link(&ctx, &link).await.expect("link");
         let rows = store.kg_query(&src, 2, false).await.expect("kg_query");

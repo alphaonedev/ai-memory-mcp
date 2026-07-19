@@ -5300,7 +5300,19 @@ impl PostgresStore {
 
         // Step 1: archive the OLD row with archive_reason='superseded'.
         // #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.
-        let archive_rows = sqlx::query(
+        // #2221 — LAST-WINS re-archive parity with the sqlite supersede
+        // funnel (`storage::archive_memory_no_tx`'s `INSERT OR REPLACE`).
+        // Pre-#2221 this site used `ON CONFLICT (id) DO NOTHING` + a
+        // 0-rows-affected `NotFound`: when an `archived_memories` row for
+        // the OLD id already existed (e.g. an `in_place_edit` snapshot on
+        // the same id), the conflict took `DO NOTHING`, `rows_affected`
+        // was 0, and this funnel rolled back with a MISTYPED `NotFound`
+        // for a memory that EXISTS — while sqlite's `INSERT OR REPLACE`
+        // succeeded (overwrote the snapshot last-wins). The shared
+        // `SQL_ARCHIVE_ON_CONFLICT_LAST_WINS` clause overwrites every
+        // payload column from `EXCLUDED`, so postgres now matches sqlite
+        // byte-for-byte on both the success case and the archived payload.
+        let archive_rows = sqlx::query(&format!(
             "INSERT INTO archived_memories
                 (id, tier, namespace, title, content, tags, priority, confidence,
                  source, access_count, created_at, updated_at, last_accessed_at,
@@ -5319,16 +5331,23 @@ impl PostgresStore {
                     confidence_source, confidence_signals, confidence_decayed_at,
                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
              FROM memories WHERE id = $1
-             ON CONFLICT (id) DO NOTHING",
-        )
+             {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
+        ))
         .bind(id)
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("archive on supersede", e))?
         .rows_affected();
         if archive_rows == 0 {
-            // Row vanished or the ON CONFLICT path took over — surface a
-            // typed not-found instead of silently dropping the supersede.
+            // Defensive guard (now unreachable in practice): with the
+            // last-wins `DO UPDATE`, `rows_affected` is 1 whenever the
+            // source SELECT matches — and the OLD row is pinned by the
+            // `SELECT ... FOR UPDATE` above, so it cannot vanish inside
+            // this tx. A 0 here would mean the source row genuinely
+            // disappeared under the held lock; surface a typed not-found
+            // rather than silently dropping the supersede. (Pre-#2221 this
+            // branch ALSO fired on a pre-existing archive row under
+            // `DO NOTHING` — the mistyped-NotFound bug this commit closes.)
             tx.rollback()
                 .await
                 .map_err(|e| to_store_err("rollback supersede", e))?;
@@ -5791,6 +5810,8 @@ impl PostgresStore {
                     valid_until: valid_until.map(|t| t.to_rfc3339()),
                     observed_by,
                     attest_level,
+                    source_cid: None,
+                    target_cid: None,
                 })
             })
             .collect()
@@ -15987,6 +16008,8 @@ impl MemoryStore for PostgresStore {
                     // adapter matches the `memory_get_links` MCP
                     // tool's docstring promise.
                     attest_level,
+                    source_cid: None,
+                    target_cid: None,
                 })
             })
             .collect()
@@ -16057,6 +16080,8 @@ impl MemoryStore for PostgresStore {
                     valid_from: valid_from.map(|t| t.to_rfc3339()),
                     valid_until: valid_until.map(|t| t.to_rfc3339()),
                     attest_level,
+                    source_cid: None,
+                    target_cid: None,
                 })
             })
             .collect()
@@ -26111,6 +26136,8 @@ mod tests {
                     observed_by: None,
                     signature: None,
                     attest_level: None,
+                    source_cid: None,
+                    target_cid: None,
                 },
             )
             .await
@@ -26129,6 +26156,8 @@ mod tests {
                     observed_by: None,
                     signature: None,
                     attest_level: None,
+                    source_cid: None,
+                    target_cid: None,
                 },
             )
             .await
@@ -26602,6 +26631,8 @@ mod tests {
             valid_from: None,
             valid_until: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         store.link(&ctx, &link).await.expect("create link");
         let row = store
@@ -26654,6 +26685,8 @@ mod tests {
             valid_from: None,
             valid_until: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
 
         // a reflects_on b lands fine (no cycle yet).
@@ -26979,6 +27012,8 @@ mod tests {
             observed_by: None,
             signature: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         restricted
             .link_signed(&ctx, &link, None)
@@ -27124,6 +27159,8 @@ mod tests {
             valid_from: None,
             valid_until: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         store.link(&ctx, &link).await.expect("create link");
         // Call the SAL trait method (3-arg form) — verifies the trait
@@ -27355,6 +27392,8 @@ mod tests {
             valid_from: None,
             valid_until: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         store.link(&ctx, &link).await.expect("create link");
 
@@ -27706,6 +27745,8 @@ mod tests {
             valid_from: None,
             valid_until: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         store.link(&ctx, &link).await.expect("create link");
         // list_links scoped to the source memory's namespace surfaces it.
@@ -27803,6 +27844,8 @@ mod tests {
                     valid_from: None,
                     valid_until: None,
                     attest_level: None,
+                    source_cid: None,
+                    target_cid: None,
                 },
             )
             .await
@@ -28003,6 +28046,8 @@ mod tests {
             valid_from: None,
             valid_until: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         // The `memory_links_attest_signature_atomic_ck` DB constraint ties
         // attest-level and signature together: an unsigned edge carries no

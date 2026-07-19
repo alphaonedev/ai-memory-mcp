@@ -94,7 +94,20 @@ use serde_json::json;
 // 101 -> 103 advertised), whose property-restored (#859) schemas grew the
 // full-profile tools/list payload to ~6563 cl100k_base tokens. 6650 = 6563
 // + 87 margin; still 4350 below the 11000 structural backstop.
-const FULL_PROFILE_TOKEN_CEILING: usize = 6_650;
+// 2026-07-19 — raised 6650 -> 6750: #2204 (#1834 claim-bitemporal) added
+// three new optional wire params — `valid_at` on `memory_recall` +
+// `memory_list`, `valid_until` on `memory_update` — which grew the
+// trimmed full-profile tools/list payload to 6692 cl100k_base tokens.
+// Confirmed structural, not prose: `wire_compact_descriptions` +
+// `strip_docs_from_tools` already strip every per-property `description`
+// on this trimmed path, so the added cost is the three property KEYS +
+// their `inputSchema` type shapes, not natural-language text (the
+// v0.8.0 #1709 precedent — 3 new legitimate wire fields on 3 already-
+// advertised tools, not a prose regression). #2204's own PR re-blessed
+// the tool-definition + per-profile snapshots but missed this ceiling.
+// 6750 = 6692 + 58 margin; still 4250 below the 11000 structural
+// backstop.
+const FULL_PROFILE_TOKEN_CEILING: usize = 6_750;
 
 fn mem_with_content(id: &str, content: &str) -> Memory {
     Memory {

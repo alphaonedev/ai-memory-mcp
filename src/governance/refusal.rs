@@ -168,10 +168,18 @@ impl std::fmt::Display for GovernanceRefusal {
         // Byte-identical to pre-#963 `Deny(String)` Display: routes
         // through the canonical deny_message helper so the wire shape
         // ("<action> denied by governance: <reason>") cannot drift.
+        //
+        // v1.0.0 #1862 (TRACT-gap G10.2) — the render goes THROUGH the
+        // read-only `crate::claim::refusal::RefusalClaim` projection so the
+        // G10.2 anchor has a live constructor on every refusal-format path
+        // (wired, not floating). The projection copies `action.as_str()` and
+        // `reason` verbatim, so the wire string is byte-identical — pinned by
+        // `claim::refusal::tests::display_is_byte_identical_through_the_projection`.
+        let claim_shape = crate::claim::refusal::RefusalClaim::of_refusal(self);
         let msg = crate::governance::deny_message(
-            self.action.as_str(),
+            &claim_shape.action,
             crate::governance::DenyGate::Governance,
-            &self.reason,
+            &claim_shape.reason,
         );
         f.write_str(&msg)
     }

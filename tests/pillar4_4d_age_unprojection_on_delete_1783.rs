@@ -80,6 +80,8 @@ fn mk_link(source_id: &str, target_id: &str, now: &str) -> MemoryLink {
         observed_by: None,
         signature: None,
         attest_level: None,
+        source_cid: None,
+        target_cid: None,
     }
 }
 

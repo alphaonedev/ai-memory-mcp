@@ -4185,6 +4185,8 @@ mod tests {
             observed_by: None,
             signature: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         let level = s
             .link_signed(&ctx, &link, None)
@@ -4307,6 +4309,8 @@ mod tests {
             observed_by: None,
             signature: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         // Default forwards to link(); MinimalStore::link returns Ok.
         s.apply_remote_link(&ctx, &link, "unsigned")
@@ -4875,6 +4879,8 @@ mod tests {
             observed_by: None,
             signature: Some(b"sig-bytes".to_vec()),
             attest_level: Some("ed25519".to_string()),
+            source_cid: None,
+            target_cid: None,
         };
         // The default body forwards to link() and reports the
         // (caller-supplied) attest_level when no signature override
@@ -5588,6 +5594,8 @@ mod tests {
             observed_by: None,
             signature: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         let reg = AgentRegistration {
             agent_id: "ai:cov".into(),
