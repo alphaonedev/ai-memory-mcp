@@ -1023,6 +1023,15 @@ pub fn validate_create(mem: &CreateMemory) -> Result<()> {
     if let Some(ref span) = mem.source_span {
         validate_source_span(span)?;
     }
+    // #2258 / #1834 — reject a malformed claim-bitemporal valid_from /
+    // valid_until at the DTO boundary (lexicographic `valid_at` filtering
+    // means a non-RFC3339 bound would silently mis-filter rather than error).
+    if let Some(ref v) = mem.valid_from {
+        validate_valid_at(v)?;
+    }
+    if let Some(ref v) = mem.valid_until {
+        validate_valid_at(v)?;
+    }
     Ok(())
 }
 

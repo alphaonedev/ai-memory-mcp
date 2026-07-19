@@ -308,10 +308,33 @@ pub(super) fn parse_and_build_memory(
         crate::validate::validate_source_span(span).map_err(|e| e.to_string())?;
     }
 
+    // #2258 / #1834 — caller-supplied claim-bitemporal VALID-time bounds.
+    // Both are optional RFC3339 timestamps validated up front (a non-RFC3339
+    // value is compared lexicographically against the stored bounds at
+    // `valid_at` recall time, so it must be rejected here, not stored). The
+    // persist layer stamps `valid_from` at create and preserves it immutably
+    // on upsert (`db::insert` ON CONFLICT keeps the stored value); `valid_until`
+    // COALESCEs so a caller can also set it here (it stays updatable via
+    // `memory_update`).
+    let valid_from = match params[param_names::VALID_FROM].as_str().map(str::trim) {
+        Some(s) if !s.is_empty() => {
+            crate::validate::validate_valid_at(s).map_err(|e| e.to_string())?;
+            Some(s.to_string())
+        }
+        _ => None,
+    };
+    let valid_until = match params[param_names::VALID_UNTIL].as_str().map(str::trim) {
+        Some(s) if !s.is_empty() => {
+            crate::validate::validate_valid_at(s).map_err(|e| e.to_string())?;
+            Some(s.to_string())
+        }
+        _ => None,
+    };
+
     let mem = Memory {
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
-        valid_from: None,
-        valid_until: None,
+        valid_from,
+        valid_until,
         id: uuid::Uuid::new_v4().to_string(),
         tier,
         namespace,
