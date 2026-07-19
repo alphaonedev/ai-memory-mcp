@@ -1605,11 +1605,19 @@ mod d1_6_987_tests {
             let got = post_props
                 .get(name)
                 .unwrap_or_else(|| panic!("post-D1.6 missing tool {name}"));
-            let added: Vec<&String> = got.difference(want).collect();
+            let added: BTreeSet<&str> = got.difference(want).map(String::as_str).collect();
             let removed: Vec<&String> = want.difference(got).collect();
+            // #2258 deliberately extends only memory_store's write schema. Keep the
+            // historical snapshot immutable and pin that narrow additive exception;
+            // every removal and every other tool/property addition remains forbidden.
+            let expected_added: BTreeSet<&str> = if name == "memory_store" {
+                ["valid_from", "valid_until"].into_iter().collect()
+            } else {
+                BTreeSet::new()
+            };
             assert!(
-                added.is_empty() && removed.is_empty(),
-                "post-D1.6 {name}.inputSchema.properties drifted: added = {added:?}, removed = {removed:?}"
+                added == expected_added && removed.is_empty(),
+                "post-D1.6 {name}.inputSchema.properties drifted: added = {added:?} (expected {expected_added:?}), removed = {removed:?}"
             );
         }
     }
