@@ -1113,6 +1113,8 @@ fn ga2_link() -> ai_memory::models::MemoryLink {
         valid_from: None,
         valid_until: None,
         attest_level: None,
+        source_cid: None,
+        target_cid: None,
     }
 }
 

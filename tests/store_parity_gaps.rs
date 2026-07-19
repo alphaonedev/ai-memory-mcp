@@ -475,6 +475,114 @@ fn verify_gap_1725_in_place_archive_sqlite() {
     );
 }
 
+/// #2221 (data-integrity archive-parity) — SUPERSEDE-re-archive
+/// last-wins parity. Sqlite reference: superseding a memory whose OLD
+/// id ALREADY has an `archived_memories` row (an `in_place_edit`
+/// snapshot from a prior content edit — SAME id, live row still
+/// present) must SUCCEED and OVERWRITE that snapshot with the
+/// `archive_reason='superseded'` copy of the OLD live payload. Sqlite's
+/// supersede funnels through `archive_memory_no_tx`'s `INSERT OR
+/// REPLACE` (last-wins), so it always succeeded. The postgres twin
+/// `pg_parity_gap_2221_supersede_rearchive_lastwins` FAILS on the
+/// pre-#2221 `ON CONFLICT (id) DO NOTHING` + 0-rows-affected `NotFound`
+/// path (a mistyped `NotFound` for a memory that EXISTS); #2221 aligns
+/// the pg site to the shared `SQL_ARCHIVE_ON_CONFLICT_LAST_WINS` clause.
+fn verify_gap_2221_supersede_rearchive_lastwins_sqlite() {
+    let conn = fresh_sqlite();
+    let id = seed_memory(&conn, "g2221-a", "test", "g2221 title", "content-v1");
+
+    // Precondition: an in-place content edit snapshots the prior content
+    // (v1) into `archived_memories` under archive_reason='in_place_edit',
+    // SAME id, live row kept (now content-v2). This is the archive row
+    // the subsequent supersede's INSERT must overwrite, not choke on.
+    let (ok, changed) = db::update_with_expected_version(
+        &conn,
+        &id,
+        None,
+        Some("content-v2"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None, // #1834 valid_until
+    )
+    .expect("in-place edit");
+    assert!(ok && changed, "in-place edit applied");
+    let pre_reason: String = conn
+        .query_row(
+            "SELECT archive_reason FROM archived_memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |r| r.get(0),
+        )
+        .expect("in_place_edit snapshot exists");
+    assert_eq!(pre_reason, "in_place_edit", "precondition snapshot present");
+
+    // Supersede X. The archive step re-archives the OLD live row
+    // (content-v2) under archive_reason='superseded' — hitting the
+    // pre-existing archived_memories row for this id.
+    let result = db::update_with_archive_on_supersede(
+        &conn,
+        &id,
+        None,
+        Some("content-v3"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        ai_memory::models::EditSource::Llm,
+    )
+    .expect("supersede must succeed even with a pre-existing archive row");
+    assert_eq!(result.archived_id, id, "archived_id is the OLD id");
+    assert_ne!(result.new_id, id, "new_id is freshly minted");
+
+    // The archive row for the OLD id is now LAST-WINS: reason flipped to
+    // 'superseded' and content is the OLD live payload (content-v2),
+    // overwriting the earlier in_place_edit snapshot — NOT first-wins.
+    let (a_reason, a_content): (String, String) = conn
+        .query_row(
+            "SELECT archive_reason, content FROM archived_memories WHERE id = ?1",
+            rusqlite::params![&result.archived_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("archived row exists after supersede");
+    assert_eq!(a_reason, "superseded", "reason overwritten last-wins");
+    assert_eq!(
+        a_content, "content-v2",
+        "archived payload is the OLD live row (last-wins), not the stale snapshot"
+    );
+
+    // OLD row evicted from live; the NEW row carries content-v3.
+    let live: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE id = ?1",
+            rusqlite::params![&result.archived_id],
+            |r| r.get(0),
+        )
+        .expect("count live old");
+    assert_eq!(live, 0, "OLD row evicted from live memories");
+    let new_content: String = conn
+        .query_row(
+            "SELECT content FROM memories WHERE id = ?1",
+            rusqlite::params![&result.new_id],
+            |r| r.get(0),
+        )
+        .expect("new row content");
+    assert_eq!(
+        new_content, "content-v3",
+        "new row carries the patched content"
+    );
+}
+
 /// Gap 6 (#889) — `search_with_source_uri` post-filters by URI. Sqlite
 /// reference.
 fn verify_gap_6_search_source_uri_sqlite() {
@@ -608,6 +716,11 @@ fn sqlite_parity_gap_7_get_links_columns() {
 #[test]
 fn sqlite_parity_gap_1725_in_place_archive() {
     verify_gap_1725_in_place_archive_sqlite();
+}
+
+#[test]
+fn sqlite_parity_gap_2221_supersede_rearchive_lastwins() {
+    verify_gap_2221_supersede_rearchive_lastwins_sqlite();
 }
 
 /// #1725 regression — `update_with_expected_version` must work when the
@@ -833,6 +946,7 @@ mod postgres_side {
         verify_gap_3_recall_observations_sqlite, verify_gap_5_edit_source_sqlite,
         verify_gap_6_search_source_uri_sqlite, verify_gap_7_get_links_columns_sqlite,
         verify_gap_1725_in_place_archive_sqlite,
+        verify_gap_2221_supersede_rearchive_lastwins_sqlite,
     };
     use ai_memory::models::Memory;
     use ai_memory::store::postgres::PostgresStore;
@@ -988,6 +1102,105 @@ mod postgres_side {
             .await
             .expect("count archive non-content");
         assert_eq!(nonc, 0, "metadata/priority-only edit archives nothing");
+    }
+
+    /// #2221 (data-integrity archive-parity) — postgres twin of
+    /// `verify_gap_2221_supersede_rearchive_lastwins_sqlite`. Superseding
+    /// a memory whose OLD id already carries an `archived_memories` row
+    /// (an `in_place_edit` snapshot; live row still present) must SUCCEED
+    /// and OVERWRITE that snapshot last-wins. Pre-#2221 the pg supersede
+    /// Step-1 archive INSERT used `ON CONFLICT (id) DO NOTHING` + a
+    /// 0-rows-affected `NotFound`, so this exact case ROLLED BACK with a
+    /// mistyped `NotFound` for a memory that EXISTS — while the sqlite
+    /// reference (INSERT OR REPLACE) succeeded. This twin FAILS on the
+    /// old pg behavior and passes once the site adopts the shared
+    /// `SQL_ARCHIVE_ON_CONFLICT_LAST_WINS` clause.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_parity_gap_2221_supersede_rearchive_lastwins() {
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        // Sqlite reference pins the last-wins contract shape.
+        verify_gap_2221_supersede_rearchive_lastwins_sqlite();
+
+        let ctx = ai_memory::store::CallerContext::for_agent("parity-test");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let mut mem = sample_memory(&format!("pg-g2221-{run}"));
+        mem.content = "content-v1".to_string();
+        mem.metadata = serde_json::json!({ "agent_id": "parity-test" });
+        let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &mem).await;
+
+        // Precondition: an in-place content edit snapshots content-v1 into
+        // archived_memories under archive_reason='in_place_edit' (SAME id,
+        // live row kept at content-v2) — the row the supersede must
+        // overwrite last-wins rather than choke on.
+        let p1 = ai_memory::store::UpdatePatch {
+            content: Some("content-v2".to_string()),
+            ..ai_memory::store::UpdatePatch::default()
+        };
+        pg.update_with_expected_version(&ctx, &mem.id, p1, None)
+            .await
+            .expect("in-place edit");
+        let pre_reason: String =
+            sqlx::query_scalar("SELECT archive_reason FROM archived_memories WHERE id = $1")
+                .bind(&mem.id)
+                .fetch_one(pg.pool())
+                .await
+                .expect("in_place_edit snapshot exists");
+        assert_eq!(pre_reason, "in_place_edit", "precondition snapshot present");
+
+        // Supersede X. Pre-#2221 this returned Err(NotFound) because the
+        // ON CONFLICT (id) DO NOTHING left rows_affected == 0 against the
+        // pre-existing archive row; post-#2221 the last-wins DO UPDATE
+        // succeeds — byte-parity with the sqlite INSERT OR REPLACE.
+        let patch = ai_memory::store::UpdatePatch {
+            content: Some("content-v3".to_string()),
+            ..ai_memory::store::UpdatePatch::default()
+        };
+        let (archived_id, new_id) = pg
+            .update_with_archive_on_supersede(
+                &mem.id,
+                patch,
+                None,
+                ai_memory::models::EditSource::Llm,
+            )
+            .await
+            .expect("supersede must succeed even with a pre-existing archive row");
+        assert_eq!(archived_id, mem.id, "archived_id is the OLD id");
+        assert_ne!(new_id, mem.id, "new_id is freshly minted");
+
+        // Last-wins: the archive row for the OLD id now carries reason
+        // 'superseded' and the OLD LIVE payload (content-v2), overwriting
+        // the stale in_place_edit snapshot — byte-identical to sqlite.
+        let (a_reason, a_content): (String, String) =
+            sqlx::query_as("SELECT archive_reason, content FROM archived_memories WHERE id = $1")
+                .bind(&mem.id)
+                .fetch_one(pg.pool())
+                .await
+                .expect("archive row after supersede");
+        assert_eq!(a_reason, "superseded", "reason overwritten last-wins");
+        assert_eq!(
+            a_content, "content-v2",
+            "archived payload is the OLD live row (last-wins), not the stale snapshot"
+        );
+
+        // OLD row evicted from live; the NEW row carries content-v3.
+        let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memories WHERE id = $1")
+            .bind(&mem.id)
+            .fetch_one(pg.pool())
+            .await
+            .expect("count live old");
+        assert_eq!(live, 0, "OLD row evicted from live memories");
+        let new_content: String = sqlx::query_scalar("SELECT content FROM memories WHERE id = $1")
+            .bind(&new_id)
+            .fetch_one(pg.pool())
+            .await
+            .expect("new row content");
+        assert_eq!(
+            new_content, "content-v3",
+            "new row carries the patched content"
+        );
     }
 
     /// #228 / #1728 Commit A-carry — postgres twin of

@@ -1005,6 +1005,8 @@ mod tests {
             valid_from: None,
             valid_until: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         let json = serde_json::to_string(&post).expect("encode Link");
         let back: Link = serde_json::from_str(&json).expect("decode Link");

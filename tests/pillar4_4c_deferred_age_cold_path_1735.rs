@@ -102,6 +102,8 @@ async fn deferred_link_enqueues_drains_and_find_paths_via_cte_1735() {
         observed_by: None,
         signature: None,
         attest_level: None,
+        source_cid: None,
+        target_cid: None,
     };
     store
         .link(&ctx, &link)
