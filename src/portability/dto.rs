@@ -1,0 +1,588 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! #2006 — the per-class HEX envelope DTOs (spec §V2-2).
+//!
+//! Each signed record class crosses the v2 export envelope as a DEDICATED DTO
+//! (never the domain struct's default serde — three of the domain structs have
+//! no serde derive at all, and the ones that do emit `Vec<u8>` as a JSON number
+//! array). Every byte field routes through the shared
+//! [`crate::portability::hex_bytes`] codec so BOTH directions use the identical
+//! encoding and the round-trip is byte-preserved (L2). Signatures cross
+//! verbatim — an importer NEVER re-signs; it reconstructs the exact bytes so
+//! the destination re-verify sees the original signature.
+//!
+//! Conversions are bidirectional: `From<&DomainRow>` for the emit path and
+//! `try_into_domain` / `From<Dto>` for the import path. Reconstruction is
+//! FAIL-CLOSED on a closed-vocabulary field (an unknown `reason` /
+//! `custody_class` slug is an error, never a silent default).
+
+use serde::{Deserialize, Serialize};
+
+use crate::governance::rules_store::Rule;
+use crate::identity::lineage::{CustodyClass, LineageReason, LineageRecord};
+use crate::portability::hex_bytes::HexBytes;
+use crate::portability::read::{ForgetTombstone, LineageExport, RevisionRow};
+use crate::revisions::{RecordKind, RevisionLeaf};
+use crate::signed_events::SignedEvent;
+use crate::storage::model_attest::ModelAttestation;
+
+/// Error reconstructing a domain row from its DTO on the import path — a
+/// closed-vocabulary slug outside its enum. Fail-closed: never a silent
+/// default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DtoError {
+    /// A `memory_revisions.kind` slug outside [`RecordKind`].
+    UnknownRevisionKind(String),
+    /// An `agent_lineage.reason` slug outside [`LineageReason`].
+    UnknownLineageReason(String),
+    /// An `agent_lineage.custody_class` slug outside [`CustodyClass`].
+    UnknownCustodyClass(String),
+}
+
+impl std::fmt::Display for DtoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownRevisionKind(s) => write!(f, "unknown revision kind {s:?}"),
+            Self::UnknownLineageReason(s) => write!(f, "unknown lineage reason {s:?}"),
+            Self::UnknownCustodyClass(s) => write!(f, "unknown custody class {s:?}"),
+        }
+    }
+}
+
+impl std::error::Error for DtoError {}
+
+// ── signed_events (§V2-2.1) ────────────────────────────────────────────────
+
+/// `signed_events[]` DTO — the V-4 audit chain row. Carries `prev_hash` +
+/// `sequence` + `cause_hash` (the forensic-bundle envelope omits them) so the
+/// destination `verify_audit_trail` can recompute the cross-row chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedEventDto {
+    pub id: String,
+    pub agent_id: String,
+    pub event_type: String,
+    pub payload_hash: HexBytes,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<HexBytes>,
+    pub attest_level: String,
+    pub timestamp: String,
+    pub prev_hash: HexBytes,
+    pub sequence: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause_hash: Option<HexBytes>,
+}
+
+impl From<&SignedEvent> for SignedEventDto {
+    fn from(e: &SignedEvent) -> Self {
+        Self {
+            id: e.id.clone(),
+            agent_id: e.agent_id.clone(),
+            event_type: e.event_type.clone(),
+            payload_hash: HexBytes(e.payload_hash.clone()),
+            signature: e.signature.clone().map(HexBytes),
+            attest_level: e.attest_level.clone(),
+            timestamp: e.timestamp.clone(),
+            prev_hash: HexBytes(e.prev_hash.clone()),
+            sequence: e.sequence,
+            cause_hash: e.cause_hash.clone().map(HexBytes),
+        }
+    }
+}
+
+impl From<SignedEventDto> for SignedEvent {
+    fn from(d: SignedEventDto) -> Self {
+        Self {
+            id: d.id,
+            agent_id: d.agent_id,
+            event_type: d.event_type,
+            payload_hash: d.payload_hash.0,
+            signature: d.signature.map(|h| h.0),
+            attest_level: d.attest_level,
+            timestamp: d.timestamp,
+            prev_hash: d.prev_hash.0,
+            sequence: d.sequence,
+            cause_hash: d.cause_hash.map(|h| h.0),
+        }
+    }
+}
+
+// ── memory_revisions (§V2-2.2) ─────────────────────────────────────────────
+
+/// `memory_revisions[]` DTO — an identity-only revision leaf + its chain
+/// columns (`prev_hash`, `sequence`) so the destination recomputes the spine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevisionDto {
+    pub id: String,
+    pub memory_id: String,
+    /// Closed [`RecordKind`] wire slug (e.g. `SUPERSEDE`).
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_version: Option<i64>,
+    pub namespace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<HexBytes>,
+    pub prev_hash: HexBytes,
+    pub sequence: i64,
+}
+
+impl From<&RevisionRow> for RevisionDto {
+    fn from(r: &RevisionRow) -> Self {
+        Self {
+            id: r.leaf.id.clone(),
+            memory_id: r.leaf.memory_id.clone(),
+            kind: r.leaf.kind.as_str().to_string(),
+            prior_version: r.leaf.prior_version,
+            namespace: r.leaf.namespace.clone(),
+            agent_id: r.leaf.agent_id.clone(),
+            created_at: r.leaf.created_at.clone(),
+            signature: r.leaf.signature.clone().map(HexBytes),
+            prev_hash: HexBytes(r.prev_hash.clone()),
+            sequence: r.sequence,
+        }
+    }
+}
+
+impl RevisionDto {
+    /// Reconstruct the domain [`RevisionRow`]. Fail-closed on an unknown kind.
+    ///
+    /// # Errors
+    /// The `kind` slug is outside [`RecordKind`].
+    pub fn try_into_domain(self) -> Result<RevisionRow, DtoError> {
+        let kind = RecordKind::from_str_opt(&self.kind)
+            .ok_or_else(|| DtoError::UnknownRevisionKind(self.kind.clone()))?;
+        Ok(RevisionRow {
+            leaf: RevisionLeaf {
+                id: self.id,
+                memory_id: self.memory_id,
+                kind,
+                prior_version: self.prior_version,
+                namespace: self.namespace,
+                agent_id: self.agent_id,
+                created_at: self.created_at,
+                signature: self.signature.map(|h| h.0),
+            },
+            prev_hash: self.prev_hash.0,
+            sequence: self.sequence,
+        })
+    }
+}
+
+// ── forget_tombstones (§V2-2.3) ────────────────────────────────────────────
+
+/// `forget_tombstones[]` DTO — the signed erasure receipt (identity + time +
+/// signature, NEVER a content fingerprint).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgetTombstoneDto {
+    pub memory_id: String,
+    pub namespace: String,
+    pub forgotten_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<HexBytes>,
+}
+
+impl From<&ForgetTombstone> for ForgetTombstoneDto {
+    fn from(t: &ForgetTombstone) -> Self {
+        Self {
+            memory_id: t.memory_id.clone(),
+            namespace: t.namespace.clone(),
+            forgotten_at: t.forgotten_at.clone(),
+            agent_id: t.agent_id.clone(),
+            signature: t.signature.clone().map(HexBytes),
+        }
+    }
+}
+
+impl From<ForgetTombstoneDto> for ForgetTombstone {
+    fn from(d: ForgetTombstoneDto) -> Self {
+        Self {
+            memory_id: d.memory_id,
+            namespace: d.namespace,
+            forgotten_at: d.forgotten_at,
+            agent_id: d.agent_id,
+            signature: d.signature.map(|h| h.0),
+        }
+    }
+}
+
+// ── agent_lineage (§V2-2.4) ────────────────────────────────────────────────
+
+/// `agent_lineage[]` DTO — a signed key-succession record + its detached
+/// signature. Closed-vocabulary `reason` / `custody_class` cross as their wire
+/// slugs; the optional recovery-quorum bytes cross hex-encoded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineageDto {
+    pub agent_id: String,
+    pub epoch: u64,
+    /// [`LineageReason`] wire slug (`genesis`/`rotation`/`recovery`/`revocation`).
+    pub reason: String,
+    pub predecessor_pubkey_b64: String,
+    pub successor_pubkey_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_pubkey_b64: Option<String>,
+    pub not_before: String,
+    pub prev_record_hash: HexBytes,
+    /// [`CustodyClass`] wire slug (`software-file` default).
+    pub custody_class: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspected_compromise_from_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardian_set_id: Option<HexBytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_threshold: Option<u64>,
+    /// The detached Ed25519 signature over the record's canonical bytes
+    /// (always present — stored ALONGSIDE the record, not signed-in).
+    pub signature: HexBytes,
+}
+
+impl From<&LineageExport> for LineageDto {
+    fn from(l: &LineageExport) -> Self {
+        let r = &l.record;
+        Self {
+            agent_id: r.agent_id.clone(),
+            epoch: r.epoch,
+            reason: r.reason.as_str().to_string(),
+            predecessor_pubkey_b64: r.predecessor_pubkey_b64.clone(),
+            successor_pubkey_b64: r.successor_pubkey_b64.clone(),
+            recovery_pubkey_b64: r.recovery_pubkey_b64.clone(),
+            not_before: r.not_before.clone(),
+            prev_record_hash: HexBytes(r.prev_record_hash.clone()),
+            custody_class: r.custody_class.as_str().to_string(),
+            suspected_compromise_from_seq: r.suspected_compromise_from_seq,
+            guardian_set_id: r.guardian_set_id.clone().map(HexBytes),
+            recovery_threshold: r.recovery_threshold,
+            signature: HexBytes(l.signature.clone()),
+        }
+    }
+}
+
+impl LineageDto {
+    /// Reconstruct the domain [`LineageExport`]. Fail-closed on an unknown
+    /// `reason` or `custody_class` slug.
+    ///
+    /// # Errors
+    /// A closed-vocabulary slug is outside its enum.
+    pub fn try_into_domain(self) -> Result<LineageExport, DtoError> {
+        let reason = LineageReason::from_str(&self.reason)
+            .ok_or_else(|| DtoError::UnknownLineageReason(self.reason.clone()))?;
+        let custody_class = CustodyClass::from_str(&self.custody_class)
+            .ok_or_else(|| DtoError::UnknownCustodyClass(self.custody_class.clone()))?;
+        Ok(LineageExport {
+            agent_id: self.agent_id.clone(),
+            record: LineageRecord {
+                agent_id: self.agent_id,
+                epoch: self.epoch,
+                reason,
+                predecessor_pubkey_b64: self.predecessor_pubkey_b64,
+                successor_pubkey_b64: self.successor_pubkey_b64,
+                recovery_pubkey_b64: self.recovery_pubkey_b64,
+                not_before: self.not_before,
+                prev_record_hash: self.prev_record_hash.0,
+                custody_class,
+                suspected_compromise_from_seq: self.suspected_compromise_from_seq,
+                guardian_set_id: self.guardian_set_id.map(|h| h.0),
+                recovery_threshold: self.recovery_threshold,
+            },
+            signature: self.signature.0,
+        })
+    }
+}
+
+// ── model_attestations (§V2-2.5) ───────────────────────────────────────────
+
+/// `model_attestations[]` DTO — a write-once model-family provenance record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelAttestationDto {
+    pub id: String,
+    pub provider: String,
+    pub model_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_digest: Option<String>,
+    pub model_family: String,
+    pub attest_level: String,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<HexBytes>,
+    pub created_at: String,
+}
+
+impl From<&ModelAttestation> for ModelAttestationDto {
+    fn from(m: &ModelAttestation) -> Self {
+        Self {
+            id: m.id.clone(),
+            provider: m.provider.clone(),
+            model_ref: m.model_ref.clone(),
+            model_digest: m.model_digest.clone(),
+            model_family: m.model_family.clone(),
+            attest_level: m.attest_level.clone(),
+            agent_id: m.agent_id.clone(),
+            signature: m.signature.clone().map(HexBytes),
+            created_at: m.created_at.clone(),
+        }
+    }
+}
+
+impl From<ModelAttestationDto> for ModelAttestation {
+    fn from(d: ModelAttestationDto) -> Self {
+        Self {
+            id: d.id,
+            provider: d.provider,
+            model_ref: d.model_ref,
+            model_digest: d.model_digest,
+            model_family: d.model_family,
+            attest_level: d.attest_level,
+            agent_id: d.agent_id,
+            signature: d.signature.map(|h| h.0),
+            created_at: d.created_at,
+        }
+    }
+}
+
+// ── governance_rules (§V2-2.6, L3) ─────────────────────────────────────────
+
+/// `governance_rules[]` DTO (L3) — an operator-signed policy row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernanceRuleDto {
+    pub id: String,
+    pub kind: String,
+    pub matcher: String,
+    pub severity: String,
+    pub reason: String,
+    pub namespace: String,
+    pub created_by: String,
+    pub created_at: i64,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<HexBytes>,
+    pub attest_level: String,
+}
+
+impl From<&Rule> for GovernanceRuleDto {
+    fn from(r: &Rule) -> Self {
+        Self {
+            id: r.id.clone(),
+            kind: r.kind.clone(),
+            matcher: r.matcher.clone(),
+            severity: r.severity.clone(),
+            reason: r.reason.clone(),
+            namespace: r.namespace.clone(),
+            created_by: r.created_by.clone(),
+            created_at: r.created_at,
+            enabled: r.enabled,
+            signature: r.signature.clone().map(HexBytes),
+            attest_level: r.attest_level.clone(),
+        }
+    }
+}
+
+impl From<GovernanceRuleDto> for Rule {
+    fn from(d: GovernanceRuleDto) -> Self {
+        Self {
+            id: d.id,
+            kind: d.kind,
+            matcher: d.matcher,
+            severity: d.severity,
+            reason: d.reason,
+            namespace: d.namespace,
+            created_by: d.created_by,
+            created_at: d.created_at,
+            enabled: d.enabled,
+            signature: d.signature.map(|h| h.0),
+            attest_level: d.attest_level,
+        }
+    }
+}
+
+// ── trust_anchors (§V2-2.6, L3) ────────────────────────────────────────────
+
+/// `trust_anchors[]` DTO (L3) — an enrolled role's PUBLIC verifying key.
+///
+/// PUBLIC keys ONLY; a private key NEVER crosses the envelope. Advisory at the
+/// destination — the substrate's re-verify K1-pins its OWN out-of-band enrolled
+/// keys (`AI_MEMORY_*_PUBKEY`), so an importer treats these as informational
+/// and never adopts them as a trust root (spec §V2-2.6 + the #2006 vote).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustAnchorDto {
+    /// The enrolled role (`operator`/`witness`/`recorder`/`judge`/`stopper`).
+    pub role: String,
+    /// URL-safe-no-pad base64 of the 32-byte Ed25519 verifying key.
+    pub pubkey_b64: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The load-bearing property for every DTO: domain → DTO → JSON → DTO →
+    /// domain reproduces the exact bytes, and the JSON carries byte fields as
+    /// hex STRINGS (never a number array).
+    fn assert_no_number_array(json: &str) {
+        assert!(
+            !json.contains('['),
+            "a byte field serialized as a number array (not hex): {json}"
+        );
+    }
+
+    #[test]
+    fn signed_event_dto_round_trips_byte_exact() {
+        let ev = SignedEvent {
+            id: "e1".into(),
+            agent_id: "alice".into(),
+            event_type: "memory_link.created".into(),
+            payload_hash: vec![0xde, 0xad],
+            signature: Some(vec![0x01; 64]),
+            attest_level: "signed".into(),
+            timestamp: "2026-07-14T00:00:00Z".into(),
+            prev_hash: vec![0x00; 32],
+            sequence: 7,
+            cause_hash: None,
+        };
+        let dto = SignedEventDto::from(&ev);
+        let json = serde_json::to_string(&dto).unwrap();
+        assert_no_number_array(&json);
+        let back: SignedEvent = serde_json::from_str::<SignedEventDto>(&json)
+            .unwrap()
+            .into();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn revision_dto_round_trips_and_fails_closed_on_bad_kind() {
+        let row = RevisionRow {
+            leaf: RevisionLeaf {
+                id: "r1".into(),
+                memory_id: "m1".into(),
+                kind: RecordKind::Supersede,
+                prior_version: Some(3),
+                namespace: "ns".into(),
+                agent_id: None,
+                created_at: "2026-07-14T00:00:00Z".into(),
+                signature: Some(vec![0xab; 64]),
+            },
+            prev_hash: vec![0x11; 32],
+            sequence: 4,
+        };
+        let dto = RevisionDto::from(&row);
+        let json = serde_json::to_string(&dto).unwrap();
+        assert_no_number_array(&json);
+        let back = serde_json::from_str::<RevisionDto>(&json)
+            .unwrap()
+            .try_into_domain()
+            .unwrap();
+        assert_eq!(back, row);
+        // Fail-closed on a forged kind.
+        let mut bad = dto;
+        bad.kind = "BOGUS".into();
+        assert_eq!(
+            bad.try_into_domain().unwrap_err(),
+            DtoError::UnknownRevisionKind("BOGUS".into())
+        );
+    }
+
+    #[test]
+    fn forget_tombstone_dto_round_trips() {
+        let t = ForgetTombstone {
+            memory_id: "m1".into(),
+            namespace: "ns".into(),
+            forgotten_at: "2026-07-14T00:00:00Z".into(),
+            agent_id: Some("alice".into()),
+            signature: Some(vec![0x22; 64]),
+        };
+        let json = serde_json::to_string(&ForgetTombstoneDto::from(&t)).unwrap();
+        assert_no_number_array(&json);
+        let back: ForgetTombstone = serde_json::from_str::<ForgetTombstoneDto>(&json)
+            .unwrap()
+            .into();
+        assert_eq!(back, t);
+    }
+
+    #[test]
+    fn lineage_dto_round_trips_and_fails_closed() {
+        let export = LineageExport {
+            agent_id: "alice".into(),
+            record: LineageRecord {
+                agent_id: "alice".into(),
+                epoch: 2,
+                reason: LineageReason::Rotation,
+                predecessor_pubkey_b64: "AAAA".into(),
+                successor_pubkey_b64: "BBBB".into(),
+                recovery_pubkey_b64: None,
+                not_before: "2026-07-14T00:00:00Z".into(),
+                prev_record_hash: vec![0x33; 32],
+                custody_class: CustodyClass::SoftwareFile,
+                suspected_compromise_from_seq: None,
+                guardian_set_id: None,
+                recovery_threshold: None,
+            },
+            signature: vec![0x44; 64],
+        };
+        let json = serde_json::to_string(&LineageDto::from(&export)).unwrap();
+        assert_no_number_array(&json);
+        let back = serde_json::from_str::<LineageDto>(&json)
+            .unwrap()
+            .try_into_domain()
+            .unwrap();
+        assert_eq!(back.record, export.record);
+        assert_eq!(back.signature, export.signature);
+    }
+
+    #[test]
+    fn model_attestation_dto_round_trips() {
+        let m = ModelAttestation {
+            id: "a1".into(),
+            provider: "openrouter".into(),
+            model_ref: "google/gemma-4-31b".into(),
+            model_digest: None,
+            model_family: "gemma".into(),
+            attest_level: "operator_signed".into(),
+            agent_id: "op".into(),
+            signature: Some(vec![0x55; 64]),
+            created_at: "2026-07-14T00:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&ModelAttestationDto::from(&m)).unwrap();
+        assert_no_number_array(&json);
+        let back: ModelAttestation = serde_json::from_str::<ModelAttestationDto>(&json)
+            .unwrap()
+            .into();
+        assert_eq!(back, m);
+    }
+
+    #[test]
+    fn governance_rule_dto_round_trips() {
+        let r = Rule {
+            id: "R1".into(),
+            kind: "namespace_deny".into(),
+            matcher: "secret/*".into(),
+            severity: "refuse".into(),
+            reason: "no secrets".into(),
+            namespace: "*".into(),
+            created_by: "op".into(),
+            created_at: 1_700_000_000,
+            enabled: true,
+            signature: Some(vec![0x66; 64]),
+            attest_level: "operator_signed".into(),
+        };
+        let json = serde_json::to_string(&GovernanceRuleDto::from(&r)).unwrap();
+        assert_no_number_array(&json);
+        let back: Rule = serde_json::from_str::<GovernanceRuleDto>(&json)
+            .unwrap()
+            .into();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn trust_anchor_dto_carries_only_public_key() {
+        let a = TrustAnchorDto {
+            role: "witness".into(),
+            pubkey_b64: "abc123".into(),
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        let back: TrustAnchorDto = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, a);
+    }
+}
