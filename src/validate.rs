@@ -1163,6 +1163,20 @@ pub fn validate_memory(mem: &Memory) -> Result<()> {
     {
         bail!("expires_at is not valid RFC3339");
     }
+    // v1.0.0 #1834 claim-bitemporal VALID-time (pre-ship 3x7, #2006 L1
+    // parity): a full-Memory import must not land a malformed validity
+    // interval. Format-only — the `validate_update` posture; historical
+    // intervals are legitimate on import.
+    if let Some(ref ts) = mem.valid_from
+        && !is_valid_rfc3339(ts)
+    {
+        bail!("valid_from is not valid RFC3339");
+    }
+    if let Some(ref ts) = mem.valid_until
+        && !is_valid_rfc3339(ts)
+    {
+        bail!("valid_until is not valid RFC3339");
+    }
     validate_metadata(&mem.metadata)?;
     // v0.7.0 Form 4 — fact-provenance fields on a full Memory import.
     validate_citations(&mem.citations)?;
