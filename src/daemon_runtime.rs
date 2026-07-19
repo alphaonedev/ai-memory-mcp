@@ -259,8 +259,11 @@ pub enum Command {
     /// crypto spine is separately exportable via
     /// `ai-memory export-forensic-bundle`. The export payload carries
     /// additive `export_scope` / `portability_complete` / `excludes` markers
-    /// and a stderr WARN naming this scope.
-    Export,
+    /// and a stderr WARN naming this scope. `--full` (v1.0.0 #2006) instead
+    /// emits the integrity-complete Portability-v2 envelope (every signed
+    /// record class byte-preserved + re-verifiable, with a computed
+    /// `conformance_level` marker).
+    Export(cli::io::ExportArgs),
     /// Import memories from JSON (stdin)
     Import(ImportArgs),
     /// Resolve a contradiction — mark one memory as superseding another
@@ -1404,13 +1407,13 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
                 code => std::process::exit(code),
             }
         }
-        Command::Export => {
+        Command::Export(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            cli::io::export(&db_path, &mut out)
+            cli::io::export(&db_path, &a, &mut out)
         }
         Command::Import(a) => {
             let stdout = std::io::stdout();
@@ -3449,6 +3452,19 @@ pub fn spawn_gc_loop_with_shadow_retention(
                 Ok(n) if n > 0 => tracing::info!("gc: purged {n} old archived memories"),
                 _ => {}
             }
+            // #2064 — erasure cold-tier sweep: bundle committed archived
+            // rows into (k, m) Reed-Solomon shard bundles, paced at
+            // SWEEP_LIMIT_PER_TICK oldest-first per tick. No-op unless
+            // AI_MEMORY_ERASURE_COLD_TIER is enabled.
+            match crate::erasure::archive_sync::gc_tick(&lock.0) {
+                Ok(r) if r.bundled > 0 || r.failed > 0 => tracing::info!(
+                    "gc: erasure cold tier bundled {} archived rows ({} failed, retried next tick)",
+                    r.bundled,
+                    r.failed
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("erasure cold-tier sweep failed: {e:#}"),
+            }
             // Cluster G (#767, PERF-4) — shadow-mode observation
             // retention sweep. `<= 0` is a no-op (operator opt-out).
             match crate::confidence::shadow::gc_observations(&lock.0, shadow_retention_days) {
@@ -4962,9 +4978,12 @@ pub async fn bootstrap_serve(
     // has named since v0.7.0 M8. Defaults preserve the legacy
     // 100k-evict-oldest behavior byte-identically.
     let index_limits = app_config.resolve_limits();
+    // v1.0.0 #1860 — resolved through the backend-selecting funnel
+    // (default backend unless the opt-in `vectorlite` feature + env
+    // knob select the extension backend; fails closed to default).
     let vector_index_state: Arc<Mutex<Option<Box<dyn hnsw::VectorSearchIndex>>>> =
         Arc::new(Mutex::new(embedder.is_some().then(|| {
-            hnsw::boxed_default_index(
+            hnsw::boxed_configured_index(
                 index_limits.vector_index_capacity,
                 index_limits.vector_index_hard_fail_at_cap,
             )
@@ -7431,7 +7450,9 @@ mod tests {
         assert!(is_write_command(&Command::Gc));
         assert!(!is_write_command(&Command::Stats));
         assert!(!is_write_command(&Command::Namespaces));
-        assert!(!is_write_command(&Command::Export));
+        assert!(!is_write_command(&Command::Export(
+            cli::io::ExportArgs::default()
+        )));
         assert!(!is_write_command(&Command::Shell));
         assert!(!is_write_command(&Command::Man));
         assert!(!is_write_command(&Command::Mcp {

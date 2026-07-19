@@ -551,6 +551,8 @@ pub mod background;
 // future MCP `memory_checkpoint_*` handlers over a bare rusqlite Connection.
 pub mod checkpoints;
 pub mod cli;
+// v1.0.0 #1830 (TRACT-gap G16) — durability-model disclosure anchor (no erasure
+// cold tier; the deliberate absent-variant is the machine-checked gap record).
 pub mod color;
 /// v0.7.0 Form 5 (issue #758) — auto-confidence + shadow-mode +
 /// freshness-decay + calibration tooling. Closes the FORM 5 PARTIAL
@@ -571,6 +573,10 @@ pub mod content_patch;
 pub mod coordination_audit;
 pub mod curator;
 pub mod daemon_runtime;
+pub mod durability;
+// v1.0.0 #2064 (TRACT-gap G16, #1830) — opt-in erasure-coded archive
+// cold-tier redundancy layer (operator-authorized reed-solomon-simd dep).
+pub mod erasure;
 // v0.7.0 L0.5-3 — module renamed from `db` → `storage` as part of
 // the flat-to-modular refactor. The `pub use storage as db;` shim
 // below preserves every `crate::db::*` path across the codebase
@@ -621,6 +627,11 @@ pub mod handlers;
 // based on whether the harness supports deferred-tool registration.
 pub mod harness;
 pub mod hnsw;
+// v1.0.0 #1860 — opt-in vectorlite ANN backend scaffolding behind the
+// OFF-by-default `vectorlite` feature (runtime-loaded operator-acquired
+// SQLite extension; fails closed to the default HNSW backend).
+#[cfg(feature = "vectorlite")]
+pub mod vectorlite;
 // v0.7 Track G — programmable lifecycle hook pipeline. G1 lands
 // the config schema + SIGHUP hot-reload plumbing; the executor
 // (G3) and the actual fire points (G7+) layer on top of this
@@ -689,6 +700,9 @@ pub mod offload;
 pub mod persona;
 // v0.7.0 L1-5 — SKILL.md parser and structured-document ingestion pipelines.
 pub mod parsing;
+// v1.0.0 #2006 — the integrity-complete Portability-v2 exporter + importer
+// (`ai-memory export --full` / the symmetric `import`).
+pub mod portability;
 // v0.7.0 K9 — unified permission system. Composes declarative
 // `[permissions.rules]` matchers, the K3 `[permissions].mode`
 // knob, and G1-G11 hook decisions into a single `Decision`.

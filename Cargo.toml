@@ -111,6 +111,18 @@ hmac = "0.12"
 # form). Introduced ONLY as the cid address function; the inner content
 # digest + the whole audit spine stay on `sha2`.
 blake3 = "1.5"
+# v1.0.0 #2064 (TRACT-gap G16, #1830) — Reed-Solomon erasure coding for the
+# opt-in archive cold-tier redundancy layer (`src/erasure`). OPERATOR-
+# AUTHORIZED dependency (2026-07-18, sole-authority rule): the #1830 2x5
+# adversarial vote (4d3ea1c5) UNANIMOUSLY rejected hand-rolling a GF(2^8)
+# codec (a codec bug corrupts the cold tier irrecoverably), so the vetted
+# crate IS the design. Vetting evidence (recorded in the introducing PR):
+# crates.io since 2023-11, 1.77M downloads (670k recent), maintained
+# (3.1.0 2025-10-14), MIT AND BSD-3-Clause (Apache-2.0-compatible), zero
+# RustSec advisories, MSRV 1.82 <= our 1.96. O(n log n) Leopard-RS
+# (GF(2^16)) with SIMD on x86-64 + AArch64; the shard on-disk format is
+# this crate's codec format (resolves the vote's T4 freeze concern).
+reed-solomon-simd = "3.1"
 # v0.7.0 (issue #654 MVP attestation) — hex-encode the SHA-256 of model
 # weight files for `src/inference::AttestedWeights`. Already pulled in
 # transitively via several other crates; promoted to a direct dep so
@@ -300,6 +312,21 @@ syslog = []
 # (North Star: DEGRADE, never corrupt). cfg(feature) consumer:
 # `src/recover/watcher.rs` (arch-11 audit).
 fs-notify = ["dep:notify"]
+# v1.0.0 #1860 — OPT-IN vectorlite ANN backend scaffolding. OFF by
+# default and deliberately NOT in any CI job or release channel: the
+# vectorlite native library (an Apache-2.0 C++ SQLite loadable
+# extension; NO Rust crate exists — the crates.io `vectorlite` name is
+# an unrelated project) cannot be acquired reproducibly across the
+# 3-OS CI matrix + 5 release channels, which is the plan-killer #1860
+# itself documents. This feature adds ZERO build-time acquisition: it
+# only enables rusqlite's `load_extension` API (still bundled SQLite)
+# and compiles `src/vectorlite.rs`, which loads an OPERATOR-ACQUIRED
+# extension binary at runtime from AI_MEMORY_VECTORLITE_EXTENSION
+# (see scripts/fetch-vectorlite.sh) and FAILS CLOSED to the default
+# pure-Rust HNSW backend on any load/smoke failure. cfg(feature)
+# consumers: `src/vectorlite.rs`, `src/lib.rs`, `src/hnsw.rs`,
+# `tests/vectorlite_1860.rs` (arch-11 audit).
+vectorlite = ["rusqlite/load_extension"]
 
 [dev-dependencies]
 proptest = "1"
