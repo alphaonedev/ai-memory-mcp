@@ -1534,6 +1534,20 @@ pub struct CreateMemory {
     /// the verifier re-derives the identical signed envelope.
     #[serde(default)]
     pub created_at: Option<String>,
+    /// #2258 / #1834 — claim-bitemporal VALID-time start. RFC3339 timestamp
+    /// recording when the fact BECAME true (backfill / future-effective),
+    /// distinct from `created_at` transaction-time. Validated via
+    /// `validate::validate_valid_at`. IMMUTABLE after create — a later upsert
+    /// keeps the stored value (`db::insert` / `PostgresStore::store` ON
+    /// CONFLICT preserve `valid_from`). Absent ⇒ unbounded start.
+    #[serde(default)]
+    pub valid_from: Option<String>,
+    /// #2258 / #1834 — claim-bitemporal VALID-time end bound (half-open
+    /// `[valid_from, valid_until)`). RFC3339; validated via
+    /// `validate::validate_valid_at`. Stays updatable via `PUT /memories/{id}`
+    /// (`memory_update`). Absent ⇒ unbounded end.
+    #[serde(default)]
+    pub valid_until: Option<String>,
 }
 
 /// Compiled default `confidence` stamped when a store surface (MCP

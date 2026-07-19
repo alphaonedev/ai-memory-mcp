@@ -820,8 +820,12 @@ async fn create_memory_postgres(
         version: 1,
         lifecycle_state: crate::models::LifecycleState::Open,
         cid: None,
-        valid_from: None,
-        valid_until: None,
+        // #2258 / #1834 — claim-bitemporal VALID-time bounds (validated in
+        // `validate::validate_create`). Postgres `store` ON CONFLICT keeps
+        // `valid_from` immutably and COALESCEs `valid_until` (parity with the
+        // sqlite branch below).
+        valid_from: body.valid_from.clone(),
+        valid_until: body.valid_until.clone(),
     };
     // v1.0.0 (#1945, spec §4) — epistemic-typing provenance: a caller-
     // supplied `kind` is `declared`; caller silence (the system default) is
@@ -1290,8 +1294,12 @@ pub async fn create_memory(
 
     let mut mem = Memory {
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
-        valid_from: None,
-        valid_until: None,
+        // #2258 / #1834 — claim-bitemporal VALID-time bounds (validated in
+        // `validate::validate_create`). `valid_from` is stamped at create and
+        // preserved immutably on upsert by the persist layer; `valid_until`
+        // COALESCEs and stays updatable via `PUT /memories/{id}`.
+        valid_from: body.valid_from.clone(),
+        valid_until: body.valid_until.clone(),
         id: Uuid::new_v4().to_string(),
         tier: body.tier.clone(),
         namespace: body.namespace.clone(),
@@ -1563,6 +1571,8 @@ mod tests {
             kind: None,
             signature: None,
             created_at: None,
+            valid_from: None,
+            valid_until: None,
         }
     }
 
