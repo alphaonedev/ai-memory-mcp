@@ -480,6 +480,11 @@ impl DeferredAuditJournal {
         for entry in std::fs::read_dir(&spool_dir).context("scan deferred-audit spool")? {
             let entry = entry.context("read deferred-audit spool entry")?;
             let entry_path = entry.path();
+            if is_publication_probe(&entry_path) {
+                std::fs::remove_file(&entry_path)
+                    .context("remove abandoned deferred-audit publication probe")?;
+                continue;
+            }
             if entry_path.extension().is_some_and(|ext| ext == "pending") {
                 let frame =
                     std::fs::read(&entry_path).context("read deferred-audit pending frame")?;
@@ -861,6 +866,19 @@ fn validate_atomic_publication(spool_dir: &Path) -> Result<()> {
     let _ = std::fs::remove_file(&published);
     let _ = std::fs::remove_file(&staging);
     result
+}
+
+fn is_publication_probe(path: &Path) -> bool {
+    if !path
+        .extension()
+        .is_some_and(|extension| extension == "probe")
+    {
+        return false;
+    }
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.strip_prefix('.'))
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
 }
 
 fn create_private_marker(path: &Path, content: &[u8]) -> Result<bool> {
@@ -3415,6 +3433,22 @@ mod tests {
         let replayed = reopened.replay().unwrap();
         assert_eq!(replayed.len(), 1);
         assert_eq!(replayed[0].occurrence_id, event.occurrence_id);
+    }
+
+    #[test]
+    fn journal_reclaims_abandoned_publication_probe_on_open() {
+        let dir = fresh_tempdir();
+        let journal_path = dir.path().join("probe-reconcile.journal");
+        let journal = DeferredAuditJournal::open(&journal_path).unwrap();
+        let probe = journal
+            .spool_dir
+            .join(format!(".{}.probe", uuid::Uuid::new_v4()));
+        std::fs::write(&probe, b"").unwrap();
+        drop(journal);
+
+        let reopened = DeferredAuditJournal::open(&journal_path).unwrap();
+        assert!(!probe.exists());
+        assert_eq!(reopened.spool_usage.lock().unwrap().entries, 0);
     }
 
     #[cfg(unix)]
