@@ -207,6 +207,14 @@ jobs:
       # pass above and the postgres-feature job's fully-compiled pass.
       - name: Clippy (all targets, sal — cfg-stripped doc-lint class)
         run: cargo clippy --all-targets --features sal -- -D warnings -D clippy::all -D clippy::pedantic
+      - name: Verify reviewed build-script pins and closure (#2259)
+        run: |
+          # `cargo metadata --offline` resolves the complete cross-platform
+          # graph, including target-only crates that this Linux clippy leg
+          # does not compile. Fetch the locked graph first; the verifier then
+          # remains offline and checksum-driven.
+          cargo fetch --locked
+          python3 scripts/check-build-script-vetting.py
 
   # actionlint — workflow-injection guard (#1851, audit follow-up #1855).
   # actionlint's NATIVE expression-injection check flags the #1851 class: an
