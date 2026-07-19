@@ -302,10 +302,12 @@ cognitive counterpart in the memory store itself.
   fail-CLOSED on a matched verdict. Sqlite-MCP-only (matches the
   signals/actions posture; HTTP/postgres reads out of scope).
 - **Crash-durable deferred-audit queue ([#1732](https://github.com/alphaonedev/ai-memory-mcp/issues/1732), PE-4).**
-  A `DeferredAuditJournal` (append-only, fsync-per-record shadow file)
+  A `DeferredAuditJournal` (fsync-per-record per-occurrence crash spool)
   durably journals each governance refusal before the in-memory `mpsc`
   send; `recover_deferred_audit` replays un-drained records into
-  `signed_events` at boot (idempotent on `payload_hash`). Wired into both
+  `signed_events` at boot (content-bound and idempotent on stable occurrence
+  ID, with legacy payload-hash cardinality compatibility). Spool entries are
+  acknowledged only after durable chain or DLQ residence. Wired into both
   `serve` and `mcp` boot paths.
 
 ## Other notable changes

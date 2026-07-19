@@ -100,6 +100,14 @@ const PANIC_RETRY_BACKOFF_BASE_MS: u64 = 10;
 /// persistent failure remains scheduler-friendly and operationally visible.
 const PANIC_RETRY_BACKOFF_MAX_MS: u64 = 1_000;
 
+/// Defensive upper bound for one journal frame. Refusal payloads are normally
+/// only a few KiB; bounding recovery prevents a corrupt length prefix from
+/// driving an unbounded allocation.
+const JOURNAL_MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+/// Suffix for the per-occurrence crash spool used by new-format records.
+const JOURNAL_SPOOL_SUFFIX: &str = ".spool";
+
 /// Wire-name for the deferred refusal audit row. Audit-side dashboards
 /// filter on this string to surface storage-hook refusals separate
 /// from the existing `governance.check` rows produced by the audited
@@ -353,7 +361,7 @@ impl DeferredAuditMetrics {
 /// The in-memory [`DeferredAuditQueue`] mpsc loses any submitted-but-
 /// not-yet-drained refusal on a SIGKILL (the `signed_events_dlq` only
 /// covers an append FAILURE after the drainer has the event, not the
-/// pre-drain window). This append-only journal closes that hole:
+/// pre-drain window). This journal plus per-occurrence spool closes that hole:
 /// [`DeferredAuditQueue::submit`] durably `write()+fsync`-es each event
 /// here BEFORE handing it to the live drainer, and [`recover_deferred_audit`]
 /// replays un-drained records into `signed_events` at boot.
@@ -368,13 +376,14 @@ impl DeferredAuditMetrics {
 /// (only blocking verdicts enqueue) so the per-record fsync is cheap.
 ///
 /// **Frame:** `[u32-LE payload_len][payload = DeferredAuditEvent::canonical_bytes][32-byte sha256(payload)]`.
-/// A crash mid-append leaves a torn trailing record; [`Self::replay`]
-/// detects it (short read OR sha256 mismatch) and discards the tail —
-/// the durability contract is "a record is recovered iff its full frame
-/// landed + fsync'd before the crash."
+/// New records are one atomic-create spool file per occurrence and are removed
+/// only after durable chain/DLQ residence, bounding live disk use to pending
+/// work. The original stream is replayed only for legacy records. A short
+/// trailing legacy write is ignored; complete corrupt frames fail closed.
 pub struct DeferredAuditJournal {
     path: PathBuf,
     file: Mutex<File>,
+    spool_dir: PathBuf,
 }
 
 /// Panic message when the journal mutex is poisoned (a prior holder
@@ -398,6 +407,9 @@ impl DeferredAuditJournal {
     /// Propagates the open / chmod IO error.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
+        let spool_dir = PathBuf::from(format!("{}{}", path.display(), JOURNAL_SPOOL_SUFFIX));
+        std::fs::create_dir_all(&spool_dir)
+            .with_context(|| format!("create deferred-audit spool {}", spool_dir.display()))?;
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -413,6 +425,7 @@ impl DeferredAuditJournal {
         Ok(Self {
             path,
             file: Mutex::new(file),
+            spool_dir,
         })
     }
 
@@ -426,12 +439,39 @@ impl DeferredAuditJournal {
         let payload = event
             .canonical_bytes()
             .context("journal append: canonical_bytes")?;
-        let len = u32::try_from(payload.len()).context("journal append: payload too large")?;
-        let hash = payload_hash(&payload); // raw 32-byte sha256
-        let mut frame = Vec::with_capacity(4 + payload.len() + hash.len());
-        frame.extend_from_slice(&len.to_le_bytes());
-        frame.extend_from_slice(&payload);
-        frame.extend_from_slice(&hash);
+        let frame = journal_frame(&payload)?;
+
+        if let Some(occurrence_id) = &event.occurrence_id {
+            let spool_path = self.spool_path(occurrence_id);
+            match OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&spool_path)
+            {
+                Ok(mut spool) => {
+                    spool
+                        .write_all(&frame)
+                        .context("journal spool append: write_all")?;
+                    spool.sync_all().context("journal spool append: fsync")?;
+                    self.sync_spool_dir()?;
+                    return Ok(());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let existing = std::fs::read(&spool_path)
+                        .context("journal spool append: read existing occurrence")?;
+                    if existing == frame {
+                        return Ok(());
+                    }
+                    anyhow::bail!(
+                        "journal spool occurrence-id collision at {}",
+                        spool_path.display()
+                    );
+                }
+                Err(e) => return Err(e).context("journal spool append: create occurrence"),
+            }
+        }
+
+        // Legacy records without occurrence IDs retain the v1 frame stream.
         let mut f = self.file.lock().expect(JOURNAL_MUTEX_POISONED);
         // Seek to end before writing — the handle is read+write (not
         // append-mode, for Windows truncate compatibility), and the Mutex
@@ -453,32 +493,76 @@ impl DeferredAuditJournal {
     pub fn replay(&self) -> Result<Vec<DeferredAuditEvent>> {
         let mut f = self.file.lock().expect(JOURNAL_MUTEX_POISONED);
         f.seek(SeekFrom::Start(0)).context("journal replay: seek")?;
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf).context("journal replay: read")?;
+        let mut out = replay_legacy_stream(&mut f)?;
         drop(f);
-        let mut out = Vec::new();
-        let mut off = 0usize;
-        while off + 4 <= buf.len() {
-            let len =
-                u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
-            let payload_start = off + 4;
-            let hash_start = payload_start + len;
-            let rec_end = hash_start + 32;
-            if rec_end > buf.len() {
-                break; // torn trailing record — discard tail
+
+        let mut spool_paths = std::fs::read_dir(&self.spool_dir)
+            .with_context(|| format!("journal replay: read spool {}", self.spool_dir.display()))?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "event"))
+            .collect::<Vec<_>>();
+        spool_paths.sort();
+        for path in spool_paths {
+            let metadata = std::fs::metadata(&path)
+                .with_context(|| format!("journal replay: stat {}", path.display()))?;
+            let max_frame = u64::try_from(JOURNAL_MAX_PAYLOAD_BYTES + 36).unwrap_or(u64::MAX);
+            if metadata.len() > max_frame {
+                anyhow::bail!("journal spool frame too large: {}", path.display());
             }
-            let payload = &buf[payload_start..hash_start];
-            let stored_hash = &buf[hash_start..rec_end];
-            if payload_hash(payload) != stored_hash {
-                break; // corrupt tail — discard
-            }
-            match DeferredAuditEvent::from_canonical_bytes(payload) {
-                Ok(ev) => out.push(ev),
-                Err(_) => break, // undecodable tail — discard
-            }
-            off = rec_end;
+            let frame = std::fs::read(&path)
+                .with_context(|| format!("journal replay: read {}", path.display()))?;
+            out.push(parse_complete_journal_frame(&frame).with_context(|| {
+                format!("journal replay: corrupt spool frame {}", path.display())
+            })?);
         }
         Ok(out)
+    }
+
+    /// Remove the crash-spool record for an occurrence after it is durably
+    /// represented in either `signed_events` or `signed_events_dlq`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on canonicalization, identity mismatch, removal, or
+    /// directory-fsync failure. Missing records are accepted because the live
+    /// path may be running without a successfully journaled occurrence.
+    pub fn acknowledge(&self, event: &DeferredAuditEvent) -> Result<()> {
+        let Some(occurrence_id) = &event.occurrence_id else {
+            return Ok(());
+        };
+        let spool_path = self.spool_path(occurrence_id);
+        let existing = match std::fs::read(&spool_path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).context("journal acknowledge: read occurrence"),
+        };
+        let expected = journal_frame(&event.canonical_bytes()?)?;
+        if existing != expected {
+            anyhow::bail!(
+                "journal acknowledge occurrence-id/payload collision at {}",
+                spool_path.display()
+            );
+        }
+        std::fs::remove_file(&spool_path).context("journal acknowledge: remove occurrence")?;
+        self.sync_spool_dir()
+    }
+
+    fn spool_path(&self, occurrence_id: &str) -> PathBuf {
+        let name = format!(
+            "{}.event",
+            hex::encode(payload_hash(occurrence_id.as_bytes()))
+        );
+        self.spool_dir.join(name)
+    }
+
+    fn sync_spool_dir(&self) -> Result<()> {
+        #[cfg(unix)]
+        File::open(&self.spool_dir)
+            .context("journal spool: open directory for fsync")?
+            .sync_all()
+            .context("journal spool: fsync directory")?;
+        Ok(())
     }
 
     /// Truncate the journal to empty + fsync. Called after a successful
@@ -504,10 +588,90 @@ impl DeferredAuditJournal {
     }
 }
 
+fn journal_frame(payload: &[u8]) -> Result<Vec<u8>> {
+    if payload.len() > JOURNAL_MAX_PAYLOAD_BYTES {
+        anyhow::bail!("journal payload exceeds {JOURNAL_MAX_PAYLOAD_BYTES} bytes");
+    }
+    let len = u32::try_from(payload.len()).context("journal frame: payload too large")?;
+    let hash = payload_hash(payload);
+    let mut frame = Vec::with_capacity(4 + payload.len() + hash.len());
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(payload);
+    frame.extend_from_slice(&hash);
+    Ok(frame)
+}
+
+fn replay_legacy_stream(file: &mut File) -> Result<Vec<DeferredAuditEvent>> {
+    let mut out = Vec::new();
+    let mut frame_index = 0_u64;
+    loop {
+        let mut len_bytes = [0_u8; 4];
+        let first = file
+            .read(&mut len_bytes[..1])
+            .context("journal replay: read length prefix")?;
+        if first == 0 {
+            break;
+        }
+        if !read_exact_or_torn(file, &mut len_bytes[1..])? {
+            break;
+        }
+        let len = u32::from_le_bytes(len_bytes) as usize;
+        if len > JOURNAL_MAX_PAYLOAD_BYTES {
+            anyhow::bail!("journal replay: frame {frame_index} length {len} exceeds limit");
+        }
+        let mut payload = vec![0_u8; len];
+        if !read_exact_or_torn(file, &mut payload)? {
+            break;
+        }
+        let mut stored_hash = [0_u8; 32];
+        if !read_exact_or_torn(file, &mut stored_hash)? {
+            break;
+        }
+        if payload_hash(&payload).as_slice() != stored_hash {
+            anyhow::bail!("journal replay: hash mismatch at frame {frame_index}");
+        }
+        out.push(
+            DeferredAuditEvent::from_canonical_bytes(&payload)
+                .with_context(|| format!("journal replay: decode frame {frame_index}"))?,
+        );
+        frame_index += 1;
+    }
+    Ok(out)
+}
+
+fn read_exact_or_torn(reader: &mut File, buf: &mut [u8]) -> Result<bool> {
+    match reader.read_exact(buf) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e).context("journal replay: read frame"),
+    }
+}
+
+fn parse_complete_journal_frame(frame: &[u8]) -> Result<DeferredAuditEvent> {
+    if frame.len() < 36 {
+        anyhow::bail!("journal frame is truncated");
+    }
+    let len = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+    if len > JOURNAL_MAX_PAYLOAD_BYTES {
+        anyhow::bail!("journal frame payload exceeds limit");
+    }
+    let expected_len = 4_usize
+        .checked_add(len)
+        .and_then(|n| n.checked_add(32))
+        .context("journal frame length overflow")?;
+    if frame.len() != expected_len {
+        anyhow::bail!("journal frame length mismatch");
+    }
+    let payload = &frame[4..4 + len];
+    if payload_hash(payload).as_slice() != &frame[4 + len..] {
+        anyhow::bail!("journal frame hash mismatch");
+    }
+    DeferredAuditEvent::from_canonical_bytes(payload).context("journal frame decode")
+}
+
 /// v0.8.0 PE-4 (#1732) — boot drain-on-recovery. Replays every intact
 /// record in the journal at `journal_path` into `signed_events` (via a
-/// fresh-`Connection` [`SqliteSignedEventsSink`]), then truncates the journal
-/// only when every record is proven chained. **Idempotent:** new-format
+/// fresh-`Connection` [`SqliteSignedEventsSink`]). **Idempotent:** new-format
 /// records use their stable per-submission occurrence ID. Legacy records that
 /// lack an occurrence ID use cardinality-aware payload-hash credits so two
 /// identical journal frames remain two audit occurrences.
@@ -520,20 +684,25 @@ impl DeferredAuditJournal {
 ///
 /// # Errors
 /// Propagates journal IO or DB-open errors. If any record cannot reach the
-/// chain (including a DLQ landing), the journal is retained intact for a later
-/// retry; already-chained records are skipped idempotently on that pass.
+/// chain or durable DLQ, its spool record is retained for a later retry;
+/// already-persisted records are content-checked and acknowledged.
 pub fn recover_deferred_audit(journal_path: &Path, db_path: &Path) -> Result<usize> {
     if !journal_path.exists() {
         return Ok(0);
     }
-    let journal = DeferredAuditJournal::open(journal_path)?;
+    let journal = Arc::new(DeferredAuditJournal::open(journal_path)?);
     let events = journal.replay()?;
     if events.is_empty() {
         journal.truncate()?;
         return Ok(0);
     }
     let conn = crate::db::open(db_path).context("recover_deferred_audit: open db for dedup")?;
-    let mut sink = SqliteSignedEventsSink::new(db_path);
+    let mut sink = SqliteSignedEventsSink {
+        db_path: db_path.to_path_buf(),
+        conn: None,
+        metrics: None,
+        journal: Some(Arc::clone(&journal)),
+    };
     let mut recovered = 0usize;
     let mut unresolved = false;
     let mut legacy_credits: HashMap<Vec<u8>, i64> = HashMap::new();
@@ -547,12 +716,41 @@ pub fn recover_deferred_audit(journal_path: &Path, db_path: &Path) -> Result<usi
             }
         };
         let already_chained = if let Some(occurrence_id) = &ev.occurrence_id {
-            conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM signed_events WHERE event_type = ?1 AND id = ?2)",
-                rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, occurrence_id],
-                |r| r.get::<_, bool>(0),
-            )
-            .context("recover_deferred_audit: occurrence-id dedup query")?
+            use rusqlite::OptionalExtension as _;
+            let chained_hash: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT payload_hash FROM signed_events WHERE event_type = ?1 AND id = ?2",
+                    rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, occurrence_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .context("recover_deferred_audit: occurrence-id chain query")?;
+            if let Some(existing_hash) = chained_hash {
+                if existing_hash != hash {
+                    unresolved = true;
+                    tracing::error!(%occurrence_id, "recovery occurrence-id collision in signed_events");
+                    continue;
+                }
+                journal.acknowledge(ev)?;
+                true
+            } else {
+                let dlq_hash: Option<Vec<u8>> = conn.query_row(
+                    "SELECT payload_hash FROM signed_events_dlq WHERE event_type = ?1 AND id = ?2 ORDER BY rowid DESC LIMIT 1",
+                    rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, occurrence_id],
+                    |r| r.get(0),
+                ).optional().context("recover_deferred_audit: occurrence-id DLQ query")?;
+                if let Some(existing_hash) = dlq_hash {
+                    if existing_hash != hash {
+                        unresolved = true;
+                        tracing::error!(%occurrence_id, "recovery occurrence-id collision in signed_events_dlq");
+                        continue;
+                    }
+                    journal.acknowledge(ev)?;
+                    true
+                } else {
+                    false
+                }
+            }
         } else {
             let credits = match legacy_credits.entry(hash.clone()) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -581,10 +779,9 @@ pub fn recover_deferred_audit(journal_path: &Path, db_path: &Path) -> Result<usi
         match sink.append(ev) {
             Ok(AppendOutcome::Appended) => recovered += 1,
             Ok(AppendOutcome::DlqLanded) => {
-                unresolved = true;
                 tracing::warn!(
                     occurrence_id = ?ev.occurrence_id,
-                    "recover_deferred_audit: event landed in DLQ; retaining journal for retry"
+                    "recover_deferred_audit: event durably landed in DLQ"
                 );
             }
             Err(e) => {
@@ -838,6 +1035,7 @@ pub struct SqliteSignedEventsSink {
     db_path: PathBuf,
     conn: Option<rusqlite::Connection>,
     metrics: Option<DeferredAuditMetrics>,
+    journal: Option<Arc<DeferredAuditJournal>>,
 }
 
 impl SqliteSignedEventsSink {
@@ -857,6 +1055,7 @@ impl SqliteSignedEventsSink {
             db_path: db_path.into(),
             conn: None,
             metrics: None,
+            journal: None,
         }
     }
 
@@ -869,7 +1068,28 @@ impl SqliteSignedEventsSink {
             db_path: db_path.into(),
             conn: None,
             metrics: Some(metrics),
+            journal: None,
         }
+    }
+
+    fn with_metrics_and_journal(
+        db_path: impl Into<PathBuf>,
+        metrics: DeferredAuditMetrics,
+        journal: Option<Arc<DeferredAuditJournal>>,
+    ) -> Self {
+        Self {
+            db_path: db_path.into(),
+            conn: None,
+            metrics: Some(metrics),
+            journal,
+        }
+    }
+
+    fn acknowledge(&self, event: &DeferredAuditEvent) -> Result<()> {
+        if let Some(journal) = &self.journal {
+            journal.acknowledge(event)?;
+        }
+        Ok(())
     }
 
     fn ensure_conn(&mut self) -> Result<&rusqlite::Connection> {
@@ -920,45 +1140,56 @@ impl DeferredAuditSink for SqliteSignedEventsSink {
         // New queue/journal events therefore reuse their occurrence UUID as
         // signed_events.id. Payload-hash fallback exists only for legacy
         // journal records that predate occurrence IDs.
-        let (query, identity): (&str, &dyn rusqlite::ToSql) =
-            if let Some(occurrence_id) = &event.occurrence_id {
-                (
-                    "SELECT EXISTS(SELECT 1 FROM signed_events \
-                     WHERE event_type = ?1 AND id = ?2)",
-                    occurrence_id,
+        if let Some(occurrence_id) = &event.occurrence_id {
+            use rusqlite::OptionalExtension as _;
+            let existing: Option<Vec<u8>> = self
+                .ensure_conn()?
+                .query_row(
+                    "SELECT payload_hash FROM signed_events WHERE event_type = ?1 AND id = ?2",
+                    rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, occurrence_id],
+                    |row| row.get(0),
                 )
-            } else {
-                (
-                    "SELECT EXISTS(SELECT 1 FROM signed_events \
-                     WHERE event_type = ?1 AND payload_hash = ?2)",
-                    &hash,
-                )
-            };
-        match self.ensure_conn()?.query_row(
-            query,
-            rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, identity],
-            |row| row.get::<_, bool>(0),
-        ) {
-            Ok(true) => {
-                tracing::warn!(
-                    agent_id = %event.agent_id,
-                    "deferred_audit sink: retry found the canonical event already chained; \
-                     treating the append as idempotently complete"
-                );
+                .optional()
+                .context("deferred-audit occurrence-id retry probe")?;
+            if let Some(existing) = existing {
+                if existing != hash {
+                    anyhow::bail!("deferred-audit occurrence-id collision with different payload");
+                }
+                self.acknowledge(event)?;
                 return Ok(AppendOutcome::Appended);
             }
-            Ok(false) => {}
-            Err(e) => {
-                // A damaged/mismatched table can make the dedup probe
-                // fail. Continue into the normal append path so its
-                // established failure handling can land the event in
-                // the DLQ instead of losing it at this advisory probe.
-                tracing::warn!(
-                    error = %e,
-                    agent_id = %event.agent_id,
-                    "deferred_audit sink: idempotency probe failed; continuing to \
-                     append so the normal DLQ fallback remains available"
-                );
+        } else {
+            let query = (
+                "SELECT EXISTS(SELECT 1 FROM signed_events \
+                     WHERE event_type = ?1 AND payload_hash = ?2)",
+                &hash as &dyn rusqlite::ToSql,
+            );
+            match self.ensure_conn()?.query_row(
+                query.0,
+                rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, query.1],
+                |row| row.get::<_, bool>(0),
+            ) {
+                Ok(true) => {
+                    tracing::warn!(
+                        agent_id = %event.agent_id,
+                        "deferred_audit sink: retry found the canonical event already chained; \
+                         treating the append as idempotently complete"
+                    );
+                    return Ok(AppendOutcome::Appended);
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    // A damaged/mismatched table can make the dedup probe
+                    // fail. Continue into the normal append path so its
+                    // established failure handling can land the event in
+                    // the DLQ instead of losing it at this advisory probe.
+                    tracing::warn!(
+                        error = %e,
+                        agent_id = %event.agent_id,
+                        "deferred_audit sink: idempotency probe failed; continuing to \
+                         append so the normal DLQ fallback remains available"
+                    );
+                }
             }
         }
 
@@ -1007,7 +1238,10 @@ impl SqliteSignedEventsSink {
         for attempt in 0..=APPEND_UNIQUE_RACE_MAX_RETRIES {
             let conn = self.ensure_conn()?;
             match append_signed_event(conn, &signed) {
-                Ok(()) => return Ok(AppendOutcome::Appended),
+                Ok(()) => {
+                    self.acknowledge(event)?;
+                    return Ok(AppendOutcome::Appended);
+                }
                 Err(e) => {
                     if is_unique_constraint_race(&e) && attempt < APPEND_UNIQUE_RACE_MAX_RETRIES {
                         self.bump_race_retry();
@@ -1087,6 +1321,7 @@ impl SqliteSignedEventsSink {
              event landed in signed_events_dlq (chain row NOT advanced; replay needed)"
         );
         self.bump_dlq();
+        self.acknowledge(event)?;
         Ok(AppendOutcome::DlqLanded)
     }
 }
@@ -1103,10 +1338,15 @@ impl SqliteSignedEventsSink {
 /// flip every race into a DLQ-land.
 fn is_unique_constraint_race(err: &anyhow::Error) -> bool {
     for cause in err.chain() {
-        if let Some(rusqlite::Error::SqliteFailure(code, _)) =
+        if let Some(rusqlite::Error::SqliteFailure(code, message)) =
             cause.downcast_ref::<rusqlite::Error>()
         {
-            if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE {
+            if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                && message.as_deref().is_some_and(|message| {
+                    message.contains("signed_events.sequence")
+                        || message.contains("idx_signed_events_sequence")
+                })
+            {
                 return true;
             }
         }
@@ -1472,10 +1712,15 @@ pub fn install_deferred_audit_drainer_with_journal(
     let metrics = queue.metrics();
     let db_path_buf = db_path.to_path_buf();
     let metrics_for_factory = metrics.clone();
+    let journal_for_factory = queue.journal.clone();
     let supervisor = spawn_supervised_drainer(
         receiver,
         move || {
-            SqliteSignedEventsSink::with_metrics(db_path_buf.clone(), metrics_for_factory.clone())
+            SqliteSignedEventsSink::with_metrics_and_journal(
+                db_path_buf.clone(),
+                metrics_for_factory.clone(),
+                journal_for_factory.clone(),
+            )
         },
         metrics,
         u32::MAX,
@@ -2337,6 +2582,26 @@ mod tests {
         assert_eq!(count, 1, "panic retry must not duplicate the chain row");
     }
 
+    #[test]
+    fn sqlite_sink_retry_rejects_occurrence_id_payload_collision() {
+        let dir = fresh_tempdir();
+        let db_path = dir.path().join("retry-id-collision.db");
+        let _ = crate::db::open(&db_path).expect("init db");
+        let mut sink = SqliteSignedEventsSink::new(db_path);
+        let first =
+            DeferredAuditEvent::from_refusal("agent:first", &refusal_action(), &refusal_decision())
+                .unwrap();
+        let mut collision = DeferredAuditEvent::from_refusal(
+            "agent:different",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        collision.occurrence_id.clone_from(&first.occurrence_id);
+        assert_eq!(sink.append(&first).unwrap(), AppendOutcome::Appended);
+        assert!(sink.append_retry(&collision).is_err());
+    }
+
     #[tokio::test]
     async fn sqlite_sink_lazy_open_only_on_first_append() {
         // Construct a sink against a path that doesn't exist yet; if
@@ -2413,6 +2678,24 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn journaled_installer_acknowledges_live_spool_after_durable_append() {
+        let dir = fresh_tempdir();
+        let db_path = dir.path().join("journaled-installer.db");
+        let _ = crate::db::open(&db_path).expect("init db");
+        let journal_path = deferred_audit_journal_path(&db_path);
+        let (queue, supervisor) = install_deferred_audit_drainer_with_journal(&db_path);
+        assert!(queue.submit_refusal("agent:ack", &refusal_action(), &refusal_decision()));
+        close_and_flush(queue, supervisor).await.unwrap();
+        assert!(
+            DeferredAuditJournal::open(journal_path)
+                .unwrap()
+                .replay()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // -----------------------------------------------------------------
@@ -2505,7 +2788,11 @@ mod tests {
     fn is_unique_constraint_race_classifies_correctly() {
         let unique_err = rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE),
-            Some("UNIQUE constraint failed".to_string()),
+            Some("UNIQUE constraint failed: signed_events.sequence".to_string()),
+        );
+        let id_unique_err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE),
+            Some("UNIQUE constraint failed: signed_events.id".to_string()),
         );
         let other_err = rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
@@ -2517,6 +2804,9 @@ mod tests {
             anyhow::Error::from(other_err).context("append signed_event");
         assert!(is_unique_constraint_race(&wrapped_unique));
         assert!(!is_unique_constraint_race(&wrapped_other));
+        assert!(!is_unique_constraint_race(&anyhow::Error::from(
+            id_unique_err
+        )));
 
         // Non-rusqlite errors are never UNIQUE races.
         let plain: anyhow::Error = anyhow::anyhow!("plain error");
@@ -2652,9 +2942,10 @@ mod tests {
         let dir = fresh_tempdir();
         let journal_path = dir.path().join("torn.journal");
         let journal = DeferredAuditJournal::open(&journal_path).unwrap();
-        let ev =
+        let mut ev =
             DeferredAuditEvent::from_refusal("agent:a", &refusal_action(), &refusal_decision())
                 .unwrap();
+        ev.occurrence_id = None;
         journal.append(&ev).unwrap();
         journal.append(&ev).unwrap();
         // Append a TORN frame: a u32 length header claiming 999 bytes but
@@ -2673,6 +2964,28 @@ mod tests {
             recovered.len(),
             2,
             "the 2 intact records replay; the torn trailing frame is discarded"
+        );
+    }
+
+    #[test]
+    fn journal_corrupt_complete_frame_fails_closed() {
+        let dir = fresh_tempdir();
+        let journal_path = dir.path().join("corrupt.journal");
+        let journal = DeferredAuditJournal::open(&journal_path).unwrap();
+        let mut ev =
+            DeferredAuditEvent::from_refusal("agent:a", &refusal_action(), &refusal_decision())
+                .unwrap();
+        ev.occurrence_id = None;
+        journal.append(&ev).unwrap();
+        drop(journal);
+        let mut bytes = std::fs::read(&journal_path).unwrap();
+        bytes[4] ^= 1;
+        std::fs::write(&journal_path, bytes).unwrap();
+        assert!(
+            DeferredAuditJournal::open(&journal_path)
+                .unwrap()
+                .replay()
+                .is_err()
         );
     }
 

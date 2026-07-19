@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Deferred-audit panic recovery now retains the queue receiver and retries the in-flight event** ([#2271](https://github.com/alphaonedev/ai-memory-mcp/issues/2271), v1.0.0 pre-ship flake). The supervisor owns the receiver, catches sink panics at the synchronous append boundary, rebuilds the sink, and retries the same occurrence within a bounded, scheduler-friendly restart budget. Every submission receives a stable occurrence ID reused as `signed_events.id`; retry/recovery accepts an existing ID only when its payload hash matches. New journal records use bounded per-occurrence spool files acknowledged after durable chain or DLQ residence, while corrupt complete legacy frames fail closed. SQLite retry classification is restricted to the chain sequence index.
+
 - **Direct-API SDK shims preserve vendor promise APIs and keep capture work off async event loops** ([#2253](https://github.com/alphaonedev/ai-memory-mcp/issues/2253), [#2254](https://github.com/alphaonedev/ai-memory-mcp/issues/2254), [#2255](https://github.com/alphaonedev/ai-memory-mcp/issues/2255); pre-ship 3x7 Wave-B). The TypeScript wrappers now return the original Anthropic/OpenAI `APIPromise` unchanged (retaining `.withResponse()` / `.asResponse()`) and attach non-consuming response observers; their default MCP capture transport uses ordered asynchronous child processes with timeout/output bounds instead of `spawnSync`. Python async wrappers offload both capture calls through `asyncio.to_thread`. All four READMEs now state accurately that cross-process re-run deduplication requires an explicitly stable session id; the default per-wrap UUID deduplicates only within that wrapped client.
 
 - **Erasure cold-tier sweep no longer runs under the shared HTTP request lock** (pre-ship 3x7 code battery, HIGH availability finding on [#2064](https://github.com/alphaonedev/ai-memory-mcp/issues/2064)). The daemon gc loop ran the #2064 erasure cold-tier sweep (`archive_sync::gc_tick` — up to `SWEEP_LIMIT_PER_TICK`=256 Reed-Solomon encodes + per-shard fsyncs, plus the reconcile/scrub pass) while holding the ONE global `Db = Arc<Mutex<(Connection, …)>>` every HTTP handler serializes on, so with `AI_MEMORY_ERASURE_COLD_TIER` enabled a draining backlog stalled the ENTIRE API for seconds-to-tens-of-seconds every gc tick. The sweep now runs on a **dedicated connection** opened from the daemon's stored DB path, inside `tokio::task::spawn_blocking`, AFTER the in-lock gc section drops the handler mutex (`archive_sync::gc_tick_detached`; the join is awaited so two sweeps of one store can never overlap — the keyset frontier + rotating reconcile cursor are single-sweeper state). Sound because the sweep is DB-READ-ONLY (bundle files are its only writes) and cross-connection concurrency with the purge/restore funnels is the already-supported regime (a CLI purge runs on its own connection against a live daemon); the #2213 invariants — purge-intent journal BEFORE `DELETE`, quarantine-not-destroy for un-journaled rowless bundles, the #2225 poison skip-set — are untouched (only WHERE the sweep's connection comes from changes; the process-static sweep state is keyed by store directory, which resolves identically). FAIL-CLOSED fallback: non-file-backed databases (`:memory:` / `mode=memory`, where a fresh connection would open a DIFFERENT empty database and the detached reconciler would mis-classify every live bundle as rowless) stay on the legacy under-lock tick via `archive_sync::is_in_memory_db_path`. Regression coverage: `tests/erasure_cold_tier_2064.rs::{detached_sweep_completes_while_handler_mutex_is_held, detached_sweep_refuses_non_file_backed_paths, gc_loop_runs_detached_erasure_arm_for_file_backed_db}`. No new MCP tool / HTTP route / CLI subcommand / DB migration — no SSOT-count move.
@@ -1440,21 +1442,22 @@ lifecycle surface adds only permissive optional fields to the existing
   `mpsc`: a SIGKILL before the supervised drainer processed a submitted
   governance refusal LOST it (`signed_events_dlq` only covers an append
   FAILURE after the drainer has the event, not the pre-drain window). Added
-  a `DeferredAuditJournal` — an append-only, fsync-per-record shadow file
+  a `DeferredAuditJournal` — an fsync-per-record crash spool
   (`<db>.deferred-audit.journal`, mode 0600; frame =
   `[u32-LE len][canonical_bytes][32-byte sha256]`). `DeferredAuditQueue::submit`
   now durably journals each refusal BEFORE the mpsc send, and
   `recover_deferred_audit` replays un-drained records into `signed_events`
-  at boot (then truncates). Design via the deterministic **5-agent vote
+  at boot. New records have stable occurrence IDs and one bounded spool file
+  per pending occurrence, acknowledged after durable chain/DLQ residence;
+  legacy stream records retain cardinality-aware recovery. Design via the deterministic **5-agent vote
   (4d3ea1c5)** (tripped T4 on-disk format): a journal **file** was chosen
   over a sqlite pending-table because `submit` fires inside `storage::insert`
   holding the substrate's `BEGIN IMMEDIATE` write lock — a second connection
   writing the same DB would self-deadlock; a raw file append touches no
-  `Connection`. Replay is **idempotent** (dedup on the deterministic
-  `payload_hash`, since the sink stamps a random `id`) so a crash between the
+  `Connection`. Replay is **idempotent and content-bound** on occurrence ID so a crash between the
   pre-crash drainer's append and the SIGKILL never double-appends the hash
-  chain; a torn trailing frame (crash mid-append) is detected (short-read or
-  sha256 mismatch) and discarded. Boot recovery is **replay-all-then-go-live**,
+  chain; a short trailing legacy write is ignored while a complete hash or
+  decode failure aborts recovery without deleting evidence. Boot recovery is **replay-all-then-go-live**,
   wired into BOTH the `serve` and `mcp` boot paths (the MCP stdio path has no
   shutdown drain, so durability + boot recovery is its only safety net).
   Tests pin crash-recovery, torn-record-discard, and idempotent-replay.
