@@ -94,6 +94,21 @@
 //!     Mirrors `test_secret_not_in_capabilities` for the embeddings
 //!     sibling of the LLM key.
 //!
+//! 11. **`test_vectorlite_extension_env_falls_through_to_default_backend_2256`**
+//!     (#2256; the #1860/#2219 knob) — `AI_MEMORY_VECTORLITE_EXTENSION`
+//!     selects the opt-in vectorlite ANN backend. It is a pure runtime
+//!     env knob (no CLI flag, no `config.toml` binding), so the ladder
+//!     collapses to `env > compiled default backend`, resolved through
+//!     the boot funnel `hnsw::boxed_configured_index`. In the DEFAULT
+//!     build the OFF-by-default `vectorlite` cargo feature is not
+//!     compiled, so the env is INERT — setting it can never hand back a
+//!     broken or non-default index (fail-closed: a derived-artifact
+//!     selector never risks the durable path). A feature-gated arm
+//!     (runs only in the `--features vectorlite` CI leg, #2257) pins the
+//!     actual env-resolution ladder through `vectorlite::from_env`:
+//!     unset / empty / bogus-path all resolve `None` (the compiled
+//!     default backend), degrade never corrupt.
+//!
 //! All tests serialize env mutation through the shared `ENV_LOCK`: the
 //! single-key tests via [`EnvVarGuard`], and the multi-key `[limits]`
 //! tests via [`MultiEnvVarGuard`] (which acquires the non-reentrant
@@ -1323,5 +1338,98 @@ fn test_m2_tls_escape_hatch_envs_default_and_parse_2032() {
             want,
             "AI_MEMORY_REQUIRE_TLS={val:?} must resolve to {want}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 11. AI_MEMORY_VECTORLITE_EXTENSION — opt-in vectorlite ANN backend selector
+//     (#2256; the #1860/#2219 knob). Pure runtime env knob (no CLI flag, no
+//     config.toml binding): the ladder collapses to `env > compiled default
+//     backend`, resolved through the boot funnel `hnsw::boxed_configured_index`.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_vectorlite_extension_env_falls_through_to_default_backend_2256() {
+    use ai_memory::hnsw::boxed_configured_index;
+
+    // The knob const lives in the feature-gated `ai_memory::vectorlite`
+    // module, so the DEFAULT build cannot name the symbol — use the wire
+    // string literal (the SSOT is `vectorlite::VECTORLITE_EXTENSION_ENV`,
+    // pinned end-to-end by the feature-gated arm below).
+    const VECTORLITE_EXTENSION_ENV: &str = "AI_MEMORY_VECTORLITE_EXTENSION";
+
+    // ---- Default build: env is INERT (feature not compiled) ----
+    // Setting a bogus path can never hand back a broken or non-default
+    // index — the funnel is hard-wired to the compiled default backend and
+    // the env knob is a no-op. Degrade, never corrupt.
+    {
+        let _guard = EnvVarGuard::set(
+            VECTORLITE_EXTENSION_ENV,
+            "/nonexistent/dir/vectorlite.so".to_string(),
+        );
+        let idx = boxed_configured_index(0, false);
+        assert!(
+            idx.is_empty(),
+            "funnel must return a fresh default index regardless of the env var"
+        );
+        idx.insert("a".into(), vec![1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(idx.len(), 1, "the returned index must be fully functional");
+        let hits = idx.search(&[1.0, 0.0, 0.0, 0.0], 1, None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "a");
+    }
+
+    // ---- Compiled-default half: env UNSET yields the same functional
+    //      default backend ----
+    {
+        let _unset = EnvVarGuard::remove(VECTORLITE_EXTENSION_ENV);
+        let idx = boxed_configured_index(0, false);
+        assert!(idx.is_empty(), "unset env → default backend");
+    }
+
+    // ---- Feature-gated arm — pins the ACTUAL env-resolution ladder
+    //      (`env > compiled default backend`) through `vectorlite::from_env`.
+    //      Runs only in the `--features vectorlite` CI leg (#2257). ----
+    #[cfg(feature = "vectorlite")]
+    {
+        use ai_memory::vectorlite::{VECTORLITE_EXTENSION_ENV as ENV_CONST, from_env};
+
+        // The wire-string literal above must equal the SSOT const.
+        assert_eq!(
+            VECTORLITE_EXTENSION_ENV, ENV_CONST,
+            "the config_precedence pin string must track the vectorlite SSOT const"
+        );
+
+        // env set to a bogus path → fail-closed → None (default backend).
+        {
+            let _bogus = EnvVarGuard::set(ENV_CONST, "/nonexistent/dir/vectorlite.so".to_string());
+            assert!(
+                from_env(0, false).is_none(),
+                "a bogus extension path must fail closed to the default backend"
+            );
+        }
+        // env set to a real-but-not-an-extension file → fail-closed → None.
+        {
+            let _bad = EnvVarGuard::set(ENV_CONST, "Cargo.toml".to_string());
+            assert!(
+                from_env(0, false).is_none(),
+                "a non-extension file must fail closed to the default backend"
+            );
+        }
+        // env unset → None (compiled default).
+        {
+            let _off = EnvVarGuard::remove(ENV_CONST);
+            assert!(
+                from_env(0, false).is_none(),
+                "unset env must resolve to the default backend"
+            );
+        }
+        // env empty / whitespace → None (trimmed to empty → default).
+        {
+            let _empty = EnvVarGuard::set(ENV_CONST, "   ".to_string());
+            assert!(
+                from_env(0, false).is_none(),
+                "empty/whitespace env must resolve to the default backend"
+            );
+        }
     }
 }
