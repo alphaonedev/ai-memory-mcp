@@ -141,6 +141,47 @@ def test_async_records_user_then_assistant(monkeypatch: pytest.MonkeyPatch) -> N
     assert [c["role"] for c in recorded] == ["user", "assistant"]
 
 
+def test_async_capture_does_not_block_event_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_capture(**_kwargs: object) -> bool:
+        started.set()
+        return release.wait(0.5)
+
+    monkeypatch.setattr(shim_mod, "capture_turn", slow_capture)
+
+    class _AsyncCompletions:
+        async def create(self, **_kwargs: object) -> object:
+            return _text_response()
+
+    class _AsyncChat:
+        def __init__(self) -> None:
+            self.completions = _AsyncCompletions()
+
+    class _AsyncClient:
+        def __init__(self) -> None:
+            self.chat = _AsyncChat()
+
+    async def _drive() -> None:
+        task = asyncio.create_task(
+            wrap(_AsyncClient()).chat.completions.create(
+                messages=[{"role": "user", "content": "loop stays live"}]
+            )
+        )
+        while not started.is_set():
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.01)
+        assert not task.done(), "capture must be waiting in a worker, not blocking the loop"
+        release.set()
+        await task
+
+    asyncio.run(_drive())
+
+
 # --------------------------------------------------------------------------- #
 # Opt-in real legs (skipped by default)
 # --------------------------------------------------------------------------- #

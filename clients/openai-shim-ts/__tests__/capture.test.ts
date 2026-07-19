@@ -14,7 +14,7 @@ import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { captureTurn } from "../src/index.ts";
+import { captureTurn, captureTurnAsync } from "../src/index.ts";
 
 const POSIX = process.platform !== "win32";
 
@@ -43,6 +43,28 @@ test(
   () => {
     const bin = fakeSubstrate('{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"boom"}}');
     assert.equal(call(bin), false);
+  },
+);
+
+test(
+  "async capture leaves the event loop responsive",
+  { skip: POSIX ? false : "posix-only fake-substrate test" },
+  async () => {
+    const bin = fakeSubstrate('{"jsonrpc":"2.0","id":2,"result":{"content":[]}}');
+    const pending = captureTurnAsync({
+      hostSessionId: "s",
+      hostTurnIndex: 0,
+      role: "user",
+      content: "x",
+      aiMemoryBin: bin,
+    });
+    let ticked = false;
+    await new Promise<void>((resolve) => setImmediate(() => {
+      ticked = true;
+      resolve();
+    }));
+    assert.equal(ticked, true, "spawn transport must yield to other callbacks");
+    assert.equal(await pending, true);
   },
 );
 
