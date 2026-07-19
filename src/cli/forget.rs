@@ -141,6 +141,7 @@ mod tests {
             None,
             None,
             None,
+            None, // #1834 valid_at (no as-of)
         )
         .unwrap();
         assert_eq!(still.len(), 1);
@@ -230,6 +231,7 @@ mod tests {
             None,
             None,
             None,
+            None, // #1834 valid_at (no as-of)
         )
         .unwrap();
         assert_eq!(beta_apples.len(), 1);

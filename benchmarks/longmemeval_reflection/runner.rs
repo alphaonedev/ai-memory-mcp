@@ -657,6 +657,7 @@ where
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )?;
     let reflections: Vec<&Memory> = all_in_ns
         .iter()
@@ -784,6 +785,8 @@ where
         let now = Utc::now().to_rfc3339();
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: scenario_d1.namespace.clone(),

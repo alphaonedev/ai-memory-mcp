@@ -71,6 +71,8 @@ fn pg_mem(id: &str, ns: &str, title: &str, agent_id: &str, why_trace: Option<&st
         confidence_decayed_at: None,
         version: 1,
         lifecycle_state: ai_memory::models::LifecycleState::Open,
+        valid_from: None,
+        valid_until: None,
         cid: None,
     }
 }

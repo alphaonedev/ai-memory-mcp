@@ -416,6 +416,7 @@ fn form_5_fields_round_trip_through_storage_layer() {
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .expect("list");
     let back = rows.into_iter().find(|m| m.id == id).expect("found");
@@ -1185,6 +1186,7 @@ fn recall_output_byte_identical_around_1706_shadow_sweep() {
             false,
             None,
             None,
+            None, // #1834 valid_at
         )
         .expect("recall")
         .0

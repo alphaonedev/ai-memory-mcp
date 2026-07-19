@@ -29,6 +29,11 @@ pub struct ListRequest {
     #[serde(default)]
     pub agent_id: Option<String>,
 
+    /// #1834 claim-bitemporal as-of: RFC3339 point in valid-time. Returns only
+    /// claims asserted to hold at this instant (valid_from/valid_until window).
+    #[serde(default)]
+    pub valid_at: Option<String>,
+
     /// Response format.
     #[serde(default)]
     pub format: Option<String>,
@@ -92,6 +97,13 @@ pub(super) fn handle_list(
     if let Some(aid) = agent_id {
         validate::validate_agent_id(aid).map_err(|e| e.to_string())?;
     }
+    // v1.0.0 #1834 — claim-bitemporal AS-OF; RFC3339-validate at this entry
+    // surface so a malformed value is a clear error, not a silent lexicographic
+    // mis-filter.
+    let valid_at = params["valid_at"].as_str();
+    if let Some(v) = valid_at {
+        validate::validate_valid_at(v).map_err(|e| e.to_string())?;
+    }
 
     let results = db::list(
         conn,
@@ -104,6 +116,7 @@ pub(super) fn handle_list(
         None,
         None,
         agent_id,
+        valid_at,
     )
     .map_err(|e| e.to_string())?;
     let results = match caller {
@@ -137,6 +150,8 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier,
             namespace: ns.to_string(),

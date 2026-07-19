@@ -882,6 +882,22 @@ pub fn validate_source_uri(s: &str) -> Result<()> {
     }
 }
 
+/// v1.0.0 #1834 — validate a claim-bitemporal AS-OF (`valid_at`) recall/list
+/// query parameter. The value is compared LEXICOGRAPHICALLY against the stored
+/// RFC3339 `valid_from`/`valid_until` bounds, so a non-RFC3339 string would
+/// silently mis-filter rather than error. Reject it at the entry surfaces
+/// (HTTP recall/list handlers, MCP tools, CLI) so a malformed as-of is a clear
+/// `400`/typed error, not a wrong-but-successful result set.
+///
+/// # Errors
+/// Returns an error when `valid_at` is not a parseable RFC3339 timestamp.
+pub fn validate_valid_at(valid_at: &str) -> Result<()> {
+    if !is_valid_rfc3339(valid_at) {
+        bail!("valid_at must be an RFC3339 timestamp (e.g. 2026-01-01T00:00:00Z)");
+    }
+    Ok(())
+}
+
 /// v0.7.0 Form 4 (issue #757) — validate a [`SourceSpan`] byte-range.
 ///
 /// Requires `start < end` and bounds both values within
@@ -1148,6 +1164,10 @@ pub fn validate_update(update: &UpdateMemory) -> Result<()> {
     }
     if let Some(ref uri) = update.source_uri {
         validate_source_uri(uri)?;
+    }
+    // v1.0.0 #1834 — reject a malformed claim-bitemporal valid_until up front.
+    if let Some(ref v) = update.valid_until {
+        validate_valid_at(v)?;
     }
     // #1726 — reject an unparseable lifecycle_state target up front (naming
     // the valid set); transition legality is enforced in the update path.

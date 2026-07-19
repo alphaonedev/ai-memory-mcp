@@ -102,8 +102,10 @@ fn v064_era_memory(id: &str, tier: Tier, namespace: &str, title: &str, body: &st
 /// v0.6.x columns an end user cares about. Equality of two fingerprints
 /// across a migration boundary == lossless for those columns.
 fn memory_fingerprint(conn: &Connection) -> Vec<(String, String, String, String, String, i32)> {
-    let mut rows = db::list(conn, None, None, 10_000, 0, None, None, None, None, None)
-        .expect("list all memories");
+    let mut rows = db::list(
+        conn, None, None, 10_000, 0, None, None, None, None, None, None,
+    )
+    .expect("list all memories");
     rows.sort_by(|a, b| a.id.cmp(&b.id));
     rows.into_iter()
         .map(|m| {
