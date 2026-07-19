@@ -21,6 +21,7 @@ Design (issue #1974's sibling, #1390; 5-agent vote 4d3ea1c5):
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
 import itertools
 import sys
@@ -112,10 +113,12 @@ class _AsyncMessagesProxy:
         return getattr(self._inner, name)
 
     async def create(self, *args: Any, **kwargs: Any) -> Any:
-        self._rec.record_request(kwargs)
+        # The capture transport performs a subprocess handshake; keep it off
+        # the caller's asyncio event loop (#2254).
+        await asyncio.to_thread(self._rec.record_request, kwargs)
         response = await self._inner.create(*args, **kwargs)
         if not kwargs.get("stream"):
-            self._rec.record_response(response)
+            await asyncio.to_thread(self._rec.record_response, response)
         return response
 
 

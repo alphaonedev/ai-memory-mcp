@@ -59,8 +59,10 @@ client = wrap(
 - **Streaming.** A `stream=True` call records the request turn and passes the
   stream through untouched (consuming it to record the reply would break
   passthrough).
-- **Idempotent.** Turns dedup on `host_session_id` + `host_turn_index`, so a
-  re-run does not duplicate memories.
+- **Idempotent with a stable session id.** Turns dedup on `host_session_id` +
+  `host_turn_index`. The default per-wrap UUID deduplicates only within that
+  wrapped client; pass a stable `host_session_id` (as above) to deduplicate
+  across process re-runs.
 
 ## Tests
 

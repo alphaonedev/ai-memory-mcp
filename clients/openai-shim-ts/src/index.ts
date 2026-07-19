@@ -18,12 +18,13 @@
  * `openai` is a PEER dependency — bring your own client. The shim is
  * non-wedging: a capture failure never disturbs your LLM call.
  */
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 
 const DEFAULT_BIN = "ai-memory";
 const CALL_ID = 2;
 const TIMEOUT_MS = 30_000;
+const MAX_CAPTURE_STDOUT_BYTES = 1_048_576;
 const HOST_KIND = "openai-sdk";
 
 // --------------------------------------------------------------------------- //
@@ -132,6 +133,67 @@ export function captureTurn(p: CaptureTurnParams): boolean {
   return true;
 }
 
+/** Async capture transport used by wrapped clients so Node's event loop never blocks. */
+export function captureTurnAsync(p: CaptureTurnParams): Promise<boolean> {
+  const bin = p.aiMemoryBin ?? process.env.AI_MEMORY_BIN ?? DEFAULT_BIN;
+  const frames = buildFrames(buildRequest(p));
+  return new Promise((resolve) => {
+    let stdout = "";
+    let settled = false;
+    const finish = (ok: boolean): void => {
+      if (!settled) {
+        settled = true;
+        resolve(ok);
+      }
+    };
+    const child = spawn(bin, ["mcp", "--profile", "full"], {
+      stdio: ["pipe", "pipe", "ignore"],
+    });
+    const timer = setTimeout(() => {
+      child.kill();
+      warn("capture timed out");
+      finish(false);
+    }, TIMEOUT_MS);
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+      if (stdout.length > MAX_CAPTURE_STDOUT_BYTES) {
+        child.kill();
+        warn("capture output exceeded 1 MiB");
+        finish(false);
+      }
+    });
+    child.stdin.on("error", (e) => {
+      clearTimeout(timer);
+      warn(`capture stdin failed: ${e.message}`);
+      finish(false);
+    });
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      warn(`capture spawn failed: ${e.message}`);
+      finish(false);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (settled) return;
+      if (code !== 0) {
+        warn(`substrate exited ${String(code)}`);
+        finish(false);
+        return;
+      }
+      const resp = pickCallResponse(stdout);
+      const inner = resp?.result as Record<string, unknown> | undefined;
+      if (!resp || resp.error != null || (inner && inner.isError === true)) {
+        warn("substrate returned a failed capture response");
+        finish(false);
+        return;
+      }
+      finish(true);
+    });
+    child.stdin.end(frames);
+  });
+}
+
 // --------------------------------------------------------------------------- //
 // Extraction seam (OpenAI Chat Completions shape; pinned by recorded cassettes)
 // --------------------------------------------------------------------------- //
@@ -200,7 +262,7 @@ export function extractResponseText(response: unknown): string {
 // Delegating proxy (chat.completions.create nesting)
 // --------------------------------------------------------------------------- //
 
-export type CaptureFn = (p: CaptureTurnParams) => boolean;
+export type CaptureFn = (p: CaptureTurnParams) => boolean | Promise<boolean>;
 
 export interface WrapOptions {
   hostSessionId?: string;
@@ -215,6 +277,7 @@ class Recorder {
   private readonly opts: WrapOptions;
   private readonly sessionId: string;
   private counter = 0;
+  private captureTail: Promise<void> = Promise.resolve();
 
   constructor(opts: WrapOptions) {
     this.opts = opts;
@@ -224,8 +287,7 @@ class Recorder {
   private record(role: string, content: string): void {
     if (!content) return;
     try {
-      const cap = this.opts.captureFn ?? captureTurn;
-      cap({
+      const params = {
         hostSessionId: this.sessionId,
         hostTurnIndex: this.counter++,
         role,
@@ -233,7 +295,18 @@ class Recorder {
         namespace: this.opts.namespace,
         hostKind: this.opts.hostKind ?? HOST_KIND,
         aiMemoryBin: this.opts.aiMemoryBin,
-      });
+      };
+      if (this.opts.captureFn) {
+        const outcome = this.opts.captureFn(params);
+        if (outcome instanceof Promise) {
+          void outcome.catch((e) => warn(`record failed: ${String(e)}`));
+        }
+      } else {
+        // Preserve request/response ordering without blocking the event loop.
+        this.captureTail = this.captureTail
+          .then(() => captureTurnAsync(params))
+          .then(() => undefined, (e) => warn(`record failed: ${String(e)}`));
+      }
     } catch (e) {
       warn(`record failed: ${String(e)}`);
     }
@@ -266,10 +339,13 @@ function wrapCompletions(inner: unknown, rec: Recorder): unknown {
           rec.recordRequest(kwargs);
           const result = (target as Record<string, (...a: unknown[]) => unknown>).create(...args);
           if (kwargs.stream) return result; // stream: request-only, pass through
-          return Promise.resolve(result).then((resp: unknown) => {
-            rec.recordResponse(resp);
-            return resp;
-          });
+          // Observe completion without replacing the vendor APIPromise: callers
+          // retain `.withResponse()` / `.asResponse()` and every future member.
+          void Promise.resolve(result).then(
+            (resp: unknown) => rec.recordResponse(resp),
+            () => {},
+          );
+          return result;
         };
       }
       return Reflect.get(target, prop, receiver);

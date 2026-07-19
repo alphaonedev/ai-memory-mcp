@@ -56,7 +56,10 @@ const client = wrap(new Anthropic(), {
 - **Opaque / pass-through.** Arguments and responses are forwarded verbatim.
 - **Streaming.** A `stream: true` call records the request turn and passes the
   stream through untouched.
-- **Idempotent.** Turns dedup on `hostSessionId` + `hostTurnIndex`.
+- **Idempotent with a stable session id.** Turns dedup on `hostSessionId` +
+  `hostTurnIndex`. The default per-wrap UUID deduplicates only within that
+  wrapped client; pass a stable `hostSessionId` (as above) to deduplicate
+  across process re-runs.
 
 ## Tests
 
