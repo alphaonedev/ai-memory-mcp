@@ -428,6 +428,19 @@ impl ErasureStore {
         validate_bundle_id(id).is_ok() && self.journal_dir().join(id).is_file()
     }
 
+    /// Age (seconds) of a purge-intent marker, i.e. how long ago the intent
+    /// was journaled. `None` when the marker is absent/unreadable. Used to
+    /// distinguish a STALE marker from an ABORTED purge (row still present,
+    /// marker old) from a concurrent in-flight purge (marker fresh) — #2064 R5.
+    #[must_use]
+    pub fn purge_intent_age_secs(&self, id: &str) -> Option<u64> {
+        if validate_bundle_id(id).is_err() {
+            return None;
+        }
+        let meta = std::fs::metadata(self.journal_dir().join(id)).ok()?;
+        meta.modified().ok()?.elapsed().ok().map(|d| d.as_secs())
+    }
+
     /// Clear a purge-intent marker once its bundle is confirmed gone (the
     /// happy-path purge removed the bundle, or the reconciler reaped it).
     /// Best-effort — a lingering marker is compacted by

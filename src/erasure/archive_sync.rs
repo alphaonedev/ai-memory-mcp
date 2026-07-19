@@ -567,6 +567,10 @@ pub struct ReconcileReport {
     pub temp_reaped: usize,
     /// Vestigial purge-intent journal markers compacted (bundle already gone).
     pub journal_compacted: usize,
+    /// Stale purge-intent markers cleared for a row that STILL EXISTS (an
+    /// aborted purge) so a later genuine DB loss of that id is quarantined,
+    /// not hard-reaped on a delayed fuse (R5).
+    pub stale_intent_cleared: usize,
     /// Current bundles hash-verified by the scrub lane.
     pub scrub_verified: usize,
     /// Torn/degraded bundles re-minted from the durable archived row.
@@ -708,14 +712,38 @@ pub fn reconcile_and_scrub(
     for offset in 0..scan_limit.min(n) {
         let id = &ids[(start + offset) % n];
         report.scanned += 1;
-        if row_exists(conn, ARCHIVED_TABLE, id) {
-            scrub_candidates.push(id.clone());
-            continue;
-        }
-        if row_exists(conn, MEMORIES_TABLE, id) {
-            // Stale-but-protected: a live row still owns this id (a restore
-            // moved it back). The restore path removes the bundle directly;
-            // never reap a live row's snapshot on a transient read race.
+        let archived = row_exists(conn, ARCHIVED_TABLE, id);
+        let live = !archived && row_exists(conn, MEMORIES_TABLE, id);
+        if archived || live {
+            // R5 — a purge-intent marker for a row that STILL EXISTS past the
+            // grace window is STALE (from an ABORTED purge whose `DELETE`
+            // failed — a completed purge deletes the row). Left in place it
+            // would later convert a GENUINE partial DB loss of this id into a
+            // hard-reap of the last copy (the forbidden direction, on a delayed
+            // fuse). Clear it: a real purge re-journals, and the age gate skips
+            // a concurrent in-flight purge (whose failure mode is quarantine —
+            // safe — anyway).
+            if store.is_purge_intended(id)
+                && store
+                    .purge_intent_age_secs(id)
+                    .is_some_and(|a| a >= grace_secs)
+            {
+                store.clear_purge_intent(id);
+                report.stale_intent_cleared += 1;
+                tracing::warn!(
+                    target: ERASURE_TRACE_TARGET,
+                    bundle_id = %id,
+                    "erasure cold tier: cleared STALE purge-intent marker for a row that still \
+                     exists (aborted purge) — a real purge re-journals"
+                );
+            }
+            // A live-but-not-archived row owns this id (a restore moved it
+            // back); the restore path removes the bundle directly, so never
+            // reap a live row's snapshot on a transient read race. An archived
+            // row makes the bundle a scrub candidate.
+            if archived {
+                scrub_candidates.push(id.clone());
+            }
             continue;
         }
         // Rowless. The grace window (from MINT time) holds the reaper off an

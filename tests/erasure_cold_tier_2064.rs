@@ -440,6 +440,60 @@ fn unjournaled_dbloss_bundle_is_quarantined_not_destroyed_and_recoverable() {
 }
 
 #[test]
+fn aborted_purge_stale_marker_is_cleared_so_later_dbloss_quarantines() {
+    // R5 — a purge that JOURNALED intent then had its `DELETE` abort
+    // (SQLITE_BUSY / IO) leaves a stale marker while the row + bundle survive.
+    // compact_purge_journal can't clear it (the bundle still exists). Left in
+    // place, a LATER genuine DB loss of that id would be hard-reaped (the
+    // forbidden direction, on a delayed fuse). The reconciler must clear a
+    // stale marker (row present + journaled + past grace); a subsequent DB
+    // loss then QUARANTINES (safe), not reaps.
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    seed_archived(&f.conn, "row-aborted", "survives an aborted purge", None);
+    archive_sync::gc_tick(&f.conn).expect("sweep");
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+
+    // Aborted purge: intent journaled, but the DELETE failed so the archived
+    // row + its bundle both still exist.
+    archive_sync::journal_purge_intent_best_effort(&f.conn, &["row-aborted".to_string()]);
+    assert!(
+        store.is_purge_intended("row-aborted"),
+        "intent marker present"
+    );
+
+    // Reconcile (grace 0): the row still exists → the stale marker is cleared.
+    let rr = archive_sync::reconcile_and_scrub(&f.conn, &store, 512, 16, 0);
+    assert_eq!(
+        rr.stale_intent_cleared, 1,
+        "stale marker on a surviving row is cleared"
+    );
+    assert!(
+        !store.is_purge_intended("row-aborted"),
+        "the stale intent marker is gone"
+    );
+
+    // A GENUINE later DB loss of the same id must QUARANTINE (preserve), not
+    // hard-reap — the delayed-fuse direction is closed.
+    drop_archived_row(&f.conn, "row-aborted");
+    let rr2 = archive_sync::reconcile_and_scrub(&f.conn, &store, 512, 16, 0);
+    assert_eq!(
+        rr2.quarantined, 1,
+        "a later DB loss quarantines (not hard-reaped) once the stale marker is gone"
+    );
+    assert_eq!(
+        rr2.orphans_reaped, 0,
+        "no destruction — the marker was cleared"
+    );
+    enable(false);
+}
+
+#[test]
 fn re_archived_row_rebundles_on_stamp_change() {
     // F5 — the `bundle_is_current` mismatch path: a row whose `archived_at`
     // differs from its bundle's recorded stamp (a re-archive) is re-bundled.
