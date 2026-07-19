@@ -289,6 +289,21 @@ e2e = []
 # Linux-only journald sink, avoiding the operator-gated dep additions of the
 # original #1765). cfg(feature) consumer: `src/logging.rs` (arch-11 audit).
 syslog = []
+# v1.0.0 #1860 — OPT-IN vectorlite ANN backend scaffolding. OFF by
+# default and deliberately NOT in any CI job or release channel: the
+# vectorlite native library (an Apache-2.0 C++ SQLite loadable
+# extension; NO Rust crate exists — the crates.io `vectorlite` name is
+# an unrelated project) cannot be acquired reproducibly across the
+# 3-OS CI matrix + 5 release channels, which is the plan-killer #1860
+# itself documents. This feature adds ZERO build-time acquisition: it
+# only enables rusqlite's `load_extension` API (still bundled SQLite)
+# and compiles `src/vectorlite.rs`, which loads an OPERATOR-ACQUIRED
+# extension binary at runtime from AI_MEMORY_VECTORLITE_EXTENSION
+# (see scripts/fetch-vectorlite.sh) and FAILS CLOSED to the default
+# pure-Rust HNSW backend on any load/smoke failure. cfg(feature)
+# consumers: `src/vectorlite.rs`, `src/lib.rs`, `src/hnsw.rs`,
+# `tests/vectorlite_1860.rs` (arch-11 audit).
+vectorlite = ["rusqlite/load_extension"]
 
 [dev-dependencies]
 proptest = "1"
