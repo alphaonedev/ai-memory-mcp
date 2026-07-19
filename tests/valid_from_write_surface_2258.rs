@@ -480,3 +480,160 @@ async fn http_store_rejects_malformed_valid_from() {
         "malformed valid_from on the HTTP surface must 400, not silently store"
     );
 }
+
+// ---------------------------------------------------------------------------
+// HTTP `POST /api/v1/memories/bulk` — the FOURTH write funnel (#2258 audit).
+// bulk_create consumes the same extended CreateMemory DTO + runs
+// validate_create per row, so it now REJECTS a malformed bound; before the
+// fix it then hardcoded valid_from/valid_until = None at BOTH build sites,
+// silently dropping a valid caller value (the exact #2258 failure mode).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn http_bulk_store_valid_from_round_trips() {
+    permissive_attestation();
+    let (router, f) = build_router_fixture();
+    let ns = "vf-http-bulk";
+    let title = "http-bulk-bitemporal-claim";
+
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/api/v1/memories/bulk",
+        Some(serde_json::json!([{
+            "title": title,
+            "content": "http bulk bitemporal claim body long enough to read as prose.",
+            "namespace": ns,
+            "tier": "long",
+            "valid_from": T_JAN,
+            "valid_until": T_SEP,
+        }])),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "POST /memories/bulk with valid_from/valid_until must 200; body={body}"
+    );
+    assert_eq!(
+        body.get("created").and_then(serde_json::Value::as_u64),
+        Some(1),
+        "the one bulk row must have been created; body={body}"
+    );
+
+    let conn = ai_memory::db::open(f.path()).expect("reopen shared db");
+    let (vf, vu) = stored_bounds(&conn, ns, title);
+    assert_same_instant(&vf.expect("valid_from persisted"), T_JAN);
+    assert_same_instant(&vu.expect("valid_until persisted"), T_SEP);
+}
+
+#[tokio::test]
+async fn http_bulk_store_rejects_malformed_valid_from() {
+    permissive_attestation();
+    let (router, f) = build_router_fixture();
+    let ns = "vf-http-bulk-bad";
+    let title = "http-bulk-bad-valid-from";
+
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/api/v1/memories/bulk",
+        Some(serde_json::json!([{
+            "title": title,
+            "content": "http bulk body long enough to satisfy the content validator.",
+            "namespace": ns,
+            "valid_from": "not-a-timestamp",
+        }])),
+    )
+    .await;
+    // Per-row validate_create failure skips the row into `errors[]` (never a
+    // silent store), so `created` is 0 and the row does not persist.
+    assert_eq!(status, StatusCode::OK, "bulk envelope is 200; body={body}");
+    assert_eq!(
+        body.get("created").and_then(serde_json::Value::as_u64),
+        Some(0),
+        "a malformed-bound bulk row must NOT be created; body={body}"
+    );
+    let conn = ai_memory::db::open(f.path()).expect("reopen shared db");
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE namespace = ?1 AND title = ?2",
+            params![ns, title],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert_eq!(count, 0, "the rejected bulk row must not persist");
+}
+
+// ---------------------------------------------------------------------------
+// Interval-sanity disposition (#2258 audit MINOR): `valid_from > valid_until`
+// is an EMPTY half-open interval, ACCEPTED (not rejected) — consistent with
+// the `memory_update` precedent and the North Star (an empty interval yields
+// FEWER results, never WRONG results). This pins the deliberate behavior.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn store_accepts_inverted_interval_as_empty_never_valid() {
+    let f = NamedTempFile::new().expect("tempfile");
+    let db_path = f.path().to_path_buf();
+    let conn = ai_memory::db::open(&db_path).expect("db::open");
+    let ttl = ResolvedTtl::default();
+    let ns = "vf-inverted";
+    let title = "inverted-interval-claim";
+
+    // valid_from (SEP) is AFTER valid_until (JAN) — an empty interval.
+    let params = serde_json::json!({
+        "title": title,
+        "content": "inverted bitemporal claim body long enough to read as prose.",
+        "namespace": ns,
+        "tier": "long",
+        "valid_from": T_SEP,
+        "valid_until": T_JAN,
+    });
+    ai_memory::mcp::tools::handle_store_for_tests(
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+    )
+    .expect("an inverted interval is ACCEPTED at the store surface");
+
+    // The row persisted with the caller's (inverted) bounds verbatim.
+    let (vf, vu) = stored_bounds(&conn, ns, title);
+    assert_same_instant(&vf.expect("valid_from persisted"), T_SEP);
+    assert_same_instant(&vu.expect("valid_until persisted"), T_JAN);
+
+    let titles = |valid_at: Option<&str>| -> Vec<String> {
+        let (rows, _) = ai_memory::db::recall(
+            &conn,
+            "inverted",
+            Some(ns),
+            50,
+            None,
+            None,
+            None,
+            ai_memory::SECS_PER_HOUR,
+            ai_memory::SECS_PER_DAY,
+            None,
+            None,
+            false,
+            None,
+            None,
+            valid_at,
+        )
+        .expect("recall");
+        rows.into_iter().map(|(m, _)| m.title).collect()
+    };
+
+    // No valid_at filter → the row is returned (empty interval only affects
+    // valid_at-filtered recall, never legacy recall).
+    assert!(
+        titles(None).iter().any(|t| t == title),
+        "an unfiltered recall must still return the row"
+    );
+    // Any valid_at → the empty [valid_from, valid_until) interval matches no
+    // instant, so the row is filtered out (fewer results, never wrong).
+    for at in [T_JAN, T_JUN, T_SEP, T_DEC] {
+        assert!(
+            !titles(Some(at)).iter().any(|t| t == title),
+            "an empty (inverted) interval must never satisfy a valid_at recall (at={at})"
+        );
+    }
+}

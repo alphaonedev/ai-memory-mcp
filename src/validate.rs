@@ -889,6 +889,17 @@ pub fn validate_source_uri(s: &str) -> Result<()> {
 /// (HTTP recall/list handlers, MCP tools, CLI) so a malformed as-of is a clear
 /// `400`/typed error, not a wrong-but-successful result set.
 ///
+/// This validates the RFC3339 FORMAT ONLY, not interval ORDERING. When a store
+/// caller supplies `valid_from > valid_until` (or `==`), the half-open
+/// `[valid_from, valid_until)` interval is EMPTY by definition — no `valid_at`
+/// instant satisfies `valid_from <= t < valid_until` — so the memory is simply
+/// never returned on a `valid_at`-filtered recall. This is INTENTIONAL and
+/// accepted (matching the `memory_update` `valid_until`-patch precedent, which
+/// likewise does not enforce ordering): an empty interval DEGRADES to fewer
+/// results, never WRONG results (North Star). It is a caller assertion, not a
+/// corruption — the durable memory text is untouched — so the store surfaces
+/// deliberately do NOT reject an inverted interval.
+///
 /// # Errors
 /// Returns an error when `valid_at` is not a parseable RFC3339 timestamp.
 pub fn validate_valid_at(valid_at: &str) -> Result<()> {
