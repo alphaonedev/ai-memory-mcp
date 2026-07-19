@@ -756,3 +756,154 @@ fn poison_skip_set_clears_on_restart_2225() {
     );
     enable(false);
 }
+
+// =====================================================================
+// Pre-ship 3x7 concurrency fix — the sweep runs OFF the handler mutex
+// =====================================================================
+
+/// The detached sweep completes its full encode+fsync pass WHILE the
+/// daemon's handler mutex (the `handlers::Db` lock every HTTP request
+/// serializes on) is HELD by someone else — proving structurally that the
+/// sweep never acquires it: it runs on its OWN dedicated connection, and
+/// the shared connection is unreachable behind the held guard. Under the
+/// pre-fix topology this call graph was impossible (the sweep only ran
+/// INSIDE the lock), and an enabled cold tier draining a backlog stalled
+/// every API request for the duration of the sweep.
+#[test]
+fn detached_sweep_completes_while_handler_mutex_is_held() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let Fixture {
+        _tmp,
+        conn,
+        db_path,
+    } = fixture();
+    seed_archived(
+        &conn,
+        "row-offlock",
+        "sweeps without the handler mutex",
+        None,
+    );
+
+    // The daemon's shared state shape (`handlers::Db`).
+    let state: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
+        conn,
+        db_path.clone(),
+        ai_memory::config::ResolvedTtl::default(),
+        true,
+    )));
+    // HOLD the handler mutex for the entire sweep. If the detached sweep
+    // needed it (or the shared connection behind it), this would deadlock.
+    let guard = state.blocking_lock();
+    let report = archive_sync::gc_tick_detached(&db_path).expect("detached sweep");
+    assert_eq!(
+        report.bundled, 1,
+        "detached sweep bundles on its own connection with the handler mutex held"
+    );
+    assert!(
+        erasure_dir(&db_path)
+            .join("row-offlock")
+            .join("manifest.json")
+            .is_file(),
+        "bundle written while the handler mutex was held"
+    );
+    drop(guard);
+
+    // The sweep is DB-read-only: the archived row is untouched, observed
+    // through the SHARED connection after the lock is released.
+    let lock = state.blocking_lock();
+    let n: i64 = lock
+        .0
+        .query_row("SELECT COUNT(*) FROM archived_memories", [], |r| r.get(0))
+        .expect("count archived");
+    assert_eq!(n, 1, "sweep wrote nothing to the database");
+    drop(lock);
+    enable(false);
+}
+
+/// The detached sweep FAILS CLOSED on any non-file-backed path: a dedicated
+/// connection to `:memory:` (or a `mode=memory` URI) opens a DIFFERENT,
+/// empty database whose reconciler would mis-classify every live bundle as
+/// rowless. Callers gate on `is_in_memory_db_path` and keep such databases
+/// on the legacy under-lock tick — a false-positive classification only
+/// re-serializes the sweep, never yields a wrong result.
+#[test]
+fn detached_sweep_refuses_non_file_backed_paths() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    for p in [":memory:", "file:cold?mode=memory&cache=shared", ""] {
+        assert!(
+            archive_sync::is_in_memory_db_path(Path::new(p)),
+            "{p:?} must classify as non-file-backed"
+        );
+        assert!(
+            archive_sync::gc_tick_detached(Path::new(p)).is_err(),
+            "{p:?} must be refused LOUD by the detached sweep"
+        );
+    }
+    assert!(
+        !archive_sync::is_in_memory_db_path(Path::new("/var/lib/ai-memory/cold.db")),
+        "a plain file path is file-backed"
+    );
+    // Disabled tier short-circuits to an empty report before any path or
+    // connection work — nothing to run off-lock.
+    enable(false);
+    let r = archive_sync::gc_tick_detached(Path::new(":memory:")).expect("disabled = no-op");
+    assert_eq!(
+        r.bundled + r.failed + r.already_current + r.skipped_poison,
+        0,
+        "disabled cold tier is a strict no-op"
+    );
+}
+
+/// End-to-end daemon wiring: the production gc loop
+/// (`spawn_gc_loop_with_shadow_retention`) drives the DETACHED erasure arm
+/// for a file-backed database — the bundle lands on disk while the loop
+/// holds the handler mutex only for the short in-lock section of each tick.
+#[test]
+fn gc_loop_runs_detached_erasure_arm_for_file_backed_db() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let Fixture {
+        _tmp,
+        conn,
+        db_path,
+    } = fixture();
+    seed_archived(&conn, "row-loop", "bundled by the daemon gc loop", None);
+    let state: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
+        conn,
+        db_path.clone(),
+        ai_memory::config::ResolvedTtl::default(),
+        true,
+    )));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let handle = ai_memory::daemon_runtime::spawn_gc_loop_with_shadow_retention(
+            state.clone(),
+            None,
+            30,
+            std::time::Duration::from_millis(5),
+        );
+        let manifest = erasure_dir(&db_path).join("row-loop").join("manifest.json");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !manifest.is_file() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        handle.abort();
+        let _ = handle.await;
+        assert!(
+            manifest.is_file(),
+            "gc loop's detached erasure arm bundled the archived row"
+        );
+    });
+    enable(false);
+}
