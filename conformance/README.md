@@ -29,7 +29,8 @@ conformance/
 │   ├── signed/                 3 signed vectors (valid / tampered / proof)
 │   ├── subkey_chain/           obl. 3 group members (cert→write + self-declared)
 │   ├── lineage/                obl. 5 group members (valid / revoked / fork)
-│   └── chain/                  obl. 2 group members (intact / deletion / truncation)
+│   ├── chain/                  obl. 2 group members (intact / deletion / truncation)
+│   └── export/                 §V2-6 envelope L1/L2/L3 round-trip fixture (JSON, #2030)
 └── readers/
     ├── reader.py            Python 3 reference reader (stdlib-only)
     └── reader.mjs           Node.js reference reader (stdlib-only, Node ≥ 19)
@@ -55,6 +56,14 @@ Regenerate after a deliberate, spec-approved format change with:
 ```
 AI_MEMORY_REGEN_GOLDEN=1 cargo test --test conformance_corpus
 ```
+
+The one non-hex artifact — the §V2-6 envelope round-trip fixture
+`vectors/export/round_trip_l3.json` (#2030) — follows the SAME encoder-generated,
+drift-gated discipline but is produced by a sibling test from the pinned
+Portability-v2 exporter (`emit::build_full_envelope`); regenerate it with
+`AI_MEMORY_REGEN_GOLDEN=1 cargo test --test conformance_export_roundtrip_2030`.
+It is NOT part of `manifest.json` / `corpus_digest` (which cover the signed-byte
+hex family the non-Rust readers verify).
 
 ## manifest.json
 
@@ -218,14 +227,22 @@ advisory) and obligation 6 (apply the fail-closed visibility allow-list to any
 surfaced set) are verifier-runtime policies, not properties of a static record.
 A corpus of bytes cannot force them; they are the implementer's contract.
 
-**Remaining residue** — one fixture, tracked under **#1944** (v1.x):
-
-- an **L1/L2/L3 export-envelope round-trip fixture** for Portability v2 §V2-5's
-  data-plane half. The envelope FORMAT is frozen (PORTABILITY-V2 §V2-4, schema
-  v80), but the v2-envelope PRODUCER (`ai-memory export`'s portability path) is
-  deferred to v1.x under #1944 — `ai-memory export` today is a memories+links
-  convenience view, not the portability exporter — so this fixture cannot be
-  encoder-generated under the same drift-gated discipline as its siblings until
-  that producer lands. It is intentionally NOT hand-authored.
+**Envelope round-trip fixture — SHIPPED (#2030).** The last residue is now
+closed. The former blocker ("the #1944 v1.x v2-envelope producer") is STALE:
+the integrity-complete Portability-v2 exporter + fail-closed importer landed on
+`release/v1.0.0` (#2006, `src/portability/`), so `ai-memory export --full`
+produces the frozen v2 envelope from a PINNED PRODUCTION encoder. The
+§V2-6 envelope-level **L1/L2/L3 round-trip fixture** now lives at
+[`vectors/export/round_trip_l3.json`](vectors/export/round_trip_l3.json) — an
+encoder-generated, deterministic (fixed ids + timestamps; no `Date::now`)
+single-document JSON envelope carrying a row in every §V2-2 signed class + the
+L3 operator PUBLIC trust anchor. Unlike the hex vectors above (which the
+non-Rust readers verify), this envelope fixture exercises the **Rust production
+importer** end-to-end: `tests/conformance_export_roundtrip_2030.rs` drift-gates
+it against a fresh regeneration AND round-trips it through
+`import::import_full_envelope`, asserting per-class byte-exact preservation of
+the signed spine (L2) + the source-of-truth memory TEXT (L1) + governance (L3)
+per spec §V2-1. Regenerate after a spec-approved change (e.g. a schema bump) with
+`AI_MEMORY_REGEN_GOLDEN=1 cargo test --test conformance_export_roundtrip_2030`.
 
 All groups are additive — they change no frozen bytes.

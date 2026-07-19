@@ -157,6 +157,8 @@ fn build_link(
         valid_from: valid_from.map(str::to_string),
         valid_until: None,
         attest_level: None,
+        source_cid: None,
+        target_cid: None,
     }
 }
 

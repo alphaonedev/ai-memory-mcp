@@ -134,6 +134,8 @@ fn link(src: &str, tgt: &str, relation: MemoryLinkRelation, created_at: &str) ->
         valid_from: Some(created_at.to_string()),
         valid_until: None,
         attest_level: None,
+        source_cid: None,
+        target_cid: None,
     }
 }
 
