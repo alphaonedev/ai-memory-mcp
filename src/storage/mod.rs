@@ -6478,7 +6478,7 @@ pub fn find_synthesis_candidates(
 /// (`memories.cid`), or `None` when the row is absent or carries no cid
 /// (legacy / pre-v74). Used to stamp the lineage-DAG `source_cid` /
 /// `target_cid` mirror columns on link write.
-fn read_memory_cid(conn: &Connection, id: &str) -> Option<String> {
+pub(crate) fn read_memory_cid(conn: &Connection, id: &str) -> Option<String> {
     conn.query_row("SELECT cid FROM memories WHERE id = ?1", params![id], |r| {
         r.get::<_, Option<String>>(0)
     })
@@ -7227,6 +7227,11 @@ pub fn get_links(conn: &Connection, id: &str) -> Result<Vec<MemoryLink>> {
             valid_until: row.get::<_, Option<String>>(5)?,
             observed_by: row.get::<_, Option<String>>(6)?,
             attest_level: row.get::<_, Option<String>>(7)?,
+            // #2215 — the `memory_get_links` graph view is a selective
+            // projection (it also leaves `signature` `None`); the lineage
+            // cid mirror is not part of its promised shape, so `None`.
+            source_cid: None,
+            target_cid: None,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -12439,7 +12444,8 @@ pub fn export_links(conn: &Connection) -> Result<Vec<MemoryLink>> {
     // the inbound path falls back to `attest_level = "unsigned"`.
     let mut stmt = conn.prepare(
         "SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
-                ml.signature, ml.observed_by, ml.valid_from, ml.valid_until
+                ml.signature, ml.observed_by, ml.valid_from, ml.valid_until,
+                ml.source_cid, ml.target_cid
          FROM memory_links ml
          JOIN memories ms ON ms.id = ml.source_id AND (ms.expires_at IS NULL OR ms.expires_at > ?1)
          JOIN memories mt ON mt.id = ml.target_id AND (mt.expires_at IS NULL OR mt.expires_at > ?1)",
@@ -12462,6 +12468,12 @@ pub fn export_links(conn: &Connection) -> Result<Vec<MemoryLink>> {
             // pre-v0.7 receivers do not see an unknown field. Leaving
             // this `None` keeps `skip_serializing_if` from emitting it.
             attest_level: None,
+            // v1.0.0 #2215 — carry the schema-v75 lineage-DAG cid mirror
+            // (`source_cid` / `target_cid`) so the Portability-v2 envelope
+            // round-trips it losslessly. NULL mirror rows stay `None` →
+            // `skip_serializing_if` keeps the federation wire byte-identical.
+            source_cid: row.get::<_, Option<String>>(8)?,
+            target_cid: row.get::<_, Option<String>>(9)?,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -22854,6 +22866,8 @@ mod tests {
             observed_by: Some("peer:remote".to_string()),
             signature: Some(vec![0xAB_u8; 64]),
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
 
         // Peer-attested inbound bypasses the K9 deny.
@@ -22871,6 +22885,8 @@ mod tests {
             observed_by: Some("peer:remote".to_string()),
             signature: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         let err = create_link_inbound(&conn, &link2, "unsigned")
             .expect_err("unsigned inbound must NOT bypass governance");
@@ -22912,6 +22928,8 @@ mod tests {
             observed_by: Some("peer:remote".to_string()),
             signature: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         let err = create_link_inbound(&conn, &cycle_link, "peer_attested")
             .expect_err("cycle check must run even on peer_attested inbound");
@@ -25580,6 +25598,8 @@ mod tests {
             valid_from: Some(now.clone()),
             valid_until: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         let before = count_signed_events_of_type(&conn, "memory_link.created");
         create_link_inbound(&conn, &link, "unsigned").unwrap();
