@@ -845,6 +845,8 @@ pub struct ReconcileReport {
     pub quarantined: usize,
     /// Quarantined bundles restored to the active store under DR mode.
     pub quarantine_recovered: usize,
+    /// Quarantine recovery attempts that failed and were left for a later tick.
+    pub quarantine_recovery_failed: usize,
     /// Stale `.tmp-*` assembly dirs from crashed writers reaped.
     pub temp_reaped: usize,
     /// Vestigial purge-intent journal markers compacted (bundle already gone).
@@ -861,10 +863,9 @@ pub struct ReconcileReport {
 
 /// Existence probe against one of the two FIXED tables (`archived_memories` /
 /// `memories`) — never a caller-supplied name, so the interpolation is safe.
-fn row_exists(conn: &Connection, table: &str, id: &str) -> bool {
+fn row_exists(conn: &Connection, table: &str, id: &str) -> rusqlite::Result<bool> {
     let sql = format!("SELECT COUNT(*) > 0 FROM {table} WHERE id = ?1");
     conn.query_row(&sql, [id], |r| r.get::<_, bool>(0))
-        .unwrap_or(false)
 }
 
 /// Scrub one CURRENT bundle: hash-verify it (a within-budget degraded bundle
@@ -965,20 +966,49 @@ pub fn reconcile_and_scrub(
     let mut report = ReconcileReport {
         temp_reaped,
         journal_compacted: store.compact_purge_journal(|id| {
-            !row_exists(conn, ARCHIVED_TABLE, id) && !row_exists(conn, MEMORIES_TABLE, id)
+            match (
+                row_exists(conn, ARCHIVED_TABLE, id),
+                row_exists(conn, MEMORIES_TABLE, id),
+            ) {
+                (Ok(false), Ok(false)) => true,
+                (Ok(_), Ok(_)) => false,
+                (archived, live) => {
+                    tracing::warn!(
+                        target: ERASURE_TRACE_TARGET,
+                        bundle_id = %id,
+                        archived_error = ?archived.err(),
+                        live_error = ?live.err(),
+                        "erasure cold tier: row probe failed during journal compaction; \
+                         retaining marker for a later tick"
+                    );
+                    false
+                }
+            }
         }),
         ..ReconcileReport::default()
     };
     if recover_mode {
         for id in store.list_quarantined_ids() {
-            if store.recover_quarantined(&id).unwrap_or(false) {
-                report.quarantine_recovered += 1;
-                tracing::warn!(
-                    target: ERASURE_TRACE_TARGET,
-                    bundle_id = %id,
-                    "erasure cold tier: DR mode — quarantined bundle RECOVERED to active; \
-                     run `archive restore` to reconstruct the row"
-                );
+            match store.recover_quarantined(&id) {
+                Ok(true) => {
+                    report.quarantine_recovered += 1;
+                    tracing::warn!(
+                        target: ERASURE_TRACE_TARGET,
+                        bundle_id = %id,
+                        "erasure cold tier: DR mode — quarantined bundle RECOVERED to active; \
+                         run `archive restore` to reconstruct the row"
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    report.quarantine_recovery_failed += 1;
+                    tracing::warn!(
+                        target: ERASURE_TRACE_TARGET,
+                        bundle_id = %id,
+                        %error,
+                        "erasure cold tier: DR-mode quarantine recovery failed; retrying next tick"
+                    );
+                }
             }
         }
     }
@@ -993,8 +1023,34 @@ pub fn reconcile_and_scrub(
     for offset in 0..scan_limit.min(n) {
         let id = &ids[(start + offset) % n];
         report.scanned += 1;
-        let archived = row_exists(conn, ARCHIVED_TABLE, id);
-        let live = !archived && row_exists(conn, MEMORIES_TABLE, id);
+        let archived = match row_exists(conn, ARCHIVED_TABLE, id) {
+            Ok(exists) => exists,
+            Err(error) => {
+                tracing::warn!(
+                    target: ERASURE_TRACE_TARGET,
+                    bundle_id = %id,
+                    %error,
+                    "erasure cold tier: archived-row existence probe failed; skipping bundle this tick"
+                );
+                continue;
+            }
+        };
+        let live = if archived {
+            false
+        } else {
+            match row_exists(conn, MEMORIES_TABLE, id) {
+                Ok(exists) => exists,
+                Err(error) => {
+                    tracing::warn!(
+                        target: ERASURE_TRACE_TARGET,
+                        bundle_id = %id,
+                        %error,
+                        "erasure cold tier: live-row existence probe failed; skipping bundle this tick"
+                    );
+                    continue;
+                }
+            }
+        };
         if archived || live {
             // R5 — a purge-intent marker for a row that STILL EXISTS past the
             // grace window is STALE (from an ABORTED purge whose `DELETE`
@@ -1053,25 +1109,26 @@ pub fn reconcile_and_scrub(
     report
 }
 
-/// Write-ahead purge-intent journal, best-effort (destruction-intent record
+/// Write-ahead purge-intent journal (destruction-intent record
 /// BEFORE a purge `DELETE`). No-op when no bundle directory exists, so purge
-/// stays byte-identical for deployments that never enabled the cold tier. A
-/// journal-write failure degrades to QUARANTINE (the reconciler preserves the
-/// bundle rather than destroying it) — safe, never a data-loss.
-pub fn journal_purge_intent_best_effort(conn: &Connection, ids: &[String]) {
+/// stays byte-identical for deployments that never enabled the cold tier.
+/// A journal-write failure is returned so the purge transaction fails closed
+/// before deleting any affected row (#2252).
+///
+/// # Errors
+/// Returns the journal I/O failure when destruction intent cannot be made
+/// durable.
+pub fn journal_purge_intent(conn: &Connection, ids: &[String]) -> Result<()> {
     if ids.is_empty() {
-        return;
+        return Ok(());
     }
     let Some(store) = store_if_dir_present(conn) else {
-        return;
+        return Ok(());
     };
-    if let Err(e) = store.journal_purge_intent(ids) {
-        tracing::warn!(
-            target: ERASURE_TRACE_TARGET,
-            "erasure cold tier: purge-intent journal write failed (affected bundles will be \
-             QUARANTINED not destroyed): {e}"
-        );
-    }
+    store
+        .journal_purge_intent(ids)
+        .context("erasure cold tier: purge-intent journal write failed")?;
+    Ok(())
 }
 
 /// The gc-tick entry point: no-op when the cold tier is disabled; otherwise

@@ -526,7 +526,8 @@ fn journaled_purge_orphan_is_reaped_and_not_resurrectable() {
 
     // A purge that journaled intent + deleted the row, then CRASHED before
     // removing the bundle.
-    archive_sync::journal_purge_intent_best_effort(&f.conn, &["row-purged-crash".to_string()]);
+    archive_sync::journal_purge_intent(&f.conn, &["row-purged-crash".to_string()])
+        .expect("journal purge intent");
     drop_archived_row(&f.conn, "row-purged-crash");
 
     // Restore refuses a journaled id immediately (before any reconciliation).
@@ -563,7 +564,8 @@ fn purge_marker_blocks_cross_process_remint_until_row_and_bundle_are_gone() {
         .expect("store")
         .expect("enabled");
 
-    archive_sync::journal_purge_intent_best_effort(&f.conn, &["row-purge-race".to_string()]);
+    archive_sync::journal_purge_intent(&f.conn, &["row-purge-race".to_string()])
+        .expect("journal purge intent");
     archive_sync::remove_bundles_best_effort(&f.conn, &["row-purge-race".to_string()]);
     assert!(!bundle.exists(), "purge removed the old bundle");
     assert!(
@@ -665,6 +667,107 @@ fn unjournaled_dbloss_bundle_is_quarantined_not_destroyed_and_recoverable() {
 }
 
 #[test]
+fn row_probe_error_skips_bundle_instead_of_classifying_it_as_rowless() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    seed_archived(&f.conn, "row-probe-error", "must remain untouched", None);
+    archive_sync::gc_tick(&f.conn).expect("sweep");
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+    let active = erasure_dir(&f.db_path).join("row-probe-error");
+
+    f.conn
+        .execute("DROP TABLE archived_memories", [])
+        .expect("inject archived-row probe failure");
+    let report = archive_sync::reconcile_and_scrub(&f.conn, &store, 512, 16, 0);
+
+    assert_eq!(report.scanned, 1);
+    assert_eq!(report.orphans_reaped, 0);
+    assert_eq!(report.quarantined, 0);
+    assert!(
+        active.join("manifest.json").is_file(),
+        "a DB probe error must leave the bundle untouched for a later tick"
+    );
+    enable(false);
+}
+
+#[test]
+fn dr_recovery_error_is_reported_for_retry() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+    let malformed = erasure_dir(&f.db_path)
+        .join(".quarantine")
+        .join("invalid id");
+    std::fs::create_dir_all(&malformed).expect("create malformed quarantine entry");
+    std::fs::write(malformed.join("manifest.json"), b"{}").expect("write manifest sentinel");
+
+    unsafe { std::env::set_var(ENV_ERASURE_RECOVER_QUARANTINE, "1") };
+    let report = archive_sync::reconcile_and_scrub(&f.conn, &store, 512, 16, 0);
+    assert_eq!(report.quarantine_recovered, 0);
+    assert_eq!(
+        report.quarantine_recovery_failed, 1,
+        "a failed DR recovery must be visible and retried later"
+    );
+    assert!(malformed.join("manifest.json").is_file());
+    unsafe { std::env::remove_var(ENV_ERASURE_RECOVER_QUARANTINE) };
+    enable(false);
+}
+
+#[test]
+fn purge_marker_creation_failure_is_fail_closed() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    seed_archived(
+        &f.conn,
+        "row-marker-failure",
+        "must survive failed journaling",
+        None,
+    );
+    archive_sync::gc_tick(&f.conn).expect("sweep");
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+    let marker_path = erasure_dir(&f.db_path)
+        .join(".purge-intent")
+        .join("row-marker-failure");
+    std::fs::create_dir_all(&marker_path).expect("occupy marker path with a directory");
+
+    let error = db::purge_archive(&f.conn, None)
+        .expect_err("purge must not proceed when its intent cannot be journaled");
+    assert!(
+        format!("{error:#}").contains("create purge-intent marker"),
+        "unexpected error chain: {error:#}"
+    );
+    let surviving: i64 = f
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM archived_memories WHERE id = 'row-marker-failure'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count surviving archived row");
+    assert_eq!(surviving, 1, "the archived row must remain intact");
+    assert!(
+        store.contains("row-marker-failure"),
+        "the cold-tier bundle must remain intact"
+    );
+    enable(false);
+}
+
+#[test]
 fn aborted_purge_stale_marker_is_cleared_so_later_dbloss_quarantines() {
     // R5 — a purge that JOURNALED intent then had its `DELETE` abort
     // (SQLITE_BUSY / IO) leaves a stale marker while the row + bundle survive.
@@ -686,7 +789,8 @@ fn aborted_purge_stale_marker_is_cleared_so_later_dbloss_quarantines() {
 
     // Aborted purge: intent journaled, but the DELETE failed so the archived
     // row + its bundle both still exist.
-    archive_sync::journal_purge_intent_best_effort(&f.conn, &["row-aborted".to_string()]);
+    archive_sync::journal_purge_intent(&f.conn, &["row-aborted".to_string()])
+        .expect("journal purge intent");
     assert!(
         store.is_purge_intended("row-aborted"),
         "intent marker present"

@@ -453,8 +453,9 @@ impl ErasureStore {
     /// per id BEFORE the purge `DELETE`, then fsync the journal dir so the
     /// intent is durable across a crash. The reconciler hard-reaps a rowless
     /// bundle ONLY for a journaled id; everything else it QUARANTINES. Invalid
-    /// ids are skipped (never a path-traversal). Best-effort: a journal-write
-    /// failure degrades to quarantine (safe — data is preserved, not lost).
+    /// ids are skipped (never a path-traversal). A per-id marker failure is
+    /// returned so the caller can fail closed instead of deleting an
+    /// unjournaled row (#2252).
     ///
     /// # Errors
     /// [`ErasureError::Io`] when the journal dir cannot be created / fsynced.
@@ -470,7 +471,8 @@ impl ErasureStore {
             }
             // An empty marker: existence IS the signal, so only the directory
             // entry must be durable (fsynced once below), not file contents.
-            let _ = std::fs::File::create(jdir.join(id));
+            std::fs::File::create(jdir.join(id))
+                .map_err(|e| io_err("create purge-intent marker", &e))?;
         }
         fsync_dir(&jdir)
     }
@@ -546,8 +548,12 @@ impl ErasureStore {
             std::fs::remove_dir_all(&dst).map_err(|e| io_err("clear stale quarantine", &e))?;
         }
         std::fs::rename(&src, &dst).map_err(|e| io_err("quarantine bundle", &e))?;
-        let _ = fsync_dir(&qdir);
-        let _ = fsync_dir(&self.dir);
+        if let Err(error) = fsync_dir(&qdir) {
+            tracing::warn!(bundle_id = %id, %error, "failed to fsync quarantine directory");
+        }
+        if let Err(error) = fsync_dir(&self.dir) {
+            tracing::warn!(bundle_id = %id, %error, "failed to fsync erasure store directory after quarantine");
+        }
         Ok(true)
     }
 
@@ -585,7 +591,9 @@ impl ErasureStore {
             return Ok(false);
         }
         std::fs::rename(&src, &dst).map_err(|e| io_err("recover quarantined bundle", &e))?;
-        let _ = fsync_dir(&self.dir);
+        if let Err(error) = fsync_dir(&self.dir) {
+            tracing::warn!(bundle_id = %id, %error, "failed to fsync erasure store directory after quarantine recovery");
+        }
         Ok(true)
     }
 }
