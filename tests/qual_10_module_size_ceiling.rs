@@ -799,7 +799,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // valid_at AS-OF predicates + the merge_inbound full-row writer carrying
     // the two VALID-time columns ($29/$30) land the merged file at 27_903;
     // ceiling 27_820 -> 28_000 (+97 headroom).
-    ("src/store/postgres.rs", 28_000),
+    // 2026-07-18 (#2195/#2196 data-integrity archive-parity, merged onto the
+    // #2207 tree): threading lifecycle_state through the 3 pg archive INSERT
+    // sites (forget/run_gc/archive_by_ids) + the shared
+    // SQL_ARCHIVE_ON_CONFLICT_LAST_WINS clause (last-wins re-archive parity)
+    // + two live-PG parity tests (each with the F1 delete-on-restore pin).
+    // Combined with the #2207 VALID-time reads, the merged file lands above
+    // 28_000; ceiling bumped 28_000 -> 28_200 to hold both additions.
+    ("src/store/postgres.rs", 28_200),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
