@@ -3624,8 +3624,14 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             )?;
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 85 {
             // v85 (#2035, v1.0.0) — archive→restore lossless round-trip for the
+            // #1834 claim-bitemporal VALID-time. LITERALIZED from the
+            // const-phrased tip form when the v86 arm landed (#2265; the
+            // #2218 convention — settled arms take a literal guard and enter
+            // the monotonic lane, ONLY the current tip stays symbolic).
+            // Behaviour-identical: any DB below 85 still runs it; a DB at
+            // >= 85 already carries the columns (probe-guarded, idempotent).
             // #1834 claim-bitemporal VALID-time. Adds `valid_from` + `valid_until`
             // (RFC3339 TEXT) to `archived_memories` so a memory archived via GC
             // eviction (archive_on_gc), explicit `forget`, or the in_place_edit

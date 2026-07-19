@@ -33,10 +33,12 @@ const BACKENDS: [&str; 2] = ["sqlite", "postgres"];
 /// in lockstep with a dated comment (and the shell-gate pin), the same
 /// discipline as the `qual_10` module-size ceilings.
 /// 2026-07-18 (#2198): sqlite=8, postgres=1.
-// 2026-07-19 (#1834 pre-ship 3x7): sqlite 8 -> 9 — the v86 VALID-time
-// rendering-normalization arm joins the const-phrased tail cohort; postgres
+// 2026-07-19 (#1834 pre-ship 3x7 / PR #2265): sqlite stays 8 — the v86
+// VALID-time arm joins the const-phrased cohort AND the settled v85 arm is
+// LITERALIZED to `if version < 85` (the #2218 convention: settled arms enter
+// the monotonic literal lane, only the current tip stays symbolic); postgres
 // stays 1 (v85 renumbered to a literal arm, migrate_v86 takes the tail slot).
-const EXPECTED_CONST_ARMS_SQLITE: usize = 9;
+const EXPECTED_CONST_ARMS_SQLITE: usize = 8;
 const EXPECTED_CONST_ARMS_POSTGRES: usize = 1;
 
 /// Read a repo-relative source file (the migration ladder sources) to a String.
