@@ -3452,6 +3452,19 @@ pub fn spawn_gc_loop_with_shadow_retention(
                 Ok(n) if n > 0 => tracing::info!("gc: purged {n} old archived memories"),
                 _ => {}
             }
+            // #2064 — erasure cold-tier sweep: bundle committed archived
+            // rows into (k, m) Reed-Solomon shard bundles, paced at
+            // SWEEP_LIMIT_PER_TICK oldest-first per tick. No-op unless
+            // AI_MEMORY_ERASURE_COLD_TIER is enabled.
+            match crate::erasure::archive_sync::gc_tick(&lock.0) {
+                Ok(r) if r.bundled > 0 || r.failed > 0 => tracing::info!(
+                    "gc: erasure cold tier bundled {} archived rows ({} failed, retried next tick)",
+                    r.bundled,
+                    r.failed
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("erasure cold-tier sweep failed: {e:#}"),
+            }
             // Cluster G (#767, PERF-4) — shadow-mode observation
             // retention sweep. `<= 0` is a no-op (operator opt-out).
             match crate::confidence::shadow::gc_observations(&lock.0, shadow_retention_days) {

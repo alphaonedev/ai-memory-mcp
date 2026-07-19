@@ -337,13 +337,22 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // storage/mod.rs at 25_738; ceiling 25_650 -> 25_850. Then #2035 v85
     // archive->restore valid_from/valid_until column threading + round-trip
     // unit test added ~65 LOC on top of the merge.
+    //
     // 2026-07-18 (#1834 claim-bitemporal residual, PR #2204): threading
     // valid_from/valid_until through row_to_memory + insert/insert_if_newer +
     // update_with_expected_version + build_list_query/list + recall +
     // recall_hybrid FTS/semantic phases (valid_at AS-OF predicate) + the #2207
     // merge-lane overwrite_full_row_by_id VALID-time columns lands the merged
     // file at 26_029; ceiling 25_900 -> 26_100.
-    ("src/storage/mod.rs", 26_100),
+    //
+    // 2026-07-19 — #2064 (erasure cold tier) merged on top of #2204: the
+    // purge funnels journal destruction intent + collect/remove bundle ids,
+    // the two restore funnels gain reconstruct-on-read + stale-bundle removal
+    // (F1/R1). Combined with the #2204 claim-bitemporal threading above the
+    // merged file lands at 26_155; ceiling 26_100 -> 26_250. Growth justified:
+    // wiring on existing funnels only — the erasure subsystem itself lives in
+    // the new src/erasure/ modules.
+    ("src/storage/mod.rs", 26_250),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -1128,7 +1137,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // coverage tests (bind/revoke × json/non-json + empty-token error) to clear
     // the daemon_runtime.rs per-module COVERAGE floor. Combined with #2045 L6
     // this lands daemon_runtime.rs at 10_676; ceiling 10_500 → 10_750.
-    ("src/daemon_runtime.rs", 10_850), /* 2026-07-17 #2167 extract run_sqlite_embedding_space_boot_maintenance helper + both-open-arms unit test to cover the boot-open Err arm (10_783) */
+    ("src/daemon_runtime.rs", 10_900), /* 2026-07-17 #2167 extract run_sqlite_embedding_space_boot_maintenance helper + both-open-arms unit test to cover the boot-open Err arm (10_783). 2026-07-19 #2064 erasure gc-tick wiring stacked on the #2205 export --full + #1860 vectorlite serve/mcp boot funnels lands the merged file at 10_853; ceiling 10_850 -> 10_900 (lockstep). */
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
