@@ -65,6 +65,8 @@ pub fn handle_notify(
 
     let mem = Memory {
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
+        valid_from: None,
+        valid_until: None,
         id: uuid::Uuid::new_v4().to_string(),
         tier,
         namespace: namespace.clone(),
@@ -153,6 +155,7 @@ pub fn handle_inbox(
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .map_err(|e| e.to_string())?;
     let filtered: Vec<&Memory> = items
@@ -341,6 +344,8 @@ mod d1_5_986_tests {
         let now = chrono::Utc::now().to_rfc3339();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: super::super::agent::messages_namespace_for(owner),

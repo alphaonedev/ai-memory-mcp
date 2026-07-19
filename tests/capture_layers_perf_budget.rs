@@ -272,6 +272,8 @@ fn seed_watermark_in_future(db_path: &std::path::Path, agent_id: &str) {
     let future = chrono::Utc::now() + chrono::Duration::hours(1);
     let mem = Memory {
         cid: None,
+        valid_from: None,
+        valid_until: None,
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Long,
         namespace: "perf-budget".to_string(),

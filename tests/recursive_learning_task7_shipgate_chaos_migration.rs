@@ -407,7 +407,10 @@ fn mid_tx_link_write_failure_rolls_back_reflection_memory() {
     assert!(matches!(err, ReflectError::Validation(_)));
 
     // No reflection memory landed.
-    let all = db::list(&conn, None, None, 1000, 0, None, None, None, None, None).unwrap();
+    let all = db::list(
+        &conn, None, None, 1000, 0, None, None, None, None, None, None,
+    )
+    .unwrap();
     assert_eq!(
         all.len(),
         2,
@@ -514,7 +517,10 @@ fn mid_tx_target_deletion_rolls_back_reflection_atomically() {
     assert!(matches!(err, ReflectError::Database(_)));
 
     // No reflection memory landed.
-    let all = db::list(&conn, None, None, 1000, 0, None, None, None, None, None).unwrap();
+    let all = db::list(
+        &conn, None, None, 1000, 0, None, None, None, None, None, None,
+    )
+    .unwrap();
     assert_eq!(
         all.len(),
         1,
@@ -940,7 +946,10 @@ fn validation_refuses_oversized_or_malformed_inputs() {
     assert!(matches!(err, ReflectError::Validation(_)));
 
     // None of those refusals create any new memories.
-    let all = db::list(&conn, None, None, 1000, 0, None, None, None, None, None).unwrap();
+    let all = db::list(
+        &conn, None, None, 1000, 0, None, None, None, None, None, None,
+    )
+    .unwrap();
     assert_eq!(
         all.len(),
         1,

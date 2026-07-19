@@ -654,6 +654,12 @@ pub struct Filter {
     pub agent_id: Option<String>,
     pub since: Option<chrono::DateTime<chrono::Utc>>,
     pub until: Option<chrono::DateTime<chrono::Utc>>,
+    /// v1.0.0 #1834 — claim-bitemporal AS-OF: RFC3339 point in VALID-time.
+    /// Narrows to claims asserted to hold at this instant (`valid_from <=
+    /// valid_at` AND `valid_until` unset-or-`> valid_at`, end-exclusive).
+    /// DISTINCT from `since`/`until` (which bound `created_at`). `None` = no
+    /// valid-time filter.
+    pub valid_at: Option<String>,
     pub limit: usize,
     /// v1.0.0 #2167 §3 — the live embedder's space fingerprint for a
     /// semantic `recall_hybrid`. `Some(fp)` gates every stored vector
@@ -3570,6 +3576,12 @@ pub struct UpdatePatch {
     /// before reaching the storage layer; the storage layer trusts the
     /// patch as already-validated.
     pub source_uri: Option<String>,
+    /// v1.0.0 #1834 — opt-in claim-bitemporal `valid_until` patch. `None`
+    /// leaves the stored value untouched (COALESCE on the SQL layer); `Some(v)`
+    /// closes or moves the claim's VALID interval. `valid_from` is IMMUTABLE
+    /// (never in this patch — the genesis assertion instant). Validated via
+    /// `crate::validate::validate_valid_at` before reaching storage.
+    pub valid_until: Option<String>,
     /// v0.7.0 #1423 — opt-in expires_at patch. Pre-#1423 the postgres
     /// PUT handler silently dropped `body.expires_at` because this
     /// field didn't exist on the patch — `UpdateMemory.expires_at`
@@ -3988,6 +4000,8 @@ mod tests {
     fn dummy_memory(id: &str) -> Memory {
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: id.to_string(),
             tier: Tier::Mid,
             namespace: "mock".to_string(),

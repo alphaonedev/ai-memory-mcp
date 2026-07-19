@@ -257,6 +257,10 @@
             "default": true,
             "description": "Gap 7 (#890): per-row provenance decoration.",
             "type": "boolean"
+          },
+          "valid_at": {
+            "description": "#1834 claim-bitemporal as-of: RFC3339 point in valid-time.",
+            "type": "string"
           }
         },
         "required": [
@@ -382,6 +386,10 @@
               "mid",
               "long"
             ],
+            "type": "string"
+          },
+          "valid_at": {
+            "description": "#1834 claim-bitemporal as-of: RFC3339 point in valid-time. Returns only claims asserted to hold at this instant (valid_from/valid_until window).",
             "type": "string"
           }
         },
@@ -945,6 +953,10 @@
           },
           "capability": {
             "description": "#1827 capability token (cap1:..) — may flip a governance Deny/Pending on this update to Allow within its caveats.",
+            "type": "string"
+          },
+          "valid_until": {
+            "description": "#1834 claim-bitemporal: close/move the claim's valid_until (RFC3339). valid_from is immutable.",
             "type": "string"
           }
         },

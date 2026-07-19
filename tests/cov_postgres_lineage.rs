@@ -91,6 +91,8 @@ async fn raw_pool() -> Option<sqlx::PgPool> {
 fn mem(id: &str, ns: &str, title: &str, content: &str, created_at: &str) -> Memory {
     Memory {
         cid: None,
+        valid_from: None,
+        valid_until: None,
         id: id.to_string(),
         tier: Tier::Mid,
         namespace: ns.to_string(),

@@ -222,6 +222,7 @@ fn recall_hybrid_loop_does_not_call_get_embedding_per_row() {
         None,
         None, // #1720 caller,
         None,
+        None, // #1834 valid_at
     )
     .expect("recall_hybrid_with_telemetry ok");
     assert!(!results.is_empty(), "expected non-empty recall results");
@@ -288,6 +289,7 @@ fn recall_touch_uses_single_transaction_per_call() {
             false,
             None,
             None, // #1720 caller
+            None, // #1834 valid_at
         )
     };
     let (results, _outcome) = recall(&conn).expect("recall ok");

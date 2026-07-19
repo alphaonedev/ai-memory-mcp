@@ -266,6 +266,8 @@ impl MemoryStore for SqliteStore {
             patch.metadata.as_ref(),
             patch.source_uri.as_deref(),
             None,
+            // v1.0.0 #1834 — thread the patch's valid_until (valid_from immutable).
+            patch.valid_until.as_deref(),
         )
         .map_err(box_err)?;
         if !found {
@@ -333,6 +335,8 @@ impl MemoryStore for SqliteStore {
             until.as_deref(),
             tags_first,
             filter.agent_id.as_deref(),
+            // v1.0.0 #1834 — claim-bitemporal AS-OF from the SAL Filter.
+            filter.valid_at.as_deref(),
         )
         .map_err(box_err)?;
         // #910 SAL-level scope=private gate (see `is_visible_to_caller`
@@ -370,6 +374,7 @@ impl MemoryStore for SqliteStore {
         loop {
             let rows = db::list(
                 &conn, None, None, PAGE, offset, None, None, None, None, None,
+                None, // #1834 valid_at (no as-of)
             )
             .map_err(box_err)?;
             let page_len = rows.len();
@@ -772,6 +777,8 @@ impl MemoryStore for SqliteStore {
         let tags_first = filter.tags_any.first().map(String::as_str);
         let since = filter.since.map(|d| d.to_rfc3339());
         let until = filter.until.map(|d| d.to_rfc3339());
+        // v1.0.0 #1834 — claim-bitemporal AS-OF from the SAL Filter.
+        let valid_at = filter.valid_at.as_deref();
         let limit = if filter.limit == 0 { 10 } else { filter.limit };
         let scoring = crate::config::ResolvedScoring::default();
         // v0.8.0 #1720 A3 — owner-keyed scope=private visibility caller
@@ -822,6 +829,8 @@ impl MemoryStore for SqliteStore {
                 // the recall Filter gates every stored vector so recall
                 // never scores a foreign / unverified embedding space.
                 filter.active_embedding_space.as_deref(),
+                // v1.0.0 #1834 — SAL semantic recall now filters by valid-time.
+                valid_at,
             )
             .map_err(box_err)?
             .0
@@ -841,6 +850,8 @@ impl MemoryStore for SqliteStore {
                 false,
                 None,
                 vis_caller,
+                // v1.0.0 #1834 — SAL keyword recall now filters by valid-time.
+                valid_at,
             )
             .map_err(box_err)?
             .0
@@ -2304,6 +2315,8 @@ impl MemoryStore for SqliteStore {
             version: 1,
             lifecycle_state: crate::models::LifecycleState::Open,
             cid: None,
+            valid_from: None,
+            valid_until: None,
         };
         let conn = self.state.lock().await;
         db::insert(&conn, &mem).map_err(box_err)
@@ -2493,6 +2506,8 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: "sal-test".to_string(),

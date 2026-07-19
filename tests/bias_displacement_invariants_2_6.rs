@@ -205,6 +205,7 @@ fn recall_default(conn: &Connection, ns: &str, query: &str) -> Vec<(String, f64)
         false,
         None,
         None, // #1720 caller
+        None, // #1834 valid_at
     )
     .expect("recall");
     results.into_iter().map(|(m, s)| (m.id, s)).collect()

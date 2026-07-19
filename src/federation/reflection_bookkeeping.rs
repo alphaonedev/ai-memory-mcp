@@ -284,6 +284,8 @@ mod tests {
         let now = Utc::now().to_rfc3339();
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: id.to_string(),
             tier: Tier::Mid,
             namespace: "test".to_string(),

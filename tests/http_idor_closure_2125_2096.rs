@@ -481,6 +481,8 @@ fn seed_observation(db_path: &std::path::Path, namespace: &str, title: &str) -> 
         confidence_decayed_at: None,
         version: 1,
         lifecycle_state: LifecycleState::Open,
+        valid_from: None,
+        valid_until: None,
     };
     ai_memory::db::insert(&conn, &mem).expect("insert observation")
 }

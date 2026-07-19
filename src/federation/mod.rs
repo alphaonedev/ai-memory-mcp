@@ -344,6 +344,8 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: "fed-test".to_string(),
             tier: crate::models::Tier::Mid,
             namespace: "app".to_string(),
@@ -1841,6 +1843,8 @@ mod tests {
     fn catchup_memory(title: &str, updated_at: &str) -> Memory {
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: format!("cat-{title}"),
             tier: crate::models::Tier::Mid,
             namespace: "catchup".to_string(),

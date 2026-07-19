@@ -1070,6 +1070,8 @@ fn ga2_memory(id: &str) -> ai_memory::models::Memory {
     let now = chrono::Utc::now().to_rfc3339();
     ai_memory::models::Memory {
         cid: None,
+        valid_from: None,
+        valid_until: None,
         id: id.to_string(),
         tier: ai_memory::models::Tier::Mid,
         namespace: "covga2".to_string(),

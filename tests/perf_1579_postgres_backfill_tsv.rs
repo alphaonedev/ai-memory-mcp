@@ -417,6 +417,7 @@ async fn b2_search_still_returns_matches_through_sal() {
         agent_id: None,
         since: None,
         until: None,
+        valid_at: None,
         limit: 10,
         active_embedding_space: None,
     };
