@@ -1280,7 +1280,9 @@ pub fn check_agent_action_deferred_cached(
     // PE-5) to the deferred audit queue. `submit_refusal` enqueues
     // any blocking verdict; Allow / Warn are not chain-logged here.
     if decision.is_blocking() {
-        queue.submit_refusal(agent_id, action, &decision);
+        if !queue.submit_refusal(agent_id, action, &decision) {
+            anyhow::bail!("governance refusal audit admission failed; action remains blocked");
+        }
     }
     Ok(decision)
 }

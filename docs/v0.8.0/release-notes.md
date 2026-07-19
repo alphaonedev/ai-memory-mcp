@@ -309,9 +309,10 @@ cognitive counterpart in the memory store itself.
   ID, with legacy payload-hash cardinality compatibility). Spool entries are
   atomically published with private permissions, bounded to 4,096 entries / 32
   MiB, and acknowledged only after durable chain or DLQ residence. Quota
-  exhaustion records a durable overflow marker and refuses unjournaled
-  delivery; journal-open failure returns a closed queue rather than a volatile
-  fallback. Wired into both
+  exhaustion records bounded timestamp/occurrence/hash overflow evidence and
+  refuses unjournaled delivery; production governance callers propagate that
+  failure and keep the action blocked. Recovery/journal-open failure returns a
+  closed queue rather than a volatile fallback. Wired into both
   `serve` and `mcp` boot paths.
 
 ## Other notable changes

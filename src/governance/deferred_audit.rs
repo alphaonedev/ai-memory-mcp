@@ -110,7 +110,9 @@ const JOURNAL_SPOOL_SUFFIX: &str = ".spool";
 const JOURNAL_SPOOL_MAX_ENTRIES: usize = 4_096;
 const JOURNAL_SPOOL_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const JOURNAL_LEGACY_REPLAY_MAX_BYTES: u64 = 32 * 1024 * 1024;
-const JOURNAL_OVERFLOW_MARKER: &str = ".overflow";
+const JOURNAL_OVERFLOW_MARKER_LIMIT: usize = 256;
+const JOURNAL_OVERFLOW_PREFIX: &str = ".overflow-";
+const JOURNAL_OVERFLOW_SATURATED: &str = ".overflow-saturated";
 
 /// Wire-name for the deferred refusal audit row. Audit-side dashboards
 /// filter on this string to surface storage-hook refusals separate
@@ -452,15 +454,20 @@ impl DeferredAuditJournal {
             sync_directory(parent).context("fsync deferred-audit spool parent")?;
         }
         let mut usage = SpoolUsage::default();
+        let mut overflow_markers = 0_usize;
         for entry in std::fs::read_dir(&spool_dir).context("scan deferred-audit spool")? {
             let entry = entry.context("read deferred-audit spool entry")?;
             let entry_path = entry.path();
-            if entry_path.extension().is_some_and(|ext| ext == "pending") {
-                std::fs::remove_file(&entry_path)
-                    .context("remove abandoned deferred-audit staging file")?;
-                continue;
+            if entry_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(JOURNAL_OVERFLOW_PREFIX))
+            {
+                overflow_markers += 1;
             }
-            if entry_path.extension().is_some_and(|ext| ext == "event") {
+            if entry_path.extension().is_some_and(|ext| ext == "pending")
+                || entry_path.extension().is_some_and(|ext| ext == "event")
+            {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -471,7 +478,11 @@ impl DeferredAuditJournal {
                 usage.bytes = usage.bytes.saturating_add(entry.metadata()?.len());
             }
         }
+        if overflow_markers > 0 {
+            tracing::error!(overflow_markers, path = %spool_dir.display(), "deferred-audit spool contains durable overflow evidence; prior refusals were blocked because audit admission was unavailable");
+        }
         sync_directory(&spool_dir).context("fsync reconciled deferred-audit spool")?;
+        validate_atomic_publication(&spool_dir)?;
         if usage.entries > JOURNAL_SPOOL_MAX_ENTRIES || usage.bytes > JOURNAL_SPOOL_MAX_BYTES {
             anyhow::bail!("deferred-audit spool exceeds configured safety bounds");
         }
@@ -513,7 +524,7 @@ impl DeferredAuditJournal {
             if usage.entries >= JOURNAL_SPOOL_MAX_ENTRIES
                 || usage.bytes.saturating_add(frame_len) > JOURNAL_SPOOL_MAX_BYTES
             {
-                self.record_overflow()?;
+                self.record_overflow(event, &payload)?;
                 anyhow::bail!("deferred-audit spool quota exhausted; refusing unjournaled event");
             }
             let staging_path = self
@@ -536,16 +547,25 @@ impl DeferredAuditJournal {
                 staging
                     .sync_all()
                     .context("journal spool append: fsync staging")?;
-                std::fs::rename(&staging_path, &spool_path)
+                std::fs::hard_link(&staging_path, &spool_path)
                     .context("journal spool append: publish occurrence")?;
-                self.sync_spool_dir()
+                usage.entries += 1;
+                usage.bytes += frame_len;
+                self.sync_spool_dir()?;
+                match std::fs::remove_file(&staging_path) {
+                    Ok(()) => self.sync_spool_dir(),
+                    Err(error) => {
+                        usage.entries += 1;
+                        usage.bytes += frame_len;
+                        tracing::error!(%error, path = %staging_path.display(), "deferred-audit staging cleanup failed; artifact remains quota-accounted");
+                        Ok(())
+                    }
+                }
             })();
             if staged.is_err() {
                 let _ = std::fs::remove_file(&staging_path);
             }
             staged?;
-            usage.entries += 1;
-            usage.bytes += frame_len;
             return Ok(());
         }
 
@@ -647,24 +667,26 @@ impl DeferredAuditJournal {
         sync_directory(&self.spool_dir).context("journal spool: fsync directory")
     }
 
-    fn record_overflow(&self) -> Result<()> {
-        let marker = self.spool_dir.join(JOURNAL_OVERFLOW_MARKER);
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        match options.open(&marker) {
-            Ok(mut file) => {
-                file.write_all(b"deferred-audit spool quota exhausted\n")?;
-                file.sync_all()?;
-                self.sync_spool_dir()
+    fn record_overflow(&self, event: &DeferredAuditEvent, payload: &[u8]) -> Result<()> {
+        let evidence = format!(
+            "timestamp={} occurrence_id={} payload_hash={}\n",
+            chrono::Utc::now().to_rfc3339(),
+            event.occurrence_id.as_deref().unwrap_or("legacy"),
+            hex::encode(payload_hash(payload))
+        );
+        for index in 0..JOURNAL_OVERFLOW_MARKER_LIMIT {
+            let marker = self
+                .spool_dir
+                .join(format!("{JOURNAL_OVERFLOW_PREFIX}{index:03}"));
+            if create_private_marker(&marker, evidence.as_bytes())? {
+                return self.sync_spool_dir();
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-            Err(error) => Err(error).context("create deferred-audit overflow marker"),
         }
+        let saturated = self.spool_dir.join(JOURNAL_OVERFLOW_SATURATED);
+        if create_private_marker(&saturated, b"overflow evidence saturated\n")? {
+            self.sync_spool_dir()?;
+        }
+        Ok(())
     }
 
     /// Truncate the journal to empty + fsync. Called after a successful
@@ -702,6 +724,7 @@ fn sync_directory(path: &Path) -> Result<()> {
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
         OpenOptions::new()
             .read(true)
+            .write(true)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)?
             .sync_all()?;
@@ -709,6 +732,49 @@ fn sync_directory(path: &Path) -> Result<()> {
     }
     #[cfg(not(any(unix, windows)))]
     anyhow::bail!("directory durability is unsupported on this platform");
+}
+
+fn validate_atomic_publication(spool_dir: &Path) -> Result<()> {
+    let probe_id = uuid::Uuid::new_v4();
+    let staging = spool_dir.join(format!(".{probe_id}.pending"));
+    let published = spool_dir.join(format!(".{probe_id}.probe"));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| -> Result<()> {
+        options.open(&staging)?.sync_all()?;
+        std::fs::hard_link(&staging, &published)
+            .context("deferred-audit spool lacks atomic no-replace publication")?;
+        std::fs::remove_file(&published)?;
+        std::fs::remove_file(&staging)?;
+        sync_directory(spool_dir)
+    })();
+    let _ = std::fs::remove_file(&published);
+    let _ = std::fs::remove_file(&staging);
+    result
+}
+
+fn create_private_marker(path: &Path, content: &[u8]) -> Result<bool> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            file.write_all(content)?;
+            file.sync_all()?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error).context("create deferred-audit overflow marker"),
+    }
 }
 
 fn journal_frame(payload: &[u8]) -> Result<Vec<u8>> {
@@ -1829,11 +1895,13 @@ pub fn install_deferred_audit_drainer_with_journal(
     // Boot recovery FIRST (replay-all-then-go-live): chain any pre-crash
     // refusals into signed_events before the live queue/hooks exist.
     if let Err(e) = recover_deferred_audit(&journal_path, db_path) {
-        tracing::warn!(
-            "deferred-audit boot recovery failed for {} (continuing; pre-crash refusals may \
-             remain in the journal for the next boot): {e:#}",
+        tracing::error!(
+            "deferred-audit boot recovery failed for {}; audit delivery is FAIL-CLOSED: {e:#}",
             journal_path.display()
         );
+        let (queue, receiver) = DeferredAuditQueue::new();
+        drop(receiver);
+        return (queue, tokio::spawn(async {}));
     }
     let journal = match DeferredAuditJournal::open(&journal_path) {
         Ok(j) => Arc::new(j),
@@ -3179,7 +3247,11 @@ mod tests {
         std::fs::write(&pending, b"partial").unwrap();
         drop(journal);
         let reopened = DeferredAuditJournal::open(&journal_path).unwrap();
-        assert!(!pending.exists());
+        assert!(
+            pending.exists(),
+            "possibly-live staging remains quota-accounted"
+        );
+        assert_eq!(reopened.spool_usage.lock().unwrap().entries, 2);
         let replayed = reopened.replay().unwrap();
         assert_eq!(replayed.len(), 1);
         assert_eq!(replayed[0].agent_id, "agent:valid");
@@ -3225,7 +3297,12 @@ mod tests {
         assert!(!queue.submit_refusal("agent:quota", &refusal_action(), &refusal_decision()));
         assert!(receiver.try_recv().is_err());
         assert_eq!(queue.metrics().send_failure_count(), 1);
-        assert!(journal.spool_dir.join(JOURNAL_OVERFLOW_MARKER).exists());
+        assert!(
+            journal
+                .spool_dir
+                .join(format!("{JOURNAL_OVERFLOW_PREFIX}000"))
+                .exists()
+        );
     }
 
     #[test]

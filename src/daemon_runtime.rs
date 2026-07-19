@@ -4232,7 +4232,12 @@ pub(crate) fn install_governance_pre_write_hook(
                         rule_id: "governance:consultation_failed".to_string(),
                         reason: reason.clone(),
                     };
-                    queue_for_hook.submit_refusal(&agent_id, &action, &synthetic_refusal);
+                    if !queue_for_hook.submit_refusal(&agent_id, &action, &synthetic_refusal) {
+                        return Err(
+                            "governance refusal audit admission failed; action remains blocked"
+                                .to_string(),
+                        );
+                    }
                     if fail_open {
                         tracing::warn!(
                             "L1-6 governance pre-write: rule consultation failed: {}; \
@@ -4365,11 +4370,16 @@ pub(crate) fn install_governance_pre_action_hook(
                         rule_id: "governance:consultation_failed".to_string(),
                         reason: reason.clone(),
                     };
-                    queue_for_wire_check.submit_refusal(
+                    if !queue_for_wire_check.submit_refusal(
                         WIRE_ACTION_ACTOR,
                         action,
                         &synthetic_refusal,
-                    );
+                    ) {
+                        return Err(
+                            "governance refusal audit admission failed; action remains blocked"
+                                .to_string(),
+                        );
+                    }
                     if fail_open {
                         tracing::warn!(
                             "wire_check: rule consultation failed: {}; \
@@ -4456,7 +4466,11 @@ fn governance_consultation_unavailable_inner(
         rule_id: "governance:consultation_unavailable".to_string(),
         reason: reason.clone(),
     };
-    queue.submit_refusal(agent_id, action, &synthetic_refusal);
+    if !queue.submit_refusal(agent_id, action, &synthetic_refusal) {
+        return Err(
+            "governance refusal audit admission failed; action remains blocked".to_string(),
+        );
+    }
     if fail_open {
         tracing::warn!(
             "{surface}: hook consultation connection unavailable (rules DB at {}); \
