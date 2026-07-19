@@ -1,0 +1,200 @@
+{
+  "spec_version": "2",
+  "db_schema_version": 85,
+  "source": "ai-memory-conformance-2030",
+  "exported_at": "2026-07-14T00:00:00Z",
+  "memories": [
+    {
+      "id": "mem-round-1",
+      "tier": "mid",
+      "namespace": "portability",
+      "title": "durable title",
+      "content": "the durable source-of-truth text that must round-trip losslessly",
+      "tags": [
+        "alpha",
+        "beta"
+      ],
+      "priority": 7,
+      "confidence": 0.9,
+      "source": "test",
+      "access_count": 0,
+      "created_at": "2026-07-14T00:00:00Z",
+      "updated_at": "2026-07-14T00:00:00Z",
+      "expires_at": "2026-07-21T00:00:00+00:00",
+      "metadata": {
+        "agent_id": "alice",
+        "version_vector": {
+          "entries": {
+            "host:pop-os": "2026-07-14T00:00:00Z"
+          }
+        }
+      },
+      "reflection_depth": 0,
+      "memory_kind": "decision",
+      "citations": [],
+      "confidence_source": "caller_provided",
+      "version": 1,
+      "lifecycle_state": "open",
+      "cid": "b3:711190c5325b021b34b5ea3bb534fde7545d09fb029e515ca252e426eb35d462",
+      "valid_from": "2026-01-01T00:00:00Z",
+      "valid_until": "2027-01-01T00:00:00Z"
+    }
+  ],
+  "links": [],
+  "signed_events": [
+    {
+      "id": "evt-0",
+      "agent_id": "alice",
+      "event_type": "memory_link.created",
+      "payload_hash": "169b5b823c62b64ca7e5f8456a13c8d5d06f4ece522a58bc2b8a784dcf3609b0",
+      "attest_level": "unsigned",
+      "timestamp": "2026-07-14T00:00:00Z",
+      "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "sequence": 1
+    },
+    {
+      "id": "evt-1",
+      "agent_id": "alice",
+      "event_type": "memory_link.created",
+      "payload_hash": "f64551fcd6f07823cb87971cfb91446425da18286b3ab1ef935e0cbd7a69f68a",
+      "attest_level": "unsigned",
+      "timestamp": "2026-07-14T00:00:00Z",
+      "prev_hash": "97793ed832ab80f509bdb549b3e016792bfdee90625f9ded84e1044dbb29c3a5",
+      "sequence": 2
+    },
+    {
+      "id": "evt-2",
+      "agent_id": "alice",
+      "event_type": "memory_link.created",
+      "payload_hash": "3946ca64ff78d93ca61090a437cbb6b3d2ca0d488f5f9ccf3059608368b27693",
+      "attest_level": "unsigned",
+      "timestamp": "2026-07-14T00:00:00Z",
+      "prev_hash": "d9ab11b70245e74881686743f9f2aace97aec3d986860d850a7c8931d8eec288",
+      "sequence": 3
+    },
+    {
+      "id": "evt-3",
+      "agent_id": "alice",
+      "event_type": "memory_link.created",
+      "payload_hash": "43bb00d0ce7790a53b91256b370c887b24791a5539a6fbfb70c5870e8c91ae5d",
+      "attest_level": "unsigned",
+      "timestamp": "2026-07-14T00:00:00Z",
+      "prev_hash": "e9251ac9fec2990878cad536009dd3b7555c6da2017adbeb527be084f0be5ebe",
+      "sequence": 4
+    }
+  ],
+  "memory_revisions": [
+    {
+      "id": "rev-1",
+      "memory_id": "mem-1",
+      "kind": "SUPERSEDE",
+      "prior_version": 1,
+      "namespace": "ns",
+      "agent_id": "alice",
+      "created_at": "2026-07-14T00:00:00Z",
+      "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "sequence": 1
+    }
+  ],
+  "forget_tombstones": [
+    {
+      "memory_id": "mem-forgotten",
+      "namespace": "ns",
+      "forgotten_at": "2026-07-14T00:00:00Z",
+      "agent_id": "alice",
+      "signature": "11111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111"
+    }
+  ],
+  "model_attestations": [
+    {
+      "id": "ma-1",
+      "provider": "openrouter",
+      "model_ref": "google/gemma-4-31b",
+      "model_family": "gemma",
+      "attest_level": "loader_observed",
+      "agent_id": "",
+      "created_at": "2026-07-14T00:00:00Z"
+    }
+  ],
+  "governance_rules": [
+    {
+      "id": "R-1",
+      "kind": "namespace_deny",
+      "matcher": "secret/*",
+      "severity": "refuse",
+      "reason": "no secrets",
+      "namespace": "*",
+      "created_by": "op",
+      "created_at": 1700000000,
+      "enabled": true,
+      "attest_level": "unsigned"
+    },
+    {
+      "id": "R001",
+      "kind": "filesystem_write",
+      "matcher": "{\"glob\":\"/tmp/**\"}",
+      "severity": "refuse",
+      "reason": "Operator hard rule (#691): no /tmp writes. Use $TMPDIR or .local-runs/.",
+      "namespace": "_global",
+      "created_by": "system:seed",
+      "created_at": 0,
+      "enabled": false,
+      "attest_level": "unsigned"
+    },
+    {
+      "id": "R002",
+      "kind": "filesystem_write",
+      "matcher": "{\"glob\":\"/var/tmp/**\"}",
+      "severity": "refuse",
+      "reason": "Operator hard rule (#691): no /var/tmp writes.",
+      "namespace": "_global",
+      "created_by": "system:seed",
+      "created_at": 0,
+      "enabled": false,
+      "attest_level": "unsigned"
+    },
+    {
+      "id": "R003",
+      "kind": "filesystem_write",
+      "matcher": "{\"glob\":\"/private/tmp/**\"}",
+      "severity": "refuse",
+      "reason": "Operator hard rule (#691): no /private/tmp writes (macOS realpath of /tmp).",
+      "namespace": "_global",
+      "created_by": "system:seed",
+      "created_at": 0,
+      "enabled": false,
+      "attest_level": "unsigned"
+    },
+    {
+      "id": "R004",
+      "kind": "process_spawn",
+      "matcher": "{\"binary\":\"cargo\",\"disk_free_min_gib\":20}",
+      "severity": "refuse",
+      "reason": "Operator hard rule (#691): cargo refused on low-disk system (<20 GiB free).",
+      "namespace": "_global",
+      "created_by": "system:seed",
+      "created_at": 0,
+      "enabled": false,
+      "attest_level": "unsigned"
+    }
+  ],
+  "trust_anchors": [
+    {
+      "role": "operator",
+      "pubkey_b64": "GX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE"
+    }
+  ],
+  "portability_complete": true,
+  "conformance_level": "L3",
+  "conformance_by_class": {
+    "forget_tombstones": "L2",
+    "governance_rules": "L3",
+    "links": "L1",
+    "memories": "L1",
+    "memory_revisions": "L2",
+    "model_attestations": "L2",
+    "signed_events": "L2",
+    "trust_anchors": "L3"
+  },
+  "count": 1
+}
