@@ -242,6 +242,8 @@ mod tests {
             valid_from: None,
             valid_until: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         let view = ClaimView::of_memory(&sample(), std::slice::from_ref(&link));
         assert_eq!(
