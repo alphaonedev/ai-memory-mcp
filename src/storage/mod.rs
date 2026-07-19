@@ -8277,9 +8277,13 @@ pub fn proactive_conflict_check(
     // embedder that produced `query_embedding`); the nullable
     // `?N IS NULL OR =` form keeps legacy dim-only behavior when no active
     // space is seeded (keyword-only / no embedder). The ANN-routed path
-    // (`proactive_conflict_check_candidates`) is already effectively gated
-    // because the in-memory index only holds active-space vectors
-    // post-#2167 (`get_all_embeddings` seeds active-space rows only).
+    // (`proactive_conflict_check_candidates`) is NOT covered by index
+    // membership alone — a candidate id can resolve to a row whose
+    // `embedding_space` drifted from the index snapshot (a concurrent
+    // out-of-process reembed) — so per #2188 defense-in-depth it carries
+    // its OWN direct row-side `AND (?N IS NULL OR embedding_space = ?N)`
+    // gate (see the comment there) rather than relying on this one
+    // transitively.
     let active_space = crate::embeddings::active_embedding_space();
     let mut stmt = conn.prepare(
         "SELECT id, title, content, embedding FROM memories
