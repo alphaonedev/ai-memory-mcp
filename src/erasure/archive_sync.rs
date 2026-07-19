@@ -38,7 +38,8 @@
 //! was minted under.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
@@ -73,6 +74,24 @@ pub const SCRUB_LIMIT_PER_TICK: usize = 16;
 /// bundling `limit` so it only bites under a pinned frontier.
 pub const SWEEP_PROBE_BUDGET_PER_TICK: usize = 4096;
 
+/// Consecutive per-row bundling failures before a row is treated as POISON and
+/// added to the process-static skip-set (#2225). Small so a genuinely-poison
+/// row (non-UTF-8 TEXT, non-finite REAL — permanent encode failures) stops
+/// pinning the keyset frontier within a few ticks, yet `> 1` so a transient
+/// failure (a momentary disk hiccup) is retried IN PLACE first before the row
+/// is skipped. The probe budget ([`SWEEP_PROBE_BUDGET_PER_TICK`]) bounds the
+/// per-tick COST of a pinned frontier; this skip-set bounds the DURATION of the
+/// pin so the tail is no longer starved while the poison row persists.
+pub const POISON_FAILURE_THRESHOLD: usize = 3;
+
+/// Upper bound on the per-store poison skip-set (#2225). Past the cap the
+/// OLDEST poison id is FIFO-evicted and thus retried on its next encounter —
+/// degrading gracefully to the pre-#2225 frontier-pin behavior for that one
+/// oldest id rather than growing memory without bound (North-Star: degrade,
+/// never OOM). Generously above the bundling `limit` so a realistic poison
+/// count never hits it.
+pub const POISON_SKIP_SET_CAP: usize = 4096;
+
 /// Grace window before an ownerless bundle (no archived AND no live row) is
 /// reaped and before a crashed `.tmp-*` dir is swept — long enough that an
 /// in-flight archive / reconstruct-on-read cannot race the reaper (F1).
@@ -103,6 +122,10 @@ pub struct SweepReport {
     pub already_current: usize,
     /// Rows whose bundling failed (WARN-logged; retried next pass).
     pub failed: usize,
+    /// Rows passed over this pass because they are in the process-static poison
+    /// skip-set (#2225) — not re-attempted, and NOT allowed to pin the frontier
+    /// so newer rows behind them are no longer starved. A restart retries them.
+    pub skipped_poison: usize,
 }
 
 /// Resolve the bundle directory for this connection: `AI_MEMORY_ERASURE_DIR`
@@ -179,6 +202,114 @@ fn reconcile_cursor() -> &'static AtomicUsize {
     CURSOR.get_or_init(|| AtomicUsize::new(0))
 }
 
+/// Per-store POISON tracking (#2225): sub-threshold consecutive-failure counts
+/// plus the bounded skip-set of ids the sweep passes over. Process-static and
+/// keyed by store dir alongside the keyset frontier ([`sweep_frontier`]), so it
+/// RESETS on restart — a repaired poison row is thus retried on the next boot
+/// (self-healing, consistent with the frontier's own restart-reset semantics).
+#[derive(Default)]
+struct PoisonState {
+    /// Consecutive bundling-failure count per id, held ONLY while below the
+    /// threshold (cleared on a success or on promotion into `skip`). Disjoint
+    /// from `skip_index` because the loop consults `skip_index` first and never
+    /// re-attempts a skipped row.
+    fail_counts: HashMap<String, usize>,
+    /// FIFO order of skip-set ids, for bounded eviction past the cap.
+    skip: VecDeque<String>,
+    /// Membership index of the skip-set (the authoritative "is this poison?").
+    skip_index: HashSet<String>,
+}
+
+impl PoisonState {
+    fn is_skipped(&self, id: &str) -> bool {
+        self.skip_index.contains(id)
+    }
+
+    /// Record one bundling failure for `id`. Returns `true` when this failure
+    /// PROMOTES the id into the skip-set (`>= POISON_FAILURE_THRESHOLD`
+    /// consecutive failures), at which point the frontier may pass it.
+    fn record_failure(&mut self, id: &str) -> bool {
+        let count = self.fail_counts.entry(id.to_string()).or_insert(0);
+        *count += 1;
+        if *count < POISON_FAILURE_THRESHOLD {
+            return false;
+        }
+        self.fail_counts.remove(id);
+        if self.skip_index.insert(id.to_string()) {
+            self.skip.push_back(id.to_string());
+            // Bounded: FIFO-evict the oldest poison id past the cap so an
+            // unbounded stream of distinct poison ids can never grow this set
+            // without bound (the evicted id degrades to retry-and-repin).
+            while self.skip.len() > POISON_SKIP_SET_CAP {
+                if let Some(evicted) = self.skip.pop_front() {
+                    self.skip_index.remove(&evicted);
+                }
+            }
+        }
+        true
+    }
+
+    /// A successful bundle clears any sub-threshold failure streak for `id`.
+    fn record_success(&mut self, id: &str) {
+        self.fail_counts.remove(id);
+    }
+}
+
+/// Process-static poison registry, keyed by store dir (the [`sweep_frontier`]
+/// precedent). Resets on restart.
+fn poison_registry() -> &'static Mutex<HashMap<PathBuf, PoisonState>> {
+    static REG: OnceLock<Mutex<HashMap<PathBuf, PoisonState>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Whether `id` is a recorded poison row for `dir` (in the skip-set).
+fn is_poison(dir: &Path, id: &str) -> bool {
+    poison_registry()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(dir)
+        .is_some_and(|state| state.is_skipped(id))
+}
+
+/// Record a bundling failure for `(dir, id)`; returns `true` when the id is
+/// newly promoted into the skip-set this call.
+fn record_bundle_failure(dir: &Path, id: &str) -> bool {
+    poison_registry()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(dir.to_path_buf())
+        .or_default()
+        .record_failure(id)
+}
+
+/// Clear any sub-threshold failure streak for `(dir, id)` after a successful
+/// bundle. No-op (and no allocation) when the store has no poison state.
+fn record_bundle_success(dir: &Path, id: &str) {
+    let mut reg = poison_registry()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(state) = reg.get_mut(dir) {
+        state.record_success(id);
+    }
+}
+
+/// Reset the PROCESS-STATIC sweep state (keyset frontier + poison skip-set) for
+/// `dir` — the in-process equivalent of a daemon restart for that store: the
+/// next sweep re-scans from the oldest archived row and RETRIES every
+/// previously-skipped poison row. This is the self-healing path once a poison
+/// row's underlying cause has been repaired, and the hook the #2225
+/// restart-clears-semantics test drives without forking a process.
+pub fn reset_process_static_sweep_state_for_dir(dir: &Path) {
+    sweep_frontier()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(dir);
+    poison_registry()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(dir);
+}
+
 /// One paced sweep pass: bundle up to `limit` committed archived rows that
 /// lack a current bundle, oldest `archived_at` first (a monotone frontier —
 /// resumable and starvation-free).
@@ -192,6 +323,20 @@ fn reconcile_cursor() -> &'static AtomicUsize {
 /// in the table each tick — the pacing bound holds precisely when the system
 /// is degraded. Already-current rows below the persisted keyset frontier are
 /// skipped entirely rather than re-probed on every tick.
+///
+/// # Poison rows (#2225 — R3 residual)
+/// A permanently-failing row (non-UTF-8 TEXT, non-finite REAL) would otherwise
+/// PIN the keyset frontier forever: the frontier never advances past a failed
+/// row, so once a poison row accumulates more than
+/// [`SWEEP_PROBE_BUDGET_PER_TICK`] successors the probe budget is exhausted on
+/// the already-current prefix before the tail is reached, and newer archived
+/// rows STARVE until the poison row is fixed. After
+/// [`POISON_FAILURE_THRESHOLD`] consecutive failures the row is added to a
+/// bounded ([`POISON_SKIP_SET_CAP`]) process-static skip-set with a WARN naming
+/// the id + reason; the frontier is then allowed to PASS it, draining the tail.
+/// The skip-set resets on restart (see
+/// [`reset_process_static_sweep_state_for_dir`]) so a repaired row is retried —
+/// self-healing, exactly like the keyset frontier's own restart-reset.
 ///
 /// # Errors
 /// Only on the id-scan query itself; per-row bundling failures are counted
@@ -232,14 +377,48 @@ pub fn sweep_archive_bundles(
             break;
         }
         let (id, archived_at) = row.context("erasure sweep: archive scan row")?;
+        // #2225 — a row already recorded as POISON (>= POISON_FAILURE_THRESHOLD
+        // consecutive failures this process) is PASSED OVER: not re-attempted,
+        // not charged against the probe budget (a cheap in-memory lookup, not a
+        // filesystem probe), and — critically — allowed to advance the keyset
+        // frontier so newer archived rows behind it are no longer STARVED. A
+        // restart clears the skip-set and retries the row. The skip-set is
+        // bounded (LRU/cap); at most POISON_SKIP_SET_CAP such passes per tick.
+        if is_poison(&key, &id) {
+            report.skipped_poison += 1;
+            if !failed_seen && let Some(at) = archived_at {
+                advanced = Some((at, id));
+            }
+            continue;
+        }
         probed += 1;
         if bundle_is_current(store, &id, archived_at.as_deref()) {
             report.already_current += 1;
+            record_bundle_success(&key, &id);
         } else {
             match bundle_one_row(conn, store, &id) {
-                Ok(()) => report.bundled += 1,
+                Ok(()) => {
+                    report.bundled += 1;
+                    record_bundle_success(&key, &id);
+                }
                 Err(e) => {
                     report.failed += 1;
+                    if record_bundle_failure(&key, &id) {
+                        // Threshold reached: the row JOINS the skip-set. WARN
+                        // once (naming id + reason) and let the frontier pass it
+                        // now so the starved tail behind it drains.
+                        tracing::warn!(
+                            target: ERASURE_TRACE_TARGET,
+                            bundle_id = %id,
+                            "erasure sweep: archived row failed bundling {POISON_FAILURE_THRESHOLD}x; \
+                             adding to the process-static poison skip-set so the keyset frontier can \
+                             advance past it (newer rows no longer starved; a restart retries it): {e:#}"
+                        );
+                        if !failed_seen && let Some(at) = archived_at {
+                            advanced = Some((at, id));
+                        }
+                        continue;
+                    }
                     failed_seen = true;
                     tracing::warn!(
                         target: ERASURE_TRACE_TARGET,
@@ -251,10 +430,10 @@ pub fn sweep_archive_bundles(
             }
         }
         // Advance the keyset frontier only over the contiguous current/bundled
-        // prefix: a failed row (and everything after it this pass) stays in
-        // scope for the next tick. A NULL `archived_at` row never anchors the
-        // frontier (no orderable key; it sorts first and is bundled on the
-        // first, frontier-empty, pass).
+        // prefix: a sub-threshold failed row (and everything after it this pass)
+        // stays in scope for the next tick. A NULL `archived_at` row never
+        // anchors the frontier (no orderable key; it sorts first and is bundled
+        // on the first, frontier-empty, pass).
         if !failed_seen && let Some(at) = archived_at {
             advanced = Some((at, id));
         }

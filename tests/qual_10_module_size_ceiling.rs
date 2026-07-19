@@ -352,7 +352,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // merged file lands at 26_155; ceiling 26_100 -> 26_250. Growth justified:
     // wiring on existing funnels only — the erasure subsystem itself lives in
     // the new src/erasure/ modules.
-    ("src/storage/mod.rs", 26_250),
+    // 2026-07-18 (TRACT anchors port, #1832/#1863/#1864): the ForgetReceipt
+    // read-only projection (get_forget_tombstone / verify_forget_receipt +
+    // round-trip tests) + the g10_3_* promotion-court and g10_4_*
+    // namespace-boundary characterization tests land storage/mod.rs at
+    // 26_650; ceiling 26_750 (+100 headroom). Read-only projections +
+    // honesty machine-checks — no new write path.
+    ("src/storage/mod.rs", 26_750),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress

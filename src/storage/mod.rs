@@ -4119,6 +4119,134 @@ pub fn memory_is_archived(conn: &Connection, memory_id: &str) -> Result<bool> {
     Ok(exists)
 }
 
+/// #1832 (TRACT-gap G18) — a read-only projection of a persisted v71
+/// `forget_tombstones` row: the SIGNED ERASURE ATTESTATION the substrate
+/// ALREADY computes at forget time (`purge_and_tombstone_forget`) and stores,
+/// surfaced so the requester can actually RECEIVE their proof-of-erasure.
+///
+/// # This is a receipt, NOT covenant enforcement
+///
+/// This is deliberately narrow: a right-to-be-forgotten RECEIPT (proof that a
+/// forget was RECORDED), **not** an assertion that the TRACT human↔AI covenant
+/// is enforced (its other clauses — a mandatory `why_trace` write-gate,
+/// immutable-authorship enforcement, permanent-dissent conservation — are
+/// UNIMPLEMENTED; see `docs/spec/TRACT-L1-CLAIM-CONTRACT.md` §8). The receipt is
+/// never re-signed here — it projects the bytes signed once at forget time.
+///
+/// The signature commits ONLY to `{memory_id, namespace, forgotten_at}` (the
+/// [`forget_tombstone_signable_bytes`] pre-image) — NEVER content (a content
+/// fingerprint would re-leak the erased row). [`signed`](Self::signed) is
+/// `false` on an unsigned daemon (no enrolled audit key — a common posture),
+/// in which case the receipt carries identity + time but NO cryptographic
+/// proof: read `signed` BEFORE trusting `signature`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ForgetReceipt {
+    /// The forgotten memory's id (a `forget_tombstones` row exists for it).
+    pub memory_id: String,
+    /// The namespace the forgotten memory lived in.
+    pub namespace: String,
+    /// RFC3339 instant the forget was recorded (`forgotten_at`).
+    pub forgotten_at: String,
+    /// The forgotten row's owner `agent_id`, when it carried one. This is the
+    /// VICTIM's owner, NOT the signer (the signer is always the daemon audit
+    /// key).
+    pub agent_id: Option<String>,
+    /// The daemon-audit-key Ed25519 signature over
+    /// [`forget_tombstone_signable_bytes`], when the daemon had an enrolled
+    /// key at forget time. `None` on an unsigned daemon.
+    pub signature: Option<Vec<u8>>,
+    /// `true` iff [`signature`](Self::signature) is present. A convenience
+    /// mirror so a consumer never mistakes an unsigned receipt for a proof.
+    pub signed: bool,
+}
+
+/// #1832 — the verdict of verifying a [`ForgetReceipt`] against a daemon audit
+/// verifying key. An UNSIGNED receipt is [`Unsigned`](Self::Unsigned) — never
+/// [`Valid`](Self::Valid): a missing signature is the absence of proof, not
+/// proof of anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgetReceiptVerdict {
+    /// The signature verified against the supplied key over the receipt's own
+    /// recomputed signable bytes.
+    Valid,
+    /// A signature is present but did not verify (wrong key, tampered receipt,
+    /// or malformed signature).
+    Invalid,
+    /// No signature on the receipt — the forget was recorded on an unsigned
+    /// daemon, so there is nothing to verify.
+    Unsigned,
+}
+
+/// #1832 — read the [`ForgetReceipt`] for an already-forgotten `memory_id`, or
+/// `Ok(None)` when no `forget_tombstones` row exists for it. A pure read
+/// projection of the v71 columns — it neither forgets nor re-signs.
+///
+/// # Errors
+/// - The underlying `SELECT` fails (I/O / corruption).
+pub fn get_forget_tombstone(conn: &Connection, memory_id: &str) -> Result<Option<ForgetReceipt>> {
+    use rusqlite::OptionalExtension;
+    let row = conn
+        .query_row(
+            "SELECT memory_id, namespace, forgotten_at, agent_id, signature \
+             FROM forget_tombstones WHERE memory_id = ?1",
+            params![memory_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<Vec<u8>>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(row.map(
+        |(memory_id, namespace, forgotten_at, agent_id, signature)| {
+            let signed = signature.is_some();
+            ForgetReceipt {
+                memory_id,
+                namespace,
+                forgotten_at,
+                agent_id,
+                signature,
+                signed,
+            }
+        },
+    ))
+}
+
+/// #1832 — verify a [`ForgetReceipt`]'s signature against a daemon audit
+/// `verifying_key`, RECOMPUTING the canonical signable bytes from the receipt's
+/// OWN `{memory_id, namespace, forgotten_at}` (never a presented digest — the
+/// #1464 / #626 discipline). Reuses the already-public
+/// [`forget_tombstone_signable_bytes`] pre-image + Ed25519 `verify_strict`, so
+/// this adds no new crypto contract — only exposes the one the forget path
+/// already froze at schema v71.
+#[must_use]
+pub fn verify_forget_receipt(
+    receipt: &ForgetReceipt,
+    verifying_key: &ed25519_dalek::VerifyingKey,
+) -> ForgetReceiptVerdict {
+    use ed25519_dalek::Signature;
+    let Some(sig_bytes) = receipt.signature.as_deref() else {
+        return ForgetReceiptVerdict::Unsigned;
+    };
+    let Ok(sig) = Signature::from_slice(sig_bytes) else {
+        return ForgetReceiptVerdict::Invalid;
+    };
+    let signable = forget_tombstone_signable_bytes(
+        &receipt.memory_id,
+        &receipt.namespace,
+        &receipt.forgotten_at,
+    );
+    match verifying_key.verify_strict(&signable, &sig) {
+        Ok(()) => ForgetReceiptVerdict::Valid,
+        Err(_) => ForgetReceiptVerdict::Invalid,
+    }
+}
+
 /// v0.9.0 G8 (#1825) — read a row's storage-internal `cid_genesis`
 /// pre-image on demand (it is deliberately NOT a [`Memory`] field). The
 /// verify path uses it to recompute + check the BLAKE3 address. Returns
@@ -17837,6 +17965,90 @@ mod tests {
         assert_eq!(escape_like_pattern("hello world"), "hello world");
     }
 
+    /// #1832 (TRACT-gap G18) — forget-receipt round-trip: a receipt whose
+    /// signature was minted over the canonical [`forget_tombstone_signable_bytes`]
+    /// verifies `Valid`; tampering ANY signed field flips it to `Invalid`; a
+    /// receipt with no signature is `Unsigned` (never `Valid`).
+    #[test]
+    fn forget_receipt_1832_verify_round_trip() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let vk = sk.verifying_key();
+        let (id, ns, at) = ("mem-abc", "team/eng", "2026-07-15T00:00:00Z");
+        let sig = sk.sign(&forget_tombstone_signable_bytes(id, ns, at));
+
+        let receipt = ForgetReceipt {
+            memory_id: id.to_string(),
+            namespace: ns.to_string(),
+            forgotten_at: at.to_string(),
+            agent_id: Some("ai:owner".to_string()),
+            signature: Some(sig.to_bytes().to_vec()),
+            signed: true,
+        };
+        assert_eq!(
+            verify_forget_receipt(&receipt, &vk),
+            ForgetReceiptVerdict::Valid,
+            "a faithfully-signed receipt must verify"
+        );
+
+        // Tamper a signed field — recompute of the signable diverges → Invalid.
+        let mut tampered = receipt.clone();
+        tampered.namespace = "attacker/ns".to_string();
+        assert_eq!(
+            verify_forget_receipt(&tampered, &vk),
+            ForgetReceiptVerdict::Invalid,
+            "tampering the namespace must break verification"
+        );
+
+        // Wrong key → Invalid.
+        let other = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        assert_eq!(
+            verify_forget_receipt(&receipt, &other),
+            ForgetReceiptVerdict::Invalid,
+            "a different key must not verify"
+        );
+
+        // Unsigned receipt is never Valid.
+        let unsigned = ForgetReceipt {
+            signature: None,
+            signed: false,
+            ..receipt.clone()
+        };
+        assert_eq!(
+            verify_forget_receipt(&unsigned, &vk),
+            ForgetReceiptVerdict::Unsigned,
+            "a missing signature is the absence of proof, not proof"
+        );
+    }
+
+    /// #1832 — the accessor projects a persisted tombstone; on an unsigned
+    /// test daemon (no audit key) the receipt is present but `signed = false`,
+    /// and a never-forgotten id yields `None`.
+    #[test]
+    fn forget_receipt_1832_accessor_projects_tombstone() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO forget_tombstones \
+                 (memory_id, namespace, forgotten_at, agent_id, signature) \
+             VALUES ('m1', 'ns', '2026-07-15T00:00:00Z', 'ai:owner', NULL)",
+            [],
+        )
+        .unwrap();
+
+        let got = get_forget_tombstone(&conn, "m1").unwrap().unwrap();
+        assert_eq!(got.memory_id, "m1");
+        assert_eq!(got.namespace, "ns");
+        assert_eq!(got.agent_id.as_deref(), Some("ai:owner"));
+        assert!(!got.signed, "NULL signature column → unsigned receipt");
+        assert!(got.signature.is_none());
+
+        assert!(
+            get_forget_tombstone(&conn, "never").unwrap().is_none(),
+            "no tombstone → None"
+        );
+    }
+
     /// v1.0.0 #1831 (G17) — end-to-end persisted M-of-N key-loss recovery:
     /// enroll a lineage, "lose" the head key, then RECOVER to a fresh
     /// primary via a 2-of-3 guardian quorum through the real persistence
@@ -23229,6 +23441,246 @@ mod tests {
         let resolved = resolve_governance_policy(&conn, "ns/locked")
             .expect("policy must resolve when explicitly set");
         assert_eq!(resolved.core.write, crate::models::GovernanceLevel::Owner);
+    }
+
+    // ---- #1863 (TRACT-gap G10.3) promotion-court characterization ----------
+    //
+    // These pin the HONEST current state documented in contract §13: the
+    // `promote` GovernanceLevel governs CALLER-initiated promotion only; the
+    // access-count auto-promote in the fold MAINTENANCE verb is court-blind
+    // (maintenance-exempt, like substrate eviction), and `long` durability is
+    // ALSO reachable via the WRITE lane (gated by `write`, not `promote`). A
+    // future v1.x opt-in to suppress maintenance auto-promote in
+    // adjudicated-permanence namespaces would flip test 1's assertion —
+    // deliberately failing it so the behavior change is a conscious edit here +
+    // a §13 ledger update.
+
+    /// Insert a namespace standard with `promote: Owner` (a configured court)
+    /// but `write: Any` (the write lane open) and return the fresh conn.
+    fn court_ns_conn(ns: &str) -> Connection {
+        use crate::models::{ApproverType, CorePolicy, GovernanceLevel, GovernancePolicy};
+        let conn = test_db();
+        let policy = GovernancePolicy {
+            core: CorePolicy {
+                write: GovernanceLevel::Any,
+                promote: GovernanceLevel::Owner,
+                delete: GovernanceLevel::Owner,
+                approver: ApproverType::Human,
+                inherit: true,
+                max_reflection_depth: None,
+                required_scope: None,
+            },
+            ..Default::default()
+        };
+        let mut standard = make_memory("g10-3-std", &format!("_standards-{ns}"), Tier::Long, 9);
+        standard.metadata = serde_json::json!({"governance": policy});
+        let sid = insert(&conn, &standard).unwrap();
+        set_namespace_standard(&conn, ns, &sid, None).unwrap();
+        conn
+    }
+
+    /// Test 1 — the access-count auto-promote (fold/touch MAINTENANCE verb) is
+    /// COURT-BLIND: a `mid` row in a `promote: Owner` namespace still flips to
+    /// `long` at `PROMOTION_THRESHOLD`, because the fold is callerless frecency
+    /// bookkeeping and never consults the promote court.
+    #[test]
+    fn g10_3_access_count_auto_promote_is_court_blind() {
+        let ns = "g10-3/court";
+        let conn = court_ns_conn(ns);
+        let mut m = make_memory("hot", ns, Tier::Mid, 5);
+        m.access_count = PROMOTION_THRESHOLD - 1;
+        let id = insert(&conn, &m).unwrap();
+        // Drive the maintenance auto-promote (one bump crosses the threshold).
+        touch(
+            &conn,
+            &id,
+            crate::models::SHORT_TTL_EXTEND_SECS,
+            crate::models::MID_TTL_EXTEND_SECS,
+        )
+        .unwrap();
+        let tier: String = conn
+            .query_row(
+                "SELECT tier FROM memories WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            tier, "long",
+            "access-count auto-promote is maintenance-exempt / court-blind (G10.3 §13); \
+             a v1.x suppress-in-adjudicated-namespaces opt-in would keep it 'mid'"
+        );
+    }
+
+    /// Test 2 — CALLER-initiated promotion IS court-gated: `enforce_governance`
+    /// with `GovernedAction::Promote` against the `promote: Owner` namespace by
+    /// a non-owner is denied. (Contrast test 1 — same namespace, different lane.)
+    #[test]
+    fn g10_3_caller_promote_is_court_gated() {
+        use crate::config::{
+            PermissionsMode, lock_permissions_mode_for_test,
+            override_active_permissions_mode_for_test,
+        };
+        use crate::models::{GovernanceDecision, GovernedAction};
+        let _gate = lock_permissions_mode_for_test();
+        override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+
+        let ns = "g10-3/court-promote";
+        let conn = court_ns_conn(ns);
+        let decision = enforce_governance(
+            &conn,
+            GovernedAction::Promote,
+            ns,
+            "ai:not-the-owner",
+            None,
+            None,
+            &serde_json::json!({"title": "x"}),
+            None,
+        )
+        .expect("enforce_governance must not error");
+        assert!(
+            matches!(decision, GovernanceDecision::Deny(_)),
+            "caller-initiated promote IS court-gated (promote: Owner) — got {decision:?}"
+        );
+    }
+
+    /// Test 3 — the DIRECT `tier=long` WRITE lane uses the `write` level, NOT
+    /// `promote`: a store into the `promote: Owner` (but `write: Any`) namespace
+    /// is Allowed, so `long` durability is reachable WITHOUT the promote court.
+    /// This is why "no `long` past a configured court" is not achievable by
+    /// gating the auto-promote lane alone (§13).
+    #[test]
+    fn g10_3_direct_long_write_uses_write_level_not_promote() {
+        use crate::config::{
+            PermissionsMode, lock_permissions_mode_for_test,
+            override_active_permissions_mode_for_test,
+        };
+        use crate::models::{GovernanceDecision, GovernedAction};
+        let _gate = lock_permissions_mode_for_test();
+        override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+
+        let ns = "g10-3/court-write";
+        let conn = court_ns_conn(ns);
+        let decision = enforce_governance(
+            &conn,
+            GovernedAction::Store,
+            ns,
+            "ai:anyone",
+            None,
+            None,
+            &serde_json::json!({"title": "x", "tier": "long"}),
+            None,
+        )
+        .expect("enforce_governance must not error");
+        assert!(
+            matches!(decision, GovernanceDecision::Allow),
+            "a tier=long store is gated by the WRITE level (Any here), NOT the promote \
+             court — long is reachable via the write lane (§13) — got {decision:?}"
+        );
+    }
+
+    // ---- #1864 (TRACT-gap G10.4) bridge-capability characterization --------
+    //
+    // Pin the HONEST current state documented in contract §14: cross-namespace
+    // recall is UNRESTRICTED — the namespace filter is EXACT-match (not
+    // hierarchical), `None` spans every namespace, and the read path consults
+    // NO capability token (namespace is a filter, not an enforced trust
+    // boundary). A future v1.x read-side bridge-capability would make a
+    // cross-namespace read require a token, flipping test 1 — deliberately
+    // failing it so the behavior change is a conscious edit + a §14 update.
+
+    /// Test 1 — cross-namespace recall SPANS namespaces un-gated: a keyword
+    /// search with `namespace = None` returns rows from BOTH `A` and `B` with
+    /// no capability token presented (the search signature has no capability
+    /// parameter — the read path has no gate).
+    #[test]
+    fn g10_4_cross_namespace_recall_is_unrestricted() {
+        let conn = test_db();
+        let mut a = make_memory("bridgeword alpha", "g10-4/a", Tier::Mid, 5);
+        a.content = "bridgeword payload in namespace a".to_string();
+        let mut b = make_memory("bridgeword beta", "g10-4/b", Tier::Mid, 5);
+        b.content = "bridgeword payload in namespace b".to_string();
+        insert(&conn, &a).unwrap();
+        insert(&conn, &b).unwrap();
+
+        // namespace=None spans ALL namespaces — no capability required.
+        let all = search(
+            &conn,
+            "bridgeword",
+            None, // <- cross-namespace: no boundary, no token
+            None,
+            10,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let namespaces: std::collections::HashSet<&str> =
+            all.iter().map(|m| m.namespace.as_str()).collect();
+        assert!(
+            namespaces.contains("g10-4/a") && namespaces.contains("g10-4/b"),
+            "cross-namespace recall is UNRESTRICTED (G10.4 §14): namespace=None returns \
+             rows from every namespace with NO bridge-capability; got {namespaces:?}"
+        );
+    }
+
+    /// Test 2 — the namespace filter is EXACT-match, NOT hierarchical: a search
+    /// scoped to the ancestor `g10-4` returns NOTHING from the child `g10-4/a`.
+    /// This is why the hierarchical `Caveat::NamespacePrefix` bridge-cap does
+    /// not compose with the recall filter (§14) — a v1.x concern.
+    #[test]
+    fn g10_4_namespace_filter_is_exact_match_not_hierarchical() {
+        let conn = test_db();
+        let mut child = make_memory("exactword one", "g10-4/a", Tier::Mid, 5);
+        child.content = "exactword lives in the child namespace".to_string();
+        insert(&conn, &child).unwrap();
+
+        // Exact-match: the ancestor filter does NOT match the child namespace.
+        let ancestor_scoped = search(
+            &conn,
+            "exactword",
+            Some("g10-4"),
+            None,
+            10,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            ancestor_scoped.is_empty(),
+            "namespace filter is EXACT-match (§14): 'g10-4' does not match child \
+             'g10-4/a' — got {} rows",
+            ancestor_scoped.len()
+        );
+        // The exact child namespace DOES return it.
+        let exact = search(
+            &conn,
+            "exactword",
+            Some("g10-4/a"),
+            None,
+            10,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(exact.len(), 1, "exact-namespace recall returns the row");
     }
 
     /// F1 regression (v0.7.0 round-2-fixes): when a parent namespace
