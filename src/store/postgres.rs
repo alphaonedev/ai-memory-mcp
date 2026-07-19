@@ -14923,12 +14923,14 @@ impl MemoryStore for PostgresStore {
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version, embedding,
                 mentioned_entity_id, lifecycle_state,
-                cid, cid_genesis, embedding_space
+                cid, cid_genesis, embedding_space,
+                valid_from, valid_until
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                       $18, $19, $20,
                       $21, $22, $23,
                       $24, $25, $26,
-                      $27, $28, $29, $30, $31)
+                      $27, $28, $29, $30, $31,
+                      $32, $33)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 tier = CASE
@@ -14995,6 +14997,11 @@ impl MemoryStore for PostgresStore {
                 -- re-store (sqlite parity); advances go through the typed
                 -- update gate.
                 lifecycle_state = memories.lifecycle_state,
+                -- v1.0.0 #2267 / #1834 — match the plain `store()`
+                -- claim-bitemporal contract: genesis is immutable while a
+                -- newly supplied upper bound may close the existing claim.
+                valid_from = memories.valid_from,
+                valid_until = COALESCE(EXCLUDED.valid_until, memories.valid_until),
                 -- v0.9.0 G8 (#1825) — cid/cid_genesis OMITTED from DO UPDATE
                 -- SET: surviving row keeps its genesis.
                 -- #1632 (pg twin) — upsert-merge bumps the Gap-1 counter.
@@ -15032,6 +15039,14 @@ impl MemoryStore for PostgresStore {
         .bind(&embed_cid.cid)
         .bind(&embed_cid.genesis)
         .bind(emb_space)
+        // v1.0.0 #2267 — this hot path used to omit both durable columns.
+        // Canonicalize at the same boundary as plain `store()` (#2265/v86).
+        .bind(crate::validate::canonical_valid_time_opt(
+            memory.valid_from.as_deref(),
+        ))
+        .bind(crate::validate::canonical_valid_time_opt(
+            memory.valid_until.as_deref(),
+        ))
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory_with_embedding", e))?
@@ -26961,6 +26976,40 @@ mod tests {
         let got2 = store.get(&ctx, &id2).await.expect("get back 2");
         assert_eq!(got2.entity_id.as_deref(), Some("entity-1608-b"));
         assert_eq!(got2.persona_version, Some(7));
+    }
+
+    /// #2267 — the postgres HTTP-create hot path must carry the same
+    /// claim-bitemporal columns as plain `store()`, including v86's canonical
+    /// UTC rendering. Before the fix both values were silently dropped.
+    #[tokio::test]
+    async fn live_store_with_embedding_round_trips_valid_time_2267() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("valid-time-2267-{unique}");
+        let mut mem = sample_memory(&format!("valid-{unique}"), &ns, "valid-2267", "body");
+        mem.valid_from = Some("2026-07-19T12:34:56.123456+05:00".to_string());
+        mem.valid_until = Some("2026-07-20T12:34:56Z".to_string());
+
+        let embedding = vec![0.5_f32; 384];
+        let id = store
+            .store_with_embedding(&ctx, &mem, Some(&embedding), Some("test-space#none"))
+            .await
+            .expect("store_with_embedding");
+        let got = store.get(&ctx, &id).await.expect("get back");
+
+        assert_eq!(
+            got.valid_from.as_deref(),
+            Some("2026-07-19T07:34:56.123456Z")
+        );
+        assert_eq!(
+            got.valid_until.as_deref(),
+            Some("2026-07-20T12:34:56.000000Z")
+        );
     }
 
     /// #1607 — postgres twin of the sqlite #1596 touch-TTL extension

@@ -37,7 +37,7 @@ dirs = "6"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 clap_mangen = "0.2"
-rusqlite = { version = "0.32" }
+rusqlite = { version = "0.32", features = ["functions"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # v0.7.0 #972 D1.1 (#982) — schemars derives the MCP tool inputSchema
@@ -346,7 +346,7 @@ tempfile = "3"
 # recall, so the `trace` feature on rusqlite is dev-only. Production
 # builds keep the bare `rusqlite = { version = "0.32" }` import — the
 # trace surface compiles into a no-op without this feature.
-rusqlite = { version = "0.32", features = ["trace"] }
+rusqlite = { version = "0.32", features = ["functions", "trace"] }
 tower = { version = "0.5", features = ["util"] }
 # Wave 4 (v0.6.3) — TLS test fixture generator. Pinned to an exact version
 # so cert / key / fingerprint bytes stay stable across machines (rcgen's
