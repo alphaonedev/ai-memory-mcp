@@ -256,6 +256,7 @@ thiserror = { version = "2", optional = true }
 # the `vector` type used by the hybrid-recall path.
 sqlx = { version = "0.8", optional = true, default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json", "macros"] }
 pgvector = { version = "0.4", optional = true, features = ["sqlx"] }
+notify = { version = "8.2.0", optional = true }
 
 # v0.6.0.0 — SQLite variant selection. Default builds the standard
 # bundled SQLite (matching pre-v0.6.0.0 behavior byte-for-byte). The
@@ -301,6 +302,16 @@ e2e = []
 # Linux-only journald sink, avoiding the operator-gated dep additions of the
 # original #1765). cfg(feature) consumer: `src/logging.rs` (arch-11 audit).
 syslog = []
+# #1978 (v1.0.0) — OPT-IN inotify/FSEvents/ReadDirectoryChangesW-backed L3
+# watch path (the `notify` crate, notify-rs org, CC0-1.0). OFF by default:
+# the std-only `std::fs::metadata` poll loop stays the portable default and
+# the build is byte-identical when this flag is off (the `notify` dep is not
+# compiled). When ON, `run_watch_daemon` first tries the event-driven loop
+# and FALLS BACK to the poll loop on any init failure (unsupported platform,
+# watch-limit exhaustion, no watchable dir) so capture never silently stops
+# (North Star: DEGRADE, never corrupt). cfg(feature) consumer:
+# `src/recover/watcher.rs` (arch-11 audit).
+fs-notify = ["dep:notify"]
 # v1.0.0 #1860 — OPT-IN vectorlite ANN backend scaffolding. OFF by
 # default and deliberately NOT in any CI job or release channel: the
 # vectorlite native library (an Apache-2.0 C++ SQLite loadable
