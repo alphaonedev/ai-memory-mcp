@@ -312,6 +312,17 @@ fn agent_pub_path(dir: &Path, agent_id: &str) -> PathBuf {
     dir.join(format!("{agent_id}{PUB_SUFFIX}"))
 }
 
+/// v1.0.0 #2004 (PR #2214 audit F4) — does ANY key material exist for
+/// `agent_id` under `dir` (`.pub` OR `.priv`)? Distinguishes "custody is
+/// genuinely absent" (both files missing → an opt-in feature is simply not
+/// enrolled) from "custody is present but unloadable" (a [`load`] failure
+/// with material on disk → corrupt / truncated / half-enrolled key files
+/// that an EXPLICIT operation must surface, never silently skip).
+#[must_use]
+pub(crate) fn key_material_present(agent_id: &str, dir: &Path) -> bool {
+    agent_pub_path(dir, agent_id).exists() || dir.join(format!("{agent_id}{PRIV_SUFFIX}")).exists()
+}
+
 /// #1679 — outcome of a [`rotate`] call.
 #[derive(Debug)]
 pub struct RotateOutcome {

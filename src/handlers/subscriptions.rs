@@ -449,6 +449,8 @@ pub async fn subscribe(
             version: 1,
             lifecycle_state: crate::models::LifecycleState::Open,
             cid: None,
+            valid_from: None,
+            valid_until: None,
         };
         let ctx = crate::store::CallerContext::for_agent(&caller);
         let stored_id = match app.store.store(&ctx, &mem).await {
@@ -538,6 +540,7 @@ pub async fn subscribe(
             None,
             None,
             None,
+            None, // #1834 valid_at (no as-of)
         )
         .ok()
         .and_then(|rows| {

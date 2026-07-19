@@ -247,6 +247,7 @@ fn collect_reflections(
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )?;
     Ok(rows
         .into_iter()
@@ -416,6 +417,8 @@ mod tests {
         let now = Utc::now().to_rfc3339();
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: ns.to_string(),

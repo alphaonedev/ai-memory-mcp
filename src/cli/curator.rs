@@ -1145,6 +1145,7 @@ fn run_rollback(db_path: &Path, args: &CuratorArgs, out: &mut CliOutput<'_>) -> 
             None,
             None,
             None,
+            None, // #1834 valid_at (no as-of)
         )?;
         let mut reversed = 0usize;
         for mem in &log {
@@ -1464,6 +1465,8 @@ mod tests {
         }
         let mem = crate::models::Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: crate::models::Tier::Mid,
             namespace: "_curator/rollback".to_string(),
@@ -1515,6 +1518,8 @@ mod tests {
             }
             let mem = crate::models::Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: crate::models::Tier::Mid,
                 namespace: "ns".to_string(),
@@ -1593,6 +1598,8 @@ mod tests {
             }
             let m1 = crate::models::Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: crate::models::Tier::Mid,
                 namespace: "ns".to_string(),
@@ -1623,6 +1630,8 @@ mod tests {
             };
             let m2 = crate::models::Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: crate::models::Tier::Mid,
                 namespace: "ns".to_string(),
@@ -1699,6 +1708,8 @@ mod tests {
             }
             let mem = crate::models::Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: crate::models::Tier::Mid,
                 namespace: "ns".to_string(),
@@ -1745,6 +1756,8 @@ mod tests {
             }
             let mem = crate::models::Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: crate::models::Tier::Mid,
                 namespace: "_curator/rollback".to_string(),
@@ -2423,7 +2436,20 @@ mod tests {
         );
         // The [consolidated] row landed.
         let conn = db::open(&env.db_path).unwrap();
-        let rows = db::list(&conn, Some("ns"), None, 16, 0, None, None, None, None, None).unwrap();
+        let rows = db::list(
+            &conn,
+            Some("ns"),
+            None,
+            16,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(
             rows.iter().any(|m| m.title.starts_with("[consolidated]")),
             "a consolidated row must exist"
@@ -2453,7 +2479,20 @@ mod tests {
         assert!(report.errors.is_empty(), "no errors: {:?}", report.errors);
         // Both source rows remain; no consolidated row.
         let conn = db::open(&env.db_path).unwrap();
-        let rows = db::list(&conn, Some("ns"), None, 16, 0, None, None, None, None, None).unwrap();
+        let rows = db::list(
+            &conn,
+            Some("ns"),
+            None,
+            16,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(rows.len(), 2, "both source rows remain live");
     }
 

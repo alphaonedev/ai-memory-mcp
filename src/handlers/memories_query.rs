@@ -98,6 +98,20 @@ pub async fn list_memories(
         return resp;
     }
 
+    // v1.0.0 #1834 — RFC3339-validate the claim-bitemporal AS-OF at the entry
+    // surface. `valid_at` is compared lexicographically against stored bounds,
+    // so a malformed value would silently mis-filter — reject it as a 400
+    // instead. Covers both the SAL (postgres) and direct (sqlite) branches.
+    if let Some(v) = p.valid_at.as_deref()
+        && let Err(e) = crate::validate::validate_valid_at(v)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": crate::errors::msg::invalid("valid_at", e)})),
+        )
+            .into_response();
+    }
+
     // v0.7.0 Wave-3 — Postgres-backed daemons dispatch through the
     // SAL trait. The trait's `Filter` shape carries
     // `(namespace, tier, tags_any, agent_id, since, until, limit)`,
@@ -145,6 +159,9 @@ pub async fn list_memories(
             agent_id: p.agent_id.clone(),
             since,
             until,
+            // v1.0.0 #1834 — claim-bitemporal AS-OF from the list DTO (RFC3339
+            // validated at the entry guard above).
+            valid_at: p.valid_at.clone(),
             limit,
             // #2167 — list/search never runs the recall space gate.
             active_embedding_space: None,
@@ -194,6 +211,8 @@ pub async fn list_memories(
             p.until.as_deref(),
             p.tags.as_deref(),
             p.agent_id.as_deref(),
+            // v1.0.0 #1834 — claim-bitemporal AS-OF (validated at entry).
+            p.valid_at.as_deref(),
         )
     })
     .await;
@@ -336,6 +355,10 @@ pub async fn search_memories(
             agent_id: p.agent_id.clone(),
             since,
             until,
+            // v1.0.0 #1834 — the claim-bitemporal AS-OF is scoped to the
+            // recall + list surfaces (design 591608d4); the keyword-search
+            // surface does not expose it, so no as-of filter applies here.
+            valid_at: None,
             limit,
             // #2167 — list/search never runs the recall space gate.
             active_embedding_space: None,
@@ -886,6 +909,8 @@ pub async fn bulk_create(
                 version: 1,
                 lifecycle_state: crate::models::LifecycleState::Open,
                 cid: None,
+                valid_from: None,
+                valid_until: None,
             };
 
             // #1919 (CWE-288) — per-row agent attestation, mirroring the
@@ -1113,6 +1138,8 @@ pub async fn bulk_create(
             // `attest_level` / adopt the signed `created_at`.
             let mut mem = Memory {
                 cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
+                valid_from: None,
+                valid_until: None,
                 id: Uuid::new_v4().to_string(),
                 tier: body.tier,
                 namespace: body.namespace,

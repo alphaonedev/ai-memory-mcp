@@ -256,6 +256,7 @@ fn update_preserves_authorship_by_default_and_refuses_rewrite_under_enforce() {
         Some(&rewrite),
         None,
         None,
+        None, // #1834 valid_until
     )
     .unwrap();
     assert!(found);
@@ -285,6 +286,7 @@ fn update_preserves_authorship_by_default_and_refuses_rewrite_under_enforce() {
         Some(&rewrite),
         None,
         None,
+        None, // #1834 valid_until
     )
     .expect_err("enforce must refuse an authorship rewrite");
     assert!(err.downcast_ref::<GovernanceRefusal>().is_some());
@@ -311,6 +313,7 @@ fn update_preserves_authorship_by_default_and_refuses_rewrite_under_enforce() {
         Some(&same),
         None,
         None,
+        None, // #1834 valid_until
     )
     .unwrap();
     assert!(
@@ -435,6 +438,7 @@ fn update_omitting_agent_id_preserves_authorship() {
         Some(&omit),
         None,
         None,
+        None, // #1834 valid_until
     )
     .unwrap();
     assert!(found);

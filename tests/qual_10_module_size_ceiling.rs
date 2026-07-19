@@ -338,13 +338,21 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // archive->restore valid_from/valid_until column threading + round-trip
     // unit test added ~65 LOC on top of the merge.
     //
-    // 2026-07-18 — bumped 25_900 → 26_000 by #2064 (erasure cold tier):
-    // the purge funnels collect bundle ids + remove bundles (destruction
-    // intent flows through the redundancy layer) and the two restore
-    // funnels gain the reconstruct-on-read fallback (~85 LOC; 25_924 at
-    // the bump). Growth is justified: wiring on existing funnels only —
-    // the erasure subsystem itself lives in the new src/erasure/ modules.
-    ("src/storage/mod.rs", 26_000),
+    // 2026-07-18 (#1834 claim-bitemporal residual, PR #2204): threading
+    // valid_from/valid_until through row_to_memory + insert/insert_if_newer +
+    // update_with_expected_version + build_list_query/list + recall +
+    // recall_hybrid FTS/semantic phases (valid_at AS-OF predicate) + the #2207
+    // merge-lane overwrite_full_row_by_id VALID-time columns lands the merged
+    // file at 26_029; ceiling 25_900 -> 26_100.
+    //
+    // 2026-07-19 — #2064 (erasure cold tier) merged on top of #2204: the
+    // purge funnels journal destruction intent + collect/remove bundle ids,
+    // the two restore funnels gain reconstruct-on-read + stale-bundle removal
+    // (F1/R1). Combined with the #2204 claim-bitemporal threading above the
+    // merged file lands at 26_155; ceiling 26_100 -> 26_250. Growth justified:
+    // wiring on existing funnels only — the erasure subsystem itself lives in
+    // the new src/erasure/ modules.
+    ("src/storage/mod.rs", 26_250),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -403,7 +411,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // mandatory-hook-presence enforcement gate (PreEventEnforceGate + install +
     // consult_pre_event_gate + test installer) + consult wiring in the
     // eligible pre-event dispatchers landed the file at 15_482; +48 headroom.
-    ("src/mcp/mod.rs", 15_800), /* 2026-07-18 campaign/docs-disclosure-bundle (#1868): B7-STREAM disposition comment block + initialize_advertises_no_streaming_capability_1868 regression test landed the file at 15_753 (was 15_700, #2172) */
+    ("src/mcp/mod.rs", 15_900), /* 2026-07-18 campaign/docs-disclosure-bundle (#1868): B7-STREAM disposition comment block + initialize_advertises_no_streaming_capability_1868 regression test landed the file at 15_753 (was 15_700, #2172). Then #1834 claim-bitemporal residual (PR #2204): valid_at recall/list dispatch + valid_until update threading + Memory struct-literal valid_from/valid_until fanout landed the merged file at 15_861; ceiling 15_800 -> 15_900 */
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
     // (fdfa69dd9 / 1d2b9553f / 6c8283cdf / dca98bd6b / 5d7f083e4 —
@@ -793,7 +801,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // recompute (signed_events head-row canonical hash + memory_revisions
     // head-row recompute + parse-dual + fold, K3 parity with sqlite) lands
     // postgres.rs at 27_762; ceiling 27_820 (+58 headroom).
-    ("src/store/postgres.rs", 27_820),
+    // 2026-07-18 (#1834 claim-bitemporal residual + #2207 merge-lane fix,
+    // PR #2204 merged onto the #1873 tree): pg valid_from/valid_until reads +
+    // store/store_batch/apply_remote_memory persistence (LWW) + both update
+    // funnels ($12/$14 valid_until COALESCE) + recall FTS/semantic/list
+    // valid_at AS-OF predicates + the merge_inbound full-row writer carrying
+    // the two VALID-time columns ($29/$30) land the merged file at 27_903;
+    // ceiling 27_820 -> 28_000 (+97 headroom).
+    ("src/store/postgres.rs", 28_000),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

@@ -367,7 +367,10 @@ fn a2a_2_multi_agent_private_visibility_isolation() {
     }
 
     // Total stored: 3 agents × (2 private + 1 collective) = 9.
-    let all = db::list(&conn, None, None, 100, 0, None, None, None, None, None).expect("list all");
+    let all = db::list(
+        &conn, None, None, 100, 0, None, None, None, None, None, None,
+    )
+    .expect("list all");
     assert_eq!(all.len(), 9, "9 rows total");
 }
 
@@ -664,8 +667,20 @@ fn a2a_5_four_domain_namespace_isolation() {
 
     // Per-namespace boundary check.
     for (ns, _, _) in &domains {
-        let listed =
-            db::list(&conn, Some(ns), None, 100, 0, None, None, None, None, None).expect("ns list");
+        let listed = db::list(
+            &conn,
+            Some(ns),
+            None,
+            100,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("ns list");
         assert_eq!(
             listed.len(),
             5,
@@ -679,8 +694,10 @@ fn a2a_5_four_domain_namespace_isolation() {
     }
 
     // Cross-namespace recall (no filter) returns all 20.
-    let all =
-        db::list(&conn, None, None, 100, 0, None, None, None, None, None).expect("global list");
+    let all = db::list(
+        &conn, None, None, 100, 0, None, None, None, None, None, None,
+    )
+    .expect("global list");
     assert_eq!(all.len(), 20, "global list = 4 × 5 = 20; got {}", all.len());
 }
 

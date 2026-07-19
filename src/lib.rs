@@ -627,6 +627,11 @@ pub mod handlers;
 // based on whether the harness supports deferred-tool registration.
 pub mod harness;
 pub mod hnsw;
+// v1.0.0 #1860 — opt-in vectorlite ANN backend scaffolding behind the
+// OFF-by-default `vectorlite` feature (runtime-loaded operator-acquired
+// SQLite extension; fails closed to the default HNSW backend).
+#[cfg(feature = "vectorlite")]
+pub mod vectorlite;
 // v0.7 Track G — programmable lifecycle hook pipeline. G1 lands
 // the config schema + SIGHUP hot-reload plumbing; the executor
 // (G3) and the actual fire points (G7+) layer on top of this

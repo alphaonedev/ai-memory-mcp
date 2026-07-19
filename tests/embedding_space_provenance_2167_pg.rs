@@ -132,6 +132,7 @@ async fn pg_recall_never_scores_foreign_space_2167() {
         until: None,
         limit: 50,
         active_embedding_space: Some(active.clone()),
+        valid_at: None,
     };
     let results = store
         .recall_hybrid(&ctx, "zzznomatchtokenzzz", Some(&vec), &filter)

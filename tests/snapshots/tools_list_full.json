@@ -254,6 +254,13 @@
               "null"
             ]
           },
+          "valid_at": {
+            "title": "1834 claim-bitemporal AS-OF: RFC3339 point in VALID-time. Returns only",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "verbose_provenance": {
             "type": [
               "boolean",
@@ -396,6 +403,13 @@
             ]
           },
           "tier": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "valid_at": {
+            "title": "1834 claim-bitemporal as-of: RFC3339 point in valid-time. Returns only",
             "type": [
               "string",
               "null"
@@ -983,6 +997,12 @@
             ]
           },
           "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "valid_until": {
             "type": [
               "string",
               "null"
