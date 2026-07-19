@@ -26,8 +26,10 @@
 //!
 //! 1. The storage hook captures the refusal verdict + agent identity
 //!    + canonical action payload as a [`DeferredAuditEvent`] and
-//!    submits it to the queue via [`DeferredAuditQueue::submit`]
-//!    (non-blocking, never panics).
+//!    submits it to the queue via [`DeferredAuditQueue::submit`]. Journaled
+//!    submission synchronously acquires the spool lock and fsyncs before the
+//!    in-memory send; failures are reported and the governed action stays
+//!    blocked.
 //! 2. A background drainer task ([`spawn_drainer_task`]) owns a FRESH
 //!    `Connection` (opened against the same `db_path` but NOT the
 //!    substrate writer's connection — SQLite WAL allows parallel
@@ -56,8 +58,8 @@
 //! - Memory pressure under attack is bounded by the rate at which the
 //!   drainer can append `signed_events` rows; on macOS / Linux a
 //!   single SQLite append in WAL mode is ~25-100 microseconds, so a
-//!   sustained 100k refusals/second saturates one core but never
-//!   blocks the storage write path.
+//!   sustained refusal load can therefore contend on the synchronous durable
+//!   admission path; this is intentional fail-closed backpressure.
 //!
 //! # Graceful shutdown
 //!
@@ -431,6 +433,11 @@ impl DeferredAuditJournal {
         let spool_existed = spool_dir.exists();
         std::fs::create_dir_all(&spool_dir)
             .with_context(|| format!("create deferred-audit spool {}", spool_dir.display()))?;
+        let spool_metadata = std::fs::symlink_metadata(&spool_dir)
+            .context("inspect deferred-audit spool directory")?;
+        if !spool_metadata.is_dir() || spool_metadata.file_type().is_symlink() {
+            anyhow::bail!("deferred-audit spool path is not a trusted directory");
+        }
         let mut journal_options = OpenOptions::new();
         journal_options.create(true).read(true).write(true);
         #[cfg(unix)]
@@ -438,9 +445,11 @@ impl DeferredAuditJournal {
             use std::os::unix::fs::OpenOptionsExt;
             journal_options.mode(0o600);
         }
+        apply_no_follow(&mut journal_options);
         let file = journal_options
             .open(&path)
             .with_context(|| format!("open deferred-audit journal {}", path.display()))?;
+        ensure_regular_file(&file, "deferred-audit journal")?;
         let lock_path = spool_dir.join(".lock");
         let mut lock_options = OpenOptions::new();
         lock_options.create(true).read(true).write(true);
@@ -449,9 +458,11 @@ impl DeferredAuditJournal {
             use std::os::unix::fs::OpenOptionsExt;
             lock_options.mode(0o600);
         }
+        apply_no_follow(&mut lock_options);
         let spool_lock = lock_options
             .open(&lock_path)
             .context("open deferred-audit spool lock")?;
+        ensure_regular_file(&spool_lock, "deferred-audit spool lock")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -550,14 +561,24 @@ impl DeferredAuditJournal {
                 overflow_markers += 1;
             }
             if entry_path.extension().is_some_and(|ext| ext == "event") {
+                if !entry
+                    .file_type()
+                    .context("inspect deferred-audit spool entry type")?
+                    .is_file()
+                {
+                    anyhow::bail!("deferred-audit spool event is not a regular file");
+                }
+                let entry_file = open_frame_file(&entry_path)
+                    .context("open deferred-audit spool entry safely")?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&entry_path, std::fs::Permissions::from_mode(0o600))
+                    entry_file
+                        .set_permissions(std::fs::Permissions::from_mode(0o600))
                         .context("tighten deferred-audit spool entry permissions")?;
                 }
                 usage.entries = usage.entries.saturating_add(1);
-                usage.bytes = usage.bytes.saturating_add(entry.metadata()?.len());
+                usage.bytes = usage.bytes.saturating_add(entry_file.metadata()?.len());
             }
         }
         if overflow_markers > 0 {
@@ -1001,7 +1022,7 @@ fn parse_complete_journal_frame(frame: &[u8]) -> Result<DeferredAuditEvent> {
 }
 
 fn read_journal_frame_bounded(path: &Path) -> Result<Vec<u8>> {
-    let file = File::open(path)?;
+    let file = open_frame_file(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         anyhow::bail!("journal frame is not a regular file");
@@ -1017,6 +1038,36 @@ fn read_journal_frame_bounded(path: &Path) -> Result<Vec<u8>> {
         anyhow::bail!("journal frame grew beyond maximum size while reading");
     }
     Ok(frame)
+}
+
+fn open_frame_file(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    apply_no_follow(&mut options);
+    let file = options.open(path)?;
+    ensure_regular_file(&file, "journal frame")?;
+    Ok(file)
+}
+
+fn ensure_regular_file(file: &File, label: &str) -> Result<()> {
+    if !file.metadata()?.is_file() {
+        anyhow::bail!("{label} is not a regular file");
+    }
+    Ok(())
+}
+
+fn apply_no_follow(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
 }
 
 fn occurrence_residence(
@@ -3521,6 +3572,41 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn journal_rejects_symlink_event_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let dir = fresh_tempdir();
+        let journal_path = dir.path().join("symlink-event.journal");
+        let journal = DeferredAuditJournal::open(&journal_path).unwrap();
+        let outside = dir.path().join("outside-frame");
+        std::fs::write(&outside, b"outside").unwrap();
+        let event_link = journal.spool_dir.join("hostile.event");
+        symlink(&outside, &event_link).unwrap();
+        drop(journal);
+
+        assert!(DeferredAuditJournal::open(&journal_path).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_rejects_fifo_event_without_opening_it() {
+        let dir = fresh_tempdir();
+        let journal_path = dir.path().join("fifo-event.journal");
+        let journal = DeferredAuditJournal::open(&journal_path).unwrap();
+        let event_fifo = journal.spool_dir.join("hostile.event");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&event_fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        drop(journal);
+
+        assert!(DeferredAuditJournal::open(&journal_path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn journal_spool_permissions_are_private() {
         use std::os::unix::fs::PermissionsExt;
         let dir = fresh_tempdir();
@@ -3620,6 +3706,114 @@ mod tests {
         assert_eq!(second_handle.spool_usage.lock().unwrap().entries, 2);
         first_handle.acknowledge(&first).unwrap();
         assert_eq!(first_handle.spool_usage.lock().unwrap().entries, 1);
+    }
+
+    #[test]
+    fn journal_cross_process_lock_prevents_simultaneous_quota_overshoot() {
+        const ROLE_ENV: &str = "AI_MEMORY_TEST_SPOOL_LOCK_ROLE";
+        const JOURNAL_ENV: &str = "AI_MEMORY_TEST_SPOOL_LOCK_JOURNAL";
+        const READY_ENV: &str = "AI_MEMORY_TEST_SPOOL_LOCK_READY";
+        const START_ENV: &str = "AI_MEMORY_TEST_SPOOL_LOCK_START";
+        const RESULT_ENV: &str = "AI_MEMORY_TEST_SPOOL_LOCK_RESULT";
+
+        if let Ok(role) = std::env::var(ROLE_ENV) {
+            let journal_path = PathBuf::from(std::env::var_os(JOURNAL_ENV).unwrap());
+            let ready_path = PathBuf::from(std::env::var_os(READY_ENV).unwrap());
+            let start_path = PathBuf::from(std::env::var_os(START_ENV).unwrap());
+            let result_path = PathBuf::from(std::env::var_os(RESULT_ENV).unwrap());
+            let journal = DeferredAuditJournal::open(journal_path).unwrap();
+            std::fs::write(&ready_path, b"ready").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !start_path.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "start barrier timeout"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let event = DeferredAuditEvent::from_refusal(
+                &format!("agent:quota-race-{role}"),
+                &refusal_action(),
+                &refusal_decision(),
+            )
+            .unwrap();
+            let result = if journal.append(&event).is_ok() {
+                b"ok".as_slice()
+            } else {
+                b"full".as_slice()
+            };
+            std::fs::write(result_path, result).unwrap();
+            return;
+        }
+
+        let dir = fresh_tempdir();
+        let journal_path = dir.path().join("cross-process-quota.journal");
+        let journal = DeferredAuditJournal::open(&journal_path).unwrap();
+        let sample = DeferredAuditEvent::from_refusal(
+            "agent:quota-race-a",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        let sample_len = u64::try_from(
+            journal_frame(&sample.canonical_bytes().unwrap())
+                .unwrap()
+                .len(),
+        )
+        .unwrap();
+        let mut remaining = JOURNAL_SPOOL_MAX_BYTES - sample_len;
+        let mut index = 0_u32;
+        while remaining > 0 {
+            let chunk = remaining.min(JOURNAL_MAX_FRAME_BYTES);
+            let filler =
+                File::create(journal.spool_dir.join(format!("filler-{index}.event"))).unwrap();
+            filler.set_len(chunk).unwrap();
+            remaining -= chunk;
+            index += 1;
+        }
+        journal.sync_spool_dir().unwrap();
+        drop(journal);
+
+        let start_path = dir.path().join("start");
+        let executable = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        let mut result_paths = Vec::new();
+        for role in ["a", "b"] {
+            let ready_path = dir.path().join(format!("ready-{role}"));
+            let result_path = dir.path().join(format!("result-{role}"));
+            let child = std::process::Command::new(&executable)
+                .arg("--exact")
+                .arg("governance::deferred_audit::tests::journal_cross_process_lock_prevents_simultaneous_quota_overshoot")
+                .arg("--nocapture")
+                .env(ROLE_ENV, role)
+                .env(JOURNAL_ENV, &journal_path)
+                .env(READY_ENV, &ready_path)
+                .env(START_ENV, &start_path)
+                .env(RESULT_ENV, &result_path)
+                .spawn()
+                .unwrap();
+            children.push((child, ready_path));
+            result_paths.push(result_path);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while children.iter().any(|(_, ready)| !ready.exists()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ready barrier timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::fs::write(&start_path, b"start").unwrap();
+        for (mut child, _) in children {
+            assert!(child.wait().unwrap().success());
+        }
+        let admitted = result_paths
+            .iter()
+            .filter(|path| std::fs::read(path).unwrap() == b"ok")
+            .count();
+        assert_eq!(admitted, 1);
+        let final_usage = scan_spool_usage(&journal_spool_dir(&journal_path)).unwrap();
+        assert!(final_usage.bytes <= JOURNAL_SPOOL_MAX_BYTES);
     }
 
     #[test]

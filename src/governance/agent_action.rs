@@ -1267,7 +1267,9 @@ pub fn check_agent_action_deferred(
 ///
 /// # Errors
 ///
-/// Returns an error if the rules-table SELECT fails.
+/// Returns an error if the rules-table SELECT fails or a blocking verdict
+/// cannot be durably admitted to the deferred audit path. Audit-admission
+/// errors are typed as [`AuditAdmissionError`] and remain fail-closed.
 pub fn check_agent_action_deferred_cached(
     conn: &Connection,
     cache: Option<&RuleCache>,
