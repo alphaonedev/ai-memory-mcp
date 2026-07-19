@@ -245,8 +245,17 @@ fn cmd_verify_receipt(
         )?;
     }
     // A tampered/invalid signature is a hard failure signal for scripting.
+    // Propagated via `bail!` (the module's round-2 F11 discipline: not
+    // stderr + process::exit, which skips destructors and cannot be
+    // asserted in-process) — the CLI top-level renders the error and maps
+    // it to exit code 1. The verdict line above has already been written,
+    // so scripting consumers get both the structured verdict and the
+    // non-zero exit.
     if verdict == "invalid" {
-        std::process::exit(1);
+        bail!(
+            "forget receipt {}: signature verification FAILED (invalid)",
+            receipt.memory_id
+        );
     }
     Ok(())
 }
