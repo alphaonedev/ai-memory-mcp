@@ -199,6 +199,40 @@ fn restore_survives_shard_loss_up_to_parity_budget() {
 }
 
 #[test]
+fn hostile_manifest_geometry_is_rejected_before_allocation() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    seed_archived(&f.conn, "row-hostile-geometry", "must fail closed", None);
+    archive_sync::gc_tick(&f.conn).expect("sweep");
+
+    let manifest_path = erasure_dir(&f.db_path)
+        .join("row-hostile-geometry")
+        .join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).expect("read manifest"))
+            .expect("parse manifest");
+    manifest["data_shards"] = serde_json::json!(usize::MAX);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("serialize hostile manifest"),
+    )
+    .expect("write hostile manifest");
+    drop_archived_row(&f.conn, "row-hostile-geometry");
+
+    let err = db::restore_archived(&f.conn, "row-hostile-geometry")
+        .expect_err("hostile geometry must be a typed refusal, never an allocation panic");
+    let detail = format!("{err:#}");
+    assert!(
+        detail.contains("manifest malformed") && detail.contains("invalid erasure params"),
+        "unexpected refusal: {detail}"
+    );
+    enable(false);
+}
+
+#[test]
 fn loss_beyond_budget_fails_loud_with_zero_partial_state() {
     let _g = env_lock()
         .lock()
@@ -346,6 +380,134 @@ fn sweep_is_paced_by_the_limit() {
 }
 
 #[test]
+fn sweep_frontier_survives_fresh_cli_process_2247() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    for (id, at) in [
+        ("row-cli-1", "2020-01-01T00:00:01Z"),
+        ("row-cli-2", "2020-01-01T00:00:02Z"),
+        ("row-cli-3", "2020-01-01T00:00:03Z"),
+    ] {
+        seed_archived(&f.conn, id, "cli cadence", None);
+        set_archived_at(&f.conn, id, at);
+    }
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+    let first = archive_sync::sweep_archive_bundles(&f.conn, &store, 1).expect("first CLI gc");
+    assert_eq!(first.bundled, 1);
+    assert!(store.dir().join(".sweep-frontier.json").is_file());
+
+    archive_sync::clear_process_caches_for_tests(store.dir());
+    let next = archive_sync::sweep_archive_bundles(&f.conn, &store, 16).expect("fresh CLI gc");
+    assert_eq!(next.bundled, 2, "fresh process resumes behind row 1");
+    assert_eq!(
+        next.already_current, 0,
+        "fresh process loads the durable frontier instead of re-probing the prefix"
+    );
+    enable(false);
+}
+
+#[test]
+fn reconcile_inventory_caches_root_walk_and_folds_temp_reap_2248() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    seed_archived(&f.conn, "row-indexed", "inventory", None);
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+    archive_sync::sweep_archive_bundles(&f.conn, &store, 16).expect("sweep");
+
+    let (first, reaped) = store.reconcile_inventory(0, 0);
+    assert_eq!(first, vec!["row-indexed"]);
+    assert_eq!(reaped, 0);
+
+    // A valid-looking directory added behind the cache is not discovered by
+    // the ordinary fast path, proving that path does no root enumeration.
+    let shadow = store.dir().join("row-shadow");
+    std::fs::create_dir(&shadow).expect("shadow dir");
+    std::fs::copy(
+        store.dir().join("row-indexed").join("manifest.json"),
+        shadow.join("manifest.json"),
+    )
+    .expect("shadow manifest");
+    let temp = store.dir().join(".tmp-crashed-writer");
+    std::fs::create_dir(&temp).expect("temp dir");
+    let (cached, cached_reaped) = store.reconcile_inventory(u64::MAX, 0);
+    assert_eq!(cached, vec!["row-indexed"]);
+    assert_eq!(cached_reaped, 0);
+    assert!(temp.exists(), "fast path performs no second temp-dir walk");
+
+    let (refreshed, refreshed_reaped) = store.reconcile_inventory(0, 0);
+    assert_eq!(refreshed, vec!["row-indexed", "row-shadow"]);
+    assert_eq!(
+        refreshed_reaped, 1,
+        "refresh folds temp reap into its one walk"
+    );
+    assert!(!temp.exists());
+    enable(false);
+}
+
+#[test]
+fn reconcile_cursor_is_durable_and_keyed_per_store_2247() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f1 = fixture();
+    let f2 = fixture();
+    for f in [&f1, &f2] {
+        for id in ["row-cursor-a", "row-cursor-b"] {
+            seed_archived(&f.conn, id, "cursor", None);
+        }
+        archive_sync::gc_tick(&f.conn).expect("bundle cursor fixture");
+        for id in ["row-cursor-a", "row-cursor-b"] {
+            drop_archived_row(&f.conn, id);
+        }
+    }
+    let s1 = archive_sync::store_for_conn(&f1.conn)
+        .expect("store 1")
+        .expect("enabled");
+    let s2 = archive_sync::store_for_conn(&f2.conn)
+        .expect("store 2")
+        .expect("enabled");
+
+    let first = archive_sync::reconcile_and_scrub(&f1.conn, &s1, 1, 0, 0);
+    assert_eq!(first.quarantined, 1);
+    assert!(
+        s1.dir()
+            .join(".quarantine/row-cursor-a/manifest.json")
+            .is_file(),
+        "store 1 begins at its own cursor zero"
+    );
+    archive_sync::clear_process_caches_for_tests(s1.dir());
+    let resumed = archive_sync::reconcile_and_scrub(&f1.conn, &s1, 1, 0, 0);
+    assert_eq!(resumed.quarantined, 1);
+    assert!(
+        s1.dir()
+            .join(".quarantine/row-cursor-b/manifest.json")
+            .is_file(),
+        "fresh process resumes store 1 from its durable cursor"
+    );
+
+    let independent = archive_sync::reconcile_and_scrub(&f2.conn, &s2, 1, 0, 0);
+    assert_eq!(independent.quarantined, 1);
+    assert!(
+        s2.dir()
+            .join(".quarantine/row-cursor-a/manifest.json")
+            .is_file(),
+        "store 2 has an independent cursor instead of inheriting store 1's"
+    );
+    enable(false);
+}
+
+#[test]
 fn journaled_purge_orphan_is_reaped_and_not_resurrectable() {
     // R1 (SAFE half of F1) — a bundle whose id carries a RECORDED purge intent
     // (journaled BEFORE the DELETE) is confirmed destruction. A crash between
@@ -383,6 +545,46 @@ fn journaled_purge_orphan_is_reaped_and_not_resurrectable() {
         !bundle.exists(),
         "journaled orphan bundle gone after reconciliation"
     );
+    enable(false);
+}
+
+#[test]
+fn purge_marker_blocks_cross_process_remint_until_row_and_bundle_are_gone() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    seed_archived(&f.conn, "row-purge-race", "must not be re-minted", None);
+    archive_sync::gc_tick(&f.conn).expect("initial sweep");
+    let dir = erasure_dir(&f.db_path);
+    let bundle = dir.join("row-purge-race");
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+
+    archive_sync::journal_purge_intent_best_effort(&f.conn, &["row-purge-race".to_string()]);
+    archive_sync::remove_bundles_best_effort(&f.conn, &["row-purge-race".to_string()]);
+    assert!(!bundle.exists(), "purge removed the old bundle");
+    assert!(
+        store.is_purge_intended("row-purge-race"),
+        "intent survives removal while a racing sweep may still see the row"
+    );
+
+    // Model the second process: its sweep starts from an empty in-process
+    // frontier while the durable archived row remains visible.
+    archive_sync::reset_process_static_sweep_state_for_dir(&dir);
+    let raced = archive_sync::sweep_archive_bundles(&f.conn, &store, 16).expect("racing sweep");
+    assert_eq!(raced.skipped_purge_intent, 1);
+    assert!(!bundle.exists(), "durable intent forbids re-minting");
+    assert!(store.is_purge_intended("row-purge-race"));
+
+    // Only after the row and bundle are both absent may compaction retire the
+    // marker. This keeps the journal bounded without reopening the race.
+    drop_archived_row(&f.conn, "row-purge-race");
+    let rr = archive_sync::reconcile_and_scrub(&f.conn, &store, 16, 0, 0);
+    assert_eq!(rr.journal_compacted, 1);
+    assert!(!store.is_purge_intended("row-purge-race"));
     enable(false);
 }
 

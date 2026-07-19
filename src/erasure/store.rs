@@ -62,16 +62,19 @@ pub const TEMP_DIR_PREFIX: &str = ".tmp-";
 /// BEFORE the `DELETE` (#2064 F1). The reconciler HARD-deletes a rowless
 /// bundle ONLY when its id is journaled here; a rowless bundle with NO marker
 /// is treated as possible DB loss and QUARANTINED (never destroyed). Dot-led
-/// so it is skipped by [`ErasureStore::list_committed_bundle_ids`].
+/// so it is skipped by [`ErasureStore::reconcile_inventory`].
 pub const PURGE_JOURNAL_DIR: &str = ".purge-intent";
 
 /// Dot-led subdir a rowless-but-UN-journaled bundle is MOVED into instead of
 /// being destroyed (#2064 F1): the DR-recovery holding pen. Invisible to
-/// `get` / `list_committed_bundle_ids` so a quarantined bundle can never be
+/// `get` / `reconcile_inventory` so a quarantined bundle can never be
 /// resurrected via `archive restore` (the resurrection lane stays closed),
 /// yet the bytes are PRESERVED on disk and recoverable
 /// ([`ErasureStore::recover_quarantined`]).
 pub const QUARANTINE_DIR: &str = ".quarantine";
+/// Derived committed-bundle inventory used to keep ordinary reconcile ticks
+/// bounded. A malformed/missing cache is rebuilt from the store root.
+const BUNDLE_INVENTORY_FILE: &str = ".bundle-inventory.json";
 
 /// fsync a single file so its bytes reach stable storage before the rename
 /// that publishes the bundle (F3 — power-loss durability: a torn/empty shard
@@ -295,7 +298,17 @@ impl ErasureStore {
                 reason: format!("manifest parse failed: {e}"),
             }
         })?;
-        let total = manifest.data_shards.saturating_add(manifest.parity_shards);
+        // The manifest is untrusted disk input. Validate its shard geometry
+        // before using it for allocation or filesystem iteration; the codec's
+        // later validation is intentionally defense-in-depth, not our first
+        // chance to reject a capacity-overflow/OOM manifest (#2243).
+        let params =
+            ErasureParams::new(manifest.data_shards, manifest.parity_shards).map_err(|e| {
+                ErasureError::ManifestMalformed {
+                    reason: e.to_string(),
+                }
+            })?;
+        let total = params.total_shards();
         let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(total);
         for i in 0..total {
             match std::fs::read(dir.join(shard_file_name(i))) {
@@ -347,19 +360,60 @@ impl ErasureStore {
         Ok(true)
     }
 
-    /// Enumerate the ids of every COMMITTED bundle (manifest present) in the
-    /// store, skipping in-progress `.tmp-*` assembly dirs and any dot-led
-    /// entry. Best-effort: an unreadable store root yields an empty list.
-    /// Backs the gc-tick orphan-reconciliation + scrub pass (F1/F3).
+    /// Load the cached committed-bundle inventory, refreshing it with ONE
+    /// combined root walk when absent/stale. The refresh also reaps stale temp
+    /// dirs, avoiding the former second full `read_dir` pass (#2248).
+    ///
+    /// Ordinary ticks read one small state file and examine only their bounded
+    /// window. A refresh tick pays the O(n) discovery cost at the explicit slow
+    /// cadence; the cache is derived and self-heals after malformed/torn writes.
     #[must_use]
-    pub fn list_committed_bundle_ids(&self) -> Vec<String> {
+    pub fn reconcile_inventory(
+        &self,
+        refresh_after_secs: u64,
+        temp_older_than_secs: u64,
+    ) -> (Vec<String>, usize) {
+        let cache_path = self.dir.join(BUNDLE_INVENTORY_FILE);
+        let cache_fresh = std::fs::metadata(&cache_path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age.as_secs() < refresh_after_secs);
+        if cache_fresh
+            && let Ok(bytes) = std::fs::read(&cache_path)
+            && let Ok(ids) = serde_json::from_slice::<Vec<String>>(&bytes)
+        {
+            return (
+                ids.into_iter()
+                    .filter(|id| validate_bundle_id(id).is_ok())
+                    .collect(),
+                0,
+            );
+        }
+
         let mut ids = Vec::new();
+        let mut temp_reaped = 0;
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return ids;
+            return (ids, temp_reaped);
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
+            if name.starts_with(TEMP_DIR_PREFIX) {
+                let age = entry
+                    .path()
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|d| d.as_secs());
+                if age.is_some_and(|a| a >= temp_older_than_secs)
+                    && std::fs::remove_dir_all(entry.path()).is_ok()
+                {
+                    temp_reaped += 1;
+                }
+                continue;
+            }
             if name.starts_with('.') {
                 continue;
             }
@@ -367,7 +421,11 @@ impl ErasureStore {
                 ids.push(name.to_string());
             }
         }
-        ids
+        ids.sort_unstable();
+        if let Ok(bytes) = serde_json::to_vec(&ids) {
+            let _ = std::fs::write(cache_path, bytes);
+        }
+        (ids, temp_reaped)
     }
 
     /// Age (seconds) of a bundle's manifest, i.e. how long ago it was last
@@ -379,38 +437,6 @@ impl ErasureStore {
         let dir = self.bundle_dir(id).ok()?;
         let meta = std::fs::metadata(dir.join(MANIFEST_FILE)).ok()?;
         meta.modified().ok()?.elapsed().ok().map(|d| d.as_secs())
-    }
-
-    /// Remove `.tmp-*` assembly dirs older than `older_than_secs` — the
-    /// crashed-writer leak the module doc's "next put clears it" claim never
-    /// actually cleaned (temp names embed nanos+pid, so a later `put` uses a
-    /// different name). Returns the count reaped (F1).
-    #[must_use]
-    pub fn reap_stale_temp_dirs(&self, older_than_secs: u64) -> usize {
-        let mut reaped = 0;
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return 0;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if !name.starts_with(TEMP_DIR_PREFIX) {
-                continue;
-            }
-            let age = entry
-                .path()
-                .metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.elapsed().ok())
-                .map(|d| d.as_secs());
-            if age.is_some_and(|a| a >= older_than_secs)
-                && std::fs::remove_dir_all(entry.path()).is_ok()
-            {
-                reaped += 1;
-            }
-        }
-        reaped
     }
 
     // ---- #2064 F1: purge-intent journal + quarantine (destructive-op safety) ----
@@ -468,20 +494,21 @@ impl ErasureStore {
         meta.modified().ok()?.elapsed().ok().map(|d| d.as_secs())
     }
 
-    /// Clear a purge-intent marker once its bundle is confirmed gone (the
-    /// happy-path purge removed the bundle, or the reconciler reaped it).
-    /// Best-effort — a lingering marker is compacted by
-    /// [`Self::compact_purge_journal`].
+    /// Clear a purge-intent marker once both its bundle and owning DB row are
+    /// confirmed gone. Callers must not clear merely after bundle removal: a
+    /// racing sweep may still hold a snapshot containing the row (#2246).
     pub fn clear_purge_intent(&self, id: &str) {
         if validate_bundle_id(id).is_ok() {
             let _ = std::fs::remove_file(self.journal_dir().join(id));
         }
     }
 
-    /// Drop journal markers whose bundle no longer exists (the purge fully
-    /// completed) so the journal stays bounded. Returns the count compacted.
+    /// Drop journal markers whose bundle no longer exists and whose caller-
+    /// supplied durable-state check confirms the owning DB row is also gone.
+    /// Keeping the marker until both halves disappear closes the cross-process
+    /// purge/sweep re-mint race (#2246). Returns the count compacted.
     #[must_use]
-    pub fn compact_purge_journal(&self) -> usize {
+    pub fn compact_purge_journal(&self, row_is_gone: impl Fn(&str) -> bool) -> usize {
         let mut compacted = 0;
         let Ok(entries) = std::fs::read_dir(self.journal_dir()) else {
             return 0;
@@ -489,7 +516,10 @@ impl ErasureStore {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if !self.contains(name) && std::fs::remove_file(entry.path()).is_ok() {
+            if !self.contains(name)
+                && row_is_gone(name)
+                && std::fs::remove_file(entry.path()).is_ok()
+            {
                 compacted += 1;
             }
         }
@@ -499,7 +529,7 @@ impl ErasureStore {
     /// MOVE the committed bundle for `id` into the quarantine holding pen
     /// (rowless + un-journaled → possible DB loss). NON-destructive: the bytes
     /// are preserved and recoverable, but the bundle is now invisible to
-    /// `get` / `list_committed_bundle_ids`, so it cannot be resurrected via a
+    /// `get` / `reconcile_inventory`, so it cannot be resurrected via a
     /// serving path. Returns whether a bundle was quarantined.
     ///
     /// # Errors

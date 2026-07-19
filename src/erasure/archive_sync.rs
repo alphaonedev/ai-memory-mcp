@@ -39,8 +39,8 @@
 
 use std::collections::HashMap;
 use std::collections::{HashSet, VecDeque};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use anyhow::{Context, Result};
@@ -96,6 +96,9 @@ pub const POISON_SKIP_SET_CAP: usize = 4096;
 /// reaped and before a crashed `.tmp-*` dir is swept — long enough that an
 /// in-flight archive / reconstruct-on-read cannot race the reaper (F1).
 pub const RECONCILE_GRACE_SECS: u64 = crate::SECS_PER_HOUR as u64;
+/// Slow-cadence refresh for the derived committed-bundle inventory. Ordinary
+/// ticks avoid a full root walk; refresh folds temp-dir reaping into that walk.
+pub const INVENTORY_REFRESH_SECS: u64 = crate::SECS_PER_HOUR as u64;
 
 /// The live memories table — the second existence lane the orphan reconciler
 /// consults so a bundle whose row was restored back to `memories` is left
@@ -112,6 +115,8 @@ const PAYLOAD_KEY_COLUMNS: &str = "columns";
 const PAYLOAD_KEY_B64: &str = "$b64";
 /// The protected table.
 const ARCHIVED_TABLE: &str = "archived_memories";
+const SWEEP_FRONTIER_STATE_FILE: &str = ".sweep-frontier.json";
+const RECONCILE_CURSOR_STATE_FILE: &str = ".reconcile-cursor";
 
 /// Report from one sweep pass.
 #[derive(Debug, Default, Clone, Copy)]
@@ -124,8 +129,12 @@ pub struct SweepReport {
     pub failed: usize,
     /// Rows passed over this pass because they are in the process-static poison
     /// skip-set (#2225) — not re-attempted, and NOT allowed to pin the frontier
-    /// so newer rows behind them are no longer starved. A restart retries them.
+    /// so newer rows behind them are no longer starved. The explicit repair
+    /// reset hook retries them.
     pub skipped_poison: usize,
+    /// Rows not bundled because a durable purge-intent marker forbids minting
+    /// a fresh copy while destruction may be racing in another process.
+    pub skipped_purge_intent: usize,
 }
 
 /// Resolve the bundle directory for this connection: `AI_MEMORY_ERASURE_DIR`
@@ -181,32 +190,96 @@ pub fn store_if_dir_present(conn: &Connection) -> Option<ErasureStore> {
     }
 }
 
-/// Process-static keyset resume frontier per store dir: the `(archived_at,
+/// In-process cache of the DURABLE keyset resume frontier per store dir: the `(archived_at,
 /// id)` of the last CONTIGUOUSLY current-or-bundled row the sweep reached, so
 /// an already-bundled prefix is not re-probed (a filesystem stat + manifest
 /// read + JSON parse) on every subsequent tick (F2 — the O(N)-per-tick
-/// re-probe elimination the auditor flagged). Resets on process restart, at
-/// which point a fresh scan from the oldest row re-covers everything — a
-/// clock-skew-skipped row is thus self-healing across a restart.
+/// re-probe elimination the auditor flagged). The authoritative value is also
+/// persisted under the store root, so one-shot CLI gc invocations resume rather
+/// than permanently starving the tail behind a large current prefix (#2247).
 fn sweep_frontier() -> &'static Mutex<HashMap<PathBuf, (String, String)>> {
     static FRONTIER: OnceLock<Mutex<HashMap<PathBuf, (String, String)>>> = OnceLock::new();
     FRONTIER.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Rotating cursor so the bounded per-tick reconcile scan (and the scrub it
-/// feeds) covers the WHOLE store over successive ticks instead of only ever
-/// examining the first `scan_limit` listing positions (R2) — the "paced +
-/// eventually-covering" guarantee, honest at corpus scale.
-fn reconcile_cursor() -> &'static AtomicUsize {
-    static CURSOR: OnceLock<AtomicUsize> = OnceLock::new();
-    CURSOR.get_or_init(|| AtomicUsize::new(0))
+/// Per-store in-process cache for the durable rotating reconcile cursor.
+fn reconcile_cursors() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static CURSORS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    CURSORS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn read_frontier(dir: &Path) -> Option<(String, String)> {
+    let bytes = std::fs::read(dir.join(SWEEP_FRONTIER_STATE_FILE)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn persist_gc_state(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let path = dir.join(name);
+    let staging = dir.join(format!(".tmp-gc-state-{name}-{}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&staging)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    #[cfg(windows)]
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+    }
+    std::fs::rename(&staging, &path)?;
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+fn persist_frontier(dir: &Path, frontier: &(String, String)) {
+    let path = dir.join(SWEEP_FRONTIER_STATE_FILE);
+    let Ok(bytes) = serde_json::to_vec(frontier) else {
+        return;
+    };
+    if let Err(e) = persist_gc_state(dir, SWEEP_FRONTIER_STATE_FILE, &bytes) {
+        tracing::warn!(
+            target: ERASURE_TRACE_TARGET,
+            state_path = %path.display(),
+            "erasure sweep: failed to persist resume frontier (next process may re-probe): {e}"
+        );
+    }
+}
+
+fn next_reconcile_start(dir: &Path, step: usize, len: usize) -> usize {
+    let mut cursors = reconcile_cursors()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let cursor = cursors.entry(dir.to_path_buf()).or_insert_with(|| {
+        std::fs::read_to_string(dir.join(RECONCILE_CURSOR_STATE_FILE))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    });
+    let start = *cursor % len;
+    *cursor = cursor.wrapping_add(step);
+    let path = dir.join(RECONCILE_CURSOR_STATE_FILE);
+    if let Err(e) = persist_gc_state(
+        dir,
+        RECONCILE_CURSOR_STATE_FILE,
+        cursor.to_string().as_bytes(),
+    ) {
+        tracing::warn!(
+            target: ERASURE_TRACE_TARGET,
+            state_path = %path.display(),
+            "erasure reconcile: failed to persist rotating cursor: {e}"
+        );
+    }
+    start
 }
 
 /// Per-store POISON tracking (#2225): sub-threshold consecutive-failure counts
 /// plus the bounded skip-set of ids the sweep passes over. Process-static and
-/// keyed by store dir alongside the keyset frontier ([`sweep_frontier`]), so it
-/// RESETS on restart — a repaired poison row is thus retried on the next boot
-/// (self-healing, consistent with the frontier's own restart-reset semantics).
+/// keyed by store dir alongside the keyset frontier ([`sweep_frontier`]). The
+/// explicit reset hook retries repaired poison rows; ordinary process restarts
+/// retain the durable frontier so CLI-only gc continues draining (#2247).
 #[derive(Default)]
 struct PoisonState {
     /// Consecutive bundling-failure count per id, held ONLY while below the
@@ -256,10 +329,28 @@ impl PoisonState {
 }
 
 /// Process-static poison registry, keyed by store dir (the [`sweep_frontier`]
-/// precedent). Resets on restart.
+/// precedent). Resets with the explicit sweep-state reset hook.
 fn poison_registry() -> &'static Mutex<HashMap<PathBuf, PoisonState>> {
     static REG: OnceLock<Mutex<HashMap<PathBuf, PoisonState>>> = OnceLock::new();
     REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Clear only process-local caches while preserving durable resume files.
+/// Test hook for modeling a fresh CLI process under #2247.
+#[doc(hidden)]
+pub fn clear_process_caches_for_tests(dir: &Path) {
+    sweep_frontier()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(dir);
+    reconcile_cursors()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(dir);
+    poison_registry()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(dir);
 }
 
 /// Whether `id` is a recorded poison row for `dir` (in the skip-set).
@@ -293,21 +384,16 @@ fn record_bundle_success(dir: &Path, id: &str) {
     }
 }
 
-/// Reset the PROCESS-STATIC sweep state (keyset frontier + poison skip-set) for
+/// Explicitly reset durable + process sweep state (frontier, cursor, poison) for
 /// `dir` — the in-process equivalent of a daemon restart for that store: the
 /// next sweep re-scans from the oldest archived row and RETRIES every
 /// previously-skipped poison row. This is the self-healing path once a poison
 /// row's underlying cause has been repaired, and the hook the #2225
 /// restart-clears-semantics test drives without forking a process.
 pub fn reset_process_static_sweep_state_for_dir(dir: &Path) {
-    sweep_frontier()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .remove(dir);
-    poison_registry()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .remove(dir);
+    clear_process_caches_for_tests(dir);
+    let _ = std::fs::remove_file(dir.join(SWEEP_FRONTIER_STATE_FILE));
+    let _ = std::fs::remove_file(dir.join(RECONCILE_CURSOR_STATE_FILE));
 }
 
 /// One paced sweep pass: bundle up to `limit` committed archived rows that
@@ -334,9 +420,9 @@ pub fn reset_process_static_sweep_state_for_dir(dir: &Path) {
 /// [`POISON_FAILURE_THRESHOLD`] consecutive failures the row is added to a
 /// bounded ([`POISON_SKIP_SET_CAP`]) process-static skip-set with a WARN naming
 /// the id + reason; the frontier is then allowed to PASS it, draining the tail.
-/// The skip-set resets on restart (see
+/// The skip-set resets with the explicit repair/reset hook (see
 /// [`reset_process_static_sweep_state_for_dir`]) so a repaired row is retried —
-/// self-healing, exactly like the keyset frontier's own restart-reset.
+/// self-healing without sacrificing the durable CLI resume frontier.
 ///
 /// # Errors
 /// Only on the id-scan query itself; per-row bundling failures are counted
@@ -348,12 +434,15 @@ pub fn sweep_archive_bundles(
 ) -> Result<SweepReport> {
     let mut report = SweepReport::default();
     let key = store.dir().to_path_buf();
-    let (front_at, front_id) = sweep_frontier()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(&key)
-        .cloned()
-        .unwrap_or_default();
+    let (front_at, front_id) = {
+        let mut frontiers = sweep_frontier()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        frontiers
+            .entry(key.clone())
+            .or_insert_with(|| read_frontier(&key).unwrap_or_default())
+            .clone()
+    };
     let mut stmt = conn
         .prepare(
             "SELECT id, archived_at FROM archived_memories \
@@ -397,9 +486,15 @@ pub fn sweep_archive_bundles(
             record_bundle_success(&key, &id);
         } else {
             match bundle_one_row(conn, store, &id) {
-                Ok(()) => {
+                Ok(true) => {
                     report.bundled += 1;
                     record_bundle_success(&key, &id);
+                }
+                Ok(false) => {
+                    report.skipped_purge_intent += 1;
+                    // The marker is durable shared state. Allow the frontier
+                    // past this row: compaction clears it only after both row
+                    // and bundle are gone, so no racing process can re-mint.
                 }
                 Err(e) => {
                     report.failed += 1;
@@ -439,6 +534,7 @@ pub fn sweep_archive_bundles(
         }
     }
     if let Some(frontier) = advanced {
+        persist_frontier(&key, &frontier);
         sweep_frontier()
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -533,11 +629,17 @@ fn archived_row_payload(conn: &Connection, id: &str) -> Result<(Vec<u8>, serde_j
 }
 
 /// Bundle one committed archived row into the store.
-fn bundle_one_row(conn: &Connection, store: &ErasureStore, id: &str) -> Result<()> {
+fn bundle_one_row(conn: &Connection, store: &ErasureStore, id: &str) -> Result<bool> {
+    // Destruction intent outranks a stale DB snapshot held by a racing sweep.
+    // The marker is not compacted until the row AND bundle are gone (#2246).
+    if store.is_purge_intended(id) {
+        return Ok(false);
+    }
     let (payload, meta) = archived_row_payload(conn, id)?;
     store
         .put(id, &payload, meta)
-        .map_err(|e| anyhow::anyhow!("bundle write failed: {e}"))
+        .map_err(|e| anyhow::anyhow!("bundle write failed: {e}"))?;
+    Ok(true)
 }
 
 /// Convert one payload JSON value back to a rusqlite [`Value`]. Refuses
@@ -714,9 +816,10 @@ pub fn remove_bundles_best_effort(conn: &Connection, ids: &[String]) {
     };
     for id in ids {
         match store.remove(id) {
-            // Happy path: the purge-journaled bundle is gone — drop its
-            // now-vestigial intent marker so the journal stays bounded.
-            Ok(_) => store.clear_purge_intent(id),
+            // Keep the marker even on success. The reconciler compacts it only
+            // after both bundle and DB row are verifiably gone, preventing a
+            // racing process with a stale row snapshot from re-minting (#2246).
+            Ok(_) => {}
             // A failed removal KEEPS the marker so the reconciler hard-reaps
             // the (journaled) survivor rather than quarantining it.
             Err(e) => tracing::warn!(
@@ -773,10 +876,7 @@ fn scrub_one(conn: &Connection, store: &ErasureStore, id: &str) -> Result<bool> 
     match store.get(id) {
         // Verified (or self-healed within budget) — nothing to do.
         Ok(Some(_)) | Ok(None) => Ok(false),
-        Err(_) => {
-            bundle_one_row(conn, store, id)?;
-            Ok(true)
-        }
+        Err(_) => Ok(bundle_one_row(conn, store, id)?),
     }
 }
 
@@ -861,9 +961,12 @@ pub fn reconcile_and_scrub(
     grace_secs: u64,
 ) -> ReconcileReport {
     let recover_mode = recover_quarantine_enabled();
+    let (ids, temp_reaped) = store.reconcile_inventory(INVENTORY_REFRESH_SECS, grace_secs);
     let mut report = ReconcileReport {
-        temp_reaped: store.reap_stale_temp_dirs(grace_secs),
-        journal_compacted: store.compact_purge_journal(),
+        temp_reaped,
+        journal_compacted: store.compact_purge_journal(|id| {
+            !row_exists(conn, ARCHIVED_TABLE, id) && !row_exists(conn, MEMORIES_TABLE, id)
+        }),
         ..ReconcileReport::default()
     };
     if recover_mode {
@@ -879,14 +982,13 @@ pub fn reconcile_and_scrub(
             }
         }
     }
-    let ids = store.list_committed_bundle_ids();
     let n = ids.len();
     if n == 0 {
         return report;
     }
     // R2 — rotate the window start each tick so every listing position is
     // eventually examined even when n > scan_limit.
-    let start = reconcile_cursor().fetch_add(scan_limit, Ordering::Relaxed) % n;
+    let start = next_reconcile_start(store.dir(), scan_limit, n);
     let mut scrub_candidates: Vec<String> = Vec::new();
     for offset in 0..scan_limit.min(n) {
         let id = &ids[(start + offset) % n];
@@ -902,7 +1004,8 @@ pub fn reconcile_and_scrub(
             // fuse). Clear it: a real purge re-journals, and the age gate skips
             // a concurrent in-flight purge (whose failure mode is quarantine —
             // safe — anyway).
-            if store.is_purge_intended(id)
+            if store.contains(id)
+                && store.is_purge_intended(id)
                 && store
                     .purge_intent_age_secs(id)
                     .is_some_and(|a| a >= grace_secs)
@@ -1042,8 +1145,8 @@ pub fn is_in_memory_db_path(db_path: &Path) -> bool {
 /// never on connection identity. The purge-journal ordering (journal
 /// BEFORE `DELETE`), the quarantine-not-destroy posture, and the #2225
 /// poison skip-set are untouched — only WHERE the sweep's connection comes
-/// from changes. The process-static sweep state (keyset frontier, poison
-/// registry, reconcile cursor) is keyed by store DIRECTORY, which resolves
+/// from changes. Sweep state (durable frontier/cursor plus process poison
+/// registry) is keyed by store DIRECTORY, which resolves
 /// identically for the dedicated connection (same DB file ⇒ same
 /// `<db>.erasure` sibling), so frontier semantics carry over unchanged.
 /// Callers MUST NOT run two sweeps of one store concurrently (that state
