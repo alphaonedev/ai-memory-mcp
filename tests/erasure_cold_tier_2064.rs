@@ -83,6 +83,29 @@ fn drop_archived_row(conn: &Connection, id: &str) {
         .expect("simulate archived-row loss");
 }
 
+/// Pin an archived row's `archived_at` so the sweep's `(archived_at, id)`
+/// keyset frontier ordering is deterministic in a test.
+fn set_archived_at(conn: &Connection, id: &str, at: &str) {
+    conn.execute(
+        "UPDATE archived_memories SET archived_at = ?1 WHERE id = ?2",
+        params![at, id],
+    )
+    .expect("set archived_at");
+}
+
+/// Make an archived row PERMANENTLY un-bundleable (#2225): stamp a non-UTF-8
+/// TEXT `title` (`CAST(x'ff' AS TEXT)` stores the raw 0xFF byte) so
+/// `archived_row_payload` bails loud on every bundling attempt — exactly the
+/// poison-row failure mode (non-UTF-8 TEXT / non-finite REAL) the frontier
+/// used to pin on.
+fn poison_row(conn: &Connection, id: &str) {
+    conn.execute(
+        "UPDATE archived_memories SET title = CAST(x'ff' AS TEXT) WHERE id = ?1",
+        params![id],
+    )
+    .expect("poison archived row title with non-UTF-8 bytes");
+}
+
 fn enable(on: bool) {
     if on {
         unsafe { std::env::set_var(ENV_ERASURE_COLD_TIER, "1") };
@@ -602,4 +625,127 @@ fn disabled_by_default_no_bundles_and_no_resurrection() {
         !db::restore_archived(&f.conn, "row-off").expect("restore"),
         "with the tier off a lost archived row stays lost (Ok(false))"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// #2225 — a poison row must not STARVE bundling of newer rows.
+//
+// The #2064 sweep's keyset frontier never advances past a failed row, so a
+// permanently-failing (poison) row plus more than SWEEP_PROBE_BUDGET_PER_TICK
+// successors pins the frontier forever and starves the tail. The bounded
+// process-static poison skip-set unpins the frontier after a few ticks: these
+// tests drive that behavior with a small, fast corpus (the frontier-advance is
+// the mechanism that prevents the large-corpus starvation).
+// ─────────────────────────────────────────────────────────────────────
+
+/// Seed one poison row (earliest `archived_at`) plus three successors, then
+/// drive enough ticks for the poison row to enter the skip-set.
+fn poison_plus_successors_fixture() -> (Fixture, PathBuf) {
+    let f = fixture();
+    seed_archived(&f.conn, "aaa-poison", "will be corrupted", None);
+    seed_archived(&f.conn, "bbb-succ-1", "successor one", None);
+    seed_archived(&f.conn, "ccc-succ-2", "successor two", None);
+    seed_archived(&f.conn, "ddd-succ-3", "successor three", None);
+    // Deterministic frontier ordering: the poison row sorts strictly first.
+    set_archived_at(&f.conn, "aaa-poison", "2020-01-01T00:00:00Z");
+    set_archived_at(&f.conn, "bbb-succ-1", "2020-01-01T00:00:01Z");
+    set_archived_at(&f.conn, "ccc-succ-2", "2020-01-01T00:00:02Z");
+    set_archived_at(&f.conn, "ddd-succ-3", "2020-01-01T00:00:03Z");
+    poison_row(&f.conn, "aaa-poison");
+    let dir = erasure_dir(&f.db_path);
+    // A clean process-static frontier/skip-set for this store dir (this store's
+    // dir is a fresh tempdir, but reset defensively for isolation).
+    archive_sync::reset_process_static_sweep_state_for_dir(&dir);
+    (f, dir)
+}
+
+#[test]
+fn poison_row_does_not_starve_successor_bundling_2225() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let (f, dir) = poison_plus_successors_fixture();
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+
+    // Drive enough ticks for the poison row to fail POISON_FAILURE_THRESHOLD
+    // times and enter the skip-set (after which the frontier passes it).
+    for _ in 0..(archive_sync::POISON_FAILURE_THRESHOLD + 2) {
+        archive_sync::sweep_archive_bundles(&f.conn, &store, archive_sync::SWEEP_LIMIT_PER_TICK)
+            .expect("sweep pass");
+    }
+
+    // Every successor is bundled despite the poison row that precedes them.
+    for id in ["bbb-succ-1", "ccc-succ-2", "ddd-succ-3"] {
+        assert!(
+            dir.join(id).join("manifest.json").is_file(),
+            "successor {id} must bundle despite the poison predecessor (#2225)"
+        );
+    }
+    // The poison row itself never bundles — its archived DB row is the durable
+    // source of truth (a redundancy gap, never corruption / data loss).
+    assert!(
+        !dir.join("aaa-poison").join("manifest.json").is_file(),
+        "the poison row must NOT bundle (it fails encode); the archived row is the durable truth"
+    );
+
+    // The fix's signature: once the poison row is skipped, the keyset frontier
+    // has advanced PAST it, so a settled tick re-probes NOTHING (failed == 0).
+    // Without the skip-set the frontier stays pinned before the poison row and
+    // every tick re-fails it (failed == 1) forever — the starvation the issue
+    // describes.
+    let settled =
+        archive_sync::sweep_archive_bundles(&f.conn, &store, archive_sync::SWEEP_LIMIT_PER_TICK)
+            .expect("settled sweep");
+    assert_eq!(
+        settled.failed, 0,
+        "the frontier has advanced past the poison row — it is no longer re-probed each tick"
+    );
+    assert_eq!(settled.bundled, 0, "nothing new to bundle at steady state");
+    enable(false);
+}
+
+#[test]
+fn poison_skip_set_clears_on_restart_2225() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let (f, dir) = poison_plus_successors_fixture();
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+
+    // Drive the poison row into the skip-set + settle the frontier past it.
+    for _ in 0..(archive_sync::POISON_FAILURE_THRESHOLD + 2) {
+        archive_sync::sweep_archive_bundles(&f.conn, &store, archive_sync::SWEEP_LIMIT_PER_TICK)
+            .expect("sweep pass");
+    }
+    let settled =
+        archive_sync::sweep_archive_bundles(&f.conn, &store, archive_sync::SWEEP_LIMIT_PER_TICK)
+            .expect("settled sweep");
+    assert_eq!(
+        settled.failed, 0,
+        "poison row skipped; frontier advanced past it"
+    );
+
+    // Simulate a process RESTART: the skip-set + keyset frontier are
+    // process-static and reset on restart, so the poison row is RETRIED (the
+    // self-healing path once its underlying cause is repaired).
+    archive_sync::reset_process_static_sweep_state_for_dir(&dir);
+
+    let after_restart =
+        archive_sync::sweep_archive_bundles(&f.conn, &store, archive_sync::SWEEP_LIMIT_PER_TICK)
+            .expect("post-restart sweep");
+    assert_eq!(
+        after_restart.failed, 1,
+        "a restart clears the skip-set — the poison row is re-attempted (fails again, still poison)"
+    );
+    assert_eq!(
+        after_restart.skipped_poison, 0,
+        "the skip-set was cleared by the restart, so nothing is skipped on the first fresh tick"
+    );
+    enable(false);
 }
