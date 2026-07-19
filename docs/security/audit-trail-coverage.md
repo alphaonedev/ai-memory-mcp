@@ -47,10 +47,11 @@ chain row. The auditor can verify:
 - Every reflection write with cross-peer provenance.
 - Every schema migration the substrate applied.
 
-Out of scope (closed by v0.8.0 **#697**): out-of-band agent actions
-the substrate cannot see and read-action visibility. Hard-crash loss in the
-deferred queue was closed by PE-4's durable spool and recovery-before-live
-path. See §4.
+Still out of scope / incomplete under **#697**: out-of-band agent actions the
+substrate cannot see, plus the intentional read-gate audit-availability gap
+(engaged read decisions are best-effort logged). Hard-crash loss for
+successfully admitted deferred events was closed by PE-4's durable spool and
+recovery-before-live path. See §4.
 
 ---
 
@@ -65,8 +66,8 @@ path. See §4.
 | Governance refusals on substrate-INTERNAL pre-write hook (`check_agent_action_no_audit`) | **Chain-logged and crash-durable after successful admission** via PE-3 + PE-4 | `event_type = "governance.refusal"`; payload hash binds canonical `{action, decision, agent_id, timestamp, occurrence_id}`; admitted occurrences are spooled before queue delivery and acknowledged only after chain/DLQ residence | quota exhaustion stores bounded timestamp/occurrence/payload-hash evidence instead of the full event; other admission/recovery failures emit operational errors and keep the queue/action closed without promising a marker | **#697** V08-PE-4 shipped |
 | Approval-API decisions (L1-8) | **Chain-logged today** | `event_type = "approval.<decision>"`, binds approver identity + decision + correlation id | none | — |
 | Schema migrations | **Chain-logged today** at boot | `event_type = "schema.migration"`, binds from-version + to-version + migration filename hash | none | — |
-| Read actions (`memory_recall` / `memory_search` / `memory_list` / `memory_get` / `memory_session_boot`) | **NOT chain-logged** at engine level. Handler-layer `AuditAction::Recall` etc. row is emitted to the JSON audit log per [`audit-trail.md`](./audit-trail.html), but no `signed_events` row | n/a — v0.8.0 adds `event_type = "governance.read_check"` once V08-PE-2 lands | engine has no `AgentAction::Read` variant at HEAD | **#697** V08-PE-2 |
-| Subprocess actions from Bash spawn chain (fork→exec under a permitted shell) | **NOT visible** to the engine at HEAD | n/a — v0.8.0 adds eBPF/dtrace surface and `event_type = "process.spawn_chain"` | invisible to the substrate without a kernel-side probe | **#697** V08-PE-3 |
+| Read actions (`memory_recall` / `memory_search` / `memory_list` / `memory_get` / `memory_session_boot`) | **Governance-evaluable today.** With enabled `read_action` rules, each decision is best-effort chain-logged; the zero-rule fast path emits nothing | `event_type = "governance.check"`, canonical action is `AgentAction::Read { surface, namespace, query }` plus the decision | audit-append failure logs a warning and the read proceeds by intentional split fail-posture; a blocking rule verdict itself remains fail-closed | **#697** V08-PE-2 shipped |
+| Subprocess actions from Bash spawn chain (fork→exec under a permitted shell) | **NOT visible** to the engine | n/a — a future kernel-side probe would emit `event_type = "process.spawn_chain"` | invisible to the substrate without a kernel-side probe | **#697** V08-PE-3 |
 | Out-of-band agent actions | **Unenforceable by definition** | n/a — substrate has no visibility | partial mitigations: V08-PE-1 mandatory-hook + V08-PE-6 TPM-bound binary integrity | **#697** V08-PE-1, V08-PE-6 |
 | Hard-crash-lost deferred events | **Closed for admitted occurrences by PE-4** — persistent per-occurrence spool | recovery replays content-bound occurrences before hooks go live; stable occurrence IDs make retry idempotent | spool is bounded to 4,096 entries / 32 MiB; quota exhaustion blocks the action and records bounded overflow evidence, while other unavailable-admission failures block and emit operational errors | **#697** V08-PE-4 shipped |
 
@@ -119,7 +120,7 @@ them direct database access.
 ### 3.4 Raw `signed_events` query example
 
 ```sql
--- Every refusal verdict, newest first, for a given agent
+-- Every synchronous governance decision, newest first, for a given agent
 SELECT id, agent_id, event_type, payload_hash, attest_level, timestamp
 FROM signed_events
 WHERE event_type = 'governance.check'
@@ -127,16 +128,20 @@ WHERE event_type = 'governance.check'
 ORDER BY timestamp DESC
 LIMIT 100;
 
--- Refusal-only filter — decode the payload_hash row by row through
--- the canonical_bytes path. Separately inspect the private deferred-audit
--- spool's bounded `.overflow-*` evidence and startup ERROR diagnostics for
--- refusals that stayed blocked because durable admission was unavailable.
+-- `signed_events` stores a one-way SHA-256 digest, not the decision preimage,
+-- so SQL alone cannot filter these rows by Allow/Warn/Refuse/Escalate. To
+-- verify a row, hash an independently retained canonical `{action, decision}`
+-- preimage and compare the digest. Deferred `governance.refusal` rows instead
+-- bind `{action, decision, agent_id, timestamp, occurrence_id}`. Separately
+-- inspect the private spool's bounded `.overflow-*` evidence and startup ERROR
+-- diagnostics for quota-exhausted refusals that stayed blocked.
 ```
 
-The canonical-bytes recipe is stable across versions. A future audit
-tool that wants to recompute hashes without the substrate binary can
-follow `governance/agent_action.rs::canonical_bytes` plus the
-matching emit in `emit_check_event`.
+The canonical-byte recipes are stable across versions. Recomputing a digest
+without the substrate binary requires the original canonical preimage from an
+independent evidence source; follow `governance/agent_action.rs` plus
+`emit_check_event` for synchronous checks, or
+`DeferredAuditEvent::canonical_bytes` for deferred refusals.
 
 ---
 
@@ -473,25 +478,25 @@ no-peer-header default-deny.
 
 ## 10. Forward roadmap
 
-Eight sub-tasks under **#697** drive 100% coverage. Each closes one
-row in §2:
+Eight sub-tasks under **#697** define the coverage program. Current status:
 
-- **V08-PE-1** Mandatory-hook profile — closes "out-of-band agent
-  actions" partially.
-- **V08-PE-2** Read-action gating — closes the "Read actions" row.
+- **V08-PE-1 — SHIPPED.** Mandatory-hook presence profile partially
+  mitigates out-of-band actions.
+- **V08-PE-2 — SHIPPED.** Read-action gating covers the five MCP read
+  surfaces with the documented best-effort audit posture.
 - **V08-PE-3** Subprocess-chain visibility — closes the "subprocess
   actions" row.
 - **V08-PE-4 — SHIPPED.** Persistent audit queue closes the former
   "hard-crash drainer loss" row with bounded durable admission,
   recovery-before-live, and fail-closed overflow handling.
-- **V08-PE-5** Severity-based human escalation — adds the Escalate
-  verdict, closes the "no human escalation" gap.
+- **V08-PE-5 — SHIPPED.** Severity-based human escalation adds the
+  fail-closed `Escalate` verdict.
 - **V08-PE-6** TPM-bound binary integrity — closes the "out-of-band"
   row's last partial mitigation.
 - **V08-PE-7** Refuse-by-default profile — flips the seed rules from
   `enabled = 0` to `enabled = 1, attest_level = operator_signed` for
   procurement-tier deployments.
-- **V08-PE-8** `ai-memory verify-audit-trail` — closes the
+- **V08-PE-8 — SHIPPED.** `ai-memory verify-audit-trail` closes the
   end-to-end verification loop (steps 1 + 2 + 3 in §6).
 
 Effort: 22–28 sessions · 3–4 weeks wall-clock · MEDIUM-HIGH risk.
