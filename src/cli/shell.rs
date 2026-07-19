@@ -74,6 +74,7 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
                 // `None` keeps the trust-all read posture (same as the
                 // all-`None` as_agent above).
                 None,
+                None,
             ) {
                 Ok((results, _outcome)) => {
                     // v0.9.0 P0-1 (#1869, T8) — shell ledger append on
@@ -154,7 +155,7 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
         }
         "list" | "ls" => {
             let ns = parts.get(1).copied();
-            match db::list(conn, ns, None, 20, 0, None, None, None, None, None) {
+            match db::list(conn, ns, None, 20, 0, None, None, None, None, None, None) {
                 Ok(results) => {
                     for mem in &results {
                         let age = human_age(&mem.updated_at);

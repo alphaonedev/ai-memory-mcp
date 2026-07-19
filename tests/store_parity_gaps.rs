@@ -156,6 +156,7 @@ fn verify_gap_1_version_sqlite() {
         None,
         None,
         Some(1),
+        None, // #1834 valid_until
     )
     .expect("first update succeeds");
     let v2: i64 = conn
@@ -183,6 +184,7 @@ fn verify_gap_1_version_sqlite() {
         None,
         None,
         Some(1),
+        None, // #1834 valid_until
     );
     let err = res.expect_err("stale expected_version must fail");
     let conflict = err
@@ -368,6 +370,7 @@ fn verify_gap_1725_in_place_archive_sqlite() {
         None,
         None,
         None,
+        None, // #1834 valid_until
     )
     .expect("edit 1");
     assert!(ok && changed, "edit 1 applied with content_changed=true");
@@ -411,6 +414,7 @@ fn verify_gap_1725_in_place_archive_sqlite() {
         None,
         None,
         None,
+        None, // #1834 valid_until
     )
     .expect("edit 2");
     let archive_count: i64 = conn
@@ -455,6 +459,7 @@ fn verify_gap_1725_in_place_archive_sqlite() {
         None,
         None,
         None,
+        None, // #1834 valid_until
     )
     .expect("priority-only edit");
     let nonc_count: i64 = conn
@@ -681,6 +686,7 @@ fn sqlite_update_inside_caller_transaction_does_not_nest_1725() {
         None,
         None,
         None,
+        None, // #1834 valid_until
     )
     .expect("in-place update inside an open tx must NOT nest-error");
     assert!(ok && changed, "update applied with content_changed");

@@ -90,6 +90,12 @@ pub struct UpdateRequest {
     pub source_uri: Option<String>,
 
     #[schemars(
+        description = "#1834 claim-bitemporal: close/move the claim's valid_until (RFC3339). valid_from is immutable."
+    )]
+    #[serde(default)]
+    pub valid_until: Option<String>,
+
+    #[schemars(
         description = "#1709 Pillar-2 lifecycle transition target (open|active|blocked|done|abandoned). Illegal transitions are rejected; terminals go nowhere."
     )]
     #[serde(default)]
@@ -190,6 +196,9 @@ pub(super) fn handle_update(
     // Validated below before reaching the storage layer; storage path
     // trusts the value as already-validated.
     let source_uri = params["source_uri"].as_str();
+    // v1.0.0 #1834 — opt-in claim-bitemporal valid_until patch (valid_from
+    // immutable). Validated below before reaching storage.
+    let valid_until = params["valid_until"].as_str();
     // v0.7.0 Provenance Gap 1 (#884) — optimistic-concurrency
     // `expected_version` param. When supplied + non-null, the
     // underlying storage::update_with_expected_version refuses the
@@ -307,6 +316,9 @@ pub(super) fn handle_update(
     }
     if let Some(uri) = source_uri {
         validate::validate_source_uri(uri).map_err(|e| e.to_string())?;
+    }
+    if let Some(v) = valid_until {
+        validate::validate_valid_at(v).map_err(|e| e.to_string())?;
     }
 
     let metadata = if params["metadata"].is_object() {
@@ -486,6 +498,8 @@ pub(super) fn handle_update(
         metadata.as_ref(),
         source_uri,
         expected_version,
+        // v1.0.0 #1834 — opt-in valid_until patch (valid_from immutable).
+        valid_until,
     )
     .map_err(|e| conflict_or_string(&e))?;
 
@@ -591,6 +605,8 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: MTier::Mid,
             namespace: "test".to_string(),

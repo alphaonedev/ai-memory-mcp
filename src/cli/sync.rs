@@ -672,6 +672,8 @@ mod tests {
     fn test_restamp_agent_id_preserves_original() {
         let mut mem = models::Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: "m1".to_string(),
             tier: models::Tier::Mid,
             namespace: "ns".to_string(),
@@ -712,6 +714,8 @@ mod tests {
     fn test_restamp_same_agent_no_imported_from() {
         let mut mem = models::Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: "m1".to_string(),
             tier: models::Tier::Mid,
             namespace: "ns".to_string(),
@@ -958,6 +962,8 @@ mod tests {
         let conn = db::open(&remote).unwrap();
         let mem = models::Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: id.clone(),
             tier: models::Tier::Mid,
             namespace: "ns".to_string(),
@@ -1006,6 +1012,8 @@ mod tests {
     fn pr9i_restamp_no_original_agent_id() {
         let mut mem = models::Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: "m-noid".to_string(),
             tier: models::Tier::Mid,
             namespace: "ns".to_string(),

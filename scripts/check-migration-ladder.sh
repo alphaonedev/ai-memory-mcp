@@ -26,7 +26,19 @@
 #       prefix (e.g. two `0041_*`) — the EXACT #2036-vs-#2192 collision shape.
 #   (b) two ladder ARMS declaring the same schema VERSION (a duplicate
 #       `if version < N {` in migrations.rs, or a duplicate `migrate_vN` /
-#       `if current_version < N {` in postgres.rs).
+#       `if current_version < N {` in postgres.rs). Arm-lane hardening (#2198,
+#       Fable audit of #2197): the CURRENT house convention phrases the TAIL
+#       arms against the const — `if version < CURRENT_SCHEMA_VERSION {` — which
+#       is INVISIBLE to a literal-`N` scan (three demonstrated escapes: a 2nd
+#       const-phrased arm; a literal `if version < 85` that duplicates the
+#       const-phrased v85 tip; a postgres `fn migrate_v85_extra` name-variant).
+#       So rule (b) now ALSO: (b1) NORMALIZES symbolic arms — a literal /
+#       resolved-arithmetic (`CURRENT_SCHEMA_VERSION - K`) arm AT OR ABOVE the
+#       const tip collides with the const-phrased cohort; (b2) PINS the exact
+#       count of bare const-phrased arms per adapter (a silent add moves the
+#       count and fails — bump the pin in lockstep, module-size-ceiling style);
+#       (b3) flags a DUPLICATE migrate_vN VERSION even under a name-variant
+#       (`migrate_vNN_suffix`) the exact-name dup regex misses.
 #   (c) a GAP (outside the documented historical allow-list) OR a
 #       non-monotonic jump in the ladder numbering: file prefixes must be
 #       gap-free per backend, and the literal `if version < N` arm sequence
@@ -79,6 +91,22 @@ LADDER_EXEMPT_FILES=(
     "postgres/0011_v0631_data_integrity.sql"
     "postgres/0012_v0700_metadata_object_check.sql"
 )
+#
+# EXPECTED_CONST_ARMS_<backend>: the exact count of bare const-phrased ladder
+# arms — `if version < CURRENT_SCHEMA_VERSION {` (sqlite) /
+# `if current_version < CURRENT_SCHEMA_VERSION {` (postgres) — that a
+# convention-following tree carries (#2198). These arms are the idempotent,
+# probe-guarded TAIL steps that run on any legacy upgrade; they gate on the
+# symbolic const rather than a literal, so the literal-`N` duplicate/monotonic
+# scan cannot see them. Pinning the count makes a silent ADD move the number
+# and FAIL — the author must either renumber the previous tip arm to a literal
+# (which then enters the monotonic lane) or bump this pin in lockstep with a
+# dated comment. Same discipline as the qual_10 module-size ceilings. Mirrored
+# in tests/migration_ladder_integrity.rs (EXPECTED_CONST_ARMS_*), bump both.
+# 2026-07-18 (#2198): sqlite=8 (the v74/v75/v76/v77/v78/v79/v80/v85-era arms),
+#                     postgres=1 (the single `if current_version < CSV` tail arm).
+EXPECTED_CONST_ARMS_SQLITE=8
+EXPECTED_CONST_ARMS_POSTGRES=1
 
 # --- Helpers ----------------------------------------------------------------
 
@@ -138,6 +166,43 @@ collect_arm_versions() {
         | grep -oE 'version < [0-9]+' | grep -oE '[0-9]+' || true
 }
 
+# collect_literal_arm_versions <rust-file> <arm-var> — the generic form of
+# `collect_arm_versions` for either adapter's arm variable (`version` for
+# sqlite migrations.rs, `current_version` for postgres.rs). Literal-`N` arms
+# only, in file order.
+collect_literal_arm_versions() {
+    local f="$1" var="$2"
+    grep -E "^[[:space:]]*if ${var} < [0-9]+ \{" "$f" 2>/dev/null \
+        | grep -oE "${var} < [0-9]+" | grep -oE '[0-9]+' || true
+}
+
+# count_bare_const_arms <rust-file> <arm-var> — how many arms gate on the BARE
+# symbolic const `if <var> < CURRENT_SCHEMA_VERSION {` (the count-pinned tail
+# cohort). Arithmetic forms (`… - K`) are deliberately EXCLUDED here — those are
+# resolved to a concrete numeric and treated as literal-equivalent arms.
+count_bare_const_arms() {
+    local f="$1" var="$2" n
+    n="$(grep -cE "^[[:space:]]*if ${var} < CURRENT_SCHEMA_VERSION \{" "$f" 2>/dev/null || true)"
+    echo "${n:-0}"
+}
+
+# collect_resolved_arithmetic_arms <rust-file> <arm-var> <csv> — NORMALIZATION:
+# resolve `if <var> < CURRENT_SCHEMA_VERSION - K {` / `+ K` to its concrete
+# numeric (csv-K / csv+K) so a symbolic-arithmetic arm cannot smuggle a
+# duplicate of a literal arm past the scan. Emits one concrete version per such
+# arm, in file order. (None exist in the tree today — this is the fail-closed
+# generalization the #2198 normalization mandate asks for.)
+collect_resolved_arithmetic_arms() {
+    local f="$1" var="$2" csv="$3" line op num
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        op="$(printf '%s' "$line" | grep -oE '[-+] *[0-9]+' | grep -oE '[-+]' | head -1)"
+        num="$(printf '%s' "$line" | grep -oE '[-+] *[0-9]+' | grep -oE '[0-9]+' | head -1)"
+        [[ -z "$op" || -z "$num" ]] && continue
+        if [[ "$op" == "-" ]]; then echo $((csv - num)); else echo $((csv + num)); fi
+    done < <(grep -oE "^[[:space:]]*if ${var} < CURRENT_SCHEMA_VERSION *[-+] *[0-9]+ \{" "$f" 2>/dev/null || true)
+}
+
 # --- The gate ---------------------------------------------------------------
 
 run_gate() {
@@ -148,6 +213,13 @@ run_gate() {
 
     local violations=0
     local backend dir
+
+    # CURRENT_SCHEMA_VERSION per adapter — read once up front so the arm-lane
+    # normalization (rule b1) can resolve the const-phrased tip; rule (d)
+    # cross-adapter agreement re-uses the same values.
+    local cv_sqlite cv_pg
+    cv_sqlite="$(read_current_schema_version "$mig_rs")"
+    cv_pg="$(read_current_schema_version "$pg_rs")"
 
     # ---- Rule (a) + (c-gap): per-backend prefix uniqueness + gap-free -------
     for backend in "${BACKENDS[@]}"; do
@@ -212,6 +284,34 @@ run_gate() {
             fi
             prev="$v"
         done < <(collect_arm_versions "$mig_rs")
+
+        # (b1) NORMALIZATION + tip-cohort ceiling (#2198): a literal or
+        #      resolved-arithmetic arm AT OR ABOVE CURRENT_SCHEMA_VERSION
+        #      duplicates the const-phrased `if version < CURRENT_SCHEMA_VERSION`
+        #      tip cohort. Catches the D1b escape (a literal `if version < 85`
+        #      alongside the const-phrased v85 tip — invisible to the monotonic
+        #      scan because 85 > 84 reads as "increasing").
+        if [[ -n "$cv_sqlite" ]]; then
+            local eff
+            while IFS= read -r eff; do
+                [[ -z "$eff" ]] && continue
+                if (( eff >= cv_sqlite )); then
+                    echo "❌ migration-ladder [sqlite]: RULE (b) arm \`if version < $eff\` is at/above CURRENT_SCHEMA_VERSION=$cv_sqlite — it duplicates the const-phrased \`if version < CURRENT_SCHEMA_VERSION\` tip cohort. Renumber below the tip, or bump the const AND the tip migration file in lockstep." >&2
+                    violations=$((violations + 1))
+                fi
+            done < <( { collect_literal_arm_versions "$mig_rs" version; \
+                        collect_resolved_arithmetic_arms "$mig_rs" version "$cv_sqlite"; } )
+
+            # (b2) const-phrased tip-cohort COUNT pin: catches the D1a escape
+            #      (a silently-added 2nd `if version < CURRENT_SCHEMA_VERSION`
+            #      arm the literal scan never sees).
+            local nconst
+            nconst="$(count_bare_const_arms "$mig_rs" version)"
+            if (( nconst != EXPECTED_CONST_ARMS_SQLITE )); then
+                echo "❌ migration-ladder [sqlite]: RULE (b) const-phrased arm count is $nconst but the pin is $EXPECTED_CONST_ARMS_SQLITE — a bare \`if version < CURRENT_SCHEMA_VERSION\` arm was added or removed (invisible to the literal-arm scan). Renumber the previous tip arm to a literal, or bump EXPECTED_CONST_ARMS_SQLITE in lockstep with a dated comment." >&2
+                violations=$((violations + 1))
+            fi
+        fi
     else
         echo "❌ migration-ladder: sqlite ladder source not found: $mig_rs" >&2
         violations=$((violations + 1))
@@ -235,15 +335,48 @@ run_gate() {
             printf '%s\n' "$duparm" | sed -E 's/^/     /' >&2
             violations=$((violations + 1))
         fi
+
+        # (b3) DUPLICATE migrate fn VERSION under a name-variant (#2198): the
+        #      exact-name dup regex above (`fn migrate_vN(`) misses a variant
+        #      like `fn migrate_v85_extra(` (precedent in-tree: migrate_v29_stamp).
+        #      Scan the NUMERIC after `fn migrate_v` across ALL variants and flag
+        #      a repeated version. Catches the D2 escape.
+        local dupfnnum
+        dupfnnum="$(grep -oE 'fn migrate_v[0-9]+' "$pg_rs" 2>/dev/null | grep -oE '[0-9]+' | sort -n | uniq -d || true)"
+        if [[ -n "$dupfnnum" ]]; then
+            echo "❌ migration-ladder [postgres]: RULE (b) DUPLICATE migrate fn VERSION(s) (a name-variant like migrate_vNN_suffix escapes the exact-name dup check):" >&2
+            printf '%s\n' "$dupfnnum" | sed -E 's/^/     v/' >&2
+            violations=$((violations + 1))
+        fi
+
+        # (b1)+(b2) NORMALIZATION ceiling + const-phrased cohort COUNT pin,
+        #      mirroring the sqlite arm lane.
+        if [[ -n "$cv_pg" ]]; then
+            local peff
+            while IFS= read -r peff; do
+                [[ -z "$peff" ]] && continue
+                if (( peff >= cv_pg )); then
+                    echo "❌ migration-ladder [postgres]: RULE (b) arm \`if current_version < $peff\` is at/above CURRENT_SCHEMA_VERSION=$cv_pg — it duplicates the const-phrased tip cohort. Renumber below the tip, or bump the const AND the tip migration in lockstep." >&2
+                    violations=$((violations + 1))
+                fi
+            done < <( { collect_literal_arm_versions "$pg_rs" current_version; \
+                        collect_resolved_arithmetic_arms "$pg_rs" current_version "$cv_pg"; } )
+
+            local npgconst
+            npgconst="$(count_bare_const_arms "$pg_rs" current_version)"
+            if (( npgconst != EXPECTED_CONST_ARMS_POSTGRES )); then
+                echo "❌ migration-ladder [postgres]: RULE (b) const-phrased arm count is $npgconst but the pin is $EXPECTED_CONST_ARMS_POSTGRES — a bare \`if current_version < CURRENT_SCHEMA_VERSION\` arm was added or removed (invisible to the literal-arm scan). Renumber the previous tip arm to a literal, or bump EXPECTED_CONST_ARMS_POSTGRES in lockstep with a dated comment." >&2
+                violations=$((violations + 1))
+            fi
+        fi
     else
         echo "❌ migration-ladder: postgres ladder source not found: $pg_rs" >&2
         violations=$((violations + 1))
     fi
 
     # ---- Rule (d): cross-adapter tip agreement ------------------------------
-    local cv_sqlite cv_pg
-    cv_sqlite="$(read_current_schema_version "$mig_rs")"
-    cv_pg="$(read_current_schema_version "$pg_rs")"
+    # (cv_sqlite / cv_pg were read once at the top of run_gate for the arm-lane
+    # normalization; rule (d) re-uses them.)
     if [[ -z "$cv_sqlite" ]]; then
         echo "❌ migration-ladder: could not read CURRENT_SCHEMA_VERSION from $mig_rs" >&2
         violations=$((violations + 1))
@@ -326,13 +459,17 @@ run_gate() {
 # --- Self-test --------------------------------------------------------------
 
 run_self_test() {
-    echo "migration-ladder gate: self-test (clean control -> PASS; #2036/#2192 same-prefix collision -> FAIL; same-version-two-arms -> FAIL)"
+    echo "migration-ladder gate: self-test (clean control -> PASS; #2036/#2192 same-prefix collision -> FAIL; same-version-two-arms -> FAIL; #2198 arm-lane const-phrase escapes D1a/D1b/D2 -> FAIL)"
     local scratch
     # Project hard rule: scratch UNDER the repo, never system /tmp.
     scratch="$(mktemp -d "$ROOT/.migration-ladder-selftest.XXXXXX")"
     trap 'rm -rf "$scratch"' RETURN
 
     local fail=0
+    # CURRENT_SCHEMA_VERSION of the real tree — the #2198 escapes are phrased
+    # against it, so resolve it dynamically (never hard-code the tip version).
+    local csv
+    csv="$(read_current_schema_version "$ROOT/src/storage/migrations.rs")"
 
     # (0) Clean control — the real tree must PASS.
     if run_gate >/dev/null 2>&1; then
@@ -379,8 +516,68 @@ run_self_test() {
         fail=1
     fi
 
+    # ---- #2198 arm-lane const-phrase escapes (Fable audit of #2197) ----------
+    #
+    # These three shapes ALL exited 0 on the pre-#2198 gate because rule (b)
+    # only saw LITERAL-number arms and the CURRENT house convention phrases the
+    # tail arms against `CURRENT_SCHEMA_VERSION`.
+
+    # (c) D1a — append a SECOND bare `if version < CURRENT_SCHEMA_VERSION {` arm
+    #     to migrations.rs. Invisible to the literal scan; caught by the
+    #     const-cohort COUNT pin (b2).
+    local duprs_c="$scratch/migrations_d1a.rs"
+    cp "$ROOT/src/storage/migrations.rs" "$duprs_c"
+    printf '\n// self-test injected 2nd const-phrased arm (D1a)\n        if version < CURRENT_SCHEMA_VERSION {\n            // duplicate const-phrased tip arm\n        }\n' >> "$duprs_c"
+    local out_c
+    if out_c="$(LADDER_MIGRATIONS_RS="$duprs_c" run_gate 2>&1)"; then
+        echo "  [c] D1a extra const-phrased arm: NOT CAUGHT (gate passed) — FAIL" >&2
+        fail=1
+    elif printf '%s' "$out_c" | grep -q 'const-phrased arm count is 9 but the pin is 8'; then
+        echo "  [c] D1a extra const-phrased arm (invisible to literal scan): CAUGHT"
+    else
+        echo "  [c] D1a extra const-phrased arm: gate failed but without the count-pin message — FAIL" >&2
+        printf '%s\n' "$out_c" >&2
+        fail=1
+    fi
+
+    # (d) D1b — append a LITERAL `if version < <csv> {` arm that duplicates the
+    #     const-phrased tip. Monotonic scan reads it as "increasing" (csv > 84);
+    #     caught by the normalization tip-cohort ceiling (b1).
+    local duprs_d="$scratch/migrations_d1b.rs"
+    cp "$ROOT/src/storage/migrations.rs" "$duprs_d"
+    printf '\n// self-test injected literal-at-ceiling arm (D1b)\n        if version < %s {\n            // literal duplicate of the const-phrased tip\n        }\n' "$csv" >> "$duprs_d"
+    local out_d
+    if out_d="$(LADDER_MIGRATIONS_RS="$duprs_d" run_gate 2>&1)"; then
+        echo "  [d] D1b literal-at-ceiling arm: NOT CAUGHT (gate passed) — FAIL" >&2
+        fail=1
+    elif printf '%s' "$out_d" | grep -q "RULE (b) arm .if version < ${csv}. is at/above CURRENT_SCHEMA_VERSION"; then
+        echo "  [d] D1b literal duplicate of const-phrased tip: CAUGHT"
+    else
+        echo "  [d] D1b literal-at-ceiling arm: gate failed but without the ceiling message — FAIL" >&2
+        printf '%s\n' "$out_d" >&2
+        fail=1
+    fi
+
+    # (e) D2 — postgres `fn migrate_v<csv>_extra(` name-variant (precedent:
+    #     migrate_v29_stamp) escapes the exact-name `fn migrate_vN(` dup regex.
+    #     Caught by the numeric-version dup scan (b3).
+    local dupg_e="$scratch/postgres_d2.rs"
+    cp "$ROOT/src/store/postgres.rs" "$dupg_e"
+    printf '\nfn migrate_v%s_extra(conn: &SelfTestConn) -> SelfTestResult {\n    // name-variant duplicate of migrate_v%s (D2)\n    Ok(())\n}\n' "$csv" "$csv" >> "$dupg_e"
+    local out_e
+    if out_e="$(LADDER_POSTGRES_RS="$dupg_e" run_gate 2>&1)"; then
+        echo "  [e] D2 postgres fn name-variant: NOT CAUGHT (gate passed) — FAIL" >&2
+        fail=1
+    elif printf '%s' "$out_e" | grep -q 'DUPLICATE migrate fn VERSION'; then
+        echo "  [e] D2 postgres migrate_vNN_suffix name-variant: CAUGHT"
+    else
+        echo "  [e] D2 postgres fn name-variant: gate failed but without the fn-version-dup message — FAIL" >&2
+        printf '%s\n' "$out_e" >&2
+        fail=1
+    fi
+
     if (( fail == 0 )); then
-        echo "migration-ladder gate self-test: PASS (load-bearing — catches the collision + the dup-arm shapes, spares a clean tree)"
+        echo "migration-ladder gate self-test: PASS (load-bearing — catches the prefix collision, the dup-arm shapes, AND the #2198 const-phrase arm-lane escapes D1a/D1b/D2, spares a clean tree)"
         return 0
     fi
     echo "migration-ladder gate self-test: FAIL" >&2
@@ -395,7 +592,7 @@ main() {
         exit $?
     fi
     if run_gate; then
-        echo "✅ migration-ladder-uniqueness gate: PASS (prefixes unique + gap-free, arms strictly monotonic, cross-adapter tip agrees, no orphans)"
+        echo "✅ migration-ladder-uniqueness gate: PASS (prefixes unique + gap-free, arms strictly monotonic incl. normalized const-phrased tip cohort, cross-adapter tip agrees, no orphans)"
         exit 0
     else
         echo "" >&2

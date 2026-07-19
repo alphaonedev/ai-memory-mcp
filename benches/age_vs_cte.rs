@@ -520,6 +520,8 @@ async fn insert_fixture(
     for (i, id) in ids.iter().enumerate() {
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: id.clone(),
             tier: Tier::Mid,
             namespace: namespace.to_string(),

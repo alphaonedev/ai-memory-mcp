@@ -1022,6 +1022,12 @@ pub fn handle_recall_dto(
     let tags = req.tags.as_deref();
     let since: Option<&str> = explicit_since.or(scope_since.as_deref());
     let until = req.until.as_deref();
+    let valid_at = req.valid_at.as_deref();
+    // v1.0.0 #1834 — RFC3339-validate the claim-bitemporal AS-OF at this entry
+    // surface so a malformed value errors instead of mis-filtering.
+    if let Some(v) = valid_at {
+        validate::validate_valid_at(v).map_err(|e| e.to_string())?;
+    }
     // #151 visibility
     let as_agent = req.as_agent.as_deref();
     if let Some(a) = as_agent {
@@ -1227,6 +1233,8 @@ pub fn handle_recall_dto(
                     caller,
                     // v1.0.0 #2167 §3 — active embedder fingerprint gate.
                     Some(mcp_active_space.as_str()),
+                    // v1.0.0 #1834 — claim-bitemporal AS-OF instant.
+                    valid_at,
                 )
                 .map_err(|e| e.to_string())?;
                 let results = crate::cli::recall::apply_form4_recall_filters(
@@ -1337,6 +1345,7 @@ pub fn handle_recall_dto(
         source_uri_prefix.as_deref(),
         // v0.8.0 #1720 A3 — owner-keyed visibility caller.
         caller,
+        valid_at,
     )
     .map_err(|e| e.to_string())?;
     let results = crate::cli::recall::apply_form4_recall_filters(
@@ -1402,6 +1411,8 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: ns.to_string(),
