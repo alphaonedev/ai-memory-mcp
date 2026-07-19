@@ -120,6 +120,7 @@ const JOURNAL_LEGACY_REPLAY_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const JOURNAL_OVERFLOW_MARKER_LIMIT: usize = 256;
 const JOURNAL_OVERFLOW_PREFIX: &str = ".overflow-";
 const JOURNAL_OVERFLOW_SATURATED: &str = ".overflow-saturated";
+const JOURNAL_OVERFLOW_MARKER_LABEL: &str = "deferred-audit overflow marker";
 /// Stable fail-closed reason propagated when a blocking verdict cannot be
 /// durably admitted to the deferred audit path.
 pub const AUDIT_ADMISSION_FAILED: &str =
@@ -539,7 +540,7 @@ impl DeferredAuditJournal {
                 #[cfg(windows)]
                 windows_private::open_private_file(
                     &entry_path,
-                    "deferred-audit overflow marker",
+                    JOURNAL_OVERFLOW_MARKER_LABEL,
                     false,
                 )?;
                 overflow_markers += 1;
@@ -1006,7 +1007,7 @@ fn is_publication_probe(path: &Path) -> bool {
 }
 
 fn create_private_marker(path: &Path, content: &[u8]) -> Result<bool> {
-    match create_new_private_file(path, "deferred-audit overflow marker") {
+    match create_new_private_file(path, JOURNAL_OVERFLOW_MARKER_LABEL) {
         Ok(mut file) => {
             file.write_all(content)?;
             file.sync_all()?;
@@ -1018,7 +1019,7 @@ fn create_private_marker(path: &Path, content: &[u8]) -> Result<bool> {
                 .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists) =>
         {
             #[cfg(windows)]
-            windows_private::open_private_file(path, "deferred-audit overflow marker", false)?;
+            windows_private::open_private_file(path, JOURNAL_OVERFLOW_MARKER_LABEL, false)?;
             Ok(false)
         }
         Err(error) => Err(error).context("create deferred-audit overflow marker"),
