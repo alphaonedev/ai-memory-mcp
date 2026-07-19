@@ -25,7 +25,7 @@
         "agent_id": "alice",
         "version_vector": {
           "entries": {
-            "host:pop-os": "2026-07-14T00:00:00Z"
+            "conformance-fixture-writer": "2026-07-14T00:00:00Z"
           }
         }
       },

@@ -40,6 +40,17 @@
 //! deterministically without depending on the host's ambient key enrolment. The
 //! private seed NEVER crosses the envelope — only the PUBLIC anchor does (spec
 //! §V2-2.6 / §V2-5a).
+//!
+//! ## Vector-clock actor pin (the machine-independence fix)
+//! A memory's durable `metadata.version_vector` is keyed by the process
+//! federation node identity, which defaults to `host:<hostname>` — a
+//! machine-dependent value that would otherwise leak the generating host into
+//! the committed golden (`host:pop-os` vs a CI runner's `host:runnervm…`). We
+//! PIN `AI_MEMORY_FED_IDENTITY` (env #61) to a FIXED, machine-independent id
+//! (`conformance-fixture-writer`) before the FIRST DB write, so the vector-clock
+//! actor key is stable in any environment. `local_node_identity()` caches its
+//! resolution in a process `OnceLock` on first read, so the pin is forced once,
+//! ordering-safe, before either test touches the insert path.
 
 #![allow(clippy::missing_panics_doc)]
 // `src_*` / `dst_*` and `dto`/`row` pairings are a deliberate
@@ -87,6 +98,32 @@ const SEED_MEMORY_ID: &str = "mem-round-1";
 /// COMPUTED conformance marker reaches L3 deterministically; the private seed
 /// never crosses the envelope.
 const FIXTURE_OPERATOR_SEED: [u8; 32] = [0x2a; 32];
+/// Fixed, machine-INDEPENDENT federation node identity (env #61
+/// `AI_MEMORY_FED_IDENTITY`). Pins the durable `metadata.version_vector` actor
+/// key so it does not leak `host:<hostname>` into the committed golden.
+const FIXTURE_NODE_IDENTITY: &str = "conformance-fixture-writer";
+
+/// Pin the process federation node identity to [`FIXTURE_NODE_IDENTITY`] BEFORE
+/// any DB write stamps a `metadata.version_vector`. `local_node_identity()`
+/// resolves once (`OnceLock`) to `AI_MEMORY_FED_IDENTITY` → configured →
+/// `host:<hostname>`; the host default is machine-dependent and would break the
+/// golden's determinism. Set the env under the shared `ENV_LOCK`, FORCE the
+/// resolution to cache the fixed id while the env is set, then release the guard
+/// — the cached value persists process-wide, so every later insert (generation
+/// AND round-trip import) stamps the same actor key regardless of test order.
+fn ensure_fixed_node_identity() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let _g =
+            MultiEnvVarGuard::apply(&[("AI_MEMORY_FED_IDENTITY", Some(FIXTURE_NODE_IDENTITY))]);
+        // Force the OnceLock to cache the fixed id while the env is set.
+        let resolved = ai_memory::federation::identity::resolver::local_node_identity();
+        assert_eq!(
+            resolved, FIXTURE_NODE_IDENTITY,
+            "node identity must pin to the fixed fixture writer (was a prior read already cached?)"
+        );
+    });
+}
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_REL)
@@ -266,6 +303,7 @@ fn envelope_json(env: &emit::ExportEnvelope) -> String {
 /// pinned exporter. Under `AI_MEMORY_REGEN_GOLDEN=1` it rewrites the golden.
 #[test]
 fn fixture_matches_pinned_exporter() {
+    ensure_fixed_node_identity();
     let env = build_fixture_envelope();
     let text = envelope_json(&env);
     let path = fixture_path();
@@ -314,6 +352,7 @@ fn fixture_matches_pinned_exporter() {
 /// source-of-truth memory TEXT (L1) + governance (L3), per spec §V2-1 / §V2-6.
 #[test]
 fn committed_fixture_round_trips_through_production_importer() {
+    ensure_fixed_node_identity();
     let path = fixture_path();
     let committed = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
