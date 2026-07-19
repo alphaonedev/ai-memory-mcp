@@ -107,6 +107,9 @@ const JOURNAL_MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 
 /// Suffix for the per-occurrence crash spool used by new-format records.
 const JOURNAL_SPOOL_SUFFIX: &str = ".spool";
+const JOURNAL_SPOOL_MAX_ENTRIES: usize = 4_096;
+const JOURNAL_SPOOL_MAX_BYTES: u64 = 32 * 1024 * 1024;
+const JOURNAL_LEGACY_REPLAY_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Wire-name for the deferred refusal audit row. Audit-side dashboards
 /// filter on this string to surface storage-hook refusals separate
@@ -376,14 +379,22 @@ impl DeferredAuditMetrics {
 /// (only blocking verdicts enqueue) so the per-record fsync is cheap.
 ///
 /// **Frame:** `[u32-LE payload_len][payload = DeferredAuditEvent::canonical_bytes][32-byte sha256(payload)]`.
-/// New records are one atomic-create spool file per occurrence and are removed
-/// only after durable chain/DLQ residence, bounding live disk use to pending
-/// work. The original stream is replayed only for legacy records. A short
+/// New records are atomically published as one private spool file per
+/// occurrence and removed only after durable chain/DLQ residence. Entry and
+/// byte quotas fail closed before disk/inode exhaustion. The original stream
+/// is replayed only for legacy records. A short
 /// trailing legacy write is ignored; complete corrupt frames fail closed.
 pub struct DeferredAuditJournal {
     path: PathBuf,
     file: Mutex<File>,
     spool_dir: PathBuf,
+    spool_usage: Mutex<SpoolUsage>,
+}
+
+#[derive(Default)]
+struct SpoolUsage {
+    entries: usize,
+    bytes: u64,
 }
 
 /// Panic message when the journal mutex is poisoned (a prior holder
@@ -407,7 +418,10 @@ impl DeferredAuditJournal {
     /// Propagates the open / chmod IO error.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        let spool_dir = PathBuf::from(format!("{}{}", path.display(), JOURNAL_SPOOL_SUFFIX));
+        let mut spool_os = path.as_os_str().to_os_string();
+        spool_os.push(JOURNAL_SPOOL_SUFFIX);
+        let spool_dir = PathBuf::from(spool_os);
+        let spool_existed = spool_dir.exists();
         std::fs::create_dir_all(&spool_dir)
             .with_context(|| format!("create deferred-audit spool {}", spool_dir.display()))?;
         let file = OpenOptions::new()
@@ -421,11 +435,37 @@ impl DeferredAuditJournal {
             use std::os::unix::fs::PermissionsExt;
             // Best-effort 0600 — the journal carries refusal payloads.
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            std::fs::set_permissions(&spool_dir, std::fs::Permissions::from_mode(0o700))
+                .context("tighten deferred-audit spool permissions")?;
+            if !spool_existed && let Some(parent) = spool_dir.parent() {
+                File::open(parent)
+                    .context("open deferred-audit spool parent for fsync")?
+                    .sync_all()
+                    .context("fsync deferred-audit spool parent")?;
+            }
+        }
+        let mut usage = SpoolUsage::default();
+        for entry in std::fs::read_dir(&spool_dir).context("scan deferred-audit spool")? {
+            let entry = entry.context("read deferred-audit spool entry")?;
+            if entry.path().extension().is_some_and(|ext| ext == "event") {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o600))
+                        .context("tighten deferred-audit spool entry permissions")?;
+                }
+                usage.entries = usage.entries.saturating_add(1);
+                usage.bytes = usage.bytes.saturating_add(entry.metadata()?.len());
+            }
+        }
+        if usage.entries > JOURNAL_SPOOL_MAX_ENTRIES || usage.bytes > JOURNAL_SPOOL_MAX_BYTES {
+            anyhow::bail!("deferred-audit spool exceeds configured safety bounds");
         }
         Ok(Self {
             path,
             file: Mutex::new(file),
             spool_dir,
+            spool_usage: Mutex::new(usage),
         })
     }
 
@@ -443,32 +483,57 @@ impl DeferredAuditJournal {
 
         if let Some(occurrence_id) = &event.occurrence_id {
             let spool_path = self.spool_path(occurrence_id);
-            match OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&spool_path)
-            {
-                Ok(mut spool) => {
-                    spool
-                        .write_all(&frame)
-                        .context("journal spool append: write_all")?;
-                    spool.sync_all().context("journal spool append: fsync")?;
-                    self.sync_spool_dir()?;
+            let mut usage = self.spool_usage.lock().expect(JOURNAL_MUTEX_POISONED);
+            if spool_path.exists() {
+                let existing = std::fs::read(&spool_path)
+                    .context("journal spool append: read existing occurrence")?;
+                if existing == frame {
                     return Ok(());
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let existing = std::fs::read(&spool_path)
-                        .context("journal spool append: read existing occurrence")?;
-                    if existing == frame {
-                        return Ok(());
-                    }
-                    anyhow::bail!(
-                        "journal spool occurrence-id collision at {}",
-                        spool_path.display()
-                    );
-                }
-                Err(e) => return Err(e).context("journal spool append: create occurrence"),
+                anyhow::bail!(
+                    "journal spool occurrence-id collision at {}",
+                    spool_path.display()
+                );
             }
+            let frame_len = u64::try_from(frame.len()).context("journal spool frame length")?;
+            if usage.entries >= JOURNAL_SPOOL_MAX_ENTRIES
+                || usage.bytes.saturating_add(frame_len) > JOURNAL_SPOOL_MAX_BYTES
+            {
+                anyhow::bail!("deferred-audit spool quota exhausted; refusing unjournaled event");
+            }
+            let staging_path = self
+                .spool_dir
+                .join(format!(".{}.pending", uuid::Uuid::new_v4()));
+            let mut options = OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut staging = options
+                .open(&staging_path)
+                .context("journal spool append: create staging")?;
+            let staged = (|| -> Result<()> {
+                staging
+                    .write_all(&frame)
+                    .context("journal spool append: write staging")?;
+                staging
+                    .sync_all()
+                    .context("journal spool append: fsync staging")?;
+                std::fs::hard_link(&staging_path, &spool_path)
+                    .context("journal spool append: publish occurrence")?;
+                std::fs::remove_file(&staging_path)
+                    .context("journal spool append: remove staging link")?;
+                self.sync_spool_dir()
+            })();
+            if staged.is_err() {
+                let _ = std::fs::remove_file(&staging_path);
+            }
+            staged?;
+            usage.entries += 1;
+            usage.bytes += frame_len;
+            return Ok(());
         }
 
         // Legacy records without occurrence IDs retain the v1 frame stream.
@@ -545,7 +610,13 @@ impl DeferredAuditJournal {
             );
         }
         std::fs::remove_file(&spool_path).context("journal acknowledge: remove occurrence")?;
-        self.sync_spool_dir()
+        self.sync_spool_dir()?;
+        let mut usage = self.spool_usage.lock().expect(JOURNAL_MUTEX_POISONED);
+        usage.entries = usage.entries.saturating_sub(1);
+        usage.bytes = usage
+            .bytes
+            .saturating_sub(u64::try_from(existing.len()).unwrap_or(u64::MAX));
+        Ok(())
     }
 
     fn spool_path(&self, occurrence_id: &str) -> PathBuf {
@@ -604,6 +675,7 @@ fn journal_frame(payload: &[u8]) -> Result<Vec<u8>> {
 fn replay_legacy_stream(file: &mut File) -> Result<Vec<DeferredAuditEvent>> {
     let mut out = Vec::new();
     let mut frame_index = 0_u64;
+    let mut aggregate_bytes = 0_u64;
     loop {
         let mut len_bytes = [0_u8; 4];
         let first = file
@@ -618,6 +690,11 @@ fn replay_legacy_stream(file: &mut File) -> Result<Vec<DeferredAuditEvent>> {
         let len = u32::from_le_bytes(len_bytes) as usize;
         if len > JOURNAL_MAX_PAYLOAD_BYTES {
             anyhow::bail!("journal replay: frame {frame_index} length {len} exceeds limit");
+        }
+        aggregate_bytes = aggregate_bytes
+            .saturating_add(u64::try_from(len).unwrap_or(u64::MAX).saturating_add(36));
+        if aggregate_bytes > JOURNAL_LEGACY_REPLAY_MAX_BYTES {
+            anyhow::bail!("journal replay: legacy aggregate exceeds safety limit");
         }
         let mut payload = vec![0_u8; len];
         if !read_exact_or_torn(file, &mut payload)? {
@@ -669,6 +746,42 @@ fn parse_complete_journal_frame(frame: &[u8]) -> Result<DeferredAuditEvent> {
     DeferredAuditEvent::from_canonical_bytes(payload).context("journal frame decode")
 }
 
+fn occurrence_residence(
+    conn: &rusqlite::Connection,
+    occurrence_id: &str,
+    expected_hash: &[u8],
+) -> Result<Option<AppendOutcome>> {
+    use rusqlite::OptionalExtension as _;
+    let chained: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT payload_hash FROM signed_events WHERE event_type = ?1 AND id = ?2",
+            rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, occurrence_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("deferred-audit occurrence residence: chain query")?;
+    let mut stmt = conn
+        .prepare("SELECT payload_hash FROM signed_events_dlq WHERE event_type = ?1 AND id = ?2")
+        .context("deferred-audit occurrence residence: prepare DLQ query")?;
+    let dlq_hashes = stmt
+        .query_map(
+            rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, occurrence_id],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if chained.as_deref().is_some_and(|hash| hash != expected_hash)
+        || dlq_hashes.iter().any(|hash| hash != expected_hash)
+    {
+        anyhow::bail!("deferred-audit occurrence-id collision with different payload");
+    }
+    match (chained.is_some(), dlq_hashes.is_empty()) {
+        (true, false) => anyhow::bail!("deferred-audit occurrence has dual chain/DLQ residence"),
+        (true, true) => Ok(Some(AppendOutcome::Appended)),
+        (false, false) => Ok(Some(AppendOutcome::DlqLanded)),
+        (false, true) => Ok(None),
+    }
+}
+
 /// v0.8.0 PE-4 (#1732) — boot drain-on-recovery. Replays every intact
 /// record in the journal at `journal_path` into `signed_events` (via a
 /// fresh-`Connection` [`SqliteSignedEventsSink`]). **Idempotent:** new-format
@@ -716,46 +829,23 @@ pub fn recover_deferred_audit(journal_path: &Path, db_path: &Path) -> Result<usi
             }
         };
         let already_chained = if let Some(occurrence_id) = &ev.occurrence_id {
-            use rusqlite::OptionalExtension as _;
-            let chained_hash: Option<Vec<u8>> = conn
-                .query_row(
-                    "SELECT payload_hash FROM signed_events WHERE event_type = ?1 AND id = ?2",
-                    rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, occurrence_id],
-                    |r| r.get(0),
-                )
-                .optional()
-                .context("recover_deferred_audit: occurrence-id chain query")?;
-            if let Some(existing_hash) = chained_hash {
-                if existing_hash != hash {
-                    unresolved = true;
-                    tracing::error!(%occurrence_id, "recovery occurrence-id collision in signed_events");
-                    continue;
-                }
-                journal.acknowledge(ev)?;
-                true
-            } else {
-                let dlq_hash: Option<Vec<u8>> = conn.query_row(
-                    "SELECT payload_hash FROM signed_events_dlq WHERE event_type = ?1 AND id = ?2 ORDER BY rowid DESC LIMIT 1",
-                    rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, occurrence_id],
-                    |r| r.get(0),
-                ).optional().context("recover_deferred_audit: occurrence-id DLQ query")?;
-                if let Some(existing_hash) = dlq_hash {
-                    if existing_hash != hash {
-                        unresolved = true;
-                        tracing::error!(%occurrence_id, "recovery occurrence-id collision in signed_events_dlq");
-                        continue;
-                    }
+            match occurrence_residence(&conn, occurrence_id, &hash) {
+                Ok(Some(_)) => {
                     journal.acknowledge(ev)?;
                     true
-                } else {
-                    false
+                }
+                Ok(None) => false,
+                Err(error) => {
+                    unresolved = true;
+                    tracing::error!(%occurrence_id, %error, "recovery occurrence-id collision");
+                    continue;
                 }
             }
         } else {
             let credits = match legacy_credits.entry(hash.clone()) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    let count = conn
+                    let chain_count = conn
                         .query_row(
                             "SELECT COUNT(*) FROM signed_events \
                              WHERE event_type = ?1 AND payload_hash = ?2",
@@ -763,7 +853,12 @@ pub fn recover_deferred_audit(journal_path: &Path, db_path: &Path) -> Result<usi
                             |r| r.get::<_, i64>(0),
                         )
                         .context("recover_deferred_audit: legacy cardinality query")?;
-                    entry.insert(count)
+                    let dlq_count = conn.query_row(
+                        "SELECT COUNT(*) FROM signed_events_dlq WHERE event_type = ?1 AND payload_hash = ?2",
+                        rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, &hash],
+                        |r| r.get::<_, i64>(0),
+                    ).context("recover_deferred_audit: legacy DLQ cardinality query")?;
+                    entry.insert(chain_count + dlq_count)
                 }
             };
             if *credits > 0 {
@@ -888,15 +983,17 @@ impl DeferredAuditQueue {
         // v0.8.0 PE-4 (#1732) — durability point: journal the event
         // (write+fsync, NO DB Connection — re-entrancy-safe) BEFORE the
         // mpsc send, so a SIGKILL before the drainer processes it is
-        // recoverable at next boot. A journal failure degrades durability
-        // but must not drop the live path — log loudly + still enqueue.
+        // recoverable at next boot. Fail closed if durability cannot be
+        // established: enqueueing an unjournaled event would silently reopen
+        // the crash-loss window and let a hostile refusal stream exhaust disk.
         if let Some(journal) = &self.journal
             && let Err(e) = journal.append(&event)
         {
+            self.metrics.send_failures.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
-                "deferred_audit_queue: journal append failed (crash-durability degraded for \
-                 this refusal; live drainer still attempted): {e:#}"
+                "deferred_audit_queue: journal append failed; refusing unjournaled delivery: {e:#}"
             );
+            return false;
         }
         match self.sender.send(event) {
             Ok(()) => true,
@@ -1141,22 +1238,10 @@ impl DeferredAuditSink for SqliteSignedEventsSink {
         // signed_events.id. Payload-hash fallback exists only for legacy
         // journal records that predate occurrence IDs.
         if let Some(occurrence_id) = &event.occurrence_id {
-            use rusqlite::OptionalExtension as _;
-            let existing: Option<Vec<u8>> = self
-                .ensure_conn()?
-                .query_row(
-                    "SELECT payload_hash FROM signed_events WHERE event_type = ?1 AND id = ?2",
-                    rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, occurrence_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .context("deferred-audit occurrence-id retry probe")?;
-            if let Some(existing) = existing {
-                if existing != hash {
-                    anyhow::bail!("deferred-audit occurrence-id collision with different payload");
-                }
+            let residence = occurrence_residence(self.ensure_conn()?, occurrence_id, &hash)?;
+            if let Some(outcome) = residence {
                 self.acknowledge(event)?;
-                return Ok(AppendOutcome::Appended);
+                return Ok(outcome);
             }
         } else {
             let query = (
@@ -2602,6 +2687,32 @@ mod tests {
         assert!(sink.append_retry(&collision).is_err());
     }
 
+    #[test]
+    fn sqlite_sink_retry_recognizes_matching_dlq_residence() {
+        let dir = fresh_tempdir();
+        let db_path = dir.path().join("retry-dlq-residence.db");
+        let conn = crate::db::open(&db_path).expect("init db");
+        let event = DeferredAuditEvent::from_refusal(
+            "agent:retry-dlq",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        let hash = payload_hash(&event.canonical_bytes().unwrap());
+        conn.execute(
+            "INSERT INTO signed_events_dlq (id, agent_id, event_type, payload_hash, attest_level, timestamp, failure_reason, failed_at) VALUES (?1, ?2, ?3, ?4, 'unsigned', ?5, 'injected', ?5)",
+            rusqlite::params![event.occurrence_id, event.agent_id, GOVERNANCE_REFUSAL_EVENT_TYPE, hash, event.timestamp.to_rfc3339()],
+        ).unwrap();
+        drop(conn);
+        let mut sink = SqliteSignedEventsSink::new(db_path.clone());
+        assert_eq!(sink.append_retry(&event).unwrap(), AppendOutcome::DlqLanded);
+        let conn = crate::db::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM signed_events_dlq", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
     #[tokio::test]
     async fn sqlite_sink_lazy_open_only_on_first_append() {
         // Construct a sink against a path that doesn't exist yet; if
@@ -2990,6 +3101,62 @@ mod tests {
     }
 
     #[test]
+    fn journal_ignores_incomplete_staging_files() {
+        let dir = fresh_tempdir();
+        let journal_path = dir.path().join("staging.journal");
+        let journal = DeferredAuditJournal::open(&journal_path).unwrap();
+        let ev =
+            DeferredAuditEvent::from_refusal("agent:valid", &refusal_action(), &refusal_decision())
+                .unwrap();
+        journal.append(&ev).unwrap();
+        std::fs::write(journal.spool_dir.join(".crash.pending"), b"partial").unwrap();
+        let replayed = journal.replay().unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].agent_id, "agent:valid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_spool_permissions_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fresh_tempdir();
+        let journal_path = dir.path().join("private.journal");
+        let journal = DeferredAuditJournal::open(&journal_path).unwrap();
+        let ev = DeferredAuditEvent::from_refusal(
+            "agent:private",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        journal.append(&ev).unwrap();
+        assert_eq!(
+            std::fs::metadata(&journal.spool_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let event_path = journal.spool_path(ev.occurrence_id.as_deref().unwrap());
+        assert_eq!(
+            std::fs::metadata(event_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn journal_quota_refuses_unjournaled_queue_delivery() {
+        let dir = fresh_tempdir();
+        let journal =
+            Arc::new(DeferredAuditJournal::open(dir.path().join("quota.journal")).unwrap());
+        journal.spool_usage.lock().unwrap().entries = JOURNAL_SPOOL_MAX_ENTRIES;
+        let (queue, mut receiver) = DeferredAuditQueue::new_with_journal(Some(journal));
+        assert!(!queue.submit_refusal("agent:quota", &refusal_action(), &refusal_decision()));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(queue.metrics().send_failure_count(), 1);
+    }
+
+    #[test]
     fn journal_recovery_is_idempotent_no_duplicate_1732() {
         // A refusal already chained pre-crash must NOT be re-appended on a
         // second recovery pass (dedup on stable occurrence ID).
@@ -3089,6 +3256,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn legacy_journal_recovery_counts_matching_dlq_as_terminal() {
+        let dir = fresh_tempdir();
+        let db_path = dir.path().join("journal-legacy-dlq.db");
+        let conn = crate::db::open(&db_path).expect("init db");
+        let journal_path = deferred_audit_journal_path(&db_path);
+        let mut legacy = DeferredAuditEvent::from_refusal(
+            "agent:legacy-dlq",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        legacy.occurrence_id = None;
+        let hash = payload_hash(&legacy.canonical_bytes().unwrap());
+        conn.execute(
+            "INSERT INTO signed_events_dlq (id, agent_id, event_type, payload_hash, attest_level, timestamp, failure_reason, failed_at) VALUES ('legacy-id', ?1, ?2, ?3, 'unsigned', ?4, 'injected', ?4)",
+            rusqlite::params![legacy.agent_id, GOVERNANCE_REFUSAL_EVENT_TYPE, hash, legacy.timestamp.to_rfc3339()],
+        ).unwrap();
+        drop(conn);
+        DeferredAuditJournal::open(&journal_path)
+            .unwrap()
+            .append(&legacy)
+            .unwrap();
+        assert_eq!(recover_deferred_audit(&journal_path, &db_path).unwrap(), 0);
+        let conn = crate::db::open(&db_path).unwrap();
+        let chained: i64 = conn
+            .query_row("SELECT COUNT(*) FROM signed_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(chained, 0);
     }
 
     #[test]

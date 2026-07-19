@@ -307,7 +307,9 @@ cognitive counterpart in the memory store itself.
   send; `recover_deferred_audit` replays un-drained records into
   `signed_events` at boot (content-bound and idempotent on stable occurrence
   ID, with legacy payload-hash cardinality compatibility). Spool entries are
-  acknowledged only after durable chain or DLQ residence. Wired into both
+  atomically published with private permissions, bounded to 4,096 entries / 32
+  MiB, and acknowledged only after durable chain or DLQ residence. Quota or
+  persistence failure refuses unjournaled delivery. Wired into both
   `serve` and `mcp` boot paths.
 
 ## Other notable changes
