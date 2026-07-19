@@ -15,6 +15,16 @@
 //! crash mid-swap leaves either the old bundle or the new one (plus an
 //! orphan temp dir that the next `put` for that id clears).
 //!
+//! Per-platform durability (#2230): every shard + the manifest gets a
+//! per-FILE fsync before the publish rename. That per-file barrier holds on
+//! BOTH unix and Windows (on Windows the fsync handle is opened with write
+//! access — `FlushFileBuffers` refuses a read-only handle; see
+//! [`fsync_file`]). The DIRECTORY fsync that makes the create/rename itself
+//! durable is unix-only — Windows has no portable `fsync(dir)` equivalent
+//! ([`fsync_dir`] is a documented no-op there), so on Windows bundle-publish
+//! durability rests on the per-file fsyncs plus the atomic `MoveFileEx`
+//! rename semantics rather than an explicit directory barrier.
+//!
 //! Read discipline ([`ErasureStore::get`]): shards are hash-verified
 //! against the manifest; corrupt/missing shards are demoted to erasures and
 //! the payload is reconstructed ONLY when at least `k` shards verify, with
@@ -66,8 +76,25 @@ pub const QUARANTINE_DIR: &str = ".quarantine";
 /// fsync a single file so its bytes reach stable storage before the rename
 /// that publishes the bundle (F3 — power-loss durability: a torn/empty shard
 /// behind a surviving manifest is exactly what the sweep must never leave).
+///
+/// Per-platform handle discipline (#2230): on unix a read-only handle can be
+/// fsync'd — `fsync(2)` accepts any valid descriptor. On Windows the same
+/// `File::sync_all` maps to `FlushFileBuffers`, which REQUIRES a handle with
+/// write access (`GENERIC_WRITE`); a read-only handle returns
+/// `ERROR_ACCESS_DENIED` (os error 5). So the handle is opened with write
+/// access on Windows. The per-file durability barrier therefore holds
+/// byte-for-byte on BOTH platforms — the F3 crash-safety claim is honest on
+/// each. (The DIRECTORY-fsync step below is the one that has no portable
+/// Windows equivalent and degrades to a documented no-op there.)
 fn fsync_file(path: &Path) -> Result<(), ErasureError> {
-    let f = std::fs::File::open(path).map_err(|e| io_err("fsync open file", &e))?;
+    // Windows: open with write access so FlushFileBuffers is permitted.
+    #[cfg(windows)]
+    let opened = std::fs::OpenOptions::new().write(true).open(path);
+    // Unix / macOS: read-only open is sufficient — byte-identical to the
+    // pre-#2230 behaviour on those platforms.
+    #[cfg(not(windows))]
+    let opened = std::fs::File::open(path);
+    let f = opened.map_err(|e| io_err("fsync open file", &e))?;
     f.sync_all().map_err(|e| io_err("fsync file", &e))
 }
 
@@ -545,6 +572,25 @@ mod tests {
         (0..len)
             .map(|i| u8::try_from((i * 13 + 3) % 256).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn fsync_file_succeeds_on_freshly_written_file() {
+        // #2230 — the per-file durability barrier must not error on ANY
+        // platform. Pre-fix, `fsync_file` opened the file read-only and
+        // called `sync_all`; on windows-latest that returned
+        // `ERROR_ACCESS_DENIED` (os error 5) because FlushFileBuffers refuses
+        // a read-only handle, panicking every `put`-driven test. This pins
+        // the barrier directly: on unix it exercises the unchanged read-only
+        // path, on Windows the write-handle path.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join(shard_file_name(0));
+        std::fs::write(&p, b"durable shard bytes").unwrap();
+        fsync_file(&p)
+            .expect("fsync_file must succeed on a freshly written file on every platform");
+        // The bytes are intact after the barrier (a write-open must not
+        // truncate on windows).
+        assert_eq!(std::fs::read(&p).unwrap(), b"durable shard bytes");
     }
 
     #[test]
