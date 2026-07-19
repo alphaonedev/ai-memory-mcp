@@ -56,6 +56,10 @@ tokio = { version = "1", features = ["full"] }
 # Pure Rust, dep-light, both are in the tokio family.
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-core = "0.3"
+# #2271 — cross-process advisory lock for deferred-audit spool admission,
+# preventing concurrent daemon/MCP processes from overshooting byte/inode caps.
+# Pure-Rust facade over flock/LockFileEx; no native build script.
+fs2 = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 # v0.6.3.1 (PR-5 / issue #487) — rolling file appender for the
