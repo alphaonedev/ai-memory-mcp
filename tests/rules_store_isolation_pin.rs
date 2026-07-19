@@ -434,14 +434,23 @@ fn governance_hooks_fail_closed_on_rule_consultation_error_1054() {
     // Both hook closures must include the fail-closed message
     // (`failing CLOSED`) inside their Err arm. Scan each install
     // block for the marker.
-    for hook_marker in [
-        "crate::storage::GOVERNANCE_PRE_WRITE.set(Box::new(",
-        "crate::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(",
+    for (hook_marker, next_item_marker) in [
+        (
+            "crate::storage::GOVERNANCE_PRE_WRITE.set(Box::new(",
+            "/// #1685",
+        ),
+        (
+            "crate::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(",
+            "/// v0.7.0 #1455 (SEC, MED)",
+        ),
     ] {
         let install_idx = body
             .find(hook_marker)
             .unwrap_or_else(|| panic!("hook install line `{hook_marker}` missing"));
-        let end_idx = (install_idx + 8000).min(body.len());
+        let end_idx = body[install_idx..].find(next_item_marker).map_or_else(
+            || panic!("item boundary `{next_item_marker}` after `{hook_marker}` missing"),
+            |offset| install_idx + offset,
+        );
         let closure_body = &body[install_idx..end_idx];
         assert!(
             closure_body.contains("failing CLOSED"),
