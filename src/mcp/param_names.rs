@@ -183,6 +183,10 @@ pub const UNRETIRE: &str = "unretire";
 pub const UNTIL: &str = "until";
 pub const URL: &str = "url";
 pub const VALID_AT: &str = "valid_at";
+/// #2258 — caller-supplied claim-bitemporal `valid_from` on the
+/// `memory_store` write surface. SSOT-aliased to the storage row/field
+/// name so the tool param and the persisted column can never drift.
+pub const VALID_FROM: &str = crate::models::field_names::VALID_FROM;
 pub const VALID_UNTIL: &str = crate::models::field_names::VALID_UNTIL;
 /// #2122 — caller-supplied covenant clause-1 rationale param
 /// (`memory_notify` / `memory_share`). SSOT-aliased to the storage
@@ -331,6 +335,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     UNTIL,
     URL,
     VALID_AT,
+    VALID_FROM,
     VALID_UNTIL,
     WHY_TRACE,
 ];
@@ -359,9 +364,12 @@ mod tests {
         // param on memory_notify / memory_share).
         // v1.0.0 #1974 — 128 -> 131: CONTENT_APPEND + CONTENT_REPLACE_FROM +
         //   CONTENT_REPLACE_TO (memory_update content patch primitive).
+        // v1.0.0 #2258 (2026-07-19) — 131 -> 132: VALID_FROM (claim-bitemporal
+        //   valid_from on the memory_store write surface; VALID_UNTIL already
+        //   present for memory_kg_invalidate / memory_update).
         assert_eq!(
             ALL_PARAM_NAMES.len(),
-            131,
+            132,
             "MCP param-name SSOT census drifted from v0.7.0 baseline"
         );
     }

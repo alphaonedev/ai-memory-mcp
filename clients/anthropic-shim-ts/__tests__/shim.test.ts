@@ -53,6 +53,25 @@ test("records user then assistant and passes response through", async () => {
   assert.equal(spy[1].hostSessionId, "s1");
 });
 
+test("returns the original APIPromise surface", async () => {
+  const resp = textResponse();
+  const apiPromise = Object.assign(Promise.resolve(resp), {
+    withResponse: () => "with-response",
+    asResponse: () => "as-response",
+  });
+  const client = wrap(
+    { messages: { create: () => apiPromise } },
+    spyOpts([], { hostSessionId: "s-apipromise" }),
+  );
+  const returned = (client.messages as { create: (a: unknown) => typeof apiPromise }).create({
+    messages: [{ role: "user", content: "preserve methods" }],
+  });
+  assert.equal(returned, apiPromise);
+  assert.equal(returned.withResponse(), "with-response");
+  assert.equal(returned.asResponse(), "as-response");
+  assert.equal(await returned, resp);
+});
+
 test("delegates unknown properties", () => {
   const spy: CaptureTurnParams[] = [];
   const client = wrap(fakeClient(textResponse()), spyOpts(spy));
