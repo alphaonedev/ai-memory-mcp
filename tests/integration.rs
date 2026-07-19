@@ -1286,15 +1286,41 @@ fn test_consolidation() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Verify total decreased (3 removed, 1 added = 1)
+    // Verify the OPERATOR-VISIBLE population collapsed 3 -> 1. Under the v75
+    // lineage-DAG default (#1859), now production-boot-seeded ON by #2233,
+    // `consolidate` TOMBSTONES its sources instead of hard-deleting them: the
+    // 3 sources are retained in `memories` with lifecycle_state='tombstoned'
+    // (so raw `stats.total` — a COUNT(*) with NO lifecycle filter — is now 4,
+    // not < 3) but are structurally excluded from every read/egress lane
+    // (tombstone exclusion pinned in `src/storage/mod.rs`). Assert the visible
+    // population via `list` (which applies the exclusion) rather than the raw
+    // physical row count, so the test tracks the documented default instead of
+    // the pre-#2233 inert-feature behavior. Follow-up #2237 proposes a
+    // lifecycle breakdown in `stats` so the raw count stops being ambiguous.
     let output = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "--json", "stats"])
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "list",
+            "-n",
+            "consol-test",
+        ])
         .output()
         .unwrap();
-    let stats: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(
-        stats["total"].as_u64().unwrap() < 3,
-        "total should have decreased after consolidation"
+    let listed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let visible = listed["memories"]
+        .as_array()
+        .expect("list --json returns a memories array");
+    assert_eq!(
+        visible.len(),
+        1,
+        "consolidation should collapse the 3 visible sources into 1 consolidated \
+         memory (tombstoned sources are excluded from the visible list); got: {listed:?}"
+    );
+    assert_eq!(
+        visible[0]["title"], "consolidated knowledge",
+        "the single remaining visible memory is the consolidated one"
     );
 
     let _ = std::fs::remove_file(&db_path);

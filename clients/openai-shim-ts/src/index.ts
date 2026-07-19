@@ -117,6 +117,13 @@ export function captureTurn(p: CaptureTurnParams): boolean {
     warn("no capture response from substrate");
     return false;
   }
+  // A top-level JSON-RPC `error` member (unknown-method / invalid-params / etc.)
+  // is a FAILURE, not a success — it carries no `result`, so it would otherwise
+  // slip past the `isError` check below and be mis-counted as a captured turn.
+  if (resp.error != null) {
+    warn("substrate returned JSON-RPC error");
+    return false;
+  }
   const inner = resp.result as Record<string, unknown> | undefined;
   if (inner && typeof inner === "object" && inner.isError === true) {
     warn("substrate returned isError:true");
