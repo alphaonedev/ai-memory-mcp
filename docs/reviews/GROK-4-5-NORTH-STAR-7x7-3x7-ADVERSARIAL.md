@@ -1,3 +1,7 @@
+---
+layout: doc
+---
+
 # Grok 4.5 — North Star 7/7 maximal-truthfulness audit  
 ## 3×7 **executed** adversarial agents + CodeGraph cross-correlation
 
@@ -11,8 +15,8 @@
 > **Prior revision note:** An earlier draft of this path used single-author multi-lens *format* without 21 processes. **This revision supersedes that method.** CLAIMED ≠ ATTESTED for family diversity (all agents same model family); process diversity is real.
 >
 > **Related:**  
-> - [`GROK-4-5-V1.0.0-3x7-ADVERSARIAL-AND-PARL.md`](GROK-4-5-V1.0.0-3x7-ADVERSARIAL-AND-PARL.md)  
-> - [`PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.md`](PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.md) (harder 27-req bar)  
+> - [`GROK-4-5-V1.0.0-3x7-ADVERSARIAL-AND-PARL.md`](GROK-4-5-V1.0.0-3x7-ADVERSARIAL-AND-PARL.html)  
+> - [`PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.md`](PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.html) (harder 27-req bar)  
 > - `ROADMAP.md` §0–§4 · Landing `#executive-brief`
 
 ---

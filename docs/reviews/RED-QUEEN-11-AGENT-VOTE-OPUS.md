@@ -1,6 +1,10 @@
+---
+layout: doc
+---
+
 # Red Queen vs ai-memory — 11-Agent Vote (OPUS re-verification)
 
-> **SUPERSEDED-FOR-PLACEMENT** by [`RED-QUEEN-21-AGENT-VOTE-OPUS.md`](RED-QUEEN-21-AGENT-VOTE-OPUS.md). This document is an **Opus re-verification** of the Grok 11-agent isolated run ([`RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md`](RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md), 2026-06-27, base `c85b9c56`) against the working tree at `release/v0.8.0` @ `ead3da0c`. It is retained for the 11-lens audit trail and unanimous-conclusion lineage; the **vote tallies are immutable audit artifacts** and are NOT rewritten — only an Errata section and inline `[STALE]`/`[VERIFIED ✓]` flags are added.
+> **SUPERSEDED-FOR-PLACEMENT** by [`RED-QUEEN-21-AGENT-VOTE-OPUS.md`](RED-QUEEN-21-AGENT-VOTE-OPUS.html). This document is an **Opus re-verification** of the Grok 11-agent isolated run ([`RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md`](RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.html), 2026-06-27, base `c85b9c56`) against the working tree at `release/v0.8.0` @ `ead3da0c`. It is retained for the 11-lens audit trail and unanimous-conclusion lineage; the **vote tallies are immutable audit artifacts** and are NOT rewritten — only an Errata section and inline `[STALE]`/`[VERIFIED ✓]` flags are added.
 
 **Author:** Claude Opus 4.8 (1M context)
 **Re-verification date:** 2026-06-28
@@ -34,9 +38,9 @@ The 11-agent merge (Grok) and this Opus re-verification agree on every Q. Annota
 |---|----------------|-----------------|
 | **Q1** Use Red Queen? | **YES — principles · CUT full RQGM from `src/`** (11/11) | **Unchanged.** Re-confirmed: `rg 'epoch_manifest\|RQGM\|co-evolv\|evolutionary\|genetic\|fitness' src/` = 0 production hits. |
 | **Q2** Where? | **HYBRID; L3 EXTERNAL hard** (11/11 substance) | **Unchanged.** |
-| **Q3** How? | Quorum + signed epoch manifest + shadow ledger + optional runner | **Refined (21-agent #8):** epoch apply MUST hit the **V-4 chain** (`epoch.manifest_applied`); and the manifest should be **bound to an `EpochAdvance` Checkpoint** (complementary, not a free-floating JSON) — see [21-agent OPUS C-2](RED-QUEEN-21-AGENT-VOTE-OPUS.md). |
+| **Q3** How? | Quorum + signed epoch manifest + shadow ledger + optional runner | **Refined (21-agent #8):** epoch apply MUST hit the **V-4 chain** (`epoch.manifest_applied`); and the manifest should be **bound to an `EpochAdvance` Checkpoint** (complementary, not a free-floating JSON) — see [21-agent OPUS C-2](RED-QUEEN-21-AGENT-VOTE-OPUS.html). |
 | **Q4** Pathway? | v0.9 spine → curator L2 → `ai-memory-rqgm` sibling v0.9.1+ | **Unchanged;** mark FED-RQ-01 **IN-FLIGHT (uncommitted)** rather than "pending". |
-| **Q5** Better than RQGM? | **§2.6 quorum + epoch > internal RQGM** (11/11) | **Refined:** "more durable **conditional on** attested family-distinctness *and* vote-independence" — both unbuilt ([21-agent C-3](RED-QUEEN-21-AGENT-VOTE-OPUS.md)). |
+| **Q5** Better than RQGM? | **§2.6 quorum + epoch > internal RQGM** (11/11) | **Refined:** "more durable **conditional on** attested family-distinctness *and* vote-independence" — both unbuilt ([21-agent C-3](RED-QUEEN-21-AGENT-VOTE-OPUS.html)). |
 
 **11-agent confidence:** 87% (range 78–91%). **Opus re-verification confidence in the 11-agent conclusions:** 90%.
 
@@ -63,11 +67,11 @@ The 11-agent merge (Grok) and this Opus re-verification agree on every Q. Annota
 | 3 | Security / Fail-Closed | 91% | ✓ — `enforce` inert + `RuleEngine` static re-confirmed; **+ Opus new finding: governance silent-disable** (`rules_store.rs:593`, no sig/audit) |
 | 4 | Curator Runtime | 86% | ✓ — single `AutonomyLlm`/`build_curator_llm`; decorrelation `--reflect`-only (1 caller) |
 | 5 | D1 Recursive Learning | 84% | ✓ — `reflect_with_hooks` 20 callers **VERIFIED**; MCP `ReflectHooks::empty()` gap re-confirmed (`mcp/tools/reflect.rs:496`) |
-| 6 | ASI Trajectory | 79% | ✓ — measurability-cliff reservation upheld, **but split**: structural-invariant signals are substrate-measurable; semantic (contradiction-density) is capability-coupled ([21-agent C-6](RED-QUEEN-21-AGENT-VOTE-OPUS.md)) |
+| 6 | ASI Trajectory | 79% | ✓ — measurability-cliff reservation upheld, **but split**: structural-invariant signals are substrate-measurable; semantic (contradiction-density) is capability-coupled ([21-agent C-6](RED-QUEEN-21-AGENT-VOTE-OPUS.html)) |
 | 7 | Procurement / Claims | 91% | ✓ — `enforce` inert = theater; "Red Queen-ready ~55–65%" headline **Opus tightens to ~15% optimization-readiness / ~5% family-verify** |
 | 8 | Performance / Ops | 82% | ✓ — #965 correct; governance-hook mutex nuance added (E-3) |
 | 9 | Federation | 78% | **`[STALE — see E-1]`** checkpoint-federation claim; FED-RQ-01 now in working tree |
-| 10 | Alternatives Analyst | 85% | ✓ — N≥3 quorum > internal RQGM; "quorum alone suffices" refined to "needs epoch-freeze" ([21-agent F-15](RED-QUEEN-21-AGENT-VOTE-OPUS.md)) |
+| 10 | Alternatives Analyst | 85% | ✓ — N≥3 quorum > internal RQGM; "quorum alone suffices" refined to "needs epoch-freeze" ([21-agent F-15](RED-QUEEN-21-AGENT-VOTE-OPUS.html)) |
 | 11 | Sibling Repo / Future | 87% | **`[STALE — see E-2]`** RQ-01 "delivered" → untracked, no consumer. See the OPUS sibling doc. |
 
 ---
@@ -93,10 +97,10 @@ The 11-agent merge (Grok) and this Opus re-verification agree on every Q. Annota
 
 | Doc | Relationship |
 |-----|--------------|
-| [`RED-QUEEN-21-AGENT-VOTE-OPUS.md`](RED-QUEEN-21-AGENT-VOTE-OPUS.md) | **Superseding placement authority** (21 lenses, this doc's successor) |
-| [`RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md`](RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md) | The Grok source this re-verifies |
-| [`RED-QUEEN-AGENT-11-ISOLATED-SIBLING-REPO-FUTURE-OPUS.md`](RED-QUEEN-AGENT-11-ISOLATED-SIBLING-REPO-FUTURE-OPUS.md) | Opus sibling-repo re-issue (Agent 11 lens detail) |
-| [`RQGM-2606.26294-vs-v0.8.0-OPUS.md`](RQGM-2606.26294-vs-v0.8.0-OPUS.md) | Opus mechanism map |
+| [`RED-QUEEN-21-AGENT-VOTE-OPUS.md`](RED-QUEEN-21-AGENT-VOTE-OPUS.html) | **Superseding placement authority** (21 lenses, this doc's successor) |
+| [`RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md`](RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.html) | The Grok source this re-verifies |
+| [`RED-QUEEN-AGENT-11-ISOLATED-SIBLING-REPO-FUTURE-OPUS.md`](RED-QUEEN-AGENT-11-ISOLATED-SIBLING-REPO-FUTURE-OPUS.html) | Opus sibling-repo re-issue (Agent 11 lens detail) |
+| [`RQGM-2606.26294-vs-v0.8.0-OPUS.md`](RQGM-2606.26294-vs-v0.8.0-OPUS.html) | Opus mechanism map |
 
 ---
 

@@ -1,3 +1,7 @@
+---
+layout: doc
+---
+
 # The Perfect Endpoint AI Memory System — 3×7 Adversarial Convergence Specification
 
 > **Document classification:** Strategic reference specification. Candidate input for the v1.0.0 ROADMAP revision and for `docs/strategy/moonshot-synthesis.md` reconciliation. Not a feature commitment.
@@ -8,7 +12,7 @@
 >
 > **Methodology caveat (binding, per moonshot-synthesis §0 discipline).** All 21 voting agents are Fable-5/Anthropic-family instances. The adversarial diversity here is **lens-decorrelated, not family-decorrelated** — this is CLAIMED-diverse convergence, not ATTESTED-decorrelated convergence, and the substrate's own §2.6 principle applies to this document with full force. This specification is a **candidate for the [#1171] heterogeneous evaluator panel** (non-Anthropic model families) before any part of it is committed to ROADMAP.md. Where this document and the panel later disagree, the panel wins.
 >
-> **Companion document:** [`PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.md`](PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.md) — the codegraph gap-map of ai-memory v0.9.0 + the planned v1.0.0 against this spec.
+> **Companion document:** [`PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.md`](PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.html) — the codegraph gap-map of ai-memory v0.9.0 + the planned v1.0.0 against this spec.
 
 ---
 
@@ -196,7 +200,7 @@ A2 attested-capture-channel (substrate-verified "observed" class) · A5 attested
 
 ## 7. Adjudicated amendments (2026-07-09, binding — cross-family 3×7 vs Grok 4.5, run `wf_a100ebc9-daa`)
 
-Where this section conflicts with §2–§6 above, this section wins. Full evidence: [`FABLE-VS-GROK-4-5-3x7-ADJUDICATION.md`](FABLE-VS-GROK-4-5-3x7-ADJUDICATION.md).
+Where this section conflicts with §2–§6 above, this section wins. Full evidence: [`FABLE-VS-GROK-4-5-3x7-ADJUDICATION.md`](FABLE-VS-GROK-4-5-3x7-ADJUDICATION.html).
 
 1. **A-CAP (capture completeness) is elevated to converged-class, panel-routed.** The 27-set contained no capture requirement — "pure recall of an empty corpus" (Grok S3/2.2-C) is a sustained objection given the substrate's founding #1388 failure class. Requirement: operator directives and session cognition are captured across the L1–L4 ladder including a mid-session watcher, with a process-death kill-test acceptance. The L3 watcher *build* sequences behind the Sprint-0 W4 keep/cut ruling + operator notify-dependency approval.
 2. **A-CORP (corpus lifecycle) added:** bounded growth under a named pressure policy + typed forget as first-class semantics; "infinite corpus by default" is banned. Spec/scoring only — no compaction/size-GC default flips without a T3 vote.

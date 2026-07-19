@@ -15,6 +15,17 @@ kramdown:
   syntax_highlighter: rouge
   hard_wrap: false
 
+# Apply the documentation shell to every Markdown page that lacks its own
+# layout front matter. Without this (and without per-file `layout: doc`),
+# GitHub Pages serves *.md as raw text — the reviews/ adjudication docs
+# were dead-links on the public site until this default + front matter.
+defaults:
+  - scope:
+      path: ""
+      type: "pages"
+    values:
+      layout: "doc"
+
 # Exclude repo/dev scaffolding from the build output.
 exclude:
   - "*.bak"

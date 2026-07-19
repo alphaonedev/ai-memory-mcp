@@ -1,3 +1,7 @@
+---
+layout: doc
+---
+
 # Red Queen / RQGM — FINAL Decision + Development Roadmap (OPUS, eternity-grade)
 
 > **This is the project's final, locked decision point on Red Queen / RQGM.** It is the canonical artifact folded into `ROADMAP.md` §25. It supersedes the placement debate in all prior review docs; those remain as the audit-trail lineage.
@@ -8,7 +12,7 @@
 **Paper:** [The Red Queen Gödel Machine (arXiv:2606.26294)](https://arxiv.org/abs/2606.26294) — [PDF](https://arxiv.org/pdf/2606.26294) (Iacob et al., 24 Jun 2026). **Provenance:** surfaced to the project by **Nick Jensen** ([X post](https://x.com/howtoprompt__/status/2070824205663273175)).
 **Method:** CodeGraph CLI (`/Users/fate/.grok/bin/codegraph`, warm index 846 files) as L1 evidence + `rg`/`Read`/`git`. Every load-bearing claim carries a `file:line` anchor.
 **Tracking issue:** [#1820](https://github.com/alphaonedev/ai-memory-mcp/issues/1820).
-**Companions:** [`RED-QUEEN-21-AGENT-VOTE-OPUS.md`](RED-QUEEN-21-AGENT-VOTE-OPUS.md) (placement authority) · [`RQGM-2606.26294-vs-v0.8.0-OPUS.md`](RQGM-2606.26294-vs-v0.8.0-OPUS.md) (mechanism map) · [`RED-QUEEN-11-AGENT-VOTE-OPUS.md`](RED-QUEEN-11-AGENT-VOTE-OPUS.md) · [`RED-QUEEN-AGENT-11-ISOLATED-SIBLING-REPO-FUTURE-OPUS.md`](RED-QUEEN-AGENT-11-ISOLATED-SIBLING-REPO-FUTURE-OPUS.md).
+**Companions:** [`RED-QUEEN-21-AGENT-VOTE-OPUS.md`](RED-QUEEN-21-AGENT-VOTE-OPUS.html) (placement authority) · [`RQGM-2606.26294-vs-v0.8.0-OPUS.md`](RQGM-2606.26294-vs-v0.8.0-OPUS.html) (mechanism map) · [`RED-QUEEN-11-AGENT-VOTE-OPUS.md`](RED-QUEEN-11-AGENT-VOTE-OPUS.html) · [`RED-QUEEN-AGENT-11-ISOLATED-SIBLING-REPO-FUTURE-OPUS.md`](RED-QUEEN-AGENT-11-ISOLATED-SIBLING-REPO-FUTURE-OPUS.html).
 
 ---
 

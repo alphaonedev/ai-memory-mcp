@@ -1,6 +1,10 @@
+---
+layout: doc
+---
+
 # Sibling Repo / External-L3 Future-Proofing (OPUS re-issue)
 
-**Lens:** Sibling Repo / Future-Proofing — Opus re-verification of the Grok Agent-11 isolated run ([`RED-QUEEN-AGENT-11-ISOLATED-SIBLING-REPO-FUTURE.md`](RED-QUEEN-AGENT-11-ISOLATED-SIBLING-REPO-FUTURE.md), base `c85b9c56`)
+**Lens:** Sibling Repo / Future-Proofing — Opus re-verification of the Grok Agent-11 isolated run ([`RED-QUEEN-AGENT-11-ISOLATED-SIBLING-REPO-FUTURE.md`](RED-QUEEN-AGENT-11-ISOLATED-SIBLING-REPO-FUTURE.html), base `c85b9c56`)
 **Author:** Claude Opus 4.8 (1M context)
 **Re-verification date:** 2026-06-28
 **Codebase:** `release/v0.8.0` @ `ead3da0c` (working tree)
@@ -37,7 +41,7 @@
 The load-bearing property of the whole proposal is that the substrate has **zero compile-time dependency on any sibling**. This is mechanically provable today:
 
 - `rg -i 'rqgm|epoch_manifest|red.?queen' src/` → **0 hits, exit 1.** No crate, module, import, or fs-watch in `src/` references a sibling.
-- `rg 'epoch_manifest|RQGM|evolutionary|genetic|fitness|co-evolv' src/` (production) → **0 hits** (corroborated in [`RQGM-…-OPUS.md`](RQGM-2606.26294-vs-v0.8.0-OPUS.md)).
+- `rg 'epoch_manifest|RQGM|evolutionary|genetic|fitness|co-evolv' src/` (production) → **0 hits** (corroborated in [`RQGM-…-OPUS.md`](RQGM-2606.26294-vs-v0.8.0-OPUS.html)).
 - The only `epoch_manifest` artifact in the tree is `docs/contracts/epoch_manifest.schema.json` — docs-only, **untracked**.
 
 **Conclusion:** `ai-memory → ai-memory-rqgm` has **no** compile dependency. The sibling depends on the substrate (reads exports); never the reverse. This clean one-directionality is the strongest part of the proposal and should lead any procurement framing.
@@ -99,7 +103,7 @@ This gets **epoch-freeze federation + audit** from the Checkpoint **and** **payl
 | Stationary judge | `build_curator_llm @ cli/curator.rs:114` | **HOLDS ✓** (single resolver, one `OllamaClient`) |
 | Decorrelation not in daemon | 0 hits in `daemon_runtime.rs` | **HOLDS ✓** (`rg -ic decorrelation src/daemon_runtime.rs` = 0; `--reflect`-only) |
 | `enforce` inert | `decorrelation_probe.rs:272-280` | **HOLDS ✓** (`:272` `if mode==Enforce` → advisory degrade) |
-| MCP hooks empty | `reflect_with_hooks(…, ReflectHooks::empty())` sqlite `843` / postgres `7906` | **HOLDS ✓** (both real; +a 3rd site `postgres.rs:14064`; the MCP-handler site is `mcp/tools/reflect.rs:496` — see [Auditor 1 reconciliation](RED-QUEEN-21-AGENT-VOTE-OPUS.md)) |
+| MCP hooks empty | `reflect_with_hooks(…, ReflectHooks::empty())` sqlite `843` / postgres `7906` | **HOLDS ✓** (both real; +a 3rd site `postgres.rs:14064`; the MCP-handler site is `mcp/tools/reflect.rs:496` — see [Auditor 1 reconciliation](RED-QUEEN-21-AGENT-VOTE-OPUS.html)) |
 | Forensic `Manifest` ≠ epoch | `forensic/bundle.rs:151` | **HOLDS ✓** (tar-bundle index, not an epoch manifest) |
 | **RQ-01 status** | "✅ delivered this run" | **CORRECTED → drafted, git-untracked, zero `src/` consumer** (`git status` `?? docs/contracts/`) |
 | **Checkpoint primitive (new)** | — | `models/checkpoint.rs:109` (struct); `checkpoints/mod.rs:47-72` (`resolution_signable`/`verify_checkpoint_resolution`); MCP `mcp/tools/checkpoint.rs` |

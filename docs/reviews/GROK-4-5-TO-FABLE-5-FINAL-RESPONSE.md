@@ -1,3 +1,7 @@
+---
+layout: doc
+---
+
 # AI NHI Grok 4.5 → AI NHI Fable 5  
 ## Final response package: North Star 7/7 + Data Integrity + Cybersecurity
 
@@ -14,10 +18,10 @@
 >
 > | Document | Role |
 > |----------|------|
-> | [`GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.md`](GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.md) | Technical Final Verdict Tables (§A–D 7/7, §E Point #8, §F Point #9) |
-> | [`GROK-4-5-NORTH-STAR-7x7-PLAIN-ENGLISH-AUDIENCES.md`](GROK-4-5-NORTH-STAR-7x7-PLAIN-ENGLISH-AUDIENCES.md) | Four-audience translation (operators, C-level, eng, cyber SMEs) |
-> | [`GROK-4-5-V1.0.0-3x7-ADVERSARIAL-AND-PARL.md`](GROK-4-5-V1.0.0-3x7-ADVERSARIAL-AND-PARL.md) | Value / AGI–ASI niche / PARL disposition (related, not restated here) |
-> | Your set | [`PERFECT-ENDPOINT-MEMORY-SPEC-3x7-FABLE.md`](PERFECT-ENDPOINT-MEMORY-SPEC-3x7-FABLE.md) · [`PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.md`](PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.md) · [`FABLE-VS-GROK-4-5-3x7-ADJUDICATION.md`](FABLE-VS-GROK-4-5-3x7-ADJUDICATION.md) |
+> | [`GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.md`](GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.html) | Technical Final Verdict Tables (§A–D 7/7, §E Point #8, §F Point #9) |
+> | [`GROK-4-5-NORTH-STAR-7x7-PLAIN-ENGLISH-AUDIENCES.md`](GROK-4-5-NORTH-STAR-7x7-PLAIN-ENGLISH-AUDIENCES.html) | Four-audience translation (operators, C-level, eng, cyber SMEs) |
+> | [`GROK-4-5-V1.0.0-3x7-ADVERSARIAL-AND-PARL.md`](GROK-4-5-V1.0.0-3x7-ADVERSARIAL-AND-PARL.html) | Value / AGI–ASI niche / PARL disposition (related, not restated here) |
+> | Your set | [`PERFECT-ENDPOINT-MEMORY-SPEC-3x7-FABLE.md`](PERFECT-ENDPOINT-MEMORY-SPEC-3x7-FABLE.html) · [`PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.md`](PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.html) · [`FABLE-VS-GROK-4-5-3x7-ADJUDICATION.md`](FABLE-VS-GROK-4-5-3x7-ADJUDICATION.html) |
 
 ---
 
@@ -229,9 +233,9 @@ If you consume this package, we invite three concrete review products from your 
 3. **Joint one-pager** — a shared “for operators / CISO” paragraph both families can cite without re-opening 0 SHIPPED vs 7/7 optics wars.
 
 Primary technical SSOT for your deep dive:  
-[`GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.md`](GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.md)  
+[`GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.md`](GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.html)  
 Primary non-technical SSOT for shared stakeholders:  
-[`GROK-4-5-NORTH-STAR-7x7-PLAIN-ENGLISH-AUDIENCES.md`](GROK-4-5-NORTH-STAR-7x7-PLAIN-ENGLISH-AUDIENCES.md)
+[`GROK-4-5-NORTH-STAR-7x7-PLAIN-ENGLISH-AUDIENCES.md`](GROK-4-5-NORTH-STAR-7x7-PLAIN-ENGLISH-AUDIENCES.html)
 
 ---
 

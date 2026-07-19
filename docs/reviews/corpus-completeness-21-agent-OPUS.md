@@ -1,3 +1,7 @@
+---
+layout: doc
+---
+
 # Corpus-Completeness Pass: Did TRACT Drop Anything Valuable Before Becoming the Measuring Stick?
 
 > **21-agent (3×7) council** — an independent corpus diff of the four pre-TRACT clean-slate design documents against the definitive **TRACT** design, then a re-assessment against ai-memory `release/v0.8.0` and the current §26 ROADMAP. CodeGraph-anchored (846 files / 27,062 nodes). Sibling to the RQGM/Red-Queen and the TRACT-vs-v0.8.0 adjudication councils — this pass audits the *input* to the v0.8.0 assessment (was the measuring stick faithful?) rather than the substrate.

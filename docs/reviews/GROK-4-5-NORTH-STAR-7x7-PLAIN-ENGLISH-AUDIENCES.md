@@ -1,7 +1,11 @@
+---
+layout: doc
+---
+
 # ai-memory North Star 7/7 — Plain English for four audiences
 
 > **What this is:** A plain-language translation of the **Final Verdict Table** from the executed multi-agent audit  
-> [`GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.md`](GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.md)  
+> [`GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.md`](GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.html)  
 > (21 adversarial agents on points 1–7 + **separate 21 agents on Point #8 Data Integrity** + **separate 21 agents on Point #9 Cybersecurity** + CodeGraph, 2026-07-18).  
 > **What this is not:** A new technical audit, a marketing rewrite of the moonshot, or a release note.
 >
@@ -221,7 +225,7 @@ ai-memory is like a **secure notebook and filing system for AI helpers** that li
 ### Reference
 
 Full ledger, subagent IDs, and evidence:  
-[`GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.md`](GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.md) (§E Point #8, §F Point #9)
+[`GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.md`](GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.html) (§E Point #8, §F Point #9)
 
 ---
 
@@ -342,7 +346,7 @@ Full ledger, subagent IDs, and evidence:
 
 | Item | Detail |
 |------|--------|
-| Technical SSOT | [`GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.md`](GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.md) |
+| Technical SSOT | [`GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.md`](GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.html) |
 | Method | 21 executed explore subagents (3 waves × 7) on 1–7 + CodeGraph / code evidence |
 | Ballot (1–7) | 4 × 7/7_YES · 16 × 7/7_CONDITIONAL · 1 × NOT_7/7 |
 | Aggregate (1–7) | **7/7 in kind · 0 missing · majority CONDITIONAL** |
