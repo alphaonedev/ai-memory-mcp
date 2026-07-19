@@ -1008,3 +1008,64 @@ pub fn gc_tick(conn: &Connection) -> Result<SweepReport> {
     }
     Ok(report)
 }
+
+/// Whether `db_path` denotes a NON-file-backed sqlite database (an empty
+/// path, `:memory:`, or a `mode=memory` URI). A DEDICATED connection opened
+/// from such a path would see a DIFFERENT (empty) database, so the detached
+/// sweep must never run against it — its reconciler would mis-classify
+/// every live bundle as rowless and quarantine the lot. Conservative by
+/// design: a false positive only routes the sweep back to the legacy
+/// under-lock tick (correct, merely serialized), never to a wrong result.
+#[must_use]
+pub fn is_in_memory_db_path(db_path: &Path) -> bool {
+    if db_path.as_os_str().is_empty() {
+        return true;
+    }
+    let s = db_path.to_string_lossy();
+    s.contains(":memory:") || s.contains("mode=memory")
+}
+
+/// Pre-ship 3x7 concurrency fix (#2064) — the gc-tick entry point for a
+/// DEDICATED connection: opens its own connection from the daemon's stored
+/// DB path and runs [`gc_tick`] against it, so the Reed-Solomon encodes +
+/// per-shard fsyncs (up to [`SWEEP_LIMIT_PER_TICK`] rows per tick when a
+/// backlog drains) never ride the shared HTTP handler mutex — pre-fix, an
+/// enabled cold tier draining a backlog stalled the ENTIRE API for the
+/// duration of the sweep every gc tick.
+///
+/// Sound because the sweep is DB-READ-ONLY (bundle files are its only
+/// writes) and cross-connection concurrency with the purge/restore funnels
+/// is the already-supported regime (a CLI purge runs on its own connection
+/// against a live daemon): the write-ahead purge-intent journal, the
+/// quarantine classification, and the grace-window / stale-intent age
+/// gates in [`reconcile_and_scrub`] key on durable filesystem + DB state,
+/// never on connection identity. The purge-journal ordering (journal
+/// BEFORE `DELETE`), the quarantine-not-destroy posture, and the #2225
+/// poison skip-set are untouched — only WHERE the sweep's connection comes
+/// from changes. The process-static sweep state (keyset frontier, poison
+/// registry, reconcile cursor) is keyed by store DIRECTORY, which resolves
+/// identically for the dedicated connection (same DB file ⇒ same
+/// `<db>.erasure` sibling), so frontier semantics carry over unchanged.
+/// Callers MUST NOT run two sweeps of one store concurrently (that state
+/// is single-sweeper); the daemon gc loop awaits each tick.
+///
+/// # Errors
+/// Fails LOUD on a non-file-backed path (callers gate on
+/// [`is_in_memory_db_path`] and keep such databases on the legacy
+/// under-lock tick), on connection-open failure, and on the [`gc_tick`]
+/// scan-level failures (per-row failures stay absorbed into the report).
+pub fn gc_tick_detached(db_path: &Path) -> Result<SweepReport> {
+    if !erasure_cold_tier_enabled() {
+        return Ok(SweepReport::default());
+    }
+    if is_in_memory_db_path(db_path) {
+        anyhow::bail!(
+            "erasure detached sweep: {} is not a file-backed database — a dedicated \
+             connection would open a different (empty) database; use the under-lock tick",
+            db_path.display()
+        );
+    }
+    let conn = crate::storage::open(db_path)
+        .with_context(|| format!("erasure detached sweep: open {}", db_path.display()))?;
+    gc_tick(&conn)
+}

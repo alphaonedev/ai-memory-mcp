@@ -3447,6 +3447,15 @@ pub fn spawn_gc_loop_with_shadow_retention(
     interval: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // #2064 pre-ship concurrency fix — snapshot the immutable DB path
+        // ONCE so the erasure cold-tier sweep can run on a DEDICATED
+        // connection OFF the shared handler mutex (see the erasure arms
+        // below). The tuple's `PathBuf` never changes for the daemon
+        // lifetime; non-file-backed databases stay on the legacy
+        // under-lock tick (`is_in_memory_db_path`).
+        let erasure_db_path = { state.lock().await.1.clone() };
+        let erasure_detached =
+            !crate::erasure::archive_sync::is_in_memory_db_path(&erasure_db_path);
         loop {
             tokio::time::sleep(interval).await;
             let lock = state.lock().await;
@@ -3482,14 +3491,21 @@ pub fn spawn_gc_loop_with_shadow_retention(
             // rows into (k, m) Reed-Solomon shard bundles, paced at
             // SWEEP_LIMIT_PER_TICK oldest-first per tick. No-op unless
             // AI_MEMORY_ERASURE_COLD_TIER is enabled.
-            match crate::erasure::archive_sync::gc_tick(&lock.0) {
-                Ok(r) if r.bundled > 0 || r.failed > 0 => tracing::info!(
-                    "gc: erasure cold tier bundled {} archived rows ({} failed, retried next tick)",
-                    r.bundled,
-                    r.failed
-                ),
-                Ok(_) => {}
-                Err(e) => tracing::warn!("erasure cold-tier sweep failed: {e:#}"),
+            //
+            // Pre-ship 3x7 concurrency fix: on a FILE-BACKED database the
+            // sweep runs AFTER this lock is dropped, on a DEDICATED
+            // connection inside `spawn_blocking` (see below), so its
+            // Reed-Solomon encodes + per-shard fsyncs (up to
+            // SWEEP_LIMIT_PER_TICK rows when a backlog drains) never stall
+            // the HTTP handlers that serialize on this mutex. This
+            // under-lock arm survives ONLY for non-file-backed databases,
+            // where a fresh connection would open a DIFFERENT (empty)
+            // database and the detached reconciler would mis-classify every
+            // live bundle as rowless (quarantining them) — fail-closed:
+            // fall back to the legacy serialized tick rather than degrade
+            // into wrong reconciliation.
+            if !erasure_detached {
+                log_erasure_gc_report(crate::erasure::archive_sync::gc_tick(&lock.0));
             }
             // Cluster G (#767, PERF-4) — shadow-mode observation
             // retention sweep. `<= 0` is a no-op (operator opt-out).
@@ -3511,8 +3527,50 @@ pub fn spawn_gc_loop_with_shadow_retention(
                 Ok(_) => {}
                 Err(e) => tracing::warn!("recall_observations gc failed: {e}"),
             }
+            // Pre-ship 3x7 concurrency fix (#2064) — release the handler
+            // mutex BEFORE the erasure cold-tier sweep. The sweep is
+            // DB-READ-ONLY (bundle files are its only writes) and
+            // cross-connection concurrency with the purge/restore funnels
+            // is the already-supported regime (a CLI purge runs on its own
+            // connection against a live daemon; the reconciler's
+            // grace-window + stale-intent age gates reason about exactly
+            // that), so a dedicated connection is sound. `spawn_blocking`
+            // keeps the encode/fsync work off the async workers, and the
+            // join is AWAITED (never detached-and-forgotten) so two sweeps
+            // of one store can never overlap — the keyset frontier and the
+            // rotating reconcile cursor are single-sweeper state.
+            drop(lock);
+            if erasure_detached && crate::erasure::erasure_cold_tier_enabled() {
+                let path = erasure_db_path.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::erasure::archive_sync::gc_tick_detached(&path)
+                })
+                .await
+                {
+                    Ok(result) => log_erasure_gc_report(result),
+                    Err(e) => {
+                        tracing::warn!("erasure cold-tier sweep task failed to join: {e}");
+                    }
+                }
+            }
         }
     })
+}
+
+/// Shared per-tick log rendering for the #2064 erasure cold-tier sweep
+/// report — one site for the info/warn lines whether the sweep ran on the
+/// legacy under-lock arm (non-file-backed databases) or the detached
+/// dedicated-connection arm (pre-ship 3x7 concurrency fix).
+fn log_erasure_gc_report(result: anyhow::Result<crate::erasure::archive_sync::SweepReport>) {
+    match result {
+        Ok(r) if r.bundled > 0 || r.failed > 0 => tracing::info!(
+            "gc: erasure cold tier bundled {} archived rows ({} failed, retried next tick)",
+            r.bundled,
+            r.failed
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("erasure cold-tier sweep failed: {e:#}"),
+    }
 }
 
 /// v0.7.0 K2 — spawn the periodic `pending_actions` timeout sweeper.
