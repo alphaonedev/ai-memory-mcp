@@ -433,9 +433,7 @@ impl DeferredAuditJournal {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let spool_dir = journal_spool_dir(&path);
-        let spool_existed = spool_dir.exists();
-        std::fs::create_dir_all(&spool_dir)
-            .with_context(|| format!("create deferred-audit spool {}", spool_dir.display()))?;
+        create_or_validate_spool_dir(&spool_dir)?;
         let spool_metadata = std::fs::symlink_metadata(&spool_dir)
             .context("inspect deferred-audit spool directory")?;
         if !spool_metadata.is_dir() || spool_metadata.file_type().is_symlink() {
@@ -478,17 +476,6 @@ impl DeferredAuditJournal {
                 .context("tighten deferred-audit spool lock permissions")?;
             file.set_permissions(std::fs::Permissions::from_mode(0o600))
                 .context("tighten deferred-audit journal permissions")?;
-            open_directory_handle(&spool_dir)?
-                .set_permissions(std::fs::Permissions::from_mode(0o700))
-                .context("tighten deferred-audit spool permissions")?;
-        }
-        if !spool_existed && let Some(parent) = spool_dir.parent() {
-            let parent = if parent.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                parent
-            };
-            sync_directory(parent).context("fsync deferred-audit spool parent")?;
         }
         fs2::FileExt::lock_exclusive(&spool_lock)
             .context("lock deferred-audit spool during open")?;
@@ -711,6 +698,10 @@ impl DeferredAuditJournal {
     /// Propagates the seek / read IO error.
     pub fn replay(&self) -> Result<Vec<DeferredAuditEvent>> {
         let _spool_guard = self.lock_spool()?;
+        self.replay_locked()
+    }
+
+    fn replay_locked(&self) -> Result<Vec<DeferredAuditEvent>> {
         let mut f = self.file.lock().expect(JOURNAL_MUTEX_POISONED);
         f.seek(SeekFrom::Start(0)).context("journal replay: seek")?;
         let mut out = replay_legacy_stream(&mut f)?;
@@ -751,6 +742,15 @@ impl DeferredAuditJournal {
         };
         let mut usage = self.spool_usage.lock().expect(JOURNAL_MUTEX_POISONED);
         let _spool_guard = self.lock_spool()?;
+        self.acknowledge_locked(event, occurrence_id, &mut usage)
+    }
+
+    fn acknowledge_locked(
+        &self,
+        event: &DeferredAuditEvent,
+        occurrence_id: &str,
+        usage: &mut SpoolUsage,
+    ) -> Result<()> {
         let spool_path = self.spool_path(occurrence_id);
         let existing = match read_journal_frame_bounded(&spool_path) {
             Ok(bytes) => bytes,
@@ -855,6 +855,70 @@ fn journal_spool_dir(journal_path: &Path) -> PathBuf {
     let mut spool_os = journal_path.as_os_str().to_os_string();
     spool_os.push(JOURNAL_SPOOL_SUFFIX);
     PathBuf::from(spool_os)
+}
+
+fn create_or_validate_spool_dir(spool_dir: &Path) -> Result<bool> {
+    let created = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(spool_dir) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("create deferred-audit spool {}", spool_dir.display())
+                    });
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            match std::fs::create_dir(spool_dir) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("create deferred-audit spool {}", spool_dir.display())
+                    });
+                }
+            }
+        }
+    };
+
+    let metadata =
+        std::fs::symlink_metadata(spool_dir).context("inspect deferred-audit spool directory")?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        anyhow::bail!("deferred-audit spool path is not a trusted directory");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let directory = open_directory_handle(spool_dir)?;
+        let metadata = directory
+            .metadata()
+            .context("inspect deferred-audit spool directory handle")?;
+        // SAFETY: geteuid has no preconditions and only reads process credentials.
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != effective_uid {
+            anyhow::bail!("deferred-audit spool directory is not owned by the daemon uid");
+        }
+        if metadata.permissions().mode() & 0o777 != 0o700 {
+            anyhow::bail!("deferred-audit spool directory is not private to the daemon uid");
+        }
+    }
+    if created && let Some(parent) = spool_dir.parent() {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        sync_directory(parent).context("fsync deferred-audit spool parent")?;
+    }
+    Ok(created)
 }
 
 struct SpoolLockGuard<'a>(&'a File);
@@ -1198,8 +1262,14 @@ pub fn recover_deferred_audit(journal_path: &Path, db_path: &Path) -> Result<usi
     if !journal_path.exists() && !journal_spool_dir(journal_path).exists() {
         return Ok(0);
     }
-    let journal = Arc::new(DeferredAuditJournal::open(journal_path)?);
-    let events = journal.replay()?;
+    let journal = DeferredAuditJournal::open(journal_path)?;
+    // Recovery is one cross-process claim: snapshot, residence checks, DB
+    // append/DLQ landing, spool acknowledgement, and legacy truncation must
+    // not interleave with another daemon recovering the same journal.
+    let mut usage = journal.spool_usage.lock().expect(JOURNAL_MUTEX_POISONED);
+    let _spool_guard = journal.lock_spool()?;
+    let events = journal.replay_locked()?;
+    recovery_test_barrier();
     if events.is_empty() {
         journal.truncate()?;
         return Ok(0);
@@ -1209,7 +1279,9 @@ pub fn recover_deferred_audit(journal_path: &Path, db_path: &Path) -> Result<usi
         db_path: db_path.to_path_buf(),
         conn: None,
         metrics: None,
-        journal: Some(Arc::clone(&journal)),
+        // The outer recovery claim owns acknowledgement. Letting the sink
+        // acknowledge would recursively acquire the non-reentrant spool lock.
+        journal: None,
     };
     let mut recovered = 0usize;
     let mut unresolved = false;
@@ -1226,7 +1298,7 @@ pub fn recover_deferred_audit(journal_path: &Path, db_path: &Path) -> Result<usi
         let already_chained = if let Some(occurrence_id) = &ev.occurrence_id {
             match occurrence_residence(&conn, occurrence_id, &hash) {
                 Ok(Some(_)) => {
-                    journal.acknowledge(ev)?;
+                    journal.acknowledge_locked(ev, occurrence_id, &mut usage)?;
                     true
                 }
                 Ok(None) => false,
@@ -1267,8 +1339,16 @@ pub fn recover_deferred_audit(journal_path: &Path, db_path: &Path) -> Result<usi
             continue;
         }
         match sink.append(ev) {
-            Ok(AppendOutcome::Appended) => recovered += 1,
+            Ok(AppendOutcome::Appended) => {
+                if let Some(occurrence_id) = &ev.occurrence_id {
+                    journal.acknowledge_locked(ev, occurrence_id, &mut usage)?;
+                }
+                recovered += 1;
+            }
             Ok(AppendOutcome::DlqLanded) => {
+                if let Some(occurrence_id) = &ev.occurrence_id {
+                    journal.acknowledge_locked(ev, occurrence_id, &mut usage)?;
+                }
                 tracing::warn!(
                     occurrence_id = ?ev.occurrence_id,
                     "recover_deferred_audit: event durably landed in DLQ"
@@ -1297,6 +1377,29 @@ pub fn recover_deferred_audit(journal_path: &Path, db_path: &Path) -> Result<usi
         );
     }
     Ok(recovered)
+}
+
+#[cfg(not(test))]
+fn recovery_test_barrier() {}
+
+#[cfg(test)]
+fn recovery_test_barrier() {
+    const READY_ENV: &str = "AI_MEMORY_TEST_RECOVERY_SNAPSHOT_READY";
+    const RELEASE_ENV: &str = "AI_MEMORY_TEST_RECOVERY_SNAPSHOT_RELEASE";
+    let (Some(ready), Some(release)) = (std::env::var_os(READY_ENV), std::env::var_os(RELEASE_ENV))
+    else {
+        return;
+    };
+    std::fs::write(ready, b"ready").expect("write recovery snapshot-ready marker");
+    let release = PathBuf::from(release);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !release.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "recovery snapshot release timeout"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// Producer-side handle. Cloneable so multiple callsites (HTTP
@@ -1740,6 +1843,25 @@ impl SqliteSignedEventsSink {
             }
         }
 
+        // A peer process can commit this stable occurrence ID after our
+        // preflight but before our INSERT. Re-probe an ID-constraint failure
+        // before DLQ fallback so an idempotently matching chain row can never
+        // acquire dual residence. Other failures retain the normal DLQ path.
+        if last_err
+            .as_ref()
+            .is_some_and(is_occurrence_id_constraint_race)
+            && let Some(occurrence_id) = &event.occurrence_id
+        {
+            let residence = {
+                let conn = self.ensure_conn()?;
+                occurrence_residence(conn, occurrence_id, &signed.payload_hash)
+            }?;
+            if let Some(outcome) = residence {
+                self.acknowledge(event)?;
+                return Ok(outcome);
+            }
+        }
+
         // Either the retry budget was exhausted on UNIQUE races OR
         // the first attempt produced a non-race error. Land in DLQ.
         //
@@ -1826,6 +1948,28 @@ fn is_unique_constraint_race(err: &anyhow::Error) -> bool {
                     message.contains("signed_events.sequence")
                         || message.contains("idx_signed_events_sequence")
                 })
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_occurrence_id_constraint_race(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(rusqlite::Error::SqliteFailure(code, message)) =
+            cause.downcast_ref::<rusqlite::Error>()
+        {
+            let is_id_constraint = matches!(
+                code.extended_code,
+                rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                    | rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+            );
+            if is_id_constraint
+                && message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("signed_events.id"))
             {
                 return true;
             }
@@ -3316,6 +3460,10 @@ mod tests {
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE),
             Some("UNIQUE constraint failed: signed_events.id".to_string()),
         );
+        let id_primary_key_err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY),
+            Some("UNIQUE constraint failed: signed_events.id".to_string()),
+        );
         let other_err = rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
             Some("database is locked".to_string()),
@@ -3326,9 +3474,13 @@ mod tests {
             anyhow::Error::from(other_err).context("append signed_event");
         assert!(is_unique_constraint_race(&wrapped_unique));
         assert!(!is_unique_constraint_race(&wrapped_other));
-        assert!(!is_unique_constraint_race(&anyhow::Error::from(
-            id_unique_err
+        let id_unique_err = anyhow::Error::from(id_unique_err);
+        assert!(!is_unique_constraint_race(&id_unique_err));
+        assert!(is_occurrence_id_constraint_race(&id_unique_err));
+        assert!(is_occurrence_id_constraint_race(&anyhow::Error::from(
+            id_primary_key_err
         )));
+        assert!(!is_occurrence_id_constraint_race(&wrapped_unique));
 
         // Non-rusqlite errors are never UNIQUE races.
         let plain: anyhow::Error = anyhow::anyhow!("plain error");
@@ -3705,6 +3857,66 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn journal_spool_creation_is_private_with_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const ROLE_ENV: &str = "AI_MEMORY_TEST_PRIVATE_SPOOL_ROLE";
+        const SPOOL_ENV: &str = "AI_MEMORY_TEST_PRIVATE_SPOOL_PATH";
+
+        if std::env::var_os(ROLE_ENV).is_some() {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let spool = PathBuf::from(std::env::var_os(SPOOL_ENV).unwrap());
+            // SAFETY: umask accepts every mode value and returns the prior mask.
+            let previous = unsafe { libc::umask(0) };
+            let created = create_or_validate_spool_dir(&spool).unwrap();
+            // SAFETY: restoring the mask returned by umask has no preconditions.
+            unsafe { libc::umask(previous) };
+            assert!(created);
+            let metadata = std::fs::metadata(spool).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+            // SAFETY: geteuid has no preconditions and only reads credentials.
+            assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+            return;
+        }
+
+        let dir = fresh_tempdir();
+        let spool = dir.path().join("atomic-private-spool");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("governance::deferred_audit::tests::journal_spool_creation_is_private_with_permissive_umask")
+            .arg("--nocapture")
+            .env(ROLE_ENV, "child")
+            .env(SPOOL_ENV, &spool)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::metadata(spool).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_rejects_preexisting_nonprivate_spool_without_repairing_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = fresh_tempdir();
+        let spool = dir.path().join("preexisting-broad-spool");
+        std::fs::create_dir(&spool).unwrap();
+        std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        assert!(create_or_validate_spool_dir(&spool).is_err());
+        assert_eq!(
+            std::fs::metadata(spool).unwrap().permissions().mode() & 0o777,
+            0o777,
+            "an exposed legacy spool must fail closed, not be repaired and trusted"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn journal_windows_publish_ack_and_reopen_runtime() {
@@ -3975,6 +4187,143 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "exactly one row despite two recovery passes");
+    }
+
+    #[test]
+    fn journal_recovery_serializes_occurrence_and_legacy_claims_across_processes() {
+        const ROLE_ENV: &str = "AI_MEMORY_TEST_RECOVERY_ROLE";
+        const JOURNAL_ENV: &str = "AI_MEMORY_TEST_RECOVERY_JOURNAL";
+        const DB_ENV: &str = "AI_MEMORY_TEST_RECOVERY_DB";
+        const RESULT_ENV: &str = "AI_MEMORY_TEST_RECOVERY_RESULT";
+        const STARTED_ENV: &str = "AI_MEMORY_TEST_RECOVERY_STARTED";
+        const READY_ENV: &str = "AI_MEMORY_TEST_RECOVERY_SNAPSHOT_READY";
+        const RELEASE_ENV: &str = "AI_MEMORY_TEST_RECOVERY_SNAPSHOT_RELEASE";
+
+        if std::env::var_os(ROLE_ENV).is_some() {
+            let journal = PathBuf::from(std::env::var_os(JOURNAL_ENV).unwrap());
+            let db = PathBuf::from(std::env::var_os(DB_ENV).unwrap());
+            let result = PathBuf::from(std::env::var_os(RESULT_ENV).unwrap());
+            std::fs::write(std::env::var_os(STARTED_ENV).unwrap(), b"started").unwrap();
+            let recovered = recover_deferred_audit(&journal, &db).unwrap();
+            std::fs::write(result, recovered.to_string()).unwrap();
+            return;
+        }
+
+        let dir = fresh_tempdir();
+        let db_path = dir.path().join("cross-process-recovery.db");
+        let _ = crate::db::open(&db_path).expect("init db");
+        let journal_path = deferred_audit_journal_path(&db_path);
+        let occurrence = DeferredAuditEvent::from_refusal(
+            "agent:recovery-occurrence",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        let mut legacy = DeferredAuditEvent::from_refusal(
+            "agent:recovery-legacy",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        legacy.occurrence_id = None;
+        let journal = DeferredAuditJournal::open(&journal_path).unwrap();
+        journal.append(&occurrence).unwrap();
+        journal.append(&legacy).unwrap();
+        drop(journal);
+
+        let executable = std::env::current_exe().unwrap();
+        let spawn_child = |role: &str| {
+            let ready = dir.path().join(format!("ready-{role}"));
+            let release = dir.path().join(format!("release-{role}"));
+            let result = dir.path().join(format!("result-{role}"));
+            let started = dir.path().join(format!("started-{role}"));
+            let child = std::process::Command::new(&executable)
+                .arg("--exact")
+                .arg("governance::deferred_audit::tests::journal_recovery_serializes_occurrence_and_legacy_claims_across_processes")
+                .arg("--nocapture")
+                .env(ROLE_ENV, role)
+                .env(JOURNAL_ENV, &journal_path)
+                .env(DB_ENV, &db_path)
+                .env(RESULT_ENV, &result)
+                .env(STARTED_ENV, &started)
+                .env(READY_ENV, &ready)
+                .env(RELEASE_ENV, &release)
+                .spawn()
+                .unwrap();
+            (child, started, ready, release, result)
+        };
+        let (mut first, first_started, first_ready, first_release, first_result) =
+            spawn_child("first");
+        wait_for_test_path(&first_started);
+        wait_for_test_path(&first_ready);
+        let (mut second, second_started, second_ready, second_release, second_result) =
+            spawn_child("second");
+        wait_for_test_path(&second_started);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert!(
+            !second_ready.exists(),
+            "a second recovery must not snapshot while the first claim is active"
+        );
+        std::fs::write(&first_release, b"release").unwrap();
+        assert!(first.wait().unwrap().success());
+        wait_for_test_path(&second_ready);
+        std::fs::write(&second_release, b"release").unwrap();
+        assert!(second.wait().unwrap().success());
+
+        let recovered: usize = [&first_result, &second_result]
+            .iter()
+            .map(|path| {
+                std::fs::read_to_string(path)
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            })
+            .sum();
+        assert_eq!(recovered, 2);
+        let conn = crate::db::open(&db_path).unwrap();
+        let chained: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1 AND agent_id IN (?2, ?3)",
+                rusqlite::params![
+                    GOVERNANCE_REFUSAL_EVENT_TYPE,
+                    occurrence.agent_id,
+                    legacy.agent_id
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let dlq: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events_dlq WHERE event_type = ?1 AND agent_id IN (?2, ?3)",
+                rusqlite::params![
+                    GOVERNANCE_REFUSAL_EVENT_TYPE,
+                    occurrence.agent_id,
+                    legacy.agent_id
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(chained, 2);
+        assert_eq!(dlq, 0);
+        assert_eq!(std::fs::metadata(&journal_path).unwrap().len(), 0);
+        assert!(
+            DeferredAuditJournal::open(&journal_path)
+                .unwrap()
+                .replay()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    fn wait_for_test_path(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "marker timeout: {path:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
