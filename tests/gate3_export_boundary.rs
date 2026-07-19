@@ -183,7 +183,12 @@ mod tests {
         let mut stderr = Vec::<u8>::new();
         {
             let mut out = ai_memory::cli::CliOutput::from_std(&mut stdout, &mut stderr);
-            ai_memory::cli::io::export(db_path, &mut out).expect("cli export");
+            ai_memory::cli::io::export(
+                db_path,
+                &ai_memory::cli::io::ExportArgs::default(),
+                &mut out,
+            )
+            .expect("cli export");
         }
         String::from_utf8(stdout).expect("stdout is utf8")
     }

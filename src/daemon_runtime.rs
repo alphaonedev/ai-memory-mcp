@@ -259,8 +259,11 @@ pub enum Command {
     /// crypto spine is separately exportable via
     /// `ai-memory export-forensic-bundle`. The export payload carries
     /// additive `export_scope` / `portability_complete` / `excludes` markers
-    /// and a stderr WARN naming this scope.
-    Export,
+    /// and a stderr WARN naming this scope. `--full` (v1.0.0 #2006) instead
+    /// emits the integrity-complete Portability-v2 envelope (every signed
+    /// record class byte-preserved + re-verifiable, with a computed
+    /// `conformance_level` marker).
+    Export(cli::io::ExportArgs),
     /// Import memories from JSON (stdin)
     Import(ImportArgs),
     /// Resolve a contradiction — mark one memory as superseding another
@@ -1404,13 +1407,13 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
                 code => std::process::exit(code),
             }
         }
-        Command::Export => {
+        Command::Export(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            cli::io::export(&db_path, &mut out)
+            cli::io::export(&db_path, &a, &mut out)
         }
         Command::Import(a) => {
             let stdout = std::io::stdout();
@@ -7447,7 +7450,9 @@ mod tests {
         assert!(is_write_command(&Command::Gc));
         assert!(!is_write_command(&Command::Stats));
         assert!(!is_write_command(&Command::Namespaces));
-        assert!(!is_write_command(&Command::Export));
+        assert!(!is_write_command(&Command::Export(
+            cli::io::ExportArgs::default()
+        )));
         assert!(!is_write_command(&Command::Shell));
         assert!(!is_write_command(&Command::Man));
         assert!(!is_write_command(&Command::Mcp {

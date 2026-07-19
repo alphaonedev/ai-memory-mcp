@@ -47,6 +47,19 @@ impl From<OnConflict> for ConflictMode {
     }
 }
 
+/// v1.0.0 #2006 — arguments for `ai-memory export`.
+#[derive(Args, Default)]
+pub struct ExportArgs {
+    /// Emit the FULL Portability-v2 integrity envelope — every signed record
+    /// class (audit chain, revisions, tombstones, lineage, attestations,
+    /// governance rules + trust anchors) byte-preserved and re-verifiable at
+    /// import, with a computed `conformance_level` (L1/L2/L3) marker. This is
+    /// the integrity portability path. Without `--full`, `export` stays the
+    /// memories+links convenience view.
+    #[arg(long, default_value_t = false)]
+    pub full: bool,
+}
+
 #[derive(Args)]
 pub struct ImportArgs {
     /// Trust `metadata.agent_id` in imported JSON (default: restamp with caller's id).
@@ -107,10 +120,28 @@ pub struct MineArgs {
 /// The full integrity-complete exporter defers to v1.x (see
 /// `docs/spec/PORTABILITY-V2.md` §V2-7). The serialization core
 /// (`db::export_all` / `db::export_links`) is deliberately untouched.
-pub fn export(db_path: &Path, out: &mut CliOutput<'_>) -> Result<()> {
+pub fn export(db_path: &Path, args: &ExportArgs, out: &mut CliOutput<'_>) -> Result<()> {
     use crate::export_scope;
     use crate::models::field_names;
     let conn = db::open(db_path)?;
+
+    // v1.0.0 #2006 — the integrity portability path. `--full` emits the full
+    // Portability-v2 envelope (every signed record class byte-preserved +
+    // re-verifiable, spec `docs/spec/PORTABILITY-V2.md`) with a COMPUTED
+    // `conformance_level` marker. This IS the portability path, so it does NOT
+    // emit the scope-limiting stderr WARN the convenience view carries. The
+    // memories are still screened by `build_full_envelope` (same
+    // confidentiality boundary).
+    if args.full {
+        let envelope = crate::portability::emit::build_full_envelope(
+            &conn,
+            "ai-memory",
+            &Utc::now().to_rfc3339(),
+        )?;
+        writeln!(out.stdout, "{}", serde_json::to_string_pretty(&envelope)?)?;
+        return Ok(());
+    }
+
     let memories = db::export_all(&conn)?;
     // v1.0.0 Gate-3 (#1838/G28 + #1844) — unify the export confidentiality
     // boundary with the HTTP admin sibling (`handlers::admin::export_memories`).
@@ -171,6 +202,60 @@ pub(crate) fn import_from_str(
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     let data: serde_json::Value = serde_json::from_str(payload)?;
+
+    // v1.0.0 #2006 — a v2 integrity envelope carries `spec_version`. Route it
+    // to the full byte-preserving, re-verifying importer. A v1 payload
+    // (memories+links, no `spec_version`) stays on the L1 path below,
+    // UNCHANGED.
+    //
+    // #2210 — the route is FAIL-CLOSED on the envelope itself: the
+    // `spec_version` VALUE must be the supported "2" (a newer spec refuses
+    // loudly instead of deserializing with its new record classes silently
+    // dropped — a v2+ envelope must NEVER fall through to the L1 path, which
+    // would drop the whole signed spine), and the strict
+    // (`deny_unknown_fields`) envelope parse refuses an unrecognized
+    // top-level class array.
+    //
+    // #2211 — `ImportArgs` is honoured on this path exactly like L1: the
+    // default restamps `metadata.agent_id` with the caller's id
+    // (`--trust-source` preserves verbatim), and `--on-conflict` governs
+    // `(title, namespace)` collisions with existing destination rows.
+    if let Some(spec) = data.get("spec_version") {
+        let supported = crate::portability::emit::SPEC_VERSION_V2;
+        if spec.as_str() != Some(supported) {
+            anyhow::bail!(
+                "import REFUSED (fail-closed): unsupported portability spec_version {spec} — \
+                 this node understands spec_version \"{supported}\". The bundle was produced \
+                 by a newer/unknown spec; importing it here could silently drop signed record \
+                 classes. Upgrade this node instead; no rows were applied"
+            );
+        }
+        let envelope: crate::portability::emit::ExportEnvelope = serde_json::from_value(data)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "import REFUSED (fail-closed): the v2 envelope did not parse strictly \
+                     ({e}) — an unrecognized or malformed field means the bundle carries \
+                     content this node would otherwise silently drop; no rows were applied"
+                )
+            })?;
+        let caller_id = identity::resolve_agent_id(cli_agent_id, None)?;
+        let opts = crate::portability::import::ImportOptions {
+            trust_source: args.trust_source,
+            caller_agent_id: caller_id,
+            on_conflict: args.on_conflict.into(),
+        };
+        let conn = db::open(db_path)?;
+        let report = crate::portability::import::import_full_envelope(&conn, &envelope, &opts)?;
+        writeln!(out.stdout, "{}", serde_json::to_string_pretty(&report)?)?;
+        if args.trust_source {
+            writeln!(
+                out.stderr,
+                "warning: --trust-source: agent_id from imported JSON was preserved as-is"
+            )?;
+        }
+        return Ok(());
+    }
+
     let memories: Vec<models::Memory> =
         serde_json::from_value(data.get("memories").cloned().unwrap_or_default())?;
     let links: Vec<models::MemoryLink> =
@@ -184,6 +269,28 @@ pub(crate) fn import_from_str(
     let mut restamped = 0usize;
     let mut errors = Vec::new();
     for mut mem in memories {
+        // #2208 re-audit N1 — the v1 wire-form must honour the SAME forget
+        // covenant as the v2 route: stripping `spec_version` from a bundle
+        // must not become a DOWNGRADE BYPASS that resurrects a
+        // dest-forgotten id (the dest tombstone is the durable erasure
+        // receipt; `insert_with_conflict` performs no tombstone check).
+        if db::memory_is_tombstoned(&conn, &mem.id)? {
+            errors.push(format!(
+                "{}: skipped — a destination forget tombstone forbids re-admission",
+                mem.id
+            ));
+            continue;
+        }
+        // #2208 N1 mirror — a dest-ARCHIVED id must not be re-admitted live
+        // (dual residency); the sanctioned way back is memory_archive_restore.
+        if db::memory_is_archived(&conn, &mem.id)? {
+            errors.push(format!(
+                "{}: skipped — the id is archived at the destination \
+                 (restore via memory_archive_restore, not import)",
+                mem.id
+            ));
+            continue;
+        }
         if !args.trust_source {
             let original = mem
                 .metadata
@@ -499,7 +606,7 @@ mod tests {
         let _ = seed_memory(&db, "ns-init", "init", "init");
         {
             let mut out = env.output();
-            export(&db, &mut out).unwrap();
+            export(&db, &ExportArgs::default(), &mut out).unwrap();
         }
         let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
         assert!(v["memories"].is_array());
@@ -521,7 +628,7 @@ mod tests {
         drop(conn);
         {
             let mut out = env.output();
-            export(&db, &mut out).unwrap();
+            export(&db, &ExportArgs::default(), &mut out).unwrap();
         }
         let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
         let mems = v["memories"].as_array().unwrap();
@@ -537,7 +644,7 @@ mod tests {
         let _ = seed_memory(&db, "ns", "x", "y");
         {
             let mut out = env.output();
-            export(&db, &mut out).unwrap();
+            export(&db, &ExportArgs::default(), &mut out).unwrap();
         }
         // Pretty-printed JSON has at least one newline + 2-space indent.
         let s = env.stdout_str();
@@ -551,7 +658,7 @@ mod tests {
         let mut buf = Vec::<u8>::new();
         let mut errbuf = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut buf, &mut errbuf);
-        export(db_path, &mut out).unwrap();
+        export(db_path, &ExportArgs::default(), &mut out).unwrap();
         String::from_utf8(buf).unwrap()
     }
 
@@ -635,6 +742,231 @@ mod tests {
             Some("preserved-agent")
         );
         assert!(dst.stderr_str().contains("trust-source"));
+    }
+
+    /// ★ #2208 re-audit N1 — the v1 wire-form (no `spec_version`) honours
+    /// the SAME forget covenant as the v2 route: a dest-forgotten id in a
+    /// v1-form payload is refused/skipped, and a dest-archived id is not
+    /// re-admitted live. Fails on pre-N1 code (stripping `spec_version`
+    /// was a downgrade bypass — `insert_with_conflict` performed no
+    /// tombstone/archive check, so the forgotten row resurrected under its
+    /// original id).
+    #[test]
+    fn v1_form_import_does_not_resurrect_dest_forgotten_or_archived_2208() {
+        // Source carries two rows in DISTINCT namespaces so the dest can
+        // forget one (namespace-filtered) and archive the other.
+        let src = TestEnv::fresh();
+        let src_db = src.db_path.clone();
+        let id_forget = seed_memory(&src_db, "ns-forget", "f-title", "f-content");
+        let id_archive = seed_memory(&src_db, "ns-archive", "a-title", "a-content");
+        let payload = export_payload_at(&src_db);
+        assert!(
+            !payload.contains("spec_version"),
+            "fixture: the payload is the v1 wire form"
+        );
+
+        let mut dst = TestEnv::fresh();
+        let dst_db = dst.db_path.clone();
+        let args = ImportArgs {
+            trust_source: false,
+            on_conflict: OnConflict::Version,
+        };
+        {
+            let mut out = dst.output();
+            import_from_str(&payload, &dst_db, &args, true, Some("caller"), &mut out).unwrap();
+        }
+        {
+            let conn = db::open(&dst_db).unwrap();
+            assert!(db::get(&conn, &id_forget).unwrap().is_some());
+            // Dest operator forgets one row + archives the other.
+            assert_eq!(
+                db::forget(&conn, Some("ns-forget"), None, None, false).unwrap(),
+                1,
+                "dest forgot the row"
+            );
+            assert!(
+                db::archive_memory(&conn, &id_archive, Some("test")).unwrap(),
+                "dest archived the row"
+            );
+        }
+
+        // Re-import the SAME v1-form payload: neither id may come back live.
+        {
+            let mut out = dst.output();
+            import_from_str(&payload, &dst_db, &args, true, Some("caller"), &mut out).unwrap();
+        }
+        let conn = db::open(&dst_db).unwrap();
+        assert!(
+            db::get(&conn, &id_forget).unwrap().is_none(),
+            "the dest-forgotten memory must NOT resurrect via the v1 wire form"
+        );
+        assert!(
+            db::memory_is_tombstoned(&conn, &id_forget).unwrap(),
+            "the tombstone survives"
+        );
+        assert!(
+            db::get(&conn, &id_archive).unwrap().is_none(),
+            "the dest-archived memory must NOT be re-admitted live"
+        );
+        assert!(
+            db::memory_is_archived(&conn, &id_archive).unwrap(),
+            "the archived row is untouched"
+        );
+        // The per-row skips are surfaced in the JSON errors array.
+        let v: serde_json::Value =
+            serde_json::from_str(dst.stdout_str().lines().last().unwrap()).unwrap();
+        let errs = v["errors"].as_array().unwrap();
+        assert!(
+            errs.iter()
+                .any(|e| e.as_str().unwrap_or_default().contains("tombstone")),
+            "the tombstone skip is reported, got: {errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.as_str().unwrap_or_default().contains("archived")),
+            "the archive skip is reported, got: {errs:?}"
+        );
+    }
+
+    /// The FULL Portability-v2 envelope payload (the `--full` wire form).
+    fn export_full_payload_at(db_path: &Path) -> String {
+        let mut buf = Vec::<u8>::new();
+        let mut errbuf = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut buf, &mut errbuf);
+        export(db_path, &ExportArgs { full: true }, &mut out).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// ★ #2210 — the v2 route validates the `spec_version` VALUE: a
+    /// spec_version-"3" payload must refuse loudly, and must NOT fall
+    /// through to the L1 path (which would silently drop the signed spine).
+    /// Fails on pre-#2210 code (only key PRESENCE was checked, so the value
+    /// was never validated and the envelope parsed permissively).
+    #[test]
+    fn v2_route_refuses_unsupported_spec_version_2210() {
+        let mut dst = TestEnv::fresh();
+        let dst_db = dst.db_path.clone();
+        let payload = serde_json::json!({
+            "spec_version": "3",
+            "db_schema_version": 1,
+            "memories": [],
+            "links": [],
+            "portability_complete": false,
+            "conformance_level": "L1",
+            "conformance_by_class": {},
+            "count": 0
+        })
+        .to_string();
+        let args = ImportArgs {
+            trust_source: false,
+            on_conflict: OnConflict::Version,
+        };
+        let err = {
+            let mut out = dst.output();
+            import_from_str(&payload, &dst_db, &args, false, Some("caller"), &mut out)
+                .expect_err("a spec_version-3 payload must refuse")
+        };
+        assert!(err.to_string().contains("spec_version"), "got: {err}");
+    }
+
+    /// ★ #2210 — the v2 route's strict envelope parse refuses an unknown
+    /// top-level record class instead of silently dropping it. Fails on
+    /// pre-#2210 code (no `deny_unknown_fields` — the array vanished and the
+    /// import "succeeded").
+    #[test]
+    fn v2_route_refuses_unknown_record_class_2210() {
+        let src = TestEnv::fresh();
+        let src_db = src.db_path.clone();
+        let _ = seed_memory(&src_db, "ns", "t2210", "c2210");
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&export_full_payload_at(&src_db)).unwrap();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert("future_class".into(), serde_json::json!([{"sig": "x"}]));
+
+        let mut dst = TestEnv::fresh();
+        let dst_db = dst.db_path.clone();
+        let args = ImportArgs {
+            trust_source: false,
+            on_conflict: OnConflict::Version,
+        };
+        let err = {
+            let mut out = dst.output();
+            import_from_str(
+                &payload.to_string(),
+                &dst_db,
+                &args,
+                false,
+                Some("caller"),
+                &mut out,
+            )
+            .expect_err("an unknown top-level class must refuse")
+        };
+        assert!(err.to_string().contains("fail-closed"), "got: {err}");
+        // ZERO rows landed.
+        let conn = db::open(&dst_db).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "a refused v2 import applies zero rows");
+    }
+
+    /// ★ #2211 — the v2 route honours `ImportArgs` exactly like L1: a
+    /// spine-less v2 bundle's forged `agent_id` is RESTAMPED with the
+    /// caller's id by default. Fails on pre-#2211 code (the v2 route ignored
+    /// `ImportArgs` and preserved the forged identity verbatim).
+    #[test]
+    fn v2_route_restamps_agent_id_by_default_2211() {
+        let src = TestEnv::fresh();
+        let src_db = src.db_path.clone();
+        let id = seed_memory(&src_db, "ns", "v2-restamp", "v2-content");
+        {
+            let conn = db::open(&src_db).unwrap();
+            conn.execute(
+                "UPDATE memories SET metadata = json_set(metadata, '$.agent_id', 'forged-agent') WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        }
+        let payload = export_full_payload_at(&src_db);
+        assert!(
+            payload.contains("spec_version"),
+            "fixture: the payload routes to the v2 importer"
+        );
+
+        let mut dst = TestEnv::fresh();
+        let dst_db = dst.db_path.clone();
+        let args = ImportArgs {
+            trust_source: false,
+            on_conflict: OnConflict::Version,
+        };
+        {
+            let mut out = dst.output();
+            import_from_str(
+                &payload,
+                &dst_db,
+                &args,
+                false,
+                Some("caller-agent"),
+                &mut out,
+            )
+            .unwrap();
+        }
+        let conn = db::open(&dst_db).unwrap();
+        let mem = db::get(&conn, &id).unwrap().unwrap();
+        assert_eq!(
+            mem.metadata.get("agent_id").and_then(|v| v.as_str()),
+            Some("caller-agent"),
+            "the v2 route restamps by default, exactly like L1"
+        );
+        assert_eq!(
+            mem.metadata
+                .get("imported_from_agent_id")
+                .and_then(|v| v.as_str()),
+            Some("forged-agent"),
+            "the original claim is preserved as provenance"
+        );
     }
 
     #[test]

@@ -700,6 +700,9 @@ pub mod offload;
 pub mod persona;
 // v0.7.0 L1-5 — SKILL.md parser and structured-document ingestion pipelines.
 pub mod parsing;
+// v1.0.0 #2006 — the integrity-complete Portability-v2 exporter + importer
+// (`ai-memory export --full` / the symmetric `import`).
+pub mod portability;
 // v0.7.0 K9 — unified permission system. Composes declarative
 // `[permissions.rules]` matchers, the K3 `[permissions].mode`
 // knob, and G1-G11 hook decisions into a single `Decision`.
