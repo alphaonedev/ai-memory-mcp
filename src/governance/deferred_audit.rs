@@ -439,44 +439,13 @@ impl DeferredAuditJournal {
         if !spool_metadata.is_dir() || spool_metadata.file_type().is_symlink() {
             anyhow::bail!("deferred-audit spool path is not a trusted directory");
         }
-        let mut journal_options = OpenOptions::new();
-        journal_options.create(true).read(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            journal_options.mode(0o600);
-        }
-        apply_no_follow(&mut journal_options);
-        let file = journal_options
-            .open(&path)
-            .with_context(|| format!("open deferred-audit journal {}", path.display()))?;
-        ensure_regular_file(&file, "deferred-audit journal")?;
+        let file = open_or_create_private_file(&path, "deferred-audit journal")?;
         let lock_path = spool_dir.join(".lock");
-        let mut lock_options = OpenOptions::new();
-        lock_options.create(true).read(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            lock_options.mode(0o600);
-        }
-        apply_no_follow(&mut lock_options);
-        let spool_lock = lock_options
-            .open(&lock_path)
-            .context("open deferred-audit spool lock")?;
-        ensure_regular_file(&spool_lock, "deferred-audit spool lock")?;
+        let spool_lock = open_or_create_private_file(&lock_path, "deferred-audit spool lock")?;
         let spool_identity = same_file::Handle::from_path(&spool_dir)
             .context("capture deferred-audit spool directory identity")?;
         let lock_identity = same_file::Handle::from_file(spool_lock.try_clone()?)
             .context("capture deferred-audit spool lock identity")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            spool_lock
-                .set_permissions(std::fs::Permissions::from_mode(0o600))
-                .context("tighten deferred-audit spool lock permissions")?;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .context("tighten deferred-audit journal permissions")?;
-        }
         fs2::FileExt::lock_exclusive(&spool_lock)
             .context("lock deferred-audit spool during open")?;
         verify_spool_identity(&spool_identity, &lock_identity, &spool_dir, &lock_path)?;
@@ -1145,6 +1114,44 @@ fn ensure_regular_file(file: &File, label: &str) -> Result<()> {
         anyhow::bail!("{label} is not a regular file");
     }
     Ok(())
+}
+
+fn open_or_create_private_file(path: &Path, label: &str) -> Result<File> {
+    let open = |create_new: bool| -> std::io::Result<File> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(create_new);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        apply_no_follow(&mut options);
+        options.open(path)
+    };
+    let file = match open(true) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            open(false).with_context(|| format!("open existing {label} {}", path.display()))?
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("create {label} {}", path.display()));
+        }
+    };
+    ensure_regular_file(&file, label)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("inspect {label}"))?;
+        // SAFETY: geteuid has no preconditions and only reads process credentials.
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != effective_uid || metadata.permissions().mode() & 0o777 != 0o600 {
+            anyhow::bail!("{label} is not private to the daemon uid");
+        }
+    }
+    Ok(file)
 }
 
 fn verify_spool_identity(
@@ -3850,6 +3857,22 @@ mod tests {
                 & 0o777,
             0o700
         );
+        assert_eq!(
+            journal
+                .file
+                .lock()
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            journal.spool_lock.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let event_path = journal.spool_path(ev.occurrence_id.as_deref().unwrap());
         assert_eq!(
             std::fs::metadata(event_path).unwrap().permissions().mode() & 0o777,
@@ -3915,6 +3938,50 @@ mod tests {
             0o777,
             "an exposed legacy spool must fail closed, not be repaired and trusted"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_rejects_nonprivate_legacy_journal_without_import_or_repair() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = fresh_tempdir();
+        let db_path = dir.path().join("nonprivate-legacy.db");
+        let _ = crate::db::open(&db_path).expect("init db");
+        let journal_path = deferred_audit_journal_path(&db_path);
+        let mut planted = DeferredAuditEvent::from_refusal(
+            "agent:planted-legacy",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        planted.occurrence_id = None;
+        std::fs::write(
+            &journal_path,
+            journal_frame(&planted.canonical_bytes().unwrap()).unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        assert!(recover_deferred_audit(&journal_path, &db_path).is_err());
+        assert_eq!(
+            std::fs::metadata(&journal_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o666,
+            "an exposed journal must fail closed, not be repaired and replayed"
+        );
+        let conn = crate::db::open(&db_path).unwrap();
+        let imported: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1 AND agent_id = ?2",
+                rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, planted.agent_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(imported, 0);
     }
 
     #[cfg(windows)]
