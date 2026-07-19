@@ -5791,6 +5791,8 @@ impl PostgresStore {
                     valid_until: valid_until.map(|t| t.to_rfc3339()),
                     observed_by,
                     attest_level,
+                    source_cid: None,
+                    target_cid: None,
                 })
             })
             .collect()
@@ -15987,6 +15989,8 @@ impl MemoryStore for PostgresStore {
                     // adapter matches the `memory_get_links` MCP
                     // tool's docstring promise.
                     attest_level,
+                    source_cid: None,
+                    target_cid: None,
                 })
             })
             .collect()
@@ -16057,6 +16061,8 @@ impl MemoryStore for PostgresStore {
                     valid_from: valid_from.map(|t| t.to_rfc3339()),
                     valid_until: valid_until.map(|t| t.to_rfc3339()),
                     attest_level,
+                    source_cid: None,
+                    target_cid: None,
                 })
             })
             .collect()
@@ -26111,6 +26117,8 @@ mod tests {
                     observed_by: None,
                     signature: None,
                     attest_level: None,
+                    source_cid: None,
+                    target_cid: None,
                 },
             )
             .await
@@ -26129,6 +26137,8 @@ mod tests {
                     observed_by: None,
                     signature: None,
                     attest_level: None,
+                    source_cid: None,
+                    target_cid: None,
                 },
             )
             .await
@@ -26602,6 +26612,8 @@ mod tests {
             valid_from: None,
             valid_until: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         store.link(&ctx, &link).await.expect("create link");
         let row = store
@@ -26654,6 +26666,8 @@ mod tests {
             valid_from: None,
             valid_until: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
 
         // a reflects_on b lands fine (no cycle yet).
@@ -26979,6 +26993,8 @@ mod tests {
             observed_by: None,
             signature: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         restricted
             .link_signed(&ctx, &link, None)
@@ -27124,6 +27140,8 @@ mod tests {
             valid_from: None,
             valid_until: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         store.link(&ctx, &link).await.expect("create link");
         // Call the SAL trait method (3-arg form) — verifies the trait
@@ -27355,6 +27373,8 @@ mod tests {
             valid_from: None,
             valid_until: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         store.link(&ctx, &link).await.expect("create link");
 
@@ -27706,6 +27726,8 @@ mod tests {
             valid_from: None,
             valid_until: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         store.link(&ctx, &link).await.expect("create link");
         // list_links scoped to the source memory's namespace surfaces it.
@@ -27803,6 +27825,8 @@ mod tests {
                     valid_from: None,
                     valid_until: None,
                     attest_level: None,
+                    source_cid: None,
+                    target_cid: None,
                 },
             )
             .await
@@ -28003,6 +28027,8 @@ mod tests {
             valid_from: None,
             valid_until: None,
             attest_level: None,
+            source_cid: None,
+            target_cid: None,
         };
         // The `memory_links_attest_signature_atomic_ck` DB constraint ties
         // attest-level and signature together: an unsigned edge carries no

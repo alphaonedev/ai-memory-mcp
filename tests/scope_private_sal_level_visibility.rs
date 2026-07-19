@@ -293,6 +293,8 @@ async fn bob_find_paths_drops_invisible_nodes_910_sal() {
         observed_by: None,
         signature: None,
         attest_level: None,
+        source_cid: None,
+        target_cid: None,
     };
     store.link(&alice_ctx, &link).await.expect("link");
 
