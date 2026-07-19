@@ -3427,6 +3427,90 @@ mod tests {
         assert!(!restored);
     }
 
+    // #2196 (data-integrity archive-parity) — a memory archived in a
+    // non-`open` lifecycle_state must restore in THAT state, not silently
+    // COALESCE to `open`. sqlite has always threaded lifecycle_state; this
+    // test is the sqlite half of the cross-backend parity pair (the pg twin
+    // `archive_lifecycle_state_survives_restore_parity_2196` FAILS on the
+    // pre-fix postgres archive INSERT that omitted lifecycle_state).
+    #[tokio::test]
+    async fn archive_lifecycle_state_survives_restore_parity_2196() {
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let mut mem = test_memory("lifecycle-roundtrip-2196", "content");
+        mem.lifecycle_state = crate::models::LifecycleState::Blocked;
+        let id = store.store(&ctx, &mem).await.expect("store");
+
+        let moved = store
+            .archive_by_ids(&ctx, &[id.clone()], Some("manual"))
+            .await
+            .expect("archive_by_ids");
+        assert_eq!(moved, 1);
+
+        let restored = store
+            .archive_restore(&ctx, &id)
+            .await
+            .expect("archive_restore");
+        assert!(restored, "restore must succeed");
+
+        let got = store.get(&ctx, &id).await.expect("get restored");
+        assert_eq!(
+            got.lifecycle_state,
+            crate::models::LifecycleState::Blocked,
+            "lifecycle_state must survive the archive->restore round-trip",
+        );
+    }
+
+    // #2195 (data-integrity archive-parity) — re-archiving the SAME id whose
+    // payload changed between archivings must be LAST-WINS (sqlite `INSERT OR
+    // REPLACE`). The pg twin `archive_rearchive_is_last_wins_parity_2195`
+    // FAILS on the pre-fix postgres `ON CONFLICT (id) DO UPDATE` that
+    // refreshed only archived_at/archive_reason (first-payload-wins).
+    #[tokio::test]
+    async fn archive_rearchive_is_last_wins_parity_2195() {
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+        let m1 = test_memory("rearchive-lastwins-2195", "content-v1");
+        let id = store.store(&ctx, &m1).await.expect("store v1");
+
+        // First archive: cold-storage copy carries content-v1, row deleted.
+        let moved = store
+            .archive_by_ids(&ctx, &[id.clone()], Some("manual"))
+            .await
+            .expect("archive v1");
+        assert_eq!(moved, 1);
+
+        // Re-seed the SAME id into `memories` with changed content (the
+        // federation LWW insert preserves the id), then re-archive so the
+        // archive INSERT hits the ON CONFLICT (id) path.
+        let mut m2 = m1.clone();
+        m2.id = id.clone();
+        m2.content = "content-v2".to_string();
+        m2.updated_at = (chrono::Utc::now() + chrono::Duration::seconds(5)).to_rfc3339();
+        store
+            .merge_inbound(&ctx, &m2)
+            .await
+            .expect("merge_inbound v2");
+
+        let moved = store
+            .archive_by_ids(&ctx, &[id.clone()], Some("manual"))
+            .await
+            .expect("archive v2");
+        assert_eq!(moved, 1);
+
+        let restored = store
+            .archive_restore(&ctx, &id)
+            .await
+            .expect("archive_restore");
+        assert!(restored, "restore must succeed");
+
+        let got = store.get(&ctx, &id).await.expect("get restored");
+        assert_eq!(
+            got.content, "content-v2",
+            "re-archive must be last-wins (the newest payload), not first-wins",
+        );
+    }
+
     #[tokio::test]
     async fn export_memories_and_links_round_trip() {
         let store = fresh_store();

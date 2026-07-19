@@ -80,6 +80,39 @@ const SQL_DELETE_MEMORY_BY_ID: &str = "DELETE FROM memories WHERE id = $1";
 /// snapshot before re-INSERTing the prior content) and by `restore_archived`
 /// (removes the archive row after a successful restore).
 const SQL_DELETE_ARCHIVED_MEMORY_BY_ID: &str = "DELETE FROM archived_memories WHERE id = $1";
+/// #2195 (data-integrity archive-parity) — LAST-WINS `ON CONFLICT` clause for
+/// the eviction / manual archive-INSERT paths (`forget`, `run_gc`, `size_gc`,
+/// `archive_by_ids`). SQLite archives via `INSERT OR REPLACE` (last-wins: a
+/// re-archive of the same id overwrites EVERY payload column), while the
+/// postgres paths previously refreshed ONLY `archived_at` / `archive_reason`
+/// (first-payload-wins) — so re-archiving a memory whose content changed
+/// between archivings left DIVERGENT archived payloads across backends. This
+/// clause overwrites every payload column from `EXCLUDED` so postgres matches
+/// the sqlite last-wins contract byte-for-byte. `id` (the conflict key) is not
+/// updated. Shared const so the identical clause is not duplicated across the
+/// four sites (also keeps `scripts/check-hardcoded-literals.sh` green).
+const SQL_ARCHIVE_ON_CONFLICT_LAST_WINS: &str = "ON CONFLICT (id) DO UPDATE SET \
+     tier = EXCLUDED.tier, namespace = EXCLUDED.namespace, title = EXCLUDED.title, \
+     content = EXCLUDED.content, tags = EXCLUDED.tags, priority = EXCLUDED.priority, \
+     confidence = EXCLUDED.confidence, source = EXCLUDED.source, \
+     access_count = EXCLUDED.access_count, created_at = EXCLUDED.created_at, \
+     updated_at = EXCLUDED.updated_at, last_accessed_at = EXCLUDED.last_accessed_at, \
+     expires_at = EXCLUDED.expires_at, archived_at = EXCLUDED.archived_at, \
+     archive_reason = EXCLUDED.archive_reason, metadata = EXCLUDED.metadata, \
+     embedding = EXCLUDED.embedding, embedding_dim = EXCLUDED.embedding_dim, \
+     embedding_space = EXCLUDED.embedding_space, original_tier = EXCLUDED.original_tier, \
+     original_expires_at = EXCLUDED.original_expires_at, \
+     reflection_depth = EXCLUDED.reflection_depth, atomised_into = EXCLUDED.atomised_into, \
+     atom_of = EXCLUDED.atom_of, memory_kind = EXCLUDED.memory_kind, \
+     entity_id = EXCLUDED.entity_id, persona_version = EXCLUDED.persona_version, \
+     citations = EXCLUDED.citations, source_uri = EXCLUDED.source_uri, \
+     source_span = EXCLUDED.source_span, confidence_source = EXCLUDED.confidence_source, \
+     confidence_signals = EXCLUDED.confidence_signals, \
+     confidence_decayed_at = EXCLUDED.confidence_decayed_at, \
+     mentioned_entity_id = EXCLUDED.mentioned_entity_id, version = EXCLUDED.version, \
+     lifecycle_state = EXCLUDED.lifecycle_state, \
+     encrypted_envelope = EXCLUDED.encrypted_envelope, valid_from = EXCLUDED.valid_from, \
+     valid_until = EXCLUDED.valid_until";
 /// #1642 — postgres twin of `storage::SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID`
 /// (`src/storage/mod.rs`): deleting a memory that serves as a namespace
 /// standard must also remove the `namespace_meta` row that points at it,
@@ -17968,7 +18001,7 @@ impl MemoryStore for PostgresStore {
 
         if archive {
             // Insert matching rows into archived_memories before deletion.
-            sqlx::query(
+            sqlx::query(&format!(
                 "INSERT INTO archived_memories (
                     id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
@@ -17978,7 +18011,10 @@ impl MemoryStore for PostgresStore {
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version, encrypted_envelope, valid_from, valid_until
+                    -- #2196 - carry lifecycle_state so a non-open archived state
+                    -- survives the archive->restore round-trip (restore no longer
+                    -- COALESCEs a NULL to 'open'); mirrors the sqlite archive.
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -17987,17 +18023,16 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version, encrypted_envelope, valid_from, valid_until
+                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
                 FROM memories
                 WHERE ($1::text IS NULL OR namespace = $1)
                   AND ($2::text IS NULL OR tier = $2)
                   AND ($3::text IS NULL
                        OR title ILIKE $3
                        OR content ILIKE $3)
-                ON CONFLICT (id) DO UPDATE SET
-                    archived_at = EXCLUDED.archived_at,
-                    archive_reason = EXCLUDED.archive_reason",
-            )
+                -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
+                {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
+            ))
             .bind(namespace)
             .bind(tier_str.as_deref())
             .bind(pattern_like.as_deref())
@@ -20100,7 +20135,7 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err("gc begin tx", e))?;
 
         if archive {
-            sqlx::query(
+            sqlx::query(&format!(
                 "INSERT INTO archived_memories (
                     id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
@@ -20110,7 +20145,9 @@ impl MemoryStore for PostgresStore {
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version, encrypted_envelope, valid_from, valid_until
+                    -- #2196 - carry lifecycle_state through the TTL archive so a
+                    -- non-open state survives archive->restore (postgres parity).
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -20119,13 +20156,12 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version, encrypted_envelope, valid_from, valid_until
+                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
                 FROM memories
                 WHERE expires_at IS NOT NULL AND expires_at < $1
-                ON CONFLICT (id) DO UPDATE SET
-                    archived_at = EXCLUDED.archived_at,
-                    archive_reason = EXCLUDED.archive_reason",
-            )
+                -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
+                {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
+            ))
             .bind(now)
             .execute(&mut *tx)
             .await
@@ -20251,7 +20287,7 @@ impl MemoryStore for PostgresStore {
                 .map_err(|e| to_store_err("size_gc begin tx", e))?;
 
             if archive {
-                sqlx::query(
+                sqlx::query(&format!(
                     "INSERT INTO archived_memories (
                         id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
@@ -20272,10 +20308,9 @@ impl MemoryStore for PostgresStore {
                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
                     FROM memories
                     WHERE id = $1
-                    ON CONFLICT (id) DO UPDATE SET
-                        archived_at = EXCLUDED.archived_at,
-                        archive_reason = EXCLUDED.archive_reason",
-                )
+                    -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
+                    {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
+                ))
                 .bind(&id)
                 .execute(&mut *tx)
                 .await
@@ -20630,7 +20665,7 @@ impl MemoryStore for PostgresStore {
             if exists.is_none() {
                 continue;
             }
-            sqlx::query(
+            sqlx::query(&format!(
                 "INSERT INTO archived_memories (
                     id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
@@ -20640,7 +20675,9 @@ impl MemoryStore for PostgresStore {
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version, encrypted_envelope, valid_from, valid_until
+                    -- #2196 - carry lifecycle_state through the manual archive so a
+                    -- non-open state survives archive->restore (postgres parity).
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -20649,12 +20686,11 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version, encrypted_envelope, valid_from, valid_until
+                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
                 FROM memories WHERE id = $3
-                ON CONFLICT (id) DO UPDATE SET
-                    archived_at = EXCLUDED.archived_at,
-                    archive_reason = EXCLUDED.archive_reason",
-            )
+                -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
+                {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
+            ))
             .bind(now)
             .bind(archive_reason)
             .bind(id)
@@ -27254,6 +27290,102 @@ mod tests {
                 .iter()
                 .any(|l| l.source_id == a_id && l.target_id == b_id),
             "A->B edge must be preserved across archive_by_ids + archive_restore"
+        );
+    }
+
+    /// #2196 (data-integrity archive-parity) — postgres twin of the sqlite
+    /// `archive_lifecycle_state_survives_restore_parity_2196`. A memory
+    /// archived in a non-`open` lifecycle_state must restore in THAT state.
+    /// FAILS on the pre-fix postgres archive INSERT (forget / run_gc /
+    /// archive_by_ids) that omitted lifecycle_state so restore COALESCEd the
+    /// NULL to `open`. Skips cleanly when `AI_MEMORY_TEST_POSTGRES_URL` unset.
+    #[tokio::test]
+    async fn archive_lifecycle_state_survives_restore_parity_2196() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("archive-lifecycle-2196-{unique}");
+        let id = format!("lc-2196-{unique}");
+        let mut mem = sample_memory(&id, &ns, "lifecycle-roundtrip-2196", "content");
+        mem.lifecycle_state = crate::models::LifecycleState::Blocked;
+        store.store(&ctx, &mem).await.expect("store");
+
+        let moved = store
+            .archive_by_ids(&ctx, &[id.clone()], Some("manual"))
+            .await
+            .expect("archive_by_ids");
+        assert_eq!(moved, 1);
+
+        let restored = store
+            .archive_restore(&ctx, &id)
+            .await
+            .expect("archive_restore");
+        assert!(restored, "restore must succeed");
+
+        let got = store.get(&ctx, &id).await.expect("get restored");
+        assert_eq!(
+            got.lifecycle_state,
+            crate::models::LifecycleState::Blocked,
+            "lifecycle_state must survive the archive->restore round-trip on postgres",
+        );
+    }
+
+    /// #2195 (data-integrity archive-parity) — postgres twin of the sqlite
+    /// `archive_rearchive_is_last_wins_parity_2195`. Re-archiving the SAME id
+    /// whose payload changed must be LAST-WINS. FAILS on the pre-fix postgres
+    /// `ON CONFLICT (id) DO UPDATE` that refreshed only archived_at /
+    /// archive_reason (first-payload-wins). Skips cleanly when the env is unset.
+    #[tokio::test]
+    async fn archive_rearchive_is_last_wins_parity_2195() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("archive-lastwins-2195-{unique}");
+        let id = format!("lw-2195-{unique}");
+        let m1 = sample_memory(&id, &ns, "rearchive-lastwins-2195", "content-v1");
+        store.store(&ctx, &m1).await.expect("store v1");
+
+        let moved = store
+            .archive_by_ids(&ctx, &[id.clone()], Some("manual"))
+            .await
+            .expect("archive v1");
+        assert_eq!(moved, 1);
+
+        // Re-seed the SAME id into `memories` with changed content (federation
+        // LWW insert preserves the id), then re-archive so the archive INSERT
+        // hits the ON CONFLICT (id) path.
+        let mut m2 = m1.clone();
+        m2.content = "content-v2".to_string();
+        m2.updated_at = (chrono::Utc::now() + chrono::Duration::seconds(5)).to_rfc3339();
+        store
+            .merge_inbound(&ctx, &m2)
+            .await
+            .expect("merge_inbound v2");
+
+        let moved = store
+            .archive_by_ids(&ctx, &[id.clone()], Some("manual"))
+            .await
+            .expect("archive v2");
+        assert_eq!(moved, 1);
+
+        let restored = store
+            .archive_restore(&ctx, &id)
+            .await
+            .expect("archive_restore");
+        assert!(restored, "restore must succeed");
+
+        let got = store.get(&ctx, &id).await.expect("get restored");
+        assert_eq!(
+            got.content, "content-v2",
+            "re-archive must be last-wins (newest payload) on postgres, not first-wins",
         );
     }
 

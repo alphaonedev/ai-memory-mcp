@@ -786,7 +786,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // recompute (signed_events head-row canonical hash + memory_revisions
     // head-row recompute + parse-dual + fold, K3 parity with sqlite) lands
     // postgres.rs at 27_762; ceiling 27_820 (+58 headroom).
-    ("src/store/postgres.rs", 27_820),
+    // 2026-07-18 (#2195/#2196 data-integrity archive-parity): threading
+    // lifecycle_state through the 3 pg archive INSERT sites (forget/run_gc/
+    // archive_by_ids) + the shared SQL_ARCHIVE_ON_CONFLICT_LAST_WINS clause
+    // (last-wins re-archive parity) + two live-PG parity tests land
+    // postgres.rs at 27_929; ceiling 28_000 (+71 headroom).
+    ("src/store/postgres.rs", 28_000),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
