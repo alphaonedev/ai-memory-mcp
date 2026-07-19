@@ -253,7 +253,7 @@ pub fn run(
         "prior_epoch_id": doc.body.prior_epoch_id,
         "policy_seq": doc.body.policy_seq,
         "content_hash": content_hex,
-        "checkpoint_id": cp.id,
+        crate::cli::JSON_KEY_CHECKPOINT_ID: cp.id,
         "applied": true,
     });
     crate::cli::rules::emit_ok(json, out, "epoch-apply", &payload)?;

@@ -23,7 +23,7 @@ use std::time::Instant;
 use crate::config::{AppConfig, FeatureTier, ResolvedModels, TierConfig};
 use crate::db;
 use crate::embeddings::{Embed, Embedder};
-use crate::hnsw::{VectorIndex, VectorSearchIndex};
+use crate::hnsw::VectorSearchIndex;
 use crate::llm::OllamaClient;
 use crate::reranker::{BatchedReranker, CrossEncoder};
 
@@ -3795,11 +3795,13 @@ pub fn run_mcp_server(
     // 100k-evict-oldest behavior byte-identically.
     let vector_index: Option<std::sync::Arc<dyn VectorSearchIndex>> = if embedder.is_some() {
         let index_limits = app_config.resolve_limits();
-        let idx: std::sync::Arc<dyn VectorSearchIndex> =
-            std::sync::Arc::new(VectorIndex::empty_with_capacity(
-                index_limits.vector_index_capacity,
-                index_limits.vector_index_hard_fail_at_cap,
-            ));
+        // v1.0.0 #1860 — resolved through the backend-selecting funnel
+        // (default backend unless the opt-in `vectorlite` feature + env
+        // knob select the extension backend; fails closed to default).
+        let idx: std::sync::Arc<dyn VectorSearchIndex> = crate::hnsw::arc_configured_index(
+            index_limits.vector_index_capacity,
+            index_limits.vector_index_hard_fail_at_cap,
+        );
         eprintln!(
             "ai-memory: HNSW index warming in background; semantic recall \
              serves keyword/FTS results until the swap lands (#1579 B3)"
