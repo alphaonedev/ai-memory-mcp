@@ -136,6 +136,7 @@ fn recall_on_readonly_connection_returns_rows_without_touching() {
         false,
         None,
         None,
+        None, // #1834 valid_at
     )
     .expect("recall on read-only connection must succeed");
 

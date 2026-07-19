@@ -38,6 +38,10 @@ pub struct ListArgs {
     pub since: Option<String>,
     #[arg(long)]
     pub until: Option<String>,
+    /// #1834 claim-bitemporal as-of: RFC3339 point in valid-time. Returns only
+    /// claims asserted to hold at this instant (valid_from/valid_until window).
+    #[arg(long)]
+    pub valid_at: Option<String>,
     #[arg(long)]
     pub tags: Option<String>,
     #[arg(long, default_value_t = 0)]
@@ -106,6 +110,10 @@ pub fn cmd_list(
     if let Some(ref aid) = args.agent_id {
         validate::validate_agent_id(aid)?;
     }
+    // v1.0.0 #1834 — RFC3339-validate --valid-at at the CLI entry.
+    if let Some(ref v) = args.valid_at {
+        validate::validate_valid_at(v)?;
+    }
     let conn = db::open(db_path)?;
     let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
     let tier = args.tier.as_deref().and_then(Tier::from_str);
@@ -120,6 +128,8 @@ pub fn cmd_list(
         args.until.as_deref(),
         args.tags.as_deref(),
         args.agent_id.as_deref(),
+        // v1.0.0 #1834 — claim-bitemporal AS-OF.
+        args.valid_at.as_deref(),
     )?;
     if json_out {
         writeln!(
@@ -252,6 +262,7 @@ mod tests {
             limit: 20,
             since: None,
             until: None,
+            valid_at: None,
             tags: None,
             offset: 0,
             agent_id: None,
@@ -588,6 +599,8 @@ mod tests {
         }
         let standard = models::Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "_standards-gov-ns".to_string(),

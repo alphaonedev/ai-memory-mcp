@@ -288,7 +288,10 @@ fn pre_reflect_deny_veto_refuses_reflection_and_writes_nothing() {
     }
 
     // Only the original src memory should exist; no reflection row landed.
-    let all = db::list(&conn, None, None, 1000, 0, None, None, None, None, None).unwrap();
+    let all = db::list(
+        &conn, None, None, 1000, 0, None, None, None, None, None, None,
+    )
+    .unwrap();
     assert_eq!(all.len(), 1, "veto must leave the DB unchanged");
     assert_eq!(all[0].id, src_id);
 

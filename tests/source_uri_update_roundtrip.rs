@@ -76,6 +76,7 @@ fn source_uri_rename_is_persisted_and_readable() {
         None, // metadata
         Some("doc:new.pdf"),
         None, // expected_version
+        None, // #1834 valid_until
     )
     .expect("update with new source_uri");
     assert!(found, "update must locate the row");
@@ -118,6 +119,7 @@ fn source_uri_first_write_promotes_null_to_uri() {
         None,
         Some("uri:https://example.com/article"),
         None,
+        None, // #1834 valid_until
     )
     .expect("update");
     assert!(found);
@@ -156,6 +158,7 @@ fn source_uri_unchanged_when_patch_omits_it() {
         None,
         None, // source_uri = None — must NOT blank the stored column
         None,
+        None, // #1834 valid_until
     )
     .expect("update");
     assert!(found);
@@ -208,6 +211,7 @@ fn invalid_source_uri_rejected_by_validator() {
         expires_at: None,
         metadata: None,
         source_uri: Some("no-scheme-here".to_string()),
+        valid_until: None,
         agent_id: None,
         lifecycle_state: None,
     };

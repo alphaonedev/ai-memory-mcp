@@ -278,6 +278,8 @@ pub async fn update_memory(
             metadata: body.metadata.clone(),
             // v0.7.0 Provenance Gap 2 (#906) — thread source_uri patch.
             source_uri: body.source_uri.clone(),
+            // v1.0.0 #1834 — thread valid_until patch (valid_from immutable).
+            valid_until: body.valid_until.clone(),
             // v0.7.0 #1423 — thread expires_at patch. Pre-#1423 the
             // postgres branch built UpdatePatch without expires_at so
             // PUT /memories/{id} silently dropped body.expires_at on
@@ -514,6 +516,8 @@ pub async fn update_memory(
         preserved_metadata.as_ref(),
         body.source_uri.as_deref(),
         if_match_version,
+        // v1.0.0 #1834 — opt-in valid_until patch (valid_from immutable).
+        body.valid_until.as_deref(),
     ) {
         Ok((true, _)) => {
             // v0.8.0 Pillar 2 (#1726) — apply an optional lifecycle

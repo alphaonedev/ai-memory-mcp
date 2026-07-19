@@ -56,7 +56,10 @@
 //! embedding vector and is CORRECTLY re-stamped when the destination re-embeds
 //! the durable text — carrying the source tag without the vector would falsely
 //! label a non-existent vector (a fail-closed violation); the `memories`
-//! `valid_from`/`valid_until` v79 columns have no sqlite writer (always NULL).
+//! `valid_from`/`valid_until` v79 claim-bitemporal columns (#1834/#2204) are
+//! [`crate::models::Memory`] fields, so they ride the envelope and land through
+//! `insert_imported`'s column bindings — a lossless round-trip (pinned by
+//! `tests/portability_roundtrip_2006.rs`).
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};

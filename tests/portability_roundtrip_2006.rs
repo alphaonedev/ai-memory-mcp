@@ -47,6 +47,10 @@ fn durable_memory() -> Memory {
         updated_at: now,
         memory_kind: MemoryKind::Decision,
         metadata: serde_json::json!({ "agent_id": "alice" }),
+        // #1834/#2204 — claim-bitemporal VALID-time bounds are part of the
+        // durable truth and must round-trip losslessly through the envelope.
+        valid_from: Some("2026-01-01T00:00:00Z".into()),
+        valid_until: Some("2027-01-01T00:00:00Z".into()),
         ..Memory::default()
     }
 }
@@ -217,6 +221,19 @@ fn full_envelope_round_trips_every_signed_class_byte_exact() {
         dst_mem.metadata["agent_id"], src_mem.metadata["agent_id"],
         "agent_id preserved"
     );
+    // #1834/#2204 — the claim-bitemporal VALID-time bounds round-trip (the
+    // fixture pins both to Some; a silent drop here would be a durable-truth
+    // data-loss of exactly the class the N3 sweep covered).
+    assert_eq!(
+        dst_mem.valid_from, src_mem.valid_from,
+        "valid_from preserved"
+    );
+    assert!(src_mem.valid_from.is_some(), "fixture carries valid_from");
+    assert_eq!(
+        dst_mem.valid_until, src_mem.valid_until,
+        "valid_until preserved"
+    );
+    assert!(src_mem.valid_until.is_some(), "fixture carries valid_until");
     // #1825 cid: content-addressed + DETERMINISTICALLY re-derived from the
     // genesis fields on import, so it is byte-identical without being exported.
     assert!(src_mem.cid.is_some(), "source stamped a cid");

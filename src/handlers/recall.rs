@@ -123,6 +123,19 @@ pub async fn recall_memories_get(
         )
             .into_response();
     }
+    // v1.0.0 #1834 — RFC3339-validate the claim-bitemporal AS-OF at the entry
+    // handler (recall_response returns a tuple and cannot surface a 400, so the
+    // guard belongs here). A malformed value would otherwise mis-filter via the
+    // lexicographic SQL compare.
+    if let Some(ref v) = req.valid_at
+        && let Err(e) = validate::validate_valid_at(v)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": crate::errors::msg::invalid("valid_at", e)})),
+        )
+            .into_response();
+    }
     // #1579 B4 — negotiate the response format BEFORE doing any work.
     // `json` (default) keeps the legacy envelope; `toon` /
     // `toon_compact` reuse the MCP TOON encoder; anything else is a
@@ -206,6 +219,16 @@ pub async fn recall_memories_post(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": crate::errors::msg::invalid("as_agent", e)})),
+        )
+            .into_response();
+    }
+    // v1.0.0 #1834 — RFC3339-validate the claim-bitemporal AS-OF (see GET path).
+    if let Some(ref v) = req.valid_at
+        && let Err(e) = validate::validate_valid_at(v)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": crate::errors::msg::invalid("valid_at", e)})),
         )
             .into_response();
     }
@@ -350,6 +373,10 @@ async fn recall_response(
     let tags = req.tags.as_deref();
     let since = req.since.as_deref();
     let until = req.until.as_deref();
+    // v1.0.0 #1834 — claim-bitemporal AS-OF. RFC3339 shape is validated at the
+    // entry handlers (GET/POST/MCP/CLI); here it is threaded into the recall
+    // SQL where it filters `valid_from`/`valid_until` (end-exclusive).
+    let valid_at = req.valid_at.as_deref();
     let as_agent = req.as_agent.as_deref();
     let budget_tokens = req.resolved_budget_tokens();
     let has_citations = req.has_citations.unwrap_or(false);
@@ -449,6 +476,10 @@ async fn recall_response(
         {
             filter.until = Some(dt.into());
         }
+        // v1.0.0 #1834 — carry the claim-bitemporal AS-OF onto the SAL Filter
+        // (RFC3339 shape validated at the entry handlers). Stored as the raw
+        // RFC3339 string; the SAL recall/list SQL binds it directly.
+        filter.valid_at = valid_at.map(str::to_string);
         return match app
             .store
             .recall_hybrid(&ctx_caller, context, query_emb.as_deref(), &filter)
@@ -734,6 +765,7 @@ async fn recall_response(
     let tags_owned = tags.map(str::to_string);
     let since_owned = since.map(str::to_string);
     let until_owned = until.map(str::to_string);
+    let valid_at_owned = valid_at.map(str::to_string);
     let source_uri_owned = source_uri_prefix.map(str::to_string);
     let agent_owned = as_agent.or(caller_principal).map(str::to_string);
     let caller_owned = caller_principal.map(str::to_string);
@@ -784,6 +816,8 @@ async fn recall_response(
                 caller_owned.as_deref(),
                 // v1.0.0 #2167 §3 — active embedder fingerprint gate.
                 active_space_owned.as_deref(),
+                // v1.0.0 #1834 — claim-bitemporal AS-OF instant.
+                valid_at_owned.as_deref(),
             );
             (r, "hybrid")
         } else {
@@ -802,6 +836,7 @@ async fn recall_response(
                 false,
                 source_uri_owned.as_deref(),
                 caller_owned.as_deref(),
+                valid_at_owned.as_deref(),
             );
             (r, "keyword")
         }

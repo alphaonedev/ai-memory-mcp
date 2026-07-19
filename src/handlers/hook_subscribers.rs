@@ -429,6 +429,8 @@ async fn set_namespace_standard_inner(
                     version: 1,
                     lifecycle_state: crate::models::LifecycleState::Open,
                     cid: None,
+                    valid_from: None,
+                    valid_until: None,
                 };
                 match app.store.store(&ctx, &placeholder).await {
                     Ok(id) => id,
@@ -606,6 +608,7 @@ async fn set_namespace_standard_inner(
             None,
             Some(NAMESPACE_STANDARD_TAG),
             None,
+            None, // #1834 valid_at (no as-of)
         )
         .ok()
         .and_then(|v| v.into_iter().next());
@@ -695,6 +698,8 @@ async fn set_namespace_standard_inner(
                 };
             let placeholder = Memory {
                 cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
+                valid_from: None,
+                valid_until: None,
                 id: Uuid::new_v4().to_string(),
                 tier: Tier::Long,
                 namespace: ns.to_string(),

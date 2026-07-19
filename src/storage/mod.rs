@@ -915,6 +915,18 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
             .get::<_, Option<String>>(field_names::CID)
             .ok()
             .flatten(),
+        // v1.0.0 #1834 — schema v79 claim-bitemporal VALID-TIME columns.
+        // `None` on pre-v79 rows (column absent) and on rows the caller never
+        // time-bounded (NULL). `.ok().flatten()` keeps the reader tolerant of
+        // a DB whose migration ladder hasn't reached v79 yet.
+        valid_from: row
+            .get::<_, Option<String>>(field_names::VALID_FROM)
+            .ok()
+            .flatten(),
+        valid_until: row
+            .get::<_, Option<String>>(field_names::VALID_UNTIL)
+            .ok()
+            .flatten(),
     };
 
     // #228 Commit B — at-rest content decryption. The decrypt branch is
@@ -1165,8 +1177,8 @@ fn insert_inner(conn: &Connection, mem: &Memory, stamp_local_clock: bool) -> Res
     // lands here). `prepare_cached` skips the re-parse of this ~60-line
     // upsert on every call after the first.
     let mut insert_stmt = conn.prepare_cached(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope, cid, cid_genesis, kind_provenance)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope, cid, cid_genesis, kind_provenance, valid_from, valid_until)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
          ON CONFLICT(title, namespace) DO UPDATE SET
             -- v0.9.0 G8 (#1825) — the surviving row KEEPS its own genesis
             -- content-id + pre-image (self-assign, never the excluded
@@ -1272,7 +1284,15 @@ fn insert_inner(conn: &Connection, mem: &Memory, stamp_local_clock: bool) -> Res
             -- incoming write when it carries one, else keeps the stored
             -- value (a re-store that omits the carrier must not blank an
             -- existing marker). COALESCE, like the Form-4/5 columns above.
-            kind_provenance = COALESCE(excluded.kind_provenance, memories.kind_provenance)
+            kind_provenance = COALESCE(excluded.kind_provenance, memories.kind_provenance),
+            -- v1.0.0 #1834 — claim-bitemporal validity. `valid_from` is
+            -- IMMUTABLE once set (a correction is a supersede, not a mutation),
+            -- so the stored value always wins on upsert. `valid_until` is the
+            -- one caller-updatable bound (closing a claim), so a re-store that
+            -- carries a non-NULL upper bound sets it; else the existing value
+            -- is kept (COALESCE, matching the Form-4/5 provenance columns).
+            valid_from = memories.valid_from,
+            valid_until = COALESCE(excluded.valid_until, memories.valid_until)
          RETURNING id",
     )?;
     let kind_provenance_col = extract_kind_provenance(mem);
@@ -1309,6 +1329,8 @@ fn insert_inner(conn: &Connection, mem: &Memory, stamp_local_clock: bool) -> Res
             cid_stamp.cid,
             cid_stamp.genesis,
             kind_provenance_col,
+            mem.valid_from,
+            mem.valid_until,
         ],
         |r| r.get(0),
     )?;
@@ -1753,8 +1775,8 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
             // its `MemoryKind::Reflection` typing and the stored row
             // falls back to the column DEFAULT 'observation'.
             let actual_id: String = conn.query_row(
-                "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope, cid, cid_genesis)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
+                "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope, cid, cid_genesis, valid_from, valid_until)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)
                  RETURNING id",
                 params![
                     mem.id, mem.tier.as_str(), mem.namespace, mem.title, content_to_store,
@@ -1766,6 +1788,9 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
                     mem.confidence_source.as_str(), confidence_signals_json, mem.confidence_decayed_at,
                     mentioned_entity_id, mem.lifecycle_state.as_str(), encrypted_envelope,
                     cid_stamp.cid, cid_stamp.genesis,
+                    // v1.0.0 #1834 — claim-bitemporal validity replicates verbatim
+                    // (federation carries a claim's asserted validity window).
+                    mem.valid_from, mem.valid_until,
                 ],
                 |r| r.get(0),
             ).map_err(|e| {
@@ -2400,7 +2425,7 @@ pub fn update(
 ) -> Result<(bool, bool)> {
     update_with_expected_version(
         conn, id, title, content, tier, namespace, tags, priority, confidence, expires_at,
-        metadata, None, None,
+        metadata, None, None, None,
     )
 }
 
@@ -2433,6 +2458,11 @@ pub fn update_with_expected_version(
     metadata: Option<&serde_json::Value>,
     source_uri: Option<&str>,
     expected_version: Option<i64>,
+    // v1.0.0 #1834 — opt-in claim-bitemporal `valid_until` patch. `None` leaves
+    // the stored value alone (COALESCE at the SQL layer); `Some(v)` closes/moves
+    // the claim's valid interval. `valid_from` is IMMUTABLE — it is never in the
+    // UPDATE SET list, so it is always preserved (the genesis assertion instant).
+    valid_until: Option<&str>,
 ) -> Result<(bool, bool)> {
     // #1955 R45 — record-stop fence for the update funnel.
     crate::storage::record_stop::gate_storage_conn(conn)?;
@@ -2513,6 +2543,11 @@ pub fn update_with_expected_version(
         source_uri: source_uri
             .map(str::to_string)
             .or_else(|| existing.source_uri.clone()),
+        // v1.0.0 #1834 — reflect the post-merge valid_until for governance
+        // (valid_from is carried immutably by the `..existing` spread).
+        valid_until: valid_until
+            .map(str::to_string)
+            .or_else(|| existing.valid_until.clone()),
         ..existing.clone()
     };
     consult_governance_pre_write(&governed)?;
@@ -2617,9 +2652,9 @@ pub fn update_with_expected_version(
                         '{}'
                     )
                 ),
-                source_uri = COALESCE(?11, source_uri), encrypted_envelope=?14, version = version + 1
+                source_uri = COALESCE(?11, source_uri), encrypted_envelope=?14, valid_until = COALESCE(?15, valid_until), version = version + 1
              WHERE id=?12 AND (?13 IS NULL OR version = ?13)",
-            params![effective_tier.as_str(), namespace, new_title, update_content_to_store, tags_json, priority, confidence, now, expires_at, metadata_json, source_uri, id, expected_version, update_encrypted_envelope],
+            params![effective_tier.as_str(), namespace, new_title, update_content_to_store, tags_json, priority, confidence, now, expires_at, metadata_json, source_uri, id, expected_version, update_encrypted_envelope, valid_until],
         );
         match update_res {
             Ok(0) => {
@@ -3626,6 +3661,10 @@ pub fn undo_in_place_edit(
         Some(&snap.metadata),
         snap.source_uri.as_deref(),
         Some(live.version),
+        // v1.0.0 #1834 — undo-edit path; UndoSnapshot does not yet carry
+        // valid_until (tracked with the archive-columns work), so leave the
+        // live value untouched (valid_from is immutable regardless).
+        None,
     )?;
     if !found {
         // Row vanished between our read and the update (or version
@@ -5049,6 +5088,10 @@ pub fn build_list_query(
     until: Option<&str>,
     tags_filter: Option<&str>,
     agent_id: Option<&str>,
+    // v1.0.0 #1834 — claim-bitemporal AS-OF (RFC3339). When set, restrict to
+    // rows whose half-open [valid_from, valid_until) window (END-EXCLUSIVE;
+    // NULL bounds = unbounded) contains the instant. `None` = no filter.
+    valid_at: Option<&str>,
     limit: usize,
     offset: usize,
 ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
@@ -5084,6 +5127,14 @@ pub fn build_list_query(
         sql.push_str(" AND agent_id_idx = ?");
         params_vec.push(Box::new(a.to_string()));
     }
+    // v1.0.0 #1834 — claim-bitemporal AS-OF. Half-open [valid_from, valid_until)
+    // END-EXCLUSIVE; NULL bounds unbounded. Bound twice (one per placeholder)
+    // in the dynamic sequential param order.
+    if let Some(v) = valid_at {
+        sql.push_str(" AND (valid_from IS NULL OR valid_from <= ?) AND (valid_until IS NULL OR valid_until > ?)");
+        params_vec.push(Box::new(v.to_string()));
+        params_vec.push(Box::new(v.to_string()));
+    }
     // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list hides
     // Tombstoned/Quarantined (and any unknown state) from list. No alias in
     // SQL_LIST_BASE, so the unqualified column is used.
@@ -5107,6 +5158,8 @@ pub fn list(
     until: Option<&str>,
     tags_filter: Option<&str>,
     agent_id: Option<&str>,
+    // v1.0.0 #1834 — claim-bitemporal AS-OF. See [`build_list_query`].
+    valid_at: Option<&str>,
 ) -> Result<Vec<Memory>> {
     let now = Utc::now().to_rfc3339();
     let (sql, params_vec) = build_list_query(
@@ -5118,6 +5171,7 @@ pub fn list(
         until,
         tags_filter,
         agent_id,
+        valid_at,
         limit,
         offset,
     );
@@ -5714,6 +5768,8 @@ pub fn recall_with_telemetry(
     source_uri_prefix: Option<&str>,
     // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
     caller: Option<&str>,
+    // v1.0.0 #1834 — claim-bitemporal AS-OF, threaded to `recall`.
+    valid_at: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -5734,6 +5790,7 @@ pub fn recall_with_telemetry(
         include_archived,
         source_uri_prefix,
         caller,
+        valid_at,
     )?;
     let telemetry = crate::models::RecallTelemetry {
         fts_candidates: results.len(),
@@ -5783,6 +5840,9 @@ pub fn recall(
     // ownership, not namespace. DISTINCT from `as_agent` (the
     // namespace). `None` = fail-closed (no private rows).
     caller: Option<&str>,
+    // v1.0.0 #1834 — claim-bitemporal AS-OF: RFC3339 point in VALID-time.
+    // `None` = no valid-time filter (bound to ?13, NULL-guarded in the SQL).
+    valid_at: Option<&str>,
 ) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
     let now = Utc::now().to_rfc3339();
     let fts_query = sanitize_fts_query(context, true);
@@ -5811,9 +5871,11 @@ pub fn recall(
     // #1720 A3 — `source_uri` renumbered ?12 → ?13: the caller
     // placeholder (?12) binds right after the visibility prefixes
     // (?8..?11), so the trailing source_uri LIKE filter shifts up one.
+    // #1834 — the claim-bitemporal AS-OF param takes ?13 (always bound,
+    // NULL-guarded), so the conditional source_uri LIKE filter shifts to ?14.
     let (source_uri_fragment, source_uri_param): (&str, Option<String>) = match source_uri_prefix {
         Some(prefix) if !prefix.is_empty() => (
-            "AND m.source_uri LIKE ?13 ESCAPE '\\'",
+            "AND m.source_uri LIKE ?14 ESCAPE '\\'",
             Some(format!("{}%", escape_like_pattern(prefix))),
         ),
         _ => ("", None),
@@ -5847,6 +5909,13 @@ pub fn recall(
            AND (?4 IS NULL OR EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?4))
            AND (?5 IS NULL OR m.created_at >= ?5)
            AND (?6 IS NULL OR m.created_at <= ?6)
+           -- #1834 claim-bitemporal AS-OF (?13): return only claims asserted to
+           -- hold at valid_at — half-open [valid_from, valid_until), END-
+           -- EXCLUSIVE, symmetric NULL=unbounded. NULL-guarded so `None`
+           -- (?13 IS NULL) is a no-op, byte-identical to the pre-#1834 result.
+           -- DISTINCT from since/until (?5/?6) which bound created_at.
+           AND (?13 IS NULL OR ((m.valid_from IS NULL OR m.valid_from <= ?13)
+                                AND (m.valid_until IS NULL OR m.valid_until > ?13)))
            {archived_fragment}
            {source_uri_fragment}
            {vis}
@@ -5887,7 +5956,8 @@ pub fn recall(
                 vis_u,
                 vis_o,
                 caller,    // ?12
-                uri_param, // ?13
+                valid_at,  // ?13
+                uri_param, // ?14
             ],
             row_handler,
         )?;
@@ -5906,7 +5976,8 @@ pub fn recall(
                 vis_t,
                 vis_u,
                 vis_o,
-                caller, // ?12
+                caller,   // ?12
+                valid_at, // ?13
             ],
             row_handler,
         )?;
@@ -5991,6 +6062,8 @@ pub fn promote_to_namespace(
     let now = Utc::now().to_rfc3339();
     let clone = Memory {
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
+        valid_from: source.valid_from.clone(),
+        valid_until: source.valid_until.clone(),
         id: uuid::Uuid::new_v4().to_string(),
         tier: source.tier.clone(),
         namespace: to_namespace.to_string(),
@@ -7356,6 +7429,8 @@ pub fn consolidate(
             // v0.9.0 G8 (#1825) — stamped below from this candidate's
             // genesis identity; the raw INSERT binds the pair.
             cid: None,
+            valid_from: None,
+            valid_until: None,
         };
         consult_governance_pre_write(&candidate)?;
         // #2121 — TRACT covenant clause 1 gate on the consolidate funnel
@@ -8732,6 +8807,8 @@ pub fn entity_register(
         let now = Utc::now().to_rfc3339();
         let mem = Memory {
             cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: namespace.to_string(),
@@ -9826,6 +9903,8 @@ pub fn register_agent(
 
     let mem = Memory {
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
+        valid_from: None,
+        valid_until: None,
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Long,
         namespace: AGENTS_NAMESPACE.to_string(),
@@ -12262,8 +12341,8 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // once per pulled row; `prepare_cached` amortises the parse of the
     // largest SQL statement in the file across the whole batch.
     let mut newer_wins_stmt = conn.prepare_cached(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version, lifecycle_state, encrypted_envelope, cid, cid_genesis)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version, lifecycle_state, encrypted_envelope, cid, cid_genesis, valid_from, valid_until)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
          ON CONFLICT(title, namespace) DO UPDATE SET
             -- v0.9.0 G8 (#1825) — a federation merge NEVER overwrites the
             -- surviving local row's genesis content-id: keep the local
@@ -12379,7 +12458,15 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             -- update site, so the replicated value is already-validated.
             lifecycle_state = CASE WHEN excluded.updated_at > memories.updated_at
                                         OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                                   THEN excluded.lifecycle_state ELSE memories.lifecycle_state END
+                                   THEN excluded.lifecycle_state ELSE memories.lifecycle_state END,
+            -- v1.0.0 #1834 — claim-bitemporal validity under federation LWW.
+            -- `valid_from` is immutable (local genesis wins, like `cid`);
+            -- `valid_until` follows the newer-wins tiebreak so a peer that
+            -- CLOSED a claim (set the upper bound) replicates that close.
+            valid_from = memories.valid_from,
+            valid_until = CASE WHEN excluded.updated_at > memories.updated_at
+                                 OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                               THEN excluded.valid_until ELSE memories.valid_until END
          RETURNING id",
     )?;
     let actual_id: String = newer_wins_stmt.query_row(
@@ -12415,6 +12502,8 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             encrypted_envelope,
             cid_stamp.cid,
             cid_stamp.genesis,
+            mem.valid_from,
+            mem.valid_until,
         ],
         |r| r.get(0),
     )?;
@@ -12543,9 +12632,11 @@ pub fn merge_inbound(conn: &Connection, inbound: &Memory) -> Result<String> {
 /// `(title, namespace)`, not `id`). The UPDATE is keyed on `id`, so it
 /// also rewrites `title` / `namespace` when the merge picked the remote's
 /// (a LWW visibility edit) without tripping the `(title, namespace)`
-/// dedup path. Writes all 27 logical columns + the denormalised
-/// `mentioned_entity_id` (re-derived from the merged row, same as the
-/// `insert` / `insert_if_newer` chokepoints).
+/// dedup path. Writes all 29 logical columns (incl. the #1834 / #2207
+/// `valid_from` / `valid_until` VALID-time interval so a peer's claim-close
+/// replicates by id) + the denormalised `mentioned_entity_id` (re-derived
+/// from the merged row, same as the `insert` / `insert_if_newer`
+/// chokepoints).
 ///
 /// Because this writer bypasses those chokepoints, the secret screen +
 /// pre-write governance hook + inbound why_trace gate run in its ONLY
@@ -12631,8 +12722,10 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
             mentioned_entity_id = ?25,
             version = ?26,
             lifecycle_state = ?27,
-            encrypted_envelope = ?28
-         WHERE id = ?29",
+            encrypted_envelope = ?28,
+            valid_from = ?29,
+            valid_until = ?30
+         WHERE id = ?31",
         params![
             mem.tier.as_str(),
             mem.namespace,
@@ -12662,6 +12755,15 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
             mem.version,
             mem.lifecycle_state.as_str(),
             merge_encrypted_envelope,
+            // #2207 — the #1834 claim-bitemporal VALID-time interval. The
+            // same-`id` federation merge lane MUST persist the merged
+            // `valid_until` (newer-wins in `merge_memory`, so a peer that
+            // CLOSED a claim replicates the close by id and replicas
+            // converge). `valid_from` is local-immutable in `merge_memory`
+            // (matches the `(title, namespace)` upsert arms' genesis-wins
+            // rule); carrying it verbatim here is a no-op overwrite.
+            mem.valid_from,
+            mem.valid_until,
             mem.id,
         ],
     )?;
@@ -13890,6 +13992,8 @@ pub fn recall_hybrid(
     caller: Option<&str>,
     // v1.0.0 #2167 §3 — active embedder space fingerprint. See [`recall`].
     active_space: Option<&str>,
+    // v1.0.0 #1834 — claim-bitemporal AS-OF instant. See [`recall`].
+    valid_at: Option<&str>,
 ) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
     let (results, outcome, _telemetry) = recall_hybrid_with_telemetry(
         conn,
@@ -13910,6 +14014,7 @@ pub fn recall_hybrid(
         source_uri_prefix,
         caller,
         active_space,
+        valid_at,
     )?;
     Ok((results, outcome))
 }
@@ -13942,6 +14047,8 @@ pub fn recall_hybrid_precomputed_hnsw(
     caller: Option<&str>,
     // v1.0.0 #2167 §3 — active embedder space fingerprint. See [`recall`].
     active_space: Option<&str>,
+    // v1.0.0 #1834 — claim-bitemporal AS-OF instant. See [`recall`].
+    valid_at: Option<&str>,
 ) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
     let (results, outcome, _telemetry) = recall_hybrid_with_telemetry_precomputed_hnsw(
         conn,
@@ -13962,6 +14069,7 @@ pub fn recall_hybrid_precomputed_hnsw(
         source_uri_prefix,
         caller,
         active_space,
+        valid_at,
     )?;
     Ok((results, outcome))
 }
@@ -14071,13 +14179,18 @@ fn prepare_hybrid_query<'a>(
     // the caller placeholder binds right after the visibility prefixes:
     // FTS ?12 → ?13 (vis ?8..?11, caller ?12); semantic ?10 → ?11
     // (vis ?6..?9, caller ?10).
+    // v1.0.0 #1834 — the claim-bitemporal AS-OF param binds at a FIXED slot
+    // right after `caller` (FTS ?13, semantic ?11) so its fragment is a
+    // constant string on BOTH the uri-present and uri-absent branches; the
+    // optional source_uri param therefore moves up one more slot (FTS
+    // ?13 → ?14, semantic ?11 → ?12) when present.
     let fts_source_uri_fragment = if source_uri_like_param.is_some() {
-        "AND m.source_uri LIKE ?13 ESCAPE '\\'"
+        "AND m.source_uri LIKE ?14 ESCAPE '\\'"
     } else {
         ""
     };
     let sem_source_uri_fragment = if source_uri_like_param.is_some() {
-        "AND memories.source_uri LIKE ?11 ESCAPE '\\'"
+        "AND memories.source_uri LIKE ?12 ESCAPE '\\'"
     } else {
         ""
     };
@@ -14110,6 +14223,9 @@ fn fts_keyword_phase(
     tags_filter: Option<&str>,
     since: Option<&str>,
     until: Option<&str>,
+    // v1.0.0 #1834 — claim-bitemporal AS-OF instant (RFC3339) bound at the
+    // fixed ?13 slot; `None` passes every row (the `?13 IS NULL OR …` guard).
+    valid_at: Option<&str>,
     limit: usize,
 ) -> Result<Vec<(Memory, f64, Option<Vec<u8>>, Option<String>)>> {
     // #1909 — same unclamped public `limit`; guard the multiply against
@@ -14150,6 +14266,7 @@ fn fts_keyword_phase(
            AND (?6 IS NULL OR m.created_at <= ?6)
            {fts_archived_fragment}
            {fts_source_uri_fragment}
+           {fts_valid_at_fragment}
            {vis}
            {lifecycle_vis}
          ORDER BY fts_score DESC
@@ -14157,6 +14274,12 @@ fn fts_keyword_phase(
         fts_hierarchy_fragment = prep.fts_hierarchy_fragment,
         fts_archived_fragment = prep.fts_archived_fragment,
         fts_source_uri_fragment = prep.fts_source_uri_fragment,
+        // v1.0.0 #1834 — claim-bitemporal AS-OF at the fixed ?13 slot (binds
+        // right after `caller` ?12). Half-open [valid_from, valid_until)
+        // END-EXCLUSIVE per SQL:2011; NULL bounds = unbounded; `?13 IS NULL`
+        // (no as-of) admits every row.
+        fts_valid_at_fragment = "AND (?13 IS NULL OR ((m.valid_from IS NULL OR m.valid_from <= ?13) \
+             AND (m.valid_until IS NULL OR m.valid_until > ?13)))",
         vis = visibility_clause(8, 12, "m"),
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list on the
         // hybrid-recall FTS branch.
@@ -14198,7 +14321,8 @@ fn fts_keyword_phase(
                         vis_u,
                         vis_o,
                         caller,    // ?12
-                        uri_param, // ?13
+                        valid_at,  // ?13 (#1834)
+                        uri_param, // ?14
                     ],
                     fts_row_handler,
                 )?
@@ -14218,7 +14342,8 @@ fn fts_keyword_phase(
                         vis_t,
                         vis_u,
                         vis_o,
-                        caller, // ?12
+                        caller,   // ?12
+                        valid_at, // ?13 (#1834)
                     ],
                     fts_row_handler,
                 )?
@@ -14311,6 +14436,10 @@ fn semantic_phase(
     tags_filter: Option<&str>,
     since: Option<&str>,
     until: Option<&str>,
+    // v1.0.0 #1834 — claim-bitemporal AS-OF instant (RFC3339). Applied in
+    // SQL on the linear-scan branch (fixed ?11 slot) and in Rust on the
+    // HNSW branch (which carries no SQL WHERE), mirroring since/until.
+    valid_at: Option<&str>,
     limit: usize,
     include_archived: bool,
     source_uri_prefix: Option<&str>,
@@ -14484,6 +14613,19 @@ fn semantic_phase(
             {
                 continue;
             }
+            // v1.0.0 #1834 — claim-bitemporal AS-OF re-filter. The HNSW branch
+            // loads candidates via `get_many` (no SQL WHERE), so the half-open
+            // [valid_from, valid_until) END-EXCLUSIVE window is applied in Rust
+            // here, mirroring the FTS/linear-scan SQL predicate. Exclude a row
+            // whose validity has not started (`valid_from > as-of`) or has
+            // already ended (`valid_until <= as-of`); NULL bounds = unbounded.
+            if let Some(v) = valid_at {
+                if mem.valid_from.as_deref().is_some_and(|f| f > v)
+                    || mem.valid_until.as_deref().is_some_and(|u| u <= v)
+                {
+                    continue;
+                }
+            }
             if !is_visible(mem, &prep.prefixes, prep.caller.as_deref()) {
                 continue;
             }
@@ -14538,11 +14680,18 @@ fn semantic_phase(
            AND (?5 IS NULL OR created_at <= ?5)
            {sem_archived_fragment}
            {sem_source_uri_fragment}
+           {sem_valid_at_fragment}
            {vis}
            {lifecycle_vis}",
         sem_hierarchy_fragment = prep.sem_hierarchy_fragment,
         sem_archived_fragment = prep.sem_archived_fragment,
         sem_source_uri_fragment = prep.sem_source_uri_fragment,
+        // v1.0.0 #1834 — claim-bitemporal AS-OF at the fixed ?11 slot (binds
+        // right after `caller` ?10). Half-open [valid_from, valid_until)
+        // END-EXCLUSIVE; NULL bounds = unbounded; `?11 IS NULL` admits all.
+        sem_valid_at_fragment =
+            "AND (?11 IS NULL OR ((valid_from IS NULL OR valid_from <= ?11) \
+             AND (valid_until IS NULL OR valid_until > ?11)))",
         vis = visibility_clause(6, 10, "memories"),
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list on the
         // semantic linear-scan branch (unqualified `memories` columns).
@@ -14580,7 +14729,8 @@ fn semantic_phase(
                         vis_u,
                         vis_o,
                         caller,    // ?10
-                        uri_param, // ?11
+                        valid_at,  // ?11 (#1834)
+                        uri_param, // ?12
                     ],
                     sem_row_handler,
                 )?
@@ -14598,7 +14748,8 @@ fn semantic_phase(
                         vis_t,
                         vis_u,
                         vis_o,
-                        caller, // ?10
+                        caller,   // ?10
+                        valid_at, // ?11 (#1834)
                     ],
                     sem_row_handler,
                 )?
@@ -14818,6 +14969,8 @@ pub fn recall_hybrid_with_telemetry(
     caller: Option<&str>,
     // v1.0.0 #2167 §3 — active embedder space fingerprint. See [`recall`].
     active_space: Option<&str>,
+    // v1.0.0 #1834 — claim-bitemporal AS-OF instant. See [`recall`].
+    valid_at: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -14843,6 +14996,7 @@ pub fn recall_hybrid_with_telemetry(
         source_uri_prefix,
         caller,
         active_space,
+        valid_at,
     )
 }
 
@@ -14885,6 +15039,8 @@ pub fn recall_hybrid_with_telemetry_precomputed_hnsw(
     caller: Option<&str>,
     // v1.0.0 #2167 §3 — active embedder space fingerprint. See [`recall`].
     active_space: Option<&str>,
+    // v1.0.0 #1834 — claim-bitemporal AS-OF instant. See [`recall`].
+    valid_at: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -14910,6 +15066,7 @@ pub fn recall_hybrid_with_telemetry_precomputed_hnsw(
         source_uri_prefix,
         caller,
         active_space,
+        valid_at,
     )
 }
 
@@ -14944,6 +15101,8 @@ fn recall_hybrid_with_telemetry_inner(
     // a semantic recall, `None` for keyword-only / no embedder). Gates the
     // FTS + semantic branches through `cosine_similarity_space_checked`.
     active_space: Option<&str>,
+    // v1.0.0 #1834 — claim-bitemporal AS-OF instant. See [`recall`].
+    valid_at: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -14961,7 +15120,7 @@ fn recall_hybrid_with_telemetry_inner(
     );
 
     // Stage 2 — FTS5 keyword phase.
-    let fts_results = fts_keyword_phase(conn, &prep, tags_filter, since, until, limit)?;
+    let fts_results = fts_keyword_phase(conn, &prep, tags_filter, since, until, valid_at, limit)?;
 
     // Fusion pool (id → (memory, fts_score, cosine_score)). FTS rows
     // land first so their inline-fetched embedding-cosine wins; the
@@ -15066,6 +15225,7 @@ fn recall_hybrid_with_telemetry_inner(
         tags_filter,
         since,
         until,
+        valid_at,
         limit,
         include_archived,
         source_uri_prefix,
@@ -17919,6 +18079,8 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: tier.clone(),
             namespace: ns.to_string(),
@@ -18659,6 +18821,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(results.len(), 2);
@@ -18681,6 +18844,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(results.len(), 1);
@@ -18697,7 +18861,7 @@ mod tests {
             )
             .unwrap();
         }
-        let results = list(&conn, None, None, 3, 0, None, None, None, None, None).unwrap();
+        let results = list(&conn, None, None, 3, 0, None, None, None, None, None, None).unwrap();
         assert_eq!(results.len(), 3);
     }
 
@@ -18783,6 +18947,7 @@ mod tests {
             false,
             None,
             None, // #1720 caller
+            None, // #1834 valid_at
         )
         .unwrap();
         assert!(!results.is_empty());
@@ -18812,6 +18977,7 @@ mod tests {
             false,
             None,
             None, // #1720 caller
+            None, // #1834 valid_at
         );
         // May return empty or error, both acceptable
         assert!(results.is_ok() || results.is_err());
@@ -19982,7 +20148,10 @@ mod tests {
 
         let deleted = forget(&conn, Some("delete-me"), None, None, false).unwrap();
         assert_eq!(deleted, 2);
-        let remaining = list(&conn, None, None, 100, 0, None, None, None, None, None).unwrap();
+        let remaining = list(
+            &conn, None, None, 100, 0, None, None, None, None, None, None,
+        )
+        .unwrap();
         assert_eq!(remaining.len(), 1);
     }
 
@@ -20003,7 +20172,10 @@ mod tests {
         assert_eq!(deleted, 2, "both forget-ns rows deleted");
 
         // Deleted from live `memories` (only keep-ns remains).
-        let remaining = list(&conn, None, None, 100, 0, None, None, None, None, None).unwrap();
+        let remaining = list(
+            &conn, None, None, 100, 0, None, None, None, None, None, None,
+        )
+        .unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].namespace, "keep-ns");
 
@@ -21112,6 +21284,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(results.len(), 1);
@@ -21159,6 +21332,7 @@ mod tests {
             false,
             None,
             None, // #1720 caller
+            None, // #1834 valid_at
         )
         .unwrap();
         assert!(!results.is_empty());
@@ -22974,6 +23148,8 @@ mod tests {
         }
         let standard = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: format!("_standards-{parent_ns}"),
@@ -23121,6 +23297,8 @@ mod tests {
         }
         let standard = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: format!("_standards-{parent_ns}"),
@@ -24998,6 +25176,8 @@ mod tests {
         // Insert one observation and one reflection memory.
         let obs = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "kind-ns".to_string(),
@@ -25028,6 +25208,8 @@ mod tests {
         };
         let ref_mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "kind-ns".to_string(),
@@ -25099,6 +25281,8 @@ mod tests {
         let conn = test_db();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "roundtrip-ns".to_string(),
@@ -25150,6 +25334,8 @@ mod tests {
         // First insert: Reflection.
         let mem_reflection = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: id.clone(),
             tier: Tier::Long,
             namespace: "sticky-ns".to_string(),
@@ -25183,6 +25369,8 @@ mod tests {
         // Second upsert: Observation (same title+namespace → triggers ON CONFLICT).
         let mem_obs = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(), // different id, same title+ns
             tier: Tier::Long,
             namespace: "sticky-ns".to_string(),
@@ -25636,6 +25824,7 @@ mod tests {
         let (vis, tomb, quar) = seed_lifecycle_corpus(&conn, "ns/life");
         let (rows, _) = recall(
             &conn, "widget", None, 50, None, None, None, 0, 0, None, None, false, None, None,
+            None, // #1834 valid_at
         )
         .unwrap();
         let ids: Vec<&str> = rows.iter().map(|(m, _)| m.id.as_str()).collect();
@@ -25680,6 +25869,7 @@ mod tests {
             None,
             50,
             0,
+            None,
             None,
             None,
             None,

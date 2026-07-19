@@ -217,6 +217,7 @@ async fn assert_signed_bulk_row_emits_write_signature(backend: StorageBackend, n
         None,
         None,
         None,
+        None, // #1834 valid_at
     )
     .expect("db::list");
     assert_eq!(rows.len(), 1, "exactly one persisted row; got: {rows:?}");
