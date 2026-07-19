@@ -37,9 +37,12 @@ The cryptographic forensic audit trail provides **tamper-evident
 provenance for every substrate-visible action that crosses a
 governance decision boundary**. A regulator or procurement auditor
 can, given the database and the operator public key, walk the chain
-end to end and verify:
+end to end and verify successfully admitted substrate events. For a blocking
+governance verdict whose durable admission fails, the action remains blocked;
+quota exhaustion leaves bounded hash-based evidence rather than a full
+chain row. The auditor can verify:
 
-- Every refusal verdict the engine produced.
+- Every refusal verdict durably admitted to the audit path.
 - Every approval-API decision.
 - Every reflection write with cross-peer provenance.
 - Every schema migration the substrate applied.
@@ -53,19 +56,19 @@ path. See §4.
 
 ## 2. Coverage matrix
 
-| Event class | Current logging status at `c359e89` | `signed_events` row shape | Known gaps | v0.8.0 issue |
+| Event class | Current logging status | `signed_events` row shape | Known gaps | v0.8.0 issue |
 |---|---|---|---|---|
 | Cross-row chain integrity | **Chain-logged today** (v0.7.0 V-4 closeout, #698) — every row carries `prev_hash` + `sequence`; [`verify_chain`](../../src/signed_events.rs) walks every row and flags chain breaks | `prev_hash BLOB` = SHA-256 over [`canonical_chain_bytes`](../../src/signed_events.rs) of the preceding row (ZERO_HASH for first); `sequence INTEGER` monotonic from 1, pinned by UNIQUE index | DELETE row N is detected at row N+1's prev_hash check; raw row-pruning operators must accept the documented chain break | — |
 | Memory writes (`store` / `update` / `link` / `delete` / `archive` / `consolidate`) | **Chain-logged today** via `signed_events.append` (`src/signed_events.rs`) on every successful substrate write | `event_type = "memory.<verb>"`, `payload_hash` over canonical-JSON of the post-write row, `signature` (Ed25519 over `payload_hash`), `attest_level` ∈ {`unsigned`, `signed`} | none for the success leg | — |
 | Reflection writes | **Chain-logged today** with `peer_origin` for cross-peer paths (L2-2 commit `2aef248`) | `event_type = "reflection.write"`, payload binds `(source_ids, depth, peer_origin)` | none | — |
 | Governance refusals on agent-EXTERNAL surface (Bash / Write / Network / ProcessSpawn / Custom) via `check_agent_action` (audited path) | **Chain-logged today** synchronously, every call | `event_type = "governance.check"`, `payload_hash` over canonical `{action, decision}` JSON, `agent_id` carrier set | none | — |
-| Governance refusals on substrate-INTERNAL pre-write hook (`check_agent_action_no_audit`) | **Chain-logged and crash-durable today** via PE-3 + PE-4 | identical shape to the audited path — same canonical bytes / payload hash; each blocking occurrence is durably admitted to the bounded private spool before queue delivery, then acknowledged only after chain/DLQ residence | no known silent-loss gap; admission/recovery failure is fail-closed and surfaces bounded overflow evidence | **#697** V08-PE-4 shipped |
+| Governance refusals on substrate-INTERNAL pre-write hook (`check_agent_action_no_audit`) | **Chain-logged and crash-durable after successful admission** via PE-3 + PE-4 | `event_type = "governance.refusal"`; payload hash binds canonical `{action, decision, agent_id, timestamp, occurrence_id}`; admitted occurrences are spooled before queue delivery and acknowledged only after chain/DLQ residence | quota exhaustion stores bounded timestamp/occurrence/payload-hash evidence instead of the full event; other admission/recovery failures emit operational errors and keep the queue/action closed without promising a marker | **#697** V08-PE-4 shipped |
 | Approval-API decisions (L1-8) | **Chain-logged today** | `event_type = "approval.<decision>"`, binds approver identity + decision + correlation id | none | — |
 | Schema migrations | **Chain-logged today** at boot | `event_type = "schema.migration"`, binds from-version + to-version + migration filename hash | none | — |
 | Read actions (`memory_recall` / `memory_search` / `memory_list` / `memory_get` / `memory_session_boot`) | **NOT chain-logged** at engine level. Handler-layer `AuditAction::Recall` etc. row is emitted to the JSON audit log per [`audit-trail.md`](./audit-trail.html), but no `signed_events` row | n/a — v0.8.0 adds `event_type = "governance.read_check"` once V08-PE-2 lands | engine has no `AgentAction::Read` variant at HEAD | **#697** V08-PE-2 |
 | Subprocess actions from Bash spawn chain (fork→exec under a permitted shell) | **NOT visible** to the engine at HEAD | n/a — v0.8.0 adds eBPF/dtrace surface and `event_type = "process.spawn_chain"` | invisible to the substrate without a kernel-side probe | **#697** V08-PE-3 |
 | Out-of-band agent actions | **Unenforceable by definition** | n/a — substrate has no visibility | partial mitigations: V08-PE-1 mandatory-hook + V08-PE-6 TPM-bound binary integrity | **#697** V08-PE-1, V08-PE-6 |
-| Hard-crash-lost deferred events | **Closed by PE-4** — persistent per-occurrence spool | recovery replays content-bound occurrences before hooks go live; stable occurrence IDs make retry idempotent | spool is bounded to 4,096 entries / 32 MiB; exhausted or unavailable admission blocks the governed action and records bounded overflow evidence | **#697** V08-PE-4 shipped |
+| Hard-crash-lost deferred events | **Closed for admitted occurrences by PE-4** — persistent per-occurrence spool | recovery replays content-bound occurrences before hooks go live; stable occurrence IDs make retry idempotent | spool is bounded to 4,096 entries / 32 MiB; quota exhaustion blocks the action and records bounded overflow evidence, while other unavailable-admission failures block and emit operational errors | **#697** V08-PE-4 shipped |
 
 ---
 
@@ -125,8 +128,9 @@ ORDER BY timestamp DESC
 LIMIT 100;
 
 -- Refusal-only filter — decode the payload_hash row by row through
--- the canonical_bytes path; or pair with the `governance.check_dropped`
--- counter once V08-PE-4 lands.
+-- the canonical_bytes path. Separately inspect the private deferred-audit
+-- spool's bounded `.overflow-*` evidence and startup ERROR diagnostics for
+-- refusals that stayed blocked because durable admission was unavailable.
 ```
 
 The canonical-bytes recipe is stable across versions. A future audit
