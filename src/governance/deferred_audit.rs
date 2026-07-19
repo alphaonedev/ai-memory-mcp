@@ -40,11 +40,10 @@
 //!
 //! # Supervisor pattern
 //!
-//! The drainer task is wrapped by [`spawn_supervised_drainer`] which
-//! restarts the inner task on panic. A panic in the drainer would
-//! otherwise silently drop the audit chain — a regression worse than
-//! the original gap. The supervisor uses `tokio::task::spawn` with
-//! `JoinHandle` polling so cleanup on shutdown is deterministic.
+//! The drainer task is wrapped by [`spawn_supervised_drainer`], which
+//! keeps ownership of the receiver while catching sink panics. It can
+//! therefore rebuild the sink and retry the in-flight event without
+//! dropping the receiver or the queued audit chain.
 //!
 //! # Backpressure / lossiness
 //!
@@ -714,6 +713,11 @@ pub enum AppendOutcome {
 /// `append` MUST be `&mut` so a test sink can record events into an
 /// owned `Vec` without interior mutability. Production sinks
 /// (SQLite-backed) hold their state behind the impl.
+///
+/// Implementations used with [`spawn_supervised_drainer`] MUST make a
+/// retry of the same event idempotent. A sink can panic after making
+/// its write durable but before returning, so the supervisor cannot
+/// otherwise distinguish "not written" from "written, then panicked".
 pub trait DeferredAuditSink: Send + 'static {
     /// Persist one event.
     ///
@@ -817,6 +821,39 @@ impl DeferredAuditSink for SqliteSignedEventsSink {
             .canonical_bytes()
             .context("SqliteSignedEventsSink: canonical_bytes")?;
         let hash = payload_hash(&bytes);
+        // The panic supervisor retries the same in-flight event with
+        // a fresh sink. A panic could happen after SQLite committed
+        // but before `append` returned, so make that retry idempotent
+        // by the canonical payload hash (the boot journal recovery
+        // uses the same identity rule).
+        match self.ensure_conn()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM signed_events \
+             WHERE event_type = ?1 AND payload_hash = ?2)",
+            rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, &hash],
+            |row| row.get::<_, bool>(0),
+        ) {
+            Ok(true) => {
+                tracing::warn!(
+                    agent_id = %event.agent_id,
+                    "deferred_audit sink: retry found the canonical event already chained; \
+                     treating the append as idempotently complete"
+                );
+                return Ok(AppendOutcome::Appended);
+            }
+            Ok(false) => {}
+            Err(e) => {
+                // A damaged/mismatched table can make the dedup probe
+                // fail. Continue into the normal append path so its
+                // established failure handling can land the event in
+                // the DLQ instead of losing it at this advisory probe.
+                tracing::warn!(
+                    error = %e,
+                    agent_id = %event.agent_id,
+                    "deferred_audit sink: idempotency probe failed; continuing to \
+                     append so the normal DLQ fallback remains available"
+                );
+            }
+        }
         // v0.7.0 #1035 — sign the payload_hash with the daemon's
         // process-wide audit key when installed. The forensic JSONL
         // sink and this SQL sink share the same key (installed by
@@ -1034,23 +1071,23 @@ pub fn spawn_drainer_task<S: DeferredAuditSink + 'static>(
     })
 }
 
-/// Supervisor: spawns the drainer with panic recovery. Any panic
-/// caught at the `JoinHandle::is_panic()` boundary triggers a
-/// respawn with a FRESH sink (`make_sink()`), preserving the
-/// receiver and the metrics handle.
+/// Supervisor: drains events while retaining ownership of the
+/// receiver across sink panics. A caught panic rebuilds a FRESH sink
+/// (`make_sink()`) and retries the in-flight event, preserving both
+/// the receiver and the metrics handle.
 ///
 /// The supervisor task returns when either:
 ///   - The channel sender is dropped and the channel is fully
 ///     drained (graceful shutdown).
-///   - `max_restarts` consecutive panics occur (default `u32::MAX`
-///     — effectively never gives up; an operator that wants to
-///     fail loudly on persistent panics can configure a finite
-///     limit).
+///   - A sink exhausts `max_restarts` while retrying one in-flight
+///     event (default `u32::MAX` — effectively never gives up; an
+///     operator that wants to fail loudly on persistent panics can
+///     configure a finite limit).
 ///
 /// The returned `JoinHandle` resolves when the supervisor exits.
 #[must_use]
 pub fn spawn_supervised_drainer<F, S>(
-    receiver: UnboundedReceiver<DeferredAuditEvent>,
+    mut receiver: UnboundedReceiver<DeferredAuditEvent>,
     make_sink: F,
     metrics: DeferredAuditMetrics,
     max_restarts: u32,
@@ -1060,42 +1097,60 @@ where
     S: DeferredAuditSink + 'static,
 {
     tokio::spawn(async move {
-        // Drainer iteration. The receiver lives inside the spawned
-        // task; on graceful shutdown the task returns it back to
-        // us. On panic the receiver is lost — see the
-        // documentation block for the supervisor restart pattern.
-        let sink = make_sink();
-        let handle = spawn_drainer_task(receiver, sink, metrics.clone());
-        match handle.await {
-            Ok(returned_receiver) => {
-                // Drainer exited gracefully — sender dropped + drained.
-                drop(returned_receiver);
-            }
-            Err(join_err) if join_err.is_panic() => {
-                metrics.drainer_panics.fetch_add(1, Ordering::Relaxed);
-                tracing::error!(
-                    "deferred_audit supervisor: drainer task panicked ({join_err}); \
-                     max_restarts={max_restarts} — receiver moved into the panicked \
-                     task and cannot be recovered; future refusals submitted to the \
-                     existing queue will fail to land. Operator action required: \
-                     rebuild the daemon's deferred-audit queue (or restart the daemon) \
-                     to restore the audit-chain property."
-                );
-                // We cannot loop without a valid receiver. The
-                // max_restarts variable is preserved in the API so
-                // future revisions can introduce a buffering scheme
-                // that lets the supervisor recover the in-flight
-                // events; today the contract is "panic in drainer
-                // = chain loss on the unflushed buffer, future
-                // events recorded as send_failures".
-                let _ = max_restarts;
-            }
-            Err(join_err) => {
-                // Cancellation (task aborted) — treat as shutdown.
-                tracing::warn!(
-                    "deferred_audit supervisor: drainer aborted ({join_err}); \
-                     pending events may be lost"
-                );
+        let mut sink = make_sink();
+        let mut consecutive_restarts = 0_u32;
+
+        while let Some(event) = receiver.recv().await {
+            loop {
+                let append_result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.append(&event)));
+
+                match append_result {
+                    Ok(Ok(AppendOutcome::Appended)) => {
+                        metrics.appended.fetch_add(1, Ordering::Relaxed);
+                        consecutive_restarts = 0;
+                        break;
+                    }
+                    Ok(Ok(AppendOutcome::DlqLanded)) => {
+                        metrics.append_failures.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            "deferred_audit drainer: event landed in DLQ \
+                             (audit chain row NOT advanced; operator replay needed)"
+                        );
+                        consecutive_restarts = 0;
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        metrics.append_failures.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(
+                            "deferred_audit drainer: sink.append failed \
+                             (no DLQ landing either): {e:#}"
+                        );
+                        consecutive_restarts = 0;
+                        break;
+                    }
+                    Err(_) => {
+                        metrics.drainer_panics.fetch_add(1, Ordering::Relaxed);
+                        if consecutive_restarts == max_restarts {
+                            tracing::error!(
+                                "deferred_audit supervisor: sink panicked and exhausted \
+                                 max_restarts={max_restarts}; this supervisor is stopping \
+                                 with the in-flight event unflushed. The journal preserves \
+                                 it for boot recovery when enabled; operator restart required."
+                            );
+                            return;
+                        }
+
+                        consecutive_restarts += 1;
+                        tracing::error!(
+                            restart = consecutive_restarts,
+                            max_restarts,
+                            "deferred_audit supervisor: sink panicked; rebuilding sink \
+                             and retrying the in-flight event"
+                        );
+                        sink = make_sink();
+                    }
+                }
             }
         }
     })
@@ -1551,39 +1606,48 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_records_panic_metric_on_drainer_panic() {
-        // Sink panics on first call. The supervisor catches the
-        // panic, bumps drainer_panics, and (per current
-        // implementation) terminates after the panic — the receiver
-        // moved into the panicked task and cannot be recovered.
-        // We verify the panic-counter side-effect.
+        // The first sink panics on its first call. The supervisor must
+        // retain the receiver, rebuild the sink, retry that event, and
+        // then drain an event submitted after recovery.
         let (queue, rx) = DeferredAuditQueue::new();
         let metrics = queue.metrics();
-        let panic_on = Some(0_usize);
+        let recorded: Arc<Mutex<Vec<DeferredAuditEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded_for_factory = recorded.clone();
+        let call_count = Arc::new(AtomicU64::new(0));
+        let call_count_for_factory = call_count.clone();
         let supervisor = spawn_supervised_drainer(
             rx,
             move || MockSink {
-                recorded: Arc::new(Mutex::new(Vec::new())),
-                panic_on,
+                recorded: recorded_for_factory.clone(),
+                panic_on: Some(0),
                 error_on: None,
-                call_count: Arc::new(AtomicU64::new(0)),
+                call_count: call_count_for_factory.clone(),
             },
             metrics.clone(),
-            1, // max 1 restart (= no respawn beyond the initial spawn)
+            1,
         );
 
-        let event =
-            DeferredAuditEvent::from_refusal("agent:panic", &refusal_action(), &refusal_decision())
-                .unwrap();
-        queue.submit(event);
-        // Wait for the supervisor to observe the panic and exit.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), supervisor)
+        for agent_id in ["agent:panic", "agent:after-restart"] {
+            let event =
+                DeferredAuditEvent::from_refusal(agent_id, &refusal_action(), &refusal_decision())
+                    .unwrap();
+            assert!(queue.submit(event));
+        }
+
+        close_and_flush(queue, supervisor)
             .await
-            .expect("supervisor must exit after observing panic");
+            .expect("supervisor must recover and drain after one allowed restart");
         assert_eq!(
             metrics.panic_count(),
             1,
             "supervisor must record exactly one drainer panic"
         );
+        assert_eq!(metrics.appended_count(), 2);
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+        let recorded = recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].agent_id, "agent:panic");
+        assert_eq!(recorded[1].agent_id, "agent:after-restart");
     }
 
     #[tokio::test]
@@ -1877,6 +1941,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "drainer must have written the row");
+    }
+
+    #[test]
+    fn sqlite_sink_retry_is_idempotent_by_canonical_payload() {
+        let dir = fresh_tempdir();
+        let db_path = dir.path().join("def-audit-idempotent-retry.db");
+        let _ = crate::db::open(&db_path).expect("init db");
+        let mut sink = SqliteSignedEventsSink::new(db_path.clone());
+        let event =
+            DeferredAuditEvent::from_refusal("agent:retry", &refusal_action(), &refusal_decision())
+                .unwrap();
+
+        assert_eq!(sink.append(&event).unwrap(), AppendOutcome::Appended);
+        assert_eq!(sink.append(&event).unwrap(), AppendOutcome::Appended);
+
+        let conn = crate::db::open(&db_path).expect("reopen db");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1 AND agent_id = ?2",
+                rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, "agent:retry"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "same-event retry must not duplicate the chain row"
+        );
     }
 
     #[tokio::test]
