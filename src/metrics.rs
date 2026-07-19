@@ -835,6 +835,12 @@ pub fn record_store(tier: &str, ok: bool) {
 }
 
 /// Convenience: record a recall, labeled by mode + latency.
+///
+/// SCOPE (#1839): called from the HTTP recall path only (both backends) —
+/// MCP-stdio recalls populate NEITHER `ai_memory_recall_total` NOR
+/// `ai_memory_recall_latency_seconds` (a stdio daemon exposes no `/metrics`
+/// endpoint, so the scraped HTTP surface is the one instrumented; both
+/// series share this one funnel and therefore the same HTTP-only scope).
 #[allow(dead_code)]
 pub fn record_recall(mode: &str, latency_seconds: f64) {
     registry().recall_total.with_label_values(&[mode]).inc();

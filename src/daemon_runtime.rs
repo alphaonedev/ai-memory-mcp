@@ -5055,6 +5055,26 @@ pub async fn bootstrap_serve(
     )
     .context("federation config")?;
 
+    // v1.0.0 TRACT G16 (#1830) — durability-model boot disclosure: the first
+    // production consumer of `resolve_durability_model` (the #2213 audit's F6
+    // no-consumer note). Reports the DOMINANT durability posture computed from
+    // the REAL resolved config (synchronous PRAGMA level, quorum wiring, the
+    // #2064 erasure cold tier) so operators see the durability they actually
+    // have, not the durability they assume. `federation.is_some()` is the
+    // peers-configured signal: `FederationConfig::build` returns `Some` only
+    // when `--quorum-writes > 0` AND peers are configured.
+    let durability_model = crate::durability::resolve_durability_model(
+        crate::storage::connection::db_synchronous(),
+        args.quorum_writes,
+        federation.is_some(),
+        crate::erasure::erasure_cold_tier_enabled(),
+    );
+    tracing::info!(
+        "durability model: {} (multi-node: {})",
+        durability_model.label(),
+        durability_model.is_multi_node(),
+    );
+
     let mut task_handles: Vec<JoinHandle<()>> = Vec::new();
 
     if let Some(ref fed) = federation {
