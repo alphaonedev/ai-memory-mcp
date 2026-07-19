@@ -45,8 +45,9 @@ end to end and verify:
 - Every schema migration the substrate applied.
 
 Out of scope (closed by v0.8.0 **#697**): out-of-band agent actions
-the substrate cannot see, hard-crash-lost rows in the deferred queue,
-and read-action visibility. See §4.
+the substrate cannot see and read-action visibility. Hard-crash loss in the
+deferred queue was closed by PE-4's durable spool and recovery-before-live
+path. See §4.
 
 ---
 
@@ -58,13 +59,13 @@ and read-action visibility. See §4.
 | Memory writes (`store` / `update` / `link` / `delete` / `archive` / `consolidate`) | **Chain-logged today** via `signed_events.append` (`src/signed_events.rs`) on every successful substrate write | `event_type = "memory.<verb>"`, `payload_hash` over canonical-JSON of the post-write row, `signature` (Ed25519 over `payload_hash`), `attest_level` ∈ {`unsigned`, `signed`} | none for the success leg | — |
 | Reflection writes | **Chain-logged today** with `peer_origin` for cross-peer paths (L2-2 commit `2aef248`) | `event_type = "reflection.write"`, payload binds `(source_ids, depth, peer_origin)` | none | — |
 | Governance refusals on agent-EXTERNAL surface (Bash / Write / Network / ProcessSpawn / Custom) via `check_agent_action` (audited path) | **Chain-logged today** synchronously, every call | `event_type = "governance.check"`, `payload_hash` over canonical `{action, decision}` JSON, `agent_id` carrier set | none | — |
-| Governance refusals on substrate-INTERNAL pre-write hook (`check_agent_action_no_audit`) | **Chain-logged today** via PE-3 deferred queue (merged commit `07b4957`) | identical shape to the audited path — same canonical bytes / payload hash; emit deferred via tokio drain task in `src/governance/deferred_audit.rs::install_deferred_audit_drainer` | hard-crash drainer loss (process-local queue); see V08-PE-4 | **#697** V08-PE-4 closes durability (V08 closeout) |
+| Governance refusals on substrate-INTERNAL pre-write hook (`check_agent_action_no_audit`) | **Chain-logged and crash-durable today** via PE-3 + PE-4 | identical shape to the audited path — same canonical bytes / payload hash; each blocking occurrence is durably admitted to the bounded private spool before queue delivery, then acknowledged only after chain/DLQ residence | no known silent-loss gap; admission/recovery failure is fail-closed and surfaces bounded overflow evidence | **#697** V08-PE-4 shipped |
 | Approval-API decisions (L1-8) | **Chain-logged today** | `event_type = "approval.<decision>"`, binds approver identity + decision + correlation id | none | — |
 | Schema migrations | **Chain-logged today** at boot | `event_type = "schema.migration"`, binds from-version + to-version + migration filename hash | none | — |
 | Read actions (`memory_recall` / `memory_search` / `memory_list` / `memory_get` / `memory_session_boot`) | **NOT chain-logged** at engine level. Handler-layer `AuditAction::Recall` etc. row is emitted to the JSON audit log per [`audit-trail.md`](./audit-trail.html), but no `signed_events` row | n/a — v0.8.0 adds `event_type = "governance.read_check"` once V08-PE-2 lands | engine has no `AgentAction::Read` variant at HEAD | **#697** V08-PE-2 |
 | Subprocess actions from Bash spawn chain (fork→exec under a permitted shell) | **NOT visible** to the engine at HEAD | n/a — v0.8.0 adds eBPF/dtrace surface and `event_type = "process.spawn_chain"` | invisible to the substrate without a kernel-side probe | **#697** V08-PE-3 |
 | Out-of-band agent actions | **Unenforceable by definition** | n/a — substrate has no visibility | partial mitigations: V08-PE-1 mandatory-hook + V08-PE-6 TPM-bound binary integrity | **#697** V08-PE-1, V08-PE-6 |
-| Hard-crash-lost deferred events | **Gap** — process-local queue | rows drop silently on SIGKILL between verdict and drain | persistent on-disk queue closes the gap | **#697** V08-PE-4 |
+| Hard-crash-lost deferred events | **Closed by PE-4** — persistent per-occurrence spool | recovery replays content-bound occurrences before hooks go live; stable occurrence IDs make retry idempotent | spool is bounded to 4,096 entries / 32 MiB; exhausted or unavailable admission blocks the governed action and records bounded overflow evidence | **#697** V08-PE-4 shipped |
 
 ---
 
@@ -223,13 +224,15 @@ Cold-honest gaps, every one tracked at **#697**:
   audit row writes so deadlock is structurally impossible. The
   handler-layer `AuditAction::Store` row on the failure leg is also
   emitted to the JSON audit log per [`audit-trail.md`](./audit-trail.html).
-  Hard-crash loss is the only remaining gap (process-local queue),
-  closed by V08-PE-4 in v0.8.0.
-- **Hard-crash-lost deferred events.** PE-3's queue is
-  process-local. A SIGKILL / OOM / power loss between the verdict
-  and the drain task's `append_signed_event` call loses pending
-  rows. V08-PE-4 closes the gap with a persistent on-disk queue
-  durable across daemon restart.
+  PE-4 closes the former hard-crash gap: the request path fsyncs a private,
+  per-occurrence spool record before in-memory delivery. Boot recovery runs
+  before hooks go live, is content-bound and idempotent, and removes a spool
+  record only after durable chain or DLQ residence.
+- **Hard-crash-lost deferred events — closed by PE-4.** The spool is bounded
+  to 4,096 entries / 32 MiB and serialized across daemon/MCP processes.
+  Admission or recovery failure never falls back to a volatile queue: the
+  action remains blocked, and quota exhaustion leaves bounded
+  timestamp/occurrence/payload-hash overflow evidence for operators.
 
 ---
 
@@ -474,8 +477,9 @@ row in §2:
 - **V08-PE-2** Read-action gating — closes the "Read actions" row.
 - **V08-PE-3** Subprocess-chain visibility — closes the "subprocess
   actions" row.
-- **V08-PE-4** Persistent audit queue — closes the "hard-crash
-  drainer loss" row.
+- **V08-PE-4 — SHIPPED.** Persistent audit queue closes the former
+  "hard-crash drainer loss" row with bounded durable admission,
+  recovery-before-live, and fail-closed overflow handling.
 - **V08-PE-5** Severity-based human escalation — adds the Escalate
   verdict, closes the "no human escalation" gap.
 - **V08-PE-6** TPM-bound binary integrity — closes the "out-of-band"
