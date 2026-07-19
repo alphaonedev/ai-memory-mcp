@@ -108,6 +108,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.61.2",
  "wiremock",
  "x25519-dalek",
  "zeroize",

@@ -69,7 +69,7 @@ recovery-before-live path. See §4.
 | Read actions (`memory_recall` / `memory_search` / `memory_list` / `memory_get` / `memory_session_boot`) | **Governance-evaluable today.** With enabled `read_action` rules, each decision is best-effort chain-logged; the zero-rule fast path emits nothing | `event_type = "governance.check"`, canonical action is `AgentAction::Read { surface, namespace, query }` plus the decision | audit-append failure logs a warning and the read proceeds by intentional split fail-posture; a blocking rule verdict itself remains fail-closed | **#697** V08-PE-2 shipped |
 | Subprocess actions from Bash spawn chain (fork→exec under a permitted shell) | **NOT visible** to the engine | n/a — a future kernel-side probe would emit `event_type = "process.spawn_chain"` | invisible to the substrate without a kernel-side probe | **#697** V08-PE-3 |
 | Out-of-band agent actions | **Unenforceable by definition** | n/a — substrate has no visibility | shipped partial mitigation: V08-PE-1 mandatory-hook presence; future mitigation: V08-PE-6 TPM-bound binary integrity | **#697** V08-PE-1, V08-PE-6 |
-| Hard-crash-lost deferred events | **Closed for admitted occurrences by PE-4** — persistent per-occurrence spool | recovery replays content-bound occurrences before hooks go live; stable occurrence IDs make retry idempotent | spool is bounded to 4,096 entries / 32 MiB; quota exhaustion blocks the action and records bounded overflow evidence, while other unavailable-admission failures block and emit operational errors | **#697** V08-PE-4 shipped |
+| Hard-crash-lost deferred events | **Closed for admitted occurrences by PE-4** — persistent per-occurrence spool | recovery replays content-bound occurrences before hooks go live; stable occurrence IDs make retry idempotent; artifacts require exact effective-UID modes on Unix or a protected current-token-owner-only DACL validated by handle on Windows | spool is bounded to 4,096 entries / 32 MiB; quota exhaustion blocks the action and records bounded overflow evidence, while other unavailable-admission failures block and emit operational errors | **#697** V08-PE-4 shipped |
 
 ---
 
@@ -188,7 +188,35 @@ Comprehensive list for the current release branch:
   itself emits a row at boot identifying the from-version /
   to-version transition.
 
-### 4.1 v0.7.0 V-4 closeout — SQL-side hash chain
+### 4.1 Windows upgrade recovery for legacy deferred-audit artifacts
+
+The v1.0.0 Windows policy deliberately rejects deferred-audit journals,
+`.spool` directories, locks, and spool children created by earlier builds with
+inherited or otherwise noncanonical DACLs. Rejection is fail-closed and does
+not repair, import, or delete those artifacts: a formerly broad DACL could
+have allowed another local account to plant evidence.
+
+Before upgrading a Windows installation that has deferred-audit artifacts:
+
+1. Stop every `ai-memory` process that can access the database.
+2. Preserve a forensic copy of the legacy journal and its adjacent `.spool`
+   directory. Inspect the spool for pending `.event`, `.pending`, `.probe`, and
+   `.overflow-*` evidence before changing anything.
+3. Do not edit the old ACLs and then trust the files in place. If pending
+   evidence is trusted and must be recovered, replay it with the previously
+   deployed, signed binary while the installation is isolated, then stop that
+   binary again. v1.0.0 has no offline ACL migration/import command.
+4. After evidence disposition, move—not silently delete—the complete legacy
+   journal and `.spool` directory to the forensic holding location.
+5. Start v1.0.0. It atomically creates a new journal, spool, lock, and children
+   with the protected current-token-owner-only policy. Retain the moved legacy
+   evidence according to the site's audit-retention procedure.
+
+An opening error after upgrade is therefore an operator-visible evidence
+disposition event, not a prompt to grant broader permissions or auto-repair
+the old tree.
+
+### 4.2 v0.7.0 V-4 closeout — SQL-side hash chain
 
 The v0.7.0 [Policy Engine](https://github.com/alphaonedev/ai-memory-mcp/issues/693)
 validation pass flagged V-4 (substrate-authority cross-row chain

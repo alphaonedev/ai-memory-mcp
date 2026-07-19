@@ -402,6 +402,11 @@ libc = "0.2"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Deferred-audit crash evidence is created with an explicit protected DACL and
+# validated by handle on Windows. Keep the Win32 surface target-only.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+
 [[bench]]
 name = "recall"
 harness = false

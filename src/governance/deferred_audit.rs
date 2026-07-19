@@ -78,6 +78,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
+
+#[cfg(windows)]
+#[path = "deferred_audit_windows.rs"]
+mod windows_private;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
@@ -433,7 +437,7 @@ impl DeferredAuditJournal {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let spool_dir = journal_spool_dir(&path);
-        create_or_validate_spool_dir(&spool_dir)?;
+        let (_spool_created, spool_directory) = create_or_validate_spool_dir(&spool_dir)?;
         let spool_metadata = std::fs::symlink_metadata(&spool_dir)
             .context("inspect deferred-audit spool directory")?;
         if !spool_metadata.is_dir() || spool_metadata.file_type().is_symlink() {
@@ -442,7 +446,7 @@ impl DeferredAuditJournal {
         let file = open_or_create_private_file(&path, "deferred-audit journal")?;
         let lock_path = spool_dir.join(".lock");
         let spool_lock = open_or_create_private_file(&lock_path, "deferred-audit spool lock")?;
-        let spool_identity = same_file::Handle::from_path(&spool_dir)
+        let spool_identity = same_file::Handle::from_file(spool_directory)
             .context("capture deferred-audit spool directory identity")?;
         let lock_identity = same_file::Handle::from_file(spool_lock.try_clone()?)
             .context("capture deferred-audit spool lock identity")?;
@@ -455,11 +459,23 @@ impl DeferredAuditJournal {
             let entry = entry.context("read deferred-audit spool entry")?;
             let entry_path = entry.path();
             if is_publication_probe(&entry_path) {
+                #[cfg(windows)]
+                windows_private::open_private_file(
+                    &entry_path,
+                    "deferred-audit publication probe",
+                    false,
+                )?;
                 std::fs::remove_file(&entry_path)
                     .context("remove abandoned deferred-audit publication probe")?;
                 continue;
             }
             if entry_path.extension().is_some_and(|ext| ext == "pending") {
+                #[cfg(windows)]
+                windows_private::open_private_file(
+                    &entry_path,
+                    "deferred-audit pending frame",
+                    false,
+                )?;
                 let entry_type = entry
                     .file_type()
                     .context("inspect deferred-audit pending frame type")?;
@@ -520,6 +536,12 @@ impl DeferredAuditJournal {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with(JOURNAL_OVERFLOW_PREFIX))
             {
+                #[cfg(windows)]
+                windows_private::open_private_file(
+                    &entry_path,
+                    "deferred-audit overflow marker",
+                    false,
+                )?;
                 overflow_markers += 1;
             }
             if entry_path.extension().is_some_and(|ext| ext == "event") {
@@ -606,16 +628,9 @@ impl DeferredAuditJournal {
             let staging_path = self
                 .spool_dir
                 .join(format!(".{}.pending", uuid::Uuid::new_v4()));
-            let mut options = OpenOptions::new();
-            options.create_new(true).write(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut staging = options
-                .open(&staging_path)
-                .context("journal spool append: create staging")?;
+            let mut staging =
+                create_new_private_file(&staging_path, "deferred-audit spool staging frame")
+                    .context("journal spool append: create staging")?;
             let staged = (|| -> Result<()> {
                 staging
                     .write_all(&frame)
@@ -826,7 +841,7 @@ fn journal_spool_dir(journal_path: &Path) -> PathBuf {
     PathBuf::from(spool_os)
 }
 
-fn create_or_validate_spool_dir(spool_dir: &Path) -> Result<bool> {
+fn create_or_validate_spool_dir(spool_dir: &Path) -> Result<(bool, File)> {
     let created = {
         #[cfg(unix)]
         {
@@ -845,6 +860,20 @@ fn create_or_validate_spool_dir(spool_dir: &Path) -> Result<bool> {
         }
         #[cfg(not(unix))]
         {
+            #[cfg(windows)]
+            {
+                let (directory, created) =
+                    windows_private::create_or_open_private_directory(spool_dir)?;
+                if created {
+                    let parent = spool_dir
+                        .parent()
+                        .filter(|path| !path.as_os_str().is_empty());
+                    let parent = parent.unwrap_or_else(|| Path::new("."));
+                    sync_directory(parent).context("fsync deferred-audit spool parent")?;
+                }
+                return Ok((created, directory));
+            }
+            #[cfg(not(windows))]
             match std::fs::create_dir(spool_dir) {
                 Ok(()) => true,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
@@ -863,7 +892,7 @@ fn create_or_validate_spool_dir(spool_dir: &Path) -> Result<bool> {
         anyhow::bail!("deferred-audit spool path is not a trusted directory");
     }
     #[cfg(unix)]
-    {
+    let directory = {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         let directory = open_directory_handle(spool_dir)?;
@@ -878,7 +907,8 @@ fn create_or_validate_spool_dir(spool_dir: &Path) -> Result<bool> {
         if metadata.permissions().mode() & 0o777 != 0o700 {
             anyhow::bail!("deferred-audit spool directory is not private to the daemon uid");
         }
-    }
+        directory
+    };
     if created && let Some(parent) = spool_dir.parent() {
         let parent = if parent.as_os_str().is_empty() {
             Path::new(".")
@@ -887,7 +917,13 @@ fn create_or_validate_spool_dir(spool_dir: &Path) -> Result<bool> {
         };
         sync_directory(parent).context("fsync deferred-audit spool parent")?;
     }
-    Ok(created)
+    #[cfg(unix)]
+    return Ok((created, directory));
+    #[cfg(not(any(unix, windows)))]
+    {
+        let directory = File::open(spool_dir)?;
+        Ok((created, directory))
+    }
 }
 
 struct SpoolLockGuard<'a>(&'a File);
@@ -942,17 +978,11 @@ fn validate_atomic_publication(spool_dir: &Path) -> Result<()> {
     let probe_id = uuid::Uuid::new_v4();
     let staging = spool_dir.join(format!(".{probe_id}.pending"));
     let published = spool_dir.join(format!(".{probe_id}.probe"));
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
     let result = (|| -> Result<()> {
-        options.open(&staging)?.sync_all()?;
+        create_new_private_file(&staging, "deferred-audit publication probe")?.sync_all()?;
         std::fs::hard_link(&staging, &published)
             .context("deferred-audit spool lacks atomic no-replace publication")?;
+        open_frame_file(&published).context("validate deferred-audit publication probe")?;
         std::fs::remove_file(&published)?;
         std::fs::remove_file(&staging)?;
         sync_directory(spool_dir)
@@ -976,20 +1006,21 @@ fn is_publication_probe(path: &Path) -> bool {
 }
 
 fn create_private_marker(path: &Path, content: &[u8]) -> Result<bool> {
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    match options.open(path) {
+    match create_new_private_file(path, "deferred-audit overflow marker") {
         Ok(mut file) => {
             file.write_all(content)?;
             file.sync_all()?;
             Ok(true)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists) =>
+        {
+            #[cfg(windows)]
+            windows_private::open_private_file(path, "deferred-audit overflow marker", false)?;
+            Ok(false)
+        }
         Err(error) => Err(error).context("create deferred-audit overflow marker"),
     }
 }
@@ -1101,12 +1132,19 @@ fn read_journal_frame_bounded(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn open_frame_file(path: &Path) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    apply_no_follow(&mut options);
-    let file = options.open(path)?;
-    ensure_regular_file(&file, "journal frame")?;
-    Ok(file)
+    #[cfg(windows)]
+    {
+        return windows_private::open_private_file(path, "deferred-audit journal frame", false);
+    }
+    #[cfg(not(windows))]
+    {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        apply_no_follow(&mut options);
+        let file = options.open(path)?;
+        ensure_regular_file(&file, "journal frame")?;
+        Ok(file)
+    }
 }
 
 fn ensure_regular_file(file: &File, label: &str) -> Result<()> {
@@ -1117,41 +1155,69 @@ fn ensure_regular_file(file: &File, label: &str) -> Result<()> {
 }
 
 fn open_or_create_private_file(path: &Path, label: &str) -> Result<File> {
-    let open = |create_new: bool| -> std::io::Result<File> {
+    #[cfg(windows)]
+    {
+        return windows_private::open_or_create_private_file(path, label);
+    }
+    #[cfg(not(windows))]
+    {
+        let open = |create_new: bool| -> std::io::Result<File> {
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create_new(create_new);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            apply_no_follow(&mut options);
+            options.open(path)
+        };
+        let file = match open(true) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                open(false).with_context(|| format!("open existing {label} {}", path.display()))?
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("create {label} {}", path.display()));
+            }
+        };
+        ensure_regular_file(&file, label)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+            let metadata = file
+                .metadata()
+                .with_context(|| format!("inspect {label}"))?;
+            // SAFETY: geteuid has no preconditions and only reads process credentials.
+            let effective_uid = unsafe { libc::geteuid() };
+            if metadata.uid() != effective_uid || metadata.permissions().mode() & 0o777 != 0o600 {
+                anyhow::bail!("{label} is not private to the daemon uid");
+            }
+        }
+        Ok(file)
+    }
+}
+
+fn create_new_private_file(path: &Path, label: &str) -> Result<File> {
+    #[cfg(windows)]
+    {
+        return windows_private::create_new_private_file(path, label);
+    }
+    #[cfg(not(windows))]
+    {
         let mut options = OpenOptions::new();
-        options.read(true).write(true).create_new(create_new);
+        options.create_new(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
         apply_no_follow(&mut options);
-        options.open(path)
-    };
-    let file = match open(true) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            open(false).with_context(|| format!("open existing {label} {}", path.display()))?
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("create {label} {}", path.display()));
-        }
-    };
-    ensure_regular_file(&file, label)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-        let metadata = file
-            .metadata()
-            .with_context(|| format!("inspect {label}"))?;
-        // SAFETY: geteuid has no preconditions and only reads process credentials.
-        let effective_uid = unsafe { libc::geteuid() };
-        if metadata.uid() != effective_uid || metadata.permissions().mode() & 0o777 != 0o600 {
-            anyhow::bail!("{label} is not private to the daemon uid");
-        }
+        options
+            .open(path)
+            .with_context(|| format!("create private {label} {}", path.display()))
     }
-    Ok(file)
 }
 
 fn verify_spool_identity(
@@ -3712,7 +3778,11 @@ mod tests {
                 .unwrap();
         journal.append(&ev).unwrap();
         let pending = journal.spool_dir.join(".crash.pending");
-        std::fs::write(&pending, b"partial").unwrap();
+        let mut pending_file =
+            create_new_private_file(&pending, "test deferred-audit staging frame").unwrap();
+        pending_file.write_all(b"partial").unwrap();
+        pending_file.sync_all().unwrap();
+        drop(pending_file);
         drop(journal);
         let reopened = DeferredAuditJournal::open(&journal_path).unwrap();
         assert!(
@@ -3737,11 +3807,13 @@ mod tests {
         )
         .unwrap();
         let pending = journal.spool_dir.join(".crash.pending");
-        std::fs::write(
-            &pending,
-            journal_frame(&event.canonical_bytes().unwrap()).unwrap(),
-        )
-        .unwrap();
+        let mut pending_file =
+            create_new_private_file(&pending, "test deferred-audit staging frame").unwrap();
+        pending_file
+            .write_all(&journal_frame(&event.canonical_bytes().unwrap()).unwrap())
+            .unwrap();
+        pending_file.sync_all().unwrap();
+        drop(pending_file);
         drop(journal);
         let reopened = DeferredAuditJournal::open(&journal_path).unwrap();
         assert!(!pending.exists());
@@ -3759,7 +3831,10 @@ mod tests {
         let probe = journal
             .spool_dir
             .join(format!(".{}.probe", uuid::Uuid::new_v4()));
-        std::fs::write(&probe, b"").unwrap();
+        create_new_private_file(&probe, "test deferred-audit publication probe")
+            .unwrap()
+            .sync_all()
+            .unwrap();
         drop(journal);
 
         let reopened = DeferredAuditJournal::open(&journal_path).unwrap();
@@ -3773,7 +3848,7 @@ mod tests {
         let journal_path = dir.path().join("oversized-pending.journal");
         let journal = DeferredAuditJournal::open(&journal_path).unwrap();
         let pending = journal.spool_dir.join(".oversized.pending");
-        let file = File::create(&pending).unwrap();
+        let file = create_new_private_file(&pending, "test deferred-audit staging frame").unwrap();
         file.set_len(JOURNAL_MAX_FRAME_BYTES + 1).unwrap();
         drop(file);
         drop(journal);
@@ -3795,7 +3870,8 @@ mod tests {
         )
         .unwrap();
         let event_path = journal.spool_path(event.occurrence_id.as_deref().unwrap());
-        let file = File::create(event_path).unwrap();
+        let file =
+            create_new_private_file(&event_path, "test deferred-audit journal frame").unwrap();
         file.set_len(JOURNAL_MAX_FRAME_BYTES + 1).unwrap();
         drop(file);
 
@@ -3897,7 +3973,7 @@ mod tests {
             let spool = PathBuf::from(std::env::var_os(SPOOL_ENV).unwrap());
             // SAFETY: umask accepts every mode value and returns the prior mask.
             let previous = unsafe { libc::umask(0) };
-            let created = create_or_validate_spool_dir(&spool).unwrap();
+            let (created, _directory) = create_or_validate_spool_dir(&spool).unwrap();
             // SAFETY: restoring the mask returned by umask has no preconditions.
             unsafe { libc::umask(previous) };
             assert!(created);
@@ -3989,6 +4065,112 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn journal_windows_artifacts_use_protected_owner_only_dacls() {
+        let dir = fresh_tempdir();
+        let path = dir.path().join("windows-private.journal");
+        let event = DeferredAuditEvent::from_refusal(
+            "agent:windows-private",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        let journal = DeferredAuditJournal::open(&path).unwrap();
+        journal.append(&event).unwrap();
+
+        windows_private::validate_private_path_for_test(&journal.spool_dir, true).unwrap();
+        windows_private::validate_private_path_for_test(&path, false).unwrap();
+        windows_private::validate_private_path_for_test(&journal.lock_path, false).unwrap();
+        windows_private::validate_private_path_for_test(
+            &journal.spool_path(event.occurrence_id.as_deref().unwrap()),
+            false,
+        )
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn journal_windows_rejects_permissive_preplanted_artifacts() {
+        let dir = fresh_tempdir();
+
+        let spool_journal = dir.path().join("permissive-spool.journal");
+        let spool = journal_spool_dir(&spool_journal);
+        windows_private::create_permissive_path_for_test(&spool, true).unwrap();
+        assert!(DeferredAuditJournal::open(&spool_journal).is_err());
+
+        let legacy = dir.path().join("permissive-legacy.journal");
+        windows_private::create_permissive_path_for_test(&legacy, false).unwrap();
+        assert!(DeferredAuditJournal::open(&legacy).is_err());
+
+        let lock_journal = dir.path().join("permissive-lock.journal");
+        let lock_spool = journal_spool_dir(&lock_journal);
+        let (_created, directory) = create_or_validate_spool_dir(&lock_spool).unwrap();
+        drop(directory);
+        windows_private::create_permissive_path_for_test(&lock_spool.join(".lock"), false).unwrap();
+        assert!(DeferredAuditJournal::open(&lock_journal).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn journal_windows_rejects_permissive_event_and_marker_preplants() {
+        let dir = fresh_tempdir();
+        let path = dir.path().join("permissive-spool-files.journal");
+        let event = DeferredAuditEvent::from_refusal(
+            "agent:windows-preplant",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        let journal = DeferredAuditJournal::open(&path).unwrap();
+        journal.append(&event).unwrap();
+        let event_path = journal.spool_path(event.occurrence_id.as_deref().unwrap());
+        let marker = journal
+            .spool_dir
+            .join(format!("{JOURNAL_OVERFLOW_PREFIX}000"));
+        drop(journal);
+
+        std::fs::remove_file(&event_path).unwrap();
+        windows_private::create_permissive_path_for_test(&event_path, false).unwrap();
+        assert!(DeferredAuditJournal::open(&path).is_err());
+
+        std::fs::remove_file(&event_path).unwrap();
+        windows_private::create_permissive_path_for_test(&marker, false).unwrap();
+        assert!(create_private_marker(&marker, b"must not be suppressed").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn journal_windows_rejects_legacy_inherited_and_noncanonical_dacls_without_repair() {
+        let dir = fresh_tempdir();
+
+        let legacy_dir = dir.path().join("legacy-parent");
+        let inherited = legacy_dir.join("legacy-inherited.event");
+        windows_private::create_legacy_inherited_file_for_test(&legacy_dir, &inherited).unwrap();
+        assert!(windows_private::validate_private_path_for_test(&inherited, false).is_err());
+        assert!(
+            inherited.exists(),
+            "rejection must not delete legacy evidence"
+        );
+        assert!(windows_private::validate_private_path_for_test(&inherited, false).is_err());
+
+        let extra_ace = dir.path().join("extra-ace.event");
+        windows_private::create_extra_ace_path_for_test(&extra_ace).unwrap();
+        assert!(windows_private::validate_private_path_for_test(&extra_ace, false).is_err());
+        assert!(
+            extra_ace.exists(),
+            "rejection must not repair or delete evidence"
+        );
+
+        let null_dacl = dir.path().join("null-dacl.event");
+        windows_private::create_null_dacl_path_for_test(&null_dacl).unwrap();
+        assert!(windows_private::validate_private_path_for_test(&null_dacl, false).is_err());
+        assert!(
+            null_dacl.exists(),
+            "rejection must not repair or delete evidence"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn journal_windows_publish_ack_and_reopen_runtime() {
         let dir = fresh_tempdir();
         let path = dir.path().join("windows-durability.journal");
@@ -4022,7 +4204,8 @@ mod tests {
         // Populate the filesystem itself because admission deliberately rescans
         // under the OS lock instead of trusting the process-local cache.
         let quota_filler = journal.spool_dir.join("quota-filler.event");
-        let filler = File::create(&quota_filler).unwrap();
+        let filler =
+            create_new_private_file(&quota_filler, "test deferred-audit journal frame").unwrap();
         filler.set_len(JOURNAL_SPOOL_MAX_BYTES).unwrap();
         filler.sync_all().unwrap();
         journal.sync_spool_dir().unwrap();
@@ -4118,8 +4301,11 @@ mod tests {
         let mut index = 0_u32;
         while remaining > 0 {
             let chunk = remaining.min(JOURNAL_MAX_FRAME_BYTES);
-            let filler =
-                File::create(journal.spool_dir.join(format!("filler-{index}.event"))).unwrap();
+            let filler = create_new_private_file(
+                &journal.spool_dir.join(format!("filler-{index}.event")),
+                "test deferred-audit journal frame",
+            )
+            .unwrap();
             filler.set_len(chunk).unwrap();
             remaining -= chunk;
             index += 1;
@@ -4184,7 +4370,8 @@ mod tests {
         let journal = DeferredAuditJournal::open(&journal_path).unwrap();
         let displaced = journal.spool_dir.join(".lock.displaced");
         std::fs::rename(&journal.lock_path, &displaced).unwrap();
-        let replacement = File::create(&journal.lock_path).unwrap();
+        let replacement =
+            create_new_private_file(&journal.lock_path, "test replacement spool lock").unwrap();
         fs2::FileExt::lock_exclusive(&replacement).unwrap();
         let event = DeferredAuditEvent::from_refusal(
             "agent:replaced-lock",

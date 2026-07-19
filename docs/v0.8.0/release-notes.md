@@ -307,13 +307,19 @@ cognitive counterpart in the memory store itself.
   send; `recover_deferred_audit` replays un-drained records into
   `signed_events` at boot (content-bound and idempotent on stable occurrence
   ID, with legacy payload-hash cardinality compatibility). Spool entries are
-  atomically published with private permissions, bounded to 4,096 entries / 32
+  atomically published with owner-private permissions (exact effective-UID
+  modes on Unix; protected current-token-owner-only DACLs validated by handle
+  on Windows), bounded to 4,096 entries / 32
   MiB, and acknowledged only after durable chain or DLQ residence. Quota
   exhaustion records bounded timestamp/occurrence/hash overflow evidence and
   refuses unjournaled delivery; production governance callers propagate that
   failure and keep the action blocked. Recovery/journal-open failure returns a
   closed queue rather than a volatile fallback. Wired into both
-  `serve` and `mcp` boot paths.
+  `serve` and `mcp` boot paths. Earlier Windows builds created inherited-DACL
+  artifacts that v1.0.0 intentionally rejects without repair; follow the
+  stop/preserve/inspect/prior-signed-binary recovery/move-aside/restart runbook
+  in `docs/security/audit-trail-coverage.md` before upgrading an installation
+  with an existing deferred-audit journal or spool.
 
 ## Other notable changes
 
