@@ -60,10 +60,10 @@ fn v74_columns_and_version_both_backends() {
         db::migrations::current_schema_version_for_tests(),
         "fresh open reaches the current schema tip"
     );
-    // Tip pin: the ladder head advanced to v82 (#2024 skill retire columns;
-    // was v81 = #1831 threshold-key-recovery) — the v74 cid columns asserted
-    // below still exist, only the tip moved.
-    assert_eq!(db::migrations::current_schema_version_for_tests(), 85);
+    // Tip pin: the ladder head advanced to v86 (#1834 pre-ship 3x7
+    // valid-time canonicalization; was v85 = #2035 archive valid-time) —
+    // the v74 cid columns asserted below still exist, only the tip moved.
+    assert_eq!(db::migrations::current_schema_version_for_tests(), 86);
     // The additive columns exist and are queryable.
     assert!(
         conn.prepare("SELECT cid, cid_genesis FROM memories LIMIT 0")
@@ -76,7 +76,7 @@ fn v74_columns_and_version_both_backends() {
     let conn2 = db::open(&path).unwrap();
     assert_eq!(
         schema_version(&conn2),
-        85,
+        86,
         "re-open stays at the current tip idempotently"
     );
     assert!(

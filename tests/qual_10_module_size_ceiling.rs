@@ -821,7 +821,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // + two live-PG parity tests (each with the F1 delete-on-restore pin).
     // Combined with the #2207 VALID-time reads, the merged file lands above
     // 28_000; ceiling bumped 28_000 -> 28_200 to hold both additions.
-    ("src/store/postgres.rs", 28_200),
+    // 2026-07-19 (#1834 pre-ship 3x7): the v86 valid-time canonicalization
+    // migration (migrate_v86 + funnel canonicalization comments) lands
+    // postgres.rs at 28_203; ceiling bumped 28_200 -> 28_300.
+    ("src/store/postgres.rs", 28_300),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -1143,7 +1146,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // coverage tests (bind/revoke × json/non-json + empty-token error) to clear
     // the daemon_runtime.rs per-module COVERAGE floor. Combined with #2045 L6
     // this lands daemon_runtime.rs at 10_676; ceiling 10_500 → 10_750.
-    ("src/daemon_runtime.rs", 10_900), /* 2026-07-17 #2167 extract run_sqlite_embedding_space_boot_maintenance helper + both-open-arms unit test to cover the boot-open Err arm (10_783). 2026-07-19 #2064 erasure gc-tick wiring stacked on the #2205 export --full + #1860 vectorlite serve/mcp boot funnels lands the merged file at 10_853; ceiling 10_850 -> 10_900 (lockstep). */
+    ("src/daemon_runtime.rs", 11_000), /* 2026-07-17 #2167 extract run_sqlite_embedding_space_boot_maintenance helper + both-open-arms unit test to cover the boot-open Err arm (10_783). 2026-07-19 #2064 erasure gc-tick wiring stacked on the #2205 export --full + #1860 vectorlite serve/mcp boot funnels lands the merged file at 10_853; ceiling 10_850 -> 10_900 (lockstep). 2026-07-19 pre-ship 3x7: erasure sweep moved OFF the handler mutex (detached spawn_blocking arm + shared log helper) lands the file at 10_931; ceiling 10_900 -> 10_950 (lockstep). 2026-07-19 merged with the #2233/#2235 lineage boot-seed (+26) -> 10_957; ceiling 10_950 -> 11_000 (lockstep). */
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
@@ -1236,7 +1239,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-17 (#2167 S1): the v84 embedding_space migration arm + SCHEMA
     // column doc land migrations.rs at 5_446; ceiling 5_450 (+4 headroom).
     // Additive ALTER-ADD-COLUMN migration only.
-    ("src/storage/migrations.rs", 5_550), /* 2026-07-18 #2035 v85 archived_memories valid_from/valid_until migration arm (5_491) */
+    ("src/storage/migrations.rs", 5_650), /* 2026-07-19 #1834 pre-ship 3x7 v86 valid-time canonicalization arm + normalize_valid_time_rows helper (5_569); was 5_550 (2026-07-18 #2035 v85 arm, 5_491) */
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.

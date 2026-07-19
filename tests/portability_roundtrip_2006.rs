@@ -42,7 +42,11 @@ fn durable_memory() -> Memory {
         tags: vec!["alpha".into(), "beta".into()],
         priority: 7,
         confidence: 0.9,
-        source: "test".into(),
+        // Pre-ship 3x7 HIGH-2: must be a `validate::VALID_SOURCES` member —
+        // the v2 importer now runs the L1-parity `validate_memory` gate,
+        // and the historical `"test"` value was only importable because
+        // the v2 route ran zero validation.
+        source: "system".into(),
         created_at: now.clone(),
         updated_at: now,
         memory_kind: MemoryKind::Decision,

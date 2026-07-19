@@ -1172,6 +1172,13 @@ fn insert_inner(conn: &Connection, mem: &Memory, stamp_local_clock: bool) -> Res
     // keeps its own genesis (DO UPDATE SET cid = memories.cid), so this
     // pair only lands on a fresh genesis INSERT.
     let cid_stamp = crate::identity::cid::stamp_memory_cid(mem);
+    // v1.0.0 #1834 (pre-ship 3x7) — canonicalize the claim-bitemporal
+    // VALID-time bounds at the storage funnel so every caller (MCP / HTTP /
+    // CLI / federation / import / curator) persists the ONE fixed UTC
+    // rendering byte comparison is correct against. See
+    // `validate::canonicalize_valid_time`.
+    let valid_from_canon = crate::validate::canonical_valid_time_opt(mem.valid_from.as_deref());
+    let valid_until_canon = crate::validate::canonical_valid_time_opt(mem.valid_until.as_deref());
     // #1579 B6 — `insert` is the hottest write statement in the
     // substrate (every store / upsert / capture-turn / federation push
     // lands here). `prepare_cached` skips the re-parse of this ~60-line
@@ -1329,8 +1336,8 @@ fn insert_inner(conn: &Connection, mem: &Memory, stamp_local_clock: bool) -> Res
             cid_stamp.cid,
             cid_stamp.genesis,
             kind_provenance_col,
-            mem.valid_from,
-            mem.valid_until,
+            valid_from_canon,
+            valid_until_canon,
         ],
         |r| r.get(0),
     )?;
@@ -1788,9 +1795,11 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
                     mem.confidence_source.as_str(), confidence_signals_json, mem.confidence_decayed_at,
                     mentioned_entity_id, mem.lifecycle_state.as_str(), encrypted_envelope,
                     cid_stamp.cid, cid_stamp.genesis,
-                    // v1.0.0 #1834 — claim-bitemporal validity replicates verbatim
-                    // (federation carries a claim's asserted validity window).
-                    mem.valid_from, mem.valid_until,
+                    // v1.0.0 #1834 — claim-bitemporal validity, canonicalized
+                    // to the fixed UTC rendering at this funnel (pre-ship 3x7)
+                    // so the TEXT predicates compare instants correctly.
+                    crate::validate::canonical_valid_time_opt(mem.valid_from.as_deref()),
+                    crate::validate::canonical_valid_time_opt(mem.valid_until.as_deref()),
                 ],
                 |r| r.get(0),
             ).map_err(|e| {
@@ -2473,6 +2482,13 @@ pub fn update_with_expected_version(
     };
     drop(rows);
     drop(stmt);
+
+    // v1.0.0 #1834 (pre-ship 3x7) — canonicalize the opt-in `valid_until`
+    // patch at this funnel so the close instant persists in the fixed UTC
+    // rendering the TEXT predicates compare correctly (a `Z`/offset-rendered
+    // close would otherwise mis-order against a canonical `valid_at`).
+    let valid_until_canon = crate::validate::canonical_valid_time_opt(valid_until);
+    let valid_until = valid_until_canon.as_deref();
 
     // v0.7.0 Provenance Gap 1 (#884) — pre-check optimistic gate.
     // The same predicate is also asserted atomically inside the
@@ -5260,8 +5276,12 @@ pub fn build_list_query(
     // in the dynamic sequential param order.
     if let Some(v) = valid_at {
         sql.push_str(" AND (valid_from IS NULL OR valid_from <= ?) AND (valid_until IS NULL OR valid_until > ?)");
-        params_vec.push(Box::new(v.to_string()));
-        params_vec.push(Box::new(v.to_string()));
+        // Pre-ship 3x7 (#1834) — bind the CANONICAL fixed-UTC rendering so
+        // the lexicographic TEXT comparison is exactly instant comparison
+        // (stored bounds are canonicalized at the write funnels + v86).
+        let v_canon = crate::validate::canonicalize_valid_time(v).unwrap_or_else(|| v.to_string());
+        params_vec.push(Box::new(v_canon.clone()));
+        params_vec.push(Box::new(v_canon));
     }
     // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list hides
     // Tombstoned/Quarantined (and any unknown state) from list. No alias in
@@ -5974,6 +5994,11 @@ pub fn recall(
 ) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
     let now = Utc::now().to_rfc3339();
     let fts_query = sanitize_fts_query(context, true);
+    // Pre-ship 3x7 (#1834) — canonicalize the AS-OF instant before the ?13
+    // TEXT bind so byte comparison against the canonical stored bounds is
+    // exactly instant comparison (Z vs +00:00 vs non-UTC offsets).
+    let valid_at_canon = crate::validate::canonical_valid_time_opt(valid_at);
+    let valid_at = valid_at_canon.as_deref();
     let (vis_p, vis_t, vis_u, vis_o) = compute_visibility_prefixes(as_agent);
 
     // Task 1.12: hierarchy expansion. If `namespace` is hierarchical (contains
@@ -12760,8 +12785,11 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             encrypted_envelope,
             cid_stamp.cid,
             cid_stamp.genesis,
-            mem.valid_from,
-            mem.valid_until,
+            // v1.0.0 #1834 (pre-ship 3x7) — canonical fixed-UTC rendering at
+            // the federation-receive funnel too, so a peer's `Z` / offset
+            // rendering can never mis-order against a local `+00:00` row.
+            crate::validate::canonical_valid_time_opt(mem.valid_from.as_deref()),
+            crate::validate::canonical_valid_time_opt(mem.valid_until.as_deref()),
         ],
         |r| r.get(0),
     )?;
@@ -13019,9 +13047,11 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
             // CLOSED a claim replicates the close by id and replicas
             // converge). `valid_from` is local-immutable in `merge_memory`
             // (matches the `(title, namespace)` upsert arms' genesis-wins
-            // rule); carrying it verbatim here is a no-op overwrite.
-            mem.valid_from,
-            mem.valid_until,
+            // rule). Canonicalized at this funnel (pre-ship 3x7, #1834) so
+            // the merged interval lands in the fixed UTC rendering the TEXT
+            // predicates compare correctly.
+            crate::validate::canonical_valid_time_opt(mem.valid_from.as_deref()),
+            crate::validate::canonical_valid_time_opt(mem.valid_until.as_deref()),
             mem.id,
         ],
     )?;
@@ -15376,6 +15406,15 @@ fn recall_hybrid_with_telemetry_inner(
         source_uri_prefix,
         caller,
     );
+
+    // Pre-ship 3x7 (#1834) — canonicalize the AS-OF instant ONCE for the
+    // whole hybrid pipeline (FTS ?13 + semantic linear-scan ?11 SQL binds
+    // AND the HNSW Rust re-filter below) so the lexicographic TEXT/byte
+    // comparisons are exactly instant comparisons against the canonical
+    // stored bounds. Unparseable input keeps its bytes (surface validation
+    // already rejected it with a 400/typed error).
+    let valid_at_canon = crate::validate::canonical_valid_time_opt(valid_at);
+    let valid_at = valid_at_canon.as_deref();
 
     // Stage 2 — FTS5 keyword phase.
     let fts_results = fts_keyword_phase(conn, &prep, tags_filter, since, until, valid_at, limit)?;

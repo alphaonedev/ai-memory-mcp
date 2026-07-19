@@ -28,6 +28,10 @@
 //!   a failure, never a skip), with nothing persisted in every case.
 //! - (g) `#[cfg(feature = "sal-postgres")]` postgres parity: the same built
 //!   anchor inserted + read back through the pg SAL verifies identically.
+//! - (h) #2242 verify-before-countersign: a TAMPERED chain (sequence gap /
+//!   in-place middle-row edit) REFUSES the ceremony with the typed
+//!   `RefusedChainDirty` outcome and persists NOTHING; a clean chain still
+//!   emits normally (pin a).
 //!
 //! The witness key-dir / pubkey env vars are process-global, so every test
 //! serialises via a module-local lock and clears the env on exit (the #1822
@@ -366,6 +370,96 @@ fn unloadable_witness_custody_is_a_failure_not_a_skip() {
         )
         .expect("count");
     assert_eq!(n, 0, "nothing persists on a failed ceremony");
+    clear_witness_env();
+}
+
+// ── (h) #2242 — verify BEFORE countersign: a dirty chain REFUSES the ceremony ──
+
+/// #2242 — count the persisted `re_anchor` checkpoints (a refused ceremony
+/// must persist NOTHING).
+fn reanchor_checkpoint_count(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM checkpoints WHERE condition_type = ?1",
+        [ConditionType::ReAnchor.as_str()],
+        |r| r.get(0),
+    )
+    .expect("count")
+}
+
+/// #2242 — a MID-CHAIN sequence gap (deleted row) is tamper the verifier
+/// catches; the ceremony must REFUSE with the typed outcome instead of
+/// countersigning the surviving head (which would launder the deletion under
+/// a fresh signed anchor).
+#[test]
+fn reanchor_refuses_on_sequence_gap() {
+    let _g = lock();
+    let kdir = fresh_dir("i-keys");
+    let ddir = fresh_dir("i-db");
+    let _kp = enrol_witness(kdir.path());
+    let (_path, conn) = open_db(ddir.path());
+
+    append_rows(&conn, 5);
+    // Inject the tamper: delete a middle row → sequence gap (3, 3). Same
+    // injection shape as tests/verify_audit_trail_pe8.rs.
+    conn.execute("DELETE FROM signed_events WHERE sequence = 3", [])
+        .expect("inject gap");
+
+    match emit_reanchor_ceremony(&conn).expect("ceremony call itself is Ok") {
+        ReAnchorOutcome::RefusedChainDirty(detail) => {
+            assert!(
+                detail.contains("sequence gaps"),
+                "refusal detail names the tamper class, got: {detail}"
+            );
+        }
+        other => panic!("expected RefusedChainDirty, got {other:?}"),
+    }
+    assert_eq!(
+        reanchor_checkpoint_count(&conn),
+        0,
+        "a refused ceremony persists NO re-anchor checkpoint"
+    );
+    clear_witness_env();
+}
+
+/// #2242 — an IN-PLACE edit of a middle row (`payload_hash` rewrite) breaks the
+/// next row's `prev_hash` link; the ceremony must REFUSE, not countersign.
+#[test]
+fn reanchor_refuses_on_inplace_edit() {
+    let _g = lock();
+    let kdir = fresh_dir("j-keys");
+    let ddir = fresh_dir("j-db");
+    let _kp = enrol_witness(kdir.path());
+    let (_path, conn) = open_db(ddir.path());
+
+    append_rows(&conn, 5);
+    // Inject the tamper: rewrite a middle row's payload_hash → the recomputed
+    // canonical hash of row 3 no longer matches row 4's stored prev_hash.
+    conn.execute(
+        "UPDATE signed_events SET payload_hash = X'deadbeefdeadbeef' WHERE sequence = 3",
+        [],
+    )
+    .expect("inject in-place edit");
+
+    let outcome = emit_reanchor_ceremony(&conn).expect("ceremony call itself is Ok");
+    match &outcome {
+        ReAnchorOutcome::RefusedChainDirty(detail) => {
+            assert!(
+                detail.contains("hash-chain break"),
+                "refusal detail names the tamper class, got: {detail}"
+            );
+        }
+        other => panic!("expected RefusedChainDirty, got {other:?}"),
+    }
+    assert_eq!(
+        outcome.reason_tag(),
+        Some("chain_verification_failed"),
+        "the refusal carries the stable machine-readable reason tag"
+    );
+    assert_eq!(
+        reanchor_checkpoint_count(&conn),
+        0,
+        "a refused ceremony persists NO re-anchor checkpoint"
+    );
     clear_witness_env();
 }
 
