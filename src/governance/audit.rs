@@ -1194,6 +1194,56 @@ pub fn load_witness_signing_key() -> Result<Option<crate::identity::keypair::Age
     }
 }
 
+/// v1.0.0 #2004 (PR #2214 audit F4) — ceremony-grade disposition of the
+/// audit-witness custody. [`load_witness_signing_key`] deliberately collapses
+/// every non-signing state to `Ok(None)` (right for the THROTTLED background
+/// witness cadence, where a WARN log is the only appropriate signal). An
+/// EXPLICIT operator ceremony (`ai-memory audit re-anchor`) must instead
+/// distinguish the three states, because "skipped: nothing enrolled" and
+/// "your enrolled key is broken" demand different operator actions.
+#[derive(Debug)]
+pub enum WitnessCustody {
+    /// No custody at all — the dir is missing or holds no key material.
+    /// An opt-in feature that is simply not enrolled (skip, not an error).
+    Absent,
+    /// Key material EXISTS on disk but cannot produce a signature: corrupt /
+    /// wrong-length / lax-mode files, or a public-only custody (no `.priv`).
+    /// For an explicit ceremony this is a FAILURE to surface, never a skip —
+    /// the contained string is the load error detail (never key bytes).
+    Unloadable(String),
+    /// A signing-capable witness keypair loaded cleanly.
+    Signer(Box<crate::identity::keypair::AgentKeypair>),
+}
+
+/// Inspect the audit-witness custody for an EXPLICIT ceremony (spec §5.3).
+/// See [`WitnessCustody`] for the three-state contract. The background
+/// witness cadence keeps using [`load_witness_signing_key`] unchanged.
+///
+/// # Errors
+/// The witness key dir cannot be resolved (no OS config dir and no override).
+pub fn inspect_witness_custody() -> Result<WitnessCustody> {
+    let dir = witness_key_dir()?;
+    if !dir.exists() {
+        return Ok(WitnessCustody::Absent);
+    }
+    match crate::identity::keypair::load(WITNESS_KEY_LABEL, &dir) {
+        Ok(kp) if kp.can_sign() => Ok(WitnessCustody::Signer(Box::new(kp))),
+        Ok(_) => Ok(WitnessCustody::Unloadable(
+            "public-only custody (no private key) — cannot produce the re-anchor \
+             countersignature"
+                .to_string(),
+        )),
+        Err(e) => {
+            if crate::identity::keypair::key_material_present(WITNESS_KEY_LABEL, &dir) {
+                // Material on disk that will not load: corrupt or half-enrolled.
+                Ok(WitnessCustody::Unloadable(format!("{e:#}")))
+            } else {
+                Ok(WitnessCustody::Absent)
+            }
+        }
+    }
+}
+
 /// Load the OUT-OF-BAND enrolled audit-witness VERIFYING key (the K1 pin
 /// authority). Precedence: [`WITNESS_PUBKEY_ENV`] URL-safe-no-pad base64
 /// (highest — injected from a secret store, never on the DB-writable disk),
@@ -1894,6 +1944,239 @@ pub fn build_signed_witness_checkpoint(
     crate::checkpoints::sign_resolution_into(&mut cp, keypair)
         .context("sign audit-head witness resolution")?;
     Ok(cp)
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.0 #2004 (R75 · spec §5.3 · vote `4d3ea1c5`) — RE-ANCHOR CEREMONY ANCHOR
+// ---------------------------------------------------------------------------
+//
+// Crypto-agility bridge: per-record PQ signatures are forbidden (spec §2.4),
+// so post-quantum strength binds at CHECKPOINT granularity via a re-anchor
+// ceremony — the new-suite key countersigns "seen prior chain head H @ seq N"
+// under a new suite ([`crate::identity::re_anchor`], FROZEN §5.3 format). This
+// block WIRES that frozen primitive into the same off-daemon-custody,
+// K1-pinnable `checkpoints`-row persistence the #1822 audit-head witness uses:
+// the ceremony record's canonical CBOR + its detached countersignature ride in
+// a signed [`crate::models::ConditionType::ReAnchor`] checkpoint resolution,
+// so the anchor is loadable + verifiable exactly like a witness anchor. The
+// re-anchor signer is the SAME distinct off-daemon audit-witness custody key
+// (a separate PQ-capable key becomes its own enrolment lever at the v1.x
+// suite flip; the universal per-class `suite_tag` stays v1.x-deferred).
+
+/// Reserved `checkpoints.namespace` the re-anchor ceremony anchors live in.
+/// Distinct so an operator can grep the crypto-agility bridge records apart
+/// from coordination checkpoints and the witness anchors (the
+/// [`WITNESS_CHECKPOINT_NAMESPACE`] precedent).
+pub const REANCHOR_CHECKPOINT_NAMESPACE: &str = "_reanchor_ceremony";
+
+/// `checkpoints.title` stamped on every re-anchor ceremony anchor.
+const REANCHOR_CHECKPOINT_TITLE: &str = "crypto-agility re-anchor";
+
+/// `checkpoints.created_by` / `resolved_by` pseudo-actor for re-anchor anchors.
+pub const REANCHOR_RESOLVED_BY: &str = "audit:reanchor";
+
+/// Schema version embedded in the re-anchor `resolution` JSON (`"v": N`).
+const REANCHOR_RESOLUTION_VERSION: i64 = 1;
+
+/// The signed `resolution` payload of a [`crate::models::ConditionType::ReAnchor`]
+/// checkpoint (spec §5.3). Carries the FROZEN ceremony artifact — the canonical
+/// `re-anchor/v1` CBOR pre-image + its detached new-suite countersignature —
+/// base64 (STANDARD) encoded. The authoritative signed bytes are the CBOR (a
+/// verifier `decode_re_anchor_v1`s it, NEVER trusts a re-derived projection);
+/// the enclosing checkpoint envelope signature then binds this whole payload
+/// into the K1-pinnable row.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ReAnchorResolutionWire {
+    /// Resolution schema version (`REANCHOR_RESOLUTION_VERSION`).
+    v: i64,
+    /// Base64 (STANDARD) of [`crate::identity::re_anchor::canonical_cbor_re_anchor_v1`]
+    /// — the exact pre-image the detached signature is computed over.
+    re_anchor_cbor: String,
+    /// Base64 (STANDARD) of the 64-byte detached `re-anchor/v1` countersignature.
+    re_anchor_sig: String,
+}
+
+/// Build + SIGN a resolved [`crate::models::ConditionType::ReAnchor`] checkpoint
+/// countersigning the prior-suite chain head (`prior_head_hash` @
+/// `prior_head_sequence`) at wall-clock `now` (epoch seconds) / `anchored_at`
+/// (RFC3339), signed by `keypair` (the audit-witness custody signer — its
+/// private key produces BOTH the detached `re-anchor/v1` countersignature and
+/// the enclosing checkpoint envelope signature). The returned checkpoint is
+/// ready to `checkpoints::insert` into either backend.
+///
+/// The committed `new_suite_tag` is [`SuiteId::Ed25519Sha256`] — the only
+/// suite that exists at v1.0.0 (a future PQ suite supplies its own signer over
+/// the SAME pinned pre-image; verification cross-checks the enrolled suite).
+///
+/// # Errors
+/// - `keypair` is public-only (cannot produce the detached countersignature).
+/// - Propagates the [`crate::checkpoints::sign_resolution_into`] envelope error.
+pub fn build_signed_reanchor_checkpoint(
+    prior_head_hash: &[u8],
+    prior_head_sequence: u64,
+    anchored_at: &str,
+    now: i64,
+    keypair: &crate::identity::keypair::AgentKeypair,
+) -> Result<crate::models::Checkpoint> {
+    use crate::identity::re_anchor::{
+        SignableReAnchorV1, canonical_cbor_re_anchor_v1, sign_re_anchor,
+    };
+    use crate::identity::suite::SuiteId;
+    use crate::models::{CheckpointState, ConditionType};
+
+    let signing_key = keypair.private.as_ref().ok_or_else(|| {
+        anyhow!("re-anchor ceremony requires a private witness key (public-only)")
+    })?;
+
+    // FROZEN §5.3 pre-image: the new-suite key countersigns the prior head.
+    let signable = SignableReAnchorV1 {
+        prior_chain_head_hash: prior_head_hash,
+        prior_head_sequence,
+        new_suite_tag: SuiteId::Ed25519Sha256.tag(),
+        anchored_at,
+    };
+    let cbor = canonical_cbor_re_anchor_v1(&signable);
+    let sig = sign_re_anchor(signing_key, &signable);
+
+    let wire = ReAnchorResolutionWire {
+        v: REANCHOR_RESOLUTION_VERSION,
+        re_anchor_cbor: B64.encode(&cbor),
+        re_anchor_sig: B64.encode(sig),
+    };
+    // to_string on this fixed-shape struct is infallible in practice; still
+    // propagate rather than persist a signed-but-empty resolution (which a
+    // read-back would reject as MalformedResolution) — degrade-never-corrupt.
+    let resolution =
+        serde_json::to_string(&wire).context("serialize re-anchor ceremony resolution")?;
+
+    let mut cp = crate::models::Checkpoint {
+        id: uuid::Uuid::new_v4().to_string(),
+        namespace: REANCHOR_CHECKPOINT_NAMESPACE.to_string(),
+        title: REANCHOR_CHECKPOINT_TITLE.to_string(),
+        condition_type: ConditionType::ReAnchor,
+        condition: serde_json::Value::Null,
+        state: CheckpointState::Resolved,
+        created_by: REANCHOR_RESOLVED_BY.to_string(),
+        resolved_by: Some(REANCHOR_RESOLVED_BY.to_string()),
+        resolution: Some(resolution),
+        resolution_note: None,
+        signature: Vec::new(),
+        resolver_pubkey: Vec::new(),
+        created_at: now,
+        deadline_at: None,
+        resolved_at: Some(now),
+        metadata: serde_json::Value::Null,
+    };
+    crate::checkpoints::sign_resolution_into(&mut cp, keypair)
+        .context("sign re-anchor ceremony resolution")?;
+    Ok(cp)
+}
+
+/// Why a [`verify_reanchor_checkpoint`] read-back was refused (spec §5.3).
+///
+/// Fail-closed: every non-`Ok` disposition is a rejection. The distinct
+/// variants are for logs / audit envelopes, mirroring
+/// [`crate::identity::re_anchor::ReAnchorError`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReAnchorCheckpointError {
+    /// The checkpoint is not a [`crate::models::ConditionType::ReAnchor`] anchor.
+    NotReAnchor,
+    /// The `resolver_pubkey` did not equal the ENROLLED witness key (K1 pin).
+    PubkeyNotEnrolled,
+    /// The checkpoint envelope signature did not validate over its resolution.
+    EnvelopeInvalid,
+    /// The `resolution` was absent, not the expected schema version, or its
+    /// base64 CBOR / signature fields did not decode.
+    MalformedResolution,
+    /// The embedded CBOR failed the frozen `re-anchor/v1` structural decode.
+    DecodeFailed(crate::identity::re_anchor::ReAnchorDecodeError),
+    /// The detached countersignature (or its suite cross-check) failed.
+    CountersignatureInvalid(crate::identity::re_anchor::ReAnchorError),
+}
+
+impl ReAnchorCheckpointError {
+    /// Stable machine-readable tag for logs + JSON error envelopes.
+    #[must_use]
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::NotReAnchor => "reanchor_checkpoint_not_reanchor",
+            Self::PubkeyNotEnrolled => "reanchor_checkpoint_pubkey_not_enrolled",
+            Self::EnvelopeInvalid => "reanchor_checkpoint_envelope_invalid",
+            Self::MalformedResolution => "reanchor_checkpoint_malformed_resolution",
+            Self::DecodeFailed(e) => e.tag(),
+            Self::CountersignatureInvalid(e) => e.tag(),
+        }
+    }
+}
+
+impl std::fmt::Display for ReAnchorCheckpointError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.tag())
+    }
+}
+
+impl std::error::Error for ReAnchorCheckpointError {}
+
+/// Verify a re-anchor ceremony checkpoint read back from either backend
+/// (spec §5.3 / §2.4), K1-pinned to the OUT-OF-BAND `enrolled_witness_vk`.
+///
+/// The check order is deliberate and fail-closed:
+/// 1. the anchor is a [`crate::models::ConditionType::ReAnchor`];
+/// 2. K1 pin — `resolver_pubkey` equals the enrolled witness key (the anchor
+///    never self-describes its trust root);
+/// 3. the checkpoint ENVELOPE signature validates over the resolution
+///    ([`crate::checkpoints::verify`]);
+/// 4. the embedded CBOR passes the FROZEN `re-anchor/v1` structural decode
+///    ([`crate::identity::re_anchor::decode_re_anchor_v1`]) — the persisted
+///    bytes are decoded, never a re-derived projection;
+/// 5. the detached countersignature validates under the enrolled key + the
+///    §2.4 suite cross-check ([`crate::identity::re_anchor::verify_re_anchor`]).
+///
+/// # Errors
+/// A [`ReAnchorCheckpointError`] describing the first failing step.
+pub fn verify_reanchor_checkpoint(
+    cp: &crate::models::Checkpoint,
+    enrolled_witness_vk: &VerifyingKey,
+) -> Result<crate::identity::re_anchor::ReAnchorRecord, ReAnchorCheckpointError> {
+    use crate::identity::re_anchor::{decode_re_anchor_v1, verify_re_anchor};
+    use crate::identity::suite::SuiteId;
+    use crate::models::ConditionType;
+
+    if cp.condition_type != ConditionType::ReAnchor {
+        return Err(ReAnchorCheckpointError::NotReAnchor);
+    }
+    // K1 — pin against the enrolled witness key BEFORE trusting any signature.
+    if cp.resolver_pubkey.as_slice() != enrolled_witness_vk.to_bytes().as_slice() {
+        return Err(ReAnchorCheckpointError::PubkeyNotEnrolled);
+    }
+    if !crate::checkpoints::verify(cp) {
+        return Err(ReAnchorCheckpointError::EnvelopeInvalid);
+    }
+    let res = cp
+        .resolution
+        .as_deref()
+        .ok_or(ReAnchorCheckpointError::MalformedResolution)?;
+    let wire: ReAnchorResolutionWire =
+        serde_json::from_str(res).map_err(|_| ReAnchorCheckpointError::MalformedResolution)?;
+    if wire.v != REANCHOR_RESOLUTION_VERSION {
+        return Err(ReAnchorCheckpointError::MalformedResolution);
+    }
+    let cbor = B64
+        .decode(wire.re_anchor_cbor.as_bytes())
+        .map_err(|_| ReAnchorCheckpointError::MalformedResolution)?;
+    let sig = B64
+        .decode(wire.re_anchor_sig.as_bytes())
+        .map_err(|_| ReAnchorCheckpointError::MalformedResolution)?;
+
+    let record = decode_re_anchor_v1(&cbor).map_err(ReAnchorCheckpointError::DecodeFailed)?;
+    verify_re_anchor(
+        enrolled_witness_vk,
+        SuiteId::Ed25519Sha256,
+        &record.as_signable(),
+        &sig,
+    )
+    .map_err(ReAnchorCheckpointError::CountersignatureInvalid)?;
+    Ok(record)
 }
 
 // ---------------------------------------------------------------------------
