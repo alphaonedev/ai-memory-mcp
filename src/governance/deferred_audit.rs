@@ -67,6 +67,7 @@
 //! `signed_events` before the daemon's tokio runtime is torn down,
 //! or the chain-log property is broken.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -116,6 +117,13 @@ pub const GOVERNANCE_REFUSAL_EVENT_TYPE: &str = "governance.refusal";
 /// way to `signed_events.payload_hash`.
 #[derive(Debug, Clone)]
 pub struct DeferredAuditEvent {
+    /// Stable identity for one queue submission. [`DeferredAuditQueue::submit`]
+    /// replaces this with a fresh UUID for every call, so submitting the same
+    /// cloned event twice still represents two audit occurrences. The ID is
+    /// journaled and reused as `signed_events.id`, which makes panic retry and
+    /// crash recovery unambiguous. `None` is accepted only for legacy journal
+    /// records written before occurrence IDs were introduced.
+    pub occurrence_id: Option<String>,
     /// Agent identity at the moment of refusal (resolved from request
     /// or process context). Lands in `signed_events.agent_id`.
     pub agent_id: String,
@@ -145,6 +153,7 @@ impl DeferredAuditEvent {
             return None;
         }
         Some(Self {
+            occurrence_id: Some(uuid::Uuid::new_v4().to_string()),
             agent_id: agent_id.to_string(),
             action: action.clone(),
             decision: decision.clone(),
@@ -189,12 +198,15 @@ impl DeferredAuditEvent {
     /// action variant (in practice never happens for the canonical
     /// AgentAction shapes).
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
-        let canonical = serde_json::json!({
+        let mut canonical = serde_json::json!({
             "action": self.action,
             "decision": self.decision,
             "agent_id": self.agent_id,
             "timestamp": self.timestamp.to_rfc3339(),
         });
+        if let Some(occurrence_id) = &self.occurrence_id {
+            canonical["occurrence_id"] = serde_json::Value::String(occurrence_id.clone());
+        }
         serde_json::to_vec(&canonical).context("DeferredAuditEvent::canonical_bytes")
     }
 
@@ -238,6 +250,10 @@ impl DeferredAuditEvent {
             .context("from_canonical_bytes: parse timestamp")?
             .with_timezone(&chrono::Utc);
         Ok(Self {
+            occurrence_id: v
+                .get("occurrence_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
             agent_id,
             action,
             decision,
@@ -260,9 +276,10 @@ pub struct DeferredAuditMetrics {
     /// Number of submit attempts that failed because the receiver
     /// was already closed (drainer dropped / shutdown raced).
     pub send_failures: Arc<AtomicU64>,
-    /// Number of drainer iterations that failed the SQLite append.
-    /// A non-zero value indicates DB pressure / corruption; the
-    /// supervisor surfaces these in tracing::error logs.
+    /// Number of drainer iterations that failed the sink append, landed in
+    /// the DLQ, or terminated after exhausting the panic-restart budget. A
+    /// non-zero value indicates degraded audit delivery; the supervisor
+    /// surfaces the exact cause in tracing logs.
     pub append_failures: Arc<AtomicU64>,
     /// Number of sink panics observed by the supervisor. This includes a
     /// terminal panic that exhausts the configured restart budget.
@@ -489,12 +506,11 @@ impl DeferredAuditJournal {
 
 /// v0.8.0 PE-4 (#1732) — boot drain-on-recovery. Replays every intact
 /// record in the journal at `journal_path` into `signed_events` (via a
-/// fresh-`Connection` [`SqliteSignedEventsSink`]), then truncates the
-/// journal. **Idempotent:** each record is skipped when a
-/// `governance.refusal` row with the same `payload_hash` already exists
-/// (the pre-crash drainer may have landed some before the SIGKILL) — the
-/// sink stamps a random `id` so dedup is on the deterministic
-/// `payload_hash`, not the id, to avoid double-appending the hash chain.
+/// fresh-`Connection` [`SqliteSignedEventsSink`]), then truncates the journal
+/// only when every record is proven chained. **Idempotent:** new-format
+/// records use their stable per-submission occurrence ID. Legacy records that
+/// lack an occurrence ID use cardinality-aware payload-hash credits so two
+/// identical journal frames remain two audit occurrences.
 ///
 /// MUST run BEFORE the live governance hooks are installed (replay-all-
 /// then-go-live) so recovered refusals chain ahead of new ones. Wired
@@ -503,10 +519,10 @@ impl DeferredAuditJournal {
 /// Returns the count of records freshly appended (excludes deduped).
 ///
 /// # Errors
-/// Propagates journal IO or DB-open errors. A per-record sink failure is
-/// logged and skipped (best-effort, like the live drainer's DLQ path).
+/// Propagates journal IO or DB-open errors. If any record cannot reach the
+/// chain (including a DLQ landing), the journal is retained intact for a later
+/// retry; already-chained records are skipped idempotently on that pass.
 pub fn recover_deferred_audit(journal_path: &Path, db_path: &Path) -> Result<usize> {
-    use rusqlite::OptionalExtension;
     if !journal_path.exists() {
         return Ok(0);
     }
@@ -519,33 +535,75 @@ pub fn recover_deferred_audit(journal_path: &Path, db_path: &Path) -> Result<usi
     let conn = crate::db::open(db_path).context("recover_deferred_audit: open db for dedup")?;
     let mut sink = SqliteSignedEventsSink::new(db_path);
     let mut recovered = 0usize;
+    let mut unresolved = false;
+    let mut legacy_credits: HashMap<Vec<u8>, i64> = HashMap::new();
     for ev in &events {
         let hash = match ev.canonical_bytes() {
             Ok(b) => payload_hash(&b),
             Err(e) => {
-                tracing::warn!("recover_deferred_audit: skipping undecodable record: {e:#}");
+                unresolved = true;
+                tracing::warn!("recover_deferred_audit: retaining undecodable record: {e:#}");
                 continue;
             }
         };
-        let already: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM signed_events WHERE event_type = ?1 AND payload_hash = ?2 LIMIT 1",
-                rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, hash],
-                |r| r.get(0),
+        let already_chained = if let Some(occurrence_id) = &ev.occurrence_id {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM signed_events WHERE event_type = ?1 AND id = ?2)",
+                rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, occurrence_id],
+                |r| r.get::<_, bool>(0),
             )
-            .optional()
-            .context("recover_deferred_audit: dedup query")?;
-        if already.is_some() {
-            continue; // already chained pre-crash — idempotent skip
+            .context("recover_deferred_audit: occurrence-id dedup query")?
+        } else {
+            let credits = match legacy_credits.entry(hash.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let count = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM signed_events \
+                             WHERE event_type = ?1 AND payload_hash = ?2",
+                            rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, &hash],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .context("recover_deferred_audit: legacy cardinality query")?;
+                    entry.insert(count)
+                }
+            };
+            if *credits > 0 {
+                *credits -= 1;
+                true
+            } else {
+                false
+            }
+        };
+        if already_chained {
+            continue;
         }
         match sink.append(ev) {
-            Ok(_) => recovered += 1,
+            Ok(AppendOutcome::Appended) => recovered += 1,
+            Ok(AppendOutcome::DlqLanded) => {
+                unresolved = true;
+                tracing::warn!(
+                    occurrence_id = ?ev.occurrence_id,
+                    "recover_deferred_audit: event landed in DLQ; retaining journal for retry"
+                );
+            }
             Err(e) => {
-                tracing::warn!("recover_deferred_audit: sink append failed (skipping): {e:#}");
+                unresolved = true;
+                tracing::warn!(
+                    occurrence_id = ?ev.occurrence_id,
+                    "recover_deferred_audit: sink append failed; retaining journal: {e:#}"
+                );
             }
         }
     }
-    journal.truncate()?;
+    if unresolved {
+        tracing::warn!(
+            path = %journal_path.display(),
+            "recover_deferred_audit: one or more records remain unresolved; journal retained"
+        );
+    } else {
+        journal.truncate()?;
+    }
     if recovered > 0 {
         tracing::info!(
             "recover_deferred_audit: replayed {recovered} pre-crash refusal(s) into signed_events"
@@ -624,7 +682,11 @@ impl DeferredAuditQueue {
     /// bumped and a `tracing::warn` is emitted, but the caller path is
     /// unaffected. Returns `true` when the event was queued, `false` when
     /// the receiver was already closed.
-    pub fn submit(&self, event: DeferredAuditEvent) -> bool {
+    pub fn submit(&self, mut event: DeferredAuditEvent) -> bool {
+        // Identity belongs to the delivery occurrence, not to the cloneable
+        // payload. Reassign on every submit so two submissions of the same
+        // DeferredAuditEvent remain two independently durable chain rows.
+        event.occurrence_id = Some(uuid::Uuid::new_v4().to_string());
         self.metrics.submitted.fetch_add(1, Ordering::Relaxed);
         // v0.8.0 PE-4 (#1732) — durability point: journal the event
         // (write+fsync, NO DB Connection — re-entrancy-safe) BEFORE the
@@ -852,13 +914,29 @@ impl DeferredAuditSink for SqliteSignedEventsSink {
             .context("SqliteSignedEventsSink::append_retry: canonical_bytes")?;
         let hash = payload_hash(&bytes);
 
-        // This probe is intentionally retry-only. Applying it to ordinary
-        // appends would collapse two legitimate submissions of an identical
-        // DeferredAuditEvent into one audit-chain occurrence.
+        // This probe is intentionally retry-only and occurrence-scoped.
+        // Payload equality cannot distinguish a post-commit panic from a
+        // pre-commit panic when an older identical occurrence already exists.
+        // New queue/journal events therefore reuse their occurrence UUID as
+        // signed_events.id. Payload-hash fallback exists only for legacy
+        // journal records that predate occurrence IDs.
+        let (query, identity): (&str, &dyn rusqlite::ToSql) =
+            if let Some(occurrence_id) = &event.occurrence_id {
+                (
+                    "SELECT EXISTS(SELECT 1 FROM signed_events \
+                     WHERE event_type = ?1 AND id = ?2)",
+                    occurrence_id,
+                )
+            } else {
+                (
+                    "SELECT EXISTS(SELECT 1 FROM signed_events \
+                     WHERE event_type = ?1 AND payload_hash = ?2)",
+                    &hash,
+                )
+            };
         match self.ensure_conn()?.query_row(
-            "SELECT EXISTS(SELECT 1 FROM signed_events \
-             WHERE event_type = ?1 AND payload_hash = ?2)",
-            rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, &hash],
+            query,
+            rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, identity],
             |row| row.get::<_, bool>(0),
         ) {
             Ok(true) => {
@@ -908,7 +986,10 @@ impl SqliteSignedEventsSink {
                 ),
             };
         let signed = SignedEvent {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: event
+                .occurrence_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             agent_id: event.agent_id.clone(),
             event_type: GOVERNANCE_REFUSAL_EVENT_TYPE.to_string(),
             payload_hash: hash,
@@ -1214,9 +1295,12 @@ fn panic_retry_backoff(restart: u32) -> std::time::Duration {
     std::time::Duration::from_millis(millis)
 }
 
-/// Close the queue and wait for the supervisor task to drain every
-/// pending event. After this returns the chain-log property is
-/// "every refusal submitted before close lands in `signed_events`."
+/// Close the queue and wait for the supervisor task to account for every
+/// pending event. `Ok(())` means each submission either advanced
+/// `signed_events` or reached an explicitly counted failure/DLQ outcome; callers
+/// that require a fully advanced chain must additionally require zero
+/// [`DeferredAuditMetrics::append_failure_count`] and
+/// [`DeferredAuditMetrics::send_failure_count`].
 ///
 /// # Errors
 ///
@@ -1474,6 +1558,7 @@ mod tests {
     #[test]
     fn rule_id_returns_none_for_non_refusal() {
         let event = DeferredAuditEvent {
+            occurrence_id: Some(uuid::Uuid::new_v4().to_string()),
             agent_id: "x".into(),
             action: refusal_action(),
             decision: Decision::Allow,
@@ -1609,6 +1694,25 @@ mod tests {
     struct PanicAfterCommitSqliteSink {
         inner: SqliteSignedEventsSink,
         calls: Arc<AtomicU64>,
+    }
+
+    struct PanicBeforeCommitSqliteSink {
+        inner: SqliteSignedEventsSink,
+        calls: Arc<AtomicU64>,
+    }
+
+    impl DeferredAuditSink for PanicBeforeCommitSqliteSink {
+        fn append(&mut self, event: &DeferredAuditEvent) -> Result<AppendOutcome> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("injected panic before SQLite commit");
+            }
+            self.inner.append(event)
+        }
+
+        fn append_retry(&mut self, event: &DeferredAuditEvent) -> Result<AppendOutcome> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.append_retry(event)
+        }
     }
 
     impl DeferredAuditSink for PanicAfterCommitSqliteSink {
@@ -1832,6 +1936,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "post-commit retry must not duplicate chain row");
+    }
+
+    #[tokio::test]
+    async fn precommit_panic_does_not_collapse_prior_identical_occurrence() {
+        let dir = fresh_tempdir();
+        let db_path = dir.path().join("def-audit-panic-before-commit.db");
+        let _ = crate::db::open(&db_path).expect("init db");
+        let event = DeferredAuditEvent::from_refusal(
+            "agent:pre-commit",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        let mut first_sink = SqliteSignedEventsSink::new(db_path.clone());
+        assert_eq!(first_sink.append(&event).unwrap(), AppendOutcome::Appended);
+
+        let (queue, rx) = DeferredAuditQueue::new();
+        let metrics = queue.metrics();
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_for_factory = calls.clone();
+        let db_for_factory = db_path.clone();
+        let supervisor = spawn_supervised_drainer(
+            rx,
+            move || PanicBeforeCommitSqliteSink {
+                inner: SqliteSignedEventsSink::new(db_for_factory.clone()),
+                calls: calls_for_factory.clone(),
+            },
+            metrics.clone(),
+            1,
+        );
+        assert!(queue.submit(event.clone()));
+
+        close_and_flush(queue, supervisor)
+            .await
+            .expect("pre-commit panic retry must drain successfully");
+        assert_eq!(metrics.panic_count(), 1);
+        assert_eq!(metrics.appended_count(), 1);
+
+        let conn = crate::db::open(&db_path).expect("reopen db");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1 AND agent_id = ?2",
+                rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, "agent:pre-commit"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "both identical occurrences must advance the chain"
+        );
     }
 
     #[tokio::test]
@@ -2139,9 +2293,14 @@ mod tests {
             &refusal_decision(),
         )
         .unwrap();
+        let mut second_occurrence = event.clone();
+        second_occurrence.occurrence_id = Some(uuid::Uuid::new_v4().to_string());
 
         assert_eq!(sink.append(&event).unwrap(), AppendOutcome::Appended);
-        assert_eq!(sink.append(&event).unwrap(), AppendOutcome::Appended);
+        assert_eq!(
+            sink.append(&second_occurrence).unwrap(),
+            AppendOutcome::Appended
+        );
 
         let conn = crate::db::open(&db_path).expect("reopen db");
         let count: i64 = conn
@@ -2520,7 +2679,7 @@ mod tests {
     #[test]
     fn journal_recovery_is_idempotent_no_duplicate_1732() {
         // A refusal already chained pre-crash must NOT be re-appended on a
-        // second recovery pass (dedup on payload_hash, not the random id).
+        // second recovery pass (dedup on stable occurrence ID).
         let dir = fresh_tempdir();
         let db_path = dir.path().join("idem.db");
         let _ = crate::db::open(&db_path).expect("init db");
@@ -2547,7 +2706,7 @@ mod tests {
         assert_eq!(
             recover_deferred_audit(&journal_path, &db_path).unwrap(),
             0,
-            "an already-chained refusal must not be re-appended (dedup on payload_hash)"
+            "an already-chained occurrence must not be re-appended"
         );
 
         let conn = crate::db::open(&db_path).unwrap();
@@ -2559,5 +2718,97 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "exactly one row despite two recovery passes");
+    }
+
+    #[test]
+    fn journal_recovery_preserves_identical_occurrence_multiplicity() {
+        let dir = fresh_tempdir();
+        let db_path = dir.path().join("journal-occurrence-multiplicity.db");
+        let _ = crate::db::open(&db_path).expect("init db");
+        let journal_path = deferred_audit_journal_path(&db_path);
+        let first =
+            DeferredAuditEvent::from_refusal("agent:multi", &refusal_action(), &refusal_decision())
+                .unwrap();
+        let mut second = first.clone();
+        second.occurrence_id = Some(uuid::Uuid::new_v4().to_string());
+        let journal = DeferredAuditJournal::open(&journal_path).unwrap();
+        journal.append(&first).unwrap();
+        journal.append(&second).unwrap();
+        drop(journal);
+
+        assert_eq!(recover_deferred_audit(&journal_path, &db_path).unwrap(), 2);
+        let conn = crate::db::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1 AND agent_id = ?2",
+                rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, "agent:multi"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn legacy_journal_recovery_uses_cardinality_not_existence() {
+        let dir = fresh_tempdir();
+        let db_path = dir.path().join("journal-legacy-cardinality.db");
+        let _ = crate::db::open(&db_path).expect("init db");
+        let journal_path = deferred_audit_journal_path(&db_path);
+        let mut legacy = DeferredAuditEvent::from_refusal(
+            "agent:legacy-multi",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        legacy.occurrence_id = None;
+        let journal = DeferredAuditJournal::open(&journal_path).unwrap();
+        journal.append(&legacy).unwrap();
+        journal.append(&legacy).unwrap();
+        drop(journal);
+
+        assert_eq!(recover_deferred_audit(&journal_path, &db_path).unwrap(), 2);
+        let conn = crate::db::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1 AND agent_id = ?2",
+                rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, "agent:legacy-multi"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn journal_recovery_retains_records_after_unrecoverable_sink_error() {
+        let dir = fresh_tempdir();
+        let db_path = dir.path().join("journal-retain-on-error.db");
+        let conn = crate::db::open(&db_path).expect("init db");
+        conn.execute_batch(
+            "CREATE TRIGGER reject_signed_event BEFORE INSERT ON signed_events \
+             BEGIN SELECT RAISE(FAIL, 'injected signed event failure'); END; \
+             CREATE TRIGGER reject_signed_dlq BEFORE INSERT ON signed_events_dlq \
+             BEGIN SELECT RAISE(FAIL, 'injected dlq failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+        let journal_path = deferred_audit_journal_path(&db_path);
+        let event = DeferredAuditEvent::from_refusal(
+            "agent:retain",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        DeferredAuditJournal::open(&journal_path)
+            .unwrap()
+            .append(&event)
+            .unwrap();
+
+        assert_eq!(recover_deferred_audit(&journal_path, &db_path).unwrap(), 0);
+        let replayed = DeferredAuditJournal::open(&journal_path)
+            .unwrap()
+            .replay()
+            .unwrap();
+        assert_eq!(replayed.len(), 1, "unresolved event must remain durable");
+        assert_eq!(replayed[0].occurrence_id, event.occurrence_id);
     }
 }
