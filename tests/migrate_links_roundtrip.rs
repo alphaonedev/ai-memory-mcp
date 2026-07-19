@@ -110,6 +110,8 @@ fn link(src: &str, dst: &str, rel: &str) -> MemoryLink {
         valid_from: None,
         valid_until: None,
         attest_level: None,
+        source_cid: None,
+        target_cid: None,
     }
 }
 

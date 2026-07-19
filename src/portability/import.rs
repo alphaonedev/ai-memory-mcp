@@ -467,6 +467,35 @@ fn apply_all_classes(
         report.memories += 1;
     }
     for link in &env.links {
+        // #2215 — repopulate the schema-v75 lineage-DAG cid mirror
+        // (`source_cid` / `target_cid`) so an imported edge keeps its
+        // tombstone-resilient node identity (pre-fix the raw INSERT dropped
+        // both columns, so EVERY imported edge landed NULL — a #2006 residual
+        // fidelity gap). Resolution, gated on `lineage_dag_enabled()` for
+        // byte-parity with the native `create_link_signed` write path (COND;
+        // when the DAG is OFF the mirror binds NULL — the legacy shape):
+        //   1. PREFER the value the bundle carried (a fresh exporter round-trips
+        //      the source's real cid via `MemoryLink.source_cid`/`target_cid`);
+        //   2. else BACKFILL by probing the just-staged endpoint's `memories.cid`
+        //      (an older bundle that predates the exporter twin fix carries no
+        //      cids — the memories loop above re-derived them deterministically,
+        //      so the mirror resolves from the live endpoint);
+        //   3. else leave NULL — the pre-v75 legacy state (endpoint has no cid).
+        //      DEGRADE, do not INVENT: a NULL mirror still resolves via the
+        //      query layer's live LEFT JOIN while both endpoints are present.
+        let (source_cid, target_cid): (Option<String>, Option<String>) =
+            if crate::config::lineage_dag_enabled() {
+                (
+                    link.source_cid
+                        .clone()
+                        .or_else(|| crate::storage::read_memory_cid(conn, &link.source_id)),
+                    link.target_cid
+                        .clone()
+                        .or_else(|| crate::storage::read_memory_cid(conn, &link.target_id)),
+                )
+            } else {
+                (None, None)
+            };
         // RAW, byte-preserving (`create_link` would re-derive the signature +
         // attest_level — a loss). `OR IGNORE` is idempotent on the natural key
         // and silently skips an edge whose endpoint memory is absent (e.g. a
@@ -475,8 +504,8 @@ fn apply_all_classes(
             .execute(
                 "INSERT OR IGNORE INTO memory_links \
                     (source_id, target_id, relation, created_at, valid_from, valid_until, \
-                     observed_by, signature, attest_level) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     observed_by, signature, attest_level, source_cid, target_cid) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     link.source_id,
                     link.target_id,
@@ -487,6 +516,8 @@ fn apply_all_classes(
                     link.observed_by,
                     link.signature,
                     link.attest_level,
+                    source_cid,
+                    target_cid,
                 ],
             )
             .with_context(|| format!("import link {}->{}", link.source_id, link.target_id))?;

@@ -456,6 +456,11 @@ pub async fn create_link(
             observed_by: None,
             signature: None,
             attest_level: None,
+            // #2215 — the DB write (`link_signed` → `create_link_signed`)
+            // stamps the lineage-DAG cid mirror from the endpoints; the
+            // request-side struct carries no cids of its own.
+            source_cid: None,
+            target_cid: None,
         };
         // v0.7.0 ship-hardening (2026-05-19): resolve caller from
         // X-Agent-Id header so the link write's audit + ownership
@@ -719,6 +724,10 @@ pub async fn create_link(
                     valid_from: None,
                     valid_until: None,
                     attest_level: None,
+                    // #2215 — the receiver re-stamps the cid mirror from its
+                    // own endpoints; the fanout struct carries none.
+                    source_cid: None,
+                    target_cid: None,
                 };
                 match crate::federation::broadcast_link_quorum(fed, &link).await {
                     Ok(tracker) => {
