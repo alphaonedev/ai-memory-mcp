@@ -142,7 +142,7 @@ matching emit in `emit_check_event`.
 
 ## 4. What's chain-logged today
 
-Comprehensive list, all shipped at HEAD `c359e89`:
+Comprehensive list for the current release branch:
 
 - **Cross-row chain integrity** (v0.7.0 V-4 closeout, #698) — every
   `signed_events` row carries `prev_hash BLOB` (SHA-256 over the
