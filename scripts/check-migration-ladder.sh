@@ -105,7 +105,11 @@ LADDER_EXEMPT_FILES=(
 # in tests/migration_ladder_integrity.rs (EXPECTED_CONST_ARMS_*), bump both.
 # 2026-07-18 (#2198): sqlite=8 (the v74/v75/v76/v77/v78/v79/v80/v85-era arms),
 #                     postgres=1 (the single `if current_version < CSV` tail arm).
-EXPECTED_CONST_ARMS_SQLITE=8
+# 2026-07-19 (#1834 pre-ship 3x7): sqlite 8 -> 9 — the v86 VALID-time
+#                     rendering-normalization arm joins the const-phrased tail
+#                     cohort; postgres stays 1 (v85 renumbered to a literal
+#                     arm, migrate_v86 takes the const tail slot).
+EXPECTED_CONST_ARMS_SQLITE=9
 EXPECTED_CONST_ARMS_POSTGRES=1
 
 # --- Helpers ----------------------------------------------------------------

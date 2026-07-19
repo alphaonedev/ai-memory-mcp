@@ -1,0 +1,50 @@
+-- Copyright 2026 AlphaOne LLC
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- v1.0.0 #1834 (pre-ship 3x7) — schema v86: one-time normalization of the
+-- claim-bitemporal VALID-time renderings on `memories` + `archived_memories`
+-- to the ONE canonical fixed-UTC form `YYYY-MM-DDTHH:MM:SS.ffffffZ`
+-- (`validate::canonicalize_valid_time`; microsecond precision, `Z` suffix,
+-- fixed width).
+--
+-- WHY. Every #1834 predicate — the sqlite list/recall/hybrid/semantic SQL,
+-- the HNSW Rust re-filter, and the postgres `::text` binds — compares the
+-- `valid_from` / `valid_until` TEXT columns LEXICOGRAPHICALLY against the
+-- caller's `valid_at`. RFC3339 admits many renderings of the SAME instant
+-- (`Z` vs `+00:00`, variable fractional digits, non-UTC offsets), and equal
+-- instants rendered differently order WRONGLY as bytes:
+--   '2026-06-01T00:00:00Z' > '2026-06-01T00:00:00+00:00'   ('Z' 0x5A > '+')
+-- so a Z-rendered `valid_until` at the boundary instant was wrongly INCLUDED
+-- against a '+00:00'-rendered `valid_at` (end-exclusivity violated), and a
+-- '+05:00'-offset bound mis-filtered by hours. From v86 the write funnels
+-- (sqlite `insert` / `insert_if_newer` / `insert_with_conflict` /
+-- `overwrite_full_row_by_id` / the `valid_until` update patch; postgres
+-- `store` / `store_batch` / `apply_remote_memory` / `merge_inbound` / both
+-- update funnels) canonicalize at admission, and every `valid_at` query bind
+-- canonicalizes too — this migration heals rows written BEFORE the fix so
+-- byte comparison is exactly instant comparison across the whole corpus.
+--
+-- MECHANICS. The normalization is applied by an in-code Rust arm
+-- (`storage::migrations::normalize_valid_time_rows`, postgres twin
+-- `PostgresStore::migrate_v86`) rather than SQL in this file, because exact
+-- microsecond-precision RFC3339 re-rendering needs chrono (SQLite strftime
+-- caps at milliseconds and floats through julianday; a postgres
+-- text->timestamptz cast would abort the whole migration on one unparseable
+-- row). Per-row contract: parseable RFC3339 -> re-rendered canonically
+-- (INSTANT-PRESERVING — only the rendering changes); unparseable -> exact
+-- bytes kept (fail-safe, never destroy); already-canonical -> skipped
+-- (idempotent / replay-safe). These columns are UNSIGNED metadata (not in
+-- the SignableWrite v2 envelope, not in the cid genesis pre-image), so no
+-- signature or content-address breaks. No DDL, no table rebuild -> the
+-- v63/v65 trigger-drop hazard does not arise; the v53-scoped FTS trigger
+-- (`AFTER UPDATE OF title, content, tags`) does not fire on these columns.
+--
+-- This file is the canonical documentation twin of the in-code arm (the
+-- 0069_v85 comment-reference precedent). Representative equivalent (executed
+-- in Rust, NOT from this file):
+--
+--   UPDATE memories
+--      SET valid_from  = canonicalize_rfc3339_utc_micros(valid_from),
+--          valid_until = canonicalize_rfc3339_utc_micros(valid_until)
+--    WHERE valid_from IS NOT NULL OR valid_until IS NOT NULL;
+--   -- and the same statement over archived_memories.

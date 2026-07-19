@@ -821,7 +821,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // + two live-PG parity tests (each with the F1 delete-on-restore pin).
     // Combined with the #2207 VALID-time reads, the merged file lands above
     // 28_000; ceiling bumped 28_000 -> 28_200 to hold both additions.
-    ("src/store/postgres.rs", 28_200),
+    // 2026-07-19 (#1834 pre-ship 3x7): the v86 valid-time canonicalization
+    // migration (migrate_v86 + funnel canonicalization comments) lands
+    // postgres.rs at 28_203; ceiling bumped 28_200 -> 28_300.
+    ("src/store/postgres.rs", 28_300),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -1236,7 +1239,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-17 (#2167 S1): the v84 embedding_space migration arm + SCHEMA
     // column doc land migrations.rs at 5_446; ceiling 5_450 (+4 headroom).
     // Additive ALTER-ADD-COLUMN migration only.
-    ("src/storage/migrations.rs", 5_550), /* 2026-07-18 #2035 v85 archived_memories valid_from/valid_until migration arm (5_491) */
+    ("src/storage/migrations.rs", 5_650), /* 2026-07-19 #1834 pre-ship 3x7 v86 valid-time canonicalization arm + normalize_valid_time_rows helper (5_569); was 5_550 (2026-07-18 #2035 v85 arm, 5_491) */
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.

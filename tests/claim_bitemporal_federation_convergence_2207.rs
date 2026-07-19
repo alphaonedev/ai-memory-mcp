@@ -56,6 +56,12 @@ const RECALL_AFTER_CLOSE: &str = "2026-06-20T00:00:00+00:00";
 // Recall AS-OF Jun 05 — strictly BEFORE the close, so the row is still valid.
 const RECALL_BEFORE_CLOSE: &str = "2026-06-05T00:00:00+00:00";
 
+/// Pre-ship 3x7 (#1834) — the write funnels canonicalize VALID-time bounds
+/// to the fixed UTC rendering; stored-byte assertions expect it.
+fn canon(ts: &str) -> String {
+    ai_memory::validate::canonicalize_valid_time(ts).expect("canonical rendering")
+}
+
 fn claim(id: &str, updated_at: &str, valid_until: Option<&str>) -> Memory {
     Memory {
         id: id.to_string(),
@@ -125,8 +131,9 @@ fn remote_newer_close_replicates_by_id_and_valid_at_excludes() {
     let got = db::get(&conn, &id).expect("get").expect("row present");
     assert_eq!(
         got.valid_until.as_deref(),
-        Some(CLOSE_AT),
-        "receiver adopts the peer's valid_until close (crdt_merge + full-row writer)"
+        Some(canon(CLOSE_AT).as_str()),
+        "receiver adopts the peer's valid_until close (crdt_merge + full-row writer; \
+         canonical rendering at the funnel)"
     );
 
     // CONVERGENCE: a valid_at recall AFTER the close excludes the row.
@@ -177,8 +184,8 @@ fn both_merge_orders_converge_to_identical_rows() {
     // IDENTICAL final rows (full serialized shape), incl. valid_until.
     assert_eq!(
         row1.valid_until.as_deref(),
-        Some(CLOSE_AT),
-        "both orders must land the close (newer-wins)"
+        Some(canon(CLOSE_AT).as_str()),
+        "both orders must land the close (newer-wins; canonical rendering)"
     );
     // `metadata.version_vector` is node-LOCAL observation state: each
     // insert stamps its own host clock entry, and these hand-built inbound
@@ -221,7 +228,7 @@ fn stale_remote_reopen_does_not_clobber_local_close() {
     let got = db::get(&conn, &id).expect("get").expect("row present");
     assert_eq!(
         got.valid_until.as_deref(),
-        Some(CLOSE_AT),
+        Some(canon(CLOSE_AT).as_str()),
         "a stale open must not reopen a fresher local close"
     );
     assert!(

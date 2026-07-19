@@ -139,6 +139,12 @@ async fn seed(
     (early, late, legacy)
 }
 
+/// Pre-ship 3x7 (#1834) — the pg write funnels canonicalize VALID-time
+/// bounds to the fixed UTC rendering; stored-byte assertions expect it.
+fn canon(ts: &str) -> String {
+    ai_memory::validate::canonicalize_valid_time(ts).expect("canonical rendering")
+}
+
 fn titles(rows: &[Memory]) -> Vec<String> {
     let mut t: Vec<String> = rows.iter().map(|m| m.title.clone()).collect();
     t.sort();
@@ -244,12 +250,12 @@ async fn pg_update_closes_valid_until_while_valid_from_stays_immutable_1834() {
     let closed = store.get(&ctx, &late_id).await.expect("get closed");
     assert_eq!(
         closed.valid_until.as_deref(),
-        Some("2026-09-01T00:00:00Z"),
-        "the valid_until patch must close the claim's interval"
+        Some(canon("2026-09-01T00:00:00Z").as_str()),
+        "the valid_until patch must close the claim's interval (canonical rendering)"
     );
     assert_eq!(
         closed.valid_from.as_deref(),
-        Some("2026-06-01T00:00:00Z"),
+        Some(canon("2026-06-01T00:00:00Z").as_str()),
         "valid_from is IMMUTABLE — the genesis assertion instant must survive the patch"
     );
 
@@ -261,5 +267,94 @@ async fn pg_update_closes_valid_until_while_valid_from_stays_immutable_1834() {
     assert!(
         !after.iter().any(|m| m.id == late_id),
         "a closed claim must not be live after its valid_until"
+    );
+}
+
+/// Pre-ship 3x7 (#1834) — mixed RFC3339 renderings of the SAME instant must
+/// filter identically on the pg `::text` predicates. Pre-fix the `$8`/`$10`
+/// binds compared raw caller bytes against raw stored bytes, so a
+/// `+00:00`-rendered `valid_at` at the boundary of a `Z`-rendered
+/// `valid_until` was wrongly INCLUDED (`'Z' > '+'`), and a `+05:00`-offset
+/// bound mis-filtered by hours. Post-fix both sides canonicalize to the
+/// fixed UTC micros rendering, so byte comparison IS instant comparison.
+#[tokio::test]
+async fn pg_mixed_renderings_compare_as_instants_1834() {
+    let Some(store) = live_pg().await else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let owner = "ai:1834-pg-canon";
+    let ctx = CallerContext::for_agent(owner);
+    let ns = format!("bitemporal1834c-{}", uuid::Uuid::new_v4());
+    // Seed stores Z-rendered bounds: early [2026-01-01Z, 2026-06-01Z),
+    // late [2026-06-01Z, inf), legacy NULL/NULL.
+    seed(&store, &ctx, &ns, owner).await;
+
+    // The boundary instant rendered `+00:00` — the SAME instant as the seed's
+    // `Z` bound. END-EXCLUSIVE at valid_until + START-INCLUSIVE at valid_from
+    // must hold regardless of rendering: early OUT, late IN.
+    let boundary_offset = store
+        .list(&ctx, &filter(&ns, Some("2026-06-01T00:00:00+00:00")))
+        .await
+        .expect("list boundary +00:00");
+    assert_eq!(
+        titles(&boundary_offset),
+        vec!["late claim", "legacy claim"],
+        "a +00:00-rendered valid_at at the Z-rendered boundary must stay \
+         start-inclusive / end-exclusive (equal instants, different bytes)"
+    );
+
+    // The same boundary instant rendered as a NON-UTC offset.
+    let boundary_kabul = store
+        .list(&ctx, &filter(&ns, Some("2026-06-01T05:00:00+05:00")))
+        .await
+        .expect("list boundary +05:00");
+    assert_eq!(
+        titles(&boundary_kabul),
+        vec!["late claim", "legacy claim"],
+        "a +05:00-rendered valid_at of the SAME instant must filter identically"
+    );
+
+    // An offset-rendered STORED bound: [2026-06-01T05:00:00+05:00, inf) ==
+    // [2026-06-01T00:00:00Z, inf). A UTC as-of 30 minutes later is INSIDE.
+    let off_id = uuid::Uuid::new_v4().to_string();
+    store
+        .store(
+            &ctx,
+            &mem(
+                &off_id,
+                &ns,
+                "offset claim",
+                owner,
+                Some("2026-06-01T05:00:00+05:00"),
+                None,
+            ),
+        )
+        .await
+        .expect("store offset claim");
+    let inside = store
+        .list(&ctx, &filter(&ns, Some("2026-06-01T00:30:00Z")))
+        .await
+        .expect("list inside offset window");
+    assert!(
+        inside.iter().any(|m| m.id == off_id),
+        "an offset-rendered valid_from must filter by INSTANT, not bytes \
+         (pre-fix: '05:00:00+05:00' > '00:30:00Z' lexicographically => wrongly excluded)"
+    );
+    let before = store
+        .list(&ctx, &filter(&ns, Some("2026-05-31T23:59:59Z")))
+        .await
+        .expect("list before offset window");
+    assert!(
+        !before.iter().any(|m| m.id == off_id),
+        "an as-of strictly before the offset claim's start must exclude it"
+    );
+
+    // The stored bytes are the canonical fixed-UTC rendering.
+    let got = store.get(&ctx, &off_id).await.expect("get offset claim");
+    assert_eq!(
+        got.valid_from.as_deref(),
+        Some(canon("2026-06-01T05:00:00+05:00").as_str()),
+        "the pg store funnel must persist the canonical fixed-UTC rendering"
     );
 }
