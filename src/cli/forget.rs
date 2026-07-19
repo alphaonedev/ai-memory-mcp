@@ -37,6 +37,20 @@ pub struct ForgetArgs {
     /// the handler refuses to run without this confirmation.
     #[arg(long, default_value_t = false)]
     pub confirm_global: bool,
+    /// #1832 (TRACT-gap G18) — QUERY-ONLY: print the SIGNED ERASURE ATTESTATION
+    /// (forget receipt) for an already-forgotten `<memory_id>` instead of
+    /// forgetting anything. The receipt is the proof-of-erasure the substrate
+    /// already recorded at forget time (identity + time, NEVER content). Its
+    /// `signed` flag is `false` on an unsigned daemon. Not a covenant-enforcement
+    /// guarantee — see `docs/spec/TRACT-L1-CLAIM-CONTRACT.md` §8.
+    #[arg(long, value_name = "MEMORY_ID")]
+    pub show_receipt: Option<String>,
+    /// #1832 (TRACT-gap G18) — QUERY-ONLY: verify the forget receipt for an
+    /// already-forgotten `<memory_id>` against the daemon audit key, recomputing
+    /// the canonical signable bytes from the receipt itself. Prints
+    /// `valid`/`invalid`/`unsigned`/`no key`. Does not forget anything.
+    #[arg(long, value_name = "MEMORY_ID")]
+    pub verify_receipt: Option<String>,
 }
 
 /// Round-2 F11 — return the safety-rail error string when the operator
@@ -68,6 +82,15 @@ pub fn cmd_forget(
     json_out: bool,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
+    // #1832 — QUERY-ONLY sub-modes: inspect / verify a past forget's receipt.
+    // These never forget; they short-circuit before the delete path.
+    if let Some(id) = args.show_receipt.as_deref() {
+        return cmd_show_receipt(db_path, id, json_out, out);
+    }
+    if let Some(id) = args.verify_receipt.as_deref() {
+        return cmd_verify_receipt(db_path, id, json_out, out);
+    }
+
     // Round-2 F11 — refuse global-scope deletes without explicit
     // confirmation. The error is propagated via `bail!` (not stderr +
     // process::exit) so test code can assert on the message without
@@ -100,6 +123,134 @@ pub fn cmd_forget(
     Ok(())
 }
 
+/// #1832 — base64 (url-safe, no pad) render of a receipt signature, matching
+/// the witness/approval-key encoding used elsewhere in the CLI.
+fn sig_b64(sig: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig)
+}
+
+/// #1832 — `forget --show-receipt <id>`: print the signed erasure attestation
+/// for an already-forgotten memory id. Query-only.
+fn cmd_show_receipt(
+    db_path: &Path,
+    memory_id: &str,
+    json_out: bool,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    let conn = db::open(db_path)?;
+    let Some(receipt) = db::get_forget_tombstone(&conn, memory_id)? else {
+        if json_out {
+            writeln!(
+                out.stdout,
+                "{}",
+                serde_json::json!({"memory_id": memory_id, "receipt": null})
+            )?;
+        } else {
+            writeln!(out.stdout, "no forget receipt for {memory_id}")?;
+        }
+        return Ok(());
+    };
+    if json_out {
+        writeln!(
+            out.stdout,
+            "{}",
+            serde_json::json!({
+                "memory_id": receipt.memory_id,
+                "namespace": receipt.namespace,
+                "forgotten_at": receipt.forgotten_at,
+                "agent_id": receipt.agent_id,
+                "signed": receipt.signed,
+                "signature": receipt.signature.as_deref().map(sig_b64),
+            })
+        )?;
+    } else {
+        writeln!(out.stdout, "forget receipt for {}", receipt.memory_id)?;
+        writeln!(out.stdout, "  namespace:    {}", receipt.namespace)?;
+        writeln!(out.stdout, "  forgotten_at: {}", receipt.forgotten_at)?;
+        writeln!(
+            out.stdout,
+            "  agent_id:     {}",
+            receipt.agent_id.as_deref().unwrap_or("(none)")
+        )?;
+        match receipt.signature.as_deref() {
+            Some(sig) => writeln!(out.stdout, "  signature:    {} (signed)", sig_b64(sig))?,
+            None => writeln!(
+                out.stdout,
+                "  signature:    (unsigned — daemon had no enrolled audit key)"
+            )?,
+        }
+    }
+    Ok(())
+}
+
+/// #1832 — `forget --verify-receipt <id>`: verify the forget receipt's
+/// signature against the daemon audit key. Query-only. Reuses the same
+/// verifying-key resolution ladder as `verify-audit-trail` (`src/cli/audit.rs`).
+fn cmd_verify_receipt(
+    db_path: &Path,
+    memory_id: &str,
+    json_out: bool,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    let conn = db::open(db_path)?;
+    let Some(receipt) = db::get_forget_tombstone(&conn, memory_id)? else {
+        if json_out {
+            writeln!(
+                out.stdout,
+                "{}",
+                serde_json::json!({"memory_id": memory_id, "verdict": "no receipt"})
+            )?;
+        } else {
+            writeln!(out.stdout, "no forget receipt for {memory_id}")?;
+        }
+        return Ok(());
+    };
+
+    // Resolve the daemon audit verifying key (same ladder as verify-audit-trail).
+    let agent_id =
+        crate::identity::resolve_agent_id(None, None).unwrap_or_else(|_| "ai-memory".to_string());
+    let verifying_key =
+        crate::governance::audit::load_daemon_verifying_key(&agent_id).unwrap_or(None);
+
+    let verdict = match (&verifying_key, receipt.signed) {
+        // No key on this host — cannot verify a signed receipt here.
+        (None, true) => "no key",
+        (Some(vk), _) => match db::verify_forget_receipt(&receipt, vk) {
+            db::ForgetReceiptVerdict::Valid => "valid",
+            db::ForgetReceiptVerdict::Invalid => "invalid",
+            db::ForgetReceiptVerdict::Unsigned => "unsigned",
+        },
+        // Unsigned receipt, no key needed to say so.
+        (None, false) => "unsigned",
+    };
+
+    if json_out {
+        writeln!(
+            out.stdout,
+            "{}",
+            serde_json::json!({
+                "memory_id": receipt.memory_id,
+                "namespace": receipt.namespace,
+                "forgotten_at": receipt.forgotten_at,
+                "signed": receipt.signed,
+                "verdict": verdict,
+            })
+        )?;
+    } else {
+        writeln!(
+            out.stdout,
+            "forget receipt {}: {verdict}",
+            receipt.memory_id
+        )?;
+    }
+    // A tampered/invalid signature is a hard failure signal for scripting.
+    if verdict == "invalid" {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +262,8 @@ mod tests {
             pattern: None,
             tier: None,
             confirm_global: false,
+            show_receipt: None,
+            verify_receipt: None,
         }
     }
 
@@ -343,5 +496,108 @@ mod tests {
         }
         let stdout = env.stdout_str();
         assert!(stdout.contains("forgot 2 memories"), "got: {stdout}");
+    }
+
+    // ---- #1832 forget-receipt query sub-modes -----------------------------
+
+    #[test]
+    fn show_receipt_after_forget_returns_unsigned_receipt() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "gone", "bye");
+        // Forget it (records the tombstone).
+        {
+            let mut a = args();
+            a.namespace = Some("ns".to_string());
+            let mut out = env.output();
+            cmd_forget(&db, &a, true, &mut out).unwrap();
+        }
+        // Now inspect the receipt for the forgotten id.
+        let mut a = args();
+        a.show_receipt = Some(id.clone());
+        {
+            let mut out = env.output();
+            cmd_forget(&db, &a, true, &mut out).unwrap();
+        }
+        // stdout carries both the forget line and the receipt line — the
+        // receipt JSON is the last line.
+        let last = env.stdout_str().trim().lines().last().unwrap().to_string();
+        let v: serde_json::Value = serde_json::from_str(&last).unwrap();
+        assert_eq!(v["memory_id"].as_str().unwrap(), id);
+        assert_eq!(v["namespace"].as_str().unwrap(), "ns");
+        // The test daemon has no enrolled audit key → unsigned receipt.
+        assert_eq!(v["signed"].as_bool().unwrap(), false);
+        assert!(v["signature"].is_null());
+        assert!(v["forgotten_at"].as_str().is_some());
+    }
+
+    #[test]
+    fn show_receipt_missing_id_reports_none() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let mut a = args();
+        a.show_receipt = Some("never-forgotten".to_string());
+        {
+            let mut out = env.output();
+            cmd_forget(&db, &a, true, &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert!(v["receipt"].is_null());
+    }
+
+    #[test]
+    fn verify_receipt_unsigned_daemon_reports_unsigned() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "gone", "bye");
+        {
+            let mut a = args();
+            a.namespace = Some("ns".to_string());
+            let mut out = env.output();
+            cmd_forget(&db, &a, true, &mut out).unwrap();
+        }
+        let mut a = args();
+        a.verify_receipt = Some(id.clone());
+        {
+            let mut out = env.output();
+            cmd_forget(&db, &a, true, &mut out).unwrap();
+        }
+        let last = env.stdout_str().trim().lines().last().unwrap().to_string();
+        let v: serde_json::Value = serde_json::from_str(&last).unwrap();
+        // No enrolled audit key + unsigned tombstone → "unsigned".
+        assert_eq!(v["verdict"].as_str().unwrap(), "unsigned");
+        assert_eq!(v["signed"].as_bool().unwrap(), false);
+    }
+
+    #[test]
+    fn show_receipt_does_not_forget() {
+        // The query sub-mode must never delete: a live row survives an
+        // invocation that carries --show-receipt.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let _ = seed_memory(&db, "ns", "keep", "me");
+        let mut a = args();
+        a.namespace = Some("ns".to_string()); // present but must be IGNORED
+        a.show_receipt = Some("whatever".to_string());
+        {
+            let mut out = env.output();
+            cmd_forget(&db, &a, true, &mut out).unwrap();
+        }
+        let conn = db::open(&db).unwrap();
+        let still = db::list(
+            &conn,
+            Some("ns"),
+            None,
+            10,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(still.len(), 1, "show-receipt must not forget anything");
     }
 }

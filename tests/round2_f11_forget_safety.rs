@@ -31,6 +31,8 @@ fn args_blank() -> ForgetArgs {
         pattern: None,
         tier: None,
         confirm_global: false,
+        show_receipt: None,
+        verify_receipt: None,
     }
 }
 
