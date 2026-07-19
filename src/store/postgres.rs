@@ -27332,6 +27332,20 @@ mod tests {
             crate::models::LifecycleState::Blocked,
             "lifecycle_state must survive the archive->restore round-trip on postgres",
         );
+
+        // #2195 (F1 audit pin) - delete-on-restore parity: the archive copy must
+        // be gone after a successful restore, so a second restore of the same id
+        // is a no-op (Ok(false)). If the pg restore RETAINED the copy, this second
+        // call would surface it (the now-active row -> Conflict) and .expect would
+        // panic - pins the delete-on-restore disposition no prior test covered.
+        let second = store
+            .archive_restore(&ctx, &id)
+            .await
+            .expect("second restore");
+        assert!(
+            !second,
+            "archive copy must be deleted on restore (second restore is a no-op) on postgres",
+        );
     }
 
     /// #2195 (data-integrity archive-parity) — postgres twin of the sqlite
@@ -27386,6 +27400,20 @@ mod tests {
         assert_eq!(
             got.content, "content-v2",
             "re-archive must be last-wins (newest payload) on postgres, not first-wins",
+        );
+
+        // #2195 (F1 audit pin) - delete-on-restore parity: the archive copy must
+        // be gone after the restore, so a second restore of the same id is a no-op
+        // (Ok(false)). Retention would leave the copy present and .expect would
+        // panic on the resulting conflict - pins the disposition no prior test
+        // covered (reverting the pg DELETE would fail this).
+        let second = store
+            .archive_restore(&ctx, &id)
+            .await
+            .expect("second restore");
+        assert!(
+            !second,
+            "archive copy must be deleted on restore (second restore is a no-op) on postgres",
         );
     }
 

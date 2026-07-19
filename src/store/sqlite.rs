@@ -3459,6 +3459,21 @@ mod tests {
             crate::models::LifecycleState::Blocked,
             "lifecycle_state must survive the archive->restore round-trip",
         );
+
+        // #2195 (F1 audit pin) - restore is DELETE-on-restore: the archive copy
+        // must be GONE after a successful restore, so a second restore of the
+        // same id is a no-op (Ok(false)). If restore RETAINED the copy, the copy
+        // would still be present and this second call would surface it (returning
+        // true / erroring on the now-active row) - this pins the delete-on-restore
+        // disposition that no prior test covered.
+        let second = store
+            .archive_restore(&ctx, &id)
+            .await
+            .expect("second restore");
+        assert!(
+            !second,
+            "archive copy must be deleted on restore (second restore is a no-op)",
+        );
     }
 
     // #2195 (data-integrity archive-parity) — re-archiving the SAME id whose
@@ -3508,6 +3523,19 @@ mod tests {
         assert_eq!(
             got.content, "content-v2",
             "re-archive must be last-wins (the newest payload), not first-wins",
+        );
+
+        // #2195 (F1 audit pin) - delete-on-restore: the archive copy must be gone
+        // after the restore, so a second restore of the same id is a no-op
+        // (Ok(false)). Retention would leave the copy present and this would not
+        // return false - pins the disposition no prior test covered.
+        let second = store
+            .archive_restore(&ctx, &id)
+            .await
+            .expect("second restore");
+        assert!(
+            !second,
+            "archive copy must be deleted on restore (second restore is a no-op)",
         );
     }
 
