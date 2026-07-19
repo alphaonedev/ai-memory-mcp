@@ -529,7 +529,7 @@ impl DeferredAuditJournal {
                 match std::fs::hard_link(&entry_path, &published) {
                     Ok(()) => sync_directory(&spool_dir)?,
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        if std::fs::read(&published)? != frame {
+                        if read_journal_frame_bounded(&published)? != frame {
                             anyhow::bail!("pending deferred-audit occurrence collision");
                         }
                     }
@@ -597,7 +597,7 @@ impl DeferredAuditJournal {
             let _spool_guard = self.lock_spool()?;
             *usage = scan_spool_usage(&self.spool_dir)?;
             if spool_path.exists() {
-                let existing = std::fs::read(&spool_path)
+                let existing = read_journal_frame_bounded(&spool_path)
                     .context("journal spool append: read existing occurrence")?;
                 if existing == frame {
                     return Ok(());
@@ -717,10 +717,16 @@ impl DeferredAuditJournal {
         let mut usage = self.spool_usage.lock().expect(JOURNAL_MUTEX_POISONED);
         let _spool_guard = self.lock_spool()?;
         let spool_path = self.spool_path(occurrence_id);
-        let existing = match std::fs::read(&spool_path) {
+        let existing = match read_journal_frame_bounded(&spool_path) {
             Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e).context("journal acknowledge: read occurrence"),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error).context("journal acknowledge: read occurrence"),
         };
         let expected = journal_frame(&event.canonical_bytes()?)?;
         if existing != expected {
@@ -3491,6 +3497,26 @@ mod tests {
         let reopened = DeferredAuditJournal::open(&journal_path).unwrap();
         assert!(!pending.exists());
         assert_eq!(reopened.spool_usage.lock().unwrap().entries, 0);
+    }
+
+    #[test]
+    fn journal_bounds_existing_event_reads_for_append_and_acknowledge() {
+        let dir = fresh_tempdir();
+        let journal_path = dir.path().join("oversized-event.journal");
+        let journal = DeferredAuditJournal::open(&journal_path).unwrap();
+        let event = DeferredAuditEvent::from_refusal(
+            "agent:oversized-event",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        let event_path = journal.spool_path(event.occurrence_id.as_deref().unwrap());
+        let file = File::create(event_path).unwrap();
+        file.set_len(JOURNAL_MAX_FRAME_BYTES + 1).unwrap();
+        drop(file);
+
+        assert!(journal.append(&event).is_err());
+        assert!(journal.acknowledge(&event).is_err());
     }
 
     #[cfg(unix)]
