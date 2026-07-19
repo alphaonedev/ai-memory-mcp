@@ -47,6 +47,22 @@ pub const ERASURE_TRACE_TARGET: &str = "erasure::cold_tier";
 /// #2064 F1 orphan-`.tmp` leak fix).
 pub const TEMP_DIR_PREFIX: &str = ".tmp-";
 
+/// Dot-led subdir holding the write-ahead purge-intent journal: one empty
+/// marker file per id a purge funnel is ABOUT TO destroy, written + fsync'd
+/// BEFORE the `DELETE` (#2064 F1). The reconciler HARD-deletes a rowless
+/// bundle ONLY when its id is journaled here; a rowless bundle with NO marker
+/// is treated as possible DB loss and QUARANTINED (never destroyed). Dot-led
+/// so it is skipped by [`ErasureStore::list_committed_bundle_ids`].
+pub const PURGE_JOURNAL_DIR: &str = ".purge-intent";
+
+/// Dot-led subdir a rowless-but-UN-journaled bundle is MOVED into instead of
+/// being destroyed (#2064 F1): the DR-recovery holding pen. Invisible to
+/// `get` / `list_committed_bundle_ids` so a quarantined bundle can never be
+/// resurrected via `archive restore` (the resurrection lane stays closed),
+/// yet the bytes are PRESERVED on disk and recoverable
+/// ([`ErasureStore::recover_quarantined`]).
+pub const QUARANTINE_DIR: &str = ".quarantine";
+
 /// fsync a single file so its bytes reach stable storage before the rename
 /// that publishes the bundle (F3 — power-loss durability: a torn/empty shard
 /// behind a surviving manifest is exactly what the sweep must never leave).
@@ -368,6 +384,139 @@ impl ErasureStore {
             }
         }
         reaped
+    }
+
+    // ---- #2064 F1: purge-intent journal + quarantine (destructive-op safety) ----
+
+    fn journal_dir(&self) -> PathBuf {
+        self.dir.join(PURGE_JOURNAL_DIR)
+    }
+
+    fn quarantine_dir(&self) -> PathBuf {
+        self.dir.join(QUARANTINE_DIR)
+    }
+
+    /// Write-ahead journal of DESTRUCTION INTENT: create an empty marker file
+    /// per id BEFORE the purge `DELETE`, then fsync the journal dir so the
+    /// intent is durable across a crash. The reconciler hard-reaps a rowless
+    /// bundle ONLY for a journaled id; everything else it QUARANTINES. Invalid
+    /// ids are skipped (never a path-traversal). Best-effort: a journal-write
+    /// failure degrades to quarantine (safe — data is preserved, not lost).
+    ///
+    /// # Errors
+    /// [`ErasureError::Io`] when the journal dir cannot be created / fsynced.
+    pub fn journal_purge_intent(&self, ids: &[String]) -> Result<(), ErasureError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let jdir = self.journal_dir();
+        std::fs::create_dir_all(&jdir).map_err(|e| io_err("create purge journal dir", &e))?;
+        for id in ids {
+            if validate_bundle_id(id).is_err() {
+                continue;
+            }
+            // An empty marker: existence IS the signal, so only the directory
+            // entry must be durable (fsynced once below), not file contents.
+            let _ = std::fs::File::create(jdir.join(id));
+        }
+        fsync_dir(&jdir)
+    }
+
+    /// Whether id carries a recorded purge intent (a journal marker).
+    #[must_use]
+    pub fn is_purge_intended(&self, id: &str) -> bool {
+        validate_bundle_id(id).is_ok() && self.journal_dir().join(id).is_file()
+    }
+
+    /// Clear a purge-intent marker once its bundle is confirmed gone (the
+    /// happy-path purge removed the bundle, or the reconciler reaped it).
+    /// Best-effort — a lingering marker is compacted by
+    /// [`Self::compact_purge_journal`].
+    pub fn clear_purge_intent(&self, id: &str) {
+        if validate_bundle_id(id).is_ok() {
+            let _ = std::fs::remove_file(self.journal_dir().join(id));
+        }
+    }
+
+    /// Drop journal markers whose bundle no longer exists (the purge fully
+    /// completed) so the journal stays bounded. Returns the count compacted.
+    #[must_use]
+    pub fn compact_purge_journal(&self) -> usize {
+        let mut compacted = 0;
+        let Ok(entries) = std::fs::read_dir(self.journal_dir()) else {
+            return 0;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !self.contains(name) && std::fs::remove_file(entry.path()).is_ok() {
+                compacted += 1;
+            }
+        }
+        compacted
+    }
+
+    /// MOVE the committed bundle for `id` into the quarantine holding pen
+    /// (rowless + un-journaled → possible DB loss). NON-destructive: the bytes
+    /// are preserved and recoverable, but the bundle is now invisible to
+    /// `get` / `list_committed_bundle_ids`, so it cannot be resurrected via a
+    /// serving path. Returns whether a bundle was quarantined.
+    ///
+    /// # Errors
+    /// [`ErasureError::Io`] on a filesystem failure during the move.
+    pub fn quarantine(&self, id: &str) -> Result<bool, ErasureError> {
+        let src = self.bundle_dir(id)?;
+        if !src.exists() {
+            return Ok(false);
+        }
+        let qdir = self.quarantine_dir();
+        std::fs::create_dir_all(&qdir).map_err(|e| io_err("create quarantine dir", &e))?;
+        let dst = qdir.join(id);
+        if dst.exists() {
+            std::fs::remove_dir_all(&dst).map_err(|e| io_err("clear stale quarantine", &e))?;
+        }
+        std::fs::rename(&src, &dst).map_err(|e| io_err("quarantine bundle", &e))?;
+        let _ = fsync_dir(&qdir);
+        let _ = fsync_dir(&self.dir);
+        Ok(true)
+    }
+
+    /// Ids of every quarantined bundle (a committed manifest under the
+    /// quarantine pen) — the operator's DR inventory.
+    #[must_use]
+    pub fn list_quarantined_ids(&self) -> Vec<String> {
+        let mut ids = Vec::new();
+        let Ok(entries) = std::fs::read_dir(self.quarantine_dir()) else {
+            return ids;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if entry.path().join(MANIFEST_FILE).is_file() {
+                ids.push(name.to_string());
+            }
+        }
+        ids
+    }
+
+    /// DR-recovery: MOVE a quarantined bundle back to the active store so
+    /// `archive restore <id>` can reconstruct from it. Refuses to clobber an
+    /// existing active bundle. Returns whether a bundle was recovered.
+    ///
+    /// # Errors
+    /// [`ErasureError::Io`] on a filesystem failure during the move.
+    pub fn recover_quarantined(&self, id: &str) -> Result<bool, ErasureError> {
+        let src = self.quarantine_dir().join(id);
+        if !src.join(MANIFEST_FILE).is_file() {
+            return Ok(false);
+        }
+        let dst = self.bundle_dir(id)?;
+        if dst.exists() {
+            return Ok(false);
+        }
+        std::fs::rename(&src, &dst).map_err(|e| io_err("recover quarantined bundle", &e))?;
+        let _ = fsync_dir(&self.dir);
+        Ok(true)
     }
 }
 

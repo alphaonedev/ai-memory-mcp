@@ -12032,6 +12032,10 @@ pub fn purge_archive(conn: &Connection, older_than_days: Option<i64>) -> Result<
         Some(days) => {
             let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
             let bundle_ids = erasure_purge_candidate_ids(conn, "archived_at < ?1", &[&cutoff]);
+            // #2064 F1 — record destruction intent BEFORE the DELETE so the
+            // reconciler HARD-reaps these (not quarantine) if a crash orphans
+            // a bundle between here and remove_bundles_best_effort.
+            crate::erasure::archive_sync::journal_purge_intent_best_effort(conn, &bundle_ids);
             let deleted = conn.execute(
                 "DELETE FROM archived_memories WHERE archived_at < ?1",
                 params![cutoff],
@@ -12041,6 +12045,8 @@ pub fn purge_archive(conn: &Connection, older_than_days: Option<i64>) -> Result<
         }
         None => {
             let bundle_ids = erasure_purge_candidate_ids(conn, "1=1", &[]);
+            // #2064 F1 — journal destruction intent before the DELETE.
+            crate::erasure::archive_sync::journal_purge_intent_best_effort(conn, &bundle_ids);
             let deleted = conn.execute("DELETE FROM archived_memories", [])?;
             crate::erasure::archive_sync::remove_bundles_best_effort(conn, &bundle_ids);
             Ok(deleted)
@@ -12092,6 +12098,8 @@ pub fn purge_archive_for_caller(
                    )",
                 &[&cutoff, &caller],
             );
+            // #2064 F1 — journal destruction intent before the DELETE.
+            crate::erasure::archive_sync::journal_purge_intent_best_effort(conn, &bundle_ids);
             let deleted = conn.execute(
                 "DELETE FROM archived_memories \
                  WHERE archived_at < ?1 \
@@ -12111,6 +12119,8 @@ pub fn purge_archive_for_caller(
                    json_extract(metadata, '$.target_agent_id') = ?1",
                 &[&caller],
             );
+            // #2064 F1 — journal destruction intent before the DELETE.
+            crate::erasure::archive_sync::journal_purge_intent_best_effort(conn, &bundle_ids);
             let deleted = conn.execute(
                 "DELETE FROM archived_memories \
                  WHERE \

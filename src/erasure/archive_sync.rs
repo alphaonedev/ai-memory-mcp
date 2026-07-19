@@ -18,11 +18,16 @@
 //!   verified/reconstructed and the archived row re-inserted inside the
 //!   caller's transaction, after which the NORMAL restore path (governance
 //!   hook, collision check, cid re-mint) runs unchanged.
-//! - **Destruction intent flows through**: the purge funnels remove the
-//!   bundles of the rows they delete, so purged (e.g. forgotten-then-
-//!   purged) content cannot be resurrected from the redundancy layer. This
-//!   cleanup keys on the store DIRECTORY being present, not the enable
-//!   flag, so disabling the feature never silently strands purged content.
+//! - **Destruction intent flows through — SAFELY (F1/R1)**: the purge funnels
+//!   record intent in a durable write-ahead JOURNAL before the `DELETE`, then
+//!   remove the bundles, so purged (e.g. forgotten-then-purged) content cannot
+//!   be resurrected. This cleanup keys on the store DIRECTORY being present,
+//!   not the enable flag, so disabling the feature never silently strands
+//!   purged content. Crucially, a rowless bundle is destroyed ONLY when its id
+//!   is journaled: a rowless bundle with NO recorded intent is treated as
+//!   possible partial DB LOSS (the disaster the tier exists to survive) and is
+//!   QUARANTINED (preserved + hidden), never destroyed — because "never cause
+//!   unintentional data loss" outranks "purged content must not resurrect".
 //!
 //! The archived DB row remains the durable source of truth; bundles are
 //! derived, regenerable redundancy (North-Star: derived artifacts are
@@ -42,7 +47,9 @@ use rusqlite::Connection;
 use rusqlite::types::{Value, ValueRef};
 
 use super::store::{ERASURE_TRACE_TARGET, ErasureStore};
-use super::{ENV_ERASURE_DIR, erasure_cold_tier_enabled, resolve_erasure_params};
+use super::{
+    ENV_ERASURE_DIR, erasure_cold_tier_enabled, recover_quarantine_enabled, resolve_erasure_params,
+};
 use crate::models::field_names::ARCHIVED_AT;
 
 /// Max archived rows bundled per gc tick — the pacing bound. Backlogs
@@ -57,6 +64,14 @@ pub const RECONCILE_SCAN_LIMIT_PER_TICK: usize = 512;
 /// Max bundle hash-verifications (the expensive scrub work) per gc tick — a
 /// slow background integrity pass, not a full re-verify (F3).
 pub const SCRUB_LIMIT_PER_TICK: usize = 16;
+
+/// Max rows the sweep PROBES (filesystem stat + manifest read) per tick,
+/// counting already-current rows — the bound that holds even when the
+/// keyset frontier is pinned by a permanently-failing (poison) row, so a
+/// single non-UTF-8 / non-finite row can no longer reopen the O(N)-per-tick
+/// re-probe the frontier was meant to close (R3). Generously above the
+/// bundling `limit` so it only bites under a pinned frontier.
+pub const SWEEP_PROBE_BUDGET_PER_TICK: usize = 4096;
 
 /// Grace window before an ownerless bundle (no archived AND no live row) is
 /// reaped and before a crashed `.tmp-*` dir is swept — long enough that an
@@ -155,9 +170,11 @@ fn sweep_frontier() -> &'static Mutex<HashMap<PathBuf, (String, String)>> {
     FRONTIER.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Rotating cursor so the bounded per-tick scrub covers the whole store over
-/// successive ticks instead of re-verifying the same prefix forever (F3).
-fn scrub_cursor() -> &'static AtomicUsize {
+/// Rotating cursor so the bounded per-tick reconcile scan (and the scrub it
+/// feeds) covers the WHOLE store over successive ticks instead of only ever
+/// examining the first `scan_limit` listing positions (R2) — the "paced +
+/// eventually-covering" guarantee, honest at corpus scale.
+fn reconcile_cursor() -> &'static AtomicUsize {
     static CURSOR: OnceLock<AtomicUsize> = OnceLock::new();
     CURSOR.get_or_init(|| AtomicUsize::new(0))
 }
@@ -206,11 +223,16 @@ pub fn sweep_archive_bundles(
         .context("erasure sweep: archive scan")?;
     let mut advanced: Option<(String, String)> = None;
     let mut failed_seen = false;
+    let mut probed = 0usize;
     for row in rows {
-        if report.bundled + report.failed >= limit {
+        // R3 — break on EITHER bound: the bundling `limit` (attempts) OR the
+        // probe budget (rows stat'd, incl. already-current). The probe budget
+        // is what bounds the per-tick cost when a poison row pins the frontier.
+        if report.bundled + report.failed >= limit || probed >= SWEEP_PROBE_BUDGET_PER_TICK {
             break;
         }
         let (id, archived_at) = row.context("erasure sweep: archive scan row")?;
+        probed += 1;
         if bundle_is_current(store, &id, archived_at.as_deref()) {
             report.already_current += 1;
         } else {
@@ -465,6 +487,12 @@ pub fn try_restore_archived_row_from_bundle(
     let Some(store) = store_for_conn(conn)? else {
         return Ok(false);
     };
+    // R1 — a recorded purge intent means this id was DESTROYED on purpose;
+    // refuse to resurrect it even though the bundle still lingers (the
+    // reconciler hard-reaps it next tick). Closes the purge→reconcile window.
+    if store.is_purge_intended(id) {
+        return Ok(false);
+    }
     let Some(bundle) = store
         .get(id)
         .map_err(|e| anyhow::anyhow!("erasure reconstruct-on-read for {id} failed: {e}"))?
@@ -506,12 +534,18 @@ pub fn remove_bundles_best_effort(conn: &Connection, ids: &[String]) {
         return;
     };
     for id in ids {
-        if let Err(e) = store.remove(id) {
-            tracing::warn!(
+        match store.remove(id) {
+            // Happy path: the purge-journaled bundle is gone — drop its
+            // now-vestigial intent marker so the journal stays bounded.
+            Ok(_) => store.clear_purge_intent(id),
+            // A failed removal KEEPS the marker so the reconciler hard-reaps
+            // the (journaled) survivor rather than quarantining it.
+            Err(e) => tracing::warn!(
                 target: ERASURE_TRACE_TARGET,
                 bundle_id = %id,
-                "erasure cold tier: purged row's bundle removal failed: {e}"
-            );
+                "erasure cold tier: purged row's bundle removal failed \
+                 (reconciler will reap the journaled survivor): {e}"
+            ),
         }
     }
 }
@@ -521,11 +555,18 @@ pub fn remove_bundles_best_effort(conn: &Connection, ids: &[String]) {
 pub struct ReconcileReport {
     /// Committed bundles examined this pass.
     pub scanned: usize,
-    /// Orphan bundles (no archived AND no live row, past the grace window)
-    /// reaped so purged content cannot be resurrected.
+    /// Rowless bundles with a RECORDED purge intent (journaled) HARD-reaped —
+    /// confirmed destruction, so purged content cannot be resurrected.
     pub orphans_reaped: usize,
+    /// Rowless bundles with NO recorded intent (possible DB loss) MOVED to
+    /// quarantine — preserved + invisible to serving, never destroyed (F1/R1).
+    pub quarantined: usize,
+    /// Quarantined bundles restored to the active store under DR mode.
+    pub quarantine_recovered: usize,
     /// Stale `.tmp-*` assembly dirs from crashed writers reaped.
     pub temp_reaped: usize,
+    /// Vestigial purge-intent journal markers compacted (bundle already gone).
+    pub journal_compacted: usize,
     /// Current bundles hash-verified by the scrub lane.
     pub scrub_verified: usize,
     /// Torn/degraded bundles re-minted from the durable archived row.
@@ -556,11 +597,79 @@ fn scrub_one(conn: &Connection, store: &ErasureStore, id: &str) -> Result<bool> 
     }
 }
 
-/// The gc-tick orphan-reconciliation + torn-bundle scrub pass (F1/F3). Reaps
-/// stale `.tmp-*` dirs and ownerless bundles (no archived AND no live row,
-/// older than `grace_secs`), and hash-verifies a bounded rotating slice of the
-/// current bundles (re-minting any torn one from the durable row). Bounded +
-/// eventually-covering; best-effort (every failure WARNs, never aborts).
+/// Classify + act on one ROWLESS bundle (no archived, no live row).
+///
+/// R1 (North Star: never cause unintentional data loss). A rowless bundle is
+/// byte-indistinguishable between two states: (a) intentional PURGE, and (b)
+/// partial DB LOSS where the bundle is the LAST SURVIVING COPY — exactly the
+/// disaster the tier exists to survive. The discriminator is the durable
+/// write-ahead purge-intent JOURNAL:
+/// - journaled id  → HARD-reap (confirmed destruction; resurrection closed);
+/// - un-journaled + DR mode → LEAVE ACTIVE (operator asserted DB loss — keep
+///   it serveable for `archive restore`);
+/// - un-journaled otherwise → QUARANTINE (preserve + hide; never destroy),
+///   with a LOUD WARN naming the recovery knob.
+fn reconcile_one_rowless(
+    store: &ErasureStore,
+    id: &str,
+    recover_mode: bool,
+    report: &mut ReconcileReport,
+) {
+    if store.is_purge_intended(id) {
+        match store.remove(id) {
+            Ok(_) => {
+                store.clear_purge_intent(id);
+                report.orphans_reaped += 1;
+                tracing::warn!(
+                    target: ERASURE_TRACE_TARGET,
+                    bundle_id = %id,
+                    "erasure cold tier: reaped bundle for a JOURNALED purge — \
+                     destruction intent honored"
+                );
+            }
+            Err(e) => tracing::warn!(
+                target: ERASURE_TRACE_TARGET,
+                bundle_id = %id,
+                "erasure cold tier: journaled-purge bundle reap failed (retried next tick): {e}"
+            ),
+        }
+        return;
+    }
+    if recover_mode {
+        // DR: operator asserted DB loss; keep the last copy serveable so
+        // `archive restore <id>` can reconstruct it. Never quarantined here.
+        return;
+    }
+    match store.quarantine(id) {
+        Ok(true) => {
+            report.quarantined += 1;
+            tracing::warn!(
+                target: ERASURE_TRACE_TARGET,
+                bundle_id = %id,
+                "erasure cold tier: rowless bundle with NO recorded destruction intent — \
+                 possible DB LOSS; QUARANTINED (preserved, not destroyed). To recover, set \
+                 AI_MEMORY_ERASURE_RECOVER_QUARANTINE=1 and restart, then `archive restore`."
+            );
+        }
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            target: ERASURE_TRACE_TARGET,
+            bundle_id = %id,
+            "erasure cold tier: quarantine of rowless bundle failed (retried next tick): {e}"
+        ),
+    }
+}
+
+/// The gc-tick orphan-reconciliation + torn-bundle scrub pass (F1/R1/R2/F3).
+///
+/// Reaps stale `.tmp-*` dirs; compacts vestigial purge-journal markers;
+/// (DR mode) recovers quarantined bundles to active; then walks a ROTATING
+/// `scan_limit`-sized window over the full committed listing (R2 —
+/// eventually-covering, not just the first `scan_limit`). For each rowless
+/// bundle past `grace_secs` it reaps-if-journaled / quarantines-otherwise
+/// ([`reconcile_one_rowless`], R1); for each current bundle it feeds a bounded
+/// scrub that re-mints a torn one from the durable row (F3). Best-effort —
+/// every failure WARNs, never aborts.
 pub fn reconcile_and_scrub(
     conn: &Connection,
     store: &ErasureStore,
@@ -568,13 +677,36 @@ pub fn reconcile_and_scrub(
     scrub_limit: usize,
     grace_secs: u64,
 ) -> ReconcileReport {
+    let recover_mode = recover_quarantine_enabled();
     let mut report = ReconcileReport {
         temp_reaped: store.reap_stale_temp_dirs(grace_secs),
+        journal_compacted: store.compact_purge_journal(),
         ..ReconcileReport::default()
     };
+    if recover_mode {
+        for id in store.list_quarantined_ids() {
+            if store.recover_quarantined(&id).unwrap_or(false) {
+                report.quarantine_recovered += 1;
+                tracing::warn!(
+                    target: ERASURE_TRACE_TARGET,
+                    bundle_id = %id,
+                    "erasure cold tier: DR mode — quarantined bundle RECOVERED to active; \
+                     run `archive restore` to reconstruct the row"
+                );
+            }
+        }
+    }
     let ids = store.list_committed_bundle_ids();
+    let n = ids.len();
+    if n == 0 {
+        return report;
+    }
+    // R2 — rotate the window start each tick so every listing position is
+    // eventually examined even when n > scan_limit.
+    let start = reconcile_cursor().fetch_add(scan_limit, Ordering::Relaxed) % n;
     let mut scrub_candidates: Vec<String> = Vec::new();
-    for id in ids.iter().take(scan_limit) {
+    for offset in 0..scan_limit.min(n) {
+        let id = &ids[(start + offset) % n];
         report.scanned += 1;
         if row_exists(conn, ARCHIVED_TABLE, id) {
             scrub_candidates.push(id.clone());
@@ -586,35 +718,16 @@ pub fn reconcile_and_scrub(
             // never reap a live row's snapshot on a transient read race.
             continue;
         }
-        // Orphan: neither an archived nor a live row references this bundle —
-        // reap it (past the grace window) so purged / forgotten-then-purged
-        // content can never be resurrected from the redundancy layer.
+        // Rowless. The grace window (from MINT time) holds the reaper off an
+        // in-flight archive / reconstruct that has not yet committed its row.
         if !store.manifest_age_secs(id).is_some_and(|a| a >= grace_secs) {
             continue;
         }
-        match store.remove(id) {
-            Ok(_) => {
-                report.orphans_reaped += 1;
-                tracing::warn!(
-                    target: ERASURE_TRACE_TARGET,
-                    bundle_id = %id,
-                    "erasure cold tier: reaped ORPHAN bundle (no archived or live row) — \
-                     destruction intent reconciled"
-                );
-            }
-            Err(e) => tracing::warn!(
-                target: ERASURE_TRACE_TARGET,
-                bundle_id = %id,
-                "erasure cold tier: orphan bundle reap failed (retried next tick): {e}"
-            ),
-        }
+        reconcile_one_rowless(store, id, recover_mode, &mut report);
     }
-    // Bounded, rotating scrub over the current bundles.
+    // Bounded scrub over the current bundles found in THIS rotating window.
     if !scrub_candidates.is_empty() && scrub_limit > 0 {
-        let n = scrub_candidates.len();
-        let start = scrub_cursor().fetch_add(scrub_limit, Ordering::Relaxed) % n;
-        for offset in 0..scrub_limit.min(n) {
-            let id = &scrub_candidates[(start + offset) % n];
+        for id in scrub_candidates.iter().take(scrub_limit) {
             report.scrub_verified += 1;
             match scrub_one(conn, store, id) {
                 Ok(true) => report.scrub_reminted += 1,
@@ -628,6 +741,27 @@ pub fn reconcile_and_scrub(
         }
     }
     report
+}
+
+/// Write-ahead purge-intent journal, best-effort (destruction-intent record
+/// BEFORE a purge `DELETE`). No-op when no bundle directory exists, so purge
+/// stays byte-identical for deployments that never enabled the cold tier. A
+/// journal-write failure degrades to QUARANTINE (the reconciler preserves the
+/// bundle rather than destroying it) — safe, never a data-loss.
+pub fn journal_purge_intent_best_effort(conn: &Connection, ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let Some(store) = store_if_dir_present(conn) else {
+        return;
+    };
+    if let Err(e) = store.journal_purge_intent(ids) {
+        tracing::warn!(
+            target: ERASURE_TRACE_TARGET,
+            "erasure cold tier: purge-intent journal write failed (affected bundles will be \
+             QUARANTINED not destroyed): {e}"
+        );
+    }
 }
 
 /// The gc-tick entry point: no-op when the cold tier is disabled; otherwise
@@ -649,10 +783,17 @@ pub fn gc_tick(conn: &Connection) -> Result<SweepReport> {
         SCRUB_LIMIT_PER_TICK,
         RECONCILE_GRACE_SECS,
     );
-    if rr.orphans_reaped > 0 || rr.temp_reaped > 0 || rr.scrub_reminted > 0 {
+    if rr.orphans_reaped > 0
+        || rr.quarantined > 0
+        || rr.quarantine_recovered > 0
+        || rr.temp_reaped > 0
+        || rr.scrub_reminted > 0
+    {
         tracing::info!(
             target: ERASURE_TRACE_TARGET,
             orphans_reaped = rr.orphans_reaped,
+            quarantined = rr.quarantined,
+            quarantine_recovered = rr.quarantine_recovered,
             temp_reaped = rr.temp_reaped,
             scrub_reminted = rr.scrub_reminted,
             "erasure cold tier: reconciliation pass"

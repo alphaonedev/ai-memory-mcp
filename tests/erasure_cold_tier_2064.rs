@@ -25,6 +25,7 @@ use std::sync::{Mutex, OnceLock};
 
 use ai_memory::db;
 use ai_memory::erasure::ENV_ERASURE_COLD_TIER;
+use ai_memory::erasure::ENV_ERASURE_RECOVER_QUARANTINE;
 use ai_memory::erasure::archive_sync;
 use ai_memory::models::Tier;
 use rusqlite::{Connection, params};
@@ -322,39 +323,119 @@ fn sweep_is_paced_by_the_limit() {
 }
 
 #[test]
-fn orphan_bundle_reaped_and_not_resurrectable() {
-    // F1 (HIGH) — a bundle whose archived row was purged (or lost between the
-    // DELETE and the best-effort bundle removal) is an ORPHAN. Pre-fix it
-    // survived FOREVER (no future purge revisits a purged id) and
-    // `archive restore` could resurrect purged / forgotten-then-purged
-    // content. The gc-tick orphan reconciliation must reap it.
+fn journaled_purge_orphan_is_reaped_and_not_resurrectable() {
+    // R1 (SAFE half of F1) — a bundle whose id carries a RECORDED purge intent
+    // (journaled BEFORE the DELETE) is confirmed destruction. A crash between
+    // the DELETE and the best-effort removal orphans the bundle; the
+    // reconciler HARD-reaps it, and restore refuses to resurrect it even
+    // while it lingers.
     let _g = env_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     enable(true);
     let f = fixture();
-    seed_archived(&f.conn, "row-orphan", "purged, must not resurrect", None);
+    seed_archived(&f.conn, "row-purged-crash", "destroyed on purpose", None);
     archive_sync::gc_tick(&f.conn).expect("sweep");
-    let bundle = erasure_dir(&f.db_path).join("row-orphan");
+    let bundle = erasure_dir(&f.db_path).join("row-purged-crash");
     assert!(bundle.join("manifest.json").is_file(), "bundle minted");
 
-    // Simulate the purge-crash orphan: the archived row vanishes but the
-    // bundle survives (remove_bundles_best_effort never ran).
-    drop_archived_row(&f.conn, "row-orphan");
-    assert!(bundle.exists(), "orphan bundle present pre-reconciliation");
+    // A purge that journaled intent + deleted the row, then CRASHED before
+    // removing the bundle.
+    archive_sync::journal_purge_intent_best_effort(&f.conn, &["row-purged-crash".to_string()]);
+    drop_archived_row(&f.conn, "row-purged-crash");
 
-    // Reconcile with a zero grace window (the const grace is 1h — not
-    // waitable in a test). The orphan is reaped; the id no longer resurrects.
+    // Restore refuses a journaled id immediately (before any reconciliation).
+    assert!(
+        !db::restore_archived(&f.conn, "row-purged-crash").expect("restore"),
+        "a journaled-purge id must NOT resurrect, even while its bundle lingers"
+    );
+
     let store = archive_sync::store_for_conn(&f.conn)
         .expect("store")
         .expect("enabled");
     let rr = archive_sync::reconcile_and_scrub(&f.conn, &store, 512, 16, 0);
-    assert_eq!(rr.orphans_reaped, 1, "the orphan bundle is reaped");
-    assert!(!bundle.exists(), "orphan bundle gone after reconciliation");
+    assert_eq!(rr.orphans_reaped, 1, "the journaled orphan is hard-reaped");
+    assert_eq!(rr.quarantined, 0, "a journaled orphan is never quarantined");
     assert!(
-        !db::restore_archived(&f.conn, "row-orphan").expect("restore after reap"),
-        "a purge-crash orphan must NOT be resurrectable from the cold tier"
+        !bundle.exists(),
+        "journaled orphan bundle gone after reconciliation"
     );
+    enable(false);
+}
+
+#[test]
+fn unjournaled_dbloss_bundle_is_quarantined_not_destroyed_and_recoverable() {
+    // R1 (BLOCKING inversion) — a rowless bundle with NO recorded purge intent
+    // is byte-INDISTINGUISHABLE from the partial-DB-loss disaster the tier
+    // EXISTS to survive (the bundle is the last surviving copy). It MUST NOT be
+    // destroyed: quarantine (preserve + hide) instead. `restore` refuses to
+    // auto-materialize a quarantined bundle (resurrection lane stays closed),
+    // yet the operator can recover it via the DR path. "Never cause
+    // unintentional data loss" outranks "purged content must not resurrect".
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    seed_archived(&f.conn, "row-dbloss", "the last surviving copy", None);
+    archive_sync::gc_tick(&f.conn).expect("sweep");
+    let active = erasure_dir(&f.db_path).join("row-dbloss");
+    let quarantined = erasure_dir(&f.db_path)
+        .join(".quarantine")
+        .join("row-dbloss");
+    assert!(active.join("manifest.json").is_file(), "bundle minted");
+
+    // Partial DB loss: the archived row vanishes, NO purge intent journaled.
+    drop_archived_row(&f.conn, "row-dbloss");
+
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+    let rr = archive_sync::reconcile_and_scrub(&f.conn, &store, 512, 16, 0);
+    assert_eq!(
+        rr.quarantined, 1,
+        "possible DB loss → QUARANTINE, never destroy"
+    );
+    assert_eq!(
+        rr.orphans_reaped, 0,
+        "no destruction without a recorded purge intent"
+    );
+    assert!(!active.exists(), "bundle moved OUT of the active store");
+    assert!(
+        quarantined.join("manifest.json").is_file(),
+        "bundle PRESERVED in quarantine (not destroyed)"
+    );
+    assert!(
+        !db::restore_archived(&f.conn, "row-dbloss").expect("restore"),
+        "a quarantined bundle is invisible to restore (resurrection lane closed)"
+    );
+
+    // DR recovery: the operator asserts DB loss, engages recovery, reconciles →
+    // the bundle returns to active; restore then reconstructs the lost row.
+    unsafe { std::env::set_var(ENV_ERASURE_RECOVER_QUARANTINE, "1") };
+    let rr2 = archive_sync::reconcile_and_scrub(&f.conn, &store, 512, 16, 0);
+    assert_eq!(
+        rr2.quarantine_recovered, 1,
+        "DR mode recovers the quarantined bundle to active"
+    );
+    assert!(
+        active.join("manifest.json").is_file(),
+        "bundle is back in the active store"
+    );
+    assert!(
+        db::restore_archived(&f.conn, "row-dbloss").expect("DR restore"),
+        "after recovery the DB-lost row reconstructs from its preserved shards"
+    );
+    let content: String = f
+        .conn
+        .query_row(
+            "SELECT content FROM memories WHERE id = 'row-dbloss'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("restored live row");
+    assert_eq!(content, "the last surviving copy", "byte-exact recovery");
+    unsafe { std::env::remove_var(ENV_ERASURE_RECOVER_QUARANTINE) };
     enable(false);
 }
 

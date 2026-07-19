@@ -43,6 +43,12 @@
 //! - [`ENV_ERASURE_DATA_SHARDS`] / [`ENV_ERASURE_PARITY_SHARDS`] — the
 //!   (k, m) geometry for NEW bundles (defaults 4 + 2). Existing bundles
 //!   stay readable under their manifest-recorded geometry.
+//! - [`ENV_ERASURE_RECOVER_QUARANTINE`] — DR-recovery mode (default OFF).
+//!   The gc reconciliation NEVER hard-deletes a rowless bundle unless its
+//!   id is recorded in the write-ahead purge-intent journal; an un-journaled
+//!   rowless bundle (possible DB loss) is QUARANTINED, not destroyed. This
+//!   switch moves quarantined bundles back to active so `archive restore`
+//!   can reach them (the operator's "this was DB loss" assertion).
 
 pub mod archive_sync;
 pub mod codec;
@@ -66,21 +72,42 @@ pub const ENV_ERASURE_DATA_SHARDS: &str = "AI_MEMORY_ERASURE_DATA_SHARDS";
 /// `m` — parity-shard count (the loss budget) for newly written bundles.
 pub const ENV_ERASURE_PARITY_SHARDS: &str = "AI_MEMORY_ERASURE_PARITY_SHARDS";
 
+/// DR-recovery switch (default OFF): when truthy the gc-tick reconciliation
+/// MOVES every quarantined bundle back to the active store (so
+/// `archive restore <id>` can reach it) AND stops quarantining new rowless
+/// un-journaled bundles — the explicit operator assertion "this was DB loss,
+/// not purge; keep the redundancy serveable". The operator sets it, restarts,
+/// runs `archive restore <id>` per recovered id, then unsets it. Named in the
+/// loud quarantine WARN (#2064 F1). Same truthy grammar as the master switch.
+pub const ENV_ERASURE_RECOVER_QUARANTINE: &str = "AI_MEMORY_ERASURE_RECOVER_QUARANTINE";
+
 /// Compiled default `k`.
 pub const DEFAULT_ERASURE_DATA_SHARDS: usize = 4;
 
 /// Compiled default `m`.
 pub const DEFAULT_ERASURE_PARITY_SHARDS: usize = 2;
 
-/// Whether the erasure cold tier is enabled (default OFF — opt-in).
-#[must_use]
-pub fn erasure_cold_tier_enabled() -> bool {
-    std::env::var(ENV_ERASURE_COLD_TIER).ok().is_some_and(|v| {
+/// Truthy-grammar check (`1`/`true`/`yes`/`on`, case-insensitive, trimmed) —
+/// the secure-opt-in shape shared by every erasure boolean env knob.
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name).ok().is_some_and(|v| {
         matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
         )
     })
+}
+
+/// Whether the erasure cold tier is enabled (default OFF — opt-in).
+#[must_use]
+pub fn erasure_cold_tier_enabled() -> bool {
+    env_truthy(ENV_ERASURE_COLD_TIER)
+}
+
+/// Whether the DR quarantine-recovery mode is engaged (default OFF).
+#[must_use]
+pub fn recover_quarantine_enabled() -> bool {
+    env_truthy(ENV_ERASURE_RECOVER_QUARANTINE)
 }
 
 /// Parse one shard-count knob: a positive integer within the codec cap
