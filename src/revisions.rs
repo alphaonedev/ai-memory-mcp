@@ -343,6 +343,80 @@ pub fn read_revision_chain_head(conn: &Connection) -> Result<(i64, [u8; 32])> {
     }
 }
 
+/// v1.0.0 #2202 (CWE-354) — recompute
+/// `SHA-256(canonical_revision_chain_bytes(row, sequence))` as lowercase hex for
+/// the SURVIVING `memory_revisions` row at `sequence`, or `None` when no row
+/// survives there (or its `kind` is unknown → the head-hash lane withholds
+/// `Unknown`). The `memory_revisions` twin of
+/// [`crate::signed_events`]'s `recompute_signed_row_hash_at`: the #1873 witness
+/// head-hash lane compares the witnessed revision head hash against THIS
+/// recompute AT the anchored sequence. `canonical_revision_chain_bytes` excludes
+/// `prev_hash` and rows are append-immutable, so the anchored row's hash is
+/// stable under later appends and comparing whenever `anchored_seq <= db_head`
+/// can never false-positive on a clean chain.
+///
+/// # Errors
+/// Propagates the `rusqlite` query error.
+pub fn recompute_revision_row_hash_at(conn: &Connection, sequence: i64) -> Result<Option<String>> {
+    #[allow(clippy::type_complexity)]
+    let row: Option<(
+        String,
+        String,
+        String,
+        Option<i64>,
+        String,
+        Option<String>,
+        String,
+        Option<Vec<u8>>,
+    )> = conn
+        .query_row(
+            "SELECT id, memory_id, kind, prior_version, namespace, agent_id, created_at, \
+                    signature \
+             FROM memory_revisions \
+             WHERE sequence = ?1 \
+             LIMIT 1",
+            [sequence],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            },
+        )
+        .optional()
+        .context("recompute memory_revisions row at sequence")?;
+    let Some((id, memory_id, kind_s, prior_version, namespace, agent_id, created_at, signature)) =
+        row
+    else {
+        return Ok(None);
+    };
+    let Some(kind) = RecordKind::from_str_opt(&kind_s) else {
+        return Ok(None);
+    };
+    let leaf = RevisionLeaf {
+        id,
+        memory_id,
+        kind,
+        prior_version,
+        namespace,
+        agent_id,
+        created_at,
+        signature,
+    };
+    let canon = canonical_revision_chain_bytes(&leaf, sequence);
+    let mut hasher = Sha256::new();
+    hasher.update(&canon);
+    Ok(Some(crate::signed_events::hex_lower(
+        hasher.finalize().as_slice(),
+    )))
+}
+
 /// Append ONE signed identity-only leaf to `memory_revisions`, computing
 /// the `prev_hash` + `sequence` chain columns at insert time. The caller
 /// owns the transaction (this is the `_no_tx` / in-tx shape, mirroring

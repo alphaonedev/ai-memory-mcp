@@ -867,6 +867,54 @@ fn read_chain_head(conn: &Connection) -> Result<(i64, [u8; 32])> {
     }
 }
 
+/// v1.0.0 #2202 (CWE-354) — recompute `SHA-256(canonical_chain_bytes(row))` as
+/// lowercase hex for the SURVIVING `signed_events` row at `sequence`, or `None`
+/// when no row survives there (a gap the monotonic-sequence scan already
+/// surfaces → the head-hash lane withholds `Unknown`).
+///
+/// This is the #1873 "compare AT the anchored sequence" primitive: the anchored
+/// row's canonical hash is STABLE under later appends (`canonical_chain_bytes`
+/// deliberately excludes `prev_hash`, and rows are append-immutable), so
+/// comparing an off-table / witness anchor against this recompute whenever
+/// `anchored_seq <= db_head` can NEVER false-positive on a clean chain — yet it
+/// convicts a same-length whole-suffix rewrite that spans the anchored row even
+/// after the daemon has appended past the watermark (the steady state) or the
+/// attacker appended one linked row to push the head past the anchor. Shared by
+/// the forensic-watermark + witness lanes on both backends (K3 parity).
+fn recompute_signed_row_hash_at(conn: &Connection, sequence: i64) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    let event: Option<SignedEvent> = conn
+        .query_row(
+            "SELECT id, agent_id, event_type, payload_hash, signature, attest_level, \
+                    timestamp, sequence, cause_hash \
+             FROM signed_events \
+             WHERE sequence = ?1 \
+             LIMIT 1",
+            params![sequence],
+            |row| {
+                Ok(SignedEvent {
+                    id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    event_type: row.get(2)?,
+                    payload_hash: row.get(3)?,
+                    signature: row.get(4)?,
+                    attest_level: row.get(5)?,
+                    timestamp: row.get(6)?,
+                    sequence: row.get(7)?,
+                    cause_hash: row.get::<_, Option<Vec<u8>>>(8)?,
+                    prev_hash: Vec::new(), // not part of the canonical bytes
+                })
+            },
+        )
+        .optional()
+        .context("recompute_signed_row_hash_at: read row at sequence")?;
+    Ok(event.map(|ev| {
+        let mut hasher = Sha256::new();
+        hasher.update(canonical_chain_bytes(&ev));
+        hex_lower(hasher.finalize().as_slice())
+    }))
+}
+
 /// Outcome of a [`verify_chain`] pass over the `signed_events` table.
 ///
 /// `rows_checked` counts every row the verifier walked.
@@ -1400,6 +1448,127 @@ pub fn compute_rollback_verdict(
     }
 }
 
+/// Operator-facing chain-name label for the primary audit chain, used in the
+/// `chain` field of the [`HeadHashCheck`] / [`WitnessCheck`] verdicts (one
+/// named SSOT, per the "no hardcoded literals" enforcement directive).
+pub const CHAIN_SIGNED_EVENTS: &str = "signed_events";
+/// Operator-facing chain-name label for the dual-chain revision spine.
+pub const CHAIN_MEMORY_REVISIONS: &str = "memory_revisions";
+
+/// v1.0.0 #1873 (CWE-354) — verdict of the audit-head HASH-anchor check: does
+/// the surviving head row's recomputed canonical hash equal the hash the
+/// off-table anchor (#1850 forensic watermark) / the dual-chain WITNESS (#1822)
+/// recorded at the SAME sequence?
+///
+/// The pre-#1873 `TruncationCheck` / `WitnessCheck` verdicts compare the head
+/// SEQUENCE only (`db_head < anchored_head`), so on an UNSIGNED daemon (no
+/// enrolled key → `verify_chain` verifier `None`) an attacker with DB write
+/// access can rewrite the whole suffix with recomputed `prev_hash` at the SAME
+/// length and both seq-only checks read clean. Both anchors already RECORD the
+/// head canonical hash (`head_canonical_hash` in the watermark payload;
+/// `signed_head_hash` / `revisions_head_hash` in the witness resolution) — this
+/// verdict finally COMPARES it.
+///
+/// `Unknown` withholds (default posture) when there is no anchor OR the head
+/// row is absent — never a false alarm. `NotDetected` = the recomputed head
+/// hash equals the anchored hash. `Mismatch` = a same-length suffix rewrite of
+/// the head row was detected (dirty, like [`TruncationCheck::Detected`]).
+///
+/// # Known bounds (honest scoping — do NOT overclaim)
+/// * `canonical_chain_bytes` deliberately EXCLUDES `prev_hash` (hash-agility),
+///   so a single head-row hash does NOT transitively bind interior rows: an
+///   interior / mid-suffix rewrite BELOW the anchored head that leaves the head
+///   row's own columns intact, and a rewrite of the up-to-`WATERMARK_INTERVAL`-1
+///   un-anchored rows ABOVE the last watermark, are NOT caught here. The
+///   off-host `AI_MEMORY_LOG_SINK=syslog` tier (or a future rolling/accumulator
+///   hash) is the residual-closing control for those.
+/// * `#1930` encoding-skew transient: `canonical_chain_bytes` is NOT
+///   byte-identical to the pre-#1930 encoding, so an anchor emitted by a
+///   pre-#1930 binary and re-verified by a post-#1930 binary can `Mismatch` on
+///   a CLEAN head row — a NARROW, one-time window that closes as soon as the
+///   next watermark fires (≤`WATERMARK_INTERVAL` appends, or graceful shutdown)
+///   under the new encoding. Any deployment that has emitted one watermark
+///   since the #1930 upgrade is unaffected.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum HeadHashCheck {
+    /// No anchor available, or the head row is absent — verdict withheld
+    /// (the safe default; never a false alarm).
+    Unknown,
+    /// The recomputed head-row canonical hash equals the anchored hash.
+    NotDetected,
+    /// A same-length suffix rewrite of the head row was detected: the anchored
+    /// head hash and the recomputed head-row hash differ at EQUAL sequence.
+    Mismatch {
+        /// Which chain the mismatch was found on
+        /// (`signed_events` | `memory_revisions`).
+        chain: String,
+        /// The anchor source + truncated hashes for the operator report.
+        detail: String,
+    },
+}
+
+/// v1.0.0 #1873 — compute the [`HeadHashCheck`] verdict for ONE anchor+chain.
+/// Pure (no I/O) so the recompute-and-compare policy is unit-testable in
+/// isolation (the `compute_rollback_verdict` precedent); the I/O wrapper reads
+/// the anchors + recomputes the head-row hash and folds the per-anchor verdicts
+/// (first `Mismatch` wins) inside `verify_audit_trail` on BOTH backends (K3
+/// parity). `anchored_hash` = the off-table / witness head hash (`None` = no
+/// anchor → withhold); `recomputed_hash` = `SHA-256(canonical_chain_bytes(head
+/// row))` in lowercase hex (`None` = head row absent → withhold). Comparison is
+/// case-insensitive so a hex-case difference is never a false `Mismatch`.
+#[must_use]
+pub fn compute_head_hash_verdict(
+    anchored_hash: Option<&str>,
+    recomputed_hash: Option<&str>,
+    chain: &str,
+) -> HeadHashCheck {
+    match (anchored_hash, recomputed_hash) {
+        // Structural non-comparability → withhold (never a false alarm).
+        (None, _) | (_, None) => HeadHashCheck::Unknown,
+        (Some(anchored), Some(recomputed)) if anchored.eq_ignore_ascii_case(recomputed) => {
+            HeadHashCheck::NotDetected
+        }
+        (Some(anchored), Some(recomputed)) => {
+            let head = |h: &str| h.chars().take(12).collect::<String>();
+            HeadHashCheck::Mismatch {
+                chain: chain.to_string(),
+                detail: format!(
+                    "{chain} head-row canonical hash mismatch at equal sequence \
+                     (same-length suffix rewrite): anchored {}… != recomputed {}…",
+                    head(anchored),
+                    head(recomputed)
+                ),
+            }
+        }
+    }
+}
+
+/// v1.0.0 #1873 — fold the per-anchor [`HeadHashCheck`] verdicts (the #1850
+/// forensic watermark + the #1822 dual-chain witness, each for the chains it
+/// anchors) into the single `AuditTrailReport.head_hash` verdict. Precedence:
+/// ANY `Mismatch` wins (a same-length rewrite on ANY anchored chain is dirty —
+/// the FIRST such, so the forensic lane is passed first); else if ANY lane
+/// verified a `NotDetected` (a real match happened) the verdict is
+/// `NotDetected`; else `Unknown` (no anchor was comparable → withhold). Pure so
+/// both backends' `verify_audit_trail` fold identically (K3 parity).
+#[must_use]
+pub fn fold_head_hash_verdicts(verdicts: Vec<HeadHashCheck>) -> HeadHashCheck {
+    if let Some(mismatch) = verdicts
+        .iter()
+        .find(|v| matches!(v, HeadHashCheck::Mismatch { .. }))
+    {
+        return mismatch.clone();
+    }
+    if verdicts
+        .iter()
+        .any(|v| matches!(v, HeadHashCheck::NotDetected))
+    {
+        return HeadHashCheck::NotDetected;
+    }
+    HeadHashCheck::Unknown
+}
+
 /// v0.9.0 G9 (#1826) — verdict of the three-key Recorder/Judge/Stopper
 /// signing-layer SEPARATION check, computed by
 /// [`compute_role_separation_verdict`]. Additive/opt-in: with no role keys
@@ -1619,6 +1788,33 @@ pub fn compute_witness_verdict(
     WitnessCheck::NotDetected
 }
 
+/// v1.0.0 #1873 F3 (#2203) — the witness dual head, extracted ONLY when the
+/// latest witness checkpoint passes the SAME K1 pin + signature gate
+/// [`compute_witness_verdict`] enforces, so the head-hash lane can never trust a
+/// FORGED in-DB checkpoint to mint a false `Mismatch` (or an unearned
+/// `NotDetected`). Returns `None` — the head-hash lane then withholds
+/// (`Unknown`) — when there is no anchor, no out-of-band pin to anchor the
+/// pubkey, the K1 pin fails, or the signature is invalid. Mirrors the pin-FIRST
+/// discipline of [`compute_witness_verdict`]; shared by both backends (K3 parity).
+#[must_use]
+pub fn verified_witness_dual_head(
+    latest_witness: Option<&crate::models::Checkpoint>,
+    enrolled_pubkey: Option<&ed25519_dalek::VerifyingKey>,
+) -> Option<crate::governance::audit::WitnessDualHead> {
+    let cp = latest_witness?;
+    // No out-of-band pin → cannot cryptographically anchor the pubkey → withhold
+    // (mirrors `compute_witness_verdict`'s `enrolled_pubkey.is_none()` withhold).
+    let expected = enrolled_pubkey?;
+    // K1 pin FIRST, then signature self-consistency over the canonical resolution.
+    if cp.resolver_pubkey.as_slice() != expected.to_bytes().as_slice() {
+        return None;
+    }
+    if !crate::checkpoints::verify(cp) {
+        return None;
+    }
+    crate::governance::audit::parse_witness_dual_head(cp)
+}
+
 /// Cause-binding verdict (#1822 K2). `rows_without_cause == 0` →
 /// [`CauseBinding::NotDetected`]; otherwise [`CauseBinding::Detected`] under
 /// require-mode (fail-closed) or [`CauseBinding::Unknown`] (withhold) by
@@ -1703,6 +1899,15 @@ pub struct AuditTrailReport {
     /// `Sanctioned` (operator-attested DR) and `NotDetected` are clean. SHARED
     /// off-table reader on both backends (K3 parity). See [`RollbackCheck`].
     pub rollback: RollbackCheck,
+    /// v1.0.0 #1873 (CWE-354) — audit-head HASH-anchor verdict: the surviving
+    /// head row's recomputed canonical hash vs the anchored/witnessed head hash
+    /// at EQUAL sequence, catching a same-length suffix rewrite the seq-only
+    /// `truncation`/`witness` checks miss on an unsigned daemon. `Unknown`
+    /// withholds (default — no anchor / head row absent, byte-identical
+    /// legacy); `Mismatch` is dirty. Populated IDENTICALLY by both backends.
+    /// See [`HeadHashCheck`] for the known bounds (interior-row / sub-interval /
+    /// #1930 encoding-skew).
+    pub head_hash: HeadHashCheck,
 }
 
 impl AuditTrailReport {
@@ -1752,6 +1957,11 @@ impl AuditTrailReport {
                 self.rollback,
                 RollbackCheck::Evidence { .. } | RollbackCheck::Missing
             )
+            // v1.0.0 #1873 (CWE-354) — a head-hash Mismatch (same-length suffix
+            // rewrite detected at equal sequence) is dirty, like
+            // TruncationCheck::Detected; Unknown/NotDetected keep an otherwise-
+            // clean report clean (no anchor / head row absent = legacy-identical).
+            && !matches!(self.head_hash, HeadHashCheck::Mismatch { .. })
     }
 }
 
@@ -2007,6 +2217,78 @@ pub fn verify_audit_trail(conn: &Connection, since: Option<&str>) -> Result<Audi
     // anchor reader (identical verdict on the postgres twin, K3 parity).
     let rollback = crate::governance::audit::compute_rollback_verdict_for_report(head_sequence);
 
+    // v1.0.0 #1873 (CWE-354) — audit-head HASH-anchor check. The seq-only
+    // `truncation` + `witness` verdicts above miss a SAME-LENGTH suffix rewrite
+    // on an unsigned daemon (recomputed `prev_hash`, equal row count). For every
+    // anchor that records a head hash — the #1850 forensic watermark
+    // (signed_events) + the #1822 dual-chain WITNESS (signed_events AND
+    // memory_revisions) — recompute the canonical hash of the SURVIVING ROW AT
+    // THE ANCHORED SEQUENCE and compare whenever `anchored_seq <= db_head`
+    // (#2202). Comparing AT the anchored sequence — not only when it is still the
+    // head — convicts a rewrite spanning the anchored row even after the daemon
+    // has appended past the watermark (the steady state ~63/64 of the time) or
+    // the attacker appended one linked row to push the head past the anchor.
+    // `canonical_chain_bytes` excludes `prev_hash` and rows are append-immutable,
+    // so the anchored row's hash is stable under later appends and this can never
+    // false-positive; `anchored_seq > db_head` stays withheld (the truncation /
+    // witness lanes own that) and a missing row at the anchored sequence (a gap
+    // surfaced above) → `None` → withhold. F3 (#2203): the witness anchor is
+    // consumed ONLY THROUGH the K1 pin + signature gate
+    // (`verified_witness_dual_head`) so a forged in-DB checkpoint can't mint a
+    // false verdict. `recompute_signed_row_hash_at` /
+    // `revisions::recompute_revision_row_hash_at` + the pure
+    // `fold_head_hash_verdicts` → the postgres twin computes an identical verdict
+    // (K3 parity). See [`HeadHashCheck`] for the interior-row / sub-interval /
+    // #1930 bounds.
+    let head_hash = {
+        let witness_dual =
+            verified_witness_dual_head(latest_witness.as_ref(), enrolled_pubkey.as_ref());
+        let mut verdicts: Vec<HeadHashCheck> = Vec::new();
+        // (a) forensic watermark → signed_events row AT the anchored sequence.
+        if let Some((anchored_head, anchored_hash)) =
+            crate::governance::audit::last_audit_watermark()
+            && anchored_head > 0
+            && anchored_head <= head_sequence
+        {
+            let recomputed = recompute_signed_row_hash_at(conn, anchored_head)
+                .ok()
+                .flatten();
+            verdicts.push(compute_head_hash_verdict(
+                Some(&anchored_hash),
+                recomputed.as_deref(),
+                CHAIN_SIGNED_EVENTS,
+            ));
+        }
+        // (b) witness dual anchor → signed_events + memory_revisions rows AT the
+        //     anchored sequences.
+        if let Some(dual) = witness_dual {
+            if dual.signed_head_sequence > 0 && dual.signed_head_sequence <= head_sequence {
+                let recomputed = recompute_signed_row_hash_at(conn, dual.signed_head_sequence)
+                    .ok()
+                    .flatten();
+                verdicts.push(compute_head_hash_verdict(
+                    Some(&dual.signed_head_hash),
+                    recomputed.as_deref(),
+                    CHAIN_SIGNED_EVENTS,
+                ));
+            }
+            if dual.revisions_head_sequence > 0 && dual.revisions_head_sequence <= revisions_head {
+                let recomputed = crate::revisions::recompute_revision_row_hash_at(
+                    conn,
+                    dual.revisions_head_sequence,
+                )
+                .ok()
+                .flatten();
+                verdicts.push(compute_head_hash_verdict(
+                    Some(&dual.revisions_head_hash),
+                    recomputed.as_deref(),
+                    CHAIN_MEMORY_REVISIONS,
+                ));
+            }
+        }
+        fold_head_hash_verdicts(verdicts)
+    };
+
     Ok(AuditTrailReport {
         total_events: usize::try_from(report.rows_checked).unwrap_or(usize::MAX),
         chain_intact: report.chain_holds(),
@@ -2016,6 +2298,7 @@ pub fn verify_audit_trail(conn: &Connection, since: Option<&str>) -> Result<Audi
         since: since.map(ToString::to_string),
         truncation,
         witness,
+        head_hash,
         cause_binding,
         signature_failures: report.signature_failures.clone(),
         role_separation,
@@ -2468,6 +2751,105 @@ mod tests {
     use chrono::Utc;
     use rusqlite::Connection;
     use uuid::Uuid;
+
+    // v1.0.0 #1873 (CWE-354) — pure-fn coverage for the audit-head hash verdict.
+    #[test]
+    fn head_hash_verdict_withholds_without_anchor_or_row() {
+        // No anchor → withhold (never a false alarm).
+        assert_eq!(
+            compute_head_hash_verdict(None, Some("abc123"), "signed_events"),
+            HeadHashCheck::Unknown
+        );
+        // Head row absent → withhold.
+        assert_eq!(
+            compute_head_hash_verdict(Some("abc123"), None, "signed_events"),
+            HeadHashCheck::Unknown
+        );
+    }
+
+    #[test]
+    fn head_hash_verdict_matches_are_clean_case_insensitive() {
+        assert_eq!(
+            compute_head_hash_verdict(Some("DEADBEEF"), Some("deadbeef"), "signed_events"),
+            HeadHashCheck::NotDetected,
+            "hex case difference must never be a false Mismatch"
+        );
+    }
+
+    #[test]
+    fn head_hash_verdict_flags_same_length_rewrite() {
+        // Equal-sequence, differing head hash = a same-length suffix rewrite.
+        let v = compute_head_hash_verdict(
+            Some("aaaaaaaaaaaaaaaa"),
+            Some("bbbbbbbbbbbbbbbb"),
+            "signed_events",
+        );
+        match v {
+            HeadHashCheck::Mismatch { chain, detail } => {
+                assert_eq!(chain, "signed_events");
+                assert!(
+                    detail.contains("same-length suffix rewrite"),
+                    "detail: {detail}"
+                );
+            }
+            other => panic!("expected Mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fold_head_hash_verdicts_precedence() {
+        use HeadHashCheck::{Mismatch, NotDetected, Unknown};
+        let mm = || Mismatch {
+            chain: "signed_events".to_string(),
+            detail: "x".to_string(),
+        };
+        // Empty → Unknown (withhold).
+        assert_eq!(fold_head_hash_verdicts(vec![]), Unknown);
+        // Any Unknown-only → Unknown.
+        assert_eq!(fold_head_hash_verdicts(vec![Unknown, Unknown]), Unknown);
+        // A verified match with no mismatch → NotDetected.
+        assert_eq!(
+            fold_head_hash_verdicts(vec![Unknown, NotDetected]),
+            NotDetected
+        );
+        // ANY mismatch wins over matches/withholds (dirty).
+        assert_eq!(
+            fold_head_hash_verdicts(vec![NotDetected, mm(), Unknown]),
+            mm()
+        );
+        assert_eq!(fold_head_hash_verdicts(vec![mm()]), mm());
+    }
+
+    #[test]
+    fn head_hash_mismatch_dirties_is_clean() {
+        // A clean report is is_clean(); flipping ONLY head_hash to Mismatch
+        // must dirty it (the exit-code gate must fire on the rewrite).
+        let mut report = AuditTrailReport {
+            total_events: 1,
+            chain_intact: true,
+            first_break_sequence: None,
+            sequence_gaps: Vec::new(),
+            head_sequence: 1,
+            since: None,
+            truncation: TruncationCheck::NotDetected,
+            witness: WitnessCheck::Unknown,
+            head_hash: HeadHashCheck::NotDetected,
+            cause_binding: CauseBinding::Unknown,
+            signature_failures: Vec::new(),
+            role_separation: RoleSeparationCheck::Unknown,
+            lineage: crate::identity::lineage::LineageCheck::Unknown,
+            rollback: RollbackCheck::Unknown,
+        };
+        assert!(report.is_clean(), "baseline report must be clean");
+        report.head_hash = HeadHashCheck::Mismatch {
+            chain: "signed_events".to_string(),
+            detail: "x".to_string(),
+        };
+        assert!(
+            !report.is_clean(),
+            "a head-hash Mismatch must dirty is_clean (exit-1 on same-length rewrite)"
+        );
+    }
 
     /// In-memory connection with the v25 schema applied. We don't go
     /// through `db::open` (which carries the full migration ladder
