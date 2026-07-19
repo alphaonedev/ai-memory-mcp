@@ -85,7 +85,7 @@ pub struct ExportEnvelope {
     pub source: String,
     /// RFC3339 export instant.
     pub exported_at: String,
-    /// The 28-field `Memory` rows (screened — forbidden classes dropped,
+    /// The 30-field `Memory` rows (screened — forbidden classes dropped,
     /// credentials masked).
     pub memories: Vec<Memory>,
     /// The `MemoryLink` rows.

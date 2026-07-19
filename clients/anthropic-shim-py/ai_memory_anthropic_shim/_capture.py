@@ -152,6 +152,13 @@ def capture_turn(
     if resp is None:
         print("WARN ai-memory-anthropic-shim: no capture response from substrate", file=sys.stderr)
         return False
+    # A top-level JSON-RPC `error` member (e.g. an unknown-method / invalid-params
+    # fault) is a FAILURE, not a success — it carries no `result`, so it would
+    # otherwise slip past the `isError` check below and be mis-counted as a
+    # captured turn. Screen it before the tool-level `isError` branch.
+    if resp.get("error") is not None:
+        print("WARN ai-memory-anthropic-shim: substrate returned JSON-RPC error", file=sys.stderr)
+        return False
     if isinstance(resp.get("result"), dict) and resp["result"].get("isError") is True:
         print("WARN ai-memory-anthropic-shim: substrate returned isError:true", file=sys.stderr)
         return False

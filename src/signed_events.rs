@@ -2690,6 +2690,15 @@ pub enum ReAnchorOutcome {
     /// FAILURE: witness key material exists but cannot sign (corrupt /
     /// half-enrolled / public-only custody). Nothing was persisted.
     KeyUnloadable(String),
+    /// FAILURE (#2242): the pre-countersign [`verify_audit_trail`] pass found
+    /// the chain DIRTY (hash-chain break, sequence gap, anchored tail
+    /// truncation, witness/head-hash anchor mismatch, or any other verdict
+    /// [`AuditTrailReport::is_clean`] treats as dirty). The ceremony REFUSES
+    /// to countersign — a re-anchor over a tampered head would convert
+    /// recoverable tamper-EVIDENCE into a fresh signed false statement.
+    /// Carries a human-readable summary of the dirty verdicts. Nothing was
+    /// persisted.
+    RefusedChainDirty(String),
 }
 
 impl ReAnchorOutcome {
@@ -2702,6 +2711,7 @@ impl ReAnchorOutcome {
             Self::SkippedNoCustody => Some("witness_custody_absent"),
             Self::SkippedEmptyChain => Some("empty_chain"),
             Self::KeyUnloadable(_) => Some("witness_key_unloadable"),
+            Self::RefusedChainDirty(_) => Some("chain_verification_failed"),
         }
     }
 }
@@ -2739,6 +2749,22 @@ pub fn emit_reanchor_ceremony(conn: &Connection) -> Result<ReAnchorOutcome> {
     if head_seq <= 0 {
         return Ok(ReAnchorOutcome::SkippedEmptyChain);
     }
+    // v1.0.0 #2242 — VERIFY BEFORE COUNTERSIGNING (fail closed). The ceremony
+    // is exactly the moment an attacker wants a fresh countersignature over
+    // tampered history, so the FULL verifier runs first: the cross-row hash
+    // chain + sequence contiguity, the #1850 off-table truncation watermark,
+    // the #1822 witness dual-head anchor, and the #1873 head-hash anchor are
+    // all reconciled through [`verify_audit_trail`], and ANY verdict that
+    // [`AuditTrailReport::is_clean`] treats as dirty REFUSES the ceremony with
+    // the typed [`ReAnchorOutcome::RefusedChainDirty`] — the tamper is CAUGHT
+    // here, never laundered under a new signed anchor. Withheld verdicts
+    // (`Unknown` — no anchor enrolled) keep the pre-#2242 clean semantics.
+    let report = verify_audit_trail(conn, None).context("re-anchor: verify audit trail")?;
+    if !report.is_clean() {
+        return Ok(ReAnchorOutcome::RefusedChainDirty(dirty_chain_summary(
+            &report,
+        )));
+    }
     let now_dt = chrono::Utc::now();
     // head_seq > 0 is guaranteed by the guard above; propagate rather than
     // silently anchoring sequence 0 (a false statement) on the impossible
@@ -2754,6 +2780,68 @@ pub fn emit_reanchor_ceremony(conn: &Connection) -> Result<ReAnchorOutcome> {
     )?;
     crate::checkpoints::insert(conn, &cp).context("re-anchor: insert checkpoint")?;
     Ok(ReAnchorOutcome::Anchored(Box::new(cp)))
+}
+
+/// v1.0.0 #2242 — render the DIRTY verdicts of an [`AuditTrailReport`] into
+/// the human-readable refusal detail carried by
+/// [`ReAnchorOutcome::RefusedChainDirty`]. Mirrors the dirty arms of
+/// [`AuditTrailReport::is_clean`] EXACTLY (a withheld `Unknown` / clean
+/// verdict is never listed), so the operator sees WHY the ceremony refused
+/// — which tamper class fired — not just that it did.
+fn dirty_chain_summary(report: &AuditTrailReport) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !report.chain_intact {
+        match report.first_break_sequence {
+            Some(seq) => parts.push(format!("hash-chain break at sequence {seq}")),
+            None => parts.push("hash-chain break".to_string()),
+        }
+    }
+    if !report.sequence_gaps.is_empty() {
+        parts.push(format!("sequence gaps {:?}", report.sequence_gaps));
+    }
+    if matches!(report.truncation, TruncationCheck::Detected { .. }) {
+        parts.push(format!("tail truncation {:?}", report.truncation));
+    }
+    if matches!(
+        report.witness,
+        WitnessCheck::Detected { .. } | WitnessCheck::Forged { .. } | WitnessCheck::Missing
+    ) {
+        parts.push(format!("witness anchor {:?}", report.witness));
+    }
+    if matches!(report.cause_binding, CauseBinding::Detected { .. }) {
+        parts.push(format!("cause binding {:?}", report.cause_binding));
+    }
+    if matches!(
+        report.role_separation,
+        RoleSeparationCheck::Forged { .. }
+            | RoleSeparationCheck::Misconfigured { .. }
+            | RoleSeparationCheck::Missing
+    ) {
+        parts.push(format!("role separation {:?}", report.role_separation));
+    }
+    if matches!(
+        report.lineage,
+        crate::identity::lineage::LineageCheck::Forged { .. }
+            | crate::identity::lineage::LineageCheck::Missing
+    ) {
+        parts.push(format!("identity lineage {:?}", report.lineage));
+    }
+    if matches!(
+        report.rollback,
+        RollbackCheck::Evidence { .. } | RollbackCheck::Missing
+    ) {
+        parts.push(format!("rollback evidence {:?}", report.rollback));
+    }
+    if matches!(report.head_hash, HeadHashCheck::Mismatch { .. }) {
+        parts.push(format!("head-hash anchor {:?}", report.head_hash));
+    }
+    if parts.is_empty() {
+        // Defensive: is_clean() said dirty but no arm above matched — a
+        // future is_clean() extension not mirrored here. Refuse with the
+        // full report rather than an empty (uninformative) detail.
+        parts.push(format!("audit trail dirty: {report:?}"));
+    }
+    parts.join("; ")
 }
 
 /// Lowercase-hex encode a byte slice. Centralised so the #1850 watermark

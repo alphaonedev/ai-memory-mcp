@@ -67,24 +67,26 @@ The "defaults stop lying" lane (Gate 1′) is the centerpiece: six knobs
 that shipped OFF (or non-functional) through v0.10.0 now resolve to their
 secure posture by default, each riding the one-cycle deprecation-WARN
 discipline the v0.10.0 `warn-carrier` release delivered. The release also
-advances the schema **v78 → v81** (all additive), adds an M-of-N
+advances the schema **v78 → v85** (all additive), adds an M-of-N
 threshold key-recovery lane, human-key-signed m-of-n approvals, an
 open-time rollback-evidence check, an inference-plane egress gate, and a
 named `asi-hard` no-disable security posture.
 
 **Surface at v1.0.0** (SSOT: `src/lib.rs` `EXPECTED_*` consts +
-`src/profile.rs`; the tool/route/CLI counts carry forward unchanged from
-v0.9.0 — v1.0.0's growth is env-knob + schema surface, not new
-tools/routes/subcommands):
+`src/profile.rs`; v1.0.0's growth is primarily env-knob + schema surface,
+with a small net increase in tool/route/CLI counts over v0.9.0 — e.g. the
+`Stop` ([#1955](https://github.com/alphaonedev/ai-memory-mcp/issues/1955))
+and `Watch` ([#1978](https://github.com/alphaonedev/ai-memory-mcp/issues/1978))
+CLI subcommands):
 
 | Surface | v1.0.0 |
 |---|---|
-| MCP tools (`--profile full`) | **101 advertised** (100 callable + the always-on `memory_capabilities` bootstrap) |
+| MCP tools (`--profile full`) | **103 advertised** (102 callable + the always-on `memory_capabilities` bootstrap) |
 | MCP tools (`--profile core`) | **7** (original 5 + `memory_load_family` + `memory_smart_load`) + the `memory_capabilities` bootstrap |
-| HTTP routes | **92 production `.route(...)` registrations** / 78 unique URL paths |
-| CLI subcommands | **87 default build** / **89 under `--features sal`** (the `capability init` sub-verb rides the existing `Capability` command, so the top-level count is unchanged) |
+| HTTP routes | **93 production `.route(...)` registrations** / 79 unique URL paths |
+| CLI subcommands | **89 default build** / **91 under `--features sal`** (the `capability init` sub-verb rides the existing `Capability` command, so the top-level count is unchanged) |
 | `MemoryKind` variants | **16** (adds v1.0.0 epistemic typing `Told` / `Instruction` / `Intervention`, [#1945](https://github.com/alphaonedev/ai-memory-mcp/issues/1945)) |
-| Schema | **v81** (`CURRENT_SCHEMA_VERSION`, both adapters) |
+| Schema | **v85** (`CURRENT_SCHEMA_VERSION`, both adapters) |
 
 ## Secure-default flips (breaking)
 
@@ -299,20 +301,32 @@ vector path could only be exercised on an operator's own machine.
   fails LOUD. The `asi-hard` config TEMPLATE (`docs/deploy/asi-hard.env`)
   sets `INFERENCE_EGRESS=loopback-only` explicitly; `asi-hard` never
   becomes a compiled default flip.
-- **`ai-memory export` de-silenced — convenience view, not portability ([#1944](https://github.com/alphaonedev/ai-memory-mcp/issues/1944)).**
-  The JSON `export` command now announces its `memories + links`
-  convenience scope instead of silently omitting the tamper-evidence +
-  governance spine: a stderr-only WARN (so a piped `export > corpus.json`
-  stays valid JSON) plus additive in-band markers
-  (`export_scope="memories+links"`, `portability_complete=false`,
-  `excludes=[...]`). It directs to `ai-memory backup` (lossless SQLite
-  `VACUUM INTO`) for integrity-preserving portability and
-  `export-forensic-bundle` for the signed crypto spine; the standing
-  forbidden-export-class discipline ([#1838](https://github.com/alphaonedev/ai-memory-mcp/issues/1838))
-  keeps signed classes out of the convenience view. The GA portability
-  claim rests on Portability Spec v2 + the CC0 conformance corpus
-  ([#1837](https://github.com/alphaonedev/ai-memory-mcp/issues/1837)) +
-  `ai-memory backup`, not on `export`.
+- **Portability Spec v2 exporter + importer — SHIPPED ([#2006](https://github.com/alphaonedev/ai-memory-mcp/issues/2006)); `export` de-silenced ([#1944](https://github.com/alphaonedev/ai-memory-mcp/issues/1944)).**
+  `ai-memory export --full` emits the full v2 envelope (`src/portability/emit.rs`):
+  `spec_version="2"`, `db_schema_version`, and every §V2-2 signed array
+  (`signed_events`, `memory_revisions`, `forget_tombstones`, `agent_lineage`,
+  `model_attestations`, `governance_rules`, `trust_anchors`) byte-preserved,
+  with a `conformance_level` (L1/L2/L3) COMPUTED from an in-export re-verify
+  pass (a broken audit chain honestly downgrades to L1). A v2 envelope
+  imports via `src/portability/import.rs::import_full_envelope`, which is
+  **FAIL-CLOSED + ALL-OR-NOTHING** per PORTABILITY-V2 §V2-7: every class is
+  staged inside ONE transaction, the imported audit spine is re-verified with
+  `verify_audit_trail` BEFORE commit, and a malformed / tampered / truncated
+  bundle (broken hash link, sequence gap, detected tail-truncation) is
+  REJECTED with the transaction rolled back — a rejected bundle applies
+  **ZERO rows** (never a partial apply); the importer NEVER re-signs.
+  The **default** `ai-memory export` (no `--full`) remains the
+  `memories + links` CONVENIENCE view and now announces that scope instead of
+  silently omitting the tamper-evidence + governance spine: a stderr-only WARN
+  (so a piped `export > corpus.json` stays valid JSON) plus additive in-band
+  markers (`export_scope="memories+links"`, `portability_complete=false`,
+  `excludes=[...]`). The standing forbidden-export-class discipline
+  ([#1838](https://github.com/alphaonedev/ai-memory-mcp/issues/1838)) keeps
+  signed classes out of the convenience view. The GA portability claim rests
+  on Portability Spec v2 + `export --full` / the v2 importer + the CC0
+  conformance corpus ([#1837](https://github.com/alphaonedev/ai-memory-mcp/issues/1837))
+  + the two non-Rust readers + `ai-memory backup` (lossless SQLite
+  `VACUUM INTO`) — NOT on the default `export`.
 
 ## Gate-3 evidence
 
@@ -336,7 +350,7 @@ firm" line for this epic). It ran as a five-step program:
    findings raised ([#2014](https://github.com/alphaonedev/ai-memory-mcp/issues/2014)–[#2017](https://github.com/alphaonedev/ai-memory-mcp/issues/2017))
    were all fixed in-release per the prime directive (no deferrals).
 5. **Final AI-NHI dogfood — PASS.** The dogfood on the GA binary confirmed
-   a **lossless v78 → v81 migration on a real corpus** (the additive
+   a **lossless v78 → v85 migration on a real corpus** (the additive
    crypto-core / lineage-custody / M-of-N-recovery ladder round-trips on
    live data), functional green, and a sound `verify-audit-trail` (the
    witness / cause-binding / role-separation / identity-lineage /
@@ -370,10 +384,10 @@ green before the (operator-gated) tag cut.
 > summarized here for completeness and to record that both review lanes
 > closed green with zero GA-blockers.
 
-## Schema ladder v78 → v81
+## Schema ladder v78 → v85
 
 All additive (CLAUDE.md §Database is the SSOT). Both adapters mirror via
-`src/store/postgres.rs::{migrate_v79 … migrate_v81}`; the v78→v81 ladder
+`src/store/postgres.rs::{migrate_v79 … migrate_v85}`; the v78→v85 ladder
 round-trips losslessly on a real corpus (Gate-3 dogfood).
 
 | Schema | Change |
@@ -381,6 +395,10 @@ round-trips losslessly on a real corpus (Gate-3 dogfood).
 | v79 | crypto-core stage 2 — additive `memories.kind_provenance` ([#1945](https://github.com/alphaonedev/ai-memory-mcp/issues/1945)) + claim-bitemporal `valid_from` / `valid_until` ([#1834](https://github.com/alphaonedev/ai-memory-mcp/issues/1834)) + the `agent_subkey_certs` SubkeyCert table ([#1942](https://github.com/alphaonedev/ai-memory-mcp/issues/1942)); purely additive, no full-table rebuild |
 | v80 | lineage-custody + revocation — additive `agent_lineage.custody_class` + `suspected_compromise_from_seq`, `reason` CHECK widened to admit `revocation` ([#1949](https://github.com/alphaonedev/ai-memory-mcp/issues/1949)) |
 | v81 | M-of-N recovery-quorum — additive recovery-only `agent_lineage.guardian_set_id` + `recovery_threshold`, committed inside the signed CBOR body ([#1831](https://github.com/alphaonedev/ai-memory-mcp/issues/1831), G17) |
+| v82 | operator-authorized skill retire/unretire — additive `skills.retired_at` / `retired_by` / `retire_reason` (sqlite-only; postgres ships no skills table so `migrate_v82` is a version-stamp no-op) ([#2024](https://github.com/alphaonedev/ai-memory-mcp/issues/2024)) |
+| v83 | per-agent HTTP API-key principal binding — additive `agent_api_keys` table (`sha256(token) → agent_id`, both backends) backing the H1 IDOR + M1 admin-spoof fix ([#2044](https://github.com/alphaonedev/ai-memory-mcp/issues/2044) / #2032-A) |
+| v84 | per-row embedding-space provenance — additive `embedding_space` column on `memories` + `archived_memories` (both backends) so recall never scores a vector from a different embedding space after a same-dim model swap ([#2167](https://github.com/alphaonedev/ai-memory-mcp/issues/2167)) |
+| v85 | archive claim-validity parity — additive `valid_from` / `valid_until` on `archived_memories` (both backends), closing the archive→restore data-loss where the #1834 claim-validity interval was dropped on the round-trip ([#2035](https://github.com/alphaonedev/ai-memory-mcp/issues/2035)) |
 {% endraw %}
 </content>
 </invoke>
