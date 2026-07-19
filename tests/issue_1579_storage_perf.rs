@@ -101,7 +101,7 @@ fn a2_bare_list_walks_composite_index_without_sort() {
     let conn = open_test_db();
     let now = chrono::Utc::now().to_rfc3339();
     let (sql, _params) =
-        db::build_list_query(None, None, None, &now, None, None, None, None, 10, 0);
+        db::build_list_query(None, None, None, &now, None, None, None, None, None, 10, 0);
     let plan = explain(&conn, &sql);
     assert!(
         plan.contains("USING INDEX idx_memories_list_order"),
@@ -126,6 +126,7 @@ fn a2_namespace_list_uses_ns_composite_index_without_sort() {
         None,
         None,
         None,
+        None, // #1834 valid_at
         10,
         0,
     );
@@ -154,6 +155,7 @@ fn a2_namespace_tier_minpriority_list_stays_sort_free() {
         None,
         None,
         None,
+        None, // #1834 valid_at
         10,
         0,
     );
@@ -172,8 +174,19 @@ fn a2_namespace_tier_minpriority_list_stays_sort_free() {
 fn a2_min_priority_only_list_range_scans_composite_index() {
     let conn = open_test_db();
     let now = chrono::Utc::now().to_rfc3339();
-    let (sql, _params) =
-        db::build_list_query(None, None, Some(5), &now, None, None, None, None, 10, 0);
+    let (sql, _params) = db::build_list_query(
+        None,
+        None,
+        Some(5),
+        &now,
+        None,
+        None,
+        None,
+        None,
+        None,
+        10,
+        0,
+    );
     let plan = explain(&conn, &sql);
     assert!(
         plan.contains("USING INDEX idx_memories_list_order"),
@@ -241,6 +254,7 @@ fn a2_list_filters_and_ordering_behave_unchanged() {
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .expect("list ns/one");
     let titles: Vec<&str> = listed.iter().map(|m| m.title.as_str()).collect();
@@ -262,6 +276,7 @@ fn a2_list_filters_and_ordering_behave_unchanged() {
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .expect("list min_priority");
     assert_eq!(floored.len(), 2, "priority >= 6 must keep exactly 2 rows");
@@ -278,6 +293,7 @@ fn a2_list_filters_and_ordering_behave_unchanged() {
         None,
         Some("pinned"),
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .expect("list by tag");
     assert_eq!(by_tag.len(), 1);
@@ -295,6 +311,7 @@ fn a2_list_filters_and_ordering_behave_unchanged() {
         None,
         None,
         Some("ai:test-agent"),
+        None, // #1834 valid_at (no as-of)
     )
     .expect("list by agent");
     assert_eq!(by_agent.len(), 1);
@@ -312,6 +329,7 @@ fn a2_list_filters_and_ordering_behave_unchanged() {
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .expect("list page 2");
     let page2_titles: Vec<&str> = page2.iter().map(|m| m.title.as_str()).collect();
@@ -330,6 +348,7 @@ fn a2_list_filters_and_ordering_behave_unchanged() {
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .expect("list since future");
     assert!(none.is_empty(), "since=2999 must match nothing");

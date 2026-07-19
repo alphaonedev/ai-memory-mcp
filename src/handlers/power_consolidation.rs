@@ -935,6 +935,7 @@ pub async fn load_family_handler(
             agent_id: None,
             since: None,
             until: None,
+            valid_at: None,
             limit: MAX_BULK_SIZE,
             // #2167 — load_family listing never runs the recall space gate.
             active_embedding_space: None,

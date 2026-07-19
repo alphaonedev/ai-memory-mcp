@@ -164,6 +164,8 @@ pub fn seed_memory(db_path: &Path, namespace: &str, title: &str, content: &str) 
     }
     let mem = models::Memory {
         cid: None,
+        valid_from: None,
+        valid_until: None,
         id: uuid::Uuid::new_v4().to_string(),
         tier: models::Tier::Mid,
         namespace: namespace.to_string(),

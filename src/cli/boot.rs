@@ -219,6 +219,7 @@ fn fetch_boot_memories(
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )?;
     if !primary.is_empty() {
         return Ok((primary, namespace.to_string()));
@@ -237,6 +238,7 @@ fn fetch_boot_memories(
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )?;
     Ok((fallback, String::new()))
 }

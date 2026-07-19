@@ -57,6 +57,7 @@ pub(super) fn collect_candidates(conn: &Connection, cfg: &CuratorConfig) -> Resu
             None,
             None,
             None,
+            None, // #1834 valid_at (no as-of)
         )?;
         if batch.len() >= cap {
             // We can't tell from db::list whether there were strictly
@@ -110,6 +111,7 @@ pub(super) fn adjacent_memory(conn: &Connection, mem: &Memory) -> Result<Option<
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )?;
     Ok(batch
         .into_iter()

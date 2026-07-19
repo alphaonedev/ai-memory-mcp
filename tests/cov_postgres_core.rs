@@ -53,6 +53,8 @@ fn mem(id: &str, ns: &str, title: &str, content: &str) -> Memory {
     let now = chrono::Utc::now().to_rfc3339();
     Memory {
         cid: None,
+        valid_from: None,
+        valid_until: None,
         id: id.to_string(),
         tier: Tier::Mid,
         namespace: ns.to_string(),
@@ -220,6 +222,7 @@ async fn update_all_patch_fields() {
         confidence: Some(0.5),
         metadata: Some(serde_json::json!({"agent_id":"ai:cov4","note":"x"})),
         source_uri: Some("doc:cov4".to_string()),
+        valid_until: None,
         expires_at: None,
         namespace: None,
         lifecycle_state: None,

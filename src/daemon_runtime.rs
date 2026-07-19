@@ -4962,9 +4962,12 @@ pub async fn bootstrap_serve(
     // has named since v0.7.0 M8. Defaults preserve the legacy
     // 100k-evict-oldest behavior byte-identically.
     let index_limits = app_config.resolve_limits();
+    // v1.0.0 #1860 — resolved through the backend-selecting funnel
+    // (default backend unless the opt-in `vectorlite` feature + env
+    // knob select the extension backend; fails closed to default).
     let vector_index_state: Arc<Mutex<Option<Box<dyn hnsw::VectorSearchIndex>>>> =
         Arc::new(Mutex::new(embedder.is_some().then(|| {
-            hnsw::boxed_default_index(
+            hnsw::boxed_configured_index(
                 index_limits.vector_index_capacity,
                 index_limits.vector_index_hard_fail_at_cap,
             )
@@ -8349,6 +8352,8 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         let mem = crate::models::Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: crate::models::Tier::Mid,
             namespace: "ns".to_string(),
@@ -8415,6 +8420,8 @@ mod tests {
         for i in 0..3 {
             let mem = crate::models::Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: crate::models::Tier::Long,
                 namespace: "ns-b3".to_string(),
@@ -8513,6 +8520,8 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         let mem = crate::models::Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: crate::models::Tier::Short,
             namespace: "ns-gc".to_string(),
@@ -9877,6 +9886,8 @@ decision = "allow"
         let conn = db::open(&env.db_path).unwrap();
         let mem = crate::models::Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: "vi-1".to_string(),
             tier: crate::models::Tier::Mid,
             namespace: "test".to_string(),

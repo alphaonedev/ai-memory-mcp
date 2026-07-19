@@ -131,6 +131,8 @@ async fn live_pg() -> Option<PostgresStore> {
 fn sample_memory(id: &str, namespace: &str) -> Memory {
     Memory {
         cid: None,
+        valid_from: None,
+        valid_until: None,
         id: id.to_string(),
         tier: Tier::Long,
         namespace: namespace.to_string(),
