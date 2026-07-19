@@ -1,5 +1,7 @@
 ---
 layout: doc
+redirect_from:
+  - /reviews/RED-QUEEN-21-AGENT-VOTE-vs-ai-memory.md
 ---
 
 # Red Queen vs ai-memory — 21-Agent Adversarial Vote (FULL SPECTRUM / ASI MOONSHOT)

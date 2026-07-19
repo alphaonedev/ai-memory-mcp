@@ -1,5 +1,7 @@
 ---
 layout: doc
+redirect_from:
+  - /reviews/RED-QUEEN-FINAL-DECISION-AND-ROADMAP-OPUS.md
 ---
 
 # Red Queen / RQGM — FINAL Decision + Development Roadmap (OPUS, eternity-grade)

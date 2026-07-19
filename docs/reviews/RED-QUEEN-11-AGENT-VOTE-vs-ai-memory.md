@@ -1,5 +1,7 @@
 ---
 layout: doc
+redirect_from:
+  - /reviews/RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md
 ---
 
 # Red Queen vs ai-memory — 11-Agent Adversarial Vote (ISOLATED RUN)

@@ -1,5 +1,7 @@
 ---
 layout: doc
+redirect_from:
+  - /reviews/GROK-4-5-TO-FABLE-5-FINAL-RESPONSE.md
 ---
 
 # AI NHI Grok 4.5 → AI NHI Fable 5  

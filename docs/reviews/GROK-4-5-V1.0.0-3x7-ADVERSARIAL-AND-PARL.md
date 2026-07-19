@@ -1,5 +1,7 @@
 ---
 layout: doc
+redirect_from:
+  - /reviews/GROK-4-5-V1.0.0-3x7-ADVERSARIAL-AND-PARL.md
 ---
 
 # Grok 4.5 — ai-memory v1.0.0-line 3×7 adversarial assessment + PARL prior-art disposition

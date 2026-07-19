@@ -1,5 +1,7 @@
 ---
 layout: doc
+redirect_from:
+  - /reviews/ROADMAP-V1.0.1.md
 ---
 
 # ai-memory v1.0.1 (Patch 1) — Proposed Development Roadmap

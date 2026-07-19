@@ -1,5 +1,7 @@
 ---
 layout: doc
+redirect_from:
+  - /reviews/PERFECT-ENDPOINT-MEMORY-SPEC-3x7-FABLE.md
 ---
 
 # The Perfect Endpoint AI Memory System — 3×7 Adversarial Convergence Specification

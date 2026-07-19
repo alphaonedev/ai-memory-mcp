@@ -1,5 +1,7 @@
 ---
 layout: doc
+redirect_from:
+  - /reviews/AGENT-9-FEDERATION-ISOLATED.md
 ---
 
 # Agent 9 — Federation / Multi-Endpoint (ISOLATED RUN)

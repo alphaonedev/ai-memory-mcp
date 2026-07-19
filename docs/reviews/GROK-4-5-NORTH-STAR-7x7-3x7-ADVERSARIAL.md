@@ -1,5 +1,7 @@
 ---
 layout: doc
+redirect_from:
+  - /reviews/GROK-4-5-NORTH-STAR-7x7-3x7-ADVERSARIAL.md
 ---
 
 # Grok 4.5 — North Star 7/7 maximal-truthfulness audit  

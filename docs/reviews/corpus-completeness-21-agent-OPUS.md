@@ -1,5 +1,7 @@
 ---
 layout: doc
+redirect_from:
+  - /reviews/corpus-completeness-21-agent-OPUS.md
 ---
 
 # Corpus-Completeness Pass: Did TRACT Drop Anything Valuable Before Becoming the Measuring Stick?
