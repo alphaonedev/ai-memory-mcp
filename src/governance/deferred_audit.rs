@@ -426,9 +426,7 @@ impl DeferredAuditJournal {
     /// Propagates the open / chmod IO error.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        let mut spool_os = path.as_os_str().to_os_string();
-        spool_os.push(JOURNAL_SPOOL_SUFFIX);
-        let spool_dir = PathBuf::from(spool_os);
+        let spool_dir = journal_spool_dir(&path);
         let spool_existed = spool_dir.exists();
         std::fs::create_dir_all(&spool_dir)
             .with_context(|| format!("create deferred-audit spool {}", spool_dir.display()))?;
@@ -549,10 +547,11 @@ impl DeferredAuditJournal {
         }
         sync_directory(&spool_dir).context("fsync reconciled deferred-audit spool")?;
         validate_atomic_publication(&spool_dir)?;
-        fs2::FileExt::unlock(&spool_lock).context("unlock deferred-audit spool after open")?;
+        usage = scan_spool_usage(&spool_dir)?;
         if usage.entries > JOURNAL_SPOOL_MAX_ENTRIES || usage.bytes > JOURNAL_SPOOL_MAX_BYTES {
             anyhow::bail!("deferred-audit spool exceeds configured safety bounds");
         }
+        fs2::FileExt::unlock(&spool_lock).context("unlock deferred-audit spool after open")?;
         Ok(Self {
             path,
             file: Mutex::new(file),
@@ -659,6 +658,7 @@ impl DeferredAuditJournal {
     /// # Errors
     /// Propagates the seek / read IO error.
     pub fn replay(&self) -> Result<Vec<DeferredAuditEvent>> {
+        let _spool_guard = self.lock_spool()?;
         let mut f = self.file.lock().expect(JOURNAL_MUTEX_POISONED);
         f.seek(SeekFrom::Start(0)).context("journal replay: seek")?;
         let mut out = replay_legacy_stream(&mut f)?;
@@ -783,6 +783,12 @@ impl DeferredAuditJournal {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+fn journal_spool_dir(journal_path: &Path) -> PathBuf {
+    let mut spool_os = journal_path.as_os_str().to_os_string();
+    spool_os.push(JOURNAL_SPOOL_SUFFIX);
+    PathBuf::from(spool_os)
 }
 
 struct SpoolLockGuard<'a>(&'a File);
@@ -1017,7 +1023,7 @@ fn occurrence_residence(
 /// chain or durable DLQ, its spool record is retained for a later retry;
 /// already-persisted records are content-checked and acknowledged.
 pub fn recover_deferred_audit(journal_path: &Path, db_path: &Path) -> Result<usize> {
-    if !journal_path.exists() {
+    if !journal_path.exists() && !journal_spool_dir(journal_path).exists() {
         return Ok(0);
     }
     let journal = Arc::new(DeferredAuditJournal::open(journal_path)?);
@@ -3249,6 +3255,35 @@ mod tests {
     }
 
     #[test]
+    fn recovery_replays_surviving_spool_when_legacy_journal_is_missing() {
+        let dir = fresh_tempdir();
+        let db_path = dir.path().join("orphan-spool.db");
+        let _ = crate::db::open(&db_path).expect("init db schema");
+        let journal_path = deferred_audit_journal_path(&db_path);
+        let event = DeferredAuditEvent::from_refusal(
+            "agent:orphan-spool",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        let journal = DeferredAuditJournal::open(&journal_path).unwrap();
+        journal.append(&event).unwrap();
+        drop(journal);
+        std::fs::remove_file(&journal_path).unwrap();
+
+        assert_eq!(recover_deferred_audit(&journal_path, &db_path).unwrap(), 1);
+        let conn = crate::db::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE agent_id = ?1",
+                ["agent:orphan-spool"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn submit_with_journal_is_durable_before_return_1912() {
         // #1912 — the corrected `submit` doc states that when a journal is
         // configured the event is durably fsync'd BEFORE `submit` returns
@@ -3376,6 +3411,7 @@ mod tests {
         drop(journal);
         let reopened = DeferredAuditJournal::open(&journal_path).unwrap();
         assert!(!pending.exists());
+        assert_eq!(reopened.spool_usage.lock().unwrap().entries, 1);
         let replayed = reopened.replay().unwrap();
         assert_eq!(replayed.len(), 1);
         assert_eq!(replayed[0].occurrence_id, event.occurrence_id);
