@@ -909,8 +909,12 @@ pub async fn bulk_create(
                 version: 1,
                 lifecycle_state: crate::models::LifecycleState::Open,
                 cid: None,
-                valid_from: None,
-                valid_until: None,
+                // #2258 / #1834 — claim-bitemporal VALID-time bounds (validated
+                // in `validate_create`, called per-row above). Postgres `store`
+                // ON CONFLICT keeps `valid_from` immutably + COALESCEs
+                // `valid_until` (parity with the single-create path).
+                valid_from: body.valid_from.clone(),
+                valid_until: body.valid_until.clone(),
             };
 
             // #1919 (CWE-288) — per-row agent attestation, mirroring the
@@ -1134,12 +1138,20 @@ pub async fn bulk_create(
             let citations = body.citations;
             let source_uri = body.source_uri;
             let source_span = body.source_span;
+            // #2258 / #1834 — claim-bitemporal VALID-time bounds (validated in
+            // `validate_create` per-row above). Resolved into locals here so
+            // the owned `Option<String>`s aren't partial-moved before the
+            // struct literal, matching the citations/source_uri pattern.
+            let valid_from = body.valid_from;
+            let valid_until = body.valid_until;
             // #1919 — mutable so the per-row attestation below can stamp
             // `attest_level` / adopt the signed `created_at`.
             let mut mem = Memory {
                 cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
-                valid_from: None,
-                valid_until: None,
+                // #2258 / #1834 — sqlite `db::insert` ON CONFLICT keeps
+                // `valid_from` immutably + COALESCEs `valid_until`.
+                valid_from,
+                valid_until,
                 id: Uuid::new_v4().to_string(),
                 tier: body.tier,
                 namespace: body.namespace,

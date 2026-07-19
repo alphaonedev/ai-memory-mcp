@@ -124,6 +124,26 @@ pub struct StoreRequest {
     #[schemars(description = "#885 Source URI (doc:/uri:/file:); indexed for #889.")]
     pub source_uri: Option<String>,
 
+    // #2258 / #1834 — claim-bitemporal VALID-time interval `[valid_from,
+    // valid_until)` (RFC3339). `valid_from` records when the claim BECAME
+    // true (backfill / future-effective), distinct from `created_at`
+    // transaction-time; it is IMMUTABLE after create (never changed on a
+    // later upsert). `valid_until` is the end bound and stays updatable via
+    // `memory_update`. Both validated as RFC3339 via `validate_valid_at`.
+    // Plain `//` (not `///`) so schemars emits only the concise attribute
+    // description, consistent with the signed-write fields above.
+    #[serde(default)]
+    #[schemars(
+        description = "#1834 RFC3339 claim valid_from (when the fact became true); immutable after create."
+    )]
+    pub valid_from: Option<String>,
+
+    #[serde(default)]
+    #[schemars(
+        description = "#1834 RFC3339 claim valid_until (end of the asserted validity interval)."
+    )]
+    pub valid_until: Option<String>,
+
     // #626 Layer-3 (C7) — detached Ed25519 agent-attestation signature,
     // standard base64, over the `SignableWrite` envelope
     // (agent_id+namespace+title+kind+created_at+sha256(content)). When
