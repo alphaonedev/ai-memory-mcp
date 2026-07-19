@@ -1075,27 +1075,53 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
     // `PostgresStore::link_internal` reads it at write time. Default sync =
     // byte-identical inline AGE MERGE; harmless on sqlite/mcp/CLI paths.
     crate::config::set_age_projection_mode(resolved_storage.age_projection_mode);
-    // v0.9.0 G13-mem (#1859) — the resolved lineage-DAG flags
-    // (`resolved_storage.lineage_dag` / `.consolidate_tombstone_sources`,
-    // master default ON) are DELIBERATELY NOT seeded into the process-wide
-    // atomics here. Mirrors the G6 `append_only` precedent: the flag is a
-    // BEHAVIOR-CHANGING process-wide `AtomicBool`, and `daemon_runtime::run`
-    // is exercised by the lib unit-test binary (the Identity/Rules/Governance
-    // dispatch tests), so seeding it here would flip the flag ON for every
-    // concurrently-running storage/cycle/consolidate unit test in the same
-    // process and make the suite order-dependent. The edge-write cid
-    // population, the P-wide acyclicity guard, the lineage query surface, and
-    // `db::consolidate`'s tombstone path all read `lineage_dag_enabled()` /
-    // `consolidate_tombstone_sources_enabled()`, which stay OFF (byte-identical
-    // legacy) until explicitly seeded. Wiring the production master-on seed
-    // (behind a test-isolation reset in the daemon_runtime harness) is the
-    // tracked follow-up; callers opt in today via `AI_MEMORY_LINEAGE_DAG` +
-    // `crate::config::set_lineage_dag` / `set_consolidate_tombstone_sources`
-    // (which `resolve_storage` already resolves the values for).
-    let _ = (
-        resolved_storage.lineage_dag,
-        resolved_storage.consolidate_tombstone_sources,
-    );
+    // v0.9.0 G13-mem (#1859; production boot seed WIRED by #2233) — seed the
+    // process-wide lineage-DAG flags from the resolved `[storage]` config
+    // (env `AI_MEMORY_LINEAGE_DAG` / `AI_MEMORY_CONSOLIDATE_TOMBSTONE_SOURCES`
+    // > `[storage]` section > compiled default: master ON, sub-flag tracks the
+    // master). Once seeded, the edge-write `source_cid`/`target_cid` mirror,
+    // the P-wide acyclicity guard, the lineage query surface, and
+    // `db::consolidate`'s tombstone path go live on every production subcommand
+    // path (serve / mcp / CLI, both backends) — closing the #2233 defaults-lie
+    // where `lineage_dag_enabled()` read FALSE in production despite the
+    // documented `true` default (and, via #2215/#2229, where the import
+    // repopulation stayed inert because it correctly copied the native gate).
+    // Mirrors the `set_db_mmap_size` / `set_age_projection_mode` /
+    // `set_screen_mode` seeds above.
+    //
+    // The seed is `#[cfg(not(test))]`-gated purely for TEST ISOLATION, NOT to
+    // opt out of production: the lineage flags are BEHAVIOR-CHANGING
+    // process-wide `AtomicBool`s and `daemon_runtime::run` is ALSO exercised by
+    // the lib unit-test binary (the Identity/Rules/Governance dispatch tests),
+    // so seeding unconditionally would flip the flag ON for every
+    // concurrently-running storage / cycle / consolidate unit test in the same
+    // process and make the suite order-dependent (the blocker the pre-#2233
+    // discard named). `cfg(test)` is true ONLY for the lib's own
+    // `cargo test --lib` build; the production `ai-memory` binary AND every
+    // integration test under `tests/` link the lib WITHOUT `cfg(test)`, so both
+    // exercise the real seed (pinned end-to-end by
+    // `tests/lineage_boot_seed_2233.rs`). Raw-library callers that never run
+    // this boot path keep the unseeded `false` default — `lineage_dag_enabled()`
+    // reads OFF until seeded — preserving embedder / unit-test isolation
+    // exactly as before.
+    #[cfg(not(test))]
+    {
+        crate::config::set_lineage_dag(resolved_storage.lineage_dag);
+        crate::config::set_consolidate_tombstone_sources(
+            resolved_storage.consolidate_tombstone_sources,
+        );
+    }
+    #[cfg(test)]
+    {
+        // Lib-unit-test build (`cargo test --lib`): SKIP the process-wide seed
+        // for test isolation (see the block above) but still READ the resolved
+        // fields so the `dead_code` lint stays green under `-D warnings` — the
+        // resolver's work is deliberately observed here, not applied.
+        let _ = (
+            resolved_storage.lineage_dag,
+            resolved_storage.consolidate_tombstone_sources,
+        );
+    }
     // v0.8.1 W1 (#1821 / gap G29) — seed the process-wide credential-screen
     // mode from the resolved `[security]` config (env
     // `AI_MEMORY_SECRET_SCREEN_MODE` > `[security].secret_screen_mode` >
