@@ -16,6 +16,22 @@ pub struct UpdateArgs {
     pub title: Option<String>,
     #[arg(long, short, allow_hyphen_values = true)]
     pub content: Option<String>,
+    /// #1974/#2079 content patch: raw text appended to the end of the current
+    /// content (verbatim, no separator). Mutually exclusive with `--content`
+    /// and the `--content-replace-*` pair; an empty fragment is rejected.
+    #[arg(long, allow_hyphen_values = true)]
+    pub content_append: Option<String>,
+    /// #1974/#2079 content patch: substring to replace in the current content.
+    /// MUST occur exactly once (0 or >1 matches → typed error, never a silent
+    /// first-match). Requires `--content-replace-to`; mutually exclusive with
+    /// `--content` / `--content-append`.
+    #[arg(long, allow_hyphen_values = true)]
+    pub content_replace_from: Option<String>,
+    /// #1974/#2079 content patch: replacement text for the unique
+    /// `--content-replace-from` match (may be empty = deletion). Requires
+    /// `--content-replace-from`.
+    #[arg(long, allow_hyphen_values = true)]
+    pub content_replace_to: Option<String>,
     #[arg(long, short)]
     pub tier: Option<String>,
     #[arg(long, short)]
@@ -76,10 +92,55 @@ pub fn run(
             .filter(|s| !s.is_empty())
             .collect()
     });
+    // #1974/#2079 — opt-in content-patch primitive (CLI parity with the MCP
+    // `memory_update` surface). Assemble the FULL replacement content from the
+    // CURRENT stored content plus a single append XOR unique-match replace op,
+    // then thread the result through the SAME `validate_content` (empty-reject
+    // + secret-screen of the RESULT) and version-gated CAS a full-content
+    // update takes — so the patch is a pre-step, not a new write path. The read
+    // pins the version the content was assembled against and threads it as
+    // `expected_version` (TOCTOU fail-close: a concurrent write between the read
+    // and the CAS surfaces as a VERSION_CONFLICT); a caller-supplied
+    // `--expected-version` must agree with the observed version, else it is
+    // rejected here before any write.
+    let mut expected_version = args.expected_version;
+    let patch = crate::content_patch::ContentPatch {
+        append: args.content_append.as_deref(),
+        replace_from: args.content_replace_from.as_deref(),
+        replace_to: args.content_replace_to.as_deref(),
+    };
+    let patched_content: Option<String> = if patch.is_active() {
+        if args.content.is_some() {
+            return Err(anyhow::anyhow!(
+                "content cannot be combined with content_append/content_replace_* (full replacement and patch are mutually exclusive)"
+            ));
+        }
+        let current = db::get(&conn, &resolved_id)?
+            .ok_or_else(|| anyhow::anyhow!("{}", crate::errors::msg::not_found(&args.id)))?;
+        if let Some(expected) = expected_version
+            && expected != current.version
+        {
+            return Err(anyhow::anyhow!(
+                "VERSION_CONFLICT: expected version {expected}, current is {}",
+                current.version
+            ));
+        }
+        expected_version = Some(current.version);
+        Some(
+            patch
+                .apply(&current.content)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        )
+    } else {
+        None
+    };
+    // The patched result (when present) is the effective content for the rest
+    // of the flow — validation and the CAS both see it.
+    let effective_content: Option<&str> = patched_content.as_deref().or(args.content.as_deref());
     if let Some(ref t) = args.title {
         validate::validate_title(t)?;
     }
-    if let Some(ref c) = args.content {
+    if let Some(c) = effective_content {
         validate::validate_content(c)?;
     }
     if let Some(ref ns) = args.namespace {
@@ -139,7 +200,7 @@ pub fn run(
         &conn,
         &resolved_id,
         args.title.as_deref(),
-        args.content.as_deref(),
+        effective_content,
         tier.as_ref(),
         args.namespace.as_deref(),
         tags.as_ref(),
@@ -148,7 +209,7 @@ pub fn run(
         args.expires_at.as_deref(),
         metadata_patch.as_ref(),
         args.source_uri.as_deref(),
-        args.expected_version,
+        expected_version,
         // v1.0.0 #1834 — opt-in valid_until patch (valid_from immutable).
         args.valid_until.as_deref(),
     )?;
@@ -195,6 +256,10 @@ mod tests {
             id: id.to_string(),
             title: None,
             content: None,
+            // #1974/#2079 content-patch flags
+            content_append: None,
+            content_replace_from: None,
+            content_replace_to: None,
             tier: None,
             namespace: None,
             tags: None,
@@ -552,5 +617,136 @@ mod tests {
         let mut out = env.output();
         let err = run(&db, &args, false, &mut out).unwrap_err();
         assert!(err.to_string().contains("CONFLICT"), "got: {err}");
+    }
+
+    // ----------------------------------------------------------------
+    // #1974/#2079 — content-patch primitive on the CLI `update` surface.
+    // ----------------------------------------------------------------
+
+    fn stored_content(db: &Path, id: &str) -> String {
+        let conn = crate::db::open(db).unwrap();
+        crate::db::get(&conn, id).unwrap().unwrap().content
+    }
+
+    #[test]
+    fn test_update_content_append_concatenates_onto_current() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "tt", "base body");
+        let mut args = empty_args(&id);
+        args.content_append = Some(" appended".to_string());
+        {
+            let mut out = env.output();
+            run(&db, &args, false, &mut out).unwrap();
+        }
+        assert_eq!(stored_content(&db, &id), "base body appended");
+    }
+
+    #[test]
+    fn test_update_content_replace_unique_match_ok() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "tt", "alpha beta gamma");
+        let mut args = empty_args(&id);
+        args.content_replace_from = Some("beta".to_string());
+        args.content_replace_to = Some("BETA".to_string());
+        {
+            let mut out = env.output();
+            run(&db, &args, false, &mut out).unwrap();
+        }
+        assert_eq!(stored_content(&db, &id), "alpha BETA gamma");
+    }
+
+    #[test]
+    fn test_update_content_replace_ambiguous_match_refused_no_write() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "tt", "x x x");
+        let mut args = empty_args(&id);
+        args.content_replace_from = Some("x".to_string());
+        args.content_replace_to = Some("y".to_string());
+        let err = {
+            let mut out = env.output();
+            run(&db, &args, false, &mut out).unwrap_err()
+        };
+        assert!(
+            err.to_string().contains("matched 3 times"),
+            "ambiguous match must be refused with a count; got: {err}"
+        );
+        // Fail-closed: no bytes changed.
+        assert_eq!(stored_content(&db, &id), "x x x");
+    }
+
+    #[test]
+    fn test_update_content_replace_not_found_refused_no_write() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "tt", "a b c");
+        let mut args = empty_args(&id);
+        args.content_replace_from = Some("zzz".to_string());
+        args.content_replace_to = Some("Q".to_string());
+        let err = {
+            let mut out = env.output();
+            run(&db, &args, false, &mut out).unwrap_err()
+        };
+        assert!(
+            err.to_string().contains("not found"),
+            "a zero-match replace must be refused; got: {err}"
+        );
+        assert_eq!(stored_content(&db, &id), "a b c");
+    }
+
+    #[test]
+    fn test_update_content_plus_patch_is_mutually_exclusive() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "tt", "cc");
+        let mut args = empty_args(&id);
+        args.content = Some("full replacement".to_string());
+        args.content_append = Some(" tail".to_string());
+        let err = {
+            let mut out = env.output();
+            run(&db, &args, false, &mut out).unwrap_err()
+        };
+        assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn test_update_content_replace_to_empty_deleting_whole_body_rejected() {
+        // Result re-validation: a replace that empties the whole content is
+        // rejected by validate_content (empty-reject of the RESULT), and no
+        // bytes change.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "tt", "solo");
+        let mut args = empty_args(&id);
+        args.content_replace_from = Some("solo".to_string());
+        args.content_replace_to = Some(String::new());
+        let err = {
+            let mut out = env.output();
+            run(&db, &args, false, &mut out).unwrap_err()
+        };
+        assert!(
+            err.to_string().contains("content cannot be empty"),
+            "empty assembled result must be rejected; got: {err}"
+        );
+        assert_eq!(stored_content(&db, &id), "solo");
+    }
+
+    #[test]
+    fn test_update_content_append_version_pinned_and_bumped() {
+        // The patch reads + pins the observed version and threads it as the CAS
+        // gate; a matching caller --expected-version agrees and the write lands.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "tt", "body");
+        let mut args = empty_args(&id);
+        args.content_append = Some(" more".to_string());
+        args.expected_version = Some(1); // seeded rows start at version 1
+        {
+            let mut out = env.output();
+            run(&db, &args, false, &mut out).unwrap();
+        }
+        assert_eq!(stored_content(&db, &id), "body more");
     }
 }
