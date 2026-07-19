@@ -4940,10 +4940,10 @@ pub async fn bootstrap_serve(
     // `db::open` against the same db_path) so it does NOT contend
     // with the substrate writer's lock held during `storage::insert`.
     // SQLite WAL mode allows the rule-read to proceed in parallel.
-    // Failure to open the rule-consultation connection degrades to
-    // ALLOW with a WARN: a transient FS issue must not wedge the
-    // write surface, and the operator can detect the degradation
-    // from the log surface.
+    // Failure to open the rule-consultation connection defaults to a
+    // fail-closed synthetic refusal. The explicit consultation-only
+    // fail-open override can permit it only after that refusal is durably
+    // admitted to the deferred audit path.
     //
     // v0.7.0 Policy-Engine Item 3 (2026-05-14) — the hook now also
     // submits every refusal to the process-wide deferred-audit
@@ -4998,10 +4998,10 @@ pub async fn bootstrap_serve(
     // (`storage::insert` is sync; wire-check is consulted from sync
     // `governance::wire_check::check` regardless of caller context).
     //
-    // If `db::open` fails at install time, we install hooks that
-    // degrade to ALLOW on every call with a WARN — same posture as
-    // the pre-#1017 per-call open-failure leg. The operator sees the
-    // diagnostic in daemon logs and can re-attempt.
+    // If `db::open` fails at install time, the installed hooks default to a
+    // fail-closed synthetic refusal. An explicit consultation-only fail-open
+    // override can allow only after durable audit admission; otherwise the
+    // action remains blocked and the operator sees the diagnostic.
     let hook_consultation_conn: Option<Arc<std::sync::Mutex<rusqlite::Connection>>> =
         match db::open(db_path) {
             Ok(c) => Some(Arc::new(std::sync::Mutex::new(c))),
@@ -5009,7 +5009,8 @@ pub async fn bootstrap_serve(
                 tracing::warn!(
                     target: "ai_memory::daemon_runtime",
                     "v0.7.0 #1017: failed to open hook consultation connection at {}: {}; \
-                     governance hooks will degrade to ALLOW on every invocation",
+                     governance hooks will fail closed unless the explicit consultation-only \
+                     fail-open override is enabled and durable audit admission succeeds",
                     db_path.display(),
                     e,
                 );

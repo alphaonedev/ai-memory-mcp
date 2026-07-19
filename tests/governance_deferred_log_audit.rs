@@ -57,9 +57,16 @@ use common::*;
 // Test helpers
 // ---------------------------------------------------------------------------
 
-/// Tempdir helper — honors TMPDIR per the project hard rule.
+/// Tempdir helper pinned to repository-owned scratch space.
 fn fresh_tempdir() -> tempfile::TempDir {
-    tempfile::tempdir().expect("tempdir under TMPDIR")
+    let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(".local-runs")
+        .join("test-tmp");
+    std::fs::create_dir_all(&scratch).expect("create repository-owned test scratch");
+    tempfile::Builder::new()
+        .prefix("governance-deferred-")
+        .tempdir_in(scratch)
+        .expect("repository-owned governance tempdir")
 }
 
 /// Seed a `memory_write` refuse rule into the `governance_rules` table

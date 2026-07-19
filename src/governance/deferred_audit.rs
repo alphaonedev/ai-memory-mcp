@@ -3116,11 +3116,14 @@ mod tests {
     // -----------------------------------------------------------------
 
     fn fresh_tempdir() -> tempfile::TempDir {
-        // Honor project hard rule: no /tmp writes by name. The
-        // tempfile crate honors TMPDIR (exported at session
-        // bootstrap to .local-runs/tmp), so this resolves under the
-        // project-local scratch tree.
-        tempfile::tempdir().expect("tempdir")
+        let scratch = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".local-runs")
+            .join("test-tmp");
+        std::fs::create_dir_all(&scratch).expect("create repository-owned test scratch");
+        tempfile::Builder::new()
+            .prefix("deferred-audit-")
+            .tempdir_in(scratch)
+            .expect("repository-owned deferred-audit tempdir")
     }
 
     #[tokio::test]
