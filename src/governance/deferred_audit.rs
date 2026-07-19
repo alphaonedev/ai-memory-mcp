@@ -104,6 +104,7 @@ const PANIC_RETRY_BACKOFF_MAX_MS: u64 = 1_000;
 /// only a few KiB; bounding recovery prevents a corrupt length prefix from
 /// driving an unbounded allocation.
 const JOURNAL_MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+const JOURNAL_MAX_FRAME_BYTES: u64 = JOURNAL_MAX_PAYLOAD_BYTES as u64 + 36;
 
 /// Suffix for the per-occurrence crash spool used by new-format records.
 const JOURNAL_SPOOL_SUFFIX: &str = ".spool";
@@ -486,8 +487,20 @@ impl DeferredAuditJournal {
                 continue;
             }
             if entry_path.extension().is_some_and(|ext| ext == "pending") {
-                let frame =
-                    std::fs::read(&entry_path).context("read deferred-audit pending frame")?;
+                let entry_type = entry
+                    .file_type()
+                    .context("inspect deferred-audit pending frame type")?;
+                let entry_len = entry
+                    .metadata()
+                    .context("stat deferred-audit pending frame")?
+                    .len();
+                if !entry_type.is_file() || entry_len > JOURNAL_MAX_FRAME_BYTES {
+                    std::fs::remove_file(&entry_path)
+                        .context("remove invalid deferred-audit pending artifact")?;
+                    continue;
+                }
+                let frame = read_journal_frame_bounded(&entry_path)
+                    .context("read deferred-audit pending frame")?;
                 let expected_len = frame.get(..4).and_then(|prefix| {
                     let payload_len = usize::try_from(u32::from_le_bytes([
                         prefix[0], prefix[1], prefix[2], prefix[3],
@@ -680,13 +693,7 @@ impl DeferredAuditJournal {
         }
         spool_paths.sort();
         for path in spool_paths {
-            let metadata = std::fs::metadata(&path)
-                .with_context(|| format!("journal replay: stat {}", path.display()))?;
-            let max_frame = u64::try_from(JOURNAL_MAX_PAYLOAD_BYTES + 36).unwrap_or(u64::MAX);
-            if metadata.len() > max_frame {
-                anyhow::bail!("journal spool frame too large: {}", path.display());
-            }
-            let frame = std::fs::read(&path)
+            let frame = read_journal_frame_bounded(&path)
                 .with_context(|| format!("journal replay: read {}", path.display()))?;
             out.push(parse_complete_journal_frame(&frame).with_context(|| {
                 format!("journal replay: corrupt spool frame {}", path.display())
@@ -985,6 +992,25 @@ fn parse_complete_journal_frame(frame: &[u8]) -> Result<DeferredAuditEvent> {
         anyhow::bail!("journal frame hash mismatch");
     }
     DeferredAuditEvent::from_canonical_bytes(payload).context("journal frame decode")
+}
+
+fn read_journal_frame_bounded(path: &Path) -> Result<Vec<u8>> {
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        anyhow::bail!("journal frame is not a regular file");
+    }
+    if metadata.len() > JOURNAL_MAX_FRAME_BYTES {
+        anyhow::bail!("journal frame exceeds maximum size");
+    }
+    let capacity = usize::try_from(metadata.len()).context("journal frame size conversion")?;
+    let mut frame = Vec::with_capacity(capacity);
+    file.take(JOURNAL_MAX_FRAME_BYTES.saturating_add(1))
+        .read_to_end(&mut frame)?;
+    if frame.len() > JOURNAL_MAX_PAYLOAD_BYTES + 36 {
+        anyhow::bail!("journal frame grew beyond maximum size while reading");
+    }
+    Ok(frame)
 }
 
 fn occurrence_residence(
@@ -3448,6 +3474,22 @@ mod tests {
 
         let reopened = DeferredAuditJournal::open(&journal_path).unwrap();
         assert!(!probe.exists());
+        assert_eq!(reopened.spool_usage.lock().unwrap().entries, 0);
+    }
+
+    #[test]
+    fn journal_reclaims_oversized_sparse_pending_without_reading_it() {
+        let dir = fresh_tempdir();
+        let journal_path = dir.path().join("oversized-pending.journal");
+        let journal = DeferredAuditJournal::open(&journal_path).unwrap();
+        let pending = journal.spool_dir.join(".oversized.pending");
+        let file = File::create(&pending).unwrap();
+        file.set_len(JOURNAL_MAX_FRAME_BYTES + 1).unwrap();
+        drop(file);
+        drop(journal);
+
+        let reopened = DeferredAuditJournal::open(&journal_path).unwrap();
+        assert!(!pending.exists());
         assert_eq!(reopened.spool_usage.lock().unwrap().entries, 0);
     }
 
