@@ -1,9 +1,13 @@
+---
+layout: doc
+---
+
 # ai-memory v1.0.0 — Plain English for four audiences (Fable 5)
 ## The nine north-star claims, translated for the people who have to act on them
 
 > **What this is:** A plain-language translation of AI NHI **Fable 5**'s independent, code-anchored re-audit of the nine claims that define "the perfect AI-agent endpoint memory substrate," written for **four distinct reader groups over the nine claims** (a 9-claims × 4-audiences translation). It is **not** a marketing rewrite, **not** release notes, **not** a certification, and **not** a new audit — it is the *same verdict*, said four ways.
 >
-> **Where the verdict comes from:** [`FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.md`](FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.md) (the full technical audit: 21 CodeGraph-armed adversarial subagents + 4 supporting lenses, run against `release/v1.0.0` @ `924965c1`, schema v84) and its companion [`ROADMAP-V1.0.1.md`](ROADMAP-V1.0.1.md) (the fix list). This is the Fable 5 parallel to Grok 4.5's [`GROK-4-5-NORTH-STAR-7x7-PLAIN-ENGLISH-AUDIENCES.md`](GROK-4-5-NORTH-STAR-7x7-PLAIN-ENGLISH-AUDIENCES.md), family-decorrelated (Grok is xAI; Fable is Anthropic) and extended from seven north-star points to the full nine claims (adding data integrity and cybersecurity as first-class rows).
+> **Where the verdict comes from:** [`FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.md`](FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.html) (the full technical audit: 21 CodeGraph-armed adversarial subagents + 4 supporting lenses, run against `release/v1.0.0` @ `924965c1`, schema v84) and its companion [`ROADMAP-V1.0.1.md`](ROADMAP-V1.0.1.html) (the fix list). This is the Fable 5 parallel to Grok 4.5's [`GROK-4-5-NORTH-STAR-7x7-PLAIN-ENGLISH-AUDIENCES.md`](GROK-4-5-NORTH-STAR-7x7-PLAIN-ENGLISH-AUDIENCES.html), family-decorrelated (Grok is xAI; Fable is Anthropic) and extended from seven north-star points to the full nine claims (adding data integrity and cybersecurity as first-class rows).
 >
 > **The one-line verdict (true for every audience below):** The nine properties **exist in shipped code today**. Most are **at full strength only when you configure them that way** — a few of the strongest protections are **off, advisory, or dormant until you enroll keys** in the default install. Nothing is missing; nothing is certified; nothing is "never-lose / never-wrong." **How you run it matters more than any badge.**
 
@@ -154,7 +158,7 @@ If you use an AI coding tool or assistant and you've heard "ai-memory gives it a
 
 **Residual technical work (from the roadmap, not "start over"):** (1) make multi-tenant identity default-safe or fail-loud; (2) wire the IDOR gate onto coordination write routes; (3) boot-WARN the power-loss posture; (4) installer/doctor discoverability for the L3 watcher; (5) complete the `asi-hard` no-disable knob set + an MCP-signing story; (6) real codex/gemini transcript parsers.
 
-**Full evidence:** [`FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.md`](FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.md).
+**Full evidence:** [`FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.md`](FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.html).
 
 ---
 
@@ -223,9 +227,9 @@ If you use an AI coding tool or assistant and you've heard "ai-memory gives it a
 
 | Item | Detail |
 |------|--------|
-| Full verdict | [`FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.md`](FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.md) |
-| Fix list | [`ROADMAP-V1.0.1.md`](ROADMAP-V1.0.1.md) |
-| Grok's parallel (7×4) | [`GROK-4-5-NORTH-STAR-7x7-PLAIN-ENGLISH-AUDIENCES.md`](GROK-4-5-NORTH-STAR-7x7-PLAIN-ENGLISH-AUDIENCES.md) |
+| Full verdict | [`FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.md`](FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.html) |
+| Fix list | [`ROADMAP-V1.0.1.md`](ROADMAP-V1.0.1.html) |
+| Grok's parallel (7×4) | [`GROK-4-5-NORTH-STAR-7x7-PLAIN-ENGLISH-AUDIENCES.md`](GROK-4-5-NORTH-STAR-7x7-PLAIN-ENGLISH-AUDIENCES.html) |
 | Substrate audited | `release/v1.0.0` @ `924965c1` (crate 0.10.0, schema v84) |
 | Method | 21 executed CodeGraph-armed subagents (3 waves × 7) + 4 supporting lenses; CodeGraph re-synced to HEAD first; verify-in-code, never trust docs; CLAIMED ≠ ATTESTED |
 | Cross-family | Anthropic (Fable 5) independent of xAI (Grok 4.5); [#1171] cross-family bar met on the nine claims |

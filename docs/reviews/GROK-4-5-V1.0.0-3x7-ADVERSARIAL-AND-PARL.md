@@ -1,3 +1,7 @@
+---
+layout: doc
+---
+
 # Grok 4.5 — ai-memory v1.0.0-line 3×7 adversarial assessment + PARL prior-art disposition
 
 > **Document classification:** Adversarial strategic assessment + prior-art disposition. Reference material for operators and AI NHI; **not** a §2 property change, **not** a ROADMAP commitment, **not** a ship-gate.
@@ -12,7 +16,7 @@
 > **Authorship caveat:** Single-family assessor (xAI Grok). Lens-decorrelated across 21 adversarial roles; **not** family-decorrelated. Candidate for the [#1171](https://github.com/alphaonedev/ai-memory-mcp/issues/1171) heterogeneous panel. CLAIMED ≠ ATTESTED.
 >
 > **Related reviews (do not supersede):**  
-> - [`PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.md`](PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.md) — Fable 27-requirement gap-map vs v0.9.0  
+> - [`PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.md`](PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.html) — Fable 27-requirement gap-map vs v0.9.0  
 > - [`docs/strategy/decentmem-mapping.md`](../strategy/decentmem-mapping.md) — DecentMem orchestration-layer mapping (precedent for PARL disposition)  
 > - [`docs/strategy/moonshot-synthesis.md`](../strategy/moonshot-synthesis.md) — §0 moonshot anchor  
 > - `ROADMAP.md` §0–§6 — seven properties + scope honesty (DeepMind / #1698)
@@ -542,7 +546,7 @@ These are assessment findings, **not** ROADMAP commitments:
 
 | Document | Relationship |
 |----------|--------------|
-| [`PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.md`](PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.md) | Fable 27-requirement constitution gap-map (stricter “perfect endpoint” bar). This Grok review assesses **value / #1 / ASI niche** and **PARL disposition**, not a full R1–R84 register. |
+| [`PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.md`](PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.html) | Fable 27-requirement constitution gap-map (stricter “perfect endpoint” bar). This Grok review assesses **value / #1 / ASI niche** and **PARL disposition**, not a full R1–R84 register. |
 | [`docs/strategy/decentmem-mapping.md`](../strategy/decentmem-mapping.md) | Same layer-firewall logic applied here to PARL. |
 | `ROADMAP.md` §1 scope honesty / §2.3 / §2.5 | This review **affirms** those precision claims rather than re-litigating them. |
 | Moonshot §0 sentence | Directionally correct; **over-broad if taken literally** without the necessary-but-not-sufficient rider. |

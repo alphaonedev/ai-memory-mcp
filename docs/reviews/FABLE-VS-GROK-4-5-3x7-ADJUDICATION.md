@@ -1,3 +1,7 @@
+---
+layout: doc
+---
+
 # Fable vs Grok 4.5 — 3×7 Cross-Family Adjudication of the Perfect-Endpoint Assessments
 
 > **Document classification:** Adjudication record + binding corrections list. Completes the cross-family check both same-day assessments required of themselves.

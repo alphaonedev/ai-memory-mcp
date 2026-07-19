@@ -1,3 +1,7 @@
+---
+layout: doc
+---
+
 # Agent 11 — Sibling Repo / Future-Proofing (ISOLATED)
 
 **Lens:** Sibling Repo / Future-Proofing  
@@ -6,7 +10,7 @@
 **Date:** 2026-06-28  
 **Codebase:** `release/v0.8.0` @ `c85b9c56` (CodeGraph mandatory)  
 **North Star:** [`docs/strategy/moonshot-synthesis.md`](../strategy/moonshot-synthesis.md) §0  
-**Prior art:** [`RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md`](RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md)  
+**Prior art:** [`RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md`](RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.html)  
 **Paper:** [The Red Queen Gödel Machine (arXiv:2606.26294)](https://arxiv.org/abs/2606.26294) — [PDF](https://arxiv.org/pdf/2606.26294) (Iacob et al., 24 Jun 2026)
 
 ---

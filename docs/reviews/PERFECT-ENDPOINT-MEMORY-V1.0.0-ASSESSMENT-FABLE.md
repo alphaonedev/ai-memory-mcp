@@ -1,6 +1,10 @@
+---
+layout: doc
+---
+
 # Will ai-memory v1.0.0 Be the Perfect Endpoint Memory System? — Codegraph Gap-Map + Recommended v1.0.0 Roadmap
 
-> **Document classification:** Assessment + roadmap recommendation. Candidate input for the ROADMAP.md v1.0.0 revision. Companion to [`PERFECT-ENDPOINT-MEMORY-SPEC-3x7-FABLE.md`](PERFECT-ENDPOINT-MEMORY-SPEC-3x7-FABLE.md) (the 3×7-converged 27-requirement specification).
+> **Document classification:** Assessment + roadmap recommendation. Candidate input for the ROADMAP.md v1.0.0 revision. Companion to [`PERFECT-ENDPOINT-MEMORY-SPEC-3x7-FABLE.md`](PERFECT-ENDPOINT-MEMORY-SPEC-3x7-FABLE.html) (the 3×7-converged 27-requirement specification).
 >
 > **Date:** 2026-07-08 (v0.9.0 GA day). **Assessed substrate:** v0.9.0 @ main `59695ad0` (schema v78, 101 MCP tools), codegraph-indexed same day (901 files). **Assessed plan:** ROADMAP.md §11.6 + §25.3 v1.0.0 lane + §26 TRACT register + open v1.0-milestoned issues.
 >
@@ -124,7 +128,7 @@ v0.9.0 is the strongest existing base for this specification — and v1.0.0 **as
 
 ## 7. Adjudicated amendments to the v1.0.0 program (2026-07-09, binding)
 
-From the cross-family 3×7 adjudication vs the Grok 4.5 49-agent assessment ([`FABLE-VS-GROK-4-5-3x7-ADJUDICATION.md`](FABLE-VS-GROK-4-5-3x7-ADJUDICATION.md)); where this section conflicts with §4 above, this section wins.
+From the cross-family 3×7 adjudication vs the Grok 4.5 49-agent assessment ([`FABLE-VS-GROK-4-5-3x7-ADJUDICATION.md`](FABLE-VS-GROK-4-5-3x7-ADJUDICATION.html)); where this section conflicts with §4 above, this section wins.
 
 **Gate 1 (P0 freeze-critical) additions:**
 - **UUID→cid record-identity-authority ADR** (Grok R16 sustained) — T4 5-agent vote pre-freeze; cutover migration stays out of v1.0 unless the ADR rules otherwise.

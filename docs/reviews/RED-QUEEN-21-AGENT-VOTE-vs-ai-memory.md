@@ -1,3 +1,7 @@
+---
+layout: doc
+---
+
 # Red Queen vs ai-memory — 21-Agent Adversarial Vote (FULL SPECTRUM / ASI MOONSHOT)
 
 **Status:** FINAL synthesis from **21 independent agent executions**  
@@ -5,7 +9,7 @@
 **Vote protocol:** 5-agent crossroads `4d3ea1c5` pattern · 21 adversarial lenses · **isolated subagents, no cross-talk**  
 **Codebase:** `release/v0.8.0` @ `c85b9c56`  
 **North Star:** [`docs/strategy/moonshot-synthesis.md`](../strategy/moonshot-synthesis.md) §0 (endpoint substrate through AGI→ASI→beyond)  
-**Prior art:** [`RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md`](RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md) · [`RQGM-2606.26294-vs-v0.8.0.md`](RQGM-2606.26294-vs-v0.8.0.md) · [`docs/contracts/epoch_manifest.schema.json`](../contracts/epoch_manifest.schema.json)
+**Prior art:** [`RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md`](RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.html) · [`RQGM-2606.26294-vs-v0.8.0.md`](RQGM-2606.26294-vs-v0.8.0.html) · [`docs/contracts/epoch_manifest.schema.json`](../contracts/epoch_manifest.schema.json)
 
 **Paper:** [The Red Queen Gödel Machine (arXiv:2606.26294)](https://arxiv.org/abs/2606.26294) — [PDF](https://arxiv.org/pdf/2606.26294) (Iacob et al., 24 Jun 2026)
 
@@ -527,10 +531,10 @@ TIER ∅ — MCU / Zephyr / NuttX: ai-memory NOT resident;
 
 | Doc | Status |
 |-----|--------|
-| [`RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md`](RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md) | **Superseded for placement** by this 21-agent doc; agent 1–11 verdicts retained above |
-| [`RQGM-2606.26294-vs-v0.8.0.md`](RQGM-2606.26294-vs-v0.8.0.md) | Mechanism map valid |
-| [`AGENT-9-FEDERATION-ISOLATED.md`](AGENT-9-FEDERATION-ISOLATED.md) | Federation lens detail |
-| [`RED-QUEEN-AGENT-11-ISOLATED-SIBLING-REPO-FUTURE.md`](RED-QUEEN-AGENT-11-ISOLATED-SIBLING-REPO-FUTURE.md) | Sibling contract detail |
+| [`RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md`](RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.html) | **Superseded for placement** by this 21-agent doc; agent 1–11 verdicts retained above |
+| [`RQGM-2606.26294-vs-v0.8.0.md`](RQGM-2606.26294-vs-v0.8.0.html) | Mechanism map valid |
+| [`AGENT-9-FEDERATION-ISOLATED.md`](AGENT-9-FEDERATION-ISOLATED.html) | Federation lens detail |
+| [`RED-QUEEN-AGENT-11-ISOLATED-SIBLING-REPO-FUTURE.md`](RED-QUEEN-AGENT-11-ISOLATED-SIBLING-REPO-FUTURE.html) | Sibling contract detail |
 | [`docs/contracts/epoch_manifest.schema.json`](../contracts/epoch_manifest.schema.json) | **RQ-01 shipped** |
 | [`v0.9.0/RECURSIVE-LEARNING-A-PLUS-ROADMAP.md`](../v0.9.0/RECURSIVE-LEARNING-A-PLUS-ROADMAP.md) | **Execution DAG** |
 | [`moonshot-synthesis.md`](../strategy/moonshot-synthesis.md) | **North Star — authoritative** |

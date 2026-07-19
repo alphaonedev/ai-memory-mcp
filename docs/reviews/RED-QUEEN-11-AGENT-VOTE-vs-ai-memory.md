@@ -1,3 +1,7 @@
+---
+layout: doc
+---
+
 # Red Queen vs ai-memory — 11-Agent Adversarial Vote (ISOLATED RUN)
 
 **Status:** FINAL synthesis from **11 independent agent executions**  
@@ -5,7 +9,7 @@
 **Vote protocol:** 5-agent crossroads `4d3ea1c5` pattern · 11 adversarial lenses · **isolated subagents, no cross-talk**  
 **Codebase:** `release/v0.8.0` @ `c85b9c56` (each agent mandated CodeGraph)  
 **North Star:** [`docs/strategy/moonshot-synthesis.md`](../strategy/moonshot-synthesis.md) §0  
-**Prior art:** [`RQGM-2606.26294-vs-v0.8.0.md`](RQGM-2606.26294-vs-v0.8.0.md)
+**Prior art:** [`RQGM-2606.26294-vs-v0.8.0.md`](RQGM-2606.26294-vs-v0.8.0.html)
 
 **Paper:** [The Red Queen Gödel Machine (arXiv:2606.26294)](https://arxiv.org/abs/2606.26294) — [PDF](https://arxiv.org/pdf/2606.26294) (Iacob et al., 24 Jun 2026)
 
@@ -370,7 +374,7 @@
 
 | Doc | Status |
 |-----|--------|
-| [`RQGM-2606.26294-vs-v0.8.0.md`](RQGM-2606.26294-vs-v0.8.0.md) | Mechanism map still valid; placement superseded by this vote |
+| [`RQGM-2606.26294-vs-v0.8.0.md`](RQGM-2606.26294-vs-v0.8.0.html) | Mechanism map still valid; placement superseded by this vote |
 | [`v0.9.0/RECURSIVE-LEARNING-A-PLUS-ROADMAP.md`](../v0.9.0/RECURSIVE-LEARNING-A-PLUS-ROADMAP.md) | **Execution DAG** — unchanged; this vote adds L1/L2/L3 framing |
 | [`moonshot-synthesis.md`](../strategy/moonshot-synthesis.md) | **North Star** — authoritative |
 

@@ -1,13 +1,17 @@
+---
+layout: doc
+---
+
 # ai-memory v1.0.1 (Patch 1) — Proposed Development Roadmap
 
-> **Document classification:** Proposed patch-release roadmap. Candidate input for the ROADMAP.md v1.0.1 revision. **Not** a §2 property amendment, **not** a ship-gate, **not** a release authorization. Derived from the code-anchored findings in [`FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.md`](FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.md).
+> **Document classification:** Proposed patch-release roadmap. Candidate input for the ROADMAP.md v1.0.1 revision. **Not** a §2 property amendment, **not** a ship-gate, **not** a release authorization. Derived from the code-anchored findings in [`FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.md`](FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.html).
 >
 > **Date:** 2026-07-18
 > **Author:** Fable 5 (Anthropic family) acting as AI NHI, synthesizing a 21-agent (3×7) + 4-supporting-lens CodeGraph-armed adversarial audit.
 > **Substrate baseline:** `release/v1.0.0` @ `924965c1` — crate `0.10.0`, **schema v84**.
 > **Cross-family basis:** every item below traces to a finding confirmed independently by the Fable 5 (Anthropic) panel and, where noted, agreed by the Grok 4.5 (xAI) package — the two-family [#1171] bar.
 >
-> **Scope discipline:** v1.0.1 is a **Patch-1 hardening + claims-discipline release**, not a feature release. It closes the **default-safety** and **honesty** gaps the v1.0.0 audit surfaced — the difference between "the machinery exists" and "the machinery is on / true for every running instance." It does **not** open new perfect-endpoint constitution work (that is the separate v1.x program tracked in [`PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.md`](PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.md) §4). Any item that changes a persisted/signed/wire shape is flagged **[T4]** and requires the 5-agent crossroads vote (`4d3ea1c5`) before implementation.
+> **Scope discipline:** v1.0.1 is a **Patch-1 hardening + claims-discipline release**, not a feature release. It closes the **default-safety** and **honesty** gaps the v1.0.0 audit surfaced — the difference between "the machinery exists" and "the machinery is on / true for every running instance." It does **not** open new perfect-endpoint constitution work (that is the separate v1.x program tracked in [`PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.md`](PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.html) §4). Any item that changes a persisted/signed/wire shape is flagged **[T4]** and requires the 5-agent crossroads vote (`4d3ea1c5`) before implementation.
 
 ---
 
@@ -160,7 +164,7 @@ But the audit also found a consistent pattern: **the strongest new controls are 
 
 ## 8. Provenance
 
-Every item traces to a code-anchored finding in [`FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.md`](FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.md), itself derived from a 21-agent (3×7) + 4-supporting-lens CodeGraph-armed adversarial audit of `release/v1.0.0` @ `924965c1` (schema v84), family-decorrelated from the Grok 4.5 package it re-audits. Findings SEC-1 and the kill-list are cross-family (Grok + Fable) confirmed.
+Every item traces to a code-anchored finding in [`FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.md`](FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.html), itself derived from a 21-agent (3×7) + 4-supporting-lens CodeGraph-armed adversarial audit of `release/v1.0.0` @ `924965c1` (schema v84), family-decorrelated from the Grok 4.5 package it re-audits. Findings SEC-1 and the kill-list are cross-family (Grok + Fable) confirmed.
 
 | Date | Change |
 |------|--------|

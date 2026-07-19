@@ -1,3 +1,7 @@
+---
+layout: doc
+---
+
 # Red Queen / RQGM vs ai-memory — 21-Lens Adversarial Assessment (OPUS)
 
 **Status:** FINAL synthesis — **21 isolated lenses across 3 sequential waves of 7 subagents (7-concurrent hard cap)**
@@ -7,8 +11,8 @@
 **North Star:** [`docs/strategy/moonshot-synthesis.md`](../strategy/moonshot-synthesis.md) §0 (endpoint substrate through AGI→ASI→beyond)
 **Paper:** [The Red Queen Gödel Machine (arXiv:2606.26294)](https://arxiv.org/abs/2606.26294) — [PDF](https://arxiv.org/pdf/2606.26294) (Iacob et al., 24 Jun 2026)
 **Provenance:** Surfaced to the project by **Nick Jensen** — [X post](https://x.com/howtoprompt__/status/2070824205663273175) · [abstract](https://arxiv.org/abs/2606.26294) · [PDF](https://arxiv.org/pdf/2606.26294)
-**Prior art (re-verified, not assumed):** [`RQGM-2606.26294-vs-v0.8.0.md`](RQGM-2606.26294-vs-v0.8.0.md) · [`RED-QUEEN-21-AGENT-VOTE-vs-ai-memory.md`](RED-QUEEN-21-AGENT-VOTE-vs-ai-memory.md) (Grok) · [`RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md`](RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md) · GitHub issue #1820
-**Companion:** [`RQGM-2606.26294-vs-v0.8.0-OPUS.md`](RQGM-2606.26294-vs-v0.8.0-OPUS.md) (paper↔code mechanism map)
+**Prior art (re-verified, not assumed):** [`RQGM-2606.26294-vs-v0.8.0.md`](RQGM-2606.26294-vs-v0.8.0.html) · [`RED-QUEEN-21-AGENT-VOTE-vs-ai-memory.md`](RED-QUEEN-21-AGENT-VOTE-vs-ai-memory.html) (Grok) · [`RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md`](RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.html) · GitHub issue #1820
+**Companion:** [`RQGM-2606.26294-vs-v0.8.0-OPUS.md`](RQGM-2606.26294-vs-v0.8.0-OPUS.html) (paper↔code mechanism map)
 
 ---
 
@@ -380,7 +384,7 @@ D3-021 enforce (after 012) · D4-015 shadow #1706 · #1705 already FULL parity (
 
 ## Compare / contrast vs the prior Grok 21-agent doc
 
-This Opus run **broadly agrees** with [`RED-QUEEN-21-AGENT-VOTE-vs-ai-memory.md`](RED-QUEEN-21-AGENT-VOTE-vs-ai-memory.md) on the headline (principles yes, RQGM external, quorum+epoch primary, attestation-before-enforce, shadow-before-live). The differences below are where Opus **diverges, corrects, or sharpens** — each with re-verified evidence.
+This Opus run **broadly agrees** with [`RED-QUEEN-21-AGENT-VOTE-vs-ai-memory.md`](RED-QUEEN-21-AGENT-VOTE-vs-ai-memory.html) on the headline (principles yes, RQGM external, quorum+epoch primary, attestation-before-enforce, shadow-before-live). The differences below are where Opus **diverges, corrects, or sharpens** — each with re-verified evidence.
 
 | # | Topic | Grok 21-agent doc | **Opus finding** | Evidence |
 |---|-------|-------------------|------------------|----------|
