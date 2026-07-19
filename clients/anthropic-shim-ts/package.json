@@ -1,0 +1,52 @@
+{
+  "name": "@alphaone/ai-memory-anthropic-shim",
+  "version": "0.1.0",
+  "description": "Record each Anthropic Messages turn to ai-memory (Direct-API SDK shim).",
+  "license": "Apache-2.0",
+  "author": "AlphaOne LLC",
+  "homepage": "https://github.com/alphaonedev/ai-memory-mcp/tree/main/clients/anthropic-shim-ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alphaonedev/ai-memory-mcp.git",
+    "directory": "clients/anthropic-shim-ts"
+  },
+  "bugs": {
+    "url": "https://github.com/alphaonedev/ai-memory-mcp/issues"
+  },
+  "keywords": ["ai-memory", "mcp", "memory", "anthropic", "claude", "llm", "shim"],
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test '__tests__/*.test.ts'",
+    "clean": "rm -rf dist"
+  },
+  "peerDependencies": {
+    "@anthropic-ai/sdk": ">=0.30.0"
+  },
+  "peerDependenciesMeta": {
+    "@anthropic-ai/sdk": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

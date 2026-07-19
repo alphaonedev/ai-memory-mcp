@@ -108,6 +108,16 @@ pub fn run(db_path: &Path, args: &VerifyAuditTrailArgs, out: &mut CliOutput<'_>)
             )
             .context(CTX_WRITE_AUDIT_REPORT)?;
         }
+        // #1873 (CWE-354) — surface a same-length suffix rewrite the seq-only
+        // truncation check misses (head-row canonical hash != anchored hash at
+        // equal sequence). Unknown/NotDetected are silent (withhold / clean).
+        if let crate::signed_events::HeadHashCheck::Mismatch { chain, detail } = &report.head_hash {
+            writeln!(
+                out.stdout,
+                "  audit-head HASH mismatch on {chain} (same-length suffix rewrite): {detail}",
+            )
+            .context(CTX_WRITE_AUDIT_REPORT)?;
+        }
         // #1822 G5b — surface the INDEPENDENT dual-chain witness verdict (K1).
         match &report.witness {
             crate::signed_events::WitnessCheck::Detected {
