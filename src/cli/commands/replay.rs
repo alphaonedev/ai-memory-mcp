@@ -186,6 +186,8 @@ mod tests {
             let now = chrono::Utc::now().to_rfc3339();
             let mem = crate::models::Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: crate::models::Tier::Mid,
                 namespace: "ns".to_string(),

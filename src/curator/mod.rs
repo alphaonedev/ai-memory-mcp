@@ -837,6 +837,8 @@ mod tests {
     fn needs_curation_skips_internal_namespaces() {
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: "m1".to_string(),
             tier: Tier::Mid,
             namespace: "_messages/alice".to_string(),
@@ -872,6 +874,8 @@ mod tests {
     fn needs_curation_skips_short_content() {
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: "m1".to_string(),
             tier: Tier::Mid,
             namespace: "app".to_string(),
@@ -907,6 +911,8 @@ mod tests {
     fn needs_curation_skips_already_tagged() {
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: "m1".to_string(),
             tier: Tier::Long,
             namespace: "app".to_string(),
@@ -942,6 +948,8 @@ mod tests {
     fn needs_curation_respects_include_list() {
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: "m1".to_string(),
             tier: Tier::Long,
             namespace: "app".to_string(),
@@ -983,6 +991,8 @@ mod tests {
     fn needs_curation_respects_exclude_list() {
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: "m1".to_string(),
             tier: Tier::Long,
             namespace: "noisy".to_string(),
@@ -1045,6 +1055,8 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: ns.to_string(),
@@ -1270,6 +1282,8 @@ mod tests {
         for i in 0..5 {
             let mem = Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: format!("test-mem-{i}"),
                 tier: crate::models::Tier::Mid,
                 namespace: "test".to_string(),
@@ -1560,6 +1574,8 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: ns.to_string(),
@@ -1657,6 +1673,7 @@ mod tests {
             None,
             None,
             None,
+            None, // #1834 valid_at (no as-of)
         )
         .unwrap();
         assert!(reports.is_empty(), "dry-run must not persist self-report");
@@ -1854,6 +1871,7 @@ mod tests {
             None,
             None,
             None,
+            None, // #1834 valid_at (no as-of)
         )
         .unwrap();
         assert_eq!(reports.len(), 1);
@@ -2069,6 +2087,8 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         let m_a = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: "smart-a".to_string(),
             tier: Tier::Long,
             namespace: "smart".to_string(),
@@ -2351,6 +2371,8 @@ fn apply_rollback_handles_storage_error() {
     let now = chrono::Utc::now().to_rfc3339();
     let mem = Memory {
         cid: None,
+        valid_from: None,
+        valid_until: None,
         id: "m1".to_string(),
         tier: Tier::Mid,
         namespace: "test".to_string(),
@@ -2391,7 +2413,8 @@ fn apply_rollback_handles_storage_error() {
     match persist_auto_tags(&conn, &mem, &tags) {
         Ok(_) => {
             // Verify the update succeeded by reading it back
-            let batch = db::list(&conn, None, None, 10, 0, None, None, None, None, None).unwrap();
+            let batch =
+                db::list(&conn, None, None, 10, 0, None, None, None, None, None, None).unwrap();
             let updated = batch.iter().find(|m| m.id == mem.id).unwrap();
             assert!(updated.metadata.get("auto_tags").is_some());
         }
@@ -2413,6 +2436,8 @@ fn consolidate_pair_skips_when_namespaces_disagree() {
     let now = chrono::Utc::now().to_rfc3339();
     let mem1 = Memory {
         cid: None,
+        valid_from: None,
+        valid_until: None,
         id: "m1".to_string(),
         tier: Tier::Mid,
         namespace: "ns1".to_string(),
@@ -2444,6 +2469,8 @@ fn consolidate_pair_skips_when_namespaces_disagree() {
 
     let mem2 = Memory {
         cid: None,
+        valid_from: None,
+        valid_until: None,
         id: "m2".to_string(),
         tier: Tier::Mid,
         namespace: "ns2".to_string(),
@@ -2560,6 +2587,8 @@ mod consolidation_pass_tests_1746 {
         let now = chrono::Utc::now().to_rfc3339();
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: ns.to_string(),
@@ -2658,7 +2687,20 @@ mod consolidation_pass_tests_1746 {
             *llm.summarize_calls.lock().unwrap() >= 1,
             "real mode summarises via the LLM"
         );
-        let rows = db::list(&conn, Some("ns"), None, 16, 0, None, None, None, None, None).unwrap();
+        let rows = db::list(
+            &conn,
+            Some("ns"),
+            None,
+            16,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(
             rows.iter().any(|m| m.title.starts_with("[consolidated]")),
             "the live pass writes a consolidated row"
@@ -2705,7 +2747,20 @@ mod consolidation_pass_tests_1746 {
             0,
             "dry-run skips the LLM"
         );
-        let rows = db::list(&conn, Some("ns"), None, 16, 0, None, None, None, None, None).unwrap();
+        let rows = db::list(
+            &conn,
+            Some("ns"),
+            None,
+            16,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(rows.len(), 2, "both source rows remain live");
     }
 

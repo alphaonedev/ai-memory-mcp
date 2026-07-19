@@ -195,6 +195,8 @@ pub fn generate_scenarios() -> Vec<Scenario> {
             let ts = (base - Duration::minutes(j_i64)).to_rfc3339();
             observations.push(Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 // Deterministic id derived from scenario + j so a
                 // re-materialised snapshot is byte-identical.
                 id: format!("{scenario_id}-obs-{j:02}"),

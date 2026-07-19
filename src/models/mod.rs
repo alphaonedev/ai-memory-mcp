@@ -589,6 +589,8 @@ mod tests {
     fn memory_serde_roundtrip_minimal() {
         let m = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: "abc".into(),
             tier: Tier::Mid,
             namespace: "global".into(),

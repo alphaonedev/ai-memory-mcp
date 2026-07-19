@@ -229,6 +229,7 @@ fn recall(
         None,
         None,   // caller
         active, // #2167 active space fingerprint
+        None,   // #1834 valid_at
     )
     .expect("recall_hybrid_with_telemetry");
     (results, telemetry)
@@ -723,6 +724,7 @@ fn recall_with_index(
         None,
         None,
         active,
+        None, // #1834 valid_at
     )
     .expect("recall_hybrid_with_telemetry (indexed)");
     (results, telemetry)

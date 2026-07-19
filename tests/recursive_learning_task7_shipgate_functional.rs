@@ -349,6 +349,7 @@ fn reflection_is_recall_visible_alongside_non_reflection_memories() {
         false,
         None,
         None, // #1720 caller
+        None, // #1834 valid_at
     )
     .expect("recall ok");
     let ids: Vec<String> = results.iter().map(|(m, _)| m.id.clone()).collect();
@@ -514,7 +515,10 @@ fn hook_veto_refuses_reflection_without_depth_cap_audit() {
 
     // No reflection memory persisted (the substrate never reached the
     // tx open).
-    let all = db::list(&conn, None, None, 1000, 0, None, None, None, None, None).unwrap();
+    let all = db::list(
+        &conn, None, None, 1000, 0, None, None, None, None, None, None,
+    )
+    .unwrap();
     assert_eq!(all.len(), 1, "veto must leave only the original source");
     assert_eq!(all[0].id, sid);
 

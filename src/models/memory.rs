@@ -1028,6 +1028,32 @@ pub struct Memory {
     /// the absent shape off the wire for pre-v74 federation peers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cid: Option<String>,
+    /// v1.0.0 #1834 (TRACT G20, schema v79) — claim-level bitemporal
+    /// VALID-TIME lower bound: the RFC3339 instant from which this claim is
+    /// asserted to hold IN THE WORLD. DISTINCT from `created_at` (transaction
+    /// time — when the row was written): a backfilled fact can be valid_from a
+    /// past instant, a future-effective policy from a future one. `None` =
+    /// unbounded past (−∞), so a claim with no lower bound is valid at every
+    /// `valid_at` query instant (legacy / default rows stay visible). Stored
+    /// on `memories.valid_from TEXT NULL`. Mirrors the `memory_links`
+    /// edge-level temporal columns. UNSIGNED, caller-CLAIMED metadata — NOT in
+    /// the `SignableWrite` v2 envelope; the federation write-signature path
+    /// does NOT attest it (trust-on-write, like `metadata.agent_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<String>,
+    /// v1.0.0 #1834 (TRACT G20, schema v79) — claim-level bitemporal
+    /// VALID-TIME upper bound (END-EXCLUSIVE): the RFC3339 instant AT which the
+    /// claim stops being asserted. A `valid_at` query matches when
+    /// `valid_until IS NULL OR valid_until > valid_at` (half-open
+    /// `[valid_from, valid_until)`, SQL:2011 convention — a claim ending at T
+    /// and one starting at T do not both match `valid_at = T`). `None` = still
+    /// valid (unbounded future, +∞). Set/updated via `memory_update` to CLOSE a
+    /// claim (the canonical bitemporal event); `valid_from` is immutable once
+    /// set (a correction is a supersede, not a mutation). Stored on
+    /// `memories.valid_until TEXT NULL`. Same UNSIGNED / non-attested posture
+    /// as `valid_from`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<String>,
 }
 
 impl Memory {
@@ -1036,7 +1062,9 @@ impl Memory {
     /// (26 at v0.7.0, was 15 at v0.6.x)" narrative in CLAUDE.md /
     /// README.md / ROADMAP.md / release-notes — the 27th field is the
     /// v0.8.0 Pillar-2 (#1709) `lifecycle_state` column; the 28th field is
-    /// the v0.9.0 G8 (#1825) additive `cid` content-id column.
+    /// the v0.9.0 G8 (#1825) additive `cid` content-id column; the 29th + 30th
+    /// are the v1.0.0 #1834 claim-bitemporal `valid_from` + `valid_until`
+    /// VALID-TIME columns.
     /// Adding or removing a field requires
     /// bumping this const in the same commit, OR the parity test pin
     /// at `tests/memory_field_count_invariant.rs` fails the build.
@@ -1045,7 +1073,7 @@ impl Memory {
     /// (Memory shape drift), mirrors the
     /// `MemoryLinkRelation::COUNT` + `EXPECTED_CLI_SUBCOMMANDS_*`
     /// drift-blocker pattern landed in commits 960578cfd + 233e8a247.
-    pub const FIELD_COUNT: usize = 28;
+    pub const FIELD_COUNT: usize = 30;
 
     /// v0.7.0 #1466 — the `expires_at` value a fresh store must persist.
     /// An explicit value the caller supplied wins; otherwise a non-`Long`
@@ -1335,6 +1363,8 @@ impl Default for Memory {
     fn default() -> Self {
         Self {
             cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
+            valid_from: None,
+            valid_until: None,
             id: String::new(),
             tier: Tier::Mid,
             namespace: crate::DEFAULT_NAMESPACE.to_string(),
@@ -1551,6 +1581,14 @@ pub struct UpdateMemory {
     /// Validated by `validate::validate_source_uri` before reaching
     /// storage.
     pub source_uri: Option<String>,
+    /// v1.0.0 #1834 — opt-in claim-bitemporal `valid_until` patch. `None`
+    /// leaves the stored value alone (COALESCE at the SQL layer); `Some(v)`
+    /// closes or moves the claim's VALID interval. `valid_from` is IMMUTABLE
+    /// (the genesis assertion instant) and is deliberately absent from this
+    /// patch — it is never updatable. Validated by `validate::validate_valid_at`
+    /// before reaching storage.
+    #[serde(default)]
+    pub valid_until: Option<String>,
     /// v0.7.0 #930 SECURITY-high (Track A P9, 2026-05-20) — optional
     /// caller-asserted `agent_id` for body/header parity. When set,
     /// MUST match the resolved `X-Agent-Id` header (Full-Measure-A
@@ -1637,6 +1675,11 @@ pub struct ListQuery {
     pub since: Option<String>,
     #[serde(default)]
     pub until: Option<String>,
+    /// v1.0.0 #1834 — claim-bitemporal AS-OF: RFC3339 point in VALID-time.
+    /// Returns only claims asserted to hold at this instant (their half-open
+    /// `[valid_from, valid_until)` window contains it). Omit for no filter.
+    #[serde(default)]
+    pub valid_at: Option<String>,
     #[serde(default)]
     pub tags: Option<String>,
     /// Filter by `metadata.agent_id` (exact match).
@@ -1667,6 +1710,9 @@ pub struct RecallQuery {
     pub since: Option<String>,
     #[serde(default)]
     pub until: Option<String>,
+    /// #1834 claim-bitemporal as-of: RFC3339 point in valid-time.
+    #[serde(default)]
+    pub valid_at: Option<String>,
     /// Task 1.5 visibility filtering.
     #[serde(default)]
     pub as_agent: Option<String>,
@@ -1759,6 +1805,9 @@ pub struct RecallBody {
     pub since: Option<String>,
     #[serde(default)]
     pub until: Option<String>,
+    /// #1834 claim-bitemporal as-of: RFC3339 point in valid-time.
+    #[serde(default)]
+    pub valid_at: Option<String>,
     /// Task 1.5 visibility filtering.
     #[serde(default)]
     pub as_agent: Option<String>,

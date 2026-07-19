@@ -195,6 +195,8 @@ mod tests {
     fn mem_with_metadata(metadata: serde_json::Value) -> Memory {
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: "test-id".to_string(),
             tier: Tier::Long,
             namespace: "test-ns".to_string(),

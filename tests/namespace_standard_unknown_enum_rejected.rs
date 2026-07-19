@@ -39,6 +39,8 @@ fn insert_standard(conn: &Connection, namespace: &str) -> String {
     let id = uuid::Uuid::new_v4().to_string();
     let mem = Memory {
         cid: None,
+        valid_from: None,
+        valid_until: None,
         id: id.clone(),
         tier: Tier::Long,
         namespace: namespace.to_string(),
