@@ -110,6 +110,7 @@ const JOURNAL_SPOOL_SUFFIX: &str = ".spool";
 const JOURNAL_SPOOL_MAX_ENTRIES: usize = 4_096;
 const JOURNAL_SPOOL_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const JOURNAL_LEGACY_REPLAY_MAX_BYTES: u64 = 32 * 1024 * 1024;
+const JOURNAL_OVERFLOW_MARKER: &str = ".overflow";
 
 /// Wire-name for the deferred refusal audit row. Audit-side dashboards
 /// filter on this string to surface storage-hook refusals separate
@@ -424,40 +425,53 @@ impl DeferredAuditJournal {
         let spool_existed = spool_dir.exists();
         std::fs::create_dir_all(&spool_dir)
             .with_context(|| format!("create deferred-audit spool {}", spool_dir.display()))?;
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
+        let mut journal_options = OpenOptions::new();
+        journal_options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            journal_options.mode(0o600);
+        }
+        let file = journal_options
             .open(&path)
             .with_context(|| format!("open deferred-audit journal {}", path.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            // Best-effort 0600 — the journal carries refusal payloads.
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .context("tighten deferred-audit journal permissions")?;
             std::fs::set_permissions(&spool_dir, std::fs::Permissions::from_mode(0o700))
                 .context("tighten deferred-audit spool permissions")?;
-            if !spool_existed && let Some(parent) = spool_dir.parent() {
-                File::open(parent)
-                    .context("open deferred-audit spool parent for fsync")?
-                    .sync_all()
-                    .context("fsync deferred-audit spool parent")?;
-            }
+        }
+        if !spool_existed && let Some(parent) = spool_dir.parent() {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            sync_directory(parent).context("fsync deferred-audit spool parent")?;
         }
         let mut usage = SpoolUsage::default();
         for entry in std::fs::read_dir(&spool_dir).context("scan deferred-audit spool")? {
             let entry = entry.context("read deferred-audit spool entry")?;
-            if entry.path().extension().is_some_and(|ext| ext == "event") {
+            let entry_path = entry.path();
+            if entry_path.extension().is_some_and(|ext| ext == "pending") {
+                std::fs::remove_file(&entry_path)
+                    .context("remove abandoned deferred-audit staging file")?;
+                continue;
+            }
+            if entry_path.extension().is_some_and(|ext| ext == "event") {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o600))
+                    std::fs::set_permissions(&entry_path, std::fs::Permissions::from_mode(0o600))
                         .context("tighten deferred-audit spool entry permissions")?;
                 }
                 usage.entries = usage.entries.saturating_add(1);
                 usage.bytes = usage.bytes.saturating_add(entry.metadata()?.len());
             }
         }
+        sync_directory(&spool_dir).context("fsync reconciled deferred-audit spool")?;
         if usage.entries > JOURNAL_SPOOL_MAX_ENTRIES || usage.bytes > JOURNAL_SPOOL_MAX_BYTES {
             anyhow::bail!("deferred-audit spool exceeds configured safety bounds");
         }
@@ -499,6 +513,7 @@ impl DeferredAuditJournal {
             if usage.entries >= JOURNAL_SPOOL_MAX_ENTRIES
                 || usage.bytes.saturating_add(frame_len) > JOURNAL_SPOOL_MAX_BYTES
             {
+                self.record_overflow()?;
                 anyhow::bail!("deferred-audit spool quota exhausted; refusing unjournaled event");
             }
             let staging_path = self
@@ -521,10 +536,8 @@ impl DeferredAuditJournal {
                 staging
                     .sync_all()
                     .context("journal spool append: fsync staging")?;
-                std::fs::hard_link(&staging_path, &spool_path)
+                std::fs::rename(&staging_path, &spool_path)
                     .context("journal spool append: publish occurrence")?;
-                std::fs::remove_file(&staging_path)
-                    .context("journal spool append: remove staging link")?;
                 self.sync_spool_dir()
             })();
             if staged.is_err() {
@@ -561,12 +574,15 @@ impl DeferredAuditJournal {
         let mut out = replay_legacy_stream(&mut f)?;
         drop(f);
 
-        let mut spool_paths = std::fs::read_dir(&self.spool_dir)
+        let mut spool_paths = Vec::new();
+        for entry in std::fs::read_dir(&self.spool_dir)
             .with_context(|| format!("journal replay: read spool {}", self.spool_dir.display()))?
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "event"))
-            .collect::<Vec<_>>();
+        {
+            let path = entry.context("journal replay: read spool entry")?.path();
+            if path.extension().is_some_and(|ext| ext == "event") {
+                spool_paths.push(path);
+            }
+        }
         spool_paths.sort();
         for path in spool_paths {
             let metadata = std::fs::metadata(&path)
@@ -596,6 +612,7 @@ impl DeferredAuditJournal {
         let Some(occurrence_id) = &event.occurrence_id else {
             return Ok(());
         };
+        let mut usage = self.spool_usage.lock().expect(JOURNAL_MUTEX_POISONED);
         let spool_path = self.spool_path(occurrence_id);
         let existing = match std::fs::read(&spool_path) {
             Ok(bytes) => bytes,
@@ -611,7 +628,6 @@ impl DeferredAuditJournal {
         }
         std::fs::remove_file(&spool_path).context("journal acknowledge: remove occurrence")?;
         self.sync_spool_dir()?;
-        let mut usage = self.spool_usage.lock().expect(JOURNAL_MUTEX_POISONED);
         usage.entries = usage.entries.saturating_sub(1);
         usage.bytes = usage
             .bytes
@@ -628,12 +644,27 @@ impl DeferredAuditJournal {
     }
 
     fn sync_spool_dir(&self) -> Result<()> {
+        sync_directory(&self.spool_dir).context("journal spool: fsync directory")
+    }
+
+    fn record_overflow(&self) -> Result<()> {
+        let marker = self.spool_dir.join(JOURNAL_OVERFLOW_MARKER);
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
         #[cfg(unix)]
-        File::open(&self.spool_dir)
-            .context("journal spool: open directory for fsync")?
-            .sync_all()
-            .context("journal spool: fsync directory")?;
-        Ok(())
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&marker) {
+            Ok(mut file) => {
+                file.write_all(b"deferred-audit spool quota exhausted\n")?;
+                file.sync_all()?;
+                self.sync_spool_dir()
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error).context("create deferred-audit overflow marker"),
+        }
     }
 
     /// Truncate the journal to empty + fsync. Called after a successful
@@ -657,6 +688,27 @@ impl DeferredAuditJournal {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all()?;
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?
+            .sync_all()?;
+        return Ok(());
+    }
+    #[cfg(not(any(unix, windows)))]
+    anyhow::bail!("directory durability is unsupported on this platform");
 }
 
 fn journal_frame(payload: &[u8]) -> Result<Vec<u8>> {
@@ -1766,8 +1818,9 @@ pub fn deferred_audit_journal_path(db_path: &Path) -> PathBuf {
 /// synchronously before this returns, so the caller installing the live
 /// governance hooks afterward gets replay-all-then-go-live ordering.
 ///
-/// Falls back to the in-memory-only behaviour (no durability) only if the
-/// journal file cannot be opened (logged loudly) — the daemon still boots.
+/// If the journal cannot be opened, returns a closed queue so every attempted
+/// submission fails visibly; production never downgrades to volatile audit
+/// delivery under corruption or resource exhaustion.
 #[must_use]
 pub fn install_deferred_audit_drainer_with_journal(
     db_path: &Path,
@@ -1783,17 +1836,18 @@ pub fn install_deferred_audit_drainer_with_journal(
         );
     }
     let journal = match DeferredAuditJournal::open(&journal_path) {
-        Ok(j) => Some(Arc::new(j)),
+        Ok(j) => Arc::new(j),
         Err(e) => {
-            tracing::warn!(
-                "deferred-audit journal open failed for {} (crash-durability DISABLED this run; \
-                 in-memory queue only): {e:#}",
+            tracing::error!(
+                "deferred-audit journal open failed for {}; audit delivery is FAIL-CLOSED: {e:#}",
                 journal_path.display()
             );
-            None
+            let (queue, receiver) = DeferredAuditQueue::new();
+            drop(receiver);
+            return (queue, tokio::spawn(async {}));
         }
     };
-    let (queue, receiver) = DeferredAuditQueue::new_with_journal(journal);
+    let (queue, receiver) = DeferredAuditQueue::new_with_journal(Some(journal));
     let metrics = queue.metrics();
     let db_path_buf = db_path.to_path_buf();
     let metrics_for_factory = metrics.clone();
@@ -2809,6 +2863,18 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn journal_open_failure_returns_closed_queue_not_volatile_fallback() {
+        let dir = fresh_tempdir();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"block").unwrap();
+        let (queue, supervisor) =
+            install_deferred_audit_drainer_with_journal(&blocker.join("db.sqlite"));
+        assert!(!queue.is_open());
+        assert!(!queue.submit_refusal("agent:closed", &refusal_action(), &refusal_decision()));
+        supervisor.await.unwrap();
+    }
+
     // -----------------------------------------------------------------
     // Cluster-C SEC-3 (issue #767) — DLQ + race-retry coverage
     // -----------------------------------------------------------------
@@ -3109,8 +3175,12 @@ mod tests {
             DeferredAuditEvent::from_refusal("agent:valid", &refusal_action(), &refusal_decision())
                 .unwrap();
         journal.append(&ev).unwrap();
-        std::fs::write(journal.spool_dir.join(".crash.pending"), b"partial").unwrap();
-        let replayed = journal.replay().unwrap();
+        let pending = journal.spool_dir.join(".crash.pending");
+        std::fs::write(&pending, b"partial").unwrap();
+        drop(journal);
+        let reopened = DeferredAuditJournal::open(&journal_path).unwrap();
+        assert!(!pending.exists());
+        let replayed = reopened.replay().unwrap();
         assert_eq!(replayed.len(), 1);
         assert_eq!(replayed[0].agent_id, "agent:valid");
     }
@@ -3150,10 +3220,12 @@ mod tests {
         let journal =
             Arc::new(DeferredAuditJournal::open(dir.path().join("quota.journal")).unwrap());
         journal.spool_usage.lock().unwrap().entries = JOURNAL_SPOOL_MAX_ENTRIES;
-        let (queue, mut receiver) = DeferredAuditQueue::new_with_journal(Some(journal));
+        let (queue, mut receiver) =
+            DeferredAuditQueue::new_with_journal(Some(Arc::clone(&journal)));
         assert!(!queue.submit_refusal("agent:quota", &refusal_action(), &refusal_decision()));
         assert!(receiver.try_recv().is_err());
         assert_eq!(queue.metrics().send_failure_count(), 1);
+        assert!(journal.spool_dir.join(JOURNAL_OVERFLOW_MARKER).exists());
     }
 
     #[test]
