@@ -883,10 +883,11 @@ pub fn validate_source_uri(s: &str) -> Result<()> {
 }
 
 /// v1.0.0 #1834 — validate a claim-bitemporal AS-OF (`valid_at`) recall/list
-/// query parameter. The value is compared LEXICOGRAPHICALLY against the stored
-/// RFC3339 `valid_from`/`valid_until` bounds, so a non-RFC3339 string would
-/// silently mis-filter rather than error. Reject it at the entry surfaces
-/// (HTTP recall/list handlers, MCP tools, CLI) so a malformed as-of is a clear
+/// query parameter. The value is canonicalized ([`canonicalize_valid_time`])
+/// and then compared LEXICOGRAPHICALLY against the (canonical) stored RFC3339
+/// `valid_from`/`valid_until` bounds, so a non-RFC3339 string would silently
+/// mis-filter rather than error. Reject it at the entry surfaces (HTTP
+/// recall/list handlers, MCP tools, CLI) so a malformed as-of is a clear
 /// `400`/typed error, not a wrong-but-successful result set.
 ///
 /// # Errors
@@ -896,6 +897,46 @@ pub fn validate_valid_at(valid_at: &str) -> Result<()> {
         bail!("valid_at must be an RFC3339 timestamp (e.g. 2026-01-01T00:00:00Z)");
     }
     Ok(())
+}
+
+/// v1.0.0 #1834 (pre-ship 3x7 fix) — canonicalize a claim-bitemporal
+/// VALID-time instant (`valid_from` / `valid_until` / `valid_at`) to the ONE
+/// fixed UTC rendering the substrate stores and compares:
+/// `YYYY-MM-DDTHH:MM:SS.ffffffZ` (`chrono::SecondsFormat::Micros`, `Z`
+/// suffix — fixed width, microsecond precision, matching postgres
+/// `timestamptz` resolution).
+///
+/// WHY: every #1834 predicate — the sqlite list/recall/hybrid/semantic SQL,
+/// the HNSW Rust re-filter, and the postgres `::text` binds — compares these
+/// columns LEXICOGRAPHICALLY as TEXT. RFC3339 admits many renderings of the
+/// SAME instant (`Z` vs `+00:00`, variable fractional digits, non-UTC
+/// offsets), and equal instants rendered differently order WRONGLY as bytes:
+/// `…T00:00:00Z` > `…T00:00:00+00:00` (`'Z'` 0x5A > `'+'` 0x2B), and a
+/// `+05:00` offset mis-orders by hours. Canonicalizing at every trust
+/// boundary (store/update/federation/import funnels + the `valid_at` query
+/// binds) makes byte comparison EXACTLY instant comparison, so the
+/// documented start-inclusive / end-exclusive contract holds. On-disk legacy
+/// renderings are normalized once by schema migration v86.
+///
+/// Returns `None` when `ts` is not parseable RFC3339 — callers keep the
+/// original bytes in that case (degrade to prior behaviour, never destroy a
+/// value the validation gates admitted).
+#[must_use]
+pub fn canonicalize_valid_time(ts: &str) -> Option<String> {
+    chrono::DateTime::parse_from_rfc3339(ts.trim())
+        .ok()
+        .map(|dt| {
+            dt.with_timezone(&chrono::Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+        })
+}
+
+/// Option-in / lossy sibling of [`canonicalize_valid_time`]: `None` passes
+/// through, a parseable value canonicalizes, an unparseable value is
+/// preserved byte-for-byte (fail-safe — the funnel never erases data).
+#[must_use]
+pub fn canonical_valid_time_opt(v: Option<&str>) -> Option<String> {
+    v.map(|s| canonicalize_valid_time(s).unwrap_or_else(|| s.to_string()))
 }
 
 /// v0.7.0 Form 4 (issue #757) — validate a [`SourceSpan`] byte-range.
