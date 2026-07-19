@@ -652,10 +652,14 @@ fn poison_plus_successors_fixture() -> (Fixture, PathBuf) {
     set_archived_at(&f.conn, "ccc-succ-2", "2020-01-01T00:00:02Z");
     set_archived_at(&f.conn, "ddd-succ-3", "2020-01-01T00:00:03Z");
     poison_row(&f.conn, "aaa-poison");
+    // NOTE: the store dir is a fresh tempdir, so its process-static frontier /
+    // poison skip-set start empty — no reset needed here. A reset that DID
+    // matter (the restart test) must key on the store's OWN `dir()` (the exact
+    // PathBuf the sweep uses as its registry key), NOT a recomputed
+    // `erasure_dir(db_path)`: on macOS the tempdir path is a `/tmp`→`/private/tmp`
+    // symlink, so `is_file()` resolves it but a raw-string PathBuf HashMap-key
+    // comparison does not — the two strings differ and the wrong key is cleared.
     let dir = erasure_dir(&f.db_path);
-    // A clean process-static frontier/skip-set for this store dir (this store's
-    // dir is a fresh tempdir, but reset defensively for isolation).
-    archive_sync::reset_process_static_sweep_state_for_dir(&dir);
     (f, dir)
 }
 
@@ -713,7 +717,7 @@ fn poison_skip_set_clears_on_restart_2225() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     enable(true);
-    let (f, dir) = poison_plus_successors_fixture();
+    let (f, _dir) = poison_plus_successors_fixture();
     let store = archive_sync::store_for_conn(&f.conn)
         .expect("store")
         .expect("enabled");
@@ -733,8 +737,11 @@ fn poison_skip_set_clears_on_restart_2225() {
 
     // Simulate a process RESTART: the skip-set + keyset frontier are
     // process-static and reset on restart, so the poison row is RETRIED (the
-    // self-healing path once its underlying cause is repaired).
-    archive_sync::reset_process_static_sweep_state_for_dir(&dir);
+    // self-healing path once its underlying cause is repaired). Reset via the
+    // store's OWN `dir()` — the exact PathBuf the sweep uses as its registry
+    // key — so this matches on macOS too, where a recomputed erasure_dir string
+    // would differ by the /tmp -> /private/tmp symlink (see the fixture note).
+    archive_sync::reset_process_static_sweep_state_for_dir(store.dir());
 
     let after_restart =
         archive_sync::sweep_archive_bundles(&f.conn, &store, archive_sync::SWEEP_LIMIT_PER_TICK)
