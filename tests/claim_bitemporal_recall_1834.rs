@@ -39,6 +39,13 @@ fn test_serial() -> &'static Mutex<()> {
 const NS: &str = "bitemporal-1834";
 const TERM: &str = "bitemporal";
 
+/// Pre-ship 3x7 (#1834) — the write funnels canonicalize VALID-time bounds
+/// to the fixed UTC rendering, so stored-byte assertions expect the
+/// canonical form of the caller-supplied instant.
+fn canon(ts: &str) -> String {
+    ai_memory::validate::canonicalize_valid_time(ts).expect("canonical rendering")
+}
+
 // Interval endpoints used across the scenarios.
 const T_JAN: &str = "2026-01-01T00:00:00+00:00";
 const T_JUN: &str = "2026-06-01T00:00:00+00:00";
@@ -207,13 +214,14 @@ fn update_closes_valid_until_while_valid_from_stays_immutable() {
     let row = storage::get(&conn, &id).expect("get").expect("present");
     assert_eq!(
         row.valid_from.as_deref(),
-        Some(T_JUN),
-        "valid_from must stay immutable across a valid_until update"
+        Some(canon(T_JUN).as_str()),
+        "valid_from must stay immutable (same INSTANT, canonical rendering) \
+         across a valid_until update"
     );
     assert_eq!(
         row.valid_until.as_deref(),
-        Some(T_SEP),
-        "valid_until must be updated to the new close instant"
+        Some(canon(T_SEP).as_str()),
+        "valid_until must be updated to the new close instant (canonical)"
     );
 
     // The closed interval is now [JUN, SEP): visible in JUL, hidden in OCT
@@ -248,13 +256,13 @@ fn archive_restore_roundtrips_valid_from_and_valid_until() {
     let restored = storage::get(&conn, &id).expect("get").expect("restored");
     assert_eq!(
         restored.valid_from.as_deref(),
-        Some(T_JAN),
-        "valid_from must survive archive→restore"
+        Some(canon(T_JAN).as_str()),
+        "valid_from must survive archive→restore (canonical rendering)"
     );
     assert_eq!(
         restored.valid_until.as_deref(),
-        Some(T_JUN),
-        "valid_until must survive archive→restore"
+        Some(canon(T_JUN).as_str()),
+        "valid_until must survive archive→restore (canonical rendering)"
     );
 }
 

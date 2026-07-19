@@ -1065,10 +1065,10 @@ fn v77_migration_backfills_preexisting_rows_folded() {
     let dir = tempfile::tempdir_in(&root).expect("tempdir");
     let path = dir.path().join("v77.db");
 
-    // Fresh open reaches the current tip (v83, #2044 agent_api_keys)
-    // with the v77 `folded` column present.
+    // Fresh open reaches the current tip (v86, #1834 pre-ship 3x7
+    // valid-time canonicalization) with the v77 `folded` column present.
     let conn = db::open(&path).expect("open");
-    assert_eq!(db::migrations::current_schema_version_for_tests(), 85);
+    assert_eq!(db::migrations::current_schema_version_for_tests(), 86);
     let version: i64 = conn
         .query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_version",
@@ -1076,7 +1076,7 @@ fn v77_migration_backfills_preexisting_rows_folded() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 85, "fresh open reaches the current tip");
+    assert_eq!(version, 86, "fresh open reaches the current tip");
     assert!(
         conn.prepare("SELECT folded FROM recall_observations LIMIT 0")
             .is_ok(),

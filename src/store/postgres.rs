@@ -716,7 +716,15 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       idempotent, replay-safe DDL batch (the v74 precedent). Purely
 //       additive, no full-table rebuild → no trigger recreation.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 85;
+// v86 = #1834 pre-ship 3x7 (v1.0.0) — one-time normalization of legacy
+//       claim-bitemporal VALID-time renderings on `memories` +
+//       `archived_memories` to the canonical fixed-UTC form
+//       (`validate::canonicalize_valid_time`). Rust-side per-row
+//       re-render (instant-preserving, idempotent, fail-safe on
+//       unparseable values); the write funnels canonicalize from v86 on.
+//       Doc twin: migrations/postgres/0043_v86_valid_time_canonicalize.sql.
+//       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
+const CURRENT_SCHEMA_VERSION: i32 = 86;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1845,8 +1853,11 @@ impl PostgresStore {
         if current_version < 84 {
             self.migrate_v84().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 85 {
             self.migrate_v85().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v86().await?;
         }
 
         Ok(())
@@ -4379,7 +4390,9 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("apply v85 archived valid-time", e))?;
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // Stamp the LITERAL arm version, not CURRENT_SCHEMA_VERSION — v86 now
+        // sits at the ladder head, so v85 must record exactly 85.
+        record_schema_version(&mut tx, 85).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v85 migration", e))?;
@@ -4387,6 +4400,70 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v85 applied (#2035: valid_from/valid_until \
              claim-bitemporal columns on archived_memories)"
+        );
+        Ok(())
+    }
+
+    /// v86 (#1834 pre-ship 3x7, v1.0.0) — normalize legacy claim-bitemporal
+    /// VALID-time renderings on `memories` + `archived_memories` to the ONE
+    /// canonical fixed-UTC form (`validate::canonicalize_valid_time`,
+    /// `YYYY-MM-DDTHH:MM:SS.ffffffZ`). The #1834 predicates compare these
+    /// TEXT columns via `::text` binds, so `Z` vs `+00:00` renderings of
+    /// the SAME instant (or a non-UTC offset) ordered WRONGLY as bytes.
+    /// Rust-side per-row re-render (postgres twin of the sqlite
+    /// `normalize_valid_time_rows` arm): instant-preserving, idempotent
+    /// (canonical values re-render to themselves and are skipped), and
+    /// fail-safe (an unparseable value keeps its exact bytes — the
+    /// migration never destroys a value). These columns are UNSIGNED
+    /// metadata (not in the SignableWrite v2 envelope / cid genesis), so
+    /// no signature breaks. Doc twin:
+    /// migrations/postgres/0043_v86_valid_time_canonicalize.sql.
+    async fn migrate_v86(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v86 normalize tx", e))?;
+        for table_sql in [
+            (
+                "SELECT id, valid_from, valid_until FROM memories \
+                 WHERE valid_from IS NOT NULL OR valid_until IS NOT NULL",
+                "UPDATE memories SET valid_from = $1, valid_until = $2 WHERE id = $3",
+            ),
+            (
+                "SELECT id, valid_from, valid_until FROM archived_memories \
+                 WHERE valid_from IS NOT NULL OR valid_until IS NOT NULL",
+                "UPDATE archived_memories SET valid_from = $1, valid_until = $2 \
+                 WHERE id = $3",
+            ),
+        ] {
+            let (select_sql, update_sql) = table_sql;
+            let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(select_sql)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("v86 select valid-time rows", e))?;
+            for (id, vf, vu) in rows {
+                let vf_canon = crate::validate::canonical_valid_time_opt(vf.as_deref());
+                let vu_canon = crate::validate::canonical_valid_time_opt(vu.as_deref());
+                if vf_canon != vf || vu_canon != vu {
+                    sqlx::query(update_sql)
+                        .bind(vf_canon)
+                        .bind(vu_canon)
+                        .bind(&id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| to_store_err("v86 normalize valid-time row", e))?;
+                }
+            }
+        }
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v86 migration", e))?;
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v86 applied (#1834 pre-ship 3x7: claim \
+             valid-time renderings canonicalized to fixed UTC)"
         );
         Ok(())
     }
@@ -5016,8 +5093,11 @@ impl PostgresStore {
         // #228 Commit B — encrypted_envelope ($13): sealed ciphertext when
         // encryption is on, NULL when off (paired with the $3 content).
         .bind(upd_encrypted_envelope)
-        // v1.0.0 #1834 — valid_until COALESCE slot ($14); TEXT RFC3339.
-        .bind(patch.valid_until)
+        // v1.0.0 #1834 — valid_until COALESCE slot ($14); TEXT RFC3339,
+        // canonicalized to the fixed UTC rendering (pre-ship 3x7).
+        .bind(crate::validate::canonical_valid_time_opt(
+            patch.valid_until.as_deref(),
+        ))
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("update_with_expected_version", e))?
@@ -13814,9 +13894,11 @@ impl MemoryStore for PostgresStore {
         // ($31), derived from the `metadata.kind_provenance` carrier (sqlite
         // `db::insert` parity via `extract_kind_provenance`).
         .bind(crate::storage::extract_kind_provenance(memory))
-        // v1.0.0 #1834 — claim-bitemporal VALID-TIME columns ($32, $33).
-        .bind(memory.valid_from.as_deref())
-        .bind(memory.valid_until.as_deref())
+        // v1.0.0 #1834 — claim-bitemporal VALID-TIME columns ($32, $33),
+        // canonicalized to the fixed UTC rendering at this funnel
+        // (pre-ship 3x7) so the TEXT predicates compare instants correctly.
+        .bind(crate::validate::canonical_valid_time_opt(memory.valid_from.as_deref()))
+        .bind(crate::validate::canonical_valid_time_opt(memory.valid_until.as_deref()))
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory", e))?
@@ -14067,9 +14149,14 @@ impl MemoryStore for PostgresStore {
                 .push_bind(batch_cid.cid)
                 .push_bind(batch_cid.genesis)
                 // v1.0.0 #1834 — claim-bitemporal VALID-TIME (order matches the
-                // `valid_from, valid_until` column tail above).
-                .push_bind(memory.valid_from.clone())
-                .push_bind(memory.valid_until.clone());
+                // `valid_from, valid_until` column tail above), canonicalized
+                // to the fixed UTC rendering at this funnel (pre-ship 3x7).
+                .push_bind(crate::validate::canonical_valid_time_opt(
+                    memory.valid_from.as_deref(),
+                ))
+                .push_bind(crate::validate::canonical_valid_time_opt(
+                    memory.valid_until.as_deref(),
+                ));
         });
         if let Some(e) = push_err {
             return Err(e);
@@ -15432,8 +15519,11 @@ impl MemoryStore for PostgresStore {
         // patch tier is 'long' the SET clause above ignores $11 and
         // clears the expiry unconditionally.
         .bind(parse_rfc3339_opt(patch.expires_at.as_deref()))
-        // v1.0.0 #1834 — valid_until COALESCE slot ($12); TEXT RFC3339.
-        .bind(patch.valid_until)
+        // v1.0.0 #1834 — valid_until COALESCE slot ($12); TEXT RFC3339,
+        // canonicalized to the fixed UTC rendering (pre-ship 3x7).
+        .bind(crate::validate::canonical_valid_time_opt(
+            patch.valid_until.as_deref(),
+        ))
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("update", e))?
@@ -15658,7 +15748,11 @@ impl MemoryStore for PostgresStore {
             .bind(filter.agent_id.as_ref())
             // v1.0.0 #1834 — claim-bitemporal AS-OF ($8); TEXT RFC3339, half-open
             // [valid_from, valid_until) END-EXCLUSIVE; NULL bounds = unbounded.
-            .bind(filter.valid_at.as_deref())
+            // Canonical fixed-UTC rendering (pre-ship 3x7) so the ::text
+            // comparison is exactly instant comparison.
+            .bind(crate::validate::canonical_valid_time_opt(
+                filter.valid_at.as_deref(),
+            ))
             .fetch_all(&self.pool)
             .await
             .map_err(|e| to_store_err("list", e))?;
@@ -16455,8 +16549,15 @@ impl MemoryStore for PostgresStore {
         .bind(memory.lifecycle_state.as_str())
         .bind(&remote_cid.cid)
         .bind(&remote_cid.genesis)
-        .bind(memory.valid_from.as_deref())
-        .bind(memory.valid_until.as_deref())
+        // Pre-ship 3x7 (#1834) — canonical fixed-UTC rendering at the
+        // federation-receive funnel so a peer's `Z` / offset rendering can
+        // never mis-order against a local `+00:00` row.
+        .bind(crate::validate::canonical_valid_time_opt(
+            memory.valid_from.as_deref(),
+        ))
+        .bind(crate::validate::canonical_valid_time_opt(
+            memory.valid_until.as_deref(),
+        ))
         .fetch_one(&self.pool)
         .await
         .map_err(|e| to_store_err("apply_remote_memory upsert", e))?;
@@ -16631,10 +16732,15 @@ impl MemoryStore for PostgresStore {
         // merged `valid_until` so a peer that CLOSED a claim replicates the
         // close by id (newer-wins in `merge_memory`) → replicas converge on
         // VALID-time. `valid_from` is local-immutable in `merge_memory`; the
-        // verbatim overwrite is a no-op (matches the `apply_remote_memory`
-        // upsert arm's `valid_from = memories.valid_from` genesis-wins rule).
-        .bind(merged.valid_from.as_deref())
-        .bind(merged.valid_until.as_deref())
+        // overwrite is a no-op (matches the `apply_remote_memory` upsert
+        // arm's `valid_from = memories.valid_from` genesis-wins rule).
+        // Canonicalized to the fixed UTC rendering (pre-ship 3x7).
+        .bind(crate::validate::canonical_valid_time_opt(
+            merged.valid_from.as_deref(),
+        ))
+        .bind(crate::validate::canonical_valid_time_opt(
+            merged.valid_until.as_deref(),
+        ))
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("merge_inbound full-row update", e))?;
@@ -16911,7 +17017,10 @@ impl MemoryStore for PostgresStore {
         .bind(caller_opt)
         // v1.0.0 #1834 — claim-bitemporal AS-OF ($10); TEXT RFC3339, half-open
         // [valid_from, valid_until) END-EXCLUSIVE; NULL bounds = unbounded.
-        .bind(filter.valid_at.as_deref())
+        // Canonical fixed-UTC rendering (pre-ship 3x7).
+        .bind(crate::validate::canonical_valid_time_opt(
+            filter.valid_at.as_deref(),
+        ))
         .fetch_all(&self.pool)
         .await
         .map_err(|e| to_store_err("recall_hybrid fts pool", e))?;
@@ -16994,7 +17103,10 @@ impl MemoryStore for PostgresStore {
             .bind(caller_opt)
             .bind(filter.active_embedding_space.as_ref())
             // v1.0.0 #1834 — claim-bitemporal AS-OF ($11). See FTS pool above.
-            .bind(filter.valid_at.as_deref())
+            // Canonical fixed-UTC rendering (pre-ship 3x7).
+            .bind(crate::validate::canonical_valid_time_opt(
+                filter.valid_at.as_deref(),
+            ))
             .fetch_all(&self.pool)
             .await
             .map_err(|e| to_store_err("recall_hybrid semantic pool", e))?;

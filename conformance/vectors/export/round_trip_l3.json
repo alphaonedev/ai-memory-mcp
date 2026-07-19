@@ -1,6 +1,6 @@
 {
   "spec_version": "2",
-  "db_schema_version": 85,
+  "db_schema_version": 86,
   "source": "ai-memory-conformance-2030",
   "exported_at": "2026-07-14T00:00:00Z",
   "memories": [
@@ -36,8 +36,8 @@
       "version": 1,
       "lifecycle_state": "open",
       "cid": "b3:711190c5325b021b34b5ea3bb534fde7545d09fb029e515ca252e426eb35d462",
-      "valid_from": "2026-01-01T00:00:00Z",
-      "valid_until": "2027-01-01T00:00:00Z"
+      "valid_from": "2026-01-01T00:00:00.000000Z",
+      "valid_until": "2027-01-01T00:00:00.000000Z"
     }
   ],
   "links": [],
