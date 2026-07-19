@@ -1,5 +1,7 @@
 ---
 layout: doc
+redirect_from:
+  - /reviews/RED-QUEEN-21-AGENT-VOTE-OPUS.md
 ---
 
 # Red Queen / RQGM vs ai-memory — 21-Lens Adversarial Assessment (OPUS)

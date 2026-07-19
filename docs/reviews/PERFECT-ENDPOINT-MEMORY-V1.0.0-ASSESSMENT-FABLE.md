@@ -1,5 +1,7 @@
 ---
 layout: doc
+redirect_from:
+  - /reviews/PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.md
 ---
 
 # Will ai-memory v1.0.0 Be the Perfect Endpoint Memory System? — Codegraph Gap-Map + Recommended v1.0.0 Roadmap

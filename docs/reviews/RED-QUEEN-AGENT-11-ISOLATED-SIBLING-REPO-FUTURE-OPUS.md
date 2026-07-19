@@ -1,5 +1,7 @@
 ---
 layout: doc
+redirect_from:
+  - /reviews/RED-QUEEN-AGENT-11-ISOLATED-SIBLING-REPO-FUTURE-OPUS.md
 ---
 
 # Sibling Repo / External-L3 Future-Proofing (OPUS re-issue)

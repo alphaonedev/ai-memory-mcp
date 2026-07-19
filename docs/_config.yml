@@ -15,6 +15,12 @@ kramdown:
   syntax_highlighter: rouge
   hard_wrap: false
 
+# Allowed on GitHub Pages; used so legacy …/foo.md bookmarks redirect to
+# the rendered …/foo.html pages (see per-file redirect_from in reviews/).
+plugins:
+  - jekyll-redirect-from
+  - jekyll-seo-tag
+
 # Apply the documentation shell to every Markdown page that lacks its own
 # layout front matter. Without this (and without per-file `layout: doc`),
 # GitHub Pages serves *.md as raw text — the reviews/ adjudication docs

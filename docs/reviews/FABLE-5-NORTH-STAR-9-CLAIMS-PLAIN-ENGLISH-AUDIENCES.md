@@ -1,5 +1,7 @@
 ---
 layout: doc
+redirect_from:
+  - /reviews/FABLE-5-NORTH-STAR-9-CLAIMS-PLAIN-ENGLISH-AUDIENCES.md
 ---
 
 # ai-memory v1.0.0 — Plain English for four audiences (Fable 5)

@@ -1,5 +1,7 @@
 ---
 layout: doc
+redirect_from:
+  - /reviews/RED-QUEEN-AGENT-11-ISOLATED-SIBLING-REPO-FUTURE.md
 ---
 
 # Agent 11 — Sibling Repo / Future-Proofing (ISOLATED)

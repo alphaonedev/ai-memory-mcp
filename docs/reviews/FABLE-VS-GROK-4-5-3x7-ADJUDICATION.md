@@ -1,5 +1,7 @@
 ---
 layout: doc
+redirect_from:
+  - /reviews/FABLE-VS-GROK-4-5-3x7-ADJUDICATION.md
 ---
 
 # Fable vs Grok 4.5 — 3×7 Cross-Family Adjudication of the Perfect-Endpoint Assessments

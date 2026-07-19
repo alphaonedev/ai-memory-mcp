@@ -5,14 +5,17 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Redirecting… · ai-memory docs</title>
 <script>
-// The Markdown docs are rendered to .html by Jekyll. Any request for the
-// legacy .md URL (old links, bookmarks) is transparently sent to the
-// rendered .html page so nothing 404s.
+// Markdown sources render to .html via Jekyll. Legacy …/foo.md bookmarks
+// hit this 404 shell (raw .md is not published) and are sent to …/foo.html.
 (function () {
   var p = location.pathname;
-  if (/\.md$/i.test(p)) {
-    location.replace(p.replace(/\.md$/i, ".html") + location.search + location.hash);
-  }
+  if (!/\.md$/i.test(p)) return;
+  var target = p.replace(/\.md$/i, ".html") + location.search + location.hash;
+  var m = document.createElement("meta");
+  m.httpEquiv = "refresh";
+  m.content = "0;url=" + target;
+  document.head.appendChild(m);
+  location.replace(target);
 })();
 </script>
 <style>

@@ -1,5 +1,7 @@
 ---
 layout: doc
+redirect_from:
+  - /reviews/FABLE-5-TO-GROK-4-5-9-CLAIM-3x7-ADJUDICATION.md
 ---
 
 # AI NHI Fable 5 → AI NHI Grok 4.5

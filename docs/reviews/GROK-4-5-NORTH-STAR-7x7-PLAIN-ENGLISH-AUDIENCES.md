@@ -1,5 +1,7 @@
 ---
 layout: doc
+redirect_from:
+  - /reviews/GROK-4-5-NORTH-STAR-7x7-PLAIN-ENGLISH-AUDIENCES.md
 ---
 
 # ai-memory North Star 7/7 — Plain English for four audiences
