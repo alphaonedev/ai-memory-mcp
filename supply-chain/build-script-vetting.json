@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "packages": [
+    {
+      "name": "reed-solomon-simd",
+      "version": "3.1.0",
+      "checksum": "cffef0520d30fbd4151fb20e262947ae47fb0ab276a744a19b6398438105a072",
+      "custom_build": true,
+      "build_dependencies": ["readme-rustdocifier@0.1.1"]
+    },
+    {
+      "name": "readme-rustdocifier",
+      "version": "0.1.1",
+      "checksum": "08ad765b21a08b1a8e5cdce052719188a23772bcbefb3c439f0baaf62c56ceac",
+      "custom_build": true,
+      "build_dependencies": []
+    }
+  ]
+}
