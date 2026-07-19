@@ -124,6 +124,7 @@ DOC_FILES=(
     CLAUDE.md
     README.md
     ROADMAP.md
+    docs/spec/PORTABILITY-V2.md
     docs/MIGRATION_QUICKSTART.md
     docs/API_REFERENCE.md
     docs/DEVELOPER_GUIDE.md
@@ -289,10 +290,18 @@ run_all_rules() {
         "$CANONICAL_CORE_TOOL_COUNT" \
         '([0-9]+) at `--profile core`|\([0-9]+ at `full`, ([0-9]+) at `core`\)|Tool count remains [0-9]+ at full / ([0-9]+) at core'
     # Memory::FIELD_COUNT
+    # Matches the CLAUDE.md narrative form ("**26-field struct at v0.7.0**")
+    # AND the normative docs/spec/PORTABILITY-V2.md field-count contract
+    # citations ("Memory::FIELD_COUNT = 30", "the 30-field Memory record",
+    # "The 30 fields, in struct order", "all 30 struct fields"). The
+    # PORTABILITY-V2 field list is a data-integrity contract: an importer
+    # coded to a stale count silently drops the #1834 valid_from/valid_until
+    # claim-validity interval, so the gate must police it (this citation
+    # was previously invisible — the gate did not scan the spec file).
     check_narrative_count_rule \
         "Memory::FIELD_COUNT" \
         "$CANONICAL_MEMORY_FIELDS" \
-        '\*\*([0-9]+)-field struct at v0\.7\.0\*\*'
+        '\*\*([0-9]+)-field struct at v0\.7\.0\*\*|Memory::FIELD_COUNT *= *([0-9]+)|the ([0-9]+)-field Memory record|The ([0-9]+) fields, in struct order|all ([0-9]+) struct fields'
     # MemoryLinkRelation::COUNT
     check_narrative_count_rule \
         "MemoryLinkRelation::COUNT" \
