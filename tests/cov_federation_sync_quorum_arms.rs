@@ -194,6 +194,8 @@ fn fixture_link() -> ai_memory::models::MemoryLink {
         observed_by: None,
         signature: None,
         attest_level: None,
+        source_cid: None,
+        target_cid: None,
     }
 }
 

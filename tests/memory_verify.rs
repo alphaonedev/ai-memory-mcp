@@ -337,6 +337,8 @@ fn peer_attested_link_verifies_and_reports_peer_attested() {
         valid_from: Some(valid_from.clone()),
         valid_until: None,
         attest_level: None,
+        source_cid: None,
+        target_cid: None,
     };
     db::create_link_inbound(&f.conn, &inbound, "peer_attested").expect("create_link_inbound");
     assert_eq!(

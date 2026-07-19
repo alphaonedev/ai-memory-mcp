@@ -126,6 +126,8 @@ fn link(src: &str, tgt: &str) -> MemoryLink {
         valid_from: Some(chrono::Utc::now().to_rfc3339()),
         valid_until: None,
         attest_level: None,
+        source_cid: None,
+        target_cid: None,
     }
 }
 

@@ -451,6 +451,25 @@ pub struct MemoryLink {
     /// pre-v0.7 federation peers that don't carry the column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attest_level: Option<String>,
+    /// v0.9.0 G13-mem (#1859) / v1.0.0 #2215 — the lineage-DAG content-id
+    /// mirror columns (`memory_links.source_cid` / `.target_cid`). Each edge
+    /// mirrors its endpoints' schema-v74 `memories.cid` AT LINK-CREATION TIME
+    /// so a lineage traversal resolves stable node identity even after an
+    /// endpoint is tombstoned. Carried on the wire so the Portability-v2
+    /// envelope round-trips them losslessly (#2215 — the exporter twin of the
+    /// import repopulation fix): `crate::storage::export_links` populates
+    /// them, and `crate::portability::import` re-writes them into the
+    /// destination's mirror columns. `None` on legacy edges, pre-v74
+    /// endpoints, or rows written while `lineage_dag_enabled()` was OFF.
+    /// Advisory-resolution only (COND 2, #1859): NOT part of the Ed25519
+    /// `SignableLink` preimage, so carrying them is byte-compat with every
+    /// shipped signature + federated peer. `skip_serializing_if` keeps the
+    /// wire byte-identical for the common NULL-mirror row (and for the
+    /// selective read paths that leave them `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_cid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_cid: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
