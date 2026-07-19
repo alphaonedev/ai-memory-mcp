@@ -171,6 +171,15 @@ pub struct ImportReport {
     /// Link rows skipped because they failed
     /// [`crate::validate::validate_link`] (id shape / relation / self-link).
     pub invalid_links_skipped: usize,
+    /// Link rows skipped because an endpoint memory is ABSENT at insert
+    /// time (skipped earlier in this import — tombstoned / archived /
+    /// invalid / forged / conflict-refused — or never present at the
+    /// destination). `memory_links` carries `REFERENCES memories(id)`
+    /// FKs and `db::open` sets `PRAGMA foreign_keys=ON`; SQLite's
+    /// `OR IGNORE` conflict resolution does NOT apply to FK constraints,
+    /// so without this probe one dangling edge would FK-error and roll
+    /// back the WHOLE all-or-nothing transaction (pre-ship 3x7 F1).
+    pub links_skipped_missing_endpoint: usize,
     /// Memory rows whose wire-asserted attestation was NOT honoured: the
     /// bundle claimed `attest_level=agent_attested` (or presented a
     /// signature) but the DESTINATION could not verify it (re-attributed
@@ -246,6 +255,22 @@ pub fn import_full_envelope(
              may carry record shapes this node cannot faithfully ingest. Upgrade this node \
              first; NO rows were applied",
             env.db_schema_version
+        );
+    }
+    // ── Pre-ship 3x7 advisory — the explicit-trust posture is LOUD. ──
+    // Under `--trust-source` wire identity claims (metadata.agent_id /
+    // agent_pubkey) are preserved VERBATIM by design (operator-trusted
+    // backup restore), which includes `_agents` registration rows that can
+    // ENROLL key material consulted by future write/federation
+    // verification (`db::agent_pubkey`). That is the accepted risk of
+    // explicit operator trust — never import an untrusted bundle under
+    // this flag (see #2264 for the v1-wire-form sibling).
+    if opts.trust_source {
+        tracing::warn!(
+            target: IMPORT_TRACE_TARGET,
+            "--trust-source: wire identity claims (metadata.agent_id / agent_pubkey) are \
+             preserved VERBATIM — imported _agents registration rows can enroll key material \
+             for future verification; accepted risk of explicit operator trust (#2264)"
         );
     }
     // ── Pre-ship 3x7 HIGH-1: snapshot the DESTINATION-enrolled author keys
@@ -570,6 +595,36 @@ fn apply_all_classes(
             );
             continue;
         }
+        // ── Pre-ship 3x7 F1 — endpoint-presence gate (FK-abort trap). ──
+        // `memory_links.source_id`/`target_id` carry `REFERENCES
+        // memories(id)` FKs and `db::open` sets `PRAGMA foreign_keys=ON`.
+        // SQLite's ON-CONFLICT resolution does NOT apply to FOREIGN KEY
+        // constraints, so `INSERT OR IGNORE` does NOT skip a dangling edge
+        // — it raises an FK error that `?`-aborts the whole all-or-nothing
+        // transaction (zero rows land, the report/WARNs never surface),
+        // directly contradicting the per-row skip disposition. Probe both
+        // endpoints against the STAGED state (the memories loop above ran
+        // in this same transaction) and skip + WARN + count any edge whose
+        // endpoint is absent: skipped earlier in this import (tombstoned /
+        // archived / invalid / forged / conflict-refused) or simply never
+        // present at the destination.
+        if !memory_row_exists(conn, &link.source_id)? || !memory_row_exists(conn, &link.target_id)?
+        {
+            report.links_skipped_missing_endpoint += 1;
+            report.warnings.push(format!(
+                "link {}->{} skipped: an endpoint memory is absent at the destination \
+                 (skipped earlier in this import, or never present)",
+                link.source_id, link.target_id
+            ));
+            tracing::warn!(
+                target: IMPORT_TRACE_TARGET,
+                source_id = %link.source_id,
+                target_id = %link.target_id,
+                "bundle link skipped: endpoint memory absent — inserting it would FK-abort \
+                 the whole import transaction (pre-ship 3x7 F1)"
+            );
+            continue;
+        }
         // #2215 — repopulate the schema-v75 lineage-DAG cid mirror
         // (`source_cid` / `target_cid`) so an imported edge keeps its
         // tombstone-resilient node identity (pre-fix the raw INSERT dropped
@@ -600,9 +655,11 @@ fn apply_all_classes(
                 (None, None)
             };
         // RAW, byte-preserving (`create_link` would re-derive the signature +
-        // attest_level — a loss). `OR IGNORE` is idempotent on the natural key
-        // and silently skips an edge whose endpoint memory is absent (e.g. a
-        // link to a tombstoned row), so it never spuriously aborts the import.
+        // attest_level — a loss). `OR IGNORE` is idempotent on the natural
+        // key (UNIQUE constraint) ONLY — it does NOT cover FK violations
+        // (SQLite ON CONFLICT never applies to FK constraints; the pre-F1
+        // comment here claimed otherwise), which is why the endpoint probe
+        // above must run before this INSERT.
         let n = conn
             .execute(
                 "INSERT OR IGNORE INTO memory_links \
@@ -937,6 +994,23 @@ fn apply_all_classes(
     report.trust_anchors_seen = env.trust_anchors.len();
 
     Ok(report)
+}
+
+/// Pre-ship 3x7 F1 — lightweight existence probe for a link endpoint
+/// against the STAGED transaction state. Deliberately NOT
+/// [`crate::storage::get`] (full row read + decrypt path) — one
+/// `EXISTS` per endpoint is all the FK gate needs.
+///
+/// # Errors
+///
+/// Surfaces underlying query failures.
+fn memory_row_exists(conn: &Connection, id: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
+        params![id],
+        |r| r.get(0),
+    )
+    .with_context(|| format!("import: endpoint-presence probe for memory {id}"))
 }
 
 /// Pre-ship 3x7 HIGH-1 — resolve the DESTINATION-enrolled Ed25519 key for
@@ -2033,6 +2107,84 @@ mod tests {
             report.warnings.len(),
             4,
             "each refusal carries a WARN, got: {:?}",
+            report.warnings
+        );
+    }
+
+    /// ★ F1 (audit finding on the HIGH-2 fix): a bundle link whose endpoint
+    /// memory was SKIPPED earlier in the import (here: an invalid row the
+    /// HIGH-2 gate refused) must be skipped + counted — NOT reach the raw
+    /// INSERT, whose `REFERENCES memories(id)` FK (with
+    /// `PRAGMA foreign_keys=ON`, and `OR IGNORE` NOT covering FK
+    /// violations) would abort the WHOLE all-or-nothing transaction with
+    /// zero rows landed. Fails pre-fix (the whole import errors and the
+    /// good row never lands).
+    #[test]
+    fn link_to_skipped_memory_does_not_fk_abort_the_import_preship_3x7_f1() {
+        let src = fresh_conn("fk-link-src-");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+
+        // A row the HIGH-2 validation gate will SKIP (priority out of range)…
+        let mut bad = memory_fixture("mem-bad-f1", "bad endpoint", "alice");
+        bad.priority = 9999;
+        env.memories.push(bad);
+        // …and a good row that must still land.
+        env.memories
+            .push(memory_fixture("mem-good-f1", "good endpoint", "alice"));
+
+        let mk_link = |source: &str, target: &str| crate::models::MemoryLink {
+            source_id: source.into(),
+            target_id: target.into(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: "2026-07-14T00:00:00Z".into(),
+            signature: None,
+            observed_by: None,
+            valid_from: None,
+            valid_until: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        };
+        // Edge referencing the SKIPPED row (the F1 FK trap)…
+        env.links.push(mk_link("mem-bad-f1", "mem-good-f1"));
+        // …an edge to an id never present anywhere…
+        env.links
+            .push(mk_link("mem-good-f1", "mem-never-existed-f1"));
+        // …and a control edge between two PRESENT rows (a second good
+        // neighbour — a self-link would trip the validity gate instead).
+        env.memories
+            .push(memory_fixture("mem-good2-f1", "good endpoint 2", "alice"));
+        env.links.push(mk_link("mem-good-f1", "mem-good2-f1"));
+
+        let dst = fresh_conn("fk-link-dst-");
+        let report = import_full_envelope(&dst, &env, &opts_trusted())
+            .expect("the import must COMMIT — a dangling link is a per-row skip, not an abort");
+        assert!(report.committed);
+        assert_eq!(report.invalid_skipped, 1, "the bad endpoint row skipped");
+        assert_eq!(report.memories, 2, "both good rows landed");
+        assert_eq!(
+            report.links_skipped_missing_endpoint, 2,
+            "both dangling edges skipped + counted"
+        );
+        assert_eq!(report.links, 1, "the control edge landed");
+        assert!(
+            crate::storage::get(&dst, "mem-good-f1")
+                .expect("get")
+                .is_some(),
+            "the rest of the bundle still commits"
+        );
+        let links: i64 = dst
+            .query_row("SELECT COUNT(*) FROM memory_links", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(links, 1, "only the control edge persisted");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .filter(|w| w.contains("endpoint memory is absent"))
+                .count()
+                == 2,
+            "each dangling edge carries a WARN, got: {:?}",
             report.warnings
         );
     }
