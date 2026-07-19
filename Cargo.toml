@@ -60,6 +60,9 @@ futures-core = "0.3"
 # preventing concurrent daemon/MCP processes from overshooting byte/inode caps.
 # Pure-Rust facade over flock/LockFileEx; no native build script.
 fs2 = "0.4"
+# Cross-platform stable file identity (dev+ino on Unix, volume/file ID on
+# Windows) for detecting spool-directory and lock-path replacement races.
+same-file = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 # v0.6.3.1 (PR-5 / issue #487) — rolling file appender for the

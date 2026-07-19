@@ -401,6 +401,8 @@ pub struct DeferredAuditJournal {
     spool_usage: Mutex<SpoolUsage>,
     spool_lock: File,
     lock_path: PathBuf,
+    spool_identity: same_file::Handle,
+    lock_identity: same_file::Handle,
 }
 
 #[derive(Default)]
@@ -464,6 +466,10 @@ impl DeferredAuditJournal {
             .open(&lock_path)
             .context("open deferred-audit spool lock")?;
         ensure_regular_file(&spool_lock, "deferred-audit spool lock")?;
+        let spool_identity = same_file::Handle::from_path(&spool_dir)
+            .context("capture deferred-audit spool directory identity")?;
+        let lock_identity = same_file::Handle::from_file(spool_lock.try_clone()?)
+            .context("capture deferred-audit spool lock identity")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -486,7 +492,7 @@ impl DeferredAuditJournal {
         }
         fs2::FileExt::lock_exclusive(&spool_lock)
             .context("lock deferred-audit spool during open")?;
-        verify_locked_path_identity(&spool_lock, &lock_path)?;
+        verify_spool_identity(&spool_identity, &lock_identity, &spool_dir, &lock_path)?;
         let mut usage = SpoolUsage::default();
         let mut overflow_markers = 0_usize;
         for entry in std::fs::read_dir(&spool_dir).context("scan deferred-audit spool")? {
@@ -590,7 +596,7 @@ impl DeferredAuditJournal {
         if usage.entries > JOURNAL_SPOOL_MAX_ENTRIES || usage.bytes > JOURNAL_SPOOL_MAX_BYTES {
             anyhow::bail!("deferred-audit spool exceeds configured safety bounds");
         }
-        verify_locked_path_identity(&spool_lock, &lock_path)?;
+        verify_spool_identity(&spool_identity, &lock_identity, &spool_dir, &lock_path)?;
         fs2::FileExt::unlock(&spool_lock).context("unlock deferred-audit spool after open")?;
         Ok(Self {
             path,
@@ -599,6 +605,8 @@ impl DeferredAuditJournal {
             spool_usage: Mutex::new(usage),
             spool_lock,
             lock_path,
+            spool_identity,
+            lock_identity,
         })
     }
 
@@ -790,7 +798,12 @@ impl DeferredAuditJournal {
     }
 
     fn verify_lock_identity(&self) -> Result<()> {
-        verify_locked_path_identity(&self.spool_lock, &self.lock_path)
+        verify_spool_identity(
+            &self.spool_identity,
+            &self.lock_identity,
+            &self.spool_dir,
+            &self.lock_path,
+        )
     }
 
     fn record_overflow(&self, event: &DeferredAuditEvent, payload: &[u8]) -> Result<()> {
@@ -1070,7 +1083,22 @@ fn ensure_regular_file(file: &File, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn verify_locked_path_identity(locked: &File, lock_path: &Path) -> Result<()> {
+fn verify_spool_identity(
+    expected_spool: &same_file::Handle,
+    expected_lock: &same_file::Handle,
+    spool_dir: &Path,
+    lock_path: &Path,
+) -> Result<()> {
+    let spool_metadata =
+        std::fs::symlink_metadata(spool_dir).context("inspect deferred-audit spool identity")?;
+    if !spool_metadata.is_dir() || spool_metadata.file_type().is_symlink() {
+        anyhow::bail!("deferred-audit spool directory identity changed");
+    }
+    let current_spool = same_file::Handle::from_path(spool_dir)
+        .context("reopen deferred-audit spool for identity check")?;
+    if &current_spool != expected_spool {
+        anyhow::bail!("deferred-audit spool directory identity changed");
+    }
     let mut options = OpenOptions::new();
     options.read(true).write(true);
     apply_no_follow(&mut options);
@@ -1078,18 +1106,12 @@ fn verify_locked_path_identity(locked: &File, lock_path: &Path) -> Result<()> {
         .open(lock_path)
         .context("reopen deferred-audit spool lock for identity check")?;
     ensure_regular_file(&current, "deferred-audit spool lock")?;
-    match fs2::FileExt::try_lock_exclusive(&current) {
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
-        Ok(()) => {
-            fs2::FileExt::unlock(&current).context("unlock replacement spool lock")?;
-            anyhow::bail!("deferred-audit spool lock identity changed");
-        }
-        Err(error) => Err(error).context("verify deferred-audit spool lock identity"),
+    let current_lock = same_file::Handle::from_file(current)
+        .context("capture current deferred-audit spool lock identity")?;
+    if &current_lock != expected_lock {
+        anyhow::bail!("deferred-audit spool lock identity changed");
     }
-    .and_then(|()| {
-        ensure_regular_file(locked, "held deferred-audit spool lock")?;
-        Ok(())
-    })
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -3880,7 +3902,8 @@ mod tests {
         let journal = DeferredAuditJournal::open(&journal_path).unwrap();
         let displaced = journal.spool_dir.join(".lock.displaced");
         std::fs::rename(&journal.lock_path, &displaced).unwrap();
-        File::create(&journal.lock_path).unwrap();
+        let replacement = File::create(&journal.lock_path).unwrap();
+        fs2::FileExt::lock_exclusive(&replacement).unwrap();
         let event = DeferredAuditEvent::from_refusal(
             "agent:replaced-lock",
             &refusal_action(),
@@ -3899,7 +3922,7 @@ mod tests {
         let displaced = dir.path().join("displaced-spool");
         std::fs::rename(&journal.spool_dir, &displaced).unwrap();
         std::fs::create_dir(&journal.spool_dir).unwrap();
-        File::create(journal.spool_dir.join(".lock")).unwrap();
+        std::fs::hard_link(displaced.join(".lock"), journal.spool_dir.join(".lock")).unwrap();
         let event = DeferredAuditEvent::from_refusal(
             "agent:replaced-spool",
             &refusal_action(),
