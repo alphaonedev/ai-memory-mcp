@@ -41,6 +41,34 @@ fn shard_file_name(i: usize) -> String {
 /// Tracing target for the erasure cold tier.
 pub const ERASURE_TRACE_TARGET: &str = "erasure::cold_tier";
 
+/// Prefix of the in-progress assembly directory a `put` swaps from. A crash
+/// mid-swap can leave one behind; the gc-tick reconciliation reaps stale ones
+/// (they embed nanos+pid, so a later `put` never reuses the exact name — the
+/// #2064 F1 orphan-`.tmp` leak fix).
+pub const TEMP_DIR_PREFIX: &str = ".tmp-";
+
+/// fsync a single file so its bytes reach stable storage before the rename
+/// that publishes the bundle (F3 — power-loss durability: a torn/empty shard
+/// behind a surviving manifest is exactly what the sweep must never leave).
+fn fsync_file(path: &Path) -> Result<(), ErasureError> {
+    let f = std::fs::File::open(path).map_err(|e| io_err("fsync open file", &e))?;
+    f.sync_all().map_err(|e| io_err("fsync file", &e))
+}
+
+/// fsync a directory so a create/rename within it is durable. A no-op on
+/// platforms where a directory cannot be opened as a file (Windows) — the
+/// per-file fsyncs still hold there.
+#[cfg(unix)]
+fn fsync_dir(path: &Path) -> Result<(), ErasureError> {
+    let f = std::fs::File::open(path).map_err(|e| io_err("fsync open dir", &e))?;
+    f.sync_all().map_err(|e| io_err("fsync dir", &e))
+}
+
+#[cfg(not(unix))]
+fn fsync_dir(_path: &Path) -> Result<(), ErasureError> {
+    Ok(())
+}
+
 /// A payload read back from the store.
 #[derive(Debug)]
 pub struct RecoveredBundle {
@@ -156,7 +184,7 @@ impl ErasureStore {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let tmp_dir = self.dir.join(format!(
-            ".tmp-{}-{nanos}-{}",
+            "{TEMP_DIR_PREFIX}{}-{nanos}-{}",
             bundle.manifest.bundle_id,
             std::process::id()
         ));
@@ -166,8 +194,10 @@ impl ErasureStore {
         std::fs::create_dir_all(&tmp_dir).map_err(|e| io_err("create bundle temp dir", &e))?;
         let result = (|| -> Result<(), ErasureError> {
             for (i, shard) in bundle.shards.iter().enumerate() {
-                std::fs::write(tmp_dir.join(shard_file_name(i)), shard)
-                    .map_err(|e| io_err("write shard", &e))?;
+                let shard_path = tmp_dir.join(shard_file_name(i));
+                std::fs::write(&shard_path, shard).map_err(|e| io_err("write shard", &e))?;
+                // F3 — each shard durable before the commit marker lands.
+                fsync_file(&shard_path)?;
             }
             // Manifest LAST: its presence is the bundle's commit marker.
             let manifest_bytes = serde_json::to_vec_pretty(&bundle.manifest).map_err(|e| {
@@ -175,14 +205,21 @@ impl ErasureStore {
                     reason: format!("manifest serialize failed: {e}"),
                 }
             })?;
-            std::fs::write(tmp_dir.join(MANIFEST_FILE), manifest_bytes)
+            let manifest_path = tmp_dir.join(MANIFEST_FILE);
+            std::fs::write(&manifest_path, manifest_bytes)
                 .map_err(|e| io_err("write manifest", &e))?;
+            fsync_file(&manifest_path)?;
+            // F3 — the temp dir's entries (shards + manifest) durable before
+            // it is renamed into place.
+            fsync_dir(&tmp_dir)?;
             // Swap: retire any existing bundle, then rename the temp dir in.
             if final_dir.exists() {
                 std::fs::remove_dir_all(final_dir)
                     .map_err(|e| io_err("remove previous bundle", &e))?;
             }
             std::fs::rename(&tmp_dir, final_dir).map_err(|e| io_err("commit bundle", &e))?;
+            // F3 — the rename itself durable (the parent directory entry).
+            fsync_dir(&self.dir)?;
             Ok(())
         })();
         if result.is_err() {
@@ -265,6 +302,72 @@ impl ErasureStore {
         }
         std::fs::remove_dir_all(&dir).map_err(|e| io_err("remove bundle", &e))?;
         Ok(true)
+    }
+
+    /// Enumerate the ids of every COMMITTED bundle (manifest present) in the
+    /// store, skipping in-progress `.tmp-*` assembly dirs and any dot-led
+    /// entry. Best-effort: an unreadable store root yields an empty list.
+    /// Backs the gc-tick orphan-reconciliation + scrub pass (F1/F3).
+    #[must_use]
+    pub fn list_committed_bundle_ids(&self) -> Vec<String> {
+        let mut ids = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return ids;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with('.') {
+                continue;
+            }
+            if entry.path().join(MANIFEST_FILE).is_file() {
+                ids.push(name.to_string());
+            }
+        }
+        ids
+    }
+
+    /// Age (seconds) of a bundle's manifest, i.e. how long ago it was last
+    /// (re-)minted. `None` when the manifest is absent/unreadable or the clock
+    /// went backwards. Used to hold the orphan reaper off freshly-written
+    /// bundles (grace window, F1).
+    #[must_use]
+    pub fn manifest_age_secs(&self, id: &str) -> Option<u64> {
+        let dir = self.bundle_dir(id).ok()?;
+        let meta = std::fs::metadata(dir.join(MANIFEST_FILE)).ok()?;
+        meta.modified().ok()?.elapsed().ok().map(|d| d.as_secs())
+    }
+
+    /// Remove `.tmp-*` assembly dirs older than `older_than_secs` — the
+    /// crashed-writer leak the module doc's "next put clears it" claim never
+    /// actually cleaned (temp names embed nanos+pid, so a later `put` uses a
+    /// different name). Returns the count reaped (F1).
+    #[must_use]
+    pub fn reap_stale_temp_dirs(&self, older_than_secs: u64) -> usize {
+        let mut reaped = 0;
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return 0;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with(TEMP_DIR_PREFIX) {
+                continue;
+            }
+            let age = entry
+                .path()
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .map(|d| d.as_secs());
+            if age.is_some_and(|a| a >= older_than_secs)
+                && std::fs::remove_dir_all(entry.path()).is_ok()
+            {
+                reaped += 1;
+            }
+        }
+        reaped
     }
 }
 

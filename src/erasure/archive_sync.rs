@@ -32,7 +32,10 @@
 //! are skipped with a WARN, and the bundle records the schema version it
 //! was minted under.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -45,6 +48,25 @@ use crate::models::field_names::ARCHIVED_AT;
 /// Max archived rows bundled per gc tick — the pacing bound. Backlogs
 /// drain monotonically (oldest-first) across ticks instead of in one blast.
 pub const SWEEP_LIMIT_PER_TICK: usize = 256;
+
+/// Max committed bundles the gc-tick orphan-reconciliation + scrub pass
+/// examines per tick. Paced + eventually-covering — a corpus-scale store
+/// never blocks a tick (F1/F2/F3 MANAGEABLE-at-scale).
+pub const RECONCILE_SCAN_LIMIT_PER_TICK: usize = 512;
+
+/// Max bundle hash-verifications (the expensive scrub work) per gc tick — a
+/// slow background integrity pass, not a full re-verify (F3).
+pub const SCRUB_LIMIT_PER_TICK: usize = 16;
+
+/// Grace window before an ownerless bundle (no archived AND no live row) is
+/// reaped and before a crashed `.tmp-*` dir is swept — long enough that an
+/// in-flight archive / reconstruct-on-read cannot race the reaper (F1).
+pub const RECONCILE_GRACE_SECS: u64 = crate::SECS_PER_HOUR as u64;
+
+/// The live memories table — the second existence lane the orphan reconciler
+/// consults so a bundle whose row was restored back to `memories` is left
+/// alone (never a caller input; a fixed const alongside [`ARCHIVED_TABLE`]).
+const MEMORIES_TABLE: &str = "memories";
 
 /// Payload JSON: top-level key naming the source table.
 const PAYLOAD_KEY_TABLE: &str = "table";
@@ -121,6 +143,25 @@ pub fn store_if_dir_present(conn: &Connection) -> Option<ErasureStore> {
     }
 }
 
+/// Process-static keyset resume frontier per store dir: the `(archived_at,
+/// id)` of the last CONTIGUOUSLY current-or-bundled row the sweep reached, so
+/// an already-bundled prefix is not re-probed (a filesystem stat + manifest
+/// read + JSON parse) on every subsequent tick (F2 — the O(N)-per-tick
+/// re-probe elimination the auditor flagged). Resets on process restart, at
+/// which point a fresh scan from the oldest row re-covers everything — a
+/// clock-skew-skipped row is thus self-healing across a restart.
+fn sweep_frontier() -> &'static Mutex<HashMap<PathBuf, (String, String)>> {
+    static FRONTIER: OnceLock<Mutex<HashMap<PathBuf, (String, String)>>> = OnceLock::new();
+    FRONTIER.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Rotating cursor so the bounded per-tick scrub covers the whole store over
+/// successive ticks instead of re-verifying the same prefix forever (F3).
+fn scrub_cursor() -> &'static AtomicUsize {
+    static CURSOR: OnceLock<AtomicUsize> = OnceLock::new();
+    CURSOR.get_or_init(|| AtomicUsize::new(0))
+}
+
 /// One paced sweep pass: bundle up to `limit` committed archived rows that
 /// lack a current bundle, oldest `archived_at` first (a monotone frontier —
 /// resumable and starvation-free).
@@ -128,49 +169,99 @@ pub fn store_if_dir_present(conn: &Connection) -> Option<ErasureStore> {
 /// A row whose existing bundle records a DIFFERENT `archived_at` is
 /// re-bundled (the row was re-archived since); identical stamps skip.
 ///
+/// # Pacing (F2)
+/// `limit` bounds ATTEMPTS (`bundled + failed`), not just successes, so a
+/// systemic failure (disk full, a poison row) can no longer retry every row
+/// in the table each tick — the pacing bound holds precisely when the system
+/// is degraded. Already-current rows below the persisted keyset frontier are
+/// skipped entirely rather than re-probed on every tick.
+///
 /// # Errors
 /// Only on the id-scan query itself; per-row bundling failures are counted
-/// + WARN-logged and retried on the next pass (paced degrade, never abort).
+/// + WARN-logged and retried on the next tick (paced degrade, never abort).
 pub fn sweep_archive_bundles(
     conn: &Connection,
     store: &ErasureStore,
     limit: usize,
 ) -> Result<SweepReport> {
     let mut report = SweepReport::default();
+    let key = store.dir().to_path_buf();
+    let (front_at, front_id) = sweep_frontier()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&key)
+        .cloned()
+        .unwrap_or_default();
     let mut stmt = conn
-        .prepare("SELECT id, archived_at FROM archived_memories ORDER BY archived_at ASC")
+        .prepare(
+            "SELECT id, archived_at FROM archived_memories \
+             WHERE ?1 = '' OR archived_at > ?1 OR (archived_at = ?1 AND id > ?2) \
+             ORDER BY archived_at ASC, id ASC",
+        )
         .context("erasure sweep: archive scan prepare")?;
     let rows = stmt
-        .query_map([], |r| {
+        .query_map([front_at.as_str(), front_id.as_str()], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
         })
         .context("erasure sweep: archive scan")?;
+    let mut advanced: Option<(String, String)> = None;
+    let mut failed_seen = false;
     for row in rows {
-        if report.bundled >= limit {
+        if report.bundled + report.failed >= limit {
             break;
         }
         let (id, archived_at) = row.context("erasure sweep: archive scan row")?;
         if bundle_is_current(store, &id, archived_at.as_deref()) {
             report.already_current += 1;
-            continue;
-        }
-        match bundle_one_row(conn, store, &id) {
-            Ok(()) => report.bundled += 1,
-            Err(e) => {
-                report.failed += 1;
-                tracing::warn!(
-                    target: ERASURE_TRACE_TARGET,
-                    bundle_id = %id,
-                    "erasure sweep: bundling archived row failed (will retry next pass): {e:#}"
-                );
+        } else {
+            match bundle_one_row(conn, store, &id) {
+                Ok(()) => report.bundled += 1,
+                Err(e) => {
+                    report.failed += 1;
+                    failed_seen = true;
+                    tracing::warn!(
+                        target: ERASURE_TRACE_TARGET,
+                        bundle_id = %id,
+                        "erasure sweep: bundling archived row failed (will retry next tick): {e:#}"
+                    );
+                    continue;
+                }
             }
         }
+        // Advance the keyset frontier only over the contiguous current/bundled
+        // prefix: a failed row (and everything after it this pass) stays in
+        // scope for the next tick. A NULL `archived_at` row never anchors the
+        // frontier (no orderable key; it sorts first and is bundled on the
+        // first, frontier-empty, pass).
+        if !failed_seen && let Some(at) = archived_at {
+            advanced = Some((at, id));
+        }
+    }
+    if let Some(frontier) = advanced {
+        sweep_frontier()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key, frontier);
     }
     Ok(report)
 }
 
 /// Cheap currency check: manifest present AND its recorded `archived_at`
 /// matches the row's. (Payload-level verification happens on read.)
+///
+/// # Archived-row immutability invariant (F5)
+/// Keying currency on the manifest `archived_at` stamp is sound ONLY because
+/// an archived row is IMMUTABLE post-mint EXCEPT the #2167 in-place
+/// `embedding_space` heal-stamp (an `UPDATE archived_memories SET
+/// embedding_space = …` that does NOT bump `archived_at`). That single
+/// mutation is harmless here: the restore INSERT-SELECT's S8 CASE NULLs any
+/// foreign/legacy-space vector on the way back to the live table, so a bundle
+/// carrying the pre-stamp `embedding_space` still re-materializes correctly.
+/// Any FUTURE in-place mutator of `archived_memories` MUST bump `archived_at`
+/// (or otherwise invalidate the bundle) or this check will silently serve a
+/// stale bundle. The torn-bundle case (manifest stamp matches but shards are
+/// corrupt) is covered independently by the scrub lane in
+/// [`reconcile_and_scrub`], which the frontier-skip cannot mask.
 fn bundle_is_current(store: &ErasureStore, id: &str, archived_at: Option<&str>) -> bool {
     if !store.contains(id) {
         return false;
@@ -204,6 +295,17 @@ fn archived_row_payload(conn: &Connection, id: &str) -> Result<(Vec<u8>, serde_j
         let v = match row.get_ref(i).context("erasure payload: column read")? {
             ValueRef::Null => serde_json::Value::Null,
             ValueRef::Integer(n) => serde_json::Value::from(n),
+            // F4 — a non-finite REAL (NaN/±Inf) maps to JSON `null` under
+            // `serde_json::Value::from(f64)`, silently ALTERING the archived
+            // value on encode + any reconstruct. Refuse LOUDLY instead, so the
+            // sweep never bakes a lossy value into a bundle (matching the
+            // decode side's "refuses … never guesses" posture).
+            ValueRef::Real(x) if !x.is_finite() => {
+                anyhow::bail!(
+                    "erasure payload: column {name} holds a non-finite REAL ({x}) — \
+                     refusing to encode a value JSON cannot represent without loss"
+                );
+            }
             ValueRef::Real(x) => serde_json::Value::from(x),
             ValueRef::Text(t) => serde_json::Value::from(
                 std::str::from_utf8(t).context("erasure payload: non-UTF-8 TEXT column")?,
@@ -388,8 +490,14 @@ pub fn try_restore_archived_row_from_bundle(
 }
 
 /// Best-effort bundle removal for purged archived rows (destruction
-/// intent). Failures WARN — the DB purge already committed and a leftover
-/// bundle is caught by the next purge — but are never silent.
+/// intent). Failures WARN (never silent). A bundle that survives a failed
+/// removal — or a crash BETWEEN the purge `DELETE` and this call — becomes an
+/// ORPHAN. It is NOT "caught by the next purge" (the purged id no longer
+/// appears in `archived_memories`, so no future purge-candidate scan ever
+/// revisits it); it is reaped by the gc-tick orphan-reconciliation pass
+/// ([`reconcile_and_scrub`]), which closes the #2208-class resurrection
+/// window (`archive restore <id>` could otherwise re-materialize purged /
+/// forgotten-then-purged content from the surviving shards).
 pub fn remove_bundles_best_effort(conn: &Connection, ids: &[String]) {
     if ids.is_empty() {
         return;
@@ -408,8 +516,123 @@ pub fn remove_bundles_best_effort(conn: &Connection, ids: &[String]) {
     }
 }
 
+/// Report from one orphan-reconciliation + scrub pass.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReconcileReport {
+    /// Committed bundles examined this pass.
+    pub scanned: usize,
+    /// Orphan bundles (no archived AND no live row, past the grace window)
+    /// reaped so purged content cannot be resurrected.
+    pub orphans_reaped: usize,
+    /// Stale `.tmp-*` assembly dirs from crashed writers reaped.
+    pub temp_reaped: usize,
+    /// Current bundles hash-verified by the scrub lane.
+    pub scrub_verified: usize,
+    /// Torn/degraded bundles re-minted from the durable archived row.
+    pub scrub_reminted: usize,
+}
+
+/// Existence probe against one of the two FIXED tables (`archived_memories` /
+/// `memories`) — never a caller-supplied name, so the interpolation is safe.
+fn row_exists(conn: &Connection, table: &str, id: &str) -> bool {
+    let sql = format!("SELECT COUNT(*) > 0 FROM {table} WHERE id = ?1");
+    conn.query_row(&sql, [id], |r| r.get::<_, bool>(0))
+        .unwrap_or(false)
+}
+
+/// Scrub one CURRENT bundle: hash-verify it (a within-budget degraded bundle
+/// self-heals inside [`ErasureStore::get`]); a torn-BEYOND-budget bundle
+/// (manifest survived a power loss, its shards did not) is re-minted from the
+/// DURABLE archived row so it is whole BEFORE a reconstruct ever needs it.
+/// Returns whether a re-mint happened.
+fn scrub_one(conn: &Connection, store: &ErasureStore, id: &str) -> Result<bool> {
+    match store.get(id) {
+        // Verified (or self-healed within budget) — nothing to do.
+        Ok(Some(_)) | Ok(None) => Ok(false),
+        Err(_) => {
+            bundle_one_row(conn, store, id)?;
+            Ok(true)
+        }
+    }
+}
+
+/// The gc-tick orphan-reconciliation + torn-bundle scrub pass (F1/F3). Reaps
+/// stale `.tmp-*` dirs and ownerless bundles (no archived AND no live row,
+/// older than `grace_secs`), and hash-verifies a bounded rotating slice of the
+/// current bundles (re-minting any torn one from the durable row). Bounded +
+/// eventually-covering; best-effort (every failure WARNs, never aborts).
+pub fn reconcile_and_scrub(
+    conn: &Connection,
+    store: &ErasureStore,
+    scan_limit: usize,
+    scrub_limit: usize,
+    grace_secs: u64,
+) -> ReconcileReport {
+    let mut report = ReconcileReport {
+        temp_reaped: store.reap_stale_temp_dirs(grace_secs),
+        ..ReconcileReport::default()
+    };
+    let ids = store.list_committed_bundle_ids();
+    let mut scrub_candidates: Vec<String> = Vec::new();
+    for id in ids.iter().take(scan_limit) {
+        report.scanned += 1;
+        if row_exists(conn, ARCHIVED_TABLE, id) {
+            scrub_candidates.push(id.clone());
+            continue;
+        }
+        if row_exists(conn, MEMORIES_TABLE, id) {
+            // Stale-but-protected: a live row still owns this id (a restore
+            // moved it back). The restore path removes the bundle directly;
+            // never reap a live row's snapshot on a transient read race.
+            continue;
+        }
+        // Orphan: neither an archived nor a live row references this bundle —
+        // reap it (past the grace window) so purged / forgotten-then-purged
+        // content can never be resurrected from the redundancy layer.
+        if !store.manifest_age_secs(id).is_some_and(|a| a >= grace_secs) {
+            continue;
+        }
+        match store.remove(id) {
+            Ok(_) => {
+                report.orphans_reaped += 1;
+                tracing::warn!(
+                    target: ERASURE_TRACE_TARGET,
+                    bundle_id = %id,
+                    "erasure cold tier: reaped ORPHAN bundle (no archived or live row) — \
+                     destruction intent reconciled"
+                );
+            }
+            Err(e) => tracing::warn!(
+                target: ERASURE_TRACE_TARGET,
+                bundle_id = %id,
+                "erasure cold tier: orphan bundle reap failed (retried next tick): {e}"
+            ),
+        }
+    }
+    // Bounded, rotating scrub over the current bundles.
+    if !scrub_candidates.is_empty() && scrub_limit > 0 {
+        let n = scrub_candidates.len();
+        let start = scrub_cursor().fetch_add(scrub_limit, Ordering::Relaxed) % n;
+        for offset in 0..scrub_limit.min(n) {
+            let id = &scrub_candidates[(start + offset) % n];
+            report.scrub_verified += 1;
+            match scrub_one(conn, store, id) {
+                Ok(true) => report.scrub_reminted += 1,
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    target: ERASURE_TRACE_TARGET,
+                    bundle_id = %id,
+                    "erasure cold tier: scrub re-mint failed (retried next tick): {e:#}"
+                ),
+            }
+        }
+    }
+    report
+}
+
 /// The gc-tick entry point: no-op when the cold tier is disabled; otherwise
-/// one paced sweep pass.
+/// one paced sweep pass PLUS the orphan-reconciliation + scrub pass (both
+/// ride the same tick, both bounded).
 ///
 /// # Errors
 /// Propagates store-resolution and scan-level failures (per-row failures
@@ -418,5 +641,22 @@ pub fn gc_tick(conn: &Connection) -> Result<SweepReport> {
     let Some(store) = store_for_conn(conn)? else {
         return Ok(SweepReport::default());
     };
-    sweep_archive_bundles(conn, &store, SWEEP_LIMIT_PER_TICK)
+    let report = sweep_archive_bundles(conn, &store, SWEEP_LIMIT_PER_TICK)?;
+    let rr = reconcile_and_scrub(
+        conn,
+        &store,
+        RECONCILE_SCAN_LIMIT_PER_TICK,
+        SCRUB_LIMIT_PER_TICK,
+        RECONCILE_GRACE_SECS,
+    );
+    if rr.orphans_reaped > 0 || rr.temp_reaped > 0 || rr.scrub_reminted > 0 {
+        tracing::info!(
+            target: ERASURE_TRACE_TARGET,
+            orphans_reaped = rr.orphans_reaped,
+            temp_reaped = rr.temp_reaped,
+            scrub_reminted = rr.scrub_reminted,
+            "erasure cold tier: reconciliation pass"
+        );
+    }
+    Ok(report)
 }

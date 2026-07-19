@@ -106,10 +106,15 @@ fn sweep_bundles_and_restore_reconstructs_lost_row() {
     assert!(dir.join("row-alpha").join("manifest.json").is_file());
     assert!(dir.join("row-beta").join("manifest.json").is_file());
 
-    // Idempotent second pass: nothing re-bundles.
+    // Idempotent second pass: nothing re-bundles. With the F2 keyset frontier
+    // the already-bundled prefix is SKIPPED (not re-probed), so a steady-state
+    // tick does zero filesystem work — `already_current` is 0, not 2.
     let again = archive_sync::gc_tick(&f.conn).expect("sweep 2");
     assert_eq!(again.bundled, 0);
-    assert_eq!(again.already_current, 2);
+    assert_eq!(
+        again.already_current, 0,
+        "F2: the keyset frontier skips the already-bundled prefix — no re-probe"
+    );
 
     // Partial DB loss, then reconstruct-on-read via the NORMAL restore verb.
     drop_archived_row(&f.conn, "row-alpha");
@@ -309,7 +314,137 @@ fn sweep_is_paced_by_the_limit() {
     );
     let second = archive_sync::sweep_archive_bundles(&f.conn, &store, 10).expect("pass 2");
     assert_eq!(second.bundled, 2, "the frontier resumes where it left off");
-    assert_eq!(second.already_current, 1);
+    assert_eq!(
+        second.already_current, 0,
+        "F2: the keyset frontier skips the row bundled in pass 1 — it is not re-probed"
+    );
+    enable(false);
+}
+
+#[test]
+fn orphan_bundle_reaped_and_not_resurrectable() {
+    // F1 (HIGH) — a bundle whose archived row was purged (or lost between the
+    // DELETE and the best-effort bundle removal) is an ORPHAN. Pre-fix it
+    // survived FOREVER (no future purge revisits a purged id) and
+    // `archive restore` could resurrect purged / forgotten-then-purged
+    // content. The gc-tick orphan reconciliation must reap it.
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    seed_archived(&f.conn, "row-orphan", "purged, must not resurrect", None);
+    archive_sync::gc_tick(&f.conn).expect("sweep");
+    let bundle = erasure_dir(&f.db_path).join("row-orphan");
+    assert!(bundle.join("manifest.json").is_file(), "bundle minted");
+
+    // Simulate the purge-crash orphan: the archived row vanishes but the
+    // bundle survives (remove_bundles_best_effort never ran).
+    drop_archived_row(&f.conn, "row-orphan");
+    assert!(bundle.exists(), "orphan bundle present pre-reconciliation");
+
+    // Reconcile with a zero grace window (the const grace is 1h — not
+    // waitable in a test). The orphan is reaped; the id no longer resurrects.
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+    let rr = archive_sync::reconcile_and_scrub(&f.conn, &store, 512, 16, 0);
+    assert_eq!(rr.orphans_reaped, 1, "the orphan bundle is reaped");
+    assert!(!bundle.exists(), "orphan bundle gone after reconciliation");
+    assert!(
+        !db::restore_archived(&f.conn, "row-orphan").expect("restore after reap"),
+        "a purge-crash orphan must NOT be resurrectable from the cold tier"
+    );
+    enable(false);
+}
+
+#[test]
+fn re_archived_row_rebundles_on_stamp_change() {
+    // F5 — the `bundle_is_current` mismatch path: a row whose `archived_at`
+    // differs from its bundle's recorded stamp (a re-archive) is re-bundled.
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    seed_archived(&f.conn, "row-restamp", "v1", None);
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+    archive_sync::sweep_archive_bundles(&f.conn, &store, 256).expect("sweep 1");
+    let stamp1 = store.get_manifest_meta("row-restamp").expect("manifest 1")["archived_at"]
+        .as_str()
+        .expect("stamp")
+        .to_string();
+
+    // A re-archive of the same id lands a strictly-later `archived_at`.
+    let later = "2999-01-01T00:00:00+00:00";
+    f.conn
+        .execute(
+            "UPDATE archived_memories SET archived_at = ?1 WHERE id = 'row-restamp'",
+            params![later],
+        )
+        .expect("re-stamp");
+    let report = archive_sync::sweep_archive_bundles(&f.conn, &store, 256).expect("sweep 2");
+    assert_eq!(
+        report.bundled, 1,
+        "the re-stamped row re-bundles (bundle_is_current mismatch path)"
+    );
+    let stamp2 = store.get_manifest_meta("row-restamp").expect("manifest 2")["archived_at"]
+        .as_str()
+        .expect("stamp")
+        .to_string();
+    assert_eq!(stamp2, later, "the manifest currency stamp is refreshed");
+    assert_ne!(
+        stamp1, later,
+        "the pre-restamp bundle carried the old stamp"
+    );
+    enable(false);
+}
+
+#[test]
+fn torn_bundle_detected_and_reminted_by_scrub() {
+    // F3 — a power loss can leave the manifest (the commit marker) behind
+    // TORN shards. `bundle_is_current` trusts the manifest stamp, so the sweep
+    // never re-mints it and the redundancy is silently gone until a
+    // reconstruct needs it. The scrub lane hash-verifies current bundles and
+    // re-mints a torn one from the DURABLE archived row BEFORE it is needed.
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    seed_archived(&f.conn, "row-torn", "torn shards after power loss", None);
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+    archive_sync::sweep_archive_bundles(&f.conn, &store, 256).expect("sweep");
+
+    // Truncate beyond the parity budget: delete m + 1 = 3 of the 6 shards.
+    let bundle = erasure_dir(&f.db_path).join("row-torn");
+    for shard in ["shard-000.bin", "shard-001.bin", "shard-002.bin"] {
+        std::fs::remove_file(bundle.join(shard)).expect("delete shard");
+    }
+    assert!(
+        store.get("row-torn").is_err(),
+        "a torn-beyond-budget bundle fails loud pre-scrub"
+    );
+
+    // The archived row still exists (the durable source of truth), so scrub
+    // re-mints the whole bundle from it.
+    let rr = archive_sync::reconcile_and_scrub(&f.conn, &store, 512, 16, 0);
+    assert_eq!(
+        rr.scrub_reminted, 1,
+        "the torn current bundle is re-minted from the durable archived row"
+    );
+    let recovered = store
+        .get("row-torn")
+        .expect("get")
+        .expect("bundle present after re-mint");
+    assert!(
+        !recovered.was_degraded,
+        "the re-mint restored the full loss budget"
+    );
     enable(false);
 }
 

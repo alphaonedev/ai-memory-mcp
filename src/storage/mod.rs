@@ -11689,6 +11689,17 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
     match result {
         Ok(v) => {
             conn.execute_batch(connection::SQL_COMMIT)?;
+            // #2064 F1 — the archived row is now live; its cold-tier bundle is
+            // a STALE snapshot. Remove it in the same flow so a later
+            // non-archiving delete of the live row cannot resurrect the old
+            // version via `archive restore` (best-effort; a survivor is reaped
+            // by the gc-tick orphan reconciliation).
+            if v {
+                crate::erasure::archive_sync::remove_bundles_best_effort(
+                    conn,
+                    std::slice::from_ref(&id.to_string()),
+                );
+            }
             Ok(v)
         }
         Err(e) => {
@@ -11879,6 +11890,14 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
     match result {
         Ok(v) => {
             conn.execute_batch(connection::SQL_COMMIT)?;
+            // #2064 F1 — remove the now-stale bundle after a successful
+            // restore (see [`restore_archived`] for the rationale).
+            if v {
+                crate::erasure::archive_sync::remove_bundles_best_effort(
+                    conn,
+                    std::slice::from_ref(&id.to_string()),
+                );
+            }
             Ok(v)
         }
         Err(e) => {
@@ -11994,7 +12013,8 @@ fn erasure_purge_candidate_ids(
         Ok(ids) => ids,
         Err(e) => {
             tracing::warn!(
-                "erasure purge-candidate scan failed (bundles are retried by the next purge): {e:#}"
+                "erasure purge-candidate scan failed (orphaned bundles are reaped by the \
+                 gc-tick reconciliation pass, NOT a later purge): {e:#}"
             );
             Vec::new()
         }
