@@ -298,6 +298,8 @@ pub(crate) fn import_from_str(
                 .and_then(serde_json::Value::as_str)
                 .map(ToString::to_string);
             if let Some(obj) = mem.metadata.as_object_mut() {
+                use crate::models::field_names;
+
                 obj.insert(
                     "agent_id".to_string(),
                     serde_json::Value::String(caller_id.clone()),
@@ -310,6 +312,24 @@ pub(crate) fn import_from_str(
                         serde_json::Value::String(orig.clone()),
                     );
                     restamped += 1;
+                }
+
+                // #2264 — the v1 wire form is unauthenticated under the
+                // default posture. Never let an imported `_agents` row seed
+                // the destination's enrolled-key lookup, and never preserve
+                // an attestation/signature after changing its bound agent id.
+                obj.remove(field_names::AGENT_PUBKEY);
+                let carried_attestation = obj.remove(field_names::ATTEST_LEVEL).is_some();
+                let carried_signature = obj.remove(field_names::WRITE_SIGNATURE).is_some();
+                if carried_attestation || carried_signature {
+                    obj.insert(
+                        field_names::ATTEST_LEVEL.to_string(),
+                        serde_json::Value::String(
+                            crate::identity::verify::AttestLevel::Claimed
+                                .as_str()
+                                .to_string(),
+                        ),
+                    );
                 }
             }
         }
@@ -707,6 +727,71 @@ mod tests {
                 .get("imported_from_agent_id")
                 .and_then(|v| v.as_str()),
             Some("other-agent")
+        );
+    }
+
+    #[test]
+    fn test_v1_default_import_cannot_plant_agent_pubkey_2264() {
+        let src = TestEnv::fresh();
+        let src_db = src.db_path.clone();
+        let id = seed_memory(&src_db, "seed", "seed", "seed");
+        let conn = db::open(&src_db).unwrap();
+        let mut planted = db::get(&conn, &id).unwrap().unwrap();
+        let planted_agent = "ai:planted-v1-key";
+        planted.namespace = crate::models::AGENTS_NAMESPACE.to_string();
+        planted.title = crate::models::agent_registration_title(planted_agent);
+        planted.metadata = serde_json::json!({
+            "agent_id": planted_agent,
+            (crate::models::field_names::AGENT_PUBKEY): "attacker-controlled-key",
+            (crate::models::field_names::ATTEST_LEVEL): "agent_attested",
+            (crate::models::field_names::WRITE_SIGNATURE): "forged-signature"
+        });
+        let payload = serde_json::json!({"memories": [planted], "links": []}).to_string();
+
+        let mut dst = TestEnv::fresh();
+        let dst_db = dst.db_path.clone();
+        let args = ImportArgs {
+            trust_source: false,
+            on_conflict: OnConflict::Version,
+        };
+        {
+            let mut out = dst.output();
+            import_from_str(
+                &payload,
+                &dst_db,
+                &args,
+                true,
+                Some("caller-agent"),
+                &mut out,
+            )
+            .unwrap();
+        }
+
+        let conn = db::open(&dst_db).unwrap();
+        assert_eq!(
+            db::agent_pubkey(&conn, planted_agent).unwrap(),
+            None,
+            "untrusted v1 import must not seed the enrolled-key surface"
+        );
+        let imported = db::get(&conn, &id).unwrap().unwrap();
+        assert!(
+            imported
+                .metadata
+                .get(crate::models::field_names::AGENT_PUBKEY)
+                .is_none()
+        );
+        assert!(
+            imported
+                .metadata
+                .get(crate::models::field_names::WRITE_SIGNATURE)
+                .is_none()
+        );
+        assert_eq!(
+            imported
+                .metadata
+                .get(crate::models::field_names::ATTEST_LEVEL)
+                .and_then(serde_json::Value::as_str),
+            Some(crate::identity::verify::AttestLevel::Claimed.as_str())
         );
     }
 

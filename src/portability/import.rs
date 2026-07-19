@@ -9,7 +9,7 @@
 //! **FAIL-CLOSED and ALL-OR-NOTHING**:
 //!
 //! - **One transaction.** Every class is applied inside ONE
-//!   [`rusqlite::Connection::unchecked_transaction`]. A fatal per-row error (a
+//!   `BEGIN IMMEDIATE` [`rusqlite::Transaction`]. A fatal per-row error (a
 //!   malformed DTO, a DB fault) short-circuits via `?`, the [`rusqlite::Transaction`]
 //!   drops WITHOUT commit, and SQLite rolls the whole import back — so a rejected
 //!   bundle applies **ZERO rows**. There is no partial apply.
@@ -283,14 +283,12 @@ pub fn import_full_envelope(
     let enrolled_keys = snapshot_dest_enrolled_keys(conn, env, opts)?;
 
     // ── ALL-OR-NOTHING: one transaction wraps the entire apply. ──
-    // `unchecked_transaction` issues BEGIN DEFERRED on `&Connection`; every
-    // helper below is either a raw `execute` or a transaction-free storage
-    // primitive (`storage::insert` / `storage::get` open no inner tx), so no
-    // nested-transaction hazard arises. On any `?` below the `Transaction`
-    // drops here without commit → SQLite ROLLBACK → zero rows applied.
-    let tx = conn
-        .unchecked_transaction()
-        .context("portability import: could not open the atomic import transaction")?;
+    // Take the write reservation up front. BEGIN DEFERRED allowed another
+    // writer to commit after our read snapshot and made the later write
+    // upgrade fail with un-retried SQLITE_BUSY_SNAPSHOT (#2250). IMMEDIATE
+    // either acquires the reservation before staging begins or returns a
+    // retriable busy without applying any rows.
+    let tx = begin_atomic_import(conn)?;
 
     let mut report = apply_all_classes(&tx, env, opts, &enrolled_keys)?;
 
@@ -362,6 +360,11 @@ pub fn import_full_envelope(
         .context("portability import: transaction commit failed")?;
     report.committed = true;
     Ok(report)
+}
+
+fn begin_atomic_import(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
+    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .context("portability import: could not open the atomic BEGIN IMMEDIATE transaction")
 }
 
 /// Stage every class into `conn` (a live transaction). Any `?` here aborts the
@@ -1294,6 +1297,41 @@ mod tests {
         drop(crate::db::open(&path).expect("init"));
         std::mem::forget(dir);
         crate::db::open(&path).expect("open")
+    }
+
+    #[test]
+    fn atomic_import_reserves_the_writer_up_front_2250() {
+        let conn = fresh_conn("begin-immediate-2250");
+        conn.execute_batch("CREATE TABLE import_lock_probe (value INTEGER NOT NULL)")
+            .unwrap();
+        let db_path = conn
+            .path()
+            .expect("file-backed test connection")
+            .to_string();
+        let competitor = Connection::open(db_path).unwrap();
+        competitor.busy_timeout(std::time::Duration::ZERO).unwrap();
+
+        let tx = begin_atomic_import(&conn).expect("BEGIN IMMEDIATE");
+        let err = competitor
+            .execute("INSERT INTO import_lock_probe (value) VALUES (1)", [])
+            .expect_err("a competing writer must not enter during import staging");
+        assert!(
+            matches!(
+                err,
+                rusqlite::Error::SqliteFailure(ref inner, _)
+                    if matches!(
+                        inner.code,
+                        rusqlite::ErrorCode::DatabaseBusy
+                            | rusqlite::ErrorCode::DatabaseLocked
+                    )
+            ),
+            "expected SQLite busy/locked from the reserved writer, got {err:?}"
+        );
+
+        drop(tx);
+        competitor
+            .execute("INSERT INTO import_lock_probe (value) VALUES (1)", [])
+            .expect("writer proceeds after import rollback");
     }
 
     fn append_row(conn: &Connection, i: usize) {
