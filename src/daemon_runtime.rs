@@ -4104,166 +4104,169 @@ pub(crate) fn install_governance_pre_write_hook(
     let queue_for_hook = deferred_audit_queue.clone();
     let cache_for_hook = Arc::clone(rule_cache);
     let conn_for_hook = hook_consultation_conn;
-    let install_result =
-        crate::storage::GOVERNANCE_PRE_WRITE.set(Box::new(
-            move |mem: &crate::models::Memory| -> std::result::Result<(), String> {
-                let action = AgentAction::Custom {
-                    custom_kind: "memory_write".to_string(),
-                    payload: serde_json::json!({
-                        "namespace": mem.namespace,
-                        "tier": mem.tier.as_str(),
-                        (field_names::MEMORY_KIND): mem.memory_kind.as_str(),
-                        "title": mem.title,
-                    }),
-                };
-                // Resolve the agent_id from the memory's metadata
-                // (every substrate-written memory carries it under
-                // `metadata.agent_id` — see CLAUDE.md §"Agent
-                // Identity"). Fall back to a stable hook-source tag
-                // when the metadata key is missing so the audit row
-                // still attributes the refusal.
-                let agent_id = mem
-                    .metadata
-                    .get("agent_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("substrate:pre_write_hook")
-                    .to_string();
-                let Some(conn_arc) = conn_for_hook.as_ref() else {
-                    // v0.7.0 #1455 (SEC, MED) — FAIL-CLOSED when the hook
-                    // consultation connection could not be opened at
-                    // install time. The pre-#1455 posture degraded to
-                    // ALLOW, which meant a daemon that lost its rules DB
-                    // at boot (permissions flip, disk pressure, an
-                    // attacker who can make `db::open` fail) silently
-                    // disabled the entire substrate write-gate while
-                    // continuing to accept writes. That is the same
-                    // bypass class #1054 closed for consultation ERRORS;
-                    // an unavailable connection is just a permanent
-                    // consultation failure and gets the same secure
-                    // default + the same operator escape hatch.
-                    return governance_consultation_unavailable(
-                        &queue_for_hook,
-                        &agent_id,
-                        &action,
-                        &rules_db_path,
-                        "L1-6 governance pre-write",
-                    );
-                };
-                let conn_guard = match conn_arc.lock() {
-                    Ok(g) => g,
-                    Err(poisoned) => {
-                        tracing::warn!(
-                            "L1-6 governance pre-write: consultation connection mutex poisoned; \
-                             recovering inner connection and continuing"
-                        );
-                        poisoned.into_inner()
-                    }
-                };
-                let conn_for_check: &rusqlite::Connection = &conn_guard;
-                match check_agent_action_deferred_cached(
-                    conn_for_check,
-                    Some(&cache_for_hook),
+    let install_result = crate::storage::GOVERNANCE_PRE_WRITE.set(Box::new(
+        move |mem: &crate::models::Memory| -> std::result::Result<(), String> {
+            let action = AgentAction::Custom {
+                custom_kind: "memory_write".to_string(),
+                payload: serde_json::json!({
+                    "namespace": mem.namespace,
+                    "tier": mem.tier.as_str(),
+                    (field_names::MEMORY_KIND): mem.memory_kind.as_str(),
+                    "title": mem.title,
+                }),
+            };
+            // Resolve the agent_id from the memory's metadata
+            // (every substrate-written memory carries it under
+            // `metadata.agent_id` — see CLAUDE.md §"Agent
+            // Identity"). Fall back to a stable hook-source tag
+            // when the metadata key is missing so the audit row
+            // still attributes the refusal.
+            let agent_id = mem
+                .metadata
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("substrate:pre_write_hook")
+                .to_string();
+            let Some(conn_arc) = conn_for_hook.as_ref() else {
+                // v0.7.0 #1455 (SEC, MED) — FAIL-CLOSED when the hook
+                // consultation connection could not be opened at
+                // install time. The pre-#1455 posture degraded to
+                // ALLOW, which meant a daemon that lost its rules DB
+                // at boot (permissions flip, disk pressure, an
+                // attacker who can make `db::open` fail) silently
+                // disabled the entire substrate write-gate while
+                // continuing to accept writes. That is the same
+                // bypass class #1054 closed for consultation ERRORS;
+                // an unavailable connection is just a permanent
+                // consultation failure and gets the same secure
+                // default + the same operator escape hatch.
+                return governance_consultation_unavailable(
+                    &queue_for_hook,
                     &agent_id,
                     &action,
-                    &queue_for_hook,
-                ) {
-                    Ok(RuleDecision::Allow | RuleDecision::Warn { .. }) => Ok(()),
-                    Ok(RuleDecision::Refuse { rule_id, reason }) => {
-                        tracing::info!(
-                            "L1-6 governance pre-write refused namespace={:?} rule_id={} \
+                    &rules_db_path,
+                    "L1-6 governance pre-write",
+                );
+            };
+            let conn_guard = match conn_arc.lock() {
+                Ok(g) => g,
+                Err(poisoned) => {
+                    tracing::warn!(
+                        "L1-6 governance pre-write: consultation connection mutex poisoned; \
+                             recovering inner connection and continuing"
+                    );
+                    poisoned.into_inner()
+                }
+            };
+            let conn_for_check: &rusqlite::Connection = &conn_guard;
+            match check_agent_action_deferred_cached(
+                conn_for_check,
+                Some(&cache_for_hook),
+                &agent_id,
+                &action,
+                &queue_for_hook,
+            ) {
+                Ok(RuleDecision::Allow | RuleDecision::Warn { .. }) => Ok(()),
+                Ok(RuleDecision::Refuse { rule_id, reason }) => {
+                    tracing::info!(
+                        "L1-6 governance pre-write refused namespace={:?} rule_id={} \
                              reason={} (chain-logged via deferred audit queue)",
-                            mem.namespace,
-                            rule_id,
-                            reason
-                        );
-                        Err(reason)
-                    }
-                    Ok(RuleDecision::Escalate { rule_id, reason }) => {
-                        // §22 PE-5 — an `escalate` verdict FAILS CLOSED:
-                        // it blocks the write exactly like a refusal
-                        // (`Err`). The deferred audit queue chain-logs it
-                        // (the verdict is blocking, so `submit_refusal`
-                        // enqueues it). Queue persistence + the human
-                        // review queue + timeout-sweep are the #697 PE-5
-                        // follow-on, NOT this primitive — so for now the
-                        // action is paused-as-blocked.
-                        tracing::info!(
-                            "L1-6 governance pre-write escalated namespace={:?} rule_id={} \
+                        mem.namespace,
+                        rule_id,
+                        reason
+                    );
+                    Err(reason)
+                }
+                Ok(RuleDecision::Escalate { rule_id, reason }) => {
+                    // §22 PE-5 — an `escalate` verdict FAILS CLOSED:
+                    // it blocks the write exactly like a refusal
+                    // (`Err`). The deferred audit queue chain-logs it
+                    // (the verdict is blocking, so `submit_refusal`
+                    // enqueues it). Queue persistence + the human
+                    // review queue + timeout-sweep are the #697 PE-5
+                    // follow-on, NOT this primitive — so for now the
+                    // action is paused-as-blocked.
+                    tracing::info!(
+                        "L1-6 governance pre-write escalated namespace={:?} rule_id={} \
                              reason={} (blocked pending human review; chain-logged)",
-                            mem.namespace,
-                            rule_id,
-                            reason
+                        mem.namespace,
+                        rule_id,
+                        reason
+                    );
+                    Err(reason)
+                }
+                Err(e) => {
+                    if e.downcast_ref::<crate::governance::agent_action::AuditAdmissionError>()
+                        .is_some()
+                    {
+                        return Err(
+                            crate::governance::deferred_audit::AUDIT_ADMISSION_FAILED.to_string()
                         );
-                        Err(reason)
                     }
-                    Err(e) => {
-                        if e.downcast_ref::<crate::governance::agent_action::AuditAdmissionError>()
-                            .is_some()
-                        {
-                            return Err(crate::governance::deferred_audit::AUDIT_ADMISSION_FAILED
-                                .to_string());
-                        }
-                        // v0.7.0 #1054 (Agent-2 #4) — fail-CLOSED on
-                        // rule-consultation error and chain-log the
-                        // refusal so an attacker who can induce
-                        // consultation errors (concurrent PRAGMA
-                        // wal_checkpoint, ATTACH-as-readonly
-                        // contention, etc.) cannot race a refused
-                        // write through the gate. The pre-#1054
-                        // posture degraded to ALLOW, which made the
-                        // gate dependent on the rule consultation
-                        // never erroring — a fragile invariant.
-                        //
-                        // Operators with a legitimate need for the
-                        // legacy fail-open posture (e.g. during a
-                        // chaos-test window where transient SQL
-                        // pressure is expected) can opt back in via
-                        // `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1`.
-                        // The unsafe override is logged at WARN on
-                        // every fire and counts toward the
-                        // governance posture surface so an audit can
-                        // detect the legacy-permissive mode.
-                        let reason = format!("governance:consultation_failed: {e}");
-                        let fail_open = std::env::var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR")
-                            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                            .unwrap_or(false);
-                        // Emit a governance.refusal-shaped row to the
-                        // deferred audit queue regardless of the
-                        // open/closed decision so the audit chain
-                        // captures the consultation failure either
-                        // way. The synthetic Decision::Refuse uses
-                        // rule_id=`governance:consultation_failed` so
-                        // a downstream auditor can distinguish
-                        // "no rule fired" from "consultation broke".
-                        let synthetic_refusal = RuleDecision::Refuse {
-                            rule_id: "governance:consultation_failed".to_string(),
-                            reason: reason.clone(),
-                        };
-                        if !queue_for_hook.submit_refusal(&agent_id, &action, &synthetic_refusal) {
-                            return Err(crate::governance::deferred_audit::AUDIT_ADMISSION_FAILED
-                                .to_string());
-                        }
-                        if fail_open {
-                            tracing::warn!(
-                                "L1-6 governance pre-write: rule consultation failed: {}; \
+                    // v0.7.0 #1054 (Agent-2 #4) — fail-CLOSED on
+                    // rule-consultation error and chain-log the
+                    // refusal so an attacker who can induce
+                    // consultation errors (concurrent PRAGMA
+                    // wal_checkpoint, ATTACH-as-readonly
+                    // contention, etc.) cannot race a refused
+                    // write through the gate. The pre-#1054
+                    // posture degraded to ALLOW, which made the
+                    // gate dependent on the rule consultation
+                    // never erroring — a fragile invariant.
+                    //
+                    // Operators with a legitimate need for the
+                    // legacy fail-open posture (e.g. during a
+                    // chaos-test window where transient SQL
+                    // pressure is expected) can opt back in via
+                    // `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1`.
+                    // The unsafe override is logged at WARN on
+                    // every fire and counts toward the
+                    // governance posture surface so an audit can
+                    // detect the legacy-permissive mode.
+                    let reason = format!("governance:consultation_failed: {e}");
+                    let fail_open = std::env::var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                    // Emit a governance.refusal-shaped row to the
+                    // deferred audit queue regardless of the
+                    // open/closed decision so the audit chain
+                    // captures the consultation failure either
+                    // way. The synthetic Decision::Refuse uses
+                    // rule_id=`governance:consultation_failed` so
+                    // a downstream auditor can distinguish
+                    // "no rule fired" from "consultation broke".
+                    let synthetic_refusal = RuleDecision::Refuse {
+                        rule_id: "governance:consultation_failed".to_string(),
+                        reason: reason.clone(),
+                    };
+                    let audit_admitted =
+                        queue_for_hook.submit_refusal(&agent_id, &action, &synthetic_refusal);
+                    let outcome =
+                        governance_consultation_posture(fail_open, audit_admitted, &reason);
+                    if !audit_admitted {
+                        return outcome;
+                    }
+                    if fail_open {
+                        tracing::warn!(
+                            "L1-6 governance pre-write: rule consultation failed: {}; \
                                  AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 — \
                                  degrading to ALLOW (UNSAFE, legacy posture)",
-                                e
-                            );
-                            Ok(())
-                        } else {
-                            tracing::warn!(
-                                "L1-6 governance pre-write: rule consultation failed: {}; \
+                            e
+                        );
+                        outcome
+                    } else {
+                        tracing::warn!(
+                            "L1-6 governance pre-write: rule consultation failed: {}; \
                                  failing CLOSED (post-#1054 secure default — \
                                  set AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 to revert)",
-                                e
-                            );
-                            Err(reason)
-                        }
+                            e
+                        );
+                        outcome
                     }
                 }
-            },
-        ));
+            }
+        },
+    ));
     if install_result.is_err() {
         // Already installed — happens if the same process boots a
         // write surface twice (test reuse via `bootstrap_serve`, or a
@@ -4305,114 +4308,116 @@ pub(crate) fn install_governance_pre_action_hook(
     let cache_for_wire_check = Arc::clone(rule_cache);
     let queue_for_wire_check = deferred_audit_queue.clone();
     let conn_for_wire_check = hook_consultation_conn;
-    let install_result =
-        crate::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(
-            move |action: &AgentAction| -> std::result::Result<(), String> {
-                let Some(conn_arc) = conn_for_wire_check.as_ref() else {
-                    // #1455 — FAIL-CLOSED when the consultation connection is
-                    // unavailable; a daemon-internal wire action is higher-stakes
-                    // than a storage write, so degrading to ALLOW would be the
-                    // worst place to fail open.
-                    return governance_consultation_unavailable(
-                        &queue_for_wire_check,
-                        WIRE_ACTION_ACTOR,
-                        action,
-                        &rules_db_path,
-                        "wire_check",
-                    );
-                };
-                let conn_guard = match conn_arc.lock() {
-                    Ok(g) => g,
-                    Err(poisoned) => {
-                        tracing::warn!(
-                            "wire_check: consultation connection mutex poisoned; \
-                         recovering inner connection and continuing"
-                        );
-                        poisoned.into_inner()
-                    }
-                };
-                let conn_for_check: &rusqlite::Connection = &conn_guard;
-                match check_agent_action_deferred_cached(
-                    conn_for_check,
-                    Some(&cache_for_wire_check),
+    let install_result = crate::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(
+        move |action: &AgentAction| -> std::result::Result<(), String> {
+            let Some(conn_arc) = conn_for_wire_check.as_ref() else {
+                // #1455 — FAIL-CLOSED when the consultation connection is
+                // unavailable; a daemon-internal wire action is higher-stakes
+                // than a storage write, so degrading to ALLOW would be the
+                // worst place to fail open.
+                return governance_consultation_unavailable(
+                    &queue_for_wire_check,
                     WIRE_ACTION_ACTOR,
                     action,
-                    &queue_for_wire_check,
-                ) {
-                    Ok(RuleDecision::Allow | RuleDecision::Warn { .. }) => Ok(()),
-                    Ok(RuleDecision::Refuse { rule_id, reason }) => {
-                        tracing::info!(
-                            "wire_check refused action kind={} rule_id={} reason={} \
+                    &rules_db_path,
+                    "wire_check",
+                );
+            };
+            let conn_guard = match conn_arc.lock() {
+                Ok(g) => g,
+                Err(poisoned) => {
+                    tracing::warn!(
+                        "wire_check: consultation connection mutex poisoned; \
+                         recovering inner connection and continuing"
+                    );
+                    poisoned.into_inner()
+                }
+            };
+            let conn_for_check: &rusqlite::Connection = &conn_guard;
+            match check_agent_action_deferred_cached(
+                conn_for_check,
+                Some(&cache_for_wire_check),
+                WIRE_ACTION_ACTOR,
+                action,
+                &queue_for_wire_check,
+            ) {
+                Ok(RuleDecision::Allow | RuleDecision::Warn { .. }) => Ok(()),
+                Ok(RuleDecision::Refuse { rule_id, reason }) => {
+                    tracing::info!(
+                        "wire_check refused action kind={} rule_id={} reason={} \
                          (chain-logged via deferred audit queue)",
-                            action.kind(),
-                            rule_id,
-                            reason,
-                        );
-                        Err(reason)
-                    }
-                    Ok(RuleDecision::Escalate { rule_id, reason }) => {
-                        // §22 PE-5 — `escalate` FAILS CLOSED: block the
-                        // action like a refusal (`Err`). Chain-logged via
-                        // the deferred queue (blocking verdict). Queue
-                        // persistence / human-review routing / timeout are
-                        // the #697 PE-5 follow-on, not this primitive.
-                        tracing::info!(
-                            "wire_check escalated action kind={} rule_id={} reason={} \
+                        action.kind(),
+                        rule_id,
+                        reason,
+                    );
+                    Err(reason)
+                }
+                Ok(RuleDecision::Escalate { rule_id, reason }) => {
+                    // §22 PE-5 — `escalate` FAILS CLOSED: block the
+                    // action like a refusal (`Err`). Chain-logged via
+                    // the deferred queue (blocking verdict). Queue
+                    // persistence / human-review routing / timeout are
+                    // the #697 PE-5 follow-on, not this primitive.
+                    tracing::info!(
+                        "wire_check escalated action kind={} rule_id={} reason={} \
                          (blocked pending human review; chain-logged)",
-                            action.kind(),
-                            rule_id,
-                            reason,
+                        action.kind(),
+                        rule_id,
+                        reason,
+                    );
+                    Err(reason)
+                }
+                Err(e) => {
+                    if e.downcast_ref::<crate::governance::agent_action::AuditAdmissionError>()
+                        .is_some()
+                    {
+                        return Err(
+                            crate::governance::deferred_audit::AUDIT_ADMISSION_FAILED.to_string()
                         );
-                        Err(reason)
                     }
-                    Err(e) => {
-                        if e.downcast_ref::<crate::governance::agent_action::AuditAdmissionError>()
-                            .is_some()
-                        {
-                            return Err(crate::governance::deferred_audit::AUDIT_ADMISSION_FAILED
-                                .to_string());
-                        }
-                        // #1054 — same fail-CLOSED posture as the storage hook;
-                        // env escape hatch AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1.
-                        let reason = format!("governance:consultation_failed: {e}");
-                        let fail_open = std::env::var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR")
-                            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                            .unwrap_or(false);
-                        let synthetic_refusal = RuleDecision::Refuse {
-                            rule_id: "governance:consultation_failed".to_string(),
-                            reason: reason.clone(),
-                        };
-                        if !queue_for_wire_check.submit_refusal(
-                            WIRE_ACTION_ACTOR,
-                            action,
-                            &synthetic_refusal,
-                        ) {
-                            return Err(crate::governance::deferred_audit::AUDIT_ADMISSION_FAILED
-                                .to_string());
-                        }
-                        if fail_open {
-                            tracing::warn!(
-                                "wire_check: rule consultation failed: {}; \
+                    // #1054 — same fail-CLOSED posture as the storage hook;
+                    // env escape hatch AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1.
+                    let reason = format!("governance:consultation_failed: {e}");
+                    let fail_open = std::env::var("AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                    let synthetic_refusal = RuleDecision::Refuse {
+                        rule_id: "governance:consultation_failed".to_string(),
+                        reason: reason.clone(),
+                    };
+                    let audit_admitted = queue_for_wire_check.submit_refusal(
+                        WIRE_ACTION_ACTOR,
+                        action,
+                        &synthetic_refusal,
+                    );
+                    let outcome =
+                        governance_consultation_posture(fail_open, audit_admitted, &reason);
+                    if !audit_admitted {
+                        return outcome;
+                    }
+                    if fail_open {
+                        tracing::warn!(
+                            "wire_check: rule consultation failed: {}; \
                              AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 — \
                              degrading to ALLOW for this action ({}) (UNSAFE, legacy posture)",
-                                e,
-                                action.kind(),
-                            );
-                            Ok(())
-                        } else {
-                            tracing::warn!(
-                                "wire_check: rule consultation failed: {}; failing CLOSED \
+                            e,
+                            action.kind(),
+                        );
+                        outcome
+                    } else {
+                        tracing::warn!(
+                            "wire_check: rule consultation failed: {}; failing CLOSED \
                              for this action ({}) (post-#1054 secure default — set \
                              AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 to revert)",
-                                e,
-                                action.kind(),
-                            );
-                            Err(reason)
-                        }
+                            e,
+                            action.kind(),
+                        );
+                        outcome
                     }
                 }
-            },
-        ));
+            }
+        },
+    ));
     if install_result.is_err() {
         tracing::debug!(
             "wire_check pre-action hook already installed (process-wide OnceLock); \
@@ -4424,6 +4429,25 @@ pub(crate) fn install_governance_pre_action_hook(
              FilesystemWrite/NetworkRequest/ProcessSpawn; n26: Bash + Custom \
              have no egress sink yet — structural coverage tracked v0.8 #1695)"
         );
+    }
+}
+
+/// Resolve the post-consultation-error security posture shared by both hook
+/// installers and the unavailable-connection path.
+///
+/// Durable audit admission is a prerequisite for the explicit fail-open
+/// override. Without it, the action stays blocked regardless of the override.
+fn governance_consultation_posture(
+    fail_open: bool,
+    audit_admitted: bool,
+    reason: &str,
+) -> std::result::Result<(), String> {
+    if !audit_admitted {
+        Err(crate::governance::deferred_audit::AUDIT_ADMISSION_FAILED.to_string())
+    } else if fail_open {
+        Ok(())
+    } else {
+        Err(reason.to_string())
     }
 }
 
@@ -4476,8 +4500,10 @@ fn governance_consultation_unavailable_inner(
         rule_id: "governance:consultation_unavailable".to_string(),
         reason: reason.clone(),
     };
-    if !queue.submit_refusal(agent_id, action, &synthetic_refusal) {
-        return Err(crate::governance::deferred_audit::AUDIT_ADMISSION_FAILED.to_string());
+    let audit_admitted = queue.submit_refusal(agent_id, action, &synthetic_refusal);
+    let outcome = governance_consultation_posture(fail_open, audit_admitted, &reason);
+    if !audit_admitted {
+        return outcome;
     }
     if fail_open {
         tracing::warn!(
@@ -4485,14 +4511,14 @@ fn governance_consultation_unavailable_inner(
              {ENV_GOVERNANCE_FAIL_OPEN}=1 — degrading to ALLOW (UNSAFE, legacy posture)",
             rules_db_path.display(),
         );
-        Ok(())
+        outcome
     } else {
         tracing::warn!(
             "{surface}: hook consultation connection unavailable (rules DB at {}); failing CLOSED \
              (#1455 secure default — set {ENV_GOVERNANCE_FAIL_OPEN}=1 to revert)",
             rules_db_path.display(),
         );
-        Err(reason)
+        outcome
     }
 }
 
@@ -7043,6 +7069,32 @@ mod tests {
     /// posture. The pre-#1455 behaviour silently degraded to ALLOW,
     /// disabling the entire substrate write-gate whenever `db::open`
     /// failed at boot.
+    #[test]
+    fn governance_consultation_posture_pins_closed_open_and_admission_failure() {
+        let reason = "governance:consultation_failed: injected";
+
+        assert_eq!(
+            governance_consultation_posture(false, true, reason),
+            Err(reason.to_string()),
+            "secure default must fail closed after durable audit admission"
+        );
+        assert_eq!(
+            governance_consultation_posture(true, true, reason),
+            Ok(()),
+            "explicit override may allow only after durable audit admission"
+        );
+        assert_eq!(
+            governance_consultation_posture(true, false, reason),
+            Err(crate::governance::deferred_audit::AUDIT_ADMISSION_FAILED.to_string()),
+            "audit admission failure must override the fail-open setting"
+        );
+        assert_eq!(
+            governance_consultation_posture(false, false, reason),
+            Err(crate::governance::deferred_audit::AUDIT_ADMISSION_FAILED.to_string()),
+            "audit admission failure must remain fail closed"
+        );
+    }
+
     #[test]
     fn governance_consultation_unavailable_fails_closed_by_default_1455() {
         use crate::governance::agent_action::AgentAction;

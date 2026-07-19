@@ -437,11 +437,11 @@ fn governance_hooks_fail_closed_on_rule_consultation_error_1054() {
     for (hook_marker, next_item_marker) in [
         (
             "crate::storage::GOVERNANCE_PRE_WRITE.set(Box::new(",
-            "/// #1685",
+            "pub(crate) fn install_governance_pre_action_hook(",
         ),
         (
             "crate::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(",
-            "/// v0.7.0 #1455 (SEC, MED)",
+            "fn governance_consultation_posture(",
         ),
     ] {
         let install_idx = body
@@ -465,6 +465,22 @@ fn governance_hooks_fail_closed_on_rule_consultation_error_1054() {
              synthesise a `governance:consultation_failed` \
              refusal and push it to the deferred audit queue so \
              the chain-log captures the consultation failure."
+        );
+        assert!(
+            closure_body.contains("let outcome =")
+                && closure_body.contains(
+                    "governance_consultation_posture(fail_open, audit_admitted, &reason)",
+                )
+                && closure_body.contains("return outcome;")
+                && closure_body
+                    .lines()
+                    .filter(|line| line.trim() == "outcome")
+                    .count()
+                    == 2,
+            "post-#1054: `{hook_marker}` MUST delegate its executable verdict to the \
+             behavior-tested `governance_consultation_posture` helper, return that verdict \
+             when audit admission fails, and use it as both executable posture branches' \
+             final expression"
         );
     }
 }
