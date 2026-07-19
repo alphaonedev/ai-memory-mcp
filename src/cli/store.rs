@@ -77,6 +77,18 @@ pub struct StoreArgs {
     /// (validated via `validate::validate_source_span`).
     #[arg(long)]
     pub source_span: Option<String>,
+    /// #2258 / #1834 — claim-bitemporal VALID-time start (RFC3339). Records
+    /// when the fact BECAME true (backfill / future-effective), distinct from
+    /// `created_at` transaction-time. Maps to `Memory::valid_from` (validated
+    /// via `validate::validate_valid_at`). IMMUTABLE after create.
+    #[arg(long)]
+    pub valid_from: Option<String>,
+    /// #2258 / #1834 — claim-bitemporal VALID-time end bound (RFC3339,
+    /// half-open `[valid_from, valid_until)`). Maps to `Memory::valid_until`
+    /// (validated via `validate::validate_valid_at`); stays updatable via
+    /// `ai-memory update`.
+    #[arg(long)]
+    pub valid_until: Option<String>,
     /// v0.7.0 F2.3 (#1427) — QW-2 persona artefact entity binding.
     /// Required when `--kind persona`. Maps to `Memory::entity_id`.
     #[arg(long)]
@@ -244,10 +256,32 @@ pub fn run(
         }
     };
 
+    // #2258 / #1834 — caller-supplied claim-bitemporal VALID-time bounds.
+    // Validated as RFC3339 up front (a non-RFC3339 bound would silently
+    // mis-filter at `valid_at` recall time). `valid_from` is stamped at create
+    // and preserved immutably on upsert by the persist layer; `valid_until`
+    // stays updatable via `ai-memory update`.
+    let valid_from = match args.valid_from.as_deref() {
+        None => None,
+        Some(s) => {
+            validate::validate_valid_at(s)
+                .map_err(|e| anyhow::anyhow!("invalid --valid-from: {e}"))?;
+            Some(s.to_string())
+        }
+    };
+    let valid_until = match args.valid_until.as_deref() {
+        None => None,
+        Some(s) => {
+            validate::validate_valid_at(s)
+                .map_err(|e| anyhow::anyhow!("invalid --valid-until: {e}"))?;
+            Some(s.to_string())
+        }
+    };
+
     let mut mem = models::Memory {
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
-        valid_from: None,
-        valid_until: None,
+        valid_from,
+        valid_until,
         id: uuid::Uuid::new_v4().to_string(),
         tier,
         namespace,
@@ -459,6 +493,8 @@ mod tests {
             citations: None,
             source_uri: None,
             source_span: None,
+            valid_from: None,
+            valid_until: None,
             entity_id: None,
             sign: false,
             write_v2: None,

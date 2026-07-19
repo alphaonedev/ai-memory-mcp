@@ -117,6 +117,18 @@
           },
           "title": {
             "type": "string"
+          },
+          "valid_from": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "valid_until": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
