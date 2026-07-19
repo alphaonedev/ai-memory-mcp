@@ -137,6 +137,12 @@ pub struct ImportReport {
     /// pre-existing `forget_tombstones` (#2208: a destination-forgotten
     /// memory must never resurrect through an import).
     pub tombstoned_skipped: usize,
+    /// Bundle `forget_tombstones` NOT staged because their id is currently
+    /// LIVE at the destination (#2208 re-audit N2: an unauthenticated bundle
+    /// tombstone must not suppress a live destination row — it would plant a
+    /// contradictory live-row+tombstone state and permanently block the id's
+    /// future admission; only the destination's own forget funnel erases).
+    pub tombstones_skipped_live: usize,
     /// Memory rows skipped because the DESTINATION holds the id in
     /// `archived_memories` (#2208 adjacent: re-admitting it live would
     /// leave the id in BOTH tables; the sanctioned way back to live is
@@ -308,6 +314,34 @@ fn apply_all_classes(
     // step-(2) destination probe reads, so one probe covers both the
     // bundle's tombstones and the destination's pre-existing ones (#2208).
     for t in &env.forget_tombstones {
+        // #2208 re-audit N2 — a bundle tombstone is UNAUTHENTICATED input,
+        // and the substrate's resurrection guard is EXISTENCE-based. If the
+        // id is currently LIVE at the destination, staging the tombstone
+        // would plant the contradictory live-row+tombstone state AND
+        // permanently suppress the id's future federation/import admission
+        // — an erasure the destination operator never ordered. Refuse to
+        // plant it: skip + WARN, keep the destination's live truth (the
+        // dest's own `memory_forget` funnel is the only sanctioned eraser
+        // of a live dest row). A tombstone for a NOT-live id still stages
+        // (the legitimate erasure-receipt transfer).
+        if crate::storage::get(conn, &t.memory_id)
+            .with_context(|| format!("import: live probe for tombstone {}", t.memory_id))?
+            .is_some()
+        {
+            report.tombstones_skipped_live += 1;
+            report.warnings.push(format!(
+                "forget_tombstone for {} skipped: the id is LIVE at the destination — a \
+                 bundle tombstone cannot suppress a live destination row (erase it via \
+                 memory_forget at the destination if intended)",
+                t.memory_id
+            ));
+            tracing::warn!(
+                target: "portability::import",
+                memory_id = %t.memory_id,
+                "bundle forget_tombstone skipped: id is live at the destination"
+            );
+            continue;
+        }
         conn.execute(
             "INSERT OR IGNORE INTO forget_tombstones \
                 (memory_id, namespace, forgotten_at, agent_id, signature) \
@@ -1331,6 +1365,62 @@ mod tests {
                 .expect("get")
                 .is_none(),
             "the colliding row is refused under error mode"
+        );
+    }
+
+    /// ★ #2208 re-audit N2: a bundle `forget_tombstone` for an id that is
+    /// currently LIVE at the destination is NOT staged (skip + WARN) — an
+    /// unauthenticated bundle tombstone must not plant the contradictory
+    /// live-row+tombstone state or suppress the id's future admission.
+    /// Fails on pre-N2 code (the tombstone raw-inserted unconditionally).
+    #[test]
+    fn bundle_tombstone_for_live_dest_row_is_not_staged_n2() {
+        let src = fresh_conn("tomb-live-src-");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        env.forget_tombstones
+            .push(crate::portability::dto::ForgetTombstoneDto {
+                memory_id: "mem-live-n2".into(),
+                namespace: "portability".into(),
+                forgotten_at: "2026-07-14T00:00:00Z".into(),
+                agent_id: Some("mallory".into()),
+                signature: None,
+            });
+
+        let dst = fresh_conn("tomb-live-dst-");
+        crate::storage::insert(&dst, &memory_fixture("mem-live-n2", "alive", "bob"))
+            .expect("seed live dest row");
+
+        let report = import_full_envelope(&dst, &env, &opts_trusted()).expect("import");
+        assert_eq!(report.tombstones_skipped_live, 1, "the skip is counted");
+        assert_eq!(report.forget_tombstones, 0, "the tombstone was NOT staged");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("mem-live-n2") && w.contains("LIVE")),
+            "a WARN names the suppressed tombstone, got: {:?}",
+            report.warnings
+        );
+        assert!(
+            !crate::storage::memory_is_tombstoned(&dst, "mem-live-n2").expect("probe"),
+            "no tombstone row landed for the live id"
+        );
+        assert!(
+            crate::storage::get(&dst, "mem-live-n2")
+                .expect("get")
+                .is_some(),
+            "the live destination row is untouched"
+        );
+
+        // Control: a tombstone for a NOT-live id still stages (the
+        // legitimate erasure-receipt transfer path is unchanged).
+        let dst2 = fresh_conn("tomb-live-dst2-");
+        let report2 = import_full_envelope(&dst2, &env, &opts_trusted()).expect("import 2");
+        assert_eq!(report2.forget_tombstones, 1, "not-live tombstone staged");
+        assert_eq!(report2.tombstones_skipped_live, 0);
+        assert!(
+            crate::storage::memory_is_tombstoned(&dst2, "mem-live-n2").expect("probe"),
+            "the erasure receipt transferred on the empty destination"
         );
     }
 

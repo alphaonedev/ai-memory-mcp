@@ -269,6 +269,28 @@ pub(crate) fn import_from_str(
     let mut restamped = 0usize;
     let mut errors = Vec::new();
     for mut mem in memories {
+        // #2208 re-audit N1 — the v1 wire-form must honour the SAME forget
+        // covenant as the v2 route: stripping `spec_version` from a bundle
+        // must not become a DOWNGRADE BYPASS that resurrects a
+        // dest-forgotten id (the dest tombstone is the durable erasure
+        // receipt; `insert_with_conflict` performs no tombstone check).
+        if db::memory_is_tombstoned(&conn, &mem.id)? {
+            errors.push(format!(
+                "{}: skipped — a destination forget tombstone forbids re-admission",
+                mem.id
+            ));
+            continue;
+        }
+        // #2208 N1 mirror — a dest-ARCHIVED id must not be re-admitted live
+        // (dual residency); the sanctioned way back is memory_archive_restore.
+        if db::memory_is_archived(&conn, &mem.id)? {
+            errors.push(format!(
+                "{}: skipped — the id is archived at the destination \
+                 (restore via memory_archive_restore, not import)",
+                mem.id
+            ));
+            continue;
+        }
         if !args.trust_source {
             let original = mem
                 .metadata
@@ -718,6 +740,90 @@ mod tests {
             Some("preserved-agent")
         );
         assert!(dst.stderr_str().contains("trust-source"));
+    }
+
+    /// ★ #2208 re-audit N1 — the v1 wire-form (no `spec_version`) honours
+    /// the SAME forget covenant as the v2 route: a dest-forgotten id in a
+    /// v1-form payload is refused/skipped, and a dest-archived id is not
+    /// re-admitted live. Fails on pre-N1 code (stripping `spec_version`
+    /// was a downgrade bypass — `insert_with_conflict` performed no
+    /// tombstone/archive check, so the forgotten row resurrected under its
+    /// original id).
+    #[test]
+    fn v1_form_import_does_not_resurrect_dest_forgotten_or_archived_2208() {
+        // Source carries two rows in DISTINCT namespaces so the dest can
+        // forget one (namespace-filtered) and archive the other.
+        let src = TestEnv::fresh();
+        let src_db = src.db_path.clone();
+        let id_forget = seed_memory(&src_db, "ns-forget", "f-title", "f-content");
+        let id_archive = seed_memory(&src_db, "ns-archive", "a-title", "a-content");
+        let payload = export_payload_at(&src_db);
+        assert!(
+            !payload.contains("spec_version"),
+            "fixture: the payload is the v1 wire form"
+        );
+
+        let mut dst = TestEnv::fresh();
+        let dst_db = dst.db_path.clone();
+        let args = ImportArgs {
+            trust_source: false,
+            on_conflict: OnConflict::Version,
+        };
+        {
+            let mut out = dst.output();
+            import_from_str(&payload, &dst_db, &args, true, Some("caller"), &mut out).unwrap();
+        }
+        {
+            let conn = db::open(&dst_db).unwrap();
+            assert!(db::get(&conn, &id_forget).unwrap().is_some());
+            // Dest operator forgets one row + archives the other.
+            assert_eq!(
+                db::forget(&conn, Some("ns-forget"), None, None, false).unwrap(),
+                1,
+                "dest forgot the row"
+            );
+            assert!(
+                db::archive_memory(&conn, &id_archive, Some("test")).unwrap(),
+                "dest archived the row"
+            );
+        }
+
+        // Re-import the SAME v1-form payload: neither id may come back live.
+        {
+            let mut out = dst.output();
+            import_from_str(&payload, &dst_db, &args, true, Some("caller"), &mut out).unwrap();
+        }
+        let conn = db::open(&dst_db).unwrap();
+        assert!(
+            db::get(&conn, &id_forget).unwrap().is_none(),
+            "the dest-forgotten memory must NOT resurrect via the v1 wire form"
+        );
+        assert!(
+            db::memory_is_tombstoned(&conn, &id_forget).unwrap(),
+            "the tombstone survives"
+        );
+        assert!(
+            db::get(&conn, &id_archive).unwrap().is_none(),
+            "the dest-archived memory must NOT be re-admitted live"
+        );
+        assert!(
+            db::memory_is_archived(&conn, &id_archive).unwrap(),
+            "the archived row is untouched"
+        );
+        // The per-row skips are surfaced in the JSON errors array.
+        let v: serde_json::Value =
+            serde_json::from_str(dst.stdout_str().lines().last().unwrap()).unwrap();
+        let errs = v["errors"].as_array().unwrap();
+        assert!(
+            errs.iter()
+                .any(|e| e.as_str().unwrap_or_default().contains("tombstone")),
+            "the tombstone skip is reported, got: {errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.as_str().unwrap_or_default().contains("archived")),
+            "the archive skip is reported, got: {errs:?}"
+        );
     }
 
     /// The FULL Portability-v2 envelope payload (the `--full` wire form).
