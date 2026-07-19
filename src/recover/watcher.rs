@@ -5,22 +5,25 @@
 //! capture daemon (issue [#1978](https://github.com/alphaonedev/ai-memory-mcp/issues/1978),
 //! the L3 layer of the #1389 layered-capture architecture).
 //!
-//! ## Why polling, not `notify`
+//! ## Poll (portable default) + OPT-IN `notify` event path
 //!
 //! The canonical L3 design (policy memory `f62cb182`, #1389 design
 //! comment) describes "a daemon thread subscribing to filesystem
 //! notifications (the `notify` crate: inotify / `FSEvents` /
-//! `ReadDirectoryChangesW`)". Adding `notify` is a new external
-//! dependency, which is operator-gated under the sole-authority
-//! no-external-injection rule (CLAUDE.md §"Sole-authority operator") —
-//! an AI NHI agent cannot add a dependency. This module satisfies the
-//! SAME architectural contract — continuous, bounded, backend-agnostic
-//! capture across every known host transcript directory, feeding the
-//! shared L2 parser pipeline with L2-identical idempotency — using a
-//! **std-only bounded poll loop** (`std::fs::metadata` mtime/size
-//! diffing) instead of OS-level filesystem notifications. No new
-//! crate; the dependency-add blocker recorded against #1978 does not
-//! apply to this design.
+//! `ReadDirectoryChangesW`)". This module's **std-only bounded poll
+//! loop** (`std::fs::metadata` mtime/size diffing) is the portable
+//! default — continuous, bounded, backend-agnostic capture across every
+//! known host transcript directory, feeding the shared L2 parser pipeline
+//! with L2-identical idempotency, and depending on NO external crate.
+//!
+//! With the OPT-IN `fs-notify` cargo feature compiled in (issue #1978;
+//! the `notify` crate add was operator-authorized 2026-07-18), an
+//! inotify/`FSEvents`/`ReadDirectoryChangesW` event-driven path runs
+//! ALONGSIDE this poll loop — see [`notify_backed_watch`]. It only
+//! changes WHEN a recovery pass runs; it triggers the SAME [`poll_once`]
+//! funnel on a filesystem event and FALLS BACK to this poll loop on any
+//! init failure, so the poll path stays the load-bearing default and the
+//! build is byte-identical when the feature is off.
 //!
 //! ## Mechanism
 //!
@@ -629,12 +632,52 @@ where
     outcomes
 }
 
+/// Emit the per-host tracing summary for the CHANGED outcomes of one
+/// tick. Shared by the std-only poll loop
+/// ([`run_watch_daemon_with_resolver`]) and the OPT-IN `fs-notify` event
+/// loop ([`notify_backed_watch`]) so both surface identical
+/// operator-facing logs.
+fn log_changed_outcomes(outcomes: &[HostTickOutcome]) {
+    for o in outcomes.iter().filter(|o| o.changed) {
+        if let Some(e) = &o.error {
+            tracing::warn!("L3 watch: {} tick error: {e}", o.host.as_str());
+        } else if let Some(r) = &o.recover_report {
+            tracing::info!(
+                "L3 watch: {} captured {} new memories \
+                 (skipped_dedup={}, skipped_limit={}, errors={})",
+                o.host.as_str(),
+                // `lines_atomised`, not the quiet-truncated
+                // `memories_created.len()` (issue #2116).
+                r.lines_atomised,
+                r.lines_skipped_dedup,
+                r.lines_skipped_limit,
+                r.errors.len(),
+            );
+        }
+    }
+}
+
 /// Blocking L3 daemon body. Loops until `shutdown` flips, sleeping in
 /// [`SHUTDOWN_POLL_TICK`] increments between full `cfg.poll_interval`
 /// ticks (mirrors [`crate::curator::run_daemon`]'s shutdown-check
 /// granularity). Never panics on a per-host recovery failure — see
 /// [`poll_once`]'s per-host error handling.
+///
+/// When the OPT-IN `fs-notify` feature is compiled in (issue #1978), the
+/// event-driven inotify/FSEvents/ReadDirectoryChangesW loop is tried
+/// FIRST; it FALLS BACK to the poll loop below on any init failure
+/// (unsupported platform, watch-limit exhaustion, no watchable directory,
+/// or a mid-run watcher fault) so capture NEVER silently stops (North
+/// Star: DEGRADE, never corrupt). When the feature is off the notify
+/// block is compiled out and this function is byte-identical to the
+/// std-only poll loop — the poll watcher stays the portable default.
 pub fn run_watch_daemon(db_path: PathBuf, cfg: WatchConfig, shutdown: Arc<AtomicBool>) {
+    #[cfg(feature = "fs-notify")]
+    {
+        if run_watch_daemon_notify(&db_path, &cfg, &shutdown) {
+            return;
+        }
+    }
     run_watch_daemon_with_resolver(db_path, cfg, shutdown, transcript_paths::resolve_transcript);
 }
 
@@ -662,23 +705,7 @@ pub fn run_watch_daemon_with_resolver<R>(
 
     while !shutdown.load(Ordering::Relaxed) {
         let outcomes = poll_once_with_resolver(&db_path, &cfg, &mut states, &resolve);
-        for o in outcomes.iter().filter(|o| o.changed) {
-            if let Some(e) = &o.error {
-                tracing::warn!("L3 watch: {} tick error: {e}", o.host.as_str());
-            } else if let Some(r) = &o.recover_report {
-                tracing::info!(
-                    "L3 watch: {} captured {} new memories \
-                     (skipped_dedup={}, skipped_limit={}, errors={})",
-                    o.host.as_str(),
-                    // `lines_atomised`, not the quiet-truncated
-                    // `memories_created.len()` (issue #2116).
-                    r.lines_atomised,
-                    r.lines_skipped_dedup,
-                    r.lines_skipped_limit,
-                    r.errors.len(),
-                );
-            }
-        }
+        log_changed_outcomes(&outcomes);
         report.absorb_tick(outcomes);
 
         let deadline = Instant::now() + cfg.poll_interval;
@@ -696,6 +723,191 @@ pub fn run_watch_daemon_with_resolver<R>(
         report.memories_captured,
         report.errors,
     );
+}
+
+/// Event-driven L3 watch loop (#1978 OPT-IN `fs-notify` feature).
+///
+/// Builds the watch set from the configured hosts' transcript parent
+/// directories ([`transcript_paths::watch_dirs`]) and drives the shared
+/// [`notify_backed_watch`] core with the production resolver + tracing
+/// logger. Returns `true` if the loop ran to `shutdown`, `false` if it
+/// could not initialize (caller then falls back to the poll loop).
+#[cfg(feature = "fs-notify")]
+fn run_watch_daemon_notify(
+    db_path: &std::path::Path,
+    cfg: &WatchConfig,
+    shutdown: &Arc<AtomicBool>,
+) -> bool {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut dirs = Vec::new();
+    for &host in &cfg.hosts {
+        dirs.extend(transcript_paths::watch_dirs(host, &cwd));
+    }
+    notify_backed_watch(
+        db_path,
+        cfg,
+        shutdown,
+        &dirs,
+        transcript_paths::resolve_transcript,
+        log_changed_outcomes,
+    )
+}
+
+/// Injectable core of the [`run_watch_daemon_notify`] event loop
+/// (M-MOCKABLE-SYSCALLS; issue #1978). `watch_dirs`, `resolve`, and
+/// `on_outcomes` are parameters so a hermetic test can point the watcher
+/// at a temp directory, inject a pure resolver, and observe recovery
+/// ticks without touching the real `$HOME` or opening a DB (mirrors the
+/// [`poll_once_with_resolver`] injection seam). Production
+/// ([`run_watch_daemon_notify`]) passes the real per-host watch dirs,
+/// [`transcript_paths::resolve_transcript`], and the tracing logger.
+///
+/// # Design — DEGRADE, never corrupt (North Star)
+///
+/// The `notify` crate only changes WHEN a poll runs; it does NOT fork the
+/// capture logic — every filesystem event triggers the SAME
+/// [`poll_once_with_resolver`] recovery funnel (debounced/coalesced), so
+/// the L2-identical `(mtime, len)` change detection + `transcript_line_dedup`
+/// idempotency are unchanged. A periodic BACKSTOP poll at
+/// `cfg.poll_interval` still runs even under a silent event stream, so a
+/// dropped inotify event (queue overflow under load) degrades to the poll
+/// cadence rather than losing capture. On any init failure (no watcher, no
+/// watchable dir) or a mid-run watcher fault the fn returns `false` and the
+/// caller resumes the pure poll loop — capture never silently stops.
+///
+/// Returns `true` if the loop ran to `shutdown`, `false` if no directory
+/// could be watched or the watcher faulted (caller falls back to poll).
+///
+/// # Panics
+///
+/// Does not panic.
+#[cfg(feature = "fs-notify")]
+pub fn notify_backed_watch<R, F>(
+    db_path: &std::path::Path,
+    cfg: &WatchConfig,
+    shutdown: &Arc<AtomicBool>,
+    watch_dirs: &[PathBuf],
+    resolve: R,
+    mut on_outcomes: F,
+) -> bool
+where
+    R: Fn(HostKind, &std::path::Path) -> Result<Option<PathBuf>, transcript_paths::ResolveError>,
+    F: FnMut(&[HostTickOutcome]),
+{
+    use notify::{EventKind, RecursiveMode, Watcher};
+    use std::collections::HashSet;
+    use std::sync::mpsc::{RecvTimeoutError, channel};
+
+    /// Coalescing window after the first event of a write burst. A host
+    /// writes a transcript turn as several syscalls (create/append/
+    /// rename); this short settle lets one recovery pass cover the whole
+    /// turn instead of one pass per syscall.
+    const NOTIFY_DEBOUNCE: Duration = Duration::from_millis(200);
+
+    let (tx, rx) = channel();
+    let mut watcher = match notify::recommended_watcher(move |res| {
+        let _ = tx.send(res);
+    }) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!("L3 watch: notify init failed ({e}); using poll fallback");
+            return false;
+        }
+    };
+
+    let mut watched = 0usize;
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for dir in watch_dirs {
+        // Watch the target dir if it exists, else its parent (one level up,
+        // never higher) so a not-yet-created per-cwd project dir's creation
+        // + first file still fire events under a recursive watch.
+        let target = if dir.is_dir() {
+            Some(dir.clone())
+        } else {
+            dir.parent()
+                .filter(|p| p.is_dir())
+                .map(std::path::Path::to_path_buf)
+        };
+        if let Some(target) = target {
+            if seen.insert(target.clone())
+                && watcher.watch(&target, RecursiveMode::Recursive).is_ok()
+            {
+                watched += 1;
+            }
+        }
+    }
+    if watched == 0 {
+        tracing::warn!("L3 watch: no watchable transcript directory; using poll fallback");
+        return false;
+    }
+    tracing::info!(
+        "L3 watch daemon started (fs-notify, {watched} dir(s) watched, backstop={}s, dry_run={})",
+        cfg.poll_interval.as_secs(),
+        cfg.dry_run,
+    );
+
+    let mut states: HashMap<HostKind, HostPollState> = HashMap::new();
+    let mut report = WatchReport::default();
+
+    // A single recovery pass — shared by the initial catch-up tick, every
+    // event-driven tick, and the periodic backstop tick.
+    let mut run_tick = |states: &mut HashMap<HostKind, HostPollState>, report: &mut WatchReport| {
+        let outcomes = poll_once_with_resolver(db_path, cfg, states, &resolve);
+        on_outcomes(&outcomes);
+        report.absorb_tick(outcomes);
+    };
+
+    // Initial catch-up: capture anything written between the last shutdown
+    // and the watch arming (a session that wrote while the daemon started).
+    run_tick(&mut states, &mut report);
+    let mut last_poll = Instant::now();
+
+    while !shutdown.load(Ordering::Relaxed) {
+        match rx.recv_timeout(SHUTDOWN_POLL_TICK) {
+            Ok(Ok(event)) => {
+                // Ignore pure Access events (a concurrent tail/cat) so a
+                // reader never spins the loop; any content mutation ticks.
+                if !matches!(event.kind, EventKind::Access(_)) {
+                    std::thread::sleep(NOTIFY_DEBOUNCE);
+                    while rx.try_recv().is_ok() {} // drain the coalesced burst
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    run_tick(&mut states, &mut report);
+                    last_poll = Instant::now();
+                }
+            }
+            // A watcher-level error event (e.g. a transient inotify queue
+            // overflow) — the backstop below still guarantees capture.
+            Ok(Err(_)) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                // Backstop poll: even if notify DROPS an event under load,
+                // the loop still captures at the operator's poll cadence.
+                // The notify path is a latency optimization ON TOP OF the
+                // poll guarantee, never a replacement for it.
+                if last_poll.elapsed() >= cfg.poll_interval {
+                    run_tick(&mut states, &mut report);
+                    last_poll = Instant::now();
+                }
+            }
+            // The watcher thread died. Fall back to the poll loop — capture
+            // must never stop.
+            Err(RecvTimeoutError::Disconnected) => {
+                tracing::warn!("L3 watch: notify channel disconnected; falling back to poll loop");
+                return false;
+            }
+        }
+    }
+
+    tracing::info!(
+        "L3 watch daemon shutdown (fs-notify; ticks={}, changes_detected={}, \
+         memories_captured={}, errors={})",
+        report.ticks,
+        report.changes_detected,
+        report.memories_captured,
+        report.errors,
+    );
+    true
 }
 
 #[cfg(test)]
