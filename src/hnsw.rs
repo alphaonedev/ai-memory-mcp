@@ -29,6 +29,12 @@ use crate::hooks::EvictionEvent;
 /// Tracing target for the HNSW eviction worker (#1558 tracing-target SSOT).
 const EVICTION_TRACE_TARGET: &str = "hnsw.eviction";
 
+/// Machine-tag for capacity evictions (`EvictionEvent.reason`) — the
+/// SSOT shared by every `VectorSearchIndex` backend (the default
+/// index here + the #1860 vectorlite backend) so hook consumers see
+/// one vocabulary regardless of the active backend.
+pub const EVICTION_REASON_MAX_ENTRIES: &str = "max_entries_reached";
+
 /// Maximum overflow entries before triggering a rebuild.
 const REBUILD_THRESHOLD: usize = 200;
 
@@ -1047,7 +1053,7 @@ impl VectorIndex {
                 tracing::warn!(
                     target: EVICTION_TRACE_TARGET,
                     evicted_id = %evicted_id,
-                    reason = "max_entries_reached",
+                    reason = EVICTION_REASON_MAX_ENTRIES,
                     max_entries = max_entries,
                     "hnsw index evicting oldest entry: cap reached"
                 );
@@ -1059,7 +1065,7 @@ impl VectorIndex {
                     let payload = EvictionEvent::new(
                         evicted_id.clone(),
                         String::new(), // namespace not in scope at hnsw layer
-                        "max_entries_reached",
+                        EVICTION_REASON_MAX_ENTRIES,
                     );
                     let _ = sink.send(payload);
                 }

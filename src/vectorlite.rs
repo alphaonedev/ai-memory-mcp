@@ -72,7 +72,9 @@ use std::thread::JoinHandle;
 
 use rusqlite::Connection;
 
-use crate::hnsw::{DEFAULT_MAX_ENTRIES, VectorHit, VectorIndex, VectorSearchIndex};
+use crate::hnsw::{
+    DEFAULT_MAX_ENTRIES, EVICTION_REASON_MAX_ENTRIES, VectorHit, VectorIndex, VectorSearchIndex,
+};
 use crate::hooks::EvictionEvent;
 
 /// Path to the operator-acquired vectorlite loadable extension
@@ -86,11 +88,6 @@ pub const VECTORLITE_EXTENSION_ENV: &str = "AI_MEMORY_VECTORLITE_EXTENSION";
 /// index connection (never the durable memory DB — the index
 /// connection holds derived data only).
 const VEC_TABLE: &str = "vec_idx";
-
-/// Eviction reason tag — same machine-tag the default backend emits
-/// (`hnsw.rs` `max_entries_reached`) so hook consumers see one
-/// vocabulary regardless of the active backend.
-const EVICTION_REASON_MAX_ENTRIES: &str = "max_entries_reached";
 
 /// The live vectorlite half of [`Backend`].
 struct VlState {
