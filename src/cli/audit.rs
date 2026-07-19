@@ -175,67 +175,121 @@ pub fn run(args: AuditArgs, app_config: &AppConfig, out: &mut CliOutput<'_>) -> 
     }
 }
 
-/// v1.0.0 #2004 (spec §5.3) — the crypto-agility re-anchor ceremony. Reads the
-/// current `signed_events` head, countersigns it under the enrolled suite with
-/// the audit-witness custody key, and persists a signed `re_anchor` checkpoint
-/// (both backends). The freshly-persisted anchor is then self-verified via the
-/// read-back path (K1-pinned to the enrolled witness pubkey) so the operator
-/// sees the ceremony round-trip, not just a write.
+/// The chain label the sqlite-endpoint re-anchor ceremony anchors — printed
+/// on every disposition so an operator on a POSTGRES-backed deployment (whose
+/// pg `signed_events` chain has NO re-anchor twin yet — issue #2217, PR #2214
+/// audit F2) can never mistake a local-sqlite anchor for a pg-chain ceremony.
+const REANCHOR_CHAIN_LABEL: &str = "sqlite:signed_events";
+
+/// v1.0.0 #2004 (spec §5.3) — the crypto-agility re-anchor ceremony for the
+/// LOCAL sqlite `signed_events` chain (the pg twin is issue #2217). Reads the
+/// current head, countersigns it under the enrolled suite with the
+/// audit-witness custody key, and persists a signed `re_anchor` checkpoint.
+/// The anchor is then RELOADED from the database (`checkpoints::get`, PR
+/// #2214 audit F3 — the persisted row, never the in-memory copy) and
+/// self-verified via the read-back path (K1-pinned to the enrolled witness
+/// pubkey) so the operator sees the true ceremony round-trip.
 fn run_re_anchor(
     args: &ReAnchorArgs,
     app_config: &AppConfig,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
+    use crate::signed_events::ReAnchorOutcome;
     use anyhow::Context;
     let db_path = app_config.effective_db(std::path::Path::new(crate::daemon_runtime::DEFAULT_DB));
     let conn = crate::db::open(&db_path)
         .with_context(|| format!("audit re-anchor: open db at {}", db_path.display()))?;
-    let Some(cp) =
-        crate::signed_events::emit_reanchor_ceremony(&conn).context("emit re-anchor ceremony")?
-    else {
-        // Opt-in no-op (no enrolled witness signing key, or an empty chain).
-        // The disposition is still made EXPLICIT on stdout in JSON mode — an
-        // automation invoking `--json` must never have to distinguish
-        // "skipped" from "crashed before printing" by an empty stdout.
-        if args.json {
-            let obj = serde_json::json!({
-                "status": "skipped",
-                "reason": "no_witness_key_or_empty_chain",
-            });
-            writeln!(out.stdout, "{obj}")?;
+    let outcome =
+        crate::signed_events::emit_reanchor_ceremony(&conn).context("emit re-anchor ceremony")?;
+    // Opt-in no-ops (nothing enrolled / nothing to anchor) exit 0; an
+    // UNLOADABLE enrolled key is a ceremony FAILURE (exit 1, distinct
+    // reason — PR #2214 audit F4). Every disposition is EXPLICIT on
+    // stdout in JSON mode — an automation invoking `--json` must never
+    // have to distinguish "skipped" from "crashed" by an empty stdout.
+    match &outcome {
+        ReAnchorOutcome::Anchored(_) => {}
+        skip @ (ReAnchorOutcome::SkippedNoCustody | ReAnchorOutcome::SkippedEmptyChain) => {
+            let reason = skip.reason_tag().unwrap_or_default();
+            if args.json {
+                let obj = serde_json::json!({
+                    "status": "skipped",
+                    "reason": reason,
+                    "db": db_path.display().to_string(),
+                    "chain": REANCHOR_CHAIN_LABEL,
+                });
+                writeln!(out.stdout, "{obj}")?;
+            }
+            let guidance = if matches!(skip, ReAnchorOutcome::SkippedNoCustody) {
+                "no audit-witness custody enrolled — enrol a signing key \
+                 (AI_MEMORY_WITNESS_KEY_DIR) to run the ceremony"
+            } else {
+                "the signed_events chain is empty — nothing to anchor"
+            };
+            writeln!(
+                out.stderr,
+                "re-anchor SKIPPED ({reason}) on db {} (chain {REANCHOR_CHAIN_LABEL}): \
+                 {guidance}",
+                db_path.display()
+            )?;
+            return Ok(0);
         }
-        writeln!(
-            out.stderr,
-            "re-anchor: no ceremony emitted — enrol an audit-witness signing key \
-             (AI_MEMORY_WITNESS_KEY_DIR) and ensure the signed_events chain is non-empty"
-        )?;
-        return Ok(0);
+        fail @ ReAnchorOutcome::KeyUnloadable(detail) => {
+            let reason = fail.reason_tag().unwrap_or_default();
+            if args.json {
+                let obj = serde_json::json!({
+                    "status": "error",
+                    "reason": reason,
+                    "detail": detail,
+                    "db": db_path.display().to_string(),
+                    "chain": REANCHOR_CHAIN_LABEL,
+                });
+                writeln!(out.stdout, "{obj}")?;
+            }
+            writeln!(
+                out.stderr,
+                "re-anchor FAILED ({reason}): a witness key IS enrolled but could not be \
+                 loaded ({detail}); repair the custody under AI_MEMORY_WITNESS_KEY_DIR — \
+                 nothing was persisted"
+            )?;
+            return Ok(1);
+        }
+    }
+    let ReAnchorOutcome::Anchored(cp) = outcome else {
+        unreachable!("non-Anchored outcomes returned above");
     };
-    // Self-verify the persisted anchor against the OUT-OF-BAND enrolled witness
-    // pubkey (K1) — the same read-back a fresh verifier performs. THREE-STATE,
-    // fail-closed: a verify FAILURE (e.g. enrolment drift where the enrolled
-    // pubkey does not match the custody signing key) MUST be distinguishable
-    // from "no pubkey enrolled to pin against", and MUST surface a non-zero
-    // exit so the operator sees a persisted-but-unverifiable anchor, not a
-    // silent "ok". A green ceremony that persists an anchor no verifier can
-    // K1-check would defeat the module's own contract.
-    let readback = match crate::governance::audit::load_enrolled_witness_pubkey()? {
-        Some(vk) => match crate::governance::audit::verify_reanchor_checkpoint(&cp, &vk) {
-            Ok(_) => ReadBack::Pass,
-            Err(e) => ReadBack::Fail(e),
+    let cp = *cp;
+    // PR #2214 audit F3 — the self-verify must READ BACK the persisted row
+    // (the same reload a fresh verifier performs), so a future insert /
+    // row-decode defect corrupting `resolution` / `signature` /
+    // `resolver_pubkey` is caught here, not just the in-memory struct.
+    let persisted = crate::checkpoints::get(&conn, &cp.id)
+        .with_context(|| format!("re-anchor: reload persisted anchor {}", cp.id))?;
+    // THREE-STATE + fail-closed: a verify FAILURE (e.g. enrolment drift where
+    // the enrolled pubkey does not match the custody signing key) MUST be
+    // distinguishable from "no pubkey enrolled to pin against", and MUST
+    // surface a non-zero exit so the operator sees a
+    // persisted-but-unverifiable anchor, not a silent "ok".
+    let readback = match persisted {
+        None => ReadBack::RowMissing,
+        Some(row) => match crate::governance::audit::load_enrolled_witness_pubkey()? {
+            Some(vk) => match crate::governance::audit::verify_reanchor_checkpoint(&row, &vk) {
+                Ok(_) => ReadBack::Pass,
+                Err(e) => ReadBack::Fail(e),
+            },
+            None => ReadBack::NoPin,
         },
-        None => ReadBack::NoPin,
     };
-    let exit = if matches!(readback, ReadBack::Fail(_)) {
-        1
-    } else {
-        0
+    let exit = match readback {
+        ReadBack::Pass | ReadBack::NoPin => 0,
+        ReadBack::Fail(_) | ReadBack::RowMissing => 1,
     };
     if args.json {
         let mut obj = serde_json::json!({
             "status": if exit == 0 { "ok" } else { "verify_failed" },
             crate::cli::JSON_KEY_CHECKPOINT_ID: cp.id,
             "namespace": cp.namespace,
+            "db": db_path.display().to_string(),
+            "chain": REANCHOR_CHAIN_LABEL,
             "verified": matches!(readback, ReadBack::Pass),
             "readback": readback.machine_tag(),
         });
@@ -250,6 +304,9 @@ fn run_re_anchor(
                 "unverified (no enrolled witness pubkey — set AI_MEMORY_WITNESS_PUBKEY to K1-pin)"
                     .to_string()
             }
+            ReadBack::RowMissing => {
+                "FAILED (persisted anchor row could not be reloaded from the database)".to_string()
+            }
             ReadBack::Fail(e) => format!(
                 "FAILED ({}) — the persisted anchor did NOT verify against the enrolled \
                  witness pubkey; check AI_MEMORY_WITNESS_PUBKEY matches the custody signing key",
@@ -258,19 +315,23 @@ fn run_re_anchor(
         };
         writeln!(
             out.stdout,
-            "re-anchor {}: crypto-agility ceremony anchor {} recorded (namespace {}); \
-             read-back verify: {line}",
+            "re-anchor {}: crypto-agility ceremony anchor {} recorded (namespace {}, db {}, \
+             chain {REANCHOR_CHAIN_LABEL}); read-back verify: {line}",
             if exit == 0 { "OK" } else { "WARN" },
             cp.id,
-            cp.namespace
+            cp.namespace,
+            db_path.display()
         )?;
     }
     Ok(exit)
 }
 
-/// Three-state disposition of the `audit re-anchor` self-verify read-back.
-/// Distinguishes a genuine K1 PASS, an absent enrolled pubkey (nothing to pin
-/// against — not a failure), and an actual verify FAILURE (fail-closed, exit 1).
+/// Disposition of the `audit re-anchor` self-verify READ-BACK (the persisted
+/// row reloaded via `checkpoints::get`, PR #2214 audit F3). Distinguishes a
+/// genuine K1 PASS, an absent enrolled pubkey (nothing to pin against — not a
+/// failure), a reload miss (`RowMissing` — the insert claimed success but the
+/// row cannot be read back; fail-closed, exit 1), and an actual verify
+/// FAILURE (fail-closed, exit 1).
 ///
 /// `NoPin` is DEFENSIVE in the current shared-custody layout: an emitted
 /// ceremony implies `keypair::load` succeeded, which requires the same
@@ -281,6 +342,7 @@ fn run_re_anchor(
 enum ReadBack {
     Pass,
     NoPin,
+    RowMissing,
     Fail(crate::governance::audit::ReAnchorCheckpointError),
 }
 
@@ -290,6 +352,7 @@ impl ReadBack {
         match self {
             Self::Pass => "pass",
             Self::NoPin => "no_enrolled_pubkey",
+            Self::RowMissing => "row_missing",
             Self::Fail(_) => "fail",
         }
     }
@@ -1881,16 +1944,28 @@ mod reanchor_ceremony_2004_cli_tests {
         clear_witness_env();
     }
 
-    /// Removing the custody `.pub` disables the SIGNING-key load itself
-    /// (`keypair::load` reads the `.pub` first), so the ceremony is an
-    /// explicit opt-in NO-OP — never a half-emitted anchor with nothing to
-    /// pin against. The `--json` disposition must still be machine-readable
-    /// (an explicit `skipped`, never an empty stdout), and the stderr
-    /// guidance must name the enrolment lever. This is also why
-    /// `ReadBack::NoPin` is defensive-unreachable post-emit: any emitted
-    /// ceremony implies a loadable `.pub`, which the K1 fallback pin reads.
+    /// Count of persisted re-anchor checkpoint rows in the TestEnv db —
+    /// the "nothing was persisted" pin for skip / failure dispositions.
+    fn reanchor_row_count(db_path: &std::path::Path) -> i64 {
+        let conn = crate::db::open(db_path).expect("open db");
+        conn.query_row(
+            "SELECT COUNT(*) FROM checkpoints WHERE condition_type = ?1",
+            [crate::models::ConditionType::ReAnchor.as_str()],
+            |r| r.get(0),
+        )
+        .expect("count")
+    }
+
+    /// PR #2214 audit F4 — a PRESENT-but-broken custody (here: the `.pub`
+    /// removed while the `.priv` remains — key material exists but
+    /// `keypair::load` cannot load it) is a ceremony FAILURE, not a skip:
+    /// exit 1, JSON `status=error` with the distinct
+    /// `witness_key_unloadable` reason, stderr naming the custody lever,
+    /// and NOTHING persisted. Pre-F4 this collapsed into the exit-0
+    /// "skipped: enrol a key" path with guidance that was FALSE (a key IS
+    /// enrolled).
     #[test]
-    fn re_anchor_missing_custody_pub_is_explicit_skip_not_fail() {
+    fn re_anchor_unloadable_custody_fails_closed_nonzero() {
         let _g = crate::identity::keypair::key_dir_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1898,15 +1973,61 @@ mod reanchor_ceremony_2004_cli_tests {
         let mut env = TestEnv::fresh();
         append_rows(&env.db_path, 2);
         let kdir = tempfile::tempdir().expect("kdir");
-        // Enrol custody, then remove the `.pub`: the signer load now fails,
-        // so NO ceremony emits (fail-safe — nothing is persisted that a
-        // verifier could not K1-check).
         let _signer = enrol_signing_key(kdir.path());
         std::fs::remove_file(
             kdir.path()
                 .join(format!("{}.pub", witness::WITNESS_KEY_LABEL)),
         )
         .expect("remove pub");
+        let cfg = cfg_for(&env);
+        let code = {
+            let mut out = env.output();
+            run_re_anchor(&ReAnchorArgs { json: true }, &cfg, &mut out).expect("run")
+        };
+        assert_eq!(
+            code,
+            1,
+            "unloadable enrolled custody must fail closed: {}",
+            env.stdout_str()
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(env.stdout_str().trim()).expect("json summary");
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["reason"], "witness_key_unloadable");
+        assert!(
+            env.stderr_str().contains("AI_MEMORY_WITNESS_KEY_DIR"),
+            "stderr must name the custody lever: {}",
+            env.stderr_str()
+        );
+        assert_eq!(
+            reanchor_row_count(&env.db_path),
+            0,
+            "no anchor may persist when the ceremony failed"
+        );
+        clear_witness_env();
+    }
+
+    /// Genuinely ABSENT custody (the dir does not exist — nothing enrolled)
+    /// is the opt-in no-op: exit 0, an explicit machine-readable `skipped`
+    /// JSON (never an empty stdout an automation would have to guess about),
+    /// stderr naming the enrolment lever, nothing persisted.
+    #[test]
+    fn re_anchor_absent_custody_is_explicit_skip_not_fail() {
+        let _g = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_witness_env();
+        let mut env = TestEnv::fresh();
+        append_rows(&env.db_path, 2);
+        // Point custody at a dir that does NOT exist (hermetic — never the
+        // host's real default custody dir).
+        let kdir = tempfile::tempdir().expect("kdir");
+        unsafe {
+            std::env::set_var(
+                witness::WITNESS_KEY_DIR_ENV,
+                kdir.path().join("does-not-exist"),
+            );
+        }
         let cfg = cfg_for(&env);
         let code = {
             let mut out = env.output();
@@ -1921,23 +2042,17 @@ mod reanchor_ceremony_2004_cli_tests {
         let v: serde_json::Value =
             serde_json::from_str(env.stdout_str().trim()).expect("json summary");
         assert_eq!(v["status"], "skipped");
-        assert_eq!(v["reason"], "no_witness_key_or_empty_chain");
+        assert_eq!(v["reason"], "witness_custody_absent");
         assert!(
             env.stderr_str().contains("AI_MEMORY_WITNESS_KEY_DIR"),
             "stderr must name the enrolment lever: {}",
             env.stderr_str()
         );
-        // No checkpoint was persisted — the checkpoints table has no
-        // re-anchor row (fail-safe: skipped means SKIPPED).
-        let conn = crate::db::open(&env.db_path).expect("open db");
-        let n: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM checkpoints WHERE condition_type = ?1",
-                [crate::models::ConditionType::ReAnchor.as_str()],
-                |r| r.get(0),
-            )
-            .expect("count");
-        assert_eq!(n, 0, "no anchor may persist when the ceremony skipped");
+        assert_eq!(
+            reanchor_row_count(&env.db_path),
+            0,
+            "no anchor may persist when the ceremony skipped"
+        );
         clear_witness_env();
     }
 }

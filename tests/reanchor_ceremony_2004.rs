@@ -9,18 +9,23 @@
 //! `ai_memory::identity::re_anchor`) and persists it as a signed
 //! [`ConditionType::ReAnchor`] checkpoint — mirroring the #1822 audit-head
 //! witness's off-daemon-custody, K1-pinnable persistence. These tests prove
-//! the ceremony ROUND-TRIPS (emit → reload → verify) and FAIL-CLOSES on every
-//! tamper class, on both backends (K3).
+//! the ceremony ROUND-TRIPS (emit → RELOAD the persisted row via
+//! `checkpoints::get` → verify; PR #2214 audit F3) and FAIL-CLOSES on every
+//! tamper class, on both backends (K3). Scope: the ceremony operates on the
+//! LOCAL sqlite chain only (the pg twin is issue #2217; PR #2214 audit F2).
 //!
 //! Pins:
-//! - (a) emit → the persisted anchor verifies; the decoded record binds the
-//!   real head sequence + the Ed25519 suite tag.
+//! - (a) emit → the PERSISTED anchor (reloaded from the db, never the
+//!   returned struct) verifies; the decoded record binds the real head
+//!   sequence + the Ed25519 suite tag.
 //! - (b) a tampered `resolution` (envelope broken) → `EnvelopeInvalid`.
 //! - (c) a tampered detached countersignature (envelope RE-SIGNED so only the
 //!   inner signature is wrong) → `CountersignatureInvalid`.
 //! - (d) verify under a DIFFERENT enrolled key → `PubkeyNotEnrolled` (K1).
 //! - (e) a non-re-anchor checkpoint → `NotReAnchor`.
-//! - (f) no witness key enrolled / an empty chain → `Ok(None)` (opt-in no-op).
+//! - (f) absent custody / empty chain → the typed skip outcomes; a
+//!   PRESENT-but-unloadable custody → `KeyUnloadable` (PR #2214 audit F4 —
+//!   a failure, never a skip), with nothing persisted in every case.
 //! - (g) `#[cfg(feature = "sal-postgres")]` postgres parity: the same built
 //!   anchor inserted + read back through the pg SAL verifies identically.
 //!
@@ -37,7 +42,7 @@ use ai_memory::governance::audit::{self as witness, ReAnchorCheckpointError};
 use ai_memory::identity::cbor_array::SUITE_ED25519_SHA256;
 use ai_memory::models::ConditionType;
 use ai_memory::signed_events::{
-    SignedEvent, append_signed_event, emit_reanchor_ceremony, payload_hash,
+    ReAnchorOutcome, SignedEvent, append_signed_event, emit_reanchor_ceremony, payload_hash,
 };
 use rusqlite::Connection;
 
@@ -110,6 +115,23 @@ fn append_rows(conn: &Connection, n: usize) {
     }
 }
 
+/// Run the ceremony and unwrap the `Anchored` outcome (panics on any other
+/// disposition — these tests enrol a signer + a non-empty chain).
+fn emit_anchored(conn: &Connection) -> ai_memory::models::Checkpoint {
+    match emit_reanchor_ceremony(conn).expect("emit ok") {
+        ReAnchorOutcome::Anchored(cp) => *cp,
+        other => panic!("expected Anchored, got {other:?}"),
+    }
+}
+
+/// PR #2214 audit F3 — reload the persisted anchor row from the database.
+/// Verifiers must consume THIS row, never the emit-returned struct.
+fn reload(conn: &Connection, id: &str) -> ai_memory::models::Checkpoint {
+    ai_memory::checkpoints::get(conn, id)
+        .expect("checkpoints::get")
+        .expect("persisted anchor row present")
+}
+
 // ── (a) emit → persisted anchor verifies + binds the real head ──────────────
 
 #[test]
@@ -121,16 +143,26 @@ fn emit_then_verify_round_trips() {
     let (_path, conn) = open_db(ddir.path());
 
     append_rows(&conn, 5);
-    let cp = emit_reanchor_ceremony(&conn)
-        .expect("emit ok")
-        .expect("a witness key is enrolled and the chain is non-empty → Some");
+    let emitted = emit_anchored(&conn);
 
+    // PR #2214 audit F3 — the round-trip verifies the RELOADED row, so an
+    // insert / row-decode defect corrupting resolution / signature /
+    // resolver_pubkey fails HERE, not just in the in-memory struct.
+    let cp = reload(&conn, &emitted.id);
     assert_eq!(cp.condition_type, ConditionType::ReAnchor);
     assert_eq!(cp.namespace, witness::REANCHOR_CHECKPOINT_NAMESPACE);
     assert_eq!(cp.resolver_pubkey, kp.public.to_bytes().to_vec());
+    assert_eq!(
+        cp.resolution, emitted.resolution,
+        "persisted resolution round-trips"
+    );
+    assert_eq!(
+        cp.signature, emitted.signature,
+        "persisted envelope signature round-trips"
+    );
 
     let record = witness::verify_reanchor_checkpoint(&cp, &kp.public)
-        .expect("the freshly-persisted anchor verifies under the enrolled key");
+        .expect("the reloaded persisted anchor verifies under the enrolled key");
     // The ceremony countersigned the CURRENT head (sequence 5) under Ed25519.
     assert_eq!(record.prior_head_sequence, 5);
     assert_eq!(record.new_suite_tag, SUITE_ED25519_SHA256);
@@ -149,9 +181,10 @@ fn verify_rejects_tampered_resolution() {
     let (_path, conn) = open_db(ddir.path());
 
     append_rows(&conn, 3);
-    let mut cp = emit_reanchor_ceremony(&conn)
-        .expect("emit ok")
-        .expect("Some");
+    let mut cp = {
+        let emitted = emit_anchored(&conn);
+        reload(&conn, &emitted.id)
+    };
 
     // Flip a byte inside the signed resolution string — the checkpoint envelope
     // signature is computed over the whole resolution, so ANY mutation breaks
@@ -183,9 +216,10 @@ fn verify_rejects_tampered_countersignature() {
     let (_path, conn) = open_db(ddir.path());
 
     append_rows(&conn, 4);
-    let mut cp = emit_reanchor_ceremony(&conn)
-        .expect("emit ok")
-        .expect("Some");
+    let mut cp = {
+        let emitted = emit_anchored(&conn);
+        reload(&conn, &emitted.id)
+    };
 
     // Swap the detached countersignature for a valid-length-but-wrong one
     // (64 zero bytes), then RE-SIGN the envelope so the outer signature passes
@@ -215,9 +249,10 @@ fn verify_rejects_wrong_enrolled_pubkey() {
     let (_path, conn) = open_db(ddir.path());
 
     append_rows(&conn, 3);
-    let cp = emit_reanchor_ceremony(&conn)
-        .expect("emit ok")
-        .expect("Some");
+    let cp = {
+        let emitted = emit_anchored(&conn);
+        reload(&conn, &emitted.id)
+    };
 
     let attacker = ai_memory::identity::keypair::generate("attacker").expect("gen");
     assert_eq!(
@@ -239,9 +274,10 @@ fn verify_rejects_non_reanchor_checkpoint() {
     let (_path, conn) = open_db(ddir.path());
 
     append_rows(&conn, 3);
-    let mut cp = emit_reanchor_ceremony(&conn)
-        .expect("emit ok")
-        .expect("Some");
+    let mut cp = {
+        let emitted = emit_anchored(&conn);
+        reload(&conn, &emitted.id)
+    };
     // Re-label the condition type: the type guard refuses it up-front, before
     // any signature work.
     cp.condition_type = ConditionType::AuditHeadWitness;
@@ -258,14 +294,27 @@ fn verify_rejects_non_reanchor_checkpoint() {
 #[test]
 fn no_witness_key_is_noop() {
     let _g = lock();
+    let kdir = fresh_dir("f-keys");
     let ddir = fresh_dir("f-db");
-    clear_witness_env(); // ensure no key is enrolled
+    clear_witness_env();
+    // Point custody at a dir that does NOT exist (hermetic — never the
+    // host's real default custody dir).
+    unsafe {
+        std::env::set_var(
+            witness::WITNESS_KEY_DIR_ENV,
+            kdir.path().join("does-not-exist"),
+        );
+    }
     let (_path, conn) = open_db(ddir.path());
     append_rows(&conn, 3);
     assert!(
-        emit_reanchor_ceremony(&conn).expect("ok").is_none(),
-        "no enrolled witness key → the ceremony is a no-op",
+        matches!(
+            emit_reanchor_ceremony(&conn).expect("ok"),
+            ReAnchorOutcome::SkippedNoCustody
+        ),
+        "absent custody → the ceremony is the typed opt-in skip",
     );
+    clear_witness_env();
 }
 
 #[test]
@@ -277,9 +326,46 @@ fn empty_chain_is_noop() {
     let (_path, conn) = open_db(ddir.path());
     // No rows appended → head sequence 0 → nothing to anchor.
     assert!(
-        emit_reanchor_ceremony(&conn).expect("ok").is_none(),
-        "an empty signed_events chain → the ceremony is a no-op",
+        matches!(
+            emit_reanchor_ceremony(&conn).expect("ok"),
+            ReAnchorOutcome::SkippedEmptyChain
+        ),
+        "an empty signed_events chain → the typed empty-chain skip",
     );
+    clear_witness_env();
+}
+
+/// PR #2214 audit F4 — key material that EXISTS but cannot load (here a
+/// corrupt, wrong-length `.priv` beside a valid `.pub`) is `KeyUnloadable`,
+/// never a silent skip, and persists nothing.
+#[test]
+fn unloadable_witness_custody_is_a_failure_not_a_skip() {
+    let _g = lock();
+    let kdir = fresh_dir("h-keys");
+    let ddir = fresh_dir("h-db");
+    let _kp = enrol_witness(kdir.path());
+    // Corrupt the private key: truncate it to garbage so `keypair::load`
+    // errors while key material remains present on disk.
+    let priv_path = kdir
+        .path()
+        .join(format!("{}.priv", witness::WITNESS_KEY_LABEL));
+    std::fs::write(&priv_path, b"corrupt").expect("corrupt priv");
+    let (_path, conn) = open_db(ddir.path());
+    append_rows(&conn, 3);
+    match emit_reanchor_ceremony(&conn).expect("ok") {
+        ReAnchorOutcome::KeyUnloadable(detail) => {
+            assert!(!detail.is_empty(), "unloadable detail names the load error");
+        }
+        other => panic!("expected KeyUnloadable, got {other:?}"),
+    }
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM checkpoints WHERE condition_type = ?1",
+            [ConditionType::ReAnchor.as_str()],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert_eq!(n, 0, "nothing persists on a failed ceremony");
     clear_witness_env();
 }
 

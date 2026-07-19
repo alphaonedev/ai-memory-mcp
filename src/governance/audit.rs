@@ -1194,6 +1194,56 @@ pub fn load_witness_signing_key() -> Result<Option<crate::identity::keypair::Age
     }
 }
 
+/// v1.0.0 #2004 (PR #2214 audit F4) — ceremony-grade disposition of the
+/// audit-witness custody. [`load_witness_signing_key`] deliberately collapses
+/// every non-signing state to `Ok(None)` (right for the THROTTLED background
+/// witness cadence, where a WARN log is the only appropriate signal). An
+/// EXPLICIT operator ceremony (`ai-memory audit re-anchor`) must instead
+/// distinguish the three states, because "skipped: nothing enrolled" and
+/// "your enrolled key is broken" demand different operator actions.
+#[derive(Debug)]
+pub enum WitnessCustody {
+    /// No custody at all — the dir is missing or holds no key material.
+    /// An opt-in feature that is simply not enrolled (skip, not an error).
+    Absent,
+    /// Key material EXISTS on disk but cannot produce a signature: corrupt /
+    /// wrong-length / lax-mode files, or a public-only custody (no `.priv`).
+    /// For an explicit ceremony this is a FAILURE to surface, never a skip —
+    /// the contained string is the load error detail (never key bytes).
+    Unloadable(String),
+    /// A signing-capable witness keypair loaded cleanly.
+    Signer(Box<crate::identity::keypair::AgentKeypair>),
+}
+
+/// Inspect the audit-witness custody for an EXPLICIT ceremony (spec §5.3).
+/// See [`WitnessCustody`] for the three-state contract. The background
+/// witness cadence keeps using [`load_witness_signing_key`] unchanged.
+///
+/// # Errors
+/// The witness key dir cannot be resolved (no OS config dir and no override).
+pub fn inspect_witness_custody() -> Result<WitnessCustody> {
+    let dir = witness_key_dir()?;
+    if !dir.exists() {
+        return Ok(WitnessCustody::Absent);
+    }
+    match crate::identity::keypair::load(WITNESS_KEY_LABEL, &dir) {
+        Ok(kp) if kp.can_sign() => Ok(WitnessCustody::Signer(Box::new(kp))),
+        Ok(_) => Ok(WitnessCustody::Unloadable(
+            "public-only custody (no private key) — cannot produce the re-anchor \
+             countersignature"
+                .to_string(),
+        )),
+        Err(e) => {
+            if crate::identity::keypair::key_material_present(WITNESS_KEY_LABEL, &dir) {
+                // Material on disk that will not load: corrupt or half-enrolled.
+                Ok(WitnessCustody::Unloadable(format!("{e:#}")))
+            } else {
+                Ok(WitnessCustody::Absent)
+            }
+        }
+    }
+}
+
 /// Load the OUT-OF-BAND enrolled audit-witness VERIFYING key (the K1 pin
 /// authority). Precedence: [`WITNESS_PUBKEY_ENV`] URL-safe-no-pad base64
 /// (highest — injected from a secret store, never on the DB-writable disk),

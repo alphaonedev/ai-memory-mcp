@@ -2671,33 +2671,74 @@ pub fn force_emit_audit_head_witness(conn: &Connection) {
     maybe_emit_audit_head_witness(conn, head_seq, &head_hash, true);
 }
 
+/// v1.0.0 #2004 (spec §5.3) — typed disposition of one
+/// [`emit_reanchor_ceremony`] run. An EXPLICIT operator ceremony must never
+/// collapse "skipped because nothing is enrolled" with "your enrolled key is
+/// broken" (PR #2214 audit F4): the former is an opt-in no-op, the latter is
+/// a failure the operator must see (with a distinct reason + non-zero exit at
+/// the CLI).
+#[derive(Debug)]
+pub enum ReAnchorOutcome {
+    /// The ceremony ran: the anchor checkpoint was built, signed, and
+    /// inserted. Carries the inserted checkpoint for display; verifiers must
+    /// RELOAD the persisted row (PR #2214 audit F3), never trust this copy.
+    Anchored(Box<crate::models::Checkpoint>),
+    /// Opt-in no-op: no audit-witness custody is enrolled at all.
+    SkippedNoCustody,
+    /// No-op: the `signed_events` chain is empty — nothing to anchor.
+    SkippedEmptyChain,
+    /// FAILURE: witness key material exists but cannot sign (corrupt /
+    /// half-enrolled / public-only custody). Nothing was persisted.
+    KeyUnloadable(String),
+}
+
+impl ReAnchorOutcome {
+    /// Stable machine-readable reason tag for the non-`Anchored` states
+    /// (the CLI JSON `reason` field + test pins).
+    #[must_use]
+    pub fn reason_tag(&self) -> Option<&'static str> {
+        match self {
+            Self::Anchored(_) => None,
+            Self::SkippedNoCustody => Some("witness_custody_absent"),
+            Self::SkippedEmptyChain => Some("empty_chain"),
+            Self::KeyUnloadable(_) => Some("witness_key_unloadable"),
+        }
+    }
+}
+
 /// v1.0.0 #2004 (spec §5.3) — OPERATOR-INVOKED crypto-agility re-anchor
-/// ceremony: countersign the CURRENT `signed_events` chain head under the
-/// enrolled suite and persist it as a signed
+/// ceremony: countersign the CURRENT **sqlite** `signed_events` chain head
+/// under the enrolled suite and persist it as a signed
 /// [`crate::models::ConditionType::ReAnchor`] checkpoint (the #1822
-/// witness-anchor persistence, both backends). Unlike the witness cadence this
-/// is NOT throttled and NOT fire-and-forget — it is an explicit ceremony whose
-/// success / failure the operator must see, so the disposition is returned
-/// rather than swallowed.
+/// witness-anchor persistence). Unlike the witness cadence this is NOT
+/// throttled and NOT fire-and-forget — it is an explicit ceremony whose
+/// disposition the operator must see, so a typed [`ReAnchorOutcome`] is
+/// returned rather than a collapsed `Option`.
 ///
-/// Returns `Ok(None)` when no audit-witness key is enrolled (opt-in: the same
-/// distinct off-daemon custody key that signs witness anchors produces the
-/// re-anchor countersignature) or the chain is empty (nothing to anchor). On
-/// success the inserted checkpoint is returned for display / read-back
-/// verification ([`crate::governance::audit::verify_reanchor_checkpoint`]).
+/// SCOPE (PR #2214 audit F2): this operates on the LOCAL sqlite chain the
+/// given connection opens. The postgres `signed_events` chain (its own
+/// witness emission lives in `store/postgres.rs`) has NO re-anchor twin yet —
+/// tracked as issue #2217; callers must surface WHICH db/chain was anchored.
+///
+/// Custody is inspected BEFORE the chain-head read (an unloadable enrolled
+/// key must not be masked by an empty chain), via the three-state
+/// [`crate::governance::audit::inspect_witness_custody`].
 ///
 /// # Errors
-/// The head read, witness-key load, checkpoint build (a public-only key), or
-/// the insert failed.
-pub fn emit_reanchor_ceremony(conn: &Connection) -> Result<Option<crate::models::Checkpoint>> {
-    use crate::governance::audit as witness;
+/// The custody-dir resolution, head read, checkpoint build, or insert failed.
+pub fn emit_reanchor_ceremony(conn: &Connection) -> Result<ReAnchorOutcome> {
+    use crate::governance::audit::{self as witness, WitnessCustody};
+    let keypair = match witness::inspect_witness_custody()? {
+        WitnessCustody::Absent => return Ok(ReAnchorOutcome::SkippedNoCustody),
+        WitnessCustody::Unloadable(detail) => {
+            return Ok(ReAnchorOutcome::KeyUnloadable(detail));
+        }
+        WitnessCustody::Signer(kp) => kp,
+    };
     let (head_seq, head_hash) = read_chain_head(conn).context("re-anchor: read chain head")?;
     if head_seq <= 0 {
-        return Ok(None); // empty chain — nothing to anchor.
+        return Ok(ReAnchorOutcome::SkippedEmptyChain);
     }
-    let Some(keypair) = witness::load_witness_signing_key()? else {
-        return Ok(None); // opt-in: no audit-witness key enrolled.
-    };
     let now_dt = chrono::Utc::now();
     // head_seq > 0 is guaranteed by the guard above; propagate rather than
     // silently anchoring sequence 0 (a false statement) on the impossible
@@ -2712,7 +2753,7 @@ pub fn emit_reanchor_ceremony(conn: &Connection) -> Result<Option<crate::models:
         &keypair,
     )?;
     crate::checkpoints::insert(conn, &cp).context("re-anchor: insert checkpoint")?;
-    Ok(Some(cp))
+    Ok(ReAnchorOutcome::Anchored(Box::new(cp)))
 }
 
 /// Lowercase-hex encode a byte slice. Centralised so the #1850 watermark
