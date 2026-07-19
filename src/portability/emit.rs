@@ -65,7 +65,16 @@ impl ConformanceLevel {
 /// The signed arrays are omitted when their table is empty (spec §V2-2 —
 /// "optional envelope arrays"); `memories` / `links` are always present. The
 /// three markers are the honest, computed conformance signal.
+///
+/// **`deny_unknown_fields` is load-bearing (#2210, fail-closed parse).** A
+/// bundle produced by a FUTURE spec that added a NEW top-level record class
+/// must REFUSE to import here rather than deserialize with the unknown class
+/// array silently dropped — that would re-open the #2006 silent-signed-
+/// spine-drop defect class at the import boundary. This is a portability
+/// WIRE envelope, not an MCP tool-request struct, so the #1052 permissive-
+/// schema rule (which is about `tools/list` schema honesty) does not apply.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExportEnvelope {
     /// Always [`SPEC_VERSION_V2`].
     pub spec_version: String,
@@ -111,7 +120,7 @@ pub struct ExportEnvelope {
 /// `schema_version` migration ledger (`0` on a pre-migration DB). Stamps what
 /// the DB actually IS, per spec §V2-4 ("`db_schema_version` carries the integer
 /// storage schema").
-fn db_schema_version(conn: &Connection) -> Result<i64> {
+pub(crate) fn db_schema_version(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_version",
         [],

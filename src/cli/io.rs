@@ -203,16 +203,56 @@ pub(crate) fn import_from_str(
 ) -> Result<()> {
     let data: serde_json::Value = serde_json::from_str(payload)?;
 
-    // v1.0.0 #2006 — a v2 integrity envelope carries `spec_version`. Route it to
-    // the full byte-preserving, re-verifying importer (a faithful round-trip:
-    // preserves every field VERBATIM, so no agent-id restamp — the integrity
-    // guarantee IS verbatim preservation). A v1 payload (memories+links, no
-    // `spec_version`) stays on the L1 path below, UNCHANGED.
-    if data.get("spec_version").is_some() {
-        let envelope: crate::portability::emit::ExportEnvelope = serde_json::from_value(data)?;
+    // v1.0.0 #2006 — a v2 integrity envelope carries `spec_version`. Route it
+    // to the full byte-preserving, re-verifying importer. A v1 payload
+    // (memories+links, no `spec_version`) stays on the L1 path below,
+    // UNCHANGED.
+    //
+    // #2210 — the route is FAIL-CLOSED on the envelope itself: the
+    // `spec_version` VALUE must be the supported "2" (a newer spec refuses
+    // loudly instead of deserializing with its new record classes silently
+    // dropped — a v2+ envelope must NEVER fall through to the L1 path, which
+    // would drop the whole signed spine), and the strict
+    // (`deny_unknown_fields`) envelope parse refuses an unrecognized
+    // top-level class array.
+    //
+    // #2211 — `ImportArgs` is honoured on this path exactly like L1: the
+    // default restamps `metadata.agent_id` with the caller's id
+    // (`--trust-source` preserves verbatim), and `--on-conflict` governs
+    // `(title, namespace)` collisions with existing destination rows.
+    if let Some(spec) = data.get("spec_version") {
+        let supported = crate::portability::emit::SPEC_VERSION_V2;
+        if spec.as_str() != Some(supported) {
+            anyhow::bail!(
+                "import REFUSED (fail-closed): unsupported portability spec_version {spec} — \
+                 this node understands spec_version \"{supported}\". The bundle was produced \
+                 by a newer/unknown spec; importing it here could silently drop signed record \
+                 classes. Upgrade this node instead; no rows were applied"
+            );
+        }
+        let envelope: crate::portability::emit::ExportEnvelope = serde_json::from_value(data)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "import REFUSED (fail-closed): the v2 envelope did not parse strictly \
+                     ({e}) — an unrecognized or malformed field means the bundle carries \
+                     content this node would otherwise silently drop; no rows were applied"
+                )
+            })?;
+        let caller_id = identity::resolve_agent_id(cli_agent_id, None)?;
+        let opts = crate::portability::import::ImportOptions {
+            trust_source: args.trust_source,
+            caller_agent_id: caller_id,
+            on_conflict: args.on_conflict.into(),
+        };
         let conn = db::open(db_path)?;
-        let report = crate::portability::import::import_full_envelope(&conn, &envelope)?;
+        let report = crate::portability::import::import_full_envelope(&conn, &envelope, &opts)?;
         writeln!(out.stdout, "{}", serde_json::to_string_pretty(&report)?)?;
+        if args.trust_source {
+            writeln!(
+                out.stderr,
+                "warning: --trust-source: agent_id from imported JSON was preserved as-is"
+            )?;
+        }
         return Ok(());
     }
 
@@ -678,6 +718,147 @@ mod tests {
             Some("preserved-agent")
         );
         assert!(dst.stderr_str().contains("trust-source"));
+    }
+
+    /// The FULL Portability-v2 envelope payload (the `--full` wire form).
+    fn export_full_payload_at(db_path: &Path) -> String {
+        let mut buf = Vec::<u8>::new();
+        let mut errbuf = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut buf, &mut errbuf);
+        export(db_path, &ExportArgs { full: true }, &mut out).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// ★ #2210 — the v2 route validates the `spec_version` VALUE: a
+    /// spec_version-"3" payload must refuse loudly, and must NOT fall
+    /// through to the L1 path (which would silently drop the signed spine).
+    /// Fails on pre-#2210 code (only key PRESENCE was checked, so the value
+    /// was never validated and the envelope parsed permissively).
+    #[test]
+    fn v2_route_refuses_unsupported_spec_version_2210() {
+        let mut dst = TestEnv::fresh();
+        let dst_db = dst.db_path.clone();
+        let payload = serde_json::json!({
+            "spec_version": "3",
+            "db_schema_version": 1,
+            "memories": [],
+            "links": [],
+            "portability_complete": false,
+            "conformance_level": "L1",
+            "conformance_by_class": {},
+            "count": 0
+        })
+        .to_string();
+        let args = ImportArgs {
+            trust_source: false,
+            on_conflict: OnConflict::Version,
+        };
+        let err = {
+            let mut out = dst.output();
+            import_from_str(&payload, &dst_db, &args, false, Some("caller"), &mut out)
+                .expect_err("a spec_version-3 payload must refuse")
+        };
+        assert!(err.to_string().contains("spec_version"), "got: {err}");
+    }
+
+    /// ★ #2210 — the v2 route's strict envelope parse refuses an unknown
+    /// top-level record class instead of silently dropping it. Fails on
+    /// pre-#2210 code (no `deny_unknown_fields` — the array vanished and the
+    /// import "succeeded").
+    #[test]
+    fn v2_route_refuses_unknown_record_class_2210() {
+        let src = TestEnv::fresh();
+        let src_db = src.db_path.clone();
+        let _ = seed_memory(&src_db, "ns", "t2210", "c2210");
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&export_full_payload_at(&src_db)).unwrap();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert("future_class".into(), serde_json::json!([{"sig": "x"}]));
+
+        let mut dst = TestEnv::fresh();
+        let dst_db = dst.db_path.clone();
+        let args = ImportArgs {
+            trust_source: false,
+            on_conflict: OnConflict::Version,
+        };
+        let err = {
+            let mut out = dst.output();
+            import_from_str(
+                &payload.to_string(),
+                &dst_db,
+                &args,
+                false,
+                Some("caller"),
+                &mut out,
+            )
+            .expect_err("an unknown top-level class must refuse")
+        };
+        assert!(err.to_string().contains("fail-closed"), "got: {err}");
+        // ZERO rows landed.
+        let conn = db::open(&dst_db).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "a refused v2 import applies zero rows");
+    }
+
+    /// ★ #2211 — the v2 route honours `ImportArgs` exactly like L1: a
+    /// spine-less v2 bundle's forged `agent_id` is RESTAMPED with the
+    /// caller's id by default. Fails on pre-#2211 code (the v2 route ignored
+    /// `ImportArgs` and preserved the forged identity verbatim).
+    #[test]
+    fn v2_route_restamps_agent_id_by_default_2211() {
+        let src = TestEnv::fresh();
+        let src_db = src.db_path.clone();
+        let id = seed_memory(&src_db, "ns", "v2-restamp", "v2-content");
+        {
+            let conn = db::open(&src_db).unwrap();
+            conn.execute(
+                "UPDATE memories SET metadata = json_set(metadata, '$.agent_id', 'forged-agent') WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        }
+        let payload = export_full_payload_at(&src_db);
+        assert!(
+            payload.contains("spec_version"),
+            "fixture: the payload routes to the v2 importer"
+        );
+
+        let mut dst = TestEnv::fresh();
+        let dst_db = dst.db_path.clone();
+        let args = ImportArgs {
+            trust_source: false,
+            on_conflict: OnConflict::Version,
+        };
+        {
+            let mut out = dst.output();
+            import_from_str(
+                &payload,
+                &dst_db,
+                &args,
+                false,
+                Some("caller-agent"),
+                &mut out,
+            )
+            .unwrap();
+        }
+        let conn = db::open(&dst_db).unwrap();
+        let mem = db::get(&conn, &id).unwrap().unwrap();
+        assert_eq!(
+            mem.metadata.get("agent_id").and_then(|v| v.as_str()),
+            Some("caller-agent"),
+            "the v2 route restamps by default, exactly like L1"
+        );
+        assert_eq!(
+            mem.metadata
+                .get("imported_from_agent_id")
+                .and_then(|v| v.as_str()),
+            Some("forged-agent"),
+            "the original claim is preserved as provenance"
+        );
     }
 
     #[test]

@@ -1033,6 +1033,32 @@ pub(crate) fn extract_kind_provenance(mem: &Memory) -> Option<&'static str> {
 /// and the `SELECT` would return the wrong row id. `SQLite` 3.35+
 /// supports `RETURNING`; it executes atomically within the `INSERT`.
 pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
+    insert_inner(conn, mem, true)
+}
+
+/// v1.0.0 #2211 — REMOTE-ADMISSION insert for the Portability-v2 importer.
+///
+/// Byte-identical to [`insert`] (same record-stop / governance / why-trace /
+/// secret-screen funnel, same cid stamp, same upsert SQL) EXCEPT it does NOT
+/// advance this node's own component of the per-memory vector clock —
+/// mirroring the federation-receive posture of [`insert_if_newer`] /
+/// `overwrite_full_row_by_id` (the `stamp_version_vector` doc contract: a
+/// remote-authored row applied locally must never falsely bump this node,
+/// which would misattribute clock authorship and skew the #1757 LWW /
+/// convergence decisions). An imported row was authored elsewhere; the
+/// destination merely admits it.
+///
+/// # Errors
+///
+/// Identical to [`insert`].
+pub fn insert_imported(conn: &Connection, mem: &Memory) -> Result<String> {
+    insert_inner(conn, mem, false)
+}
+
+/// Shared body of [`insert`] / [`insert_imported`]. `stamp_local_clock`
+/// selects whether this node's vector-clock component is advanced
+/// (local authorship) or the metadata crosses verbatim (remote admission).
+fn insert_inner(conn: &Connection, mem: &Memory, stamp_local_clock: bool) -> Result<String> {
     // #1955 R45 — record-stop fence: outermost of the write funnel, so a
     // stopped record plane refuses even before governance evaluates.
     crate::storage::record_stop::gate_storage_conn(conn)?;
@@ -1071,7 +1097,10 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
     // metadata so the in-memory `mem` is untouched; the ON CONFLICT arm
     // updates `metadata = excluded.metadata`, so a re-store persists the
     // advanced clock too.
-    let stamped_metadata = {
+    // #2211 — `insert_imported` skips the stamp entirely (remote admission:
+    // the row was authored elsewhere; bumping this node's component here
+    // would misattribute clock authorship).
+    let stamped_metadata = if stamp_local_clock {
         let mut m = mem.metadata.clone();
         crate::models::stamp_version_vector(
             &mut m,
@@ -1079,6 +1108,8 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
             &mem.updated_at,
         );
         m
+    } else {
+        mem.metadata.clone()
     };
     let metadata_json = serde_json::to_string(&stamped_metadata)?;
     // v0.7.0 Form 4 — encode citations/source_span to JSON for the
@@ -4023,6 +4054,26 @@ pub fn forget_tombstone_signable_bytes(
 pub fn memory_is_tombstoned(conn: &Connection, memory_id: &str) -> Result<bool> {
     let exists: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM forget_tombstones WHERE memory_id = ?1)",
+        params![memory_id],
+        |r| r.get(0),
+    )?;
+    Ok(exists)
+}
+
+/// v1.0.0 #2208 — does an ARCHIVED row exist for `memory_id`?
+///
+/// The Portability-v2 importer probes this so a memory the DESTINATION
+/// deliberately moved to `archived_memories` is not silently re-admitted as
+/// a LIVE row (which would leave the id present in BOTH tables — an
+/// internally contradictory dual-residency state). The sanctioned way back
+/// to live is `memory_archive_restore`, never a bulk import.
+///
+/// # Errors
+///
+/// Returns `Err` only on hard SQLite failures.
+pub fn memory_is_archived(conn: &Connection, memory_id: &str) -> Result<bool> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM archived_memories WHERE id = ?1)",
         params![memory_id],
         |r| r.get(0),
     )?;

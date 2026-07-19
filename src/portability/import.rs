@@ -62,8 +62,55 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
-use crate::portability::emit::ExportEnvelope;
+use crate::identity::lineage::LineageCheck;
+use crate::portability::emit::{ExportEnvelope, SPEC_VERSION_V2};
 use crate::signed_events::TruncationCheck;
+use crate::storage::ConflictMode;
+
+/// Caller-supplied dispositions for a v2 integrity import (#2211).
+///
+/// The v2 route previously ignored `ImportArgs` entirely — always preserving
+/// `metadata.agent_id` verbatim and always taking the silent `(title,
+/// namespace)` upsert-merge. That silently bypassed the L1
+/// restamp-by-default provenance hygiene (one attacker-controlled
+/// `spec_version` key flipped the identity posture of the whole import) and
+/// could CLOBBER a destination row's content on a title collision. These
+/// options replicate the L1 `ImportArgs` semantics on the v2 path.
+#[derive(Debug, Clone)]
+pub struct ImportOptions {
+    /// Preserve `metadata.agent_id` VERBATIM (the operator explicitly
+    /// passed `--trust-source`). Default `false` = restamp with the
+    /// caller's id, exactly like the L1 import path.
+    ///
+    /// Verbatim identity is gated EXCLUSIVELY on this explicit operator
+    /// flag — deliberately NOT on "the bundle carries a re-verified
+    /// signed_events spine": with no enrolled verifier an UNSIGNED chain
+    /// is hash-link-consistent by construction and trivially forgeable,
+    /// so an intact spine is NOT identity attestation and earns no
+    /// implicit trust (fail-closed, #2211).
+    pub trust_source: bool,
+    /// The caller identity used to restamp `metadata.agent_id` when
+    /// [`Self::trust_source`] is `false` (the L1 restamp parity).
+    pub caller_agent_id: String,
+    /// Disposition on a `(title, namespace)` collision between an imported
+    /// memory and an EXISTING destination row with a DIFFERENT id —
+    /// replicating the L1 `--on-conflict` semantics: `Version` (default —
+    /// auto-suffix the incoming title, never clobber), `Merge` (legacy
+    /// silent upsert-merge), `Error` (refuse + skip the colliding row,
+    /// counted + warned, the rest of the bundle continues).
+    pub on_conflict: ConflictMode,
+}
+
+impl Default for ImportOptions {
+    /// The L1-parity secure default: restamp identity, never clobber.
+    fn default() -> Self {
+        Self {
+            trust_source: false,
+            caller_agent_id: String::new(),
+            on_conflict: ConflictMode::Version,
+        }
+    }
+}
 
 /// Per-class outcome of an integrity import.
 ///
@@ -85,10 +132,27 @@ pub struct ImportReport {
     pub governance_rejected: usize,
     /// Trust anchors seen in the envelope (advisory — never adopted).
     pub trust_anchors_seen: usize,
-    /// Memory rows skipped because a tombstone forbade re-admission.
+    /// Memory rows skipped because a tombstone forbade re-admission —
+    /// counting BOTH the bundle's own tombstones AND the DESTINATION's
+    /// pre-existing `forget_tombstones` (#2208: a destination-forgotten
+    /// memory must never resurrect through an import).
     pub tombstoned_skipped: usize,
+    /// Memory rows skipped because the DESTINATION holds the id in
+    /// `archived_memories` (#2208 adjacent: re-admitting it live would
+    /// leave the id in BOTH tables; the sanctioned way back to live is
+    /// `memory_archive_restore`).
+    pub archived_skipped: usize,
+    /// Memory rows whose `metadata.agent_id` was restamped with the
+    /// caller's id (the L1-parity default; `--trust-source` disables).
+    pub restamped: usize,
+    /// Memory rows skipped under `--on-conflict error` because their
+    /// `(title, namespace)` collided with an existing destination row.
+    pub conflicts_skipped: usize,
     /// `true` when the imported audit spine re-verified in the transaction.
     pub reverify_chain_ok: bool,
+    /// `true` when the staged `memory_revisions` chain replayed cleanly
+    /// (contiguous unique sequences, linked `prev_hash`es — #2209).
+    pub reverify_revisions_ok: bool,
     /// `true` iff the transaction committed (always `true` on the `Ok` path).
     pub committed: bool,
     /// Human-readable non-fatal notes (dropped governance rules).
@@ -105,12 +169,49 @@ pub struct ImportReport {
 ///
 /// # Errors
 /// Returns `Err` (and applies ZERO rows — the transaction rolls back) when:
+/// - the envelope's `spec_version` is not the supported `"2"`, or its
+///   `db_schema_version` is NEWER than the destination's applied schema
+///   (#2210 — a newer-producer bundle must refuse loudly, never partially
+///   ingest);
 /// - a DTO cannot be reconstructed (a closed-vocabulary slug outside its enum —
 ///   a malformed / tampered bundle);
 /// - a row insert hits a DB fault;
 /// - the imported audit spine does not re-verify (a tampered / truncated /
-///   malformed bundle) — the fail-closed spine gate.
-pub fn import_full_envelope(conn: &Connection, env: &ExportEnvelope) -> Result<ImportReport> {
+///   malformed bundle) — the fail-closed spine gate;
+/// - the staged `memory_revisions` chain does not replay (#2209 — a tampered
+///   revision row, a duplicate/gapped sequence from merging a foreign chain
+///   into a non-empty destination, or a broken `prev_hash` link);
+/// - the staged `agent_lineage` succession chains verify as FORGED (#2209 —
+///   a tampered lineage record, or a bundle chain that forks the
+///   destination's existing key-succession history).
+pub fn import_full_envelope(
+    conn: &Connection,
+    env: &ExportEnvelope,
+    opts: &ImportOptions,
+) -> Result<ImportReport> {
+    // ── FAIL-CLOSED envelope gate (#2210) ──
+    // Defense-in-depth twin of the parse-time checks in `cli::io` (this
+    // function is the funnel — every caller must be covered).
+    if env.spec_version != SPEC_VERSION_V2 {
+        anyhow::bail!(
+            "portability import REJECTED (fail-closed): unsupported spec_version {:?} — this \
+             node understands spec_version {SPEC_VERSION_V2:?}; the bundle was produced by a \
+             newer/unknown spec, so importing it here could silently drop signed record \
+             classes. Upgrade this node instead; NO rows were applied",
+            env.spec_version
+        );
+    }
+    let dest_schema = crate::portability::emit::db_schema_version(conn)
+        .context("portability import: could not read the destination's applied schema version")?;
+    if env.db_schema_version > dest_schema {
+        anyhow::bail!(
+            "portability import REJECTED (fail-closed): the bundle was exported from \
+             db_schema_version {} but this destination is at {dest_schema} — a newer producer \
+             may carry record shapes this node cannot faithfully ingest. Upgrade this node \
+             first; NO rows were applied",
+            env.db_schema_version
+        );
+    }
     // ── ALL-OR-NOTHING: one transaction wraps the entire apply. ──
     // `unchecked_transaction` issues BEGIN DEFERRED on `&Connection`; every
     // helper below is either a raw `execute` or a transaction-free storage
@@ -121,7 +222,7 @@ pub fn import_full_envelope(conn: &Connection, env: &ExportEnvelope) -> Result<I
         .unchecked_transaction()
         .context("portability import: could not open the atomic import transaction")?;
 
-    let mut report = apply_all_classes(&tx, env)?;
+    let mut report = apply_all_classes(&tx, env, opts)?;
 
     // ── FAIL-CLOSED spine gate ──
     // Re-verify the STAGED audit spine with the substrate's own authoritative
@@ -147,6 +248,46 @@ pub fn import_full_envelope(conn: &Connection, env: &ExportEnvelope) -> Result<I
     }
     report.reverify_chain_ok = true;
 
+    // ── FAIL-CLOSED revisions gate (#2209) ──
+    // The `signed_events` gate above covers ONE of the three signed spine
+    // classes. `memory_revisions` rows cross RAW with their own
+    // `prev_hash`/`sequence` chain and (pre-#2209) committed UNVERIFIED —
+    // and `memory_revisions.sequence` carries no UNIQUE constraint, so a
+    // non-empty-destination merge could commit duplicate/forked revision
+    // sequences into the tamper-evidence lane. Replay the WHOLE staged
+    // chain (destination + bundle rows, post-`INSERT OR IGNORE`) from the
+    // stored columns alone: sequences must be 1..=N, strictly contiguous and
+    // UNIQUE (the uniqueness guard), and every row's `prev_hash` must equal
+    // SHA-256 of its predecessor's canonical chain bytes.
+    if let Some(defect) = verify_staged_revision_chain(&tx)
+        .context("portability import: could not replay the staged memory_revisions chain")?
+    {
+        anyhow::bail!(
+            "portability import REJECTED (fail-closed): the staged memory_revisions chain \
+             did not replay ({defect}) — the bundle is tampered/forked, or it conflicts with \
+             this destination's existing revision chain; NO rows were applied"
+        );
+    }
+    report.reverify_revisions_ok = true;
+
+    // ── FAIL-CLOSED lineage gate (#2209) ──
+    // `verify_audit_trail` already computed the identity-lineage verdict
+    // (the `agent_lineage` genesis→head walk reconciled against its
+    // `signed_events` witnesses) — but the pre-#2209 gate ignored it, so a
+    // bundle whose lineage records were tampered, or whose epochs fork the
+    // destination's existing key-succession chain (`prev_record_hash`
+    // pointing at the BUNDLE's predecessor while the destination kept its
+    // own rows at the overlapping epochs), committed a poisoned identity
+    // history. A `Forged` walk refuses the whole import.
+    if matches!(audit.lineage, LineageCheck::Forged { .. }) {
+        anyhow::bail!(
+            "portability import REJECTED (fail-closed): the staged agent_lineage succession \
+             chain verifies as FORGED ({:?}) — the bundle's lineage records are tampered or \
+             fork this destination's existing key-succession history; NO rows were applied",
+            audit.lineage
+        );
+    }
+
     tx.commit()
         .context("portability import: transaction commit failed")?;
     report.committed = true;
@@ -155,11 +296,17 @@ pub fn import_full_envelope(conn: &Connection, env: &ExportEnvelope) -> Result<I
 
 /// Stage every class into `conn` (a live transaction). Any `?` here aborts the
 /// whole import (the caller's transaction rolls back).
-fn apply_all_classes(conn: &Connection, env: &ExportEnvelope) -> Result<ImportReport> {
+fn apply_all_classes(
+    conn: &Connection,
+    env: &ExportEnvelope,
+    opts: &ImportOptions,
+) -> Result<ImportReport> {
     let mut report = ImportReport::default();
 
-    // (1) forget_tombstones FIRST — tombstone-before-admit.
-    let mut tombstoned: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // (1) forget_tombstones FIRST — tombstone-before-admit. The bundle's
+    // tombstones are staged into the SAME `forget_tombstones` table the
+    // step-(2) destination probe reads, so one probe covers both the
+    // bundle's tombstones and the destination's pre-existing ones (#2208).
     for t in &env.forget_tombstones {
         conn.execute(
             "INSERT OR IGNORE INTO forget_tombstones \
@@ -174,19 +321,35 @@ fn apply_all_classes(conn: &Connection, env: &ExportEnvelope) -> Result<ImportRe
             ],
         )
         .with_context(|| format!("import forget_tombstone for memory {}", t.memory_id))?;
-        tombstoned.insert(t.memory_id.clone());
         report.forget_tombstones += 1;
     }
 
-    // (2) memories (tombstoned skipped; id-keyed idempotent) + links.
+    // (2) memories (tombstoned/archived skipped; id-keyed idempotent) + links.
     for mem in &env.memories {
-        if tombstoned.contains(&mem.id) {
+        // #2208 — the forget covenant: a signed forget receipt is a promise.
+        // The DESTINATION's `forget_tombstones` (now also holding the
+        // bundle's own tombstones from step 1) is authoritative — a
+        // dest-forgotten row probes `None` on `storage::get` (it was
+        // erased), so without this gate a re-import RESURRECTED it and left
+        // a live row alongside its own FORGET tombstone. Same structural
+        // prevention `insert_if_newer` applies on the federation funnel.
+        if crate::storage::memory_is_tombstoned(conn, &mem.id)
+            .with_context(|| format!("import: tombstone probe for memory {}", mem.id))?
+        {
             report.tombstoned_skipped += 1;
             continue;
         }
+        // #2208 adjacent — a row the destination ARCHIVED also probes `None`
+        // on `storage::get`; re-admitting it live would leave the id in
+        // BOTH `memories` and `archived_memories` (dual residency). The
+        // sanctioned way back to live is `memory_archive_restore`.
+        if crate::storage::memory_is_archived(conn, &mem.id)
+            .with_context(|| format!("import: archive probe for memory {}", mem.id))?
+        {
+            report.archived_skipped += 1;
+            continue;
+        }
         // Idempotent: skip a memory already present (a re-import is a no-op).
-        // Fresh rows go through `storage::insert` (screening + FTS trigger + the
-        // deterministic cid re-derivation); it opens no inner transaction.
         if crate::storage::get(conn, &mem.id)
             .with_context(|| format!("import: probing existing memory {}", mem.id))?
             .is_some()
@@ -194,7 +357,76 @@ fn apply_all_classes(conn: &Connection, env: &ExportEnvelope) -> Result<ImportRe
             report.memories += 1;
             continue;
         }
-        crate::storage::insert(conn, mem).with_context(|| format!("import memory {}", mem.id))?;
+        let mut staged = mem.clone();
+        // #2211 — the L1 restamp-by-default provenance hygiene, replicated
+        // (verbatim identity ONLY under the operator's explicit
+        // `--trust-source`; see `ImportOptions::trust_source`). Mirrors the
+        // L1 path byte-for-byte: the caller's id replaces
+        // `metadata.agent_id` and the original claim is preserved under
+        // `imported_from_agent_id`.
+        if !opts.trust_source {
+            let original = staged
+                .metadata
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string);
+            if let Some(obj) = staged.metadata.as_object_mut() {
+                obj.insert(
+                    "agent_id".to_string(),
+                    serde_json::Value::String(opts.caller_agent_id.clone()),
+                );
+                if let Some(orig) = original.as_ref()
+                    && orig.as_str() != opts.caller_agent_id
+                {
+                    obj.insert(
+                        crate::models::field_names::IMPORTED_FROM_AGENT_ID.to_string(),
+                        serde_json::Value::String(orig.clone()),
+                    );
+                    report.restamped += 1;
+                }
+            }
+        }
+        // #2211 — honour the operator's `(title, namespace)` collision
+        // disposition (the L1 `--on-conflict` semantics). Pre-#2211 the v2
+        // path always took `storage::insert`'s silent upsert-merge, which
+        // CLOBBERED an existing destination row's content whenever an
+        // imported memory (different id) collided on `(title, namespace)`.
+        if let Some(existing_id) =
+            crate::storage::find_by_title_namespace(conn, &staged.title, &staged.namespace)
+                .with_context(|| format!("import: collision probe for memory {}", staged.id))?
+        {
+            match opts.on_conflict {
+                // Legacy silent upsert-merge — the operator opted in.
+                ConflictMode::Merge => {}
+                // Default: auto-suffix the INCOMING title so both rows
+                // persist — never clobber the destination's durable text.
+                ConflictMode::Version => {
+                    staged.title = crate::storage::next_versioned_title(
+                        conn,
+                        &staged.title,
+                        &staged.namespace,
+                    )?;
+                }
+                // Refuse + skip the colliding row, continue the bundle
+                // (the documented L1 `--on-conflict error` semantics).
+                ConflictMode::Error => {
+                    report.conflicts_skipped += 1;
+                    report.warnings.push(format!(
+                        "memory {} skipped: (title, namespace) collision with existing {existing_id}",
+                        staged.id
+                    ));
+                    continue;
+                }
+            }
+        }
+        // Fresh rows go through `storage::insert_imported` (same screening +
+        // FTS trigger + deterministic cid re-derivation funnel as
+        // `storage::insert`, but WITHOUT advancing this node's vector-clock
+        // component — remote-admission semantics mirroring `insert_if_newer`,
+        // #2211: the destination did not author these rows). It opens no
+        // inner transaction.
+        crate::storage::insert_imported(conn, &staged)
+            .with_context(|| format!("import memory {}", staged.id))?;
         report.memories += 1;
     }
     for link in &env.links {
@@ -227,25 +459,69 @@ fn apply_all_classes(conn: &Connection, env: &ExportEnvelope) -> Result<ImportRe
     // (3) signed_events — RAW (byte-preserve prev_hash/sequence/cause_hash).
     for dto in &env.signed_events {
         let ev: crate::signed_events::SignedEvent = dto.clone().into();
-        conn.execute(
-            "INSERT OR IGNORE INTO signed_events \
-                (id, agent_id, event_type, payload_hash, signature, attest_level, \
-                 timestamp, prev_hash, sequence, cause_hash) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                ev.id,
-                ev.agent_id,
-                ev.event_type,
-                ev.payload_hash,
-                ev.signature,
-                ev.attest_level,
-                ev.timestamp,
-                ev.prev_hash,
-                ev.sequence,
-                ev.cause_hash,
-            ],
-        )
-        .with_context(|| format!("import signed_event {}", ev.id))?;
+        let n = conn
+            .execute(
+                "INSERT OR IGNORE INTO signed_events \
+                    (id, agent_id, event_type, payload_hash, signature, attest_level, \
+                     timestamp, prev_hash, sequence, cause_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    ev.id,
+                    ev.agent_id,
+                    ev.event_type,
+                    ev.payload_hash,
+                    ev.signature,
+                    ev.attest_level,
+                    ev.timestamp,
+                    ev.prev_hash,
+                    ev.sequence,
+                    ev.cause_hash,
+                ],
+            )
+            .with_context(|| format!("import signed_event {}", ev.id))?;
+        // #2209 — an `OR IGNORE` that IGNORED is legitimate ONLY for an
+        // idempotent re-import (the surviving row is byte-identical). An
+        // ignore caused by a DIFFERENT surviving row at this id — or by the
+        // `idx_signed_events_sequence` UNIQUE index when a different row
+        // already occupies this sequence (a non-empty-destination chain
+        // merge) — would SILENTLY DROP part of the bundle's signed spine
+        // while the destination's own clean chain still passed the
+        // re-verify: exactly the silent-spine-drop class #2006 exists to
+        // kill. Refuse instead.
+        if n == 0 {
+            let identical: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM signed_events \
+                     WHERE id = ?1 AND agent_id = ?2 AND event_type = ?3 \
+                       AND payload_hash = ?4 AND signature IS ?5 AND attest_level = ?6 \
+                       AND timestamp = ?7 AND prev_hash = ?8 AND sequence = ?9 \
+                       AND cause_hash IS ?10)",
+                    params![
+                        ev.id,
+                        ev.agent_id,
+                        ev.event_type,
+                        ev.payload_hash,
+                        ev.signature,
+                        ev.attest_level,
+                        ev.timestamp,
+                        ev.prev_hash,
+                        ev.sequence,
+                        ev.cause_hash,
+                    ],
+                    |r| r.get(0),
+                )
+                .with_context(|| format!("import: identity probe for signed_event {}", ev.id))?;
+            if !identical {
+                anyhow::bail!(
+                    "import signed_event {} (sequence {}): a DIFFERENT row already occupies \
+                     this id/sequence in the destination — the bundle's audit chain forks the \
+                     destination's; refusing rather than silently dropping part of the signed \
+                     spine",
+                    ev.id,
+                    ev.sequence
+                );
+            }
+        }
         report.signed_events += 1;
     }
 
@@ -257,25 +533,68 @@ fn apply_all_classes(conn: &Connection, env: &ExportEnvelope) -> Result<ImportRe
             .clone()
             .try_into_domain()
             .with_context(|| format!("import memory_revision {}", dto.id))?;
-        conn.execute(
-            "INSERT OR IGNORE INTO memory_revisions \
-                (id, memory_id, kind, prior_version, namespace, agent_id, created_at, \
-                 signature, prev_hash, sequence) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                row.leaf.id,
-                row.leaf.memory_id,
-                row.leaf.kind.as_str(),
-                row.leaf.prior_version,
-                row.leaf.namespace,
-                row.leaf.agent_id,
-                row.leaf.created_at,
-                row.leaf.signature,
-                row.prev_hash,
-                row.sequence,
-            ],
-        )
-        .with_context(|| format!("import memory_revision {}", row.leaf.id))?;
+        let n = conn
+            .execute(
+                "INSERT OR IGNORE INTO memory_revisions \
+                    (id, memory_id, kind, prior_version, namespace, agent_id, created_at, \
+                     signature, prev_hash, sequence) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    row.leaf.id,
+                    row.leaf.memory_id,
+                    row.leaf.kind.as_str(),
+                    row.leaf.prior_version,
+                    row.leaf.namespace,
+                    row.leaf.agent_id,
+                    row.leaf.created_at,
+                    row.leaf.signature,
+                    row.prev_hash,
+                    row.sequence,
+                ],
+            )
+            .with_context(|| format!("import memory_revision {}", row.leaf.id))?;
+        // #2209 — same identical-or-refuse discipline as the signed_events
+        // loop: an ignore from the `idx_memory_revisions_sequence` UNIQUE
+        // index (a foreign chain merged into a non-empty destination) or a
+        // same-id-different-bytes row is a FORK; silently keeping the
+        // destination row while counting the bundle row as imported would
+        // silently drop part of the revisions spine.
+        if n == 0 {
+            let identical: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM memory_revisions \
+                     WHERE id = ?1 AND memory_id = ?2 AND kind = ?3 \
+                       AND prior_version IS ?4 AND namespace = ?5 AND agent_id IS ?6 \
+                       AND created_at = ?7 AND signature IS ?8 AND prev_hash = ?9 \
+                       AND sequence = ?10)",
+                    params![
+                        row.leaf.id,
+                        row.leaf.memory_id,
+                        row.leaf.kind.as_str(),
+                        row.leaf.prior_version,
+                        row.leaf.namespace,
+                        row.leaf.agent_id,
+                        row.leaf.created_at,
+                        row.leaf.signature,
+                        row.prev_hash,
+                        row.sequence,
+                    ],
+                    |r| r.get(0),
+                )
+                .with_context(|| {
+                    format!("import: identity probe for memory_revision {}", row.leaf.id)
+                })?;
+            if !identical {
+                anyhow::bail!(
+                    "import memory_revision {} (sequence {}): a DIFFERENT row already occupies \
+                     this id/sequence in the destination — the bundle's revision chain forks \
+                     the destination's; refusing rather than silently dropping part of the \
+                     revisions spine",
+                    row.leaf.id,
+                    row.sequence
+                );
+            }
+        }
         report.memory_revisions += 1;
     }
 
@@ -332,6 +651,43 @@ fn apply_all_classes(conn: &Connection, env: &ExportEnvelope) -> Result<ImportRe
                 record.agent_id, record.epoch
             )
         })?;
+        // #2209 — identical-or-refuse on the `(agent_id, epoch)` composite
+        // PK (the C5 anti-equivocation constraint): an ignore whose
+        // surviving row differs from the bundle's record is EQUIVOCATION —
+        // two different succession records claiming the same epoch. The
+        // canonical `record_bytes` + detached signature pin the whole
+        // record, so one byte-comparison covers every signed field.
+        {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_lineage \
+                     WHERE agent_id = ?1 AND epoch = ?2 \
+                       AND record_bytes = ?3 AND signature = ?4",
+                    params![
+                        record.agent_id,
+                        i64::try_from(record.epoch)
+                            .context("import: agent_lineage epoch exceeds i64")?,
+                        record_bytes,
+                        export.signature,
+                    ],
+                    |r| r.get(0),
+                )
+                .with_context(|| {
+                    format!(
+                        "import: identity probe for agent_lineage {}",
+                        record.agent_id
+                    )
+                })?;
+            if n == 0 {
+                anyhow::bail!(
+                    "import agent_lineage {} epoch {}: a DIFFERENT succession record already \
+                     occupies this (agent_id, epoch) in the destination (equivocation) — \
+                     refusing rather than silently dropping the bundle's lineage record",
+                    record.agent_id,
+                    record.epoch
+                );
+            }
+        }
         report.agent_lineage += 1;
     }
 
@@ -412,6 +768,68 @@ fn apply_all_classes(conn: &Connection, env: &ExportEnvelope) -> Result<ImportRe
     Ok(report)
 }
 
+/// #2209 — replay-verify the WHOLE staged `memory_revisions` chain from the
+/// stored columns alone (the revisions-chain verifier the pre-commit gate
+/// lacked; `signed_events` has `verify_audit_trail`, this is its
+/// `memory_revisions` mirror).
+///
+/// Invariants asserted, in walk order over `ORDER BY sequence ASC`:
+/// - sequences are UNIQUE (the uniqueness guard — the table carries no
+///   `UNIQUE(sequence)` constraint, so merging a foreign chain into a
+///   non-empty destination would otherwise commit duplicate sequences);
+/// - sequences are contiguous `1..=N` (a gap = a truncated/forked chain);
+/// - row 1's `prev_hash` is the zero hash, and every later row's `prev_hash`
+///   equals `SHA-256(canonical_revision_chain_bytes(predecessor))` — the
+///   exact link `revisions::append_revision_leaf` writes, so a tampered
+///   interior row (any identity field OR its `prev_hash`) breaks the replay.
+///
+/// Returns `Ok(None)` on a clean (or empty) chain, `Ok(Some(defect))` naming
+/// the first defect. Signature verification is deliberately NOT attempted
+/// here (parity with the `signed_events` gate: with no enrolled verifier the
+/// integrity guarantee is the byte-preserved chain replay).
+///
+/// # Errors
+/// A revision row cannot be read/reconstructed (fail-closed — an unknown
+/// `kind` slug in the STORED state is itself a defect surfaced by
+/// `read_all_memory_revisions`).
+fn verify_staged_revision_chain(conn: &Connection) -> Result<Option<String>> {
+    use sha2::{Digest, Sha256};
+
+    let rows = crate::portability::read::read_all_memory_revisions(conn)?;
+    let mut expected_prev: [u8; 32] = crate::signed_events::ZERO_HASH;
+    let mut prev_seq: i64 = 0;
+    for row in &rows {
+        let seq = row.sequence;
+        if seq == prev_seq {
+            return Ok(Some(format!(
+                "duplicate sequence {seq} (id {}) — two distinct revision rows claim the same \
+                 chain position",
+                row.leaf.id
+            )));
+        }
+        if seq != prev_seq + 1 {
+            return Ok(Some(format!(
+                "sequence gap: expected {}, found {seq} (id {})",
+                prev_seq + 1,
+                row.leaf.id
+            )));
+        }
+        if row.prev_hash.as_slice() != expected_prev.as_slice() {
+            return Ok(Some(format!(
+                "broken prev_hash link at sequence {seq} (id {})",
+                row.leaf.id
+            )));
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(crate::revisions::canonical_revision_chain_bytes(
+            &row.leaf, seq,
+        ));
+        expected_prev.copy_from_slice(&hasher.finalize());
+        prev_seq = seq;
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +867,40 @@ mod tests {
         append_signed_event(conn, &ev).expect("append");
     }
 
+    /// The explicit operator-trusted-backup posture (#2211) — the legacy
+    /// verbatim behaviour the byte-exact round-trip tests exercise.
+    fn opts_trusted() -> ImportOptions {
+        ImportOptions {
+            trust_source: true,
+            caller_agent_id: "importer".into(),
+            ..ImportOptions::default()
+        }
+    }
+
+    /// The DEFAULT (L1-parity) posture: restamp identity, never clobber.
+    fn opts_default() -> ImportOptions {
+        ImportOptions {
+            trust_source: false,
+            caller_agent_id: "importer".into(),
+            ..ImportOptions::default()
+        }
+    }
+
+    /// A minimal durable memory fixture carrying a (claimed) author id.
+    fn memory_fixture(id: &str, title: &str, agent_id: &str) -> crate::models::Memory {
+        let now = "2026-07-14T00:00:00Z".to_string();
+        crate::models::Memory {
+            id: id.into(),
+            namespace: "portability".into(),
+            title: title.into(),
+            content: format!("durable content of {id}"),
+            created_at: now.clone(),
+            updated_at: now,
+            metadata: serde_json::json!({ "agent_id": agent_id }),
+            ..crate::models::Memory::default()
+        }
+    }
+
     #[test]
     fn signed_events_round_trip_byte_exact_and_reverify() {
         let src = fresh_conn("src-");
@@ -460,7 +912,7 @@ mod tests {
         assert_eq!(env.signed_events.len(), 5);
 
         let dst = fresh_conn("dst-");
-        let report = import_full_envelope(&dst, &env).expect("import");
+        let report = import_full_envelope(&dst, &env, &opts_trusted()).expect("import");
         assert_eq!(report.signed_events, 5);
         assert!(report.committed, "the fail-closed import committed");
 
@@ -488,8 +940,8 @@ mod tests {
         }
         let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
         let dst = fresh_conn("idem-dst-");
-        let first = import_full_envelope(&dst, &env).expect("import 1");
-        let second = import_full_envelope(&dst, &env).expect("import 2");
+        let first = import_full_envelope(&dst, &env, &opts_trusted()).expect("import 1");
+        let second = import_full_envelope(&dst, &env, &opts_trusted()).expect("import 2");
         assert_eq!(first.signed_events, 3);
         assert_eq!(second.signed_events, 3);
         let rows = list_signed_events(&dst, None, usize::MAX, 0).expect("rows");
@@ -513,7 +965,8 @@ mod tests {
             crate::portability::hex_bytes::HexBytes(vec![0xba, 0xad]);
 
         let dst = fresh_conn("tamper-dst-");
-        let err = import_full_envelope(&dst, &env).expect_err("tampered bundle must be rejected");
+        let err = import_full_envelope(&dst, &env, &opts_trusted())
+            .expect_err("tampered bundle must be rejected");
         assert!(
             err.to_string().contains("REJECTED"),
             "loud fail-closed error, got: {err}"
@@ -541,13 +994,382 @@ mod tests {
         env.signed_events.remove(2);
 
         let dst = fresh_conn("trunc-dst-");
-        let err = import_full_envelope(&dst, &env).expect_err("truncated bundle must be rejected");
+        let err = import_full_envelope(&dst, &env, &opts_trusted())
+            .expect_err("truncated bundle must be rejected");
         assert!(err.to_string().contains("REJECTED"), "got: {err}");
         assert!(
             list_signed_events(&dst, None, usize::MAX, 0)
                 .expect("rows")
                 .is_empty(),
             "a rejected import must leave ZERO rows"
+        );
+    }
+
+    /// ★ #2208 FORGET COVENANT: a memory the DESTINATION forgot (row erased +
+    /// dest tombstone recorded) must NOT resurrect on a re-import of a bundle
+    /// that still carries it. Fails on pre-#2208 code (only the BUNDLE's
+    /// tombstones were consulted; `storage::insert` re-admitted the row).
+    #[test]
+    fn dest_forgotten_memory_is_not_resurrected_2208() {
+        let src = fresh_conn("forget-src-");
+        let mem = memory_fixture("mem-forget-2208", "forgettable", "alice");
+        crate::storage::insert(&src, &mem).expect("seed src");
+        let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+
+        let dst = fresh_conn("forget-dst-");
+        import_full_envelope(&dst, &env, &opts_trusted()).expect("first import");
+        assert!(
+            crate::storage::get(&dst, "mem-forget-2208")
+                .expect("get")
+                .is_some(),
+            "first import landed the row"
+        );
+
+        // The destination operator forgets it — the durable erasure receipt.
+        let forgotten = crate::storage::forget(&dst, Some("portability"), None, None, false)
+            .expect("dest forget");
+        assert_eq!(forgotten, 1, "dest forgot the row");
+        assert!(
+            crate::storage::memory_is_tombstoned(&dst, "mem-forget-2208").expect("probe"),
+            "dest recorded a forget tombstone"
+        );
+
+        // Re-import the SAME bundle: the forgotten content must stay gone.
+        let report = import_full_envelope(&dst, &env, &opts_trusted()).expect("re-import");
+        assert!(
+            crate::storage::get(&dst, "mem-forget-2208")
+                .expect("get")
+                .is_none(),
+            "the forgotten memory must NOT resurrect through the import"
+        );
+        assert_eq!(report.tombstoned_skipped, 1, "the skip is counted");
+        assert!(
+            crate::storage::memory_is_tombstoned(&dst, "mem-forget-2208").expect("probe"),
+            "the tombstone survives the import"
+        );
+    }
+
+    /// #2208 adjacent: a memory the DESTINATION archived must not be
+    /// re-admitted LIVE (dual residency in `memories` + `archived_memories`).
+    #[test]
+    fn dest_archived_memory_is_not_readmitted_live_2208() {
+        let src = fresh_conn("arch-src-");
+        let mem = memory_fixture("mem-arch-2208", "archivable", "alice");
+        crate::storage::insert(&src, &mem).expect("seed src");
+        let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+
+        let dst = fresh_conn("arch-dst-");
+        import_full_envelope(&dst, &env, &opts_trusted()).expect("first import");
+        assert!(
+            crate::storage::archive_memory(&dst, "mem-arch-2208", Some("test")).expect("archive"),
+            "dest archived the row"
+        );
+
+        let report = import_full_envelope(&dst, &env, &opts_trusted()).expect("re-import");
+        assert_eq!(report.archived_skipped, 1, "the archived skip is counted");
+        assert!(
+            crate::storage::get(&dst, "mem-arch-2208")
+                .expect("get")
+                .is_none(),
+            "the archived memory must NOT be re-admitted live"
+        );
+        assert!(
+            crate::storage::memory_is_archived(&dst, "mem-arch-2208").expect("probe"),
+            "the archived row is untouched"
+        );
+    }
+
+    /// ★ #2209: a bundle whose `memory_revisions` chain was TAMPERED (an
+    /// identity field mutated after export) is REJECTED with zero rows.
+    /// Fails on pre-#2209 code (revisions committed with no chain walk).
+    #[test]
+    fn tampered_revision_chain_is_rejected_with_zero_rows_2209() {
+        use crate::revisions::{RecordKind, RevisionLeaf, append_revision_leaf};
+        let src = fresh_conn("rev-tamper-src-");
+        for i in 0..3 {
+            let leaf = RevisionLeaf::new(
+                format!("rev-{i}"),
+                format!("mem-{i}"),
+                RecordKind::Supersede,
+                Some(1),
+                "ns",
+                Some("alice".into()),
+                "2026-07-14T00:00:00Z",
+            );
+            append_revision_leaf(&src, &leaf).expect("append leaf");
+        }
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        assert_eq!(env.memory_revisions.len(), 3);
+        // Tamper an INTERIOR row's identity field: the NEXT row's prev_hash
+        // was computed over the ORIGINAL bytes, so the replay must break.
+        env.memory_revisions[1].namespace = "tampered-ns".into();
+
+        let dst = fresh_conn("rev-tamper-dst-");
+        let err = import_full_envelope(&dst, &env, &opts_trusted())
+            .expect_err("tampered revision chain must be rejected");
+        assert!(
+            err.to_string().contains("REJECTED"),
+            "loud fail-closed error, got: {err}"
+        );
+        let n: i64 = dst
+            .query_row("SELECT COUNT(*) FROM memory_revisions", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(n, 0, "a rejected import must leave ZERO revision rows");
+    }
+
+    /// ★ #2209 uniqueness guard: importing a bundle with its OWN revision
+    /// chain into a destination that already carries a DIFFERENT chain would
+    /// commit duplicate/forked sequences (`memory_revisions.sequence` has no
+    /// UNIQUE constraint) — the staged replay must refuse. Fails on
+    /// pre-#2209 code (both chains committed interleaved).
+    #[test]
+    fn diverging_dest_revision_chain_refuses_merge_2209() {
+        use crate::revisions::{RecordKind, RevisionLeaf, append_revision_leaf};
+        let src = fresh_conn("rev-fork-src-");
+        append_revision_leaf(
+            &src,
+            &RevisionLeaf::new(
+                "rev-src",
+                "mem-src",
+                RecordKind::Supersede,
+                Some(1),
+                "ns",
+                Some("alice".into()),
+                "2026-07-14T00:00:00Z",
+            ),
+        )
+        .expect("src leaf");
+        let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+
+        let dst = fresh_conn("rev-fork-dst-");
+        append_revision_leaf(
+            &dst,
+            &RevisionLeaf::new(
+                "rev-dst",
+                "mem-dst",
+                RecordKind::Tombstone,
+                Some(2),
+                "other-ns",
+                Some("bob".into()),
+                "2026-07-15T00:00:00Z",
+            ),
+        )
+        .expect("dst leaf");
+
+        let err = import_full_envelope(&dst, &env, &opts_trusted())
+            .expect_err("a forked revision merge must refuse");
+        assert!(
+            format!("{err:#}").contains("DIFFERENT row"),
+            "loud fail-closed fork error, got: {err:#}"
+        );
+        // The destination keeps EXACTLY its own pre-existing chain.
+        let n: i64 = dst
+            .query_row("SELECT COUNT(*) FROM memory_revisions", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(n, 1, "the destination chain is untouched");
+    }
+
+    /// ★ #2209: a bundle carrying a FORGED `agent_lineage` record (garbage
+    /// signature) is REJECTED with zero rows. Fails on pre-#2209 code (the
+    /// gate ignored `audit.lineage`, committing the forged succession row).
+    #[test]
+    fn forged_agent_lineage_is_rejected_with_zero_rows_2209() {
+        use base64::Engine as _;
+        let src = fresh_conn("lin-forge-src-");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        let pk_b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x42_u8; 32].as_slice());
+        env.agent_lineage.push(crate::portability::dto::LineageDto {
+            agent_id: "mallory".into(),
+            epoch: 0,
+            reason: "genesis".into(),
+            predecessor_pubkey_b64: pk_b64.clone(),
+            successor_pubkey_b64: pk_b64,
+            recovery_pubkey_b64: None,
+            not_before: "2026-07-14T00:00:00Z".into(),
+            prev_record_hash: crate::portability::hex_bytes::HexBytes(vec![0u8; 32]),
+            custody_class: "software-file".into(),
+            suspected_compromise_from_seq: None,
+            guardian_set_id: None,
+            recovery_threshold: None,
+            signature: crate::portability::hex_bytes::HexBytes(vec![0xab_u8; 64]),
+        });
+
+        let dst = fresh_conn("lin-forge-dst-");
+        let err = import_full_envelope(&dst, &env, &opts_trusted())
+            .expect_err("a forged lineage record must be rejected");
+        assert!(
+            err.to_string().contains("REJECTED"),
+            "loud fail-closed error, got: {err}"
+        );
+        let n: i64 = dst
+            .query_row("SELECT COUNT(*) FROM agent_lineage", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(n, 0, "a rejected import must leave ZERO lineage rows");
+    }
+
+    /// ★ #2211: a SPINE-LESS v2 bundle (empty `signed_events` — the empty
+    /// chain passes the audit gate trivially) must NOT import forged
+    /// `agent_id` claims verbatim: without `--trust-source` the identity is
+    /// RESTAMPED exactly like the L1 path. Fails on pre-#2211 code (verbatim
+    /// preservation with zero verification).
+    #[test]
+    fn spine_less_bundle_restamps_identity_by_default_2211() {
+        let src = fresh_conn("restamp-src-");
+        let mem = memory_fixture("mem-restamp-2211", "claimed", "forged-agent");
+        crate::storage::insert(&src, &mem).expect("seed src");
+        let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        assert!(
+            env.signed_events.is_empty(),
+            "fixture: the bundle is spine-less"
+        );
+
+        let dst = fresh_conn("restamp-dst-");
+        let report = import_full_envelope(&dst, &env, &opts_default()).expect("import");
+        assert_eq!(report.restamped, 1, "the restamp is counted");
+        let got = crate::storage::get(&dst, "mem-restamp-2211")
+            .expect("get")
+            .expect("row landed");
+        assert_eq!(
+            got.metadata.get("agent_id").and_then(|v| v.as_str()),
+            Some("importer"),
+            "the forged agent_id must be restamped with the caller's id"
+        );
+        assert_eq!(
+            got.metadata
+                .get(crate::models::field_names::IMPORTED_FROM_AGENT_ID)
+                .and_then(|v| v.as_str()),
+            Some("forged-agent"),
+            "the original claim is preserved as provenance, not honoured"
+        );
+
+        // The explicit operator flag restores the verbatim posture.
+        let dst2 = fresh_conn("restamp-dst2-");
+        import_full_envelope(&dst2, &env, &opts_trusted()).expect("trusted import");
+        let got2 = crate::storage::get(&dst2, "mem-restamp-2211")
+            .expect("get")
+            .expect("row landed");
+        assert_eq!(
+            got2.metadata.get("agent_id").and_then(|v| v.as_str()),
+            Some("forged-agent"),
+            "--trust-source preserves the source identity verbatim"
+        );
+    }
+
+    /// #2211: imported rows are REMOTE-ADMITTED — the destination's own
+    /// vector-clock component is NOT advanced (mirrors `insert_if_newer`).
+    /// Fails on pre-#2211 code (`storage::insert` stamped the local clock).
+    #[test]
+    fn imported_rows_do_not_bump_local_vector_clock_2211() {
+        use crate::models::field_names;
+        let src = fresh_conn("clock-src-");
+        // Seed WITHOUT the local-authorship stamp so the exported metadata
+        // carries NO version vector at all.
+        crate::storage::insert_imported(
+            &src,
+            &memory_fixture("mem-clock-2211", "clockless", "alice"),
+        )
+        .expect("seed src");
+        let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+
+        let dst = fresh_conn("clock-dst-");
+        import_full_envelope(&dst, &env, &opts_trusted()).expect("import");
+        let got = crate::storage::get(&dst, "mem-clock-2211")
+            .expect("get")
+            .expect("row landed");
+        assert!(
+            got.metadata.get(field_names::VERSION_VECTOR).is_none(),
+            "a remote-admitted row must not gain a destination clock component, got: {}",
+            got.metadata
+        );
+    }
+
+    /// ★ #2211: a `(title, namespace)` collision with an EXISTING destination
+    /// row (different id) must NOT silently clobber the destination's durable
+    /// text — the default `Version` disposition suffixes the INCOMING title.
+    /// Fails on pre-#2211 code (`storage::insert`'s upsert-merge overwrote
+    /// the destination row's content).
+    #[test]
+    fn title_collision_does_not_clobber_dest_row_2211() {
+        let src = fresh_conn("clobber-src-");
+        let mut incoming = memory_fixture("mem-incoming-2211", "shared title", "alice");
+        incoming.content = "bundle content".into();
+        crate::storage::insert(&src, &incoming).expect("seed src");
+        let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+
+        let dst = fresh_conn("clobber-dst-");
+        let mut existing = memory_fixture("mem-existing-2211", "shared title", "bob");
+        existing.content = "destination content".into();
+        crate::storage::insert(&dst, &existing).expect("seed dst");
+
+        let report = import_full_envelope(&dst, &env, &opts_trusted()).expect("import");
+        assert_eq!(report.memories, 1);
+        let kept = crate::storage::get(&dst, "mem-existing-2211")
+            .expect("get")
+            .expect("dest row survives");
+        assert_eq!(
+            kept.content, "destination content",
+            "the destination row's durable text must NOT be clobbered"
+        );
+        let landed = crate::storage::get(&dst, "mem-incoming-2211")
+            .expect("get")
+            .expect("incoming row landed");
+        assert_eq!(
+            landed.title, "shared title (2)",
+            "the incoming title is version-suffixed (never-clobber default)"
+        );
+
+        // `--on-conflict error` refuses + skips the colliding row.
+        let dst2 = fresh_conn("clobber-dst2-");
+        crate::storage::insert(&dst2, &existing).expect("seed dst2");
+        let mut opts = opts_trusted();
+        opts.on_conflict = ConflictMode::Error;
+        let report2 = import_full_envelope(&dst2, &env, &opts).expect("import");
+        assert_eq!(report2.conflicts_skipped, 1, "the skip is counted");
+        assert!(
+            crate::storage::get(&dst2, "mem-incoming-2211")
+                .expect("get")
+                .is_none(),
+            "the colliding row is refused under error mode"
+        );
+    }
+
+    /// ★ #2210: the envelope gate refuses a NEWER `db_schema_version` and a
+    /// non-"2" `spec_version` loudly (fail-closed) instead of partially
+    /// ingesting. Fails on pre-#2210 code (neither value was checked).
+    #[test]
+    fn newer_producer_envelope_is_refused_2210() {
+        let src = fresh_conn("newer-src-");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        env.db_schema_version += 1_000;
+        let dst = fresh_conn("newer-dst-");
+        let err = import_full_envelope(&dst, &env, &opts_trusted())
+            .expect_err("a newer-schema bundle must be refused");
+        assert!(err.to_string().contains("db_schema_version"), "got: {err}");
+
+        let mut env2 = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        env2.spec_version = "3".into();
+        let err2 = import_full_envelope(&dst, &env2, &opts_trusted())
+            .expect_err("a spec_version-3 bundle must be refused");
+        assert!(err2.to_string().contains("spec_version"), "got: {err2}");
+    }
+
+    /// ★ #2210: the strict envelope parse refuses an unknown top-level
+    /// record class (a future spec's class array must never be silently
+    /// dropped). Fails on pre-#2210 code (no `deny_unknown_fields`).
+    #[test]
+    fn unknown_record_class_is_refused_at_parse_2210() {
+        let src = fresh_conn("unknown-src-");
+        let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        let mut value = serde_json::to_value(&env).expect("to_value");
+        value
+            .as_object_mut()
+            .expect("object")
+            .insert("future_class".into(), serde_json::json!([{"x": 1}]));
+        let parsed: std::result::Result<ExportEnvelope, _> = serde_json::from_value(value);
+        assert!(
+            parsed.is_err(),
+            "an unknown top-level class must refuse to parse, not be dropped"
         );
     }
 }

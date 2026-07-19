@@ -143,7 +143,20 @@ fn full_envelope_round_trips_every_signed_class_byte_exact() {
 
     // Import into a FRESH destination.
     let dst = fresh_db("dst-");
-    let report = import::import_full_envelope(&dst, &parsed).expect("import");
+    // `trust_source: true` is the explicit
+    // operator-trusted-backup posture (#2211): the byte-exact identity
+    // round-trip below (`agent_id` preserved verbatim) is EARNED by the
+    // flag, not granted by default — the default restamps like L1.
+    let report = import::import_full_envelope(
+        &dst,
+        &parsed,
+        &import::ImportOptions {
+            trust_source: true,
+            caller_agent_id: "importer".into(),
+            ..import::ImportOptions::default()
+        },
+    )
+    .expect("import");
 
     // Every class landed.
     assert_eq!(report.memories, 1, "memories count");
