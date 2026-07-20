@@ -6503,7 +6503,9 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
 /// append of the daemon's life. Inherits the emitter's own gating: with no
 /// enrolled witness key the emission is a no-op (byte-identical legacy
 /// shutdown). The caller must treat any witness/checkpoint failure as an
-/// uncertified shutdown.
+/// uncertified shutdown. A failure can leave a witness checkpoint or
+/// off-table anchor partially committed; neither is a clean-shutdown claim,
+/// and both remain available for operator triage and idempotent recovery.
 ///
 /// # Errors
 /// Returns an error when final witness emission or the WAL checkpoint fails.
