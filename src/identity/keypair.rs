@@ -473,6 +473,34 @@ where
     })
 }
 
+/// Load only an agent's public verifying key from `<agent_id>.pub`.
+///
+/// This path never opens or materializes the sibling private key. Use it for
+/// verification, trust-anchor export, and other read-only identity flows.
+///
+/// # Errors
+/// Returns an error when the agent-id shape or public-key file is invalid.
+pub fn load_public(agent_id: &str, dir: &Path) -> Result<VerifyingKey> {
+    // #977 — shape-only here; the daemon loads its own keypair under
+    // the reserved label `DAEMON_KEYPAIR_LABEL = "daemon"` and must
+    // continue to succeed. Wire-routed callers validate at entry points.
+    validate::validate_agent_id_shape(agent_id)?;
+    let pub_path = agent_pub_path(dir, agent_id);
+    let pub_bytes = fs::read(&pub_path)
+        .with_context(|| format!("reading public key {}", pub_path.display()))?;
+    if pub_bytes.len() != PUBLIC_KEY_LEN {
+        bail!(
+            "public key {} has {} bytes, expected {PUBLIC_KEY_LEN}",
+            pub_path.display(),
+            pub_bytes.len()
+        );
+    }
+    let mut pub_arr = [0u8; PUBLIC_KEY_LEN];
+    pub_arr.copy_from_slice(&pub_bytes);
+    VerifyingKey::from_bytes(&pub_arr)
+        .with_context(|| format!("decoding public key {}", pub_path.display()))
+}
+
 /// Load `agent_id`'s keypair from `dir`.
 ///
 /// The public file must exist (errors otherwise). The private file is
@@ -497,34 +525,9 @@ where
 /// commercial AgenticMem layer's responsibility — see the
 /// "Hardware-backed key storage" section above).
 pub fn load(agent_id: &str, dir: &Path) -> Result<AgentKeypair> {
-    // #977 — shape-only here; the daemon loads its own keypair under
-    // the reserved label `DAEMON_KEYPAIR_LABEL = "daemon"` and must
-    // continue to succeed. Wire-routed callers (CLI `identity load`,
-    // MCP `agent` tool) validate at their entry point via
-    // [`crate::validate::validate_agent_id`] (which rejects reserved
-    // names) before reaching here.
-    validate::validate_agent_id_shape(agent_id)?;
+    let public = load_public(agent_id, dir)?;
     let pub_path = agent_pub_path(dir, agent_id);
     let priv_path = dir.join(format!("{agent_id}{PRIV_SUFFIX}"));
-
-    let pub_bytes = fs::read(&pub_path)
-        .with_context(|| format!("reading public key {}", pub_path.display()))?;
-    if pub_bytes.len() != PUBLIC_KEY_LEN {
-        bail!(
-            "public key {} has {} bytes, expected {PUBLIC_KEY_LEN}",
-            pub_path.display(),
-            pub_bytes.len()
-        );
-    }
-    let mut pub_arr = [0u8; PUBLIC_KEY_LEN];
-    pub_arr.copy_from_slice(&pub_bytes);
-    // COVERAGE: with_context closure (line 218) reachable when the
-    //           32-byte file decodes into an invalid Edwards-curve
-    //           point. The load_returns_decode_context_for_corrupt_public_key
-    //           test exercises this with the all-FF input; whether
-    //           dalek 2.x accepts that input or not is version-bound.
-    let public = VerifyingKey::from_bytes(&pub_arr)
-        .with_context(|| format!("decoding public key {}", pub_path.display()))?;
 
     // v0.7.0 S4-LOW1 — refuse to load a `.priv` whose Unix mode bits
     // grant any group/other access. Only fire when the file exists;

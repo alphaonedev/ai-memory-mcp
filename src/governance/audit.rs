@@ -1276,8 +1276,8 @@ pub fn load_enrolled_witness_pubkey() -> Result<Option<VerifyingKey>> {
     if !dir.exists() {
         return Ok(None);
     }
-    match crate::identity::keypair::load(WITNESS_KEY_LABEL, &dir) {
-        Ok(kp) => Ok(Some(kp.public)),
+    match crate::identity::keypair::load_public(WITNESS_KEY_LABEL, &dir) {
+        Ok(public) => Ok(Some(public)),
         Err(_) => Ok(None),
     }
 }
@@ -1450,8 +1450,8 @@ fn load_enrolled_role_pubkey(
     if !dir.exists() {
         return Ok(None);
     }
-    match crate::identity::keypair::load(label, &dir) {
-        Ok(kp) => Ok(Some(kp.public)),
+    match crate::identity::keypair::load_public(label, &dir) {
+        Ok(public) => Ok(Some(public)),
         Err(_) => Ok(None),
     }
 }
