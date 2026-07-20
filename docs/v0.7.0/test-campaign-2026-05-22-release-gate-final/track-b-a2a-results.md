@@ -3,6 +3,12 @@ layout: doc
 ---
 # Track B — A2A Non-Corpus Regression Results (2026-05-22)
 
+> Historical record: the `signed_events_dlq` replay claims below describe a
+> v0.7 test recipe and are superseded for v1.0.0. The v1.0.0 contract is
+> evidence retention in the chain, DLQ, or durable spool for operator
+> disposition; there is no automatic replay path or replay CLI, and DLQ
+> timestamps remain `TEXT`.
+
 Track B re-verifies the 8 A2A non-corpus scenarios from the
 `2026-05-19` campaign against the post-#1013 + post-22-issue-fix
 binary `d4b60aa5b8…6b4ef3e` (commit `fd172f2cf`). The scenarios were

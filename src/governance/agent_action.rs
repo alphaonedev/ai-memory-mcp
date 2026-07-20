@@ -1237,8 +1237,8 @@ pub fn check_agent_action_no_audit_cached(
 /// audit write to a background tokio task with its OWN
 /// `Connection` (SQLite WAL allows parallel writers).
 ///
-/// On Allow / Warn paths the queue is NOT touched — the
-/// load-bearing audit emit only happens on `Refuse`.
+/// On Allow / Warn paths the queue is NOT touched — the load-bearing audit
+/// emit happens only for blocking `Refuse` or `Escalate` verdicts.
 ///
 /// # Errors
 ///
@@ -2197,6 +2197,38 @@ mod tests {
         let error = check_agent_action_deferred_cached(&conn, None, "agent:typed", &action, &queue)
             .unwrap_err();
         assert!(error.downcast_ref::<AuditAdmissionError>().is_some());
+    }
+
+    #[test]
+    fn deferred_escalation_is_admitted_to_audit_queue() {
+        let _forensic = forensic_lock();
+        let _no_pubkey = no_operator_pubkey();
+        let conn = fresh_conn();
+        add_rule(
+            &conn,
+            "E-audit",
+            "bash",
+            r#"{"command_substring":"review"}"#,
+            "escalate",
+            true,
+        );
+        let (queue, mut receiver) = crate::governance::deferred_audit::DeferredAuditQueue::new();
+        let action = AgentAction::Bash {
+            command: "review this".into(),
+            cwd: None,
+        };
+
+        let decision =
+            check_agent_action_deferred(&conn, "agent:escalated", &action, &queue).unwrap();
+        assert!(matches!(
+            decision,
+            Decision::Escalate { ref rule_id, .. } if rule_id == "E-audit"
+        ));
+        let event = receiver
+            .try_recv()
+            .expect("blocking escalation must enter the deferred audit queue");
+        assert_eq!(event.agent_id, "agent:escalated");
+        assert_eq!(event.rule_id(), Some("E-audit"));
     }
 
     #[test]

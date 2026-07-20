@@ -96,9 +96,9 @@ fn signed_events_dlq_evidence_row_roundtrips_1046() {
     }
 
     let conn = fresh_db();
-    // Step 1: synthesize a DLQ row (in production this lands when
-    // the chain-write fails). The shape mirrors
-    // `deferred_audit.rs::record_dlq`.
+    // Step 1: synthesize a DLQ row (in production this lands through the
+    // serialized deferred-audit DLQ insertion path when the chain write
+    // fails).
     //
     // #1136: column names updated to match the actual signed_events_dlq
     // schema (PRAGMA table_info: dlq_id, id, agent_id, event_type,

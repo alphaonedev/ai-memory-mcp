@@ -3,6 +3,12 @@ layout: doc
 ---
 # ai-memory v0.7.0 — `attested-cortex` (release notes)
 
+> Historical record: the `signed_events_dlq` TIMESTAMPTZ-promotion and
+> replay-into-chain statements below were superseded before v1.0.0. The
+> authoritative v1.0.0 schema intentionally stores those timestamps as
+> `TEXT`, and v1.0.0 preserves chain-or-DLQ/spool evidence for operator
+> disposition; it ships no automatic replay path or replay CLI.
+
 ## Release procedure (operator-gated, post v0.7.0)
 
 v0.7.0 separates CI verification from publish. `ci.yml` runs on every

@@ -3,6 +3,11 @@ layout: doc
 ---
 # ai-memory v0.7.0 — Release-Gate Final Testing Dossier (2026-05-22)
 
+> Historical record: references below to `signed_events_dlq` replay describe
+> the v0.7 campaign fixture/recipe, not the v1.0.0 product contract. v1.0.0
+> retains chain-or-DLQ/spool evidence for operator disposition and ships no
+> automatic replay path or replay CLI; DLQ timestamps remain `TEXT`.
+
 ## What this is
 
 The release-gate final testing campaign for ai-memory v0.7.0. The branch

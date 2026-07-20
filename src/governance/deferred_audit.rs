@@ -95,8 +95,10 @@ use crate::signed_events::{SignedEvent, append_signed_event_no_tx, payload_hash}
 /// (concurrent writer beat us to the same `sequence` value on the
 /// `idx_signed_events_sequence` UNIQUE index). The BEGIN IMMEDIATE wrap
 /// in `append_signed_event` should make true contention rare; this
-/// retry budget is the safety belt. After exhausting it the event
-/// lands in `signed_events_dlq` so the audit drop is never silent.
+/// retry budget is the safety belt. After exhausting it, the sink attempts
+/// `signed_events_dlq` landing. If that also fails, it returns an explicit
+/// error; journal-backed production delivery retains admitted spool evidence
+/// for a later recovery attempt, so the failure is never silent.
 const APPEND_UNIQUE_RACE_MAX_RETRIES: usize = 5;
 
 /// Delay the first panic retry by this many milliseconds. Retrying a
@@ -2625,6 +2627,13 @@ mod tests {
         }
     }
 
+    fn escalation_decision() -> Decision {
+        Decision::Escalate {
+            rule_id: "E001".to_string(),
+            reason: "operator approval required".to_string(),
+        }
+    }
+
     #[test]
     fn from_refusal_returns_some_for_refuse() {
         let event =
@@ -2633,6 +2642,19 @@ mod tests {
         assert_eq!(event.agent_id, "agent:alice");
         assert_eq!(event.rule_id(), Some("R001"));
         assert_eq!(event.reason(), Some("no writes to secrets/*"));
+    }
+
+    #[test]
+    fn from_refusal_returns_some_for_escalate() {
+        let event = DeferredAuditEvent::from_refusal(
+            "agent:alice",
+            &refusal_action(),
+            &escalation_decision(),
+        )
+        .expect("must be Some for Escalate verdict");
+        assert_eq!(event.agent_id, "agent:alice");
+        assert_eq!(event.rule_id(), Some("E001"));
+        assert_eq!(event.reason(), Some("operator approval required"));
     }
 
     #[test]
@@ -4099,6 +4121,27 @@ mod tests {
             "the refusal must be durably journaled before submit() returns"
         );
         assert_eq!(replayed[0].agent_id, "agent:durable");
+    }
+
+    #[test]
+    fn submit_escalation_with_journal_is_durable_before_return() {
+        let dir = fresh_tempdir();
+        let journal_path = dir.path().join("durable-escalation.journal");
+        let journal = Arc::new(DeferredAuditJournal::open(&journal_path).expect("open journal"));
+        let (queue, _rx) = DeferredAuditQueue::new_with_journal(Some(journal));
+
+        assert!(
+            queue.submit_refusal("agent:escalated", &refusal_action(), &escalation_decision(),)
+        );
+
+        let replayed = DeferredAuditJournal::open(&journal_path)
+            .expect("reopen journal")
+            .replay()
+            .expect("replay");
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].agent_id, "agent:escalated");
+        assert_eq!(replayed[0].rule_id(), Some("E001"));
+        assert_eq!(replayed[0].reason(), Some("operator approval required"));
     }
 
     #[test]
