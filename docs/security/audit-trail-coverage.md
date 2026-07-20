@@ -208,7 +208,7 @@ Before upgrading a Windows installation that has deferred-audit artifacts:
    binary again. v1.0.0 has no offline ACL migration/import command.
 4. After evidence disposition, move—not silently delete—the complete legacy
    journal and `.spool` directory to the forensic holding location.
-5. Start v1.0.0. It atomically creates a new journal, spool, lock, and children
+5. Start v1.0.0. It creates each new journal, spool, lock, and child artifact
    with the protected current-token-owner-only policy. Retain the moved legacy
    evidence according to the site's audit-retention procedure.
 

@@ -594,7 +594,9 @@ impl DeferredAuditJournal {
     /// on stable storage.
     ///
     /// # Errors
-    /// Propagates the serialize / write / fsync IO error.
+    /// Returns an error if serialization or durable admission fails, including
+    /// spool validation, locking, quota/collision checks, publication, writes,
+    /// or file and directory synchronization.
     pub fn append(&self, event: &DeferredAuditEvent) -> Result<()> {
         let payload = event
             .canonical_bytes()
