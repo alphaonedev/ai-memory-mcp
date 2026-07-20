@@ -460,6 +460,12 @@ pub const RETRY_BACKOFFS: &[std::time::Duration] = &[
 /// expectations.
 pub const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Graceful-shutdown budget for already-admitted webhook deliveries. One
+/// delivery may consume four ACK windows plus the retry backoffs (~26.2s), so
+/// this must remain larger than that healthy worst case and below the shipped
+/// systemd stop budget after the other drain phases are included.
+pub(crate) const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// #2032 LM2 — hard ceiling on the webhook ACK response body the daemon
 /// will buffer. The K6 ACK contract is a tiny JSON envelope
 /// (`{"status":"ack","correlation_id":"..."}`), so 64 KiB is generous.
@@ -2295,6 +2301,14 @@ mod tests {
     /// `into_inner` so one panicking test doesn't cascade-fail the
     /// other.
     static SSRF_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn shutdown_budget_covers_one_full_webhook_retry_ladder() {
+        let attempts = u32::try_from(RETRY_BACKOFFS.len() + 1).unwrap();
+        let retry_ladder =
+            ACK_TIMEOUT * attempts + RETRY_BACKOFFS.iter().copied().sum::<std::time::Duration>();
+        assert!(SHUTDOWN_DRAIN_TIMEOUT > retry_ladder);
+    }
 
     #[test]
     fn https_allowed() {

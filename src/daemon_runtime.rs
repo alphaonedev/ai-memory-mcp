@@ -6073,6 +6073,16 @@ fn fatal_shutdown(reason: &'static str) -> anyhow::Error {
     anyhow::Error::new(FatalShutdownError::new(reason))
 }
 
+fn classify_server_failure(error: anyhow::Error) -> anyhow::Error {
+    let detail = format!("{error:#}");
+    tracing::error!(%error, "daemon server setup failed; operator correction required");
+    eprintln!("ai-memory: fatal daemon server setup failure: {detail} (exit 75)");
+    anyhow::Error::new(FatalShutdownError::with_detail(
+        "daemon server setup failed",
+        detail,
+    ))
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) -> Result<()> {
     init_tracing();
@@ -6399,8 +6409,10 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    let subscription_deadline =
+        tokio::time::Instant::now() + crate::subscriptions::SHUTDOWN_DRAIN_TIMEOUT;
     while crate::subscriptions::dispatch_in_flight() != 0 {
-        if tokio::time::Instant::now() >= task_join_deadline {
+        if tokio::time::Instant::now() >= subscription_deadline {
             return Err(fatal_shutdown(
                 "subscription dispatch shutdown deadline exceeded",
             ));
@@ -6443,7 +6455,9 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     // folds them in even though the drainer holds its own connection.
     shutdown_witness_flush_and_checkpoint(&checkpoint_state).await;
 
-    server_result?;
+    if let Err(error) = server_result {
+        return Err(classify_server_failure(error));
+    }
     Ok(())
 }
 
@@ -8213,22 +8227,28 @@ mod tests {
         let unit = std::fs::read_to_string(root.join("packaging/systemd/ai-memory.service"))
             .expect("read packaged systemd unit");
         assert!(unit.contains("KillSignal=SIGINT"));
-        assert!(unit.contains("TimeoutStopSec=60"));
+        assert!(unit.contains("TimeoutStopSec=90"));
         assert!(unit.contains("RestartPreventExitStatus=75"));
 
         let hive =
             std::fs::read_to_string(root.join("deploy/hive-1461/provision/50_federation.sh"))
                 .expect("read hive provisioning script");
         assert!(hive.contains("KillSignal=SIGINT"));
-        assert!(hive.contains("TimeoutStopSec=60"));
+        assert!(hive.contains("TimeoutStopSec=90"));
         assert!(hive.contains("RestartPreventExitStatus=75"));
 
         let digital_ocean =
             std::fs::read_to_string(root.join("deploy/do-1461/provision/50_federation.sh"))
                 .expect("read DigitalOcean provisioning script");
         assert!(digital_ocean.contains("KillSignal=SIGINT"));
-        assert!(digital_ocean.contains("TimeoutStopSec=60"));
+        assert!(digital_ocean.contains("TimeoutStopSec=90"));
         assert!(digital_ocean.contains("RestartPreventExitStatus=75"));
+    }
+
+    #[test]
+    fn server_failures_map_to_non_restarting_fatal_status() {
+        let error = classify_server_failure(anyhow::anyhow!("listener failed"));
+        assert!(error.downcast_ref::<FatalShutdownError>().is_some());
     }
 
     // ----- spawn_gc_loop / spawn_wal_checkpoint_loop --------------------

@@ -117,7 +117,7 @@ Restart=on-failure
 RestartPreventExitStatus=75
 RestartSec=3
 KillSignal=SIGINT
-TimeoutStopSec=60
+TimeoutStopSec=90
 LimitNOFILE=65536
 
 [Install]

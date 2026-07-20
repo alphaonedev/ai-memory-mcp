@@ -68,7 +68,7 @@ Environment=RUST_LOG=ai_memory=info,tower_http=info
 
 # Graceful shutdown: checkpoints WAL before exit
 KillSignal=SIGINT
-TimeoutStopSec=60
+TimeoutStopSec=90
 
 [Install]
 WantedBy=multi-user.target
@@ -858,19 +858,20 @@ The HTTP daemon handles SIGINT (Ctrl+C) gracefully:
 3. Checkpoints the WAL (`PRAGMA wal_checkpoint(TRUNCATE)`)
 4. Exits cleanly
 
-For systemd, use `KillSignal=SIGINT` and `TimeoutStopSec=60`. This covers the
-default 30-second HTTP request grace period plus the bounded background-writer
-and deferred-audit drain phases, leaving time for the final witness/checkpoint
-or the visible exit-75 failure path.
+For systemd, use `KillSignal=SIGINT` and `TimeoutStopSec=90`. This covers the
+default 30-second HTTP request grace period plus the bounded background-writer,
+webhook-delivery, and deferred-audit drain phases, leaving time for the final
+witness/checkpoint or the visible exit-75 failure path.
 
 > **Note:** The HTTP daemon handles SIGINT (Ctrl+C) gracefully with WAL checkpoint. Systemd sends SIGTERM by default -- the service file sets `KillSignal=SIGINT` to ensure clean shutdown.
 
 The daemon exits with status **75 (`EX_TEMPFAIL`)** when it cannot safely drop
 its Tokio runtime. During shutdown this means a background writer or
 deferred-audit drain missed its deadline; the daemon deliberately skips the
-final witness/WAL checkpoint rather than certify a racing writer. During boot,
-the same status can follow a configuration, key/TLS, federation, database, or
-storage initialization error after lifecycle resources may have been created.
+final witness/WAL checkpoint rather than certify a racing writer. During boot
+or serving, the same status can follow a configuration, key/TLS, federation,
+database/storage initialization, listener, or server transport error after
+lifecycle resources may have been created.
 Always use the preceding `fatal daemon bootstrap/shutdown` diagnostic to
 distinguish the cause; do not blindly restart-loop a configuration error.
 
