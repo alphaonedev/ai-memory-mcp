@@ -300,8 +300,8 @@ pub struct DeferredAuditMetrics {
     /// Number of submission attempts. Includes events rejected during durable
     /// journal admission and events not delivered because the receiver closed.
     pub submitted: Arc<AtomicU64>,
-    /// Number of events the drainer successfully appended to
-    /// `signed_events`.
+    /// Number of drainer events terminally resident in `signed_events`,
+    /// whether freshly appended or idempotently observed.
     pub appended: Arc<AtomicU64>,
     /// Number of submit attempts that failed durable journal admission or
     /// channel delivery (drainer dropped / shutdown raced).
@@ -315,8 +315,8 @@ pub struct DeferredAuditMetrics {
     /// terminal panic that exhausts the configured restart budget.
     /// Should be zero in healthy operation.
     pub drainer_panics: Arc<AtomicU64>,
-    /// Cluster-C SEC-3 (issue #767) — number of events that landed in
-    /// the `signed_events_dlq` table after exhausting the
+    /// Cluster-C SEC-3 (issue #767) — number of fresh rows this sink inserted
+    /// into `signed_events_dlq` after exhausting the
     /// `SQLITE_CONSTRAINT_UNIQUE` retry budget or hitting an
     /// unrecoverable non-race error. Surfaced via the capabilities-v3
     /// envelope's `approval.deferred_audit_dlq_size` field (live count
@@ -339,7 +339,8 @@ impl DeferredAuditMetrics {
         self.submitted.load(Ordering::Relaxed)
     }
 
-    /// Number of events successfully chain-logged since process boot.
+    /// Number of events observed terminally resident in `signed_events` since
+    /// process boot, whether freshly appended or already present.
     #[must_use]
     pub fn appended_count(&self) -> u64 {
         self.appended.load(Ordering::Relaxed)
@@ -351,7 +352,8 @@ impl DeferredAuditMetrics {
         self.send_failures.load(Ordering::Relaxed)
     }
 
-    /// Number of append failures (SQLite error).
+    /// Number of drainer events accounted as append failures, including sink
+    /// errors, DLQ residence, and exhausted panic-restart budgets.
     #[must_use]
     pub fn append_failure_count(&self) -> u64 {
         self.append_failures.load(Ordering::Relaxed)
@@ -363,8 +365,8 @@ impl DeferredAuditMetrics {
         self.drainer_panics.load(Ordering::Relaxed)
     }
 
-    /// Cluster-C SEC-3 — cumulative number of events that landed in
-    /// `signed_events_dlq` since process boot.
+    /// Cluster-C SEC-3 — cumulative number of fresh `signed_events_dlq` rows
+    /// inserted by this sink since process boot.
     #[must_use]
     pub fn dlq_landed_count(&self) -> u64 {
         self.dlq_landed.load(Ordering::Relaxed)
