@@ -109,6 +109,10 @@ const PANIC_RETRY_BACKOFF_BASE_MS: u64 = 10;
 /// Cap panic-retry backoff so a transiently repaired sink is retried while
 /// persistent failure remains scheduler-friendly and operationally visible.
 const PANIC_RETRY_BACKOFF_MAX_MS: u64 = 1_000;
+/// Production retry budget for one unresolved in-flight occurrence. Three
+/// retries after the initial attempt preserve prefix order without allowing a
+/// permanent sink failure to head-of-line block the queue indefinitely.
+const SUPERVISOR_MAX_RETRIES: u32 = 3;
 
 /// Defensive upper bound for one journal frame. Refusal payloads are normally
 /// only a few KiB; bounding recovery prevents a corrupt length prefix from
@@ -306,6 +310,10 @@ pub struct DeferredAuditMetrics {
     /// Number of drainer events terminally resident in `signed_events`,
     /// whether freshly appended or idempotently observed.
     pub appended: Arc<AtomicU64>,
+    /// Number of submitted occurrences whose terminal chain/DLQ residence and
+    /// required acknowledgement completed. This is the shutdown drain
+    /// accounting counter; unresolved retry attempts never advance it.
+    pub completed: Arc<AtomicU64>,
     /// Number of submit attempts that failed durable journal admission or
     /// channel delivery (drainer dropped / shutdown raced).
     pub send_failures: Arc<AtomicU64>,
@@ -347,6 +355,10 @@ impl DeferredAuditMetrics {
     #[must_use]
     pub fn appended_count(&self) -> u64 {
         self.appended.load(Ordering::Relaxed)
+    }
+
+    fn completed_count(&self) -> u64 {
+        self.completed.load(Ordering::Relaxed)
     }
 
     /// Number of durable-admission or channel-delivery failures.
@@ -783,6 +795,10 @@ impl DeferredAuditJournal {
         usage: &mut SpoolUsage,
     ) -> Result<()> {
         let Some(spool_path) = self.find_spool_path(occurrence_id)? else {
+            // A preceding acknowledgement may have unlinked the entry and
+            // then failed its directory fsync. Repeat the durability barrier
+            // before treating the missing path as acknowledged.
+            self.sync_spool_dir()?;
             self.verify_lock_identity()?;
             return Ok(());
         };
@@ -793,6 +809,7 @@ impl DeferredAuditJournal {
                     .downcast_ref::<std::io::Error>()
                     .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound) =>
             {
+                self.sync_spool_dir()?;
                 self.verify_lock_identity()?;
                 return Ok(());
             }
@@ -1821,7 +1838,7 @@ pub fn recover_deferred_audit(journal_path: &Path, db_path: &Path) -> Result<usi
             Err(e) => {
                 unresolved = true;
                 tracing::warn!("recover_deferred_audit: retaining undecodable record: {e:#}");
-                continue;
+                break;
             }
         };
         let already_chained = if let Some(occurrence_id) = &ev.occurrence_id {
@@ -1834,7 +1851,7 @@ pub fn recover_deferred_audit(journal_path: &Path, db_path: &Path) -> Result<usi
                 Err(error) => {
                     unresolved = true;
                     tracing::error!(%occurrence_id, %error, "recovery occurrence-id collision");
-                    continue;
+                    break;
                 }
             }
         } else {
@@ -1889,6 +1906,7 @@ pub fn recover_deferred_audit(journal_path: &Path, db_path: &Path) -> Result<usi
                     occurrence_id = ?ev.occurrence_id,
                     "recover_deferred_audit: sink append failed; retaining journal: {e:#}"
                 );
+                break;
             }
         }
     }
@@ -2502,6 +2520,7 @@ pub fn spawn_drainer_task<S: DeferredAuditSink + 'static>(
             match sink.append(&event) {
                 Ok(AppendOutcome::Appended) => {
                     metrics.appended.fetch_add(1, Ordering::Relaxed);
+                    metrics.completed.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(AppendOutcome::DlqLanded) => {
                     // Cluster-C SEC-3: the sink established the event's
@@ -2513,6 +2532,7 @@ pub fn spawn_drainer_task<S: DeferredAuditSink + 'static>(
                     // the SAME signal regardless of which bucket
                     // the row went into.
                     metrics.append_failures.fetch_add(1, Ordering::Relaxed);
+                    metrics.completed.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         "deferred_audit drainer: event landed in DLQ \
                          (audit chain row NOT advanced; chain-aware operator \
@@ -2521,15 +2541,10 @@ pub fn spawn_drainer_task<S: DeferredAuditSink + 'static>(
                 }
                 Err(e) => {
                     metrics.append_failures.fetch_add(1, Ordering::Relaxed);
-                    tracing::error!(
-                        "deferred_audit drainer: sink.append failed before end-to-end \
-                         completion; terminal DB residence may already exist: {:#}",
-                        e
+                    panic!(
+                        "deferred_audit drainer: sink.append failed; refusing to advance \
+                         beyond the unresolved prefix occurrence: {e:#}"
                     );
-                    // We don't requeue — the channel is single-consumer.
-                    // The supervisor's panic-restart path is for sink
-                    // PANICS (poisoned state); soft errors here are
-                    // recorded and the loop continues.
                 }
             }
         }
@@ -2586,11 +2601,13 @@ where
                 match append_result {
                     Ok(Ok(AppendOutcome::Appended)) => {
                         metrics.appended.fetch_add(1, Ordering::Relaxed);
+                        metrics.completed.fetch_add(1, Ordering::Relaxed);
                         consecutive_restarts = 0;
                         break;
                     }
                     Ok(Ok(AppendOutcome::DlqLanded)) => {
                         metrics.append_failures.fetch_add(1, Ordering::Relaxed);
+                        metrics.completed.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(
                             "deferred_audit drainer: event landed in DLQ \
                              (audit chain row NOT advanced; chain-aware operator \
@@ -2601,12 +2618,23 @@ where
                     }
                     Ok(Err(e)) => {
                         metrics.append_failures.fetch_add(1, Ordering::Relaxed);
+                        if consecutive_restarts == max_restarts {
+                            panic!(
+                                "deferred_audit supervisor: sink remained unresolved and \
+                                 exhausted max_restarts={max_restarts}; refusing to advance \
+                                 beyond the in-flight occurrence: {e:#}"
+                            );
+                        }
+                        consecutive_restarts += 1;
+                        is_retry = true;
                         tracing::error!(
-                            "deferred_audit drainer: sink.append failed before end-to-end \
-                             completion; terminal DB residence may already exist: {e:#}"
+                            retry = consecutive_restarts,
+                            max_restarts,
+                            "deferred_audit supervisor: sink append unresolved; rebuilding \
+                             sink and retrying the same in-flight occurrence: {e:#}"
                         );
-                        consecutive_restarts = 0;
-                        break;
+                        sink = make_sink();
+                        tokio::time::sleep(panic_retry_backoff(consecutive_restarts)).await;
                     }
                     Err(_) => {
                         metrics.drainer_panics.fetch_add(1, Ordering::Relaxed);
@@ -2691,8 +2719,9 @@ const DRAIN_POLL_INTERVAL: std::time::Duration =
 const DRAIN_POLL_INTERVAL_MILLIS: u64 = 10;
 
 /// Wait (bounded) until every event submitted to the queue has been
-/// accounted for by the drainer — appended to `signed_events`, landed in
-/// the DLQ / counted as an append failure, or recorded as a send failure.
+/// terminally completed by the drainer — acknowledged after proven
+/// `signed_events`/DLQ residence, or recorded as a send failure. Unresolved
+/// sink attempts do not count as completion.
 ///
 /// This is the daemon shutdown-path counterpart to [`close_and_flush`].
 /// Unlike `close_and_flush`, it does NOT require the producer-side senders
@@ -2726,16 +2755,13 @@ pub async fn drain_pending(metrics: &DeferredAuditMetrics, timeout: std::time::D
     }
 }
 
-/// Number of submitted events the drainer has finished with — every
-/// received event bumps exactly one of `appended` / `append_failures`
-/// (the latter also covers DLQ landings), and a closed receiver bumps
-/// `send_failures`. The sum equalling `submitted` means the backlog is
-/// fully processed.
+/// Number of submitted events the drainer has terminally finished with.
+/// `completed` covers acknowledged chain/DLQ residence; a closed receiver
+/// bumps `send_failures`. Unresolved retries never make a shutdown look clean.
 #[must_use]
 fn drain_accounted(metrics: &DeferredAuditMetrics) -> u64 {
     metrics
-        .appended_count()
-        .saturating_add(metrics.append_failure_count())
+        .completed_count()
         .saturating_add(metrics.send_failure_count())
 }
 
@@ -2764,7 +2790,7 @@ pub fn install_deferred_audit_drainer(db_path: &Path) -> (DeferredAuditQueue, Jo
             SqliteSignedEventsSink::with_metrics(db_path_buf.clone(), metrics_for_factory.clone())
         },
         metrics,
-        u32::MAX,
+        SUPERVISOR_MAX_RETRIES,
     );
     (queue, supervisor)
 }
@@ -2837,7 +2863,7 @@ pub fn install_deferred_audit_drainer_with_journal(
             )
         },
         metrics,
-        u32::MAX,
+        SUPERVISOR_MAX_RETRIES,
     );
     (queue, supervisor)
 }
@@ -3070,6 +3096,18 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct AlwaysErrorSink {
+        attempts: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl DeferredAuditSink for AlwaysErrorSink {
+        fn append(&mut self, event: &DeferredAuditEvent) -> Result<AppendOutcome> {
+            self.attempts.lock().unwrap().push(event.agent_id.clone());
+            anyhow::bail!("always-error sink")
+        }
+    }
+
     struct PanicAfterCommitSqliteSink {
         inner: SqliteSignedEventsSink,
         calls: Arc<AtomicU64>,
@@ -3141,10 +3179,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drainer_continues_after_sink_error() {
-        // Sink errors on the second call; the drainer should
-        // record the error in metrics and proceed to handle
-        // subsequent events.
+    async fn bare_drainer_stops_at_sink_error_without_processing_suffix() {
+        // The bare test drainer has no sink factory or retry budget, so it
+        // must terminate visibly rather than let a suffix overtake an
+        // unresolved prefix occurrence.
         let (queue, rx) = DeferredAuditQueue::new();
         let metrics = queue.metrics();
         let mut sink = MockSink::default();
@@ -3162,12 +3200,86 @@ mod tests {
             queue.submit(event);
         }
         drop(queue);
-        let _ = handle.await.unwrap();
-        // Event 0 and 2 landed; event 1 hit the error.
+        let error = handle
+            .await
+            .expect_err("unresolved sink error must terminate");
+        assert!(error.is_panic());
+        // Event 0 landed, event 1 failed, and event 2 was never attempted.
         let recorded = recorded.lock().unwrap();
-        assert_eq!(recorded.len(), 2);
-        assert_eq!(metrics.appended_count(), 2);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].agent_id, "agent:0");
+        assert_eq!(metrics.appended_count(), 1);
         assert_eq!(metrics.append_failure_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn supervisor_retries_soft_error_without_reordering_suffix() {
+        let (queue, rx) = DeferredAuditQueue::new();
+        let metrics = queue.metrics();
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let call_count = Arc::new(AtomicU64::new(0));
+        let recorded_for_factory = recorded.clone();
+        let call_count_for_factory = call_count.clone();
+        let supervisor = spawn_supervised_drainer(
+            rx,
+            move || MockSink {
+                recorded: recorded_for_factory.clone(),
+                error_on: Some(0),
+                call_count: call_count_for_factory.clone(),
+                ..MockSink::default()
+            },
+            metrics.clone(),
+            SUPERVISOR_MAX_RETRIES,
+        );
+        for agent_id in ["agent:first", "agent:second"] {
+            queue.submit(
+                DeferredAuditEvent::from_refusal(agent_id, &refusal_action(), &refusal_decision())
+                    .unwrap(),
+            );
+        }
+        drop(queue);
+        supervisor.await.unwrap();
+
+        let agents: Vec<_> = recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| event.agent_id.clone())
+            .collect();
+        assert_eq!(agents, ["agent:first", "agent:second"]);
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+        assert_eq!(metrics.append_failure_count(), 1);
+        assert_eq!(metrics.appended_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn supervisor_soft_error_exhaustion_never_attempts_suffix() {
+        let (queue, rx) = DeferredAuditQueue::new();
+        let metrics = queue.metrics();
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let attempts_for_factory = attempts.clone();
+        let supervisor = spawn_supervised_drainer(
+            rx,
+            move || AlwaysErrorSink {
+                attempts: attempts_for_factory.clone(),
+            },
+            metrics.clone(),
+            SUPERVISOR_MAX_RETRIES,
+        );
+        for agent_id in ["agent:blocked", "agent:suffix"] {
+            queue.submit(
+                DeferredAuditEvent::from_refusal(agent_id, &refusal_action(), &refusal_decision())
+                    .unwrap(),
+            );
+        }
+        drop(queue);
+        let error = supervisor
+            .await
+            .expect_err("retry exhaustion must terminate visibly");
+        assert!(error.is_panic());
+        assert_eq!(attempts.lock().unwrap().as_slice(), ["agent:blocked"; 4]);
+        assert_eq!(metrics.append_failure_count(), 4);
+        assert_eq!(metrics.appended_count(), 0);
     }
 
     // -----------------------------------------------------------------
@@ -3505,14 +3617,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_pending_counts_append_failures_as_accounted() {
-        // A sink that always errors still "accounts" for the event via
-        // append_failures, so drain_pending must terminate (the audit row
-        // is lost/DLQ'd but the shutdown path must not hang on it).
+    async fn drain_pending_does_not_count_unresolved_failure_as_complete() {
         let (queue, rx) = DeferredAuditQueue::new();
         let metrics = queue.metrics();
-        // Factory yields a sink that errors on its first (only) call, so
-        // the event is "accounted" via append_failures rather than appended.
         let supervisor = spawn_supervised_drainer(
             rx,
             move || MockSink {
@@ -3522,22 +3629,22 @@ mod tests {
                 call_count: Arc::new(AtomicU64::new(0)),
             },
             metrics.clone(),
-            u32::MAX,
+            0,
         );
         let event =
             DeferredAuditEvent::from_refusal("agent:err", &refusal_action(), &refusal_decision())
                 .unwrap();
         queue.submit(event);
         let hook_held = queue.clone();
-        let drained = drain_pending(&metrics, std::time::Duration::from_secs(5)).await;
+        let drained = drain_pending(&metrics, std::time::Duration::from_millis(100)).await;
         assert!(
-            drained,
-            "append failures count as accounted — must not hang"
+            !drained,
+            "an unresolved occurrence must never make the queue look drained"
         );
         assert_eq!(metrics.append_failure_count(), 1);
         drop(hook_held);
         drop(queue);
-        let _ = supervisor.await;
+        assert!(supervisor.await.unwrap_err().is_panic());
     }
 
     #[tokio::test]
@@ -4048,7 +4155,7 @@ mod tests {
             rx,
             move || SqliteSignedEventsSink::new(bad_path.clone()),
             metrics.clone(),
-            u32::MAX,
+            0,
         );
         let event =
             DeferredAuditEvent::from_refusal("agent:bad", &refusal_action(), &refusal_decision())
@@ -4056,7 +4163,7 @@ mod tests {
         queue.submit(event);
         // Allow the drainer to attempt the append.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        close_and_flush(queue, supervisor).await.unwrap();
+        assert!(close_and_flush(queue, supervisor).await.is_err());
         assert!(
             metrics.append_failure_count() >= 1,
             "append failure on bad path must be recorded; got {}",
