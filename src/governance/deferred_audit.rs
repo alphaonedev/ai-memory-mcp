@@ -1026,7 +1026,8 @@ fn spool_ancestor_permissions_trusted(
     if mode & 0o002 != 0 {
         // Sticky containment prevents unrelated users from renaming an entry
         // they do not own when the directory owner is root or the daemon.
-        return mode & libc::S_ISVTX != 0 && (owner_uid == 0 || owner_uid == effective_uid);
+        return mode & u32::from(libc::S_ISVTX) != 0
+            && (owner_uid == 0 || owner_uid == effective_uid);
     }
     // Group-write is accepted only as the daemon owner's explicit primary
     // group trust grant. Foreign/supplementary groups are not trusted.
