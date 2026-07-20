@@ -115,7 +115,8 @@ ExecStart=$BIN serve \\
   --shutdown-grace-secs 30
 Restart=on-failure
 RestartSec=3
-TimeoutStopSec=45
+KillSignal=SIGINT
+TimeoutStopSec=60
 LimitNOFILE=65536
 
 [Install]

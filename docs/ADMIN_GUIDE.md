@@ -864,15 +864,20 @@ or the visible exit-75 failure path.
 
 > **Note:** The HTTP daemon handles SIGINT (Ctrl+C) gracefully with WAL checkpoint. Systemd sends SIGTERM by default -- the service file sets `KillSignal=SIGINT` to ensure clean shutdown.
 
-If a background writer or deferred-audit drain cannot quiesce within the
-shutdown deadline, the daemon deliberately skips the final witness/WAL
-checkpoint and exits with status **75 (`EX_TEMPFAIL`)**. This prevents an
-uncancellable SQLite/filesystem operation from racing a falsely certified
-final audit head. The deferred-audit occurrence spool is fsynced before queue
-admission and is replayed idempotently on the next boot. Treat exit 75 as a
-storage-health signal: preserve the database and adjacent
+The daemon exits with status **75 (`EX_TEMPFAIL`)** when it cannot safely drop
+its Tokio runtime. During shutdown this means a background writer or
+deferred-audit drain missed its deadline; the daemon deliberately skips the
+final witness/WAL checkpoint rather than certify a racing writer. During boot,
+the same status can follow a configuration, key/TLS, federation, database, or
+storage initialization error after lifecycle resources may have been created.
+Always use the preceding `fatal daemon bootstrap/shutdown` diagnostic to
+distinguish the cause; do not blindly restart-loop a configuration error.
+
+For a shutdown deadline, preserve the database and adjacent
 `.deferred-audit.journal.spool`, inspect disk/lock health, and restart only
-after the underlying stall is cleared.
+after the stall is cleared. The occurrence spool is fsynced before queue
+admission and replayed idempotently on the next boot. For a bootstrap failure,
+correct the named configuration/credential/storage error before restarting.
 
 The MCP server exits cleanly when stdin closes (AI client session ends).
 

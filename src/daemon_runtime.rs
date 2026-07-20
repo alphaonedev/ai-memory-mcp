@@ -8199,6 +8199,21 @@ mod tests {
         .expect("tracked blocking child must release its guard");
     }
 
+    #[test]
+    fn shipped_systemd_units_preserve_graceful_shutdown_budget() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let unit = std::fs::read_to_string(root.join("packaging/systemd/ai-memory.service"))
+            .expect("read packaged systemd unit");
+        assert!(unit.contains("KillSignal=SIGINT"));
+        assert!(unit.contains("TimeoutStopSec=60"));
+
+        let hive =
+            std::fs::read_to_string(root.join("deploy/hive-1461/provision/50_federation.sh"))
+                .expect("read hive provisioning script");
+        assert!(hive.contains("KillSignal=SIGINT"));
+        assert!(hive.contains("TimeoutStopSec=60"));
+    }
+
     // ----- spawn_gc_loop / spawn_wal_checkpoint_loop --------------------
 
     #[tokio::test(start_paused = true)]
