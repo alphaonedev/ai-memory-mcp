@@ -65,9 +65,11 @@
 //!
 //! [`DeferredAuditQueue::close_and_flush`] drops the sender and
 //! awaits the supervisor task to terminate. The drainer drains every
-//! still-buffered event before exiting; pending events MUST land in
-//! `signed_events` before the daemon's tokio runtime is torn down,
-//! or the chain-log property is broken.
+//! still-buffered event before exiting; each pending event MUST reach
+//! terminal accounting in `signed_events`, `signed_events_dlq`, or an
+//! explicit counted failure before the daemon's tokio runtime is torn
+//! down. Callers that require every event to advance the audit chain
+//! must additionally require zero append and send failures.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -248,8 +250,9 @@ impl DeferredAuditEvent {
     /// # Errors
     ///
     /// Returns an error if the bytes are not the canonical JSON shape
-    /// (missing field, undecodable variant, malformed timestamp) — the
-    /// replay loop treats that as a corrupt trailing record and stops.
+    /// (missing field, undecodable variant, malformed timestamp). Recovery
+    /// propagates that error and preserves the durable evidence, failing
+    /// closed; only a physically incomplete trailing legacy frame is ignored.
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self> {
         let v: serde_json::Value =
             serde_json::from_slice(bytes).context("from_canonical_bytes: parse json")?;
@@ -2265,10 +2268,10 @@ pub fn spawn_drainer_task<S: DeferredAuditSink + 'static>(
                     metrics.appended.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(AppendOutcome::DlqLanded) => {
-                    // Cluster-C SEC-3: the sink already captured the
-                    // event in `signed_events_dlq` and bumped its
-                    // own dlq_landed metric (if wired). We also bump
-                    // `append_failures` so existing dashboards that
+                    // Cluster-C SEC-3: the sink established the event's
+                    // residence in `signed_events_dlq`; a fresh insert also
+                    // bumped its own dlq_landed metric (if wired). We bump
+                    // `append_failures` here so existing dashboards that
                     // alert on a non-zero append_failures count
                     // still surface DLQ landings — operators read
                     // the SAME signal regardless of which bucket
@@ -4549,6 +4552,41 @@ mod tests {
                 .any(|cause| cause.to_string().contains("nontrivial macOS extended ACL"))
         );
         assert!(journal_path.exists(), "untrusted journal must be preserved");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn journal_macos_rejects_extended_acl_on_existing_spool_without_mutation() {
+        use std::process::Command;
+
+        let dir = fresh_tempdir();
+        let journal_path = dir.path().join("extended-spool.journal");
+        let journal = DeferredAuditJournal::open(&journal_path).unwrap();
+        let spool_dir = journal.spool_dir.clone();
+        let sentinel = spool_dir.join("preserve.pending");
+        drop(journal);
+        std::fs::write(&sentinel, b"untrusted evidence").unwrap();
+        let status = Command::new("chmod")
+            .args(["+a", "everyone allow add_file,delete_child"])
+            .arg(&spool_dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let error = DeferredAuditJournal::open(&journal_path)
+            .err()
+            .expect("extended ACL spool directory must fail closed");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("nontrivial macOS extended ACL"))
+        );
+        assert!(spool_dir.exists(), "untrusted spool must be preserved");
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"untrusted evidence",
+            "untrusted spool contents must not be repaired or deleted"
+        );
     }
 
     #[cfg(target_os = "macos")]
