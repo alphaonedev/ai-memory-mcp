@@ -408,6 +408,10 @@ pub struct DeferredAuditJournal {
     lock_path: PathBuf,
     spool_identity: same_file::Handle,
     lock_identity: same_file::Handle,
+    // On Windows, these root-to-parent handles deliberately omit
+    // FILE_SHARE_DELETE so no lexical ancestor can be replaced or retargeted
+    // while path-based journal operations are in flight.
+    _spool_ancestor_guards: Vec<File>,
 }
 
 #[derive(Default)]
@@ -438,7 +442,8 @@ impl DeferredAuditJournal {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let spool_dir = journal_spool_dir(&path);
-        let (_spool_created, spool_directory) = create_or_validate_spool_dir(&spool_dir)?;
+        let (_spool_created, spool_directory, spool_ancestor_guards) =
+            create_or_validate_spool_dir(&spool_dir)?;
         let spool_metadata = std::fs::symlink_metadata(&spool_dir)
             .context("inspect deferred-audit spool directory")?;
         if !spool_metadata.is_dir() || spool_metadata.file_type().is_symlink() {
@@ -586,6 +591,7 @@ impl DeferredAuditJournal {
             lock_path,
             spool_identity,
             lock_identity,
+            _spool_ancestor_guards: spool_ancestor_guards,
         })
     }
 
@@ -842,7 +848,24 @@ fn journal_spool_dir(journal_path: &Path) -> PathBuf {
     PathBuf::from(spool_os)
 }
 
-fn create_or_validate_spool_dir(spool_dir: &Path) -> Result<(bool, File)> {
+#[cfg(windows)]
+fn create_or_validate_spool_dir(spool_dir: &Path) -> Result<(bool, File, Vec<File>)> {
+    let parent = spool_dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let ancestor_guards = windows_private::open_spool_ancestor_guards(parent)?;
+    let (directory, created) = windows_private::create_or_open_private_directory(spool_dir)?;
+    if created {
+        sync_directory(parent).context("fsync deferred-audit spool parent")?;
+    }
+    Ok((created, directory, ancestor_guards))
+}
+
+#[cfg(not(windows))]
+fn create_or_validate_spool_dir(spool_dir: &Path) -> Result<(bool, File, Vec<File>)> {
+    #[cfg(unix)]
+    validate_spool_ancestor_chain(spool_dir)?;
     let created = {
         #[cfg(unix)]
         {
@@ -861,20 +884,6 @@ fn create_or_validate_spool_dir(spool_dir: &Path) -> Result<(bool, File)> {
         }
         #[cfg(not(unix))]
         {
-            #[cfg(windows)]
-            {
-                let (directory, created) =
-                    windows_private::create_or_open_private_directory(spool_dir)?;
-                if created {
-                    let parent = spool_dir
-                        .parent()
-                        .filter(|path| !path.as_os_str().is_empty());
-                    let parent = parent.unwrap_or_else(|| Path::new("."));
-                    sync_directory(parent).context("fsync deferred-audit spool parent")?;
-                }
-                return Ok((created, directory));
-            }
-            #[cfg(not(windows))]
             match std::fs::create_dir(spool_dir) {
                 Ok(()) => true,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
@@ -919,12 +928,109 @@ fn create_or_validate_spool_dir(spool_dir: &Path) -> Result<(bool, File)> {
         sync_directory(parent).context("fsync deferred-audit spool parent")?;
     }
     #[cfg(unix)]
-    return Ok((created, directory));
-    #[cfg(not(any(unix, windows)))]
+    return Ok((created, directory, Vec::new()));
+    #[cfg(not(unix))]
     {
         let directory = File::open(spool_dir)?;
-        Ok((created, directory))
+        Ok((created, directory, Vec::new()))
     }
+}
+
+#[cfg(unix)]
+fn validate_spool_ancestor_chain(spool_dir: &Path) -> Result<()> {
+    let parent = spool_dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let absolute_parent = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolve deferred-audit spool parent")?
+            .join(parent)
+    };
+    validate_spool_ancestors_at(&absolute_parent)?;
+    let resolved_parent = std::fs::canonicalize(&absolute_parent)
+        .context("resolve deferred-audit spool parent symlinks")?;
+    validate_spool_ancestors_at(&resolved_parent)
+}
+
+#[cfg(unix)]
+fn validate_spool_ancestors_at(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    for ancestor in path.ancestors() {
+        let link_metadata = std::fs::symlink_metadata(ancestor).with_context(|| {
+            format!(
+                "inspect deferred-audit spool ancestor link {}",
+                ancestor.display()
+            )
+        })?;
+        // A lexical symlink is protected by its containing directory. The
+        // resolved target chain is validated in a second pass below.
+        if link_metadata.file_type().is_symlink() {
+            continue;
+        }
+        let directory = open_directory_handle(ancestor).with_context(|| {
+            format!(
+                "open deferred-audit spool ancestor safely {}",
+                ancestor.display()
+            )
+        })?;
+        let metadata = directory.metadata().with_context(|| {
+            format!(
+                "inspect deferred-audit spool ancestor {}",
+                ancestor.display()
+            )
+        })?;
+        let mode = metadata.permissions().mode();
+        // SAFETY: geteuid has no preconditions and only reads credentials.
+        let effective_uid = unsafe { libc::geteuid() };
+        // SAFETY: getegid has no preconditions and only reads credentials.
+        let effective_gid = unsafe { libc::getegid() };
+        if !spool_ancestor_permissions_trusted(
+            metadata.uid(),
+            metadata.gid(),
+            mode,
+            effective_uid,
+            effective_gid,
+        ) {
+            anyhow::bail!(
+                "deferred-audit spool ancestor permits untrusted rename: {}",
+                ancestor.display()
+            );
+        }
+        if !metadata.is_dir() {
+            anyhow::bail!(
+                "deferred-audit spool ancestor is not a directory: {}",
+                ancestor.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn spool_ancestor_permissions_trusted(
+    owner_uid: u32,
+    owner_gid: u32,
+    mode: u32,
+    effective_uid: u32,
+    effective_gid: u32,
+) -> bool {
+    // An untrusted owner can chmod later even when owner-write is currently
+    // absent, so every ancestor must be controlled by root or this daemon.
+    if owner_uid != 0 && owner_uid != effective_uid {
+        return false;
+    }
+    if mode & 0o002 != 0 {
+        // Sticky containment prevents unrelated users from renaming an entry
+        // they do not own when the directory owner is root or the daemon.
+        return mode & libc::S_ISVTX != 0 && (owner_uid == 0 || owner_uid == effective_uid);
+    }
+    // Group-write is accepted only as the daemon owner's explicit primary
+    // group trust grant. Foreign/supplementary groups are not trusted.
+    mode & 0o020 == 0 || (owner_uid == effective_uid && owner_gid == effective_gid)
 }
 
 struct SpoolLockGuard<'a>(&'a File);
@@ -3974,7 +4080,8 @@ mod tests {
             let spool = PathBuf::from(std::env::var_os(SPOOL_ENV).unwrap());
             // SAFETY: umask accepts every mode value and returns the prior mask.
             let previous = unsafe { libc::umask(0) };
-            let (created, _directory) = create_or_validate_spool_dir(&spool).unwrap();
+            let (created, _directory, _ancestor_guards) =
+                create_or_validate_spool_dir(&spool).unwrap();
             // SAFETY: restoring the mask returned by umask has no preconditions.
             unsafe { libc::umask(previous) };
             assert!(created);
@@ -4018,6 +4125,55 @@ mod tests {
             0o777,
             "an exposed legacy spool must fail closed, not be repaired and trusted"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_rejects_spool_beneath_untrusted_world_writable_ancestor() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = fresh_tempdir();
+        let exposed_parent = dir.path().join("exposed-parent");
+        std::fs::create_dir(&exposed_parent).unwrap();
+        std::fs::set_permissions(&exposed_parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let journal_path = exposed_parent.join("audit.journal");
+
+        assert!(DeferredAuditJournal::open(&journal_path).is_err());
+        assert!(
+            !journal_spool_dir(&journal_path).exists(),
+            "the spool must not be created beneath a rename-capable ancestor"
+        );
+
+        std::fs::set_permissions(&exposed_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spool_ancestor_permission_policy_rejects_rename_capable_foreign_owners() {
+        let daemon_uid = 1_000;
+        let daemon_gid = 1_001;
+
+        assert!(!spool_ancestor_permissions_trusted(
+            2_000, 2_001, 0o755, daemon_uid, daemon_gid
+        ));
+        assert!(!spool_ancestor_permissions_trusted(
+            2_000, 2_001, 0o555, daemon_uid, daemon_gid
+        ));
+        assert!(spool_ancestor_permissions_trusted(
+            daemon_uid, 2_001, 0o755, daemon_uid, daemon_gid
+        ));
+        assert!(spool_ancestor_permissions_trusted(
+            daemon_uid, daemon_gid, 0o775, daemon_uid, daemon_gid
+        ));
+        assert!(!spool_ancestor_permissions_trusted(
+            daemon_uid, 2_001, 0o775, daemon_uid, daemon_gid
+        ));
+        assert!(spool_ancestor_permissions_trusted(
+            0, 0, 0o1777, daemon_uid, daemon_gid
+        ));
+        assert!(!spool_ancestor_permissions_trusted(
+            0, 0, 0o777, daemon_uid, daemon_gid
+        ));
     }
 
     #[cfg(unix)]
@@ -4090,6 +4246,70 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn journal_windows_retained_guards_block_live_ancestor_rename() {
+        let dir = fresh_tempdir();
+        let guarded_ancestor = dir.path().join("guarded-ancestor");
+        let journal_parent = guarded_ancestor.join("journal-parent");
+        std::fs::create_dir_all(&journal_parent).unwrap();
+        let path = journal_parent.join("windows-rename-guard.journal");
+        let journal = DeferredAuditJournal::open(&path).unwrap();
+        let displaced = dir.path().join("displaced-ancestor");
+
+        assert!(
+            std::fs::rename(&guarded_ancestor, &displaced).is_err(),
+            "retained non-delete-sharing handles must block a live ancestor swap"
+        );
+        drop(journal);
+        std::fs::rename(&guarded_ancestor, &displaced).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn journal_windows_rejects_lexical_ancestor_reparse() {
+        use std::os::windows::fs::symlink_dir;
+
+        let dir = fresh_tempdir();
+        let target = dir.path().join("target");
+        let target_parent = target.join("db");
+        std::fs::create_dir_all(&target_parent).unwrap();
+        let junction = dir.path().join("junction");
+        symlink_dir(&target, &junction).unwrap();
+
+        assert!(windows_private::open_spool_ancestor_guards(&junction.join("db")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn journal_windows_rejects_untrusted_ancestor_delete_authority() {
+        let dir = fresh_tempdir();
+        let exposed_parent = dir.path().join("exposed-parent");
+        windows_private::create_permissive_path_for_test(&exposed_parent, true).unwrap();
+        let path = exposed_parent.join("unsafe-ancestor.journal");
+
+        assert!(DeferredAuditJournal::open(&path).is_err());
+        assert!(!journal_spool_dir(&path).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn journal_windows_ancestor_policy_pins_each_dangerous_right() {
+        let dir = fresh_tempdir();
+        for (index, rights) in ["DC", "SD", "WD", "WO", "GA"].into_iter().enumerate() {
+            let ancestor = dir.path().join(format!("dangerous-{index}"));
+            windows_private::create_ancestor_grant_for_test(&ancestor, rights).unwrap();
+            assert!(
+                windows_private::open_spool_ancestor_guards(&ancestor).is_err(),
+                "untrusted {rights} grant must fail closed"
+            );
+        }
+
+        let benign = dir.path().join("benign-read-grant");
+        windows_private::create_ancestor_grant_for_test(&benign, "GRGX").unwrap();
+        assert!(windows_private::open_spool_ancestor_guards(&benign).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn journal_windows_rejects_permissive_preplanted_artifacts() {
         let dir = fresh_tempdir();
 
@@ -4104,7 +4324,8 @@ mod tests {
 
         let lock_journal = dir.path().join("permissive-lock.journal");
         let lock_spool = journal_spool_dir(&lock_journal);
-        let (_created, directory) = create_or_validate_spool_dir(&lock_spool).unwrap();
+        let (_created, directory, _ancestor_guards) =
+            create_or_validate_spool_dir(&lock_spool).unwrap();
         drop(directory);
         windows_private::create_permissive_path_for_test(&lock_spool.join(".lock"), false).unwrap();
         assert!(DeferredAuditJournal::open(&lock_journal).is_err());
@@ -4384,6 +4605,7 @@ mod tests {
         assert!(journal.append(&event).is_err());
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn journal_rejects_replaced_spool_directory_identity() {
         let dir = fresh_tempdir();

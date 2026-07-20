@@ -69,7 +69,7 @@ recovery-before-live path. See §4.
 | Read actions (`memory_recall` / `memory_search` / `memory_list` / `memory_get` / `memory_session_boot`) | **Governance-evaluable today.** With enabled `read_action` rules, each decision is best-effort chain-logged; the zero-rule fast path emits nothing | `event_type = "governance.check"`, canonical action is `AgentAction::Read { surface, namespace, query }` plus the decision | audit-append failure logs a warning and the read proceeds by intentional split fail-posture; a blocking rule verdict itself remains fail-closed | **#697** V08-PE-2 shipped |
 | Subprocess actions from Bash spawn chain (fork→exec under a permitted shell) | **NOT visible** to the engine | n/a — a future kernel-side probe would emit `event_type = "process.spawn_chain"` | invisible to the substrate without a kernel-side probe | **#697** V08-PE-3 |
 | Out-of-band agent actions | **Unenforceable by definition** | n/a — substrate has no visibility | shipped partial mitigation: V08-PE-1 mandatory-hook presence; future mitigation: V08-PE-6 TPM-bound binary integrity | **#697** V08-PE-1, V08-PE-6 |
-| Hard-crash-lost deferred events | **Closed for admitted occurrences by PE-4** — persistent per-occurrence spool | recovery replays content-bound occurrences before hooks go live; stable occurrence IDs make retry idempotent; artifacts require exact effective-UID modes on Unix or a protected current-token-owner-only DACL validated by handle on Windows | spool is bounded to 4,096 entries / 32 MiB; quota exhaustion blocks the action and records bounded overflow evidence, while other unavailable-admission failures block and emit operational errors | **#697** V08-PE-4 shipped |
+| Hard-crash-lost deferred events | **Closed for admitted occurrences by PE-4** — persistent per-occurrence spool | recovery replays content-bound occurrences before hooks go live; stable occurrence IDs make retry idempotent; artifacts require exact effective-UID modes and root/daemon-owned lexical/resolved ancestors on Unix (group-write only for daemon-owned effective-primary-group directories; world-write only with root/daemon-owned sticky containment), or a protected current-token-owner-only DACL plus reparse rejection, trusted owner/delete-authority ACL validation, and retained no-delete-sharing handles for every lexical ancestor and the spool on Windows | spool is bounded to 4,096 entries / 32 MiB; quota exhaustion blocks the action and records bounded overflow evidence, while other unavailable-admission failures block and emit operational errors | **#697** V08-PE-4 shipped |
 
 ---
 
@@ -215,6 +215,16 @@ Before upgrading a Windows installation that has deferred-audit artifacts:
 An opening error after upgrade is therefore an operator-visible evidence
 disposition event, not a prompt to grant broader permissions or auto-repair
 the old tree.
+
+On Windows, a token that already holds a live `WRITE_DAC`, `WRITE_OWNER`, or
+equivalent security-control handle acquired under an earlier ACL is treated as
+having privileged control of that storage namespace. The ancestor checks fail
+closed on every such grant visible in the current DACL, but Windows does not
+provide a share mode that revokes a handle authorized before validation.
+Operators must therefore provision the database beneath a daemon-, SYSTEM-,
+Administrators-, or TrustedInstaller-controlled tree before exposing it to an
+untrusted local account; suspected prior ACL compromise requires the same
+stop/isolate/forensic-disposition procedure above.
 
 ### 4.2 v0.7.0 V-4 closeout — SQL-side hash chain
 

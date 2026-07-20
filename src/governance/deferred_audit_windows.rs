@@ -9,26 +9,35 @@ use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_INSUFFICIENT_BUFFER, GetLastError,
-    HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_INSUFFICIENT_BUFFER, GENERIC_ALL,
+    GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
-    SDDL_REVISION_1, SE_FILE_OBJECT,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    ConvertStringSidToSidW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    ACL, ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION, EqualSid,
-    GetAclInformation, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
-    GetTokenInformation, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
-    SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    ACE_HEADER, ACE_INHERITED_OBJECT_TYPE_PRESENT, ACE_OBJECT_TYPE_PRESENT, ACL,
+    ACL_SIZE_INFORMATION, AclSizeInformation, CreateWellKnownSid, DACL_SECURITY_INFORMATION,
+    EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+    GetTokenInformation, INHERIT_ONLY_ACE, IsValidSid, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE,
+    TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo,
-    GetFileInformationByHandleEx, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE,
+    CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+    FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FileAttributeTagInfo, GetFileInformationByHandleEx, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE,
+    WRITE_DAC, WRITE_OWNER,
 };
+
+const ACCESS_ALLOWED_ACE_TYPE: u32 = 0;
+const ACCESS_ALLOWED_COMPOUND_ACE_TYPE: u32 = 4;
+const ACCESS_ALLOWED_OBJECT_ACE_TYPE: u32 = 5;
+const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u32 = 9;
+const ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE: u32 = 11;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 struct OwnedHandle(HANDLE);
@@ -64,6 +73,24 @@ impl CurrentSid {
     }
 }
 
+struct SidBuffer {
+    storage: Vec<usize>,
+}
+
+impl SidBuffer {
+    fn as_ptr(&self) -> PSID {
+        self.storage.as_ptr().cast_mut().cast()
+    }
+}
+
+struct AllocatedSid(LocalAllocation);
+
+impl AllocatedSid {
+    fn as_ptr(&self) -> PSID {
+        self.0.0
+    }
+}
+
 struct PrivateDescriptor {
     allocation: LocalAllocation,
 }
@@ -96,7 +123,9 @@ pub(super) fn create_or_open_private_directory(path: &Path) -> Result<(File, boo
             });
         }
     }
-    let file = open_existing(path, ObjectKind::Directory, true)?;
+    // Omit delete sharing on the retained directory handle. This prevents a
+    // parent writer from renaming the live spool between identity checks.
+    let file = open_existing_with_share_delete(path, ObjectKind::Directory, true, false)?;
     validate_private_handle(
         &file,
         ObjectKind::Directory,
@@ -152,7 +181,267 @@ pub(super) fn open_private_file(path: &Path, label: &str, writable: bool) -> Res
     Ok(file)
 }
 
+/// Retain every lexical spool ancestor without delete sharing for the journal
+/// lifetime. Opening root-to-leaf closes the namespace behind us: once a
+/// component handle is acquired, Windows refuses renaming/deleting that
+/// component, and `OPEN_REPARSE_POINT` lets us reject a junction/symlink at
+/// each final component rather than following it silently.
+pub(super) fn open_spool_ancestor_guards(path: &Path) -> Result<Vec<File>> {
+    use std::path::Component;
+
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        anyhow::bail!("deferred-audit spool path contains a parent traversal");
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolve deferred-audit spool parent")?
+            .join(path)
+    };
+    let mut ancestors = absolute.ancestors().collect::<Vec<_>>();
+    ancestors.reverse();
+    let mut guards = Vec::with_capacity(ancestors.len());
+    for ancestor in ancestors {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        let file = open_existing_with_share_delete(ancestor, ObjectKind::Directory, false, false)
+            .with_context(|| {
+            format!(
+                "open deferred-audit spool ancestor guard {}",
+                ancestor.display()
+            )
+        })?;
+        validate_handle_shape(
+            &file,
+            ObjectKind::Directory,
+            "deferred-audit spool ancestor",
+        )?;
+        validate_ancestor_security(&file, "deferred-audit spool ancestor")?;
+        guards.push(file);
+    }
+    Ok(guards)
+}
+
+fn validate_ancestor_security(file: &File, label: &str) -> Result<()> {
+    let handle = file.as_raw_handle().cast::<c_void>() as HANDLE;
+    let mut owner: PSID = null_mut();
+    let mut dacl: *mut ACL = null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    // SAFETY: output pointers are valid and the handle remains live.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &raw mut owner,
+            null_mut(),
+            &raw mut dacl,
+            null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::from_raw_os_error(status.cast_signed()))
+            .with_context(|| format!("read {label} security descriptor"));
+    }
+    let _descriptor_guard = LocalAllocation(descriptor);
+    if owner.is_null() || dacl.is_null() {
+        anyhow::bail!("{label} has a missing owner or null DACL");
+    }
+
+    let current = current_user_sid()?;
+    let system = well_known_sid(WinLocalSystemSid)?;
+    let administrators = well_known_sid(WinBuiltinAdministratorsSid)?;
+    let trusted_installer =
+        string_sid("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464")?;
+    let trusted = [
+        current.as_ptr(),
+        system.as_ptr(),
+        administrators.as_ptr(),
+        trusted_installer.as_ptr(),
+    ];
+    if !sid_is_one_of(owner, &trusted) {
+        anyhow::bail!("{label} owner is not a trusted Windows principal");
+    }
+
+    let mut info: ACL_SIZE_INFORMATION = unsafe { zeroed() };
+    // SAFETY: dacl is live with the descriptor and info is correctly sized.
+    if unsafe {
+        GetAclInformation(
+            dacl,
+            (&raw mut info).cast(),
+            u32::try_from(size_of::<ACL_SIZE_INFORMATION>()).expect("ACL info size fits u32"),
+            AclSizeInformation,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("inspect {label} DACL"));
+    }
+    for index in 0..info.AceCount {
+        let mut ace = null_mut();
+        // SAFETY: index is below the API-reported ACE count and output is valid.
+        if unsafe { GetAce(dacl, index, &raw mut ace) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("read {label} DACL ACE"));
+        }
+        validate_ancestor_ace(ace.cast_const(), &trusted, label)?;
+    }
+    Ok(())
+}
+
+fn validate_ancestor_ace(ace: *const c_void, trusted: &[PSID], label: &str) -> Result<()> {
+    // SAFETY: GetAce returned an ACE pointer valid while the DACL is live.
+    let header = unsafe { std::ptr::read_unaligned(ace.cast::<ACE_HEADER>()) };
+    if u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0 {
+        return Ok(());
+    }
+    let ace_type = u32::from(header.AceType);
+    let simple =
+        ace_type == ACCESS_ALLOWED_ACE_TYPE || ace_type == ACCESS_ALLOWED_CALLBACK_ACE_TYPE;
+    let object = ace_type == ACCESS_ALLOWED_OBJECT_ACE_TYPE
+        || ace_type == ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE;
+    if !simple && !object {
+        if ace_type == ACCESS_ALLOWED_COMPOUND_ACE_TYPE {
+            anyhow::bail!("{label} has an unsupported compound allow ACE");
+        }
+        return Ok(());
+    }
+    let ace_bytes = usize::from(header.AceSize);
+    let mask_offset = size_of::<ACE_HEADER>();
+    if ace_bytes < mask_offset + size_of::<u32>() {
+        anyhow::bail!("{label} has a truncated allow ACE");
+    }
+    // SAFETY: bounds above cover the unaligned mask read.
+    let mask = unsafe { std::ptr::read_unaligned(ace.cast::<u8>().add(mask_offset).cast::<u32>()) };
+    if !ancestor_mask_is_dangerous(mask) {
+        return Ok(());
+    }
+    let sid_offset = if simple {
+        mask_offset + size_of::<u32>()
+    } else {
+        let flags_offset = mask_offset + size_of::<u32>();
+        if ace_bytes < flags_offset + size_of::<u32>() {
+            anyhow::bail!("{label} has a truncated object allow ACE");
+        }
+        // SAFETY: bounds above cover the unaligned flags read.
+        let flags =
+            unsafe { std::ptr::read_unaligned(ace.cast::<u8>().add(flags_offset).cast::<u32>()) };
+        flags_offset
+            + size_of::<u32>()
+            + if flags & ACE_OBJECT_TYPE_PRESENT != 0 {
+                16
+            } else {
+                0
+            }
+            + if flags & ACE_INHERITED_OBJECT_TYPE_PRESENT != 0 {
+                16
+            } else {
+                0
+            }
+    };
+    // SAFETY: GetAce returned this pointer and AceSize is the API-reported
+    // extent of the ACE within the live ACL.
+    let ace_slice = unsafe { std::slice::from_raw_parts(ace.cast::<u8>(), ace_bytes) };
+    embedded_sid_length(ace_slice, sid_offset)
+        .with_context(|| format!("inspect {label} allow ACE SID bounds"))?;
+    // SAFETY: the offset is within this ACE; IsValidSid validates its structure.
+    let sid = unsafe { ace.cast::<u8>().add(sid_offset).cast_mut().cast::<c_void>() };
+    // SAFETY: sid points into the live ACE and has the minimum SID prefix available.
+    if unsafe { IsValidSid(sid) } == 0 {
+        anyhow::bail!("{label} has an invalid allow ACE SID");
+    }
+    if !sid_is_one_of(sid, trusted) {
+        anyhow::bail!(
+            "{label} grants rename or security-control authority to an untrusted principal"
+        );
+    }
+    Ok(())
+}
+
+fn ancestor_mask_is_dangerous(mask: u32) -> bool {
+    mask & (FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_ALL) != 0
+}
+
+fn embedded_sid_length(ace: &[u8], sid_offset: usize) -> Result<usize> {
+    const SID_PREFIX_BYTES: usize = 8;
+    let prefix_end = sid_offset
+        .checked_add(SID_PREFIX_BYTES)
+        .context("allow ACE SID offset overflow")?;
+    if prefix_end > ace.len() {
+        anyhow::bail!("truncated allow ACE SID prefix");
+    }
+    let subauthority_count = usize::from(ace[sid_offset + 1]);
+    let sid_bytes = SID_PREFIX_BYTES
+        .checked_add(
+            subauthority_count
+                .checked_mul(size_of::<u32>())
+                .context("allow ACE SID length overflow")?,
+        )
+        .context("allow ACE SID length overflow")?;
+    let sid_end = sid_offset
+        .checked_add(sid_bytes)
+        .context("allow ACE SID extent overflow")?;
+    if sid_end > ace.len() {
+        anyhow::bail!("truncated allow ACE SID subauthorities");
+    }
+    Ok(sid_bytes)
+}
+
+fn well_known_sid(kind: i32) -> Result<SidBuffer> {
+    let word = size_of::<usize>();
+    let mut bytes = SECURITY_MAX_SID_SIZE;
+    let words = usize::try_from(bytes)
+        .context("well-known SID buffer length")?
+        .div_ceil(word);
+    let mut storage = vec![0_usize; words];
+    // SAFETY: storage is aligned and contains SECURITY_MAX_SID_SIZE writable bytes.
+    if unsafe {
+        CreateWellKnownSid(
+            kind,
+            null_mut(),
+            storage.as_mut_ptr().cast(),
+            &raw mut bytes,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error()).context("build trusted well-known SID");
+    }
+    Ok(SidBuffer { storage })
+}
+
+fn string_sid(value: &str) -> Result<AllocatedSid> {
+    let wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut sid = null_mut();
+    // SAFETY: input is NUL-terminated and output receives a LocalAlloc-owned SID.
+    if unsafe { ConvertStringSidToSidW(wide.as_ptr(), &raw mut sid) } == 0 {
+        return Err(std::io::Error::last_os_error()).context("build trusted string SID");
+    }
+    Ok(AllocatedSid(LocalAllocation(sid)))
+}
+
+fn sid_is_one_of(candidate: PSID, trusted: &[PSID]) -> bool {
+    trusted.iter().any(|trusted_sid| {
+        // SAFETY: candidate and every trusted SID remain live for this comparison.
+        unsafe { EqualSid(candidate, *trusted_sid) != 0 }
+    })
+}
+
 fn open_existing(path: &Path, kind: ObjectKind, writable: bool) -> Result<File> {
+    open_existing_with_share_delete(path, kind, writable, true)
+}
+
+fn open_existing_with_share_delete(
+    path: &Path,
+    kind: ObjectKind,
+    writable: bool,
+    share_delete: bool,
+) -> Result<File> {
     let wide = wide_path(path)?;
     let mut access = FILE_GENERIC_READ | READ_CONTROL | SYNCHRONIZE;
     if writable {
@@ -168,11 +457,13 @@ fn open_existing(path: &Path, kind: ObjectKind, writable: bool) -> Result<File> 
             FILE_ATTRIBUTE_NORMAL
         };
     // SAFETY: the UTF-16 path remains live; OPEN_EXISTING does not consume pointers.
+    let share_mode =
+        FILE_SHARE_READ | FILE_SHARE_WRITE | if share_delete { FILE_SHARE_DELETE } else { 0 };
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
             access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            share_mode,
             null(),
             OPEN_EXISTING,
             flags,
@@ -187,29 +478,10 @@ fn open_existing(path: &Path, kind: ObjectKind, writable: bool) -> Result<File> 
 }
 
 fn validate_private_handle(file: &File, kind: ObjectKind, label: &str) -> Result<()> {
+    validate_handle_shape(file, kind, label)?;
+
     let raw = file.as_raw_handle().cast::<c_void>();
     let handle = raw as HANDLE;
-    let mut tag: FILE_ATTRIBUTE_TAG_INFO = unsafe { zeroed() };
-    // SAFETY: tag points to a correctly sized writable structure and handle is live.
-    if unsafe {
-        GetFileInformationByHandleEx(
-            handle,
-            FileAttributeTagInfo,
-            (&raw mut tag).cast(),
-            u32::try_from(size_of::<FILE_ATTRIBUTE_TAG_INFO>()).expect("tag size fits u32"),
-        )
-    } == 0
-    {
-        return Err(std::io::Error::last_os_error()).with_context(|| format!("inspect {label}"));
-    }
-    if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        anyhow::bail!("{label} is a reparse point");
-    }
-    let is_directory = tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
-    if is_directory != (kind == ObjectKind::Directory) {
-        anyhow::bail!("{label} has the wrong filesystem object type");
-    }
-
     let sid = current_user_sid()?;
     let expected = private_descriptor(&sid, kind)?;
     let expected_acl = descriptor_dacl(expected.as_ptr())?;
@@ -258,6 +530,32 @@ fn validate_private_handle(file: &File, kind: ObjectKind, label: &str) -> Result
     }
     if acl_bytes(dacl)? != expected_bytes {
         anyhow::bail!("{label} DACL is not the canonical daemon-owner-only policy");
+    }
+    Ok(())
+}
+
+fn validate_handle_shape(file: &File, kind: ObjectKind, label: &str) -> Result<()> {
+    let raw = file.as_raw_handle().cast::<c_void>();
+    let handle = raw as HANDLE;
+    let mut tag: FILE_ATTRIBUTE_TAG_INFO = unsafe { zeroed() };
+    // SAFETY: tag points to a correctly sized writable structure and handle is live.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileAttributeTagInfo,
+            (&raw mut tag).cast(),
+            u32::try_from(size_of::<FILE_ATTRIBUTE_TAG_INFO>()).expect("tag size fits u32"),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("inspect {label}"));
+    }
+    if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        anyhow::bail!("{label} is a reparse point");
+    }
+    let is_directory = tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    if is_directory != (kind == ObjectKind::Directory) {
+        anyhow::bail!("{label} has the wrong filesystem object type");
     }
     Ok(())
 }
@@ -433,6 +731,17 @@ pub(super) fn create_permissive_path_for_test(path: &Path, directory: bool) -> R
 }
 
 #[cfg(test)]
+pub(super) fn create_ancestor_grant_for_test(path: &Path, rights: &str) -> Result<()> {
+    let sid = current_user_sid()?;
+    let sid_text = sid_string(&sid)?;
+    create_path_with_sddl_for_test(
+        path,
+        true,
+        &format!("O:{sid_text}D:P(A;;FA;;;{sid_text})(A;;{rights};;;WD)"),
+    )
+}
+
+#[cfg(test)]
 pub(super) fn create_extra_ace_path_for_test(path: &Path) -> Result<()> {
     let sid = current_user_sid()?;
     let sid_text = sid_string(&sid)?;
@@ -532,4 +841,49 @@ fn create_path_with_sddl_for_test(path: &Path, directory: bool, sddl: &str) -> R
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod ancestor_policy_tests {
+    use super::*;
+
+    #[test]
+    fn dangerous_ancestor_mask_covers_every_namespace_control_right() {
+        for mask in [
+            FILE_DELETE_CHILD,
+            DELETE,
+            WRITE_DAC,
+            WRITE_OWNER,
+            GENERIC_ALL,
+        ] {
+            assert!(ancestor_mask_is_dangerous(mask));
+        }
+        assert!(!ancestor_mask_is_dangerous(FILE_GENERIC_WRITE));
+    }
+
+    #[test]
+    fn embedded_sid_bounds_cover_simple_and_object_allow_aces() {
+        for sid_offset in [8_usize, 12, 28, 44] {
+            let mut valid = vec![0_u8; sid_offset + 12];
+            valid[sid_offset] = 1;
+            valid[sid_offset + 1] = 1;
+            assert_eq!(embedded_sid_length(&valid, sid_offset).unwrap(), 12);
+
+            let mut truncated = vec![0_u8; sid_offset + 12];
+            truncated[sid_offset] = 1;
+            truncated[sid_offset + 1] = 2;
+            assert!(embedded_sid_length(&truncated, sid_offset).is_err());
+        }
+    }
+
+    #[test]
+    fn trusted_sid_membership_rejects_a_foreign_principal() {
+        let current = string_sid("S-1-5-21-1-2-3-1001").unwrap();
+        let system = string_sid("S-1-5-18").unwrap();
+        let foreign = string_sid("S-1-5-21-1-2-3-2002").unwrap();
+        let trusted = [current.as_ptr(), system.as_ptr()];
+
+        assert!(sid_is_one_of(current.as_ptr(), &trusted));
+        assert!(!sid_is_one_of(foreign.as_ptr(), &trusted));
+    }
 }

@@ -308,8 +308,11 @@ cognitive counterpart in the memory store itself.
   `signed_events` at boot (content-bound and idempotent on stable occurrence
   ID, with legacy payload-hash cardinality compatibility). Spool entries are
   atomically published with owner-private permissions (exact effective-UID
-  modes on Unix; protected current-token-owner-only DACLs validated by handle
-  on Windows), bounded to 4,096 entries / 32
+  modes and root/daemon-owned ancestors on Unix (group-write only for the
+  daemon's effective primary group; world-write only with sticky containment); protected
+  current-token-owner-only DACLs plus reparse rejection, trusted ancestor
+  owner/delete-authority validation, and retained no-delete-sharing
+  lexical-ancestor/spool handles on Windows), bounded to 4,096 entries / 32
   MiB, and acknowledged only after durable chain or DLQ residence. Quota
   exhaustion records bounded timestamp/occurrence/hash overflow evidence and
   refuses unjournaled delivery; production governance callers propagate that
