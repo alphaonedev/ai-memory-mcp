@@ -990,15 +990,7 @@ fn validate_spool_ancestors_at(path: &Path) -> Result<()> {
         let mode = metadata.permissions().mode();
         // SAFETY: geteuid has no preconditions and only reads credentials.
         let effective_uid = unsafe { libc::geteuid() };
-        // SAFETY: getegid has no preconditions and only reads credentials.
-        let effective_gid = unsafe { libc::getegid() };
-        if !spool_ancestor_permissions_trusted(
-            metadata.uid(),
-            metadata.gid(),
-            mode,
-            effective_uid,
-            effective_gid,
-        ) {
+        if !spool_ancestor_permissions_trusted(metadata.uid(), mode, effective_uid) {
             anyhow::bail!(
                 "deferred-audit spool ancestor permits untrusted rename: {}",
                 ancestor.display()
@@ -1017,27 +1009,19 @@ fn validate_spool_ancestors_at(path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn spool_ancestor_permissions_trusted(
-    owner_uid: u32,
-    owner_gid: u32,
-    mode: u32,
-    effective_uid: u32,
-    effective_gid: u32,
-) -> bool {
+fn spool_ancestor_permissions_trusted(owner_uid: u32, mode: u32, effective_uid: u32) -> bool {
     // An untrusted owner can chmod later even when owner-write is currently
     // absent, so every ancestor must be controlled by root or this daemon.
     if owner_uid != 0 && owner_uid != effective_uid {
         return false;
     }
-    if mode & 0o002 != 0 {
+    if mode & 0o022 != 0 {
         // Sticky containment prevents unrelated users from renaming an entry
         // they do not own when the directory owner is root or the daemon.
         return mode & u32::from(libc::S_ISVTX) != 0
             && (owner_uid == 0 || owner_uid == effective_uid);
     }
-    // Group-write is accepted only as the daemon owner's explicit primary
-    // group trust grant. Foreign/supplementary groups are not trusted.
-    mode & 0o020 == 0 || (owner_uid == effective_uid && owner_gid == effective_gid)
+    true
 }
 
 struct SpoolLockGuard<'a>(&'a File);
@@ -1373,8 +1357,11 @@ fn validate_macos_trivial_acl(file: &File, label: &str) -> Result<()> {
     // extended-ACL selector accepted by acl_get_fd_np.
     let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
     if acl.is_null() {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("read {label} macOS extended ACL"));
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(());
+        }
+        return Err(error).with_context(|| format!("read {label} macOS extended ACL"));
     }
     let _acl_guard = AclGuard(acl);
     let mut entry: AclEntry = std::ptr::null_mut();
@@ -3364,14 +3351,38 @@ mod tests {
     // -----------------------------------------------------------------
 
     fn fresh_tempdir() -> tempfile::TempDir {
+        #[cfg(windows)]
+        let scratch = {
+            let local_data = std::env::var_os("LOCALAPPDATA")
+                .expect("Windows deferred-audit tests require LOCALAPPDATA");
+            let scratch = PathBuf::from(local_data).join("ai-memory-deferred-audit-tests");
+            let (_guard, _created) = windows_private::create_or_open_private_directory(&scratch)
+                .expect("create protected Windows deferred-audit test scratch");
+            scratch
+        };
+        #[cfg(not(windows))]
         let scratch = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(".local-runs")
             .join("test-tmp");
+        #[cfg(not(windows))]
         std::fs::create_dir_all(&scratch).expect("create repository-owned test scratch");
-        tempfile::Builder::new()
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700))
+                .expect("secure repository-owned test scratch");
+        }
+        let dir = tempfile::Builder::new()
             .prefix("deferred-audit-")
-            .tempdir_in(scratch)
-            .expect("repository-owned deferred-audit tempdir")
+            .tempdir_in(&scratch)
+            .expect("repository-owned deferred-audit tempdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("secure repository-owned deferred-audit tempdir");
+        }
+        dir
     }
 
     fn signed_refusal_for_test(event: &DeferredAuditEvent) -> SignedEvent {
@@ -4668,29 +4679,52 @@ mod tests {
     #[test]
     fn spool_ancestor_permission_policy_rejects_rename_capable_foreign_owners() {
         let daemon_uid = 1_000;
-        let daemon_gid = 1_001;
 
         assert!(!spool_ancestor_permissions_trusted(
-            2_000, 2_001, 0o755, daemon_uid, daemon_gid
+            2_000, 0o755, daemon_uid
         ));
         assert!(!spool_ancestor_permissions_trusted(
-            2_000, 2_001, 0o555, daemon_uid, daemon_gid
+            2_000, 0o555, daemon_uid
         ));
         assert!(spool_ancestor_permissions_trusted(
-            daemon_uid, 2_001, 0o755, daemon_uid, daemon_gid
-        ));
-        assert!(spool_ancestor_permissions_trusted(
-            daemon_uid, daemon_gid, 0o775, daemon_uid, daemon_gid
+            daemon_uid, 0o755, daemon_uid
         ));
         assert!(!spool_ancestor_permissions_trusted(
-            daemon_uid, 2_001, 0o775, daemon_uid, daemon_gid
-        ));
-        assert!(spool_ancestor_permissions_trusted(
-            0, 0, 0o1777, daemon_uid, daemon_gid
+            daemon_uid, 0o775, daemon_uid
         ));
         assert!(!spool_ancestor_permissions_trusted(
-            0, 0, 0o777, daemon_uid, daemon_gid
+            daemon_uid, 0o770, daemon_uid
         ));
+        assert!(spool_ancestor_permissions_trusted(0, 0o1777, daemon_uid));
+        assert!(spool_ancestor_permissions_trusted(
+            daemon_uid, 0o1770, daemon_uid
+        ));
+        assert!(!spool_ancestor_permissions_trusted(0, 0o777, daemon_uid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_rejects_group_writable_primary_gid_ancestor() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = fresh_tempdir();
+        let group_writable = dir.path().join("primary-group-writable");
+        std::fs::create_dir(&group_writable).unwrap();
+        std::fs::set_permissions(&group_writable, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let journal_path = group_writable.join("audit.journal");
+
+        let error = DeferredAuditJournal::open(&journal_path)
+            .err()
+            .expect("primary-group-writable ancestor must fail closed");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("permits untrusted rename"))
+        );
+        assert!(
+            !journal_spool_dir(&journal_path).exists(),
+            "the spool must not be created beneath a group-writable ancestor"
+        );
     }
 
     #[cfg(unix)]
