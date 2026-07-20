@@ -6399,6 +6399,14 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    while crate::subscriptions::dispatch_in_flight() != 0 {
+        if tokio::time::Instant::now() >= task_join_deadline {
+            return Err(fatal_shutdown(
+                "subscription dispatch shutdown deadline exceeded",
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     // Process-global governance hooks retain sender clones forever. Ask the
     // supervisor to close its receiver instead: sends linearized before close
@@ -8206,12 +8214,21 @@ mod tests {
             .expect("read packaged systemd unit");
         assert!(unit.contains("KillSignal=SIGINT"));
         assert!(unit.contains("TimeoutStopSec=60"));
+        assert!(unit.contains("RestartPreventExitStatus=75"));
 
         let hive =
             std::fs::read_to_string(root.join("deploy/hive-1461/provision/50_federation.sh"))
                 .expect("read hive provisioning script");
         assert!(hive.contains("KillSignal=SIGINT"));
         assert!(hive.contains("TimeoutStopSec=60"));
+        assert!(hive.contains("RestartPreventExitStatus=75"));
+
+        let digital_ocean =
+            std::fs::read_to_string(root.join("deploy/do-1461/provision/50_federation.sh"))
+                .expect("read DigitalOcean provisioning script");
+        assert!(digital_ocean.contains("KillSignal=SIGINT"));
+        assert!(digital_ocean.contains("TimeoutStopSec=60"));
+        assert!(digital_ocean.contains("RestartPreventExitStatus=75"));
     }
 
     // ----- spawn_gc_loop / spawn_wal_checkpoint_loop --------------------

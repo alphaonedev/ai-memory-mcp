@@ -23,6 +23,7 @@
 use crate::models::field_names;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, anyhow};
@@ -34,6 +35,30 @@ use tokio::sync::Semaphore;
 /// Tracing target for the subscription fan-out / DLQ surface
 /// (#1558 tracing-target SSOT).
 const SUBSCRIPTIONS_TRACE_TARGET: &str = "ai_memory::subscriptions";
+
+static DISPATCH_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+struct DispatchInFlightGuard;
+
+impl DispatchInFlightGuard {
+    fn new() -> Self {
+        DISPATCH_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for DispatchInFlightGuard {
+    fn drop(&mut self) {
+        DISPATCH_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Number of webhook deliveries whose async/blocking worker has not yet
+/// completed. The daemon waits for zero before final audit certification.
+#[must_use]
+pub(crate) fn dispatch_in_flight() -> usize {
+    DISPATCH_IN_FLIGHT.load(Ordering::SeqCst)
+}
 
 /// Public-facing subscription record (no secret plaintext).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1067,7 +1092,9 @@ pub fn dispatch_event_to_subs(
         // `#[tokio::test]` attaches a runtime to the calling thread.
         if let Some(rt) = handle.as_ref() {
             let permit_sem = dispatch_semaphore();
+            let in_flight = DispatchInFlightGuard::new();
             rt.spawn(async move {
+                let _in_flight = in_flight;
                 // Acquire-then-blocking-step. `acquire_owned` returns
                 // an `OwnedSemaphorePermit` that gets moved into the
                 // blocking task and is dropped when the worker
@@ -1100,7 +1127,11 @@ pub fn dispatch_event_to_subs(
             // only by legacy unit tests that call `dispatch_event`
             // outside `#[tokio::test]`; production daemons always
             // run under `#[tokio::main]`.
-            std::thread::spawn(work);
+            let in_flight = DispatchInFlightGuard::new();
+            std::thread::spawn(move || {
+                let _in_flight = in_flight;
+                work();
+            });
         }
     }
 }

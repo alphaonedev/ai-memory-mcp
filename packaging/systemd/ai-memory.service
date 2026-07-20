@@ -10,6 +10,7 @@ User=ai-memory
 Group=ai-memory
 ExecStart=/usr/bin/ai-memory serve --host 127.0.0.1 --port 9077
 Restart=on-failure
+RestartPreventExitStatus=75
 RestartSec=5s
 KillSignal=SIGINT
 TimeoutStopSec=60

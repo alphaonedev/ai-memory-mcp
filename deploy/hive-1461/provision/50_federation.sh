@@ -114,6 +114,7 @@ ExecStart=$BIN serve \\
   --federation-identity $fed_id \\
   --shutdown-grace-secs 30
 Restart=on-failure
+RestartPreventExitStatus=75
 RestartSec=3
 KillSignal=SIGINT
 TimeoutStopSec=60

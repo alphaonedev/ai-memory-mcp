@@ -62,6 +62,7 @@ After=network.target
 Type=simple
 ExecStart=/usr/local/bin/ai-memory --db /var/lib/ai-memory/ai-memory.db serve
 Restart=on-failure
+RestartPreventExitStatus=75
 RestartSec=5
 Environment=RUST_LOG=ai_memory=info,tower_http=info
 
@@ -878,6 +879,8 @@ For a shutdown deadline, preserve the database and adjacent
 after the stall is cleared. The occurrence spool is fsynced before queue
 admission and replayed idempotently on the next boot. For a bootstrap failure,
 correct the named configuration/credential/storage error before restarting.
+The shipped systemd unit uses `RestartPreventExitStatus=75` so these failures
+remain stopped for operator triage instead of entering an automatic loop.
 
 The MCP server exits cleanly when stdin closes (AI client session ends).
 
