@@ -13,42 +13,41 @@
 -- refusal was permanently lost — the exact failure mode the
 -- chain-log primitive exists to prevent.
 --
--- The Cluster-C fix splits drainer failures into two buckets:
+-- The current sink handles failures in two stages:
 --
 --   * `SQLITE_CONSTRAINT_UNIQUE` on the `idx_signed_events_sequence`
---     UNIQUE index: requeue. This is a race-only failure (two
---     concurrent writers raced to grab the same `sequence` value)
---     and the BEGIN IMMEDIATE wrap in `append_signed_event` now
---     serialises retries against the wal-write lock. The event
---     lands on the next drainer iteration.
+--     UNIQUE index: retry within the same append call, up to the
+--     bounded retry budget. BEGIN IMMEDIATE serialises each fresh
+--     residence check + append attempt against the WAL write lock.
 --
---   * Everything else (disk full, schema corruption, FK violation,
---     malformed event): land in `signed_events_dlq` so an operator
---     can manually replay or post-mortem the loss. The DLQ row
---     mirrors the would-be `signed_events` row schema PLUS a
---     `failure_reason` column carrying the rusqlite error string at
---     time of DLQ landing.
+--   * On retry exhaustion or a non-race chain error, attempt to land
+--     in `signed_events_dlq` for chain-aware operator disposition.
+--     If that INSERT also fails, append returns an error; on the
+--     journal-backed production path the already-admitted spool
+--     record remains for recovery. A successful DLQ row carries the
+--     failure reason observed at landing time.
 --
 -- # Why a SQL table (not a JSONL file)
 --
--- - The DLQ is queryable from the existing `signed_events`-aware
---   tooling (capabilities `dlq.size`, future `ai-memory audit
---   dlq list`).
+-- - The DLQ is queryable through the capabilities live-depth signal
+--   and direct operator inspection.
 -- - The drainer already owns a SQLite Connection; landing a row in
 --   the same DB is one INSERT, no extra I/O surface.
 -- - JSONL would couple the DLQ to the audit-log path's append-only
 --   chflags semantics — which is the wrong primitive (the DLQ is
 --   recoverable / mutable; the audit log is not).
--- - A future `ai-memory audit dlq replay <row_id>` substrate command
---   can re-attempt the chain-log insert with one SQL DELETE +
---   `append_signed_event` from the row's captured columns.
+-- - v1.0.0 ships no replay CLI or automatic replay sweep. Operators
+--   preserve these rows and escalate for chain-aware disposition;
+--   ad hoc copy/delete SQL is not a supported recovery procedure.
 --
 -- # Columns
 --
 -- Mirrors `signed_events` 1:1 for the would-be-chain-log fields
 -- (`id` / `agent_id` / `event_type` / `payload_hash` / `signature` /
--- `attest_level` / `timestamp`) so a future "replay one DLQ row"
--- tool can reconstruct the original `SignedEvent` losslessly. Adds:
+-- `attest_level` / `timestamp`) so the failed `SignedEvent` inputs remain
+-- inspectable for possible chain-aware disposition. The original refusal
+-- payload is not stored here, and v1.0.0 exposes no supported replay
+-- procedure. Adds:
 --
 -- * `dlq_id`         — INTEGER PRIMARY KEY AUTOINCREMENT. Distinct
 --                      from `id` because two failed attempts to
@@ -65,10 +64,11 @@
 --
 -- # Append-only invariant — NOT enforced for the DLQ
 --
--- Unlike `signed_events`, the DLQ IS mutable: an operator replaying
--- a DLQ row DELETEs it after a successful re-append. There is no
--- chain-hash on DLQ rows; the integrity property the DLQ provides
--- is "no audit drop is silent", not "DLQ rows are tamper-evident".
+-- Unlike `signed_events`, the schema does not enforce append-only
+-- storage or chain-hash DLQ rows. v1.0.0 provides no supported replay
+-- or deletion command, so operators preserve rows until an explicit
+-- chain-aware disposition. The property is "a successful DLQ landing
+-- is observable", not "DLQ rows are tamper-evident".
 
 CREATE TABLE IF NOT EXISTS signed_events_dlq (
     dlq_id          INTEGER PRIMARY KEY AUTOINCREMENT,

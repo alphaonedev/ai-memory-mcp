@@ -2150,12 +2150,13 @@ impl SqliteSignedEventsSink {
         }
 
         // Either the retry budget was exhausted on UNIQUE races OR
-        // the first attempt produced a non-race error. Land in DLQ.
+        // the first attempt produced a non-race error. Attempt DLQ landing.
         //
         // #1046 (Agent-6 #7) — chain-log property advisory.
         // The audit-chain delivery contract is:
         //
-        //   **chain-log emission is "exactly-once OR DLQ-recoverable"**
+        //   **chain residence, successful DLQ evidence, or explicit error
+        //   with retained journal evidence on the production path**
         //
         // Specifically:
         //   - On the happy path, every refusal lands exactly one
@@ -2186,7 +2187,8 @@ impl SqliteSignedEventsSink {
                 agent_id = %signed.agent_id,
                 event_id = %signed.id,
                 "deferred_audit sink: append exhausted retries or hit non-race error — \
-                 event landed in signed_events_dlq (chain row NOT advanced; replay needed)"
+                 event landed in signed_events_dlq (chain row NOT advanced; \
+                 chain-aware operator disposition needed; no automatic replay)"
             );
             self.bump_dlq();
         }
@@ -2274,7 +2276,8 @@ pub fn spawn_drainer_task<S: DeferredAuditSink + 'static>(
                     metrics.append_failures.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         "deferred_audit drainer: event landed in DLQ \
-                         (audit chain row NOT advanced; operator replay needed)"
+                         (audit chain row NOT advanced; chain-aware operator \
+                         disposition needed; no automatic replay)"
                     );
                 }
                 Err(e) => {
@@ -2350,7 +2353,8 @@ where
                         metrics.append_failures.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(
                             "deferred_audit drainer: event landed in DLQ \
-                             (audit chain row NOT advanced; operator replay needed)"
+                             (audit chain row NOT advanced; chain-aware operator \
+                             disposition needed; no automatic replay)"
                         );
                         consecutive_restarts = 0;
                         break;

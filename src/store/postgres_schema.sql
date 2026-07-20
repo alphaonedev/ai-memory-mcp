@@ -867,8 +867,8 @@ CREATE INDEX IF NOT EXISTS idx_agent_subkey_certs_instance
 --
 -- Mirrors `migrations/postgres/0021_v07_signed_events_dlq.sql`. See
 -- the SQLite migration in `migrations/sqlite/0034_v07_signed_events_dlq.sql`
--- for the design rationale (failure-split between race-on-UNIQUE
--- requeue and DLQ-land; non-append-only invariant carve-out).
+-- for the design rationale (bounded same-call sequence-race retry,
+-- followed by a DLQ attempt; non-append-only schema carve-out).
 
 -- v0.7.0 #1044 (Agent-3 #9) — `timestamp` and `failed_at` are
 -- intentionally TEXT (not TIMESTAMPTZ) to match the SQLite-shape
@@ -887,10 +887,9 @@ CREATE INDEX IF NOT EXISTS idx_agent_subkey_certs_instance
 -- and the per-query cast cost is dominated by the cardinality of
 -- the DLQ itself.
 --
--- A future v0.8 ALTER COLUMN migration may convert these to
--- TIMESTAMPTZ with `USING ... ::TIMESTAMPTZ`; deferred from v0.7.0
--- to avoid bumping CURRENT_SCHEMA_VERSION for a cosmetic
--- column-type change. Tracking under follow-up; sister table
+-- Converting these columns to TIMESTAMPTZ would require an explicit
+-- compatibility migration with `USING ... ::TIMESTAMPTZ`; v1.0.0
+-- intentionally retains the cross-backend TEXT contract. The sister table
 -- `federation_push_dlq` (line ~625 below) uses TIMESTAMPTZ because
 -- that path was authored directly on the postgres side at v48 and
 -- never carried the sqlite-shape compatibility constraint.

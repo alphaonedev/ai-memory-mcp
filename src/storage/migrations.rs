@@ -523,7 +523,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_event_type
 -- Mirrors `migrations/sqlite/0034_v07_signed_events_dlq.sql` so a
 -- fresh DB bootstrap that bypasses the migration ladder still ends
 -- up with the table present. See the migration file for the design
--- rationale (failure-split between race-requeue and DLQ-land).
+-- rationale (bounded same-call retry followed by a DLQ attempt).
 CREATE TABLE IF NOT EXISTS signed_events_dlq (
     dlq_id          INTEGER PRIMARY KEY AUTOINCREMENT,
     id              TEXT NOT NULL,
@@ -727,13 +727,13 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 // v40 = v0.7.0 Cluster-C SEC-3 closeout (issue #767) — adds the
 //       `signed_events_dlq` table backing the deferred-audit drainer's
 //       new dead-letter-queue path. Pre-Cluster-C the drainer dropped
-//       failed appends silently; with v40 in place the drainer requeues
-//       on `SQLITE_CONSTRAINT_UNIQUE` (chain-head race) and lands every
-//       other failure in `signed_events_dlq`. Pure additive on legacy
-//       data — fresh installs inherit the table via the bootstrap
-//       SCHEMA; pre-v40 deployments pick it up here. The DLQ is
-//       intentionally NOT append-only (operator-driven replay deletes
-//       rows after re-append).
+//       failed appends silently; with v40 in place the sink retries
+//       classified sequence races within the same call, then attempts
+//       `signed_events_dlq` on exhaustion or non-race failure. A failed
+//       DLQ INSERT still returns an error; journal-backed admission keeps
+//       the spool evidence. Pure additive on legacy data — fresh installs
+//       inherit the table via the bootstrap SCHEMA; pre-v40 deployments
+//       pick it up here. v1.0.0 has no replay/deletion CLI.
 // v41 = v0.7.0 Cluster G — shadow-mode retention + denormalised
 //       `source` column + compound `(namespace, source, observed_at)`
 //       index supporting the calibration scan (issue #767, PERF-4 +
@@ -1224,7 +1224,7 @@ const MIGRATION_V39_SQLITE: &str =
 // v0.7.0 Cluster-C SEC-3 closeout (issue #767) — `signed_events_dlq`
 // table. CREATE TABLE IF NOT EXISTS + indexes — fully idempotent.
 // Substrate for the deferred-audit drainer's new dead-letter-queue
-// path (race-on-UNIQUE requeue; non-race errors land here).
+// path (bounded same-call sequence-race retry, then a DLQ attempt).
 const MIGRATION_V40_SQLITE: &str =
     include_str!("../../migrations/sqlite/0034_v07_signed_events_dlq.sql");
 // v0.7.0 Cluster G — shadow-mode retention + denormalised `source`

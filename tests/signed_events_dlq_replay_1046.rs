@@ -42,7 +42,7 @@ fn signed_events_dlq_table_exists_after_migrate_1046() {
     assert_eq!(
         count, 1,
         "#1046: signed_events_dlq table MUST exist after migration ladder; \
-         the v0.7.0 'exactly-once OR DLQ-recoverable' contract depends on it"
+         durable observation of successful DLQ landings depends on it"
     );
 }
 
