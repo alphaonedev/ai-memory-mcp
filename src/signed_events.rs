@@ -2600,7 +2600,9 @@ fn maybe_emit_audit_head_witness(
     signed_head_hash: &str,
     force: bool,
 ) {
-    if let Err(e) = try_emit_audit_head_witness(conn, signed_head_seq, signed_head_hash, force) {
+    if let Err(e) =
+        try_emit_audit_head_witness(conn, signed_head_seq, signed_head_hash, force, false)
+    {
         tracing::warn!(
             target: SIGNED_EVENTS_TRACE_TARGET,
             "audit-head witness emission failed (swallowed): {e:#}"
@@ -2616,14 +2618,28 @@ fn try_emit_audit_head_witness(
     signed_head_seq: i64,
     signed_head_hash: &str,
     force: bool,
+    strict: bool,
 ) -> Result<()> {
     use crate::governance::audit as witness;
     // Cheap pre-check — keeps witness-key file I/O off every append.
     if !force && !witness::witness_interval_reached(signed_head_seq) {
         return Ok(());
     }
-    let Some(keypair) = witness::load_witness_signing_key()? else {
-        return Ok(()); // opt-in: no witness key enrolled → no-op.
+    let keypair = if strict {
+        match witness::inspect_witness_custody()? {
+            witness::WitnessCustody::Absent => return Ok(()),
+            witness::WitnessCustody::Unloadable(detail) => {
+                return Err(anyhow::anyhow!(
+                    "witness custody is enrolled but unloadable: {detail}"
+                ));
+            }
+            witness::WitnessCustody::Signer(keypair) => keypair,
+        }
+    } else {
+        let Some(keypair) = witness::load_witness_signing_key()? else {
+            return Ok(()); // opt-in: no witness key enrolled → no-op.
+        };
+        Box::new(keypair)
     };
     // Claim the slot only once we know we can actually sign.
     if !witness::witness_claim_slot(signed_head_seq, force) {
@@ -2645,7 +2661,11 @@ fn try_emit_audit_head_witness(
     crate::checkpoints::insert(conn, &cp).context("witness: insert checkpoint")?;
     // v1.0.0 #1946 B — mirror the signed anchor OFF-TABLE (fire-and-forget) so
     // a whole-DB-file rollback is detectable at the next `db::open`.
-    witness::append_head_anchor(&cp);
+    if strict {
+        witness::append_head_anchor_durable(&cp)?;
+    } else {
+        witness::append_head_anchor(&cp);
+    }
     Ok(())
 }
 
@@ -2654,12 +2674,16 @@ fn try_emit_audit_head_witness(
 /// shutdown entry point: call before a clean daemon exit so the final head is
 /// witnessed even if it did not reach a `WATERMARK_INTERVAL` boundary. No-op
 /// when no witness key is enrolled.
+///
+/// # Errors
+/// Returns an error when enrolled custody is unloadable, the checkpoint cannot
+/// be built or inserted, or its off-table anchor cannot be durably persisted.
 pub fn try_force_emit_audit_head_witness(conn: &Connection) -> Result<()> {
     let (head_seq, head_hash) = read_chain_head(conn)?;
     if head_seq <= 0 {
         return Ok(());
     }
-    try_emit_audit_head_witness(conn, head_seq, &hex_lower(&head_hash), true)
+    try_emit_audit_head_witness(conn, head_seq, &hex_lower(&head_hash), true, true)
 }
 
 /// Backward-compatible fire-and-forget wrapper for operator/legacy call sites.

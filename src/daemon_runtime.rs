@@ -6058,6 +6058,7 @@ impl std::fmt::Display for FatalShutdownError {
 impl std::error::Error for FatalShutdownError {}
 
 const FINAL_CERTIFICATION_TIMEOUT: Duration = Duration::from_secs(5);
+const SERVER_AUX_TASK_REGISTRY_POISONED: &str = "server auxiliary task registry poisoned";
 
 fn fatal_shutdown(reason: &'static str) -> anyhow::Error {
     tracing::error!(
@@ -6296,7 +6297,7 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
             });
             server_aux_tasks_for_run
                 .lock()
-                .expect("server auxiliary task registry poisoned")
+                .expect(SERVER_AUX_TASK_REGISTRY_POISONED)
                 .push(signal_task);
             // v0.7.0 #1581 — bind with the NoDelayAcceptor-wrapped rustls
             // acceptor instead of `bind_rustls` (whose DefaultAcceptor never
@@ -6372,7 +6373,7 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
             });
             server_aux_tasks_for_run
                 .lock()
-                .expect("server auxiliary task registry poisoned")
+                .expect(SERVER_AUX_TASK_REGISTRY_POISONED)
                 .push(signal_task);
             axum_server::bind(socket_addr)
                 .handle(handle)
@@ -6385,7 +6386,7 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     bootstrap.task_handles.extend(
         server_aux_tasks
             .lock()
-            .expect("server auxiliary task registry poisoned")
+            .expect(SERVER_AUX_TASK_REGISTRY_POISONED)
             .drain(..),
     );
 
@@ -6503,6 +6504,9 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
 /// enrolled witness key the emission is a no-op (byte-identical legacy
 /// shutdown). The caller must treat any witness/checkpoint failure as an
 /// uncertified shutdown.
+///
+/// # Errors
+/// Returns an error when final witness emission or the WAL checkpoint fails.
 pub async fn shutdown_witness_flush_and_checkpoint(db_state: &Db) -> Result<()> {
     let lock = db_state.lock().await;
     crate::signed_events::try_force_emit_audit_head_witness(&lock.0)?;
