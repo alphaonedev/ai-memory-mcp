@@ -1953,9 +1953,9 @@ impl SqliteSignedEventsSink {
         }
     }
 
-    /// Construct a sink wired to a metrics handle. The handle's
-    /// `dlq_landed` and `unique_race_retries` counters are bumped as
-    /// the sink observes those outcomes.
+    /// Construct a sink wired to a metrics handle. `dlq_landed` increments
+    /// only when this sink freshly inserts a DLQ row; `unique_race_retries`
+    /// increments for each classified chain-sequence retry.
     #[must_use]
     pub fn with_metrics(db_path: impl Into<PathBuf>, metrics: DeferredAuditMetrics) -> Self {
         Self {
