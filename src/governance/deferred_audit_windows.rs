@@ -216,12 +216,8 @@ pub(super) fn open_spool_ancestor_guards(path: &Path) -> Result<Vec<File>> {
                 ancestor.display()
             )
         })?;
-        validate_handle_shape(
-            &file,
-            ObjectKind::Directory,
-            "deferred-audit spool ancestor",
-        )?;
-        validate_ancestor_security(&file, "deferred-audit spool ancestor")?;
+        validate_handle_shape(&file, ObjectKind::Directory, super::SPOOL_ANCESTOR_LABEL)?;
+        validate_ancestor_security(&file, super::SPOOL_ANCESTOR_LABEL)?;
         guards.push(file);
     }
     Ok(guards)

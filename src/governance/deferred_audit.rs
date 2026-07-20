@@ -119,6 +119,8 @@ const JOURNAL_SPOOL_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const JOURNAL_LEGACY_REPLAY_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const JOURNAL_OVERFLOW_MARKER_LIMIT: usize = 256;
 const JOURNAL_OVERFLOW_PREFIX: &str = ".overflow-";
+#[cfg(any(target_os = "macos", windows))]
+const SPOOL_ANCESTOR_LABEL: &str = "deferred-audit spool ancestor";
 const JOURNAL_OVERFLOW_SATURATED: &str = ".overflow-saturated";
 const JOURNAL_OVERFLOW_MARKER_LABEL: &str = "deferred-audit overflow marker";
 /// Stable fail-closed reason propagated when a blocking verdict cannot be
@@ -465,27 +467,19 @@ impl DeferredAuditJournal {
             let entry = entry.context("read deferred-audit spool entry")?;
             let entry_path = entry.path();
             if is_publication_probe(&entry_path) {
-                #[cfg(windows)]
-                windows_private::open_private_file(
-                    &entry_path,
-                    "deferred-audit publication probe",
-                    false,
-                )?;
+                open_frame_file(&entry_path)
+                    .context("validate abandoned deferred-audit publication probe")?;
                 std::fs::remove_file(&entry_path)
                     .context("remove abandoned deferred-audit publication probe")?;
                 continue;
             }
             if entry_path.extension().is_some_and(|ext| ext == "pending") {
-                #[cfg(windows)]
-                windows_private::open_private_file(
-                    &entry_path,
-                    "deferred-audit pending frame",
-                    false,
-                )?;
+                let pending_file = open_frame_file(&entry_path)
+                    .context("validate deferred-audit pending frame")?;
                 let entry_type = entry
                     .file_type()
                     .context("inspect deferred-audit pending frame type")?;
-                let entry_len = entry
+                let entry_len = pending_file
                     .metadata()
                     .context("stat deferred-audit pending frame")?
                     .len();
@@ -542,12 +536,7 @@ impl DeferredAuditJournal {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with(JOURNAL_OVERFLOW_PREFIX))
             {
-                #[cfg(windows)]
-                windows_private::open_private_file(
-                    &entry_path,
-                    JOURNAL_OVERFLOW_MARKER_LABEL,
-                    false,
-                )?;
+                open_frame_file(&entry_path).context("validate deferred-audit overflow marker")?;
                 overflow_markers += 1;
             }
             if entry_path.extension().is_some_and(|ext| ext == "event") {
@@ -917,6 +906,8 @@ fn create_or_validate_spool_dir(spool_dir: &Path) -> Result<(bool, File, Vec<Fil
         if metadata.permissions().mode() & 0o777 != 0o700 {
             anyhow::bail!("deferred-audit spool directory is not private to the daemon uid");
         }
+        #[cfg(target_os = "macos")]
+        validate_macos_trivial_acl(&directory, "deferred-audit spool directory")?;
         directory
     };
     if created && let Some(parent) = spool_dir.parent() {
@@ -1006,6 +997,8 @@ fn validate_spool_ancestors_at(path: &Path) -> Result<()> {
                 ancestor.display()
             );
         }
+        #[cfg(target_os = "macos")]
+        validate_macos_trivial_acl(&directory, SPOOL_ANCESTOR_LABEL)?;
     }
     Ok(())
 }
@@ -1125,8 +1118,7 @@ fn create_private_marker(path: &Path, content: &[u8]) -> Result<bool> {
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists) =>
         {
-            #[cfg(windows)]
-            windows_private::open_private_file(path, JOURNAL_OVERFLOW_MARKER_LABEL, false)?;
+            open_frame_file(path).context("validate existing deferred-audit overflow marker")?;
             Ok(false)
         }
         Err(error) => Err(error).context("create deferred-audit overflow marker"),
@@ -1251,6 +1243,8 @@ fn open_frame_file(path: &Path) -> Result<File> {
         apply_no_follow(&mut options);
         let file = options.open(path)?;
         ensure_regular_file(&file, "journal frame")?;
+        #[cfg(unix)]
+        validate_unix_private_file(&file, "journal frame")?;
         Ok(file)
     }
 }
@@ -1291,18 +1285,7 @@ fn open_or_create_private_file(path: &Path, label: &str) -> Result<File> {
         };
         ensure_regular_file(&file, label)?;
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-
-            let metadata = file
-                .metadata()
-                .with_context(|| format!("inspect {label}"))?;
-            // SAFETY: geteuid has no preconditions and only reads process credentials.
-            let effective_uid = unsafe { libc::geteuid() };
-            if metadata.uid() != effective_uid || metadata.permissions().mode() & 0o777 != 0o600 {
-                anyhow::bail!("{label} is not private to the daemon uid");
-            }
-        }
+        validate_unix_private_file(&file, label)?;
         Ok(file)
     }
 }
@@ -1322,10 +1305,78 @@ fn create_new_private_file(path: &Path, label: &str) -> Result<File> {
             options.mode(0o600);
         }
         apply_no_follow(&mut options);
-        options
+        let file = options
             .open(path)
-            .with_context(|| format!("create private {label} {}", path.display()))
+            .with_context(|| format!("create private {label} {}", path.display()))?;
+        ensure_regular_file(&file, label)?;
+        #[cfg(unix)]
+        validate_unix_private_file(&file, label)?;
+        Ok(file)
     }
+}
+
+#[cfg(unix)]
+fn validate_unix_private_file(file: &File, label: &str) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect {label}"))?;
+    // SAFETY: geteuid has no preconditions and only reads process credentials.
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_uid || metadata.permissions().mode() & 0o777 != 0o600 {
+        anyhow::bail!("{label} is not private to the daemon uid");
+    }
+    #[cfg(target_os = "macos")]
+    validate_macos_trivial_acl(file, label)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn validate_macos_trivial_acl(file: &File, label: &str) -> Result<()> {
+    use std::ffi::c_void;
+    use std::os::fd::AsRawFd as _;
+
+    type Acl = *mut c_void;
+    type AclEntry = *mut c_void;
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> Acl;
+        fn acl_get_entry(acl: Acl, entry_id: libc::c_int, entry: *mut AclEntry) -> libc::c_int;
+        fn acl_free(value: *mut c_void) -> libc::c_int;
+    }
+    struct AclGuard(Acl);
+    impl Drop for AclGuard {
+        fn drop(&mut self) {
+            // SAFETY: acl_get_fd_np returned this owned ACL allocation.
+            unsafe {
+                acl_free(self.0);
+            }
+        }
+    }
+
+    // SAFETY: the descriptor is live and ACL_TYPE_EXTENDED is the Darwin
+    // extended-ACL selector accepted by acl_get_fd_np.
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("read {label} macOS extended ACL"));
+    }
+    let _acl_guard = AclGuard(acl);
+    let mut entry: AclEntry = std::ptr::null_mut();
+    // SAFETY: acl is live and entry points to writable storage. Darwin returns
+    // zero when it yields an entry and minus one when no first entry exists or
+    // an error occurs.
+    let status = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &raw mut entry) };
+    if status == 0 {
+        anyhow::bail!("{label} has a nontrivial macOS extended ACL");
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::EINVAL) {
+        return Err(error).with_context(|| format!("inspect {label} macOS extended ACL"));
+    }
+    Ok(())
 }
 
 fn verify_spool_identity(
@@ -4146,6 +4197,128 @@ mod tests {
         );
 
         std::fs::set_permissions(&exposed_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn journal_macos_rejects_extended_acl_ancestor_despite_private_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Command;
+
+        let dir = fresh_tempdir();
+        let exposed_parent = dir.path().join("extended-acl-parent");
+        std::fs::create_dir(&exposed_parent).unwrap();
+        std::fs::set_permissions(&exposed_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let status = Command::new("chmod")
+            .args(["+a", "everyone allow add_file,delete_child"])
+            .arg(&exposed_parent)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let journal_path = exposed_parent.join("audit.journal");
+
+        let error = DeferredAuditJournal::open(&journal_path)
+            .err()
+            .expect("extended ACL ancestor must fail closed");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("nontrivial macOS extended ACL"))
+        );
+        assert!(!journal_spool_dir(&journal_path).exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn journal_macos_rejects_extended_acl_on_existing_journal_without_repair() {
+        use std::process::Command;
+
+        let dir = fresh_tempdir();
+        let journal_path = dir.path().join("extended-acl.journal");
+        drop(DeferredAuditJournal::open(&journal_path).unwrap());
+        let status = Command::new("chmod")
+            .args(["+a", "everyone allow write,delete"])
+            .arg(&journal_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let error = DeferredAuditJournal::open(&journal_path)
+            .err()
+            .expect("extended ACL journal must fail closed");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("nontrivial macOS extended ACL"))
+        );
+        assert!(journal_path.exists(), "untrusted journal must be preserved");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn journal_macos_rejects_extended_acl_pending_frame_without_deleting_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Command;
+
+        let dir = fresh_tempdir();
+        let journal_path = dir.path().join("extended-pending.journal");
+        let journal = DeferredAuditJournal::open(&journal_path).unwrap();
+        let pending = journal.spool_dir.join("planted.pending");
+        drop(journal);
+        std::fs::write(&pending, b"torn").unwrap();
+        std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let status = Command::new("chmod")
+            .args(["+a", "everyone allow write,delete"])
+            .arg(&pending)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let error = DeferredAuditJournal::open(&journal_path)
+            .err()
+            .expect("extended ACL pending frame must fail closed");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("nontrivial macOS extended ACL"))
+        );
+        assert!(
+            pending.exists(),
+            "untrusted pending frame must be preserved"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn journal_macos_rejects_extended_acl_probe_without_deleting_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Command;
+
+        let dir = fresh_tempdir();
+        let journal_path = dir.path().join("extended-probe.journal");
+        let journal = DeferredAuditJournal::open(&journal_path).unwrap();
+        let probe = journal
+            .spool_dir
+            .join(format!(".{}.probe", uuid::Uuid::new_v4()));
+        drop(journal);
+        std::fs::write(&probe, []).unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let status = Command::new("chmod")
+            .args(["+a", "everyone allow write,delete"])
+            .arg(&probe)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let error = DeferredAuditJournal::open(&journal_path)
+            .err()
+            .expect("extended ACL probe must fail closed");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("nontrivial macOS extended ACL"))
+        );
+        assert!(probe.exists(), "untrusted probe must be preserved");
     }
 
     #[cfg(unix)]
