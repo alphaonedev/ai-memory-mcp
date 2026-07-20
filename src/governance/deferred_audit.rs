@@ -520,10 +520,11 @@ impl DeferredAuditJournal {
                     .occurrence_id
                     .as_deref()
                     .context("pending deferred-audit frame lacks occurrence ID")?;
-                let published = spool_dir.join(format!(
-                    "{}.event",
-                    hex::encode(payload_hash(occurrence_id.as_bytes()))
-                ));
+                let occurrence_hash = hex::encode(payload_hash(occurrence_id.as_bytes()));
+                let published = parse_pending_admission_sequence(&entry_path)?.map_or_else(
+                    || spool_dir.join(format!("{occurrence_hash}.event")),
+                    |sequence| spool_dir.join(format!("{sequence:020}-{occurrence_hash}.event")),
+                );
                 match std::fs::hard_link(&entry_path, &published) {
                     Ok(()) => sync_directory(&spool_dir)?,
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -549,6 +550,8 @@ impl DeferredAuditJournal {
                 overflow_markers += 1;
             }
             if entry_path.extension().is_some_and(|ext| ext == "event") {
+                parse_spool_event_name(&entry_path)
+                    .context("validate deferred-audit spool event filename")?;
                 if !entry
                     .file_type()
                     .context("inspect deferred-audit spool entry type")?
@@ -608,11 +611,10 @@ impl DeferredAuditJournal {
         let frame = journal_frame(&payload)?;
 
         if let Some(occurrence_id) = &event.occurrence_id {
-            let spool_path = self.spool_path(occurrence_id);
             let mut usage = self.spool_usage.lock().expect(JOURNAL_MUTEX_POISONED);
             let _spool_guard = self.lock_spool()?;
             *usage = scan_spool_usage(&self.spool_dir)?;
-            if spool_path.exists() {
+            if let Some(spool_path) = self.find_spool_path(occurrence_id)? {
                 let existing = read_journal_frame_bounded(&spool_path)
                     .context("journal spool append: read existing occurrence")?;
                 if existing == frame {
@@ -632,9 +634,12 @@ impl DeferredAuditJournal {
                 self.verify_lock_identity()?;
                 anyhow::bail!("deferred-audit spool quota exhausted; refusing unjournaled event");
             }
-            let staging_path = self
-                .spool_dir
-                .join(format!(".{}.pending", uuid::Uuid::new_v4()));
+            let admission_sequence = self.next_spool_sequence()?;
+            let spool_path = self.spool_path(occurrence_id, admission_sequence);
+            let staging_path = self.spool_dir.join(format!(
+                ".{admission_sequence:020}-{}.pending",
+                uuid::Uuid::new_v4()
+            ));
             let mut staging =
                 create_new_private_file(&staging_path, "deferred-audit spool staging frame")
                     .context("journal spool append: create staging")?;
@@ -702,22 +707,50 @@ impl DeferredAuditJournal {
         let mut out = replay_legacy_stream(&mut f)?;
         drop(f);
 
-        let mut spool_paths = Vec::new();
+        let mut spool_entries = Vec::new();
+        let mut sequences = std::collections::HashSet::new();
+        let mut occurrence_hashes = std::collections::HashSet::new();
         for entry in std::fs::read_dir(&self.spool_dir)
             .with_context(|| format!("journal replay: read spool {}", self.spool_dir.display()))?
         {
             let path = entry.context("journal replay: read spool entry")?.path();
             if path.extension().is_some_and(|ext| ext == "event") {
-                spool_paths.push(path);
+                let name = parse_spool_event_name(&path)?;
+                if !occurrence_hashes.insert(name.occurrence_hash.to_string()) {
+                    anyhow::bail!("duplicate deferred-audit occurrence hash in spool");
+                }
+                if name
+                    .admission_sequence
+                    .is_some_and(|sequence| !sequences.insert(sequence))
+                {
+                    anyhow::bail!("duplicate deferred-audit admission sequence in spool");
+                }
+                let admission_sequence = name.admission_sequence;
+                let occurrence_hash = name.occurrence_hash.to_string();
+                spool_entries.push((path, admission_sequence, occurrence_hash));
             }
         }
-        spool_paths.sort();
-        for path in spool_paths {
+        spool_entries.sort_by(|left, right| {
+            (left.1.is_some(), left.1.unwrap_or(0), &left.2).cmp(&(
+                right.1.is_some(),
+                right.1.unwrap_or(0),
+                &right.2,
+            ))
+        });
+        for (path, _, occurrence_hash) in spool_entries {
             let frame = read_journal_frame_bounded(&path)
                 .with_context(|| format!("journal replay: read {}", path.display()))?;
-            out.push(parse_complete_journal_frame(&frame).with_context(|| {
+            let event = parse_complete_journal_frame(&frame).with_context(|| {
                 format!("journal replay: corrupt spool frame {}", path.display())
-            })?);
+            })?;
+            let occurrence_id = event
+                .occurrence_id
+                .as_deref()
+                .context("spool event lacks occurrence ID")?;
+            if hex::encode(payload_hash(occurrence_id.as_bytes())) != occurrence_hash {
+                anyhow::bail!("spool filename does not match event occurrence ID");
+            }
+            out.push(event);
         }
         self.verify_lock_identity()?;
         Ok(out)
@@ -746,7 +779,10 @@ impl DeferredAuditJournal {
         occurrence_id: &str,
         usage: &mut SpoolUsage,
     ) -> Result<()> {
-        let spool_path = self.spool_path(occurrence_id);
+        let Some(spool_path) = self.find_spool_path(occurrence_id)? else {
+            self.verify_lock_identity()?;
+            return Ok(());
+        };
         let existing = match read_journal_frame_bounded(&spool_path) {
             Ok(bytes) => bytes,
             Err(error)
@@ -773,12 +809,69 @@ impl DeferredAuditJournal {
         Ok(())
     }
 
-    fn spool_path(&self, occurrence_id: &str) -> PathBuf {
+    fn spool_path(&self, occurrence_id: &str, admission_sequence: u64) -> PathBuf {
         let name = format!(
-            "{}.event",
+            "{admission_sequence:020}-{}.event",
             hex::encode(payload_hash(occurrence_id.as_bytes()))
         );
         self.spool_dir.join(name)
+    }
+
+    fn find_spool_path(&self, occurrence_id: &str) -> Result<Option<PathBuf>> {
+        let hash = hex::encode(payload_hash(occurrence_id.as_bytes()));
+        let mut found = None;
+        for entry in std::fs::read_dir(&self.spool_dir)
+            .with_context(|| format!("scan deferred-audit spool {}", self.spool_dir.display()))?
+        {
+            let path = entry.context("scan deferred-audit spool entry")?.path();
+            if !path
+                .extension()
+                .is_some_and(|extension| extension == "event")
+            {
+                continue;
+            }
+            let name = parse_spool_event_name(&path)?;
+            if name.occurrence_hash == hash && found.replace(path).is_some() {
+                anyhow::bail!("duplicate deferred-audit occurrence spool artifact");
+            }
+        }
+        Ok(found)
+    }
+
+    fn next_spool_sequence(&self) -> Result<u64> {
+        let mut maximum = 0_u64;
+        let mut sequences = std::collections::HashSet::new();
+        let mut occurrence_hashes = std::collections::HashSet::new();
+        for entry in std::fs::read_dir(&self.spool_dir)
+            .with_context(|| format!("scan deferred-audit spool {}", self.spool_dir.display()))?
+        {
+            let path = entry.context("scan deferred-audit spool entry")?.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "event")
+            {
+                let name = parse_spool_event_name(&path)?;
+                if !occurrence_hashes.insert(name.occurrence_hash.to_string()) {
+                    anyhow::bail!("duplicate deferred-audit occurrence hash in spool");
+                }
+                if let Some(sequence) = name.admission_sequence {
+                    if !sequences.insert(sequence) {
+                        anyhow::bail!("duplicate deferred-audit admission sequence in spool");
+                    }
+                    maximum = maximum.max(sequence);
+                }
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "pending")
+            {
+                if let Some(sequence) = parse_pending_admission_sequence(&path)? {
+                    maximum = maximum.max(sequence);
+                }
+            }
+        }
+        maximum
+            .checked_add(1)
+            .context("deferred-audit spool admission sequence exhausted")
     }
 
     fn sync_spool_dir(&self) -> Result<()> {
@@ -1136,6 +1229,78 @@ fn journal_frame(payload: &[u8]) -> Result<Vec<u8>> {
     frame.extend_from_slice(payload);
     frame.extend_from_slice(&hash);
     Ok(frame)
+}
+
+struct SpoolEventName<'a> {
+    admission_sequence: Option<u64>,
+    occurrence_hash: &'a str,
+}
+
+fn parse_spool_event_name(path: &Path) -> Result<SpoolEventName<'_>> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("deferred-audit spool event filename is not UTF-8")?;
+    let stem = name
+        .strip_suffix(".event")
+        .context("deferred-audit spool event has invalid extension")?;
+    let (admission_sequence, occurrence_hash) = if stem.len() == 64 {
+        (None, stem)
+    } else if stem.len() == 85 && stem.as_bytes()[20] == b'-' {
+        let sequence = &stem[..20];
+        if !sequence.bytes().all(|byte| byte.is_ascii_digit()) {
+            anyhow::bail!("deferred-audit spool sequence is not canonical decimal");
+        }
+        let parsed = sequence
+            .parse::<u64>()
+            .context("deferred-audit spool sequence exceeds u64")?;
+        if parsed == 0 {
+            anyhow::bail!("deferred-audit spool sequence must be positive");
+        }
+        (Some(parsed), &stem[21..])
+    } else {
+        anyhow::bail!("deferred-audit spool event filename is not canonical");
+    };
+    if !occurrence_hash
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        anyhow::bail!("deferred-audit spool occurrence hash is not canonical lowercase hex");
+    }
+    Ok(SpoolEventName {
+        admission_sequence,
+        occurrence_hash,
+    })
+}
+
+fn parse_pending_admission_sequence(path: &Path) -> Result<Option<u64>> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("deferred-audit pending filename is not UTF-8")?;
+    let stem = name
+        .strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".pending"))
+        .context("deferred-audit pending filename is not canonical")?;
+    if uuid::Uuid::parse_str(stem).is_ok() {
+        return Ok(None);
+    }
+    let (sequence, identifier) = stem
+        .split_once('-')
+        .context("deferred-audit pending filename is not canonical")?;
+    if sequence.len() != 20
+        || !sequence.bytes().all(|byte| byte.is_ascii_digit())
+        || uuid::Uuid::parse_str(identifier).is_err()
+    {
+        anyhow::bail!("deferred-audit pending filename is not canonical");
+    }
+    let parsed = sequence
+        .parse()
+        .context("deferred-audit pending sequence exceeds u64")?;
+    if parsed == 0 {
+        anyhow::bail!("deferred-audit pending sequence must be positive");
+    }
+    Ok(Some(parsed))
 }
 
 fn replay_legacy_stream(file: &mut File) -> Result<Vec<DeferredAuditEvent>> {
@@ -3575,7 +3740,10 @@ mod tests {
         .unwrap();
         event.occurrence_id = Some(uuid::Uuid::new_v4().to_string());
         journal.append(&event).unwrap();
-        let spool_path = journal.spool_path(event.occurrence_id.as_deref().unwrap());
+        let spool_path = journal
+            .find_spool_path(event.occurrence_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
         let expected_hash = payload_hash(&event.canonical_bytes().unwrap());
         let mismatched_hash = vec![0xA5_u8; 32];
         conn.execute(
@@ -3660,7 +3828,10 @@ mod tests {
         .unwrap();
         event.occurrence_id = Some(uuid::Uuid::new_v4().to_string());
         journal.append(&event).unwrap();
-        let spool_path = journal.spool_path(event.occurrence_id.as_deref().unwrap());
+        let spool_path = journal
+            .find_spool_path(event.occurrence_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
         let signed = signed_refusal_for_test(&event);
         assert_eq!(
             append_occurrence_serialized(&conn, &signed).unwrap(),
@@ -4299,7 +4470,9 @@ mod tests {
             DeferredAuditEvent::from_refusal("agent:valid", &refusal_action(), &refusal_decision())
                 .unwrap();
         journal.append(&ev).unwrap();
-        let pending = journal.spool_dir.join(".crash.pending");
+        let pending = journal
+            .spool_dir
+            .join(format!(".{}.pending", uuid::Uuid::new_v4()));
         let mut pending_file =
             create_new_private_file(&pending, "test deferred-audit staging frame").unwrap();
         pending_file.write_all(b"partial").unwrap();
@@ -4328,7 +4501,9 @@ mod tests {
             &refusal_decision(),
         )
         .unwrap();
-        let pending = journal.spool_dir.join(".crash.pending");
+        let pending = journal
+            .spool_dir
+            .join(format!(".{}.pending", uuid::Uuid::new_v4()));
         let mut pending_file =
             create_new_private_file(&pending, "test deferred-audit staging frame").unwrap();
         pending_file
@@ -4343,6 +4518,52 @@ mod tests {
         let replayed = reopened.replay().unwrap();
         assert_eq!(replayed.len(), 1);
         assert_eq!(replayed[0].occurrence_id, event.occurrence_id);
+    }
+
+    #[test]
+    fn journal_reconciles_sequence_bearing_pending_frames_in_admission_order() {
+        let dir = fresh_tempdir();
+        let journal_path = dir.path().join("pending-order.journal");
+        let journal = DeferredAuditJournal::open(&journal_path).unwrap();
+        let first = DeferredAuditEvent::from_refusal(
+            "agent:published-first",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        journal.append(&first).unwrap();
+
+        for (sequence, agent_id) in [(2_u64, "agent:pending-second"), (3, "agent:pending-third")] {
+            let event =
+                DeferredAuditEvent::from_refusal(agent_id, &refusal_action(), &refusal_decision())
+                    .unwrap();
+            let pending = journal
+                .spool_dir
+                .join(format!(".{sequence:020}-{}.pending", uuid::Uuid::new_v4()));
+            let mut pending_file =
+                create_new_private_file(&pending, "test deferred-audit staging frame").unwrap();
+            pending_file
+                .write_all(&journal_frame(&event.canonical_bytes().unwrap()).unwrap())
+                .unwrap();
+            pending_file.sync_all().unwrap();
+        }
+        drop(journal);
+
+        let replayed = DeferredAuditJournal::open(&journal_path)
+            .unwrap()
+            .replay()
+            .unwrap();
+        assert_eq!(
+            replayed
+                .iter()
+                .map(|event| event.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "agent:published-first",
+                "agent:pending-second",
+                "agent:pending-third"
+            ]
+        );
     }
 
     #[test]
@@ -4391,7 +4612,7 @@ mod tests {
             &refusal_decision(),
         )
         .unwrap();
-        let event_path = journal.spool_path(event.occurrence_id.as_deref().unwrap());
+        let event_path = journal.spool_path(event.occurrence_id.as_deref().unwrap(), 1);
         let file =
             create_new_private_file(&event_path, "test deferred-audit journal frame").unwrap();
         file.set_len(JOURNAL_MAX_FRAME_BYTES + 1).unwrap();
@@ -4474,7 +4695,10 @@ mod tests {
             journal.spool_lock.metadata().unwrap().permissions().mode() & 0o777,
             0o600
         );
-        let event_path = journal.spool_path(ev.occurrence_id.as_deref().unwrap());
+        let event_path = journal
+            .find_spool_path(ev.occurrence_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             std::fs::metadata(event_path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -4862,7 +5086,10 @@ mod tests {
         windows_private::validate_private_path_for_test(&path, false).unwrap();
         windows_private::validate_private_path_for_test(&journal.lock_path, false).unwrap();
         windows_private::validate_private_path_for_test(
-            &journal.spool_path(event.occurrence_id.as_deref().unwrap()),
+            &journal
+                .find_spool_path(event.occurrence_id.as_deref().unwrap())
+                .unwrap()
+                .unwrap(),
             false,
         )
         .unwrap();
@@ -4968,7 +5195,10 @@ mod tests {
         .unwrap();
         let journal = DeferredAuditJournal::open(&path).unwrap();
         journal.append(&event).unwrap();
-        let event_path = journal.spool_path(event.occurrence_id.as_deref().unwrap());
+        let event_path = journal
+            .find_spool_path(event.occurrence_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
         let marker = journal
             .spool_dir
             .join(format!("{JOURNAL_OVERFLOW_PREFIX}000"));
@@ -5106,7 +5336,7 @@ mod tests {
             Arc::new(DeferredAuditJournal::open(dir.path().join("quota.journal")).unwrap());
         // Populate the filesystem itself because admission deliberately rescans
         // under the OS lock instead of trusting the process-local cache.
-        let quota_filler = journal.spool_dir.join("quota-filler.event");
+        let quota_filler = journal.spool_dir.join(format!("{}.event", "0".repeat(64)));
         let filler =
             create_new_private_file(&quota_filler, "test deferred-audit journal frame").unwrap();
         filler.set_len(JOURNAL_SPOOL_MAX_BYTES).unwrap();
@@ -5207,7 +5437,7 @@ mod tests {
         while remaining > 0 {
             let chunk = remaining.min(JOURNAL_MAX_FRAME_BYTES);
             let filler = create_new_private_file(
-                &journal.spool_dir.join(format!("filler-{index}.event")),
+                &journal.spool_dir.join(format!("{index:064x}.event")),
                 "test deferred-audit journal frame",
             )
             .unwrap();
@@ -5350,6 +5580,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "exactly one row despite two recovery passes");
+    }
+
+    #[test]
+    fn journal_replay_preserves_admission_order_not_occurrence_hash_order() {
+        let dir = fresh_tempdir();
+        let journal = DeferredAuditJournal::open(dir.path().join("ordered.journal")).unwrap();
+        let first_id = uuid::Uuid::from_u128(1).to_string();
+        let first_hash = payload_hash(first_id.as_bytes());
+        let second_id = (2_u128..)
+            .map(|value| uuid::Uuid::from_u128(value).to_string())
+            .find(|candidate| payload_hash(candidate.as_bytes()) < first_hash)
+            .expect("find occurrence hash that sorts before the first");
+
+        let mut first = DeferredAuditEvent::from_refusal(
+            "agent:admission-first",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        first.occurrence_id = Some(first_id);
+        let mut second = DeferredAuditEvent::from_refusal(
+            "agent:admission-second",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        second.occurrence_id = Some(second_id);
+
+        journal.append(&first).unwrap();
+        journal.append(&second).unwrap();
+        drop(journal);
+
+        let replayed = DeferredAuditJournal::open(dir.path().join("ordered.journal"))
+            .unwrap()
+            .replay()
+            .unwrap();
+        assert_eq!(
+            replayed
+                .iter()
+                .map(|event| event.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            ["agent:admission-first", "agent:admission-second"]
+        );
     }
 
     #[test]
