@@ -86,7 +86,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use crate::governance::agent_action::{AgentAction, Decision};
-use crate::signed_events::{SignedEvent, append_signed_event, payload_hash};
+use crate::signed_events::{SignedEvent, append_signed_event_no_tx, payload_hash};
 
 /// Cluster-C SEC-3 (issue #767) — maximum number of times a sink will
 /// retry a single audit append after a `SQLITE_CONSTRAINT_UNIQUE` race
@@ -294,15 +294,14 @@ impl DeferredAuditEvent {
 /// (just `Arc` bumps); the public read path is on the queue handle.
 #[derive(Debug, Clone, Default)]
 pub struct DeferredAuditMetrics {
-    /// Number of events submitted into the queue. Includes events
-    /// that were later dropped because the receiver was already
-    /// closed.
+    /// Number of submission attempts. Includes events rejected during durable
+    /// journal admission and events not delivered because the receiver closed.
     pub submitted: Arc<AtomicU64>,
     /// Number of events the drainer successfully appended to
     /// `signed_events`.
     pub appended: Arc<AtomicU64>,
-    /// Number of submit attempts that failed because the receiver
-    /// was already closed (drainer dropped / shutdown raced).
+    /// Number of submit attempts that failed durable journal admission or
+    /// channel delivery (drainer dropped / shutdown raced).
     pub send_failures: Arc<AtomicU64>,
     /// Number of drainer iterations that failed the sink append, landed in
     /// the DLQ, or terminated after exhausting the panic-restart budget. A
@@ -343,7 +342,7 @@ impl DeferredAuditMetrics {
         self.appended.load(Ordering::Relaxed)
     }
 
-    /// Number of submit failures (receiver dropped).
+    /// Number of durable-admission or channel-delivery failures.
     #[must_use]
     pub fn send_failure_count(&self) -> u64 {
         self.send_failures.load(Ordering::Relaxed)
@@ -428,8 +427,10 @@ struct SpoolUsage {
 const JOURNAL_MUTEX_POISONED: &str = "deferred-audit journal mutex poisoned";
 
 impl DeferredAuditJournal {
-    /// Open (creating if absent) the journal at `path`, tightening to
-    /// mode 0600 on unix.
+    /// Open (creating if absent) the journal at `path` with private storage.
+    /// Existing Unix paths must already have the daemon's effective UID, exact
+    /// private modes, trusted ancestors, and (on macOS) no extended ACL. The
+    /// opener rejects unsafe state rather than repairing it.
     ///
     /// Opened `read + write` (NOT append-mode): on Windows an append-only
     /// handle grants `FILE_APPEND_DATA` but not the general write access
@@ -440,7 +441,8 @@ impl DeferredAuditJournal {
     /// truncate hazard.
     ///
     /// # Errors
-    /// Propagates the open / chmod IO error.
+    /// Propagates storage IO errors and rejects unsafe path type, identity,
+    /// ownership, permissions, ACL, or ancestor state.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let spool_dir = journal_spool_dir(&path);
@@ -1473,6 +1475,59 @@ fn occurrence_residence(
     }
 }
 
+fn append_occurrence_serialized(
+    conn: &rusqlite::Connection,
+    event: &SignedEvent,
+) -> Result<AppendOutcome> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .context("deferred-audit occurrence append: begin IMMEDIATE transaction")?;
+    if let Some(outcome) = occurrence_residence(&tx, &event.id, &event.payload_hash)? {
+        tx.commit()
+            .context("deferred-audit occurrence append: commit residence check")?;
+        return Ok(outcome);
+    }
+    append_signed_event_no_tx(&tx, event)
+        .context("deferred-audit occurrence append: append signed event")?;
+    tx.commit()
+        .context("deferred-audit occurrence append: commit signed event")?;
+    Ok(AppendOutcome::Appended)
+}
+
+fn land_occurrence_in_dlq_serialized(
+    conn: &rusqlite::Connection,
+    event: &SignedEvent,
+    failure_reason: &str,
+) -> Result<(AppendOutcome, bool)> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .context("deferred-audit DLQ landing: begin IMMEDIATE transaction")?;
+    if let Some(outcome) = occurrence_residence(&tx, &event.id, &event.payload_hash)? {
+        tx.commit()
+            .context("deferred-audit DLQ landing: commit residence check")?;
+        return Ok((outcome, false));
+    }
+    tx.execute(
+        "INSERT INTO signed_events_dlq \
+         (id, agent_id, event_type, payload_hash, signature, attest_level, \
+          timestamp, failure_reason, failed_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            event.id,
+            event.agent_id,
+            event.event_type,
+            event.payload_hash,
+            event.signature,
+            event.attest_level,
+            event.timestamp,
+            failure_reason,
+            chrono::Utc::now().to_rfc3339(),
+        ],
+    )
+    .context("SqliteSignedEventsSink: DLQ insert")?;
+    tx.commit()
+        .context("deferred-audit DLQ landing: commit DLQ row")?;
+    Ok((AppendOutcome::DlqLanded, true))
+}
+
 /// v0.8.0 PE-4 (#1732) — boot drain-on-recovery. Replays every intact
 /// record in the journal at `journal_path` into `signed_events` (via a
 /// fresh-`Connection` [`SqliteSignedEventsSink`]). **Idempotent:** new-format
@@ -1700,10 +1755,11 @@ impl DeferredAuditQueue {
     /// self-throttles the producer, applying implicit backpressure rather
     /// than growing without bound in practice.
     ///
-    /// Never panics — if the receiver is closed the metric counter is
-    /// bumped and a `tracing::warn` is emitted, but the caller path is
-    /// unaffected. Returns `true` when the event was queued, `false` when
-    /// the receiver was already closed.
+    /// Returns `true` only when durable admission (when configured) and channel
+    /// delivery both succeed. Returns `false`, increments `send_failures`, and
+    /// emits a warning when journal admission fails or the receiver is closed.
+    /// Direct callers must handle `false`; governed production wrappers convert
+    /// it to a fail-closed admission error.
     pub fn submit(&self, mut event: DeferredAuditEvent) -> bool {
         // Identity belongs to the delivery occurrence, not to the cloneable
         // payload. Reassign on every submit so two submissions of the same
@@ -1729,18 +1785,26 @@ impl DeferredAuditQueue {
             Ok(()) => true,
             Err(_) => {
                 self.metrics.send_failures.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    "deferred_audit_queue: submit failed (drainer receiver closed); \
-                     audit chain row LOST for this refusal"
-                );
+                if self.journal.is_some() {
+                    tracing::warn!(
+                        "deferred_audit_queue: submit failed (drainer receiver closed); \
+                         refusal remains durably journaled for boot recovery"
+                    );
+                } else {
+                    tracing::warn!(
+                        "deferred_audit_queue: submit failed (drainer receiver closed); \
+                         audit chain row LOST for this journal-less refusal"
+                    );
+                }
                 false
             }
         }
     }
 
-    /// Convenience: build + submit a refusal from the three hook
-    /// inputs. Returns `true` when an event was actually enqueued
-    /// (i.e. the verdict was a refusal AND the receiver was open).
+    /// Convenience: build + submit a refusal from the three hook inputs.
+    /// Returns `true` only for a refusal that passed durable admission and was
+    /// delivered. Returns `false` for a non-refusal, journal-admission failure,
+    /// or closed receiver.
     pub fn submit_refusal(
         &self,
         agent_id: &str,
@@ -1849,15 +1913,13 @@ pub trait DeferredAuditSink: Send + 'static {
 ///
 /// # Cluster-C SEC-3 (issue #767) — race-retry + DLQ
 ///
-/// The sink wraps `append_signed_event` in a bounded retry loop. A
-/// `SQLITE_CONSTRAINT_UNIQUE` failure on the `idx_signed_events_sequence`
-/// UNIQUE index is the recoverable race-only signal (two writers
-/// computed the same `next_seq` simultaneously); the sink re-runs
-/// `append_signed_event` (which re-reads the chain head) up to
-/// [`APPEND_UNIQUE_RACE_MAX_RETRIES`] times. Any other rusqlite
-/// error, or a retry budget exhaustion, lands the event in
-/// `signed_events_dlq` and returns `Ok(AppendOutcome::DlqLanded)` so
-/// the drainer can update its counters without crashing.
+/// The sink serializes occurrence-residence checks and chain insertion in one
+/// `BEGIN IMMEDIATE` transaction. If chain insertion fails, DLQ fallback opens
+/// a second `BEGIN IMMEDIATE` transaction and rechecks both tables before it
+/// inserts, preventing cross-process dual chain/DLQ residence. A bounded retry
+/// remains for defensive `signed_events.sequence` UNIQUE races. A failure to
+/// obtain either writer transaction leaves the durable spool occurrence intact
+/// for a later retry.
 pub struct SqliteSignedEventsSink {
     db_path: PathBuf,
     conn: Option<rusqlite::Connection>,
@@ -2045,17 +2107,17 @@ impl SqliteSignedEventsSink {
             ..SignedEvent::default()
         };
 
-        // Race-retry loop: SQLITE_CONSTRAINT_UNIQUE on the
-        // `idx_signed_events_sequence` index is the race-only failure
-        // mode. Every other rusqlite error path bails to DLQ.
+        // The IMMEDIATE transaction serializes the stable-occurrence residence
+        // check with the chain insertion. The bounded UNIQUE retry remains a
+        // defensive guard for chain-head constraint failures.
         let conn_path = self.db_path.clone();
         let mut last_err: Option<anyhow::Error> = None;
         for attempt in 0..=APPEND_UNIQUE_RACE_MAX_RETRIES {
             let conn = self.ensure_conn()?;
-            match append_signed_event(conn, &signed) {
-                Ok(()) => {
+            match append_occurrence_serialized(conn, &signed) {
+                Ok(outcome) => {
                     self.acknowledge(event)?;
-                    return Ok(AppendOutcome::Appended);
+                    return Ok(outcome);
                 }
                 Err(e) => {
                     if is_unique_constraint_race(&e) && attempt < APPEND_UNIQUE_RACE_MAX_RETRIES {
@@ -2072,25 +2134,6 @@ impl SqliteSignedEventsSink {
                     last_err = Some(e);
                     break;
                 }
-            }
-        }
-
-        // A peer process can commit this stable occurrence ID after our
-        // preflight but before our INSERT. Re-probe an ID-constraint failure
-        // before DLQ fallback so an idempotently matching chain row can never
-        // acquire dual residence. Other failures retain the normal DLQ path.
-        if last_err
-            .as_ref()
-            .is_some_and(is_occurrence_id_constraint_race)
-            && let Some(occurrence_id) = &event.occurrence_id
-        {
-            let residence = {
-                let conn = self.ensure_conn()?;
-                occurrence_residence(conn, occurrence_id, &signed.payload_hash)
-            }?;
-            if let Some(outcome) = residence {
-                self.acknowledge(event)?;
-                return Ok(outcome);
             }
         }
 
@@ -2129,34 +2172,20 @@ impl SqliteSignedEventsSink {
         let err = last_err.unwrap_or_else(|| anyhow::anyhow!("unknown drainer sink error"));
         let failure_reason = format!("{err:#}");
         let conn = self.ensure_conn()?;
-        conn.execute(
-            "INSERT INTO signed_events_dlq \
-             (id, agent_id, event_type, payload_hash, signature, attest_level, \
-              timestamp, failure_reason, failed_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            rusqlite::params![
-                signed.id,
-                signed.agent_id,
-                signed.event_type,
-                signed.payload_hash,
-                signed.signature,
-                signed.attest_level,
-                signed.timestamp,
-                failure_reason,
-                chrono::Utc::now().to_rfc3339(),
-            ],
-        )
-        .context("SqliteSignedEventsSink: DLQ insert")?;
-        tracing::error!(
-            failure_reason = %failure_reason,
-            agent_id = %signed.agent_id,
-            event_id = %signed.id,
-            "deferred_audit sink: append exhausted retries or hit non-race error — \
-             event landed in signed_events_dlq (chain row NOT advanced; replay needed)"
-        );
-        self.bump_dlq();
+        let (outcome, freshly_landed) =
+            land_occurrence_in_dlq_serialized(conn, &signed, &failure_reason)?;
+        if freshly_landed {
+            tracing::error!(
+                failure_reason = %failure_reason,
+                agent_id = %signed.agent_id,
+                event_id = %signed.id,
+                "deferred_audit sink: append exhausted retries or hit non-race error — \
+                 event landed in signed_events_dlq (chain row NOT advanced; replay needed)"
+            );
+            self.bump_dlq();
+        }
         self.acknowledge(event)?;
-        Ok(AppendOutcome::DlqLanded)
+        Ok(outcome)
     }
 }
 
@@ -2180,28 +2209,6 @@ fn is_unique_constraint_race(err: &anyhow::Error) -> bool {
                     message.contains("signed_events.sequence")
                         || message.contains("idx_signed_events_sequence")
                 })
-            {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn is_occurrence_id_constraint_race(err: &anyhow::Error) -> bool {
-    for cause in err.chain() {
-        if let Some(rusqlite::Error::SqliteFailure(code, message)) =
-            cause.downcast_ref::<rusqlite::Error>()
-        {
-            let is_id_constraint = matches!(
-                code.extended_code,
-                rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
-                    | rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
-            );
-            if is_id_constraint
-                && message
-                    .as_deref()
-                    .is_some_and(|message| message.contains("signed_events.id"))
             {
                 return true;
             }
@@ -3491,6 +3498,74 @@ mod tests {
         assert_eq!(count, 1);
     }
 
+    #[test]
+    fn serialized_dlq_fallback_rechecks_peer_chain_commit() {
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+
+        let dir = fresh_tempdir();
+        let db_path = dir.path().join("busy-peer-commit.db");
+        let conn_a = crate::db::open(&db_path).expect("init writer A");
+        let conn_b = crate::db::open(&db_path).expect("open writer B");
+        conn_b
+            .busy_timeout(Duration::from_millis(10))
+            .expect("short deterministic busy timeout");
+        let mut event = DeferredAuditEvent::from_refusal(
+            "agent:busy-peer",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        event.occurrence_id = Some(uuid::Uuid::new_v4().to_string());
+        let signed = SignedEvent {
+            id: event.occurrence_id.clone().unwrap(),
+            agent_id: event.agent_id.clone(),
+            event_type: GOVERNANCE_REFUSAL_EVENT_TYPE.to_string(),
+            payload_hash: payload_hash(&event.canonical_bytes().unwrap()),
+            attest_level: crate::models::AttestLevel::Unsigned.as_str().to_string(),
+            timestamp: event.timestamp.to_rfc3339(),
+            ..SignedEvent::default()
+        };
+
+        let tx_a =
+            rusqlite::Transaction::new_unchecked(&conn_a, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+        append_signed_event_no_tx(&tx_a, &signed).unwrap();
+
+        let signed_for_b = signed.clone();
+        let (busy_seen_tx, busy_seen_rx) = sync_channel(0);
+        let (peer_committed_tx, peer_committed_rx) = sync_channel(0);
+        let writer_b = std::thread::spawn(move || {
+            assert!(append_occurrence_serialized(&conn_b, &signed_for_b).is_err());
+            busy_seen_tx.send(()).unwrap();
+            peer_committed_rx.recv().unwrap();
+            land_occurrence_in_dlq_serialized(&conn_b, &signed_for_b, "database is locked")
+        });
+
+        busy_seen_rx.recv().unwrap();
+        tx_a.commit().unwrap();
+        peer_committed_tx.send(()).unwrap();
+        let (outcome, freshly_landed) = writer_b.join().unwrap().unwrap();
+        assert_eq!(outcome, AppendOutcome::Appended);
+        assert!(!freshly_landed);
+
+        let chain_count: i64 = conn_a
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE id = ?1",
+                [&signed.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let dlq_count: i64 = conn_a
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events_dlq WHERE id = ?1",
+                [&signed.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((chain_count, dlq_count), (1, 0));
+    }
+
     #[tokio::test]
     async fn sqlite_sink_lazy_open_only_on_first_append() {
         // Construct a sink against a path that doesn't exist yet; if
@@ -3608,45 +3683,28 @@ mod tests {
     /// `signed_events_dlq` (NOT silently dropped) and the
     /// `dlq_landed` counter MUST bump.
     ///
-    /// Failure injection: pre-fill `signed_events` with a row whose
-    /// `id` collides with the next UUIDv4 the sink will mint. We can't
-    /// predict UUIDs, so we instead break the table at the schema
-    /// level: drop the `event_type` column. The next `append_signed_event`
-    /// fails on the INSERT (column not found) — an unrecoverable
-    /// non-race error that triggers DLQ land.
+    /// Failure injection: a `BEFORE INSERT` trigger rejects only the chain
+    /// insert while leaving residence queries and the DLQ healthy.
     #[tokio::test]
     async fn sqlite_sink_lands_event_in_dlq_on_unrecoverable_error() {
         let dir = fresh_tempdir();
         let db_path = dir.path().join("dlq-test.db");
         let _ = crate::db::open(&db_path).expect("init db");
 
-        // Inject the fault: drop the NOT-NULL `event_type` column from
-        // signed_events. Subsequent inserts fail with a constraint
-        // error (NULL into NOT NULL slot) — an unrecoverable non-race
-        // error. We do this by rebuilding the table without the
-        // column; the DLQ table stays intact.
+        // Inject an unrecoverable non-race chain failure without damaging the
+        // schema used by the serialized residence check.
         {
             let conn = crate::db::open(&db_path).expect("open for fault inject");
             conn.execute_batch(
-                "DROP TABLE signed_events; \
-                 CREATE TABLE signed_events ( \
-                    id TEXT PRIMARY KEY, \
-                    agent_id TEXT NOT NULL, \
-                    payload_hash BLOB NOT NULL, \
-                    signature BLOB, \
-                    attest_level TEXT NOT NULL DEFAULT 'unsigned', \
-                    timestamp TEXT NOT NULL, \
-                    prev_hash BLOB, \
-                    sequence INTEGER, cause_hash BLOB \
-                 ); \
-                 CREATE UNIQUE INDEX idx_signed_events_sequence \
-                    ON signed_events(sequence);",
+                "CREATE TRIGGER reject_deferred_audit_chain \
+                 BEFORE INSERT ON signed_events \
+                 BEGIN SELECT RAISE(FAIL, 'injected chain failure'); END;",
             )
-            .expect("fault-inject schema rewrite");
+            .expect("fault-inject chain trigger");
         }
 
         // Spawn drainer + submit one event. The sink will fail the
-        // append (column missing → schema mismatch is unrecoverable)
+        // append (trigger rejection is an unrecoverable non-race failure)
         // and land it in DLQ.
         let (queue, supervisor) = install_deferred_audit_drainer(&db_path);
         let metrics = queue.metrics();
@@ -3691,14 +3749,6 @@ mod tests {
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE),
             Some("UNIQUE constraint failed: signed_events.sequence".to_string()),
         );
-        let id_unique_err = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE),
-            Some("UNIQUE constraint failed: signed_events.id".to_string()),
-        );
-        let id_primary_key_err = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY),
-            Some("UNIQUE constraint failed: signed_events.id".to_string()),
-        );
         let other_err = rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
             Some("database is locked".to_string()),
@@ -3709,14 +3759,6 @@ mod tests {
             anyhow::Error::from(other_err).context("append signed_event");
         assert!(is_unique_constraint_race(&wrapped_unique));
         assert!(!is_unique_constraint_race(&wrapped_other));
-        let id_unique_err = anyhow::Error::from(id_unique_err);
-        assert!(!is_unique_constraint_race(&id_unique_err));
-        assert!(is_occurrence_id_constraint_race(&id_unique_err));
-        assert!(is_occurrence_id_constraint_race(&anyhow::Error::from(
-            id_primary_key_err
-        )));
-        assert!(!is_occurrence_id_constraint_race(&wrapped_unique));
-
         // Non-rusqlite errors are never UNIQUE races.
         let plain: anyhow::Error = anyhow::anyhow!("plain error");
         assert!(!is_unique_constraint_race(&plain));

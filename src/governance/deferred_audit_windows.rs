@@ -843,6 +843,45 @@ fn create_path_with_sddl_for_test(path: &Path, directory: bool, sddl: &str) -> R
 mod ancestor_policy_tests {
     use super::*;
 
+    fn test_sid(subauthorities: &[u32]) -> Vec<u8> {
+        let mut sid = Vec::with_capacity(8 + std::mem::size_of_val(subauthorities));
+        sid.push(1);
+        sid.push(u8::try_from(subauthorities.len()).unwrap());
+        sid.extend_from_slice(&[0, 0, 0, 0, 0, 5]);
+        for subauthority in subauthorities {
+            sid.extend_from_slice(&subauthority.to_le_bytes());
+        }
+        sid
+    }
+
+    fn test_allow_ace(
+        ace_type: u32,
+        ace_flags: u8,
+        mask: u32,
+        object_flags: Option<u32>,
+        sid: &[u8],
+    ) -> Vec<u8> {
+        let mut ace = vec![u8::try_from(ace_type).unwrap(), ace_flags, 0, 0];
+        ace.extend_from_slice(&mask.to_le_bytes());
+        if let Some(object_flags) = object_flags {
+            ace.extend_from_slice(&object_flags.to_le_bytes());
+            if object_flags & ACE_OBJECT_TYPE_PRESENT != 0 {
+                ace.extend_from_slice(&[0x11; 16]);
+            }
+            if object_flags & ACE_INHERITED_OBJECT_TYPE_PRESENT != 0 {
+                ace.extend_from_slice(&[0x22; 16]);
+            }
+        }
+        ace.extend_from_slice(sid);
+        let ace_size = u16::try_from(ace.len()).unwrap();
+        ace[2..4].copy_from_slice(&ace_size.to_le_bytes());
+        ace
+    }
+
+    fn validate_test_ace(ace: &[u8], trusted: &[PSID]) -> Result<()> {
+        validate_ancestor_ace(ace.as_ptr().cast(), trusted, "test ancestor")
+    }
+
     #[test]
     fn dangerous_ancestor_mask_covers_every_namespace_control_right() {
         for mask in [
@@ -881,5 +920,93 @@ mod ancestor_policy_tests {
 
         assert!(sid_is_one_of(current.as_ptr(), &trusted));
         assert!(!sid_is_one_of(foreign.as_ptr(), &trusted));
+    }
+
+    #[test]
+    fn callback_allow_ace_enforces_dangerous_foreign_sid() {
+        let trusted_sid = string_sid("S-1-5-18").unwrap();
+        let trusted = [trusted_sid.as_ptr()];
+        let trusted_bytes = test_sid(&[18]);
+        let foreign_bytes = test_sid(&[21, 1, 2, 3, 2002]);
+
+        let trusted_ace = test_allow_ace(
+            ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
+            0,
+            FILE_DELETE_CHILD,
+            None,
+            &trusted_bytes,
+        );
+        assert!(validate_test_ace(&trusted_ace, &trusted).is_ok());
+
+        let foreign_ace = test_allow_ace(
+            ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
+            0,
+            WRITE_DAC,
+            None,
+            &foreign_bytes,
+        );
+        assert!(validate_test_ace(&foreign_ace, &trusted).is_err());
+
+        let benign_foreign_ace = test_allow_ace(
+            ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
+            0,
+            FILE_GENERIC_WRITE,
+            None,
+            &foreign_bytes,
+        );
+        assert!(validate_test_ace(&benign_foreign_ace, &trusted).is_ok());
+    }
+
+    #[test]
+    fn object_allow_aces_enforce_every_guid_offset() {
+        let trusted_sid = string_sid("S-1-5-18").unwrap();
+        let trusted = [trusted_sid.as_ptr()];
+        let trusted_bytes = test_sid(&[18]);
+        let foreign_bytes = test_sid(&[21, 1, 2, 3, 2002]);
+        let object_flag_sets = [
+            0,
+            ACE_OBJECT_TYPE_PRESENT,
+            ACE_INHERITED_OBJECT_TYPE_PRESENT,
+            ACE_OBJECT_TYPE_PRESENT | ACE_INHERITED_OBJECT_TYPE_PRESENT,
+        ];
+
+        for ace_type in [
+            ACCESS_ALLOWED_OBJECT_ACE_TYPE,
+            ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE,
+        ] {
+            for object_flags in object_flag_sets {
+                let trusted_ace =
+                    test_allow_ace(ace_type, 0, WRITE_OWNER, Some(object_flags), &trusted_bytes);
+                assert!(validate_test_ace(&trusted_ace, &trusted).is_ok());
+
+                let foreign_ace =
+                    test_allow_ace(ace_type, 0, GENERIC_ALL, Some(object_flags), &foreign_bytes);
+                assert!(validate_test_ace(&foreign_ace, &trusted).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn compound_allow_ace_fails_closed_and_inherit_only_is_ignored() {
+        let trusted_sid = string_sid("S-1-5-18").unwrap();
+        let trusted = [trusted_sid.as_ptr()];
+        let sid = test_sid(&[18]);
+        let compound = test_allow_ace(
+            ACCESS_ALLOWED_COMPOUND_ACE_TYPE,
+            0,
+            FILE_DELETE_CHILD,
+            None,
+            &sid,
+        );
+        assert!(validate_test_ace(&compound, &trusted).is_err());
+
+        let inherit_only = test_allow_ace(
+            ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE,
+            u8::try_from(INHERIT_ONLY_ACE).unwrap(),
+            GENERIC_ALL,
+            Some(ACE_OBJECT_TYPE_PRESENT | ACE_INHERITED_OBJECT_TYPE_PRESENT),
+            &test_sid(&[21, 1, 2, 3, 2002]),
+        );
+        assert!(validate_test_ace(&inherit_only, &trusted).is_ok());
     }
 }
