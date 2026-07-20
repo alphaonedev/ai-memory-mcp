@@ -6031,17 +6031,32 @@ fn init_tracing() {
 #[derive(Debug)]
 pub struct FatalShutdownError {
     reason: &'static str,
+    detail: Option<String>,
 }
 
 impl FatalShutdownError {
     const fn new(reason: &'static str) -> Self {
-        Self { reason }
+        Self {
+            reason,
+            detail: None,
+        }
+    }
+
+    fn with_detail(reason: &'static str, detail: String) -> Self {
+        Self {
+            reason,
+            detail: Some(detail),
+        }
     }
 }
 
 impl std::fmt::Display for FatalShutdownError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "fatal daemon shutdown: {}", self.reason)
+        write!(formatter, "fatal daemon shutdown: {}", self.reason)?;
+        if let Some(detail) = &self.detail {
+            write!(formatter, ": {detail}")?;
+        }
+        Ok(())
     }
 }
 
@@ -6062,7 +6077,18 @@ fn fatal_shutdown(reason: &'static str) -> anyhow::Error {
 pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) -> Result<()> {
     init_tracing();
 
-    let mut bootstrap = bootstrap_serve(&db_path, &args, app_config).await?;
+    let mut bootstrap = match bootstrap_serve(&db_path, &args, app_config).await {
+        Ok(bootstrap) => bootstrap,
+        Err(error) => {
+            let detail = format!("{error:#}");
+            tracing::error!(%error, "daemon bootstrap failed; terminating before runtime drop");
+            eprintln!("ai-memory: fatal daemon bootstrap failure: {detail} (exit 75)");
+            return Err(anyhow::Error::new(FatalShutdownError::with_detail(
+                "daemon bootstrap failed",
+                detail,
+            )));
+        }
+    };
 
     // Round-2 F8 + Round-3 F12 — startup banner. Surfaces the effective
     // permissions mode (and the v0.7.0 enforce-default migration warning
@@ -6211,6 +6237,8 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     let api_key_state = bootstrap.api_key_state;
     let app_state = bootstrap.app_state;
     let request_timeout = bootstrap.request_timeout;
+    let server_aux_tasks = Arc::new(std::sync::Mutex::new(Vec::<JoinHandle<()>>::new()));
+    let server_aux_tasks_for_run = Arc::clone(&server_aux_tasks);
 
     // Native TLS (Layer 1): if both --tls-cert and --tls-key are provided,
     // bind via axum-server + rustls. Plain HTTP otherwise — backward
@@ -6251,10 +6279,14 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
             let grace = std::time::Duration::from_secs(args.shutdown_grace_secs);
             let handle = axum_server::Handle::new();
             let handle_clone = handle.clone();
-            tokio::spawn(async move {
+            let signal_task = tokio::spawn(async move {
                 shutdown.await;
                 handle_clone.graceful_shutdown(Some(grace));
             });
+            server_aux_tasks_for_run
+                .lock()
+                .expect("server auxiliary task registry poisoned")
+                .push(signal_task);
             // v0.7.0 #1581 — bind with the NoDelayAcceptor-wrapped rustls
             // acceptor instead of `bind_rustls` (whose DefaultAcceptor never
             // sets TCP_NODELAY). Without it, Nagle + the client's delayed-ACK
@@ -6332,6 +6364,12 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         Ok(())
     }
     .await;
+    bootstrap.task_handles.extend(
+        server_aux_tasks
+            .lock()
+            .expect("server auxiliary task registry poisoned")
+            .drain(..),
+    );
 
     // Stop and join every periodic/background writer before establishing the
     // deferred-audit receiver-close barrier. Dropping a Tokio JoinHandle would

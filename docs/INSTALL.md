@@ -790,7 +790,7 @@ Environment=RUST_LOG=ai_memory=info
 
 # Graceful shutdown checkpoints the WAL
 KillSignal=SIGINT
-TimeoutStopSec=10
+TimeoutStopSec=60
 
 [Install]
 WantedBy=multi-user.target

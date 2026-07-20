@@ -67,7 +67,7 @@ Environment=RUST_LOG=ai_memory=info,tower_http=info
 
 # Graceful shutdown: checkpoints WAL before exit
 KillSignal=SIGINT
-TimeoutStopSec=10
+TimeoutStopSec=60
 
 [Install]
 WantedBy=multi-user.target
@@ -857,7 +857,10 @@ The HTTP daemon handles SIGINT (Ctrl+C) gracefully:
 3. Checkpoints the WAL (`PRAGMA wal_checkpoint(TRUNCATE)`)
 4. Exits cleanly
 
-For systemd, use `KillSignal=SIGINT` and `TimeoutStopSec=10` to ensure the checkpoint completes.
+For systemd, use `KillSignal=SIGINT` and `TimeoutStopSec=60`. This covers the
+default 30-second HTTP request grace period plus the bounded background-writer
+and deferred-audit drain phases, leaving time for the final witness/checkpoint
+or the visible exit-75 failure path.
 
 > **Note:** The HTTP daemon handles SIGINT (Ctrl+C) gracefully with WAL checkpoint. Systemd sends SIGTERM by default -- the service file sets `KillSignal=SIGINT` to ensure clean shutdown.
 
