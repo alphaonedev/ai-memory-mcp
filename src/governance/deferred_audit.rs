@@ -660,6 +660,9 @@ impl DeferredAuditJournal {
         }
 
         // Legacy records without occurrence IDs retain the v1 frame stream.
+        // Use the same cross-process lock order as recovery (spool → file) so
+        // no second journal handle can append between snapshot and truncate.
+        let _spool_guard = self.lock_spool()?;
         let mut f = self.file.lock().expect(JOURNAL_MUTEX_POISONED);
         // Seek to end before writing — the handle is read+write (not
         // append-mode, for Windows truncate compatibility), and the Mutex
@@ -1844,23 +1847,24 @@ impl DeferredAuditQueue {
 /// into three buckets so the drainer's metrics + DLQ accounting line
 /// up with the operator-facing semantics:
 ///
-/// * [`AppendOutcome::Appended`] — row landed in `signed_events`,
-///   chain advanced one step. Increments `appended`.
-/// * [`AppendOutcome::DlqLanded`] — append exhausted its race-retry
-///   budget or hit an unrecoverable non-race error; the sink wrote
-///   the event into `signed_events_dlq` with the failure reason
-///   captured. Increments `dlq_landed`. The audit chain itself does
-///   NOT advance, but the row is recoverable post-mortem.
+/// * [`AppendOutcome::Appended`] — the occurrence is terminally resident in
+///   `signed_events`, either freshly inserted or idempotently observed.
+///   Drainer handling increments `appended`; an idempotent observation does not
+///   imply that this call advanced the chain.
+/// * [`AppendOutcome::DlqLanded`] — the occurrence is terminally resident in
+///   `signed_events_dlq`, either freshly inserted after a chain failure or
+///   idempotently observed. Drainer handling counts this as an append failure;
+///   `dlq_landed` increments only for a DLQ row freshly inserted by this sink.
 /// * Returning `Err(_)` from `append` means the sink could not even
 ///   land in the DLQ (e.g. DB file gone, schema mismatch). Increments
 ///   `append_failures` — the chain-log property has truly broken for
 ///   this event and an operator must intervene.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppendOutcome {
-    /// Event landed in `signed_events`.
+    /// Event is terminally resident in `signed_events` (new or pre-existing).
     Appended,
-    /// Event landed in `signed_events_dlq` after exhausting retries
-    /// or hitting an unrecoverable non-race error.
+    /// Event is terminally resident in `signed_events_dlq` (new or
+    /// pre-existing).
     DlqLanded,
 }
 
@@ -3512,7 +3516,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_sink_retry_rejects_mismatched_dlq_and_preserves_spool() {
+    fn sqlite_sink_retry_checks_every_dlq_hash_and_preserves_spool() {
         let dir = fresh_tempdir();
         let db_path = dir.path().join("retry-mismatched-dlq.db");
         let conn = crate::db::open(&db_path).expect("init db");
@@ -3527,7 +3531,22 @@ mod tests {
         event.occurrence_id = Some(uuid::Uuid::new_v4().to_string());
         journal.append(&event).unwrap();
         let spool_path = journal.spool_path(event.occurrence_id.as_deref().unwrap());
+        let expected_hash = payload_hash(&event.canonical_bytes().unwrap());
         let mismatched_hash = vec![0xA5_u8; 32];
+        conn.execute(
+            "INSERT INTO signed_events_dlq \
+             (id, agent_id, event_type, payload_hash, attest_level, timestamp, \
+              failure_reason, failed_at) \
+             VALUES (?1, ?2, ?3, ?4, 'unsigned', ?5, 'injected matching', ?5)",
+            rusqlite::params![
+                event.occurrence_id,
+                event.agent_id,
+                GOVERNANCE_REFUSAL_EVENT_TYPE,
+                expected_hash,
+                event.timestamp.to_rfc3339(),
+            ],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO signed_events_dlq \
              (id, agent_id, event_type, payload_hash, attest_level, timestamp, \
@@ -3561,13 +3580,16 @@ mod tests {
 
         let conn = crate::db::open(&db_path).unwrap();
         let hashes: Vec<Vec<u8>> = conn
-            .prepare("SELECT payload_hash FROM signed_events_dlq WHERE id = ?1")
+            .prepare(
+                "SELECT payload_hash FROM signed_events_dlq \
+                 WHERE id = ?1 ORDER BY dlq_id",
+            )
             .unwrap()
             .query_map([event.occurrence_id.as_deref().unwrap()], |row| row.get(0))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(hashes, vec![vec![0xA5_u8; 32]]);
+        assert_eq!(hashes, vec![expected_hash, vec![0xA5_u8; 32]]);
         let chain_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM signed_events WHERE id = ?1",
@@ -4087,6 +4109,97 @@ mod tests {
             2,
             "the 2 intact records replay; the torn trailing frame is discarded"
         );
+    }
+
+    #[test]
+    fn legacy_append_waits_through_snapshot_and_truncate() {
+        use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+        use std::time::Duration;
+
+        let dir = fresh_tempdir();
+        let journal_path = dir.path().join("legacy-snapshot-truncate.journal");
+        let snapshot_handle = DeferredAuditJournal::open(&journal_path).unwrap();
+        let append_handle = DeferredAuditJournal::open(&journal_path).unwrap();
+        let mut first = DeferredAuditEvent::from_refusal(
+            "agent:legacy-before-snapshot",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        let mut second = DeferredAuditEvent::from_refusal(
+            "agent:legacy-after-snapshot",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        first.occurrence_id = None;
+        second.occurrence_id = None;
+        snapshot_handle.append(&first).unwrap();
+
+        let spool_guard = snapshot_handle.lock_spool().unwrap();
+        let snapshot = snapshot_handle.replay_locked().unwrap();
+        assert_eq!(snapshot.len(), 1);
+        let (started_tx, started_rx) = sync_channel(0);
+        let (finished_tx, finished_rx) = sync_channel(0);
+        let appender = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = append_handle.append(&second);
+            finished_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(100)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+
+        snapshot_handle.truncate().unwrap();
+        drop(spool_guard);
+        finished_rx.recv().unwrap().unwrap();
+        appender.join().unwrap();
+        let remaining = snapshot_handle.replay().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].agent_id, "agent:legacy-after-snapshot");
+    }
+
+    #[test]
+    fn simultaneous_legacy_appends_from_two_handles_preserve_multiplicity() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = fresh_tempdir();
+        let journal_path = dir.path().join("legacy-two-handles.journal");
+        let first_handle = DeferredAuditJournal::open(&journal_path).unwrap();
+        let second_handle = DeferredAuditJournal::open(&journal_path).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let spawn_append = |handle: DeferredAuditJournal, agent_id: &'static str| {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let mut event = DeferredAuditEvent::from_refusal(
+                    agent_id,
+                    &refusal_action(),
+                    &refusal_decision(),
+                )
+                .unwrap();
+                event.occurrence_id = None;
+                barrier.wait();
+                handle.append(&event).unwrap();
+            })
+        };
+        let first = spawn_append(first_handle, "agent:legacy-handle-one");
+        let second = spawn_append(second_handle, "agent:legacy-handle-two");
+        barrier.wait();
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let replay = DeferredAuditJournal::open(&journal_path)
+            .unwrap()
+            .replay()
+            .unwrap();
+        let agents: std::collections::HashSet<_> =
+            replay.iter().map(|event| event.agent_id.as_str()).collect();
+        assert_eq!(replay.len(), 2);
+        assert_eq!(agents.len(), 2);
+        assert!(agents.contains("agent:legacy-handle-one"));
+        assert!(agents.contains("agent:legacy-handle-two"));
     }
 
     #[test]
