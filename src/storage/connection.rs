@@ -24,10 +24,12 @@ fn register_valid_time_functions(conn: &Connection) -> rusqlite::Result<()> {
         1,
         FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS,
         |ctx| {
-            let raw = ctx.get::<String>(0)?;
-            Ok(chrono::DateTime::parse_from_rfc3339(&raw)
-                .ok()
-                .map(|instant| instant.timestamp_micros()))
+            let raw = ctx.get::<Option<String>>(0)?;
+            Ok(raw.and_then(|value| {
+                chrono::DateTime::parse_from_rfc3339(&value)
+                    .ok()
+                    .map(|instant| instant.timestamp_micros())
+            }))
         },
     )
 }
@@ -350,6 +352,18 @@ fn apply_sqlcipher_key(_conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn valid_time_projection_accepts_sql_null_2266() {
+        let conn = Connection::open_in_memory().expect("open in-memory database");
+        register_valid_time_functions(&conn).expect("register valid-time functions");
+
+        let projected: Option<i64> = conn
+            .query_row("SELECT rfc3339_epoch_micros(NULL)", [], |row| row.get(0))
+            .expect("SQL NULL must project to SQL NULL");
+
+        assert_eq!(projected, None);
+    }
 
     #[test]
     fn open_round_trip_creates_db_and_runs_migrations() {

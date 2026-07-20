@@ -27010,6 +27010,34 @@ mod tests {
             got.valid_until.as_deref(),
             Some("2026-07-20T12:34:56.000000Z")
         );
+
+        // The conflict arm must preserve the claim's genesis while allowing
+        // a later write to close its upper bound. A regression here would
+        // make the embedded hot path disagree with plain `store()` even
+        // though the initial insert above still passed.
+        mem.id = uuid::Uuid::new_v4().to_string();
+        mem.valid_from = Some("2030-01-01T00:00:00Z".to_string());
+        mem.valid_until = Some("2026-07-19T18:45:01.654321-04:00".to_string());
+        let upserted_id = store
+            .store_with_embedding(&ctx, &mem, Some(&embedding), Some("test-space#none"))
+            .await
+            .expect("upsert store_with_embedding");
+        assert_eq!(
+            upserted_id, id,
+            "title/namespace upsert must keep row identity"
+        );
+
+        let upserted = store.get(&ctx, &id).await.expect("get upserted row");
+        assert_eq!(
+            upserted.valid_from.as_deref(),
+            Some("2026-07-19T07:34:56.123456Z"),
+            "upsert must preserve the original valid_from genesis"
+        );
+        assert_eq!(
+            upserted.valid_until.as_deref(),
+            Some("2026-07-19T22:45:01.654321Z"),
+            "upsert may close the claim with a canonical upper bound"
+        );
     }
 
     /// #1607 — postgres twin of the sqlite #1596 touch-TTL extension

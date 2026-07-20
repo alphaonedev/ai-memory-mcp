@@ -9162,9 +9162,9 @@ pub fn kg_timeline(
     // Compose the predicate dynamically for `since` / `until`. #2266:
     // compare parsed instants rather than signed wire bytes. Link validity is
     // inside the H2 signature, so normalizing the stored text would invalidate
-    // existing peer signatures; SQLite's julianday parser accepts equivalent
-    // RFC3339 offset renderings without mutating their authenticated bytes.
-    // Unparseable values yield NULL and fail closed.
+    // existing peer signatures; the registered chrono-backed projection
+    // accepts equivalent RFC3339 offset renderings without mutating their
+    // authenticated bytes. Unparseable values yield NULL and fail closed.
     let valid_time_fn = connection::SQL_FN_RFC3339_EPOCH_MICROS;
     let mut sql = format!(
         "SELECT ml.target_id, ml.relation, ml.valid_from, ml.valid_until,
