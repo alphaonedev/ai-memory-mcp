@@ -2230,16 +2230,13 @@ fn is_unique_constraint_race(err: &anyhow::Error) -> bool {
 ///
 /// Surfaced via the capabilities-v3 envelope's
 /// `approval.deferred_audit_dlq_size` field so operator dashboards
-/// see the current DLQ depth without scraping logs. Returns `0` on
-/// query failure (a missing table or transient lock); callers that
-/// want hard-fail behavior should query the table directly.
+/// see the current DLQ depth without scraping logs. The capabilities
+/// pathway treats this query as best-effort and falls back to `0` if
+/// this function returns an error.
 ///
 /// # Errors
 ///
-/// Returns the underlying `rusqlite` error if the SELECT fails for a
-/// reason other than `SQLITE_NOMEM` (which we treat as transient).
-/// The capabilities pathway treats this as best-effort and falls
-/// through to 0 on error.
+/// Returns an error if the `SELECT COUNT(*)` query fails.
 pub fn dlq_size(conn: &rusqlite::Connection) -> Result<u64> {
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM signed_events_dlq", [], |r| r.get(0))
