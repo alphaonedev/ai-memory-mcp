@@ -127,6 +127,7 @@ const JOURNAL_OVERFLOW_PREFIX: &str = ".overflow-";
 const SPOOL_ANCESTOR_LABEL: &str = "deferred-audit spool ancestor";
 const JOURNAL_OVERFLOW_SATURATED: &str = ".overflow-saturated";
 const JOURNAL_OVERFLOW_MARKER_LABEL: &str = "deferred-audit overflow marker";
+const JOURNAL_PENDING_NAME_INVALID: &str = "deferred-audit pending filename is not canonical";
 /// Stable fail-closed reason propagated when a blocking verdict cannot be
 /// durably admitted to the deferred audit path.
 pub const AUDIT_ADMISSION_FAILED: &str =
@@ -1281,18 +1282,16 @@ fn parse_pending_admission_sequence(path: &Path) -> Result<Option<u64>> {
     let stem = name
         .strip_prefix('.')
         .and_then(|name| name.strip_suffix(".pending"))
-        .context("deferred-audit pending filename is not canonical")?;
+        .context(JOURNAL_PENDING_NAME_INVALID)?;
     if uuid::Uuid::parse_str(stem).is_ok() {
         return Ok(None);
     }
-    let (sequence, identifier) = stem
-        .split_once('-')
-        .context("deferred-audit pending filename is not canonical")?;
+    let (sequence, identifier) = stem.split_once('-').context(JOURNAL_PENDING_NAME_INVALID)?;
     if sequence.len() != 20
         || !sequence.bytes().all(|byte| byte.is_ascii_digit())
         || uuid::Uuid::parse_str(identifier).is_err()
     {
-        anyhow::bail!("deferred-audit pending filename is not canonical");
+        anyhow::bail!(JOURNAL_PENDING_NAME_INVALID);
     }
     let parsed = sequence
         .parse()
