@@ -1862,10 +1862,12 @@ impl DeferredAuditQueue {
 ///   `signed_events_dlq`, either freshly inserted after a chain failure or
 ///   idempotently observed. Drainer handling counts this as an append failure;
 ///   `dlq_landed` increments only for a DLQ row freshly inserted by this sink.
-/// * Returning `Err(_)` from `append` means the sink could not even
-///   land in the DLQ (e.g. DB file gone, schema mismatch). Increments
-///   `append_failures` — the chain-log property has truly broken for
-///   this event and an operator must intervene.
+/// * Returning `Err(_)` from `append` means end-to-end sink completion failed.
+///   Chain or DLQ residence may or may not already exist; examples include a
+///   DB landing failure and a post-residence journal-acknowledgement failure.
+///   Drainer handling increments `append_failures` and requires operator
+///   intervention. On the journal-backed production path, admitted evidence
+///   remains available for recovery until acknowledged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppendOutcome {
     /// Event is terminally resident in `signed_events` (new or pre-existing).
@@ -1891,11 +1893,12 @@ pub trait DeferredAuditSink: Send + 'static {
     ///
     /// # Errors
     ///
-    /// Returns `Err` only when the sink cannot even land the event in
-    /// its DLQ surface — a genuinely unrecoverable case (DB file gone,
-    /// schema mismatch). Soft failures (race retries, unrecoverable
-    /// `signed_events` INSERT followed by successful DLQ land) are
-    /// reported via [`AppendOutcome::DlqLanded`].
+    /// Returns `Err` when end-to-end sink completion fails. Chain or DLQ
+    /// residence may or may not already exist (for example, a DB landing
+    /// failure versus a post-residence journal-acknowledgement failure). A
+    /// journal-backed caller retains admitted evidence until acknowledgement.
+    /// Chain-insert failure followed by successful DLQ landing and
+    /// acknowledgement is reported via [`AppendOutcome::DlqLanded`].
     fn append(&mut self, event: &DeferredAuditEvent) -> Result<AppendOutcome>;
 
     /// Retry an event after the preceding [`Self::append`] panicked.
