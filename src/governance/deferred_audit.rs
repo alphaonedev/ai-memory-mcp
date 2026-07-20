@@ -2721,7 +2721,10 @@ impl DeferredAuditShutdown {
             Ok(result) => result.map(|()| true),
             Err(_) => {
                 self.supervisor.abort();
-                let _ = self.supervisor.await;
+                // Do not await after abort: a synchronous SQLite/fsync/lock
+                // operation cannot observe Tokio cancellation and could block
+                // forever. The production caller treats this outcome as
+                // process-fatal and performs no later witness/checkpoint work.
                 Ok(false)
             }
         }
@@ -3226,6 +3229,24 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct BlockingSink {
+        entered: Arc<std::sync::atomic::AtomicBool>,
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl DeferredAuditSink for BlockingSink {
+        fn append(&mut self, _event: &DeferredAuditEvent) -> Result<AppendOutcome> {
+            self.entered.store(true, Ordering::SeqCst);
+            let (lock, condition) = &*self.release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = condition.wait(released).unwrap();
+            }
+            Ok(AppendOutcome::Appended)
+        }
+    }
+
+    #[derive(Clone)]
     struct AlwaysErrorSink {
         attempts: Arc<Mutex<Vec<String>>>,
     }
@@ -3409,6 +3430,42 @@ mod tests {
         assert_eq!(attempts.lock().unwrap().as_slice(), ["agent:blocked"; 4]);
         assert_eq!(metrics.append_failure_count(), 4);
         assert_eq!(metrics.appended_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_timeout_does_not_await_uncancellable_sync_sink() {
+        let (queue, receiver) = DeferredAuditQueue::new();
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let sink = BlockingSink {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        };
+        let (close, shutdown) = oneshot::channel();
+        let supervisor = spawn_supervised_drainer_inner(
+            receiver,
+            move || sink.clone(),
+            queue.metrics(),
+            0,
+            Some(shutdown),
+        );
+        assert!(queue.submit_refusal("agent:block", &refusal_action(), &refusal_decision()));
+        while !entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+
+        let outcome = DeferredAuditShutdown {
+            close: Some(close),
+            supervisor,
+        }
+        .close_and_flush(std::time::Duration::from_millis(20))
+        .await
+        .unwrap();
+        assert!(!outcome, "blocked synchronous sink must report timeout");
+
+        let (lock, condition) = &*release;
+        *lock.lock().unwrap() = true;
+        condition.notify_all();
     }
 
     // -----------------------------------------------------------------

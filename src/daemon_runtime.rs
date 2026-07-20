@@ -6256,30 +6256,33 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     // are drained, while later journal-backed sends fail closed and retain
     // durable boot-recovery evidence. Awaiting the supervisor also proves the
     // audit writer has stopped before the witness and WAL checkpoint.
-    let drained = match bootstrap
+    match bootstrap
         .deferred_audit_shutdown
         .close_and_flush(crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT)
         .await
     {
-        Ok(drained) => drained,
+        Ok(true) => {
+            tracing::info!(
+                "deferred-audit queue drained ({} refusals accounted) — checkpointing WAL",
+                drain_metrics.submitted_count()
+            );
+        }
+        Ok(false) => {
+            tracing::error!(
+                "deferred-audit shutdown deadline exceeded; durable spool retained for boot recovery"
+            );
+            eprintln!(
+                "ai-memory: fatal deferred-audit shutdown timeout; durable spool retained for boot recovery"
+            );
+            std::process::exit(75);
+        }
         Err(error) => {
             tracing::error!(%error, "deferred-audit supervisor failed during shutdown");
-            false
+            eprintln!(
+                "ai-memory: fatal deferred-audit supervisor failure; durable spool retained for boot recovery"
+            );
+            std::process::exit(75);
         }
-    };
-    if drained {
-        tracing::info!(
-            "deferred-audit queue drained ({} refusals accounted) — checkpointing WAL",
-            drain_metrics.submitted_count()
-        );
-    } else {
-        tracing::warn!(
-            "deferred-audit drain timed out after {:?}: {} submitted but only {} accounted — \
-             some refusal audit rows may not have flushed before exit",
-            crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
-            drain_metrics.submitted_count(),
-            drain_metrics.completed_count() + drain_metrics.send_failure_count(),
-        );
     }
 
     // Final witness flush + WAL checkpoint now that every writer (HTTP
