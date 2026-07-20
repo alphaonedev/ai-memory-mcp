@@ -134,7 +134,18 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(daemon_runtime::run(cli, &app_config))
+    let result = runtime.block_on(daemon_runtime::run(cli, &app_config));
+    if result.as_ref().err().is_some_and(|error| {
+        error
+            .downcast_ref::<daemon_runtime::FatalShutdownError>()
+            .is_some()
+    }) {
+        // EX_TEMPFAIL. Exit before dropping the runtime: a synchronous writer
+        // that missed its shutdown deadline may be uncancellable, while its
+        // fsynced deferred-audit spool remains boot-recoverable.
+        std::process::exit(75);
+    }
+    result
 }
 
 /// v0.7.0 #697 — best-effort init for the forensic governance log.

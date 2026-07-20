@@ -63,7 +63,7 @@
 //!
 //! # Graceful shutdown
 //!
-//! [`DeferredAuditQueue::close_and_flush`] drops the sender and
+//! [`close_and_flush`] drops the sender and
 //! awaits the supervisor task to terminate. The drainer drains every
 //! still-buffered event before exiting; each pending event MUST reach
 //! acknowledged terminal residence in `signed_events` or
@@ -2701,7 +2701,7 @@ where
 /// Production shutdown capability for a journal-backed deferred-audit
 /// supervisor. Closing is receiver-owned, so process-global sender clones do
 /// not prevent the already-admitted channel prefix from draining to `None`.
-pub struct DeferredAuditShutdown {
+pub(crate) struct DeferredAuditShutdown {
     close: Option<oneshot::Sender<()>>,
     supervisor: JoinHandle<()>,
 }
@@ -2710,7 +2710,7 @@ impl DeferredAuditShutdown {
     /// Close receiver admission, drain the accepted prefix, and await the
     /// supervisor. Late journal-backed submissions fail closed and remain in
     /// the spool for boot recovery.
-    pub async fn close_and_flush(
+    pub(crate) async fn close_and_flush(
         mut self,
         timeout: std::time::Duration,
     ) -> std::result::Result<bool, tokio::task::JoinError> {
@@ -2759,12 +2759,11 @@ pub async fn close_and_flush(
     supervisor.await
 }
 
-/// Default bounded wait for [`drain_pending`] — how long the daemon's
-/// shutdown path waits for the drainer to establish acknowledged terminal
-/// chain/DLQ residence for every accepted refusal before giving up and
-/// proceeding to WAL checkpoint + exit. Five seconds comfortably covers a multi-thousand-event backlog
-/// at the sink's ~25-100 microsecond-per-append rate while still bounding
-/// shutdown latency if the drainer is genuinely wedged.
+/// Default daemon shutdown deadline for background-writer quiescence and
+/// deferred-audit drain. On expiry the binary exits with `EX_TEMPFAIL` before
+/// witness/WAL checkpoint; the fsynced spool remains for boot recovery. Five
+/// seconds comfortably covers a multi-thousand-event backlog at the sink's
+/// ~25-100 microsecond-per-append rate.
 pub const DEFAULT_SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(SHUTDOWN_DRAIN_TIMEOUT_SECS);
 
@@ -2786,8 +2785,9 @@ const DRAIN_POLL_INTERVAL_MILLIS: u64 = 10;
 /// `signed_events`/DLQ residence, or recorded as a send failure. Unresolved
 /// sink attempts do not count as completion.
 ///
-/// This is the daemon shutdown-path counterpart to [`close_and_flush`].
-/// Unlike `close_and_flush`, it does NOT require the producer-side senders
+/// This legacy observability helper does not establish a producer barrier and
+/// is therefore not used by the daemon's production shutdown path. Unlike
+/// [`close_and_flush`], it does NOT require the producer-side senders
 /// to be dropped: the daemon installs the queue's sender clones inside
 /// process-wide `OnceLock` governance hooks
 /// (`storage::GOVERNANCE_PRE_WRITE`, `wire_check::GOVERNANCE_PRE_ACTION`)
@@ -2797,10 +2797,8 @@ const DRAIN_POLL_INTERVAL_MILLIS: u64 = 10;
 /// drainer to catch up to the submitted count by polling the shared atomic
 /// metrics.
 ///
-/// MUST be called only after every write path that can submit a refusal
-/// has quiesced (i.e. after the HTTP server's graceful-shutdown future has
-/// resolved). At that point `submitted` is final, so the loop terminates
-/// as soon as the drainer finishes the backlog.
+/// MUST be called only after the caller has independently proved that every
+/// write path which can submit a refusal has quiesced.
 ///
 /// Returns `true` when the queue fully drained within `timeout`, `false`
 /// when the timeout elapsed with events still in flight (the caller should
@@ -2935,7 +2933,7 @@ pub fn install_deferred_audit_drainer_with_journal(
 /// shutdown barrier. Intended for the HTTP daemon, whose process-global hook
 /// sender clones cannot be dropped during graceful shutdown.
 #[must_use]
-pub fn install_deferred_audit_drainer_with_shutdown(
+pub(crate) fn install_deferred_audit_drainer_with_shutdown(
     db_path: &Path,
 ) -> (DeferredAuditQueue, DeferredAuditShutdown) {
     let journal_path = deferred_audit_journal_path(db_path);

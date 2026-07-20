@@ -3790,7 +3790,7 @@ pub struct ServeBootstrap {
     /// retains after the queue is moved into `AppState`.
     pub deferred_audit_metrics: crate::governance::deferred_audit::DeferredAuditMetrics,
     /// Receiver-owned shutdown barrier for the deferred-audit supervisor.
-    pub deferred_audit_shutdown: crate::governance::deferred_audit::DeferredAuditShutdown,
+    pub(crate) deferred_audit_shutdown: crate::governance::deferred_audit::DeferredAuditShutdown,
 }
 
 /// v0.7.0 Wave-3 — resolve a [`MemoryStore`] handle from the operator's
@@ -5505,16 +5505,20 @@ pub async fn bootstrap_serve(
         };
         #[cfg(feature = "sal")]
         {
-            federation::spawn_catchup_loop_with_store(
+            task_handles.push(federation::spawn_catchup_loop_with_store(
                 fed.clone(),
                 catchup_db,
                 Some(store_handle.clone()),
                 interval,
-            );
+            ));
         }
         #[cfg(not(feature = "sal"))]
         {
-            federation::spawn_catchup_loop(fed.clone(), catchup_db, interval);
+            task_handles.push(federation::spawn_catchup_loop(
+                fed.clone(),
+                catchup_db,
+                interval,
+            ));
         }
 
         // v0.7.0 Track D #933 — federation push DLQ replay worker.
@@ -5524,8 +5528,11 @@ pub async fn bootstrap_serve(
         // `ai_memory_federation_push_dlq_depth` Prometheus gauge.
         #[cfg(feature = "sal")]
         if let Some(sink) = fed.dlq_sink.clone() {
-            let _replay_handle =
-                federation::spawn_replay_federation_push_dlq(fed.clone(), sink, interval);
+            task_handles.push(federation::spawn_replay_federation_push_dlq(
+                fed.clone(),
+                sink,
+                interval,
+            ));
             tracing::info!(
                 "federation push DLQ replay worker enabled: polling every {}s",
                 args.catchup_interval_secs,
@@ -5626,9 +5633,11 @@ pub async fn bootstrap_serve(
         let renewal_interval = Duration::from_secs(
             federation::identity::renewal::DEFAULT_RENEWAL_INTERVAL_SECS.unsigned_abs(),
         );
-        let _renewal_handle = federation::identity::renewal::spawn_refresh_outbound_credential(
-            db_state.clone(),
-            renewal_interval,
+        task_handles.push(
+            federation::identity::renewal::spawn_refresh_outbound_credential(
+                db_state.clone(),
+                renewal_interval,
+            ),
         );
         tracing::info!(
             "federation outbound credential renewal worker enabled: refreshing every {}s",
@@ -5971,6 +5980,29 @@ fn init_tracing() {
 ///
 /// Behaviour is preserved from the pre-W6 inline `main::serve` body — only
 /// the structure has changed.
+/// Marker returned when daemon shutdown cannot prove that every writer has
+/// stopped. The binary boundary maps this to `EX_TEMPFAIL` before dropping the
+/// Tokio runtime, so an uncancellable synchronous writer cannot stall runtime
+/// destruction or race a final witness/checkpoint.
+#[derive(Debug)]
+pub struct FatalShutdownError {
+    reason: &'static str,
+}
+
+impl FatalShutdownError {
+    const fn new(reason: &'static str) -> Self {
+        Self { reason }
+    }
+}
+
+impl std::fmt::Display for FatalShutdownError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "fatal daemon shutdown: {}", self.reason)
+    }
+}
+
+impl std::error::Error for FatalShutdownError {}
+
 #[allow(clippy::too_many_lines)]
 pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) -> Result<()> {
     init_tracing();
@@ -6246,9 +6278,20 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     // Stop and join every periodic/background writer before establishing the
     // deferred-audit receiver-close barrier. Dropping a Tokio JoinHandle would
     // detach the task and permit a late write after the final checkpoint.
-    for task in bootstrap.task_handles {
+    for task in &bootstrap.task_handles {
         task.abort();
-        let _ = task.await;
+    }
+    let task_join_deadline = tokio::time::Instant::now()
+        + crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT;
+    for task in bootstrap.task_handles {
+        if tokio::time::timeout_at(task_join_deadline, task)
+            .await
+            .is_err()
+        {
+            return Err(anyhow::Error::new(FatalShutdownError::new(
+                "background writer shutdown deadline exceeded",
+            )));
+        }
     }
 
     // Process-global governance hooks retain sender clones forever. Ask the
@@ -6274,14 +6317,18 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
             eprintln!(
                 "ai-memory: fatal deferred-audit shutdown timeout; durable spool retained for boot recovery"
             );
-            std::process::exit(75);
+            return Err(anyhow::Error::new(FatalShutdownError::new(
+                "deferred-audit shutdown deadline exceeded",
+            )));
         }
         Err(error) => {
             tracing::error!(%error, "deferred-audit supervisor failed during shutdown");
             eprintln!(
                 "ai-memory: fatal deferred-audit supervisor failure; durable spool retained for boot recovery"
             );
-            std::process::exit(75);
+            return Err(anyhow::Error::new(FatalShutdownError::new(
+                "deferred-audit supervisor failed",
+            )));
         }
     }
 
