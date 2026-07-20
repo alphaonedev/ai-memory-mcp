@@ -45,7 +45,7 @@ use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -3262,6 +3262,27 @@ fn ensure_and_load_daemon_keypair() -> (
 // Background tasks (GC, WAL checkpoint)
 // ---------------------------------------------------------------------------
 
+struct BlockingTaskGuard(Arc<AtomicUsize>);
+
+impl Drop for BlockingTaskGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn spawn_tracked_blocking<F, R>(tracker: &Arc<AtomicUsize>, task: F) -> JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    tracker.fetch_add(1, Ordering::SeqCst);
+    let tracker = Arc::clone(tracker);
+    tokio::task::spawn_blocking(move || {
+        let _guard = BlockingTaskGuard(tracker);
+        task()
+    })
+}
+
 /// Spawn the periodic GC loop. Sleeps `interval`, then runs `db::gc`,
 /// `db::auto_purge_archive`, and (Cluster G, #767) the shadow-
 /// observation retention sweep against the daemon's shared connection.
@@ -3385,6 +3406,7 @@ type FamilyEmbeddingsCache =
 /// disabled arm is the default and a no-op beyond a debug log.
 fn spawn_family_embedding_precompute_if_enabled(
     task_handles: &mut Vec<JoinHandle<()>>,
+    blocking_tasks: &Arc<AtomicUsize>,
     enabled: bool,
     family_embeddings: &FamilyEmbeddingsCache,
     embedder_arc: &Arc<Option<Embedder>>,
@@ -3392,13 +3414,14 @@ fn spawn_family_embedding_precompute_if_enabled(
     if enabled {
         let cache = family_embeddings.clone();
         let embedder_for_task = embedder_arc.clone();
+        let blocking_tasks = Arc::clone(blocking_tasks);
         task_handles.push(tokio::spawn(async move {
             // H1 (v0.7.0 round-2) lock-discipline: the slow embed calls run in
             // a `spawn_blocking` closure holding NO lock; only after the whole
             // batch is computed do we take the write lock ONCE to swap in the
             // populated `Some(Vec)` — readers see `None` or the full vector,
             // never a half-built one.
-            let computed = tokio::task::spawn_blocking(move || {
+            let computed = spawn_tracked_blocking(&blocking_tasks, move || {
                 AppState::precompute_family_embeddings(
                     embedder_for_task
                         .as_ref()
@@ -3445,6 +3468,22 @@ pub fn spawn_gc_loop_with_shadow_retention(
     archive_max_days: Option<i64>,
     shadow_retention_days: i64,
     interval: Duration,
+) -> JoinHandle<()> {
+    spawn_gc_loop_with_shadow_retention_tracked(
+        state,
+        archive_max_days,
+        shadow_retention_days,
+        interval,
+        Arc::new(AtomicUsize::new(0)),
+    )
+}
+
+fn spawn_gc_loop_with_shadow_retention_tracked(
+    state: Db,
+    archive_max_days: Option<i64>,
+    shadow_retention_days: i64,
+    interval: Duration,
+    blocking_tasks: Arc<AtomicUsize>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // #2064 pre-ship concurrency fix — snapshot the immutable DB path
@@ -3542,7 +3581,7 @@ pub fn spawn_gc_loop_with_shadow_retention(
             drop(lock);
             if erasure_detached && crate::erasure::erasure_cold_tier_enabled() {
                 let path = erasure_db_path.clone();
-                match tokio::task::spawn_blocking(move || {
+                match spawn_tracked_blocking(&blocking_tasks, move || {
                     crate::erasure::archive_sync::gc_tick_detached(&path)
                 })
                 .await
@@ -3791,6 +3830,7 @@ pub struct ServeBootstrap {
     pub deferred_audit_metrics: crate::governance::deferred_audit::DeferredAuditMetrics,
     /// Receiver-owned shutdown barrier for the deferred-audit supervisor.
     pub(crate) deferred_audit_shutdown: crate::governance::deferred_audit::DeferredAuditShutdown,
+    pub(crate) blocking_tasks: Arc<AtomicUsize>,
 }
 
 /// v0.7.0 Wave-3 — resolve a [`MemoryStore`] handle from the operator's
@@ -5214,6 +5254,7 @@ pub async fn bootstrap_serve(
     );
 
     let mut task_handles: Vec<JoinHandle<()>> = Vec::new();
+    let blocking_tasks = Arc::new(AtomicUsize::new(0));
 
     if let Some(ref fed) = federation {
         tracing::info!(
@@ -5334,6 +5375,7 @@ pub async fn bootstrap_serve(
             == Some("1");
     spawn_family_embedding_precompute_if_enabled(
         &mut task_handles,
+        &blocking_tasks,
         precompute_family_embeddings_enabled,
         &family_embeddings,
         &embedder_arc,
@@ -5802,11 +5844,12 @@ pub async fn bootstrap_serve(
         crate::confidence::shadow::DEFAULT_SHADOW_RETENTION_DAYS,
         crate::config::ConfidenceConfig::effective_shadow_retention_days,
     );
-    task_handles.push(spawn_gc_loop_with_shadow_retention(
+    task_handles.push(spawn_gc_loop_with_shadow_retention_tracked(
         db_state.clone(),
         app_config.archive_max_days,
         shadow_retention_days,
         Duration::from_secs(GC_INTERVAL_SECS),
+        Arc::clone(&blocking_tasks),
     ));
 
     // #1690 — offloaded_blobs TTL sweep. `offload_ttl_sweep::spawn` existed but
@@ -5959,6 +6002,7 @@ pub async fn bootstrap_serve(
         request_timeout: Duration::from_secs(app_config.effective_request_timeout_secs()),
         deferred_audit_metrics,
         deferred_audit_shutdown,
+        blocking_tasks,
     })
 }
 
@@ -6003,11 +6047,22 @@ impl std::fmt::Display for FatalShutdownError {
 
 impl std::error::Error for FatalShutdownError {}
 
+fn fatal_shutdown(reason: &'static str) -> anyhow::Error {
+    tracing::error!(
+        reason,
+        "fatal daemon shutdown; final witness/checkpoint skipped"
+    );
+    eprintln!(
+        "ai-memory: fatal daemon shutdown: {reason}; final witness/checkpoint skipped (exit 75)"
+    );
+    anyhow::Error::new(FatalShutdownError::new(reason))
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) -> Result<()> {
     init_tracing();
 
-    let bootstrap = bootstrap_serve(&db_path, &args, app_config).await?;
+    let mut bootstrap = bootstrap_serve(&db_path, &args, app_config).await?;
 
     // Round-2 F8 + Round-3 F12 — startup banner. Surfaces the effective
     // permissions mode (and the v0.7.0 enforce-default migration warning
@@ -6111,7 +6166,7 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         let reload_models = Arc::clone(&bootstrap.app_state.resolved_models);
         let reload_tier = app_config.effective_tier(None);
         let reload_db = db_path.clone();
-        tokio::spawn(async move {
+        bootstrap.task_handles.push(tokio::spawn(async move {
             let mut hup =
                 match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
                     Ok(sig) => sig,
@@ -6132,7 +6187,7 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
                 )
                 .await;
             }
-        });
+        }));
     }
 
     // Graceful shutdown. The signal future only waits for ctrl_c and
@@ -6153,127 +6208,130 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         let _ = tokio::signal::ctrl_c().await;
         tracing::info!("shutting down — draining deferred-audit queue then checkpointing WAL");
     };
+    let api_key_state = bootstrap.api_key_state;
+    let app_state = bootstrap.app_state;
+    let request_timeout = bootstrap.request_timeout;
 
     // Native TLS (Layer 1): if both --tls-cert and --tls-key are provided,
     // bind via axum-server + rustls. Plain HTTP otherwise — backward
     // compatible with every prior release. The `requires = …` clap
     // attributes prevent the half-configured case.
-    if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
-        // rustls 0.23 needs an explicit CryptoProvider; install ring
-        // before any TLS setup. Idempotent — second install is a
-        // harmless no-op via ignore.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        // Load TLS / mTLS config BEFORE printing the "listening" log
-        // so a misconfigured cert / key / allowlist surfaces the error
-        // first (red-team #248).
-        let tls_config = if let Some(allowlist_path) = &args.mtls_allowlist {
-            tracing::info!(
-                "mTLS enabled — client certs required. Allowlist: {}",
-                allowlist_path.display()
-            );
-            tls::load_mtls_rustls_config(cert, key, allowlist_path).await?
-        } else {
-            tracing::warn!(
-                "TLS enabled but mTLS NOT configured — sync endpoints \
+    let server_result: Result<()> = async move {
+        if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
+            // rustls 0.23 needs an explicit CryptoProvider; install ring
+            // before any TLS setup. Idempotent — second install is a
+            // harmless no-op via ignore.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            // Load TLS / mTLS config BEFORE printing the "listening" log
+            // so a misconfigured cert / key / allowlist surfaces the error
+            // first (red-team #248).
+            let tls_config = if let Some(allowlist_path) = &args.mtls_allowlist {
+                tracing::info!(
+                    "mTLS enabled — client certs required. Allowlist: {}",
+                    allowlist_path.display()
+                );
+                tls::load_mtls_rustls_config(cert, key, allowlist_path).await?
+            } else {
+                tracing::warn!(
+                    "TLS enabled but mTLS NOT configured — sync endpoints \
                  (/api/v1/sync/push, /api/v1/sync/since) accept any client. \
                  Set --mtls-allowlist for production peer-mesh deployments \
                  (red-team #231)."
-            );
-            tls::load_rustls_config(cert, key).await?
-        };
-        let app = crate::build_router_with_timeout(
-            bootstrap.api_key_state,
-            bootstrap.app_state,
-            bootstrap.request_timeout,
-        );
-        tracing::info!("ai-memory listening on https://{addr}");
-        let socket_addr: std::net::SocketAddr = addr.parse()?;
-        // axum-server doesn't have a direct graceful-shutdown on the
-        // TLS builder yet; spawn the signal listener on the Handle
-        // instead so ctrl_c triggers a graceful shutdown. Window is
-        // operator-configurable via --shutdown-grace-secs (default 30,
-        // bumped from 10 in v0.6.0 — red-team #233).
-        let grace = std::time::Duration::from_secs(args.shutdown_grace_secs);
-        let handle = axum_server::Handle::new();
-        let handle_clone = handle.clone();
-        tokio::spawn(async move {
-            shutdown.await;
-            handle_clone.graceful_shutdown(Some(grace));
-        });
-        // v0.7.0 #1581 — bind with the NoDelayAcceptor-wrapped rustls
-        // acceptor instead of `bind_rustls` (whose DefaultAcceptor never
-        // sets TCP_NODELAY). Without it, Nagle + the client's delayed-ACK
-        // timer added a fixed ~40 ms to the FIRST request of every fresh
-        // (m)TLS connection — the #1579 P3 fleet finding. Verifier chain
-        // and accept/reject semantics are unchanged; see
-        // `tls::serve_rustls_acceptor` + tests/mtls_nodelay_acceptor.rs.
-        //
-        // #2045 L6 — when the operator configures a cert-peer-binding map
-        // (`AI_MEMORY_FED_CERT_PEER_BINDING_MAP`), swap in the peer-binding
-        // acceptor so the presenting client cert's operator-bound peer-id is
-        // injected into request extensions for the `/sync/*` cross-check.
-        // Only meaningful under mTLS (peer certs exist only there); with no
-        // map the byte-identical `serve_rustls_acceptor` path is kept.
-        let cert_peer_bindings = if args.mtls_allowlist.is_some() {
-            tls::cert_peer_binding_map_from_env()?
+                );
+                tls::load_rustls_config(cert, key).await?
+            };
+            let app = crate::build_router_with_timeout(api_key_state, app_state, request_timeout);
+            tracing::info!("ai-memory listening on https://{addr}");
+            let socket_addr: std::net::SocketAddr = addr.parse()?;
+            // axum-server doesn't have a direct graceful-shutdown on the
+            // TLS builder yet; spawn the signal listener on the Handle
+            // instead so ctrl_c triggers a graceful shutdown. Window is
+            // operator-configurable via --shutdown-grace-secs (default 30,
+            // bumped from 10 in v0.6.0 — red-team #233).
+            let grace = std::time::Duration::from_secs(args.shutdown_grace_secs);
+            let handle = axum_server::Handle::new();
+            let handle_clone = handle.clone();
+            tokio::spawn(async move {
+                shutdown.await;
+                handle_clone.graceful_shutdown(Some(grace));
+            });
+            // v0.7.0 #1581 — bind with the NoDelayAcceptor-wrapped rustls
+            // acceptor instead of `bind_rustls` (whose DefaultAcceptor never
+            // sets TCP_NODELAY). Without it, Nagle + the client's delayed-ACK
+            // timer added a fixed ~40 ms to the FIRST request of every fresh
+            // (m)TLS connection — the #1579 P3 fleet finding. Verifier chain
+            // and accept/reject semantics are unchanged; see
+            // `tls::serve_rustls_acceptor` + tests/mtls_nodelay_acceptor.rs.
+            //
+            // #2045 L6 — when the operator configures a cert-peer-binding map
+            // (`AI_MEMORY_FED_CERT_PEER_BINDING_MAP`), swap in the peer-binding
+            // acceptor so the presenting client cert's operator-bound peer-id is
+            // injected into request extensions for the `/sync/*` cross-check.
+            // Only meaningful under mTLS (peer certs exist only there); with no
+            // map the byte-identical `serve_rustls_acceptor` path is kept.
+            let cert_peer_bindings = if args.mtls_allowlist.is_some() {
+                tls::cert_peer_binding_map_from_env()?
+            } else {
+                None
+            };
+            // #2045 L6 — surface the inert-posture + open-L6-window footguns at
+            // boot so a set-but-ineffective control (or the still-vulnerable
+            // FED_REQUIRE_SIG=0 state) is loud, not silent.
+            for warning in cert_peer_binding_boot_warnings(
+                tls::cert_peer_binding_mode(),
+                args.mtls_allowlist.is_some(),
+                cert_peer_bindings.as_ref().is_some_and(|m| !m.is_empty()),
+                crate::federation::signing::require_sig(),
+            ) {
+                tracing::warn!(target: "federation::attestation", "{warning}");
+            }
+            if let Some(bindings) = cert_peer_bindings {
+                tracing::info!(
+                    bound_fingerprints = bindings.len(),
+                    "mTLS cert↔x-peer-id binding active (#2045 L6); posture: {:?}",
+                    tls::cert_peer_binding_mode()
+                );
+                axum_server::bind(socket_addr)
+                    .acceptor(tls::serve_rustls_acceptor_with_peer_binding(
+                        &tls_config,
+                        bindings,
+                    ))
+                    .handle(handle)
+                    .serve(app.into_make_service())
+                    .await?;
+            } else {
+                axum_server::bind(socket_addr)
+                    .acceptor(tls::serve_rustls_acceptor(&tls_config))
+                    .handle(handle)
+                    .serve(app.into_make_service())
+                    .await?;
+            }
         } else {
-            None
-        };
-        // #2045 L6 — surface the inert-posture + open-L6-window footguns at
-        // boot so a set-but-ineffective control (or the still-vulnerable
-        // FED_REQUIRE_SIG=0 state) is loud, not silent.
-        for warning in cert_peer_binding_boot_warnings(
-            tls::cert_peer_binding_mode(),
-            args.mtls_allowlist.is_some(),
-            cert_peer_bindings.as_ref().is_some_and(|m| !m.is_empty()),
-            crate::federation::signing::require_sig(),
-        ) {
-            tracing::warn!(target: "federation::attestation", "{warning}");
-        }
-        if let Some(bindings) = cert_peer_bindings {
-            tracing::info!(
-                bound_fingerprints = bindings.len(),
-                "mTLS cert↔x-peer-id binding active (#2045 L6); posture: {:?}",
-                tls::cert_peer_binding_mode()
-            );
-            axum_server::bind(socket_addr)
-                .acceptor(tls::serve_rustls_acceptor_with_peer_binding(
-                    &tls_config,
-                    bindings,
-                ))
-                .handle(handle)
-                .serve(app.into_make_service())
-                .await?;
-        } else {
-            axum_server::bind(socket_addr)
-                .acceptor(tls::serve_rustls_acceptor(&tls_config))
-                .handle(handle)
-                .serve(app.into_make_service())
-                .await?;
-        }
-    } else {
-        tracing::warn!(
-            "TLS NOT enabled — sync endpoints (/api/v1/sync/push, \
+            tracing::warn!(
+                "TLS NOT enabled — sync endpoints (/api/v1/sync/push, \
              /api/v1/sync/since) accept any caller over plain HTTP. \
              Set --tls-cert + --tls-key + --mtls-allowlist for production \
              peer-mesh deployments (red-team #231)."
-        );
-        tracing::info!("ai-memory listening on http://{addr}");
-        // Wave 3 (v0.6.3): the non-TLS path delegates to
-        // `daemon_runtime::serve_http_with_shutdown_future`, which is the
-        // same `build_router` + `TcpListener::bind` + `axum::serve` body
-        // the integration tests drive in-process. Production threads its
-        // WAL-checkpoint-on-shutdown future in directly so the cleanup
-        // semantic is preserved verbatim.
-        serve_http_with_shutdown_future_and_timeout(
-            &addr,
-            bootstrap.api_key_state,
-            bootstrap.app_state,
-            bootstrap.request_timeout,
-            shutdown,
-        )
-        .await?;
+            );
+            tracing::info!("ai-memory listening on http://{addr}");
+            // Wave 3 (v0.6.3): the non-TLS path delegates to
+            // `daemon_runtime::serve_http_with_shutdown_future`, which is the
+            // same `build_router` + `TcpListener::bind` + `axum::serve` body
+            // the integration tests drive in-process. Production threads its
+            // WAL-checkpoint-on-shutdown future in directly so the cleanup
+            // semantic is preserved verbatim.
+            serve_http_with_shutdown_future_and_timeout(
+                &addr,
+                api_key_state,
+                app_state,
+                request_timeout,
+                shutdown,
+            )
+            .await?;
+        }
+        Ok(())
     }
+    .await;
 
     // Stop and join every periodic/background writer before establishing the
     // deferred-audit receiver-close barrier. Dropping a Tokio JoinHandle would
@@ -6284,14 +6342,24 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     let task_join_deadline = tokio::time::Instant::now()
         + crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT;
     for task in bootstrap.task_handles {
-        if tokio::time::timeout_at(task_join_deadline, task)
-            .await
-            .is_err()
-        {
-            return Err(anyhow::Error::new(FatalShutdownError::new(
-                "background writer shutdown deadline exceeded",
-            )));
+        match tokio::time::timeout_at(task_join_deadline, task).await {
+            Err(_) => {
+                return Err(fatal_shutdown(
+                    "background writer shutdown deadline exceeded",
+                ));
+            }
+            Ok(Err(error)) if !error.is_cancelled() => {
+                tracing::error!(%error, "background writer task failed before shutdown");
+                return Err(fatal_shutdown("background writer task failed"));
+            }
+            Ok(Ok(())) | Ok(Err(_)) => {}
         }
+    }
+    while bootstrap.blocking_tasks.load(Ordering::SeqCst) != 0 {
+        if tokio::time::Instant::now() >= task_join_deadline {
+            return Err(fatal_shutdown("blocking writer shutdown deadline exceeded"));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     // Process-global governance hooks retain sender clones forever. Ask the
@@ -6311,24 +6379,15 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
             );
         }
         Ok(false) => {
-            tracing::error!(
-                "deferred-audit shutdown deadline exceeded; durable spool retained for boot recovery"
-            );
-            eprintln!(
-                "ai-memory: fatal deferred-audit shutdown timeout; durable spool retained for boot recovery"
-            );
-            return Err(anyhow::Error::new(FatalShutdownError::new(
-                "deferred-audit shutdown deadline exceeded",
-            )));
+            return Err(fatal_shutdown(
+                "deferred-audit shutdown deadline exceeded; durable spool retained for boot recovery",
+            ));
         }
         Err(error) => {
             tracing::error!(%error, "deferred-audit supervisor failed during shutdown");
-            eprintln!(
-                "ai-memory: fatal deferred-audit supervisor failure; durable spool retained for boot recovery"
-            );
-            return Err(anyhow::Error::new(FatalShutdownError::new(
-                "deferred-audit supervisor failed",
-            )));
+            return Err(fatal_shutdown(
+                "deferred-audit supervisor failed; durable spool retained for boot recovery",
+            ));
         }
     }
 
@@ -6338,6 +6397,7 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     // folds them in even though the drainer holds its own connection.
     shutdown_witness_flush_and_checkpoint(&checkpoint_state).await;
 
+    server_result?;
     Ok(())
 }
 
@@ -8027,7 +8087,13 @@ mod tests {
         let cache: FamilyEmbeddingsCache = Arc::new(tokio::sync::RwLock::new(None));
         let embedder: Arc<Option<Embedder>> = Arc::new(None);
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
-        spawn_family_embedding_precompute_if_enabled(&mut handles, true, &cache, &embedder);
+        spawn_family_embedding_precompute_if_enabled(
+            &mut handles,
+            &Arc::new(AtomicUsize::new(0)),
+            true,
+            &cache,
+            &embedder,
+        );
         assert_eq!(
             handles.len(),
             1,
@@ -8047,8 +8113,52 @@ mod tests {
 
         // disabled=false: the else arm (debug log) — no task spawned.
         let mut none_handles: Vec<JoinHandle<()>> = Vec::new();
-        spawn_family_embedding_precompute_if_enabled(&mut none_handles, false, &cache, &embedder);
+        spawn_family_embedding_precompute_if_enabled(
+            &mut none_handles,
+            &Arc::new(AtomicUsize::new(0)),
+            false,
+            &cache,
+            &embedder,
+        );
         assert!(none_handles.is_empty(), "disabled path spawns no task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tracked_blocking_child_survives_outer_abort_until_work_finishes() {
+        let tracker = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let entered = Arc::new(AtomicBool::new(false));
+        let outer_tracker = Arc::clone(&tracker);
+        let outer_release = Arc::clone(&release);
+        let outer_entered = Arc::clone(&entered);
+        let outer = tokio::spawn(async move {
+            let child = spawn_tracked_blocking(&outer_tracker, move || {
+                outer_entered.store(true, Ordering::SeqCst);
+                let (lock, condition) = &*outer_release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = condition.wait(released).unwrap();
+                }
+            });
+            let _ = child.await;
+        });
+        while !entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        outer.abort();
+        let _ = outer.await;
+        assert_eq!(tracker.load(Ordering::SeqCst), 1);
+
+        let (lock, condition) = &*release;
+        *lock.lock().unwrap() = true;
+        condition.notify_all();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while tracker.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("tracked blocking child must release its guard");
     }
 
     // ----- spawn_gc_loop / spawn_wal_checkpoint_loop --------------------

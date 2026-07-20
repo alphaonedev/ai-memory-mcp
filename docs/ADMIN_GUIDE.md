@@ -861,6 +861,16 @@ For systemd, use `KillSignal=SIGINT` and `TimeoutStopSec=10` to ensure the check
 
 > **Note:** The HTTP daemon handles SIGINT (Ctrl+C) gracefully with WAL checkpoint. Systemd sends SIGTERM by default -- the service file sets `KillSignal=SIGINT` to ensure clean shutdown.
 
+If a background writer or deferred-audit drain cannot quiesce within the
+shutdown deadline, the daemon deliberately skips the final witness/WAL
+checkpoint and exits with status **75 (`EX_TEMPFAIL`)**. This prevents an
+uncancellable SQLite/filesystem operation from racing a falsely certified
+final audit head. The deferred-audit occurrence spool is fsynced before queue
+admission and is replayed idempotently on the next boot. Treat exit 75 as a
+storage-health signal: preserve the database and adjacent
+`.deferred-audit.journal.spool`, inspect disk/lock health, and restart only
+after the underlying stall is cleared.
+
 The MCP server exits cleanly when stdin closes (AI client session ends).
 
 ## Database Management
