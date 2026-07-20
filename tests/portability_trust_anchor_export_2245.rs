@@ -34,7 +34,12 @@ fn full_export_includes_custody_file_role_pubkeys_2245() {
     for (role, label, _) in roles {
         let dir = root.path().join(role);
         let keypair = keypair::generate(label).expect("generate role key");
-        keypair::save_public_only(&keypair, &dir).expect("save role public key");
+        keypair::save(&keypair, &dir).expect("save paired role key");
+        std::fs::write(
+            dir.join(format!("{label}.priv")),
+            b"unreadable-to-public-flow",
+        )
+        .expect("corrupt unrelated private key fixture");
         expected.insert(role, keypair.public_base64());
         role_dirs.push(dir);
     }
@@ -67,4 +72,60 @@ fn full_export_includes_custody_file_role_pubkeys_2245() {
             "custody-only {role} anchor must be exported"
         );
     }
+}
+
+#[test]
+fn full_export_prefers_out_of_band_env_anchor_over_custody_file_2245() {
+    let scratch = std::env::current_dir().expect("cwd").join(".local-runs");
+    std::fs::create_dir_all(&scratch).expect("scratch root");
+    let root = tempfile::Builder::new()
+        .prefix("trust-anchor-env-precedence-2245-")
+        .tempdir_in(&scratch)
+        .expect("scratch dir");
+    let custody = keypair::generate(RECORDER_KEY_LABEL).expect("generate custody key");
+    keypair::save_public_only(&custody, root.path()).expect("save custody public key");
+    let pinned = keypair::generate("recorder-env-pin").expect("generate env pin");
+    let recorder_dir = root.path().to_string_lossy().into_owned();
+    let pinned_b64 = pinned.public_base64();
+    let _env = MultiEnvVarGuard::apply(&[
+        (RECORDER_KEY_DIR_ENV, Some(recorder_dir.as_str())),
+        (RECORDER_PUBKEY_ENV, Some(pinned_b64.as_str())),
+    ]);
+
+    let conn = ai_memory::db::open(&root.path().join("export.db")).expect("open database");
+    let envelope = build_full_envelope(&conn, "test", "2026-07-19T00:00:00Z").expect("export");
+    let exported = envelope
+        .trust_anchors
+        .iter()
+        .find(|anchor| anchor.role == "recorder")
+        .expect("recorder anchor");
+    assert_eq!(exported.pubkey_b64, pinned_b64);
+    assert_ne!(exported.pubkey_b64, custody.public_base64());
+}
+
+#[test]
+fn full_export_does_not_fall_back_past_malformed_env_anchor_2245() {
+    let scratch = std::env::current_dir().expect("cwd").join(".local-runs");
+    std::fs::create_dir_all(&scratch).expect("scratch root");
+    let root = tempfile::Builder::new()
+        .prefix("trust-anchor-malformed-env-2245-")
+        .tempdir_in(&scratch)
+        .expect("scratch dir");
+    let custody = keypair::generate(RECORDER_KEY_LABEL).expect("generate custody key");
+    keypair::save_public_only(&custody, root.path()).expect("save custody public key");
+    let recorder_dir = root.path().to_string_lossy().into_owned();
+    let _env = MultiEnvVarGuard::apply(&[
+        (RECORDER_KEY_DIR_ENV, Some(recorder_dir.as_str())),
+        (RECORDER_PUBKEY_ENV, Some("not-valid-base64!")),
+    ]);
+
+    let conn = ai_memory::db::open(&root.path().join("export.db")).expect("open database");
+    let envelope = build_full_envelope(&conn, "test", "2026-07-19T00:00:00Z").expect("export");
+    assert!(
+        envelope
+            .trust_anchors
+            .iter()
+            .all(|anchor| anchor.role != "recorder"),
+        "a malformed out-of-band pin must not silently fall back to custody"
+    );
 }
