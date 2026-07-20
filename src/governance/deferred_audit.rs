@@ -317,8 +317,8 @@ pub struct DeferredAuditMetrics {
     pub drainer_panics: Arc<AtomicU64>,
     /// Cluster-C SEC-3 (issue #767) — number of fresh rows this sink inserted
     /// into `signed_events_dlq` after exhausting the
-    /// `SQLITE_CONSTRAINT_UNIQUE` retry budget or hitting an
-    /// unrecoverable non-race error. Surfaced via the capabilities-v3
+    /// `SQLITE_CONSTRAINT_UNIQUE` retry budget or hitting a non-race chain
+    /// error, which this sink does not retry. Surfaced via the capabilities-v3
     /// envelope's `approval.deferred_audit_dlq_size` field (live count
     /// query) and via this counter (cumulative since process boot).
     pub dlq_landed: Arc<AtomicU64>,
@@ -2291,7 +2291,8 @@ pub fn spawn_drainer_task<S: DeferredAuditSink + 'static>(
                 Err(e) => {
                     metrics.append_failures.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
-                        "deferred_audit drainer: sink.append failed (no DLQ landing either): {:#}",
+                        "deferred_audit drainer: sink.append failed before end-to-end \
+                         completion; terminal DB residence may already exist: {:#}",
                         e
                     );
                     // We don't requeue — the channel is single-consumer.
@@ -2370,8 +2371,8 @@ where
                     Ok(Err(e)) => {
                         metrics.append_failures.fetch_add(1, Ordering::Relaxed);
                         tracing::error!(
-                            "deferred_audit drainer: sink.append failed \
-                             (no DLQ landing either): {e:#}"
+                            "deferred_audit drainer: sink.append failed before end-to-end \
+                             completion; terminal DB residence may already exist: {e:#}"
                         );
                         consecutive_restarts = 0;
                         break;
