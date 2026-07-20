@@ -4242,7 +4242,8 @@ pub(crate) fn install_governance_pre_write_hook(
                     let audit_admitted =
                         queue_for_hook.submit_refusal(&agent_id, &action, &synthetic_refusal);
                     let outcome =
-                        governance_consultation_posture(fail_open, audit_admitted, &reason);
+                        governance_consultation_refusal_reason(fail_open, audit_admitted, &reason)
+                            .map_or(Ok(()), Err);
                     if !audit_admitted {
                         return outcome;
                     }
@@ -4391,7 +4392,8 @@ pub(crate) fn install_governance_pre_action_hook(
                         &synthetic_refusal,
                     );
                     let outcome =
-                        governance_consultation_posture(fail_open, audit_admitted, &reason);
+                        governance_consultation_refusal_reason(fail_open, audit_admitted, &reason)
+                            .map_or(Ok(()), Err);
                     if !audit_admitted {
                         return outcome;
                     }
@@ -4437,17 +4439,17 @@ pub(crate) fn install_governance_pre_action_hook(
 ///
 /// Durable audit admission is a prerequisite for the explicit fail-open
 /// override. Without it, the action stays blocked regardless of the override.
-fn governance_consultation_posture(
+fn governance_consultation_refusal_reason(
     fail_open: bool,
     audit_admitted: bool,
     reason: &str,
-) -> std::result::Result<(), String> {
+) -> Option<String> {
     if !audit_admitted {
-        Err(crate::governance::deferred_audit::AUDIT_ADMISSION_FAILED.to_string())
+        Some(crate::governance::deferred_audit::AUDIT_ADMISSION_FAILED.to_string())
     } else if fail_open {
-        Ok(())
+        None
     } else {
-        Err(reason.to_string())
+        Some(reason.to_string())
     }
 }
 
@@ -4501,7 +4503,8 @@ fn governance_consultation_unavailable_inner(
         reason: reason.clone(),
     };
     let audit_admitted = queue.submit_refusal(agent_id, action, &synthetic_refusal);
-    let outcome = governance_consultation_posture(fail_open, audit_admitted, &reason);
+    let outcome = governance_consultation_refusal_reason(fail_open, audit_admitted, &reason)
+        .map_or(Ok(()), Err);
     if !audit_admitted {
         return outcome;
     }
@@ -7074,23 +7077,23 @@ mod tests {
         let reason = "governance:consultation_failed: injected";
 
         assert_eq!(
-            governance_consultation_posture(false, true, reason),
-            Err(reason.to_string()),
+            governance_consultation_refusal_reason(false, true, reason),
+            Some(reason.to_string()),
             "secure default must fail closed after durable audit admission"
         );
         assert_eq!(
-            governance_consultation_posture(true, true, reason),
-            Ok(()),
+            governance_consultation_refusal_reason(true, true, reason),
+            None,
             "explicit override may allow only after durable audit admission"
         );
         assert_eq!(
-            governance_consultation_posture(true, false, reason),
-            Err(crate::governance::deferred_audit::AUDIT_ADMISSION_FAILED.to_string()),
+            governance_consultation_refusal_reason(true, false, reason),
+            Some(crate::governance::deferred_audit::AUDIT_ADMISSION_FAILED.to_string()),
             "audit admission failure must override the fail-open setting"
         );
         assert_eq!(
-            governance_consultation_posture(false, false, reason),
-            Err(crate::governance::deferred_audit::AUDIT_ADMISSION_FAILED.to_string()),
+            governance_consultation_refusal_reason(false, false, reason),
+            Some(crate::governance::deferred_audit::AUDIT_ADMISSION_FAILED.to_string()),
             "audit admission failure must remain fail closed"
         );
     }

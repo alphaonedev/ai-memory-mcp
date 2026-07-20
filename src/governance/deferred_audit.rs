@@ -437,7 +437,9 @@ const JOURNAL_MUTEX_POISONED: &str = "deferred-audit journal mutex poisoned";
 impl DeferredAuditJournal {
     /// Open (creating if absent) the journal at `path` with private storage.
     /// Existing Unix paths must already have the daemon's effective UID, exact
-    /// private modes, trusted ancestors, and (on macOS) no extended ACL. The
+    /// private modes and trusted ancestors. On macOS, ancestors may contain
+    /// only deny entries; every deferred-audit artifact must have no extended
+    /// ACL. The
     /// opener rejects unsafe state rather than repairing it.
     ///
     /// Opened `read + write` (NOT append-mode): on Windows an append-only
@@ -1100,7 +1102,7 @@ fn validate_spool_ancestors_at(path: &Path) -> Result<()> {
             );
         }
         #[cfg(target_os = "macos")]
-        validate_macos_trivial_acl(&directory, SPOOL_ANCESTOR_LABEL)?;
+        validate_macos_deny_only_acl(&directory, SPOOL_ANCESTOR_LABEL)?;
     }
     Ok(())
 }
@@ -1544,6 +1546,81 @@ fn validate_macos_trivial_acl(file: &File, label: &str) -> Result<()> {
         return Err(error).with_context(|| format!("inspect {label} macOS extended ACL"));
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn validate_macos_deny_only_acl(file: &File, label: &str) -> Result<()> {
+    use std::ffi::c_void;
+    use std::os::fd::AsRawFd as _;
+
+    type Acl = *mut c_void;
+    type AclEntry = *mut c_void;
+    type AclTag = libc::c_int;
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+    const ACL_NEXT_ENTRY: libc::c_int = 1;
+    // Darwin's public <sys/acl.h> defines ACL_EXTENDED_DENY as 2.
+    const ACL_EXTENDED_DENY: AclTag = 2;
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> Acl;
+        fn acl_get_entry(acl: Acl, entry_id: libc::c_int, entry: *mut AclEntry) -> libc::c_int;
+        fn acl_get_tag_type(entry: AclEntry, tag: *mut AclTag) -> libc::c_int;
+        fn acl_free(value: *mut c_void) -> libc::c_int;
+    }
+    struct AclGuard(Acl);
+    impl Drop for AclGuard {
+        fn drop(&mut self) {
+            // SAFETY: acl_get_fd_np returned this owned ACL allocation.
+            unsafe {
+                acl_free(self.0);
+            }
+        }
+    }
+
+    // SAFETY: the descriptor is live and ACL_TYPE_EXTENDED is the Darwin
+    // extended-ACL selector accepted by acl_get_fd_np.
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(());
+        }
+        return Err(error).with_context(|| format!("read {label} macOS extended ACL"));
+    }
+    let _acl_guard = AclGuard(acl);
+    let mut entry: AclEntry = std::ptr::null_mut();
+    let mut entry_id = ACL_FIRST_ENTRY;
+    loop {
+        // Darwin uses EINVAL to report clean end-of-list. Clear errno first so
+        // an iterator failure cannot be mistaken for a stale terminal value.
+        // SAFETY: __error returns writable thread-local errno storage.
+        unsafe {
+            *libc::__error() = 0;
+        }
+        // SAFETY: acl is live and entry points to writable storage.
+        let status = unsafe { acl_get_entry(acl, entry_id, &raw mut entry) };
+        if status == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                return Ok(());
+            }
+            return Err(error).with_context(|| format!("iterate {label} macOS extended ACL"));
+        }
+        if status != 0 || entry.is_null() {
+            anyhow::bail!("{label} macOS extended ACL iteration was malformed");
+        }
+
+        let mut tag: AclTag = 0;
+        // SAFETY: acl_get_entry yielded this live entry and tag is writable.
+        if unsafe { acl_get_tag_type(entry, &raw mut tag) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("classify {label} macOS extended ACL entry"));
+        }
+        if tag != ACL_EXTENDED_DENY {
+            anyhow::bail!("{label} macOS extended ACL contains an authority-granting entry");
+        }
+        entry_id = ACL_NEXT_ENTRY;
+    }
 }
 
 fn verify_spool_identity(
@@ -4809,9 +4886,34 @@ mod tests {
         assert!(
             error
                 .chain()
-                .any(|cause| cause.to_string().contains("nontrivial macOS extended ACL"))
+                .any(|cause| cause.to_string().contains("authority-granting entry"))
         );
         assert!(!journal_spool_dir(&journal_path).exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn journal_macos_accepts_deny_only_extended_acl_ancestor() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Command;
+
+        let dir = fresh_tempdir();
+        let protected_parent = dir.path().join("deny-only-acl-parent");
+        std::fs::create_dir(&protected_parent).unwrap();
+        std::fs::set_permissions(&protected_parent, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let status = Command::new("chmod")
+            .args(["+a", "everyone deny delete"])
+            .arg(&protected_parent)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let journal_path = protected_parent.join("audit.journal");
+        let journal = DeferredAuditJournal::open(&journal_path)
+            .expect("a deny-only ancestor ACL cannot grant rename authority");
+        assert!(journal_path.exists());
+        assert!(journal.spool_dir.exists());
     }
 
     #[cfg(target_os = "macos")]
@@ -5144,7 +5246,14 @@ mod tests {
     #[test]
     fn journal_windows_ancestor_policy_pins_each_dangerous_right() {
         let dir = fresh_tempdir();
-        for (index, rights) in ["DC", "SD", "WD", "WO", "GA"].into_iter().enumerate() {
+        // SDDL's `DC` mnemonic is the directory-services DELETE_CHILD bit
+        // (0x2), not the filesystem FILE_DELETE_CHILD bit (0x40). Inject the
+        // numeric filesystem mask so this integration test exercises the same
+        // right as `ancestor_mask_is_dangerous` and the pure mask test.
+        for (index, rights) in ["0x00000040", "SD", "WD", "WO", "GA"]
+            .into_iter()
+            .enumerate()
+        {
             let ancestor = dir.path().join(format!("dangerous-{index}"));
             windows_private::create_ancestor_grant_for_test(&ancestor, rights).unwrap();
             assert!(
