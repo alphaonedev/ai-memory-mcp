@@ -4998,12 +4998,13 @@ mod tests {
                 );
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            let event = DeferredAuditEvent::from_refusal(
+            let mut event = DeferredAuditEvent::from_refusal(
                 &format!("agent:quota-race-{role}"),
                 &refusal_action(),
                 &refusal_decision(),
             )
             .unwrap();
+            event.timestamp = "2026-07-20T00:00:00.123456789Z".parse().unwrap();
             let result = if journal.append(&event).is_ok() {
                 b"ok".as_slice()
             } else {
@@ -5016,12 +5017,13 @@ mod tests {
         let dir = fresh_tempdir();
         let journal_path = dir.path().join("cross-process-quota.journal");
         let journal = DeferredAuditJournal::open(&journal_path).unwrap();
-        let sample = DeferredAuditEvent::from_refusal(
+        let mut sample = DeferredAuditEvent::from_refusal(
             "agent:quota-race-a",
             &refusal_action(),
             &refusal_decision(),
         )
         .unwrap();
+        sample.timestamp = "2026-07-20T00:00:00.123456789Z".parse().unwrap();
         let sample_len = u64::try_from(
             journal_frame(&sample.canonical_bytes().unwrap())
                 .unwrap()
