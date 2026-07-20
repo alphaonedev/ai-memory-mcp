@@ -1,31 +1,19 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! v0.7.0 #1046 + #1116 — signed_events DLQ → chain replay
-//! operator-side workflow pin.
+//! #1046 + #1116 — `signed_events_dlq` durable evidence pins.
 //!
-//! Per the #1046 close-comment and the v0.7.0 CHANGELOG entry, the
-//! signed_events audit chain ships an "exactly-once OR
-//! DLQ-recoverable" contract: an event whose append fails the
-//! chain-write (lock contention, transient SQL error) lands in
-//! `signed_events_dlq` with the failure reason recorded. The
-//! operator-side replay workflow is the v0.7.0 path; a boot-time
-//! sweep is tracked as v0.8 follow-up.
+//! An event that cannot reach the signed-events chain lands in
+//! `signed_events_dlq` with its identity, payload hash, and failure reason
+//! preserved. v1.0.0 ships neither an automatic replay sweep nor a replay
+//! CLI, so these tests deliberately make no replay-and-delete claim.
 //!
 //! This file pins:
 //!
 //! 1. The DLQ table exists in the schema (so a future migration
 //!    that drops the table fails the pin).
-//! 2. A row written to `signed_events_dlq` is queryable via the
-//!    operator-side SELECT shape documented in the CHANGELOG.
-//! 3. After operator-side replay-and-delete (the documented SQL
-//!    workflow), the chain advances past the recovered row.
-//!
-//! `#[ignore]`-gated only on (3) because the production
-//! `replay_dlq` operator helper is not yet wired in v0.7.0 (it
-//! lives in the deferred_audit module as a documented SQL recipe
-//! for now; the operator runs the recipe by hand against the DB
-//! file). Pins (1) and (2) run unconditionally.
+//! 2. The durable evidence columns remain present.
+//! 3. A representative row round-trips through those columns without loss.
 
 #![allow(clippy::missing_panics_doc, clippy::doc_markdown)]
 
@@ -57,15 +45,12 @@ fn signed_events_dlq_table_exists_after_migrate_1046() {
 }
 
 /// v0.7.0 #1046 + #1116 pin 2 — the DLQ table accepts the operator-
-/// visible row shape documented in the v0.7.0 CHANGELOG. A schema
-/// drift (column renamed / dropped) fails this pin.
+/// visible durable-evidence row shape. A schema drift (column renamed /
+/// dropped) fails this pin.
 #[test]
 fn signed_events_dlq_accepts_documented_row_shape_1046() {
     let conn = fresh_db();
-    // Insert a synthetic DLQ row matching the documented contract.
-    // The exact column set may evolve; the load-bearing columns the
-    // operator workflow needs are `kind`, `agent_id`, `payload`,
-    // `failure_reason`, `created_at` (or equivalents).
+    // Inspect the schema directly so a missing evidence column fails loudly.
     let pragma_cols: Vec<String> = conn
         .prepare("PRAGMA table_info(signed_events_dlq)")
         .expect("PRAGMA prepare")
@@ -73,33 +58,41 @@ fn signed_events_dlq_accepts_documented_row_shape_1046() {
         .expect("query")
         .collect::<Result<_, _>>()
         .expect("collect");
-    // The exact column set is documented in
-    // `migrations/sqlite/0020_v07_signed_events.sql` + the
-    // operator-workflow notes in CHANGELOG. The pin asserts SOME
-    // payload-carrying column exists (i.e. the table is not empty
-    // / schema-stripped).
-    assert!(
-        pragma_cols.len() >= 3,
-        "#1046: signed_events_dlq must carry at least 3 columns for \
-         operator replay (got {}: {:?})",
-        pragma_cols.len(),
-        pragma_cols
-    );
+    for required in [
+        "id",
+        "agent_id",
+        "event_type",
+        "payload_hash",
+        "signature",
+        "attest_level",
+        "timestamp",
+        "failure_reason",
+        "failed_at",
+    ] {
+        assert!(
+            pragma_cols.iter().any(|column| column == required),
+            "#1046: signed_events_dlq missing durable-evidence column {required}: {pragma_cols:?}"
+        );
+    }
 }
 
-/// v0.7.0 #1046 + #1116 pin 3 — the documented operator-side
-/// replay-and-delete SQL workflow advances the chain past a
-/// recovered DLQ row.
-///
-/// `#[ignore]`-gated per #1046's close-comment: the boot-time
-/// replay sweep is v0.8 follow-up; v0.7.0 ships the operator-side
-/// SQL recipe. This test pins the recipe's shape so a future change
-/// to the chain-write internals surfaces the operator's runbook
-/// drift.
+/// #1046 + #1116 pin 3 — a representative DLQ row round-trips every
+/// recovery-relevant field without implying that replay tooling exists.
 #[test]
-#[ignore = "documents the v0.7.0 operator-side DLQ replay recipe; \
-            boot-time replay sweep tracked for v0.8"]
-fn signed_events_dlq_operator_replay_advances_chain_1046() {
+fn signed_events_dlq_evidence_row_roundtrips_1046() {
+    #[derive(Debug, PartialEq, Eq)]
+    struct EvidenceRow {
+        id: String,
+        agent_id: String,
+        event_type: String,
+        payload_hash: Vec<u8>,
+        signature: Option<Vec<u8>>,
+        attest_level: String,
+        timestamp: String,
+        failure_reason: String,
+        failed_at: String,
+    }
+
     let conn = fresh_db();
     // Step 1: synthesize a DLQ row (in production this lands when
     // the chain-write fails). The shape mirrors
@@ -111,28 +104,29 @@ fn signed_events_dlq_operator_replay_advances_chain_1046() {
     // failed_at). The original pin used pre-rename column names
     // (kind/payload/created_at); the rename landed when the chain
     // primitives were unified with signed_events.
+    let payload_hash = vec![0xde, 0xad, 0xbe, 0xef, 0x10, 0x46];
+    let signature = Some(vec![0x10, 0x46, 0xaa, 0x55]);
     let inserted = conn.execute(
         "INSERT INTO signed_events_dlq \
             (id, agent_id, event_type, payload_hash, signature, attest_level, \
              timestamp, failure_reason, failed_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
-            // Synthetic deterministic values — the pin only asserts
-            // schema-shape match; the values are not load-bearing.
+            // Synthetic deterministic values pin the storage classes and
+            // lossless evidence shape, not cryptographic validity.
             "synth-event-1046",
             "ai:operator-test",
             "governance.check",
-            "deadbeef".repeat(8), // payload_hash (64 hex chars)
-            Vec::<u8>::new(),     // signature BLOB; empty is acceptable
+            &payload_hash,
+            &signature,
             "unsigned",
             "2026-05-22T10:00:00Z",
             "lock_contention",
             "2026-05-22T10:00:00Z",
         ],
     );
-    // If the insert failed because of a column name mismatch, the
-    // operator runbook needs to update — surface the actual columns
-    // for the runbook drift.
+    // If the insert failed because of a column name mismatch, surface the
+    // actual columns for evidence-contract drift.
     if let Err(e) = &inserted {
         let pragma_cols: Vec<String> = conn
             .prepare("PRAGMA table_info(signed_events_dlq)")
@@ -143,23 +137,43 @@ fn signed_events_dlq_operator_replay_advances_chain_1046() {
             .unwrap();
         panic!(
             "#1046: signed_events_dlq INSERT failed ({e}); columns: {pragma_cols:?}. \
-             The operator-side replay recipe documented in CHANGELOG must match \
-             the actual schema."
+             The durable-evidence contract must match the actual schema."
         );
     }
 
-    let dlq_count_before: i64 = conn
-        .query_row("SELECT COUNT(*) FROM signed_events_dlq", [], |r| r.get(0))
-        .expect("count");
-    assert_eq!(dlq_count_before, 1, "DLQ row landed");
-
-    // Step 2 (documented operator recipe): replay the DLQ row into
-    // signed_events by writing a fresh chain row and deleting the
-    // DLQ row in the same transaction. The chain advances by one;
-    // the operator's audit window observes the recovered event.
-    //
-    // In v0.7.0 the operator runs this by hand against the DB file;
-    // a future helper (`replay_dlq` fn) is tracked as v0.8 follow-up.
-    // The pin documents the recipe shape so a future schema change
-    // surfaces the operator runbook drift.
+    let evidence: EvidenceRow = conn
+        .query_row(
+            "SELECT id, agent_id, event_type, payload_hash, signature, \
+                    attest_level, timestamp, failure_reason, failed_at \
+             FROM signed_events_dlq WHERE id = ?1",
+            ["synth-event-1046"],
+            |row| {
+                Ok(EvidenceRow {
+                    id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    event_type: row.get(2)?,
+                    payload_hash: row.get(3)?,
+                    signature: row.get(4)?,
+                    attest_level: row.get(5)?,
+                    timestamp: row.get(6)?,
+                    failure_reason: row.get(7)?,
+                    failed_at: row.get(8)?,
+                })
+            },
+        )
+        .expect("query durable DLQ evidence");
+    assert_eq!(
+        evidence,
+        EvidenceRow {
+            id: "synth-event-1046".to_string(),
+            agent_id: "ai:operator-test".to_string(),
+            event_type: "governance.check".to_string(),
+            payload_hash,
+            signature,
+            attest_level: "unsigned".to_string(),
+            timestamp: "2026-05-22T10:00:00Z".to_string(),
+            failure_reason: "lock_contention".to_string(),
+            failed_at: "2026-05-22T10:00:00Z".to_string(),
+        }
+    );
 }

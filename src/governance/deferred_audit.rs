@@ -2152,8 +2152,8 @@ impl SqliteSignedEventsSink {
         // Either the retry budget was exhausted on UNIQUE races OR
         // the first attempt produced a non-race error. Land in DLQ.
         //
-        // v0.7.0 #1046 (Agent-6 #7) — chain-log property advisory.
-        // At v0.7.0 the audit-chain delivery contract is:
+        // #1046 (Agent-6 #7) — chain-log property advisory.
+        // The audit-chain delivery contract is:
         //
         //   **chain-log emission is "exactly-once OR DLQ-recoverable"**
         //
@@ -2164,23 +2164,17 @@ impl SqliteSignedEventsSink {
         //   - On the DLQ-landing path (this branch), the refusal
         //     row does NOT advance the chain — instead a row lands
         //     in `signed_events_dlq` with the same `id`,
-        //     `agent_id`, `payload_hash`, and `failure_reason`.
-        //     The DLQ row preserves enough state to replay back
-        //     into the chain.
-        //   - There is NO boot-time DLQ→chain replay path at
-        //     v0.7.0. Operators with non-zero `dlq_landed_count`
-        //     should run the operator-side replay tooling (or
-        //     manual SQL: copy DLQ rows into `signed_events` after
-        //     resolving the chain-head race condition that caused
-        //     the DLQ landing).
+        //     `agent_id`, `payload_hash`, and `failure_reason` for
+        //     chain-aware operator investigation.
+        //   - v1.0.0 has no boot-time replay sweep or replay CLI.
+        //     Operators preserve the database and DLQ rows, stop
+        //     writers, and escalate rather than copying/deleting
+        //     rows with ad hoc SQL.
         //
-        // A future v0.8 change can wire a boot-time DLQ replay
-        // sweep that retries every `signed_events_dlq` entry into
-        // `signed_events` via `append_signed_event`. The current
-        // chain-log property is the load-bearing contract: the
+        // The current chain-log property is the load-bearing contract: the
         // cryptographic chain never carries a "phantom" refusal
         // (every chain row is a real append), and DLQ rows are
-        // recoverable via operator action.
+        // preserved for explicit operator disposition.
         let err = last_err.unwrap_or_else(|| anyhow::anyhow!("unknown drainer sink error"));
         let failure_reason = format!("{err:#}");
         let conn = self.ensure_conn()?;
