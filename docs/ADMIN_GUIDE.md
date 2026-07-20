@@ -865,17 +865,22 @@ leaving time for the visible exit-75 failure path.
 
 > **Note:** The HTTP daemon handles SIGINT (Ctrl+C) gracefully with WAL checkpoint. Systemd sends SIGTERM by default -- the service file sets `KillSignal=SIGINT` to ensure clean shutdown.
 
-The daemon exits with status **75 (`EX_TEMPFAIL`)** when it cannot safely drop
-its Tokio runtime. During shutdown this means a background writer or
-deferred-audit drain missed its deadline; the daemon deliberately skips the
-final witness/WAL checkpoint rather than certify a racing writer. During boot
-or serving, the same status can follow a configuration, key/TLS, federation,
-database/storage initialization, listener, or server transport error after
-lifecycle resources may have been created.
+The daemon exits with status **75 (`EX_TEMPFAIL`)** when it cannot certify a
+safe shutdown or safely drop its Tokio runtime. Before final certification,
+this means a background writer or deferred-audit drain missed its deadline;
+the daemon deliberately skips the final witness/WAL checkpoint rather than
+certify a racing writer. After final certification begins, the same status
+means witness custody could not sign, the durable off-table anchor could not
+be persisted, the WAL checkpoint failed, or the certification deadline
+expired. In that case certification may be partially committed and is not a
+clean-shutdown claim. During boot or serving, status 75 can also follow a
+configuration, key/TLS, federation, database/storage initialization, listener,
+or server transport error after lifecycle resources may have been created.
 Always use the preceding `fatal daemon bootstrap/shutdown` diagnostic to
 distinguish the cause; do not blindly restart-loop a configuration error.
 
-For a shutdown deadline, preserve the database and adjacent
+For any shutdown certification failure, preserve the database, witness custody
+directory, off-table head-anchor log, and adjacent
 `.deferred-audit.journal.spool`, inspect disk/lock health, and restart only
 after the stall is cleared. The occurrence spool is fsynced before queue
 admission and replayed idempotently on the next boot. For a bootstrap failure,
