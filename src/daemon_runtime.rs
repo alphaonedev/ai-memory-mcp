@@ -6356,20 +6356,27 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
              peer-mesh deployments (red-team #231)."
             );
             tracing::info!("ai-memory listening on http://{addr}");
-            // Wave 3 (v0.6.3): the non-TLS path delegates to
-            // `daemon_runtime::serve_http_with_shutdown_future`, which is the
-            // same `build_router` + `TcpListener::bind` + `axum::serve` body
-            // the integration tests drive in-process. Production threads its
-            // WAL-checkpoint-on-shutdown future in directly so the cleanup
-            // semantic is preserved verbatim.
-            serve_http_with_shutdown_future_and_timeout(
-                &addr,
-                api_key_state,
-                app_state,
-                request_timeout,
-                shutdown,
-            )
-            .await?;
+            // Production plain HTTP uses the same bounded graceful-shutdown
+            // handle as TLS. The generic axum test helper intentionally keeps
+            // its caller-controlled future, but has no grace deadline of its
+            // own and therefore is not suitable for the service-manager path.
+            let socket_addr: std::net::SocketAddr = addr.parse()?;
+            let app = crate::build_router_with_timeout(api_key_state, app_state, request_timeout);
+            let grace = Duration::from_secs(args.shutdown_grace_secs);
+            let handle = axum_server::Handle::new();
+            let handle_clone = handle.clone();
+            let signal_task = tokio::spawn(async move {
+                shutdown.await;
+                handle_clone.graceful_shutdown(Some(grace));
+            });
+            server_aux_tasks_for_run
+                .lock()
+                .expect("server auxiliary task registry poisoned")
+                .push(signal_task);
+            axum_server::bind(socket_addr)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await?;
         }
         Ok(())
     }
@@ -8243,6 +8250,12 @@ mod tests {
         assert!(digital_ocean.contains("KillSignal=SIGINT"));
         assert!(digital_ocean.contains("TimeoutStopSec=90"));
         assert!(digital_ocean.contains("RestartPreventExitStatus=75"));
+
+        let default_shutdown_budget = Duration::from_secs(30)
+            + crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT
+            + crate::subscriptions::SHUTDOWN_DRAIN_TIMEOUT
+            + crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT;
+        assert!(default_shutdown_budget < Duration::from_secs(90));
     }
 
     #[test]
