@@ -1866,8 +1866,11 @@ impl DeferredAuditQueue {
 ///   Chain or DLQ residence may or may not already exist; examples include a
 ///   DB landing failure and a post-residence journal-acknowledgement failure.
 ///   Drainer handling increments `append_failures` and requires operator
-///   intervention. On the journal-backed production path, admitted evidence
-///   remains available for recovery until acknowledged.
+///   intervention. A DB landing failure on the journal-backed production path
+///   retains the spool artifact. A post-residence acknowledgement error can
+///   occur before or after unlink; terminal DB evidence already exists and an
+///   idempotent retry or recovery pass can detect that residence and retry
+///   acknowledgement without duplicating the DB row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppendOutcome {
     /// Event is terminally resident in `signed_events` (new or pre-existing).
@@ -1895,10 +1898,12 @@ pub trait DeferredAuditSink: Send + 'static {
     ///
     /// Returns `Err` when end-to-end sink completion fails. Chain or DLQ
     /// residence may or may not already exist (for example, a DB landing
-    /// failure versus a post-residence journal-acknowledgement failure). A
-    /// journal-backed caller retains admitted evidence until acknowledgement.
-    /// Chain-insert failure followed by successful DLQ landing and
-    /// acknowledgement is reported via [`AppendOutcome::DlqLanded`].
+    /// failure versus a post-residence journal-acknowledgement failure). On a
+    /// journal-backed path, DB landing failure retains the spool artifact;
+    /// acknowledgement failure may occur before or after unlink, with terminal
+    /// DB evidence already established. Chain-insert failure followed by
+    /// successful DLQ landing and acknowledgement is reported via
+    /// [`AppendOutcome::DlqLanded`].
     fn append(&mut self, event: &DeferredAuditEvent) -> Result<AppendOutcome>;
 
     /// Retry an event after the preceding [`Self::append`] panicked.
