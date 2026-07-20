@@ -692,11 +692,89 @@ fn acl_bytes(acl: *const ACL) -> Result<Vec<u8>> {
 }
 
 fn wide_path(path: &Path) -> Result<Vec<u16>> {
-    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    const BACKSLASH: u16 = b'\\' as u16;
+    const SLASH: u16 = b'/' as u16;
+
+    let supplied: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if supplied.contains(&0) {
+        anyhow::bail!("Windows path contains an interior NUL");
+    }
+    if let Some(std::path::Component::Prefix(prefix)) = path.components().next() {
+        match prefix.kind() {
+            std::path::Prefix::VerbatimDisk(_) | std::path::Prefix::VerbatimUNC(_, _) => {
+                return Ok(supplied.into_iter().chain(std::iter::once(0)).collect());
+            }
+            std::path::Prefix::Verbatim(namespace)
+                if is_volume_guid_namespace(namespace)
+                    && matches!(
+                        path.components().nth(1),
+                        Some(std::path::Component::RootDir)
+                    ) =>
+            {
+                return Ok(supplied.into_iter().chain(std::iter::once(0)).collect());
+            }
+            std::path::Prefix::DeviceNS(_) | std::path::Prefix::Verbatim(_) => {
+                anyhow::bail!("unsupported Windows device or verbatim path namespace");
+            }
+            std::path::Prefix::Disk(_) | std::path::Prefix::UNC(_, _) => {}
+        }
+    }
+
+    let absolute = std::path::absolute(path).context("resolve absolute Windows path")?;
+    let mut wide: Vec<u16> = absolute.as_os_str().encode_wide().collect();
     if wide.contains(&0) {
         anyhow::bail!("Windows path contains an interior NUL");
     }
-    Ok(wide.into_iter().chain(std::iter::once(0)).collect())
+    for unit in &mut wide {
+        if *unit == SLASH {
+            *unit = BACKSLASH;
+        }
+    }
+
+    let mut extended = if wide.starts_with(&[BACKSLASH, BACKSLASH]) {
+        let mut prefixed = "\\\\?\\UNC\\".encode_utf16().collect::<Vec<_>>();
+        prefixed.extend_from_slice(&wide[2..]);
+        prefixed
+    } else {
+        let mut prefixed = "\\\\?\\".encode_utf16().collect::<Vec<_>>();
+        prefixed.extend_from_slice(&wide);
+        prefixed
+    };
+    extended.push(0);
+    Ok(extended)
+}
+
+fn is_volume_guid_namespace(namespace: &std::ffi::OsStr) -> bool {
+    let units: Vec<u16> = namespace.encode_wide().collect();
+    let volume = b"Volume";
+    if units.len() != 44
+        || !units[..volume.len()]
+            .iter()
+            .zip(volume)
+            .all(|(unit, expected)| {
+                u8::try_from(*unit).is_ok_and(|actual| actual.eq_ignore_ascii_case(expected))
+            })
+        || units[6] != u16::from(b'{')
+    {
+        return false;
+    }
+    if units[43] != u16::from(b'}') {
+        return false;
+    }
+
+    units[7..43].iter().enumerate().all(|(index, unit)| {
+        matches!(index, 8 | 13 | 18 | 23)
+            .then_some(u16::from(b'-'))
+            .map_or_else(
+                || char::from_u32(u32::from(*unit)).is_some_and(|ch| ch.is_ascii_hexdigit()),
+                |hyphen| *unit == hyphen,
+            )
+    })
+}
+
+#[cfg(test)]
+pub(super) fn wide_path_for_test(path: &Path) -> Result<Vec<u16>> {
+    wide_path(path)
 }
 
 fn is_already_exists(error: &anyhow::Error) -> bool {

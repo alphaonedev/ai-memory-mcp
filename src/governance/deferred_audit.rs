@@ -5042,6 +5042,63 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn journal_windows_supports_extended_length_paths() {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        let dir = fresh_tempdir();
+        let mut nested = dir.path().to_path_buf();
+        for index in 0..4 {
+            nested.push(format!("segment-{index}-{}", "x".repeat(70)));
+        }
+        std::fs::create_dir_all(&nested).expect("create long protected test path");
+        let journal_path = nested.join("extended-length-audit.journal");
+        assert!(
+            journal_path.as_os_str().encode_wide().count() > 260,
+            "fixture must exceed legacy MAX_PATH"
+        );
+
+        let journal = DeferredAuditJournal::open(&journal_path).expect("open long-path journal");
+        let event = DeferredAuditEvent::from_refusal(
+            "agent:long-path",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        journal.append(&event).expect("append long-path event");
+        drop(journal);
+
+        let replayed = DeferredAuditJournal::open(&journal_path)
+            .expect("reopen long-path journal")
+            .replay()
+            .expect("replay long-path journal");
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].agent_id, "agent:long-path");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn journal_windows_rejects_device_and_generic_verbatim_namespaces() {
+        windows_private::wide_path_for_test(Path::new(
+            r"\\?\vOlUmE{12345678-1234-1234-1234-123456789abc}\directory\audit.journal",
+        ))
+        .expect("rooted volume-GUID namespace must be accepted case-insensitively");
+
+        for path in [
+            Path::new(r"\\.\PhysicalDrive0"),
+            Path::new(r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1"),
+        ] {
+            let error = windows_private::wide_path_for_test(path)
+                .expect_err("non-filesystem Windows namespace must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("unsupported Windows device or verbatim path namespace")
+            );
+        }
+    }
+
     #[test]
     fn journal_quota_refuses_unjournaled_queue_delivery() {
         let dir = fresh_tempdir();
