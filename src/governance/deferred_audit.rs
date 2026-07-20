@@ -66,10 +66,10 @@
 //! [`DeferredAuditQueue::close_and_flush`] drops the sender and
 //! awaits the supervisor task to terminate. The drainer drains every
 //! still-buffered event before exiting; each pending event MUST reach
-//! terminal accounting in `signed_events`, `signed_events_dlq`, or an
-//! explicit counted failure before the daemon's tokio runtime is torn
-//! down. Callers that require every event to advance the audit chain
-//! must additionally require zero append and send failures.
+//! acknowledged terminal residence in `signed_events` or
+//! `signed_events_dlq`. An unresolved sink exhausts its finite retry budget
+//! and terminates the supervisor visibly rather than making shutdown appear
+//! clean.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -357,7 +357,9 @@ impl DeferredAuditMetrics {
         self.appended.load(Ordering::Relaxed)
     }
 
-    fn completed_count(&self) -> u64 {
+    /// Number of occurrences with acknowledged terminal chain/DLQ residence.
+    #[must_use]
+    pub fn completed_count(&self) -> u64 {
         self.completed.load(Ordering::Relaxed)
     }
 
@@ -2673,12 +2675,9 @@ fn panic_retry_backoff(restart: u32) -> std::time::Duration {
     std::time::Duration::from_millis(millis)
 }
 
-/// Close the queue and wait for the supervisor task to account for every
-/// pending event. `Ok(())` means each submission either advanced
-/// `signed_events` or reached an explicitly counted failure/DLQ outcome; callers
-/// that require a fully advanced chain must additionally require zero
-/// [`DeferredAuditMetrics::append_failure_count`] and
-/// [`DeferredAuditMetrics::send_failure_count`].
+/// Close the queue and wait for every pending event to reach acknowledged
+/// terminal chain/DLQ residence. An unresolved occurrence never counts as
+/// drained merely because its failed attempts were observed.
 ///
 /// # Errors
 ///

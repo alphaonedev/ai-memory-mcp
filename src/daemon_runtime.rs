@@ -6276,9 +6276,7 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
              some refusal audit rows may not have flushed before exit",
             crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
             drain_metrics.submitted_count(),
-            drain_metrics.appended_count()
-                + drain_metrics.append_failure_count()
-                + drain_metrics.send_failure_count(),
+            drain_metrics.completed_count() + drain_metrics.send_failure_count(),
         );
     }
 
