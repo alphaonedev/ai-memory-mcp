@@ -6019,11 +6019,6 @@ fn init_tracing() {
         .try_init();
 }
 
-/// Run the HTTP memory daemon. Loads TLS state, builds `AppState`, spawns
-/// the GC + WAL-checkpoint loops, and binds a listener (TLS or plain HTTP).
-///
-/// Behaviour is preserved from the pre-W6 inline `main::serve` body — only
-/// the structure has changed.
 /// Marker returned when daemon shutdown cannot prove that every writer has
 /// stopped. The binary boundary maps this to `EX_TEMPFAIL` before dropping the
 /// Tokio runtime, so an uncancellable synchronous writer cannot stall runtime
@@ -6062,6 +6057,8 @@ impl std::fmt::Display for FatalShutdownError {
 
 impl std::error::Error for FatalShutdownError {}
 
+const FINAL_CERTIFICATION_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn fatal_shutdown(reason: &'static str) -> anyhow::Error {
     tracing::error!(
         reason,
@@ -6083,6 +6080,10 @@ fn classify_server_failure(error: anyhow::Error) -> anyhow::Error {
     ))
 }
 
+/// Run the HTTP memory daemon. Loads TLS state, builds `AppState`, spawns
+/// lifecycle-owned workers, and binds a listener (TLS or plain HTTP). On every
+/// exit path it quiesces writers, drains deferred audit, and either completes
+/// final witness/WAL certification or returns [`FatalShutdownError`].
 #[allow(clippy::too_many_lines)]
 pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) -> Result<()> {
     init_tracing();
@@ -6460,7 +6461,30 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
     // handlers + the deferred-audit drainer) has quiesced. The drainer's
     // appends share this database's WAL file, so this single checkpoint
     // folds them in even though the drainer holds its own connection.
-    shutdown_witness_flush_and_checkpoint(&checkpoint_state).await;
+    let certification_state = checkpoint_state.clone();
+    let mut certification_task =
+        tokio::spawn(
+            async move { shutdown_witness_flush_and_checkpoint(&certification_state).await },
+        );
+    match tokio::time::timeout(FINAL_CERTIFICATION_TIMEOUT, &mut certification_task).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => {
+            tracing::error!(%error, "final witness/WAL certification failed");
+            return Err(fatal_shutdown("final witness/WAL certification failed"));
+        }
+        Ok(Err(error)) => {
+            tracing::error!(%error, "final witness/WAL certification task failed");
+            return Err(fatal_shutdown(
+                "final witness/WAL certification task failed",
+            ));
+        }
+        Err(_) => {
+            certification_task.abort();
+            return Err(fatal_shutdown(
+                "final witness/WAL certification deadline exceeded",
+            ));
+        }
+    }
 
     if let Err(error) = server_result {
         return Err(classify_server_failure(error));
@@ -6477,12 +6501,12 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
 /// deferred-audit queue has drained, so the witnessed head includes every
 /// append of the daemon's life. Inherits the emitter's own gating: with no
 /// enrolled witness key the emission is a no-op (byte-identical legacy
-/// shutdown); emission failures are logged + swallowed (fire-and-forget —
-/// shutdown never fails on a witness error).
-pub async fn shutdown_witness_flush_and_checkpoint(db_state: &Db) {
+/// shutdown). The caller must treat any witness/checkpoint failure as an
+/// uncertified shutdown.
+pub async fn shutdown_witness_flush_and_checkpoint(db_state: &Db) -> Result<()> {
     let lock = db_state.lock().await;
-    crate::signed_events::force_emit_audit_head_witness(&lock.0);
-    let _ = db::checkpoint(&lock.0);
+    crate::signed_events::try_force_emit_audit_head_witness(&lock.0)?;
+    db::checkpoint(&lock.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -6660,13 +6684,10 @@ pub async fn serve_http_with_shutdown(
     .await
 }
 
-/// Variant of [`serve_http_with_shutdown`] that takes an arbitrary
-/// shutdown future. The production `serve()` needs to run a WAL
-/// checkpoint after the OS signal but before tearing down the listener;
-/// that cleanup work is awkward to express through a `Notify` alone.
-/// Accepting a `Future` lets the caller embed any async cleanup into the
-/// shutdown future itself, while the helper keeps the `build_router` +
-/// `TcpListener::bind` + `axum::serve` body it already owns.
+/// Variant of [`serve_http_with_shutdown`] that takes an arbitrary shutdown
+/// future. This is an in-process harness surface; production [`serve`] uses
+/// `axum_server::Handle` for a bounded grace period and performs writer drains
+/// plus final certification only after the listener has quiesced.
 pub async fn serve_http_with_shutdown_future<F>(
     addr: &str,
     api_key_state: ApiKeyState,
@@ -8254,7 +8275,8 @@ mod tests {
         let default_shutdown_budget = Duration::from_secs(30)
             + crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT
             + crate::subscriptions::SHUTDOWN_DRAIN_TIMEOUT
-            + crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT;
+            + crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT
+            + FINAL_CERTIFICATION_TIMEOUT;
         assert!(default_shutdown_budget < Duration::from_secs(90));
     }
 

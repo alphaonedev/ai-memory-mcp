@@ -860,8 +860,8 @@ The HTTP daemon handles SIGINT (Ctrl+C) gracefully:
 
 For systemd, use `KillSignal=SIGINT` and `TimeoutStopSec=90`. This covers the
 default 30-second HTTP request grace period plus the bounded background-writer,
-webhook-delivery, and deferred-audit drain phases, leaving time for the final
-witness/checkpoint or the visible exit-75 failure path.
+webhook-delivery, deferred-audit drain, and final witness/checkpoint phases,
+leaving time for the visible exit-75 failure path.
 
 > **Note:** The HTTP daemon handles SIGINT (Ctrl+C) gracefully with WAL checkpoint. Systemd sends SIGTERM by default -- the service file sets `KillSignal=SIGINT` to ensure clean shutdown.
 

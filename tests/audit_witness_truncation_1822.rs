@@ -435,7 +435,8 @@ fn run_shutdown_flush(db: &ai_memory::handlers::Db) {
         .enable_all()
         .build()
         .expect("tokio runtime")
-        .block_on(ai_memory::daemon_runtime::shutdown_witness_flush_and_checkpoint(db));
+        .block_on(ai_memory::daemon_runtime::shutdown_witness_flush_and_checkpoint(db))
+        .unwrap();
 }
 
 #[test]
