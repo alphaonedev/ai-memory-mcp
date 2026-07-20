@@ -308,9 +308,10 @@ cognitive counterpart in the memory store itself.
   `signed_events` at boot (content-bound and idempotent on stable occurrence
   ID, with legacy payload-hash cardinality compatibility). Spool entries are
   atomically published with owner-private permissions (exact effective-UID
-  modes and root/daemon-owned ancestors on Unix (group-write only for the
-  daemon's effective primary group; world-write only with sticky containment;
-  macOS extended ACLs must be trivial); protected
+  modes, no lexical symlink ancestors, and root/daemon-owned ancestors on Unix
+  (any group/world-writable ancestor is rejected unless root/daemon ownership
+  plus the sticky bit provides rename containment; macOS extended ACLs must be
+  trivial); protected
   current-token-owner-only DACLs plus reparse rejection, trusted ancestor
   owner/delete-authority validation, and retained no-delete-sharing
   lexical-ancestor/spool handles on Windows), bounded to 4,096 entries / 32

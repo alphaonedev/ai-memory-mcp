@@ -972,10 +972,11 @@ fn validate_spool_ancestors_at(path: &Path) -> Result<()> {
                 ancestor.display()
             )
         })?;
-        // A lexical symlink is protected by its containing directory. The
-        // resolved target chain is validated in a second pass below.
         if link_metadata.file_type().is_symlink() {
-            continue;
+            anyhow::bail!(
+                "deferred-audit spool ancestor is a symlink: {}",
+                ancestor.display()
+            );
         }
         let directory = open_directory_handle(ancestor).with_context(|| {
             format!(
@@ -4767,6 +4768,35 @@ mod tests {
         assert!(
             !journal_spool_dir(&journal_path).exists(),
             "the spool must not be created beneath a group-writable ancestor"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_rejects_symlink_ancestor_inside_sticky_directory() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let dir = fresh_tempdir();
+        let sticky = dir.path().join("sticky-parent");
+        let target = dir.path().join("symlink-target");
+        std::fs::create_dir(&sticky).unwrap();
+        std::fs::set_permissions(&sticky, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        let link = sticky.join("replaceable-link");
+        symlink(&target, &link).unwrap();
+        let journal_path = link.join("audit.journal");
+
+        let error = DeferredAuditJournal::open(&journal_path)
+            .err()
+            .expect("a lexical symlink ancestor must fail closed");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("ancestor is a symlink"))
+        );
+        assert!(
+            !journal_spool_dir(&target.join("audit.journal")).exists(),
+            "validation must fail before creating a spool through the symlink"
         );
     }
 
