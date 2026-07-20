@@ -3789,6 +3789,8 @@ pub struct ServeBootstrap {
     /// metrics handle is the only drain-observability surface `serve`
     /// retains after the queue is moved into `AppState`.
     pub deferred_audit_metrics: crate::governance::deferred_audit::DeferredAuditMetrics,
+    /// Receiver-owned shutdown barrier for the deferred-audit supervisor.
+    pub deferred_audit_shutdown: crate::governance::deferred_audit::DeferredAuditShutdown,
 }
 
 /// v0.7.0 Wave-3 — resolve a [`MemoryStore`] handle from the operator's
@@ -4990,8 +4992,8 @@ pub async fn bootstrap_serve(
     // queue is built with the journal so every submit is durable before
     // the mpsc send. Runs BEFORE the governance hooks install below
     // (replay-all-then-go-live).
-    let (deferred_audit_queue, deferred_audit_supervisor) =
-        crate::governance::deferred_audit::install_deferred_audit_drainer_with_journal(db_path);
+    let (deferred_audit_queue, deferred_audit_shutdown) =
+        crate::governance::deferred_audit::install_deferred_audit_drainer_with_shutdown(db_path);
     // Capture the shared atomic metrics handle BEFORE the queue is cloned
     // into the governance hooks + moved onto `AppState`. `serve` polls
     // these on shutdown to drain the queue before the WAL checkpoint.
@@ -5783,15 +5785,6 @@ pub async fn bootstrap_serve(
         http_identity_mode,
     };
 
-    // v0.7.0 Policy-Engine Item 3 — register the deferred-audit
-    // supervisor task with the task_handles vec so `serve()` aborts
-    // it on shutdown. The supervisor wraps the drainer with panic
-    // recovery + graceful drain of buffered events when the queue is
-    // closed. This MUST be in `task_handles` so the test assertion in
-    // `test_bootstrap_serve_keyword_tier_no_embedder` updates its
-    // expected count accordingly.
-    task_handles.push(deferred_audit_supervisor);
-
     // Automatic GC. Cluster G (#767) — pass through the operator-
     // tunable `[confidence] shadow_retention_days` so the periodic
     // sweep on `confidence_shadow_observations` runs at the configured
@@ -5956,6 +5949,7 @@ pub async fn bootstrap_serve(
         // H7 (v0.7.0 round-2) — per-request HTTP timeout (default 60s).
         request_timeout: Duration::from_secs(app_config.effective_request_timeout_secs()),
         deferred_audit_metrics,
+        deferred_audit_shutdown,
     })
 }
 
@@ -6249,22 +6243,30 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         .await?;
     }
 
-    // v0.7.0 Policy-Engine Item 3 — the HTTP server has now fully
-    // quiesced (graceful shutdown complete; no in-flight request can
-    // submit another refusal), so `submitted` is final. Drain the
-    // deferred-audit queue before exit so every refusal captured during
-    // the daemon's life lands in `signed_events`. We can NOT use
-    // `close_and_flush` here: the governance hooks
-    // (`storage::GOVERNANCE_PRE_WRITE`, `wire_check::GOVERNANCE_PRE_ACTION`)
-    // hold sender clones inside process-wide `OnceLock`s that never drop,
-    // so the channel never closes and awaiting the supervisor would block
-    // forever. `drain_pending` instead polls the shared atomic metrics
-    // until the drainer has caught up to the submitted count.
-    let drained = crate::governance::deferred_audit::drain_pending(
-        &drain_metrics,
-        crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
-    )
-    .await;
+    // Stop and join every periodic/background writer before establishing the
+    // deferred-audit receiver-close barrier. Dropping a Tokio JoinHandle would
+    // detach the task and permit a late write after the final checkpoint.
+    for task in bootstrap.task_handles {
+        task.abort();
+        let _ = task.await;
+    }
+
+    // Process-global governance hooks retain sender clones forever. Ask the
+    // supervisor to close its receiver instead: sends linearized before close
+    // are drained, while later journal-backed sends fail closed and retain
+    // durable boot-recovery evidence. Awaiting the supervisor also proves the
+    // audit writer has stopped before the witness and WAL checkpoint.
+    let drained = match bootstrap
+        .deferred_audit_shutdown
+        .close_and_flush(crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT)
+        .await
+    {
+        Ok(drained) => drained,
+        Err(error) => {
+            tracing::error!(%error, "deferred-audit supervisor failed during shutdown");
+            false
+        }
+    };
     if drained {
         tracing::info!(
             "deferred-audit queue drained ({} refusals accounted) — checkpointing WAL",
@@ -8324,7 +8326,7 @@ mod tests {
         // parallel CI load — see the gate site in `bootstrap_serve`
         // for the rationale. The task count reverts to nine when the
         // env var is unset.
-        assert_eq!(bs.task_handles.len(), 9);
+        assert_eq!(bs.task_handles.len(), 8);
         // Cleanly abort the spawned tasks so they don't leak across tests.
         for h in bs.task_handles {
             h.abort();

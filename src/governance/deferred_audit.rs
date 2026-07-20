@@ -84,7 +84,10 @@ use anyhow::{Context, Result};
 #[cfg(windows)]
 #[path = "deferred_audit_windows.rs"]
 mod windows_private;
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::{
+    mpsc::{self, UnboundedReceiver, UnboundedSender},
+    oneshot,
+};
 use tokio::task::JoinHandle;
 
 use crate::governance::agent_action::{AgentAction, Decision};
@@ -369,8 +372,8 @@ impl DeferredAuditMetrics {
         self.send_failures.load(Ordering::Relaxed)
     }
 
-    /// Number of drainer events accounted as append failures, including sink
-    /// errors, DLQ residence, and exhausted panic-restart budgets.
+    /// Number of failed append attempts, including retryable sink errors, DLQ
+    /// residence, and exhausted panic-restart budgets.
     #[must_use]
     pub fn append_failure_count(&self) -> u64 {
         self.append_failures.load(Ordering::Relaxed)
@@ -2576,10 +2579,24 @@ pub fn spawn_drainer_task<S: DeferredAuditSink + 'static>(
 /// The returned `JoinHandle` resolves when the supervisor exits.
 #[must_use]
 pub fn spawn_supervised_drainer<F, S>(
+    receiver: UnboundedReceiver<DeferredAuditEvent>,
+    make_sink: F,
+    metrics: DeferredAuditMetrics,
+    max_restarts: u32,
+) -> JoinHandle<()>
+where
+    F: Fn() -> S + Send + 'static,
+    S: DeferredAuditSink + 'static,
+{
+    spawn_supervised_drainer_inner(receiver, make_sink, metrics, max_restarts, None)
+}
+
+fn spawn_supervised_drainer_inner<F, S>(
     mut receiver: UnboundedReceiver<DeferredAuditEvent>,
     make_sink: F,
     metrics: DeferredAuditMetrics,
     max_restarts: u32,
+    mut shutdown: Option<oneshot::Receiver<()>>,
 ) -> JoinHandle<()>
 where
     F: Fn() -> S + Send + 'static,
@@ -2589,7 +2606,21 @@ where
         let mut sink = make_sink();
         let mut consecutive_restarts = 0_u32;
 
-        while let Some(event) = receiver.recv().await {
+        loop {
+            let event = if let Some(shutdown_rx) = shutdown.as_mut() {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx => {
+                        receiver.close();
+                        shutdown = None;
+                        receiver.recv().await
+                    }
+                    event = receiver.recv() => event,
+                }
+            } else {
+                receiver.recv().await
+            };
+            let Some(event) = event else { break };
             let mut is_retry = false;
             loop {
                 let append_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2667,6 +2698,36 @@ where
     })
 }
 
+/// Production shutdown capability for a journal-backed deferred-audit
+/// supervisor. Closing is receiver-owned, so process-global sender clones do
+/// not prevent the already-admitted channel prefix from draining to `None`.
+pub struct DeferredAuditShutdown {
+    close: Option<oneshot::Sender<()>>,
+    supervisor: JoinHandle<()>,
+}
+
+impl DeferredAuditShutdown {
+    /// Close receiver admission, drain the accepted prefix, and await the
+    /// supervisor. Late journal-backed submissions fail closed and remain in
+    /// the spool for boot recovery.
+    pub async fn close_and_flush(
+        mut self,
+        timeout: std::time::Duration,
+    ) -> std::result::Result<bool, tokio::task::JoinError> {
+        if let Some(close) = self.close.take() {
+            let _ = close.send(());
+        }
+        match tokio::time::timeout(timeout, &mut self.supervisor).await {
+            Ok(result) => result.map(|()| true),
+            Err(_) => {
+                self.supervisor.abort();
+                let _ = self.supervisor.await;
+                Ok(false)
+            }
+        }
+    }
+}
+
 fn panic_retry_backoff(restart: u32) -> std::time::Duration {
     let exponent = restart.saturating_sub(1).min(10);
     let millis = PANIC_RETRY_BACKOFF_BASE_MS
@@ -2696,9 +2757,9 @@ pub async fn close_and_flush(
 }
 
 /// Default bounded wait for [`drain_pending`] — how long the daemon's
-/// shutdown path waits for the drainer to flush every submitted refusal
-/// into `signed_events` before giving up and proceeding to WAL checkpoint
-/// + exit. Five seconds comfortably covers a multi-thousand-event backlog
+/// shutdown path waits for the drainer to establish acknowledged terminal
+/// chain/DLQ residence for every accepted refusal before giving up and
+/// proceeding to WAL checkpoint + exit. Five seconds comfortably covers a multi-thousand-event backlog
 /// at the sink's ~25-100 microsecond-per-append rate while still bounding
 /// shutdown latency if the drainer is genuinely wedged.
 pub const DEFAULT_SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration =
@@ -2865,6 +2926,75 @@ pub fn install_deferred_audit_drainer_with_journal(
         SUPERVISOR_MAX_RETRIES,
     );
     (queue, supervisor)
+}
+
+/// Journal-backed production installer with an explicit receiver-owned
+/// shutdown barrier. Intended for the HTTP daemon, whose process-global hook
+/// sender clones cannot be dropped during graceful shutdown.
+#[must_use]
+pub fn install_deferred_audit_drainer_with_shutdown(
+    db_path: &Path,
+) -> (DeferredAuditQueue, DeferredAuditShutdown) {
+    let journal_path = deferred_audit_journal_path(db_path);
+    if let Err(e) = recover_deferred_audit(&journal_path, db_path) {
+        tracing::error!(
+            "deferred-audit boot recovery failed for {}; audit delivery is FAIL-CLOSED: {e:#}",
+            journal_path.display()
+        );
+        let (queue, receiver) = DeferredAuditQueue::new();
+        drop(receiver);
+        return (
+            queue,
+            DeferredAuditShutdown {
+                close: None,
+                supervisor: tokio::spawn(async {}),
+            },
+        );
+    }
+    let journal = match DeferredAuditJournal::open(&journal_path) {
+        Ok(journal) => Arc::new(journal),
+        Err(e) => {
+            tracing::error!(
+                "deferred-audit journal open failed for {}; audit delivery is FAIL-CLOSED: {e:#}",
+                journal_path.display()
+            );
+            let (queue, receiver) = DeferredAuditQueue::new();
+            drop(receiver);
+            return (
+                queue,
+                DeferredAuditShutdown {
+                    close: None,
+                    supervisor: tokio::spawn(async {}),
+                },
+            );
+        }
+    };
+    let (queue, receiver) = DeferredAuditQueue::new_with_journal(Some(journal));
+    let metrics = queue.metrics();
+    let db_path_buf = db_path.to_path_buf();
+    let metrics_for_factory = metrics.clone();
+    let journal_for_factory = queue.journal.clone();
+    let (close, shutdown) = oneshot::channel();
+    let supervisor = spawn_supervised_drainer_inner(
+        receiver,
+        move || {
+            SqliteSignedEventsSink::with_metrics_and_journal(
+                db_path_buf.clone(),
+                metrics_for_factory.clone(),
+                journal_for_factory.clone(),
+            )
+        },
+        metrics,
+        SUPERVISOR_MAX_RETRIES,
+        Some(shutdown),
+    );
+    (
+        queue,
+        DeferredAuditShutdown {
+            close: Some(close),
+            supervisor,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -4222,6 +4352,40 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_barrier_drains_prefix_and_preserves_late_submit_for_recovery() {
+        let dir = fresh_tempdir();
+        let db_path = dir.path().join("shutdown-barrier.db");
+        let _ = crate::db::open(&db_path).expect("init db");
+        let journal_path = deferred_audit_journal_path(&db_path);
+        let (queue, shutdown) = install_deferred_audit_drainer_with_shutdown(&db_path);
+
+        assert!(queue.submit_refusal("agent:prefix", &refusal_action(), &refusal_decision()));
+        assert!(
+            shutdown
+                .close_and_flush(std::time::Duration::from_secs(5))
+                .await
+                .unwrap()
+        );
+
+        assert!(!queue.submit_refusal("agent:late", &refusal_action(), &refusal_decision()));
+        let replay = DeferredAuditJournal::open(journal_path)
+            .unwrap()
+            .replay()
+            .unwrap();
+        assert_eq!(replay.len(), 1, "late refusal must remain recoverable");
+
+        let conn = crate::db::open(&db_path).expect("reopen db");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1",
+                rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "accepted prefix must drain before close returns");
     }
 
     #[tokio::test]
