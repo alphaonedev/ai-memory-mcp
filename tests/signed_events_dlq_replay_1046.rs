@@ -3,10 +3,12 @@
 
 //! #1046 + #1116 — `signed_events_dlq` durable evidence pins.
 //!
-//! An event that cannot reach the signed-events chain lands in
+//! When chain insertion fails but DLQ insertion succeeds, the event lands in
 //! `signed_events_dlq` with its identity, payload hash, and failure reason
-//! preserved. v1.0.0 ships neither an automatic replay sweep nor a replay
-//! CLI, so these tests deliberately make no replay-and-delete claim.
+//! preserved. On the journal-backed production path, if both writes fail, the
+//! already-admitted durable spool record remains for recovery. v1.0.0 ships
+//! neither an automatic replay sweep nor a replay CLI, so these tests
+//! deliberately make no replay-and-delete claim.
 //!
 //! This file pins:
 //!
@@ -122,7 +124,7 @@ fn signed_events_dlq_evidence_row_roundtrips_1046() {
             "unsigned",
             "2026-05-22T10:00:00Z",
             "lock_contention",
-            "2026-05-22T10:00:00Z",
+            "2026-05-22T10:05:00Z",
         ],
     );
     // If the insert failed because of a column name mismatch, surface the
@@ -173,7 +175,7 @@ fn signed_events_dlq_evidence_row_roundtrips_1046() {
             attest_level: "unsigned".to_string(),
             timestamp: "2026-05-22T10:00:00Z".to_string(),
             failure_reason: "lock_contention".to_string(),
-            failed_at: "2026-05-22T10:00:00Z".to_string(),
+            failed_at: "2026-05-22T10:05:00Z".to_string(),
         }
     );
 }
