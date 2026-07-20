@@ -671,13 +671,14 @@ impl DeferredAuditJournal {
         Ok(())
     }
 
-    /// Replay every intact record in order, stopping at the first torn
-    /// or corrupt (necessarily trailing) record. A trailing partial
-    /// frame is discarded — it was never fully fsync'd, so by contract
-    /// it is not a recoverable event.
+    /// Replay every intact record in order. Only a physically incomplete
+    /// trailing frame in the legacy stream is ignored because it was never
+    /// fully fsync'd. A complete corrupt, oversized, or undecodable legacy
+    /// frame and every invalid spool frame fail closed; evidence is preserved.
     ///
     /// # Errors
-    /// Propagates the seek / read IO error.
+    /// Returns an error for seek/read/lock/identity failures, replay limits,
+    /// invalid complete legacy frames, or invalid spool artifacts.
     pub fn replay(&self) -> Result<Vec<DeferredAuditEvent>> {
         let _spool_guard = self.lock_spool()?;
         self.replay_locked()
@@ -1907,9 +1908,9 @@ pub trait DeferredAuditSink: Send + 'static {
 /// daemon's database path and appends a `governance.refusal` row to
 /// `signed_events` for each event.
 ///
-/// One `Connection` per drainer task — NOT shared with the substrate
-/// writer. SQLite WAL mode lets the drainer's appends proceed in
-/// parallel with the writer's INSERTs without lock contention.
+/// One `Connection` per drainer task — NOT shared with the substrate writer.
+/// SQLite WAL permits independent readers, while writer contention is
+/// serialized by `BEGIN IMMEDIATE` and handled fail closed.
 ///
 /// # Cluster-C SEC-3 (issue #767) — race-retry + DLQ
 ///
@@ -3358,6 +3359,18 @@ mod tests {
             .expect("repository-owned deferred-audit tempdir")
     }
 
+    fn signed_refusal_for_test(event: &DeferredAuditEvent) -> SignedEvent {
+        SignedEvent {
+            id: event.occurrence_id.clone().unwrap(),
+            agent_id: event.agent_id.clone(),
+            event_type: GOVERNANCE_REFUSAL_EVENT_TYPE.to_string(),
+            payload_hash: payload_hash(&event.canonical_bytes().unwrap()),
+            attest_level: crate::models::AttestLevel::Unsigned.as_str().to_string(),
+            timestamp: event.timestamp.to_rfc3339(),
+            ..SignedEvent::default()
+        }
+    }
+
     #[tokio::test]
     async fn sqlite_sink_appends_governance_refusal_row() {
         let dir = fresh_tempdir();
@@ -3499,6 +3512,143 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_sink_retry_rejects_mismatched_dlq_and_preserves_spool() {
+        let dir = fresh_tempdir();
+        let db_path = dir.path().join("retry-mismatched-dlq.db");
+        let conn = crate::db::open(&db_path).expect("init db");
+        let journal =
+            Arc::new(DeferredAuditJournal::open(deferred_audit_journal_path(&db_path)).unwrap());
+        let mut event = DeferredAuditEvent::from_refusal(
+            "agent:mismatched-dlq",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        event.occurrence_id = Some(uuid::Uuid::new_v4().to_string());
+        journal.append(&event).unwrap();
+        let spool_path = journal.spool_path(event.occurrence_id.as_deref().unwrap());
+        let mismatched_hash = vec![0xA5_u8; 32];
+        conn.execute(
+            "INSERT INTO signed_events_dlq \
+             (id, agent_id, event_type, payload_hash, attest_level, timestamp, \
+              failure_reason, failed_at) \
+             VALUES (?1, ?2, ?3, ?4, 'unsigned', ?5, 'injected', ?5)",
+            rusqlite::params![
+                event.occurrence_id,
+                event.agent_id,
+                GOVERNANCE_REFUSAL_EVENT_TYPE,
+                mismatched_hash,
+                event.timestamp.to_rfc3339(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut sink = SqliteSignedEventsSink::with_metrics_and_journal(
+            db_path.clone(),
+            DeferredAuditMetrics::default(),
+            Some(Arc::clone(&journal)),
+        );
+        let error = sink.append_retry(&event).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "deferred-audit occurrence-id collision with different payload"
+        );
+        assert!(
+            spool_path.exists(),
+            "collision must preserve spool evidence"
+        );
+
+        let conn = crate::db::open(&db_path).unwrap();
+        let hashes: Vec<Vec<u8>> = conn
+            .prepare("SELECT payload_hash FROM signed_events_dlq WHERE id = ?1")
+            .unwrap()
+            .query_map([event.occurrence_id.as_deref().unwrap()], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(hashes, vec![vec![0xA5_u8; 32]]);
+        let chain_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE id = ?1",
+                [event.occurrence_id.as_deref().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(chain_count, 0);
+    }
+
+    #[test]
+    fn sqlite_sink_retry_rejects_dual_residence_and_preserves_spool() {
+        let dir = fresh_tempdir();
+        let db_path = dir.path().join("retry-dual-residence.db");
+        let conn = crate::db::open(&db_path).expect("init db");
+        let journal =
+            Arc::new(DeferredAuditJournal::open(deferred_audit_journal_path(&db_path)).unwrap());
+        let mut event = DeferredAuditEvent::from_refusal(
+            "agent:dual-residence",
+            &refusal_action(),
+            &refusal_decision(),
+        )
+        .unwrap();
+        event.occurrence_id = Some(uuid::Uuid::new_v4().to_string());
+        journal.append(&event).unwrap();
+        let spool_path = journal.spool_path(event.occurrence_id.as_deref().unwrap());
+        let signed = signed_refusal_for_test(&event);
+        assert_eq!(
+            append_occurrence_serialized(&conn, &signed).unwrap(),
+            AppendOutcome::Appended
+        );
+        conn.execute(
+            "INSERT INTO signed_events_dlq \
+             (id, agent_id, event_type, payload_hash, attest_level, timestamp, \
+              failure_reason, failed_at) \
+             VALUES (?1, ?2, ?3, ?4, 'unsigned', ?5, 'injected', ?5)",
+            rusqlite::params![
+                signed.id,
+                signed.agent_id,
+                signed.event_type,
+                signed.payload_hash,
+                signed.timestamp,
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut sink = SqliteSignedEventsSink::with_metrics_and_journal(
+            db_path.clone(),
+            DeferredAuditMetrics::default(),
+            Some(Arc::clone(&journal)),
+        );
+        let error = sink.append_retry(&event).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "deferred-audit occurrence has dual chain/DLQ residence"
+        );
+        assert!(
+            spool_path.exists(),
+            "dual residence must preserve spool evidence"
+        );
+
+        let conn = crate::db::open(&db_path).unwrap();
+        let chain_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE id = ?1",
+                [&signed.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let dlq_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events_dlq WHERE id = ?1",
+                [&signed.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((chain_count, dlq_count), (1, 1));
+    }
+
+    #[test]
     fn serialized_dlq_fallback_rechecks_peer_chain_commit() {
         use std::sync::mpsc::sync_channel;
         use std::time::Duration;
@@ -3517,15 +3667,7 @@ mod tests {
         )
         .unwrap();
         event.occurrence_id = Some(uuid::Uuid::new_v4().to_string());
-        let signed = SignedEvent {
-            id: event.occurrence_id.clone().unwrap(),
-            agent_id: event.agent_id.clone(),
-            event_type: GOVERNANCE_REFUSAL_EVENT_TYPE.to_string(),
-            payload_hash: payload_hash(&event.canonical_bytes().unwrap()),
-            attest_level: crate::models::AttestLevel::Unsigned.as_str().to_string(),
-            timestamp: event.timestamp.to_rfc3339(),
-            ..SignedEvent::default()
-        };
+        let signed = signed_refusal_for_test(&event);
 
         let tx_a =
             rusqlite::Transaction::new_unchecked(&conn_a, rusqlite::TransactionBehavior::Immediate)
