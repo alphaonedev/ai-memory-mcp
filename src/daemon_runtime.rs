@@ -8351,6 +8351,56 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_bind_failure_drains_writers_before_returning_fatal_status() {
+        let env = TestEnv::fresh();
+        let mut args = args_with_db(&env.db_path);
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("reserve a loopback port for the bind-failure test");
+        args.port = occupied.local_addr().expect("read reserved address").port();
+
+        let error = serve(env.db_path.clone(), args, &AppConfig::default())
+            .await
+            .expect_err("an occupied bind address must stop the daemon");
+        let fatal = error
+            .downcast_ref::<FatalShutdownError>()
+            .expect("bind failure must retain the service-manager marker");
+        assert_eq!(fatal.reason, "daemon server setup failed");
+        assert!(
+            fatal
+                .detail
+                .as_deref()
+                .is_some_and(|detail| !detail.is_empty()),
+            "fatal detail must preserve the bind failure: {fatal}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_tls_bind_failure_uses_the_same_certified_shutdown_path() {
+        let env = TestEnv::fresh();
+        let mut args = args_with_db(&env.db_path);
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("reserve a loopback port for the TLS bind-failure test");
+        args.port = occupied.local_addr().expect("read reserved address").port();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls");
+        args.tls_cert = Some(fixtures.join("valid_cert.pem"));
+        args.tls_key = Some(fixtures.join("valid_key_pkcs8.pem"));
+
+        let error = serve(env.db_path.clone(), args, &AppConfig::default())
+            .await
+            .expect_err("an occupied TLS bind address must stop the daemon");
+        let fatal = error
+            .downcast_ref::<FatalShutdownError>()
+            .expect("TLS bind failure must retain the service-manager marker");
+        assert_eq!(fatal.reason, "daemon server setup failed");
+        assert!(
+            fatal
+                .detail
+                .as_deref()
+                .is_some_and(|detail| !detail.is_empty())
+        );
+    }
+
     // ----- spawn_gc_loop / spawn_wal_checkpoint_loop --------------------
 
     #[tokio::test(start_paused = true)]
