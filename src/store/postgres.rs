@@ -5009,14 +5009,21 @@ impl PostgresStore {
             "UPDATE memories SET
                 title = COALESCE($2, title),
                 content = COALESCE($3, content),
-                -- #228 Commit B — at-rest envelope. $13 carries the sealed
-                -- ciphertext when encryption is on (paired with the $3
-                -- placeholder) and NULL when off (paired with the plaintext
-                -- patch/stored content), so content + envelope always move
-                -- together. Unconditional assignment (not COALESCE): under
-                -- encryption-off this rewrites a previously-encrypted row's
-                -- envelope to NULL, matching the content rewrite.
-                encrypted_envelope = $13,
+                -- #228 Commit B / #2292 — at-rest envelope, moved in LOCKSTEP
+                -- with `content` via the SAME `$3 IS NULL` predicate. A
+                -- content-bearing patch ($3 = sealed placeholder when on /
+                -- plaintext when off) sets $13 (sealed ciphertext when on, NULL
+                -- when off — clearing a stale envelope so the two never
+                -- desync). #2292 FIX: a metadata-only patch ($3 IS NULL) now
+                -- leaves the existing envelope UNTOUCHED. Pre-#2292 this was an
+                -- UNCONDITIONAL = $13: on a metadata-only update under an
+                -- enabled gate, upd_effective_content was the raw empty-string
+                -- placeholder, seal_content of an empty string returned None,
+                -- $13 bound NULL, and the sealed envelope was DESTROYED so
+                -- get() returned an empty string for a still-encrypted row
+                -- (silent data loss). The trait update funnel uses the
+                -- IDENTICAL guard so the two paths match.
+                encrypted_envelope = CASE WHEN $3 IS NULL THEN encrypted_envelope ELSE $13 END,
                 tier = CASE
                     WHEN $4::TEXT IS NULL THEN tier
                     WHEN tier_rank($4::TEXT) >= tier_rank(tier) THEN $4::TEXT
@@ -15630,10 +15637,53 @@ impl MemoryStore for PostgresStore {
         // version-gated inherent `update_with_expected_version` helper,
         // which applies the same owner gate + SET semantics and refuses
         // stale versions with the typed VersionConflict envelope.
+        // #2292 — at-rest content-seal on the DEFAULT (non-If-Match) update
+        // funnel — the 9th postgres content-write funnel (found by the #2292
+        // audit; NOT in the issue's list). Pre-#2292 this UPDATE bound
+        // `patch.content` PLAINTEXT via `content = COALESCE($3, content)` and
+        // had NO `encrypted_envelope` in the SET, so under an enabled gate a
+        // content patch wrote V2 PLAINTEXT while the row's stale envelope kept
+        // cipher(V1): `get()` (which decrypts on envelope-PRESENCE) returned
+        // the OLD V1 — the V2 update was SILENTLY LOST, V2 leaked in the clear,
+        // and a key rotation bricked the row. Seal the EFFECTIVE new content
+        // (patch's when supplied, else stored) under the row's owner agent_id —
+        // the SAME Rust computation as the If-Match twin
+        // `update_with_expected_version_once`. `upd_agent_id` resolves from
+        // `governed.metadata` (the patch-or-stored merge the SQL persists;
+        // agent_id is immutable, guarded above).
+        let upd_effective_content: &str = patch.content.as_deref().unwrap_or(cur_content.as_str());
+        let upd_agent_id = governed
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let upd_sealed = crate::encryption::seal_content(upd_effective_content, upd_agent_id)
+            .map_err(at_rest_seal_err)?;
+        // When sealing, write the placeholder into `content` (Some); when not
+        // sealing, bind None so the SQL COALESCE keeps the patch-or-stored
+        // plaintext. `or_else(patch.content)` preserves an off-gate content
+        // patch exactly (the If-Match twin's shape).
+        let upd_content_bind: Option<String> = upd_sealed
+            .as_ref()
+            .map(|(_, ph)| ph.clone())
+            .or_else(|| patch.content.clone());
+        let upd_encrypted_envelope: Option<Vec<u8>> =
+            upd_sealed.as_ref().map(|(env, _)| env.clone());
+
         let rows_affected = sqlx::query(
             "UPDATE memories SET
                 title = COALESCE($2, title),
                 content = COALESCE($3, content),
+                -- #2292 — the at-rest envelope moves in LOCKSTEP with `content`
+                -- via the SAME `$3 IS NULL` predicate: a content-bearing patch
+                -- ($3 = sealed placeholder when on / plaintext when off) sets
+                -- the envelope to $13 (sealed ciphertext when on, NULL when off
+                -- — clearing any stale envelope so content + envelope never
+                -- desync); a metadata-only patch ($3 IS NULL) leaves the
+                -- existing envelope UNTOUCHED so a sealed row's envelope is
+                -- never accidentally nulled (the None-content-preserves-envelope
+                -- rule; the If-Match twin uses the SAME guard).
+                encrypted_envelope = CASE WHEN $3 IS NULL THEN encrypted_envelope ELSE $13 END,
                 tier = CASE
                     WHEN $4::TEXT IS NULL THEN tier
                     WHEN tier_rank($4::TEXT) >= tier_rank(tier) THEN $4::TEXT
@@ -15684,7 +15734,9 @@ impl MemoryStore for PostgresStore {
         )
         .bind(id)
         .bind(patch.title)
-        .bind(patch.content)
+        // #2292 — sealed placeholder ("" under an enabled gate), plaintext when
+        // off, or None (COALESCE keeps stored) on a metadata-only patch.
+        .bind(upd_content_bind)
         .bind(patch.tier.as_ref().map(Tier::as_str))
         .bind(patch.namespace)
         .bind(
@@ -15712,6 +15764,10 @@ impl MemoryStore for PostgresStore {
         .bind(crate::validate::canonical_valid_time_opt(
             patch.valid_until.as_deref(),
         ))
+        // #2292 — sealed ciphertext envelope ($13); NULL when off. The SET's
+        // `$3 IS NULL` CASE leaves the existing envelope untouched on a
+        // metadata-only patch, so this NULL only lands when content IS patched.
+        .bind(upd_encrypted_envelope)
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("update", e))?

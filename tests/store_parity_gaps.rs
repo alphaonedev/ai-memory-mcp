@@ -1913,6 +1913,125 @@ mod postgres_side {
         assert_sealed_2292(&raw, env.as_ref(), &dec, plaintext);
     }
 
+    /// #2292 — the 9th funnel: the DEFAULT (non-If-Match) trait `update()`.
+    /// Pre-#2292 its live UPDATE bound `patch.content` PLAINTEXT via
+    /// `content = COALESCE($3, content)` with NO `encrypted_envelope`, so a
+    /// content patch under an enabled gate wrote V2 plaintext while the stale
+    /// envelope kept cipher(V1) — `get()` (decrypts on envelope-PRESENCE)
+    /// returned the OLD V1, silently LOSING the V2 update (worse than a leak).
+    /// This asserts (a) a content patch seals V2 + `get()` returns the NEW V2,
+    /// and (b) a follow-up METADATA-ONLY patch leaves the sealed envelope
+    /// intact (the `$3 IS NULL` CASE guard — the same guard the If-Match twin
+    /// now uses). Teardown-before-assert (#2287).
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_update_seals_content_2292() {
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-2292");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
+        // SAFETY: serial #[ignore] pg tests.
+        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+
+        // Seed the row with V1 (sealed under the gate).
+        let mut orig = sample_memory(&format!("pg-2292-update-{run}"));
+        orig.content = "original V1 body".to_string();
+        orig.metadata = serde_json::json!({ "agent_id": "pg-2292-agent" });
+        let id = MemoryStore::store(&pg, &admin_ctx, &orig)
+            .await
+            .expect("store V1");
+
+        // Content patch V2 via the DEFAULT (non-If-Match) trait update.
+        let v2 = "pg SENSITIVE 2292 update V2 body";
+        let patch = ai_memory::store::UpdatePatch {
+            content: Some(v2.to_string()),
+            ..Default::default()
+        };
+        MemoryStore::update(&pg, &admin_ctx, &id, patch)
+            .await
+            .expect("update V2 under encryption");
+        let (raw_c, env_c): (String, Option<Vec<u8>>) =
+            sqlx::query_as("SELECT content, encrypted_envelope FROM memories WHERE id = $1")
+                .bind(&id)
+                .fetch_one(pg.pool())
+                .await
+                .expect("raw after content patch");
+        let got_v2 = MemoryStore::get(&pg, &admin_ctx, &id)
+            .await
+            .map(|m| m.content)
+            .unwrap_or_default();
+
+        // Metadata-only patch (no content) — the sealed envelope must survive.
+        let meta_patch = ai_memory::store::UpdatePatch {
+            priority: Some(7),
+            ..Default::default()
+        };
+        MemoryStore::update(&pg, &admin_ctx, &id, meta_patch)
+            .await
+            .expect("metadata-only update");
+        let (raw_m, env_m): (String, Option<Vec<u8>>) =
+            sqlx::query_as("SELECT content, encrypted_envelope FROM memories WHERE id = $1")
+                .bind(&id)
+                .fetch_one(pg.pool())
+                .await
+                .expect("raw after metadata patch");
+        let got_after_meta = MemoryStore::get(&pg, &admin_ctx, &id)
+            .await
+            .map(|m| m.content)
+            .unwrap_or_default();
+
+        // Teardown BEFORE asserts (shared DB, #2287).
+        let _ = sqlx::query("DELETE FROM memories WHERE id = $1")
+            .bind(&id)
+            .execute(pg.pool())
+            .await;
+        let _ = sqlx::query("DELETE FROM archived_memories WHERE id = $1")
+            .bind(&id)
+            .execute(pg.pool())
+            .await;
+        // SAFETY: restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
+                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
+            }
+        }
+
+        // (a) content patch sealed + NO silent data loss.
+        assert_eq!(
+            raw_c, "",
+            "#2292: update content column must hold the placeholder, not plaintext V2"
+        );
+        assert!(
+            !raw_c.contains("SENSITIVE"),
+            "#2292: the V2 plaintext must never reach the content column"
+        );
+        assert!(
+            env_c.is_some(),
+            "#2292: update must populate encrypted_envelope for a content patch"
+        );
+        assert_eq!(
+            got_v2, v2,
+            "#2292: get must return the NEW V2 (no silent data loss back to stale V1)"
+        );
+        // (b) metadata-only patch preserved the sealed envelope.
+        assert_eq!(
+            raw_m, "",
+            "#2292: metadata-only patch keeps the content placeholder"
+        );
+        assert!(
+            env_m.is_some(),
+            "#2292: metadata-only patch must NOT null the sealed envelope (CASE guard)"
+        );
+        assert_eq!(
+            got_after_meta, v2,
+            "#2292: metadata-only patch must preserve V2 (envelope untouched)"
+        );
+    }
+
     /// #2289 — `PostgresStore::store_batch` MUST persist the caller-supplied
     /// `kind_provenance` (#1945), mirroring `store()` and the sqlite
     /// trait-default loop. Pre-#2289 the bulk INSERT never listed the
