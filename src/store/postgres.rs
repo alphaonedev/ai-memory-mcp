@@ -14261,6 +14261,18 @@ impl MemoryStore for PostgresStore {
                 -- v0.8.0 Pillar 2 (#1709) — lifecycle_state preserved on
                 -- re-store (sqlite parity).
                 lifecycle_state = memories.lifecycle_state,
+                -- v1.0.0 #2280 / #1834 — sqlite `db::insert` + plain `store()`
+                -- parity: valid_from is IMMUTABLE (stored value always wins),
+                -- valid_until is caller-updatable so a fresh upper bound may
+                -- CLOSE the existing claim (COALESCE keeps the stored bound
+                -- when the incoming write omits it). Batch upsert-merge was
+                -- the one write funnel missing the #1834 claim-bitemporal
+                -- arms that store()/store_with_embedding already carry.
+                -- (#2289 fold: kind_provenance IS now both inserted and
+                -- conflict-merged below — the store_batch INSERT lists the
+                -- column, so EXCLUDED.kind_provenance is defined.)
+                valid_from = memories.valid_from,
+                valid_until = COALESCE(EXCLUDED.valid_until, memories.valid_until),
                 -- v0.9.0 G8 (#1825) — cid/cid_genesis OMITTED from DO UPDATE
                 -- SET: surviving row keeps its genesis.
                 -- #1632 (pg twin) — upsert-merge bumps the Gap-1 counter.
@@ -26574,10 +26586,21 @@ mod tests {
         .await
         .expect("seed pending_actions row");
 
-        let rows =
+        let list_result =
             <PostgresStore as MemoryStore>::list_pending_actions(&store, Some("pending"), 100)
-                .await
-                .expect("list_pending_actions");
+                .await;
+        // #2287 — shared-DB isolation: the sal-postgres suite shares ONE
+        // `ai_memory_test` database with no per-test schema isolation, and
+        // the global `pending_actions` table backs the un-scoped
+        // `serve_postgres_extended::pending_list_returns_structured_empty_on_postgres`
+        // contract. Delete the seeded row BEFORE the assertions so it never
+        // leaks into that global list AND so cleanup runs even if an
+        // assertion below fails.
+        let _ = sqlx::query("DELETE FROM pending_actions WHERE id = $1")
+            .bind(&pid)
+            .execute(&store.pool)
+            .await;
+        let rows = list_result.expect("list_pending_actions");
         let row = rows
             .iter()
             .find(|r| r.id == pid)
@@ -27184,6 +27207,96 @@ mod tests {
         );
     }
 
+    /// #2280 — the `store_batch` upsert-merge arm was the ONE write
+    /// funnel missing the #1834 claim-bitemporal `valid_from` /
+    /// `valid_until` arms that `store()` / `store_with_embedding`
+    /// already carry. Pins: (1) valid_from set on the FIRST batch write
+    /// survives a conflicting SECOND batch write asserting a DIFFERENT
+    /// valid_from (genesis immutable); (2) a valid_until supplied on the
+    /// conflicting write CLOSES the claim; (3) a THIRD upsert with
+    /// valid_until = NULL does NOT reopen it (COALESCE keeps the stored
+    /// close bound). Models on `live_store_with_embedding_conflict_preserves_valid_time_2267`.
+    #[tokio::test]
+    async fn live_store_batch_conflict_preserves_valid_time_2280() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("valid-time-batch-2280-{unique}");
+        let title = format!("valid-batch-{unique}");
+
+        // First batch write: valid_from set, valid_until NULL (open claim).
+        let mut original = sample_memory(&title, &ns, "valid-batch-2280", "body");
+        original.valid_from = Some("2026-07-19T12:34:56.123456+05:00".to_string());
+        original.valid_until = None;
+        let first_ids = store
+            .store_batch(&ctx, std::slice::from_ref(&original))
+            .await
+            .expect("seed batch store");
+        assert_eq!(first_ids.len(), 1);
+        let id = first_ids[0].clone();
+
+        let seeded = store.get(&ctx, &id).await.expect("get seeded row");
+        assert_eq!(
+            seeded.valid_from.as_deref(),
+            Some("2026-07-19T07:34:56.123456Z"),
+            "first batch write must canonicalize + persist valid_from"
+        );
+        assert_eq!(
+            seeded.valid_until.as_deref(),
+            None,
+            "first batch write leaves the claim open"
+        );
+
+        // Second batch write on the SAME (title, namespace): a DIFFERENT
+        // valid_from (must NOT overwrite genesis) + a valid_until (must
+        // CLOSE the claim).
+        let mut conflict = sample_memory(&title, &ns, "valid-batch-2280", "updated");
+        conflict.valid_from = Some("2030-01-01T00:00:00Z".to_string());
+        conflict.valid_until = Some("2026-07-19T18:45:01.654321-04:00".to_string());
+        let second_ids = store
+            .store_batch(&ctx, std::slice::from_ref(&conflict))
+            .await
+            .expect("conflicting batch store");
+        assert_eq!(second_ids, vec![id.clone()], "upsert resolves to same id");
+
+        let got = store.get(&ctx, &id).await.expect("get conflicted row");
+        assert_eq!(
+            got.valid_from.as_deref(),
+            Some("2026-07-19T07:34:56.123456Z"),
+            "batch conflict must preserve the first-write genesis valid_from"
+        );
+        assert_eq!(
+            got.valid_until.as_deref(),
+            Some("2026-07-19T22:45:01.654321Z"),
+            "batch conflict may close the claim via a fresh valid_until"
+        );
+
+        // Third batch write with valid_until = NULL must NOT reopen the
+        // now-closed claim (COALESCE keeps the stored close bound).
+        let mut non_clearing = sample_memory(&title, &ns, "valid-batch-2280", "updated again");
+        non_clearing.valid_from = Some("2040-01-01T00:00:00Z".to_string());
+        non_clearing.valid_until = None;
+        store
+            .store_batch(&ctx, std::slice::from_ref(&non_clearing))
+            .await
+            .expect("NULL-bound batch conflict");
+        let retained = store.get(&ctx, &id).await.expect("get retained bound");
+        assert_eq!(
+            retained.valid_from.as_deref(),
+            Some("2026-07-19T07:34:56.123456Z"),
+            "a later batch conflict must still preserve genesis"
+        );
+        assert_eq!(
+            retained.valid_until.as_deref(),
+            Some("2026-07-19T22:45:01.654321Z"),
+            "incoming NULL must not reopen an existing close bound"
+        );
+    }
+
     /// #1607 — postgres twin of the sqlite #1596 touch-TTL extension
     /// FLOOR. Pre-fix `touch_after_recall` REPLACED `expires_at` with
     /// `NOW() + window`, so recalling a fresh mid-tier row pulled its
@@ -27629,15 +27742,22 @@ mod tests {
         .execute(&store.pool)
         .await
         .expect("insert pending");
-        let result = store
+        let first_result = store
             .decide_pending_action(&ctx, &pid, false, "ai:sal-test")
-            .await
-            .expect("decide_pending_action");
+            .await;
+        let second_result = store
+            .decide_pending_action(&ctx, &pid, false, "ai:sal-test")
+            .await;
+        // #2287 — remove the seeded row before asserting (runs even on an
+        // assertion failure) so it never leaks into the global
+        // `pending_actions` table the pending-list contract observes.
+        let _ = sqlx::query("DELETE FROM pending_actions WHERE id = $1")
+            .bind(&pid)
+            .execute(&store.pool)
+            .await;
+        let result = first_result.expect("decide_pending_action");
         assert!(result, "first decide must return true");
-        let second = store
-            .decide_pending_action(&ctx, &pid, false, "ai:sal-test")
-            .await
-            .expect("decide_pending_action second");
+        let second = second_result.expect("decide_pending_action second");
         assert!(!second, "already-decided rows must return false");
     }
 
@@ -27666,7 +27786,7 @@ mod tests {
         .await
         .expect("insert pending");
         let approver = format!("ai:sal-approver-{unique}");
-        store
+        let register_result = store
             .register_agent(
                 &ctx,
                 &crate::models::AgentRegistration {
@@ -27677,15 +27797,22 @@ mod tests {
                     last_seen_at: chrono::Utc::now().to_rfc3339(),
                 },
             )
-            .await
-            .expect("register approver");
+            .await;
         // approve_with_approver_type alias must produce the same outcome
         // as governance_approve_with_consensus for the Human approver
         // (no namespace policy ⇒ Human default).
-        let outcome = store
+        let outcome_result = store
             .approve_with_approver_type(&ctx, &pid, &approver)
-            .await
-            .expect("approve_with_approver_type");
+            .await;
+        // #2287 — remove the seeded row before asserting (runs even on an
+        // assertion / operation failure) so it never leaks into the global
+        // `pending_actions` table the pending-list contract observes.
+        let _ = sqlx::query("DELETE FROM pending_actions WHERE id = $1")
+            .bind(&pid)
+            .execute(&store.pool)
+            .await;
+        register_result.expect("register approver");
+        let outcome = outcome_result.expect("approve_with_approver_type");
         assert!(matches!(outcome, crate::store::ApproveOutcome::Approved));
     }
 
