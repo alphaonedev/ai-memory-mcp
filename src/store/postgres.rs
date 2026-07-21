@@ -26533,10 +26533,21 @@ mod tests {
         .await
         .expect("seed pending_actions row");
 
-        let rows =
+        let list_result =
             <PostgresStore as MemoryStore>::list_pending_actions(&store, Some("pending"), 100)
-                .await
-                .expect("list_pending_actions");
+                .await;
+        // #2287 — shared-DB isolation: the sal-postgres suite shares ONE
+        // `ai_memory_test` database with no per-test schema isolation, and
+        // the global `pending_actions` table backs the un-scoped
+        // `serve_postgres_extended::pending_list_returns_structured_empty_on_postgres`
+        // contract. Delete the seeded row BEFORE the assertions so it never
+        // leaks into that global list AND so cleanup runs even if an
+        // assertion below fails.
+        let _ = sqlx::query("DELETE FROM pending_actions WHERE id = $1")
+            .bind(&pid)
+            .execute(&store.pool)
+            .await;
+        let rows = list_result.expect("list_pending_actions");
         let row = rows
             .iter()
             .find(|r| r.id == pid)
@@ -27678,15 +27689,22 @@ mod tests {
         .execute(&store.pool)
         .await
         .expect("insert pending");
-        let result = store
+        let first_result = store
             .decide_pending_action(&ctx, &pid, false, "ai:sal-test")
-            .await
-            .expect("decide_pending_action");
+            .await;
+        let second_result = store
+            .decide_pending_action(&ctx, &pid, false, "ai:sal-test")
+            .await;
+        // #2287 — remove the seeded row before asserting (runs even on an
+        // assertion failure) so it never leaks into the global
+        // `pending_actions` table the pending-list contract observes.
+        let _ = sqlx::query("DELETE FROM pending_actions WHERE id = $1")
+            .bind(&pid)
+            .execute(&store.pool)
+            .await;
+        let result = first_result.expect("decide_pending_action");
         assert!(result, "first decide must return true");
-        let second = store
-            .decide_pending_action(&ctx, &pid, false, "ai:sal-test")
-            .await
-            .expect("decide_pending_action second");
+        let second = second_result.expect("decide_pending_action second");
         assert!(!second, "already-decided rows must return false");
     }
 
@@ -27715,7 +27733,7 @@ mod tests {
         .await
         .expect("insert pending");
         let approver = format!("ai:sal-approver-{unique}");
-        store
+        let register_result = store
             .register_agent(
                 &ctx,
                 &crate::models::AgentRegistration {
@@ -27726,15 +27744,22 @@ mod tests {
                     last_seen_at: chrono::Utc::now().to_rfc3339(),
                 },
             )
-            .await
-            .expect("register approver");
+            .await;
         // approve_with_approver_type alias must produce the same outcome
         // as governance_approve_with_consensus for the Human approver
         // (no namespace policy ⇒ Human default).
-        let outcome = store
+        let outcome_result = store
             .approve_with_approver_type(&ctx, &pid, &approver)
-            .await
-            .expect("approve_with_approver_type");
+            .await;
+        // #2287 — remove the seeded row before asserting (runs even on an
+        // assertion / operation failure) so it never leaks into the global
+        // `pending_actions` table the pending-list contract observes.
+        let _ = sqlx::query("DELETE FROM pending_actions WHERE id = $1")
+            .bind(&pid)
+            .execute(&store.pool)
+            .await;
+        register_result.expect("register approver");
+        let outcome = outcome_result.expect("approve_with_approver_type");
         assert!(matches!(outcome, crate::store::ApproveOutcome::Approved));
     }
 

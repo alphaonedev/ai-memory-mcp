@@ -377,6 +377,25 @@ async fn seed_pending_store(
     }
 }
 
+/// #2287 — shared-DB isolation teardown. The sal-postgres suite shares ONE
+/// `ai_memory_test` database with no per-test schema isolation, and the
+/// `pending_actions` table backs the GLOBAL `GET /api/v1/pending` list that
+/// `serve_postgres_extended::pending_list_returns_structured_empty_on_postgres`
+/// asserts is EMPTY. Every `seed_pending_store` caller must therefore reap its
+/// seeded pending row (+ the approve-policy `namespace_meta` row) so it does
+/// not leak into that global list under a broad impact set. Mirrors the
+/// `cleanup_governance_ns` convention in `src/store/postgres.rs`.
+async fn cleanup_pending_ns(pool: &sqlx::PgPool, ns: &str) {
+    let _ = sqlx::query("DELETE FROM pending_actions WHERE namespace LIKE $1")
+        .bind(format!("{ns}%"))
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM namespace_meta WHERE namespace LIKE $1")
+        .bind(format!("{ns}%"))
+        .execute(pool)
+        .await;
+}
+
 macro_rules! pg_test {
     ($name:ident, $url:ident, $body:block) => {
         #[tokio::test]
@@ -413,6 +432,9 @@ pg_test!(pg_list_pending_admin_sees_seeded_row, url, {
         &format!("/api/v1/pending?status=pending&namespace={ns}&limit=1000"),
     )
     .await;
+    // #2287 — reap the seeded pending row before asserting (survives an
+    // assertion failure) so it never leaks into the global pending list.
+    cleanup_pending_ns(store.pool(), &ns).await;
     assert_eq!(status, StatusCode::OK, "body={body}");
     assert_eq!(body["storage_backend"], "postgres");
     assert_eq!(body["owner_scope"], "admin");
@@ -446,6 +468,9 @@ pg_test!(pg_list_pending_non_admin_filtered_to_caller, url, {
         .body(Body::empty())
         .unwrap();
     let (status, body) = decode(&router, req).await;
+    // #2287 — reap the seeded pending row before asserting (survives an
+    // assertion failure) so it never leaks into the global pending list.
+    cleanup_pending_ns(store.pool(), &ns).await;
     assert_eq!(status, StatusCode::OK, "body={body}");
     assert_eq!(body["storage_backend"], "postgres");
     assert_eq!(body["owner_scope"], "caller");
@@ -785,6 +810,9 @@ pg_test!(pg_approval_decide_approve_postgres_arm, url, {
     let body = json!({"decision": "approve", "remember": "once"});
     let req = signed_approval_request(&pending_id, &body);
     let (status, resp) = decode(&router, req).await;
+    // #2287 — reap the seeded pending row (any status) before asserting so
+    // it never leaks into the global pending list.
+    cleanup_pending_ns(store.pool(), &ns).await;
     // The approve path runs governance_approve_with_consensus +
     // execute_pending_action against real postgres. A single human
     // approver may resolve to Approved (200 with executed=true) or
@@ -808,6 +836,9 @@ pg_test!(pg_approval_decide_deny_postgres_arm, url, {
     let body = json!({"decision": "deny", "remember": "once"});
     let req = signed_approval_request(&pending_id, &body);
     let (status, resp) = decode(&router, req).await;
+    // #2287 — reap the seeded pending row (now rejected) before asserting so
+    // it never leaks into the global pending list.
+    cleanup_pending_ns(store.pool(), &ns).await;
     assert_eq!(status, StatusCode::OK, "deny pg arm body={resp}");
     assert_eq!(resp["rejected"], true);
     assert_eq!(resp["id"], pending_id);
