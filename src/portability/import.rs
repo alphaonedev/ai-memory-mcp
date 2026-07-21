@@ -9,7 +9,7 @@
 //! **FAIL-CLOSED and ALL-OR-NOTHING**:
 //!
 //! - **One transaction.** Every class is applied inside ONE
-//!   [`rusqlite::Connection::unchecked_transaction`]. A fatal per-row error (a
+//!   `BEGIN IMMEDIATE` [`rusqlite::Transaction`]. A fatal per-row error (a
 //!   malformed DTO, a DB fault) short-circuits via `?`, the [`rusqlite::Transaction`]
 //!   drops WITHOUT commit, and SQLite rolls the whole import back — so a rejected
 //!   bundle applies **ZERO rows**. There is no partial apply.
@@ -273,24 +273,22 @@ pub fn import_full_envelope(
              for future verification; accepted risk of explicit operator trust (#2264)"
         );
     }
+    // ── ALL-OR-NOTHING: one transaction wraps the entire apply. ──
+    // Take the write reservation BEFORE the destination trust snapshot.
+    // BEGIN DEFERRED allowed another writer to commit after that snapshot,
+    // making verification use a stale/revoked key and the later write upgrade
+    // fail with un-retried SQLITE_BUSY_SNAPSHOT (#2250). IMMEDIATE either
+    // acquires the reservation before any trust read or returns retriable busy
+    // without applying any rows.
+    let tx = begin_atomic_import(conn)?;
     // ── Pre-ship 3x7 HIGH-1: snapshot the DESTINATION-enrolled author keys
-    // BEFORE the transaction stages any bundle row. Verifying against a
+    // AFTER reserving the writer but BEFORE staging any bundle row. Verifying against a
     // lookup made INSIDE the transaction would let a crafted bundle
     // self-enroll (stage an `_agents` registration row carrying an
     // attacker `agent_pubkey`, then have a later row in the SAME bundle
     // "verify" against it). The snapshot pins verification to the keys the
-    // destination trusted before this unauthenticated input arrived.
-    let enrolled_keys = snapshot_dest_enrolled_keys(conn, env, opts)?;
-
-    // ── ALL-OR-NOTHING: one transaction wraps the entire apply. ──
-    // `unchecked_transaction` issues BEGIN DEFERRED on `&Connection`; every
-    // helper below is either a raw `execute` or a transaction-free storage
-    // primitive (`storage::insert` / `storage::get` open no inner tx), so no
-    // nested-transaction hazard arises. On any `?` below the `Transaction`
-    // drops here without commit → SQLite ROLLBACK → zero rows applied.
-    let tx = conn
-        .unchecked_transaction()
-        .context("portability import: could not open the atomic import transaction")?;
+    // destination trusted at this transaction's serialization point.
+    let enrolled_keys = snapshot_dest_enrolled_keys(&tx, env, opts)?;
 
     let mut report = apply_all_classes(&tx, env, opts, &enrolled_keys)?;
 
@@ -362,6 +360,11 @@ pub fn import_full_envelope(
         .context("portability import: transaction commit failed")?;
     report.committed = true;
     Ok(report)
+}
+
+fn begin_atomic_import(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
+    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .context("portability import: could not open the atomic BEGIN IMMEDIATE transaction")
 }
 
 /// Stage every class into `conn` (a live transaction). Any `?` here aborts the
@@ -1115,22 +1118,53 @@ fn apply_import_attestation(
              (unauthenticated input must not seed the enrolled-key surface; pre-ship 3x7)"
         );
     }
-    let presented_sig: Option<Vec<u8>> = staged
-        .metadata
-        .get(field_names::WRITE_SIGNATURE)
-        .and_then(serde_json::Value::as_str)
-        .and_then(|s| {
+    let wire_signature = staged.metadata.get(field_names::WRITE_SIGNATURE);
+    let presented_sig: Option<Vec<u8>> = match wire_signature {
+        None => None,
+        Some(serde_json::Value::String(encoded)) => {
             use base64::Engine;
-            base64::engine::general_purpose::STANDARD
-                .decode(s.trim())
-                .ok()
-        });
+            match base64::engine::general_purpose::STANDARD.decode(encoded.trim()) {
+                Ok(signature) if signature.len() == crate::identity::verify::SIGNATURE_LEN => {
+                    Some(signature)
+                }
+                Ok(_) | Err(_) => {
+                    report.forged_signature_skipped += 1;
+                    report.warnings.push(format!(
+                        "memory {} skipped: presented write_signature is malformed",
+                        staged.id
+                    ));
+                    tracing::warn!(
+                        target: IMPORT_TRACE_TARGET,
+                        memory_id = %staged.id,
+                        "bundle memory skipped: presented write_signature is malformed \
+                         (invalid base64 or not exactly 64 bytes; never treated as absent)"
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+        Some(_) => {
+            report.forged_signature_skipped += 1;
+            report.warnings.push(format!(
+                "memory {} skipped: presented write_signature has a non-string shape",
+                staged.id
+            ));
+            tracing::warn!(
+                target: IMPORT_TRACE_TARGET,
+                memory_id = %staged.id,
+                "bundle memory skipped: presented write_signature has a non-string shape \
+                 (never treated as absent)"
+            );
+            return Ok(false);
+        }
+    };
     // (2) Byte-preserving fast path: nothing asserted, nothing presented.
     if !wire_has_attest_level && presented_sig.is_none() {
         return Ok(true);
     }
     let land_claimed = |staged: &mut crate::models::Memory, report: &mut ImportReport| {
         if let Some(obj) = staged.metadata.as_object_mut() {
+            obj.remove(field_names::WRITE_SIGNATURE);
             obj.insert(
                 field_names::ATTEST_LEVEL.to_string(),
                 serde_json::Value::String(
@@ -1175,6 +1209,11 @@ fn apply_import_attestation(
         false,
     ) {
         Ok(level) => {
+            if level != crate::identity::verify::AttestLevel::AgentAttested
+                && let Some(obj) = staged.metadata.as_object_mut()
+            {
+                obj.remove(field_names::WRITE_SIGNATURE);
+            }
             if wire_asserted_attested
                 && level != crate::identity::verify::AttestLevel::AgentAttested
             {
@@ -1279,6 +1318,17 @@ mod tests {
     use crate::signed_events::{
         SignedEvent, append_signed_event, list_signed_events, payload_hash,
     };
+    use std::sync::Mutex;
+
+    static IMPORT_TRACE_LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static IMPORT_TRACE_GUARD: Mutex<()> = Mutex::new(());
+
+    fn import_trace_callback(statement: &str) {
+        IMPORT_TRACE_LOG
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(statement.to_string());
+    }
 
     fn fresh_conn(tag: &str) -> Connection {
         let root = std::env::current_dir()
@@ -1294,6 +1344,85 @@ mod tests {
         drop(crate::db::open(&path).expect("init"));
         std::mem::forget(dir);
         crate::db::open(&path).expect("open")
+    }
+
+    #[test]
+    fn atomic_import_reserves_the_writer_up_front_2250() {
+        let conn = fresh_conn("begin-immediate-2250");
+        conn.execute_batch("CREATE TABLE import_lock_probe (value INTEGER NOT NULL)")
+            .unwrap();
+        let db_path = conn
+            .path()
+            .expect("file-backed test connection")
+            .to_string();
+        let competitor = Connection::open(db_path).unwrap();
+        competitor.busy_timeout(std::time::Duration::ZERO).unwrap();
+
+        let tx = begin_atomic_import(&conn).expect("BEGIN IMMEDIATE");
+        let err = competitor
+            .execute("INSERT INTO import_lock_probe (value) VALUES (1)", [])
+            .expect_err("a competing writer must not enter during import staging");
+        assert!(
+            matches!(
+                err,
+                rusqlite::Error::SqliteFailure(ref inner, _)
+                    if matches!(
+                        inner.code,
+                        rusqlite::ErrorCode::DatabaseBusy
+                            | rusqlite::ErrorCode::DatabaseLocked
+                    )
+            ),
+            "expected SQLite busy/locked from the reserved writer, got {err:?}"
+        );
+
+        drop(tx);
+        competitor
+            .execute("INSERT INTO import_lock_probe (value) VALUES (1)", [])
+            .expect("writer proceeds after import rollback");
+    }
+
+    #[test]
+    fn import_entrypoint_reserves_writer_before_enrolled_key_snapshot_2250() {
+        let _trace_guard = IMPORT_TRACE_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        IMPORT_TRACE_LOG
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+
+        let src = fresh_conn("entrypoint-order-src-2250-");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        env.memories.push(memory_fixture(
+            "mem-entrypoint-order-2250",
+            "transaction ordering",
+            "ai:source-2250",
+        ));
+        let mut dst = fresh_conn("entrypoint-order-dst-2250-");
+        dst.trace(Some(import_trace_callback));
+        let report = import_full_envelope(&dst, &env, &opts_trusted()).expect("import");
+        dst.trace(None);
+        assert_eq!(report.memories, 1);
+
+        let trace = IMPORT_TRACE_LOG
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let begin = trace
+            .iter()
+            .position(|statement| statement.trim_start().starts_with("BEGIN IMMEDIATE"))
+            .expect("entrypoint must open BEGIN IMMEDIATE");
+        let snapshot = trace
+            .iter()
+            .position(|statement| {
+                statement.contains("json_extract(metadata, '$.agent_pubkey')")
+                    && statement.contains("WHERE namespace")
+            })
+            .expect("entrypoint must query the destination-enrolled author key");
+        assert!(
+            begin < snapshot,
+            "writer reservation must precede trust snapshot; trace={trace:?}"
+        );
     }
 
     fn append_row(conn: &Connection, i: usize) {
@@ -1972,6 +2101,102 @@ mod tests {
                 .any(|w| w.contains("mem-forged-sig-3x7")),
             "a WARN names the skipped row, got: {:?}",
             report.warnings
+        );
+    }
+
+    #[test]
+    fn malformed_presented_write_signatures_are_skipped_2264() {
+        use crate::models::field_names;
+        use base64::Engine as _;
+
+        let malformed = [
+            ("invalid-base64", serde_json::json!("%%%not-base64%%%")),
+            ("non-string", serde_json::json!({"bytes": [1, 2, 3]})),
+            ("empty", serde_json::json!("")),
+            (
+                "one-byte",
+                serde_json::json!(base64::engine::general_purpose::STANDARD.encode([0_u8; 1])),
+            ),
+            (
+                "63-bytes",
+                serde_json::json!(base64::engine::general_purpose::STANDARD.encode([0_u8; 63])),
+            ),
+            (
+                "65-bytes",
+                serde_json::json!(base64::engine::general_purpose::STANDARD.encode([0_u8; 65])),
+            ),
+        ];
+        for (case, wire_value) in malformed {
+            let src = fresh_conn(&format!("attest-malformed-src-{case}-"));
+            let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+            let id = format!("mem-malformed-sig-{case}");
+            let mut mem = memory_fixture(&id, "malformed signature", "ai:author-3x7");
+            mem.metadata
+                .as_object_mut()
+                .unwrap()
+                .insert(field_names::WRITE_SIGNATURE.to_string(), wire_value);
+            env.memories.push(mem);
+
+            let dst = fresh_conn(&format!("attest-malformed-dst-{case}-"));
+            let report = import_full_envelope(&dst, &env, &opts_trusted()).expect("import");
+            assert_eq!(report.forged_signature_skipped, 1, "case={case}");
+            assert_eq!(report.memories, 0, "case={case}");
+            assert!(
+                crate::storage::get(&dst, &id).unwrap().is_none(),
+                "case={case}"
+            );
+            assert!(
+                report.warnings.iter().any(|warning| warning.contains(&id)),
+                "case={case}; warnings={:?}",
+                report.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn restamping_removes_signature_bound_to_original_agent_2264() {
+        use crate::models::field_names;
+        use base64::Engine as _;
+
+        let original_agent = "ai:original-signer-2264";
+        let kp = crate::identity::keypair::generate(original_agent).expect("keygen");
+        let mut mem = memory_fixture("mem-restamped-sig-2264", "signed row", original_agent);
+        let signature = crate::identity::attest::sign_memory_write(&kp, &mem, original_agent)
+            .expect("sign original attribution");
+        mem.metadata.as_object_mut().unwrap().insert(
+            field_names::WRITE_SIGNATURE.to_string(),
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(signature)),
+        );
+        let src = fresh_conn("attest-restamp-src-2264-");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        env.memories.push(mem);
+
+        let dst = fresh_conn("attest-restamp-dst-2264-");
+        crate::storage::register_agent(&dst, original_agent, "ai:generic", &[])
+            .expect("register original signer");
+        crate::storage::bind_agent_pubkey(&dst, original_agent, &kp.public_base64())
+            .expect("bind original key");
+        let report = import_full_envelope(&dst, &env, &opts_default()).expect("import");
+        assert_eq!(report.memories, 1);
+
+        let got = crate::storage::get(&dst, "mem-restamped-sig-2264")
+            .unwrap()
+            .expect("row landed claimed");
+        assert_eq!(
+            got.metadata
+                .get(crate::META_KEY_AGENT_ID)
+                .and_then(serde_json::Value::as_str),
+            Some("importer")
+        );
+        assert_eq!(
+            got.metadata
+                .get(field_names::ATTEST_LEVEL)
+                .and_then(serde_json::Value::as_str),
+            Some("claimed")
+        );
+        assert!(
+            got.metadata.get(field_names::WRITE_SIGNATURE).is_none(),
+            "a signature bound to the original attribution must not survive restamping"
         );
     }
 
