@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.0.0] — 2026-07-21
 
+### Fixed
+
+- **`tests/form_1_synthesis.rs` test-isolation flake on the synthesis prompt-size telemetry counter** ([#2285](https://github.com/alphaonedev/ai-memory-mcp/issues/2285), observed on [#2283](https://github.com/alphaonedev/ai-memory-mcp/pull/2283) CI run 29852909319). `run_synthesis_pass` (`src/mcp/tools/store/synthesis.rs`) calls `build_prompt_with_cap` — which records the process-global `SYNTHESIS_PROMPT_MAX_CHARS` running-max telemetry counter — unconditionally whenever a store engages synthesis, BEFORE any K9 recheck / delete-cap / failure-mode disposition. Only the two dedicated PERF tests that assert an exact count on that counter held the pre-existing `prompt_max_chars_lock()` guard; every other synthesis-engaging test in the file (14 of them) wrote the same global counter without holding it, so under cargo's default parallel test runner one of those writer tests could land a larger max between an asserting test's prompt build and its `assert_eq!`, producing an intermittent failure. Test-only fix: every test whose `run_store`/`run_store_with_embedder` call reaches `run_synthesis_pass` now takes the same shared `prompt_max_chars_lock()` guard for the duration of the test. No production code changed.
+
 ### CI
 
 - **Build-script vetting claims are now mechanically pinned** ([#2259](https://github.com/alphaonedev/ai-memory-mcp/issues/2259); pre-ship 3x7 Wave-B). The formal supply-chain record now covers the actual `reed-solomon-simd` 3.1.0 `build.rs` and its `readme-rustdocifier` 0.1.1 build dependency (including that helper's own build script and full source): both are documentation-only `README.md` → `OUT_DIR` transforms with no network/process/unsafe/native-probe behavior. `scripts/check-build-script-vetting.py`, run in CI, fails on checksum, custom-build-target, or exact build-dependency-closure drift so a future "no build scripts"-style claim cannot rest on an unchecked assumption.
