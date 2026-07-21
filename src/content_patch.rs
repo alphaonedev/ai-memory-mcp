@@ -176,6 +176,10 @@ impl ContentPatch<'_> {
 /// under-count a self-overlapping needle to 1 and let the unique-match replace
 /// silently pick the first. `needle` is assumed non-empty (the caller guards).
 fn count_overlapping(haystack: &str, needle: &str) -> usize {
+    debug_assert!(
+        !needle.is_empty(),
+        "count_overlapping requires non-empty needle (guarded by ReplaceFromEmpty)"
+    );
     let mut count = 0;
     let mut start = 0;
     while let Some(rel) = haystack[start..].find(needle) {
@@ -279,19 +283,38 @@ mod tests {
         // #2111 regression: "aa" occurs at OVERLAPPING positions 0 and 1 in
         // "aaa" — an ambiguous target. Non-overlapping `str::matches` counts it
         // as 1 and would silently first-match replace (yielding "Xa"); the
-        // "exactly once" contract requires rejecting it. (Deletion form too, to
-        // be sure the overlap check runs before the replace.)
+        // "exactly once" contract requires rejecting it.
         let p = ContentPatch {
             replace_from: Some("aa"),
             replace_to: Some("X"),
             ..Default::default()
         };
         assert_eq!(p.apply("aaa").unwrap_err(), PatchError::ReplaceMultiple(2));
+        // Deletion form (replace_to = "") is rejected identically — the overlap
+        // gate runs BEFORE the replace, so a `to=""` deletion cannot sneak a
+        // silent first-match mutation past the ambiguity check either.
+        let p_del = ContentPatch {
+            replace_from: Some("aa"),
+            replace_to: Some(""),
+            ..Default::default()
+        };
+        assert_eq!(
+            p_del.apply("aaa").unwrap_err(),
+            PatchError::ReplaceMultiple(2)
+        );
         assert_eq!(
             count_overlapping("aaaa", "aa"),
             3,
             "overlapping count of 'aa' in 'aaaa' is 3 (positions 0,1,2)"
         );
+        // Multibyte overlap: "éé" (each 'é' is 2 UTF-8 bytes) occurs at
+        // overlapping char positions 0 and 1 in "ééé" — count is 2, NOT 1. This
+        // pins the `char::len_utf8` advance: a "step by 1 byte" mutant would
+        // desync the UTF-8 boundary and mis-count.
+        assert_eq!(count_overlapping("ééé", "éé"), 2);
+        // A needle CAPABLE of self-overlap that only occurs once (no actual
+        // overlap in this haystack) counts as exactly 1 — accepted as unique.
+        assert_eq!(count_overlapping("baab", "aa"), 1);
     }
 
     #[test]
