@@ -412,6 +412,67 @@ fn v86_migration_normalizes_legacy_mixed_renderings() {
     assert_eq!(row2.valid_until, row.valid_until);
 }
 
+/// #2281 — the schema-v86 in-code arm must ALSO normalize mixed
+/// renderings on `archived_memories`, not just `memories`. The v85
+/// archive-parity migration carries `valid_from`/`valid_until` into the
+/// archive on the round-trip; a pre-v86 binary therefore left mixed
+/// renderings on archived rows exactly as it did on live rows, and the
+/// #1834 predicates compare those TEXT columns lexicographically. This
+/// pins the archive arm at `src/storage/migrations.rs` (the
+/// `has_archive_table` branch of the v86 normalization): plant a mixed
+/// rendering on an ARCHIVED row at schema 85, re-open, and assert the
+/// archived row's valid_from/valid_until heal to the canonical fixed-UTC
+/// form.
+#[test]
+fn v86_migration_normalizes_archived_memories_rows_2281() {
+    let _g = test_serial()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (tmp, conn) = fresh_db();
+    let id = storage::insert(&conn, &mem("archivedrow", Some(BOUND_Z), None)).expect("insert");
+    // Move the row into `archived_memories` (v85 archive-parity carries the
+    // #1834 valid-time columns across the round-trip).
+    assert!(
+        storage::archive_memory(&conn, &id, Some("valid-time-2281")).expect("archive"),
+        "the row must archive into archived_memories"
+    );
+
+    // Simulate a pre-fix on-disk state on the ARCHIVED row: raw mixed
+    // renderings + version 85.
+    conn.execute(
+        "UPDATE archived_memories SET valid_from = ?1, valid_until = ?2 WHERE id = ?3",
+        rusqlite::params!["2026-01-01T05:00:00+05:00", "2026-06-01T00:00:00Z", id],
+    )
+    .expect("plant legacy renderings on archived row");
+    conn.execute("DELETE FROM schema_version", [])
+        .expect("clear version");
+    conn.execute("INSERT INTO schema_version (version) VALUES (85)", [])
+        .expect("stamp v85");
+    drop(conn);
+
+    // Re-open: the migration ladder runs the v86 normalization arm, which
+    // must reach `archived_memories`.
+    let conn = ai_memory::db::open(tmp.path()).expect("re-open runs v86");
+    let (arch_from, arch_until): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT valid_from, valid_until FROM archived_memories WHERE id = ?1",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("archived row present");
+    assert_eq!(
+        arch_from.as_deref(),
+        Some("2026-01-01T00:00:00.000000Z"),
+        "v86 must normalize a +05:00-rendered archived valid_from to canonical UTC \
+         (instant-preserving: 05:00+05:00 == 00:00Z)"
+    );
+    assert_eq!(
+        arch_until.as_deref(),
+        Some(BOUND_CANON),
+        "v86 must normalize a Z-rendered archived valid_until to the canonical micros form"
+    );
+}
+
 /// The `valid_until` update patch canonicalizes the close instant at the
 /// funnel, so a `+05:00`-rendered close persists as fixed UTC and the
 /// closed window filters by instant.
