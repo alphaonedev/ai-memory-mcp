@@ -6,14 +6,14 @@
   },
   "metadata": {
     "description": "Persistent, tier-aware memory for AI agents — the ai-memory substrate as a Claude Code plugin.",
-    "version": "0.1.0"
+    "version": "1.0.0"
   },
   "plugins": [
     {
       "name": "ai-memory",
       "source": "./plugins/ai-memory",
       "description": "Persistent memory for Claude Code: the ai-memory MCP server (full memory-tool surface at --profile full), a SessionStart recall hook that boots each session memory-aware, and an opt-in PreToolUse governance gate.",
-      "version": "0.1.0",
+      "version": "1.0.0",
       "author": {
         "name": "AlphaOne LLC"
       },

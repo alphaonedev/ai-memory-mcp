@@ -1,6 +1,6 @@
 {
   "name": "@alphaone/ai-memory-anthropic-shim",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Record each Anthropic Messages turn to ai-memory (Direct-API SDK shim).",
   "license": "Apache-2.0",
   "author": "AlphaOne LLC",

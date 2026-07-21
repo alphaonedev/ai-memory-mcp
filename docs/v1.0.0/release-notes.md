@@ -67,7 +67,7 @@ The "defaults stop lying" lane (Gate 1′) is the centerpiece: six knobs
 that shipped OFF (or non-functional) through v0.10.0 now resolve to their
 secure posture by default, each riding the one-cycle deprecation-WARN
 discipline the v0.10.0 `warn-carrier` release delivered. The release also
-advances the schema **v78 → v85** (all additive), adds an M-of-N
+advances the schema **v78 → v86** (all additive), adds an M-of-N
 threshold key-recovery lane, human-key-signed m-of-n approvals, an
 open-time rollback-evidence check, an inference-plane egress gate, and a
 named `asi-hard` no-disable security posture.
@@ -86,7 +86,7 @@ CLI subcommands):
 | HTTP routes | **93 production `.route(...)` registrations** / 79 unique URL paths |
 | CLI subcommands | **89 default build** / **91 under `--features sal`** (the `capability init` sub-verb rides the existing `Capability` command, so the top-level count is unchanged) |
 | `MemoryKind` variants | **16** (adds v1.0.0 epistemic typing `Told` / `Instruction` / `Intervention`, [#1945](https://github.com/alphaonedev/ai-memory-mcp/issues/1945)) |
-| Schema | **v85** (`CURRENT_SCHEMA_VERSION`, both adapters) |
+| Schema | **v86** (`CURRENT_SCHEMA_VERSION`, both adapters) |
 
 ## Secure-default flips (breaking)
 
@@ -301,6 +301,25 @@ vector path could only be exercised on an operator's own machine.
   fails LOUD. The `asi-hard` config TEMPLATE (`docs/deploy/asi-hard.env`)
   sets `INFERENCE_EGRESS=loopback-only` explicitly; `asi-hard` never
   becomes a compiled default flip.
+- **Erasure-coded archive cold tier ([#2064](https://github.com/alphaonedev/ai-memory-mcp/issues/2064), G16).**
+  `AI_MEMORY_ERASURE_COLD_TIER` (env-table row #140, default `false` /
+  opt-in) activates a redundancy layer for `archived_memories`: a
+  paced sweep encodes each committed archived row into k data + m
+  parity Reed-Solomon shards (`reed-solomon-simd`, operator-authorized
+  per the #1830 vote), with per-shard + whole-payload SHA-256 gates.
+  Any k of the k+m shards reconstruct the archived row; loss beyond
+  the m budget FAILS LOUD, never silently returns wrong bytes. The
+  archived DB row stays the durable source of truth — the shard
+  bundles are DERIVED, regenerable redundancy, never the primary
+  record. Purge/restore correctness rests on a durable write-ahead
+  purge-intent journal written BEFORE each purge `DELETE`: a
+  JOURNALED rowless bundle is confirmed-destroyed and reaped, while an
+  UN-journaled rowless bundle (byte-indistinguishable from partial DB
+  loss) is QUARANTINED — preserved and hidden from `get`/restore,
+  NEVER destroyed, per the North Star "never cause unintentional data
+  loss." Shard placement is SINGLE-NODE at v1.0.0 (see "Honest
+  limits" below) — the no-primary multi-node placement is the tracked
+  G16 residual.
 - **Portability Spec v2 exporter + importer — SHIPPED ([#2006](https://github.com/alphaonedev/ai-memory-mcp/issues/2006)); `export` de-silenced ([#1944](https://github.com/alphaonedev/ai-memory-mcp/issues/1944)).**
   `ai-memory export --full` emits the full v2 envelope (`src/portability/emit.rs`):
   `spec_version="2"`, `db_schema_version`, and every §V2-2 signed array
@@ -350,7 +369,7 @@ firm" line for this epic). It ran as a five-step program:
    findings raised ([#2014](https://github.com/alphaonedev/ai-memory-mcp/issues/2014)–[#2017](https://github.com/alphaonedev/ai-memory-mcp/issues/2017))
    were all fixed in-release per the prime directive (no deferrals).
 5. **Final AI-NHI dogfood — PASS.** The dogfood on the GA binary confirmed
-   a **lossless v78 → v85 migration on a real corpus** (the additive
+   a **lossless v78 → v86 migration on a real corpus** (the additive
    crypto-core / lineage-custody / M-of-N-recovery ladder round-trips on
    live data), functional green, and a sound `verify-audit-trail` (the
    witness / cause-binding / role-separation / identity-lineage /
@@ -384,10 +403,10 @@ green before the (operator-gated) tag cut.
 > summarized here for completeness and to record that both review lanes
 > closed green with zero GA-blockers.
 
-## Schema ladder v78 → v85
+## Schema ladder v78 → v86
 
 All additive (CLAUDE.md §Database is the SSOT). Both adapters mirror via
-`src/store/postgres.rs::{migrate_v79 … migrate_v85}`; the v78→v85 ladder
+`src/store/postgres.rs::{migrate_v79 … migrate_v86}`; the v78→v86 ladder
 round-trips losslessly on a real corpus (Gate-3 dogfood).
 
 | Schema | Change |
@@ -399,6 +418,60 @@ round-trips losslessly on a real corpus (Gate-3 dogfood).
 | v83 | per-agent HTTP API-key principal binding — additive `agent_api_keys` table (`sha256(token) → agent_id`, both backends) backing the H1 IDOR + M1 admin-spoof fix ([#2044](https://github.com/alphaonedev/ai-memory-mcp/issues/2044) / #2032-A) |
 | v84 | per-row embedding-space provenance — additive `embedding_space` column on `memories` + `archived_memories` (both backends) so recall never scores a vector from a different embedding space after a same-dim model swap ([#2167](https://github.com/alphaonedev/ai-memory-mcp/issues/2167)) |
 | v85 | archive claim-validity parity — additive `valid_from` / `valid_until` on `archived_memories` (both backends), closing the archive→restore data-loss where the #1834 claim-validity interval was dropped on the round-trip ([#2035](https://github.com/alphaonedev/ai-memory-mcp/issues/2035)) |
+| v86 | claim-bitemporal valid-time canonicalization — **DATA-MUTATING** (unlike every other v79-v85 rung, which is a pure additive `ADD COLUMN`): every stored `valid_from`/`valid_until` TEXT rendering on `memories` + `archived_memories` is REWRITTEN to the ONE fixed-UTC form `YYYY-MM-DDTHH:MM:SS.ffffffZ` (`validate::canonicalize_valid_time`), so the #1834 predicates' lexicographic TEXT comparison is exactly instant comparison — RFC3339's many equal-instant renderings (`Z` vs `+00:00`, variable fractional digits, non-UTC offsets) previously ordered WRONGLY as bytes, silently violating the start-inclusive/end-exclusive contract. The rewrite is INSTANT-PRESERVING (only the byte rendering changes, never the represented moment), idempotent (safe to re-run), and fail-safe (an unparseable value is left byte-untouched rather than destroyed) on both backends ([#1834](https://github.com/alphaonedev/ai-memory-mcp/issues/1834) pre-ship 3x7) |
+
+## Honest limits
+
+v1.0.0's tamper-evidence, attestation, and durability controls are
+real but scoped — this section states the residual bounds honestly
+rather than overclaiming, per the North Star (degrade, never corrupt
+or overclaim).
+
+- **Tamper-evidence bounds (interior-rewrite residual).** The
+  `signed_events` cross-row hash chain plus the #1850 forensic
+  watermark and the #1873/#2202 head-hash anchor detect **tail
+  truncation** and a **same-length whole-suffix rewrite at or above
+  the anchored sequence** on both backends. They do NOT bind an
+  **interior / mid-suffix rewrite BELOW the anchored row** — the
+  head-hash anchor's `canonical_chain_bytes` deliberately excludes
+  `prev_hash`, so it commits only to the anchored row, not the whole
+  prefix — nor the up-to-`WATERMARK_INTERVAL`−1 (=63) un-anchored
+  rows above the last watermark. See `CLAUDE.md`'s `signed_events`
+  paragraph for the full residual-2 scoping; the off-host
+  `AI_MEMORY_LOG_SINK=syslog` tier (or a future rolling/accumulator
+  hash committing the whole prefix) is the residual-closing control
+  for a hostile host.
+- **Rollback check is ESTIMABLE, not ATTESTABLE.** The open-time
+  rollback-evidence check (`AI_MEMORY_REQUIRE_ROLLBACK_CHECK`, row
+  #124) compares the surviving `signed_events` head against a
+  witness-signed off-table high-water mark — tamper-EVIDENCE, not
+  tamper-PROOF. An attacker who images the DB file and the anchor
+  file TOGETHER (a whole-host snapshot-and-restore) evades detection;
+  whole-host resistance needs a TPM2 NV counter or a genuinely
+  off-host anchor, both out of scope for the OSS build at v1.0.0.
+- **Claimed-vs-attested identity and diversity.** `metadata.agent_id`
+  and the reflection-decorrelation probe's model-family signal are
+  CLAIMED (self-asserted by the caller) unless independently attested
+  via the `model_attestations` substrate or an enrolled Ed25519 key.
+  The decorrelation probe's `advisory` default (row #92) computes
+  dominance over CLAIMED producer signals and says so explicitly in
+  its WARN text; `enforce` stays RESERVED because a refusal on
+  CLAIMED-only distinctness would be security theater — the
+  write-time quorum gate (row #120) refuses ONLY on evidence-backed
+  ATTESTED monoculture, never on a claimed-only corpus.
+- **Loader-attestation coverage caps at ~40%.** The `model_attestations`
+  table (schema v78) is TOFU write-once and populated at the LLM-client
+  construction boundary (`loader_observed`) or by explicit operator
+  enrollment (`operator_signed`); only substrate-invoked generation is
+  attestable, so loader-observed coverage of a corpus's actual model
+  provenance hard-caps at roughly 40% (ROADMAP.md §24) — external or
+  pre-substrate content is never retroactively attested.
+- **Erasure cold tier is single-node at v1.0.0.** The #2064 archive
+  cold-tier redundancy layer places its Reed-Solomon shard bundles on
+  the SAME host as the primary database (see the erasure cold-tier
+  bullet under "Additive surfaces"); it protects against local
+  disk/file corruption and partial data loss on that host, NOT against
+  a whole-host loss. Multi-node shard placement is a tracked residual
+  (`DurabilityModel::ErasureCodedColdTier.is_multi_node() == false`,
+  G16 residual) deferred past v1.0.0.
 {% endraw %}
-</content>
-</invoke>

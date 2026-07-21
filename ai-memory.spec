@@ -1,5 +1,5 @@
 Name:           ai-memory
-Version:        0.6.0
+Version:        1.0.0
 Release:        1%{?dist}
 Summary:        AI-agnostic persistent memory system — MCP server, HTTP API, and CLI
 ExclusiveArch:  x86_64 aarch64
@@ -36,6 +36,17 @@ install -m 0755 ai-memory %{buildroot}%{_bindir}/ai-memory
 %{_bindir}/ai-memory
 
 %changelog
+* Tue Jul 21 2026 AlphaOne LLC <alphaonedev@users.noreply.github.com> - 1.0.0-1
+- v1.0.0 GA release: schema v86 (claim-bitemporal valid-time
+  canonicalization), erasure-coded archive cold tier (#2064),
+  v1.0.0 secure-default flips (federation write/signal signature
+  requirements, HTTP attested-identity, checkpoint/policy-currency
+  gates), macaroon capability tokens default-on, asi-hard security
+  posture, inference-plane egress gating, three-key governance
+  role separation, identity-lineage succession chain, M-of-N
+  threshold key recovery
+- See CHANGELOG.md for the full consolidated v1.0.0 entry
+
 * Sun Apr 19 2026 AlphaOne LLC <alphaonedev@users.noreply.github.com> - 0.6.0-1
 - Phase 1 complete: schema metadata, agent identity (NHI),
   agent registration, scope-based visibility, namespace standards,
