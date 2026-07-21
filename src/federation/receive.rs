@@ -44,6 +44,33 @@ fn log_catchup_sync_state_observe_failed(peer_id: &str, e: impl std::fmt::Displa
     tracing::warn!("catchup: sync_state_observe failed for {peer_id}: {e}");
 }
 
+/// #2290 — sign an outbound `/sync/since` catch-up GET so an ENROLLED peer
+/// accepts the pull under the default `AI_MEMORY_FED_REQUIRE_SIG=1` posture.
+///
+/// The inbound `/sync/since` receiver (`verify_get_signature_or_reject`)
+/// refuses an enrolled peer's request that omits `X-Memory-Sig` with
+/// `401 x_memory_sig_missing`, but pre-#2290 NO outbound catch-up client
+/// signed the GET — so the MOST-secure (fully enrolled, default-strict)
+/// mesh got the WORST catch-up (structurally 401'd every tick). This mirrors
+/// the `/sync/push` client signing EXACTLY (`X-Memory-Sig` + `X-Memory-Nonce`
+/// over the shared canonical GET bytes). When no daemon signing key is on
+/// disk the request stays unsigned (byte-identical to the pre-#2290 wire),
+/// preserving the permissive / unenrolled `AI_MEMORY_FED_REQUIRE_SIG=0`
+/// posture. `url` is parsed exactly as `reqwest` will send it, so the signed
+/// path+query match the receiver's `OriginalUri` byte-for-byte.
+fn sign_catchup_get(
+    req: reqwest::RequestBuilder,
+    signing_key: Option<&ed25519_dalek::SigningKey>,
+    url: &str,
+) -> reqwest::RequestBuilder {
+    match crate::federation::signing::sign_get_url(signing_key, url) {
+        Some((sig, nonce)) => req
+            .header(crate::federation::signing::SIGNATURE_HEADER, sig)
+            .header(crate::federation::signing::NONCE_HEADER, nonce),
+        None => req,
+    }
+}
+
 /// #1928 (CWE-770) — hard ceiling on a federation catchup/sync response body.
 /// reqwest's `.json()` buffers the ENTIRE body into RAM before parsing with no
 /// length bound, so a hostile-but-enrolled peer answering `/sync/since` with a
@@ -257,6 +284,9 @@ pub(super) async fn catchup_once_with_store(
         if let Some(ref key) = config.api_key {
             req = req.header(crate::HEADER_API_KEY, key);
         }
+        // #2290 — sign the catch-up GET so enrolled peers accept it under
+        // the default AI_MEMORY_FED_REQUIRE_SIG=1 posture (see fn docs).
+        req = sign_catchup_get(req, config.signing_key.as_deref(), &url);
         let resp = match req.send().await {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
@@ -435,6 +465,9 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
         if let Some(ref key) = config.api_key {
             req = req.header(crate::HEADER_API_KEY, key);
         }
+        // #2290 — sign the catch-up GET so enrolled peers accept it under
+        // the default AI_MEMORY_FED_REQUIRE_SIG=1 posture (see fn docs).
+        req = sign_catchup_get(req, config.signing_key.as_deref(), &url);
         let resp = match req.send().await {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
@@ -551,6 +584,9 @@ pub async fn catchup_once_for_tests(config: &FederationConfig) {
         if let Some(ref key) = config.api_key {
             req = req.header(crate::HEADER_API_KEY, key);
         }
+        // #2290 — sign the catch-up GET so enrolled peers accept it under
+        // the default AI_MEMORY_FED_REQUIRE_SIG=1 posture (see fn docs).
+        req = sign_catchup_get(req, config.signing_key.as_deref(), &url);
         let resp = match req.send().await {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
