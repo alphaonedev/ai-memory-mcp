@@ -9159,28 +9159,41 @@ pub fn kg_timeline(
         .unwrap_or(KG_TIMELINE_DEFAULT_LIMIT)
         .clamp(1, KG_TIMELINE_MAX_LIMIT);
 
-    // Compose the predicate dynamically for `since` / `until`. Bind
-    // values are appended in the same order so the placeholders line up.
-    let mut sql = String::from(
+    // Compose the predicate dynamically for `since` / `until`. #2266:
+    // compare parsed instants rather than signed wire bytes. Link validity is
+    // inside the H2 signature, so normalizing the stored text would invalidate
+    // existing peer signatures; the registered chrono-backed projection
+    // accepts equivalent RFC3339 offset renderings without mutating their
+    // authenticated bytes. Unparseable values yield NULL and fail closed.
+    let valid_time_fn = connection::SQL_FN_RFC3339_EPOCH_MICROS;
+    let mut sql = format!(
         "SELECT ml.target_id, ml.relation, ml.valid_from, ml.valid_until,
                 ml.observed_by, m.title, m.namespace, ml.created_at
          FROM memory_links ml
          JOIN memories m ON m.id = ml.target_id
          WHERE ml.source_id = ?1
-           AND ml.valid_from IS NOT NULL",
+           AND {valid_time_fn}(ml.valid_from) IS NOT NULL",
     );
     let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(source_id.to_string())];
     if let Some(s) = since {
-        sql.push_str(" AND ml.valid_from >= ?");
+        sql.push_str(&format!(
+            " AND {valid_time_fn}(ml.valid_from) >= {valid_time_fn}(?"
+        ));
         sql.push_str(&(binds.len() + 1).to_string());
+        sql.push(')');
         binds.push(Box::new(s.to_string()));
     }
     if let Some(u) = until {
-        sql.push_str(" AND ml.valid_from <= ?");
+        sql.push_str(&format!(
+            " AND {valid_time_fn}(ml.valid_from) <= {valid_time_fn}(?"
+        ));
         sql.push_str(&(binds.len() + 1).to_string());
+        sql.push(')');
         binds.push(Box::new(u.to_string()));
     }
-    sql.push_str(" ORDER BY ml.valid_from ASC, ml.created_at ASC LIMIT ?");
+    sql.push_str(&format!(
+        " ORDER BY {valid_time_fn}(ml.valid_from) ASC, ml.created_at ASC LIMIT ?"
+    ));
     sql.push_str(&(binds.len() + 1).to_string());
     binds.push(Box::new(i64::try_from(cap).unwrap_or(i64::MAX)));
 
@@ -9499,13 +9512,24 @@ pub fn kg_query(
     // resolution order so positional placeholders line up.
     let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     let mut hop_filter = String::new();
+    let valid_time_fn = connection::SQL_FN_RFC3339_EPOCH_MICROS;
+    // #2266 — parse at comparison time so equivalent RFC3339 renderings map
+    // to the same instant while the H2-signed link bytes remain untouched.
     if let Some(t) = valid_at {
-        hop_filter.push_str(" AND ml.valid_from IS NOT NULL AND ml.valid_from <= ?");
+        hop_filter.push_str(&format!(
+            " AND {valid_time_fn}(ml.valid_from) IS NOT NULL \
+             AND {valid_time_fn}(ml.valid_from) <= {valid_time_fn}(?"
+        ));
         binds.push(Box::new(t.to_string()));
         hop_filter.push_str(&binds.len().to_string());
-        hop_filter.push_str(" AND (ml.valid_until IS NULL OR ml.valid_until > ?");
+        hop_filter.push(')');
+        hop_filter.push_str(&format!(
+            " AND (ml.valid_until IS NULL OR \
+             {valid_time_fn}(ml.valid_until) > {valid_time_fn}(?"
+        ));
         binds.push(Box::new(t.to_string()));
         hop_filter.push_str(&binds.len().to_string());
+        hop_filter.push(')');
         hop_filter.push(')');
     } else if !include_invalidated {
         // "Current view" default — exclude edges that have been
@@ -9514,9 +9538,10 @@ pub fn kg_query(
         // invalidated edges in default kg_query results.
         // Caller can pass include_invalidated=true to opt in to the
         // full-history view.
-        hop_filter.push_str(
-            " AND (ml.valid_until IS NULL OR ml.valid_until > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-        );
+        let now = chrono::Utc::now().timestamp_micros();
+        hop_filter.push_str(&format!(
+            " AND (ml.valid_until IS NULL OR {valid_time_fn}(ml.valid_until) > {now})"
+        ));
     }
     if let Some(agents) = allowed_agents {
         // Already short-circuited the empty case above.
@@ -9584,7 +9609,8 @@ pub fn kg_query(
          FROM traversal t \
          JOIN memories m ON m.id = t.target_id \
          WHERE 1=1 {lifecycle_vis} \
-         ORDER BY t.depth ASC, COALESCE(t.valid_from, t.link_created_at) ASC, \
+         ORDER BY t.depth ASC,
+                  COALESCE({valid_time_fn}(t.valid_from), {valid_time_fn}(t.link_created_at)) ASC, \
                   t.link_created_at ASC \
          LIMIT ?{limit_ph}",
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list on the
@@ -9931,9 +9957,11 @@ pub fn find_paths(
     // graph. NHI-P3-T7 regression: prior versions enumerated paths
     // through invalidated edges by default.
     let invalidated_filter = if include_invalidated {
-        ""
+        String::new()
     } else {
-        " WHERE (valid_until IS NULL OR valid_until > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))"
+        let valid_time_fn = connection::SQL_FN_RFC3339_EPOCH_MICROS;
+        let now = chrono::Utc::now().timestamp_micros();
+        format!(" WHERE (valid_until IS NULL OR {valid_time_fn}(valid_until) > {now})")
     };
 
     // The CTE walks symmetric edges: for each row in `memory_links` we
@@ -24013,6 +24041,116 @@ mod tests {
         assert_eq!(full.len(), 2);
     }
 
+    #[test]
+    fn kg_current_views_parse_offset_valid_until_2266() {
+        let conn = test_db();
+        let src = make_memory("offset-current-src", "ns", Tier::Long, 5);
+        let target = make_memory("offset-current-target", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &target).unwrap();
+        // This instant is one hour in the future, but its -12:00 wall-clock
+        // rendering sorts before the current UTC rendering byte-wise.
+        let west = chrono::FixedOffset::west_opt(12 * 60 * 60).unwrap();
+        let future_offset = (chrono::Utc::now() + chrono::Duration::hours(1))
+            .with_timezone(&west)
+            .to_rfc3339();
+        insert_link_full(
+            &conn,
+            &src.id,
+            &target.id,
+            "related_to",
+            Some("2026-01-01T00:00:00Z"),
+            Some(&future_offset),
+            None,
+        );
+
+        let current = kg_query(&conn, &src.id, 1, None, None, None, false).unwrap();
+        assert_eq!(current.len(), 1, "future edge remains current");
+        let paths = find_paths(&conn, &src.id, &target.id, Some(1), None, false).unwrap();
+        assert_eq!(paths, vec![vec![src.id, target.id]]);
+    }
+
+    #[test]
+    fn kg_valid_time_malformed_values_fail_closed_2266() {
+        let conn = test_db();
+        let src = make_memory("malformed-src", "ns", Tier::Long, 5);
+        let bad_start = make_memory("malformed-start", "ns", Tier::Long, 5);
+        let bad_end = make_memory("malformed-end", "ns", Tier::Long, 5);
+        let valid = make_memory("malformed-control", "ns", Tier::Long, 5);
+        for memory in [&src, &bad_start, &bad_end, &valid] {
+            insert(&conn, memory).unwrap();
+        }
+        insert_link_full(
+            &conn,
+            &src.id,
+            &bad_start.id,
+            "related_to",
+            Some("not-rfc3339"),
+            None,
+            None,
+        );
+        insert_link_full(
+            &conn,
+            &src.id,
+            &bad_end.id,
+            "related_to",
+            Some("2026-01-01T00:00:00Z"),
+            Some("not-rfc3339"),
+            None,
+        );
+        insert_link_full(
+            &conn,
+            &src.id,
+            &valid.id,
+            "related_to",
+            Some("2026-01-01T00:00:00Z"),
+            None,
+            None,
+        );
+
+        let timeline = kg_timeline(&conn, &src.id, None, None, None).unwrap();
+        assert_eq!(timeline.len(), 2, "malformed valid_from must be hidden");
+        assert!(timeline.iter().all(|row| row.target_id != bad_start.id));
+
+        let at = kg_query(
+            &conn,
+            &src.id,
+            1,
+            Some("2026-01-02T00:00:00Z"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(at.len(), 1, "malformed stored bounds must fail closed");
+        assert_eq!(at[0].target_id, valid.id);
+
+        let current = kg_query(&conn, &src.id, 1, None, None, None, false).unwrap();
+        assert!(current.iter().all(|row| row.target_id != bad_end.id));
+        assert!(
+            find_paths(&conn, &src.id, &bad_end.id, Some(1), None, false)
+                .unwrap()
+                .is_empty(),
+            "malformed valid_until must not remain current"
+        );
+
+        assert!(
+            kg_timeline(&conn, &src.id, Some("invalid"), None, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            kg_timeline(&conn, &src.id, None, Some("invalid"), None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            kg_query(&conn, &src.id, 1, Some("invalid"), None, None, false)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     // -- Pillar 2 / Stream C — kg_query (depth=1) ---------------------------
 
     /// Insert a link with explicit `temporal/observed_by` columns so the
@@ -24156,6 +24294,194 @@ mod tests {
         .unwrap();
         assert_eq!(n_apr.len(), 1);
         assert_eq!(n_apr[0].target_id, t2.id);
+    }
+
+    #[test]
+    fn kg_valid_time_compares_instants_without_rewriting_signed_bytes_2266() {
+        use crate::identity::{keypair, sign as link_sign, verify as link_verify};
+
+        let conn = test_db();
+        let src = make_memory("offset-src", "ns", Tier::Long, 5);
+        let target = make_memory("offset-target", "ns", Tier::Long, 5);
+        insert(&conn, &src).unwrap();
+        insert(&conn, &target).unwrap();
+        // Stored rendering denotes 00:00Z -> 01:00Z. Byte-wise comparison
+        // against the Z-rendered query would incorrectly treat the start as
+        // later merely because its wall-clock hour is `01`.
+        let signed_start = "2026-01-01T01:00:00+01:00";
+        let signed_end = "2026-01-01T02:00:00+01:00";
+        let kp = keypair::generate("ai:peer").expect("generate signing key");
+        let signable = link_sign::SignableLink {
+            src_id: &src.id,
+            dst_id: &target.id,
+            relation: "related_to",
+            observed_by: Some(kp.agent_id.as_str()),
+            valid_from: Some(signed_start),
+            valid_until: Some(signed_end),
+        };
+        let signature = link_sign::sign(&kp, &signable).expect("sign noncanonical-offset link");
+        let created_at = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO memory_links \
+             (source_id, target_id, relation, created_at, valid_from, valid_until, \
+              observed_by, signature, attest_level) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'self_signed')",
+            params![
+                &src.id,
+                &target.id,
+                "related_to",
+                &created_at,
+                signed_start,
+                signed_end,
+                &kp.agent_id,
+                &signature,
+            ],
+        )
+        .expect("insert signed noncanonical-offset link");
+
+        let at_half_hour = kg_query(
+            &conn,
+            &src.id,
+            1,
+            Some("2026-01-01T00:30:00Z"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(at_half_hour.len(), 1);
+        assert_eq!(at_half_hour[0].target_id, target.id);
+
+        let immediately_before_end = kg_query(
+            &conn,
+            &src.id,
+            1,
+            Some("2026-01-01T00:59:59.999999Z"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(immediately_before_end.len(), 1);
+        let at_end = kg_query(
+            &conn,
+            &src.id,
+            1,
+            Some("2026-01-01T01:00:00Z"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(at_end.is_empty(), "valid_until must remain end-exclusive");
+
+        let timeline = kg_timeline(
+            &conn,
+            &src.id,
+            Some("2026-01-01T00:00:00Z"),
+            Some("2026-01-01T00:00:00Z"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].valid_from, signed_start);
+        assert_eq!(timeline[0].valid_until.as_deref(), Some(signed_end));
+
+        let (stored_start, stored_end, stored_signature): (String, String, Vec<u8>) = conn
+            .query_row(
+                "SELECT valid_from, valid_until, signature FROM memory_links \
+                 WHERE source_id = ?1 AND target_id = ?2 AND relation = 'related_to'",
+                params![&src.id, &target.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read signed link after temporal queries");
+        assert_eq!(stored_start, signed_start);
+        assert_eq!(stored_end, signed_end);
+        assert_eq!(stored_signature, signature);
+        let persisted = link_sign::SignableLink {
+            src_id: &src.id,
+            dst_id: &target.id,
+            relation: "related_to",
+            observed_by: Some(kp.agent_id.as_str()),
+            valid_from: Some(stored_start.as_str()),
+            valid_until: Some(stored_end.as_str()),
+        };
+        link_verify::verify(&kp.public, &persisted, &stored_signature)
+            .expect("temporal reads must preserve the authoritative H2 signature");
+
+        // The parser projection is integer microseconds, not julianday's
+        // floating-point approximation: a one-microsecond boundary remains
+        // observable under the v86 precision contract.
+        let micro_target = make_memory("micro-target", "ns", Tier::Long, 5);
+        insert(&conn, &micro_target).unwrap();
+        insert_link_full(
+            &conn,
+            &src.id,
+            &micro_target.id,
+            "related_to",
+            Some("2026-01-01T00:00:00.000002Z"),
+            None,
+            None,
+        );
+        let before_micro = kg_query(
+            &conn,
+            &src.id,
+            1,
+            Some("2026-01-01T00:00:00.000001Z"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(before_micro.len(), 1);
+        assert_eq!(before_micro[0].target_id, target.id);
+        let at_micro = kg_query(
+            &conn,
+            &src.id,
+            1,
+            Some("2026-01-01T00:00:00.000002Z"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(at_micro.len(), 2);
+    }
+
+    #[test]
+    fn kg_timeline_orders_by_parsed_instant_2266() {
+        let conn = test_db();
+        let src = make_memory("timeline-order-src", "ns", Tier::Long, 5);
+        let earlier = make_memory("timeline-order-earlier", "ns", Tier::Long, 5);
+        let later = make_memory("timeline-order-later", "ns", Tier::Long, 5);
+        for memory in [&src, &earlier, &later] {
+            insert(&conn, memory).unwrap();
+        }
+        // Lexically `00:00Z` sorts before `01:30+02`, but the latter denotes
+        // 23:30Z on the previous day and must appear first chronologically.
+        insert_link_full(
+            &conn,
+            &src.id,
+            &later.id,
+            "related_to",
+            Some("2026-01-01T00:00:00Z"),
+            None,
+            None,
+        );
+        insert_link_full(
+            &conn,
+            &src.id,
+            &earlier.id,
+            "related_to",
+            Some("2026-01-01T01:30:00+02:00"),
+            None,
+            None,
+        );
+
+        let timeline = kg_timeline(&conn, &src.id, None, None, None).unwrap();
+        assert_eq!(timeline.len(), 2);
+        assert_eq!(timeline[0].target_id, earlier.id);
+        assert_eq!(timeline[1].target_id, later.id);
     }
 
     #[test]

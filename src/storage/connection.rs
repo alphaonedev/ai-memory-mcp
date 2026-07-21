@@ -11,6 +11,29 @@ use std::path::Path;
 
 use super::migrations::{SCHEMA, migrate};
 
+/// #2266 — exact, parse-tolerant RFC3339 instant projection for SQLite KG
+/// predicates. Returning NULL for malformed text makes comparisons fail
+/// closed without modifying the H2-signed source bytes.
+pub const SQL_FN_RFC3339_EPOCH_MICROS: &str = "rfc3339_epoch_micros";
+
+fn register_valid_time_functions(conn: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+
+    conn.create_scalar_function(
+        SQL_FN_RFC3339_EPOCH_MICROS,
+        1,
+        FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS,
+        |ctx| {
+            let raw = ctx.get::<Option<String>>(0)?;
+            Ok(raw.and_then(|value| {
+                chrono::DateTime::parse_from_rfc3339(&value)
+                    .ok()
+                    .map(|instant| instant.timestamp_micros())
+            }))
+        },
+    )
+}
+
 /// v0.7.0 fix campaign R1-M2 (#690) — defense-in-depth CHECK
 /// constraints applied as `CREATE TRIGGER IF NOT EXISTS` statements
 /// after the schema-version migration ladder runs. Sourced from
@@ -121,6 +144,7 @@ pub fn db_synchronous() -> &'static str {
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).context("failed to open database")?;
     apply_sqlcipher_key(&conn)?;
+    register_valid_time_functions(&conn).context("register valid-time SQL functions")?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     // v1.0.0 #1961 (R23/R7) — resolved `PRAGMA synchronous`. Default
@@ -181,6 +205,7 @@ pub fn open_read_only(path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, flags)
         .context("failed to open read-only database connection")?;
     apply_sqlcipher_key(&conn)?;
+    register_valid_time_functions(&conn).context("register valid-time SQL functions")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     // #1579 B7 — mirror the writer's memory-mapped I/O budget so the
     // read-pool shares the OS page cache reservation.
@@ -327,6 +352,41 @@ fn apply_sqlcipher_key(_conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn valid_time_projection_accepts_sql_null_2266() {
+        let conn = Connection::open_in_memory().expect("open in-memory database");
+        register_valid_time_functions(&conn).expect("register valid-time functions");
+
+        let projected: Option<i64> = conn
+            .query_row("SELECT rfc3339_epoch_micros(NULL)", [], |row| row.get(0))
+            .expect("SQL NULL must project to SQL NULL");
+
+        assert_eq!(projected, None);
+    }
+
+    #[test]
+    fn read_only_connection_registers_valid_time_projection_2266() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("valid-time.sqlite3");
+        let writer = open(&path).expect("create and migrate database");
+        drop(writer);
+
+        let reader = open_read_only(&path).expect("open read-only database");
+        let (offset, null_value, malformed): (Option<i64>, Option<i64>, Option<i64>) = reader
+            .query_row(
+                "SELECT rfc3339_epoch_micros('2026-01-01T01:00:00+01:00'), \
+                        rfc3339_epoch_micros(NULL), \
+                        rfc3339_epoch_micros('not-rfc3339')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read-only connection must expose valid-time projection");
+
+        assert_eq!(offset, Some(1_767_225_600_000_000));
+        assert_eq!(null_value, None);
+        assert_eq!(malformed, None);
+    }
 
     #[test]
     fn open_round_trip_creates_db_and_runs_migrations() {
