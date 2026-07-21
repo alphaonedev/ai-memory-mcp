@@ -8289,7 +8289,66 @@ mod tests {
     #[test]
     fn server_failures_map_to_non_restarting_fatal_status() {
         let error = classify_server_failure(anyhow::anyhow!("listener failed"));
-        assert!(error.downcast_ref::<FatalShutdownError>().is_some());
+        let fatal = error
+            .downcast_ref::<FatalShutdownError>()
+            .expect("server failure must become a fatal shutdown error");
+        assert_eq!(fatal.reason, "daemon server setup failed");
+        assert_eq!(fatal.detail.as_deref(), Some("listener failed"));
+        assert_eq!(
+            fatal.to_string(),
+            "fatal daemon shutdown: daemon server setup failed: listener failed"
+        );
+    }
+
+    #[test]
+    fn fatal_shutdown_without_detail_preserves_exit_reason() {
+        let error = fatal_shutdown("background writer task failed");
+        let fatal = error
+            .downcast_ref::<FatalShutdownError>()
+            .expect("shutdown failure must retain its typed marker");
+        assert_eq!(fatal.reason, "background writer task failed");
+        assert!(fatal.detail.is_none());
+        assert_eq!(
+            fatal.to_string(),
+            "fatal daemon shutdown: background writer task failed"
+        );
+    }
+
+    #[test]
+    fn blocking_task_guard_decrements_tracker_on_every_exit_path() {
+        let tracker = Arc::new(AtomicUsize::new(2));
+        {
+            let _first = BlockingTaskGuard(Arc::clone(&tracker));
+            assert_eq!(tracker.load(Ordering::SeqCst), 2);
+        }
+        assert_eq!(tracker.load(Ordering::SeqCst), 1);
+        drop(BlockingTaskGuard(Arc::clone(&tracker)));
+        assert_eq!(tracker.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn serve_bootstrap_failure_returns_typed_fatal_shutdown() {
+        let env = TestEnv::fresh();
+        std::fs::write(&env.db_path, b"not a directory").expect("create parent file");
+        let unopenable = env.db_path.join("daemon.db");
+        let error = serve(
+            unopenable,
+            args_with_db(&env.db_path),
+            &AppConfig::default(),
+        )
+        .await
+        .expect_err("an unopenable database path must stop daemon bootstrap");
+        let fatal = error
+            .downcast_ref::<FatalShutdownError>()
+            .expect("bootstrap failure must retain the service-manager marker");
+        assert_eq!(fatal.reason, "daemon bootstrap failed");
+        assert!(
+            fatal
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("daemon.db")),
+            "fatal detail must preserve the failing database path: {fatal}"
+        );
     }
 
     // ----- spawn_gc_loop / spawn_wal_checkpoint_loop --------------------
