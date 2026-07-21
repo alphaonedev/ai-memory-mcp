@@ -298,6 +298,8 @@ pub(crate) fn import_from_str(
                 .and_then(serde_json::Value::as_str)
                 .map(ToString::to_string);
             if let Some(obj) = mem.metadata.as_object_mut() {
+                use crate::models::field_names;
+
                 obj.insert(
                     "agent_id".to_string(),
                     serde_json::Value::String(caller_id.clone()),
@@ -310,6 +312,24 @@ pub(crate) fn import_from_str(
                         serde_json::Value::String(orig.clone()),
                     );
                     restamped += 1;
+                }
+
+                // #2264 — the v1 wire form is unauthenticated under the
+                // default posture. Never let an imported `_agents` row seed
+                // the destination's enrolled-key lookup, and never preserve
+                // an attestation/signature after changing its bound agent id.
+                obj.remove(field_names::AGENT_PUBKEY);
+                let carried_attestation = obj.remove(field_names::ATTEST_LEVEL).is_some();
+                let carried_signature = obj.remove(field_names::WRITE_SIGNATURE).is_some();
+                if carried_attestation || carried_signature {
+                    obj.insert(
+                        field_names::ATTEST_LEVEL.to_string(),
+                        serde_json::Value::String(
+                            crate::identity::verify::AttestLevel::Claimed
+                                .as_str()
+                                .to_string(),
+                        ),
+                    );
                 }
             }
         }
@@ -711,6 +731,172 @@ mod tests {
     }
 
     #[test]
+    fn test_v1_default_import_cannot_plant_agent_pubkey_2264() {
+        let src = TestEnv::fresh();
+        let src_db = src.db_path.clone();
+        let id = seed_memory(&src_db, "seed", "seed", "seed");
+        let conn = db::open(&src_db).unwrap();
+        let mut planted = db::get(&conn, &id).unwrap().unwrap();
+        let planted_agent = "ai:planted-v1-key";
+        planted.namespace = crate::models::AGENTS_NAMESPACE.to_string();
+        planted.title = crate::models::agent_registration_title(planted_agent);
+        planted.expires_at = Some("2099-01-01T00:00:00Z".into());
+        planted.metadata = serde_json::json!({
+            "agent_id": planted_agent,
+            (crate::models::field_names::AGENT_PUBKEY): "attacker-controlled-key",
+            (crate::models::field_names::ATTEST_LEVEL): "agent_attested",
+            (crate::models::field_names::WRITE_SIGNATURE): "forged-signature"
+        });
+        let payload = serde_json::json!({"memories": [planted], "links": []}).to_string();
+
+        let mut dst = TestEnv::fresh();
+        let dst_db = dst.db_path.clone();
+        let args = ImportArgs {
+            trust_source: false,
+            on_conflict: OnConflict::Version,
+        };
+        {
+            let mut out = dst.output();
+            import_from_str(
+                &payload,
+                &dst_db,
+                &args,
+                true,
+                Some("caller-agent"),
+                &mut out,
+            )
+            .unwrap();
+        }
+
+        let conn = db::open(&dst_db).unwrap();
+        assert_eq!(
+            db::agent_pubkey(&conn, planted_agent).unwrap(),
+            None,
+            "untrusted v1 import must not seed the enrolled-key surface"
+        );
+        let imported = db::get(&conn, &id).unwrap().unwrap();
+        assert!(
+            imported
+                .metadata
+                .get(crate::models::field_names::AGENT_PUBKEY)
+                .is_none()
+        );
+        assert!(
+            imported
+                .metadata
+                .get(crate::models::field_names::WRITE_SIGNATURE)
+                .is_none()
+        );
+        assert_eq!(
+            imported
+                .metadata
+                .get(crate::models::field_names::ATTEST_LEVEL)
+                .and_then(serde_json::Value::as_str),
+            Some(crate::identity::verify::AttestLevel::Claimed.as_str())
+        );
+    }
+
+    #[test]
+    fn v1_agent_claims_follow_explicit_trust_posture_2264() {
+        let src = TestEnv::fresh();
+        let src_db = src.db_path.clone();
+        let id = seed_memory(&src_db, "seed", "seed-posture", "seed");
+        let conn = db::open(&src_db).unwrap();
+        let mut registration = db::get(&conn, &id).unwrap().unwrap();
+        let agent = "ai:v1-posture-agent";
+        let wire_key = "operator-trusted-wire-key";
+        let wire_signature = "operator-trusted-wire-signature";
+        registration.namespace = crate::models::AGENTS_NAMESPACE.to_string();
+        registration.title = crate::models::agent_registration_title(agent);
+        registration.expires_at = Some("2099-01-01T00:00:00Z".into());
+        registration.metadata = serde_json::json!({
+            "agent_id": agent,
+            (crate::models::field_names::AGENT_PUBKEY): wire_key,
+            (crate::models::field_names::ATTEST_LEVEL): "agent_attested",
+            (crate::models::field_names::WRITE_SIGNATURE): wire_signature
+        });
+        let payload = serde_json::json!({"memories": [registration], "links": []}).to_string();
+
+        let mut default_dst = TestEnv::fresh();
+        let default_db = default_dst.db_path.clone();
+        {
+            let mut out = default_dst.output();
+            import_from_str(
+                &payload,
+                &default_db,
+                &ImportArgs {
+                    trust_source: false,
+                    on_conflict: OnConflict::Version,
+                },
+                true,
+                Some(agent),
+                &mut out,
+            )
+            .unwrap();
+        }
+        let conn = db::open(&default_db).unwrap();
+        assert_eq!(db::agent_pubkey(&conn, agent).unwrap(), None);
+        let default_row = db::get(&conn, &id).unwrap().unwrap();
+        assert!(
+            default_row
+                .metadata
+                .get(crate::models::field_names::AGENT_PUBKEY)
+                .is_none()
+        );
+        assert!(
+            default_row
+                .metadata
+                .get(crate::models::field_names::WRITE_SIGNATURE)
+                .is_none()
+        );
+        assert_eq!(
+            default_row
+                .metadata
+                .get(crate::models::field_names::ATTEST_LEVEL)
+                .and_then(serde_json::Value::as_str),
+            Some(crate::identity::verify::AttestLevel::Claimed.as_str())
+        );
+
+        let mut trusted_dst = TestEnv::fresh();
+        let trusted_db = trusted_dst.db_path.clone();
+        {
+            let mut out = trusted_dst.output();
+            import_from_str(
+                &payload,
+                &trusted_db,
+                &ImportArgs {
+                    trust_source: true,
+                    on_conflict: OnConflict::Version,
+                },
+                true,
+                Some(agent),
+                &mut out,
+            )
+            .unwrap();
+        }
+        let conn = db::open(&trusted_db).unwrap();
+        assert_eq!(
+            db::agent_pubkey(&conn, agent).unwrap(),
+            Some(wire_key.into())
+        );
+        let trusted_row = db::get(&conn, &id).unwrap().unwrap();
+        assert_eq!(
+            trusted_row
+                .metadata
+                .get(crate::models::field_names::WRITE_SIGNATURE)
+                .and_then(serde_json::Value::as_str),
+            Some(wire_signature)
+        );
+        assert_eq!(
+            trusted_row
+                .metadata
+                .get(crate::models::field_names::ATTEST_LEVEL)
+                .and_then(serde_json::Value::as_str),
+            Some("agent_attested")
+        );
+    }
+
+    #[test]
     fn test_import_trust_source_preserves_agent_id() {
         let src = TestEnv::fresh();
         let src_db = src.db_path.clone();
@@ -835,6 +1021,99 @@ mod tests {
         let mut out = CliOutput::from_std(&mut buf, &mut errbuf);
         export(db_path, &ExportArgs { full: true }, &mut out).unwrap();
         String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn v1_and_v2_skip_non_object_metadata_but_import_valid_sibling_2264() {
+        let src = TestEnv::fresh();
+        let src_db = src.db_path.clone();
+        let bad_id = seed_memory(&src_db, "metadata-shape", "bad", "bad metadata");
+        let good_id = seed_memory(&src_db, "metadata-shape", "good", "valid sibling");
+
+        let mut v1: serde_json::Value = serde_json::from_str(&export_payload_at(&src_db)).unwrap();
+        let bad_v1 = v1["memories"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|memory| memory["id"] == bad_id)
+            .expect("bad v1 fixture row");
+        bad_v1["metadata"] = serde_json::Value::Null;
+
+        let mut v1_dst = TestEnv::fresh();
+        let v1_db = v1_dst.db_path.clone();
+        {
+            let mut out = v1_dst.output();
+            import_from_str(
+                &v1.to_string(),
+                &v1_db,
+                &ImportArgs {
+                    trust_source: false,
+                    on_conflict: OnConflict::Version,
+                },
+                true,
+                Some("ai:metadata-importer"),
+                &mut out,
+            )
+            .unwrap();
+        }
+        let v1_report: serde_json::Value =
+            serde_json::from_str(v1_dst.stdout_str().lines().last().unwrap()).unwrap();
+        assert_eq!(v1_report["imported"], 1);
+        assert_eq!(v1_report["errors"].as_array().unwrap().len(), 1);
+        assert!(
+            v1_report["errors"][0]
+                .as_str()
+                .is_some_and(|error| error.contains(&bad_id) && error.contains("metadata")),
+            "malformed v1 metadata must be reported: {v1_report}"
+        );
+        let conn = db::open(&v1_db).unwrap();
+        assert!(db::get(&conn, &bad_id).unwrap().is_none());
+        assert!(db::get(&conn, &good_id).unwrap().is_some());
+
+        let mut v2: serde_json::Value =
+            serde_json::from_str(&export_full_payload_at(&src_db)).unwrap();
+        let bad_v2 = v2["memories"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|memory| memory["id"] == bad_id)
+            .expect("bad v2 fixture row");
+        bad_v2["metadata"] = serde_json::Value::Null;
+
+        let mut v2_dst = TestEnv::fresh();
+        let v2_db = v2_dst.db_path.clone();
+        {
+            let mut out = v2_dst.output();
+            import_from_str(
+                &v2.to_string(),
+                &v2_db,
+                &ImportArgs {
+                    trust_source: false,
+                    on_conflict: OnConflict::Version,
+                },
+                true,
+                Some("ai:metadata-importer"),
+                &mut out,
+            )
+            .unwrap();
+        }
+        let v2_report: serde_json::Value =
+            serde_json::from_str(v2_dst.stdout_str().trim()).unwrap();
+        assert_eq!(v2_report["memories"], 1);
+        assert_eq!(v2_report["invalid_skipped"], 1);
+        assert!(
+            v2_report["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning.as_str().is_some_and(|warning| {
+                    warning.contains(&bad_id) && warning.contains("metadata")
+                })),
+            "malformed v2 metadata must be reported: {v2_report}"
+        );
+        let conn = db::open(&v2_db).unwrap();
+        assert!(db::get(&conn, &bad_id).unwrap().is_none());
+        assert!(db::get(&conn, &good_id).unwrap().is_some());
     }
 
     /// ★ #2210 — the v2 route validates the `spec_version` VALUE: a
