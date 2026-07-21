@@ -8358,8 +8358,10 @@ mod tests {
         let occupied = std::net::TcpListener::bind("127.0.0.1:0")
             .expect("reserve a loopback port for the bind-failure test");
         args.port = occupied.local_addr().expect("read reserved address").port();
+        let mut config = AppConfig::default();
+        config.tier = Some("keyword".to_string());
 
-        let error = serve(env.db_path.clone(), args, &AppConfig::default())
+        let error = serve(env.db_path.clone(), args, &config)
             .await
             .expect_err("an occupied bind address must stop the daemon");
         let fatal = error
@@ -8385,8 +8387,10 @@ mod tests {
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls");
         args.tls_cert = Some(fixtures.join("valid_cert.pem"));
         args.tls_key = Some(fixtures.join("valid_key_pkcs8.pem"));
+        let mut config = AppConfig::default();
+        config.tier = Some("keyword".to_string());
 
-        let error = serve(env.db_path.clone(), args, &AppConfig::default())
+        let error = serve(env.db_path.clone(), args, &config)
             .await
             .expect_err("an occupied TLS bind address must stop the daemon");
         let fatal = error
