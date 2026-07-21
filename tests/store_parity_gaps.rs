@@ -1411,6 +1411,508 @@ mod postgres_side {
         );
     }
 
+    // ================================================================
+    // #2292 — at-rest content-seal parity for the remaining postgres
+    // content-write funnels (siblings of #2288's `store_batch`). Each
+    // funnel minted / rewrote a `memories` row via a bespoke INSERT/UPDATE
+    // that bound plaintext into `content` and omitted `encrypted_envelope`,
+    // so an `AI_MEMORY_ENCRYPT_AT_REST` deployment leaked plaintext while
+    // `store()` sealed. All now route through `seal_content_for_insert`.
+    //
+    // Test design: every funnel has an ON-gate SEAL assertion (the
+    // security-critical one — content column holds NO plaintext + envelope
+    // present + `get` decrypts). The OFF-gate byte-identical assertion is
+    // pinned on the two representative conflict shapes (unconditional:
+    // `store_with_embedding`; newer-wins: `apply_remote_memory`); the
+    // OFF branch is the shared `seal_content_for_insert` `None` arm
+    // (verbatim content + NULL envelope) exercised identically by every
+    // funnel, so those two pins cover the off-path for all eight.
+    // #[ignore]-gated live-pg per convention; teardown-before-assert (#2287).
+    // ================================================================
+
+    /// #2292 — read the RAW `content` + `encrypted_envelope` for `id`, run
+    /// `get` (which transparently decrypts while the gate is still ON), then
+    /// DELETE the row (teardown BEFORE the caller asserts — shared DB, #2287).
+    /// Returns `(raw_content, envelope, decrypted_content)`.
+    async fn seal_probe_2292(
+        pg: &PostgresStore,
+        id: &str,
+        ctx: &ai_memory::store::CallerContext,
+    ) -> (String, Option<Vec<u8>>, String) {
+        use ai_memory::store::MemoryStore;
+        let (raw_content, envelope): (String, Option<Vec<u8>>) =
+            sqlx::query_as("SELECT content, encrypted_envelope FROM memories WHERE id = $1")
+                .bind(id)
+                .fetch_one(pg.pool())
+                .await
+                .expect("raw read");
+        let decrypted = MemoryStore::get(pg, ctx, id)
+            .await
+            .map(|m| m.content)
+            .unwrap_or_default();
+        let _ = sqlx::query("DELETE FROM memories WHERE id = $1")
+            .bind(id)
+            .execute(pg.pool())
+            .await;
+        (raw_content, envelope, decrypted)
+    }
+
+    fn assert_sealed_2292(raw: &str, env: Option<&Vec<u8>>, decrypted: &str, plaintext: &str) {
+        assert_eq!(
+            raw, "",
+            "#2292: content column must hold the empty placeholder, not plaintext"
+        );
+        assert!(
+            !raw.contains("SENSITIVE"),
+            "#2292: the plaintext must never reach the content column"
+        );
+        assert!(
+            env.is_some(),
+            "#2292: encrypted_envelope must be populated under the at-rest gate"
+        );
+        assert_eq!(
+            decrypted, plaintext,
+            "#2292: get must transparently recover the sealed plaintext"
+        );
+    }
+
+    /// #2292 — `store_with_embedding` (PRIMARY embedded-write hot path).
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_store_with_embedding_seals_content_2292() {
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-2292");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+
+        // ── ON: content is sealed. ──────────────────────────────────
+        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
+        // SAFETY: pg tests are #[ignore] and run serially under --ignored.
+        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+        let plaintext = "pg SENSITIVE 2292 store_with_embedding";
+        let mut mem = sample_memory(&format!("pg-2292-swe-on-{run}"));
+        mem.content = plaintext.to_string();
+        mem.metadata = serde_json::json!({ "agent_id": "pg-2292-agent" });
+        let id = MemoryStore::store_with_embedding(&pg, &admin_ctx, &mem, None, None)
+            .await
+            .expect("store_with_embedding under encryption");
+        let (raw, env, dec) = seal_probe_2292(&pg, &id, &admin_ctx).await;
+        // SAFETY: restore env before asserting.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
+                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
+            }
+        }
+        assert_sealed_2292(&raw, env.as_ref(), &dec, plaintext);
+
+        // ── OFF: byte-identical — plaintext stored, envelope NULL. ───
+        let prev_off = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST") };
+        let off_plain = "pg plaintext-when-off 2292 swe";
+        let mut mem_off = sample_memory(&format!("pg-2292-swe-off-{run}"));
+        mem_off.content = off_plain.to_string();
+        mem_off.metadata = serde_json::json!({ "agent_id": "pg-2292-agent" });
+        let off_id = MemoryStore::store_with_embedding(&pg, &admin_ctx, &mem_off, None, None)
+            .await
+            .expect("store_with_embedding, gate off");
+        let (raw_off, env_off, dec_off) = seal_probe_2292(&pg, &off_id, &admin_ctx).await;
+        // SAFETY: restore.
+        unsafe {
+            if let Some(v) = prev_off {
+                std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v);
+            }
+        }
+        assert_eq!(
+            raw_off, off_plain,
+            "#2292: gate OFF stores plaintext verbatim (byte-identical)"
+        );
+        assert!(
+            env_off.is_none(),
+            "#2292: gate OFF leaves encrypted_envelope NULL"
+        );
+        assert_eq!(dec_off, off_plain, "#2292: gate OFF get returns plaintext");
+    }
+
+    /// #2292 — `apply_remote_memory` (federation inbound; NEWER-WINS
+    /// content arm, so the envelope arm must move in lockstep). Fresh-insert
+    /// path (unique title) exercises the seal on the INSERT; the ON-conflict
+    /// lockstep CASE is asserted structurally by the SQL text.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_apply_remote_memory_seals_content_2292() {
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-2292");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+
+        // ── ON. ─────────────────────────────────────────────────────
+        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
+        // SAFETY: serial #[ignore] pg tests.
+        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+        let plaintext = "pg SENSITIVE 2292 apply_remote";
+        let mut mem = sample_memory(&format!("pg-2292-remote-on-{run}"));
+        mem.content = plaintext.to_string();
+        mem.metadata = serde_json::json!({ "agent_id": "pg-2292-agent" });
+        let id = MemoryStore::apply_remote_memory(&pg, &admin_ctx, &mem)
+            .await
+            .expect("apply_remote_memory under encryption");
+        let (raw, env, dec) = seal_probe_2292(&pg, &id, &admin_ctx).await;
+        // SAFETY: restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
+                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
+            }
+        }
+        assert_sealed_2292(&raw, env.as_ref(), &dec, plaintext);
+
+        // ── OFF: byte-identical. ────────────────────────────────────
+        let prev_off = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST") };
+        let off_plain = "pg plaintext-when-off 2292 remote";
+        let mut mem_off = sample_memory(&format!("pg-2292-remote-off-{run}"));
+        mem_off.content = off_plain.to_string();
+        mem_off.metadata = serde_json::json!({ "agent_id": "pg-2292-agent" });
+        let off_id = MemoryStore::apply_remote_memory(&pg, &admin_ctx, &mem_off)
+            .await
+            .expect("apply_remote_memory, gate off");
+        let (raw_off, env_off, _dec) = seal_probe_2292(&pg, &off_id, &admin_ctx).await;
+        // SAFETY: restore.
+        unsafe {
+            if let Some(v) = prev_off {
+                std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v);
+            }
+        }
+        assert_eq!(
+            raw_off, off_plain,
+            "#2292: apply_remote gate OFF stores plaintext verbatim"
+        );
+        assert!(
+            env_off.is_none(),
+            "#2292: apply_remote gate OFF leaves encrypted_envelope NULL"
+        );
+    }
+
+    /// #2292 — `capture_turn_idempotent` (L4 turn capture).
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_capture_turn_seals_content_2292() {
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-2292");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
+        // SAFETY: serial #[ignore] pg tests.
+        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+
+        let plaintext = "pg SENSITIVE 2292 capture_turn";
+        let mut mem = sample_memory(&format!("pg-2292-capture-{run}"));
+        mem.content = plaintext.to_string();
+        mem.metadata = serde_json::json!({ "agent_id": "pg-2292-agent" });
+        let ev = ai_memory::signed_events::SignedEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: "pg-2292-agent".to_string(),
+            event_type: "l4.capture".to_string(),
+            payload_hash: vec![0u8; 32],
+            signature: None,
+            attest_level: "claimed".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            ..Default::default()
+        };
+        let write = ai_memory::models::CaptureTurnWrite {
+            memory: mem.clone(),
+            sha256: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            host_kind: "claude-code".to_string(),
+            host_session_id: format!("sess-{run}"),
+            host_turn_index: 0,
+            recovered_at_ms: 0,
+            signed_event: ev,
+        };
+        let res = MemoryStore::capture_turn_idempotent(&pg, &admin_ctx, &write)
+            .await
+            .expect("capture_turn under encryption");
+        let (raw, env, dec) = seal_probe_2292(&pg, &res.memory_id, &admin_ctx).await;
+        // Best-effort dedup-row cleanup so re-runs stay isolated.
+        let _ = sqlx::query("DELETE FROM transcript_line_dedup WHERE host_session_id = $1")
+            .bind(format!("sess-{run}"))
+            .execute(pg.pool())
+            .await;
+        // SAFETY: restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
+                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
+            }
+        }
+        assert_sealed_2292(&raw, env.as_ref(), &dec, plaintext);
+    }
+
+    /// #2292 — `recover_turn_idempotent` (L2 transcript recovery).
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_recover_turn_seals_content_2292() {
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-2292");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
+        // SAFETY: serial #[ignore] pg tests.
+        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+
+        let plaintext = "pg SENSITIVE 2292 recover_turn";
+        let mut mem = sample_memory(&format!("pg-2292-recover-{run}"));
+        mem.content = plaintext.to_string();
+        mem.metadata = serde_json::json!({ "agent_id": "pg-2292-agent" });
+        let norm = uuid::Uuid::new_v4().as_bytes().to_vec();
+        let write = ai_memory::models::RecoverTurnWrite {
+            memory: mem.clone(),
+            normalized_sha256: norm.clone(),
+            raw_sha256: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            host_kind: "claude-code".to_string(),
+            transcript_path: format!("/x/{run}"),
+            host_session_id: None,
+            host_turn_index: None,
+            recovered_at_ms: 0,
+        };
+        let res = MemoryStore::recover_turn_idempotent(&pg, &admin_ctx, &write)
+            .await
+            .expect("recover_turn under encryption");
+        let (raw, env, dec) = seal_probe_2292(&pg, &res.memory_id, &admin_ctx).await;
+        let _ = sqlx::query("DELETE FROM transcript_line_dedup WHERE sha256 = $1")
+            .bind(norm)
+            .execute(pg.pool())
+            .await;
+        // SAFETY: restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
+                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
+            }
+        }
+        assert_sealed_2292(&raw, env.as_ref(), &dec, plaintext);
+    }
+
+    /// #2292 — `reflect_with_hooks` (reflection synthesis; the derived
+    /// `content` is `input.content`).
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_reflect_seals_content_2292() {
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-2292");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let ns = format!("parity-test/2292-reflect-{run}");
+        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
+        // SAFETY: serial #[ignore] pg tests.
+        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+
+        // Seed one source memory to reflect on.
+        let mut src = sample_memory(&format!("pg-2292-reflect-src-{run}"));
+        src.namespace.clone_from(&ns);
+        src.content = "source body".to_string();
+        src.metadata = serde_json::json!({ "agent_id": "pg-2292-agent" });
+        let src_id = MemoryStore::store(&pg, &admin_ctx, &src)
+            .await
+            .expect("store reflect source");
+
+        let plaintext = "pg SENSITIVE 2292 reflection body";
+        let input = ai_memory::db::ReflectInput {
+            source_ids: vec![src_id.clone()],
+            title: format!("pg-2292-reflection-{run}"),
+            content: plaintext.to_string(),
+            namespace: Some(ns.clone()),
+            tier: ai_memory::models::Tier::Mid,
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "nhi".to_string(),
+            agent_id: "pg-2292-agent".to_string(),
+            metadata: serde_json::json!({}),
+        };
+        let outcome = pg
+            .reflect(&admin_ctx, &input)
+            .await
+            .expect("reflect under encryption");
+        let (raw, env, dec) = seal_probe_2292(&pg, &outcome.id, &admin_ctx).await;
+        let _ = sqlx::query("DELETE FROM memories WHERE id = $1")
+            .bind(&src_id)
+            .execute(pg.pool())
+            .await;
+        // SAFETY: restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
+                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
+            }
+        }
+        assert_sealed_2292(&raw, env.as_ref(), &dec, plaintext);
+    }
+
+    /// #2292 — `consolidate` (the consolidated `summary` is the sealed
+    /// content).
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_consolidate_seals_content_2292() {
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-2292");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let ns = format!("parity-test/2292-consol-{run}");
+        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
+        // SAFETY: serial #[ignore] pg tests.
+        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+
+        let mut src = sample_memory(&format!("pg-2292-consol-src-{run}"));
+        src.namespace.clone_from(&ns);
+        src.content = "source body".to_string();
+        src.metadata = serde_json::json!({ "agent_id": "pg-2292-agent" });
+        let src_id = MemoryStore::store(&pg, &admin_ctx, &src)
+            .await
+            .expect("store consolidate source");
+
+        let plaintext = "pg SENSITIVE 2292 consolidated summary";
+        let id = MemoryStore::consolidate(
+            &pg,
+            &admin_ctx,
+            std::slice::from_ref(&src_id),
+            &format!("pg-2292-consolidated-{run}"),
+            plaintext,
+            &ns,
+            &ai_memory::models::Tier::Long,
+            "test",
+            "pg-2292-agent",
+        )
+        .await
+        .expect("consolidate under encryption");
+        let (raw, env, dec) = seal_probe_2292(&pg, &id, &admin_ctx).await;
+        // Source rows are deleted by consolidate; best-effort sweep anyway.
+        let _ = sqlx::query("DELETE FROM memories WHERE namespace = $1")
+            .bind(&ns)
+            .execute(pg.pool())
+            .await;
+        // SAFETY: restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
+                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
+            }
+        }
+        assert_sealed_2292(&raw, env.as_ref(), &dec, plaintext);
+    }
+
+    /// #2292 — `update_with_archive_on_supersede` (the append-and-archive
+    /// twin mints a NEW version row carrying the patched content).
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_supersede_seals_content_2292() {
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-2292");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
+        // SAFETY: serial #[ignore] pg tests.
+        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+
+        let mut orig = sample_memory(&format!("pg-2292-supersede-{run}"));
+        orig.content = "original body".to_string();
+        orig.metadata = serde_json::json!({ "agent_id": "pg-2292-agent" });
+        let old_id = MemoryStore::store(&pg, &admin_ctx, &orig)
+            .await
+            .expect("store supersede original");
+
+        let plaintext = "pg SENSITIVE 2292 superseding body";
+        let patch = ai_memory::store::UpdatePatch {
+            content: Some(plaintext.to_string()),
+            ..Default::default()
+        };
+        let (_old, new_id) = pg
+            .update_with_archive_on_supersede(
+                &old_id,
+                patch,
+                None,
+                ai_memory::models::EditSource::Llm,
+            )
+            .await
+            .expect("supersede under encryption");
+        let (raw, env, dec) = seal_probe_2292(&pg, &new_id, &admin_ctx).await;
+        let _ = sqlx::query("DELETE FROM archived_memories WHERE id = $1")
+            .bind(&old_id)
+            .execute(pg.pool())
+            .await;
+        // SAFETY: restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
+                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
+            }
+        }
+        assert_sealed_2292(&raw, env.as_ref(), &dec, plaintext);
+    }
+
+    /// #2292 — `merge_inbound` (same-id federation merge; the full-row UPDATE
+    /// that the issue audit MISSED). Under an enabled gate a merge onto an
+    /// EXISTING sealed row must re-seal the merged content, never overwrite
+    /// it with plaintext + leave a stale envelope.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_merge_inbound_seals_content_2292() {
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-2292");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
+        // SAFETY: serial #[ignore] pg tests.
+        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+
+        // Seed the existing row (sealed under the gate).
+        let mut orig = sample_memory(&format!("pg-2292-merge-{run}"));
+        orig.content = "original body".to_string();
+        orig.metadata = serde_json::json!({ "agent_id": "pg-2292-agent" });
+        let id = MemoryStore::store(&pg, &admin_ctx, &orig)
+            .await
+            .expect("store merge original");
+
+        // Inbound: SAME id, strictly-newer updated_at, new sensitive content
+        // → merge_inbound resolves the by-id UPDATE path.
+        let plaintext = "pg SENSITIVE 2292 merged inbound body";
+        let mut inbound = orig.clone();
+        inbound.id = id.clone();
+        inbound.content = plaintext.to_string();
+        inbound.updated_at = (chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
+        let merged_id = MemoryStore::merge_inbound(&pg, &admin_ctx, &inbound)
+            .await
+            .expect("merge_inbound under encryption");
+        assert_eq!(merged_id, id, "merge resolves the same-id UPDATE path");
+        let (raw, env, dec) = seal_probe_2292(&pg, &id, &admin_ctx).await;
+        // SAFETY: restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
+                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
+            }
+        }
+        assert_sealed_2292(&raw, env.as_ref(), &dec, plaintext);
+    }
+
     /// #2289 — `PostgresStore::store_batch` MUST persist the caller-supplied
     /// `kind_provenance` (#1945), mirroring `store()` and the sqlite
     /// trait-default loop. Pre-#2289 the bulk INSERT never listed the
