@@ -1,6 +1,6 @@
 {
   "name": "ai-memory",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Persistent, tier-aware memory for Claude Code: the ai-memory MCP server + a SessionStart recall hook + an opt-in PreToolUse governance gate. Requires the `ai-memory` binary on PATH (see README).",
   "author": {
     "name": "AlphaOne LLC",
