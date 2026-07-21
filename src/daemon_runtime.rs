@@ -6839,6 +6839,13 @@ pub async fn sync_cycle_once(
             "memories": outgoing,
             "dry_run": false,
         });
+        // #2297 — serialise the body ONCE so the signature input matches the
+        // wire bytes the receiver sees. Sending via `.body(bytes)` + explicit
+        // content-type (rather than `.json(&body)`, which re-serialises)
+        // guarantees the signed bytes are byte-identical to what the receiver's
+        // `verify_signature_or_reject` reads — the same discipline the working
+        // /sync/push client uses (`src/federation/sync.rs`).
+        let body_bytes = serde_json::to_vec(&body)?;
         // v0.7.0 #238 — attach `x-peer-id` so the receiver attests
         // body.sender_agent_id against our wire-level peer identity.
         let mut req = client
@@ -6849,9 +6856,30 @@ pub async fn sync_cycle_once(
                 local_agent_id,
             )
             .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
-            .json(&body);
+            .body(body_bytes.clone());
         if let Some(key) = api_key {
             req = req.header(crate::HEADER_API_KEY, key);
+        }
+        // #2297 — sign the outbound /sync/push POST body with the daemon signing
+        // key (loaded from local_agent_id's on-disk keypair) so an ENROLLED peer
+        // accepts the push under the default AI_MEMORY_FED_REQUIRE_SIG=1 posture —
+        // the receiver's verify_signature_or_reject gate otherwise refuses an
+        // enrolled peer's unsigned POST with 401 x_memory_sig_missing. This is the
+        // PUSH sibling of the #2290/#2296 pull-side signing above: mirrors the
+        // working /sync/push client (`src/federation/sync.rs`) — signs
+        // `body_bytes || 0x00 || nonce` per the #922 nonce binding + attaches the
+        // X-Memory-Sig / X-Memory-Nonce headers. Unsigned when no key is on disk
+        // (preserves the permissive / unenrolled posture).
+        let push_signing_key = crate::governance::audit::load_daemon_signing_key(local_agent_id)
+            .ok()
+            .flatten();
+        if let Some(sk) = push_signing_key.as_ref() {
+            let nonce = uuid::Uuid::new_v4().to_string();
+            let sig_header =
+                crate::federation::signing::sign_body_with_nonce_header(sk, &body_bytes, &nonce);
+            req = req
+                .header(crate::federation::signing::SIGNATURE_HEADER, sig_header)
+                .header(crate::federation::signing::NONCE_HEADER, nonce);
         }
         let resp = req.send().await?;
         if !resp.status().is_success() {
