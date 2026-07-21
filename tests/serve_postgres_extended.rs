@@ -622,6 +622,26 @@ async fn pending_list_returns_structured_empty_on_postgres() {
         eprintln!("skipping pending_list_returns_structured_empty_on_postgres");
         return;
     };
+    // #2287 — the shared `ai_memory_test` DB has NO per-test isolation, and this
+    // test asserts on the GLOBAL `GET /api/v1/pending` count (== 0), so ANY
+    // pending_actions row a co-scheduled test seeded (and did not fully clean
+    // up) makes the assertion flaky. The Postgres feature gate runs SERIAL
+    // (`cargo test … -- --test-threads=1` on every branch of the ci.yml "Run lib
+    // + integration tests" step), so it is safe + robust-by-construction to
+    // establish our OWN precondition rather than depend on every other test's
+    // teardown: clear `pending_actions` before asserting the empty list. (A
+    // blanket DELETE would be UNSAFE under parallelism — it would nuke a
+    // concurrent test's in-flight rows — but the gate never runs these threaded,
+    // so this is the durable fix that ends the #2287 whack-a-mole.)
+    {
+        let precondition_store = PostgresStore::connect(&url)
+            .await
+            .expect("connect postgres for pending_actions precondition");
+        sqlx::query("DELETE FROM pending_actions")
+            .execute(precondition_store.pool())
+            .await
+            .expect("clear pending_actions precondition (#2287)");
+    }
     let (base, shutdown, handle) = spawn_daemon(&url).await;
     let client = pg_test_client("ai:ext-test");
 
