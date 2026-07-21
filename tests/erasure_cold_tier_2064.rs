@@ -575,7 +575,10 @@ fn purge_marker_blocks_cross_process_remint_until_row_and_bundle_are_gone() {
 
     // Model the second process: its sweep starts from an empty in-process
     // frontier while the durable archived row remains visible.
-    archive_sync::reset_process_static_sweep_state_for_dir(&dir);
+    // Use the store's canonical directory: on macOS the fixture path can be
+    // spelled through /tmp while ErasureStore resolves it through /private/tmp,
+    // and the process cache is keyed by the latter PathBuf.
+    archive_sync::reset_process_static_sweep_state_for_dir(store.dir());
     let raced = archive_sync::sweep_archive_bundles(&f.conn, &store, 16).expect("racing sweep");
     assert_eq!(raced.skipped_purge_intent, 1);
     assert!(!bundle.exists(), "durable intent forbids re-minting");
