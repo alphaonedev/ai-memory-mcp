@@ -5009,14 +5009,21 @@ impl PostgresStore {
             "UPDATE memories SET
                 title = COALESCE($2, title),
                 content = COALESCE($3, content),
-                -- #228 Commit B — at-rest envelope. $13 carries the sealed
-                -- ciphertext when encryption is on (paired with the $3
-                -- placeholder) and NULL when off (paired with the plaintext
-                -- patch/stored content), so content + envelope always move
-                -- together. Unconditional assignment (not COALESCE): under
-                -- encryption-off this rewrites a previously-encrypted row's
-                -- envelope to NULL, matching the content rewrite.
-                encrypted_envelope = $13,
+                -- #228 Commit B / #2292 — at-rest envelope, moved in LOCKSTEP
+                -- with `content` via the SAME `$3 IS NULL` predicate. A
+                -- content-bearing patch ($3 = sealed placeholder when on /
+                -- plaintext when off) sets $13 (sealed ciphertext when on, NULL
+                -- when off — clearing a stale envelope so the two never
+                -- desync). #2292 FIX: a metadata-only patch ($3 IS NULL) now
+                -- leaves the existing envelope UNTOUCHED. Pre-#2292 this was an
+                -- UNCONDITIONAL = $13: on a metadata-only update under an
+                -- enabled gate, upd_effective_content was the raw empty-string
+                -- placeholder, seal_content of an empty string returned None,
+                -- $13 bound NULL, and the sealed envelope was DESTROYED so
+                -- get() returned an empty string for a still-encrypted row
+                -- (silent data loss). The trait update funnel uses the
+                -- IDENTICAL guard so the two paths match.
+                encrypted_envelope = CASE WHEN $3 IS NULL THEN encrypted_envelope ELSE $13 END,
                 tier = CASE
                     WHEN $4::TEXT IS NULL THEN tier
                     WHEN tier_rank($4::TEXT) >= tier_rank(tier) THEN $4::TEXT
@@ -5482,6 +5489,14 @@ impl PostgresStore {
         // v0.9.0 G8 (#1825) — the supersede mints a NEW genesis row, so it
         // stamps its own content-id from the (plaintext) candidate identity.
         let supersede_cid = crate::identity::cid::stamp_memory_cid(&candidate);
+        // #2292 — at-rest content-seal on the supersede twin (the plain
+        // in-place `update()` at ~4947 already seals; this append-and-archive
+        // twin minted the NEW version's `content` PLAINTEXT + omitted
+        // `encrypted_envelope`). Seal via `candidate` (its `content ==
+        // new_content`, its metadata preserves the row's `agent_id`). This is
+        // a fresh-id INSERT with NO ON CONFLICT arm, so only the column + bind
+        // are needed.
+        let (supersede_content, supersede_envelope) = seal_content_for_insert(&candidate)?;
         sqlx::query(
             "INSERT INTO memories
                 (id, tier, namespace, title, content, tags, priority, confidence,
@@ -5489,18 +5504,19 @@ impl PostgresStore {
                  expires_at, metadata, reflection_depth, memory_kind,
                  entity_id, persona_version, citations, source_uri, source_span,
                  confidence_source, confidence_signals, confidence_decayed_at,
-                 mentioned_entity_id, version, cid, cid_genesis)
+                 mentioned_entity_id, version, cid, cid_genesis, encrypted_envelope)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, NOW(), NOW(), NULL,
                      $10, $11, $12, $13,
                      $14, $15, $16, $17, $18,
                      $19, $20, $21,
-                     $22, 1, $23, $24)",
+                     $22, 1, $23, $24, $25)",
         )
         .bind(&new_id)
         .bind(new_tier.as_str())
         .bind(&new_namespace)
         .bind(&new_title)
-        .bind(&new_content)
+        // #2292 — sealed placeholder ("" under an enabled gate, else content).
+        .bind(&supersede_content)
         .bind(
             serde_json::to_value(&new_tags).map_err(|e| StoreError::IntegrityFailed {
                 detail: serialize_err("tags", e),
@@ -5524,6 +5540,8 @@ impl PostgresStore {
         .bind(mentioned_entity_id.as_deref())
         .bind(&supersede_cid.cid)
         .bind(&supersede_cid.genesis)
+        // #2292 — sealed ciphertext envelope ($25); NULL when encryption off.
+        .bind(supersede_envelope)
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert new on supersede", e))?;
@@ -10147,6 +10165,16 @@ impl PostgresStore {
         // from the DO UPDATE SET below: a surviving upsert-merge row keeps its
         // own genesis cid.
         let reflect_cid = crate::identity::cid::stamp_memory_cid(&candidate);
+        // #2292 — at-rest content-seal on the reflection-synthesis funnel.
+        // Pre-#2292 this INSERT bound `input.content` PLAINTEXT and omitted
+        // `encrypted_envelope`, so a reflection's synthesized body persisted in
+        // the clear under an enabled gate. Seal via `candidate` (its `content
+        // == input.content`, its metadata carries the reflecting `agent_id`).
+        // Content arm is unconditional → envelope moves with it. The seal
+        // helper returns `StoreError`; map it into this funnel's `ReflectError`
+        // (a seal failure is a backend-side integrity fault).
+        let (reflect_content, reflect_envelope) = seal_content_for_insert(&candidate)
+            .map_err(|e| ReflectError::Database(e.to_string()))?;
 
         // Insert the reflection memory inside the tx.
         let actual_id: String = sqlx::query(
@@ -10154,11 +10182,13 @@ impl PostgresStore {
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
                 expires_at, metadata, reflection_depth, memory_kind, mentioned_entity_id,
-                cid, cid_genesis
+                cid, cid_genesis, encrypted_envelope
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULL, NULL, $13, $14, $15, $16,
-                      $17, $18)
+                      $17, $18, $19)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
+                -- #2292 — content + envelope move together (store() parity).
+                encrypted_envelope = EXCLUDED.encrypted_envelope,
                 tier = CASE
                     WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
                         THEN EXCLUDED.tier
@@ -10191,7 +10221,8 @@ impl PostgresStore {
         .bind(input.tier.as_str())
         .bind(&target_namespace)
         .bind(&input.title)
-        .bind(&input.content)
+        // #2292 — sealed placeholder ("" under an enabled gate, else content).
+        .bind(&reflect_content)
         .bind(&tags_json)
         .bind(input.priority.clamp(1, 10))
         .bind(input.confidence.clamp(0.0, 1.0))
@@ -10205,6 +10236,8 @@ impl PostgresStore {
         .bind(mentioned_entity_id.as_deref())
         .bind(&reflect_cid.cid)
         .bind(&reflect_cid.genesis)
+        // #2292 — sealed ciphertext envelope ($19); NULL when encryption off.
+        .bind(reflect_envelope)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| ReflectError::Database(format!("insert reflection memory: {e}")))?
@@ -11712,6 +11745,49 @@ fn at_rest_seal_err(e: impl std::fmt::Display) -> StoreError {
     StoreError::IntegrityFailed {
         detail: format!("at-rest seal_content failed: {e}"),
     }
+}
+
+/// #2292 — shared at-rest content-seal computation for the postgres content-
+/// write funnels that mint or rewrite a `memories` row via a bespoke
+/// INSERT/UPDATE rather than routing through [`PostgresStore::store`]. Extracts
+/// the `store()` seal pattern (#228 Commit B) into ONE named site so no funnel
+/// can silently persist PLAINTEXT under the `AI_MEMORY_ENCRYPT_AT_REST` gate —
+/// the confidentiality-bypass class #2288 closed on `store_batch` and #2292
+/// closes on `store_with_embedding` / `capture_turn_idempotent` /
+/// `recover_turn_idempotent` / `apply_remote_memory` / `consolidate` /
+/// `reflect_with_hooks` / the supersede twin / `merge_inbound`.
+///
+/// Returns `(content_to_store, encrypted_envelope)`:
+/// - gate ON  → `("" placeholder, Some(sealed 0x03 envelope bytes))`
+/// - gate OFF → `(verbatim content, None)` — byte-identical to the pre-seal
+///   path (`seal_content` returns `None` when encryption is disabled OR the
+///   content is empty).
+///
+/// The caller binds `content_to_store` into the `content` column and
+/// `encrypted_envelope` into the `encrypted_envelope` BYTEA column (schema
+/// v68). Upsert funnels MUST additionally move the envelope with the content
+/// on their `ON CONFLICT … DO UPDATE SET` arm (using the SAME predicate as the
+/// `content` arm) so a re-store / newer-wins merge never desyncs the two.
+/// Fail-closed: an enabled gate with no `metadata.agent_id` returns `Err`
+/// (there is no recipient key to seal to), exactly as `store` / `store_batch`.
+///
+/// # Errors
+/// [`StoreError::IntegrityFailed`] when [`crate::encryption::seal_content`]
+/// fails (enabled gate with no `agent_id`, or an AEAD seal failure).
+fn seal_content_for_insert(memory: &Memory) -> StoreResult<(String, Option<Vec<u8>>)> {
+    let agent_id = memory
+        .metadata
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let sealed =
+        crate::encryption::seal_content(&memory.content, agent_id).map_err(at_rest_seal_err)?;
+    Ok(match sealed {
+        // `placeholder` is the empty string `seal_content` returns alongside
+        // the envelope; the ciphertext lives in `encrypted_envelope`.
+        Some((envelope, placeholder)) => (placeholder, Some(envelope)),
+        None => (memory.content.clone(), None),
+    })
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -14469,6 +14545,12 @@ impl MemoryStore for PostgresStore {
         // from the DO UPDATE SET below: a surviving upsert-merge row keeps its
         // own genesis cid.
         let capture_cid = crate::identity::cid::stamp_memory_cid(memory);
+        // #2292 — at-rest content-seal on the L4 turn-capture funnel. Pre-#2292
+        // this inline INSERT bound `memory.content` PLAINTEXT and omitted
+        // `encrypted_envelope`, leaking verbatim conversation turns under an
+        // enabled gate. Content arm is unconditional, so the envelope moves
+        // with it unconditionally on the ON CONFLICT arm.
+        let (capture_content, capture_envelope) = seal_content_for_insert(memory)?;
 
         let inserted_id: String = sqlx::query(
             "INSERT INTO memories (
@@ -14477,13 +14559,16 @@ impl MemoryStore for PostgresStore {
                 expires_at, metadata, reflection_depth, memory_kind,
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
-                mentioned_entity_id, cid, cid_genesis
+                mentioned_entity_id, cid, cid_genesis, encrypted_envelope
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                       $18, $19, $20,
                       $21, $22, $23,
-                      $24, $25, $26)
+                      $24, $25, $26, $27)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
+                -- #2292 — content + envelope move together (store()/store_batch
+                -- parity); an encryption-off re-store clears any stale envelope.
+                encrypted_envelope = EXCLUDED.encrypted_envelope,
                 tier = CASE
                     WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
                         THEN EXCLUDED.tier
@@ -14535,7 +14620,8 @@ impl MemoryStore for PostgresStore {
         .bind(memory.tier.as_str())
         .bind(&memory.namespace)
         .bind(&memory.title)
-        .bind(&memory.content)
+        // #2292 — sealed placeholder ("" under an enabled gate, else verbatim).
+        .bind(&capture_content)
         .bind(&tags_json)
         .bind(memory.priority)
         .bind(memory.confidence)
@@ -14557,6 +14643,8 @@ impl MemoryStore for PostgresStore {
         .bind(mentioned_entity_id.as_deref())
         .bind(&capture_cid.cid)
         .bind(&capture_cid.genesis)
+        // #2292 — sealed ciphertext envelope ($27); NULL when encryption off.
+        .bind(capture_envelope)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("capture_turn insert memory", e))?
@@ -14728,6 +14816,11 @@ impl MemoryStore for PostgresStore {
         // OMITTED from the DO UPDATE SET below: a surviving upsert-merge row
         // keeps its own genesis cid.
         let recover_cid = crate::identity::cid::stamp_memory_cid(memory);
+        // #2292 — at-rest content-seal on the L2 transcript-recovery funnel.
+        // Pre-#2292 this inline INSERT bound `memory.content` PLAINTEXT and
+        // omitted `encrypted_envelope`, leaking recovered turns under an
+        // enabled gate. Content arm is unconditional → envelope moves with it.
+        let (recover_content, recover_envelope) = seal_content_for_insert(memory)?;
 
         let inserted_id: String = sqlx::query(
             "INSERT INTO memories (
@@ -14736,13 +14829,15 @@ impl MemoryStore for PostgresStore {
                 expires_at, metadata, reflection_depth, memory_kind,
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
-                mentioned_entity_id, cid, cid_genesis
+                mentioned_entity_id, cid, cid_genesis, encrypted_envelope
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                       $18, $19, $20,
                       $21, $22, $23,
-                      $24, $25, $26)
+                      $24, $25, $26, $27)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
+                -- #2292 — content + envelope move together (store() parity).
+                encrypted_envelope = EXCLUDED.encrypted_envelope,
                 tier = CASE
                     WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
                         THEN EXCLUDED.tier
@@ -14791,7 +14886,8 @@ impl MemoryStore for PostgresStore {
         .bind(memory.tier.as_str())
         .bind(&memory.namespace)
         .bind(&memory.title)
-        .bind(&memory.content)
+        // #2292 — sealed placeholder ("" under an enabled gate, else verbatim).
+        .bind(&recover_content)
         .bind(&tags_json)
         .bind(memory.priority)
         .bind(memory.confidence)
@@ -14813,6 +14909,8 @@ impl MemoryStore for PostgresStore {
         .bind(mentioned_entity_id.as_deref())
         .bind(&recover_cid.cid)
         .bind(&recover_cid.genesis)
+        // #2292 — sealed ciphertext envelope ($27); NULL when encryption off.
+        .bind(recover_envelope)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("recover_turn insert memory", e))?
@@ -14979,6 +15077,14 @@ impl MemoryStore for PostgresStore {
         // identity. OMITTED from the DO UPDATE SET below: a surviving
         // upsert-merge row keeps its own genesis cid.
         let embed_cid = crate::identity::cid::stamp_memory_cid(memory);
+        // #2292 — at-rest content-seal on the PRIMARY embedded-write hot path
+        // (every semantic-tier store). Pre-#2292 this funnel bound
+        // `memory.content` PLAINTEXT and omitted `encrypted_envelope`, so an
+        // `AI_MEMORY_ENCRYPT_AT_REST` deployment leaked plaintext on its
+        // busiest write path while `store()` sealed. Content arm is
+        // unconditional (`content = EXCLUDED.content`), so the envelope moves
+        // with it unconditionally on the ON CONFLICT arm below.
+        let (embed_content, embed_envelope) = seal_content_for_insert(memory)?;
 
         let id: String = sqlx::query(
             "INSERT INTO memories (
@@ -14990,15 +15096,20 @@ impl MemoryStore for PostgresStore {
                 entity_id, persona_version, embedding,
                 mentioned_entity_id, lifecycle_state,
                 cid, cid_genesis, embedding_space,
-                valid_from, valid_until
+                valid_from, valid_until, encrypted_envelope
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                       $18, $19, $20,
                       $21, $22, $23,
                       $24, $25, $26,
                       $27, $28, $29, $30, $31,
-                      $32, $33)
+                      $32, $33, $34)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
+                -- #2292 — content + envelope move together on upsert so a
+                -- re-store replaces both the placeholder and the ciphertext
+                -- (encryption-off writes plaintext + NULL, clearing any stale
+                -- ciphertext). Mirrors `store()` / `store_batch()`.
+                encrypted_envelope = EXCLUDED.encrypted_envelope,
                 tier = CASE
                     WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
                         THEN EXCLUDED.tier
@@ -15078,7 +15189,8 @@ impl MemoryStore for PostgresStore {
         .bind(memory.tier.as_str())
         .bind(&memory.namespace)
         .bind(&memory.title)
-        .bind(&memory.content)
+        // #2292 — sealed placeholder ("" under an enabled gate, else verbatim).
+        .bind(&embed_content)
         .bind(&tags_json)
         .bind(memory.priority)
         .bind(memory.confidence)
@@ -15113,6 +15225,8 @@ impl MemoryStore for PostgresStore {
         .bind(crate::validate::canonical_valid_time_opt(
             memory.valid_until.as_deref(),
         ))
+        // #2292 — sealed ciphertext envelope ($34); NULL when encryption off.
+        .bind(embed_envelope)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory_with_embedding", e))?
@@ -15523,10 +15637,53 @@ impl MemoryStore for PostgresStore {
         // version-gated inherent `update_with_expected_version` helper,
         // which applies the same owner gate + SET semantics and refuses
         // stale versions with the typed VersionConflict envelope.
+        // #2292 — at-rest content-seal on the DEFAULT (non-If-Match) update
+        // funnel — the 9th postgres content-write funnel (found by the #2292
+        // audit; NOT in the issue's list). Pre-#2292 this UPDATE bound
+        // `patch.content` PLAINTEXT via `content = COALESCE($3, content)` and
+        // had NO `encrypted_envelope` in the SET, so under an enabled gate a
+        // content patch wrote V2 PLAINTEXT while the row's stale envelope kept
+        // cipher(V1): `get()` (which decrypts on envelope-PRESENCE) returned
+        // the OLD V1 — the V2 update was SILENTLY LOST, V2 leaked in the clear,
+        // and a key rotation bricked the row. Seal the EFFECTIVE new content
+        // (patch's when supplied, else stored) under the row's owner agent_id —
+        // the SAME Rust computation as the If-Match twin
+        // `update_with_expected_version_once`. `upd_agent_id` resolves from
+        // `governed.metadata` (the patch-or-stored merge the SQL persists;
+        // agent_id is immutable, guarded above).
+        let upd_effective_content: &str = patch.content.as_deref().unwrap_or(cur_content.as_str());
+        let upd_agent_id = governed
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let upd_sealed = crate::encryption::seal_content(upd_effective_content, upd_agent_id)
+            .map_err(at_rest_seal_err)?;
+        // When sealing, write the placeholder into `content` (Some); when not
+        // sealing, bind None so the SQL COALESCE keeps the patch-or-stored
+        // plaintext. `or_else(patch.content)` preserves an off-gate content
+        // patch exactly (the If-Match twin's shape).
+        let upd_content_bind: Option<String> = upd_sealed
+            .as_ref()
+            .map(|(_, ph)| ph.clone())
+            .or_else(|| patch.content.clone());
+        let upd_encrypted_envelope: Option<Vec<u8>> =
+            upd_sealed.as_ref().map(|(env, _)| env.clone());
+
         let rows_affected = sqlx::query(
             "UPDATE memories SET
                 title = COALESCE($2, title),
                 content = COALESCE($3, content),
+                -- #2292 — the at-rest envelope moves in LOCKSTEP with `content`
+                -- via the SAME `$3 IS NULL` predicate: a content-bearing patch
+                -- ($3 = sealed placeholder when on / plaintext when off) sets
+                -- the envelope to $13 (sealed ciphertext when on, NULL when off
+                -- — clearing any stale envelope so content + envelope never
+                -- desync); a metadata-only patch ($3 IS NULL) leaves the
+                -- existing envelope UNTOUCHED so a sealed row's envelope is
+                -- never accidentally nulled (the None-content-preserves-envelope
+                -- rule; the If-Match twin uses the SAME guard).
+                encrypted_envelope = CASE WHEN $3 IS NULL THEN encrypted_envelope ELSE $13 END,
                 tier = CASE
                     WHEN $4::TEXT IS NULL THEN tier
                     WHEN tier_rank($4::TEXT) >= tier_rank(tier) THEN $4::TEXT
@@ -15577,7 +15734,9 @@ impl MemoryStore for PostgresStore {
         )
         .bind(id)
         .bind(patch.title)
-        .bind(patch.content)
+        // #2292 — sealed placeholder ("" under an enabled gate), plaintext when
+        // off, or None (COALESCE keeps stored) on a metadata-only patch.
+        .bind(upd_content_bind)
         .bind(patch.tier.as_ref().map(Tier::as_str))
         .bind(patch.namespace)
         .bind(
@@ -15605,6 +15764,10 @@ impl MemoryStore for PostgresStore {
         .bind(crate::validate::canonical_valid_time_opt(
             patch.valid_until.as_deref(),
         ))
+        // #2292 — sealed ciphertext envelope ($13); NULL when off. The SET's
+        // `$3 IS NULL` CASE leaves the existing envelope untouched on a
+        // metadata-only patch, so this NULL only lands when content IS patched.
+        .bind(upd_encrypted_envelope)
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("update", e))?
@@ -16427,6 +16590,19 @@ impl MemoryStore for PostgresStore {
         // UPDATE SET below so an existing local row keeps its own genesis cid
         // on a federation-merge.
         let remote_cid = crate::identity::cid::stamp_memory_cid(memory);
+        // #2292 — at-rest content-seal on the federation-RECEIVE funnel. Under
+        // an enabled `AI_MEMORY_ENCRYPT_AT_REST` gate the receiver seals the
+        // inbound plaintext to its LOCAL per-agent key (at-rest confidentiality
+        // is a local property; the receiver keys under the row's own
+        // `metadata.agent_id`). Pre-#2292 this funnel bound `memory.content`
+        // PLAINTEXT and omitted `encrypted_envelope`. CRITICAL: the content
+        // ON CONFLICT arm is NEWER-WINS (not unconditional), so the envelope
+        // arm below MUST use the IDENTICAL predicate so content + envelope stay
+        // in lockstep — an unconditional `EXCLUDED.encrypted_envelope` would
+        // desync a locally-kept content with a peer's ciphertext. Fail-closed
+        // on an empty agent_id mirrors `store()` (a well-formed federated row
+        // always carries `agent_id`).
+        let (remote_content, remote_envelope) = seal_content_for_insert(memory)?;
         let row = sqlx::query(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
@@ -16436,11 +16612,11 @@ impl MemoryStore for PostgresStore {
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version, version,
                 mentioned_entity_id, lifecycle_state,
-                cid, cid_genesis, valid_from, valid_until
+                cid, cid_genesis, valid_from, valid_until, encrypted_envelope
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                 $18, $19, $20, $21, $22, $23, $24, $25, $26,
-                $27, $28, $29, $30, $31, $32
+                $27, $28, $29, $30, $31, $32, $33
             )
             ON CONFLICT (title, namespace) DO UPDATE SET
                 -- #1631 — every newer-wins arm carries the sqlite
@@ -16455,6 +16631,18 @@ impl MemoryStore for PostgresStore {
                              AND EXCLUDED.id > memories.id)
                         THEN EXCLUDED.content
                     ELSE memories.content
+                END,
+                -- #2292 — the sealed envelope moves in LOCKSTEP with `content`:
+                -- the SAME newer-wins predicate, so a merge that keeps the
+                -- local content keeps the local envelope, and a merge that
+                -- takes EXCLUDED.content takes EXCLUDED.encrypted_envelope.
+                -- (Unconditional EXCLUDED here would desync content/envelope.)
+                encrypted_envelope = CASE
+                    WHEN EXCLUDED.updated_at > memories.updated_at
+                         OR (EXCLUDED.updated_at = memories.updated_at
+                             AND EXCLUDED.id > memories.id)
+                        THEN EXCLUDED.encrypted_envelope
+                    ELSE memories.encrypted_envelope
                 END,
                 -- #1631 — tier upgrades are monotone REGARDLESS of the
                 -- timestamp (sqlite parity): a stale peer that promoted
@@ -16604,7 +16792,8 @@ impl MemoryStore for PostgresStore {
         .bind(memory.tier.as_str())
         .bind(&memory.namespace)
         .bind(&memory.title)
-        .bind(&memory.content)
+        // #2292 — sealed placeholder ("" under an enabled gate, else verbatim).
+        .bind(&remote_content)
         .bind(&tags_json)
         .bind(memory.priority)
         .bind(memory.confidence)
@@ -16639,6 +16828,10 @@ impl MemoryStore for PostgresStore {
         .bind(crate::validate::canonical_valid_time_opt(
             memory.valid_until.as_deref(),
         ))
+        // #2292 — sealed ciphertext envelope ($33); NULL when encryption off.
+        // On the newer-wins upsert arm it is kept/replaced in lockstep with
+        // `content` (see the matching CASE above).
+        .bind(remote_envelope)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| to_store_err("apply_remote_memory upsert", e))?;
@@ -16757,6 +16950,16 @@ impl MemoryStore for PostgresStore {
         };
         let confidence_decayed_at = parse_rfc3339_opt(merged.confidence_decayed_at.as_deref());
         let mentioned_entity_id = crate::storage::extract_mentioned_entity_id(&merged);
+        // #2292 — at-rest content-seal on the same-id federation-MERGE funnel.
+        // This funnel (found during the #2292 sweep; NOT in the issue's audit
+        // list) rewrites an EXISTING row's `content = $5` with the merged
+        // content but omitted `encrypted_envelope` from the SET — so under an
+        // enabled gate a federation merge OVERWROTE a sealed row's content with
+        // PLAINTEXT and left a STALE ciphertext envelope (desync + leak).
+        // `merge_memory` already resolved every field, so the sealed content +
+        // envelope are written verbatim (no CASE); mirrors the in-place
+        // `update()` seal at ~4947.
+        let (merge_content, merge_envelope) = seal_content_for_insert(&merged)?;
 
         // Full-row UPDATE by id — every column is written verbatim from
         // the already-resolved merged row (NO CASE / GREATEST / COALESCE
@@ -16777,14 +16980,20 @@ impl MemoryStore for PostgresStore {
                 source_span = $20, confidence_source = $21, confidence_signals = $22,
                 confidence_decayed_at = $23, entity_id = $24, persona_version = $25,
                 version = $26, mentioned_entity_id = $27, lifecycle_state = $28,
-                valid_from = $29, valid_until = $30
+                valid_from = $29, valid_until = $30,
+                -- #2292 — the sealed envelope is written in lockstep with
+                -- `content = $5` (both come from the already-resolved `merged`
+                -- row); an encryption-off merge writes plaintext + NULL,
+                -- clearing any stale ciphertext.
+                encrypted_envelope = $31
              WHERE id = $1",
         )
         .bind(&merged.id)
         .bind(merged.tier.as_str())
         .bind(&merged.namespace)
         .bind(&merged.title)
-        .bind(&merged.content)
+        // #2292 — sealed placeholder ("" under an enabled gate, else content).
+        .bind(&merge_content)
         .bind(&tags_json)
         .bind(merged.priority)
         .bind(merged.confidence)
@@ -16822,6 +17031,8 @@ impl MemoryStore for PostgresStore {
         .bind(crate::validate::canonical_valid_time_opt(
             merged.valid_until.as_deref(),
         ))
+        // #2292 — sealed ciphertext envelope ($31); NULL when encryption off.
+        .bind(merge_envelope)
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("merge_inbound full-row update", e))?;
@@ -18888,12 +19099,20 @@ impl MemoryStore for PostgresStore {
         // from the DO UPDATE SET below: a surviving upsert-merge row keeps its
         // own genesis cid.
         let consolidate_cid = crate::identity::cid::stamp_memory_cid(&candidate);
+        // #2292 — at-rest content-seal on the consolidation funnel (the
+        // consolidated `summary` is the derived content). Pre-#2292 this INSERT
+        // bound `summary` PLAINTEXT and omitted `encrypted_envelope`, so a
+        // curator consolidation persisted plaintext under an enabled gate.
+        // Seal via `candidate` (its `content == summary`, its metadata carries
+        // the consolidator `agent_id`). Content arm is unconditional →
+        // envelope moves with it unconditionally on the ON CONFLICT arm.
+        let (consolidate_content, consolidate_envelope) = seal_content_for_insert(&candidate)?;
         let inserted_id: String = sqlx::query_scalar(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, expires_at, metadata,
-                confidence_source, cid, cid_genesis
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, 1.0, $8, $9, $10, $10, $11, $12, $13, $14, $15)
+                confidence_source, cid, cid_genesis, encrypted_envelope
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, 1.0, $8, $9, $10, $10, $11, $12, $13, $14, $15, $16)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 tier = CASE
                     WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
@@ -18901,6 +19120,8 @@ impl MemoryStore for PostgresStore {
                     ELSE memories.tier
                 END,
                 content = EXCLUDED.content,
+                -- #2292 — content + envelope move together (store() parity).
+                encrypted_envelope = EXCLUDED.encrypted_envelope,
                 tags = EXCLUDED.tags,
                 priority = EXCLUDED.priority,
                 confidence = EXCLUDED.confidence,
@@ -18928,7 +19149,8 @@ impl MemoryStore for PostgresStore {
         .bind(tier.as_str())
         .bind(namespace)
         .bind(title)
-        .bind(summary)
+        // #2292 — sealed placeholder ("" under an enabled gate, else summary).
+        .bind(&consolidate_content)
         .bind(&tags_value)
         .bind(max_priority)
         .bind(source)
@@ -18945,6 +19167,8 @@ impl MemoryStore for PostgresStore {
         .bind(candidate.confidence_source.as_str())
         .bind(&consolidate_cid.cid)
         .bind(&consolidate_cid.genesis)
+        // #2292 — sealed ciphertext envelope ($16); NULL when encryption off.
+        .bind(consolidate_envelope)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("consolidate upsert", e))?;
