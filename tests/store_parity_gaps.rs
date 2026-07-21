@@ -1411,6 +1411,49 @@ mod postgres_side {
         );
     }
 
+    /// #2289 — `PostgresStore::store_batch` MUST persist the caller-supplied
+    /// `kind_provenance` (#1945), mirroring `store()` and the sqlite
+    /// trait-default loop. Pre-#2289 the bulk INSERT never listed the
+    /// column, so a batch-stored memory silently dropped its epistemic-typing
+    /// provenance on postgres. Teardown-before-assert (shared DB, #2287).
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_store_batch_persists_kind_provenance_2289() {
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let mut mem = sample_memory(&format!("pg-2289-kp-{run}"));
+        // `kind_provenance` rides `metadata` (extract_kind_provenance).
+        mem.metadata = serde_json::json!({ "kind_provenance": "regex" });
+        let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-2289");
+
+        let ids = MemoryStore::store_batch(&pg, &admin_ctx, std::slice::from_ref(&mem))
+            .await
+            .expect("store_batch");
+        let id = ids[0].clone();
+
+        let kp: Option<String> =
+            sqlx::query_scalar("SELECT kind_provenance FROM memories WHERE id = $1")
+                .bind(&id)
+                .fetch_one(pg.pool())
+                .await
+                .expect("read kind_provenance");
+
+        // Teardown FIRST.
+        let _ = sqlx::query("DELETE FROM memories WHERE id = $1")
+            .bind(&id)
+            .execute(pg.pool())
+            .await;
+
+        assert_eq!(
+            kp.as_deref(),
+            Some("regex"),
+            "#2289: store_batch must persist caller-supplied kind_provenance"
+        );
+    }
+
     /// #228 Commit B — postgres twin of the sqlite fail-closed test. A
     /// row with a non-NULL envelope whose recipient key cannot decrypt
     /// (sealed to agent A but the row names agent B) must FAIL the read

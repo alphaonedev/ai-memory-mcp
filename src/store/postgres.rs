@@ -14039,7 +14039,7 @@ impl MemoryStore for PostgresStore {
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version,
                 mentioned_entity_id, lifecycle_state, encrypted_envelope,
-                cid, cid_genesis,
+                cid, cid_genesis, kind_provenance,
                 valid_from, valid_until
             ) ",
         );
@@ -14183,6 +14183,12 @@ impl MemoryStore for PostgresStore {
                 // order matches the `cid, cid_genesis` column tail above).
                 .push_bind(batch_cid.cid)
                 .push_bind(batch_cid.genesis)
+                // v1.0.0 (#1945 / #2289) — denormalised epistemic-typing
+                // provenance (order matches the `kind_provenance` column above),
+                // derived from `metadata.kind_provenance` (sqlite `db::insert`
+                // parity via `extract_kind_provenance`). Pre-#2289 the bulk
+                // funnel dropped it, silently losing caller provenance on pg.
+                .push_bind(crate::storage::extract_kind_provenance(memory))
                 // v1.0.0 #1834 — claim-bitemporal VALID-TIME (order matches the
                 // `valid_from, valid_until` column tail above), canonicalized
                 // to the fixed UTC rendering at this funnel (pre-ship 3x7).
@@ -14254,7 +14260,11 @@ impl MemoryStore for PostgresStore {
                 -- v0.9.0 G8 (#1825) — cid/cid_genesis OMITTED from DO UPDATE
                 -- SET: surviving row keeps its genesis.
                 -- #1632 (pg twin) — upsert-merge bumps the Gap-1 counter.
-                version = memories.version + 1
+                version = memories.version + 1,
+                -- v1.0.0 (#1945 / #2289) — sqlite + `store()` parity: the
+                -- epistemic-typing provenance follows the incoming write when
+                -- present, else keeps the stored marker (COALESCE).
+                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
             RETURNING id, title, namespace",
         );
 
