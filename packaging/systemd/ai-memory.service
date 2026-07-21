@@ -10,7 +10,10 @@ User=ai-memory
 Group=ai-memory
 ExecStart=/usr/bin/ai-memory serve --host 127.0.0.1 --port 9077
 Restart=on-failure
+RestartPreventExitStatus=75
 RestartSec=5s
+KillSignal=SIGINT
+TimeoutStopSec=90
 
 # State location. The package installer creates /var/lib/ai-memory owned by
 # ai-memory:ai-memory with mode 0750.

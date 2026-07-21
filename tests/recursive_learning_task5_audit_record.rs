@@ -531,8 +531,9 @@ fn source_not_found_does_not_emit_depth_cap_audit() {
 // (9) Audit row's timestamp is ordered: refusal-1 < refusal-2.
 //
 // `list_signed_events` returns rows in ASCENDING timestamp order. Two
-// refusals back-to-back must surface in chronological order so a
-// future operator replay walks the chain forward in time.
+// refusals back-to-back must surface in chronological order for operator
+// presentation and inspection. Cryptographic verification follows sequence
+// and prev_hash, not wall-clock ordering.
 // ─────────────────────────────────────────────────────────────────────
 
 #[test]

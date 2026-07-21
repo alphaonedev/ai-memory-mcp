@@ -65,6 +65,7 @@ dependencies = [
  "criterion",
  "dirs",
  "ed25519-dalek",
+ "fs2",
  "futures-core",
  "gethostname",
  "hex",
@@ -85,6 +86,7 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "rustls",
+ "same-file",
  "schemars",
  "serde",
  "serde_json",
@@ -106,6 +108,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.61.2",
  "wiremock",
  "x25519-dalek",
  "zeroize",
@@ -1535,6 +1538,16 @@ checksum = "73fde052dbfc920003cfd2c8e2c6e6d4cc7c1091538c3a24226cec0665ab08c0"
 dependencies = [
  "autocfg",
  "tokio",
+]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]
@@ -3175,7 +3188,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

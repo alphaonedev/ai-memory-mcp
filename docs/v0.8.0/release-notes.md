@@ -302,11 +302,29 @@ cognitive counterpart in the memory store itself.
   fail-CLOSED on a matched verdict. Sqlite-MCP-only (matches the
   signals/actions posture; HTTP/postgres reads out of scope).
 - **Crash-durable deferred-audit queue ([#1732](https://github.com/alphaonedev/ai-memory-mcp/issues/1732), PE-4).**
-  A `DeferredAuditJournal` (append-only, fsync-per-record shadow file)
+  A `DeferredAuditJournal` (fsync-per-record per-occurrence crash spool)
   durably journals each governance refusal before the in-memory `mpsc`
   send; `recover_deferred_audit` replays un-drained records into
-  `signed_events` at boot (idempotent on `payload_hash`). Wired into both
-  `serve` and `mcp` boot paths.
+  `signed_events` at boot (content-bound and idempotent on stable occurrence
+  ID, with legacy payload-hash cardinality compatibility). Spool entries are
+  atomically published with owner-private permissions (exact effective-UID
+  modes, no lexical symlink ancestors, and root/daemon-owned ancestors on Unix
+  (any group/world-writable ancestor is rejected unless root/daemon ownership
+  plus the sticky bit provides rename containment; macOS extended ACLs must be
+  trivial); protected
+  current-token-owner-only DACLs plus reparse rejection, trusted ancestor
+  owner/delete-authority validation, and retained no-delete-sharing
+  lexical-ancestor/spool handles on Windows), bounded to 4,096 entries / 32
+  MiB, and acknowledged only after durable chain or DLQ residence. Quota
+  exhaustion records bounded timestamp/occurrence/hash overflow evidence and
+  refuses unjournaled delivery; production governance callers propagate that
+  failure and keep the action blocked. Recovery/journal-open failure returns a
+  closed queue rather than a volatile fallback. Wired into both
+  `serve` and `mcp` boot paths. Earlier Windows builds created inherited-DACL
+  artifacts that v1.0.0 intentionally rejects without repair; follow the
+  stop/preserve/inspect/prior-signed-binary recovery/move-aside/restart runbook
+  in `docs/security/audit-trail-coverage.md` before upgrading an installation
+  with an existing deferred-audit journal or spool.
 
 ## Other notable changes
 

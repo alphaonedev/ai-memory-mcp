@@ -2282,7 +2282,7 @@ pub fn rollback_counter_for(signed_head_sequence: i64) -> RollbackWire {
 /// exist (opt-in: a deployment with no enrolled witness key never emits a
 /// witness in the first place). Errors are logged + swallowed by the caller.
 pub fn append_head_anchor(cp: &crate::models::Checkpoint) {
-    if let Err(e) = try_append_head_anchor(cp) {
+    if let Err(e) = try_append_head_anchor(cp, false) {
         tracing::warn!(
             target: AUDIT_TRACE_TARGET,
             "off-table head-anchor append failed (swallowed): {e:#}"
@@ -2290,12 +2290,25 @@ pub fn append_head_anchor(cp: &crate::models::Checkpoint) {
     }
 }
 
-fn try_append_head_anchor(cp: &crate::models::Checkpoint) -> Result<()> {
+/// Append a checkpoint to the off-table anchor and make the append durable.
+///
+/// This is the strict final-certification sibling of [`append_head_anchor`].
+///
+/// # Errors
+/// Returns an error when the custody directory cannot be resolved, or when
+/// serialization, append, file synchronization, or directory synchronization
+/// fails.
+pub fn append_head_anchor_durable(cp: &crate::models::Checkpoint) -> Result<()> {
+    try_append_head_anchor(cp, true)
+}
+
+fn try_append_head_anchor(cp: &crate::models::Checkpoint, durable: bool) -> Result<()> {
     let dir = witness_key_dir()?;
     if !dir.exists() {
         return Ok(());
     }
     let path = dir.join(HEAD_ANCHOR_LOG_FILENAME);
+    let created = !path.exists();
     let line = serde_json::to_string(cp).context("serialise head-anchor checkpoint")?;
     let mut f = OpenOptions::new()
         .create(true)
@@ -2303,6 +2316,25 @@ fn try_append_head_anchor(cp: &crate::models::Checkpoint) -> Result<()> {
         .open(&path)
         .with_context(|| format!("open head-anchor log at {}", path.display()))?;
     writeln!(f, "{line}").context("append head-anchor line")?;
+    if durable {
+        f.sync_all().context("fsync head-anchor log")?;
+        if created {
+            sync_anchor_directory(&dir)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_anchor_directory(dir: &Path) -> Result<()> {
+    File::open(dir)
+        .with_context(|| format!("open head-anchor directory at {}", dir.display()))?
+        .sync_all()
+        .context("fsync head-anchor directory")
+}
+
+#[cfg(not(unix))]
+fn sync_anchor_directory(_dir: &Path) -> Result<()> {
     Ok(())
 }
 
