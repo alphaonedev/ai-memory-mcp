@@ -853,7 +853,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // claim-bitemporal valid_from/valid_until parity arms (the one write
     // funnel that omitted them) + a live-PG store_batch conflict/NULL-retention
     // regression test. Lands postgres.rs at 28_490; ceiling 28_400 -> 28_520.
-    ("src/store/postgres.rs", 28_520),
+    // 2026-07-21 (#2288 + #2289, folded onto the #2280/#2284 valid-time arms):
+    // store_batch also seals content into encrypted_envelope (at-rest
+    // encryption bulk parity) + persists kind_provenance + routes the seal
+    // error through the shared at_rest_seal_err helper — the per-row seal
+    // block, two added INSERT columns + binds, and two more ON CONFLICT arms
+    // (encrypted_envelope + kind_provenance, adjacent to #2280's valid-time
+    // arms) land the merged file at 28_569. Ceiling 28_520 -> 28_600 (+31).
+    ("src/store/postgres.rs", 28_600),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
