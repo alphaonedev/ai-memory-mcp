@@ -366,6 +366,29 @@ mod tests {
     }
 
     #[test]
+    fn read_only_connection_registers_valid_time_projection_2266() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("valid-time.sqlite3");
+        let writer = open(&path).expect("create and migrate database");
+        drop(writer);
+
+        let reader = open_read_only(&path).expect("open read-only database");
+        let (offset, null_value, malformed): (Option<i64>, Option<i64>, Option<i64>) = reader
+            .query_row(
+                "SELECT rfc3339_epoch_micros('2026-01-01T01:00:00+01:00'), \
+                        rfc3339_epoch_micros(NULL), \
+                        rfc3339_epoch_micros('not-rfc3339')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read-only connection must expose valid-time projection");
+
+        assert_eq!(offset, Some(1_767_225_600_000_000));
+        assert_eq!(null_value, None);
+        assert_eq!(malformed, None);
+    }
+
+    #[test]
     fn open_round_trip_creates_db_and_runs_migrations() {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let conn = open(tmp.path()).expect("open initial");

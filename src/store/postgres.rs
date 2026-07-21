@@ -27101,6 +27101,33 @@ mod tests {
             Some("2026-07-19T22:45:01.654321Z"),
             "embedded conflict may close the claim"
         );
+
+        let mut non_clearing = sample_memory(&title, &ns, "valid-conflict-2267", "updated again");
+        non_clearing.valid_from = Some("2040-01-01T00:00:00Z".to_string());
+        non_clearing.valid_until = None;
+        store
+            .store_with_embedding(
+                &ctx,
+                &non_clearing,
+                Some(&embedding),
+                Some("test-space#none"),
+            )
+            .await
+            .expect("embedded NULL-bound conflict");
+        let retained = store
+            .get(&ctx, &id)
+            .await
+            .expect("get retained close bound");
+        assert_eq!(
+            retained.valid_from.as_deref(),
+            Some("2026-07-19T07:34:56.123456Z"),
+            "a later embedded conflict must still preserve genesis"
+        );
+        assert_eq!(
+            retained.valid_until.as_deref(),
+            Some("2026-07-19T22:45:01.654321Z"),
+            "incoming NULL must not erase an existing close bound"
+        );
     }
 
     /// #1607 — postgres twin of the sqlite #1596 touch-TTL extension

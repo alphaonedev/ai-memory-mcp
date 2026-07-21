@@ -24298,6 +24298,8 @@ mod tests {
 
     #[test]
     fn kg_valid_time_compares_instants_without_rewriting_signed_bytes_2266() {
+        use crate::identity::{keypair, sign as link_sign, verify as link_verify};
+
         let conn = test_db();
         let src = make_memory("offset-src", "ns", Tier::Long, 5);
         let target = make_memory("offset-target", "ns", Tier::Long, 5);
@@ -24308,15 +24310,34 @@ mod tests {
         // later merely because its wall-clock hour is `01`.
         let signed_start = "2026-01-01T01:00:00+01:00";
         let signed_end = "2026-01-01T02:00:00+01:00";
-        insert_link_full(
-            &conn,
-            &src.id,
-            &target.id,
-            "related_to",
-            Some(signed_start),
-            Some(signed_end),
-            Some("ai:peer"),
-        );
+        let kp = keypair::generate("ai:peer").expect("generate signing key");
+        let signable = link_sign::SignableLink {
+            src_id: &src.id,
+            dst_id: &target.id,
+            relation: "related_to",
+            observed_by: Some(kp.agent_id.as_str()),
+            valid_from: Some(signed_start),
+            valid_until: Some(signed_end),
+        };
+        let signature = link_sign::sign(&kp, &signable).expect("sign noncanonical-offset link");
+        let created_at = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO memory_links \
+             (source_id, target_id, relation, created_at, valid_from, valid_until, \
+              observed_by, signature, attest_level) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'self_signed')",
+            params![
+                &src.id,
+                &target.id,
+                "related_to",
+                &created_at,
+                signed_start,
+                signed_end,
+                &kp.agent_id,
+                &signature,
+            ],
+        )
+        .expect("insert signed noncanonical-offset link");
 
         let at_half_hour = kg_query(
             &conn,
@@ -24331,6 +24352,29 @@ mod tests {
         assert_eq!(at_half_hour.len(), 1);
         assert_eq!(at_half_hour[0].target_id, target.id);
 
+        let immediately_before_end = kg_query(
+            &conn,
+            &src.id,
+            1,
+            Some("2026-01-01T00:59:59.999999Z"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(immediately_before_end.len(), 1);
+        let at_end = kg_query(
+            &conn,
+            &src.id,
+            1,
+            Some("2026-01-01T01:00:00Z"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(at_end.is_empty(), "valid_until must remain end-exclusive");
+
         let timeline = kg_timeline(
             &conn,
             &src.id,
@@ -24342,6 +24386,28 @@ mod tests {
         assert_eq!(timeline.len(), 1);
         assert_eq!(timeline[0].valid_from, signed_start);
         assert_eq!(timeline[0].valid_until.as_deref(), Some(signed_end));
+
+        let (stored_start, stored_end, stored_signature): (String, String, Vec<u8>) = conn
+            .query_row(
+                "SELECT valid_from, valid_until, signature FROM memory_links \
+                 WHERE source_id = ?1 AND target_id = ?2 AND relation = 'related_to'",
+                params![&src.id, &target.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read signed link after temporal queries");
+        assert_eq!(stored_start, signed_start);
+        assert_eq!(stored_end, signed_end);
+        assert_eq!(stored_signature, signature);
+        let persisted = link_sign::SignableLink {
+            src_id: &src.id,
+            dst_id: &target.id,
+            relation: "related_to",
+            observed_by: Some(kp.agent_id.as_str()),
+            valid_from: Some(stored_start.as_str()),
+            valid_until: Some(stored_end.as_str()),
+        };
+        link_verify::verify(&kp.public, &persisted, &stored_signature)
+            .expect("temporal reads must preserve the authoritative H2 signature");
 
         // The parser projection is integer microseconds, not julianday's
         // floating-point approximation: a one-microsecond boundary remains
