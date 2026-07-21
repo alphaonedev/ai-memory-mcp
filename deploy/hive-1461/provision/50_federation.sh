@@ -114,8 +114,10 @@ ExecStart=$BIN serve \\
   --federation-identity $fed_id \\
   --shutdown-grace-secs 30
 Restart=on-failure
+RestartPreventExitStatus=75
 RestartSec=3
-TimeoutStopSec=45
+KillSignal=SIGINT
+TimeoutStopSec=90
 LimitNOFILE=65536
 
 [Install]

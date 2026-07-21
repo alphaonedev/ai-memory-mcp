@@ -23,6 +23,7 @@
 use crate::models::field_names;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, anyhow};
@@ -34,6 +35,30 @@ use tokio::sync::Semaphore;
 /// Tracing target for the subscription fan-out / DLQ surface
 /// (#1558 tracing-target SSOT).
 const SUBSCRIPTIONS_TRACE_TARGET: &str = "ai_memory::subscriptions";
+
+static DISPATCH_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+struct DispatchInFlightGuard;
+
+impl DispatchInFlightGuard {
+    fn new() -> Self {
+        DISPATCH_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for DispatchInFlightGuard {
+    fn drop(&mut self) {
+        DISPATCH_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Number of webhook deliveries whose async/blocking worker has not yet
+/// completed. The daemon waits for zero before final audit certification.
+#[must_use]
+pub(crate) fn dispatch_in_flight() -> usize {
+    DISPATCH_IN_FLIGHT.load(Ordering::SeqCst)
+}
 
 /// Public-facing subscription record (no secret plaintext).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -434,6 +459,12 @@ pub const RETRY_BACKOFFS: &[std::time::Duration] = &[
 /// retry. Exposed so the integration tests can pin the wall-clock
 /// expectations.
 pub const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Graceful-shutdown budget for already-admitted webhook deliveries. One
+/// delivery may consume four ACK windows plus the retry backoffs (~26.2s), so
+/// this must remain larger than that healthy worst case and below the shipped
+/// systemd stop budget after the other drain phases are included.
+pub(crate) const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// #2032 LM2 — hard ceiling on the webhook ACK response body the daemon
 /// will buffer. The K6 ACK contract is a tiny JSON envelope
@@ -1067,7 +1098,9 @@ pub fn dispatch_event_to_subs(
         // `#[tokio::test]` attaches a runtime to the calling thread.
         if let Some(rt) = handle.as_ref() {
             let permit_sem = dispatch_semaphore();
+            let in_flight = DispatchInFlightGuard::new();
             rt.spawn(async move {
+                let _in_flight = in_flight;
                 // Acquire-then-blocking-step. `acquire_owned` returns
                 // an `OwnedSemaphorePermit` that gets moved into the
                 // blocking task and is dropped when the worker
@@ -1100,7 +1133,11 @@ pub fn dispatch_event_to_subs(
             // only by legacy unit tests that call `dispatch_event`
             // outside `#[tokio::test]`; production daemons always
             // run under `#[tokio::main]`.
-            std::thread::spawn(work);
+            let in_flight = DispatchInFlightGuard::new();
+            std::thread::spawn(move || {
+                let _in_flight = in_flight;
+                work();
+            });
         }
     }
 }
@@ -2264,6 +2301,14 @@ mod tests {
     /// `into_inner` so one panicking test doesn't cascade-fail the
     /// other.
     static SSRF_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn shutdown_budget_covers_one_full_webhook_retry_ladder() {
+        let attempts = u32::try_from(RETRY_BACKOFFS.len() + 1).unwrap();
+        let retry_ladder =
+            ACK_TIMEOUT * attempts + RETRY_BACKOFFS.iter().copied().sum::<std::time::Duration>();
+        assert!(SHUTDOWN_DRAIN_TIMEOUT > retry_ladder);
+    }
 
     #[test]
     fn https_allowed() {

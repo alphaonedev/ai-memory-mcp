@@ -1116,7 +1116,9 @@ pub struct CapabilityApproval {
     /// `signed_events_dlq` (the deferred-audit drainer's dead-letter
     /// queue). Non-zero means at least one storage-hook
     /// `governance.refusal` event failed to chain-log into
-    /// `signed_events` and landed in the DLQ for operator replay.
+    /// `signed_events` and successfully landed in the DLQ for
+    /// chain-aware operator disposition. v1.0.0 has no automatic
+    /// replay sweep or replay CLI.
     /// Default-omitted from the wire when zero so existing dashboards
     /// see no churn on healthy daemons.
     #[serde(default, skip_serializing_if = "is_zero_u64")]

@@ -1237,15 +1237,15 @@ pub fn check_agent_action_no_audit_cached(
 /// audit write to a background tokio task with its OWN
 /// `Connection` (SQLite WAL allows parallel writers).
 ///
-/// On Allow / Warn paths the queue is NOT touched — the
-/// load-bearing audit emit only happens on `Refuse`.
+/// On Allow / Warn paths the queue is NOT touched — the load-bearing audit
+/// emit happens only for blocking `Refuse` or `Escalate` verdicts.
 ///
 /// # Errors
 ///
-/// Returns an error if the rules-table SELECT fails. The deferred
-/// audit submit is fire-and-forget (it never errors out to the
-/// caller; a closed receiver bumps a metric counter and emits a
-/// tracing::warn).
+/// Returns an error if the rules-table SELECT fails or a blocking verdict
+/// cannot be durably admitted to the deferred audit path. Audit-admission
+/// errors are typed as [`AuditAdmissionError`] and must remain fail-closed;
+/// they are not eligible for consultation-error fail-open overrides.
 pub fn check_agent_action_deferred(
     conn: &Connection,
     agent_id: &str,
@@ -1267,7 +1267,9 @@ pub fn check_agent_action_deferred(
 ///
 /// # Errors
 ///
-/// Returns an error if the rules-table SELECT fails.
+/// Returns an error if the rules-table SELECT fails or a blocking verdict
+/// cannot be durably admitted to the deferred audit path. Audit-admission
+/// errors are typed as [`AuditAdmissionError`] and remain fail-closed.
 pub fn check_agent_action_deferred_cached(
     conn: &Connection,
     cache: Option<&RuleCache>,
@@ -1280,10 +1282,26 @@ pub fn check_agent_action_deferred_cached(
     // PE-5) to the deferred audit queue. `submit_refusal` enqueues
     // any blocking verdict; Allow / Warn are not chain-logged here.
     if decision.is_blocking() {
-        queue.submit_refusal(agent_id, action, &decision);
+        if !queue.submit_refusal(agent_id, action, &decision) {
+            return Err(AuditAdmissionError.into());
+        }
     }
     Ok(decision)
 }
+
+/// Typed marker ensuring an audit-path failure cannot be mistaken for a rule
+/// consultation error and passed through the operator's consultation-only
+/// fail-open escape hatch.
+#[derive(Debug)]
+pub struct AuditAdmissionError;
+
+impl std::fmt::Display for AuditAdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(crate::governance::deferred_audit::AUDIT_ADMISSION_FAILED)
+    }
+}
+
+impl std::error::Error for AuditAdmissionError {}
 
 /// Convenience for tests + the future K10 wiring: count how many
 /// rules match the given action without running side effects.
@@ -2155,6 +2173,62 @@ mod tests {
             "write-path governance gate must not synchronously sign on ALLOW; \
              per-row Ed25519 signing belongs off the request thread"
         );
+    }
+
+    #[test]
+    fn deferred_blocking_verdict_preserves_typed_audit_admission_failure() {
+        let _forensic = forensic_lock();
+        let _no_pubkey = no_operator_pubkey();
+        let conn = fresh_conn();
+        add_rule(
+            &conn,
+            "R-audit",
+            "bash",
+            r#"{"command_substring":"blocked"}"#,
+            "refuse",
+            true,
+        );
+        let (queue, receiver) = crate::governance::deferred_audit::DeferredAuditQueue::new();
+        drop(receiver);
+        let action = AgentAction::Bash {
+            command: "blocked".into(),
+            cwd: None,
+        };
+        let error = check_agent_action_deferred_cached(&conn, None, "agent:typed", &action, &queue)
+            .unwrap_err();
+        assert!(error.downcast_ref::<AuditAdmissionError>().is_some());
+    }
+
+    #[test]
+    fn deferred_escalation_is_admitted_to_audit_queue() {
+        let _forensic = forensic_lock();
+        let _no_pubkey = no_operator_pubkey();
+        let conn = fresh_conn();
+        add_rule(
+            &conn,
+            "E-audit",
+            "bash",
+            r#"{"command_substring":"review"}"#,
+            "escalate",
+            true,
+        );
+        let (queue, mut receiver) = crate::governance::deferred_audit::DeferredAuditQueue::new();
+        let action = AgentAction::Bash {
+            command: "review this".into(),
+            cwd: None,
+        };
+
+        let decision =
+            check_agent_action_deferred(&conn, "agent:escalated", &action, &queue).unwrap();
+        assert!(matches!(
+            decision,
+            Decision::Escalate { ref rule_id, .. } if rule_id == "E-audit"
+        ));
+        let event = receiver
+            .try_recv()
+            .expect("blocking escalation must enter the deferred audit queue");
+        assert_eq!(event.agent_id, "agent:escalated");
+        assert_eq!(event.rule_id(), Some("E-audit"));
     }
 
     #[test]

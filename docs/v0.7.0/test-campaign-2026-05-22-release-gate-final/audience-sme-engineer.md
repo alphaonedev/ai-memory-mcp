@@ -3,6 +3,11 @@ layout: doc
 ---
 # v0.7.0 Release-Gate Final Testing — SME / Engineer / Architect Briefing
 
+> Historical record: the `signed_events_dlq` replay recipe discussed below
+> was a v0.7 campaign artifact and is not a v1.0.0 replay facility. v1.0.0
+> retains chain-or-DLQ/spool evidence for operator disposition, ships no
+> automatic replay path or replay CLI, and keeps DLQ timestamps as `TEXT`.
+
 ## Verdict
 
 **SHIP-RECOMMENDED.** 7,321 passed / 0 failed / 0 ignored across 269

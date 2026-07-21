@@ -45,7 +45,8 @@ use ai_memory::governance::audit as witness;
 use ai_memory::models::ConditionType;
 use ai_memory::signed_events::{
     CauseBinding, HeadHashCheck, SignedEvent, TruncationCheck, WitnessCheck, append_signed_event,
-    canonical_chain_bytes, force_emit_audit_head_witness, payload_hash, verify_audit_trail,
+    canonical_chain_bytes, force_emit_audit_head_witness, payload_hash,
+    try_force_emit_audit_head_witness, verify_audit_trail,
 };
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
@@ -435,7 +436,8 @@ fn run_shutdown_flush(db: &ai_memory::handlers::Db) {
         .enable_all()
         .build()
         .expect("tokio runtime")
-        .block_on(ai_memory::daemon_runtime::shutdown_witness_flush_and_checkpoint(db));
+        .block_on(ai_memory::daemon_runtime::shutdown_witness_flush_and_checkpoint(db))
+        .unwrap();
 }
 
 #[test]
@@ -509,15 +511,65 @@ fn daemon_shutdown_path_wires_the_witness_flush() {
     ))
     .expect("read daemon_runtime.rs");
     assert!(
-        src.contains("shutdown_witness_flush_and_checkpoint(&checkpoint_state)"),
+        src.contains("shutdown_witness_flush_and_checkpoint(&certification_state)"),
         "serve()'s post-quiesce shutdown block must call \
          shutdown_witness_flush_and_checkpoint"
     );
     assert!(
-        src.contains("force_emit_audit_head_witness(&lock.0)"),
+        src.contains("try_force_emit_audit_head_witness(&lock.0)"),
         "the shutdown flush helper must force-emit the audit-head witness \
          before the final WAL checkpoint"
     );
+}
+
+#[test]
+fn strict_shutdown_witness_rejects_corrupt_enrolled_custody() {
+    let _g = lock();
+    let kdir = fresh_dir("strict-corrupt-keys");
+    let ddir = fresh_dir("strict-corrupt-db");
+    let _kp = enrol_witness(kdir.path());
+    let (_path, conn) = open_db(ddir.path());
+    append_rows(&conn, 1);
+
+    std::fs::write(
+        kdir.path()
+            .join(format!("{}.priv", witness::WITNESS_KEY_LABEL)),
+        b"corrupt",
+    )
+    .expect("corrupt enrolled witness private key");
+
+    let error = try_force_emit_audit_head_witness(&conn)
+        .expect_err("strict shutdown certification must reject corrupt custody");
+    assert!(
+        error
+            .to_string()
+            .contains("custody is enrolled but unloadable"),
+        "unexpected error: {error:#}"
+    );
+    clear_witness_env();
+}
+
+#[test]
+fn strict_shutdown_witness_propagates_anchor_append_failure() {
+    let _g = lock();
+    let kdir = fresh_dir("strict-anchor-keys");
+    let ddir = fresh_dir("strict-anchor-db");
+    let _kp = enrol_witness(kdir.path());
+    let (_path, conn) = open_db(ddir.path());
+    append_rows(&conn, 1);
+
+    // A directory at the log path deterministically makes OpenOptions fail,
+    // including when tests run with elevated filesystem privileges.
+    std::fs::create_dir(kdir.path().join(witness::HEAD_ANCHOR_LOG_FILENAME))
+        .expect("install anchor-path fault");
+
+    let error = try_force_emit_audit_head_witness(&conn)
+        .expect_err("strict shutdown certification must propagate anchor failure");
+    assert!(
+        error.to_string().contains("open head-anchor log"),
+        "unexpected error: {error:#}"
+    );
+    clear_witness_env();
 }
 
 // ── (g) grep-guard: the pg append chokepoint references the emitters ──

@@ -57,9 +57,16 @@ use common::*;
 // Test helpers
 // ---------------------------------------------------------------------------
 
-/// Tempdir helper — honors TMPDIR per the project hard rule.
+/// Tempdir helper pinned to repository-owned scratch space.
 fn fresh_tempdir() -> tempfile::TempDir {
-    tempfile::tempdir().expect("tempdir under TMPDIR")
+    let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(".local-runs")
+        .join("test-tmp");
+    std::fs::create_dir_all(&scratch).expect("create repository-owned test scratch");
+    tempfile::Builder::new()
+        .prefix("governance-deferred-")
+        .tempdir_in(scratch)
+        .expect("repository-owned governance tempdir")
 }
 
 /// Seed a `memory_write` refuse rule into the `governance_rules` table
@@ -210,7 +217,7 @@ async fn drainer_does_not_block_inserts() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 3 — supervisor records panic metric on drainer panic
+// Test 3 — supervisor retains receiver and restarts after sink panic
 // ---------------------------------------------------------------------------
 
 /// Sink that panics on the Nth append. Used to exercise the
@@ -246,27 +253,47 @@ async fn drainer_restarts_after_panic() {
         metrics.clone(),
         1,
     );
-    // Submit one event; the sink panics on call 0.
+    // Submit one event; the sink panics on call 0 and must retry it
+    // with a freshly-built sink while retaining the receiver.
     let event = DeferredAuditEvent::from_refusal(
         "agent:panic",
         &refusal_action(),
         &refusal_decision("R-panic", "panic test"),
     )
     .unwrap();
-    queue.submit(event);
+    assert!(queue.submit(event));
 
-    // The supervisor must observe the panic, record it, and exit.
-    let _ = tokio::time::timeout(Duration::from_secs(2), supervisor)
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while metrics.panic_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("supervisor must observe the injected panic");
+
+    // Exercise the same queue after recovery, then require shutdown
+    // to drain both the retried and post-restart events.
+    let later = DeferredAuditEvent::from_refusal(
+        "agent:after-restart",
+        &refusal_action(),
+        &refusal_decision("R-panic", "panic test"),
+    )
+    .unwrap();
+    assert!(queue.submit(later));
+    close_and_flush(queue, supervisor)
         .await
-        .expect("supervisor must exit after observing panic");
+        .expect("recovered supervisor must drain and exit cleanly");
+
     assert_eq!(
         metrics.panic_count(),
         1,
         "exactly one panic must be recorded"
     );
-    assert!(
-        call_count.load(Ordering::SeqCst) >= 1,
-        "sink must have been invoked before the panic"
+    assert_eq!(metrics.appended_count(), 2, "both events must land");
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        3,
+        "panic + retry + post-restart append"
     );
 }
 

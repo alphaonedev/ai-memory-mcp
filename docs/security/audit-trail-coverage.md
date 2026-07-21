@@ -3,20 +3,20 @@ layout: doc
 ---
 # Cryptographic Forensic Audit Trail — Coverage Matrix
 
-**Status as of branch `feat/v0.7.0-grand-slam` (HEAD `12a7f29`,
-2026-05-14, post fold-J audit pass).** Updated to reflect that PE-1
-(#694) / PE-2 (#695) / PE-3 (#696) all merged on the grand-slam branch
-(commits `cb6cca9` / `5392162` / `07b4957` respectively).
+**Status: v1.0.0 pre-ship release branch (updated 2026-07-19).** This is the
+current coverage statement for the cryptographic forensic audit trail.
+Historical v0.7.0 PE-1/PE-2/PE-3 milestones remain linked below; shipped and
+current behavior is described by the matrix and sections that follow.
 
-This doc is the v0.7.0 honest single source of truth for the
-cryptographic forensic audit trail. It is the substrate-side companion
+This document is the substrate-side companion
 to [`audit-trail.md`](./audit-trail.html) (which documents the on-disk
 JSON audit log surface — a different and complementary subsystem).
 
 Where this doc says "the chain", it means the SQLite/Postgres
 `signed_events` table — the append-only, hash-chained, optionally
-Ed25519-signed event store the substrate itself maintains. The
-v0.8.0 epic (**#697**) drives this chain to 100% coverage.
+Ed25519-signed event store the substrate itself maintains. The #697 coverage
+program is partially complete; shipped and remaining items are identified
+explicitly.
 
 Cross-references:
 
@@ -37,34 +37,39 @@ The cryptographic forensic audit trail provides **tamper-evident
 provenance for every substrate-visible action that crosses a
 governance decision boundary**. A regulator or procurement auditor
 can, given the database and the operator public key, walk the chain
-end to end and verify:
+end to end and verify successfully admitted substrate events. For a blocking
+governance verdict whose durable admission fails, the action remains blocked;
+quota exhaustion leaves bounded hash-based evidence rather than a full
+chain row. The auditor can verify:
 
-- Every refusal verdict the engine produced.
+- Every refusal verdict durably admitted to the audit path.
 - Every approval-API decision.
 - Every reflection write with cross-peer provenance.
 - Every schema migration the substrate applied.
 
-Out of scope (closed by v0.8.0 **#697**): out-of-band agent actions
-the substrate cannot see, hard-crash-lost rows in the deferred queue,
-and read-action visibility. See §4.
+Still out of scope / incomplete under **#697**: out-of-band agent actions the
+substrate cannot see, plus the intentional read-gate audit-availability gap
+(engaged read decisions are best-effort logged). Hard-crash loss for
+successfully admitted deferred events was closed by PE-4's durable spool and
+recovery-before-live path. See §4.
 
 ---
 
 ## 2. Coverage matrix
 
-| Event class | Current logging status at `c359e89` | `signed_events` row shape | Known gaps | v0.8.0 issue |
+| Event class | Current logging status | `signed_events` row shape | Known gaps | v0.8.0 issue |
 |---|---|---|---|---|
 | Cross-row chain integrity | **Chain-logged today** (v0.7.0 V-4 closeout, #698) — every row carries `prev_hash` + `sequence`; [`verify_chain`](../../src/signed_events.rs) walks every row and flags chain breaks | `prev_hash BLOB` = SHA-256 over [`canonical_chain_bytes`](../../src/signed_events.rs) of the preceding row (ZERO_HASH for first); `sequence INTEGER` monotonic from 1, pinned by UNIQUE index | DELETE row N is detected at row N+1's prev_hash check; raw row-pruning operators must accept the documented chain break | — |
 | Memory writes (`store` / `update` / `link` / `delete` / `archive` / `consolidate`) | **Chain-logged today** via `signed_events.append` (`src/signed_events.rs`) on every successful substrate write | `event_type = "memory.<verb>"`, `payload_hash` over canonical-JSON of the post-write row, `signature` (Ed25519 over `payload_hash`), `attest_level` ∈ {`unsigned`, `signed`} | none for the success leg | — |
 | Reflection writes | **Chain-logged today** with `peer_origin` for cross-peer paths (L2-2 commit `2aef248`) | `event_type = "reflection.write"`, payload binds `(source_ids, depth, peer_origin)` | none | — |
 | Governance refusals on agent-EXTERNAL surface (Bash / Write / Network / ProcessSpawn / Custom) via `check_agent_action` (audited path) | **Chain-logged today** synchronously, every call | `event_type = "governance.check"`, `payload_hash` over canonical `{action, decision}` JSON, `agent_id` carrier set | none | — |
-| Governance refusals on substrate-INTERNAL pre-write hook (`check_agent_action_no_audit`) | **Chain-logged today** via PE-3 deferred queue (merged commit `07b4957`) | identical shape to the audited path — same canonical bytes / payload hash; emit deferred via tokio drain task in `src/governance/deferred_audit.rs::install_deferred_audit_drainer` | hard-crash drainer loss (process-local queue); see V08-PE-4 | **#697** V08-PE-4 closes durability (V08 closeout) |
+| Governance refusals on substrate-INTERNAL pre-write hook (`check_agent_action_no_audit`) | **Chain-logged and crash-durable after successful admission** via PE-3 + PE-4 | `event_type = "governance.refusal"`; payload hash binds canonical `{action, decision, agent_id, timestamp, occurrence_id}`; admitted occurrences are spooled before queue delivery and acknowledged only after chain/DLQ residence | quota exhaustion stores bounded timestamp/occurrence/payload-hash evidence instead of the full event; other admission/recovery failures emit operational errors and keep the queue/action closed without promising a marker | **#697** V08-PE-4 shipped |
 | Approval-API decisions (L1-8) | **Chain-logged today** | `event_type = "approval.<decision>"`, binds approver identity + decision + correlation id | none | — |
 | Schema migrations | **Chain-logged today** at boot | `event_type = "schema.migration"`, binds from-version + to-version + migration filename hash | none | — |
-| Read actions (`memory_recall` / `memory_search` / `memory_list` / `memory_get` / `memory_session_boot`) | **NOT chain-logged** at engine level. Handler-layer `AuditAction::Recall` etc. row is emitted to the JSON audit log per [`audit-trail.md`](./audit-trail.html), but no `signed_events` row | n/a — v0.8.0 adds `event_type = "governance.read_check"` once V08-PE-2 lands | engine has no `AgentAction::Read` variant at HEAD | **#697** V08-PE-2 |
-| Subprocess actions from Bash spawn chain (fork→exec under a permitted shell) | **NOT visible** to the engine at HEAD | n/a — v0.8.0 adds eBPF/dtrace surface and `event_type = "process.spawn_chain"` | invisible to the substrate without a kernel-side probe | **#697** V08-PE-3 |
-| Out-of-band agent actions | **Unenforceable by definition** | n/a — substrate has no visibility | partial mitigations: V08-PE-1 mandatory-hook + V08-PE-6 TPM-bound binary integrity | **#697** V08-PE-1, V08-PE-6 |
-| Hard-crash-lost deferred events | **Gap** — process-local queue | rows drop silently on SIGKILL between verdict and drain | persistent on-disk queue closes the gap | **#697** V08-PE-4 |
+| Read actions (`memory_recall` / `memory_search` / `memory_list` / `memory_get` / `memory_session_boot`) | **Governance-evaluable today.** With enabled `read_action` rules, each decision is best-effort chain-logged; the zero-rule fast path emits nothing | `event_type = "governance.check"`, canonical action is `AgentAction::Read { surface, namespace, query }` plus the decision | audit-append failure logs a warning and the read proceeds by intentional split fail-posture; a blocking rule verdict itself remains fail-closed | **#697** V08-PE-2 shipped |
+| Subprocess actions from Bash spawn chain (fork→exec under a permitted shell) | **NOT visible** to the engine | n/a — a future kernel-side probe would emit `event_type = "process.spawn_chain"` | invisible to the substrate without a kernel-side probe | **#697** V08-PE-3 |
+| Out-of-band agent actions | **Unenforceable by definition** | n/a — substrate has no visibility | shipped partial mitigation: V08-PE-1 mandatory-hook presence; future mitigation: V08-PE-6 TPM-bound binary integrity | **#697** V08-PE-1, V08-PE-6 |
+| Hard-crash-lost deferred events | **Closed for admitted occurrences by PE-4** — persistent per-occurrence spool | recovery replays content-bound occurrences before hooks go live; stable occurrence IDs make retry idempotent; artifacts require exact effective-UID modes, no lexical symlink ancestors, and root/daemon-owned lexical/resolved ancestors on Unix (any group/world-writable ancestor is rejected unless root/daemon ownership plus the sticky bit provides rename containment; macOS artifacts require trivial extended ACLs, while ancestors additionally permit deny-only ACLs), or a protected current-token-owner-only DACL plus reparse rejection, trusted owner/delete-authority ACL validation, and retained no-delete-sharing handles for every lexical ancestor and the spool on Windows | spool is bounded to 4,096 entries / 32 MiB; quota exhaustion blocks the action and records bounded overflow evidence, while other unavailable-admission failures block and emit operational errors | **#697** V08-PE-4 shipped |
 
 ---
 
@@ -81,11 +86,14 @@ sequence-ascending order. For each row:
 2. Recompute `SHA-256(canonical_chain_bytes(row N-1))` and compare
    against row N's stored `prev_hash`. Mismatch flags a chain break
    at row N.
-3. When `signature` is present and `attest_level = signed`, verify
-   the Ed25519 signature against the operator-issued (or per-agent-
-   issued) verifying key.
+3. When `signature` is present and `attest_level = signed`, attempt Ed25519
+   verification with the configured daemon verifier or enrolled recorder
+   verifier. Rows without an applicable configured key are skipped rather
+   than treated as signature failures.
 
-Exits 0 on chain GREEN; 1 on chain break. `--since <sequence>`
+Exits 0 when the cross-row chain holds; 1 on a chain break. Signature failures
+are reported separately and do not currently determine this chain-only exit
+status. `--since <sequence>`
 skips already-verified rows. `--format json` emits a
 machine-parseable
 [`signed_events::ChainVerificationReport`](../../src/signed_events.rs)
@@ -115,7 +123,7 @@ them direct database access.
 ### 3.4 Raw `signed_events` query example
 
 ```sql
--- Every refusal verdict, newest first, for a given agent
+-- Every synchronous governance decision, newest first, for a given agent
 SELECT id, agent_id, event_type, payload_hash, attest_level, timestamp
 FROM signed_events
 WHERE event_type = 'governance.check'
@@ -123,21 +131,26 @@ WHERE event_type = 'governance.check'
 ORDER BY timestamp DESC
 LIMIT 100;
 
--- Refusal-only filter — decode the payload_hash row by row through
--- the canonical_bytes path; or pair with the `governance.check_dropped`
--- counter once V08-PE-4 lands.
+-- `signed_events` stores a one-way SHA-256 digest, not the decision preimage,
+-- so SQL alone cannot filter these rows by Allow/Warn/Refuse/Escalate. To
+-- verify a row, hash an independently retained canonical `{action, decision}`
+-- preimage and compare the digest. Deferred `governance.refusal` rows instead
+-- bind `{action, decision, agent_id, timestamp, occurrence_id}`. Separately
+-- inspect the private spool's bounded `.overflow-*` evidence and startup ERROR
+-- diagnostics for quota-exhausted refusals that stayed blocked.
 ```
 
-The canonical-bytes recipe is stable across versions. A future audit
-tool that wants to recompute hashes without the substrate binary can
-follow `governance/agent_action.rs::canonical_bytes` plus the
-matching emit in `emit_check_event`.
+The canonical-byte recipes are stable across versions. Recomputing a digest
+without the substrate binary requires the original canonical preimage from an
+independent evidence source; follow `governance/agent_action.rs` plus
+`emit_check_event` for synchronous checks, or
+`DeferredAuditEvent::canonical_bytes` for deferred refusals.
 
 ---
 
 ## 4. What's chain-logged today
 
-Comprehensive list, all shipped at HEAD `c359e89`:
+Comprehensive list for the current release branch:
 
 - **Cross-row chain integrity** (v0.7.0 V-4 closeout, #698) — every
   `signed_events` row carries `prev_hash BLOB` (SHA-256 over the
@@ -157,14 +170,63 @@ Comprehensive list, all shipped at HEAD `c359e89`:
   `check_agent_action` (the audited path) — every Bash /
   FilesystemWrite / NetworkRequest / ProcessSpawn / Custom check
   emits one row, regardless of decision (`Allow` / `Warn` /
-  `Refuse`).
+  `Refuse` / `Escalate`).
+- **Read-action governance** on the five MCP read surfaces via
+  `AgentAction::Read`. When `read_action` rules are enabled, decisions use the
+  synchronous `governance.check` path; audit append is best-effort and an
+  append failure does not convert an otherwise permitted read into a denial.
+  Blocking `Refuse` / `Escalate` decisions remain blocked. The zero-rule fast
+  path emits no row.
+- **Storage-hook blocking verdicts** via the PE-3/PE-4 deferred path.
+  Successfully admitted occurrences are fsync-spooled before queue delivery
+  and acknowledged only after `signed_events` or DLQ residence. Admission or
+  recovery failure remains fail-closed; internal spool-quota exhaustion
+  records bounded overflow evidence.
 - **Approval-API decisions** (L1-8) — every operator approval /
   rejection of a pending action emits a `signed_events` row.
 - **Schema migrations** — every `signed_events` table migration
   itself emits a row at boot identifying the from-version /
   to-version transition.
 
-### 4.1 v0.7.0 V-4 closeout — SQL-side hash chain
+### 4.1 Windows upgrade recovery for legacy deferred-audit artifacts
+
+The v1.0.0 Windows policy deliberately rejects deferred-audit journals,
+`.spool` directories, locks, and spool children created by earlier builds with
+inherited or otherwise noncanonical DACLs. Rejection is fail-closed and does
+not repair, import, or delete those artifacts: a formerly broad DACL could
+have allowed another local account to plant evidence.
+
+Before upgrading a Windows installation that has deferred-audit artifacts:
+
+1. Stop every `ai-memory` process that can access the database.
+2. Preserve a forensic copy of the legacy journal and its adjacent `.spool`
+   directory. Inspect the spool for pending `.event`, `.pending`, `.probe`, and
+   `.overflow-*` evidence before changing anything.
+3. Do not edit the old ACLs and then trust the files in place. If pending
+   evidence is trusted and must be recovered, replay it with the previously
+   deployed, signed binary while the installation is isolated, then stop that
+   binary again. v1.0.0 has no offline ACL migration/import command.
+4. After evidence disposition, move—not silently delete—the complete legacy
+   journal and `.spool` directory to the forensic holding location.
+5. Start v1.0.0. It creates each new journal, spool, lock, and child artifact
+   with the protected current-token-owner-only policy. Retain the moved legacy
+   evidence according to the site's audit-retention procedure.
+
+An opening error after upgrade is therefore an operator-visible evidence
+disposition event, not a prompt to grant broader permissions or auto-repair
+the old tree.
+
+On Windows, a token that already holds a live `WRITE_DAC`, `WRITE_OWNER`, or
+equivalent security-control handle acquired under an earlier ACL is treated as
+having privileged control of that storage namespace. The ancestor checks fail
+closed on every such grant visible in the current DACL, but Windows does not
+provide a share mode that revokes a handle authorized before validation.
+Operators must therefore provision the database beneath a daemon-, SYSTEM-,
+Administrators-, or TrustedInstaller-controlled tree before exposing it to an
+untrusted local account; suspected prior ACL compromise requires the same
+stop/isolate/forensic-disposition procedure above.
+
+### 4.2 v0.7.0 V-4 closeout — SQL-side hash chain
 
 The v0.7.0 [Policy Engine](https://github.com/alphaonedev/ai-memory-mcp/issues/693)
 validation pass flagged V-4 (substrate-authority cross-row chain
@@ -176,7 +238,7 @@ inline:
 | Property | Surface | Verification |
 |---|---|---|
 | Row-level append-only | Rust API surface, no public mutators | `signed_events::tests::append_only_invariant_no_mutators_in_src` |
-| Per-row Ed25519 signature | `signed_events.signature` (filled when the writer holds a keypair) | `verify-reflection-chain` (for reflection rows); planned signature-leg in `verify-signed-events-chain --verify-signatures` |
+| Per-row Ed25519 signature | `signed_events.signature` (filled when the writer holds a keypair) | `verify-signed-events-chain` reports applicable daemon/recorder signature failures separately from its chain-only exit status; `verify-reflection-chain` verifies reflection-edge signatures |
 | **Cross-row hash chain** (this closeout) | `signed_events.prev_hash` + `signed_events.sequence` (v34/v33) | `verify-signed-events-chain` walks every row, reports chain GREEN or first break |
 | JSONL portable chain | `<audit_dir>/audit.log` line-by-line | `ai-memory audit verify` |
 
@@ -194,12 +256,15 @@ per-row Ed25519 signatures remain as defense-in-depth.
 
 ---
 
-## 5. What's NOT chain-logged today
+## 5. Remaining gaps and qualified coverage
 
-Cold-honest gaps, every one tracked at **#697**:
+The current release does not claim complete visibility or guaranteed
+audit-row admission for every event:
 
-- **Read actions** (recall / search / list / get / session_boot). The
-  engine has no `AgentAction::Read` variant. V08-PE-2 adds it.
+- **Read audit availability.** Read actions are governance-evaluable, but
+  audit append is intentionally best-effort and the zero-rule fast path emits
+  nothing. This is an audit-availability limitation, not a governance bypass:
+  blocking verdicts remain fail-closed.
 - **Subprocess actions from a Bash spawn chain.** A `Bash` rule
   fires against the literal argv the harness proposes. A
   fork+exec inside a permitted shell is born inside the kernel
@@ -209,108 +274,64 @@ Cold-honest gaps, every one tracked at **#697**:
 - **Out-of-band agent actions.** Unenforceable by definition. The
   substrate cannot gate an action that never crosses the harness or
   daemon boundary. Partial mitigations: V08-PE-1 mandatory-hook
-  profile (procurement-tier daemon refuses to serve when the
-  PreToolUse hook is uninstalled); V08-PE-6 TPM-bound binary
-  integrity (daemon attests the shipping binary against a signed
-  manifest at boot).
-- **Storage-hook refusals — PE-3 merged at HEAD `12a7f29` (#696,
-  commit `07b4957`).** A refusal at the `storage::insert` pre-write
-  hook short-circuits the SQL with no row written and emits
-  `MemoryError::RefusedByGovernance` to the caller; PE-3 makes this
-  refusal also typed AND chain-logged via the deferred queue
-  (`src/governance/deferred_audit.rs::install_deferred_audit_drainer`)
-  — the in-flight write transaction releases its lock before the
-  audit row writes so deadlock is structurally impossible. The
-  handler-layer `AuditAction::Store` row on the failure leg is also
-  emitted to the JSON audit log per [`audit-trail.md`](./audit-trail.html).
-  Hard-crash loss is the only remaining gap (process-local queue),
-  closed by V08-PE-4 in v0.8.0.
-- **Hard-crash-lost deferred events.** PE-3's queue is
-  process-local. A SIGKILL / OOM / power loss between the verdict
-  and the drain task's `append_signed_event` call loses pending
-  rows. V08-PE-4 closes the gap with a persistent on-disk queue
-  durable across daemon restart.
+  profile (procurement-tier daemon refuses to serve when the PreToolUse hook is
+  uninstalled). Future mitigation V08-PE-6 would add TPM-bound binary integrity
+  and boot attestation against a signed manifest.
+- **Deferred-audit admission failures.** PE-4 closes hard-crash loss for
+  successfully admitted occurrences. It cannot promise a full chain/DLQ row
+  when durable admission itself fails. The governed action remains blocked;
+  internal quota exhaustion leaves bounded
+  timestamp/occurrence/payload-hash evidence, while other failures emit
+  operational errors.
 
 ---
 
 ## 6. Verification
 
-An auditor verifies the chain end to end with three independent
-checks. v0.8.0 V08-PE-8 (**#697**) ships `ai-memory
-verify-audit-trail` to do all three mechanically:
+`ai-memory verify-audit-trail [--since <RFC3339>] [--json]` is the shipped
+operator verifier. It walks the `signed_events` cross-row hash chain,
+preserves verification across a `--since` window boundary, enumerates sequence
+gaps, and returns 0 only when `AuditTrailReport::is_clean()`. The report also
+surfaces the implemented off-table head/truncation, witness, role-separation,
+identity-lineage, rollback, and cause-binding checks when configured.
 
-1. **Monotonic sequence check.** Every `signed_events` row carries a
-   per-process monotonic sequence number. The verifier asserts
-   strictly-increasing order. A gap surfaces as a precise row id and
-   "expected N, got N+k" diagnostic.
-2. **Ed25519 signature check per row.** When the row's `attest_level`
-   is `signed`, the verifier recomputes the canonical bytes and
-   verifies the signature against the operator-issued (or
-   per-agent-issued) verifying key. A failure surfaces the row id
-   and the verifying key id.
-3. **Cross-reference against the expected event surface.** The
-   verifier walks the substrate state (memories, links, approvals,
-   migrations) and asserts that every state-changing event has a
-   matching `signed_events` row. A missing row is a coverage
-   regression. The current V08-PE-8 design produces a JSON
-   "completeness report" with the missing event class enumerated.
-
-The v0.8.0 verifier closes the loop. Today, the equivalent check is
-manual: combine `ai-memory verify-reflection-chain` (steps 1 + 2) with
-a hand-cranked cross-reference against the expected event surface for
-step 3.
+It does not reconstruct missing event preimages, verify that every substrate
+state change has a matching audit row, or presently promise per-row Ed25519
+verification. Those coverage/completeness checks require independently
+retained evidence or dedicated companion tooling. `ai-memory
+verify-signed-events-chain` remains the lower-level sequence-scoped chain walk;
+`ai-memory verify-reflection-chain` verifies reflection ancestry/signatures.
 
 ---
 
 ## 7. Severity classification
 
-Current verdict shapes — `src/governance/agent_action.rs::Decision`:
+Current `src/governance/agent_action.rs::Decision` variants are `Allow`,
+`Warn { rule_id, reason }`, `Refuse { rule_id, reason }`, and
+`Escalate { rule_id, reason }`.
 
-- **Allow.** Action proceeds. The audited path still emits a
-  `governance.check` row for the audit chain.
-- **Warn { rule_id, reason }.** Action proceeds with a logged
-  warning. `signed_events` row records the warning rule_id.
-- **Refuse { rule_id, reason }.** Action blocked. `signed_events`
-  row records the refusal rule_id.
-
-v0.8.0 V08-PE-5 (**#697**) adds **Escalate { rule_id, prompt }** —
-ambiguous decisions open an operator approval slot. The Escalate
-verdict pairs with the L1-8 Approval-API surface (already shipped):
-when an Escalate fires, the substrate emits a `pending_action` row,
-the operator dashboard surfaces it, and the operator's
-allow/deny decision joins the audit chain. The current verdict
-vocabulary has no provision for this — V08-PE-5 closes the gap.
+- `Allow` and `Warn` permit the action.
+- `Refuse` and `Escalate` are blocking decisions (`Decision::is_blocking`).
+- Synchronous evaluated decisions use the `governance.check` event path.
+- Deferred storage-hook blocking occurrences use `governance.refusal` after
+  successful durable admission.
 
 ---
 
 ## 8. Operator response surface
 
-What happens when audit-trail integrity is compromised — i.e. when
-`ai-memory verify-reflection-chain` exits non-zero or when an
-external SIEM detects a row mismatch:
+When `ai-memory verify-audit-trail`, `verify-signed-events-chain`, or
+`verify-reflection-chain` reports an integrity failure, the command returns a
+non-zero result and identifies the implemented failing check and available
+row/sequence context. Operators should retain the database and companion audit
+artifacts, stop relying on the affected chain as trusted evidence, and
+investigate against independently retained witnesses or forensic exports.
 
-1. **The verifier surfaces the precise failure.** Row id, failure
-   mode (sequence gap / hash mismatch / signature failure /
-   missing-row coverage gap), recovered row count up to the failure.
-2. **A `tracing::error!` log line fires** at the same shape used by
-   the L1-6 tampered-signature path. The line is structured for
-   SIEM ingest.
-3. **The substrate refuses to emit further `signed_events` rows
-   until the operator clears the alert.** This is the
-   chain-corruption response: rather than continue writing rows
-   downstream of a known-bad point in the chain (which would taint
-   the recovery path), the daemon logs a hard error and the
-   write path consults the `signed_events` health gate. Storage
-   writes still proceed for normal (non-audit-chain-bound)
-   operations, but every governance check fails closed
-   (Refuse with `audit_chain_corrupted` reason) until the
-   operator runs the recovery verb.
-
-The recovery verb is operator-side. The audit-chain integrity
-property is single-direction: once compromised, only an
-operator-with-physical-access can restore the chain to a known-good
-state (typically by truncating to the last verified row and re-issuing
-the operator key).
+The current release does not claim that running a verifier automatically
+freezes subsequent writes, repairs missing rows, reconstructs event preimages,
+or authorizes destructive chain truncation. Recovery is an operator-controlled
+forensic procedure whose safe action depends on the reported failure and the
+independent evidence available.
 
 ---
 
@@ -466,31 +487,32 @@ no-peer-header default-deny.
 
 ## 10. Forward roadmap
 
-Eight sub-tasks under **#697** drive 100% coverage. Each closes one
-row in §2:
+Eight sub-tasks under **#697** define the coverage program. Current status:
 
-- **V08-PE-1** Mandatory-hook profile — closes "out-of-band agent
-  actions" partially.
-- **V08-PE-2** Read-action gating — closes the "Read actions" row.
+- **V08-PE-1 — SHIPPED.** Mandatory-hook presence profile partially
+  mitigates out-of-band actions.
+- **V08-PE-2 — SHIPPED.** Read-action gating covers the five MCP read
+  surfaces with the documented best-effort audit posture.
 - **V08-PE-3** Subprocess-chain visibility — closes the "subprocess
   actions" row.
-- **V08-PE-4** Persistent audit queue — closes the "hard-crash
-  drainer loss" row.
-- **V08-PE-5** Severity-based human escalation — adds the Escalate
-  verdict, closes the "no human escalation" gap.
+- **V08-PE-4 — SHIPPED.** Persistent audit queue closes the former
+  "hard-crash drainer loss" row with bounded durable admission,
+  recovery-before-live, and fail-closed overflow handling.
+- **V08-PE-5 — SHIPPED.** Severity-based human escalation adds the
+  fail-closed `Escalate` verdict.
 - **V08-PE-6** TPM-bound binary integrity — closes the "out-of-band"
   row's last partial mitigation.
 - **V08-PE-7** Refuse-by-default profile — flips the seed rules from
   `enabled = 0` to `enabled = 1, attest_level = operator_signed` for
   procurement-tier deployments.
-- **V08-PE-8** `ai-memory verify-audit-trail` — closes the
-  end-to-end verification loop (steps 1 + 2 + 3 in §6).
+- **V08-PE-8 — SHIPPED.** `ai-memory verify-audit-trail` provides the
+  operator chain/gap and configured integrity report described in §6.
 
 Effort: 22–28 sessions · 3–4 weeks wall-clock · MEDIUM-HIGH risk.
 Tracking: **#697**.
 
 ---
 
-*Document classification: Public-facing OSS audit-trail coverage
-matrix. v0.7.0 Option B single source of truth for the cryptographic
-forensic chain. Updated at every §16-style integration gate.*
+*Document classification: Public-facing OSS audit-trail coverage matrix for
+the current v1.0.0 pre-ship release branch. Historical milestones are labeled;
+current claims are updated at each integration gate.*
