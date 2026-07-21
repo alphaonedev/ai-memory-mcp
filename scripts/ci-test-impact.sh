@@ -83,8 +83,12 @@ is_foundational() {
         src/lib.rs|src/main.rs|src/validate.rs|src/profile.rs|src/errors.rs|src/identity.rs|src/identity/*) return 0 ;;
         # Configuration + boot
         src/config.rs|src/config/*|src/daemon_runtime.rs|src/bootloader.rs) return 0 ;;
-        # Schema migrations (every test touching the DB depends on these)
-        src/storage/migrations.rs|src/storage/migration_meta.rs|src/storage/mod.rs) return 0 ;;
+        # Schema migrations + the sqlite substrate (every test touching the
+        # DB depends on these). #1802 R-05: the storage/mod.rs monolith is
+        # being split into src/storage/ submodules — the whole directory
+        # stays foundational (dir-glob, mirrors src/identity/*) so the split
+        # never weakens the "storage changes force the full suite" invariant.
+        src/storage/*) return 0 ;;
         migrations/*|migrations/**) return 0 ;;
         # SAL trait surface (touches every store consumer)
         src/store/mod.rs) return 0 ;;
