@@ -11853,6 +11853,7 @@ pub fn list_archived(
 /// (this commit wires sqlite only).
 pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
+    let _erasure_guard = crate::erasure::archive_sync::coordination_lock_if_enabled(conn)?;
     conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
     let result = (|| -> Result<bool> {
         let exists: bool = conn
@@ -12003,7 +12004,7 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
         // idempotent). Edges whose other endpoint is permanently gone are
         // correctly skipped (the FK would reject them).
         restore_links_for_memory(conn, id)?;
-        conn.execute("DELETE FROM archived_memories WHERE id = ?1", params![id])?;
+        conn.execute(SQL_DELETE_ARCHIVED_BY_ID, params![id])?;
         Ok(true)
     })();
     match result {
@@ -12047,6 +12048,7 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
 /// surface cannot be used to probe other owners' archived ids.
 pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
+    let _erasure_guard = crate::erasure::archive_sync::coordination_lock_if_enabled(conn)?;
     conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
     let result = (|| -> Result<bool> {
         // Owner gate: row must exist AND match the caller (or be an
@@ -12204,7 +12206,7 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
         // #1771 — re-insert the preserved edge graph (both-endpoints-exist,
         // idempotent). See [`restore_archived`] for the contract.
         restore_links_for_memory(conn, id)?;
-        conn.execute("DELETE FROM archived_memories WHERE id = ?1", params![id])?;
+        conn.execute(SQL_DELETE_ARCHIVED_BY_ID, params![id])?;
         Ok(true)
     })();
     match result {
@@ -12315,30 +12317,59 @@ fn load_archived_as_memory(conn: &Connection, id: &str) -> Result<Memory> {
 /// resurrectable from shards). Returns empty — and runs NO query — when no
 /// bundle directory exists on disk, so purge stays byte-identical for
 /// deployments that never enabled the cold tier.
+const SQL_DELETE_ARCHIVED_BY_ID: &str = "DELETE FROM archived_memories WHERE id = ?1";
+
 fn erasure_purge_candidate_ids(
     conn: &Connection,
     where_clause: &str,
     sql_params: &[&dyn rusqlite::types::ToSql],
-) -> Vec<String> {
-    if crate::erasure::archive_sync::store_if_dir_present(conn).is_none() {
-        return Vec::new();
-    }
+) -> Result<Vec<String>> {
     let sql = format!("SELECT id FROM archived_memories WHERE {where_clause}");
-    let collect = || -> Result<Vec<String>> {
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(sql_params, |r| r.get::<_, String>(0))?;
-        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(sql_params, |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// Execute one archive purge under the cold-tier store's cross-process
+/// exclusion domain. Candidate selection and deletion share one IMMEDIATE
+/// transaction, and only the exact journaled ids are deleted. Without an
+/// existing cold-tier store this keeps the historical direct DELETE path.
+fn purge_archive_matching(
+    conn: &Connection,
+    where_clause: &str,
+    sql_params: &[&dyn rusqlite::types::ToSql],
+) -> Result<usize> {
+    let Some(store) = crate::erasure::archive_sync::store_if_dir_present(conn) else {
+        let sql = format!("DELETE FROM archived_memories WHERE {where_clause}");
+        return Ok(conn.execute(&sql, sql_params)?);
     };
-    match collect() {
-        Ok(ids) => ids,
-        Err(e) => {
+    // Lock acquisition precedes BEGIN IMMEDIATE. Detached sweep/reconcile code
+    // uses a dedicated connection and never waits on the handler mutex while
+    // holding this guard, avoiding DB-lock/file-lock inversion.
+    let _guard = store
+        .lock_exclusive()
+        .map_err(|e| anyhow::anyhow!("erasure purge coordination lock failed: {e}"))?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let bundle_ids = erasure_purge_candidate_ids(&tx, where_clause, sql_params)?;
+    store
+        .journal_purge_intent(&bundle_ids)
+        .map_err(|e| anyhow::anyhow!("erasure purge-intent journal failed: {e}"))?;
+    let mut deleted = 0usize;
+    for id in &bundle_ids {
+        deleted += tx.execute(SQL_DELETE_ARCHIVED_BY_ID, [id])?;
+    }
+    tx.commit()?;
+    for id in &bundle_ids {
+        if let Err(error) = store.remove(id) {
             tracing::warn!(
-                "erasure purge-candidate scan failed (orphaned bundles are reaped by the \
-                 gc-tick reconciliation pass, NOT a later purge): {e:#}"
+                target: crate::erasure::store::ERASURE_TRACE_TARGET,
+                bundle_id = %id,
+                %error,
+                "erasure cold tier: purged row bundle removal failed; marker retained for reconciliation"
             );
-            Vec::new()
         }
     }
+    Ok(deleted)
 }
 
 pub fn purge_archive(conn: &Connection, older_than_days: Option<i64>) -> Result<usize> {
@@ -12351,26 +12382,9 @@ pub fn purge_archive(conn: &Connection, older_than_days: Option<i64>) -> Result<
         }
         Some(days) => {
             let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
-            let bundle_ids = erasure_purge_candidate_ids(conn, "archived_at < ?1", &[&cutoff]);
-            // #2064 F1 — record destruction intent BEFORE the DELETE so the
-            // reconciler HARD-reaps these (not quarantine) if a crash orphans
-            // a bundle between here and remove_bundles_best_effort.
-            crate::erasure::archive_sync::journal_purge_intent(conn, &bundle_ids)?;
-            let deleted = conn.execute(
-                "DELETE FROM archived_memories WHERE archived_at < ?1",
-                params![cutoff],
-            )?;
-            crate::erasure::archive_sync::remove_bundles_best_effort(conn, &bundle_ids);
-            Ok(deleted)
+            purge_archive_matching(conn, "archived_at < ?1", &[&cutoff])
         }
-        None => {
-            let bundle_ids = erasure_purge_candidate_ids(conn, "1=1", &[]);
-            // #2064 F1 — journal destruction intent before the DELETE.
-            crate::erasure::archive_sync::journal_purge_intent(conn, &bundle_ids)?;
-            let deleted = conn.execute("DELETE FROM archived_memories", [])?;
-            crate::erasure::archive_sync::remove_bundles_best_effort(conn, &bundle_ids);
-            Ok(deleted)
-        }
+        None => purge_archive_matching(conn, "1=1", &[]),
     }
 }
 
@@ -12409,7 +12423,7 @@ pub fn purge_archive_for_caller(
         }
         Some(days) => {
             let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
-            let bundle_ids = erasure_purge_candidate_ids(
+            purge_archive_matching(
                 conn,
                 "archived_at < ?1 \
                    AND ( \
@@ -12417,40 +12431,14 @@ pub fn purge_archive_for_caller(
                      json_extract(metadata, '$.target_agent_id') = ?2 \
                    )",
                 &[&cutoff, &caller],
-            );
-            // #2064 F1 — journal destruction intent before the DELETE.
-            crate::erasure::archive_sync::journal_purge_intent(conn, &bundle_ids)?;
-            let deleted = conn.execute(
-                "DELETE FROM archived_memories \
-                 WHERE archived_at < ?1 \
-                   AND ( \
-                     json_extract(metadata, '$.agent_id') = ?2 OR \
-                     json_extract(metadata, '$.target_agent_id') = ?2 \
-                   )",
-                params![cutoff, caller],
-            )?;
-            crate::erasure::archive_sync::remove_bundles_best_effort(conn, &bundle_ids);
-            Ok(deleted)
+            )
         }
-        None => {
-            let bundle_ids = erasure_purge_candidate_ids(
-                conn,
-                "json_extract(metadata, '$.agent_id') = ?1 OR \
+        None => purge_archive_matching(
+            conn,
+            "json_extract(metadata, '$.agent_id') = ?1 OR \
                    json_extract(metadata, '$.target_agent_id') = ?1",
-                &[&caller],
-            );
-            // #2064 F1 — journal destruction intent before the DELETE.
-            crate::erasure::archive_sync::journal_purge_intent(conn, &bundle_ids)?;
-            let deleted = conn.execute(
-                "DELETE FROM archived_memories \
-                 WHERE \
-                   json_extract(metadata, '$.agent_id') = ?1 OR \
-                   json_extract(metadata, '$.target_agent_id') = ?1",
-                params![caller],
-            )?;
-            crate::erasure::archive_sync::remove_bundles_best_effort(conn, &bundle_ids);
-            Ok(deleted)
-        }
+            &[&caller],
+        ),
     }
 }
 

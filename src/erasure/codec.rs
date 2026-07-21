@@ -51,6 +51,11 @@ pub const MANIFEST_FORMAT_VERSION: u32 = 1;
 /// but the cold tier's bundles are per-archived-row and small.
 pub const MAX_SHARDS_PER_KIND: usize = 256;
 
+/// Maximum reconstructed payload accepted from an on-disk bundle. Archived
+/// rows are normally far smaller; this generous ceiling keeps hostile but
+/// internally-consistent manifests from requesting unbounded memory.
+pub const MAX_BUNDLE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+
 /// The (k, m) erasure-coding parameters: `k` data shards + `m` parity
 /// shards; any `k` of the `k + m` reconstruct the payload exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,7 +320,7 @@ pub fn encode_bundle(
 
 /// Validate a manifest's internal consistency before trusting any of its
 /// geometry for reconstruction.
-fn validate_manifest(manifest: &BundleManifest) -> Result<(), ErasureError> {
+pub(crate) fn validate_manifest(manifest: &BundleManifest) -> Result<(), ErasureError> {
     if manifest.codec != CODEC_ID {
         return Err(ErasureError::UnknownCodec {
             found: manifest.codec.clone(),
@@ -348,7 +353,26 @@ fn validate_manifest(manifest: &BundleManifest) -> Result<(), ErasureError> {
             ),
         });
     }
-    let capacity = (manifest.data_shards as u64).saturating_mul(manifest.shard_size as u64);
+    if manifest.shard_size > MAX_BUNDLE_PAYLOAD_BYTES {
+        return Err(ErasureError::ManifestMalformed {
+            reason: format!(
+                "shard_size {} exceeds limit {MAX_BUNDLE_PAYLOAD_BYTES}",
+                manifest.shard_size
+            ),
+        });
+    }
+    let capacity = (manifest.data_shards as u64)
+        .checked_mul(manifest.shard_size as u64)
+        .ok_or_else(|| ErasureError::ManifestMalformed {
+            reason: "data-shard capacity overflow".to_string(),
+        })?;
+    if capacity > MAX_BUNDLE_PAYLOAD_BYTES as u64 {
+        return Err(ErasureError::ManifestMalformed {
+            reason: format!(
+                "data-shard capacity {capacity} exceeds limit {MAX_BUNDLE_PAYLOAD_BYTES}"
+            ),
+        });
+    }
     if manifest.payload_len > capacity {
         return Err(ErasureError::ManifestMalformed {
             reason: format!(
@@ -452,7 +476,12 @@ pub fn reconstruct_bundle(
         usize::try_from(manifest.payload_len).map_err(|_| ErasureError::ManifestMalformed {
             reason: format!("payload_len {} exceeds usize", manifest.payload_len),
         })?;
-    let mut payload = Vec::with_capacity(k * manifest.shard_size);
+    let payload_capacity =
+        k.checked_mul(manifest.shard_size)
+            .ok_or_else(|| ErasureError::ManifestMalformed {
+                reason: "payload allocation size overflow".to_string(),
+            })?;
+    let mut payload = Vec::with_capacity(payload_capacity);
     for i in 0..k {
         if let Some(bytes) = valid[i] {
             payload.extend_from_slice(bytes);

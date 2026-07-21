@@ -41,13 +41,14 @@ use std::collections::HashMap;
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
 use rusqlite::types::{Value, ValueRef};
+use rusqlite::{Connection, OptionalExtension as _};
 
-use super::store::{ERASURE_TRACE_TARGET, ErasureStore};
+use super::store::{ERASURE_TRACE_TARGET, ErasureStore, read_bounded_state_file};
 use super::{
     ENV_ERASURE_DIR, erasure_cold_tier_enabled, recover_quarantine_enabled, resolve_erasure_params,
 };
@@ -117,6 +118,40 @@ const PAYLOAD_KEY_B64: &str = "$b64";
 const ARCHIVED_TABLE: &str = "archived_memories";
 const SWEEP_FRONTIER_STATE_FILE: &str = ".sweep-frontier.json";
 const RECONCILE_CURSOR_STATE_FILE: &str = ".reconcile-cursor";
+const POISON_RETRY_STATE_FILE: &str = ".sweep-poison-retry.json";
+const REPAIR_RETRY_STATE_FILE: &str = ".sweep-repair-retry.json";
+const MAX_FRONTIER_STATE_BYTES: u64 = 4096;
+const MAX_CURSOR_STATE_BYTES: u64 = 128;
+const MAX_POISON_STATE_BYTES: u64 = 1024 * 1024;
+
+static TEST_PAUSE_BEFORE_PUBLISH_LOCK: AtomicBool = AtomicBool::new(false);
+static TEST_REACHED_BEFORE_PUBLISH_LOCK: AtomicBool = AtomicBool::new(false);
+
+/// Deterministic integration-test barrier for the stale-snapshot publication
+/// race. Production callers never enable it.
+#[doc(hidden)]
+pub fn set_pause_before_publish_lock_for_tests(enabled: bool) {
+    TEST_REACHED_BEFORE_PUBLISH_LOCK.store(false, Ordering::SeqCst);
+    TEST_PAUSE_BEFORE_PUBLISH_LOCK.store(enabled, Ordering::SeqCst);
+}
+
+/// Whether a sweep is paused after preparing a bundle but before acquiring
+/// the transition lock.
+#[doc(hidden)]
+#[must_use]
+pub fn reached_before_publish_lock_for_tests() -> bool {
+    TEST_REACHED_BEFORE_PUBLISH_LOCK.load(Ordering::SeqCst)
+}
+
+#[doc(hidden)]
+pub fn reset_lock_attempts_for_tests() {
+    super::store::reset_lock_attempts_for_tests();
+}
+
+#[doc(hidden)]
+pub fn lock_attempts_for_tests() -> usize {
+    super::store::lock_attempts_for_tests()
+}
 
 /// Report from one sweep pass.
 #[derive(Debug, Default, Clone, Copy)]
@@ -190,6 +225,32 @@ pub fn store_if_dir_present(conn: &Connection) -> Option<ErasureStore> {
     }
 }
 
+/// Test-only coordination seam: hold the exact per-store OS exclusion guard
+/// used by sweep publication, purge, and reconciliation. The opaque return
+/// type prevents callers from manipulating the underlying file handle.
+#[doc(hidden)]
+pub fn coordination_lock_for_tests(conn: &Connection) -> Result<impl Drop> {
+    let store =
+        store_for_conn(conn)?.ok_or_else(|| anyhow::anyhow!("erasure cold tier is not enabled"))?;
+    store
+        .lock_exclusive()
+        .map_err(|error| anyhow::anyhow!("erasure coordination lock failed: {error}"))
+}
+
+/// Acquire the transition guard when the cold tier is enabled. Restore
+/// funnels call this BEFORE `BEGIN IMMEDIATE`, matching purge's lock order.
+pub(crate) fn coordination_lock_if_enabled(
+    conn: &Connection,
+) -> Result<Option<super::store::CoordinationGuard>> {
+    let Some(store) = store_for_conn(conn)? else {
+        return Ok(None);
+    };
+    store
+        .lock_exclusive()
+        .map(Some)
+        .map_err(|error| anyhow::anyhow!("erasure coordination lock failed: {error}"))
+}
+
 /// In-process cache of the DURABLE keyset resume frontier per store dir: the `(archived_at,
 /// id)` of the last CONTIGUOUSLY current-or-bundled row the sweep reached, so
 /// an already-bundled prefix is not re-probed (a filesystem stat + manifest
@@ -209,18 +270,39 @@ fn reconcile_cursors() -> &'static Mutex<HashMap<PathBuf, usize>> {
 }
 
 fn read_frontier(dir: &Path) -> Option<(String, String)> {
-    let bytes = std::fs::read(dir.join(SWEEP_FRONTIER_STATE_FILE)).ok()?;
+    let bytes = read_bounded_state_file(
+        &dir.join(SWEEP_FRONTIER_STATE_FILE),
+        MAX_FRONTIER_STATE_BYTES,
+    )?;
     serde_json::from_slice(&bytes).ok()
 }
 
 fn persist_gc_state(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     let path = dir.join(name);
-    let staging = dir.join(format!(".tmp-gc-state-{name}-{}", std::process::id()));
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&staging)?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let staging = dir.join(format!(
+        ".tmp-gc-state-{name}-{}-{nonce}",
+        std::process::id()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options.open(&staging)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
@@ -253,10 +335,12 @@ fn next_reconcile_start(dir: &Path, step: usize, len: usize) -> usize {
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     let cursor = cursors.entry(dir.to_path_buf()).or_insert_with(|| {
-        std::fs::read_to_string(dir.join(RECONCILE_CURSOR_STATE_FILE))
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0)
+        read_bounded_state_file(
+            &dir.join(RECONCILE_CURSOR_STATE_FILE),
+            MAX_CURSOR_STATE_BYTES,
+        )
+        .and_then(|bytes| std::str::from_utf8(&bytes).ok()?.trim().parse().ok())
+        .unwrap_or(0)
     });
     let start = *cursor % len;
     *cursor = cursor.wrapping_add(step);
@@ -291,9 +375,29 @@ struct PoisonState {
     skip: VecDeque<String>,
     /// Membership index of the skip-set (the authoritative "is this poison?").
     skip_index: HashSet<String>,
+    /// Durable poison ids scheduled for one retry after THIS process loads
+    /// them. Cleared after the attempt but kept in `skip` on failure so the
+    /// next real process restart tries again without re-failing every tick.
+    restart_retry_pending: HashSet<String>,
 }
 
 impl PoisonState {
+    fn from_durable(dir: &Path) -> Self {
+        let ids: Vec<String> =
+            read_bounded_state_file(&dir.join(POISON_RETRY_STATE_FILE), MAX_POISON_STATE_BYTES)
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+        let mut state = Self::default();
+        for id in ids.into_iter().take(POISON_SKIP_SET_CAP) {
+            if super::store::validate_bundle_id(&id).is_ok() && state.skip_index.insert(id.clone())
+            {
+                state.restart_retry_pending.insert(id.clone());
+                state.skip.push_back(id);
+            }
+        }
+        state
+    }
+
     fn is_skipped(&self, id: &str) -> bool {
         self.skip_index.contains(id)
     }
@@ -323,9 +427,85 @@ impl PoisonState {
     }
 
     /// A successful bundle clears any sub-threshold failure streak for `id`.
-    fn record_success(&mut self, id: &str) {
+    fn record_success(&mut self, id: &str) -> bool {
         self.fail_counts.remove(id);
+        let removed = self.skip_index.remove(id);
+        if removed {
+            self.skip.retain(|candidate| candidate != id);
+            self.restart_retry_pending.remove(id);
+        }
+        removed
     }
+}
+
+fn persist_poison_retries(dir: &Path, state: &PoisonState) {
+    let Ok(bytes) = serde_json::to_vec(&state.skip) else {
+        return;
+    };
+    if let Err(error) = persist_gc_state(dir, POISON_RETRY_STATE_FILE, &bytes) {
+        tracing::warn!(
+            target: ERASURE_TRACE_TARGET,
+            state_path = %dir.join(POISON_RETRY_STATE_FILE).display(),
+            %error,
+            "erasure sweep: failed to persist poison retry set"
+        );
+    }
+}
+
+fn repair_retry_ids(dir: &Path) -> Vec<String> {
+    read_bounded_state_file(&dir.join(REPAIR_RETRY_STATE_FILE), MAX_POISON_STATE_BYTES)
+        .and_then(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| super::store::validate_bundle_id(id).is_ok())
+        .take(POISON_SKIP_SET_CAP)
+        .collect()
+}
+
+/// Caller holds the store coordination lock. Returns `true` only when this
+/// exact id is already durable or was fsync'd successfully; callers must keep
+/// the purge marker on capacity/I/O failure.
+fn enqueue_repair_retry(dir: &Path, id: &str) -> bool {
+    let mut ids = repair_retry_ids(dir);
+    if ids.iter().any(|candidate| candidate == id) {
+        return true;
+    }
+    if ids.len() >= POISON_SKIP_SET_CAP {
+        tracing::warn!(
+            target: ERASURE_TRACE_TARGET,
+            bundle_id = %id,
+            "erasure sweep: aborted-purge retry queue is full; retaining purge marker"
+        );
+        return false;
+    }
+    ids.push(id.to_string());
+    let Ok(bytes) = serde_json::to_vec(&ids) else {
+        return false;
+    };
+    match persist_gc_state(dir, REPAIR_RETRY_STATE_FILE, &bytes) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                target: ERASURE_TRACE_TARGET,
+                bundle_id = %id,
+                %error,
+                "erasure sweep: failed to persist aborted-purge retry; retaining purge marker"
+            );
+            false
+        }
+    }
+}
+
+fn clear_repair_retry(store: &ErasureStore, id: &str) -> bool {
+    let Ok(_guard) = store.lock_exclusive() else {
+        return false;
+    };
+    let mut ids = repair_retry_ids(store.dir());
+    ids.retain(|candidate| candidate != id);
+    let Ok(bytes) = serde_json::to_vec(&ids) else {
+        return false;
+    };
+    persist_gc_state(store.dir(), REPAIR_RETRY_STATE_FILE, &bytes).is_ok()
 }
 
 /// Process-static poison registry, keyed by store dir (the [`sweep_frontier`]
@@ -358,19 +538,35 @@ fn is_poison(dir: &Path, id: &str) -> bool {
     poison_registry()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .get(dir)
-        .is_some_and(|state| state.is_skipped(id))
+        .entry(dir.to_path_buf())
+        .or_insert_with(|| PoisonState::from_durable(dir))
+        .is_skipped(id)
+}
+
+fn poison_retry_ids(dir: &Path) -> Vec<String> {
+    let mut registry = poison_registry()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let state = registry
+        .entry(dir.to_path_buf())
+        .or_insert_with(|| PoisonState::from_durable(dir));
+    state.restart_retry_pending.drain().collect()
 }
 
 /// Record a bundling failure for `(dir, id)`; returns `true` when the id is
 /// newly promoted into the skip-set this call.
 fn record_bundle_failure(dir: &Path, id: &str) -> bool {
-    poison_registry()
+    let mut registry = poison_registry()
         .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+        .unwrap_or_else(PoisonError::into_inner);
+    let state = registry
         .entry(dir.to_path_buf())
-        .or_default()
-        .record_failure(id)
+        .or_insert_with(|| PoisonState::from_durable(dir));
+    let promoted = state.record_failure(id);
+    if promoted {
+        persist_poison_retries(dir, state);
+    }
+    promoted
 }
 
 /// Clear any sub-threshold failure streak for `(dir, id)` after a successful
@@ -380,7 +576,9 @@ fn record_bundle_success(dir: &Path, id: &str) {
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     if let Some(state) = reg.get_mut(dir) {
-        state.record_success(id);
+        if state.record_success(id) {
+            persist_poison_retries(dir, state);
+        }
     }
 }
 
@@ -394,6 +592,7 @@ pub fn reset_process_static_sweep_state_for_dir(dir: &Path) {
     clear_process_caches_for_tests(dir);
     let _ = std::fs::remove_file(dir.join(SWEEP_FRONTIER_STATE_FILE));
     let _ = std::fs::remove_file(dir.join(RECONCILE_CURSOR_STATE_FILE));
+    let _ = std::fs::remove_file(dir.join(POISON_RETRY_STATE_FILE));
 }
 
 /// One paced sweep pass: bundle up to `limit` committed archived rows that
@@ -434,6 +633,71 @@ pub fn sweep_archive_bundles(
 ) -> Result<SweepReport> {
     let mut report = SweepReport::default();
     let key = store.dir().to_path_buf();
+    // A stale purge marker can be cleared by any process after an aborted
+    // purge. This shared queue is consulted on every tick (independent of the
+    // cached monotone frontier), so another process cannot re-persist a stale
+    // frontier and strand the surviving row.
+    for id in repair_retry_ids(&key).into_iter().take(limit) {
+        let archived_at = conn
+            .query_row(
+                "SELECT archived_at FROM archived_memories WHERE id = ?1",
+                [&id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        if archived_at
+            .as_ref()
+            .is_some_and(|stamp| bundle_is_current(store, &id, stamp.as_deref()))
+        {
+            // A prior pass published successfully but could not compact the
+            // retry file. Do not charge the paced work budget forever.
+            let _ = clear_repair_retry(store, &id);
+            continue;
+        }
+        match bundle_one_row(conn, store, &id) {
+            Ok(true) => {
+                report.bundled += 1;
+                clear_repair_retry(store, &id);
+            }
+            Ok(false) => report.skipped_purge_intent += 1,
+            Err(error) => {
+                report.failed += 1;
+                tracing::warn!(
+                    target: ERASURE_TRACE_TARGET,
+                    bundle_id = %id,
+                    %error,
+                    "erasure sweep: aborted-purge retry still fails"
+                );
+            }
+        }
+    }
+    // Durable poison retries run independently of the monotone frontier. A
+    // real process restart reloads this bounded set, so a repaired poison row
+    // behind the persisted frontier self-heals without rewinding the corpus.
+    for id in poison_retry_ids(&key)
+        .into_iter()
+        .take(limit.saturating_sub(report.bundled + report.failed))
+    {
+        match bundle_one_row(conn, store, &id) {
+            Ok(true) => {
+                report.bundled += 1;
+                record_bundle_success(&key, &id);
+            }
+            Ok(false) => {
+                report.skipped_purge_intent += 1;
+                record_bundle_success(&key, &id);
+            }
+            Err(error) => {
+                report.failed += 1;
+                tracing::warn!(
+                    target: ERASURE_TRACE_TARGET,
+                    bundle_id = %id,
+                    %error,
+                    "erasure sweep: durable poison retry still fails"
+                );
+            }
+        }
+    }
     let (front_at, front_id) = {
         let mut frontiers = sweep_frontier()
             .lock()
@@ -455,6 +719,13 @@ pub fn sweep_archive_bundles(
             Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
         })
         .context("erasure sweep: archive scan")?;
+    // Materialize one bounded page and release the SELECT statement before
+    // publishing anything. Otherwise SQLite can keep this connection in the
+    // scan's WAL snapshot and make bundle_one_row's post-lock recheck stale.
+    let rows = rows
+        .take(SWEEP_PROBE_BUDGET_PER_TICK + POISON_SKIP_SET_CAP)
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
     let mut advanced: Option<(String, String)> = None;
     let mut failed_seen = false;
     let mut probed = 0usize;
@@ -465,7 +736,7 @@ pub fn sweep_archive_bundles(
         if report.bundled + report.failed >= limit || probed >= SWEEP_PROBE_BUDGET_PER_TICK {
             break;
         }
-        let (id, archived_at) = row.context("erasure sweep: archive scan row")?;
+        let (id, archived_at) = row;
         // #2225 — a row already recorded as POISON (>= POISON_FAILURE_THRESHOLD
         // consecutive failures this process) is PASSED OVER: not re-attempted,
         // not charged against the probe budget (a cheap in-memory lookup, not a
@@ -630,15 +901,47 @@ fn archived_row_payload(conn: &Connection, id: &str) -> Result<(Vec<u8>, serde_j
 
 /// Bundle one committed archived row into the store.
 fn bundle_one_row(conn: &Connection, store: &ErasureStore, id: &str) -> Result<bool> {
-    // Destruction intent outranks a stale DB snapshot held by a racing sweep.
-    // The marker is not compacted until the row AND bundle are gone (#2246).
+    // Expensive encode + shard fsync happen before entering the publication
+    // exclusion domain. Nothing under the temp directory is serving-visible.
+    let (payload, meta) = archived_row_payload(conn, id)?;
+    let expected_archived_at = meta.get(ARCHIVED_AT).cloned().unwrap_or_default();
+    let prepared = store
+        .prepare_put(id, &payload, meta)
+        .map_err(|e| anyhow::anyhow!("bundle preparation failed: {e}"))?;
+    if TEST_PAUSE_BEFORE_PUBLISH_LOCK.load(Ordering::SeqCst) {
+        TEST_REACHED_BEFORE_PUBLISH_LOCK.store(true, Ordering::SeqCst);
+        while TEST_PAUSE_BEFORE_PUBLISH_LOCK.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+    }
+
+    // The short critical section closes the purge-marker ABA: purge and
+    // marker compaction participate in the same per-store OS lock. Re-read
+    // the durable DB row after locking so a stale WAL snapshot can never be
+    // published after DELETE (or after an id was re-archived at a new stamp).
+    let _guard = store
+        .lock_exclusive()
+        .map_err(|e| anyhow::anyhow!("bundle publication lock failed: {e}"))?;
     if store.is_purge_intended(id) {
         return Ok(false);
     }
-    let (payload, meta) = archived_row_payload(conn, id)?;
+    let current_archived_at: Option<Option<String>> = conn
+        .query_row(
+            "SELECT archived_at FROM archived_memories WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("erasure publication: recheck archived row")?;
+    let Some(current_archived_at) = current_archived_at else {
+        return Ok(false);
+    };
+    if serde_json::to_value(current_archived_at)? != expected_archived_at {
+        anyhow::bail!("archived row {id} changed while its bundle was prepared; retrying");
+    }
     store
-        .put(id, &payload, meta)
-        .map_err(|e| anyhow::anyhow!("bundle write failed: {e}"))?;
+        .publish_prepared(prepared)
+        .map_err(|e| anyhow::anyhow!("bundle publication failed: {e}"))?;
     Ok(true)
 }
 
@@ -874,7 +1177,16 @@ fn row_exists(conn: &Connection, table: &str, id: &str) -> rusqlite::Result<bool
 /// DURABLE archived row so it is whole BEFORE a reconstruct ever needs it.
 /// Returns whether a re-mint happened.
 fn scrub_one(conn: &Connection, store: &ErasureStore, id: &str) -> Result<bool> {
-    match store.get(id) {
+    // `get` may self-heal a within-budget degraded bundle. Serialize that
+    // rewrite with purge/publication; drop the guard before `bundle_one_row`,
+    // which acquires the same lock after preparing its replacement.
+    let recovered = {
+        let _guard = store
+            .lock_exclusive()
+            .map_err(|e| anyhow::anyhow!("scrub coordination lock failed: {e}"))?;
+        store.get(id)
+    };
+    match recovered {
         // Verified (or self-healed within budget) — nothing to do.
         Ok(Some(_)) | Ok(None) => Ok(false),
         Err(_) => Ok(bundle_one_row(conn, store, id)?),
@@ -894,11 +1206,37 @@ fn scrub_one(conn: &Connection, store: &ErasureStore, id: &str) -> Result<bool> 
 /// - un-journaled otherwise → QUARANTINE (preserve + hide; never destroy),
 ///   with a LOUD WARN naming the recovery knob.
 fn reconcile_one_rowless(
+    conn: &Connection,
     store: &ErasureStore,
     id: &str,
     recover_mode: bool,
     report: &mut ReconcileReport,
 ) {
+    let Ok(_guard) = store.lock_exclusive() else {
+        tracing::warn!(
+            target: ERASURE_TRACE_TARGET,
+            bundle_id = %id,
+            "erasure cold tier: coordination lock failed; refusing rowless transition"
+        );
+        return;
+    };
+    match (
+        row_exists(conn, ARCHIVED_TABLE, id),
+        row_exists(conn, MEMORIES_TABLE, id),
+    ) {
+        (Ok(false), Ok(false)) => {}
+        (Ok(_), Ok(_)) => return,
+        (archived, live) => {
+            tracing::warn!(
+                target: ERASURE_TRACE_TARGET,
+                bundle_id = %id,
+                archived_error = ?archived.err(),
+                live_error = ?live.err(),
+                "erasure cold tier: row probe failed under coordination lock; refusing rowless transition"
+            );
+            return;
+        }
+    }
     if store.is_purge_intended(id) {
         match store.remove(id) {
             Ok(_) => {
@@ -962,10 +1300,23 @@ pub fn reconcile_and_scrub(
     grace_secs: u64,
 ) -> ReconcileReport {
     let recover_mode = recover_quarantine_enabled();
-    let (ids, temp_reaped) = store.reconcile_inventory(INVENTORY_REFRESH_SECS, grace_secs);
-    let mut report = ReconcileReport {
-        temp_reaped,
-        journal_compacted: store.compact_purge_journal(|id| {
+    // Inventory refresh can reap stale prepared directories and replace its
+    // derived cache. Keep both transitions inside the same per-store
+    // exclusion used by publication, purge, and the remaining reconciliation
+    // phases so a concurrent publisher cannot lose its prepared bundle.
+    let (ids, temp_reaped) = match store.lock_exclusive() {
+        Ok(_guard) => store.reconcile_inventory(INVENTORY_REFRESH_SECS, grace_secs),
+        Err(error) => {
+            tracing::warn!(
+                target: ERASURE_TRACE_TARGET,
+                %error,
+                "erasure cold tier: coordination lock failed; skipping inventory reconciliation"
+            );
+            (Vec::new(), 0)
+        }
+    };
+    let journal_compacted = match store.lock_exclusive() {
+        Ok(_guard) => store.compact_purge_journal(|id| {
             match (
                 row_exists(conn, ARCHIVED_TABLE, id),
                 row_exists(conn, MEMORIES_TABLE, id),
@@ -985,11 +1336,81 @@ pub fn reconcile_and_scrub(
                 }
             }
         }),
+        Err(error) => {
+            tracing::warn!(
+                target: ERASURE_TRACE_TARGET,
+                %error,
+                "erasure cold tier: coordination lock failed; skipping journal compaction"
+            );
+            0
+        }
+    };
+    let mut report = ReconcileReport {
+        temp_reaped,
+        journal_compacted,
         ..ReconcileReport::default()
     };
+    // Repair aborted purges from the JOURNAL inventory, not the bundle
+    // inventory: an intent may have been written before the first bundle was
+    // ever minted. Clearing such a stale marker also rewinds the sweep
+    // frontier so the surviving row cannot remain stranded behind it.
+    for id in store.list_purge_intent_ids() {
+        let cleared = match store.lock_exclusive() {
+            Ok(_guard) => {
+                let archived = row_exists(conn, ARCHIVED_TABLE, &id);
+                let live = row_exists(conn, MEMORIES_TABLE, &id);
+                let row_still_exists = match (&archived, &live) {
+                    (Ok(archived), Ok(live)) => *archived || *live,
+                    _ => {
+                        tracing::warn!(
+                            target: ERASURE_TRACE_TARGET,
+                            bundle_id = %id,
+                            archived_error = ?archived.as_ref().err(),
+                            live_error = ?live.as_ref().err(),
+                            "erasure cold tier: row probe failed during stale-intent repair; retaining marker"
+                        );
+                        false
+                    }
+                };
+                let stale = archived.is_ok()
+                    && live.is_ok()
+                    && row_still_exists
+                    && store
+                        .purge_intent_age_secs(&id)
+                        .is_some_and(|age| age >= grace_secs);
+                let admitted = stale && enqueue_repair_retry(store.dir(), &id);
+                if admitted {
+                    store.clear_purge_intent(&id);
+                }
+                admitted
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: ERASURE_TRACE_TARGET,
+                    bundle_id = %id,
+                    %error,
+                    "erasure cold tier: coordination lock failed; retaining purge intent"
+                );
+                false
+            }
+        };
+        if cleared {
+            reset_process_static_sweep_state_for_dir(store.dir());
+            report.stale_intent_cleared += 1;
+            tracing::warn!(
+                target: ERASURE_TRACE_TARGET,
+                bundle_id = %id,
+                "erasure cold tier: cleared stale purge intent for surviving row and rewound sweep frontier"
+            );
+        }
+    }
     if recover_mode {
         for id in store.list_quarantined_ids() {
-            match store.recover_quarantined(&id) {
+            let recovered = match store.lock_exclusive() {
+                Ok(_guard) => store.recover_quarantined(&id),
+                Err(error) => Err(error),
+            };
+            match recovered {
                 Ok(true) => {
                     report.quarantine_recovered += 1;
                     tracing::warn!(
@@ -1052,29 +1473,6 @@ pub fn reconcile_and_scrub(
             }
         };
         if archived || live {
-            // R5 — a purge-intent marker for a row that STILL EXISTS past the
-            // grace window is STALE (from an ABORTED purge whose `DELETE`
-            // failed — a completed purge deletes the row). Left in place it
-            // would later convert a GENUINE partial DB loss of this id into a
-            // hard-reap of the last copy (the forbidden direction, on a delayed
-            // fuse). Clear it: a real purge re-journals, and the age gate skips
-            // a concurrent in-flight purge (whose failure mode is quarantine —
-            // safe — anyway).
-            if store.contains(id)
-                && store.is_purge_intended(id)
-                && store
-                    .purge_intent_age_secs(id)
-                    .is_some_and(|a| a >= grace_secs)
-            {
-                store.clear_purge_intent(id);
-                report.stale_intent_cleared += 1;
-                tracing::warn!(
-                    target: ERASURE_TRACE_TARGET,
-                    bundle_id = %id,
-                    "erasure cold tier: cleared STALE purge-intent marker for a row that still \
-                     exists (aborted purge) — a real purge re-journals"
-                );
-            }
             // A live-but-not-archived row owns this id (a restore moved it
             // back); the restore path removes the bundle directly, so never
             // reap a live row's snapshot on a transient read race. An archived
@@ -1089,7 +1487,7 @@ pub fn reconcile_and_scrub(
         if !store.manifest_age_secs(id).is_some_and(|a| a >= grace_secs) {
             continue;
         }
-        reconcile_one_rowless(store, id, recover_mode, &mut report);
+        reconcile_one_rowless(conn, store, id, recover_mode, &mut report);
     }
     // Bounded scrub over the current bundles found in THIS rotating window.
     if !scrub_candidates.is_empty() && scrub_limit > 0 {
