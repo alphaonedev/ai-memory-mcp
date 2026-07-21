@@ -27038,6 +27038,69 @@ mod tests {
             Some("2026-07-19T22:45:01.654321Z"),
             "upsert may close the claim with a canonical upper bound"
         );
+
+        store
+            .archive_by_ids(&ctx, std::slice::from_ref(&id), Some("valid-time-2267"))
+            .await
+            .expect("archive valid-time row");
+        assert!(
+            store
+                .archive_restore(&ctx, &id)
+                .await
+                .expect("restore valid-time row")
+        );
+        let restored = store.get(&ctx, &id).await.expect("get restored row");
+        assert_eq!(
+            restored.valid_from.as_deref(),
+            Some("2026-07-19T07:34:56.123456Z")
+        );
+        assert_eq!(
+            restored.valid_until.as_deref(),
+            Some("2026-07-19T22:45:01.654321Z")
+        );
+    }
+
+    /// Isolate the conflict arm from the initial embedded insert so a partial
+    /// fix that binds the columns but omits the ON CONFLICT policy still fails.
+    #[tokio::test]
+    async fn live_store_with_embedding_conflict_preserves_valid_time_2267() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("valid-time-conflict-2267-{unique}");
+        let title = format!("valid-conflict-{unique}");
+        let mut original = sample_memory(&title, &ns, "valid-conflict-2267", "body");
+        original.valid_from = Some("2026-07-19T12:34:56.123456+05:00".to_string());
+        let id = store
+            .store(&ctx, &original)
+            .await
+            .expect("seed plain store");
+
+        let mut conflict = sample_memory(&title, &ns, "valid-conflict-2267", "updated");
+        conflict.valid_from = Some("2030-01-01T00:00:00Z".to_string());
+        conflict.valid_until = Some("2026-07-19T18:45:01.654321-04:00".to_string());
+        let embedding = vec![0.5_f32; 384];
+        let upserted_id = store
+            .store_with_embedding(&ctx, &conflict, Some(&embedding), Some("test-space#none"))
+            .await
+            .expect("embedded conflict");
+        assert_eq!(upserted_id, id);
+
+        let got = store.get(&ctx, &id).await.expect("get conflicted row");
+        assert_eq!(
+            got.valid_from.as_deref(),
+            Some("2026-07-19T07:34:56.123456Z"),
+            "embedded conflict must preserve the plain-store genesis"
+        );
+        assert_eq!(
+            got.valid_until.as_deref(),
+            Some("2026-07-19T22:45:01.654321Z"),
+            "embedded conflict may close the claim"
+        );
     }
 
     /// #1607 — postgres twin of the sqlite #1596 touch-TTL extension

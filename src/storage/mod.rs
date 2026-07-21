@@ -24070,6 +24070,87 @@ mod tests {
         assert_eq!(paths, vec![vec![src.id, target.id]]);
     }
 
+    #[test]
+    fn kg_valid_time_malformed_values_fail_closed_2266() {
+        let conn = test_db();
+        let src = make_memory("malformed-src", "ns", Tier::Long, 5);
+        let bad_start = make_memory("malformed-start", "ns", Tier::Long, 5);
+        let bad_end = make_memory("malformed-end", "ns", Tier::Long, 5);
+        let valid = make_memory("malformed-control", "ns", Tier::Long, 5);
+        for memory in [&src, &bad_start, &bad_end, &valid] {
+            insert(&conn, memory).unwrap();
+        }
+        insert_link_full(
+            &conn,
+            &src.id,
+            &bad_start.id,
+            "related_to",
+            Some("not-rfc3339"),
+            None,
+            None,
+        );
+        insert_link_full(
+            &conn,
+            &src.id,
+            &bad_end.id,
+            "related_to",
+            Some("2026-01-01T00:00:00Z"),
+            Some("not-rfc3339"),
+            None,
+        );
+        insert_link_full(
+            &conn,
+            &src.id,
+            &valid.id,
+            "related_to",
+            Some("2026-01-01T00:00:00Z"),
+            None,
+            None,
+        );
+
+        let timeline = kg_timeline(&conn, &src.id, None, None, None).unwrap();
+        assert_eq!(timeline.len(), 2, "malformed valid_from must be hidden");
+        assert!(timeline.iter().all(|row| row.target_id != bad_start.id));
+
+        let at = kg_query(
+            &conn,
+            &src.id,
+            1,
+            Some("2026-01-02T00:00:00Z"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(at.len(), 1, "malformed stored bounds must fail closed");
+        assert_eq!(at[0].target_id, valid.id);
+
+        let current = kg_query(&conn, &src.id, 1, None, None, None, false).unwrap();
+        assert!(current.iter().all(|row| row.target_id != bad_end.id));
+        assert!(
+            find_paths(&conn, &src.id, &bad_end.id, Some(1), None, false)
+                .unwrap()
+                .is_empty(),
+            "malformed valid_until must not remain current"
+        );
+
+        assert!(
+            kg_timeline(&conn, &src.id, Some("invalid"), None, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            kg_timeline(&conn, &src.id, None, Some("invalid"), None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            kg_query(&conn, &src.id, 1, Some("invalid"), None, None, false)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     // -- Pillar 2 / Stream C — kg_query (depth=1) ---------------------------
 
     /// Insert a link with explicit `temporal/observed_by` columns so the
@@ -24299,6 +24380,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(at_micro.len(), 2);
+    }
+
+    #[test]
+    fn kg_timeline_orders_by_parsed_instant_2266() {
+        let conn = test_db();
+        let src = make_memory("timeline-order-src", "ns", Tier::Long, 5);
+        let earlier = make_memory("timeline-order-earlier", "ns", Tier::Long, 5);
+        let later = make_memory("timeline-order-later", "ns", Tier::Long, 5);
+        for memory in [&src, &earlier, &later] {
+            insert(&conn, memory).unwrap();
+        }
+        // Lexically `00:00Z` sorts before `01:30+02`, but the latter denotes
+        // 23:30Z on the previous day and must appear first chronologically.
+        insert_link_full(
+            &conn,
+            &src.id,
+            &later.id,
+            "related_to",
+            Some("2026-01-01T00:00:00Z"),
+            None,
+            None,
+        );
+        insert_link_full(
+            &conn,
+            &src.id,
+            &earlier.id,
+            "related_to",
+            Some("2026-01-01T01:30:00+02:00"),
+            None,
+            None,
+        );
+
+        let timeline = kg_timeline(&conn, &src.id, None, None, None).unwrap();
+        assert_eq!(timeline.len(), 2);
+        assert_eq!(timeline[0].target_id, earlier.id);
+        assert_eq!(timeline[1].target_id, later.id);
     }
 
     #[test]
