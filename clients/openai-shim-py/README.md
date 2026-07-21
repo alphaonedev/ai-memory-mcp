@@ -56,7 +56,10 @@ client = wrap(
 - **Opaque / pass-through.** Arguments and responses are forwarded verbatim.
 - **Streaming.** A `stream=True` call records the request turn and passes the
   stream through untouched.
-- **Idempotent.** Turns dedup on `host_session_id` + `host_turn_index`.
+- **Idempotent with a stable session id.** Turns dedup on `host_session_id` +
+  `host_turn_index`. The default per-wrap UUID deduplicates only within that
+  wrapped client; pass a stable `host_session_id` (as above) to deduplicate
+  across process re-runs.
 
 ## Tests
 

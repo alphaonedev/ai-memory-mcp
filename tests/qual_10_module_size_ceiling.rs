@@ -358,17 +358,24 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // namespace-boundary characterization tests land storage/mod.rs at
     // 26_650; ceiling 26_750 (+100 headroom). Read-only projections +
     // honesty machine-checks — no new write path.
-    // 2026-07-19 (#1802 R-05 S1, rebuilt on v1.0.0 HEAD) — REDUCED
-    // 26_750 → 26_100: the doctor / observability probe region (~678 LOC:
+    // 2026-07-21 (#2266/#2267, PR #2274): VALID-time comparison preserves
+    // signed offset bytes while the SQLite UDF/query paths compare instants;
+    // focused boundary, read-only-open, malformed-value, signature, and
+    // round-trip regressions land storage/mod.rs at 27_035. The 5-agent
+    // crossroads vote chose the policy-prescribed lockstep bump over a
+    // release-train module split. Ceiling 26_750 -> 27_100 (+65 headroom).
+    //
+    // 2026-07-21 (#1802 R-05 S1, folded onto release HEAD) — REDUCED
+    // 27_100 → 26_450: the doctor / observability probe region (698 LOC:
     // is_namespace_standard .. doctor_reflection_totals_by_namespace, incl.
     // sweep_pending_action_timeouts + the capability-expansion ledger) moved
     // verbatim to the new src/storage/doctor.rs submodule (itemized
     // re-export shim keeps every `crate::storage::*` / `crate::db::*` path
-    // stable). mod.rs lands at 26_009; ceiling 26_100 (+91). Per the QUAL-10
-    // shrink rule: "when a file's LOC SHRINKS (a refactor split), the
-    // ceiling falls".
-    ("src/storage/mod.rs", 26_100),
-    // 2026-07-19 (#1802 R-05 S1) — NEW submodule extracted from
+    // stable). After the fold onto the #2266/#2267 27_035 file the extract
+    // lands mod.rs at 26_362; ceiling 26_450 (+88). Per the QUAL-10 shrink
+    // rule: "when a file's LOC SHRINKS (a refactor split), the ceiling falls".
+    ("src/storage/mod.rs", 26_450),
+    // 2026-07-21 (#1802 R-05 S1) — NEW submodule extracted from
     // storage/mod.rs (doctor / observability probes). Measured 698;
     // ceiling 800 (+102).
     ("src/storage/doctor.rs", 800),
@@ -834,7 +841,15 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // + two live-PG parity tests (each with the F1 delete-on-restore pin).
     // Combined with the #2207 VALID-time reads, the merged file lands above
     // 28_000; ceiling bumped 28_000 -> 28_200 to hold both additions.
-    ("src/store/postgres.rs", 28_200),
+    // 2026-07-19 (#1834 pre-ship 3x7): the v86 valid-time canonicalization
+    // migration (migrate_v86 + funnel canonicalization comments) lands
+    // postgres.rs at 28_203; ceiling bumped 28_200 -> 28_300.
+    // 2026-07-21 (#2267, PR #2274): the two-column VALID-time persistence /
+    // conflict policy plus live-Postgres parity and NULL-retention regressions
+    // land postgres.rs at 28_387. The 5-agent crossroads vote chose the
+    // policy-prescribed lockstep bump over a release-train module split.
+    // Ceiling 28_300 -> 28_400 (+13 headroom).
+    ("src/store/postgres.rs", 28_400),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -1156,7 +1171,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // coverage tests (bind/revoke × json/non-json + empty-token error) to clear
     // the daemon_runtime.rs per-module COVERAGE floor. Combined with #2045 L6
     // this lands daemon_runtime.rs at 10_676; ceiling 10_500 → 10_750.
-    ("src/daemon_runtime.rs", 10_900), /* 2026-07-17 #2167 extract run_sqlite_embedding_space_boot_maintenance helper + both-open-arms unit test to cover the boot-open Err arm (10_783). 2026-07-19 #2064 erasure gc-tick wiring stacked on the #2205 export --full + #1860 vectorlite serve/mcp boot funnels lands the merged file at 10_853; ceiling 10_850 -> 10_900 (lockstep). */
+    ("src/daemon_runtime.rs", 11_400), /* 2026-07-17 #2167 extract run_sqlite_embedding_space_boot_maintenance helper + both-open-arms unit test to cover the boot-open Err arm (10_783). 2026-07-19 #2064 erasure gc-tick wiring stacked on the #2205 export --full + #1860 vectorlite serve/mcp boot funnels lands the merged file at 10_853; ceiling 10_850 -> 10_900 (lockstep). 2026-07-19 pre-ship 3x7: erasure sweep moved OFF the handler mutex (detached spawn_blocking arm + shared log helper) lands the file at 10_931; ceiling 10_900 -> 10_950 (lockstep). 2026-07-19 merged with the #2233/#2235 lineage boot-seed (+26) -> 10_957; ceiling 10_950 -> 11_000 (lockstep). 2026-07-19 #2271 consultation-posture mutation seam + behavior pin lands at 11_032; ceiling 11_000 -> 11_050 (lockstep). 2026-07-20 #2271 shutdown lifecycle hardening tracks every writer, bounds plain/TLS quiescence, drains deferred audit, and makes final witness/WAL certification fail closed; production plus regression coverage lands at 11_326, ceiling 11_050 -> 11_400 (+74 headroom, lockstep). */
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
@@ -1249,7 +1264,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-17 (#2167 S1): the v84 embedding_space migration arm + SCHEMA
     // column doc land migrations.rs at 5_446; ceiling 5_450 (+4 headroom).
     // Additive ALTER-ADD-COLUMN migration only.
-    ("src/storage/migrations.rs", 5_550), /* 2026-07-18 #2035 v85 archived_memories valid_from/valid_until migration arm (5_491) */
+    ("src/storage/migrations.rs", 5_650), /* 2026-07-19 #1834 pre-ship 3x7 v86 valid-time canonicalization arm + normalize_valid_time_rows helper (5_569); was 5_550 (2026-07-18 #2035 v85 arm, 5_491) */
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.

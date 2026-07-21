@@ -302,17 +302,27 @@ fn governance_hooks_capture_consultation_connection_at_install_time_1017() {
     // textual scan (look for the install line, then peek the next
     // ~40 lines of the closure body) — the closures are <30 lines
     // each so a 40-line lookahead is comfortably sufficient.
-    for hook_marker in [
-        "crate::storage::GOVERNANCE_PRE_WRITE.set(Box::new(",
-        "crate::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(",
+    for (hook_marker, next_item_marker) in [
+        (
+            "crate::storage::GOVERNANCE_PRE_WRITE.set(Box::new(",
+            "pub(crate) fn install_governance_pre_action_hook(",
+        ),
+        (
+            "crate::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(",
+            "fn governance_consultation_refusal_reason(",
+        ),
     ] {
         let install_idx = body.find(hook_marker).unwrap_or_else(|| {
             panic!("hook install line `{hook_marker}` missing from daemon_runtime.rs")
         });
-        // Closure bodies are bounded by the next `));` followed by
-        // matching install_result handling. Scan the next 5000 chars
-        // (closures are ~2.5KB max each) for the anti-pattern.
-        let end_idx = (install_idx + 5000).min(body.len());
+        // Bound the scan at the next Rust item. Avoid an arbitrary byte
+        // offset: daemon_runtime.rs contains non-ASCII documentation, so a
+        // numeric byte window can land inside a UTF-8 code point and panic
+        // before checking the actual regression invariant.
+        let end_idx = body[install_idx..].find(next_item_marker).map_or_else(
+            || panic!("item boundary `{next_item_marker}` after `{hook_marker}` missing"),
+            |offset| install_idx + offset,
+        );
         let closure_body = &body[install_idx..end_idx];
         assert!(
             !closure_body.contains("db::open(&rules_db_path)"),
@@ -434,14 +444,23 @@ fn governance_hooks_fail_closed_on_rule_consultation_error_1054() {
     // Both hook closures must include the fail-closed message
     // (`failing CLOSED`) inside their Err arm. Scan each install
     // block for the marker.
-    for hook_marker in [
-        "crate::storage::GOVERNANCE_PRE_WRITE.set(Box::new(",
-        "crate::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(",
+    for (hook_marker, next_item_marker) in [
+        (
+            "crate::storage::GOVERNANCE_PRE_WRITE.set(Box::new(",
+            "pub(crate) fn install_governance_pre_action_hook(",
+        ),
+        (
+            "crate::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(",
+            "fn governance_consultation_refusal_reason(",
+        ),
     ] {
         let install_idx = body
             .find(hook_marker)
             .unwrap_or_else(|| panic!("hook install line `{hook_marker}` missing"));
-        let end_idx = (install_idx + 8000).min(body.len());
+        let end_idx = body[install_idx..].find(next_item_marker).map_or_else(
+            || panic!("item boundary `{next_item_marker}` after `{hook_marker}` missing"),
+            |offset| install_idx + offset,
+        );
         let closure_body = &body[install_idx..end_idx];
         assert!(
             closure_body.contains("failing CLOSED"),
@@ -456,6 +475,22 @@ fn governance_hooks_fail_closed_on_rule_consultation_error_1054() {
              synthesise a `governance:consultation_failed` \
              refusal and push it to the deferred audit queue so \
              the chain-log captures the consultation failure."
+        );
+        assert!(
+            closure_body.contains("let outcome =")
+                && closure_body.contains(
+                    "governance_consultation_refusal_reason(fail_open, audit_admitted, &reason)",
+                )
+                && closure_body.contains("return outcome;")
+                && closure_body
+                    .lines()
+                    .filter(|line| line.trim() == "outcome")
+                    .count()
+                    == 2,
+            "post-#1054: `{hook_marker}` MUST delegate its executable verdict to the \
+             behavior-tested `governance_consultation_refusal_reason` helper, return that verdict \
+             when audit admission fails, and use it as both executable posture branches' \
+             final expression"
         );
     }
 }

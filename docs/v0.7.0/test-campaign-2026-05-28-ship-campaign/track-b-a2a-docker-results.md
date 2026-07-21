@@ -3,6 +3,11 @@ layout: doc
 ---
 # Track B — A2A In-Host via Lan-Parity Docker Stack Results (2026-05-28)
 
+> Historical record: the `signed_events_dlq` replay recipe referenced below
+> is not a v1.0.0 product replay facility. v1.0.0 retains chain-or-DLQ/spool
+> evidence for operator disposition, ships no automatic replay path or replay
+> CLI, and keeps DLQ timestamps as `TEXT`.
+
 Track B re-verifies the A2A non-corpus regression against the
 integrated `release/v0.7.0` tip `be3347d70` using the lan-parity
 Docker stack as the federation substrate. The alice (HTTP

@@ -207,6 +207,14 @@ jobs:
       # pass above and the postgres-feature job's fully-compiled pass.
       - name: Clippy (all targets, sal — cfg-stripped doc-lint class)
         run: cargo clippy --all-targets --features sal -- -D warnings -D clippy::all -D clippy::pedantic
+      - name: Verify reviewed build-script pins and closure (#2259)
+        run: |
+          # `cargo metadata --offline` resolves the complete cross-platform
+          # graph, including target-only crates that this Linux clippy leg
+          # does not compile. Fetch the locked graph first; the verifier then
+          # remains offline and checksum-driven.
+          cargo fetch --locked
+          python3 scripts/check-build-script-vetting.py
 
   # actionlint — workflow-injection guard (#1851, audit follow-up #1855).
   # actionlint's NATIVE expression-injection check flags the #1851 class: an
@@ -936,6 +944,47 @@ jobs:
         env:
           AI_MEMORY_NO_CONFIG: "1"
         run: cargo test --features sal --lib
+
+  # v1.0.0 #2257 — vectorlite OPT-IN feature gate. The `vectorlite` cargo
+  # feature (#1860/#2219; `rusqlite/load_extension` + `src/vectorlite.rs`)
+  # is OFF by default and was in NO CI job, so the no-native-lib fail-closed
+  # seam contract (`tests/vectorlite_1860.rs`, which needs NO native
+  # artifact to compile + run) never compiled on a PR — a bit-rot gap of the
+  # v0.8.1 full-feature-matrix lesson. This job compiles + lints + runs the
+  # feature-gated surface on every code PR: clippy under the feature (catches
+  # the opt-in module + its tests drifting) and the no-native-lib test layer
+  # (`vectorlite_1860` — the `#[ignore]`d live-extension layer self-skips).
+  # It also runs `config_precedence` under the feature so the #2256
+  # feature-gated env-resolution pin is exercised. Skipped on docs-only PRs.
+  vectorlite-feature:
+    name: vectorlite feature gate
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    # #1487 — bound the job so a wedged test can't pin the runner.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (vectorlite feature, all targets)
+        run: cargo clippy --all-targets --features vectorlite -- -D warnings -D clippy::all -D clippy::pedantic
+
+      - name: Run vectorlite no-native-lib seam tests (#1860)
+        env:
+          AI_MEMORY_NO_CONFIG: "1"
+        run: cargo test --features vectorlite --test vectorlite_1860
+
+      - name: Run config-precedence under vectorlite (#2256 feature-gated pin)
+        env:
+          AI_MEMORY_NO_CONFIG: "1"
+        run: cargo test --features vectorlite --test config_precedence
 
   # v0.6.5 — Dockerfile-build smoke. Runs on EVERY push to main / develop /
   # release/** AND on EVERY PR that touches code. Builds the Docker image;

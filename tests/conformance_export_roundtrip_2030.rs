@@ -167,9 +167,18 @@ fn durable_memory() -> Memory {
         tags: vec!["alpha".into(), "beta".into()],
         priority: 7,
         confidence: 0.9,
-        source: "test".into(),
+        // Pre-ship 3x7 HIGH-2: must be a `validate::VALID_SOURCES` member —
+        // the v2 importer now runs the L1-parity `validate_memory` gate, and
+        // the historical `"test"` value was only importable because the v2
+        // route ran zero validation.
+        source: "system".into(),
         created_at: FIXED_TS.into(),
         updated_at: FIXED_TS.into(),
+        // Keep the golden durable across wall-clock time. Relying on the Mid
+        // tier's seven-day default made this fixture disappear after
+        // 2026-07-21 UTC even though every encoded timestamp is intentionally
+        // fixed for byte stability.
+        expires_at: Some("2099-01-01T00:00:00Z".into()),
         memory_kind: MemoryKind::Decision,
         metadata: serde_json::json!({ "agent_id": "alice" }),
         valid_from: Some("2026-01-01T00:00:00Z".into()),

@@ -42,9 +42,17 @@ fn durable_memory() -> Memory {
         tags: vec!["alpha".into(), "beta".into()],
         priority: 7,
         confidence: 0.9,
-        source: "test".into(),
+        // Pre-ship 3x7 HIGH-2: must be a `validate::VALID_SOURCES` member —
+        // the v2 importer now runs the L1-parity `validate_memory` gate,
+        // and the historical `"test"` value was only importable because
+        // the v2 route ran zero validation.
+        source: "system".into(),
         created_at: now.clone(),
         updated_at: now,
+        // Pin beyond the test horizon. Leaving this `None` lets the tier
+        // policy stamp the next UTC-midnight expiry; a suite that crosses
+        // that boundary then correctly exports zero live memories.
+        expires_at: Some("2099-01-01T00:00:00Z".into()),
         memory_kind: MemoryKind::Decision,
         metadata: serde_json::json!({ "agent_id": "alice" }),
         // #1834/#2204 — claim-bitemporal VALID-time bounds are part of the

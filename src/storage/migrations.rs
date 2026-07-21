@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 85).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 86).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -523,7 +523,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_event_type
 -- Mirrors `migrations/sqlite/0034_v07_signed_events_dlq.sql` so a
 -- fresh DB bootstrap that bypasses the migration ladder still ends
 -- up with the table present. See the migration file for the design
--- rationale (failure-split between race-requeue and DLQ-land).
+-- rationale (bounded same-call retry followed by a DLQ attempt).
 CREATE TABLE IF NOT EXISTS signed_events_dlq (
     dlq_id          INTEGER PRIMARY KEY AUTOINCREMENT,
     id              TEXT NOT NULL,
@@ -727,13 +727,13 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 // v40 = v0.7.0 Cluster-C SEC-3 closeout (issue #767) — adds the
 //       `signed_events_dlq` table backing the deferred-audit drainer's
 //       new dead-letter-queue path. Pre-Cluster-C the drainer dropped
-//       failed appends silently; with v40 in place the drainer requeues
-//       on `SQLITE_CONSTRAINT_UNIQUE` (chain-head race) and lands every
-//       other failure in `signed_events_dlq`. Pure additive on legacy
-//       data — fresh installs inherit the table via the bootstrap
-//       SCHEMA; pre-v40 deployments pick it up here. The DLQ is
-//       intentionally NOT append-only (operator-driven replay deletes
-//       rows after re-append).
+//       failed appends silently; with v40 in place the sink retries
+//       classified sequence races within the same call, then attempts
+//       `signed_events_dlq` on exhaustion or non-race failure. A failed
+//       DLQ INSERT still returns an error; journal-backed admission keeps
+//       the spool evidence. Pure additive on legacy data — fresh installs
+//       inherit the table via the bootstrap SCHEMA; pre-v40 deployments
+//       pick it up here. v1.0.0 has no replay/deletion CLI.
 // v41 = v0.7.0 Cluster G — shadow-mode retention + denormalised
 //       `source` column + compound `(namespace, source, observed_at)`
 //       index supporting the calibration scan (issue #767, PERF-4 +
@@ -864,7 +864,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 85;
+const CURRENT_SCHEMA_VERSION: i64 = 86;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1224,7 +1224,7 @@ const MIGRATION_V39_SQLITE: &str =
 // v0.7.0 Cluster-C SEC-3 closeout (issue #767) — `signed_events_dlq`
 // table. CREATE TABLE IF NOT EXISTS + indexes — fully idempotent.
 // Substrate for the deferred-audit drainer's new dead-letter-queue
-// path (race-on-UNIQUE requeue; non-race errors land here).
+// path (bounded same-call sequence-race retry, then a DLQ attempt).
 const MIGRATION_V40_SQLITE: &str =
     include_str!("../../migrations/sqlite/0034_v07_signed_events_dlq.sql");
 // v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
@@ -3624,8 +3624,14 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             )?;
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 85 {
             // v85 (#2035, v1.0.0) — archive→restore lossless round-trip for the
+            // #1834 claim-bitemporal VALID-time. LITERALIZED from the
+            // const-phrased tip form when the v86 arm landed (#2265; the
+            // #2218 convention — settled arms take a literal guard and enter
+            // the monotonic lane, ONLY the current tip stays symbolic).
+            // Behaviour-identical: any DB below 85 still runs it; a DB at
+            // >= 85 already carries the columns (probe-guarded, idempotent).
             // #1834 claim-bitemporal VALID-time. Adds `valid_from` + `valid_until`
             // (RFC3339 TEXT) to `archived_memories` so a memory archived via GC
             // eviction (archive_on_gc), explicit `forget`, or the in_place_edit
@@ -3666,6 +3672,51 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                         [],
                     )?;
                 }
+            }
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v86 (#1834 pre-ship 3x7, v1.0.0) — normalize legacy
+            // claim-bitemporal VALID-time renderings on `memories` +
+            // `archived_memories` to the ONE canonical fixed-UTC form
+            // (`validate::canonicalize_valid_time`,
+            // `YYYY-MM-DDTHH:MM:SS.ffffffZ`). Every #1834 predicate compares
+            // these TEXT columns lexicographically, and RFC3339 admits many
+            // renderings of the SAME instant (`Z` vs `+00:00`, variable
+            // fractional digits, non-UTC offsets) that order WRONGLY as
+            // bytes — silently violating the start-inclusive / end-exclusive
+            // contract. The write funnels canonicalize from v86 on; this
+            // one-time in-code arm (the v54 backfill precedent) heals rows
+            // written before the fix. Instant-preserving (the parsed
+            // timestamp is unchanged — only its rendering), idempotent (a
+            // canonical value re-canonicalizes to itself), and fail-safe
+            // (an unparseable value keeps its exact bytes — never destroy).
+            // These columns are UNSIGNED metadata (NOT in the SignableWrite
+            // v2 envelope, NOT in the cid genesis pre-image), so rewriting
+            // the rendering breaks no signature. Doc twin:
+            // migrations/sqlite/0070_v86_valid_time_canonicalize.sql.
+            normalize_valid_time_rows(
+                conn,
+                "SELECT rowid, valid_from, valid_until FROM memories \
+                 WHERE valid_from IS NOT NULL OR valid_until IS NOT NULL",
+                "UPDATE memories SET valid_from = ?1, valid_until = ?2 WHERE rowid = ?3",
+            )?;
+            let has_archive_table: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'archived_memories')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if has_archive_table {
+                normalize_valid_time_rows(
+                    conn,
+                    "SELECT rowid, valid_from, valid_until FROM archived_memories \
+                     WHERE valid_from IS NOT NULL OR valid_until IS NOT NULL",
+                    "UPDATE archived_memories SET valid_from = ?1, valid_until = ?2 \
+                     WHERE rowid = ?3",
+                )?;
             }
         }
 
@@ -3718,6 +3769,35 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
 /// legacy rows were NULLed after the ladder already ran. Safe to call
 /// outside a transaction (each per-row UPDATE autocommits); inside the
 /// migrate tx it participates in that tx.
+/// v86 (#1834 pre-ship 3x7) — one-table VALID-time rendering normalizer
+/// behind the v86 migration arm. `select_sql` yields
+/// `(rowid, valid_from, valid_until)` for rows carrying at least one bound;
+/// `update_sql` writes `(valid_from, valid_until, rowid)`. A value that
+/// parses as RFC3339 is re-rendered canonically
+/// (`validate::canonicalize_valid_time`); an unparseable value keeps its
+/// exact bytes (fail-safe — the migration NEVER destroys a value, it only
+/// re-renders instants). Rows already canonical are skipped (idempotent —
+/// a re-run updates nothing). Column presence is probed via the SELECT
+/// prepare so a partial-schema fixture that stamped a version without the
+/// v79/v85 columns is a clean no-op (the v84/v85 probe precedent).
+fn normalize_valid_time_rows(conn: &Connection, select_sql: &str, update_sql: &str) -> Result<()> {
+    let Ok(mut stmt) = conn.prepare(select_sql) else {
+        return Ok(());
+    };
+    let rows: Vec<(i64, Option<String>, Option<String>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (rowid, vf, vu) in rows {
+        let vf_canon = crate::validate::canonical_valid_time_opt(vf.as_deref());
+        let vu_canon = crate::validate::canonical_valid_time_opt(vu.as_deref());
+        if vf_canon != vf || vu_canon != vu {
+            conn.execute(update_sql, params![vf_canon, vu_canon, rowid])?;
+        }
+    }
+    Ok(())
+}
+
 pub fn backfill_memory_cids(conn: &Connection) -> Result<usize> {
     // The `in_place_edit` snapshot exclusion needs `archived_memories`; some
     // fixture DBs (partial-schema migration-ladder tests) don't create it, so

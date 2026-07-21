@@ -45,7 +45,7 @@ use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -1075,27 +1075,53 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
     // `PostgresStore::link_internal` reads it at write time. Default sync =
     // byte-identical inline AGE MERGE; harmless on sqlite/mcp/CLI paths.
     crate::config::set_age_projection_mode(resolved_storage.age_projection_mode);
-    // v0.9.0 G13-mem (#1859) — the resolved lineage-DAG flags
-    // (`resolved_storage.lineage_dag` / `.consolidate_tombstone_sources`,
-    // master default ON) are DELIBERATELY NOT seeded into the process-wide
-    // atomics here. Mirrors the G6 `append_only` precedent: the flag is a
-    // BEHAVIOR-CHANGING process-wide `AtomicBool`, and `daemon_runtime::run`
-    // is exercised by the lib unit-test binary (the Identity/Rules/Governance
-    // dispatch tests), so seeding it here would flip the flag ON for every
-    // concurrently-running storage/cycle/consolidate unit test in the same
-    // process and make the suite order-dependent. The edge-write cid
-    // population, the P-wide acyclicity guard, the lineage query surface, and
-    // `db::consolidate`'s tombstone path all read `lineage_dag_enabled()` /
-    // `consolidate_tombstone_sources_enabled()`, which stay OFF (byte-identical
-    // legacy) until explicitly seeded. Wiring the production master-on seed
-    // (behind a test-isolation reset in the daemon_runtime harness) is the
-    // tracked follow-up; callers opt in today via `AI_MEMORY_LINEAGE_DAG` +
-    // `crate::config::set_lineage_dag` / `set_consolidate_tombstone_sources`
-    // (which `resolve_storage` already resolves the values for).
-    let _ = (
-        resolved_storage.lineage_dag,
-        resolved_storage.consolidate_tombstone_sources,
-    );
+    // v0.9.0 G13-mem (#1859; production boot seed WIRED by #2233) — seed the
+    // process-wide lineage-DAG flags from the resolved `[storage]` config
+    // (env `AI_MEMORY_LINEAGE_DAG` / `AI_MEMORY_CONSOLIDATE_TOMBSTONE_SOURCES`
+    // > `[storage]` section > compiled default: master ON, sub-flag tracks the
+    // master). Once seeded, the edge-write `source_cid`/`target_cid` mirror,
+    // the P-wide acyclicity guard, the lineage query surface, and
+    // `db::consolidate`'s tombstone path go live on every production subcommand
+    // path (serve / mcp / CLI, both backends) — closing the #2233 defaults-lie
+    // where `lineage_dag_enabled()` read FALSE in production despite the
+    // documented `true` default (and, via #2215/#2229, where the import
+    // repopulation stayed inert because it correctly copied the native gate).
+    // Mirrors the `set_db_mmap_size` / `set_age_projection_mode` /
+    // `set_screen_mode` seeds above.
+    //
+    // The seed is `#[cfg(not(test))]`-gated purely for TEST ISOLATION, NOT to
+    // opt out of production: the lineage flags are BEHAVIOR-CHANGING
+    // process-wide `AtomicBool`s and `daemon_runtime::run` is ALSO exercised by
+    // the lib unit-test binary (the Identity/Rules/Governance dispatch tests),
+    // so seeding unconditionally would flip the flag ON for every
+    // concurrently-running storage / cycle / consolidate unit test in the same
+    // process and make the suite order-dependent (the blocker the pre-#2233
+    // discard named). `cfg(test)` is true ONLY for the lib's own
+    // `cargo test --lib` build; the production `ai-memory` binary AND every
+    // integration test under `tests/` link the lib WITHOUT `cfg(test)`, so both
+    // exercise the real seed (pinned end-to-end by
+    // `tests/lineage_boot_seed_2233.rs`). Raw-library callers that never run
+    // this boot path keep the unseeded `false` default — `lineage_dag_enabled()`
+    // reads OFF until seeded — preserving embedder / unit-test isolation
+    // exactly as before.
+    #[cfg(not(test))]
+    {
+        crate::config::set_lineage_dag(resolved_storage.lineage_dag);
+        crate::config::set_consolidate_tombstone_sources(
+            resolved_storage.consolidate_tombstone_sources,
+        );
+    }
+    #[cfg(test)]
+    {
+        // Lib-unit-test build (`cargo test --lib`): SKIP the process-wide seed
+        // for test isolation (see the block above) but still READ the resolved
+        // fields so the `dead_code` lint stays green under `-D warnings` — the
+        // resolver's work is deliberately observed here, not applied.
+        let _ = (
+            resolved_storage.lineage_dag,
+            resolved_storage.consolidate_tombstone_sources,
+        );
+    }
     // v0.8.1 W1 (#1821 / gap G29) — seed the process-wide credential-screen
     // mode from the resolved `[security]` config (env
     // `AI_MEMORY_SECRET_SCREEN_MODE` > `[security].secret_screen_mode` >
@@ -3236,6 +3262,27 @@ fn ensure_and_load_daemon_keypair() -> (
 // Background tasks (GC, WAL checkpoint)
 // ---------------------------------------------------------------------------
 
+struct BlockingTaskGuard(Arc<AtomicUsize>);
+
+impl Drop for BlockingTaskGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn spawn_tracked_blocking<F, R>(tracker: &Arc<AtomicUsize>, task: F) -> JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    tracker.fetch_add(1, Ordering::SeqCst);
+    let tracker = Arc::clone(tracker);
+    tokio::task::spawn_blocking(move || {
+        let _guard = BlockingTaskGuard(tracker);
+        task()
+    })
+}
+
 /// Spawn the periodic GC loop. Sleeps `interval`, then runs `db::gc`,
 /// `db::auto_purge_archive`, and (Cluster G, #767) the shadow-
 /// observation retention sweep against the daemon's shared connection.
@@ -3359,6 +3406,7 @@ type FamilyEmbeddingsCache =
 /// disabled arm is the default and a no-op beyond a debug log.
 fn spawn_family_embedding_precompute_if_enabled(
     task_handles: &mut Vec<JoinHandle<()>>,
+    blocking_tasks: &Arc<AtomicUsize>,
     enabled: bool,
     family_embeddings: &FamilyEmbeddingsCache,
     embedder_arc: &Arc<Option<Embedder>>,
@@ -3366,13 +3414,14 @@ fn spawn_family_embedding_precompute_if_enabled(
     if enabled {
         let cache = family_embeddings.clone();
         let embedder_for_task = embedder_arc.clone();
+        let blocking_tasks = Arc::clone(blocking_tasks);
         task_handles.push(tokio::spawn(async move {
             // H1 (v0.7.0 round-2) lock-discipline: the slow embed calls run in
             // a `spawn_blocking` closure holding NO lock; only after the whole
             // batch is computed do we take the write lock ONCE to swap in the
             // populated `Some(Vec)` — readers see `None` or the full vector,
             // never a half-built one.
-            let computed = tokio::task::spawn_blocking(move || {
+            let computed = spawn_tracked_blocking(&blocking_tasks, move || {
                 AppState::precompute_family_embeddings(
                     embedder_for_task
                         .as_ref()
@@ -3420,7 +3469,32 @@ pub fn spawn_gc_loop_with_shadow_retention(
     shadow_retention_days: i64,
     interval: Duration,
 ) -> JoinHandle<()> {
+    spawn_gc_loop_with_shadow_retention_tracked(
+        state,
+        archive_max_days,
+        shadow_retention_days,
+        interval,
+        Arc::new(AtomicUsize::new(0)),
+    )
+}
+
+fn spawn_gc_loop_with_shadow_retention_tracked(
+    state: Db,
+    archive_max_days: Option<i64>,
+    shadow_retention_days: i64,
+    interval: Duration,
+    blocking_tasks: Arc<AtomicUsize>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // #2064 pre-ship concurrency fix — snapshot the immutable DB path
+        // ONCE so the erasure cold-tier sweep can run on a DEDICATED
+        // connection OFF the shared handler mutex (see the erasure arms
+        // below). The tuple's `PathBuf` never changes for the daemon
+        // lifetime; non-file-backed databases stay on the legacy
+        // under-lock tick (`is_in_memory_db_path`).
+        let erasure_db_path = { state.lock().await.1.clone() };
+        let erasure_detached =
+            !crate::erasure::archive_sync::is_in_memory_db_path(&erasure_db_path);
         loop {
             tokio::time::sleep(interval).await;
             let lock = state.lock().await;
@@ -3456,14 +3530,21 @@ pub fn spawn_gc_loop_with_shadow_retention(
             // rows into (k, m) Reed-Solomon shard bundles, paced at
             // SWEEP_LIMIT_PER_TICK oldest-first per tick. No-op unless
             // AI_MEMORY_ERASURE_COLD_TIER is enabled.
-            match crate::erasure::archive_sync::gc_tick(&lock.0) {
-                Ok(r) if r.bundled > 0 || r.failed > 0 => tracing::info!(
-                    "gc: erasure cold tier bundled {} archived rows ({} failed, retried next tick)",
-                    r.bundled,
-                    r.failed
-                ),
-                Ok(_) => {}
-                Err(e) => tracing::warn!("erasure cold-tier sweep failed: {e:#}"),
+            //
+            // Pre-ship 3x7 concurrency fix: on a FILE-BACKED database the
+            // sweep runs AFTER this lock is dropped, on a DEDICATED
+            // connection inside `spawn_blocking` (see below), so its
+            // Reed-Solomon encodes + per-shard fsyncs (up to
+            // SWEEP_LIMIT_PER_TICK rows when a backlog drains) never stall
+            // the HTTP handlers that serialize on this mutex. This
+            // under-lock arm survives ONLY for non-file-backed databases,
+            // where a fresh connection would open a DIFFERENT (empty)
+            // database and the detached reconciler would mis-classify every
+            // live bundle as rowless (quarantining them) — fail-closed:
+            // fall back to the legacy serialized tick rather than degrade
+            // into wrong reconciliation.
+            if !erasure_detached {
+                log_erasure_gc_report(crate::erasure::archive_sync::gc_tick(&lock.0));
             }
             // Cluster G (#767, PERF-4) — shadow-mode observation
             // retention sweep. `<= 0` is a no-op (operator opt-out).
@@ -3485,8 +3566,50 @@ pub fn spawn_gc_loop_with_shadow_retention(
                 Ok(_) => {}
                 Err(e) => tracing::warn!("recall_observations gc failed: {e}"),
             }
+            // Pre-ship 3x7 concurrency fix (#2064) — release the handler
+            // mutex BEFORE the erasure cold-tier sweep. The sweep is
+            // DB-READ-ONLY (bundle files are its only writes) and
+            // cross-connection concurrency with the purge/restore funnels
+            // is the already-supported regime (a CLI purge runs on its own
+            // connection against a live daemon; the reconciler's
+            // grace-window + stale-intent age gates reason about exactly
+            // that), so a dedicated connection is sound. `spawn_blocking`
+            // keeps the encode/fsync work off the async workers, and the
+            // join is AWAITED (never detached-and-forgotten) so two sweeps
+            // of one store can never overlap — the keyset frontier and the
+            // rotating reconcile cursor are single-sweeper state.
+            drop(lock);
+            if erasure_detached && crate::erasure::erasure_cold_tier_enabled() {
+                let path = erasure_db_path.clone();
+                match spawn_tracked_blocking(&blocking_tasks, move || {
+                    crate::erasure::archive_sync::gc_tick_detached(&path)
+                })
+                .await
+                {
+                    Ok(result) => log_erasure_gc_report(result),
+                    Err(e) => {
+                        tracing::warn!("erasure cold-tier sweep task failed to join: {e}");
+                    }
+                }
+            }
         }
     })
+}
+
+/// Shared per-tick log rendering for the #2064 erasure cold-tier sweep
+/// report — one site for the info/warn lines whether the sweep ran on the
+/// legacy under-lock arm (non-file-backed databases) or the detached
+/// dedicated-connection arm (pre-ship 3x7 concurrency fix).
+fn log_erasure_gc_report(result: anyhow::Result<crate::erasure::archive_sync::SweepReport>) {
+    match result {
+        Ok(r) if r.bundled > 0 || r.failed > 0 => tracing::info!(
+            "gc: erasure cold tier bundled {} archived rows ({} failed, retried next tick)",
+            r.bundled,
+            r.failed
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("erasure cold-tier sweep failed: {e:#}"),
+    }
 }
 
 /// v0.7.0 K2 — spawn the periodic `pending_actions` timeout sweeper.
@@ -3705,6 +3828,9 @@ pub struct ServeBootstrap {
     /// metrics handle is the only drain-observability surface `serve`
     /// retains after the queue is moved into `AppState`.
     pub deferred_audit_metrics: crate::governance::deferred_audit::DeferredAuditMetrics,
+    /// Receiver-owned shutdown barrier for the deferred-audit supervisor.
+    pub(crate) deferred_audit_shutdown: crate::governance::deferred_audit::DeferredAuditShutdown,
+    pub(crate) blocking_tasks: Arc<AtomicUsize>,
 }
 
 /// v0.7.0 Wave-3 — resolve a [`MemoryStore`] handle from the operator's
@@ -4112,6 +4238,13 @@ pub(crate) fn install_governance_pre_write_hook(
                     Err(reason)
                 }
                 Err(e) => {
+                    if e.downcast_ref::<crate::governance::agent_action::AuditAdmissionError>()
+                        .is_some()
+                    {
+                        return Err(
+                            crate::governance::deferred_audit::AUDIT_ADMISSION_FAILED.to_string()
+                        );
+                    }
                     // v0.7.0 #1054 (Agent-2 #4) — fail-CLOSED on
                     // rule-consultation error and chain-log the
                     // refusal so an attacker who can induce
@@ -4148,7 +4281,14 @@ pub(crate) fn install_governance_pre_write_hook(
                         rule_id: "governance:consultation_failed".to_string(),
                         reason: reason.clone(),
                     };
-                    queue_for_hook.submit_refusal(&agent_id, &action, &synthetic_refusal);
+                    let audit_admitted =
+                        queue_for_hook.submit_refusal(&agent_id, &action, &synthetic_refusal);
+                    let outcome =
+                        governance_consultation_refusal_reason(fail_open, audit_admitted, &reason)
+                            .map_or(Ok(()), Err);
+                    if !audit_admitted {
+                        return outcome;
+                    }
                     if fail_open {
                         tracing::warn!(
                             "L1-6 governance pre-write: rule consultation failed: {}; \
@@ -4156,7 +4296,7 @@ pub(crate) fn install_governance_pre_write_hook(
                                  degrading to ALLOW (UNSAFE, legacy posture)",
                             e
                         );
-                        Ok(())
+                        outcome
                     } else {
                         tracing::warn!(
                             "L1-6 governance pre-write: rule consultation failed: {}; \
@@ -4164,7 +4304,7 @@ pub(crate) fn install_governance_pre_write_hook(
                                  set AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 to revert)",
                             e
                         );
-                        Err(reason)
+                        outcome
                     }
                 }
             }
@@ -4271,6 +4411,13 @@ pub(crate) fn install_governance_pre_action_hook(
                     Err(reason)
                 }
                 Err(e) => {
+                    if e.downcast_ref::<crate::governance::agent_action::AuditAdmissionError>()
+                        .is_some()
+                    {
+                        return Err(
+                            crate::governance::deferred_audit::AUDIT_ADMISSION_FAILED.to_string()
+                        );
+                    }
                     // #1054 — same fail-CLOSED posture as the storage hook;
                     // env escape hatch AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1.
                     let reason = format!("governance:consultation_failed: {e}");
@@ -4281,11 +4428,17 @@ pub(crate) fn install_governance_pre_action_hook(
                         rule_id: "governance:consultation_failed".to_string(),
                         reason: reason.clone(),
                     };
-                    queue_for_wire_check.submit_refusal(
+                    let audit_admitted = queue_for_wire_check.submit_refusal(
                         WIRE_ACTION_ACTOR,
                         action,
                         &synthetic_refusal,
                     );
+                    let outcome =
+                        governance_consultation_refusal_reason(fail_open, audit_admitted, &reason)
+                            .map_or(Ok(()), Err);
+                    if !audit_admitted {
+                        return outcome;
+                    }
                     if fail_open {
                         tracing::warn!(
                             "wire_check: rule consultation failed: {}; \
@@ -4294,7 +4447,7 @@ pub(crate) fn install_governance_pre_action_hook(
                             e,
                             action.kind(),
                         );
-                        Ok(())
+                        outcome
                     } else {
                         tracing::warn!(
                             "wire_check: rule consultation failed: {}; failing CLOSED \
@@ -4303,7 +4456,7 @@ pub(crate) fn install_governance_pre_action_hook(
                             e,
                             action.kind(),
                         );
-                        Err(reason)
+                        outcome
                     }
                 }
             }
@@ -4320,6 +4473,25 @@ pub(crate) fn install_governance_pre_action_hook(
              FilesystemWrite/NetworkRequest/ProcessSpawn; n26: Bash + Custom \
              have no egress sink yet — structural coverage tracked v0.8 #1695)"
         );
+    }
+}
+
+/// Resolve the post-consultation-error security posture shared by both hook
+/// installers and the unavailable-connection path.
+///
+/// Durable audit admission is a prerequisite for the explicit fail-open
+/// override. Without it, the action stays blocked regardless of the override.
+fn governance_consultation_refusal_reason(
+    fail_open: bool,
+    audit_admitted: bool,
+    reason: &str,
+) -> Option<String> {
+    if !audit_admitted {
+        Some(crate::governance::deferred_audit::AUDIT_ADMISSION_FAILED.to_string())
+    } else if fail_open {
+        None
+    } else {
+        Some(reason.to_string())
     }
 }
 
@@ -4372,21 +4544,26 @@ fn governance_consultation_unavailable_inner(
         rule_id: "governance:consultation_unavailable".to_string(),
         reason: reason.clone(),
     };
-    queue.submit_refusal(agent_id, action, &synthetic_refusal);
+    let audit_admitted = queue.submit_refusal(agent_id, action, &synthetic_refusal);
+    let outcome = governance_consultation_refusal_reason(fail_open, audit_admitted, &reason)
+        .map_or(Ok(()), Err);
+    if !audit_admitted {
+        return outcome;
+    }
     if fail_open {
         tracing::warn!(
             "{surface}: hook consultation connection unavailable (rules DB at {}); \
              {ENV_GOVERNANCE_FAIL_OPEN}=1 — degrading to ALLOW (UNSAFE, legacy posture)",
             rules_db_path.display(),
         );
-        Ok(())
+        outcome
     } else {
         tracing::warn!(
             "{surface}: hook consultation connection unavailable (rules DB at {}); failing CLOSED \
              (#1455 secure default — set {ENV_GOVERNANCE_FAIL_OPEN}=1 to revert)",
             rules_db_path.display(),
         );
-        Err(reason)
+        outcome
     }
 }
 
@@ -4834,10 +5011,10 @@ pub async fn bootstrap_serve(
     // `db::open` against the same db_path) so it does NOT contend
     // with the substrate writer's lock held during `storage::insert`.
     // SQLite WAL mode allows the rule-read to proceed in parallel.
-    // Failure to open the rule-consultation connection degrades to
-    // ALLOW with a WARN: a transient FS issue must not wedge the
-    // write surface, and the operator can detect the degradation
-    // from the log surface.
+    // Failure to open the rule-consultation connection defaults to a
+    // fail-closed synthetic refusal. The explicit consultation-only
+    // fail-open override can permit it only after that refusal is durably
+    // admitted to the deferred audit path.
     //
     // v0.7.0 Policy-Engine Item 3 (2026-05-14) — the hook now also
     // submits every refusal to the process-wide deferred-audit
@@ -4855,8 +5032,8 @@ pub async fn bootstrap_serve(
     // queue is built with the journal so every submit is durable before
     // the mpsc send. Runs BEFORE the governance hooks install below
     // (replay-all-then-go-live).
-    let (deferred_audit_queue, deferred_audit_supervisor) =
-        crate::governance::deferred_audit::install_deferred_audit_drainer_with_journal(db_path);
+    let (deferred_audit_queue, deferred_audit_shutdown) =
+        crate::governance::deferred_audit::install_deferred_audit_drainer_with_shutdown(db_path);
     // Capture the shared atomic metrics handle BEFORE the queue is cloned
     // into the governance hooks + moved onto `AppState`. `serve` polls
     // these on shutdown to drain the queue before the WAL checkpoint.
@@ -4892,10 +5069,10 @@ pub async fn bootstrap_serve(
     // (`storage::insert` is sync; wire-check is consulted from sync
     // `governance::wire_check::check` regardless of caller context).
     //
-    // If `db::open` fails at install time, we install hooks that
-    // degrade to ALLOW on every call with a WARN — same posture as
-    // the pre-#1017 per-call open-failure leg. The operator sees the
-    // diagnostic in daemon logs and can re-attempt.
+    // If `db::open` fails at install time, the installed hooks default to a
+    // fail-closed synthetic refusal. An explicit consultation-only fail-open
+    // override can allow only after durable audit admission; otherwise the
+    // action remains blocked and the operator sees the diagnostic.
     let hook_consultation_conn: Option<Arc<std::sync::Mutex<rusqlite::Connection>>> =
         match db::open(db_path) {
             Ok(c) => Some(Arc::new(std::sync::Mutex::new(c))),
@@ -4903,7 +5080,8 @@ pub async fn bootstrap_serve(
                 tracing::warn!(
                     target: "ai_memory::daemon_runtime",
                     "v0.7.0 #1017: failed to open hook consultation connection at {}: {}; \
-                     governance hooks will degrade to ALLOW on every invocation",
+                     governance hooks will fail closed unless the explicit consultation-only \
+                     fail-open override is enabled and durable audit admission succeeds",
                     db_path.display(),
                     e,
                 );
@@ -5076,6 +5254,7 @@ pub async fn bootstrap_serve(
     );
 
     let mut task_handles: Vec<JoinHandle<()>> = Vec::new();
+    let blocking_tasks = Arc::new(AtomicUsize::new(0));
 
     if let Some(ref fed) = federation {
         tracing::info!(
@@ -5196,6 +5375,7 @@ pub async fn bootstrap_serve(
             == Some("1");
     spawn_family_embedding_precompute_if_enabled(
         &mut task_handles,
+        &blocking_tasks,
         precompute_family_embeddings_enabled,
         &family_embeddings,
         &embedder_arc,
@@ -5367,16 +5547,20 @@ pub async fn bootstrap_serve(
         };
         #[cfg(feature = "sal")]
         {
-            federation::spawn_catchup_loop_with_store(
+            task_handles.push(federation::spawn_catchup_loop_with_store(
                 fed.clone(),
                 catchup_db,
                 Some(store_handle.clone()),
                 interval,
-            );
+            ));
         }
         #[cfg(not(feature = "sal"))]
         {
-            federation::spawn_catchup_loop(fed.clone(), catchup_db, interval);
+            task_handles.push(federation::spawn_catchup_loop(
+                fed.clone(),
+                catchup_db,
+                interval,
+            ));
         }
 
         // v0.7.0 Track D #933 — federation push DLQ replay worker.
@@ -5386,8 +5570,11 @@ pub async fn bootstrap_serve(
         // `ai_memory_federation_push_dlq_depth` Prometheus gauge.
         #[cfg(feature = "sal")]
         if let Some(sink) = fed.dlq_sink.clone() {
-            let _replay_handle =
-                federation::spawn_replay_federation_push_dlq(fed.clone(), sink, interval);
+            task_handles.push(federation::spawn_replay_federation_push_dlq(
+                fed.clone(),
+                sink,
+                interval,
+            ));
             tracing::info!(
                 "federation push DLQ replay worker enabled: polling every {}s",
                 args.catchup_interval_secs,
@@ -5488,9 +5675,11 @@ pub async fn bootstrap_serve(
         let renewal_interval = Duration::from_secs(
             federation::identity::renewal::DEFAULT_RENEWAL_INTERVAL_SECS.unsigned_abs(),
         );
-        let _renewal_handle = federation::identity::renewal::spawn_refresh_outbound_credential(
-            db_state.clone(),
-            renewal_interval,
+        task_handles.push(
+            federation::identity::renewal::spawn_refresh_outbound_credential(
+                db_state.clone(),
+                renewal_interval,
+            ),
         );
         tracing::info!(
             "federation outbound credential renewal worker enabled: refreshing every {}s",
@@ -5647,15 +5836,6 @@ pub async fn bootstrap_serve(
         http_identity_mode,
     };
 
-    // v0.7.0 Policy-Engine Item 3 — register the deferred-audit
-    // supervisor task with the task_handles vec so `serve()` aborts
-    // it on shutdown. The supervisor wraps the drainer with panic
-    // recovery + graceful drain of buffered events when the queue is
-    // closed. This MUST be in `task_handles` so the test assertion in
-    // `test_bootstrap_serve_keyword_tier_no_embedder` updates its
-    // expected count accordingly.
-    task_handles.push(deferred_audit_supervisor);
-
     // Automatic GC. Cluster G (#767) — pass through the operator-
     // tunable `[confidence] shadow_retention_days` so the periodic
     // sweep on `confidence_shadow_observations` runs at the configured
@@ -5664,11 +5844,12 @@ pub async fn bootstrap_serve(
         crate::confidence::shadow::DEFAULT_SHADOW_RETENTION_DAYS,
         crate::config::ConfidenceConfig::effective_shadow_retention_days,
     );
-    task_handles.push(spawn_gc_loop_with_shadow_retention(
+    task_handles.push(spawn_gc_loop_with_shadow_retention_tracked(
         db_state.clone(),
         app_config.archive_max_days,
         shadow_retention_days,
         Duration::from_secs(GC_INTERVAL_SECS),
+        Arc::clone(&blocking_tasks),
     ));
 
     // #1690 — offloaded_blobs TTL sweep. `offload_ttl_sweep::spawn` existed but
@@ -5820,6 +6001,8 @@ pub async fn bootstrap_serve(
         // H7 (v0.7.0 round-2) — per-request HTTP timeout (default 60s).
         request_timeout: Duration::from_secs(app_config.effective_request_timeout_secs()),
         deferred_audit_metrics,
+        deferred_audit_shutdown,
+        blocking_tasks,
     })
 }
 
@@ -5836,16 +6019,88 @@ fn init_tracing() {
         .try_init();
 }
 
+/// Marker returned when daemon shutdown cannot prove that every writer has
+/// stopped. The binary boundary maps this to `EX_TEMPFAIL` before dropping the
+/// Tokio runtime, so an uncancellable synchronous writer cannot stall runtime
+/// destruction or race a final witness/checkpoint.
+#[derive(Debug)]
+pub struct FatalShutdownError {
+    reason: &'static str,
+    detail: Option<String>,
+}
+
+impl FatalShutdownError {
+    const fn new(reason: &'static str) -> Self {
+        Self {
+            reason,
+            detail: None,
+        }
+    }
+
+    fn with_detail(reason: &'static str, detail: String) -> Self {
+        Self {
+            reason,
+            detail: Some(detail),
+        }
+    }
+}
+
+impl std::fmt::Display for FatalShutdownError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "fatal daemon shutdown: {}", self.reason)?;
+        if let Some(detail) = &self.detail {
+            write!(formatter, ": {detail}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for FatalShutdownError {}
+
+const FINAL_CERTIFICATION_TIMEOUT: Duration = Duration::from_secs(5);
+const SERVER_AUX_TASK_REGISTRY_POISONED: &str = "server auxiliary task registry poisoned";
+
+fn fatal_shutdown(reason: &'static str) -> anyhow::Error {
+    tracing::error!(
+        reason,
+        "fatal daemon shutdown; final witness/checkpoint skipped"
+    );
+    eprintln!(
+        "ai-memory: fatal daemon shutdown: {reason}; final witness/checkpoint skipped (exit 75)"
+    );
+    anyhow::Error::new(FatalShutdownError::new(reason))
+}
+
+fn classify_server_failure(error: anyhow::Error) -> anyhow::Error {
+    let detail = format!("{error:#}");
+    tracing::error!(%error, "daemon server setup failed; operator correction required");
+    eprintln!("ai-memory: fatal daemon server setup failure: {detail} (exit 75)");
+    anyhow::Error::new(FatalShutdownError::with_detail(
+        "daemon server setup failed",
+        detail,
+    ))
+}
+
 /// Run the HTTP memory daemon. Loads TLS state, builds `AppState`, spawns
-/// the GC + WAL-checkpoint loops, and binds a listener (TLS or plain HTTP).
-///
-/// Behaviour is preserved from the pre-W6 inline `main::serve` body — only
-/// the structure has changed.
+/// lifecycle-owned workers, and binds a listener (TLS or plain HTTP). On every
+/// exit path it quiesces writers, drains deferred audit, and either completes
+/// final witness/WAL certification or returns [`FatalShutdownError`].
 #[allow(clippy::too_many_lines)]
 pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) -> Result<()> {
     init_tracing();
 
-    let bootstrap = bootstrap_serve(&db_path, &args, app_config).await?;
+    let mut bootstrap = match bootstrap_serve(&db_path, &args, app_config).await {
+        Ok(bootstrap) => bootstrap,
+        Err(error) => {
+            let detail = format!("{error:#}");
+            tracing::error!(%error, "daemon bootstrap failed; terminating before runtime drop");
+            eprintln!("ai-memory: fatal daemon bootstrap failure: {detail} (exit 75)");
+            return Err(anyhow::Error::new(FatalShutdownError::with_detail(
+                "daemon bootstrap failed",
+                detail,
+            )));
+        }
+    };
 
     // Round-2 F8 + Round-3 F12 — startup banner. Surfaces the effective
     // permissions mode (and the v0.7.0 enforce-default migration warning
@@ -5949,7 +6204,7 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         let reload_models = Arc::clone(&bootstrap.app_state.resolved_models);
         let reload_tier = app_config.effective_tier(None);
         let reload_db = db_path.clone();
-        tokio::spawn(async move {
+        bootstrap.task_handles.push(tokio::spawn(async move {
             let mut hup =
                 match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
                     Ok(sig) => sig,
@@ -5970,7 +6225,7 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
                 )
                 .await;
             }
-        });
+        }));
     }
 
     // Graceful shutdown. The signal future only waits for ctrl_c and
@@ -5991,167 +6246,250 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         let _ = tokio::signal::ctrl_c().await;
         tracing::info!("shutting down — draining deferred-audit queue then checkpointing WAL");
     };
+    let api_key_state = bootstrap.api_key_state;
+    let app_state = bootstrap.app_state;
+    let request_timeout = bootstrap.request_timeout;
+    let server_aux_tasks = Arc::new(std::sync::Mutex::new(Vec::<JoinHandle<()>>::new()));
+    let server_aux_tasks_for_run = Arc::clone(&server_aux_tasks);
 
     // Native TLS (Layer 1): if both --tls-cert and --tls-key are provided,
     // bind via axum-server + rustls. Plain HTTP otherwise — backward
     // compatible with every prior release. The `requires = …` clap
     // attributes prevent the half-configured case.
-    if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
-        // rustls 0.23 needs an explicit CryptoProvider; install ring
-        // before any TLS setup. Idempotent — second install is a
-        // harmless no-op via ignore.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        // Load TLS / mTLS config BEFORE printing the "listening" log
-        // so a misconfigured cert / key / allowlist surfaces the error
-        // first (red-team #248).
-        let tls_config = if let Some(allowlist_path) = &args.mtls_allowlist {
-            tracing::info!(
-                "mTLS enabled — client certs required. Allowlist: {}",
-                allowlist_path.display()
-            );
-            tls::load_mtls_rustls_config(cert, key, allowlist_path).await?
-        } else {
-            tracing::warn!(
-                "TLS enabled but mTLS NOT configured — sync endpoints \
+    let server_result: Result<()> = async move {
+        if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
+            // rustls 0.23 needs an explicit CryptoProvider; install ring
+            // before any TLS setup. Idempotent — second install is a
+            // harmless no-op via ignore.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            // Load TLS / mTLS config BEFORE printing the "listening" log
+            // so a misconfigured cert / key / allowlist surfaces the error
+            // first (red-team #248).
+            let tls_config = if let Some(allowlist_path) = &args.mtls_allowlist {
+                tracing::info!(
+                    "mTLS enabled — client certs required. Allowlist: {}",
+                    allowlist_path.display()
+                );
+                tls::load_mtls_rustls_config(cert, key, allowlist_path).await?
+            } else {
+                tracing::warn!(
+                    "TLS enabled but mTLS NOT configured — sync endpoints \
                  (/api/v1/sync/push, /api/v1/sync/since) accept any client. \
                  Set --mtls-allowlist for production peer-mesh deployments \
                  (red-team #231)."
-            );
-            tls::load_rustls_config(cert, key).await?
-        };
-        let app = crate::build_router_with_timeout(
-            bootstrap.api_key_state,
-            bootstrap.app_state,
-            bootstrap.request_timeout,
-        );
-        tracing::info!("ai-memory listening on https://{addr}");
-        let socket_addr: std::net::SocketAddr = addr.parse()?;
-        // axum-server doesn't have a direct graceful-shutdown on the
-        // TLS builder yet; spawn the signal listener on the Handle
-        // instead so ctrl_c triggers a graceful shutdown. Window is
-        // operator-configurable via --shutdown-grace-secs (default 30,
-        // bumped from 10 in v0.6.0 — red-team #233).
-        let grace = std::time::Duration::from_secs(args.shutdown_grace_secs);
-        let handle = axum_server::Handle::new();
-        let handle_clone = handle.clone();
-        tokio::spawn(async move {
-            shutdown.await;
-            handle_clone.graceful_shutdown(Some(grace));
-        });
-        // v0.7.0 #1581 — bind with the NoDelayAcceptor-wrapped rustls
-        // acceptor instead of `bind_rustls` (whose DefaultAcceptor never
-        // sets TCP_NODELAY). Without it, Nagle + the client's delayed-ACK
-        // timer added a fixed ~40 ms to the FIRST request of every fresh
-        // (m)TLS connection — the #1579 P3 fleet finding. Verifier chain
-        // and accept/reject semantics are unchanged; see
-        // `tls::serve_rustls_acceptor` + tests/mtls_nodelay_acceptor.rs.
-        //
-        // #2045 L6 — when the operator configures a cert-peer-binding map
-        // (`AI_MEMORY_FED_CERT_PEER_BINDING_MAP`), swap in the peer-binding
-        // acceptor so the presenting client cert's operator-bound peer-id is
-        // injected into request extensions for the `/sync/*` cross-check.
-        // Only meaningful under mTLS (peer certs exist only there); with no
-        // map the byte-identical `serve_rustls_acceptor` path is kept.
-        let cert_peer_bindings = if args.mtls_allowlist.is_some() {
-            tls::cert_peer_binding_map_from_env()?
+                );
+                tls::load_rustls_config(cert, key).await?
+            };
+            let app = crate::build_router_with_timeout(api_key_state, app_state, request_timeout);
+            tracing::info!("ai-memory listening on https://{addr}");
+            let socket_addr: std::net::SocketAddr = addr.parse()?;
+            // axum-server doesn't have a direct graceful-shutdown on the
+            // TLS builder yet; spawn the signal listener on the Handle
+            // instead so ctrl_c triggers a graceful shutdown. Window is
+            // operator-configurable via --shutdown-grace-secs (default 30,
+            // bumped from 10 in v0.6.0 — red-team #233).
+            let grace = std::time::Duration::from_secs(args.shutdown_grace_secs);
+            let handle = axum_server::Handle::new();
+            let handle_clone = handle.clone();
+            let signal_task = tokio::spawn(async move {
+                shutdown.await;
+                handle_clone.graceful_shutdown(Some(grace));
+            });
+            server_aux_tasks_for_run
+                .lock()
+                .expect(SERVER_AUX_TASK_REGISTRY_POISONED)
+                .push(signal_task);
+            // v0.7.0 #1581 — bind with the NoDelayAcceptor-wrapped rustls
+            // acceptor instead of `bind_rustls` (whose DefaultAcceptor never
+            // sets TCP_NODELAY). Without it, Nagle + the client's delayed-ACK
+            // timer added a fixed ~40 ms to the FIRST request of every fresh
+            // (m)TLS connection — the #1579 P3 fleet finding. Verifier chain
+            // and accept/reject semantics are unchanged; see
+            // `tls::serve_rustls_acceptor` + tests/mtls_nodelay_acceptor.rs.
+            //
+            // #2045 L6 — when the operator configures a cert-peer-binding map
+            // (`AI_MEMORY_FED_CERT_PEER_BINDING_MAP`), swap in the peer-binding
+            // acceptor so the presenting client cert's operator-bound peer-id is
+            // injected into request extensions for the `/sync/*` cross-check.
+            // Only meaningful under mTLS (peer certs exist only there); with no
+            // map the byte-identical `serve_rustls_acceptor` path is kept.
+            let cert_peer_bindings = if args.mtls_allowlist.is_some() {
+                tls::cert_peer_binding_map_from_env()?
+            } else {
+                None
+            };
+            // #2045 L6 — surface the inert-posture + open-L6-window footguns at
+            // boot so a set-but-ineffective control (or the still-vulnerable
+            // FED_REQUIRE_SIG=0 state) is loud, not silent.
+            for warning in cert_peer_binding_boot_warnings(
+                tls::cert_peer_binding_mode(),
+                args.mtls_allowlist.is_some(),
+                cert_peer_bindings.as_ref().is_some_and(|m| !m.is_empty()),
+                crate::federation::signing::require_sig(),
+            ) {
+                tracing::warn!(target: "federation::attestation", "{warning}");
+            }
+            if let Some(bindings) = cert_peer_bindings {
+                tracing::info!(
+                    bound_fingerprints = bindings.len(),
+                    "mTLS cert↔x-peer-id binding active (#2045 L6); posture: {:?}",
+                    tls::cert_peer_binding_mode()
+                );
+                axum_server::bind(socket_addr)
+                    .acceptor(tls::serve_rustls_acceptor_with_peer_binding(
+                        &tls_config,
+                        bindings,
+                    ))
+                    .handle(handle)
+                    .serve(app.into_make_service())
+                    .await?;
+            } else {
+                axum_server::bind(socket_addr)
+                    .acceptor(tls::serve_rustls_acceptor(&tls_config))
+                    .handle(handle)
+                    .serve(app.into_make_service())
+                    .await?;
+            }
         } else {
-            None
-        };
-        // #2045 L6 — surface the inert-posture + open-L6-window footguns at
-        // boot so a set-but-ineffective control (or the still-vulnerable
-        // FED_REQUIRE_SIG=0 state) is loud, not silent.
-        for warning in cert_peer_binding_boot_warnings(
-            tls::cert_peer_binding_mode(),
-            args.mtls_allowlist.is_some(),
-            cert_peer_bindings.as_ref().is_some_and(|m| !m.is_empty()),
-            crate::federation::signing::require_sig(),
-        ) {
-            tracing::warn!(target: "federation::attestation", "{warning}");
-        }
-        if let Some(bindings) = cert_peer_bindings {
-            tracing::info!(
-                bound_fingerprints = bindings.len(),
-                "mTLS cert↔x-peer-id binding active (#2045 L6); posture: {:?}",
-                tls::cert_peer_binding_mode()
-            );
-            axum_server::bind(socket_addr)
-                .acceptor(tls::serve_rustls_acceptor_with_peer_binding(
-                    &tls_config,
-                    bindings,
-                ))
-                .handle(handle)
-                .serve(app.into_make_service())
-                .await?;
-        } else {
-            axum_server::bind(socket_addr)
-                .acceptor(tls::serve_rustls_acceptor(&tls_config))
-                .handle(handle)
-                .serve(app.into_make_service())
-                .await?;
-        }
-    } else {
-        tracing::warn!(
-            "TLS NOT enabled — sync endpoints (/api/v1/sync/push, \
+            tracing::warn!(
+                "TLS NOT enabled — sync endpoints (/api/v1/sync/push, \
              /api/v1/sync/since) accept any caller over plain HTTP. \
              Set --tls-cert + --tls-key + --mtls-allowlist for production \
              peer-mesh deployments (red-team #231)."
-        );
-        tracing::info!("ai-memory listening on http://{addr}");
-        // Wave 3 (v0.6.3): the non-TLS path delegates to
-        // `daemon_runtime::serve_http_with_shutdown_future`, which is the
-        // same `build_router` + `TcpListener::bind` + `axum::serve` body
-        // the integration tests drive in-process. Production threads its
-        // WAL-checkpoint-on-shutdown future in directly so the cleanup
-        // semantic is preserved verbatim.
-        serve_http_with_shutdown_future_and_timeout(
-            &addr,
-            bootstrap.api_key_state,
-            bootstrap.app_state,
-            bootstrap.request_timeout,
-            shutdown,
-        )
-        .await?;
+            );
+            tracing::info!("ai-memory listening on http://{addr}");
+            // Production plain HTTP uses the same bounded graceful-shutdown
+            // handle as TLS. The generic axum test helper intentionally keeps
+            // its caller-controlled future, but has no grace deadline of its
+            // own and therefore is not suitable for the service-manager path.
+            let socket_addr: std::net::SocketAddr = addr.parse()?;
+            let app = crate::build_router_with_timeout(api_key_state, app_state, request_timeout);
+            let grace = Duration::from_secs(args.shutdown_grace_secs);
+            let handle = axum_server::Handle::new();
+            let handle_clone = handle.clone();
+            let signal_task = tokio::spawn(async move {
+                shutdown.await;
+                handle_clone.graceful_shutdown(Some(grace));
+            });
+            server_aux_tasks_for_run
+                .lock()
+                .expect(SERVER_AUX_TASK_REGISTRY_POISONED)
+                .push(signal_task);
+            axum_server::bind(socket_addr)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await?;
+        }
+        Ok(())
+    }
+    .await;
+    bootstrap.task_handles.extend(
+        server_aux_tasks
+            .lock()
+            .expect(SERVER_AUX_TASK_REGISTRY_POISONED)
+            .drain(..),
+    );
+
+    // Stop and join every periodic/background writer before establishing the
+    // deferred-audit receiver-close barrier. Dropping a Tokio JoinHandle would
+    // detach the task and permit a late write after the final checkpoint.
+    for task in &bootstrap.task_handles {
+        task.abort();
+    }
+    let task_join_deadline = tokio::time::Instant::now()
+        + crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT;
+    for task in bootstrap.task_handles {
+        match tokio::time::timeout_at(task_join_deadline, task).await {
+            Err(_) => {
+                return Err(fatal_shutdown(
+                    "background writer shutdown deadline exceeded",
+                ));
+            }
+            Ok(Err(error)) if !error.is_cancelled() => {
+                tracing::error!(%error, "background writer task failed before shutdown");
+                return Err(fatal_shutdown("background writer task failed"));
+            }
+            Ok(Ok(())) | Ok(Err(_)) => {}
+        }
+    }
+    while bootstrap.blocking_tasks.load(Ordering::SeqCst) != 0 {
+        if tokio::time::Instant::now() >= task_join_deadline {
+            return Err(fatal_shutdown("blocking writer shutdown deadline exceeded"));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let subscription_deadline =
+        tokio::time::Instant::now() + crate::subscriptions::SHUTDOWN_DRAIN_TIMEOUT;
+    while crate::subscriptions::dispatch_in_flight() != 0 {
+        if tokio::time::Instant::now() >= subscription_deadline {
+            return Err(fatal_shutdown(
+                "subscription dispatch shutdown deadline exceeded",
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // v0.7.0 Policy-Engine Item 3 — the HTTP server has now fully
-    // quiesced (graceful shutdown complete; no in-flight request can
-    // submit another refusal), so `submitted` is final. Drain the
-    // deferred-audit queue before exit so every refusal captured during
-    // the daemon's life lands in `signed_events`. We can NOT use
-    // `close_and_flush` here: the governance hooks
-    // (`storage::GOVERNANCE_PRE_WRITE`, `wire_check::GOVERNANCE_PRE_ACTION`)
-    // hold sender clones inside process-wide `OnceLock`s that never drop,
-    // so the channel never closes and awaiting the supervisor would block
-    // forever. `drain_pending` instead polls the shared atomic metrics
-    // until the drainer has caught up to the submitted count.
-    let drained = crate::governance::deferred_audit::drain_pending(
-        &drain_metrics,
-        crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
-    )
-    .await;
-    if drained {
-        tracing::info!(
-            "deferred-audit queue drained ({} refusals accounted) — checkpointing WAL",
-            drain_metrics.submitted_count()
-        );
-    } else {
-        tracing::warn!(
-            "deferred-audit drain timed out after {:?}: {} submitted but only {} accounted — \
-             some refusal audit rows may not have flushed before exit",
-            crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
-            drain_metrics.submitted_count(),
-            drain_metrics.appended_count()
-                + drain_metrics.append_failure_count()
-                + drain_metrics.send_failure_count(),
-        );
+    // Process-global governance hooks retain sender clones forever. Ask the
+    // supervisor to close its receiver instead: sends linearized before close
+    // are drained, while later journal-backed sends fail closed and retain
+    // durable boot-recovery evidence. Awaiting the supervisor also proves the
+    // audit writer has stopped before the witness and WAL checkpoint.
+    match bootstrap
+        .deferred_audit_shutdown
+        .close_and_flush(crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT)
+        .await
+    {
+        Ok(true) => {
+            tracing::info!(
+                "deferred-audit queue drained ({} refusals accounted) — checkpointing WAL",
+                drain_metrics.submitted_count()
+            );
+        }
+        Ok(false) => {
+            return Err(fatal_shutdown(
+                "deferred-audit shutdown deadline exceeded; durable spool retained for boot recovery",
+            ));
+        }
+        Err(error) => {
+            tracing::error!(%error, "deferred-audit supervisor failed during shutdown");
+            return Err(fatal_shutdown(
+                "deferred-audit supervisor failed; durable spool retained for boot recovery",
+            ));
+        }
     }
 
     // Final witness flush + WAL checkpoint now that every writer (HTTP
     // handlers + the deferred-audit drainer) has quiesced. The drainer's
     // appends share this database's WAL file, so this single checkpoint
     // folds them in even though the drainer holds its own connection.
-    shutdown_witness_flush_and_checkpoint(&checkpoint_state).await;
+    let certification_state = checkpoint_state.clone();
+    let mut certification_task =
+        tokio::spawn(
+            async move { shutdown_witness_flush_and_checkpoint(&certification_state).await },
+        );
+    match tokio::time::timeout(FINAL_CERTIFICATION_TIMEOUT, &mut certification_task).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => {
+            tracing::error!(%error, "final witness/WAL certification failed");
+            return Err(fatal_shutdown("final witness/WAL certification failed"));
+        }
+        Ok(Err(error)) => {
+            tracing::error!(%error, "final witness/WAL certification task failed");
+            return Err(fatal_shutdown(
+                "final witness/WAL certification task failed",
+            ));
+        }
+        Err(_) => {
+            certification_task.abort();
+            return Err(fatal_shutdown(
+                "final witness/WAL certification deadline exceeded",
+            ));
+        }
+    }
 
+    if let Err(error) = server_result {
+        return Err(classify_server_failure(error));
+    }
     Ok(())
 }
 
@@ -6164,12 +6502,17 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
 /// deferred-audit queue has drained, so the witnessed head includes every
 /// append of the daemon's life. Inherits the emitter's own gating: with no
 /// enrolled witness key the emission is a no-op (byte-identical legacy
-/// shutdown); emission failures are logged + swallowed (fire-and-forget —
-/// shutdown never fails on a witness error).
-pub async fn shutdown_witness_flush_and_checkpoint(db_state: &Db) {
+/// shutdown). The caller must treat any witness/checkpoint failure as an
+/// uncertified shutdown. A failure can leave a witness checkpoint or
+/// off-table anchor partially committed; neither is a clean-shutdown claim,
+/// and both remain available for operator triage and idempotent recovery.
+///
+/// # Errors
+/// Returns an error when final witness emission or the WAL checkpoint fails.
+pub async fn shutdown_witness_flush_and_checkpoint(db_state: &Db) -> Result<()> {
     let lock = db_state.lock().await;
-    crate::signed_events::force_emit_audit_head_witness(&lock.0);
-    let _ = db::checkpoint(&lock.0);
+    crate::signed_events::try_force_emit_audit_head_witness(&lock.0)?;
+    db::checkpoint(&lock.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -6347,13 +6690,10 @@ pub async fn serve_http_with_shutdown(
     .await
 }
 
-/// Variant of [`serve_http_with_shutdown`] that takes an arbitrary
-/// shutdown future. The production `serve()` needs to run a WAL
-/// checkpoint after the OS signal but before tearing down the listener;
-/// that cleanup work is awkward to express through a `Notify` alone.
-/// Accepting a `Future` lets the caller embed any async cleanup into the
-/// shutdown future itself, while the helper keeps the `build_router` +
-/// `TcpListener::bind` + `axum::serve` body it already owns.
+/// Variant of [`serve_http_with_shutdown`] that takes an arbitrary shutdown
+/// future. This is an in-process harness surface; production [`serve`] uses
+/// `axum_server::Handle` for a bounded grace period and performs writer drains
+/// plus final certification only after the listener has quiesced.
 pub async fn serve_http_with_shutdown_future<F>(
     addr: &str,
     api_key_state: ApiKeyState,
@@ -6737,6 +7077,10 @@ fn _imports_in_use(_: Instant, _: Duration) {}
 // ===========================================================================
 
 #[cfg(test)]
+#[path = "daemon_runtime_shutdown_tests.rs"]
+mod daemon_runtime_shutdown_tests;
+
+#[cfg(test)]
 #[allow(deprecated)] // DOC-6: tests intentionally exercise legacy AppConfig flat fields
 mod tests {
     use super::*;
@@ -6936,6 +7280,32 @@ mod tests {
     /// posture. The pre-#1455 behaviour silently degraded to ALLOW,
     /// disabling the entire substrate write-gate whenever `db::open`
     /// failed at boot.
+    #[test]
+    fn governance_consultation_posture_pins_closed_open_and_admission_failure() {
+        let reason = "governance:consultation_failed: injected";
+
+        assert_eq!(
+            governance_consultation_refusal_reason(false, true, reason),
+            Some(reason.to_string()),
+            "secure default must fail closed after durable audit admission"
+        );
+        assert_eq!(
+            governance_consultation_refusal_reason(true, true, reason),
+            None,
+            "explicit override may allow only after durable audit admission"
+        );
+        assert_eq!(
+            governance_consultation_refusal_reason(true, false, reason),
+            Some(crate::governance::deferred_audit::AUDIT_ADMISSION_FAILED.to_string()),
+            "audit admission failure must override the fail-open setting"
+        );
+        assert_eq!(
+            governance_consultation_refusal_reason(false, false, reason),
+            Some(crate::governance::deferred_audit::AUDIT_ADMISSION_FAILED.to_string()),
+            "audit admission failure must remain fail closed"
+        );
+    }
+
     #[test]
     fn governance_consultation_unavailable_fails_closed_by_default_1455() {
         use crate::governance::agent_action::AgentAction;
@@ -7815,7 +8185,13 @@ mod tests {
         let cache: FamilyEmbeddingsCache = Arc::new(tokio::sync::RwLock::new(None));
         let embedder: Arc<Option<Embedder>> = Arc::new(None);
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
-        spawn_family_embedding_precompute_if_enabled(&mut handles, true, &cache, &embedder);
+        spawn_family_embedding_precompute_if_enabled(
+            &mut handles,
+            &Arc::new(AtomicUsize::new(0)),
+            true,
+            &cache,
+            &embedder,
+        );
         assert_eq!(
             handles.len(),
             1,
@@ -7835,8 +8211,148 @@ mod tests {
 
         // disabled=false: the else arm (debug log) — no task spawned.
         let mut none_handles: Vec<JoinHandle<()>> = Vec::new();
-        spawn_family_embedding_precompute_if_enabled(&mut none_handles, false, &cache, &embedder);
+        spawn_family_embedding_precompute_if_enabled(
+            &mut none_handles,
+            &Arc::new(AtomicUsize::new(0)),
+            false,
+            &cache,
+            &embedder,
+        );
         assert!(none_handles.is_empty(), "disabled path spawns no task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tracked_blocking_child_survives_outer_abort_until_work_finishes() {
+        let tracker = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let entered = Arc::new(AtomicBool::new(false));
+        let outer_tracker = Arc::clone(&tracker);
+        let outer_release = Arc::clone(&release);
+        let outer_entered = Arc::clone(&entered);
+        let outer = tokio::spawn(async move {
+            let child = spawn_tracked_blocking(&outer_tracker, move || {
+                outer_entered.store(true, Ordering::SeqCst);
+                let (lock, condition) = &*outer_release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = condition.wait(released).unwrap();
+                }
+            });
+            let _ = child.await;
+        });
+        while !entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        outer.abort();
+        let _ = outer.await;
+        assert_eq!(tracker.load(Ordering::SeqCst), 1);
+
+        let (lock, condition) = &*release;
+        *lock.lock().unwrap() = true;
+        condition.notify_all();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while tracker.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("tracked blocking child must release its guard");
+    }
+
+    #[test]
+    fn shipped_systemd_units_preserve_graceful_shutdown_budget() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let unit = std::fs::read_to_string(root.join("packaging/systemd/ai-memory.service"))
+            .expect("read packaged systemd unit");
+        assert!(unit.contains("KillSignal=SIGINT"));
+        assert!(unit.contains("TimeoutStopSec=90"));
+        assert!(unit.contains("RestartPreventExitStatus=75"));
+
+        let hive =
+            std::fs::read_to_string(root.join("deploy/hive-1461/provision/50_federation.sh"))
+                .expect("read hive provisioning script");
+        assert!(hive.contains("KillSignal=SIGINT"));
+        assert!(hive.contains("TimeoutStopSec=90"));
+        assert!(hive.contains("RestartPreventExitStatus=75"));
+
+        let digital_ocean =
+            std::fs::read_to_string(root.join("deploy/do-1461/provision/50_federation.sh"))
+                .expect("read DigitalOcean provisioning script");
+        assert!(digital_ocean.contains("KillSignal=SIGINT"));
+        assert!(digital_ocean.contains("TimeoutStopSec=90"));
+        assert!(digital_ocean.contains("RestartPreventExitStatus=75"));
+
+        let default_shutdown_budget = Duration::from_secs(30)
+            + crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT
+            + crate::subscriptions::SHUTDOWN_DRAIN_TIMEOUT
+            + crate::governance::deferred_audit::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT
+            + FINAL_CERTIFICATION_TIMEOUT;
+        assert!(default_shutdown_budget < Duration::from_secs(90));
+    }
+
+    #[test]
+    fn server_failures_map_to_non_restarting_fatal_status() {
+        let error = classify_server_failure(anyhow::anyhow!("listener failed"));
+        let fatal = error
+            .downcast_ref::<FatalShutdownError>()
+            .expect("server failure must become a fatal shutdown error");
+        assert_eq!(fatal.reason, "daemon server setup failed");
+        assert_eq!(fatal.detail.as_deref(), Some("listener failed"));
+        assert_eq!(
+            fatal.to_string(),
+            "fatal daemon shutdown: daemon server setup failed: listener failed"
+        );
+    }
+
+    #[test]
+    fn fatal_shutdown_without_detail_preserves_exit_reason() {
+        let error = fatal_shutdown("background writer task failed");
+        let fatal = error
+            .downcast_ref::<FatalShutdownError>()
+            .expect("shutdown failure must retain its typed marker");
+        assert_eq!(fatal.reason, "background writer task failed");
+        assert!(fatal.detail.is_none());
+        assert_eq!(
+            fatal.to_string(),
+            "fatal daemon shutdown: background writer task failed"
+        );
+    }
+
+    #[test]
+    fn blocking_task_guard_decrements_tracker_on_every_exit_path() {
+        let tracker = Arc::new(AtomicUsize::new(2));
+        {
+            let _first = BlockingTaskGuard(Arc::clone(&tracker));
+            assert_eq!(tracker.load(Ordering::SeqCst), 2);
+        }
+        assert_eq!(tracker.load(Ordering::SeqCst), 1);
+        drop(BlockingTaskGuard(Arc::clone(&tracker)));
+        assert_eq!(tracker.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn serve_bootstrap_failure_returns_typed_fatal_shutdown() {
+        let env = TestEnv::fresh();
+        std::fs::write(&env.db_path, b"not a directory").expect("create parent file");
+        let unopenable = env.db_path.join("daemon.db");
+        let error = serve(
+            unopenable,
+            args_with_db(&env.db_path),
+            &AppConfig::default(),
+        )
+        .await
+        .expect_err("an unopenable database path must stop daemon bootstrap");
+        let fatal = error
+            .downcast_ref::<FatalShutdownError>()
+            .expect("bootstrap failure must retain the service-manager marker");
+        assert_eq!(fatal.reason, "daemon bootstrap failed");
+        assert!(
+            fatal
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("daemon.db")),
+            "fatal detail must preserve the failing database path: {fatal}"
+        );
     }
 
     // ----- spawn_gc_loop / spawn_wal_checkpoint_loop --------------------
@@ -8164,7 +8680,7 @@ mod tests {
         // parallel CI load — see the gate site in `bootstrap_serve`
         // for the rationale. The task count reverts to nine when the
         // env var is unset.
-        assert_eq!(bs.task_handles.len(), 9);
+        assert_eq!(bs.task_handles.len(), 8);
         // Cleanly abort the spawned tasks so they don't leak across tests.
         for h in bs.task_handles {
             h.abort();

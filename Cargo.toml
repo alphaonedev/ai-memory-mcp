@@ -37,7 +37,7 @@ dirs = "6"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 clap_mangen = "0.2"
-rusqlite = { version = "0.32" }
+rusqlite = { version = "0.32", features = ["functions"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # v0.7.0 #972 D1.1 (#982) — schemars derives the MCP tool inputSchema
@@ -56,6 +56,13 @@ tokio = { version = "1", features = ["full"] }
 # Pure Rust, dep-light, both are in the tokio family.
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-core = "0.3"
+# #2271 — cross-process advisory lock for deferred-audit spool admission,
+# preventing concurrent daemon/MCP processes from overshooting byte/inode caps.
+# Pure-Rust facade over flock/LockFileEx; no native build script.
+fs2 = "0.4"
+# Cross-platform stable file identity (dev+ino on Unix, volume/file ID on
+# Windows) for detecting spool-directory and lock-path replacement races.
+same-file = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 # v0.6.3.1 (PR-5 / issue #487) — rolling file appender for the
@@ -256,6 +263,7 @@ thiserror = { version = "2", optional = true }
 # the `vector` type used by the hybrid-recall path.
 sqlx = { version = "0.8", optional = true, default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json", "macros"] }
 pgvector = { version = "0.4", optional = true, features = ["sqlx"] }
+notify = { version = "8.2.0", optional = true }
 
 # v0.6.0.0 — SQLite variant selection. Default builds the standard
 # bundled SQLite (matching pre-v0.6.0.0 behavior byte-for-byte). The
@@ -301,6 +309,16 @@ e2e = []
 # Linux-only journald sink, avoiding the operator-gated dep additions of the
 # original #1765). cfg(feature) consumer: `src/logging.rs` (arch-11 audit).
 syslog = []
+# #1978 (v1.0.0) — OPT-IN inotify/FSEvents/ReadDirectoryChangesW-backed L3
+# watch path (the `notify` crate, notify-rs org, CC0-1.0). OFF by default:
+# the std-only `std::fs::metadata` poll loop stays the portable default and
+# the build is byte-identical when this flag is off (the `notify` dep is not
+# compiled). When ON, `run_watch_daemon` first tries the event-driven loop
+# and FALLS BACK to the poll loop on any init failure (unsupported platform,
+# watch-limit exhaustion, no watchable dir) so capture never silently stops
+# (North Star: DEGRADE, never corrupt). cfg(feature) consumer:
+# `src/recover/watcher.rs` (arch-11 audit).
+fs-notify = ["dep:notify"]
 # v1.0.0 #1860 — OPT-IN vectorlite ANN backend scaffolding. OFF by
 # default and deliberately NOT in any CI job or release channel: the
 # vectorlite native library (an Apache-2.0 C++ SQLite loadable
@@ -326,9 +344,9 @@ tempfile = "3"
 # v0.7.0 Cluster-F PERF regression suite (`tests/cluster_f_perf_regressions.rs`)
 # needs `Connection::trace` to count individual statements fired during
 # recall, so the `trace` feature on rusqlite is dev-only. Production
-# builds keep the bare `rusqlite = { version = "0.32" }` import — the
-# trace surface compiles into a no-op without this feature.
-rusqlite = { version = "0.32", features = ["trace"] }
+# builds enable only the production `functions` surface; the `trace` surface
+# compiles into a no-op outside dev/test builds.
+rusqlite = { version = "0.32", features = ["functions", "trace"] }
 tower = { version = "0.5", features = ["util"] }
 # Wave 4 (v0.6.3) — TLS test fixture generator. Pinned to an exact version
 # so cert / key / fingerprint bytes stay stable across machines (rcgen's
@@ -383,6 +401,11 @@ libc = "0.2"
 # hash chain, not the file flag.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Deferred-audit crash evidence is created with an explicit protected DACL and
+# validated by handle on Windows. Keep the Win32 surface target-only.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
 [[bench]]
 name = "recall"

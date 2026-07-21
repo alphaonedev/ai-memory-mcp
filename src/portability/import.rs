@@ -9,7 +9,7 @@
 //! **FAIL-CLOSED and ALL-OR-NOTHING**:
 //!
 //! - **One transaction.** Every class is applied inside ONE
-//!   [`rusqlite::Connection::unchecked_transaction`]. A fatal per-row error (a
+//!   `BEGIN IMMEDIATE` [`rusqlite::Transaction`]. A fatal per-row error (a
 //!   malformed DTO, a DB fault) short-circuits via `?`, the [`rusqlite::Transaction`]
 //!   drops WITHOUT commit, and SQLite rolls the whole import back — so a rejected
 //!   bundle applies **ZERO rows**. There is no partial apply.
@@ -69,6 +69,11 @@ use crate::identity::lineage::LineageCheck;
 use crate::portability::emit::{ExportEnvelope, SPEC_VERSION_V2};
 use crate::signed_events::TruncationCheck;
 use crate::storage::ConflictMode;
+
+/// `tracing` target for every importer WARN (the
+/// `federation_receive::ATTESTATION_TRACE_TARGET` const precedent —
+/// pm-v3.1 no-hardcoded-literals).
+const IMPORT_TRACE_TARGET: &str = "portability::import";
 
 /// Caller-supplied dispositions for a v2 integrity import (#2211).
 ///
@@ -157,6 +162,37 @@ pub struct ImportReport {
     /// Memory rows skipped under `--on-conflict error` because their
     /// `(title, namespace)` collided with an existing destination row.
     pub conflicts_skipped: usize,
+    /// Memory rows skipped because they failed the L1-parity input
+    /// validation ([`crate::validate::validate_memory`]) — size / range /
+    /// RFC3339 (incl. the #1834 `valid_from`/`valid_until`) / refuse-mode
+    /// secret screen (pre-ship 3x7 HIGH-2; the `cli::io` L1 import has run
+    /// this per-row gate since #1780 — the v2 route ran ZERO validation).
+    pub invalid_skipped: usize,
+    /// Link rows skipped because they failed
+    /// [`crate::validate::validate_link`] (id shape / relation / self-link).
+    pub invalid_links_skipped: usize,
+    /// Link rows skipped because an endpoint memory is ABSENT at insert
+    /// time (skipped earlier in this import — tombstoned / archived /
+    /// invalid / forged / conflict-refused — or never present at the
+    /// destination). `memory_links` carries `REFERENCES memories(id)`
+    /// FKs and `db::open` sets `PRAGMA foreign_keys=ON`; SQLite's
+    /// `OR IGNORE` conflict resolution does NOT apply to FK constraints,
+    /// so without this probe one dangling edge would FK-error and roll
+    /// back the WHOLE all-or-nothing transaction (pre-ship 3x7 F1).
+    pub links_skipped_missing_endpoint: usize,
+    /// Memory rows whose wire-asserted attestation was NOT honoured: the
+    /// bundle claimed `attest_level=agent_attested` (or presented a
+    /// signature) but the DESTINATION could not verify it (re-attributed
+    /// under restamp, no destination-enrolled author key, or no signature),
+    /// so the row landed `attest_level=claimed` (pre-ship 3x7 HIGH-1 — the
+    /// wire `attest_level` is NEVER trusted).
+    pub attestation_downgraded: usize,
+    /// Memory rows SKIPPED because they presented a `write_signature` that
+    /// FAILED verification against the destination-enrolled author key — a
+    /// presented-but-invalid signature is always rejected, never downgraded
+    /// to `claimed` (the #1464 invariant; mirrors the federation receive
+    /// path's per-row skip disposition).
+    pub forged_signature_skipped: usize,
     /// `true` when the imported audit spine re-verified in the transaction.
     pub reverify_chain_ok: bool,
     /// `true` when the staged `memory_revisions` chain replayed cleanly
@@ -221,17 +257,40 @@ pub fn import_full_envelope(
             env.db_schema_version
         );
     }
+    // ── Pre-ship 3x7 advisory — the explicit-trust posture is LOUD. ──
+    // Under `--trust-source` wire identity claims (metadata.agent_id /
+    // agent_pubkey) are preserved VERBATIM by design (operator-trusted
+    // backup restore), which includes `_agents` registration rows that can
+    // ENROLL key material consulted by future write/federation
+    // verification (`db::agent_pubkey`). That is the accepted risk of
+    // explicit operator trust — never import an untrusted bundle under
+    // this flag (see #2264 for the v1-wire-form sibling).
+    if opts.trust_source {
+        tracing::warn!(
+            target: IMPORT_TRACE_TARGET,
+            "--trust-source: wire identity claims (metadata.agent_id / agent_pubkey) are \
+             preserved VERBATIM — imported _agents registration rows can enroll key material \
+             for future verification; accepted risk of explicit operator trust (#2264)"
+        );
+    }
     // ── ALL-OR-NOTHING: one transaction wraps the entire apply. ──
-    // `unchecked_transaction` issues BEGIN DEFERRED on `&Connection`; every
-    // helper below is either a raw `execute` or a transaction-free storage
-    // primitive (`storage::insert` / `storage::get` open no inner tx), so no
-    // nested-transaction hazard arises. On any `?` below the `Transaction`
-    // drops here without commit → SQLite ROLLBACK → zero rows applied.
-    let tx = conn
-        .unchecked_transaction()
-        .context("portability import: could not open the atomic import transaction")?;
+    // Take the write reservation BEFORE the destination trust snapshot.
+    // BEGIN DEFERRED allowed another writer to commit after that snapshot,
+    // making verification use a stale/revoked key and the later write upgrade
+    // fail with un-retried SQLITE_BUSY_SNAPSHOT (#2250). IMMEDIATE either
+    // acquires the reservation before any trust read or returns retriable busy
+    // without applying any rows.
+    let tx = begin_atomic_import(conn)?;
+    // ── Pre-ship 3x7 HIGH-1: snapshot the DESTINATION-enrolled author keys
+    // AFTER reserving the writer but BEFORE staging any bundle row. Verifying against a
+    // lookup made INSIDE the transaction would let a crafted bundle
+    // self-enroll (stage an `_agents` registration row carrying an
+    // attacker `agent_pubkey`, then have a later row in the SAME bundle
+    // "verify" against it). The snapshot pins verification to the keys the
+    // destination trusted at this transaction's serialization point.
+    let enrolled_keys = snapshot_dest_enrolled_keys(&tx, env, opts)?;
 
-    let mut report = apply_all_classes(&tx, env, opts)?;
+    let mut report = apply_all_classes(&tx, env, opts, &enrolled_keys)?;
 
     // ── FAIL-CLOSED spine gate ──
     // Re-verify the STAGED audit spine with the substrate's own authoritative
@@ -303,12 +362,18 @@ pub fn import_full_envelope(
     Ok(report)
 }
 
+fn begin_atomic_import(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
+    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .context("portability import: could not open the atomic BEGIN IMMEDIATE transaction")
+}
+
 /// Stage every class into `conn` (a live transaction). Any `?` here aborts the
 /// whole import (the caller's transaction rolls back).
 fn apply_all_classes(
     conn: &Connection,
     env: &ExportEnvelope,
     opts: &ImportOptions,
+    enrolled_keys: &std::collections::HashMap<String, Option<String>>,
 ) -> Result<ImportReport> {
     let mut report = ImportReport::default();
 
@@ -339,7 +404,7 @@ fn apply_all_classes(
                 t.memory_id
             ));
             tracing::warn!(
-                target: "portability::import",
+                target: IMPORT_TRACE_TARGET,
                 memory_id = %t.memory_id,
                 "bundle forget_tombstone skipped: id is live at the destination"
             );
@@ -400,19 +465,21 @@ fn apply_all_classes(
         // `--trust-source`; see `ImportOptions::trust_source`). Mirrors the
         // L1 path byte-for-byte: the caller's id replaces
         // `metadata.agent_id` and the original claim is preserved under
-        // `imported_from_agent_id`.
+        // `imported_from_agent_id`. The ORIGINAL claim is hoisted so the
+        // attestation re-derivation below can apply the federation
+        // re-attribution rule (`apply_inbound_write_attestation`).
+        let original_claim = staged
+            .metadata
+            .get(crate::META_KEY_AGENT_ID)
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string);
         if !opts.trust_source {
-            let original = staged
-                .metadata
-                .get("agent_id")
-                .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string);
             if let Some(obj) = staged.metadata.as_object_mut() {
                 obj.insert(
-                    "agent_id".to_string(),
+                    crate::META_KEY_AGENT_ID.to_string(),
                     serde_json::Value::String(opts.caller_agent_id.clone()),
                 );
-                if let Some(orig) = original.as_ref()
+                if let Some(orig) = original_claim.as_ref()
                     && orig.as_str() != opts.caller_agent_id
                 {
                     obj.insert(
@@ -422,6 +489,49 @@ fn apply_all_classes(
                     report.restamped += 1;
                 }
             }
+        }
+        // ── Pre-ship 3x7 HIGH-1 — NEVER trust wire attestation. ──
+        // Bundles are UNAUTHENTICATED input (this module's own threat
+        // model), yet pre-fix the wire-supplied `metadata.attest_level` /
+        // `write_signature` / `agent_pubkey` persisted VERBATIM — a crafted
+        // bundle minted `attest_level=agent_attested` rows this node's
+        // trust surfaces (`row_is_agent_attested`, quarantine routing,
+        // forensics) then believed. Re-derive the attestation from what the
+        // DESTINATION can verify, mirroring the federation
+        // `apply_inbound_write_attestation` discipline (reused via the same
+        // `stamp_attestation` gate). A presented-but-FORGED signature skips
+        // the row (per-row skip + WARN, the federation caller's
+        // disposition); everything else lands `claimed` at worst.
+        if !apply_import_attestation(
+            &mut staged,
+            original_claim.as_deref(),
+            opts.trust_source,
+            enrolled_keys,
+            &mut report,
+        )? {
+            continue;
+        }
+        // ── Pre-ship 3x7 HIGH-2 — L1-parity input validation. ──
+        // The `cli::io` L1 wire-form has validated every imported row since
+        // #1780 (`validate::validate_memory` at src/cli/io.rs); the v2
+        // route ran ZERO validation, landing rows that violate every write
+        // invariant (MAX_CONTENT_SIZE, priority/confidence ranges, RFC3339
+        // timestamps incl. #1834 valid_from/valid_until, refuse-mode secret
+        // screen). Per-row skip + WARN — the bundle continues, matching the
+        // tombstone/conflict disposition posture; never a silent accept.
+        if let Err(e) = crate::validate::validate_memory(&staged) {
+            report.invalid_skipped += 1;
+            report.warnings.push(format!(
+                "memory {} skipped: failed input validation: {e}",
+                staged.id
+            ));
+            tracing::warn!(
+                target: IMPORT_TRACE_TARGET,
+                memory_id = %staged.id,
+                error = %e,
+                "bundle memory skipped: failed L1-parity input validation (pre-ship 3x7)"
+            );
+            continue;
         }
         // #2211 — honour the operator's `(title, namespace)` collision
         // disposition (the L1 `--on-conflict` semantics). Pre-#2211 the v2
@@ -467,6 +577,57 @@ fn apply_all_classes(
         report.memories += 1;
     }
     for link in &env.links {
+        // Pre-ship 3x7 HIGH-2 (link lane) — L1 parity with the `cli::io`
+        // per-link `validate::validate_link` gate: id shape, closed
+        // relation vocabulary, and the self-link refusal. Per-row skip +
+        // WARN; the bundle continues.
+        if let Err(e) =
+            crate::validate::validate_link(&link.source_id, &link.target_id, link.relation.as_str())
+        {
+            report.invalid_links_skipped += 1;
+            report.warnings.push(format!(
+                "link {}->{} skipped: failed input validation: {e}",
+                link.source_id, link.target_id
+            ));
+            tracing::warn!(
+                target: IMPORT_TRACE_TARGET,
+                source_id = %link.source_id,
+                target_id = %link.target_id,
+                error = %e,
+                "bundle link skipped: failed L1-parity input validation (pre-ship 3x7)"
+            );
+            continue;
+        }
+        // ── Pre-ship 3x7 F1 — endpoint-presence gate (FK-abort trap). ──
+        // `memory_links.source_id`/`target_id` carry `REFERENCES
+        // memories(id)` FKs and `db::open` sets `PRAGMA foreign_keys=ON`.
+        // SQLite's ON-CONFLICT resolution does NOT apply to FOREIGN KEY
+        // constraints, so `INSERT OR IGNORE` does NOT skip a dangling edge
+        // — it raises an FK error that `?`-aborts the whole all-or-nothing
+        // transaction (zero rows land, the report/WARNs never surface),
+        // directly contradicting the per-row skip disposition. Probe both
+        // endpoints against the STAGED state (the memories loop above ran
+        // in this same transaction) and skip + WARN + count any edge whose
+        // endpoint is absent: skipped earlier in this import (tombstoned /
+        // archived / invalid / forged / conflict-refused) or simply never
+        // present at the destination.
+        if !memory_row_exists(conn, &link.source_id)? || !memory_row_exists(conn, &link.target_id)?
+        {
+            report.links_skipped_missing_endpoint += 1;
+            report.warnings.push(format!(
+                "link {}->{} skipped: an endpoint memory is absent at the destination \
+                 (skipped earlier in this import, or never present)",
+                link.source_id, link.target_id
+            ));
+            tracing::warn!(
+                target: IMPORT_TRACE_TARGET,
+                source_id = %link.source_id,
+                target_id = %link.target_id,
+                "bundle link skipped: endpoint memory absent — inserting it would FK-abort \
+                 the whole import transaction (pre-ship 3x7 F1)"
+            );
+            continue;
+        }
         // #2215 — repopulate the schema-v75 lineage-DAG cid mirror
         // (`source_cid` / `target_cid`) so an imported edge keeps its
         // tombstone-resilient node identity (pre-fix the raw INSERT dropped
@@ -497,9 +658,11 @@ fn apply_all_classes(
                 (None, None)
             };
         // RAW, byte-preserving (`create_link` would re-derive the signature +
-        // attest_level — a loss). `OR IGNORE` is idempotent on the natural key
-        // and silently skips an edge whose endpoint memory is absent (e.g. a
-        // link to a tombstoned row), so it never spuriously aborts the import.
+        // attest_level — a loss). `OR IGNORE` is idempotent on the natural
+        // key (UNIQUE constraint) ONLY — it does NOT cover FK violations
+        // (SQLite ON CONFLICT never applies to FK constraints; the pre-F1
+        // comment here claimed otherwise), which is why the endpoint probe
+        // above must run before this INSERT.
         let n = conn
             .execute(
                 "INSERT OR IGNORE INTO memory_links \
@@ -836,6 +999,256 @@ fn apply_all_classes(
     Ok(report)
 }
 
+/// Pre-ship 3x7 F1 — lightweight existence probe for a link endpoint
+/// against the STAGED transaction state. Deliberately NOT
+/// [`crate::storage::get`] (full row read + decrypt path) — one
+/// `EXISTS` per endpoint is all the FK gate needs.
+///
+/// # Errors
+///
+/// Surfaces underlying query failures.
+fn memory_row_exists(conn: &Connection, id: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
+        params![id],
+        |r| r.get(0),
+    )
+    .with_context(|| format!("import: endpoint-presence probe for memory {id}"))
+}
+
+/// Pre-ship 3x7 HIGH-1 — resolve the DESTINATION-enrolled Ed25519 key for
+/// every author the bundle's memories will be attributed to, BEFORE the
+/// import transaction stages any bundle row.
+///
+/// The lookup ([`crate::storage::agent_pubkey`]) reads the flat
+/// `metadata.agent_pubkey` off the `_agents` registration row — a row shape
+/// an unauthenticated bundle can itself carry. Snapshotting pre-transaction
+/// structurally prevents in-bundle self-enrollment: a crafted registration
+/// row staged earlier in the SAME bundle can never supply the key a later
+/// row "verifies" against.
+///
+/// Under the default restamp posture the only attributed author is the
+/// caller; under `--trust-source` each memory keeps its own claimed author.
+///
+/// # Errors
+///
+/// Surfaces underlying key-lookup query failures.
+fn snapshot_dest_enrolled_keys(
+    conn: &Connection,
+    env: &ExportEnvelope,
+    opts: &ImportOptions,
+) -> Result<std::collections::HashMap<String, Option<String>>> {
+    let mut keys = std::collections::HashMap::new();
+    for mem in &env.memories {
+        let author: Option<String> = if opts.trust_source {
+            mem.metadata
+                .get(crate::META_KEY_AGENT_ID)
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        } else {
+            Some(opts.caller_agent_id.clone())
+        };
+        let Some(author) = author.filter(|a| !a.is_empty()) else {
+            continue;
+        };
+        if !keys.contains_key(&author) {
+            let bound = crate::storage::agent_pubkey(conn, &author).with_context(|| {
+                format!("portability import: resolving enrolled key for author {author}")
+            })?;
+            keys.insert(author, bound);
+        }
+    }
+    Ok(keys)
+}
+
+/// Pre-ship 3x7 HIGH-1 — re-derive a staged memory's attestation from what
+/// the DESTINATION can verify, never from the wire (the federation
+/// [`crate::handlers::federation_receive`] `apply_inbound_write_attestation`
+/// discipline, reused through the same
+/// [`crate::identity::attest::stamp_attestation`] gate).
+///
+/// Behaviour, in order:
+/// 1. Under the default restamp posture the wire `metadata.agent_pubkey`
+///    identity-key claim is STRIPPED (unauthenticated input must not seed
+///    the destination's enrolled-key lookup surface).
+/// 2. A byte-preserving fast path: a row that neither asserts an
+///    `attest_level` nor presents a `write_signature` is left untouched
+///    (absent reads as `claimed` on every trust surface).
+/// 3. The re-attribution rule: a row whose identity was restamped
+///    (`original_claim != attributed`) can never verify the ORIGINAL
+///    claimant's signature against the new attribution — land `claimed`,
+///    skip verification (mirrors `apply_inbound_write_attestation`).
+/// 4. Otherwise verify any presented `metadata.write_signature` against the
+///    pre-transaction snapshot of the author's DESTINATION-enrolled key:
+///    valid → `agent_attested`; absent signature or unenrolled author →
+///    `claimed`; presented-but-FORGED → the row is SKIPPED (`Ok(false)`),
+///    never downgraded — the #1464 invariant that a deliberately bad
+///    signature cannot launder into a stored row.
+///
+/// Returns `Ok(true)` to keep the row, `Ok(false)` to skip it (forged).
+///
+/// # Errors
+///
+/// None currently beyond the `Result` plumbing shared with the loop; forged
+/// signatures are a counted per-row skip, not a batch abort.
+fn apply_import_attestation(
+    staged: &mut crate::models::Memory,
+    original_claim: Option<&str>,
+    trust_source: bool,
+    enrolled_keys: &std::collections::HashMap<String, Option<String>>,
+    report: &mut ImportReport,
+) -> Result<bool> {
+    use crate::models::field_names;
+
+    let wire_asserted_attested = staged
+        .metadata
+        .get(field_names::ATTEST_LEVEL)
+        .and_then(serde_json::Value::as_str)
+        == Some(crate::identity::verify::AttestLevel::AgentAttested.as_str());
+    let wire_has_attest_level = staged.metadata.get(field_names::ATTEST_LEVEL).is_some();
+    // (1) Strip the wire identity-key claim under the restamp posture.
+    if !trust_source
+        && let Some(obj) = staged.metadata.as_object_mut()
+        && obj.remove(field_names::AGENT_PUBKEY).is_some()
+    {
+        tracing::warn!(
+            target: IMPORT_TRACE_TARGET,
+            memory_id = %staged.id,
+            "bundle memory carried a wire agent_pubkey identity-key claim — stripped \
+             (unauthenticated input must not seed the enrolled-key surface; pre-ship 3x7)"
+        );
+    }
+    let wire_signature = staged.metadata.get(field_names::WRITE_SIGNATURE);
+    let presented_sig: Option<Vec<u8>> = match wire_signature {
+        None => None,
+        Some(serde_json::Value::String(encoded)) => {
+            use base64::Engine;
+            match base64::engine::general_purpose::STANDARD.decode(encoded.trim()) {
+                Ok(signature) if signature.len() == crate::identity::verify::SIGNATURE_LEN => {
+                    Some(signature)
+                }
+                Ok(_) | Err(_) => {
+                    report.forged_signature_skipped += 1;
+                    report.warnings.push(format!(
+                        "memory {} skipped: presented write_signature is malformed",
+                        staged.id
+                    ));
+                    tracing::warn!(
+                        target: IMPORT_TRACE_TARGET,
+                        memory_id = %staged.id,
+                        "bundle memory skipped: presented write_signature is malformed \
+                         (invalid base64 or not exactly 64 bytes; never treated as absent)"
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+        Some(_) => {
+            report.forged_signature_skipped += 1;
+            report.warnings.push(format!(
+                "memory {} skipped: presented write_signature has a non-string shape",
+                staged.id
+            ));
+            tracing::warn!(
+                target: IMPORT_TRACE_TARGET,
+                memory_id = %staged.id,
+                "bundle memory skipped: presented write_signature has a non-string shape \
+                 (never treated as absent)"
+            );
+            return Ok(false);
+        }
+    };
+    // (2) Byte-preserving fast path: nothing asserted, nothing presented.
+    if !wire_has_attest_level && presented_sig.is_none() {
+        return Ok(true);
+    }
+    let land_claimed = |staged: &mut crate::models::Memory, report: &mut ImportReport| {
+        if let Some(obj) = staged.metadata.as_object_mut() {
+            obj.remove(field_names::WRITE_SIGNATURE);
+            obj.insert(
+                field_names::ATTEST_LEVEL.to_string(),
+                serde_json::Value::String(
+                    crate::identity::verify::AttestLevel::Claimed
+                        .as_str()
+                        .to_string(),
+                ),
+            );
+        }
+        if wire_asserted_attested {
+            report.attestation_downgraded += 1;
+            tracing::warn!(
+                target: IMPORT_TRACE_TARGET,
+                memory_id = %staged.id,
+                "bundle memory asserted attest_level=agent_attested but the destination \
+                 could not verify it — landed claimed (wire attestation is never trusted; \
+                 pre-ship 3x7)"
+            );
+        }
+    };
+    let attributed = staged
+        .metadata
+        .get(crate::META_KEY_AGENT_ID)
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    let Some(attributed) = attributed.filter(|a| !a.is_empty()) else {
+        land_claimed(staged, report);
+        return Ok(true);
+    };
+    // (3) The re-attribution rule.
+    if original_claim.is_some_and(|c| c != attributed) {
+        land_claimed(staged, report);
+        return Ok(true);
+    }
+    // (4) Verify against the pre-transaction DESTINATION-enrolled key.
+    let bound: Option<&str> = enrolled_keys.get(&attributed).and_then(|k| k.as_deref());
+    match crate::identity::attest::stamp_attestation(
+        staged,
+        &attributed,
+        bound,
+        presented_sig.as_deref(),
+        false,
+    ) {
+        Ok(level) => {
+            if level != crate::identity::verify::AttestLevel::AgentAttested
+                && let Some(obj) = staged.metadata.as_object_mut()
+            {
+                obj.remove(field_names::WRITE_SIGNATURE);
+            }
+            if wire_asserted_attested
+                && level != crate::identity::verify::AttestLevel::AgentAttested
+            {
+                report.attestation_downgraded += 1;
+                tracing::warn!(
+                    target: IMPORT_TRACE_TARGET,
+                    memory_id = %staged.id,
+                    author = %attributed,
+                    "bundle memory asserted attest_level=agent_attested but the destination \
+                     verified only 'claimed' (no enrolled author key / no signature) — \
+                     wire attestation is never trusted (pre-ship 3x7)"
+                );
+            }
+            Ok(true)
+        }
+        Err(e) => {
+            report.forged_signature_skipped += 1;
+            report.warnings.push(format!(
+                "memory {} skipped: presented write_signature failed verification against \
+                 the destination-enrolled key for {attributed} (forged; never downgraded)",
+                staged.id
+            ));
+            tracing::warn!(
+                target: IMPORT_TRACE_TARGET,
+                memory_id = %staged.id,
+                author = %attributed,
+                error = %e,
+                "bundle memory skipped: presented write_signature is FORGED against the \
+                 destination-enrolled author key (pre-ship 3x7; #1464 invariant)"
+            );
+            Ok(false)
+        }
+    }
+}
+
 /// #2209 — replay-verify the WHOLE staged `memory_revisions` chain from the
 /// stored columns alone (the revisions-chain verifier the pre-commit gate
 /// lacked; `signed_events` has `verify_audit_trail`, this is its
@@ -905,6 +1318,17 @@ mod tests {
     use crate::signed_events::{
         SignedEvent, append_signed_event, list_signed_events, payload_hash,
     };
+    use std::sync::Mutex;
+
+    static IMPORT_TRACE_LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static IMPORT_TRACE_GUARD: Mutex<()> = Mutex::new(());
+
+    fn import_trace_callback(statement: &str) {
+        IMPORT_TRACE_LOG
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(statement.to_string());
+    }
 
     fn fresh_conn(tag: &str) -> Connection {
         let root = std::env::current_dir()
@@ -920,6 +1344,85 @@ mod tests {
         drop(crate::db::open(&path).expect("init"));
         std::mem::forget(dir);
         crate::db::open(&path).expect("open")
+    }
+
+    #[test]
+    fn atomic_import_reserves_the_writer_up_front_2250() {
+        let conn = fresh_conn("begin-immediate-2250");
+        conn.execute_batch("CREATE TABLE import_lock_probe (value INTEGER NOT NULL)")
+            .unwrap();
+        let db_path = conn
+            .path()
+            .expect("file-backed test connection")
+            .to_string();
+        let competitor = Connection::open(db_path).unwrap();
+        competitor.busy_timeout(std::time::Duration::ZERO).unwrap();
+
+        let tx = begin_atomic_import(&conn).expect("BEGIN IMMEDIATE");
+        let err = competitor
+            .execute("INSERT INTO import_lock_probe (value) VALUES (1)", [])
+            .expect_err("a competing writer must not enter during import staging");
+        assert!(
+            matches!(
+                err,
+                rusqlite::Error::SqliteFailure(ref inner, _)
+                    if matches!(
+                        inner.code,
+                        rusqlite::ErrorCode::DatabaseBusy
+                            | rusqlite::ErrorCode::DatabaseLocked
+                    )
+            ),
+            "expected SQLite busy/locked from the reserved writer, got {err:?}"
+        );
+
+        drop(tx);
+        competitor
+            .execute("INSERT INTO import_lock_probe (value) VALUES (1)", [])
+            .expect("writer proceeds after import rollback");
+    }
+
+    #[test]
+    fn import_entrypoint_reserves_writer_before_enrolled_key_snapshot_2250() {
+        let _trace_guard = IMPORT_TRACE_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        IMPORT_TRACE_LOG
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+
+        let src = fresh_conn("entrypoint-order-src-2250-");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        env.memories.push(memory_fixture(
+            "mem-entrypoint-order-2250",
+            "transaction ordering",
+            "ai:source-2250",
+        ));
+        let mut dst = fresh_conn("entrypoint-order-dst-2250-");
+        dst.trace(Some(import_trace_callback));
+        let report = import_full_envelope(&dst, &env, &opts_trusted()).expect("import");
+        dst.trace(None);
+        assert_eq!(report.memories, 1);
+
+        let trace = IMPORT_TRACE_LOG
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let begin = trace
+            .iter()
+            .position(|statement| statement.trim_start().starts_with("BEGIN IMMEDIATE"))
+            .expect("entrypoint must open BEGIN IMMEDIATE");
+        let snapshot = trace
+            .iter()
+            .position(|statement| {
+                statement.contains("json_extract(metadata, '$.agent_pubkey')")
+                    && statement.contains("WHERE namespace")
+            })
+            .expect("entrypoint must query the destination-enrolled author key");
+        assert!(
+            begin < snapshot,
+            "writer reservation must precede trust snapshot; trace={trace:?}"
+        );
     }
 
     fn append_row(conn: &Connection, i: usize) {
@@ -964,6 +1467,7 @@ mod tests {
             content: format!("durable content of {id}"),
             created_at: now.clone(),
             updated_at: now,
+            expires_at: Some("2099-01-01T00:00:00Z".into()),
             metadata: serde_json::json!({ "agent_id": agent_id }),
             ..crate::models::Memory::default()
         }
@@ -1081,7 +1585,7 @@ mod tests {
     fn dest_forgotten_memory_is_not_resurrected_2208() {
         let src = fresh_conn("forget-src-");
         let mem = memory_fixture("mem-forget-2208", "forgettable", "alice");
-        crate::storage::insert(&src, &mem).expect("seed src");
+        crate::storage::insert_imported(&src, &mem).expect("seed unsigned source row");
         let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
 
         let dst = fresh_conn("forget-dst-");
@@ -1123,7 +1627,7 @@ mod tests {
     fn dest_archived_memory_is_not_readmitted_live_2208() {
         let src = fresh_conn("arch-src-");
         let mem = memory_fixture("mem-arch-2208", "archivable", "alice");
-        crate::storage::insert(&src, &mem).expect("seed src");
+        crate::storage::insert_imported(&src, &mem).expect("seed unsigned source row");
         let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
 
         let dst = fresh_conn("arch-dst-");
@@ -1285,7 +1789,7 @@ mod tests {
     fn spine_less_bundle_restamps_identity_by_default_2211() {
         let src = fresh_conn("restamp-src-");
         let mem = memory_fixture("mem-restamp-2211", "claimed", "forged-agent");
-        crate::storage::insert(&src, &mem).expect("seed src");
+        crate::storage::insert_imported(&src, &mem).expect("seed unsigned source row");
         let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
         assert!(
             env.signed_events.is_empty(),
@@ -1294,7 +1798,7 @@ mod tests {
 
         let dst = fresh_conn("restamp-dst-");
         let report = import_full_envelope(&dst, &env, &opts_default()).expect("import");
-        assert_eq!(report.restamped, 1, "the restamp is counted");
+        assert_eq!(report.restamped, 1, "the restamp is counted: {report:?}");
         let got = crate::storage::get(&dst, "mem-restamp-2211")
             .expect("get")
             .expect("row landed");
@@ -1362,7 +1866,7 @@ mod tests {
         let src = fresh_conn("clobber-src-");
         let mut incoming = memory_fixture("mem-incoming-2211", "shared title", "alice");
         incoming.content = "bundle content".into();
-        crate::storage::insert(&src, &incoming).expect("seed src");
+        crate::storage::insert_imported(&src, &incoming).expect("seed unsigned source row");
         let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
 
         let dst = fresh_conn("clobber-dst-");
@@ -1494,6 +1998,420 @@ mod tests {
         assert!(
             parsed.is_err(),
             "an unknown top-level class must refuse to parse, not be dropped"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Pre-ship 3x7 battery — HIGH-1 (wire attestation never trusted) +
+    // HIGH-2 (L1-parity input validation). Each ★ test FAILS on the
+    // pre-fix code (verbatim wire attest_level / zero validation).
+    // -----------------------------------------------------------------
+
+    /// ★ HIGH-1: a bundle asserting `attest_level=agent_attested` for an
+    /// author with NO destination-enrolled key must land `claimed` — the
+    /// wire value is NEVER trusted. Fails pre-fix (the wire metadata
+    /// persisted verbatim, so `row_is_agent_attested` believed it).
+    #[test]
+    fn forged_wire_attest_level_lands_claimed_preship_3x7() {
+        use crate::models::field_names;
+        let src = fresh_conn("attest-wire-src-");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        let mut mem = memory_fixture("mem-wire-attest-3x7", "forged attestation", "mallory");
+        mem.metadata.as_object_mut().unwrap().insert(
+            field_names::ATTEST_LEVEL.to_string(),
+            serde_json::json!("agent_attested"),
+        );
+        env.memories.push(mem);
+
+        // Trusted posture (identity preserved): still re-derived, not copied.
+        let dst = fresh_conn("attest-wire-dst-");
+        let report = import_full_envelope(&dst, &env, &opts_trusted()).expect("import");
+        assert_eq!(report.memories, 1);
+        assert_eq!(report.attestation_downgraded, 1, "the downgrade is counted");
+        let got = crate::storage::get(&dst, "mem-wire-attest-3x7")
+            .expect("get")
+            .expect("row landed");
+        assert_eq!(
+            got.metadata
+                .get(field_names::ATTEST_LEVEL)
+                .and_then(|v| v.as_str()),
+            Some("claimed"),
+            "wire agent_attested MUST land claimed when the destination cannot verify"
+        );
+
+        // Default restamp posture: re-attributed → claimed as well.
+        let dst2 = fresh_conn("attest-wire-dst2-");
+        let report2 = import_full_envelope(&dst2, &env, &opts_default()).expect("import");
+        assert_eq!(report2.attestation_downgraded, 1);
+        let got2 = crate::storage::get(&dst2, "mem-wire-attest-3x7")
+            .expect("get")
+            .expect("row landed");
+        assert_eq!(
+            got2.metadata
+                .get(field_names::ATTEST_LEVEL)
+                .and_then(|v| v.as_str()),
+            Some("claimed"),
+            "restamped rows can never carry the wire attestation"
+        );
+    }
+
+    /// ★ HIGH-1: a presented `write_signature` that FAILS verification
+    /// against the destination-enrolled author key SKIPS the row (never
+    /// downgraded to claimed — the #1464 invariant). Fails pre-fix (the
+    /// forged signature persisted verbatim with the wire attest_level).
+    #[test]
+    fn forged_write_signature_is_skipped_preship_3x7() {
+        use crate::models::field_names;
+        use base64::Engine as _;
+        let dst = fresh_conn("attest-forged-dst-");
+        crate::storage::register_agent(&dst, "ai:author-3x7", "ai:generic", &[]).expect("register");
+        let kp = crate::identity::keypair::generate("ai:author-3x7").expect("keygen");
+        crate::storage::bind_agent_pubkey(&dst, "ai:author-3x7", &kp.public_base64())
+            .expect("bind");
+
+        let src = fresh_conn("attest-forged-src-");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        let mut mem = memory_fixture("mem-forged-sig-3x7", "forged signature", "ai:author-3x7");
+        let obj = mem.metadata.as_object_mut().unwrap();
+        obj.insert(
+            field_names::ATTEST_LEVEL.to_string(),
+            serde_json::json!("agent_attested"),
+        );
+        obj.insert(
+            field_names::WRITE_SIGNATURE.to_string(),
+            serde_json::json!(
+                base64::engine::general_purpose::STANDARD.encode([0xAB_u8; 64].as_slice())
+            ),
+        );
+        env.memories.push(mem);
+
+        let report = import_full_envelope(&dst, &env, &opts_trusted()).expect("import");
+        assert_eq!(report.forged_signature_skipped, 1, "the skip is counted");
+        assert_eq!(report.memories, 0, "the forged row did NOT land");
+        assert!(
+            crate::storage::get(&dst, "mem-forged-sig-3x7")
+                .expect("get")
+                .is_none(),
+            "a presented-but-forged signature must skip the row, never launder to claimed"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("mem-forged-sig-3x7")),
+            "a WARN names the skipped row, got: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn malformed_presented_write_signatures_are_skipped_2264() {
+        use crate::models::field_names;
+        use base64::Engine as _;
+
+        let malformed = [
+            ("invalid-base64", serde_json::json!("%%%not-base64%%%")),
+            ("non-string", serde_json::json!({"bytes": [1, 2, 3]})),
+            ("empty", serde_json::json!("")),
+            (
+                "one-byte",
+                serde_json::json!(base64::engine::general_purpose::STANDARD.encode([0_u8; 1])),
+            ),
+            (
+                "63-bytes",
+                serde_json::json!(base64::engine::general_purpose::STANDARD.encode([0_u8; 63])),
+            ),
+            (
+                "65-bytes",
+                serde_json::json!(base64::engine::general_purpose::STANDARD.encode([0_u8; 65])),
+            ),
+        ];
+        for (case, wire_value) in malformed {
+            let src = fresh_conn(&format!("attest-malformed-src-{case}-"));
+            let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+            let id = format!("mem-malformed-sig-{case}");
+            let mut mem = memory_fixture(&id, "malformed signature", "ai:author-3x7");
+            mem.metadata
+                .as_object_mut()
+                .unwrap()
+                .insert(field_names::WRITE_SIGNATURE.to_string(), wire_value);
+            env.memories.push(mem);
+
+            let dst = fresh_conn(&format!("attest-malformed-dst-{case}-"));
+            let report = import_full_envelope(&dst, &env, &opts_trusted()).expect("import");
+            assert_eq!(report.forged_signature_skipped, 1, "case={case}");
+            assert_eq!(report.memories, 0, "case={case}");
+            assert!(
+                crate::storage::get(&dst, &id).unwrap().is_none(),
+                "case={case}"
+            );
+            assert!(
+                report.warnings.iter().any(|warning| warning.contains(&id)),
+                "case={case}; warnings={:?}",
+                report.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn restamping_removes_signature_bound_to_original_agent_2264() {
+        use crate::models::field_names;
+        use base64::Engine as _;
+
+        let original_agent = "ai:original-signer-2264";
+        let kp = crate::identity::keypair::generate(original_agent).expect("keygen");
+        let mut mem = memory_fixture("mem-restamped-sig-2264", "signed row", original_agent);
+        let signature = crate::identity::attest::sign_memory_write(&kp, &mem, original_agent)
+            .expect("sign original attribution");
+        mem.metadata.as_object_mut().unwrap().insert(
+            field_names::WRITE_SIGNATURE.to_string(),
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(signature)),
+        );
+        let src = fresh_conn("attest-restamp-src-2264-");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        env.memories.push(mem);
+
+        let dst = fresh_conn("attest-restamp-dst-2264-");
+        crate::storage::register_agent(&dst, original_agent, "ai:generic", &[])
+            .expect("register original signer");
+        crate::storage::bind_agent_pubkey(&dst, original_agent, &kp.public_base64())
+            .expect("bind original key");
+        let report = import_full_envelope(&dst, &env, &opts_default()).expect("import");
+        assert_eq!(report.memories, 1);
+
+        let got = crate::storage::get(&dst, "mem-restamped-sig-2264")
+            .unwrap()
+            .expect("row landed claimed");
+        assert_eq!(
+            got.metadata
+                .get(crate::META_KEY_AGENT_ID)
+                .and_then(serde_json::Value::as_str),
+            Some("importer")
+        );
+        assert_eq!(
+            got.metadata
+                .get(field_names::ATTEST_LEVEL)
+                .and_then(serde_json::Value::as_str),
+            Some("claimed")
+        );
+        assert!(
+            got.metadata.get(field_names::WRITE_SIGNATURE).is_none(),
+            "a signature bound to the original attribution must not survive restamping"
+        );
+    }
+
+    /// HIGH-1 positive control: a VALID `write_signature` against the
+    /// destination-enrolled author key upgrades to `agent_attested` — the
+    /// re-derivation never falsely downgrades a legitimate attestation.
+    #[test]
+    fn valid_write_signature_verifies_agent_attested_preship_3x7() {
+        use crate::models::field_names;
+        use base64::Engine as _;
+        let dst = fresh_conn("attest-ok-dst-");
+        crate::storage::register_agent(&dst, "ai:signer-3x7", "ai:generic", &[]).expect("register");
+        let kp = crate::identity::keypair::generate("ai:signer-3x7").expect("keygen");
+        crate::storage::bind_agent_pubkey(&dst, "ai:signer-3x7", &kp.public_base64())
+            .expect("bind");
+
+        let mut mem = memory_fixture("mem-valid-sig-3x7", "signed row", "ai:signer-3x7");
+        let sig =
+            crate::identity::attest::sign_memory_write(&kp, &mem, "ai:signer-3x7").expect("sign");
+        mem.metadata.as_object_mut().unwrap().insert(
+            field_names::WRITE_SIGNATURE.to_string(),
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(&sig)),
+        );
+        let src = fresh_conn("attest-ok-src-");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        env.memories.push(mem);
+
+        let report = import_full_envelope(&dst, &env, &opts_trusted()).expect("import");
+        assert_eq!(report.memories, 1);
+        assert_eq!(report.forged_signature_skipped, 0);
+        assert_eq!(report.attestation_downgraded, 0);
+        let got = crate::storage::get(&dst, "mem-valid-sig-3x7")
+            .expect("get")
+            .expect("row landed");
+        assert_eq!(
+            got.metadata
+                .get(field_names::ATTEST_LEVEL)
+                .and_then(|v| v.as_str()),
+            Some("agent_attested"),
+            "a destination-verified signature earns agent_attested"
+        );
+    }
+
+    /// ★ HIGH-1 (identity-key surface): under the default restamp posture a
+    /// wire `metadata.agent_pubkey` claim is STRIPPED so an unauthenticated
+    /// bundle can never seed the destination's enrolled-key lookup
+    /// (`db::agent_pubkey` reads the flat metadata key off `_agents` rows).
+    #[test]
+    fn wire_agent_pubkey_is_stripped_by_default_preship_3x7() {
+        use crate::models::field_names;
+        let src = fresh_conn("pubkey-strip-src-");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+        let mut mem = memory_fixture("mem-pubkey-3x7", "identity plant", "mallory");
+        mem.metadata.as_object_mut().unwrap().insert(
+            field_names::AGENT_PUBKEY.to_string(),
+            serde_json::json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        );
+        env.memories.push(mem);
+
+        let dst = fresh_conn("pubkey-strip-dst-");
+        import_full_envelope(&dst, &env, &opts_default()).expect("import");
+        let got = crate::storage::get(&dst, "mem-pubkey-3x7")
+            .expect("get")
+            .expect("row landed");
+        assert!(
+            got.metadata.get(field_names::AGENT_PUBKEY).is_none(),
+            "the wire identity-key claim must be stripped under restamp, got: {}",
+            got.metadata
+        );
+    }
+
+    /// ★ HIGH-2: rows violating the write invariants (over-MAX_CONTENT_SIZE,
+    /// out-of-range priority, non-RFC3339 #1834 valid_from) are refused
+    /// per-row (skip + WARN + counted) and NOT persisted; the rest of the
+    /// bundle continues. An invalid link (self-link) is likewise skipped.
+    /// Fails pre-fix (the v2 route ran ZERO input validation).
+    #[test]
+    fn invalid_rows_are_refused_not_persisted_preship_3x7() {
+        let src = fresh_conn("invalid-src-");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+
+        let mut oversize = memory_fixture("mem-oversize-3x7", "oversize", "alice");
+        oversize.content = "x".repeat(crate::models::MAX_CONTENT_SIZE + 1);
+        env.memories.push(oversize);
+
+        let mut bad_priority = memory_fixture("mem-priority-3x7", "bad priority", "alice");
+        bad_priority.priority = 9999;
+        env.memories.push(bad_priority);
+
+        let mut bad_valid_from = memory_fixture("mem-validfrom-3x7", "bad valid_from", "alice");
+        bad_valid_from.valid_from = Some("not-a-timestamp".into());
+        env.memories.push(bad_valid_from);
+
+        env.memories
+            .push(memory_fixture("mem-good-3x7", "good row", "alice"));
+
+        // Invalid link: self-link on the good row.
+        env.links.push(crate::models::MemoryLink {
+            source_id: "mem-good-3x7".into(),
+            target_id: "mem-good-3x7".into(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: "2026-07-14T00:00:00Z".into(),
+            signature: None,
+            observed_by: None,
+            valid_from: None,
+            valid_until: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        });
+
+        let dst = fresh_conn("invalid-dst-");
+        let report = import_full_envelope(&dst, &env, &opts_trusted()).expect("import");
+        assert_eq!(report.invalid_skipped, 3, "all three invalid rows counted");
+        assert_eq!(report.memories, 1, "only the good row landed");
+        assert_eq!(report.invalid_links_skipped, 1, "the self-link is refused");
+        for id in ["mem-oversize-3x7", "mem-priority-3x7", "mem-validfrom-3x7"] {
+            assert!(
+                crate::storage::get(&dst, id).expect("get").is_none(),
+                "invalid row {id} must NOT be persisted"
+            );
+        }
+        assert!(
+            crate::storage::get(&dst, "mem-good-3x7")
+                .expect("get")
+                .is_some(),
+            "the valid row still lands (per-row skip, never a batch drop)"
+        );
+        let links: i64 = dst
+            .query_row("SELECT COUNT(*) FROM memory_links", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(links, 0, "the invalid link must NOT be persisted");
+        assert_eq!(
+            report.warnings.len(),
+            4,
+            "each refusal carries a WARN, got: {:?}",
+            report.warnings
+        );
+    }
+
+    /// ★ F1 (audit finding on the HIGH-2 fix): a bundle link whose endpoint
+    /// memory was SKIPPED earlier in the import (here: an invalid row the
+    /// HIGH-2 gate refused) must be skipped + counted — NOT reach the raw
+    /// INSERT, whose `REFERENCES memories(id)` FK (with
+    /// `PRAGMA foreign_keys=ON`, and `OR IGNORE` NOT covering FK
+    /// violations) would abort the WHOLE all-or-nothing transaction with
+    /// zero rows landed. Fails pre-fix (the whole import errors and the
+    /// good row never lands).
+    #[test]
+    fn link_to_skipped_memory_does_not_fk_abort_the_import_preship_3x7_f1() {
+        let src = fresh_conn("fk-link-src-");
+        let mut env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
+
+        // A row the HIGH-2 validation gate will SKIP (priority out of range)…
+        let mut bad = memory_fixture("mem-bad-f1", "bad endpoint", "alice");
+        bad.priority = 9999;
+        env.memories.push(bad);
+        // …and a good row that must still land.
+        env.memories
+            .push(memory_fixture("mem-good-f1", "good endpoint", "alice"));
+
+        let mk_link = |source: &str, target: &str| crate::models::MemoryLink {
+            source_id: source.into(),
+            target_id: target.into(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: "2026-07-14T00:00:00Z".into(),
+            signature: None,
+            observed_by: None,
+            valid_from: None,
+            valid_until: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        };
+        // Edge referencing the SKIPPED row (the F1 FK trap)…
+        env.links.push(mk_link("mem-bad-f1", "mem-good-f1"));
+        // …an edge to an id never present anywhere…
+        env.links
+            .push(mk_link("mem-good-f1", "mem-never-existed-f1"));
+        // …and a control edge between two PRESENT rows (a second good
+        // neighbour — a self-link would trip the validity gate instead).
+        env.memories
+            .push(memory_fixture("mem-good2-f1", "good endpoint 2", "alice"));
+        env.links.push(mk_link("mem-good-f1", "mem-good2-f1"));
+
+        let dst = fresh_conn("fk-link-dst-");
+        let report = import_full_envelope(&dst, &env, &opts_trusted())
+            .expect("the import must COMMIT — a dangling link is a per-row skip, not an abort");
+        assert!(report.committed);
+        assert_eq!(report.invalid_skipped, 1, "the bad endpoint row skipped");
+        assert_eq!(report.memories, 2, "both good rows landed");
+        assert_eq!(
+            report.links_skipped_missing_endpoint, 2,
+            "both dangling edges skipped + counted"
+        );
+        assert_eq!(report.links, 1, "the control edge landed");
+        assert!(
+            crate::storage::get(&dst, "mem-good-f1")
+                .expect("get")
+                .is_some(),
+            "the rest of the bundle still commits"
+        );
+        let links: i64 = dst
+            .query_row("SELECT COUNT(*) FROM memory_links", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(links, 1, "only the control edge persisted");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .filter(|w| w.contains("endpoint memory is absent"))
+                .count()
+                == 2,
+            "each dangling edge carries a WARN, got: {:?}",
+            report.warnings
         );
     }
 }

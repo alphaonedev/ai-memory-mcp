@@ -286,6 +286,15 @@ cold tier against partial disk corruption / lost shard files, NOT whole-node
 loss, so the TRACT G16 end-state (**no-primary multi-node placement**) remains
 the open residual. The executable anchor is `crate::durability`.
 
+The local shard directory is an operator-controlled durability location, not
+an authenticity boundary against a principal that can rewrite it. Per-shard
+and payload SHA-256 provide corruption detection, **not a MAC/signature**: a
+same-authority writer could replace a manifest and every shard consistently.
+Protect the erasure directory with the same OS ownership and access controls
+as the database. The implementation rejects symlink/non-regular coordination
+state and bounds hostile manifest/shard geometry as defense in depth, but it
+does not claim cryptographic recovery provenance in v1.0.0.
+
 ### 9.1 The actual durability model (honest taxonomy)
 
 Codegraph-verified. There is **no** automatic full-copy replication; the label

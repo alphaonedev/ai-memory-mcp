@@ -143,7 +143,7 @@ tokenise() {
     {
         printf '%s\n' "$stem"
         printf '%s\n' "$full"
-    } | tr '_-./' '\n' | awk '
+    } | tr '_./-' '\n' | awk '
         length($0) >= 3 \
         && $0 !~ /^(rs|src|lib|mod|tests|test|the|and|for|use|with|core|util|utils|main)$/ {
             print tolower($0)

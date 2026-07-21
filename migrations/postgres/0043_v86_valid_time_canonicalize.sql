@@ -1,0 +1,36 @@
+-- Copyright 2026 AlphaOne LLC
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- v1.0.0 #1834 (pre-ship 3x7) — schema v86 (postgres twin of
+-- migrations/sqlite/0070_v86_valid_time_canonicalize.sql): one-time
+-- normalization of the claim-bitemporal VALID-time renderings on
+-- `memories` + `archived_memories` to the ONE canonical fixed-UTC form
+-- `YYYY-MM-DDTHH:MM:SS.ffffffZ` (`validate::canonicalize_valid_time`).
+--
+-- WHY. The #1834 `valid_from` / `valid_until` columns are RFC3339 TEXT on
+-- BOTH backends, and every predicate binds the caller's `valid_at` as
+-- `$n::text` and compares LEXICOGRAPHICALLY (`valid_from <= $n`,
+-- `valid_until > $n`). RFC3339 admits many renderings of the SAME instant
+-- (`Z` vs `+00:00`, variable fractional digits, non-UTC offsets) that order
+-- WRONGLY as bytes, silently violating the documented start-inclusive /
+-- end-exclusive contract. From v86 the write funnels (`store` /
+-- `store_batch` / `apply_remote_memory` / `merge_inbound` / both update
+-- funnels) canonicalize at admission and the query binds canonicalize too;
+-- this migration heals rows written BEFORE the fix.
+--
+-- MECHANICS. Applied by the in-code Rust arm `PostgresStore::migrate_v86`
+-- (NOT SQL from this file): a per-row chrono re-render is
+-- instant-preserving, idempotent (canonical values are skipped), and
+-- fail-safe (an unparseable value keeps its exact bytes — a bare
+-- `::timestamptz` cast in SQL would abort the whole migration on one bad
+-- row, a self-DOS). These columns are UNSIGNED metadata (not in the
+-- SignableWrite v2 envelope / cid genesis), so no signature breaks. No DDL,
+-- no rewrite. Representative equivalent (executed in Rust, NOT here):
+--
+--   UPDATE memories
+--      SET valid_from  = to_char((valid_from)::timestamptz AT TIME ZONE 'UTC',
+--                                'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+--          valid_until = to_char((valid_until)::timestamptz AT TIME ZONE 'UTC',
+--                                'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+--    WHERE valid_from IS NOT NULL OR valid_until IS NOT NULL;
+--   -- and the same statement over archived_memories.

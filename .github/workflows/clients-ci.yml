@@ -1,0 +1,85 @@
+name: clients-ci
+
+# Runs the SDK-shim package test suites (issue #1390 / merged via #2212) on
+# every PR/push that touches clients/**. These four Direct-API SDK shim
+# packages ship genuine pytest / node:test suites that NO other CI job
+# executed — so a broken shim could publish green at the GA release moment
+# (publish-sdk-shims.yml built-only before publishing). This leg closes that
+# gap on the PR side; publish-sdk-shims.yml runs the SAME suites again
+# immediately before each publish so nothing ships without its tests passing.
+#
+# Runtimes are pinned to what each package actually needs:
+#  - Python packages: requires-python >= 3.10 (pyproject.toml); tested on 3.12.
+#  - TypeScript packages: the `test` script is
+#      node --experimental-strip-types --test '__tests__/*.test.ts'
+#    which needs Node >= 22.6 (native TS type-stripping). The package `engines`
+#    field advertises node >= 18 for CONSUMERS of the built `dist/` output, but
+#    running the SOURCE test suite needs 22.6+ — hence Node 22 here, NOT 20.
+
+on:
+  push:
+    branches: [main, develop, "release/**"]
+    paths:
+      - "clients/**"
+      - ".github/workflows/clients-ci.yml"
+  pull_request:
+    branches: [main, develop, "release/**"]
+    paths:
+      - "clients/**"
+      - ".github/workflows/clients-ci.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clients-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-shims:
+    name: pytest (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - anthropic-shim-py
+          - openai-shim-py
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install package + pytest
+        working-directory: clients/${{ matrix.package }}
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install "pytest>=8.0"
+      - name: pytest
+        working-directory: clients/${{ matrix.package }}
+        env:
+          AI_MEMORY_NO_CONFIG: "1"
+        run: python -m pytest -q
+
+  ts-shims:
+    name: node:test (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - anthropic-shim-ts
+          - openai-shim-ts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # >= 22.6 required by the `--experimental-strip-types` test script.
+          node-version: "22"
+      - name: npm ci
+        working-directory: clients/${{ matrix.package }}
+        run: npm ci
+      - name: npm test
+        working-directory: clients/${{ matrix.package }}
+        run: npm test

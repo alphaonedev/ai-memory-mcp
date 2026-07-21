@@ -1487,15 +1487,15 @@ scrape_configs:
 
 ### 12.3 Log routing for signed-events DLQ (#1046)
 
-The signed-events DLQ replay-into-chain contract (#1046, commit
-`371a28d7d`) documents how DLQ rows re-enter the V-4 chain when the
-replay worker re-attempts them. Tail the
-`ai_memory::federation::push_dlq` tracing target via
-`journalctl -u ai-memory --output=json | jq -c 'select(.target ==
-"ai_memory::federation::push_dlq")'` and forward to a SIEM. A non-zero
-`quarantined_total` rate is the load-bearing alarm — the substrate
-has given up on a peer push and an operator must decide whether to
-retry or hand-replicate.
+`signed_events_dlq` has no automatic replay worker in v1.0.0. Monitor
+`approval.deferred_audit_dlq_size` in the capabilities-v3 envelope and the
+`deferred_audit` ERROR/WARN records. A non-zero depth requires operator review:
+preserve a database backup and the DLQ rows, stop normal writers, and escalate
+for a chain-aware recovery. v1.0.0 ships no replay CLI or automatic procedure;
+do not delete or hand-insert these rows with ad hoc SQL. Do not confuse this
+queue with `federation_push_dlq`; only the federation queue uses the
+`ai_memory::federation::push_dlq` replay worker and its `quarantined_total`
+telemetry.
 
 ### 12.4 `ai-memory doctor` — daily health check
 

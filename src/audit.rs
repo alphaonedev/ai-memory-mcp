@@ -30,11 +30,13 @@
 //!    future compliance contexts that mandate content capture.
 //! 5. **Per-process monotonic sequence**, independent of the chain.
 //!    Lets a SIEM detect dropped lines even before the chain check.
-//! 6. **No backpressure on the caller.** Emission is synchronous (one
-//!    write per line so the chain is consistent across processes
-//!    concurrently appending — the file is opened with `O_APPEND`),
-//!    but failures inside emit are swallowed and logged via `tracing`.
-//!    A broken audit pipeline never blocks a memory operation.
+//! 6. **Best-effort failure posture.** Emission is synchronous and
+//!    serialized within one process. The file is opened with `O_APPEND`, but
+//!    separate processes are not chain-serialized and a crash or short write
+//!    can leave a torn final line. Run one writer per audit file and use
+//!    `audit verify` to detect malformed or broken chains. Failures inside
+//!    emit are swallowed and logged via `tracing`; a broken audit pipeline
+//!    never blocks a memory operation.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};

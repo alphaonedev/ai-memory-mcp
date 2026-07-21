@@ -85,7 +85,7 @@ pub struct ExportEnvelope {
     pub source: String,
     /// RFC3339 export instant.
     pub exported_at: String,
-    /// The 28-field `Memory` rows (screened — forbidden classes dropped,
+    /// The 30-field `Memory` rows (screened — forbidden classes dropped,
     /// credentials masked).
     pub memories: Vec<Memory>,
     /// The `MemoryLink` rows.
@@ -128,20 +128,13 @@ pub(crate) fn db_schema_version(conn: &Connection) -> Result<i64> {
     )?)
 }
 
-/// Decode a role's enrolled PUBLIC key from a URL-safe-no-pad base64 env var,
-/// returning `None` when unset / malformed. Never touches private keys.
-fn role_pubkey_from_env(env: &str) -> Option<VerifyingKey> {
-    let raw = std::env::var(env).ok()?;
-    let bytes = URL_SAFE_NO_PAD.decode(raw.trim()).ok()?;
-    let arr: [u8; 32] = bytes.as_slice().try_into().ok()?;
-    VerifyingKey::from_bytes(&arr).ok()
-}
-
 /// Collect the enrolled role trust anchors (spec §V2-2.6). PUBLIC keys ONLY —
 /// a private key NEVER crosses. Advisory at the destination (re-verify K1-pins
 /// its own out-of-band keys).
 fn collect_trust_anchors() -> Vec<TrustAnchorDto> {
-    use crate::governance::audit::{JUDGE_PUBKEY_ENV, RECORDER_PUBKEY_ENV, STOPPER_PUBKEY_ENV};
+    use crate::governance::audit::{
+        load_enrolled_judge_pubkey, load_enrolled_recorder_pubkey, load_enrolled_stopper_pubkey,
+    };
     let mut anchors = Vec::new();
     let mut push = |role: &str, vk: Option<VerifyingKey>| {
         if let Some(vk) = vk {
@@ -161,9 +154,12 @@ fn collect_trust_anchors() -> Vec<TrustAnchorDto> {
             .ok()
             .flatten(),
     );
-    push("recorder", role_pubkey_from_env(RECORDER_PUBKEY_ENV));
-    push("judge", role_pubkey_from_env(JUDGE_PUBKEY_ENV));
-    push("stopper", role_pubkey_from_env(STOPPER_PUBKEY_ENV));
+    // #2245 — use the canonical K1 loaders so custody-dir `<label>.pub`
+    // enrolments are exported too; the prior env-only reimplementation
+    // silently omitted three roles from otherwise complete envelopes.
+    push("recorder", load_enrolled_recorder_pubkey().ok().flatten());
+    push("judge", load_enrolled_judge_pubkey().ok().flatten());
+    push("stopper", load_enrolled_stopper_pubkey().ok().flatten());
     anchors
 }
 

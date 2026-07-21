@@ -62,12 +62,13 @@ After=network.target
 Type=simple
 ExecStart=/usr/local/bin/ai-memory --db /var/lib/ai-memory/ai-memory.db serve
 Restart=on-failure
+RestartPreventExitStatus=75
 RestartSec=5
 Environment=RUST_LOG=ai_memory=info,tower_http=info
 
 # Graceful shutdown: checkpoints WAL before exit
 KillSignal=SIGINT
-TimeoutStopSec=10
+TimeoutStopSec=90
 
 [Install]
 WantedBy=multi-user.target
@@ -857,9 +858,35 @@ The HTTP daemon handles SIGINT (Ctrl+C) gracefully:
 3. Checkpoints the WAL (`PRAGMA wal_checkpoint(TRUNCATE)`)
 4. Exits cleanly
 
-For systemd, use `KillSignal=SIGINT` and `TimeoutStopSec=10` to ensure the checkpoint completes.
+For systemd, use `KillSignal=SIGINT` and `TimeoutStopSec=90`. This covers the
+default 30-second HTTP request grace period plus the bounded background-writer,
+webhook-delivery, deferred-audit drain, and final witness/checkpoint phases,
+leaving time for the visible exit-75 failure path.
 
 > **Note:** The HTTP daemon handles SIGINT (Ctrl+C) gracefully with WAL checkpoint. Systemd sends SIGTERM by default -- the service file sets `KillSignal=SIGINT` to ensure clean shutdown.
+
+The daemon exits with status **75 (`EX_TEMPFAIL`)** when it cannot certify a
+safe shutdown or safely drop its Tokio runtime. Before final certification,
+this means a background writer or deferred-audit drain missed its deadline;
+the daemon deliberately skips the final witness/WAL checkpoint rather than
+certify a racing writer. After final certification begins, the same status
+means witness custody could not sign, the durable off-table anchor could not
+be persisted, the WAL checkpoint failed, or the certification deadline
+expired. In that case certification may be partially committed and is not a
+clean-shutdown claim. During boot or serving, status 75 can also follow a
+configuration, key/TLS, federation, database/storage initialization, listener,
+or server transport error after lifecycle resources may have been created.
+Always use the preceding `fatal daemon bootstrap/shutdown` diagnostic to
+distinguish the cause; do not blindly restart-loop a configuration error.
+
+For any shutdown certification failure, preserve the database, witness custody
+directory, off-table head-anchor log, and adjacent
+`.deferred-audit.journal.spool`, inspect disk/lock health, and restart only
+after the stall is cleared. The occurrence spool is fsynced before queue
+admission and replayed idempotently on the next boot. For a bootstrap failure,
+correct the named configuration/credential/storage error before restarting.
+The shipped systemd unit uses `RestartPreventExitStatus=75` so these failures
+remain stopped for operator triage instead of entering an automatic loop.
 
 The MCP server exits cleanly when stdin closes (AI client session ends).
 
