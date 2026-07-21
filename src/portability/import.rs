@@ -1338,6 +1338,7 @@ mod tests {
             content: format!("durable content of {id}"),
             created_at: now.clone(),
             updated_at: now,
+            expires_at: Some("2099-01-01T00:00:00Z".into()),
             metadata: serde_json::json!({ "agent_id": agent_id }),
             ..crate::models::Memory::default()
         }
@@ -1455,7 +1456,7 @@ mod tests {
     fn dest_forgotten_memory_is_not_resurrected_2208() {
         let src = fresh_conn("forget-src-");
         let mem = memory_fixture("mem-forget-2208", "forgettable", "alice");
-        crate::storage::insert(&src, &mem).expect("seed src");
+        crate::storage::insert_imported(&src, &mem).expect("seed unsigned source row");
         let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
 
         let dst = fresh_conn("forget-dst-");
@@ -1497,7 +1498,7 @@ mod tests {
     fn dest_archived_memory_is_not_readmitted_live_2208() {
         let src = fresh_conn("arch-src-");
         let mem = memory_fixture("mem-arch-2208", "archivable", "alice");
-        crate::storage::insert(&src, &mem).expect("seed src");
+        crate::storage::insert_imported(&src, &mem).expect("seed unsigned source row");
         let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
 
         let dst = fresh_conn("arch-dst-");
@@ -1659,7 +1660,7 @@ mod tests {
     fn spine_less_bundle_restamps_identity_by_default_2211() {
         let src = fresh_conn("restamp-src-");
         let mem = memory_fixture("mem-restamp-2211", "claimed", "forged-agent");
-        crate::storage::insert(&src, &mem).expect("seed src");
+        crate::storage::insert_imported(&src, &mem).expect("seed unsigned source row");
         let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
         assert!(
             env.signed_events.is_empty(),
@@ -1668,7 +1669,7 @@ mod tests {
 
         let dst = fresh_conn("restamp-dst-");
         let report = import_full_envelope(&dst, &env, &opts_default()).expect("import");
-        assert_eq!(report.restamped, 1, "the restamp is counted");
+        assert_eq!(report.restamped, 1, "the restamp is counted: {report:?}");
         let got = crate::storage::get(&dst, "mem-restamp-2211")
             .expect("get")
             .expect("row landed");
@@ -1736,7 +1737,7 @@ mod tests {
         let src = fresh_conn("clobber-src-");
         let mut incoming = memory_fixture("mem-incoming-2211", "shared title", "alice");
         incoming.content = "bundle content".into();
-        crate::storage::insert(&src, &incoming).expect("seed src");
+        crate::storage::insert_imported(&src, &incoming).expect("seed unsigned source row");
         let env = build_full_envelope(&src, "src", "2026-07-14T00:00:00Z").expect("export");
 
         let dst = fresh_conn("clobber-dst-");
