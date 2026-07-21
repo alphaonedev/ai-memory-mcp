@@ -11,7 +11,7 @@ write_files:
     permissions: '0644'
     content: |
       [Unit]
-      Description=IronClaw v0.28.1 agent #${agent_index} (Track E1 hive)
+      Description=IronClaw v0.29.1 agent #${agent_index} (Track E1 hive)
       After=network-online.target
       Wants=network-online.target
 
@@ -22,7 +22,7 @@ write_files:
       Environment=AI_MEMORY_AGENT_ID=hive-e1-agent-${agent_index}
       Environment=AI_MEMORY_HTTP=http://${memory_private_ip}:9077
       Environment=XAI_API_KEY=__OPERATOR_INJECTED_AT_BOOT__
-      ExecStart=/opt/ironclaw/bin/ironclaw --provider openai-compatible --base-url https://api.x.ai/v1 --model grok-4.3
+      ExecStart=/opt/ironclaw/bin/ironclaw --provider openai-compatible --base-url https://api.x.ai/v1 --model grok-4.5
       Restart=on-failure
       RestartSec=5
 
