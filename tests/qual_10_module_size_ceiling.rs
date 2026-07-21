@@ -860,7 +860,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // block, two added INSERT columns + binds, and two more ON CONFLICT arms
     // (encrypted_envelope + kind_provenance, adjacent to #2280's valid-time
     // arms) land the merged file at 28_569. Ceiling 28_520 -> 28_600 (+31).
-    ("src/store/postgres.rs", 28_600),
+    // 2026-07-21 (#2292): route the remaining EIGHT postgres content-write
+    // funnels (store_with_embedding / capture_turn / recover_turn /
+    // apply_remote_memory / consolidate / reflect_with_hooks / the supersede
+    // twin / merge_inbound) through the shared `seal_content_for_insert`
+    // at-rest seal helper — the helper + per-funnel seal block, the added
+    // `encrypted_envelope` INSERT column + bind, and each upsert funnel's ON
+    // CONFLICT arm land the file at 28_736. Ceiling 28_600 -> 28_800 (+64).
+    ("src/store/postgres.rs", 28_800),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
