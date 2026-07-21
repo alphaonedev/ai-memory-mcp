@@ -212,6 +212,15 @@ const BASE_CONTENT: &str = "This is a substantial body so the AUTONOMY_MIN_CONTE
 /// insert; the new row exists alongside the existing candidate.
 #[test]
 fn verb_add_proceeds_with_insert() {
+    // #2285 — `run_store` below engages real synthesis (a candidate is
+    // seeded), which calls `build_prompt_with_cap` and writes the
+    // process-global `SYNTHESIS_PROMPT_MAX_CHARS` running-max counter.
+    // Serialize against the tests that assert an exact count on that
+    // counter so this test's write can't land mid-assert.
+    let _prompt_telemetry_guard = prompt_max_chars_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
     let (conn, db_path) = open_db();
     // Seed and incoming share keyword tokens so the FTS pre-filter
     // surfaces the seeded row as a candidate. Titles differ enough
@@ -259,6 +268,13 @@ fn verb_add_proceeds_with_insert() {
 /// candidate with `merged_content` and SKIPs the new-row insert.
 #[test]
 fn verb_update_rewrites_existing_and_skips_insert() {
+    // #2285 — see `verb_add_proceeds_with_insert` for why this guard is
+    // needed: `run_store` engages real synthesis and writes the
+    // process-global prompt-size telemetry counter.
+    let _prompt_telemetry_guard = prompt_max_chars_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
     let (conn, db_path) = open_db();
     let existing_id = seed_existing(
         &conn,
@@ -333,6 +349,13 @@ fn verb_update_rewrites_existing_and_skips_insert() {
 /// proceeds with the standard insert.
 #[test]
 fn verb_delete_removes_candidate_and_inserts_new() {
+    // #2285 — see `verb_add_proceeds_with_insert` for why this guard is
+    // needed: `run_store` engages real synthesis and writes the
+    // process-global prompt-size telemetry counter.
+    let _prompt_telemetry_guard = prompt_max_chars_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
     let (conn, db_path) = open_db();
     let existing_id = seed_existing(
         &conn,
@@ -378,6 +401,13 @@ fn verb_delete_removes_candidate_and_inserts_new() {
 /// insert; both rows survive.
 #[test]
 fn verb_no_op_keeps_candidate_and_inserts_new() {
+    // #2285 — see `verb_add_proceeds_with_insert` for why this guard is
+    // needed: `run_store` engages real synthesis and writes the
+    // process-global prompt-size telemetry counter.
+    let _prompt_telemetry_guard = prompt_max_chars_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
     let (conn, db_path) = open_db();
     let existing_id = seed_existing(
         &conn,
@@ -597,6 +627,12 @@ fn synthesis_delete_verdict_consults_k9_per_candidate() {
     let _g = k9_synthesis_rules_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // #2285 — `run_store` below engages real synthesis and writes the
+    // process-global `SYNTHESIS_PROMPT_MAX_CHARS` running-max counter;
+    // serialize against the tests that assert an exact count on it.
+    let _prompt_telemetry_guard = prompt_max_chars_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
 
     let (conn, db_path) = open_db();
     let ns = "ns-k9-recheck";
@@ -665,6 +701,14 @@ fn synthesis_delete_verdict_consults_k9_per_candidate() {
 /// `GOVERNANCE_REFUSED` envelope. No candidate is deleted.
 #[test]
 fn synthesis_unbounded_delete_refused_without_k10_approval() {
+    // #2285 — `run_store` below builds the synthesis prompt (and thus
+    // writes the process-global prompt-size telemetry counter) before
+    // the per-call delete cap is checked on the returned verdict, even
+    // though this test expects the write to ultimately refuse.
+    let _prompt_telemetry_guard = prompt_max_chars_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
     let (conn, db_path) = open_db();
     let ns = "ns-unbounded-delete";
     // No policy installed → default cap of 1 applies.
@@ -727,6 +771,13 @@ fn synthesis_unbounded_delete_refused_without_k10_approval() {
 /// the legacy fall-through.
 #[test]
 fn synthesis_response_carries_synthesis_failed_on_llm_error() {
+    // #2285 — the prompt is built (and the process-global prompt-size
+    // telemetry counter written) before the mocked LLM call fails, so
+    // this test still needs to serialize against the asserting tests.
+    let _prompt_telemetry_guard = prompt_max_chars_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
     let (conn, db_path) = open_db();
     let ns = "ns-failed-flag";
     // Default policy: fall_through.
@@ -832,6 +883,13 @@ fn synthesis_prompt_truncates_candidate_content_at_cap() {
 /// error instead of silently falling through.
 #[test]
 fn synthesis_block_write_namespace_refuses_on_curator_down() {
+    // #2285 — the prompt is built (and the process-global prompt-size
+    // telemetry counter written) before the mocked LLM call fails, so
+    // this test still needs to serialize against the asserting tests.
+    let _prompt_telemetry_guard = prompt_max_chars_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
     let (conn, db_path) = open_db();
     let ns = "ns-block-write";
     install_synthesis_policy(
@@ -884,6 +942,13 @@ fn synthesis_block_write_namespace_refuses_on_curator_down() {
 /// the substrate-state assertion is the load-bearing check.
 #[test]
 fn synthesis_multi_update_verdict_honors_all_updates() {
+    // #2285 — see `verb_add_proceeds_with_insert` for why this guard is
+    // needed: `run_store` engages real synthesis and writes the
+    // process-global prompt-size telemetry counter.
+    let _prompt_telemetry_guard = prompt_max_chars_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
     let (conn, db_path) = open_db();
     let ns = "ns-multi-update";
 
@@ -1121,6 +1186,12 @@ fn synthesis_delete_verdict_k9_ask_skips_candidate() {
     let _g = k9_synthesis_rules_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // #2285 — `run_store` below engages real synthesis and writes the
+    // process-global `SYNTHESIS_PROMPT_MAX_CHARS` running-max counter;
+    // serialize against the tests that assert an exact count on it.
+    let _prompt_telemetry_guard = prompt_max_chars_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
 
     let (conn, db_path) = open_db();
     let ns = "ns-k9-ask-synthesis";
@@ -1179,6 +1250,13 @@ fn synthesis_delete_verdict_k9_ask_skips_candidate() {
 /// (lines 670-679).
 #[test]
 fn synthesis_update_plus_delete_combined_applies_both() {
+    // #2285 — see `verb_add_proceeds_with_insert` for why this guard is
+    // needed: `run_store` engages real synthesis and writes the
+    // process-global prompt-size telemetry counter.
+    let _prompt_telemetry_guard = prompt_max_chars_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
     let (conn, db_path) = open_db();
     let ns = "ns-update-plus-delete";
     let id_update = seed_existing(
@@ -1302,6 +1380,12 @@ impl ai_memory::embeddings::Embed for IntegrationMockEmbedder {
 fn synthesis_update_with_embedder_re_embeds_merged_content() {
     use ai_memory::hnsw::VectorIndex;
 
+    // #2285 — `run_store_with_embedder` below engages real synthesis and
+    // writes the process-global prompt-size telemetry counter.
+    let _prompt_telemetry_guard = prompt_max_chars_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
     let (conn, db_path) = open_db();
     let ns = "ns-update-embed";
     let id_update = seed_existing(
@@ -1367,6 +1451,13 @@ fn synthesis_update_with_embedder_re_embeds_merged_content() {
 /// row with relation='supersedes' from the new memory id → target id.
 #[test]
 fn issue_1239_synthesis_update_emits_supersedes_link() {
+    // #2285 — see `verb_add_proceeds_with_insert` for why this guard is
+    // needed: `run_store` engages real synthesis and writes the
+    // process-global prompt-size telemetry counter.
+    let _prompt_telemetry_guard = prompt_max_chars_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
     let (conn, db_path) = open_db();
     let ns = "ns-1239-update";
     let target_id = seed_existing(
@@ -1450,6 +1541,13 @@ fn issue_1239_synthesis_update_emits_supersedes_link() {
 ///      never have run, leaving the candidate alive).
 #[test]
 fn issue_1239_synthesis_delete_reinsert_emits_supersedes_link() {
+    // #2285 — see `verb_add_proceeds_with_insert` for why this guard is
+    // needed: `run_store` engages real synthesis and writes the
+    // process-global prompt-size telemetry counter.
+    let _prompt_telemetry_guard = prompt_max_chars_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
     let (conn, db_path) = open_db();
     let ns = "ns-1239-delete-reinsert";
     let target_id = seed_existing(
@@ -1602,6 +1700,14 @@ fn issue_1240_synthesis_depth_guard_refuses_at_depth_4() {
 /// confirm the counter starts at 0 in the absence of a parent scope.
 #[test]
 fn issue_1240_synthesis_depth_guard_admits_depth_under_cap() {
+    // #2285 — unlike its depth=4-refusal sibling above, this test runs
+    // the synthesis pass to completion (depth=1, under the cap), so
+    // `run_store` writes the process-global prompt-size telemetry
+    // counter and must serialize against the asserting tests.
+    let _prompt_telemetry_guard = prompt_max_chars_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
     let (conn, db_path) = open_db();
     let ns = "ns-1240-under-cap";
     let _seed = seed_existing(&conn, "kubernetes deployment notes", "prior body", ns);
