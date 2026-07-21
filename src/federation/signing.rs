@@ -68,6 +68,64 @@ pub fn sign_body_with_nonce_header(key: &SigningKey, body: &[u8], nonce: &str) -
     format!("{ED25519_PREFIX}{b64}")
 }
 
+/// v0.7.0 #1031 / v1.0.0 #2290 — canonical byte stream a federation GET
+/// request is signed over: `method || '\n' || path || '\n' || query`.
+///
+/// This is the SINGLE SOURCE OF TRUTH shared by the receiver verifier
+/// ([`crate::handlers::federation_signing_check::verify_get_signature_or_reject`]
+/// delegates to it) AND every outbound catch-up client (via
+/// [`sign_get_request`] / [`sign_get_url`]), so the signed bytes are
+/// byte-identical on both ends. Any divergence fails CLOSED (the receiver
+/// returns `401`), never silently accepts — the data-integrity posture.
+#[must_use]
+pub fn canonical_get_bytes(method: &str, path: &str, query: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(method.len() + path.len() + query.len() + 2);
+    out.extend_from_slice(method.as_bytes());
+    out.push(b'\n');
+    out.extend_from_slice(path.as_bytes());
+    out.push(b'\n');
+    out.extend_from_slice(query.as_bytes());
+    out
+}
+
+/// v1.0.0 #2290 — sign an outbound federation GET for the #1031 signed-GET
+/// contract. Returns `(x_memory_sig_header_value, nonce)`, mirroring the
+/// `/sync/push` client signing EXACTLY: [`sign_body_with_nonce_header`] over
+/// [`canonical_get_bytes`]`(method, path, query) || 0x00 || nonce`, with a
+/// fresh v4-UUID nonce (the same shape the push client generates). An enrolled
+/// peer's catch-up GET therefore verifies under the default
+/// `AI_MEMORY_FED_REQUIRE_SIG=1` posture, closing #2290.
+#[must_use]
+pub fn sign_get_request(
+    key: &SigningKey,
+    method: &str,
+    path: &str,
+    query: &str,
+) -> (String, String) {
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let canonical = canonical_get_bytes(method, path, query);
+    let sig_header = sign_body_with_nonce_header(key, &canonical, &nonce);
+    (sig_header, nonce)
+}
+
+/// v1.0.0 #2290 — compute the signed-GET headers for an outbound catch-up
+/// `GET <url>`. Parses `url` with the SAME parser `reqwest` uses, so the
+/// signed `path`/`query` are byte-identical to the wire request-target the
+/// receiver reconstructs via axum's `OriginalUri`. Returns `Some((sig, nonce))`
+/// for the [`SIGNATURE_HEADER`] / [`NONCE_HEADER`] pair, or `None` when:
+/// - `key` is `None` (no daemon signing key on disk) — the outbound GET stays
+///   unsigned, preserving the permissive / unenrolled `AI_MEMORY_FED_REQUIRE_SIG=0`
+///   posture (byte-identical to pre-#2290), OR
+/// - `url` fails to parse (the request would fail at `send()` anyway).
+#[must_use]
+pub fn sign_get_url(key: Option<&SigningKey>, url: &str) -> Option<(String, String)> {
+    let key = key?;
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let path = parsed.path();
+    let query = parsed.query().unwrap_or("");
+    Some(sign_get_request(key, "GET", path, query))
+}
+
 /// Reason a signature verification failed.
 #[derive(Debug, Clone)]
 pub enum VerifyError {

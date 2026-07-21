@@ -6783,6 +6783,23 @@ pub async fn sync_cycle_once(
     if let Some(key) = api_key {
         req = req.header(crate::HEADER_API_KEY, key);
     }
+    // #2290 — sign the outbound /sync/since pull GET with the daemon signing
+    // key (loaded from local_agent_id's on-disk keypair) so an ENROLLED peer
+    // accepts the catch-up pull under the default AI_MEMORY_FED_REQUIRE_SIG=1
+    // posture — the receiver's verify_get_signature_or_reject gate otherwise
+    // refuses an enrolled peer's unsigned GET with 401 x_memory_sig_missing.
+    // Mirrors the /sync/push client signing (canonical GET bytes + nonce).
+    // Unsigned when no key is on disk (preserves the permissive posture).
+    let pull_signing_key = crate::governance::audit::load_daemon_signing_key(local_agent_id)
+        .ok()
+        .flatten();
+    if let Some((sig, nonce)) =
+        crate::federation::signing::sign_get_url(pull_signing_key.as_ref(), &pull_url)
+    {
+        req = req
+            .header(crate::federation::signing::SIGNATURE_HEADER, sig)
+            .header(crate::federation::signing::NONCE_HEADER, nonce);
+    }
     let resp = req.send().await?;
     if !resp.status().is_success() {
         anyhow::bail!("sync-daemon: pull status {}", resp.status());
