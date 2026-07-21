@@ -1,3 +1,19 @@
+ai-memory (1.0.0-1) noble; urgency=medium
+
+  * v1.0.0 GA release. Schema v86 (claim-bitemporal valid-time
+    canonicalization). Erasure-coded archive cold tier (#2064,
+    opt-in AI_MEMORY_ERASURE_COLD_TIER). v1.0.0 secure-default flips:
+    federation write/signal signature requirements, checkpoint-
+    resolution signatures, policy-currency refusal, HTTP per-agent-key
+    attested identity (advisory), macaroon capability tokens default-on
+    with zero-config owner enrollment. asi-hard named security posture
+    + inference-plane egress gating. Three-key governance role
+    separation (recorder/judge/stopper) + identity-lineage succession
+    chain + M-of-N threshold key recovery.
+  * See CHANGELOG.md for the full consolidated v1.0.0 entry.
+
+ -- Justin Jessup <Justin@alpha-one.mobi>  Tue, 21 Jul 2026 00:00:00 +0000
+
 ai-memory (0.6.0-1) noble; urgency=medium
 
   * Phase 1 complete: Tasks 1.1 schema metadata, 1.2 agent identity (NHI),
