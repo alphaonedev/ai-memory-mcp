@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-memory-openai-shim"
-version = "0.1.0"
+version = "1.0.0"
 description = "Record each OpenAI Chat Completions turn to ai-memory (Direct-API SDK shim)."
 readme = "README.md"
 requires-python = ">=3.10"

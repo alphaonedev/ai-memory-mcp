@@ -1,6 +1,6 @@
 {
   "name": "@alphaone/ai-memory-openai-shim",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Record each OpenAI Chat Completions turn to ai-memory (Direct-API SDK shim).",
   "license": "Apache-2.0",
   "author": "AlphaOne LLC",

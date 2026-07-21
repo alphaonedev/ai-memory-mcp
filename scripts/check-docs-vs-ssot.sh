@@ -31,7 +31,10 @@
 # Rules:
 #  - CURRENT_SCHEMA_VERSION → docs claims of "schema v<N>",
 #    "CURRENT_SCHEMA_VERSION = <N>", "schema_version=<N>",
-#    "schema_version = <N>". Historical "v52 added X" / "v51 added X"
+#    "schema_version = <N>", the release-notes.md markdown-table row
+#    "| Schema | **v<N>** (`CURRENT_SCHEMA_VERSION`", and ROADMAP's
+#    scoped plain-prose "the current substrate has advanced to schema
+#    <N>" phrasing (#2282). Historical "v52 added X" / "v51 added X"
 #    narrative refs are LEFT ALONE (they describe past ladder events,
 #    not the current canonical state).
 #  - EXPECTED_PRODUCTION_ROUTES_COUNT → docs claims of
@@ -133,6 +136,7 @@ DOC_FILES=(
     docs/compliance/nsa-csi-mcp-security-mapping.md
     docs/integrations/README.md
     docs/integrations/claude-code.md
+    docs/v1.0.0/release-notes.md
 )
 
 # CHANGELOG.md is intentionally excluded — every entry is a historical
@@ -198,6 +202,21 @@ patterns = [
     re.compile(r'schema \*\*v([0-9]+)\*\* sqlite'),
     re.compile(r'backends sit at \*\*schema_version=([0-9]+)'),
     re.compile(r'logical schema \*\*v([0-9]+)\*\*'),
+    # Markdown table form (release-notes.md Surface-at-vX.Y.Z table row):
+    #   | Schema | **v86** (CURRENT_SCHEMA_VERSION, both adapters) |
+    # \x60 is the backtick code-span delimiter, spelled as a hex escape
+    # rather than a literal backtick character -- this whole block is
+    # interpolated inside a double-quoted python3 -c string, and a
+    # literal backtick there would trigger bash command substitution.
+    re.compile(r'\| *Schema *\| *\*\*v([0-9]+)\*\* *\(\x60CURRENT_SCHEMA_VERSION'),
+    # ROADMAPs plain-prose current-state phrasing. Scoped to the exact
+    # phrase the current substrate has advanced to schema N (issue
+    # #2282) rather than a bare schema-([0-9]+) pattern -- a generic
+    # word-boundary pattern false-positives on legitimate HISTORICAL
+    # narrative mentions elsewhere in ROADMAP.md, e.g. advanced to
+    # schema 78 anchored to a past release, or schema 45 in ladder
+    # history, which are correct historical state, not drift.
+    re.compile(r'the current substrate has advanced to schema ([0-9]+)'),
 ]
 for ln, line in enumerate(open('$f').read().splitlines(), 1):
     for p in patterns:
