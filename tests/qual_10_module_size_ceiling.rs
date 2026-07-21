@@ -364,7 +364,21 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // round-trip regressions land storage/mod.rs at 27_035. The 5-agent
     // crossroads vote chose the policy-prescribed lockstep bump over a
     // release-train module split. Ceiling 26_750 -> 27_100 (+65 headroom).
-    ("src/storage/mod.rs", 27_100),
+    //
+    // 2026-07-21 (#1802 R-05 S1, folded onto release HEAD) — REDUCED
+    // 27_100 → 26_450: the doctor / observability probe region (698 LOC:
+    // is_namespace_standard .. doctor_reflection_totals_by_namespace, incl.
+    // sweep_pending_action_timeouts + the capability-expansion ledger) moved
+    // verbatim to the new src/storage/doctor.rs submodule (itemized
+    // re-export shim keeps every `crate::storage::*` / `crate::db::*` path
+    // stable). After the fold onto the #2266/#2267 27_035 file the extract
+    // lands mod.rs at 26_362; ceiling 26_450 (+88). Per the QUAL-10 shrink
+    // rule: "when a file's LOC SHRINKS (a refactor split), the ceiling falls".
+    ("src/storage/mod.rs", 26_450),
+    // 2026-07-21 (#1802 R-05 S1) — NEW submodule extracted from
+    // storage/mod.rs (doctor / observability probes). Measured 698;
+    // ceiling 800 (+102).
+    ("src/storage/doctor.rs", 800),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
