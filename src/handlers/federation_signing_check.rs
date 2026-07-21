@@ -1346,13 +1346,10 @@ fn allow_unenrolled_peers_enabled() -> bool {
 /// without re-parsing.
 #[must_use]
 pub(super) fn canonical_get_bytes(method: &str, path: &str, query: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(method.len() + path.len() + query.len() + 2);
-    out.extend_from_slice(method.as_bytes());
-    out.push(b'\n');
-    out.extend_from_slice(path.as_bytes());
-    out.push(b'\n');
-    out.extend_from_slice(query.as_bytes());
-    out
+    // #2290 — delegate to the federation-signing SSOT so the receiver
+    // verifier and every outbound catch-up client sign/verify byte-identical
+    // canonical bytes (they cannot drift).
+    fed_signing::canonical_get_bytes(method, path, query)
 }
 
 /// v0.7.0 #1031 — verify an `X-Memory-Sig` header against the
