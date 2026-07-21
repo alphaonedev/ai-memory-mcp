@@ -4945,9 +4945,7 @@ impl PostgresStore {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let upd_sealed = crate::encryption::seal_content(upd_effective_content, upd_agent_id)
-            .map_err(|e| StoreError::IntegrityFailed {
-                detail: format!("at-rest seal_content failed: {e}"),
-            })?;
+            .map_err(at_rest_seal_err)?;
         // When sealing, write the placeholder verbatim into `content`
         // (Some); when not sealing, bind None so the SQL COALESCE keeps the
         // patch-or-stored plaintext exactly as before.
@@ -11706,6 +11704,16 @@ fn serialize_err(field: &str, e: impl std::fmt::Display) -> String {
     format!("serialize {field}: {e}")
 }
 
+/// #2288 — shared constructor for the at-rest content-seal failure
+/// `StoreError`. One home for the message string so the three seal sites
+/// (`store`, `store_batch`, and the supersede/update path) reference it by
+/// name instead of each embedding the literal (hardcoded-literal ratchet).
+fn at_rest_seal_err(e: impl std::fmt::Display) -> StoreError {
+    StoreError::IntegrityFailed {
+        detail: format!("at-rest seal_content failed: {e}"),
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn to_store_err(what: &str, e: sqlx::Error) -> StoreError {
     StoreError::BackendUnavailable {
@@ -13736,9 +13744,7 @@ impl MemoryStore for PostgresStore {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let store_sealed = crate::encryption::seal_content(&memory.content, store_agent_id)
-            .map_err(|e| StoreError::IntegrityFailed {
-                detail: format!("at-rest seal_content failed: {e}"),
-            })?;
+            .map_err(at_rest_seal_err)?;
         let store_content_to_store = store_sealed
             .as_ref()
             .map_or(memory.content.as_str(), |(_, ph)| ph.as_str());
@@ -14038,8 +14044,9 @@ impl MemoryStore for PostgresStore {
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version,
-                mentioned_entity_id, lifecycle_state,
-                cid, cid_genesis, valid_from, valid_until
+                mentioned_entity_id, lifecycle_state, encrypted_envelope,
+                cid, cid_genesis, kind_provenance,
+                valid_from, valid_until
             ) ",
         );
 
@@ -14115,11 +14122,40 @@ impl MemoryStore for PostgresStore {
             // below so a surviving upsert-merge row keeps its own genesis cid.
             let batch_cid = crate::identity::cid::stamp_memory_cid(memory);
 
+            // #2288 — at-rest content encryption (postgres BULK parity with
+            // `store()`). Seal each row's plaintext to the per-agent X25519 key
+            // when enabled; the `content` column then carries the empty
+            // placeholder and the ciphertext lands in the `encrypted_envelope`
+            // BYTEA column (schema v68). When disabled (default) `sealed` is
+            // None: content is stored verbatim and the envelope binds NULL —
+            // byte-identical to the pre-#2288 path. agent_id is the NHI
+            // provenance marker from metadata (fail-closed under an enabled
+            // gate when absent, matching `store()`). Content-only: title / tags
+            // / metadata stay plain. Pre-#2288 the bulk funnel NEVER sealed, so
+            // an encryption-on `POST /api/v1/memories/bulk` persisted PLAINTEXT
+            // while `store()` sealed — a silent at-rest-encryption bypass.
+            let batch_agent_id = memory
+                .metadata
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let sealed = match crate::encryption::seal_content(&memory.content, batch_agent_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    push_err.get_or_insert(at_rest_seal_err(e));
+                    return;
+                }
+            };
+            let content_to_store: String = sealed
+                .as_ref()
+                .map_or_else(|| memory.content.clone(), |(_, ph)| ph.clone());
+            let encrypted_envelope: Option<Vec<u8>> = sealed.map(|(env, _)| env);
+
             row.push_bind(memory.id.clone())
                 .push_bind(memory.tier.as_str().to_string())
                 .push_bind(memory.namespace.clone())
                 .push_bind(memory.title.clone())
-                .push_bind(memory.content.clone())
+                .push_bind(content_to_store)
                 .push_bind(tags_json)
                 .push_bind(memory.priority)
                 .push_bind(memory.confidence)
@@ -14144,10 +14180,19 @@ impl MemoryStore for PostgresStore {
                 .push_bind(mentioned_entity_id)
                 // v0.8.0 Pillar 2 (#1709) — lifecycle_state parity with `store()`.
                 .push_bind(memory.lifecycle_state.as_str().to_string())
+                // #2288 — sealed ciphertext envelope (order matches the
+                // `encrypted_envelope` column above); NULL when encryption off.
+                .push_bind(encrypted_envelope)
                 // v0.9.0 G8 (#1825) — genesis content-id pair (positional
                 // order matches the `cid, cid_genesis` column tail above).
                 .push_bind(batch_cid.cid)
                 .push_bind(batch_cid.genesis)
+                // v1.0.0 (#1945 / #2289) — denormalised epistemic-typing
+                // provenance (order matches the `kind_provenance` column above),
+                // derived from `metadata.kind_provenance` (sqlite `db::insert`
+                // parity via `extract_kind_provenance`). Pre-#2289 the bulk
+                // funnel dropped it, silently losing caller provenance on pg.
+                .push_bind(crate::storage::extract_kind_provenance(memory))
                 // v1.0.0 #1834 — claim-bitemporal VALID-TIME (order matches the
                 // `valid_from, valid_until` column tail above), canonicalized
                 // to the fixed UTC rendering at this funnel (pre-ship 3x7).
@@ -14165,6 +14210,11 @@ impl MemoryStore for PostgresStore {
         builder.push(
             " ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
+                -- #2288 — content + envelope move together on upsert (sqlite +
+                -- `store()` parity): a re-store replaces both the placeholder
+                -- and the ciphertext, and an encryption-off write clears any
+                -- stale envelope to NULL.
+                encrypted_envelope = EXCLUDED.encrypted_envelope,
                 tier = CASE
                     WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
                         THEN EXCLUDED.tier
@@ -14218,16 +14268,19 @@ impl MemoryStore for PostgresStore {
                 -- when the incoming write omits it). Batch upsert-merge was
                 -- the one write funnel missing the #1834 claim-bitemporal
                 -- arms that store()/store_with_embedding already carry.
-                -- (kind_provenance is NOT set here — like store_with_embedding
-                -- the store_batch INSERT never lists that column, so there is
-                -- no EXCLUDED.kind_provenance to reference; only store() both
-                -- inserts and conflict-merges it.)
+                -- (#2289 fold: kind_provenance IS now both inserted and
+                -- conflict-merged below — the store_batch INSERT lists the
+                -- column, so EXCLUDED.kind_provenance is defined.)
                 valid_from = memories.valid_from,
                 valid_until = COALESCE(EXCLUDED.valid_until, memories.valid_until),
                 -- v0.9.0 G8 (#1825) — cid/cid_genesis OMITTED from DO UPDATE
                 -- SET: surviving row keeps its genesis.
                 -- #1632 (pg twin) — upsert-merge bumps the Gap-1 counter.
-                version = memories.version + 1
+                version = memories.version + 1,
+                -- v1.0.0 (#1945 / #2289) — sqlite + `store()` parity: the
+                -- epistemic-typing provenance follows the incoming write when
+                -- present, else keeps the stored marker (COALESCE).
+                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
             RETURNING id, title, namespace",
         );
 
