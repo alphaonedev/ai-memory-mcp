@@ -22,6 +22,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use ai_memory::db;
 use ai_memory::erasure::ENV_ERASURE_COLD_TIER;
@@ -36,7 +37,7 @@ fn env_lock() -> &'static Mutex<()> {
 }
 
 struct Fixture {
-    _tmp: tempfile::TempDir,
+    tmp: tempfile::TempDir,
     conn: Connection,
     db_path: PathBuf,
 }
@@ -45,11 +46,7 @@ fn fixture() -> Fixture {
     let tmp = tempfile::tempdir().expect("tempdir");
     let db_path = tmp.path().join("cold.db");
     let conn = db::open(&db_path).expect("open file-backed sqlite");
-    Fixture {
-        _tmp: tmp,
-        conn,
-        db_path,
-    }
+    Fixture { tmp, conn, db_path }
 }
 
 fn erasure_dir(db_path: &Path) -> PathBuf {
@@ -195,6 +192,78 @@ fn restore_survives_shard_loss_up_to_parity_budget() {
         )
         .expect("restored live row");
     assert_eq!(content, "survives m shard losses");
+    enable(false);
+}
+
+#[test]
+fn hostile_manifest_geometry_is_rejected_before_allocation() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    seed_archived(&f.conn, "row-hostile-geometry", "must fail closed", None);
+    archive_sync::gc_tick(&f.conn).expect("sweep");
+
+    let manifest_path = erasure_dir(&f.db_path)
+        .join("row-hostile-geometry")
+        .join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).expect("read manifest"))
+            .expect("parse manifest");
+    manifest["data_shards"] = serde_json::json!(usize::MAX);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("serialize hostile manifest"),
+    )
+    .expect("write hostile manifest");
+    drop_archived_row(&f.conn, "row-hostile-geometry");
+
+    let err = db::restore_archived(&f.conn, "row-hostile-geometry")
+        .expect_err("hostile geometry must be a typed refusal, never an allocation panic");
+    let detail = format!("{err:#}");
+    assert!(
+        detail.contains("manifest malformed") && detail.contains("invalid erasure params"),
+        "unexpected refusal: {detail}"
+    );
+    enable(false);
+}
+
+#[test]
+fn hostile_manifest_and_shard_sizes_are_bounded_before_reads() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    for id in ["row-huge-shard", "row-huge-manifest"] {
+        seed_archived(&f.conn, id, "bounded hostile input", None);
+    }
+    archive_sync::gc_tick(&f.conn).expect("sweep");
+    let root = erasure_dir(&f.db_path);
+
+    let shard_manifest = root.join("row-huge-shard").join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&shard_manifest).expect("read manifest"))
+            .expect("parse manifest");
+    manifest["shard_size"] = serde_json::json!(128 * 1024 * 1024usize);
+    manifest["payload_len"] = serde_json::json!(1);
+    std::fs::write(
+        &shard_manifest,
+        serde_json::to_vec(&manifest).expect("serialize hostile manifest"),
+    )
+    .expect("write hostile manifest");
+    drop_archived_row(&f.conn, "row-huge-shard");
+    let shard_error = db::restore_archived(&f.conn, "row-huge-shard")
+        .expect_err("huge shard geometry must fail before shard reads");
+    assert!(format!("{shard_error:#}").contains("shard_size"));
+
+    let huge_manifest = root.join("row-huge-manifest").join("manifest.json");
+    std::fs::write(&huge_manifest, vec![b'x'; 1024 * 1024 + 1]).expect("write oversized manifest");
+    drop_archived_row(&f.conn, "row-huge-manifest");
+    let manifest_error = db::restore_archived(&f.conn, "row-huge-manifest")
+        .expect_err("oversized manifest must fail before allocation");
+    assert!(format!("{manifest_error:#}").contains("manifest size"));
     enable(false);
 }
 
@@ -346,6 +415,134 @@ fn sweep_is_paced_by_the_limit() {
 }
 
 #[test]
+fn sweep_frontier_survives_fresh_cli_process_2247() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    for (id, at) in [
+        ("row-cli-1", "2020-01-01T00:00:01Z"),
+        ("row-cli-2", "2020-01-01T00:00:02Z"),
+        ("row-cli-3", "2020-01-01T00:00:03Z"),
+    ] {
+        seed_archived(&f.conn, id, "cli cadence", None);
+        set_archived_at(&f.conn, id, at);
+    }
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+    let first = archive_sync::sweep_archive_bundles(&f.conn, &store, 1).expect("first CLI gc");
+    assert_eq!(first.bundled, 1);
+    assert!(store.dir().join(".sweep-frontier.json").is_file());
+
+    archive_sync::clear_process_caches_for_tests(store.dir());
+    let next = archive_sync::sweep_archive_bundles(&f.conn, &store, 16).expect("fresh CLI gc");
+    assert_eq!(next.bundled, 2, "fresh process resumes behind row 1");
+    assert_eq!(
+        next.already_current, 0,
+        "fresh process loads the durable frontier instead of re-probing the prefix"
+    );
+    enable(false);
+}
+
+#[test]
+fn reconcile_inventory_caches_root_walk_and_folds_temp_reap_2248() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    seed_archived(&f.conn, "row-indexed", "inventory", None);
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+    archive_sync::sweep_archive_bundles(&f.conn, &store, 16).expect("sweep");
+
+    let (first, reaped) = store.reconcile_inventory(0, 0);
+    assert_eq!(first, vec!["row-indexed"]);
+    assert_eq!(reaped, 0);
+
+    // A valid-looking directory added behind the cache is not discovered by
+    // the ordinary fast path, proving that path does no root enumeration.
+    let shadow = store.dir().join("row-shadow");
+    std::fs::create_dir(&shadow).expect("shadow dir");
+    std::fs::copy(
+        store.dir().join("row-indexed").join("manifest.json"),
+        shadow.join("manifest.json"),
+    )
+    .expect("shadow manifest");
+    let temp = store.dir().join(".tmp-crashed-writer");
+    std::fs::create_dir(&temp).expect("temp dir");
+    let (cached, cached_reaped) = store.reconcile_inventory(u64::MAX, 0);
+    assert_eq!(cached, vec!["row-indexed"]);
+    assert_eq!(cached_reaped, 0);
+    assert!(temp.exists(), "fast path performs no second temp-dir walk");
+
+    let (refreshed, refreshed_reaped) = store.reconcile_inventory(0, 0);
+    assert_eq!(refreshed, vec!["row-indexed", "row-shadow"]);
+    assert_eq!(
+        refreshed_reaped, 1,
+        "refresh folds temp reap into its one walk"
+    );
+    assert!(!temp.exists());
+    enable(false);
+}
+
+#[test]
+fn reconcile_cursor_is_durable_and_keyed_per_store_2247() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f1 = fixture();
+    let f2 = fixture();
+    for f in [&f1, &f2] {
+        for id in ["row-cursor-a", "row-cursor-b"] {
+            seed_archived(&f.conn, id, "cursor", None);
+        }
+        archive_sync::gc_tick(&f.conn).expect("bundle cursor fixture");
+        for id in ["row-cursor-a", "row-cursor-b"] {
+            drop_archived_row(&f.conn, id);
+        }
+    }
+    let s1 = archive_sync::store_for_conn(&f1.conn)
+        .expect("store 1")
+        .expect("enabled");
+    let s2 = archive_sync::store_for_conn(&f2.conn)
+        .expect("store 2")
+        .expect("enabled");
+
+    let first = archive_sync::reconcile_and_scrub(&f1.conn, &s1, 1, 0, 0);
+    assert_eq!(first.quarantined, 1);
+    assert!(
+        s1.dir()
+            .join(".quarantine/row-cursor-a/manifest.json")
+            .is_file(),
+        "store 1 begins at its own cursor zero"
+    );
+    archive_sync::clear_process_caches_for_tests(s1.dir());
+    let resumed = archive_sync::reconcile_and_scrub(&f1.conn, &s1, 1, 0, 0);
+    assert_eq!(resumed.quarantined, 1);
+    assert!(
+        s1.dir()
+            .join(".quarantine/row-cursor-b/manifest.json")
+            .is_file(),
+        "fresh process resumes store 1 from its durable cursor"
+    );
+
+    let independent = archive_sync::reconcile_and_scrub(&f2.conn, &s2, 1, 0, 0);
+    assert_eq!(independent.quarantined, 1);
+    assert!(
+        s2.dir()
+            .join(".quarantine/row-cursor-a/manifest.json")
+            .is_file(),
+        "store 2 has an independent cursor instead of inheriting store 1's"
+    );
+    enable(false);
+}
+
+#[test]
 fn journaled_purge_orphan_is_reaped_and_not_resurrectable() {
     // R1 (SAFE half of F1) — a bundle whose id carries a RECORDED purge intent
     // (journaled BEFORE the DELETE) is confirmed destruction. A crash between
@@ -364,7 +561,8 @@ fn journaled_purge_orphan_is_reaped_and_not_resurrectable() {
 
     // A purge that journaled intent + deleted the row, then CRASHED before
     // removing the bundle.
-    archive_sync::journal_purge_intent_best_effort(&f.conn, &["row-purged-crash".to_string()]);
+    archive_sync::journal_purge_intent(&f.conn, &["row-purged-crash".to_string()])
+        .expect("journal purge intent");
     drop_archived_row(&f.conn, "row-purged-crash");
 
     // Restore refuses a journaled id immediately (before any reconciliation).
@@ -382,6 +580,202 @@ fn journaled_purge_orphan_is_reaped_and_not_resurrectable() {
     assert!(
         !bundle.exists(),
         "journaled orphan bundle gone after reconciliation"
+    );
+    enable(false);
+}
+
+#[test]
+fn purge_marker_blocks_cross_process_remint_until_row_and_bundle_are_gone() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    seed_archived(&f.conn, "row-purge-race", "must not be re-minted", None);
+    archive_sync::gc_tick(&f.conn).expect("initial sweep");
+    let dir = erasure_dir(&f.db_path);
+    let bundle = dir.join("row-purge-race");
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+
+    archive_sync::journal_purge_intent(&f.conn, &["row-purge-race".to_string()])
+        .expect("journal purge intent");
+    archive_sync::remove_bundles_best_effort(&f.conn, &["row-purge-race".to_string()]);
+    assert!(!bundle.exists(), "purge removed the old bundle");
+    assert!(
+        store.is_purge_intended("row-purge-race"),
+        "intent survives removal while a racing sweep may still see the row"
+    );
+
+    // Model the second process: its sweep starts from an empty in-process
+    // frontier while the durable archived row remains visible.
+    // Use the store's canonical directory: on macOS the fixture path can be
+    // spelled through /tmp while ErasureStore resolves it through /private/tmp,
+    // and the process cache is keyed by the latter PathBuf.
+    archive_sync::reset_process_static_sweep_state_for_dir(store.dir());
+    let raced = archive_sync::sweep_archive_bundles(&f.conn, &store, 16).expect("racing sweep");
+    assert_eq!(raced.skipped_purge_intent, 1);
+    assert!(!bundle.exists(), "durable intent forbids re-minting");
+    assert!(store.is_purge_intended("row-purge-race"));
+
+    // Only after the row and bundle are both absent may compaction retire the
+    // marker. This keeps the journal bounded without reopening the race.
+    drop_archived_row(&f.conn, "row-purge-race");
+    let rr = archive_sync::reconcile_and_scrub(&f.conn, &store, 16, 0, 0);
+    assert_eq!(rr.journal_compacted, 1);
+    assert!(!store.is_purge_intended("row-purge-race"));
+    enable(false);
+}
+
+#[test]
+fn one_store_lock_serializes_sweep_publication_and_purge() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    seed_archived(&f.conn, "row-lock-purge", "must be purged exactly", None);
+    seed_archived(
+        &f.conn,
+        "row-lock-sweep",
+        "must publish after release",
+        None,
+    );
+
+    // Both operations must block on the SAME canonical lock inode. The short
+    // timeout is not the correctness oracle by itself: each operation then
+    // completes successfully immediately after the held guard is dropped.
+    let held = archive_sync::coordination_lock_for_tests(&f.conn).expect("hold store lock");
+    archive_sync::reset_lock_attempts_for_tests();
+    let purge_db = f.db_path.clone();
+    let (purge_tx, purge_rx) = std::sync::mpsc::channel();
+    let purge_thread = std::thread::spawn(move || {
+        let conn = db::open(&purge_db).expect("open purge connection");
+        purge_tx
+            .send(db::purge_archive(&conn, None))
+            .expect("send purge result");
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while archive_sync::lock_attempts_for_tests() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "purge worker must reach the production lock acquisition"
+        );
+        std::thread::yield_now();
+    }
+    assert!(
+        matches!(
+            purge_rx.recv_timeout(Duration::from_millis(150)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
+        "purge must not cross the held store transition lock"
+    );
+    drop(held);
+    purge_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("purge completes after release")
+        .expect("purge succeeds");
+    purge_thread.join().expect("purge thread");
+
+    seed_archived(&f.conn, "row-lock-sweep-2", "fresh sweep candidate", None);
+    let held = archive_sync::coordination_lock_for_tests(&f.conn).expect("hold store lock");
+    archive_sync::reset_lock_attempts_for_tests();
+    let sweep_db = f.db_path.clone();
+    let (sweep_tx, sweep_rx) = std::sync::mpsc::channel();
+    let sweep_thread = std::thread::spawn(move || {
+        let conn = db::open(&sweep_db).expect("open sweep connection");
+        let store = archive_sync::store_for_conn(&conn)
+            .expect("store")
+            .expect("enabled");
+        sweep_tx
+            .send(archive_sync::sweep_archive_bundles(
+                &conn,
+                &store,
+                archive_sync::SWEEP_LIMIT_PER_TICK,
+            ))
+            .expect("send sweep result");
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while archive_sync::lock_attempts_for_tests() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sweep worker must reach the production lock acquisition"
+        );
+        std::thread::yield_now();
+    }
+    assert!(
+        matches!(
+            sweep_rx.recv_timeout(Duration::from_millis(150)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
+        "sweep publication must not cross the held store transition lock"
+    );
+    drop(held);
+    let report = sweep_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("sweep completes after release")
+        .expect("sweep succeeds");
+    assert_eq!(report.bundled, 1);
+    sweep_thread.join().expect("sweep thread");
+    enable(false);
+}
+
+#[test]
+fn prepared_stale_snapshot_cannot_publish_after_purge_and_compaction() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    seed_archived(&f.conn, "row-aba", "must never resurrect", None);
+    archive_sync::set_pause_before_publish_lock_for_tests(true);
+    let sweep_db = f.db_path.clone();
+    let (sweep_tx, sweep_rx) = std::sync::mpsc::channel();
+    let sweep_thread = std::thread::spawn(move || {
+        let conn = db::open(&sweep_db).expect("open stale sweep connection");
+        let store = archive_sync::store_for_conn(&conn)
+            .expect("store")
+            .expect("enabled");
+        sweep_tx
+            .send(archive_sync::sweep_archive_bundles(
+                &conn,
+                &store,
+                archive_sync::SWEEP_LIMIT_PER_TICK,
+            ))
+            .expect("send stale sweep result");
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !archive_sync::reached_before_publish_lock_for_tests() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sweep never reached deterministic pre-publication barrier"
+        );
+        std::thread::yield_now();
+    }
+
+    // The old implementation had already passed its sole marker check here.
+    // Complete purge and marker compaction before allowing stale publication.
+    assert_eq!(db::purge_archive(&f.conn, None).expect("purge"), 1);
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+    let _ = archive_sync::reconcile_and_scrub(&f.conn, &store, 512, 16, 0);
+    archive_sync::set_pause_before_publish_lock_for_tests(false);
+    let stale = sweep_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("stale sweep completes")
+        .expect("stale sweep returns cleanly");
+    sweep_thread.join().expect("stale sweep thread");
+
+    assert_eq!(stale.bundled, 0, "stale snapshot must not publish");
+    assert!(
+        !store.contains("row-aba"),
+        "purged bundle must remain absent"
+    );
+    assert!(
+        !db::restore_archived(&f.conn, "row-aba").expect("restore probe"),
+        "purged content must not resurrect"
     );
     enable(false);
 }
@@ -463,6 +857,220 @@ fn unjournaled_dbloss_bundle_is_quarantined_not_destroyed_and_recoverable() {
 }
 
 #[test]
+fn row_probe_error_skips_bundle_instead_of_classifying_it_as_rowless() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    seed_archived(&f.conn, "row-probe-error", "must remain untouched", None);
+    archive_sync::gc_tick(&f.conn).expect("sweep");
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+    let active = erasure_dir(&f.db_path).join("row-probe-error");
+
+    f.conn
+        .execute("DROP TABLE archived_memories", [])
+        .expect("inject archived-row probe failure");
+    let report = archive_sync::reconcile_and_scrub(&f.conn, &store, 512, 16, 0);
+
+    assert_eq!(report.scanned, 1);
+    assert_eq!(report.orphans_reaped, 0);
+    assert_eq!(report.quarantined, 0);
+    assert!(
+        active.join("manifest.json").is_file(),
+        "a DB probe error must leave the bundle untouched for a later tick"
+    );
+    enable(false);
+}
+
+#[test]
+fn live_row_probe_error_also_leaves_rowless_bundle_untouched() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    seed_archived(
+        &f.conn,
+        "row-live-probe-error",
+        "must remain untouched",
+        None,
+    );
+    archive_sync::gc_tick(&f.conn).expect("sweep");
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+    let active = erasure_dir(&f.db_path).join("row-live-probe-error");
+    drop_archived_row(&f.conn, "row-live-probe-error");
+    f.conn
+        .execute("DROP TABLE memories", [])
+        .expect("inject live-row probe failure");
+
+    let report = archive_sync::reconcile_and_scrub(&f.conn, &store, 512, 16, 0);
+    assert_eq!(report.scanned, 1);
+    assert_eq!(report.orphans_reaped, 0);
+    assert_eq!(report.quarantined, 0);
+    assert!(
+        active.join("manifest.json").is_file(),
+        "a live-table probe error must leave the bundle untouched"
+    );
+    enable(false);
+}
+
+#[test]
+fn dr_recovery_error_is_reported_for_retry() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+    let malformed = erasure_dir(&f.db_path)
+        .join(".quarantine")
+        .join("invalid id");
+    std::fs::create_dir_all(&malformed).expect("create malformed quarantine entry");
+    std::fs::write(malformed.join("manifest.json"), b"{}").expect("write manifest sentinel");
+
+    unsafe { std::env::set_var(ENV_ERASURE_RECOVER_QUARANTINE, "1") };
+    let report = archive_sync::reconcile_and_scrub(&f.conn, &store, 512, 16, 0);
+    assert_eq!(report.quarantine_recovered, 0);
+    assert_eq!(
+        report.quarantine_recovery_failed, 1,
+        "a failed DR recovery must be visible and retried later"
+    );
+    assert!(malformed.join("manifest.json").is_file());
+    unsafe { std::env::remove_var(ENV_ERASURE_RECOVER_QUARANTINE) };
+    enable(false);
+}
+
+#[test]
+fn purge_marker_creation_failure_is_fail_closed() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    seed_archived(
+        &f.conn,
+        "row-marker-failure",
+        "must survive failed journaling",
+        None,
+    );
+    archive_sync::gc_tick(&f.conn).expect("sweep");
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+    let marker_path = erasure_dir(&f.db_path)
+        .join(".purge-intent")
+        .join("row-marker-failure");
+    std::fs::create_dir_all(&marker_path).expect("occupy marker path with a directory");
+
+    let error = db::purge_archive(&f.conn, None)
+        .expect_err("purge must not proceed when its intent cannot be journaled");
+    assert!(
+        format!("{error:#}").contains("create purge-intent marker"),
+        "unexpected error chain: {error:#}"
+    );
+    let surviving: i64 = f
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM archived_memories WHERE id = 'row-marker-failure'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count surviving archived row");
+    assert_eq!(surviving, 1, "the archived row must remain intact");
+    assert!(
+        store.contains("row-marker-failure"),
+        "the cold-tier bundle must remain intact"
+    );
+    enable(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn purge_refuses_symlinked_lock_and_marker_without_touching_targets() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    seed_archived(&f.conn, "row-symlink-defense", "must survive", None);
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+    let victim = f.tmp.path().join("victim.txt");
+    std::fs::write(&victim, b"do-not-touch").expect("seed victim");
+
+    let lock_path = store.dir().join(".erasure-coordination.lock");
+    std::os::unix::fs::symlink(&victim, &lock_path).expect("plant lock symlink");
+    let lock_error = db::purge_archive(&f.conn, None).expect_err("symlinked lock must fail closed");
+    assert!(format!("{lock_error:#}").contains("coordination lock"));
+    assert_eq!(
+        std::fs::read(&victim).expect("read victim"),
+        b"do-not-touch"
+    );
+    std::fs::remove_file(&lock_path).expect("remove planted lock symlink");
+
+    // Establish the legitimate lock inode, then attack the per-id marker.
+    drop(archive_sync::coordination_lock_for_tests(&f.conn).expect("create legitimate lock"));
+    let journal = store.dir().join(".purge-intent");
+    std::fs::create_dir_all(&journal).expect("create journal dir");
+    std::os::unix::fs::symlink(&victim, journal.join("row-symlink-defense"))
+        .expect("plant marker symlink");
+    let marker_error =
+        db::purge_archive(&f.conn, None).expect_err("symlinked marker must fail closed");
+    assert!(format!("{marker_error:#}").contains("purge-intent marker"));
+    assert_eq!(
+        std::fs::read(&victim).expect("read victim"),
+        b"do-not-touch"
+    );
+    let inventory = store.dir().join(".bundle-inventory.json");
+    let injected_inventory = f.tmp.path().join("injected-inventory.json");
+    std::fs::write(&injected_inventory, b"[\"injected-bundle\"]").expect("seed injection");
+    std::os::unix::fs::symlink(&injected_inventory, &inventory).expect("plant inventory symlink");
+    let (ids, _) = store.reconcile_inventory(u64::MAX, 0);
+    assert!(
+        !ids.iter().any(|id| id == "injected-bundle"),
+        "fresh inventory symlink must not be consumed"
+    );
+    assert_eq!(
+        std::fs::read(&victim).expect("read victim"),
+        b"do-not-touch",
+        "derived inventory refresh must never follow a planted symlink"
+    );
+    std::fs::remove_file(&inventory).expect("remove inventory symlink");
+
+    // A hostile frontier symlink must not skip the real archived row. This
+    // exercises the read path (not merely safe replacement of the symlink).
+    seed_archived(&f.conn, "row-state-read", "must not be skipped", None);
+    let injected_frontier = f.tmp.path().join("injected-frontier.json");
+    std::fs::write(&injected_frontier, b"[\"9999-12-31\",\"zzzz\"]")
+        .expect("seed frontier injection");
+    let frontier = store.dir().join(".sweep-frontier.json");
+    std::os::unix::fs::symlink(&injected_frontier, &frontier).expect("plant frontier symlink");
+    archive_sync::clear_process_caches_for_tests(store.dir());
+    let sweep = archive_sync::sweep_archive_bundles(&f.conn, &store, 16)
+        .expect("sweep ignores hostile frontier state");
+    assert!(sweep.bundled >= 1);
+    assert!(store.contains("row-state-read"));
+    let survives: i64 = f
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM archived_memories WHERE id = 'row-symlink-defense'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count survivor");
+    assert_eq!(survives, 1);
+    enable(false);
+}
+
+#[test]
 fn aborted_purge_stale_marker_is_cleared_so_later_dbloss_quarantines() {
     // R5 — a purge that JOURNALED intent then had its `DELETE` abort
     // (SQLITE_BUSY / IO) leaves a stale marker while the row + bundle survive.
@@ -484,7 +1092,8 @@ fn aborted_purge_stale_marker_is_cleared_so_later_dbloss_quarantines() {
 
     // Aborted purge: intent journaled, but the DELETE failed so the archived
     // row + its bundle both still exist.
-    archive_sync::journal_purge_intent_best_effort(&f.conn, &["row-aborted".to_string()]);
+    archive_sync::journal_purge_intent(&f.conn, &["row-aborted".to_string()])
+        .expect("journal purge intent");
     assert!(
         store.is_purge_intended("row-aborted"),
         "intent marker present"
@@ -513,6 +1122,97 @@ fn aborted_purge_stale_marker_is_cleared_so_later_dbloss_quarantines() {
         rr2.orphans_reaped, 0,
         "no destruction — the marker was cleared"
     );
+    enable(false);
+}
+
+#[test]
+fn stale_intent_is_retained_when_repair_retry_admission_fails() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+    let retry_path = store.dir().join(".sweep-repair-retry.json");
+
+    seed_archived(&f.conn, "row-retry-io", "retain on retry I/O failure", None);
+    archive_sync::journal_purge_intent(&f.conn, &["row-retry-io".to_string()])
+        .expect("journal I/O case");
+    std::fs::create_dir(&retry_path).expect("block retry-state publication");
+    let report = archive_sync::reconcile_and_scrub(&f.conn, &store, 16, 0, 0);
+    assert_eq!(report.stale_intent_cleared, 0);
+    assert!(store.is_purge_intended("row-retry-io"));
+    std::fs::remove_dir(&retry_path).expect("remove publication blocker");
+
+    seed_archived(
+        &f.conn,
+        "row-retry-capacity",
+        "retain when retry queue is full",
+        None,
+    );
+    archive_sync::journal_purge_intent(&f.conn, &["row-retry-capacity".to_string()])
+        .expect("journal capacity case");
+    let full: Vec<String> = (0..archive_sync::POISON_SKIP_SET_CAP)
+        .map(|i| format!("queued-{i}"))
+        .collect();
+    std::fs::write(
+        &retry_path,
+        serde_json::to_vec(&full).expect("serialize full queue"),
+    )
+    .expect("seed full retry queue");
+    let report = archive_sync::reconcile_and_scrub(&f.conn, &store, 16, 0, 0);
+    assert_eq!(report.stale_intent_cleared, 0);
+    assert!(store.is_purge_intended("row-retry-capacity"));
+    enable(false);
+}
+
+#[test]
+fn aborted_purge_without_bundle_retries_despite_other_process_stale_frontier() {
+    let _g = env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    enable(true);
+    let f = fixture();
+    seed_archived(
+        &f.conn,
+        "row-aborted-before-bundle",
+        "must regain cold-tier protection",
+        None,
+    );
+    let store = archive_sync::store_for_conn(&f.conn)
+        .expect("store")
+        .expect("enabled");
+    archive_sync::journal_purge_intent(&f.conn, &["row-aborted-before-bundle".to_string()])
+        .expect("journal purge intent");
+
+    let skipped =
+        archive_sync::sweep_archive_bundles(&f.conn, &store, archive_sync::SWEEP_LIMIT_PER_TICK)
+            .expect("sweep while purge appears active");
+    assert_eq!(skipped.skipped_purge_intent, 1);
+    assert!(!store.contains("row-aborted-before-bundle"));
+
+    let rr = archive_sync::reconcile_and_scrub(&f.conn, &store, 512, 16, 0);
+    assert_eq!(rr.stale_intent_cleared, 1);
+    assert!(!store.is_purge_intended("row-aborted-before-bundle"));
+
+    // Model a second daemon re-persisting its unaffected stale frontier beyond
+    // this row after the first daemon repaired the marker. A fresh local cache
+    // then observes that shared state. The targeted retry queue must win
+    // independently of the normal frontier scan.
+    std::fs::write(
+        store.dir().join(".sweep-frontier.json"),
+        b"[\"9999-12-31\",\"zzzz\"]",
+    )
+    .expect("re-persist other process frontier");
+    archive_sync::clear_process_caches_for_tests(store.dir());
+
+    let retried =
+        archive_sync::sweep_archive_bundles(&f.conn, &store, archive_sync::SWEEP_LIMIT_PER_TICK)
+            .expect("sweep after stale intent repair");
+    assert_eq!(retried.bundled, 1);
+    assert!(store.contains("row-aborted-before-bundle"));
     enable(false);
 }
 
@@ -735,24 +1435,21 @@ fn poison_skip_set_clears_on_restart_2225() {
         "poison row skipped; frontier advanced past it"
     );
 
-    // Simulate a process RESTART: the skip-set + keyset frontier are
-    // process-static and reset on restart, so the poison row is RETRIED (the
-    // self-healing path once its underlying cause is repaired). Reset via the
-    // store's OWN `dir()` — the exact PathBuf the sweep uses as its registry
-    // key — so this matches on macOS too, where a recomputed erasure_dir string
-    // would differ by the /tmp -> /private/tmp symlink (see the fixture note).
-    archive_sync::reset_process_static_sweep_state_for_dir(store.dir());
+    // Simulate a REAL process restart: clear only process caches while keeping
+    // the durable frontier and durable poison-retry set. The retry must happen
+    // even though the row is behind the persisted frontier.
+    archive_sync::clear_process_caches_for_tests(store.dir());
 
     let after_restart =
         archive_sync::sweep_archive_bundles(&f.conn, &store, archive_sync::SWEEP_LIMIT_PER_TICK)
             .expect("post-restart sweep");
     assert_eq!(
         after_restart.failed, 1,
-        "a restart clears the skip-set — the poison row is re-attempted (fails again, still poison)"
+        "a restart reloads the durable retry set and re-attempts the poison row"
     );
     assert_eq!(
         after_restart.skipped_poison, 0,
-        "the skip-set was cleared by the restart, so nothing is skipped on the first fresh tick"
+        "the durable retry occurs before the frontier scan"
     );
     enable(false);
 }
@@ -776,7 +1473,7 @@ fn detached_sweep_completes_while_handler_mutex_is_held() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     enable(true);
     let Fixture {
-        _tmp,
+        tmp: _tmp,
         conn,
         db_path,
     } = fixture();
@@ -871,7 +1568,7 @@ fn gc_loop_runs_detached_erasure_arm_for_file_backed_db() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     enable(true);
     let Fixture {
-        _tmp,
+        tmp: _tmp,
         conn,
         db_path,
     } = fixture();

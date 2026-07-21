@@ -32,6 +32,15 @@
 //! disclosure anchor stays wildcard-free-exhaustive so the placement
 //! upgrade must consciously re-wire it).
 //!
+//! The shard tree is an operator-controlled local durability directory, not
+//! an authenticity boundary against a malicious principal with write access
+//! to that directory. SHA-256 detects accidental/torn/corrupt shard data but
+//! is not a MAC or signature: a same-authority writer could replace a manifest
+//! and all shards consistently. Operators must protect the directory with OS
+//! ownership/permissions at least as strongly as the SQLite database. The
+//! implementation still rejects unsafe symlink/non-regular coordination and
+//! state objects and bounds hostile disk geometry as defense in depth.
+//!
 //! # Knobs (direct-read, the row-84/85 precedent)
 //!
 //! - [`ENV_ERASURE_COLD_TIER`] — opt-in master switch (default OFF; OFF is
