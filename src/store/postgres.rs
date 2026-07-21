@@ -14038,8 +14038,9 @@ impl MemoryStore for PostgresStore {
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version,
-                mentioned_entity_id, lifecycle_state,
-                cid, cid_genesis, valid_from, valid_until
+                mentioned_entity_id, lifecycle_state, encrypted_envelope,
+                cid, cid_genesis,
+                valid_from, valid_until
             ) ",
         );
 
@@ -14115,11 +14116,42 @@ impl MemoryStore for PostgresStore {
             // below so a surviving upsert-merge row keeps its own genesis cid.
             let batch_cid = crate::identity::cid::stamp_memory_cid(memory);
 
+            // #2288 — at-rest content encryption (postgres BULK parity with
+            // `store()`). Seal each row's plaintext to the per-agent X25519 key
+            // when enabled; the `content` column then carries the empty
+            // placeholder and the ciphertext lands in the `encrypted_envelope`
+            // BYTEA column (schema v68). When disabled (default) `sealed` is
+            // None: content is stored verbatim and the envelope binds NULL —
+            // byte-identical to the pre-#2288 path. agent_id is the NHI
+            // provenance marker from metadata (fail-closed under an enabled
+            // gate when absent, matching `store()`). Content-only: title / tags
+            // / metadata stay plain. Pre-#2288 the bulk funnel NEVER sealed, so
+            // an encryption-on `POST /api/v1/memories/bulk` persisted PLAINTEXT
+            // while `store()` sealed — a silent at-rest-encryption bypass.
+            let batch_agent_id = memory
+                .metadata
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let sealed = match crate::encryption::seal_content(&memory.content, batch_agent_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    push_err.get_or_insert(StoreError::IntegrityFailed {
+                        detail: format!("at-rest seal_content failed: {e}"),
+                    });
+                    return;
+                }
+            };
+            let content_to_store: String = sealed
+                .as_ref()
+                .map_or_else(|| memory.content.clone(), |(_, ph)| ph.clone());
+            let encrypted_envelope: Option<Vec<u8>> = sealed.map(|(env, _)| env);
+
             row.push_bind(memory.id.clone())
                 .push_bind(memory.tier.as_str().to_string())
                 .push_bind(memory.namespace.clone())
                 .push_bind(memory.title.clone())
-                .push_bind(memory.content.clone())
+                .push_bind(content_to_store)
                 .push_bind(tags_json)
                 .push_bind(memory.priority)
                 .push_bind(memory.confidence)
@@ -14144,6 +14176,9 @@ impl MemoryStore for PostgresStore {
                 .push_bind(mentioned_entity_id)
                 // v0.8.0 Pillar 2 (#1709) — lifecycle_state parity with `store()`.
                 .push_bind(memory.lifecycle_state.as_str().to_string())
+                // #2288 — sealed ciphertext envelope (order matches the
+                // `encrypted_envelope` column above); NULL when encryption off.
+                .push_bind(encrypted_envelope)
                 // v0.9.0 G8 (#1825) — genesis content-id pair (positional
                 // order matches the `cid, cid_genesis` column tail above).
                 .push_bind(batch_cid.cid)
@@ -14165,6 +14200,11 @@ impl MemoryStore for PostgresStore {
         builder.push(
             " ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
+                -- #2288 — content + envelope move together on upsert (sqlite +
+                -- `store()` parity): a re-store replaces both the placeholder
+                -- and the ciphertext, and an encryption-off write clears any
+                -- stale envelope to NULL.
+                encrypted_envelope = EXCLUDED.encrypted_envelope,
                 tier = CASE
                     WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
                         THEN EXCLUDED.tier

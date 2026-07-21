@@ -1333,6 +1333,84 @@ mod postgres_side {
         }
     }
 
+    /// #2288 — at-rest encryption parity for the BULK funnel. Under the
+    /// `AI_MEMORY_ENCRYPT_AT_REST` gate, `PostgresStore::store_batch` MUST
+    /// seal each row exactly as `store()` does: `content` holds the empty
+    /// placeholder, `encrypted_envelope` (BYTEA) carries the ciphertext,
+    /// and `MemoryStore::get` transparently decrypts. Pre-#2288 the bulk
+    /// funnel bound plaintext into `content` and NEVER populated the
+    /// envelope, so `POST /api/v1/memories/bulk` persisted PLAINTEXT while
+    /// the operator believed at-rest encryption was on — a silent bypass.
+    ///
+    /// Teardown runs BEFORE the assertions (the shared `ai_memory_test`
+    /// DB has no per-test isolation — #2287), so a failed assertion never
+    /// leaks the seeded row.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_store_batch_seals_content_2288() {
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
+        // SAFETY: pg tests are #[ignore] and run serially under --ignored.
+        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+
+        let agent = "pg-2288-batch-agent";
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let plaintext = "pg batch sensitive content — #2288 seal parity";
+        let mut mem = sample_memory(&format!("pg-2288-batch-{run}"));
+        mem.content = plaintext.to_string();
+        mem.metadata = serde_json::json!({ "agent_id": agent });
+        let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-2288");
+
+        let ids = MemoryStore::store_batch(&pg, &admin_ctx, std::slice::from_ref(&mem))
+            .await
+            .expect("store_batch under encryption");
+        assert_eq!(ids.len(), 1, "one id returned");
+        let id = ids[0].clone();
+
+        // Raw row: content placeholder empty, envelope non-NULL.
+        let (raw_content, envelope): (String, Option<Vec<u8>>) =
+            sqlx::query_as("SELECT content, encrypted_envelope FROM memories WHERE id = $1")
+                .bind(&id)
+                .fetch_one(pg.pool())
+                .await
+                .expect("raw read");
+        // get transparently decrypts.
+        let fetched = MemoryStore::get(&pg, &admin_ctx, &id).await.expect("get");
+
+        // Teardown FIRST so an assertion failure below never leaks the row.
+        let _ = sqlx::query("DELETE FROM memories WHERE id = $1")
+            .bind(&id)
+            .execute(pg.pool())
+            .await;
+        // SAFETY: restore the env before asserting.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
+                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
+            }
+        }
+
+        assert_eq!(
+            raw_content, "",
+            "#2288: store_batch content column must hold the empty placeholder, not plaintext"
+        );
+        assert!(
+            !raw_content.contains("sensitive"),
+            "#2288: the plaintext must never reach the content column"
+        );
+        assert!(
+            envelope.is_some(),
+            "#2288: store_batch must populate encrypted_envelope under the at-rest gate"
+        );
+        assert_eq!(
+            fetched.content, plaintext,
+            "#2288: get must transparently recover the sealed plaintext"
+        );
+    }
+
     /// #228 Commit B — postgres twin of the sqlite fail-closed test. A
     /// row with a non-NULL envelope whose recipient key cannot decrypt
     /// (sealed to agent A but the row names agent B) must FAIL the read

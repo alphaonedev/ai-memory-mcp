@@ -849,7 +849,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // land postgres.rs at 28_387. The 5-agent crossroads vote chose the
     // policy-prescribed lockstep bump over a release-train module split.
     // Ceiling 28_300 -> 28_400 (+13 headroom).
-    ("src/store/postgres.rs", 28_400),
+    // 2026-07-21 (#2288 + #2289): store_batch now seals content into
+    // encrypted_envelope (at-rest encryption bulk parity) + persists
+    // kind_provenance — the per-row seal block, the two added INSERT columns
+    // + binds, and the two ON CONFLICT arms land postgres.rs at 28_437.
+    // Ceiling 28_400 -> 28_500 (+63 headroom).
+    ("src/store/postgres.rs", 28_500),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
