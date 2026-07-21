@@ -4945,9 +4945,7 @@ impl PostgresStore {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let upd_sealed = crate::encryption::seal_content(upd_effective_content, upd_agent_id)
-            .map_err(|e| StoreError::IntegrityFailed {
-                detail: format!("at-rest seal_content failed: {e}"),
-            })?;
+            .map_err(at_rest_seal_err)?;
         // When sealing, write the placeholder verbatim into `content`
         // (Some); when not sealing, bind None so the SQL COALESCE keeps the
         // patch-or-stored plaintext exactly as before.
@@ -11706,6 +11704,16 @@ fn serialize_err(field: &str, e: impl std::fmt::Display) -> String {
     format!("serialize {field}: {e}")
 }
 
+/// #2288 — shared constructor for the at-rest content-seal failure
+/// `StoreError`. One home for the message string so the three seal sites
+/// (`store`, `store_batch`, and the supersede/update path) reference it by
+/// name instead of each embedding the literal (hardcoded-literal ratchet).
+fn at_rest_seal_err(e: impl std::fmt::Display) -> StoreError {
+    StoreError::IntegrityFailed {
+        detail: format!("at-rest seal_content failed: {e}"),
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn to_store_err(what: &str, e: sqlx::Error) -> StoreError {
     StoreError::BackendUnavailable {
@@ -13736,9 +13744,7 @@ impl MemoryStore for PostgresStore {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let store_sealed = crate::encryption::seal_content(&memory.content, store_agent_id)
-            .map_err(|e| StoreError::IntegrityFailed {
-                detail: format!("at-rest seal_content failed: {e}"),
-            })?;
+            .map_err(at_rest_seal_err)?;
         let store_content_to_store = store_sealed
             .as_ref()
             .map_or(memory.content.as_str(), |(_, ph)| ph.as_str());
@@ -14136,9 +14142,7 @@ impl MemoryStore for PostgresStore {
             let sealed = match crate::encryption::seal_content(&memory.content, batch_agent_id) {
                 Ok(v) => v,
                 Err(e) => {
-                    push_err.get_or_insert(StoreError::IntegrityFailed {
-                        detail: format!("at-rest seal_content failed: {e}"),
-                    });
+                    push_err.get_or_insert(at_rest_seal_err(e));
                     return;
                 }
             };
