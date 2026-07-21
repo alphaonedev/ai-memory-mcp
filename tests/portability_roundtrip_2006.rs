@@ -49,6 +49,10 @@ fn durable_memory() -> Memory {
         source: "system".into(),
         created_at: now.clone(),
         updated_at: now,
+        // Pin beyond the test horizon. Leaving this `None` lets the tier
+        // policy stamp the next UTC-midnight expiry; a suite that crosses
+        // that boundary then correctly exports zero live memories.
+        expires_at: Some("2099-01-01T00:00:00Z".into()),
         memory_kind: MemoryKind::Decision,
         metadata: serde_json::json!({ "agent_id": "alice" }),
         // #1834/#2204 — claim-bitemporal VALID-time bounds are part of the
