@@ -33,10 +33,16 @@
 //! (re-encoded and atomically re-written) so the loss budget is restored —
 //! best-effort, WARN on failure, never blocking the read.
 
-use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    fs::{File, OpenOptions},
+    io::{Read, Write},
+    path::{Path, PathBuf},
+};
 
 use super::codec::{
-    BundleManifest, EncodedBundle, ErasureError, ErasureParams, encode_bundle, reconstruct_bundle,
+    BundleManifest, ErasureError, ErasureParams, MAX_BUNDLE_PAYLOAD_BYTES, encode_bundle,
+    reconstruct_bundle, validate_manifest,
 };
 
 /// Manifest file name inside a bundle directory.
@@ -62,16 +68,62 @@ pub const TEMP_DIR_PREFIX: &str = ".tmp-";
 /// BEFORE the `DELETE` (#2064 F1). The reconciler HARD-deletes a rowless
 /// bundle ONLY when its id is journaled here; a rowless bundle with NO marker
 /// is treated as possible DB loss and QUARANTINED (never destroyed). Dot-led
-/// so it is skipped by [`ErasureStore::list_committed_bundle_ids`].
+/// so it is skipped by [`ErasureStore::reconcile_inventory`].
 pub const PURGE_JOURNAL_DIR: &str = ".purge-intent";
 
 /// Dot-led subdir a rowless-but-UN-journaled bundle is MOVED into instead of
 /// being destroyed (#2064 F1): the DR-recovery holding pen. Invisible to
-/// `get` / `list_committed_bundle_ids` so a quarantined bundle can never be
+/// `get` / `reconcile_inventory` so a quarantined bundle can never be
 /// resurrected via `archive restore` (the resurrection lane stays closed),
 /// yet the bytes are PRESERVED on disk and recoverable
 /// ([`ErasureStore::recover_quarantined`]).
 pub const QUARANTINE_DIR: &str = ".quarantine";
+/// Derived committed-bundle inventory used to keep ordinary reconcile ticks
+/// bounded. A malformed/missing cache is rebuilt from the store root.
+const BUNDLE_INVENTORY_FILE: &str = ".bundle-inventory.json";
+const COORDINATION_LOCK_FILE: &str = ".erasure-coordination.lock";
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_INVENTORY_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_INVENTORY_ENTRIES: usize = 100_000;
+const LOCK_INSPECTION_CONTEXT: &str = "inspect erasure coordination lock";
+const MARKER_INSPECTION_CONTEXT: &str = "inspect purge-intent marker";
+static TEST_LOCK_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+
+#[doc(hidden)]
+pub(crate) fn reset_lock_attempts_for_tests() {
+    TEST_LOCK_ATTEMPTS.store(0, Ordering::SeqCst);
+}
+
+#[doc(hidden)]
+pub(crate) fn lock_attempts_for_tests() -> usize {
+    TEST_LOCK_ATTEMPTS.load(Ordering::SeqCst)
+}
+
+/// Exclusive per-store coordination guard. Dropping it releases the OS lock,
+/// including after unwinding; process death releases it in the kernel.
+pub(crate) struct CoordinationGuard {
+    file: File,
+}
+
+impl Drop for CoordinationGuard {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+/// A fully encoded and fsync'd bundle that is not visible until published.
+pub(crate) struct PreparedBundle {
+    temp_dir: Option<PathBuf>,
+    final_dir: PathBuf,
+}
+
+impl Drop for PreparedBundle {
+    fn drop(&mut self) {
+        if let Some(path) = self.temp_dir.take() {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
 
 /// fsync a single file so its bytes reach stable storage before the rename
 /// that publishes the bundle (F3 — power-loss durability: a torn/empty shard
@@ -150,6 +202,96 @@ fn io_err(context: &str, e: &std::io::Error) -> ErasureError {
     }
 }
 
+/// Read a small operator-owned state file without following filesystem
+/// aliases. Invalid, non-regular, multiply-linked, or oversized inputs are
+/// treated as absent so callers can fail safe to their rebuild/default path.
+pub(crate) fn read_bounded_state_file(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() != 1 {
+            return None;
+        }
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 <= max_bytes).then_some(bytes)
+}
+
+fn persist_derived_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), ErasureError> {
+    let destination = dir.join(name);
+    if let Ok(metadata) = std::fs::symlink_metadata(&destination)
+        && (!metadata.is_file() || metadata.file_type().is_symlink())
+    {
+        return Err(ErasureError::Io {
+            context: "inspect derived state destination".to_string(),
+            detail: format!("{} is not a regular file", destination.display()),
+        });
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let staging = dir.join(format!(
+        ".tmp-derived-{name}-{}-{nonce}",
+        std::process::id()
+    ));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let result = (|| -> Result<(), ErasureError> {
+        let mut file = options
+            .open(&staging)
+            .map_err(|e| io_err("create derived state staging file", &e))?;
+        file.write_all(bytes)
+            .map_err(|e| io_err("write derived state staging file", &e))?;
+        file.sync_all()
+            .map_err(|e| io_err("fsync derived state staging file", &e))?;
+        drop(file);
+        #[cfg(windows)]
+        if destination.exists() {
+            std::fs::remove_file(&destination)
+                .map_err(|e| io_err("replace derived state destination", &e))?;
+        }
+        std::fs::rename(&staging, &destination).map_err(|e| io_err("publish derived state", &e))?;
+        fsync_dir(dir)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(staging);
+    }
+    result
+}
+
 /// The on-disk erasure bundle store.
 #[derive(Debug, Clone)]
 pub struct ErasureStore {
@@ -167,6 +309,7 @@ impl ErasureStore {
     pub fn open(dir: impl Into<PathBuf>, params: ErasureParams) -> Result<Self, ErasureError> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir).map_err(|e| io_err("create store dir", &e))?;
+        let dir = std::fs::canonicalize(&dir).map_err(|e| io_err("canonicalize store dir", &e))?;
         Ok(Self { dir, params })
     }
 
@@ -179,6 +322,68 @@ impl ErasureStore {
     fn bundle_dir(&self, id: &str) -> Result<PathBuf, ErasureError> {
         validate_bundle_id(id)?;
         Ok(self.dir.join(id))
+    }
+
+    /// Acquire the one cross-process exclusion domain for this canonical
+    /// store. The file is never truncated and is rejected if it is a symlink,
+    /// non-regular file, or (on Unix) has multiple hard links.
+    pub(crate) fn lock_exclusive(&self) -> Result<CoordinationGuard, ErasureError> {
+        let path = self.dir.join(COORDINATION_LOCK_FILE);
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let file = options
+            .open(&path)
+            .map_err(|e| io_err("open erasure coordination lock", &e))?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| io_err(LOCK_INSPECTION_CONTEXT, &e))?;
+        if !metadata.is_file() {
+            return Err(ErasureError::Io {
+                context: LOCK_INSPECTION_CONTEXT.to_string(),
+                detail: "lock is not a regular file".to_string(),
+            });
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if metadata.nlink() != 1 || metadata.mode() & 0o077 != 0 {
+                return Err(ErasureError::Io {
+                    context: LOCK_INSPECTION_CONTEXT.to_string(),
+                    detail: "lock must have one hard link and mode no broader than 0600"
+                        .to_string(),
+                });
+            }
+        }
+        TEST_LOCK_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+        fs2::FileExt::lock_exclusive(&file)
+            .map_err(|e| io_err("lock erasure coordination file", &e))?;
+        let opened = same_file::Handle::from_file(
+            file.try_clone()
+                .map_err(|e| io_err("clone erasure coordination lock", &e))?,
+        )
+        .map_err(|e| io_err("capture erasure coordination lock identity", &e))?;
+        let current = same_file::Handle::from_path(&path)
+            .map_err(|e| io_err("recheck erasure coordination lock identity", &e))?;
+        if opened != current {
+            return Err(ErasureError::Io {
+                context: "recheck erasure coordination lock identity".to_string(),
+                detail: "lock path was replaced while acquiring it".to_string(),
+            });
+        }
+        Ok(CoordinationGuard { file })
     }
 
     /// Whether a committed bundle (manifest present) exists for `id`.
@@ -195,8 +400,17 @@ impl ErasureStore {
     #[must_use]
     pub fn get_manifest_meta(&self, id: &str) -> Option<serde_json::Value> {
         let dir = self.bundle_dir(id).ok()?;
-        let bytes = std::fs::read(dir.join(MANIFEST_FILE)).ok()?;
+        let file = File::open(dir.join(MANIFEST_FILE)).ok()?;
+        let len = file.metadata().ok()?.len();
+        if len > MAX_MANIFEST_BYTES {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(len as usize);
+        file.take(MAX_MANIFEST_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
         let manifest: BundleManifest = serde_json::from_slice(&bytes).ok()?;
+        validate_manifest(&manifest).ok()?;
         Some(manifest.meta)
     }
 
@@ -211,17 +425,19 @@ impl ErasureStore {
         payload: &[u8],
         meta: serde_json::Value,
     ) -> Result<(), ErasureError> {
-        let final_dir = self.bundle_dir(id)?;
-        let bundle = encode_bundle(self.params, id, payload, meta)?;
-        self.write_bundle_at(&final_dir, &bundle)
+        let prepared = self.prepare_put(id, payload, meta)?;
+        self.publish_prepared(prepared)
     }
 
-    /// Assemble `bundle` in a temp dir and swap it into `final_dir`.
-    fn write_bundle_at(
+    /// Encode and fsync a private bundle without publishing it.
+    pub(crate) fn prepare_put(
         &self,
-        final_dir: &Path,
-        bundle: &EncodedBundle,
-    ) -> Result<(), ErasureError> {
+        id: &str,
+        payload: &[u8],
+        meta: serde_json::Value,
+    ) -> Result<PreparedBundle, ErasureError> {
+        let final_dir = self.bundle_dir(id)?;
+        let bundle = encode_bundle(self.params, id, payload, meta)?;
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -255,20 +471,38 @@ impl ErasureStore {
             // F3 — the temp dir's entries (shards + manifest) durable before
             // it is renamed into place.
             fsync_dir(&tmp_dir)?;
-            // Swap: retire any existing bundle, then rename the temp dir in.
-            if final_dir.exists() {
-                std::fs::remove_dir_all(final_dir)
-                    .map_err(|e| io_err("remove previous bundle", &e))?;
-            }
-            std::fs::rename(&tmp_dir, final_dir).map_err(|e| io_err("commit bundle", &e))?;
-            // F3 — the rename itself durable (the parent directory entry).
-            fsync_dir(&self.dir)?;
             Ok(())
         })();
         if result.is_err() {
             let _ = std::fs::remove_dir_all(&tmp_dir);
         }
-        result
+        result?;
+        Ok(PreparedBundle {
+            temp_dir: Some(tmp_dir),
+            final_dir,
+        })
+    }
+
+    /// Publish a previously prepared bundle. Callers coordinating with purge
+    /// hold [`Self::lock_exclusive`] across their fresh DB/intent validation
+    /// and this short rename critical section.
+    pub(crate) fn publish_prepared(
+        &self,
+        mut prepared: PreparedBundle,
+    ) -> Result<(), ErasureError> {
+        let temp_dir = prepared.temp_dir.take().ok_or_else(|| ErasureError::Io {
+            context: "publish prepared bundle".to_string(),
+            detail: "prepared bundle was already consumed".to_string(),
+        })?;
+        if prepared.final_dir.exists() {
+            std::fs::remove_dir_all(&prepared.final_dir)
+                .map_err(|e| io_err("remove previous bundle", &e))?;
+        }
+        if let Err(error) = std::fs::rename(&temp_dir, &prepared.final_dir) {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Err(io_err("commit bundle", &error));
+        }
+        fsync_dir(&self.dir)
     }
 
     /// Read + verify + (if needed) reconstruct the payload for `id`.
@@ -285,21 +519,61 @@ impl ErasureStore {
     pub fn get(&self, id: &str) -> Result<Option<RecoveredBundle>, ErasureError> {
         let dir = self.bundle_dir(id)?;
         let manifest_path = dir.join(MANIFEST_FILE);
-        let manifest_bytes = match std::fs::read(&manifest_path) {
-            Ok(b) => b,
+        let manifest_file = match File::open(&manifest_path) {
+            Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(io_err("read manifest", &e)),
         };
+        let manifest_len = manifest_file
+            .metadata()
+            .map_err(|e| io_err("inspect manifest", &e))?
+            .len();
+        if manifest_len > MAX_MANIFEST_BYTES {
+            return Err(ErasureError::ManifestMalformed {
+                reason: format!("manifest size {manifest_len} exceeds limit {MAX_MANIFEST_BYTES}"),
+            });
+        }
+        let mut manifest_bytes = Vec::with_capacity(manifest_len as usize);
+        manifest_file
+            .take(MAX_MANIFEST_BYTES + 1)
+            .read_to_end(&mut manifest_bytes)
+            .map_err(|e| io_err("read manifest", &e))?;
         let manifest: BundleManifest = serde_json::from_slice(&manifest_bytes).map_err(|e| {
             ErasureError::ManifestMalformed {
                 reason: format!("manifest parse failed: {e}"),
             }
         })?;
-        let total = manifest.data_shards.saturating_add(manifest.parity_shards);
+        // The manifest is untrusted disk input. Validate its shard geometry
+        // before using it for allocation or filesystem iteration; the codec's
+        // later validation is intentionally defense-in-depth, not our first
+        // chance to reject a capacity-overflow/OOM manifest (#2243).
+        validate_manifest(&manifest)?;
+        let params =
+            ErasureParams::new(manifest.data_shards, manifest.parity_shards).map_err(|e| {
+                ErasureError::ManifestMalformed {
+                    reason: e.to_string(),
+                }
+            })?;
+        let total = params.total_shards();
         let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(total);
         for i in 0..total {
-            match std::fs::read(dir.join(shard_file_name(i))) {
-                Ok(bytes) => shards.push(Some(bytes)),
+            let shard_path = dir.join(shard_file_name(i));
+            match File::open(&shard_path) {
+                Ok(file) => {
+                    let len = file
+                        .metadata()
+                        .map_err(|e| io_err("inspect shard", &e))?
+                        .len();
+                    if len != manifest.shard_size as u64 || len > MAX_BUNDLE_PAYLOAD_BYTES as u64 {
+                        shards.push(None);
+                        continue;
+                    }
+                    let mut bytes = Vec::with_capacity(manifest.shard_size);
+                    file.take(manifest.shard_size as u64 + 1)
+                        .read_to_end(&mut bytes)
+                        .map_err(|e| io_err("read shard", &e))?;
+                    shards.push((bytes.len() == manifest.shard_size).then_some(bytes));
+                }
                 // Missing or unreadable shard == erasure; the codec's hash
                 // gate handles wrong-content cases.
                 Err(_) => shards.push(None),
@@ -347,19 +621,62 @@ impl ErasureStore {
         Ok(true)
     }
 
-    /// Enumerate the ids of every COMMITTED bundle (manifest present) in the
-    /// store, skipping in-progress `.tmp-*` assembly dirs and any dot-led
-    /// entry. Best-effort: an unreadable store root yields an empty list.
-    /// Backs the gc-tick orphan-reconciliation + scrub pass (F1/F3).
+    /// Load the cached committed-bundle inventory, refreshing it with ONE
+    /// combined root walk when absent/stale. The refresh also reaps stale temp
+    /// dirs, avoiding the former second full `read_dir` pass (#2248).
+    ///
+    /// Ordinary ticks read one small state file and examine only their bounded
+    /// window. A refresh tick pays the O(n) discovery cost at the explicit slow
+    /// cadence; the cache is derived and self-heals after malformed/torn writes.
     #[must_use]
-    pub fn list_committed_bundle_ids(&self) -> Vec<String> {
+    pub fn reconcile_inventory(
+        &self,
+        refresh_after_secs: u64,
+        temp_older_than_secs: u64,
+    ) -> (Vec<String>, usize) {
+        let cache_path = self.dir.join(BUNDLE_INVENTORY_FILE);
+        let cache_fresh = std::fs::symlink_metadata(&cache_path)
+            .ok()
+            .filter(|m| m.is_file() && !m.file_type().is_symlink())
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age.as_secs() < refresh_after_secs);
+        if cache_fresh
+            && let Some(bytes) = read_bounded_state_file(&cache_path, MAX_INVENTORY_BYTES)
+            && let Ok(ids) = serde_json::from_slice::<Vec<String>>(&bytes)
+            && ids.len() <= MAX_INVENTORY_ENTRIES
+        {
+            return (
+                ids.into_iter()
+                    .filter(|id| validate_bundle_id(id).is_ok())
+                    .collect(),
+                0,
+            );
+        }
+
         let mut ids = Vec::new();
+        let mut temp_reaped = 0;
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return ids;
+            return (ids, temp_reaped);
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
+            if name.starts_with(TEMP_DIR_PREFIX) {
+                let age = entry
+                    .path()
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|d| d.as_secs());
+                if age.is_some_and(|a| a >= temp_older_than_secs)
+                    && std::fs::remove_dir_all(entry.path()).is_ok()
+                {
+                    temp_reaped += 1;
+                }
+                continue;
+            }
             if name.starts_with('.') {
                 continue;
             }
@@ -367,7 +684,17 @@ impl ErasureStore {
                 ids.push(name.to_string());
             }
         }
-        ids
+        ids.sort_unstable();
+        if let Ok(bytes) = serde_json::to_vec(&ids) {
+            if let Err(error) = persist_derived_file(&self.dir, BUNDLE_INVENTORY_FILE, &bytes) {
+                tracing::warn!(
+                    target: ERASURE_TRACE_TARGET,
+                    %error,
+                    "failed to persist derived bundle inventory"
+                );
+            }
+        }
+        (ids, temp_reaped)
     }
 
     /// Age (seconds) of a bundle's manifest, i.e. how long ago it was last
@@ -379,38 +706,6 @@ impl ErasureStore {
         let dir = self.bundle_dir(id).ok()?;
         let meta = std::fs::metadata(dir.join(MANIFEST_FILE)).ok()?;
         meta.modified().ok()?.elapsed().ok().map(|d| d.as_secs())
-    }
-
-    /// Remove `.tmp-*` assembly dirs older than `older_than_secs` — the
-    /// crashed-writer leak the module doc's "next put clears it" claim never
-    /// actually cleaned (temp names embed nanos+pid, so a later `put` uses a
-    /// different name). Returns the count reaped (F1).
-    #[must_use]
-    pub fn reap_stale_temp_dirs(&self, older_than_secs: u64) -> usize {
-        let mut reaped = 0;
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return 0;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if !name.starts_with(TEMP_DIR_PREFIX) {
-                continue;
-            }
-            let age = entry
-                .path()
-                .metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.elapsed().ok())
-                .map(|d| d.as_secs());
-            if age.is_some_and(|a| a >= older_than_secs)
-                && std::fs::remove_dir_all(entry.path()).is_ok()
-            {
-                reaped += 1;
-            }
-        }
-        reaped
     }
 
     // ---- #2064 F1: purge-intent journal + quarantine (destructive-op safety) ----
@@ -427,8 +722,9 @@ impl ErasureStore {
     /// per id BEFORE the purge `DELETE`, then fsync the journal dir so the
     /// intent is durable across a crash. The reconciler hard-reaps a rowless
     /// bundle ONLY for a journaled id; everything else it QUARANTINES. Invalid
-    /// ids are skipped (never a path-traversal). Best-effort: a journal-write
-    /// failure degrades to quarantine (safe — data is preserved, not lost).
+    /// ids are skipped (never a path-traversal). A per-id marker failure is
+    /// returned so the caller can fail closed instead of deleting an
+    /// unjournaled row (#2252).
     ///
     /// # Errors
     /// [`ErasureError::Io`] when the journal dir cannot be created / fsynced.
@@ -438,13 +734,56 @@ impl ErasureStore {
         }
         let jdir = self.journal_dir();
         std::fs::create_dir_all(&jdir).map_err(|e| io_err("create purge journal dir", &e))?;
+        let journal_metadata = std::fs::symlink_metadata(&jdir)
+            .map_err(|e| io_err("inspect purge journal dir", &e))?;
+        if !journal_metadata.is_dir() || journal_metadata.file_type().is_symlink() {
+            return Err(ErasureError::Io {
+                context: "inspect purge journal dir".to_string(),
+                detail: "purge journal must be a real directory".to_string(),
+            });
+        }
         for id in ids {
-            if validate_bundle_id(id).is_err() {
-                continue;
-            }
+            validate_bundle_id(id)?;
             // An empty marker: existence IS the signal, so only the directory
             // entry must be durable (fsynced once below), not file contents.
-            let _ = std::fs::File::create(jdir.join(id));
+            let marker = jdir.join(id);
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt as _;
+                const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+                options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            }
+            let file = options
+                .open(&marker)
+                .map_err(|e| io_err("create purge-intent marker", &e))?;
+            let metadata = file
+                .metadata()
+                .map_err(|e| io_err(MARKER_INSPECTION_CONTEXT, &e))?;
+            if !metadata.is_file() {
+                return Err(ErasureError::Io {
+                    context: MARKER_INSPECTION_CONTEXT.to_string(),
+                    detail: "marker is not a regular file".to_string(),
+                });
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                if metadata.nlink() != 1 {
+                    return Err(ErasureError::Io {
+                        context: MARKER_INSPECTION_CONTEXT.to_string(),
+                        detail: "marker must have exactly one hard link".to_string(),
+                    });
+                }
+            }
         }
         fsync_dir(&jdir)
     }
@@ -468,20 +807,38 @@ impl ErasureStore {
         meta.modified().ok()?.elapsed().ok().map(|d| d.as_secs())
     }
 
-    /// Clear a purge-intent marker once its bundle is confirmed gone (the
-    /// happy-path purge removed the bundle, or the reconciler reaped it).
-    /// Best-effort — a lingering marker is compacted by
-    /// [`Self::compact_purge_journal`].
+    /// Enumerate valid regular purge-intent markers. Used to repair aborted
+    /// purges even when no bundle was ever minted for the surviving row.
+    #[must_use]
+    pub fn list_purge_intent_ids(&self) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(self.journal_dir()) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let id = entry.file_name().into_string().ok()?;
+                let metadata = entry.metadata().ok()?;
+                (metadata.is_file() && validate_bundle_id(&id).is_ok()).then_some(id)
+            })
+            .collect()
+    }
+
+    /// Clear a purge-intent marker once both its bundle and owning DB row are
+    /// confirmed gone. Callers must not clear merely after bundle removal: a
+    /// racing sweep may still hold a snapshot containing the row (#2246).
     pub fn clear_purge_intent(&self, id: &str) {
         if validate_bundle_id(id).is_ok() {
             let _ = std::fs::remove_file(self.journal_dir().join(id));
         }
     }
 
-    /// Drop journal markers whose bundle no longer exists (the purge fully
-    /// completed) so the journal stays bounded. Returns the count compacted.
+    /// Drop journal markers whose bundle no longer exists and whose caller-
+    /// supplied durable-state check confirms the owning DB row is also gone.
+    /// Keeping the marker until both halves disappear closes the cross-process
+    /// purge/sweep re-mint race (#2246). Returns the count compacted.
     #[must_use]
-    pub fn compact_purge_journal(&self) -> usize {
+    pub fn compact_purge_journal(&self, row_is_gone: impl Fn(&str) -> bool) -> usize {
         let mut compacted = 0;
         let Ok(entries) = std::fs::read_dir(self.journal_dir()) else {
             return 0;
@@ -489,7 +846,10 @@ impl ErasureStore {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if !self.contains(name) && std::fs::remove_file(entry.path()).is_ok() {
+            if !self.contains(name)
+                && row_is_gone(name)
+                && std::fs::remove_file(entry.path()).is_ok()
+            {
                 compacted += 1;
             }
         }
@@ -499,7 +859,7 @@ impl ErasureStore {
     /// MOVE the committed bundle for `id` into the quarantine holding pen
     /// (rowless + un-journaled → possible DB loss). NON-destructive: the bytes
     /// are preserved and recoverable, but the bundle is now invisible to
-    /// `get` / `list_committed_bundle_ids`, so it cannot be resurrected via a
+    /// `get` / `reconcile_inventory`, so it cannot be resurrected via a
     /// serving path. Returns whether a bundle was quarantined.
     ///
     /// # Errors
@@ -516,8 +876,12 @@ impl ErasureStore {
             std::fs::remove_dir_all(&dst).map_err(|e| io_err("clear stale quarantine", &e))?;
         }
         std::fs::rename(&src, &dst).map_err(|e| io_err("quarantine bundle", &e))?;
-        let _ = fsync_dir(&qdir);
-        let _ = fsync_dir(&self.dir);
+        if let Err(error) = fsync_dir(&qdir) {
+            tracing::warn!(bundle_id = %id, %error, "failed to fsync quarantine directory");
+        }
+        if let Err(error) = fsync_dir(&self.dir) {
+            tracing::warn!(bundle_id = %id, %error, "failed to fsync erasure store directory after quarantine");
+        }
         Ok(true)
     }
 
@@ -555,7 +919,9 @@ impl ErasureStore {
             return Ok(false);
         }
         std::fs::rename(&src, &dst).map_err(|e| io_err("recover quarantined bundle", &e))?;
-        let _ = fsync_dir(&self.dir);
+        if let Err(error) = fsync_dir(&self.dir) {
+            tracing::warn!(bundle_id = %id, %error, "failed to fsync erasure store directory after quarantine recovery");
+        }
         Ok(true)
     }
 }
