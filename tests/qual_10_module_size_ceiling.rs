@@ -849,7 +849,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // land postgres.rs at 28_387. The 5-agent crossroads vote chose the
     // policy-prescribed lockstep bump over a release-train module split.
     // Ceiling 28_300 -> 28_400 (+13 headroom).
-    ("src/store/postgres.rs", 28_400),
+    // 2026-07-21 (#2280): the store_batch upsert-merge arm gains the #1834
+    // claim-bitemporal valid_from/valid_until parity arms (the one write
+    // funnel that omitted them) + a live-PG store_batch conflict/NULL-retention
+    // regression test. Lands postgres.rs at 28_490; ceiling 28_400 -> 28_520.
+    ("src/store/postgres.rs", 28_520),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

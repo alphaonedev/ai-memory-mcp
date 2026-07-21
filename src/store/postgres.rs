@@ -14211,6 +14211,19 @@ impl MemoryStore for PostgresStore {
                 -- v0.8.0 Pillar 2 (#1709) — lifecycle_state preserved on
                 -- re-store (sqlite parity).
                 lifecycle_state = memories.lifecycle_state,
+                -- v1.0.0 #2280 / #1834 — sqlite `db::insert` + plain `store()`
+                -- parity: valid_from is IMMUTABLE (stored value always wins),
+                -- valid_until is caller-updatable so a fresh upper bound may
+                -- CLOSE the existing claim (COALESCE keeps the stored bound
+                -- when the incoming write omits it). Batch upsert-merge was
+                -- the one write funnel missing the #1834 claim-bitemporal
+                -- arms that store()/store_with_embedding already carry.
+                -- (kind_provenance is NOT set here — like store_with_embedding
+                -- the store_batch INSERT never lists that column, so there is
+                -- no EXCLUDED.kind_provenance to reference; only store() both
+                -- inserts and conflict-merges it.)
+                valid_from = memories.valid_from,
+                valid_until = COALESCE(EXCLUDED.valid_until, memories.valid_until),
                 -- v0.9.0 G8 (#1825) — cid/cid_genesis OMITTED from DO UPDATE
                 -- SET: surviving row keeps its genesis.
                 -- #1632 (pg twin) — upsert-merge bumps the Gap-1 counter.
@@ -27127,6 +27140,96 @@ mod tests {
             retained.valid_until.as_deref(),
             Some("2026-07-19T22:45:01.654321Z"),
             "incoming NULL must not erase an existing close bound"
+        );
+    }
+
+    /// #2280 — the `store_batch` upsert-merge arm was the ONE write
+    /// funnel missing the #1834 claim-bitemporal `valid_from` /
+    /// `valid_until` arms that `store()` / `store_with_embedding`
+    /// already carry. Pins: (1) valid_from set on the FIRST batch write
+    /// survives a conflicting SECOND batch write asserting a DIFFERENT
+    /// valid_from (genesis immutable); (2) a valid_until supplied on the
+    /// conflicting write CLOSES the claim; (3) a THIRD upsert with
+    /// valid_until = NULL does NOT reopen it (COALESCE keeps the stored
+    /// close bound). Models on `live_store_with_embedding_conflict_preserves_valid_time_2267`.
+    #[tokio::test]
+    async fn live_store_batch_conflict_preserves_valid_time_2280() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("valid-time-batch-2280-{unique}");
+        let title = format!("valid-batch-{unique}");
+
+        // First batch write: valid_from set, valid_until NULL (open claim).
+        let mut original = sample_memory(&title, &ns, "valid-batch-2280", "body");
+        original.valid_from = Some("2026-07-19T12:34:56.123456+05:00".to_string());
+        original.valid_until = None;
+        let first_ids = store
+            .store_batch(&ctx, std::slice::from_ref(&original))
+            .await
+            .expect("seed batch store");
+        assert_eq!(first_ids.len(), 1);
+        let id = first_ids[0].clone();
+
+        let seeded = store.get(&ctx, &id).await.expect("get seeded row");
+        assert_eq!(
+            seeded.valid_from.as_deref(),
+            Some("2026-07-19T07:34:56.123456Z"),
+            "first batch write must canonicalize + persist valid_from"
+        );
+        assert_eq!(
+            seeded.valid_until.as_deref(),
+            None,
+            "first batch write leaves the claim open"
+        );
+
+        // Second batch write on the SAME (title, namespace): a DIFFERENT
+        // valid_from (must NOT overwrite genesis) + a valid_until (must
+        // CLOSE the claim).
+        let mut conflict = sample_memory(&title, &ns, "valid-batch-2280", "updated");
+        conflict.valid_from = Some("2030-01-01T00:00:00Z".to_string());
+        conflict.valid_until = Some("2026-07-19T18:45:01.654321-04:00".to_string());
+        let second_ids = store
+            .store_batch(&ctx, std::slice::from_ref(&conflict))
+            .await
+            .expect("conflicting batch store");
+        assert_eq!(second_ids, vec![id.clone()], "upsert resolves to same id");
+
+        let got = store.get(&ctx, &id).await.expect("get conflicted row");
+        assert_eq!(
+            got.valid_from.as_deref(),
+            Some("2026-07-19T07:34:56.123456Z"),
+            "batch conflict must preserve the first-write genesis valid_from"
+        );
+        assert_eq!(
+            got.valid_until.as_deref(),
+            Some("2026-07-19T22:45:01.654321Z"),
+            "batch conflict may close the claim via a fresh valid_until"
+        );
+
+        // Third batch write with valid_until = NULL must NOT reopen the
+        // now-closed claim (COALESCE keeps the stored close bound).
+        let mut non_clearing = sample_memory(&title, &ns, "valid-batch-2280", "updated again");
+        non_clearing.valid_from = Some("2040-01-01T00:00:00Z".to_string());
+        non_clearing.valid_until = None;
+        store
+            .store_batch(&ctx, std::slice::from_ref(&non_clearing))
+            .await
+            .expect("NULL-bound batch conflict");
+        let retained = store.get(&ctx, &id).await.expect("get retained bound");
+        assert_eq!(
+            retained.valid_from.as_deref(),
+            Some("2026-07-19T07:34:56.123456Z"),
+            "a later batch conflict must still preserve genesis"
+        );
+        assert_eq!(
+            retained.valid_until.as_deref(),
+            Some("2026-07-19T22:45:01.654321Z"),
+            "incoming NULL must not reopen an existing close bound"
         );
     }
 
