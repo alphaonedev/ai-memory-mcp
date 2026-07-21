@@ -358,7 +358,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // namespace-boundary characterization tests land storage/mod.rs at
     // 26_650; ceiling 26_750 (+100 headroom). Read-only projections +
     // honesty machine-checks — no new write path.
-    ("src/storage/mod.rs", 26_750),
+    // 2026-07-21 (#2266/#2267, PR #2274): VALID-time comparison preserves
+    // signed offset bytes while the SQLite UDF/query paths compare instants;
+    // focused boundary, read-only-open, malformed-value, signature, and
+    // round-trip regressions land storage/mod.rs at 27_035. The 5-agent
+    // crossroads vote chose the policy-prescribed lockstep bump over a
+    // release-train module split. Ceiling 26_750 -> 27_100 (+65 headroom).
+    ("src/storage/mod.rs", 27_100),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -824,7 +830,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-19 (#1834 pre-ship 3x7): the v86 valid-time canonicalization
     // migration (migrate_v86 + funnel canonicalization comments) lands
     // postgres.rs at 28_203; ceiling bumped 28_200 -> 28_300.
-    ("src/store/postgres.rs", 28_300),
+    // 2026-07-21 (#2267, PR #2274): the two-column VALID-time persistence /
+    // conflict policy plus live-Postgres parity and NULL-retention regressions
+    // land postgres.rs at 28_387. The 5-agent crossroads vote chose the
+    // policy-prescribed lockstep bump over a release-train module split.
+    // Ceiling 28_300 -> 28_400 (+13 headroom).
+    ("src/store/postgres.rs", 28_400),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
