@@ -18680,35 +18680,47 @@ impl MemoryStore for PostgresStore {
         // subquery so the snapshot and the delete pin to the same row set
         // inside this one tx; idempotent via the PK `ON CONFLICT`. Postgres
         // twin of the SQLite `archive_links_for_memory` snapshot.
-        sqlx::query(
-            "INSERT INTO archived_memory_links (
-                 source_id, target_id, relation, created_at, valid_from,
-                 valid_until, observed_by, signature, attest_level, archived_at
-             )
-             SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
-                    ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
-                    ml.attest_level, now()
-             FROM memory_links ml
-             WHERE ml.source_id IN (
-                       SELECT id FROM memories
-                       WHERE ($1::text IS NULL OR namespace = $1)
-                         AND ($2::text IS NULL OR tier = $2)
-                         AND ($3::text IS NULL
-                              OR tsv @@ plainto_tsquery('english', $3)))
-                OR ml.target_id IN (
-                       SELECT id FROM memories
-                       WHERE ($1::text IS NULL OR namespace = $1)
-                         AND ($2::text IS NULL OR tier = $2)
-                         AND ($3::text IS NULL
-                              OR tsv @@ plainto_tsquery('english', $3)))
-             ON CONFLICT (source_id, target_id, relation) DO NOTHING",
-        )
-        .bind(namespace)
-        .bind(tier_str.as_deref())
-        .bind(pattern)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("forget snapshot links", e))?;
+        //
+        // #2313 — runs ONLY when `archive`, matching the sqlite contract
+        // ("Runs only when `archive` so a hard (non-recoverable) forget
+        // keeps its documented edge-loss", src/storage/mod.rs). Pre-fix
+        // this INSERT ran unconditionally, so an erasure-intent hard
+        // forget (archive = false) permanently retained the victims' edge
+        // topology (relation, observed_by, signature, valid intervals) as
+        // orphan rows no code path ever reaps — with no archived_memories
+        // row, restore could never consume them and archive_purge never
+        // touches archived_memory_links.
+        if archive {
+            sqlx::query(
+                "INSERT INTO archived_memory_links (
+                     source_id, target_id, relation, created_at, valid_from,
+                     valid_until, observed_by, signature, attest_level, archived_at
+                 )
+                 SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
+                        ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
+                        ml.attest_level, now()
+                 FROM memory_links ml
+                 WHERE ml.source_id IN (
+                           SELECT id FROM memories
+                           WHERE ($1::text IS NULL OR namespace = $1)
+                             AND ($2::text IS NULL OR tier = $2)
+                             AND ($3::text IS NULL
+                                  OR tsv @@ plainto_tsquery('english', $3)))
+                    OR ml.target_id IN (
+                           SELECT id FROM memories
+                           WHERE ($1::text IS NULL OR namespace = $1)
+                             AND ($2::text IS NULL OR tier = $2)
+                             AND ($3::text IS NULL
+                                  OR tsv @@ plainto_tsquery('english', $3)))
+                 ON CONFLICT (source_id, target_id, relation) DO NOTHING",
+            )
+            .bind(namespace)
+            .bind(tier_str.as_deref())
+            .bind(pattern)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("forget snapshot links", e))?;
+        }
 
         // v0.9.0 G8 (#1825) T7 — erasure invariant (postgres parity/defence):
         // NULL the `cid_genesis` pre-image for every row this forget will
@@ -28475,6 +28487,126 @@ mod tests {
             .bind(&ns)
             .execute(&store.pool)
             .await;
+    }
+
+    /// #2313 — a HARD forget (archive = false) must NOT snapshot the
+    /// victims' `memory_links` into `archived_memory_links` (the sqlite
+    /// contract: "a hard (non-recoverable) forget keeps its documented
+    /// edge-loss"), while an archive = true forget MUST preserve them for
+    /// restore. Pre-fix postgres ran the #1771 snapshot unconditionally,
+    /// permanently retaining forgotten rows' edge topology as unreapable
+    /// orphans. Skips without AI_MEMORY_TEST_POSTGRES_URL.
+    #[tokio::test]
+    async fn hard_forget_leaves_no_archived_link_snapshot_2313() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+
+        // Leg 1 — hard forget: no snapshot rows may survive.
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("hardforget-2313-{unique}");
+        let a_id = format!("hf2313-a-{unique}");
+        let b_id = format!("hf2313-b-{unique}");
+        let a = sample_memory(&a_id, &ns, "hf-a", "hard forget edge endpoint a");
+        let b = sample_memory(&b_id, &ns, "hf-b", "hard forget edge endpoint b");
+        store.store(&ctx, &a).await.expect("store a");
+        store.store(&ctx, &b).await.expect("store b");
+        let link = crate::models::MemoryLink {
+            source_id: a_id.clone(),
+            target_id: b_id.clone(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            valid_from: None,
+            valid_until: None,
+            observed_by: None,
+            signature: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        };
+        store.link(&ctx, &link).await.expect("link a->b");
+        let deleted = store
+            .forget(&ctx, Some(&ns), None, None, false)
+            .await
+            .expect("hard forget");
+        assert_eq!(deleted, 2, "hard forget reaps both rows");
+        let (snap_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM archived_memory_links \
+             WHERE source_id = $1 OR target_id = $1",
+        )
+        .bind(&a_id)
+        .fetch_one(&store.pool)
+        .await
+        .expect("count snapshot rows");
+        assert_eq!(
+            snap_count, 0,
+            "a hard (archive=false) forget must not retain an archived link snapshot"
+        );
+
+        // Leg 2 — archiving forget: the snapshot MUST land (restore fuel).
+        let unique2 = uuid::Uuid::new_v4();
+        let ns2 = format!("softforget-2313-{unique2}");
+        let c_id = format!("hf2313-c-{unique2}");
+        let d_id = format!("hf2313-d-{unique2}");
+        let c = sample_memory(&c_id, &ns2, "hf-c", "soft forget edge endpoint c");
+        let d = sample_memory(&d_id, &ns2, "hf-d", "soft forget edge endpoint d");
+        store.store(&ctx, &c).await.expect("store c");
+        store.store(&ctx, &d).await.expect("store d");
+        let link2 = crate::models::MemoryLink {
+            source_id: c_id.clone(),
+            target_id: d_id.clone(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            valid_from: None,
+            valid_until: None,
+            observed_by: None,
+            signature: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        };
+        store.link(&ctx, &link2).await.expect("link c->d");
+        let deleted2 = store
+            .forget(&ctx, Some(&ns2), None, None, true)
+            .await
+            .expect("archiving forget");
+        assert_eq!(deleted2, 2, "archiving forget reaps both rows");
+        let (snap_count2,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM archived_memory_links \
+             WHERE source_id = $1 AND target_id = $2",
+        )
+        .bind(&c_id)
+        .bind(&d_id)
+        .fetch_one(&store.pool)
+        .await
+        .expect("count snapshot rows 2");
+        assert_eq!(
+            snap_count2, 1,
+            "an archive=true forget must preserve the edge snapshot for restore"
+        );
+
+        // Cleanup.
+        for victim_ns in [&ns, &ns2] {
+            let _ = sqlx::query("DELETE FROM archived_memories WHERE namespace = $1")
+                .bind(victim_ns)
+                .execute(&store.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM forget_tombstones WHERE namespace = $1")
+                .bind(victim_ns)
+                .execute(&store.pool)
+                .await;
+        }
+        for victim in [&a_id, &b_id, &c_id, &d_id] {
+            let _ = sqlx::query(
+                "DELETE FROM archived_memory_links WHERE source_id = $1 OR target_id = $1",
+            )
+            .bind(victim)
+            .execute(&store.pool)
+            .await;
+        }
     }
 
     /// #2196 (data-integrity archive-parity) — postgres twin of the sqlite
