@@ -648,3 +648,124 @@ fn federation_merge_seals_content_and_snapshots_1773() {
         "#1773: federation merge must snapshot the pre-merge row"
     );
 }
+
+// =====================================================================
+// #2301 — storage::consolidate at-rest encryption sealing (SQLite).
+//
+// `db::consolidate` mints the consolidated summary via its OWN raw
+// `INSERT INTO memories (...)` that bypasses the `db::insert`
+// chokepoint. Pre-#2301 that INSERT bound the plaintext `summary` into
+// the `content` column and never called `seal_content`, so a curator
+// consolidation under `AI_MEMORY_ENCRYPT_AT_REST=1` persisted the
+// summary as PLAINTEXT at rest — the SQLite sibling of the Postgres
+// #2292 gap. These tests pin the seal on the consolidate funnel:
+// content-column placeholder + non-NULL envelope + get()-decrypts under
+// the gate; byte-identical plaintext + NULL envelope with the gate off.
+// The on-path test FAILS on pre-fix code (mutation check).
+// =====================================================================
+
+/// Insert two source memories owned by `agent`, returning their ids.
+fn seed_two_sources(conn: &rusqlite::Connection, agent: &str, ns: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    for (i, body) in ["source one body", "source two body"].iter().enumerate() {
+        let mut mem = make_mem(&format!("consolidate-src-{i}"), body, ns);
+        mem.metadata = serde_json::json!({ "agent_id": agent });
+        ids.push(db::insert(conn, &mem).expect("insert source"));
+    }
+    ids
+}
+
+#[test]
+fn issue_2301_consolidate_on_path_seals_summary_and_get_decrypts() {
+    let _gate = EncryptGate::on();
+    let conn = fresh_conn();
+
+    let agent = "issue-2301-consolidator";
+    let ns = "global";
+    let ids = seed_two_sources(&conn, agent, ns);
+    let summary = "consolidated at-rest summary — #2301 sqlite seal ON path";
+
+    // substrate_authored=true stamps the substrate why_trace so the
+    // consolidate TRACT gate passes trivially regardless of enforce mode.
+    let new_id = db::consolidate(
+        &conn,
+        &ids,
+        "consolidate-2301-on",
+        summary,
+        ns,
+        &Tier::Long,
+        "consolidation",
+        agent,
+        true,
+    )
+    .expect("consolidate under encryption");
+
+    // Raw row: the consolidated content column holds the empty placeholder,
+    // the ciphertext lives in encrypted_envelope.
+    let (raw_content, envelope): (String, Option<Vec<u8>>) = conn
+        .query_row(
+            "SELECT content, encrypted_envelope FROM memories WHERE id = ?1",
+            params![&new_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("raw read");
+    assert_eq!(
+        raw_content, "",
+        "encryption ON: consolidated content column must hold the empty placeholder (no plaintext at rest)"
+    );
+    assert!(
+        envelope.is_some(),
+        "encryption ON: consolidated row must carry a non-NULL encrypted_envelope"
+    );
+
+    // db::get transparently decrypts back to the original summary.
+    let fetched = db::get(&conn, &new_id).expect("get").expect("exists");
+    assert_eq!(
+        fetched.content, summary,
+        "encryption ON: db::get must recover the consolidated summary plaintext"
+    );
+}
+
+#[test]
+fn issue_2301_consolidate_off_path_is_byte_identical() {
+    // Gate OFF (default): consolidated content stored verbatim, envelope NULL.
+    let _gate = EncryptGate::off();
+    let conn = fresh_conn();
+
+    let agent = "issue-2301-consolidator-off";
+    let ns = "global";
+    let ids = seed_two_sources(&conn, agent, ns);
+    let summary = "consolidated summary, gate OFF — #2301";
+
+    let new_id = db::consolidate(
+        &conn,
+        &ids,
+        "consolidate-2301-off",
+        summary,
+        ns,
+        &Tier::Long,
+        "consolidation",
+        agent,
+        true,
+    )
+    .expect("consolidate without encryption");
+
+    let (raw_content, envelope): (String, Option<Vec<u8>>) = conn
+        .query_row(
+            "SELECT content, encrypted_envelope FROM memories WHERE id = ?1",
+            params![&new_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("raw read");
+    assert_eq!(
+        raw_content, summary,
+        "encryption OFF: consolidated content column must hold the summary verbatim"
+    );
+    assert!(
+        envelope.is_none(),
+        "encryption OFF: consolidated encrypted_envelope must be NULL (byte-identical default)"
+    );
+
+    let fetched = db::get(&conn, &new_id).expect("get").expect("exists");
+    assert_eq!(fetched.content, summary);
+}
