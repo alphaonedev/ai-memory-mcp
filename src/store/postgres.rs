@@ -9786,6 +9786,18 @@ impl PostgresStore {
         // every encryption-off row → no-op, so the default path is
         // byte-identical (content keeps the plaintext read above). A missing
         // column on a pre-v68 backup surfaces as a try_get error → None.
+        //
+        // #2303 — this decrypt is LOAD-BEARING for `apply_remote_memory`
+        // receive-seal safety wherever `row_to_memory` backs a federation
+        // SEND path (`list_memories_updated_since`, the `GET
+        // /api/v1/sync/since` peer-pull surface): a sealed row's `content`
+        // is a `""` sentinel (see `encryption::seal_content`), and if this
+        // decrypt were ever skipped the send path would ship that
+        // placeholder, and the receiver would re-seal an empty string
+        // under its own key — content='' + a fresh envelope, an
+        // unrecoverable silent content loss with no error anywhere in the
+        // pipe. Do not remove. Pinned by
+        // `tests/store_parity_gaps.rs::pg_list_memories_updated_since_decrypts_for_send_2303`.
         let enc: Option<Vec<u8>> = row
             .try_get::<Option<Vec<u8>>, _>(field_names::ENCRYPTED_ENVELOPE)
             .unwrap_or(None);
@@ -16435,6 +16447,12 @@ impl MemoryStore for PostgresStore {
     // + `db::insert_if_newer` contracts so the wire shape is byte-
     // identical regardless of which backend a peer runs on. Tier never
     // downgrades; `metadata.agent_id` is preserved across upsert.
+    //
+    // #2303 — this is the federation SEND/catch-up read path. It routes
+    // every row through `Self::row_to_memory`, whose decrypt-on-envelope-
+    // presence branch is load-bearing here: a sealed row must reach the
+    // wire as decrypted plaintext, never the `content=""` sentinel — see
+    // the `#2303` note on `row_to_memory` for the full failure mode.
 
     async fn list_memories_updated_since(
         &self,

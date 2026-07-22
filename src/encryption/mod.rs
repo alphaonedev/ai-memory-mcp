@@ -601,6 +601,21 @@ pub fn encryption_enabled(config_flag: Option<bool>) -> bool {
 /// over a memory with no `agent_id` to key encryption to is refused
 /// rather than silently storing plaintext.
 ///
+/// #2303 — the `content=""` placeholder this seals into is a storage
+/// SENTINEL, not a real payload. It must NEVER wire-ship over
+/// federation as-is: the federation SEND path (`memories_updated_since`
+/// / `PostgresStore::list_memories_updated_since`) MUST decrypt via
+/// [`open_content`] (or the row-mapper's inline decrypt) before a row
+/// leaves this node, so peers always receive plaintext. If a sealed
+/// placeholder ever shipped raw, the receiving `apply_remote_memory`
+/// would re-seal an EMPTY string under its own key — content='' +
+/// a fresh (empty) envelope, with no error anywhere: unrecoverable,
+/// silent content loss. Pinned by
+/// `tests/encryption_at_rest.rs::federation_send_list_updated_since_decrypts_2303`
+/// (sqlite) and
+/// `tests/store_parity_gaps.rs::pg_list_memories_updated_since_decrypts_for_send_2303`
+/// (postgres).
+///
 /// # Errors
 /// * Returns `Err` when encryption is enabled, `content` is non-empty,
 ///   but `agent_id` is empty — there is no recipient key to seal to.

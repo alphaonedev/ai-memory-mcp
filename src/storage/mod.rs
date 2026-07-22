@@ -15794,6 +15794,16 @@ pub fn memories_updated_since(
     // placeholder as the peer's content. The other named-column reader
     // (`metadata` etc.) tolerates the addition because `row_to_memory`
     // reads every column by name.
+    //
+    // #2303 — this decrypt is LOAD-BEARING for `apply_remote_memory`
+    // receive-seal safety: a sealed row's `content` column is a `""`
+    // sentinel (see `encryption::seal_content`), and if this send path
+    // ever shipped that placeholder instead of decrypted plaintext, the
+    // receiver would re-seal an empty string under its own key —
+    // content='' + a fresh envelope, an unrecoverable silent content
+    // loss with no error anywhere in the pipe. Do not remove this
+    // decrypt or the `encrypted_envelope` column from `COLS`. Pinned by
+    // `tests/encryption_at_rest.rs::federation_send_list_updated_since_decrypts_2303`.
     const COLS: &str = "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
                 source, access_count, created_at, updated_at, last_accessed_at, \
                 expires_at, metadata, encrypted_envelope \
