@@ -13635,7 +13635,12 @@ fn resolve_embeddable_rows(raw: Vec<EmbeddableRawRow>) -> Vec<(String, String, S
 /// envelope is present but won't decrypt (e.g. key absent), failing loud
 /// rather than degrading the vector (mirrors the #1593 fail-loud-skip
 /// embedder posture). agent_id is read from the row's `metadata.agent_id`.
-fn resolve_embeddable_content(
+///
+/// `pub(crate)` since #2317: the postgres SAL `list_unembedded` scan
+/// shares this resolver so the pg serve-boot backfill never embeds the
+/// at-rest seal placeholder (one decrypt-or-skip SSOT, no per-backend
+/// drift).
+pub(crate) fn resolve_embeddable_content(
     id: &str,
     content: String,
     envelope: Option<Vec<u8>>,

@@ -15416,11 +15416,24 @@ impl MemoryStore for PostgresStore {
         // cost / thundering-herd. Gated on a KNOWN active fingerprint so an
         // unseeded (keyword-only) process never widens the scan.
         let active_space = crate::embeddings::active_embedding_space();
+        // #2317 — also SELECT `encrypted_envelope` + `metadata` so
+        // at-rest-encrypted rows (whose `content` column stores the empty
+        // seal placeholder per #2288/#2292 — the plaintext lives ONLY in
+        // the envelope) are DECRYPTED before embedding, via the SAME
+        // `resolve_embeddable_content` resolver the sqlite #1779 fix uses.
+        // Pre-fix this scan returned the placeholder verbatim, so the
+        // serve-boot backfill embedded `title + ""` (a title-only vector),
+        // stamped it with the active space (permanently leaving the scan
+        // set), and on the NULL-space / foreign-space heal arms REPLACED
+        // good store-time vectors corpus-wide. A row whose envelope fails
+        // to decrypt (key absent) is SKIPPED, never embedded degraded.
         let rows = if let (true, Some(active_fp)) =
             (pg_heal_foreign_space_enabled(), active_space.as_deref())
         {
             sqlx::query(
-                "SELECT id, title, content FROM memories \
+                "SELECT id, title, content, encrypted_envelope, \
+                        metadata::text AS metadata_json \
+                   FROM memories \
                   WHERE embedding IS NULL \
                      OR (embedding IS NOT NULL AND embedding_space IS NULL) \
                      OR (embedding IS NOT NULL AND embedding_space IS NOT NULL \
@@ -15435,7 +15448,9 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err("list_unembedded", e))?
         } else {
             sqlx::query(
-                "SELECT id, title, content FROM memories \
+                "SELECT id, title, content, encrypted_envelope, \
+                        metadata::text AS metadata_json \
+                   FROM memories \
                   WHERE embedding IS NULL \
                      OR (embedding IS NOT NULL AND embedding_space IS NULL) \
                   ORDER BY created_at ASC \
@@ -15446,18 +15461,46 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("list_unembedded", e))?
         };
-        rows.iter()
-            .map(|r| {
-                Ok((
-                    r.try_get::<String, _>("id")
-                        .map_err(|e| to_store_err("read unembedded id", e))?,
-                    r.try_get::<String, _>("title")
-                        .map_err(|e| to_store_err("read unembedded title", e))?,
-                    r.try_get::<String, _>("content")
-                        .map_err(|e| to_store_err("read unembedded content", e))?,
-                ))
-            })
-            .collect()
+        let mut out: Vec<(String, String, String)> = Vec::with_capacity(rows.len());
+        let mut decrypt_skipped = 0usize;
+        for r in &rows {
+            let id = r
+                .try_get::<String, _>("id")
+                .map_err(|e| to_store_err("read unembedded id", e))?;
+            let title = r
+                .try_get::<String, _>("title")
+                .map_err(|e| to_store_err("read unembedded title", e))?;
+            let content = r
+                .try_get::<String, _>("content")
+                .map_err(|e| to_store_err("read unembedded content", e))?;
+            let envelope = r
+                .try_get::<Option<Vec<u8>>, _>("encrypted_envelope")
+                .map_err(|e| to_store_err("read unembedded envelope", e))?;
+            let metadata_json = r
+                .try_get::<String, _>("metadata_json")
+                .map_err(|e| to_store_err("read unembedded metadata", e))?;
+            match crate::storage::resolve_embeddable_content(&id, content, envelope, &metadata_json)
+            {
+                Some(plaintext) => out.push((id, title, plaintext)),
+                None => decrypt_skipped += 1,
+            }
+        }
+        // #2317 — the pg scan is LIMIT-from-top (no cursor), so undecryptable
+        // rows are re-fetched every pass and an all-skipped pass returns
+        // EMPTY (the caller's zero-progress break terminates the sweep — no
+        // spin). Surface the skip count LOUDLY so an operator sees exactly
+        // why the backfill is not healing those rows (key absent / moved
+        // host) instead of a silent success.
+        if decrypt_skipped > 0 {
+            tracing::warn!(
+                skipped = decrypt_skipped,
+                "embedding backfill: skipped encrypted rows whose envelope failed to \
+                 decrypt — embedding their empty placeholder would overwrite good \
+                 store-time embeddings (#2317, pg twin of #1779). Restore the \
+                 decryption key to heal these rows."
+            );
+        }
+        Ok(out)
     }
 
     /// #1579 A4 — single-transaction batch embedding write. One commit
@@ -28870,6 +28913,75 @@ mod tests {
         .bind(&a_id)
         .execute(&store.pool)
         .await;
+    }
+
+    /// #2317 — the pg backfill scan must never hand the embedder the
+    /// at-rest seal PLACEHOLDER. A row whose `encrypted_envelope` is
+    /// present but undecryptable (key absent / corrupt) is SKIPPED (pg
+    /// twin of the sqlite #1779 `resolve_embeddable_content` posture) —
+    /// pre-fix `list_unembedded` returned its empty `content` verbatim and
+    /// the sweep wrote a title-only vector that permanently left the scan
+    /// set. A plain unencrypted row in the same pass must still be
+    /// returned verbatim. Skips without AI_MEMORY_TEST_POSTGRES_URL.
+    #[tokio::test]
+    async fn list_unembedded_skips_undecryptable_sealed_rows_2317() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("unemb-2317-{unique}");
+        let sealed_id = format!("unemb2317-sealed-{unique}");
+        let plain_id = format!("unemb2317-plain-{unique}");
+        // Sealed row: content holds the EMPTY placeholder, the (here
+        // deliberately undecryptable) envelope carries the ciphertext, no
+        // embedding — the exact post-#2288 at-rest shape the sweep scans.
+        sqlx::query(
+            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, \
+                 confidence, source, access_count, created_at, updated_at, metadata, \
+                 encrypted_envelope) \
+             VALUES ($1, 'mid', $2, 'sealed row', '', '[]', 5, 1.0, 'test', 0, now(), \
+                 now(), '{\"agent_id\":\"ai:sal-test\"}', $3)",
+        )
+        .bind(&sealed_id)
+        .bind(&ns)
+        .bind(vec![3u8, 0xde, 0xad, 0xbe, 0xef])
+        .execute(&store.pool)
+        .await
+        .expect("insert sealed row");
+        sqlx::query(
+            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, \
+                 confidence, source, access_count, created_at, updated_at, metadata) \
+             VALUES ($1, 'mid', $2, 'plain row', 'plain unencrypted body', '[]', 5, 1.0, \
+                 'test', 0, now(), now(), '{\"agent_id\":\"ai:sal-test\"}')",
+        )
+        .bind(&plain_id)
+        .bind(&ns)
+        .execute(&store.pool)
+        .await
+        .expect("insert plain row");
+
+        let admin = CallerContext::for_admin("ai:sal-test");
+        let scanned = store
+            .list_unembedded(&admin, 1_000_000)
+            .await
+            .expect("list_unembedded");
+        assert!(
+            !scanned.iter().any(|(id, _, _)| id == &sealed_id),
+            "an undecryptable sealed row must be SKIPPED, never returned as the placeholder"
+        );
+        let plain = scanned.iter().find(|(id, _, _)| id == &plain_id);
+        assert!(
+            matches!(plain, Some((_, _, content)) if content == "plain unencrypted body"),
+            "a plain row in the same pass is returned with its verbatim content"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM memories WHERE namespace = $1")
+            .bind(&ns)
+            .execute(&store.pool)
+            .await;
     }
 
     /// #2196 (data-integrity archive-parity) — postgres twin of the sqlite
