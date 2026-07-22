@@ -47,6 +47,17 @@
 #   scripts/check-hardcoded-literals.sh --self-test
 #     - inject a contrived NEW triplicated literal, verify HARD-BLOCK,
 #       clean up. Proves the gate is load-bearing (pm-v3.2).
+#
+# Requires bash >= 4 (Grok W2-bash3): this gate uses an associative array
+# (`declare -A base_count`), absent from bash 3.2 (stock on macOS — Apple
+# has shipped no post-3.2 bash since the GPLv3 switch). Running under 3.2
+# previously died with an opaque syntax error deep in the script; the
+# guard below fails fast with an actionable message instead.
+
+if [[ -z "${BASH_VERSINFO:-}" || "${BASH_VERSINFO[0]}" -lt 4 ]]; then
+    echo "check-hardcoded-literals.sh: requires bash >= 4 (found ${BASH_VERSION:-unknown}) — this gate uses an associative array that stock macOS bash 3.2 cannot run. Install a modern bash (e.g. 'brew install bash') and re-run explicitly, e.g. '/opt/homebrew/bin/bash $0 --self-test'." >&2
+    exit 1
+fi
 
 set -euo pipefail
 
