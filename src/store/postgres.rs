@@ -13452,45 +13452,61 @@ async fn record_memory_quota_in_tx(
     agent_id: &str,
     namespace: &str,
     bytes_added: i64,
+    enforce_ceilings: bool,
 ) -> StoreResult<()> {
-    let now = Utc::now();
-    sqlx::query(
-        "INSERT INTO agent_quotas (
-             agent_id, namespace,
-             max_memories_per_day, max_storage_bytes, max_links_per_day,
-             current_memories_today, current_storage_bytes, current_links_today,
-             day_started_at, created_at, updated_at
-         ) VALUES ($1, $2, $3, $4, $5, 1, $6, 0, $7, $7, $7)
-         ON CONFLICT (agent_id, namespace) DO UPDATE SET
-             current_memories_today = CASE
-                 WHEN date_trunc('day', agent_quotas.day_started_at) = date_trunc('day', $7)
-                     THEN agent_quotas.current_memories_today + 1
-                 ELSE 1
-             END,
-             current_links_today = CASE
-                 WHEN date_trunc('day', agent_quotas.day_started_at) = date_trunc('day', $7)
-                     THEN agent_quotas.current_links_today
-                 ELSE 0
-             END,
-             current_storage_bytes = agent_quotas.current_storage_bytes + EXCLUDED.current_storage_bytes,
-             day_started_at = CASE
-                 WHEN date_trunc('day', agent_quotas.day_started_at) = date_trunc('day', $7)
-                     THEN agent_quotas.day_started_at
-                 ELSE $7
-             END,
-             updated_at = $7",
+    record_memory_quota_batch_in_tx(tx, agent_id, namespace, 1, bytes_added, enforce_ceilings).await
+}
+
+/// #2311 — build the typed `QuotaExceeded` for a ceiling-guarded record
+/// statement that affected 0 rows (the DO UPDATE guard refused the
+/// increment). Re-reads the row IN THIS TX (same day-rolled projection as
+/// `check_memory_quota`) so the error names the limit that actually
+/// tripped with accurate current/max values.
+async fn quota_ceiling_exceeded_error(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    agent_id: &str,
+    namespace: &str,
+    memories_added: i64,
+    now: chrono::DateTime<Utc>,
+) -> StoreError {
+    let row: Result<(i64, i64, i64, i64), sqlx::Error> = sqlx::query_as(
+        "SELECT \
+             CASE WHEN date_trunc('day', day_started_at) = date_trunc('day', $3) \
+                  THEN current_memories_today ELSE 0 END, \
+             max_memories_per_day, \
+             current_storage_bytes, \
+             max_storage_bytes \
+         FROM agent_quotas WHERE agent_id = $1 AND namespace = $2",
     )
     .bind(agent_id)
     .bind(namespace)
-    .bind(quota_defaults().max_memories_per_day)
-    .bind(quota_defaults().max_storage_bytes)
-    .bind(quota_defaults().max_links_per_day)
-    .bind(bytes_added)
     .bind(now)
-    .execute(&mut **tx)
-    .await
-    .map_err(|e| to_store_err("record agent_quotas memory increment", e))?;
-    Ok(())
+    .fetch_one(&mut **tx)
+    .await;
+    match row {
+        Ok((effective_memories, max_memories, current_bytes, max_bytes)) => {
+            if effective_memories.saturating_add(memories_added) > max_memories {
+                StoreError::QuotaExceeded {
+                    agent_id: agent_id.to_string(),
+                    namespace: namespace.to_string(),
+                    limit: crate::quotas::QuotaLimit::MemoriesPerDay
+                        .as_str()
+                        .to_string(),
+                    current: effective_memories,
+                    max: max_memories,
+                }
+            } else {
+                StoreError::QuotaExceeded {
+                    agent_id: agent_id.to_string(),
+                    namespace: namespace.to_string(),
+                    limit: crate::quotas::QuotaLimit::StorageBytes.as_str().to_string(),
+                    current: current_bytes,
+                    max: max_bytes,
+                }
+            }
+        }
+        Err(e) => to_store_err("re-read agent_quotas after ceiling refusal", e),
+    }
 }
 
 /// #1481 — count-aware sibling of [`record_memory_quota_in_tx`] for the
@@ -13506,9 +13522,36 @@ async fn record_memory_quota_batch_in_tx(
     namespace: &str,
     memories_added: i64,
     bytes_added: i64,
+    enforce_ceilings: bool,
 ) -> StoreResult<()> {
     let now = Utc::now();
-    sqlx::query(
+    // #2311 — close the check-then-record TOCTOU for TENANT callers.
+    // `check_memory_quota` is a plain pooled read on a separate connection,
+    // so N concurrent writes could all pass the check below cap and all
+    // record (the exact race the sqlite `quotas::check_and_record` closes
+    // with BEGIN IMMEDIATE, #628 H12). When `enforce_ceilings` the DO
+    // UPDATE arm re-checks the day-rolled ceilings ATOMICALLY against the
+    // row it is about to increment; a refused increment affects 0 rows and
+    // maps to the typed `QuotaExceeded`, rolling the whole store tx back.
+    // The fresh-INSERT arm is not guarded (INSERT always reports 1 row):
+    // a first-ever write's ceiling is enforced by the pre-check — there is
+    // no counter row to race on, and two concurrent first writes collide on
+    // the PK so the loser lands on the guarded update arm.
+    // `enforce_ceilings = false` keeps the record-only posture (admin /
+    // curator / internal SAL writes — the surfaces sqlite neither charges
+    // nor enforces) byte-identical to the pre-#2311 statement.
+    let guard = if enforce_ceilings {
+        "\n         WHERE (CASE
+                 WHEN date_trunc('day', agent_quotas.day_started_at) = date_trunc('day', $7)
+                     THEN agent_quotas.current_memories_today
+                 ELSE 0
+             END) + EXCLUDED.current_memories_today <= agent_quotas.max_memories_per_day
+           AND agent_quotas.current_storage_bytes + EXCLUDED.current_storage_bytes
+                   <= agent_quotas.max_storage_bytes"
+    } else {
+        ""
+    };
+    let res = sqlx::query(&format!(
         "INSERT INTO agent_quotas (
              agent_id, namespace,
              max_memories_per_day, max_storage_bytes, max_links_per_day,
@@ -13532,8 +13575,8 @@ async fn record_memory_quota_batch_in_tx(
                      THEN agent_quotas.day_started_at
                  ELSE $7
              END,
-             updated_at = $7",
-    )
+             updated_at = $7{guard}"
+    ))
     .bind(agent_id)
     .bind(namespace)
     .bind(quota_defaults().max_memories_per_day)
@@ -13545,6 +13588,11 @@ async fn record_memory_quota_batch_in_tx(
     .execute(&mut **tx)
     .await
     .map_err(|e| to_store_err("record agent_quotas batch memory increment", e))?;
+    if enforce_ceilings && res.rows_affected() == 0 {
+        return Err(
+            quota_ceiling_exceeded_error(tx, agent_id, namespace, memories_added, now).await,
+        );
+    }
     Ok(())
 }
 
@@ -14006,7 +14054,18 @@ impl MemoryStore for PostgresStore {
         // we never lose the count.
         let quota_agent_id = resolve_quota_agent_id(ctx, &memory.metadata);
         let bytes_added = memory_storage_bytes(memory);
-        record_memory_quota_in_tx(&mut tx, &quota_agent_id, &memory.namespace, bytes_added).await?;
+        // #2311 — tenant callers get the atomic in-tx ceiling guard (the
+        // handler's `check_memory_quota` pre-check remains only the
+        // fast-fail 429 shape); admin/curator contexts stay record-only,
+        // matching the sqlite surface-enforcement scoping.
+        record_memory_quota_in_tx(
+            &mut tx,
+            &quota_agent_id,
+            &memory.namespace,
+            bytes_added,
+            !ctx.bypass_visibility,
+        )
+        .await?;
 
         tx.commit()
             .await
@@ -14410,7 +14469,18 @@ impl MemoryStore for PostgresStore {
             entry.1 = entry.1.saturating_add(memory_storage_bytes(memory));
         }
         for ((agent_id, namespace), (count, bytes)) in &quota_groups {
-            record_memory_quota_batch_in_tx(&mut tx, agent_id, namespace, *count, *bytes).await?;
+            // #2311 — tenant bulk callers get the atomic in-tx ceiling
+            // guard; a tripped ceiling rolls the whole batch back
+            // (trait-contract atomicity). Admin contexts stay record-only.
+            record_memory_quota_batch_in_tx(
+                &mut tx,
+                agent_id,
+                namespace,
+                *count,
+                *bytes,
+                !ctx.bypass_visibility,
+            )
+            .await?;
         }
 
         tx.commit()
@@ -15248,7 +15318,18 @@ impl MemoryStore for PostgresStore {
         // v0.7.0 #1156 — per-namespace quota dimension (v50 PK).
         let quota_agent_id = resolve_quota_agent_id(ctx, &memory.metadata);
         let bytes_added = memory_storage_bytes(memory);
-        record_memory_quota_in_tx(&mut tx, &quota_agent_id, &memory.namespace, bytes_added).await?;
+        // #2311 — tenant callers get the atomic in-tx ceiling guard (the
+        // handler's `check_memory_quota` pre-check remains only the
+        // fast-fail 429 shape); admin/curator contexts stay record-only,
+        // matching the sqlite surface-enforcement scoping.
+        record_memory_quota_in_tx(
+            &mut tx,
+            &quota_agent_id,
+            &memory.namespace,
+            bytes_added,
+            !ctx.bypass_visibility,
+        )
+        .await?;
 
         tx.commit()
             .await
@@ -28241,6 +28322,90 @@ mod tests {
             .bind(&aid)
             .execute(&store.pool)
             .await;
+    }
+
+    /// #2311 — postgres tenant-quota TOCTOU. `check_memory_quota` is a
+    /// plain pooled read on a separate connection, so pre-fix N concurrent
+    /// stores at ceiling-1 all passed the check and all recorded (overshoot
+    /// up to N-1 past the cap — the race sqlite's BEGIN IMMEDIATE
+    /// `check_and_record` closes, #628 H12). The fix re-checks the
+    /// day-rolled ceilings atomically inside the record statement's DO
+    /// UPDATE guard for tenant callers. This test pins the (agent, ns) row
+    /// at max_memories_per_day = 1 and races 8 concurrent tenant stores:
+    /// exactly ONE may land; the rest get the typed QuotaExceeded; the
+    /// counter never overshoots. Skips without AI_MEMORY_TEST_POSTGRES_URL.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tenant_quota_record_is_atomic_under_concurrency_2311() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("quota-2311-{unique}");
+        // Seed the accounting row at a ceiling of ONE remaining write.
+        sqlx::query(
+            "INSERT INTO agent_quotas (
+                 agent_id, namespace,
+                 max_memories_per_day, max_storage_bytes, max_links_per_day,
+                 current_memories_today, current_storage_bytes, current_links_today,
+                 day_started_at, created_at, updated_at
+             ) VALUES ('ai:sal-test', $1, 1, 104857600, 5000, 0, 0, 0, now(), now(), now())",
+        )
+        .bind(&ns)
+        .execute(&store.pool)
+        .await
+        .expect("seed agent_quotas row");
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let store = store.clone();
+            let ctx = ctx.clone();
+            let ns = ns.clone();
+            handles.push(tokio::spawn(async move {
+                let mem = sample_memory(
+                    &format!("quota-2311-{i}-{}", uuid::Uuid::new_v4()),
+                    &ns,
+                    &format!("quota row {i}"),
+                    "quota race body",
+                );
+                store.store(&ctx, &mem).await
+            }));
+        }
+        let mut ok = 0usize;
+        for h in handles {
+            match h.await.expect("join store task") {
+                Ok(_) => ok += 1,
+                Err(StoreError::QuotaExceeded { .. }) => {}
+                Err(e) => panic!("unexpected store error under quota race: {e}"),
+            }
+        }
+        assert_eq!(
+            ok, 1,
+            "exactly one concurrent tenant store may land at ceiling-1"
+        );
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT current_memories_today FROM agent_quotas \
+             WHERE agent_id = 'ai:sal-test' AND namespace = $1",
+        )
+        .bind(&ns)
+        .fetch_one(&store.pool)
+        .await
+        .expect("read counter");
+        assert_eq!(count, 1, "the counter must never overshoot the ceiling");
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM memories WHERE namespace = $1")
+            .bind(&ns)
+            .execute(&store.pool)
+            .await;
+        let _ = sqlx::query(
+            "DELETE FROM agent_quotas WHERE agent_id = 'ai:sal-test' AND namespace = $1",
+        )
+        .bind(&ns)
+        .execute(&store.pool)
+        .await;
     }
 
     /// #2196 (data-integrity archive-parity) — postgres twin of the sqlite
