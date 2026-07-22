@@ -18593,20 +18593,29 @@ impl MemoryStore for PostgresStore {
                 detail: crate::errors::msg::FORGET_FILTER_REQUIRED.to_string(),
             });
         }
-        // Postgres uses ILIKE for the pattern match (no FTS5 here); the
-        // sqlite path uses an FTS query. Both are case-insensitive
-        // substring/token matches against title+content; we land on
-        // ILIKE over title || ' ' || content so the wire contract
-        // ("forget anything matching this string") is preserved.
+        // #2312 — token-AND pattern semantics, matching the sqlite twin.
+        // sqlite routes the DESTRUCTIVE forget pattern through
+        // `forget_fts_query` -> `sanitize_fts_query(pat, false)` (#1601):
+        // every whitespace-separated token must match as a WHOLE token
+        // (FTS5 implicit AND) — the conservative posture the memory_forget
+        // wire contract promises ("every whitespace-separated token must
+        // match"). The previous postgres arm was `title ILIKE '%pat%' OR
+        // content ILIKE '%pat%'` — a contiguous SUBSTRING match that
+        // over-deleted (pattern "cat" reaped rows containing "education")
+        // and under-deleted (non-adjacent multi-token patterns), so the
+        // same destructive wire call deleted DIFFERENT row sets per
+        // backend. The predicate is now `tsv @@ plainto_tsquery('english',
+        // $pattern)` over the v57 stored tsvector (title + content):
+        // plainto_tsquery AND-joins every lexeme and treats its input as
+        // plain text (no operator surface — injection-safe, so the #2032
+        // LM1 escaping is no longer needed; a bare "%" or an
+        // all-punctuation pattern normalizes to the EMPTY tsquery, which
+        // matches NOTHING — the fail-safe twin of sqlite's `"_empty_"`
+        // sentinel). Documented residual: the `english` config stems and
+        // drops stopwords where FTS5 unicode61 does not, so token
+        // boundaries differ marginally across backends; both remain
+        // whole-token AND matches.
         let tier_str = tier.map(|t| t.as_str().to_string());
-        // #2032 LM1 — escape LIKE metacharacters (`%` `_` `\\`) in the
-        // caller-supplied pattern so `forget(pattern="%")` matches a
-        // LITERAL `%` (the sqlite/FTS twin's behaviour) instead of the
-        // ILIKE wildcard that would archive+delete the WHOLE scope. The
-        // outer `%…%` stays literal wildcards for the intended substring
-        // match. PostgreSQL LIKE/ILIKE uses backslash as the default
-        // escape character, so no explicit `ESCAPE` clause is required.
-        let pattern_like = pattern.map(|p| format!("%{}%", crate::storage::escape_like_pattern(p)));
         let now = chrono::Utc::now().to_rfc3339();
 
         // #1776 — archive + delete MUST be one transaction (mirror `run_gc` /
@@ -18651,14 +18660,13 @@ impl MemoryStore for PostgresStore {
                 WHERE ($1::text IS NULL OR namespace = $1)
                   AND ($2::text IS NULL OR tier = $2)
                   AND ($3::text IS NULL
-                       OR title ILIKE $3
-                       OR content ILIKE $3)
+                       OR tsv @@ plainto_tsquery('english', $3))
                 -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
                 {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
             ))
             .bind(namespace)
             .bind(tier_str.as_deref())
-            .bind(pattern_like.as_deref())
+            .bind(pattern)
             .bind(parse_rfc3339_required(&now)?)
             .execute(&mut *tx)
             .await
@@ -18686,20 +18694,18 @@ impl MemoryStore for PostgresStore {
                        WHERE ($1::text IS NULL OR namespace = $1)
                          AND ($2::text IS NULL OR tier = $2)
                          AND ($3::text IS NULL
-                              OR title ILIKE $3
-                              OR content ILIKE $3))
+                              OR tsv @@ plainto_tsquery('english', $3)))
                 OR ml.target_id IN (
                        SELECT id FROM memories
                        WHERE ($1::text IS NULL OR namespace = $1)
                          AND ($2::text IS NULL OR tier = $2)
                          AND ($3::text IS NULL
-                              OR title ILIKE $3
-                              OR content ILIKE $3))
+                              OR tsv @@ plainto_tsquery('english', $3)))
              ON CONFLICT (source_id, target_id, relation) DO NOTHING",
         )
         .bind(namespace)
         .bind(tier_str.as_deref())
-        .bind(pattern_like.as_deref())
+        .bind(pattern)
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("forget snapshot links", e))?;
@@ -18717,12 +18723,11 @@ impl MemoryStore for PostgresStore {
                AND ($1::text IS NULL OR namespace = $1)
                AND ($2::text IS NULL OR tier = $2)
                AND ($3::text IS NULL
-                    OR title ILIKE $3
-                    OR content ILIKE $3)",
+                    OR tsv @@ plainto_tsquery('english', $3))",
         )
         .bind(namespace)
         .bind(tier_str.as_deref())
-        .bind(pattern_like.as_deref())
+        .bind(pattern)
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("forget scrub cid_genesis", e))?;
@@ -18746,13 +18751,12 @@ impl MemoryStore for PostgresStore {
                AND ($1::text IS NULL OR namespace = $1)
                AND ($2::text IS NULL OR tier = $2)
                AND ($3::text IS NULL
-                    OR title ILIKE $3
-                    OR content ILIKE $3)
+                    OR tsv @@ plainto_tsquery('english', $3))
              RETURNING id",
         )
         .bind(namespace)
         .bind(tier_str.as_deref())
-        .bind(pattern_like.as_deref())
+        .bind(pattern)
         .bind(crate::encryption::crypto_erase_marker())
         .fetch_all(&mut *tx)
         .await
@@ -18770,13 +18774,12 @@ impl MemoryStore for PostgresStore {
              WHERE ($1::text IS NULL OR namespace = $1)
                AND ($2::text IS NULL OR tier = $2)
                AND ($3::text IS NULL
-                    OR title ILIKE $3
-                    OR content ILIKE $3)
+                    OR tsv @@ plainto_tsquery('english', $3))
              RETURNING id, namespace, metadata->>'agent_id'",
         )
         .bind(namespace)
         .bind(tier_str.as_deref())
-        .bind(pattern_like.as_deref())
+        .bind(pattern)
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| to_store_err("forget delete", e))?;
@@ -18918,30 +18921,22 @@ impl MemoryStore for PostgresStore {
     ) -> StoreResult<Vec<String>> {
         // #1849 (CWE-862) — DISTINCT namespaces of the forget match set,
         // NON-owner-scoped (admin path). Mirrors the [`forget`] DELETE
-        // predicate EXACTLY (the same ILIKE-over-title/content substring
-        // match + tier filter) but omits the namespace predicate (this is
-        // only consulted on a `namespace = None` cross-namespace forget) and
-        // SELECTs DISTINCT namespace with NO LIMIT — so the HTTP gate sees
-        // every governed namespace, including any whose rows would sort past
-        // the #1602 preview cap. 5-agent vote 4d3ea1c5.
+        // predicate EXACTLY (#2312: the same token-AND
+        // `tsv @@ plainto_tsquery` match + tier filter) but omits the
+        // namespace predicate (this is only consulted on a
+        // `namespace = None` cross-namespace forget) and SELECTs DISTINCT
+        // namespace with NO LIMIT — so the HTTP gate sees every governed
+        // namespace, including any whose rows would sort past the #1602
+        // preview cap. 5-agent vote 4d3ea1c5.
         let tier_str = tier.map(|t| t.as_str().to_string());
-        // #2032 LM1 — escape LIKE metacharacters (`%` `_` `\\`) in the
-        // caller-supplied pattern so `forget(pattern="%")` matches a
-        // LITERAL `%` (the sqlite/FTS twin's behaviour) instead of the
-        // ILIKE wildcard that would archive+delete the WHOLE scope. The
-        // outer `%…%` stays literal wildcards for the intended substring
-        // match. PostgreSQL LIKE/ILIKE uses backslash as the default
-        // escape character, so no explicit `ESCAPE` clause is required.
-        let pattern_like = pattern.map(|p| format!("%{}%", crate::storage::escape_like_pattern(p)));
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT DISTINCT namespace FROM memories
              WHERE ($1::text IS NULL OR tier = $1)
                AND ($2::text IS NULL
-                    OR title ILIKE $2
-                    OR content ILIKE $2)",
+                    OR tsv @@ plainto_tsquery('english', $2))",
         )
         .bind(tier_str.as_deref())
-        .bind(pattern_like.as_deref())
+        .bind(pattern)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| to_store_err("forget_distinct_namespaces", e))?;
@@ -28406,6 +28401,80 @@ mod tests {
         .bind(&ns)
         .execute(&store.pool)
         .await;
+    }
+
+    /// #2312 — destructive forget pattern must be TOKEN-AND (the sqlite
+    /// `forget_fts_query` #1601 contract the memory_forget wire promises),
+    /// not a contiguous ILIKE substring. Pins all three divergence legs on
+    /// postgres: (a) pattern "cat" must NOT reap a row whose content merely
+    /// CONTAINS the substring ("education"); (b) a multi-token pattern with
+    /// NON-ADJACENT tokens must match (token AND, not substring); (c) the
+    /// bare "%" pattern must delete NOTHING (the #2032 LM1 posture —
+    /// plainto_tsquery normalizes it to the empty query). Skips without
+    /// AI_MEMORY_TEST_POSTGRES_URL.
+    #[tokio::test]
+    async fn forget_pattern_is_token_and_not_substring_2312() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("forget-2312-{unique}");
+        let edu = sample_memory(
+            &format!("f2312-edu-{unique}"),
+            &ns,
+            "substring bait",
+            "education policy notes",
+        );
+        let nonadj = sample_memory(
+            &format!("f2312-nonadj-{unique}"),
+            &ns,
+            "non adjacent tokens",
+            "alphatok filler words between betatok",
+        );
+        store.store(&ctx, &edu).await.expect("store edu");
+        store.store(&ctx, &nonadj).await.expect("store nonadj");
+
+        // (a) substring over-delete must NOT happen: "cat" is not a token
+        // of either row ("education" merely contains it).
+        let deleted = store
+            .forget(&ctx, Some(&ns), Some("cat"), None, false)
+            .await
+            .expect("forget cat");
+        assert_eq!(
+            deleted, 0,
+            "pattern 'cat' must not reap rows merely CONTAINING the substring"
+        );
+
+        // (c) LM1 posture: a bare wildcard deletes nothing.
+        let deleted = store
+            .forget(&ctx, Some(&ns), Some("%"), None, false)
+            .await
+            .expect("forget wildcard");
+        assert_eq!(deleted, 0, "bare '%' must not match the whole scope");
+
+        // (b) token-AND under-delete must NOT happen: non-adjacent tokens
+        // still match (sqlite FTS5 implicit-AND parity).
+        let deleted = store
+            .forget(&ctx, Some(&ns), Some("alphatok betatok"), None, false)
+            .await
+            .expect("forget non-adjacent tokens");
+        assert_eq!(
+            deleted, 1,
+            "non-adjacent token-AND pattern must reap exactly the matching row"
+        );
+
+        // Cleanup (the edu row survives all three forgets).
+        let _ = sqlx::query("DELETE FROM memories WHERE namespace = $1")
+            .bind(&ns)
+            .execute(&store.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM forget_tombstones WHERE namespace = $1")
+            .bind(&ns)
+            .execute(&store.pool)
+            .await;
     }
 
     /// #2196 (data-integrity archive-parity) — postgres twin of the sqlite
