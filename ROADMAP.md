@@ -468,7 +468,7 @@ The first proposal (single recover-on-boot mechanism) was correctly identified a
 | Layer | Surface | Catches | Position |
 |---|---|---|---|
 | **L1 — Agent discipline** | CLAUDE.md HARD-RULE + START-HERE memory + `memory_capture_nag` substrate watcher | The common case (agent forgot to call `memory_store`) | Prompt-level + cheap substrate hook |
-| **L2 — Recover-on-boot** | `ai-memory recover-previous-session` CLI + `memory_recover_previous_session` MCP tool | The narrow case (SIGKILL between sessions on same host) | BACKSTOP only; never positioned as "the fix" |
+| **L2 — Recover-on-boot** | `ai-memory recover-previous-session` CLI (CLI-only — no MCP-tool counterpart) | The narrow case (SIGKILL between sessions on same host) | BACKSTOP only; never positioned as "the fix" |
 | **L3 — Substrate watcher** | Filesystem-notify daemon thread inside the ai-memory daemon | Mid-session crashes + multi-session-on-same-host concurrent capture | Universal scrape backstop while L4 propagates |
 | **L4 — Protocol layer** | New `memory_capture_turn` MCP tool + capabilities advertisement + RFC + per-host adapter shims | Everything L1-L3 catch, cleanly — no host-format coupling | THE FIX; survives 50 years of vendor churn |
 

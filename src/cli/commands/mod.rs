@@ -73,9 +73,8 @@ pub mod subscription_dlq_list;
 pub mod subscription_replay;
 pub mod unsubscribe;
 // v0.7.0 (issue #1389) — recover-on-boot fail-safe for the #1388
-// substrate failure mode. The CLI surface chains after `ai-memory
-// boot` in the SessionStart hook; the MCP-tool surface
-// `memory_recover_previous_session` lives at
-// `src/mcp/tools/recover_previous_session.rs` and shares the same
-// `crate::recover::recover_from_transcript` handler.
+// substrate failure mode. CLI-only surface: chains after `ai-memory
+// boot` in the SessionStart hook via `crate::recover::recover_from_transcript`.
+// There is no MCP-tool counterpart (no `memory_recover_previous_session`
+// tool was ever implemented/registered; corrected per Grok W1A4-01).
 pub mod recover_previous_session;

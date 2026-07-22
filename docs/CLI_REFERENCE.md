@@ -910,9 +910,10 @@ twin (byte-equal envelopes; `--json` for the raw envelope):
 
 Fail-safe recovery of agent context from a host's per-turn transcript
 file after an ungraceful session end (SIGKILL, tmux lockup, host
-crash). Designed for SessionStart-hook chaining after `ai-memory boot`;
-the in-session counterpart is the `memory_recover_previous_session`
-MCP surface.
+crash). Designed for SessionStart-hook chaining after `ai-memory boot`.
+There is currently no MCP-tool counterpart — `recover-previous-session`
+is CLI-only; in-session recovery goes through `memory_recall` /
+`memory_session_start` instead.
 
 ### Additional v0.7.0 subcommands
 

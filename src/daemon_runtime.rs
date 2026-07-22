@@ -456,8 +456,8 @@ pub enum Command {
     /// session terminated ungracefully (SIGKILL, tmux lockup, host
     /// crash) between turns. Closes the #1388 substrate failure
     /// mode. Designed for SessionStart-hook chaining after
-    /// `ai-memory boot`; the in-session counterpart is the
-    /// `memory_recover_previous_session` MCP tool.
+    /// `ai-memory boot`. CLI-only — there is no `memory_recover_previous_session`
+    /// MCP tool (never implemented/registered; corrected per Grok W1A4-01).
     RecoverPreviousSession(
         crate::cli::commands::recover_previous_session::RecoverPreviousSessionArgs,
     ),
