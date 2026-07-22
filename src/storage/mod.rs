@@ -7618,8 +7618,26 @@ pub fn consolidate(
         consult_why_trace_gate(&candidate)?;
         // v0.9.0 G8 (#1825) — a consolidated memory is a fresh genesis, so
         // it mints its own content-id from the (plaintext) summary + the
-        // candidate's genesis identity.
+        // candidate's genesis identity. Minted BEFORE the #228 seal swap
+        // below so the cid always hashes the plaintext summary, never the
+        // ciphertext placeholder (mirrors the `db::insert` ordering).
         let cid_stamp = crate::identity::cid::stamp_memory_cid(&candidate);
+        // #228/#2301 Commit B — at-rest content encryption on the consolidate
+        // funnel. This raw INSERT bypasses the `db::insert` chokepoint (where
+        // the SQLite seal normally lands), so without this call a curator
+        // consolidation under `AI_MEMORY_ENCRYPT_AT_REST=1` would persist the
+        // summary as PLAINTEXT in the `content` column (the SQLite sibling of
+        // the Postgres #2292 gap). Mirror `db::insert` (`:1181`) EXACTLY: seal
+        // the plaintext summary to the consolidator's per-agent key; on an
+        // enabled gate `content` then carries the empty placeholder and the
+        // ciphertext lands in `encrypted_envelope`. When disabled (default)
+        // `sealed` is None, `content_to_store` is the plaintext summary and
+        // the envelope is NULL — byte-identical to pre-#2301 behaviour.
+        // `consolidator_agent_id` is the authoritative NHI owner stamped into
+        // `metadata.agent_id` above, so it is the correct seal key.
+        let sealed = crate::encryption::seal_content(summary, consolidator_agent_id)?;
+        let content_to_store = sealed.as_ref().map_or(summary, |(_, ph)| ph.as_str());
+        let encrypted_envelope: Option<&[u8]> = sealed.as_ref().map(|(env, _)| env.as_slice());
 
         // v0.7.0 #1466 — consolidate mints a fresh memory via this raw
         // INSERT, so it must carry the tier-default expiry too; otherwise a
@@ -7627,9 +7645,9 @@ pub fn consolidate(
         // never reaped by GC. `candidate.created_at == now` so the backfill
         // here matches the `?10` bound below.
         conn.execute(
-            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, expires_at, metadata, confidence_source, cid, cid_genesis)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1.0, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15)",
-            params![new_id, tier.as_str(), namespace, title, summary, tags_json, max_priority, source, total_access, now, candidate.effective_expires_at(), metadata_json, candidate.confidence_source.as_str(), cid_stamp.cid, cid_stamp.genesis],
+            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, expires_at, metadata, confidence_source, cid, cid_genesis, encrypted_envelope)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1.0, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![new_id, tier.as_str(), namespace, title, content_to_store, tags_json, max_priority, source, total_access, now, candidate.effective_expires_at(), metadata_json, candidate.confidence_source.as_str(), cid_stamp.cid, cid_stamp.genesis, encrypted_envelope],
         )?;
 
         // v0.9.0 G13-mem (#1859, COND 1) — the SINGLE consolidate-leaf
@@ -15776,6 +15794,16 @@ pub fn memories_updated_since(
     // placeholder as the peer's content. The other named-column reader
     // (`metadata` etc.) tolerates the addition because `row_to_memory`
     // reads every column by name.
+    //
+    // #2303 — this decrypt is LOAD-BEARING for `apply_remote_memory`
+    // receive-seal safety: a sealed row's `content` column is a `""`
+    // sentinel (see `encryption::seal_content`), and if this send path
+    // ever shipped that placeholder instead of decrypted plaintext, the
+    // receiver would re-seal an empty string under its own key —
+    // content='' + a fresh envelope, an unrecoverable silent content
+    // loss with no error anywhere in the pipe. Do not remove this
+    // decrypt or the `encrypted_envelope` column from `COLS`. Pinned by
+    // `tests/encryption_at_rest.rs::federation_send_list_updated_since_decrypts_2303`.
     const COLS: &str = "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
                 source, access_count, created_at, updated_at, last_accessed_at, \
                 expires_at, metadata, encrypted_envelope \
