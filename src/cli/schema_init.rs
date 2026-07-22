@@ -956,8 +956,103 @@ mod tests {
     // The test (1) inits at 384, (2) verifies dim=384, (3) runs
     // schema-init with embedding_dim=768, (4) verifies dim=768 and
     // embedding_dim_migrated=true, (5) re-runs at 768 to confirm
-    // idempotence (embedding_dim_migrated=false).
+    // idempotence (embedding_dim_migrated=false), (6) restores the
+    // shared column back to 384 on the way out.
+    //
+    // #2295 — this test previously left the shared
+    // `AI_MEMORY_TEST_POSTGRES_URL` database's `memories.embedding`
+    // column at `vector(768)` on exit, which broke the
+    // `live_store_with_embedding_*` tests (hardcoded to a 384-dim
+    // vector via `PostgresStore::connect`) when both landed in the
+    // same `cargo test --features sal-postgres --lib --
+    // --include-ignored --test-threads=1` binary. `RestoreDimOnDrop`
+    // below is an RAII teardown guard (same shape as
+    // `tests/common/postgres_env.rs::SchemaCleanupGuard`) that
+    // restores the column to 384 even if an assertion panics
+    // mid-test, so the shared schema is left exactly as this test
+    // found it.
     // ----------------------------------------------------------------
+
+    /// Drop-time worker that restores the shared `public.memories`
+    /// embedding column back to the default 384 dim, regardless of
+    /// whether the owning test completed normally or panicked
+    /// mid-way. See the `#2295` note above.
+    #[cfg(feature = "sal-postgres")]
+    struct RestoreDimOnDrop {
+        url: String,
+    }
+
+    #[cfg(feature = "sal-postgres")]
+    impl Drop for RestoreDimOnDrop {
+        fn drop(&mut self) {
+            let url = self.url.clone();
+            // `drop` is sync; the restore needs an async connection +
+            // migration call. Spawn a thread with its own current-thread
+            // runtime and join it so the restore completes before the
+            // process moves on to the next test (mirrors
+            // `SchemaCleanupGuard::drop` in
+            // `tests/common/postgres_env.rs`).
+            let join = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build drop-time tokio runtime");
+                rt.block_on(async move {
+                    let store =
+                        match crate::store::postgres::PostgresStore::connect_with_dim(&url, 768)
+                            .await
+                        {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!(
+                                    "schema_init_postgres_embedding_dim_conversion: restore-to-384 teardown connect failed: {e}"
+                                );
+                                return;
+                            }
+                        };
+                    // force=true: this is a shared TEST database and the
+                    // teardown's sole purpose is leaving the schema as
+                    // this test found it, so any 768-dim embeddings this
+                    // test itself produced are fine to NULL on the way
+                    // back down to 384.
+                    if let Err(e) = store.migrate_embedding_dim(384, true).await {
+                        eprintln!(
+                            "schema_init_postgres_embedding_dim_conversion: restore-to-384 teardown failed: {e}"
+                        );
+                    }
+                });
+            });
+            if let Err(e) = join.join() {
+                eprintln!(
+                    "schema_init_postgres_embedding_dim_conversion: restore-to-384 teardown thread panicked: {e:?}"
+                );
+            }
+        }
+    }
+
+    // #2295 coverage note: `schema_init_postgres_embedding_dim_conversion`
+    // (below) is `#[ignore]`-gated (requires a live postgres) so it never
+    // runs in the default coverage suite, which would otherwise leave
+    // `RestoreDimOnDrop::drop`'s connect-failure branch (thread spawn +
+    // dedicated tokio runtime + the `Err` arm's `eprintln!`/`return`)
+    // completely unexercised. This test does NOT require
+    // `AI_MEMORY_TEST_POSTGRES_URL` and never touches the network: an
+    // unparseable connection string fails synchronously inside
+    // `PostgresStore::connect_with_dim` (`url.parse::<PgConnectOptions>()`,
+    // before any TCP attempt), driving the guard's `Drop` through its
+    // failure path deterministically and fast.
+    #[cfg(feature = "sal-postgres")]
+    #[tokio::test]
+    async fn restore_dim_on_drop_runs_teardown_on_connect_failure() {
+        {
+            let _guard = RestoreDimOnDrop {
+                url: "not-a-valid-postgres-url".to_string(),
+            };
+            // _guard drops at the end of this block, exercising
+            // `RestoreDimOnDrop::drop` synchronously (the spawned
+            // thread is joined before `drop` returns).
+        }
+    }
 
     #[cfg(feature = "sal-postgres")]
     #[tokio::test]
@@ -965,6 +1060,9 @@ mod tests {
     async fn schema_init_postgres_embedding_dim_conversion() {
         let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
             .expect("AI_MEMORY_TEST_POSTGRES_URL must be set");
+        // Registered BEFORE any schema-init call so a panic on any
+        // step below still restores the shared column (RAII teardown).
+        let _restore_guard = RestoreDimOnDrop { url: url.clone() };
 
         // Step 1 — init at the default 384 dim.
         let mut stdout = Vec::<u8>::new();
