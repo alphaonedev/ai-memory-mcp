@@ -696,9 +696,13 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 // v70 = #1771 (v0.8.0, 5-agent vote 4d3ea1c5) — `archived_memory_links`
 //       edge-preservation snapshot table. Mirrors `memory_links` columns
 //       sans the `REFERENCES memories(id)` FK (archive table) + an
-//       `archived_at` stamp. Created on both backends for adapter-schema
-//       consistency; SQLite wires snapshot/restore this commit, postgres
-//       snapshot/restore is a tracked follow-up. Additive CREATE TABLE
+//       `archived_at` stamp. Created on both backends; the postgres
+//       snapshot/restore wiring SHIPPED (#2318 doc fix — it was long
+//       described here as "a tracked follow-up"): `forget` snapshots the
+//       victims' links when archiving, `archive_by_ids` snapshots per id,
+//       and `archive_restore` re-inserts every preserved edge whose both
+//       endpoints exist (pinned by
+//       `archive_restore_preserves_links_pg_1771`). Additive CREATE TABLE
 //       IF NOT EXISTS (v59/v60/v69 precedent) — replay-safe.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep.
 // v77 = #1869 (v0.9.0 P0-1 recall purity) — `folded` fold-state column
