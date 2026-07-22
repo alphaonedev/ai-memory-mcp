@@ -1600,6 +1600,89 @@ mod postgres_side {
         );
     }
 
+    /// #2303 — pin the federation-send-decrypts invariant on postgres.
+    /// `list_memories_updated_since` backs the `GET /api/v1/sync/since`
+    /// federation peer-pull surface. At-rest encryption seals a row's
+    /// plaintext into `encrypted_envelope`, leaving `content=""` as a
+    /// storage sentinel; the #2292 `apply_remote_memory` receive-side
+    /// sealing is safe ONLY because this SEND path decrypts before
+    /// shipping. If it ever shipped the raw sealed row instead, a
+    /// receiving peer would re-seal that EMPTY string under its own
+    /// key — content='' + a fresh envelope, unrecoverable silent
+    /// content loss with no error anywhere. This asserts the send-path
+    /// read returns decrypted plaintext, not the placeholder, so a
+    /// future regression that skips the decrypt fails this test.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_list_memories_updated_since_decrypts_for_send_2303() {
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-2303");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+
+        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
+        // SAFETY: serial #[ignore] pg tests.
+        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+
+        // Capture a tight since-bound BEFORE the insert so the send-path
+        // read below scopes to just this row on a shared live DB.
+        let since_ts = chrono::Utc::now().to_rfc3339();
+        let plaintext = "pg SENSITIVE 2303 fed-send";
+        let mut mem = sample_memory(&format!("pg-2303-fed-send-{run}"));
+        mem.content = plaintext.to_string();
+        mem.metadata = serde_json::json!({ "agent_id": "pg-2303-agent" });
+        let id = MemoryStore::store_with_embedding(&pg, &admin_ctx, &mem, None, None)
+            .await
+            .expect("store under encryption");
+
+        // Sanity: the on-disk row IS sealed before the send-path read.
+        let (raw, env): (String, Option<Vec<u8>>) =
+            sqlx::query_as("SELECT content, encrypted_envelope FROM memories WHERE id = $1")
+                .bind(&id)
+                .fetch_one(pg.pool())
+                .await
+                .expect("raw read");
+        assert_eq!(
+            raw, "",
+            "#2303: sanity — at-rest row must hold the sealed placeholder"
+        );
+        assert!(
+            env.is_some(),
+            "#2303: sanity — at-rest row must carry a non-NULL envelope"
+        );
+
+        // The federation SEND path itself.
+        let sent = MemoryStore::list_memories_updated_since(&pg, Some(&since_ts), 5000)
+            .await
+            .expect("list_memories_updated_since");
+        let wire = sent.iter().find(|m| m.id == id).map(|m| m.content.clone());
+
+        // Teardown before asserting (shared DB, #2287 convention).
+        let _ = sqlx::query("DELETE FROM memories WHERE id = $1")
+            .bind(&id)
+            .execute(pg.pool())
+            .await;
+        // SAFETY: restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
+                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
+            }
+        }
+
+        let wire_content = wire.expect("#2303: row must be present in the send-path result");
+        assert_eq!(
+            wire_content, plaintext,
+            "#2303: federation send path must ship DECRYPTED plaintext, not the sealed placeholder"
+        );
+        assert_ne!(
+            wire_content, "",
+            "#2303: federation send path must never ship the empty sealed placeholder"
+        );
+    }
+
     /// #2292 — `capture_turn_idempotent` (L4 turn capture).
     #[tokio::test]
     #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]

@@ -648,3 +648,69 @@ fn federation_merge_seals_content_and_snapshots_1773() {
         "#1773: federation merge must snapshot the pre-merge row"
     );
 }
+
+#[test]
+fn federation_send_list_updated_since_decrypts_2303() {
+    // #2303 — pin the federation-send-decrypts invariant. At-rest
+    // encryption seals a row's plaintext into `encrypted_envelope` and
+    // leaves `content=""` as a storage SENTINEL, never a real payload
+    // (`encryption::seal_content` returns `None` — no sealing at all —
+    // for empty content, so a live sealed row's `content` column can
+    // ONLY be the empty placeholder). The #2292 `apply_remote_memory`
+    // receive-side sealing is safe ONLY because the federation SEND
+    // path decrypts before shipping: if `memories_updated_since` (which
+    // backs `SqliteStore::list_memories_updated_since`, the peer-pull
+    // `GET /api/v1/sync/since` surface) ever regressed to ship the raw
+    // sealed row instead of decrypted plaintext, a receiving peer's
+    // `apply_remote_memory` would re-seal that EMPTY string under its
+    // own key — content='' + a FRESH (empty-plaintext) envelope, with
+    // no error anywhere in the pipe: unrecoverable, silent content
+    // loss. This test asserts the send-path read returns the DECRYPTED
+    // plaintext, not the placeholder and not raw ciphertext, so any
+    // future change that skips the decrypt fails this test.
+    let _gate = EncryptGate::on();
+    let conn = fresh_conn();
+
+    let agent = "fed-send-2303-agent";
+    let plaintext = "sensitive content that must NOT wire-ship sealed — #2303";
+    let mut mem = make_mem("fed-send-2303", plaintext, "global");
+    mem.metadata = serde_json::json!({ "agent_id": agent });
+    mem.updated_at = "2026-01-01T00:00:00+00:00".to_string();
+    let id = db::insert(&conn, &mem).expect("insert under encryption");
+
+    // Sanity: the on-disk row IS sealed (content='' placeholder, a
+    // non-NULL envelope) — the precondition this test's send-path
+    // assertion below depends on.
+    let (raw_content, envelope): (String, Option<Vec<u8>>) = conn
+        .query_row(
+            "SELECT content, encrypted_envelope FROM memories WHERE id = ?1",
+            params![&id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("raw read");
+    assert_eq!(
+        raw_content, "",
+        "sanity: at-rest row must hold the sealed placeholder before the send-path read"
+    );
+    assert!(
+        envelope.is_some(),
+        "sanity: at-rest row must carry a non-NULL envelope before the send-path read"
+    );
+
+    // The federation SEND path itself.
+    let sent = db::memories_updated_since(&conn, Some("2025-01-01T00:00:00+00:00"), 100)
+        .expect("memories_updated_since");
+    let wire = sent
+        .iter()
+        .find(|m| m.id == id)
+        .expect("row must be present in the send-path result");
+
+    assert_eq!(
+        wire.content, plaintext,
+        "#2303: federation send path must ship DECRYPTED plaintext, not the sealed placeholder"
+    );
+    assert_ne!(
+        wire.content, "",
+        "#2303: federation send path must never ship the empty sealed placeholder"
+    );
+}
