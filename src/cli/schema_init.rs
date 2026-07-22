@@ -1030,6 +1030,30 @@ mod tests {
         }
     }
 
+    // #2295 coverage note: `schema_init_postgres_embedding_dim_conversion`
+    // (below) is `#[ignore]`-gated (requires a live postgres) so it never
+    // runs in the default coverage suite, which would otherwise leave
+    // `RestoreDimOnDrop::drop`'s connect-failure branch (thread spawn +
+    // dedicated tokio runtime + the `Err` arm's `eprintln!`/`return`)
+    // completely unexercised. This test does NOT require
+    // `AI_MEMORY_TEST_POSTGRES_URL` and never touches the network: an
+    // unparseable connection string fails synchronously inside
+    // `PostgresStore::connect_with_dim` (`url.parse::<PgConnectOptions>()`,
+    // before any TCP attempt), driving the guard's `Drop` through its
+    // failure path deterministically and fast.
+    #[cfg(feature = "sal-postgres")]
+    #[tokio::test]
+    async fn restore_dim_on_drop_runs_teardown_on_connect_failure() {
+        {
+            let _guard = RestoreDimOnDrop {
+                url: "not-a-valid-postgres-url".to_string(),
+            };
+            // _guard drops at the end of this block, exercising
+            // `RestoreDimOnDrop::drop` synchronously (the spawned
+            // thread is joined before `drop` returns).
+        }
+    }
+
     #[cfg(feature = "sal-postgres")]
     #[tokio::test]
     #[ignore = "requires running postgres; see comment above for the recipe"]
