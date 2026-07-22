@@ -16602,6 +16602,35 @@ impl MemoryStore for PostgresStore {
         memory: &Memory,
     ) -> StoreResult<String> {
         self.gate_record_stop()?;
+        // #2314 — sqlite `insert_if_newer` guard parity on the pg
+        // federation-apply funnel (reached by the /sync/push receive path
+        // AND the catchup puller). (a) G30 resurrection guard: DROP an
+        // inbound write for a tombstoned id (tombstone-wins) so a stale
+        // peer cannot revive a forgotten/GDPR-erased row via LWW —
+        // idempotent no-op return, logged for audit. (b) G29 credential
+        // REDACT: ALWAYS redact, NEVER refuse (a refused inbound row
+        // would diverge replicas; no-op unless screening was seeded
+        // non-`off`). Both guards previously existed ONLY on
+        // `merge_inbound`, leaving every apply_remote_memory caller
+        // unguarded on postgres while sqlite carries them inside
+        // `db::insert_if_newer` itself.
+        let tombstoned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM forget_tombstones WHERE memory_id = $1)",
+        )
+        .bind(&memory.id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("apply_remote_memory tombstone check", e))?;
+        if tombstoned {
+            tracing::info!(
+                target: "forget.tombstone",
+                memory_id = %memory.id,
+                "rejected inbound federation write for a forgotten id (resurrection guard)"
+            );
+            return Ok(memory.id.clone());
+        }
+        let screened = screen_storage_memory(memory);
+        let memory = screened.as_ref().unwrap_or(memory);
         // ARCH-1 (CRITICAL) — substrate governance pre-write parity.
         // Federation-pushed memories must clear the same pre-write
         // hook as locally-authored writes; otherwise a peer could push
@@ -28607,6 +28636,73 @@ mod tests {
             .execute(&store.pool)
             .await;
         }
+    }
+
+    /// #2314 — G30 resurrection guard on the postgres federation-apply
+    /// funnel. A forgotten id (forget_tombstones row present) pushed back
+    /// by a stale peer must be DROPPED (tombstone-wins) on BOTH inbound
+    /// primitives: `apply_remote_memory` (catchup puller + merge
+    /// fall-through) and `merge_inbound` (the /sync/push funnel post-fix).
+    /// Pre-fix `apply_remote_memory` had no tombstone check, so a
+    /// forgotten/GDPR-erased row RESURRECTED on a postgres receiver while
+    /// the identical push against sqlite was dropped. Skips without
+    /// AI_MEMORY_TEST_POSTGRES_URL.
+    #[tokio::test]
+    async fn apply_remote_memory_respects_forget_tombstone_2314() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("tombstone-2314-{unique}");
+        let vid = format!("ts2314-{unique}");
+        let victim = sample_memory(&vid, &ns, "tombstoned row", "forget me and stay gone");
+        store.store(&ctx, &victim).await.expect("store victim");
+        // Hard forget writes the forget_tombstones row for the id.
+        let deleted = store
+            .forget(&ctx, Some(&ns), None, None, false)
+            .await
+            .expect("hard forget");
+        assert_eq!(deleted, 1, "victim reaped");
+        let (has_tomb,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM forget_tombstones WHERE memory_id = $1)",
+        )
+        .bind(&vid)
+        .fetch_one(&store.pool)
+        .await
+        .expect("tombstone probe");
+        assert!(has_tomb, "forget must have written the tombstone");
+
+        // A stale peer re-pushes the row through BOTH inbound primitives.
+        let replay = sample_memory(&vid, &ns, "tombstoned row", "resurrection attempt");
+        let id = store
+            .apply_remote_memory(&ctx, &replay)
+            .await
+            .expect("apply_remote_memory is an idempotent no-op on a tombstoned id");
+        assert_eq!(id, vid);
+        let id2 = store
+            .merge_inbound(&ctx, &replay)
+            .await
+            .expect("merge_inbound is an idempotent no-op on a tombstoned id");
+        assert_eq!(id2, vid);
+        let (alive,): (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM memories WHERE id = $1)")
+                .bind(&vid)
+                .fetch_one(&store.pool)
+                .await
+                .expect("resurrection probe");
+        assert!(
+            !alive,
+            "a forgotten id must NOT be resurrected via the federation apply funnel"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM forget_tombstones WHERE memory_id = $1")
+            .bind(&vid)
+            .execute(&store.pool)
+            .await;
     }
 
     /// #2196 (data-integrity archive-parity) — postgres twin of the sqlite

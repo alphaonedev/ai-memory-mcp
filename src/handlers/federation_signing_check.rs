@@ -351,13 +351,23 @@ pub(super) async fn sync_push_via_store(
         // per-namespace reflection caps via the SAL `resolve_governance_policy`
         // (both backends) and applying any per-memory re-attribution — so
         // the exact persisted row is stored here.)
-        match app.store.apply_remote_memory(&ctx, &to_insert).await {
+        // #2314 — route the postgres receive funnel through the HARDENED
+        // `merge_inbound` (previously dead code): it carries the G30
+        // forget-tombstone resurrection guard, the G29 secret-screen
+        // redact, the #1719 attestation sanitize + #1755 updated_at clamp,
+        // and the same-id `merge_memory` field-merge — the exact guard set
+        // the sqlite funnel gets from `db::merge_inbound`/`insert_if_newer`.
+        // Pre-fix this called `apply_remote_memory`, which had NONE of the
+        // receive-lane guards (a stale peer could resurrect a forgotten
+        // row; a same-id/different-title push error-skipped forever).
+        match app.store.merge_inbound(&ctx, &to_insert).await {
             Ok(applied_id) => {
                 applied += 1;
                 // v1.0.0 R19/A3 (#1948) — route-OUT dequarantine-on-attest
-                // (postgres twin). `apply_remote_memory` PRESERVES an existing
-                // row's lifecycle_state on conflict, so a now-attested write
-                // clears any prior quarantine via the SAL raw-UPDATE surface.
+                // (postgres twin). `merge_inbound` PRESERVES an existing
+                // row's lifecycle_state (merge_memory keeps the local
+                // state), so a now-attested write clears any prior
+                // quarantine via the SAL raw-UPDATE surface.
                 if crate::handlers::federation_receive::row_is_agent_attested(&to_insert) {
                     let _ = app.store.dequarantine(&applied_id).await;
                 }
