@@ -20042,12 +20042,24 @@ impl MemoryStore for PostgresStore {
                 id: action_id.to_string(),
             });
         }
-        sqlx::query(
+        // #2310 — the FOR UPDATE pre-read above cannot lock an ABSENT row, so
+        // two concurrent first-acquires both read None and both reach this
+        // upsert; the second one's INSERT blocks on the PK until the first
+        // commits, then its ON CONFLICT arm fires. A previously-unconditional
+        // DO UPDATE let that loser silently STEAL the just-committed live
+        // lease (both callers returned Ok — mutual-exclusion break). The
+        // upsert is therefore self-guarding: the update arm applies ONLY when
+        // the surviving row is ours or expired (the same predicate the
+        // pre-read evaluates), and `rows_affected() == 0` maps to the typed
+        // Conflict the doc contract promises.
+        let upsert = sqlx::query(
             "INSERT INTO leases (action_id, holder, acquired_at, expires_at, heartbeat_at) \
              VALUES ($1, $2, $3, $4, $3) \
              ON CONFLICT (action_id) DO UPDATE SET holder = EXCLUDED.holder, \
                 acquired_at = EXCLUDED.acquired_at, expires_at = EXCLUDED.expires_at, \
-                heartbeat_at = EXCLUDED.heartbeat_at",
+                heartbeat_at = EXCLUDED.heartbeat_at \
+             WHERE leases.holder = EXCLUDED.holder \
+                OR leases.expires_at <= EXCLUDED.acquired_at",
         )
         .bind(action_id)
         .bind(holder)
@@ -20056,6 +20068,11 @@ impl MemoryStore for PostgresStore {
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("lease_acquire upsert", e))?;
+        if upsert.rows_affected() == 0 {
+            return Err(StoreError::Conflict {
+                id: action_id.to_string(),
+            });
+        }
         let row = sqlx::query(PG_LEASE_SELECT_BY_ID)
             .bind(action_id)
             .fetch_one(&mut *tx)
@@ -28138,6 +28155,92 @@ mod tests {
                 .any(|l| l.source_id == a_id && l.target_id == b_id),
             "A->B edge must be preserved across archive_by_ids + archive_restore"
         );
+    }
+
+    /// #2310 — postgres `lease_acquire` first-acquire mutual exclusion.
+    /// `SELECT ... FOR UPDATE` cannot lock an ABSENT row, so two concurrent
+    /// first-acquires both read `None`; pre-fix the unconditional
+    /// `ON CONFLICT (action_id) DO UPDATE` then let the LOSER silently steal
+    /// the winner's just-committed live lease and BOTH callers returned `Ok`.
+    /// The fix makes the upsert self-guarding (same-holder or expired only)
+    /// and maps `rows_affected() == 0` to the typed `Conflict`. This test
+    /// races 8 concurrent first-acquires with distinct holders and asserts
+    /// exactly ONE `Ok`, and that the surviving row belongs to that winner.
+    /// Skips cleanly when `AI_MEMORY_TEST_POSTGRES_URL` unset.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lease_acquire_concurrent_first_acquire_single_winner_2310() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("lease-2310-{unique}");
+        let aid = format!("lease-2310-act-{unique}");
+        let action = crate::models::Action {
+            id: aid.clone(),
+            namespace: ns,
+            kind: "test.lease-race".to_string(),
+            state: crate::models::ActionState::Pending,
+            title: "lease 2310 race target".to_string(),
+            payload: serde_json::json!({}),
+            priority: 5,
+            agent_id: Some("ai:sal-test".to_string()),
+            claimed_by: None,
+            vector_clock: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+        };
+        store
+            .action_create(&ctx, &action)
+            .await
+            .expect("action_create");
+
+        let now = 1_700_100_000_i64;
+        let expires = now + 60;
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let store = store.clone();
+            let ctx = ctx.clone();
+            let aid = aid.clone();
+            handles.push(tokio::spawn(async move {
+                let holder = format!("holder-{i}");
+                store
+                    .lease_acquire(&ctx, &aid, &holder, now, expires)
+                    .await
+                    .map(|l| l.holder)
+            }));
+        }
+        let mut winners = Vec::new();
+        for h in handles {
+            match h.await.expect("join lease task") {
+                Ok(holder) => winners.push(holder),
+                Err(StoreError::Conflict { .. }) => {}
+                Err(e) => panic!("unexpected lease_acquire error: {e}"),
+            }
+        }
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one concurrent first-acquire may win the lease (got {winners:?})"
+        );
+        let (holder_row,): (String,) =
+            sqlx::query_as("SELECT holder FROM leases WHERE action_id = $1")
+                .bind(&aid)
+                .fetch_one(&store.pool)
+                .await
+                .expect("lease row present");
+        assert_eq!(
+            holder_row, winners[0],
+            "the surviving leases row must belong to the single winner"
+        );
+        // Cleanup — cascade removes the lease row with the action.
+        let _ = sqlx::query("DELETE FROM actions WHERE id = $1")
+            .bind(&aid)
+            .execute(&store.pool)
+            .await;
     }
 
     /// #2196 (data-integrity archive-parity) — postgres twin of the sqlite
