@@ -21220,7 +21220,11 @@ impl MemoryStore for PostgresStore {
         // would be rejected (and is correctly skipped here). Idempotent via
         // the PK `ON CONFLICT`. Postgres twin of the SQLite
         // `restore_links_for_memory` re-insert.
-        sqlx::query(
+        // #2315 — RETURNING the actually-restored edges so they can be
+        // re-projected into the AGE graph below (only edges this INSERT
+        // landed; ON CONFLICT skips report nothing, which is correct —
+        // an already-present edge is already projected or queued).
+        let restored_edges: Vec<(String, String, String)> = sqlx::query_as(
             "INSERT INTO memory_links (
                  source_id, target_id, relation, created_at, valid_from,
                  valid_until, observed_by, signature, attest_level
@@ -21232,12 +21236,80 @@ impl MemoryStore for PostgresStore {
              WHERE (aml.source_id = $1 OR aml.target_id = $1)
                AND EXISTS (SELECT 1 FROM memories m WHERE m.id = aml.source_id)
                AND EXISTS (SELECT 1 FROM memories m WHERE m.id = aml.target_id)
-             ON CONFLICT (source_id, target_id, relation) DO NOTHING",
+             ON CONFLICT (source_id, target_id, relation) DO NOTHING
+             RETURNING source_id, target_id, relation",
         )
         .bind(id)
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| to_store_err("archive_restore restore links", e))?;
+
+        // #2315 — re-PROJECT the restored edges into the AGE `memory_graph`.
+        // Every delete path unprojects (forget / delete / consolidate / gc /
+        // size_gc / archive_by_ids), but restore previously re-inserted the
+        // relational rows WITHOUT re-projecting, so an AGE-routed kg_query
+        // permanently missed restored edges (the CTE fallback fires only on
+        // AGE runtime failure, never on a valid-but-empty result) — a
+        // split-brain with no self-heal. Deferred mode enqueues the outbox
+        // rows in THIS tx (the drainer's existence re-check tolerates any
+        // later delete); sync mode MERGEs via a SAVEPOINT so an AGE runtime
+        // failure degrades to a WARN instead of failing the relational
+        // restore (#700/#1542 posture — the graph is derived data; the
+        // restore of the durable rows must never be blocked by it).
+        if matches!(self.kg_backend, KgBackend::Age) {
+            for (src, dst, rel) in &restored_edges {
+                if matches!(
+                    crate::config::age_projection_mode(),
+                    crate::config::AgeProjectionMode::Deferred
+                ) {
+                    sqlx::query(
+                        "INSERT INTO kg_projection_outbox (source_id, target_id, relation) \
+                         VALUES ($1, $2, $3)",
+                    )
+                    .bind(src)
+                    .bind(dst)
+                    .bind(rel)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("archive_restore enqueue kg_projection_outbox", e))?;
+                } else {
+                    sqlx::query("SAVEPOINT age_restore_projection")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| to_store_err("savepoint age_restore_projection", e))?;
+                    match project_link_into_age(&mut tx, src, dst, rel).await {
+                        Ok(()) => {
+                            sqlx::query("RELEASE SAVEPOINT age_restore_projection")
+                                .execute(&mut *tx)
+                                .await
+                                .map_err(|e| {
+                                    to_store_err("release savepoint age_restore_projection", e)
+                                })?;
+                        }
+                        Err(e) if is_age_runtime_failure(&e) => {
+                            sqlx::query("ROLLBACK TO SAVEPOINT age_restore_projection")
+                                .execute(&mut *tx)
+                                .await
+                                .map_err(|e2| {
+                                    to_store_err("rollback savepoint age_restore_projection", e2)
+                                })?;
+                            tracing::warn!(
+                                target: TRACE_TARGET_KG,
+                                source_id = %src,
+                                target_id = %dst,
+                                relation = %rel,
+                                err = %e,
+                                "AGE projection skipped on archive_restore — \
+                                 relational memory_links row still committed. \
+                                 find_paths_cypher will degrade to CTE fallback \
+                                 for queries that traverse this edge."
+                            );
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
 
         sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
             .bind(id)
@@ -21439,6 +21511,16 @@ impl MemoryStore for PostgresStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("archive_by_ids delete", e))?;
+            // #2315 — AGE unprojection parity. This was the ONLY hard-delete
+            // path that skipped `unproject_memory_from_age` (delete / forget /
+            // apply_remote_deletion / consolidate / run_gc / size_gc all call
+            // it), so a manually-archived memory left a ghost `:Memory` node +
+            // incident edges in the `memory_graph` projection that AGE-routed
+            // kg_query kept returning — a live-looking edge to a non-live
+            // memory. Same-tx DETACH DELETE, mirroring the forget() shape.
+            if matches!(self.kg_backend, KgBackend::Age) {
+                unproject_memory_from_age(&mut tx, id).await?;
+            }
             moved += 1;
         }
 
@@ -28703,6 +28785,91 @@ mod tests {
             .bind(&vid)
             .execute(&store.pool)
             .await;
+    }
+
+    /// #2315 — AGE projection integrity across the manual archive round
+    /// trip. (a) `archive_by_ids` must UNPROJECT the archived memories
+    /// (pre-fix it was the only hard-delete path skipping
+    /// `unproject_memory_from_age`, leaving ghost `:Memory` nodes/edges
+    /// AGE-routed kg_query kept returning); (b) `archive_restore` must
+    /// RE-PROJECT the restored edges (pre-fix the relational rows returned
+    /// but the AGE current view permanently missed them). Requires an
+    /// AGE-enabled postgres (`AI_MEMORY_TEST_AGE_URL`); skips cleanly
+    /// otherwise, including when the target resolves to the CTE backend.
+    #[tokio::test]
+    async fn archive_round_trip_keeps_age_projection_consistent_2315() {
+        let Some(url) = std::env::var("AI_MEMORY_TEST_AGE_URL").ok() else {
+            eprintln!("skip: AI_MEMORY_TEST_AGE_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        if !matches!(store.kg_backend, KgBackend::Age) {
+            eprintln!("skip: AI_MEMORY_TEST_AGE_URL target did not resolve KgBackend::Age");
+            return;
+        }
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("age-2315-{unique}");
+        let a_id = format!("age2315-a-{unique}");
+        let b_id = format!("age2315-b-{unique}");
+        let a = sample_memory(&a_id, &ns, "age-a", "age projection endpoint a");
+        let b = sample_memory(&b_id, &ns, "age-b", "age projection endpoint b");
+        store.store(&ctx, &a).await.expect("store a");
+        store.store(&ctx, &b).await.expect("store b");
+        let link = crate::models::MemoryLink {
+            source_id: a_id.clone(),
+            target_id: b_id.clone(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            valid_from: None,
+            valid_until: None,
+            observed_by: None,
+            signature: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        };
+        store.link(&ctx, &link).await.expect("link a->b");
+        let before = store.kg_query(&a_id, 2).await.expect("kg_query before");
+        assert!(
+            before.iter().any(|r| r.target_id == b_id),
+            "sanity: the A->B edge is AGE-visible after link()"
+        );
+
+        // (a) archive both endpoints — the AGE view must go EMPTY (no
+        // ghost node/edge for a non-live memory).
+        let moved = store
+            .archive_by_ids(&ctx, &[a_id.clone(), b_id.clone()], Some("test-2315"))
+            .await
+            .expect("archive_by_ids");
+        assert_eq!(moved, 2);
+        let ghost = store.kg_query(&a_id, 2).await.expect("kg_query archived");
+        assert!(
+            ghost.is_empty(),
+            "archive_by_ids must unproject — no ghost AGE edges for archived rows"
+        );
+
+        // (b) restore both — the edge returns relationally AND in the AGE
+        // current view (re-projection).
+        assert!(store.archive_restore(&ctx, &a_id).await.expect("restore a"));
+        assert!(store.archive_restore(&ctx, &b_id).await.expect("restore b"));
+        let after = store.kg_query(&a_id, 2).await.expect("kg_query restored");
+        assert!(
+            after.iter().any(|r| r.target_id == b_id),
+            "archive_restore must re-project the restored A->B edge into AGE"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM memories WHERE namespace = $1")
+            .bind(&ns)
+            .execute(&store.pool)
+            .await;
+        let _ = sqlx::query(
+            "DELETE FROM archived_memory_links WHERE source_id = $1 OR target_id = $1",
+        )
+        .bind(&a_id)
+        .execute(&store.pool)
+        .await;
     }
 
     /// #2196 (data-integrity archive-parity) — postgres twin of the sqlite
