@@ -867,7 +867,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // at-rest seal helper — the helper + per-funnel seal block, the added
     // `encrypted_envelope` INSERT column + bind, and each upsert funnel's ON
     // CONFLICT arm land the file at 28_736. Ceiling 28_600 -> 28_800 (+64).
-    ("src/store/postgres.rs", 28_800),
+    // 2026-07-21 (#2303): pin the federation-send-decrypts invariant —
+    // load-bearing comments on `row_to_memory`'s decrypt branch and the
+    // `list_memories_updated_since` federation-send-path section header
+    // (see tests/store_parity_gaps.rs::pg_list_memories_updated_since_decrypts_for_send_2303)
+    // land the file at 28_810. Ceiling 28_800 -> 28_900 (+90 headroom).
+    ("src/store/postgres.rs", 28_900),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
