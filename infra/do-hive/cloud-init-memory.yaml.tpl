@@ -5,16 +5,20 @@
 # #1842 fix (v0.8.1): the prior template installed postgresql-16 but never
 # installed pgvector and never built Apache AGE (AGE is source-only -- not an
 # apt package -- and `CREATE EXTENSION age` failed). It also used the invalid
-# `--bind` flag. This template installs pgvector (apt), builds AGE from source
+# `--bind` flag. This template installs pgvector, builds AGE from source
 # against pg16, preloads AGE, creates the db + both extensions, and runs serve
 # with the correct `--host/--port` flags + a postgres `--store-url`.
+#
+# #2293 fix (v1.0.0): the noble apt package `postgresql-16-pgvector` pins
+# pgvector 0.6.0, below the daemon's tested 0.7.x-0.8.x range (the v0.9.0 GA
+# reference round certified 0.8.4). pgvector is now built from source, same
+# as AGE, pinned to the certified v0.8.4 tag.
 #
 # All provisioning is logged to /var/log/ai-memory-provision.log for SSH triage.
 package_update: true
 package_upgrade: false
 packages:
   - postgresql-16
-  - postgresql-16-pgvector
   - postgresql-server-dev-16
   - build-essential
   - flex
@@ -59,6 +63,17 @@ write_files:
       mkdir -p /opt/ai-memory/bin /var/log/ai-memory
       chown -R aimemory:aimemory /opt/ai-memory /var/log/ai-memory
 
+      # --- build + install pgvector from source against pg16 (#2293) ---
+      # The noble apt package pins 0.6.0, below the tested 0.7.x-0.8.x range.
+      # Pin to the v0.9.0 GA-certified v0.8.4 tag instead.
+      if [ ! -f "$(/usr/bin/pg_config --pkglibdir)/vector.so" ]; then
+        rm -rf /opt/pgvector-src
+        git clone --branch v0.8.4 --depth 1 https://github.com/pgvector/pgvector.git /opt/pgvector-src
+        cd /opt/pgvector-src
+        make PG_CONFIG=/usr/bin/pg_config
+        make install PG_CONFIG=/usr/bin/pg_config
+      fi
+
       # --- build + install Apache AGE from source against pg16 ---
       # AGE is source-only. master supports PG16; pin the PG16 release branch.
       if [ ! -f "$(/usr/bin/pg_config --pkglibdir)/age.so" ]; then
@@ -84,6 +99,7 @@ write_files:
       sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='aimemory'" | grep -q 1 || \
         sudo -u postgres psql -c "CREATE DATABASE aimemory OWNER aimemory;"
       sudo -u postgres psql -d aimemory -c "CREATE EXTENSION IF NOT EXISTS vector;"
+      sudo -u postgres psql -d aimemory -c "ALTER EXTENSION vector UPDATE;" || true
       sudo -u postgres psql -d aimemory -c "CREATE EXTENSION IF NOT EXISTS age;"
       sudo -u postgres psql -d aimemory -c "GRANT ALL ON SCHEMA ag_catalog TO aimemory;" || true
       sudo -u postgres psql -d aimemory -c "SELECT extname, extversion FROM pg_extension WHERE extname IN ('vector','age');"
