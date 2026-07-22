@@ -340,9 +340,16 @@ fn redact_pem_blocks(content: &str) -> String {
             .nth(1)
             .map(|(i, _)| i)
         {
+            // `block_end` is REST-relative (`begin` indexes into `rest`,
+            // `footer_rel` into `after_begin = &rest[begin..]`), so the scan
+            // must advance within `rest` — NOT re-slice the original
+            // `content` (FBL-16: re-basing to `content` reproduced the same
+            // tail on the 2nd equal-length block, looping forever). Each
+            // iteration strictly shrinks `rest` by `block_end > 0` bytes,
+            // so the scan is bounded O(len).
             let block_end = begin + footer_rel + PEM_END_MARKER.len();
             out.push_str(REDACTION_PLACEHOLDER);
-            rest = &content[block_end..];
+            rest = &rest[block_end..];
         } else {
             // No clean footer — redact the remainder from BEGIN.
             out.push_str(REDACTION_PLACEHOLDER);
@@ -765,5 +772,150 @@ mod tests {
         let k = kinds_of(c);
         // github appears twice but is deduped; sorted order.
         assert_eq!(k, vec![KIND_AWS_ACCESS_KEY, KIND_GITHUB_TOKEN]);
+    }
+
+    // ── FBL-16 regression: multi-PEM-block scan must terminate ──────────
+    //
+    // Pre-fix, `redact_pem_blocks` applied a rest-relative offset to the
+    // ORIGINAL `content` slice when advancing past a redacted block, so any
+    // content with 2+ equal-length PEM private-key blocks reproduced the
+    // identical `rest` forever — an infinite loop on the default caller
+    // write path (screen_for_caller runs on every store). Every hang-prone
+    // case below runs the screen on a worker thread and bounds it with
+    // `recv_timeout` so a regression FAILS (loudly) instead of wedging the
+    // test suite.
+
+    /// Timeout budget for the bounded-termination tests. Generous vs. the
+    /// microseconds the fixed O(n) scan needs, tight vs. a real hang.
+    const PEM_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// One synthetic PEM private-key block. `body` varies the payload so
+    /// tests can cover equal-length AND unequal-length block sequences.
+    fn pem_key_block(body: &str) -> String {
+        format!("-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----")
+    }
+
+    /// Run `screen` on a worker thread with a hang bound; returns the
+    /// redacted content (or the input for a Clean outcome).
+    fn redacted_of_bounded(content: &str) -> String {
+        let owned = content.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out = match screen(&owned) {
+                ScreenOutcome::Clean => owned,
+                ScreenOutcome::Hit { redacted, .. } => redacted,
+            };
+            // A send after the receiver timed out is fine — ignore it.
+            let _ = tx.send(out);
+        });
+        rx.recv_timeout(PEM_SCAN_TIMEOUT)
+            .expect("FBL-16 regression: redact_pem_blocks failed to terminate within the bound")
+    }
+
+    #[test]
+    fn fbl16_two_equal_adjacent_pem_blocks_terminate_and_redact() {
+        // Two EQUAL-LENGTH blocks back-to-back — the exact non-advancing
+        // cursor shape that looped forever pre-fix.
+        let block = pem_key_block("AAAAAAAA");
+        let c = format!("{block}{block}");
+        let r = redacted_of_bounded(&c);
+        assert_eq!(
+            r.matches(REDACTION_PLACEHOLDER).count(),
+            2,
+            "both blocks redacted: {r}"
+        );
+        assert!(!r.contains("AAAAAAAA"), "no key bytes survive: {r}");
+        assert!(!r.contains(PEM_BEGIN_MARKER), "no marker survives: {r}");
+    }
+
+    #[test]
+    fn fbl16_two_separated_pem_blocks_preserve_surrounding_text() {
+        let c = format!(
+            "prefix\n{}\nmiddle\n{}\nsuffix",
+            pem_key_block("AAAAAAAA"),
+            pem_key_block("AAAAAAAA")
+        );
+        let r = redacted_of_bounded(&c);
+        assert_eq!(r.matches(REDACTION_PLACEHOLDER).count(), 2, "{r}");
+        assert!(!r.contains("AAAAAAAA"), "{r}");
+        assert!(
+            r.contains("prefix") && r.contains("middle") && r.contains("suffix"),
+            "benign text between blocks survives: {r}"
+        );
+    }
+
+    #[test]
+    fn fbl16_three_and_many_pem_blocks_all_redacted() {
+        // 3 blocks with distinct bodies (unequal lengths), then N=8 blocks
+        // mixing adjacent and separated placements.
+        let c3 = format!(
+            "{} a {} b {}",
+            pem_key_block("SHORT"),
+            pem_key_block("MEDIUMMEDIUMMEDIUM"),
+            pem_key_block("LONGLONGLONGLONGLONGLONGLONGLONG")
+        );
+        let r3 = redacted_of_bounded(&c3);
+        assert_eq!(r3.matches(REDACTION_PLACEHOLDER).count(), 3, "{r3}");
+        assert!(!r3.contains("SHORT") && !r3.contains("MEDIUM") && !r3.contains("LONG"));
+
+        let n = 8;
+        let mut cn = String::new();
+        for i in 0..n {
+            cn.push_str(&pem_key_block(&format!("KEYBODY{i:02}")));
+            if i % 2 == 0 {
+                cn.push_str("\nsep\n"); // alternate separated / adjacent
+            }
+        }
+        let rn = redacted_of_bounded(&cn);
+        assert_eq!(rn.matches(REDACTION_PLACEHOLDER).count(), n, "{rn}");
+        assert!(!rn.contains("KEYBODY"), "no key bytes survive: {rn}");
+    }
+
+    #[test]
+    fn fbl16_benign_pem_certificate_untouched() {
+        // PEM-looking NON-key content: no `PRIVATE KEY-----` marker, so the
+        // screen never fires and the content passes through untouched.
+        let c = "-----BEGIN CERTIFICATE-----\nMIIBcert+payload/AAAA\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nMIIBcert+payload/BBBB\n-----END CERTIFICATE-----";
+        assert_eq!(screen(c), ScreenOutcome::Clean, "cert-only PEM must pass");
+    }
+
+    #[test]
+    fn fbl16_fuzz_interleaved_partial_begin_markers_no_hang() {
+        // Fuzz-style adversarial shapes: real key blocks interleaved with
+        // PARTIAL / dangling BEGIN markers, header-only fragments, and
+        // marker-adjacent noise. Assert bounded termination + no key bytes
+        // surviving; exact placeholder placement is the fallback branch's
+        // concern, not this test's.
+        let cases = [
+            // Dangling BEGIN before a full block.
+            format!("-----BEGIN {}", pem_key_block("FUZZBODY1")),
+            // Full block, then a header-only fragment (1 END marker — hits
+            // the truncated-paste fallback).
+            format!(
+                "{}\n-----BEGIN EC PRIVATE KEY-----\ntruncated",
+                pem_key_block("FUZZBODY2")
+            ),
+            // Partial BEGIN markers between two full equal blocks.
+            format!(
+                "-----BEGIN\n{}\n-----BEGIN NOISE\n{}\n-----BEGIN",
+                pem_key_block("FUZZBODY3"),
+                pem_key_block("FUZZBODY3")
+            ),
+            // Marker soup: repeated BEGIN fragments with no END at all.
+            "-----BEGIN -----BEGIN -----BEGIN PRIVATE KEY-----".repeat(5),
+            // Adjacent equal blocks wrapped in partial markers on both ends.
+            format!(
+                "-----BEGIN{}{}-----BEGIN",
+                pem_key_block("FUZZBODY4"),
+                pem_key_block("FUZZBODY4")
+            ),
+        ];
+        for (i, c) in cases.iter().enumerate() {
+            let r = redacted_of_bounded(c);
+            assert!(
+                !r.contains("FUZZBODY"),
+                "case {i}: key bytes must not survive: {r}"
+            );
+        }
     }
 }
