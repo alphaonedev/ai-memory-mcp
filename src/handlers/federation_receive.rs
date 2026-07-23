@@ -2441,7 +2441,7 @@ pub async fn sync_push(
             "namespace_meta_applied": namespace_meta_applied,
             "namespace_meta_cleared": namespace_meta_cleared,
             "noop": noop,
-            "skipped": skipped,
+            (crate::handlers::SKIPPED_FIELD): skipped,
             (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
             "dry_run": body.dry_run,
             "receiver_agent_id": local_agent_id,
