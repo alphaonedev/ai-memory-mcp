@@ -228,7 +228,7 @@ fn stored_expiry(conn: &Connection, id: &str) -> Option<String> {
 /// A FUTURE expiry supplied in a negative-offset RFC3339 rendering sorts
 /// lexicographically BELOW a UTC-rendered `now` (the pre-fix premature-GC
 /// shape). The insert funnel must canonicalize it to the fixed-UTC form so
-/// the same instant survives gc() and the byte order is chronological.
+/// the same instant survives `gc()` and the byte order is chronological.
 #[test]
 fn fbl02_insert_canonicalizes_offset_expiry_and_gc_does_not_reap() {
     let conn = fresh_sqlite();
@@ -265,7 +265,7 @@ fn fbl02_insert_canonicalizes_offset_expiry_and_gc_does_not_reap() {
 }
 
 /// The inverse hazard: an EXPIRED instant in a positive-offset rendering
-/// byte-sorts ABOVE `now` (pre-fix over-retention). Canonicalized, gc()
+/// byte-sorts ABOVE `now` (pre-fix over-retention). Canonicalized, `gc()`
 /// reaps it on schedule.
 #[test]
 fn fbl02_insert_canonicalizes_positive_offset_expired_row_so_gc_reaps() {
@@ -386,7 +386,7 @@ fn priority_of(conn: &Connection, id: &str) -> i64 {
     .expect("row")
 }
 
-/// The touch decade ladder stops at ACCESS_PRIORITY_CEILING and never
+/// The touch decade ladder stops at `ACCESS_PRIORITY_CEILING` and never
 /// touches rows already in the operator band (8-10).
 #[test]
 fn fbl34_touch_decade_bump_caps_at_access_ceiling() {
@@ -660,7 +660,7 @@ fn fed_mem(title: &str, updated_at: &str, expires_at: &str) -> Memory {
     }
 }
 
-/// A STALE losing peer (older updated_at) must not shorten the local
+/// A STALE losing peer (older `updated_at`) must not shorten the local
 /// row's expiry — pre-fix the bare COALESCE adopted it verbatim and GC
 /// reaped the live row early.
 #[test]
@@ -691,9 +691,9 @@ fn fbl20_stale_loser_push_cannot_shorten_local_expiry() {
     );
 }
 
-/// Even a WINNING peer (newer updated_at) with an EARLIER expiry keeps
-/// the local later expiry — recall fold-extensions raise expires_at
-/// without bumping updated_at, so the extension floor must hold across
+/// Even a WINNING peer (newer `updated_at`) with an EARLIER expiry keeps
+/// the local later expiry — recall fold-extensions raise `expires_at`
+/// without bumping `updated_at`, so the extension floor must hold across
 /// federation (the merge is the MAX lattice join, convergent both ways).
 #[test]
 fn fbl20_winning_peer_with_earlier_expiry_keeps_local_extension() {
