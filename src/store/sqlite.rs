@@ -2637,17 +2637,22 @@ mod tests {
         let ctx = CallerContext::for_agent("alice");
         let m = test_memory("exp-1634", "expiry-thread fixture body");
         store.store(&ctx, &m).await.expect("store");
-        let want = "2027-01-01T00:00:00+00:00";
+        let caller_input = "2027-01-01T00:00:00+00:00";
         let patch = UpdatePatch {
-            expires_at: Some(want.to_string()),
+            expires_at: Some(caller_input.to_string()),
             ..Default::default()
         };
         store.update(&ctx, &m.id, patch).await.expect("update");
         let got = store.get(&ctx, &m.id).await.expect("get");
+        // #2332 (FBL-02): the update funnel canonicalizes expires_at to the
+        // fixed-UTC rendering, so the row holds the canonical form of the
+        // caller's instant — same instant, canonical bytes.
+        let want = crate::validate::canonicalize_valid_time(caller_input)
+            .expect("caller input is valid RFC3339");
         assert_eq!(
             got.expires_at.as_deref(),
-            Some(want),
-            "#1634: patch.expires_at must reach the row"
+            Some(want.as_str()),
+            "#1634: patch.expires_at must reach the row (canonicalized per #2332)"
         );
     }
 
