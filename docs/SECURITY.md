@@ -39,13 +39,17 @@ capabilities:
    cryptographically attested one, and keep the mTLS peer allowlist tight.
    (Store-path agent attestation — #626 Layer-3 — upgrades *directly
    authored* CLI/MCP/HTTP writes to `agent_attested` when a valid Ed25519
-   signature is presented; since v0.9 the store-path default now
-   REQUIRES attestation (#1751): an unsigned direct CLI/MCP/HTTP write
-   is REJECTED (`403 ATTESTATION_FAILED`) unless the operator sets
-   `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`, restoring the pre-v0.9
-   permissive posture. This is the flip promised by the v0.8.0
-   one-cycle deprecation WARN. The federation **receive** path remains
-   claimed-by-default —
+   signature is presented. The store-path default is **surface-scoped**
+   (#1985, v1.0.0, correcting the v0.9.0 #1751 blanket posture): an
+   unsigned direct **HTTP** write is REJECTED (`403 ATTESTATION_FAILED`)
+   by default (fail-closed — an unauthenticated network client is not
+   the operator), but unsigned **CLI**/**MCP** writes stay PERMISSIVE by
+   default (operator-as-actor — the human at the shell / the MCP host
+   IS the operator and has no way to construct/sign the canonical
+   envelope) and land `claimed`. Setting
+   `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` forces strict enforcement on
+   every surface (the old v0.9.0 posture); `=0` forces permissive
+   everywhere. The federation **receive** path remains claimed-by-default —
    per-write *cryptographic* attestation of synced memories needs a
    wire-protocol extension (sender signs each row, receiver verifies) and
    is tracked under Pillar-3 #1719; mTLS + the per-memory authorship

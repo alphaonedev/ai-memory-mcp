@@ -29,7 +29,7 @@ The substrate-as-cortex promise — "the place I write what I learn so I can be 
 
 ### Why scraping the transcript is the wrong layer
 
-The recover-on-boot mechanism (`recover-previous-session` CLI + `memory_recover_previous_session` MCP tool — see L2 of `#1389`) closes the failure for hosts that write transcripts to a known filesystem location. But it couples the substrate to the host's internal transcript format. Claude Code's JSONL format has already drifted between versions; Codex CLI and Gemini CLI have their own shapes; future hosts may not write transcripts at all. Maintenance burden compounds linearly with host count and per-host versions.
+The recover-on-boot mechanism (`recover-previous-session` CLI, CLI-only — see L2 of `#1389`) closes the failure for hosts that write transcripts to a known filesystem location. But it couples the substrate to the host's internal transcript format. Claude Code's JSONL format has already drifted between versions; Codex CLI and Gemini CLI have their own shapes; future hosts may not write transcripts at all. Maintenance burden compounds linearly with host count and per-host versions.
 
 The correct architectural layer is the protocol: the host pushes each turn to subscribing substrates as part of normal MCP flow, the substrate stores it idempotently. No filesystem scraping. No version drift coupling. Hosts that adopt get clean capture; substrates that adopt get a uniform turn surface across all participating hosts.
 

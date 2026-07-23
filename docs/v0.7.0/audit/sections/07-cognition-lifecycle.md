@@ -221,7 +221,7 @@ ungracefully between turns.
 
 | Capability | Provenance | Notes |
 |---|---|---|
-| Canonical handler | `src/recover/mod.rs:261` `recover_from_transcript` | Dual surface: CLI `recover-previous-session` + MCP `memory_recover_previous_session`. Never panics; errors surface via `RecoverReport.errors` so a SessionStart hook can't wedge boot (`:246-249`). |
+| Canonical handler | `src/recover/mod.rs:261` `recover_from_transcript` | CLI-only surface: `recover-previous-session` (no MCP-tool counterpart was ever registered — corrected post-hoc, see Grok W1A4-01). Never panics; errors surface via `RecoverReport.errors` so a SessionStart hook can't wedge boot (`:246-249`). |
 | `RecoverReport` wire shape | `src/recover/mod.rs:43-93` | Per-phase elapsed-ms, lines total/atomised/skipped-dedup/skipped-limit, memories_created, `fast_path_hit`, `schema_version_at_run`. |
 | `DEFAULT_RECOVER_LIMIT` | `src/recover/mod.rs:169` | `100` lines/run (bounds SessionStart latency). |
 | `QUIET_MEMORY_ID_PREVIEW_CAP` | `src/recover/mod.rs:176` | `10` — caps echoed IDs in `--quiet`. |
