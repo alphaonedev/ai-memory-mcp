@@ -72,8 +72,15 @@ fn make_memory(title: &str, ns: &str, tier: Tier) -> Memory {
 fn archive_preserves_embedding_and_tier_on_restore() {
     let conn = open_test_db();
     let mut mem = make_memory("integrity-G5", "p2/test", Tier::Mid);
-    let stored_expires_at = mem.expires_at.clone();
     db::insert(&conn, &mem).expect("insert");
+    // FBL-02 (#2332) canonicalizes `expires_at` on store, so the persisted rendering
+    // may differ from the raw pre-canonical input; capture the actually-persisted value
+    // as the round-trip baseline so archive->restore preservation is asserted against
+    // what the DB holds (instant-preserving), not the raw input string.
+    let stored_expires_at = db::get(&conn, &mem.id)
+        .expect("get after insert")
+        .expect("row present")
+        .expires_at;
 
     // Set an embedding so we can verify it round-trips through the archive.
     let embedding: Vec<f32> = (0..8).map(|i| (i as f32) * 0.125).collect();
