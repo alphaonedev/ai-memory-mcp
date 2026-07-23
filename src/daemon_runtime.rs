@@ -3362,6 +3362,76 @@ fn spawn_postgres_fold_loop_if_enabled(
     }
 }
 
+/// FBL-22 (v1.0.0) — postgres-backed `serve` had NO periodic maintenance: the
+/// gc / archive-purge / lease-sweep loops spawned by `bootstrap_serve` all bind
+/// the local sqlite `Db` mutex and call rusqlite free-functions, so on a
+/// `--store-url postgres://…` daemon they ticked against the placeholder sqlite
+/// DB while the pg corpus's expired rows / stale archives / expired leases
+/// accumulated unbounded (the CLAUDE.md "GC runs every 30 minutes; expired
+/// memories are archived before deletion" contract was silently false on pg).
+/// Only `spawn_postgres_fold_loop_if_enabled` had a pg twin.
+///
+/// This spawns the pg maintenance loop (mirroring the sqlite serve bootstrap)
+/// so the SAL trait methods that already exist —
+/// [`crate::store::MemoryStore::run_gc`],
+/// [`crate::store::MemoryStore::archive_purge`], and
+/// [`crate::store::MemoryStore::lease_sweep_expired`] — are driven on the
+/// `GC_INTERVAL_SECS` cadence. Paced + resumable (one chunked pass per tick per
+/// the fleet-manageability doctrine); a failure of any leg is WARNed and never
+/// aborts the loop (degrade, never corrupt). Fold-before-gc parity with the
+/// sqlite loop + the admin HTTP path (`handlers::admin`): the recall-access
+/// fold runs first so an unfolded TTL extension is applied before eviction is
+/// evaluated. Spawns onto `task_handles` only for the postgres backend; the
+/// backend/gate decision is split out of `bootstrap_serve` (mirroring
+/// `spawn_postgres_fold_loop_if_enabled`) so it is unit-testable with any
+/// `MemoryStore` without a live-PG boot.
+#[cfg(feature = "sal")]
+fn spawn_postgres_maintenance_loop_if_enabled(
+    task_handles: &mut Vec<JoinHandle<()>>,
+    backend: crate::handlers::StorageBackend,
+    store: &std::sync::Arc<dyn crate::store::MemoryStore>,
+    archive_on_gc: bool,
+    archive_max_days: Option<i64>,
+) {
+    if !matches!(backend, crate::handlers::StorageBackend::Postgres) {
+        return;
+    }
+    let store = store.clone();
+    task_handles.push(tokio::spawn(async move {
+        let interval = Duration::from_secs(GC_INTERVAL_SECS);
+        // Admin/bypass context so archive-purge covers every owner's stale
+        // archives (mirrors the unscoped sqlite `db::auto_purge_archive`).
+        let admin =
+            crate::store::CallerContext::for_admin(crate::identity::sentinels::DAEMON_PRINCIPAL);
+        loop {
+            tokio::time::sleep(interval).await;
+            // Fold-before-gc (pg twin of the sqlite loop): apply pending
+            // recall-access TTL extensions before evaluating eviction.
+            if let Err(e) = store.fold_recall_accesses().await {
+                tracing::warn!("pg-maint: recall-access fold failed (pre-gc): {e}");
+            }
+            match store.run_gc(archive_on_gc).await {
+                Ok(n) if n > 0 => tracing::info!("pg-maint: expired {n} memories"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("pg-maint: run_gc failed: {e}"),
+            }
+            match store.archive_purge(&admin, archive_max_days).await {
+                Ok(n) if n > 0 => {
+                    tracing::info!("pg-maint: purged {n} old archived memories");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("pg-maint: archive_purge failed: {e}"),
+            }
+            let now = chrono::Utc::now().timestamp();
+            match store.lease_sweep_expired(now).await {
+                Ok(n) if n > 0 => tracing::info!("pg-maint: reclaimed {n} expired leases"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("pg-maint: lease_sweep_expired failed: {e}"),
+            }
+        }
+    }));
+}
+
 /// v1.0.0 #2167 (S5/S6) — open a private boot connection and run the sqlite
 /// embedding-space adoption/census (`db::embedding_space_boot_maintenance`).
 /// Split out of `bootstrap_serve` (mirrors `spawn_postgres_fold_loop_if_enabled`)
@@ -5882,6 +5952,24 @@ pub async fn bootstrap_serve(
         &app_state.store,
         fold_interval_secs,
     );
+
+    // FBL-22 (v1.0.0) — postgres serve maintenance loop (gc + archive-purge +
+    // lease-sweep). The sqlite gc/lease/pending loops above all bind the local
+    // sqlite `Db` mutex, so a `--store-url postgres://…` daemon never reaped
+    // expired rows / stale archives / expired leases on its pg corpus (the
+    // CLAUDE.md GC contract was silently false on postgres). This drives the
+    // existing SAL trait methods on the pg backend at the same GC cadence.
+    #[cfg(feature = "sal")]
+    {
+        let pg_archive_on_gc = { db_state.lock().await.3 };
+        spawn_postgres_maintenance_loop_if_enabled(
+            &mut task_handles,
+            app_state.storage_backend,
+            &app_state.store,
+            pg_archive_on_gc,
+            app_config.archive_max_days,
+        );
+    }
 
     // v0.6.0 GA: periodic WAL checkpoint. Under continuous writes the WAL
     // file grows until SQLite's auto-checkpoint fires (every 1000 pages by
@@ -8828,6 +8916,57 @@ mod tests {
         assert!(
             handles.is_empty(),
             "the sqlite backend does not spawn the SAL fold loop"
+        );
+    }
+
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn spawn_postgres_maintenance_loop_if_enabled_spawns_for_postgres_backend() {
+        // FBL-22 — the backend TAG is independent of the store type, so a cheap
+        // real sqlite store stands in (no postgres connection). The loop is
+        // aborted before its first GC_INTERVAL_SECS tick.
+        let env = TestEnv::fresh();
+        let store: std::sync::Arc<dyn crate::store::MemoryStore> = std::sync::Arc::new(
+            crate::store::sqlite::SqliteStore::open(&env.db_path).expect("open sqlite store"),
+        );
+        let mut handles: Vec<JoinHandle<()>> = Vec::new();
+        spawn_postgres_maintenance_loop_if_enabled(
+            &mut handles,
+            crate::handlers::StorageBackend::Postgres,
+            &store,
+            true,
+            Some(90),
+        );
+        assert_eq!(
+            handles.len(),
+            1,
+            "postgres backend spawns the SAL maintenance loop"
+        );
+        for h in handles {
+            h.abort();
+        }
+    }
+
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn spawn_postgres_maintenance_loop_if_enabled_skips_for_sqlite_backend() {
+        // FBL-22 — sqlite already has the under-lock gc/archive/lease loops, so
+        // the SAL maintenance loop must NOT double-spawn on the sqlite backend.
+        let env = TestEnv::fresh();
+        let store: std::sync::Arc<dyn crate::store::MemoryStore> = std::sync::Arc::new(
+            crate::store::sqlite::SqliteStore::open(&env.db_path).expect("open sqlite store"),
+        );
+        let mut handles: Vec<JoinHandle<()>> = Vec::new();
+        spawn_postgres_maintenance_loop_if_enabled(
+            &mut handles,
+            crate::handlers::StorageBackend::Sqlite,
+            &store,
+            true,
+            None,
+        );
+        assert!(
+            handles.is_empty(),
+            "the sqlite backend does not spawn the SAL maintenance loop"
         );
     }
 
