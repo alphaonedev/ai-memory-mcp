@@ -1177,7 +1177,30 @@ impl VectorIndex {
             Err(poisoned) => poisoned.into_inner(),
         };
         state.all_entries.retain(|(eid, _)| eid != id);
+        let overflow_len_before = state.overflow.len();
         state.overflow.retain(|(eid, _)| eid != id);
+        // v1.0.0 FBL-05 — bump the overflow generation whenever a remove
+        // actually drops an entry from `overflow`. `try_swap_warming` trims
+        // overflow by COUNT (`drain(..overflow_at_snapshot)`), assuming the
+        // first N entries are exactly the snapshot-covered ones now in the
+        // rebuilt graph. A `retain` that removes an entry from within that
+        // covered prefix SHIFTS every later overflow entry left by one, so a
+        // positional drain would reap a post-snapshot insert that is NOT in
+        // the new graph — silently dropping it from BOTH overflow and the
+        // graph (a searchability data-loss), while `is_fully_searchable`
+        // still reads true because `graph_entry_count` counts the
+        // removed-but-in-graph entry. Bumping the generation makes the
+        // in-flight rebuild's snapshot detected as stale at swap time
+        // (`result.overflow_generation != state.overflow_generation`), so the
+        // warming result is DROPPED without draining and the next rebuild
+        // captures the post-remove state cleanly — mirroring the eviction
+        // `overflow.clear()` guard (#1074). Only bump when overflow actually
+        // shrank: a remove that touched only `all_entries` (id absent from
+        // overflow) leaves overflow positions intact and must not needlessly
+        // discard a valid in-flight rebuild.
+        if state.overflow.len() != overflow_len_before {
+            state.overflow_generation = state.overflow_generation.wrapping_add(1);
+        }
         // v0.7.0 #1087 — invalidate cached valid_ids set after remove.
         state.valid_ids_cache = None;
         // Note: the HNSW index itself is immutable — removed IDs are filtered
@@ -2475,6 +2498,108 @@ mod d1_968_tests {
         assert!(
             gen_after > gen_initial,
             "eviction-clear path must bump overflow_generation (#1074)"
+        );
+    }
+
+    // v1.0.0 FBL-05 — `remove()` that drops an entry from `overflow` must
+    // bump `overflow_generation` (the same invariant eviction's
+    // `overflow.clear()` upholds). A `retain` that removes an overflow entry
+    // shifts every later overflow position left by one; the positional
+    // `try_swap_warming` drain would then reap a DIFFERENT entry than the
+    // snapshot covered. Only a remove that actually shrinks overflow bumps —
+    // a remove of a graph-only entry (absent from overflow) leaves positions
+    // intact and must NOT needlessly discard an in-flight rebuild.
+    #[test]
+    fn remove_from_overflow_bumps_generation_fbl_05() {
+        let idx = VectorIndex::empty();
+        idx.insert("alpha".to_string(), make_embedding(&[1.0, 0.0, 0.0, 0.0]));
+        idx.insert("beta".to_string(), make_embedding(&[0.0, 1.0, 0.0, 0.0]));
+        let gen_before = idx.inner.lock().unwrap().overflow_generation;
+
+        // Removing an entry PRESENT in overflow shrinks it → generation bumps.
+        idx.remove("alpha");
+        let gen_after_present = idx.inner.lock().unwrap().overflow_generation;
+        assert!(
+            gen_after_present > gen_before,
+            "remove() of an overflow-resident entry must bump overflow_generation (FBL-05)"
+        );
+
+        // Removing an ABSENT id does not touch overflow → generation stable.
+        idx.remove("never-existed");
+        let gen_after_absent = idx.inner.lock().unwrap().overflow_generation;
+        assert_eq!(
+            gen_after_absent, gen_after_present,
+            "remove() of an absent id must NOT bump the generation (no wasted rebuild)"
+        );
+    }
+
+    // v1.0.0 FBL-05 regression — a `remove()` during an in-flight rebuild
+    // must NOT let the double-buffer swap silently drop a post-snapshot
+    // insert. The swap trims overflow POSITIONALLY (`drain(..N)` where N is
+    // the snapshot-time overflow length), assuming the first N entries are
+    // exactly the snapshot-covered ones now in the rebuilt graph. A remove
+    // inside that prefix shifts a post-snapshot insert INTO the drained
+    // window, so a stale swap would reap it from BOTH overflow and the graph.
+    // With the generation guard, the mid-rebuild remove bumps the generation,
+    // the swap detects its snapshot as stale, and DROPS the warming result
+    // without draining — the post-snapshot insert survives (searchable via
+    // the overflow linear scan) and the next rebuild captures cleanly.
+    #[test]
+    fn remove_during_rebuild_does_not_drop_post_snapshot_insert_fbl_05() {
+        let idx = VectorIndex::empty();
+        // `alpha` + `beta` are the snapshot-covered prefix (overflow_at_snapshot
+        // = 2); `gamma` is the post-snapshot insert that is NOT in the graph.
+        idx.insert("alpha".to_string(), make_embedding(&[1.0, 0.0, 0.0, 0.0]));
+        idx.insert("beta".to_string(), make_embedding(&[0.0, 1.0, 0.0, 0.0]));
+        idx.insert("gamma".to_string(), make_embedding(&[0.0, 0.0, 1.0, 0.0]));
+
+        // Capture the generation the (fictional) rebuild snapshot would carry
+        // BEFORE the racing remove — exactly what `rebuild_async` records.
+        let snapshot_generation = idx.inner.lock().unwrap().overflow_generation;
+
+        // A remove() lands mid-rebuild, dropping `alpha` from the snapshot
+        // prefix. `beta` + `gamma` shift left; with the FBL-05 fix the
+        // generation bumps so the snapshot below is now stale.
+        idx.remove("alpha");
+
+        // Park a warming result carrying the PRE-remove snapshot generation +
+        // the snapshot-time overflow length (2) — the shape `rebuild_async`
+        // would have produced had it completed just as the remove landed.
+        {
+            let mut w = idx.warming.lock().unwrap();
+            *w = Some(RebuildResult {
+                hnsw: None,
+                overflow_at_snapshot: 2,
+                overflow_generation: snapshot_generation,
+                entries_in_graph: 2,
+            });
+        }
+
+        // The swap MUST refuse (stale-by-generation) and MUST NOT drain.
+        let swapped = idx.try_swap_warming();
+        assert!(
+            !swapped,
+            "a remove() mid-rebuild must invalidate the snapshot so the swap is dropped (FBL-05)"
+        );
+
+        // `gamma` — the post-snapshot insert — must still be searchable. Under
+        // the pre-fix positional drain it would have been reaped out of
+        // overflow (and it is not in any graph), i.e. silently lost.
+        let hits = idx.search(&make_embedding(&[0.0, 0.0, 1.0, 0.0]), 5);
+        assert!(
+            hits.iter().any(|h| h.id == "gamma"),
+            "the post-snapshot insert must survive a remove-during-rebuild (FBL-05); hits={:?}",
+            hits.iter().map(|h| &h.id).collect::<Vec<_>>()
+        );
+        // `beta` (also shifted by the remove) survives too.
+        assert!(
+            idx.inner
+                .lock()
+                .unwrap()
+                .overflow
+                .iter()
+                .any(|(id, _)| id == "beta"),
+            "beta must remain in overflow (no positional drain occurred)"
         );
     }
 

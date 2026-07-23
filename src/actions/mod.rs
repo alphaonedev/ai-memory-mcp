@@ -452,6 +452,28 @@ pub enum LeaseAcquire {
 /// different holder blocks acquisition (`Conflict`); otherwise the lease is
 /// inserted-or-replaced and re-fetched (`Acquired`).
 ///
+/// # Concurrency (v1.0.0 FBL-06)
+/// The whole acquire is ONE atomic `INSERT ... ON CONFLICT ... DO UPDATE`
+/// statement, NOT a `SELECT`-then-`INSERT OR REPLACE` check-then-act. The
+/// prior two-statement form ran as two independent autocommit statements
+/// with no enclosing transaction, so under WAL two connections sharing one
+/// DB (two MCP stdio processes, or an MCP client + the HTTP daemon — both
+/// documented supported topologies) could interleave the conflict `SELECT`
+/// and each observe "no live conflicting lease", then each `INSERT OR
+/// REPLACE` and BOTH be granted the same single-holder lease. SQLite
+/// executes an upsert as a single statement under the write lock, so
+/// exactly one racer wins (the SQLite analogue of the postgres twin's
+/// `SELECT ... FOR UPDATE`, and the same TOCTOU-closing discipline as
+/// `crate::quotas::check_and_record`'s `BEGIN IMMEDIATE`). The
+/// single-conditional-statement form is used here in preference to a
+/// `BEGIN IMMEDIATE` transaction because both production callers pass a
+/// bare `&Connection` (no outer tx), so a nested `BEGIN` is unavailable —
+/// the atomic upsert is the minimal, allocation-free fix. Data-integrity
+/// note (North Star): a double-grant of a single-holder lease is a
+/// correctness/safety violation (two writers believe they hold exclusive
+/// coordination authority); making the grant atomic fails closed — the
+/// worst case is a spurious `Conflict` a caller retries, never two winners.
+///
 /// # Errors
 /// Propagates the `rusqlite` query/insert error.
 pub fn lease_acquire(
@@ -461,26 +483,30 @@ pub fn lease_acquire(
     now: i64,
     expires_at: i64,
 ) -> rusqlite::Result<LeaseAcquire> {
-    // A non-expired lease held by a different holder blocks acquisition.
-    let existing: Option<(String, i64)> = conn
-        .query_row(
-            "SELECT holder, expires_at FROM leases WHERE action_id = ?1",
-            params![action_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    if let Some((h, exp)) = existing
-        && exp > now
-        && h != holder
-    {
-        return Ok(LeaseAcquire::Conflict);
-    }
-    conn.execute(
-        "INSERT OR REPLACE INTO leases \
+    // The `DO UPDATE` arm's `WHERE` re-derives the acquire predicate against
+    // the EXISTING row (`leases.*` = pre-update values): acquisition is
+    // permitted only when the current lease is EXPIRED (`expires_at <= now`)
+    // OR held by the SAME holder (re-acquire / renew). A live lease held by a
+    // DIFFERENT holder fails the guard, the update is a no-op, and
+    // `changes()` is 0 — the same disposition the old `exp > now && h != holder`
+    // branch produced, now evaluated atomically inside the single statement.
+    let changed = conn.execute(
+        "INSERT INTO leases \
             (action_id, holder, acquired_at, expires_at, heartbeat_at) \
-         VALUES (?1, ?2, ?3, ?4, ?3)",
+         VALUES (?1, ?2, ?3, ?4, ?3) \
+         ON CONFLICT(action_id) DO UPDATE SET \
+            holder = excluded.holder, \
+            acquired_at = excluded.acquired_at, \
+            expires_at = excluded.expires_at, \
+            heartbeat_at = excluded.heartbeat_at \
+         WHERE leases.expires_at <= ?3 OR leases.holder = ?2",
         params![action_id, holder, now, expires_at],
     )?;
+    if changed == 0 {
+        // A non-expired lease is held by a different holder: the `DO UPDATE`
+        // guard rejected the acquire (no row inserted, no row updated).
+        return Ok(LeaseAcquire::Conflict);
+    }
     let lease = conn.query_row(LEASE_SELECT_BY_ID_SQL, params![action_id], row_to_lease)?;
     Ok(LeaseAcquire::Acquired(lease))
 }
@@ -972,5 +998,81 @@ mod tests {
         }
         assert_eq!(sweep_expired_leases(&conn, now).unwrap(), 0);
         assert!(lease_get(&conn, "sweep-1").unwrap().is_some());
+    }
+
+    // v1.0.0 FBL-05/FBL-06 regression: `lease_acquire` must be atomic across
+    // SEPARATE connections to one file-backed (WAL) DB — the documented
+    // supported topology of two MCP stdio processes, or an MCP client + the
+    // HTTP daemon, sharing one `AI_MEMORY_DB`. Pre-fix, the conflict `SELECT`
+    // and the `INSERT OR REPLACE` were two independent autocommit statements
+    // with no enclosing transaction, so N racers could each observe "no live
+    // lease" and each be granted the SAME single-holder lease. The single
+    // conditional `INSERT ... ON CONFLICT ... DO UPDATE` statement runs under
+    // the write lock, so EXACTLY ONE contender wins.
+    #[test]
+    fn lease_acquire_cross_connection_race_single_winner_fbl_06() {
+        use std::sync::{Arc, Barrier};
+
+        // A file-backed DB is REQUIRED — `:memory:` connections do not share
+        // state, so the cross-process contention cannot be reproduced there.
+        // Scratch under a project-local temp dir (never system /tmp).
+        let dir = tempfile::tempdir().expect("temp dir for shared file DB");
+        let db_path = dir.path().join("fbl06_lease_race.db");
+
+        // Seed the action row (the lease FK target) on a writer connection.
+        {
+            let writer = crate::storage::open(&db_path).expect("open writer");
+            create(&writer, &sample("race-1")).expect("create action");
+        }
+
+        const RACERS: usize = 12;
+        let now = 1_700_000_000_i64;
+        let expires_at = now + 60;
+        let barrier = Arc::new(Barrier::new(RACERS));
+        let path = Arc::new(db_path.clone());
+
+        let handles: Vec<_> = (0..RACERS)
+            .map(|i| {
+                let barrier = Arc::clone(&barrier);
+                let path = Arc::clone(&path);
+                std::thread::spawn(move || {
+                    // Each racer opens its OWN connection to the shared file.
+                    let conn = crate::storage::open(path.as_path()).expect("open racer conn");
+                    let holder = format!("holder-{i}");
+                    // Line every racer up so they hit the write path together.
+                    barrier.wait();
+                    // A busy connection may surface `database is locked`
+                    // despite the 5s busy_timeout under extreme contention;
+                    // a returned Err is NOT a second grant (fail-closed), so
+                    // treat it as a non-winner.
+                    match lease_acquire(&conn, "race-1", &holder, now, expires_at) {
+                        Ok(LeaseAcquire::Acquired(lease)) => Some(lease.holder),
+                        Ok(LeaseAcquire::Conflict) | Err(_) => None,
+                    }
+                })
+            })
+            .collect();
+
+        let winners: Vec<String> = handles
+            .into_iter()
+            .filter_map(|h| h.join().expect("racer thread panicked"))
+            .collect();
+
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one racer may win the single-holder lease (FBL-06); winners={winners:?}"
+        );
+
+        // The persisted lease holder MUST equal the sole reported winner —
+        // the acquire and the persisted row agree.
+        let verify = crate::storage::open(&db_path).expect("open verify conn");
+        let persisted = lease_get(&verify, "race-1")
+            .expect("lease_get")
+            .expect("a lease is persisted");
+        assert_eq!(
+            persisted.holder, winners[0],
+            "the persisted holder must be the reported winner"
+        );
     }
 }

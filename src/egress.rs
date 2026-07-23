@@ -128,8 +128,10 @@ impl InferenceEgressMode {
 
     /// Parse a mode token (case-insensitive, trimmed). Accepts `-` / `_`
     /// separator spellings and the `local` synonym for loopback-only.
-    /// An unrecognised token is `None` so the caller can fall through to
-    /// the default with a WARN rather than silently mis-resolving.
+    /// An unrecognised token is `None` so the caller can decide the
+    /// disposition (FBL-14: a SET-but-unrecognised value fails CLOSED to
+    /// [`Self::Deny`], never silently widening egress) rather than
+    /// mis-resolving.
     #[must_use]
     pub fn parse(token: &str) -> Option<Self> {
         match token.trim().to_ascii_lowercase().as_str() {
@@ -142,29 +144,46 @@ impl InferenceEgressMode {
         }
     }
 
-    /// Resolve the posture from [`ENV_INFERENCE_EGRESS`]. An unset var, or
-    /// an unrecognised value, resolves to the compiled default
-    /// [`Self::Allow`] (an unrecognised value additionally logs a one-shot
-    /// WARN — see [`resolve_inference_egress_mode`]).
+    /// Resolve the posture from [`ENV_INFERENCE_EGRESS`]. An UNSET var
+    /// resolves to the compiled default [`Self::Allow`] (byte-identical
+    /// legacy — an operator who never opted in is unaffected). A
+    /// SET-but-UNRECOGNISED value fails CLOSED to [`Self::Deny`] with a
+    /// one-shot WARN (FBL-14 — see [`resolve_inference_egress_mode`]).
     #[must_use]
     pub fn resolve() -> Self {
         resolve_inference_egress_mode()
     }
 }
 
-/// Resolve [`InferenceEgressMode`] from the environment, WARN-ing on an
-/// unrecognised token (fall through to the [`InferenceEgressMode::Allow`]
-/// default). Split from [`InferenceEgressMode::resolve`] so the WARN site
-/// is unambiguous.
+/// Resolve [`InferenceEgressMode`] from the environment.
+///
+/// FBL-14 (v1.0.0, T3 security posture): an unrecognised token no longer
+/// silently WIDENS egress to [`InferenceEgressMode::Allow`]. An operator who
+/// SET `AI_MEMORY_INFERENCE_EGRESS` at all is expressing restriction intent;
+/// a typo (`deny-all`, `denied`, `local-only`, …) must not re-open
+/// memory-content egress to external vendors. The unrecognised-token arm
+/// therefore falls to the MOST-RESTRICTIVE-SAFE posture
+/// [`InferenceEgressMode::Deny`] (fail closed — no inference client is
+/// constructed, so no memory content can leave the host) with a loud one-shot
+/// WARN naming the accepted tokens. This DEGRADES rather than crashes the boot
+/// (the North Star manageability rule for a fleet of trillions of agents — a
+/// single typo'd knob must not crash-loop the daemon; it reduces function
+/// loudly and self-describes so the operator corrects it).
+///
+/// The UNSET arm keeps the byte-identical-legacy [`InferenceEgressMode::Allow`]
+/// default so a deployment that never opted in is unchanged; only a
+/// SET-but-unrecognised value is treated as fail-closed.
 #[must_use]
 pub fn resolve_inference_egress_mode() -> InferenceEgressMode {
     match std::env::var(ENV_INFERENCE_EGRESS) {
         Ok(v) => InferenceEgressMode::parse(&v).unwrap_or_else(|| {
             tracing::warn!(
-                "unrecognised {ENV_INFERENCE_EGRESS} value {v:?} — falling through to \
-                 \"allow\" (expected \"allow\" | \"loopback-only\" | \"deny\")"
+                "unrecognised {ENV_INFERENCE_EGRESS} value {v:?} — refusing to widen \
+                 inference egress on a typo; failing CLOSED to \"deny\" (no memory content \
+                 leaves the host for inference). Set an explicit \
+                 \"allow\" | \"loopback-only\" | \"deny\" to choose the posture."
             );
-            InferenceEgressMode::Allow
+            InferenceEgressMode::Deny
         }),
         Err(_) => InferenceEgressMode::Allow,
     }
@@ -407,6 +426,66 @@ mod tests {
             Some(InferenceEgressMode::Deny)
         );
         assert_eq!(InferenceEgressMode::parse("garbage"), None);
+    }
+
+    // v1.0.0 FBL-14 (T3 security posture) regression: a SET-but-unrecognised
+    // `AI_MEMORY_INFERENCE_EGRESS` value must NOT silently WIDEN egress to
+    // `Allow`. A restriction-intending operator who typos the token (e.g.
+    // `deny-all`, `denied`, `local-only`) must fail CLOSED to the
+    // most-restrictive-safe posture `Deny`, never re-open memory-content
+    // egress to external vendors. The UNSET arm stays byte-identical-legacy
+    // `Allow` so a deployment that never opted in is unaffected.
+    #[test]
+    fn unrecognised_token_fails_closed_to_deny_not_allow_fbl_14() {
+        // Serialize with the crate-canonical env guard so a concurrent
+        // env-reading test cannot observe our mutation.
+        let _guard = crate::config::test_env_lock();
+
+        // Snapshot + restore the prior value so we leave the env pristine.
+        let prior = std::env::var(ENV_INFERENCE_EGRESS).ok();
+        let restore = |prior: &Option<String>| {
+            // SAFETY: serialized by `test_env_lock`; no other thread mutates
+            // the process env concurrently (mirrors the crate's env-test
+            // convention, e.g. `src/config.rs` / `src/security_profile.rs`).
+            match prior {
+                Some(v) => unsafe { std::env::set_var(ENV_INFERENCE_EGRESS, v) },
+                None => unsafe { std::env::remove_var(ENV_INFERENCE_EGRESS) },
+            }
+        };
+
+        // Several plausible typos of a RESTRICTION intent — each must fail
+        // CLOSED to `Deny`, and in particular must NOT resolve to `Allow`.
+        for typo in ["deny-all", "denied", "local-only", "loopbackonly", "xyzzy"] {
+            // SAFETY: serialized by `test_env_lock` (see above).
+            unsafe { std::env::set_var(ENV_INFERENCE_EGRESS, typo) };
+            let resolved = resolve_inference_egress_mode();
+            assert_eq!(
+                resolved,
+                InferenceEgressMode::Deny,
+                "unrecognised token {typo:?} must fail CLOSED to Deny (FBL-14)"
+            );
+            assert_ne!(
+                resolved,
+                InferenceEgressMode::Allow,
+                "unrecognised token {typo:?} must NEVER widen to Allow (FBL-14)"
+            );
+        }
+
+        // A recognised token still resolves normally (the typo path is the
+        // only behaviour change).
+        // SAFETY: serialized by `test_env_lock` (see above).
+        unsafe { std::env::set_var(ENV_INFERENCE_EGRESS, "loopback-only") };
+        assert_eq!(
+            resolve_inference_egress_mode(),
+            InferenceEgressMode::LoopbackOnly
+        );
+
+        // The UNSET arm keeps the byte-identical-legacy Allow default.
+        // SAFETY: serialized by `test_env_lock` (see above).
+        unsafe { std::env::remove_var(ENV_INFERENCE_EGRESS) };
+        assert_eq!(resolve_inference_egress_mode(), InferenceEgressMode::Allow);
+
+        restore(&prior);
     }
 
     #[test]
