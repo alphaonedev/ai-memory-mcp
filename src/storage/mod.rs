@@ -1996,10 +1996,12 @@ pub fn touch(conn: &Connection, id: &str, short_extend: i64, mid_extend: i64) ->
             params![now_str, id, PROMOTION_THRESHOLD],
         )?;
 
+        // v1.0.0 #2339 (FBL-34) — access-driven bumps stop at the named
+        // ceiling; rows already above it (operator band 8-10) are untouched.
         conn.execute(
-            "UPDATE memories SET priority = MIN(priority + 1, 10)
-             WHERE id = ?1 AND access_count > 0 AND access_count % 10 = 0 AND priority < 10",
-            params![id],
+            "UPDATE memories SET priority = MIN(priority + 1, ?2)
+             WHERE id = ?1 AND access_count > 0 AND access_count % 10 = 0 AND priority < ?2",
+            params![id, crate::models::ACCESS_PRIORITY_CEILING],
         )?;
 
         Ok(())
@@ -2100,14 +2102,16 @@ pub fn touch_many(
             "UPDATE memories SET tier = 'long', expires_at = NULL, updated_at = ?1
              WHERE id = ?2 AND tier = 'mid' AND access_count >= ?3",
         )?;
+        // v1.0.0 #2339 (FBL-34) — access-driven bumps stop at the named
+        // ceiling; rows already above it (operator band 8-10) are untouched.
         let mut priority_stmt = conn.prepare_cached(
-            "UPDATE memories SET priority = MIN(priority + 1, 10)
-             WHERE id = ?1 AND access_count > 0 AND access_count % 10 = 0 AND priority < 10",
+            "UPDATE memories SET priority = MIN(priority + 1, ?2)
+             WHERE id = ?1 AND access_count > 0 AND access_count % 10 = 0 AND priority < ?2",
         )?;
         for id in ids {
             bump_stmt.execute(params![now_str, short_expires, mid_expires, id])?;
             promote_stmt.execute(params![now_str, id, PROMOTION_THRESHOLD])?;
-            priority_stmt.execute(params![id])?;
+            priority_stmt.execute(params![id, crate::models::ACCESS_PRIORITY_CEILING])?;
         }
         Ok(())
     })();
@@ -2227,11 +2231,16 @@ pub fn fold_recall_accesses(
             // maintenance verb applying metadata-only access
             // bookkeeping (the same sanction class as the legacy
             // touch); they never rewrite memory content.
-            let mut bump_stmt = conn.prepare_cached(
+            // v1.0.0 #2339 (FBL-34) — the fold's decade bump stops at the
+            // named ceiling; rows already above it (operator band 8-10)
+            // keep their priority byte-identical.
+            let mut bump_stmt = conn.prepare_cached(&format!(
                 "UPDATE memories SET
                     access_count = MIN(access_count + ?1, 1000000),
-                    priority = MIN(priority
-                        + (MIN(access_count + ?1, 1000000) / 10 - access_count / 10), 10),
+                    priority = CASE WHEN priority >= {ceiling} THEN priority
+                        ELSE MIN(priority
+                            + (MIN(access_count + ?1, 1000000) / 10 - access_count / 10),
+                            {ceiling}) END,
                     last_accessed_at = CASE
                         WHEN last_accessed_at IS NULL OR last_accessed_at < ?2 THEN ?2
                         ELSE last_accessed_at
@@ -2243,7 +2252,8 @@ pub fn fold_recall_accesses(
                         ELSE expires_at
                     END
                  WHERE id = ?5",
-            )?;
+                ceiling = crate::models::ACCESS_PRIORITY_CEILING,
+            ))?;
             let mut promote_stmt = conn.prepare_cached(
                 "UPDATE memories SET tier = 'long', expires_at = NULL, updated_at = ?1
                  WHERE id = ?2 AND tier = 'mid' AND access_count >= ?3",
@@ -12157,9 +12167,15 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
                     -- the metadata carrier, vocab-guarded to the closed
                     -- #1945 set (the import-funnel re-denorm precedent).
                     COALESCE(kind_provenance,
-                             CASE WHEN json_extract(metadata, '$.kind_provenance')
-                                       IN ('declared', 'channel_derived', 'regex', 'llm')
-                                  THEN json_extract(metadata, '$.kind_provenance')
+                             -- json_valid guard: a corrupt (non-JSON)
+                             -- archived metadata blob must not abort the
+                             -- restore (json_extract raises on malformed
+                             -- JSON; the legacy restore path tolerates it).
+                             CASE WHEN json_valid(metadata) THEN
+                                  CASE WHEN json_extract(metadata, '$.kind_provenance')
+                                            IN ('declared', 'channel_derived', 'regex', 'llm')
+                                       THEN json_extract(metadata, '$.kind_provenance')
+                                  END
                              END),
                     ?3, ?4,
                     valid_from, valid_until
@@ -12370,9 +12386,15 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
                     -- the metadata carrier, vocab-guarded to the closed
                     -- #1945 set (the import-funnel re-denorm precedent).
                     COALESCE(kind_provenance,
-                             CASE WHEN json_extract(metadata, '$.kind_provenance')
-                                       IN ('declared', 'channel_derived', 'regex', 'llm')
-                                  THEN json_extract(metadata, '$.kind_provenance')
+                             -- json_valid guard: a corrupt (non-JSON)
+                             -- archived metadata blob must not abort the
+                             -- restore (json_extract raises on malformed
+                             -- JSON; the legacy restore path tolerates it).
+                             CASE WHEN json_valid(metadata) THEN
+                                  CASE WHEN json_extract(metadata, '$.kind_provenance')
+                                            IN ('declared', 'channel_derived', 'regex', 'llm')
+                                       THEN json_extract(metadata, '$.kind_provenance')
+                                  END
                              END),
                     ?3, ?4,
                     valid_from, valid_until

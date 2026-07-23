@@ -355,6 +355,107 @@ fn fbl02_insert_if_newer_canonicalizes_offset_expiry() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// #2339 (FBL-34) — access-priority ceiling + reachable decay
+// ─────────────────────────────────────────────────────────────────────
+
+fn seed_with_priority(conn: &Connection, id: &str, priority: i32, access_count: i64) -> String {
+    let mem = Memory {
+        id: id.to_string(),
+        tier: Tier::Long,
+        namespace: "storage-chain".to_string(),
+        title: format!("pr-{id}"),
+        content: format!("content for {id}"),
+        priority,
+        confidence: 1.0,
+        source: "test".to_string(),
+        access_count,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        metadata: json!({}),
+        ..Memory::default()
+    };
+    db::insert(conn, &mem).expect("seed")
+}
+
+fn priority_of(conn: &Connection, id: &str) -> i64 {
+    conn.query_row(
+        "SELECT priority FROM memories WHERE id = ?1",
+        rusqlite::params![id],
+        |r| r.get(0),
+    )
+    .expect("row")
+}
+
+/// The touch decade ladder stops at ACCESS_PRIORITY_CEILING and never
+/// touches rows already in the operator band (8-10).
+#[test]
+fn fbl34_touch_decade_bump_caps_at_access_ceiling() {
+    let conn = fresh_sqlite();
+    // 9 accesses → the next touch crosses the decade.
+    let below = seed_with_priority(&conn, "fbl34-below", 6, 9);
+    let at = seed_with_priority(&conn, "fbl34-at", 7, 9);
+    let operator = seed_with_priority(&conn, "fbl34-op", 9, 9);
+
+    for id in [&below, &at, &operator] {
+        db::touch(&conn, id, ai_memory::SECS_PER_HOUR, ai_memory::SECS_PER_DAY).expect("touch");
+    }
+
+    assert_eq!(
+        priority_of(&conn, &below),
+        7,
+        "a below-ceiling row still bumps on the decade"
+    );
+    assert_eq!(
+        priority_of(&conn, &at),
+        7,
+        "the access ratchet stops AT the ceiling"
+    );
+    assert_eq!(
+        priority_of(&conn, &operator),
+        9,
+        "operator-band rows (8-10) are never touched by the access ladder"
+    );
+}
+
+/// The v77 fold decade ladder honors the same ceiling (and never lowers a
+/// row already above it).
+#[test]
+fn fbl34_fold_decade_bump_caps_at_access_ceiling() {
+    let conn = fresh_sqlite();
+    // 25 unfolded observations = 2 decades crossed from access_count 0.
+    let inflating = seed_with_priority(&conn, "fbl34-fold", 6, 0);
+    let operator = seed_with_priority(&conn, "fbl34-fold-op", 10, 0);
+    for (n, id) in [(25usize, &inflating), (25usize, &operator)] {
+        for k in 0..n {
+            ai_memory::observations::record_recall(
+                &conn,
+                &format!("fbl34-{id}-{k}"),
+                &[ai_memory::observations::Candidate {
+                    memory_id: id,
+                    retriever: "fts5",
+                    rank: 1,
+                    score: 0.5,
+                }],
+            )
+            .expect("record");
+        }
+    }
+    db::fold_recall_accesses(&conn, ai_memory::SECS_PER_HOUR, ai_memory::SECS_PER_DAY)
+        .expect("fold");
+
+    assert_eq!(
+        priority_of(&conn, &inflating),
+        7,
+        "the fold's decade bump caps at the ceiling (pre-fix: 6 + 2 = 8)"
+    );
+    assert_eq!(
+        priority_of(&conn, &operator),
+        10,
+        "a row already above the ceiling keeps its priority byte-identical"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // #2338 (FBL-33) — G7 soft-loser recall down-weight
 // ─────────────────────────────────────────────────────────────────────
 

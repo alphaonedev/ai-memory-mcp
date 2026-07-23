@@ -17747,7 +17747,7 @@ impl MemoryStore for PostgresStore {
         // SQL standard (RHS of SET evaluates against the OLD row),
         // so the `access_count + 1` / `LEAST(...)` arithmetic
         // mirrors what the original ordered sequence saw.
-        sqlx::query(
+        sqlx::query(&format!(
             "UPDATE memories SET
                 access_count = LEAST(access_count + 1, 1000000),
                 last_accessed_at = NOW(),
@@ -17771,12 +17771,15 @@ impl MemoryStore for PostgresStore {
                 priority = CASE
                     WHEN LEAST(access_count + 1, 1000000) > 0
                          AND LEAST(access_count + 1, 1000000) % 10 = 0
-                         AND priority < 10
-                        THEN LEAST(priority + 1, 10)
+                         AND priority < {ceiling}
+                        THEN LEAST(priority + 1, {ceiling})
                     ELSE priority
                 END
              WHERE id = ANY($1)",
-        )
+            // v1.0.0 #2339 (FBL-34) — access bumps stop at the named
+            // ceiling (sqlite touch/touch_many parity).
+            ceiling = crate::models::ACCESS_PRIORITY_CEILING,
+        ))
         .bind(ids)
         .execute(&self.pool)
         .await
@@ -19632,7 +19635,7 @@ impl MemoryStore for PostgresStore {
             // verb applying metadata-only access bookkeeping (the same
             // sanction class as the legacy touch); it never rewrites
             // memory content.
-            let folded_ids: Vec<String> = sqlx::query_scalar(
+            let folded_ids: Vec<String> = sqlx::query_scalar(&format!(
                 "WITH batch AS (
                     SELECT memory_id
                       FROM recall_observations
@@ -19655,9 +19658,10 @@ impl MemoryStore for PostgresStore {
                 )
                 UPDATE memories m SET
                     access_count = LEAST(m.access_count + a.n, 1000000),
-                    priority = LEAST(m.priority
-                        + (LEAST(m.access_count + a.n, 1000000) / 10
-                           - m.access_count / 10)::int, 10),
+                    priority = CASE WHEN m.priority >= {ceiling} THEN m.priority
+                        ELSE LEAST(m.priority
+                            + (LEAST(m.access_count + a.n, 1000000) / 10
+                               - m.access_count / 10)::int, {ceiling}) END,
                     last_accessed_at = GREATEST(
                         COALESCE(m.last_accessed_at, a.t_max), a.t_max),
                     expires_at = CASE
@@ -19680,7 +19684,11 @@ impl MemoryStore for PostgresStore {
                  FROM agg a
                  WHERE m.id = a.memory_id
                 RETURNING m.id",
-            )
+                // v1.0.0 #2339 (FBL-34) — the fold's decade bump stops at
+                // the named ceiling (sqlite fold_recall_accesses parity);
+                // rows already above it keep their priority byte-identical.
+                ceiling = crate::models::ACCESS_PRIORITY_CEILING,
+            ))
             .bind(chunk_limit)
             .fetch_all(&self.pool)
             .await

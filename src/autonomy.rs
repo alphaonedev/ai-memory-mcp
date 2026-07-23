@@ -675,9 +675,21 @@ fn apply_priority_feedback(
     mem: &Memory,
     dry_run: bool,
 ) -> Result<Option<RollbackEntry>> {
-    // Access-signal policy:
-    //   access_count >= 10 AND last_accessed_at within 7d → +1 (cap 10)
-    //   access_count == 0 AND created_at older than 30d     → -1 (floor 1)
+    // Access-signal policy (v1.0.0 #2339 / FBL-34 — bounded, reachable):
+    //   access_count >= 10 AND last_accessed_at within 7d
+    //     → +1, capped at ACCESS_PRIORITY_CEILING (8-10 reserved for
+    //       explicit caller/operator intent — the access ratchet can no
+    //       longer pollute the operator band).
+    //   STALE (last access older than PRIORITY_DECAY_STALE_DAYS, or never
+    //   accessed and created at least that long ago) AND priority within
+    //   the access band (<= ACCESS_PRIORITY_CEILING)
+    //     → -1 per cycle, floor 1. The previous condition
+    //       (`access_count == 0`) was structurally unreachable for any
+    //       row ever recalled — priority only ever went UP. Rows above
+    //       the ceiling never decay: operator-set 8-10 intent is
+    //       indistinguishable from legacy ratcheted rows, and silently
+    //       eroding operator signal is strictly worse than leaving a
+    //       legacy row inflated (fail-safe).
     //   else no change.
     let now = chrono::Utc::now();
     let before = mem.priority;
@@ -694,11 +706,16 @@ fn apply_priority_feedback(
         .map(chrono::DateTime::<chrono::Utc>::from);
 
     let recent = last_accessed.is_some_and(|t| (now - t).num_days() <= 7);
-    let cold_enough = created.is_some_and(|t| (now - t).num_days() >= 30);
+    let cold_enough =
+        created.is_some_and(|t| (now - t).num_days() >= crate::models::PRIORITY_DECAY_STALE_DAYS);
+    let stale = last_accessed.map_or(cold_enough, |t| {
+        (now - t).num_days() >= crate::models::PRIORITY_DECAY_STALE_DAYS
+    });
 
-    if mem.access_count >= 10 && recent && after < 10 {
-        after = after.saturating_add(1).min(10);
-    } else if mem.access_count == 0 && cold_enough && after > 1 {
+    let ceiling = i32::try_from(crate::models::ACCESS_PRIORITY_CEILING).unwrap_or(7);
+    if mem.access_count >= 10 && recent && after < ceiling {
+        after = after.saturating_add(1).min(ceiling);
+    } else if stale && after > 1 && after <= ceiling {
         after = after.saturating_sub(1).max(1);
     }
 
@@ -1992,6 +2009,62 @@ mod tests {
             }
             _ => panic!("expected PriorityAdjust"),
         }
+    }
+
+    /// v1.0.0 #2339 (FBL-34) — the decay arm is REACHABLE for accessed
+    /// rows (staleness-based, not the structurally-dead access_count==0),
+    /// bounded (-1/cycle, floor 1), and SCOPED to the access band so
+    /// operator-set 8-10 priorities never silently erode; the up-arm caps
+    /// at ACCESS_PRIORITY_CEILING.
+    #[test]
+    fn priority_feedback_decay_reachable_and_operator_band_protected_2339() {
+        let (_tmp, conn) = setup_conn();
+        let stale_ts = (chrono::Utc::now() - chrono::Duration::days(40)).to_rfc3339();
+        let old_created = (chrono::Utc::now() - chrono::Duration::days(90)).to_rfc3339();
+
+        // (a) Accessed-but-stale row inside the band DECAYS (pre-fix the
+        // arm required access_count == 0 — unreachable once ever recalled).
+        let mut stale = sample_mem("stale2339", "ns", "T1", "content", Tier::Mid);
+        stale.priority = 6;
+        stale.access_count = 50;
+        stale.created_at = old_created.clone();
+        stale.last_accessed_at = Some(stale_ts.clone());
+        db::insert(&conn, &stale).unwrap();
+        match apply_priority_feedback(&conn, &stale, false).unwrap() {
+            Some(RollbackEntry::PriorityAdjust { before, after, .. }) => {
+                assert_eq!(before, 6);
+                assert_eq!(after, 5, "stale accessed row decays -1");
+            }
+            other => panic!("expected decay PriorityAdjust, got {other:?}"),
+        }
+
+        // (b) Operator band (8-10) NEVER decays — indistinguishable from
+        // explicit operator intent (fail-safe).
+        let mut operator = sample_mem("op2339", "ns", "T2", "content", Tier::Long);
+        operator.priority = 9;
+        operator.access_count = 50;
+        operator.created_at = old_created.clone();
+        operator.last_accessed_at = Some(stale_ts);
+        db::insert(&conn, &operator).unwrap();
+        assert!(
+            apply_priority_feedback(&conn, &operator, false)
+                .unwrap()
+                .is_none(),
+            "operator-band priority must not decay"
+        );
+
+        // (c) The hot up-arm stops at the ceiling — no bump into 8-10.
+        let mut hot = sample_mem("hot2339", "ns", "T3", "content", Tier::Mid);
+        hot.priority = i32::try_from(crate::models::ACCESS_PRIORITY_CEILING).unwrap();
+        hot.access_count = 100;
+        hot.last_accessed_at = Some(chrono::Utc::now().to_rfc3339());
+        db::insert(&conn, &hot).unwrap();
+        assert!(
+            apply_priority_feedback(&conn, &hot, false)
+                .unwrap()
+                .is_none(),
+            "the access ratchet must not push past the ceiling"
+        );
     }
 
     #[test]
