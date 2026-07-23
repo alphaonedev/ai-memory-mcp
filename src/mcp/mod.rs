@@ -656,6 +656,13 @@ pub(crate) use recall_observations::{
 pub use replay::handle_replay;
 pub use rule_list::handle_rule_list;
 pub(crate) use session_start::handle_session_start;
+// FBL-09 — re-export the session_start mode SSOT so the HTTP handler's
+// postgres branch (src/handlers/hook_subscribers.rs) tags its response
+// with the same `mode` literal without duplicating the string. Gated on
+// `sal` because that postgres branch is its only consumer (the sqlite
+// path uses the in-module const directly).
+#[cfg(feature = "sal")]
+pub(crate) use session_start::SESSION_START_MODE;
 pub use subscribe::handle_unsubscribe;
 // v0.7.0 ARCH-3 / FX-C3 (#batch2) — CLI parity exports for the
 // subscribe family + entity family + kg admin family + multistep

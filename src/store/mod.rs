@@ -1246,6 +1246,37 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// FBL-08 (v1.0.0 pre-ship 3x7) — remove the directional link(s)
+    /// `source_id → target_id` from the CONFIGURED backend.
+    ///
+    /// Deletes every `memory_links` row matching the `(source_id,
+    /// target_id)` pair (all relations between the pair — the same
+    /// contract the legacy `db::delete_link` free-function has, since the
+    /// `DELETE /api/v1/links` wire shape carries no relation). Returns
+    /// `true` when at least one row was removed, `false` when the pair
+    /// had no edge.
+    ///
+    /// Pre-#FBL-08 the HTTP `delete_link` handler ran `db::delete_link`
+    /// against the LOCAL sqlite `app.db` even on a postgres-backed daemon
+    /// — silently mutating an unrelated scratch DB while the postgres
+    /// `memory_links` row (and its AGE edge) survived, and lying to the
+    /// caller with `{"deleted": false}`. Routing the destructive delete
+    /// through this trait method makes it hit the configured store.
+    ///
+    /// Default returns `UnsupportedCapability` so an adapter that has not
+    /// wired the delete fails LOUD rather than silently reporting a
+    /// no-op deletion (which would mask graph-topology data drift).
+    async fn delete_link(
+        &self,
+        _ctx: &CallerContext,
+        _source_id: &str,
+        _target_id: &str,
+    ) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "DELETE_LINK".to_string(),
+        })
+    }
+
     /// Register an agent in the adapter's `_agents` namespace (Task
     /// 1.3).
     async fn register_agent(
