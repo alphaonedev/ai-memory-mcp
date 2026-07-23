@@ -1197,6 +1197,16 @@ fn insert_inner(conn: &Connection, mem: &Memory, stamp_local_clock: bool) -> Res
     // `validate::canonicalize_valid_time`.
     let valid_from_canon = crate::validate::canonical_valid_time_opt(mem.valid_from.as_deref());
     let valid_until_canon = crate::validate::canonical_valid_time_opt(mem.valid_until.as_deref());
+    // v1.0.0 #2332 (FBL-02) — canonicalize `expires_at` at the SAME funnel
+    // the v86 #1834 work canonicalized valid_from/valid_until: every expiry
+    // consumer (GC reap, recall/list visibility, the #1596 touch/fold MAX()
+    // floors) compares this TEXT column lexicographically against a
+    // UTC-rendered `now`, and a caller-supplied non-UTC offset rendering
+    // orders wrongly as bytes (premature reap / over-retention / a voided
+    // extension floor). Unparseable values pass through byte-for-byte
+    // (fail-safe — the validation gates already admitted them).
+    let effective_expires = mem.effective_expires_at();
+    let expires_canon = crate::validate::canonical_valid_time_opt(effective_expires.as_deref());
     // #1579 B6 — `insert` is the hottest write statement in the
     // substrate (every store / upsert / capture-turn / federation push
     // lands here). `prepare_cached` skips the re-parse of this ~60-line
@@ -1336,7 +1346,7 @@ fn insert_inner(conn: &Connection, mem: &Memory, stamp_local_clock: bool) -> Res
             mem.created_at,
             mem.updated_at,
             mem.last_accessed_at,
-            mem.effective_expires_at(),
+            expires_canon,
             metadata_json,
             mem.reflection_depth,
             mem.memory_kind.as_str(),
@@ -1806,7 +1816,10 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
                 params![
                     mem.id, mem.tier.as_str(), mem.namespace, mem.title, content_to_store,
                     tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
-                    mem.created_at, mem.updated_at, mem.last_accessed_at, mem.effective_expires_at(),
+                    mem.created_at, mem.updated_at, mem.last_accessed_at,
+                    // v1.0.0 #2332 (FBL-02) — canonical fixed-UTC expiry
+                    // rendering (the v86 valid_* precedent below).
+                    crate::validate::canonical_valid_time_opt(mem.effective_expires_at().as_deref()),
                     metadata_json, mem.reflection_depth, mem.memory_kind.as_str(),
                     mem.entity_id, mem.persona_version,
                     citations_json, mem.source_uri, source_span_json,
@@ -2564,6 +2577,14 @@ pub fn update_with_expected_version(
     } else {
         expires_at
     };
+    // v1.0.0 #2332 (FBL-02) — canonicalize the merged expiry (caller patch
+    // OR carried-forward stored value) to the fixed-UTC v86 rendering so
+    // the lexicographic expiry predicates (GC / recall / touch-fold MAX
+    // floors) compare chronologically. Unparseable values pass through
+    // byte-for-byte (fail-safe). Also heals a legacy offset rendering on
+    // the existing row the first time the row is patched.
+    let expires_canon = crate::validate::canonical_valid_time_opt(expires_at);
+    let expires_at = expires_canon.as_deref();
     // #2060 — TRACT covenant clause 2: authorship-immutability gate.
     // Consult BEFORE the shadow below so we see the caller's RAW patch
     // metadata (not whatever an upstream `preserve_provenance_keys` call
@@ -12878,7 +12899,11 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             mem.created_at,
             mem.updated_at,
             mem.last_accessed_at,
-            mem.effective_expires_at(),
+            // v1.0.0 #2332 (FBL-02) — canonical fixed-UTC expiry rendering at
+            // the federation-receive funnel too (the v86 valid_* precedent
+            // below): a peer's offset rendering must never mis-order against
+            // the local GC / recall / floor predicates.
+            crate::validate::canonical_valid_time_opt(mem.effective_expires_at().as_deref()),
             metadata_json,
             mem.reflection_depth,
             mem.memory_kind.as_str(),
@@ -13136,7 +13161,9 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
             mem.created_at,
             mem.updated_at,
             mem.last_accessed_at,
-            mem.effective_expires_at(),
+            // v1.0.0 #2332 (FBL-02) — canonical fixed-UTC expiry rendering on
+            // the federation merge-writer path (v86 valid_* precedent).
+            crate::validate::canonical_valid_time_opt(mem.effective_expires_at().as_deref()),
             metadata_json,
             mem.reflection_depth,
             mem.memory_kind.as_str(),
@@ -18328,7 +18355,12 @@ mod tests {
     fn ttl_gap_secs(created_at: &str, expires_at: &str) -> i64 {
         let base = chrono::DateTime::parse_from_rfc3339(created_at).unwrap();
         let exp = chrono::DateTime::parse_from_rfc3339(expires_at).unwrap();
-        (exp - base).num_seconds()
+        // v1.0.0 #2332 (FBL-02) — the funnel canonicalizes the stored
+        // rendering to MICROsecond precision while `created_at` keeps
+        // nanoseconds, so round the gap to the nearest second instead of
+        // truncating (a sub-microsecond shortfall must not read as -1s).
+        let ms = (exp - base).num_milliseconds();
+        (ms + 500).div_euclid(1000)
     }
 
     #[test]
@@ -18374,7 +18406,13 @@ mod tests {
         mem.expires_at = Some(explicit.clone());
         let id = insert(&conn, &mem).unwrap();
         let got = get(&conn, &id).unwrap().unwrap();
-        assert_eq!(got.expires_at, Some(explicit));
+        // v1.0.0 #2332 (FBL-02) — the funnel canonicalizes the RENDERING to
+        // the fixed-UTC v86 form; the INSTANT is preserved exactly.
+        let stored = got.expires_at.expect("explicit expiry kept");
+        assert!(stored.ends_with('Z'), "canonical rendering, got {stored}");
+        let stored_dt = chrono::DateTime::parse_from_rfc3339(&stored).unwrap();
+        let explicit_dt = chrono::DateTime::parse_from_rfc3339(&explicit).unwrap();
+        assert_eq!(stored_dt.timestamp_micros(), explicit_dt.timestamp_micros());
     }
 
     #[test]
@@ -19098,9 +19136,17 @@ mod tests {
             Tier::Short.as_str(),
             "G5: restore must preserve the original tier"
         );
+        // v1.0.0 #2332 (FBL-02) — the insert funnel stored the canonical
+        // fixed-UTC rendering; the archive→restore round-trip preserves the
+        // INSTANT (compare at micro precision, not bytes).
+        let stored = chrono::DateTime::parse_from_rfc3339(
+            got.expires_at.as_deref().expect("expiry restored"),
+        )
+        .unwrap();
+        let original = chrono::DateTime::parse_from_rfc3339(&original_expiry).unwrap();
         assert_eq!(
-            got.expires_at,
-            Some(original_expiry),
+            stored.timestamp_micros(),
+            original.timestamp_micros(),
             "G5: restore must preserve the original expires_at"
         );
     }
