@@ -1908,6 +1908,21 @@ agent-to-agent (A2A) federation** validation run. No schema change (stays at
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
+### Security (v1.0.0 pre-ship Grok 2x5 — governance lane)
+
+- **W1A4-08 (#2357) — reserved `_peer_head_entanglement` namespace no longer
+  writable via MCP/CLI store or any namespace-move lane.** The R22
+  `reject_reserved_write_namespace` guard was consulted ONLY by the HTTP
+  `validate_create` funnel; the MCP `memory_store` and CLI `store` paths
+  (inline free-fn validation) and every namespace-MOVE lane (update on
+  HTTP/MCP/CLI, vertical promote on MCP/CLI) skipped it, so callers could
+  author or move memory rows into the write-reserved substrate namespace.
+  All caller write/move ingresses now consult the same guard; read lanes
+  (list/search/recall filters) and federation-receive replication are
+  deliberately unchanged. `src/validate.rs` (`validate_update`),
+  `src/mcp/tools/store/validation.rs`, `src/mcp/tools/{update,promote}.rs`,
+  `src/cli/{store,update,promote}.rs`.
+
 ### Fixed (v1.0.0 pre-ship 3x7 — routing + quota lane)
 
 - **FBL-08 (HIGH) — `DELETE /api/v1/links` now hits the configured store on

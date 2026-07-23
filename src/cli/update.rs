@@ -145,6 +145,9 @@ pub fn run(
     }
     if let Some(ref ns) = args.namespace {
         validate::validate_namespace(ns)?;
+        // #2357 (W1A4-08) — namespace MOVE = caller write into the target
+        // namespace; consult the R22 reserved-namespace refusal.
+        validate::reject_reserved_write_namespace(ns)?;
     }
     if let Some(ref tags) = tags {
         validate::validate_tags(tags)?;
@@ -288,6 +291,23 @@ mod tests {
         }
         assert!(env.stdout_str().contains("updated:"));
         assert!(env.stdout_str().contains("new-title"));
+    }
+
+    /// #2357 (W1A4-08) — CLI update namespace MOVE into the write-reserved
+    /// `_peer_head_entanglement` namespace is refused.
+    #[test]
+    fn test_update_rejects_reserved_namespace_move_2357() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "reserved-move", "content");
+        let mut args = empty_args(&id);
+        args.namespace = Some(
+            crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE.to_string(),
+        );
+        let mut out = env.output();
+        let err = run(&db, &args, false, &mut out)
+            .expect_err("reserved namespace move must be refused");
+        assert!(err.to_string().contains("reserved"), "got: {err}");
     }
 
     #[test]
