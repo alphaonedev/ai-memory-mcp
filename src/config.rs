@@ -142,7 +142,11 @@ pub mod config_keys {
     pub const DEFAULT_NAMESPACE: &str = "default_namespace";
     /// Legacy flat `embedding_model` key (v2: `[embeddings].model`).
     pub const EMBEDDING_MODEL: &str = "embedding_model";
-    /// Legacy flat `max_memory_mb` key (v2: resolved via `[storage]`).
+    /// Legacy flat `max_memory_mb` key. PARSED but NOT ENFORCED (FBL-13):
+    /// it has no runtime consumer — it does not cap memory or storage and is
+    /// NOT an auto-tier-selection input on any live path. `resolve_storage`
+    /// emits a one-shot WARN when it is set. Use `[limits].max_storage_bytes`
+    /// (`AI_MEMORY_MAX_STORAGE_BYTES`) for an actual per-agent storage ceiling.
     pub const MAX_MEMORY_MB: &str = "max_memory_mb";
     /// Legacy flat `ollama_url` key (v2: `[llm].base_url` / `[embeddings].url`).
     pub const OLLAMA_URL: &str = "ollama_url";
@@ -172,6 +176,24 @@ pub mod config_keys {
 #[must_use]
 pub fn default_tier_llm_model() -> &'static str {
     backend_default_model(crate::llm::BACKEND_OLLAMA)
+}
+
+/// FBL-13 — one-shot operator WARN that the legacy `max_memory_mb` knob is
+/// parsed but NOT enforced (no runtime consumer). Gated by a process-`Once` so
+/// the repeated `resolve_storage` calls (serve / mcp / doctor boot) do not spam
+/// the log. See [`config_keys::MAX_MEMORY_MB`].
+fn warn_max_memory_mb_inert_once() {
+    use std::sync::Once;
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            target: "config.max_memory_mb",
+            "config `max_memory_mb` is parsed but NOT enforced — it does not cap \
+             memory or storage and is not an auto-tier-selection input on any \
+             live path (FBL-13). For a real per-agent storage ceiling use \
+             [limits].max_storage_bytes / AI_MEMORY_MAX_STORAGE_BYTES"
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -8492,6 +8514,16 @@ impl AppConfig {
             .or(self.archive_max_days);
 
         let max_memory_mb = cfg.and_then(|s| s.max_memory_mb).or(self.max_memory_mb);
+        // FBL-13 — `max_memory_mb` is DEAD config: it is parsed, migrated, and
+        // carried onto `ResolvedStorage`, but NO production code consumes it
+        // (it caps neither memory nor storage, and is not an auto-tier-selection
+        // input on any live path). Rather than let a documented operator ceiling
+        // silently do nothing, emit a one-shot WARN naming the real knob. The
+        // field is retained (removing the public `TierConfig.max_memory_mb` /
+        // resolved carrier is a wire/back-compat change deferred to a vote).
+        if max_memory_mb.is_some() {
+            warn_max_memory_mb_inert_once();
+        }
 
         // #1579 B7 — sqlite mmap size, uniform ladder:
         // env > [storage] section > compiled default. `0` is a
@@ -8815,9 +8847,6 @@ impl AppConfig {
 
 # Default namespace for new memories
 # default_namespace = "global"
-
-# Memory budget in MB (for auto tier selection)
-# max_memory_mb = 4096
 
 # Archive expired memories before GC deletion (default: true)
 # archive_on_gc = true
@@ -12238,6 +12267,28 @@ max_page_size = 1000000
             crate::storage::DEFAULT_DB_MMAP_SIZE_BYTES,
             "no env + no section must bottom out on the compiled 256 MiB default"
         );
+    }
+
+    #[test]
+    fn resolve_storage_carries_but_does_not_enforce_max_memory_mb_fbl13() {
+        // FBL-13 — the legacy `max_memory_mb` flat field resolves onto
+        // ResolvedStorage (the produced field is what is dead — no consumer),
+        // and the resolve path is reachable with the WARN branch taken. This
+        // pins that setting the knob does NOT error and is carried verbatim
+        // (removing the field is a separate vote-gated wire change).
+        let _g = env_var_lock();
+        let mut cfg = empty_app_config();
+        cfg.max_memory_mb = Some(64);
+        let resolved = cfg.resolve_storage();
+        assert_eq!(
+            resolved.max_memory_mb,
+            Some(64),
+            "legacy max_memory_mb must still resolve onto ResolvedStorage (it is \
+             the produced-but-unconsumed field that is dead, not the parse)"
+        );
+        // A config with no max_memory_mb leaves it None (WARN branch not taken).
+        let bare = empty_app_config();
+        assert_eq!(bare.resolve_storage().max_memory_mb, None);
     }
 
     #[test]

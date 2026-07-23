@@ -1022,7 +1022,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `try_load_from` Result-returning loaders (the hot-swap reload path
     // that PROPAGATES parse/validate errors instead of swallowing them to
     // default()) land config.rs at 12_897; ceiling 12_850 -> 12_950 (+53).
-    ("src/config.rs", 12_950),
+    // 2026-07-23 FBL-13/FBL-30/FBL-31 config-defaults-lie honesty fixes
+    // (max_memory_mb inert WARN + doc-correct, auto_extract reserved doc,
+    // audit schema_version/hash_chain/attestation doc + resolve/warn helper +
+    // regression test) land config.rs at 12_969; ceiling 12_950 -> 13_020
+    // (+51 headroom, lockstep).
+    ("src/config.rs", 13_020),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the
