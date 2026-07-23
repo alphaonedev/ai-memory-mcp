@@ -1900,6 +1900,37 @@ agent-to-agent (A2A) federation** validation run. No schema change (stays at
 
 ## [Unreleased] — v0.7.x doc follow-ups + Wave-2 refactor (post-tag)
 
+### Fixed (v1.0.0 pre-ship 3x7 — routing + quota lane)
+
+- **FBL-08 (HIGH) — `DELETE /api/v1/links` now hits the configured store on
+  a postgres-backed daemon.** Pre-fix the handler ran `db::delete_link`
+  against the LOCAL sqlite `app.db` regardless of backend, silently
+  mutating an unrelated scratch DB while the postgres `memory_links` row +
+  its AGE edge survived and the caller got a false `{"deleted": false}`.
+  The destructive delete now routes through the new backend-blind
+  `MemoryStore::delete_link` trait method (relational `DELETE` is the
+  source of truth; the AGE `memory_graph` edge is unprojected best-effort
+  in the same tx under `sync` projection so `find_paths_cypher` cannot
+  traverse a phantom edge). `src/store/{mod,sqlite,postgres}.rs`,
+  `src/handlers/links.rs`.
+- **FBL-09 — `POST /api/v1/session_start` serves recent-memory context
+  from the configured store on a postgres-backed daemon.** Pre-fix it
+  locked the local sqlite `app.db` on every backend, so a postgres-fleet
+  agent booting via HTTP got an empty/unrelated recent-memory context.
+  The postgres branch now lists via the SAL trait (`app.store.list`) +
+  the `scope=private` visibility post-filter. `src/handlers/hook_subscribers.rs`.
+- **FBL-12 — `memory_update` now charges the per-agent storage-bytes
+  quota on content-growing updates.** Pre-fix every update funnel (MCP
+  `memory_update`, HTTP `PUT /memories/{id}`, the `content_append`/
+  `content_replace` patch) charged ZERO, so an agent could grow each
+  stored row toward `MAX_CONTENT_SIZE` while its `current_storage_bytes`
+  counter reflected only the store-time bytes — an unbounded-growth
+  bypass of the storage cap. The sqlite funnels now charge the positive
+  byte delta against the row owner's per-namespace cap (fail-closed on
+  breach; refunded if the write itself fails), via the new
+  `quotas::charge_update_growth`. `src/quotas.rs`, `src/mcp/tools/update.rs`,
+  `src/handlers/memories.rs`.
+
 ### Moonshot-property declaration (ROADMAP §17 quality gate)
 
 > Per ROADMAP §17, every release declares which of the seven §2 moonshot

@@ -872,7 +872,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `list_memories_updated_since` federation-send-path section header
     // (see tests/store_parity_gaps.rs::pg_list_memories_updated_since_decrypts_for_send_2303)
     // land the file at 28_810. Ceiling 28_800 -> 28_900 (+90 headroom).
-    ("src/store/postgres.rs", 28_900),
+    // 2026-07-23 (FBL-08 3x7): add the `PostgresStore::delete_link` SAL trait
+    // impl (relational DELETE + best-effort same-tx AGE edge unprojection
+    // under a SAVEPOINT) + the `unproject_link_from_age` edge-delete helper
+    // so `DELETE /api/v1/links` hits the configured store on a postgres
+    // daemon (was silently mutating a local sqlite file); land the file at
+    // 28_926. Ceiling 28_900 -> 29_020 (+94 headroom).
+    ("src/store/postgres.rs", 29_020),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
