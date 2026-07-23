@@ -5530,16 +5530,21 @@ pub fn search_with_source_uri(
            {source_uri_fragment}
            {vis}
            {lifecycle_vis}
-         ORDER BY (fts.rank * -1)
+         ORDER BY ((fts.rank * -1)
            + (m.priority * 0.5)
            + (MIN(m.access_count, 50) * 0.1)
            + (m.confidence * 2.0)
-           + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1))
+           + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1)))
+           -- v1.0.0 #2338 (FBL-33) — G7 soft-loser down-weight (see recall).
+           * (CASE WHEN json_extract(m.metadata, '$.contradiction_soft_loser') = 1
+                   THEN {soft_loser_factor} ELSE 1.0 END)
            DESC
          LIMIT ?9",
         vis = visibility_clause(11, 15, "m"),
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
         lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
+        // v1.0.0 #2338 (FBL-33) — G7 soft-loser down-weight factor.
+        soft_loser_factor = SOFT_LOSER_SCORE_FACTOR,
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = if let Some(uri) = source_uri {
@@ -6018,6 +6023,16 @@ pub fn recall_with_telemetry(
     Ok((results, outcome, telemetry))
 }
 
+/// v1.0.0 #2338 (FBL-33) — multiplicative recall-score penalty for a
+/// contradiction-conserved SOFT LOSER (the G7 #1824 marker
+/// `metadata.contradiction_soft_loser`, written by
+/// [`conserve_contradiction`]). The marker's own contract ("recall
+/// ranking may consult it") had ZERO ranking consumers, so an
+/// LLM-confirmed-contradicted long-tier row kept outranking its fresh
+/// winner at full score. Reversible + node-local exactly like the marker
+/// itself: clearing the marker (the G7 rollback) restores full rank.
+pub const SOFT_LOSER_SCORE_FACTOR: f64 = 0.5;
+
 pub fn recall(
     conn: &Connection,
     context: &str,
@@ -6112,12 +6127,18 @@ pub fn recall(
                 -- `score` column is read by name (not positionally) so this
                 -- insertion is safe.
                 m.encrypted_envelope,
-                (fts.rank * -1)
+                ((fts.rank * -1)
                 + (m.priority * 0.5)
                 + (MIN(m.access_count, 50) * 0.1)
                 + (m.confidence * 2.0)
                 + (CASE m.tier WHEN 'long' THEN 3.0 WHEN 'mid' THEN 1.0 ELSE 0.0 END)
-                + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1))
+                + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1)))
+                -- v1.0.0 #2338 (FBL-33) — the promised G7 soft down-weight:
+                -- a contradiction-conserved loser is multiplicatively
+                -- penalized so it can no longer outrank its winner at full
+                -- score (reversible — clearing the marker restores rank).
+                * (CASE WHEN json_extract(m.metadata, '$.contradiction_soft_loser') = 1
+                        THEN {soft_loser_factor} ELSE 1.0 END)
                 AS score
          FROM memories_fts fts
          JOIN memories m ON m.rowid = fts.rowid
@@ -6145,6 +6166,8 @@ pub fn recall(
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list: hides
         // Tombstoned/Quarantined (and any unknown state) from recall.
         lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
+        // v1.0.0 #2338 (FBL-33) — G7 soft-loser down-weight factor.
+        soft_loser_factor = SOFT_LOSER_SCORE_FACTOR,
     );
     let mut stmt = conn.prepare(&sql)?;
     // Bind ?13 only when the source-URI fragment is active; SQLite
@@ -15395,7 +15418,23 @@ fn blend_and_rank(
                     }
                 });
             let decay = scoring.decay_multiplier(&mem.tier, age_days);
-            (mem, blended * decay)
+            // v1.0.0 #2338 (FBL-33) — the promised G7 soft down-weight on
+            // the HYBRID lane, applied to the FUSED score so BOTH the
+            // keyword and semantic components are penalized (an SQL-side
+            // fts_score penalty alone would leave the loser fully ranked
+            // through the cosine half). Reversible: the G7 rollback clears
+            // the marker and full rank returns.
+            let soft_loser = mem
+                .metadata
+                .get(crate::models::field_names::CONTRADICTION_SOFT_LOSER)
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+            let penalty = if soft_loser {
+                SOFT_LOSER_SCORE_FACTOR
+            } else {
+                1.0
+            };
+            (mem, blended * decay * penalty)
         })
         .collect();
     // v0.9.0 P0-1 (#1869) — determinism. `scored` is a `HashMap`, so

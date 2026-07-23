@@ -355,6 +355,93 @@ fn fbl02_insert_if_newer_canonicalizes_offset_expiry() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// #2338 (FBL-33) — G7 soft-loser recall down-weight
+// ─────────────────────────────────────────────────────────────────────
+
+/// After a G7 conserve, the soft-loser marker must actually LOWER the
+/// loser's recall rank: a long-tier priority-8 conserved loser previously
+/// outranked its fresh mid-tier winner at full score.
+#[test]
+fn fbl33_conserved_soft_loser_ranks_below_winner_on_keyword_recall() {
+    let conn = fresh_sqlite();
+    // Loser: long tier, high priority — pre-fix score dominance.
+    let loser = Memory {
+        id: "fbl33-loser".to_string(),
+        tier: Tier::Long,
+        namespace: "storage-chain".to_string(),
+        title: "deploy target directive v1".to_string(),
+        content: "the canonical deploy target is server X".to_string(),
+        priority: 8,
+        confidence: 1.0,
+        source: "test".to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        metadata: json!({}),
+        ..Memory::default()
+    };
+    let winner = Memory {
+        id: "fbl33-winner".to_string(),
+        tier: Tier::Mid,
+        namespace: "storage-chain".to_string(),
+        title: "deploy target directive v2".to_string(),
+        content: "the canonical deploy target is server Y".to_string(),
+        priority: 5,
+        confidence: 1.0,
+        source: "test".to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        metadata: json!({}),
+        ..Memory::default()
+    };
+    db::insert(&conn, &loser).expect("insert loser");
+    db::insert(&conn, &winner).expect("insert winner");
+
+    let rank = |conn: &Connection| -> Vec<String> {
+        let (rows, _) = db::recall(
+            conn,
+            "deploy target",
+            Some("storage-chain"),
+            10,
+            None,
+            None,
+            None,
+            ai_memory::SECS_PER_HOUR,
+            ai_memory::SECS_PER_DAY,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .expect("recall");
+        rows.into_iter().map(|(m, _)| m.id).collect()
+    };
+
+    // Sanity: pre-conserve the long/priority-8 loser outranks the winner.
+    let before = rank(&conn);
+    assert_eq!(
+        before.first().map(String::as_str),
+        Some("fbl33-loser"),
+        "pre-conserve the stale directive dominates (tier +3.0, priority +4.0)"
+    );
+
+    // Conserve the pair (writes the soft-loser marker + contradicts edge).
+    db::conserve_contradiction(&conn, &loser, "fbl33-winner", None).expect("conserve");
+
+    let after = rank(&conn);
+    assert_eq!(
+        after.first().map(String::as_str),
+        Some("fbl33-winner"),
+        "the promised soft down-weight must rank the conserved loser below its winner"
+    );
+    assert!(
+        after.contains(&"fbl33-loser".to_string()),
+        "the loser stays recallable (down-weighted, never hidden — G7 conserve)"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // #2336 (FBL-24) — embedding scans advance past decrypt-skipped batches
 // ─────────────────────────────────────────────────────────────────────
 
