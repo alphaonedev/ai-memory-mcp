@@ -355,6 +355,133 @@ fn fbl02_insert_if_newer_canonicalizes_offset_expiry() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// #2335 (FBL-20) — federation LWW expiry extension floor
+// ─────────────────────────────────────────────────────────────────────
+
+fn fed_mem(title: &str, updated_at: &str, expires_at: &str) -> Memory {
+    Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier: Tier::Mid,
+        namespace: "storage-chain".to_string(),
+        title: title.to_string(),
+        content: format!("content of {title}"),
+        priority: 5,
+        confidence: 1.0,
+        source: "test".to_string(),
+        created_at: updated_at.to_string(),
+        updated_at: updated_at.to_string(),
+        expires_at: Some(expires_at.to_string()),
+        metadata: json!({}),
+        ..Memory::default()
+    }
+}
+
+/// A STALE losing peer (older updated_at) must not shorten the local
+/// row's expiry — pre-fix the bare COALESCE adopted it verbatim and GC
+/// reaped the live row early.
+#[test]
+fn fbl20_stale_loser_push_cannot_shorten_local_expiry() {
+    let conn = fresh_sqlite();
+    let now = chrono::Utc::now();
+    let local_expiry = (now + chrono::Duration::days(7)).to_rfc3339();
+    let local = fed_mem("fbl20 row", &now.to_rfc3339(), &local_expiry);
+    let id = db::insert_if_newer(&conn, &local).expect("local insert");
+
+    // Stale peer: same (title, namespace), OLDER updated_at, MUCH shorter
+    // expiry.
+    let peer = fed_mem(
+        "fbl20 row",
+        &(now - chrono::Duration::hours(2)).to_rfc3339(),
+        &(now + chrono::Duration::hours(1)).to_rfc3339(),
+    );
+    let merged_id = db::insert_if_newer(&conn, &peer).expect("peer push");
+    assert_eq!(merged_id, id, "(title, namespace) upsert merges");
+
+    let stored = stored_expiry(&conn, &id).expect("expiry present");
+    let stored_dt = chrono::DateTime::parse_from_rfc3339(&stored).expect("parseable");
+    let local_dt = chrono::DateTime::parse_from_rfc3339(&local_expiry).expect("parseable");
+    assert_eq!(
+        stored_dt.timestamp_micros(),
+        local_dt.timestamp_micros(),
+        "a stale losing peer must not shorten the local expiry (#1596 floor)"
+    );
+}
+
+/// Even a WINNING peer (newer updated_at) with an EARLIER expiry keeps
+/// the local later expiry — recall fold-extensions raise expires_at
+/// without bumping updated_at, so the extension floor must hold across
+/// federation (the merge is the MAX lattice join, convergent both ways).
+#[test]
+fn fbl20_winning_peer_with_earlier_expiry_keeps_local_extension() {
+    let conn = fresh_sqlite();
+    let now = chrono::Utc::now();
+    let extended = (now + chrono::Duration::days(7)).to_rfc3339();
+    let local = fed_mem(
+        "fbl20 winner",
+        &(now - chrono::Duration::hours(1)).to_rfc3339(),
+        &extended,
+    );
+    let id = db::insert_if_newer(&conn, &local).expect("local insert");
+
+    let peer = fed_mem(
+        "fbl20 winner",
+        &now.to_rfc3339(), // newer — wins the content tiebreak
+        &(now + chrono::Duration::days(1)).to_rfc3339(), // earlier expiry
+    );
+    db::insert_if_newer(&conn, &peer).expect("peer push");
+
+    // Content followed the winner…
+    let content: String = conn
+        .query_row(
+            "SELECT content FROM memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |r| r.get(0),
+        )
+        .expect("row");
+    assert_eq!(content, "content of fbl20 winner");
+    // …but the expiry kept the local extension floor.
+    let stored = stored_expiry(&conn, &id).expect("expiry present");
+    let stored_dt = chrono::DateTime::parse_from_rfc3339(&stored).expect("parseable");
+    let ext_dt = chrono::DateTime::parse_from_rfc3339(&extended).expect("parseable");
+    assert_eq!(
+        stored_dt.timestamp_micros(),
+        ext_dt.timestamp_micros(),
+        "a winning peer's earlier expiry must not roll back a local fold-extension"
+    );
+}
+
+/// A peer carrying a LATER expiry extends the local row (the other half
+/// of the lattice join — replicas converge to the later instant).
+#[test]
+fn fbl20_peer_with_later_expiry_extends_local() {
+    let conn = fresh_sqlite();
+    let now = chrono::Utc::now();
+    let local = fed_mem(
+        "fbl20 extend",
+        &now.to_rfc3339(),
+        &(now + chrono::Duration::hours(2)).to_rfc3339(),
+    );
+    let id = db::insert_if_newer(&conn, &local).expect("local insert");
+
+    let later = (now + chrono::Duration::days(3)).to_rfc3339();
+    let peer = fed_mem(
+        "fbl20 extend",
+        &(now - chrono::Duration::hours(3)).to_rfc3339(), // stale loser
+        &later,
+    );
+    db::insert_if_newer(&conn, &peer).expect("peer push");
+
+    let stored = stored_expiry(&conn, &id).expect("expiry present");
+    let stored_dt = chrono::DateTime::parse_from_rfc3339(&stored).expect("parseable");
+    let later_dt = chrono::DateTime::parse_from_rfc3339(&later).expect("parseable");
+    assert_eq!(
+        stored_dt.timestamp_micros(),
+        later_dt.timestamp_micros(),
+        "the merge converges to the LATER expiry regardless of tiebreak"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // #2333 (FBL-03) — schema v87
 // ─────────────────────────────────────────────────────────────────────
 

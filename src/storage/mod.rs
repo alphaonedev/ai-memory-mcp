@@ -12810,8 +12810,25 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
                         ELSE memories.tier END,
             updated_at = MAX(memories.updated_at, excluded.updated_at),
             access_count = MAX(memories.access_count, excluded.access_count),
+            -- v1.0.0 #2335 (FBL-20) — expires_at was the ONLY LWW-class
+            -- column with NO newer-wins guard: the bare
+            -- COALESCE(excluded.expires_at, memories.expires_at) adopted a
+            -- STALE losing peer's expiry verbatim, silently shortening a
+            -- live row's TTL (recall fold-extensions raise expires_at
+            -- WITHOUT bumping updated_at, so routine bidirectional sync
+            -- rolled local extensions back and GC reaped early — with the
+            -- v70 auto-eviction posture that is permanent link-edge loss).
+            -- The merge is now the extension-FLOOR lattice join (scalar
+            -- MAX, both operands funnel-canonicalized per #2332 so byte
+            -- order is chronological): both replicas converge to the LATER
+            -- expiry regardless of push order (MAX is commutative /
+            -- idempotent — a true CRDT join, strictly stronger than the
+            -- updated_at tiebreak for this column), and the #1596
+            -- never-move-expiry-earlier contract holds across federation.
+            -- The long⇒NULL arm keeps the #1626 immortality coupling.
             expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
-                              ELSE COALESCE(excluded.expires_at, memories.expires_at) END,
+                              ELSE MAX(COALESCE(excluded.expires_at, memories.expires_at),
+                                       COALESCE(memories.expires_at, excluded.expires_at)) END,
             -- #1784 — preserve immutable provenance keys (agent_id + the
             -- consolidation derived_from / consolidated_from_agents arrays)
             -- across a newer-wins merge: json_patch overlays the existing
