@@ -194,6 +194,20 @@ pub(super) async fn post_once(
                     {
                         return AckOutcome::IdDrift;
                     }
+                    // #2341 (W1A2-01/02) — a 2xx is NOT proof of application.
+                    // Read the receiver's structured report: items the peer
+                    // SKIPPED (validation / attestation / namespace-scope
+                    // refusals) or counted `unsupported_on_postgres` (the
+                    // FED-RQ-01 honest-count subcollections a pg receiver
+                    // cannot apply) were NEVER applied, so counting the 2xx
+                    // as an ack met W-of-N quorum and retired push-DLQ rows
+                    // for writes that do not exist on the peer. Idempotent
+                    // no-ops land in the receiver's `noop` counter (never
+                    // `skipped`), so replays of already-converged state
+                    // still ack cleanly.
+                    if let Some(reason) = success_report_non_ack_reason(&v) {
+                        return AckOutcome::Fail(reason);
+                    }
                     AckOutcome::Ack
                 }
                 Err(_) => AckOutcome::Ack, // body unparseable but 2xx = ack
@@ -224,6 +238,42 @@ pub(super) async fn post_once(
         }
         Err(e) => AckOutcome::Fail(crate::errors::msg::network(e)),
     }
+}
+
+/// #2341 (W1A2-01/02) — inspect a 2xx receiver report and return the
+/// non-ack reason when the peer's own envelope says items were NOT applied.
+///
+/// Non-ack triggers (fail-closed on the receiver's own admission):
+/// - `unsupported_on_postgres > 0` — the FED-RQ-01 postgres receiver
+///   honestly counts subcollections it cannot apply
+///   (archives/restores/pendings/decisions/namespace-meta/checkpoints);
+///   a 2xx carrying that count is a structural non-apply for this peer.
+/// - `skipped > 0` — the receiver refused items (validation failure,
+///   per-write attestation refusal, #1934 namespace-scope refusal, or a
+///   substrate error). Idempotent replays land `noop`, never `skipped`.
+///
+/// Everything else stays an ack: absent counters (legacy peers / plain
+/// 2xx bodies) keep the backward-compatible posture, and
+/// `checkpoints_conflicted` (first-resolution-wins convergence — the
+/// local resolution is KEPT by design) is deliberately not a non-ack.
+/// The 429 quota leg never reaches this function (`Throttled` is
+/// classified status-precise before the body parse).
+pub(super) fn success_report_non_ack_reason(v: &serde_json::Value) -> Option<String> {
+    let count = |key: &str| v.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let unsupported = count(crate::handlers::UNSUPPORTED_ON_POSTGRES_FIELD);
+    let skipped = count(crate::handlers::SKIPPED_FIELD);
+    if unsupported > 0 {
+        return Some(format!(
+            "peer 2xx but {unsupported} item(s) {} (not applied on this peer)",
+            crate::handlers::UNSUPPORTED_ON_POSTGRES_FIELD
+        ));
+    }
+    if skipped > 0 {
+        return Some(format!(
+            "peer 2xx but {skipped} item(s) skipped (refused/not applied by receiver)"
+        ));
+    }
+    None
 }
 
 /// Backoff before the single retry attempt in [`post_and_classify`].

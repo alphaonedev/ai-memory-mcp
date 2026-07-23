@@ -108,3 +108,84 @@ fn redact_before_sign_then_emit_verifies_against_persisted_bytes_1801() {
         "the emitted signature must round-trip (standard base64)"
     );
 }
+
+/// #2340 (FBL-32) — the RECEIVE-side twin of the ordering discipline above:
+/// an `off`-mode ORIGIN signs + emits over RAW secret-bearing bytes; a
+/// `redact`-mode receiver must redact to the to-be-persisted form BEFORE
+/// attestation, drop the now-uncoverable raw-bytes signature, and land the
+/// row `claimed` — NEVER a false `agent_attested` over bytes that differ
+/// from what is stored.
+#[test]
+fn receive_redacts_before_attestation_so_raw_signed_secret_lands_claimed_2340() {
+    set_screen_mode(SecretScreenMode::Redact);
+    let author = "ai:origin-off-mode";
+    let kp = keypair::generate(author).unwrap();
+    let mut mem = mem_with(&format!("deploy with {SECRET_TOKEN} then restart"));
+    mem.metadata = serde_json::json!({ "agent_id": author });
+
+    // Off-mode origin: `redact_before_sign` no-ops under `Off`, so the
+    // signature commits to the RAW bytes; EMIT ships it.
+    let sig = attest::sign_memory_write(&kp, &mem, author).unwrap();
+    attest::persist_write_signature(&mut mem, &sig);
+
+    // Receiver (#2340): redact to the persisted form BEFORE attestation.
+    let mutated = ai_memory::federation::receive_auth::redact_inbound_before_attestation(&mut mem);
+    assert!(mutated, "the raw secret must mutate the signed surface");
+    assert!(
+        !mem.content.contains(SECRET_TOKEN),
+        "content must be redacted to the persisted form"
+    );
+    assert!(
+        mem.metadata.get(WRITE_SIGNATURE).is_none(),
+        "the stale raw-bytes signature must be dropped"
+    );
+
+    // The attestation step (now with no presented signature) lands the row
+    // honestly `claimed` under the permissive posture.
+    let pk_b64 = base64::engine::general_purpose::STANDARD.encode(kp.public.to_bytes());
+    let level = attest::stamp_attestation(&mut mem, author, Some(&pk_b64), None, false)
+        .expect("unsigned permissive attestation");
+    assert_eq!(level.as_str(), "claimed");
+    assert_eq!(mem.metadata["attest_level"], "claimed");
+
+    // The storage funnel's own later redaction is an idempotent no-op — the
+    // stamped/attested bytes ARE the persisted bytes.
+    assert!(
+        redact_for_storage(&mem.content).is_none(),
+        "funnel redaction must be a no-op on the pre-redacted content"
+    );
+}
+
+/// #2340 (FBL-32) — same-mode traffic is untouched: an origin following the
+/// #1801 redact-before-sign discipline ships pre-redacted signed bytes; the
+/// receiver's pre-attestation redact is a no-op, the signature survives, and
+/// the row still verifies to `agent_attested` over the persisted bytes.
+#[test]
+fn receive_helper_is_noop_for_redact_before_sign_traffic_2340() {
+    set_screen_mode(SecretScreenMode::Redact);
+    let author = "ai:origin-same-mode";
+    let kp = keypair::generate(author).unwrap();
+    let mut mem = mem_with(&format!("deploy with {SECRET_TOKEN} then restart"));
+    mem.metadata = serde_json::json!({ "agent_id": author });
+
+    // Same-mode origin: redact FIRST, then sign + EMIT (#1801 discipline).
+    attest::redact_before_sign(&mut mem);
+    let sig = attest::sign_memory_write(&kp, &mem, author).unwrap();
+    attest::persist_write_signature(&mut mem, &sig);
+
+    let mutated = ai_memory::federation::receive_auth::redact_inbound_before_attestation(&mut mem);
+    assert!(
+        !mutated,
+        "pre-redacted signed bytes must pass the receive screen unchanged"
+    );
+    let presented = mem
+        .metadata
+        .get(WRITE_SIGNATURE)
+        .and_then(serde_json::Value::as_str)
+        .map(|s| base64::engine::general_purpose::STANDARD.decode(s).unwrap())
+        .expect("signature must be retained");
+    let pk_b64 = base64::engine::general_purpose::STANDARD.encode(kp.public.to_bytes());
+    let level = attest::stamp_attestation(&mut mem, author, Some(&pk_b64), Some(&presented), false)
+        .expect("attested traffic must keep verifying");
+    assert_eq!(level.as_str(), "agent_attested");
+}
