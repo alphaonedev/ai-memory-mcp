@@ -502,6 +502,77 @@ pub async fn update_memory(
         );
         crate::identity::preserve_provenance_keys(&existing_meta, new_meta)
     });
+    // FBL-12 (v1.0.0 pre-ship 3x7) — charge the storage-byte GROWTH of
+    // this in-place update against the row OWNER's per-namespace storage
+    // cap BEFORE the write lands. Pre-fix the update funnels (this HTTP
+    // PUT path + the MCP `memory_update` twin) skipped the quota entirely
+    // — only `insert` charged it — so an agent could grow each stored row
+    // to MAX_CONTENT_SIZE while its `current_storage_bytes` counter
+    // reflected only the store-time bytes (an unbounded-growth bypass of
+    // the per-agent storage cap). Keyed on the immutable row owner
+    // (`metadata.agent_id`) + effective namespace; a legacy-unowned row
+    // (empty owner) is uncharged, mirroring the create path.
+    let quota_charge: Option<(String, String, i64)> = match existing_for_authz.as_ref() {
+        Some(existing) => {
+            let owner = existing
+                .metadata
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if owner.is_empty() {
+                None
+            } else {
+                let eff_ns = body
+                    .namespace
+                    .as_deref()
+                    .unwrap_or(existing.namespace.as_str())
+                    .to_string();
+                let new_meta = preserved_metadata
+                    .clone()
+                    .unwrap_or_else(|| existing.metadata.clone());
+                let new_title = body.title.as_deref().unwrap_or(existing.title.as_str());
+                let new_content = body.content.as_deref().unwrap_or(existing.content.as_str());
+                let new_bytes = crate::quotas::coordination_payload_bytes(
+                    &[new_title, new_content],
+                    &[&new_meta],
+                );
+                let old_bytes = crate::quotas::coordination_payload_bytes(
+                    &[&existing.title, &existing.content],
+                    &[&existing.metadata],
+                );
+                match crate::quotas::charge_update_growth(
+                    &lock.0, &owner, &eff_ns, old_bytes, new_bytes,
+                ) {
+                    Ok(0) => None,
+                    Ok(delta) => Some((owner, eff_ns, delta)),
+                    Err(crate::quotas::QuotaCheckError::Quota(qe)) => {
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            Json(json!({
+                                "code": crate::errors::error_codes::QUOTA_EXCEEDED,
+                                "error": qe.to_string(),
+                                "limit": qe.limit.as_str(),
+                                "current": qe.current,
+                                "max": qe.max,
+                                "agent_id": qe.agent_id,
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Err(crate::quotas::QuotaCheckError::Sql(se)) => {
+                        tracing::error!("update_memory: quota substrate error: {se}");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": crate::errors::msg::QUOTA_CHECK_FAILED})),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+        }
+        None => None,
+    };
     match db::update_with_expected_version(
         &lock.0,
         &resolved_id,
@@ -599,9 +670,20 @@ pub async fn update_memory(
             Json(json!(mem)).into_response()
         }
         Ok((false, _)) => {
+            // FBL-12 — refund the growth charge when the row vanished
+            // between the charge and the write (the growth never landed).
+            if let Some((ref owner, ref ns, delta)) = quota_charge {
+                let _ = crate::quotas::refund_storage_only(&lock.0, owner, ns, delta);
+            }
             (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
         }
         Err(e) => {
+            // FBL-12 — refund the growth charge when the write itself
+            // fails (e.g. a VersionConflict) so a retry storm on a
+            // conflicting update cannot slowly inflate the counter.
+            if let Some((ref owner, ref ns, delta)) = quota_charge {
+                let _ = crate::quotas::refund_storage_only(&lock.0, owner, ns, delta);
+            }
             // v0.7.0 Provenance Gap 1 (#884) — typed VersionConflict
             // surfaces as 409 with a structured envelope naming both
             // expected + current versions so callers can re-read and

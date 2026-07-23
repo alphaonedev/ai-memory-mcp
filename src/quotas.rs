@@ -782,6 +782,58 @@ pub fn refund_storage_only(
     Ok(())
 }
 
+/// FBL-12 (v1.0.0 pre-ship 3x7) — charge the positive storage-byte
+/// GROWTH of a content-growing UPDATE against the row owner's
+/// per-namespace storage cap.
+///
+/// The update funnels (MCP `memory_update`, HTTP `PUT /memories/{id}`,
+/// the `content_append`/`content_replace` patch primitive) historically
+/// bypassed the storage-bytes quota entirely — only `insert` charged it
+/// — so an agent could grow each stored row to `MAX_CONTENT_SIZE`
+/// (64 KiB) while its `current_storage_bytes` counter reflected only the
+/// store-time bytes. That defeats the quota's stated blast-radius
+/// purpose (an agent nominally capped at 100 MiB could occupy multi-GB).
+///
+/// `old_bytes` / `new_bytes` are the `(title + content + serialized
+/// metadata)` byte counts BEFORE and AFTER the update, computed with the
+/// same accounting the write path uses ([`coordination_payload_bytes`]).
+///
+/// - `delta <= 0` (a shrink or no-op): returns `Ok(())` WITHOUT charging
+///   or refunding — the update never gets cheaper to store than its
+///   original charge, mirroring the conservative posture of the insert
+///   path (a caller cannot bank storage credit by shrinking a row).
+/// - `delta > 0`: charges the delta via [`check_and_record_storage_only`]
+///   (atomic `BEGIN IMMEDIATE`, storage-cap enforced, daily write-count
+///   untouched because an update is not a net-new memory). When the
+///   growth would breach `max_storage_bytes` the charge is refused with
+///   [`QuotaCheckError::Quota`] and the caller MUST refuse the update
+///   (fail-closed) — the growth never lands.
+///
+/// The caller refunds the returned delta via [`refund_storage_only`] if
+/// the subsequent update itself fails (e.g. a `VersionConflict`), so a
+/// retry storm on a conflicting update cannot slowly inflate the
+/// counter.
+///
+/// # Errors
+///
+/// - [`QuotaCheckError::Quota`] when the growth would exceed
+///   `max_storage_bytes`.
+/// - [`QuotaCheckError::Sql`] when the substrate read or write fails.
+pub fn charge_update_growth(
+    conn: &Connection,
+    agent_id: &str,
+    namespace: &str,
+    old_bytes: i64,
+    new_bytes: i64,
+) -> std::result::Result<i64, QuotaCheckError> {
+    let delta = new_bytes.saturating_sub(old_bytes);
+    if delta <= 0 {
+        return Ok(0);
+    }
+    check_and_record_storage_only(conn, agent_id, namespace, delta)?;
+    Ok(delta)
+}
+
 /// v0.7 K8 — record a successful write against the
 /// `(agent_id, namespace)` quota counters. Called AFTER the underlying
 /// insert succeeds so a failed store does not consume quota.
@@ -1069,6 +1121,52 @@ mod tests {
         ))
         .expect("apply v50 per-namespace migration");
         conn
+    }
+
+    // FBL-12 (v1.0.0 pre-ship 3x7) — charge_update_growth charges only the
+    // positive byte delta of a content-growing update.
+    #[test]
+    fn fbl12_charge_update_growth_charges_positive_delta() {
+        let conn = fresh_db();
+        let charged =
+            charge_update_growth(&conn, "agent-g", GLOBAL_NAMESPACE, 100, 250).expect("charge");
+        assert_eq!(charged, 150, "delta = new - old");
+        let status = get_status(&conn, "agent-g", GLOBAL_NAMESPACE).expect("status");
+        assert_eq!(status.current_storage_bytes, 150);
+    }
+
+    // FBL-12 — a shrink / no-op update charges nothing (never a refund,
+    // never negative credit).
+    #[test]
+    fn fbl12_charge_update_growth_noop_on_shrink() {
+        let conn = fresh_db();
+        let charged =
+            charge_update_growth(&conn, "agent-s", GLOBAL_NAMESPACE, 250, 100).expect("charge");
+        assert_eq!(charged, 0);
+        let status = get_status(&conn, "agent-s", GLOBAL_NAMESPACE).expect("status");
+        assert_eq!(status.current_storage_bytes, 0, "no charge on shrink");
+    }
+
+    // FBL-12 — growth past the storage cap is REFUSED (fail-closed) so an
+    // update cannot bypass max_storage_bytes.
+    #[test]
+    fn fbl12_charge_update_growth_refuses_past_cap() {
+        let conn = fresh_db();
+        // Seed the row then clamp the cap to a tiny value.
+        charge_update_growth(&conn, "agent-c", GLOBAL_NAMESPACE, 0, 10).expect("seed");
+        conn.execute(
+            "UPDATE agent_quotas SET max_storage_bytes = 20
+             WHERE agent_id = ?1 AND namespace = ?2",
+            params!["agent-c", GLOBAL_NAMESPACE],
+        )
+        .unwrap();
+        // current = 10, growth of 100 → 110 > 20 → refused.
+        let err = charge_update_growth(&conn, "agent-c", GLOBAL_NAMESPACE, 0, 100)
+            .expect_err("must refuse growth past cap");
+        assert!(matches!(err, QuotaCheckError::Quota(_)));
+        // The refusal did not mutate the counter.
+        let status = get_status(&conn, "agent-c", GLOBAL_NAMESPACE).expect("status");
+        assert_eq!(status.current_storage_bytes, 10, "refused charge is atomic");
     }
 
     #[test]

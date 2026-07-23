@@ -484,7 +484,54 @@ pub(super) fn handle_update(
         }));
     }
 
-    let (found, content_changed) = db::update_with_expected_version(
+    // FBL-12 (v1.0.0 pre-ship 3x7) — charge the storage-byte GROWTH of
+    // this in-place update against the row OWNER's per-namespace storage
+    // cap BEFORE the write lands. Pre-fix every update funnel (this MCP
+    // path, the HTTP PUT path, and the #1974 content_append/replace patch
+    // assembled above) skipped the quota entirely — only `insert` charged
+    // it — so an agent could grow each stored row to MAX_CONTENT_SIZE
+    // while its `current_storage_bytes` counter reflected only the
+    // store-time bytes (an unbounded-growth bypass of the per-agent
+    // storage cap). Keyed on the immutable row owner (`metadata.agent_id`)
+    // + effective namespace; a legacy-unowned row (empty owner) is
+    // uncharged, mirroring the insert path's `if !agent_id.is_empty()`.
+    let quota_charge: Option<(String, String, i64)> = {
+        let existing = db::get(conn, &resolved_id)
+            .map_err(|e| e.to_string())?
+            .ok_or(crate::errors::msg::MEMORY_NOT_FOUND)?;
+        let owner = existing
+            .metadata
+            .get(param_names::AGENT_ID)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if owner.is_empty() {
+            None
+        } else {
+            let eff_ns = namespace.unwrap_or(existing.namespace.as_str()).to_string();
+            let new_meta = metadata
+                .clone()
+                .unwrap_or_else(|| existing.metadata.clone());
+            let new_title = title.unwrap_or(existing.title.as_str());
+            let new_content = content.unwrap_or(existing.content.as_str());
+            let new_bytes =
+                crate::quotas::coordination_payload_bytes(&[new_title, new_content], &[&new_meta]);
+            let old_bytes = crate::quotas::coordination_payload_bytes(
+                &[&existing.title, &existing.content],
+                &[&existing.metadata],
+            );
+            match crate::quotas::charge_update_growth(conn, &owner, &eff_ns, old_bytes, new_bytes) {
+                Ok(0) => None,
+                Ok(delta) => Some((owner, eff_ns, delta)),
+                Err(crate::quotas::QuotaCheckError::Quota(qe)) => return Err(qe.to_string()),
+                Err(crate::quotas::QuotaCheckError::Sql(se)) => {
+                    return Err(format!("quota check failed: {se}"));
+                }
+            }
+        }
+    };
+
+    let (found, content_changed) = match db::update_with_expected_version(
         conn,
         &resolved_id,
         title,
@@ -500,10 +547,25 @@ pub(super) fn handle_update(
         expected_version,
         // v1.0.0 #1834 — opt-in valid_until patch (valid_from immutable).
         valid_until,
-    )
-    .map_err(|e| conflict_or_string(&e))?;
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            // FBL-12 — refund the growth charge when the write itself
+            // fails (e.g. a VersionConflict) so a retry storm on a
+            // conflicting update cannot slowly inflate the counter.
+            if let Some((ref owner, ref ns, delta)) = quota_charge {
+                let _ = crate::quotas::refund_storage_only(conn, owner, ns, delta);
+            }
+            return Err(conflict_or_string(&e));
+        }
+    };
 
     if !found {
+        // FBL-12 — refund on the not-found tail (the row vanished
+        // between the charge and the write); the growth never landed.
+        if let Some((ref owner, ref ns, delta)) = quota_charge {
+            let _ = crate::quotas::refund_storage_only(conn, owner, ns, delta);
+        }
         return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
     }
 
@@ -635,6 +697,68 @@ mod tests {
             version: 1,
             lifecycle_state: crate::models::LifecycleState::Open,
         }
+    }
+
+    // FBL-12 (v1.0.0 pre-ship 3x7) — a content-growing in-place update
+    // charges the storage-byte GROWTH against the row OWNER's storage
+    // quota. Pre-fix every update funnel charged ZERO, so an agent could
+    // grow each row toward MAX_CONTENT_SIZE while its
+    // `current_storage_bytes` counter stayed at the store-time value — an
+    // unbounded-growth bypass of the per-agent storage cap.
+    #[test]
+    fn fbl12_content_growing_update_charges_storage_quota() {
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
+        let conn = fresh_conn();
+        let mem = make_mem("quota-grow"); // owner "ai:owner", namespace "test"
+        let id = db::insert(&conn, &mem).expect("ins");
+        let before = crate::quotas::get_status(&conn, "ai:owner", "test")
+            .expect("status")
+            .current_storage_bytes;
+        let big = "x".repeat(20_000);
+        handle_update(
+            &conn,
+            &json!({ "id": id, "content": big }),
+            None,
+            None,
+            None,
+        )
+        .expect("update ok");
+        let after = crate::quotas::get_status(&conn, "ai:owner", "test")
+            .expect("status")
+            .current_storage_bytes;
+        assert!(
+            after >= before + 15_000,
+            "content growth must charge the storage-bytes delta (before={before}, after={after})"
+        );
+    }
+
+    // FBL-12 — a SHRINKING update charges nothing: the caller can never
+    // bank negative storage credit, and a shrink is never refused.
+    #[test]
+    fn fbl12_shrinking_update_charges_nothing() {
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
+        let conn = fresh_conn();
+        let mut mem = make_mem("quota-shrink");
+        mem.content = "y".repeat(10_000);
+        let id = db::insert(&conn, &mem).expect("ins");
+        let before = crate::quotas::get_status(&conn, "ai:owner", "test")
+            .expect("status")
+            .current_storage_bytes;
+        handle_update(
+            &conn,
+            &json!({ "id": id, "content": "tiny" }),
+            None,
+            None,
+            None,
+        )
+        .expect("update ok");
+        let after = crate::quotas::get_status(&conn, "ai:owner", "test")
+            .expect("status")
+            .current_storage_bytes;
+        assert_eq!(
+            before, after,
+            "a shrink must not change the storage counter"
+        );
     }
 
     // A. happy path — update multiple fields, no embedder
