@@ -13313,6 +13313,42 @@ async fn unproject_memory_from_age_inner(
     Ok(())
 }
 
+/// FBL-08 (v1.0.0) — best-effort AGE EDGE unprojection for
+/// [`PostgresStore::delete_link`]. Deletes every relationship between the
+/// two `Memory` nodes (all relations, matching the relational
+/// `DELETE ... WHERE source_id = $1 AND target_id = $2`) WITHOUT touching
+/// the nodes themselves (contrast [`unproject_memory_from_age_inner`],
+/// which `DETACH DELETE`s a node on a memory hard-delete). Mirrors the
+/// [`project_link_into_age`] discipline (tolerated LOAD + `SET LOCAL`
+/// search_path; the id is bound through the params surface, never
+/// interpolated). Called under a SAVEPOINT so an AGE runtime failure
+/// degrades to a warn rather than aborting the relational delete.
+async fn unproject_link_from_age(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    source_id: &str,
+    target_id: &str,
+) -> StoreResult<()> {
+    // #1542/#1640 — shared tolerated-LOAD helper.
+    load_age_tolerated(tx).await?;
+    sqlx::query(SQL_SET_AGE_SEARCH_PATH)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("set search_path (unproject_link)", e))?;
+    // AGE 1.5.0 requires both the `AS (col agtype)` column list and a
+    // trailing RETURN even for a write; the endpoint ids are bound
+    // through the params surface exactly like the link MERGE.
+    let sql = "SELECT r FROM cypher('memory_graph', \
+         $$ MATCH (s:Memory {id: $src})-[r]->(t:Memory {id: $dst}) DELETE r RETURN r $$, \
+         $1) AS (r agtype)";
+    let params = age_params_jsonb(&[("src", source_id), ("dst", target_id)]);
+    sqlx::query(sql)
+        .bind(Agtype(params))
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("unproject link edge from AGE", e))?;
+    Ok(())
+}
+
 /// from sqlx; the AGE branch needs this helper to mirror the same
 /// shape so the upper-layer handler stays backend-blind.
 fn agtype_optional_string(s: &str) -> Option<String> {
@@ -16435,6 +16471,86 @@ impl MemoryStore for PostgresStore {
                 })
             })
             .collect()
+    }
+
+    /// FBL-08 (v1.0.0) — remove the directional link(s) `source_id →
+    /// target_id` from the postgres store. The relational `DELETE FROM
+    /// memory_links` is the source of truth (all relations between the
+    /// pair, matching the sqlite `db::delete_link` contract); the AGE
+    /// `memory_graph` edge mirror is unprojected best-effort in the SAME
+    /// tx under `sync` projection mode so a subsequent cypher-backed
+    /// `find_paths` does not traverse a phantom edge. Under `deferred`
+    /// mode the AGE mirror is already read via the relational recursive-
+    /// CTE, so a lagging edge is tolerated (no inline unprojection).
+    async fn delete_link(
+        &self,
+        _ctx: &CallerContext,
+        source_id: &str,
+        target_id: &str,
+    ) -> StoreResult<bool> {
+        self.gate_record_stop()?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin delete_link tx", e))?;
+
+        let res = sqlx::query("DELETE FROM memory_links WHERE source_id = $1 AND target_id = $2")
+            .bind(source_id)
+            .bind(target_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("delete memory_link", e))?;
+        let removed = res.rows_affected() > 0;
+
+        if removed
+            && matches!(self.kg_backend, KgBackend::Age)
+            && matches!(
+                crate::config::age_projection_mode(),
+                crate::config::AgeProjectionMode::Sync
+            )
+        {
+            // Mirror the link-INSERT projection discipline (#1542): the
+            // whole unprojection rides a SAVEPOINT so an AGE runtime
+            // failure rolls back to a healthy outer tx and degrades to a
+            // warn instead of aborting the canonical relational delete.
+            sqlx::query("SAVEPOINT age_link_unprojection")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("savepoint age_link_unprojection", e))?;
+            match unproject_link_from_age(&mut tx, source_id, target_id).await {
+                Ok(()) => {
+                    sqlx::query("RELEASE SAVEPOINT age_link_unprojection")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| to_store_err("release savepoint age_link_unprojection", e))?;
+                }
+                Err(e) if is_age_runtime_failure(&e) => {
+                    sqlx::query("ROLLBACK TO SAVEPOINT age_link_unprojection")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e2| {
+                            to_store_err("rollback savepoint age_link_unprojection", e2)
+                        })?;
+                    tracing::warn!(
+                        target: TRACE_TARGET_KG,
+                        source_id = %source_id,
+                        target_id = %target_id,
+                        err = %e,
+                        "AGE edge unprojection skipped on link delete — \
+                         relational memory_links row(s) still removed. \
+                         find_paths_cypher may traverse a phantom edge until \
+                         the projection is rebuilt; the relational CTE is correct."
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit delete_link tx", e))?;
+        Ok(removed)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
