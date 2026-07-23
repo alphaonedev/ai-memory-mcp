@@ -1022,7 +1022,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `try_load_from` Result-returning loaders (the hot-swap reload path
     // that PROPAGATES parse/validate errors instead of swallowing them to
     // default()) land config.rs at 12_897; ceiling 12_850 -> 12_950 (+53).
-    ("src/config.rs", 12_950),
+    // 2026-07-23 FBL-13/FBL-30/FBL-31 config-defaults-lie honesty fixes
+    // (max_memory_mb inert WARN + doc-correct, auto_extract reserved doc,
+    // audit schema_version/hash_chain/attestation doc + resolve/warn helper +
+    // regression test) land config.rs at 12_969; ceiling 12_950 -> 13_020
+    // (+51 headroom, lockstep).
+    ("src/config.rs", 13_020),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the
@@ -1194,7 +1199,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // coverage tests (bind/revoke × json/non-json + empty-token error) to clear
     // the daemon_runtime.rs per-module COVERAGE floor. Combined with #2045 L6
     // this lands daemon_runtime.rs at 10_676; ceiling 10_500 → 10_750.
-    ("src/daemon_runtime.rs", 11_450), /* 2026-07-17 #2167 extract run_sqlite_embedding_space_boot_maintenance helper + both-open-arms unit test to cover the boot-open Err arm (10_783). 2026-07-19 #2064 erasure gc-tick wiring stacked on the #2205 export --full + #1860 vectorlite serve/mcp boot funnels lands the merged file at 10_853; ceiling 10_850 -> 10_900 (lockstep). 2026-07-19 pre-ship 3x7: erasure sweep moved OFF the handler mutex (detached spawn_blocking arm + shared log helper) lands the file at 10_931; ceiling 10_900 -> 10_950 (lockstep). 2026-07-19 merged with the #2233/#2235 lineage boot-seed (+26) -> 10_957; ceiling 10_950 -> 11_000 (lockstep). 2026-07-19 #2271 consultation-posture mutation seam + behavior pin lands at 11_032; ceiling 11_000 -> 11_050 (lockstep). 2026-07-20 #2271 shutdown lifecycle hardening tracks every writer, bounds plain/TLS quiescence, drains deferred audit, and makes final witness/WAL certification fail closed; production plus regression coverage lands at 11_326, ceiling 11_050 -> 11_400 (+74 headroom, lockstep). 2026-07-21 #2290 sign the sync_cycle_once /sync/since pull GET (load daemon signing key + attach X-Memory-Sig/X-Memory-Nonce) lands the file at 11_406; ceiling 11_400 -> 11_450 (+44 headroom, lockstep). */
+    ("src/daemon_runtime.rs", 11_640), /* 2026-07-17 #2167 extract run_sqlite_embedding_space_boot_maintenance helper + both-open-arms unit test to cover the boot-open Err arm (10_783). 2026-07-19 #2064 erasure gc-tick wiring stacked on the #2205 export --full + #1860 vectorlite serve/mcp boot funnels lands the merged file at 10_853; ceiling 10_850 -> 10_900 (lockstep). 2026-07-19 pre-ship 3x7: erasure sweep moved OFF the handler mutex (detached spawn_blocking arm + shared log helper) lands the file at 10_931; ceiling 10_900 -> 10_950 (lockstep). 2026-07-19 merged with the #2233/#2235 lineage boot-seed (+26) -> 10_957; ceiling 10_950 -> 11_000 (lockstep). 2026-07-19 #2271 consultation-posture mutation seam + behavior pin lands at 11_032; ceiling 11_000 -> 11_050 (lockstep). 2026-07-20 #2271 shutdown lifecycle hardening tracks every writer, bounds plain/TLS quiescence, drains deferred audit, and makes final witness/WAL certification fail closed; production plus regression coverage lands at 11_326, ceiling 11_050 -> 11_400 (+74 headroom, lockstep). 2026-07-21 #2290 sign the sync_cycle_once /sync/since pull GET (load daemon signing key + attach X-Memory-Sig/X-Memory-Nonce) lands the file at 11_406; ceiling 11_400 -> 11_450 (+44 headroom, lockstep). 2026-07-23 FBL-22 postgres serve maintenance loop (spawn_postgres_maintenance_loop_if_enabled gc + archive-purge + lease-sweep pg twin + bootstrap wiring + 2 spawn/skip unit tests) lands the file at 11_573; ceiling 11_450 -> 11_640 (+67 headroom, lockstep). */
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
