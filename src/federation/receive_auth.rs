@@ -562,6 +562,75 @@ pub fn evaluate_inbound_policy_freshness(
     }
 }
 
+/// #2340 (FBL-32) — redact an inbound relayed memory to its TO-BE-PERSISTED
+/// form BEFORE the per-write content attestation stamps `attest_level`.
+///
+/// The storage funnels redact under the forced `refuse`→`redact`
+/// federation-receive posture (env row #95), so pre-fix the receive path
+/// verified + stamped `agent_attested` over the RAW inbound bytes and then
+/// persisted DIFFERENT (redacted) bytes — a row whose `write_signature` no
+/// longer covers its own stored content, violating the
+/// [`crate::identity::attest`] signed-bytes == persisted-bytes contract and
+/// env row #94 ("recomputing sha256(content) over the PERSISTED content
+/// bytes"). This mirrors the authoring-side redact-before-sign discipline
+/// (#1801): attestation is evaluated over exactly the bytes the funnel will
+/// store, making the funnel's own later redaction an idempotent no-op.
+///
+/// Dispositions:
+/// - **Same-mode traffic** (the author redacted before signing, or the
+///   content carries no credential material): the screen is a no-op or
+///   idempotent, the signature still covers the persisted bytes, and
+///   `agent_attested` is preserved — byte-identical behavior.
+/// - **Cross-mode traffic** (an `off`-mode origin signed + shipped RAW
+///   secret-bearing bytes): the SIGNED surface (content and/or title)
+///   mutates, so the presented `metadata.write_signature` can no longer
+///   cover any bytes this node will persist. The stale signature is DROPPED
+///   (with a WARN) so the attestation step lands the row honestly at
+///   `claimed` — or refuses an honored third-party relay under the strict
+///   flip — instead of stamping a cryptographically false `agent_attested`.
+///
+/// Returns `true` when the screen mutated the SIGNED surface (any presented
+/// raw-bytes `write_signature` was dropped alongside).
+pub fn redact_inbound_before_attestation(mem: &mut crate::models::Memory) -> bool {
+    let screened = crate::secret_screen::redact_memory_for_storage(mem);
+    apply_screened_inbound(mem, screened)
+}
+
+/// Pure core of [`redact_inbound_before_attestation`]: fold an
+/// already-computed screened clone back onto the inbound row and drop the
+/// presented `write_signature` iff the SIGNED surface (content / title — the
+/// two [`crate::identity::sign::SignableWrite`] fields the screen can
+/// mutate) changed. Split out so the disposition is unit-testable without
+/// touching the process-global screen-mode `OnceLock`.
+fn apply_screened_inbound(
+    mem: &mut crate::models::Memory,
+    screened: Option<crate::models::Memory>,
+) -> bool {
+    let Some(screened) = screened else {
+        return false;
+    };
+    let signed_surface_mutated = screened.content != mem.content || screened.title != mem.title;
+    *mem = screened;
+    if !signed_surface_mutated {
+        return false;
+    }
+    let dropped = mem.metadata.as_object_mut().is_some_and(|obj| {
+        obj.remove(crate::models::field_names::WRITE_SIGNATURE)
+            .is_some()
+    });
+    if dropped {
+        tracing::warn!(
+            target: crate::handlers::federation_receive::ATTESTATION_TRACE_TARGET,
+            memory_id = %mem.id,
+            "sync_push: secret screen redacted the SIGNED surface of an inbound \
+             relayed memory; dropping the presented write_signature (it covers raw \
+             bytes this node will not persist) so the row cannot land falsely \
+             agent_attested (#2340). Origin should redact-before-sign (#1801)."
+        );
+    }
+    signed_surface_mutated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -964,5 +1033,112 @@ mod tests {
             assert!(require_checkpoint_sig_enabled(), "{truthy:?} → strict");
         }
         unsafe { std::env::remove_var(REQUIRE_CHECKPOINT_SIG_ENV) };
+    }
+
+    // ---- #2340 (FBL-32) — redact-before-attestation disposition ----
+    //
+    // These exercise the pure core `apply_screened_inbound` with a
+    // hand-built screened clone so they never touch the process-global
+    // screen-mode `OnceLock` (lib unit tests share one process; seeding
+    // `Redact` here would leak into unrelated storage-funnel tests). The
+    // real-screen wiring is pinned by the integration twins in
+    // `tests/federation_write_sig_emit_1801.rs` (a Redact-seeded binary).
+
+    use crate::identity::attest;
+    use crate::models::Memory;
+    use base64::Engine as _;
+
+    fn signed_secret_mem(author: &str) -> (Memory, crate::identity::keypair::AgentKeypair) {
+        let kp = kp_mod::generate(author).unwrap();
+        let mut mem = Memory {
+            id: "m-2340".to_string(),
+            namespace: "team/alpha".to_string(),
+            title: "deploy notes".to_string(),
+            content: "deploy with ghp_abcdefghijklmnopqrstuvwxyz0123456789 then restart"
+                .to_string(),
+            created_at: "2026-07-01T12:00:00+00:00".to_string(),
+            metadata: serde_json::json!({ "agent_id": author }),
+            ..Memory::default()
+        };
+        // Off-mode origin: sign over the RAW bytes and EMIT the signature.
+        let sig = attest::sign_memory_write(&kp, &mem, author).unwrap();
+        attest::persist_write_signature(&mut mem, &sig);
+        (mem, kp)
+    }
+
+    fn pk_b64(kp: &crate::identity::keypair::AgentKeypair) -> String {
+        base64::engine::general_purpose::STANDARD.encode(kp.public.to_bytes())
+    }
+
+    /// Cross-mode: the screen mutated the SIGNED surface, so the stale
+    /// raw-bytes signature is dropped and the attestation step lands the
+    /// row honestly at `claimed` — never a false `agent_attested` over
+    /// bytes that differ from what is stored.
+    #[test]
+    fn screened_signed_surface_drops_stale_signature_and_lands_claimed_2340() {
+        let author = "ai:origin-off-2340";
+        let (mut mem, kp) = signed_secret_mem(author);
+        let screened = Memory {
+            content: "deploy with [REDACTED:github_token] then restart".to_string(),
+            ..mem.clone()
+        };
+        assert!(super::apply_screened_inbound(&mut mem, Some(screened)));
+        assert!(
+            mem.metadata
+                .get(crate::models::field_names::WRITE_SIGNATURE)
+                .is_none(),
+            "stale raw-bytes write_signature must be dropped"
+        );
+        // The funnel then attests with NO presented signature (the drop) →
+        // permissive lands `claimed`.
+        let level =
+            attest::stamp_attestation(&mut mem, author, Some(&pk_b64(&kp)), None, false).unwrap();
+        assert_eq!(level.as_str(), "claimed");
+        assert_eq!(mem.metadata["attest_level"], "claimed");
+    }
+
+    /// Same-mode / clean traffic: no screen hit (`None`) keeps the presented
+    /// signature intact, and it still verifies to `agent_attested` over the
+    /// unchanged (persisted) bytes.
+    #[test]
+    fn clean_screen_keeps_signature_and_agent_attested_2340() {
+        let author = "ai:origin-clean-2340";
+        let (mut mem, kp) = signed_secret_mem(author);
+        assert!(!super::apply_screened_inbound(&mut mem, None));
+        let presented = mem
+            .metadata
+            .get(crate::models::field_names::WRITE_SIGNATURE)
+            .and_then(serde_json::Value::as_str)
+            .map(|s| base64::engine::general_purpose::STANDARD.decode(s).unwrap())
+            .expect("signature retained");
+        let level = attest::stamp_attestation(
+            &mut mem,
+            author,
+            Some(&pk_b64(&kp)),
+            Some(&presented),
+            false,
+        )
+        .unwrap();
+        assert_eq!(level.as_str(), "agent_attested");
+    }
+
+    /// A screen hit that mutates ONLY unsigned surfaces (tags / metadata
+    /// values) keeps the signature: the `SignableWrite` envelope commits to
+    /// content + title only, so the signature still covers the persisted
+    /// signed bytes.
+    #[test]
+    fn unsigned_surface_only_redaction_keeps_signature_2340() {
+        let author = "ai:origin-meta-2340";
+        let (mut mem, _kp) = signed_secret_mem(author);
+        let mut screened = mem.clone();
+        screened.tags = vec!["[REDACTED:bearer_token]".to_string()];
+        assert!(!super::apply_screened_inbound(&mut mem, Some(screened)));
+        assert!(
+            mem.metadata
+                .get(crate::models::field_names::WRITE_SIGNATURE)
+                .is_some(),
+            "signature covering unmutated content+title must be retained"
+        );
+        assert_eq!(mem.tags, vec!["[REDACTED:bearer_token]".to_string()]);
     }
 }

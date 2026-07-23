@@ -490,6 +490,18 @@ fn apply_all_classes(
                 }
             }
         }
+        // #2353 (sibling of #2340) — redact to the TO-BE-PERSISTED form
+        // BEFORE the attestation re-derivation below, so the stamp covers
+        // exactly the bytes `storage::insert_imported`'s origin-blind screen
+        // will persist. Under `redact` mode a bundle row whose signature
+        // covers RAW secret-bearing bytes would otherwise land
+        // `agent_attested` with mutated stored bytes (the #2340
+        // stamp-then-redact class); the helper drops the now-uncoverable
+        // signature so the row lands honestly `claimed`. (Under the default
+        // `refuse` mode the L1-parity `validate_memory` below refuses
+        // secret-bearing rows outright, so this only changes `redact`-mode
+        // outcomes.)
+        crate::federation::receive_auth::redact_inbound_before_attestation(&mut staged);
         // ── Pre-ship 3x7 HIGH-1 — NEVER trust wire attestation. ──
         // Bundles are UNAUTHENTICATED input (this module's own threat
         // model), yet pre-fix the wire-supplied `metadata.attest_level` /
