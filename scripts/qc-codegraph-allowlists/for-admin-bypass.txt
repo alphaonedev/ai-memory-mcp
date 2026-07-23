@@ -12,6 +12,12 @@ src/curator/compaction.rs:CONSOLIDATOR_AGENT_ID
 src/curator/decorrelation_probe.rs:agent_id
 src/curator/reflection_pass.rs:agent_id
 src/curator/transcript_classify_pass.rs:agent_id
+# FBL-22 (#2342) — postgres serve maintenance loop (spawn_postgres_maintenance_
+# loop_if_enabled): the periodic archive_purge must cover EVERY owner's stale
+# archives, mirroring the sqlite loop's unscoped db::auto_purge_archive. The
+# admin/bypass ctx is the daemon principal, constructed from the DAEMON_PRINCIPAL
+# const (never a raw literal); background maintenance, never a tenant handler.
+src/daemon_runtime.rs:DAEMON_PRINCIPAL
 src/daemon_runtime.rs:EMBEDDING_BACKFILL
 src/federation/receive.rs:FEDERATION_CATCHUP
 src/handlers/admin.rs:DAEMON_PRINCIPAL

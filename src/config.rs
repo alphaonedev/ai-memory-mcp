@@ -142,7 +142,11 @@ pub mod config_keys {
     pub const DEFAULT_NAMESPACE: &str = "default_namespace";
     /// Legacy flat `embedding_model` key (v2: `[embeddings].model`).
     pub const EMBEDDING_MODEL: &str = "embedding_model";
-    /// Legacy flat `max_memory_mb` key (v2: resolved via `[storage]`).
+    /// Legacy flat `max_memory_mb` key. PARSED but NOT ENFORCED (FBL-13):
+    /// it has no runtime consumer — it does not cap memory or storage and is
+    /// NOT an auto-tier-selection input on any live path. `resolve_storage`
+    /// emits a one-shot WARN when it is set. Use `[limits].max_storage_bytes`
+    /// (`AI_MEMORY_MAX_STORAGE_BYTES`) for an actual per-agent storage ceiling.
     pub const MAX_MEMORY_MB: &str = "max_memory_mb";
     /// Legacy flat `ollama_url` key (v2: `[llm].base_url` / `[embeddings].url`).
     pub const OLLAMA_URL: &str = "ollama_url";
@@ -172,6 +176,24 @@ pub mod config_keys {
 #[must_use]
 pub fn default_tier_llm_model() -> &'static str {
     backend_default_model(crate::llm::BACKEND_OLLAMA)
+}
+
+/// FBL-13 — one-shot operator WARN that the legacy `max_memory_mb` knob is
+/// parsed but NOT enforced (no runtime consumer). Gated by a process-`Once` so
+/// the repeated `resolve_storage` calls (serve / mcp / doctor boot) do not spam
+/// the log. See [`config_keys::MAX_MEMORY_MB`].
+fn warn_max_memory_mb_inert_once() {
+    use std::sync::Once;
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            target: "config.max_memory_mb",
+            "config `max_memory_mb` is parsed but NOT enforced — it does not cap \
+             memory or storage and is not an auto-tier-selection input on any \
+             live path (FBL-13). For a real per-agent storage ceiling use \
+             [limits].max_storage_bytes / AI_MEMORY_MAX_STORAGE_BYTES"
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -2405,14 +2427,20 @@ pub struct TranscriptNamespaceConfig {
     pub default_ttl_secs: Option<i64>,
     /// Namespace-specific archive-grace override.
     pub archive_grace_secs: Option<i64>,
-    /// v0.7 I5 — opt in the namespace to the reference R5 pre_store
+    /// v0.7 I5 — per-namespace opt-in intent for the reference R5 pre_store
     /// transcript-extractor hook (`tools/transcript-extractor/`).
-    /// Default `None` → disabled, matching the "default off" lesson
-    /// from G3-G11. Operators that wire the extractor binary into
-    /// their `hooks.toml` set this flag per namespace to gate the
-    /// derived-memory expansion. `Some(false)` is identical to
-    /// `None` and exists so an explicit "no, don't extract here"
-    /// can be expressed alongside a wildcard `Some(true)`.
+    ///
+    /// **RESERVED / NOT YET ENFORCED (FBL-30).** [`Self::auto_extract`] is
+    /// resolved by [`TranscriptsConfig::auto_extract_for`], but NO production
+    /// pre_store dispatch path consults it — there is no substrate mechanism to
+    /// identify "the extractor hook" among generic `[[hook]]` command entries,
+    /// so this flag cannot gate a generic hook. It does NOT short-circuit the
+    /// pre_store chain (the extractor binary self-gates only on transcript
+    /// shape). To actually scope the extractor to specific namespaces, use the
+    /// per-hook `namespace` field in `hooks.toml` (wired by FBL-29): a
+    /// `[[hook]]` with `namespace = "agent/claude"` fires ONLY in that
+    /// namespace. `Some(false)` is identical to `None`; the field is retained
+    /// as tested infrastructure for a future wiring.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_extract: Option<bool>,
 }
@@ -2534,10 +2562,13 @@ impl TranscriptsConfig {
     /// 4. `false` (default off — matches the "every reference hook
     ///    ships off-by-default" lesson from G10/G11).
     ///
-    /// The R5 reference extractor (`tools/transcript-extractor/`)
-    /// reads this flag at the namespace gate before doing any LLM
-    /// work, so a namespace that hasn't opted in pays the cost of
-    /// one HashMap lookup per `pre_store` fire and nothing more.
+    /// **RESERVED / NOT YET ENFORCED (FBL-30).** This resolver is correct but
+    /// has NO production caller: no pre_store dispatch path consults it, and
+    /// the R5 reference extractor binary does NOT read config (it depends only
+    /// on serde and self-gates on transcript shape). It is NOT the mechanism
+    /// that scopes the extractor — the wired per-hook `namespace` field in
+    /// `hooks.toml` (FBL-29) is. Kept as tested infrastructure for a future
+    /// wiring; callers must not assume it gates anything today.
     #[must_use]
     pub fn auto_extract_for(&self, namespace: &str) -> bool {
         let Some(table) = self.namespaces.as_ref() else {
@@ -6261,20 +6292,30 @@ pub struct AuditConfig {
     pub path: Option<String>,
     /// Documented schema version on the wire. The binary always emits
     /// `audit::SCHEMA_VERSION`; this knob is reserved for forward
-    /// compatibility and must equal the binary's emitted version
-    /// today (validated at init).
+    /// compatibility and must equal the binary's emitted version today.
+    /// VALIDATED at init (FBL-31): an explicit value that does not match
+    /// `audit::SCHEMA_VERSION` fails the audit-sink init fail-closed.
+    /// Unset is the default (no-op).
     pub schema_version: Option<u32>,
     /// Whether to redact `memory.content` from emitted events. **The
     /// only supported value in v1 is `true`** — the audit schema does
     /// not expose a content field at all; this flag is reserved for a
     /// future per-namespace exception API.
     pub redact_content: Option<bool>,
-    /// Whether to compute and verify the per-line hash chain. Default `true`.
+    /// Whether to compute and verify the per-line hash chain. The
+    /// cross-row hash chain is MANDATORY (the load-bearing tamper-evidence)
+    /// and cannot be disabled — an explicit `hash_chain = false` is REFUSED
+    /// at audit init fail-closed (FBL-31). Default (unset) / `true` proceed.
     pub hash_chain: Option<bool>,
-    /// Cadence in minutes for the periodic `CHECKPOINT.sig`
-    /// attestation marker. The marker is a synthetic audit event that
-    /// pins the chain head into the log so an attacker who truncates
-    /// the file can't silently rewind history. Default 60. 0 disables.
+    /// Cadence in minutes for the periodic `CHECKPOINT.sig` attestation
+    /// marker — a synthetic audit event that would pin the chain head into
+    /// the log so a file-truncation attacker can't silently rewind history.
+    /// **RESERVED / NOT YET EMITTED (FBL-31):** no emission loop exists yet;
+    /// an audit-enabled daemon with a non-zero cadence emits a one-shot
+    /// operator WARN naming the reserved status instead of silently
+    /// advertising attestation it does not get. The load-bearing
+    /// anti-truncation evidence today is the `signed_events` witness /
+    /// watermark chain, not this marker. Default 60. 0 disables the WARN.
     pub attestation_cadence_minutes: Option<u32>,
     /// Apply the platform-appropriate "append-only" file flag at
     /// startup. Best-effort defense in depth; the chain is the
@@ -8492,6 +8533,16 @@ impl AppConfig {
             .or(self.archive_max_days);
 
         let max_memory_mb = cfg.and_then(|s| s.max_memory_mb).or(self.max_memory_mb);
+        // FBL-13 — `max_memory_mb` is DEAD config: it is parsed, migrated, and
+        // carried onto `ResolvedStorage`, but NO production code consumes it
+        // (it caps neither memory nor storage, and is not an auto-tier-selection
+        // input on any live path). Rather than let a documented operator ceiling
+        // silently do nothing, emit a one-shot WARN naming the real knob. The
+        // field is retained (removing the public `TierConfig.max_memory_mb` /
+        // resolved carrier is a wire/back-compat change deferred to a vote).
+        if max_memory_mb.is_some() {
+            warn_max_memory_mb_inert_once();
+        }
 
         // #1579 B7 — sqlite mmap size, uniform ladder:
         // env > [storage] section > compiled default. `0` is a
@@ -8815,9 +8866,6 @@ impl AppConfig {
 
 # Default namespace for new memories
 # default_namespace = "global"
-
-# Memory budget in MB (for auto tier selection)
-# max_memory_mb = 4096
 
 # Archive expired memories before GC deletion (default: true)
 # archive_on_gc = true
@@ -12238,6 +12286,28 @@ max_page_size = 1000000
             crate::storage::DEFAULT_DB_MMAP_SIZE_BYTES,
             "no env + no section must bottom out on the compiled 256 MiB default"
         );
+    }
+
+    #[test]
+    fn resolve_storage_carries_but_does_not_enforce_max_memory_mb_fbl13() {
+        // FBL-13 — the legacy `max_memory_mb` flat field resolves onto
+        // ResolvedStorage (the produced field is what is dead — no consumer),
+        // and the resolve path is reachable with the WARN branch taken. This
+        // pins that setting the knob does NOT error and is carried verbatim
+        // (removing the field is a separate vote-gated wire change).
+        let _g = env_var_lock();
+        let mut cfg = empty_app_config();
+        cfg.max_memory_mb = Some(64);
+        let resolved = cfg.resolve_storage();
+        assert_eq!(
+            resolved.max_memory_mb,
+            Some(64),
+            "legacy max_memory_mb must still resolve onto ResolvedStorage (it is \
+             the produced-but-unconsumed field that is dead, not the parse)"
+        );
+        // A config with no max_memory_mb leaves it None (WARN branch not taken).
+        let bare = empty_app_config();
+        assert_eq!(bare.resolve_storage().max_memory_mb, None);
     }
 
     #[test]
