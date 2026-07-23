@@ -6292,20 +6292,30 @@ pub struct AuditConfig {
     pub path: Option<String>,
     /// Documented schema version on the wire. The binary always emits
     /// `audit::SCHEMA_VERSION`; this knob is reserved for forward
-    /// compatibility and must equal the binary's emitted version
-    /// today (validated at init).
+    /// compatibility and must equal the binary's emitted version today.
+    /// VALIDATED at init (FBL-31): an explicit value that does not match
+    /// `audit::SCHEMA_VERSION` fails the audit-sink init fail-closed.
+    /// Unset is the default (no-op).
     pub schema_version: Option<u32>,
     /// Whether to redact `memory.content` from emitted events. **The
     /// only supported value in v1 is `true`** — the audit schema does
     /// not expose a content field at all; this flag is reserved for a
     /// future per-namespace exception API.
     pub redact_content: Option<bool>,
-    /// Whether to compute and verify the per-line hash chain. Default `true`.
+    /// Whether to compute and verify the per-line hash chain. The
+    /// cross-row hash chain is MANDATORY (the load-bearing tamper-evidence)
+    /// and cannot be disabled — an explicit `hash_chain = false` is REFUSED
+    /// at audit init fail-closed (FBL-31). Default (unset) / `true` proceed.
     pub hash_chain: Option<bool>,
-    /// Cadence in minutes for the periodic `CHECKPOINT.sig`
-    /// attestation marker. The marker is a synthetic audit event that
-    /// pins the chain head into the log so an attacker who truncates
-    /// the file can't silently rewind history. Default 60. 0 disables.
+    /// Cadence in minutes for the periodic `CHECKPOINT.sig` attestation
+    /// marker — a synthetic audit event that would pin the chain head into
+    /// the log so a file-truncation attacker can't silently rewind history.
+    /// **RESERVED / NOT YET EMITTED (FBL-31):** no emission loop exists yet;
+    /// an audit-enabled daemon with a non-zero cadence emits a one-shot
+    /// operator WARN naming the reserved status instead of silently
+    /// advertising attestation it does not get. The load-bearing
+    /// anti-truncation evidence today is the `signed_events` witness /
+    /// watermark chain, not this marker. Default 60. 0 disables the WARN.
     pub attestation_cadence_minutes: Option<u32>,
     /// Apply the platform-appropriate "append-only" file flag at
     /// startup. Best-effort defense in depth; the chain is the
