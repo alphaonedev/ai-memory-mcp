@@ -2427,14 +2427,20 @@ pub struct TranscriptNamespaceConfig {
     pub default_ttl_secs: Option<i64>,
     /// Namespace-specific archive-grace override.
     pub archive_grace_secs: Option<i64>,
-    /// v0.7 I5 — opt in the namespace to the reference R5 pre_store
+    /// v0.7 I5 — per-namespace opt-in intent for the reference R5 pre_store
     /// transcript-extractor hook (`tools/transcript-extractor/`).
-    /// Default `None` → disabled, matching the "default off" lesson
-    /// from G3-G11. Operators that wire the extractor binary into
-    /// their `hooks.toml` set this flag per namespace to gate the
-    /// derived-memory expansion. `Some(false)` is identical to
-    /// `None` and exists so an explicit "no, don't extract here"
-    /// can be expressed alongside a wildcard `Some(true)`.
+    ///
+    /// **RESERVED / NOT YET ENFORCED (FBL-30).** [`Self::auto_extract`] is
+    /// resolved by [`TranscriptsConfig::auto_extract_for`], but NO production
+    /// pre_store dispatch path consults it — there is no substrate mechanism to
+    /// identify "the extractor hook" among generic `[[hook]]` command entries,
+    /// so this flag cannot gate a generic hook. It does NOT short-circuit the
+    /// pre_store chain (the extractor binary self-gates only on transcript
+    /// shape). To actually scope the extractor to specific namespaces, use the
+    /// per-hook `namespace` field in `hooks.toml` (wired by FBL-29): a
+    /// `[[hook]]` with `namespace = "agent/claude"` fires ONLY in that
+    /// namespace. `Some(false)` is identical to `None`; the field is retained
+    /// as tested infrastructure for a future wiring.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_extract: Option<bool>,
 }
@@ -2556,10 +2562,13 @@ impl TranscriptsConfig {
     /// 4. `false` (default off — matches the "every reference hook
     ///    ships off-by-default" lesson from G10/G11).
     ///
-    /// The R5 reference extractor (`tools/transcript-extractor/`)
-    /// reads this flag at the namespace gate before doing any LLM
-    /// work, so a namespace that hasn't opted in pays the cost of
-    /// one HashMap lookup per `pre_store` fire and nothing more.
+    /// **RESERVED / NOT YET ENFORCED (FBL-30).** This resolver is correct but
+    /// has NO production caller: no pre_store dispatch path consults it, and
+    /// the R5 reference extractor binary does NOT read config (it depends only
+    /// on serde and self-gates on transcript shape). It is NOT the mechanism
+    /// that scopes the extractor — the wired per-hook `namespace` field in
+    /// `hooks.toml` (FBL-29) is. Kept as tested infrastructure for a future
+    /// wiring; callers must not assume it gates anything today.
     #[must_use]
     pub fn auto_extract_for(&self, namespace: &str) -> bool {
         let Some(table) = self.namespaces.as_ref() else {
