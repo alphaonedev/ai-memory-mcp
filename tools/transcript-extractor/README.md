@@ -64,31 +64,31 @@ transcript-extractor --daemon
 
 ## Opt-in
 
-The extractor is **off by default**. Operators wire it in two
-places:
+The extractor is **off by default**. Register it as a `pre_store`
+hook in `hooks.toml`. See `docs/hooks/` for the canonical schema (G1).
 
-1. `hooks.toml` — register the binary as a `pre_store` hook. See
-   `docs/hooks/` for the canonical schema (G1).
-2. `config.toml` — flip `auto_extract = true` for the namespace(s)
-   that should drive extraction:
+### Scoping the extractor to specific namespaces
 
-   ```toml
-   [transcripts.namespaces."agent/claude"]
-   auto_extract = true
-   default_ttl_secs = 86400
+Use the per-hook `namespace` field in `hooks.toml` (wired in v1.0.0,
+FBL-29): a `[[hook]]` whose `namespace` is a non-wildcard pattern fires
+ONLY in a matching namespace (exact → longest `prefix/*` → `*` wildcard).
+A `namespace = "*"` (the schema default) fires everywhere.
 
-   [transcripts.namespaces."team/eng/*"]
-   auto_extract = true
-   ```
+```toml
+[[hook]]
+event     = "pre_store"
+command   = "/usr/local/bin/transcript-extractor"
+namespace = "agent/claude"   # extractor runs only in agent/claude
+enabled   = true
+```
 
-   Resolution follows the same precedence as `default_ttl_secs`
-   (exact match → longest `prefix/*` → `*` wildcard → off). See
-   `TranscriptsConfig::auto_extract_for` in `src/config.rs`.
-
-When the namespace flag is `false` (or unset) the extractor binary
-itself still executes, but the production `pre_store` chain
-short-circuits before invoking it — so the daemon child never
-sees an envelope it shouldn't process.
+> **`[transcripts.namespaces].auto_extract` is RESERVED / NOT YET
+> ENFORCED (FBL-30).** `TranscriptsConfig::auto_extract_for` in
+> `src/config.rs` resolves the flag, but NO production pre_store dispatch
+> path consults it, and the extractor binary does not read `config.toml`
+> at all (it self-gates on transcript shape). It does **not**
+> short-circuit the pre_store chain. Do not rely on it to scope
+> extraction — use the per-hook `namespace` field above.
 
 ## Limitations the reference acknowledges
 

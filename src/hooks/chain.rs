@@ -267,7 +267,29 @@ impl HookChain {
             .map(|h| (h.clone(), registry.get(h)))
             .collect();
 
+        // FBL-29 (v1.0.0) — resolve the in-flight namespace ONCE at entry (read
+        // from the original payload, before any Modify mutates it) so per-hook
+        // namespace scoping can gate the loop below. `fire` is the single
+        // chokepoint every dispatch surface funnels through (pre-event enforce
+        // gate, post-event observers, the reused signal chains built at MCP
+        // boot), so gating here fixes every path in one place — the per-hook
+        // `namespace` pattern was previously parsed but never matched.
+        // Owned so the read does not hold a borrow of `current_payload` across
+        // the loop below (a hook `Modify` mutates `current_payload`).
+        let payload_ns: Option<String> = current_payload
+            .get("namespace")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+
         for (cfg, executor) in prepared {
+            // FBL-29 — skip a hook whose configured `namespace` pattern does
+            // not cover the in-flight namespace. A `*`/empty pattern (the
+            // schema default) matches everything, so configs that don't scope
+            // hooks are byte-identical. A scoped hook no longer fires (Modify /
+            // Deny) in namespaces the operator scoped it OUT of.
+            if !cfg.matches_namespace(payload_ns.as_deref()) {
+                continue;
+            }
             // G6: derive the per-hook budget from what's left of the
             // chain deadline. `None` means the deadline already
             // passed — record a violation, treat the remaining hooks
@@ -1030,6 +1052,45 @@ mod tests {
         let chain = HookChain::for_event(&all, HookEvent::PreStore);
         assert_eq!(chain.hooks().len(), 1);
         assert_eq!(chain.hooks()[0].command, PathBuf::from("/bin/keep"));
+    }
+
+    #[tokio::test]
+    async fn fire_skips_hook_scoped_out_of_namespace() {
+        // FBL-29 — a hook scoped `namespace = "team/*"` must NOT fire on a
+        // write into `personal/notes`. The hook is `fail_mode = Closed` with a
+        // nonexistent command: if the namespace gate skips it (correct), the
+        // chain returns Allow WITHOUT ever spawning; if the gate were absent it
+        // would try to exec the missing command, error, and — under Closed —
+        // Deny. Asserting Allow proves the scoped-out hook was skipped.
+        let mut scoped = make_cfg(0, FailMode::Closed, "/nonexistent/deny-hook-bin");
+        scoped.namespace = "team/*".to_string();
+        let chain = HookChain::new(vec![scoped]);
+        let mut registry = ExecutorRegistry::new();
+
+        let out_of_scope = chain
+            .fire(
+                HookEvent::PreStore,
+                json!({ "namespace": "personal/notes", "title": "t", "content": "c" }),
+                &mut registry,
+            )
+            .await;
+        assert!(
+            matches!(out_of_scope, ChainResult::Allow),
+            "a team/* hook must not fire (Modify/Deny) on a personal/notes write; got {out_of_scope:?}"
+        );
+
+        // A namespace-less payload also leaves a scoped hook dormant.
+        let no_ns = chain
+            .fire(
+                HookEvent::PreStore,
+                json!({ "title": "t", "content": "c" }),
+                &mut registry,
+            )
+            .await;
+        assert!(
+            matches!(no_ns, ChainResult::Allow),
+            "a scoped hook must not fire on a namespace-less payload; got {no_ns:?}"
+        );
     }
 
     // ---- first-deny-wins ----------------------------------------------------
