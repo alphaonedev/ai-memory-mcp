@@ -2547,6 +2547,23 @@ pub fn update_with_expected_version(
         Some(v) => Some(v),
         None => existing.expires_at.as_deref(),
     };
+    // v1.0.0 #2331 (FBL-01) — the #1626 tier→long ⇒ expires_at = NULL
+    // coupling, sqlite parity with BOTH postgres update funnels
+    // (`update_with_expected_version_once` + the trait `update`) and with
+    // this file's own insert ON CONFLICT arm / fold auto-promote / both
+    // promote surfaces. When the EFFECTIVE tier is Long the merged expiry
+    // is forced NULL — overriding a caller-supplied patch value AND the
+    // existing row's stale short/mid TTL — because the GC reap predicate
+    // is tier-blind (`expires_at IS NOT NULL AND expires_at < now`), so a
+    // leftover TTL on a promoted "permanent" row would archive it (or
+    // hard-delete + crypto-erase it under archive_on_gc=false) at the
+    // stale deadline. Silent destruction of a documented-permanent row is
+    // a direct North-Star data-integrity violation.
+    let expires_at = if matches!(*effective_tier, Tier::Long) {
+        None
+    } else {
+        expires_at
+    };
     // #2060 — TRACT covenant clause 2: authorship-immutability gate.
     // Consult BEFORE the shadow below so we see the caller's RAW patch
     // metadata (not whatever an upstream `preserve_provenance_keys` call
@@ -2901,6 +2918,16 @@ pub fn update_with_archive_on_supersede(
         Some("" | "null") => None,
         Some(v) => Some(v.to_string()),
         None => existing.expires_at.clone(),
+    };
+    // v1.0.0 #2331 (FBL-01) — same #1626 tier→long ⇒ expires_at = NULL
+    // coupling as `update_with_expected_version`: the superseding row is a
+    // FRESH id (the insert ON CONFLICT long⇒NULL arm never fires for it),
+    // so a mid→long supersede would otherwise inherit the OLD row's live
+    // TTL and the tier-blind GC would reap the new "permanent" row.
+    let new_expires = if matches!(new_tier, Tier::Long) {
+        None
+    } else {
+        new_expires
     };
     // v0.7.0 Provenance Gap 2 (#906) — caller-supplied source_uri
     // wins; otherwise inherit from the OLD row. Mirrors the pattern
