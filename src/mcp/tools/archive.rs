@@ -137,6 +137,19 @@ pub(super) fn handle_gc(
     params: &Value,
     archive: bool,
 ) -> Result<Value, String> {
+    // #2308 (FBL-04) — fold-before-gc on the MCP `memory_gc` surface.
+    // MCP stdio spawns no fold loop, so pending recall-driven TTL
+    // floor-extensions (#1869 pure recall) are applied here BEFORE
+    // both branches: the dry-run count then matches post-fold reality
+    // (a recalled-but-extended row is not counted as reapable), and
+    // the real sweep never reaps a row whose folded expiry is in the
+    // future (silent crypto-erasure when `archive` is false).
+    // Best-effort: WARN on error, degrade to the pre-fold posture.
+    // `db::gc` folds again as the structural backstop (cheap
+    // has-unfolded fast-path no-op).
+    if let Err(e) = db::fold_recall_accesses(conn, crate::SECS_PER_HOUR, crate::SECS_PER_DAY) {
+        tracing::warn!("recall-access fold failed (pre-gc, memory_gc): {e}");
+    }
     let dry_run = params["dry_run"].as_bool().unwrap_or(false);
     if dry_run {
         // Just count expired without deleting
@@ -483,6 +496,71 @@ mod tests {
         let result = handle_gc(&conn, &json!({"dry_run": false}), true).expect("gc run ok");
         assert_eq!(result["collected"], 0);
         assert_eq!(result["dry_run"], false);
+    }
+
+    #[test]
+    fn handle_gc_2308_folds_pending_extension_before_dry_run_and_real_gc() {
+        // #2308 (FBL-04) regression — the MCP `memory_gc` surface must
+        // apply pending recall-driven TTL floor-extensions BEFORE both
+        // the dry-run count and the real sweep. Two short-tier rows
+        // whose BASE 6h TTL already lapsed; only one was recalled
+        // (pure recall → an unfolded `recall_observations` row whose
+        // per-access short-tier extension, observed_at + 1h, pushes
+        // its real expiry into the future).
+        let conn = open_conn();
+        let created = (chrono::Utc::now() - chrono::Duration::hours(7)).to_rfc3339();
+        let lapsed = (chrono::Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
+        for id in ["fbl04-recalled", "fbl04-control"] {
+            conn.execute(
+                "INSERT INTO memories (id, tier, namespace, title, content, created_at, \
+                                       updated_at, expires_at) \
+                 VALUES (?1, 'short', 'fbl04', ?1, 'c', ?2, ?2, ?3)",
+                rusqlite::params![id, created, lapsed],
+            )
+            .unwrap();
+        }
+        crate::observations::record_recall(
+            &conn,
+            "fbl04-mcp-r1",
+            &[crate::observations::Candidate {
+                memory_id: "fbl04-recalled",
+                retriever: "fts5",
+                rank: 1,
+                score: 0.5,
+            }],
+        )
+        .unwrap();
+
+        // Dry-run counts POST-fold reality: only the un-recalled
+        // control row is reapable (pre-#2308 this counted 2).
+        let dry = handle_gc(&conn, &json!({"dry_run": true}), false).expect("gc dry-run ok");
+        assert_eq!(dry["dry_run"], true);
+        assert_eq!(dry["collected"], 1, "dry-run must match post-fold reality");
+        let exists = |id: &str| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM memories WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(exists("fbl04-recalled"), 1, "dry-run deletes nothing");
+        assert_eq!(exists("fbl04-control"), 1, "dry-run deletes nothing");
+
+        // Real run reaps ONLY the control row; the recalled row's
+        // folded extension keeps it alive (pre-#2308 it was reaped —
+        // silent crypto-erasure with archive=false).
+        let real = handle_gc(&conn, &json!({}), false).expect("gc run ok");
+        assert_eq!(real["dry_run"], false);
+        assert_eq!(real["collected"], 1);
+        assert_eq!(
+            exists("fbl04-recalled"),
+            1,
+            "recalled row survived memory_gc: its TTL extension was folded before eviction"
+        );
+        assert_eq!(
+            exists("fbl04-control"),
+            0,
+            "control row expired as scheduled"
+        );
     }
 
     #[test]

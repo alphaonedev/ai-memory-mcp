@@ -14,11 +14,13 @@
 //! the kill, but ai-memory has no bridge to that durable artifact —
 //! until this module.
 //!
-//! The recovery surface is **dual**: a CLI subcommand
+//! The recovery surface is a CLI subcommand
 //! (`ai-memory recover-previous-session`) for SessionStart-hook
-//! integration, and an MCP tool (`memory_recover_previous_session`)
-//! for in-session agent self-recovery. Both call into
-//! [`recover_from_transcript`] which is the canonical handler.
+//! integration, which calls into [`recover_from_transcript`], the
+//! canonical handler. There is no MCP-tool counterpart — no
+//! `memory_recover_previous_session` tool was ever implemented or
+//! registered (corrected per Grok W1A4-01); in-session recovery
+//! goes through `memory_recall` / `memory_session_start` instead.
 //!
 //! See issue [#1389](https://github.com/alphaonedev/ai-memory-mcp/issues/1389)
 //! for the full design + acceptance criteria; see CLAUDE.md

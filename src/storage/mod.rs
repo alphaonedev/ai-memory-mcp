@@ -11394,6 +11394,18 @@ pub fn stats(conn: &Connection, db_path: &Path) -> Result<Stats> {
 }
 
 /// Run GC if there are any expired memories. Lightweight check first.
+///
+/// #2308 (FBL-04) — fold-before-gc holds on this path STRUCTURALLY:
+/// eviction only ever happens through [`gc`], which folds pending
+/// recall-access TTL extensions first. A row whose base TTL lapsed but
+/// whose folded expiry lies in the future trips the `has_expired`
+/// probe below (its stale `expires_at` is in the past), so [`gc`] runs,
+/// folds, extends the row, and reaps nothing — the row survives. The
+/// fold is deliberately NOT run unconditionally here: this function
+/// sits on the MCP/CLI recall + store hot paths, and an unconditional
+/// fold would re-introduce recall-time write bursts (the exact
+/// behavior #1869 pure-recall removed; pinned by
+/// `tests/recall_purity_p01.rs`).
 pub fn gc_if_needed(conn: &Connection, archive: bool) -> Result<usize> {
     let now = Utc::now().to_rfc3339();
     let has_expired: bool = conn
@@ -11443,6 +11455,26 @@ const SQL_GC_EXPIRED_CHUNK_IDS: &str = "SELECT id FROM memories \
      ORDER BY rowid LIMIT ?2";
 
 pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
+    // #2308 (FBL-04) — fold-before-gc at the eviction chokepoint. With
+    // recall pure (#1869), a recalled row's TTL floor-extension lives
+    // in unfolded `recall_observations` rows until a fold applies it,
+    // and MCP stdio spawns no fold loop — so an MCP-driven eviction
+    // (`memory_gc`, or any of the `gc_if_needed` hot-path sites) could
+    // reap a hot short/mid row whose REAL expiry was already extended
+    // (silent crypto-erasure when `archive` is false). Every eviction
+    // path funnels through THIS function, so fold FIRST, before any
+    // expiry evaluation. Best-effort (WARN, never abort the sweep):
+    // a failed fold degrades to the pre-fold posture — fewer
+    // extensions applied — and never corrupts. Callers that already
+    // folded (daemon gc tick, CLI `gc`, HTTP admin) hit the
+    // has-unfolded fast path, so this costs one indexed probe and
+    // never double-applies ladders (consumed rows are marked
+    // `folded = 1`). The compiled default extend windows (1h short /
+    // 1d mid) mirror the SAL `SqliteStore::fold_recall_accesses`
+    // delegate.
+    if let Err(e) = fold_recall_accesses(conn, crate::SECS_PER_HOUR, crate::SECS_PER_DAY) {
+        tracing::warn!("recall-access fold failed (pre-gc): {e}");
+    }
     let now = Utc::now().to_rfc3339();
     // #1579 B6 (F5.7) — bounded-lock-hold chunked sweep. Each loop
     // iteration archives + deletes at most GC_CHUNK_ROWS expired rows
