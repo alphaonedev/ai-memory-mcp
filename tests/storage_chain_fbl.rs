@@ -355,6 +355,41 @@ fn fbl02_insert_if_newer_canonicalizes_offset_expiry() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// #2334 (FBL-15) — stats expiry-axis reconciliation
+// ─────────────────────────────────────────────────────────────────────
+
+/// `stats.total` stays the raw physical count while the additive `live` /
+/// `expired_pending_gc` fields reconcile the expiry axis against the boot
+/// inventory's live definition — no more phantom rows between surfaces.
+#[test]
+fn fbl15_stats_live_and_expired_pending_gc_reconcile_total() {
+    let conn = fresh_sqlite();
+    // One live row + one expired-awaiting-GC row.
+    let future = (chrono::Utc::now() + chrono::Duration::days(2)).to_rfc3339();
+    seed(&conn, "fbl15-live", Tier::Mid, Some(&future));
+    let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    seed(&conn, "fbl15-expired", Tier::Short, Some(&past));
+
+    let stats = db::stats(&conn, std::path::Path::new(":memory:")).expect("stats");
+    assert_eq!(stats.total, 2, "total stays the raw physical count");
+    assert_eq!(
+        stats.live, 1,
+        "live counts only non-expired lifecycle-visible rows (the boot definition)"
+    );
+    assert_eq!(
+        stats.expired_pending_gc, 1,
+        "the expired row awaiting the GC tick is surfaced, not hidden inside total"
+    );
+
+    // After gc() the axes re-converge.
+    db::gc(&conn, true).expect("gc");
+    let stats = db::stats(&conn, std::path::Path::new(":memory:")).expect("stats");
+    assert_eq!(stats.total, 1);
+    assert_eq!(stats.live, 1);
+    assert_eq!(stats.expired_pending_gc, 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // #2335 (FBL-20) — federation LWW expiry extension floor
 // ─────────────────────────────────────────────────────────────────────
 

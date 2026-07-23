@@ -23270,8 +23270,32 @@ impl MemoryStore for PostgresStore {
                 .await
                 .unwrap_or(0);
 
+        // v1.0.0 #2334 (FBL-15) — LIVE count (non-expired + lifecycle-
+        // visible, the boot/export definition) and the expired-awaiting-GC
+        // remainder, mirroring the sqlite `db::stats` twin so the expiry
+        // axis reconciles identically on both backends.
+        let live: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*)::BIGINT FROM memories \
+             WHERE (expires_at IS NULL OR expires_at > $1) {}",
+            crate::models::lifecycle_visible_clause("")
+        ))
+        .bind(now_dt)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("stats live", e))?;
+        let expired_pending_gc: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::BIGINT FROM memories \
+             WHERE expires_at IS NOT NULL AND expires_at <= $1",
+        )
+        .bind(now_dt)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("stats expired_pending_gc", e))?;
+
         Ok(crate::models::Stats {
             total: total_usize,
+            live: usize::try_from(live).unwrap_or(0),
+            expired_pending_gc: usize::try_from(expired_pending_gc).unwrap_or(0),
             by_tier,
             by_namespace,
             expiring_soon: usize::try_from(expiring_soon).unwrap_or(0),

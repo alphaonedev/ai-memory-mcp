@@ -11385,6 +11385,29 @@ pub fn append_recovery(
 pub fn stats(conn: &Connection, db_path: &Path) -> Result<Stats> {
     let total: usize = conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))?;
 
+    // v1.0.0 #2334 (FBL-15) — reconcile the three 'total' predicates: boot
+    // counts LIVE (non-expired) rows, export filters expiry + lifecycle,
+    // while `total` above is the raw physical count. Surface the LIVE
+    // count (expiry + the fail-closed lifecycle allow-list — the
+    // boot/export definition) and the expired-awaiting-GC remainder so
+    // agents reconciling boot vs stats stop seeing phantom rows.
+    let now_live = Utc::now().to_rfc3339();
+    let live: usize = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM memories \
+             WHERE (expires_at IS NULL OR expires_at > ?1) {}",
+            crate::models::lifecycle_visible_clause("")
+        ),
+        params![now_live],
+        |r| r.get(0),
+    )?;
+    let expired_pending_gc: usize = conn.query_row(
+        "SELECT COUNT(*) FROM memories \
+         WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+        params![now_live],
+        |r| r.get(0),
+    )?;
+
     let mut stmt =
         conn.prepare("SELECT tier, COUNT(*) FROM memories GROUP BY tier ORDER BY COUNT(*) DESC")?;
     let by_tier = stmt
@@ -11431,6 +11454,8 @@ pub fn stats(conn: &Connection, db_path: &Path) -> Result<Stats> {
 
     Ok(Stats {
         total,
+        live,
+        expired_pending_gc,
         by_tier,
         by_namespace,
         expiring_soon,
