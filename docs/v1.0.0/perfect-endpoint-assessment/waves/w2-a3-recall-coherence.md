@@ -63,7 +63,7 @@ Pure recall is a real architectural flip (default OFF sync-touch, schema v77 `fo
 | Session hydrate | `memory_session_start` + visibility filter path (`mcp/tools/session_start.rs`) |
 | Persona identity | `PersonaGenerator` AgentKeypair-signed optional; **never in-place overwrite** (version++ rows); `PersonaError::NoReflections` |
 | L1 capture discipline | CLAUDE.md hard-rule + `recover/nag.rs` (`AI_MEMORY_CAPTURE_NAG_THRESHOLD` default 5) → stderr WARN + `capture_lag` signed event |
-| L2 recover | `recover_from_transcript` + SAL twin; `transcript_line_dedup` (schema v52); tag `recovered-from-transcript`; CLI + MCP `memory_recover_previous_session` |
+| L2 recover | `recover_from_transcript` + SAL twin; `transcript_line_dedup` (schema v52); tag `recovered-from-transcript`; CLI-only (`recover-previous-session` — no MCP-tool counterpart was ever registered) |
 | L4 capture_turn | MCP `memory_capture_turn` + HTTP `POST /api/v1/capture_turn`; idempotent SHA256 dedup; optional host Ed25519 allowlist |
 | Owner lockout tooling | #1720 B2 `reown` + B3 boot guard (`AI_MEMORY_REQUIRE_OWNED_ROWS`) |
 | Kind/pipeline surface | 13 `MemoryKind` + Goal/Plan/Step; reflect/atomise/skill composition (2.4-adjacent, feeds 2.2 externalized self) |
