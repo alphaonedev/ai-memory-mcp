@@ -27,7 +27,10 @@ use super::federation_signing_check::verify_signature_or_reject;
 
 /// Tracing target for receive-side peer-attestation checks
 /// (#1558 tracing-target SSOT).
-pub(super) const ATTESTATION_TRACE_TARGET: &str = "federation::attestation";
+/// `pub(crate)` (was `pub(super)`) since #2340 so the shared
+/// [`crate::federation::receive_auth::redact_inbound_before_attestation`]
+/// helper can WARN under the same target both receive twins use.
+pub(crate) const ATTESTATION_TRACE_TARGET: &str = "federation::attestation";
 
 /// v0.7.0 federation security — extract the peer's self-claimed
 /// `x-peer-id` header. Lowercase form per HTTP/2 wire convention;
@@ -1356,6 +1359,14 @@ pub async fn sync_push(
         // Hoist the author's bound key so the refusal WARN can distinguish
         // missing-author-key from missing-signature (item 7 observability —
         // the manual substitute for the deferred TOFU key distribution).
+        //
+        // #2340 (FBL-32) — redact to the TO-BE-PERSISTED form FIRST, so the
+        // attestation below verifies + stamps over exactly the bytes
+        // `db::merge_inbound`'s storage funnel will persist (the funnel's own
+        // redact becomes an idempotent no-op). A cross-mode raw-signed row
+        // has its stale write_signature dropped inside the helper and lands
+        // honestly `claimed` instead of a false `agent_attested`.
+        crate::federation::receive_auth::redact_inbound_before_attestation(&mut to_insert);
         let author_bound_key = db::agent_pubkey(&lock.0, &attribute_agent).ok().flatten();
         if let Err(e) = apply_inbound_write_attestation(
             &mut to_insert,

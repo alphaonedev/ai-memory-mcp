@@ -207,6 +207,13 @@ pub(super) async fn sync_push_via_store(
         // opt-in) an unsigned honored third-party claim. The enrolled-key
         // lookup resolves through the SAL `agent_pubkey` trait method so both
         // backends behave identically.
+        // #2340 (FBL-32) — redact to the TO-BE-PERSISTED form FIRST (postgres
+        // twin of the sqlite receive path): the attestation below verifies +
+        // stamps over exactly the bytes `PostgresStore::merge_inbound`'s
+        // screen will persist. A cross-mode raw-signed row has its stale
+        // write_signature dropped inside the helper and lands honestly
+        // `claimed` instead of a false `agent_attested`.
+        crate::federation::receive_auth::redact_inbound_before_attestation(&mut to_insert);
         let bound_pubkey = app
             .store
             .agent_pubkey(&attribute_agent)
