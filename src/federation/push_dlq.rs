@@ -321,6 +321,10 @@ fn classify_quarantine_cause(last_error: &str) -> &'static str {
         || last_error.contains("422")
         || last_error.contains("signature")
         || last_error.contains("schema")
+        // #2341 — a 2xx whose receiver report counted the push
+        // `unsupported_on_postgres` is structurally un-appliable on that
+        // peer (FED-RQ-01 subcollection gap), not a transient flap.
+        || last_error.contains(crate::handlers::UNSUPPORTED_ON_POSTGRES_FIELD)
     {
         "permanent"
     } else {
@@ -1297,6 +1301,14 @@ mod replay_arm_tests {
         assert_eq!(
             classify_quarantine_cause("connection reset by peer"),
             "other"
+        );
+        // #2341 — a peer-2xx-but-unsupported_on_postgres non-ack reason is
+        // structurally permanent for that peer, not "other".
+        assert_eq!(
+            classify_quarantine_cause(
+                "peer 2xx but 1 item(s) unsupported_on_postgres (not applied on this peer)"
+            ),
+            "permanent"
         );
     }
 }
