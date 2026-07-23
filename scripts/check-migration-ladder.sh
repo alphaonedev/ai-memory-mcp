@@ -125,6 +125,11 @@ LADDER_EXEMPT_FILES=(
 #                     current tip stays symbolic), so the count is unchanged.
 #                     postgres stays 1 (v85 renumbered to a literal arm,
 #                     migrate_v86 takes the const tail slot).
+# 2026-07-23 (#2333 FBL-03): counts UNCHANGED — the settled v86 arm is
+#                     LITERALIZED on both backends (`if version < 86` /
+#                     `if current_version < 86`) and the new v87 tip arm
+#                     (archived_memories.kind_provenance + the #2332
+#                     expiry-rendering heal) takes the const slot.
 EXPECTED_CONST_ARMS_SQLITE=8
 EXPECTED_CONST_ARMS_POSTGRES=1
 

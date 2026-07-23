@@ -353,3 +353,152 @@ fn fbl02_insert_if_newer_canonicalizes_offset_expiry() {
     let stored_dt = chrono::DateTime::parse_from_rfc3339(&stored).expect("parseable");
     assert_eq!(stored_dt.timestamp_micros(), future.timestamp_micros());
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// #2333 (FBL-03) — schema v87
+// ─────────────────────────────────────────────────────────────────────
+
+fn seed_with_kind_provenance(conn: &Connection, id: &str, prov: &str) -> String {
+    let mem = Memory {
+        id: id.to_string(),
+        tier: Tier::Long,
+        namespace: "storage-chain".to_string(),
+        title: format!("kp-{id}"),
+        content: format!("content for {id}"),
+        priority: 5,
+        confidence: 1.0,
+        source: "test".to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        metadata: json!({ "kind_provenance": prov }),
+        ..Memory::default()
+    };
+    db::insert(conn, &mem).expect("seed")
+}
+
+fn column_kind_provenance(conn: &Connection, table: &str, id: &str) -> Option<String> {
+    let sql = format!("SELECT kind_provenance FROM {table} WHERE id = ?1");
+    conn.query_row(&sql, rusqlite::params![id], |r| r.get(0))
+        .expect("row present")
+}
+
+/// archive→restore must round-trip the v79 denormalized column (the
+/// v49/#1025 + v85/#2035 archive-column-parity contract).
+#[test]
+fn fbl03_archive_restore_roundtrips_kind_provenance() {
+    let conn = fresh_sqlite();
+    let id = seed_with_kind_provenance(&conn, "fbl03-a", "llm");
+    assert_eq!(
+        column_kind_provenance(&conn, "memories", &id).as_deref(),
+        Some("llm"),
+        "insert denormalizes the metadata carrier"
+    );
+
+    assert!(db::archive_memory(&conn, &id, Some("test")).expect("archive"));
+    assert_eq!(
+        column_kind_provenance(&conn, "archived_memories", &id).as_deref(),
+        Some("llm"),
+        "archive INSERT...SELECT must carry kind_provenance"
+    );
+
+    assert!(db::restore_archived(&conn, &id).expect("restore"));
+    assert_eq!(
+        column_kind_provenance(&conn, "memories", &id).as_deref(),
+        Some("llm"),
+        "restore must re-insert kind_provenance (column == metadata carrier)"
+    );
+}
+
+/// A LEGACY archive row (archived pre-v87, column NULL) re-derives the
+/// column from the metadata carrier on restore, vocab-guarded.
+#[test]
+fn fbl03_restore_rederives_kind_provenance_for_legacy_archive_rows() {
+    let conn = fresh_sqlite();
+    let id = seed_with_kind_provenance(&conn, "fbl03-b", "declared");
+    assert!(db::archive_memory(&conn, &id, Some("test")).expect("archive"));
+    // Simulate a pre-v87 archive row: column NULL, carrier intact.
+    conn.execute(
+        "UPDATE archived_memories SET kind_provenance = NULL WHERE id = ?1",
+        rusqlite::params![&id],
+    )
+    .expect("null out");
+
+    assert!(db::restore_archived(&conn, &id).expect("restore"));
+    assert_eq!(
+        column_kind_provenance(&conn, "memories", &id).as_deref(),
+        Some("declared"),
+        "legacy archive rows re-derive the column from metadata.kind_provenance"
+    );
+}
+
+/// The federation-receive funnel (`insert_if_newer`) stamps the
+/// denormalized column (pg store-lane parity).
+#[test]
+fn fbl03_insert_if_newer_stamps_kind_provenance() {
+    let conn = fresh_sqlite();
+    let mem = Memory {
+        id: "fbl03-c".to_string(),
+        tier: Tier::Long,
+        namespace: "storage-chain".to_string(),
+        title: "fed kp".to_string(),
+        content: "peer row".to_string(),
+        priority: 5,
+        confidence: 1.0,
+        source: "test".to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        metadata: json!({ "kind_provenance": "channel_derived" }),
+        ..Memory::default()
+    };
+    let id = db::insert_if_newer(&conn, &mem).expect("federation insert");
+    assert_eq!(
+        column_kind_provenance(&conn, "memories", &id).as_deref(),
+        Some("channel_derived"),
+        "insert_if_newer must denormalize the carrier like db::insert does"
+    );
+}
+
+/// The v87 one-time heal normalizes pre-fix offset expiry renderings on a
+/// LEGACY database (the #2332 stored-corpus half).
+#[test]
+fn fbl03_v87_migration_heals_offset_expiry_renderings() {
+    let root = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(".local-runs")
+        .join("storage-chain-fbl");
+    std::fs::create_dir_all(&root).ok();
+    let dir = tempfile::tempdir_in(&root).expect("tempdir");
+    let path = dir.path().join("v87-heal.db");
+
+    let future = chrono::Utc::now() + chrono::Duration::days(30);
+    let offset = chrono::FixedOffset::west_opt(5 * 3600).expect("offset");
+    let rendered = future.with_timezone(&offset).to_rfc3339();
+    {
+        let conn = db::open(&path).expect("open fresh db");
+        let id = seed(&conn, "fbl03-d", Tier::Mid, None);
+        // Plant a pre-fix verbatim offset rendering (bypassing the now-
+        // canonicalizing funnels) and roll the version stamp back to 86 so
+        // the reopen replays the v87 arm.
+        conn.execute(
+            "UPDATE memories SET expires_at = ?1 WHERE id = ?2",
+            rusqlite::params![&rendered, &id],
+        )
+        .expect("plant offset rendering");
+        conn.execute_batch(
+            "DELETE FROM schema_version; INSERT INTO schema_version (version) VALUES (86);",
+        )
+        .expect("roll stamp back");
+    }
+    let conn = db::open(&path).expect("reopen runs the v87 arm");
+    let stored = stored_expiry(&conn, "fbl03-d").expect("expiry present");
+    assert!(
+        stored.ends_with('Z'),
+        "v87 heal must canonicalize the rendering, got {stored}"
+    );
+    let stored_dt = chrono::DateTime::parse_from_rfc3339(&stored).expect("parseable");
+    assert_eq!(
+        stored_dt.timestamp_micros(),
+        future.timestamp_micros(),
+        "heal is instant-preserving"
+    );
+}

@@ -1,0 +1,38 @@
+-- Copyright 2026 AlphaOne LLC
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- v1.0.0 #2333 (FBL-03) + #2332 (FBL-02) — schema v87: two coordinated
+-- heals, both additive / instant-preserving, NO table rebuild (so the
+-- v63/v65 trigger-drop hazard does not arise).
+--
+-- (a) archived_memories.kind_provenance. The v79 (#1945) migration added
+--     the denormalized SQL-queryable `kind_provenance` copy (closed vocab
+--     declared|channel_derived|regex|llm) to `memories` only. Its two v79
+--     siblings valid_from/valid_until were mirrored onto the archive at
+--     v85 (#2035); kind_provenance was skipped, so every archive
+--     INSERT...SELECT dropped the column and archive→restore landed the
+--     restored row with the column NULL while the metadata carrier kept
+--     the value — a column-vs-carrier desync (the v49/#1025 + v85/#2035
+--     archive-column-parity class). From v87 the archive funnels carry the
+--     column, both restore paths re-insert it (legacy pre-v87 archive rows
+--     re-derive it from metadata, vocab-guarded), and the federation
+--     `insert_if_newer` funnel stamps it (pg parity).
+--
+--     The DDL below is applied by the probe-guarded in-code arm in
+--     src/storage/migrations.rs (SQLite has no ADD COLUMN IF NOT EXISTS):
+
+ALTER TABLE archived_memories ADD COLUMN kind_provenance TEXT;
+
+-- (b) one-time expiry-rendering normalization (#2332). Every sqlite
+--     expiry predicate (GC reap, recall/list visibility, the #1596
+--     touch/fold MAX() floors) compares the `expires_at` TEXT column
+--     LEXICOGRAPHICALLY against a UTC-rendered now; RFC3339 admits many
+--     renderings of the same instant that order wrongly as bytes. The
+--     write funnels canonicalize from the #2332 fix on; the in-code arm
+--     (`storage::migrations::normalize_expiry_rows` — Rust, NOT SQL from
+--     this file, per the 0070_v86 precedent) heals pre-fix rows on
+--     memories.expires_at + archived_memories.{expires_at,
+--     original_expires_at}. Per-row contract: parseable → re-rendered
+--     canonically (instant-preserving); unparseable → exact bytes kept
+--     (fail-safe); already-canonical → skipped (idempotent). Postgres
+--     needs no expiry heal (expires_at is TIMESTAMPTZ there).

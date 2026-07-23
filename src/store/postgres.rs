@@ -358,6 +358,16 @@ const MIGRATION_V84_EMBEDDING_SPACE: &str =
 const MIGRATION_V85_ARCHIVED_VALID_TIME: &str =
     include_str!("../../migrations/postgres/0042_v85_archived_valid_time.sql");
 
+/// v1.0.0 #2333 (FBL-03) — schema v87: mirror the v79 (#1945)
+/// denormalized `kind_provenance` column onto `archived_memories`
+/// (the third v79 column; its two siblings landed at v85/#2035), so
+/// archive→restore stops dropping the SQL-queryable epistemic-provenance
+/// copy. Additive `ADD COLUMN IF NOT EXISTS`, no rewrite. The sqlite v87
+/// arm additionally heals legacy `expires_at` renderings (#2332) —
+/// postgres needs no expiry heal (`expires_at` is TIMESTAMPTZ here).
+const MIGRATION_V87_ARCHIVED_KIND_PROVENANCE: &str =
+    include_str!("../../migrations/postgres/0044_v87_archived_kind_provenance.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -724,7 +734,13 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       unparseable values); the write funnels canonicalize from v86 on.
 //       Doc twin: migrations/postgres/0043_v86_valid_time_canonicalize.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 86;
+// v87 — #2333 (FBL-03): `archived_memories.kind_provenance` — the third
+//       v79 (#1945) column mirrored onto the archive (siblings landed at
+//       v85/#2035) so archive→restore stops dropping the denormalized
+//       epistemic-provenance copy. Additive ADD COLUMN IF NOT EXISTS.
+//       Doc twin: migrations/postgres/0044_v87_archived_kind_provenance.sql.
+//       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
+const CURRENT_SCHEMA_VERSION: i32 = 87;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1856,8 +1872,11 @@ impl PostgresStore {
         if current_version < 85 {
             self.migrate_v85().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 86 {
             self.migrate_v86().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v87().await?;
         }
 
         Ok(())
@@ -4456,7 +4475,7 @@ impl PostgresStore {
                 }
             }
         }
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        record_schema_version(&mut tx, 86).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v86 migration", e))?;
@@ -4464,6 +4483,28 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v86 applied (#1834 pre-ship 3x7: claim \
              valid-time renderings canonicalized to fixed UTC)"
+        );
+        Ok(())
+    }
+
+    async fn migrate_v87(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v87 ddl tx", e))?;
+        sqlx::raw_sql(MIGRATION_V87_ARCHIVED_KIND_PROVENANCE)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v87 archived kind_provenance ddl", e))?;
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v87 migration", e))?;
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v87 applied (#2333 FBL-03: archived_memories.\
+             kind_provenance archive-column parity)"
         );
         Ok(())
     }

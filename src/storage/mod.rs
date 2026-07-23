@@ -3408,7 +3408,7 @@ pub(crate) fn archive_memory_no_tx(
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
-              mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
+              mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, ?1, ?2, metadata,
@@ -3416,7 +3416,7 @@ pub(crate) fn archive_memory_no_tx(
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
              FROM memories WHERE id = ?3",
             params![now, reason, id],
         )?;
@@ -3495,7 +3495,7 @@ pub(crate) fn archive_memory_insert_only(conn: &Connection, id: &str, reason: &s
           reflection_depth, atomised_into, atom_of, memory_kind,
           entity_id, persona_version, citations, source_uri, source_span,
           confidence_source, confidence_signals, confidence_decayed_at,
-          mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
+          mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
          SELECT id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
                 expires_at, ?1, ?2, metadata,
@@ -3503,7 +3503,7 @@ pub(crate) fn archive_memory_insert_only(conn: &Connection, id: &str, reason: &s
                 reflection_depth, atomised_into, atom_of, memory_kind,
                 entity_id, persona_version, citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
-                mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
          FROM memories WHERE id = ?3",
         params![now, reason, id],
     )?;
@@ -3853,7 +3853,7 @@ pub fn archive_memory_for_caller(
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
-              mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
+              mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, ?1, ?2, metadata,
@@ -3861,7 +3861,7 @@ pub fn archive_memory_for_caller(
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
              FROM memories WHERE id = ?3",
             params![now, reason, id],
         )?;
@@ -4622,7 +4622,7 @@ pub fn forget(
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
-                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?4, 'forget', metadata,
@@ -4630,7 +4630,7 @@ pub fn forget(
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
-                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                      FROM memories WHERE rowid IN (
                         SELECT m.rowid FROM memories_fts fts
                         JOIN memories m ON m.rowid = fts.rowid
@@ -4651,7 +4651,7 @@ pub fn forget(
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
-                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?3, 'forget', metadata,
@@ -4659,7 +4659,7 @@ pub fn forget(
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
-                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                      FROM memories WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)",
                     params![namespace, tier_str, now],
                 )?;
@@ -5084,7 +5084,7 @@ pub fn forget_for_caller(
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
-                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?4, 'forget', metadata,
@@ -5092,7 +5092,7 @@ pub fn forget_for_caller(
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
-                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                      FROM memories WHERE rowid IN (
                         SELECT m.rowid FROM memories_fts fts
                         JOIN memories m ON m.rowid = fts.rowid
@@ -5116,7 +5116,7 @@ pub fn forget_for_caller(
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
-                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?3, 'forget', metadata,
@@ -5124,7 +5124,7 @@ pub fn forget_for_caller(
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
-                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                      FROM memories WHERE (?1 IS NULL OR namespace = ?1)
                        AND (?2 IS NULL OR tier = ?2)
                        AND (json_extract(metadata,'$.agent_id') = ?4
@@ -11549,7 +11549,7 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
-                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?1, 'ttl_expired', metadata,
@@ -11557,7 +11557,7 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
-                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                      FROM memories
                      WHERE id IN ({SQL_GC_EXPIRED_CHUNK_IDS})"
                 ))?;
@@ -12069,7 +12069,7 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
               mentioned_entity_id, version, lifecycle_state, encrypted_envelope,
-              cid, cid_genesis, valid_from, valid_until)
+              kind_provenance, cid, cid_genesis, valid_from, valid_until)
              SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                     tags, priority, confidence, source, access_count, created_at,
                     ?1, last_accessed_at, original_expires_at, metadata,
@@ -12103,6 +12103,16 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
                     COALESCE(version, 1),
                     COALESCE(lifecycle_state, 'open'),
                     encrypted_envelope,
+                    -- v1.0.0 #2333 (FBL-03) — carry the v79 kind_provenance
+                    -- denormalized column through the round-trip; legacy
+                    -- pre-v87 archive rows (column NULL) re-derive it from
+                    -- the metadata carrier, vocab-guarded to the closed
+                    -- #1945 set (the import-funnel re-denorm precedent).
+                    COALESCE(kind_provenance,
+                             CASE WHEN json_extract(metadata, '$.kind_provenance')
+                                       IN ('declared', 'channel_derived', 'regex', 'llm')
+                                  THEN json_extract(metadata, '$.kind_provenance')
+                             END),
                     ?3, ?4,
                     valid_from, valid_until
              FROM archived_memories WHERE id = ?2",
@@ -12272,7 +12282,7 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
               mentioned_entity_id, version, lifecycle_state, encrypted_envelope,
-              cid, cid_genesis, valid_from, valid_until)
+              kind_provenance, cid, cid_genesis, valid_from, valid_until)
              SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                     tags, priority, confidence, source, access_count, created_at,
                     ?1, last_accessed_at, original_expires_at, metadata,
@@ -12306,6 +12316,16 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
                     COALESCE(version, 1),
                     COALESCE(lifecycle_state, 'open'),
                     encrypted_envelope,
+                    -- v1.0.0 #2333 (FBL-03) — carry the v79 kind_provenance
+                    -- denormalized column through the round-trip; legacy
+                    -- pre-v87 archive rows (column NULL) re-derive it from
+                    -- the metadata carrier, vocab-guarded to the closed
+                    -- #1945 set (the import-funnel re-denorm precedent).
+                    COALESCE(kind_provenance,
+                             CASE WHEN json_extract(metadata, '$.kind_provenance')
+                                       IN ('declared', 'channel_derived', 'regex', 'llm')
+                                  THEN json_extract(metadata, '$.kind_provenance')
+                             END),
                     ?3, ?4,
                     valid_from, valid_until
              FROM archived_memories WHERE id = ?2",
@@ -12756,8 +12776,8 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // once per pulled row; `prepare_cached` amortises the parse of the
     // largest SQL statement in the file across the whole batch.
     let mut newer_wins_stmt = conn.prepare_cached(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version, lifecycle_state, encrypted_envelope, cid, cid_genesis, valid_from, valid_until)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version, lifecycle_state, encrypted_envelope, cid, cid_genesis, valid_from, valid_until, kind_provenance)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)
          ON CONFLICT(title, namespace) DO UPDATE SET
             -- v0.9.0 G8 (#1825) — a federation merge NEVER overwrites the
             -- surviving local row's genesis content-id: keep the local
@@ -12874,6 +12894,10 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             lifecycle_state = CASE WHEN excluded.updated_at > memories.updated_at
                                         OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
                                    THEN excluded.lifecycle_state ELSE memories.lifecycle_state END,
+            -- v1.0.0 #2333 (FBL-03) — stamp/merge the v79 denormalized
+            -- kind_provenance on the federation funnel (pg 13949 parity:
+            -- COALESCE keeps the local value when the peer carries none).
+            kind_provenance = COALESCE(excluded.kind_provenance, memories.kind_provenance),
             -- v1.0.0 #1834 — claim-bitemporal validity under federation LWW.
             -- `valid_from` is immutable (local genesis wins, like `cid`);
             -- `valid_until` follows the newer-wins tiebreak so a peer that
@@ -12926,6 +12950,9 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             // rendering can never mis-order against a local `+00:00` row.
             crate::validate::canonical_valid_time_opt(mem.valid_from.as_deref()),
             crate::validate::canonical_valid_time_opt(mem.valid_until.as_deref()),
+            // v1.0.0 #2333 (FBL-03) — denormalize the v79 kind_provenance
+            // from the metadata carrier on the federation funnel (?34).
+            extract_kind_provenance(mem),
         ],
         |r| r.get(0),
     )?;

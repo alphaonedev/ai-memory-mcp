@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed (STORAGE-CHAIN lane, fable-3x7 findings)
+
+- **sqlite `memory_update` tier→long now clears the stale short/mid `expires_at`** ([#2331](https://github.com/alphaonedev/ai-memory-mcp/issues/2331), FBL-01) — the #1626 tier→long ⇒ `expires_at = NULL` coupling, previously postgres-only, landed on the sqlite `update_with_expected_version` + supersede funnels so the tier-blind GC can no longer archive (or hard-delete + crypto-erase under `archive_on_gc=false`) an explicitly-promoted permanent row at its leftover TTL deadline. Pinned by `tests/storage_chain_fbl.rs`.
+- **`expires_at` renderings are canonicalized at every sqlite write funnel** ([#2332](https://github.com/alphaonedev/ai-memory-mcp/issues/2332), FBL-02) — every expiry predicate (GC reap, recall/list visibility, the #1596 touch/fold `MAX()` floors) compares the TEXT column lexicographically, and a caller/peer-supplied non-UTC-offset RFC3339 rendering mis-ordered as bytes (premature reap / over-retention / voided extension floor). The v86 `canonical_valid_time_opt` machinery now applies to `expires_at` at `insert`, `insert_with_conflict`, `update_with_expected_version`, `insert_if_newer`, and `overwrite_full_row_by_id`; unparseable values pass through byte-for-byte (fail-safe). Postgres unaffected (`TIMESTAMPTZ`).
+- **schema v87 — `archived_memories.kind_provenance` + one-time expiry-rendering heal** ([#2333](https://github.com/alphaonedev/ai-memory-mcp/issues/2333), FBL-03; heals #2332 pre-fix rows). The third v79/#1945 column is finally mirrored onto the archive on BOTH backends (its two v79 siblings landed at v85/#2035): carried through every sqlite archive `INSERT...SELECT`, re-inserted by both `restore_archived*` paths (legacy pre-v87 archive rows re-derive it from the `metadata.kind_provenance` carrier, vocab-guarded), and stamped/merged by the federation `insert_if_newer` funnel (pg store-lane parity). The sqlite v87 arm additionally normalizes legacy `expires_at` / `original_expires_at` renderings to the canonical fixed-UTC form (`normalize_expiry_rows` — instant-preserving, idempotent, fail-safe). `migrations/sqlite/0071_v87_archived_kind_provenance.sql` + `migrations/postgres/0044_v87_archived_kind_provenance.sql`; `CURRENT_SCHEMA_VERSION` 86→87 in lockstep on both adapters. The postgres archive/restore column-list carry is the tracked cross-backend follow-up on #2333.
+
 ## [1.0.0] — 2026-07-21
 
 ### Security
