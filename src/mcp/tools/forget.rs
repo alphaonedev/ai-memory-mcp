@@ -88,6 +88,9 @@ fn forget_governance_gate_one_ns(
     // caller is correct: the owner-scope restricts the match set to
     // caller-owned rows, so the Owner level resolves caller == owner;
     // Registered + signed-rule levels gate here too.
+    // #2356 (W1A6-03) — `pre_governance_decision` mandatory-hook-presence
+    // consult BEFORE the governance decision dispatches.
+    crate::mcp::consult_pre_governance_decision_gate(ns, "delete", caller, None)?;
     match db::enforce_governance(
         conn,
         GovernedAction::Delete,

@@ -380,6 +380,14 @@ pub fn handle_capture_turn(
         // param ONCE; inert unless `[capabilities].enabled`.
         let capability =
             crate::governance::capability::parse_presented_token(req.capability.as_deref(), caller);
+        // #2356 (W1A6-03) — `pre_governance_decision` mandatory-hook-presence
+        // consult BEFORE the governance decision dispatches.
+        crate::mcp::consult_pre_governance_decision_gate(
+            &gate_namespace,
+            "store",
+            caller,
+            Some(&write.memory.id),
+        )?;
         match crate::db::enforce_governance(
             conn,
             GovernedAction::Store,

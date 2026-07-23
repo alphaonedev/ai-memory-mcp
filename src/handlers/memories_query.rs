@@ -997,6 +997,19 @@ pub async fn bulk_create(
                 .and_then(|v| v.as_str())
                 .unwrap_or(crate::identity::sentinels::DAEMON_PRINCIPAL);
             let payload_for_pending = serde_json::to_value(&mem).unwrap_or_else(|_| json!({}));
+            // #2356 (W1A6-03) — `pre_governance_decision` presence consult
+            // BEFORE the per-row governance decision dispatches. A refusal
+            // accumulates as a row error (mirroring the Deny arm) so the
+            // bulk envelope stays shape-stable.
+            if let Err(reason) = crate::mcp::consult_pre_governance_decision_gate(
+                &mem.namespace,
+                "store",
+                agent_id,
+                None,
+            ) {
+                errors.push(format!("{}: {reason}", mem.title));
+                continue;
+            }
             match app
                 .store
                 .enforce_governance_action(

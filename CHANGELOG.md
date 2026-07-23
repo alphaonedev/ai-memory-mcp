@@ -1910,6 +1910,23 @@ agent-to-agent (A2A) federation** validation run. No schema change (stays at
 
 ### Security (v1.0.0 pre-ship Grok 2x5 — governance lane)
 
+- **W1A6-03 (#2356) — `pre_governance_decision` is now a REAL dispatchable
+  required event (PE-1 enforcement-theater fix).** The event was
+  ELIGIBLE_REQUIRED and the boot banner / `doctor --hooks` printed "WILL
+  DENY (enforce)" for it, but it had zero production dispatch sites — the
+  declared control was fail-open. A shared dispatch-layer consult
+  (`crate::mcp::consult_pre_governance_decision_gate` + the HTTP wrapper
+  `http_pre_governance_decision_gate`, the #1885/#1924 precedent) now fires
+  immediately BEFORE every production governance-decision dispatch: the
+  HTTP handlers' sqlite `db::enforce_governance` branches AND postgres
+  `MemoryStore::enforce_governance_action` branches (create, bulk-create,
+  delete, promote, admin import, kg entity-register), the MCP write tools
+  (store, update, delete, promote, forget, capture_turn), and the explicit
+  `memory_check_agent_action` surface (MCP + CLI shared funnel; the CLI
+  process never installs the gate so it stays inert there). Inert (zero
+  cost beyond one `OnceLock` load) for the default enforce-off deployment.
+  Regression: `tests/pre_governance_decision_gate_2356.rs`.
+
 - **W1A4-08 (#2357) — reserved `_peer_head_entanglement` namespace no longer
   writable via MCP/CLI store or any namespace-move lane.** The R22
   `reject_reserved_write_namespace` guard was consulted ONLY by the HTTP

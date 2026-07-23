@@ -819,6 +819,16 @@ pub async fn delete_memory(
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
             let payload = json!({"id": mem.id, "title": mem.title});
+            // #2356 (W1A6-03) — `pre_governance_decision` presence consult
+            // BEFORE the governance decision dispatches (postgres branch).
+            if let Some(resp) = super::create::http_pre_governance_decision_gate(
+                &mem.namespace,
+                "delete",
+                &agent_id,
+                Some(&mem.id),
+            ) {
+                return resp;
+            }
             match app
                 .store
                 .enforce_governance_action(
@@ -984,6 +994,16 @@ pub async fn delete_memory(
         // `X-AI-Memory-Capability` header ONCE; inert unless
         // `[capabilities].enabled`.
         let capability = crate::handlers::capability_from_headers(&headers, &agent_id);
+        // #2356 (W1A6-03) — `pre_governance_decision` presence consult
+        // BEFORE the governance decision dispatches (sqlite branch).
+        if let Some(resp) = super::create::http_pre_governance_decision_gate(
+            &target.namespace,
+            "delete",
+            &agent_id,
+            Some(&target.id),
+        ) {
+            return resp;
+        }
         match db::enforce_governance(
             &lock.0,
             GovernedAction::Delete,
@@ -1255,6 +1275,16 @@ pub async fn promote_memory(
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
             let payload = json!({"id": target.id});
+            // #2356 (W1A6-03) — `pre_governance_decision` presence consult
+            // BEFORE the governance decision dispatches (postgres branch).
+            if let Some(resp) = super::create::http_pre_governance_decision_gate(
+                &target.namespace,
+                "promote",
+                &agent_id,
+                Some(&target.id),
+            ) {
+                return resp;
+            }
             match app
                 .store
                 .enforce_governance_action(
@@ -1448,6 +1478,16 @@ pub async fn promote_memory(
         // `X-AI-Memory-Capability` header ONCE; inert unless
         // `[capabilities].enabled`.
         let capability = crate::handlers::capability_from_headers(&headers, &agent_id);
+        // #2356 (W1A6-03) — `pre_governance_decision` presence consult
+        // BEFORE the governance decision dispatches (sqlite branch).
+        if let Some(resp) = super::create::http_pre_governance_decision_gate(
+            &target.namespace,
+            "promote",
+            &agent_id,
+            Some(&target.id),
+        ) {
+            return resp;
+        }
         match db::enforce_governance(
             &lock.0,
             GovernedAction::Promote,
