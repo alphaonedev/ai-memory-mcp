@@ -13732,7 +13732,7 @@ pub fn get_unembedded_ids_batch_after(
     conn: &Connection,
     after_id: Option<&str>,
     limit: usize,
-) -> Result<Vec<(String, String, String)>> {
+) -> Result<EmbeddableScan> {
     // #1779 — pull encrypted_envelope + metadata so encrypted rows are
     // decrypted (or skipped) before embedding; see `resolve_embeddable_content`.
     let raw = if let Some(after) = after_id {
@@ -13750,7 +13750,7 @@ pub fn get_unembedded_ids_batch_after(
         let rows = stmt.query_map(params![limit], embeddable_row_mapper)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    Ok(resolve_embeddable_rows(raw))
+    Ok(resolve_embeddable_scan(raw))
 }
 
 /// #1779 — `query_map` row mapper for the embedding-fetch SELECTs that now
@@ -13771,13 +13771,50 @@ fn embeddable_row_mapper(row: &rusqlite::Row<'_>) -> rusqlite::Result<Embeddable
 /// encrypted-at-rest rows and SKIPPING (omitting) any whose envelope won't
 /// decrypt. See [`resolve_embeddable_content`].
 fn resolve_embeddable_rows(raw: Vec<EmbeddableRawRow>) -> Vec<(String, String, String)> {
-    let mut out: Vec<(String, String, String)> = Vec::with_capacity(raw.len());
+    resolve_embeddable_scan(raw).rows
+}
+
+/// v1.0.0 #2336 (FBL-24) — one page of an embedding scan, carrying the
+/// RAW-fetch cursor + the decrypt-skip count ALONGSIDE the resolved rows.
+///
+/// The #1779 decrypt-or-skip filter runs BEFORE the sweep callers used to
+/// compute their keyset cursor and their empty-chunk break, so a whole
+/// batch of undecryptable rows returned an EMPTY resolved chunk that the
+/// loops read as end-of-corpus — terminating the sweep early with a
+/// SUCCESS report and never scanning past the poison window (the exact
+/// #1595 starvation class the cursor fix closed), while decrypt-skips
+/// were absent from every outcome count. Callers now advance from
+/// [`EmbeddableScan::raw_last_id`], break only when the RAW fetch was
+/// empty, and fold [`EmbeddableScan::decrypt_skipped`] into their skip
+/// totals.
+#[derive(Debug, Default)]
+pub struct EmbeddableScan {
+    /// Decrypt-resolved `(id, title, plaintext)` triples, ready to embed.
+    pub rows: Vec<(String, String, String)>,
+    /// Last id of the RAW fetch (before the decrypt filter) — the keyset
+    /// cursor. `None` ⇔ the raw fetch was empty ⇔ end of corpus.
+    pub raw_last_id: Option<String>,
+    /// Rows omitted because their envelope failed to decrypt (#1779).
+    pub decrypt_skipped: usize,
+}
+
+/// #2336 — resolve a raw fetch into an [`EmbeddableScan`] (rows +
+/// raw-cursor + decrypt-skip count).
+fn resolve_embeddable_scan(raw: Vec<EmbeddableRawRow>) -> EmbeddableScan {
+    let raw_last_id = raw.last().map(|(id, ..)| id.clone());
+    let mut rows: Vec<(String, String, String)> = Vec::with_capacity(raw.len());
+    let mut decrypt_skipped = 0usize;
     for (id, title, content, envelope, metadata_json) in raw {
-        if let Some(resolved) = resolve_embeddable_content(&id, content, envelope, &metadata_json) {
-            out.push((id, title, resolved));
+        match resolve_embeddable_content(&id, content, envelope, &metadata_json) {
+            Some(resolved) => rows.push((id, title, resolved)),
+            None => decrypt_skipped += 1,
         }
     }
-    out
+    EmbeddableScan {
+        rows,
+        raw_last_id,
+        decrypt_skipped,
+    }
 }
 
 /// #1779 — resolve the embeddable plaintext for a backfill / reembed row.
@@ -13840,7 +13877,7 @@ pub fn get_memory_texts_batch(
     after_id: Option<&str>,
     limit: usize,
     exclude_space: Option<&str>,
-) -> Result<Vec<(String, String, String)>> {
+) -> Result<EmbeddableScan> {
     // #1779 — also pull `encrypted_envelope` + `metadata` so at-rest-encrypted
     // rows (where `content` holds the empty placeholder and the plaintext lives
     // in the envelope) are DECRYPTED before embedding. Embedding the
@@ -13879,7 +13916,7 @@ pub fn get_memory_texts_batch(
         binds.iter().map(std::convert::AsRef::as_ref).collect();
     let rows = stmt.query_map(bind_refs.as_slice(), embeddable_row_mapper)?;
     let raw = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(resolve_embeddable_rows(raw))
+    Ok(resolve_embeddable_scan(raw))
 }
 
 /// v1.0.0 #2167 §5/§7 — outcome of `reembed --stamp-only`, the explicit
@@ -20172,14 +20209,23 @@ mod tests {
         ids.sort();
 
         let first = get_unembedded_ids_batch_after(&conn, None, 2).unwrap();
-        assert_eq!(first.len(), 2);
-        assert_eq!(first[0].0, ids[0], "scan starts at the smallest id");
-        let cursor = first.last().unwrap().0.clone();
+        assert_eq!(first.rows.len(), 2);
+        assert_eq!(first.rows[0].0, ids[0], "scan starts at the smallest id");
+        // #2336 — the raw cursor equals the last resolved id when nothing
+        // was decrypt-skipped.
+        assert_eq!(
+            first.raw_last_id.as_deref(),
+            Some(first.rows.last().unwrap().0.as_str())
+        );
+        assert_eq!(first.decrypt_skipped, 0);
+        let cursor = first.rows.last().unwrap().0.clone();
 
         let rest = get_unembedded_ids_batch_after(&conn, Some(&cursor), 10).unwrap();
-        assert_eq!(rest.len(), 3);
+        assert_eq!(rest.rows.len(), 3);
         assert!(
-            rest.iter().all(|(id, _, _)| id.as_str() > cursor.as_str()),
+            rest.rows
+                .iter()
+                .all(|(id, _, _)| id.as_str() > cursor.as_str()),
             "every row must sort strictly after the cursor"
         );
 
@@ -20192,8 +20238,8 @@ mod tests {
         )
         .unwrap();
         let after = get_unembedded_ids_batch_after(&conn, None, 10).unwrap();
-        assert_eq!(after.len(), 4);
-        assert!(after.iter().all(|(id, _, _)| id != &ids[0]));
+        assert_eq!(after.rows.len(), 4);
+        assert!(after.rows.iter().all(|(id, _, _)| id != &ids[0]));
     }
 
     /// #1598 — the reembed full-corpus scan returns embedded AND
@@ -20230,18 +20276,22 @@ mod tests {
         .unwrap();
 
         let all = get_memory_texts_batch(&conn, None, None, 100, None).unwrap();
-        assert_eq!(all.len(), 5, "unfiltered scan sees every live row");
+        assert_eq!(all.rows.len(), 5, "unfiltered scan sees every live row");
 
         let ns_a = get_memory_texts_batch(&conn, Some("reembed-a"), None, 100, None).unwrap();
-        assert_eq!(ns_a.len(), 3);
-        assert_eq!(ns_a[0].0, ns_a_ids[0], "embedded row still scanned");
+        assert_eq!(ns_a.rows.len(), 3);
+        assert_eq!(ns_a.rows[0].0, ns_a_ids[0], "embedded row still scanned");
 
         let first = get_memory_texts_batch(&conn, Some("reembed-a"), None, 1, None).unwrap();
-        let cursor = first[0].0.clone();
+        let cursor = first.rows[0].0.clone();
         let rest =
             get_memory_texts_batch(&conn, Some("reembed-a"), Some(&cursor), 100, None).unwrap();
-        assert_eq!(rest.len(), 2);
-        assert!(rest.iter().all(|(id, _, _)| id.as_str() > cursor.as_str()));
+        assert_eq!(rest.rows.len(), 2);
+        assert!(
+            rest.rows
+                .iter()
+                .all(|(id, _, _)| id.as_str() > cursor.as_str())
+        );
     }
 
     /// #1598 — the reembed writer REPLACES vectors across a dim change

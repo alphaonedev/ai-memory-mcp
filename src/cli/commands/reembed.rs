@@ -204,18 +204,38 @@ pub(crate) fn run_reembed_live(
         if remaining == 0 {
             break;
         }
-        let chunk = db::get_memory_texts_batch(
+        let scan = db::get_memory_texts_batch(
             conn,
             namespace,
             cursor.as_deref(),
             remaining,
             exclude_space,
         )?;
-        if chunk.is_empty() {
+        if scan.raw_last_id.is_none() {
+            // v1.0.0 #2336 (FBL-24): break only when the RAW fetch was
+            // empty — an all-decrypt-skipped batch must keep scanning past
+            // the poison window instead of reporting early success.
             break;
         }
-        outcome.total += chunk.len();
-        cursor = chunk.last().map(|(id, _, _)| id.clone());
+        outcome.total += scan.rows.len() + scan.decrypt_skipped;
+        cursor = scan.raw_last_id.clone();
+        if scan.decrypt_skipped > 0 {
+            writeln!(
+                out.stderr,
+                "reembed: skipped {} encrypted row(s) whose envelope failed to decrypt \
+                 (previous vectors kept, #1779/#2336)",
+                scan.decrypt_skipped
+            )?;
+            outcome.skipped += scan.decrypt_skipped;
+        }
+        let chunk = scan.rows;
+        if chunk.is_empty() {
+            // Whole batch decrypt-skipped: pace + continue (cursor advanced).
+            if pacing.sleep_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(pacing.sleep_ms));
+            }
+            continue;
+        }
 
         let embedded = crate::mcp::embed_rows_with_fallback(emb, &chunk);
         for (id, reason) in &embedded.skipped {

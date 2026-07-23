@@ -355,6 +355,67 @@ fn fbl02_insert_if_newer_canonicalizes_offset_expiry() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// #2336 (FBL-24) — embedding scans advance past decrypt-skipped batches
+// ─────────────────────────────────────────────────────────────────────
+
+/// A WHOLE batch of undecryptable envelopes must not read as
+/// end-of-corpus: the scan exposes the RAW cursor + skip count so the
+/// sweep steps past the poison window and reaches the rows behind it.
+#[test]
+fn fbl24_scan_advances_past_all_decrypt_skipped_batch() {
+    let conn = fresh_sqlite();
+    // Two consecutive-by-id rows whose envelope is garbage (undecryptable)
+    // followed by a healthy plaintext row.
+    for id in ["fbl24-a", "fbl24-b"] {
+        seed(&conn, id, Tier::Long, None);
+        conn.execute(
+            "UPDATE memories SET encrypted_envelope = X'DEADBEEF' WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .expect("plant garbage envelope");
+    }
+    seed(&conn, "fbl24-z", Tier::Long, None);
+
+    // Page 1 (batch of 2): both rows decrypt-skip — the resolved chunk is
+    // empty, but the RAW cursor covers the poison window and the skips are
+    // counted (pre-fix: empty chunk => sweep reported SUCCESS and never
+    // scanned further).
+    let page1 = db::get_unembedded_ids_batch_after(&conn, None, 2).expect("page 1");
+    assert!(page1.rows.is_empty(), "both rows are undecryptable");
+    assert_eq!(page1.decrypt_skipped, 2, "skips are counted, not omitted");
+    assert_eq!(
+        page1.raw_last_id.as_deref(),
+        Some("fbl24-b"),
+        "the raw cursor advances past the poison window"
+    );
+
+    // Page 2 from the raw cursor: the healthy row behind the window IS
+    // reached.
+    let page2 =
+        db::get_unembedded_ids_batch_after(&conn, page1.raw_last_id.as_deref(), 2).expect("page 2");
+    assert_eq!(page2.decrypt_skipped, 0);
+    assert_eq!(page2.rows.len(), 1);
+    assert_eq!(page2.rows[0].0, "fbl24-z", "the post-window row is scanned");
+
+    // Page 3: RAW fetch empty ⇔ true end of corpus (the only break
+    // condition the sweeps use now).
+    let page3 =
+        db::get_unembedded_ids_batch_after(&conn, page2.raw_last_id.as_deref(), 2).expect("page 3");
+    assert!(page3.raw_last_id.is_none(), "end of corpus");
+    assert!(page3.rows.is_empty());
+
+    // The reembed full-corpus scan exposes the same contract.
+    let texts = db::get_memory_texts_batch(&conn, None, None, 2, None).expect("texts page 1");
+    assert!(texts.rows.is_empty());
+    assert_eq!(texts.decrypt_skipped, 2);
+    assert_eq!(texts.raw_last_id.as_deref(), Some("fbl24-b"));
+    let texts2 = db::get_memory_texts_batch(&conn, None, texts.raw_last_id.as_deref(), 2, None)
+        .expect("texts page 2");
+    assert_eq!(texts2.rows.len(), 1);
+    assert_eq!(texts2.rows[0].0, "fbl24-z");
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // #2334 (FBL-15) — stats expiry-axis reconciliation
 // ─────────────────────────────────────────────────────────────────────
 
