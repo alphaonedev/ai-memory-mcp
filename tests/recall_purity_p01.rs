@@ -982,6 +982,83 @@ fn fold_before_gc_retains_recalled_expiring_row() {
     );
 }
 
+#[test]
+fn gc_if_needed_folds_pending_extension_before_evicting_2308() {
+    // #2308 (FBL-04) regression — the `db::gc_if_needed` sites (MCP
+    // recall + the CLI store/recall/crud/io hot paths) and the MCP
+    // `memory_gc` real-run route ALL evict through `db::gc`, which must
+    // fold pending recall-access TTL extensions BEFORE evaluating
+    // expiry. Pre-#2308, MCP stdio (which spawns no fold loop) reaped a
+    // hot short-tier row here despite its pending extension — silent
+    // crypto-erasure when archive_on_gc=false.
+    let _g = env_lock();
+    clear_flags();
+    let (conn, _dir) = fresh_db();
+    // Two short-tier rows whose BASE 6h TTL has already lapsed
+    // (created 7h ago, expired 30min ago); only one is recalled.
+    let created = (chrono::Utc::now() - chrono::Duration::hours(7)).to_rfc3339();
+    let lapsed = (chrono::Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
+    for id in ["fbl04-recalled", "fbl04-control"] {
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at, \
+                                   expires_at) \
+             VALUES (?1, 'short', 'fbl04', ?1, 'c', ?2, ?2, ?3)",
+            rusqlite::params![id, created, lapsed],
+        )
+        .unwrap();
+    }
+    // A PURE recall appended an unfolded (folded = 0) ledger row whose
+    // pending short-tier floor-extension (observed_at + 1h, i.e. ~now
+    // + 1h) pushes the row's REAL expiry past the lapsed base TTL.
+    ai_memory::observations::record_recall(
+        &conn,
+        "fbl04-r1",
+        &[ai_memory::observations::Candidate {
+            memory_id: "fbl04-recalled",
+            retriever: "fts5",
+            rank: 1,
+            score: 0.5,
+        }],
+    )
+    .unwrap();
+    assert_eq!(unfolded_count(&conn), 1, "extension is pending, unfolded");
+
+    // The hot-path eviction entry: must fold-then-evict, never
+    // evict-then-lose-the-extension.
+    db::gc_if_needed(&conn, false).expect("gc_if_needed");
+
+    let exists = |id: &str| -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM memories WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(
+        exists("fbl04-recalled"),
+        1,
+        "recalled row survived gc_if_needed: its pending TTL extension was folded before eviction"
+    );
+    assert_eq!(
+        exists("fbl04-control"),
+        0,
+        "un-recalled control row expired as scheduled"
+    );
+    // The fold was really applied (not merely a reap-skip): the ledger
+    // drained and the row's expiry now lies in the future.
+    assert_eq!(unfolded_count(&conn), 0, "gc consumed the pending fold");
+    let expires_at: String = conn
+        .query_row(
+            "SELECT expires_at FROM memories WHERE id = 'fbl04-recalled'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        expires_at > chrono::Utc::now().to_rfc3339(),
+        "folded expiry must lie in the future (got {expires_at})"
+    );
+}
+
 // =====================================================================
 // F — gc-tick fold fallback (AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS=0)
 // =====================================================================
