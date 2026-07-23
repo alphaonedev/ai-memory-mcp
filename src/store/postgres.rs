@@ -28795,13 +28795,12 @@ mod tests {
             .await
             .expect("hard forget");
         assert_eq!(deleted, 1, "victim reaped");
-        let (has_tomb,): (bool,) = sqlx::query_as(
-            "SELECT EXISTS(SELECT 1 FROM forget_tombstones WHERE memory_id = $1)",
-        )
-        .bind(&vid)
-        .fetch_one(&store.pool)
-        .await
-        .expect("tombstone probe");
+        let (has_tomb,): (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM forget_tombstones WHERE memory_id = $1)")
+                .bind(&vid)
+                .fetch_one(&store.pool)
+                .await
+                .expect("tombstone probe");
         assert!(has_tomb, "forget must have written the tombstone");
 
         // A stale peer re-pushes the row through BOTH inbound primitives.
@@ -28911,12 +28910,11 @@ mod tests {
             .bind(&ns)
             .execute(&store.pool)
             .await;
-        let _ = sqlx::query(
-            "DELETE FROM archived_memory_links WHERE source_id = $1 OR target_id = $1",
-        )
-        .bind(&a_id)
-        .execute(&store.pool)
-        .await;
+        let _ =
+            sqlx::query("DELETE FROM archived_memory_links WHERE source_id = $1 OR target_id = $1")
+                .bind(&a_id)
+                .execute(&store.pool)
+                .await;
     }
 
     /// #2317 — the pg backfill scan must never hand the embedder the
