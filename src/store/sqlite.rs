@@ -558,6 +558,22 @@ impl MemoryStore for SqliteStore {
         db::get_links(&conn, anchor_id).map_err(box_err)
     }
 
+    /// FBL-08 (v1.0.0) — thin delegate to the legacy `db::delete_link`
+    /// free-function so the sqlite backend behaviour is byte-identical to
+    /// the pre-trait `DELETE /api/v1/links` handler. The Postgres adapter
+    /// mirrors this over the same `memory_links` table (+ best-effort AGE
+    /// edge unprojection).
+    async fn delete_link(
+        &self,
+        _ctx: &CallerContext,
+        source_id: &str,
+        target_id: &str,
+    ) -> StoreResult<bool> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::delete_link(&conn, source_id, target_id).map_err(box_err)
+    }
+
     async fn list_links(&self, namespace: Option<&str>) -> StoreResult<Vec<MemoryLink>> {
         // F6 Gap 2 (v0.7.0) — surface `memory_links` to the migrate
         // runner. The namespace filter, when set, matches the source
@@ -2541,6 +2557,49 @@ mod tests {
             version: 1,
             lifecycle_state: crate::models::LifecycleState::Open,
         }
+    }
+
+    // FBL-08 (v1.0.0 pre-ship 3x7) — SqliteStore::delete_link removes the
+    // directional edge from the CONFIGURED store and reports removal
+    // truthfully. This is the trait method the postgres `DELETE
+    // /api/v1/links` handler now routes through instead of running
+    // `db::delete_link` against an unrelated local sqlite file.
+    #[tokio::test]
+    async fn fbl08_delete_link_removes_edge_and_reports_removal() {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let store = SqliteStore::open(tmp.path()).expect("open");
+        let ctx = CallerContext::for_agent("alice");
+        let a = test_memory("fbl08-src", "source body");
+        let b = test_memory("fbl08-dst", "target body");
+        let src = store.store(&ctx, &a).await.expect("store a");
+        let dst = store.store(&ctx, &b).await.expect("store b");
+        let link = MemoryLink {
+            source_id: src.clone(),
+            target_id: dst.clone(),
+            relation: crate::models::MemoryLinkRelation::default(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            valid_from: None,
+            valid_until: None,
+            observed_by: None,
+            signature: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        };
+        store.link_signed(&ctx, &link, None).await.expect("link");
+        let before = store.get_links_for_anchor(&src).await.expect("links");
+        assert_eq!(before.len(), 1, "edge should exist before delete");
+        // First delete removes it and reports true.
+        let removed = store.delete_link(&ctx, &src, &dst).await.expect("delete");
+        assert!(removed, "delete_link must report the edge was removed");
+        let after = store.get_links_for_anchor(&src).await.expect("links");
+        assert!(
+            after.is_empty(),
+            "edge must be gone from the configured store after delete"
+        );
+        // Re-deleting a gone edge reports false — never a lie.
+        let again = store.delete_link(&ctx, &src, &dst).await.expect("delete");
+        assert!(!again, "re-deleting a gone edge must report false");
     }
 
     #[tokio::test]

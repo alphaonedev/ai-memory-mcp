@@ -2346,6 +2346,113 @@ mod tests {
         );
     }
 
+    // ---- #2341 (W1A2-01/02) — 2xx receiver-report ack classification ----
+
+    /// Spawn a mock peer that always 200s with the given response envelope.
+    async fn spawn_envelope_peer(envelope: serde_json::Value) -> String {
+        let app = Router::new().route(
+            "/api/v1/sync/push",
+            post(move |AxumJson(_b): AxumJson<serde_json::Value>| {
+                let env = envelope.clone();
+                async move { (StatusCode::OK, AxumJson(env)) }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        format!("http://{addr}/api/v1/sync/push")
+    }
+
+    async fn classify_against_envelope(envelope: serde_json::Value) -> AckOutcome {
+        let url = spawn_envelope_peer(envelope).await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(2000))
+            .build()
+            .unwrap();
+        let body = serde_json::json!({"sender_agent_id":"ai:test","memories":[]});
+        super::sync::post_once(&client, &url, &body, "mem-x", Some("mem-x"), None, None).await
+    }
+
+    /// #2341 — a postgres receiver's 200 carrying `unsupported_on_postgres`
+    /// items (the FED-RQ-01 honest count of subcollections it cannot apply)
+    /// must NOT count as an applied-ack: quorum would be met and push-DLQ
+    /// rows retired for writes the peer never landed.
+    #[tokio::test]
+    async fn success_with_unsupported_on_postgres_is_not_ack() {
+        let outcome = classify_against_envelope(serde_json::json!({
+            "applied": 0, "skipped": 0, "unsupported_on_postgres": 1
+        }))
+        .await;
+        match outcome {
+            AckOutcome::Fail(reason) => assert!(
+                reason.contains("unsupported_on_postgres"),
+                "reason must name the unsupported count: {reason}"
+            ),
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    /// #2341 — a receiver's 200 that SKIPPED items (validation / attestation
+    /// / namespace-scope refusal) must NOT count as an applied-ack.
+    #[tokio::test]
+    async fn success_with_skipped_items_is_not_ack() {
+        let outcome = classify_against_envelope(serde_json::json!({
+            "applied": 0, "skipped": 1
+        }))
+        .await;
+        match outcome {
+            AckOutcome::Fail(reason) => assert!(
+                reason.contains("skipped"),
+                "reason must name the skipped count: {reason}"
+            ),
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    /// #2341 — a fully-applied 200 stays an ack, and so does a legacy /
+    /// counter-less 2xx body (backward compatibility with peers that do not
+    /// emit the structured report). Idempotent replays land in `noop` on the
+    /// receiver, never `skipped`, so a converged no-op push also stays Ack.
+    #[tokio::test]
+    async fn success_with_clean_or_absent_report_stays_ack() {
+        for envelope in [
+            serde_json::json!({"applied": 1, "skipped": 0, "unsupported_on_postgres": 0}),
+            serde_json::json!({"applied": 0, "noop": 1, "skipped": 0}),
+            serde_json::json!({"status": "ok"}),
+        ] {
+            let outcome = classify_against_envelope(envelope.clone()).await;
+            assert!(
+                matches!(outcome, AckOutcome::Ack),
+                "expected Ack for {envelope}, got {outcome:?}"
+            );
+        }
+    }
+
+    /// #2341 — pure-classifier arms (no HTTP): the exact before/after pin.
+    /// Before the fix ANY 2xx classified Ack; after, the receiver's own
+    /// report gates the ack.
+    #[test]
+    fn success_report_non_ack_reason_arms() {
+        use super::sync::success_report_non_ack_reason;
+        // Non-ack: unsupported wins the reason even when skipped is also set.
+        let both = serde_json::json!({"skipped": 2, "unsupported_on_postgres": 3});
+        let reason = success_report_non_ack_reason(&both).expect("non-ack");
+        assert!(reason.contains("3 item(s) unsupported_on_postgres"));
+        // Non-ack: skipped alone.
+        let skipped = serde_json::json!({"skipped": 2});
+        let reason = success_report_non_ack_reason(&skipped).expect("non-ack");
+        assert!(reason.contains("2 item(s) skipped"));
+        // Ack: clean report, absent counters, non-numeric garbage.
+        assert!(success_report_non_ack_reason(&serde_json::json!({"skipped": 0})).is_none());
+        assert!(success_report_non_ack_reason(&serde_json::json!({})).is_none());
+        assert!(
+            success_report_non_ack_reason(&serde_json::json!({"skipped": "weird"})).is_none(),
+            "non-numeric counters fall back to the legacy ack posture"
+        );
+    }
+
     /// W12-G #3: `bulk_catchup_push` with no peers returns immediately
     /// without spawning. Hits the `if memories.is_empty() || config.peers
     /// .is_empty()` shortcut — the existing

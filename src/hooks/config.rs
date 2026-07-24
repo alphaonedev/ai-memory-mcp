@@ -189,6 +189,43 @@ pub struct HookConfig {
     pub fail_mode: FailMode,
 }
 
+impl HookConfig {
+    /// FBL-29 (v1.0.0) — does this hook fire for an in-flight payload whose
+    /// namespace is `namespace`?
+    ///
+    /// Before this shipped, the per-hook `namespace` field was parsed +
+    /// validated but NEVER matched against the payload, so a hook scoped
+    /// `namespace = "team/secure/*"` fired (Modify / Deny) in EVERY namespace —
+    /// a documented operator-scoping knob that silently mutated / blocked writes
+    /// contrary to explicit scope. This restores the intended semantics.
+    ///
+    /// Matching (mirrors [`crate::config::TranscriptsConfig::auto_extract_for`]):
+    /// a `*` (or empty) pattern matches everything — the schema default, so a
+    /// config that already uses `namespace = "*"` is byte-identical to the
+    /// pre-fix behaviour. A non-wildcard pattern matches EXACTLY, or as a
+    /// `prefix/*` glob (the prefix itself and any child under `prefix/`). A
+    /// scoped hook fired against a payload that carries NO namespace (`None` —
+    /// eviction / some recall shapes) does NOT fire: the operator scoped it to
+    /// specific namespaces and there is none to match, so it stays scoped OUT.
+    #[must_use]
+    pub fn matches_namespace(&self, namespace: Option<&str>) -> bool {
+        let pat = self.namespace.trim();
+        if pat.is_empty() || pat == "*" {
+            return true;
+        }
+        let Some(ns) = namespace else {
+            return false;
+        };
+        if pat == ns {
+            return true;
+        }
+        if let Some(prefix) = pat.strip_suffix("/*") {
+            return ns == prefix || ns.starts_with(&format!("{prefix}/"));
+        }
+        false
+    }
+}
+
 /// Wire-shape mirror of [`HookConfig`] used only for TOML
 /// deserialization. `mode` is `Option<HookMode>` so missing values
 /// can be filled in from [`default_mode_for_event`] at parse time
@@ -884,6 +921,47 @@ namespace = "team/*"
         assert_eq!(closed, "\"closed\"");
         let back: FailMode = serde_json::from_str("\"closed\"").unwrap();
         assert_eq!(back, FailMode::Closed);
+    }
+
+    #[test]
+    fn matches_namespace_gates_hook_firing() {
+        // FBL-29 — the per-hook `namespace` pattern must actually gate firing.
+        let mk = |pat: &str| HookConfig {
+            event: HookEvent::PreStore,
+            command: std::path::PathBuf::from("/bin/true"),
+            priority: 0,
+            timeout_ms: 1_000,
+            mode: HookMode::Exec,
+            enabled: true,
+            namespace: pat.to_string(),
+            fail_mode: FailMode::Open,
+        };
+
+        // Wildcard (schema default) matches every namespace AND a
+        // namespace-less payload (byte-identical to the pre-fix behaviour).
+        assert!(mk("*").matches_namespace(Some("anything")));
+        assert!(mk("*").matches_namespace(None));
+        // Empty is treated as match-all too (load-time validation already
+        // rejects empty, but be defensive).
+        assert!(mk("").matches_namespace(Some("x")));
+
+        // Exact literal match — and non-match.
+        assert!(mk("team/eng").matches_namespace(Some("team/eng")));
+        assert!(!mk("team/eng").matches_namespace(Some("team/sales")));
+        assert!(!mk("team/eng").matches_namespace(Some("personal/notes")));
+
+        // `prefix/*` glob: matches the prefix itself and any child, not a
+        // sibling that merely shares a string prefix.
+        assert!(mk("team/*").matches_namespace(Some("team")));
+        assert!(mk("team/*").matches_namespace(Some("team/eng")));
+        assert!(mk("team/*").matches_namespace(Some("team/eng/backend")));
+        assert!(!mk("team/*").matches_namespace(Some("teamwork")));
+        assert!(!mk("team/*").matches_namespace(Some("personal")));
+
+        // A SCOPED hook fired against a namespace-less payload does NOT fire —
+        // the operator scoped it OUT, and there is no namespace to match.
+        assert!(!mk("team/*").matches_namespace(None));
+        assert!(!mk("team/eng").matches_namespace(None));
     }
 
     #[test]

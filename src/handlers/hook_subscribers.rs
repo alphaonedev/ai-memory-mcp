@@ -1249,6 +1249,69 @@ pub async fn session_start(
     if let Some(l) = body.limit {
         params["limit"] = json!(l);
     }
+
+    // FBL-09 (v1.0.0 pre-ship 3x7) — serve session_start context from the
+    // CONFIGURED store on a postgres-backed daemon. Pre-fix this handler
+    // locked the LOCAL sqlite `app.db` and ran `mcp::handle_session_start`
+    // against it on EVERY backend, so a postgres-fleet agent booting via
+    // HTTP got recent-memory context from the (empty/unrelated) local
+    // sqlite file — silently hiding the fleet's real corpus. Route the
+    // recent-memory list + the `scope=private` visibility post-filter
+    // through the SAL trait (`app.store.list`), matching the postgres
+    // `list_memories` precedent. (The sqlite decorator enrichment +
+    // namespace-standard injection are rusqlite-conn-bound; their absence
+    // on postgres is consistent with the existing postgres `list_memories`
+    // path, which likewise serves plain rows — tracked as the follow-up
+    // parity item, not a wrong-backend data defect.)
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        if let Some(ns) = body.namespace.as_deref()
+            && let Err(e) = validate::validate_namespace(ns)
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": crate::errors::msg::invalid("namespace", e)})),
+            )
+                .into_response();
+        }
+        let limit = usize::try_from(body.limit.unwrap_or(10))
+            .unwrap_or(usize::MAX)
+            .min(50);
+        let filter = crate::store::Filter {
+            namespace: body.namespace.clone(),
+            tier: None,
+            tags_any: Vec::new(),
+            agent_id: None,
+            since: None,
+            until: None,
+            valid_at: None,
+            limit,
+            active_embedding_space: None,
+        };
+        let ctx = crate::store::CallerContext::for_agent(&caller);
+        return match app.store.list(&ctx, &filter).await {
+            Ok(mems) => {
+                let visible: Vec<crate::models::Memory> = mems
+                    .into_iter()
+                    .filter(|m| crate::visibility::is_visible_to_caller(m, &caller))
+                    .collect();
+                let mut v = json!({
+                    "memories": &visible,
+                    "count": visible.len(),
+                    "mode": crate::mcp::SESSION_START_MODE,
+                    "session_id": Uuid::new_v4().to_string(),
+                });
+                if let Some(ref a) = body.agent_id
+                    && let Some(obj) = v.as_object_mut()
+                {
+                    obj.insert("agent_id".into(), json!(a));
+                }
+                (StatusCode::OK, Json(v)).into_response()
+            }
+            Err(e) => store_err_to_response(e),
+        };
+    }
+
     let lock = app.db.lock().await;
     let result = crate::mcp::handle_session_start(&lock.0, &params, None, Some(&caller));
     drop(lock);
