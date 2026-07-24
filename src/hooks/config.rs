@@ -224,6 +224,46 @@ impl HookConfig {
         }
         false
     }
+
+    /// #2390 (N9) — `true` when this hook covers ANY namespace in `namespaces`.
+    ///
+    /// Multi-namespace companion to [`Self::matches_namespace`], for operations
+    /// that legitimately span more than one namespace: a link (its SOURCE and
+    /// TARGET memories may live in different namespaces), a consolidation (N
+    /// source ids), a bulk store (N bodies). Fire-if-ANY is the fail-closed
+    /// reading — a hook scoped to `prod` MUST fire on a link that touches `prod`
+    /// regardless of which endpoint is the source, otherwise a caller picks
+    /// which guard hook runs simply by swapping `source_id`/`target_id`.
+    ///
+    /// An EMPTY slice means "no in-flight namespace could be resolved" and is
+    /// deliberately equivalent to `matches_namespace(None)`: a `*`/empty pattern
+    /// still matches (unscoped hooks are namespace-blind by construction), a
+    /// scoped hook still does not. Callers that must not silently skip a scoped
+    /// hook in that case use [`super::enforce::unresolved_namespace_deny`] to
+    /// fail closed instead.
+    #[must_use]
+    pub fn matches_any_namespace(&self, namespaces: &[String]) -> bool {
+        if namespaces.is_empty() {
+            return self.matches_namespace(None);
+        }
+        namespaces
+            .iter()
+            .any(|ns| self.matches_namespace(Some(ns.as_str())))
+    }
+
+    /// #2390 (N9) — `true` when this hook carries an operator-set namespace
+    /// SCOPE (a non-wildcard, non-empty `namespace` pattern).
+    ///
+    /// A scoped hook is one whose firing decision DEPENDS on the in-flight
+    /// namespace, so it cannot be evaluated truthfully when that namespace is
+    /// unresolvable. [`super::enforce::unresolved_namespace_deny`] uses this to
+    /// tell "the namespace does not matter here" (all hooks wildcard → proceed)
+    /// from "we would be silently skipping a control" (→ fail closed).
+    #[must_use]
+    pub fn is_namespace_scoped(&self) -> bool {
+        let pat = self.namespace.trim();
+        !(pat.is_empty() || pat == "*")
+    }
 }
 
 /// Wire-shape mirror of [`HookConfig`] used only for TOML
@@ -962,6 +1002,63 @@ namespace = "team/*"
         // the operator scoped it OUT, and there is no namespace to match.
         assert!(!mk("team/*").matches_namespace(None));
         assert!(!mk("team/eng").matches_namespace(None));
+    }
+
+    /// Build a `HookConfig` whose only interesting field is its namespace
+    /// pattern — shared by the #2390 scoping tests below.
+    fn mk_ns(pat: &str) -> HookConfig {
+        HookConfig {
+            event: HookEvent::PreStore,
+            command: std::path::PathBuf::from("/bin/true"),
+            priority: 0,
+            timeout_ms: 1_000,
+            mode: HookMode::Exec,
+            enabled: true,
+            namespace: pat.to_string(),
+            fail_mode: FailMode::Open,
+        }
+    }
+
+    /// #2390 (N9) — multi-namespace matching is fire-if-ANY, so an operation
+    /// spanning several namespaces (a link's two endpoints, a consolidation's N
+    /// sources, a bulk store's N bodies) fires every hook that covers ANY of
+    /// them. Anchoring on one member would let a caller choose which guard hook
+    /// runs by reordering the operands.
+    #[test]
+    fn matches_any_namespace_is_fire_if_any_2390() {
+        let ns = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+
+        // Covers the SECOND member only → still fires.
+        assert!(mk_ns("prod").matches_any_namespace(&ns(&["scratch", "prod"])));
+        // Covers the FIRST member only → still fires.
+        assert!(mk_ns("prod").matches_any_namespace(&ns(&["prod", "scratch"])));
+        // Covers neither → does not fire.
+        assert!(!mk_ns("prod").matches_any_namespace(&ns(&["scratch", "dev"])));
+        // Globs compose with the ANY rule.
+        assert!(mk_ns("team/*").matches_any_namespace(&ns(&["personal", "team/eng"])));
+
+        // An EMPTY set is exactly `matches_namespace(None)`: wildcard hooks
+        // still fire, scoped hooks still do not (never silently widened).
+        assert!(mk_ns("*").matches_any_namespace(&[]));
+        assert!(mk_ns("").matches_any_namespace(&[]));
+        assert!(!mk_ns("prod").matches_any_namespace(&[]));
+    }
+
+    /// #2390 (N9) — `is_namespace_scoped` distinguishes "the namespace does not
+    /// matter for this hook" (wildcard/empty) from "this hook's firing decision
+    /// DEPENDS on the namespace", which is what the unresolved-namespace
+    /// fail-closed guard keys on.
+    #[test]
+    fn is_namespace_scoped_only_for_non_wildcard_patterns_2390() {
+        for pat in ["*", "", "  ", " * "] {
+            assert!(
+                !mk_ns(pat).is_namespace_scoped(),
+                "{pat:?} is a wildcard, not a scope"
+            );
+        }
+        for pat in ["prod", "team/*", " team/eng "] {
+            assert!(mk_ns(pat).is_namespace_scoped(), "{pat:?} is a real scope");
+        }
     }
 
     #[test]

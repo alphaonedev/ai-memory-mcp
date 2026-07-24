@@ -55,11 +55,18 @@ use super::{AppState, JsonOrBadRequest};
 /// underlying consult drives the async hook chain via `block_on_local`, which
 /// uses `block_in_place` on the daemon's multi-thread runtime — safe to call
 /// from an async handler.
+/// #2390 (N9) — `namespaces` is the SUBSTRATE-resolved namespace set the
+/// operation will touch (see [`resolve_pre_event_namespaces`]). It is a required
+/// parameter rather than a payload key so the compiler enumerates every dispatch
+/// site — the 11-of-13 omission that made namespace-scoped hooks dead code is
+/// now a build error — and so a caller-supplied `"namespace"` in a forwarded
+/// request body can never decide which hook is in scope.
 pub(crate) fn http_pre_event_gate(
     event: crate::hooks::HookEvent,
+    namespaces: Vec<String>,
     payload: serde_json::Value,
 ) -> Option<axum::response::Response> {
-    match crate::mcp::consult_pre_event_gate(event, payload) {
+    match crate::mcp::consult_pre_event_gate(event, namespaces, payload) {
         Ok(()) => None,
         Err(reason) => Some(
             (
@@ -69,6 +76,68 @@ pub(crate) fn http_pre_event_gate(
                 .into_response(),
         ),
     }
+}
+
+/// #2390 (N9) — resolve the namespace(s) of `ids` on the HTTP surface for
+/// pre-event hook scoping.
+///
+/// Resolution MIRRORS THE BACKEND the write itself will take, because a
+/// resolution skew is a live defect in both directions: resolving nothing where
+/// the handler resolves something re-opens the #2390 bypass (or, under
+/// `enforce` with a scoped hook, 503s a legitimate write), and the postgres
+/// daemon must not be left resolving nothing while sqlite works — a sqlite-only
+/// `db::get` here would silently re-open the bypass on postgres with no
+/// non-`#[ignore]` test to catch it (the #1799 lesson).
+///
+/// * Sqlite backend (and every non-`sal` build) → [`crate::db::resolve_id`], the
+///   PREFIX-capable resolution the sqlite write handlers use, so a caller
+///   passing a legitimate id prefix resolves at the gate exactly as it will at
+///   the write.
+/// * Postgres backend → `app.store.get`, matching the postgres branches, which
+///   resolve by exact id through the same SAL call.
+///
+/// The DB read happens ONLY when the pre-event gate is installed
+/// (`[hooks].enforce_mode != off` AND a non-empty `required_events`), so the
+/// default deployment pays one `OnceLock` load and no query.
+///
+/// Returns de-duplicated namespaces; empty when nothing resolves, which
+/// `dispatch_pre_event_enforced` converts into a fail-closed refusal under
+/// `enforce` when a namespace-scoped hook is configured for the event.
+pub(crate) async fn resolve_pre_event_namespaces(
+    app: &AppState,
+    headers: &axum::http::HeaderMap,
+    ids: &[String],
+) -> Vec<String> {
+    if !crate::mcp::pre_event_gate_installed() || ids.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        let ctx = crate::handlers::parity::http_caller_ctx(headers, None);
+        for id in ids {
+            if let Ok(mem) = app.store.get(&ctx, id).await
+                && !out.contains(&mem.namespace)
+            {
+                out.push(mem.namespace);
+            }
+        }
+        return out;
+    }
+    let _ = headers;
+    // Sqlite: the prefix-capable resolution, matching the sqlite write handlers.
+    // The guard is released at the end of this function, before the handler
+    // takes its own lock for the write.
+    let guard = app.db.lock().await;
+    for id in ids {
+        if let Ok(Some(mem)) = crate::db::resolve_id(&guard.0, id)
+            && !out.contains(&mem.namespace)
+        {
+            out.push(mem.namespace);
+        }
+    }
+    drop(guard);
+    out
 }
 
 /// #2356 (W1A6-03) — consult the pre-event enforcement gate for
@@ -1219,8 +1288,13 @@ pub async fn create_memory(
     // `required_events = ["pre_store"]` with no enabled hook DENIES the HTTP
     // write (503) exactly as it does on the MCP path. INERT for default
     // (enforce-off) deployments.
+    // #2390 (N9) — `body.namespace` is already the resolved namespace (serde
+    // `default_namespace()` applies the #1590 ladder), so this site was the one
+    // pre-event dispatch that was namespace-truthful; passing it explicitly
+    // makes that structural instead of incidental.
     if let Some(resp) = http_pre_event_gate(
         crate::hooks::HookEvent::PreStore,
+        vec![body.namespace.clone()],
         json!({
             "agent_id": agent_id,
             "namespace": body.namespace,
