@@ -1433,3 +1433,45 @@ fn test_vectorlite_extension_env_falls_through_to_default_backend_2256() {
         }
     }
 }
+
+/// v1.0.0 #2383 (N1) — `AI_MEMORY_STRICT_DECRYPT_READS` precedence.
+///
+/// The read-posture knob is a DIRECT-READ env var (no clap flag, no
+/// `[section]` field), so its ladder is just `env > compiled default false`.
+/// It is consulted ONLY on the rare decrypt-failure branch, which is why it
+/// is deliberately NOT cached behind an atomic — a stale cache would make the
+/// posture untoggleable at runtime and would be a test-isolation hazard in a
+/// parallel test binary.
+mod strict_decrypt_reads_2383 {
+    use super::EnvVarGuard;
+    use ai_memory::storage::{ENV_STRICT_DECRYPT_READS, strict_decrypt_reads_enabled};
+
+    #[test]
+    fn env_truthy_set_enables_strict_reads_unset_is_the_split_posture() {
+        // Unset ⇒ compiled default: the split posture (scans degrade).
+        {
+            let _off = EnvVarGuard::remove(ENV_STRICT_DECRYPT_READS);
+            assert!(
+                !strict_decrypt_reads_enabled(),
+                "unset must resolve to the compiled default (split posture)"
+            );
+        }
+        // Every truthy spelling the sibling require-mode gates accept.
+        for truthy in ["1", "true", "TRUE", "yes", "on", " on "] {
+            let _on = EnvVarGuard::set(ENV_STRICT_DECRYPT_READS, truthy.to_string());
+            assert!(
+                strict_decrypt_reads_enabled(),
+                "{truthy:?} must enable the fail-closed read posture"
+            );
+        }
+        // Anything else falls through to the default (a typo must never
+        // silently change the posture in either direction).
+        for falsy in ["0", "false", "no", "off", "", "  ", "strict", "maybe"] {
+            let _off = EnvVarGuard::set(ENV_STRICT_DECRYPT_READS, falsy.to_string());
+            assert!(
+                !strict_decrypt_reads_enabled(),
+                "{falsy:?} must fall through to the split posture"
+            );
+        }
+    }
+}
