@@ -240,6 +240,28 @@ async fn put_json(router: &axum::Router, uri: &str, body: Value) -> (StatusCode,
     (status, v)
 }
 
+async fn put_json_as(
+    router: &axum::Router,
+    uri: &str,
+    body: Value,
+    caller_agent_id: &str,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("x-agent-id", caller_agent_id)
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, v)
+}
+
 // ---------------------------------------------------------------------------
 // /api/v1/memories — create / get / update / delete / promote on PG branch
 // ---------------------------------------------------------------------------
@@ -361,6 +383,88 @@ async fn pg_update_memory_unknown_returns_404() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// FBL-12 residual (#2378) — the postgres branch of `PUT /memories/{id}`
+/// must charge the storage-byte GROWTH of an in-place update against the
+/// row owner's per-namespace storage cap. Pre-#2378 the pg branch skipped
+/// the quota entirely, so an agent could grow each row uncharged. Drives
+/// the new `app.store.charge_update_growth` call on the pg branch (landing
+/// on the `SqliteStore` delegate in this fake-pg harness).
+#[tokio::test]
+async fn pg_update_growth_charges_quota_returns_429() {
+    let (router, f) = build_fake_pg_router();
+    let db_path = f.path().to_path_buf();
+    let body = json!({
+        "tier": "mid",
+        "namespace": "qns",
+        "title": "qtitle",
+        "content": "seed",
+        "tags": [],
+        "priority": 5,
+        "confidence": 1.0,
+        "source": "user",
+        "agent_id": "qv",
+        "metadata": {},
+    });
+    let (cs, cv) = post_json_as(&router, "/api/v1/memories", body, "qv").await;
+    assert!(
+        cs == StatusCode::CREATED || cs == StatusCode::OK,
+        "create: {cs} body={cv}"
+    );
+    let id = cv["id"].as_str().unwrap().to_string();
+
+    // Pin a TINY per-(agent, namespace) storage cap with ZERO headroom so
+    // any positive growth breaches it — targeted to THIS agent only, so no
+    // other test's compiled defaults are perturbed.
+    {
+        let conn = ai_memory::db::open(&db_path).expect("open for quota seed");
+        // ensure the (agent, namespace) row exists (default ceilings)…
+        let _ = ai_memory::quotas::get_status(&conn, "qv", "qns").expect("ensure quota row");
+        // …then pin max == current so delta > 0 always exceeds.
+        conn.execute(
+            "UPDATE agent_quotas \
+               SET max_storage_bytes = 10, current_storage_bytes = 10 \
+             WHERE agent_id = 'qv' AND namespace = 'qns'",
+            [],
+        )
+        .expect("pin tiny cap");
+    }
+
+    // Growth (~1 KiB) must be refused with 429 QUOTA_EXCEEDED.
+    let big = "x".repeat(1024);
+    let (gs, gv) = put_json_as(
+        &router,
+        &format!("/api/v1/memories/{id}"),
+        json!({ "content": big }),
+        "qv",
+    )
+    .await;
+    assert_eq!(
+        gs,
+        StatusCode::TOO_MANY_REQUESTS,
+        "growth past cap must 429: {gv}"
+    );
+    assert_eq!(
+        gv["code"].as_str(),
+        Some(ai_memory::errors::error_codes::QUOTA_EXCEEDED),
+        "429 envelope carries QUOTA_EXCEEDED code: {gv}"
+    );
+    assert_eq!(
+        gv["limit"].as_str(),
+        Some(ai_memory::quotas::QuotaLimit::StorageBytes.as_str()),
+        "limit names storage_bytes: {gv}"
+    );
+
+    // Control: a shrink / no-op update charges nothing (delta <= 0) → 200.
+    let (ss, sv) = put_json_as(
+        &router,
+        &format!("/api/v1/memories/{id}"),
+        json!({ "content": "s" }),
+        "qv",
+    )
+    .await;
+    assert_eq!(ss, StatusCode::OK, "shrink must pass uncharged: {sv}");
 }
 
 #[tokio::test]

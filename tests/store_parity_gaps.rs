@@ -925,6 +925,72 @@ async fn sqlite_trait_update_bumps_version_1024() {
     );
 }
 
+/// FBL-12 residual (#2378) — sqlite reference companion to
+/// `postgres_side::pg_charge_update_growth_over_cap_returns_quota_exceeded_2378`
+/// (which is `#[ignore]`-gated on a live PG host, so it never actuates in
+/// CI). This half runs unconditionally and pins the sqlite trait impl's
+/// three cheap arms so the two backends demonstrably agree on the
+/// no-charge cases:
+///
+/// - an EMPTY owner charges nothing and returns `Ok(0)` — an update on a
+///   row with no resolvable owner has nobody to bill, and inventing a
+///   charge against `""` would corrupt an unrelated counter;
+/// - a shrink / no-op (`new_bytes <= old_bytes`) charges nothing — a
+///   caller cannot bank storage credit by shrinking a row;
+/// - a positive growth charges exactly `new_bytes - old_bytes`.
+#[cfg(feature = "sal")]
+#[tokio::test]
+async fn sqlite_charge_update_growth_no_charge_arms_2378() {
+    use ai_memory::store::MemoryStore;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = ai_memory::store::sqlite::SqliteStore::open(tmp.path().join("grow-2378.db"))
+        .expect("open SqliteStore");
+    let ctx = ai_memory::store::CallerContext::for_admin("parity-test-2378");
+    let ns = "parity-test";
+
+    // Empty owner → Ok(0), and no quota row is conjured for `""`.
+    let anon = store
+        .charge_update_growth(&ctx, "", ns, 0, 4096)
+        .await
+        .expect("empty owner is a no-op, not an error");
+    assert_eq!(anon, 0, "an ownerless update must charge nobody");
+
+    // Shrink / no-op → Ok(0).
+    let shrink = store
+        .charge_update_growth(&ctx, "sqlite-grow-2378", ns, 500, 100)
+        .await
+        .expect("shrink is a no-op");
+    assert_eq!(shrink, 0, "shrink/no-op must charge zero");
+    let equal = store
+        .charge_update_growth(&ctx, "sqlite-grow-2378", ns, 250, 250)
+        .await
+        .expect("equal bytes is a no-op");
+    assert_eq!(equal, 0, "an unchanged byte count must charge zero");
+
+    // Positive growth charges exactly the delta, and the counter agrees.
+    let delta = store
+        .charge_update_growth(&ctx, "sqlite-grow-2378", ns, 100, 250)
+        .await
+        .expect("within-cap growth charges");
+    assert_eq!(delta, 150, "growth charges exactly new_bytes - old_bytes");
+    let rows = store
+        .quota_status_list_ns(ns)
+        .await
+        .expect("quota_status_list_ns");
+    let row = rows
+        .iter()
+        .find(|r| r.agent_id == "sqlite-grow-2378")
+        .expect("charged agent has a quota row");
+    assert_eq!(
+        row.current_storage_bytes, 150,
+        "only the positive delta landed on the counter"
+    );
+    assert!(
+        !rows.iter().any(|r| r.agent_id.is_empty()),
+        "the empty-owner no-op must not create a quota row"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Postgres-side gate — compiles under `sal-postgres`; skipped on
 // `cargo test` by `#[ignore]` so this development node (which cannot
@@ -1008,6 +1074,60 @@ mod postgres_side {
             msg.contains("VersionConflict"),
             "expected VersionConflict, got: {msg}"
         );
+    }
+
+    /// FBL-12 residual (#2378) — postgres `charge_update_growth`: a
+    /// content-growth charge that would breach `max_storage_bytes` is
+    /// refused with the typed `QuotaExceeded` (→ HTTP 429) via the single
+    /// TOCTOU-free conditional UPDATE, while a within-cap growth charges
+    /// the delta and a shrink / no-op charges nothing. This is the pg twin
+    /// of the sqlite `crate::quotas::charge_update_growth` contract that
+    /// the HTTP `PUT /memories/{id}` postgres branch now consults.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_charge_update_growth_over_cap_returns_quota_exceeded_2378() {
+        use ai_memory::store::{MemoryStore, StoreError};
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let ctx = ai_memory::store::CallerContext::for_agent("parity-test-2378");
+        let ns = "q2378";
+
+        // A shrink / no-op charges nothing.
+        let owner_noop = "pg-grow-noop-2378";
+        let z = MemoryStore::charge_update_growth(&pg, &ctx, owner_noop, ns, 500, 100)
+            .await
+            .expect("shrink is a no-op");
+        assert_eq!(z, 0, "shrink/no-op must charge zero");
+
+        // A within-cap growth charges the delta and returns it.
+        let owner_ok = "pg-grow-ok-2378";
+        let d = MemoryStore::charge_update_growth(&pg, &ctx, owner_ok, ns, 0, 128)
+            .await
+            .expect("within-cap growth charges");
+        assert_eq!(d, 128, "within-cap growth returns the charged delta");
+        // Compensating refund keeps the shared pg row from accumulating
+        // across repeated --ignored runs.
+        pg.refund_update_growth(owner_ok, ns, 128).await;
+
+        // A growth larger than the 100 MiB default cap is refused,
+        // regardless of any residual from prior runs (current + 200 MiB
+        // always exceeds a 100 MiB ceiling).
+        let owner_cap = "pg-grow-cap-2378";
+        let over = 200 * 1024 * 1024;
+        let err = MemoryStore::charge_update_growth(&pg, &ctx, owner_cap, ns, 0, over)
+            .await
+            .expect_err("growth past cap must be refused");
+        match err {
+            StoreError::QuotaExceeded { limit, .. } => {
+                assert_eq!(
+                    limit,
+                    ai_memory::quotas::QuotaLimit::StorageBytes.as_str(),
+                    "limit names storage_bytes"
+                );
+            }
+            other => panic!("expected QuotaExceeded, got: {other}"),
+        }
     }
 
     /// #1725 (P0.2) — postgres twin of
