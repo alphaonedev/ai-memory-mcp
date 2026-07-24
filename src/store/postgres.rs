@@ -4910,6 +4910,13 @@ impl PostgresStore {
             .get("agent_id")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        // v1.0.0 #2383 (N1) — the at-rest seal key must be the agent id the row
+        // RETAINS. The metadata SET clause below overlays the STORED row's
+        // provenance keys on top of a whole-object patch (existing-wins), so a
+        // patch that carries a different `agent_id` — or omits it entirely —
+        // must NOT change which per-agent key the ciphertext is sealed to.
+        // Captured here before the governance builder consumes `cur_meta`.
+        let retained_seal_agent_id = metadata_agent_id_slot(&cur_meta).map(str::to_string);
         let leaf_ns = cur_ns.clone();
 
         // Pre-check (cheap fast-path); the atomic re-check below is
@@ -4984,11 +4991,11 @@ impl PostgresStore {
         // (`governed.metadata` is exactly that merge). Both `content` and
         // `encrypted_envelope` are SET together so they never desync.
         let upd_effective_content: &str = patch.content.as_deref().unwrap_or(cur_content.as_str());
-        let upd_agent_id = governed
-            .metadata
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        // #2383 (N1) — retained identity (stored row wins), falling back to the
+        // patch only when the stored row carries no `agent_id` key at all.
+        let upd_agent_id = retained_seal_agent_id
+            .as_deref()
+            .unwrap_or_else(|| metadata_agent_id_slot(&governed.metadata).unwrap_or_default());
         let upd_sealed = crate::encryption::seal_content(upd_effective_content, upd_agent_id)
             .map_err(at_rest_seal_err)?;
         // When sealing, write the placeholder verbatim into `content`
@@ -5662,7 +5669,14 @@ impl PostgresStore {
         .await
         .map_err(|e| to_store_err("search_with_source_uri", e))?;
 
-        rows.iter().map(Self::row_to_memory).collect()
+        // #2383 (N1) — discovery scan: skip undecryptable rows, never deny the batch.
+        Ok(rows
+            .iter()
+            .map(Self::row_to_memory_scan)
+            .collect::<StoreResult<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
     /// v0.7.0 Provenance Gap 6 (issue #889) — list every memory
@@ -5700,7 +5714,14 @@ impl PostgresStore {
         .await
         .map_err(|e| to_store_err("list_by_source_uri", e))?;
 
-        rows.iter().map(Self::row_to_memory).collect()
+        // #2383 (N1) — discovery scan: skip undecryptable rows, never deny the batch.
+        Ok(rows
+            .iter()
+            .map(Self::row_to_memory_scan)
+            .collect::<StoreResult<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
     /// v0.7.0 Gap 3 (issue #886) — insert one or more
@@ -9694,7 +9715,39 @@ impl PostgresStore {
         })
     }
 
+    /// Map a `memories` row into a [`Memory`], FAIL-CLOSED on an undecryptable
+    /// at-rest envelope. Postgres twin of `crate::storage::row_to_memory`; use
+    /// it for TARGETED reads (`get` by id) and completeness-critical egress.
+    /// Discovery scans use [`Self::row_to_memory_scan`].
     fn row_to_memory(row: &sqlx::postgres::PgRow) -> StoreResult<Memory> {
+        match Self::row_to_memory_with_policy(
+            row,
+            crate::storage::DecryptFailurePolicy::FailClosed,
+        )? {
+            Some(memory) => Ok(memory),
+            // Unreachable by construction: `FailClosed` converts an
+            // undecryptable envelope into `Err` inside the mapper.
+            None => Err(StoreError::IntegrityFailed {
+                detail: "row_to_memory: fail-closed policy yielded no row".to_string(),
+            }),
+        }
+    }
+
+    /// v1.0.0 #2383 (N1) — scan-flavoured row mapper: `Ok(None)` means "this
+    /// row could not be decrypted and was SKIPPED" (WARN + metric already
+    /// emitted). `Err` still signals a REAL read failure, so a schema problem
+    /// is never mistaken for a skippable poison row. Postgres twin of
+    /// `crate::storage::row_to_memory_scan` — see
+    /// `crate::storage::DecryptFailurePolicy` for why targeted reads stay
+    /// fail-closed while bulk scans degrade.
+    fn row_to_memory_scan(row: &sqlx::postgres::PgRow) -> StoreResult<Option<Memory>> {
+        Self::row_to_memory_with_policy(row, crate::storage::DecryptFailurePolicy::SkipRow)
+    }
+
+    fn row_to_memory_with_policy(
+        row: &sqlx::postgres::PgRow,
+        policy: crate::storage::DecryptFailurePolicy,
+    ) -> StoreResult<Option<Memory>> {
         let created_at: DateTime<Utc> = row
             .try_get(field_names::CREATED_AT)
             .map_err(|e| to_store_err(READ_CREATED_AT, e))?;
@@ -9895,10 +9948,30 @@ impl PostgresStore {
             match crate::encryption::open_content(&bytes, agent_id) {
                 Ok(plaintext) => memory.content = plaintext,
                 Err(e) => {
-                    // FAIL-CLOSED: a row with a non-NULL envelope MUST
-                    // decrypt or the read errors. Never surface the empty
-                    // placeholder as if it were the plaintext content
-                    // (would mask key loss / corruption).
+                    // NEVER surface the empty placeholder as if it were the
+                    // plaintext content (that would mask key loss /
+                    // corruption). The only two legal dispositions are "error"
+                    // and "omit"; `crate::storage::DecryptFailurePolicy`
+                    // documents which read takes which.
+                    //
+                    // v1.0.0 #2383 (N1) — SkipRow keeps ONE poisoned row from
+                    // denying an entire namespace's list/search/recall. The row
+                    // is NOT modified or deleted; it becomes readable again the
+                    // moment the correct keypair is restored.
+                    if policy == crate::storage::DecryptFailurePolicy::SkipRow
+                        && !crate::storage::strict_decrypt_reads_enabled()
+                    {
+                        tracing::warn!(
+                            target: crate::storage::UNDECRYPTABLE_ROW_TRACE_TARGET,
+                            row_id = %memory.id,
+                            namespace = %memory.namespace,
+                            agent_id = %agent_id,
+                            error = %e,
+                            "{}", crate::storage::UNDECRYPTABLE_ROW_SKIPPED_MSG
+                        );
+                        crate::metrics::record_corrupt_provenance(field_names::ENCRYPTED_ENVELOPE);
+                        return Ok(None);
+                    }
                     return Err(StoreError::IntegrityFailed {
                         detail: format!("decrypt failed for memory {}: {e}", memory.id),
                     });
@@ -9906,7 +9979,7 @@ impl PostgresStore {
             }
         }
 
-        Ok(memory)
+        Ok(Some(memory))
     }
 
     /// v0.7.0 recursive-learning Task 4/8 (issue #655) — Postgres parity
@@ -10270,8 +10343,15 @@ impl PostgresStore {
         // Content arm is unconditional → envelope moves with it. The seal
         // helper returns `StoreError`; map it into this funnel's `ReflectError`
         // (a seal failure is a backend-side integrity fault).
-        let (reflect_content, reflect_envelope) = seal_content_for_insert(&candidate)
+        // v1.0.0 #2383 (N1) — sealed to the identity the SURVIVING row RETAINS,
+        // not the incoming writer: the `ON CONFLICT` arm keeps the existing row's
+        // `agent_id` (#1784) while taking the incoming envelope, so an
+        // incoming-keyed seal left the durable row unreadable. Same tx as the
+        // upsert, so the pre-read + write are one atomic unit.
+        let reflect_seal = seal_content_for_upsert(&mut *tx, &candidate)
+            .await
             .map_err(|e| ReflectError::Database(e.to_string()))?;
+        let (reflect_content, reflect_envelope) = (reflect_seal.content(), reflect_seal.envelope());
 
         // Insert the reflection memory inside the tx.
         let actual_id: String = sqlx::query(
@@ -10340,6 +10420,14 @@ impl PostgresStore {
         .map_err(|e| ReflectError::Database(format!("insert reflection memory: {e}")))?
         .try_get::<String, _>("id")
         .map_err(|e| ReflectError::Database(format!("read returned id: {e}")))?;
+
+        // #2383 (N1) — invariant backstop, same tx: a non-NULL
+        // `encrypted_envelope` MUST open under the row's persisted
+        // `metadata.agent_id`. Repairs the concurrent-first-creation race the
+        // pre-read cannot close under READ COMMITTED.
+        reconcile_envelope_owner(&mut *tx, &actual_id, &candidate.content, &reflect_seal)
+            .await
+            .map_err(|e| ReflectError::Database(e.to_string()))?;
 
         // Write each `reflects_on` link inside the same tx.
         for src_id in &input.source_ids {
@@ -11941,6 +12029,300 @@ fn seal_content_for_insert(memory: &Memory) -> StoreResult<(String, Option<Vec<u
         None => (memory.content.clone(), None),
     })
 }
+
+/// v1.0.0 #2383 (N1) — the outcome of sealing content for a postgres write
+/// whose SQL carries an `ON CONFLICT (title, namespace) DO UPDATE` arm.
+/// Postgres twin of `crate::storage::UpsertSeal`; the two backends implement
+/// the identical seal-to-the-RETAINED-identity contract.
+pub(crate) struct UpsertSeal {
+    /// Bind into the `content` column (plaintext verbatim, or the empty
+    /// placeholder when an envelope was produced).
+    content_to_store: String,
+    /// Bind into `encrypted_envelope` (`None` = at-rest encryption off).
+    envelope: Option<Vec<u8>>,
+    /// The agent id `envelope` is sealed to.
+    sealed_under: String,
+}
+
+impl UpsertSeal {
+    /// Seal `memory`'s content to `sealed_under` (the RETAINED identity).
+    ///
+    /// # Errors
+    /// [`StoreError::IntegrityFailed`] when the seal fails — in particular an
+    /// enabled gate over a row that retains NO agent id has no recipient key,
+    /// and refusing is strictly better than a silent plaintext store.
+    fn seal(memory: &Memory, sealed_under: String) -> StoreResult<Self> {
+        let sealed = crate::encryption::seal_content(&memory.content, &sealed_under)
+            .map_err(at_rest_seal_err)?;
+        Ok(match sealed {
+            Some((envelope, placeholder)) => Self {
+                content_to_store: placeholder,
+                envelope: Some(envelope),
+                sealed_under,
+            },
+            None => Self {
+                content_to_store: memory.content.clone(),
+                envelope: None,
+                sealed_under,
+            },
+        })
+    }
+
+    fn content(&self) -> &str {
+        &self.content_to_store
+    }
+
+    fn envelope(&self) -> Option<&Vec<u8>> {
+        self.envelope.as_ref()
+    }
+}
+
+/// Resolve a `metadata` object's `agent_id` the way the postgres `EXCLUDED.metadata ||
+/// <existing provenance>` overlay and `row_to_memory` resolve it: `None` = the key is
+/// ABSENT (the overlay leaves the base value); `Some(s)` = PRESENT, and the surviving
+/// row reads it as `s` (`""` for a present-but-non-string value).
+fn metadata_agent_id_slot(metadata: &serde_json::Value) -> Option<&str> {
+    metadata
+        .get("agent_id")
+        .map(|v| v.as_str().unwrap_or_default())
+}
+
+/// v1.0.0 #2383 (N1) — the `agent_id` a `(title, namespace)` upsert's SURVIVING
+/// postgres row will retain.
+///
+/// Every `ON CONFLICT (title, namespace) DO UPDATE` arm in this adapter keeps the
+/// EXISTING row's provenance keys (#1784 authorship immutability: `EXCLUDED.metadata
+/// || (SELECT jsonb_object_agg(...) WHERE k IN ('agent_id', …))`, right-side-wins)
+/// while `content` + `encrypted_envelope` move to the incoming writer's values.
+/// Sealing to the INCOMING agent therefore produced a durable row keyed to one agent
+/// and attributed to another — unreadable on every subsequent read.
+///
+/// Costs ONE indexed lookup on `memories_title_ns_uidx`, and ONLY when at-rest
+/// encryption is enabled: the default path never touches the executor, so an
+/// encryption-off deployment is byte-identical to pre-#2383.
+async fn retained_agent_id_for_upsert(
+    conn: &mut sqlx::PgConnection,
+    memory: &Memory,
+) -> StoreResult<String> {
+    let incoming = metadata_agent_id_slot(&memory.metadata).unwrap_or_default();
+    if !crate::encryption::encryption_enabled(None) {
+        return Ok(incoming.to_string());
+    }
+    // `->>` yields SQL NULL for BOTH an absent key and a JSON null, but the two
+    // resolve DIFFERENTLY: the `||` overlay only carries keys the existing row
+    // actually HAS, so an ABSENT key leaves EXCLUDED's (incoming) agent_id in
+    // place, while a PRESENT json-null overwrites it and the reader resolves it
+    // to the empty id. `jsonb_exists` disambiguates (the function form, not the
+    // `?` operator, so no driver placeholder ambiguity). Mirrors the sqlite
+    // `metadata_agent_id_slot` Option semantics exactly.
+    let existing: Option<(bool, Option<String>)> = sqlx::query_as(
+        "SELECT jsonb_exists(metadata, 'agent_id'), metadata->>'agent_id' \
+         FROM memories WHERE title = $1 AND namespace = $2",
+    )
+    .bind(&memory.title)
+    .bind(&memory.namespace)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| to_store_err("resolve retained agent_id for upsert", e))?;
+    Ok(match existing {
+        // No conflict target — the incoming row IS the surviving row.
+        None => incoming.to_string(),
+        // Key ABSENT on the existing row ⇒ the overlay keeps the incoming id.
+        Some((false, _)) => incoming.to_string(),
+        // Key PRESENT ⇒ that is what the surviving row will carry (a json-null
+        // or non-string value reads back as the empty id).
+        Some((true, retained)) => retained.unwrap_or_default(),
+    })
+}
+
+/// v1.0.0 #2383 (N1) — seal content for a postgres write that may land on the
+/// `(title, namespace)` conflict arm, keyed to the identity the surviving row
+/// will RETAIN rather than the incoming writer's. Postgres twin of
+/// `crate::storage::seal_content_for_upsert`.
+///
+/// # Errors
+/// [`StoreError::IntegrityFailed`] when the seal fails (an enabled gate over a
+/// row that will retain NO agent id has no recipient key — fail-closed, never a
+/// silent plaintext store).
+async fn seal_content_for_upsert(
+    conn: &mut sqlx::PgConnection,
+    memory: &Memory,
+) -> StoreResult<UpsertSeal> {
+    let sealed_under = retained_agent_id_for_upsert(conn, memory).await?;
+    UpsertSeal::seal(memory, sealed_under)
+}
+
+/// v1.0.0 #2383 (N1) — BATCHED twin of [`seal_content_for_upsert`] for the
+/// multi-row `store_batch` upsert.
+///
+/// Resolves every row's RETAINED identity in ONE round trip (an `UNNEST` join
+/// over the batch's `(title, namespace)` pairs) instead of one lookup per row,
+/// so an encryption-on bulk ingest does not pay N extra statements. Returns one
+/// [`UpsertSeal`] per input memory, in input order.
+///
+/// # Errors
+/// Backend errors from the lookup, or [`StoreError::IntegrityFailed`] from a
+/// failed seal (see [`UpsertSeal::seal`]).
+async fn seal_content_for_upsert_batch(
+    conn: &mut sqlx::PgConnection,
+    memories: &[Memory],
+) -> StoreResult<Vec<UpsertSeal>> {
+    if !crate::encryption::encryption_enabled(None) {
+        // Encryption off: no lookup, no envelope — byte-identical to pre-#2383.
+        return memories
+            .iter()
+            .map(|memory| {
+                UpsertSeal::seal(
+                    memory,
+                    metadata_agent_id_slot(&memory.metadata)
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect();
+    }
+    let titles: Vec<String> = memories.iter().map(|m| m.title.clone()).collect();
+    let namespaces: Vec<String> = memories.iter().map(|m| m.namespace.clone()).collect();
+    // `jsonb_exists` disambiguates an ABSENT `agent_id` key (the overlay keeps
+    // the incoming id) from a PRESENT json-null (the reader resolves it to the
+    // empty id) — see `retained_agent_id_for_upsert`. Rows whose key is absent
+    // are simply omitted from the map so the per-row fallback below applies.
+    let existing: Vec<(String, String, bool, Option<String>)> = sqlx::query_as(
+        "SELECT title, namespace, jsonb_exists(metadata, 'agent_id'), metadata->>'agent_id' \
+         FROM memories \
+         WHERE (title, namespace) IN (SELECT * FROM UNNEST($1::text[], $2::text[]))",
+    )
+    .bind(&titles)
+    .bind(&namespaces)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| to_store_err("resolve retained agent_ids for batch upsert", e))?;
+    let retained_by_key: std::collections::HashMap<(String, String), String> = existing
+        .into_iter()
+        .filter(|(_, _, has_key, _)| *has_key)
+        .map(|(title, namespace, _, agent)| ((title, namespace), agent.unwrap_or_default()))
+        .collect();
+    memories
+        .iter()
+        .map(|memory| {
+            let key = (memory.title.clone(), memory.namespace.clone());
+            let sealed_under = retained_by_key.get(&key).cloned().unwrap_or_else(|| {
+                metadata_agent_id_slot(&memory.metadata)
+                    .unwrap_or_default()
+                    .to_string()
+            });
+            UpsertSeal::seal(memory, sealed_under)
+        })
+        .collect()
+}
+
+/// v1.0.0 #2383 (N1) — post-write backstop enforcing the invariant "a non-NULL
+/// `encrypted_envelope` MUST open under the row's persisted `metadata.agent_id`",
+/// even when the pre-read in [`retained_agent_id_for_upsert`] raced a concurrent
+/// first-creation (postgres READ COMMITTED admits exactly that window).
+///
+/// The lookup is keyed on `encrypted_envelope = <our bytes>` so it fires ONLY for
+/// the row that actually carries the envelope this call sealed; a newer-wins merge
+/// whose inbound row LOST keeps the local envelope (already consistent) and matches
+/// nothing. Envelopes carry a fresh random DEK + nonce per seal, so the byte match
+/// is an exact identity test.
+///
+/// No-op when at-rest encryption is off. MUST be awaited on the SAME transaction as
+/// the upsert so no reader observes the intermediate state.
+async fn reconcile_envelope_owner(
+    conn: &mut sqlx::PgConnection,
+    id: &str,
+    plaintext: &str,
+    seal: &UpsertSeal,
+) -> StoreResult<()> {
+    let Some(our_envelope) = seal.envelope() else {
+        return Ok(());
+    };
+    let retained: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT metadata->>'agent_id' FROM memories WHERE id = $1 AND encrypted_envelope = $2",
+    )
+    .bind(id)
+    .bind(our_envelope)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| to_store_err("reconcile envelope owner", e))?;
+    let Some(retained) = retained else {
+        // Our envelope is not the one that survived — nothing to reconcile.
+        return Ok(());
+    };
+    reconcile_envelope_owner_known(conn, id, plaintext, seal, &retained.unwrap_or_default()).await
+}
+
+/// v1.0.0 #2383 (N1) — core of [`reconcile_envelope_owner`] for callers that
+/// ALREADY know the surviving row's retained `agent_id` (the multi-row
+/// `store_batch` learns it from its `RETURNING` clause, so it needs no extra
+/// lookup). No-op when the retained identity matches what we sealed to.
+async fn reconcile_envelope_owner_known(
+    conn: &mut sqlx::PgConnection,
+    id: &str,
+    plaintext: &str,
+    seal: &UpsertSeal,
+    retained: &str,
+) -> StoreResult<()> {
+    let Some(our_envelope) = seal.envelope() else {
+        return Ok(());
+    };
+    if retained == seal.sealed_under {
+        return Ok(());
+    }
+    tracing::warn!(
+        target: ENVELOPE_OWNER_RECONCILE_TARGET,
+        memory_id = %id,
+        sealed_under = %seal.sealed_under,
+        retained_agent_id = %retained,
+        "{ENVELOPE_OWNER_RECONCILED_MSG}"
+    );
+    // Re-seal the SAME plaintext under the retained identity. `seal_content`
+    // fails closed on an empty retained id, rolling the enclosing transaction
+    // back rather than leaving an unreadable row on disk.
+    let repaired =
+        crate::encryption::seal_content(plaintext, retained).map_err(at_rest_seal_err)?;
+    let Some((repaired_envelope, placeholder)) = repaired else {
+        return Err(StoreError::IntegrityFailed {
+            detail: format!(
+                "at-rest encryption was disabled mid-write; refusing to reconcile the envelope of memory {id}"
+            ),
+        });
+    };
+    // APPEND-ONLY-SANCTIONED (#1823 G6) — CIPHERTEXT RE-KEY, not a content
+    // revision (postgres twin of the sqlite `reconcile_envelope_owner`
+    // sanction). This rewrites the ENCODING of content this very transaction
+    // just committed: the same plaintext, re-sealed to the identity the
+    // surviving row retained. The durable memory TEXT is bit-identical before
+    // and after (`content` goes placeholder -> the same placeholder; only the
+    // AEAD envelope's recipient key changes), so there is no new version to
+    // record — and the enclosing write funnel has ALREADY appended the
+    // revision leaf for the write being repaired. Emitting a second leaf here
+    // would assert a content change that did not happen. The
+    // `encrypted_envelope = $2` guard scopes the UPDATE to the exact row still
+    // carrying the envelope we wrote.
+    sqlx::query(
+        "UPDATE memories SET content = $3, encrypted_envelope = $4 \
+         WHERE id = $1 AND encrypted_envelope = $2",
+    )
+    .bind(id)
+    .bind(our_envelope)
+    .bind(placeholder)
+    .bind(repaired_envelope)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| to_store_err("reconcile envelope owner update", e))?;
+    Ok(())
+}
+
+/// Structured `tracing` target for the #2383 post-write envelope re-key.
+const ENVELOPE_OWNER_RECONCILE_TARGET: &str = "encryption.envelope_owner_reconciled";
+
+/// WARN emitted when the #2383 backstop had to re-key a freshly written envelope
+/// to the identity the surviving row retained.
+const ENVELOPE_OWNER_RECONCILED_MSG: &str = "upsert-merge landed on a row that retains a DIFFERENT agent_id than the \
+     content was sealed to (concurrent first-creation race); re-sealing the \
+     merged content to the retained identity so the row stays readable";
 
 #[allow(clippy::needless_pass_by_value)]
 fn to_store_err(what: &str, e: sqlx::Error) -> StoreError {
@@ -14110,18 +14492,16 @@ impl MemoryStore for PostgresStore {
         // byte-identical to the pre-wiring path. agent_id is the NHI
         // provenance marker from metadata (fail-closed under an enabled
         // gate when absent). Content-only: title/tags/metadata stay plain.
-        let store_agent_id = memory
-            .metadata
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let store_sealed = crate::encryption::seal_content(&memory.content, store_agent_id)
-            .map_err(at_rest_seal_err)?;
-        let store_content_to_store = store_sealed
-            .as_ref()
-            .map_or(memory.content.as_str(), |(_, ph)| ph.as_str());
-        let store_encrypted_envelope: Option<&[u8]> =
-            store_sealed.as_ref().map(|(env, _)| env.as_slice());
+        //
+        // v1.0.0 #2383 (N1) — sealed to the identity the SURVIVING row
+        // RETAINS, not to the incoming writer: the `ON CONFLICT` arm below
+        // keeps the existing row's `agent_id` (#1784) while taking the
+        // incoming envelope, so an incoming-keyed seal left the durable row
+        // unreadable. See `seal_content_for_upsert`. Runs on the same tx as
+        // the upsert so the pre-read and the write are one atomic unit.
+        let store_seal = seal_content_for_upsert(&mut *tx, memory).await?;
+        let store_content_to_store = store_seal.content();
+        let store_encrypted_envelope: Option<&Vec<u8>> = store_seal.envelope();
         // v0.9.0 G8 (#1825) — stamp the content-id from the PLAINTEXT
         // genesis identity (never the ciphertext placeholder). OMITTED from
         // the DO UPDATE SET below so a surviving upsert-merge row keeps its
@@ -14283,6 +14663,12 @@ impl MemoryStore for PostgresStore {
         .try_get::<String, _>("id")
         .map_err(|e| to_store_err(READ_RETURNED_ID, e))?;
 
+        // #2383 (N1) — invariant backstop: a non-NULL `encrypted_envelope`
+        // MUST open under the row's persisted `metadata.agent_id`. Same tx,
+        // so a concurrent first-creation race is repaired before any reader
+        // can observe it.
+        reconcile_envelope_owner(&mut *tx, &id, &memory.content, &store_seal).await?;
+
         // v0.7.0.1 G1 / v0.7.0 #1156 — record quota usage in the same
         // tx against the per-namespace accounting row (v50 PK
         // extension). Best-effort resolution of agent_id; a missing
@@ -14419,6 +14805,12 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("begin store_batch tx", e))?;
 
+        // v1.0.0 #2383 (N1) — resolve every row's RETAINED seal identity in ONE
+        // round trip BEFORE the synchronous `push_values` closure (which cannot
+        // await). Under encryption-off this touches neither the executor nor the
+        // ciphertext, so the bulk path stays byte-identical to pre-#2383.
+        let batch_seals = seal_content_for_upsert_batch(&mut *tx, memories).await?;
+
         let mut builder: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
@@ -14517,22 +14909,12 @@ impl MemoryStore for PostgresStore {
             // / metadata stay plain. Pre-#2288 the bulk funnel NEVER sealed, so
             // an encryption-on `POST /api/v1/memories/bulk` persisted PLAINTEXT
             // while `store()` sealed — a silent at-rest-encryption bypass.
-            let batch_agent_id = memory
-                .metadata
-                .get("agent_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let sealed = match crate::encryption::seal_content(&memory.content, batch_agent_id) {
-                Ok(v) => v,
-                Err(e) => {
-                    push_err.get_or_insert(at_rest_seal_err(e));
-                    return;
-                }
-            };
-            let content_to_store: String = sealed
-                .as_ref()
-                .map_or_else(|| memory.content.clone(), |(_, ph)| ph.clone());
-            let encrypted_envelope: Option<Vec<u8>> = sealed.map(|(env, _)| env);
+            // #2383 (N1) — the seal was resolved above against the identity the
+            // SURVIVING row RETAINS (the `ON CONFLICT` arm keeps the existing
+            // row's `agent_id` per #1784 while taking the incoming envelope).
+            let seal = &batch_seals[idx];
+            let content_to_store: String = seal.content().to_string();
+            let encrypted_envelope: Option<Vec<u8>> = seal.envelope().cloned();
 
             row.push_bind(memory.id.clone())
                 .push_bind(memory.tier.as_str().to_string())
@@ -14664,7 +15046,11 @@ impl MemoryStore for PostgresStore {
                 -- epistemic-typing provenance follows the incoming write when
                 -- present, else keeps the stored marker (COALESCE).
                 kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
-            RETURNING id, title, namespace",
+            -- v1.0.0 #2383 (N1) — the POST-update `metadata.agent_id` (after
+            -- the existing-wins provenance overlay above) rides back on the
+            -- SAME statement, so the envelope-owner reconcile below costs
+            -- zero extra round trips and is race-free by construction.
+            RETURNING id, title, namespace, metadata->>'agent_id' AS retained_agent_id",
         );
 
         let rows = builder
@@ -14678,6 +15064,9 @@ impl MemoryStore for PostgresStore {
         // resolve to its persisted id in 1:1 input order.
         let mut id_by_key: std::collections::HashMap<(String, String), String> =
             std::collections::HashMap::with_capacity(rows.len());
+        // #2383 (N1) — same key, the agent_id the surviving row RETAINED.
+        let mut retained_by_key: std::collections::HashMap<(String, String), String> =
+            std::collections::HashMap::with_capacity(rows.len());
         for row in &rows {
             let id: String = row
                 .try_get("id")
@@ -14688,7 +15077,34 @@ impl MemoryStore for PostgresStore {
             let namespace: String = row
                 .try_get("namespace")
                 .map_err(|e| to_store_err("store_batch read returned namespace", e))?;
-            id_by_key.insert((title, namespace), id);
+            let retained: Option<String> = row
+                .try_get("retained_agent_id")
+                .map_err(|e| to_store_err("store_batch read retained agent_id", e))?;
+            id_by_key.insert((title.clone(), namespace.clone()), id);
+            retained_by_key.insert((title, namespace), retained.unwrap_or_default());
+        }
+
+        // #2383 (N1) — invariant backstop, same tx: repair any row whose
+        // surviving `metadata.agent_id` differs from the identity its envelope
+        // was sealed to (a concurrent first-creation that landed between the
+        // batched pre-read and this INSERT). The batch's `ON CONFLICT` arm sets
+        // `encrypted_envelope = EXCLUDED.encrypted_envelope` unconditionally, so
+        // OUR envelope is always the one on the row — no landed-check needed.
+        for idx in keep.iter().copied() {
+            let memory = &memories[idx];
+            let key = (memory.title.clone(), memory.namespace.clone());
+            let (Some(id), Some(retained)) = (id_by_key.get(&key), retained_by_key.get(&key))
+            else {
+                continue;
+            };
+            reconcile_envelope_owner_known(
+                &mut *tx,
+                id,
+                &memory.content,
+                &batch_seals[idx],
+                retained,
+            )
+            .await?;
         }
 
         // Quota: one upsert per distinct (quota_agent_id, namespace),
@@ -14868,7 +15284,13 @@ impl MemoryStore for PostgresStore {
         // `encrypted_envelope`, leaking verbatim conversation turns under an
         // enabled gate. Content arm is unconditional, so the envelope moves
         // with it unconditionally on the ON CONFLICT arm.
-        let (capture_content, capture_envelope) = seal_content_for_insert(memory)?;
+        // v1.0.0 #2383 (N1) — sealed to the identity the SURVIVING row RETAINS,
+        // not the incoming writer: the `ON CONFLICT` arm keeps the existing row's
+        // `agent_id` (#1784) while taking the incoming envelope, so an
+        // incoming-keyed seal left the durable row unreadable. Same tx as the
+        // upsert, so the pre-read + write are one atomic unit.
+        let capture_seal = seal_content_for_upsert(&mut *tx, memory).await?;
+        let (capture_content, capture_envelope) = (capture_seal.content(), capture_seal.envelope());
 
         let inserted_id: String = sqlx::query(
             "INSERT INTO memories (
@@ -14968,6 +15390,12 @@ impl MemoryStore for PostgresStore {
         .map_err(|e| to_store_err("capture_turn insert memory", e))?
         .try_get::<String, _>("id")
         .map_err(|e| to_store_err("capture_turn read returned id", e))?;
+
+        // #2383 (N1) — invariant backstop, same tx: a non-NULL
+        // `encrypted_envelope` MUST open under the row's persisted
+        // `metadata.agent_id`. Repairs the concurrent-first-creation race the
+        // pre-read cannot close under READ COMMITTED.
+        reconcile_envelope_owner(&mut *tx, &inserted_id, &memory.content, &capture_seal).await?;
 
         // `transcript_line_dedup` row. `ON CONFLICT (sha256) DO NOTHING`
         // guards the rare concurrent-duplicate race that READ COMMITTED
@@ -15138,7 +15566,13 @@ impl MemoryStore for PostgresStore {
         // Pre-#2292 this inline INSERT bound `memory.content` PLAINTEXT and
         // omitted `encrypted_envelope`, leaking recovered turns under an
         // enabled gate. Content arm is unconditional → envelope moves with it.
-        let (recover_content, recover_envelope) = seal_content_for_insert(memory)?;
+        // v1.0.0 #2383 (N1) — sealed to the identity the SURVIVING row RETAINS,
+        // not the incoming writer: the `ON CONFLICT` arm keeps the existing row's
+        // `agent_id` (#1784) while taking the incoming envelope, so an
+        // incoming-keyed seal left the durable row unreadable. Same tx as the
+        // upsert, so the pre-read + write are one atomic unit.
+        let recover_seal = seal_content_for_upsert(&mut *tx, memory).await?;
+        let (recover_content, recover_envelope) = (recover_seal.content(), recover_seal.envelope());
 
         let inserted_id: String = sqlx::query(
             "INSERT INTO memories (
@@ -15256,6 +15690,12 @@ impl MemoryStore for PostgresStore {
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("recover_turn insert dedup row", e))?;
+
+        // #2383 (N1) — invariant backstop, same tx: a non-NULL
+        // `encrypted_envelope` MUST open under the row's persisted
+        // `metadata.agent_id`. Repairs the concurrent-first-creation race the
+        // pre-read cannot close under READ COMMITTED.
+        reconcile_envelope_owner(&mut *tx, &inserted_id, &memory.content, &recover_seal).await?;
 
         tx.commit()
             .await
@@ -15402,7 +15842,13 @@ impl MemoryStore for PostgresStore {
         // busiest write path while `store()` sealed. Content arm is
         // unconditional (`content = EXCLUDED.content`), so the envelope moves
         // with it unconditionally on the ON CONFLICT arm below.
-        let (embed_content, embed_envelope) = seal_content_for_insert(memory)?;
+        // v1.0.0 #2383 (N1) — sealed to the identity the SURVIVING row RETAINS,
+        // not the incoming writer: the `ON CONFLICT` arm keeps the existing row's
+        // `agent_id` (#1784) while taking the incoming envelope, so an
+        // incoming-keyed seal left the durable row unreadable. Same tx as the
+        // upsert, so the pre-read + write are one atomic unit.
+        let embed_seal = seal_content_for_upsert(&mut *tx, memory).await?;
+        let (embed_content, embed_envelope) = (embed_seal.content(), embed_seal.envelope());
 
         let id: String = sqlx::query(
             "INSERT INTO memories (
@@ -15550,6 +15996,12 @@ impl MemoryStore for PostgresStore {
         .map_err(|e| to_store_err("insert memory_with_embedding", e))?
         .try_get::<String, _>("id")
         .map_err(|e| to_store_err(READ_RETURNED_ID, e))?;
+
+        // #2383 (N1) — invariant backstop, same tx: a non-NULL
+        // `encrypted_envelope` MUST open under the row's persisted
+        // `metadata.agent_id`. Repairs the concurrent-first-creation race the
+        // pre-read cannot close under READ COMMITTED.
+        reconcile_envelope_owner(&mut *tx, &id, &memory.content, &embed_seal).await?;
 
         // v0.7.0 #1156 — per-namespace quota dimension (v50 PK).
         let quota_agent_id = resolve_quota_agent_id(ctx, &memory.metadata);
@@ -15890,6 +16342,11 @@ impl MemoryStore for PostgresStore {
             patch.metadata.as_ref(),
             &cur_ns,
         )?;
+        // v1.0.0 #2383 (N1) — retained at-rest seal identity (see the If-Match
+        // twin `update_with_expected_version_once`): the SQL metadata overlay
+        // keeps the STORED row's agent_id, so the seal must too. Captured
+        // before the governance builder consumes `cur_meta`.
+        let retained_seal_agent_id = metadata_agent_id_slot(&cur_meta).map(str::to_string);
 
         // `content_changed` is true when the patch supplies a title OR
         // content that differs from the stored row. A metadata / tag /
@@ -16024,11 +16481,11 @@ impl MemoryStore for PostgresStore {
         // `governed.metadata` (the patch-or-stored merge the SQL persists;
         // agent_id is immutable, guarded above).
         let upd_effective_content: &str = patch.content.as_deref().unwrap_or(cur_content.as_str());
-        let upd_agent_id = governed
-            .metadata
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        // #2383 (N1) — retained identity (stored row wins), falling back to the
+        // patch only when the stored row carries no `agent_id` key at all.
+        let upd_agent_id = retained_seal_agent_id
+            .as_deref()
+            .unwrap_or_else(|| metadata_agent_id_slot(&governed.metadata).unwrap_or_default());
         let upd_sealed = crate::encryption::seal_content(upd_effective_content, upd_agent_id)
             .map_err(at_rest_seal_err)?;
         // When sealing, write the placeholder into `content` (Some); when not
@@ -16377,10 +16834,14 @@ impl MemoryStore for PostgresStore {
         // hypothetical SQL drift between the WHERE clause above and
         // the canonical Rust predicate cannot widen the visibility
         // window. Costs O(returned-rows); negligible.
+        // #2383 (N1) — discovery scan: skip undecryptable rows, never deny the batch.
         let mems: Vec<Memory> = rows
             .iter()
-            .map(Self::row_to_memory)
-            .collect::<StoreResult<Vec<_>>>()?;
+            .map(Self::row_to_memory_scan)
+            .collect::<StoreResult<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
         if ctx.bypass_visibility {
             return Ok(mems);
         }
@@ -16448,11 +16909,13 @@ impl MemoryStore for PostgresStore {
         // Belt-and-suspenders: re-apply the prefix predicate in-process
         // so the result is correct even if the byte-range bounds ever
         // drift from the requested prefix.
+        // #2383 (N1) — discovery scan: skip undecryptable rows, never deny the batch.
         rows.iter()
-            .map(Self::row_to_memory)
+            .map(Self::row_to_memory_scan)
             .collect::<StoreResult<Vec<_>>>()
             .map(|mems| {
                 mems.into_iter()
+                    .flatten()
                     .filter(|m| m.namespace.starts_with(prefix))
                     .collect()
             })
@@ -16576,10 +17039,14 @@ impl MemoryStore for PostgresStore {
         .map_err(|e| to_store_err("search", e))?;
 
         // Belt-and-suspenders: re-apply the predicate in-process.
+        // #2383 (N1) — discovery scan: skip undecryptable rows, never deny the batch.
         let mems: Vec<Memory> = rows
             .iter()
-            .map(Self::row_to_memory)
-            .collect::<StoreResult<Vec<_>>>()?;
+            .map(Self::row_to_memory_scan)
+            .collect::<StoreResult<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
         if ctx.bypass_visibility {
             return Ok(mems);
         }
@@ -16957,7 +17424,17 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err("list memories updated since", e))?,
         };
 
-        rows.iter().map(Self::row_to_memory).collect()
+        // #2383 (N1) — a row this node cannot decrypt cannot be relayed (the
+        // send path MUST ship plaintext, see the #2303 note on the mapper), so
+        // it is SKIPPED with a WARN instead of failing the whole catch-up
+        // batch. It stays on disk and replicates once its keypair is restored.
+        Ok(rows
+            .iter()
+            .map(Self::row_to_memory_scan)
+            .collect::<StoreResult<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
     async fn apply_remote_memory(
@@ -17095,7 +17572,23 @@ impl MemoryStore for PostgresStore {
         // desync a locally-kept content with a peer's ciphertext. Fail-closed
         // on an empty agent_id mirrors `store()` (a well-formed federated row
         // always carries `agent_id`).
-        let (remote_content, remote_envelope) = seal_content_for_insert(memory)?;
+        // v1.0.0 #2383 (N1) — the federation-receive upsert now runs in its OWN
+        // transaction so the seal pre-read, the newer-wins upsert, and the
+        // envelope-owner reconcile are ONE atomic unit. Pre-#2383 this funnel
+        // executed a bare `fetch_one(&self.pool)` with no tx, so a repair could
+        // not have been rolled back with the write it repairs.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin apply_remote_memory tx", e))?;
+        // Sealed to the identity the SURVIVING row RETAINS: the newer-wins arm
+        // takes the INBOUND envelope while the metadata overlay keeps the LOCAL
+        // row's `agent_id` (#1784), so a peer-keyed seal left a row nothing
+        // could decrypt. A losing inbound row keeps the local envelope, which is
+        // already consistent — the reconcile matches nothing and no-ops.
+        let remote_seal = seal_content_for_upsert(&mut *tx, memory).await?;
+        let (remote_content, remote_envelope) = (remote_seal.content(), remote_seal.envelope());
         let row = sqlx::query(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
@@ -17332,12 +17825,21 @@ impl MemoryStore for PostgresStore {
         // On the newer-wins upsert arm it is kept/replaced in lockstep with
         // `content` (see the matching CASE above).
         .bind(remote_envelope)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("apply_remote_memory upsert", e))?;
 
-        row.try_get::<String, _>("id")
-            .map_err(|e| to_store_err(READ_RETURNED_ID, e))
+        let applied_id = row
+            .try_get::<String, _>("id")
+            .map_err(|e| to_store_err(READ_RETURNED_ID, e))?;
+        // #2383 (N1) — invariant backstop, same tx: a non-NULL
+        // `encrypted_envelope` MUST open under the row's persisted
+        // `metadata.agent_id`.
+        reconcile_envelope_owner(&mut *tx, &applied_id, &memory.content, &remote_seal).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit apply_remote_memory tx", e))?;
+        Ok(applied_id)
     }
 
     async fn merge_inbound(&self, ctx: &CallerContext, inbound: &Memory) -> StoreResult<String> {
@@ -17830,7 +18332,10 @@ impl MemoryStore for PostgresStore {
         let mut scored: std::collections::HashMap<String, (Memory, f64, f64, i64)> =
             std::collections::HashMap::new();
         for r in &fts_rows {
-            let mem = Self::row_to_memory(r)?;
+            // #2383 (N1) — discovery scan: skip undecryptable rows, never deny the batch.
+            let Some(mem) = Self::row_to_memory_scan(r)? else {
+                continue;
+            };
             let fts_score: f64 = r.try_get("fts_score").unwrap_or(0.0);
             let content_len: i64 = r.try_get::<i32, _>(COL_CONTENT_LEN).map_or_else(
                 |_| {
@@ -17913,7 +18418,10 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err("recall_hybrid semantic pool", e))?;
 
             for r in &sem_rows {
-                let mem = Self::row_to_memory(r)?;
+                // #2383 (N1) — discovery scan: skip undecryptable rows, never deny the batch.
+                let Some(mem) = Self::row_to_memory_scan(r)? else {
+                    continue;
+                };
                 let cosine: f64 = r.try_get("cosine_sim").unwrap_or(0.0);
                 let content_len: i64 = r.try_get::<i32, _>(COL_CONTENT_LEN).map_or_else(
                     |_| {
@@ -19625,7 +20133,14 @@ impl MemoryStore for PostgresStore {
         // Seal via `candidate` (its `content == summary`, its metadata carries
         // the consolidator `agent_id`). Content arm is unconditional →
         // envelope moves with it unconditionally on the ON CONFLICT arm.
-        let (consolidate_content, consolidate_envelope) = seal_content_for_insert(&candidate)?;
+        // v1.0.0 #2383 (N1) — sealed to the identity the SURVIVING row RETAINS,
+        // not the incoming writer: the `ON CONFLICT` arm keeps the existing row's
+        // `agent_id` (#1784) while taking the incoming envelope, so an
+        // incoming-keyed seal left the durable row unreadable. Same tx as the
+        // upsert, so the pre-read + write are one atomic unit.
+        let consolidate_seal = seal_content_for_upsert(&mut *tx, &candidate).await?;
+        let (consolidate_content, consolidate_envelope) =
+            (consolidate_seal.content(), consolidate_seal.envelope());
         let inserted_id: String = sqlx::query_scalar(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
@@ -19691,6 +20206,17 @@ impl MemoryStore for PostgresStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("consolidate upsert", e))?;
+        // #2383 (N1) — invariant backstop, same tx: a non-NULL
+        // `encrypted_envelope` MUST open under the row's persisted
+        // `metadata.agent_id`. Repairs the concurrent-first-creation race the
+        // pre-read cannot close under READ COMMITTED.
+        reconcile_envelope_owner(
+            &mut *tx,
+            &inserted_id,
+            &candidate.content,
+            &consolidate_seal,
+        )
+        .await?;
         let new_id = inserted_id;
 
         // Delete source rows.
@@ -24176,7 +24702,10 @@ impl MemoryStore for PostgresStore {
 
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
-            out.push(Self::row_to_memory(r)?);
+            // #2383 (N1) — discovery scan: skip undecryptable rows, never deny the batch.
+            if let Some(mem) = Self::row_to_memory_scan(r)? {
+                out.push(mem);
+            }
         }
         Ok(out)
     }
