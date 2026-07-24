@@ -256,6 +256,16 @@ vector path could only be exercised on an operator's own machine.
   = tamper-EVIDENCE, not tamper-PROOF (an imaged-disk attacker who
   snapshots DB + anchor together wins; whole-host resistance needs TPM2
   NV / off-host anchor). Surfaced by `verify-audit-trail` on both backends.
+  [#2370](https://github.com/alphaonedev/ai-memory-mcp/issues/2370) scoped
+  the shared anchor log PER DATABASE via a signed v3 `db_id` (derived from
+  the genesis `signed_events` row), so sibling databases on one witness
+  mount no longer cross-refuse each other's opens under require-mode;
+  legacy id-less v1/v2 anchor lines stay counted CONSERVATIVELY for one
+  release, and the operator sanction record binds the database it clears.
+  The open-time check + per-DB verdict filter are sqlite-side; the postgres
+  `verify-audit-trail` check side keeps the conservative count-every-anchor
+  posture pending [#2373](https://github.com/alphaonedev/ai-memory-mcp/issues/2373)
+  (postgres EMISSION already stamps v3 `db_id` anchors).
 - **Federated commit-checkpoint resolution signatures ([#1936](https://github.com/alphaonedev/ai-memory-mcp/issues/1936), FED-RQ-01).**
   `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` (env-table row #125, default
   `1`) gates the inner per-resolution signature on inbound federated
@@ -449,6 +459,19 @@ or overclaim).
   file TOGETHER (a whole-host snapshot-and-restore) evades detection;
   whole-host resistance needs a TPM2 NV counter or a genuinely
   off-host anchor, both out of scope for the OSS build at v1.0.0.
+  Two [#2370](https://github.com/alphaonedev/ai-memory-mcp/issues/2370)
+  per-database-scoping residuals share that boundary: (i)
+  **wipe-and-reinit `db_id` rotation** — replacing the database with a
+  re-initialised chain mints a NEW genesis identity that matches no
+  existing anchor, resolving a clean `NotApplicable` open instead of
+  `Evidence` (same imaged-disk-class attacker; a wipe-to-EMPTY without
+  re-init is still caught as Evidence); (ii) **mixed-version fleet
+  freeze** — a v3 anchor writer paired with a pre-#2370 reader (which
+  hard-rejects `v: 3` resolutions) freezes that old reader's high-water
+  at the last v1/v2 line, so it WITHHOLDS rather than detects newer
+  rollbacks until upgraded (one-release conservatism: old readers never
+  mint a FALSE verdict, and the new reader still counts legacy id-less
+  lines toward Evidence).
 - **Claimed-vs-attested identity and diversity.** `metadata.agent_id`
   and the reflection-decorrelation probe's model-family signal are
   CLAIMED (self-asserted by the caller) unless independently attested

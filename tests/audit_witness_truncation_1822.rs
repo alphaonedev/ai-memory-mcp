@@ -288,6 +288,7 @@ fn head_resigned_under_daemon_key_is_forged_by_the_pin() {
     let forged = witness::build_signed_witness_checkpoint(
         &forged_dual,
         None,
+        None,
         chrono::Utc::now().timestamp() + 10, // ensure it is the "latest"
         &daemon_kp,
     )
@@ -666,7 +667,7 @@ mod postgres_parity {
             revisions_head_sequence: 0,
             revisions_head_hash: "00".to_string(),
         };
-        let cp = witness::build_signed_witness_checkpoint(&dual, None, ts.timestamp(), &kp)
+        let cp = witness::build_signed_witness_checkpoint(&dual, None, None, ts.timestamp(), &kp)
             .expect("build cp");
         sqlx::query(
             "INSERT INTO checkpoints \
