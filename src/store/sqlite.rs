@@ -1378,7 +1378,9 @@ impl MemoryStore for SqliteStore {
 
     async fn lease_sweep_expired(&self, now: i64) -> StoreResult<usize> {
         let conn = self.state.lock().await;
-        crate::actions::sweep_expired_leases(&conn, now).map_err(box_err)
+        // #2371 — emit one coordination-audit `signed_events` row per reclaimed
+        // lease (the FORCED-revocation twin of the voluntary lease-op audit).
+        crate::actions::sweep_expired_leases_audited(&conn, now).map_err(box_err)
     }
 
     async fn signal_send(

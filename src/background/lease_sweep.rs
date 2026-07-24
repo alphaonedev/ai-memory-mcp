@@ -11,6 +11,13 @@
 //! ([`crate::background::offload_ttl_sweep`]) structurally; the cadence is
 //! tighter (hourly, not daily) because leases are short-lived.
 //!
+//! #2371 — a reclaim is a FORCED revocation of coordination authority (the
+//! holder did not voluntarily surrender the lease), so the sweep drives the
+//! audited primitive [`crate::actions::sweep_expired_leases_audited`], which
+//! appends one `coordination.lease_expire_reclaim` `signed_events` row per
+//! reclaimed lease — the tamper-evident twin of the voluntary
+//! acquire/renew/release audit rows.
+//!
 //! Spawned by `daemon_runtime::bootstrap_serve` alongside the GC, TTL, and
 //! transcript-lifecycle loops; aborted on shutdown.
 
@@ -48,7 +55,7 @@ impl LeaseSweepAdapter
     )
 {
     fn run_lease_sweep(&self, now_unix: i64) -> anyhow::Result<usize> {
-        crate::actions::sweep_expired_leases(&self.0, now_unix).map_err(anyhow::Error::from)
+        crate::actions::sweep_expired_leases_audited(&self.0, now_unix).map_err(anyhow::Error::from)
     }
 }
 
@@ -90,7 +97,8 @@ mod tests {
     struct ConnAdapter(rusqlite::Connection);
     impl LeaseSweepAdapter for ConnAdapter {
         fn run_lease_sweep(&self, now_unix: i64) -> anyhow::Result<usize> {
-            crate::actions::sweep_expired_leases(&self.0, now_unix).map_err(anyhow::Error::from)
+            crate::actions::sweep_expired_leases_audited(&self.0, now_unix)
+                .map_err(anyhow::Error::from)
         }
     }
 
@@ -127,6 +135,49 @@ mod tests {
         crate::actions::lease_acquire(&conn, "ls-1", "holder", now, now - 1).unwrap();
         let adapter = ConnAdapter(conn);
         assert_eq!(adapter.run_lease_sweep(now).unwrap(), 1);
+    }
+
+    /// #2371 — the sweep is a FORCED lease revocation, so it must leave the
+    /// same coordination-audit trace the voluntary ops do: exactly one
+    /// `coordination.lease_expire_reclaim` `signed_events` row per reclaimed
+    /// lease, attributed to the reclaimed holder. Mirrors the voluntary
+    /// lease-op audit test in `coordination_audit::tests`.
+    #[test]
+    fn run_lease_sweep_emits_coordination_audit_per_reclaimed_lease() {
+        let conn = crate::storage::open(std::path::Path::new(":memory:")).unwrap();
+        let now = 1_700_000_000;
+        let action = crate::models::Action {
+            id: "audit-ls-1".to_string(),
+            namespace: "_act".to_string(),
+            kind: "test.kind".to_string(),
+            state: crate::models::ActionState::Pending,
+            title: "t".to_string(),
+            payload: serde_json::json!({}),
+            priority: 5,
+            agent_id: None,
+            claimed_by: None,
+            vector_clock: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+            created_at: now,
+            updated_at: now,
+        };
+        crate::actions::create(&conn, &action).unwrap();
+        crate::actions::lease_acquire(&conn, "audit-ls-1", "holder-x", now, now - 1).unwrap();
+
+        let adapter = ConnAdapter(conn);
+        assert_eq!(adapter.run_lease_sweep(now).unwrap(), 1);
+
+        let (count, agent): (i64, String) = adapter
+            .0
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(agent_id), '') FROM signed_events \
+                 WHERE event_type = ?1",
+                rusqlite::params![crate::coordination_audit::LEASE_SWEEP_RECLAIM],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "exactly one lease-sweep reclaim audit row");
+        assert_eq!(agent, "holder-x", "attributed to the reclaimed holder");
     }
 
     /// Default-const sanity: the cadence resolves to the documented value so a

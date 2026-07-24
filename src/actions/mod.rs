@@ -562,12 +562,52 @@ pub fn lease_get(
 }
 
 /// Reclaim (delete) every lease whose `expires_at <= now`, releasing the
-/// action for a fresh holder. Returns the number of leases reclaimed.
+/// action for a fresh holder. Returns the reclaimed `(action_id, holder)`
+/// pairs so the caller can emit one coordination-audit `signed_events` row per
+/// FORCED reclamation (#2371) — the asymmetric twin of the voluntary
+/// [`lease_release`], which is the ONE lease op that previously left no
+/// forensic trace. The `DELETE ... RETURNING` is atomic, so the returned set is
+/// EXACTLY the rows removed (no SELECT-then-DELETE TOCTOU where a concurrently
+/// renewed lease could be audited as reclaimed without being deleted).
 ///
 /// # Errors
-/// Propagates the `rusqlite` delete error.
-pub fn sweep_expired_leases(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
-    conn.execute("DELETE FROM leases WHERE expires_at <= ?1", params![now])
+/// Propagates the `rusqlite` delete/query error.
+pub fn sweep_expired_leases(
+    conn: &Connection,
+    now: i64,
+) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut stmt =
+        conn.prepare("DELETE FROM leases WHERE expires_at <= ?1 RETURNING action_id, holder")?;
+    let reclaimed = stmt
+        .query_map(params![now], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+    Ok(reclaimed)
+}
+
+/// Reclaim expired leases via [`sweep_expired_leases`] AND emit one
+/// coordination-audit `signed_events` row per reclaimed lease
+/// ([`crate::coordination_audit::LEASE_SWEEP_RECLAIM`]), attributed to the
+/// reclaimed `holder` (the entity losing coordination authority) with the same
+/// `[action_id, holder]` identity the voluntary lease ops use. Returns the
+/// reclaimed count. The audit append is best-effort (#1722): the DELETE has
+/// already committed, so a rare append failure is WARN-logged inside
+/// [`crate::coordination_audit::emit`], never propagated.
+///
+/// # Errors
+/// Propagates the `rusqlite` delete/query error from [`sweep_expired_leases`].
+pub fn sweep_expired_leases_audited(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
+    let reclaimed = sweep_expired_leases(conn, now)?;
+    for (action_id, holder) in &reclaimed {
+        crate::coordination_audit::emit(
+            conn,
+            crate::coordination_audit::LEASE_SWEEP_RECLAIM,
+            holder,
+            &[action_id.as_str(), holder.as_str()],
+        );
+    }
+    Ok(reclaimed.len())
 }
 
 #[cfg(test)]
@@ -987,8 +1027,13 @@ mod tests {
             LeaseAcquire::Conflict => panic!("expected Acquired"),
         }
 
-        // The sweep reclaims exactly the one expired lease.
-        assert_eq!(sweep_expired_leases(&conn, now).unwrap(), 1);
+        // The sweep reclaims exactly the one expired lease and RETURNS the
+        // (action_id, holder) pair so the caller can audit the reclamation.
+        let reclaimed = sweep_expired_leases(&conn, now).unwrap();
+        assert_eq!(
+            reclaimed,
+            vec![("sweep-1".to_string(), "holder".to_string())]
+        );
         assert!(lease_get(&conn, "sweep-1").unwrap().is_none());
 
         // A non-expired lease (expires_at = now + 1000) is NOT swept.
@@ -996,8 +1041,51 @@ mod tests {
             LeaseAcquire::Acquired(_) => {}
             LeaseAcquire::Conflict => panic!("expected Acquired"),
         }
-        assert_eq!(sweep_expired_leases(&conn, now).unwrap(), 0);
+        assert!(sweep_expired_leases(&conn, now).unwrap().is_empty());
         assert!(lease_get(&conn, "sweep-1").unwrap().is_some());
+    }
+
+    #[test]
+    fn sweep_expired_leases_audited_emits_one_row_per_reclaimed_lease() {
+        let conn = fresh();
+        let now = 1_700_000_000;
+        create(&conn, &sample("audited-1")).unwrap();
+        create(&conn, &sample("audited-2")).unwrap();
+        // Two expired leases held by distinct holders.
+        lease_acquire(&conn, "audited-1", "holder-a", now, now - 1).unwrap();
+        lease_acquire(&conn, "audited-2", "holder-b", now, now - 1).unwrap();
+
+        assert_eq!(sweep_expired_leases_audited(&conn, now).unwrap(), 2);
+
+        // Exactly one LEASE_SWEEP_RECLAIM row per reclaimed lease, each
+        // attributed to the reclaimed holder.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1",
+                params![crate::coordination_audit::LEASE_SWEEP_RECLAIM],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2, "one audit row per reclaimed lease");
+        let holders: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT agent_id) FROM signed_events WHERE event_type = ?1",
+                params![crate::coordination_audit::LEASE_SWEEP_RECLAIM],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(holders, 2, "rows attributed to each reclaimed holder");
+
+        // An idempotent re-sweep reclaims nothing and appends no new rows.
+        assert_eq!(sweep_expired_leases_audited(&conn, now).unwrap(), 0);
+        let count2: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1",
+                params![crate::coordination_audit::LEASE_SWEEP_RECLAIM],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count2, 2, "no-op sweep appends no audit rows");
     }
 
     // v1.0.0 FBL-05/FBL-06 regression: `lease_acquire` must be atomic across

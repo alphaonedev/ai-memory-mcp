@@ -892,7 +892,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // (#2310-#2318) + the v87 anchor merge + the FBL-20/33/03 pg mirrors
     // land the file at 29_869. Ceiling 29_020 -> 29_900 (+31 headroom).
     // The module-split relief remains tracked under #650-class follow-ups.
-    ("src/store/postgres.rs", 29_900),
+    // 2026-07-24 (#2371 lease-sweep-audit) — `lease_sweep_expired` gains a
+    // `DELETE ... RETURNING` + per-pair emit loop, the
+    // `emit_lease_sweep_reclaim_audit` helper, and the sal-postgres
+    // `lease_sweep_expired_emits_coordination_audit_2371` regression test;
+    // land the file at 29_997. Ceiling 29_900 -> 30_040 (+43 headroom).
+    ("src/store/postgres.rs", 30_040),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

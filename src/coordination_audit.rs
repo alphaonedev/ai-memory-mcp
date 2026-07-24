@@ -62,6 +62,13 @@ pub const LEASE_ACQUIRE: &str = "coordination.lease_acquire";
 pub const LEASE_RENEW: &str = "coordination.lease_renew";
 /// Lease release (`memory_lease_release`).
 pub const LEASE_RELEASE: &str = "coordination.lease_release";
+/// Forced lease reclamation by the background expiry sweeper
+/// (`background::lease_sweep` / the postgres maintenance loop). The
+/// asymmetric twin of the VOLUNTARY [`LEASE_RELEASE`]: the sweeper reclaims
+/// coordination authority a holder did NOT voluntarily surrender, so — as the
+/// only FORCED revocation of a lease — it MUST leave the same tamper-evident
+/// forensic trace the voluntary ops do (#2371).
+pub const LEASE_SWEEP_RECLAIM: &str = "coordination.lease_expire_reclaim";
 /// Attested-checkpoint creation (`memory_checkpoint_create`).
 pub const CHECKPOINT_CREATE: &str = "coordination.checkpoint_create";
 /// Attested-checkpoint resolution (`memory_checkpoint_resolve`).
@@ -72,6 +79,23 @@ pub const ROUTINE_CREATE: &str = "coordination.routine_create";
 pub const ROUTINE_FREEZE: &str = "coordination.routine_freeze";
 /// Routine run / materialisation (`memory_routine_run`).
 pub const ROUTINE_RUN: &str = "coordination.routine_run";
+
+/// Build the coordination-audit `payload_hash`: SHA-256 over `identity_parts`
+/// joined by the 0x1F unit separator (the module's canonical bounded-identity
+/// digest). Shared by [`emit`] (the sqlite append) and the postgres
+/// coordination-audit append so a given `identity_parts` hashes byte-identically
+/// on both backends (#2371 lease-sweep parity).
+#[must_use]
+pub fn coordination_payload_hash(identity_parts: &[&str]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    for (i, part) in identity_parts.iter().enumerate() {
+        if i > 0 {
+            hasher.update([FIELD_SEP]);
+        }
+        hasher.update(part.as_bytes());
+    }
+    hasher.finalize().to_vec()
+}
 
 /// Emit one `signed_events` audit row for a coordination state-mutation.
 ///
@@ -87,17 +111,8 @@ pub const ROUTINE_RUN: &str = "coordination.routine_run";
 /// already succeeded, so an audit-append failure must not surface to the
 /// caller. See the module docs for the rationale.
 pub fn emit(conn: &rusqlite::Connection, event_type: &str, actor: &str, identity_parts: &[&str]) {
-    let mut hasher = Sha256::new();
-    for (i, part) in identity_parts.iter().enumerate() {
-        if i > 0 {
-            hasher.update([FIELD_SEP]);
-        }
-        hasher.update(part.as_bytes());
-    }
-    let payload_hash = hasher.finalize().to_vec();
-
     let event = crate::signed_events::SignedEvent::with_daemon_signature(
-        payload_hash,
+        coordination_payload_hash(identity_parts),
         actor.to_string(),
         event_type.to_string(),
         chrono::Utc::now().to_rfc3339(),
