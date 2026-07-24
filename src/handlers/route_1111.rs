@@ -208,8 +208,39 @@ pub async fn handle_reflect_http(
     }
     // #1924 (CWE-288) — consult the PRE-REFLECT enforcement gate before the
     // reflection write (HTTP parity with the MCP gate). INERT by default.
+    // #2390 (N9) — a reflection lands in `namespace` when supplied, else in the
+    // namespace of the FIRST source memory (`storage::reflect` step 4); source
+    // namespaces fold in too because the write emits `reflects_on` edges onto
+    // those rows. Pre-fix the raw caller body was the payload, so a caller-
+    // supplied `"namespace"` decided the scope and an omitted one skipped every
+    // scoped `pre_reflect` hook.
+    let reflect_source_ids: Vec<String> = body
+        .get(crate::mcp::param_names::SOURCE_IDS)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut reflect_namespaces: Vec<String> = body
+        .get(crate::mcp::param_names::NAMESPACE)
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| vec![s.to_owned()])
+        .unwrap_or_default();
+    for ns in
+        crate::handlers::create::resolve_pre_event_namespaces(&app, &headers, &reflect_source_ids)
+            .await
+    {
+        if !reflect_namespaces.contains(&ns) {
+            reflect_namespaces.push(ns);
+        }
+    }
     if let Some(resp) = crate::handlers::create::http_pre_event_gate(
         crate::hooks::HookEvent::PreReflect,
+        reflect_namespaces,
         body.clone(),
     ) {
         return resp;

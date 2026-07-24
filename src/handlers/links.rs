@@ -348,9 +348,34 @@ pub async fn create_link(
 ) -> impl IntoResponse {
     // #1924 (CWE-288) — consult the PRE-LINK enforcement gate before the link
     // write (HTTP parity with the MCP gate). INERT for default deployments.
-    if let Some(resp) =
-        crate::handlers::create::http_pre_event_gate(crate::hooks::HookEvent::PreLink, raw.clone())
-    {
+    //
+    // #2390 (N9) — `MemoryLink` has no namespace column, so a link's namespace
+    // is derived from its ENDPOINTS. BOTH contribute (fire-if-ANY): anchoring on
+    // the source alone would let a caller choose which namespace-scoped guard
+    // hook fires by swapping `source_id`/`target_id`. Pre-fix the raw caller body
+    // was the payload, so (a) no namespace was present and every scoped PreLink
+    // hook was skipped, and (b) a caller-supplied `"namespace"` key would have
+    // been TRUSTED as the scope. Both are closed here: the substrate resolves the
+    // set and `dispatch_pre_event_enforced` overwrites the payload key.
+    let link_endpoint_ids: Vec<String> = [
+        raw.get(crate::mcp::param_names::SOURCE_ID),
+        raw.get("from"),
+        raw.get(crate::mcp::param_names::TARGET_ID),
+        raw.get("to"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(serde_json::Value::as_str)
+    .map(str::to_owned)
+    .collect();
+    let link_namespaces =
+        crate::handlers::create::resolve_pre_event_namespaces(&app, &headers, &link_endpoint_ids)
+            .await;
+    if let Some(resp) = crate::handlers::create::http_pre_event_gate(
+        crate::hooks::HookEvent::PreLink,
+        link_namespaces,
+        raw.clone(),
+    ) {
         return resp;
     }
     // v0.7.0 G-PHASE-E-1 (#706) — reject unknown fields with a

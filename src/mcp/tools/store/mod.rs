@@ -326,7 +326,27 @@ pub(crate) fn handle_store(
     // `OnceLock` load on the hot store path. Payload = the raw store arguments,
     // fired only when a pre_store hook IS present (the deny path short-circuits
     // before firing).
-    crate::mcp::consult_pre_event_gate(crate::hooks::HookEvent::PreStore, params.clone())?;
+    // #2390 (N9) — resolve the namespace the write will ACTUALLY land in through
+    // the SAME #1590 ladder `parse_store_params` uses (explicit caller param >
+    // operator-configured `[storage].default_namespace` > compiled
+    // `DEFAULT_NAMESPACE`). Pre-fix the raw params were passed through verbatim,
+    // so a default-namespace store (caller omits `namespace`) carried NO
+    // top-level namespace and every namespace-scoped `pre_store` hook was
+    // silently skipped — the PreStore half of #2390.
+    let store_namespace = params[crate::mcp::param_names::NAMESPACE]
+        .as_str()
+        .map_or_else(
+            || {
+                crate::config::configured_default_namespace()
+                    .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string())
+            },
+            str::to_string,
+        );
+    crate::mcp::consult_pre_event_gate(
+        crate::hooks::HookEvent::PreStore,
+        vec![store_namespace],
+        params.clone(),
+    )?;
 
     // v0.7.0 (issue #318) — when operators have configured a federation
     // forward URL, every MCP write routes through the local HTTP daemon

@@ -55,15 +55,61 @@ Fields ([`src/hooks/config.rs:174-190`](../src/hooks/config.rs)):
   `pre_recall_expand`), exec otherwise.
 - **`enabled`** — soft-disable without removing the row.
 - **`namespace`** — glob pattern; chain is filtered before invocation.
-  Validation is shape-only today (`validate_hook` at
-  [`src/hooks/config.rs:297`](../src/hooks/config.rs)); the runtime
-  matcher is a substrate-side prefix check.
+  `*` or empty (the schema default) matches every namespace; otherwise the
+  pattern matches EXACTLY, or as a `prefix/*` glob covering the prefix itself
+  and any child under it. Validation is shape-only (`validate_hook` at
+  [`src/hooks/config.rs:297`](../src/hooks/config.rs)); the runtime matcher is
+  [`HookConfig::matches_namespace`](../src/hooks/config.rs). See
+  §"Namespace scoping on pre-* events" below for how the in-flight namespace is
+  resolved.
 - **`fail_mode`** — `open` (default; executor errors → chain logs
   warning, treats hook as `Allow`) or `closed` (executor errors →
   chain `Deny` and short-circuit). Use `closed` only for
   compliance-critical hooks (PII redaction, regulated-tenant access
   control) where silent fail-open is worse than a hard refusal.
   Defined at [`src/hooks/config.rs:111-122`](../src/hooks/config.rs).
+
+## Namespace scoping on pre-\* events (#2390)
+
+A `namespace`-scoped hook only fires when the substrate can say which namespace
+the in-flight operation touches. For every pre-\* event that runs through the
+enforcement gate, that namespace is resolved by the SUBSTRATE — never read from
+the request body — using the same rule the operation's own handler uses:
+
+| Event | In-flight namespace |
+|---|---|
+| `pre_store` | the resolved target namespace: caller `namespace` > `[storage].default_namespace` > compiled default. Omitting `namespace` scopes on the DEFAULT namespace, not on "no namespace". Bulk stores contribute every distinct namespace in the batch. |
+| `pre_delete` / `pre_promote` | the TARGET ROW's namespace |
+| `pre_link` | BOTH endpoints' namespaces |
+| `pre_consolidate` | the resolved target namespace + every source row's namespace |
+| `pre_reflect` | the caller `namespace`, else the FIRST source memory's namespace, + every source row's namespace |
+| `pre_governance_decision` | the namespace the decision is being made in |
+
+Two consequences worth knowing before you scope a hook:
+
+- **Fire-if-ANY.** An operation that spans several namespaces (a link's two
+  endpoints, a consolidation's sources, a bulk store) fires every hook covering
+  ANY of them. A `prod`-scoped hook therefore fires on a link between a
+  `scratch` source and a `prod` target — otherwise swapping `source_id` and
+  `target_id` would choose which guard hook runs.
+- **A caller cannot pick its own scope.** A `namespace` field in the request
+  body is NOT what the hook is scoped against; the substrate-resolved value
+  overwrites it in the payload the hook receives.
+
+**Unresolvable namespace.** If the namespace cannot be resolved (a memory id
+that does not exist, a concurrent delete) AND at least one namespace-scoped hook
+is configured for that event, the operation is refused with `503` under
+`enforce_mode = "enforce"` (WARN + allow under `advisory`, no-op under `off`)
+rather than silently skipping the hook. When every configured hook for the event
+is wildcard-scoped, the namespace is irrelevant to the firing decision and the
+chain runs normally — so unscoped deployments never see this.
+
+**Presence is namespace-blind.** `[hooks].required_events` asks "does an enabled
+hook exist for this event?", not "does one cover this namespace". If every
+enabled hook for a required event is namespace-scoped, writes OUTSIDE that scope
+run UNGOVERNED while the presence gate reads as satisfied. `ai-memory doctor
+--hooks` flags exactly this config; add a `namespace = "*"` hook to cover the
+rest. Namespace-qualified `required_events` is tracked as a follow-up.
 
 ## 27-event matrix
 

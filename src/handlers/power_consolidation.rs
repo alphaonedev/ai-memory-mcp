@@ -262,9 +262,21 @@ pub async fn consolidate_memories(
 ) -> impl IntoResponse {
     // #1924 (CWE-288) — consult the PRE-CONSOLIDATE enforcement gate before the
     // consolidation write (HTTP parity with the MCP gate).
+    // #2390 (N9) — the summary lands in `body.namespace` (serde-defaulted) and
+    // the N source rows it consumes may live elsewhere; every touched namespace
+    // contributes so a hook scoped to any of them fires. Pre-fix the payload was
+    // `{"ids": [...]}` with no namespace, so scoped hooks never fired.
+    let mut consolidate_namespaces = vec![body.namespace.clone()];
+    for ns in crate::handlers::create::resolve_pre_event_namespaces(&app, &headers, &body.ids).await
+    {
+        if !consolidate_namespaces.contains(&ns) {
+            consolidate_namespaces.push(ns);
+        }
+    }
     if let Some(resp) = crate::handlers::create::http_pre_event_gate(
         crate::hooks::HookEvent::PreConsolidate,
-        serde_json::json!({ "ids": body.ids }),
+        consolidate_namespaces,
+        serde_json::json!({ "ids": body.ids, "namespace": body.namespace }),
     ) {
         return resp;
     }
