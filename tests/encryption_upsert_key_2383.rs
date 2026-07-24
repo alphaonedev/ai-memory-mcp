@@ -294,6 +294,49 @@ fn cross_agent_upsert_preserves_authorship_and_new_content_2383() {
 }
 
 #[test]
+fn upsert_onto_agentless_legacy_row_seals_to_the_incoming_id_2383() {
+    // A row written while encryption was OFF can legitimately carry NO
+    // `agent_id` key at all. The conflict arm's provenance overlay only
+    // carries keys the existing row actually HAS, so an ABSENT key leaves the
+    // INCOMING writer's agent_id in place — the retained-identity resolver
+    // must fall back to the incoming id, NOT to the empty id (which has no
+    // recipient key and would fail the write closed). This is the case that
+    // distinguishes "key absent" from "key present but null"; the postgres
+    // twin needs `jsonb_exists` to tell them apart.
+    let gate = EncryptGate::off();
+    let conn = fresh_conn();
+    let ns = "n2383-agentless";
+
+    let mut legacy = make_mem("legacy", "plaintext legacy content", ns, "unused");
+    legacy.metadata = serde_json::json!({ "note": "no agent_id key" });
+    let id = db::insert(&conn, &legacy).expect("legacy insert with the gate OFF");
+    assert_eq!(
+        persisted_agent_id(&conn, &id),
+        None,
+        "fixture precondition: the legacy row carries NO agent_id"
+    );
+    drop(gate);
+
+    let _on = EncryptGate::on();
+    let incoming = make_mem("legacy", "encrypted rewrite", ns, "agent-legacy-2383");
+    assert_eq!(
+        db::insert(&conn, &incoming).expect("upsert under encryption"),
+        id
+    );
+
+    assert_eq!(
+        persisted_agent_id(&conn, &id).as_deref(),
+        Some("agent-legacy-2383"),
+        "an ABSENT existing key lets the incoming agent_id survive the overlay"
+    );
+    assert_eq!(
+        db::get(&conn, &id).expect("read").expect("row").content,
+        "encrypted rewrite",
+        "the row must be sealed to (and readable under) the surviving agent_id"
+    );
+}
+
+#[test]
 fn federation_insert_if_newer_cross_agent_keeps_row_readable_2383() {
     // The federation twin: `insert_if_newer`'s newer-wins arm takes the
     // INBOUND envelope while the metadata overlay keeps the LOCAL row's

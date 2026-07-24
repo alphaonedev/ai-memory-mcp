@@ -12108,8 +12108,16 @@ async fn retained_agent_id_for_upsert(
     if !crate::encryption::encryption_enabled(None) {
         return Ok(incoming.to_string());
     }
-    let existing: Option<Option<String>> = sqlx::query_scalar(
-        "SELECT metadata->>'agent_id' FROM memories WHERE title = $1 AND namespace = $2",
+    // `->>` yields SQL NULL for BOTH an absent key and a JSON null, but the two
+    // resolve DIFFERENTLY: the `||` overlay only carries keys the existing row
+    // actually HAS, so an ABSENT key leaves EXCLUDED's (incoming) agent_id in
+    // place, while a PRESENT json-null overwrites it and the reader resolves it
+    // to the empty id. `jsonb_exists` disambiguates (the function form, not the
+    // `?` operator, so no driver placeholder ambiguity). Mirrors the sqlite
+    // `metadata_agent_id_slot` Option semantics exactly.
+    let existing: Option<(bool, Option<String>)> = sqlx::query_as(
+        "SELECT jsonb_exists(metadata, 'agent_id'), metadata->>'agent_id' \
+         FROM memories WHERE title = $1 AND namespace = $2",
     )
     .bind(&memory.title)
     .bind(&memory.namespace)
@@ -12119,10 +12127,11 @@ async fn retained_agent_id_for_upsert(
     Ok(match existing {
         // No conflict target — the incoming row IS the surviving row.
         None => incoming.to_string(),
-        // `->>` yields SQL NULL for both an absent key and a JSON null; both
-        // read back as the empty agent id, matching `row_to_memory`.
-        Some(None) => String::new(),
-        Some(Some(retained)) => retained,
+        // Key ABSENT on the existing row ⇒ the overlay keeps the incoming id.
+        Some((false, _)) => incoming.to_string(),
+        // Key PRESENT ⇒ that is what the surviving row will carry (a json-null
+        // or non-string value reads back as the empty id).
+        Some((true, retained)) => retained.unwrap_or_default(),
     })
 }
 
@@ -12174,8 +12183,13 @@ async fn seal_content_for_upsert_batch(
     }
     let titles: Vec<String> = memories.iter().map(|m| m.title.clone()).collect();
     let namespaces: Vec<String> = memories.iter().map(|m| m.namespace.clone()).collect();
-    let existing: Vec<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT title, namespace, metadata->>'agent_id' FROM memories \
+    // `jsonb_exists` disambiguates an ABSENT `agent_id` key (the overlay keeps
+    // the incoming id) from a PRESENT json-null (the reader resolves it to the
+    // empty id) — see `retained_agent_id_for_upsert`. Rows whose key is absent
+    // are simply omitted from the map so the per-row fallback below applies.
+    let existing: Vec<(String, String, bool, Option<String>)> = sqlx::query_as(
+        "SELECT title, namespace, jsonb_exists(metadata, 'agent_id'), metadata->>'agent_id' \
+         FROM memories \
          WHERE (title, namespace) IN (SELECT * FROM UNNEST($1::text[], $2::text[]))",
     )
     .bind(&titles)
@@ -12185,7 +12199,8 @@ async fn seal_content_for_upsert_batch(
     .map_err(|e| to_store_err("resolve retained agent_ids for batch upsert", e))?;
     let retained_by_key: std::collections::HashMap<(String, String), String> = existing
         .into_iter()
-        .map(|(title, namespace, agent)| ((title, namespace), agent.unwrap_or_default()))
+        .filter(|(_, _, has_key, _)| *has_key)
+        .map(|(title, namespace, _, agent)| ((title, namespace), agent.unwrap_or_default()))
         .collect();
     memories
         .iter()
