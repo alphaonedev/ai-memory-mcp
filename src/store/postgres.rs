@@ -5027,7 +5027,7 @@ impl PostgresStore {
                      reflection_depth, atomised_into, atom_of, memory_kind,
                      entity_id, persona_version, citations, source_uri, source_span,
                      confidence_source, confidence_signals, confidence_decayed_at,
-                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
+                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, NOW(), $2, metadata,
@@ -5035,7 +5035,7 @@ impl PostgresStore {
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                  FROM memories WHERE id = $1",
             )
             .bind(id)
@@ -5451,7 +5451,7 @@ impl PostgresStore {
                  reflection_depth, atomised_into, atom_of, memory_kind,
                  entity_id, persona_version, citations, source_uri, source_span,
                  confidence_source, confidence_signals, confidence_decayed_at,
-                 mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
+                 mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, NOW(), 'superseded', metadata,
@@ -5459,7 +5459,7 @@ impl PostgresStore {
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
              FROM memories WHERE id = $1
              {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
         ))
@@ -5626,7 +5626,14 @@ impl PostgresStore {
         // to_tsvector(title||' '||content) per matched row.
         let rows = sqlx::query(&format!(
             "SELECT m.*,
-                    ts_rank(m.tsv, plainto_tsquery('english', $1)) AS rank
+                    ts_rank(m.tsv, plainto_tsquery('english', $1))
+                    -- v1.0.0 #2338 (FBL-33 pg mirror) — G7 soft-loser
+                    -- down-weight: a contradiction-conserved loser is
+                    -- multiplicatively penalized so it cannot outrank its
+                    -- winner at full score (reversible — clearing the
+                    -- marker restores rank; sqlite twin in db::recall).
+                    * (CASE WHEN (m.metadata->>'contradiction_soft_loser') = '1'
+                            THEN {soft_loser_factor} ELSE 1.0 END) AS rank
              FROM memories m
              WHERE m.tsv @@ plainto_tsquery('english', $1)
                AND ($2::text IS NULL OR m.namespace = $2)
@@ -5642,6 +5649,7 @@ impl PostgresStore {
              LIMIT $7",
             // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
             lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
+            soft_loser_factor = crate::storage::SOFT_LOSER_SCORE_FACTOR,
         ))
         .bind(query)
         .bind(filter.namespace.as_ref())
@@ -15808,7 +15816,7 @@ impl MemoryStore for PostgresStore {
                      reflection_depth, atomised_into, atom_of, memory_kind,
                      entity_id, persona_version, citations, source_uri, source_span,
                      confidence_source, confidence_signals, confidence_decayed_at,
-                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
+                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, NOW(), $2, metadata,
@@ -15816,7 +15824,7 @@ impl MemoryStore for PostgresStore {
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                  FROM memories WHERE id = $1",
             )
             .bind(id)
@@ -17005,12 +17013,19 @@ impl MemoryStore for PostgresStore {
                 updated_at = GREATEST(memories.updated_at, EXCLUDED.updated_at),
                 -- #1631 — sqlite parity: access_count converges on MAX.
                 access_count = GREATEST(memories.access_count, EXCLUDED.access_count),
-                -- #1631 — sqlite parity: long-tier pins expiry to NULL;
-                -- otherwise a peer push that omits expiry keeps the local
-                -- one rather than blanking it out.
+                -- v1.0.0 #2335 (FBL-20 pg mirror) — the federation expiry
+                -- merge is the extension-FLOOR lattice join, not LWW: a
+                -- STALE losing peer must never drag a live row's expiry
+                -- earlier (recall fold-extensions raise expires_at without
+                -- bumping updated_at). GREATEST over the COALESCE'd pair is
+                -- commutative/idempotent (true CRDT join) so both replicas
+                -- converge to the LATER expiry regardless of push order,
+                -- and the #1596 never-move-expiry-earlier contract holds
+                -- across federation. Long⇒NULL keeps the #1626 coupling.
                 expires_at = CASE
                     WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
-                    ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
+                    ELSE GREATEST(COALESCE(EXCLUDED.expires_at, memories.expires_at),
+                                  COALESCE(memories.expires_at, EXCLUDED.expires_at))
                 END,
                 metadata = CASE
                     WHEN EXCLUDED.updated_at > memories.updated_at
@@ -18884,7 +18899,7 @@ impl MemoryStore for PostgresStore {
                     -- #2196 - carry lifecycle_state so a non-open archived state
                     -- survives the archive->restore round-trip (restore no longer
                     -- COALESCEs a NULL to 'open'); mirrors the sqlite archive.
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -18893,7 +18908,7 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                 FROM memories
                 WHERE ($1::text IS NULL OR namespace = $1)
                   AND ($2::text IS NULL OR tier = $2)
@@ -21052,7 +21067,7 @@ impl MemoryStore for PostgresStore {
                     confidence_source, confidence_signals, confidence_decayed_at,
                     -- #2196 - carry lifecycle_state through the TTL archive so a
                     -- non-open state survives archive->restore (postgres parity).
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -21061,7 +21076,7 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                 FROM memories
                 WHERE expires_at IS NOT NULL AND expires_at < $1
                 -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
@@ -21201,7 +21216,7 @@ impl MemoryStore for PostgresStore {
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                     )
                     SELECT id, tier, namespace, title, content, tags, priority, confidence,
                            source, access_count, created_at, updated_at, last_accessed_at,
@@ -21210,7 +21225,7 @@ impl MemoryStore for PostgresStore {
                            reflection_depth, atomised_into, atom_of, memory_kind,
                            entity_id, persona_version, citations, source_uri, source_span,
                            confidence_source, confidence_signals, confidence_decayed_at,
-                           mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                           mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                     FROM memories
                     WHERE id = $1
                     -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
@@ -21376,7 +21391,7 @@ impl MemoryStore for PostgresStore {
                 entity_id, persona_version, citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
                 mentioned_entity_id, version, lifecycle_state, encrypted_envelope,
-                cid, cid_genesis, valid_from, valid_until
+                cid, cid_genesis, kind_provenance, valid_from, valid_until
             )
             SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                    tags, priority, confidence, source, access_count, created_at,
@@ -21411,6 +21426,13 @@ impl MemoryStore for PostgresStore {
                    COALESCE(lifecycle_state, 'open'),
                    encrypted_envelope,
                    $3::text, $4::bytea,
+                   -- v1.0.0 #2333 (FBL-03 pg mirror) — carry kind_provenance
+                   -- back on restore; legacy pre-v87 archive rows re-derive
+                   -- it from the metadata carrier, vocab-guarded (sqlite twin).
+                   COALESCE(kind_provenance,
+                            CASE WHEN metadata->>'kind_provenance' IN
+                                      ('declared','channel_derived','regex','llm')
+                                 THEN metadata->>'kind_provenance' END),
                    valid_from, valid_until
             FROM archived_memories WHERE id = $2",
         )
@@ -21654,7 +21676,7 @@ impl MemoryStore for PostgresStore {
                     confidence_source, confidence_signals, confidence_decayed_at,
                     -- #2196 - carry lifecycle_state through the manual archive so a
                     -- non-open state survives archive->restore (postgres parity).
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -21663,7 +21685,7 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                 FROM memories WHERE id = $3
                 -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
                 {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
