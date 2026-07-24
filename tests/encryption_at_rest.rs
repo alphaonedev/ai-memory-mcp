@@ -574,9 +574,13 @@ fn get_memory_texts_batch_decrypts_encrypted_rows_1779() {
     )
     .expect("persist orphan envelope");
 
-    let rows = db::get_memory_texts_batch(&conn, None, None, 100, None).expect("texts batch");
+    let scan = db::get_memory_texts_batch(&conn, None, None, 100, None).expect("texts batch");
+    // #2336 — the undecryptable row is COUNTED (not silently omitted) and
+    // the raw cursor still covers it so the sweep can advance past it.
+    assert_eq!(scan.decrypt_skipped, 1, "one decrypt-skip surfaced");
+    assert!(scan.raw_last_id.is_some());
     let by_id: std::collections::HashMap<String, String> =
-        rows.into_iter().map(|(id, _t, c)| (id, c)).collect();
+        scan.rows.into_iter().map(|(id, _t, c)| (id, c)).collect();
 
     assert_eq!(
         by_id.get(&enc_id).map(String::as_str),

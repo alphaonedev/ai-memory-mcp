@@ -547,6 +547,11 @@ pub async fn get_stats(
                 }
                 Json(json!({
                     (field_names::TOTAL_MEMORIES): s.total,
+                    // v1.0.0 #2334 (FBL-15) — additive expiry-axis fields
+                    // (live = the boot/export definition;
+                    // expired_pending_gc = the awaiting-GC remainder).
+                    "live": s.live,
+                    "expired_pending_gc": s.expired_pending_gc,
                     "by_tier": by_tier_map,
                     (field_names::BY_NAMESPACE): by_namespace_map,
                     "expiring_soon": s.expiring_soon,
