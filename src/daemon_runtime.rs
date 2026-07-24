@@ -3389,14 +3389,19 @@ fn spawn_postgres_fold_loop_if_enabled(
 fn spawn_postgres_maintenance_loop_if_enabled(
     task_handles: &mut Vec<JoinHandle<()>>,
     backend: crate::handlers::StorageBackend,
-    store: &std::sync::Arc<dyn crate::store::MemoryStore>,
+    app: &AppState,
     archive_on_gc: bool,
     archive_max_days: Option<i64>,
 ) {
     if !matches!(backend, crate::handlers::StorageBackend::Postgres) {
         return;
     }
-    let store = store.clone();
+    // Clone the whole `AppState` (cheap — every field is an `Arc`) so the loop
+    // can both drive the SAL trait (`app.store`) AND fan out the K2
+    // pending-timeout event through the existing `dispatch_event_postgres`
+    // subscriber walk, which needs `app.store` (subscription-mirror prefix scan)
+    // + `app.db` (the sqlite scratch audit path).
+    let app = app.clone();
     task_handles.push(tokio::spawn(async move {
         let interval = Duration::from_secs(GC_INTERVAL_SECS);
         // Admin/bypass context so archive-purge covers every owner's stale
@@ -3407,15 +3412,15 @@ fn spawn_postgres_maintenance_loop_if_enabled(
             tokio::time::sleep(interval).await;
             // Fold-before-gc (pg twin of the sqlite loop): apply pending
             // recall-access TTL extensions before evaluating eviction.
-            if let Err(e) = store.fold_recall_accesses().await {
+            if let Err(e) = app.store.fold_recall_accesses().await {
                 tracing::warn!("pg-maint: recall-access fold failed (pre-gc): {e}");
             }
-            match store.run_gc(archive_on_gc).await {
+            match app.store.run_gc(archive_on_gc).await {
                 Ok(n) if n > 0 => tracing::info!("pg-maint: expired {n} memories"),
                 Ok(_) => {}
                 Err(e) => tracing::warn!("pg-maint: run_gc failed: {e}"),
             }
-            match store.archive_purge(&admin, archive_max_days).await {
+            match app.store.archive_purge(&admin, archive_max_days).await {
                 Ok(n) if n > 0 => {
                     tracing::info!("pg-maint: purged {n} old archived memories");
                 }
@@ -3423,10 +3428,44 @@ fn spawn_postgres_maintenance_loop_if_enabled(
                 Err(e) => tracing::warn!("pg-maint: archive_purge failed: {e}"),
             }
             let now = chrono::Utc::now().timestamp();
-            match store.lease_sweep_expired(now).await {
+            match app.store.lease_sweep_expired(now).await {
                 Ok(n) if n > 0 => tracing::info!("pg-maint: reclaimed {n} expired leases"),
                 Ok(_) => {}
                 Err(e) => tracing::warn!("pg-maint: lease_sweep_expired failed: {e}"),
+            }
+            // FBL-22 residual — K2 pending-timeout sweep on the pg corpus. The
+            // sqlite `spawn_pending_timeout_sweep_loop` binds the LOCAL sqlite
+            // `Db` mutex + the rusqlite free fn, so a postgres daemon never
+            // expired its governance `pending_actions` (approvable forever +
+            // unbounded queue growth). Drive the SAL trait method here and fan
+            // out the SAME `pending_action_expired` lifecycle event the sqlite
+            // loop dispatches — both backends fire the identical event shape.
+            match app
+                .store
+                .sweep_pending_action_timeouts(PENDING_TIMEOUT_DEFAULT_SECS)
+                .await
+            {
+                Ok(expired) if !expired.is_empty() => {
+                    tracing::info!(
+                        "pg-maint: expired {} stale pending_action(s)",
+                        expired.len()
+                    );
+                    for (id, namespace) in expired {
+                        crate::handlers::dispatch_event_postgres(
+                            &app,
+                            "pending_action_expired",
+                            &id,
+                            &namespace,
+                            None,
+                            None,
+                        )
+                        .await;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("pg-maint: sweep_pending_action_timeouts failed: {e}");
+                }
             }
         }
     }));
@@ -5965,7 +6004,7 @@ pub async fn bootstrap_serve(
         spawn_postgres_maintenance_loop_if_enabled(
             &mut task_handles,
             app_state.storage_backend,
-            &app_state.store,
+            &app_state,
             pg_archive_on_gc,
             app_config.archive_max_days,
         );
@@ -8923,17 +8962,15 @@ mod tests {
     #[tokio::test]
     async fn spawn_postgres_maintenance_loop_if_enabled_spawns_for_postgres_backend() {
         // FBL-22 — the backend TAG is independent of the store type, so a cheap
-        // real sqlite store stands in (no postgres connection). The loop is
-        // aborted before its first GC_INTERVAL_SECS tick.
+        // real sqlite-backed `AppState` stands in (no postgres connection). The
+        // loop is aborted before its first GC_INTERVAL_SECS tick.
         let env = TestEnv::fresh();
-        let store: std::sync::Arc<dyn crate::store::MemoryStore> = std::sync::Arc::new(
-            crate::store::sqlite::SqliteStore::open(&env.db_path).expect("open sqlite store"),
-        );
+        let app = keyword_app_state(&env.db_path);
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
         spawn_postgres_maintenance_loop_if_enabled(
             &mut handles,
             crate::handlers::StorageBackend::Postgres,
-            &store,
+            &app,
             true,
             Some(90),
         );
@@ -8953,14 +8990,12 @@ mod tests {
         // FBL-22 — sqlite already has the under-lock gc/archive/lease loops, so
         // the SAL maintenance loop must NOT double-spawn on the sqlite backend.
         let env = TestEnv::fresh();
-        let store: std::sync::Arc<dyn crate::store::MemoryStore> = std::sync::Arc::new(
-            crate::store::sqlite::SqliteStore::open(&env.db_path).expect("open sqlite store"),
-        );
+        let app = keyword_app_state(&env.db_path);
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
         spawn_postgres_maintenance_loop_if_enabled(
             &mut handles,
             crate::handlers::StorageBackend::Sqlite,
-            &store,
+            &app,
             true,
             None,
         );
