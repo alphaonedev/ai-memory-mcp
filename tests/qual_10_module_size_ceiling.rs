@@ -935,12 +935,31 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // the `DecryptFailurePolicy` split row-mapper, and the seal/reconcile
     // wiring across all 10 vulnerable write arms (incl. the new
     // `apply_remote_memory` transaction). Rebased ON TOP OF the #2378 merge:
-    // MAX-WINS over the two candidate ceilings (release 30_440 vs this
+    // MAX-WINS over the two candidate ceilings (release 30_440 vs that
     // branch's pre-rebase 30_900) is 30_900, but the #2378 pg PUT-quota impl
-    // (+121) STACKS on the #2383 +518, so the rebased file MEASURES 30_906 —
+    // (+121) STACKS on the #2383 +518, so the rebased file MEASURED 30_906 —
     // above BOTH candidates. Bumped to the real size, not the max candidate.
     // Ceiling 30_440 -> 31_050 (+144 headroom).
-    ("src/store/postgres.rs", 31_050),
+    // 2026-07-24 (#2393 N12 + #2397 N17 pg write-funnel parity) — the
+    // `kind_provenance` column + `extract_kind_provenance` bind (+ the
+    // upsert-arm COALESCE) on the six postgres funnels that dropped the
+    // v79/#1945 epistemic-typing provenance sqlite persists
+    // (store_with_embedding / capture_turn / recover_turn / supersede /
+    // reflect / apply_remote_memory), plus the #2397 same-tx
+    // `unproject_memory_from_age` on the supersede hard-delete, stack on the
+    // #2383 merge. Growth is documentation-heavy (each arm carries the
+    // divergence rationale); the production SQL/bind delta is ~20 LOC.
+    //
+    // Ceiling 31_050 -> 31_200 = the MEASURED post-rebase 31_055 + 145
+    // headroom. THIRD consecutive rebase of this one entry, and the lesson
+    // the #2383 note above learned the hard way is now doctrine: MAX-WINS
+    // ACROSS CANDIDATE CEILINGS IS NOT SUFFICIENT — concurrent lanes' line
+    // additions STACK, so the merged file routinely exceeds every candidate
+    // number visible in either branch. ALWAYS `wc -l` the file AFTER
+    // resolving and set the ceiling from that measurement. (This lane's own
+    // prior 30_900 was itself a borrowed max-candidate and would have gone
+    // red here.) Real relief is the #650-class module split.
+    ("src/store/postgres.rs", 31_200),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

@@ -5556,12 +5556,14 @@ impl PostgresStore {
                  expires_at, metadata, reflection_depth, memory_kind,
                  entity_id, persona_version, citations, source_uri, source_span,
                  confidence_source, confidence_signals, confidence_decayed_at,
-                 mentioned_entity_id, version, cid, cid_genesis, encrypted_envelope)
+                 mentioned_entity_id, version, cid, cid_genesis, encrypted_envelope,
+                 kind_provenance)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, NOW(), NOW(), NULL,
                      $10, $11, $12, $13,
                      $14, $15, $16, $17, $18,
                      $19, $20, $21,
-                     $22, 1, $23, $24, $25)",
+                     $22, 1, $23, $24, $25,
+                     $26)",
         )
         .bind(&new_id)
         .bind(new_tier.as_str())
@@ -5594,6 +5596,14 @@ impl PostgresStore {
         .bind(&supersede_cid.genesis)
         // #2292 — sealed ciphertext envelope ($25); NULL when encryption off.
         .bind(supersede_envelope)
+        // v1.0.0 #2393 (N12) — the v79/#1945 epistemic-typing provenance ($26),
+        // denormalised from the `metadata.kind_provenance` carrier. The sqlite
+        // supersede twin funnels through `storage::insert`, which binds this
+        // column, so omitting it here landed NULL on postgres for every
+        // superseded rewrite — the same cross-backend divergence class #2289
+        // closed for `store_batch`. `candidate.metadata` inherits the old row's
+        // metadata (or the patch's), so the carrier survives the supersede.
+        .bind(crate::storage::extract_kind_provenance(&candidate))
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert new on supersede", e))?;
@@ -10359,9 +10369,9 @@ impl PostgresStore {
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
                 expires_at, metadata, reflection_depth, memory_kind, mentioned_entity_id,
-                cid, cid_genesis, encrypted_envelope
+                cid, cid_genesis, encrypted_envelope, kind_provenance
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULL, NULL, $13, $14, $15, $16,
-                      $17, $18, $19)
+                      $17, $18, $19, $20)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 -- #2292 — content + envelope move together (store() parity).
@@ -10391,7 +10401,11 @@ impl PostgresStore {
                 -- #1383 — mirror the sqlite ON CONFLICT clause: preserve
                 -- a previously-extracted attribution if EXCLUDED is NULL
                 -- (e.g. a re-store that lost the metadata key by accident).
-                mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id)
+                mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
+                -- v1.0.0 #2393 (N12) — sqlite parity: the epistemic-typing
+                -- provenance follows the incoming write when present, else
+                -- keeps the stored marker (the `store()` COALESCE precedent).
+                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
             RETURNING id",
         )
         .bind(&new_id)
@@ -10415,6 +10429,11 @@ impl PostgresStore {
         .bind(&reflect_cid.genesis)
         // #2292 — sealed ciphertext envelope ($19); NULL when encryption off.
         .bind(reflect_envelope)
+        // v1.0.0 #2393 (N12) — the v79/#1945 epistemic-typing provenance ($20).
+        // The sqlite reflect twin routes through `insert_with_conflict` →
+        // `storage::insert`, which binds this column, so omitting it here
+        // landed NULL on postgres for every synthesized reflection.
+        .bind(crate::storage::extract_kind_provenance(&candidate))
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| ReflectError::Database(format!("insert reflection memory: {e}")))?
@@ -15299,11 +15318,12 @@ impl MemoryStore for PostgresStore {
                 expires_at, metadata, reflection_depth, memory_kind,
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
-                mentioned_entity_id, cid, cid_genesis, encrypted_envelope
+                mentioned_entity_id, cid, cid_genesis, encrypted_envelope,
+                kind_provenance
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                       $18, $19, $20,
                       $21, $22, $23,
-                      $24, $25, $26, $27)
+                      $24, $25, $26, $27, $28)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 -- #2292 — content + envelope move together (store()/store_batch
@@ -15353,7 +15373,11 @@ impl MemoryStore for PostgresStore {
                 -- v0.9.0 G8 (#1825) — cid/cid_genesis OMITTED from DO UPDATE
                 -- SET: surviving row keeps its genesis.
                 -- #1632 (pg twin) — upsert-merge bumps the Gap-1 counter.
-                version = memories.version + 1
+                version = memories.version + 1,
+                -- v1.0.0 #2393 (N12) — sqlite parity: the epistemic-typing
+                -- provenance follows the incoming write when present, else
+                -- keeps the stored marker (the `store()` COALESCE precedent).
+                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
             RETURNING id",
         )
         .bind(&memory.id)
@@ -15385,6 +15409,11 @@ impl MemoryStore for PostgresStore {
         .bind(&capture_cid.genesis)
         // #2292 — sealed ciphertext envelope ($27); NULL when encryption off.
         .bind(capture_envelope)
+        // v1.0.0 #2393 (N12) — the v79/#1945 epistemic-typing provenance ($28).
+        // The sqlite L4 twin (`storage::capture_turn_idempotent`) funnels
+        // through `storage::insert`, which binds this column, so omitting it
+        // here landed NULL on postgres for every captured turn.
+        .bind(crate::storage::extract_kind_provenance(memory))
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("capture_turn insert memory", e))?
@@ -15581,11 +15610,12 @@ impl MemoryStore for PostgresStore {
                 expires_at, metadata, reflection_depth, memory_kind,
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
-                mentioned_entity_id, cid, cid_genesis, encrypted_envelope
+                mentioned_entity_id, cid, cid_genesis, encrypted_envelope,
+                kind_provenance
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                       $18, $19, $20,
                       $21, $22, $23,
-                      $24, $25, $26, $27)
+                      $24, $25, $26, $27, $28)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 -- #2292 — content + envelope move together (store() parity).
@@ -15631,7 +15661,11 @@ impl MemoryStore for PostgresStore {
                 mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
                 -- v0.9.0 G8 (#1825) — cid/cid_genesis OMITTED from DO UPDATE
                 -- SET: surviving row keeps its genesis.
-                version = memories.version + 1
+                version = memories.version + 1,
+                -- v1.0.0 #2393 (N12) — sqlite parity: the epistemic-typing
+                -- provenance follows the incoming write when present, else
+                -- keeps the stored marker (the `store()` COALESCE precedent).
+                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
             RETURNING id",
         )
         .bind(&memory.id)
@@ -15663,6 +15697,11 @@ impl MemoryStore for PostgresStore {
         .bind(&recover_cid.genesis)
         // #2292 — sealed ciphertext envelope ($27); NULL when encryption off.
         .bind(recover_envelope)
+        // v1.0.0 #2393 (N12) — the v79/#1945 epistemic-typing provenance ($28).
+        // The sqlite L2 twin (`storage::recover_turn_idempotent`) funnels
+        // through `storage::insert`, which binds this column, so omitting it
+        // here landed NULL on postgres for every transcript-recovered turn.
+        .bind(crate::storage::extract_kind_provenance(memory))
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("recover_turn insert memory", e))?
@@ -15860,13 +15899,13 @@ impl MemoryStore for PostgresStore {
                 entity_id, persona_version, embedding,
                 mentioned_entity_id, lifecycle_state,
                 cid, cid_genesis, embedding_space,
-                valid_from, valid_until, encrypted_envelope
+                valid_from, valid_until, encrypted_envelope, kind_provenance
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                       $18, $19, $20,
                       $21, $22, $23,
                       $24, $25, $26,
                       $27, $28, $29, $30, $31,
-                      $32, $33, $34)
+                      $32, $33, $34, $35)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 -- #2292 — content + envelope move together on upsert so a
@@ -15946,7 +15985,11 @@ impl MemoryStore for PostgresStore {
                 -- v0.9.0 G8 (#1825) — cid/cid_genesis OMITTED from DO UPDATE
                 -- SET: surviving row keeps its genesis.
                 -- #1632 (pg twin) — upsert-merge bumps the Gap-1 counter.
-                version = memories.version + 1
+                version = memories.version + 1,
+                -- v1.0.0 #2393 (N12) — sqlite parity: the epistemic-typing
+                -- provenance follows the incoming write when present, else
+                -- keeps the stored marker (the `store()` COALESCE precedent).
+                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
             RETURNING id",
         )
         .bind(&memory.id)
@@ -15991,6 +16034,12 @@ impl MemoryStore for PostgresStore {
         ))
         // #2292 — sealed ciphertext envelope ($34); NULL when encryption off.
         .bind(embed_envelope)
+        // v1.0.0 #2393 (N12) — the v79/#1945 epistemic-typing provenance ($35).
+        // This is the PRIMARY embedded-write hot path (every semantic-tier
+        // store); sqlite has no override, so its trait default forwards to
+        // `store()` → `storage::insert`, which binds the column. Omitting it
+        // here landed NULL on postgres for the busiest write funnel.
+        .bind(crate::storage::extract_kind_provenance(memory))
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory_with_embedding", e))?
@@ -17598,11 +17647,12 @@ impl MemoryStore for PostgresStore {
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version, version,
                 mentioned_entity_id, lifecycle_state,
-                cid, cid_genesis, valid_from, valid_until, encrypted_envelope
+                cid, cid_genesis, valid_from, valid_until, encrypted_envelope,
+                kind_provenance
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                 $18, $19, $20, $21, $22, $23, $24, $25, $26,
-                $27, $28, $29, $30, $31, $32, $33
+                $27, $28, $29, $30, $31, $32, $33, $34
             )
             ON CONFLICT (title, namespace) DO UPDATE SET
                 -- #1631 — every newer-wins arm carries the sqlite
@@ -17775,7 +17825,13 @@ impl MemoryStore for PostgresStore {
                              AND EXCLUDED.id > memories.id)
                         THEN EXCLUDED.valid_until
                     ELSE memories.valid_until
-                END
+                END,
+                -- v1.0.0 #2393 (N12) — sqlite `insert_if_newer` parity
+                -- (src/storage/mod.rs, the #2333/FBL-03 arm whose comment
+                -- already CLAIMED pg parity that was never wired): COALESCE
+                -- keeps the local value when the peer carries none, so a
+                -- replication hop can never blank an already-typed row.
+                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
                 -- v0.9.0 G8 (#1825) — cid/cid_genesis OMITTED from DO UPDATE
                 -- SET: the surviving local row keeps its genesis cid on a
                 -- federation-merge (preserves the local genesis pre-image).
@@ -17825,6 +17881,17 @@ impl MemoryStore for PostgresStore {
         // On the newer-wins upsert arm it is kept/replaced in lockstep with
         // `content` (see the matching CASE above).
         .bind(remote_envelope)
+        // v1.0.0 #2393 (N12) — the v79/#1945 epistemic-typing provenance ($34)
+        // on the FEDERATION RECEIVE funnel. The sqlite twin `insert_if_newer`
+        // binds it (#2333/FBL-03); postgres did not, so every memory replicated
+        // INTO a pg node landed with a NULL denormalised column while the
+        // metadata carrier still held the value — the divergence re-emerged on
+        // any onward hop that re-derived the column from a pg-sourced row.
+        .bind(crate::storage::extract_kind_provenance(memory))
+        // #2383 (N1) executes this upsert INSIDE the tx (was pool-direct) so
+        // the envelope-owner reconciliation below commits atomically with it;
+        // the bind above must therefore precede the tx-scoped execute, not the
+        // former `&self.pool` one.
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("apply_remote_memory upsert", e))?;
