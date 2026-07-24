@@ -4177,6 +4177,15 @@ pub fn forget_tombstone_signable_bytes(
 }
 
 /// v0.8.1 W2.3 (#1821 / gap G30) — has `memory_id` been forgotten (a
+/// Tracing target shared by every resurrection-guard drop site (sqlite +
+/// both postgres funnels) so the forget-tombstone audit signal is one
+/// greppable stream.
+pub const FORGET_TOMBSTONE_TRACE_TARGET: &str = "forget.tombstone";
+
+/// The one resurrection-guard drop message, shared across backends.
+pub const FORGET_TOMBSTONE_DROP_MSG: &str =
+    "rejected inbound federation write for a forgotten id (resurrection guard)";
+
 /// `forget_tombstones` row exists)? The federation RECEIVE funnel consults
 /// this BEFORE accepting an inbound write so a peer that still holds a
 /// forgotten row cannot resurrect it via LWW. Tombstone-WINS: once an id is
@@ -12777,9 +12786,9 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // Idempotent no-op return (the row stays forgotten); logged for audit.
     if memory_is_tombstoned(conn, &mem.id)? {
         tracing::info!(
-            target: "forget.tombstone",
+            target: FORGET_TOMBSTONE_TRACE_TARGET,
             memory_id = %mem.id,
-            "rejected inbound federation write for a forgotten id (resurrection guard)"
+            "{FORGET_TOMBSTONE_DROP_MSG}"
         );
         return Ok(mem.id.clone());
     }

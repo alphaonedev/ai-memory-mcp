@@ -16827,9 +16827,10 @@ impl MemoryStore for PostgresStore {
         .map_err(|e| to_store_err("apply_remote_memory tombstone check", e))?;
         if tombstoned {
             tracing::info!(
-                target: "forget.tombstone",
+                target: crate::storage::FORGET_TOMBSTONE_TRACE_TARGET,
                 memory_id = %memory.id,
-                "rejected inbound federation write for a forgotten id (resurrection guard)"
+                "{}",
+                crate::storage::FORGET_TOMBSTONE_DROP_MSG
             );
             return Ok(memory.id.clone());
         }
@@ -17187,9 +17188,10 @@ impl MemoryStore for PostgresStore {
         .map_err(|e| to_store_err("merge_inbound tombstone check", e))?;
         if tombstoned {
             tracing::info!(
-                target: "forget.tombstone",
+                target: crate::storage::FORGET_TOMBSTONE_TRACE_TARGET,
                 memory_id = %inbound.id,
-                "rejected inbound federation write for a forgotten id (resurrection guard)"
+                "{}",
+                crate::storage::FORGET_TOMBSTONE_DROP_MSG
             );
             return Ok(inbound.id.clone());
         }
