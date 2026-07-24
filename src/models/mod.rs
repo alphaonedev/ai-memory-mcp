@@ -49,6 +49,30 @@ pub use tag::*;
 pub const MAX_CONTENT_SIZE: usize = 65_536;
 
 pub const PROMOTION_THRESHOLD: i64 = 5;
+
+/// v1.0.0 #2339 (FBL-34) — ceiling for ACCESS-DRIVEN priority bumps (the
+/// touch/fold decade ladders + the curator feedback up-arm). Priority was
+/// a monotonic ratchet: ~70 recalls drove ANY row to 10, destroying the
+/// operator semantic "priority 9-10 = critical decisions" (a routine note
+/// scored the identical +5.0 recall term as an operator's priority-10
+/// correction). Access-driven bumps now stop at 7, reserving 8-10 for
+/// explicit caller/operator intent; rows ALREADY above the ceiling are
+/// never lowered by the ladders (the CASE keeps them byte-identical).
+/// Mirrored on the postgres touch/fold twins (backend parity).
+pub const ACCESS_PRIORITY_CEILING: i64 = 7;
+
+/// v1.0.0 #2339 (FBL-34) — staleness window (days) for the curator
+/// priority-DECAY arm. The previous decay condition (`access_count == 0`)
+/// was structurally unreachable for any row ever recalled (access_count
+/// is monotone), so nothing ever lowered a ratcheted priority. A row now
+/// decays -1 per curator cycle (floor 1) when it has NOT been accessed
+/// for this many days (or was never accessed and is at least this old),
+/// SCOPED to the access band (`priority <= ACCESS_PRIORITY_CEILING`) so
+/// operator-set 8-10 intent — indistinguishable from legacy ratcheted
+/// rows — is NEVER silently eroded (fail-safe: never destroy operator
+/// signal).
+pub const PRIORITY_DECAY_STALE_DAYS: i64 = 30;
+
 /// How much to extend TTL on access (1 hour for short, 1 day for mid)
 pub const SHORT_TTL_EXTEND_SECS: i64 = crate::SECS_PER_HOUR;
 pub const MID_TTL_EXTEND_SECS: i64 = crate::SECS_PER_DAY;

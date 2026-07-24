@@ -358,6 +358,16 @@ const MIGRATION_V84_EMBEDDING_SPACE: &str =
 const MIGRATION_V85_ARCHIVED_VALID_TIME: &str =
     include_str!("../../migrations/postgres/0042_v85_archived_valid_time.sql");
 
+/// v1.0.0 #2333 (FBL-03) — schema v87: mirror the v79 (#1945)
+/// denormalized `kind_provenance` column onto `archived_memories`
+/// (the third v79 column; its two siblings landed at v85/#2035), so
+/// archive→restore stops dropping the SQL-queryable epistemic-provenance
+/// copy. Additive `ADD COLUMN IF NOT EXISTS`, no rewrite. The sqlite v87
+/// arm additionally heals legacy `expires_at` renderings (#2332) —
+/// postgres needs no expiry heal (`expires_at` is TIMESTAMPTZ here).
+const MIGRATION_V87_ARCHIVED_KIND_PROVENANCE: &str =
+    include_str!("../../migrations/postgres/0044_v87_archived_kind_provenance.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -724,7 +734,13 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       unparseable values); the write funnels canonicalize from v86 on.
 //       Doc twin: migrations/postgres/0043_v86_valid_time_canonicalize.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 86;
+// v87 — #2333 (FBL-03): `archived_memories.kind_provenance` — the third
+//       v79 (#1945) column mirrored onto the archive (siblings landed at
+//       v85/#2035) so archive→restore stops dropping the denormalized
+//       epistemic-provenance copy. Additive ADD COLUMN IF NOT EXISTS.
+//       Doc twin: migrations/postgres/0044_v87_archived_kind_provenance.sql.
+//       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
+const CURRENT_SCHEMA_VERSION: i32 = 87;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1856,8 +1872,11 @@ impl PostgresStore {
         if current_version < 85 {
             self.migrate_v85().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 86 {
             self.migrate_v86().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v87().await?;
         }
 
         Ok(())
@@ -4456,7 +4475,7 @@ impl PostgresStore {
                 }
             }
         }
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        record_schema_version(&mut tx, 86).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v86 migration", e))?;
@@ -4464,6 +4483,28 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v86 applied (#1834 pre-ship 3x7: claim \
              valid-time renderings canonicalized to fixed UTC)"
+        );
+        Ok(())
+    }
+
+    async fn migrate_v87(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v87 ddl tx", e))?;
+        sqlx::raw_sql(MIGRATION_V87_ARCHIVED_KIND_PROVENANCE)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v87 archived kind_provenance ddl", e))?;
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v87 migration", e))?;
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v87 applied (#2333 FBL-03: archived_memories.\
+             kind_provenance archive-column parity)"
         );
         Ok(())
     }
@@ -17822,7 +17863,7 @@ impl MemoryStore for PostgresStore {
         // SQL standard (RHS of SET evaluates against the OLD row),
         // so the `access_count + 1` / `LEAST(...)` arithmetic
         // mirrors what the original ordered sequence saw.
-        sqlx::query(
+        sqlx::query(&format!(
             "UPDATE memories SET
                 access_count = LEAST(access_count + 1, 1000000),
                 last_accessed_at = NOW(),
@@ -17846,12 +17887,15 @@ impl MemoryStore for PostgresStore {
                 priority = CASE
                     WHEN LEAST(access_count + 1, 1000000) > 0
                          AND LEAST(access_count + 1, 1000000) % 10 = 0
-                         AND priority < 10
-                        THEN LEAST(priority + 1, 10)
+                         AND priority < {ceiling}
+                        THEN LEAST(priority + 1, {ceiling})
                     ELSE priority
                 END
              WHERE id = ANY($1)",
-        )
+            // v1.0.0 #2339 (FBL-34) — access bumps stop at the named
+            // ceiling (sqlite touch/touch_many parity).
+            ceiling = crate::models::ACCESS_PRIORITY_CEILING,
+        ))
         .bind(ids)
         .execute(&self.pool)
         .await
@@ -19707,7 +19751,7 @@ impl MemoryStore for PostgresStore {
             // verb applying metadata-only access bookkeeping (the same
             // sanction class as the legacy touch); it never rewrites
             // memory content.
-            let folded_ids: Vec<String> = sqlx::query_scalar(
+            let folded_ids: Vec<String> = sqlx::query_scalar(&format!(
                 "WITH batch AS (
                     SELECT memory_id
                       FROM recall_observations
@@ -19730,9 +19774,10 @@ impl MemoryStore for PostgresStore {
                 )
                 UPDATE memories m SET
                     access_count = LEAST(m.access_count + a.n, 1000000),
-                    priority = LEAST(m.priority
-                        + (LEAST(m.access_count + a.n, 1000000) / 10
-                           - m.access_count / 10)::int, 10),
+                    priority = CASE WHEN m.priority >= {ceiling} THEN m.priority
+                        ELSE LEAST(m.priority
+                            + (LEAST(m.access_count + a.n, 1000000) / 10
+                               - m.access_count / 10)::int, {ceiling}) END,
                     last_accessed_at = GREATEST(
                         COALESCE(m.last_accessed_at, a.t_max), a.t_max),
                     expires_at = CASE
@@ -19755,7 +19800,11 @@ impl MemoryStore for PostgresStore {
                  FROM agg a
                  WHERE m.id = a.memory_id
                 RETURNING m.id",
-            )
+                // v1.0.0 #2339 (FBL-34) — the fold's decade bump stops at
+                // the named ceiling (sqlite fold_recall_accesses parity);
+                // rows already above it keep their priority byte-identical.
+                ceiling = crate::models::ACCESS_PRIORITY_CEILING,
+            ))
             .bind(chunk_limit)
             .fetch_all(&self.pool)
             .await
@@ -23345,8 +23394,32 @@ impl MemoryStore for PostgresStore {
                 .await
                 .unwrap_or(0);
 
+        // v1.0.0 #2334 (FBL-15) — LIVE count (non-expired + lifecycle-
+        // visible, the boot/export definition) and the expired-awaiting-GC
+        // remainder, mirroring the sqlite `db::stats` twin so the expiry
+        // axis reconciles identically on both backends.
+        let live: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*)::BIGINT FROM memories \
+             WHERE (expires_at IS NULL OR expires_at > $1) {}",
+            crate::models::lifecycle_visible_clause("")
+        ))
+        .bind(now_dt)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("stats live", e))?;
+        let expired_pending_gc: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::BIGINT FROM memories \
+             WHERE expires_at IS NOT NULL AND expires_at <= $1",
+        )
+        .bind(now_dt)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("stats expired_pending_gc", e))?;
+
         Ok(crate::models::Stats {
             total: total_usize,
+            live: usize::try_from(live).unwrap_or(0),
+            expired_pending_gc: usize::try_from(expired_pending_gc).unwrap_or(0),
             by_tier,
             by_namespace,
             expiring_soon: usize::try_from(expiring_soon).unwrap_or(0),

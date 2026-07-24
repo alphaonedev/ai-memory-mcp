@@ -1,0 +1,21 @@
+-- Copyright 2026 AlphaOne LLC
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- v1.0.0 #2333 (FBL-03) — schema v87 (postgres twin of
+-- migrations/sqlite/0071_v87_archived_kind_provenance.sql): mirror the
+-- v79 (#1945) denormalized `kind_provenance` column onto
+-- `archived_memories` so the archive→restore round-trip stops dropping
+-- the SQL-queryable epistemic-provenance copy (the v49/#1025 + v85/#2035
+-- archive-column-parity class — v85 mirrored the two v79 sibling columns
+-- valid_from/valid_until but skipped kind_provenance).
+--
+-- Additive, idempotent, no rewrite. The postgres archive/restore
+-- INSERT...SELECT column-list carry is tracked as the cross-backend
+-- follow-up of #2333 (the sqlite carry lands with this migration); the
+-- column exists on both backends from v87 so the carry is purely a
+-- column-list edit.
+--
+-- No expiry-rendering heal on postgres: `expires_at` is TIMESTAMPTZ
+-- here (the sqlite-only #2332 half of the v87 arm does not apply).
+
+ALTER TABLE archived_memories ADD COLUMN IF NOT EXISTS kind_provenance TEXT;

@@ -3238,9 +3238,12 @@ pub fn run_embedding_backfill_with_batch_size(
     let mut announced = false;
     let mut cursor: Option<String> = None;
     loop {
-        let chunk = db::get_unembedded_ids_batch_after(conn, cursor.as_deref(), batch_size)?;
-        if chunk.is_empty() {
-            // Idempotence: zero rows scanned ⇒ zero work; on the
+        let scan = db::get_unembedded_ids_batch_after(conn, cursor.as_deref(), batch_size)?;
+        if scan.raw_last_id.is_none() {
+            // Idempotence: the RAW fetch was empty ⇒ end of corpus. v1.0.0
+            // #2336 (FBL-24): breaking on the RESOLVED chunk instead made a
+            // whole batch of undecryptable envelopes read as end-of-corpus,
+            // silently starving every row after the poison window. On the
             // first pass no log line is emitted so re-runs on a
             // steady-state DB stay silent.
             break;
@@ -3249,8 +3252,25 @@ pub fn run_embedding_backfill_with_batch_size(
             eprintln!("ai-memory: backfilling unembedded memories (batch_size={batch_size})...");
             announced = true;
         }
-        scanned += chunk.len();
-        cursor = chunk.last().map(|(id, _, _)| id.clone());
+        scanned += scan.rows.len() + scan.decrypt_skipped;
+        // #2336 — advance from the RAW cursor so decrypt-skipped rows are
+        // stepped past (never re-fetched, never able to pin the head), and
+        // count them as skips instead of silently omitting them.
+        cursor = scan.raw_last_id.clone();
+        if scan.decrypt_skipped > 0 {
+            eprintln!(
+                "ai-memory: backfill skipped {} encrypted row(s) whose envelope failed \
+                 to decrypt (#1779/#2336)",
+                scan.decrypt_skipped
+            );
+            skipped += scan.decrypt_skipped;
+        }
+        let chunk = scan.rows;
+        if chunk.is_empty() {
+            // Whole batch decrypt-skipped: keep scanning past the poison
+            // window (the cursor advanced above, so termination holds).
+            continue;
+        }
 
         let embedded = embed_rows_with_fallback(emb, &chunk);
         for (id, reason) in &embedded.skipped {

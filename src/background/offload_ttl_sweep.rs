@@ -4,10 +4,26 @@
 //! v0.7.0 QW-3 — daily TTL sweep for `offloaded_blobs`.
 //!
 //! The sweep removes rows where `stored_at + ttl_seconds < now`,
-//! bounded at [`MAX_PER_RUN`] deletions per pass with a [`SLEEP_BETWEEN_DELETES`]
-//! gap between deletes so the connection lock window stays short
-//! under contended writes (matches the K2 pending-actions sweeper
-//! discipline).
+//! bounded at [`MAX_PER_RUN`] deletions per pass.
+//!
+//! ## Chunked-locking contract (#2359)
+//!
+//! The daemon's shared `Db` handle is a single
+//! `Arc<Mutex<(Connection, …)>>` that serves EVERY HTTP handler, so
+//! the sweep must never hold that mutex for the length of a full
+//! pass. [`spawn`] therefore locks **per chunk**: it acquires the
+//! lock, deletes at most [`CHUNK_CAP`] rows with NO in-pass sleep
+//! ([`Duration::ZERO`]), drops the lock, then performs the
+//! [`SLEEP_BETWEEN_CHUNKS`] pacing sleep OUTSIDE the lock (via
+//! `tokio::time::sleep`, not a thread-blocking `std::thread::sleep`)
+//! so concurrent HTTP requests can acquire the mutex between chunks.
+//! It repeats until the cumulative [`MAX_PER_RUN`] cap is reached or
+//! a chunk returns fewer rows than requested (backlog drained).
+//!
+//! This supersedes the pre-#2359 posture where the whole pass — every
+//! per-row `std::thread::sleep` included — ran under one lock, stalling
+//! all HTTP traffic for up to `MAX_PER_RUN × 10ms` (~10s) per pass and
+//! parking a tokio worker thread on a blocking sleep.
 //!
 //! Spawned by `daemon_runtime::bootstrap_serve` alongside the GC and
 //! transcript-lifecycle loops; aborted on shutdown.
@@ -30,26 +46,37 @@ use crate::offload::sweep_expired;
 #[allow(clippy::cast_sign_loss)]
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(crate::SECS_PER_DAY as u64);
 
-/// Maximum number of rows deleted per sweep pass. 1000 keeps the
-/// outer loop bounded in pathological backlog scenarios (a thousand
-/// rows times the 10 ms sleep = 10 seconds wall clock, well under
-/// the daily cadence).
+/// Maximum number of rows deleted per sweep pass (cumulative across
+/// all chunks). 1000 keeps the pass bounded in pathological backlog
+/// scenarios; the daemon re-invokes at the daily cadence to drain a
+/// larger backlog over successive passes.
 pub const MAX_PER_RUN: usize = 1000;
 
-/// Sleep between consecutive deletes. 10 ms lets concurrent writes
-/// land between the SELECT-then-DELETE pairs that make up the sweep
-/// body so the connection mutex isn't held for the whole pass.
-pub const SLEEP_BETWEEN_DELETES: Duration = Duration::from_millis(10);
+/// Rows deleted per locked chunk (#2359). Small so the shared `Db`
+/// mutex is held only briefly on each acquisition; the sweep releases
+/// it and pauses [`SLEEP_BETWEEN_CHUNKS`] between chunks so concurrent
+/// HTTP handlers can interleave.
+pub const CHUNK_CAP: usize = 50;
+
+/// Pacing sleep BETWEEN chunks (#2359), performed OUTSIDE the lock via
+/// `tokio::time::sleep`. Lets concurrent writes/reads land between
+/// chunk deletions without holding the connection mutex across the
+/// pause, and without a thread-blocking `std::thread::sleep` inside
+/// the async task. The in-pass per-delete sleep is now
+/// [`Duration::ZERO`] — pacing lives here, off the lock.
+pub const SLEEP_BETWEEN_CHUNKS: Duration = Duration::from_millis(10);
 
 /// Spawn the daily sweep loop. Returns a [`JoinHandle`] the caller
 /// aborts on shutdown.
 ///
-/// The state lock is held only for the duration of each pass; the
-/// in-pass `std::thread::sleep` between deletes happens INSIDE that
-/// lock window, which is acceptable because the sweep is a single
-/// background thread and not a hot data-plane path. v0.8.0 may
-/// move the per-row sleep outside the lock if the offload write
-/// volume grows.
+/// Per the chunked-locking contract (#2359, see the module doc), the
+/// shared `Db` mutex is acquired PER CHUNK — never across a whole
+/// pass. Each chunk deletes at most [`CHUNK_CAP`] rows under the lock
+/// with no in-pass sleep, the lock is dropped, and the
+/// [`SLEEP_BETWEEN_CHUNKS`] pacing sleep runs OUTSIDE the lock so
+/// concurrent HTTP handlers can interleave. The pass ends when the
+/// cumulative [`MAX_PER_RUN`] cap is reached or a chunk returns fewer
+/// rows than requested (backlog drained).
 #[must_use]
 pub fn spawn<T>(state: Arc<Mutex<T>>, interval: Duration) -> JoinHandle<()>
 where
@@ -59,17 +86,43 @@ where
         loop {
             tokio::time::sleep(interval).await;
             let now_unix = chrono::Utc::now().timestamp();
-            let lock = state.lock().await;
-            match lock.run_sweep(now_unix) {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(
+            let mut swept = 0usize;
+            loop {
+                let chunk_cap = MAX_PER_RUN.saturating_sub(swept).min(CHUNK_CAP);
+                if chunk_cap == 0 {
+                    break; // cumulative MAX_PER_RUN reached
+                }
+                // Acquire the lock ONLY for the chunk; the guard is
+                // dropped at the end of this block, BEFORE the pacing
+                // sleep below — the whole point of #2359.
+                let outcome = {
+                    let lock = state.lock().await;
+                    lock.run_sweep_chunk(now_unix, chunk_cap)
+                };
+                match outcome {
+                    Ok(n) => {
+                        swept += n;
+                        if n < chunk_cap {
+                            break; // backlog drained
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "offload.ttl_sweep",
+                            "TTL sweep failed: {e}"
+                        );
+                        break;
+                    }
+                }
+                // Pacing sleep OUTSIDE the lock so concurrent requests
+                // can acquire the shared Db mutex between chunks.
+                tokio::time::sleep(SLEEP_BETWEEN_CHUNKS).await;
+            }
+            if swept > 0 {
+                tracing::info!(
                     target: "offload.ttl_sweep",
-                    "TTL sweep removed {n} expired offloaded blob(s)"
-                ),
-                Err(e) => tracing::warn!(
-                    target: "offload.ttl_sweep",
-                    "TTL sweep failed: {e}"
-                ),
+                    "TTL sweep removed {swept} expired offloaded blob(s)"
+                );
             }
         }
     })
@@ -81,7 +134,12 @@ where
 /// `(Connection, PathBuf, ResolvedTtl, bool)` tuple) implements
 /// this via the blanket impl below.
 pub trait SweepAdapter {
-    fn run_sweep(&self, now_unix: i64) -> anyhow::Result<usize>;
+    /// Delete up to `chunk_cap` expired rows in a SINGLE locked pass,
+    /// with NO in-pass sleep ([`Duration::ZERO`]) — [`spawn`] performs
+    /// the inter-chunk pacing sleep OUTSIDE the lock (#2359). Returns
+    /// the count deleted; a return `< chunk_cap` signals the backlog
+    /// is drained.
+    fn run_sweep_chunk(&self, now_unix: i64, chunk_cap: usize) -> anyhow::Result<usize>;
 }
 
 impl SweepAdapter
@@ -92,8 +150,8 @@ impl SweepAdapter
         bool,
     )
 {
-    fn run_sweep(&self, now_unix: i64) -> anyhow::Result<usize> {
-        sweep_expired(&self.0, now_unix, MAX_PER_RUN, SLEEP_BETWEEN_DELETES)
+    fn run_sweep_chunk(&self, now_unix: i64, chunk_cap: usize) -> anyhow::Result<usize> {
+        sweep_expired(&self.0, now_unix, chunk_cap, Duration::ZERO)
     }
 }
 
@@ -106,8 +164,8 @@ mod tests {
     /// daemon `Db` shape.
     struct ConnAdapter(rusqlite::Connection);
     impl SweepAdapter for ConnAdapter {
-        fn run_sweep(&self, now_unix: i64) -> anyhow::Result<usize> {
-            sweep_expired(&self.0, now_unix, MAX_PER_RUN, Duration::ZERO)
+        fn run_sweep_chunk(&self, now_unix: i64, chunk_cap: usize) -> anyhow::Result<usize> {
+            sweep_expired(&self.0, now_unix, chunk_cap, Duration::ZERO)
         }
     }
 
@@ -115,9 +173,9 @@ mod tests {
     fn run_sweep_is_idempotent_on_empty_table() {
         let conn = crate::storage::open(std::path::Path::new(":memory:")).unwrap();
         let adapter = ConnAdapter(conn);
-        let n = adapter.run_sweep(0).unwrap();
+        let n = adapter.run_sweep_chunk(0, MAX_PER_RUN).unwrap();
         assert_eq!(n, 0);
-        let n2 = adapter.run_sweep(0).unwrap();
+        let n2 = adapter.run_sweep_chunk(0, MAX_PER_RUN).unwrap();
         assert_eq!(n2, 0);
     }
 
@@ -132,7 +190,9 @@ mod tests {
         let r = off.offload("expiring", "ns", Some(1), "ai:alice").unwrap();
         let adapter = ConnAdapter(conn);
         // Sweep at stored_at + 60s to guarantee expiry.
-        let n = adapter.run_sweep(r.stored_at + 60).unwrap();
+        let n = adapter
+            .run_sweep_chunk(r.stored_at + 60, MAX_PER_RUN)
+            .unwrap();
         assert_eq!(n, 1);
     }
 
@@ -146,37 +206,40 @@ mod tests {
             Duration::from_secs(crate::SECS_PER_DAY as u64)
         );
         assert_eq!(MAX_PER_RUN, 1000);
-        assert_eq!(SLEEP_BETWEEN_DELETES, Duration::from_millis(10));
+        assert_eq!(CHUNK_CAP, 50);
+        assert_eq!(SLEEP_BETWEEN_CHUNKS, Duration::from_millis(10));
     }
 
     /// Adapter whose `run_sweep` always errors — exercises the `Err`
     /// arm of the [`spawn`] loop's `match` (the `tracing::warn!` path).
     struct ErrAdapter;
     impl SweepAdapter for ErrAdapter {
-        fn run_sweep(&self, _now_unix: i64) -> anyhow::Result<usize> {
+        fn run_sweep_chunk(&self, _now_unix: i64, _chunk_cap: usize) -> anyhow::Result<usize> {
             anyhow::bail!("synthetic sweep failure")
         }
     }
 
-    /// Adapter that reports a deletion count so the `Ok(n)` info-log arm
-    /// of the loop fires, and counts how many times the loop ticked so
-    /// the test can prove the spawned task actually ran the body.
+    /// Adapter that reports a deletion count so the `Ok(n)` aggregate
+    /// info-log fires, and counts how many chunk calls the loop made so
+    /// the test can prove the spawned task actually ran the body. Each
+    /// chunk returns `< CHUNK_CAP` so the inner chunk loop breaks after
+    /// one chunk per tick (no inter-chunk sleep on these ticks).
     struct CountingAdapter {
         calls: std::sync::atomic::AtomicUsize,
     }
     impl SweepAdapter for CountingAdapter {
-        fn run_sweep(&self, _now_unix: i64) -> anyhow::Result<usize> {
-            // Report a non-zero deletion on the first tick (Ok(n) arm),
-            // zero thereafter (Ok(0) arm) — both loop arms get covered.
+        fn run_sweep_chunk(&self, _now_unix: i64, _chunk_cap: usize) -> anyhow::Result<usize> {
+            // Report a non-zero deletion on the first tick (aggregate
+            // Ok(n) info-log arm), zero thereafter (silent arm).
             let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(usize::from(n == 0))
         }
     }
 
     /// Drive the real [`spawn`] tokio loop with a sub-millisecond
-    /// interval so the loop body (sleep → lock → run_sweep → match arms)
-    /// executes several times, then abort the handle. Covers the
-    /// `Ok(0)`, `Ok(n)`, and loop-cadence lines.
+    /// interval so the loop body (sleep → lock → run_sweep_chunk →
+    /// match arms) executes several times, then abort the handle.
+    /// Covers the zero, non-zero, and loop-cadence lines.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn spawn_loop_drives_run_sweep_across_arms() {
         let adapter = Arc::new(Mutex::new(CountingAdapter {
@@ -219,8 +282,7 @@ mod tests {
 
     /// The production blanket `impl SweepAdapter for (Connection, …)`
     /// tuple delegates to [`sweep_expired`]. Drive it end-to-end so the
-    /// blanket impl body (lines 95-97) is covered, not just the test
-    /// `ConnAdapter`.
+    /// blanket impl body is covered, not just the test `ConnAdapter`.
     #[test]
     fn production_tuple_adapter_runs_sweep_expired() {
         let conn = crate::storage::open(std::path::Path::new(":memory:")).unwrap();
@@ -237,8 +299,95 @@ mod tests {
             true,
         );
         // Before expiry: nothing removed.
-        assert_eq!(tuple.run_sweep(r.stored_at).unwrap(), 0);
+        assert_eq!(tuple.run_sweep_chunk(r.stored_at, MAX_PER_RUN).unwrap(), 0);
         // After expiry: the row is swept.
-        assert_eq!(tuple.run_sweep(r.stored_at + 60).unwrap(), 1);
+        assert_eq!(
+            tuple
+                .run_sweep_chunk(r.stored_at + 60, MAX_PER_RUN)
+                .unwrap(),
+            1
+        );
+    }
+
+    /// Adapter that always reports a FULL chunk so [`spawn`]'s inner
+    /// chunk loop keeps going (multiple chunks + inter-chunk sleeps)
+    /// until the cumulative `MAX_PER_RUN` cap — modelling a large
+    /// backlog. The chunk counter lives in a shared `Arc<AtomicUsize>`
+    /// so the test can observe sweep progress WITHOUT taking the mutex
+    /// under test. Used by the lock-release regression below.
+    struct FullChunkAdapter {
+        chunks: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl SweepAdapter for FullChunkAdapter {
+        fn run_sweep_chunk(&self, _now_unix: i64, chunk_cap: usize) -> anyhow::Result<usize> {
+            self.chunks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Full chunk (== chunk_cap) ⇒ the loop does NOT treat the
+            // backlog as drained and proceeds to an inter-chunk sleep.
+            Ok(chunk_cap)
+        }
+    }
+
+    /// #2359 regression: the shared `Db` mutex MUST NOT be held across
+    /// the inter-chunk pacing sleep. With paused time we drive the
+    /// [`spawn`] loop until it has run its FIRST chunk and parked at
+    /// the FIRST inter-chunk sleep (the sweep is mid-pass — a large
+    /// backlog with `MAX_PER_RUN / CHUNK_CAP` chunks still pending),
+    /// then prove a contender can acquire the lock WITHOUT advancing
+    /// the clock past that sleep — i.e. the lock is free DURING the
+    /// sleep. Under the pre-#2359 hold-across-the-whole-pass posture
+    /// the lock would stay held for every remaining chunk + sleep of
+    /// the pass, so this acquisition would block.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn lock_released_between_chunks_2359() {
+        let chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = Arc::new(Mutex::new(FullChunkAdapter {
+            chunks: Arc::clone(&chunks),
+        }));
+        // interval (1ms) ≪ SLEEP_BETWEEN_CHUNKS (10ms), and the drive
+        // loop below advances at most 8ms of virtual time — strictly
+        // less than one inter-chunk sleep — so we observe the sweep
+        // parked at its FIRST inter-chunk sleep and never let a second
+        // chunk run.
+        let handle = spawn(Arc::clone(&state), Duration::from_millis(1));
+
+        // Let the spawned task register its interval timer, then step
+        // the clock 1ms at a time until exactly one chunk has run. At
+        // that point the sweep has released the lock and is parked at
+        // the first inter-chunk sleep.
+        tokio::task::yield_now().await;
+        for _ in 0..8 {
+            if chunks.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+        }
+        let before = chunks.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            before, 1,
+            "sweep should have run exactly one chunk and parked at the inter-chunk sleep"
+        );
+
+        // The sweep is parked at the inter-chunk sleep with the lock
+        // dropped — a contender must acquire it immediately, WITHOUT
+        // us advancing past the 10ms sleep to drain the pass.
+        {
+            let contended = state.try_lock();
+            assert!(
+                contended.is_ok(),
+                "Db mutex must be free during the inter-chunk sleep (#2359)"
+            );
+        }
+        // And no further chunk ran while we probed — the sweep is
+        // genuinely parked at the sleep, not spinning under the lock.
+        assert_eq!(
+            chunks.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "sweep must stay parked at the inter-chunk sleep during the lock probe"
+        );
+
+        handle.abort();
+        let _ = handle.await;
     }
 }

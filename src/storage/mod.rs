@@ -1197,6 +1197,16 @@ fn insert_inner(conn: &Connection, mem: &Memory, stamp_local_clock: bool) -> Res
     // `validate::canonicalize_valid_time`.
     let valid_from_canon = crate::validate::canonical_valid_time_opt(mem.valid_from.as_deref());
     let valid_until_canon = crate::validate::canonical_valid_time_opt(mem.valid_until.as_deref());
+    // v1.0.0 #2332 (FBL-02) — canonicalize `expires_at` at the SAME funnel
+    // the v86 #1834 work canonicalized valid_from/valid_until: every expiry
+    // consumer (GC reap, recall/list visibility, the #1596 touch/fold MAX()
+    // floors) compares this TEXT column lexicographically against a
+    // UTC-rendered `now`, and a caller-supplied non-UTC offset rendering
+    // orders wrongly as bytes (premature reap / over-retention / a voided
+    // extension floor). Unparseable values pass through byte-for-byte
+    // (fail-safe — the validation gates already admitted them).
+    let effective_expires = mem.effective_expires_at();
+    let expires_canon = crate::validate::canonical_valid_time_opt(effective_expires.as_deref());
     // #1579 B6 — `insert` is the hottest write statement in the
     // substrate (every store / upsert / capture-turn / federation push
     // lands here). `prepare_cached` skips the re-parse of this ~60-line
@@ -1336,7 +1346,7 @@ fn insert_inner(conn: &Connection, mem: &Memory, stamp_local_clock: bool) -> Res
             mem.created_at,
             mem.updated_at,
             mem.last_accessed_at,
-            mem.effective_expires_at(),
+            expires_canon,
             metadata_json,
             mem.reflection_depth,
             mem.memory_kind.as_str(),
@@ -1806,7 +1816,10 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
                 params![
                     mem.id, mem.tier.as_str(), mem.namespace, mem.title, content_to_store,
                     tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
-                    mem.created_at, mem.updated_at, mem.last_accessed_at, mem.effective_expires_at(),
+                    mem.created_at, mem.updated_at, mem.last_accessed_at,
+                    // v1.0.0 #2332 (FBL-02) — canonical fixed-UTC expiry
+                    // rendering (the v86 valid_* precedent below).
+                    crate::validate::canonical_valid_time_opt(mem.effective_expires_at().as_deref()),
                     metadata_json, mem.reflection_depth, mem.memory_kind.as_str(),
                     mem.entity_id, mem.persona_version,
                     citations_json, mem.source_uri, source_span_json,
@@ -1983,10 +1996,12 @@ pub fn touch(conn: &Connection, id: &str, short_extend: i64, mid_extend: i64) ->
             params![now_str, id, PROMOTION_THRESHOLD],
         )?;
 
+        // v1.0.0 #2339 (FBL-34) — access-driven bumps stop at the named
+        // ceiling; rows already above it (operator band 8-10) are untouched.
         conn.execute(
-            "UPDATE memories SET priority = MIN(priority + 1, 10)
-             WHERE id = ?1 AND access_count > 0 AND access_count % 10 = 0 AND priority < 10",
-            params![id],
+            "UPDATE memories SET priority = MIN(priority + 1, ?2)
+             WHERE id = ?1 AND access_count > 0 AND access_count % 10 = 0 AND priority < ?2",
+            params![id, crate::models::ACCESS_PRIORITY_CEILING],
         )?;
 
         Ok(())
@@ -2087,14 +2102,16 @@ pub fn touch_many(
             "UPDATE memories SET tier = 'long', expires_at = NULL, updated_at = ?1
              WHERE id = ?2 AND tier = 'mid' AND access_count >= ?3",
         )?;
+        // v1.0.0 #2339 (FBL-34) — access-driven bumps stop at the named
+        // ceiling; rows already above it (operator band 8-10) are untouched.
         let mut priority_stmt = conn.prepare_cached(
-            "UPDATE memories SET priority = MIN(priority + 1, 10)
-             WHERE id = ?1 AND access_count > 0 AND access_count % 10 = 0 AND priority < 10",
+            "UPDATE memories SET priority = MIN(priority + 1, ?2)
+             WHERE id = ?1 AND access_count > 0 AND access_count % 10 = 0 AND priority < ?2",
         )?;
         for id in ids {
             bump_stmt.execute(params![now_str, short_expires, mid_expires, id])?;
             promote_stmt.execute(params![now_str, id, PROMOTION_THRESHOLD])?;
-            priority_stmt.execute(params![id])?;
+            priority_stmt.execute(params![id, crate::models::ACCESS_PRIORITY_CEILING])?;
         }
         Ok(())
     })();
@@ -2214,11 +2231,16 @@ pub fn fold_recall_accesses(
             // maintenance verb applying metadata-only access
             // bookkeeping (the same sanction class as the legacy
             // touch); they never rewrite memory content.
-            let mut bump_stmt = conn.prepare_cached(
+            // v1.0.0 #2339 (FBL-34) — the fold's decade bump stops at the
+            // named ceiling; rows already above it (operator band 8-10)
+            // keep their priority byte-identical.
+            let mut bump_stmt = conn.prepare_cached(&format!(
                 "UPDATE memories SET
                     access_count = MIN(access_count + ?1, 1000000),
-                    priority = MIN(priority
-                        + (MIN(access_count + ?1, 1000000) / 10 - access_count / 10), 10),
+                    priority = CASE WHEN priority >= {ceiling} THEN priority
+                        ELSE MIN(priority
+                            + (MIN(access_count + ?1, 1000000) / 10 - access_count / 10),
+                            {ceiling}) END,
                     last_accessed_at = CASE
                         WHEN last_accessed_at IS NULL OR last_accessed_at < ?2 THEN ?2
                         ELSE last_accessed_at
@@ -2230,7 +2252,8 @@ pub fn fold_recall_accesses(
                         ELSE expires_at
                     END
                  WHERE id = ?5",
-            )?;
+                ceiling = crate::models::ACCESS_PRIORITY_CEILING,
+            ))?;
             let mut promote_stmt = conn.prepare_cached(
                 "UPDATE memories SET tier = 'long', expires_at = NULL, updated_at = ?1
                  WHERE id = ?2 AND tier = 'mid' AND access_count >= ?3",
@@ -2547,6 +2570,31 @@ pub fn update_with_expected_version(
         Some(v) => Some(v),
         None => existing.expires_at.as_deref(),
     };
+    // v1.0.0 #2331 (FBL-01) — the #1626 tier→long ⇒ expires_at = NULL
+    // coupling, sqlite parity with BOTH postgres update funnels
+    // (`update_with_expected_version_once` + the trait `update`) and with
+    // this file's own insert ON CONFLICT arm / fold auto-promote / both
+    // promote surfaces. When the EFFECTIVE tier is Long the merged expiry
+    // is forced NULL — overriding a caller-supplied patch value AND the
+    // existing row's stale short/mid TTL — because the GC reap predicate
+    // is tier-blind (`expires_at IS NOT NULL AND expires_at < now`), so a
+    // leftover TTL on a promoted "permanent" row would archive it (or
+    // hard-delete + crypto-erase it under archive_on_gc=false) at the
+    // stale deadline. Silent destruction of a documented-permanent row is
+    // a direct North-Star data-integrity violation.
+    let expires_at = if matches!(*effective_tier, Tier::Long) {
+        None
+    } else {
+        expires_at
+    };
+    // v1.0.0 #2332 (FBL-02) — canonicalize the merged expiry (caller patch
+    // OR carried-forward stored value) to the fixed-UTC v86 rendering so
+    // the lexicographic expiry predicates (GC / recall / touch-fold MAX
+    // floors) compare chronologically. Unparseable values pass through
+    // byte-for-byte (fail-safe). Also heals a legacy offset rendering on
+    // the existing row the first time the row is patched.
+    let expires_canon = crate::validate::canonical_valid_time_opt(expires_at);
+    let expires_at = expires_canon.as_deref();
     // #2060 — TRACT covenant clause 2: authorship-immutability gate.
     // Consult BEFORE the shadow below so we see the caller's RAW patch
     // metadata (not whatever an upstream `preserve_provenance_keys` call
@@ -2901,6 +2949,16 @@ pub fn update_with_archive_on_supersede(
         Some("" | "null") => None,
         Some(v) => Some(v.to_string()),
         None => existing.expires_at.clone(),
+    };
+    // v1.0.0 #2331 (FBL-01) — same #1626 tier→long ⇒ expires_at = NULL
+    // coupling as `update_with_expected_version`: the superseding row is a
+    // FRESH id (the insert ON CONFLICT long⇒NULL arm never fires for it),
+    // so a mid→long supersede would otherwise inherit the OLD row's live
+    // TTL and the tier-blind GC would reap the new "permanent" row.
+    let new_expires = if matches!(new_tier, Tier::Long) {
+        None
+    } else {
+        new_expires
     };
     // v0.7.0 Provenance Gap 2 (#906) — caller-supplied source_uri
     // wins; otherwise inherit from the OLD row. Mirrors the pattern
@@ -3360,7 +3418,7 @@ pub(crate) fn archive_memory_no_tx(
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
-              mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
+              mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, ?1, ?2, metadata,
@@ -3368,7 +3426,7 @@ pub(crate) fn archive_memory_no_tx(
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
              FROM memories WHERE id = ?3",
             params![now, reason, id],
         )?;
@@ -3447,7 +3505,7 @@ pub(crate) fn archive_memory_insert_only(conn: &Connection, id: &str, reason: &s
           reflection_depth, atomised_into, atom_of, memory_kind,
           entity_id, persona_version, citations, source_uri, source_span,
           confidence_source, confidence_signals, confidence_decayed_at,
-          mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
+          mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
          SELECT id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
                 expires_at, ?1, ?2, metadata,
@@ -3455,7 +3513,7 @@ pub(crate) fn archive_memory_insert_only(conn: &Connection, id: &str, reason: &s
                 reflection_depth, atomised_into, atom_of, memory_kind,
                 entity_id, persona_version, citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
-                mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
          FROM memories WHERE id = ?3",
         params![now, reason, id],
     )?;
@@ -3805,7 +3863,7 @@ pub fn archive_memory_for_caller(
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
-              mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
+              mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, ?1, ?2, metadata,
@@ -3813,7 +3871,7 @@ pub fn archive_memory_for_caller(
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
              FROM memories WHERE id = ?3",
             params![now, reason, id],
         )?;
@@ -4574,7 +4632,7 @@ pub fn forget(
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
-                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?4, 'forget', metadata,
@@ -4582,7 +4640,7 @@ pub fn forget(
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
-                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                      FROM memories WHERE rowid IN (
                         SELECT m.rowid FROM memories_fts fts
                         JOIN memories m ON m.rowid = fts.rowid
@@ -4603,7 +4661,7 @@ pub fn forget(
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
-                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?3, 'forget', metadata,
@@ -4611,7 +4669,7 @@ pub fn forget(
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
-                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                      FROM memories WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)",
                     params![namespace, tier_str, now],
                 )?;
@@ -5036,7 +5094,7 @@ pub fn forget_for_caller(
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
-                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?4, 'forget', metadata,
@@ -5044,7 +5102,7 @@ pub fn forget_for_caller(
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
-                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                      FROM memories WHERE rowid IN (
                         SELECT m.rowid FROM memories_fts fts
                         JOIN memories m ON m.rowid = fts.rowid
@@ -5068,7 +5126,7 @@ pub fn forget_for_caller(
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
-                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?3, 'forget', metadata,
@@ -5076,7 +5134,7 @@ pub fn forget_for_caller(
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
-                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                      FROM memories WHERE (?1 IS NULL OR namespace = ?1)
                        AND (?2 IS NULL OR tier = ?2)
                        AND (json_extract(metadata,'$.agent_id') = ?4
@@ -5482,16 +5540,21 @@ pub fn search_with_source_uri(
            {source_uri_fragment}
            {vis}
            {lifecycle_vis}
-         ORDER BY (fts.rank * -1)
+         ORDER BY ((fts.rank * -1)
            + (m.priority * 0.5)
            + (MIN(m.access_count, 50) * 0.1)
            + (m.confidence * 2.0)
-           + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1))
+           + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1)))
+           -- v1.0.0 #2338 (FBL-33) — G7 soft-loser down-weight (see recall).
+           * (CASE WHEN json_extract(m.metadata, '$.contradiction_soft_loser') = 1
+                   THEN {soft_loser_factor} ELSE 1.0 END)
            DESC
          LIMIT ?9",
         vis = visibility_clause(11, 15, "m"),
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
         lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
+        // v1.0.0 #2338 (FBL-33) — G7 soft-loser down-weight factor.
+        soft_loser_factor = SOFT_LOSER_SCORE_FACTOR,
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = if let Some(uri) = source_uri {
@@ -5970,6 +6033,16 @@ pub fn recall_with_telemetry(
     Ok((results, outcome, telemetry))
 }
 
+/// v1.0.0 #2338 (FBL-33) — multiplicative recall-score penalty for a
+/// contradiction-conserved SOFT LOSER (the G7 #1824 marker
+/// `metadata.contradiction_soft_loser`, written by
+/// [`conserve_contradiction`]). The marker's own contract ("recall
+/// ranking may consult it") had ZERO ranking consumers, so an
+/// LLM-confirmed-contradicted long-tier row kept outranking its fresh
+/// winner at full score. Reversible + node-local exactly like the marker
+/// itself: clearing the marker (the G7 rollback) restores full rank.
+pub const SOFT_LOSER_SCORE_FACTOR: f64 = 0.5;
+
 pub fn recall(
     conn: &Connection,
     context: &str,
@@ -6064,12 +6137,18 @@ pub fn recall(
                 -- `score` column is read by name (not positionally) so this
                 -- insertion is safe.
                 m.encrypted_envelope,
-                (fts.rank * -1)
+                ((fts.rank * -1)
                 + (m.priority * 0.5)
                 + (MIN(m.access_count, 50) * 0.1)
                 + (m.confidence * 2.0)
                 + (CASE m.tier WHEN 'long' THEN 3.0 WHEN 'mid' THEN 1.0 ELSE 0.0 END)
-                + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1))
+                + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1)))
+                -- v1.0.0 #2338 (FBL-33) — the promised G7 soft down-weight:
+                -- a contradiction-conserved loser is multiplicatively
+                -- penalized so it can no longer outrank its winner at full
+                -- score (reversible — clearing the marker restores rank).
+                * (CASE WHEN json_extract(m.metadata, '$.contradiction_soft_loser') = 1
+                        THEN {soft_loser_factor} ELSE 1.0 END)
                 AS score
          FROM memories_fts fts
          JOIN memories m ON m.rowid = fts.rowid
@@ -6097,6 +6176,8 @@ pub fn recall(
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list: hides
         // Tombstoned/Quarantined (and any unknown state) from recall.
         lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
+        // v1.0.0 #2338 (FBL-33) — G7 soft-loser down-weight factor.
+        soft_loser_factor = SOFT_LOSER_SCORE_FACTOR,
     );
     let mut stmt = conn.prepare(&sql)?;
     // Bind ?13 only when the source-URI fragment is active; SQLite
@@ -11337,6 +11418,29 @@ pub fn append_recovery(
 pub fn stats(conn: &Connection, db_path: &Path) -> Result<Stats> {
     let total: usize = conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))?;
 
+    // v1.0.0 #2334 (FBL-15) — reconcile the three 'total' predicates: boot
+    // counts LIVE (non-expired) rows, export filters expiry + lifecycle,
+    // while `total` above is the raw physical count. Surface the LIVE
+    // count (expiry + the fail-closed lifecycle allow-list — the
+    // boot/export definition) and the expired-awaiting-GC remainder so
+    // agents reconciling boot vs stats stop seeing phantom rows.
+    let now_live = Utc::now().to_rfc3339();
+    let live: usize = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM memories \
+             WHERE (expires_at IS NULL OR expires_at > ?1) {}",
+            crate::models::lifecycle_visible_clause("")
+        ),
+        params![now_live],
+        |r| r.get(0),
+    )?;
+    let expired_pending_gc: usize = conn.query_row(
+        "SELECT COUNT(*) FROM memories \
+         WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+        params![now_live],
+        |r| r.get(0),
+    )?;
+
     let mut stmt =
         conn.prepare("SELECT tier, COUNT(*) FROM memories GROUP BY tier ORDER BY COUNT(*) DESC")?;
     let by_tier = stmt
@@ -11383,6 +11487,8 @@ pub fn stats(conn: &Connection, db_path: &Path) -> Result<Stats> {
 
     Ok(Stats {
         total,
+        live,
+        expired_pending_gc,
         by_tier,
         by_namespace,
         expiring_soon,
@@ -11475,6 +11581,18 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
     if let Err(e) = fold_recall_accesses(conn, crate::SECS_PER_HOUR, crate::SECS_PER_DAY) {
         tracing::warn!("recall-access fold failed (pre-gc): {e}");
     }
+    // #2358 — prune the `recall_observations` ledger from THIS chokepoint
+    // too, not only the serve daemon's dedicated gc loop
+    // (`spawn_gc_loop_with_shadow_retention_tracked`). MCP-stdio and
+    // CLI-only topologies never run that background loop, so without this
+    // call the ledger grows unbounded off the serve daemon, making the
+    // documented `AI_MEMORY_OBSERVATIONS_TTL_DAYS` contract false on those
+    // topologies. Best-effort (WARN, never abort the sweep): a failed
+    // prune degrades to "ledger grows one more sweep", never corrupts —
+    // mirrors the fold-before-gc posture immediately above.
+    if let Err(e) = crate::observations::gc::prune(conn) {
+        tracing::warn!("recall_observations prune failed (in gc): {e}");
+    }
     let now = Utc::now().to_rfc3339();
     // #1579 B6 (F5.7) — bounded-lock-hold chunked sweep. Each loop
     // iteration archives + deletes at most GC_CHUNK_ROWS expired rows
@@ -11501,7 +11619,7 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
-                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?1, 'ttl_expired', metadata,
@@ -11509,7 +11627,7 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
-                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                      FROM memories
                      WHERE id IN ({SQL_GC_EXPIRED_CHUNK_IDS})"
                 ))?;
@@ -12021,7 +12139,7 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
               mentioned_entity_id, version, lifecycle_state, encrypted_envelope,
-              cid, cid_genesis, valid_from, valid_until)
+              kind_provenance, cid, cid_genesis, valid_from, valid_until)
              SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                     tags, priority, confidence, source, access_count, created_at,
                     ?1, last_accessed_at, original_expires_at, metadata,
@@ -12055,6 +12173,22 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
                     COALESCE(version, 1),
                     COALESCE(lifecycle_state, 'open'),
                     encrypted_envelope,
+                    -- v1.0.0 #2333 (FBL-03) — carry the v79 kind_provenance
+                    -- denormalized column through the round-trip; legacy
+                    -- pre-v87 archive rows (column NULL) re-derive it from
+                    -- the metadata carrier, vocab-guarded to the closed
+                    -- #1945 set (the import-funnel re-denorm precedent).
+                    COALESCE(kind_provenance,
+                             -- json_valid guard: a corrupt (non-JSON)
+                             -- archived metadata blob must not abort the
+                             -- restore (json_extract raises on malformed
+                             -- JSON; the legacy restore path tolerates it).
+                             CASE WHEN json_valid(metadata) THEN
+                                  CASE WHEN json_extract(metadata, '$.kind_provenance')
+                                            IN ('declared', 'channel_derived', 'regex', 'llm')
+                                       THEN json_extract(metadata, '$.kind_provenance')
+                                  END
+                             END),
                     ?3, ?4,
                     valid_from, valid_until
              FROM archived_memories WHERE id = ?2",
@@ -12224,7 +12358,7 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
               mentioned_entity_id, version, lifecycle_state, encrypted_envelope,
-              cid, cid_genesis, valid_from, valid_until)
+              kind_provenance, cid, cid_genesis, valid_from, valid_until)
              SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                     tags, priority, confidence, source, access_count, created_at,
                     ?1, last_accessed_at, original_expires_at, metadata,
@@ -12258,6 +12392,22 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
                     COALESCE(version, 1),
                     COALESCE(lifecycle_state, 'open'),
                     encrypted_envelope,
+                    -- v1.0.0 #2333 (FBL-03) — carry the v79 kind_provenance
+                    -- denormalized column through the round-trip; legacy
+                    -- pre-v87 archive rows (column NULL) re-derive it from
+                    -- the metadata carrier, vocab-guarded to the closed
+                    -- #1945 set (the import-funnel re-denorm precedent).
+                    COALESCE(kind_provenance,
+                             -- json_valid guard: a corrupt (non-JSON)
+                             -- archived metadata blob must not abort the
+                             -- restore (json_extract raises on malformed
+                             -- JSON; the legacy restore path tolerates it).
+                             CASE WHEN json_valid(metadata) THEN
+                                  CASE WHEN json_extract(metadata, '$.kind_provenance')
+                                            IN ('declared', 'channel_derived', 'regex', 'llm')
+                                       THEN json_extract(metadata, '$.kind_provenance')
+                                  END
+                             END),
                     ?3, ?4,
                     valid_from, valid_until
              FROM archived_memories WHERE id = ?2",
@@ -12708,8 +12858,8 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // once per pulled row; `prepare_cached` amortises the parse of the
     // largest SQL statement in the file across the whole batch.
     let mut newer_wins_stmt = conn.prepare_cached(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version, lifecycle_state, encrypted_envelope, cid, cid_genesis, valid_from, valid_until)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version, lifecycle_state, encrypted_envelope, cid, cid_genesis, valid_from, valid_until, kind_provenance)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)
          ON CONFLICT(title, namespace) DO UPDATE SET
             -- v0.9.0 G8 (#1825) — a federation merge NEVER overwrites the
             -- surviving local row's genesis content-id: keep the local
@@ -12742,8 +12892,25 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
                         ELSE memories.tier END,
             updated_at = MAX(memories.updated_at, excluded.updated_at),
             access_count = MAX(memories.access_count, excluded.access_count),
+            -- v1.0.0 #2335 (FBL-20) — expires_at was the ONLY LWW-class
+            -- column with NO newer-wins guard: the bare
+            -- COALESCE(excluded.expires_at, memories.expires_at) adopted a
+            -- STALE losing peer's expiry verbatim, silently shortening a
+            -- live row's TTL (recall fold-extensions raise expires_at
+            -- WITHOUT bumping updated_at, so routine bidirectional sync
+            -- rolled local extensions back and GC reaped early — with the
+            -- v70 auto-eviction posture that is permanent link-edge loss).
+            -- The merge is now the extension-FLOOR lattice join (scalar
+            -- MAX, both operands funnel-canonicalized per #2332 so byte
+            -- order is chronological): both replicas converge to the LATER
+            -- expiry regardless of push order (MAX is commutative /
+            -- idempotent — a true CRDT join, strictly stronger than the
+            -- updated_at tiebreak for this column), and the #1596
+            -- never-move-expiry-earlier contract holds across federation.
+            -- The long⇒NULL arm keeps the #1626 immortality coupling.
             expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
-                              ELSE COALESCE(excluded.expires_at, memories.expires_at) END,
+                              ELSE MAX(COALESCE(excluded.expires_at, memories.expires_at),
+                                       COALESCE(memories.expires_at, excluded.expires_at)) END,
             -- #1784 — preserve immutable provenance keys (agent_id + the
             -- consolidation derived_from / consolidated_from_agents arrays)
             -- across a newer-wins merge: json_patch overlays the existing
@@ -12826,6 +12993,10 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             lifecycle_state = CASE WHEN excluded.updated_at > memories.updated_at
                                         OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
                                    THEN excluded.lifecycle_state ELSE memories.lifecycle_state END,
+            -- v1.0.0 #2333 (FBL-03) — stamp/merge the v79 denormalized
+            -- kind_provenance on the federation funnel (pg 13949 parity:
+            -- COALESCE keeps the local value when the peer carries none).
+            kind_provenance = COALESCE(excluded.kind_provenance, memories.kind_provenance),
             -- v1.0.0 #1834 — claim-bitemporal validity under federation LWW.
             -- `valid_from` is immutable (local genesis wins, like `cid`);
             -- `valid_until` follows the newer-wins tiebreak so a peer that
@@ -12851,7 +13022,11 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             mem.created_at,
             mem.updated_at,
             mem.last_accessed_at,
-            mem.effective_expires_at(),
+            // v1.0.0 #2332 (FBL-02) — canonical fixed-UTC expiry rendering at
+            // the federation-receive funnel too (the v86 valid_* precedent
+            // below): a peer's offset rendering must never mis-order against
+            // the local GC / recall / floor predicates.
+            crate::validate::canonical_valid_time_opt(mem.effective_expires_at().as_deref()),
             metadata_json,
             mem.reflection_depth,
             mem.memory_kind.as_str(),
@@ -12874,6 +13049,9 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             // rendering can never mis-order against a local `+00:00` row.
             crate::validate::canonical_valid_time_opt(mem.valid_from.as_deref()),
             crate::validate::canonical_valid_time_opt(mem.valid_until.as_deref()),
+            // v1.0.0 #2333 (FBL-03) — denormalize the v79 kind_provenance
+            // from the metadata carrier on the federation funnel (?34).
+            extract_kind_provenance(mem),
         ],
         |r| r.get(0),
     )?;
@@ -13109,7 +13287,9 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
             mem.created_at,
             mem.updated_at,
             mem.last_accessed_at,
-            mem.effective_expires_at(),
+            // v1.0.0 #2332 (FBL-02) — canonical fixed-UTC expiry rendering on
+            // the federation merge-writer path (v86 valid_* precedent).
+            crate::validate::canonical_valid_time_opt(mem.effective_expires_at().as_deref()),
             metadata_json,
             mem.reflection_depth,
             mem.memory_kind.as_str(),
@@ -13609,7 +13789,7 @@ pub fn get_unembedded_ids_batch_after(
     conn: &Connection,
     after_id: Option<&str>,
     limit: usize,
-) -> Result<Vec<(String, String, String)>> {
+) -> Result<EmbeddableScan> {
     // #1779 — pull encrypted_envelope + metadata so encrypted rows are
     // decrypted (or skipped) before embedding; see `resolve_embeddable_content`.
     let raw = if let Some(after) = after_id {
@@ -13627,7 +13807,7 @@ pub fn get_unembedded_ids_batch_after(
         let rows = stmt.query_map(params![limit], embeddable_row_mapper)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    Ok(resolve_embeddable_rows(raw))
+    Ok(resolve_embeddable_scan(raw))
 }
 
 /// #1779 — `query_map` row mapper for the embedding-fetch SELECTs that now
@@ -13648,13 +13828,50 @@ fn embeddable_row_mapper(row: &rusqlite::Row<'_>) -> rusqlite::Result<Embeddable
 /// encrypted-at-rest rows and SKIPPING (omitting) any whose envelope won't
 /// decrypt. See [`resolve_embeddable_content`].
 fn resolve_embeddable_rows(raw: Vec<EmbeddableRawRow>) -> Vec<(String, String, String)> {
-    let mut out: Vec<(String, String, String)> = Vec::with_capacity(raw.len());
+    resolve_embeddable_scan(raw).rows
+}
+
+/// v1.0.0 #2336 (FBL-24) — one page of an embedding scan, carrying the
+/// RAW-fetch cursor + the decrypt-skip count ALONGSIDE the resolved rows.
+///
+/// The #1779 decrypt-or-skip filter runs BEFORE the sweep callers used to
+/// compute their keyset cursor and their empty-chunk break, so a whole
+/// batch of undecryptable rows returned an EMPTY resolved chunk that the
+/// loops read as end-of-corpus — terminating the sweep early with a
+/// SUCCESS report and never scanning past the poison window (the exact
+/// #1595 starvation class the cursor fix closed), while decrypt-skips
+/// were absent from every outcome count. Callers now advance from
+/// [`EmbeddableScan::raw_last_id`], break only when the RAW fetch was
+/// empty, and fold [`EmbeddableScan::decrypt_skipped`] into their skip
+/// totals.
+#[derive(Debug, Default)]
+pub struct EmbeddableScan {
+    /// Decrypt-resolved `(id, title, plaintext)` triples, ready to embed.
+    pub rows: Vec<(String, String, String)>,
+    /// Last id of the RAW fetch (before the decrypt filter) — the keyset
+    /// cursor. `None` ⇔ the raw fetch was empty ⇔ end of corpus.
+    pub raw_last_id: Option<String>,
+    /// Rows omitted because their envelope failed to decrypt (#1779).
+    pub decrypt_skipped: usize,
+}
+
+/// #2336 — resolve a raw fetch into an [`EmbeddableScan`] (rows +
+/// raw-cursor + decrypt-skip count).
+fn resolve_embeddable_scan(raw: Vec<EmbeddableRawRow>) -> EmbeddableScan {
+    let raw_last_id = raw.last().map(|(id, ..)| id.clone());
+    let mut rows: Vec<(String, String, String)> = Vec::with_capacity(raw.len());
+    let mut decrypt_skipped = 0usize;
     for (id, title, content, envelope, metadata_json) in raw {
-        if let Some(resolved) = resolve_embeddable_content(&id, content, envelope, &metadata_json) {
-            out.push((id, title, resolved));
+        match resolve_embeddable_content(&id, content, envelope, &metadata_json) {
+            Some(resolved) => rows.push((id, title, resolved)),
+            None => decrypt_skipped += 1,
         }
     }
-    out
+    EmbeddableScan {
+        rows,
+        raw_last_id,
+        decrypt_skipped,
+    }
 }
 
 /// #1779 — resolve the embeddable plaintext for a backfill / reembed row.
@@ -13717,7 +13934,7 @@ pub fn get_memory_texts_batch(
     after_id: Option<&str>,
     limit: usize,
     exclude_space: Option<&str>,
-) -> Result<Vec<(String, String, String)>> {
+) -> Result<EmbeddableScan> {
     // #1779 — also pull `encrypted_envelope` + `metadata` so at-rest-encrypted
     // rows (where `content` holds the empty placeholder and the plaintext lives
     // in the envelope) are DECRYPTED before embedding. Embedding the
@@ -13756,7 +13973,7 @@ pub fn get_memory_texts_batch(
         binds.iter().map(std::convert::AsRef::as_ref).collect();
     let rows = stmt.query_map(bind_refs.as_slice(), embeddable_row_mapper)?;
     let raw = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(resolve_embeddable_rows(raw))
+    Ok(resolve_embeddable_scan(raw))
 }
 
 /// v1.0.0 #2167 §5/§7 — outcome of `reembed --stamp-only`, the explicit
@@ -15235,7 +15452,23 @@ fn blend_and_rank(
                     }
                 });
             let decay = scoring.decay_multiplier(&mem.tier, age_days);
-            (mem, blended * decay)
+            // v1.0.0 #2338 (FBL-33) — the promised G7 soft down-weight on
+            // the HYBRID lane, applied to the FUSED score so BOTH the
+            // keyword and semantic components are penalized (an SQL-side
+            // fts_score penalty alone would leave the loser fully ranked
+            // through the cosine half). Reversible: the G7 rollback clears
+            // the marker and full rank returns.
+            let soft_loser = mem
+                .metadata
+                .get(crate::models::field_names::CONTRADICTION_SOFT_LOSER)
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+            let penalty = if soft_loser {
+                SOFT_LOSER_SCORE_FACTOR
+            } else {
+                1.0
+            };
+            (mem, blended * decay * penalty)
         })
         .collect();
     // v0.9.0 P0-1 (#1869) — determinism. `scored` is a `HashMap`, so
@@ -18301,7 +18534,12 @@ mod tests {
     fn ttl_gap_secs(created_at: &str, expires_at: &str) -> i64 {
         let base = chrono::DateTime::parse_from_rfc3339(created_at).unwrap();
         let exp = chrono::DateTime::parse_from_rfc3339(expires_at).unwrap();
-        (exp - base).num_seconds()
+        // v1.0.0 #2332 (FBL-02) — the funnel canonicalizes the stored
+        // rendering to MICROsecond precision while `created_at` keeps
+        // nanoseconds, so round the gap to the nearest second instead of
+        // truncating (a sub-microsecond shortfall must not read as -1s).
+        let ms = (exp - base).num_milliseconds();
+        (ms + 500).div_euclid(1000)
     }
 
     #[test]
@@ -18347,7 +18585,13 @@ mod tests {
         mem.expires_at = Some(explicit.clone());
         let id = insert(&conn, &mem).unwrap();
         let got = get(&conn, &id).unwrap().unwrap();
-        assert_eq!(got.expires_at, Some(explicit));
+        // v1.0.0 #2332 (FBL-02) — the funnel canonicalizes the RENDERING to
+        // the fixed-UTC v86 form; the INSTANT is preserved exactly.
+        let stored = got.expires_at.expect("explicit expiry kept");
+        assert!(stored.ends_with('Z'), "canonical rendering, got {stored}");
+        let stored_dt = chrono::DateTime::parse_from_rfc3339(&stored).unwrap();
+        let explicit_dt = chrono::DateTime::parse_from_rfc3339(&explicit).unwrap();
+        assert_eq!(stored_dt.timestamp_micros(), explicit_dt.timestamp_micros());
     }
 
     #[test]
@@ -19071,9 +19315,17 @@ mod tests {
             Tier::Short.as_str(),
             "G5: restore must preserve the original tier"
         );
+        // v1.0.0 #2332 (FBL-02) — the insert funnel stored the canonical
+        // fixed-UTC rendering; the archive→restore round-trip preserves the
+        // INSTANT (compare at micro precision, not bytes).
+        let stored = chrono::DateTime::parse_from_rfc3339(
+            got.expires_at.as_deref().expect("expiry restored"),
+        )
+        .unwrap();
+        let original = chrono::DateTime::parse_from_rfc3339(&original_expiry).unwrap();
         assert_eq!(
-            got.expires_at,
-            Some(original_expiry),
+            stored.timestamp_micros(),
+            original.timestamp_micros(),
             "G5: restore must preserve the original expires_at"
         );
     }
@@ -20030,14 +20282,23 @@ mod tests {
         ids.sort();
 
         let first = get_unembedded_ids_batch_after(&conn, None, 2).unwrap();
-        assert_eq!(first.len(), 2);
-        assert_eq!(first[0].0, ids[0], "scan starts at the smallest id");
-        let cursor = first.last().unwrap().0.clone();
+        assert_eq!(first.rows.len(), 2);
+        assert_eq!(first.rows[0].0, ids[0], "scan starts at the smallest id");
+        // #2336 — the raw cursor equals the last resolved id when nothing
+        // was decrypt-skipped.
+        assert_eq!(
+            first.raw_last_id.as_deref(),
+            Some(first.rows.last().unwrap().0.as_str())
+        );
+        assert_eq!(first.decrypt_skipped, 0);
+        let cursor = first.rows.last().unwrap().0.clone();
 
         let rest = get_unembedded_ids_batch_after(&conn, Some(&cursor), 10).unwrap();
-        assert_eq!(rest.len(), 3);
+        assert_eq!(rest.rows.len(), 3);
         assert!(
-            rest.iter().all(|(id, _, _)| id.as_str() > cursor.as_str()),
+            rest.rows
+                .iter()
+                .all(|(id, _, _)| id.as_str() > cursor.as_str()),
             "every row must sort strictly after the cursor"
         );
 
@@ -20050,8 +20311,8 @@ mod tests {
         )
         .unwrap();
         let after = get_unembedded_ids_batch_after(&conn, None, 10).unwrap();
-        assert_eq!(after.len(), 4);
-        assert!(after.iter().all(|(id, _, _)| id != &ids[0]));
+        assert_eq!(after.rows.len(), 4);
+        assert!(after.rows.iter().all(|(id, _, _)| id != &ids[0]));
     }
 
     /// #1598 — the reembed full-corpus scan returns embedded AND
@@ -20088,18 +20349,22 @@ mod tests {
         .unwrap();
 
         let all = get_memory_texts_batch(&conn, None, None, 100, None).unwrap();
-        assert_eq!(all.len(), 5, "unfiltered scan sees every live row");
+        assert_eq!(all.rows.len(), 5, "unfiltered scan sees every live row");
 
         let ns_a = get_memory_texts_batch(&conn, Some("reembed-a"), None, 100, None).unwrap();
-        assert_eq!(ns_a.len(), 3);
-        assert_eq!(ns_a[0].0, ns_a_ids[0], "embedded row still scanned");
+        assert_eq!(ns_a.rows.len(), 3);
+        assert_eq!(ns_a.rows[0].0, ns_a_ids[0], "embedded row still scanned");
 
         let first = get_memory_texts_batch(&conn, Some("reembed-a"), None, 1, None).unwrap();
-        let cursor = first[0].0.clone();
+        let cursor = first.rows[0].0.clone();
         let rest =
             get_memory_texts_batch(&conn, Some("reembed-a"), Some(&cursor), 100, None).unwrap();
-        assert_eq!(rest.len(), 2);
-        assert!(rest.iter().all(|(id, _, _)| id.as_str() > cursor.as_str()));
+        assert_eq!(rest.rows.len(), 2);
+        assert!(
+            rest.rows
+                .iter()
+                .all(|(id, _, _)| id.as_str() > cursor.as_str())
+        );
     }
 
     /// #1598 — the reembed writer REPLACES vectors across a dim change

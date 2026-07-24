@@ -547,6 +547,11 @@ pub async fn get_stats(
                 }
                 Json(json!({
                     (field_names::TOTAL_MEMORIES): s.total,
+                    // v1.0.0 #2334 (FBL-15) — additive expiry-axis fields
+                    // (live = the boot/export definition;
+                    // expired_pending_gc = the awaiting-GC remainder).
+                    "live": s.live,
+                    "expired_pending_gc": s.expired_pending_gc,
                     "by_tier": by_tier_map,
                     (field_names::BY_NAMESPACE): by_namespace_map,
                     "expiring_soon": s.expiring_soon,
@@ -595,8 +600,10 @@ pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl Int
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         // v0.9.0 P0-1 (#1869) — fold-before-gc: this admin endpoint is
-        // the ONLY postgres eviction path, so the recall-access fold
-        // MUST run first or an unfolded TTL extension could be evicted
+        // one of the two postgres eviction paths (the other is
+        // spawn_postgres_maintenance_loop_if_enabled, FBL-22; #2362);
+        // BOTH must fold first, so the recall-access fold MUST run
+        // first here too or an unfolded TTL extension could be evicted
         // out from under a hot memory. Best-effort: a fold failure is
         // WARNed, never blocks the sweep.
         if let Err(e) = app.store.fold_recall_accesses().await {

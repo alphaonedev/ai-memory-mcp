@@ -2072,7 +2072,27 @@ pub struct RecallTelemetry {
 
 #[derive(Debug, Serialize)]
 pub struct Stats {
+    /// RAW physical row count (`COUNT(*)`), INCLUDING rows that are
+    /// expired-awaiting-GC and lifecycle-hidden (tombstoned/quarantined).
+    /// v1.0.0 #2334 (FBL-15): documented as the physical count; agents
+    /// reconciling against boot's `total_memories` (a LIVE count) should
+    /// read [`Stats::live`] instead — the two surfaces previously
+    /// disagreed silently on the expiry axis.
     pub total: usize,
+    /// v1.0.0 #2334 (FBL-15) — LIVE row count: non-expired
+    /// (`expires_at IS NULL OR expires_at > now`) AND lifecycle-visible
+    /// (the fail-closed [`lifecycle_visible_clause`] allow-list) — the
+    /// same definition the boot inventory and `export_all` use. Additive
+    /// wire field.
+    #[serde(default)]
+    pub live: usize,
+    /// v1.0.0 #2334 (FBL-15) — rows past their `expires_at` still awaiting
+    /// the next GC tick (up to 30 min in daemon topologies; indefinitely
+    /// in CLI-only topologies between manual `ai-memory gc` runs). The
+    /// expiry-axis remainder that made `total` and boot's live count
+    /// diverge. Additive wire field.
+    #[serde(default)]
+    pub expired_pending_gc: usize,
     pub by_tier: Vec<TierCount>,
     pub by_namespace: Vec<NamespaceCount>,
     pub expiring_soon: usize,

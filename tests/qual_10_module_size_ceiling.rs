@@ -374,7 +374,17 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // stable). After the fold onto the #2266/#2267 27_035 file the extract
     // lands mod.rs at 26_362; ceiling 26_450 (+88). Per the QUAL-10 shrink
     // rule: "when a file's LOC SHRINKS (a refactor split), the ceiling falls".
-    ("src/storage/mod.rs", 26_450),
+    // 2026-07-23 (STORAGE-CHAIN lane #2331-#2339) — bumped 26_450 →
+    // 26_750 by the fable-3x7 data-integrity fixes: the #1626 tier→long
+    // expiry coupling (#2331), expires_at rendering canonicalization at
+    // all five write funnels (#2332), the v87 archived kind_provenance
+    // carry through 8 archive + 2 restore column lists (#2333), the
+    // federation expiry extension-floor lattice join (#2335), stats
+    // live/expired_pending_gc (#2334), the EmbeddableScan raw-cursor
+    // struct (#2336), the G7 soft-loser recall penalty (#2338), and the
+    // access-priority ceiling on the touch/fold ladders (#2339).
+    // Measured 26_675; ceiling 26_750 (+75 headroom).
+    ("src/storage/mod.rs", 26_750),
     // 2026-07-21 (#1802 R-05 S1) — NEW submodule extracted from
     // storage/mod.rs (doctor / observability probes). Measured 698;
     // ceiling 800 (+102).
@@ -1298,7 +1308,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-17 (#2167 S1): the v84 embedding_space migration arm + SCHEMA
     // column doc land migrations.rs at 5_446; ceiling 5_450 (+4 headroom).
     // Additive ALTER-ADD-COLUMN migration only.
-    ("src/storage/migrations.rs", 5_650), /* 2026-07-19 #1834 pre-ship 3x7 v86 valid-time canonicalization arm + normalize_valid_time_rows helper (5_569); was 5_550 (2026-07-18 #2035 v85 arm, 5_491) */
+    ("src/storage/migrations.rs", 5_750), /* 2026-07-23 STORAGE-CHAIN #2333 v87 arm (archived kind_provenance + the #2332 normalize_expiry_rows heal), measured 5_671; was 5_650 (2026-07-19 #1834 v86 arm, 5_569) */
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.
