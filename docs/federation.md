@@ -198,7 +198,14 @@ independently — these are layered on top.
   attestation is persisted verbatim. Application is idempotent under a
   **first-resolution-wins** rule: a checkpoint already resolved locally
   with a *different* resolution is a per-item conflict (local kept,
-  counted `checkpoints_conflicted`), never a batch drop. The
+  counted `checkpoints_conflicted`), never a batch drop. That rule holds
+  **under concurrency** too
+  ([#2396](https://github.com/alphaonedev/ai-memory-mcp/issues/2396)):
+  the pending→resolved write is a compare-and-swap on `state`
+  (`… WHERE id = ? AND state = 'pending'`) and the no-local-row arm treats
+  a losing INSERT as the same disposition, so a concurrent local resolve
+  or second inbound resolution can never overwrite an already-committed
+  authority-lane verdict — the loser is reported as a conflict. The
   `EpochAdvance` epoch-freeze checkpoint rides this transport (ROADMAP
   §25.2). Decision function:
   [`src/federation/receive_auth.rs::authorize_remote_checkpoint_resolution`](../src/federation/receive_auth.rs);
