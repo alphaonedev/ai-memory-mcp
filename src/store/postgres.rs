@@ -20664,6 +20664,49 @@ impl MemoryStore for PostgresStore {
         Ok(reclaimed.len())
     }
 
+    async fn sweep_pending_action_timeouts(
+        &self,
+        default_secs: i64,
+    ) -> StoreResult<Vec<(String, String)>> {
+        use sqlx::Row;
+        // FBL-22 — backend twin of the sqlite `db::sweep_pending_action_timeouts`
+        // free fn. A non-positive global default disables the sweeper (operator
+        // escape hatch — parity with the sqlite guard). `RETURNING` makes the
+        // expired set EXACTLY the rows transitioned (atomic; no
+        // SELECT-then-UPDATE TOCTOU), so the daemon loop fans out one
+        // `pending_action_expired` event per returned (id, namespace). The
+        // `status='pending'` predicate re-checks under the UPDATE so a concurrent
+        // decide wins. `requested_at` is TIMESTAMPTZ (schema v21 columns
+        // `default_timeout_seconds` + `expired_at` exist for exactly this sweep).
+        if default_secs <= 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "UPDATE pending_actions
+                SET status = 'expired', expired_at = NOW()
+              WHERE status = 'pending'
+                AND requested_at
+                    + make_interval(secs => COALESCE(default_timeout_seconds, $1)::double precision)
+                    < NOW()
+            RETURNING id, namespace",
+        )
+        .bind(default_secs)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("sweep_pending_action_timeouts", e))?;
+        let mut expired: Vec<(String, String)> = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let id: String = r
+                .try_get("id")
+                .map_err(|e| to_store_err("sweep_pending_action_timeouts.id", e))?;
+            let namespace: String = r
+                .try_get("namespace")
+                .map_err(|e| to_store_err("sweep_pending_action_timeouts.namespace", e))?;
+            expired.push((id, namespace));
+        }
+        Ok(expired)
+    }
+
     async fn signal_send(
         &self,
         _ctx: &CallerContext,
@@ -28951,6 +28994,97 @@ mod tests {
         // Cleanup — cascade removes the lease row with the action.
         let _ = sqlx::query("DELETE FROM actions WHERE id = $1")
             .bind(&aid)
+            .execute(&store.pool)
+            .await;
+    }
+
+    /// FBL-22 — postgres `sweep_pending_action_timeouts` must flip a stale
+    /// `status='pending'` row (age past `COALESCE(default_timeout_seconds,
+    /// default_secs)`) to `status='expired'`, stamp `expired_at`, and RETURN its
+    /// `(id, namespace)` so the maintenance loop can fan out the
+    /// `pending_action_expired` event — while leaving a fresh pending row
+    /// untouched. Backend-parity twin of the sqlite free-fn tests in
+    /// `storage/mod.rs`. Skips cleanly without `AI_MEMORY_TEST_POSTGRES_URL`.
+    #[tokio::test]
+    async fn sweep_pending_action_timeouts_expires_stale_row_fbl22() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("pending-timeout-fbl22-{unique}");
+        let stale_id = format!("pending-stale-{unique}");
+        let fresh_id = format!("pending-fresh-{unique}");
+
+        // Stale row: requested 10 minutes ago with a 60s per-row timeout → a
+        // sweep candidate. Fresh row: requested NOW → must survive.
+        sqlx::query(
+            "INSERT INTO pending_actions
+                 (id, action_type, namespace, requested_by, requested_at, status,
+                  default_timeout_seconds)
+             VALUES ($1, 'store', $2, 'ai:sal-test', NOW() - interval '10 minutes',
+                     'pending', 60)",
+        )
+        .bind(&stale_id)
+        .bind(&ns)
+        .execute(&store.pool)
+        .await
+        .expect("insert stale pending row");
+        sqlx::query(
+            "INSERT INTO pending_actions
+                 (id, action_type, namespace, requested_by, requested_at, status,
+                  default_timeout_seconds)
+             VALUES ($1, 'store', $2, 'ai:sal-test', NOW(), 'pending', 60)",
+        )
+        .bind(&fresh_id)
+        .bind(&ns)
+        .execute(&store.pool)
+        .await
+        .expect("insert fresh pending row");
+
+        let expired = store
+            .sweep_pending_action_timeouts(crate::SECS_PER_DAY)
+            .await
+            .expect("sweep");
+        assert!(
+            expired.iter().any(|(id, n)| id == &stale_id && n == &ns),
+            "the stale pending row is returned as expired (got {expired:?})"
+        );
+        assert!(
+            !expired.iter().any(|(id, _)| id == &fresh_id),
+            "the fresh pending row is NOT swept"
+        );
+
+        let (stale_status, stale_expired_at): (String, Option<DateTime<Utc>>) =
+            sqlx::query_as("SELECT status, expired_at FROM pending_actions WHERE id = $1")
+                .bind(&stale_id)
+                .fetch_one(&store.pool)
+                .await
+                .expect("fetch stale row");
+        assert_eq!(stale_status, "expired", "stale row transitioned to expired");
+        assert!(
+            stale_expired_at.is_some(),
+            "expired_at stamped on the swept row"
+        );
+        let (fresh_status,): (String,) =
+            sqlx::query_as("SELECT status FROM pending_actions WHERE id = $1")
+                .bind(&fresh_id)
+                .fetch_one(&store.pool)
+                .await
+                .expect("fetch fresh row");
+        assert_eq!(fresh_status, "pending", "fresh row remains pending");
+
+        // A non-positive default disables the sweeper (operator escape hatch).
+        let none = store
+            .sweep_pending_action_timeouts(0)
+            .await
+            .expect("sweep disabled");
+        assert!(none.is_empty(), "non-positive default sweeps nothing");
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM pending_actions WHERE namespace = $1")
+            .bind(&ns)
             .execute(&store.pool)
             .await;
     }
