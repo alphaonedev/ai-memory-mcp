@@ -925,6 +925,72 @@ async fn sqlite_trait_update_bumps_version_1024() {
     );
 }
 
+/// FBL-12 residual (#2378) — sqlite reference companion to
+/// `postgres_side::pg_charge_update_growth_over_cap_returns_quota_exceeded_2378`
+/// (which is `#[ignore]`-gated on a live PG host, so it never actuates in
+/// CI). This half runs unconditionally and pins the sqlite trait impl's
+/// three cheap arms so the two backends demonstrably agree on the
+/// no-charge cases:
+///
+/// - an EMPTY owner charges nothing and returns `Ok(0)` — an update on a
+///   row with no resolvable owner has nobody to bill, and inventing a
+///   charge against `""` would corrupt an unrelated counter;
+/// - a shrink / no-op (`new_bytes <= old_bytes`) charges nothing — a
+///   caller cannot bank storage credit by shrinking a row;
+/// - a positive growth charges exactly `new_bytes - old_bytes`.
+#[cfg(feature = "sal")]
+#[tokio::test]
+async fn sqlite_charge_update_growth_no_charge_arms_2378() {
+    use ai_memory::store::MemoryStore;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = ai_memory::store::sqlite::SqliteStore::open(tmp.path().join("grow-2378.db"))
+        .expect("open SqliteStore");
+    let ctx = ai_memory::store::CallerContext::for_admin("parity-test-2378");
+    let ns = "parity-test";
+
+    // Empty owner → Ok(0), and no quota row is conjured for `""`.
+    let anon = store
+        .charge_update_growth(&ctx, "", ns, 0, 4096)
+        .await
+        .expect("empty owner is a no-op, not an error");
+    assert_eq!(anon, 0, "an ownerless update must charge nobody");
+
+    // Shrink / no-op → Ok(0).
+    let shrink = store
+        .charge_update_growth(&ctx, "sqlite-grow-2378", ns, 500, 100)
+        .await
+        .expect("shrink is a no-op");
+    assert_eq!(shrink, 0, "shrink/no-op must charge zero");
+    let equal = store
+        .charge_update_growth(&ctx, "sqlite-grow-2378", ns, 250, 250)
+        .await
+        .expect("equal bytes is a no-op");
+    assert_eq!(equal, 0, "an unchanged byte count must charge zero");
+
+    // Positive growth charges exactly the delta, and the counter agrees.
+    let delta = store
+        .charge_update_growth(&ctx, "sqlite-grow-2378", ns, 100, 250)
+        .await
+        .expect("within-cap growth charges");
+    assert_eq!(delta, 150, "growth charges exactly new_bytes - old_bytes");
+    let rows = store
+        .quota_status_list_ns(ns)
+        .await
+        .expect("quota_status_list_ns");
+    let row = rows
+        .iter()
+        .find(|r| r.agent_id == "sqlite-grow-2378")
+        .expect("charged agent has a quota row");
+    assert_eq!(
+        row.current_storage_bytes, 150,
+        "only the positive delta landed on the counter"
+    );
+    assert!(
+        !rows.iter().any(|r| r.agent_id.is_empty()),
+        "the empty-owner no-op must not create a quota row"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Postgres-side gate — compiles under `sal-postgres`; skipped on
 // `cargo test` by `#[ignore]` so this development node (which cannot

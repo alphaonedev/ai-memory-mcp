@@ -5404,6 +5404,205 @@ mod tests {
         );
     }
 
+    /// FBL-12 residual (#2378) — pins the trait-default contract for the
+    /// new `charge_update_growth` seam: an adapter that does NOT override
+    /// it MUST fail closed with `UnsupportedCapability` naming
+    /// CHARGE_UPDATE_GROWTH, never silently `Ok(0)`.
+    ///
+    /// A silent-zero default would be a data-integrity hole, not a
+    /// convenience: a substrate that has not wired storage-growth
+    /// accounting would accept unbounded in-place growth while its
+    /// `current_storage_bytes` counter stayed flat — exactly the
+    /// per-agent storage-cap bypass FBL-12 closed. Loud refusal is the
+    /// only safe default (degrade, never corrupt).
+    #[test]
+    fn default_charge_update_growth_returns_unsupported_capability_2378() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store = DefaultImplProbeStore;
+        let ctx = CallerContext::for_agent("test-agent");
+
+        let err = rt
+            .block_on(store.charge_update_growth(&ctx, "alice", "global", 100, 250))
+            .expect_err("default charge_update_growth must refuse, not silently allow");
+        assert!(
+            matches!(&err, StoreError::UnsupportedCapability { capability }
+                if capability == "CHARGE_UPDATE_GROWTH"),
+            "expected UnsupportedCapability{{CHARGE_UPDATE_GROWTH}}, got: {err}"
+        );
+
+        // A shrink-shaped call takes the SAME refusal path: the cheap
+        // `new_bytes <= old_bytes` / empty-owner short-circuits live in the
+        // ADAPTER impls, not in the trait default, so an unwired adapter
+        // cannot be coaxed into a silent success by shrinking or by an
+        // anonymous owner.
+        let shrink = rt
+            .block_on(store.charge_update_growth(&ctx, "alice", "global", 250, 100))
+            .expect_err("default refuses regardless of delta sign");
+        assert!(
+            matches!(&shrink, StoreError::UnsupportedCapability { capability }
+                if capability == "CHARGE_UPDATE_GROWTH"),
+            "shrink must not reach a silent Ok(0) on the default, got: {shrink}"
+        );
+        let anon = rt
+            .block_on(store.charge_update_growth(&ctx, "", "global", 0, 4096))
+            .expect_err("default refuses an empty owner too");
+        assert!(
+            matches!(&anon, StoreError::UnsupportedCapability { capability }
+                if capability == "CHARGE_UPDATE_GROWTH"),
+            "empty owner must not reach a silent Ok(0) on the default, got: {anon}"
+        );
+    }
+
+    /// Coverage-floor headroom companion to the probe above (#2378).
+    ///
+    /// `store/mod.rs` was clearing its 90% floor by 0.02pp before FBL-12
+    /// added the `charge_update_growth` default body — one 4-line default
+    /// arm was enough to trip the gate. Restoring that 0.02pp would leave
+    /// the next unrelated commit one line from the same trip, so this
+    /// probes the largest cluster of default arms that had NO test at all:
+    /// the Pillar-1 agent-coordination substrate (`action_*` DAG,
+    /// `lease_*` mutual exclusion, `signal_*` messaging).
+    ///
+    /// The contract it pins is a data-integrity one, not a coverage
+    /// artefact: every coordination primitive MUST fail closed with
+    /// `UnsupportedCapability` on an adapter that has not wired it. These
+    /// are the primitives fleets use to divide work — a default that
+    /// FABRICATED an answer would be worse than useless. `lease_acquire`
+    /// returning a synthetic lease would let two agents both believe they
+    /// hold exclusive rights to one action; `action_next` returning
+    /// `Ok(None)` would silently report "nothing to do" and stall a
+    /// fleet; `signal_ack` returning `Ok(true)` would mark a message
+    /// acknowledged that was never stored. Loud refusal lets the caller
+    /// degrade; a fabricated success corrupts coordination state.
+    #[test]
+    fn default_coordination_substrate_impls_fail_closed_2378() {
+        use crate::models::{ActionState, EdgeType};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store = DefaultImplProbeStore;
+        let ctx = CallerContext::for_agent("test-agent");
+        let now = 1_700_000_000_i64;
+
+        let unsupported = |err: &StoreError, cap: &str| {
+            assert!(
+                matches!(err, StoreError::UnsupportedCapability { capability }
+                    if capability == cap),
+                "expected UnsupportedCapability{{{cap}}}, got: {err}"
+            );
+        };
+
+        // --- action DAG: read, transition, and frontier all refuse ---
+        unsupported(
+            &rt.block_on(store.action_get(&ctx, "a1"))
+                .expect_err("action_get default must refuse"),
+            "ACTIONS",
+        );
+        unsupported(
+            &rt.block_on(store.action_transition(
+                &ctx,
+                "a1",
+                ActionState::Done,
+                Some("holder"),
+                now,
+            ))
+            .expect_err("action_transition default must refuse"),
+            "ACTIONS",
+        );
+        unsupported(
+            &rt.block_on(store.action_transition_cas(
+                &ctx,
+                "a1",
+                ActionState::Pending,
+                ActionState::Claimed,
+                Some("holder"),
+                now,
+            ))
+            .expect_err("action_transition_cas default must refuse"),
+            "ACTIONS",
+        );
+        unsupported(
+            &rt.block_on(store.action_list(&ctx, Some("ns"), Some(ActionState::Pending), 10))
+                .expect_err("action_list default must refuse"),
+            "ACTIONS",
+        );
+        unsupported(
+            &rt.block_on(store.action_add_edge(&ctx, "a1", "a2", EdgeType::Requires, now))
+                .expect_err("action_add_edge default must refuse"),
+            "ACTIONS",
+        );
+        unsupported(
+            &rt.block_on(store.action_edges_for(&ctx, "a1"))
+                .expect_err("action_edges_for default must refuse"),
+            "ACTIONS",
+        );
+        unsupported(
+            &rt.block_on(store.action_frontier(&ctx, "ns", 10))
+                .expect_err("action_frontier default must refuse"),
+            "ACTIONS",
+        );
+        // A fabricated Ok(None) here would read as "the fleet has nothing
+        // to do" — the refusal is what lets a caller distinguish an empty
+        // frontier from an unwired substrate.
+        unsupported(
+            &rt.block_on(store.action_next(&ctx, "ns", Some("agent-1")))
+                .expect_err("action_next default must refuse"),
+            "ACTIONS",
+        );
+        unsupported(
+            &rt.block_on(store.sweep_pending_action_timeouts(60))
+                .expect_err("sweep_pending_action_timeouts default must refuse"),
+            "GOVERNANCE_PENDING_TIMEOUT",
+        );
+
+        // --- leases: the mutual-exclusion primitive ---
+        unsupported(
+            &rt.block_on(store.lease_acquire(&ctx, "a1", "holder", now, now + 60))
+                .expect_err("lease_acquire default must refuse"),
+            "LEASES",
+        );
+        unsupported(
+            &rt.block_on(store.lease_renew(&ctx, "a1", "holder", now, now + 120))
+                .expect_err("lease_renew default must refuse"),
+            "LEASES",
+        );
+        unsupported(
+            &rt.block_on(store.lease_release(&ctx, "a1", "holder"))
+                .expect_err("lease_release default must refuse"),
+            "LEASES",
+        );
+        unsupported(
+            &rt.block_on(store.lease_get(&ctx, "a1"))
+                .expect_err("lease_get default must refuse"),
+            "LEASES",
+        );
+
+        // --- signals: inter-agent messaging ---
+        unsupported(
+            &rt.block_on(store.signal_get(&ctx, "s1"))
+                .expect_err("signal_get default must refuse"),
+            "SIGNALS",
+        );
+        unsupported(
+            &rt.block_on(store.signal_inbox(&ctx, "ns", Some("agent-1"), 10))
+                .expect_err("signal_inbox default must refuse"),
+            "SIGNALS",
+        );
+        unsupported(
+            &rt.block_on(store.signal_thread(&ctx, "corr-1"))
+                .expect_err("signal_thread default must refuse"),
+            "SIGNALS",
+        );
+        unsupported(
+            &rt.block_on(store.signal_ack(&ctx, "s1", now))
+                .expect_err("signal_ack default must refuse"),
+            "SIGNALS",
+        );
+    }
+
     /// Pins the human-readable Display contract for the StoreError
     /// variants the original display test skipped (Conflict /
     /// BackendUnavailable / InvalidInput / UnsupportedCapability /
