@@ -11475,6 +11475,18 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
     if let Err(e) = fold_recall_accesses(conn, crate::SECS_PER_HOUR, crate::SECS_PER_DAY) {
         tracing::warn!("recall-access fold failed (pre-gc): {e}");
     }
+    // #2358 — prune the `recall_observations` ledger from THIS chokepoint
+    // too, not only the serve daemon's dedicated gc loop
+    // (`spawn_gc_loop_with_shadow_retention_tracked`). MCP-stdio and
+    // CLI-only topologies never run that background loop, so without this
+    // call the ledger grows unbounded off the serve daemon, making the
+    // documented `AI_MEMORY_OBSERVATIONS_TTL_DAYS` contract false on those
+    // topologies. Best-effort (WARN, never abort the sweep): a failed
+    // prune degrades to "ledger grows one more sweep", never corrupts —
+    // mirrors the fold-before-gc posture immediately above.
+    if let Err(e) = crate::observations::gc::prune(conn) {
+        tracing::warn!("recall_observations prune failed (in gc): {e}");
+    }
     let now = Utc::now().to_rfc3339();
     // #1579 B6 (F5.7) — bounded-lock-hold chunked sweep. Each loop
     // iteration archives + deletes at most GC_CHUNK_ROWS expired rows
