@@ -341,8 +341,12 @@ impl FederationDlqSink for RecordingDlqSink {
         Ok(Vec::new())
     }
 
-    async fn mark_dlq_row_replayed(&self, _id: i64) -> Result<(), String> {
-        Ok(())
+    async fn mark_dlq_row_replayed(
+        &self,
+        _id: i64,
+        _expected_attempt_count: i32,
+    ) -> Result<bool, String> {
+        Ok(true)
     }
 
     async fn bump_dlq_attempt(&self, _id: i64, _last_error: &str) -> Result<(), String> {

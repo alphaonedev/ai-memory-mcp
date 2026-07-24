@@ -67,11 +67,17 @@ pub(crate) const PUSH_DLQ_TRACE_TARGET: &str = "ai_memory::federation::push_dlq"
 
 /// A single pending DLQ row, surfaced to the replay worker.
 ///
-/// `payload_json` is captured as the exact body the leader originally
-/// POSTed (so the replay re-POSTs the same shape regardless of whether
-/// the source memory row has been updated since), and `attempt_count`
-/// is the persisted retry counter (advisory only — the replay worker
-/// keeps trying regardless).
+/// `payload_json` is the **newest failed push body** for this
+/// `(memory_id, peer_id)` pair. `enqueue_push_failure` REFRESHES it on
+/// every conflict (a re-failed push replaces the stale first-failure
+/// body), so the replay re-POSTs the freshest attempted shape rather
+/// than an outdated first snapshot; the receiver-side LWW
+/// `insert_if_newer` makes replaying newer content safe. `attempt_count`
+/// is the persisted retry counter — advisory for the worker's retry
+/// loop, but ALSO the optimistic-concurrency token the Ack path uses
+/// (`mark_dlq_row_replayed(id, attempt_count)`) so a concurrent failure
+/// that upserts a fresher body between take-time and mark-time is not
+/// lost.
 #[derive(Debug, Clone)]
 pub struct FederationPushDlqRow {
     pub id: i64,
@@ -117,10 +123,22 @@ pub trait FederationDlqSink: Send + Sync {
         limit: usize,
     ) -> Result<Vec<FederationPushDlqRow>, String>;
 
-    /// Mark a DLQ row as replayed (the peer Acked). Implementations
-    /// may either DELETE the row or stamp `replayed_at`; the worker
-    /// doesn't care which.
-    async fn mark_dlq_row_replayed(&self, id: i64) -> Result<(), String>;
+    /// Mark a DLQ row as replayed (the peer Acked), GUARDED by the
+    /// `attempt_count` observed at take-time so a concurrent failure that
+    /// upserted a fresher body between the take and this call is not
+    /// clobbered. Implementations stamp `replayed_at` (or DELETE) ONLY
+    /// when the persisted row still carries `expected_attempt_count` and
+    /// is still pending. Returns `Ok(true)` when exactly the observed row
+    /// was marked, `Ok(false)` when 0 rows matched (a concurrent
+    /// `enqueue_push_failure` bumped `attempt_count` mid-tick) — the
+    /// caller then leaves the row pending for the next tick (fail-closed:
+    /// re-deliver the newest body rather than lose the concurrent
+    /// failure).
+    async fn mark_dlq_row_replayed(
+        &self,
+        id: i64,
+        expected_attempt_count: i32,
+    ) -> Result<bool, String>;
 
     /// Bump `attempt_count` + refresh `last_error` on an existing
     /// pending row. Used by the replay worker when a retry attempt
@@ -482,24 +500,47 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
 
         match outcome {
             AckOutcome::Ack => {
-                if let Err(e) = sink.mark_dlq_row_replayed(row.id).await {
-                    tracing::warn!(
-                        target: PUSH_DLQ_TRACE_TARGET,
-                        row_id = row.id,
-                        "replay: peer {} acked but mark_dlq_row_replayed failed: {e}",
-                        row.peer_id,
-                    );
-                } else {
-                    tracing::info!(
-                        target: PUSH_DLQ_TRACE_TARGET,
-                        row_id = row.id,
-                        memory_id = %row.memory_id,
-                        peer_id = %row.peer_id,
-                        "replay: peer {} acked for {} (DLQ row {} cleared)",
-                        row.peer_id,
-                        row.memory_id,
-                        row.id,
-                    );
+                // Guard the clear with the `attempt_count` snapshot taken
+                // when this row was drained: if a concurrent
+                // `enqueue_push_failure` bumped the counter (and refreshed
+                // `payload_json`) between the take and now, the guarded
+                // UPDATE matches 0 rows and we leave the row pending so the
+                // next tick re-POSTs the newest body — never lose the
+                // concurrent failure.
+                match sink.mark_dlq_row_replayed(row.id, row.attempt_count).await {
+                    Ok(true) => {
+                        tracing::info!(
+                            target: PUSH_DLQ_TRACE_TARGET,
+                            row_id = row.id,
+                            memory_id = %row.memory_id,
+                            peer_id = %row.peer_id,
+                            "replay: peer {} acked for {} (DLQ row {} cleared)",
+                            row.peer_id,
+                            row.memory_id,
+                            row.id,
+                        );
+                    }
+                    Ok(false) => {
+                        tracing::warn!(
+                            target: PUSH_DLQ_TRACE_TARGET,
+                            row_id = row.id,
+                            peer_id = %row.peer_id,
+                            attempt_count = row.attempt_count,
+                            "replay: peer {} acked stale body for DLQ row {} but a \
+                             concurrent failure refreshed it mid-tick — leaving pending \
+                             so the newest body is re-delivered next tick",
+                            row.peer_id,
+                            row.id,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: PUSH_DLQ_TRACE_TARGET,
+                            row_id = row.id,
+                            "replay: peer {} acked but mark_dlq_row_replayed failed: {e}",
+                            row.peer_id,
+                        );
+                    }
                 }
             }
             AckOutcome::IdDrift => {
@@ -655,8 +696,13 @@ impl FederationDlqSink for SqliteDlqSink {
         // Use `ON CONFLICT(memory_id, peer_id) WHERE replayed_at IS
         // NULL DO UPDATE` so a flapping peer doesn't stack duplicate
         // pending rows — bumps attempt_count + refreshes last_error
-        // instead. Partial unique index from the v48 migration backs
-        // this conflict target.
+        // instead. The conflict path ALSO refreshes `payload_json` +
+        // `failed_at` to the newest failed push so the pending row
+        // always carries the freshest attempted body (a later failure
+        // must not coalesce onto the stale first-failure snapshot); the
+        // receiver-side LWW `insert_if_newer` makes replaying newer
+        // content safe. Partial unique index from the v48 migration
+        // backs this conflict target.
         conn.execute(
             "INSERT INTO federation_push_dlq \
                  (memory_id, peer_id, payload_json, attempt_count, last_error, failed_at) \
@@ -664,7 +710,9 @@ impl FederationDlqSink for SqliteDlqSink {
                  ON CONFLICT(memory_id, peer_id) WHERE replayed_at IS NULL \
                  DO UPDATE SET \
                    attempt_count = attempt_count + 1, \
-                   last_error    = excluded.last_error",
+                   last_error    = excluded.last_error, \
+                   payload_json  = excluded.payload_json, \
+                   failed_at     = excluded.failed_at",
             rusqlite::params![memory_id, peer_id, payload_str, last_error, now],
         )
         .map_err(|e| format!("sqlite enqueue_push_failure: {e}"))?;
@@ -708,15 +756,25 @@ impl FederationDlqSink for SqliteDlqSink {
         Ok(rows)
     }
 
-    async fn mark_dlq_row_replayed(&self, id: i64) -> Result<(), String> {
+    async fn mark_dlq_row_replayed(
+        &self,
+        id: i64,
+        expected_attempt_count: i32,
+    ) -> Result<bool, String> {
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE federation_push_dlq SET replayed_at = ?1 WHERE id = ?2",
-            rusqlite::params![now, id],
-        )
-        .map_err(|e| format!("sqlite mark_dlq_row_replayed: {e}"))?;
-        Ok(())
+        // Optimistic-concurrency guard: only clear the row the worker
+        // actually drained (same `attempt_count`, still pending). A
+        // concurrent `enqueue_push_failure` that bumped the counter
+        // mid-tick fails this match (0 rows) and the row stays pending.
+        let n = conn
+            .execute(
+                "UPDATE federation_push_dlq SET replayed_at = ?1 \
+                 WHERE id = ?2 AND attempt_count = ?3 AND replayed_at IS NULL",
+                rusqlite::params![now, id, expected_attempt_count],
+            )
+            .map_err(|e| format!("sqlite mark_dlq_row_replayed: {e}"))?;
+        Ok(n == 1)
     }
 
     async fn bump_dlq_attempt(&self, id: i64, last_error: &str) -> Result<(), String> {
@@ -801,6 +859,11 @@ impl FederationDlqSink for PostgresDlqSink {
         last_error: &str,
     ) -> Result<(), String> {
         let pool = self.store.pool();
+        // The conflict path refreshes `payload_json` + `failed_at` to the
+        // newest failed push (mirrors the sqlite arm) so a later failure
+        // never coalesces onto the stale first-failure body. `failed_at`
+        // has a `DEFAULT now()` (see migrations/postgres/0030_*), so
+        // `EXCLUDED.failed_at` is the fresh insert-time instant.
         sqlx::query(
             "INSERT INTO federation_push_dlq \
              (memory_id, peer_id, payload_json, attempt_count, last_error) \
@@ -808,7 +871,9 @@ impl FederationDlqSink for PostgresDlqSink {
              ON CONFLICT (memory_id, peer_id) WHERE replayed_at IS NULL \
              DO UPDATE SET \
                attempt_count = federation_push_dlq.attempt_count + 1, \
-               last_error    = EXCLUDED.last_error",
+               last_error    = EXCLUDED.last_error, \
+               payload_json  = EXCLUDED.payload_json, \
+               failed_at     = EXCLUDED.failed_at",
         )
         .bind(memory_id)
         .bind(peer_id)
@@ -855,14 +920,26 @@ impl FederationDlqSink for PostgresDlqSink {
             .collect())
     }
 
-    async fn mark_dlq_row_replayed(&self, id: i64) -> Result<(), String> {
+    async fn mark_dlq_row_replayed(
+        &self,
+        id: i64,
+        expected_attempt_count: i32,
+    ) -> Result<bool, String> {
         let pool = self.store.pool();
-        sqlx::query("UPDATE federation_push_dlq SET replayed_at = now() WHERE id = $1")
-            .bind(id)
-            .execute(pool)
-            .await
-            .map_err(|e| format!("postgres mark_dlq_row_replayed: {e}"))?;
-        Ok(())
+        // Optimistic-concurrency guard (mirrors the sqlite arm): only
+        // clear the row the worker drained. A concurrent
+        // `enqueue_push_failure` that bumped `attempt_count` mid-tick
+        // fails this match (0 rows) and the row stays pending.
+        let res = sqlx::query(
+            "UPDATE federation_push_dlq SET replayed_at = now() \
+             WHERE id = $1 AND attempt_count = $2 AND replayed_at IS NULL",
+        )
+        .bind(id)
+        .bind(expected_attempt_count)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("postgres mark_dlq_row_replayed: {e}"))?;
+        Ok(res.rows_affected() == 1)
     }
 
     async fn bump_dlq_attempt(&self, id: i64, last_error: &str) -> Result<(), String> {
@@ -997,9 +1074,24 @@ mod replay_arm_tests {
             Ok(self.rows.lock().unwrap().clone())
         }
 
-        async fn mark_dlq_row_replayed(&self, id: i64) -> Result<(), String> {
+        async fn mark_dlq_row_replayed(
+            &self,
+            id: i64,
+            expected_attempt_count: i32,
+        ) -> Result<bool, String> {
+            // Model the guarded UPDATE: only clear when the live row still
+            // carries the observed attempt_count (a concurrent bump makes
+            // this a 0-row no-op → Ok(false)).
+            let matched = {
+                let rows = self.rows.lock().unwrap();
+                rows.iter()
+                    .any(|r| r.id == id && r.attempt_count == expected_attempt_count)
+            };
+            if !matched {
+                return Ok(false);
+            }
             self.marked_replayed.lock().unwrap().push(id);
-            Ok(())
+            Ok(true)
         }
 
         async fn bump_dlq_attempt(&self, id: i64, last_error: &str) -> Result<(), String> {
@@ -1310,5 +1402,32 @@ mod replay_arm_tests {
             ),
             "permanent"
         );
+    }
+
+    /// #2360 — the `mark_dlq_row_replayed` CAS contract the `replay_once` Ack
+    /// arm relies on: a mark whose `expected_attempt_count` no longer matches
+    /// the persisted row is a 0-row no-op (`Ok(false)`, row left pending); a
+    /// matching mark clears it (`Ok(true)`).
+    #[tokio::test]
+    async fn mark_dlq_row_replayed_is_attempt_count_guarded_2360() {
+        let sink = MockSink::default();
+        sink.rows.lock().unwrap().push(row(9, "peer-0", 1));
+
+        // Stale snapshot (expected=2 while the live row is at 1) → no-op.
+        assert!(
+            !sink.mark_dlq_row_replayed(9, 2).await.unwrap(),
+            "stale-snapshot mark must not clear"
+        );
+        assert!(
+            sink.marked_replayed.lock().unwrap().is_empty(),
+            "no row marked under a stale snapshot"
+        );
+
+        // Matching snapshot (expected=1) → clears the row.
+        assert!(
+            sink.mark_dlq_row_replayed(9, 1).await.unwrap(),
+            "matching-snapshot mark clears"
+        );
+        assert_eq!(sink.marked_replayed.lock().unwrap().as_slice(), &[9]);
     }
 }

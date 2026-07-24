@@ -567,3 +567,306 @@ async fn broadcast_with_embedding_ships_vector_in_push_body_1566() {
         "legacy broadcast_store_quorum must keep the pre-#1566 wire shape: {body2}"
     );
 }
+
+// ===========================================================================
+// #2360 — ON CONFLICT refreshes payload_json/failed_at; mark_dlq_row_replayed
+// is attempt_count-guarded so a concurrent failure is never lost.
+// ===========================================================================
+
+/// #2360 (Part 1) — a second failed push for the SAME `(memory_id, peer_id)`
+/// must REFRESH `payload_json` + `failed_at` on conflict (not coalesce the
+/// newer failure onto the stale first-failure body). Pre-fix the ON CONFLICT
+/// DO UPDATE touched only `attempt_count` + `last_error`, so a replay
+/// re-POSTed an outdated body.
+#[tokio::test]
+async fn enqueue_refreshes_payload_json_and_failed_at_on_conflict_2360() {
+    let (_tmp, db) = fresh_dlq_db();
+    let sink: Arc<dyn FederationDlqSink> = Arc::new(SqliteDlqSink::new(db.clone()).await.unwrap());
+
+    let body_v1 = serde_json::json!({"memories": [{"id": "mem-2360", "gen": 1}], "gen": 1});
+    sink.enqueue_push_failure("mem-2360", "peer-0", &body_v1, "first failure")
+        .await
+        .expect("first enqueue");
+
+    // Snapshot the persisted failed_at/payload after the first failure.
+    let (failed_at_v1, payload_v1): (String, String) = {
+        let g = db.lock().await;
+        g.0.query_row(
+            "SELECT failed_at, payload_json FROM federation_push_dlq WHERE memory_id = ?1",
+            rusqlite::params!["mem-2360"],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("row after first failure")
+    };
+    assert!(
+        payload_v1.contains("\"gen\":1"),
+        "v1 body persisted: {payload_v1}"
+    );
+
+    // Ensure a strictly-later RFC3339 instant for the refreshed failed_at.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let body_v2 = serde_json::json!({"memories": [{"id": "mem-2360", "gen": 2}], "gen": 2});
+    sink.enqueue_push_failure("mem-2360", "peer-0", &body_v2, "second failure")
+        .await
+        .expect("second enqueue (conflict path)");
+
+    // The pending row must now carry attempt_count=2, the NEWEST body, the
+    // refreshed last_error, and a strictly-newer failed_at.
+    let pending = sink.take_pending_dlq_rows(64).await.expect("take");
+    assert_eq!(
+        pending.len(),
+        1,
+        "conflict path must NOT stack a duplicate row"
+    );
+    assert_eq!(pending[0].attempt_count, 2, "attempt_count still bumps");
+    assert_eq!(
+        pending[0].payload_json["gen"],
+        serde_json::json!(2),
+        "payload_json REFRESHED to the newest failed body (was stale v1 pre-#2360)"
+    );
+    assert_eq!(
+        pending[0].last_error, "second failure",
+        "last_error refreshed"
+    );
+
+    let failed_at_v2: String = {
+        let g = db.lock().await;
+        g.0.query_row(
+            "SELECT failed_at FROM federation_push_dlq WHERE memory_id = ?1",
+            rusqlite::params!["mem-2360"],
+            |r| r.get(0),
+        )
+        .expect("row after second failure")
+    };
+    assert!(
+        failed_at_v2 > failed_at_v1,
+        "failed_at REFRESHED on conflict ({failed_at_v1} -> {failed_at_v2})"
+    );
+}
+
+/// #2360 (Part 2) — `mark_dlq_row_replayed(id, expected_attempt_count)` is an
+/// optimistic-concurrency CAS: it clears the row ONLY when the persisted
+/// `attempt_count` still matches the take-time snapshot. A concurrent
+/// `enqueue_push_failure` that bumped the counter (and refreshed the body)
+/// between take and mark makes the guarded UPDATE a 0-row no-op, so the row
+/// stays pending and the newest body is re-delivered next tick.
+#[tokio::test]
+async fn mark_replayed_cas_leaves_row_pending_on_concurrent_bump_2360() {
+    let (_tmp, db) = fresh_dlq_db();
+    let sink: Arc<dyn FederationDlqSink> = Arc::new(SqliteDlqSink::new(db.clone()).await.unwrap());
+
+    let body_v1 = serde_json::json!({"memories": [], "gen": 1});
+    sink.enqueue_push_failure("mem-cas", "peer-0", &body_v1, "first")
+        .await
+        .expect("enqueue v1");
+
+    // Worker drains the row → observes attempt_count == 1.
+    let snapshot = sink.take_pending_dlq_rows(64).await.expect("take");
+    assert_eq!(snapshot.len(), 1);
+    let row_id = snapshot[0].id;
+    assert_eq!(snapshot[0].attempt_count, 1);
+
+    // A concurrent failure lands BEFORE the worker marks the row replayed.
+    let body_v2 = serde_json::json!({"memories": [], "gen": 2});
+    sink.enqueue_push_failure("mem-cas", "peer-0", &body_v2, "second")
+        .await
+        .expect("concurrent enqueue v2");
+
+    // Marking with the STALE snapshot (attempt_count=1) must be a no-op.
+    let marked = sink
+        .mark_dlq_row_replayed(row_id, 1)
+        .await
+        .expect("mark with stale snapshot");
+    assert!(
+        !marked,
+        "stale-snapshot mark must NOT clear the refreshed row"
+    );
+    assert_eq!(
+        sink.pending_dlq_count().await.unwrap(),
+        1,
+        "row stays pending — the concurrent failure is NOT lost"
+    );
+
+    // Re-take (attempt_count now 2) and mark with the CURRENT counter → clears.
+    let fresh = sink.take_pending_dlq_rows(64).await.expect("re-take");
+    assert_eq!(fresh[0].attempt_count, 2);
+    let marked2 = sink
+        .mark_dlq_row_replayed(row_id, 2)
+        .await
+        .expect("mark with fresh snapshot");
+    assert!(marked2, "matching-snapshot mark clears the row");
+    assert_eq!(
+        sink.pending_dlq_count().await.unwrap(),
+        0,
+        "row cleared once the current attempt_count is acknowledged"
+    );
+}
+
+/// #2360 (Part 2, end-to-end) — drive `replay_once` to the Ack arm against a
+/// healthy peer, but with a sink whose take-time snapshot is stale relative to
+/// the persisted row (models a concurrent failure between take and mark). The
+/// Ack arm's guarded mark returns `Ok(false)`, so the row is LEFT PENDING
+/// rather than clobbered.
+#[tokio::test]
+async fn replay_ack_leaves_row_pending_when_snapshot_is_stale_2360() {
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    /// Sink that reports a take-time `attempt_count` one behind the value its
+    /// guarded mark will require — the lost-update race, deterministically.
+    #[derive(Default)]
+    struct RacingSink {
+        marked: AtomicBool,
+        left_pending: AtomicBool,
+        takes: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl FederationDlqSink for RacingSink {
+        async fn enqueue_push_failure(
+            &self,
+            _m: &str,
+            _p: &str,
+            _b: &serde_json::Value,
+            _e: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn take_pending_dlq_rows(
+            &self,
+            _limit: usize,
+        ) -> Result<Vec<ai_memory::federation::push_dlq::FederationPushDlqRow>, String> {
+            // Only surface the row on the first tick; snapshot attempt_count = 1.
+            if self.takes.fetch_add(1, Ordering::SeqCst) > 0 {
+                return Ok(Vec::new());
+            }
+            Ok(vec![
+                ai_memory::federation::push_dlq::FederationPushDlqRow {
+                    id: 42,
+                    memory_id: "mem-race".to_string(),
+                    peer_id: "peer-0".to_string(),
+                    payload_json: serde_json::json!({"memories": [], "gen": 1}),
+                    attempt_count: 1,
+                    last_error: "prior".to_string(),
+                },
+            ])
+        }
+        async fn mark_dlq_row_replayed(
+            &self,
+            _id: i64,
+            expected_attempt_count: i32,
+        ) -> Result<bool, String> {
+            // Persisted row is now at attempt_count = 2 (a concurrent failure
+            // bumped it), so the take-time snapshot of 1 no longer matches.
+            if expected_attempt_count == 2 {
+                self.marked.store(true, Ordering::SeqCst);
+                Ok(true)
+            } else {
+                self.left_pending.store(true, Ordering::SeqCst);
+                Ok(false)
+            }
+        }
+        async fn bump_dlq_attempt(&self, _id: i64, _e: &str) -> Result<(), String> {
+            Ok(())
+        }
+        async fn pending_dlq_count(&self) -> Result<i64, String> {
+            Ok(1)
+        }
+        async fn note_dlq_throttled(&self, _id: i64, _e: &str) -> Result<(), String> {
+            Ok(())
+        }
+        async fn reset_throttled_quarantine(&self) -> Result<u64, String> {
+            Ok(0)
+        }
+    }
+
+    let peer = PeerState {
+        fail_mode: Arc::new(AtomicBool::new(false)), // healthy → Ack
+        ..Default::default()
+    };
+    let peer_url = spawn_mock_peer(peer.clone()).await;
+    let sink = Arc::new(RacingSink::default());
+    let cfg = build_cfg_with_sink(&peer_url, sink.clone(), 2000);
+
+    replay_once(&cfg, sink.as_ref()).await;
+
+    assert!(
+        sink.left_pending.load(Ordering::SeqCst),
+        "the Ack arm must take the guarded-no-op branch on a stale snapshot"
+    );
+    assert!(
+        !sink.marked.load(Ordering::SeqCst),
+        "the row must NOT be marked replayed under a stale snapshot"
+    );
+    assert_eq!(
+        peer.hit_count.load(Ordering::Relaxed),
+        1,
+        "the peer still received the (newest) POST exactly once"
+    );
+}
+
+/// #2360 — postgres arm parity. Mirrors the sqlite refresh + CAS-guard pins
+/// against a live PostgresStore. Ignored by default; run with
+/// `AI_MEMORY_TEST_POSTGRES_URL` set (`cargo test --features sal-postgres --
+/// --ignored`).
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+#[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL pointing at a live instance"]
+async fn pg_dlq_refresh_and_cas_guard_2360() {
+    use ai_memory::federation::push_dlq::PostgresDlqSink;
+    use ai_memory::store::postgres::PostgresStore;
+
+    let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+        eprintln!("test skipped: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let store = match PostgresStore::connect(&url).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!("test skipped: PostgresStore::connect failed: {e}");
+            return;
+        }
+    };
+    let sink: Arc<dyn FederationDlqSink> = Arc::new(PostgresDlqSink::new(store));
+
+    // Unique ids so re-runs against a shared DB don't collide.
+    let mem_id = format!("mem-2360-pg-{}", uuid::Uuid::new_v4());
+    let peer_id = "peer-2360-pg";
+
+    let body_v1 = serde_json::json!({"memories": [], "gen": 1});
+    sink.enqueue_push_failure(&mem_id, peer_id, &body_v1, "first")
+        .await
+        .expect("pg enqueue v1");
+    let body_v2 = serde_json::json!({"memories": [], "gen": 2});
+    sink.enqueue_push_failure(&mem_id, peer_id, &body_v2, "second")
+        .await
+        .expect("pg enqueue v2 (conflict)");
+
+    let pending = sink.take_pending_dlq_rows(64).await.expect("pg take");
+    let row = pending
+        .iter()
+        .find(|r| r.memory_id == mem_id)
+        .expect("our pg row");
+    assert_eq!(row.attempt_count, 2, "pg attempt_count bumps on conflict");
+    assert_eq!(
+        row.payload_json["gen"],
+        serde_json::json!(2),
+        "pg payload_json REFRESHED to newest failed body"
+    );
+
+    // Stale-snapshot mark is a no-op; current-snapshot mark clears.
+    assert!(
+        !sink
+            .mark_dlq_row_replayed(row.id, 1)
+            .await
+            .expect("pg stale mark"),
+        "pg stale-snapshot mark must NOT clear"
+    );
+    assert!(
+        sink.mark_dlq_row_replayed(row.id, 2)
+            .await
+            .expect("pg fresh mark"),
+        "pg current-snapshot mark clears"
+    );
+}
