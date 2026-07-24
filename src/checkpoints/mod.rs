@@ -340,6 +340,43 @@ fn resolutions_match(local: &Checkpoint, incoming: &Checkpoint) -> bool {
         && local.resolution == incoming.resolution
 }
 
+/// First-resolution-wins disposition for an inbound resolution that lost the
+/// race (or arrived after) a resolution already committed locally: a
+/// byte-identical tuple is an idempotent replay, anything else is a conflict
+/// with the LOCAL resolution kept. Never a write.
+fn classify_against_local(local: &Checkpoint, incoming: &Checkpoint) -> InboundResolutionOutcome {
+    if resolutions_match(local, incoming) {
+        InboundResolutionOutcome::Noop
+    } else {
+        InboundResolutionOutcome::Conflict
+    }
+}
+
+/// Whether a `rusqlite` error is a constraint violation — the shape a losing
+/// concurrent INSERT of the same checkpoint id takes (`checkpoints.id` is the
+/// PRIMARY KEY). Used by [`apply_inbound_resolution`] to turn a lost
+/// insert race into the documented first-resolution-wins disposition instead
+/// of a hard error.
+fn is_constraint_violation(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if inner.code == rusqlite::ErrorCode::ConstraintViolation
+    )
+}
+
+/// COMPARE-AND-SWAP write used by [`apply_inbound_resolution`]: stamps the
+/// inbound resolution + attestation onto a checkpoint ONLY while that
+/// checkpoint is still locally `pending` (`?9` binds
+/// [`CheckpointState::Pending`]). The `AND state = ?9` guard is what makes
+/// first-resolution-wins hold under concurrency — without it the read that
+/// decided "local is pending" and the write that acts on that decision are a
+/// TOCTOU window in which a concurrently-committed local resolution is
+/// silently overwritten (#2396).
+const APPLY_INBOUND_RESOLUTION_CAS_SQL: &str = "UPDATE checkpoints SET state = ?1, resolved_by = ?2, resolution = ?3, \
+        resolution_note = ?4, resolved_at = ?5, signature = ?6, resolver_pubkey = ?7 \
+     WHERE id = ?8 AND state = ?9";
+
 /// Apply an inbound FEDERATED checkpoint resolution under the checkpoint
 /// substrate's **first-resolution-wins** rule (FED-RQ-01, #1936).
 ///
@@ -356,6 +393,18 @@ fn resolutions_match(local: &Checkpoint, incoming: &Checkpoint) -> bool {
 /// - **Local row already resolved, DIFFERENT tuple** → first-resolution-wins:
 ///   keep the local resolution, refuse the inbound. → [`InboundResolutionOutcome::Conflict`].
 ///
+/// # Concurrency (#2396)
+/// The pending→resolved transition is a **compare-and-swap**
+/// ([`APPLY_INBOUND_RESOLUTION_CAS_SQL`] carries `AND state = 'pending'`), and
+/// the "no local row" arm treats a losing INSERT (PRIMARY-KEY violation) as the
+/// same first-resolution-wins disposition. A concurrent local resolve or a
+/// second inbound resolution therefore can NEVER overwrite an
+/// already-committed resolution: the loser is reported as
+/// [`InboundResolutionOutcome::Conflict`] (or `Noop` when byte-identical) and
+/// the receive loop counts it in `checkpoints_conflicted`. Before the CAS this
+/// was a get-then-UPDATE TOCTOU that let a late writer flip a resolved
+/// authority-lane verdict after the fact.
+///
 /// The receiver **NEVER re-signs**: the resolver's Ed25519 attestation
 /// (`signature` / `resolver_pubkey`) travels on `incoming` and is persisted
 /// verbatim (the v0.8.0 local-substrate rule — a node stamps only its OWN
@@ -369,32 +418,43 @@ pub fn apply_inbound_resolution(
     conn: &Connection,
     incoming: &Checkpoint,
 ) -> rusqlite::Result<InboundResolutionOutcome> {
-    match get(conn, &incoming.id)? {
-        None => {
-            insert(conn, incoming)?;
-            Ok(InboundResolutionOutcome::Applied)
-        }
-        Some(local) if local.state == CheckpointState::Pending => {
-            conn.execute(
-                "UPDATE checkpoints SET state = ?1, resolved_by = ?2, resolution = ?3, \
-                    resolution_note = ?4, resolved_at = ?5, signature = ?6, \
-                    resolver_pubkey = ?7 WHERE id = ?8",
-                params![
-                    incoming.state.as_str(),
-                    incoming.resolved_by,
-                    incoming.resolution,
-                    incoming.resolution_note,
-                    incoming.resolved_at,
-                    incoming.signature,
-                    incoming.resolver_pubkey,
-                    incoming.id,
-                ],
-            )?;
-            Ok(InboundResolutionOutcome::Applied)
-        }
-        Some(local) if resolutions_match(&local, incoming) => Ok(InboundResolutionOutcome::Noop),
-        Some(_) => Ok(InboundResolutionOutcome::Conflict),
+    // Step 1 — CAS the locally-PENDING row. `n == 1` means THIS call won the
+    // pending→resolved transition; the guard makes a concurrent second writer
+    // see `n == 0` instead of clobbering the winner's resolution.
+    let updated = conn.execute(
+        APPLY_INBOUND_RESOLUTION_CAS_SQL,
+        params![
+            incoming.state.as_str(),
+            incoming.resolved_by,
+            incoming.resolution,
+            incoming.resolution_note,
+            incoming.resolved_at,
+            incoming.signature,
+            incoming.resolver_pubkey,
+            incoming.id,
+            CheckpointState::Pending.as_str(),
+        ],
+    )?;
+    if updated > 0 {
+        return Ok(InboundResolutionOutcome::Applied);
     }
+
+    // Step 2 — the CAS did not fire: either no local row exists yet, or the
+    // checkpoint is already resolved (possibly by a writer that raced us).
+    let Some(local) = get(conn, &incoming.id)? else {
+        return match insert(conn, incoming) {
+            Ok(_) => Ok(InboundResolutionOutcome::Applied),
+            // Lost the INSERT race — the winner's row landed between our read
+            // and our write. Fall back to the first-resolution-wins
+            // disposition against whatever is now committed; never overwrite.
+            Err(e) if is_constraint_violation(&e) => match get(conn, &incoming.id)? {
+                Some(local) => Ok(classify_against_local(&local, incoming)),
+                None => Err(e),
+            },
+            Err(e) => Err(e),
+        };
+    };
+    Ok(classify_against_local(&local, incoming))
 }
 
 #[cfg(test)]
