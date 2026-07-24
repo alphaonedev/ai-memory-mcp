@@ -72,9 +72,16 @@ fn issue_1596_mid_tier_touch_keeps_7d_backstop() {
     db::touch(&conn, &id, SHORT_TTL_EXTEND_SECS, MID_TTL_EXTEND_SECS).expect("touch");
 
     let post = db::get(&conn, &id).unwrap().unwrap();
+    // v1.0.0 #2332 (FBL-02) — the insert funnel canonicalizes the stored
+    // RENDERING (fixed-UTC micros + `Z`), so compare instants at micro
+    // precision rather than bytes.
+    let stored =
+        chrono::DateTime::parse_from_rfc3339(post.expires_at.as_deref().expect("expiry set"))
+            .expect("rfc3339");
+    let original = chrono::DateTime::parse_from_rfc3339(&backstop).expect("rfc3339");
     assert_eq!(
-        post.expires_at.as_deref(),
-        Some(backstop.as_str()),
+        stored.timestamp_micros(),
+        original.timestamp_micros(),
         "first recall must not shorten a mid row's +7d backstop to +1d (#1596)"
     );
 }
@@ -127,9 +134,15 @@ fn issue_1596_touch_many_is_extension_floor() {
     assert_eq!(touched, 2);
 
     let post_backstop = db::get(&conn, &id_backstop).unwrap().unwrap();
+    // v1.0.0 #2332 (FBL-02) — instant comparison (canonical rendering).
+    let stored_backstop = chrono::DateTime::parse_from_rfc3339(
+        post_backstop.expires_at.as_deref().expect("expiry set"),
+    )
+    .expect("rfc3339");
+    let original_backstop = chrono::DateTime::parse_from_rfc3339(&backstop).expect("rfc3339");
     assert_eq!(
-        post_backstop.expires_at.as_deref(),
-        Some(backstop.as_str()),
+        stored_backstop.timestamp_micros(),
+        original_backstop.timestamp_micros(),
         "touch_many must not shorten the +7d backstop (#1596)"
     );
 

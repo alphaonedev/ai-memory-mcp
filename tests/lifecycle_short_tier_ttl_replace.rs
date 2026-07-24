@@ -84,10 +84,14 @@ fn lifecycle_short_tier_touch_never_shortens_backstop_1596() {
         .as_deref()
         .expect("expires_at must still be set on short-tier post-touch");
     // #1596 extension-floor contract: the 6h backstop is LATER than
-    // now + 1h, so MAX keeps it byte-identical. Strictly-earlier (the
-    // old #830 REPLACE assertion) is the regression this test pins out.
+    // now + 1h, so MAX keeps the same INSTANT. (v1.0.0 #2332/FBL-02: the
+    // insert funnel canonicalizes the stored RENDERING to fixed-UTC
+    // micros + `Z`, so compare instants at micro precision, not bytes.)
+    let stored = chrono::DateTime::parse_from_rfc3339(new_expires_str).expect("rfc3339");
+    let original = chrono::DateTime::parse_from_rfc3339(&backstop_expires_at).expect("rfc3339");
     assert_eq!(
-        new_expires_str, backstop_expires_at,
+        stored.timestamp_micros(),
+        original.timestamp_micros(),
         "touch must not pull a later backstop expiry IN (#1596); \
          the per-access window is a floor, not a replacement"
     );

@@ -582,28 +582,73 @@ fn forget_if_superseded(
     // not delete.
     let by_id: std::collections::HashMap<&str, &Memory> =
         all.iter().map(|m| (m.id.as_str(), m)).collect();
-    let mut winner: Option<&Memory> = None;
+    // v1.0.0 #2337 (FBL-26) — BIDIRECTIONAL pair resolution. Both
+    // production marker writers (the store-time legacy classifier and the
+    // curator sweep's `persist_contradiction`) stamp
+    // `confirmed_contradictions` on the row being PROCESSED — the NEWER
+    // row, pointing at pre-existing OLDER rows — and the marker-persisting
+    // `db::update` refreshes that bearer's `updated_at`, so the original
+    // bearer-is-loser condition (`other.updated_at > mem.updated_at`) was
+    // FALSE BY CONSTRUCTION in the mainline flow and the whole G7 conserve
+    // pipeline (contradicts edge + soft-loser down-weight) never fired.
+    // The pass now resolves the pair in EITHER direction:
+    //   * bearer-is-loser  — a listed contradictor is newer with >=
+    //     confidence (the original arm; still correct for markers a peer
+    //     shipped on the older row);
+    //   * bearer-is-winner — the bearer is newer than a listed contradictor
+    //     whose confidence <= the bearer's: conserve the LISTED (older)
+    //     row as the loser (re-entry gated on ITS own conserved marker).
+    let mut pair: Option<(&Memory, &Memory)> = None; // (loser, winner)
     for v in contradictions {
         let Some(other_id) = v.as_str() else {
             continue;
         };
-        if let Some(other) = by_id.get(other_id)
-            && other.updated_at > mem.updated_at
-            && other.confidence >= mem.confidence
+        let Some(other) = by_id.get(other_id) else {
+            continue;
+        };
+        if other.updated_at > mem.updated_at && other.confidence >= mem.confidence {
+            pair = Some((mem, other));
+            break;
+        }
+        let other_conserved = other
+            .metadata
+            .get(field_names::CONTRADICTION_CONSERVED)
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        if !other_conserved
+            && mem.updated_at > other.updated_at
+            && mem.confidence >= other.confidence
         {
-            winner = Some(other);
+            pair = Some((other, mem));
             break;
         }
     }
-    let Some(winner) = winner else {
+    let Some((loser, winner)) = pair else {
         return Ok(None);
     };
 
+    // v1.0.0 #2337 — FRESH-STATE re-entry gate. The `all` candidate
+    // snapshot is materialized before the pass runs, so with MUTUAL
+    // markers (each row listing the other) the second bearer processed in
+    // the SAME cycle still sees the pair un-conserved in its stale
+    // snapshot. Re-read the selected loser from the DB and no-op when a
+    // prior iteration (or cycle) already conserved it — exactly one
+    // conserve per pair, no duplicate SUPERSEDE leaf.
+    if let Some(fresh_loser) = db::get(conn, &loser.id)?
+        && fresh_loser
+            .metadata
+            .get(field_names::CONTRADICTION_CONSERVED)
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        return Ok(None);
+    }
+
     // Canonical (min, max) endpoints of the single `contradicts` edge, so
     // the RollbackEntry describes exactly the edge the write will create.
-    let (canonical_src, canonical_tgt) = db::canonical_contradiction_pair(&mem.id, &winner.id);
+    let (canonical_src, canonical_tgt) = db::canonical_contradiction_pair(&loser.id, &winner.id);
     let entry = RollbackEntry::ConserveContradiction {
-        loser_id: mem.id.clone(),
+        loser_id: loser.id.clone(),
         winner_id: winner.id.clone(),
         canonical_src: canonical_src.to_string(),
         canonical_tgt: canonical_tgt.to_string(),
@@ -618,7 +663,7 @@ fn forget_if_superseded(
     // identity-only SUPERSEDE leaf; reversible soft-down-weight marker).
     db::conserve_contradiction(
         conn,
-        mem,
+        loser,
         &winner.id,
         curator_keypair_best_effort().as_ref(),
     )?;
@@ -630,9 +675,21 @@ fn apply_priority_feedback(
     mem: &Memory,
     dry_run: bool,
 ) -> Result<Option<RollbackEntry>> {
-    // Access-signal policy:
-    //   access_count >= 10 AND last_accessed_at within 7d → +1 (cap 10)
-    //   access_count == 0 AND created_at older than 30d     → -1 (floor 1)
+    // Access-signal policy (v1.0.0 #2339 / FBL-34 — bounded, reachable):
+    //   access_count >= 10 AND last_accessed_at within 7d
+    //     → +1, capped at ACCESS_PRIORITY_CEILING (8-10 reserved for
+    //       explicit caller/operator intent — the access ratchet can no
+    //       longer pollute the operator band).
+    //   STALE (last access older than PRIORITY_DECAY_STALE_DAYS, or never
+    //   accessed and created at least that long ago) AND priority within
+    //   the access band (<= ACCESS_PRIORITY_CEILING)
+    //     → -1 per cycle, floor 1. The previous condition
+    //       (`access_count == 0`) was structurally unreachable for any
+    //       row ever recalled — priority only ever went UP. Rows above
+    //       the ceiling never decay: operator-set 8-10 intent is
+    //       indistinguishable from legacy ratcheted rows, and silently
+    //       eroding operator signal is strictly worse than leaving a
+    //       legacy row inflated (fail-safe).
     //   else no change.
     let now = chrono::Utc::now();
     let before = mem.priority;
@@ -649,11 +706,16 @@ fn apply_priority_feedback(
         .map(chrono::DateTime::<chrono::Utc>::from);
 
     let recent = last_accessed.is_some_and(|t| (now - t).num_days() <= 7);
-    let cold_enough = created.is_some_and(|t| (now - t).num_days() >= 30);
+    let cold_enough =
+        created.is_some_and(|t| (now - t).num_days() >= crate::models::PRIORITY_DECAY_STALE_DAYS);
+    let stale = last_accessed.map_or(cold_enough, |t| {
+        (now - t).num_days() >= crate::models::PRIORITY_DECAY_STALE_DAYS
+    });
 
-    if mem.access_count >= 10 && recent && after < 10 {
-        after = after.saturating_add(1).min(10);
-    } else if mem.access_count == 0 && cold_enough && after > 1 {
+    let ceiling = i32::try_from(crate::models::ACCESS_PRIORITY_CEILING).unwrap_or(7);
+    if mem.access_count >= 10 && recent && after < ceiling {
+        after = after.saturating_add(1).min(ceiling);
+    } else if stale && after > 1 && after <= ceiling {
         after = after.saturating_sub(1).max(1);
     }
 
@@ -1949,6 +2011,62 @@ mod tests {
         }
     }
 
+    /// v1.0.0 #2339 (FBL-34) — the decay arm is REACHABLE for accessed
+    /// rows (staleness-based, not the structurally-dead access_count==0),
+    /// bounded (-1/cycle, floor 1), and SCOPED to the access band so
+    /// operator-set 8-10 priorities never silently erode; the up-arm caps
+    /// at ACCESS_PRIORITY_CEILING.
+    #[test]
+    fn priority_feedback_decay_reachable_and_operator_band_protected_2339() {
+        let (_tmp, conn) = setup_conn();
+        let stale_ts = (chrono::Utc::now() - chrono::Duration::days(40)).to_rfc3339();
+        let old_created = (chrono::Utc::now() - chrono::Duration::days(90)).to_rfc3339();
+
+        // (a) Accessed-but-stale row inside the band DECAYS (pre-fix the
+        // arm required access_count == 0 — unreachable once ever recalled).
+        let mut stale = sample_mem("stale2339", "ns", "T1", "content", Tier::Mid);
+        stale.priority = 6;
+        stale.access_count = 50;
+        stale.created_at = old_created.clone();
+        stale.last_accessed_at = Some(stale_ts.clone());
+        db::insert(&conn, &stale).unwrap();
+        match apply_priority_feedback(&conn, &stale, false).unwrap() {
+            Some(RollbackEntry::PriorityAdjust { before, after, .. }) => {
+                assert_eq!(before, 6);
+                assert_eq!(after, 5, "stale accessed row decays -1");
+            }
+            other => panic!("expected decay PriorityAdjust, got {other:?}"),
+        }
+
+        // (b) Operator band (8-10) NEVER decays — indistinguishable from
+        // explicit operator intent (fail-safe).
+        let mut operator = sample_mem("op2339", "ns", "T2", "content", Tier::Long);
+        operator.priority = 9;
+        operator.access_count = 50;
+        operator.created_at = old_created.clone();
+        operator.last_accessed_at = Some(stale_ts);
+        db::insert(&conn, &operator).unwrap();
+        assert!(
+            apply_priority_feedback(&conn, &operator, false)
+                .unwrap()
+                .is_none(),
+            "operator-band priority must not decay"
+        );
+
+        // (c) The hot up-arm stops at the ceiling — no bump into 8-10.
+        let mut hot = sample_mem("hot2339", "ns", "T3", "content", Tier::Mid);
+        hot.priority = i32::try_from(crate::models::ACCESS_PRIORITY_CEILING).unwrap();
+        hot.access_count = 100;
+        hot.last_accessed_at = Some(chrono::Utc::now().to_rfc3339());
+        db::insert(&conn, &hot).unwrap();
+        assert!(
+            apply_priority_feedback(&conn, &hot, false)
+                .unwrap()
+                .is_none(),
+            "the access ratchet must not push past the ceiling"
+        );
+    }
+
     #[test]
     fn dry_run_autonomy_does_not_write() {
         // Verify dry-run mode prevents all writes to DB
@@ -2189,6 +2307,87 @@ mod tests {
         // Dry-run preserves BOTH rows.
         assert!(db::get(&conn, "old").unwrap().is_some());
         assert!(db::get(&conn, "new").unwrap().is_some());
+    }
+
+    /// v1.0.0 #2337 (FBL-26) — the PRODUCTION marker direction: both live
+    /// writers (store-time legacy classifier + curator
+    /// `persist_contradiction`) stamp `confirmed_contradictions` on the
+    /// NEWER row pointing at the OLDER one (and the persisting update
+    /// bumps the bearer's `updated_at`), so the pre-fix bearer-is-loser
+    /// condition never fired. The bidirectional pass must conserve the
+    /// LISTED (older) row as the loser with the bearer as winner.
+    #[test]
+    fn forget_if_superseded_conserves_older_when_marker_on_newer_row_2337() {
+        let (_tmp, conn) = setup_conn();
+        let mut older = sample_mem(
+            "old2337",
+            "facts",
+            "fact v1",
+            "the sky is green",
+            Tier::Long,
+        );
+        older.updated_at = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        // Marker on the NEWER row (the production writers' direction).
+        let mut newer = sample_mem("new2337", "facts", "fact v2", "the sky is blue", Tier::Long);
+        newer.metadata["confirmed_contradictions"] = serde_json::json!(["old2337"]);
+        db::insert(&conn, &older).unwrap();
+        db::insert(&conn, &newer).unwrap();
+
+        let result =
+            forget_if_superseded(&conn, &newer, &[older.clone(), newer.clone()], false).unwrap();
+        match result {
+            Some(RollbackEntry::ConserveContradiction {
+                loser_id,
+                winner_id,
+                ..
+            }) => {
+                assert_eq!(loser_id, "old2337", "the LISTED older row is the loser");
+                assert_eq!(winner_id, "new2337", "the marker bearer is the winner");
+            }
+            other => panic!("expected ConserveContradiction, got {other:?}"),
+        }
+
+        // BOTH rows retained (G7 conserve, never delete)…
+        let old_row = db::get(&conn, "old2337").unwrap().expect("older retained");
+        assert!(db::get(&conn, "new2337").unwrap().is_some());
+        // …the soft-loser markers landed on the OLDER row…
+        assert_eq!(
+            old_row
+                .metadata
+                .get(field_names::CONTRADICTION_SOFT_LOSER)
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "soft-loser marker lands on the correct (older) side"
+        );
+        assert_eq!(
+            old_row
+                .metadata
+                .get(field_names::CONTRADICTION_WINNER_ID)
+                .and_then(serde_json::Value::as_str),
+            Some("new2337")
+        );
+        // …and the canonical contradicts edge exists.
+        let (src, _tgt) = db::canonical_contradiction_pair("old2337", "new2337");
+        let links = db::get_links(&conn, src).unwrap();
+        assert!(
+            links
+                .iter()
+                .any(|l| l.relation == crate::models::MemoryLinkRelation::Contradicts),
+            "contradicts edge written"
+        );
+
+        // Idempotence: a second pass over the SAME pair is a no-op (the
+        // older row now carries the conserved marker).
+        let refreshed_old = db::get(&conn, "old2337").unwrap().unwrap();
+        let refreshed_new = db::get(&conn, "new2337").unwrap().unwrap();
+        let again = forget_if_superseded(
+            &conn,
+            &refreshed_new,
+            &[refreshed_old, refreshed_new.clone()],
+            false,
+        )
+        .unwrap();
+        assert!(again.is_none(), "re-entry gate holds on the listed side");
     }
 
     /// `forget_if_superseded` skips non-string entries in the
