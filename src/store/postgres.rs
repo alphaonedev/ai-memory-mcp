@@ -8143,18 +8143,27 @@ impl PostgresStore {
             .map_err(|e| to_store_err("cypher kg_invalidate read", e))?;
 
         if prior_rows.is_empty() {
-            // No matching edge — mirror the SQLite path's `Ok(None)`
-            // contract by surfacing `found = false`. The transaction
-            // still commits so the LOAD/SET search_path pair don't
-            // leak across pool checkouts.
+            // #2375 (FIX #7) — MATCH-miss fall-through. Under
+            // `AI_MEMORY_AGE_PROJECTION_MODE=deferred` a freshly-written link
+            // exists relationally + in `kg_projection_outbox` but is NOT YET in
+            // AGE, so this MATCH misses. Returning `found=false` here would
+            // SILENTLY DROP the invalidation — the relational `memory_links`
+            // UPDATE below is on the HIT path only. Commit this AGE tx first (so
+            // the `SET LOCAL` search_path does not leak across the pool checkout)
+            // then fall through to `kg_invalidate_cte`'s relational
+            // `UPDATE ... RETURNING`, so a relationally-present edge is ALWAYS
+            // invalidated regardless of projection lag (also covers a
+            // projected-then-unprojected edge and a quarantined-outbox edge). The
+            // drainer re-reads `valid_until` from `memory_links` at projection
+            // time (#2377 FIX #9), so the deferred AGE edge lands
+            // already-invalidated. A truly-absent edge still returns
+            // `found=false` from the CTE — same contract as before.
             tx.commit()
                 .await
                 .map_err(|e| to_store_err(CTX_COMMIT_AGE_TX, e))?;
-            return Ok(KgInvalidateRow {
-                found: false,
-                valid_until: String::new(),
-                previous_valid_until: None,
-            });
+            return self
+                .kg_invalidate_cte(source_id, target_id, relation, valid_until)
+                .await;
         }
 
         let prior_raw: String = prior_rows[0]
@@ -9364,6 +9373,9 @@ impl PostgresStore {
                     &link.source_id,
                     &link.target_id,
                     link.relation.as_str(),
+                    // #2377 (FIX #9) — the just-bound relational validity.
+                    Some(valid_from_str.as_str()),
+                    valid_until_str.as_deref(),
                 )
                 .await
                 {
@@ -9459,17 +9471,26 @@ impl PostgresStore {
             // the link is gone, drop the orphaned outbox row WITHOUT
             // MERGEing — this is what makes deferred mode race-free against a
             // concurrent delete with no new schema/op column.
-            let (link_still_exists,): (bool,) = sqlx::query_as(
-                "SELECT EXISTS(SELECT 1 FROM memory_links \
-                 WHERE source_id = $1 AND target_id = $2 AND relation = $3)",
+            // #2377 (FIX #9) — re-read the relational row's temporal-validity
+            // in the SAME existence-check (`fetch_optional` doubles as the
+            // #1783 existence guard: `None` => the link was deleted between
+            // enqueue and drain). Threading `valid_from`/`valid_until` into
+            // the projection makes a link BORN with `valid_until` set (or one
+            // since-invalidated via the #2375 fall-through, which writes only
+            // `memory_links`) land in AGE ALREADY-carrying its validity —
+            // instead of a bare `{relation}` edge the current-view filter
+            // serves as VALID forever. No `kg_projection_outbox` schema change.
+            let existing: Option<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)> = sqlx::query_as(
+                "SELECT valid_from, valid_until FROM memory_links \
+                     WHERE source_id = $1 AND target_id = $2 AND relation = $3",
             )
             .bind(&source_id)
             .bind(&target_id)
             .bind(&relation)
-            .fetch_one(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| to_store_err("kg_projection_outbox existence check", e))?;
-            if !link_still_exists {
+            let Some((valid_from, valid_until)) = existing else {
                 sqlx::query("UPDATE kg_projection_outbox SET projected_at = now() WHERE id = $1")
                     .bind(id)
                     .execute(&mut *tx)
@@ -9479,8 +9500,19 @@ impl PostgresStore {
                     .await
                     .map_err(|e| to_store_err("commit drop deleted-link outbox row", e))?;
                 continue;
-            }
-            match project_link_into_age(&mut tx, &source_id, &target_id, &relation).await {
+            };
+            let valid_from_str = valid_from.map(|t| t.to_rfc3339());
+            let valid_until_str = valid_until.map(|t| t.to_rfc3339());
+            match project_link_into_age(
+                &mut tx,
+                &source_id,
+                &target_id,
+                &relation,
+                valid_from_str.as_deref(),
+                valid_until_str.as_deref(),
+            )
+            .await
+            {
                 Ok(()) => {
                     sqlx::query(
                         "UPDATE kg_projection_outbox SET projected_at = now() WHERE id = $1",
@@ -13201,6 +13233,14 @@ async fn project_link_into_age(
     source_id: &str,
     target_id: &str,
     relation: &str,
+    // #2377 (FIX #9) — the relational row's temporal-validity, already in
+    // `to_rfc3339()` form so the agtype STRING comparison in the current-view
+    // Cypher filter (`e.valid_until IS NULL OR e.valid_until > $now`,
+    // `build_kg_query_current_view_cypher`) matches the dual-written mirror
+    // BYTE-for-byte. `None` => the property is not set on the MERGEd edge (so
+    // `e.valid_until IS NULL` keeps a never-invalidated edge visible).
+    valid_from: Option<&str>,
+    valid_until: Option<&str>,
 ) -> StoreResult<()> {
     // Defence-in-depth: confirm the relation is in the
     // validator's accepted shape before interpolating it into the
@@ -13304,14 +13344,38 @@ async fn project_link_into_age(
     // directly. The relation property is also stored on the edge so
     // typeless traversals (`find_paths_cypher`) can read it back
     // through `last(r).relation` without a second lookup.
+    //
+    // #2377 (FIX #9) — thread the row's temporal-validity onto the edge.
+    // Pre-fix the MERGE carried only `{relation}`, so a link BORN with
+    // `valid_until` set (a federation relay of an already-invalidated edge,
+    // or a caller temporal link) was served VALID by the current-view Cypher
+    // filter FOREVER while relational reads excluded it. We `SET` each of
+    // `valid_from`/`valid_until` only when non-NULL — leaving the property
+    // ABSENT (never `SET ... = null`, which AGE treats as REMOVE) so a
+    // never-invalidated edge keeps the `e.valid_until IS NULL` fast-path.
+    let mut set_clauses: Vec<&str> = Vec::new();
+    let mut edge_pairs: Vec<(&str, &str)> =
+        vec![("src", source_id), ("dst", target_id), ("rel", relation)];
+    if let Some(vf) = valid_from {
+        set_clauses.push("r.valid_from = $valid_from");
+        edge_pairs.push(("valid_from", vf));
+    }
+    if let Some(vu) = valid_until {
+        set_clauses.push("r.valid_until = $valid_until");
+        edge_pairs.push(("valid_until", vu));
+    }
+    let set_fragment = if set_clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" SET {}", set_clauses.join(", "))
+    };
     let edge_cypher = format!(
         "MATCH (a:Memory {{id: $src}}), (b:Memory {{id: $dst}}) \
-         MERGE (a)-[r:{relation} {{relation: $rel}}]->(b) RETURN r"
+         MERGE (a)-[r:{relation} {{relation: $rel}}]->(b){set_fragment} RETURN r"
     );
     let edge_sql =
         format!("SELECT r FROM cypher('memory_graph', $$ {edge_cypher} $$, $1) AS (r agtype)");
-    let edge_params =
-        age_params_jsonb(&[("src", source_id), ("dst", target_id), ("rel", relation)]);
+    let edge_params = age_params_jsonb(&edge_pairs);
     sqlx::query(&edge_sql)
         .bind(Agtype(edge_params))
         .fetch_all(&mut **tx)
@@ -16735,13 +16799,18 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err("delete memory_link", e))?;
         let removed = res.rows_affected() > 0;
 
-        if removed
-            && matches!(self.kg_backend, KgBackend::Age)
-            && matches!(
-                crate::config::age_projection_mode(),
-                crate::config::AgeProjectionMode::Sync
-            )
-        {
+        if removed && matches!(self.kg_backend, KgBackend::Age) {
+            // #2376 (FIX #8) — unproject UNCONDITIONALLY on `KgBackend::Age`,
+            // precedent-copy of `run_gc`'s unproject posture (no vote needed).
+            // Pre-fix this was gated on `Sync` mode, but `kg_query`/`kg_timeline`
+            // stay AGE-cypher-served under `deferred`, so an edge already drained
+            // into AGE then deleted was served by cypher FOREVER — no drainer
+            // work-item removes a DELETED edge. Under `deferred` the cost is one
+            // best-effort statement: the SAVEPOINT already degrades any AGE
+            // runtime failure to a WARN, and a still-pending (un-drained) edge's
+            // DETACH-DELETE MATCH is a clean no-op (the drainer's existence-check
+            // then drops the orphaned outbox row).
+            //
             // Mirror the link-INSERT projection discipline (#1542): the
             // whole unprojection rides a SAVEPOINT so an AGE runtime
             // failure rolls back to a healthy outer tx and degrades to a
@@ -17521,11 +17590,19 @@ impl MemoryStore for PostgresStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("savepoint age_link_projection", e))?;
+            // #2377 (FIX #9) — a federation relay of an already-invalidated
+            // edge carries `valid_until`; project it onto the AGE edge so the
+            // receiver's current-view Cypher reads exclude it exactly as the
+            // relational reads do (else the relayed retraction is lost graph-side).
+            let vf_str = valid_from.map(|t| t.to_rfc3339());
+            let vu_str = valid_until.map(|t| t.to_rfc3339());
             match project_link_into_age(
                 &mut tx,
                 &link.source_id,
                 &link.target_id,
                 link.relation.as_str(),
+                vf_str.as_deref(),
+                vu_str.as_deref(),
             )
             .await
             {
@@ -19706,11 +19783,17 @@ impl MemoryStore for PostgresStore {
                             .execute(&mut *tx)
                             .await
                             .map_err(|e| to_store_err("savepoint age_consolidate_projection", e))?;
+                        // #2377 (FIX #9) — the consolidate lineage edge is
+                        // born at `now` with no `valid_until` (unbounded); pass
+                        // the same validity the relational INSERT bound above.
+                        let consolidate_vf = now.to_rfc3339();
                         match project_link_into_age(
                             &mut tx,
                             &new_id,
                             id,
                             crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
+                            Some(consolidate_vf.as_str()),
+                            None,
                         )
                         .await
                         {
@@ -21537,7 +21620,16 @@ impl MemoryStore for PostgresStore {
         // re-projected into the AGE graph below (only edges this INSERT
         // landed; ON CONFLICT skips report nothing, which is correct —
         // an already-present edge is already projected or queued).
-        let restored_edges: Vec<(String, String, String)> = sqlx::query_as(
+        // #2377 (FIX #9) — RETURNING carries `valid_from`/`valid_until` too so a
+        // restored already-invalidated edge re-projects into AGE ALREADY-carrying
+        // its validity (else the current-view Cypher reads would serve it as VALID).
+        let restored_edges: Vec<(
+            String,
+            String,
+            String,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+        )> = sqlx::query_as(
             "INSERT INTO memory_links (
                  source_id, target_id, relation, created_at, valid_from,
                  valid_until, observed_by, signature, attest_level
@@ -21550,7 +21642,7 @@ impl MemoryStore for PostgresStore {
                AND EXISTS (SELECT 1 FROM memories m WHERE m.id = aml.source_id)
                AND EXISTS (SELECT 1 FROM memories m WHERE m.id = aml.target_id)
              ON CONFLICT (source_id, target_id, relation) DO NOTHING
-             RETURNING source_id, target_id, relation",
+             RETURNING source_id, target_id, relation, valid_from, valid_until",
         )
         .bind(id)
         .fetch_all(&mut *tx)
@@ -21570,11 +21662,13 @@ impl MemoryStore for PostgresStore {
         // restore (#700/#1542 posture — the graph is derived data; the
         // restore of the durable rows must never be blocked by it).
         if matches!(self.kg_backend, KgBackend::Age) {
-            for (src, dst, rel) in &restored_edges {
+            for (src, dst, rel, valid_from, valid_until) in &restored_edges {
                 if matches!(
                     crate::config::age_projection_mode(),
                     crate::config::AgeProjectionMode::Deferred
                 ) {
+                    // Deferred: the drainer re-reads validity from memory_links
+                    // (#2377 FIX #9) at drain time, so no validity is threaded here.
                     sqlx::query(
                         "INSERT INTO kg_projection_outbox (source_id, target_id, relation) \
                          VALUES ($1, $2, $3)",
@@ -21590,7 +21684,19 @@ impl MemoryStore for PostgresStore {
                         .execute(&mut *tx)
                         .await
                         .map_err(|e| to_store_err("savepoint age_restore_projection", e))?;
-                    match project_link_into_age(&mut tx, src, dst, rel).await {
+                    // #2377 (FIX #9) — carry the restored edge's validity.
+                    let vf_str = valid_from.map(|t| t.to_rfc3339());
+                    let vu_str = valid_until.map(|t| t.to_rfc3339());
+                    match project_link_into_age(
+                        &mut tx,
+                        src,
+                        dst,
+                        rel,
+                        vf_str.as_deref(),
+                        vu_str.as_deref(),
+                    )
+                    .await
+                    {
                         Ok(()) => {
                             sqlx::query("RELEASE SAVEPOINT age_restore_projection")
                                 .execute(&mut *tx)
