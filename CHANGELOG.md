@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Offload TTL sweep no longer holds the global `Db` mutex across its per-row sleeps — up to ~10s of full HTTP stall per pass eliminated** ([#2359](https://github.com/alphaonedev/ai-memory-mcp/issues/2359); v1.0.0 pre-ship, roadmap-3x7 #18). `src/background/offload_ttl_sweep.rs::spawn` acquired the single `Arc<Mutex<(Connection, …)>>` that serves EVERY HTTP handler and held it across the whole sweep pass, while `offload::sweep_expired` runs a synchronous `std::thread::sleep(10ms)` between each of up to `MAX_PER_RUN=1000` deletes — worst case ~10s where every concurrent HTTP request blocked on `state.lock()`, plus a tokio worker parked on a blocking sleep inside an async task (the module doc admitted the hazard and deferred it to a "v0.8.0" that never shipped). `spawn` now locks **per chunk**: it acquires the lock, deletes at most `CHUNK_CAP=50` rows with `Duration::ZERO` in-pass sleep, drops the lock, then performs the `SLEEP_BETWEEN_CHUNKS=10ms` pacing sleep OUTSIDE the lock via `tokio::time::sleep`, repeating until the cumulative `MAX_PER_RUN` cap is reached or a chunk drains the backlog — so concurrent HTTP handlers acquire the shared mutex between chunks. `offload::sweep_expired` is unchanged (it already accepts a per-run cap + sleep `Duration`); the `SweepAdapter` trait's per-pass `run_sweep` became the chunked `run_sweep_chunk(now, chunk_cap)`. Regression: `background::offload_ttl_sweep::tests::lock_released_between_chunks_2359` (a `#[tokio::test(start_paused = true)]` proving the mutex is free during the inter-chunk sleep while the sweep is mid-pass). No new MCP tool / HTTP route / CLI subcommand / DB migration — no SSOT-count move.
+
 ## [1.0.0] — 2026-07-21
 
 ### Security
