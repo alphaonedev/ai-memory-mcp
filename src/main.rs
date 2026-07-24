@@ -66,6 +66,17 @@ fn main() -> Result<()> {
     // tokio runtime workers) exists. See `daemon_runtime::apply_startup_env`.
     daemon_runtime::apply_startup_env(&cli, &app_config)?;
 
+    // #2386 (v1.0.0 #1961 posture) — resolve + enforce the security posture
+    // HERE too, under the same #1889 pre-runtime contract: under `asi-hard`
+    // the enforcement PINS every unset fail-closed knob via
+    // `std::env::set_var`, which must never run once the tracing appender
+    // worker (spawned by `init_file_logging` below) or a tokio runtime
+    // worker exists. Fail-closed: a loosening override or a garbage posture
+    // token aborts the boot right here, before anything else starts. The
+    // async body logs the stashed pin report via the READ-ONLY
+    // `security_profile::runtime_boot_report`.
+    ai_memory::security_profile::enforce_at_boot_pre_runtime()?;
+
     // v0.7.0 K3 — pin the process-wide governance gate posture before
     // any subcommand has a chance to call `db::enforce_governance`.
     // Idempotent (`OnceLock::set`); first writer wins.
