@@ -859,6 +859,77 @@ pub async fn delete_link(
         }),
     );
 
+    // FBL-08 (v1.0.0 pre-ship 3x7) — route the destructive link delete
+    // through the SAL trait on a postgres-backed daemon so it hits the
+    // CONFIGURED store. Pre-fix this handler ran `db::delete_link` against
+    // the LOCAL sqlite `app.db` regardless of backend, silently mutating
+    // an unrelated scratch DB while the postgres `memory_links` row + AGE
+    // edge survived and the caller got a false `{"deleted": false}`.
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
+        // Owner-gate parity with the sqlite #939 gate below: the caller
+        // must own EITHER endpoint (links are symmetric — either party
+        // can sever). A missing source memory falls through to
+        // delete_link, which reports `deleted:false` (the pair can't
+        // hold an edge), mirroring the sqlite missing-source path.
+        match app.store.get(&ctx, &source_id).await {
+            Ok(source_mem) => {
+                let source_owner = source_mem
+                    .metadata
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let source_target = source_mem
+                    .metadata
+                    .get(field_names::TARGET_AGENT_ID)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let target_mem_owner = app.store.get(&ctx, &target_id).await.ok().and_then(|m| {
+                    m.metadata
+                        .get("agent_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                });
+                let is_unowned_legacy =
+                    source_owner.is_empty() && target_mem_owner.as_deref().unwrap_or("").is_empty();
+                let owns_source = source_owner == caller || source_target == caller;
+                let owns_target = target_mem_owner.as_deref() == Some(caller.as_str());
+                if !is_unowned_legacy
+                    && !owns_source
+                    && !owns_target
+                    && caller != sentinels::DAEMON_PRINCIPAL
+                {
+                    tracing::warn!(
+                        target: super::AUTHZ_TRACE_TARGET,
+                        "DELETE /api/v1/links 403 (postgres): caller {caller} owns neither source {source_owner} nor target {} (source_id={source_id})",
+                        target_mem_owner.as_deref().unwrap_or("")
+                    );
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "error": "caller does not own either endpoint of this link",
+                            "source_owner": source_owner,
+                            "target_owner": target_mem_owner.unwrap_or_default(),
+                            "caller": caller,
+                            "source_id": source_id,
+                            "target_id": target_id,
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+            Err(crate::store::StoreError::NotFound { .. }) => {}
+            Err(e) => return store_err_to_response(e),
+        }
+        return match app.store.delete_link(&ctx, &source_id, &target_id).await {
+            Ok(removed) => Json(json!({"deleted": removed})).into_response(),
+            Err(e) => store_err_to_response(e),
+        };
+    }
+
     // #939 SECURITY-high (Track A QC sweep, 2026-05-20) — caller-vs-
     // source-or-target-memory-owner gate. Pre-fix any caller could
     // remove any directional link in the graph regardless of who

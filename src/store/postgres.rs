@@ -358,6 +358,16 @@ const MIGRATION_V84_EMBEDDING_SPACE: &str =
 const MIGRATION_V85_ARCHIVED_VALID_TIME: &str =
     include_str!("../../migrations/postgres/0042_v85_archived_valid_time.sql");
 
+/// v1.0.0 #2333 (FBL-03) — schema v87: mirror the v79 (#1945)
+/// denormalized `kind_provenance` column onto `archived_memories`
+/// (the third v79 column; its two siblings landed at v85/#2035), so
+/// archive→restore stops dropping the SQL-queryable epistemic-provenance
+/// copy. Additive `ADD COLUMN IF NOT EXISTS`, no rewrite. The sqlite v87
+/// arm additionally heals legacy `expires_at` renderings (#2332) —
+/// postgres needs no expiry heal (`expires_at` is TIMESTAMPTZ here).
+const MIGRATION_V87_ARCHIVED_KIND_PROVENANCE: &str =
+    include_str!("../../migrations/postgres/0044_v87_archived_kind_provenance.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -728,7 +738,13 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       unparseable values); the write funnels canonicalize from v86 on.
 //       Doc twin: migrations/postgres/0043_v86_valid_time_canonicalize.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 86;
+// v87 — #2333 (FBL-03): `archived_memories.kind_provenance` — the third
+//       v79 (#1945) column mirrored onto the archive (siblings landed at
+//       v85/#2035) so archive→restore stops dropping the denormalized
+//       epistemic-provenance copy. Additive ADD COLUMN IF NOT EXISTS.
+//       Doc twin: migrations/postgres/0044_v87_archived_kind_provenance.sql.
+//       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
+const CURRENT_SCHEMA_VERSION: i32 = 87;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1860,8 +1876,11 @@ impl PostgresStore {
         if current_version < 85 {
             self.migrate_v85().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 86 {
             self.migrate_v86().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v87().await?;
         }
 
         Ok(())
@@ -4460,7 +4479,7 @@ impl PostgresStore {
                 }
             }
         }
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        record_schema_version(&mut tx, 86).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v86 migration", e))?;
@@ -4468,6 +4487,28 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v86 applied (#1834 pre-ship 3x7: claim \
              valid-time renderings canonicalized to fixed UTC)"
+        );
+        Ok(())
+    }
+
+    async fn migrate_v87(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v87 ddl tx", e))?;
+        sqlx::raw_sql(MIGRATION_V87_ARCHIVED_KIND_PROVENANCE)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v87 archived kind_provenance ddl", e))?;
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v87 migration", e))?;
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v87 applied (#2333 FBL-03: archived_memories.\
+             kind_provenance archive-column parity)"
         );
         Ok(())
     }
@@ -13317,6 +13358,42 @@ async fn unproject_memory_from_age_inner(
     Ok(())
 }
 
+/// FBL-08 (v1.0.0) — best-effort AGE EDGE unprojection for
+/// [`PostgresStore::delete_link`]. Deletes every relationship between the
+/// two `Memory` nodes (all relations, matching the relational
+/// `DELETE ... WHERE source_id = $1 AND target_id = $2`) WITHOUT touching
+/// the nodes themselves (contrast [`unproject_memory_from_age_inner`],
+/// which `DETACH DELETE`s a node on a memory hard-delete). Mirrors the
+/// [`project_link_into_age`] discipline (tolerated LOAD + `SET LOCAL`
+/// search_path; the id is bound through the params surface, never
+/// interpolated). Called under a SAVEPOINT so an AGE runtime failure
+/// degrades to a warn rather than aborting the relational delete.
+async fn unproject_link_from_age(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    source_id: &str,
+    target_id: &str,
+) -> StoreResult<()> {
+    // #1542/#1640 — shared tolerated-LOAD helper.
+    load_age_tolerated(tx).await?;
+    sqlx::query(SQL_SET_AGE_SEARCH_PATH)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("set search_path (unproject_link)", e))?;
+    // AGE 1.5.0 requires both the `AS (col agtype)` column list and a
+    // trailing RETURN even for a write; the endpoint ids are bound
+    // through the params surface exactly like the link MERGE.
+    let sql = "SELECT r FROM cypher('memory_graph', \
+         $$ MATCH (s:Memory {id: $src})-[r]->(t:Memory {id: $dst}) DELETE r RETURN r $$, \
+         $1) AS (r agtype)";
+    let params = age_params_jsonb(&[("src", source_id), ("dst", target_id)]);
+    sqlx::query(sql)
+        .bind(Agtype(params))
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("unproject link edge from AGE", e))?;
+    Ok(())
+}
+
 /// from sqlx; the AGE branch needs this helper to mirror the same
 /// shape so the upper-layer handler stays backend-blind.
 fn agtype_optional_string(s: &str) -> Option<String> {
@@ -16565,6 +16642,86 @@ impl MemoryStore for PostgresStore {
             .collect()
     }
 
+    /// FBL-08 (v1.0.0) — remove the directional link(s) `source_id →
+    /// target_id` from the postgres store. The relational `DELETE FROM
+    /// memory_links` is the source of truth (all relations between the
+    /// pair, matching the sqlite `db::delete_link` contract); the AGE
+    /// `memory_graph` edge mirror is unprojected best-effort in the SAME
+    /// tx under `sync` projection mode so a subsequent cypher-backed
+    /// `find_paths` does not traverse a phantom edge. Under `deferred`
+    /// mode the AGE mirror is already read via the relational recursive-
+    /// CTE, so a lagging edge is tolerated (no inline unprojection).
+    async fn delete_link(
+        &self,
+        _ctx: &CallerContext,
+        source_id: &str,
+        target_id: &str,
+    ) -> StoreResult<bool> {
+        self.gate_record_stop()?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin delete_link tx", e))?;
+
+        let res = sqlx::query("DELETE FROM memory_links WHERE source_id = $1 AND target_id = $2")
+            .bind(source_id)
+            .bind(target_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("delete memory_link", e))?;
+        let removed = res.rows_affected() > 0;
+
+        if removed
+            && matches!(self.kg_backend, KgBackend::Age)
+            && matches!(
+                crate::config::age_projection_mode(),
+                crate::config::AgeProjectionMode::Sync
+            )
+        {
+            // Mirror the link-INSERT projection discipline (#1542): the
+            // whole unprojection rides a SAVEPOINT so an AGE runtime
+            // failure rolls back to a healthy outer tx and degrades to a
+            // warn instead of aborting the canonical relational delete.
+            sqlx::query("SAVEPOINT age_link_unprojection")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("savepoint age_link_unprojection", e))?;
+            match unproject_link_from_age(&mut tx, source_id, target_id).await {
+                Ok(()) => {
+                    sqlx::query("RELEASE SAVEPOINT age_link_unprojection")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| to_store_err("release savepoint age_link_unprojection", e))?;
+                }
+                Err(e) if is_age_runtime_failure(&e) => {
+                    sqlx::query("ROLLBACK TO SAVEPOINT age_link_unprojection")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e2| {
+                            to_store_err("rollback savepoint age_link_unprojection", e2)
+                        })?;
+                    tracing::warn!(
+                        target: TRACE_TARGET_KG,
+                        source_id = %source_id,
+                        target_id = %target_id,
+                        err = %e,
+                        "AGE edge unprojection skipped on link delete — \
+                         relational memory_links row(s) still removed. \
+                         find_paths_cypher may traverse a phantom edge until \
+                         the projection is rebuilt; the relational CTE is correct."
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit delete_link tx", e))?;
+        Ok(removed)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -17863,7 +18020,7 @@ impl MemoryStore for PostgresStore {
         // SQL standard (RHS of SET evaluates against the OLD row),
         // so the `access_count + 1` / `LEAST(...)` arithmetic
         // mirrors what the original ordered sequence saw.
-        sqlx::query(
+        sqlx::query(&format!(
             "UPDATE memories SET
                 access_count = LEAST(access_count + 1, 1000000),
                 last_accessed_at = NOW(),
@@ -17887,12 +18044,15 @@ impl MemoryStore for PostgresStore {
                 priority = CASE
                     WHEN LEAST(access_count + 1, 1000000) > 0
                          AND LEAST(access_count + 1, 1000000) % 10 = 0
-                         AND priority < 10
-                        THEN LEAST(priority + 1, 10)
+                         AND priority < {ceiling}
+                        THEN LEAST(priority + 1, {ceiling})
                     ELSE priority
                 END
              WHERE id = ANY($1)",
-        )
+            // v1.0.0 #2339 (FBL-34) — access bumps stop at the named
+            // ceiling (sqlite touch/touch_many parity).
+            ceiling = crate::models::ACCESS_PRIORITY_CEILING,
+        ))
         .bind(ids)
         .execute(&self.pool)
         .await
@@ -19755,7 +19915,7 @@ impl MemoryStore for PostgresStore {
             // verb applying metadata-only access bookkeeping (the same
             // sanction class as the legacy touch); it never rewrites
             // memory content.
-            let folded_ids: Vec<String> = sqlx::query_scalar(
+            let folded_ids: Vec<String> = sqlx::query_scalar(&format!(
                 "WITH batch AS (
                     SELECT memory_id
                       FROM recall_observations
@@ -19778,9 +19938,10 @@ impl MemoryStore for PostgresStore {
                 )
                 UPDATE memories m SET
                     access_count = LEAST(m.access_count + a.n, 1000000),
-                    priority = LEAST(m.priority
-                        + (LEAST(m.access_count + a.n, 1000000) / 10
-                           - m.access_count / 10)::int, 10),
+                    priority = CASE WHEN m.priority >= {ceiling} THEN m.priority
+                        ELSE LEAST(m.priority
+                            + (LEAST(m.access_count + a.n, 1000000) / 10
+                               - m.access_count / 10)::int, {ceiling}) END,
                     last_accessed_at = GREATEST(
                         COALESCE(m.last_accessed_at, a.t_max), a.t_max),
                     expires_at = CASE
@@ -19803,7 +19964,11 @@ impl MemoryStore for PostgresStore {
                  FROM agg a
                  WHERE m.id = a.memory_id
                 RETURNING m.id",
-            )
+                // v1.0.0 #2339 (FBL-34) — the fold's decade bump stops at
+                // the named ceiling (sqlite fold_recall_accesses parity);
+                // rows already above it keep their priority byte-identical.
+                ceiling = crate::models::ACCESS_PRIORITY_CEILING,
+            ))
             .bind(chunk_limit)
             .fetch_all(&self.pool)
             .await
@@ -23492,8 +23657,32 @@ impl MemoryStore for PostgresStore {
                 .await
                 .unwrap_or(0);
 
+        // v1.0.0 #2334 (FBL-15) — LIVE count (non-expired + lifecycle-
+        // visible, the boot/export definition) and the expired-awaiting-GC
+        // remainder, mirroring the sqlite `db::stats` twin so the expiry
+        // axis reconciles identically on both backends.
+        let live: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*)::BIGINT FROM memories \
+             WHERE (expires_at IS NULL OR expires_at > $1) {}",
+            crate::models::lifecycle_visible_clause("")
+        ))
+        .bind(now_dt)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("stats live", e))?;
+        let expired_pending_gc: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::BIGINT FROM memories \
+             WHERE expires_at IS NOT NULL AND expires_at <= $1",
+        )
+        .bind(now_dt)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("stats expired_pending_gc", e))?;
+
         Ok(crate::models::Stats {
             total: total_usize,
+            live: usize::try_from(live).unwrap_or(0),
+            expired_pending_gc: usize::try_from(expired_pending_gc).unwrap_or(0),
             by_tier,
             by_namespace,
             expiring_soon: usize::try_from(expiring_soon).unwrap_or(0),

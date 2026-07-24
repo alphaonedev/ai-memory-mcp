@@ -62,6 +62,20 @@ pub(crate) const HTTP_AUTH_TRACE_TARGET: &str = "http::auth";
 /// `federation_signing_check`.
 pub(crate) const QUOTA_REFUSED_FIELD: &str = "quota_refused";
 
+/// #2341 (W1A2-01/02) — `skipped` count field on the federation
+/// `/sync/push` response envelope (sqlite + postgres arms). Shared with
+/// the sender-side ack classifier
+/// (`crate::federation::sync::success_report_non_ack_reason`) so the
+/// receiver report and the quorum/DLQ ack decision cannot drift apart.
+pub(crate) const SKIPPED_FIELD: &str = "skipped";
+
+/// #2341 (W1A2-01/02) — `unsupported_on_postgres` count field on the
+/// postgres federation `/sync/push` response envelope (the FED-RQ-01
+/// honest count of subcollections the pg receiver cannot apply). Shared
+/// with the sender-side ack classifier for the same no-drift reason as
+/// [`SKIPPED_FIELD`].
+pub(crate) const UNSUPPORTED_ON_POSTGRES_FIELD: &str = "unsupported_on_postgres";
+
 /// #1789 — ONE shared test lock serialising every test that mutates the
 /// federation peer-enrollment env vars
 /// (`AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT`,

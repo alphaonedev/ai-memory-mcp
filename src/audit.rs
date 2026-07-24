@@ -879,12 +879,77 @@ pub fn init_from_config(cfg: &crate::config::AuditConfig) -> Result<()> {
         }
         return Ok(());
     }
+
+    // FBL-31 leg 2 — the `schema_version` doc-comment claims the knob is
+    // "validated at init", but init read only enabled/path/redact_content/
+    // append_only, so `schema_version = 999` booted silently. Honour the
+    // documented contract: an explicit value MUST equal the binary's emitted
+    // [`SCHEMA_VERSION`]. Fail CLOSED (refuse boot) on a mismatch so an
+    // operator can never believe they pinned a forward-compat schema the binary
+    // does not actually emit. Unset (`None`) is a no-op (the default).
+    if let Some(v) = cfg.schema_version
+        && v != SCHEMA_VERSION
+    {
+        return Err(anyhow!(
+            "[audit] schema_version = {v} does not match the binary's emitted \
+             audit schema version {SCHEMA_VERSION}; the knob is validated at \
+             init (only the emitted version is supported today) — unset it or \
+             set schema_version = {SCHEMA_VERSION}"
+        ));
+    }
+
+    // FBL-31 leg 3 — `hash_chain` was never read anywhere; `hash_chain = false`
+    // was silently ignored (the cross-row chain is mandatory + load-bearing
+    // tamper-evidence). Rather than let the knob lie, refuse an explicit
+    // `false`: the chain cannot be disabled. `true`/unset proceed unchanged.
+    if cfg.hash_chain == Some(false) {
+        return Err(anyhow!(
+            "[audit] hash_chain = false is not supported — the cross-row audit \
+             hash chain is mandatory (the load-bearing tamper-evidence) and \
+             cannot be disabled; remove the key or set hash_chain = true"
+        ));
+    }
+
+    // FBL-31 leg 1 — the periodic `CHECKPOINT.sig` attestation marker is NOT
+    // yet implemented: no emission code exists and
+    // `effective_attestation_cadence_minutes` (which folds the compliance-preset
+    // cadence overrides) has no production consumer. Rather than silently
+    // advertise anti-truncation attestation an audit-enabled daemon does not
+    // get, emit a one-shot operator WARN naming the reserved status. This makes
+    // the dead knob non-silent (and gives the resolver a production caller so
+    // the preset cadence math is exercised). The load-bearing tamper-evidence
+    // is the separate signed_events witness/watermark chain, not this marker.
+    let cadence = cfg.effective_attestation_cadence_minutes();
+    if cadence > 0 {
+        warn_attestation_reserved_once(cadence);
+    }
+
     let resolved_path = resolve_audit_path(cfg);
     init(
         &resolved_path,
         cfg.redact_content.unwrap_or(true),
         cfg.append_only.unwrap_or(true),
     )
+}
+
+/// FBL-31 leg 1 — one-shot WARN that the periodic `CHECKPOINT.sig` attestation
+/// marker (`[audit] attestation_cadence_minutes`, and the compliance-preset
+/// cadence overrides it folds in) is configured but NOT yet emitted. Gated by a
+/// process-once flag so a repeated `init_from_config` (tests, hot-reload) does
+/// not spam the log.
+fn warn_attestation_reserved_once(cadence_minutes: u32) {
+    use std::sync::Once;
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            target: "audit.attestation",
+            cadence_minutes,
+            "[audit] periodic CHECKPOINT.sig attestation marker is configured \
+             (effective cadence {cadence_minutes}m) but is NOT yet emitted \
+             (reserved); the load-bearing anti-truncation tamper-evidence is \
+             the signed_events witness/watermark chain, not this marker"
+        );
+    });
 }
 
 /// Resolve the audit log file path from the config, honouring the
@@ -1043,6 +1108,80 @@ fn mark_append_only(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::models::Tier;
+
+    #[test]
+    fn init_from_config_rejects_schema_version_mismatch() {
+        // #2368 — init_from_config can mutate the process-wide sink slot;
+        // hold the shared sink lock like every other sink-touching test.
+        let _g = sink_test_lock();
+        // FBL-31 leg 2 — the "validated at init" contract is now real:
+        // an explicit schema_version != SCHEMA_VERSION fails CLOSED before any
+        // filesystem side effect.
+        let cfg = crate::config::AuditConfig {
+            enabled: Some(true),
+            schema_version: Some(SCHEMA_VERSION + 999),
+            ..Default::default()
+        };
+        let err = init_from_config(&cfg).expect_err("mismatched schema_version must fail closed");
+        assert!(
+            err.to_string().contains("schema_version"),
+            "error should name the offending knob: {err}"
+        );
+        // The matching value clears the schema_version gate (a later leg /
+        // sink-open may still run, but validation itself does not reject).
+        let ok = crate::config::AuditConfig {
+            enabled: Some(true),
+            schema_version: Some(SCHEMA_VERSION),
+            hash_chain: Some(false),
+            ..Default::default()
+        };
+        // hash_chain=false still trips leg 3, proving the schema check passed
+        // (a schema error would have short-circuited first with a different
+        // message).
+        let err2 = init_from_config(&ok).expect_err("hash_chain=false must fail closed");
+        assert!(
+            err2.to_string().contains("hash_chain"),
+            "with a matching schema_version the next gate (hash_chain) fires: {err2}"
+        );
+    }
+
+    #[test]
+    fn init_from_config_refuses_hash_chain_disable() {
+        // #2368 — see init_from_config_rejects_schema_version_mismatch.
+        let _g = sink_test_lock();
+        // FBL-31 leg 3 — hash_chain = false is unsupported (the chain is
+        // mandatory); the knob no longer silently lies.
+        let cfg = crate::config::AuditConfig {
+            enabled: Some(true),
+            hash_chain: Some(false),
+            ..Default::default()
+        };
+        let err = init_from_config(&cfg).expect_err("hash_chain=false must be refused");
+        assert!(
+            err.to_string().contains("hash_chain"),
+            "error should name hash_chain: {err}"
+        );
+    }
+
+    #[test]
+    fn init_from_config_disabled_is_noop_regardless_of_knobs() {
+        // #2368 — this arm NULLS the process-wide audit sink
+        // (`init_from_config` with enabled=false clears the slot), so
+        // running it without the shared sink lock raced every concurrent
+        // sink-holding test: the null landed between a peer test's `init`
+        // and `emit`, silently swallowing the emitted line (the CI flake
+        // that blocked PRs #2363/#2354/#2367). Hold the lock.
+        let _g = sink_test_lock();
+        // A disabled audit sink ignores the FBL-31 gates entirely (no boot
+        // refusal when audit is off), matching the documented no-op contract.
+        let cfg = crate::config::AuditConfig {
+            enabled: Some(false),
+            schema_version: Some(SCHEMA_VERSION + 999),
+            hash_chain: Some(false),
+            ..Default::default()
+        };
+        init_from_config(&cfg).expect("disabled audit is a no-op even with bad knobs");
+    }
 
     fn sample_event(seq: u64, prev: &str) -> AuditEvent {
         let mut ev = AuditEvent {

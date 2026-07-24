@@ -374,7 +374,17 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // stable). After the fold onto the #2266/#2267 27_035 file the extract
     // lands mod.rs at 26_362; ceiling 26_450 (+88). Per the QUAL-10 shrink
     // rule: "when a file's LOC SHRINKS (a refactor split), the ceiling falls".
-    ("src/storage/mod.rs", 26_450),
+    // 2026-07-23 (STORAGE-CHAIN lane #2331-#2339) — bumped 26_450 →
+    // 26_750 by the fable-3x7 data-integrity fixes: the #1626 tier→long
+    // expiry coupling (#2331), expires_at rendering canonicalization at
+    // all five write funnels (#2332), the v87 archived kind_provenance
+    // carry through 8 archive + 2 restore column lists (#2333), the
+    // federation expiry extension-floor lattice join (#2335), stats
+    // live/expired_pending_gc (#2334), the EmbeddableScan raw-cursor
+    // struct (#2336), the G7 soft-loser recall penalty (#2338), and the
+    // access-priority ceiling on the touch/fold ladders (#2339).
+    // Measured 26_675; ceiling 26_750 (+75 headroom).
+    ("src/storage/mod.rs", 26_750),
     // 2026-07-21 (#1802 R-05 S1) — NEW submodule extracted from
     // storage/mod.rs (doctor / observability probes). Measured 698;
     // ceiling 800 (+102).
@@ -872,7 +882,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `list_memories_updated_since` federation-send-path section header
     // (see tests/store_parity_gaps.rs::pg_list_memories_updated_since_decrypts_for_send_2303)
     // land the file at 28_810. Ceiling 28_800 -> 28_900 (+90 headroom).
-    ("src/store/postgres.rs", 28_900),
+    // 2026-07-23 (FBL-08 3x7): add the `PostgresStore::delete_link` SAL trait
+    // impl (relational DELETE + best-effort same-tx AGE edge unprojection
+    // under a SAVEPOINT) + the `unproject_link_from_age` edge-delete helper
+    // so `DELETE /api/v1/links` hits the configured store on a postgres
+    // daemon (was silently mutating a local sqlite file); land the file at
+    // 28_926. Ceiling 28_900 -> 29_020 (+94 headroom).
+    ("src/store/postgres.rs", 29_020),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -1022,7 +1038,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `try_load_from` Result-returning loaders (the hot-swap reload path
     // that PROPAGATES parse/validate errors instead of swallowing them to
     // default()) land config.rs at 12_897; ceiling 12_850 -> 12_950 (+53).
-    ("src/config.rs", 12_950),
+    // 2026-07-23 FBL-13/FBL-30/FBL-31 config-defaults-lie honesty fixes
+    // (max_memory_mb inert WARN + doc-correct, auto_extract reserved doc,
+    // audit schema_version/hash_chain/attestation doc + resolve/warn helper +
+    // regression test) land config.rs at 12_969; ceiling 12_950 -> 13_020
+    // (+51 headroom, lockstep).
+    ("src/config.rs", 13_020),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the
@@ -1194,7 +1215,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // coverage tests (bind/revoke × json/non-json + empty-token error) to clear
     // the daemon_runtime.rs per-module COVERAGE floor. Combined with #2045 L6
     // this lands daemon_runtime.rs at 10_676; ceiling 10_500 → 10_750.
-    ("src/daemon_runtime.rs", 11_450), /* 2026-07-17 #2167 extract run_sqlite_embedding_space_boot_maintenance helper + both-open-arms unit test to cover the boot-open Err arm (10_783). 2026-07-19 #2064 erasure gc-tick wiring stacked on the #2205 export --full + #1860 vectorlite serve/mcp boot funnels lands the merged file at 10_853; ceiling 10_850 -> 10_900 (lockstep). 2026-07-19 pre-ship 3x7: erasure sweep moved OFF the handler mutex (detached spawn_blocking arm + shared log helper) lands the file at 10_931; ceiling 10_900 -> 10_950 (lockstep). 2026-07-19 merged with the #2233/#2235 lineage boot-seed (+26) -> 10_957; ceiling 10_950 -> 11_000 (lockstep). 2026-07-19 #2271 consultation-posture mutation seam + behavior pin lands at 11_032; ceiling 11_000 -> 11_050 (lockstep). 2026-07-20 #2271 shutdown lifecycle hardening tracks every writer, bounds plain/TLS quiescence, drains deferred audit, and makes final witness/WAL certification fail closed; production plus regression coverage lands at 11_326, ceiling 11_050 -> 11_400 (+74 headroom, lockstep). 2026-07-21 #2290 sign the sync_cycle_once /sync/since pull GET (load daemon signing key + attach X-Memory-Sig/X-Memory-Nonce) lands the file at 11_406; ceiling 11_400 -> 11_450 (+44 headroom, lockstep). */
+    ("src/daemon_runtime.rs", 11_640), /* 2026-07-17 #2167 extract run_sqlite_embedding_space_boot_maintenance helper + both-open-arms unit test to cover the boot-open Err arm (10_783). 2026-07-19 #2064 erasure gc-tick wiring stacked on the #2205 export --full + #1860 vectorlite serve/mcp boot funnels lands the merged file at 10_853; ceiling 10_850 -> 10_900 (lockstep). 2026-07-19 pre-ship 3x7: erasure sweep moved OFF the handler mutex (detached spawn_blocking arm + shared log helper) lands the file at 10_931; ceiling 10_900 -> 10_950 (lockstep). 2026-07-19 merged with the #2233/#2235 lineage boot-seed (+26) -> 10_957; ceiling 10_950 -> 11_000 (lockstep). 2026-07-19 #2271 consultation-posture mutation seam + behavior pin lands at 11_032; ceiling 11_000 -> 11_050 (lockstep). 2026-07-20 #2271 shutdown lifecycle hardening tracks every writer, bounds plain/TLS quiescence, drains deferred audit, and makes final witness/WAL certification fail closed; production plus regression coverage lands at 11_326, ceiling 11_050 -> 11_400 (+74 headroom, lockstep). 2026-07-21 #2290 sign the sync_cycle_once /sync/since pull GET (load daemon signing key + attach X-Memory-Sig/X-Memory-Nonce) lands the file at 11_406; ceiling 11_400 -> 11_450 (+44 headroom, lockstep). 2026-07-23 FBL-22 postgres serve maintenance loop (spawn_postgres_maintenance_loop_if_enabled gc + archive-purge + lease-sweep pg twin + bootstrap wiring + 2 spawn/skip unit tests) lands the file at 11_573; ceiling 11_450 -> 11_640 (+67 headroom, lockstep). */
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
@@ -1287,7 +1308,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-17 (#2167 S1): the v84 embedding_space migration arm + SCHEMA
     // column doc land migrations.rs at 5_446; ceiling 5_450 (+4 headroom).
     // Additive ALTER-ADD-COLUMN migration only.
-    ("src/storage/migrations.rs", 5_650), /* 2026-07-19 #1834 pre-ship 3x7 v86 valid-time canonicalization arm + normalize_valid_time_rows helper (5_569); was 5_550 (2026-07-18 #2035 v85 arm, 5_491) */
+    ("src/storage/migrations.rs", 5_750), /* 2026-07-23 STORAGE-CHAIN #2333 v87 arm (archived kind_provenance + the #2332 normalize_expiry_rows heal), measured 5_671; was 5_650 (2026-07-19 #1834 v86 arm, 5_569) */
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.

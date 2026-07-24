@@ -982,6 +982,140 @@ fn fold_before_gc_retains_recalled_expiring_row() {
     );
 }
 
+#[test]
+fn gc_if_needed_folds_pending_extension_before_evicting_2308() {
+    // #2308 (FBL-04) regression — the `db::gc_if_needed` sites (MCP
+    // recall + the CLI store/recall/crud/io hot paths) and the MCP
+    // `memory_gc` real-run route ALL evict through `db::gc`, which must
+    // fold pending recall-access TTL extensions BEFORE evaluating
+    // expiry. Pre-#2308, MCP stdio (which spawns no fold loop) reaped a
+    // hot short-tier row here despite its pending extension — silent
+    // crypto-erasure when archive_on_gc=false.
+    let _g = env_lock();
+    clear_flags();
+    let (conn, _dir) = fresh_db();
+    // Two short-tier rows whose BASE 6h TTL has already lapsed
+    // (created 7h ago, expired 30min ago); only one is recalled.
+    let created = (chrono::Utc::now() - chrono::Duration::hours(7)).to_rfc3339();
+    let lapsed = (chrono::Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
+    for id in ["fbl04-recalled", "fbl04-control"] {
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at, \
+                                   expires_at) \
+             VALUES (?1, 'short', 'fbl04', ?1, 'c', ?2, ?2, ?3)",
+            rusqlite::params![id, created, lapsed],
+        )
+        .unwrap();
+    }
+    // A PURE recall appended an unfolded (folded = 0) ledger row whose
+    // pending short-tier floor-extension (observed_at + 1h, i.e. ~now
+    // + 1h) pushes the row's REAL expiry past the lapsed base TTL.
+    ai_memory::observations::record_recall(
+        &conn,
+        "fbl04-r1",
+        &[ai_memory::observations::Candidate {
+            memory_id: "fbl04-recalled",
+            retriever: "fts5",
+            rank: 1,
+            score: 0.5,
+        }],
+    )
+    .unwrap();
+    assert_eq!(unfolded_count(&conn), 1, "extension is pending, unfolded");
+
+    // The hot-path eviction entry: must fold-then-evict, never
+    // evict-then-lose-the-extension.
+    db::gc_if_needed(&conn, false).expect("gc_if_needed");
+
+    let exists = |id: &str| -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM memories WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(
+        exists("fbl04-recalled"),
+        1,
+        "recalled row survived gc_if_needed: its pending TTL extension was folded before eviction"
+    );
+    assert_eq!(
+        exists("fbl04-control"),
+        0,
+        "un-recalled control row expired as scheduled"
+    );
+    // The fold was really applied (not merely a reap-skip): the ledger
+    // drained and the row's expiry now lies in the future.
+    assert_eq!(unfolded_count(&conn), 0, "gc consumed the pending fold");
+    let expires_at: String = conn
+        .query_row(
+            "SELECT expires_at FROM memories WHERE id = 'fbl04-recalled'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        expires_at > chrono::Utc::now().to_rfc3339(),
+        "folded expiry must lie in the future (got {expires_at})"
+    );
+}
+
+#[test]
+fn gc_prunes_expired_folded_ledger_rows_2358() {
+    // #2358 regression — `db::gc` is the shared eviction chokepoint hit
+    // by the daemon gc tick, CLI `gc`, MCP `memory_gc`, and every
+    // `gc_if_needed` hot-path caller. Pre-#2358 it folded pending
+    // recall-access signal (#2308 FBL-04) but never called
+    // `observations::gc::prune` — the ONLY sqlite production caller of
+    // the pruner was the serve daemon's dedicated gc loop
+    // (`spawn_gc_loop_with_shadow_retention_tracked`), so MCP-stdio and
+    // CLI-only topologies (no background daemon) never pruned the
+    // `recall_observations` ledger, growing it unbounded despite the
+    // documented `AI_MEMORY_OBSERVATIONS_TTL_DAYS` contract.
+    let _g = env_lock();
+    clear_flags();
+    let (conn, _dir) = fresh_db();
+    let created = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at) \
+         VALUES ('gc2358-mem', 'long', 'gc2358', 'gc2358-mem', 'c', ?1, ?1)",
+        rusqlite::params![created],
+    )
+    .unwrap();
+    // A FOLDED ledger row whose observed_at is well past the (default 7
+    // day) TTL — the pruner's steady-state target.
+    let stale = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+    conn.execute(
+        "INSERT INTO recall_observations \
+            (recall_id, memory_id, retriever, rank, score, observed_at, folded) \
+         VALUES ('gc2358-r1', 'gc2358-mem', 'fts5', 1, 0.5, ?1, 1)",
+        rusqlite::params![stale],
+    )
+    .unwrap();
+    assert_eq!(ledger_count(&conn), 1, "stale folded row seeded");
+
+    db::gc(&conn, false).expect("gc");
+
+    assert_eq!(
+        ledger_count(&conn),
+        0,
+        "db::gc must prune the stale folded recall_observations row directly, \
+         not only via the serve daemon's dedicated gc loop"
+    );
+    // The eviction chokepoint pruned the ledger, not the memory row —
+    // the ledger-vs-memory-lifecycle distinction stays intact.
+    let mem_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE id = 'gc2358-mem'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        mem_exists, 1,
+        "the long-tier memory row itself is untouched"
+    );
+}
+
 // =====================================================================
 // F — gc-tick fold fallback (AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS=0)
 // =====================================================================
@@ -1065,10 +1199,11 @@ fn v77_migration_backfills_preexisting_rows_folded() {
     let dir = tempfile::tempdir_in(&root).expect("tempdir");
     let path = dir.path().join("v77.db");
 
-    // Fresh open reaches the current tip (v86, #1834 pre-ship 3x7
-    // valid-time canonicalization) with the v77 `folded` column present.
+    // Fresh open reaches the current tip (v87, #2333 archived
+    // kind_provenance + #2332 expiry heal) with the v77 `folded` column
+    // present.
     let conn = db::open(&path).expect("open");
-    assert_eq!(db::migrations::current_schema_version_for_tests(), 86);
+    assert_eq!(db::migrations::current_schema_version_for_tests(), 87);
     let version: i64 = conn
         .query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_version",
@@ -1076,7 +1211,7 @@ fn v77_migration_backfills_preexisting_rows_folded() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 86, "fresh open reaches the current tip");
+    assert_eq!(version, 87, "fresh open reaches the current tip");
     assert!(
         conn.prepare("SELECT folded FROM recall_observations LIMIT 0")
             .is_ok(),

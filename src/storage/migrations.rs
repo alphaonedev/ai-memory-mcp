@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 86).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 87).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -864,7 +864,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 86;
+const CURRENT_SCHEMA_VERSION: i64 = 87;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -3675,8 +3675,12 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             }
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
-            // v86 (#1834 pre-ship 3x7, v1.0.0) — normalize legacy
+        if version < 86 {
+            // v86 (#1834 pre-ship 3x7, v1.0.0) — LITERALIZED from the
+            // const-phrased tip form when the v87 arm landed (#2333; the
+            // #2218 convention — settled arms take a literal guard, ONLY the
+            // current tip stays symbolic). Behaviour-identical: idempotent
+            // normalization, any DB below 86 still runs it. — normalize legacy
             // claim-bitemporal VALID-time renderings on `memories` +
             // `archived_memories` to the ONE canonical fixed-UTC form
             // (`validate::canonicalize_valid_time`,
@@ -3717,6 +3721,78 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                     "UPDATE archived_memories SET valid_from = ?1, valid_until = ?2 \
                      WHERE rowid = ?3",
                 )?;
+            }
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v87 (#2333 FBL-03 + #2332 FBL-02, v1.0.0) — two coordinated
+            // heals, both additive / instant-preserving, NO table rebuild:
+            //
+            //  (a) `archived_memories.kind_provenance` — the third v79
+            //      (#1945) column finally mirrored onto the archive (its two
+            //      v79 siblings valid_from/valid_until landed at v85/#2035;
+            //      kind_provenance was skipped), closing the archive→restore
+            //      drop of the SQL-queryable epistemic-provenance copy. The
+            //      v49/#1025 + v85/#2035 archive-column-parity precedent;
+            //      probe-guarded (SQLite has no `ADD COLUMN IF NOT EXISTS`),
+            //      table-presence-guarded for partial-schema fixtures.
+            //      Canonical DDL: migrations/sqlite/0071_v87_archived_kind_provenance.sql.
+            //
+            //  (b) one-time normalization of legacy `expires_at` (and the
+            //      archive's `original_expires_at`) renderings to the v86
+            //      canonical fixed-UTC form — the #2332 write funnels
+            //      canonicalize from v87-adjacent code on, and every expiry
+            //      predicate (GC reap, recall/list visibility, the #1596
+            //      touch/fold MAX() floors) compares these TEXT columns
+            //      lexicographically, so a pre-fix caller-supplied non-UTC
+            //      offset rendering mis-ordered as bytes (premature reap /
+            //      over-retention). Same contract as the v86 valid-time
+            //      heal: instant-preserving, idempotent, fail-safe on
+            //      unparseable values. Postgres needs no expiry heal
+            //      (`expires_at` is TIMESTAMPTZ there).
+            let has_archive_table: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'archived_memories')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if has_archive_table {
+                let has_kind_provenance = conn
+                    .prepare("SELECT kind_provenance FROM archived_memories LIMIT 0")
+                    .is_ok();
+                if !has_kind_provenance {
+                    conn.execute(
+                        "ALTER TABLE archived_memories ADD COLUMN kind_provenance TEXT",
+                        [],
+                    )?;
+                }
+            }
+            normalize_expiry_rows(
+                conn,
+                "SELECT rowid, expires_at FROM memories WHERE expires_at IS NOT NULL",
+                "UPDATE memories SET expires_at = ?1 WHERE rowid = ?2",
+            )?;
+            if has_archive_table {
+                normalize_expiry_rows(
+                    conn,
+                    "SELECT rowid, expires_at FROM archived_memories \
+                     WHERE expires_at IS NOT NULL",
+                    "UPDATE archived_memories SET expires_at = ?1 WHERE rowid = ?2",
+                )?;
+                let has_original_expires = conn
+                    .prepare("SELECT original_expires_at FROM archived_memories LIMIT 0")
+                    .is_ok();
+                if has_original_expires {
+                    normalize_expiry_rows(
+                        conn,
+                        "SELECT rowid, original_expires_at FROM archived_memories \
+                         WHERE original_expires_at IS NOT NULL",
+                        "UPDATE archived_memories SET original_expires_at = ?1 \
+                         WHERE rowid = ?2",
+                    )?;
+                }
             }
         }
 
@@ -3780,6 +3856,30 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
 /// a re-run updates nothing). Column presence is probed via the SELECT
 /// prepare so a partial-schema fixture that stamped a version without the
 /// v79/v85 columns is a clean no-op (the v84/v85 probe precedent).
+/// v87 (#2332 FBL-02) — single-column sibling of
+/// [`normalize_valid_time_rows`] for the expiry columns: re-render every
+/// parseable RFC3339 value to the canonical fixed-UTC form
+/// (`validate::canonicalize_valid_time` shape). Instant-preserving,
+/// idempotent (canonical values are skipped), fail-safe (unparseable
+/// values keep their exact bytes — never destroy), and probe-tolerant
+/// (a missing column/table makes the SELECT prepare fail → no-op).
+fn normalize_expiry_rows(conn: &Connection, select_sql: &str, update_sql: &str) -> Result<()> {
+    let Ok(mut stmt) = conn.prepare(select_sql) else {
+        return Ok(());
+    };
+    let rows: Vec<(i64, Option<String>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (rowid, exp) in rows {
+        let exp_canon = crate::validate::canonical_valid_time_opt(exp.as_deref());
+        if exp_canon != exp {
+            conn.execute(update_sql, params![exp_canon, rowid])?;
+        }
+    }
+    Ok(())
+}
+
 fn normalize_valid_time_rows(conn: &Connection, select_sql: &str, update_sql: &str) -> Result<()> {
     let Ok(mut stmt) = conn.prepare(select_sql) else {
         return Ok(());

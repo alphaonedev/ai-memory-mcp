@@ -66,6 +66,18 @@
 #   LADDER_MIGRATIONS_RS   (default <root>/src/storage/migrations.rs)
 #   LADDER_POSTGRES_RS     (default <root>/src/store/postgres.rs)
 #   LADDER_SRC_DIR         (default <root>/src)  — orphan reference scan root
+#
+# Requires bash >= 4 (Grok W2-bash3): this gate uses associative arrays
+# (`declare -A`) and negative array indexing (`${arr[-1]}`), both absent
+# from bash 3.2 (stock on macOS — Apple has shipped no post-3.2 bash since
+# the GPLv3 switch). Running under 3.2 previously died with an opaque
+# "bad array subscript" / syntax error deep in the script; the guard below
+# fails fast with an actionable message instead.
+
+if [[ -z "${BASH_VERSINFO:-}" || "${BASH_VERSINFO[0]}" -lt 4 ]]; then
+    echo "check-migration-ladder.sh: requires bash >= 4 (found ${BASH_VERSION:-unknown}) — this gate uses associative arrays + negative array indexing that stock macOS bash 3.2 cannot run. Install a modern bash (e.g. 'brew install bash') and re-run explicitly, e.g. '/opt/homebrew/bin/bash $0 --self-test'." >&2
+    exit 1
+fi
 
 set -euo pipefail
 
@@ -113,6 +125,11 @@ LADDER_EXEMPT_FILES=(
 #                     current tip stays symbolic), so the count is unchanged.
 #                     postgres stays 1 (v85 renumbered to a literal arm,
 #                     migrate_v86 takes the const tail slot).
+# 2026-07-23 (#2333 FBL-03): counts UNCHANGED — the settled v86 arm is
+#                     LITERALIZED on both backends (`if version < 86` /
+#                     `if current_version < 86`) and the new v87 tip arm
+#                     (archived_memories.kind_provenance + the #2332
+#                     expiry-rendering heal) takes the const slot.
 EXPECTED_CONST_ARMS_SQLITE=8
 EXPECTED_CONST_ARMS_POSTGRES=1
 
