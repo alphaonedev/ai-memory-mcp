@@ -81,12 +81,20 @@ pub(crate) fn http_pre_event_gate(
 /// #2390 (N9) — resolve the namespace(s) of `ids` on the HTTP surface for
 /// pre-event hook scoping.
 ///
-/// Routes through the SAL [`crate::store::MemoryStore`] trait under `--features
-/// sal` so the sqlite AND postgres backends resolve identically — a sqlite-only
-/// `db::get` here would leave the postgres daemon resolving nothing, silently
-/// re-opening the very bypass #2390 closes, with no non-`#[ignore]` test to
-/// catch it (the #1799 lesson). Standard (non-sal) builds are sqlite-only and
-/// use the legacy connection directly.
+/// Resolution MIRRORS THE BACKEND the write itself will take, because a
+/// resolution skew is a live defect in both directions: resolving nothing where
+/// the handler resolves something re-opens the #2390 bypass (or, under
+/// `enforce` with a scoped hook, 503s a legitimate write), and the postgres
+/// daemon must not be left resolving nothing while sqlite works — a sqlite-only
+/// `db::get` here would silently re-open the bypass on postgres with no
+/// non-`#[ignore]` test to catch it (the #1799 lesson).
+///
+/// * Sqlite backend (and every non-`sal` build) → [`crate::db::resolve_id`], the
+///   PREFIX-capable resolution the sqlite write handlers use, so a caller
+///   passing a legitimate id prefix resolves at the gate exactly as it will at
+///   the write.
+/// * Postgres backend → `app.store.get`, matching the postgres branches, which
+///   resolve by exact id through the same SAL call.
 ///
 /// The DB read happens ONLY when the pre-event gate is installed
 /// (`[hooks].enforce_mode != off` AND a non-empty `required_events`), so the
@@ -105,7 +113,7 @@ pub(crate) async fn resolve_pre_event_namespaces(
     }
     let mut out: Vec<String> = Vec::new();
     #[cfg(feature = "sal")]
-    {
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
         let ctx = crate::handlers::parity::http_caller_ctx(headers, None);
         for id in ids {
             if let Ok(mem) = app.store.get(&ctx, id).await
@@ -114,19 +122,21 @@ pub(crate) async fn resolve_pre_event_namespaces(
                 out.push(mem.namespace);
             }
         }
+        return out;
     }
-    #[cfg(not(feature = "sal"))]
-    {
-        let _ = headers;
-        let guard = app.db.lock().await;
-        for id in ids {
-            if let Ok(Some(mem)) = crate::db::resolve_id(&guard.0, id)
-                && !out.contains(&mem.namespace)
-            {
-                out.push(mem.namespace);
-            }
+    let _ = headers;
+    // Sqlite: the prefix-capable resolution, matching the sqlite write handlers.
+    // The guard is released at the end of this function, before the handler
+    // takes its own lock for the write.
+    let guard = app.db.lock().await;
+    for id in ids {
+        if let Ok(Some(mem)) = crate::db::resolve_id(&guard.0, id)
+            && !out.contains(&mem.namespace)
+        {
+            out.push(mem.namespace);
         }
     }
+    drop(guard);
     out
 }
 
