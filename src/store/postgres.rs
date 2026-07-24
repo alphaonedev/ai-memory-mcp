@@ -12289,6 +12289,18 @@ async fn reconcile_envelope_owner_known(
             ),
         });
     };
+    // APPEND-ONLY-SANCTIONED (#1823 G6) — CIPHERTEXT RE-KEY, not a content
+    // revision (postgres twin of the sqlite `reconcile_envelope_owner`
+    // sanction). This rewrites the ENCODING of content this very transaction
+    // just committed: the same plaintext, re-sealed to the identity the
+    // surviving row retained. The durable memory TEXT is bit-identical before
+    // and after (`content` goes placeholder -> the same placeholder; only the
+    // AEAD envelope's recipient key changes), so there is no new version to
+    // record — and the enclosing write funnel has ALREADY appended the
+    // revision leaf for the write being repaired. Emitting a second leaf here
+    // would assert a content change that did not happen. The
+    // `encrypted_envelope = $2` guard scopes the UPDATE to the exact row still
+    // carrying the envelope we wrote.
     sqlx::query(
         "UPDATE memories SET content = $3, encrypted_envelope = $4 \
          WHERE id = $1 AND encrypted_envelope = $2",
