@@ -1383,6 +1383,19 @@ impl MemoryStore for SqliteStore {
         crate::actions::sweep_expired_leases_audited(&conn, now).map_err(box_err)
     }
 
+    async fn sweep_pending_action_timeouts(
+        &self,
+        default_secs: i64,
+    ) -> StoreResult<Vec<(String, String)>> {
+        // FBL-22 — thin delegate to the existing rusqlite free fn, which
+        // already SELECTs the candidate `(id, namespace)` pairs, flips them to
+        // `status='expired'` in one transaction, and returns them (the RETURNING
+        // equivalent). The postgres twin is `PostgresStore`'s
+        // `UPDATE ... RETURNING`.
+        let conn = self.state.lock().await;
+        crate::db::sweep_pending_action_timeouts(&conn, default_secs).map_err(box_err)
+    }
+
     async fn signal_send(
         &self,
         _ctx: &CallerContext,
@@ -2983,6 +2996,54 @@ mod tests {
         // tempdir; no /tmp violation per project rule.
         std::mem::forget(tmp);
         SqliteStore::open(&path).expect("open SqliteStore")
+    }
+
+    #[tokio::test]
+    async fn sweep_pending_action_timeouts_delegates_and_returns_pairs_fbl22() {
+        // FBL-22 — the SAL sqlite delegate must flip a stale pending row to
+        // `status='expired'` and return its `(id, namespace)` pair (the free-fn
+        // internals are exhaustively covered in `storage/mod.rs`; this pins the
+        // trait-surface wiring). A non-positive default disables the sweep.
+        let store = fresh_store();
+        {
+            let conn = store.state.lock().await;
+            conn.execute(
+                "INSERT INTO pending_actions
+                     (id, action_type, namespace, payload, requested_by, requested_at,
+                      status, default_timeout_seconds)
+                 VALUES (?1, 'store', ?2, '{}', 'tester', ?3, 'pending', NULL)",
+                rusqlite::params![
+                    "stale-sal-1",
+                    "ns/sal",
+                    (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339()
+                ],
+            )
+            .expect("insert stale pending row");
+        }
+        let expired = store
+            .sweep_pending_action_timeouts(crate::SECS_PER_HOUR)
+            .await
+            .expect("sweep");
+        assert_eq!(
+            expired,
+            vec![("stale-sal-1".to_string(), "ns/sal".to_string())],
+            "the stale pending row is returned as an (id, namespace) pair"
+        );
+        let status: String = {
+            let conn = store.state.lock().await;
+            conn.query_row(
+                "SELECT status FROM pending_actions WHERE id = ?1",
+                rusqlite::params!["stale-sal-1"],
+                |r| r.get(0),
+            )
+            .expect("fetch swept row")
+        };
+        assert_eq!(status, "expired", "row transitioned to expired");
+        let none = store
+            .sweep_pending_action_timeouts(0)
+            .await
+            .expect("sweep disabled");
+        assert!(none.is_empty(), "non-positive default sweeps nothing");
     }
 
     #[tokio::test]

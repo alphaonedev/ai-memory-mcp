@@ -897,13 +897,25 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `emit_lease_sweep_reclaim_audit` helper, and the sal-postgres
     // `lease_sweep_expired_emits_coordination_audit_2371` regression test;
     // land the file at 29_997. Ceiling 29_900 -> 30_040 (+43 headroom).
-    // 2026-07-24 (#2378 FBL-12 residual) — the `PostgresStore::charge_update_growth`
-    // SAL trait impl (ensure-row + ONE TOCTOU-free conditional agent_quotas
-    // UPDATE + typed QuotaExceeded re-read) and the `refund_update_growth`
-    // compensating-decrement helper, so the postgres `PUT /memories/{id}`
-    // branch charges storage-growth quota (was ZERO-charge); land the file at
-    // 30_118. Ceiling 30_040 -> 30_200 (+82 headroom).
-    ("src/store/postgres.rs", 30_200),
+    // 2026-07-24 (fix/age-deferred-cluster #2375/#2376/#2377) — three AGE
+    // deferred-projection-mode correctness fixes: `kg_invalidate_cypher`
+    // MATCH-miss fall-through to the relational CTE (#2375), `delete_link`
+    // unconditional-on-Age unproject (#2376), and threading
+    // `valid_from`/`valid_until` through `project_link_into_age` + its 5 call
+    // sites with the deferred-drainer re-read (#2377); landed the file at
+    // 30_150. Ceiling 30_040 -> 30_150 (+47 headroom).
+    // 2026-07-24 (#2382 pg pending-action-timeout sweep) — the
+    // `PostgresStore::sweep_pending_action_timeouts` SAL trait impl + its
+    // sal-postgres coverage landed the file at 30_256. Ceiling 30_150 -> 30_320.
+    // 2026-07-24 (#2378 FBL-12 residual pg PUT-quota) — the
+    // `PostgresStore::charge_update_growth` SAL trait impl (ensure-row + ONE
+    // TOCTOU-free conditional agent_quotas UPDATE + typed QuotaExceeded re-read)
+    // + the `refund_update_growth` compensating-decrement helper, so the
+    // postgres `PUT /memories/{id}` branch charges storage-growth quota (was
+    // ZERO-charge), stack on top of the #2382 merge and land the file at
+    // 30_377. Ceiling 30_320 -> 30_440 (+63 headroom). Module-split relief
+    // tracked under #650-class follow-ups.
+    ("src/store/postgres.rs", 30_440),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

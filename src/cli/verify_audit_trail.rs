@@ -218,7 +218,8 @@ pub fn run(db_path: &Path, args: &VerifyAuditTrailArgs, out: &mut CliOutput<'_>)
             )
             .context(CTX_WRITE_AUDIT_REPORT)?,
             crate::signed_events::RollbackCheck::Unknown
-            | crate::signed_events::RollbackCheck::NotDetected => {}
+            | crate::signed_events::RollbackCheck::NotDetected
+            | crate::signed_events::RollbackCheck::NotApplicable => {}
         }
         // #1822 G5b — surface a require-mode cause-binding coverage failure.
         if let crate::signed_events::CauseBinding::Detected { rows_without_cause } =

@@ -786,6 +786,28 @@ pub async fn bulk_create(
             .into_response();
     }
 
+    // N8 (#2389, CWE-288) — consult the PRE-STORE enforcement gate ONCE for the
+    // whole batch BEFORE any write (and before the postgres branch), so
+    // `[hooks].enforce_mode = enforce` + `required_events = ["pre_store"]` with
+    // no enabled hook DENIES the bulk write (503) exactly as it does on the
+    // single-create path (`create::create_memory`, #1924) and the MCP path
+    // (#1885). Pre-fix `bulk_create` had ZERO `http_pre_event_gate` consults, so
+    // the PE-1 PreStore gate was bypassed on the bulk surface. The gate is a
+    // content-invariant PRESENCE check (missing required hook → Deny), so ONE
+    // per-request consult is exact parity with single-create — and mirrors the
+    // whole-batch fail-closed shape of the #1919 attestation gate above. INERT
+    // (`None`) for default (enforce-off) deployments.
+    if let Some(resp) = crate::handlers::create::http_pre_event_gate(
+        crate::hooks::HookEvent::PreStore,
+        json!({
+            "agent_id": caller,
+            "bulk": true,
+            "count": bodies.len(),
+        }),
+    ) {
+        return resp;
+    }
+
     // v0.7.0 Wave-3 Continuation — postgres-backed daemons stream each
     // row through `app.store.store(...)`. Federation fanout below stays
     // sqlite-only because the federation transport assumes the

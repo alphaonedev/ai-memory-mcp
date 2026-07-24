@@ -305,7 +305,7 @@ pub fn run_with_curator(
         // model name handy. Atomiser's "unknown" fallback applies.
         (c, "unknown".to_string())
     } else {
-        match build_llm_curator(tier) {
+        match build_llm_curator(tier, db_path) {
             Ok((c, model)) => (c, model),
             Err(e) => {
                 let err = AtomiseError::CuratorFailed(e);
@@ -350,7 +350,10 @@ pub fn run_with_curator(
 /// `openai-compatible` backend), when the legacy tier has no curator
 /// LLM configured (only `Keyword`, which the caller has already
 /// gated), or when the underlying client construction fails.
-fn build_llm_curator(tier: FeatureTier) -> std::result::Result<(Box<dyn Curator>, String), String> {
+fn build_llm_curator(
+    tier: FeatureTier,
+    db_path: &Path,
+) -> std::result::Result<(Box<dyn Curator>, String), String> {
     // v0.7.x (#1146) — route through the canonical resolver. The
     // resolver folds CLI flags (none here), AI_MEMORY_LLM_* env vars,
     // the [llm] config section, the legacy `llm_model`/`ollama_url`
@@ -364,6 +367,37 @@ fn build_llm_curator(tier: FeatureTier) -> std::result::Result<(Box<dyn Curator>
     let _ = tier;
     let app_config = AppConfig::load();
     let resolved = app_config.resolve_llm(None, None, None);
+    // N7 (#2388) — inference-plane egress gate. When the operator selected
+    // AI_MEMORY_INFERENCE_EGRESS=deny (or loopback-only against an external
+    // vendor), refuse to construct the outbound curator LLM client so no
+    // memory content can be POSTed to the vendor, and emit a best-effort
+    // signed refusal. Default `allow` → no-op (byte-identical legacy).
+    // ENFORCED here (no client → no egress); mirrors the precedent at
+    // `daemon_runtime::build_llm_client` + `reload::resolve_and_build_mcp_llm`.
+    {
+        use crate::egress::{
+            EgressClass, EgressDecision, InferenceEgressMode, evaluate_inference_egress,
+        };
+        if let EgressDecision::Refuse {
+            class,
+            target,
+            reason,
+        } = evaluate_inference_egress(
+            InferenceEgressMode::resolve(),
+            EgressClass::InferenceLlm,
+            &resolved.base_url,
+        ) {
+            // #1991 — audit against the operator-resolved `db_path` threaded from
+            // the caller, NOT a recomputed `effective_db(DEFAULT_DB)` (which would
+            // misfile the row to CWD `ai-memory.db` under a non-default `--db`).
+            crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
+            return Err(format!(
+                "atomise: inference-plane egress refused ({reason}); no curator LLM client \
+                 constructed — set AI_MEMORY_INFERENCE_EGRESS=allow or loopback-only to a \
+                 local endpoint"
+            ));
+        }
+    }
     match OllamaClient::build_from_resolved(&resolved) {
         Ok(Some(client)) => {
             let model = client.model_name().to_string();
@@ -620,6 +654,42 @@ mod tests {
         assert!(
             s.contains("requires smart tier") || s.contains("tier"),
             "got stderr: {s}",
+        );
+    }
+
+    // N7 (#2388) — atomise's curator LLM builder must refuse to construct a
+    // network client under AI_MEMORY_INFERENCE_EGRESS=deny, returning Err so no
+    // memory content egresses to a vendor for atomisation. `deny` refuses EVERY
+    // target (incl. the loopback Ollama default) BEFORE `build_from_resolved`.
+    #[test]
+    fn build_llm_curator_deny_egress_returns_err_n7_2388() {
+        let _guard = crate::config::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("a.db");
+        let prior_egress = std::env::var(crate::egress::ENV_INFERENCE_EGRESS).ok();
+        let prior_noconfig = std::env::var("AI_MEMORY_NO_CONFIG").ok();
+        // SAFETY: serialized by `test_env_lock`; restored below before the guard
+        // drops so no other env-reading test observes the mutation.
+        unsafe {
+            std::env::set_var("AI_MEMORY_NO_CONFIG", "1");
+            std::env::set_var(crate::egress::ENV_INFERENCE_EGRESS, "deny");
+        }
+        let result = build_llm_curator(FeatureTier::Smart, &db_path);
+        // SAFETY: serialized by `test_env_lock` (see above).
+        unsafe {
+            match &prior_egress {
+                Some(v) => std::env::set_var(crate::egress::ENV_INFERENCE_EGRESS, v),
+                None => std::env::remove_var(crate::egress::ENV_INFERENCE_EGRESS),
+            }
+            match &prior_noconfig {
+                Some(v) => std::env::set_var("AI_MEMORY_NO_CONFIG", v),
+                None => std::env::remove_var("AI_MEMORY_NO_CONFIG"),
+            }
+        }
+        assert!(
+            result.is_err(),
+            "under AI_MEMORY_INFERENCE_EGRESS=deny the atomise curator LLM builder must \
+             return Err (no constructed network client) — N7 (#2388)"
         );
     }
 
