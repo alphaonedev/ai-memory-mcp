@@ -171,6 +171,96 @@ pub enum ChainResult {
 }
 
 // ---------------------------------------------------------------------------
+// #2390 (N9) — hook-payload namespace keys
+// ---------------------------------------------------------------------------
+
+/// Top-level hook-payload key carrying the SINGLE in-flight namespace.
+///
+/// Read by [`HookChain::fire`] for substrate-built (post-* / eviction / signal)
+/// envelopes, and STAMPED by [`dispatch_pre_event_enforced`] on every pre-event
+/// payload so hook handlers can see which namespace the write touches.
+pub const PAYLOAD_KEY_NAMESPACE: &str = crate::mcp::param_names::NAMESPACE;
+
+/// Top-level hook-payload key carrying the in-flight namespace SET, for
+/// operations that legitimately span more than one namespace (a link's two
+/// endpoints, a consolidation's N sources, a bulk store's N bodies). Stamped
+/// alongside [`PAYLOAD_KEY_NAMESPACE`] whenever the set has more than one entry.
+pub const PAYLOAD_KEY_NAMESPACES: &str = "namespaces";
+
+/// #2390 (N9) — extract the in-flight namespace set from a hook payload.
+///
+/// Reads [`PAYLOAD_KEY_NAMESPACES`] (array of strings) first, then falls back to
+/// the scalar [`PAYLOAD_KEY_NAMESPACE`]. Returns an empty `Vec` when neither is
+/// present, which [`HookConfig::matches_any_namespace`] treats exactly like the
+/// legacy `matches_namespace(None)` (wildcard hooks fire, scoped hooks do not).
+///
+/// Blank / non-string entries are dropped: a hook scope can never match them, so
+/// carrying them would only dilute the set.
+#[must_use]
+pub fn payload_namespaces(payload: &Value) -> Vec<String> {
+    if let Some(arr) = payload
+        .get(PAYLOAD_KEY_NAMESPACES)
+        .and_then(Value::as_array)
+    {
+        let out: Vec<String> = arr
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_owned)
+            .collect();
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    payload
+        .get(PAYLOAD_KEY_NAMESPACE)
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| vec![s.to_owned()])
+        .unwrap_or_default()
+}
+
+/// #2390 (N9) — stamp the substrate-resolved namespace set onto a pre-event
+/// payload, OVERWRITING any caller-supplied key.
+///
+/// The overwrite is the security property: three pre-event dispatch sites
+/// forward caller JSON verbatim as the hook payload (`memory_link` /
+/// `memory_reflect` MCP arguments, the HTTP link body), and [`HookChain::fire`]
+/// used to trust `payload["namespace"]`. A caller could therefore add
+/// `"namespace": "unwatched"` to a `memory_link` call and skip a namespace-
+/// scoped PreLink guard hook. Pre-event scoping now matches on the substrate's
+/// set (passed to [`HookChain::fire_scoped`]); this stamp keeps the payload the
+/// hook handler SEES consistent with the set it was matched against.
+fn stamp_namespaces(payload: &mut Value, namespaces: &[String]) {
+    let Some(obj) = payload.as_object_mut() else {
+        return;
+    };
+    match namespaces {
+        [] => {
+            obj.remove(PAYLOAD_KEY_NAMESPACE);
+            obj.remove(PAYLOAD_KEY_NAMESPACES);
+        }
+        [one] => {
+            obj.insert(
+                PAYLOAD_KEY_NAMESPACE.to_string(),
+                Value::String(one.clone()),
+            );
+            obj.remove(PAYLOAD_KEY_NAMESPACES);
+        }
+        many => {
+            obj.insert(
+                PAYLOAD_KEY_NAMESPACE.to_string(),
+                Value::String(many[0].clone()),
+            );
+            obj.insert(
+                PAYLOAD_KEY_NAMESPACES.to_string(),
+                Value::Array(many.iter().cloned().map(Value::String).collect()),
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HookChain — priority-sorted, fire-in-order
 // ---------------------------------------------------------------------------
 
@@ -245,6 +335,39 @@ impl HookChain {
         payload: Value,
         registry: &mut ExecutorRegistry,
     ) -> ChainResult {
+        // #2390 (N9) — the legacy entry point keeps the FBL-29 contract of
+        // reading the in-flight namespace out of the payload. This is correct
+        // for post-* observers / eviction / signal chains, whose payloads are
+        // SUBSTRATE-BUILT envelopes. PRE-event dispatch must NOT use it (a
+        // caller-supplied `namespace` key would be trusted); those paths go
+        // through `fire_scoped` with a substrate-resolved namespace set. See
+        // `dispatch_pre_event_enforced`.
+        let namespaces = payload_namespaces(&payload);
+        self.fire_scoped(event, payload, &namespaces, registry)
+            .await
+    }
+
+    /// #2390 (N9) — `fire` with the in-flight namespace(s) supplied by the
+    /// CALLER instead of read out of the payload.
+    ///
+    /// Pre-event dispatch resolves the namespace from the substrate (the
+    /// operation's target row / the resolved default-namespace ladder) and
+    /// passes it here, so per-hook namespace scoping is evaluated against what
+    /// the write will ACTUALLY touch rather than against whatever the caller
+    /// happened to put in the request body. `namespaces` may carry more than one
+    /// entry for operations that span namespaces (a link's two endpoints, a
+    /// consolidation's N sources, a bulk store's N bodies) — a hook fires when
+    /// it covers ANY of them ([`HookConfig::matches_any_namespace`]).
+    ///
+    /// An EMPTY slice preserves the [`HookConfig::matches_namespace`] `None`
+    /// semantics (wildcard hooks fire, scoped hooks do not).
+    pub async fn fire_scoped(
+        &self,
+        event: HookEvent,
+        payload: Value,
+        namespaces: &[String],
+        registry: &mut ExecutorRegistry,
+    ) -> ChainResult {
         let mut current_payload = payload;
         let mut accumulated_delta = MemoryDelta::default();
         let mut modified = false;
@@ -267,27 +390,18 @@ impl HookChain {
             .map(|h| (h.clone(), registry.get(h)))
             .collect();
 
-        // FBL-29 (v1.0.0) — resolve the in-flight namespace ONCE at entry (read
-        // from the original payload, before any Modify mutates it) so per-hook
-        // namespace scoping can gate the loop below. `fire` is the single
-        // chokepoint every dispatch surface funnels through (pre-event enforce
-        // gate, post-event observers, the reused signal chains built at MCP
-        // boot), so gating here fixes every path in one place — the per-hook
-        // `namespace` pattern was previously parsed but never matched.
-        // Owned so the read does not hold a borrow of `current_payload` across
-        // the loop below (a hook `Modify` mutates `current_payload`).
-        let payload_ns: Option<String> = current_payload
-            .get("namespace")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-
         for (cfg, executor) in prepared {
             // FBL-29 — skip a hook whose configured `namespace` pattern does
             // not cover the in-flight namespace. A `*`/empty pattern (the
             // schema default) matches everything, so configs that don't scope
             // hooks are byte-identical. A scoped hook no longer fires (Modify /
             // Deny) in namespaces the operator scoped it OUT of.
-            if !cfg.matches_namespace(payload_ns.as_deref()) {
+            //
+            // #2390 (N9) — the namespace set is now resolved by the CALLER and
+            // fixed for the whole chain, so a hook's `Modify` cannot rewrite the
+            // payload's namespace mid-chain and thereby change which LATER hooks
+            // are in scope.
+            if !cfg.matches_any_namespace(namespaces) {
                 continue;
             }
             // G6: derive the per-hook budget from what's left of the
@@ -561,6 +675,7 @@ where
 pub async fn dispatch_pre_event_enforced(
     event: HookEvent,
     payload: Value,
+    namespaces: &[String],
     all_hooks: &[HookConfig],
     mode: super::enforce::HookEnforceMode,
     required: &[HookEvent],
@@ -580,8 +695,27 @@ pub async fn dispatch_pre_event_enforced(
     // 2) Fire the chain with `effective_fail_mode` threaded through every hook
     //    (required fail-open hooks forced Closed under enforce).
     let effective = super::enforce::effective_hooks_for_event(all_hooks, event, mode, required);
+    // 3) #2390 (N9) — fail CLOSED when the in-flight namespace could not be
+    //    resolved AND a namespace-scoped hook is configured for this event.
+    //    Proceeding would silently skip that hook (`matches_namespace(None)` is
+    //    false), which is the exact silent-bypass class this gate exists to
+    //    prevent — and it would be caller-triggerable by passing an id that does
+    //    not resolve. When every configured hook is wildcard-scoped the
+    //    namespace is irrelevant and the chain runs normally.
+    if let Some(deny) =
+        super::enforce::unresolved_namespace_deny(&effective, event, mode, namespaces)
+    {
+        return deny;
+    }
+    // 4) Stamp the substrate-resolved namespace(s) onto the payload the hook
+    //    handler receives, OVERWRITING any caller-supplied key, then match hook
+    //    scopes against the substrate set (never against caller-controlled JSON).
+    let mut payload = payload;
+    stamp_namespaces(&mut payload, namespaces);
     let chain = HookChain::new(effective);
-    chain.fire(event, payload, registry).await
+    chain
+        .fire_scoped(event, payload, namespaces, registry)
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1750,6 +1884,7 @@ mod tests {
         let result = dispatch_pre_event_enforced(
             HookEvent::PreStore,
             store_payload,
+            &["default".to_string()],
             &all_hooks,
             HookEnforceMode::Enforce,
             &required,
@@ -1786,6 +1921,7 @@ mod tests {
         let result = dispatch_pre_event_enforced(
             HookEvent::PreStore,
             json!({}),
+            &[],
             &all_hooks,
             HookEnforceMode::Enforce,
             &required,
@@ -1808,6 +1944,7 @@ mod tests {
             HookEvent::PreStore,
             json!({}),
             &[],
+            &[],
             HookEnforceMode::Off,
             &required,
             &mut reg,
@@ -1826,6 +1963,7 @@ mod tests {
             HookEvent::PreStore,
             json!({}),
             &[],
+            &[],
             HookEnforceMode::Advisory,
             &required,
             &mut reg,
@@ -1842,6 +1980,7 @@ mod tests {
         let result = dispatch_pre_event_enforced(
             HookEvent::PreStore,
             json!({}),
+            &[],
             &[],
             HookEnforceMode::Enforce,
             &required,

@@ -797,8 +797,21 @@ pub async fn bulk_create(
     // per-request consult is exact parity with single-create — and mirrors the
     // whole-batch fail-closed shape of the #1919 attestation gate above. INERT
     // (`None`) for default (enforce-off) deployments.
+    // #2390 (N9) — a bulk store spans N bodies and therefore potentially N
+    // namespaces; every distinct one contributes so a hook scoped to ANY of them
+    // fires on the batch. `body.namespace` is already resolved (serde
+    // `default_namespace()` applies the #1590 ladder), so this needs no DB read.
+    // Pre-fix the payload carried no namespace at all and every namespace-scoped
+    // `pre_store` hook was silently skipped on the bulk surface.
+    let mut bulk_namespaces: Vec<String> = Vec::new();
+    for b in &bodies {
+        if !bulk_namespaces.contains(&b.namespace) {
+            bulk_namespaces.push(b.namespace.clone());
+        }
+    }
     if let Some(resp) = crate::handlers::create::http_pre_event_gate(
         crate::hooks::HookEvent::PreStore,
+        bulk_namespaces,
         json!({
             "agent_id": caller,
             "bulk": true,

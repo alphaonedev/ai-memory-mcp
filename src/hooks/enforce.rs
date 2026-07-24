@@ -160,6 +160,76 @@ pub fn enforce_required_event_presence(
     }
 }
 
+/// #2390 (N9) — fail-closed guard for an UNRESOLVABLE in-flight namespace.
+///
+/// `HookConfig::matches_namespace(None)` is `false` for a scoped hook, so a
+/// pre-event whose namespace could not be resolved would silently SKIP every
+/// namespace-scoped hook — the same silent-no-enforcement class `enforce_mode`
+/// exists to close, and one a caller can TRIGGER on demand by passing an id that
+/// does not resolve (a deleted / nonexistent / prefix-ambiguous memory id).
+///
+/// Returns:
+/// * `None` — proceed. Either the namespace resolved (`!namespaces.is_empty()`)
+///   or NO hook for this event is namespace-scoped, in which case the namespace
+///   is irrelevant to the firing decision and wildcard hooks run as always.
+///   This keeps every unscoped deployment byte-identical.
+/// * `Some(ChainResult::Deny { code: 503 })` — a scoped hook exists for this
+///   event but cannot be evaluated truthfully. Refuse loudly rather than
+///   silently skip a declared control.
+///
+/// `hooks` is the EFFECTIVE (already event-filtered + enabled) hook list, i.e.
+/// the output of [`effective_hooks_for_event`]. Pure + total.
+///
+/// Staged by `mode`, mirroring [`enforce_required_event_presence`]: `enforce`
+/// denies, `advisory` WARNs + allows (the soak rung — an operator gets to SEE
+/// how often this fires before it can refuse a write), `off` is a no-op.
+#[must_use]
+pub fn unresolved_namespace_deny(
+    hooks: &[HookConfig],
+    event: HookEvent,
+    mode: HookEnforceMode,
+    namespaces: &[String],
+) -> Option<ChainResult> {
+    if mode == HookEnforceMode::Off || !namespaces.is_empty() {
+        return None;
+    }
+    if !hooks.iter().any(HookConfig::is_namespace_scoped) {
+        return None;
+    }
+    match mode {
+        HookEnforceMode::Enforce => {
+            tracing::warn!(
+                target: "hooks.enforce.namespace_unresolved",
+                event = %event_wire(event),
+                "hooks: in-flight namespace could not be resolved and a namespace-scoped \
+                 hook is configured for this event → fail-closed deny (a scoped hook must \
+                 never be silently skipped)"
+            );
+            Some(ChainResult::Deny {
+                reason: format!(
+                    "hooks: cannot resolve the in-flight namespace for scope \
+                     evaluation of {} (a namespace-scoped hook is configured; \
+                     refusing rather than silently skipping it)",
+                    event_wire(event)
+                ),
+                code: 503,
+            })
+        }
+        HookEnforceMode::Advisory => {
+            tracing::warn!(
+                target: "hooks.enforce.namespace_unresolved",
+                event = %event_wire(event),
+                "hooks: in-flight namespace could not be resolved and a namespace-scoped \
+                 hook is configured for this event; the scoped hook is being SKIPPED \
+                 (advisory → allow). Set [hooks].enforce_mode = enforce to fail-closed"
+            );
+            None
+        }
+        // Unreachable (handled above), kept total.
+        HookEnforceMode::Off => None,
+    }
+}
+
 /// PE-1 composition (#1734) — under `enforce`, a present-but-`fail_open`
 /// required-event hook would defeat enforcement if it errored (fail-open ⇒
 /// the chain Allows). Force required-event hooks to an effective
@@ -222,9 +292,37 @@ pub fn preflight_report(
     required
         .iter()
         .map(|e| {
-            let present = hooks.iter().any(|h| h.event == *e && h.enabled);
+            let enabled_for_event: Vec<&HookConfig> = hooks
+                .iter()
+                .filter(|h| h.event == *e && h.enabled)
+                .collect();
+            let present = !enabled_for_event.is_empty();
             let wire = event_wire(*e);
             if present {
+                // #2390 (N9) — presence is namespace-BLIND, but firing is not.
+                // When every enabled hook for a required event is namespace-
+                // SCOPED, the presence gate is satisfied globally while the hook
+                // fires only inside its scope: writes in every OTHER namespace
+                // are ungoverned. That is legitimate (the operator scoped it on
+                // purpose) but it is exactly the shape that reads as "enforced"
+                // and is not, so surface it at boot / `doctor --hooks` where it
+                // is free to fix rather than leaving the operator to infer it.
+                if enabled_for_event
+                    .iter()
+                    .all(|h| HookConfig::is_namespace_scoped(h))
+                {
+                    let scopes = enabled_for_event
+                        .iter()
+                        .map(|h| h.namespace.trim())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return format!(
+                        "{wire}: required, enabled hook present but EVERY hook is \
+                         namespace-scoped ({scopes}) → writes OUTSIDE that scope run \
+                         UNGOVERNED (presence is namespace-blind; add a `namespace = \
+                         \"*\"` hook to cover the rest)"
+                    );
+                }
                 format!("{wire}: required, enabled hook present (OK)")
             } else if mode == HookEnforceMode::Enforce {
                 format!("{wire}: REQUIRED but NO enabled hook → WILL DENY (enforce)")
@@ -404,6 +502,107 @@ mod tests {
         // Advisory → the missing one is WARN+allow, not WILL DENY.
         let adv = preflight_report(&hooks, HookEnforceMode::Advisory, &req);
         assert!(adv[1].contains("WARN+allow") && !adv[1].contains("WILL DENY"));
+    }
+
+    // ---- #2390 (N9) unresolved-namespace fail-closed guard ------------------
+
+    fn scoped(event: HookEvent, namespace: &str) -> HookConfig {
+        let mut c = cfg(event, true, FailMode::Open);
+        c.namespace = namespace.to_string();
+        c
+    }
+
+    /// A resolvable namespace never trips the guard, whatever the scoping.
+    #[test]
+    fn unresolved_ns_allows_when_namespace_resolved_2390() {
+        let hooks = [scoped(HookEvent::PreLink, "prod")];
+        assert!(
+            unresolved_namespace_deny(
+                &hooks,
+                HookEvent::PreLink,
+                HookEnforceMode::Enforce,
+                &["prod".to_string()],
+            )
+            .is_none()
+        );
+    }
+
+    /// With only WILDCARD hooks the namespace is irrelevant to the firing
+    /// decision, so an unresolvable namespace must NOT deny — that would be a
+    /// self-DOS for every unscoped deployment (the overwhelming majority).
+    #[test]
+    fn unresolved_ns_allows_when_no_hook_is_scoped_2390() {
+        for pat in ["*", "", "   "] {
+            let hooks = [scoped(HookEvent::PreLink, pat)];
+            assert!(
+                unresolved_namespace_deny(
+                    &hooks,
+                    HookEvent::PreLink,
+                    HookEnforceMode::Enforce,
+                    &[]
+                )
+                .is_none(),
+                "pattern {pat:?} is wildcard — an unresolved namespace must not deny"
+            );
+        }
+    }
+
+    /// The fail-closed case: a SCOPED hook exists but the in-flight namespace is
+    /// unknown, so the hook would be silently skipped. Under `enforce` that is a
+    /// loud 503 refusal instead of a silent bypass — and it closes the vector
+    /// where a caller FORCES the skip by passing an id that does not resolve.
+    #[test]
+    fn unresolved_ns_denies_under_enforce_when_a_scoped_hook_exists_2390() {
+        let hooks = [scoped(HookEvent::PreLink, "prod/*")];
+        match unresolved_namespace_deny(&hooks, HookEvent::PreLink, HookEnforceMode::Enforce, &[]) {
+            Some(ChainResult::Deny { code, reason }) => {
+                assert_eq!(code, 503);
+                assert!(reason.contains("pre_link"), "names the event: {reason}");
+            }
+            other => panic!("expected a fail-closed 503 deny, got {other:?}"),
+        }
+    }
+
+    /// `advisory` is the soak rung (WARN + allow) so an operator sees how often
+    /// the guard would fire before it can refuse a write; `off` is a no-op.
+    #[test]
+    fn unresolved_ns_advisory_and_off_allow_2390() {
+        let hooks = [scoped(HookEvent::PreLink, "prod")];
+        for mode in [HookEnforceMode::Advisory, HookEnforceMode::Off] {
+            assert!(
+                unresolved_namespace_deny(&hooks, HookEvent::PreLink, mode, &[]).is_none(),
+                "{mode:?} must not deny"
+            );
+        }
+    }
+
+    /// #2390 — `preflight_report` must tell an operator when a required event's
+    /// hooks are ALL namespace-scoped: presence is satisfied globally while the
+    /// hook fires only inside its scope, so every other namespace is ungoverned.
+    /// Pre-#2390 that config printed a bare `(OK)`.
+    #[test]
+    fn preflight_flags_scoped_only_coverage_for_a_required_event_2390() {
+        let req = [HookEvent::PreLink];
+        let scoped_only = [scoped(HookEvent::PreLink, "prod/*")];
+        let lines = preflight_report(&scoped_only, HookEnforceMode::Enforce, &req);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("UNGOVERNED") && lines[0].contains("prod/*"),
+            "scoped-only coverage must be surfaced with its patterns: {}",
+            lines[0]
+        );
+
+        // A wildcard hook alongside it restores full coverage → plain OK line.
+        let mixed = [
+            scoped(HookEvent::PreLink, "prod/*"),
+            scoped(HookEvent::PreLink, "*"),
+        ];
+        let lines = preflight_report(&mixed, HookEnforceMode::Enforce, &req);
+        assert!(
+            lines[0].contains("(OK)") && !lines[0].contains("UNGOVERNED"),
+            "a wildcard hook covers the rest: {}",
+            lines[0]
+        );
     }
 
     #[test]

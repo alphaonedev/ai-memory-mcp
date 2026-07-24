@@ -749,8 +749,15 @@ pub async fn delete_memory(
     // #1924 (CWE-288) — consult the PRE-DELETE enforcement gate before the
     // destructive write, so `enforce_mode = enforce` + required `pre_delete`
     // with no hook DENIES (503) on the HTTP surface as it does on MCP.
+    // #2390 (N9) — the deleted row's namespace is the in-flight namespace; the
+    // payload used to be `{"id": id}` with no namespace at all, so every
+    // namespace-scoped `pre_delete` hook was silently skipped. Resolved through
+    // the SAL trait (sqlite + postgres parity), and only when the gate is armed.
+    let delete_namespaces =
+        crate::handlers::create::resolve_pre_event_namespaces(&app, &headers, &[id.clone()]).await;
     if let Some(resp) = crate::handlers::create::http_pre_event_gate(
         crate::hooks::HookEvent::PreDelete,
+        delete_namespaces,
         json!({ "id": id }),
     ) {
         return resp;
@@ -1166,8 +1173,12 @@ pub async fn promote_memory(
     }
     // #1924 (CWE-288) — consult the PRE-PROMOTE enforcement gate before the
     // tier-promotion write (HTTP parity with the MCP gate).
+    // #2390 (N9) — the promoted row's namespace (see the `pre_delete` note).
+    let promote_namespaces =
+        crate::handlers::create::resolve_pre_event_namespaces(&app, &headers, &[id.clone()]).await;
     if let Some(resp) = crate::handlers::create::http_pre_event_gate(
         crate::hooks::HookEvent::PrePromote,
+        promote_namespaces,
         json!({ "id": id }),
     ) {
         return resp;

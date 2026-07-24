@@ -1591,6 +1591,7 @@ fn set_pre_event_enforce_gate(
 /// unconditionally at zero added cost beyond one `OnceLock` load.
 pub(crate) fn consult_pre_event_gate(
     event: crate::hooks::HookEvent,
+    namespaces: Vec<String>,
     payload: Value,
 ) -> Result<(), String> {
     let Some(gate) = PRE_EVENT_ENFORCE_GATE.get() else {
@@ -1604,6 +1605,7 @@ pub(crate) fn consult_pre_event_gate(
         crate::hooks::dispatch_pre_event_enforced(
             event,
             payload,
+            &namespaces,
             &gate.all_hooks,
             gate.mode,
             &gate.required,
@@ -1629,6 +1631,135 @@ pub(crate) fn consult_pre_event_gate(
              stdio path → refused (fail-closed)"
             .to_string()),
     }
+}
+
+/// #2390 (N9) — is the pre-event enforcement gate installed in this process?
+///
+/// The gate installs ONLY when `[hooks].enforce_mode != off` AND
+/// `required_events` is non-empty (see [`run_mcp_server`] and the `serve`
+/// bootstrap), so this is `false` for the overwhelming majority of deployments.
+/// Dispatch sites whose namespace resolution needs a DB read gate that read
+/// behind this predicate, keeping the default (gate-not-installed) write path at
+/// ZERO added cost — one `OnceLock` load.
+#[must_use]
+pub fn pre_event_gate_installed() -> bool {
+    PRE_EVENT_ENFORCE_GATE.get().is_some()
+}
+
+/// #2390 (N9) — resolve the namespace(s) of `ids` for pre-event hook scoping on
+/// the MCP surface (structurally sqlite-only, #1675/n24).
+///
+/// Uses the SAME prefix-capable resolution the write handlers use
+/// ([`crate::db::resolve_id`]) so a caller passing a legitimate id PREFIX
+/// resolves identically at the gate and at the write — otherwise the gate would
+/// see "unknown namespace" for a request the handler happily commits, which is
+/// precisely the skew #2390 closes.
+///
+/// Returns de-duplicated namespaces, empty when nothing resolves;
+/// `dispatch_pre_event_enforced` turns empty into a fail-closed refusal when a
+/// namespace-scoped hook is configured for the event.
+pub(crate) fn namespaces_for_ids(conn: &rusqlite::Connection, ids: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for id in ids {
+        if let Ok(Some(mem)) = crate::db::resolve_id(conn, id)
+            && !out.contains(&mem.namespace)
+        {
+            out.push(mem.namespace);
+        }
+    }
+    out
+}
+
+/// #2390 (N9) — collect the string values of `key` from an MCP argument object,
+/// accepting either a scalar string or an array of strings.
+///
+/// `memory_delete` / `memory_promote` take a single `id`; `memory_consolidate` /
+/// `memory_reflect` take `ids` / `source_ids` arrays. One helper keeps the
+/// dispatch arms uniform.
+pub(crate) fn arg_id_list(arguments: &Value, key: &str) -> Vec<String> {
+    match arguments.get(key) {
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// #2390 (N9) — resolve the pre-event scoping namespaces from one or more
+/// memory-id arguments, doing the DB read ONLY when the gate is installed.
+///
+/// `keys` names the argument(s) carrying the ids (`id`, `ids`, `source_ids`, or
+/// `source_id` + `target_id` for a link — a link's BOTH endpoints contribute, so
+/// a hook scoped to either endpoint's namespace fires; anchoring on the source
+/// alone would let a caller choose which guard hook runs by swapping the two).
+pub(crate) fn pre_event_namespaces_for_arg_ids(
+    conn: &rusqlite::Connection,
+    arguments: &Value,
+    keys: &[&str],
+) -> Vec<String> {
+    if !pre_event_gate_installed() {
+        return Vec::new();
+    }
+    let ids: Vec<String> = keys
+        .iter()
+        .flat_map(|k| arg_id_list(arguments, k))
+        .collect();
+    namespaces_for_ids(conn, &ids)
+}
+
+/// #2390 (N9) — push `ns` onto `out` when non-blank and not already present.
+fn push_ns(out: &mut Vec<String>, ns: String) {
+    if !ns.trim().is_empty() && !out.contains(&ns) {
+        out.push(ns);
+    }
+}
+
+/// #2390 (N9) — pre-event scoping namespaces for `memory_consolidate`: the
+/// resolved TARGET namespace of the summary (`params.namespace` > compiled
+/// [`crate::DEFAULT_NAMESPACE`], exactly as `handle_consolidate` resolves it)
+/// plus every SOURCE row's namespace (they are consumed by the merge).
+pub(crate) fn consolidate_pre_event_namespaces(
+    conn: &rusqlite::Connection,
+    arguments: &Value,
+) -> Vec<String> {
+    if !pre_event_gate_installed() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    push_ns(
+        &mut out,
+        arguments[param_names::NAMESPACE]
+            .as_str()
+            .unwrap_or(crate::DEFAULT_NAMESPACE)
+            .to_string(),
+    );
+    for ns in namespaces_for_ids(conn, &arg_id_list(arguments, param_names::IDS)) {
+        push_ns(&mut out, ns);
+    }
+    out
+}
+
+/// #2390 (N9) — pre-event scoping namespaces for `memory_reflect`: the caller's
+/// `namespace` when supplied, else the namespace of the FIRST source memory
+/// (`storage::reflect` step 4), plus every source row's namespace.
+pub(crate) fn reflect_pre_event_namespaces(
+    conn: &rusqlite::Connection,
+    arguments: &Value,
+) -> Vec<String> {
+    if !pre_event_gate_installed() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if let Some(ns) = arguments[param_names::NAMESPACE].as_str() {
+        push_ns(&mut out, ns.to_string());
+    }
+    for ns in namespaces_for_ids(conn, &arg_id_list(arguments, param_names::SOURCE_IDS)) {
+        push_ns(&mut out, ns);
+    }
+    out
 }
 
 /// #2356 (W1A6-03) — consult the pre-event enforcement gate for
@@ -1672,7 +1803,21 @@ pub fn consult_pre_governance_decision_gate(
     if let (Some(id), Some(obj)) = (memory_id, payload.as_object_mut()) {
         obj.insert("memory_id".to_string(), Value::String(id.to_string()));
     }
-    consult_pre_event_gate(crate::hooks::HookEvent::PreGovernanceDecision, payload)
+    // #2390 (N9) — this event was already namespace-truthful (the namespace is a
+    // mandatory typed parameter, not a hand-built payload key); pass it through
+    // as the scoping set so the gate matches on it explicitly. A blank namespace
+    // (the `memory_check_agent_action` global-governance surface) yields an
+    // empty set, which is the honest "no namespace in flight" signal.
+    let namespaces = if namespace.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![namespace.to_string()]
+    };
+    consult_pre_event_gate(
+        crate::hooks::HookEvent::PreGovernanceDecision,
+        namespaces,
+        payload,
+    )
 }
 
 /// #1885 — test-only installer for the pre-event enforcement gate. Builds the
@@ -1841,7 +1986,14 @@ fn dispatch_memory_lineage(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 
 fn dispatch_memory_delete(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // #1885 — pre-event enforcement gate (inert unless enforce active).
-    consult_pre_event_gate(crate::hooks::HookEvent::PreDelete, ctx.arguments.clone())?;
+    // #2390 (N9) — the target row's namespace is the in-flight namespace for a
+    // delete (mirrors `handle_delete`'s own `target.namespace`, tools/delete.rs).
+    // Resolved only when the gate is installed, so the default path is unchanged.
+    consult_pre_event_gate(
+        crate::hooks::HookEvent::PreDelete,
+        pre_event_namespaces_for_arg_ids(ctx.conn, ctx.arguments, &[param_names::ID]),
+        ctx.arguments.clone(),
+    )?;
     handle_delete(
         ctx.conn,
         ctx.db_path,
@@ -1853,7 +2005,13 @@ fn dispatch_memory_delete(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 
 fn dispatch_memory_promote(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // #1885 — pre-event enforcement gate (inert unless enforce active).
-    consult_pre_event_gate(crate::hooks::HookEvent::PrePromote, ctx.arguments.clone())?;
+    // #2390 (N9) — the target row's namespace (mirrors `handle_promote`'s own
+    // `snapshot_namespace = target.namespace`, tools/promote.rs).
+    consult_pre_event_gate(
+        crate::hooks::HookEvent::PrePromote,
+        pre_event_namespaces_for_arg_ids(ctx.conn, ctx.arguments, &[param_names::ID]),
+        ctx.arguments.clone(),
+    )?;
     handle_promote(ctx.conn, ctx.db_path, ctx.arguments, ctx.mcp_client)
 }
 
@@ -1895,7 +2053,19 @@ fn dispatch_memory_get(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 
 fn dispatch_memory_link(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // #1885 — pre-event enforcement gate (inert unless enforce active).
-    consult_pre_event_gate(crate::hooks::HookEvent::PreLink, ctx.arguments.clone())?;
+    // #2390 (N9) — BOTH endpoints contribute their namespace (fire-if-ANY): a
+    // link is a graph edge reachable from each side, and anchoring on the source
+    // alone would let a caller pick which namespace-scoped guard hook fires by
+    // swapping `source_id`/`target_id`.
+    consult_pre_event_gate(
+        crate::hooks::HookEvent::PreLink,
+        pre_event_namespaces_for_arg_ids(
+            ctx.conn,
+            ctx.arguments,
+            &[param_names::SOURCE_ID, param_names::TARGET_ID],
+        ),
+        ctx.arguments.clone(),
+    )?;
     handle_link(ctx.conn, ctx.db_path, ctx.arguments, ctx.active_keypair)
 }
 
@@ -1920,8 +2090,13 @@ fn dispatch_memory_replay(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 
 fn dispatch_memory_consolidate(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // #1885 — pre-event enforcement gate (inert unless enforce active).
+    // #2390 (N9) — a consolidation writes the summary into its resolved target
+    // namespace (`params.namespace` > compiled default, mirroring
+    // tools/consolidate.rs) and CONSUMES N source rows that may live elsewhere;
+    // every touched namespace contributes so a hook scoped to any of them fires.
     consult_pre_event_gate(
         crate::hooks::HookEvent::PreConsolidate,
+        consolidate_pre_event_namespaces(ctx.conn, ctx.arguments),
         ctx.arguments.clone(),
     )?;
     handle_consolidate(
@@ -1955,7 +2130,15 @@ fn dispatch_memory_ingest_multistep(ctx: &ToolDispatchCtx<'_>) -> Result<Value, 
 
 fn dispatch_memory_reflect(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // #1885 — pre-event enforcement gate (inert unless enforce active).
-    consult_pre_event_gate(crate::hooks::HookEvent::PreReflect, ctx.arguments.clone())?;
+    // #2390 (N9) — a reflection lands in `namespace` when the caller supplies
+    // one, else in the namespace of the FIRST source memory (storage/reflect.rs
+    // step 4). Source namespaces are folded in too: a reflection derives from
+    // (and writes `reflects_on` edges to) rows a scoped hook may govern.
+    consult_pre_event_gate(
+        crate::hooks::HookEvent::PreReflect,
+        reflect_pre_event_namespaces(ctx.conn, ctx.arguments),
+        ctx.arguments.clone(),
+    )?;
     handle_reflect(
         ctx.conn,
         ctx.db_path,
