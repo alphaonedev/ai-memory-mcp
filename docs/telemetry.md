@@ -50,7 +50,7 @@ If you build with default Cargo features, the only outbound network calls the bi
 
 ## 3. Sinks — where spans go
 
-Three surfaces ship in v0.7.0 (stderr, rolling file, Prometheus `/metrics`), plus a forward-looking OTLP commitment; you choose any combination:
+Three surfaces ship in v0.7.0 (stderr, rolling file, Prometheus `/metrics`), joined by the opt-in `--features syslog` RFC-5424 remote sink at v0.8.0 (#1765); you choose any combination. OTLP is **not** among them — see the deferral note below.
 
 **stdout/stderr (default).** Spans render to stderr via `tracing-subscriber::fmt`. Suitable for systemd journals (`journalctl -u ai-memory`), Docker log drivers, and pipeline ingestion (`ai-memory serve 2>&1 | vector --config ...`).
 
@@ -69,7 +69,7 @@ level = "info"        # tracing::EnvFilter syntax
 
 The appender writes rotated files (`ai-memory.log.YYYY-MM-DD`) under the resolved path. Path precedence: CLI flag `--log-dir` > `AI_MEMORY_LOG_DIR` env > `[logging] path` config > platform default. The substrate refuses world-writable log directories — set `chmod 750` on the parent. Shipped in v0.7.0 at 98.98% test coverage; see `src/logging.rs` and the SIEM ingestion runbook at [`security/audit-trail.md`](security/audit-trail.html).
 
-**OpenTelemetry OTLP exporter (forward-looking).** The substrate's span shape is intentionally OTel-compatible. An OTLP exporter that reads `OTEL_EXPORTER_OTLP_ENDPOINT` (and the standard `OTEL_*` companion variables) is a v1.0 commitment — see ROADMAP §7.6. Until then, the file-sink path with `structured = true` produces JSON that any OTel-aware collector can ingest as a log-receiver input.
+**OpenTelemetry OTLP exporter — NOT SHIPPED; DEFERRED to v1.x.** The substrate's span shape is intentionally OTel-compatible, but **no OTLP exporter exists at v1.0.0**: there is no `opentelemetry`/OTLP dependency in `Cargo.toml`, no exporter in `src/`, and no `OTEL_*` env surface. The ROADMAP §11.6 v1.0.0 disposition ruling records OpenTelemetry standardization as DEFERRED to v1.x (it was never a v1.0.0 acceptance criterion). Use the file sink with `structured = true` — it produces JSON that any OTel-aware collector ingests as a log-receiver input — or the `--features syslog` RFC-5424 remote sink.
 
 **Prometheus `/metrics` (HTTP daemon, pull-based).** The `serve` daemon additionally exposes a Prometheus scrape surface at the bare `/metrics` path (alias `/api/v1/metrics`; `src/metrics.rs`). It is pull-only — nothing is pushed anywhere. The registered series at v0.7.0 include the core counters/gauges `ai_memory_store_total`, `ai_memory_recall_total`, `ai_memory_recall_latency_seconds`, `ai_memory_memories`, the HNSW gauges (`ai_memory_hnsw_size`, `ai_memory_hnsw_evictions_total`, `ai_memory_hnsw_last_eviction_at_nanos`), the webhook/subscription series (`ai_memory_webhook_dispatched_total`, `ai_memory_webhook_failed_total`, `ai_memory_subscriptions_active`, `ai_memory_subscription_dlq_overflow_total`), the curator series (`ai_memory_curator_cycles_total`, `ai_memory_curator_cycle_duration_seconds`, `ai_memory_curator_operations_total`), the autonomy/quality series (`ai_memory_autonomy_hook_total`, `ai_memory_contradiction_detected_total`, `ai_memory_corrupt_provenance_rows_total`, `ai_memory_auto_export_spawn_failed_total`), and the federation series (`ai_memory_federation_push_dlq_depth`, `ai_memory_federation_push_dlq_quarantined_total`, `ai_memory_federation_fanout_retry_total`, `ai_memory_federation_fanout_dropped_total`, `ai_memory_federation_partial_quorum_total`, `ai_memory_federation_cred_verify_total`, `ai_memory_federation_inbound_cred_total`, `ai_memory_federation_cred_max_age_seconds`, `ai_memory_federation_renewal_lag_seconds`). Metric values are operation counts and durations only — never memory content.
 
@@ -117,15 +117,17 @@ paging-on-health-check loop or a Nagios-style monitoring probe.
 
 ---
 
-## 6. v1.0 OpenTelemetry standardization — forward-looking commitment
+## 6. OpenTelemetry standardization — DEFERRED to v1.x (did NOT ship at v1.0.0)
 
-Per ROADMAP §7.6, every internal tracing span converts to canonical OTel spans at v1.0:
+**Status, stated honestly:** OTel standardization was planned for v1.0 and **did not ship**. The ROADMAP §11.6 v1.0.0 disposition ruling records it — alongside mDNS auto-discovery and MVCC strict-consistency mode — as DEFERRED to v1.x with zero implementation; it was never a v1.0.0 acceptance criterion. Nothing in this section describes shipped behavior.
+
+The v1.x shape remains:
 
 - Span attributes match the OTel semantic conventions where they exist (`code.namespace`, `code.function`, `db.system`, etc.).
 - An OTLP exporter ships in-tree, with the standard env-var configuration surface (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME`).
 - Backwards compatibility: the rolling-file sink continues to ship and remains operator-toggleable; OTel becomes one more sink, not a replacement for the file path.
 
-Operators who want to forward-compatibly capture spans today can run the file sink in `structured = true` mode and route the JSON through `vector` or `fluent-bit` to their OTel collector. The output schema will gain canonical attributes at v1.0; field renaming is the only churn.
+Operators who want to forward-compatibly capture spans today run the file sink in `structured = true` mode and route the JSON through `vector` or `fluent-bit` to their OTel collector (or ship RFC-5424 to a collector via the `--features syslog` sink). The output schema gains canonical attributes when OTel lands; field renaming is the only churn.
 
 ---
 

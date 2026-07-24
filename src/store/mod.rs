@@ -710,8 +710,12 @@ pub trait MemoryStore: Send + Sync {
     /// from the underlying store. Surfaced through
     /// `/api/v1/capabilities.db_schema_version` so operators can confirm
     /// at runtime whether a deployed daemon's DB is on the schema the
-    /// binary expects (target is currently 28 — see the
-    /// `CURRENT_SCHEMA_VERSION` constant on each adapter).
+    /// binary expects. The target is whatever the `CURRENT_SCHEMA_VERSION`
+    /// constant on each adapter declares (`crate::storage::migrations`
+    /// for sqlite, `crate::store::postgres` for postgres) — the literal
+    /// is deliberately NOT restated here, because a hand-copied number
+    /// goes stale the moment the ladder advances (it read "28" against a
+    /// live `CURRENT_SCHEMA_VERSION` of 87 until #2405).
     ///
     /// Default returns `0` so adapters that don't track a numeric
     /// migration ladder (a future in-memory test adapter, etc.) round-
