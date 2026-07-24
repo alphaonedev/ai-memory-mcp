@@ -325,7 +325,7 @@ fn verify_attested_weights_signature(
     verifying_key: &ed25519_dalek::VerifyingKey,
 ) -> Result<(), ed25519_dalek::SignatureError> {
     use base64::Engine;
-    use ed25519_dalek::{Signature, Verifier};
+    use ed25519_dalek::Signature;
 
     let trimmed = signature.trim();
     let sig_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -338,7 +338,12 @@ fn verify_attested_weights_signature(
     let mut sig_arr = [0u8; ed25519_dalek::SIGNATURE_LENGTH];
     sig_arr.copy_from_slice(&sig_bytes);
     let sig = Signature::from_bytes(&sig_arr);
-    verifying_key.verify(sha256.as_bytes(), &sig)
+    // N23 (#2403) — verify_strict rejects non-canonical / small-order-component
+    // signatures (S-malleability); the plain `verify` accepts them. Model-weights
+    // attestation is SHA-256-content-protected so this is non-repudiation
+    // hardening; mirrors the verify_strict sites in src/approvals.rs +
+    // src/mcp/server_identity.rs.
+    verifying_key.verify_strict(sha256.as_bytes(), &sig)
 }
 
 #[cfg(test)]
