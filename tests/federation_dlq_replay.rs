@@ -807,7 +807,7 @@ async fn replay_ack_leaves_row_pending_when_snapshot_is_stale_2360() {
 }
 
 /// #2360 — postgres arm parity. Mirrors the sqlite refresh + CAS-guard pins
-/// against a live PostgresStore. Ignored by default; run with
+/// against a live `PostgresStore`. Ignored by default; run with
 /// `AI_MEMORY_TEST_POSTGRES_URL` set (`cargo test --features sal-postgres --
 /// --ignored`).
 #[cfg(feature = "sal-postgres")]
