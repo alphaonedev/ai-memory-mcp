@@ -72,6 +72,33 @@
 //! signatures (the existing `signature` column) remain as defense-in-
 //! depth.
 //!
+//! ## #2370 per-database anchor scoping — residual bounds (honest scoping)
+//!
+//! The #1946 off-table head-anchor log is scoped PER DATABASE via the
+//! genesis-derived `db_id` ([`db_id_from_genesis_parts`], bound into the
+//! witness `resolution` at `v: 3`), so sibling databases sharing one
+//! witness mount no longer cross-contaminate rollback verdicts. Two
+//! residuals remain BY DESIGN — do NOT overclaim:
+//!
+//! - **Wipe-and-reinit db_id rotation.** An attacker who replaces the
+//!   database with a re-initialised chain mints a NEW genesis, so the
+//!   fresh db_id matches none of the old anchors and the open resolves
+//!   `RollbackCheck::NotApplicable` instead of `Evidence`. This is the
+//!   SAME ESTIMABLE-not-ATTESTABLE boundary already disclosed for the
+//!   rollback check as a whole (an imaged-disk attacker who snapshots DB
+//!   + anchor together also wins); TPM2 NV / an off-host anchor is the
+//!   residual-closing control. A rollback that wipes `signed_events` to
+//!   EMPTY (no re-init) is still caught: a head-0 opener against any
+//!   pinned anchor line stays on the Evidence path.
+//! - **Mixed-version fleet high-water freeze.** A v3 WRITER paired with a
+//!   pre-#2370 READER (which hard-rejects `v: 3` resolutions) makes the
+//!   old reader's anchor high-water FREEZE at the last v1/v2 line — the
+//!   old reader then WITHHOLDS (or under-detects newer rollbacks) until
+//!   it is upgraded. One-release conservatism: legacy id-less lines are
+//!   still counted by the new reader (over-detect toward Evidence, never
+//!   suppression), and old readers never mint a FALSE verdict — they
+//!   withhold. Upgrade every reader within one release.
+//!
 //! ## Relationship to [`crate::audit`] (JSONL chain)
 //!
 //! The JSONL audit log under `<audit_dir>/audit.log` remains the
@@ -687,6 +714,64 @@ pub fn compute_cause_hash(
     hasher.update([FIELD_SEP]);
     hasher.update(&input_digest);
     hasher.finalize().to_vec()
+}
+
+/// Domain-separation prefix for the #2370 per-database identity pre-image
+/// ([`db_id_from_genesis_parts`]). Trailing NUL + `-v1` version, mirroring
+/// [`CAUSE_PREIMAGE_DOMAIN`]'s discipline.
+const DB_ID_PREIMAGE_DOMAIN: &[u8] = b"audit-db-id-v1\0";
+
+/// SQL that reads the GENESIS (`sequence = 1`) `signed_events` row's STABLE
+/// STORED columns for the #2370 per-database identity. Bind-parameter-free
+/// (no `?`/`$1`) so the ONE string serves both the sqlite reader
+/// ([`genesis_db_id`]) and the postgres witness-emission twin (pm-v3.1
+/// literal de-dup).
+pub const GENESIS_ROW_SQL: &str =
+    "SELECT id, agent_id, payload_hash FROM signed_events WHERE sequence = 1";
+
+/// v1.0.0 #2370 — derive the per-DATABASE identity from the genesis
+/// (`sequence = 1`) `signed_events` row's stable stored columns.
+///
+/// Returns lowercase-hex SHA-256 over the domain-tagged, LENGTH-PREFIXED
+/// pre-image `DB_ID_PREIMAGE_DOMAIN || lp(id) || lp(agent_id) ||
+/// lp(payload_hash)` (`lp` = u64-BE length then bytes, the #1930 injective
+/// encoding). Deliberately NOT over `canonical_chain_bytes` (its encoding
+/// changed at #1930, so a cross-upgrade db-id would silently rotate) and
+/// deliberately EXCLUDING the row's timestamp (a postgres `TIMESTAMPTZ`
+/// readback renders differently than the stored text — the #2203 drift class
+/// — so a timestamp fold would make the two backends mint different ids for
+/// the same row). The three folded columns are immutable, backend-identical
+/// TEXT/BLOB values.
+#[must_use]
+pub fn db_id_from_genesis_parts(id: &str, agent_id: &str, genesis_payload_hash: &[u8]) -> String {
+    let mut pre = Vec::with_capacity(
+        DB_ID_PREIMAGE_DOMAIN.len() + id.len() + agent_id.len() + genesis_payload_hash.len() + 24,
+    );
+    pre.extend_from_slice(DB_ID_PREIMAGE_DOMAIN);
+    push_len_prefixed(&mut pre, id.as_bytes());
+    push_len_prefixed(&mut pre, agent_id.as_bytes());
+    push_len_prefixed(&mut pre, genesis_payload_hash);
+    hex_lower(&payload_hash(&pre))
+}
+
+/// v1.0.0 #2370 — read this database's genesis-derived identity
+/// ([`db_id_from_genesis_parts`]) from the sqlite `signed_events` table.
+/// `Ok(None)` when the chain is empty (no `sequence = 1` row) — a fresh
+/// database has no identity yet.
+///
+/// # Errors
+/// Propagates the `rusqlite` query error (e.g. the table is absent on a
+/// pre-migration legacy schema); callers on degrade-tolerant paths flatten
+/// it to `None`, which is the CONSERVATIVE count-every-anchor posture.
+pub fn genesis_db_id(conn: &Connection) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    let row: Option<(String, String, Vec<u8>)> = conn
+        .query_row(GENESIS_ROW_SQL, [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .optional()
+        .context("read signed_events genesis row for db-id")?;
+    Ok(row.map(|(id, agent_id, ph)| db_id_from_genesis_parts(&id, &agent_id, &ph)))
 }
 
 /// v73 (#1822, G5a) — the exact bytes the daemon Ed25519 key signs for
@@ -1390,6 +1475,15 @@ pub enum RollbackCheck {
     Unknown,
     /// Anchor pinned; DB head `>=` anchored high-water — no rollback evidence.
     NotDetected,
+    /// v1.0.0 #2370 — no anchor history for THIS database: either a fresh
+    /// (empty-chain, genesis-less) database against an anchor log with no
+    /// pinned lines at all, or a v3 log whose pinned lines ALL carry a
+    /// DIFFERENT `db_id` (sibling databases sharing one witness mount).
+    /// Clean; NEVER refuses the open, even under require-mode — the fix for
+    /// the second-healthy-DB boot-DoS. A head-0 opener against a log WITH
+    /// pinned id-less/own lines stays on the `Evidence` path (a rollback
+    /// that wipes `signed_events` to empty must never become undetectable).
+    NotApplicable,
     /// DB head below the anchor with no operator sanction — rollback evidence.
     Evidence {
         /// Highest witness-signed head anchored off-table.
@@ -2214,8 +2308,15 @@ pub fn verify_audit_trail(conn: &Connection, since: Option<&str>) -> Result<Audi
     let lineage = compute_identity_lineage_verdict(conn, require_lineage);
 
     // v1.0.0 #1946 D — rollback-evidence verdict from the SHARED off-table
-    // anchor reader (identical verdict on the postgres twin, K3 parity).
-    let rollback = crate::governance::audit::compute_rollback_verdict_for_report(head_sequence);
+    // anchor reader. #2370: scoped by this database's genesis-derived id (a
+    // read fault degrades to `None` = the conservative count-every-line
+    // posture). The postgres twin passes `None` pending the check-side
+    // db-id parity follow-up (#2373).
+    let db_id = genesis_db_id(conn).ok().flatten();
+    let rollback = crate::governance::audit::compute_rollback_verdict_for_report(
+        head_sequence,
+        db_id.as_deref(),
+    );
 
     // v1.0.0 #1873 (CWE-354) — audit-head HASH-anchor check. The seq-only
     // `truncation` + `witness` verdicts above miss a SAME-LENGTH suffix rewrite
@@ -2657,7 +2758,11 @@ fn try_emit_audit_head_witness(
     // v1.0.0 #1946 A — bind the OSS rollback counter (head sequence) so every
     // v1.0 witness is a `v: 2` record.
     let rollback = Some(witness::rollback_counter_for(signed_head_seq));
-    let cp = witness::build_signed_witness_checkpoint(&dual, rollback, now, &keypair)?;
+    // v1.0.0 #2370 — bind this database's genesis-derived identity so the
+    // shared off-table anchor log filters per database (`v: 3`). A chain with
+    // rows always has a genesis, so emission from this chokepoint carries it.
+    let db_id = genesis_db_id(conn).context("witness: read genesis db-id")?;
+    let cp = witness::build_signed_witness_checkpoint(&dual, rollback, db_id, now, &keypair)?;
     crate::checkpoints::insert(conn, &cp).context("witness: insert checkpoint")?;
     // v1.0.0 #1946 B — mirror the signed anchor OFF-TABLE (fire-and-forget) so
     // a whole-DB-file rollback is detectable at the next `db::open`.
@@ -3766,7 +3871,7 @@ mod tests {
             revisions_head_sequence: 3,
             revisions_head_hash: "bb".to_string(),
         };
-        let mut cp = build_signed_witness_checkpoint(&dual, None, 1_900_000_000, &kp)
+        let mut cp = build_signed_witness_checkpoint(&dual, None, None, 1_900_000_000, &kp)
             .expect("build witness cp");
 
         // Positive control: valid, pinned witness whose heads match the DB →
