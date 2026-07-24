@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (COORDINATION-AUDIT lane, roadmap-3x7 findings)
+
+- **Lease sweeper now emits a `signed_events` coordination-audit entry per reclaimed lease on both backends** ([#2371](https://github.com/alphaonedev/ai-memory-mcp/issues/2371)) — the FORCED reclamation of an expired coordination lease was the ONE lease op with no forensic trace (the voluntary acquire/renew/release ops all append signed-chain rows), so the ROADMAP "sweeper … emits `signed_events` audit entry" claim was false. The sqlite `sweep_expired_leases` now returns the reclaimed `(action_id, holder)` pairs via an atomic `DELETE … RETURNING`, and the new `sweep_expired_leases_audited` wrapper (driven by `background::lease_sweep` + the `SqliteStore` SAL path) appends one `coordination.lease_expire_reclaim` row per reclaimed lease attributed to the reclaimed holder; the postgres `lease_sweep_expired` twin does the same via `DELETE … RETURNING` + a byte-parity `signed_events` append (shared `coordination_audit::coordination_payload_hash`). Pinned by `actions::tests::sweep_expired_leases_audited_emits_one_row_per_reclaimed_lease`, `background::lease_sweep::tests::run_lease_sweep_emits_coordination_audit_per_reclaimed_lease`, and the sal-postgres `lease_sweep_expired_emits_coordination_audit_2371`.
+
 ### Fixed (STORAGE-CHAIN lane, fable-3x7 findings)
 
 - **sqlite `memory_update` tier→long now clears the stale short/mid `expires_at`** ([#2331](https://github.com/alphaonedev/ai-memory-mcp/issues/2331), FBL-01) — the #1626 tier→long ⇒ `expires_at = NULL` coupling, previously postgres-only, landed on the sqlite `update_with_expected_version` + supersede funnels so the tier-blind GC can no longer archive (or hard-delete + crypto-erase under `archive_on_gc=false`) an explicitly-promoted permanent row at its leftover TTL deadline. Pinned by `tests/storage_chain_fbl.rs`.

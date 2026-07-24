@@ -10667,6 +10667,42 @@ impl PostgresStore {
             );
         }
     }
+
+    /// #2371 — postgres twin of the sqlite `crate::coordination_audit::emit`
+    /// for a FORCED lease reclamation. Builds the row from the SAME
+    /// [`crate::coordination_audit::coordination_payload_hash`] pre-image
+    /// (`[action_id, holder]` joined by 0x1F) and the SAME `with_daemon_signature`
+    /// idiom, attributed to the reclaimed `holder`, so the
+    /// `coordination.lease_expire_reclaim` row persists + verifies identically
+    /// on both backends (K3 parity). Best-effort: an append failure is
+    /// WARN-logged and swallowed — the sweep DELETE already committed.
+    async fn emit_lease_sweep_reclaim_audit(&self, action_id: &str, holder: &str) {
+        let ts = Utc::now();
+        let event = crate::signed_events::SignedEvent::with_daemon_signature(
+            crate::coordination_audit::coordination_payload_hash(&[action_id, holder]),
+            holder.to_string(),
+            crate::coordination_audit::LEASE_SWEEP_RECLAIM.to_string(),
+            ts.to_rfc3339(),
+            None,
+        );
+        let insert_row = PgSignedEventInsert {
+            id: &event.id,
+            agent_id: &event.agent_id,
+            event_type: &event.event_type,
+            payload_hash: &event.payload_hash,
+            signature: event.signature.as_deref(),
+            attest_level: &event.attest_level,
+            timestamp: ts,
+            cause_hash: None,
+        };
+        if let Err(e) = pg_append_signed_event_with_chain(&self.pool, insert_row).await {
+            tracing::warn!(
+                target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
+                action_id, holder,
+                "failed to append coordination.lease_expire_reclaim audit row: {e}"
+            );
+        }
+    }
 }
 
 /// Caller-supplied fields for [`pg_append_signed_event_with_chain`].
@@ -20496,12 +20532,34 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn lease_sweep_expired(&self, now: i64) -> StoreResult<usize> {
-        let res = sqlx::query("DELETE FROM leases WHERE expires_at <= $1")
-            .bind(now)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| to_store_err("lease_sweep_expired", e))?;
-        Ok(usize::try_from(res.rows_affected()).unwrap_or(0))
+        use sqlx::Row;
+        // #2371 — `RETURNING` makes the reclaimed set EXACTLY the rows deleted
+        // (atomic; no SELECT-then-DELETE TOCTOU), so the FORCED reclamation
+        // leaves the same tamper-evident coordination-audit trace the voluntary
+        // lease ops do — the backend-parity twin of the sqlite
+        // `crate::actions::sweep_expired_leases_audited` path.
+        let rows =
+            sqlx::query("DELETE FROM leases WHERE expires_at <= $1 RETURNING action_id, holder")
+                .bind(now)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| to_store_err("lease_sweep_expired", e))?;
+        let mut reclaimed: Vec<(String, String)> = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let action_id: String = r
+                .try_get("action_id")
+                .map_err(|e| to_store_err("lease_sweep_expired.action_id", e))?;
+            let holder: String = r
+                .try_get("holder")
+                .map_err(|e| to_store_err("lease_sweep_expired.holder", e))?;
+            reclaimed.push((action_id, holder));
+        }
+        // Best-effort audit append per reclaimed lease (the DELETE already
+        // committed): a failure is WARN-logged, never cratering the sweep.
+        for (action_id, holder) in &reclaimed {
+            self.emit_lease_sweep_reclaim_audit(action_id, holder).await;
+        }
+        Ok(reclaimed.len())
     }
 
     async fn signal_send(
@@ -28695,6 +28753,76 @@ mod tests {
             holder_row, winners[0],
             "the surviving leases row must belong to the single winner"
         );
+        // Cleanup — cascade removes the lease row with the action.
+        let _ = sqlx::query("DELETE FROM actions WHERE id = $1")
+            .bind(&aid)
+            .execute(&store.pool)
+            .await;
+    }
+
+    /// #2371 — postgres `lease_sweep_expired` must emit one
+    /// `coordination.lease_expire_reclaim` `signed_events` row per reclaimed
+    /// lease, attributed to the reclaimed holder — the backend-parity twin of
+    /// the sqlite `sweep_expired_leases_audited` path (K3). Acquires an expired
+    /// lease, sweeps, and asserts exactly one audit row. Skips cleanly without
+    /// `AI_MEMORY_TEST_POSTGRES_URL`.
+    #[tokio::test]
+    async fn lease_sweep_expired_emits_coordination_audit_2371() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("lease-sweep-2371-{unique}");
+        let aid = format!("lease-sweep-2371-act-{unique}");
+        let holder = format!("holder-2371-{unique}");
+        let action = crate::models::Action {
+            id: aid.clone(),
+            namespace: ns,
+            kind: "test.lease-sweep".to_string(),
+            state: crate::models::ActionState::Pending,
+            title: "lease 2371 sweep target".to_string(),
+            payload: serde_json::json!({}),
+            priority: 5,
+            agent_id: Some("ai:sal-test".to_string()),
+            claimed_by: None,
+            vector_clock: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+        };
+        store
+            .action_create(&ctx, &action)
+            .await
+            .expect("action_create");
+        // Acquire a lease whose deadline is already in the past.
+        let now = 1_700_100_000_i64;
+        store
+            .lease_acquire(&ctx, &aid, &holder, now, now - 1)
+            .await
+            .expect("lease_acquire");
+
+        assert_eq!(
+            store.lease_sweep_expired(now).await.expect("sweep"),
+            1,
+            "exactly one expired lease reclaimed"
+        );
+
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM signed_events WHERE event_type = $1 AND agent_id = $2",
+        )
+        .bind(crate::coordination_audit::LEASE_SWEEP_RECLAIM)
+        .bind(&holder)
+        .fetch_one(&store.pool)
+        .await
+        .expect("query audit rows");
+        assert_eq!(
+            count, 1,
+            "one lease-sweep reclaim audit row attributed to the holder"
+        );
+
         // Cleanup — cascade removes the lease row with the action.
         let _ = sqlx::query("DELETE FROM actions WHERE id = $1")
             .bind(&aid)

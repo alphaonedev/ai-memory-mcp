@@ -528,7 +528,7 @@ L4 is the architecturally clean removal of the entire problem class: hosts volun
 - `memory_action_create / update / transition / delete / query / dag` MCP tools.
 - Action state machine (pending → claimed → in_progress → done | failed | abandoned).
 - Dependency DAG with typed edges (`requires` / `unlocks` / `blocks` / `gated_by` / `sibling`).
-- Lease + heartbeat for resilience (sweeper releases expired leases, emits `signed_events` audit entry).
+- Lease + heartbeat for resilience (sweeper releases expired leases, emitting one `coordination.lease_expire_reclaim` `signed_events` audit entry per reclaimed lease on both backends — #2371).
 - Federation-aware quorum claiming (W-of-N agreement on transitions).
 - Vector clock per `action_id` for federation merge.
 - `memory_lease_acquire / renew / release / query` MCP tools.
