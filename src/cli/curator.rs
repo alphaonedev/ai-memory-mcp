@@ -111,7 +111,10 @@ pub struct CuratorArgs {
 /// keyword tier (no curator LLM configured) and on env / construction
 /// failure — the curator falls through to keyword-only behavior so
 /// the daemon never hard-fails on an unreachable provider.
-fn build_curator_llm(tier: config::FeatureTier) -> Option<llm::OllamaClient> {
+fn build_curator_llm(
+    tier: config::FeatureTier,
+    db_path: &std::path::Path,
+) -> Option<llm::OllamaClient> {
     // v0.7.x (#1146) — route through the canonical resolver. Two
     // short-circuits preserve pre-#1146 semantics:
     //   1. Tiers with no `llm_model` preset (Keyword, Semantic) AND
@@ -129,6 +132,37 @@ fn build_curator_llm(tier: config::FeatureTier) -> Option<llm::OllamaClient> {
         && tier.config().llm_model.is_none()
     {
         return None;
+    }
+    // N7 (#2388) — inference-plane egress gate. When the operator selected
+    // AI_MEMORY_INFERENCE_EGRESS=deny (or loopback-only against an external
+    // vendor), refuse to construct the outbound curator LLM client so no
+    // memory content can be POSTed to the vendor, and emit a best-effort
+    // signed refusal. Default `allow` → no-op (byte-identical legacy).
+    // ENFORCED here (no client → no egress); mirrors the precedent at
+    // `daemon_runtime::build_llm_client` + `reload::resolve_and_build_mcp_llm`.
+    {
+        use crate::egress::{
+            EgressClass, EgressDecision, InferenceEgressMode, evaluate_inference_egress,
+        };
+        if let EgressDecision::Refuse {
+            class,
+            target,
+            reason,
+        } = evaluate_inference_egress(
+            InferenceEgressMode::resolve(),
+            EgressClass::InferenceLlm,
+            &resolved.base_url,
+        ) {
+            tracing::warn!(
+                "curator LLM client DISABLED by inference-plane egress gate \
+                 (target={target}); {reason} (#2388)"
+            );
+            // #1991 — audit against the operator-resolved `db_path` threaded from
+            // the caller, NOT a recomputed `effective_db(DEFAULT_DB)` (which would
+            // misfile the row to CWD `ai-memory.db` under a non-default `--db`).
+            crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
+            return None;
+        }
     }
     llm::OllamaClient::build_from_resolved(&resolved)
         .ok()
@@ -250,7 +284,7 @@ pub async fn run(
     };
 
     let feature_tier = app_config.effective_tier(None);
-    let llm = build_curator_llm(feature_tier);
+    let llm = build_curator_llm(feature_tier, db_path);
 
     if args.once {
         let conn = db::open(db_path)?;
@@ -390,7 +424,7 @@ async fn run_store_backed_sweep(
 
     let keypair = load_curator_keypair_best_effort();
     let feature_tier = app_config.effective_tier(None);
-    let llm = build_curator_llm(feature_tier);
+    let llm = build_curator_llm(feature_tier, db_path);
 
     // v0.8.0 Pillar-2.5 slice-3c1 (#1747) — config for the store-backed
     // consolidation sweep. `compaction.enabled` resolved from operator config
@@ -762,7 +796,7 @@ async fn run_reflect(
     let keypair = load_curator_keypair_best_effort();
 
     let feature_tier = app_config.effective_tier(None);
-    let llm = build_curator_llm(feature_tier);
+    let llm = build_curator_llm(feature_tier, db_path);
 
     // Single-namespace invocations bypass the per-namespace `enabled`
     // gate (operator explicitly asked). #1671 — `--all-namespaces` now
@@ -1844,7 +1878,8 @@ mod tests {
         // resolve a non-default `[llm]` stanza and cause this
         // assertion to fail).
         crate::cli::test_utils::ensure_no_config_env();
-        let result = build_curator_llm(config::FeatureTier::Keyword);
+        let dir = tempfile::tempdir().unwrap();
+        let result = build_curator_llm(config::FeatureTier::Keyword, &dir.path().join("c.db"));
         assert!(result.is_none());
     }
 
@@ -1859,7 +1894,8 @@ mod tests {
         // returns the Ollama compiled default rather than reading the
         // host's user-config-resolved backend.
         crate::cli::test_utils::ensure_no_config_env();
-        let _ = build_curator_llm(config::FeatureTier::Smart);
+        let dir = tempfile::tempdir().unwrap();
+        let _ = build_curator_llm(config::FeatureTier::Smart, &dir.path().join("c.db"));
         // No assertion on the value; the test exercises lines 55-56.
     }
 
@@ -2608,7 +2644,36 @@ mod tests {
         // returns the Ollama compiled default rather than the host's
         // configured backend.
         crate::cli::test_utils::ensure_no_config_env();
-        let _ = build_curator_llm(config::FeatureTier::Autonomous);
+        let dir = tempfile::tempdir().unwrap();
+        let _ = build_curator_llm(config::FeatureTier::Autonomous, &dir.path().join("c.db"));
+    }
+
+    // N7 (#2388) — the inference-egress gate must refuse to construct the
+    // curator LLM client under AI_MEMORY_INFERENCE_EGRESS=deny, so no memory
+    // content can egress to a vendor for curation. Smart tier has an llm_model
+    // preset (so the CompiledDefault short-circuit does NOT fire) — pre-fix this
+    // returned a live network client; post-fix it returns None because the
+    // egress gate refuses BEFORE `build_from_resolved`.
+    #[test]
+    fn build_curator_llm_deny_egress_returns_none_n7_2388() {
+        crate::cli::test_utils::ensure_no_config_env();
+        let _guard = config::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("c.db");
+        let prior = std::env::var(crate::egress::ENV_INFERENCE_EGRESS).ok();
+        // SAFETY: serialized by `test_env_lock`; restored below.
+        unsafe { std::env::set_var(crate::egress::ENV_INFERENCE_EGRESS, "deny") };
+        let result = build_curator_llm(config::FeatureTier::Smart, &db_path);
+        // SAFETY: serialized by `test_env_lock` (see above).
+        match &prior {
+            Some(v) => unsafe { std::env::set_var(crate::egress::ENV_INFERENCE_EGRESS, v) },
+            None => unsafe { std::env::remove_var(crate::egress::ENV_INFERENCE_EGRESS) },
+        }
+        assert!(
+            result.is_none(),
+            "under AI_MEMORY_INFERENCE_EGRESS=deny the curator LLM builder must return \
+             None (no constructed network client) — N7 (#2388)"
+        );
     }
 
     #[cfg(feature = "sal")]
