@@ -322,38 +322,65 @@ fn redact_jwts(content: &str, kinds: &mut Vec<&'static str>) -> Option<String> {
     }
 }
 
-/// Redact every PEM private-key block (`-----BEGIN … PRIVATE KEY-----` …
-/// `-----END … PRIVATE KEY-----`). Falls back to a whole-marker redaction
-/// when the END marker is absent (truncated paste).
+/// Redact every PEM PRIVATE-KEY block (`-----BEGIN … PRIVATE KEY-----` …
+/// `-----END … PRIVATE KEY-----`), each span bounded to its OWN block
+/// (#2387): a non-key PEM block (e.g. `-----BEGIN CERTIFICATE-----`) and
+/// all surrounding prose are preserved byte-for-byte, and a truncated key
+/// block (header, no footer) is redacted only up to the next `-----BEGIN`
+/// marker (or the end of input when none follows) — a later block can
+/// never be swallowed into a key's span.
+///
+/// Pre-#2387 the scan looked for the SECOND `PRIVATE KEY-----` occurrence
+/// after ANY `-----BEGIN` across the WHOLE remainder, so a certificate
+/// followed by a key folded into ONE redacted span, and a non-key `BEGIN`
+/// after a key block hit the no-footer fallback and wiped the ENTIRE
+/// remainder including non-secret prose. Both shapes are funnel-FORCED on
+/// the federation-receive / import redact path (`redact_for_storage` —
+/// `refuse` degrades to `redact` there), so the over-redaction destroyed
+/// non-secret durable content and diverged replicas.
 fn redact_pem_blocks(content: &str) -> String {
-    const PEM_END_MARKER: &str = "PRIVATE KEY-----";
     let mut out = String::with_capacity(content.len());
     let mut rest = content;
     while let Some(begin) = rest.find(PEM_BEGIN_MARKER) {
         out.push_str(&rest[..begin]);
-        // Find the END marker AFTER the BEGIN one.
-        let after_begin = &rest[begin..];
-        // The first PRIVATE KEY----- closes the header; the second closes the
-        // footer — redact through the footer occurrence if present.
-        if let Some(footer_rel) = after_begin
-            .match_indices(PEM_END_MARKER)
-            .nth(1)
-            .map(|(i, _)| i)
-        {
-            // `block_end` is REST-relative (`begin` indexes into `rest`,
-            // `footer_rel` into `after_begin = &rest[begin..]`), so the scan
-            // must advance within `rest` — NOT re-slice the original
-            // `content` (FBL-16: re-basing to `content` reproduced the same
-            // tail on the 2nd equal-length block, looping forever). Each
-            // iteration strictly shrinks `rest` by `block_end > 0` bytes,
-            // so the scan is bounded O(len).
-            let block_end = begin + footer_rel + PEM_END_MARKER.len();
-            out.push_str(REDACTION_PLACEHOLDER);
-            rest = &rest[block_end..];
-        } else {
-            // No clean footer — redact the remainder from BEGIN.
-            out.push_str(REDACTION_PLACEHOLDER);
-            return out;
+        // The scan advances within `rest` — NOT re-sliced from the original
+        // `content` (FBL-16: re-basing to `content` reproduced the same tail
+        // on the 2nd equal-length block, looping forever). Every arm below
+        // strictly shrinks `rest`, so the scan is bounded O(len).
+        rest = &rest[begin..];
+        // #2387 — bound this block's span at the NEXT `-----BEGIN` so a
+        // later block (key or not) can never be folded into this one.
+        let region_end = rest[PEM_BEGIN_MARKER.len()..]
+            .find(PEM_BEGIN_MARKER)
+            .map_or(rest.len(), |rel| PEM_BEGIN_MARKER.len() + rel);
+        let region = &rest[..region_end];
+        // Within the bounded region the FIRST `PRIVATE KEY-----` closes a
+        // key HEADER and the SECOND closes the FOOTER (the pre-#2387 scan
+        // used the same first/second rule, just unbounded).
+        let mut key_markers = region.match_indices(PEM_PRIVATE_KEY_MARKER);
+        let header = key_markers.next();
+        let footer = key_markers.next();
+        match (header, footer) {
+            (Some(_), Some((footer_at, _))) => {
+                // Complete private-key block: redact through its OWN footer.
+                // Region text after the footer (prose before the next BEGIN)
+                // is preserved by the next iteration's prefix copy.
+                out.push_str(REDACTION_PLACEHOLDER);
+                rest = &rest[footer_at + PEM_PRIVATE_KEY_MARKER.len()..];
+            }
+            (Some(_), None) => {
+                // Truncated key block (header, no footer): redact the
+                // bounded region only — never past the next `-----BEGIN`.
+                out.push_str(REDACTION_PLACEHOLDER);
+                rest = &rest[region_end..];
+            }
+            (None, _) => {
+                // Non-key PEM block (certificate, CSR, public key, …) or a
+                // dangling `-----BEGIN` fragment: not credential material —
+                // preserved verbatim.
+                out.push_str(region);
+                rest = &rest[region_end..];
+            }
         }
     }
     out.push_str(rest);
