@@ -5499,6 +5499,20 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("delete old on supersede", e))?;
+        // v1.0.0 #2397 (N17) — AGE unprojection parity on the append-and-
+        // archive SUPERSEDE funnel. The relational cascade reaps the OLD row's
+        // `memory_links`, but the AGE `memory_graph` projection is MERGE-only:
+        // without an explicit `DETACH DELETE` the superseded id survived as a
+        // ghost `:Memory` node with live-looking incident edges that AGE-routed
+        // `kg_query` / `find_paths` kept serving — the graph projection serving
+        // deleted state as live. Every sibling hard-delete path already
+        // unprojects (delete / apply_remote_deletion / forget / consolidate /
+        // run_gc / size_gc / archive_by_ids #2315); this was the last one that
+        // did not. Same-tx `DETACH DELETE`, mirroring the `forget()` shape, so
+        // the relational delete and the projection cleanup commit atomically.
+        if matches!(self.kg_backend, KgBackend::Age) {
+            unproject_memory_from_age(&mut tx, id).await?;
+        }
 
         // Step 3: insert the NEW row carrying the patched content.
         // version starts at 1 (fresh row, not a continuation).

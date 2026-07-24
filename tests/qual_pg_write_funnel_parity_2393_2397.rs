@@ -1,17 +1,17 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! v1.0.0 #2393 (N12) — BACKEND-BLIND mechanical pin for the postgres
-//! write-funnel `kind_provenance` parity fix. (#2397 (N17) extends this
-//! harness with the AGE-unprojection half in the next commit.)
+//! v1.0.0 #2393 (N12) + #2397 (N17) — BACKEND-BLIND mechanical pins for the
+//! postgres write-funnel column/unprojection parity fixes.
 //!
 //! ## Why a source-inspection test
 //!
-//! The defect is invisible without a live postgres: #2393 is a missing
-//! column in a `sqlx::query` SQL string plus its `.bind(...)` in the chain.
-//! The functional regressions live in
+//! Both defects are invisible without a live postgres: #2393 is a missing
+//! column in a `sqlx::query` SQL string plus its `.bind(...)` in the chain,
+//! and #2397 is a missing call inside a transaction that only an
+//! AGE-enabled postgres can observe. The functional regressions live in
 //! `tests/store_parity_gaps.rs` behind `#[ignore]` +
-//! `AI_MEMORY_TEST_POSTGRES_URL`, so on a host
+//! `AI_MEMORY_TEST_POSTGRES_URL` / `AI_MEMORY_TEST_AGE_URL`, so on a host
 //! (or a contributor laptop) with no database they never run and the fix is
 //! effectively uncovered.
 //!
@@ -47,6 +47,10 @@ const KIND_PROVENANCE_COLUMN: &str = "kind_provenance";
 /// honestly NULL rather than carrying an unvalidated caller string.
 const KIND_PROVENANCE_BIND: &str = "extract_kind_provenance(";
 
+/// The #1783 AGE `DETACH DELETE` helper every postgres hard-delete path must
+/// call so the `memory_graph` projection never serves a deleted memory.
+const AGE_UNPROJECT_CALL: &str = "unproject_memory_from_age(";
+
 /// Every postgres funnel that INSERTs a `memories` row and MUST persist
 /// `kind_provenance`, because its sqlite twin does. Sweeping the whole set
 /// (not just the funnels issue #2393 named) is the FBL-22/FBL-12 lesson:
@@ -74,6 +78,22 @@ const KIND_PROVENANCE_FUNNELS: &[&str] = &[
     "update_with_archive_on_supersede",
     "reflect_with_hooks",
     "apply_remote_memory",
+];
+
+/// Every postgres funnel that hard-DELETEs a live `memories` row and MUST
+/// therefore unproject it from the AGE `memory_graph` projection.
+/// `update_with_archive_on_supersede` is the #2397 net-new arm; the rest
+/// were already correct (`archive_by_ids` by #2315) and are pinned here so
+/// the class stays closed.
+const AGE_UNPROJECT_FUNNELS: &[&str] = &[
+    "delete",
+    "apply_remote_deletion",
+    "forget",
+    "consolidate",
+    "run_gc",
+    "size_gc",
+    "archive_by_ids",
+    "update_with_archive_on_supersede", // #2397 (N17)
 ];
 
 fn adapter_source() -> String {
@@ -177,6 +197,38 @@ fn pg_write_funnels_bind_kind_provenance_2393() {
         missing.is_empty(),
         "#2393 (N12): postgres write funnels missing the kind_provenance bind \
          (sqlite persists it — this is the cross-backend divergence class):\n{}",
+        missing.join("\n")
+    );
+}
+
+/// #2397 (N17) — every postgres funnel that hard-DELETEs a live `memories`
+/// row must unproject it from AGE, or the `memory_graph` projection keeps
+/// serving a ghost `:Memory` node with live-looking incident edges.
+#[test]
+fn pg_hard_delete_funnels_unproject_from_age_2397() {
+    let src = adapter_source();
+    let mut missing: Vec<String> = Vec::new();
+    for name in AGE_UNPROJECT_FUNNELS {
+        let Some(span) = fn_span(&src, name) else {
+            missing.push(format!("  {name}: function not found in {PG_ADAPTER_PATH}"));
+            continue;
+        };
+        // `delete` / `apply_remote_deletion` run pool-direct (no surrounding
+        // tx) and route through the `unproject_memory_ids_best_effort`
+        // wrapper, which calls the helper on their behalf.
+        let unprojects =
+            span.contains(AGE_UNPROJECT_CALL) || span.contains("unproject_memory_ids_best_effort(");
+        if !unprojects {
+            missing.push(format!(
+                "  {name}: hard-deletes a memories row without unprojecting it \
+                 from the AGE memory_graph — leaves a ghost node kg_query serves"
+            ));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "#2397 (N17): postgres hard-delete funnels missing AGE unprojection \
+         (the graph projection would serve deleted state as live):\n{}",
         missing.join("\n")
     );
 }
