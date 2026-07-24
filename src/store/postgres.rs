@@ -5499,21 +5499,6 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("delete old on supersede", e))?;
-        // v1.0.0 #2397 (N17) — AGE unprojection parity on the append-and-
-        // archive SUPERSEDE funnel. The relational cascade reaps the OLD row's
-        // `memory_links`, but the AGE `memory_graph` projection is MERGE-only:
-        // without an explicit `DETACH DELETE` the superseded id survived as a
-        // ghost `:Memory` node with live-looking incident edges that AGE-routed
-        // `kg_query` / `find_paths` kept serving — the graph projection serving
-        // deleted state as live. Every sibling hard-delete path already
-        // unprojects (delete / apply_remote_deletion / forget / consolidate /
-        // run_gc / size_gc / archive_by_ids #2315); this was the last one that
-        // did not. Same-tx `DETACH DELETE`, mirroring the `forget()` shape, so
-        // the relational delete and the projection cleanup commit atomically.
-        if matches!(self.kg_backend, KgBackend::Age) {
-            unproject_memory_from_age(&mut tx, id).await?;
-        }
-
         // Step 3: insert the NEW row carrying the patched content.
         // version starts at 1 (fresh row, not a continuation).
         // v0.7.0 Provenance Gap 2 (#906) — source_uri is carried
@@ -5621,6 +5606,32 @@ impl PostgresStore {
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert new on supersede", e))?;
+
+        // Step 4 — v1.0.0 #2397 (N17): AGE unprojection parity on the append-
+        // and-archive SUPERSEDE funnel. Step 2's relational cascade reaps the
+        // OLD row's `memory_links`, but the AGE `memory_graph` projection is
+        // MERGE-only: without an explicit `DETACH DELETE` the superseded id
+        // survived as a ghost `:Memory` node whose incident edges AGE-routed
+        // `kg_query` / `find_paths` kept serving — the derived graph serving
+        // deleted state as live. Every sibling hard-delete path already
+        // unprojects (delete / apply_remote_deletion / forget / consolidate /
+        // run_gc / size_gc / archive_by_ids #2315); this was the last one that
+        // did not. Same-tx `DETACH DELETE`, mirroring the `forget()` shape, so
+        // the relational delete and the projection cleanup commit atomically.
+        //
+        // Ordering is deliberate: this runs AFTER Step 3, never between the
+        // DELETE and the INSERT. `unproject_memory_from_age` issues a
+        // transaction-scoped `SET LOCAL search_path = ag_catalog, …` that
+        // reverts only at COMMIT, so a relational `INSERT INTO memories` that
+        // followed it INSIDE this tx would resolve `memories` under the
+        // AGE-first path — the #925 hazard that once landed rows in the wrong
+        // schema on per-daemon-schema deployments. The OLD id's AGE node is
+        // independent of the NEW row, so deferring the unprojection to the end
+        // of the tx is free and keeps every relational write on the operator's
+        // search_path.
+        if matches!(self.kg_backend, KgBackend::Age) {
+            unproject_memory_from_age(&mut tx, id).await?;
+        }
 
         tx.commit()
             .await
