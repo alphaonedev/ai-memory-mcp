@@ -59,6 +59,19 @@
 //! (`AI_MEMORY_FED_REQUIRE_TRANSITION_SIG`, `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG`)
 //! already default fail-closed (`1`); `asi-hard` still refuses a loosening
 //! override on them so the posture is complete.
+//!
+//! ## Call site (#2386 — pre-runtime ONLY)
+//!
+//! The environment-MUTATING enforcement ([`enforce_at_boot`], via
+//! [`enforce_at_boot_pre_runtime`]) runs in the synchronous,
+//! still-single-threaded phase of the binary's `fn main()` — BEFORE the
+//! tracing appender worker or any tokio runtime worker thread exists —
+//! because `std::env::set_var` on a live multi-threaded process is a data
+//! race (the closed-#1889 class). The async dispatch body
+//! (`daemon_runtime::run`) consumes the READ-ONLY [`runtime_boot_report`]
+//! to log the posture; it never mutates the environment.
+
+use std::sync::OnceLock;
 
 use anyhow::{Result, bail};
 
@@ -299,14 +312,7 @@ pub fn enforce_at_boot() -> Result<(SecurityPosture, Vec<PinReport>)> {
                     // hardened posture AND tried to loosen a pinned knob.
                     // Fail CLOSED: refuse to boot rather than silently
                     // honour either the weak value or override it.
-                    bail!(
-                        "security posture \"asi-hard\" refuses to disable {knob}: \
-                         it is set to {current:?} which is below the required hard \
-                         floor {hard:?}. Remove the {knob} override (asi-hard pins \
-                         it) or raise it to {hard:?}.",
-                        knob = knob.env,
-                        hard = knob.hard_value,
-                    );
+                    return Err(loosening_refusal(knob, &current));
                 }
             }
             Err(_) => {
@@ -315,12 +321,16 @@ pub fn enforce_at_boot() -> Result<(SecurityPosture, Vec<PinReport>)> {
                 // hard posture take effect everywhere without touching any
                 // read site.
                 //
-                // SAFETY: called once at daemon boot from the single-threaded
-                // configuration-resolution phase (before `serve` spawns the
-                // HTTP task pool / background sweeps), so no other thread can
-                // be reading the environment concurrently. Mirrors the
-                // existing `unsafe { std::env::set_var(...) }` boot/test
-                // sites in `daemon_runtime.rs`.
+                // SAFETY: called ONLY from the synchronous single-threaded
+                // pre-runtime phase of the binary's `fn main()` (via
+                // `enforce_at_boot_pre_runtime`, the same #1889 contract as
+                // `apply_startup_env`) — BEFORE the tracing appender worker
+                // or any tokio runtime worker thread exists — so no other
+                // thread can be reading the environment concurrently
+                // (#2386; the pre-fix call site inside the async
+                // `daemon_runtime::run` body ran on the LIVE multi-threaded
+                // runtime and re-introduced the #1889 data-race class). The
+                // async body re-checks READ-ONLY via `runtime_boot_report`.
                 unsafe {
                     std::env::set_var(knob.env, knob.hard_value);
                 }
@@ -330,6 +340,93 @@ pub fn enforce_at_boot() -> Result<(SecurityPosture, Vec<PinReport>)> {
                     action: PinAction::PinnedFromUnset,
                 });
             }
+        }
+    }
+    Ok((posture, reports))
+}
+
+/// The "no-disable" refusal for a pinned knob set below its hard floor.
+/// Single message-construction site shared by [`enforce_at_boot`] and the
+/// read-only [`runtime_boot_report`] re-derivation so the operator-facing
+/// refusal text cannot drift between the two paths (#2386).
+fn loosening_refusal(knob: &KnobSpec, current: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "security posture \"asi-hard\" refuses to disable {knob}: \
+         it is set to {current:?} which is below the required hard \
+         floor {hard:?}. Remove the {knob} override (asi-hard pins \
+         it) or raise it to {hard:?}.",
+        knob = knob.env,
+        hard = knob.hard_value,
+    )
+}
+
+/// The boot enforcement outcome stashed by [`enforce_at_boot_pre_runtime`]
+/// so the async dispatch body can LOG it without re-running the
+/// environment-mutating enforcement on the live runtime (#2386).
+static BOOT_ENFORCEMENT: OnceLock<(SecurityPosture, Vec<PinReport>)> = OnceLock::new();
+
+/// Pre-runtime entry point for the posture enforcement (#2386).
+///
+/// MUST be called from the synchronous, still-single-threaded phase of the
+/// binary's `fn main()` — before the tracing appender worker or the tokio
+/// runtime is built — because [`enforce_at_boot`]'s knob pinning writes
+/// the process environment (`std::env::set_var`), which is a data race the
+/// moment any other thread exists (the closed-#1889 class). Stashes the
+/// report for [`runtime_boot_report`] to log later. Idempotent — first
+/// writer wins, mirroring the other boot-seeded process-wide knobs.
+///
+/// # Errors
+/// Propagates every [`enforce_at_boot`] refusal: an unrecognised posture
+/// token, or (under `asi-hard`) a pinned knob set below its hard floor.
+pub fn enforce_at_boot_pre_runtime() -> Result<()> {
+    let report = enforce_at_boot()?;
+    let _ = BOOT_ENFORCEMENT.set(report);
+    Ok(())
+}
+
+/// READ-ONLY posture report for the async dispatch body (#2386).
+///
+/// Returns the report stashed by [`enforce_at_boot_pre_runtime`] when the
+/// process booted through the binary's `fn main()`. For a direct library
+/// caller of `daemon_runtime::run` (where no pre-runtime phase ran) it
+/// re-derives the report WITHOUT touching the environment — every knob is
+/// only READ, so this is safe on a live multi-threaded runtime. In that
+/// fallback, fail CLOSED: under `asi-hard` a knob that is still UNSET here
+/// means the pre-runtime pin never ran and cannot be applied safely from
+/// async context, so refuse to boot rather than silently run with a
+/// weakened posture (degrade loudly, never a silent security downgrade).
+///
+/// # Errors
+/// - The posture token is unrecognised (fail-loud).
+/// - Under `asi-hard`, a pinned knob is set below its hard floor.
+/// - Under `asi-hard`, a pinned knob is UNSET and the pre-runtime
+///   enforcement did not run (pinning from async context is the #1889
+///   data-race class, so it is refused instead).
+pub fn runtime_boot_report() -> Result<(SecurityPosture, Vec<PinReport>)> {
+    if let Some((posture, pins)) = BOOT_ENFORCEMENT.get() {
+        return Ok((*posture, pins.clone()));
+    }
+    let posture = SecurityPosture::resolve()?;
+    if posture == SecurityPosture::Standard {
+        return Ok((posture, Vec::new()));
+    }
+    let mut reports = Vec::with_capacity(KNOBS.len());
+    for knob in KNOBS {
+        match std::env::var(knob.env) {
+            Ok(current) if (knob.meets_floor)(&current) => reports.push(PinReport {
+                env: knob.env,
+                effective: knob.hard_value,
+                action: PinAction::AlreadyCompliant,
+            }),
+            Ok(current) => return Err(loosening_refusal(knob, &current)),
+            Err(_) => bail!(
+                "security posture \"asi-hard\" requires {knob} to be pinned before \
+                 the async runtime starts, but the pre-runtime enforcement never ran \
+                 (direct `daemon_runtime::run` caller?). Boot through the ai-memory \
+                 binary, or set {knob}={hard:?} explicitly before starting (#2386).",
+                knob = knob.env,
+                hard = knob.hard_value,
+            ),
         }
     }
     Ok((posture, reports))

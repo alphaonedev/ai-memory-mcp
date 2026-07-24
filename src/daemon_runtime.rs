@@ -1009,15 +1009,19 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
     // agent launch, hook exec) has a live audit target. Idempotent; a spawn
     // that fires before any seed (none do on this path) skips gracefully.
     crate::spawn_audit::seed_spawn_audit_db_path(&db_path);
-    // v1.0.0 #1961 (R23/R7) — resolve + enforce the security posture FIRST,
-    // before any knob is read or the DB is opened. Under the default
-    // `standard` posture this is a no-op; under `asi-hard` it PINS the
-    // fail-closed security knobs ON (so every downstream read site honours
-    // the hard posture) and REFUSES to boot if an operator tried to loosen
-    // any of them. Fail-closed: a loosening override or a garbage posture
-    // token aborts the boot here.
+    // v1.0.0 #1961 (R23/R7) + #2386 — the posture ENFORCEMENT (which pins
+    // every unset fail-closed knob via `std::env::set_var`) runs in the
+    // SYNCHRONOUS pre-runtime phase of the binary's `fn main()`
+    // (`security_profile::enforce_at_boot_pre_runtime`, the #1889
+    // contract), NEVER here: this body executes on the multi-threaded
+    // tokio runtime, where `set_var` is a data race (the closed-#1889
+    // class the pre-fix call site re-introduced). Here we only fetch the
+    // stashed report to LOG it — and for a direct library caller of `run`
+    // (no pre-runtime phase) the read-only re-derivation still fails
+    // closed on any asi-hard violation, including an un-pinned (unset)
+    // knob, so the fail-closed "no-disable" contract holds on every path.
     {
-        let (posture, pins) = crate::security_profile::enforce_at_boot()?;
+        let (posture, pins) = crate::security_profile::runtime_boot_report()?;
         if posture == crate::security_profile::SecurityPosture::AsiHard {
             for pin in &pins {
                 tracing::info!(
