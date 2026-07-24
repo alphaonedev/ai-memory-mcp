@@ -2317,6 +2317,33 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// FBL-22 (v1.0.0) — sweep timed-out governance `pending_actions`: flip
+    /// every `status='pending'` row whose age exceeds
+    /// `COALESCE(default_timeout_seconds, default_secs)` to `status='expired'`
+    /// (stamping `expired_at`), returning the `(id, namespace)` pairs marked so
+    /// the caller can fan out a `pending_action_expired` lifecycle event per
+    /// expired row. A non-positive `default_secs` disables the sweep entirely
+    /// (operator escape hatch — parity with the sqlite guard) and returns an
+    /// empty vec. The `status='pending'` predicate is re-checked under the
+    /// transition so a concurrent `decide_pending_action` wins.
+    ///
+    /// This is the SAL twin of the sqlite-only rusqlite free fn
+    /// [`crate::db::sweep_pending_action_timeouts`]: the postgres maintenance
+    /// loop drives it against the pg corpus (the sqlite
+    /// `spawn_pending_timeout_sweep_loop` binds the LOCAL sqlite `Db` mutex, so
+    /// pre-FBL-22 a postgres daemon never expired its `pending_actions`). The
+    /// `SqliteStore` impl delegates to that free fn; the `PostgresStore` impl is
+    /// an `UPDATE ... RETURNING`. Default `UnsupportedCapability` so an
+    /// in-memory / test adapter round-trips cleanly.
+    async fn sweep_pending_action_timeouts(
+        &self,
+        _default_secs: i64,
+    ) -> StoreResult<Vec<(String, String)>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GOVERNANCE_PENDING_TIMEOUT".to_string(),
+        })
+    }
+
     /// #1709 Pillar 1 — send a signal, optionally Ed25519-signed (the v60
     /// `signals` table). Returns the resolved attestation level — mirrors the
     /// [`MemoryStore::link_signed`] contract: when `keypair` is `Some(kp)` AND
