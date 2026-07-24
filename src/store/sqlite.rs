@@ -1776,6 +1776,38 @@ impl MemoryStore for SqliteStore {
         quotas::get_status(&conn, agent_id, namespace).map_err(box_err)
     }
 
+    /// FBL-12 residual (#2378) — delegate to the existing rusqlite
+    /// `crate::quotas::charge_update_growth` so both backends share
+    /// semantics. (The sqlite HTTP `PUT /memories/{id}` branch already
+    /// charges via the rusqlite conn directly; this trait impl exists for
+    /// cross-adapter completeness so any future trait-routed caller gets
+    /// the same enforcement.) The `QuotaCheckError` variants map to the
+    /// same typed `StoreError` shapes the postgres impl returns.
+    async fn charge_update_growth(
+        &self,
+        _ctx: &CallerContext,
+        owner: &str,
+        ns: &str,
+        old_bytes: i64,
+        new_bytes: i64,
+    ) -> StoreResult<i64> {
+        if owner.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.state.lock().await;
+        match quotas::charge_update_growth(&conn, owner, ns, old_bytes, new_bytes) {
+            Ok(delta) => Ok(delta),
+            Err(quotas::QuotaCheckError::Quota(qe)) => Err(StoreError::QuotaExceeded {
+                agent_id: qe.agent_id,
+                namespace: qe.namespace,
+                limit: qe.limit.as_str().to_string(),
+                current: qe.current,
+                max: qe.max,
+            }),
+            Err(quotas::QuotaCheckError::Sql(e)) => Err(box_err(e)),
+        }
+    }
+
     async fn quota_status_list(&self) -> StoreResult<Vec<QuotaStatus>> {
         let conn = self.state.lock().await;
         quotas::list_status(&conn, None).map_err(box_err)

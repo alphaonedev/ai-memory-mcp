@@ -2910,6 +2910,43 @@ pub trait MemoryStore: Send + Sync {
         Ok(())
     }
 
+    /// FBL-12 residual (#2378) — charge the positive storage-byte GROWTH
+    /// of an in-place `memory_update` against the row `owner`'s
+    /// per-namespace storage cap BEFORE the write lands. The update
+    /// funnels historically bypassed the storage-bytes quota entirely
+    /// (only `insert` charged it), so an agent could grow each stored row
+    /// toward `MAX_CONTENT_SIZE` while its `current_storage_bytes` counter
+    /// reflected only the store-time bytes — an unbounded-growth bypass of
+    /// the per-agent storage cap. FBL-12 fixed the MCP twin + the sqlite
+    /// HTTP branch inline via `crate::quotas::charge_update_growth`; this
+    /// trait method closes the gap on the postgres network surface.
+    ///
+    /// `old_bytes` / `new_bytes` are the `(title + content + serialized
+    /// metadata)` byte counts before / after the update
+    /// (`crate::quotas::coordination_payload_bytes`). A shrink / no-op
+    /// (`new_bytes <= old_bytes`) or an empty `owner` charges nothing and
+    /// returns `Ok(0)`. A positive growth that would breach
+    /// `max_storage_bytes` returns [`StoreError::QuotaExceeded`] (→ HTTP
+    /// 429) and the caller MUST refuse the update (fail-closed). On a
+    /// successful charge the returned delta is what the caller refunds if
+    /// the subsequent update itself fails.
+    ///
+    /// Default returns `UnsupportedCapability`; `SqliteStore` delegates to
+    /// `crate::quotas::charge_update_growth` and `PostgresStore` charges
+    /// via a single TOCTOU-free conditional `agent_quotas` UPDATE.
+    async fn charge_update_growth(
+        &self,
+        _ctx: &CallerContext,
+        _owner: &str,
+        _ns: &str,
+        _old_bytes: i64,
+        _new_bytes: i64,
+    ) -> StoreResult<i64> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "CHARGE_UPDATE_GROWTH".to_string(),
+        })
+    }
+
     /// List every quota row in the substrate, sorted ascending by
     /// `(agent_id, namespace)`. Operator-facing surface that backs
     /// `quota_status`'s "no agent_id supplied" path.

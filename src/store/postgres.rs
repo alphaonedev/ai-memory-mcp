@@ -13800,6 +13800,34 @@ impl PostgresStore {
         }
         Ok(true)
     }
+
+    /// FBL-12 residual (#2378) — compensating refund for a
+    /// `charge_update_growth` charge whose subsequent trait `update`
+    /// failed (e.g. a `VersionConflict`), so a retry storm on a
+    /// conflicting pg update cannot slowly inflate `current_storage_bytes`.
+    /// Best-effort + saturating at zero, mirroring the sqlite
+    /// `crate::quotas::refund_storage_only`.
+    pub async fn refund_update_growth(&self, owner: &str, ns: &str, delta: i64) {
+        if delta <= 0 || owner.is_empty() {
+            return;
+        }
+        let now = Utc::now();
+        if let Err(e) = sqlx::query(
+            "UPDATE agent_quotas
+                SET current_storage_bytes = GREATEST(current_storage_bytes - $1, 0),
+                    updated_at = $2
+              WHERE agent_id = $3 AND namespace = $4",
+        )
+        .bind(delta)
+        .bind(now)
+        .bind(owner)
+        .bind(ns)
+        .execute(&self.pool)
+        .await
+        {
+            tracing::warn!("charge_update_growth refund failed for agent {owner}: {e}");
+        }
+    }
 }
 
 #[async_trait]
@@ -22683,6 +22711,99 @@ impl MemoryStore for PostgresStore {
             });
         }
         Ok(())
+    }
+
+    /// FBL-12 residual (#2378) — charge the positive storage-byte GROWTH
+    /// of an in-place `memory_update` against the row owner's per-namespace
+    /// storage cap. Enforces the SAME `max_storage_bytes` ceiling the
+    /// insert path charges, so the postgres `PUT /memories/{id}` surface
+    /// can no longer grow a row past the cap uncharged (the pg residual of
+    /// FBL-12; the sqlite branch already charged inline).
+    ///
+    /// TOCTOU-free: a contention-free `INSERT … ON CONFLICT DO NOTHING`
+    /// ensures the `(agent, namespace)` row exists (mirroring the sqlite
+    /// `ensure_row` called OUTSIDE the immediate txn in
+    /// `check_and_record_storage_only`), then ONE conditional UPDATE does
+    /// the check + increment as a single statement — composing with the
+    /// #2311 single-statement conditional-record shape rather than
+    /// re-introducing a check-then-act race. A growth that would breach the
+    /// cap affects 0 rows and maps to the typed `QuotaExceeded`.
+    async fn charge_update_growth(
+        &self,
+        _ctx: &CallerContext,
+        owner: &str,
+        ns: &str,
+        old_bytes: i64,
+        new_bytes: i64,
+    ) -> StoreResult<i64> {
+        let delta = new_bytes.saturating_sub(old_bytes);
+        if delta <= 0 || owner.is_empty() {
+            return Ok(0);
+        }
+        let now = Utc::now();
+        // Ensure the quota row exists (contention-free; INSERT always
+        // reports success or a benign conflict). Storage bytes are
+        // cumulative (never daily-reset), so day-roll logic is irrelevant
+        // to a storage-only charge.
+        sqlx::query(
+            "INSERT INTO agent_quotas (
+                 agent_id, namespace,
+                 max_memories_per_day, max_storage_bytes, max_links_per_day,
+                 current_memories_today, current_storage_bytes, current_links_today,
+                 day_started_at, created_at, updated_at
+             ) VALUES ($1, $2, $3, $4, $5, 0, 0, 0, $6, $6, $6)
+             ON CONFLICT (agent_id, namespace) DO NOTHING",
+        )
+        .bind(owner)
+        .bind(ns)
+        .bind(quota_defaults().max_memories_per_day)
+        .bind(quota_defaults().max_storage_bytes)
+        .bind(quota_defaults().max_links_per_day)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("ensure agent_quotas row (charge_update_growth)", e))?;
+
+        // ONE conditional UPDATE — the ceiling re-check and the increment
+        // are a single atomic statement, so no concurrent growth can push
+        // `current_storage_bytes` past `max_storage_bytes`. rows_affected
+        // == 0 ⇒ the guard refused (the row exists — we just ensured it).
+        let res = sqlx::query(
+            "UPDATE agent_quotas
+                SET current_storage_bytes = current_storage_bytes + $1,
+                    updated_at = $2
+              WHERE agent_id = $3 AND namespace = $4
+                AND current_storage_bytes + $1 <= max_storage_bytes",
+        )
+        .bind(delta)
+        .bind(now)
+        .bind(owner)
+        .bind(ns)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("charge_update_growth storage increment", e))?;
+
+        if res.rows_affected() == 0 {
+            // Re-read the row so the typed error names accurate current/max.
+            let row: Option<(i64, i64)> = sqlx::query_as(
+                "SELECT current_storage_bytes, max_storage_bytes \
+                 FROM agent_quotas WHERE agent_id = $1 AND namespace = $2",
+            )
+            .bind(owner)
+            .bind(ns)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("re-read agent_quotas after growth refusal", e))?;
+            let (current, max) = row.unwrap_or((0, quota_defaults().max_storage_bytes));
+            return Err(StoreError::QuotaExceeded {
+                agent_id: owner.to_string(),
+                namespace: ns.to_string(),
+                limit: crate::quotas::QuotaLimit::StorageBytes.as_str().to_string(),
+                current,
+                max,
+            });
+        }
+        Ok(delta)
     }
 
     async fn quota_status_list(&self) -> StoreResult<Vec<QuotaStatus>> {

@@ -897,7 +897,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `emit_lease_sweep_reclaim_audit` helper, and the sal-postgres
     // `lease_sweep_expired_emits_coordination_audit_2371` regression test;
     // land the file at 29_997. Ceiling 29_900 -> 30_040 (+43 headroom).
-    ("src/store/postgres.rs", 30_040),
+    // 2026-07-24 (#2378 FBL-12 residual) — the `PostgresStore::charge_update_growth`
+    // SAL trait impl (ensure-row + ONE TOCTOU-free conditional agent_quotas
+    // UPDATE + typed QuotaExceeded re-read) and the `refund_update_growth`
+    // compensating-decrement helper, so the postgres `PUT /memories/{id}`
+    // branch charges storage-growth quota (was ZERO-charge); land the file at
+    // 30_118. Ceiling 30_040 -> 30_200 (+82 headroom).
+    ("src/store/postgres.rs", 30_200),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

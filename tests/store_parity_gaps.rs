@@ -1010,6 +1010,60 @@ mod postgres_side {
         );
     }
 
+    /// FBL-12 residual (#2378) — postgres `charge_update_growth`: a
+    /// content-growth charge that would breach `max_storage_bytes` is
+    /// refused with the typed `QuotaExceeded` (→ HTTP 429) via the single
+    /// TOCTOU-free conditional UPDATE, while a within-cap growth charges
+    /// the delta and a shrink / no-op charges nothing. This is the pg twin
+    /// of the sqlite `crate::quotas::charge_update_growth` contract that
+    /// the HTTP `PUT /memories/{id}` postgres branch now consults.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_charge_update_growth_over_cap_returns_quota_exceeded_2378() {
+        use ai_memory::store::{MemoryStore, StoreError};
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let ctx = ai_memory::store::CallerContext::for_agent("parity-test-2378");
+        let ns = "q2378";
+
+        // A shrink / no-op charges nothing.
+        let owner_noop = "pg-grow-noop-2378";
+        let z = MemoryStore::charge_update_growth(&pg, &ctx, owner_noop, ns, 500, 100)
+            .await
+            .expect("shrink is a no-op");
+        assert_eq!(z, 0, "shrink/no-op must charge zero");
+
+        // A within-cap growth charges the delta and returns it.
+        let owner_ok = "pg-grow-ok-2378";
+        let d = MemoryStore::charge_update_growth(&pg, &ctx, owner_ok, ns, 0, 128)
+            .await
+            .expect("within-cap growth charges");
+        assert_eq!(d, 128, "within-cap growth returns the charged delta");
+        // Compensating refund keeps the shared pg row from accumulating
+        // across repeated --ignored runs.
+        pg.refund_update_growth(owner_ok, ns, 128).await;
+
+        // A growth larger than the 100 MiB default cap is refused,
+        // regardless of any residual from prior runs (current + 200 MiB
+        // always exceeds a 100 MiB ceiling).
+        let owner_cap = "pg-grow-cap-2378";
+        let over = 200 * 1024 * 1024;
+        let err = MemoryStore::charge_update_growth(&pg, &ctx, owner_cap, ns, 0, over)
+            .await
+            .expect_err("growth past cap must be refused");
+        match err {
+            StoreError::QuotaExceeded { limit, .. } => {
+                assert_eq!(
+                    limit,
+                    ai_memory::quotas::QuotaLimit::StorageBytes.as_str(),
+                    "limit names storage_bytes"
+                );
+            }
+            other => panic!("expected QuotaExceeded, got: {other}"),
+        }
+    }
+
     /// #1725 (P0.2) — postgres twin of
     /// `verify_gap_1725_in_place_archive_sqlite`. Drives the lossless
     /// in-place update path through `PostgresStore` and asserts the
