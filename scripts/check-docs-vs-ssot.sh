@@ -48,6 +48,11 @@
 #    "74 advertised entries", "74 MCP tools", etc. The 73-vs-74
 #    disambiguation (73 callable tools + 1 memory_capabilities
 #    bootstrap) is the documented exception and is allowlisted.
+#  - Cargo.toml `version` (current release) → the "<N> advertised
+#    entries at `--profile full`** at v<X>" narrative form must
+#    attribute the CURRENT release, never a stale prior one (#12
+#    doc-drift finding: CLAUDE.md cited the v1.0.0 103/102 split but
+#    attributed it "at v0.9.0").
 #  - Memory::FIELD_COUNT → docs claims of "<N>-field struct".
 #  - HookEvent variant count (=25) → docs claims of "<N> hook lifecycle
 #    events".
@@ -93,6 +98,14 @@ extract_const_value() {
         | grep -oE '[0-9_]+$' \
         | tr -d '_'
 }
+
+# Current release version (#12 doc-drift finding) — the SSOT for any
+# doc claim that attributes a count "at v<X>". Docs must never narrate
+# a count against a stale prior-release attribution (e.g. citing the
+# v1.0.0 103/102 full-tool-count split but attributing it "at v0.9.0",
+# the release that actually shipped 101/100).
+CANONICAL_RELEASE_VERSION=$(grep -oE '^version = "[0-9]+\.[0-9]+\.[0-9]+"' Cargo.toml \
+    | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
 
 CANONICAL_SCHEMA_VERSION=$(extract_const_value src/storage/migrations.rs CURRENT_SCHEMA_VERSION 'i64|usize|i32')
 CANONICAL_ROUTES_COUNT=$(extract_const_value src/lib.rs EXPECTED_PRODUCTION_ROUTES_COUNT 'usize')
@@ -280,11 +293,17 @@ check_env_var_census_rule() {
     # const-indirected reads where the spelling lives on an `ENV_*`
     # const definition (e.g. `pub const ENV_ADMIN_HEADER_TRUST: &str =
     # "AI_MEMORY_ADMIN_HEADER_TRUST";`) — the post-#1558 house style.
+    # `|| true` guards against `set -e`/`pipefail`: when the scanned tree
+    # has ZERO matches (e.g. the --self-test fixture's tiny src/ tree),
+    # every grep stage in the pipe exits 1 (no-match), which under
+    # pipefail propagates as the assignment's exit status and silently
+    # aborts the whole gate before any later rule runs. Zero matches is a
+    # legitimate (if rare) state, not a script error.
     code_vars=$( { grep -rhoE 'env::var(_os)?\("(AI_MEMORY_[A-Z0-9_]+)"' "$REPO_ROOT/src" \
         --include='*.rs' 2>/dev/null; \
         grep -rhoE 'const ENV_[A-Z0-9_]+: *&str *= *"AI_MEMORY_[A-Z0-9_]+"' "$REPO_ROOT/src" \
         --include='*.rs' 2>/dev/null; } \
-        | grep -oE 'AI_MEMORY_[A-Z0-9_]+' | sort -u)
+        | grep -oE 'AI_MEMORY_[A-Z0-9_]+' | sort -u) || true
     for var in $code_vars; do
         if ! grep -q "$var" "$REPO_ROOT/CLAUDE.md"; then
             printf 'FAIL: %s: src reads %s but CLAUDE.md never mentions it (env-var table drift)\n' \
@@ -308,6 +327,16 @@ run_all_rules() {
         "Profile::core().expected_tool_count()" \
         "$CANONICAL_CORE_TOOL_COUNT" \
         '([0-9]+) at `--profile core`|\([0-9]+ at `full`, ([0-9]+) at `core`\)|Tool count remains [0-9]+ at full / ([0-9]+) at core'
+    # Full-tool-count VERSION ATTRIBUTION (#12 doc-drift finding): the
+    # "<N> advertised entries at `--profile full`** at v<X>" narrative
+    # form must attribute the CURRENT release, never a stale prior one
+    # (e.g. citing the v1.0.0 103/102 split but attributing "at v0.9.0",
+    # the release that actually shipped 101/100 — CLAUDE.md's own
+    # architecture section carried this exact drift).
+    check_narrative_count_rule \
+        "release-version attribution (full-tool-count)" \
+        "$CANONICAL_RELEASE_VERSION" \
+        'advertised entries at `--profile full`\*\* at v([0-9]+\.[0-9]+\.[0-9]+)'
     # Memory::FIELD_COUNT
     # Matches the CLAUDE.md narrative form ("**26-field struct at v0.7.0**")
     # AND the normative docs/spec/PORTABILITY-V2.md field-count contract
@@ -364,10 +393,11 @@ run_all_rules() {
         printf '     MemoryLinkRelation::COUNT = %s\n' "$CANONICAL_LINK_COUNT" >&2
         printf '     MemoryScope::COUNT = %s\n' "$CANONICAL_SCOPE_COUNT" >&2
         printf '     HookEvent variants = %s\n' "$CANONICAL_HOOK_EVENTS" >&2
+        printf '     Current release version (Cargo.toml) = %s\n' "$CANONICAL_RELEASE_VERSION" >&2
         exit 1
     fi
     printf '✅ docs-vs-SSOT drift gate: PASS\n'
-    printf '   Canonical values: schema=%s, full_tools=%s, core_tools=%s, routes=%s, paths=%s, cli_default=%s, cli_sal=%s, mem_fields=%s, link=%s, scope=%s, hooks=%s\n' \
+    printf '   Canonical values: schema=%s, full_tools=%s, core_tools=%s, routes=%s, paths=%s, cli_default=%s, cli_sal=%s, mem_fields=%s, link=%s, scope=%s, hooks=%s, release=%s\n' \
         "$CANONICAL_SCHEMA_VERSION" \
         "$CANONICAL_FULL_TOOL_COUNT" \
         "$CANONICAL_CORE_TOOL_COUNT" \
@@ -378,7 +408,8 @@ run_all_rules() {
         "$CANONICAL_MEMORY_FIELDS" \
         "$CANONICAL_LINK_COUNT" \
         "$CANONICAL_SCOPE_COUNT" \
-        "$CANONICAL_HOOK_EVENTS"
+        "$CANONICAL_HOOK_EVENTS" \
+        "$CANONICAL_RELEASE_VERSION"
 }
 
 # --------------------------------------------------------------------
@@ -409,24 +440,93 @@ EOF
     echo 'pub const FIELD_COUNT: usize = 26;' > src/models/memory.rs
     echo 'pub const COUNT: usize = 6;' > src/models/link.rs
     echo 'pub const COUNT: usize = 5;' > src/models/namespace.rs
-    echo 'pub enum HookEvent { A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, }' > src/hooks/events.rs
+    # Same latent-abort class as the HookEvent fix below: CANONICAL_CORE_TOOL_COUNT
+    # greps `Self::Core => &[ ... tn::* ... ]` out of src/profile.rs. An absent
+    # file made `awk ... src/profile.rs 2>/dev/null | grep -cE '^\s+tn::'` match
+    # zero lines — grep -c's no-match exit 1 silently aborted the whole gate
+    # under `set -e`/`pipefail`, before CANONICAL_HOOK_EVENTS or any narrative
+    # rule ever ran.
+    cat > src/profile.rs <<'PROFILEEOF'
+        Self::Core => &[
+            tn::A,
+            tn::B,
+            tn::C,
+            tn::D,
+            tn::E,
+            tn::F,
+            tn::G,
+        ],
+PROFILEEOF
+    # One variant per line (matching the real src/hooks/events.rs shape) so
+    # the CANONICAL_HOOK_EVENTS `awk | grep -c '^    [A-Z]...,$'` extraction
+    # actually matches >0 lines. A single joined line here (the pre-#12
+    # fixture shape) makes that grep -c return zero matches; grep exits 1
+    # on no-match, and under `set -e` that silently aborts the whole gate
+    # BEFORE any narrative rule ever runs — the self-test was then only
+    # "passing" because a nonzero exit from that unrelated abort looked
+    # identical to "the gate caught the contrived drift".
+    cat > src/hooks/events.rs <<'HOOKEOF'
+pub enum HookEvent {
+    A,
+    B,
+    C,
+    D,
+    E,
+    F,
+    G,
+    H,
+    I,
+    J,
+    K,
+    L,
+    M,
+    N,
+    O,
+    P,
+    Q,
+    R,
+    S,
+    T,
+    U,
+    V,
+    W,
+    X,
+    Y,
+}
+HOOKEOF
     : > src/mcp/registry.rs
     # ~12 RegisteredTool::of entries → tool count = 12
     for i in $(seq 1 12); do
         echo "        RegisteredTool::of::<Tool$i>()," >> src/mcp/registry.rs
     done
+    # Fixture "current release" = 9.9.9 (#12 doc-drift version-attribution rule)
+    cat > Cargo.toml <<EOF
+[package]
+name = "fixture"
+version = "9.9.9"
+EOF
 
-    # Contrived BAD docs (claims wrong values)
+    # Contrived BAD docs (claims wrong values). The last line isolates the
+    # release-version-attribution rule: the count (12) matches the fixture
+    # canonical tool count exactly (so the pre-existing tool-count rule does
+    # NOT also fire), but the "at v0.9.0" attribution does not match the
+    # fixture's Cargo.toml version (9.9.9) — the #12 doc-drift shape.
     cat > CLAUDE.md <<EOF
 **Current schema = v99** (would-be-stale-claim test).
 **74 MCP tools at \`--profile full\`** — this should fail because fixture is 12.
+**12 advertised entries at \`--profile full\`** at v0.9.0 (contrived stale-version-attribution test).
 EOF
 
     # Run the gate as a subprocess with the tmpdir as the root, so it
     # resolves SSOTs + doc files against the fixture (not the real
     # checkout).
-    if AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+    local gate_output
+    if gate_output=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
         echo "FAIL: self-test — gate did NOT catch the contrived drift"
+        cd "$REPO_ROOT"
+        exit 1
+    elif ! grep -q "release-version attribution (full-tool-count)" <<<"$gate_output"; then
+        echo "FAIL: self-test — gate did not specifically flag the contrived release-version-attribution drift"
         cd "$REPO_ROOT"
         exit 1
     else

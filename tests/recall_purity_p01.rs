@@ -1059,6 +1059,63 @@ fn gc_if_needed_folds_pending_extension_before_evicting_2308() {
     );
 }
 
+#[test]
+fn gc_prunes_expired_folded_ledger_rows_2358() {
+    // #2358 regression — `db::gc` is the shared eviction chokepoint hit
+    // by the daemon gc tick, CLI `gc`, MCP `memory_gc`, and every
+    // `gc_if_needed` hot-path caller. Pre-#2358 it folded pending
+    // recall-access signal (#2308 FBL-04) but never called
+    // `observations::gc::prune` — the ONLY sqlite production caller of
+    // the pruner was the serve daemon's dedicated gc loop
+    // (`spawn_gc_loop_with_shadow_retention_tracked`), so MCP-stdio and
+    // CLI-only topologies (no background daemon) never pruned the
+    // `recall_observations` ledger, growing it unbounded despite the
+    // documented `AI_MEMORY_OBSERVATIONS_TTL_DAYS` contract.
+    let _g = env_lock();
+    clear_flags();
+    let (conn, _dir) = fresh_db();
+    let created = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at) \
+         VALUES ('gc2358-mem', 'long', 'gc2358', 'gc2358-mem', 'c', ?1, ?1)",
+        rusqlite::params![created],
+    )
+    .unwrap();
+    // A FOLDED ledger row whose observed_at is well past the (default 7
+    // day) TTL — the pruner's steady-state target.
+    let stale = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+    conn.execute(
+        "INSERT INTO recall_observations \
+            (recall_id, memory_id, retriever, rank, score, observed_at, folded) \
+         VALUES ('gc2358-r1', 'gc2358-mem', 'fts5', 1, 0.5, ?1, 1)",
+        rusqlite::params![stale],
+    )
+    .unwrap();
+    assert_eq!(ledger_count(&conn), 1, "stale folded row seeded");
+
+    db::gc(&conn, false).expect("gc");
+
+    assert_eq!(
+        ledger_count(&conn),
+        0,
+        "db::gc must prune the stale folded recall_observations row directly, \
+         not only via the serve daemon's dedicated gc loop"
+    );
+    // The eviction chokepoint pruned the ledger, not the memory row —
+    // the ledger-vs-memory-lifecycle distinction stays intact.
+    let mem_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE id = 'gc2358-mem'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        mem_exists, 1,
+        "the long-tier memory row itself is untouched"
+    );
+}
+
 // =====================================================================
 // F — gc-tick fold fallback (AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS=0)
 // =====================================================================
