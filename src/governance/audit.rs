@@ -1092,6 +1092,14 @@ const WITNESS_RESOLUTION_VERSION: i64 = 1;
 /// ([`parse_witness_dual_head`]) accepts BOTH `v: 1` and `v: 2`.
 const WITNESS_RESOLUTION_VERSION_V2: i64 = 2;
 
+/// v1.0.0 #2370 — schema version stamped when the witness `resolution`
+/// carries the present-only per-database `db_id` (the genesis-derived
+/// database identity, [`crate::signed_events::db_id_from_genesis_parts`]).
+/// Mirrors the v2 `rollback` precedent exactly: a db_id-less record
+/// serialises to the v1/v2 byte layout unchanged (its signature keeps
+/// verifying), while a v3-aware reader accepts `v: 1`, `v: 2`, AND `v: 3`.
+const WITNESS_RESOLUTION_VERSION_V3: i64 = 3;
+
 /// Env that flips the witness verdict to FAIL-CLOSED (require-mode, K2):
 /// when set truthy, a missing / unpinnable witness anchor makes
 /// `verify_audit_trail` dirty instead of withholding judgement (`Unknown`).
@@ -1851,15 +1859,31 @@ struct WitnessResolutionWire {
     /// v2 emission (rollback present) adds the trailing `rollback` key.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     rollback: Option<RollbackWire>,
+    /// v1.0.0 #2370 — present-only per-DATABASE identity: lowercase-hex
+    /// SHA-256 over the domain-tagged, length-prefixed genesis (sequence=1)
+    /// `signed_events` row ([`crate::signed_events::db_id_from_genesis_parts`]).
+    /// Scopes the shared off-table head-anchor log per database so a second
+    /// healthy DB on the same witness mount can never false-positive
+    /// `RollbackCheck::Evidence` against another DB's anchors. Same additive
+    /// discipline as `rollback`: `None` keeps v1/v2 records byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    db_id: Option<String>,
 }
 
 /// Serialise a [`WitnessDualHead`] into the versioned `resolution` JSON the
 /// witness signature commits to (via `SignableCheckpointResolution`).
 ///
-/// `rollback` present → `v: 2` with the trailing sub-object (§5.1 A); absent
-/// → `v: 1`, byte-identical to every pre-#1946 witness record.
-fn witness_resolution_json(dual: &WitnessDualHead, rollback: Option<RollbackWire>) -> String {
-    let v = if rollback.is_some() {
+/// `db_id` present → `v: 3` (#2370); else `rollback` present → `v: 2` with
+/// the trailing sub-object (§5.1 A); else → `v: 1`, byte-identical to every
+/// pre-#1946 witness record.
+fn witness_resolution_json(
+    dual: &WitnessDualHead,
+    rollback: Option<RollbackWire>,
+    db_id: Option<String>,
+) -> String {
+    let v = if db_id.is_some() {
+        WITNESS_RESOLUTION_VERSION_V3
+    } else if rollback.is_some() {
         WITNESS_RESOLUTION_VERSION_V2
     } else {
         WITNESS_RESOLUTION_VERSION
@@ -1875,9 +1899,34 @@ fn witness_resolution_json(dual: &WitnessDualHead, rollback: Option<RollbackWire
             head_hash: dual.revisions_head_hash.clone(),
         },
         rollback,
+        db_id,
     };
     // to_string on a fixed-shape struct is infallible in practice.
     serde_json::to_string(&wire).unwrap_or_default()
+}
+
+/// Parse the full versioned `resolution` wire out of a witness checkpoint.
+/// `None` when `cp` is not an audit-head witness or its resolution is absent /
+/// malformed / a version this reader does not understand. Shared by
+/// [`parse_witness_dual_head`] (dual-head consumers) and the #2370 per-DB
+/// anchor-log scan (which additionally needs the `db_id` field).
+fn parse_witness_wire(cp: &crate::models::Checkpoint) -> Option<WitnessResolutionWire> {
+    use crate::models::ConditionType;
+    if cp.condition_type != ConditionType::AuditHeadWitness {
+        return None;
+    }
+    let res = cp.resolution.as_deref()?;
+    let wire: WitnessResolutionWire = serde_json::from_str(res).ok()?;
+    // v1.0.0 #1946 A / #2370 — a v3-aware reader accepts the legacy v1, the
+    // rollback-carrying v2, AND the db_id-carrying v3 shape (the dual-head
+    // fields are identical across all three).
+    if wire.v != WITNESS_RESOLUTION_VERSION
+        && wire.v != WITNESS_RESOLUTION_VERSION_V2
+        && wire.v != WITNESS_RESOLUTION_VERSION_V3
+    {
+        return None;
+    }
+    Some(wire)
 }
 
 /// Parse the dual-chain head back out of a witness checkpoint's `resolution`.
@@ -1885,17 +1934,7 @@ fn witness_resolution_json(dual: &WitnessDualHead, rollback: Option<RollbackWire
 /// malformed / a version this reader does not understand.
 #[must_use]
 pub fn parse_witness_dual_head(cp: &crate::models::Checkpoint) -> Option<WitnessDualHead> {
-    use crate::models::ConditionType;
-    if cp.condition_type != ConditionType::AuditHeadWitness {
-        return None;
-    }
-    let res = cp.resolution.as_deref()?;
-    let wire: WitnessResolutionWire = serde_json::from_str(res).ok()?;
-    // v1.0.0 #1946 A — a v2-aware reader accepts BOTH the legacy v1 and the
-    // rollback-carrying v2 shape (the dual-head fields are identical).
-    if wire.v != WITNESS_RESOLUTION_VERSION && wire.v != WITNESS_RESOLUTION_VERSION_V2 {
-        return None;
-    }
+    let wire = parse_witness_wire(cp)?;
     Some(WitnessDualHead {
         signed_head_sequence: wire.signed_events.head_sequence,
         signed_head_hash: wire.signed_events.head_hash,
@@ -1919,6 +1958,7 @@ pub fn parse_witness_dual_head(cp: &crate::models::Checkpoint) -> Option<Witness
 pub fn build_signed_witness_checkpoint(
     dual: &WitnessDualHead,
     rollback: Option<RollbackWire>,
+    db_id: Option<String>,
     now: i64,
     keypair: &crate::identity::keypair::AgentKeypair,
 ) -> Result<crate::models::Checkpoint> {
@@ -1932,7 +1972,7 @@ pub fn build_signed_witness_checkpoint(
         state: CheckpointState::Resolved,
         created_by: WITNESS_RESOLVED_BY.to_string(),
         resolved_by: Some(WITNESS_RESOLVED_BY.to_string()),
-        resolution: Some(witness_resolution_json(dual, rollback)),
+        resolution: Some(witness_resolution_json(dual, rollback, db_id)),
         resolution_note: None,
         signature: Vec::new(),
         resolver_pubkey: Vec::new(),
@@ -2346,15 +2386,58 @@ fn sync_anchor_directory(_dir: &Path) -> Result<()> {
 /// out-of-band (K1 pin authority unavailable), or no line both K1-pins AND
 /// signature-verifies. Every non-pinning / non-verifying line is skipped
 /// (never trusted), so a forged anchor line cannot lower the high-water mark.
+///
+/// v1.0.0 #2370 — `db_id` scopes the shared anchor log PER DATABASE: a v3
+/// line carrying a different `db_id` is skipped (it anchors a sibling DB on
+/// the same witness mount), while legacy id-less v1/v2 lines are counted
+/// CONSERVATIVELY for every opener (one-release window, over-detect toward
+/// Evidence — never suppression). `db_id = None` (an opener with no genesis /
+/// empty chain) counts EVERY pinned line, preserving the head-0-below-anchor
+/// Evidence contract.
 #[must_use]
-pub fn read_head_anchor_high_water() -> Option<i64> {
-    let dir = witness_key_dir().ok()?;
+pub fn read_head_anchor_high_water(db_id: Option<&str>) -> Option<i64> {
+    match scan_head_anchor_log(db_id) {
+        AnchorScan::High(h) => Some(h),
+        AnchorScan::Unpinnable | AnchorScan::NoPinnedLines | AnchorScan::ForeignOnly => None,
+    }
+}
+
+/// v1.0.0 #2370 — typed outcome of one pass over the off-table head-anchor
+/// log, distinguishing the states [`compute_rollback_verdict_for_report`]
+/// must treat differently (a bare `Option<i64>` collapses them).
+enum AnchorScan {
+    /// No enrolled witness pubkey / unresolvable custody dir — NOTHING can be
+    /// pinned, so no judgement about the log's content is possible (withhold;
+    /// fail-closed `Missing` under require-mode).
+    Unpinnable,
+    /// The log is absent, empty, or contains no line that passes the K1 pin +
+    /// signature gate.
+    NoPinnedLines,
+    /// Pinned lines exist, but every one is a v3 line for a DIFFERENT
+    /// database — this opener has no anchor history on this mount.
+    ForeignOnly,
+    /// The per-database-filtered high-water mark.
+    High(i64),
+}
+
+/// Single-pass scan of the head-anchor log under the K1 pin + signature gate
+/// with #2370 per-database filtering (see [`read_head_anchor_high_water`]).
+fn scan_head_anchor_log(db_id: Option<&str>) -> AnchorScan {
+    let Ok(dir) = witness_key_dir() else {
+        return AnchorScan::Unpinnable;
+    };
     let path = dir.join(HEAD_ANCHOR_LOG_FILENAME);
     // K1 pin authority — no enrolled witness pubkey ⇒ unpinnable ⇒ withhold.
-    let enrolled = load_enrolled_witness_pubkey().ok().flatten()?;
+    let Ok(Some(enrolled)) = load_enrolled_witness_pubkey() else {
+        return AnchorScan::Unpinnable;
+    };
     let enrolled_bytes = enrolled.to_bytes();
-    let f = File::open(&path).ok()?;
+    let Ok(f) = File::open(&path) else {
+        return AnchorScan::NoPinnedLines;
+    };
     let mut high: Option<i64> = None;
+    let mut any_pinned = false;
+    let mut legacy_counted = false;
     for line in BufReader::new(f).lines() {
         let Ok(line) = line else { continue };
         if line.trim().is_empty() {
@@ -2371,12 +2454,37 @@ pub fn read_head_anchor_high_water() -> Option<i64> {
         if !crate::checkpoints::verify(&cp) {
             continue;
         }
-        if let Some(dual) = parse_witness_dual_head(&cp) {
-            let seq = dual.signed_head_sequence;
-            high = Some(high.map_or(seq, |h| h.max(seq)));
+        let Some(wire) = parse_witness_wire(&cp) else {
+            continue;
+        };
+        any_pinned = true;
+        match (wire.db_id.as_deref(), db_id) {
+            // #2370 — a v3 line for a DIFFERENT database never counts against
+            // this opener (the two-DB false-positive fix).
+            (Some(line_id), Some(mine)) if line_id != mine => continue,
+            // C3 legacy window — an id-less v1/v2 line is counted for EVERY
+            // opener (conservative: over-detect toward Evidence, never used
+            // to suppress). WARN below names the operator remediation.
+            (None, Some(_)) => legacy_counted = true,
+            _ => {}
         }
+        let seq = wire.signed_events.head_sequence;
+        high = Some(high.map_or(seq, |h| h.max(seq)));
     }
-    high
+    if legacy_counted {
+        tracing::warn!(
+            target: AUDIT_TRACE_TARGET,
+            "off-table head-anchor log contains LEGACY id-less (v1/v2) witness lines — counted \
+             CONSERVATIVELY for every database on this witness mount (#2370 one-release window). \
+             Re-emit current v3 anchors (open each DB and let the witness emit, or run a graceful \
+             shutdown to force-emit) so anchors filter per-database."
+        );
+    }
+    match high {
+        Some(h) => AnchorScan::High(h),
+        None if any_pinned => AnchorScan::ForeignOnly,
+        None => AnchorScan::NoPinnedLines,
+    }
 }
 
 /// v1.0.0 #1946 A — the OPERATOR-signed sanctioned-restore record. Committed
@@ -2396,6 +2504,14 @@ struct SanctionedRestoreWire {
     gap: i64,
     /// Wall-clock epoch seconds of the ceremony.
     timestamp: i64,
+    /// v1.0.0 #2370 — OPTIONAL per-database binding (the genesis-derived
+    /// db-id, committed INSIDE the signed bytes). Present-only + `default`
+    /// keeps legacy id-less sanction lines byte-identical, so their operator
+    /// signatures keep verifying; a db_id-bearing sanction clears ONLY the
+    /// database it names, closing the cross-DB integer-collision replay hole
+    /// (same `(old_head, new_head)` pair clearing a sibling DB's evidence).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    db_id: Option<String>,
 }
 
 /// v1.0.0 #1946 C — sign a sanctioned-restore record with the OPERATOR key.
@@ -2409,6 +2525,7 @@ pub fn sign_restore_sanction(
     new_head: i64,
     now: i64,
     operator: &SigningKey,
+    db_id: Option<&str>,
 ) -> Result<String> {
     let record = SanctionedRestoreWire {
         dst: RESTORE_SANCTION_DOMAIN.to_string(),
@@ -2417,6 +2534,7 @@ pub fn sign_restore_sanction(
         new_head,
         gap: old_head.saturating_sub(new_head),
         timestamp: now,
+        db_id: db_id.map(str::to_string),
     };
     let canon = serde_json::to_vec(&record).context("encode sanctioned-restore pre-image")?;
     let sig = operator.sign(&canon);
@@ -2457,8 +2575,16 @@ pub fn append_restore_sanction(line: &str) -> Result<()> {
 /// sanction) AND (b) attests `old_head == anchored_head` and
 /// `new_head <= db_head` (the current head is inside the operator-attested DR
 /// window). Every non-verifying / non-matching line is ignored.
+///
+/// v1.0.0 #2370 — a db_id-bearing sanction additionally binds the DATABASE it
+/// sanctions: it clears ONLY when the opener's `db_id` matches. A LEGACY
+/// id-less sanction still clears on a head match for one release (upgrade
+/// continuity for already-attested DR restores) with a WARN naming the
+/// re-attest remediation; a mismatching db_id NEVER clears (the
+/// cross-database integer-collision replay hole is closed for every sanction
+/// signed at or after this release).
 #[must_use]
-fn restore_sanction_clears(anchored_head: i64, db_head: i64) -> bool {
+fn restore_sanction_clears(anchored_head: i64, db_head: i64, db_id: Option<&str>) -> bool {
     let Some(operator_pubkey) = crate::governance::rules_store::resolve_operator_pubkey() else {
         return false; // no operator pin ⇒ cannot distinguish DR from attack.
     };
@@ -2504,8 +2630,26 @@ fn restore_sanction_clears(anchored_head: i64, db_head: i64) -> bool {
         if operator_pubkey.verify_strict(&canon, &sig).is_err() {
             continue;
         }
-        if wire.old_head == anchored_head && wire.new_head <= db_head {
-            return true;
+        if wire.old_head != anchored_head || wire.new_head > db_head {
+            continue;
+        }
+        match (wire.db_id.as_deref(), db_id) {
+            // #2370 — a db_id-bound sanction clears ONLY its own database.
+            (Some(sid), Some(mine)) if sid == mine => return true,
+            // Bound to a different DB (or the opener has no computable
+            // identity) — NEVER clears: suppression must not cross databases.
+            (Some(_), _) => continue,
+            // Legacy id-less sanction — clears for one release (upgrade
+            // continuity for pre-#2370 attested DR restores), loudly.
+            (None, _) => {
+                tracing::warn!(
+                    target: AUDIT_TRACE_TARGET,
+                    "LEGACY id-less restore sanction cleared rollback evidence (#2370 one-release \
+                     window) — re-run `ai-memory audit restore-attest --sign` so the sanction \
+                     binds this database's identity and cannot clear a sibling database."
+                );
+                return true;
+            }
         }
     }
     false
@@ -2515,15 +2659,51 @@ fn restore_sanction_clears(anchored_head: i64, db_head: i64) -> bool {
 /// verdict for `db_head` from the off-table anchor + operator sanctions. SHARED
 /// by the sqlite + postgres `verify_audit_trail` twins (K3 parity) and the
 /// open-time check, so every surface returns an IDENTICAL verdict.
+///
+/// v1.0.0 #2370 — `db_id` (the opener's genesis-derived database identity,
+/// `None` on an empty / genesis-less chain) scopes the shared anchor log per
+/// database:
+/// - anchor lines filter per [`read_head_anchor_high_water`] (v3 lines match
+///   on db_id; legacy id-less lines count conservatively);
+/// - a log whose pinned lines ALL belong to other databases resolves
+///   [`crate::signed_events::RollbackCheck::NotApplicable`] (this DB has no
+///   anchor history — the healthy-second-DB boot-DoS fix);
+/// - an EMPTY-chain opener (`db_head == 0`, no genesis) is `NotApplicable`
+///   ONLY when the log contains no pinned lines at all (bootstrap); with ANY
+///   pinned line the head-0 opener stays on the Evidence path — a rollback
+///   that wipes `signed_events` to empty must never become undetectable.
 #[must_use]
-pub fn compute_rollback_verdict_for_report(db_head: i64) -> crate::signed_events::RollbackCheck {
+pub fn compute_rollback_verdict_for_report(
+    db_head: i64,
+    db_id: Option<&str>,
+) -> crate::signed_events::RollbackCheck {
+    use crate::signed_events::RollbackCheck;
     let require = require_rollback_check_enabled();
-    let anchored = read_head_anchor_high_water();
-    let sanctioned = match anchored {
-        Some(anchor) => anchor > db_head && restore_sanction_clears(anchor, db_head),
-        None => false,
-    };
-    crate::signed_events::compute_rollback_verdict(db_head, anchored, sanctioned, require)
+    match scan_head_anchor_log(db_id) {
+        AnchorScan::High(anchor) => {
+            let sanctioned = anchor > db_head && restore_sanction_clears(anchor, db_head, db_id);
+            crate::signed_events::compute_rollback_verdict(
+                db_head,
+                Some(anchor),
+                sanctioned,
+                require,
+            )
+        }
+        // #2370 — every pinned line anchors a DIFFERENT database: this DB has
+        // no anchor history on the shared mount. Clean, even under
+        // require-mode (a healthy sibling DB must not be boot-refused).
+        AnchorScan::ForeignOnly => RollbackCheck::NotApplicable,
+        // #2370 C2 — the bootstrap carve-out: a genesis-less, head-0 opener
+        // against a log with NO pinned lines at all is a fresh database, not
+        // a rollback (clean under require-mode too). Any other no-anchor case
+        // keeps the #1946 withhold / fail-closed posture.
+        AnchorScan::NoPinnedLines if db_head == 0 && db_id.is_none() => {
+            RollbackCheck::NotApplicable
+        }
+        AnchorScan::NoPinnedLines | AnchorScan::Unpinnable => {
+            crate::signed_events::compute_rollback_verdict(db_head, None, false, require)
+        }
+    }
 }
 
 /// v1.0.0 #1946 B — the OPEN-TIME head check run from `db::open` (the funnel
@@ -2541,7 +2721,11 @@ pub fn enforce_rollback_check_at_open(conn: &rusqlite::Connection) -> Result<()>
     let db_head: i64 = conn
         .query_row(crate::signed_events::CHAIN_HEAD_SQL, [], |row| row.get(0))
         .unwrap_or(0);
-    let verdict = compute_rollback_verdict_for_report(db_head);
+    // #2370 — this database's genesis-derived identity; `None` on an empty
+    // chain. A read fault also degrades to `None`, which is the CONSERVATIVE
+    // count-every-line posture (over-detect toward Evidence, never suppress).
+    let db_id = crate::signed_events::genesis_db_id(conn).ok().flatten();
+    let verdict = compute_rollback_verdict_for_report(db_head, db_id.as_deref());
     apply_rollback_disposition_at_open(&verdict)
 }
 
@@ -2629,7 +2813,10 @@ pub fn apply_rollback_disposition_at_open(
                  — cleared, opening normally"
             );
         }
-        RollbackCheck::Unknown | RollbackCheck::NotDetected | RollbackCheck::Missing => {}
+        RollbackCheck::Unknown
+        | RollbackCheck::NotDetected
+        | RollbackCheck::NotApplicable
+        | RollbackCheck::Missing => {}
     }
     match rollback_refuse_reason(verdict, require_rollback_check_enabled()) {
         Some(reason) => Err(anyhow!(reason)),
@@ -3745,7 +3932,7 @@ mod tests {
             revisions_head_sequence: 64,
             revisions_head_hash: "bb".repeat(32),
         };
-        let cp = build_signed_witness_checkpoint(&dual, None, 1_700_000_200, &kp)
+        let cp = build_signed_witness_checkpoint(&dual, None, None, 1_700_000_200, &kp)
             .expect("build audit-head witness checkpoint");
         assert_eq!(
             cp.condition_type,
@@ -3774,10 +3961,10 @@ mod tests {
             revisions_head_sequence: 3,
             revisions_head_hash: "bb".to_string(),
         };
-        let json = witness_resolution_json(&dual, None);
+        let json = witness_resolution_json(&dual, None, None);
         // Frozen v1 byte layout (declaration-order serde) — no `rollback` key,
-        // `v: 1`. A change here would break signature verification of every
-        // pre-#1946 witness record.
+        // no `db_id` key (#2370), `v: 1`. A change here would break signature
+        // verification of every pre-#1946 witness record.
         assert_eq!(
             json,
             "{\"v\":1,\"signed_events\":{\"head_sequence\":7,\"head_hash\":\"aa\"},\
@@ -3795,7 +3982,7 @@ mod tests {
             revisions_head_sequence: 64,
             revisions_head_hash: "bb".to_string(),
         };
-        let json = witness_resolution_json(&dual, Some(rollback_counter_for(128)));
+        let json = witness_resolution_json(&dual, Some(rollback_counter_for(128)), None);
         assert!(
             json.contains("\"v\":2"),
             "v2 emission bumps the version: {json}"
@@ -3804,10 +3991,15 @@ mod tests {
             json.contains("\"rollback\":{\"value\":128,\"source\":\"witness-head-anchor-log\"}"),
             "v2 carries the present-only rollback sub-object: {json}"
         );
+        assert!(
+            !json.contains("db_id"),
+            "a db_id-less emission must not serialise a db_id key (#2370): {json}"
+        );
         let kp = cov_role_keypair();
         let cp = build_signed_witness_checkpoint(
             &dual,
             Some(rollback_counter_for(128)),
+            None,
             1_700_000_300,
             &kp,
         )
@@ -3815,6 +4007,46 @@ mod tests {
         assert!(crate::checkpoints::verify(&cp), "v2 witness verifies");
         let parsed = parse_witness_dual_head(&cp).expect("v2-aware reader accepts v: 2");
         assert_eq!(parsed, dual, "dual head survives the v2 round-trip");
+    }
+
+    /// v1.0.0 #2370 — a db_id-carrying emission bumps to `v: 3`, serialises
+    /// the trailing present-only `db_id` key, verifies under the witness
+    /// signature, and the v3-aware reader round-trips the dual head.
+    #[test]
+    fn witness_resolution_v3_carries_db_id_and_round_trips() {
+        let dual = WitnessDualHead {
+            signed_head_sequence: 192,
+            signed_head_hash: "aa".to_string(),
+            revisions_head_sequence: 96,
+            revisions_head_hash: "bb".to_string(),
+        };
+        let db_id = crate::signed_events::db_id_from_genesis_parts(
+            "genesis-id",
+            "ai:genesis-agent",
+            &[0xAB; 32],
+        );
+        let json =
+            witness_resolution_json(&dual, Some(rollback_counter_for(192)), Some(db_id.clone()));
+        assert!(
+            json.contains("\"v\":3"),
+            "v3 emission bumps the version: {json}"
+        );
+        assert!(
+            json.contains(&format!("\"db_id\":\"{db_id}\"")),
+            "v3 carries the present-only db_id: {json}"
+        );
+        let kp = cov_role_keypair();
+        let cp = build_signed_witness_checkpoint(
+            &dual,
+            Some(rollback_counter_for(192)),
+            Some(db_id),
+            1_700_000_400,
+            &kp,
+        )
+        .expect("build v3 witness checkpoint");
+        assert!(crate::checkpoints::verify(&cp), "v3 witness verifies");
+        let parsed = parse_witness_dual_head(&cp).expect("v3-aware reader accepts v: 3");
+        assert_eq!(parsed, dual, "dual head survives the v3 round-trip");
     }
 
     #[test]
