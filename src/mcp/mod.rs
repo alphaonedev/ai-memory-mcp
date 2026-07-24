@@ -1631,6 +1631,50 @@ pub(crate) fn consult_pre_event_gate(
     }
 }
 
+/// #2356 (W1A6-03) — consult the pre-event enforcement gate for
+/// [`HookEvent::PreGovernanceDecision`](crate::hooks::HookEvent) immediately
+/// BEFORE a governance gate decision is dispatched.
+///
+/// `PreGovernanceDecision` has been in `ELIGIBLE_REQUIRED_EVENTS` since
+/// #1734 (PE-1) and `preflight_report` / the boot banner printed "REQUIRED
+/// but NO enabled hook → WILL DENY (enforce)" for it, but the event had ZERO
+/// production dispatch sites — `[hooks].required_events =
+/// ["pre_governance_decision"]` under `enforce_mode = enforce` never fired
+/// and never denied (a fail-open declared control). This helper is the real
+/// dispatch site: every production governance-decision funnel (the HTTP
+/// handlers' `db::enforce_governance` sqlite branches and
+/// `MemoryStore::enforce_governance_action` postgres branches, the MCP
+/// write tools' `db::enforce_governance` consults, and the explicit
+/// `memory_check_agent_action` surface) calls it BEFORE dispatching the
+/// decision, mirroring the #1885/#1924 dispatch-layer precedent (checked
+/// AROUND, never inside, the governance engine).
+///
+/// The payload is the documented [`crate::hooks::events::GovernanceContext`]
+/// wire shape. INERT (`Ok`) when no gate is installed — the default
+/// enforce-off deployment — so callers consult unconditionally at ~zero cost
+/// beyond one `OnceLock` load.
+#[doc(hidden)]
+pub fn consult_pre_governance_decision_gate(
+    namespace: &str,
+    action: &str,
+    agent_id: &str,
+    memory_id: Option<&str>,
+) -> Result<(), String> {
+    // Fast path: skip the payload build entirely when no gate is installed.
+    if PRE_EVENT_ENFORCE_GATE.get().is_none() {
+        return Ok(());
+    }
+    let mut payload = serde_json::json!({
+        "namespace": namespace,
+        "action": action,
+        "agent_id": agent_id,
+    });
+    if let (Some(id), Some(obj)) = (memory_id, payload.as_object_mut()) {
+        obj.insert("memory_id".to_string(), Value::String(id.to_string()));
+    }
+    consult_pre_event_gate(crate::hooks::HookEvent::PreGovernanceDecision, payload)
+}
+
 /// #1885 — test-only installer for the pre-event enforcement gate. Builds the
 /// executor registry from `all_hooks` and installs the gate so an integration
 /// test can drive an ACTUAL `memory_store` (via `handle_store_for_tests`) under

@@ -88,8 +88,13 @@ pub const HEAD_ATTESTATION_ENTRY_ELEMENTS: usize = 6;
 
 /// The reserved namespace for peer-head-entanglement checkpoint records
 /// (spec §5.2). Write-reserved: a normal caller memory write to this exact
-/// namespace is refused at the validate layer
-/// ([`crate::validate::validate_create`]) so only the substrate's internal
+/// namespace is refused at the validate layer via
+/// [`crate::validate::reject_reserved_write_namespace`], consulted on EVERY
+/// caller write/move ingress — the HTTP create/update funnels
+/// ([`crate::validate::validate_create`] / `validate_update`), the MCP and
+/// CLI store paths, and the namespace-MOVE lanes (update + vertical
+/// promote) on both MCP and CLI (#2357 closed the pre-v1.0.0 gap where
+/// only `validate_create` consulted it) — so only the substrate's internal
 /// equivocation lane authors rows under it. Underscore-prefixed by the
 /// same `_`-reserved-namespace convention the curator already honours.
 pub const PEER_HEAD_ENTANGLEMENT_NAMESPACE: &str = "_peer_head_entanglement";

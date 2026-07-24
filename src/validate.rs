@@ -1221,6 +1221,10 @@ pub fn validate_update(update: &UpdateMemory) -> Result<()> {
     }
     if let Some(ref ns) = update.namespace {
         validate_namespace(ns)?;
+        // #2357 (W1A4-08) — an update that MOVES a row into a namespace is a
+        // caller write into that namespace; the R22 reserved-namespace
+        // refusal applies exactly as it does on `validate_create`.
+        reject_reserved_write_namespace(ns)?;
     }
     if let Some(ref tags) = update.tags {
         validate_tags(tags)?;
@@ -2774,6 +2778,17 @@ mod tests {
         let mut u = upd();
         u.namespace = Some("has space".to_string());
         assert!(validate_update(&u).is_err());
+    }
+
+    /// #2357 (W1A4-08) — an update that MOVES a row into the write-reserved
+    /// namespace is refused at the shared `validate_update` funnel (covers
+    /// the HTTP PUT surface via `RequestValidator::validate_update`).
+    #[test]
+    fn validate_update_rejects_reserved_namespace_move() {
+        let mut u = upd();
+        u.namespace = Some(crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE.into());
+        let err = validate_update(&u).expect_err("reserved namespace move must be refused");
+        assert!(err.to_string().contains("reserved"), "got: {err}");
     }
 
     #[test]

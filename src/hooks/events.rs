@@ -148,7 +148,16 @@ pub enum HookEvent {
     PostConsolidate,
     /// Fires before a governance gate decision. Payload: [`GovernanceContext`] (writable).
     ///
-    /// TODO(G3-G11): wire here at `crate::storage::enforce_governance`.
+    /// #2356 (W1A6-03) — wired at the dispatch layer via
+    /// `crate::mcp::consult_pre_governance_decision_gate`, consulted
+    /// immediately BEFORE every production governance-decision dispatch:
+    /// the HTTP handlers' `db::enforce_governance` sqlite branches and
+    /// `MemoryStore::enforce_governance_action` postgres branches
+    /// (create / bulk-create / delete / promote / admin import /
+    /// kg entity-register), the MCP write tools' `db::enforce_governance`
+    /// consults (store / update / delete / promote / forget /
+    /// capture_turn), and the explicit `memory_check_agent_action`
+    /// governance surface (MCP + CLI shared funnel).
     PreGovernanceDecision,
     /// Fires after a governance gate decision. Payload: [`GovernanceDecision`] (read-only).
     ///

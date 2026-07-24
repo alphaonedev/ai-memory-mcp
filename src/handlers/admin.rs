@@ -904,6 +904,19 @@ pub async fn import_memories(
                 .and_then(|v| v.as_str())
                 .unwrap_or(caller.as_str());
             let payload_for_pending = serde_json::to_value(&mem).unwrap_or_else(|_| json!({}));
+            // #2356 (W1A6-03) — `pre_governance_decision` presence consult
+            // BEFORE the per-row governance decision dispatches. A refusal
+            // accumulates as a row error (mirroring the Deny arm) so the
+            // import envelope stays shape-stable.
+            if let Err(reason) = crate::mcp::consult_pre_governance_decision_gate(
+                &mem.namespace,
+                "store",
+                agent_id,
+                None,
+            ) {
+                errors.push(format!("{}: {reason}", mem.id));
+                continue;
+            }
             match app
                 .store
                 .enforce_governance_action(

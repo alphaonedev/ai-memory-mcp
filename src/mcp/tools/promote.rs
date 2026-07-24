@@ -143,6 +143,14 @@ pub(super) fn handle_promote(
             params[param_names::CAPABILITY].as_str(),
             &agent_id,
         );
+        // #2356 (W1A6-03) — `pre_governance_decision` mandatory-hook-presence
+        // consult BEFORE the governance decision dispatches.
+        crate::mcp::consult_pre_governance_decision_gate(
+            &target.namespace,
+            "promote",
+            &agent_id,
+            Some(&resolved_id),
+        )?;
         match db::enforce_governance(
             conn,
             GovernedAction::Promote,
@@ -183,6 +191,10 @@ pub(super) fn handle_promote(
     // untouched; tier is NOT changed by this path.
     if let Some(to_ns) = params["to_namespace"].as_str() {
         validate::validate_namespace(to_ns).map_err(|e| e.to_string())?;
+        // #2357 (W1A4-08) — vertical promotion CLONES a row into `to_ns`,
+        // i.e. a caller write into that namespace; consult the R22
+        // reserved-namespace refusal.
+        validate::reject_reserved_write_namespace(to_ns).map_err(|e| e.to_string())?;
         let clone_id =
             db::promote_to_namespace(conn, &resolved_id, to_ns).map_err(|e| e.to_string())?;
         // P5 (G9): fire `memory_promote` webhook for vertical mode AFTER
@@ -388,6 +400,25 @@ mod tests {
             lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(conn, &mem).expect("insert")
+    }
+
+    /// #2357 (W1A4-08) — vertical promotion CLONES a row into `to_namespace`;
+    /// the write-reserved `_peer_head_entanglement` target is refused.
+    #[test]
+    fn issue_2357_promote_rejects_reserved_to_namespace() {
+        let conn = open_conn();
+        let id = insert_owned(&conn, "issue-2357-promote", "promo-2357", "ai:alice");
+        let err = handle_promote(
+            &conn,
+            Path::new(":memory:"),
+            &json!({
+                "id": id,
+                "to_namespace": crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE,
+            }),
+            None,
+        )
+        .expect_err("reserved to_namespace must be refused");
+        assert!(err.contains("reserved"), "got: {err}");
     }
 
     #[test]

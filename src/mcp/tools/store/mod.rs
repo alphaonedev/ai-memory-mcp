@@ -493,6 +493,9 @@ pub(crate) fn handle_store(
             params[param_names::CAPABILITY].as_str(),
             &agent_id,
         );
+        // #2356 (W1A6-03) — `pre_governance_decision` mandatory-hook-presence
+        // consult BEFORE the governance decision dispatches.
+        crate::mcp::consult_pre_governance_decision_gate(&mem.namespace, "store", &agent_id, None)?;
         match db::enforce_governance(
             conn,
             GovernedAction::Store,

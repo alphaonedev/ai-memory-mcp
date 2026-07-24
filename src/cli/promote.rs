@@ -53,6 +53,9 @@ pub fn cmd_promote(
     validate::validate_id(&args.id)?;
     if let Some(ref to_ns) = args.to_namespace {
         validate::validate_namespace(to_ns)?;
+        // #2357 (W1A4-08) — vertical promotion clones into `to_ns`; consult
+        // the R22 reserved-namespace refusal.
+        validate::reject_reserved_write_namespace(to_ns)?;
     }
     let conn = db::open(db_path)?;
     let target = if let Some(m) = db::get(&conn, &args.id)? {
@@ -292,6 +295,22 @@ mod tests {
         let conn = db::open(&db).unwrap();
         let mem = db::get(&conn, &id).unwrap().unwrap();
         assert_eq!(mem.tier, Tier::Long);
+    }
+
+    /// #2357 (W1A4-08) — CLI vertical promotion into the write-reserved
+    /// `_peer_head_entanglement` namespace is refused.
+    #[test]
+    fn test_promote_rejects_reserved_to_namespace_2357() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let id = seed_memory(&db, "ns", "reserved-target", "cc");
+        let mut args = promote_args(&id);
+        args.to_namespace =
+            Some(crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE.to_string());
+        let mut out = env.output();
+        let err = cmd_promote(&db, &args, false, Some("test-agent"), &mut out)
+            .expect_err("reserved to_namespace must be refused");
+        assert!(err.to_string().contains("reserved"), "got: {err}");
     }
 
     #[test]

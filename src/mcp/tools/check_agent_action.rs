@@ -106,6 +106,14 @@ pub fn run_check(
     // to `ToolDispatchCtx` would let this entry point switch to
     // `check_agent_action_cached(conn, Some(&cache), agent_id, action)`
     // with no other call-site change. Tracked as follow-up to #1023.
+    // #2356 (W1A6-03) — `memory_check_agent_action` is the explicit
+    // governance-decision surface; consult the `pre_governance_decision`
+    // mandatory-hook-presence gate BEFORE the rules engine dispatches.
+    // Agent-action rules are not namespace-scoped, so the context
+    // namespace is empty. Inert when no gate is installed (also covers
+    // the CLI `governance check-action` reuse of this funnel — the CLI
+    // process never installs the gate).
+    crate::mcp::consult_pre_governance_decision_gate("", kind, agent_id, None)?;
     let decision = check_agent_action(conn, agent_id, action).map_err(|e| e.to_string())?;
     Ok(json!({
         "decision": decision,

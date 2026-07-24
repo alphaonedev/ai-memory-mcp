@@ -71,6 +71,36 @@ pub(crate) fn http_pre_event_gate(
     }
 }
 
+/// #2356 (W1A6-03) — consult the pre-event enforcement gate for
+/// `PreGovernanceDecision` on the HTTP surface, mirroring
+/// [`http_pre_event_gate`]. Called immediately BEFORE every HTTP-side
+/// governance-decision dispatch (both the sqlite `db::enforce_governance`
+/// branches and the postgres `MemoryStore::enforce_governance_action`
+/// branches) so `[hooks].required_events = ["pre_governance_decision"]`
+/// under `enforce_mode = enforce` actually denies instead of silently
+/// no-oping while the boot banner / `doctor --hooks` claim "WILL DENY".
+///
+/// Returns `Some(503 response)` when the gate DENIES; `None` to proceed.
+/// INERT (`None`) when no gate is installed — the default enforce-off
+/// deployment.
+pub(crate) fn http_pre_governance_decision_gate(
+    namespace: &str,
+    action: &str,
+    agent_id: &str,
+    memory_id: Option<&str>,
+) -> Option<axum::response::Response> {
+    match crate::mcp::consult_pre_governance_decision_gate(namespace, action, agent_id, memory_id) {
+        Ok(()) => None,
+        Err(reason) => Some(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": reason })),
+            )
+                .into_response(),
+        ),
+    }
+}
+
 // #866 — `create_memory` stage-helpers.
 //
 // The original `create_memory` carried ~790 LOC across the agent_id
@@ -326,6 +356,13 @@ async fn enforce_create_governance<'a>(
         Ok(v) => v,
         Err(resp) => return Err(resp),
     };
+    // #2356 (W1A6-03) — `pre_governance_decision` mandatory-hook-presence
+    // consult BEFORE the governance decision dispatches (sqlite branch).
+    if let Some(resp) =
+        http_pre_governance_decision_gate(&mem.namespace, "store", &agent_for_gov, None)
+    {
+        return Err(resp);
+    }
     match db::enforce_governance(
         &lock.0,
         GovernedAction::Store,
@@ -932,6 +969,11 @@ async fn create_memory_postgres(
     // writes. Postgres branch enforces the same inheritance chain +
     // approver_type policy as sqlite. Approve → 202 Accepted + pending id.
     let payload_for_pending = serde_json::to_value(&mem).unwrap_or_else(|_| json!({}));
+    // #2356 (W1A6-03) — `pre_governance_decision` mandatory-hook-presence
+    // consult BEFORE the governance decision dispatches (postgres branch).
+    if let Some(resp) = http_pre_governance_decision_gate(&mem.namespace, "store", agent_id, None) {
+        return resp;
+    }
     match app
         .store
         .enforce_governance_action(
