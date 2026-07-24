@@ -897,7 +897,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `emit_lease_sweep_reclaim_audit` helper, and the sal-postgres
     // `lease_sweep_expired_emits_coordination_audit_2371` regression test;
     // land the file at 29_997. Ceiling 29_900 -> 30_040 (+43 headroom).
-    ("src/store/postgres.rs", 30_040),
+    // 2026-07-24 (#2382 pg pending-action-timeout sweep) — the
+    // `PostgresStore::sweep_pending_action_timeouts` SAL trait impl
+    // (`UPDATE pending_actions SET status='expired',expired_at=NOW() ...
+    // RETURNING id,namespace`) + its `sweep_pending_action_timeouts_pg_*`
+    // sal-postgres regression coverage land the file at 30_150.
+    // Ceiling 30_040 -> 30_230 (+80 headroom).
+    ("src/store/postgres.rs", 30_230),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
