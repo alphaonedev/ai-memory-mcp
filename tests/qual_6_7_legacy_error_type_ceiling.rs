@@ -175,7 +175,12 @@ const QUAL_6_CEILING: usize = 116;
 // `handle_skill_register` / `collect_resources` String-error surface they feed
 // via `?` (the enclosing handler is `Result<Value, String>`). No new error
 // contract — the same String shape the skill-register path already uses. Net: +2.
-const QUAL_7_CEILING: usize = 37;
+// 2026-07-24 (#2356 W1A6-03 PE-1) — raised 37 → 38 for
+// `mcp::consult_pre_governance_decision_gate`: signature parity with the
+// `consult_pre_event_gate` dispatch surface it wraps (the enclosing MCP
+// handlers are `Result<Value, String>`; the HTTP twin maps the String to a
+// typed 503 at the boundary). No new error contract. Net: +1.
+const QUAL_7_CEILING: usize = 38;
 
 #[test]
 fn qual_6_result_value_string_count_below_ceiling() {

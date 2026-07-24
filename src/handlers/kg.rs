@@ -169,6 +169,16 @@ pub async fn entity_register(
                 "metadata": &extra_metadata,
                 "aliases": &body.aliases,
             });
+            // #2356 (W1A6-03) — `pre_governance_decision` presence consult
+            // BEFORE the governance decision dispatches.
+            if let Some(resp) = super::create::http_pre_governance_decision_gate(
+                &body.namespace,
+                "store",
+                &aid,
+                None,
+            ) {
+                return resp;
+            }
             match app
                 .store
                 .enforce_governance_action(

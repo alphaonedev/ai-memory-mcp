@@ -164,6 +164,11 @@ pub(super) fn parse_and_build_memory(
     validate::validate_title(title).map_err(|e| e.to_string())?;
     validate::validate_content(content).map_err(|e| e.to_string())?;
     validate::validate_namespace(&namespace).map_err(|e| e.to_string())?;
+    // #2357 (W1A4-08) — the MCP store path validates inline (it does not
+    // route through `validate::validate_create`), so the R22 reserved
+    // write-namespace refusal must be consulted here explicitly or the
+    // HTTP-only funnel leaves this surface open.
+    validate::reject_reserved_write_namespace(&namespace).map_err(|e| e.to_string())?;
     validate::validate_source(&source).map_err(|e| e.to_string())?;
     validate::validate_tags(&tags).map_err(|e| e.to_string())?;
     validate::validate_priority(priority).map_err(|e| e.to_string())?;
@@ -386,6 +391,27 @@ mod tests {
         assert_eq!(OnConflict::parse("merge").unwrap(), OnConflict::Merge);
         assert_eq!(OnConflict::parse("version").unwrap(), OnConflict::Version);
         assert!(OnConflict::parse("nope").is_err());
+    }
+
+    /// #2357 (W1A4-08) — the MCP store path must refuse the write-reserved
+    /// `_peer_head_entanglement` namespace exactly as the HTTP
+    /// `validate_create` funnel does (missed-surface enforcement parity).
+    #[test]
+    fn issue_2357_store_rejects_reserved_write_namespace() {
+        use crate::config::ResolvedTtl;
+        use crate::storage as db;
+        use serde_json::json;
+
+        let conn = db::open(std::path::Path::new(":memory:")).expect("open in-memory db");
+        let ttl = ResolvedTtl::default();
+        let params = json!({
+            "title": "issue-2357-reserved-ns",
+            "content": "memory body",
+            "namespace": crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE,
+        });
+        let err = parse_and_build_memory(&params, None, &ttl, &conn)
+            .expect_err("reserved namespace must be refused on the MCP store surface");
+        assert!(err.contains("reserved"), "got: {err}");
     }
 
     #[test]

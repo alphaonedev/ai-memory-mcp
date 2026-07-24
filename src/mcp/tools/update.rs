@@ -300,6 +300,10 @@ pub(super) fn handle_update(
     }
     if let Some(ns) = &namespace {
         validate::validate_namespace(ns).map_err(|e| e.to_string())?;
+        // #2357 (W1A4-08) — a namespace MOVE is a caller write into the
+        // target namespace; consult the R22 reserved-namespace refusal
+        // (the MCP update path does not route through `validate_update`).
+        validate::reject_reserved_write_namespace(ns).map_err(|e| e.to_string())?;
     }
     if let Some(ref t) = tags {
         validate::validate_tags(t).map_err(|e| e.to_string())?;
@@ -404,6 +408,14 @@ pub(super) fn handle_update(
             params[param_names::CAPABILITY].as_str(),
             &agent_id,
         );
+        // #2356 (W1A6-03) — `pre_governance_decision` mandatory-hook-presence
+        // consult BEFORE the governance decision dispatches.
+        crate::mcp::consult_pre_governance_decision_gate(
+            &effective_namespace,
+            "store",
+            &agent_id,
+            Some(&resolved_id),
+        )?;
         match db::enforce_governance(
             conn,
             GovernedAction::Store,
@@ -661,6 +673,29 @@ mod tests {
 
     fn fresh_conn() -> rusqlite::Connection {
         db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
+    }
+
+    /// #2357 (W1A4-08) — a namespace MOVE into the write-reserved
+    /// `_peer_head_entanglement` namespace is refused on the MCP update
+    /// surface (parity with the HTTP `validate_create` / `validate_update`
+    /// funnels).
+    #[test]
+    fn issue_2357_update_rejects_reserved_namespace_move() {
+        let conn = fresh_conn();
+        let mem = make_mem("issue-2357-move");
+        db::insert(&conn, &mem).expect("insert");
+        let err = handle_update(
+            &conn,
+            &json!({
+                "id": mem.id,
+                "namespace": crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE,
+            }),
+            None,
+            None,
+            None,
+        )
+        .expect_err("reserved namespace move must be refused");
+        assert!(err.contains("reserved"), "got: {err}");
     }
 
     fn make_mem(title: &str) -> Memory {

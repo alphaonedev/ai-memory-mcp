@@ -176,6 +176,9 @@ pub fn run(
     validate::validate_title(&args.title)?;
     validate::validate_content(&content)?;
     validate::validate_namespace(&namespace)?;
+    // #2357 (W1A4-08) — CLI store validates inline; consult the R22 reserved
+    // write-namespace refusal so the CLI surface matches HTTP `validate_create`.
+    validate::reject_reserved_write_namespace(&namespace)?;
     validate::validate_source(&args.source)?;
     validate::validate_tags(&tags)?;
     validate::validate_priority(args.priority)?;
@@ -529,6 +532,24 @@ mod tests {
         assert!(stdout.starts_with("stored: "), "got: {stdout}");
         assert!(stdout.contains("[mid]"));
         assert!(stdout.contains("ns=test-ns"));
+    }
+
+    /// #2357 (W1A4-08) — CLI store into the write-reserved
+    /// `_peer_head_entanglement` namespace is refused (parity with the
+    /// HTTP `validate_create` funnel).
+    #[test]
+    fn test_store_rejects_reserved_namespace_2357() {
+        let _lock = locked_env();
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.namespace =
+            Some(crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE.to_string());
+        let mut out = env.output();
+        let err = run(&db, args, false, &cfg, Some("test-agent"), &mut out)
+            .expect_err("reserved namespace must be refused");
+        assert!(err.to_string().contains("reserved"), "got: {err}");
     }
 
     #[test]
