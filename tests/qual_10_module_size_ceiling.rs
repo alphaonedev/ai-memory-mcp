@@ -384,7 +384,15 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // struct (#2336), the G7 soft-loser recall penalty (#2338), and the
     // access-priority ceiling on the touch/fold ladders (#2339).
     // Measured 26_675; ceiling 26_750 (+75 headroom).
-    ("src/storage/mod.rs", 26_750),
+    // 2026-07-24 (#2383 N1 encrypt-at-rest upsert key) — the
+    // `DecryptFailurePolicy` split row-mapper (fail-closed targeted reads vs
+    // skip-with-WARN discovery scans) + the `AI_MEMORY_STRICT_DECRYPT_READS`
+    // knob + the seal-to-RETAINED-identity helpers
+    // (`retained_agent_id_for_upsert` / `seal_content_for_upsert` /
+    // `reconcile_envelope_owner`) and the atomic seal/upsert/reconcile tx
+    // wrappers on `insert_inner` + `insert_if_newer` land the file at
+    // 27_132. Ceiling 26_750 -> 27_250 (+118 headroom).
+    ("src/storage/mod.rs", 27_250),
     // 2026-07-21 (#1802 R-05 S1) — NEW submodule extracted from
     // storage/mod.rs (doctor / observability probes). Measured 698;
     // ceiling 800 (+102).
@@ -915,7 +923,15 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // ZERO-charge), stack on top of the #2382 merge and land the file at
     // 30_377. Ceiling 30_320 -> 30_440 (+63 headroom). Module-split relief
     // tracked under #650-class follow-ups.
-    ("src/store/postgres.rs", 30_440),
+    // 2026-07-24 (#2383 N1 encrypt-at-rest upsert key) — the postgres twins
+    // of the sqlite #2383 work: `UpsertSeal` + `retained_agent_id_for_upsert`
+    // + `seal_content_for_upsert(_batch)` + `reconcile_envelope_owner(_known)`,
+    // the `DecryptFailurePolicy` split row-mapper, and the seal/reconcile
+    // wiring across all 10 vulnerable write arms (incl. the new
+    // `apply_remote_memory` transaction). Rebased ON TOP OF the #2378 merge
+    // (MAX-WINS over its 30_440), landing the file at the measured size below.
+    // Ceiling 30_440 -> 30_900.
+    ("src/store/postgres.rs", 30_900),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

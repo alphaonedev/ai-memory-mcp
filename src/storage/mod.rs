@@ -774,7 +774,114 @@ pub use reflect::{
 #[allow(unused_imports)]
 pub(crate) use reflect::emit_reflection_depth_exceeded_audit;
 
+/// v1.0.0 #2383 (N1) — operator knob that reverts the read path to the
+/// pre-#2383 uniform fail-CLOSED posture: when truthy, an undecryptable
+/// `encrypted_envelope` errors out EVERY read, including the best-effort
+/// discovery scans that otherwise skip the row. Set it when a silent gap in
+/// a scan result is less acceptable than a namespace-wide read outage.
+/// Default (unset) = the split posture documented on
+/// [`DecryptFailurePolicy`]. Read ONLY on the rare decrypt-failure branch,
+/// never on the per-row happy path, so it costs nothing on a clean corpus.
+pub const ENV_STRICT_DECRYPT_READS: &str = "AI_MEMORY_STRICT_DECRYPT_READS";
+
+/// Structured `tracing` target for the #2383 skip-with-WARN read degrade, so
+/// operators can alert on exactly this event class without string-matching a
+/// message body.
+pub(crate) const UNDECRYPTABLE_ROW_TRACE_TARGET: &str = "encryption.undecryptable_row_skipped";
+
+/// WARN message emitted alongside [`UNDECRYPTABLE_ROW_TRACE_TARGET`].
+pub(crate) const UNDECRYPTABLE_ROW_SKIPPED_MSG: &str = "at-rest envelope did not decrypt under the row's persisted agent_id; \
+     SKIPPING this row from the scan result (degrade, not corrupt). The row's \
+     ciphertext is untouched on disk — re-key or restore the agent keypair to \
+     recover it. Set AI_MEMORY_STRICT_DECRYPT_READS=1 to fail the read instead.";
+
+/// `true` when [`ENV_STRICT_DECRYPT_READS`] is set to a truthy value. Mirrors
+/// the truthy-set spelling of the other require-mode gates
+/// (`hnsw::strict_dim_enabled`, `identity::lineage::require_identity_lineage_enabled`).
+/// NOT cached: this is consulted only when a decrypt has already failed, so a
+/// process-env read here is off every hot path.
+#[must_use]
+pub fn strict_decrypt_reads_enabled() -> bool {
+    std::env::var(ENV_STRICT_DECRYPT_READS)
+        .map(|v| {
+            let v = v.trim();
+            v == "1"
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("yes")
+                || v.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(false)
+}
+
+/// v1.0.0 #2383 (N1) — disposition for a row whose `encrypted_envelope` will
+/// not open under the row's persisted `metadata.agent_id`.
+///
+/// The split posture (2x3 adversarial vote `4d3ea1c5`, read-posture B2
+/// unanimous 6/6) is the North-Star "DEGRADE, never corrupt / never lie"
+/// reading:
+///
+/// * [`DecryptFailurePolicy::FailClosed`] — used by TARGETED reads (`get`,
+///   `get_by_prefix`, the archive fetch) and by COMPLETENESS-CRITICAL egress
+///   (`export_all`). The caller named a specific row, or is taking a backup:
+///   silently omitting it would be a lie about what exists. Errors loudly.
+/// * [`DecryptFailurePolicy::SkipRow`] — used by BEST-EFFORT discovery scans
+///   (`list` / `search` / `recall` / `get_many` / kind+source_uri listings /
+///   the federation catch-up send). Their contract is already "the matching
+///   subset", so one unreadable row yields FEWER results — never WRONG
+///   results — instead of denying the entire namespace. Pre-#2383 these
+///   collected `Result`, so a single poisoned row made every `list` / `recall`
+///   in the namespace error out: a data-AVAILABILITY defect in its own right.
+///
+/// Either way the ciphertext on disk is untouched: the skip is a read-time
+/// degrade, never a delete, and [`ENV_STRICT_DECRYPT_READS`] reverts scans to
+/// fail-closed for operators who prefer the outage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecryptFailurePolicy {
+    /// Surface the decrypt failure as a read error (never substitute the
+    /// placeholder, never silently drop the row).
+    FailClosed,
+    /// Drop the row from the result set with a loud WARN + metric, unless
+    /// [`ENV_STRICT_DECRYPT_READS`] forces fail-closed.
+    SkipRow,
+}
+
+/// Build the fail-closed read error for an undecryptable row. One home for
+/// the shape so the targeted-read and scan paths cannot drift.
+fn undecryptable_row_error(detail: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Blob,
+        Box::new(std::io::Error::other(detail)),
+    )
+}
+
+/// Map a `memories` row into a [`Memory`], FAIL-CLOSED on an undecryptable
+/// at-rest envelope. Use this for targeted reads and completeness-critical
+/// egress; discovery scans use [`row_to_memory_scan`].
 pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
+    match row_to_memory_with_policy(row, DecryptFailurePolicy::FailClosed)? {
+        Some(mem) => Ok(mem),
+        // Unreachable by construction: `FailClosed` converts an undecryptable
+        // envelope into `Err` inside the mapper. Returned as an error rather
+        // than a panic so a future policy edit degrades loudly, never aborts.
+        None => Err(undecryptable_row_error(
+            "row_to_memory: fail-closed policy yielded no row".to_string(),
+        )),
+    }
+}
+
+/// v1.0.0 #2383 (N1) — scan-flavoured row mapper: `Ok(None)` means "this row
+/// could not be decrypted and was skipped" (WARN + metric already emitted).
+/// `Err` still signals a REAL read failure (missing column, corrupt row) so a
+/// schema problem is never mistaken for a skippable poison row.
+pub(crate) fn row_to_memory_scan(row: &rusqlite::Row) -> rusqlite::Result<Option<Memory>> {
+    row_to_memory_with_policy(row, DecryptFailurePolicy::SkipRow)
+}
+
+fn row_to_memory_with_policy(
+    row: &rusqlite::Row,
+    policy: DecryptFailurePolicy,
+) -> rusqlite::Result<Option<Memory>> {
     let row_id: String = row.get("id")?;
     let tags_json: String = row.get("tags")?;
     let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
@@ -968,20 +1075,36 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         match crate::encryption::open_content(&bytes, agent_id) {
             Ok(plaintext) => memory.content = plaintext,
             Err(e) => {
-                // FAIL-CLOSED: a row with a non-NULL envelope MUST decrypt
-                // or the read errors. Never return the empty placeholder as
-                // if it were the plaintext content — that would silently
-                // surface an empty memory and mask key loss / corruption.
-                return Err(rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Blob,
-                    Box::new(std::io::Error::other(format!("decrypt failed: {e}"))),
-                ));
+                // NEVER return the empty placeholder as if it were the
+                // plaintext content — that would silently surface an empty
+                // memory and mask key loss / corruption. The only two legal
+                // dispositions are "error" and "omit"; see
+                // [`DecryptFailurePolicy`] for which read takes which.
+                //
+                // v1.0.0 #2383 (N1) — SkipRow keeps ONE poisoned row from
+                // denying an entire namespace's `list` / `recall`. The row is
+                // NOT modified or deleted: its ciphertext stays on disk and
+                // becomes readable again the moment the correct keypair is
+                // restored (or `AI_MEMORY_STRICT_DECRYPT_READS=1` is set to
+                // surface the failure loudly instead).
+                if policy == DecryptFailurePolicy::SkipRow && !strict_decrypt_reads_enabled() {
+                    tracing::warn!(
+                        target: UNDECRYPTABLE_ROW_TRACE_TARGET,
+                        row_id = %memory.id,
+                        namespace = %memory.namespace,
+                        agent_id = %agent_id,
+                        error = %e,
+                        "{UNDECRYPTABLE_ROW_SKIPPED_MSG}"
+                    );
+                    crate::metrics::record_corrupt_provenance(field_names::ENCRYPTED_ENVELOPE);
+                    return Ok(None);
+                }
+                return Err(undecryptable_row_error(format!("decrypt failed: {e}")));
             }
         }
     }
 
-    Ok(memory)
+    Ok(Some(memory))
 }
 
 /// v0.7.0 polish PERF-8 (issue #781) — extract the canonical
@@ -1054,6 +1177,200 @@ pub(crate) fn extract_mentioned_entity_id(mem: &Memory) -> Option<String> {
 pub(crate) fn extract_kind_provenance(mem: &Memory) -> Option<&'static str> {
     crate::models::KindProvenance::from_metadata(&mem.metadata).map(|p| p.as_str())
 }
+
+/// The `metadata.agent_id` NHI provenance marker a memory carries, resolved
+/// EXACTLY the way the read path resolves it (`row_to_memory`): a non-string
+/// or absent value reads as the empty string. One home for the extraction so
+/// the seal key and the decrypt key can never drift apart.
+pub(crate) fn memory_agent_id(mem: &Memory) -> &str {
+    mem.metadata
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+}
+
+/// Resolve a `serde_json` `metadata` object's `agent_id` the way the SQL
+/// `json_patch(<base>, <existing provenance>)` overlay + `row_to_memory`
+/// resolve it: `None` = the key is ABSENT (the overlay leaves the base
+/// value in place); `Some(s)` = the key is PRESENT and the surviving row
+/// will read it as `s` (`""` for a present-but-non-string value, which the
+/// reader maps to the empty agent id).
+fn metadata_agent_id_slot(metadata: &serde_json::Value) -> Option<&str> {
+    metadata
+        .get("agent_id")
+        .map(|v| v.as_str().unwrap_or_default())
+}
+
+/// v1.0.0 #2383 (N1) — the outcome of sealing content for a write whose SQL
+/// has an `ON CONFLICT (title, namespace) DO UPDATE` arm.
+///
+/// `sealed_under` is the agent id the ciphertext is keyed to. It is retained
+/// so the post-write [`reconcile_envelope_owner`] backstop can compare it
+/// against the id the surviving row actually kept.
+pub(crate) struct UpsertSeal {
+    /// Value to bind into the `content` column (the plaintext verbatim, or
+    /// the empty placeholder when an envelope was produced).
+    pub(crate) content_to_store: String,
+    /// Value to bind into `encrypted_envelope` (`None` = encryption off).
+    pub(crate) envelope: Option<Vec<u8>>,
+    /// The agent id `envelope` is sealed to.
+    sealed_under: String,
+}
+
+impl UpsertSeal {
+    /// Borrowed view for the `params!` bind.
+    pub(crate) fn envelope_bytes(&self) -> Option<&[u8]> {
+        self.envelope.as_deref()
+    }
+}
+
+/// v1.0.0 #2383 (N1) — resolve the `agent_id` a `(title, namespace)` upsert's
+/// SURVIVING row will retain.
+///
+/// The conflict arms deliberately preserve the EXISTING row's provenance keys
+/// (#1784 authorship immutability: `json_patch(excluded.metadata, <existing
+/// agent_id / derived_from / consolidated_from_agents>)`), while `content` +
+/// `encrypted_envelope` move to the incoming writer's values. Sealing the
+/// merged content to the INCOMING agent's key therefore produced a row keyed
+/// to B but attributed to A — every subsequent read AEAD-failed and, because
+/// the scans collected `Result`, ONE such row denied the whole namespace.
+///
+/// Sealing to the RETAINED identity keeps the durable row self-consistent
+/// without touching authorship: agent B's content is stored (no data loss),
+/// sealed to the key the row's own `agent_id` resolves to.
+///
+/// Cost: ONE indexed lookup, and ONLY when at-rest encryption is enabled —
+/// the default path returns the incoming id without touching the connection,
+/// so an encryption-off deployment is byte-identical to pre-#2383.
+fn retained_agent_id_for_upsert(conn: &Connection, mem: &Memory) -> Result<String> {
+    let incoming = memory_agent_id(mem);
+    if !crate::encryption::encryption_enabled(None) {
+        return Ok(incoming.to_string());
+    }
+    use rusqlite::OptionalExtension;
+    let existing_metadata: Option<String> = conn
+        .query_row(
+            "SELECT metadata FROM memories WHERE title = ?1 AND namespace = ?2",
+            params![mem.title, mem.namespace],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(raw) = existing_metadata else {
+        // No conflict target — the incoming row IS the surviving row.
+        return Ok(incoming.to_string());
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        // Unparseable stored metadata: the reader falls back to `{}` (see
+        // `row_to_memory`), so the surviving row reads no agent_id at all.
+        // Seal to the incoming id and let the post-write reconcile repair it
+        // rather than guessing here.
+        return Ok(incoming.to_string());
+    };
+    Ok(metadata_agent_id_slot(&parsed)
+        .unwrap_or(incoming)
+        .to_string())
+}
+
+/// v1.0.0 #2383 (N1) — seal content for a write that may land on the
+/// `(title, namespace)` conflict arm, keyed to the identity the surviving row
+/// will RETAIN rather than the incoming writer's.
+fn seal_content_for_upsert(conn: &Connection, mem: &Memory) -> Result<UpsertSeal> {
+    let sealed_under = retained_agent_id_for_upsert(conn, mem)?;
+    // Fail-closed: an enabled gate over a row that will retain NO agent id
+    // has no recipient key, and `seal_content` refuses rather than silently
+    // storing plaintext.
+    let sealed = crate::encryption::seal_content(&mem.content, &sealed_under)?;
+    Ok(match sealed {
+        Some((envelope, placeholder)) => UpsertSeal {
+            content_to_store: placeholder,
+            envelope: Some(envelope),
+            sealed_under,
+        },
+        None => UpsertSeal {
+            content_to_store: mem.content.clone(),
+            envelope: None,
+            sealed_under,
+        },
+    })
+}
+
+/// v1.0.0 #2383 (N1) — post-write backstop that guarantees the invariant
+/// "a non-NULL `encrypted_envelope` MUST open under the row's persisted
+/// `metadata.agent_id`", even when the pre-read in
+/// [`retained_agent_id_for_upsert`] raced a concurrent first-creation.
+///
+/// The lookup is keyed on `encrypted_envelope = <our bytes>`, so it fires
+/// ONLY for the row that actually carries the envelope this call sealed (a
+/// newer-wins merge whose incoming row LOST keeps the local envelope, which
+/// is already consistent, and matches nothing here). Envelopes carry a fresh
+/// random DEK + nonce per seal, so the byte match is an exact identity test.
+///
+/// No-op when encryption is off (`envelope` is `None`) — zero extra
+/// statements on the default path. MUST be called inside the same
+/// transaction as the upsert so no reader ever observes the intermediate
+/// state; the sqlite upsert funnels take `BEGIN IMMEDIATE` for exactly this.
+fn reconcile_envelope_owner(
+    conn: &Connection,
+    id: &str,
+    plaintext: &str,
+    seal: &UpsertSeal,
+) -> Result<()> {
+    let Some(our_envelope) = seal.envelope_bytes() else {
+        return Ok(());
+    };
+    use rusqlite::OptionalExtension;
+    let retained: Option<rusqlite::types::Value> = conn
+        .query_row(
+            "SELECT json_extract(metadata, '$.agent_id') FROM memories \
+             WHERE id = ?1 AND encrypted_envelope = ?2",
+            params![id, our_envelope],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(retained) = retained else {
+        // Our envelope is not the one that survived — nothing to reconcile.
+        return Ok(());
+    };
+    // Mirror `row_to_memory`: a non-text value reads as the empty agent id.
+    let retained = match retained {
+        rusqlite::types::Value::Text(s) => s,
+        _ => String::new(),
+    };
+    if retained == seal.sealed_under {
+        return Ok(());
+    }
+    tracing::warn!(
+        target: UNDECRYPTABLE_ROW_TRACE_TARGET,
+        memory_id = %id,
+        sealed_under = %seal.sealed_under,
+        retained_agent_id = %retained,
+        "{ENVELOPE_OWNER_RECONCILED_MSG}"
+    );
+    // Re-seal the SAME plaintext under the retained identity. `seal_content`
+    // fails closed when the retained id is empty, which rolls the enclosing
+    // transaction back rather than leaving an unreadable row on disk.
+    let repaired = crate::encryption::seal_content(plaintext, &retained)?;
+    let Some((repaired_envelope, placeholder)) = repaired else {
+        // Encryption was disabled between the seal and this check. Nothing
+        // safe to write here; leave the row untouched and surface loudly.
+        return Err(anyhow::anyhow!(
+            "at-rest encryption was disabled mid-write; refusing to reconcile \
+             the envelope of memory {id}"
+        ));
+    };
+    conn.execute(
+        "UPDATE memories SET content = ?3, encrypted_envelope = ?4 \
+         WHERE id = ?1 AND encrypted_envelope = ?2",
+        params![id, our_envelope, placeholder, repaired_envelope],
+    )?;
+    Ok(())
+}
+
+/// WARN emitted when the #2383 backstop had to re-key a freshly written
+/// envelope to the identity the surviving row retained.
+const ENVELOPE_OWNER_RECONCILED_MSG: &str = "upsert-merge landed on a row that retains a DIFFERENT agent_id than the \
+     content was sealed to (concurrent first-creation race); re-sealing the \
+     merged content to the retained identity so the row stays readable";
 
 /// Insert with upsert on title+namespace. Returns the ID (existing or new).
 ///
@@ -1170,206 +1487,236 @@ fn insert_inner(conn: &Connection, mem: &Memory, stamp_local_clock: bool) -> Res
     // then carries the empty placeholder and the ciphertext envelope lands
     // in `encrypted_envelope`. When disabled (default) `sealed` is None and
     // the content column holds the plaintext verbatim with a NULL envelope
-    // — byte-identical to pre-wiring behaviour. agent_id is the NHI
-    // provenance marker from metadata (fail-closed under an enabled gate
-    // when absent). Content-only: title / tags / metadata stay plaintext.
-    let agent_id = mem
-        .metadata
-        .get("agent_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let sealed = crate::encryption::seal_content(&mem.content, agent_id)?;
-    let content_to_store = sealed
-        .as_ref()
-        .map_or(mem.content.as_str(), |(_, ph)| ph.as_str());
-    let encrypted_envelope: Option<&[u8]> = sealed.as_ref().map(|(env, _)| env.as_slice());
-    // v0.9.0 G8 (#1825) — stamp the additive content-id from the
-    // PLAINTEXT genesis identity, BEFORE the seal/placeholder swap above
-    // ever touched `content_to_store` (we hash `mem.content`, never the
-    // ciphertext placeholder). On an upsert conflict the surviving row
-    // keeps its own genesis (DO UPDATE SET cid = memories.cid), so this
-    // pair only lands on a fresh genesis INSERT.
-    let cid_stamp = crate::identity::cid::stamp_memory_cid(mem);
-    // v1.0.0 #1834 (pre-ship 3x7) — canonicalize the claim-bitemporal
-    // VALID-time bounds at the storage funnel so every caller (MCP / HTTP /
-    // CLI / federation / import / curator) persists the ONE fixed UTC
-    // rendering byte comparison is correct against. See
-    // `validate::canonicalize_valid_time`.
-    let valid_from_canon = crate::validate::canonical_valid_time_opt(mem.valid_from.as_deref());
-    let valid_until_canon = crate::validate::canonical_valid_time_opt(mem.valid_until.as_deref());
-    // v1.0.0 #2332 (FBL-02) — canonicalize `expires_at` at the SAME funnel
-    // the v86 #1834 work canonicalized valid_from/valid_until: every expiry
-    // consumer (GC reap, recall/list visibility, the #1596 touch/fold MAX()
-    // floors) compares this TEXT column lexicographically against a
-    // UTC-rendered `now`, and a caller-supplied non-UTC offset rendering
-    // orders wrongly as bytes (premature reap / over-retention / a voided
-    // extension floor). Unparseable values pass through byte-for-byte
-    // (fail-safe — the validation gates already admitted them).
-    let effective_expires = mem.effective_expires_at();
-    let expires_canon = crate::validate::canonical_valid_time_opt(effective_expires.as_deref());
-    // #1579 B6 — `insert` is the hottest write statement in the
-    // substrate (every store / upsert / capture-turn / federation push
-    // lands here). `prepare_cached` skips the re-parse of this ~60-line
-    // upsert on every call after the first.
-    let mut insert_stmt = conn.prepare_cached(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope, cid, cid_genesis, kind_provenance, valid_from, valid_until)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
-         ON CONFLICT(title, namespace) DO UPDATE SET
-            -- v0.9.0 G8 (#1825) — the surviving row KEEPS its own genesis
-            -- content-id + pre-image (self-assign, never the excluded
-            -- value): an upsert-merge mutates content but the memory's
-            -- GENESIS identity is fixed at creation.
-            cid = memories.cid,
-            cid_genesis = memories.cid_genesis,
-            content = excluded.content,
-            -- #228 Commit B — content + envelope move together on upsert so
-            -- a re-store under encryption replaces both the placeholder and
-            -- the ciphertext (and a re-store under encryption-off writes the
-            -- plaintext + NULL envelope, clearing any stale ciphertext).
-            encrypted_envelope = excluded.encrypted_envelope,
-            tags = excluded.tags,
-            priority = MAX(memories.priority, excluded.priority),
-            confidence = MAX(memories.confidence, excluded.confidence),
-            source = excluded.source,
-            tier = CASE WHEN excluded.tier = 'long' THEN 'long'
-                        WHEN memories.tier = 'long' THEN 'long'
-                        WHEN excluded.tier = 'mid' THEN 'mid'
-                        ELSE memories.tier END,
-            updated_at = excluded.updated_at,
-            expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
-                              ELSE COALESCE(excluded.expires_at, memories.expires_at) END,
-            -- #1784 — preserve immutable provenance keys (agent_id + the
-            -- consolidation derived_from / consolidated_from_agents arrays)
-            -- across upsert. json_patch overlays the existing row's
-            -- provenance object on top of excluded (existing-wins) and
-            -- preserves nested array values that the prior agent_id-only
-            -- json_set handled but the array keys would have double-encoded.
-            metadata = json_patch(
-                excluded.metadata,
-                COALESCE(
-                    (SELECT json_group_object(key, value)
-                     FROM json_each(memories.metadata)
-                     WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents')),
-                    '{}'
-                )
-            ),
-            -- v0.7.0 Task 1/8 — recursion depth takes the max across upsert
-            -- so a subsequent reflection at higher depth doesn't lose its
-            -- provenance signal when re-stored at the same (title, namespace).
-            reflection_depth = MAX(memories.reflection_depth, excluded.reflection_depth),
-            -- v0.7.0 L1-1 — kind is sticky: once Reflection, always Reflection.
-            -- An upsert of an observation onto an existing reflection row must
-            -- not downgrade the kind (reflect is not reversible by re-store).
-            -- v0.7.0 QW-2 — Persona is also sticky once set; the engine
-            -- writes new versions via fresh rows under a unique
-            -- `__persona_<entity>_v<n>` title rather than upsert.
-            memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
-                               WHEN memories.memory_kind = 'persona' THEN 'persona'
-                               ELSE excluded.memory_kind END,
-            -- v0.7.0 QW-2 — entity_id + persona_version stay attached to
-            -- the row they were minted with (Persona-kind upserts use
-            -- versioned titles so the conflict path is exercised only
-            -- on accidental same-title collisions).
-            entity_id = COALESCE(memories.entity_id, excluded.entity_id),
-            persona_version = COALESCE(memories.persona_version, excluded.persona_version),
-            -- v0.7.0 Form 4 — fact-provenance: when the incoming row
-            -- carries a non-empty citations array, replace the stored
-            -- value (caller re-asserted provenance); otherwise keep
-            -- the existing value (silent merge would lose freshly-cited
-            -- evidence). source_uri / source_span follow COALESCE
-            -- semantics so a new write that omits them does not blank
-            -- out existing provenance pointers.
-            citations = CASE WHEN excluded.citations = '[]'
-                             THEN memories.citations
-                             ELSE excluded.citations END,
-            source_uri = COALESCE(excluded.source_uri, memories.source_uri),
-            source_span = COALESCE(excluded.source_span, memories.source_span),
-            -- v0.7.0 Form 5 — confidence-provenance follows the same
-            -- shape as Form 4 columns: explicit non-default replaces;
-            -- caller_provided + NULL signals keep the existing
-            -- provenance signal so a re-store doesn't blank out an
-            -- auto-derived or calibrated value.
-            confidence_source = CASE WHEN excluded.confidence_source != 'caller_provided'
-                                     THEN excluded.confidence_source
-                                     ELSE memories.confidence_source END,
-            confidence_signals = COALESCE(excluded.confidence_signals, memories.confidence_signals),
-            confidence_decayed_at = COALESCE(excluded.confidence_decayed_at, memories.confidence_decayed_at),
-            -- v0.7.0 polish PERF-8 (#781) — denormalised mention tag.
-            -- COALESCE keeps any pre-existing tag (re-write that
-            -- omits the structured entity_id metadata should NOT
-            -- blank out the indexed column) while letting a fresh
-            -- extraction populate previously-NULL rows.
-            mentioned_entity_id = COALESCE(excluded.mentioned_entity_id, memories.mentioned_entity_id),
-            -- v0.8.0 Pillar 2 (#1709) — lifecycle_state is preserved across
-            -- a plain re-store: the stored value wins so a re-store of an
-            -- already-`active`/`done` row does NOT reset it to the incoming
-            -- (typically `open`) initial state. Lifecycle ADVANCES go
-            -- through the typed `memory_update` transition gate, never a
-            -- silent upsert.
-            lifecycle_state = memories.lifecycle_state,
-            -- #1632 — upsert-merge IS a mutation (content/tags/priority
-            -- can change), so the Gap-1 optimistic-concurrency counter
-            -- bumps here exactly like db::update. Pre-#1632 a re-store
-            -- rewrote content while version stood still, so a stale
-            -- If-Match could overwrite the merge invisibly. The decay
-            -- sweep remains the only documented non-bumping mutator
-            -- (tests/non_version_bumping_sites_1036.rs).
-            version = memories.version + 1,
-            -- v1.0.0 (#1945) — the epistemic-typing provenance follows the
-            -- incoming write when it carries one, else keeps the stored
-            -- value (a re-store that omits the carrier must not blank an
-            -- existing marker). COALESCE, like the Form-4/5 columns above.
-            kind_provenance = COALESCE(excluded.kind_provenance, memories.kind_provenance),
-            -- v1.0.0 #1834 — claim-bitemporal validity. `valid_from` is
-            -- IMMUTABLE once set (a correction is a supersede, not a mutation),
-            -- so the stored value always wins on upsert. `valid_until` is the
-            -- one caller-updatable bound (closing a claim), so a re-store that
-            -- carries a non-NULL upper bound sets it; else the existing value
-            -- is kept (COALESCE, matching the Form-4/5 provenance columns).
-            valid_from = memories.valid_from,
-            valid_until = COALESCE(excluded.valid_until, memories.valid_until)
-         RETURNING id",
-    )?;
-    let kind_provenance_col = extract_kind_provenance(mem);
-    let actual_id: String = insert_stmt.query_row(
-        params![
-            mem.id,
-            mem.tier.as_str(),
-            mem.namespace,
-            mem.title,
-            content_to_store,
-            tags_json,
-            mem.priority,
-            mem.confidence,
-            mem.source,
-            mem.access_count,
-            mem.created_at,
-            mem.updated_at,
-            mem.last_accessed_at,
-            expires_canon,
-            metadata_json,
-            mem.reflection_depth,
-            mem.memory_kind.as_str(),
-            mem.entity_id,
-            mem.persona_version,
-            citations_json,
-            mem.source_uri,
-            source_span_json,
-            mem.confidence_source.as_str(),
-            confidence_signals_json,
-            mem.confidence_decayed_at,
-            mentioned_entity_id,
-            mem.lifecycle_state.as_str(),
-            encrypted_envelope,
-            cid_stamp.cid,
-            cid_stamp.genesis,
-            kind_provenance_col,
-            valid_from_canon,
-            valid_until_canon,
-        ],
-        |r| r.get(0),
-    )?;
-    Ok(actual_id)
+    // — byte-identical to pre-wiring behaviour. Content-only: title / tags /
+    // metadata stay plaintext.
+    //
+    // v1.0.0 #2383 (N1) — the seal is keyed to the identity the SURVIVING row
+    // RETAINS, not to the incoming writer. The `ON CONFLICT` arm below keeps
+    // the existing row's `agent_id` (#1784) while taking the incoming
+    // envelope, so sealing to the incoming agent left the durable row keyed
+    // to one agent and attributed to another: unreadable, and (pre-#2383)
+    // namespace-poisoning on every scan. See `seal_content_for_upsert`.
+    // v1.0.0 #2383 (N1) — the at-rest seal pre-read, the upsert, and the
+    // post-write envelope-owner reconcile form ONE atomic unit: the pre-read
+    // decides which per-agent key the merged content is sealed to, and the
+    // reconcile repairs the row if a concurrent first-creation changed that
+    // answer. `BEGIN IMMEDIATE` takes the write lock up front (the
+    // `update_with_expected_version` / `consolidate` idiom) so no reader can
+    // observe an intermediate state and a failure rolls the whole write back.
+    //
+    // Taken ONLY under at-rest encryption AND only when this call owns the
+    // transaction: with encryption off the seal is a no-op, the pre-read is
+    // skipped and the reconcile returns immediately, so the default path is
+    // byte-identical to pre-#2383 (no extra statements, no lock change).
+    let owns_seal_tx = crate::encryption::encryption_enabled(None) && conn.is_autocommit();
+    if owns_seal_tx {
+        conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    }
+    let sealed_insert = (|| -> Result<String> {
+        let seal = seal_content_for_upsert(conn, mem)?;
+        let content_to_store = seal.content_to_store.as_str();
+        let encrypted_envelope: Option<&[u8]> = seal.envelope_bytes();
+        // v0.9.0 G8 (#1825) — stamp the additive content-id from the
+        // PLAINTEXT genesis identity, BEFORE the seal/placeholder swap above
+        // ever touched `content_to_store` (we hash `mem.content`, never the
+        // ciphertext placeholder). On an upsert conflict the surviving row
+        // keeps its own genesis (DO UPDATE SET cid = memories.cid), so this
+        // pair only lands on a fresh genesis INSERT.
+        let cid_stamp = crate::identity::cid::stamp_memory_cid(mem);
+        // v1.0.0 #1834 (pre-ship 3x7) — canonicalize the claim-bitemporal
+        // VALID-time bounds at the storage funnel so every caller (MCP / HTTP /
+        // CLI / federation / import / curator) persists the ONE fixed UTC
+        // rendering byte comparison is correct against. See
+        // `validate::canonicalize_valid_time`.
+        let valid_from_canon = crate::validate::canonical_valid_time_opt(mem.valid_from.as_deref());
+        let valid_until_canon =
+            crate::validate::canonical_valid_time_opt(mem.valid_until.as_deref());
+        // v1.0.0 #2332 (FBL-02) — canonicalize `expires_at` at the SAME funnel
+        // the v86 #1834 work canonicalized valid_from/valid_until: every expiry
+        // consumer (GC reap, recall/list visibility, the #1596 touch/fold MAX()
+        // floors) compares this TEXT column lexicographically against a
+        // UTC-rendered `now`, and a caller-supplied non-UTC offset rendering
+        // orders wrongly as bytes (premature reap / over-retention / a voided
+        // extension floor). Unparseable values pass through byte-for-byte
+        // (fail-safe — the validation gates already admitted them).
+        let effective_expires = mem.effective_expires_at();
+        let expires_canon = crate::validate::canonical_valid_time_opt(effective_expires.as_deref());
+        // #1579 B6 — `insert` is the hottest write statement in the
+        // substrate (every store / upsert / capture-turn / federation push
+        // lands here). `prepare_cached` skips the re-parse of this ~60-line
+        // upsert on every call after the first.
+        let mut insert_stmt = conn.prepare_cached(
+            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope, cid, cid_genesis, kind_provenance, valid_from, valid_until)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
+             ON CONFLICT(title, namespace) DO UPDATE SET
+                -- v0.9.0 G8 (#1825) — the surviving row KEEPS its own genesis
+                -- content-id + pre-image (self-assign, never the excluded
+                -- value): an upsert-merge mutates content but the memory's
+                -- GENESIS identity is fixed at creation.
+                cid = memories.cid,
+                cid_genesis = memories.cid_genesis,
+                content = excluded.content,
+                -- #228 Commit B — content + envelope move together on upsert so
+                -- a re-store under encryption replaces both the placeholder and
+                -- the ciphertext (and a re-store under encryption-off writes the
+                -- plaintext + NULL envelope, clearing any stale ciphertext).
+                encrypted_envelope = excluded.encrypted_envelope,
+                tags = excluded.tags,
+                priority = MAX(memories.priority, excluded.priority),
+                confidence = MAX(memories.confidence, excluded.confidence),
+                source = excluded.source,
+                tier = CASE WHEN excluded.tier = 'long' THEN 'long'
+                            WHEN memories.tier = 'long' THEN 'long'
+                            WHEN excluded.tier = 'mid' THEN 'mid'
+                            ELSE memories.tier END,
+                updated_at = excluded.updated_at,
+                expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
+                                  ELSE COALESCE(excluded.expires_at, memories.expires_at) END,
+                -- #1784 — preserve immutable provenance keys (agent_id + the
+                -- consolidation derived_from / consolidated_from_agents arrays)
+                -- across upsert. json_patch overlays the existing row's
+                -- provenance object on top of excluded (existing-wins) and
+                -- preserves nested array values that the prior agent_id-only
+                -- json_set handled but the array keys would have double-encoded.
+                metadata = json_patch(
+                    excluded.metadata,
+                    COALESCE(
+                        (SELECT json_group_object(key, value)
+                         FROM json_each(memories.metadata)
+                         WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents')),
+                        '{}'
+                    )
+                ),
+                -- v0.7.0 Task 1/8 — recursion depth takes the max across upsert
+                -- so a subsequent reflection at higher depth doesn't lose its
+                -- provenance signal when re-stored at the same (title, namespace).
+                reflection_depth = MAX(memories.reflection_depth, excluded.reflection_depth),
+                -- v0.7.0 L1-1 — kind is sticky: once Reflection, always Reflection.
+                -- An upsert of an observation onto an existing reflection row must
+                -- not downgrade the kind (reflect is not reversible by re-store).
+                -- v0.7.0 QW-2 — Persona is also sticky once set; the engine
+                -- writes new versions via fresh rows under a unique
+                -- `__persona_<entity>_v<n>` title rather than upsert.
+                memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
+                                   WHEN memories.memory_kind = 'persona' THEN 'persona'
+                                   ELSE excluded.memory_kind END,
+                -- v0.7.0 QW-2 — entity_id + persona_version stay attached to
+                -- the row they were minted with (Persona-kind upserts use
+                -- versioned titles so the conflict path is exercised only
+                -- on accidental same-title collisions).
+                entity_id = COALESCE(memories.entity_id, excluded.entity_id),
+                persona_version = COALESCE(memories.persona_version, excluded.persona_version),
+                -- v0.7.0 Form 4 — fact-provenance: when the incoming row
+                -- carries a non-empty citations array, replace the stored
+                -- value (caller re-asserted provenance); otherwise keep
+                -- the existing value (silent merge would lose freshly-cited
+                -- evidence). source_uri / source_span follow COALESCE
+                -- semantics so a new write that omits them does not blank
+                -- out existing provenance pointers.
+                citations = CASE WHEN excluded.citations = '[]'
+                                 THEN memories.citations
+                                 ELSE excluded.citations END,
+                source_uri = COALESCE(excluded.source_uri, memories.source_uri),
+                source_span = COALESCE(excluded.source_span, memories.source_span),
+                -- v0.7.0 Form 5 — confidence-provenance follows the same
+                -- shape as Form 4 columns: explicit non-default replaces;
+                -- caller_provided + NULL signals keep the existing
+                -- provenance signal so a re-store doesn't blank out an
+                -- auto-derived or calibrated value.
+                confidence_source = CASE WHEN excluded.confidence_source != 'caller_provided'
+                                         THEN excluded.confidence_source
+                                         ELSE memories.confidence_source END,
+                confidence_signals = COALESCE(excluded.confidence_signals, memories.confidence_signals),
+                confidence_decayed_at = COALESCE(excluded.confidence_decayed_at, memories.confidence_decayed_at),
+                -- v0.7.0 polish PERF-8 (#781) — denormalised mention tag.
+                -- COALESCE keeps any pre-existing tag (re-write that
+                -- omits the structured entity_id metadata should NOT
+                -- blank out the indexed column) while letting a fresh
+                -- extraction populate previously-NULL rows.
+                mentioned_entity_id = COALESCE(excluded.mentioned_entity_id, memories.mentioned_entity_id),
+                -- v0.8.0 Pillar 2 (#1709) — lifecycle_state is preserved across
+                -- a plain re-store: the stored value wins so a re-store of an
+                -- already-`active`/`done` row does NOT reset it to the incoming
+                -- (typically `open`) initial state. Lifecycle ADVANCES go
+                -- through the typed `memory_update` transition gate, never a
+                -- silent upsert.
+                lifecycle_state = memories.lifecycle_state,
+                -- #1632 — upsert-merge IS a mutation (content/tags/priority
+                -- can change), so the Gap-1 optimistic-concurrency counter
+                -- bumps here exactly like db::update. Pre-#1632 a re-store
+                -- rewrote content while version stood still, so a stale
+                -- If-Match could overwrite the merge invisibly. The decay
+                -- sweep remains the only documented non-bumping mutator
+                -- (tests/non_version_bumping_sites_1036.rs).
+                version = memories.version + 1,
+                -- v1.0.0 (#1945) — the epistemic-typing provenance follows the
+                -- incoming write when it carries one, else keeps the stored
+                -- value (a re-store that omits the carrier must not blank an
+                -- existing marker). COALESCE, like the Form-4/5 columns above.
+                kind_provenance = COALESCE(excluded.kind_provenance, memories.kind_provenance),
+                -- v1.0.0 #1834 — claim-bitemporal validity. `valid_from` is
+                -- IMMUTABLE once set (a correction is a supersede, not a mutation),
+                -- so the stored value always wins on upsert. `valid_until` is the
+                -- one caller-updatable bound (closing a claim), so a re-store that
+                -- carries a non-NULL upper bound sets it; else the existing value
+                -- is kept (COALESCE, matching the Form-4/5 provenance columns).
+                valid_from = memories.valid_from,
+                valid_until = COALESCE(excluded.valid_until, memories.valid_until)
+             RETURNING id",
+        )?;
+        let kind_provenance_col = extract_kind_provenance(mem);
+        let actual_id: String = insert_stmt.query_row(
+            params![
+                mem.id,
+                mem.tier.as_str(),
+                mem.namespace,
+                mem.title,
+                content_to_store,
+                tags_json,
+                mem.priority,
+                mem.confidence,
+                mem.source,
+                mem.access_count,
+                mem.created_at,
+                mem.updated_at,
+                mem.last_accessed_at,
+                expires_canon,
+                metadata_json,
+                mem.reflection_depth,
+                mem.memory_kind.as_str(),
+                mem.entity_id,
+                mem.persona_version,
+                citations_json,
+                mem.source_uri,
+                source_span_json,
+                mem.confidence_source.as_str(),
+                confidence_signals_json,
+                mem.confidence_decayed_at,
+                mentioned_entity_id,
+                mem.lifecycle_state.as_str(),
+                encrypted_envelope,
+                cid_stamp.cid,
+                cid_stamp.genesis,
+                kind_provenance_col,
+                valid_from_canon,
+                valid_until_canon,
+            ],
+            |r| r.get(0),
+        )?;
+        // #2383 (N1) — invariant backstop: a non-NULL `encrypted_envelope`
+        // MUST open under the row's persisted `metadata.agent_id`.
+        reconcile_envelope_owner(conn, &actual_id, &mem.content, &seal)?;
+        Ok(actual_id)
+    })();
+    if owns_seal_tx {
+        match &sealed_insert {
+            Ok(_) => conn.execute_batch(connection::SQL_COMMIT)?,
+            Err(_) => {
+                let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            }
+        }
+    }
+    sealed_insert
 }
 
 /// v0.7.0 fix campaign R1-M3 (#690) — substrate-side `on_conflict`
@@ -1908,9 +2255,13 @@ pub fn get_many(conn: &Connection, ids: &[String]) -> Result<HashMap<String, Mem
             .join(",");
         let sql = format!("SELECT * FROM memories WHERE id IN ({placeholders})");
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), row_to_memory)?;
+        // v1.0.0 #2383 (N1) — bulk fetch is a discovery scan: an
+        // undecryptable row is omitted (WARN + metric) rather than failing
+        // the whole batch. Callers already treat a missing id as "not
+        // fetched" (see the doc comment above).
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), row_to_memory_scan)?;
         for r in rows {
-            let mem = r?;
+            let Some(mem) = r? else { continue };
             out.insert(mem.id.clone(), mem);
         }
     }
@@ -2645,13 +2996,20 @@ pub fn update_with_expected_version(
     // `sealed` is None so we write the plaintext verbatim and set the
     // envelope to NULL (clearing any stale ciphertext under encryption-off
     // — byte-identical to the pre-wiring path where the column was always
-    // NULL). agent_id is the resolved metadata NHI marker (the patch's
-    // metadata if supplied, else the existing row's), matching the seal
-    // key that `insert` used for this row. Both columns are SET together
-    // so content + envelope can never desynchronize.
-    let update_agent_id = metadata
-        .get("agent_id")
-        .and_then(|v| v.as_str())
+    // NULL). Both columns are SET together so content + envelope can never
+    // desynchronize.
+    //
+    // v1.0.0 #2383 (N1) — the seal key is the agent id the row will RETAIN,
+    // resolved the same way the SQL below resolves it: `json_patch(?10,
+    // <existing agent_id/derived_from/consolidated_from_agents>)` overlays
+    // the STORED row's provenance on top of the patch (existing-wins,
+    // #2106), so a patch that carries a different agent_id — or omits the
+    // key entirely — must NOT change which per-agent key the ciphertext is
+    // sealed to. Pre-#2383 this read the patch's metadata, so an omitting
+    // patch sealed to `""` (a hard fail-closed error on an encrypted
+    // deployment) and a differing one produced the #2383 unreadable row.
+    let update_agent_id = metadata_agent_id_slot(&existing.metadata)
+        .or_else(|| metadata_agent_id_slot(metadata))
         .unwrap_or("");
     let update_sealed = crate::encryption::seal_content(new_content, update_agent_id)?;
     let update_content_to_store = update_sealed
@@ -5411,8 +5769,12 @@ pub fn list(
     let params_refs: Vec<&dyn rusqlite::types::ToSql> =
         params_vec.iter().map(std::convert::AsRef::as_ref).collect();
     let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(params_refs.as_slice(), row_to_memory)?;
+    // v1.0.0 #2383 (N1) — SkipRow: one undecryptable row must never deny the
+    // whole namespace listing (the pre-fix `collect::<Result<_>>` did exactly
+    // that). `flatten` drops the skipped rows; real read errors still `?`.
+    let rows = stmt.query_map(params_refs.as_slice(), row_to_memory_scan)?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map(|rows| rows.into_iter().flatten().collect())
         .map_err(Into::into)
 }
 
@@ -5436,8 +5798,10 @@ pub(crate) fn memories_by_kind(
            AND (expires_at IS NULL OR expires_at > ?2)
          ORDER BY priority DESC, updated_at DESC",
     )?;
-    let rows = stmt.query_map(params![kind.as_str(), now], row_to_memory)?;
+    // v1.0.0 #2383 (N1) — discovery scan: skip undecryptable rows.
+    let rows = stmt.query_map(params![kind.as_str(), now], row_to_memory_scan)?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map(|rows| rows.into_iter().flatten().collect())
         .map_err(Into::into)
 }
 
@@ -5586,9 +5950,10 @@ pub fn search_with_source_uri(
                 caller, // ?15
                 uri,    // ?16
             ],
-            row_to_memory,
+            row_to_memory_scan,
         )?
         .collect::<rusqlite::Result<Vec<_>>>()
+        .map(|rows| rows.into_iter().flatten().collect())
         .map_err(Into::into)
     } else {
         stmt.query_map(
@@ -5609,9 +5974,10 @@ pub fn search_with_source_uri(
                 vis_o,
                 caller, // ?15
             ],
-            row_to_memory,
+            row_to_memory_scan,
         )?
         .collect::<rusqlite::Result<Vec<_>>>()
+        .map(|rows| rows.into_iter().flatten().collect())
         .map_err(Into::into)
     };
     rows
@@ -5678,9 +6044,11 @@ pub fn list_by_source_uri(
             vis_o,
             caller, // ?8
         ],
-        row_to_memory,
+        // v1.0.0 #2383 (N1) — discovery scan: skip undecryptable rows.
+        row_to_memory_scan,
     )?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map(|rows| rows.into_iter().flatten().collect())
         .map_err(Into::into)
 }
 
@@ -6191,8 +6559,14 @@ pub fn recall(
     let mut stmt = conn.prepare(&sql)?;
     // Bind ?13 only when the source-URI fragment is active; SQLite
     // errors on parameter-count mismatch.
-    let row_handler = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Memory, f64)> {
-        let mem = row_to_memory(row)?;
+    // v1.0.0 #2383 (N1) — `Ok(None)` = the row's at-rest envelope did not
+    // decrypt and was SKIPPED (WARN + metric). Recall is a best-effort
+    // relevance scan, so one poisoned row yields fewer matches instead of
+    // denying every recall in the namespace.
+    let row_handler = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Option<(Memory, f64)>> {
+        let Some(mem) = row_to_memory_scan(row)? else {
+            return Ok(None);
+        };
         // v0.7.0 Form 4 / v0.7.x Form 6 — name-based read for the
         // trailing score column. Switched from positional `row.get`
         // after schema v38 (citations, source_uri, source_span) and
@@ -6200,7 +6574,7 @@ pub fn recall(
         // shifted the trailing column's index; name-based reads
         // survive future column additions without further churn.
         let score: f64 = row.get("score")?;
-        Ok((mem, score))
+        Ok(Some((mem, score)))
     };
     let results: Vec<(Memory, f64)> = if let Some(ref uri_param) = source_uri_param {
         let rows = stmt.query_map(
@@ -6222,7 +6596,11 @@ pub fn recall(
             ],
             row_handler,
         )?;
+        // #2383 — `flatten` drops rows the mapper skipped (undecryptable).
         rows.collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect()
     } else {
         let rows = stmt.query_map(
             params![
@@ -6242,7 +6620,11 @@ pub fn recall(
             ],
             row_handler,
         )?;
+        // #2383 — `flatten` drops rows the mapper skipped (undecryptable).
         rows.collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect()
     };
 
     // Task 1.12: proximity boost when hierarchy expansion is active.
@@ -6517,9 +6899,11 @@ fn find_similar_title_candidates(
     )?;
     let rows = stmt.query_map(
         params![fts_query, namespace, i64::try_from(limit).unwrap_or(20)],
-        row_to_memory,
+        // v1.0.0 #2383 (N1) — discovery scan: skip undecryptable rows.
+        row_to_memory_scan,
     )?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map(|rows| rows.into_iter().flatten().collect())
         .map_err(Into::into)
 }
 
@@ -12845,226 +13229,248 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // plaintext under the LOCAL recipient key — the encrypted_envelope
     // moves together with content under the SAME newer-wins CASE so a
     // timestamp winner never desynchronizes placeholder vs ciphertext.
-    let agent_id = mem
-        .metadata
-        .get("agent_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let sealed = crate::encryption::seal_content(&mem.content, agent_id)?;
-    let content_to_store = sealed
-        .as_ref()
-        .map_or(mem.content.as_str(), |(_, ph)| ph.as_str());
-    let encrypted_envelope: Option<&[u8]> = sealed.as_ref().map(|(env, _)| env.as_slice());
-    // v0.9.0 G8 (#1825) — stamp the content-id from the inbound PLAINTEXT
-    // genesis identity. Because the cid is a deterministic,
-    // MODE-INDEPENDENT function of the genesis fields, recomputing it
-    // locally on a fresh federation insert yields the SAME `b3:` address
-    // the origin node minted (receive-time equivalence,
-    // `cross_node_same_genesis_same_cid`). On a `(title, namespace)`
-    // conflict the local row KEEPS its own genesis (DO UPDATE SET below).
-    let cid_stamp = crate::identity::cid::stamp_memory_cid(mem);
-    // #1579 B6 — federation catch-up replays this newer-wins upsert
-    // once per pulled row; `prepare_cached` amortises the parse of the
-    // largest SQL statement in the file across the whole batch.
-    let mut newer_wins_stmt = conn.prepare_cached(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version, lifecycle_state, encrypted_envelope, cid, cid_genesis, valid_from, valid_until, kind_provenance)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)
-         ON CONFLICT(title, namespace) DO UPDATE SET
-            -- v0.9.0 G8 (#1825) — a federation merge NEVER overwrites the
-            -- surviving local row's genesis content-id: keep the local
-            -- `cid` / `cid_genesis` (self-assign, not excluded) so
-            -- `federation_merge_preserves_local_cid` holds.
-            cid = memories.cid,
-            cid_genesis = memories.cid_genesis,
-            content = CASE WHEN excluded.updated_at > memories.updated_at
-                             OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                           THEN excluded.content ELSE memories.content END,
-            -- #228 Commit B — the at-rest ciphertext envelope moves with
-            -- `content` under the IDENTICAL newer-wins tiebreak so the
-            -- placeholder and its ciphertext are never split across the
-            -- winner boundary (a winner's placeholder with the loser's
-            -- ciphertext would be undecryptable).
-            encrypted_envelope = CASE WHEN excluded.updated_at > memories.updated_at
-                                        OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                                      THEN excluded.encrypted_envelope ELSE memories.encrypted_envelope END,
-            tags = CASE WHEN excluded.updated_at > memories.updated_at
-                          OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                        THEN excluded.tags ELSE memories.tags END,
-            priority = MAX(memories.priority, excluded.priority),
-            confidence = MAX(memories.confidence, excluded.confidence),
-            source = CASE WHEN excluded.updated_at > memories.updated_at
-                            OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                          THEN excluded.source ELSE memories.source END,
-            tier = CASE WHEN excluded.tier = 'long' THEN 'long'
-                        WHEN memories.tier = 'long' THEN 'long'
-                        WHEN excluded.tier = 'mid' THEN 'mid'
-                        ELSE memories.tier END,
-            updated_at = MAX(memories.updated_at, excluded.updated_at),
-            access_count = MAX(memories.access_count, excluded.access_count),
-            -- v1.0.0 #2335 (FBL-20) — expires_at was the ONLY LWW-class
-            -- column with NO newer-wins guard: the bare
-            -- COALESCE(excluded.expires_at, memories.expires_at) adopted a
-            -- STALE losing peer's expiry verbatim, silently shortening a
-            -- live row's TTL (recall fold-extensions raise expires_at
-            -- WITHOUT bumping updated_at, so routine bidirectional sync
-            -- rolled local extensions back and GC reaped early — with the
-            -- v70 auto-eviction posture that is permanent link-edge loss).
-            -- The merge is now the extension-FLOOR lattice join (scalar
-            -- MAX, both operands funnel-canonicalized per #2332 so byte
-            -- order is chronological): both replicas converge to the LATER
-            -- expiry regardless of push order (MAX is commutative /
-            -- idempotent — a true CRDT join, strictly stronger than the
-            -- updated_at tiebreak for this column), and the #1596
-            -- never-move-expiry-earlier contract holds across federation.
-            -- The long⇒NULL arm keeps the #1626 immortality coupling.
-            expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
-                              ELSE MAX(COALESCE(excluded.expires_at, memories.expires_at),
-                                       COALESCE(memories.expires_at, excluded.expires_at)) END,
-            -- #1784 — preserve immutable provenance keys (agent_id + the
-            -- consolidation derived_from / consolidated_from_agents arrays)
-            -- across a newer-wins merge: json_patch overlays the existing
-            -- row's provenance object (existing-wins, array-safe) on top of
-            -- the newer-wins base (excluded if newer, else the existing row).
-            metadata = json_patch(
-                CASE WHEN excluded.updated_at > memories.updated_at
-                          OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                     THEN excluded.metadata
-                     ELSE memories.metadata END,
-                COALESCE(
-                    (SELECT json_group_object(key, value)
-                     FROM json_each(memories.metadata)
-                     WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents')),
-                    '{}'
-                )
-            ),
-            -- v0.7.0 Task 1/8 — recursion depth takes max so the reflection
-            -- signal isn't lost on newer-wins federation merges.
-            reflection_depth = MAX(memories.reflection_depth, excluded.reflection_depth),
-            -- v0.7.0 L1-1 — kind is sticky across federation merges: a
-            -- reflection row must not be downgraded to observation by a
-            -- newer-wins merge from a peer that doesn't know about the kind.
-            -- v0.7.0 QW-2 — Persona is similarly sticky.
-            memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
-                               WHEN memories.memory_kind = 'persona' THEN 'persona'
-                               ELSE excluded.memory_kind END,
-            -- v0.7.0 QW-2 — entity_id + persona_version are immutable
-            -- once set so a federation merge can't drop the persona
-            -- discriminator off a `memory_kind = 'persona'` row.
-            entity_id = COALESCE(memories.entity_id, excluded.entity_id),
-            persona_version = COALESCE(memories.persona_version, excluded.persona_version),
-            -- v0.7.0 Form 4 — fact-provenance: replace the stored
-            -- citations array only when the incoming row wins the
-            -- newer-wins tiebreak; source_uri / source_span follow
-            -- COALESCE semantics so a federation merge that lacks
-            -- provenance does not blank out a value the local row
-            -- already had.
-            citations = CASE WHEN excluded.updated_at > memories.updated_at
-                                  OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                             THEN excluded.citations ELSE memories.citations END,
-            source_uri = COALESCE(excluded.source_uri, memories.source_uri),
-            source_span = COALESCE(excluded.source_span, memories.source_span),
-            -- v0.7.0 Form 5 — confidence-provenance follows the newer-
-            -- wins shape established for the other Form 4 columns.
-            -- A peer pushing an auto-derived/calibrated value wins on
-            -- the timestamp tiebreak; otherwise the local row's
-            -- provenance is preserved so a stale peer cannot blank out
-            -- a fresher local calibration.
-            confidence_source = CASE WHEN excluded.updated_at > memories.updated_at
-                                          OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                                     THEN excluded.confidence_source ELSE memories.confidence_source END,
-            confidence_signals = CASE WHEN excluded.updated_at > memories.updated_at
-                                           OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                                      THEN excluded.confidence_signals ELSE memories.confidence_signals END,
-            confidence_decayed_at = CASE WHEN excluded.updated_at > memories.updated_at
-                                              OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                                         THEN excluded.confidence_decayed_at ELSE memories.confidence_decayed_at END,
-            -- v0.7.0 polish PERF-8 (#781) — newer-wins on the mention
-            -- tag (the winning row's content is the one a future matcher
-            -- query expects to find); otherwise preserve the local tag
-            -- so a stale peer that lacks the structured entity_id
-            -- metadata cannot blank out a value the index serves.
-            mentioned_entity_id = CASE WHEN excluded.updated_at > memories.updated_at
-                                            OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                                       THEN COALESCE(excluded.mentioned_entity_id, memories.mentioned_entity_id)
-                                       ELSE memories.mentioned_entity_id END,
-            -- #1631 (decide-once, #1029 contract) — `version` IS
-            -- replicated state on the federation merge path: merge via
-            -- MAX(local, remote) so an out-of-order peer push can't
-            -- roll the Gap-1 optimistic-concurrency counter backwards.
-            -- Matches the pg `apply_remote_memory` GREATEST arm.
-            version = MAX(memories.version, excluded.version),
-            -- v0.8.0 Pillar 2 (#1709) — lifecycle_state on the newer-wins
-            -- federation merge: the timestamp winner's state is adopted so
-            -- a peer that advanced a Goal open→done replicates that state;
-            -- a stale peer push (loses the tiebreak) preserves the local
-            -- lifecycle. Transition legality is enforced at the originating
-            -- update site, so the replicated value is already-validated.
-            lifecycle_state = CASE WHEN excluded.updated_at > memories.updated_at
-                                        OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                                   THEN excluded.lifecycle_state ELSE memories.lifecycle_state END,
-            -- v1.0.0 #2333 (FBL-03) — stamp/merge the v79 denormalized
-            -- kind_provenance on the federation funnel (pg 13949 parity:
-            -- COALESCE keeps the local value when the peer carries none).
-            kind_provenance = COALESCE(excluded.kind_provenance, memories.kind_provenance),
-            -- v1.0.0 #1834 — claim-bitemporal validity under federation LWW.
-            -- `valid_from` is immutable (local genesis wins, like `cid`);
-            -- `valid_until` follows the newer-wins tiebreak so a peer that
-            -- CLOSED a claim (set the upper bound) replicates that close.
-            valid_from = memories.valid_from,
-            valid_until = CASE WHEN excluded.updated_at > memories.updated_at
+    //
+    // v1.0.0 #2383 (N1) — federation twin of the `insert_inner` fix: the
+    // newer-wins arm takes the INCOMING envelope but the metadata overlay
+    // keeps the LOCAL row's `agent_id` (#1784), so sealing to the inbound
+    // peer's agent left a row nothing could decrypt. Seal to the identity the
+    // surviving row RETAINS instead. A losing inbound row keeps the local
+    // envelope, which is already consistent — nothing to reconcile there.
+    // v1.0.0 #2383 (N1) — same atomic seal/upsert/reconcile unit as
+    // `insert_inner`: only taken under at-rest encryption, and only when this
+    // call owns the transaction (the federation receive loop wraps batches in
+    // its own tx). Encryption off ⇒ byte-identical to pre-#2383.
+    let owns_seal_tx = crate::encryption::encryption_enabled(None) && conn.is_autocommit();
+    if owns_seal_tx {
+        conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    }
+    let sealed_merge = (|| -> Result<String> {
+        let seal = seal_content_for_upsert(conn, mem)?;
+        let content_to_store = seal.content_to_store.as_str();
+        let encrypted_envelope: Option<&[u8]> = seal.envelope_bytes();
+        // v0.9.0 G8 (#1825) — stamp the content-id from the inbound PLAINTEXT
+        // genesis identity. Because the cid is a deterministic,
+        // MODE-INDEPENDENT function of the genesis fields, recomputing it
+        // locally on a fresh federation insert yields the SAME `b3:` address
+        // the origin node minted (receive-time equivalence,
+        // `cross_node_same_genesis_same_cid`). On a `(title, namespace)`
+        // conflict the local row KEEPS its own genesis (DO UPDATE SET below).
+        let cid_stamp = crate::identity::cid::stamp_memory_cid(mem);
+        // #1579 B6 — federation catch-up replays this newer-wins upsert
+        // once per pulled row; `prepare_cached` amortises the parse of the
+        // largest SQL statement in the file across the whole batch.
+        let mut newer_wins_stmt = conn.prepare_cached(
+            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version, lifecycle_state, encrypted_envelope, cid, cid_genesis, valid_from, valid_until, kind_provenance)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)
+             ON CONFLICT(title, namespace) DO UPDATE SET
+                -- v0.9.0 G8 (#1825) — a federation merge NEVER overwrites the
+                -- surviving local row's genesis content-id: keep the local
+                -- `cid` / `cid_genesis` (self-assign, not excluded) so
+                -- `federation_merge_preserves_local_cid` holds.
+                cid = memories.cid,
+                cid_genesis = memories.cid_genesis,
+                content = CASE WHEN excluded.updated_at > memories.updated_at
                                  OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                               THEN excluded.valid_until ELSE memories.valid_until END
-         RETURNING id",
-    )?;
-    let actual_id: String = newer_wins_stmt.query_row(
-        params![
-            mem.id,
-            mem.tier.as_str(),
-            mem.namespace,
-            mem.title,
-            content_to_store,
-            tags_json,
-            mem.priority,
-            mem.confidence,
-            mem.source,
-            mem.access_count,
-            mem.created_at,
-            mem.updated_at,
-            mem.last_accessed_at,
-            // v1.0.0 #2332 (FBL-02) — canonical fixed-UTC expiry rendering at
-            // the federation-receive funnel too (the v86 valid_* precedent
-            // below): a peer's offset rendering must never mis-order against
-            // the local GC / recall / floor predicates.
-            crate::validate::canonical_valid_time_opt(mem.effective_expires_at().as_deref()),
-            metadata_json,
-            mem.reflection_depth,
-            mem.memory_kind.as_str(),
-            mem.entity_id,
-            mem.persona_version,
-            citations_json,
-            mem.source_uri,
-            source_span_json,
-            mem.confidence_source.as_str(),
-            confidence_signals_json,
-            mem.confidence_decayed_at,
-            mentioned_entity_id,
-            mem.version,
-            mem.lifecycle_state.as_str(),
-            encrypted_envelope,
-            cid_stamp.cid,
-            cid_stamp.genesis,
-            // v1.0.0 #1834 (pre-ship 3x7) — canonical fixed-UTC rendering at
-            // the federation-receive funnel too, so a peer's `Z` / offset
-            // rendering can never mis-order against a local `+00:00` row.
-            crate::validate::canonical_valid_time_opt(mem.valid_from.as_deref()),
-            crate::validate::canonical_valid_time_opt(mem.valid_until.as_deref()),
-            // v1.0.0 #2333 (FBL-03) — denormalize the v79 kind_provenance
-            // from the metadata carrier on the federation funnel (?34).
-            extract_kind_provenance(mem),
-        ],
-        |r| r.get(0),
-    )?;
-    Ok(actual_id)
+                               THEN excluded.content ELSE memories.content END,
+                -- #228 Commit B — the at-rest ciphertext envelope moves with
+                -- `content` under the IDENTICAL newer-wins tiebreak so the
+                -- placeholder and its ciphertext are never split across the
+                -- winner boundary (a winner's placeholder with the loser's
+                -- ciphertext would be undecryptable).
+                encrypted_envelope = CASE WHEN excluded.updated_at > memories.updated_at
+                                            OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                                          THEN excluded.encrypted_envelope ELSE memories.encrypted_envelope END,
+                tags = CASE WHEN excluded.updated_at > memories.updated_at
+                              OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                            THEN excluded.tags ELSE memories.tags END,
+                priority = MAX(memories.priority, excluded.priority),
+                confidence = MAX(memories.confidence, excluded.confidence),
+                source = CASE WHEN excluded.updated_at > memories.updated_at
+                                OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                              THEN excluded.source ELSE memories.source END,
+                tier = CASE WHEN excluded.tier = 'long' THEN 'long'
+                            WHEN memories.tier = 'long' THEN 'long'
+                            WHEN excluded.tier = 'mid' THEN 'mid'
+                            ELSE memories.tier END,
+                updated_at = MAX(memories.updated_at, excluded.updated_at),
+                access_count = MAX(memories.access_count, excluded.access_count),
+                -- v1.0.0 #2335 (FBL-20) — expires_at was the ONLY LWW-class
+                -- column with NO newer-wins guard: the bare
+                -- COALESCE(excluded.expires_at, memories.expires_at) adopted a
+                -- STALE losing peer's expiry verbatim, silently shortening a
+                -- live row's TTL (recall fold-extensions raise expires_at
+                -- WITHOUT bumping updated_at, so routine bidirectional sync
+                -- rolled local extensions back and GC reaped early — with the
+                -- v70 auto-eviction posture that is permanent link-edge loss).
+                -- The merge is now the extension-FLOOR lattice join (scalar
+                -- MAX, both operands funnel-canonicalized per #2332 so byte
+                -- order is chronological): both replicas converge to the LATER
+                -- expiry regardless of push order (MAX is commutative /
+                -- idempotent — a true CRDT join, strictly stronger than the
+                -- updated_at tiebreak for this column), and the #1596
+                -- never-move-expiry-earlier contract holds across federation.
+                -- The long⇒NULL arm keeps the #1626 immortality coupling.
+                expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
+                                  ELSE MAX(COALESCE(excluded.expires_at, memories.expires_at),
+                                           COALESCE(memories.expires_at, excluded.expires_at)) END,
+                -- #1784 — preserve immutable provenance keys (agent_id + the
+                -- consolidation derived_from / consolidated_from_agents arrays)
+                -- across a newer-wins merge: json_patch overlays the existing
+                -- row's provenance object (existing-wins, array-safe) on top of
+                -- the newer-wins base (excluded if newer, else the existing row).
+                metadata = json_patch(
+                    CASE WHEN excluded.updated_at > memories.updated_at
+                              OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                         THEN excluded.metadata
+                         ELSE memories.metadata END,
+                    COALESCE(
+                        (SELECT json_group_object(key, value)
+                         FROM json_each(memories.metadata)
+                         WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents')),
+                        '{}'
+                    )
+                ),
+                -- v0.7.0 Task 1/8 — recursion depth takes max so the reflection
+                -- signal isn't lost on newer-wins federation merges.
+                reflection_depth = MAX(memories.reflection_depth, excluded.reflection_depth),
+                -- v0.7.0 L1-1 — kind is sticky across federation merges: a
+                -- reflection row must not be downgraded to observation by a
+                -- newer-wins merge from a peer that doesn't know about the kind.
+                -- v0.7.0 QW-2 — Persona is similarly sticky.
+                memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
+                                   WHEN memories.memory_kind = 'persona' THEN 'persona'
+                                   ELSE excluded.memory_kind END,
+                -- v0.7.0 QW-2 — entity_id + persona_version are immutable
+                -- once set so a federation merge can't drop the persona
+                -- discriminator off a `memory_kind = 'persona'` row.
+                entity_id = COALESCE(memories.entity_id, excluded.entity_id),
+                persona_version = COALESCE(memories.persona_version, excluded.persona_version),
+                -- v0.7.0 Form 4 — fact-provenance: replace the stored
+                -- citations array only when the incoming row wins the
+                -- newer-wins tiebreak; source_uri / source_span follow
+                -- COALESCE semantics so a federation merge that lacks
+                -- provenance does not blank out a value the local row
+                -- already had.
+                citations = CASE WHEN excluded.updated_at > memories.updated_at
+                                      OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                                 THEN excluded.citations ELSE memories.citations END,
+                source_uri = COALESCE(excluded.source_uri, memories.source_uri),
+                source_span = COALESCE(excluded.source_span, memories.source_span),
+                -- v0.7.0 Form 5 — confidence-provenance follows the newer-
+                -- wins shape established for the other Form 4 columns.
+                -- A peer pushing an auto-derived/calibrated value wins on
+                -- the timestamp tiebreak; otherwise the local row's
+                -- provenance is preserved so a stale peer cannot blank out
+                -- a fresher local calibration.
+                confidence_source = CASE WHEN excluded.updated_at > memories.updated_at
+                                              OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                                         THEN excluded.confidence_source ELSE memories.confidence_source END,
+                confidence_signals = CASE WHEN excluded.updated_at > memories.updated_at
+                                               OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                                          THEN excluded.confidence_signals ELSE memories.confidence_signals END,
+                confidence_decayed_at = CASE WHEN excluded.updated_at > memories.updated_at
+                                                  OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                                             THEN excluded.confidence_decayed_at ELSE memories.confidence_decayed_at END,
+                -- v0.7.0 polish PERF-8 (#781) — newer-wins on the mention
+                -- tag (the winning row's content is the one a future matcher
+                -- query expects to find); otherwise preserve the local tag
+                -- so a stale peer that lacks the structured entity_id
+                -- metadata cannot blank out a value the index serves.
+                mentioned_entity_id = CASE WHEN excluded.updated_at > memories.updated_at
+                                                OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                                           THEN COALESCE(excluded.mentioned_entity_id, memories.mentioned_entity_id)
+                                           ELSE memories.mentioned_entity_id END,
+                -- #1631 (decide-once, #1029 contract) — `version` IS
+                -- replicated state on the federation merge path: merge via
+                -- MAX(local, remote) so an out-of-order peer push can't
+                -- roll the Gap-1 optimistic-concurrency counter backwards.
+                -- Matches the pg `apply_remote_memory` GREATEST arm.
+                version = MAX(memories.version, excluded.version),
+                -- v0.8.0 Pillar 2 (#1709) — lifecycle_state on the newer-wins
+                -- federation merge: the timestamp winner's state is adopted so
+                -- a peer that advanced a Goal open→done replicates that state;
+                -- a stale peer push (loses the tiebreak) preserves the local
+                -- lifecycle. Transition legality is enforced at the originating
+                -- update site, so the replicated value is already-validated.
+                lifecycle_state = CASE WHEN excluded.updated_at > memories.updated_at
+                                            OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                                       THEN excluded.lifecycle_state ELSE memories.lifecycle_state END,
+                -- v1.0.0 #2333 (FBL-03) — stamp/merge the v79 denormalized
+                -- kind_provenance on the federation funnel (pg 13949 parity:
+                -- COALESCE keeps the local value when the peer carries none).
+                kind_provenance = COALESCE(excluded.kind_provenance, memories.kind_provenance),
+                -- v1.0.0 #1834 — claim-bitemporal validity under federation LWW.
+                -- `valid_from` is immutable (local genesis wins, like `cid`);
+                -- `valid_until` follows the newer-wins tiebreak so a peer that
+                -- CLOSED a claim (set the upper bound) replicates that close.
+                valid_from = memories.valid_from,
+                valid_until = CASE WHEN excluded.updated_at > memories.updated_at
+                                     OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                                   THEN excluded.valid_until ELSE memories.valid_until END
+             RETURNING id",
+        )?;
+        let actual_id: String = newer_wins_stmt.query_row(
+            params![
+                mem.id,
+                mem.tier.as_str(),
+                mem.namespace,
+                mem.title,
+                content_to_store,
+                tags_json,
+                mem.priority,
+                mem.confidence,
+                mem.source,
+                mem.access_count,
+                mem.created_at,
+                mem.updated_at,
+                mem.last_accessed_at,
+                // v1.0.0 #2332 (FBL-02) — canonical fixed-UTC expiry rendering at
+                // the federation-receive funnel too (the v86 valid_* precedent
+                // below): a peer's offset rendering must never mis-order against
+                // the local GC / recall / floor predicates.
+                crate::validate::canonical_valid_time_opt(mem.effective_expires_at().as_deref()),
+                metadata_json,
+                mem.reflection_depth,
+                mem.memory_kind.as_str(),
+                mem.entity_id,
+                mem.persona_version,
+                citations_json,
+                mem.source_uri,
+                source_span_json,
+                mem.confidence_source.as_str(),
+                confidence_signals_json,
+                mem.confidence_decayed_at,
+                mentioned_entity_id,
+                mem.version,
+                mem.lifecycle_state.as_str(),
+                encrypted_envelope,
+                cid_stamp.cid,
+                cid_stamp.genesis,
+                // v1.0.0 #1834 (pre-ship 3x7) — canonical fixed-UTC rendering at
+                // the federation-receive funnel too, so a peer's `Z` / offset
+                // rendering can never mis-order against a local `+00:00` row.
+                crate::validate::canonical_valid_time_opt(mem.valid_from.as_deref()),
+                crate::validate::canonical_valid_time_opt(mem.valid_until.as_deref()),
+                // v1.0.0 #2333 (FBL-03) — denormalize the v79 kind_provenance
+                // from the metadata carrier on the federation funnel (?34).
+                extract_kind_provenance(mem),
+            ],
+            |r| r.get(0),
+        )?;
+        // #2383 (N1) — invariant backstop; a no-op when the inbound row lost
+        // the newer-wins tiebreak (our envelope is not the one on the row).
+        reconcile_envelope_owner(conn, &actual_id, &mem.content, &seal)?;
+        Ok(actual_id)
+    })();
+    if owns_seal_tx {
+        match &sealed_merge {
+            Ok(_) => conn.execute_batch(connection::SQL_COMMIT)?,
+            Err(_) => {
+                let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            }
+        }
+    }
+    sealed_merge
 }
 
 /// v0.8.0 Pillar-3 (#1709 / #224) — federation conflict-path entry that
@@ -14892,19 +15298,23 @@ fn fts_keyword_phase(
     // prepare_cached amortises re-parsing across recalls (shape cardinality
     // is small: the optional fragments expand to a handful of variants).
     let mut fts_stmt = conn.prepare_cached(&fts_sql)?;
-    let fts_row_handler =
-        |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Memory, f64, Option<Vec<u8>>, Option<String>)> {
-            let mem = row_to_memory(row)?;
-            let fts_score: f64 = row.get("fts_score")?;
-            // Index 25 = `m.embedding` (the SELECT list above places it
-            // after `confidence_decayed_at`). Pull as `Option<Vec<u8>>`
-            // so legacy rows without embeddings surface as `None`.
-            let embedding_bytes: Option<Vec<u8>> = row.get(25)?;
-            // v1.0.0 #2167 — index 27 = `m.embedding_space` (after
-            // `m.encrypted_envelope` at 26). `None` = SQL NULL (unverified).
-            let embedding_space: Option<String> = row.get(27)?;
-            Ok((mem, fts_score, embedding_bytes, embedding_space))
+    let fts_row_handler = |row: &rusqlite::Row<'_>| -> rusqlite::Result<
+        Option<(Memory, f64, Option<Vec<u8>>, Option<String>)>,
+    > {
+        // v1.0.0 #2383 (N1) — see `row_handler` above: skip, don't deny.
+        let Some(mem) = row_to_memory_scan(row)? else {
+            return Ok(None);
         };
+        let fts_score: f64 = row.get("fts_score")?;
+        // Index 25 = `m.embedding` (the SELECT list above places it
+        // after `confidence_decayed_at`). Pull as `Option<Vec<u8>>`
+        // so legacy rows without embeddings surface as `None`.
+        let embedding_bytes: Option<Vec<u8>> = row.get(25)?;
+        // v1.0.0 #2167 — index 27 = `m.embedding_space` (after
+        // `m.encrypted_envelope` at 26). `None` = SQL NULL (unverified).
+        let embedding_space: Option<String> = row.get(27)?;
+        Ok(Some((mem, fts_score, embedding_bytes, embedding_space)))
+    };
     let (vis_p, vis_t, vis_u, vis_o) = prep.prefixes.clone();
     let caller = prep.caller.as_deref();
     let rows: Vec<(Memory, f64, Option<Vec<u8>>, Option<String>)> =
@@ -14930,6 +15340,9 @@ fn fts_keyword_phase(
                     fts_row_handler,
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect()
         } else {
             fts_stmt
                 .query_map(
@@ -14951,6 +15364,9 @@ fn fts_keyword_phase(
                     fts_row_handler,
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect()
         };
     Ok(rows)
 }
@@ -15302,19 +15718,23 @@ fn semantic_phase(
     );
     // #1579 B6 — same prepare_cached treatment as the FTS branch above.
     let mut sem_stmt = conn.prepare_cached(&sem_sql)?;
-    let sem_row_handler =
-        |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Memory, Option<Vec<u8>>, Option<String>)> {
-            let mem = row_to_memory(row)?;
-            // v0.7.x Form 6 — `memory_kind` was inserted between
-            // `reflection_depth` and `embedding` in the SELECT list
-            // above; `embedding` sits at zero-based index 17.
-            let emb_bytes: Option<Vec<u8>> = row.get(17)?;
-            // v1.0.0 #2167 — `embedding_space` appended AFTER
-            // `encrypted_envelope` (index 18) so the pinned `row.get(17)`
-            // for `embedding` stays valid; read positionally at index 19.
-            let emb_space: Option<String> = row.get(19)?;
-            Ok((mem, emb_bytes, emb_space))
+    let sem_row_handler = |row: &rusqlite::Row<'_>| -> rusqlite::Result<
+        Option<(Memory, Option<Vec<u8>>, Option<String>)>,
+    > {
+        // v1.0.0 #2383 (N1) — see `row_handler` above: skip, don't deny.
+        let Some(mem) = row_to_memory_scan(row)? else {
+            return Ok(None);
         };
+        // v0.7.x Form 6 — `memory_kind` was inserted between
+        // `reflection_depth` and `embedding` in the SELECT list
+        // above; `embedding` sits at zero-based index 17.
+        let emb_bytes: Option<Vec<u8>> = row.get(17)?;
+        // v1.0.0 #2167 — `embedding_space` appended AFTER
+        // `encrypted_envelope` (index 18) so the pinned `row.get(17)`
+        // for `embedding` stays valid; read positionally at index 19.
+        let emb_space: Option<String> = row.get(19)?;
+        Ok(Some((mem, emb_bytes, emb_space)))
+    };
     let (vis_p, vis_t, vis_u, vis_o) = prep.prefixes.clone();
     let caller = prep.caller.as_deref();
     let sem_results: Vec<(Memory, Option<Vec<u8>>, Option<String>)> =
@@ -15338,6 +15758,9 @@ fn semantic_phase(
                     sem_row_handler,
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect()
         } else {
             sem_stmt
                 .query_map(
@@ -15357,6 +15780,9 @@ fn semantic_phase(
                     sem_row_handler,
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect()
         };
     for (mem, emb_bytes, emb_space) in sem_results {
         if scored.contains_key(&mem.id) {
@@ -16097,18 +16523,23 @@ pub fn memories_updated_since(
             let mut stmt = conn.prepare(&format!(
                 "{COLS} WHERE 1=1 {lifecycle_vis} ORDER BY updated_at ASC LIMIT ?1"
             ))?;
-            stmt.query_map(params![limit], row_to_memory)?
+            stmt.query_map(params![limit], row_to_memory_scan)?
                 .collect::<rusqlite::Result<Vec<_>>>()
         }
         Some(s) => {
             let mut stmt = conn.prepare(&format!(
                 "{COLS} WHERE updated_at > ?1 {lifecycle_vis} ORDER BY updated_at ASC LIMIT ?2"
             ))?;
-            stmt.query_map(params![s, limit], row_to_memory)?
+            stmt.query_map(params![s, limit], row_to_memory_scan)?
                 .collect::<rusqlite::Result<Vec<_>>>()
         }
     };
-    rows.map_err(Into::into)
+    // v1.0.0 #2383 (N1) — a row this node cannot decrypt cannot be relayed
+    // (the send path MUST ship plaintext, see the COLS note above), so it is
+    // SKIPPED with a WARN instead of failing the entire catch-up batch. It
+    // stays on disk and replicates as soon as its keypair is restored.
+    rows.map(|rows| rows.into_iter().flatten().collect())
+        .map_err(Into::into)
 }
 
 /// Deep health check — verifies DB is accessible and FTS is functional.
