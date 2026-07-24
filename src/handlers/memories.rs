@@ -302,6 +302,67 @@ pub async fn update_memory(
         // memory's owner. Pre-fix this hardcoded "ai:http" which made
         // every update appear as if from the legacy daemon principal.
         let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
+        // FBL-12 residual (#2378) — charge the storage-byte GROWTH of this
+        // in-place update against the row OWNER's per-namespace storage cap
+        // BEFORE the trait write lands, mirroring the sqlite branch below.
+        // The pre-#2378 postgres branch skipped the quota entirely, so an
+        // agent on a postgres daemon could grow each stored row toward
+        // MAX_CONTENT_SIZE while `current_storage_bytes` reflected only the
+        // store-time bytes — the per-agent storage-cap bypass FBL-12
+        // documented, un-fixed on the pg network surface. Keyed on the
+        // immutable row owner (`metadata.agent_id`) + effective namespace;
+        // a legacy-unowned row (empty owner) is uncharged, mirroring the
+        // create path. SAL new-operation recipe (prescribed precedent).
+        let existing_for_quota = app.store.get(&ctx, &id).await.ok();
+        let quota_charge: Option<(String, String, i64)> = match existing_for_quota.as_ref() {
+            Some(existing) => {
+                let owner = existing
+                    .metadata
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if owner.is_empty() {
+                    None
+                } else {
+                    let eff_ns = patch
+                        .namespace
+                        .as_deref()
+                        .unwrap_or(existing.namespace.as_str())
+                        .to_string();
+                    let new_meta = patch.metadata.as_ref().map_or_else(
+                        || existing.metadata.clone(),
+                        |m| crate::identity::preserve_provenance_keys(&existing.metadata, m),
+                    );
+                    let new_title = patch.title.as_deref().unwrap_or(existing.title.as_str());
+                    let new_content = patch
+                        .content
+                        .as_deref()
+                        .unwrap_or(existing.content.as_str());
+                    let new_bytes = crate::quotas::coordination_payload_bytes(
+                        &[new_title, new_content],
+                        &[&new_meta],
+                    );
+                    let old_bytes = crate::quotas::coordination_payload_bytes(
+                        &[&existing.title, &existing.content],
+                        &[&existing.metadata],
+                    );
+                    match app
+                        .store
+                        .charge_update_growth(&ctx, &owner, &eff_ns, old_bytes, new_bytes)
+                        .await
+                    {
+                        Ok(0) => None,
+                        Ok(delta) => Some((owner, eff_ns, delta)),
+                        // QuotaExceeded → 429 (full envelope) and every
+                        // other charge error → its typed status, both via
+                        // the shared `store_err_to_response` mapper.
+                        Err(e) => return store_err_to_response(e),
+                    }
+                }
+            }
+            None => None,
+        };
         // #1628 — honor `If-Match` on the postgres branch. Pre-fix the
         // parsed `if_match_version` was silently dropped here (the
         // trait `update` is last-write-wins), so stale writers clobbered
@@ -377,6 +438,23 @@ pub async fn update_memory(
                 response_body
             }
             Err(e) => {
+                // FBL-12 residual (#2378) — refund the growth charge when
+                // the write itself fails (e.g. a VersionConflict) so a
+                // retry storm on a conflicting update cannot slowly inflate
+                // the counter. Best-effort compensating decrement via the
+                // inherent pg helper (downcast, mirroring the If-Match
+                // path); the sqlite branch refunds via `refund_storage_only`.
+                #[cfg(feature = "sal-postgres")]
+                if let Some((ref owner, ref ns, delta)) = quota_charge
+                    && let Some(pg) = app
+                        .store
+                        .as_any()
+                        .downcast_ref::<crate::store::postgres::PostgresStore>()
+                {
+                    pg.refund_update_growth(owner, ns, delta).await;
+                }
+                #[cfg(not(feature = "sal-postgres"))]
+                let _ = &quota_charge;
                 // #1628 — map the version-gated conflict to the SAME
                 // 409 CONFLICT envelope the sqlite branch returns (see
                 // the `VersionConflict` downcast arm below): byte-equal

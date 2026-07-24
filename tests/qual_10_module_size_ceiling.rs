@@ -905,13 +905,17 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // sites with the deferred-drainer re-read (#2377); landed the file at
     // 30_150. Ceiling 30_040 -> 30_150 (+47 headroom).
     // 2026-07-24 (#2382 pg pending-action-timeout sweep) — the
-    // `PostgresStore::sweep_pending_action_timeouts` SAL trait impl
-    // (`UPDATE pending_actions SET status='expired',expired_at=NOW() ...
-    // RETURNING id,namespace`) + its `sweep_pending_action_timeouts_pg_*`
-    // sal-postgres regression coverage stack on top of the #2375-#2377 AGE
-    // merge, landing the file at 30_256. Ceiling 30_150 -> 30_320 (+64
-    // headroom). Module-split relief tracked under #650-class follow-ups.
-    ("src/store/postgres.rs", 30_320),
+    // `PostgresStore::sweep_pending_action_timeouts` SAL trait impl + its
+    // sal-postgres coverage landed the file at 30_256. Ceiling 30_150 -> 30_320.
+    // 2026-07-24 (#2378 FBL-12 residual pg PUT-quota) — the
+    // `PostgresStore::charge_update_growth` SAL trait impl (ensure-row + ONE
+    // TOCTOU-free conditional agent_quotas UPDATE + typed QuotaExceeded re-read)
+    // + the `refund_update_growth` compensating-decrement helper, so the
+    // postgres `PUT /memories/{id}` branch charges storage-growth quota (was
+    // ZERO-charge), stack on top of the #2382 merge and land the file at
+    // 30_377. Ceiling 30_320 -> 30_440 (+63 headroom). Module-split relief
+    // tracked under #650-class follow-ups.
+    ("src/store/postgres.rs", 30_440),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
