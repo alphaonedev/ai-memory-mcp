@@ -236,8 +236,15 @@ fn stamp_namespaces(payload: &mut Value, namespaces: &[String]) {
         return;
     };
     match namespaces {
+        // Nothing resolved. Drop only the key WE own; leave a caller/handler
+        // supplied `namespace` byte-untouched so existing payload shapes are
+        // preserved (notably `consult_pre_governance_decision_gate`, which
+        // deliberately carries `"namespace": ""` on the global-governance
+        // `memory_check_agent_action` surface — #2356). Fabricating or deleting
+        // a namespace here would be a lie either way, and it cannot re-open the
+        // scoping bypass: pre-event matching reads the substrate-resolved
+        // `namespaces` slice, never the payload.
         [] => {
-            obj.remove(PAYLOAD_KEY_NAMESPACE);
             obj.remove(PAYLOAD_KEY_NAMESPACES);
         }
         [one] => {
