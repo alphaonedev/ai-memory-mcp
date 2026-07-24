@@ -10892,9 +10892,21 @@ async fn pg_emit_audit_head_witness_in_tx(
     };
     let now = chrono::Utc::now().timestamp();
     // v1.0.0 #1946 A — bind the OSS rollback counter so the pg twin emits the
-    // same `v: 2` witness records as sqlite (K3 parity).
+    // same `v: 2`-lineage witness records as sqlite (K3 parity).
     let rollback = Some(witness::rollback_counter_for(signed_head_seq));
-    let cp = witness::build_signed_witness_checkpoint(&dual, rollback, now, &keypair)
+    // v1.0.0 #2370 — bind this database's genesis-derived identity (`v: 3`),
+    // derived from the SAME stable stored columns as the sqlite twin
+    // (id/agent_id/payload_hash — never a TIMESTAMPTZ readback, the #2203
+    // drift class). A legacy chain with NULL `sequence` (no seq=1 row, C2b)
+    // fetches no genesis and emits a v2 / db_id-less record.
+    let genesis: Option<(String, String, Vec<u8>)> =
+        sqlx::query_as(crate::signed_events::GENESIS_ROW_SQL)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let db_id = genesis.map(|(gid, gagent, gpayload)| {
+        crate::signed_events::db_id_from_genesis_parts(&gid, &gagent, &gpayload)
+    });
+    let cp = witness::build_signed_witness_checkpoint(&dual, rollback, db_id, now, &keypair)
         .map_err(|e| sqlx::Error::Encode(format!("audit-witness sign: {e:#}").into()))?;
     sqlx::query(
         "INSERT INTO checkpoints \
@@ -11399,8 +11411,15 @@ impl PostgresStore {
 
         // v1.0.0 #1946 D — rollback-evidence verdict from the SHARED off-table
         // anchor reader (backend-agnostic file logic), so the pg twin surfaces
-        // an IDENTICAL verdict to sqlite (K3 parity).
-        let rollback = crate::governance::audit::compute_rollback_verdict_for_report(head_sequence);
+        // an IDENTICAL verdict to sqlite (K3 parity). #2370: the pg CHECK side
+        // deliberately passes `db_id = None` this release — the conservative
+        // count-every-anchor posture, byte-identical to the pre-#2370 verdict
+        // (over-detect toward Evidence, never suppression). Postgres
+        // check-side db-id parity (threading an async genesis fetch into this
+        // sync-shared verdict fn) is tracked as the #2373 follow-up; the pg
+        // EMISSION side already stamps v3 db_id anchors above.
+        let rollback =
+            crate::governance::audit::compute_rollback_verdict_for_report(head_sequence, None);
 
         // v1.0.0 #1873 (CWE-354) — audit-head HASH-anchor check (postgres twin of
         // the sqlite `head_hash`, #2202). For every anchor that records a head hash

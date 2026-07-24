@@ -401,7 +401,13 @@ fn run_restore_attest(
     let db_head: i64 = conn
         .query_row(crate::signed_events::CHAIN_HEAD_SQL, [], |row| row.get(0))
         .unwrap_or(0);
-    let Some(old_head) = crate::governance::audit::read_head_anchor_high_water() else {
+    // #2370 — this database's genesis-derived identity: scopes BOTH the
+    // anchor high-water read below AND the signed sanction record, so the
+    // ceremony can neither read a sibling database's anchors nor mint a
+    // sanction replayable against one.
+    let db_id = crate::signed_events::genesis_db_id(&conn).ok().flatten();
+    let Some(old_head) = crate::governance::audit::read_head_anchor_high_water(db_id.as_deref())
+    else {
         bail!(
             "no pinnable off-table head anchor to attest against — enrol a witness key \
              (AI_MEMORY_WITNESS_KEY_DIR + AI_MEMORY_WITNESS_PUBKEY) and let the daemon anchor a head first"
@@ -445,8 +451,14 @@ fn run_restore_attest(
     let signing = crate::cli::rules::load_operator_signing_key_from_dir(&key_dir)
         .context("load operator signing key for restore-attest")?;
     let now = chrono::Utc::now().timestamp();
-    let line = crate::governance::audit::sign_restore_sanction(old_head, new_head, now, &signing)
-        .context("sign restore sanction")?;
+    let line = crate::governance::audit::sign_restore_sanction(
+        old_head,
+        new_head,
+        now,
+        &signing,
+        db_id.as_deref(),
+    )
+    .context("sign restore sanction")?;
     crate::governance::audit::append_restore_sanction(&line)
         .context("append restore sanction to off-table log")?;
     if args.json {
