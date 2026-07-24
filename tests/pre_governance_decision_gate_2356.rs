@@ -115,7 +115,9 @@ async fn post_memories(router: &axum::Router, body: &Value) -> (StatusCode, Valu
         .unwrap();
     let resp = router.clone().oneshot(req).await.unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, v)
 }

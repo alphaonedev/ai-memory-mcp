@@ -305,9 +305,8 @@ mod tests {
         let db = env.db_path.clone();
         let id = seed_memory(&db, "ns", "reserved-target", "cc");
         let mut args = promote_args(&id);
-        args.to_namespace = Some(
-            crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE.to_string(),
-        );
+        args.to_namespace =
+            Some(crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE.to_string());
         let mut out = env.output();
         let err = cmd_promote(&db, &args, false, Some("test-agent"), &mut out)
             .expect_err("reserved to_namespace must be refused");

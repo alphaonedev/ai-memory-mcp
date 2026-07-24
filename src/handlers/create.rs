@@ -89,8 +89,7 @@ pub(crate) fn http_pre_governance_decision_gate(
     agent_id: &str,
     memory_id: Option<&str>,
 ) -> Option<axum::response::Response> {
-    match crate::mcp::consult_pre_governance_decision_gate(namespace, action, agent_id, memory_id)
-    {
+    match crate::mcp::consult_pre_governance_decision_gate(namespace, action, agent_id, memory_id) {
         Ok(()) => None,
         Err(reason) => Some(
             (
@@ -972,8 +971,7 @@ async fn create_memory_postgres(
     let payload_for_pending = serde_json::to_value(&mem).unwrap_or_else(|_| json!({}));
     // #2356 (W1A6-03) — `pre_governance_decision` mandatory-hook-presence
     // consult BEFORE the governance decision dispatches (postgres branch).
-    if let Some(resp) = http_pre_governance_decision_gate(&mem.namespace, "store", agent_id, None)
-    {
+    if let Some(resp) = http_pre_governance_decision_gate(&mem.namespace, "store", agent_id, None) {
         return resp;
     }
     match app

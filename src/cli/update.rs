@@ -301,12 +301,11 @@ mod tests {
         let db = env.db_path.clone();
         let id = seed_memory(&db, "ns", "reserved-move", "content");
         let mut args = empty_args(&id);
-        args.namespace = Some(
-            crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE.to_string(),
-        );
+        args.namespace =
+            Some(crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE.to_string());
         let mut out = env.output();
-        let err = run(&db, &args, false, &mut out)
-            .expect_err("reserved namespace move must be refused");
+        let err =
+            run(&db, &args, false, &mut out).expect_err("reserved namespace move must be refused");
         assert!(err.to_string().contains("reserved"), "got: {err}");
     }
 

@@ -1670,10 +1670,7 @@ pub fn consult_pre_governance_decision_gate(
         "agent_id": agent_id,
     });
     if let (Some(id), Some(obj)) = (memory_id, payload.as_object_mut()) {
-        obj.insert(
-            "memory_id".to_string(),
-            Value::String(id.to_string()),
-        );
+        obj.insert("memory_id".to_string(), Value::String(id.to_string()));
     }
     consult_pre_event_gate(crate::hooks::HookEvent::PreGovernanceDecision, payload)
 }

@@ -544,9 +544,8 @@ mod tests {
         let db = env.db_path.clone();
         let cfg = config::AppConfig::default();
         let mut args = default_args();
-        args.namespace = Some(
-            crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE.to_string(),
-        );
+        args.namespace =
+            Some(crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE.to_string());
         let mut out = env.output();
         let err = run(&db, args, false, &cfg, Some("test-agent"), &mut out)
             .expect_err("reserved namespace must be refused");
