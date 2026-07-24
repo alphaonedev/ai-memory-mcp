@@ -950,7 +950,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // #2383 merge. Growth is documentation-heavy (each arm carries the
     // divergence rationale); the production SQL/bind delta is ~20 LOC.
     //
-    // Ceiling 31_050 -> 31_200 = the MEASURED post-rebase 31_055 + 145
+    // Ceiling 31_050 -> 31_200 = the MEASURED post-rebase 30_998 + 202
     // headroom. THIRD consecutive rebase of this one entry, and the lesson
     // the #2383 note above learned the hard way is now doctrine: MAX-WINS
     // ACROSS CANDIDATE CEILINGS IS NOT SUFFICIENT — concurrent lanes' line
