@@ -928,10 +928,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // + `seal_content_for_upsert(_batch)` + `reconcile_envelope_owner(_known)`,
     // the `DecryptFailurePolicy` split row-mapper, and the seal/reconcile
     // wiring across all 10 vulnerable write arms (incl. the new
-    // `apply_remote_memory` transaction). Rebased ON TOP OF the #2378 merge
-    // (MAX-WINS over its 30_440), landing the file at the measured size below.
-    // Ceiling 30_440 -> 30_900.
-    ("src/store/postgres.rs", 30_900),
+    // `apply_remote_memory` transaction). Rebased ON TOP OF the #2378 merge:
+    // MAX-WINS over the two candidate ceilings (release 30_440 vs this
+    // branch's pre-rebase 30_900) is 30_900, but the #2378 pg PUT-quota impl
+    // (+121) STACKS on the #2383 +518, so the rebased file MEASURES 30_906 —
+    // above BOTH candidates. Bumped to the real size, not the max candidate.
+    // Ceiling 30_440 -> 31_050 (+144 headroom).
+    ("src/store/postgres.rs", 31_050),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
