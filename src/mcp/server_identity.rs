@@ -94,7 +94,7 @@ use crate::models::field_names;
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, VerifyingKey};
 use serde_json::{Value, json};
 
 use crate::identity::keypair::AgentKeypair;
@@ -285,7 +285,11 @@ pub fn verify_signed_identity(block: &Value) -> Result<(), ed25519_dalek::Signat
         signed_at,
     };
     let canonical = canonical_bytes_for_identity(&identity).map_err(|_| make_err())?;
-    verifying_key.verify(&canonical, &signature)
+    // N24 (#2404) — verify_strict rejects non-canonical / small-order-component
+    // signatures (S-malleability); the plain `verify` accepts them. Ed25519
+    // signature-malleability hardening; mirrors the verify_strict sites in
+    // src/approvals.rs + src/inference/mod.rs.
+    verifying_key.verify_strict(&canonical, &signature)
 }
 
 #[cfg(test)]
