@@ -2132,11 +2132,15 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
             // Mirrors `insert`: seal content to the per-agent key when
             // enabled, store the placeholder + envelope; None (default)
             // stores plaintext verbatim with a NULL envelope.
-            let agent_id = mem
-                .metadata
-                .get("agent_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            //
+            // v1.0.0 #2383 (N1) — DELIBERATELY still the INCOMING agent id,
+            // NOT `seal_content_for_upsert`. This statement has NO `ON
+            // CONFLICT` arm: it REFUSES a `(title, namespace)` duplicate
+            // outright, so the row it writes is always a fresh genesis row
+            // whose retained `agent_id` IS the incoming one. There is no
+            // existing-wins overlay here and therefore no identity to
+            // reconcile against — adding the pre-read would be a pure cost.
+            let agent_id = memory_agent_id(mem);
             let sealed = crate::encryption::seal_content(&mem.content, agent_id)?;
             let content_to_store = sealed
                 .as_ref()
