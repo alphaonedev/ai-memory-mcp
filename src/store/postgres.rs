@@ -706,9 +706,13 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 // v70 = #1771 (v0.8.0, 5-agent vote 4d3ea1c5) — `archived_memory_links`
 //       edge-preservation snapshot table. Mirrors `memory_links` columns
 //       sans the `REFERENCES memories(id)` FK (archive table) + an
-//       `archived_at` stamp. Created on both backends for adapter-schema
-//       consistency; SQLite wires snapshot/restore this commit, postgres
-//       snapshot/restore is a tracked follow-up. Additive CREATE TABLE
+//       `archived_at` stamp. Created on both backends; the postgres
+//       snapshot/restore wiring SHIPPED (#2318 doc fix — it was long
+//       described here as "a tracked follow-up"): `forget` snapshots the
+//       victims' links when archiving, `archive_by_ids` snapshots per id,
+//       and `archive_restore` re-inserts every preserved edge whose both
+//       endpoints exist (pinned by
+//       `archive_restore_preserves_links_pg_1771`). Additive CREATE TABLE
 //       IF NOT EXISTS (v59/v60/v69 precedent) — replay-safe.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep.
 // v77 = #1869 (v0.9.0 P0-1 recall purity) — `folded` fold-state column
@@ -5023,7 +5027,7 @@ impl PostgresStore {
                      reflection_depth, atomised_into, atom_of, memory_kind,
                      entity_id, persona_version, citations, source_uri, source_span,
                      confidence_source, confidence_signals, confidence_decayed_at,
-                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
+                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, NOW(), $2, metadata,
@@ -5031,7 +5035,7 @@ impl PostgresStore {
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                  FROM memories WHERE id = $1",
             )
             .bind(id)
@@ -5447,7 +5451,7 @@ impl PostgresStore {
                  reflection_depth, atomised_into, atom_of, memory_kind,
                  entity_id, persona_version, citations, source_uri, source_span,
                  confidence_source, confidence_signals, confidence_decayed_at,
-                 mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
+                 mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, NOW(), 'superseded', metadata,
@@ -5455,7 +5459,7 @@ impl PostgresStore {
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
              FROM memories WHERE id = $1
              {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
         ))
@@ -5622,7 +5626,14 @@ impl PostgresStore {
         // to_tsvector(title||' '||content) per matched row.
         let rows = sqlx::query(&format!(
             "SELECT m.*,
-                    ts_rank(m.tsv, plainto_tsquery('english', $1)) AS rank
+                    ts_rank(m.tsv, plainto_tsquery('english', $1))
+                    -- v1.0.0 #2338 (FBL-33 pg mirror) — G7 soft-loser
+                    -- down-weight: a contradiction-conserved loser is
+                    -- multiplicatively penalized so it cannot outrank its
+                    -- winner at full score (reversible — clearing the
+                    -- marker restores rank; sqlite twin in db::recall).
+                    * (CASE WHEN (m.metadata->>'contradiction_soft_loser') = '1'
+                            THEN {soft_loser_factor} ELSE 1.0 END) AS rank
              FROM memories m
              WHERE m.tsv @@ plainto_tsquery('english', $1)
                AND ($2::text IS NULL OR m.namespace = $2)
@@ -5638,6 +5649,7 @@ impl PostgresStore {
              LIMIT $7",
             // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
             lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
+            soft_loser_factor = crate::storage::SOFT_LOSER_SCORE_FACTOR,
         ))
         .bind(query)
         .bind(filter.namespace.as_ref())
@@ -13529,45 +13541,61 @@ async fn record_memory_quota_in_tx(
     agent_id: &str,
     namespace: &str,
     bytes_added: i64,
+    enforce_ceilings: bool,
 ) -> StoreResult<()> {
-    let now = Utc::now();
-    sqlx::query(
-        "INSERT INTO agent_quotas (
-             agent_id, namespace,
-             max_memories_per_day, max_storage_bytes, max_links_per_day,
-             current_memories_today, current_storage_bytes, current_links_today,
-             day_started_at, created_at, updated_at
-         ) VALUES ($1, $2, $3, $4, $5, 1, $6, 0, $7, $7, $7)
-         ON CONFLICT (agent_id, namespace) DO UPDATE SET
-             current_memories_today = CASE
-                 WHEN date_trunc('day', agent_quotas.day_started_at) = date_trunc('day', $7)
-                     THEN agent_quotas.current_memories_today + 1
-                 ELSE 1
-             END,
-             current_links_today = CASE
-                 WHEN date_trunc('day', agent_quotas.day_started_at) = date_trunc('day', $7)
-                     THEN agent_quotas.current_links_today
-                 ELSE 0
-             END,
-             current_storage_bytes = agent_quotas.current_storage_bytes + EXCLUDED.current_storage_bytes,
-             day_started_at = CASE
-                 WHEN date_trunc('day', agent_quotas.day_started_at) = date_trunc('day', $7)
-                     THEN agent_quotas.day_started_at
-                 ELSE $7
-             END,
-             updated_at = $7",
+    record_memory_quota_batch_in_tx(tx, agent_id, namespace, 1, bytes_added, enforce_ceilings).await
+}
+
+/// #2311 — build the typed `QuotaExceeded` for a ceiling-guarded record
+/// statement that affected 0 rows (the DO UPDATE guard refused the
+/// increment). Re-reads the row IN THIS TX (same day-rolled projection as
+/// `check_memory_quota`) so the error names the limit that actually
+/// tripped with accurate current/max values.
+async fn quota_ceiling_exceeded_error(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    agent_id: &str,
+    namespace: &str,
+    memories_added: i64,
+    now: chrono::DateTime<Utc>,
+) -> StoreError {
+    let row: Result<(i64, i64, i64, i64), sqlx::Error> = sqlx::query_as(
+        "SELECT \
+             CASE WHEN date_trunc('day', day_started_at) = date_trunc('day', $3) \
+                  THEN current_memories_today ELSE 0 END, \
+             max_memories_per_day, \
+             current_storage_bytes, \
+             max_storage_bytes \
+         FROM agent_quotas WHERE agent_id = $1 AND namespace = $2",
     )
     .bind(agent_id)
     .bind(namespace)
-    .bind(quota_defaults().max_memories_per_day)
-    .bind(quota_defaults().max_storage_bytes)
-    .bind(quota_defaults().max_links_per_day)
-    .bind(bytes_added)
     .bind(now)
-    .execute(&mut **tx)
-    .await
-    .map_err(|e| to_store_err("record agent_quotas memory increment", e))?;
-    Ok(())
+    .fetch_one(&mut **tx)
+    .await;
+    match row {
+        Ok((effective_memories, max_memories, current_bytes, max_bytes)) => {
+            if effective_memories.saturating_add(memories_added) > max_memories {
+                StoreError::QuotaExceeded {
+                    agent_id: agent_id.to_string(),
+                    namespace: namespace.to_string(),
+                    limit: crate::quotas::QuotaLimit::MemoriesPerDay
+                        .as_str()
+                        .to_string(),
+                    current: effective_memories,
+                    max: max_memories,
+                }
+            } else {
+                StoreError::QuotaExceeded {
+                    agent_id: agent_id.to_string(),
+                    namespace: namespace.to_string(),
+                    limit: crate::quotas::QuotaLimit::StorageBytes.as_str().to_string(),
+                    current: current_bytes,
+                    max: max_bytes,
+                }
+            }
+        }
+        Err(e) => to_store_err("re-read agent_quotas after ceiling refusal", e),
+    }
 }
 
 /// #1481 — count-aware sibling of [`record_memory_quota_in_tx`] for the
@@ -13583,9 +13611,36 @@ async fn record_memory_quota_batch_in_tx(
     namespace: &str,
     memories_added: i64,
     bytes_added: i64,
+    enforce_ceilings: bool,
 ) -> StoreResult<()> {
     let now = Utc::now();
-    sqlx::query(
+    // #2311 — close the check-then-record TOCTOU for TENANT callers.
+    // `check_memory_quota` is a plain pooled read on a separate connection,
+    // so N concurrent writes could all pass the check below cap and all
+    // record (the exact race the sqlite `quotas::check_and_record` closes
+    // with BEGIN IMMEDIATE, #628 H12). When `enforce_ceilings` the DO
+    // UPDATE arm re-checks the day-rolled ceilings ATOMICALLY against the
+    // row it is about to increment; a refused increment affects 0 rows and
+    // maps to the typed `QuotaExceeded`, rolling the whole store tx back.
+    // The fresh-INSERT arm is not guarded (INSERT always reports 1 row):
+    // a first-ever write's ceiling is enforced by the pre-check — there is
+    // no counter row to race on, and two concurrent first writes collide on
+    // the PK so the loser lands on the guarded update arm.
+    // `enforce_ceilings = false` keeps the record-only posture (admin /
+    // curator / internal SAL writes — the surfaces sqlite neither charges
+    // nor enforces) byte-identical to the pre-#2311 statement.
+    let guard = if enforce_ceilings {
+        "\n         WHERE (CASE
+                 WHEN date_trunc('day', agent_quotas.day_started_at) = date_trunc('day', $7)
+                     THEN agent_quotas.current_memories_today
+                 ELSE 0
+             END) + EXCLUDED.current_memories_today <= agent_quotas.max_memories_per_day
+           AND agent_quotas.current_storage_bytes + EXCLUDED.current_storage_bytes
+                   <= agent_quotas.max_storage_bytes"
+    } else {
+        ""
+    };
+    let res = sqlx::query(&format!(
         "INSERT INTO agent_quotas (
              agent_id, namespace,
              max_memories_per_day, max_storage_bytes, max_links_per_day,
@@ -13609,8 +13664,8 @@ async fn record_memory_quota_batch_in_tx(
                      THEN agent_quotas.day_started_at
                  ELSE $7
              END,
-             updated_at = $7",
-    )
+             updated_at = $7{guard}"
+    ))
     .bind(agent_id)
     .bind(namespace)
     .bind(quota_defaults().max_memories_per_day)
@@ -13622,6 +13677,11 @@ async fn record_memory_quota_batch_in_tx(
     .execute(&mut **tx)
     .await
     .map_err(|e| to_store_err("record agent_quotas batch memory increment", e))?;
+    if enforce_ceilings && res.rows_affected() == 0 {
+        return Err(
+            quota_ceiling_exceeded_error(tx, agent_id, namespace, memories_added, now).await,
+        );
+    }
     Ok(())
 }
 
@@ -14083,7 +14143,18 @@ impl MemoryStore for PostgresStore {
         // we never lose the count.
         let quota_agent_id = resolve_quota_agent_id(ctx, &memory.metadata);
         let bytes_added = memory_storage_bytes(memory);
-        record_memory_quota_in_tx(&mut tx, &quota_agent_id, &memory.namespace, bytes_added).await?;
+        // #2311 — tenant callers get the atomic in-tx ceiling guard (the
+        // handler's `check_memory_quota` pre-check remains only the
+        // fast-fail 429 shape); admin/curator contexts stay record-only,
+        // matching the sqlite surface-enforcement scoping.
+        record_memory_quota_in_tx(
+            &mut tx,
+            &quota_agent_id,
+            &memory.namespace,
+            bytes_added,
+            !ctx.bypass_visibility,
+        )
+        .await?;
 
         tx.commit()
             .await
@@ -14487,7 +14558,18 @@ impl MemoryStore for PostgresStore {
             entry.1 = entry.1.saturating_add(memory_storage_bytes(memory));
         }
         for ((agent_id, namespace), (count, bytes)) in &quota_groups {
-            record_memory_quota_batch_in_tx(&mut tx, agent_id, namespace, *count, *bytes).await?;
+            // #2311 — tenant bulk callers get the atomic in-tx ceiling
+            // guard; a tripped ceiling rolls the whole batch back
+            // (trait-contract atomicity). Admin contexts stay record-only.
+            record_memory_quota_batch_in_tx(
+                &mut tx,
+                agent_id,
+                namespace,
+                *count,
+                *bytes,
+                !ctx.bypass_visibility,
+            )
+            .await?;
         }
 
         tx.commit()
@@ -15325,7 +15407,18 @@ impl MemoryStore for PostgresStore {
         // v0.7.0 #1156 — per-namespace quota dimension (v50 PK).
         let quota_agent_id = resolve_quota_agent_id(ctx, &memory.metadata);
         let bytes_added = memory_storage_bytes(memory);
-        record_memory_quota_in_tx(&mut tx, &quota_agent_id, &memory.namespace, bytes_added).await?;
+        // #2311 — tenant callers get the atomic in-tx ceiling guard (the
+        // handler's `check_memory_quota` pre-check remains only the
+        // fast-fail 429 shape); admin/curator contexts stay record-only,
+        // matching the sqlite surface-enforcement scoping.
+        record_memory_quota_in_tx(
+            &mut tx,
+            &quota_agent_id,
+            &memory.namespace,
+            bytes_added,
+            !ctx.bypass_visibility,
+        )
+        .await?;
 
         tx.commit()
             .await
@@ -15412,11 +15505,24 @@ impl MemoryStore for PostgresStore {
         // cost / thundering-herd. Gated on a KNOWN active fingerprint so an
         // unseeded (keyword-only) process never widens the scan.
         let active_space = crate::embeddings::active_embedding_space();
+        // #2317 — also SELECT `encrypted_envelope` + `metadata` so
+        // at-rest-encrypted rows (whose `content` column stores the empty
+        // seal placeholder per #2288/#2292 — the plaintext lives ONLY in
+        // the envelope) are DECRYPTED before embedding, via the SAME
+        // `resolve_embeddable_content` resolver the sqlite #1779 fix uses.
+        // Pre-fix this scan returned the placeholder verbatim, so the
+        // serve-boot backfill embedded `title + ""` (a title-only vector),
+        // stamped it with the active space (permanently leaving the scan
+        // set), and on the NULL-space / foreign-space heal arms REPLACED
+        // good store-time vectors corpus-wide. A row whose envelope fails
+        // to decrypt (key absent) is SKIPPED, never embedded degraded.
         let rows = if let (true, Some(active_fp)) =
             (pg_heal_foreign_space_enabled(), active_space.as_deref())
         {
             sqlx::query(
-                "SELECT id, title, content FROM memories \
+                "SELECT id, title, content, encrypted_envelope, \
+                        metadata::text AS metadata_json \
+                   FROM memories \
                   WHERE embedding IS NULL \
                      OR (embedding IS NOT NULL AND embedding_space IS NULL) \
                      OR (embedding IS NOT NULL AND embedding_space IS NOT NULL \
@@ -15431,7 +15537,9 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err("list_unembedded", e))?
         } else {
             sqlx::query(
-                "SELECT id, title, content FROM memories \
+                "SELECT id, title, content, encrypted_envelope, \
+                        metadata::text AS metadata_json \
+                   FROM memories \
                   WHERE embedding IS NULL \
                      OR (embedding IS NOT NULL AND embedding_space IS NULL) \
                   ORDER BY created_at ASC \
@@ -15442,18 +15550,46 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("list_unembedded", e))?
         };
-        rows.iter()
-            .map(|r| {
-                Ok((
-                    r.try_get::<String, _>("id")
-                        .map_err(|e| to_store_err("read unembedded id", e))?,
-                    r.try_get::<String, _>("title")
-                        .map_err(|e| to_store_err("read unembedded title", e))?,
-                    r.try_get::<String, _>("content")
-                        .map_err(|e| to_store_err("read unembedded content", e))?,
-                ))
-            })
-            .collect()
+        let mut out: Vec<(String, String, String)> = Vec::with_capacity(rows.len());
+        let mut decrypt_skipped = 0usize;
+        for r in &rows {
+            let id = r
+                .try_get::<String, _>("id")
+                .map_err(|e| to_store_err("read unembedded id", e))?;
+            let title = r
+                .try_get::<String, _>("title")
+                .map_err(|e| to_store_err("read unembedded title", e))?;
+            let content = r
+                .try_get::<String, _>("content")
+                .map_err(|e| to_store_err("read unembedded content", e))?;
+            let envelope = r
+                .try_get::<Option<Vec<u8>>, _>("encrypted_envelope")
+                .map_err(|e| to_store_err("read unembedded envelope", e))?;
+            let metadata_json = r
+                .try_get::<String, _>("metadata_json")
+                .map_err(|e| to_store_err("read unembedded metadata", e))?;
+            match crate::storage::resolve_embeddable_content(&id, content, envelope, &metadata_json)
+            {
+                Some(plaintext) => out.push((id, title, plaintext)),
+                None => decrypt_skipped += 1,
+            }
+        }
+        // #2317 — the pg scan is LIMIT-from-top (no cursor), so undecryptable
+        // rows are re-fetched every pass and an all-skipped pass returns
+        // EMPTY (the caller's zero-progress break terminates the sweep — no
+        // spin). Surface the skip count LOUDLY so an operator sees exactly
+        // why the backfill is not healing those rows (key absent / moved
+        // host) instead of a silent success.
+        if decrypt_skipped > 0 {
+            tracing::warn!(
+                skipped = decrypt_skipped,
+                "embedding backfill: skipped encrypted rows whose envelope failed to \
+                 decrypt — embedding their empty placeholder would overwrite good \
+                 store-time embeddings (#2317, pg twin of #1779). Restore the \
+                 decryption key to heal these rows."
+            );
+        }
+        Ok(out)
     }
 
     /// #1579 A4 — single-transaction batch embedding write. One commit
@@ -15680,7 +15816,7 @@ impl MemoryStore for PostgresStore {
                      reflection_depth, atomised_into, atom_of, memory_kind,
                      entity_id, persona_version, citations, source_uri, source_span,
                      confidence_source, confidence_signals, confidence_decayed_at,
-                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
+                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until)
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, NOW(), $2, metadata,
@@ -15688,7 +15824,7 @@ impl MemoryStore for PostgresStore {
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                  FROM memories WHERE id = $1",
             )
             .bind(id)
@@ -16678,6 +16814,36 @@ impl MemoryStore for PostgresStore {
         memory: &Memory,
     ) -> StoreResult<String> {
         self.gate_record_stop()?;
+        // #2314 — sqlite `insert_if_newer` guard parity on the pg
+        // federation-apply funnel (reached by the /sync/push receive path
+        // AND the catchup puller). (a) G30 resurrection guard: DROP an
+        // inbound write for a tombstoned id (tombstone-wins) so a stale
+        // peer cannot revive a forgotten/GDPR-erased row via LWW —
+        // idempotent no-op return, logged for audit. (b) G29 credential
+        // REDACT: ALWAYS redact, NEVER refuse (a refused inbound row
+        // would diverge replicas; no-op unless screening was seeded
+        // non-`off`). Both guards previously existed ONLY on
+        // `merge_inbound`, leaving every apply_remote_memory caller
+        // unguarded on postgres while sqlite carries them inside
+        // `db::insert_if_newer` itself.
+        let tombstoned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM forget_tombstones WHERE memory_id = $1)",
+        )
+        .bind(&memory.id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("apply_remote_memory tombstone check", e))?;
+        if tombstoned {
+            tracing::info!(
+                target: crate::storage::FORGET_TOMBSTONE_TRACE_TARGET,
+                memory_id = %memory.id,
+                "{}",
+                crate::storage::FORGET_TOMBSTONE_DROP_MSG
+            );
+            return Ok(memory.id.clone());
+        }
+        let screened = screen_storage_memory(memory);
+        let memory = screened.as_ref().unwrap_or(memory);
         // ARCH-1 (CRITICAL) — substrate governance pre-write parity.
         // Federation-pushed memories must clear the same pre-write
         // hook as locally-authored writes; otherwise a peer could push
@@ -16847,12 +17013,19 @@ impl MemoryStore for PostgresStore {
                 updated_at = GREATEST(memories.updated_at, EXCLUDED.updated_at),
                 -- #1631 — sqlite parity: access_count converges on MAX.
                 access_count = GREATEST(memories.access_count, EXCLUDED.access_count),
-                -- #1631 — sqlite parity: long-tier pins expiry to NULL;
-                -- otherwise a peer push that omits expiry keeps the local
-                -- one rather than blanking it out.
+                -- v1.0.0 #2335 (FBL-20 pg mirror) — the federation expiry
+                -- merge is the extension-FLOOR lattice join, not LWW: a
+                -- STALE losing peer must never drag a live row's expiry
+                -- earlier (recall fold-extensions raise expires_at without
+                -- bumping updated_at). GREATEST over the COALESCE'd pair is
+                -- commutative/idempotent (true CRDT join) so both replicas
+                -- converge to the LATER expiry regardless of push order,
+                -- and the #1596 never-move-expiry-earlier contract holds
+                -- across federation. Long⇒NULL keeps the #1626 coupling.
                 expires_at = CASE
                     WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
-                    ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
+                    ELSE GREATEST(COALESCE(EXCLUDED.expires_at, memories.expires_at),
+                                  COALESCE(memories.expires_at, EXCLUDED.expires_at))
                 END,
                 metadata = CASE
                     WHEN EXCLUDED.updated_at > memories.updated_at
@@ -17030,9 +17203,10 @@ impl MemoryStore for PostgresStore {
         .map_err(|e| to_store_err("merge_inbound tombstone check", e))?;
         if tombstoned {
             tracing::info!(
-                target: "forget.tombstone",
+                target: crate::storage::FORGET_TOMBSTONE_TRACE_TARGET,
                 memory_id = %inbound.id,
-                "rejected inbound federation write for a forgotten id (resurrection guard)"
+                "{}",
+                crate::storage::FORGET_TOMBSTONE_DROP_MSG
             );
             return Ok(inbound.id.clone());
         }
@@ -18672,20 +18846,29 @@ impl MemoryStore for PostgresStore {
                 detail: crate::errors::msg::FORGET_FILTER_REQUIRED.to_string(),
             });
         }
-        // Postgres uses ILIKE for the pattern match (no FTS5 here); the
-        // sqlite path uses an FTS query. Both are case-insensitive
-        // substring/token matches against title+content; we land on
-        // ILIKE over title || ' ' || content so the wire contract
-        // ("forget anything matching this string") is preserved.
+        // #2312 — token-AND pattern semantics, matching the sqlite twin.
+        // sqlite routes the DESTRUCTIVE forget pattern through
+        // `forget_fts_query` -> `sanitize_fts_query(pat, false)` (#1601):
+        // every whitespace-separated token must match as a WHOLE token
+        // (FTS5 implicit AND) — the conservative posture the memory_forget
+        // wire contract promises ("every whitespace-separated token must
+        // match"). The previous postgres arm was `title ILIKE '%pat%' OR
+        // content ILIKE '%pat%'` — a contiguous SUBSTRING match that
+        // over-deleted (pattern "cat" reaped rows containing "education")
+        // and under-deleted (non-adjacent multi-token patterns), so the
+        // same destructive wire call deleted DIFFERENT row sets per
+        // backend. The predicate is now `tsv @@ plainto_tsquery('english',
+        // $pattern)` over the v57 stored tsvector (title + content):
+        // plainto_tsquery AND-joins every lexeme and treats its input as
+        // plain text (no operator surface — injection-safe, so the #2032
+        // LM1 escaping is no longer needed; a bare "%" or an
+        // all-punctuation pattern normalizes to the EMPTY tsquery, which
+        // matches NOTHING — the fail-safe twin of sqlite's `"_empty_"`
+        // sentinel). Documented residual: the `english` config stems and
+        // drops stopwords where FTS5 unicode61 does not, so token
+        // boundaries differ marginally across backends; both remain
+        // whole-token AND matches.
         let tier_str = tier.map(|t| t.as_str().to_string());
-        // #2032 LM1 — escape LIKE metacharacters (`%` `_` `\\`) in the
-        // caller-supplied pattern so `forget(pattern="%")` matches a
-        // LITERAL `%` (the sqlite/FTS twin's behaviour) instead of the
-        // ILIKE wildcard that would archive+delete the WHOLE scope. The
-        // outer `%…%` stays literal wildcards for the intended substring
-        // match. PostgreSQL LIKE/ILIKE uses backslash as the default
-        // escape character, so no explicit `ESCAPE` clause is required.
-        let pattern_like = pattern.map(|p| format!("%{}%", crate::storage::escape_like_pattern(p)));
         let now = chrono::Utc::now().to_rfc3339();
 
         // #1776 — archive + delete MUST be one transaction (mirror `run_gc` /
@@ -18716,7 +18899,7 @@ impl MemoryStore for PostgresStore {
                     -- #2196 - carry lifecycle_state so a non-open archived state
                     -- survives the archive->restore round-trip (restore no longer
                     -- COALESCEs a NULL to 'open'); mirrors the sqlite archive.
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -18725,19 +18908,18 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                 FROM memories
                 WHERE ($1::text IS NULL OR namespace = $1)
                   AND ($2::text IS NULL OR tier = $2)
                   AND ($3::text IS NULL
-                       OR title ILIKE $3
-                       OR content ILIKE $3)
+                       OR tsv @@ plainto_tsquery('english', $3))
                 -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
                 {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
             ))
             .bind(namespace)
             .bind(tier_str.as_deref())
-            .bind(pattern_like.as_deref())
+            .bind(pattern)
             .bind(parse_rfc3339_required(&now)?)
             .execute(&mut *tx)
             .await
@@ -18751,37 +18933,47 @@ impl MemoryStore for PostgresStore {
         // subquery so the snapshot and the delete pin to the same row set
         // inside this one tx; idempotent via the PK `ON CONFLICT`. Postgres
         // twin of the SQLite `archive_links_for_memory` snapshot.
-        sqlx::query(
-            "INSERT INTO archived_memory_links (
-                 source_id, target_id, relation, created_at, valid_from,
-                 valid_until, observed_by, signature, attest_level, archived_at
-             )
-             SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
-                    ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
-                    ml.attest_level, now()
-             FROM memory_links ml
-             WHERE ml.source_id IN (
-                       SELECT id FROM memories
-                       WHERE ($1::text IS NULL OR namespace = $1)
-                         AND ($2::text IS NULL OR tier = $2)
-                         AND ($3::text IS NULL
-                              OR title ILIKE $3
-                              OR content ILIKE $3))
-                OR ml.target_id IN (
-                       SELECT id FROM memories
-                       WHERE ($1::text IS NULL OR namespace = $1)
-                         AND ($2::text IS NULL OR tier = $2)
-                         AND ($3::text IS NULL
-                              OR title ILIKE $3
-                              OR content ILIKE $3))
-             ON CONFLICT (source_id, target_id, relation) DO NOTHING",
-        )
-        .bind(namespace)
-        .bind(tier_str.as_deref())
-        .bind(pattern_like.as_deref())
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("forget snapshot links", e))?;
+        //
+        // #2313 — runs ONLY when `archive`, matching the sqlite contract
+        // ("Runs only when `archive` so a hard (non-recoverable) forget
+        // keeps its documented edge-loss", src/storage/mod.rs). Pre-fix
+        // this INSERT ran unconditionally, so an erasure-intent hard
+        // forget (archive = false) permanently retained the victims' edge
+        // topology (relation, observed_by, signature, valid intervals) as
+        // orphan rows no code path ever reaps — with no archived_memories
+        // row, restore could never consume them and archive_purge never
+        // touches archived_memory_links.
+        if archive {
+            sqlx::query(
+                "INSERT INTO archived_memory_links (
+                     source_id, target_id, relation, created_at, valid_from,
+                     valid_until, observed_by, signature, attest_level, archived_at
+                 )
+                 SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
+                        ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
+                        ml.attest_level, now()
+                 FROM memory_links ml
+                 WHERE ml.source_id IN (
+                           SELECT id FROM memories
+                           WHERE ($1::text IS NULL OR namespace = $1)
+                             AND ($2::text IS NULL OR tier = $2)
+                             AND ($3::text IS NULL
+                                  OR tsv @@ plainto_tsquery('english', $3)))
+                    OR ml.target_id IN (
+                           SELECT id FROM memories
+                           WHERE ($1::text IS NULL OR namespace = $1)
+                             AND ($2::text IS NULL OR tier = $2)
+                             AND ($3::text IS NULL
+                                  OR tsv @@ plainto_tsquery('english', $3)))
+                 ON CONFLICT (source_id, target_id, relation) DO NOTHING",
+            )
+            .bind(namespace)
+            .bind(tier_str.as_deref())
+            .bind(pattern)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("forget snapshot links", e))?;
+        }
 
         // v0.9.0 G8 (#1825) T7 — erasure invariant (postgres parity/defence):
         // NULL the `cid_genesis` pre-image for every row this forget will
@@ -18796,12 +18988,11 @@ impl MemoryStore for PostgresStore {
                AND ($1::text IS NULL OR namespace = $1)
                AND ($2::text IS NULL OR tier = $2)
                AND ($3::text IS NULL
-                    OR title ILIKE $3
-                    OR content ILIKE $3)",
+                    OR tsv @@ plainto_tsquery('english', $3))",
         )
         .bind(namespace)
         .bind(tier_str.as_deref())
-        .bind(pattern_like.as_deref())
+        .bind(pattern)
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("forget scrub cid_genesis", e))?;
@@ -18825,13 +19016,12 @@ impl MemoryStore for PostgresStore {
                AND ($1::text IS NULL OR namespace = $1)
                AND ($2::text IS NULL OR tier = $2)
                AND ($3::text IS NULL
-                    OR title ILIKE $3
-                    OR content ILIKE $3)
+                    OR tsv @@ plainto_tsquery('english', $3))
              RETURNING id",
         )
         .bind(namespace)
         .bind(tier_str.as_deref())
-        .bind(pattern_like.as_deref())
+        .bind(pattern)
         .bind(crate::encryption::crypto_erase_marker())
         .fetch_all(&mut *tx)
         .await
@@ -18849,13 +19039,12 @@ impl MemoryStore for PostgresStore {
              WHERE ($1::text IS NULL OR namespace = $1)
                AND ($2::text IS NULL OR tier = $2)
                AND ($3::text IS NULL
-                    OR title ILIKE $3
-                    OR content ILIKE $3)
+                    OR tsv @@ plainto_tsquery('english', $3))
              RETURNING id, namespace, metadata->>'agent_id'",
         )
         .bind(namespace)
         .bind(tier_str.as_deref())
-        .bind(pattern_like.as_deref())
+        .bind(pattern)
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| to_store_err("forget delete", e))?;
@@ -18997,30 +19186,22 @@ impl MemoryStore for PostgresStore {
     ) -> StoreResult<Vec<String>> {
         // #1849 (CWE-862) — DISTINCT namespaces of the forget match set,
         // NON-owner-scoped (admin path). Mirrors the [`forget`] DELETE
-        // predicate EXACTLY (the same ILIKE-over-title/content substring
-        // match + tier filter) but omits the namespace predicate (this is
-        // only consulted on a `namespace = None` cross-namespace forget) and
-        // SELECTs DISTINCT namespace with NO LIMIT — so the HTTP gate sees
-        // every governed namespace, including any whose rows would sort past
-        // the #1602 preview cap. 5-agent vote 4d3ea1c5.
+        // predicate EXACTLY (#2312: the same token-AND
+        // `tsv @@ plainto_tsquery` match + tier filter) but omits the
+        // namespace predicate (this is only consulted on a
+        // `namespace = None` cross-namespace forget) and SELECTs DISTINCT
+        // namespace with NO LIMIT — so the HTTP gate sees every governed
+        // namespace, including any whose rows would sort past the #1602
+        // preview cap. 5-agent vote 4d3ea1c5.
         let tier_str = tier.map(|t| t.as_str().to_string());
-        // #2032 LM1 — escape LIKE metacharacters (`%` `_` `\\`) in the
-        // caller-supplied pattern so `forget(pattern="%")` matches a
-        // LITERAL `%` (the sqlite/FTS twin's behaviour) instead of the
-        // ILIKE wildcard that would archive+delete the WHOLE scope. The
-        // outer `%…%` stays literal wildcards for the intended substring
-        // match. PostgreSQL LIKE/ILIKE uses backslash as the default
-        // escape character, so no explicit `ESCAPE` clause is required.
-        let pattern_like = pattern.map(|p| format!("%{}%", crate::storage::escape_like_pattern(p)));
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT DISTINCT namespace FROM memories
              WHERE ($1::text IS NULL OR tier = $1)
                AND ($2::text IS NULL
-                    OR title ILIKE $2
-                    OR content ILIKE $2)",
+                    OR tsv @@ plainto_tsquery('english', $2))",
         )
         .bind(tier_str.as_deref())
-        .bind(pattern_like.as_deref())
+        .bind(pattern)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| to_store_err("forget_distinct_namespaces", e))?;
@@ -20207,12 +20388,24 @@ impl MemoryStore for PostgresStore {
                 id: action_id.to_string(),
             });
         }
-        sqlx::query(
+        // #2310 — the FOR UPDATE pre-read above cannot lock an ABSENT row, so
+        // two concurrent first-acquires both read None and both reach this
+        // upsert; the second one's INSERT blocks on the PK until the first
+        // commits, then its ON CONFLICT arm fires. A previously-unconditional
+        // DO UPDATE let that loser silently STEAL the just-committed live
+        // lease (both callers returned Ok — mutual-exclusion break). The
+        // upsert is therefore self-guarding: the update arm applies ONLY when
+        // the surviving row is ours or expired (the same predicate the
+        // pre-read evaluates), and `rows_affected() == 0` maps to the typed
+        // Conflict the doc contract promises.
+        let upsert = sqlx::query(
             "INSERT INTO leases (action_id, holder, acquired_at, expires_at, heartbeat_at) \
              VALUES ($1, $2, $3, $4, $3) \
              ON CONFLICT (action_id) DO UPDATE SET holder = EXCLUDED.holder, \
                 acquired_at = EXCLUDED.acquired_at, expires_at = EXCLUDED.expires_at, \
-                heartbeat_at = EXCLUDED.heartbeat_at",
+                heartbeat_at = EXCLUDED.heartbeat_at \
+             WHERE leases.holder = EXCLUDED.holder \
+                OR leases.expires_at <= EXCLUDED.acquired_at",
         )
         .bind(action_id)
         .bind(holder)
@@ -20221,6 +20414,11 @@ impl MemoryStore for PostgresStore {
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("lease_acquire upsert", e))?;
+        if upsert.rows_affected() == 0 {
+            return Err(StoreError::Conflict {
+                id: action_id.to_string(),
+            });
+        }
         let row = sqlx::query(PG_LEASE_SELECT_BY_ID)
             .bind(action_id)
             .fetch_one(&mut *tx)
@@ -20869,7 +21067,7 @@ impl MemoryStore for PostgresStore {
                     confidence_source, confidence_signals, confidence_decayed_at,
                     -- #2196 - carry lifecycle_state through the TTL archive so a
                     -- non-open state survives archive->restore (postgres parity).
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -20878,7 +21076,7 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                 FROM memories
                 WHERE expires_at IS NOT NULL AND expires_at < $1
                 -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
@@ -21018,7 +21216,7 @@ impl MemoryStore for PostgresStore {
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                     )
                     SELECT id, tier, namespace, title, content, tags, priority, confidence,
                            source, access_count, created_at, updated_at, last_accessed_at,
@@ -21027,7 +21225,7 @@ impl MemoryStore for PostgresStore {
                            reflection_depth, atomised_into, atom_of, memory_kind,
                            entity_id, persona_version, citations, source_uri, source_span,
                            confidence_source, confidence_signals, confidence_decayed_at,
-                           mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                           mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                     FROM memories
                     WHERE id = $1
                     -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
@@ -21193,7 +21391,7 @@ impl MemoryStore for PostgresStore {
                 entity_id, persona_version, citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
                 mentioned_entity_id, version, lifecycle_state, encrypted_envelope,
-                cid, cid_genesis, valid_from, valid_until
+                cid, cid_genesis, kind_provenance, valid_from, valid_until
             )
             SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                    tags, priority, confidence, source, access_count, created_at,
@@ -21228,6 +21426,13 @@ impl MemoryStore for PostgresStore {
                    COALESCE(lifecycle_state, 'open'),
                    encrypted_envelope,
                    $3::text, $4::bytea,
+                   -- v1.0.0 #2333 (FBL-03 pg mirror) — carry kind_provenance
+                   -- back on restore; legacy pre-v87 archive rows re-derive
+                   -- it from the metadata carrier, vocab-guarded (sqlite twin).
+                   COALESCE(kind_provenance,
+                            CASE WHEN metadata->>'kind_provenance' IN
+                                      ('declared','channel_derived','regex','llm')
+                                 THEN metadata->>'kind_provenance' END),
                    valid_from, valid_until
             FROM archived_memories WHERE id = $2",
         )
@@ -21251,7 +21456,11 @@ impl MemoryStore for PostgresStore {
         // would be rejected (and is correctly skipped here). Idempotent via
         // the PK `ON CONFLICT`. Postgres twin of the SQLite
         // `restore_links_for_memory` re-insert.
-        sqlx::query(
+        // #2315 — RETURNING the actually-restored edges so they can be
+        // re-projected into the AGE graph below (only edges this INSERT
+        // landed; ON CONFLICT skips report nothing, which is correct —
+        // an already-present edge is already projected or queued).
+        let restored_edges: Vec<(String, String, String)> = sqlx::query_as(
             "INSERT INTO memory_links (
                  source_id, target_id, relation, created_at, valid_from,
                  valid_until, observed_by, signature, attest_level
@@ -21263,12 +21472,80 @@ impl MemoryStore for PostgresStore {
              WHERE (aml.source_id = $1 OR aml.target_id = $1)
                AND EXISTS (SELECT 1 FROM memories m WHERE m.id = aml.source_id)
                AND EXISTS (SELECT 1 FROM memories m WHERE m.id = aml.target_id)
-             ON CONFLICT (source_id, target_id, relation) DO NOTHING",
+             ON CONFLICT (source_id, target_id, relation) DO NOTHING
+             RETURNING source_id, target_id, relation",
         )
         .bind(id)
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| to_store_err("archive_restore restore links", e))?;
+
+        // #2315 — re-PROJECT the restored edges into the AGE `memory_graph`.
+        // Every delete path unprojects (forget / delete / consolidate / gc /
+        // size_gc / archive_by_ids), but restore previously re-inserted the
+        // relational rows WITHOUT re-projecting, so an AGE-routed kg_query
+        // permanently missed restored edges (the CTE fallback fires only on
+        // AGE runtime failure, never on a valid-but-empty result) — a
+        // split-brain with no self-heal. Deferred mode enqueues the outbox
+        // rows in THIS tx (the drainer's existence re-check tolerates any
+        // later delete); sync mode MERGEs via a SAVEPOINT so an AGE runtime
+        // failure degrades to a WARN instead of failing the relational
+        // restore (#700/#1542 posture — the graph is derived data; the
+        // restore of the durable rows must never be blocked by it).
+        if matches!(self.kg_backend, KgBackend::Age) {
+            for (src, dst, rel) in &restored_edges {
+                if matches!(
+                    crate::config::age_projection_mode(),
+                    crate::config::AgeProjectionMode::Deferred
+                ) {
+                    sqlx::query(
+                        "INSERT INTO kg_projection_outbox (source_id, target_id, relation) \
+                         VALUES ($1, $2, $3)",
+                    )
+                    .bind(src)
+                    .bind(dst)
+                    .bind(rel)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("archive_restore enqueue kg_projection_outbox", e))?;
+                } else {
+                    sqlx::query("SAVEPOINT age_restore_projection")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| to_store_err("savepoint age_restore_projection", e))?;
+                    match project_link_into_age(&mut tx, src, dst, rel).await {
+                        Ok(()) => {
+                            sqlx::query("RELEASE SAVEPOINT age_restore_projection")
+                                .execute(&mut *tx)
+                                .await
+                                .map_err(|e| {
+                                    to_store_err("release savepoint age_restore_projection", e)
+                                })?;
+                        }
+                        Err(e) if is_age_runtime_failure(&e) => {
+                            sqlx::query("ROLLBACK TO SAVEPOINT age_restore_projection")
+                                .execute(&mut *tx)
+                                .await
+                                .map_err(|e2| {
+                                    to_store_err("rollback savepoint age_restore_projection", e2)
+                                })?;
+                            tracing::warn!(
+                                target: TRACE_TARGET_KG,
+                                source_id = %src,
+                                target_id = %dst,
+                                relation = %rel,
+                                err = %e,
+                                "AGE projection skipped on archive_restore — \
+                                 relational memory_links row still committed. \
+                                 find_paths_cypher will degrade to CTE fallback \
+                                 for queries that traverse this edge."
+                            );
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
 
         sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
             .bind(id)
@@ -21399,7 +21676,7 @@ impl MemoryStore for PostgresStore {
                     confidence_source, confidence_signals, confidence_decayed_at,
                     -- #2196 - carry lifecycle_state through the manual archive so a
                     -- non-open state survives archive->restore (postgres parity).
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -21408,7 +21685,7 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
+                       mentioned_entity_id, version, lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until
                 FROM memories WHERE id = $3
                 -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
                 {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
@@ -21470,6 +21747,16 @@ impl MemoryStore for PostgresStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("archive_by_ids delete", e))?;
+            // #2315 — AGE unprojection parity. This was the ONLY hard-delete
+            // path that skipped `unproject_memory_from_age` (delete / forget /
+            // apply_remote_deletion / consolidate / run_gc / size_gc all call
+            // it), so a manually-archived memory left a ghost `:Memory` node +
+            // incident edges in the `memory_graph` projection that AGE-routed
+            // kg_query kept returning — a live-looking edge to a non-live
+            // memory. Same-tx DETACH DELETE, mirroring the forget() shape.
+            if matches!(self.kg_backend, KgBackend::Age) {
+                unproject_memory_from_age(&mut tx, id).await?;
+            }
             moved += 1;
         }
 
@@ -28327,6 +28614,589 @@ mod tests {
                 .any(|l| l.source_id == a_id && l.target_id == b_id),
             "A->B edge must be preserved across archive_by_ids + archive_restore"
         );
+    }
+
+    /// #2310 — postgres `lease_acquire` first-acquire mutual exclusion.
+    /// `SELECT ... FOR UPDATE` cannot lock an ABSENT row, so two concurrent
+    /// first-acquires both read `None`; pre-fix the unconditional
+    /// `ON CONFLICT (action_id) DO UPDATE` then let the LOSER silently steal
+    /// the winner's just-committed live lease and BOTH callers returned `Ok`.
+    /// The fix makes the upsert self-guarding (same-holder or expired only)
+    /// and maps `rows_affected() == 0` to the typed `Conflict`. This test
+    /// races 8 concurrent first-acquires with distinct holders and asserts
+    /// exactly ONE `Ok`, and that the surviving row belongs to that winner.
+    /// Skips cleanly when `AI_MEMORY_TEST_POSTGRES_URL` unset.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lease_acquire_concurrent_first_acquire_single_winner_2310() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("lease-2310-{unique}");
+        let aid = format!("lease-2310-act-{unique}");
+        let action = crate::models::Action {
+            id: aid.clone(),
+            namespace: ns,
+            kind: "test.lease-race".to_string(),
+            state: crate::models::ActionState::Pending,
+            title: "lease 2310 race target".to_string(),
+            payload: serde_json::json!({}),
+            priority: 5,
+            agent_id: Some("ai:sal-test".to_string()),
+            claimed_by: None,
+            vector_clock: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+        };
+        store
+            .action_create(&ctx, &action)
+            .await
+            .expect("action_create");
+
+        let now = 1_700_100_000_i64;
+        let expires = now + 60;
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let store = store.clone();
+            let ctx = ctx.clone();
+            let aid = aid.clone();
+            handles.push(tokio::spawn(async move {
+                let holder = format!("holder-{i}");
+                store
+                    .lease_acquire(&ctx, &aid, &holder, now, expires)
+                    .await
+                    .map(|l| l.holder)
+            }));
+        }
+        let mut winners = Vec::new();
+        for h in handles {
+            match h.await.expect("join lease task") {
+                Ok(holder) => winners.push(holder),
+                Err(StoreError::Conflict { .. }) => {}
+                Err(e) => panic!("unexpected lease_acquire error: {e}"),
+            }
+        }
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one concurrent first-acquire may win the lease (got {winners:?})"
+        );
+        let (holder_row,): (String,) =
+            sqlx::query_as("SELECT holder FROM leases WHERE action_id = $1")
+                .bind(&aid)
+                .fetch_one(&store.pool)
+                .await
+                .expect("lease row present");
+        assert_eq!(
+            holder_row, winners[0],
+            "the surviving leases row must belong to the single winner"
+        );
+        // Cleanup — cascade removes the lease row with the action.
+        let _ = sqlx::query("DELETE FROM actions WHERE id = $1")
+            .bind(&aid)
+            .execute(&store.pool)
+            .await;
+    }
+
+    /// #2311 — postgres tenant-quota TOCTOU. `check_memory_quota` is a
+    /// plain pooled read on a separate connection, so pre-fix N concurrent
+    /// stores at ceiling-1 all passed the check and all recorded (overshoot
+    /// up to N-1 past the cap — the race sqlite's BEGIN IMMEDIATE
+    /// `check_and_record` closes, #628 H12). The fix re-checks the
+    /// day-rolled ceilings atomically inside the record statement's DO
+    /// UPDATE guard for tenant callers. This test pins the (agent, ns) row
+    /// at max_memories_per_day = 1 and races 8 concurrent tenant stores:
+    /// exactly ONE may land; the rest get the typed QuotaExceeded; the
+    /// counter never overshoots. Skips without AI_MEMORY_TEST_POSTGRES_URL.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tenant_quota_record_is_atomic_under_concurrency_2311() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("quota-2311-{unique}");
+        // Seed the accounting row at a ceiling of ONE remaining write.
+        sqlx::query(
+            "INSERT INTO agent_quotas (
+                 agent_id, namespace,
+                 max_memories_per_day, max_storage_bytes, max_links_per_day,
+                 current_memories_today, current_storage_bytes, current_links_today,
+                 day_started_at, created_at, updated_at
+             ) VALUES ('ai:sal-test', $1, 1, 104857600, 5000, 0, 0, 0, now(), now(), now())",
+        )
+        .bind(&ns)
+        .execute(&store.pool)
+        .await
+        .expect("seed agent_quotas row");
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let store = store.clone();
+            let ctx = ctx.clone();
+            let ns = ns.clone();
+            handles.push(tokio::spawn(async move {
+                let mem = sample_memory(
+                    &format!("quota-2311-{i}-{}", uuid::Uuid::new_v4()),
+                    &ns,
+                    &format!("quota row {i}"),
+                    "quota race body",
+                );
+                store.store(&ctx, &mem).await
+            }));
+        }
+        let mut ok = 0usize;
+        for h in handles {
+            match h.await.expect("join store task") {
+                Ok(_) => ok += 1,
+                Err(StoreError::QuotaExceeded { .. }) => {}
+                Err(e) => panic!("unexpected store error under quota race: {e}"),
+            }
+        }
+        assert_eq!(
+            ok, 1,
+            "exactly one concurrent tenant store may land at ceiling-1"
+        );
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT current_memories_today FROM agent_quotas \
+             WHERE agent_id = 'ai:sal-test' AND namespace = $1",
+        )
+        .bind(&ns)
+        .fetch_one(&store.pool)
+        .await
+        .expect("read counter");
+        assert_eq!(count, 1, "the counter must never overshoot the ceiling");
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM memories WHERE namespace = $1")
+            .bind(&ns)
+            .execute(&store.pool)
+            .await;
+        let _ = sqlx::query(
+            "DELETE FROM agent_quotas WHERE agent_id = 'ai:sal-test' AND namespace = $1",
+        )
+        .bind(&ns)
+        .execute(&store.pool)
+        .await;
+    }
+
+    /// #2312 — destructive forget pattern must be TOKEN-AND (the sqlite
+    /// `forget_fts_query` #1601 contract the memory_forget wire promises),
+    /// not a contiguous ILIKE substring. Pins all three divergence legs on
+    /// postgres: (a) pattern "cat" must NOT reap a row whose content merely
+    /// CONTAINS the substring ("education"); (b) a multi-token pattern with
+    /// NON-ADJACENT tokens must match (token AND, not substring); (c) the
+    /// bare "%" pattern must delete NOTHING (the #2032 LM1 posture —
+    /// plainto_tsquery normalizes it to the empty query). Skips without
+    /// AI_MEMORY_TEST_POSTGRES_URL.
+    #[tokio::test]
+    async fn forget_pattern_is_token_and_not_substring_2312() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("forget-2312-{unique}");
+        let edu = sample_memory(
+            &format!("f2312-edu-{unique}"),
+            &ns,
+            "substring bait",
+            "education policy notes",
+        );
+        let nonadj = sample_memory(
+            &format!("f2312-nonadj-{unique}"),
+            &ns,
+            "non adjacent tokens",
+            "alphatok filler words between betatok",
+        );
+        store.store(&ctx, &edu).await.expect("store edu");
+        store.store(&ctx, &nonadj).await.expect("store nonadj");
+
+        // (a) substring over-delete must NOT happen: "cat" is not a token
+        // of either row ("education" merely contains it).
+        let deleted = store
+            .forget(&ctx, Some(&ns), Some("cat"), None, false)
+            .await
+            .expect("forget cat");
+        assert_eq!(
+            deleted, 0,
+            "pattern 'cat' must not reap rows merely CONTAINING the substring"
+        );
+
+        // (c) LM1 posture: a bare wildcard deletes nothing.
+        let deleted = store
+            .forget(&ctx, Some(&ns), Some("%"), None, false)
+            .await
+            .expect("forget wildcard");
+        assert_eq!(deleted, 0, "bare '%' must not match the whole scope");
+
+        // (b) token-AND under-delete must NOT happen: non-adjacent tokens
+        // still match (sqlite FTS5 implicit-AND parity).
+        let deleted = store
+            .forget(&ctx, Some(&ns), Some("alphatok betatok"), None, false)
+            .await
+            .expect("forget non-adjacent tokens");
+        assert_eq!(
+            deleted, 1,
+            "non-adjacent token-AND pattern must reap exactly the matching row"
+        );
+
+        // Cleanup (the edu row survives all three forgets).
+        let _ = sqlx::query("DELETE FROM memories WHERE namespace = $1")
+            .bind(&ns)
+            .execute(&store.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM forget_tombstones WHERE namespace = $1")
+            .bind(&ns)
+            .execute(&store.pool)
+            .await;
+    }
+
+    /// #2313 — a HARD forget (archive = false) must NOT snapshot the
+    /// victims' `memory_links` into `archived_memory_links` (the sqlite
+    /// contract: "a hard (non-recoverable) forget keeps its documented
+    /// edge-loss"), while an archive = true forget MUST preserve them for
+    /// restore. Pre-fix postgres ran the #1771 snapshot unconditionally,
+    /// permanently retaining forgotten rows' edge topology as unreapable
+    /// orphans. Skips without AI_MEMORY_TEST_POSTGRES_URL.
+    #[tokio::test]
+    async fn hard_forget_leaves_no_archived_link_snapshot_2313() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+
+        // Leg 1 — hard forget: no snapshot rows may survive.
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("hardforget-2313-{unique}");
+        let a_id = format!("hf2313-a-{unique}");
+        let b_id = format!("hf2313-b-{unique}");
+        let a = sample_memory(&a_id, &ns, "hf-a", "hard forget edge endpoint a");
+        let b = sample_memory(&b_id, &ns, "hf-b", "hard forget edge endpoint b");
+        store.store(&ctx, &a).await.expect("store a");
+        store.store(&ctx, &b).await.expect("store b");
+        let link = crate::models::MemoryLink {
+            source_id: a_id.clone(),
+            target_id: b_id.clone(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            valid_from: None,
+            valid_until: None,
+            observed_by: None,
+            signature: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        };
+        store.link(&ctx, &link).await.expect("link a->b");
+        let deleted = store
+            .forget(&ctx, Some(&ns), None, None, false)
+            .await
+            .expect("hard forget");
+        assert_eq!(deleted, 2, "hard forget reaps both rows");
+        let (snap_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM archived_memory_links \
+             WHERE source_id = $1 OR target_id = $1",
+        )
+        .bind(&a_id)
+        .fetch_one(&store.pool)
+        .await
+        .expect("count snapshot rows");
+        assert_eq!(
+            snap_count, 0,
+            "a hard (archive=false) forget must not retain an archived link snapshot"
+        );
+
+        // Leg 2 — archiving forget: the snapshot MUST land (restore fuel).
+        let unique2 = uuid::Uuid::new_v4();
+        let ns2 = format!("softforget-2313-{unique2}");
+        let c_id = format!("hf2313-c-{unique2}");
+        let d_id = format!("hf2313-d-{unique2}");
+        let c = sample_memory(&c_id, &ns2, "hf-c", "soft forget edge endpoint c");
+        let d = sample_memory(&d_id, &ns2, "hf-d", "soft forget edge endpoint d");
+        store.store(&ctx, &c).await.expect("store c");
+        store.store(&ctx, &d).await.expect("store d");
+        let link2 = crate::models::MemoryLink {
+            source_id: c_id.clone(),
+            target_id: d_id.clone(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            valid_from: None,
+            valid_until: None,
+            observed_by: None,
+            signature: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        };
+        store.link(&ctx, &link2).await.expect("link c->d");
+        let deleted2 = store
+            .forget(&ctx, Some(&ns2), None, None, true)
+            .await
+            .expect("archiving forget");
+        assert_eq!(deleted2, 2, "archiving forget reaps both rows");
+        let (snap_count2,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM archived_memory_links \
+             WHERE source_id = $1 AND target_id = $2",
+        )
+        .bind(&c_id)
+        .bind(&d_id)
+        .fetch_one(&store.pool)
+        .await
+        .expect("count snapshot rows 2");
+        assert_eq!(
+            snap_count2, 1,
+            "an archive=true forget must preserve the edge snapshot for restore"
+        );
+
+        // Cleanup.
+        for victim_ns in [&ns, &ns2] {
+            let _ = sqlx::query("DELETE FROM archived_memories WHERE namespace = $1")
+                .bind(victim_ns)
+                .execute(&store.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM forget_tombstones WHERE namespace = $1")
+                .bind(victim_ns)
+                .execute(&store.pool)
+                .await;
+        }
+        for victim in [&a_id, &b_id, &c_id, &d_id] {
+            let _ = sqlx::query(
+                "DELETE FROM archived_memory_links WHERE source_id = $1 OR target_id = $1",
+            )
+            .bind(victim)
+            .execute(&store.pool)
+            .await;
+        }
+    }
+
+    /// #2314 — G30 resurrection guard on the postgres federation-apply
+    /// funnel. A forgotten id (forget_tombstones row present) pushed back
+    /// by a stale peer must be DROPPED (tombstone-wins) on BOTH inbound
+    /// primitives: `apply_remote_memory` (catchup puller + merge
+    /// fall-through) and `merge_inbound` (the /sync/push funnel post-fix).
+    /// Pre-fix `apply_remote_memory` had no tombstone check, so a
+    /// forgotten/GDPR-erased row RESURRECTED on a postgres receiver while
+    /// the identical push against sqlite was dropped. Skips without
+    /// AI_MEMORY_TEST_POSTGRES_URL.
+    #[tokio::test]
+    async fn apply_remote_memory_respects_forget_tombstone_2314() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("tombstone-2314-{unique}");
+        let vid = format!("ts2314-{unique}");
+        let victim = sample_memory(&vid, &ns, "tombstoned row", "forget me and stay gone");
+        store.store(&ctx, &victim).await.expect("store victim");
+        // Hard forget writes the forget_tombstones row for the id.
+        let deleted = store
+            .forget(&ctx, Some(&ns), None, None, false)
+            .await
+            .expect("hard forget");
+        assert_eq!(deleted, 1, "victim reaped");
+        let (has_tomb,): (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM forget_tombstones WHERE memory_id = $1)")
+                .bind(&vid)
+                .fetch_one(&store.pool)
+                .await
+                .expect("tombstone probe");
+        assert!(has_tomb, "forget must have written the tombstone");
+
+        // A stale peer re-pushes the row through BOTH inbound primitives.
+        let replay = sample_memory(&vid, &ns, "tombstoned row", "resurrection attempt");
+        let id = store
+            .apply_remote_memory(&ctx, &replay)
+            .await
+            .expect("apply_remote_memory is an idempotent no-op on a tombstoned id");
+        assert_eq!(id, vid);
+        let id2 = store
+            .merge_inbound(&ctx, &replay)
+            .await
+            .expect("merge_inbound is an idempotent no-op on a tombstoned id");
+        assert_eq!(id2, vid);
+        let (alive,): (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM memories WHERE id = $1)")
+                .bind(&vid)
+                .fetch_one(&store.pool)
+                .await
+                .expect("resurrection probe");
+        assert!(
+            !alive,
+            "a forgotten id must NOT be resurrected via the federation apply funnel"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM forget_tombstones WHERE memory_id = $1")
+            .bind(&vid)
+            .execute(&store.pool)
+            .await;
+    }
+
+    /// #2315 — AGE projection integrity across the manual archive round
+    /// trip. (a) `archive_by_ids` must UNPROJECT the archived memories
+    /// (pre-fix it was the only hard-delete path skipping
+    /// `unproject_memory_from_age`, leaving ghost `:Memory` nodes/edges
+    /// AGE-routed kg_query kept returning); (b) `archive_restore` must
+    /// RE-PROJECT the restored edges (pre-fix the relational rows returned
+    /// but the AGE current view permanently missed them). Requires an
+    /// AGE-enabled postgres (`AI_MEMORY_TEST_AGE_URL`); skips cleanly
+    /// otherwise, including when the target resolves to the CTE backend.
+    #[tokio::test]
+    async fn archive_round_trip_keeps_age_projection_consistent_2315() {
+        let Some(url) = std::env::var("AI_MEMORY_TEST_AGE_URL").ok() else {
+            eprintln!("skip: AI_MEMORY_TEST_AGE_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        if !matches!(store.kg_backend, KgBackend::Age) {
+            eprintln!("skip: AI_MEMORY_TEST_AGE_URL target did not resolve KgBackend::Age");
+            return;
+        }
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("age-2315-{unique}");
+        let a_id = format!("age2315-a-{unique}");
+        let b_id = format!("age2315-b-{unique}");
+        let a = sample_memory(&a_id, &ns, "age-a", "age projection endpoint a");
+        let b = sample_memory(&b_id, &ns, "age-b", "age projection endpoint b");
+        store.store(&ctx, &a).await.expect("store a");
+        store.store(&ctx, &b).await.expect("store b");
+        let link = crate::models::MemoryLink {
+            source_id: a_id.clone(),
+            target_id: b_id.clone(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            valid_from: None,
+            valid_until: None,
+            observed_by: None,
+            signature: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        };
+        store.link(&ctx, &link).await.expect("link a->b");
+        let before = store.kg_query(&a_id, 2).await.expect("kg_query before");
+        assert!(
+            before.iter().any(|r| r.target_id == b_id),
+            "sanity: the A->B edge is AGE-visible after link()"
+        );
+
+        // (a) archive both endpoints — the AGE view must go EMPTY (no
+        // ghost node/edge for a non-live memory).
+        let moved = store
+            .archive_by_ids(&ctx, &[a_id.clone(), b_id.clone()], Some("test-2315"))
+            .await
+            .expect("archive_by_ids");
+        assert_eq!(moved, 2);
+        let ghost = store.kg_query(&a_id, 2).await.expect("kg_query archived");
+        assert!(
+            ghost.is_empty(),
+            "archive_by_ids must unproject — no ghost AGE edges for archived rows"
+        );
+
+        // (b) restore both — the edge returns relationally AND in the AGE
+        // current view (re-projection).
+        assert!(store.archive_restore(&ctx, &a_id).await.expect("restore a"));
+        assert!(store.archive_restore(&ctx, &b_id).await.expect("restore b"));
+        let after = store.kg_query(&a_id, 2).await.expect("kg_query restored");
+        assert!(
+            after.iter().any(|r| r.target_id == b_id),
+            "archive_restore must re-project the restored A->B edge into AGE"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM memories WHERE namespace = $1")
+            .bind(&ns)
+            .execute(&store.pool)
+            .await;
+        let _ =
+            sqlx::query("DELETE FROM archived_memory_links WHERE source_id = $1 OR target_id = $1")
+                .bind(&a_id)
+                .execute(&store.pool)
+                .await;
+    }
+
+    /// #2317 — the pg backfill scan must never hand the embedder the
+    /// at-rest seal PLACEHOLDER. A row whose `encrypted_envelope` is
+    /// present but undecryptable (key absent / corrupt) is SKIPPED (pg
+    /// twin of the sqlite #1779 `resolve_embeddable_content` posture) —
+    /// pre-fix `list_unembedded` returned its empty `content` verbatim and
+    /// the sweep wrote a title-only vector that permanently left the scan
+    /// set. A plain unencrypted row in the same pass must still be
+    /// returned verbatim. Skips without AI_MEMORY_TEST_POSTGRES_URL.
+    #[tokio::test]
+    async fn list_unembedded_skips_undecryptable_sealed_rows_2317() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("unemb-2317-{unique}");
+        let sealed_id = format!("unemb2317-sealed-{unique}");
+        let plain_id = format!("unemb2317-plain-{unique}");
+        // Sealed row: content holds the EMPTY placeholder, the (here
+        // deliberately undecryptable) envelope carries the ciphertext, no
+        // embedding — the exact post-#2288 at-rest shape the sweep scans.
+        sqlx::query(
+            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, \
+                 confidence, source, access_count, created_at, updated_at, metadata, \
+                 encrypted_envelope) \
+             VALUES ($1, 'mid', $2, 'sealed row', '', '[]', 5, 1.0, 'test', 0, now(), \
+                 now(), '{\"agent_id\":\"ai:sal-test\"}', $3)",
+        )
+        .bind(&sealed_id)
+        .bind(&ns)
+        .bind(vec![3u8, 0xde, 0xad, 0xbe, 0xef])
+        .execute(&store.pool)
+        .await
+        .expect("insert sealed row");
+        sqlx::query(
+            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, \
+                 confidence, source, access_count, created_at, updated_at, metadata) \
+             VALUES ($1, 'mid', $2, 'plain row', 'plain unencrypted body', '[]', 5, 1.0, \
+                 'test', 0, now(), now(), '{\"agent_id\":\"ai:sal-test\"}')",
+        )
+        .bind(&plain_id)
+        .bind(&ns)
+        .execute(&store.pool)
+        .await
+        .expect("insert plain row");
+
+        let admin = CallerContext::for_admin("ai:sal-test");
+        let scanned = store
+            .list_unembedded(&admin, 1_000_000)
+            .await
+            .expect("list_unembedded");
+        assert!(
+            !scanned.iter().any(|(id, _, _)| id == &sealed_id),
+            "an undecryptable sealed row must be SKIPPED, never returned as the placeholder"
+        );
+        let plain = scanned.iter().find(|(id, _, _)| id == &plain_id);
+        assert!(
+            matches!(plain, Some((_, _, content)) if content == "plain unencrypted body"),
+            "a plain row in the same pass is returned with its verbatim content"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query("DELETE FROM memories WHERE namespace = $1")
+            .bind(&ns)
+            .execute(&store.pool)
+            .await;
     }
 
     /// #2196 (data-integrity archive-parity) — postgres twin of the sqlite

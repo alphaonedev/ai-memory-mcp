@@ -888,7 +888,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // so `DELETE /api/v1/links` hits the configured store on a postgres
     // daemon (was silently mutating a local sqlite file); land the file at
     // 28_926. Ceiling 28_900 -> 29_020 (+94 headroom).
-    ("src/store/postgres.rs", 29_020),
+    // 2026-07-24 (fix/postgres-parity-chain) — the 8 parity fixes
+    // (#2310-#2318) + the v87 anchor merge + the FBL-20/33/03 pg mirrors
+    // land the file at 29_869. Ceiling 29_020 -> 29_900 (+31 headroom).
+    // The module-split relief remains tracked under #650-class follow-ups.
+    ("src/store/postgres.rs", 29_900),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
