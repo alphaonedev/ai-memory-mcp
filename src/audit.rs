@@ -1111,6 +1111,9 @@ mod tests {
 
     #[test]
     fn init_from_config_rejects_schema_version_mismatch() {
+        // #2368 — init_from_config can mutate the process-wide sink slot;
+        // hold the shared sink lock like every other sink-touching test.
+        let _g = sink_test_lock();
         // FBL-31 leg 2 — the "validated at init" contract is now real:
         // an explicit schema_version != SCHEMA_VERSION fails CLOSED before any
         // filesystem side effect.
@@ -1144,6 +1147,8 @@ mod tests {
 
     #[test]
     fn init_from_config_refuses_hash_chain_disable() {
+        // #2368 — see init_from_config_rejects_schema_version_mismatch.
+        let _g = sink_test_lock();
         // FBL-31 leg 3 — hash_chain = false is unsupported (the chain is
         // mandatory); the knob no longer silently lies.
         let cfg = crate::config::AuditConfig {
@@ -1160,6 +1165,13 @@ mod tests {
 
     #[test]
     fn init_from_config_disabled_is_noop_regardless_of_knobs() {
+        // #2368 — this arm NULLS the process-wide audit sink
+        // (`init_from_config` with enabled=false clears the slot), so
+        // running it without the shared sink lock raced every concurrent
+        // sink-holding test: the null landed between a peer test's `init`
+        // and `emit`, silently swallowing the emitted line (the CI flake
+        // that blocked PRs #2363/#2354/#2367). Hold the lock.
+        let _g = sink_test_lock();
         // A disabled audit sink ignores the FBL-31 gates entirely (no boot
         // refusal when audit is off), matching the documented no-op contract.
         let cfg = crate::config::AuditConfig {
