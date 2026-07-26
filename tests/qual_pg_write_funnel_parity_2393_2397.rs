@@ -98,7 +98,16 @@ const AGE_UNPROJECT_FUNNELS: &[&str] = &[
 
 fn adapter_source() -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(PG_ADAPTER_PATH);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    let raw =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    // Normalise CRLF -> LF once, at the single ingest point, so no downstream
+    // consumer in this file has to reason about line endings. On a Windows
+    // checkout with `core.autocrlf=true` every line arrives with a two-byte
+    // terminator; `fn_span` below is independently CRLF-correct, but keeping
+    // the source LF-only here means a future token/offset scan added to this
+    // file inherits the immunity instead of re-discovering the bug on the one
+    // platform none of us runs locally.
+    raw.replace("\r\n", "\n")
 }
 
 /// Extract the source span of the FIRST production `impl`-level function
@@ -112,45 +121,70 @@ fn adapter_source() -> String {
 ///
 /// Returns `None` when no such function exists, so a rename surfaces as an
 /// explicit "function not found" failure rather than a silently-vacuous pass.
+/// Line terminators are NEVER reconstructed by arithmetic here. The original
+/// implementation summed `line.len() + 1` to rebuild byte offsets, which
+/// assumes a ONE-byte terminator; `str::lines()` strips `\r\n` as well as
+/// `\n`, so on a CRLF checkout every line under-counted by one byte and the
+/// error ACCUMULATED — by the time the scan reached a function late in this
+/// 31k-line file the returned slice was thousands of bytes off and landed in
+/// a DIFFERENT function, silently reporting the fix as missing. Offsets now
+/// come from the real slice lengths via `split_inclusive('\n')`, which keeps
+/// each terminator, so LF, CRLF, and a final line with no terminator are all
+/// exact.
 fn fn_span<'a>(src: &'a str, name: &str) -> Option<&'a str> {
-    let lines: Vec<&str> = src.lines().collect();
     let sig_a = format!("    async fn {name}(");
     let sig_b = format!("    pub async fn {name}(");
+
+    // (byte_start, byte_end_past_terminator, content_without_terminator)
+    let mut lines: Vec<(usize, usize, &str)> = Vec::new();
+    let mut offset = 0usize;
+    for raw in src.split_inclusive('\n') {
+        let start = offset;
+        offset += raw.len();
+        let content = raw.strip_suffix('\n').unwrap_or(raw);
+        let content = content.strip_suffix('\r').unwrap_or(content);
+        lines.push((start, offset, content));
+    }
+
     // Single-line-signature variants (e.g. `archive_restore`, `delete`).
     let start = lines
         .iter()
-        .position(|l| l.starts_with(&sig_a) || l.starts_with(&sig_b))?;
+        .position(|(_, _, l)| l.starts_with(&sig_a) || l.starts_with(&sig_b))?;
     let end = lines[start + 1..]
         .iter()
-        .position(|l| *l == "    }")
+        .position(|(_, _, l)| *l == "    }")
         .map(|off| start + 1 + off)?;
-    // Byte offsets back into the original string so the returned slice keeps
-    // the verbatim source (line-join would drop the original line endings).
-    let begin = src
-        .lines()
-        .take(start)
-        .map(|l| l.len() + 1)
-        .sum::<usize>()
-        .min(src.len());
-    let finish = src
-        .lines()
-        .take(end + 1)
-        .map(|l| l.len() + 1)
-        .sum::<usize>()
-        .min(src.len());
-    Some(&src[begin..finish])
+    // Verbatim slice of the original source (line-join would drop the
+    // original line endings).
+    Some(&src[lines[start].0..lines[end].1])
 }
 
 /// The span extractor is the load-bearing part of both assertions below —
 /// if it silently returned an empty or mis-bounded slice, every assertion
 /// would pass vacuously. Prove it works before trusting it.
+///
+/// Probes an EARLY and a LATE function deliberately. The original version of
+/// this guard probed only `store_with_embedding`, which sits early enough in
+/// the file that the CRLF offset drift had not yet exceeded one span length —
+/// so the slice still landed inside the right body and the guard passed while
+/// four LATE funnels were being mis-read on Windows. A drift bug is
+/// proportional to how far into the file the scan has walked, so the guard has
+/// to assert at the far end of the file to be meaningful.
 #[test]
 fn span_extractor_is_load_bearing() {
     let src = adapter_source();
+
+    // --- EARLY function -------------------------------------------------
     let span = fn_span(&src, "store_with_embedding").expect("store_with_embedding must exist");
+    // `starts_with`, NOT `contains`: an offset that drifts by even ONE byte
+    // still `contains` the signature (the slice merely begins a few bytes
+    // early), so a `contains` assertion cannot detect drift at all. Anchoring
+    // the exact start is what makes this guard load-bearing.
     assert!(
-        span.contains("async fn store_with_embedding("),
-        "span must begin at the target signature"
+        span.starts_with("    async fn store_with_embedding(")
+            || span.starts_with("    pub async fn store_with_embedding("),
+        "span must begin EXACTLY at the target signature line, got: {:?}",
+        &span[..span.len().min(80)]
     );
     assert!(
         span.contains("INSERT INTO memories"),
@@ -160,10 +194,109 @@ fn span_extractor_is_load_bearing() {
         !span.contains("async fn capture_turn_idempotent("),
         "span must NOT bleed into a sibling function"
     );
+
+    // --- LATE function (the accumulated-drift detector) -----------------
+    // `apply_remote_memory` is one of the funnels the CRLF drift actually
+    // mis-read; it lives near the end of the adapter, so any offset error
+    // that accumulates per line is maximal here.
+    let late = fn_span(&src, "apply_remote_memory").expect("apply_remote_memory must exist");
+    assert!(
+        late.starts_with("    async fn apply_remote_memory(")
+            || late.starts_with("    pub async fn apply_remote_memory("),
+        "the LATE span must begin EXACTLY at its own signature — this is the \
+         assertion that catches per-line offset drift (e.g. a CRLF checkout, \
+         where the accumulated error is maximal this deep into the file) \
+         before Windows CI does. Got: {:?}",
+        &late[..late.len().min(80)]
+    );
+    assert!(
+        late.contains("apply_remote_memory upsert"),
+        "the LATE span must contain apply_remote_memory's own error label"
+    );
+    assert!(
+        !late.contains("async fn merge_inbound("),
+        "the LATE span must NOT bleed into the following function"
+    );
+
     assert!(
         fn_span(&src, "a_function_that_does_not_exist_2393").is_none(),
         "a missing function must be reported, never silently skipped"
     );
+}
+
+/// Regression pin for the CRLF offset-drift bug that red-ded Windows CI while
+/// Linux stayed green (`\n` is genuinely one byte there, so the faulty
+/// `len() + 1` arithmetic was accidentally correct).
+///
+/// Constructs a synthetic adapter with `\r\n` terminators and asserts
+/// `fn_span` still returns the CORRECT body. The two functions are ordered so
+/// that a one-byte-per-line under-count would push the second span's start
+/// backwards into the first function's body — the exact production symptom.
+#[test]
+fn fn_span_is_crlf_correct() {
+    let lf = concat!(
+        "impl PostgresStore {\n",
+        "    async fn early_funnel(&self) -> Result<()> {\n",
+        "        // padding line to build up offset drift\n",
+        "        // padding line to build up offset drift\n",
+        "        let marker = \"EARLY_ONLY_MARKER\";\n",
+        "        Ok(())\n",
+        "    }\n",
+        "\n",
+        "    async fn late_funnel(&self) -> Result<()> {\n",
+        "        let marker = \"LATE_ONLY_MARKER\";\n",
+        "        Ok(())\n",
+        "    }\n",
+        "}\n",
+    );
+    let crlf = lf.replace('\n', "\r\n");
+
+    for (label, src) in [("LF", lf), ("CRLF", crlf.as_str())] {
+        // `starts_with`, NOT `contains`. The accumulated drift over a fixture
+        // this small is only a handful of bytes — far too little to reach a
+        // neighbouring marker — so a `contains`-based assertion passes even
+        // against the buggy arithmetic and pins NOTHING. (Verified: an earlier
+        // draft of this very test did exactly that.) Anchoring the exact start
+        // byte is what detects a one-byte-per-line error.
+        let early = fn_span(src, "early_funnel")
+            .unwrap_or_else(|| panic!("{label}: early_funnel span must be found"));
+        assert!(
+            early.starts_with("    async fn early_funnel("),
+            "{label}: early span must begin EXACTLY at its own signature, got: {:?}",
+            &early[..early.len().min(60)]
+        );
+        assert!(
+            early.contains("EARLY_ONLY_MARKER"),
+            "{label}: early span must contain its own body"
+        );
+        assert!(
+            !early.contains("LATE_ONLY_MARKER"),
+            "{label}: early span must not bleed into the later function"
+        );
+
+        let late = fn_span(src, "late_funnel")
+            .unwrap_or_else(|| panic!("{label}: late_funnel span must be found"));
+        assert!(
+            late.starts_with("    async fn late_funnel("),
+            "{label}: late span must begin EXACTLY at its OWN signature — under \
+             the old `len() + 1` arithmetic this drifted backwards by one byte \
+             per preceding line on CRLF. Got: {:?}",
+            &late[..late.len().min(60)]
+        );
+        assert!(
+            late.contains("LATE_ONLY_MARKER"),
+            "{label}: late span must contain its own body"
+        );
+        assert!(
+            !late.contains("EARLY_ONLY_MARKER"),
+            "{label}: late span must NOT contain the earlier function's body"
+        );
+        // The span must also END exactly at its closing brace line.
+        assert!(
+            late.trim_end().ends_with("    }"),
+            "{label}: late span must end at its own closing brace"
+        );
+    }
 }
 
 /// #2393 (N12) — every postgres funnel that persists a `memories` row must
