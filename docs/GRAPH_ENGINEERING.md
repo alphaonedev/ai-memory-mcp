@@ -401,7 +401,7 @@ provenance decay into folklore:
 | Rule | Incident |
 |---|---|
 | R-101 build daemon | fourteen concurrent lane target trees filled a 912 GB volume to 1.4 GB free |
-| R-202 self-skip ≠ pass | CI postgres has no AGE; every AGE test self-skipped to exit 0 |
+| R-202 self-skip ≠ pass | the PR-gating postgres job runs an AGE-less image, so AGE-gated tests self-skip to exit 0 on that gate (the coverage job does run a live AGE service) |
 | R-203 prove load-bearing | a ghost-node test used a query path that silently falls back, so it passed against unfixed code |
 | R-204 `contains` blind to drift | a span guard passed while broken — `contains` cannot detect a one-byte offset at any distance |
 | R-206 static-guard sweep | five CI jobs lost to a single static guard that targeted test selection could not see |
