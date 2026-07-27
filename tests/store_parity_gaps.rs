@@ -2951,4 +2951,376 @@ mod postgres_side {
             );
         }
     }
+
+    // -----------------------------------------------------------------
+    // v1.0.0 #2393 (N12) — kind_provenance on every postgres write funnel
+    // -----------------------------------------------------------------
+    //
+    // The v79/#1945 `kind_provenance` column records HOW a memory's
+    // `memory_kind` was assigned (closed vocab declared|channel_derived|
+    // regex|llm). It is denormalised at the persist funnel from the
+    // `metadata.kind_provenance` carrier. Every sqlite write funnel routes
+    // through `storage::insert` / `insert_if_newer`, both of which bind it —
+    // so a postgres funnel that omits the bind lands NULL where sqlite lands
+    // a value: the epistemic-typing provenance silently diverges by backend.
+    //
+    // `store()` and `store_batch()` (#2289) were already covered. These pin
+    // the six remaining funnels — the three issue #2393 named plus the three
+    // the completeness sweep found. Backend-blind structural coverage lives
+    // in `tests/qual_pg_write_funnel_parity_2393_2397.rs`, which runs with no
+    // database at all; these are the functional half that additionally
+    // proves the `$N` placeholder lines up with the right `.bind()`.
+    // Teardown-before-assert throughout (shared DB, #2287).
+
+    /// The closed-vocab value seeded on every #2393 fixture. `regex` is a
+    /// non-default member of the vocab, so a funnel that silently drops the
+    /// bind cannot accidentally pass.
+    const KP_2393: &str = "regex";
+
+    /// Seed `metadata.kind_provenance` on a fixture memory.
+    fn with_kind_provenance(id: &str) -> Memory {
+        let mut mem = sample_memory(id);
+        mem.metadata = serde_json::json!({ "kind_provenance": KP_2393 });
+        mem
+    }
+
+    async fn read_kind_provenance(
+        pg: &ai_memory::store::postgres::PostgresStore,
+        id: &str,
+    ) -> Option<String> {
+        sqlx::query_scalar("SELECT kind_provenance FROM memories WHERE id = $1")
+            .bind(id)
+            .fetch_one(pg.pool())
+            .await
+            .expect("read kind_provenance")
+    }
+
+    async fn purge_memory(pg: &ai_memory::store::postgres::PostgresStore, id: &str) {
+        let _ = sqlx::query("DELETE FROM memories WHERE id = $1")
+            .bind(id)
+            .execute(pg.pool())
+            .await;
+    }
+
+    /// #2393 — `store_with_embedding` is the PRIMARY embedded-write hot path
+    /// (every semantic-tier store). sqlite has no override, so its trait
+    /// default forwards to `store()` -> `storage::insert`, which binds the
+    /// column; postgres dropped it on its busiest funnel.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_store_with_embedding_persists_kind_provenance_2393() {
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else { return };
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let mem = with_kind_provenance(&format!("pg-2393-emb-{run}"));
+        let ctx = ai_memory::store::CallerContext::for_admin("parity-test-2393");
+
+        let id = MemoryStore::store_with_embedding(&pg, &ctx, &mem, None, None)
+            .await
+            .expect("store_with_embedding");
+
+        let kp = read_kind_provenance(&pg, &id).await;
+        purge_memory(&pg, &id).await;
+        assert_eq!(
+            kp.as_deref(),
+            Some(KP_2393),
+            "#2393: store_with_embedding must persist kind_provenance (sqlite does)"
+        );
+    }
+
+    /// #2393 — L4 turn capture. The sqlite twin
+    /// (`storage::capture_turn_idempotent`) funnels through
+    /// `storage::insert`, which binds the column.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_capture_turn_persists_kind_provenance_2393() {
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else { return };
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let write = ai_memory::models::CaptureTurnWrite {
+            memory: with_kind_provenance(&format!("pg-2393-cap-{run}")),
+            sha256: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            host_kind: "claude-code".to_string(),
+            host_session_id: format!("sess-2393-{run}"),
+            host_turn_index: 1,
+            recovered_at_ms: chrono::Utc::now().timestamp_millis(),
+            signed_event: ai_memory::signed_events::SignedEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                agent_id: "ai:host".to_string(),
+                event_type: "memory_capture_turn".to_string(),
+                payload_hash: vec![0u8; 32],
+                signature: None,
+                attest_level: "self_signed".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                ..ai_memory::signed_events::SignedEvent::default()
+            },
+        };
+        let ctx = ai_memory::store::CallerContext::for_admin("parity-test-2393");
+
+        let res = MemoryStore::capture_turn_idempotent(&pg, &ctx, &write)
+            .await
+            .expect("capture_turn_idempotent");
+        assert!(!res.dedup_hit, "sanity: a fresh key must be a real write");
+
+        let kp = read_kind_provenance(&pg, &res.memory_id).await;
+        let _ = sqlx::query("DELETE FROM transcript_line_dedup WHERE memory_id = $1")
+            .bind(&res.memory_id)
+            .execute(pg.pool())
+            .await;
+        purge_memory(&pg, &res.memory_id).await;
+        assert_eq!(
+            kp.as_deref(),
+            Some(KP_2393),
+            "#2393: capture_turn_idempotent must persist kind_provenance (sqlite does)"
+        );
+    }
+
+    /// #2393 — L2 transcript recovery. The sqlite twin
+    /// (`storage::recover_turn_idempotent`) funnels through
+    /// `storage::insert`, which binds the column.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_recover_turn_persists_kind_provenance_2393() {
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else { return };
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let write = ai_memory::models::RecoverTurnWrite {
+            memory: with_kind_provenance(&format!("pg-2393-rec-{run}")),
+            normalized_sha256: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            raw_sha256: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            host_kind: "claude-code".to_string(),
+            transcript_path: "/dev/null".to_string(),
+            host_session_id: None,
+            host_turn_index: None,
+            recovered_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let ctx = ai_memory::store::CallerContext::for_admin("parity-test-2393");
+
+        let res = MemoryStore::recover_turn_idempotent(&pg, &ctx, &write)
+            .await
+            .expect("recover_turn_idempotent");
+        assert!(!res.dedup_hit, "sanity: a fresh sha must be a real write");
+
+        let kp = read_kind_provenance(&pg, &res.memory_id).await;
+        let _ = sqlx::query("DELETE FROM transcript_line_dedup WHERE memory_id = $1")
+            .bind(&res.memory_id)
+            .execute(pg.pool())
+            .await;
+        purge_memory(&pg, &res.memory_id).await;
+        assert_eq!(
+            kp.as_deref(),
+            Some(KP_2393),
+            "#2393: recover_turn_idempotent must persist kind_provenance (sqlite does)"
+        );
+    }
+
+    /// #2393 (NET-NEW, not named in the issue) — the append-and-archive
+    /// SUPERSEDE funnel mints a brand-new row that inherits the old row's
+    /// metadata. The sqlite twin routes through `storage::insert`, so the
+    /// provenance survived a supersede there and was reset to NULL on pg.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_supersede_persists_kind_provenance_2393() {
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else { return };
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let mem = with_kind_provenance(&format!("pg-2393-sup-{run}"));
+        let ctx = ai_memory::store::CallerContext::for_admin("parity-test-2393");
+        let old_id = MemoryStore::store(&pg, &ctx, &mem).await.expect("store");
+
+        let patch = ai_memory::store::UpdatePatch {
+            content: Some("superseded content".to_string()),
+            ..Default::default()
+        };
+        let (archived_id, new_id) = pg
+            .update_with_archive_on_supersede(
+                &old_id,
+                patch,
+                None,
+                ai_memory::models::EditSource::Llm,
+            )
+            .await
+            .expect("update_with_archive_on_supersede");
+        assert_eq!(
+            archived_id, old_id,
+            "sanity: the OLD row is the archived id"
+        );
+
+        let kp = read_kind_provenance(&pg, &new_id).await;
+        purge_memory(&pg, &new_id).await;
+        let _ = sqlx::query("DELETE FROM archived_memories WHERE id = $1")
+            .bind(&old_id)
+            .execute(pg.pool())
+            .await;
+        assert_eq!(
+            kp.as_deref(),
+            Some(KP_2393),
+            "#2393: the superseding row must carry kind_provenance forward (sqlite does)"
+        );
+    }
+
+    /// #2393 (NET-NEW, not named in the issue) — the FEDERATION RECEIVE
+    /// funnel. The sqlite twin `insert_if_newer` binds it (#2333/FBL-03) and
+    /// its comment already CLAIMED postgres parity that was never wired, so
+    /// every memory replicated INTO a pg node landed provenance-blind.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_apply_remote_memory_persists_kind_provenance_2393() {
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else { return };
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let mem = with_kind_provenance(&format!("pg-2393-fed-{run}"));
+        let ctx = ai_memory::store::CallerContext::for_admin("parity-test-2393");
+
+        let id = MemoryStore::apply_remote_memory(&pg, &ctx, &mem)
+            .await
+            .expect("apply_remote_memory");
+
+        let kp = read_kind_provenance(&pg, &id).await;
+        purge_memory(&pg, &id).await;
+        assert_eq!(
+            kp.as_deref(),
+            Some(KP_2393),
+            "#2393: the federation receive funnel must persist kind_provenance \
+             (sqlite insert_if_newer does)"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // v1.0.0 #2397 (N17) — AGE unprojection on the supersede funnel
+    // -----------------------------------------------------------------
+
+    /// #2397 — `update_with_archive_on_supersede` hard-DELETEs the OLD row
+    /// after archiving it. The AGE `memory_graph` projection is MERGE-only,
+    /// so without an explicit `DETACH DELETE` the superseded id survived as a
+    /// ghost `:Memory` node whose incident edges AGE-routed `kg_query` kept
+    /// serving — the derived graph serving deleted state as live. Every
+    /// sibling hard-delete path already unprojected; this was the last gap.
+    /// Requires an AGE-enabled postgres (`AI_MEMORY_TEST_AGE_URL`); skips
+    /// cleanly otherwise, including when the target resolves to the CTE
+    /// backend (where nothing is projected and the check is vacuous).
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_AGE_URL — Track C blocker per issue #79"]
+    async fn pg_supersede_unprojects_from_age_2397() {
+        use ai_memory::store::{KgBackend, MemoryStore, postgres::PostgresStore};
+        let Ok(url) = std::env::var("AI_MEMORY_TEST_AGE_URL") else {
+            eprintln!("skip: AI_MEMORY_TEST_AGE_URL not set");
+            return;
+        };
+        let pg = PostgresStore::connect(&url).await.expect("connect");
+        if !matches!(pg.kg_backend(), KgBackend::Age) {
+            eprintln!("skip: AI_MEMORY_TEST_AGE_URL target did not resolve KgBackend::Age");
+            return;
+        }
+        let ctx = ai_memory::store::CallerContext::for_admin("parity-test-2397");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let a_id = format!("pg-2397-a-{run}");
+        let b_id = format!("pg-2397-b-{run}");
+        let a = sample_memory(&a_id);
+        let b = sample_memory(&b_id);
+        MemoryStore::store(&pg, &ctx, &a).await.expect("store a");
+        MemoryStore::store(&pg, &ctx, &b).await.expect("store b");
+        let link = ai_memory::models::MemoryLink {
+            source_id: a_id.clone(),
+            target_id: b_id.clone(),
+            relation: ai_memory::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            valid_from: None,
+            valid_until: None,
+            observed_by: None,
+            signature: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        };
+        MemoryStore::link(&pg, &ctx, &link)
+            .await
+            .expect("link a->b");
+        // Probe the AGE graph DIRECTLY, never through `kg_query`: the
+        // dispatcher silently falls back to the relational recursive-CTE on
+        // any AGE runtime failure, and the CTE reads the (already-cascaded)
+        // `memory_links` table — so a kg_query-based assertion would report
+        // "no ghost" even with the projection still holding one, and the
+        // regression would pass vacuously against the pre-fix binary
+        // (empirically confirmed). Counting `:Memory` nodes by id in
+        // `memory_graph` is the only probe that actually sees the ghost.
+        let before = age_memory_node_count(&pg, &a_id).await;
+        assert_eq!(
+            before, 1,
+            "sanity: link() must MERGE an AGE :Memory node for the source"
+        );
+
+        // Supersede A. The OLD id is archived + hard-deleted; its AGE node
+        // and every incident edge must go with it.
+        let patch = ai_memory::store::UpdatePatch {
+            content: Some("superseded for 2397".to_string()),
+            ..Default::default()
+        };
+        let (_archived, new_id) = pg
+            .update_with_archive_on_supersede(
+                &a_id,
+                patch,
+                None,
+                ai_memory::models::EditSource::Llm,
+            )
+            .await
+            .expect("update_with_archive_on_supersede");
+
+        let ghost = age_memory_node_count(&pg, &a_id).await;
+
+        // Teardown BEFORE the assert (shared DB, #2287).
+        purge_memory(&pg, &new_id).await;
+        purge_memory(&pg, &b_id).await;
+        let _ = sqlx::query("DELETE FROM archived_memories WHERE id = $1")
+            .bind(&a_id)
+            .execute(pg.pool())
+            .await;
+
+        assert_eq!(
+            ghost, 0,
+            "#2397: a superseded memory must be UNPROJECTED from AGE — the \
+             memory_graph projection must never keep a ghost :Memory node (and \
+             its incident edges) for a row that no longer exists relationally"
+        );
+    }
+
+    /// Count `:Memory` nodes in the AGE `memory_graph` projection carrying
+    /// `id = memory_id`. Speaks Cypher directly (LOAD + transaction-scoped
+    /// `search_path`, the same session prelude
+    /// `PostgresStore::kg_query_cypher` uses) so the assertion can never be
+    /// satisfied by the dispatcher's relational-CTE fallback.
+    async fn age_memory_node_count(
+        pg: &ai_memory::store::postgres::PostgresStore,
+        memory_id: &str,
+    ) -> i64 {
+        let mut tx = pg.pool().begin().await.expect("begin age probe tx");
+        // A role-level LOAD refusal is tolerated on fleets where
+        // shared_preload_libraries already provides the library.
+        let _ = sqlx::query("LOAD 'age'").execute(&mut *tx).await;
+        sqlx::query("SET LOCAL search_path = ag_catalog, \"$user\", public")
+            .execute(&mut *tx)
+            .await
+            .expect("set age search_path");
+        // AGE requires the third `cypher()` argument to be a bare Param node
+        // (a formatted agtype literal is rejected: "third argument of cypher
+        // function must be a parameter"), so the id is inlined into the
+        // Cypher body instead. `memory_id` is a test-generated
+        // uuid-suffixed literal with no quote characters, so there is no
+        // injection surface — the production `kg_query_cypher` inlines its
+        // UUID-validated start id for the same AGE limitation.
+        assert!(
+            !memory_id.contains('\'') && !memory_id.contains('$'),
+            "age probe: fixture ids must be quote-free"
+        );
+        let sql = format!(
+            "SELECT count(*) FROM cypher('memory_graph', \
+             $$ MATCH (n:Memory {{id: '{memory_id}'}}) RETURN n $$) AS (n agtype)"
+        );
+        let count: i64 = sqlx::query_scalar(&sql)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("age :Memory node probe");
+        tx.commit().await.expect("commit age probe tx");
+        count
+    }
 }
