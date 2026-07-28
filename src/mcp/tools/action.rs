@@ -286,6 +286,17 @@ pub fn handle_action_edges(conn: &rusqlite::Connection, params: &Value) -> Resul
 /// `blocks` edge holds, ordered `priority DESC, created_at ASC`, capped at
 /// `limit` (default 20).
 ///
+/// # Recovery of stranded work (#2419)
+///
+/// This surface is PENDING-only by design and #2419 did NOT change it. What
+/// changed is that work can no longer get stuck outside it: when a holder's
+/// lease expires, [`crate::actions::sweep_expired_leases`] returns a still-
+/// `claimed` action to `pending` over the already-legal state-machine edge, so
+/// the node re-appears here by itself. An `in_progress` action is deliberately
+/// NOT auto-requeued (no legal `in_progress -> pending` edge — re-offering work
+/// a live worker may still be executing would risk double execution); it stays
+/// reachable via `memory_action_list { state: "in_progress" }`.
+///
 /// # Errors
 /// Returns the stringified `rusqlite` error on query failure.
 pub fn handle_action_frontier(
@@ -788,7 +799,12 @@ impl McpTool for ActionFrontierTool {
         "Rank the UNBLOCKED coordination-action frontier (#1709)."
     }
     fn docs() -> &'static str {
-        "Pillar 1 (#1709 §11.4): the ranked frontier of pending actions whose prerequisites/gates are done and that no active blocker holds."
+        "Pillar 1 (#1709 §11.4): the ranked frontier of pending actions whose prerequisites/gates are done and that no active blocker holds. \
+         Recovery contract (#2419): the frontier lists PENDING actions only, so an action a worker claimed is deliberately absent while that worker holds it. \
+         If the worker dies, its lease expires and the background lease sweep transitions the action `claimed` -> `pending` over the existing legal edge (clearing `claimed_by`) — \
+         it then re-appears here on its own and no work is stranded. \
+         An action already advanced to `in_progress` is NOT auto-requeued (there is no legal `in_progress` -> `pending` edge); use `memory_action_list` with state=`in_progress` to census those, \
+         and `memory_action_transition` to resolve them explicitly."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<ActionFrontierRequest>()
@@ -832,7 +848,9 @@ impl McpTool for LeaseAcquireTool {
         "Acquire a single-holder lease on a coordination action (#1709)."
     }
     fn docs() -> &'static str {
-        "Pillar 1 (#1709): take an exclusive, TTL-bounded lease on an action; conflicts if held."
+        "Pillar 1 (#1709): take an exclusive, TTL-bounded lease on an action; conflicts if held. \
+         The TTL is a liveness contract (#2419): when it lapses the background sweep reclaims the lease AND, if the action is still `claimed`, \
+         returns it to `pending` so it re-appears on `memory_action_frontier` instead of being stranded. Heartbeat via `memory_lease_renew` to keep it."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<LeaseAcquireRequest>()
@@ -854,7 +872,8 @@ impl McpTool for LeaseRenewTool {
         "Heartbeat-renew an owned lease on a coordination action (#1709)."
     }
     fn docs() -> &'static str {
-        "Pillar 1 (#1709): extend an owned lease's TTL; errors if no lease is held by the caller."
+        "Pillar 1 (#1709): extend an owned lease's TTL; errors if no lease is held by the caller. \
+         Renew before expiry (#2419): a lapsed lease is reclaimed by the background sweep, which also returns a still-`claimed` action to `pending` for another holder."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<LeaseRenewRequest>()

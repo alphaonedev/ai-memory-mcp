@@ -959,7 +959,21 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // resolving and set the ceiling from that measurement. (This lane's own
     // prior 30_900 was itself a borrowed max-candidate and would have gone
     // red here.) Real relief is the #650-class module split.
-    ("src/store/postgres.rs", 31_200),
+    // 2026-07-28 (#2419 lease-expiry requeue) — `lease_sweep_expired` gains the
+    // same-transaction `claimed -> pending` requeue of actions its lease delete
+    // strands (a `begin()` + a set-based `UPDATE ... WHERE id = ANY($2) AND
+    // state = 'claimed' RETURNING id` + the per-id audit fan-out), the #2371
+    // audit helper is generalised to take an `event_type` (rename, no size
+    // change), and the live-PG regression
+    // `lease_sweep_expired_requeues_stranded_claimed_action_2419` lands. The
+    // pg test MUST live inline: it reads the private `store.pool` for the
+    // `signed_events` assertion, exactly as its #2371 sibling does.
+    // MEASURED post-change: 31_199 — i.e. the prior 31_200 left ONE line of
+    // headroom on a file THREE concurrent lanes touch. Per this entry's own
+    // doctrine (measure after resolving; concurrent lanes STACK), bumped
+    // 31_200 -> 31_320 = 31_199 + 121 headroom. Real relief is the #650-class
+    // module split.
+    ("src/store/postgres.rs", 31_320),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

@@ -561,29 +561,125 @@ pub fn lease_get(
         .optional()
 }
 
+/// `tracing` target for the lease-expiry reclaim/requeue sweep. Hoisted here
+/// (the lowest layer that logs under it) so the background loop
+/// [`crate::background::lease_sweep`] and this module share ONE spelling of
+/// the target rather than scattering the literal (pm-v3.1 hardcoded-literal
+/// gate).
+pub const LEASE_SWEEP_TRACE_TARGET: &str = "lease.sweep";
+
+/// Requeue an action stranded in `claimed` whose lease has just been reclaimed
+/// by the expiry sweep (#2419).
+///
+/// **Why this exists.** `memory_action_frontier` returns only actions in
+/// `pending`. Before #2419 the sweep DELETEd the expired lease row and left the
+/// action in `claimed`, so a node whose holder died was simultaneously (a) not
+/// leased by anyone and (b) invisible to `frontier` FOREVER — the work was
+/// neither done nor surfaceable. The lease and the state had DIVERGED: the
+/// substrate already considered the action free (any caller could
+/// [`lease_acquire`] it) while the state machine still said "claimed". This
+/// reconverges the two in the same transaction as the lease reclaim.
+///
+/// **No new state, no migration.** `claimed -> pending` is ALREADY a legal edge
+/// in [`crate::models::ActionState::can_transition_to`], so this reuses
+/// [`transition_cas`] — the state guard lives in the `UPDATE ... WHERE state = ?`
+/// predicate, so an action a live worker concurrently advanced to `in_progress`
+/// loses the CAS and is left ALONE (never yanked out from under a worker that
+/// is genuinely progressing). `claimed_by` is cleared (`None`) exactly as a
+/// caller-driven `claimed -> pending` transition would.
+///
+/// **Scope (documented residual).** Only `claimed` is requeued. `in_progress`
+/// has NO legal edge back to `pending` in the state machine, so an
+/// `in_progress` node whose lease expired is NOT auto-requeued here — adding
+/// that edge would be a state-machine change, not a sweep fix. Such a node is
+/// still surfaced: the sweep emits its
+/// [`crate::coordination_audit::LEASE_SWEEP_RECLAIM`] audit row, and the node
+/// remains listable via `memory_action_list { state: "in_progress" }`.
+///
+/// Returns `true` when the requeue applied.
+///
+/// # Errors
+/// Propagates the `rusqlite` update/query error.
+fn requeue_claimed_after_lease_expiry(
+    conn: &Connection,
+    action_id: &str,
+    now: i64,
+) -> rusqlite::Result<bool> {
+    use crate::models::ActionState;
+    Ok(matches!(
+        transition_cas(
+            conn,
+            action_id,
+            ActionState::Claimed,
+            ActionState::Pending,
+            None,
+            now,
+        )?,
+        CasOutcome::Applied(_)
+    ))
+}
+
+/// Reclaim (delete) every lease whose `expires_at <= now`, releasing the
+/// action for a fresh holder, AND requeue any action left stranded in `claimed`
+/// back to `pending` (#2419) so it re-appears on `memory_action_frontier`.
+/// Returns the reclaimed `(action_id, holder, requeued)` triples: the pair the
+/// caller audits plus whether the state requeue applied.
+///
+/// The `DELETE ... RETURNING` is atomic, so the returned set is EXACTLY the rows
+/// removed (no SELECT-then-DELETE TOCTOU where a concurrently renewed lease
+/// could be audited as reclaimed without being deleted). #2419 wraps the delete
+/// AND the requeues in ONE transaction (`unchecked_transaction` — both
+/// production callers hold a bare autocommit `&Connection`) so a crash can never
+/// leave the substrate with the lease gone but the state still `claimed`, which
+/// is precisely the stranded shape the fix exists to prevent.
+///
+/// # Errors
+/// Propagates the `rusqlite` delete/update/query error.
+fn sweep_expired_leases_reclaim(
+    conn: &Connection,
+    now: i64,
+) -> rusqlite::Result<Vec<(String, String, bool)>> {
+    let tx = conn.unchecked_transaction()?;
+    let expired = {
+        let mut stmt =
+            tx.prepare("DELETE FROM leases WHERE expires_at <= ?1 RETURNING action_id, holder")?;
+        stmt.query_map(params![now], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<(String, String)>>>()?
+    };
+    let mut out = Vec::with_capacity(expired.len());
+    for (action_id, holder) in expired {
+        let requeued = requeue_claimed_after_lease_expiry(&tx, &action_id, now)?;
+        out.push((action_id, holder, requeued));
+    }
+    tx.commit()?;
+    Ok(out)
+}
+
 /// Reclaim (delete) every lease whose `expires_at <= now`, releasing the
 /// action for a fresh holder. Returns the reclaimed `(action_id, holder)`
 /// pairs so the caller can emit one coordination-audit `signed_events` row per
 /// FORCED reclamation (#2371) — the asymmetric twin of the voluntary
 /// [`lease_release`], which is the ONE lease op that previously left no
-/// forensic trace. The `DELETE ... RETURNING` is atomic, so the returned set is
-/// EXACTLY the rows removed (no SELECT-then-DELETE TOCTOU where a concurrently
-/// renewed lease could be audited as reclaimed without being deleted).
+/// forensic trace.
+///
+/// Since #2419 this ALSO requeues any action left stranded in `claimed` back to
+/// `pending` (see [`requeue_claimed_after_lease_expiry`]) in the same
+/// transaction as the lease delete — the requeue lives at THIS primitive, not
+/// only in the audited wrapper, so no caller can reclaim a lease without
+/// reconverging the action state and re-stranding the work.
 ///
 /// # Errors
-/// Propagates the `rusqlite` delete/query error.
+/// Propagates the `rusqlite` delete/update/query error.
 pub fn sweep_expired_leases(
     conn: &Connection,
     now: i64,
 ) -> rusqlite::Result<Vec<(String, String)>> {
-    let mut stmt =
-        conn.prepare("DELETE FROM leases WHERE expires_at <= ?1 RETURNING action_id, holder")?;
-    let reclaimed = stmt
-        .query_map(params![now], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
-    Ok(reclaimed)
+    Ok(sweep_expired_leases_reclaim(conn, now)?
+        .into_iter()
+        .map(|(action_id, holder, _requeued)| (action_id, holder))
+        .collect())
 }
 
 /// Reclaim expired leases via [`sweep_expired_leases`] AND emit one
@@ -595,16 +691,45 @@ pub fn sweep_expired_leases(
 /// already committed, so a rare append failure is WARN-logged inside
 /// [`crate::coordination_audit::emit`], never propagated.
 ///
+/// #2419 — an action that the reclaim also requeued `claimed -> pending`
+/// additionally emits [`crate::coordination_audit::ACTION_LEASE_EXPIRE_REQUEUE`].
+/// It is a SEPARATE slug from the lease row (and from the caller-driven
+/// [`crate::coordination_audit::ACTION_TRANSITION`]) for the same reason
+/// `LEASE_SWEEP_RECLAIM` is separate from `LEASE_RELEASE`: a FORCED state
+/// reversion an operator never requested must be distinguishable in the audit
+/// trail from one a caller asked for.
+///
 /// # Errors
-/// Propagates the `rusqlite` delete/query error from [`sweep_expired_leases`].
+/// Propagates the `rusqlite` delete/update/query error.
 pub fn sweep_expired_leases_audited(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
-    let reclaimed = sweep_expired_leases(conn, now)?;
-    for (action_id, holder) in &reclaimed {
+    let reclaimed = sweep_expired_leases_reclaim(conn, now)?;
+    let mut requeued_count = 0usize;
+    for (action_id, holder, requeued) in &reclaimed {
         crate::coordination_audit::emit(
             conn,
             crate::coordination_audit::LEASE_SWEEP_RECLAIM,
             holder,
             &[action_id.as_str(), holder.as_str()],
+        );
+        if *requeued {
+            requeued_count += 1;
+            crate::coordination_audit::emit(
+                conn,
+                crate::coordination_audit::ACTION_LEASE_EXPIRE_REQUEUE,
+                holder,
+                &[action_id.as_str(), holder.as_str()],
+            );
+        }
+    }
+    if requeued_count > 0 {
+        // obs-structured-fields: the count is a discrete queryable field, not
+        // text baked into the message, so a fleet aggregator can alert on a
+        // rising requeue rate (the signal that workers are dying mid-claim).
+        tracing::info!(
+            target: LEASE_SWEEP_TRACE_TARGET,
+            requeued = requeued_count,
+            reclaimed = reclaimed.len(),
+            "lease sweep requeued stranded claimed actions to pending"
         );
     }
     Ok(reclaimed.len())
