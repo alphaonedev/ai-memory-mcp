@@ -2330,8 +2330,16 @@ pub fn resolve_id(conn: &Connection, id: &str) -> Result<Option<Memory>> {
 pub fn touch(conn: &Connection, id: &str, short_extend: i64, mid_extend: i64) -> Result<()> {
     let now = Utc::now();
     let now_str = now.to_rfc3339();
-    let short_expires = (now + chrono::Duration::seconds(short_extend)).to_rfc3339();
-    let mid_expires = (now + chrono::Duration::seconds(mid_extend)).to_rfc3339();
+    // v1.0.0 #2418 (L-EXPIRY-CANON) — the extension floors are WRITES into
+    // `expires_at`, so they must render the ONE canonical fixed-UTC form
+    // (`validate::render_canonical_utc`) the #2332 create/update funnels and
+    // the v87 heal established. A bare `to_rfc3339()` here re-injected the
+    // `+00:00` / AutoSi-fraction rendering into the live column on every
+    // touch, re-opening the ingress v87 had closed.
+    let short_expires =
+        crate::validate::render_canonical_utc(now + chrono::Duration::seconds(short_extend));
+    let mid_expires =
+        crate::validate::render_canonical_utc(now + chrono::Duration::seconds(mid_extend));
 
     conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
 
@@ -2441,8 +2449,11 @@ pub fn touch_many(
     }
     let now = Utc::now();
     let now_str = now.to_rfc3339();
-    let short_expires = (now + chrono::Duration::seconds(short_extend)).to_rfc3339();
-    let mid_expires = (now + chrono::Duration::seconds(mid_extend)).to_rfc3339();
+    // v1.0.0 #2418 — canonical rendering on the write, as in `touch`.
+    let short_expires =
+        crate::validate::render_canonical_utc(now + chrono::Duration::seconds(short_extend));
+    let mid_expires =
+        crate::validate::render_canonical_utc(now + chrono::Duration::seconds(mid_extend));
 
     conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
 
@@ -2631,17 +2642,23 @@ pub fn fold_recall_accesses(
                  WHERE folded = 0 AND memory_id = ?1",
             )?;
             for (id, n, t_max_raw) in &agg {
-                // Normalize the ledger's `observed_at` stamp (sqlite
-                // strftime `...Z` form) into the substrate-wide
-                // `to_rfc3339()` (`+00:00`) spelling so the SQL text
-                // comparisons against `expires_at` /
-                // `last_accessed_at` stay format-consistent.
+                // Normalize the ledger's `observed_at` stamp into a
+                // `DateTime<Utc>` so the SQL text comparisons against
+                // `expires_at` / `last_accessed_at` stay format-consistent.
                 let t_max = chrono::DateTime::parse_from_rfc3339(t_max_raw)
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now());
                 let t_max_str = t_max.to_rfc3339();
-                let short_exp = (t_max + chrono::Duration::seconds(short_extend)).to_rfc3339();
-                let mid_exp = (t_max + chrono::Duration::seconds(mid_extend)).to_rfc3339();
+                // v1.0.0 #2418 — the fold's `MAX(expires_at, ?N)` floors are
+                // WRITES into `expires_at`; render the canonical fixed-UTC
+                // form so a fold never re-injects a `+00:00` / AutoSi-fraction
+                // rendering into the lexicographically-compared column.
+                let short_exp = crate::validate::render_canonical_utc(
+                    t_max + chrono::Duration::seconds(short_extend),
+                );
+                let mid_exp = crate::validate::render_canonical_utc(
+                    t_max + chrono::Duration::seconds(mid_extend),
+                );
                 bump_stmt.execute(params![n, t_max_str, short_exp, mid_exp, id])?;
                 promote_stmt.execute(params![now_str, id, PROMOTION_THRESHOLD])?;
                 if decay {
@@ -12447,6 +12464,29 @@ pub fn list_archived(
 /// `memory_transcript_links`) is regenerable telemetry and is NOT
 /// preserved by design. POSTGRES edge restore is a tracked follow-up
 /// (this commit wires sqlite only).
+/// v1.0.0 #2418 (L-EXPIRY-CANON) — read `archived_memories.original_expires_at`
+/// and return it in the ONE canonical fixed-UTC rendering.
+///
+/// Both `restore_archived*` funnels copy this column straight back into the
+/// LIVE `memories.expires_at` via `INSERT ... SELECT`, and sqlite cannot
+/// canonicalize inside SQL. Any archive row that predates the v87 heal — or
+/// that was re-materialized from an erasure cold-tier bundle written before it
+/// (`erasure::archive_sync::try_restore_archived_row_from_bundle`) — therefore
+/// re-injects a legacy rendering into the live, lexicographically-compared
+/// column. Canonicalizing here makes restore a HEAL rather than a re-infection.
+///
+/// Fail-safe in both directions: `NULL` stays `NULL` (a permanent row must not
+/// acquire a synthetic deadline) and an unparseable value passes through
+/// byte-for-byte (degrade, never destroy a value the gates admitted).
+fn canonical_archived_expiry(conn: &Connection, id: &str) -> Result<Option<String>> {
+    let raw: Option<String> = conn.query_row(
+        "SELECT original_expires_at FROM archived_memories WHERE id = ?1",
+        params![id],
+        |r| r.get(0),
+    )?;
+    Ok(crate::validate::canonical_valid_time_opt(raw.as_deref()))
+}
+
 pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
     let _erasure_guard = crate::erasure::archive_sync::coordination_lock_if_enabled(conn)?;
@@ -12518,6 +12558,11 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
         // a refusal short-circuits the transaction (outer ROLLBACK).
         let candidate = load_archived_as_memory(conn, id)?;
         consult_governance_pre_write(&candidate)?;
+        // v1.0.0 #2418 (L-EXPIRY-CANON) — ?6: the archive's
+        // `original_expires_at` in the canonical fixed-UTC rendering. Bound as
+        // a parameter because sqlite cannot canonicalize inside the
+        // INSERT...SELECT; see `canonical_archived_expiry`.
+        let restored_expiry = canonical_archived_expiry(conn, id)?;
         // #2059/#2102 — TRACT covenant clause 1 on the archive-RESTORE
         // funnel. Advisory-only (never refuses): a legacy archived row that
         // predates the covenant must stay restorable even under
@@ -12552,7 +12597,7 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
               kind_provenance, cid, cid_genesis, valid_from, valid_until)
              SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                     tags, priority, confidence, source, access_count, created_at,
-                    ?1, last_accessed_at, original_expires_at, metadata,
+                    ?1, last_accessed_at, ?6, metadata,
                     -- v1.0.0 #2167 (S8) restore/migrate HEAL: keep the
                     -- archived vector ONLY when its space matches the live
                     -- active space (?5). A foreign- or NULL-space vector has
@@ -12610,6 +12655,8 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
                 // v1.0.0 #2167 (S8) — ?5: the process-wide active-space fp
                 // (None → NULL) driving the restore heal above.
                 crate::embeddings::active_embedding_space(),
+                // v1.0.0 #2418 — ?6: canonicalized `original_expires_at`.
+                restored_expiry,
             ],
         )?;
         // #1771 — re-insert the preserved edge graph (both-endpoints-exist,
@@ -12744,6 +12791,11 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
         // SELECT above.
         let candidate = load_archived_as_memory(conn, id)?;
         consult_governance_pre_write(&candidate)?;
+        // v1.0.0 #2418 (L-EXPIRY-CANON) — ?6: the archive's
+        // `original_expires_at` in the canonical fixed-UTC rendering. Bound as
+        // a parameter because sqlite cannot canonicalize inside the
+        // INSERT...SELECT; see `canonical_archived_expiry`.
+        let restored_expiry = canonical_archived_expiry(conn, id)?;
         // #2059/#2102 — TRACT covenant clause 1 on the archive-RESTORE
         // funnel. Advisory-only (never refuses): a legacy archived row that
         // predates the covenant must stay restorable even under
@@ -12771,7 +12823,7 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
               kind_provenance, cid, cid_genesis, valid_from, valid_until)
              SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                     tags, priority, confidence, source, access_count, created_at,
-                    ?1, last_accessed_at, original_expires_at, metadata,
+                    ?1, last_accessed_at, ?6, metadata,
                     -- v1.0.0 #2167 (S8) restore/migrate HEAL: keep the
                     -- archived vector ONLY when its space matches the live
                     -- active space (?5). A foreign- or NULL-space vector has
@@ -12829,6 +12881,8 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
                 // v1.0.0 #2167 (S8) — ?5: the process-wide active-space fp
                 // (None → NULL) driving the restore heal above.
                 crate::embeddings::active_embedding_space(),
+                // v1.0.0 #2418 — ?6: canonicalized `original_expires_at`.
+                restored_expiry,
             ],
         )?;
         // #1771 — re-insert the preserved edge graph (both-endpoints-exist,
