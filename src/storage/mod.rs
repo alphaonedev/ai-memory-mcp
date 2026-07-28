@@ -16513,9 +16513,9 @@ pub fn memories_updated_since(
     // decrypts at-rest content on this federation catch-up outbound path
     // (the receiver re-seals under its own local key via `insert_if_newer`).
     // Omitting it would let the column read as NULL and serve the empty
-    // placeholder as the peer's content. The other named-column reader
-    // (`metadata` etc.) tolerates the addition because `row_to_memory`
-    // reads every column by name.
+    // placeholder as the peer's content. `row_to_memory` reads every
+    // column BY NAME, never by ordinal, so this list's ORDER is free but
+    // its MEMBERSHIP is load-bearing (see the #2384 note below).
     //
     // #2303 — this decrypt is LOAD-BEARING for `apply_remote_memory`
     // receive-seal safety: a sealed row's `content` column is a `""`
@@ -16524,11 +16524,59 @@ pub fn memories_updated_since(
     // receiver would re-seal an empty string under its own key —
     // content='' + a fresh envelope, an unrecoverable silent content
     // loss with no error anywhere in the pipe. Do not remove this
-    // decrypt or the `encrypted_envelope` column from `COLS`. Pinned by
+    // decrypt or narrow the projection so that `encrypted_envelope` stops
+    // being selected. Pinned by
     // `tests/encryption_at_rest.rs::federation_send_list_updated_since_decrypts_2303`.
+    //
+    // v1.0.0 #2384 (N2) — this list MUST name EVERY column `row_to_memory`
+    // reads. Pre-#2384 it named only 16 of them; the mapper reads BY NAME,
+    // so every unnamed column silently resolved to its Rust-side DEFAULT
+    // and the receiving peer then DURABLY PERSISTED those defaults via
+    // `apply_remote_memory` → `insert_if_newer`. A `Decision`-kind row with
+    // a bitemporal validity window crossed the node boundary as an
+    // `Observation` with valid_from/valid_until stripped, `version` reset to
+    // 1, and cid / lifecycle_state / source_uri / citations / source_span /
+    // entity_id / persona_version / reflection_depth / confidence_* all
+    // defaulted — silent, durable, cross-node corruption of the
+    // source-of-truth metadata. The postgres twin
+    // (`PostgresStore::list_memories_updated_since`) selects `*` and never
+    // had the defect, so a MIXED fleet corrupted rows only on the sqlite hop.
+    //
+    // Why an explicit list and not `*`: `memories` carries 39 columns, 8 of
+    // which the mapper never reads — including `embedding` (up to 3072xf32 =
+    // 12 KiB/row). `SELECT *` makes SQLite decode all 39 per row on a
+    // LIMIT-bounded catch-up page for no gain; measured on a 2000-row corpus
+    // with a 12 KiB embedding on every row, 20x1000-row pages:
+    // `*` = 1160-1218 ms vs this list = 1011-1018 ms (~+14%, ~+7 us/row).
+    // Federation catch-up is exactly the path that accumulates corpus-scale
+    // backlogs (#1578/#1579 B5), so that cost is not academic. Excluding the
+    // embedding columns is also CORRECT, not merely cheap: per #2167 a vector
+    // from the SENDER's embedding space must never be adopted by a receiver
+    // on a different space — the receiver re-derives its own from the durable
+    // TEXT, the North-Star "derived artifacts are disposable + regenerable"
+    // rule. The other exclusions are storage-internal (`cid_genesis`,
+    // `atom_of`, `atomised_into`, `mentioned_entity_id`) or denormalised from
+    // a projected carrier (`kind_provenance`, whose durable home is
+    // `metadata`); none is a `Memory` field, so none can cross the wire
+    // regardless of the projection.
+    //
+    // The list cannot silently drift back, which is what made the hand-list
+    // safe to keep. Three guards in
+    // `tests/federation_catchup_column_fidelity_2384.rs` fail CLOSED:
+    //   * a full-field parity test — the SEND path must return a `Memory`
+    //     identical to the targeted `SELECT *` read of a row whose every
+    //     field holds a non-default value (drops ANY column named here);
+    //   * a column census — every `memories` column must be classified as
+    //     projected-here or documented-derived, so a future migration's
+    //     column cannot escape the decision;
+    //   * a `Memory::FIELD_COUNT` pin — a new struct field forces the
+    //     fixture to cover it.
     const COLS: &str = "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
-                source, access_count, created_at, updated_at, last_accessed_at, \
-                expires_at, metadata, encrypted_envelope \
+                source, access_count, created_at, updated_at, last_accessed_at, expires_at, \
+                metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, \
+                source_uri, source_span, confidence_source, confidence_signals, \
+                confidence_decayed_at, encrypted_envelope, version, lifecycle_state, cid, \
+                valid_from, valid_until \
          FROM memories ";
     // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list. A
     // Tombstoned/Quarantined row must not relay onward on this federation
