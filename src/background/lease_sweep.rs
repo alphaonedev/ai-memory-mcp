@@ -76,11 +76,11 @@ where
             match lock.run_lease_sweep(now_unix) {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(
-                    target: "lease.sweep",
+                    target: crate::actions::LEASE_SWEEP_TRACE_TARGET,
                     "lease sweep reclaimed {n} expired lease(s)"
                 ),
                 Err(e) => tracing::warn!(
-                    target: "lease.sweep",
+                    target: crate::actions::LEASE_SWEEP_TRACE_TARGET,
                     "lease sweep failed: {e}"
                 ),
             }

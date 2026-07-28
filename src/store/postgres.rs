@@ -10833,19 +10833,25 @@ impl PostgresStore {
     }
 
     /// #2371 — postgres twin of the sqlite `crate::coordination_audit::emit`
-    /// for a FORCED lease reclamation. Builds the row from the SAME
+    /// for a FORCED lease-lifecycle event. Builds the row from the SAME
     /// [`crate::coordination_audit::coordination_payload_hash`] pre-image
     /// (`[action_id, holder]` joined by 0x1F) and the SAME `with_daemon_signature`
-    /// idiom, attributed to the reclaimed `holder`, so the
-    /// `coordination.lease_expire_reclaim` row persists + verifies identically
-    /// on both backends (K3 parity). Best-effort: an append failure is
-    /// WARN-logged and swallowed — the sweep DELETE already committed.
-    async fn emit_lease_sweep_reclaim_audit(&self, action_id: &str, holder: &str) {
+    /// idiom, attributed to the reclaimed `holder`, so the row persists +
+    /// verifies identically on both backends (K3 parity). Best-effort: an
+    /// append failure is WARN-logged and swallowed — the sweep transaction
+    /// already committed.
+    ///
+    /// #2419 generalised the hard-coded event type into the `event_type`
+    /// parameter so the `claimed -> pending` requeue
+    /// ([`crate::coordination_audit::ACTION_LEASE_EXPIRE_REQUEUE`]) rides the
+    /// same append path as [`crate::coordination_audit::LEASE_SWEEP_RECLAIM`]
+    /// instead of duplicating the builder.
+    async fn emit_coordination_lease_audit(&self, event_type: &str, action_id: &str, holder: &str) {
         let ts = Utc::now();
         let event = crate::signed_events::SignedEvent::with_daemon_signature(
             crate::coordination_audit::coordination_payload_hash(&[action_id, holder]),
             holder.to_string(),
-            crate::coordination_audit::LEASE_SWEEP_RECLAIM.to_string(),
+            event_type.to_string(),
             ts.to_rfc3339(),
             None,
         );
@@ -10862,8 +10868,8 @@ impl PostgresStore {
         if let Err(e) = pg_append_signed_event_with_chain(&self.pool, insert_row).await {
             tracing::warn!(
                 target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
-                action_id, holder,
-                "failed to append coordination.lease_expire_reclaim audit row: {e}"
+                action_id, holder, event_type,
+                "failed to append coordination lease audit row: {e}"
             );
         }
     }
@@ -21286,10 +21292,27 @@ impl MemoryStore for PostgresStore {
         // leaves the same tamper-evident coordination-audit trace the voluntary
         // lease ops do — the backend-parity twin of the sqlite
         // `crate::actions::sweep_expired_leases_audited` path.
+        //
+        // #2419 — the delete AND the `claimed -> pending` requeue of the actions
+        // it strands run in ONE transaction, the backend twin of the sqlite
+        // `sweep_expired_leases_reclaim`. Without the requeue an action whose
+        // holder died sat in `claimed` with no lease: not leased by anyone, yet
+        // invisible to `action_frontier` (which selects `state = 'pending'`)
+        // FOREVER. `claimed -> pending` is already a legal edge, so no state and
+        // no migration is added; the `AND a.state = '<claimed>'` predicate is
+        // the CAS guard (an action a live worker advanced to `in_progress`
+        // loses it and is left alone). The requeue is SET-BASED (`= ANY($2)`)
+        // rather than one statement per id so a large expired batch does not
+        // hold the write transaction open across N round trips.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("lease_sweep_expired.begin", e))?;
         let rows =
             sqlx::query("DELETE FROM leases WHERE expires_at <= $1 RETURNING action_id, holder")
                 .bind(now)
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("lease_sweep_expired", e))?;
         let mut reclaimed: Vec<(String, String)> = Vec::with_capacity(rows.len());
@@ -21302,10 +21325,58 @@ impl MemoryStore for PostgresStore {
                 .map_err(|e| to_store_err("lease_sweep_expired.holder", e))?;
             reclaimed.push((action_id, holder));
         }
+        let mut requeued: Vec<String> = Vec::new();
+        if !reclaimed.is_empty() {
+            let ids: Vec<String> = reclaimed.iter().map(|(id, _)| id.clone()).collect();
+            let sql = format!(
+                "UPDATE actions a SET state = '{pending}', claimed_by = NULL, updated_at = $1 \
+                  WHERE a.id = ANY($2) AND a.state = '{claimed}' RETURNING a.id",
+                pending = crate::models::ActionState::Pending.as_str(),
+                claimed = crate::models::ActionState::Claimed.as_str(),
+            );
+            let updated = sqlx::query(&sql)
+                .bind(now)
+                .bind(&ids)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("lease_sweep_expired.requeue", e))?;
+            for r in &updated {
+                requeued.push(
+                    r.try_get("id")
+                        .map_err(|e| to_store_err("lease_sweep_expired.requeue.id", e))?,
+                );
+            }
+        }
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("lease_sweep_expired.commit", e))?;
         // Best-effort audit append per reclaimed lease (the DELETE already
         // committed): a failure is WARN-logged, never cratering the sweep.
         for (action_id, holder) in &reclaimed {
-            self.emit_lease_sweep_reclaim_audit(action_id, holder).await;
+            self.emit_coordination_lease_audit(
+                crate::coordination_audit::LEASE_SWEEP_RECLAIM,
+                action_id,
+                holder,
+            )
+            .await;
+            if requeued.iter().any(|id| id == action_id) {
+                self.emit_coordination_lease_audit(
+                    crate::coordination_audit::ACTION_LEASE_EXPIRE_REQUEUE,
+                    action_id,
+                    holder,
+                )
+                .await;
+            }
+        }
+        if !requeued.is_empty() {
+            // obs-structured-fields — same field shape as the sqlite twin so one
+            // aggregator query covers both backends.
+            tracing::info!(
+                target: crate::actions::LEASE_SWEEP_TRACE_TARGET,
+                requeued = requeued.len(),
+                reclaimed = reclaimed.len(),
+                "lease sweep requeued stranded claimed actions to pending"
+            );
         }
         Ok(reclaimed.len())
     }
@@ -29738,6 +29809,136 @@ mod tests {
             .bind(&aid)
             .execute(&store.pool)
             .await;
+    }
+
+    /// #2419 (R-303 cross-backend parity) — postgres `lease_sweep_expired` must
+    /// requeue an action stranded in `claimed` back to `pending` so it re-appears
+    /// on `action_frontier`, exactly as the sqlite twin does. Pre-fix the action
+    /// stayed `claimed` with no lease: not leased by anyone, yet invisible to
+    /// `action_frontier` (which selects `state = 'pending'`) forever. Also pins
+    /// the CAS guard: an `in_progress` sibling in the same sweep is left alone.
+    /// Skips cleanly without `AI_MEMORY_TEST_POSTGRES_URL`.
+    #[tokio::test]
+    async fn lease_sweep_expired_requeues_stranded_claimed_action_2419() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("lease-requeue-2419-{unique}");
+        let stranded = format!("lease-requeue-2419-stranded-{unique}");
+        let live = format!("lease-requeue-2419-live-{unique}");
+        let holder = format!("holder-2419-{unique}");
+        let now = 1_700_100_000_i64;
+        let mk = |id: &str| crate::models::Action {
+            id: id.to_string(),
+            namespace: ns.clone(),
+            kind: "test.lease-requeue".to_string(),
+            state: crate::models::ActionState::Pending,
+            title: "stranded work".to_string(),
+            payload: serde_json::json!({}),
+            priority: 5,
+            agent_id: None,
+            claimed_by: None,
+            vector_clock: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+        };
+        for id in [&stranded, &live] {
+            store.action_create(&ctx, &mk(id)).await.expect("create");
+            store
+                .action_transition(
+                    &ctx,
+                    id,
+                    crate::models::ActionState::Claimed,
+                    Some(&holder),
+                    now,
+                )
+                .await
+                .expect("claim");
+            store
+                .lease_acquire(&ctx, id, &holder, now, now - 1)
+                .await
+                .expect("lease_acquire");
+        }
+        // The "live" node advanced past `claimed`; the CAS guard must skip it.
+        store
+            .action_transition(
+                &ctx,
+                &live,
+                crate::models::ActionState::InProgress,
+                Some(&holder),
+                now,
+            )
+            .await
+            .expect("in_progress");
+
+        assert_eq!(
+            store.lease_sweep_expired(now).await.expect("sweep"),
+            2,
+            "both expired leases reclaimed"
+        );
+
+        let fetched = store
+            .action_get(&ctx, &stranded)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            fetched.state,
+            crate::models::ActionState::Pending,
+            "the stranded claimed action is requeued to pending"
+        );
+        assert_eq!(
+            fetched.claimed_by, None,
+            "the dead holder's claim is cleared"
+        );
+        let live_row = store
+            .action_get(&ctx, &live)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            live_row.state,
+            crate::models::ActionState::InProgress,
+            "an in-progress action is NOT yanked back (CAS guard held)"
+        );
+
+        let frontier_ids: Vec<String> = store
+            .action_frontier(&ctx, &ns, 50)
+            .await
+            .expect("frontier")
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(
+            frontier_ids,
+            vec![stranded.clone()],
+            "the requeued node is visible on the frontier again"
+        );
+
+        let (requeue_rows,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM signed_events WHERE event_type = $1 AND agent_id = $2",
+        )
+        .bind(crate::coordination_audit::ACTION_LEASE_EXPIRE_REQUEUE)
+        .bind(&holder)
+        .fetch_one(&store.pool)
+        .await
+        .expect("query audit rows");
+        assert_eq!(
+            requeue_rows, 1,
+            "exactly one forced-requeue audit row (only the requeued action)"
+        );
+
+        for id in [&stranded, &live] {
+            let _ = sqlx::query("DELETE FROM actions WHERE id = $1")
+                .bind(id)
+                .execute(&store.pool)
+                .await;
+        }
     }
 
     /// FBL-22 — postgres `sweep_pending_action_timeouts` must flip a stale
