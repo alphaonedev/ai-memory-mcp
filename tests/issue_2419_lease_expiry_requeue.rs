@@ -6,7 +6,7 @@
 //!
 //! **The defect.** `memory_action_frontier` selects `state = 'pending'` only. A
 //! worker that claimed an action and then died left the node in `claimed`
-//! forever: not done, not leased by anyone (the hourly sweep already DELETEd
+//! forever: not done, not leased by anyone (the hourly sweep already deleted
 //! the expired lease row), and invisible to every `frontier` / `next` caller.
 //! The work was permanently lost unless an operator happened to know to run a
 //! full `memory_action_list` census by hand — which is exactly what this
