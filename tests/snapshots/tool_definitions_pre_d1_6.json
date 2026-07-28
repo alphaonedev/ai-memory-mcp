@@ -2632,7 +2632,7 @@
     },
     {
       "description": "Acquire a single-holder lease on a coordination action (#1709).",
-      "docs": "Pillar 1 (#1709): take an exclusive, TTL-bounded lease on an action; conflicts if held.",
+      "docs": "Pillar 1 (#1709): take an exclusive, TTL-bounded lease on an action; conflicts if held. The TTL is a liveness contract (#2419): when it lapses the background sweep reclaims the lease AND, if the action is still `claimed`, returns it to `pending` so it re-appears on `memory_action_frontier` instead of being stranded. Heartbeat via `memory_lease_renew` to keep it.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_lease_acquire`.",
@@ -2664,7 +2664,7 @@
     },
     {
       "description": "Heartbeat-renew an owned lease on a coordination action (#1709).",
-      "docs": "Pillar 1 (#1709): extend an owned lease's TTL; errors if no lease is held by the caller.",
+      "docs": "Pillar 1 (#1709): extend an owned lease's TTL; errors if no lease is held by the caller. Renew before expiry (#2419): a lapsed lease is reclaimed by the background sweep, which also returns a still-`claimed` action to `pending` for another holder.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_lease_renew`.",
@@ -3197,7 +3197,7 @@
     },
     {
       "description": "Rank the UNBLOCKED coordination-action frontier (#1709).",
-      "docs": "Pillar 1 (#1709 §11.4): the ranked frontier of pending actions whose prerequisites/gates are done and that no active blocker holds.",
+      "docs": "Pillar 1 (#1709 §11.4): the ranked frontier of pending actions whose prerequisites/gates are done and that no active blocker holds. Recovery contract (#2419): the frontier lists PENDING actions only, so an action a worker claimed is deliberately absent while that worker holds it. If the worker dies, its lease expires and the background lease sweep transitions the action `claimed` -> `pending` over the existing legal edge (clearing `claimed_by`) — it then re-appears here on its own and no work is stranded. An action already advanced to `in_progress` is NOT auto-requeued (there is no legal `in_progress` -> `pending` edge); use `memory_action_list` with state=`in_progress` to census those, and `memory_action_transition` to resolve them explicitly.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "v0.8.0 Pillar 1 (#1709 §11.4) — request body for `memory_action_frontier`.",

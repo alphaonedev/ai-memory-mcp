@@ -69,6 +69,14 @@ pub const LEASE_RELEASE: &str = "coordination.lease_release";
 /// only FORCED revocation of a lease — it MUST leave the same tamper-evident
 /// forensic trace the voluntary ops do (#2371).
 pub const LEASE_SWEEP_RECLAIM: &str = "coordination.lease_expire_reclaim";
+/// Forced `claimed -> pending` requeue of an action whose lease the background
+/// expiry sweeper reclaimed (#2419). Distinct from [`ACTION_TRANSITION`] (a
+/// CALLER-requested state change) for the same reason [`LEASE_SWEEP_RECLAIM`]
+/// is distinct from [`LEASE_RELEASE`]: this reversion is FORCED by the
+/// substrate, so an auditor must be able to tell it apart from one an operator
+/// asked for. Emitted only when the requeue actually applied (the
+/// `state = 'claimed'` CAS guard held).
+pub const ACTION_LEASE_EXPIRE_REQUEUE: &str = "coordination.action_lease_expire_requeue";
 /// Attested-checkpoint creation (`memory_checkpoint_create`).
 pub const CHECKPOINT_CREATE: &str = "coordination.checkpoint_create";
 /// Attested-checkpoint resolution (`memory_checkpoint_resolve`).
