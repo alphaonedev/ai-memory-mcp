@@ -273,6 +273,146 @@ from the loop.
 
 ---
 
+## 3.5 Node contracts — output is DATA, not a message
+
+**Every node's output is validated against a JSON schema at the tool boundary.**
+A shape mismatch is rejected and re-asked; it never reaches the orchestrator as
+prose to be mined by hand.
+
+This is not a style preference. For most of this campaign exactly ONE edge had a
+contract — `scripts/review.sh`, which requires
+
+```
+RULE: <rule-id> | ISSUE: <what is wrong, specifically, with file:line>
+```
+
+and then does `grep -oE '^RULE: [A-Z0-9-]+' | sort | uniq -c | sort -rn`. That
+roll-up — the one that turns *a rule cited three times* into *one badly-written
+rule* — is only possible **because the edge has a shape**. Every other edge
+returned a fenced `Q1:/Q2:/Q3:` prose block that the orchestrator read and
+re-typed.
+
+The cost was not hypothetical. Issue #2436 was filed with the **wrong line
+numbers** because its citations were transcribed out of a paragraph instead of
+consumed from a field. Three of the four R-405 violations in this campaign
+happened inside a parse-and-hope step.
+
+`executor/contracts.py` now defines the shapes and enforces them:
+
+| contract | required fields | what it makes impossible |
+|---|---|---|
+| `finding` | `claim`, `citation`, `evidence`, `severity` | a citation that does not resolve |
+| `vote` | `verdict`, `confidence`, `findings`, `killer_objection` | a refutation buried in a paragraph — `refutes` is a **field** |
+| `lane` | `landed`, `test_fails_before_fix`, `cross_backend`, `footprint` | claiming a fix landed without a load-bearing test |
+
+Two rules are enforced mechanically rather than by reading:
+
+- **Citations must match `file:line`.** `src/store/postgres.rs:5677` passes;
+  *"around line 5677 in the postgres store"* is rejected. A citation the
+  orchestrator has to interpret is a citation it will eventually retype wrong.
+- **R-203 is a boolean.** `landed: true` with `test_fails_before_fix: false`
+  raises `ContractViolation`. A test that passes against unfixed code proves
+  nothing, and a bool cannot be hedged the way a sentence can.
+
+The contract travels **with** the dispatch (`contracts.prompt_suffix(kind)`) —
+a contract the node never sees is a contract the node cannot meet.
+
+---
+
+## 3.6 Pipeline by default; a barrier must earn its wait
+
+A **barrier** holds every item to the pace of the slowest one. It is correct in
+exactly three cases:
+
+1. a stage genuinely needs the **whole set** (cross-set dedupe, ranking a
+   complete list),
+2. an early exit on the total ("zero findings → skip verification entirely"),
+3. a stage whose prompt compares against *the other findings*.
+
+*"It reads more cleanly"* is not one of them — and it was the actual reason this
+campaign used barriers everywhere. Wave 1 was drained in full before Wave 2
+started; the 1×5 was drained to the last voter before anything was acted on. The
+framing voter returned in ~7 minutes and the data-tier voter in ~12, so a
+**total-data-loss finding** (`ai-memory backup` fails open on postgres, #2444)
+sat idle behind voters that had nothing to do with it.
+
+`executor/dispatch.py` provides both, named for what they cost:
+
+- `pipeline(items, *stages)` — each item flows through **every** stage
+  independently, no synchronization point. Wall-clock is the slowest single-item
+  *chain*, not the sum of slowest-per-stage. A stage that raises drops that item
+  to `None` and skips its remaining stages, so one bad item never sinks the
+  batch.
+- `barrier(thunks)` — awaits all. Deliberately separate and deliberately named,
+  so reaching for it is a decision rather than a default.
+
+---
+
+## 3.7 Loop until dry, and dedupe against everything ever seen
+
+Fixed `2×N` waves stop because the count says so, not because the work is done.
+
+`loop_until_dry(round_fn, seen, dry_rounds=2)` runs until **K consecutive rounds
+surface nothing new**. Two properties are load-bearing:
+
+- **Dedupe against everything ever seen — never against what was confirmed.**
+  Deduping against confirmed-only is the classic non-convergence bug: a
+  judge-rejected finding reappears every round and the loop pays forever to
+  rediscover the same dead end.
+- **A loop that hits `max_rounds` without converging says so, loudly.** Reporting
+  a capped loop as exhaustive is the same silent-truncation class this campaign
+  spent the week filing issues about.
+
+The `SeenSet` is **durable** (`state/seen-*.jsonl`) — an in-memory set dies with
+the process, and this campaign has already lost work to a killed lane.
+
+Identity is semantic, not textual. Citation is the bucket; within a bucket a
+Jaccard overlap ≥ 0.6 over content words decides sameness. **The first cut of
+this class was wrong and its own self-test caught it**: an exact hash over the
+first twelve words minted two entries for *"…never fires"* and *"…never fires at
+all"*. A dedupe that does not dedupe is worse than none — the loop never goes
+dry and the roll-up double-counts. The fix is pinned in both directions:
+
+| case | second occurrence is new? |
+|---|---|
+| exact repeat | no |
+| reworded tail | no |
+| reordered clause | no |
+| **different defect, same line** | **yes** |
+| **same claim, different line** | **yes** |
+
+---
+
+## 3.8 R-207 — the Rust standard is a gate, not a prompt
+
+Every lane that touches `.rs` is held to **rust-skills**: 265 rules across 26
+categories, sourced from the Rust API Guidelines, the Performance Book, the 2024
+Edition Guide, the Rustonomicon, and the ripgrep / tokio / serde / polars / axum
+/ cargo codebases.
+
+Two lanes in this campaign were dispatched **without** it, because the standard
+lived only in an orchestrator's memory of the standard. That is precisely how a
+standard erodes — the same failure shape as the eleven Python files that
+accumulated because nobody ever wrote the language rule down (#2451).
+
+So `checks.sh fast` now enumerates the implicated categories from the changed
+files, deterministically:
+
+| changed path matches | categories raised |
+|---|---|
+| `federation` · `sync` · `receive` | `async-` `conc-` `err-` `obs-` |
+| `storage` · `store` · `migrat` | `perf-` `opt-` `mem-` `err-` `serde-` |
+| `sweep` · `background` · `daemon` | `async-` `conc-` `err-` `obs-` |
+| `handlers` · `mcp` · `cli` | `api-` `err-` `type-` `doc-` |
+| *(always)* | `test-` `anti-` |
+
+A federation + storage + sweeper change raises **121 of the 265 rules** — named
+by category, with counts, at dispatch time rather than at review time. If
+rust-skills is not installed the gate says so: *"standard unenforceable"*, rather
+than passing silently.
+
+---
+
 ## 4. Codegraph — integral, not incidental
 
 Codegraph is wired as three gates the process cannot route around.
@@ -393,6 +533,29 @@ with the verdict cited in the commit.
 
 ---
 
+## 9.1 R-405 — absence of evidence is not evidence of absence
+
+A **negative** claim ("never decrements", "unreachable", "has never executed",
+"zero callers", "no such rule exists") requires a **positive demonstration of
+the negative** — an exhaustive enumeration, a compiler error, an execution
+trace. A search that came back empty is not that demonstration.
+
+This rule was violated **four times in one campaign, by the reviewer, including
+inside the document that proposed it**. Four different tools produced the same
+error: a `grep` for a Rust const that could never match the SQL string literal
+the code actually used; reading §17's prose without grepping `tests/`; a
+`head -25` that truncated a check-run list read as absence; and a `cargo tree`
+edge filter that returned empty for a dependency plainly present in
+`Cargo.lock`.
+
+Four occurrences across four tools is not a discipline failure correctable by
+intent. **It requires a mechanical gate** — which is why `codegraph.py` now
+unions grep results into every caller set rather than trusting an empty index
+response, and why node contracts (§3.5) force citations into fields the
+orchestrator does not retype.
+
+---
+
 ## 10. Provenance
 
 Every rule above was produced by a specific failure. A partial record, because rules without
@@ -405,6 +568,8 @@ provenance decay into folklore:
 | R-203 prove load-bearing | a ghost-node test used a query path that silently falls back, so it passed against unfixed code |
 | R-204 `contains` blind to drift | a span guard passed while broken — `contains` cannot detect a one-byte offset at any distance |
 | R-206 static-guard sweep | five CI jobs lost to a single static guard that targeted test selection could not see |
+| R-207 rust standard is a gate | two lanes dispatched without the 265-rule Rust standard because it lived only in an orchestrator's memory of it |
+| R-405 absence ≠ evidence | **four** violations by the reviewer — a const-name grep that could not match a SQL string literal, prose read without grepping `tests/`, a `head -25` truncation, and a `cargo tree` query artifact |
 | R-301 codegraph footprint | an issue was filed with a 2-funnel scope; codegraph showed 14 call sites |
 | R-401/402 measure | an orchestrator brief carried three wrong ceiling numbers; a lane caught them by measuring |
 | R-403 classify the red | a rendered `fail` was a cancelled concurrency twin; a separate red was a watchdog timeout on a passing run |
