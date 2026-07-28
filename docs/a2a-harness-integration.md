@@ -24,7 +24,7 @@ exercising this repo's binary.
 
 - 103 MCP tools at `--profile full`; 7 at `--profile core` + always-on
   `memory_capabilities`.
-- 93 production HTTP routes (79 unique URL paths) registered.
+- 93 production HTTP routes (80 unique URL paths) registered.
 - Schema v78 (single logical version across sqlite + postgres; see
   `src/storage/migrations.rs::CURRENT_SCHEMA_VERSION`
   and `src/store/postgres.rs::CURRENT_SCHEMA_VERSION`).

@@ -66,6 +66,9 @@ pub const ATOM_OF: &str = "atom_of";
 pub const MENTIONED_ENTITY_ID: &str = "mentioned_entity_id";
 /// `attest_level` — wire/row field name.
 pub const ATTEST_LEVEL: &str = "attest_level";
+/// `resolved_at` — wire/row field name for a checkpoint's resolution timestamp
+/// (#2391 checkpoint-resolve HTTP surface; also the `checkpoints` row column).
+pub const RESOLVED_AT: &str = "resolved_at";
 /// `write_signature` — optional `metadata` key carrying a base64 detached
 /// Ed25519 per-write content signature over the #626 [`SignableWrite`]
 /// envelope (`agent_id + namespace + title + kind + created_at +

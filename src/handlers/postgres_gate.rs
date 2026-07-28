@@ -169,6 +169,15 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         ("POST", p) if actions_transition_path(p) => true,
         // #1718 — signal send write surface (SAL `signal_send` on postgres).
         ("POST", super::routes::SIGNALS) => true,
+        // #2391 — commit-checkpoint resolve write surface. Routes through the
+        // SAL trait on postgres (`checkpoint_resolve`, implemented by
+        // `PostgresStore`), so the gate permits it to reach the handler's
+        // postgres path. The federation fanout sits ABOVE the backend split in
+        // `handlers::resolve_checkpoint`, so a postgres-backed daemon federates
+        // checkpoint resolutions identically to sqlite — the #1552 lesson
+        // (postgres branches silently skipping quorum broadcast) does not
+        // recur here.
+        ("POST", p) if checkpoints_resolve_path(p) => true,
         // Wave-3 Continuation 2 — governance write paths (Phase 11).
         ("POST", p) if pending_decide_path(p) => true,
         ("POST", p) if namespace_standard_post_path(p) => true,
@@ -340,6 +349,17 @@ fn actions_transition_path(p: &str) -> bool {
         return false;
     };
     rest.strip_suffix("/transition")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+/// #2391 — `/api/v1/checkpoints/{id}/resolve` shape check. Mirrors
+/// [`actions_transition_path`] exactly.
+#[cfg(feature = "sal")]
+fn checkpoints_resolve_path(p: &str) -> bool {
+    let Some(rest) = p.strip_prefix("/api/v1/checkpoints/") else {
+        return false;
+    };
+    rest.strip_suffix("/resolve")
         .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
