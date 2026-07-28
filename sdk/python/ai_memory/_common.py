@@ -142,6 +142,13 @@ def build_create_body(
     envelope also pins ``kind`` and ``namespace``, so both are resolved to the
     exact values that go on the wire before signing — never afterwards.
 
+    **Namespace caveat:** when the caller omits ``namespace`` this resolves to
+    the COMPILED default (``"global"``). A daemon configured with
+    ``[storage].default_namespace`` would store the row elsewhere, and since
+    the namespace is inside the envelope the signature would not verify. The
+    client cannot see a server-side override, so signed writes against such a
+    deployment MUST pass ``namespace`` explicitly.
+
     Args:
         fields: Optional ``CreateMemory`` fields; ``None`` values are dropped
             so server-side defaults apply.

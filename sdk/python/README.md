@@ -60,8 +60,11 @@ Notes:
   SDK cannot sign a write whose identity the server would resolve from the
   `X-Agent-Id` header or an anonymous fallback.
 - The signature also commits to `namespace`, `title`, `kind`, `created_at`,
-  and `sha256(content)`. If your daemon sets `[storage].default_namespace`,
-  pass `namespace=` explicitly — the client cannot know a server-side default.
+  and `sha256(content)`. When `namespace` is omitted the client signs the
+  COMPILED default (`"global"`); a daemon configured with
+  `[storage].default_namespace` would store the row elsewhere and the
+  signature would not verify, so pass `namespace=` explicitly there — the
+  client cannot see a server-side override.
 - Reads (`recall`, `search`, `list`, `get`) need no signature.
 - Omitting `signing_key` works only where the operator has explicitly set
   `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`, i.e. against a deliberately
