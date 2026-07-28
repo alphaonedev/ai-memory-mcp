@@ -40,6 +40,10 @@ use crate::handlers::AppState;
 /// fanout (one spelling, pm-v3.1 literal gate).
 const QUORUM_ACKS_FIELD: &str = "quorum_acks";
 
+/// Rejection detail for a non-terminal `state` on the checkpoint-resolve route
+/// (one spelling, pm-v3.1 literal gate). Mirrors the MCP handler's wording.
+const CHECKPOINT_STATE_INVALID: &str = "state must be one of: resolved, rejected";
+
 /// Request body for `POST /api/v1/actions/{id}/transition`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ActionTransitionRequest {
@@ -79,6 +83,25 @@ pub struct SendSignalRequest {
     /// JSON array of related signal/memory ids.
     #[serde(default)]
     pub reference_ids: Option<serde_json::Value>,
+}
+
+/// #2391 — request body for `POST /api/v1/checkpoints/{id}/resolve`.
+///
+/// `resolved_by` is deliberately NOT a body field: the resolver is the
+/// authenticated caller (the node), mirroring [`SendSignalRequest`]'s
+/// `from_agent` provenance posture. A body-supplied resolver could not be
+/// attested against the sending node's enrolled key on the receiving peer.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CheckpointResolveHttpRequest {
+    /// Terminal resolution state — `"resolved"` or `"rejected"`.
+    pub state: String,
+    /// Structured resolution verdict (free-form string).
+    #[serde(default)]
+    pub resolution: Option<String>,
+    /// Human-readable note explaining the resolution. Advisory prose — NOT part
+    /// of the attested resolution tuple.
+    #[serde(default)]
+    pub resolution_note: Option<String>,
 }
 
 /// `POST /api/v1/actions/{id}/transition` — apply a coordination-action state
@@ -536,6 +559,204 @@ fn build_signed_transition_op(
         signer_pubkey,
         nonce,
     }
+}
+
+/// `POST /api/v1/checkpoints/{id}/resolve` — resolve a commit-checkpoint
+/// locally, then fan the resolution out to peers under W-of-N quorum when the
+/// daemon is federation-configured.
+///
+/// #2391 — this is the SEND leg of the FED-RQ-01 (#1936) checkpoint-federation
+/// transport. The receive leg (`handlers::federation_receive` +
+/// [`crate::checkpoints::apply_inbound_resolution`]) and the broadcast fn
+/// ([`crate::federation::broadcast_checkpoint_resolution_quorum`]) both shipped
+/// at v1.0.0, but checkpoints were the ONE coordination primitive #1718 never
+/// gave an HTTP route — and fanout is only reachable from a handler that holds
+/// [`AppState::federation`]. The result was a broadcast fn with ZERO production
+/// callers: two nodes running this build could never exchange a checkpoint
+/// resolution, which is the §25.2 epoch-freeze contract's only cross-node
+/// mechanism. This route closes that leg.
+///
+/// Mirrors [`transition_action`] / [`send_signal`] exactly: local write FIRST,
+/// `503` on a failed quorum with NO rollback (ADR-0001), single-node fast path
+/// when no peers are configured.
+///
+/// **Node-granular attestation.** `resolved_by` is the NODE's resolved agent id
+/// (never a body field), and the resolution is signed with the daemon's
+/// `active_keypair` — so a receiving peer verifies it against the sending
+/// node's already-enrolled public key, which is exactly what the fail-closed
+/// `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` gate
+/// ([`crate::federation::receive_auth::authorize_remote_checkpoint_resolution`])
+/// requires. Same posture as [`build_signed_transition_op`] (vote `c2fa96aa`)
+/// and [`send_signal`]'s `from_agent`.
+pub async fn resolve_checkpoint(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Path(checkpoint_id): Path<String>,
+    Json(body): Json<CheckpointResolveHttpRequest>,
+) -> impl IntoResponse {
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
+    let node_agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
+            )
+                .into_response();
+        }
+    };
+    // Only the two terminal resolution states are accepted — same filter as the
+    // MCP `memory_checkpoint_resolve` handler.
+    let Some(state) = crate::models::CheckpointState::from_str(&body.state).filter(|s| {
+        matches!(
+            s,
+            crate::models::CheckpointState::Resolved | crate::models::CheckpointState::Rejected
+        )
+    }) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": CHECKPOINT_STATE_INVALID})),
+        )
+            .into_response();
+    };
+    let now = chrono::Utc::now().timestamp();
+
+    // Local write (dual-path): sqlite via app.db + crate::checkpoints (default),
+    // postgres via the SAL `checkpoint_resolve` trait method (under --features
+    // sal). The fanout below sits ABOVE this split, so it is backend-agnostic:
+    // a postgres-backed daemon federates checkpoint resolutions identically.
+    // (#1552's lesson was a fanout wired INSIDE backend-specific branches, so
+    // the postgres arm silently skipped it — this shape structurally cannot.)
+    let resolved: Result<Option<crate::models::Checkpoint>, Response> = {
+        #[cfg(feature = "sal")]
+        {
+            if matches!(
+                app.storage_backend,
+                crate::handlers::StorageBackend::Postgres
+            ) {
+                let ctx = crate::store::CallerContext::for_agent(node_agent_id.clone());
+                app.store
+                    .checkpoint_resolve(
+                        &ctx,
+                        &checkpoint_id,
+                        state,
+                        &node_agent_id,
+                        body.resolution.as_deref(),
+                        body.resolution_note.as_deref(),
+                        now,
+                        app.active_keypair.as_ref().as_ref(),
+                    )
+                    .await
+                    .map_err(|e| checkpoint_resolve_error(&e.to_string()))
+            } else {
+                local_resolve_via_db(&app, &checkpoint_id, state, &node_agent_id, &body, now).await
+            }
+        }
+        #[cfg(not(feature = "sal"))]
+        {
+            local_resolve_via_db(&app, &checkpoint_id, state, &node_agent_id, &body, now).await
+        }
+    };
+    let cp = match resolved {
+        Ok(Some(cp)) => cp,
+        Ok(None) => return checkpoint_not_found(&checkpoint_id),
+        Err(resp) => return resp,
+    };
+
+    // #1722 coordination observability — best-effort audit row, attributed to
+    // the resolving node. The audit table always lives on the sqlite `app.db`
+    // connection regardless of the storage backend (same posture as the
+    // `send_signal` quota charge), so this is backend-uniform.
+    {
+        let conn = app.db.lock().await;
+        crate::coordination_audit::emit(
+            &conn.0,
+            crate::coordination_audit::CHECKPOINT_RESOLVE,
+            &node_agent_id,
+            &[&checkpoint_id, &node_agent_id, state.as_str()],
+        );
+    }
+
+    let mut response = json!({
+        (crate::mcp::param_names::ID): cp.id,
+        (crate::mcp::param_names::STATE): cp.state.as_str(),
+        (crate::mcp::param_names::RESOLVED_BY): cp.resolved_by,
+        (crate::models::field_names::RESOLVED_AT): cp.resolved_at,
+        (crate::models::field_names::ATTEST_LEVEL): if cp.signature.is_empty() {
+            crate::models::AttestLevel::Unsigned.as_str()
+        } else {
+            crate::models::AttestLevel::SelfSigned.as_str()
+        },
+    });
+
+    // Federation fanout (W-of-N) — only when configured. NOTE: every DB lock
+    // above is released before this await; the fanout is a network round-trip
+    // per peer and must never hold the shared sqlite connection.
+    if let Some(fed) = app.federation.as_ref() {
+        match crate::federation::broadcast_checkpoint_resolution_quorum(fed, &cp).await {
+            Ok(tracker) => match crate::federation::finalise_quorum(&tracker) {
+                Ok(got) => {
+                    response[QUORUM_ACKS_FIELD] = json!(got);
+                    return (StatusCode::OK, Json(response)).into_response();
+                }
+                Err(err) => {
+                    let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
+                    return super::under_replicated_response(&payload);
+                }
+            },
+            Err(err) => {
+                let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
+                return super::under_replicated_response(&payload);
+            }
+        }
+    }
+
+    // Single-node fast path: no peers configured.
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+/// Sqlite local resolve under the shared `app.db` connection lock. The guard is
+/// scoped to this fn so it is dropped before the caller's federation await.
+async fn local_resolve_via_db(
+    app: &AppState,
+    checkpoint_id: &str,
+    state: crate::models::CheckpointState,
+    node_agent_id: &str,
+    body: &CheckpointResolveHttpRequest,
+    now: i64,
+) -> Result<Option<crate::models::Checkpoint>, Response> {
+    let lock = app.db.lock().await;
+    crate::checkpoints::resolve(
+        &lock.0,
+        checkpoint_id,
+        state,
+        node_agent_id,
+        body.resolution.as_deref(),
+        body.resolution_note.as_deref(),
+        now,
+        app.active_keypair.as_ref().as_ref(),
+    )
+    .map_err(|e| checkpoint_resolve_error(&e.to_string()))
+}
+
+/// Shared `500` for a failed checkpoint resolve (one spelling, literal gate).
+fn checkpoint_resolve_error(detail: &str) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": format!("checkpoint resolve failed: {detail}")})),
+    )
+        .into_response()
+}
+
+/// Shared `404 checkpoint not found` response (one spelling, literal gate).
+fn checkpoint_not_found(checkpoint_id: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": format!("checkpoint not found: {checkpoint_id}")})),
+    )
+        .into_response()
 }
 
 /// 16 random bytes from the platform CSPRNG — the per-delivery anti-replay

@@ -25,6 +25,10 @@ pub const AUTO_TAG: &str = "/api/v1/auto_tag";
 pub const CAPABILITIES: &str = "/api/v1/capabilities";
 pub const CAPTURE_TURN: &str = "/api/v1/capture_turn";
 pub const CHECK_DUPLICATE: &str = "/api/v1/check_duplicate";
+/// #2391 — commit-checkpoint resolution write surface. The SEND leg of the
+/// FED-RQ-01 (#1936) checkpoint-federation transport: local resolve +
+/// W-of-N fanout via `federation::broadcast_checkpoint_resolution_quorum`.
+pub const CHECKPOINTS_ID_RESOLVE: &str = "/api/v1/checkpoints/{id}/resolve";
 pub const CONSOLIDATE: &str = "/api/v1/consolidate";
 pub const CONTRADICTIONS: &str = "/api/v1/contradictions";
 pub const ENTITIES: &str = "/api/v1/entities";

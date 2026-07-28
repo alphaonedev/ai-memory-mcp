@@ -83,7 +83,7 @@ CLI subcommands):
 |---|---|
 | MCP tools (`--profile full`) | **103 advertised** (102 callable + the always-on `memory_capabilities` bootstrap) |
 | MCP tools (`--profile core`) | **7** (original 5 + `memory_load_family` + `memory_smart_load`) + the `memory_capabilities` bootstrap |
-| HTTP routes | **93 production `.route(...)` registrations** / 79 unique URL paths |
+| HTTP routes | **94 production `.route(...)` registrations** / 80 unique URL paths |
 | CLI subcommands | **89 default build** / **91 under `--features sal`** (the `capability init` sub-verb rides the existing `Capability` command, so the top-level count is unchanged) |
 | `MemoryKind` variants | **16** (adds v1.0.0 epistemic typing `Told` / `Instruction` / `Intervention`, [#1945](https://github.com/alphaonedev/ai-memory-mcp/issues/1945)) |
 | Schema | **v87** (`CURRENT_SCHEMA_VERSION`, both adapters; v87 = #2333 archived `kind_provenance` parity + #2332 expiry-rendering heal, post-GA on release/v1.0.0) |

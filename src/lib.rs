@@ -321,7 +321,10 @@ pub const META_KEY_TARGET_AGENT_ID: &str = "target_agent_id";
 // read surface `GET /api/v1/memories/{id}/lineage` (`handlers::get_lineage`).
 // 2026-07-14 (#2024) — bumped 92 → 93: the skill retire/unretire write
 // surface `POST /api/v1/skill/{id}/retire` (`handlers::skill_retire_route`).
-pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 93;
+// 2026-07-28 (#2391) — bumped 93 → 94: the commit-checkpoint resolve write
+// surface `POST /api/v1/checkpoints/{id}/resolve`
+// (`handlers::resolve_checkpoint`) — local resolve + W-of-N federation fanout.
+pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 94;
 // 2026-06-22 (#1718 Commit C) — bumped 89 → 90: the coordination
 // action-transition write surface `POST /api/v1/actions/{id}/transition`
 // (`handlers::transition_action`) — local CAS write + W-of-N federation fanout.
@@ -349,7 +352,9 @@ pub const EXPECTED_TEST_ROUTES_COUNT: usize = 3;
 // `/api/v1/memories/{id}/lineage` (derivation lineage-DAG read surface).
 // 2026-07-14 (#2024) — bumped 78 → 79: the new unique path
 // `/api/v1/skill/{id}/retire` (skill retire/unretire write surface).
-pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 79;
+// 2026-07-28 (#2391) — bumped 79 → 80: the new unique path
+// `/api/v1/checkpoints/{id}/resolve` (commit-checkpoint resolve write surface).
+pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 80;
 
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner A, finding F-A3.1) —
@@ -953,6 +958,14 @@ pub fn build_router_with_timeout(
         // #1718 v0.8.0 Pillar-1 — signal send write surface (local write +
         // W-of-N federation fanout).
         .route(handlers::routes::SIGNALS, post(handlers::send_signal))
+        // #2391 — commit-checkpoint resolve write surface (local resolve +
+        // W-of-N federation fanout). The SEND leg of the FED-RQ-01 (#1936)
+        // checkpoint transport: without it
+        // `broadcast_checkpoint_resolution_quorum` had no production caller.
+        .route(
+            handlers::routes::CHECKPOINTS_ID_RESOLVE,
+            post(handlers::resolve_checkpoint),
+        )
         .route(handlers::routes::MEMORIES_BULK, post(handlers::bulk_create))
         .route(handlers::routes::MEMORIES_ID, get(handlers::get_memory))
         .route(handlers::routes::MEMORIES_ID, put(handlers::update_memory))
