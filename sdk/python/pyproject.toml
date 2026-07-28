@@ -7,7 +7,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-memory-mcp"
-version = "1.0.0"
+# #2455 — the version literal lives ONLY in `ai_memory/_version.py`; setuptools
+# reads it statically. Previously it was duplicated here and had drifted from
+# `__init__.__version__` (0.8.0) and the User-Agent (0.6.0-alpha.0).
+dynamic = ["version"]
 description = "Python SDK for the ai-memory HTTP API (persistent memory for AI agents)."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,17 +35,27 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# #2455 — Ed25519 write attestation. Optional so callers targeting a daemon
+# with `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` need no crypto dependency;
+# REQUIRED against a stock daemon, whose HTTP store surface fails closed.
+attestation = [
+    "cryptography>=42.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "mypy>=1.8",
     "ruff>=0.3",
+    "cryptography>=42.0",
 ]
 
 [project.urls]
 Homepage = "https://github.com/alphaonedev/ai-memory-mcp"
 Source = "https://github.com/alphaonedev/ai-memory-mcp"
 Issues = "https://github.com/alphaonedev/ai-memory-mcp/issues"
+
+[tool.setuptools.dynamic]
+version = { attr = "ai_memory._version.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["."]

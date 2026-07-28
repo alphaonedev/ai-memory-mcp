@@ -17,7 +17,6 @@
  */
 
 import { AiMemoryClient } from "../src/client.js";
-import { verifyWebhookSignature, signWebhookBody } from "../src/webhooks.js";
 import { ValidationError, NotFoundError } from "../src/errors.js";
 
 const BASE_URL = process.env.AI_MEMORY_TEST_URL ?? "http://localhost:9077";
@@ -28,38 +27,12 @@ const describeIntegration = DAEMON_ENABLED ? describe : describe.skip;
 // Pure unit tests — always run. Do not require a daemon.
 // ---------------------------------------------------------------------------
 
-describe("webhooks", () => {
-  test("verifyWebhookSignature round-trips", () => {
-    const body = JSON.stringify({ event: "memory.stored", id: "abc" });
-    const secret = "s3kr3t";
-    const sig = signWebhookBody(body, secret);
-    expect(sig.startsWith("sha256=")).toBe(true);
-    expect(verifyWebhookSignature(body, sig, secret)).toBe(true);
-  });
-
-  test("rejects wrong secret", () => {
-    const body = "hello";
-    const sig = signWebhookBody(body, "correct");
-    expect(verifyWebhookSignature(body, sig, "wrong")).toBe(false);
-  });
-
-  test("rejects tampered body", () => {
-    const sig = signWebhookBody("original", "k");
-    expect(verifyWebhookSignature("tampered", sig, "k")).toBe(false);
-  });
-
-  test("accepts bare hex (no sha256= prefix)", () => {
-    const body = "payload";
-    const sig = signWebhookBody(body, "k").replace("sha256=", "");
-    expect(verifyWebhookSignature(body, sig, "k")).toBe(true);
-  });
-
-  test("rejects empty / malformed signatures", () => {
-    expect(verifyWebhookSignature("b", "", "k")).toBe(false);
-    expect(verifyWebhookSignature("b", "sha256=zzzz", "k")).toBe(false);
-    expect(verifyWebhookSignature("b", "sha256=abc", "k")).toBe(false); // odd length
-  });
-});
+// The webhook-HMAC tests moved to __tests__/webhooks.test.ts (#2455). The
+// version that lived here built its expected signature with `signWebhookBody`
+// — the SAME construction the verifier used — so it asserted the module
+// agreed with itself and stayed green while the SDK could not verify a single
+// genuine delivery. The replacement asserts against a fixture emitted by the
+// RUST signer.
 
 describe("AiMemoryClient constructor", () => {
   test("requires baseUrl", () => {

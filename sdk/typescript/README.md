@@ -4,9 +4,13 @@ TypeScript SDK for the [ai-memory](../../) HTTP API — persistent, tier-aware
 memory for AI agents, built on top of the same daemon that powers the MCP
 server.
 
-> Status: `0.6.0-alpha.0`. Target server is ai-memory v0.6.0 HTTP API at
-> `/api/v1/`. Some endpoints (subscriptions, notify/inbox, cluster, metrics,
-> grant/revoke) target v0.6.0.0 shape and may not be merged server-side yet.
+> Status: `1.0.0` (see `package.json` — the single source of truth).
+> Target server is the ai-memory v1.0.0 HTTP API at `/api/v1/`.
+
+> **Storing requires a signature.** `POST /api/v1/memories` is the network
+> write surface (`WriteSurface::HttpDirect`) and **fails closed by default**:
+> an unsigned store is answered with `403 ATTESTATION_FAILED`. Pass
+> `signingKey` to `.store()` — see [Write attestation](#write-attestation).
 
 - Runtime: Node 20+ (uses `undici.fetch` — Node 20 ships undici as its
   platform `fetch`). Modern browsers work too; see [Browser usage](#browser-usage).
@@ -29,7 +33,7 @@ yarn add @alphaone/ai-memory
 ## Quickstart
 
 ```ts
-import { AiMemoryClient } from "@alphaone/ai-memory";
+import { AiMemoryClient, AgentSigningKey } from "@alphaone/ai-memory";
 
 const memory = new AiMemoryClient({
   baseUrl: "http://localhost:9077",
@@ -37,15 +41,22 @@ const memory = new AiMemoryClient({
   agentId: "ai:claude-opus-4.7@laptop:pid-1234", // optional default header
 });
 
-// Store
-const m = await memory.store({
-  title: "DNS zone refresh procedure",
-  content: "Run `rndc reload` then check SERIAL bump in named.log …",
-  tier: "long",
-  namespace: "ops/dns",
-  tags: ["bind9", "runbook"],
-  priority: 8,
-});
+// Store — signed, because the HTTP write surface fails closed by default.
+const key = AgentSigningKey.generate();          // or .fromSeed(readFileSync("svc.priv"))
+await memory.bindAgentPubkey("svc", key.publicKeyBase64()); // once, admin-gated
+
+const m = await memory.store(
+  {
+    title: "DNS zone refresh procedure",
+    content: "Run `rndc reload` then check SERIAL bump in named.log …",
+    tier: "long",
+    namespace: "ops/dns",
+    tags: ["bind9", "runbook"],
+    priority: 8,
+    agent_id: "svc",   // required when signing — it is inside the envelope
+  },
+  { signingKey: key },
+);
 
 // Recall — fuzzy, scored, mutates access_count + TTL
 const hits = await memory.recall({
@@ -66,7 +77,8 @@ you override `agentId`, pass an `AbortSignal`, or add custom headers.
 
 | Method | Endpoint | Description |
 | --- | --- | --- |
-| `store(body, opts?)` | `POST /api/v1/memories` | Create a new memory. |
+| `store(body, opts?)` | `POST /api/v1/memories` | Create a new memory. Pass `opts.signingKey` — unsigned stores are 403. |
+| `bindAgentPubkey(id, b64)` | `PUT /api/v1/agents/{id}/pubkey` | Enroll an attestation key (admin-gated). |
 | `storeBulk(memories, opts?)` | `POST /api/v1/memories/bulk` | Batch insert up to 1000. |
 | `get(id, opts?)` | `GET /api/v1/memories/:id` | Fetch by id. |
 | `update(id, body, opts?)` | `PUT /api/v1/memories/:id` | Patch fields. |
@@ -98,16 +110,64 @@ you override `agentId`, pass an `AbortSignal`, or add custom headers.
 #### `.store()`
 
 ```ts
-await memory.store({
-  title: "Rust trait bounds refresher",
-  content: "Trait bounds `where T: Send + Sync` …",
-  tier: "mid",
-  namespace: "rust",
-  tags: ["rust", "traits"],
-  priority: 6,
-  confidence: 0.9,
-  metadata: { source_commit: "abc123" },
-});
+await memory.store(
+  {
+    title: "Rust trait bounds refresher",
+    content: "Trait bounds `where T: Send + Sync` …",
+    tier: "mid",
+    namespace: "rust",
+    tags: ["rust", "traits"],
+    priority: 6,
+    confidence: 0.9,
+    metadata: { source_commit: "abc123" },
+    agent_id: "svc",
+  },
+  { signingKey: key },
+);
+```
+
+#### Write attestation
+
+`POST /api/v1/memories` is `WriteSurface::HttpDirect`, which fails **closed**
+by default (`src/identity/attest.rs:130-136`). A store without a valid
+Ed25519 attestation is `403 ATTESTATION_FAILED`.
+
+```ts
+import { AgentSigningKey } from "@alphaone/ai-memory";
+import { readFileSync } from "node:fs";
+
+// The daemon's own key format: 32 raw bytes at <key_dir>/<agent_id>.priv
+const key = AgentSigningKey.fromSeed(readFileSync("/etc/ai-memory/keys/svc.priv"));
+
+// One-time, admin-gated: bind the PUBLIC half to the agent.
+await memory.bindAgentPubkey("svc", key.publicKeyBase64());
+
+await memory.store({ title: "t", content: "c", agent_id: "svc" }, { signingKey: key });
+```
+
+The signature commits to `agent_id`, `namespace`, `title`, `kind`,
+`created_at`, and `sha256(content)` — nothing else. Consequences:
+
+- `agent_id` is **required** when signing; the client cannot sign a write
+  whose identity the server would resolve from a header or anonymous fallback.
+- If your daemon sets `[storage].default_namespace`, pass `namespace`
+  explicitly — the client cannot know a server-side default.
+- `created_at` must be inside the daemon's ±300s freshness window; the client
+  stamps it at call time.
+- Reads need no signature.
+
+Omitting `signingKey` works only where the operator has explicitly set
+`AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`, i.e. a deliberately weakened daemon.
+
+#### Optimistic concurrency on `.update()`
+
+The daemon's version gate for `PUT /api/v1/memories/:id` is the `If-Match`
+header — there is no `version` body field, so one placed in the body would be
+silently ignored. Use `expectedVersion`:
+
+```ts
+await memory.update(id, { content: "new" }, { expectedVersion: m.version });
+// -> ConflictError (409) if the stored row has drifted
 ```
 
 #### `.recall()`
@@ -166,7 +226,16 @@ app.post(
   express.raw({ type: "application/json" }),
   (req, res) => {
     const sig = String(req.header("X-AI-Memory-Signature") ?? "");
-    if (!verifyWebhookSignature(req.body, sig, process.env.WEBHOOK_SECRET!)) {
+    const ts = String(req.header("X-AI-Memory-Timestamp") ?? "");
+    // The daemon signs HMAC-SHA256(SHA256(secret), `${ts}.${body}`), so the
+    // timestamp is REQUIRED — omitting it throws rather than silently
+    // verifying the wrong construction. Deliveries older than 300s (or >60s
+    // in the future) are rejected as replays even with a valid MAC.
+    if (
+      !verifyWebhookSignature(req.body, sig, process.env.WEBHOOK_SECRET!, {
+        timestamp: ts,
+      })
+    ) {
       return res.status(401).send("bad signature");
     }
     const event = JSON.parse(req.body.toString("utf8"));

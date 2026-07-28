@@ -1,31 +1,48 @@
 name: clients-ci
 
-# Runs the SDK-shim package test suites (issue #1390 / merged via #2212) on
-# every PR/push that touches clients/**. These four Direct-API SDK shim
-# packages ship genuine pytest / node:test suites that NO other CI job
-# executed — so a broken shim could publish green at the GA release moment
-# (publish-sdk-shims.yml built-only before publishing). This leg closes that
-# gap on the PR side; publish-sdk-shims.yml runs the SAME suites again
+# Runs the SDK test suites — BOTH the four Direct-API shim packages under
+# `clients/**` (issue #1390 / merged via #2212) AND the two FLAGSHIP SDKs
+# under `sdk/**` (issue #2455) — on every PR/push that touches them.
+#
+# These packages ship genuine pytest / node:test / jest suites that NO other
+# CI job executed — so a broken package could publish green at the GA release
+# moment (publish-sdk-shims.yml and publish-sdks.yml were both BUILD-ONLY
+# before publishing). This leg closes that gap on the PR side;
+# publish-sdk-shims.yml AND publish-sdks.yml now run the SAME suites again
 # immediately before each publish so nothing ships without its tests passing.
+#
+# #2455 — the `clients/**`-only path filter was itself the hole: the header
+# above already named this exact hazard ("a broken shim could publish green at
+# the GA release moment") but closed it ONLY for the shims. `sdk/python` and
+# `sdk/typescript` — the packages `publish-sdks.yml` auto-publishes to PyPI +
+# npm on `push: tags: v*` — had test files executed by NOTHING. Cutting the
+# v1.0.0 tag would have published both, untested. The filter now covers
+# `sdk/**` and two jobs gate the flagship SDKs.
 #
 # Runtimes are pinned to what each package actually needs:
 #  - Python packages: requires-python >= 3.10 (pyproject.toml); tested on 3.12.
-#  - TypeScript packages: the `test` script is
+#  - TypeScript SHIM packages (`clients/*-ts`): the `test` script is
 #      node --experimental-strip-types --test '__tests__/*.test.ts'
 #    which needs Node >= 22.6 (native TS type-stripping). The package `engines`
 #    field advertises node >= 18 for CONSUMERS of the built `dist/` output, but
-#    running the SOURCE test suite needs 22.6+ — hence Node 22 here, NOT 20.
+#    running the SOURCE test suite needs 22.6+ — hence Node 22 there, NOT 20.
+#  - The FLAGSHIP `sdk/typescript` uses jest + ts-jest (not node:test), so its
+#    `engines: node >= 20` is the real floor; it is pinned to Node 20 to match
+#    what `publish-sdks.yml` builds with, so the CI leg and the publish leg
+#    exercise the same toolchain.
 
 on:
   push:
     branches: [main, develop, "release/**"]
     paths:
       - "clients/**"
+      - "sdk/**"
       - ".github/workflows/clients-ci.yml"
   pull_request:
     branches: [main, develop, "release/**"]
     paths:
       - "clients/**"
+      - "sdk/**"
       - ".github/workflows/clients-ci.yml"
 
 permissions:
@@ -83,3 +100,47 @@ jobs:
       - name: npm test
         working-directory: clients/${{ matrix.package }}
         run: npm test
+
+  # ── #2455 — flagship SDK gates ────────────────────────────────────────────
+  # `sdk/python` + `sdk/typescript` are the packages `publish-sdks.yml`
+  # auto-publishes on `push: tags: v*`. Before #2455 nothing ran their tests.
+  sdk-python:
+    name: pytest (sdk/python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install package + dev extras
+        working-directory: sdk/python
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: pytest
+        working-directory: sdk/python
+        env:
+          AI_MEMORY_NO_CONFIG: "1"
+        run: python -m pytest -q
+
+  sdk-typescript:
+    name: jest + tsc (sdk/typescript)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Matches `engines.node >= 20` AND the Node version
+          # publish-sdks.yml builds the published tarball with.
+          node-version: "20"
+      - name: npm ci
+        working-directory: sdk/typescript
+        run: npm ci
+      - name: npm test
+        working-directory: sdk/typescript
+        run: npm test
+      # `npm run build` is what publish-sdks.yml ships; running it here means a
+      # type error can never first surface during the tag-triggered publish.
+      - name: npm run build
+        working-directory: sdk/typescript
+        run: npm run build

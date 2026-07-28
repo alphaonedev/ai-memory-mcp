@@ -2,32 +2,50 @@
 
 Typed Python client for the [ai-memory](https://github.com/alphaonedev/ai-memory-mcp)
 HTTP API. Wraps the daemon's `/api/v1/` surface with sync and async clients,
-Pydantic v2 models that mirror the Rust structs, and HMAC-SHA256 webhook
-verification.
+Pydantic v2 models that mirror the Rust structs, Ed25519 write attestation,
+and HMAC-SHA256 webhook verification.
 
-**Status:** `0.6.0-alpha.0` — scaffolding, unpublished. API may change before
-GA.
+**Status:** `1.0.0`
+
+<!-- The version above is checked against ai_memory/_version.py by
+     tests/test_version.py — update the literal there, never here. -->
 
 ## Install
 
 ```bash
-# Not yet published; install from a local checkout:
-pip install -e ./sdk/python
+pip install "ai-memory-mcp[attestation]"
+
+# or from a local checkout:
+pip install -e "./sdk/python[attestation]"
 ```
 
-Requires Python 3.10+.
+Requires Python 3.10+. The `attestation` extra pulls in `cryptography`, which
+you need to **store** against a default-configured daemon — see below.
 
-## Quickstart
+## Storing requires a signature
+
+`POST /api/v1/memories` is the network write surface
+(`WriteSurface::HttpDirect`) and **fails closed by default**: an unsigned
+store is answered with `403 ATTESTATION_FAILED`. Sign the write with an
+Ed25519 key whose public half is bound to the agent:
 
 ```python
 from ai_memory import AiMemoryClient, Tier
+from ai_memory.attestation import AgentSigningKey
+
+key = AgentSigningKey.generate()          # or .from_file("svc.priv")
 
 with AiMemoryClient(base_url="http://localhost:9077") as client:
+    # One-time, admin-gated: enroll the public key for this agent.
+    client.bind_agent_pubkey("svc", key.public_key_b64())
+
     created = client.store(
         title="BIND9 build notes",
         content="Use --with-openssl=/opt/openssl, disable DoH for the lab.",
         tier=Tier.LONG,
         tags=["dns", "bind9"],
+        agent_id="svc",       # required when signing — it is inside the envelope
+        signing_key=key,
     )
     print(created["id"])
 
@@ -35,6 +53,19 @@ with AiMemoryClient(base_url="http://localhost:9077") as client:
     for memory in hits.memories:
         print(memory.title, memory.confidence)
 ```
+
+Notes:
+
+- `agent_id` is **required** when signing: the signature commits to it, so the
+  SDK cannot sign a write whose identity the server would resolve from the
+  `X-Agent-Id` header or an anonymous fallback.
+- The signature also commits to `namespace`, `title`, `kind`, `created_at`,
+  and `sha256(content)`. If your daemon sets `[storage].default_namespace`,
+  pass `namespace=` explicitly — the client cannot know a server-side default.
+- Reads (`recall`, `search`, `list`, `get`) need no signature.
+- Omitting `signing_key` works only where the operator has explicitly set
+  `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`, i.e. against a deliberately
+  weakened daemon.
 
 ## Async
 
@@ -109,6 +140,11 @@ AiMemoryClient(base_url="http://localhost:9077", agent_id="ai:claude-opus-4.7@ho
 | `grant(id, agent)` / `revoke(id, agent)` | `/api/v1/memories/{id}/grant|revoke` | Per-memory ACL. |
 | `cluster(req)` | `POST /api/v1/cluster` | Peer management. |
 | `agents()` / `register_agent(...)` | `/api/v1/agents` | NHI registry. |
+| `bind_agent_pubkey(id, b64)` | `PUT /api/v1/agents/{id}/pubkey` | Enroll an attestation key (admin). |
+
+`update(...)` takes an optional `expected_version=` for optimistic
+concurrency; it rides the `If-Match` header (the daemon's only version gate
+for that route) and a stale value raises `ConflictError` (409).
 
 ## Webhook verification
 
@@ -117,10 +153,17 @@ from ai_memory import verify_webhook_signature
 
 def handle(request) -> None:
     sig = request.headers["X-AI-Memory-Signature"]
-    if not verify_webhook_signature(request.body, sig, secret="..."):
+    ts = request.headers["X-AI-Memory-Timestamp"]
+    if not verify_webhook_signature(request.body, sig, "...", timestamp=ts):
         raise PermissionError("bad signature")
     ...
 ```
+
+The daemon signs `HMAC-SHA256(SHA256(secret), "{timestamp}.{body}")` and sends
+the timestamp in its own header, so `timestamp` is **required** — omitting it
+raises `TypeError` rather than silently verifying the wrong construction.
+Deliveries older than 300s (or more than 60s in the future) are rejected as
+replays even when the MAC is valid; tune with `max_age_secs` / `max_skew_secs`.
 
 `body` must be the raw bytes as received — do not re-encode a parsed JSON
 payload; whitespace differences will break the HMAC.

@@ -97,9 +97,46 @@ export interface CreateMemoryRequest {
    */
   agent_id?: string;
   scope?: Scope;
+  /**
+   * #1385 — Batman-taxonomy memory kind (`"observation"` default,
+   * `"decision"`, `"claim"`, ...). It is INSIDE the signed attestation
+   * envelope, so a signed write must send the same kind it signed.
+   */
+  kind?: string;
+  /**
+   * #626 Layer-3 / #2455 — detached Ed25519 attestation over the
+   * `SignableWrite` envelope, STANDARD base64.
+   *
+   * `POST /api/v1/memories` is `WriteSurface::HttpDirect` and fails CLOSED by
+   * default (`src/identity/attest.rs:130-136`), so an UNSIGNED store is
+   * `403 ATTESTATION_FAILED` on a stock daemon. Before #2455 this field did
+   * not exist here and the SDK could not produce a successful store at all.
+   * Populate it with `attestationFields()` from `@alphaone/ai-memory` — or
+   * pass `signingKey` to `client.store()` and let the client do it.
+   *
+   * When set, {@link CreateMemoryRequest.created_at} is REQUIRED.
+   */
+  signature?: string;
+  /**
+   * RFC3339 timestamp the caller signed. Required alongside `signature`;
+   * validated against the daemon's +/-300s attestation freshness window and
+   * then adopted verbatim.
+   */
+  created_at?: string;
 }
 
-/** Body for `PUT /api/v1/memories/:id`. */
+/**
+ * Body for `PUT /api/v1/memories/:id`.
+ *
+ * **Optimistic concurrency is a HEADER, not a body field.** The daemon reads
+ * the expected row version from `If-Match` (bare integer or quoted
+ * ETag-style) — `src/handlers/memories.rs:245-260`. Rust's `struct
+ * UpdateMemory` (`src/models/memory.rs:1602`) has NO `version` field, so a
+ * `version` key placed in this body would be ignored by the server while
+ * giving the caller a false sense of lost-update protection. Pass
+ * `expectedVersion` to `client.update()` instead; a stale version yields
+ * `409` (`ConflictError`).
+ */
 export interface UpdateMemoryRequest {
   title?: string;
   content?: string;

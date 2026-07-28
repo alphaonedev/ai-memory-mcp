@@ -23,6 +23,7 @@
 import { fetch as undiciFetch, Agent, type RequestInit } from "undici";
 
 import { apiErrorFromResponse, NetworkError } from "./errors.js";
+import { attestationFields, type AgentSigningKey } from "./attestation.js";
 import type {
   AgentRegistration,
   ClientOptions,
@@ -75,6 +76,37 @@ interface CallOptions<TBody = unknown> {
   requestOpts?: RequestOptions;
   /** If true, return the raw text body (for Prometheus metrics). */
   asText?: boolean;
+}
+
+/**
+ * The daemon's compiled default namespace for `POST /api/v1/memories`
+ * (`src/models/memory.rs::default_namespace` -> `crate::DEFAULT_NAMESPACE`).
+ *
+ * Needed only when SIGNING: the namespace is inside the signed envelope, so
+ * the client must commit to the exact value the server will store. Operators
+ * who set `[storage].default_namespace` MUST pass `namespace` explicitly on
+ * signed writes — the client cannot know a server-side override.
+ */
+export const DEFAULT_NAMESPACE = "global";
+
+/** The daemon's default `memory_kind` when `kind` is absent. */
+export const DEFAULT_MEMORY_KIND = "observation";
+
+/** Options for {@link AiMemoryClient.store}. */
+export interface StoreOptions extends RequestOptions {
+  /**
+   * Ed25519 key used to attest the write (#2455). Required against a stock
+   * daemon, whose HTTP store surface fails closed. See `./attestation.js`.
+   */
+  signingKey?: AgentSigningKey;
+}
+
+/** Options for {@link AiMemoryClient.update}. */
+export interface UpdateOptions extends RequestOptions {
+  /**
+   * Expected row version, sent as `If-Match`. A stale value yields `409`.
+   */
+  expectedVersion?: number | string;
 }
 
 export class AiMemoryClient {
@@ -216,15 +248,73 @@ export class AiMemoryClient {
   // Memory CRUD
   // ========================================================================
 
-  /** `POST /api/v1/memories` — create a new memory. */
+  /**
+   * `POST /api/v1/memories` — create a new memory.
+   *
+   * #2455 — this endpoint is `WriteSurface::HttpDirect`, which fails CLOSED
+   * by default: an UNSIGNED store gets `403 ATTESTATION_FAILED` from a stock
+   * daemon. Pass `opts.signingKey` (plus a matching `body.agent_id`) to
+   * attest the write:
+   *
+   * ```ts
+   * import { AiMemoryClient, AgentSigningKey } from "@alphaone/ai-memory";
+   *
+   * const key = AgentSigningKey.fromSeed(readFileSync("svc.priv"));
+   * await client.bindAgentPubkey("svc", key.publicKeyBase64()); // once, admin
+   * await client.store(
+   *   { title: "t", content: "c", agent_id: "svc" },
+   *   { signingKey: key },
+   * );
+   * ```
+   *
+   * Omitting `signingKey` only works where the operator has explicitly set
+   * `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`.
+   *
+   * Signing requires `body.agent_id`: the signature commits to it, so the
+   * client cannot sign a write whose identity the server would resolve from
+   * the `X-Agent-Id` header or an anonymous fallback.
+   */
   async store(
     body: CreateMemoryRequest,
-    opts?: RequestOptions,
+    opts?: StoreOptions,
   ): Promise<Memory> {
+    let payload = body;
+    if (opts?.signingKey) {
+      if (body.signature) {
+        throw new TypeError(
+          "pass either opts.signingKey or body.signature, not both",
+        );
+      }
+      if (!body.agent_id) {
+        throw new TypeError(
+          "opts.signingKey requires body.agent_id: the signature commits to " +
+            "the agent_id, so the client cannot sign a write whose identity " +
+            "the server would resolve from the X-Agent-Id header or an " +
+            "anonymous fallback.",
+        );
+      }
+      // Resolve namespace + kind to the exact values that go on the wire
+      // BEFORE signing — the envelope pins both, so signing anything else
+      // yields a 403 that looks like a key-enrollment problem.
+      const namespace = body.namespace ?? DEFAULT_NAMESPACE;
+      const kind = body.kind ?? DEFAULT_MEMORY_KIND;
+      payload = {
+        ...body,
+        namespace,
+        ...attestationFields(opts.signingKey, {
+          agentId: body.agent_id,
+          namespace,
+          title: body.title,
+          content: body.content,
+          kind,
+          ...(body.created_at ? { createdAt: body.created_at } : {}),
+        }),
+      };
+    }
     return this.call<Memory, CreateMemoryRequest>({
       method: "POST",
       path: "/api/v1/memories",
-      body,
+      body: payload,
       requestOpts: opts,
     });
   }
@@ -251,17 +341,33 @@ export class AiMemoryClient {
     });
   }
 
-  /** `PUT /api/v1/memories/:id`. */
+  /**
+   * `PUT /api/v1/memories/:id`.
+   *
+   * @param opts.expectedVersion Opt-in optimistic concurrency, sent as
+   *   `If-Match` — the daemon's ONLY version gate for this route
+   *   (`src/handlers/memories.rs:245-260`); there is no `version` body field,
+   *   and adding one would be silently ignored. A stale version yields `409`
+   *   (`ConflictError`) carrying both the expected and current versions.
+   *   Omit for the legacy last-write-wins behaviour.
+   */
   async update(
     id: string,
     body: UpdateMemoryRequest,
-    opts?: RequestOptions,
+    opts?: UpdateOptions,
   ): Promise<Memory> {
+    const requestOpts: RequestOptions | undefined =
+      opts?.expectedVersion === undefined
+        ? opts
+        : {
+            ...opts,
+            headers: { ...(opts.headers ?? {}), "if-match": String(opts.expectedVersion) },
+          };
     return this.call<Memory, UpdateMemoryRequest>({
       method: "PUT",
       path: `/api/v1/memories/${encodeURIComponent(id)}`,
       body,
-      requestOpts: opts,
+      requestOpts,
     });
   }
 
@@ -415,6 +521,30 @@ export class AiMemoryClient {
       method: "POST",
       path: "/api/v1/agents",
       body,
+      requestOpts: opts,
+    });
+  }
+
+  /**
+   * `PUT /api/v1/agents/:id/pubkey` — enroll an attestation public key.
+   *
+   * ADMIN-GATED. Without a bound key the daemon cannot verify a signed store
+   * and still answers `403` — fail-closed by design — so this is the required
+   * one-time step before {@link AiMemoryClient.store} with `signingKey` can
+   * succeed.
+   *
+   * @param pubkeyB64 Base64 32-byte Ed25519 public key; URL-safe unpadded is
+   *   accepted. {@link AgentSigningKey.publicKeyBase64} emits it.
+   */
+  async bindAgentPubkey(
+    agentId: string,
+    pubkeyB64: string,
+    opts?: RequestOptions,
+  ): Promise<{ bound: boolean; agent_id: string }> {
+    return this.call<{ bound: boolean; agent_id: string }, { pubkey_b64: string }>({
+      method: "PUT",
+      path: `/api/v1/agents/${encodeURIComponent(agentId)}/pubkey`,
+      body: { pubkey_b64: pubkeyB64 },
       requestOpts: opts,
     });
   }
