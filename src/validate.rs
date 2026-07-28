@@ -936,10 +936,26 @@ pub fn validate_valid_at(valid_at: &str) -> Result<()> {
 pub fn canonicalize_valid_time(ts: &str) -> Option<String> {
     chrono::DateTime::parse_from_rfc3339(ts.trim())
         .ok()
-        .map(|dt| {
-            dt.with_timezone(&chrono::Utc)
-                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
-        })
+        .map(|dt| render_canonical_utc(dt.with_timezone(&chrono::Utc)))
+}
+
+/// v1.0.0 #2418 (L-EXPIRY-CANON) — the ONE renderer behind
+/// [`canonicalize_valid_time`], exposed for the funnels that already hold a
+/// `DateTime<Utc>` and would otherwise render it themselves.
+///
+/// WHY this exists rather than a second `to_rfc3339_opts` call at each site:
+/// the sqlite `expires_at` / `valid_from` / `valid_until` columns are TEXT
+/// compared LEXICOGRAPHICALLY, so the rendering IS the ordering contract. The
+/// #1596 TTL-extension floors (`touch` / `touch_many` / `fold_recall_accesses`)
+/// bind a Rust-side `now + extend` straight into
+/// `expires_at = MAX(expires_at, ?N)` — a WRITE, not a read — and
+/// `chrono`'s bare `to_rfc3339()` renders `+00:00` with an `AutoSi` fraction
+/// (0/3/6/9 digits), so those funnels were re-introducing a non-canonical
+/// rendering on every recall fold even after the v87 heal + the #2332
+/// create/update-funnel canonicalization. One renderer, one contract.
+#[must_use]
+pub fn render_canonical_utc(dt: chrono::DateTime<chrono::Utc>) -> String {
+    dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
 /// Option-in / lossy sibling of [`canonicalize_valid_time`]: `None` passes

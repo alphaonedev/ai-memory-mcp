@@ -392,7 +392,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `reconcile_envelope_owner`) and the atomic seal/upsert/reconcile tx
     // wrappers on `insert_inner` + `insert_if_newer` land the file at
     // 27_132. Ceiling 26_750 -> 27_250 (+118 headroom).
-    ("src/storage/mod.rs", 27_250),
+    // 2026-07-28 (#2418 L-EXPIRY-CANON) — `expires_at` canonicalization at
+    // the THREE #1596 TTL-extension write funnels (`touch` / `touch_many` /
+    // `fold_recall_accesses`, which bound a bare `to_rfc3339()` `+00:00` /
+    // AutoSi-fraction rendering straight into `expires_at = MAX(...)`) plus
+    // the `canonical_archived_expiry` helper that heals a legacy
+    // `original_expires_at` on BOTH `restore_archived*` funnels. Lands the
+    // file at 27_251 — ONE line over. Ceiling 27_250 -> 27_400 (+149).
+    ("src/storage/mod.rs", 27_400),
     // 2026-07-21 (#1802 R-05 S1) — NEW submodule extracted from
     // storage/mod.rs (doctor / observability probes). Measured 698;
     // ceiling 800 (+102).
