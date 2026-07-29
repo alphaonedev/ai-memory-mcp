@@ -1334,8 +1334,8 @@ pub async fn sync_push(
         // when Layer 1 is armed and refuse either namespace out of scope.
         // Reject-before-apply: nothing is written and the batch survives.
         let existing_ns = if ns_scope_needs_existing {
-            match db::get(&lock.0, &mem.id) {
-                Ok(row) => row.map(|r| r.namespace),
+            match db::namespace_by_id(&lock.0, &mem.id) {
+                Ok(ns) => ns,
                 Err(e) => {
                     // Fail CLOSED: an unresolvable existence probe cannot be
                     // reported as "provably no local row" — that is exactly the
@@ -1811,6 +1811,49 @@ pub async fn sync_push(
             noop += 1;
             continue;
         }
+        // #2447 — `archives[]` is the same by-id reach into a foreign namespace
+        // the #1934 delete gate closed, one step softer (a recoverable move to
+        // `archived_memories` rather than a hard DELETE) — but it still removes
+        // the row from every live read of a namespace the peer was denied, and
+        // an ARCHIVED row is the input `restores[]` below resurrects. Confine
+        // it to the peer's scope with the same resolve-then-refuse shape. A
+        // missing row stays a no-op; an unresolvable one fails closed.
+        if ns_scope_needs_existing {
+            match db::namespace_by_id(&lock.0, arch_id) {
+                Ok(Some(namespace)) => {
+                    if !peer_attestation::namespace_allowed(
+                        peer_header_owned.as_deref(),
+                        &namespace,
+                        &attest_cfg,
+                    ) {
+                        tracing::warn!(
+                            target: ATTESTATION_TRACE_TARGET,
+                            memory_id = %arch_id,
+                            namespace = %namespace,
+                            peer_id = %peer_header_owned.as_deref().unwrap_or(""),
+                            "sync_push: refusing federated archive outside the peer's \
+                             namespace scope (#2447)"
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                }
+                Ok(None) => {
+                    noop += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        memory_id = %arch_id,
+                        "sync_push: archive pre-resolve failed for {arch_id}: {e}; \
+                         refusing the archive (#2447 fail-closed)"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            }
+        }
         match db::archive_memory(&lock.0, arch_id, Some("sync_push")) {
             Ok(true) => archived += 1,
             Ok(false) => noop += 1,
@@ -1841,6 +1884,49 @@ pub async fn sync_push(
         // forget by pushing a restore of a tombstoned id — so the G30 tombstone
         // gate lives HERE, not on the operator restore_archived (an authorized
         // un-forget per #1771). Tombstoned → no-op (matches the loop's posture).
+        // #2447 — `restores[]` is the resurrection twin of `archives[]`: it
+        // moves a row BACK into the live `memories` table, so an unscoped
+        // restore lets a `public/*` peer re-materialise rows in a namespace it
+        // was denied (including the pre-merge snapshot the #2447 clobber path
+        // would have left behind). The row lives in `archived_memories` at this
+        // point, hence the archive-table twin of the namespace probe. The G30
+        // tombstone gate below is orthogonal and still runs.
+        if ns_scope_needs_existing {
+            match db::archived_namespace_by_id(&lock.0, res_id) {
+                Ok(Some(namespace)) => {
+                    if !peer_attestation::namespace_allowed(
+                        peer_header_owned.as_deref(),
+                        &namespace,
+                        &attest_cfg,
+                    ) {
+                        tracing::warn!(
+                            target: ATTESTATION_TRACE_TARGET,
+                            memory_id = %res_id,
+                            namespace = %namespace,
+                            peer_id = %peer_header_owned.as_deref().unwrap_or(""),
+                            "sync_push: refusing federated restore outside the peer's \
+                             namespace scope (#2447)"
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                }
+                Ok(None) => {
+                    noop += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        memory_id = %res_id,
+                        "sync_push: restore pre-resolve failed for {res_id}: {e}; \
+                         refusing the restore (#2447 fail-closed)"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            }
+        }
         match db::memory_is_tombstoned(&lock.0, res_id) {
             Ok(true) => {
                 noop += 1;
