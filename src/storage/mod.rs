@@ -28,6 +28,14 @@ const SQL_SELECT_MEMORY_ROW_BY_ID: &str = "SELECT * FROM memories WHERE id = ?1"
 /// #1823 G6 — prior-version (namespace, version) read for the COW leaf,
 /// shared across the append-only revision sites (single SQL SSOT).
 const SQL_SELECT_NS_VERSION_BY_ID: &str = "SELECT namespace, version FROM memories WHERE id = ?1";
+/// #2447 — scalar namespace-by-id read for the federation receive-side
+/// namespace-scope gates (single SQL SSOT; see [`namespace_by_id`]).
+const SQL_SELECT_NAMESPACE_BY_ID: &str = "SELECT namespace FROM memories WHERE id = ?1";
+/// #2447 — the `archived_memories` twin of [`SQL_SELECT_NAMESPACE_BY_ID`],
+/// backing the federation `restores[]` scope gate (see
+/// [`archived_namespace_by_id`]).
+const SQL_SELECT_ARCHIVED_NAMESPACE_BY_ID: &str =
+    "SELECT namespace FROM archived_memories WHERE id = ?1";
 /// Targeted metadata + updated_at UPDATE (single SQL SSOT). Preserves
 /// `updated_at` byte-for-byte when the caller passes the row's current
 /// value — used by the G7 (#1824) contradiction-conserve marker write,
@@ -13542,6 +13550,49 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
         }
     }
     sealed_merge
+}
+
+/// #2447 (CWE-284) — resolve a live row's `namespace` by id, and NOTHING else.
+///
+/// The federation receive-side namespace-scope gates need one string per id to
+/// render a refusal. Reading it through [`get`] would be wrong on two counts:
+/// it re-runs the FULL `row_to_memory` decode (JSON `tags`/`metadata`/
+/// `citations`/`confidence_signals` + the at-rest AES envelope) once per pushed
+/// memory under the held global connection mutex — a duplicate of the read
+/// [`merge_inbound`] is about to do anyway — and, worse, `row_to_memory` runs
+/// under [`DecryptFailurePolicy::FailClosed`], so a row sealed to a DIFFERENT
+/// agent's key returns `Err`. A gate built on that would refuse (or, if a
+/// caller sloppily `.ok().flatten()`s it, ADMIT) exactly the most-protected
+/// rows. This scalar read touches no encrypted column and cannot fail that way.
+///
+/// `Ok(None)` means provably no live row with that id.
+///
+/// # Errors
+///
+/// Bubbles up rusqlite errors from the lookup. Callers on a security gate MUST
+/// fail closed on `Err` — it is not "no row".
+pub fn namespace_by_id(conn: &Connection, id: &str) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    let mut stmt = conn.prepare_cached(SQL_SELECT_NAMESPACE_BY_ID)?;
+    Ok(stmt
+        .query_row([id], |row| row.get::<_, String>(0))
+        .optional()?)
+}
+
+/// #2447 (CWE-284) — the `archived_memories` twin of [`namespace_by_id`], for
+/// the federation `restores[]` scope gate (the row a restore resurrects lives
+/// in the archive table, not in `memories`). Same scalar-read rationale, same
+/// fail-closed contract on `Err`.
+///
+/// # Errors
+///
+/// Bubbles up rusqlite errors from the lookup.
+pub fn archived_namespace_by_id(conn: &Connection, id: &str) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    let mut stmt = conn.prepare_cached(SQL_SELECT_ARCHIVED_NAMESPACE_BY_ID)?;
+    Ok(stmt
+        .query_row([id], |row| row.get::<_, String>(0))
+        .optional()?)
 }
 
 /// v0.8.0 Pillar-3 (#1709 / #224) — federation conflict-path entry that

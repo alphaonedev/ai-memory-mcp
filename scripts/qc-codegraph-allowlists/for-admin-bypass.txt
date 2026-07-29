@@ -20,6 +20,15 @@ src/curator/transcript_classify_pass.rs:agent_id
 src/daemon_runtime.rs:DAEMON_PRINCIPAL
 src/daemon_runtime.rs:EMBEDDING_BACKFILL
 src/federation/receive.rs:FEDERATION_CATCHUP
+# #2447 (CWE-284) — postgres federation-receive namespace-scope probe
+# (`resolve_stored_namespace`): resolves a row's namespace by id ONLY to render
+# a REFUSAL on the inbound write / delete lanes; the row is never returned to
+# the peer. The bypass is REQUIRED for correctness, not convenience —
+# `PostgresStore::get` folds a #910 visibility denial into `NotFound`, so a
+# tenant-scoped ctx would report a hidden foreign row as "no such row", which
+# is fail-OPEN on exactly the rows the gate protects. Peer/operator surface,
+# never a tenant handler; mirrors the sqlite twin's unscoped scalar read.
+src/handlers/federation_signing_check.rs:probe_principal
 src/handlers/admin.rs:DAEMON_PRINCIPAL
 src/handlers/hook_subscribers.rs:AI_HTTP_INTERNAL
 src/handlers/http.rs:AI_HTTP_INTERNAL
