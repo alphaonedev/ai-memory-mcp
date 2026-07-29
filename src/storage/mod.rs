@@ -17752,6 +17752,20 @@ pub enum ApproveOutcome {
     Rejected(String),
     /// Consensus quorum not yet met; vote recorded.
     Pending { votes: usize, quorum: u32 },
+    /// #2355 R40 — the human-key m-of-n SIGNED-approval quorum is not yet
+    /// met. Distinct from [`ApproveOutcome::Pending`] (which counts
+    /// *agent* consensus votes): this counts DISTINCT VALID ENROLLED
+    /// Ed25519 signers over the domain-separated approval bytes. Non-terminal
+    /// — the operator may re-submit with more signatures. NO vote is
+    /// recorded and the pending row is NOT mutated.
+    SignedQuorumNotMet { distinct: usize, threshold: usize },
+    /// #2355 R40 — TERMINAL signed-approval refusal: a forged signature, an
+    /// unenrolled signer, un-decodable material, no enrolled approvers, or
+    /// no signatures at all on a pending that REQUIRES them. Carries the
+    /// bare `QuorumError` display; each surface renders it through
+    /// [`crate::errors::msg::signed_approval_rejected`] so the wire text is
+    /// identical everywhere.
+    SignedQuorumRefused(String),
     /// Fully approved (Human single-step, matching Agent, or consensus
     /// threshold met). Caller may now replay the payload via
     /// `execute_pending_action`.
@@ -17792,11 +17806,20 @@ pub enum ApproveSurface {
 /// [`ApproveSurface`]. The multi-tenant HTTP surface enforces
 /// unconditionally; the single-operator MCP/CLI surfaces keep the
 /// `AI_MEMORY_AGENT_ID` opt-in.
+///
+/// `presented` (#2355) carries the caller's detached Ed25519 approver
+/// signatures for the R40 human-key quorum. This function is the SQLITE
+/// CHOKEPOINT for that gate: every sqlite approve surface (MCP, both HTTP
+/// approve routes, the CLI, the federation receive lane, the SAL sqlite
+/// adapter) funnels through here, so the gate cannot be missed by adding a
+/// new surface. A surface with no way to carry signatures passes `&[]`,
+/// which FAILS CLOSED on a `requires_signed_approval` pending.
 pub fn approve_with_approver_type(
     conn: &Connection,
     pending_id: &str,
     approver_agent_id: &str,
     surface: ApproveSurface,
+    presented: &[crate::approvals::signed::SignedApproval],
 ) -> Result<ApproveOutcome> {
     let Some(pa) = get_pending_action(conn, pending_id)? else {
         // #1620 — typed NotFound (was Rejected → 403; postgres 404'd).
@@ -17807,6 +17830,33 @@ pub fn approve_with_approver_type(
             "already decided: status={}",
             pa.status
         )));
+    }
+    // #2355 R40 — the human-key signed-approval quorum, checked BEFORE any
+    // approver-type arm runs so no consensus vote is recorded and no status
+    // transition happens on a pending whose quorum is unmet. Pre-#2355 this
+    // lived ONLY in the MCP handler, so both HTTP approve routes, the CLI,
+    // and the federation receive lane approved + EXECUTED a
+    // `requires_signed_approval` pending with zero signatures (CWE-306).
+    match crate::approvals::signed::evaluate_signed_approval_gate(
+        &pa.payload,
+        pending_id,
+        crate::approvals::Decision::Approve,
+        presented,
+    ) {
+        crate::approvals::signed::SignedApprovalGate::NotRequired
+        | crate::approvals::signed::SignedApprovalGate::Met(_) => {}
+        crate::approvals::signed::SignedApprovalGate::NotMet {
+            distinct,
+            threshold,
+        } => {
+            return Ok(ApproveOutcome::SignedQuorumNotMet {
+                distinct,
+                threshold,
+            });
+        }
+        crate::approvals::signed::SignedApprovalGate::Refused(e) => {
+            return Ok(ApproveOutcome::SignedQuorumRefused(e.to_string()));
+        }
     }
     // Resolve the namespace's approver type. If no policy, default to Human —
     // which accepts any approval (back-compat with 1.9 callers).
@@ -25792,7 +25842,8 @@ mod tests {
                     &conn,
                     &pid_unset,
                     "ai:alice",
-                    ApproveSurface::LocalOperator
+                    ApproveSurface::LocalOperator,
+                    &[],
                 )
                 .unwrap(),
                 ApproveOutcome::Approved
@@ -25813,7 +25864,7 @@ mod tests {
         unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:alice") };
 
         // (1) self-approval refused.
-        match approve_with_approver_type(&conn, &pid, "ai:alice", ApproveSurface::LocalOperator)
+        match approve_with_approver_type(&conn, &pid, "ai:alice", ApproveSurface::LocalOperator, &[])
             .unwrap()
         {
             ApproveOutcome::Rejected(m) => {
@@ -25825,7 +25876,7 @@ mod tests {
             other => panic!("expected self-approval rejection, got {other:?}"),
         }
         // (2) different but UNREGISTERED approver refused.
-        match approve_with_approver_type(&conn, &pid, "ai:bob", ApproveSurface::LocalOperator)
+        match approve_with_approver_type(&conn, &pid, "ai:bob", ApproveSurface::LocalOperator, &[])
             .unwrap()
         {
             ApproveOutcome::Rejected(m) => {
@@ -25840,7 +25891,7 @@ mod tests {
         register_agent(&conn, "ai:bob", "ai:generic", &[]).expect("register");
         assert!(
             matches!(
-                approve_with_approver_type(&conn, &pid, "ai:bob", ApproveSurface::LocalOperator)
+                approve_with_approver_type(&conn, &pid, "ai:bob", ApproveSurface::LocalOperator, &[])
                     .unwrap(),
                 ApproveOutcome::Approved
             ),
@@ -25877,7 +25928,7 @@ mod tests {
             &payload,
         )
         .unwrap();
-        match approve_with_approver_type(&conn, &pid_self, "ai:alice", ApproveSurface::Http)
+        match approve_with_approver_type(&conn, &pid_self, "ai:alice", ApproveSurface::Http, &[])
             .unwrap()
         {
             ApproveOutcome::Rejected(m) => assert!(
@@ -25888,7 +25939,7 @@ mod tests {
         }
 
         // (B) HTTP surface: a DIFFERENT but UNREGISTERED approver is also refused.
-        match approve_with_approver_type(&conn, &pid_self, "ai:bob", ApproveSurface::Http).unwrap()
+        match approve_with_approver_type(&conn, &pid_self, "ai:bob", ApproveSurface::Http, &[]).unwrap()
         {
             ApproveOutcome::Rejected(m) => assert!(
                 m.contains("not a registered agent"),
@@ -25901,7 +25952,7 @@ mod tests {
         register_agent(&conn, "ai:bob", "ai:generic", &[]).expect("register");
         assert!(
             matches!(
-                approve_with_approver_type(&conn, &pid_self, "ai:bob", ApproveSurface::Http)
+                approve_with_approver_type(&conn, &pid_self, "ai:bob", ApproveSurface::Http, &[])
                     .unwrap(),
                 ApproveOutcome::Approved
             ),
@@ -25926,7 +25977,8 @@ mod tests {
                     &conn,
                     &pid_local,
                     "ai:carol",
-                    ApproveSurface::LocalOperator
+                    ApproveSurface::LocalOperator,
+                    &[],
                 )
                 .unwrap(),
                 ApproveOutcome::Approved

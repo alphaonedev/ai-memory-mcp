@@ -610,6 +610,123 @@ pub mod signed {
         )
     }
 
+    /// The wire key carrying the caller's approver-signature array on every
+    /// surface (MCP tool param, both HTTP approve bodies). One const so the
+    /// four surfaces cannot drift (pm-v3.1 no-hardcoded-literals).
+    pub const APPROVALS_WIRE_KEY: &str = "approvals";
+
+    /// Parse the OPTIONAL `approvals` array of `{pubkey, signature}` objects
+    /// into [`SignedApproval`]s — the ONE parser shared by the MCP tool
+    /// params, both HTTP approve bodies, and the CLI.
+    ///
+    /// Malformed / missing entries are dropped rather than erroring: the
+    /// quorum verifier then reports the honest shortfall
+    /// ([`SignedApprovalGate::NotMet`] / [`QuorumError::NoSignatures`])
+    /// instead of a parse error that leaks which field was wrong. This is the
+    /// #1957 MCP precedent, preserved verbatim.
+    #[must_use]
+    pub fn parse_approvals_array(value: Option<&serde_json::Value>) -> Vec<SignedApproval> {
+        let Some(arr) = value.and_then(serde_json::Value::as_array) else {
+            return Vec::new();
+        };
+        arr.iter()
+            .filter_map(|entry| {
+                let pubkey = entry.get("pubkey")?.as_str()?;
+                let signature = entry.get("signature")?.as_str()?;
+                Some(SignedApproval {
+                    signer_pubkey_b64: pubkey.to_string(),
+                    signature_b64: signature.to_string(),
+                })
+            })
+            .collect()
+    }
+
+    /// Parse the `approvals` array out of a raw HTTP approve request body.
+    ///
+    /// Deliberately LENIENT about the body as a whole: the legacy
+    /// `POST /api/v1/pending/{id}/approve` surface accepts an empty body, and
+    /// tightening that would break every existing caller. An unparseable /
+    /// absent body yields no signatures — which FAILS CLOSED at the gate for
+    /// a `requires_signed_approval` pending.
+    #[must_use]
+    pub fn parse_approvals_from_body(body_bytes: &[u8]) -> Vec<SignedApproval> {
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(body_bytes) else {
+            return Vec::new();
+        };
+        parse_approvals_array(v.get(APPROVALS_WIRE_KEY))
+    }
+
+    /// Verdict of the ONE R40 signed-approval funnel
+    /// ([`evaluate_signed_approval_gate`]).
+    ///
+    /// #2355 — every approve surface (MCP, both HTTP approve routes on both
+    /// backends, the CLI, the federation receive lane) renders its own wire
+    /// shape from THIS enum; none of them re-implements the signature check.
+    /// A second verifier is the #2453 defect class (two verifiers that
+    /// disagree), and this codebase has already been bitten by it in both
+    /// SDKs — so the funnel is deliberately singular.
+    #[derive(Debug, Clone)]
+    pub enum SignedApprovalGate {
+        /// The pending was not routed from a typed escalation AND the caller
+        /// presented no signatures — the R40 gate does not engage (the
+        /// back-compat path for an ordinary consensus/human pending).
+        NotRequired,
+        /// A distinct-signer quorum over enrolled approver keys was met.
+        Met(QuorumMet),
+        /// Signatures verified but the DISTINCT-signer count is below the
+        /// m-of-n threshold. Surfaces render this as a non-terminal
+        /// "still pending" (an operator may submit more signatures), NOT a
+        /// hard refusal.
+        NotMet { distinct: usize, threshold: usize },
+        /// Terminal refusal: a forged signature, an unenrolled signer,
+        /// un-decodable material, no enrolled approvers, or no signatures at
+        /// all on a pending that REQUIRES them.
+        Refused(QuorumError),
+    }
+
+    /// The single R40 quorum funnel every approve surface routes through.
+    ///
+    /// Engages when the pending action's payload was routed from a typed
+    /// [`Decision::Escalate`](crate::governance::agent_action::Decision::Escalate)
+    /// ([`pending_requires_signed_approval`]) **OR** the caller volunteered
+    /// signatures. Otherwise returns [`SignedApprovalGate::NotRequired`] so an
+    /// ordinary pending is byte-identical to pre-#2355 behaviour.
+    ///
+    /// On a met quorum this emits the `approval_quorum_met` audit row
+    /// ([`record_quorum_event`]) so the forensic trail is identical no matter
+    /// which surface approved — pre-#2355 only the MCP surface emitted it.
+    ///
+    /// **Fail-closed by construction:** a caller that presents no signatures
+    /// (`presented = &[]`) against a `requires_signed_approval` pending gets
+    /// [`SignedApprovalGate::Refused`] with [`QuorumError::NoSignatures`].
+    /// That is what makes it safe for a surface that has no way to carry
+    /// signatures (the federation receive lane) to pass an empty slice.
+    #[must_use]
+    pub fn evaluate_signed_approval_gate(
+        payload: &serde_json::Value,
+        pending_id: &str,
+        decision: super::Decision,
+        presented: &[SignedApproval],
+    ) -> SignedApprovalGate {
+        if !pending_requires_signed_approval(payload) && presented.is_empty() {
+            return SignedApprovalGate::NotRequired;
+        }
+        match verify_quorum_from_env(pending_id, decision, presented) {
+            Ok(quorum) => {
+                record_quorum_event(pending_id, decision, &quorum);
+                SignedApprovalGate::Met(quorum)
+            }
+            Err(QuorumError::ThresholdNotMet {
+                distinct,
+                threshold,
+            }) => SignedApprovalGate::NotMet {
+                distinct,
+                threshold,
+            },
+            Err(e) => SignedApprovalGate::Refused(e),
+        }
+    }
+
     /// Whether a pending action's payload was routed from a typed escalation
     /// and therefore requires a signed approval.
     #[must_use]

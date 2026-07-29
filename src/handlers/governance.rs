@@ -237,6 +237,15 @@ pub async fn approve_pending(
         json!({ (field_names::PENDING_ID): &id }),
     );
 
+    // #2355 R40 — parse the OPTIONAL `approvals: [{pubkey, signature}]` array
+    // out of the (already HMAC-verified) body. This legacy route historically
+    // ignored its body entirely and accepted an empty one, so the parse stays
+    // lenient: no signatures FAILS CLOSED at the gate for a
+    // `requires_signed_approval` pending rather than erroring here. The K7
+    // HMAC canonical binds `<ts>.<METHOD>.<pending_id>.<body>`, so a captured
+    // signature array cannot be replayed against a different pending row.
+    let presented = crate::approvals::signed::parse_approvals_from_body(&body_bytes);
+
     // v0.7.0 Wave-3 Continuation 3 (Phase 20) — postgres-backed approve
     // routes through the FULL governance pipeline:
     // - inheritance-chain walk over `namespace_meta` (with explicit
@@ -257,7 +266,7 @@ pub async fn approve_pending(
         let ctx = crate::store::CallerContext::for_agent(agent_id.clone());
         return match app
             .store
-            .governance_approve_with_consensus(&ctx, &id, &agent_id)
+            .governance_approve_with_consensus(&ctx, &id, &agent_id, &presented)
             .await
         {
             Ok(SalOutcome::Approved) => {
@@ -310,6 +319,32 @@ pub async fn approve_pending(
                 })),
             )
                 .into_response(),
+            // #2355 R40 — human-key quorum unmet: 202 Accepted + the
+            // `signed_votes` / `signed_quorum` pair, mirroring how this route
+            // already renders an unmet CONSENSUS quorum. Non-terminal.
+            Ok(SalOutcome::SignedQuorumNotMet {
+                distinct,
+                threshold,
+            }) => (
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "approved": false,
+                    "status": "pending",
+                    "id": id,
+                    "signed_votes": distinct,
+                    "signed_quorum": threshold,
+                    "reason": crate::errors::msg::SIGNED_QUORUM_NOT_MET,
+                    (field_names::STORAGE_BACKEND): "postgres",
+                })),
+            )
+                .into_response(),
+            Ok(SalOutcome::SignedQuorumRefused(reason)) => (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": crate::errors::msg::signed_approval_rejected(reason),
+                })),
+            )
+                .into_response(),
             Ok(SalOutcome::Rejected(reason)) => (
                 StatusCode::FORBIDDEN,
                 Json(json!({"error": crate::errors::msg::approve_rejected(reason)})),
@@ -324,7 +359,13 @@ pub async fn approve_pending(
     // self-approval reject + registered-approver requirement UNCONDITIONALLY
     // (it is multi-tenant via per-request X-Agent-Id and sets no process
     // AI_MEMORY_AGENT_ID, so the storage-layer env opt-in would never fire).
-    match db::approve_with_approver_type(&lock.0, &id, &agent_id, db::ApproveSurface::Http) {
+    match db::approve_with_approver_type(
+        &lock.0,
+        &id,
+        &agent_id,
+        db::ApproveSurface::Http,
+        &presented,
+    ) {
         Ok(ApproveOutcome::Approved) => match db::execute_pending_action(&lock.0, &id) {
             Ok(memory_id) => {
                 // v0.6.2 (S34): fan out the decision AND the resulting
@@ -393,6 +434,30 @@ pub async fn approve_pending(
                 "votes": votes,
                 "quorum": quorum,
                 "reason": crate::errors::msg::CONSENSUS_NOT_REACHED,
+            })),
+        )
+            .into_response(),
+        // #2355 R40 — sqlite twin of the postgres arms above; identical wire
+        // shape so the backend stays an implementation detail.
+        Ok(ApproveOutcome::SignedQuorumNotMet {
+            distinct,
+            threshold,
+        }) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "approved": false,
+                "status": "pending",
+                "id": id,
+                "signed_votes": distinct,
+                "signed_quorum": threshold,
+                "reason": crate::errors::msg::SIGNED_QUORUM_NOT_MET,
+            })),
+        )
+            .into_response(),
+        Ok(ApproveOutcome::SignedQuorumRefused(reason)) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": crate::errors::msg::signed_approval_rejected(reason),
             })),
         )
             .into_response(),

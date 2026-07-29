@@ -1695,6 +1695,7 @@ impl MemoryStore for SqliteStore {
         _ctx: &CallerContext,
         pending_id: &str,
         approver_agent_id: &str,
+        presented: &[crate::approvals::signed::SignedApproval],
     ) -> StoreResult<super::ApproveOutcome> {
         let conn = self.state.lock().await;
         // #1796 (5-agent vote 4d3ea1c5) — the SAL trait is the store-backed
@@ -1702,11 +1703,16 @@ impl MemoryStore for SqliteStore {
         // gate UNCONDITIONALLY for behavioural parity with the postgres trait
         // impl (`governance_approve_with_consensus`, #1793). The single-operator
         // opt-in lives only on the MCP/CLI free-fn direct callers.
+        // #2355 R40 — `presented` threads the human-key approver signatures
+        // into the sqlite chokepoint, which runs the quorum gate BEFORE any
+        // vote/status transition. A caller with no signatures (`&[]`) fails
+        // CLOSED on a `requires_signed_approval` pending.
         let outcome = db::approve_with_approver_type(
             &conn,
             pending_id,
             approver_agent_id,
             db::ApproveSurface::Http,
+            presented,
         )
         .map_err(box_err)?;
         // Translate the db-layer ApproveOutcome → SAL ApproveOutcome.
@@ -1722,6 +1728,16 @@ impl MemoryStore for SqliteStore {
                 return Err(super::StoreError::NotFound {
                     id: pending_id.to_string(),
                 });
+            }
+            db::ApproveOutcome::SignedQuorumNotMet {
+                distinct,
+                threshold,
+            } => super::ApproveOutcome::SignedQuorumNotMet {
+                distinct,
+                threshold,
+            },
+            db::ApproveOutcome::SignedQuorumRefused(reason) => {
+                super::ApproveOutcome::SignedQuorumRefused(reason)
             }
             db::ApproveOutcome::Rejected(reason) => super::ApproveOutcome::Rejected(reason),
         };
@@ -2417,17 +2433,23 @@ impl MemoryStore for SqliteStore {
         _ctx: &CallerContext,
         pending_id: &str,
         approver_agent_id: &str,
+        presented: &[crate::approvals::signed::SignedApproval],
     ) -> StoreResult<super::ApproveOutcome> {
         let conn = self.state.lock().await;
         // #1796 (5-agent vote 4d3ea1c5) — store-backed (multi-tenant) surface;
         // enforce the Human-arm gate UNCONDITIONALLY for parity with the
         // postgres trait impl (#1793). MCP/CLI single-operator opt-in lives on
         // the free-fn direct callers only.
+        // #2355 R40 — `presented` threads the human-key approver signatures
+        // into the sqlite chokepoint, which runs the quorum gate BEFORE any
+        // vote/status transition. A caller with no signatures (`&[]`) fails
+        // CLOSED on a `requires_signed_approval` pending.
         let outcome = db::approve_with_approver_type(
             &conn,
             pending_id,
             approver_agent_id,
             db::ApproveSurface::Http,
+            presented,
         )
         .map_err(box_err)?;
         let sal = match outcome {
@@ -2442,6 +2464,16 @@ impl MemoryStore for SqliteStore {
                 return Err(super::StoreError::NotFound {
                     id: pending_id.to_string(),
                 });
+            }
+            db::ApproveOutcome::SignedQuorumNotMet {
+                distinct,
+                threshold,
+            } => super::ApproveOutcome::SignedQuorumNotMet {
+                distinct,
+                threshold,
+            },
+            db::ApproveOutcome::SignedQuorumRefused(reason) => {
+                super::ApproveOutcome::SignedQuorumRefused(reason)
             }
             db::ApproveOutcome::Rejected(reason) => super::ApproveOutcome::Rejected(reason),
         };
@@ -4620,7 +4652,7 @@ mod tests {
             // #1796 — Http surface enforces unconditionally; a registered
             // non-requester approver ("approver" != requester "alice") approves
             // deterministically regardless of any leaked AI_MEMORY_AGENT_ID.
-            db::approve_with_approver_type(&conn, &pid, "approver", db::ApproveSurface::Http)
+            db::approve_with_approver_type(&conn, &pid, "approver", db::ApproveSurface::Http, &[])
                 .expect("approve");
             pid
         };

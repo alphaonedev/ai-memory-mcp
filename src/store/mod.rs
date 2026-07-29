@@ -2822,11 +2822,19 @@ pub trait MemoryStore: Send + Sync {
     /// Default returns `UnsupportedCapability` so backends that don't
     /// yet wire the consensus state machine fail loudly rather than
     /// silently downgrade to single-vote approval.
+    ///
+    /// `presented` (#2355) carries the caller's detached Ed25519 approver
+    /// signatures for the R40 human-key quorum. Adapters MUST consult
+    /// [`crate::approvals::signed::evaluate_signed_approval_gate`] BEFORE
+    /// recording a vote or transitioning status, so a surface that cannot
+    /// carry signatures (`&[]`) FAILS CLOSED on a `requires_signed_approval`
+    /// pending on every backend.
     async fn governance_approve_with_consensus(
         &self,
         _ctx: &CallerContext,
         _pending_id: &str,
         _approver_agent_id: &str,
+        _presented: &[crate::approvals::signed::SignedApproval],
     ) -> StoreResult<ApproveOutcome> {
         Err(StoreError::UnsupportedCapability {
             capability: "GOVERNANCE_CONSENSUS".to_string(),
@@ -3411,8 +3419,9 @@ pub trait MemoryStore: Send + Sync {
         ctx: &CallerContext,
         pending_id: &str,
         approver_agent_id: &str,
+        presented: &[crate::approvals::signed::SignedApproval],
     ) -> StoreResult<ApproveOutcome> {
-        self.governance_approve_with_consensus(ctx, pending_id, approver_agent_id)
+        self.governance_approve_with_consensus(ctx, pending_id, approver_agent_id, presented)
             .await
     }
 
@@ -3651,6 +3660,19 @@ pub enum ApproveOutcome {
     /// The action remains `pending` (Consensus quorum not yet met).
     /// `votes` is the count of unique voters; `quorum` is the target.
     Pending { votes: usize, quorum: u32 },
+    /// #2355 R40 — the human-key m-of-n SIGNED-approval quorum is not yet
+    /// met. Distinct from [`ApproveOutcome::Pending`] (agent consensus
+    /// votes): this counts DISTINCT VALID ENROLLED Ed25519 signers over the
+    /// domain-separated approval bytes. Non-terminal — the operator may
+    /// re-submit with more signatures; no vote is recorded and the pending
+    /// row is not mutated. Backend-blind (sqlite + postgres identical).
+    SignedQuorumNotMet { distinct: usize, threshold: usize },
+    /// #2355 R40 — TERMINAL signed-approval refusal (forged / unenrolled /
+    /// un-decodable / no enrolled approvers / no signatures on a pending
+    /// that requires them). Carries the bare `QuorumError` display; each
+    /// surface renders it through
+    /// [`crate::errors::msg::signed_approval_rejected`].
+    SignedQuorumRefused(String),
     /// The vote was rejected. `reason` is human-readable.
     Rejected(String),
 }

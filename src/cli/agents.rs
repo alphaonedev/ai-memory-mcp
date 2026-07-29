@@ -118,7 +118,22 @@ pub enum PendingAction {
         limit: usize,
     },
     /// Approve a pending action by id.
-    Approve { id: String },
+    Approve {
+        id: String,
+        /// #2355 R40 — a detached Ed25519 approver signature, `<pubkey>:<sig>`
+        /// (both base64; standard or url-safe-no-pad). Repeat the flag once
+        /// per signer to satisfy an m-of-n
+        /// (`AI_MEMORY_APPROVAL_THRESHOLD`) quorum in ONE call — the
+        /// airgapped-operability model (collect signatures offline, submit
+        /// together). Base64 has no `:`, so the split is unambiguous.
+        ///
+        /// Required only for a pending routed from a typed
+        /// `Decision::Escalate` (payload `requires_signed_approval`); an
+        /// ordinary pending ignores it. Omitting it on a pending that
+        /// REQUIRES it fails CLOSED.
+        #[arg(long = "approval", value_name = "PUBKEY:SIGNATURE")]
+        approvals: Vec<String>,
+    },
     /// Reject a pending action by id.
     Reject { id: String },
 }
@@ -434,10 +449,28 @@ pub fn run_pending(
                 writeln!(out.stdout, "{} pending action(s)", items.len())?;
             }
         }
-        PendingAction::Approve { id } => {
+        PendingAction::Approve { id, approvals } => {
             use db::ApproveOutcome;
             validate::validate_id(&id)?;
             let agent = identity::resolve_agent_id(cli_agent_id, None)?;
+            // #2355 R40 — parse the repeatable `--approval <pubkey>:<sig>`
+            // flags into the shared `SignedApproval` shape. A malformed entry
+            // is dropped so the quorum verifier reports the honest shortfall
+            // (the #1957 MCP-parser precedent) rather than a parse error that
+            // discloses which half was wrong.
+            let presented: Vec<crate::approvals::signed::SignedApproval> = approvals
+                .iter()
+                .filter_map(|raw| {
+                    let (pubkey, signature) = raw.split_once(':')?;
+                    if pubkey.trim().is_empty() || signature.trim().is_empty() {
+                        return None;
+                    }
+                    Some(crate::approvals::signed::SignedApproval {
+                        signer_pubkey_b64: pubkey.trim().to_string(),
+                        signature_b64: signature.trim().to_string(),
+                    })
+                })
+                .collect();
             // #1796 (5-agent vote 4d3ea1c5) — CLI is operator-as-actor (single
             // operator); keep the Human-arm gate on the AI_MEMORY_AGENT_ID opt-in.
             match db::approve_with_approver_type(
@@ -445,6 +478,7 @@ pub fn run_pending(
                 &id,
                 &agent,
                 db::ApproveSurface::LocalOperator,
+                &presented,
             )? {
                 ApproveOutcome::Approved => {
                     let executed = db::execute_pending_action(&conn, &id)?;
@@ -484,6 +518,39 @@ pub fn run_pending(
                             "approval recorded: {id} ({votes}/{quorum} consensus, not yet met)"
                         )?;
                     }
+                }
+                // #2355 R40 — human-key quorum not yet met. Non-terminal: the
+                // operator re-runs with more `--approval` flags. Mirrors the
+                // MCP/HTTP `signed_votes` / `signed_quorum` field names.
+                ApproveOutcome::SignedQuorumNotMet {
+                    distinct,
+                    threshold,
+                } => {
+                    if json_out {
+                        writeln!(
+                            out.stdout,
+                            "{}",
+                            serde_json::json!({
+                                "approved": false,
+                                "status": "pending",
+                                "id": id,
+                                "signed_votes": distinct,
+                                "signed_quorum": threshold,
+                                "reason": crate::errors::msg::SIGNED_QUORUM_NOT_MET,
+                            })
+                        )?;
+                    } else {
+                        writeln!(
+                            out.stdout,
+                            "signed approval recorded: {id} ({distinct}/{threshold} \
+                             distinct enrolled signers, quorum not yet met)"
+                        )?;
+                    }
+                }
+                // #2355 R40 — TERMINAL refusal; hard-fail so a script cannot
+                // mistake a forged/unenrolled signature for a soft outcome.
+                ApproveOutcome::SignedQuorumRefused(reason) => {
+                    anyhow::bail!(crate::errors::msg::signed_approval_rejected(&reason));
                 }
                 // #1620 — typed not-found (was a Rejected string).
                 ApproveOutcome::NotFound => {
@@ -969,6 +1036,7 @@ mod tests {
         let args = PendingArgs {
             action: PendingAction::Approve {
                 id: "pa-approve-1".to_string(),
+                approvals: Vec::new(),
             },
         };
         {
@@ -990,6 +1058,7 @@ mod tests {
         let args = PendingArgs {
             action: PendingAction::Approve {
                 id: "pa-approve-json".to_string(),
+                approvals: Vec::new(),
             },
         };
         {
@@ -1133,6 +1202,7 @@ mod tests {
         let args = PendingArgs {
             action: PendingAction::Approve {
                 id: "pa-cons-1".to_string(),
+                approvals: Vec::new(),
             },
         };
         {
@@ -1169,6 +1239,7 @@ mod tests {
         let args = PendingArgs {
             action: PendingAction::Approve {
                 id: "pa-cons-j".to_string(),
+                approvals: Vec::new(),
             },
         };
         {
@@ -1200,7 +1271,10 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
         let args = PendingArgs {
-            action: PendingAction::Approve { id: String::new() },
+            action: PendingAction::Approve {
+                id: String::new(),
+                approvals: Vec::new(),
+            },
         };
         let mut out = env.output();
         let res = run_pending(&db, args, false, Some("test-agent"), &mut out);

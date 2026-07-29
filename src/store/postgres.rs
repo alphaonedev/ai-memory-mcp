@@ -22923,6 +22923,7 @@ impl MemoryStore for PostgresStore {
         ctx: &CallerContext,
         pending_id: &str,
         approver_agent_id: &str,
+        presented: &[crate::approvals::signed::SignedApproval],
     ) -> StoreResult<super::ApproveOutcome> {
         // Load the pending row + assert state. Missing pending_id surfaces
         // as StoreError::NotFound so the HTTP layer maps it to 404 (the
@@ -22941,6 +22942,35 @@ impl MemoryStore for PostgresStore {
                 "already decided: status={}",
                 pa.status
             )));
+        }
+
+        // #2355 R40 — the POSTGRES chokepoint for the human-key
+        // signed-approval quorum, the exact twin of the sqlite gate in
+        // `db::approve_with_approver_type`. Runs BEFORE any approver-type arm
+        // so no consensus vote is recorded and no status transition happens
+        // on a pending whose quorum is unmet. Both backends route through the
+        // SAME `evaluate_signed_approval_gate` funnel — there is exactly one
+        // signature verifier in the substrate (#2453 defect class).
+        match crate::approvals::signed::evaluate_signed_approval_gate(
+            &pa.payload,
+            pending_id,
+            crate::approvals::Decision::Approve,
+            presented,
+        ) {
+            crate::approvals::signed::SignedApprovalGate::NotRequired
+            | crate::approvals::signed::SignedApprovalGate::Met(_) => {}
+            crate::approvals::signed::SignedApprovalGate::NotMet {
+                distinct,
+                threshold,
+            } => {
+                return Ok(super::ApproveOutcome::SignedQuorumNotMet {
+                    distinct,
+                    threshold,
+                });
+            }
+            crate::approvals::signed::SignedApprovalGate::Refused(e) => {
+                return Ok(super::ApproveOutcome::SignedQuorumRefused(e.to_string()));
+            }
         }
 
         // Resolve namespace policy → approver type.

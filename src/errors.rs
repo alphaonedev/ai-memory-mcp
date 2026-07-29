@@ -124,6 +124,11 @@ pub mod msg {
     pub const GOVERNANCE_REQUIRES_APPROVAL: &str = "governance requires approval";
     pub const GOVERNANCE_CHECK_FAILED: &str = "governance check failed";
     pub const CONSENSUS_NOT_REACHED: &str = "consensus threshold not yet reached";
+    /// #2355 R40 — the NON-terminal "submit more signatures" reason, shared
+    /// by every approve surface so the wire text cannot drift between MCP,
+    /// HTTP (both backends) and the CLI. Byte-identical to the literal the
+    /// pre-#2355 MCP handler emitted.
+    pub const SIGNED_QUORUM_NOT_MET: &str = "signed approval quorum not yet met";
     pub const DECISION_WRITE_FAILED: &str = "decision write failed";
     /// #1787 — the requester of a Human-gated pending action may not approve
     /// it themselves (enforced only under the multi-tenant opt-in).
@@ -214,6 +219,16 @@ pub mod msg {
     #[must_use]
     pub fn approve_rejected(reason: impl std::fmt::Display) -> String {
         format!("approve rejected: {reason}")
+    }
+
+    /// #2355 R40 — `"signed approval rejected: {reason}"`. The TERMINAL
+    /// human-key-quorum refusal (forged signature, unenrolled signer,
+    /// un-decodable material, no enrolled approvers, or no signatures at all
+    /// on a pending that requires them). Byte-identical to the string the
+    /// pre-#2355 MCP handler produced, so the MCP wire shape is unchanged.
+    #[must_use]
+    pub fn signed_approval_rejected(reason: impl std::fmt::Display) -> String {
+        format!("signed approval rejected: {reason}")
     }
 
     /// `"older_than_days must be non-negative (got {days})"`.

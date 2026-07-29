@@ -1930,6 +1930,38 @@ pub async fn sync_push(
             skipped += 1;
             continue;
         }
+        // #2355 R40 — `upsert_pending_action` writes `status`, `decided_by`
+        // and `payload` VERBATIM from the peer (`ON CONFLICT(id) DO UPDATE`).
+        // Without this guard a peer could (a) plant a row carrying
+        // `requires_signed_approval` already `status='approved'`, minting its
+        // own "the quorum was met" evidence with zero signatures, or (b)
+        // re-push an existing id whose payload CLEARS the flag off a
+        // locally-escalated row, stripping the gate. Both defeat the R40
+        // control without ever touching an approve surface. A
+        // signed-approval-gated pending is LOCAL-CUSTODY state (its quorum is
+        // bound to THIS node's enrolled approver keys), so it is never
+        // accepted from, nor overwritten by, the wire. Fail-closed skip.
+        let inbound_flagged =
+            crate::approvals::signed::pending_requires_signed_approval(&pa.payload);
+        let local_flagged = db::get_pending_action(&lock.0, &pa.id)
+            .ok()
+            .flatten()
+            .is_some_and(|local| {
+                crate::approvals::signed::pending_requires_signed_approval(&local.payload)
+            });
+        if inbound_flagged || local_flagged {
+            tracing::warn!(
+                target: ATTESTATION_TRACE_TARGET,
+                pending_id = %pa.id,
+                sender = %body.sender_agent_id,
+                inbound_flagged,
+                local_flagged,
+                "sync_push: refusing federated upsert of a signed-approval-gated pending \
+                 (#2355 R40) — R40 pendings are local-custody and never wire-writable"
+            );
+            skipped += 1;
+            continue;
+        }
         match db::upsert_pending_action(&lock.0, pa) {
             Ok(()) => {
                 pendings_applied += 1;
@@ -1982,11 +2014,24 @@ pub async fn sync_push(
         // originator's rejected state) and grants no authority, so it keeps
         // the idempotent `decide_pending_action(false)` transition.
         if dec.approved {
+            // #2355 R40 — a REMOTE peer can never carry the human-key
+            // approval quorum: the `/sync/push` `pending_decisions` wire shape
+            // has no signature field, and the approval signing bytes are bound
+            // to THIS node's enrolled approver keys (which a peer does not
+            // hold). Passing `&[]` therefore makes the chokepoint FAIL CLOSED
+            // for any pending routed from a typed `Decision::Escalate`
+            // (payload `requires_signed_approval`) — the relayed approval is
+            // refused and counted `skipped`, and the row stays `pending` until
+            // a LOCAL operator approves it with real signatures. Convergence
+            // is preserved: the decision replays on the next catch-up once the
+            // local quorum lands. An ordinary (non-escalated) pending is
+            // byte-identical to pre-#2355.
             match db::approve_with_approver_type(
                 &lock.0,
                 &dec.id,
                 &dec.decider,
                 db::ApproveSurface::Http,
+                &[],
             ) {
                 Ok(db::ApproveOutcome::Approved) => {
                     pending_decisions_applied += 1;
@@ -2005,6 +2050,24 @@ pub async fn sync_push(
                 Ok(db::ApproveOutcome::Pending { .. }) => pending_decisions_applied += 1,
                 // Already decided / unknown pending — converged / no-op.
                 Ok(db::ApproveOutcome::NotFound) => noop += 1,
+                // #2355 R40 — the relayed approval targets a pending that
+                // REQUIRES a human-key signed quorum this lane structurally
+                // cannot supply. Refuse loudly; the row stays approvable
+                // locally.
+                Ok(
+                    db::ApproveOutcome::SignedQuorumNotMet { .. }
+                    | db::ApproveOutcome::SignedQuorumRefused(_),
+                ) => {
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        pending_id = %dec.id,
+                        decider = %dec.decider,
+                        "sync_push: refusing federated approval of a signed-approval-gated \
+                         pending (#2355 R40): a remote peer cannot carry the human-key quorum; \
+                         approve it locally with enrolled approver signatures"
+                    );
+                    skipped += 1;
+                }
                 Ok(db::ApproveOutcome::Rejected(reason)) => {
                     tracing::warn!(
                         target: ATTESTATION_TRACE_TARGET,

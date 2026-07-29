@@ -270,19 +270,11 @@ fn parse_remember_param(params: &Value) -> crate::approvals::Remember {
 /// missing / malformed entries are dropped (the quorum verifier then reports
 /// the honest shortfall). Empty when no signatures were presented.
 fn parse_signed_approvals(params: &Value) -> Vec<crate::approvals::signed::SignedApproval> {
-    let Some(arr) = params["approvals"].as_array() else {
-        return Vec::new();
-    };
-    arr.iter()
-        .filter_map(|entry| {
-            let pubkey = entry["pubkey"].as_str()?;
-            let signature = entry["signature"].as_str()?;
-            Some(crate::approvals::signed::SignedApproval {
-                signer_pubkey_b64: pubkey.to_string(),
-                signature_b64: signature.to_string(),
-            })
-        })
-        .collect()
+    // #2355 — delegates to the ONE shared parser so the MCP param shape and
+    // the two HTTP body shapes cannot drift.
+    crate::approvals::signed::parse_approvals_array(
+        params.get(crate::approvals::signed::APPROVALS_WIRE_KEY),
+    )
 }
 
 /// v0.7 K10 — record a synthetic rule + publish on the approval bus
@@ -370,47 +362,26 @@ pub fn handle_pending_approve(
     // enrolled operator/approver keys MUST be met before the underlying approve
     // proceeds. Back-compat: an ordinary (non-escalated) pending with no
     // signatures skips this gate entirely.
-    let signed_snapshot = db::get_pending_action(conn, id).map_err(|e| e.to_string())?;
-    let requires_signed = signed_snapshot
-        .as_ref()
-        .is_some_and(|p| crate::approvals::signed::pending_requires_signed_approval(&p.payload));
+    //
+    // #2355 — the gate itself MOVED into the storage chokepoint
+    // (`db::approve_with_approver_type`) so the SAME check covers every
+    // surface (both HTTP approve routes on both backends, the CLI, and the
+    // federation receive lane) instead of MCP alone. This handler now only
+    // PARSES the `approvals` array and RENDERS the verdict; the wire shape is
+    // byte-identical to the pre-#2355 MCP responses.
     let presented = parse_signed_approvals(params);
-    if requires_signed || !presented.is_empty() {
-        match crate::approvals::signed::verify_quorum_from_env(
-            id,
-            crate::approvals::Decision::Approve,
-            &presented,
-        ) {
-            Ok(quorum) => {
-                crate::approvals::signed::record_quorum_event(
-                    id,
-                    crate::approvals::Decision::Approve,
-                    &quorum,
-                );
-                // Quorum met — fall through to the existing approve + execute path.
-            }
-            Err(crate::approvals::signed::QuorumError::ThresholdNotMet {
-                distinct,
-                threshold,
-            }) => {
-                return Ok(json!({
-                    "approved": false,
-                    "status": "pending",
-                    "id": id,
-                    "signed_votes": distinct,
-                    "signed_quorum": threshold,
-                    "reason": "signed approval quorum not yet met",
-                }));
-            }
-            Err(e) => return Err(format!("signed approval rejected: {e}")),
-        }
-    }
 
     // #1796 (5-agent vote 4d3ea1c5) — MCP/stdio is the single-operator surface;
     // keep the Human-arm gate on the AI_MEMORY_AGENT_ID opt-in (an unconditional
     // reject-self would self-lock the lone operator approving their own action).
-    match db::approve_with_approver_type(conn, id, &agent_id, db::ApproveSurface::LocalOperator)
-        .map_err(|e| e.to_string())?
+    match db::approve_with_approver_type(
+        conn,
+        id,
+        &agent_id,
+        db::ApproveSurface::LocalOperator,
+        &presented,
+    )
+    .map_err(|e| e.to_string())?
     {
         ApproveOutcome::Approved => {
             // Task 1.10: auto-execute the queued action on final approval.
@@ -437,6 +408,21 @@ pub fn handle_pending_approve(
             "quorum": quorum,
             "reason": crate::errors::msg::CONSENSUS_NOT_REACHED,
         })),
+        // #2355 R40 — byte-identical to the pre-#2355 inline-gate response.
+        ApproveOutcome::SignedQuorumNotMet {
+            distinct,
+            threshold,
+        } => Ok(json!({
+            "approved": false,
+            "status": "pending",
+            "id": id,
+            "signed_votes": distinct,
+            "signed_quorum": threshold,
+            "reason": crate::errors::msg::SIGNED_QUORUM_NOT_MET,
+        })),
+        ApproveOutcome::SignedQuorumRefused(reason) => {
+            Err(crate::errors::msg::signed_approval_rejected(reason))
+        }
         // #1620 — typed not-found (was a Rejected string).
         ApproveOutcome::NotFound => Err(crate::errors::msg::pending_action_not_found(id)),
         ApproveOutcome::Rejected(reason) => Err(crate::errors::msg::approve_rejected(reason)),

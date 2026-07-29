@@ -55,6 +55,19 @@ pub struct ApprovalRequestBody {
     /// `"once"` (default), `"session"`, or `"forever"`.
     #[serde(default = "default_remember")]
     pub remember: crate::approvals::Remember,
+    /// #2355 R40 — OPTIONAL array of `{pubkey, signature}` detached Ed25519
+    /// approver signatures over the domain-separated approval bytes
+    /// (`ai-memory:approval:v1 || 0x00 || pending_id || 0x00 || decision`).
+    /// Mirrors the MCP `memory_pending_approve` `approvals` param wire shape
+    /// (CLAUDE.md env rows 126/127). Parsed via the ONE shared parser
+    /// [`crate::approvals::signed::parse_approvals_array`]. Absent / empty on
+    /// a `requires_signed_approval` pending FAILS CLOSED at the gate.
+    ///
+    /// The whole body is already bound by the K7/K10 HMAC canonical
+    /// (`<ts>.<METHOD>.<pending_id>.<body>`), so these signatures cannot be
+    /// lifted onto a different pending id inside the replay window.
+    #[serde(default)]
+    pub approvals: Option<serde_json::Value>,
 }
 
 fn default_remember() -> crate::approvals::Remember {
@@ -247,6 +260,10 @@ pub async fn approval_decide(
         )
             .into_response();
     }
+    // #2355 R40 — parse the optional approver-signature array ONCE, before
+    // the storage-backend fork, so the sqlite and postgres branches feed the
+    // identical slice into the identical gate.
+    let presented = crate::approvals::signed::parse_approvals_array(body.approvals.as_ref());
     let header_agent_id = headers
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
@@ -296,7 +313,7 @@ pub async fn approval_decide(
     // deny routes through `pending_decide(false)`.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        return approval_decide_postgres(&app, &id, &agent_id, &body).await;
+        return approval_decide_postgres(&app, &id, &agent_id, &body, &presented).await;
     }
 
     let lock = app.db.lock().await;
@@ -308,8 +325,13 @@ pub async fn approval_decide(
             // #1796 (5-agent vote 4d3ea1c5) — HTTP approve surface enforces the
             // Human-arm self-approval gate UNCONDITIONALLY regardless of backend
             // (multi-tenant; no process AI_MEMORY_AGENT_ID to key the opt-in on).
-            match db::approve_with_approver_type(&lock.0, &id, &agent_id, db::ApproveSurface::Http)
-            {
+            match db::approve_with_approver_type(
+                &lock.0,
+                &id,
+                &agent_id,
+                db::ApproveSurface::Http,
+                &presented,
+            ) {
                 Ok(crate::db::ApproveOutcome::Approved) => {
                     let executed = db::execute_pending_action(&lock.0, &id);
                     match executed {
@@ -339,6 +361,34 @@ pub async fn approval_decide(
                     "quorum": quorum,
                     "remember": format!("{:?}", body.remember).to_lowercase(),
                 }),
+                // #2355 R40 — the human-key quorum is not yet met. Non-terminal:
+                // the operator may re-POST with more signatures. Mirrors the MCP
+                // `signed_votes` / `signed_quorum` field names.
+                Ok(crate::db::ApproveOutcome::SignedQuorumNotMet {
+                    distinct,
+                    threshold,
+                }) => json!({
+                    "approved": false,
+                    "status": "pending",
+                    "id": id,
+                    "signed_votes": distinct,
+                    "signed_quorum": threshold,
+                    "reason": crate::errors::msg::SIGNED_QUORUM_NOT_MET,
+                    "remember": format!("{:?}", body.remember).to_lowercase(),
+                }),
+                // #2355 R40 — TERMINAL refusal (forged / unenrolled /
+                // un-decodable / no enrolled approvers / no signatures on a
+                // pending that requires them) → 403, the same status the
+                // policy-reject arm below uses.
+                Ok(crate::db::ApproveOutcome::SignedQuorumRefused(reason)) => {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "error": crate::errors::msg::signed_approval_rejected(reason),
+                        })),
+                    )
+                        .into_response();
+                }
                 // #1620 — missing pending id is 404 (was 403 via the
                 // collapsed Rejected arm; postgres already 404'd).
                 Ok(crate::db::ApproveOutcome::NotFound) => {
@@ -411,6 +461,7 @@ async fn approval_decide_postgres(
     id: &str,
     agent_id: &str,
     body: &ApprovalRequestBody,
+    presented: &[crate::approvals::signed::SignedApproval],
 ) -> axum::response::Response {
     let ctx = crate::store::CallerContext::for_agent(agent_id.to_string());
     // Snapshot the pending row before deciding so we can synthesise a
@@ -422,7 +473,7 @@ async fn approval_decide_postgres(
         crate::approvals::Decision::Approve => {
             match app
                 .store
-                .governance_approve_with_consensus(&ctx, id, agent_id)
+                .governance_approve_with_consensus(&ctx, id, agent_id, presented)
                 .await
             {
                 Ok(crate::store::ApproveOutcome::Approved) => {
@@ -453,6 +504,30 @@ async fn approval_decide_postgres(
                     "quorum": quorum,
                     "remember": remember_label,
                 }),
+                // #2355 R40 — postgres twin of the sqlite arms above; the wire
+                // shape is byte-identical (the storage backend is an
+                // implementation detail the K10 contract does not expose).
+                Ok(crate::store::ApproveOutcome::SignedQuorumNotMet {
+                    distinct,
+                    threshold,
+                }) => json!({
+                    "approved": false,
+                    "status": "pending",
+                    "id": id,
+                    "signed_votes": distinct,
+                    "signed_quorum": threshold,
+                    "reason": crate::errors::msg::SIGNED_QUORUM_NOT_MET,
+                    "remember": remember_label,
+                }),
+                Ok(crate::store::ApproveOutcome::SignedQuorumRefused(reason)) => {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "error": crate::errors::msg::signed_approval_rejected(reason),
+                        })),
+                    )
+                        .into_response();
+                }
                 Ok(crate::store::ApproveOutcome::Rejected(reason)) => {
                     return (
                         StatusCode::FORBIDDEN,
