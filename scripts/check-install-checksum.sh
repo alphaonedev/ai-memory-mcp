@@ -230,7 +230,14 @@ run_static() {
 # Tools the installer legitimately needs, beyond the download client. The
 # scenario-D minimal PATH is built from exactly this list, so a SHA-256
 # tool can be withheld without withholding anything else.
-MIN_TOOLS=(uname mktemp rm mkdir cp chmod tar awk wc tr ls cat sed grep)
+MIN_TOOLS=(sh gzip uname mktemp rm mkdir cp chmod tar awk wc tr ls cat sed grep)
+
+# Every fail-closed abort in install.sh / install.ps1 prints this line.
+# Reject scenarios must see it, so that a harness-level failure (a missing
+# tool, exit 127, a typo in the invocation) can never masquerade as "the
+# installer correctly refused". Asserting only "exit != 0" is how a
+# self-test passes for the wrong reason.
+REFUSAL_MARKER='install aborted (checksum gate #2449)'
 
 make_shims() {
     # $1 = bin dir, $2 = serve dir
@@ -290,10 +297,13 @@ SHIM
 }
 
 make_min_path() {
-    # $1 = dir to populate with symlinks to MIN_TOOLS (NO sha256 tool)
-    local dir="$1" t src
+    # $1 = dir to populate with symlinks to MIN_TOOLS, $2.. = extra tools.
+    # Notably absent: sha256sum and shasum, so the installer's hashing
+    # ladder can be driven down to a chosen rung.
+    local dir="$1"; shift
+    local t src
     mkdir -p "$dir"
-    for t in "${MIN_TOOLS[@]}"; do
+    for t in "${MIN_TOOLS[@]}" "$@"; do
         src="$(command -v "$t" 2>/dev/null || true)"
         if [[ -z "$src" ]]; then
             # NEVER skip-and-pass (#2452's defect class): a missing
@@ -356,12 +366,18 @@ run_scenario() {
         *)    printf 'internal error: bad checksum mode %s\n' "$mode" >&2; exit 1 ;;
     esac
 
-    if [[ "$minimal" == "yes" ]]; then
-        make_min_path "${case_dir}/min"
-        path="${bin}:${case_dir}/min"
-    else
-        path="${bin}:${PATH}"
-    fi
+    case "$minimal" in
+        no)      path="${bin}:${PATH}" ;;
+        # No SHA-256 tool at all -> the installer must abort.
+        yes)     make_min_path "${case_dir}/min";         path="${bin}:${case_dir}/min" ;;
+        # openssl is the ONLY hasher -> drives the third rung of the
+        # hashing ladder, so that rung is proven rather than assumed.
+        # (The vote's abort-only camp objected precisely that an
+        # unexercised fallback branch is the fail-open bug one layer
+        # down; these two scenarios are what answers that.)
+        openssl) make_min_path "${case_dir}/min" openssl; path="${bin}:${case_dir}/min" ;;
+        *) printf 'internal error: bad minimal mode %s\n' "$minimal" >&2; exit 1 ;;
+    esac
 
     set +e
     out="$(PATH="$path" HOME="$case_dir" sh "$installer" --dir "$target" 2>&1)"
@@ -377,17 +393,24 @@ run_scenario() {
     printf '  [%s] mode=%-4s exit=%-3d installed=%-3s expected=%s\n' \
         "$name" "$mode" "$rc" "$installed" "$expect"
 
-    local ok=1
+    local ok=1 why=""
     if [[ "$expect" == "reject" ]]; then
-        (( rc != 0 )) || ok=0
-        [[ "$installed" == "no" ]] || ok=0
+        # Exit 1 specifically — install.sh aborts with `exit 1`. A 126/127
+        # (tool missing, not executable) means the HARNESS broke, not that
+        # the installer refused, and must not be scored as a pass.
+        (( rc == 1 )) || { ok=0; why="expected exit 1 (the installer's own abort), got ${rc}"; }
+        [[ "$installed" == "no" ]] || { ok=0; why="the binary was installed anyway"; }
+        if ! grep -qF -- "$REFUSAL_MARKER" <<<"$out"; then
+            ok=0
+            why="${why:+${why}; }the refusal marker '${REFUSAL_MARKER}' was absent, so this was not a deliberate fail-closed refusal"
+        fi
     else
-        (( rc == 0 )) || ok=0
-        [[ "$installed" == "yes" ]] || ok=0
+        (( rc == 0 )) || { ok=0; why="expected exit 0, got ${rc}"; }
+        [[ "$installed" == "yes" ]] || { ok=0; why="${why:+${why}; }the binary was not installed"; }
     fi
 
     if (( ok == 0 )); then
-        violation "scenario ${name}: expected the installer to ${expect} (exit $([[ $expect == reject ]] && echo '!=0' || echo '==0'), binary $([[ $expect == reject ]] && echo 'NOT ' || echo '')installed) but it ${verdict}ed with exit=${rc} installed=${installed}."
+        violation "scenario ${name}: expected the installer to ${expect}, but ${why}."
         printf -- '--- installer output (%s) ---\n%s\n--- end ---\n' "$name" "$out" >&2
     fi
 
@@ -399,10 +422,19 @@ run_self_test() {
     info "  installer under test: ${INSTALLER}"
     mkdir -p "$SCRATCH_ROOT"
 
-    run_scenario missing-checksum    "$INSTALLER" none reject
-    run_scenario mismatched-checksum "$INSTALLER" bad  reject
-    run_scenario valid-checksum      "$INSTALLER" good accept
-    run_scenario no-sha256-tool      "$INSTALLER" good reject yes
+    # The two scenarios #2449 is about: the control must REFUSE.
+    run_scenario missing-checksum      "$INSTALLER" none reject
+    run_scenario mismatched-checksum   "$INSTALLER" bad  reject
+    # ... and it must still let a good install through, or it is not a
+    # gate, it is an outage.
+    run_scenario valid-checksum        "$INSTALLER" good accept
+    # No hashing tool at all: abort, never "skip verification".
+    run_scenario no-sha256-tool        "$INSTALLER" good reject yes
+    # openssl as the ONLY hasher: the third rung must really verify —
+    # accept a correct digest AND reject a wrong one. A rung that
+    # accepted everything would be the original bug in a new shape.
+    run_scenario openssl-rung-valid    "$INSTALLER" good accept openssl
+    run_scenario openssl-rung-mismatch "$INSTALLER" bad  reject openssl
 
     rmdir "$SCRATCH_ROOT" 2>/dev/null || true
 
