@@ -296,26 +296,28 @@ fn ladder_effects_by_version() -> BTreeMap<i32, ArmEffects> {
 // Throwaway-database plumbing
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Split a postgres URL into `(prefix-before-dbname, dbname, query-suffix)`.
-fn split_url(url: &str) -> (String, String, String) {
+/// Rewrite a postgres URL to point at a different database, preserving the
+/// scheme, credentials, host, port and the whole query string (the TLS
+/// parameters live there — `sslmode=verify-full&sslrootcert=…` — so dropping
+/// them would silently downgrade the scratch connection).
+fn url_with_db(url: &str, db: &str) -> String {
     let (base, query) = match url.find('?') {
-        Some(i) => (&url[..i], url[i..].to_string()),
-        None => (url, String::new()),
+        Some(i) => (&url[..i], &url[i..]),
+        None => (url, ""),
     };
     let scheme_end = base.find("://").map_or(0, |i| i + 3);
-    let slash = base[scheme_end..]
-        .find('/')
-        .map_or(base.len(), |i| scheme_end + i);
-    (
-        base[..=slash.min(base.len().saturating_sub(1))].to_string(),
-        base[(slash + 1).min(base.len())..].to_string(),
-        query,
-    )
-}
-
-fn url_with_db(url: &str, db: &str) -> String {
-    let (prefix, _, query) = split_url(url);
-    format!("{prefix}{db}{query}")
+    // `authority` ends at the first `/` AFTER the scheme; anything past it is
+    // the database name we are replacing. A URL with no path separator (no
+    // database named) still yields a well-formed result.
+    let prefix = match base[scheme_end..].find('/') {
+        Some(i) => &base[..=scheme_end + i],
+        None => base,
+    };
+    if prefix.ends_with('/') {
+        format!("{prefix}{db}{query}")
+    } else {
+        format!("{prefix}/{db}{query}")
+    }
 }
 
 async fn admin_pool(url: &str) -> PgPool {
@@ -334,10 +336,37 @@ struct ScratchDb {
     url: String,
 }
 
+/// Scratch databases are named `ai_memory_replay_<tag>_<epoch_secs>_<nanos>`.
+/// The epoch field is what makes the stale sweep safe.
+const SCRATCH_PREFIX: &str = "ai_memory_replay_";
+
+/// A scratch database is only reaped once it is older than this. An UNBOUNDED
+/// sweep would drop a CONCURRENT run's in-flight database (two CI jobs against
+/// one server), turning a cleanup convenience into a cross-run failure — and
+/// DROP DATABASE is irreversible. Age-bounding keeps the sweep strictly to
+/// wreckage no live run can still own.
+const SCRATCH_STALE_AFTER_SECS: u64 = 3600;
+
+fn epoch_secs_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
+}
+
+/// Parse the `<epoch_secs>` field out of a scratch database name, if it looks
+/// like one this suite created.
+fn scratch_created_at(name: &str) -> Option<u64> {
+    let rest = name.strip_prefix(SCRATCH_PREFIX)?;
+    let mut parts = rest.rsplitn(3, '_');
+    let _nanos = parts.next()?;
+    parts.next()?.parse::<u64>().ok()
+}
+
 /// Best-effort sweep of scratch databases stranded by a previous run that
-/// panicked mid-test. Names are unique per run so a leftover never wedges the
-/// next one, but leaving them to accumulate on a shared rehearsal server is not
-/// manageable — self-heal instead of requiring manual cleanup.
+/// panicked mid-test. Leaving them to accumulate on a shared rehearsal server is
+/// not manageable — self-heal instead of requiring manual cleanup — but only
+/// ever for databases old enough that no live run can still own them.
 async fn reap_stale_scratch_dbs(admin_url: &str) {
     let pool = admin_pool(admin_url).await;
     let Ok(rows) = sqlx::query_scalar::<_, String>(
@@ -349,7 +378,13 @@ async fn reap_stale_scratch_dbs(admin_url: &str) {
         pool.close().await;
         return;
     };
+    let now = epoch_secs_now();
     for name in rows {
+        let stale = scratch_created_at(&name)
+            .is_some_and(|created| now.saturating_sub(created) > SCRATCH_STALE_AFTER_SECS);
+        if !stale {
+            continue;
+        }
         let _ = sqlx::query(&format!(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{name}'"
         ))
@@ -363,12 +398,16 @@ async fn reap_stale_scratch_dbs(admin_url: &str) {
 }
 
 impl ScratchDb {
+    /// `tag` is caller-controlled but only ever a literal from this file
+    /// (`fresh`, `v67`, …); the rest of the name is synthesized. Postgres cannot
+    /// bind an identifier in DDL, so the name is interpolated — it is never
+    /// derived from external input.
     async fn create(admin_url: &str, tag: &str) -> Self {
-        let suffix = std::time::SystemTime::now()
+        let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
-            .as_nanos();
-        let name = format!("ai_memory_replay_{tag}_{}", suffix % 1_000_000_000);
+            .subsec_nanos();
+        let name = format!("{SCRATCH_PREFIX}{tag}_{}_{nanos}", epoch_secs_now());
         let pool = admin_pool(admin_url).await;
         // Idempotent: a prior crashed run must not wedge this one.
         let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {name}"))
@@ -832,4 +871,45 @@ fn ladder_effect_derivation_is_not_vacuous() {
              the replay would not exercise the defect.",
         );
     }
+}
+
+/// Unit-pin the two pure helpers the scratch-database plumbing rests on. They
+/// run with NO database, so they hold in every CI leg — and both guard
+/// irreversible operations: a mis-parsed URL would point `CREATE/DROP DATABASE`
+/// at the wrong server, and a mis-parsed name would let the stale sweep reap a
+/// concurrent run's live database.
+#[test]
+fn scratch_plumbing_helpers_are_correct() {
+    // Query string (where the TLS parameters live) must survive verbatim.
+    assert_eq!(
+        url_with_db(
+            "postgresql://u:p@127.0.0.1:5434/ai_memory_ladder?sslmode=verify-full&sslrootcert=/ca.crt",
+            "scratch",
+        ),
+        "postgresql://u:p@127.0.0.1:5434/scratch?sslmode=verify-full&sslrootcert=/ca.crt",
+    );
+    assert_eq!(
+        url_with_db("postgres://h/olddb", "newdb"),
+        "postgres://h/newdb",
+    );
+    // No path component: still yields a well-formed URL rather than mangling
+    // the authority.
+    assert_eq!(
+        url_with_db("postgres://h:5432", "newdb"),
+        "postgres://h:5432/newdb"
+    );
+
+    // Only OUR names parse, and only the epoch field is read as the age.
+    assert_eq!(
+        scratch_created_at("ai_memory_replay_v67_1700000000_123456789"),
+        Some(1_700_000_000),
+    );
+    assert_eq!(scratch_created_at("some_other_database"), None);
+    assert_eq!(
+        scratch_created_at("ai_memory_replay_v67_notanumber_1"),
+        None
+    );
+    // A production-looking database must never parse as reapable.
+    assert_eq!(scratch_created_at("ai_memory_test"), None);
+    assert_eq!(scratch_created_at("ai_memory_ladder"), None);
 }
