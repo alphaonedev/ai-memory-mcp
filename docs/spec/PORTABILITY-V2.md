@@ -149,7 +149,7 @@ This spec is normative for v1.0; the integrity-complete exporter/importer SHIPPE
 | Signed-record byte family | FROZEN + corpus-gated (this spec §V2-2, format spec, `conformance/`) |
 | Non-Rust readers | SHIPPED (2: python3 + node, `conformance/readers/`) |
 
-The full v2 envelope emit+import is shipped at v1.0.0 via `export --full` + the v2 importer (#2006), with an end-to-end byte-exact round-trip test (`tests/portability_roundtrip_2006.rs`). **Deferred to v1.x follow-ups** (tracked as their own issues): the NDJSON streaming framing (§V2-4) and the embedder-tag round-trip (§V2-5). The GA portability claim rests on Portability Spec v2 + the CC0 conformance corpus (#1837) + the two non-Rust readers + `ai-memory backup` (lossless SQLite `VACUUM INTO`) + now `ai-memory export --full`; the default `ai-memory export` remains the scope-limited convenience view — do not claim the DEFAULT export round-trips the integrity spine.
+The full v2 envelope emit+import is shipped at v1.0.0 via `export --full` + the v2 importer (#2006), with an end-to-end byte-exact round-trip test (`tests/portability_roundtrip_2006.rs`). **Deferred to v1.x follow-ups** (tracked as their own issues): the NDJSON streaming framing (§V2-4) and the embedder-tag round-trip (§V2-5). The GA portability claim rests on Portability Spec v2 + the CC0 conformance corpus (#1837) + the two non-Rust readers + `ai-memory backup` (lossless SQLite `VACUUM INTO` — SQLite deployments only; it refuses a non-SQLite store rather than emitting an empty artifact, #2444) + now `ai-memory export --full`; the default `ai-memory export` remains the scope-limited convenience view — do not claim the DEFAULT export round-trips the integrity spine.
 
 ---
 

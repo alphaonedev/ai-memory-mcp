@@ -97,20 +97,13 @@ pub struct MigrationReport {
 /// Returns an error for unrecognised URL schemes or adapter-
 /// construction failures (bad path, unreachable Postgres, etc.).
 #[allow(clippy::unused_async)]
-/// Store-URL scheme prefix for the sqlite adapter.
-pub const SQLITE_URL_SCHEME: &str = "sqlite://";
-
-/// Store-URL scheme prefixes the postgres adapter accepts.
-pub const POSTGRES_URL_SCHEMES: [&str; 2] = ["postgres://", "postgresql://"];
-
-/// True when `url` selects the postgres adapter — the ONE scheme sniff
-/// shared by `open_store`, the daemon `--store-url` dispatch, and
-/// `schema-init` (#1558 batch 5; previously four copies of the
-/// two-prefix check).
-#[must_use]
-pub fn is_postgres_url(url: &str) -> bool {
-    POSTGRES_URL_SCHEMES.iter().any(|s| url.starts_with(s))
-}
+// #1558 batch 5 collapsed four copies of the two-prefix scheme check into one
+// SSOT here; #2444 MOVED that SSOT into `crate::daemon_runtime` (an ungated
+// module) because `backup` / `restore` must fail closed on a postgres store in
+// the DEFAULT build, where this module does not compile at all. The names are
+// re-exported verbatim so `migrate::{SQLITE_URL_SCHEME, POSTGRES_URL_SCHEMES,
+// is_postgres_url}` keep resolving for every existing caller.
+pub use crate::daemon_runtime::{POSTGRES_URL_SCHEMES, SQLITE_URL_SCHEME, is_postgres_url};
 
 pub async fn open_store(url: &str) -> Result<Box<dyn MemoryStore>> {
     if let Some(path) = url.strip_prefix(SQLITE_URL_SCHEME) {
