@@ -318,6 +318,7 @@ accepted; set-below-floor → boot REFUSED):
 | `AI_MEMORY_REQUIRE_CAUSE_BINDING` | `1` |
 | `AI_MEMORY_REQUIRE_ROLE_SEPARATION` | `1` |
 | `AI_MEMORY_REQUIRE_IDENTITY_LINEAGE` | `1` |
+| `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY` | `1` (outbound federation TLS must verify the PEER SERVER cert; `--insecure-skip-server-verify` is refused — #2448) |
 | `AI_MEMORY_DB_SYNCHRONOUS` | `FULL` (power-loss durability, above) |
 
 In addition, `asi-hard` forces the config-backed governance knob

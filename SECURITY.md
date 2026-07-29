@@ -42,6 +42,12 @@ v0.8.0 flips several defaults to fail-closed/secure postures. Operators upgradin
 | **#1796** HTTP Human-arm approval gate | self-approval + unregistered approver now **unconditionally** blocked on the HTTP surface | register a distinct approver; never self-approve Human-gated actions |
 | **#1718** Federated action-state transitions require an inner per-transition signature | `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG=1` (fail-closed) | set `=0` for heterogeneous-rollout windows |
 
+## v1.0.0 secure-default changes (BREAKING) — operator action may be required
+
+| Change | New default | Migration |
+|--------|-------------|-----------|
+| **#2448** `ai-memory sync-daemon --insecure-skip-server-verify` is REFUSED | `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY=1` (fail-closed) | pass `--ca-cert <peer-ca.pem>` for a self-signed / private-CA peer, or set `AI_MEMORY_FED_PEER_FINGERPRINTS` to pin the peer server cert by SHA-256 (strongest). Only for a rollout window: `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY=0` — settable BEFORE the upgrade, and REFUSED under `AI_MEMORY_SECURITY_PROFILE=asi-hard`. The #1794 row above named this flag as an opt-out; it is no longer sufficient on its own. |
+
 **Known posture notes (by design — not vulnerabilities):**
 - **Store-path agent attestation is REQUIRED by default on the HTTP direct-write surface** (`AI_MEMORY_REQUIRE_AGENT_ATTESTATION` unset → an unsigned HTTP `POST /api/v1/memories` (+`/bulk`) is **rejected**, `403 ATTESTATION_FAILED`, rather than landing `attest_level="claimed"`). The MCP `memory_store` and CLI `store` operator-as-actor surfaces stay **permissive** by default (surface-scoped by #1985, correcting the v0.9.0 require-everywhere default that was unsatisfiable on MCP hosts — #1981); `=1` forces strict everywhere, `=0` permissive everywhere. See the table above (#1751/#1985). `metadata.agent_id` is a *claimed* identity even under attestation — do not use it for authorization decisions without checking `attest_level`.
 - **At-rest content encryption (#228)** is wired on both backends but **off by default** (verbatim plaintext); enable with `AI_MEMORY_ENCRYPT_AT_REST=1` (or `[storage] encrypt_at_rest = true`). It is an application-layer ChaCha20-Poly1305 / X25519 / HKDF per-memory content envelope, independent of the SQLCipher build — so it works on plain SQLite *and* Postgres (the two are orthogonal and compose). Fail-closed on write when enabled without an `agent_id` to key to, and on read when the keying material is missing.

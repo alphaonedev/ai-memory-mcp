@@ -301,8 +301,16 @@ ai-memory sync-daemon \
 `--trust-source`, `--dry-run`. `sync-daemon` flags: `--peers`
 (comma-list), `--interval` (seconds, default `2`), `--batch-size`
 (default `500`), `--api-key` (X-API-Key presented to peers), plus the
-mTLS options `--client-cert` / `--client-key`.
-`--insecure-skip-server-verify` is documented as DANGEROUS.
+mTLS options `--client-cert` / `--client-key`, and `--ca-cert <pem>` to
+trust a private CA / self-signed peer.
+
+Peer server certificates are **CA-validated by default** (#1794); set
+`AI_MEMORY_FED_PEER_FINGERPRINTS` to pin them by SHA-256 instead
+(strongest, #1678). `--insecure-skip-server-verify` disables verification
+entirely and is **refused by default** since #2448 — it additionally
+requires `--client-cert`, `--client-key`, and an explicit
+`AI_MEMORY_FED_REQUIRE_SERVER_VERIFY=0`, and is pinned shut under
+`AI_MEMORY_SECURITY_PROFILE=asi-hard`.
 
 ## Mining & archives
 

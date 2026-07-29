@@ -65,8 +65,17 @@ async fn mtls_config_pinning_fixture_cert() -> axum_server::tls_rustls::RustlsCo
     .expect("mTLS server config from committed fixtures")
 }
 
-/// Client config presenting the allowlisted fixture cert — the same
-/// production builder the sync-daemon uses for outbound mTLS.
+/// Client config presenting the allowlisted fixture cert.
+///
+/// #2448 — this used to call `tls::build_rustls_client_config`, the
+/// production-dead public builder that installed `DangerousAnyServerVerifier`
+/// by default; that builder is gone. The construction below is semantically
+/// identical for THIS test's purpose (same fixture cert + key as the client
+/// identity, same accept-any SERVER verifier, since the fixture server is
+/// self-signed) and mirrors the sibling `unknown_client_config` /
+/// `certless_client_config` builders. Only the construction changed — every
+/// assertion in this file is untouched, so the mTLS client-cert-pinning
+/// contract this file exists to pin is exercised exactly as before.
 async fn allowlisted_client_config() -> rustls::ClientConfig {
     // Same explicit provider pin as the sibling builders below: under
     // feature graphs where BOTH `ring` and `aws-lc-rs` are present
@@ -74,8 +83,18 @@ async fn allowlisted_client_config() -> rustls::ClientConfig {
     // cannot auto-select a process-level CryptoProvider and panics.
     // Idempotent — `AlreadyInstalled` is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    tls::build_rustls_client_config(&fixture("valid_cert.pem"), &fixture("valid_key_pkcs8.pem"))
+    let cert_pem = tokio::fs::read(fixture("valid_cert.pem"))
         .await
+        .expect("read fixture client cert");
+    let key_pem = tokio::fs::read(fixture("valid_key_pkcs8.pem"))
+        .await
+        .expect("read fixture client key");
+    let certs = tls::rustls_pki_pem_iter_certs(&cert_pem).expect("parse fixture client cert");
+    let key = tls::rustls_pki_pem_parse_private_key(&key_pem).expect("parse fixture client key");
+    rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(tls::DangerousAnyServerVerifier))
+        .with_client_auth_cert(certs, key)
         .expect("client config with allowlisted fixture cert")
 }
 

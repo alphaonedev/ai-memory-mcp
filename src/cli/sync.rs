@@ -429,6 +429,50 @@ pub async fn run_daemon(
         .try_init();
 
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let client = build_sync_client(&args).await?;
+
+    tracing::info!(
+        "sync-daemon: local_agent_id={local_agent_id} peers={peers:?} interval={interval}s",
+        peers = args.peers
+    );
+
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_for_signal = shutdown.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        shutdown_for_signal.notify_one();
+    });
+
+    crate::daemon_runtime::run_sync_daemon_with_shutdown_using_client(
+        client,
+        db_path.to_path_buf(),
+        local_agent_id,
+        args.peers,
+        args.api_key,
+        interval,
+        batch_size,
+        shutdown,
+    )
+    .await
+}
+
+/// #2448 — the sync-daemon's outbound TLS client, extracted from
+/// [`run_daemon`] so the TLS posture is constructible (and therefore
+/// assertable end-to-end against a real handshake) without entering the
+/// daemon's infinite sync loop.
+///
+/// Applies, in order: the pre-existing mTLS gate on
+/// `--insecure-skip-server-verify`, then [`tls::select_sync_tls_mode`]
+/// (pinning > accept-any > CA-validate), whose accept-any arm is itself
+/// fail-closed behind [`tls::server_verify_required`].
+///
+/// # Errors
+/// - `--insecure-skip-server-verify` without both `--client-cert` and
+///   `--client-key`.
+/// - `--insecure-skip-server-verify` while server verification is required
+///   (#2448 — the default).
+/// - Unreadable / unparseable pin file, `--ca-cert`, or client cert/key PEM.
+pub async fn build_sync_client(args: &SyncDaemonArgs) -> Result<reqwest::Client> {
     if args.insecure_skip_server_verify && (args.client_cert.is_none() || args.client_key.is_none())
     {
         anyhow::bail!(
@@ -444,9 +488,19 @@ pub async fn run_daemon(
     // optional --ca-cert for self-signed peers), NOT the prior accept-any
     // `DangerousAnyServerVerifier`. Precedence: pinning > insecure-opt-out >
     // CA-validate (see `tls::select_sync_tls_mode`).
+    //
+    // #2448 (3x3 adversarial vote) — the insecure-opt-out arm is now itself
+    // fail-closed: `select_sync_tls_mode` REFUSES it unless the operator also
+    // sets AI_MEMORY_FED_REQUIRE_SERVER_VERIFY to a falsy token. Federation
+    // ships PLAINTEXT content, so an unauthenticated peer server must never be
+    // one flag away.
     let pins = tls::peer_fingerprint_map_from_env()?;
     let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
-    builder = match tls::select_sync_tls_mode(args.insecure_skip_server_verify, pins.is_some()) {
+    builder = match tls::select_sync_tls_mode(
+        args.insecure_skip_server_verify,
+        pins.is_some(),
+        tls::server_verify_required(),
+    )? {
         tls::SyncTlsMode::Pinning => {
             // #1678/#1794 — per-host server-cert pinning, fail-closed for
             // unpinned hosts, carrying the optional mTLS client identity.
@@ -502,31 +556,7 @@ pub async fn run_daemon(
             b
         }
     };
-    let client = builder.build()?;
-
-    tracing::info!(
-        "sync-daemon: local_agent_id={local_agent_id} peers={peers:?} interval={interval}s",
-        peers = args.peers
-    );
-
-    let shutdown = Arc::new(tokio::sync::Notify::new());
-    let shutdown_for_signal = shutdown.clone();
-    tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        shutdown_for_signal.notify_one();
-    });
-
-    crate::daemon_runtime::run_sync_daemon_with_shutdown_using_client(
-        client,
-        db_path.to_path_buf(),
-        local_agent_id,
-        args.peers,
-        args.api_key,
-        interval,
-        batch_size,
-        shutdown,
-    )
-    .await
+    Ok(builder.build()?)
 }
 
 #[cfg(test)]

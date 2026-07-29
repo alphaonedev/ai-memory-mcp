@@ -342,6 +342,15 @@ mod tests {
     // A. happy path — full id
     #[test]
     fn happy_path_deletes_full_id() {
+        // #2448 CI-flake fix: this test resolves its delete caller from the
+        // AMBIENT `AI_MEMORY_AGENT_ID`, so it MUST take the same lock the
+        // env-MUTATING tests in this module take (`cross_owner_delete_refused_1786`
+        // sets it to `ai:bob`/`ai:alice`). The lock previously guarded only the
+        // writers from each other, leaving every reader free to observe a
+        // half-applied `ai:bob` and fail with "caller does not own this memory"
+        // — which is exactly how `double_delete_errors_second_time` went red on
+        // the Windows leg. Readers must hold it too.
+        let _envg = crate::identity::agent_id_env_test_lock();
         let conn = fresh_conn();
         let mem = make_mem("doomed", "test");
         let id = db::insert(&conn, &mem).expect("insert");
@@ -356,6 +365,7 @@ mod tests {
     // A. happy path — prefix resolution (no exact-id match, prefix matches)
     #[test]
     fn happy_path_prefix_resolution() {
+        let _envg = crate::identity::agent_id_env_test_lock();
         let conn = fresh_conn();
         let mut mem = make_mem("prefixed", "test");
         mem.id = "abcdef01-aaaa-bbbb-cccc-ddddeeeeffff".to_string();
@@ -371,6 +381,7 @@ mod tests {
     // The Some-branch needs a VectorIndex; we exercise it minimally below.
     #[test]
     fn happy_path_with_vector_index_removes_entry() {
+        let _envg = crate::identity::agent_id_env_test_lock();
         use crate::hnsw::VectorIndex;
         let conn = fresh_conn();
         let mem = make_mem("vec-target", "test");
@@ -426,6 +437,7 @@ mod tests {
     // E. idempotency: deleting twice errors the second time
     #[test]
     fn double_delete_errors_second_time() {
+        let _envg = crate::identity::agent_id_env_test_lock();
         let conn = fresh_conn();
         let mem = make_mem("twice", "test");
         let id = db::insert(&conn, &mem).expect("insert");
@@ -442,6 +454,7 @@ mod tests {
     // the audit/emit codepath ran inline.
     #[test]
     fn happy_path_drives_audit_emit_call_path() {
+        let _envg = crate::identity::agent_id_env_test_lock();
         let conn = fresh_conn();
         let mem = make_mem("audit", "test");
         let id = db::insert(&conn, &mem).expect("insert");

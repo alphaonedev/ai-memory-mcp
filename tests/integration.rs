@@ -8672,6 +8672,18 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
             // asserts — client-cert allowlisting.)
             "--insecure-skip-server-verify",
         ])
+        // #2448 — the flag alone no longer suffices: accept-any server certs
+        // now ALSO require this explicit falsy env token, so a single CLI flag
+        // can never disable peer server-cert verification. This test is
+        // deliberately one of the four-condition callers (flag + client-cert +
+        // client-key + this), which makes it a live end-to-end exercise of the
+        // documented escape hatch against a real handshake. The refusal that
+        // fires WITHOUT it is pinned by
+        // tests/fed_require_server_verify_2448.rs.
+        .env(
+            ai_memory::tls::FED_REQUIRE_SERVER_VERIFY_ENV,
+            ai_memory::tls::FED_REQUIRE_SERVER_VERIFY_OFF,
+        )
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
