@@ -30,12 +30,17 @@
 //!    soft-wrap copy-paste artefacts surface a clear "unexpected character"
 //!    error rather than a misleading length error further down.
 //!
-//! 3. **Layer 2 (client side)** — `build_rustls_client_config` builds a
-//!    `rustls::ClientConfig` with client-cert auth and a "dangerously-accept-
-//!    any-server-cert" verifier. Used by the sync-daemon to present its
-//!    client cert on every outbound request while connecting to peers with
-//!    self-signed server certs. Peer authenticity is established on the
-//!    other direction (they verify us via `--mtls-allowlist`).
+//! 3. **Layer 2b (client side)** — outbound peer SERVER-cert verification.
+//!    [`select_sync_tls_mode`] is the single decision point: server-cert
+//!    PINNING (`AI_MEMORY_FED_PEER_FINGERPRINTS`, fail-closed for unpinned
+//!    hosts) wins; otherwise the secure default is normal CA validation
+//!    (`SyncTlsMode::CaValidated`, #1794). The accept-ANY disposition is
+//!    reachable ONLY when the operator BOTH passes
+//!    `--insecure-skip-server-verify` (itself gated on an mTLS client cert)
+//!    AND explicitly sets `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY` to a falsy
+//!    token (#2448) — otherwise the mode selector REFUSES, so federation
+//!    never pushes plaintext memory content to an unauthenticated server by
+//!    default or by a single flag.
 //!
 //! Every public symbol below is move-extracted byte-for-byte from `main.rs`
 //! at the W3 commit, with `pub` added for cross-module visibility. Behaviour
@@ -61,6 +66,54 @@ pub const FED_PEER_FINGERPRINTS_ENV: &str = "AI_MEMORY_FED_PEER_FINGERPRINTS";
 /// a const so the no-hardcoded-literal gate sees one named site, not the
 /// same string scattered across the parser's bail arms.
 const PEER_FP_LABEL: &str = "peer fingerprint file";
+
+/// **[#2448, v1.0.0]** Env var gating the outbound federation accept-ANY
+/// server-cert disposition. Defaults **ON** (fail-closed): with it enabled,
+/// [`select_sync_tls_mode`] REFUSES to resolve
+/// [`SyncTlsMode::AcceptAny`], so `--insecure-skip-server-verify` no longer
+/// suffices on its own to disable peer server-cert verification.
+///
+/// Federation replicates PLAINTEXT memory content and is NOT end-to-end
+/// encrypted (`src/encryption/mod.rs`, #1968), so an unauthenticated server
+/// on that wire is a direct content-disclosure surface for a DNS/BGP-position
+/// adversary. The compensating control the accept-any posture historically
+/// leaned on — the peer fingerprint-pinning OUR client cert via
+/// `--mtls-allowlist` — protects the PEER from an impostor client; it does
+/// not protect US from an impostor SERVER, and that is the direction that
+/// governs content confidentiality.
+///
+/// Setting an explicit falsy token (`0`/`false`/`no`/`off`) is the
+/// staged-rollout escape hatch (the `AI_MEMORY_FED_REQUIRE_WRITE_SIG` #94 /
+/// `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` #125 shape). It is strictly
+/// ADDITIVE to the pre-existing requirements, never a cheaper path: accept-any
+/// still ALSO requires `--insecure-skip-server-verify` plus BOTH
+/// `--client-cert` and `--client-key`. Under the `asi-hard` posture the knob
+/// is PINNED to `1` by `security_profile::KNOBS`, so the escape hatch itself
+/// is no-disable there (a falsy override refuses boot).
+pub const FED_REQUIRE_SERVER_VERIFY_ENV: &str = "AI_MEMORY_FED_REQUIRE_SERVER_VERIFY";
+
+/// The canonical falsy token for [`FED_REQUIRE_SERVER_VERIFY_ENV`] — the
+/// staged-rollout escape hatch value. Named so the one place an in-tree caller
+/// legitimately disables server-cert verification (the mTLS-allowlist
+/// integration test, whose subject IS client-cert pinning) reads as a
+/// deliberate opt-out rather than a bare `"0"`, and so a future grep for the
+/// escape hatch finds every site.
+pub const FED_REQUIRE_SERVER_VERIFY_OFF: &str = "0";
+
+/// Whether outbound peer server-cert verification is REQUIRED (#2448).
+///
+/// Uses the house default-ON federation-knob grammar: disabled only by an
+/// explicit falsy token (`0`/`false`/`no`/`off`, trimmed); every other value —
+/// including unset, the empty string, or an unknown word — keeps it enabled.
+/// Mirrors `federation::receive_auth::env_flag_default_on`, re-implemented
+/// here because that module is `--features sal`-gated while `tls` is in the
+/// default build.
+#[must_use]
+pub fn server_verify_required() -> bool {
+    std::env::var(FED_REQUIRE_SERVER_VERIFY_ENV)
+        .ok()
+        .is_none_or(|v| !matches!(v.trim(), "0" | "false" | "no" | "off"))
+}
 
 /// v0.7.0 H3 — pin the rustls protocol-version floor to TLS 1.2 with TLS 1.3
 /// preferred. Listed in descending preference order; rustls negotiates the
@@ -966,96 +1019,24 @@ fn allowlist_contains_ct(allowlist: &HashSet<[u8; 32]>, fp: &[u8; 32]) -> bool {
     bool::from(found)
 }
 
-/// Build a rustls `ClientConfig` with client-cert auth and a
-/// "dangerously-accept-any-server-cert" verifier. Used by the
-/// sync-daemon to present its client cert on every outbound request
-/// while connecting to peers with self-signed server certs. Peer
-/// authenticity is established on the other direction (they verify
-/// us via `--mtls-allowlist`).
-pub async fn build_rustls_client_config(
-    cert_path: &Path,
-    key_path: &Path,
-) -> Result<rustls::ClientConfig> {
-    warn_if_key_perms_loose(key_path);
-    let cert_pem = tokio::fs::read(cert_path)
-        .await
-        .with_context(|| format!("failed to read client cert from {}", cert_path.display()))?;
-    let key_pem = tokio::fs::read(key_path)
-        .await
-        .with_context(|| format!("failed to read client key from {}", key_path.display()))?;
-
-    let certs = rustls_pki_pem_iter_certs(&cert_pem)?;
-    let key = rustls_pki_pem_parse_private_key(&key_pem)?;
-
-    // #1678 — Layer-2b server-cert pinning. When the operator sets
-    // `AI_MEMORY_FED_PEER_FINGERPRINTS`, pin peer SERVER certs by SNI host
-    // (mixed-mode: an unpinned host keeps the prior accept-any disposition
-    // on THIS CLI sync path, so pinning only strengthens pinned hosts and
-    // never downgrades). With pinning OFF the verifier + WARN below are
-    // byte-identical to the pre-#1678 path.
-    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
-        match peer_fingerprint_map_from_env()? {
-            Some(pins) => {
-                tracing::info!(
-                    target: "federation::tls",
-                    pinned_hosts = pins.len(),
-                    "federation client TLS: server-cert PINNING active (#1678); \
-                     unpinned hosts keep accept-any on the sync CLI path"
-                );
-                Arc::new(FingerprintPinServerVerifier::new(
-                    pins,
-                    UnpinnedHostPolicy::AcceptAny,
-                ))
-            }
-            None => {
-                // SAFETY: we accept any server cert because the server
-                // authenticates US via our client cert fingerprint (Layer 2's
-                // trust anchor), not via server-cert validation.
-                //
-                // v0.7.0 S6-LOW1 de-silencing: emit a once-per-process
-                // operator-visible warn so the disabled server-cert verification
-                // posture is observable in the daemon log rather than buried in
-                // the source. The compensating control (peer client-cert
-                // fingerprint pinning via `--mtls-allowlist`) is documented on
-                // `DangerousAnyServerVerifier`; the stronger control is now
-                // `AI_MEMORY_FED_PEER_FINGERPRINTS` (#1678).
-                static WARN_ONCE: std::sync::Once = std::sync::Once::new();
-                WARN_ONCE.call_once(|| {
-                    tracing::warn!(
-                        target: "federation::tls",
-                        "federation client TLS accepts ANY server certificate (server-cert \
-                         verification is OFF); peer authenticity relies entirely on the peer \
-                         fingerprint-pinning our client cert via --mtls-allowlist. Set \
-                         AI_MEMORY_FED_PEER_FINGERPRINTS to pin peer server certs (#1678), or \
-                         front the federation port with a server-cert-pinning reverse proxy on \
-                         hostile networks. See docs/runbook/federation-tls.md (#224)."
-                    );
-                });
-                Arc::new(DangerousAnyServerVerifier)
-            }
-        };
-    let config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_client_auth_cert(certs, key)
-        .context("failed to build rustls ClientConfig with client cert")?;
-    Ok(config)
-}
-
 /// #1794 (5-agent vote 4d3ea1c5) — the outbound TLS verification mode the CLI
 /// `ai-memory sync` path selects for a peer connection. Precedence mirrors the
 /// production quorum client (`federation/peer.rs`): server-cert PINNING
 /// (`AI_MEMORY_FED_PEER_FINGERPRINTS`) wins; then the explicit
 /// `--insecure-skip-server-verify` accept-any opt-out; otherwise the secure
 /// default — normal CA validation (reqwest's bundled webpki roots, plus any
-/// `--ca-cert` the operator adds for a self-signed peer).
+/// `--ca-cert` the operator adds for a self-signed peer). **[#2448]** the
+/// accept-any arm additionally requires an explicit falsy
+/// [`FED_REQUIRE_SERVER_VERIFY_ENV`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncTlsMode {
     /// `AI_MEMORY_FED_PEER_FINGERPRINTS` set → per-host server-cert pinning,
     /// fail-closed for unpinned hosts.
     Pinning,
-    /// `--insecure-skip-server-verify` → accept ANY server cert (the explicit,
-    /// loud opt-out; gated on an mTLS client cert as the compensating control).
+    /// Accept ANY server cert. Reachable only when the operator supplies ALL
+    /// of: `--insecure-skip-server-verify`, BOTH `--client-cert` and
+    /// `--client-key` (the pre-existing mTLS gate), AND an explicit falsy
+    /// [`FED_REQUIRE_SERVER_VERIFY_ENV`] (#2448). Four conditions, not one.
     AcceptAny,
     /// Secure default → CA-validate the peer server cert (bundled webpki roots
     /// + optional `--ca-cert`).
@@ -1067,62 +1048,83 @@ pub enum SyncTlsMode {
 /// change the mode (still `CaValidated`); it only adds an extra trusted root.
 /// Pure + total so the decision is unit-testable independently of the opaque
 /// rustls/reqwest config it drives.
-#[must_use]
+///
+/// **[#2448]** `server_verify_required` (from [`server_verify_required`], i.e.
+/// [`FED_REQUIRE_SERVER_VERIFY_ENV`], default **ON**) is the fail-closed gate
+/// on the accept-ANY arm. The refusal lives HERE rather than at the call site
+/// so it is structural: no present or future caller can resolve
+/// [`SyncTlsMode::AcceptAny`] without explicitly threading a `false` through,
+/// and federation therefore cannot push plaintext memory content to an
+/// unauthenticated server on a single flag. Pinning still wins outright — a
+/// pinned host is verified by fingerprint, so `--insecure-skip-server-verify`
+/// alongside an active pin map is a no-op, not a refusal.
+///
+/// # Errors
+/// Returns an error when `insecure_skip_server_verify` is set, pinning is
+/// inactive, and server verification is required — naming the two SECURE
+/// remedies first (`--ca-cert`, `AI_MEMORY_FED_PEER_FINGERPRINTS`) and the
+/// staged-rollout escape hatch last.
 pub fn select_sync_tls_mode(
     insecure_skip_server_verify: bool,
     pinning_active: bool,
-) -> SyncTlsMode {
+    server_verify_required: bool,
+) -> Result<SyncTlsMode> {
     if pinning_active {
-        SyncTlsMode::Pinning
-    } else if insecure_skip_server_verify {
-        SyncTlsMode::AcceptAny
-    } else {
-        SyncTlsMode::CaValidated
+        return Ok(SyncTlsMode::Pinning);
     }
+    if insecure_skip_server_verify {
+        if server_verify_required {
+            anyhow::bail!(
+                "--insecure-skip-server-verify is refused: it disables peer SERVER-certificate \
+                 verification while federation replicates PLAINTEXT memory content, so a \
+                 DNS/BGP-position adversary can read everything this node pushes. Pinning our \
+                 client cert on the peer side does NOT protect this direction. Fix it with \
+                 `--ca-cert <peer-ca.pem>` for a self-signed / private-CA peer, or set \
+                 {FED_PEER_FINGERPRINTS_ENV} to pin the peer's server cert by SHA-256 \
+                 (strongest). Only if you must keep the insecure posture for a staged-rollout \
+                 window, set {FED_REQUIRE_SERVER_VERIFY_ENV}=0 (refused under the asi-hard \
+                 security posture). (#2448)"
+            );
+        }
+        return Ok(SyncTlsMode::AcceptAny);
+    }
+    Ok(SyncTlsMode::CaValidated)
 }
 
-/// `ServerCertVerifier` that accepts any peer certificate. Safe ONLY when
-/// paired with a strong reverse authentication channel — in our case the
-/// peer's `--mtls-allowlist` fingerprint-pins our client cert.
+/// `ServerCertVerifier` that accepts ANY peer certificate — it performs no
+/// server-identity check whatsoever.
 ///
-/// # v0.7.0 S6-LOW1 — threat model and compensating control
+/// # Threat model (#224 → #1678 → #1794 → #2448)
 ///
-/// This verifier is intentionally permissive on the SERVER cert and is
-/// the documented compensating-with-mTLS control for issue #224. The
-/// security argument has three legs that must all hold for the
-/// resulting channel to remain trustworthy:
+/// The historical compensating argument was that the PEER fingerprint-pins
+/// OUR client cert via `--mtls-allowlist`, so a spoofed server that lacks our
+/// client key is filtered at the peer's `ClientCertVerifier`. **That argument
+/// is directionally incomplete and no longer load-bearing** (#2448): it
+/// protects the PEER from an impostor CLIENT; it does not protect US from an
+/// impostor SERVER. Since federation replicates PLAINTEXT memory content
+/// (NOT end-to-end encrypted — `src/encryption/mod.rs`, #1968), an adversary
+/// in DNS or BGP position who presents any certificate would complete the
+/// handshake and receive everything this node pushes. Confidentiality, not
+/// integrity, is what breaks: inbound content is separately authenticated by
+/// `AI_MEMORY_FED_REQUIRE_SIG` (#29) / `_WRITE_SIG` (#94) / nonce (#30) /
+/// peer enrollment (#43).
 ///
-/// 1. **Client cert is the actual authn primitive.** The peer
-///    fingerprint-pins our client cert via `--mtls-allowlist`. A
-///    misbehaving server cannot complete the TLS handshake unless our
-///    client cert's SHA-256 is on its allowlist; an attacker who has
-///    spoofed DNS but lacks our client key is filtered at the peer's
-///    `ClientCertVerifier`.
-/// 2. **Sync traffic is single-purpose.** The federation channel only
-///    carries `/api/v1/sync/push` + `/api/v1/sync/since` payloads. The
-///    receiver still validates every memory through
-///    `validate::validate_memory`, signs/verifies every link through
-///    the H3 verify path, and gates every write through the per-agent
-///    quota (S6-M2). A man-in-the-middle would gain nothing by
-///    impersonating a server we'd already authenticate ourselves to.
-/// 3. **Pinning server certs is a v0.8.0 refinement.** Layer-2b
-///    server-cert pinning lands when the `--peer-fingerprint` flag is
-///    added (tracked in #224 follow-up). At that point this verifier
-///    is replaced with a fingerprint allowlist-checking variant. Until
-///    then, operators are explicitly informed via the operator runbook
-///    (`docs/runbook/federation-tls.md`) that:
-///       - both peers MUST set `--mtls-allowlist` to fingerprint-pin
-///         each other's CLIENT cert,
-///       - server-cert presentation is not currently authenticated
-///         beyond TLS handshake completion,
-///       - any deployment that exposes the federation port to a
-///         hostile network MUST front the daemon with a reverse proxy
-///         that performs server-side cert pinning.
+/// # Current status — production-unreachable by default
 ///
-/// **Do not use this verifier outside the federation sync-daemon
-/// path.** The MCP / CLI / HTTP-app paths use the default rustls
-/// verifier with platform roots. Removing the `Dangerous` prefix from
-/// the type name would obscure the trade-off and is rejected.
+/// - Outbound peer server-cert PINNING (`AI_MEMORY_FED_PEER_FINGERPRINTS`,
+///   #1678) shipped at v0.8.0 and is the strongest control.
+/// - The CLI sync path CA-validates by default (#1794).
+/// - #2448 removed the last production constructor that installed this
+///   verifier by default, and gated the remaining accept-any disposition
+///   behind [`FED_REQUIRE_SERVER_VERIFY_ENV`] (default ON ⇒ refused).
+///
+/// In-tree, this type now survives for TEST harnesses that must speak to a
+/// self-signed fixture server (`tests/mtls_nodelay_acceptor.rs`). **Do not
+/// wire it into any production path**; the MCP / CLI / HTTP-app clients use
+/// the default rustls verifier with platform roots. Removing the `Dangerous`
+/// prefix from the type name would obscure the trade-off and is rejected.
+/// Operator guidance lives in `docs/federation.md` §"Outbound peer
+/// server-cert pinning".
 #[derive(Debug)]
 pub struct DangerousAnyServerVerifier;
 
@@ -1823,13 +1825,72 @@ mod tests {
 
     #[test]
     fn select_sync_tls_mode_precedence_1794() {
-        // Pinning wins over the insecure opt-out.
-        assert_eq!(select_sync_tls_mode(true, true), SyncTlsMode::Pinning);
-        assert_eq!(select_sync_tls_mode(false, true), SyncTlsMode::Pinning);
-        // Explicit insecure opt-out when pinning is off.
-        assert_eq!(select_sync_tls_mode(true, false), SyncTlsMode::AcceptAny);
+        // Pinning wins over the insecure opt-out — a pinned host is verified
+        // by fingerprint, so #2448's require-flag never refuses it.
+        assert_eq!(
+            select_sync_tls_mode(true, true, true).unwrap(),
+            SyncTlsMode::Pinning
+        );
+        assert_eq!(
+            select_sync_tls_mode(false, true, true).unwrap(),
+            SyncTlsMode::Pinning
+        );
+        // Explicit insecure opt-out when pinning is off — only reachable once
+        // the operator ALSO clears the #2448 require-flag.
+        assert_eq!(
+            select_sync_tls_mode(true, false, false).unwrap(),
+            SyncTlsMode::AcceptAny
+        );
         // Secure default — CA validation.
-        assert_eq!(select_sync_tls_mode(false, false), SyncTlsMode::CaValidated);
+        assert_eq!(
+            select_sync_tls_mode(false, false, true).unwrap(),
+            SyncTlsMode::CaValidated
+        );
+        assert_eq!(
+            select_sync_tls_mode(false, false, false).unwrap(),
+            SyncTlsMode::CaValidated
+        );
+    }
+
+    /// #2448 — the accept-ANY arm is fail-closed at the mode selector, so no
+    /// caller can resolve it while server verification is required. The
+    /// refusal must name the SECURE remedies before the escape hatch.
+    #[test]
+    fn select_sync_tls_mode_refuses_accept_any_when_verify_required_2448() {
+        let err = select_sync_tls_mode(true, false, true)
+            .expect_err("insecure opt-out must be refused while verification is required");
+        let msg = err.to_string();
+        assert!(msg.contains("--insecure-skip-server-verify"), "{msg}");
+        // Secure remedies first…
+        assert!(msg.contains("--ca-cert"), "{msg}");
+        assert!(msg.contains(FED_PEER_FINGERPRINTS_ENV), "{msg}");
+        // …escape hatch named last, so an operator reading the refusal is
+        // steered to fix the posture rather than to disable the control.
+        assert!(msg.contains(FED_REQUIRE_SERVER_VERIFY_ENV), "{msg}");
+        assert!(
+            msg.find("--ca-cert").unwrap() < msg.find(FED_REQUIRE_SERVER_VERIFY_ENV).unwrap(),
+            "the secure remedy must precede the escape hatch: {msg}"
+        );
+    }
+
+    /// #2448 — the require-flag follows the house default-ON federation-knob
+    /// grammar: only an explicit falsy token disables it.
+    #[test]
+    fn server_verify_required_default_on_grammar_2448() {
+        let _guard = fed_pin_env_lock();
+        // SAFETY: the process-wide env mutation is serialized by the shared
+        // federation-TLS test lock taken above.
+        unsafe { std::env::remove_var(FED_REQUIRE_SERVER_VERIFY_ENV) };
+        assert!(server_verify_required(), "unset ⇒ required (fail-closed)");
+        for falsy in ["0", "false", "no", "off", " off "] {
+            unsafe { std::env::set_var(FED_REQUIRE_SERVER_VERIFY_ENV, falsy) };
+            assert!(!server_verify_required(), "{falsy:?} ⇒ permissive");
+        }
+        for truthy in ["1", "true", "yes", "on", "", "banana"] {
+            unsafe { std::env::set_var(FED_REQUIRE_SERVER_VERIFY_ENV, truthy) };
+            assert!(server_verify_required(), "{truthy:?} ⇒ required");
+        }
+        unsafe { std::env::remove_var(FED_REQUIRE_SERVER_VERIFY_ENV) };
     }
 
     #[test]
@@ -1854,27 +1915,6 @@ mod tests {
         let cfg = build_rustls_pinning_client_config(pin_map("peer.example", b"x"), None, None)
             .expect("pinning client config with no client auth must build");
         drop(cfg);
-    }
-
-    // -----------------------------------------------------------------------
-    // build_rustls_client_config — exercises the sync-daemon's outbound
-    // TLS config path. Covers both the happy and the missing-cert error
-    // paths so the entire function body is reached by unit tests.
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_build_rustls_client_config_happy_path() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let cert = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/tls/valid_cert.pem");
-        let key = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/tls/valid_key_pkcs8.pem");
-        let config = build_rustls_client_config(&cert, &key)
-            .await
-            .expect("client config build with valid cert+key");
-        // The returned ClientConfig is opaque; if the ?-cascade above
-        // returned Ok, every parser branch and the builder ran.
-        drop(config);
     }
 
     // -----------------------------------------------------------------------
@@ -2064,20 +2104,6 @@ mod tests {
     fn test_allowlist_contains_ct_empty_allowlist_rejects() {
         let allowlist = HashSet::new();
         assert!(!allowlist_contains_ct(&allowlist, &[0u8; 32]));
-    }
-
-    #[tokio::test]
-    async fn test_build_rustls_client_config_missing_cert_errors() {
-        let cert = std::path::PathBuf::from("/does/not/exist/cert.pem");
-        let key = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/tls/valid_key_pkcs8.pem");
-        let err = build_rustls_client_config(&cert, &key)
-            .await
-            .expect_err("missing client cert must error");
-        assert!(
-            err.to_string().contains("failed to read client cert"),
-            "got: {err}"
-        );
     }
 
     // -----------------------------------------------------------------------

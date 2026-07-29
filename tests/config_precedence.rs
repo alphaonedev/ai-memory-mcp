@@ -1342,6 +1342,45 @@ fn test_m2_tls_escape_hatch_envs_default_and_parse_2032() {
 }
 
 // ---------------------------------------------------------------------------
+// 10b. AI_MEMORY_FED_REQUIRE_SERVER_VERIFY — outbound federation server-cert
+//      verification (#2448). Pure runtime env knob (no CLI flag, no
+//      config.toml binding), so the ladder collapses to `env > compiled
+//      default`. It is the INVERSE polarity of the #2032 pair above: this one
+//      defaults ON (fail-closed), the house `env_flag_default_on` grammar
+//      shared with AI_MEMORY_FED_REQUIRE_{WRITE,SIGNAL,TRANSITION,CHECKPOINT}_SIG.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_fed_require_server_verify_default_on_grammar_2448() {
+    use ai_memory::tls::{FED_REQUIRE_SERVER_VERIFY_ENV, server_verify_required};
+
+    // Table of (env-value, expected-bool). `None` = unset (default TRUE —
+    // the fail-closed direction; a typo must never silently weaken it).
+    let cases: &[(Option<&str>, bool)] = &[
+        (None, true),
+        (Some("1"), true),
+        (Some("true"), true),
+        (Some("yes"), true),
+        (Some("on"), true),
+        (Some(""), true),
+        (Some("garbage"), true),
+        (Some("0"), false),
+        (Some("false"), false),
+        (Some("no"), false),
+        (Some("off"), false),
+        (Some("  off  "), false),
+    ];
+
+    for &(val, want) in cases {
+        let _g = MultiEnvVarGuard::apply(&[(FED_REQUIRE_SERVER_VERIFY_ENV, val)]);
+        assert_eq!(
+            server_verify_required(),
+            want,
+            "AI_MEMORY_FED_REQUIRE_SERVER_VERIFY={val:?} must resolve to {want}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 11. AI_MEMORY_VECTORLITE_EXTENSION — opt-in vectorlite ANN backend selector
 //     (#2256; the #1860/#2219 knob). Pure runtime env knob (no CLI flag, no
 //     config.toml binding): the ladder collapses to `env > compiled default

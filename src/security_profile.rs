@@ -49,6 +49,7 @@
 //! | `AI_MEMORY_REQUIRE_CAUSE_BINDING` | `1` | audit rows must carry a bound cause |
 //! | `AI_MEMORY_REQUIRE_ROLE_SEPARATION` | `1` | three-key governance role separation required |
 //! | `AI_MEMORY_REQUIRE_IDENTITY_LINEAGE` | `1` | identity-lineage succession chain required |
+//! | `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY` | `1` | outbound federation TLS must verify the PEER SERVER cert — `--insecure-skip-server-verify` is refused (#2448) |
 //! | `AI_MEMORY_DB_SYNCHRONOUS` | `FULL` | power-loss durability (fsync every commit) — #1961 part C |
 //!
 //! In addition, `asi-hard` forces the config-backed governance knob
@@ -243,6 +244,11 @@ const KNOBS: &[KnobSpec] = &[
     },
     KnobSpec {
         env: "AI_MEMORY_REQUIRE_IDENTITY_LINEAGE",
+        hard_value: "1",
+        meets_floor: is_truthy,
+    },
+    KnobSpec {
+        env: crate::tls::FED_REQUIRE_SERVER_VERIFY_ENV,
         hard_value: "1",
         meets_floor: is_truthy,
     },
@@ -615,12 +621,23 @@ mod tests {
         // The pinned set must match the documented count so the module
         // docs table and the KNOBS SSOT cannot silently drift.
         let pins = pinned_knobs();
-        assert_eq!(pins.len(), 14, "documented asi-hard knob count");
+        assert_eq!(pins.len(), 15, "documented asi-hard knob count");
         // Every pin's env name is non-empty and the durability pin is FULL.
         assert!(pins.iter().all(|(e, _)| !e.is_empty()));
         assert!(
             pins.iter()
                 .any(|(e, v)| *e == crate::storage::ENV_DB_SYNCHRONOUS && *v == "FULL")
+        );
+        // #2448 — the hardened posture pins a NETWORK access-control knob:
+        // outbound federation TLS must verify the peer's SERVER cert. Before
+        // #2448 the pinned set was 100% crypto/attestation/durability, so an
+        // `asi-hard` deployment could still run `ai-memory sync-daemon
+        // --insecure-skip-server-verify` and push plaintext memory content to
+        // an unauthenticated server.
+        assert!(
+            pins.iter()
+                .any(|(e, v)| *e == crate::tls::FED_REQUIRE_SERVER_VERIFY_ENV && *v == "1"),
+            "asi-hard must pin outbound server-cert verification (#2448)"
         );
     }
 }

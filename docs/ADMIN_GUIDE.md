@@ -1276,11 +1276,21 @@ The peer-to-peer sync mesh introduces new trust assumptions. Disclosed gaps and 
 
 **Production deployments MUST set `--tls-cert + --tls-key + --mtls-allowlist`** for the peer mesh. Without all three, any network-positioned attacker can push spoofed memories or pull the entire database.
 
-#### sync-daemon does no server-cert verification without --client-cert (issue #232)
+#### sync-daemon server-cert verification (issue #232 — CLOSED by #1794 + #2448)
 
-When `sync-daemon` is invoked without `--client-cert`, the underlying reqwest client uses `danger_accept_invalid_certs(true)` — it accepts ANY server cert, no validation against system trust roots, no peer-cert pinning.
+> **This section previously stated that `sync-daemon` accepts ANY server cert when invoked without `--client-cert`. That is no longer true, and the correction is load-bearing — do not re-introduce the old claim.**
 
-**For untrusted networks, ALWAYS use mTLS in both directions.** Set `--client-cert` + `--client-key` on the daemon and `--mtls-allowlist` on the peer's `serve`.
+`sync-daemon` **CA-validates** the peer's server certificate by default (#1794): reqwest's bundled webpki roots, plus any root you add with `--ca-cert <pem>` for a self-signed / private-CA peer. Precedence is **pinning > accept-any > CA-validate**:
+
+| Posture | How to select it | Verification |
+|---|---|---|
+| **Pinning (strongest)** | `AI_MEMORY_FED_PEER_FINGERPRINTS=<pin-file>` | peer server cert pinned by SHA-256(DER) per SNI host, fail-closed for unpinned hosts (#1678) |
+| **CA-validated (default)** | nothing to set; add `--ca-cert` for a private CA | full chain + hostname validation |
+| **Accept-any (discouraged)** | requires ALL of `--insecure-skip-server-verify` + `--client-cert` + `--client-key` + `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY=0` | **none** — any certificate is accepted |
+
+Since #2448 the accept-any posture is **refused by default**: the flag alone no longer disables verification, and under `AI_MEMORY_SECURITY_PROFILE=asi-hard` the escape hatch is pinned shut (a falsy override refuses boot). Federation replicates plaintext memory content, so an unverified peer server is a direct disclosure surface.
+
+**For untrusted networks, ALWAYS use mTLS in both directions AND pin peer server certs.** Set `--client-cert` + `--client-key` on the daemon, `--mtls-allowlist` on the peer's `serve`, and `AI_MEMORY_FED_PEER_FINGERPRINTS` on both.
 
 #### Any valid mTLS peer can dump the full database (issue #239)
 
