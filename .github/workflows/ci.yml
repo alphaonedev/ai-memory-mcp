@@ -358,6 +358,25 @@ jobs:
           free -h
           echo "::endgroup::"
 
+      # #2452 — tests/conformance_readers.rs is now FAIL-CLOSED: an absent
+      # python3/node is a test FAILURE, not a silent pass. Provision both
+      # explicitly rather than relying on what each runner image happens to
+      # ship (notably, `python3` is not dependably on PATH on windows-latest
+      # — the tool-cache executable is `python.exe`). A controlled proof must
+      # not depend on an image accident: without these steps the fix would
+      # trade a silent pass for an environmental red, which is the pressure
+      # that gets a test deleted. The dedicated, self-tested proof lives in
+      # c8-precheck.yml (`Non-Rust conformance-reader proof gate (#2452)`).
+      - uses: actions/setup-python@v5
+        if: needs.classify.outputs.docs_only != 'true'
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        if: needs.classify.outputs.docs_only != 'true'
+        with:
+          node-version: '22'
+
       - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
         if: needs.classify.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@1.96.0
