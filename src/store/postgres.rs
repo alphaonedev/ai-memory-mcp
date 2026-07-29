@@ -27262,9 +27262,10 @@ mod tests {
             "embedding_dim",
             "original_tier",
             "original_expires_at",
-            // v19 — webhook event_types + index.
+            // v19 — webhook event_types column. The companion
+            // `idx_subscriptions_event_types` is LADDER-OWNED (#2424): it indexes
+            // this ALTER-added column, so it must NOT appear in the bootstrap.
             "event_types",
-            "idx_subscriptions_event_types",
             // v20 — capability-expansion audit_log.
             "CREATE TABLE IF NOT EXISTS audit_log",
             "idx_audit_log_agent_id",
@@ -27275,21 +27276,22 @@ mod tests {
             // v22 — memory_transcripts substrate.
             "CREATE TABLE IF NOT EXISTS memory_transcripts",
             "idx_memory_transcripts_namespace_created",
-            // v23 — memory_links.attest_level.
-            "idx_memory_links_attest_level",
+            // v23 — memory_links.attest_level. The index is LADDER-OWNED (#2424).
+            "attest_level",
             // v24 — memory_transcript_links join table.
             "CREATE TABLE IF NOT EXISTS memory_transcript_links",
             "idx_mtl_transcript",
             "idx_mtl_memory",
-            // v25 — transcript archive lifecycle.
-            "idx_memory_transcripts_archived_at",
+            // v25 — transcript archive lifecycle. The index is LADDER-OWNED (#2424).
+            "archived_at",
             // v26 — signed_events audit chain.
             "CREATE TABLE IF NOT EXISTS signed_events",
             "idx_signed_events_agent",
             // v27 — A2A correlation IDs + DLQ.
             "CREATE TABLE IF NOT EXISTS subscription_events",
             "CREATE TABLE IF NOT EXISTS subscription_dlq",
-            "idx_subscription_events_correlation",
+            // `idx_subscription_events_correlation` is LADDER-OWNED (#2424).
+            "correlation_id",
             "idx_subscription_dlq_correlation",
             // v28 — agent_quotas.
             "CREATE TABLE IF NOT EXISTS agent_quotas",
@@ -27299,6 +27301,58 @@ mod tests {
                 INIT_SCHEMA.contains(needle),
                 "postgres_schema.sql missing expected v17-v28 fragment: {needle}"
             );
+        }
+    }
+
+    /// #2424 — the INVERSE of the shape test above, and the half that actually
+    /// guards the GA blocker.
+    ///
+    /// `connect()` replays `INIT_SCHEMA` on EVERY open, ALWAYS before `migrate`,
+    /// so an inline `CREATE INDEX` over a column the ladder `ALTER`-adds is
+    /// absent on a LEGACY database and CRASHES the open — v67-v73 died on
+    /// `memories.cid`, v74-v83 on `memories.embedding_space`. Each index below
+    /// is therefore LADDER-OWNED: created only by the `migrate_vN` arm that adds
+    /// its column (fresh installs still get it — a fresh DB reads
+    /// `current_version = 0` and runs every arm).
+    ///
+    /// Asserting on the CREATE STATEMENT rather than the bare name is
+    /// deliberate: the schema file NAMES each of these in an explanatory
+    /// comment, so a bare-name check would pass vacuously against the comment
+    /// and silently stop guarding anything.
+    #[test]
+    fn init_schema_never_inlines_a_ladder_owned_index_2424() {
+        for index in [
+            "idx_memories_target_agent_id",
+            "idx_memories_embedding_dim",
+            "idx_memories_ns_dim",
+            "idx_memories_cid",
+            "idx_memories_embedding_space",
+            "idx_links_temporal_src",
+            "idx_links_temporal_tgt",
+            "idx_links_relation",
+            "idx_memory_links_attest_level",
+            "idx_memory_transcripts_archived_at",
+            "idx_recall_observations_agent_id",
+            "idx_recall_observations_namespace",
+            "idx_signed_events_sequence",
+            "idx_subscription_events_correlation",
+            "idx_subscriptions_event_types",
+        ] {
+            for stmt in [
+                format!("CREATE INDEX IF NOT EXISTS {index}"),
+                format!("CREATE UNIQUE INDEX IF NOT EXISTS {index}"),
+                format!("CREATE INDEX {index}"),
+                format!("CREATE UNIQUE INDEX {index}"),
+            ] {
+                assert!(
+                    !INIT_SCHEMA.contains(&stmt),
+                    "#2424: postgres_schema.sql creates `{index}` inline, but that index covers a \
+                     column the migrate ladder ALTER-adds. The bootstrap replays over LEGACY \
+                     databases BEFORE the ladder runs, so the column is absent and this DDL \
+                     CRASHES connect() — the deployment cannot start. Move it back into the \
+                     migrate_vN arm that adds the column."
+                );
+            }
         }
     }
 
