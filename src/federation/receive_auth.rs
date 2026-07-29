@@ -787,6 +787,7 @@ pub fn inbound_write_needs_existing_namespace(
 /// rather than pass `None` — `None` here means "provably no local row".
 #[must_use]
 pub fn inbound_write_namespace_authorized(
+    lane: &str,
     memory_id: &str,
     claimed_namespace: &str,
     existing_namespace: Option<&str>,
@@ -816,8 +817,8 @@ pub fn inbound_write_namespace_authorized(
                     namespace = %namespace,
                     namespace_source = source,
                     peer_id = %peer_id.unwrap_or(""),
-                    "sync_push: refusing federated memory write outside the peer's \
-                     namespace scope (#2447); skipping this memory, batch survives"
+                    "sync_push: refusing federated {lane} entry outside the peer's \
+                     namespace scope (#2447); skipping this entry, batch survives"
                 );
                 return false;
             }
@@ -834,13 +835,48 @@ pub fn inbound_write_namespace_authorized(
             peer_id = %peer_id.unwrap_or(""),
             "sync_push: peer is enrolled but declares no allowed_namespaces, so its write \
              scope is unbounded while its read + delete scope are already empty — refusing \
-             the write (#2447). Declare the peer's namespace scope in \
+             this {lane} entry (#2447). Declare the peer's namespace scope in \
              AI_MEMORY_FED_PEER_ATTESTATION (use [\"**\"] for a deliberate allow-all), or \
              set AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0 for a rollout window."
         );
         return false;
     }
     true
+}
+
+/// #2447 — the by-id sibling of [`inbound_write_namespace_authorized`], for the
+/// `/sync/push` lanes that act on an EXISTING row rather than a caller-supplied
+/// one (`archives[]`, `restores[]`): there is no claimed namespace to check,
+/// only the row's stored one.
+///
+/// Kept as a thin wrapper rather than a second policy so the two layers — and
+/// therefore the disposition of an enrolled peer that declares no scope — stay
+/// IDENTICAL across every lane. Without it, Layer 2 would deny such a peer's
+/// `memories[]` write and its `deletions[]` (which #1934 routes through the
+/// deny-on-empty `namespace_allowed`) while silently permitting the archive
+/// that removes the same row from every live read.
+///
+/// `stored_namespace` is `None` only when the caller has ALREADY established
+/// there is no such row (and has counted it as a no-op); a failed lookup must
+/// fail closed at the call site, never arrive here as `None`.
+#[must_use]
+pub fn inbound_by_id_namespace_authorized(
+    lane: &str,
+    memory_id: &str,
+    stored_namespace: &str,
+    attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
+    peer_id: Option<&str>,
+    require_push_namespace_scope: bool,
+) -> bool {
+    inbound_write_namespace_authorized(
+        lane,
+        memory_id,
+        stored_namespace,
+        None,
+        attest_cfg,
+        peer_id,
+        require_push_namespace_scope,
+    )
 }
 
 #[cfg(test)]

@@ -235,6 +235,7 @@ pub(super) async fn sync_push_via_store(
             None
         };
         if !crate::federation::receive_auth::inbound_write_namespace_authorized(
+            "memories",
             &mem.id,
             &mem.namespace,
             existing_ns.as_deref(),

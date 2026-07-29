@@ -1307,6 +1307,10 @@ pub async fn sync_push(
             peer_header_owned.as_deref(),
             &attest_cfg,
         );
+    // The by-id sibling lanes (`archives[]` / `restores[]`) probe under the
+    // whole ENROLLED posture, not just a declared scope, so Layer 2's
+    // disposition of an unscoped enrolled peer is IDENTICAL on every lane.
+    let ns_gate_enrolled = attest_cfg.has_allowlist();
     for mem in &body.memories {
         if let Err(e) = validate::RequestValidator::validate_memory(mem) {
             tracing::warn!("sync_push: skipping memory {} ({}): {e}", mem.id, mem.title);
@@ -1355,6 +1359,7 @@ pub async fn sync_push(
             None
         };
         if !crate::federation::receive_auth::inbound_write_namespace_authorized(
+            "memories",
             &mem.id,
             &mem.namespace,
             existing_ns.as_deref(),
@@ -1818,22 +1823,17 @@ pub async fn sync_push(
         // an ARCHIVED row is the input `restores[]` below resurrects. Confine
         // it to the peer's scope with the same resolve-then-refuse shape. A
         // missing row stays a no-op; an unresolvable one fails closed.
-        if ns_scope_needs_existing {
+        if ns_gate_enrolled {
             match db::namespace_by_id(&lock.0, arch_id) {
                 Ok(Some(namespace)) => {
-                    if !peer_attestation::namespace_allowed(
-                        peer_header_owned.as_deref(),
+                    if !crate::federation::receive_auth::inbound_by_id_namespace_authorized(
+                        "archives",
+                        arch_id,
                         &namespace,
                         &attest_cfg,
+                        peer_header_owned.as_deref(),
+                        require_push_ns_scope,
                     ) {
-                        tracing::warn!(
-                            target: ATTESTATION_TRACE_TARGET,
-                            memory_id = %arch_id,
-                            namespace = %namespace,
-                            peer_id = %peer_header_owned.as_deref().unwrap_or(""),
-                            "sync_push: refusing federated archive outside the peer's \
-                             namespace scope (#2447)"
-                        );
                         skipped += 1;
                         continue;
                     }
@@ -1891,22 +1891,17 @@ pub async fn sync_push(
         // would have left behind). The row lives in `archived_memories` at this
         // point, hence the archive-table twin of the namespace probe. The G30
         // tombstone gate below is orthogonal and still runs.
-        if ns_scope_needs_existing {
+        if ns_gate_enrolled {
             match db::archived_namespace_by_id(&lock.0, res_id) {
                 Ok(Some(namespace)) => {
-                    if !peer_attestation::namespace_allowed(
-                        peer_header_owned.as_deref(),
+                    if !crate::federation::receive_auth::inbound_by_id_namespace_authorized(
+                        "restores",
+                        res_id,
                         &namespace,
                         &attest_cfg,
+                        peer_header_owned.as_deref(),
+                        require_push_ns_scope,
                     ) {
-                        tracing::warn!(
-                            target: ATTESTATION_TRACE_TARGET,
-                            memory_id = %res_id,
-                            namespace = %namespace,
-                            peer_id = %peer_header_owned.as_deref().unwrap_or(""),
-                            "sync_push: refusing federated restore outside the peer's \
-                             namespace scope (#2447)"
-                        );
                         skipped += 1;
                         continue;
                     }

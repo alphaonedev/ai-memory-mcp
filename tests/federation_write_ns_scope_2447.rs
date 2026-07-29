@@ -462,6 +462,52 @@ async fn enrolled_peer_without_declared_namespaces_denied_by_default_2447() {
          be refused by default"
     );
 
+    // The SAME disposition must hold on the by-id sibling lanes, or Layer 2
+    // would deny the write while permitting the archive that removes the very
+    // same row from every live read — the inconsistency #2447 exists to end.
+    let create = json!({
+        "title": "unscoped-archive-victim",
+        "content": "secure ops row",
+        "tier": "long",
+        "namespace": VICTIM_NS,
+        "tags": [],
+        "priority": 5,
+        "source": "api",
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/memories")
+        .header("content-type", "application/json")
+        .header("x-agent-id", "ai:victim")
+        .body(Body::from(create.to_string()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let created: Value = serde_json::from_slice(&bytes).unwrap();
+    let victim_id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(count_ns(&db, VICTIM_NS).await, 1);
+
+    let arch_status = push(
+        &router,
+        &json!({
+            "sender_agent_id": PEER_ID,
+            "sender_clock": {"entries": {}},
+            "memories": [],
+            "archives": [victim_id],
+            "dry_run": false,
+        }),
+    )
+    .await;
+    assert!(arch_status.is_success());
+    assert_eq!(
+        count_ns(&db, VICTIM_NS).await,
+        1,
+        "#2447 Layer 2: an unscoped enrolled peer must be refused IDENTICALLY on \
+         the by-id archive lane, not only on memories[]"
+    );
+
     // The documented staged-rollout opt-out restores the legacy posture.
     set_posture(Some(UNSCOPED_ALLOWLIST), Some("0"));
     let (router2, db2) = build_router_with_db();
