@@ -92,6 +92,14 @@ const PEER_FP_LABEL: &str = "peer fingerprint file";
 /// is no-disable there (a falsy override refuses boot).
 pub const FED_REQUIRE_SERVER_VERIFY_ENV: &str = "AI_MEMORY_FED_REQUIRE_SERVER_VERIFY";
 
+/// The canonical falsy token for [`FED_REQUIRE_SERVER_VERIFY_ENV`] — the
+/// staged-rollout escape hatch value. Named so the one place an in-tree caller
+/// legitimately disables server-cert verification (the mTLS-allowlist
+/// integration test, whose subject IS client-cert pinning) reads as a
+/// deliberate opt-out rather than a bare `"0"`, and so a future grep for the
+/// escape hatch finds every site.
+pub const FED_REQUIRE_SERVER_VERIFY_OFF: &str = "0";
+
 /// Whether outbound peer server-cert verification is REQUIRED (#2448).
 ///
 /// Uses the house default-ON federation-knob grammar: disabled only by an
