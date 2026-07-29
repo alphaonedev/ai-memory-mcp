@@ -1118,13 +1118,33 @@ non-monotonic arm jump; (d) cross-adapter disagreement (the two
 and the postgres `migrate_vN` tip must all agree); (e) an orphan
 migration file (on disk, referenced nowhere under `src/`, not on
 `LADDER_EXEMPT_FILES`) or an `include_str!` arm referencing a missing
-file. `--self-test` plants the EXACT #2036/#2192 same-prefix-different-name
-collision AND a same-version-two-arms case in a throwaway copy UNDER
-the repo (never system `/tmp`) and confirms the gate rejects both.
+file; **(f)** a BOOTSTRAP-to-LADDER FORWARD REFERENCE (#2424, GA
+blocker) — a `CREATE [UNIQUE] INDEX` in either adapter's BOOTSTRAP
+schema (`src/store/postgres_schema.sql`; the `const SCHEMA` block in
+`src/storage/migrations.rs`) that references a column the ladder adds
+via `ALTER TABLE … ADD COLUMN`. Both adapters replay their bootstrap on
+EVERY open, ALWAYS before `migrate`, so on a LEGACY database the
+pre-existing table makes `CREATE TABLE IF NOT EXISTS` a no-op, the
+column is absent, and the index DDL CRASHES the open — the deployment
+cannot start (`IF NOT EXISTS` keys on the INDEX NAME, not the column,
+so it is no defence). Such an index belongs exclusively in the
+`migrate_vN` arm that adds the column; fresh installs still get it
+because `migrate_locked` reads `current_version = 0` and runs every
+arm. That is the `bootstrap(fresh)` = `ladder(v0 -> tip)` equivalence
+rule (f) enforces statically. `--self-test` plants the EXACT #2036/#2192
+same-prefix-different-name collision, a same-version-two-arms case, AND
+the #2424 shape on both adapters (the postgres v84
+`idx_memories_embedding_space` index that bricked two live deployments,
+plus the #1861 sqlite `idx_memories_cid` shape) in a throwaway copy
+UNDER the repo (never system `/tmp`) and confirms the gate rejects each.
 The `cargo test` twin `tests/migration_ladder_integrity.rs` re-asserts
 the same invariants (prefix-uniqueness, gap-free sequence, `MIGRATION_LADDER`
-monotonicity, cross-adapter tip agreement) so a collision fails even
-if the shell gate is bypassed. Data-integrity guardrail (North Star:
+monotonicity, cross-adapter tip agreement, and the rule-(f) forward-reference
+check) so a collision fails even if the shell gate is bypassed; the
+runtime proof against a REAL postgres — a POPULATED v67 / v73 / v83
+legacy database replayed to the tip, then compared column-for-column and
+`indexdef`-for-`indexdef` against a greenfield install — is
+`tests/postgres_ladder_replay.rs`. Data-integrity guardrail (North Star:
 degrade — a loud non-zero exit — never corrupt the ladder).
 
 ## Prime directive (operator-set, 2026-05-17)

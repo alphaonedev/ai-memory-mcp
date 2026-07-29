@@ -50,6 +50,25 @@
 #   (e) an ORPHAN migration file (present on disk but referenced NOWHERE under
 #       src/, and not on the documented exempt list), or an `include_str!`
 #       arm referencing a file that is missing on disk.
+#   (f) a BOOTSTRAP↔LADDER FORWARD REFERENCE (#2424, the GA-blocker class): a
+#       `CREATE [UNIQUE] INDEX` in a backend's BOOTSTRAP schema that references
+#       a column the LADDER adds via `ALTER TABLE <t> ADD COLUMN <c>`. Both
+#       adapters replay the bootstrap on EVERY open — `db::open` (sqlite) and
+#       `PostgresStore::connect` (postgres) apply it BEFORE `migrate` — so on a
+#       LEGACY database the pre-existing table makes `CREATE TABLE IF NOT
+#       EXISTS` a no-op, the ALTER-added column is absent, and the inline index
+#       CRASHES the open. `CREATE INDEX IF NOT EXISTS` does NOT save you: the
+#       `IF NOT EXISTS` is keyed on the INDEX NAME, so a legacy DB that never
+#       reached the arm which creates it takes the CREATE path and errors on
+#       the missing column. This is exactly #1861 (sqlite, `idx_memories_cid`)
+#       and #2424 (postgres: v67 `idx_memories_target_agent_id`, v74
+#       `idx_memories_cid`, v84 `idx_memories_embedding_space` — two live
+#       deployments bricked). An index on a ladder-added column belongs
+#       EXCLUSIVELY in its `migrate_vN` arm / migration .sql file, which runs
+#       AFTER the ALTER on legacy DBs and still runs on fresh installs (they
+#       enter the ladder at version 0 and execute every arm) — so
+#       `bootstrap(fresh)` and `ladder(v0→tip)` converge on the same schema.
+#       That equivalence is the invariant; this rule is its static enforcement.
 #
 # Mirrors the structure + `--self-test` convention of the sibling gates
 # (`scripts/check-vendor-literals.sh`, `scripts/check-l3-boundary.sh`).
@@ -57,14 +76,16 @@
 # CLI:
 #   scripts/check-migration-ladder.sh              — run the gate (exit 0/1)
 #   scripts/check-migration-ladder.sh --self-test  — plant the #2036/#2192
-#       same-prefix-different-name shape AND a same-version-two-arms case in a
+#       same-prefix-different-name shape AND a same-version-two-arms case AND
+#       the #2424 v84 bootstrap-inline-index shape (both backends) in a
 #       throwaway copy UNDER the repo (never system /tmp) and confirm the gate
-#       rejects BOTH, plus a clean-tree control — proving it is load-bearing.
+#       rejects EACH, plus a clean-tree control — proving it is load-bearing.
 #
 # Path inputs (env-overridable so --self-test can point at planted fixtures):
 #   LADDER_MIGRATIONS_DIR  (default <root>/migrations)
 #   LADDER_MIGRATIONS_RS   (default <root>/src/storage/migrations.rs)
 #   LADDER_POSTGRES_RS     (default <root>/src/store/postgres.rs)
+#   LADDER_PG_SCHEMA_SQL   (default <root>/src/store/postgres_schema.sql)
 #   LADDER_SRC_DIR         (default <root>/src)  — orphan reference scan root
 #
 # Requires bash >= 4 (Grok W2-bash3): this gate uses associative arrays
@@ -228,12 +249,108 @@ collect_resolved_arithmetic_arms() {
     done < <(grep -oE "^[[:space:]]*if ${var} < CURRENT_SCHEMA_VERSION *[-+] *[0-9]+ \{" "$f" 2>/dev/null || true)
 }
 
+# --- Rule (f) helpers: bootstrap↔ladder forward-reference (#2424) ------------
+#
+# strip_comments — drop `//`-style Rust comment lines and `--`-to-EOL SQL
+# comments so DDL quoted in PROSE (a doc-comment describing an arm, a `--`
+# rationale header in a .sql file) can never be mistaken for real DDL. Also
+# neutralises Rust string-literal punctuation (`"` and the `\` line
+# continuation) so a multi-line `sqlx::query("ALTER TABLE … \` statement scans
+# the same as plain SQL.
+strip_comments() {
+    sed -e 's|^[[:space:]]*//.*$||' -e 's|//.*$||' -e 's|--.*$||' \
+        -e 's|["\\]| |g' "$@" 2>/dev/null || true
+}
+
+# collect_ladder_added_columns <backend> <mig-dir> <ladder-rust-file>
+#   Emits one `<table>.<column>` per ALTER-ADD-COLUMN found anywhere in the
+#   backend's ladder (its migrations/<backend>/*.sql files AND the inline
+#   `ALTER TABLE … ADD COLUMN` statements in the adapter's migrate arms).
+#   Handles the multi-clause form
+#       ALTER TABLE memory_links
+#           ADD COLUMN IF NOT EXISTS valid_from  TIMESTAMPTZ,
+#           ADD COLUMN IF NOT EXISTS valid_until TIMESTAMPTZ;
+#   by carrying the most-recent `ALTER TABLE <t>` forward as the current
+#   target. Table-QUALIFIED on purpose: `namespace` is ladder-added on
+#   `agent_quotas` but original on `memories`, so an unqualified column-name
+#   match would false-positive on `memories_namespace_idx`.
+collect_ladder_added_columns() {
+    local backend="$1" mig_dir="$2" ladder_rs="$3"
+    local -a inputs=()
+    [[ -d "$mig_dir/$backend" ]] && while IFS= read -r f; do
+        inputs+=("$f")
+    done < <(find "$mig_dir/$backend" -maxdepth 1 -type f -name '*.sql' | sort)
+    [[ -f "$ladder_rs" ]] && inputs+=("$ladder_rs")
+    (( ${#inputs[@]} == 0 )) && return 0
+
+    strip_comments "${inputs[@]}" | awk '
+        {
+            line = $0
+            if (match(line, /ALTER[ \t]+TABLE[ \t]+(IF[ \t]+EXISTS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*/)) {
+                s = substr(line, RSTART, RLENGTH)
+                n = split(s, a, /[ \t]+/)
+                cur = a[n]
+            }
+            rest = line
+            while (cur != "" && match(rest, /ADD[ \t]+COLUMN[ \t]+(IF[ \t]+NOT[ \t]+EXISTS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*/)) {
+                s = substr(rest, RSTART, RLENGTH)
+                n = split(s, a, /[ \t]+/)
+                print cur "." a[n]
+                rest = substr(rest, RSTART + RLENGTH)
+            }
+        }
+    ' | sort -u
+}
+
+# extract_bootstrap <backend> <pg-schema-sql> <sqlite-migrations-rs>
+#   Emits the backend's BOOTSTRAP schema text on stdout. Postgres keeps it in a
+#   standalone .sql file; sqlite embeds it as the `const SCHEMA: &str = r"…";`
+#   raw-string block at the top of migrations.rs (the rest of that file is
+#   ladder arms, which must NOT be scanned as bootstrap).
+extract_bootstrap() {
+    local backend="$1" pg_sql="$2" sqlite_rs="$3"
+    if [[ "$backend" == "postgres" ]]; then
+        [[ -f "$pg_sql" ]] && cat "$pg_sql"
+    else
+        [[ -f "$sqlite_rs" ]] || return 0
+        awk '/const SCHEMA: *&str *= *r"/ { inblock = 1; next }
+             inblock && /^";$/          { inblock = 0; next }
+             inblock                    { print }' "$sqlite_rs"
+    fi
+}
+
+# collect_bootstrap_indexes  (stdin = bootstrap schema text)
+#   Emits one `<index-name>|<table>|<rest-of-statement>` per CREATE INDEX,
+#   re-joining statements that wrap across lines (every in-tree bootstrap
+#   wraps the `ON <table> (<cols>)` clause onto its own line).
+collect_bootstrap_indexes() {
+    sed -e 's|--.*$||' | awk '
+        BEGIN { acc = "" }
+        {
+            if (acc != "")                                    { acc = acc " " $0 }
+            else if ($0 ~ /CREATE[ \t]+(UNIQUE[ \t]+)?INDEX/)  { acc = $0 }
+            if (acc != "" && acc ~ /;/)                        { print acc; acc = "" }
+        }
+        END { if (acc != "") print acc }
+    ' | awk '
+        {
+            if (!match($0, /CREATE[ \t]+(UNIQUE[ \t]+)?INDEX[ \t]+(IF[ \t]+NOT[ \t]+EXISTS[ \t]+)?[A-Za-z_][A-Za-z0-9_]*[ \t]+ON[ \t]+[A-Za-z_][A-Za-z0-9_]*/)) next
+            head = substr($0, RSTART, RLENGTH)
+            rest = substr($0, RSTART + RLENGTH)
+            n = split(head, a, /[ \t]+/)
+            # …INDEX [IF NOT EXISTS] <name> ON <table> => a[n-2]=name, a[n]=table
+            print a[n-2] "|" a[n] "|" rest
+        }
+    '
+}
+
 # --- The gate ---------------------------------------------------------------
 
 run_gate() {
     local mig_dir="${LADDER_MIGRATIONS_DIR:-$ROOT/migrations}"
     local mig_rs="${LADDER_MIGRATIONS_RS:-$ROOT/src/storage/migrations.rs}"
     local pg_rs="${LADDER_POSTGRES_RS:-$ROOT/src/store/postgres.rs}"
+    local pg_schema_sql="${LADDER_PG_SCHEMA_SQL:-$ROOT/src/store/postgres_schema.sql}"
     local src_dir="${LADDER_SRC_DIR:-$ROOT/src}"
 
     local violations=0
@@ -478,13 +595,51 @@ run_gate() {
     done < <(grep -rhoE 'include_str!\("[^"]*migrations/(sqlite|postgres)/[0-9]{4}_[A-Za-z0-9_]+\.sql"\)' "$mig_rs" "$pg_rs" 2>/dev/null \
                 | grep -oE 'migrations/(sqlite|postgres)/[0-9]{4}_[A-Za-z0-9_]+\.sql' | sort -u || true)
 
+    # ---- Rule (f): BOOTSTRAP↔LADDER forward reference (#2424) ---------------
+    # The bootstrap replays over LEGACY databases BEFORE the ladder runs, so an
+    # inline index on a ladder-ALTER-added column crashes every legacy open.
+    # Enforced on BOTH adapters: the invariant is `bootstrap(fresh)` ≡
+    # `ladder(v0→tip)`, and a bootstrap-only index on a ladder column is exactly
+    # the shape that breaks it.
+    local fb_backend fb_ladder_rs
+    for fb_backend in "${BACKENDS[@]}"; do
+        if [[ "$fb_backend" == "postgres" ]]; then fb_ladder_rs="$pg_rs"; else fb_ladder_rs="$mig_rs"; fi
+
+        local fb_bootstrap fb_cols
+        fb_bootstrap="$(extract_bootstrap "$fb_backend" "$pg_schema_sql" "$mig_rs")"
+        [[ -z "$fb_bootstrap" ]] && continue
+        fb_cols="$(collect_ladder_added_columns "$fb_backend" "$mig_dir" "$fb_ladder_rs")"
+        [[ -z "$fb_cols" ]] && continue
+
+        local fb_stmt fb_idx fb_tbl fb_rest fb_pair fb_ptbl fb_pcol
+        while IFS= read -r fb_stmt; do
+            [[ -z "$fb_stmt" ]] && continue
+            fb_idx="${fb_stmt%%|*}"
+            fb_rest="${fb_stmt#*|}"
+            fb_tbl="${fb_rest%%|*}"
+            fb_rest="${fb_rest#*|}"
+            while IFS= read -r fb_pair; do
+                [[ -z "$fb_pair" ]] && continue
+                fb_ptbl="${fb_pair%%.*}"
+                fb_pcol="${fb_pair#*.}"
+                [[ "$fb_ptbl" == "$fb_tbl" ]] || continue
+                if printf '%s' "$fb_rest" | grep -qE "(^|[^A-Za-z0-9_])${fb_pcol}([^A-Za-z0-9_]|$)"; then
+                    echo "❌ migration-ladder [$fb_backend]: RULE (f) BOOTSTRAP↔LADDER FORWARD REFERENCE — bootstrap index \`$fb_idx\` ON $fb_tbl references \`$fb_pcol\`, a column the LADDER adds via ALTER TABLE (#2424 / #1861 class)." >&2
+                    echo "     The bootstrap schema replays over LEGACY databases BEFORE the ladder runs; the pre-existing \`$fb_tbl\` makes CREATE TABLE IF NOT EXISTS a no-op, \`$fb_pcol\` is absent, and this CREATE INDEX crashes the open. (CREATE INDEX IF NOT EXISTS does not help — it keys on the INDEX NAME, which a legacy DB below the owning arm does not have.)" >&2
+                    echo "     FIX: delete it from the bootstrap and create it ONLY in the migrate arm / migration .sql that adds \`$fb_pcol\`. Fresh installs still get it — they enter the ladder at version 0 and execute every arm, so bootstrap(fresh) stays equivalent to ladder(v0→tip)." >&2
+                    violations=$((violations + 1))
+                fi
+            done <<< "$fb_cols"
+        done < <(printf '%s\n' "$fb_bootstrap" | collect_bootstrap_indexes)
+    done
+
     return "$violations"
 }
 
 # --- Self-test --------------------------------------------------------------
 
 run_self_test() {
-    echo "migration-ladder gate: self-test (clean control -> PASS; #2036/#2192 same-prefix collision -> FAIL; same-version-two-arms -> FAIL; #2198 arm-lane const-phrase escapes D1a/D1b/D2 -> FAIL)"
+    echo "migration-ladder gate: self-test (clean control -> PASS; #2036/#2192 same-prefix collision -> FAIL; same-version-two-arms -> FAIL; #2198 arm-lane const-phrase escapes D1a/D1b/D2 -> FAIL; #2424 bootstrap-inline index on a ladder-added column, postgres v84 + sqlite cid -> FAIL)"
     local scratch
     # Project hard rule: scratch UNDER the repo, never system /tmp.
     scratch="$(mktemp -d "$ROOT/.migration-ladder-selftest.XXXXXX")"
@@ -601,8 +756,52 @@ run_self_test() {
         fail=1
     fi
 
+    # ---- #2424 bootstrap↔ladder forward reference (rule f) ------------------
+    #
+    # The GA-blocker class. Both cases plant the EXACT shape that shipped:
+    # an inline `CREATE INDEX` in the bootstrap over a column the ladder
+    # ALTER-adds. Pre-rule-(f) the gate exited 0 on both.
+
+    # (f1) POSTGRES — re-plant the v84 `idx_memories_embedding_space` shape
+    #      (`embedding_space` is ALTER-added by migrations/postgres/0041_v84_*).
+    #      This is verbatim what bricked the v74–v83 deployments.
+    local pgsql_f1="$scratch/postgres_schema_v84_shape.sql"
+    cp "$ROOT/src/store/postgres_schema.sql" "$pgsql_f1"
+    printf '\nCREATE INDEX IF NOT EXISTS idx_memories_embedding_space\n    ON memories (embedding_space) WHERE embedding_space IS NOT NULL;\n' >> "$pgsql_f1"
+    local out_f1
+    if out_f1="$(LADDER_PG_SCHEMA_SQL="$pgsql_f1" run_gate 2>&1)"; then
+        echo "  [f1] #2424 postgres v84 bootstrap-inline index: NOT CAUGHT (gate passed) — FAIL" >&2
+        fail=1
+    elif printf '%s' "$out_f1" | grep -q 'RULE (f) BOOTSTRAP.*idx_memories_embedding_space.*embedding_space'; then
+        echo "  [f1] #2424 postgres v84 bootstrap-inline index (the confirmed brick): CAUGHT"
+    else
+        echo "  [f1] #2424 postgres v84 shape: gate failed but without the rule-(f) message — FAIL" >&2
+        printf '%s\n' "$out_f1" >&2
+        fail=1
+    fi
+
+    # (f2) SQLITE — the same class on the other adapter (#1861's original
+    #      shape): re-plant `idx_memories_cid` inside the bootstrap `SCHEMA`
+    #      const. Proves rule (f) is not postgres-only.
+    local mig_rs_f2="$scratch/migrations_cid_shape.rs"
+    awk '{ print }
+         /^CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories\(tier\);$/ {
+             print "CREATE INDEX IF NOT EXISTS idx_memories_cid ON memories(cid);"
+         }' "$ROOT/src/storage/migrations.rs" > "$mig_rs_f2"
+    local out_f2
+    if out_f2="$(LADDER_MIGRATIONS_RS="$mig_rs_f2" run_gate 2>&1)"; then
+        echo "  [f2] #1861/#2424 sqlite bootstrap-inline index: NOT CAUGHT (gate passed) — FAIL" >&2
+        fail=1
+    elif printf '%s' "$out_f2" | grep -q 'migration-ladder \[sqlite\]: RULE (f) BOOTSTRAP.*idx_memories_cid'; then
+        echo "  [f2] #1861/#2424 sqlite bootstrap-inline index (cross-adapter): CAUGHT"
+    else
+        echo "  [f2] #1861/#2424 sqlite shape: gate failed but without the rule-(f) message — FAIL" >&2
+        printf '%s\n' "$out_f2" >&2
+        fail=1
+    fi
+
     if (( fail == 0 )); then
-        echo "migration-ladder gate self-test: PASS (load-bearing — catches the prefix collision, the dup-arm shapes, AND the #2198 const-phrase arm-lane escapes D1a/D1b/D2, spares a clean tree)"
+        echo "migration-ladder gate self-test: PASS (load-bearing — catches the prefix collision, the dup-arm shapes, the #2198 const-phrase arm-lane escapes D1a/D1b/D2, AND the #2424 bootstrap↔ladder forward reference on BOTH adapters; spares a clean tree)"
         return 0
     fi
     echo "migration-ladder gate self-test: FAIL" >&2
@@ -617,7 +816,7 @@ main() {
         exit $?
     fi
     if run_gate; then
-        echo "✅ migration-ladder-uniqueness gate: PASS (prefixes unique + gap-free, arms strictly monotonic incl. normalized const-phrased tip cohort, cross-adapter tip agrees, no orphans)"
+        echo "✅ migration-ladder-uniqueness gate: PASS (prefixes unique + gap-free, arms strictly monotonic incl. normalized const-phrased tip cohort, cross-adapter tip agrees, no orphans, no bootstrap↔ladder forward references on either adapter)"
         exit 0
     else
         echo "" >&2
