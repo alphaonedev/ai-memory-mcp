@@ -26,7 +26,6 @@ from ai_memory import (
     NotFoundError,
     Tier,
     ValidationError,
-    verify_webhook_signature,
 )
 from ai_memory.errors import raise_for_status
 from ai_memory.models import Memory
@@ -108,21 +107,11 @@ def test_raise_for_status_passes_on_2xx() -> None:
     raise_for_status(200, {"ok": True})  # does not raise
 
 
-def test_webhook_signature_round_trip() -> None:
-    import hashlib
-    import hmac
-
-    body = b'{"event":"memory.created"}'
-    secret = "s3cret"
-    sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-    assert verify_webhook_signature(body, sig, secret)
-    assert not verify_webhook_signature(body, sig, "wrong")
-    assert not verify_webhook_signature(body + b"tampered", sig, secret)
-
-
-def test_webhook_signature_rejects_malformed() -> None:
-    assert not verify_webhook_signature(b"x", "", "s")
-    assert not verify_webhook_signature(b"x", "sha256=notHex", "s")
+# The webhook-HMAC tests moved to tests/test_webhooks.py (#2455). The version
+# that lived here computed its "expected" signature with the SAME construction
+# the implementation used, then asserted the implementation agreed with itself
+# — it passed while the SDK could not verify a single genuine delivery. The
+# replacement asserts against a fixture emitted by the RUST signer.
 
 
 # ---------------------------------------------------------------------------

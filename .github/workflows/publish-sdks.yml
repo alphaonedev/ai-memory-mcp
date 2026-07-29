@@ -7,6 +7,17 @@ name: publish-sdks
 #
 # Both jobs run inside protected GitHub Environments so a maintainer
 # must approve each publish.
+#
+# #2455 — TEST-BEFORE-PUBLISH. This workflow triggers on `push: tags: v*`, so
+# cutting the GA tag publishes both SDKs. Before #2455 the steps were
+# setup -> build -> publish with NO test step anywhere on the path, while the
+# sibling `publish-sdk-shims.yml` deliberately ran each package's suite first.
+# Combined with `clients-ci.yml` being path-filtered to `clients/**` (so the
+# flagship SDKs were tested by NOTHING at all), a tag cut would have shipped
+# untested artifacts to PyPI and npm — unrecoverable, since a published
+# version cannot be un-published cleanly. Each job now runs the package's own
+# suite BEFORE its build+publish steps; a red suite fails the job and nothing
+# is uploaded. `clients-ci.yml` runs the SAME suites on the PR side.
 
 on:
   workflow_dispatch:
@@ -39,6 +50,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # #2455 — the suite runs BEFORE the build so a red test aborts the job
+      # with nothing built and nothing uploaded. Mirrors publish-sdk-shims.yml.
+      - name: test (gate the publish)
+        working-directory: sdk/python
+        env:
+          AI_MEMORY_NO_CONFIG: "1"
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pytest -q
       - name: build wheel + sdist
         working-directory: sdk/python
         run: |
@@ -69,10 +90,14 @@ jobs:
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org/"
-      - name: install + build
+      # #2455 — `npm test` (jest + ts-jest) runs BEFORE `npm run build`, so a
+      # red suite aborts the job with no `dist/` and nothing published.
+      # Mirrors the `install + test + build` shape in publish-sdk-shims.yml.
+      - name: install + test + build
         working-directory: sdk/typescript
         run: |
           npm ci
+          npm test
           npm run build
       # Auth via the npm automation token (env-scoped secret on the
       # npm-publish environment). id-token:write still enables --provenance.

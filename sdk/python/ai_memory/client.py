@@ -14,15 +14,17 @@ See :class:`AsyncAiMemoryClient` for the asyncio counterpart.
 from __future__ import annotations
 
 from types import TracebackType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
 from ai_memory._common import (
     DEFAULT_BASE_URL,
     DEFAULT_TIMEOUT,
+    build_create_body,
     build_httpx_kwargs,
     handle_response,
+    if_match_headers,
     prep_json,
     wrap_transport_error,
 )
@@ -39,6 +41,9 @@ from ai_memory.models import (
     SubscriptionRequest,
     UpdateMemory,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ai_memory.attestation import AgentSigningKey
 
 
 class AiMemoryClient:
@@ -105,6 +110,7 @@ class AiMemoryClient:
         *,
         json_body: Any = None,
         params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> Any:
         try:
             response = self._client.request(
@@ -112,6 +118,7 @@ class AiMemoryClient:
                 path,
                 json=prep_json(json_body) if json_body is not None else None,
                 params={k: v for k, v in (params or {}).items() if v is not None} or None,
+                headers=headers,
             )
         except httpx.HTTPError as exc:
             raise wrap_transport_error(exc) from exc
@@ -143,27 +150,61 @@ class AiMemoryClient:
         metadata: dict[str, Any] | None = None,
         agent_id: str | None = None,
         scope: str | None = None,
+        kind: str | None = None,
+        signing_key: AgentSigningKey | None = None,
+        signature: str | None = None,
+        created_at: str | None = None,
     ) -> dict[str, Any]:
-        """``POST /api/v1/memories`` — create (or upsert on title+ns)."""
-        body = CreateMemory(
+        """``POST /api/v1/memories`` — create (or upsert on title+ns).
+
+        #2455 — this endpoint is ``WriteSurface::HttpDirect``, which fails
+        CLOSED by default: an UNSIGNED store gets ``403 ATTESTATION_FAILED``
+        from a stock daemon. Pass ``signing_key`` (plus a matching
+        ``agent_id``) to attest the write:
+
+        .. code-block:: python
+
+            from ai_memory import AiMemoryClient
+            from ai_memory.attestation import AgentSigningKey
+
+            key = AgentSigningKey.from_file("~/.config/ai-memory/keys/svc.priv")
+            with AiMemoryClient() as c:
+                c.bind_agent_pubkey("svc", key.public_key_b64())  # once, admin
+                c.store(title="t", content="c", agent_id="svc", signing_key=key)
+
+        Omitting ``signing_key`` only works where the operator has explicitly
+        set ``AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0``.
+
+        Args:
+            kind: Memory kind (``observation`` default, ``decision``, ...).
+                Inside the signed envelope — when signing, this exact value
+                is what gets signed and sent.
+            signing_key: Ed25519 key; see :mod:`ai_memory.attestation`.
+            signature: A pre-computed STANDARD-base64 signature, for callers
+                that sign out-of-band. Mutually exclusive with
+                ``signing_key``; requires ``created_at``.
+            created_at: The RFC3339 timestamp that was signed. Required with
+                ``signature``; auto-generated with ``signing_key``.
+        """
+        body = build_create_body(
             title=title,
             content=content,
-            **{
-                k: v
-                for k, v in {
-                    "tier": tier,
-                    "namespace": namespace,
-                    "tags": tags,
-                    "priority": priority,
-                    "confidence": confidence,
-                    "source": source,
-                    "expires_at": expires_at,
-                    "ttl_secs": ttl_secs,
-                    "metadata": metadata,
-                    "agent_id": agent_id,
-                    "scope": scope,
-                }.items()
-                if v is not None
+            signing_key=signing_key,
+            fields={
+                "tier": tier,
+                "namespace": namespace,
+                "tags": tags,
+                "priority": priority,
+                "confidence": confidence,
+                "source": source,
+                "expires_at": expires_at,
+                "ttl_secs": ttl_secs,
+                "metadata": metadata,
+                "agent_id": agent_id,
+                "scope": scope,
+                "kind": kind,
+                "signature": signature,
+                "created_at": created_at,
             },
         )
         return self._request("POST", "/api/v1/memories", json_body=body)
@@ -179,9 +220,31 @@ class AiMemoryClient:
         raw = self._request("GET", f"/api/v1/memories/{memory_id}")
         return Memory.model_validate(raw)
 
-    def update(self, memory_id: str, update: UpdateMemory | dict[str, Any]) -> dict[str, Any]:
-        """``PUT /api/v1/memories/{id}``."""
-        return self._request("PUT", f"/api/v1/memories/{memory_id}", json_body=update)
+    def update(
+        self,
+        memory_id: str,
+        update: UpdateMemory | dict[str, Any],
+        *,
+        expected_version: int | str | None = None,
+    ) -> dict[str, Any]:
+        """``PUT /api/v1/memories/{id}``.
+
+        Args:
+            expected_version: Opt-in optimistic concurrency. Sent as
+                ``If-Match`` — the daemon's ONLY version gate for this route
+                (``src/handlers/memories.rs:245-260``); there is no ``version``
+                body field, and adding one would be silently ignored. When the
+                stored row has drifted the server answers ``409`` with both the
+                expected and current versions, which surfaces here as
+                :class:`ai_memory.errors.ConflictError`. Omit for the legacy
+                last-write-wins behaviour.
+        """
+        return self._request(
+            "PUT",
+            f"/api/v1/memories/{memory_id}",
+            json_body=update,
+            headers=if_match_headers(expected_version),
+        )
 
     def delete(self, memory_id: str) -> dict[str, Any]:
         """``DELETE /api/v1/memories/{id}``."""
@@ -442,4 +505,22 @@ class AiMemoryClient:
                 "agent_type": agent_type,
                 "capabilities": capabilities or [],
             },
+        )
+
+    def bind_agent_pubkey(self, agent_id: str, pubkey_b64: str) -> dict[str, Any]:
+        """``PUT /api/v1/agents/{id}/pubkey`` — enroll an attestation key.
+
+        ADMIN-GATED. Without a bound key the daemon cannot verify a signed
+        store and still answers ``403`` — fail-closed by design — so this is
+        the required one-time step before :meth:`store` with ``signing_key``
+        can succeed.
+
+        Args:
+            pubkey_b64: Base64 32-byte Ed25519 public key; URL-safe unpadded
+                is accepted. :meth:`AgentSigningKey.public_key_b64` emits it.
+        """
+        return self._request(
+            "PUT",
+            f"/api/v1/agents/{agent_id}/pubkey",
+            json_body={"pubkey_b64": pubkey_b64},
         )

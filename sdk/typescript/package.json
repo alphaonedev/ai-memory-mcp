@@ -26,6 +26,10 @@
       "types": "./dist/webhooks.d.ts",
       "import": "./dist/webhooks.js"
     },
+    "./attestation": {
+      "types": "./dist/attestation.d.ts",
+      "import": "./dist/attestation.js"
+    },
     "./errors": {
       "types": "./dist/errors.d.ts",
       "import": "./dist/errors.js"
