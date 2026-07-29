@@ -200,6 +200,36 @@ jobs:
         # proving the gate is load-bearing (pm-v3.2 NO FAIL MISSION discipline).
         run: bash scripts/check-migration-ladder.sh --self-test
 
+  install-checksum-gate:
+    # Issue #2449 — supply-chain. `install.sh` wrapped its checksum
+    # verification in a fail-OPEN branch (warn and install anyway), and
+    # `release.yml` published no `.sha256` asset for the tarballs the
+    # installer downloads — so the fetch 404'd on every ordinary install,
+    # the fail-open branch fired every time, and the verification step
+    # passed by DOING NOTHING. `install.ps1` verified nothing at all.
+    # HARD-BLOCKS a reintroduced fail-open branch in either installer and
+    # any release artifact published without a sibling `.sha256`.
+    name: Installer checksum fail-closed gate (#2449)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run installer checksum gate
+        run: bash scripts/check-install-checksum.sh
+      - name: Self-test the gate (regression evidence)
+        # Two halves, both load-bearing. BEHAVIOURAL: plants a MISSING and
+        # a MISMATCHED checksum and proves the REAL, unmodified install.sh
+        # rejects both (asserting on its abort token, not merely a
+        # non-zero exit, so a broken harness cannot masquerade as a
+        # correct refusal), plus a valid-checksum accept, a
+        # no-SHA-256-tool abort, and the openssl rung in isolation.
+        # STATIC: plants six regressions — a deleted gate region in each
+        # installer, a restored fail-open phrase, a removed abort branch,
+        # a deleted release.yml checksum sweep, and a dropped sibling
+        # `.sha256` — into a throwaway copy under the repo and confirms
+        # the gate rejects each, with an unmutated control first.
+        run: bash scripts/check-install-checksum.sh --self-test
+
   test-env-lock-gate:
     # Issue #2146 — the grep-gate half of issue #2127's Fix section,
     # not delivered by PR #2142 (Fable pre-merge audit of #2142).

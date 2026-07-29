@@ -8,7 +8,7 @@ BINARY="ai-memory"
 VERSION="latest"
 
 # Checksum-verification bypass. Initialised to 0 HERE, before any argument
-# parsing, and set ONLY by the --insecure-skip-checksum flag below — so an
+# parsing, and set ONLY by the --insecure-skip-checksum flag below -- so an
 # exported SKIP_CHECKSUM=1 inherited from the environment can never enable
 # it. See the checksum gate near the end of this script for why the bypass
 # is deliberately a flag and not an environment variable (#2449).
@@ -31,8 +31,8 @@ Options:
   --insecure-skip-checksum
                 Install WITHOUT verifying the SHA-256 checksum of the
                 downloaded archive. This disables the only integrity
-                control this installer has. Provided as a flag — and
-                deliberately NOT as an environment variable — so that
+                control this installer has. Provided as a flag -- and
+                deliberately NOT as an environment variable -- so that
                 bypassing verification is a per-invocation, reviewable
                 decision that cannot be silently inherited by a whole
                 fleet from a base image or CI environment.

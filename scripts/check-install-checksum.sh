@@ -136,6 +136,15 @@ audit_installer_region() {
     if ! grep -qF -- 'CHECKSUM_URL' <<<"$region" && ! grep -qF -- 'ChecksumUrl' <<<"$region"; then
         violation "${label}: checksum gate never references the checksum URL — it cannot be verifying anything."
     fi
+
+    # These scripts are piped straight into `sh` / `iex` on machines whose
+    # locale we do not control. #1880 is the standing lesson: one stray
+    # non-ASCII byte (a U+2014 em-dash) in a cloud-init template made
+    # cloud-init silently discard the whole config. Both installers were
+    # pure ASCII before #2449 and must stay that way.
+    if LC_ALL=C grep -qn '[^ -~	]' "$file"; then
+        violation "${label}: non-ASCII byte(s) at line(s) $(LC_ALL=C grep -n '[^ -~	]' "$file" | cut -d: -f1 | paste -sd, -). A script piped into sh/iex must stay pure ASCII (#1880)."
+    fi
 }
 
 # ---------------------------------------------------------------------------
