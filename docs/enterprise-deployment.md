@@ -185,6 +185,15 @@ is a `VACUUM INTO` wrapper that emits a defragmented snapshot +
 sha256 manifest; `ai-memory restore --from <dir>` verifies the manifest
 before swapping in the snapshot.
 
+This topology is SQLite (T1 singleton), so the cron line above is
+correct as written. On any Postgres-backed topology (T3+) use `pg_dump`
+/ `pg_basebackup` instead — `ai-memory backup` is SQLite-only and now
+REFUSES a Postgres store rather than emitting a plausible-looking empty
+snapshot ([#2444](https://github.com/alphaonedev/ai-memory-mcp/issues/2444)).
+Add `--store-url "$AI_MEMORY_STORE_URL"` to any backup cron on a host
+that might be re-pointed at Postgres, so the command fails loudly on the
+day it is.
+
 ### 2.7 When to graduate
 
 Graduate to T2 when **any** of these become true:

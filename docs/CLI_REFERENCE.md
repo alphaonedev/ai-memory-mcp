@@ -358,6 +358,41 @@ ai-memory restore --from /var/backups/ai-memory
 sha256 manifest. `restore` verifies the manifest before replacing the
 DB; use `--skip-verify` only for forensic recoveries.
 
+| Flag | Applies to | Notes |
+|---|---|---|
+| `--to <dir>` | `backup` | Snapshot + manifest destination. Default `./backups`. |
+| `--keep <n>` | `backup` | Retain at most `n` snapshots, oldest-first rotation. `0` disables. |
+| `--from <path>` | `restore` | A snapshot file, or a directory (newest snapshot wins). |
+| `--skip-verify` | `restore` | Skip the sha256 check. Not routine. |
+| `--store-url <url>` | both | The store this deployment serves, same grammar as `serve` / `curator`. Also read from `AI_MEMORY_STORE_URL_FILE` / `AI_MEMORY_STORE_URL`. |
+
+**SQLite only, and it now REFUSES rather than pretending**
+([#2444](https://github.com/alphaonedev/ai-memory-mcp/issues/2444)).
+`backup` snapshots a local SQLite file; it cannot capture a Postgres
+corpus. Before v1.0.0 it did not *say* so — pointed at a Postgres
+deployment it created an empty SQLite file, snapshotted that, wrote a
+**valid** sha256 manifest and exited 0, so the failure surfaced only at
+the DR restore. Both verbs now resolve the configured store first and
+refuse what they cannot capture:
+
+- a `postgres://` store (naming `pg_dump` / `pg_basebackup`; the DSN
+  password is redacted from the message),
+- an unrecognised store-URL scheme (no silent fallback to `--db`),
+- a `--store-url` that disagrees with `AI_MEMORY_STORE_URL`,
+- for `backup`, a `--db` path where no database exists — it will not
+  create one and snapshot the empty result,
+- for `restore`, a snapshot that is not a readable ai-memory database,
+  one whose manifest declares a different backend, and one on a
+  **newer** schema than the running binary understands.
+
+Pass `--store-url` explicitly (or export `AI_MEMORY_STORE_URL`) on any
+host where the daemon is Postgres-backed, so the command can refuse
+instead of guessing. The manifest now records `backend`,
+`schema_version` and `memory_count`; a snapshot with zero memories is
+WARNed on stderr. `restore` also moves the `-wal` / `-shm` sidecars
+aside with the database, so stale WAL frames can never be replayed into
+the restored corpus.
+
 ## Autonomy (v0.6.1)
 
 ### `curator`
