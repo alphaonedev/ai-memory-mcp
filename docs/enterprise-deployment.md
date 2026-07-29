@@ -394,7 +394,7 @@ auth layers ([`federation.md`](federation.html)):
 |---|---|---|
 | 1 (transport) | mTLS with SHA-256 fingerprint allowlist (`--mtls-allowlist`) | Peer without listed cert cannot open TCP |
 | 2 (application) | `x-api-key` header (the `?api_key=` query form is deprecated at v0.7.0, #1574 — WARNs once per process; slated for rejection in v0.8) | Every endpoint except `/api/v1/health` requires it |
-| 3 (identity) | Per-peer `PeerScope` JSON via `AI_MEMORY_FED_PEER_ATTESTATION` | `allowed_sender_agent_ids` on `/sync/push`; `allowed_namespaces` glob on `/sync/since`; default-deny |
+| 3 (identity) | Per-peer `PeerScope` JSON via `AI_MEMORY_FED_PEER_ATTESTATION` | `allowed_sender_agent_ids` gates the authorship a peer may claim on `/sync/push`; the `allowed_namespaces` glob gates WHICH namespaces it may touch on ALL THREE lanes — the `/sync/since` pull projection, the `deletions[]` lane (#1934), and the `memories[]` write lane + `archives[]` / `restores[]` (#2447); default-deny |
 
 Cert generation, fingerprint allowlist format, and the cert-revocation
 playbook are pinned in [`federation.md §"mTLS rotation playbook"`](federation.html)
@@ -844,8 +844,10 @@ Federation peers exchange data via two endpoints:
 - `GET /sync/since?since=<ts>` — catchup pull. Peer B pulls memories
   it missed since the last successful sync. The per-peer
   `allowed_namespaces` glob filter (`namespace_allowed`,
-  `src/federation/peer_attestation.rs:338`) gates which rows can
-  cross.
+  `src/federation/peer_attestation.rs`) gates which rows can
+  cross. The same filter gates the inbound `/sync/push` write, delete,
+  archive and restore lanes (#1934 / #2447), so data-residency scope is
+  enforced in both directions rather than on reads alone.
 
 The catchup loop (`spawn_catchup_loop`,
 `src/federation/receive.rs:35`) drives the periodic pull; default

@@ -95,8 +95,24 @@ the `x-peer-id` HTTP header) to a `PeerScope`
   may claim as `body.sender_agent_id` on `/sync/push`. Empty = peer
   may only author as itself (`body.sender_agent_id == peer-id`).
 - **`allowed_namespaces`** — glob patterns matched against
-  `Memory::namespace` on `/sync/since`. `*` = single segment, `**` =
-  any suffix. Empty = peer may not pull any rows (default-deny).
+  `Memory::namespace` on **all three lanes**: the `/sync/since` pull
+  projection, the `/sync/push` `deletions[]` lane (#1934), and — since
+  #2447 — the `/sync/push` `memories[]` WRITE lane plus its `archives[]`
+  / `restores[]` siblings. `*` = single segment, `**` = any suffix
+  (`**` is an unconditional allow-all, and is the supported way to
+  declare a deliberately unscoped peer). Empty = default-deny on every
+  lane: the peer may not pull, delete, or write any rows.
+
+  On the write lane BOTH the inbound row's claimed `namespace` AND the
+  stored namespace of any existing local row with the same `id` must
+  match, because `merge_memory` resolves `namespace` by last-writer-wins
+  — without the second check a peer could relocate a row out of a
+  namespace it was denied by pushing that row's id under an in-scope
+  namespace. Enforcement engages only under an ENROLLED posture
+  (`AI_MEMORY_FED_PEER_ATTESTATION` configured); zero-config federation
+  is unchanged. See env row 147
+  (`AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE`) for the disposition of
+  an enrolled peer that declares no namespaces at all.
 
 The attestation core is `attest_sender`
 ([`src/federation/peer_attestation.rs:257`](../src/federation/peer_attestation.rs))
