@@ -364,3 +364,336 @@ fn guardrail_d_all_sql_files_follow_nnnn_convention() {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #2424 — BOOTSTRAP ↔ LADDER equivalence: no forward reference from a
+// bootstrap index to a ladder-ALTER-added column.
+//
+// This is the `cargo test` twin of `scripts/check-migration-ladder.sh` rule
+// (f), and it is the invariant the pre-existing guardrails structurally could
+// not see: `tests/postgres_schema_parity.rs` bootstraps a FRESH disposable
+// database (greenfield only — it never migrates an existing one), and the
+// guardrail-D checks above assert the ladder's SHAPE (prefix uniqueness, gap
+// freedom, arm monotonicity, cross-adapter tip agreement) but never its
+// AGREEMENT WITH THE BOOTSTRAP.
+//
+// THE DEFECT: both adapters replay their bootstrap schema on EVERY open, ALWAYS
+// BEFORE `migrate` — `db::open` (sqlite) and `PostgresStore::connect`
+// (postgres). On a LEGACY database the pre-existing table makes
+// `CREATE TABLE IF NOT EXISTS` a no-op, so a column the ladder adds via
+// `ALTER TABLE … ADD COLUMN` is simply ABSENT, and an inline
+// `CREATE INDEX` over it kills the open. `IF NOT EXISTS` on the index does not
+// help: it keys on the INDEX NAME, so a legacy DB below the arm that would have
+// created it takes the CREATE path and errors on the missing column.
+//
+// This bricked two live pre-v84 postgres deployments (#2424): v67–v73 died on
+// `memories.cid`, v74–v83 on `memories.embedding_space`. #1861 was the same
+// class on sqlite. A postgres_schema.sql comment asserting the bootstrap "is
+// applied only at fresh schema-init, NEVER REPLAYED OVER A LEGACY DB" was the
+// shared false belief that kept arming new instances on every schema bump; it
+// is deleted, and this test is what keeps it deleted in effect.
+//
+// The rule enforced: NO `CREATE [UNIQUE] INDEX` in a backend's bootstrap may
+// reference a column the ladder ALTER-adds. Such an index belongs exclusively
+// in the `migrate_vN` arm that adds the column — which still runs on fresh
+// installs, because `migrate_locked` reads `current_version = 0` on a fresh DB
+// and executes EVERY arm. That is precisely what makes `bootstrap(fresh)` and
+// `ladder(v0 → tip)` converge, i.e. the equivalence this test defends.
+//
+// DATA-INTEGRITY posture (North Star): a violation is not a degraded index, it
+// is a deployment that CANNOT START. Fail closed in CI rather than fleet-wide.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Strip `//` Rust comments, `--` SQL comments, and Rust string-literal
+/// punctuation so DDL quoted in PROSE can never be mistaken for real DDL and a
+/// multi-line `sqlx::query("ALTER TABLE … \` statement scans like plain SQL.
+/// Mirrors the shell gate's `strip_comments`.
+fn strip_ddl_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    for line in src.lines() {
+        let mut line = line;
+        if line.trim_start().starts_with("//") {
+            out.push('\n');
+            continue;
+        }
+        if let Some(i) = line.find("//") {
+            line = &line[..i];
+        }
+        let owned = match line.find("--") {
+            Some(i) => &line[..i],
+            None => line,
+        };
+        out.push_str(&owned.replace(['"', '\\'], " "));
+        out.push('\n');
+    }
+    out
+}
+
+/// Pull the identifier that follows `kw` (skipping the optional
+/// `IF NOT EXISTS` / `IF EXISTS` guard) starting at `from`, returning the
+/// identifier plus the byte offset just past it.
+fn ident_after(tokens: &[&str], mut i: usize) -> Option<usize> {
+    // Skip an `IF [NOT] EXISTS` guard.
+    if tokens.get(i).is_some_and(|t| t.eq_ignore_ascii_case("IF")) {
+        i += 1;
+        if tokens.get(i).is_some_and(|t| t.eq_ignore_ascii_case("NOT")) {
+            i += 1;
+        }
+        if tokens
+            .get(i)
+            .is_some_and(|t| t.eq_ignore_ascii_case("EXISTS"))
+        {
+            i += 1;
+        }
+    }
+    tokens.get(i).map(|_| i)
+}
+
+/// Every `<table>.<column>` the ladder adds via `ALTER TABLE … ADD COLUMN`,
+/// across the backend's `migrations/<backend>/*.sql` files AND the inline
+/// statements in its adapter's migrate arms. The multi-clause form
+/// (`ALTER TABLE t` then several `ADD COLUMN` lines) is handled by carrying the
+/// most-recent `ALTER TABLE` target forward.
+///
+/// Table-QUALIFIED deliberately: `namespace` is ladder-added on `agent_quotas`
+/// but original on `memories`, so an unqualified column match would
+/// false-positive on `memories_namespace_idx`.
+fn ladder_added_columns(backend: &str, ladder_rs_rel: &str) -> BTreeSet<(String, String)> {
+    let mut sources = vec![read_src(ladder_rs_rel)];
+    let dir = migrations_dir(backend);
+    if let Ok(rd) = fs::read_dir(&dir) {
+        let mut files: Vec<PathBuf> = rd
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("sql")))
+            .collect();
+        files.sort();
+        for f in files {
+            sources.push(
+                fs::read_to_string(&f).unwrap_or_else(|e| panic!("read {}: {e}", f.display())),
+            );
+        }
+    }
+
+    let mut out = BTreeSet::new();
+    for src in &sources {
+        let cleaned = strip_ddl_comments(src);
+        // The most-recent `ALTER TABLE <t>` target, carried ACROSS lines so the
+        // multi-clause form resolves each `ADD COLUMN` to the right table.
+        let mut cur: Option<String> = None;
+        for line in cleaned.lines() {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            let mut i = 0usize;
+            while i < tokens.len() {
+                if tokens[i].eq_ignore_ascii_case("ALTER")
+                    && tokens
+                        .get(i + 1)
+                        .is_some_and(|t| t.eq_ignore_ascii_case("TABLE"))
+                    && let Some(j) = ident_after(&tokens, i + 2)
+                {
+                    cur = Some(strip_ident(tokens[j]));
+                    i = j + 1;
+                    continue;
+                }
+                if tokens[i].eq_ignore_ascii_case("ADD")
+                    && tokens
+                        .get(i + 1)
+                        .is_some_and(|t| t.eq_ignore_ascii_case("COLUMN"))
+                    && let Some(j) = ident_after(&tokens, i + 2)
+                {
+                    let col = strip_ident(tokens[j]);
+                    if let Some(tbl) = cur.as_ref()
+                        && !tbl.is_empty()
+                        && !col.is_empty()
+                    {
+                        out.insert((tbl.clone(), col));
+                    }
+                    i = j + 1;
+                    continue;
+                }
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Trim SQL punctuation from an identifier token (`memories(cid),` -> `memories`).
+fn strip_ident(tok: &str) -> String {
+    tok.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .split('(')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// A bootstrap `CREATE INDEX` statement, reduced to what rule (f) needs.
+struct BootstrapIndex {
+    name: String,
+    table: String,
+    /// Everything after `ON <table>` — the column list plus any partial-index
+    /// `WHERE` clause, both of which can reference columns.
+    rest: String,
+}
+
+/// The backend's BOOTSTRAP schema text. Postgres keeps it in a standalone
+/// `.sql`; sqlite embeds it as the `const SCHEMA: &str = r"…";` raw-string block
+/// at the top of `migrations.rs` (the REST of that file is ladder arms, which
+/// must NOT be scanned as bootstrap).
+fn bootstrap_schema(backend: &str) -> String {
+    if backend == "postgres" {
+        return read_src("src/store/postgres_schema.sql");
+    }
+    let src = read_src("src/storage/migrations.rs");
+    let mut out = String::new();
+    let mut inblock = false;
+    for line in src.lines() {
+        if !inblock {
+            if line.contains("const SCHEMA: &str = r\"") {
+                inblock = true;
+            }
+            continue;
+        }
+        if line == "\";" {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Parse every `CREATE [UNIQUE] INDEX … ON <table> (…)` out of a bootstrap
+/// schema, re-joining statements that wrap across lines.
+fn bootstrap_indexes(schema: &str) -> Vec<BootstrapIndex> {
+    let cleaned = strip_ddl_comments(schema);
+    let mut stmts: Vec<String> = Vec::new();
+    let mut acc = String::new();
+    for line in cleaned.lines() {
+        if acc.is_empty() {
+            let upper = line.to_ascii_uppercase();
+            if !(upper.contains("CREATE INDEX") || upper.contains("CREATE UNIQUE INDEX")) {
+                continue;
+            }
+            acc.push_str(line);
+        } else {
+            acc.push(' ');
+            acc.push_str(line);
+        }
+        if acc.contains(';') {
+            stmts.push(std::mem::take(&mut acc));
+        }
+    }
+    if !acc.is_empty() {
+        stmts.push(acc);
+    }
+
+    let mut out = Vec::new();
+    for stmt in stmts {
+        let tokens: Vec<&str> = stmt.split_whitespace().collect();
+        let Some(idx_kw) = tokens.iter().position(|t| t.eq_ignore_ascii_case("INDEX")) else {
+            continue;
+        };
+        let Some(name_pos) = ident_after(&tokens, idx_kw + 1) else {
+            continue;
+        };
+        let Some(on_pos) = tokens
+            .iter()
+            .skip(name_pos)
+            .position(|t| t.eq_ignore_ascii_case("ON"))
+            .map(|p| p + name_pos)
+        else {
+            continue;
+        };
+        let Some(table_tok) = tokens.get(on_pos + 1) else {
+            continue;
+        };
+        out.push(BootstrapIndex {
+            name: strip_ident(tokens[name_pos]),
+            table: strip_ident(table_tok),
+            rest: tokens[on_pos + 1..].join(" "),
+        });
+    }
+    out
+}
+
+/// True when `hay` mentions `needle` as a whole SQL identifier.
+fn mentions_ident(hay: &str, needle: &str) -> bool {
+    let bytes = hay.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = hay[from..].find(needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let before_ok = start == 0 || {
+            let b = bytes[start - 1];
+            !(b.is_ascii_alphanumeric() || b == b'_')
+        };
+        let after_ok = end == bytes.len() || {
+            let b = bytes[end];
+            !(b.is_ascii_alphanumeric() || b == b'_')
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// #2424 — the invariant that closes the class on BOTH adapters.
+#[test]
+fn bootstrap_never_indexes_a_ladder_added_column() {
+    for backend in BACKENDS {
+        let ladder_rs = if backend == "postgres" {
+            "src/store/postgres.rs"
+        } else {
+            "src/storage/migrations.rs"
+        };
+        let added = ladder_added_columns(backend, ladder_rs);
+        assert!(
+            !added.is_empty(),
+            "#2424 [{backend}]: parsed ZERO `ALTER TABLE … ADD COLUMN` pairs out of the ladder — \
+             the scanner is broken, so this guard would vacuously pass. Fail closed.",
+        );
+
+        let schema = bootstrap_schema(backend);
+        assert!(
+            !schema.trim().is_empty(),
+            "#2424 [{backend}]: bootstrap schema came back EMPTY — the extractor is broken \
+             (sqlite: the `const SCHEMA: &str = r\"` block moved). Fail closed.",
+        );
+        let indexes = bootstrap_indexes(&schema);
+        assert!(
+            !indexes.is_empty(),
+            "#2424 [{backend}]: parsed ZERO bootstrap `CREATE INDEX` statements — the parser is \
+             broken, so this guard would vacuously pass. Fail closed.",
+        );
+
+        for ix in &indexes {
+            for (tbl, col) in &added {
+                if tbl != &ix.table {
+                    continue;
+                }
+                assert!(
+                    !mentions_ident(&ix.rest, col),
+                    "#2424 [{backend}]: BOOTSTRAP↔LADDER FORWARD REFERENCE — bootstrap index \
+                     `{}` ON {} references `{col}`, a column the LADDER adds via \
+                     `ALTER TABLE`.\n\
+                     The bootstrap replays over LEGACY databases BEFORE the ladder runs: the \
+                     pre-existing `{}` makes `CREATE TABLE IF NOT EXISTS` a no-op, `{col}` is \
+                     absent, and this `CREATE INDEX` CRASHES the open — the deployment cannot \
+                     start (this is exactly #2424 / #1861). `CREATE INDEX IF NOT EXISTS` does \
+                     NOT save you; it keys on the INDEX NAME, which a legacy DB below the owning \
+                     arm does not have.\n\
+                     FIX: delete it from the bootstrap and create it ONLY in the `migrate_vN` \
+                     arm / migration .sql that adds `{col}`. Fresh installs still get it — they \
+                     enter the ladder at version 0 and execute every arm, which is what keeps \
+                     bootstrap(fresh) equivalent to ladder(v0 -> tip).",
+                    ix.name,
+                    ix.table,
+                    ix.table,
+                );
+            }
+        }
+    }
+}
