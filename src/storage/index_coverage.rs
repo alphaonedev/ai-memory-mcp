@@ -46,7 +46,11 @@ use rusqlite::Connection;
 const SQL_FTS_DOC_COUNT: &str = "SELECT COUNT(*) FROM memories_fts_docsize";
 
 /// Live row count of the `memories` table.
-const SQL_TOTAL_MEMORIES: &str = "SELECT COUNT(*) FROM memories";
+///
+/// `pub(crate)` since #2444 so the `backup` / `restore` corpus probe reuses
+/// this ONE named statement instead of re-scattering the literal (pm-v3.1
+/// no-hardcoded-literal rule / `scripts/check-hardcoded-literals.sh`).
+pub(crate) const SQL_TOTAL_MEMORIES: &str = "SELECT COUNT(*) FROM memories";
 
 /// A reconciliation snapshot of recall-index coverage against the
 /// `memories` table, for one database (see the [module docs](self)).
