@@ -1042,6 +1042,151 @@ mod tests {
     }
 
     #[test]
+    fn require_push_namespace_scope_default_strict_and_falsy_opts_out() {
+        // #2447 — the write-lane sibling of the two resolver tests above, and
+        // the co-located precedence pin the env-table row 147 points at (this
+        // is a direct-read knob, so it takes no `config_precedence` entry —
+        // the #84/#85/#87/#94/#96/#123/#125/#132 pattern). SAFETY: single-
+        // threaded mutation of a var no other test reads.
+        unsafe { std::env::remove_var(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV) };
+        assert!(
+            require_push_namespace_scope_enabled(),
+            "unset → strict; a FED_REQUIRE_* knob defaulting permissive would \
+             be grammar-illegal (all 7 siblings are default-ON at v1.0.0)"
+        );
+        for truthy in ["1", "true", "yes", "on", "  on  "] {
+            unsafe { std::env::set_var(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV, truthy) };
+            assert!(
+                require_push_namespace_scope_enabled(),
+                "{truthy:?} → strict"
+            );
+        }
+        for falsy in ["0", "false", "no", "off", "  off  "] {
+            unsafe { std::env::set_var(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV, falsy) };
+            assert!(
+                !require_push_namespace_scope_enabled(),
+                "{falsy:?} → the staged-rollout opt-out"
+            );
+        }
+        // The shared `env_flag_default_on` grammar trims but does NOT
+        // case-fold, so an uppercase token is unrecognised and therefore
+        // fail-closed — identical to all 7 sibling FED_REQUIRE_* knobs.
+        unsafe { std::env::set_var(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV, "OFF") };
+        assert!(
+            require_push_namespace_scope_enabled(),
+            "\"OFF\" is not a recognised falsy token → stays strict"
+        );
+        unsafe { std::env::set_var(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV, "garbage") };
+        assert!(
+            require_push_namespace_scope_enabled(),
+            "garbage → strict default (a typo must never silently widen scope)"
+        );
+        unsafe { std::env::remove_var(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV) };
+    }
+
+    /// #2447 — the pure verdict, exercised without any HTTP/DB plumbing. The
+    /// zero-config arm is the load-bearing one: a verbatim `namespace_allowed`
+    /// call would return `false` here and silently black-hole every inbound
+    /// memory on an unconfigured deployment.
+    #[test]
+    fn inbound_write_namespace_verdict_layers() {
+        use crate::federation::peer_attestation::{PeerAttestationConfig, PeerScope};
+
+        let zero_config = PeerAttestationConfig::default();
+        assert!(
+            inbound_write_namespace_authorized(
+                "memories",
+                "id-1",
+                "secure/ops",
+                None,
+                &zero_config,
+                Some("peer-1"),
+                true,
+            ),
+            "zero-config must be byte-identical to pre-#2447 even under the knob"
+        );
+
+        let mut scoped = PeerAttestationConfig::default();
+        scoped.peers.insert(
+            "peer-1".to_string(),
+            PeerScope {
+                allowed_sender_agent_ids: vec![],
+                allowed_namespaces: vec!["public/*".to_string()],
+            },
+        );
+        assert!(
+            inbound_write_namespace_authorized(
+                "memories",
+                "id-1",
+                "public/ok",
+                None,
+                &scoped,
+                Some("peer-1"),
+                true,
+            ),
+            "Layer 1: in-scope claimed namespace accepted"
+        );
+        assert!(
+            !inbound_write_namespace_authorized(
+                "memories",
+                "id-1",
+                "secure/ops",
+                None,
+                &scoped,
+                Some("peer-1"),
+                true,
+            ),
+            "Layer 1: out-of-scope claimed namespace refused"
+        );
+        assert!(
+            !inbound_write_namespace_authorized(
+                "memories",
+                "id-1",
+                "public/loot",
+                Some("secure/ops"),
+                &scoped,
+                Some("peer-1"),
+                true,
+            ),
+            "Layer 1: an in-scope CLAIM cannot launder an out-of-scope STORED \
+             namespace — this is the merge-clobber bypass"
+        );
+
+        let mut unscoped = PeerAttestationConfig::default();
+        unscoped.peers.insert(
+            "peer-1".to_string(),
+            PeerScope {
+                allowed_sender_agent_ids: vec!["a".to_string()],
+                allowed_namespaces: vec![],
+            },
+        );
+        assert!(
+            !inbound_write_namespace_authorized(
+                "memories",
+                "id-1",
+                "public/ok",
+                None,
+                &unscoped,
+                Some("peer-1"),
+                true,
+            ),
+            "Layer 2 ON: an enrolled peer declaring no scope is refused"
+        );
+        assert!(
+            inbound_write_namespace_authorized(
+                "memories",
+                "id-1",
+                "public/ok",
+                None,
+                &unscoped,
+                Some("peer-1"),
+                false,
+            ),
+            "Layer 2 OFF: the staged-rollout opt-out restores the legacy posture"
+        );
+    }
+
+    #[test]
     fn fed_require_sig_defaults_flipped_strict_at_v1_0_0() {
         // #1801→#1954 item 5 — the v1.0.0 flip: BOTH lane consts are now `true`
         // (required), split out of the former single `FED_REQUIRE_SIG_DEFAULT`
