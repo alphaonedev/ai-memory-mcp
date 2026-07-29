@@ -871,8 +871,9 @@ mod tests {
                 .to_string();
             assert!(err.contains("unrecognised store URL"), "got: {err}");
         }
-        assert!(
-            !backup_dir.join("x").parent().unwrap().exists() || snapshot_count(&backup_dir) == 0,
+        assert_eq!(
+            snapshot_count(&backup_dir),
+            0,
             "a refused backup must leave no snapshot"
         );
     }
