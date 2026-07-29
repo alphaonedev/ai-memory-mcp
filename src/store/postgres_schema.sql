@@ -263,26 +263,19 @@ CREATE INDEX IF NOT EXISTS memories_scope_idx_idx ON memories (scope_idx);
 -- v0.6.0 / Ultrareview #342 — agent_id_idx (generated column) + created_at.
 CREATE INDEX IF NOT EXISTS idx_memories_agent_id ON memories (agent_id_idx);
 CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories (created_at);
--- v0.8.0 #1720 A1 — target_agent_id_idx (generated column) for the A2
--- owner-keyed `private` visibility clause. Mirrors SQLite migration v67.
-CREATE INDEX IF NOT EXISTS idx_memories_target_agent_id ON memories (target_agent_id_idx);
--- v0.6.3.1 P2 / G4 — partial index on embedding_dim for hot-spot doctor
--- queries and the per-namespace "first write establishes dim" check.
-CREATE INDEX IF NOT EXISTS idx_memories_embedding_dim
-    ON memories (embedding_dim)
-    WHERE embedding_dim IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_memories_ns_dim
-    ON memories (namespace, embedding_dim)
-    WHERE embedding_dim IS NOT NULL;
--- v0.9.0 G8 (schema v74, #1825) — content-address lookup on the additive
--- `cid` column (postgres mirror of the sqlite idx_memories_cid arm).
-CREATE INDEX IF NOT EXISTS idx_memories_cid ON memories (cid);
--- v1.0.0 (#2167, schema v84) — partial index on the embedding-space provenance
--- token (postgres mirror of the sqlite idx_memories_embedding_space arm) so the
--- recall `AND embedding_space = $fp` predicate stays cheap in the homogeneous
--- steady state (empty non-active range).
-CREATE INDEX IF NOT EXISTS idx_memories_embedding_space
-    ON memories (embedding_space) WHERE embedding_space IS NOT NULL;
+-- #2424 (v1.0.0 GA blocker) — the following `memories` indexes are
+-- DELIBERATELY NOT created here; each references a column the migrate LADDER
+-- adds via `ALTER TABLE memories ADD COLUMN`, and this bootstrap replays over
+-- LEGACY databases BEFORE the ladder runs (see the rule block below). They are
+-- LADDER-OWNED, and fresh installs still get every one because a fresh DB
+-- enters the ladder at version 0 and executes every arm:
+--   * idx_memories_target_agent_id  (`target_agent_id_idx`, v67 #1720 A1) — migrate_v67
+--   * idx_memories_embedding_dim    (`embedding_dim`, v0.6.3.1 P2/G4)     — migrate_v18
+--   * idx_memories_ns_dim           (`embedding_dim`, v0.6.3.1 P2/G4)     — migrate_v18
+--   * idx_memories_cid              (`cid`, v74 #1825 G8)                 — migrate_v74
+--   * idx_memories_embedding_space  (`embedding_space`, v84 #2167)        — migrate_v84
+-- Two live pre-v84 postgres deployments could not start v1.0.0 before this
+-- removal: v67–v73 died on `cid`, v74–v83 on `embedding_space`.
 -- Partial indexes that reference columns ALTER-added by the migrate
 -- ladder (`atom_of` / `atomised_into` v35 postgres ↔ v36 sqlite;
 -- `entity_id` v36 ↔ v37; `source_uri` v37 ↔ v38; `confidence_source`
@@ -298,13 +291,35 @@ CREATE INDEX IF NOT EXISTS idx_memories_embedding_space
 -- `ALTER TABLE memories ADD COLUMN IF NOT EXISTS` that adds the
 -- referenced column.
 --
--- `PostgresStore::connect` applies this bootstrap before `migrate`, so
--- any `CREATE INDEX` here referencing a v35+ column would crash on a
--- legacy DB whose pre-existing `memories` table makes the `CREATE TABLE
--- IF NOT EXISTS` above a no-op (the new columns never land). Fresh
--- installs are unaffected: the `CREATE TABLE` above carries every
--- v41-era column, then every `if current_version < N` arm runs its
--- (idempotent) .sql file to attach the partial index.
+-- ─────────────────────────────────────────────────────────────────────
+-- THE RULE (whole-file scope, mechanically enforced — do not re-derive it
+-- table by table). #797 stated it for `memories`; #1861 restated it on
+-- sqlite; #2424 proved it is a CLASS, not a per-table caveat, after a
+-- narrower reading let three new violations land at v67 / v74 / v84 and
+-- bricked two live deployments.
+--
+--   NO `CREATE INDEX` ANYWHERE IN THIS FILE MAY REFERENCE A COLUMN THAT
+--   THE MIGRATE LADDER ADDS VIA `ALTER TABLE … ADD COLUMN`.
+--
+-- Why: `PostgresStore::connect` executes this ENTIRE bootstrap on EVERY
+-- open — fresh AND legacy — and always BEFORE `migrate`. On a legacy DB
+-- the pre-existing table makes `CREATE TABLE IF NOT EXISTS` a no-op, so
+-- the ladder-added column is simply absent when the inline `CREATE INDEX`
+-- runs, and `connect()` dies. `IF NOT EXISTS` on the index does NOT save
+-- you: it is keyed on the INDEX NAME, so a legacy DB sitting below the arm
+-- that would have created it takes the CREATE path and errors on the
+-- missing column. The blast radius is total — the deployment cannot start.
+--
+-- Where such an index belongs: EXCLUSIVELY in the `migrate_vN` arm (or its
+-- migration .sql) that adds the column, which on a legacy DB runs AFTER the
+-- ALTER. Fresh installs lose nothing — `migrate_locked` reads
+-- `current_version = 0` on a fresh DB and executes EVERY arm, so
+-- `bootstrap(fresh)` and `ladder(v0 → tip)` converge on the same schema.
+-- That equivalence is the invariant; `scripts/check-migration-ladder.sh`
+-- rule (f) + `tests/migration_ladder_integrity.rs` enforce it statically on
+-- both adapters, and `tests/postgres_ladder_replay.rs` proves it against a
+-- live postgres by replaying populated legacy shapes up to the tip.
+-- ─────────────────────────────────────────────────────────────────────
 
 -- v0.7.0 Form 5 — per-recall shadow-mode telemetry. Populated when
 -- AI_MEMORY_CONFIDENCE_SHADOW=1 and sampled at
@@ -421,15 +436,13 @@ CREATE INDEX IF NOT EXISTS memory_links_target_idx ON memory_links (target_id);
 -- pre-exists WITHOUT the v75 cid columns — an index on the missing column
 -- would crash `connect()` on every legacy upgrade. `migrate_v75` owns the
 -- index on BOTH paths (fresh installs run the full ladder from 0).
-CREATE INDEX IF NOT EXISTS idx_links_temporal_src
-    ON memory_links (source_id, valid_from, valid_until);
-CREATE INDEX IF NOT EXISTS idx_links_temporal_tgt
-    ON memory_links (target_id, valid_from, valid_until);
-CREATE INDEX IF NOT EXISTS idx_links_relation
-    ON memory_links (relation, valid_from);
--- v0.7.0 H4 — `memory_verify` listing path probes by attest_level.
-CREATE INDEX IF NOT EXISTS idx_memory_links_attest_level
-    ON memory_links (attest_level, created_at);
+-- #2424 — same rule, same reason: `valid_from` / `valid_until` /
+-- `attest_level` are ladder-ALTER-added onto `memory_links`, so these four
+-- indexes are LADDER-OWNED and must NOT be inlined here:
+--   * idx_links_temporal_src / _tgt / idx_links_relation (v15) — migrate_v15
+--     + migrations/postgres/{0010_v063_hierarchy_kg,0029_v07_links_temporal_columns}.sql
+--   * idx_memory_links_attest_level (v23, #H4)           — migrate_v23
+--     + migrations/postgres/0029_v07_links_temporal_columns.sql
 
 -- ─────────────────────────────────────────────────────────────────────
 -- entity_aliases — alias→entity_id resolution (v0.6.3 Stream B/C).
@@ -635,8 +648,9 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 );
 
 CREATE INDEX IF NOT EXISTS subscriptions_url_idx ON subscriptions (url);
-CREATE INDEX IF NOT EXISTS idx_subscriptions_event_types
-    ON subscriptions (event_types);
+-- #2424 — `idx_subscriptions_event_types` is LADDER-OWNED (migrate_v19): it
+-- indexes the v19 ALTER-added `subscriptions.event_types` column, so inlining
+-- it here would crash `connect()` on any pre-v19 database.
 
 -- ─────────────────────────────────────────────────────────────────────
 -- audit_log — capability-expansion audit (v0.6.4-009, NHI guardrails
@@ -698,12 +712,12 @@ CREATE TABLE IF NOT EXISTS memory_transcripts (
 
 CREATE INDEX IF NOT EXISTS idx_memory_transcripts_namespace_created
     ON memory_transcripts (namespace, created_at);
--- v0.7.0 I3 — partial index on archived rows so the prune-phase scan
--- stays O(archived) rather than O(total transcripts) on busy
--- namespaces. Mirrors SQLite migration 0019_v07_transcript_lifecycle.
-CREATE INDEX IF NOT EXISTS idx_memory_transcripts_archived_at
-    ON memory_transcripts (archived_at)
-    WHERE archived_at IS NOT NULL;
+-- v0.7.0 I3 — the archived-rows partial index that keeps the prune-phase
+-- scan O(archived) rather than O(total transcripts)
+-- (`idx_memory_transcripts_archived_at`) is LADDER-OWNED (migrate_v25): it
+-- indexes the v25 ALTER-added `memory_transcripts.archived_at` column, so
+-- inlining it here would crash `connect()` on any pre-v25 database (#2424).
+-- Mirrors SQLite migration 0019_v07_transcript_lifecycle.
 
 -- ─────────────────────────────────────────────────────────────────────
 -- memory_transcript_links — m:n join between memories and transcripts
@@ -768,7 +782,10 @@ CREATE TABLE IF NOT EXISTS signed_events (
 CREATE INDEX IF NOT EXISTS idx_signed_events_agent     ON signed_events (agent_id);
 CREATE INDEX IF NOT EXISTS idx_signed_events_type      ON signed_events (event_type);
 CREATE INDEX IF NOT EXISTS idx_signed_events_timestamp ON signed_events (timestamp);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_signed_events_sequence ON signed_events (sequence);
+-- #2424 — the V-4 chain uniqueness index `idx_signed_events_sequence` is
+-- LADDER-OWNED (migrate_v33 / migrations/postgres/0015_v07_signed_events_chain.sql):
+-- it indexes the v33 ALTER-added `signed_events.sequence` column, so inlining
+-- it here would crash `connect()` on any pre-v33 database.
 
 -- ─────────────────────────────────────────────────────────────────────
 -- agent_lineage — identity-lineage succession chain
@@ -841,10 +858,24 @@ CREATE INDEX IF NOT EXISTS idx_model_attestations_family
 -- root's Ed25519 over those bytes; `revoked` is the additive revocation
 -- flag (FALSE = live). The principal-ROOT pubkey is deliberately NOT
 -- stored (the enrolled key is the sole trust authority; stage-3 verify
--- fetches it from the agent binding). Unlike sqlite, postgres carries the
--- lookup index inline (the bootstrap schema is applied only at fresh
--- schema-init, never replayed over a legacy DB, so the #1861 sqlite
--- crash-on-legacy-open hazard does not apply — cf. idx_memories_cid).
+-- fetches it from the agent binding).
+--
+-- #2424 — this block used to claim "the bootstrap schema is applied only at
+-- fresh schema-init, never replayed over a legacy DB, so the #1861 sqlite
+-- crash-on-legacy-open hazard does not apply". That was FALSE:
+-- `PostgresStore::connect` replays this whole file on EVERY open (see THE
+-- RULE above), and the belief is what armed the v67 / v74 / v84 inline
+-- indexes that bricked two live deployments. The claim is deleted; do not
+-- reintroduce it in any form.
+--
+-- `idx_agent_subkey_certs_instance` below is nonetheless legal under THE
+-- RULE, for a reason that has nothing to do with that false claim:
+-- `instance_key_id` is a column of the `CREATE TABLE` immediately below and
+-- is NEVER `ALTER`-added by any ladder arm. A pre-v79 database has no
+-- `agent_subkey_certs` relation at all, so the `CREATE TABLE IF NOT EXISTS`
+-- actually creates it — columns and all — and the index then has its column.
+-- The hazard is exclusively "index on a column the ladder ALTER-adds to a
+-- table that may PRE-EXIST"; a wholly-new table is not that shape.
 -- ─────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS agent_subkey_certs (
     id                 TEXT NOT NULL PRIMARY KEY,
@@ -1000,8 +1031,9 @@ CREATE TABLE IF NOT EXISTS subscription_events (
     delivery_status TEXT NOT NULL DEFAULT 'pending'
 );
 
-CREATE INDEX IF NOT EXISTS idx_subscription_events_correlation
-    ON subscription_events (correlation_id);
+-- #2424 — `idx_subscription_events_correlation` is LADDER-OWNED
+-- (migrate_v27): it indexes the v27 ALTER-added
+-- `subscription_events.correlation_id` column.
 CREATE INDEX IF NOT EXISTS idx_subscription_events_subscription
     ON subscription_events (subscription_id, delivered_at);
 
@@ -1095,10 +1127,10 @@ CREATE INDEX IF NOT EXISTS idx_recall_observations_memory_id
     ON recall_observations(memory_id);
 CREATE INDEX IF NOT EXISTS idx_recall_observations_observed_at
     ON recall_observations(observed_at);
-CREATE INDEX IF NOT EXISTS idx_recall_observations_agent_id
-    ON recall_observations(agent_id);
-CREATE INDEX IF NOT EXISTS idx_recall_observations_namespace
-    ON recall_observations(namespace);
+-- #2424 — `idx_recall_observations_agent_id` + `_namespace` are LADDER-OWNED
+-- (migrate_v58): they index the v58 (#1705) ALTER-added `agent_id` /
+-- `namespace` columns, so inlining them here would crash `connect()` on any
+-- pre-v58 database.
 -- v77 (#1869) — the partial unfolded index
 -- (`idx_recall_observations_unfolded ON recall_observations(memory_id)
 -- WHERE NOT folded`) is LADDER-OWNED (migrate_v77 / the 0036 file),
