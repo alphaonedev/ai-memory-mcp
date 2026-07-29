@@ -1440,8 +1440,19 @@ mod tests {
         .unwrap();
     }
 
+    /// v1.0.0 #2445 — an above-MAX (newer-than-binary) schema is now
+    /// REFUSED at `db::open` rather than opened-with-a-warning.
+    ///
+    /// Pre-#2445 this test asserted `run(...).unwrap()` plus a
+    /// `WarnSchemaUnsupported` advisory: the binary OPENED the newer
+    /// database and proceeded with "degraded context" — i.e. it read and
+    /// would write a schema it does not understand. That advisory posture
+    /// IS the #2445 defect. `boot` still exits 0 and still emits a warn
+    /// header (it must never break an agent's session start), but the
+    /// status is now `WarnDbUnavailable`: the substrate refused to hand
+    /// out a connection at all.
     #[test]
-    fn boot_warns_on_schema_above_max() {
+    fn boot_refuses_schema_above_max() {
         let _g = test_lock();
         let mut env = TestEnv::fresh();
         seed_memory(&env.db_path, "ns-drift", "row", "x");
@@ -1456,20 +1467,18 @@ mod tests {
         let mut out = env.output();
         run(&db_path, &args, &cfg, &mut out).unwrap();
         let stdout = std::str::from_utf8(&env.stdout).unwrap();
+        let stderr = std::str::from_utf8(&env.stderr).unwrap();
         assert!(
             stdout.contains("# ai-memory boot: warn"),
-            "expected warn header for schema drift: {stdout}"
+            "expected warn header when the db is refused: {stdout}"
         );
         assert!(
-            stdout.contains("unsupported by binary"),
-            "expected schema-drift message text: {stdout}"
+            stdout.contains("db unavailable"),
+            "expected db-unavailable status after the #2445 refusal: {stdout}"
         );
         assert!(
-            stdout.contains(&format!(
-                "v{}..v{}",
-                MIN_SUPPORTED_SCHEMA, MAX_SUPPORTED_SCHEMA
-            )),
-            "expected supported range in message: {stdout}"
+            stderr.contains("NEWER than this binary supports"),
+            "expected the #2445 refusal reason on stderr: {stderr}"
         );
     }
 

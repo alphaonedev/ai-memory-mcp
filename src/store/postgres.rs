@@ -746,6 +746,52 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
 const CURRENT_SCHEMA_VERSION: i32 = 87;
 
+/// v1.0.0 #2445 — existence probe for the `schema_version` relation, the
+/// postgres twin of the sqlite `sqlite_master` probe. Lets the downgrade
+/// guard tell "greenfield database" (relation absent) apart from "the
+/// version read FAULTED", which must never be read as version 0.
+const PG_SCHEMA_VERSION_TABLE_PROBE_SQL: &str = "SELECT to_regclass('schema_version') IS NOT NULL";
+
+/// v1.0.0 #2445 — read the on-disk schema stamp fail-closed.
+///
+/// Relation absent is the ONLY condition that yields `0` (a greenfield
+/// database the bootstrap is about to initialise); every other failure
+/// propagates, so a transient read fault can never be laundered into
+/// "this database is empty, run the whole v1→tip ladder against it".
+async fn pg_read_on_disk_schema_version(pool: &sqlx::PgPool) -> StoreResult<i64> {
+    let present: bool = sqlx::query_scalar(PG_SCHEMA_VERSION_TABLE_PROBE_SQL)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| to_store_err("probe for schema_version relation", e))?;
+    if !present {
+        return Ok(0);
+    }
+    let version: Option<i32> =
+        sqlx::query_scalar(crate::storage::migrations::SELECT_SCHEMA_VERSION_SQL)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| to_store_err(crate::errors::msg::READ_SCHEMA_VERSION, e))?;
+    Ok(i64::from(version.unwrap_or(0)))
+}
+
+/// v1.0.0 #2445 — postgres arm of the schema-DOWNGRADE guard.
+///
+/// Delegates the decision AND the operator-facing refusal text to the
+/// backend-neutral SSOT in `crate::storage::migrations`, so an operator
+/// who hits this on postgres reads the identical remedy ladder a sqlite
+/// operator reads. Only the error TYPE differs (`StoreError` vs
+/// `anyhow`), matching each adapter's existing convention.
+fn pg_ensure_no_schema_downgrade(on_disk: i64) -> StoreResult<()> {
+    crate::storage::migrations::ensure_no_schema_downgrade(
+        on_disk,
+        i64::from(CURRENT_SCHEMA_VERSION),
+    )
+    .map_err(|e| StoreError::BackendUnavailable {
+        backend: "postgres".to_string(),
+        detail: format!("{e}"),
+    })
+}
+
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
 /// in-process parallel `connect()` calls. Without this lock, racing
@@ -1084,6 +1130,16 @@ impl PostgresStore {
             // The retry loop is still in place as defense-in-depth for any
             // residual catalog-level race the advisory lock can't cover
             // (e.g., a third process bypassing the lock entirely).
+            // v1.0.0 #2445 — schema-DOWNGRADE guard, probed BEFORE the
+            // bootstrap DDL. `INIT_SCHEMA` is replayed on EVERY connect;
+            // its `IF NOT EXISTS` guards key on object NAMES, so against a
+            // newer database an older binary would still issue DDL for
+            // objects a later version reshaped. Refuse before writing
+            // anything. Held under the bootstrap advisory lock, so this
+            // reads a settled version rather than racing a concurrent
+            // migrator.
+            pg_ensure_no_schema_downgrade(pg_read_on_disk_schema_version(&pool).await?)?;
+
             let init_sql = render_schema_sql(INIT_SCHEMA, dim);
             let mut last_err: Option<sqlx::Error> = None;
             for attempt in 0..5_u32 {
@@ -1640,6 +1696,12 @@ impl PostgresStore {
                 .map_err(|e| to_store_err(crate::errors::msg::READ_SCHEMA_VERSION, e))?;
 
         let current_version = current_version.unwrap_or(0);
+
+        // v1.0.0 #2445 — DOWNGRADE guard, BEFORE the `>=` no-op fast path.
+        // `==` still returns Ok below; only a STRICTLY newer on-disk schema
+        // refuses. Backstop for any caller that reaches the ladder without
+        // crossing `connect()` (which probes before INIT_SCHEMA too).
+        pg_ensure_no_schema_downgrade(i64::from(current_version))?;
 
         if current_version >= CURRENT_SCHEMA_VERSION {
             return Ok(());

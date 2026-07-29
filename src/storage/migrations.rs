@@ -33,6 +33,13 @@ use std::path::PathBuf;
 pub(crate) const SELECT_SCHEMA_VERSION_SQL: &str =
     "SELECT COALESCE(MAX(version), 0) FROM schema_version";
 
+/// v1.0.0 #2445 — existence probe for the `schema_version` table, so the
+/// downgrade guard can tell "genuinely fresh database" (table absent)
+/// apart from "the version read FAULTED" (which must never be read as
+/// version 0 — see [`read_on_disk_schema_version`]).
+const SCHEMA_VERSION_TABLE_PROBE_SQL: &str =
+    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version')";
+
 /// Column-introspection statement shared by the additive-column
 /// migration arms (one spelling; pm-v3.1 hardcoded-literal gate,
 /// #1558 wave 4).
@@ -978,6 +985,175 @@ pub const fn current_schema_version() -> i64 {
     CURRENT_SCHEMA_VERSION
 }
 
+/// v1.0.0 #2445 — env escape hatch for the open-time schema-DOWNGRADE
+/// guard.
+///
+/// **Not a boolean.** The value MUST be the EXACT on-disk schema version
+/// the operator is sanctioning (e.g. `AI_MEMORY_ALLOW_SCHEMA_DOWNGRADE=88`
+/// against a v88 database). A bare `1` / `true` does NOT open the hatch.
+/// The version-exact grammar makes the sanction SINGLE-SHOT and
+/// SELF-EXPIRING: an operator who bakes the variable into a systemd unit
+/// or container image for one rollback cannot silently blanket-permit an
+/// arbitrarily larger gap at the next schema bump — the stale value stops
+/// matching and the guard closes again. (A plain bool hatch was rejected
+/// 3/3 by the #2445 3x3 adversarial vote precisely because it never
+/// expires across a fleet.) Ignored entirely under the `asi-hard`
+/// security posture (#130): loosening a fail-closed data-integrity guard
+/// is exactly what that posture forbids.
+pub const ALLOW_SCHEMA_DOWNGRADE_ENV: &str = "AI_MEMORY_ALLOW_SCHEMA_DOWNGRADE";
+
+/// Outcome of the #2445 downgrade decision. Pure data — produced by
+/// [`downgrade_verdict`] so the whole precedence matrix is testable
+/// without touching process-global env.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DowngradeVerdict {
+    /// On-disk version is at or below what this binary's ladder targets.
+    /// The normal path — includes the `==` no-op fast path.
+    Compatible,
+    /// On-disk version is NEWER, but the operator pinned the escape hatch
+    /// to exactly this observed version. Proceed with a loud WARN.
+    Sanctioned,
+    /// On-disk version is NEWER and unsanctioned. Refuse to open.
+    Refuse,
+}
+
+/// Pure core of the #2445 guard: decide what to do about an on-disk
+/// schema stamp of `on_disk` against a binary whose ladder targets
+/// `binary`.
+///
+/// `hatch_raw` is the raw [`ALLOW_SCHEMA_DOWNGRADE_ENV`] value (`None`
+/// when unset); `asi_hard` is `crate::security_profile::is_asi_hard()`.
+/// Both are passed in rather than read here so the precedence matrix is
+/// exercised with ZERO env mutation (the `src/security_profile.rs`
+/// process-global-env hazard note).
+pub(crate) fn downgrade_verdict(
+    on_disk: i64,
+    binary: i64,
+    hatch_raw: Option<&str>,
+    asi_hard: bool,
+) -> DowngradeVerdict {
+    if on_disk <= binary {
+        return DowngradeVerdict::Compatible;
+    }
+    if asi_hard {
+        // The hardened posture pins fail-closed knobs ON and refuses any
+        // operator-set loosening below the hard floor (#1961 R23/R7). An
+        // ALLOW hatch over a data-integrity guard is such a loosening, so
+        // it is INERT here rather than silently honoured.
+        return DowngradeVerdict::Refuse;
+    }
+    match hatch_raw.map(str::trim).and_then(|v| v.parse::<i64>().ok()) {
+        Some(sanctioned) if sanctioned == on_disk => DowngradeVerdict::Sanctioned,
+        _ => DowngradeVerdict::Refuse,
+    }
+}
+
+/// The operator-facing refusal text. One spelling shared by BOTH
+/// adapters (sqlite `migrate` / `db::open`, postgres `connect` /
+/// `migrate_locked`) so the remedy an operator reads is identical on
+/// either backend.
+///
+/// The remedy ladder is stated explicitly because a guard with no
+/// documented recovery is a support burden — and this refusal fires on
+/// the second half of every canary deployment, when the operator is
+/// already under pressure:
+///
+/// 1. **Re-install the newer binary.** A downgrade's real fix is not
+///    downgrading. This restores service immediately and loses nothing.
+/// 2. **Restore the pre-upgrade snapshot.** The sqlite ladder writes one
+///    automatically before any schema mutation
+///    (`<db>.pre-migration-v<FROM>-to-v<TO>-<token>.bak`, see
+///    [`snapshot_before_migration`] / [`PRE_MIGRATION_BACKUP_INFIX`]);
+///    postgres operators use their own `pg_dump` snapshot. Stop the
+///    daemon, copy the snapshot over the live file (removing stale
+///    `-wal`/`-shm` siblings), start the OLD binary.
+/// 3. **Last resort** — sanction the mismatch with
+///    `AI_MEMORY_ALLOW_SCHEMA_DOWNGRADE=<observed version>`. The older
+///    binary then reads and writes a schema it does not understand:
+///    columns and tables added after its ladder tip are invisible to it
+///    and are NOT maintained on write. Accept only with a fresh backup
+///    in hand.
+fn schema_downgrade_refusal(on_disk: i64, binary: i64) -> String {
+    format!(
+        "refusing to open: database schema v{on_disk} is NEWER than this binary supports \
+         (v{binary}). An older binary writing a newer schema silently corrupts it. \
+         Remedy, in order: (1) re-install the newer ai-memory binary; \
+         (2) stop the daemon and restore the pre-upgrade snapshot taken before the \
+         schema-mutating migration (sqlite: the sibling \
+         `{PRE_MIGRATION_BACKUP_INFIX}` file next to the database; postgres: your \
+         pg_dump), then start this binary against it; \
+         (3) last resort, accept the risk explicitly with \
+         `{ALLOW_SCHEMA_DOWNGRADE_ENV}={on_disk}` — the exact observed version, not a \
+         boolean — after taking a fresh backup."
+    )
+}
+
+/// v1.0.0 #2445 — the open-time schema-DOWNGRADE guard.
+///
+/// An on-disk version STRICTLY GREATER than the binary's ladder tip is
+/// the downgrade case (`==` stays the no-op fast path). Fail-closed by
+/// default; see [`ALLOW_SCHEMA_DOWNGRADE_ENV`] for the escape hatch and
+/// [`schema_downgrade_refusal`] for the documented recovery ladder.
+///
+/// # Errors
+///
+/// Returns the refusal error when the on-disk schema is newer than this
+/// binary's and no exact-version sanction is present.
+pub(crate) fn ensure_no_schema_downgrade(on_disk: i64, binary: i64) -> Result<()> {
+    let hatch = std::env::var(ALLOW_SCHEMA_DOWNGRADE_ENV).ok();
+    match downgrade_verdict(
+        on_disk,
+        binary,
+        hatch.as_deref(),
+        crate::security_profile::is_asi_hard(),
+    ) {
+        DowngradeVerdict::Compatible => Ok(()),
+        DowngradeVerdict::Sanctioned => {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                on_disk_version = on_disk,
+                binary_version = binary,
+                "#2445 schema-downgrade guard OVERRIDDEN by operator sanction \
+                 ({ALLOW_SCHEMA_DOWNGRADE_ENV}={on_disk}): this binary will read and \
+                 WRITE a newer schema. Post-tip columns/tables are invisible to it and \
+                 are NOT maintained. Take a backup."
+            );
+            Ok(())
+        }
+        DowngradeVerdict::Refuse => Err(anyhow::anyhow!(schema_downgrade_refusal(on_disk, binary))),
+    }
+}
+
+/// Read the on-disk schema stamp, distinguishing "genuinely fresh"
+/// from "the probe failed".
+///
+/// The ladder's own read uses `.unwrap_or(0)`, which collapses a read
+/// FAULT into "version 0" — on a newer database that would hand the
+/// whole v1→tip ladder a schema it must not touch, i.e. the guard would
+/// become the corruption vector. So this probe checks `sqlite_master`
+/// first (a read that works on any openable database): table ABSENT is
+/// the only thing that means fresh; every other failure propagates.
+///
+/// # Errors
+///
+/// Propagates the `sqlite_master` probe failure, or any error reading
+/// the `schema_version` row once the table is known to exist.
+pub(crate) fn read_on_disk_schema_version(conn: &Connection) -> Result<i64> {
+    let table_present: bool = conn
+        .query_row(SCHEMA_VERSION_TABLE_PROBE_SQL, [], |r| r.get(0))
+        .context("probe for schema_version table")?;
+    if !table_present {
+        return Ok(0);
+    }
+    match conn.query_row(SELECT_SCHEMA_VERSION_SQL, [], |r| r.get(0)) {
+        Ok(v) => Ok(v),
+        // COALESCE(MAX(...)) always returns a row, but an empty table on
+        // some builds surfaces as no-rows; treat only that as fresh.
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+        Err(e) => Err(anyhow::Error::new(e).context("read schema_version stamp")),
+    }
+}
+
 const MIGRATION_V15_SQLITE: &str =
     include_str!("../../migrations/sqlite/0010_v063_hierarchy_kg.sql");
 // v0.6.3.1 (P4, audit G1): backfill `metadata.governance.inherit = true`
@@ -1527,6 +1703,15 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     let version: i64 = conn
         .query_row(SELECT_SCHEMA_VERSION_SQL, [], |r| r.get(0))
         .unwrap_or(0);
+
+    // v1.0.0 #2445 — DOWNGRADE guard, BEFORE the `>=` no-op fast path.
+    // `version == CURRENT_SCHEMA_VERSION` keeps returning Ok below; only a
+    // STRICTLY newer on-disk schema refuses. This is the backstop for
+    // callers that reach the ladder without crossing `db::open` (the
+    // recover path, direct SAL callers); `db::open` additionally probes
+    // BEFORE replaying the bootstrap `SCHEMA` DDL, so an older binary's
+    // CREATE-IF-NOT-EXISTS batch never touches a newer database either.
+    ensure_no_schema_downgrade(version, CURRENT_SCHEMA_VERSION)?;
 
     if version >= CURRENT_SCHEMA_VERSION {
         return Ok(());
@@ -4770,8 +4955,35 @@ mod tests {
 
     #[test]
     fn migrate_no_op_when_version_already_current() {
-        // Fast-path: `version >= CURRENT_SCHEMA_VERSION` returns
-        // immediately without entering the EXCLUSIVE transaction.
+        // Fast-path: `version == CURRENT_SCHEMA_VERSION` returns
+        // immediately without entering the EXCLUSIVE transaction, and
+        // WITHOUT tripping the #2445 downgrade guard (which fires only on
+        // a STRICTLY newer stamp).
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        conn.execute("DELETE FROM schema_version", []).unwrap();
+        conn.execute(
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            params![CURRENT_SCHEMA_VERSION],
+        )
+        .unwrap();
+        super::migrate(&conn).expect("at-current is a no-op");
+        assert_eq!(
+            current_version(&conn),
+            CURRENT_SCHEMA_VERSION,
+            "fast-path must not move the version stamp"
+        );
+    }
+
+    /// v1.0.0 #2445 — an on-disk schema NEWER than this binary's ladder
+    /// tip is REFUSED, not silently accepted as a no-op.
+    ///
+    /// This is the arm that used to read `migrate(&conn).expect(
+    /// "ahead-of-current is a no-op")` — the codified statement of the
+    /// very defect #2445 reports. The stamp must survive untouched: a
+    /// refusal is not licence to rewrite the newer database's version.
+    #[test]
+    fn migrate_refuses_when_on_disk_schema_is_newer() {
         let conn = Connection::open_in_memory().expect("in-memory db");
         conn.execute_batch(SCHEMA).expect("apply SCHEMA");
         conn.execute("DELETE FROM schema_version", []).unwrap();
@@ -4780,13 +4992,155 @@ mod tests {
             params![CURRENT_SCHEMA_VERSION + 5],
         )
         .unwrap();
-        // Even when ahead of current, the no-op path returns Ok().
-        super::migrate(&conn).expect("ahead-of-current is a no-op");
-        let v = current_version(&conn);
+        let err = super::migrate(&conn).expect_err("newer schema must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("NEWER than this binary supports"),
+            "refusal must name the downgrade condition: {msg}"
+        );
+        assert!(
+            msg.contains(ALLOW_SCHEMA_DOWNGRADE_ENV),
+            "refusal must name the escape hatch: {msg}"
+        );
         assert_eq!(
-            v,
+            current_version(&conn),
             CURRENT_SCHEMA_VERSION + 5,
-            "fast-path must not overwrite a newer version stamp"
+            "a refusal must not rewrite the newer version stamp"
+        );
+    }
+
+    /// v1.0.0 #2445 — precedence matrix for the downgrade resolver,
+    /// co-located with the resolver as CLAUDE.md requires.
+    ///
+    /// Exercised through the PURE [`super::downgrade_verdict`] so the
+    /// whole matrix runs with ZERO process-global env mutation (the
+    /// `src/security_profile.rs` env-leak hazard); the thin
+    /// env-reading wrapper is covered by
+    /// [`allow_schema_downgrade_env_is_read_by_the_wrapper`].
+    #[test]
+    fn downgrade_verdict_precedence_matrix() {
+        use super::{DowngradeVerdict as V, downgrade_verdict as verdict};
+        let tip = CURRENT_SCHEMA_VERSION;
+
+        // Compatible: older, equal — hatch state is irrelevant.
+        assert_eq!(verdict(tip - 1, tip, None, false), V::Compatible);
+        assert_eq!(verdict(tip, tip, None, false), V::Compatible);
+        assert_eq!(verdict(0, tip, None, false), V::Compatible);
+        assert_eq!(verdict(tip, tip, None, true), V::Compatible);
+
+        // Newer + no hatch -> refuse (the fail-closed default).
+        assert_eq!(verdict(tip + 1, tip, None, false), V::Refuse);
+
+        // Newer + EXACT-version hatch -> sanctioned.
+        assert_eq!(
+            verdict(tip + 1, tip, Some(&(tip + 1).to_string()), false),
+            V::Sanctioned
+        );
+        // Surrounding whitespace is tolerated (env values often carry it).
+        assert_eq!(
+            verdict(tip + 1, tip, Some(&format!("  {}  ", tip + 1)), false),
+            V::Sanctioned
+        );
+
+        // A BOOLEAN hatch does NOT open the guard — this is the whole
+        // point of the version-exact grammar.
+        for boolish in ["1", "true", "yes", "on", "TRUE"] {
+            assert_eq!(
+                verdict(tip + 1, tip, Some(boolish), false),
+                V::Refuse,
+                "boolean hatch value {boolish:?} must NOT sanction a downgrade"
+            );
+        }
+
+        // A STALE sanction (pinned to a different version) still refuses —
+        // the self-expiring property that makes the hatch fleet-safe.
+        assert_eq!(
+            verdict(tip + 2, tip, Some(&tip.to_string()), false),
+            V::Refuse
+        );
+        assert_eq!(
+            verdict(tip + 2, tip, Some(&(tip + 1).to_string()), false),
+            V::Refuse
+        );
+
+        // Garbage / empty falls through to refuse (never widens).
+        for junk in ["", "  ", "abc", "88x", "-1"] {
+            assert_eq!(
+                verdict(tip + 1, tip, Some(junk), false),
+                V::Refuse,
+                "unparseable hatch value {junk:?} must refuse"
+            );
+        }
+
+        // asi-hard (#130) makes the loosening hatch INERT even when it
+        // names the exact observed version.
+        assert_eq!(
+            verdict(tip + 1, tip, Some(&(tip + 1).to_string()), true),
+            V::Refuse
+        );
+    }
+
+    /// The env-reading wrapper actually consults
+    /// [`ALLOW_SCHEMA_DOWNGRADE_ENV`]. One env-touching test only; it
+    /// holds the crate-canonical lock and clears the variable through an
+    /// RAII guard declared AFTER the lock guard, so the guard drops FIRST
+    /// and the variable is never observable to a concurrent test.
+    #[test]
+    fn allow_schema_downgrade_env_is_read_by_the_wrapper() {
+        struct ClearOnDrop;
+        impl Drop for ClearOnDrop {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var(ALLOW_SCHEMA_DOWNGRADE_ENV) };
+            }
+        }
+        let _lock = crate::config::test_env_lock();
+        let _clear = ClearOnDrop;
+
+        let tip = CURRENT_SCHEMA_VERSION;
+        unsafe { std::env::remove_var(ALLOW_SCHEMA_DOWNGRADE_ENV) };
+        assert!(
+            super::ensure_no_schema_downgrade(tip + 1, tip).is_err(),
+            "unset hatch must fail closed"
+        );
+
+        unsafe { std::env::set_var(ALLOW_SCHEMA_DOWNGRADE_ENV, (tip + 1).to_string()) };
+        assert!(
+            super::ensure_no_schema_downgrade(tip + 1, tip).is_ok(),
+            "exact-version hatch must be honoured by the env wrapper"
+        );
+
+        unsafe { std::env::set_var(ALLOW_SCHEMA_DOWNGRADE_ENV, "1") };
+        assert!(
+            super::ensure_no_schema_downgrade(tip + 1, tip).is_err(),
+            "a boolean hatch value must not open the guard"
+        );
+    }
+
+    /// The fail-closed version probe: table ABSENT means fresh (0); a
+    /// present-but-empty table also means fresh. Anything else would
+    /// have to propagate rather than be laundered into 0.
+    #[test]
+    fn on_disk_version_probe_distinguishes_absent_from_stamped() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        assert_eq!(
+            super::read_on_disk_schema_version(&conn).expect("absent table probes clean"),
+            0,
+            "no schema_version table == genuinely fresh"
+        );
+        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        conn.execute("DELETE FROM schema_version", []).unwrap();
+        assert_eq!(
+            super::read_on_disk_schema_version(&conn).expect("empty table probes clean"),
+            0
+        );
+        conn.execute(
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            params![CURRENT_SCHEMA_VERSION + 9],
+        )
+        .unwrap();
+        assert_eq!(
+            super::read_on_disk_schema_version(&conn).expect("stamped table probes clean"),
+            CURRENT_SCHEMA_VERSION + 9
         );
     }
 

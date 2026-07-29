@@ -155,6 +155,20 @@ pub fn open(path: &Path) -> Result<Connection> {
     // the P1 A/B evidence + override ladder.
     conn.pragma_update(None, "mmap_size", db_mmap_size())?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // v1.0.0 #2445 — schema-DOWNGRADE guard, probed BEFORE any DDL runs.
+    // `execute_batch(SCHEMA)` below replays this binary's ENTIRE bootstrap
+    // schema on every open; its statements are `IF NOT EXISTS`, but that
+    // keys on the object NAME, so against a newer database an older binary
+    // would still (re)create objects a later version renamed or dropped —
+    // DDL authored by a binary already judged incompetent to hold this
+    // data. Probe first, refuse first. Placed after `apply_sqlcipher_key`
+    // so an encrypted database is readable by the time we look.
+    // The probe distinguishes table-absent (genuinely fresh) from a read
+    // fault, so a fault can never be mistaken for "version 0".
+    crate::storage::migrations::ensure_no_schema_downgrade(
+        crate::storage::migrations::read_on_disk_schema_version(&conn)?,
+        crate::storage::migrations::current_schema_version(),
+    )?;
     conn.execute_batch(SCHEMA)
         .context("failed to initialize schema")?;
     migrate(&conn)?;
