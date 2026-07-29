@@ -698,17 +698,46 @@ jobs:
         env:
           TAG: ${{ needs.preflight.outputs.tag }}
 
-      - name: Download release assets and compute SHA256
+      # #2449 - the hash pinned into the Homebrew formula is now CROSS-CHECKED
+      # against the published .sha256 rather than simply being whatever this
+      # job happened to download.
+      #
+      # Previously this step ran `curl -sL` (note: no `-f`, so an HTTP error
+      # body was saved as if it were the tarball), hashed the result, and
+      # pinned that hash into the formula. The formula therefore attested to
+      # the bytes THIS JOB received, not to the bytes the release publishes -
+      # so a corrupted or substituted download would have been faithfully
+      # pinned as authoritative, and every subsequent `brew install` would
+      # have verified against it successfully. Now that the release job
+      # publishes a .sha256 for every artifact, the two can be compared, and
+      # any disagreement fails the job instead of minting a formula.
+      - name: Download release assets, verify, and pin SHA256
         id: sha
         run: |
+          set -euo pipefail
           VERSION=${{ steps.version.outputs.version }}
           BASE="https://github.com/alphaonedev/ai-memory-mcp/releases/download/v${VERSION}"
 
           for TARGET in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
-            curl -sL -o "ai-memory-${TARGET}.tar.gz" "${BASE}/ai-memory-${TARGET}.tar.gz"
-            SHA=$(sha256sum "ai-memory-${TARGET}.tar.gz" | cut -d' ' -f1)
+            ASSET="ai-memory-${TARGET}.tar.gz"
+            # -f so an HTTP error page can never be mistaken for the tarball.
+            curl -fsSL -o "$ASSET" "${BASE}/${ASSET}"
+            curl -fsSL -o "${ASSET}.sha256" "${BASE}/${ASSET}.sha256"
+
+            EXPECTED=$(awk 'NR == 1 { print $1 }' "${ASSET}.sha256" | tr -d '\r' | tr 'A-F' 'a-f')
+            ACTUAL=$(sha256sum "$ASSET" | cut -d' ' -f1)
+
+            if ! printf '%s' "$EXPECTED" | grep -Eq '^[0-9a-f]{64}$'; then
+              echo "::error::${ASSET}.sha256 does not contain a valid SHA-256 digest"
+              exit 1
+            fi
+            if [ "$EXPECTED" != "$ACTUAL" ]; then
+              echo "::error::checksum mismatch for ${ASSET} (published ${EXPECTED}, downloaded ${ACTUAL}) - refusing to mint a Homebrew formula"
+              exit 1
+            fi
+
             SAFE=$(echo "$TARGET" | tr '-' '_')
-            echo "sha_${SAFE}=${SHA}" >> "$GITHUB_OUTPUT"
+            echo "sha_${SAFE}=${ACTUAL}" >> "$GITHUB_OUTPUT"
           done
 
       - name: Checkout Homebrew tap
