@@ -631,6 +631,254 @@ fn apply_screened_inbound(
     signed_surface_mutated
 }
 
+// ---------------------------------------------------------------------------
+// #2447 (CWE-284) — namespace confinement for the inbound WRITE lane.
+// ---------------------------------------------------------------------------
+
+/// Env knob gating the STRICT (default-deny) posture of the #2447 inbound
+/// write-lane namespace scope check — the write-lane sibling of
+/// [`REQUIRE_SIGNAL_SIG_ENV`] (#1843 Layer 2).
+pub const REQUIRE_PUSH_NAMESPACE_SCOPE_ENV: &str = "AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE";
+
+/// Whether an inbound `/sync/push` `memories[]` write from an ENROLLED peer
+/// that declares NO `allowed_namespaces` must be REFUSED — full default-deny
+/// parity with the `/sync/since` pull lane, where an empty list already means
+/// "may pull nothing" (`PeerScope::allowed_namespaces`).
+///
+/// **Default fail-closed (`true`)**, via the shared [`env_flag_default_on`]
+/// grammar every `AI_MEMORY_FED_REQUIRE_*` knob uses (#87/#94/#96/#125/#132 are
+/// 7-for-7 default-ON at v1.0.0 — federation inbound IS the network surface,
+/// ruling `9e9c3cf2` condition 7). An explicit falsy token
+/// (`0`/`false`/`no`/`off`) is the staged-rollout opt-out.
+///
+/// **This knob CANNOT brick zero-config federation**, because the gate that
+/// reads it is itself gated on [`PeerAttestationConfig::has_allowlist`]: with
+/// no `AI_MEMORY_FED_PEER_ATTESTATION` configured the check never runs. Its
+/// entire blast radius is ONE config shape — the operator wrote the peer JSON,
+/// enrolled this peer, and left `allowed_namespaces` empty/absent (it is
+/// `#[serde(default)]`, so an omitted field silently yields `[]`). That shape
+/// today grants the peer ZERO read scope and ZERO delete scope while leaving
+/// its WRITE scope unbounded; the flip makes the three lanes agree.
+///
+/// Two recoveries, both without a restart-blocking rewrite: declare the peer's
+/// real scope (or `["**"]` for deliberate allow-all — the PER-PEER escape,
+/// [`crate::federation::peer_attestation::namespace_allowed_test_glob`] treats
+/// `**` as unconditional match-all), or set this knob falsy for a fleet-wide
+/// rollout window. Note `AI_MEMORY_FED_SYNC_TRUST_PEER=1` does NOT rescue this
+/// case and never did: `namespace_allowed` consults that bypass only in the
+/// `scope_for(peer) == None` arm, so an enrolled peer's declared allowlist
+/// always wins over the legacy override.
+///
+/// 3x3 adversarial vote (`4d3ea1c5` protocol): the permissive-default variant
+/// was ranked LAST by both voting lenses — grammar-illegal under a
+/// `FED_REQUIRE_*` name, and it would leave the write lane unbounded for a
+/// config that already confines reads and deletes.
+#[must_use]
+pub fn require_push_namespace_scope_enabled() -> bool {
+    env_flag_default_on(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV)
+}
+
+/// Whether the operator has DECLARED a non-empty `allowed_namespaces` scope
+/// for this peer — the predicate that selects Layer 1 over Layer 2 below.
+///
+/// An enrolled peer whose scope row omits `allowed_namespaces` is a legal
+/// shape: `PeerScope::allowed_namespaces` is `#[serde(default)]`, so an
+/// operator who enrolls a peer purely to configure `allowed_sender_agent_ids`
+/// (the #238 attestation) silently gets `[]`. That peer has declared no scope
+/// to match against, so Layer 1 has nothing to enforce and Layer 2 decides.
+#[must_use]
+pub fn peer_declares_namespace_scope(
+    peer_id: Option<&str>,
+    attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
+) -> bool {
+    peer_id
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .and_then(|p| attest_cfg.scope_for(p))
+        .is_some_and(|scope| !scope.allowed_namespaces.is_empty())
+}
+
+/// Whether the write-lane gate needs the EXISTING local row's namespace
+/// resolved before [`inbound_write_namespace_authorized`] can decide.
+///
+/// `false` short-circuits a per-memory `get`-by-id on the federation hot path:
+/// when Layer 1 is not armed for this peer the stored namespace cannot change
+/// the verdict (Layer 2 refuses — or accepts — on the peer's scope alone).
+/// Zero-config deployments therefore pay ZERO extra reads.
+#[must_use]
+pub fn inbound_write_needs_existing_namespace(
+    peer_id: Option<&str>,
+    attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
+) -> bool {
+    attest_cfg.has_allowlist() && peer_declares_namespace_scope(peer_id, attest_cfg)
+}
+
+/// #2447 (CWE-284, security-high) — namespace confinement for an inbound
+/// relayed MEMORY write, shared verbatim by the sqlite (`sync_push`) and
+/// postgres (`sync_push_via_store`) receive loops so both backends behave
+/// identically.
+///
+/// ## The hole this closes
+///
+/// The three federation lanes were asymmetric: the PULL lane (`/sync/since`)
+/// filters its projection through the peer's `allowed_namespaces`, and the
+/// DELETE lane resolves each target row's namespace and refuses out-of-scope
+/// ids (#1934) — but the inbound `memories[]` WRITE loop consulted NEITHER.
+/// A comment in `federation_receive.rs` asserted the write lane was confined
+/// "via `resolve_inbound_attribution`"; that is false. `resolve_inbound_attribution`
+/// gates WHO you may claim to be (`metadata.agent_id` against
+/// `PeerScope::allowed_sender_agent_ids`), never WHICH namespace you may write
+/// into. So a peer attested with `allowed_namespaces: ["public/*"]` could POST
+/// a memory whose `namespace` is `secure/ops` and the row was persisted and
+/// thereafter served to that tenant's agents as substrate truth.
+///
+/// ## Both namespaces are checked (the merge-clobber variant)
+///
+/// Checking only the inbound CLAIMED namespace would leave a trivially
+/// equivalent bypass: `merge_memory` resolves the `namespace` field by LWW
+/// (`crate::models::crdt_merge`), and `merge_inbound` field-merges ANY inbound
+/// row whose `id` matches an existing local row. A `public/*`-scoped peer that
+/// pushes `{id: <a known secure/ops row id>, namespace: "public/x", …}` with a
+/// fresh `updated_at` would pass a claimed-only check and then RELOCATE the
+/// `secure/ops` row into `public/x`, clobbering its title/content — a write
+/// into (and destruction of) a namespace the peer was explicitly denied. So
+/// when the caller resolved an existing row for this id, its STORED namespace
+/// must be in scope too — the same "resolve the target row's namespace" rule
+/// the #1934 delete lane applies, unioned with the pull lane's claimed-namespace
+/// filter.
+///
+/// ## Two composed layers (the #1843 shape)
+///
+/// **Both layers are gated on [`PeerAttestationConfig::has_allowlist`] first**,
+/// exactly like [`resolve_inbound_attribution`]'s and
+/// [`signal_author_authorized`]'s Layer 1: with no
+/// `AI_MEMORY_FED_PEER_ATTESTATION` configured, the ZERO-CONFIG posture, this
+/// function is a no-op and replication is byte-identical to pre-#2447. Calling
+/// [`crate::federation::peer_attestation::namespace_allowed`] verbatim (as the
+/// #1934 delete lane does) would instead have returned `false` for every
+/// zero-config push — a silent, total federation outage — because its
+/// `scope_for(peer) == None` arm falls through to `sync_trust_peer_bypass()`,
+/// which is `false` unless the operator opted out of #239 entirely.
+///
+/// - **Layer 1 (always-on, no knob)** — the peer DECLARED a non-empty
+///   `allowed_namespaces` ([`peer_declares_namespace_scope`]). Both the claimed
+///   and the stored namespace must glob-match it, through the shared #239
+///   primitive `namespace_allowed` — the same function the #1934 delete lane
+///   and the `/sync/since` projection filter call, so all three lanes share one
+///   glob semantics and there is no second implementation to drift.
+/// - **Layer 2 ([`require_push_namespace_scope_enabled`], default ON)** — the
+///   peer is enrolled but declared NO namespace scope. Default-deny, matching
+///   what that same config already means on the pull lane; the falsy token is
+///   the staged-rollout opt-out and `["**"]` is the per-peer one.
+///
+/// [`resolve_inbound_attribution`]: crate::handlers::federation_receive::resolve_inbound_attribution
+/// [`signal_author_authorized`]: crate::handlers::federation_receive::signal_author_authorized
+///
+/// Returns `true` when the memory may be applied, `false` (with a
+/// namespace-naming WARN already emitted under
+/// [`crate::handlers::federation_receive::ATTESTATION_TRACE_TARGET`]) when the
+/// caller must `skipped += 1; continue` — a PER-MEMORY skip that never aborts
+/// the rest of the batch, matching the #1843 signal-lane disposition.
+///
+/// `existing_namespace` is the stored namespace of the local row with the same
+/// `id` (`None` when no such row exists, or when
+/// [`inbound_write_needs_existing_namespace`] said the read was unnecessary).
+/// A caller whose existence probe FAILED must fail closed (skip the row)
+/// rather than pass `None` — `None` here means "provably no local row".
+#[must_use]
+pub fn inbound_write_namespace_authorized(
+    lane: &str,
+    memory_id: &str,
+    claimed_namespace: &str,
+    existing_namespace: Option<&str>,
+    attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
+    peer_id: Option<&str>,
+    require_push_namespace_scope: bool,
+) -> bool {
+    use crate::federation::peer_attestation::namespace_allowed;
+    use crate::handlers::federation_receive::ATTESTATION_TRACE_TARGET;
+
+    // Zero-config: byte-identical faith-based replication (see the doc above).
+    if !attest_cfg.has_allowlist() {
+        return true;
+    }
+
+    // Layer 1 — enforce the scope the operator actually declared.
+    if peer_declares_namespace_scope(peer_id, attest_cfg) {
+        for (namespace, source) in [
+            (Some(claimed_namespace), "claimed"),
+            (existing_namespace, "stored"),
+        ] {
+            let Some(namespace) = namespace else { continue };
+            if !namespace_allowed(peer_id, namespace, attest_cfg) {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    memory_id = %memory_id,
+                    namespace = %namespace,
+                    namespace_source = source,
+                    peer_id = %peer_id.unwrap_or(""),
+                    "sync_push: refusing federated {lane} entry outside the peer's \
+                     namespace scope (#2447); skipping this entry, batch survives"
+                );
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Layer 2 — enrolled peer that declared no namespace scope at all.
+    if require_push_namespace_scope {
+        tracing::warn!(
+            target: ATTESTATION_TRACE_TARGET,
+            memory_id = %memory_id,
+            namespace = %claimed_namespace,
+            peer_id = %peer_id.unwrap_or(""),
+            "sync_push: peer is enrolled but declares no allowed_namespaces, so its write \
+             scope is unbounded while its read + delete scope are already empty — refusing \
+             this {lane} entry (#2447). Declare the peer's namespace scope in \
+             AI_MEMORY_FED_PEER_ATTESTATION (use [\"**\"] for a deliberate allow-all), or \
+             set AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0 for a rollout window."
+        );
+        return false;
+    }
+    true
+}
+
+/// #2447 — the by-id sibling of [`inbound_write_namespace_authorized`], for the
+/// `/sync/push` lanes that act on an EXISTING row rather than a caller-supplied
+/// one (`archives[]`, `restores[]`): there is no claimed namespace to check,
+/// only the row's stored one.
+///
+/// Kept as a thin wrapper rather than a second policy so the two layers — and
+/// therefore the disposition of an enrolled peer that declares no scope — stay
+/// IDENTICAL across every lane. Without it, Layer 2 would deny such a peer's
+/// `memories[]` write and its `deletions[]` (which #1934 routes through the
+/// deny-on-empty `namespace_allowed`) while silently permitting the archive
+/// that removes the same row from every live read.
+///
+/// `stored_namespace` is `None` only when the caller has ALREADY established
+/// there is no such row (and has counted it as a no-op); a failed lookup must
+/// fail closed at the call site, never arrive here as `None`.
+#[must_use]
+pub fn inbound_by_id_namespace_authorized(
+    lane: &str,
+    memory_id: &str,
+    stored_namespace: &str,
+    attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
+    peer_id: Option<&str>,
+    require_push_namespace_scope: bool,
+) -> bool {
+    inbound_write_namespace_authorized(
+        lane,
+        memory_id,
+        stored_namespace,
+        None,
+        attest_cfg,
+        peer_id,
+        require_push_namespace_scope,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,6 +1039,151 @@ mod tests {
             "garbage → strict default (fail-closed)"
         );
         unsafe { std::env::remove_var(REQUIRE_WRITE_SIG_ENV) };
+    }
+
+    #[test]
+    fn require_push_namespace_scope_default_strict_and_falsy_opts_out() {
+        // #2447 — the write-lane sibling of the two resolver tests above, and
+        // the co-located precedence pin the env-table row 147 points at (this
+        // is a direct-read knob, so it takes no `config_precedence` entry —
+        // the #84/#85/#87/#94/#96/#123/#125/#132 pattern). SAFETY: single-
+        // threaded mutation of a var no other test reads.
+        unsafe { std::env::remove_var(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV) };
+        assert!(
+            require_push_namespace_scope_enabled(),
+            "unset → strict; a FED_REQUIRE_* knob defaulting permissive would \
+             be grammar-illegal (all 7 siblings are default-ON at v1.0.0)"
+        );
+        for truthy in ["1", "true", "yes", "on", "  on  "] {
+            unsafe { std::env::set_var(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV, truthy) };
+            assert!(
+                require_push_namespace_scope_enabled(),
+                "{truthy:?} → strict"
+            );
+        }
+        for falsy in ["0", "false", "no", "off", "  off  "] {
+            unsafe { std::env::set_var(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV, falsy) };
+            assert!(
+                !require_push_namespace_scope_enabled(),
+                "{falsy:?} → the staged-rollout opt-out"
+            );
+        }
+        // The shared `env_flag_default_on` grammar trims but does NOT
+        // case-fold, so an uppercase token is unrecognised and therefore
+        // fail-closed — identical to all 7 sibling FED_REQUIRE_* knobs.
+        unsafe { std::env::set_var(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV, "OFF") };
+        assert!(
+            require_push_namespace_scope_enabled(),
+            "\"OFF\" is not a recognised falsy token → stays strict"
+        );
+        unsafe { std::env::set_var(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV, "garbage") };
+        assert!(
+            require_push_namespace_scope_enabled(),
+            "garbage → strict default (a typo must never silently widen scope)"
+        );
+        unsafe { std::env::remove_var(REQUIRE_PUSH_NAMESPACE_SCOPE_ENV) };
+    }
+
+    /// #2447 — the pure verdict, exercised without any HTTP/DB plumbing. The
+    /// zero-config arm is the load-bearing one: a verbatim `namespace_allowed`
+    /// call would return `false` here and silently black-hole every inbound
+    /// memory on an unconfigured deployment.
+    #[test]
+    fn inbound_write_namespace_verdict_layers() {
+        use crate::federation::peer_attestation::{PeerAttestationConfig, PeerScope};
+
+        let zero_config = PeerAttestationConfig::default();
+        assert!(
+            inbound_write_namespace_authorized(
+                "memories",
+                "id-1",
+                "secure/ops",
+                None,
+                &zero_config,
+                Some("peer-1"),
+                true,
+            ),
+            "zero-config must be byte-identical to pre-#2447 even under the knob"
+        );
+
+        let mut scoped = PeerAttestationConfig::default();
+        scoped.peers.insert(
+            "peer-1".to_string(),
+            PeerScope {
+                allowed_sender_agent_ids: vec![],
+                allowed_namespaces: vec!["public/*".to_string()],
+            },
+        );
+        assert!(
+            inbound_write_namespace_authorized(
+                "memories",
+                "id-1",
+                "public/ok",
+                None,
+                &scoped,
+                Some("peer-1"),
+                true,
+            ),
+            "Layer 1: in-scope claimed namespace accepted"
+        );
+        assert!(
+            !inbound_write_namespace_authorized(
+                "memories",
+                "id-1",
+                "secure/ops",
+                None,
+                &scoped,
+                Some("peer-1"),
+                true,
+            ),
+            "Layer 1: out-of-scope claimed namespace refused"
+        );
+        assert!(
+            !inbound_write_namespace_authorized(
+                "memories",
+                "id-1",
+                "public/loot",
+                Some("secure/ops"),
+                &scoped,
+                Some("peer-1"),
+                true,
+            ),
+            "Layer 1: an in-scope CLAIM cannot launder an out-of-scope STORED \
+             namespace — this is the merge-clobber bypass"
+        );
+
+        let mut unscoped = PeerAttestationConfig::default();
+        unscoped.peers.insert(
+            "peer-1".to_string(),
+            PeerScope {
+                allowed_sender_agent_ids: vec!["a".to_string()],
+                allowed_namespaces: vec![],
+            },
+        );
+        assert!(
+            !inbound_write_namespace_authorized(
+                "memories",
+                "id-1",
+                "public/ok",
+                None,
+                &unscoped,
+                Some("peer-1"),
+                true,
+            ),
+            "Layer 2 ON: an enrolled peer declaring no scope is refused"
+        );
+        assert!(
+            inbound_write_namespace_authorized(
+                "memories",
+                "id-1",
+                "public/ok",
+                None,
+                &unscoped,
+                Some("peer-1"),
+                false,
+            ),
+            "Layer 2 OFF: the staged-rollout opt-out restores the legacy posture"
+        );
     }
 
     #[test]

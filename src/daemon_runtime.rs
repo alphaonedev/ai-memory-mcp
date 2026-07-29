@@ -2462,6 +2462,30 @@ pub fn passphrase_from_file(path: &Path) -> Result<String> {
     Ok(passphrase)
 }
 
+/// Store-URL scheme prefix for the sqlite adapter.
+///
+/// \#2444 — HOISTED here out of [`crate::migrate`] (which is
+/// `#[cfg(feature = "sal")]`-gated, so it does not exist in a default build)
+/// because the ungated `backup` / `restore` fail-closed store guard has to
+/// sniff the configured store's scheme on EVERY build leg. `crate::migrate`
+/// re-exports this const, [`POSTGRES_URL_SCHEMES`] and [`is_postgres_url`]
+/// verbatim, so every pre-existing call site is unchanged and the literals
+/// still live in exactly one place (the pm-v3.1 no-hardcoded-literal rule).
+pub const SQLITE_URL_SCHEME: &str = "sqlite://";
+
+/// Store-URL scheme prefixes the postgres adapter accepts. See
+/// [`SQLITE_URL_SCHEME`] for why this lives here rather than in
+/// `crate::migrate`.
+pub const POSTGRES_URL_SCHEMES: [&str; 2] = ["postgres://", "postgresql://"];
+
+/// True when `url` selects the postgres adapter — the ONE scheme sniff
+/// shared by `migrate::open_store`, the daemon `--store-url` dispatch,
+/// `schema-init`, and the #2444 `backup` / `restore` store guard.
+#[must_use]
+pub fn is_postgres_url(url: &str) -> bool {
+    POSTGRES_URL_SCHEMES.iter().any(|s| url.starts_with(s))
+}
+
 /// #1927 (CWE-214) — env var carrying the store/Postgres connection URL out
 /// of band, so the DB credential need NOT be forced onto the world-readable
 /// `/proc/<pid>/cmdline`. `/proc/<pid>/environ` is owner-only (mode 0400),
