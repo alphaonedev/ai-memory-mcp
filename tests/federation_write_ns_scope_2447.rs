@@ -183,7 +183,7 @@ async fn push(router: &axum::Router, body: &Value) -> StatusCode {
     status
 }
 
-fn push_body(memories: Vec<Value>) -> Value {
+fn push_body(memories: &[Value]) -> Value {
     json!({
         "sender_agent_id": PEER_ID,
         "sender_clock": {"entries": {}},
@@ -232,7 +232,7 @@ async fn federated_write_outside_peer_scope_refused_2447() {
     // EXPLOIT: a peer scoped to public/* pushes a memory into secure/ops.
     let status = push(
         &router,
-        &push_body(vec![wire_memory(
+        &push_body(&[wire_memory(
             &uuid::Uuid::new_v4().to_string(),
             VICTIM_NS,
             "poison",
@@ -255,7 +255,7 @@ async fn federated_write_outside_peer_scope_refused_2447() {
     // the fix confines, it does not brick the peer.
     let ok_status = push(
         &router,
-        &push_body(vec![wire_memory(
+        &push_body(&[wire_memory(
             &uuid::Uuid::new_v4().to_string(),
             IN_SCOPE_NS,
             "legit",
@@ -317,7 +317,7 @@ async fn federated_write_cannot_relocate_foreign_row_by_id_collision_2447() {
     // it) and clobber its title + content.
     let status = push(
         &router,
-        &push_body(vec![wire_memory(
+        &push_body(&[wire_memory(
             &victim_id,
             "public/loot",
             "clobbered",
@@ -414,7 +414,7 @@ async fn zero_config_federation_write_still_applies_2447() {
 
     let status = push(
         &router,
-        &push_body(vec![wire_memory(
+        &push_body(&[wire_memory(
             &uuid::Uuid::new_v4().to_string(),
             VICTIM_NS,
             "zero-config replication",
@@ -445,7 +445,7 @@ async fn enrolled_peer_without_declared_namespaces_denied_by_default_2447() {
 
     let status = push(
         &router,
-        &push_body(vec![wire_memory(
+        &push_body(&[wire_memory(
             &uuid::Uuid::new_v4().to_string(),
             VICTIM_NS,
             "unscoped peer",
@@ -467,7 +467,7 @@ async fn enrolled_peer_without_declared_namespaces_denied_by_default_2447() {
     let (router2, db2) = build_router_with_db();
     let status2 = push(
         &router2,
-        &push_body(vec![wire_memory(
+        &push_body(&[wire_memory(
             &uuid::Uuid::new_v4().to_string(),
             VICTIM_NS,
             "unscoped peer",
@@ -500,7 +500,7 @@ async fn double_star_scope_is_the_per_peer_allow_all_escape_2447() {
 
     let status = push(
         &router,
-        &push_body(vec![wire_memory(
+        &push_body(&[wire_memory(
             &uuid::Uuid::new_v4().to_string(),
             VICTIM_NS,
             "explicit allow-all",

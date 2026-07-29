@@ -279,6 +279,7 @@ async fn scope_private_victim_row_still_blocks_the_merge_2447_pg() {
     victim.namespace.clone_from(&victim_ns);
     victim.title = uniq("sensitive");
     victim.content = "secure ops row".to_string();
+    victim.created_at = "2026-01-01T00:00:00+00:00".to_string();
     victim.updated_at = "2026-01-02T00:00:00+00:00".to_string();
     victim.metadata = json!({"agent_id": "ai:victim-2447", "scope": "private"});
     store
@@ -338,6 +339,8 @@ async fn federated_deletion_outside_peer_scope_refused_1934_pg() {
     victim.namespace.clone_from(&victim_ns);
     victim.title = uniq("delete-victim");
     victim.content = "secure ops row".to_string();
+    victim.created_at = "2026-01-01T00:00:00+00:00".to_string();
+    victim.updated_at = "2026-01-02T00:00:00+00:00".to_string();
     victim.metadata = json!({"agent_id": "ai:victim-2447"});
     store
         .store(&admin_ctx(), &victim)
