@@ -47,11 +47,14 @@ use tokio::sync::Notify;
 /// own `tls::fed_pin_env_lock` is `pub(crate)` and therefore unreachable from
 /// an integration-test crate, so this file owns its own lock. Integration
 /// test files are separate binaries, so a cross-file race is impossible.
-/// Poison-tolerant, mirroring the in-crate lock.
-fn verify_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+///
+/// A `tokio::sync::Mutex` (not `std::sync`) because every holder awaits while
+/// holding it — a std guard across an await point is the
+/// `clippy::await_holding_lock` hazard. Tokio mutexes are not poisoned, so no
+/// poison-tolerance shim is needed.
+async fn verify_env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    LOCK.lock().await
 }
 
 fn fixture(name: &str) -> PathBuf {
@@ -138,7 +141,7 @@ async fn probe(client: &reqwest::Client, base: &str) -> Result<reqwest::StatusCo
 /// the timeout elapses); passes after the fix (the daemon returns `Err`).
 #[tokio::test]
 async fn insecure_skip_server_verify_is_refused_by_default_2448() {
-    let _guard = verify_env_lock();
+    let _guard = verify_env_lock().await;
     // SAFETY: the process-wide env mutation is serialized by the file-local
     // lock taken above; no other thread in this test binary reads it.
     unsafe { std::env::remove_var(tls::FED_REQUIRE_SERVER_VERIFY_ENV) };
@@ -157,15 +160,16 @@ async fn insecure_skip_server_verify_is_refused_by_default_2448() {
     )
     .await;
 
-    let err = match outcome {
-        Ok(Ok(())) => panic!("sync-daemon returned Ok — expected a #2448 refusal"),
-        Ok(Err(e)) => e,
-        Err(_elapsed) => panic!(
+    // `let ... else` rather than a wildcard `Err(_)` match arm: the elapsed
+    // case is THE vulnerability signal, so it gets its own named branch.
+    let Ok(returned) = outcome else {
+        panic!(
             "sync-daemon entered its sync loop with server-cert verification DISABLED — \
              --insecure-skip-server-verify was accepted, so this node would push plaintext \
              memory content to any server presenting any certificate (#2448)"
-        ),
+        );
     };
+    let err = returned.expect_err("sync-daemon returned Ok — expected a #2448 refusal");
     let msg = err.to_string();
     assert!(
         msg.contains("--insecure-skip-server-verify"),
@@ -185,7 +189,7 @@ async fn insecure_skip_server_verify_is_refused_by_default_2448() {
 /// suite permanently so the escape hatch stays honest about what it enables.
 #[tokio::test]
 async fn escape_hatch_accepts_a_self_signed_peer_2448() {
-    let _guard = verify_env_lock();
+    let _guard = verify_env_lock().await;
     // SAFETY: serialized by the file-local lock taken above.
     unsafe { std::env::set_var(tls::FED_REQUIRE_SERVER_VERIFY_ENV, "0") };
 
@@ -208,7 +212,7 @@ async fn escape_hatch_accepts_a_self_signed_peer_2448() {
 /// without `--insecure-skip-server-verify` (#1794's `CaValidated` arm).
 #[tokio::test]
 async fn secure_default_rejects_a_self_signed_peer_1794() {
-    let _guard = verify_env_lock();
+    let _guard = verify_env_lock().await;
     // SAFETY: serialized by the file-local lock taken above.
     unsafe { std::env::remove_var(tls::FED_REQUIRE_SERVER_VERIFY_ENV) };
 
