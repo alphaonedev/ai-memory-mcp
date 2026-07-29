@@ -355,7 +355,10 @@ vector path could only be exercised on an operator's own machine.
   on Portability Spec v2 + `export --full` / the v2 importer + the CC0
   conformance corpus ([#1837](https://github.com/alphaonedev/ai-memory-mcp/issues/1837))
   + the two non-Rust readers + `ai-memory backup` (lossless SQLite
-  `VACUUM INTO`) — NOT on the default `export`.
+  `VACUUM INTO`, SQLite deployments only — it refuses a non-SQLite store
+  rather than emitting an empty artifact,
+  [#2444](https://github.com/alphaonedev/ai-memory-mcp/issues/2444))
+  — NOT on the default `export`.
 
 ## Gate-3 evidence
 

@@ -156,7 +156,10 @@ fn backup_refuses_to_create_and_snapshot_a_missing_database_2444() {
     );
 
     let (snapshots, manifests) = artifact_counts(&backups);
-    assert_eq!(snapshots, 0, "no snapshot of a database that does not exist");
+    assert_eq!(
+        snapshots, 0,
+        "no snapshot of a database that does not exist"
+    );
     assert_eq!(manifests, 0, "no manifest over content that was never read");
     assert!(!db.exists(), "backup must not create the source database");
 }
@@ -240,12 +243,7 @@ fn backup_still_succeeds_on_a_real_sqlite_deployment_2444() {
         .success();
 
     let assert = ai_memory(&db)
-        .args([
-            "--json",
-            "backup",
-            "--to",
-            backups.to_str().expect("utf-8"),
-        ])
+        .args(["--json", "backup", "--to", backups.to_str().expect("utf-8")])
         .assert()
         .success();
 

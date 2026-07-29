@@ -243,14 +243,18 @@ pub fn run_backup(
     // self-describing: which backend produced it, which migration ladder it is
     // on, and how many memories it actually contains.
     let memory_count: i64 = conn
-        .query_row(crate::storage::index_coverage::SQL_TOTAL_MEMORIES, [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            crate::storage::index_coverage::SQL_TOTAL_MEMORIES,
+            [],
+            |r| r.get(0),
+        )
         .context("counting memories in the source DB")?;
     let schema_version: i64 = conn
-        .query_row(crate::storage::migrations::SELECT_SCHEMA_VERSION_SQL, [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            crate::storage::migrations::SELECT_SCHEMA_VERSION_SQL,
+            [],
+            |r| r.get(0),
+        )
         .context("reading the source DB schema version")?;
     let ts = chrono::Utc::now().format(BACKUP_TS_FMT).to_string();
     let snapshot_name = format!("ai-memory-{ts}.db");
@@ -501,9 +505,11 @@ pub fn run_restore(
             )
         })?;
         let _: i64 = probe
-            .query_row(crate::storage::index_coverage::SQL_TOTAL_MEMORIES, [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                crate::storage::index_coverage::SQL_TOTAL_MEMORIES,
+                [],
+                |r| r.get(0),
+            )
             .with_context(|| {
                 format!(
                     "snapshot {} has no `memories` table — it is not an ai-memory \

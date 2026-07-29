@@ -81,7 +81,7 @@ mTLS-authenticated federation peers bypass the api-key check on `/api/v1/sync/*`
 
 ## 4. Backup and restore
 
-SQLite deployments use `ai-memory backup` (a `VACUUM INTO` wrapper that emits a defragmented snapshot plus a sha256 manifest):
+SQLite deployments use `ai-memory backup` (a `VACUUM INTO` wrapper that emits a defragmented snapshot plus a sha256 manifest). It is SQLite-only and **refuses** a store it cannot capture — see the Postgres note below ([#2444](https://github.com/alphaonedev/ai-memory-mcp/issues/2444)):
 
 ```bash
 ai-memory backup --to /var/backups/ai-memory --keep 48
@@ -96,6 +96,10 @@ PostgreSQL deployments use the standard tooling:
 pg_dump --format=custom ai_memory > ai-memory-$(date -u +%Y%m%dT%H%M%SZ).pgdump
 pg_restore --clean --create --dbname=postgres ai-memory-<timestamp>.pgdump
 ```
+
+`ai-memory backup` is **not** an alternative to the above on a Postgres host, and since v1.0.0 it says so instead of failing open ([#2444](https://github.com/alphaonedev/ai-memory-mcp/issues/2444)). Pointed at a Postgres deployment it used to create an empty SQLite file, snapshot it, write a valid sha256 manifest and exit 0 — the operator learned the truth at the restore. It now resolves the configured store (`--store-url`, or `AI_MEMORY_STORE_URL_FILE` / `AI_MEMORY_STORE_URL`) and errors, naming `pg_dump` / `pg_basebackup`, without writing any artifact. `ai-memory restore` refuses the same store for the same reason. **Pass `--store-url` (or export `AI_MEMORY_STORE_URL`) in the backup cron on every Postgres host** — a daemon started with `--store-url` on argv alone leaves the separate cron process no channel to learn the backend, and the guard cannot fire on a store it cannot see.
+
+One thing `pg_dump` does not cover: a Postgres-backed daemon still keeps a local SQLite sidecar at `--db` holding the governance audit spine (`signed_events`, `governance_rules`, hook consultation state). Back that file up out-of-band alongside the `pg_dump`.
 
 **Post-restore verification.** v0.7.0 ships two ad-hoc verifiers: `ai-memory verify-reflection-chain <memory_id>` (L1-3 — walks `reflects_on` edges backward to depth 0 and verifies each Ed25519 signature; exit 0 on a fully-verified chain) and `ai-memory verify-signed-events-chain --format json` (V-4 — walks the cross-row `signed_events` hash chain; `chain_holds: true` is the pass signal). Run both against the restored database before promoting it.
 
