@@ -242,7 +242,7 @@ run_static() {
 # Tools the installer legitimately needs, beyond the download client. The
 # scenario-D minimal PATH is built from exactly this list, so a SHA-256
 # tool can be withheld without withholding anything else.
-MIN_TOOLS=(sh gzip uname mktemp rm mkdir cp chmod tar awk wc tr ls cat sed grep)
+MIN_TOOLS=(sh env gzip uname mktemp rm mkdir cp chmod tar awk wc tr ls cat sed grep)
 
 # Every fail-closed abort in install.sh / install.ps1 prints this line.
 # Reject scenarios must see it, so that a harness-level failure (a missing
@@ -391,8 +391,18 @@ run_scenario() {
         *) printf 'internal error: bad minimal mode %s\n' "$minimal" >&2; exit 1 ;;
     esac
 
+    # PSModulePath / POWERSHELL_DISTRIBUTION_CHANNEL must be scrubbed:
+    # install.sh treats either as "you are running inside PowerShell, use
+    # install.ps1" and aborts before reaching any checksum logic. GitHub's
+    # ubuntu runners ship PowerShell and export PSModulePath process-wide,
+    # so without this every scenario aborts at that guard -- reject cases
+    # would have "passed" for entirely the wrong reason had the refusal
+    # token not been asserted. `env` is resolved from the harness's own
+    # PATH before the replacement PATH is applied to the child.
     set +e
-    out="$(PATH="$path" HOME="$case_dir" sh "$installer" --dir "$target" 2>&1)"
+    out="$(env -u PSModulePath -u POWERSHELL_DISTRIBUTION_CHANNEL \
+              PATH="$path" HOME="$case_dir" \
+              sh "$installer" --dir "$target" 2>&1)"
     rc=$?
     set -e
 
