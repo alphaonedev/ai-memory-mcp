@@ -69,7 +69,7 @@ fn attestation_fixture_matches_the_shipped_encoder_2455() {
 
     let content = str_field(&fx, "content");
     let content_hash = content_sha256(content);
-    let content_hash_hex: String = content_hash.iter().map(|b| format!("{b:02x}")).collect();
+    let content_hash_hex = hex_of(&content_hash);
     assert_eq!(
         content_hash_hex,
         str_field(&fx, "content_sha256_hex"),
@@ -87,7 +87,7 @@ fn attestation_fixture_matches_the_shipped_encoder_2455() {
         content_sha256: &content_hash,
     };
     let cbor = canonical_cbor_write(&write).expect("canonical CBOR encode");
-    let cbor_hex: String = cbor.iter().map(|b| format!("{b:02x}")).collect();
+    let cbor_hex = hex_of(&cbor);
     assert_eq!(
         cbor_hex,
         str_field(&fx, "canonical_cbor_hex"),
@@ -120,6 +120,18 @@ fn attestation_fixture_pins_the_write_domain_tag_2455() {
     );
 }
 
+/// Lower-hex encode.
+///
+/// Uses `fold` + `write!` rather than `map(format!).collect()`: the latter
+/// allocates a `String` per byte and trips `clippy::format_collect`, which CI
+/// lints on stable with `-D warnings`.
 fn hex_of(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
+            // Writing to a String is infallible; the Result is discarded.
+            let _ = write!(acc, "{b:02x}");
+            acc
+        })
 }
