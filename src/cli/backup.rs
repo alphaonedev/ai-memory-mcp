@@ -801,4 +801,363 @@ mod tests {
             .collect();
         assert_eq!(snaps.len(), 1, "retention should keep exactly 1 snapshot");
     }
+
+    // ------------------------------------------------------------------
+    // #2444 — fail-closed store guard + restore hardening.
+    //
+    // These complement `tests/backup_fail_closed_2444.rs`, which carries the
+    // R-203 before/after evidence by driving the real binary through the env
+    // channel. The unit tests below exercise the arms that are awkward to
+    // reach through a subprocess (a forward-schema manifest, a corrupt
+    // snapshot, WAL sidecar handling) and the `--store-url` ARGUMENT channel.
+    // ------------------------------------------------------------------
+
+    /// A postgres store declared on the flag is refused, and the message names
+    /// the supported path. The credential in the DSN is redacted.
+    #[test]
+    fn backup_refuses_a_postgres_store_url_argument_2444() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_memory(&db, "ns", "t", "c");
+        let args = BackupArgs {
+            to: db.parent().unwrap().join("backups-2444-pg"),
+            keep: 48,
+            store_url: Some("postgres://ai_memory:hunter2@127.0.0.1:5432/ai_memory".to_string()),
+        };
+        let mut out = env.output();
+        let err = run_backup(&db, &args, false, &mut out)
+            .expect_err("a postgres store must be refused")
+            .to_string();
+        assert!(err.contains("pg_dump"), "got: {err}");
+        assert!(!err.contains("hunter2"), "DSN password leaked: {err}");
+    }
+
+    /// `restore` refuses the same store — the false-assurance half of #2444.
+    #[test]
+    fn restore_refuses_a_postgres_store_url_argument_2444() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let args = RestoreArgs {
+            from: db.parent().unwrap().join("backups-2444-pg-restore"),
+            skip_verify: false,
+            store_url: Some("postgresql://ai_memory:hunter2@127.0.0.1:5432/ai".to_string()),
+        };
+        let mut out = env.output();
+        let err = run_restore(&db, &args, false, &mut out)
+            .expect_err("restoring onto a postgres store must be refused")
+            .to_string();
+        assert!(err.contains("pg_dump"), "got: {err}");
+        assert!(!err.contains("hunter2"), "DSN password leaked: {err}");
+    }
+
+    /// An unrecognised scheme must NOT fall back to the local `--db` file —
+    /// that fallback is precisely how a snapshot of the wrong database gets a
+    /// valid manifest.
+    #[test]
+    fn backup_refuses_an_unrecognised_store_url_scheme_2444() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_memory(&db, "ns", "t", "c");
+        let backup_dir = db.parent().unwrap().join("backups-2444-scheme");
+        let args = BackupArgs {
+            to: backup_dir.clone(),
+            keep: 48,
+            store_url: Some("mysql://localhost/ai_memory".to_string()),
+        };
+        {
+            let mut out = env.output();
+            let err = run_backup(&db, &args, false, &mut out)
+                .expect_err("an unrecognised scheme must be refused")
+                .to_string();
+            assert!(err.contains("unrecognised store URL"), "got: {err}");
+        }
+        assert!(
+            !backup_dir.join("x").parent().unwrap().exists() || snapshot_count(&backup_dir) == 0,
+            "a refused backup must leave no snapshot"
+        );
+    }
+
+    /// `backup` must not CREATE the database it claims to capture. `db::open`
+    /// would have created AND fully migrated it, so the resulting file is
+    /// indistinguishable from a real one by any schema probe — the existence
+    /// check has to happen first.
+    #[test]
+    fn backup_refuses_to_create_a_missing_source_database_2444() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let missing = db.parent().unwrap().join("never-created-2444.db");
+        let backup_dir = db.parent().unwrap().join("backups-2444-missing");
+        let args = BackupArgs {
+            to: backup_dir.clone(),
+            keep: 48,
+            store_url: None,
+        };
+        {
+            let mut out = env.output();
+            let err = run_backup(&missing, &args, false, &mut out)
+                .expect_err("a missing source DB must be refused")
+                .to_string();
+            assert!(err.contains("refusing to create"), "got: {err}");
+        }
+        assert!(!missing.exists(), "backup created the source database");
+        assert_eq!(snapshot_count(&backup_dir), 0);
+    }
+
+    /// The manifest is self-describing: backend, applied schema version, and
+    /// the row count actually captured.
+    #[test]
+    fn backup_manifest_records_backend_schema_and_memory_count_2444() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_memory(&db, "ns", "t", "c");
+        let args = BackupArgs {
+            to: db.parent().unwrap().join("backups-2444-manifest"),
+            keep: 48,
+            store_url: None,
+        };
+        {
+            let mut out = env.output();
+            run_backup(&db, &args, true, &mut out).unwrap();
+        }
+        let manifest: BackupManifest = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(manifest.backend.as_deref(), Some(BACKEND_SQLITE));
+        assert_eq!(
+            manifest.schema_version,
+            Some(crate::storage::migrations::current_schema_version())
+        );
+        assert_eq!(manifest.memory_count, Some(1));
+    }
+
+    /// A zero-memory snapshot is WARNed, never refused: a row count cannot
+    /// tell a legitimately fresh deployment from a wrong-store capture, and
+    /// refusing would strand the sqlite governance sidecar on a pg host.
+    #[test]
+    fn backup_warns_but_succeeds_on_an_empty_corpus_2444() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        // Bring the database into existence WITHOUT storing any memory.
+        drop(db::open(&db).unwrap());
+        let args = BackupArgs {
+            to: db.parent().unwrap().join("backups-2444-empty"),
+            keep: 48,
+            store_url: None,
+        };
+        {
+            let mut out = env.output();
+            run_backup(&db, &args, false, &mut out).expect("an empty corpus still backs up");
+        }
+        assert!(
+            env.stderr_str().contains("0 memories"),
+            "an empty snapshot must be reported; stderr was: {}",
+            env.stderr_str()
+        );
+    }
+
+    /// A manifest that POSITIVELY declares a non-sqlite origin is refused
+    /// rather than copied onto a SQLite path.
+    #[test]
+    fn restore_refuses_a_cross_backend_manifest_2444() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_memory(&db, "ns", "t", "c");
+        let backup_dir = db.parent().unwrap().join("backups-2444-xbackend");
+        let manifest = take_backup(&mut env, &db, &backup_dir);
+        let manifest_path = manifest_path_for(&backup_dir, &manifest.snapshot);
+        let mut tampered = manifest;
+        tampered.backend = Some("postgres".to_string());
+        let snap = backup_dir.join(&tampered.snapshot);
+        std::fs::write(&manifest_path, serde_json::to_string(&tampered).unwrap()).unwrap();
+
+        let args = RestoreArgs {
+            from: snap,
+            skip_verify: false,
+            store_url: None,
+        };
+        let mut out = env.output();
+        let err = run_restore(&db, &args, false, &mut out)
+            .expect_err("a cross-backend snapshot must be refused")
+            .to_string();
+        assert!(err.contains("cross-backend"), "got: {err}");
+    }
+
+    /// A snapshot from a NEWER binary opens cleanly (the ladder only migrates
+    /// forward) and then silently drops the newer columns on the next write.
+    /// Refuse instead.
+    #[test]
+    fn restore_refuses_a_forward_schema_snapshot_2444() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_memory(&db, "ns", "t", "c");
+        let backup_dir = db.parent().unwrap().join("backups-2444-forward");
+        let manifest = take_backup(&mut env, &db, &backup_dir);
+        let manifest_path = manifest_path_for(&backup_dir, &manifest.snapshot);
+        let mut tampered = manifest;
+        tampered.schema_version = Some(crate::storage::migrations::current_schema_version() + 1);
+        let snap = backup_dir.join(&tampered.snapshot);
+        std::fs::write(&manifest_path, serde_json::to_string(&tampered).unwrap()).unwrap();
+
+        let args = RestoreArgs {
+            from: snap,
+            skip_verify: false,
+            store_url: None,
+        };
+        let mut out = env.output();
+        let err = run_restore(&db, &args, false, &mut out)
+            .expect_err("a forward-schema snapshot must be refused")
+            .to_string();
+        assert!(err.contains("understands v"), "got: {err}");
+    }
+
+    /// A pre-#2444 manifest carries none of the new keys; it must still
+    /// restore (`#[serde(default)]`), because refusing every artifact an
+    /// operator already holds would be its own data-loss event.
+    #[test]
+    fn restore_accepts_a_legacy_manifest_without_the_new_fields_2444() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_memory(&db, "ns", "t", "c");
+        let backup_dir = db.parent().unwrap().join("backups-2444-legacy");
+        let manifest = take_backup(&mut env, &db, &backup_dir);
+        let manifest_path = manifest_path_for(&backup_dir, &manifest.snapshot);
+        // Re-serialise WITHOUT the #2444 keys, exactly as v0.9 would have.
+        let legacy = serde_json::json!({
+            "snapshot": manifest.snapshot,
+            "sha256": manifest.sha256,
+            "bytes": manifest.bytes,
+            "source_db": manifest.source_db,
+            "version": manifest.version,
+            "created_at": manifest.created_at,
+        });
+        std::fs::write(&manifest_path, serde_json::to_string(&legacy).unwrap()).unwrap();
+
+        let args = RestoreArgs {
+            from: backup_dir.join(&manifest.snapshot),
+            skip_verify: false,
+            store_url: None,
+        };
+        let mut out = env.output();
+        run_restore(&db, &args, false, &mut out).expect("a legacy manifest must still restore");
+    }
+
+    /// The sha256 only proves the bytes match a manifest WE wrote over
+    /// whatever was produced — and `--skip-verify` proves nothing at all. A
+    /// foreign / truncated file must be refused BEFORE the live corpus is
+    /// moved aside.
+    #[test]
+    fn restore_refuses_a_snapshot_that_is_not_an_ai_memory_database_2444() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_memory(&db, "ns", "survivor", "must not be clobbered");
+        let backup_dir = db.parent().unwrap().join("backups-2444-garbage");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        let bogus = backup_dir.join("ai-memory-2026-01-01T000000Z.db");
+        std::fs::write(&bogus, b"this is not a sqlite database at all").unwrap();
+
+        let live_before = std::fs::metadata(&db).unwrap().len();
+        let args = RestoreArgs {
+            from: bogus,
+            skip_verify: true,
+            store_url: None,
+        };
+        {
+            let mut out = env.output();
+            let err = run_restore(&db, &args, false, &mut out)
+                .expect_err("a non-ai-memory snapshot must be refused")
+                .to_string();
+            assert!(
+                err.contains("not an ai-memory database"),
+                "refusal must say it will not clobber the live corpus; got: {err}"
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(&db).unwrap().len(),
+            live_before,
+            "a refused restore must not touch the live database"
+        );
+    }
+
+    /// Renaming `<db>` aside without its `-wal` / `-shm` left the PREVIOUS
+    /// database's write-ahead log beside the freshly copied snapshot, where
+    /// SQLite can replay stale frames INTO the restored corpus.
+    #[test]
+    fn restore_moves_the_wal_and_shm_sidecars_aside_2444() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_memory(&db, "ns", "t", "c");
+        let backup_dir = db.parent().unwrap().join("backups-2444-wal");
+        let manifest = take_backup(&mut env, &db, &backup_dir);
+
+        // Plant sidecars that must not survive next to the restored file.
+        let live_wal = sidecar_path(&db, "-wal");
+        let live_shm = sidecar_path(&db, "-shm");
+        std::fs::write(&live_wal, b"stale wal frames").unwrap();
+        std::fs::write(&live_shm, b"stale shm").unwrap();
+
+        let args = RestoreArgs {
+            from: backup_dir.join(&manifest.snapshot),
+            skip_verify: false,
+            store_url: None,
+        };
+        {
+            let mut out = env.output();
+            run_restore(&db, &args, false, &mut out).unwrap();
+        }
+        assert!(
+            !live_wal.exists(),
+            "a stale -wal beside the restored DB can be replayed into it"
+        );
+        assert!(!live_shm.exists(), "a stale -shm must not survive either");
+
+        // And they moved WITH the safety copy, not into the void — the
+        // pre-restore snapshot has to stay recoverable.
+        let dir = db.parent().unwrap();
+        let aside_sidecars = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.contains("pre-restore-") && (n.ends_with("-wal") || n.ends_with("-shm"))
+            })
+            .count();
+        assert_eq!(aside_sidecars, 2, "both sidecars must be preserved aside");
+    }
+
+    // -- helpers -------------------------------------------------------
+
+    fn snapshot_count(dir: &Path) -> usize {
+        std::fs::read_dir(dir).map_or(0, |entries| {
+            entries
+                .flatten()
+                .filter(|e| {
+                    let n = e.file_name();
+                    let n = n.to_string_lossy();
+                    n.starts_with("ai-memory-") && n.ends_with(".db")
+                })
+                .count()
+        })
+    }
+
+    fn manifest_path_for(dir: &Path, snapshot: &str) -> PathBuf {
+        let stem = Path::new(snapshot).file_stem().unwrap().to_string_lossy();
+        dir.join(manifest_file_name(&stem))
+    }
+
+    /// Take a real backup and return the parsed manifest, clearing the
+    /// captured buffers so the caller's assertions see only their own output.
+    fn take_backup(env: &mut TestEnv, db: &Path, backup_dir: &Path) -> BackupManifest {
+        let args = BackupArgs {
+            to: backup_dir.to_path_buf(),
+            keep: 48,
+            store_url: None,
+        };
+        {
+            let mut out = env.output();
+            run_backup(db, &args, true, &mut out).unwrap();
+        }
+        let manifest: BackupManifest = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        env.stdout.clear();
+        env.stderr.clear();
+        manifest
+    }
 }

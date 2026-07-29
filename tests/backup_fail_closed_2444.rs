@@ -1,6 +1,11 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+// The module docs below narrate the defect in prose, naming SQLite and
+// Postgres as products rather than as code items. Matches the established
+// `tests/` precedent for prose-heavy regression docs.
+#![allow(clippy::doc_markdown)]
+
 //! v1.0.0 #2444 — `ai-memory backup` must FAIL CLOSED.
 //!
 //! # The defect these tests pin
@@ -229,8 +234,8 @@ fn restore_on_a_postgres_store_refuses_2444() {
 }
 
 /// Positive control: on a real SQLite deployment `backup` still works, and the
-/// manifest is now self-describing (#2444 records backend / schema_version /
-/// memory_count so the artifact can be judged without opening it).
+/// manifest is now self-describing (#2444 records `backend` / `schema_version` /
+/// `memory_count` so the artifact can be judged without opening it).
 #[test]
 fn backup_still_succeeds_on_a_real_sqlite_deployment_2444() {
     let tmp = TempDir::new().expect("tempdir");
