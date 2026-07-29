@@ -230,6 +230,51 @@ jobs:
         # the gate rejects each, with an unmutated control first.
         run: bash scripts/check-install-checksum.sh --self-test
 
+  conformance-readers-gate:
+    # Issue #2452 — the mandated >=2-non-Rust-reader conformance proof could
+    # silently never run. `tests/conformance_readers.rs` SKIPped-and-PASSed
+    # when python3/node were absent (libtest scores an early `return` as
+    # `ok`, and it CAPTURES the "loud" SKIP note, so the pass was silent),
+    # and `grep -rln conformance .github/workflows/` returned NOTHING — no
+    # environment anywhere was KNOWN to carry both interpreters. A Gate-1
+    # freeze-critical item marked DISCHARGED rested on a test that could
+    # no-op to green. This job is the environment where the guarantee is
+    # actually claimed, so here an absent interpreter is a FAILURE.
+    name: Non-Rust conformance-reader proof gate (#2452)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # The interpreters are PROVISIONED, not assumed. The gate fails closed
+      # when they are missing, so relying on whatever the runner image
+      # happens to ship would make a controlled proof depend on an accident.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # Needed only by the gate's R-203 / before-after evidence, which
+      # compiles tests/conformance_readers.rs standalone with `rustc --test`
+      # (the harness is deliberately crate-dependency-free — no cargo build).
+      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@1.96.0
+      - name: Run conformance-reader gate
+        run: bash scripts/check-conformance-readers.sh
+      - name: Self-test the gate (regression evidence)
+        # Plants failures and proves the gate rejects each FOR THE STATED
+        # REASON, not merely with a non-zero exit: a corrupted record, the
+        # MUST-REJECT tampered vector re-labelled VALID (which only a reader
+        # that really checks Ed25519 can catch — the plant that separates
+        # "two interpreters ran" from "a reader verified"), a no-op stub
+        # reader, a reader that prints a plausible N/N summary and nothing
+        # else, a shrunken corpus, an interpreter-free PATH against the REAL
+        # gate, a gutted fail-closed region, a restored SKIP note, a
+        # workflow set that never invokes the gate, and the escape hatch
+        # exported from CI. An unmutated control runs first. Corpus plants
+        # mutate a COPY under .local-runs/ — conformance/ is never written.
+        run: bash scripts/check-conformance-readers.sh --self-test
+
   test-env-lock-gate:
     # Issue #2146 — the grep-gate half of issue #2127's Fix section,
     # not delivered by PR #2142 (Fable pre-merge audit of #2142).
