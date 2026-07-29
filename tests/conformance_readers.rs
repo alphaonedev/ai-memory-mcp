@@ -41,7 +41,7 @@
 //! Both readers discharge the SPEC SECTION-7 STRUCTURAL obligation in full:
 //! restricted-CBOR decode, **re-encode-and-compare** against the original
 //! bytes, domain-tag / element-count pins, and the whole-corpus digest
-//! anchor. Only `node` additionally checks the Ed25519 SIGNATURES (WebCrypto);
+//! anchor. Only `node` additionally checks the Ed25519 SIGNATURES (`WebCrypto`);
 //! the Python reader is stdlib-only by policy (no vendored crypto) and
 //! reports its signature verdicts as explicit `PASS (partial)`. So the count
 //! of readers that verify SIGNATURES is 1, not 2 — a spec-vs-implementation
