@@ -3089,6 +3089,34 @@ mod tests {
 
     // ---------------- HMAC / sha256 helpers ----------------
 
+    /// #2455 — PIN the cross-language webhook fixture the SDKs verify against.
+    ///
+    /// `sdk/fixtures/webhook_hmac_vector.json` is the ONLY thing binding the
+    /// Python + TypeScript verifiers to this signer. A fixture nothing pins is
+    /// the #2453 defect one layer up: move the signing contract and the fixture
+    /// goes stale, the SDKs break at RUNTIME, and CI stays green on both sides
+    /// because neither is comparing against this code any more.
+    ///
+    /// On failure: REGENERATE the fixture and re-run both SDK suites. Never
+    /// edit the expectation to match new output.
+    #[test]
+    fn webhook_hmac_fixture_matches_the_shipped_signer_2455() {
+        let body = r#"{"event":"memory.created","memory_id":"01JQ8Z3K7VN2X5R9T4W6Y8B0C1","namespace":"global"}"#;
+        // The dispatch signer's construction: key = SHA256(plaintext secret),
+        // message = "{ts}.{body}".
+        let secret_hash = sha256_hex("s3cret-webhook-key");
+        assert_eq!(
+            secret_hash, "64d00fd48419d1a518a10d991ba926c88ba26703cf97736506957bb0cacd5fc6",
+            "fixture secret_sha256_hex is stale"
+        );
+        let sig = hmac_sha256_hex(&secret_hash, &format!("{}.{}", "1780000000", body));
+        assert_eq!(
+            format!("sha256={sig}"),
+            "sha256=1874b28ead7984334e7ada4c20eaa97936b56806225723e860c1a25d965801d5",
+            "fixture signature_header is stale"
+        );
+    }
+
     #[test]
     fn sha256_hex_known_vector() {
         // SHA256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
