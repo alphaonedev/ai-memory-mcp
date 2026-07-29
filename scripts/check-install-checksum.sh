@@ -212,8 +212,11 @@ audit_workflow_checksums() {
 
 run_static() {
     info "Installer checksum gate: static mode (#2449)"
-    audit_installer_region "install.sh" "$INSTALLER" 4 '^[[:space:]]*exit 1[[:space:]]*$'
-    audit_installer_region "install.ps1" "$INSTALLER_PS1" 4 'throw|exit 1'
+    # Match the indented CALL sites of each installer's canonical abort
+    # helper, not its definition — so deleting an abort branch (rather
+    # than merely renaming the helper) is what trips the count.
+    audit_installer_region "install.sh"  "$INSTALLER"     4 '^[[:space:]]+abort_unverified[[:space:]]*$'
+    audit_installer_region "install.ps1" "$INSTALLER_PS1" 4 '^[[:space:]]+Stop-UnverifiedInstall[[:space:]]*$'
     audit_workflow_checksums
 
     if (( violations > 0 )); then
@@ -417,6 +420,103 @@ run_scenario() {
     rm -rf "$case_dir"
 }
 
+# ---------------------------------------------------------------------------
+# STATIC self-test: prove the static gate is load-bearing by planting the
+# exact regressions it exists to catch into a throwaway copy of the repo
+# (under .local-runs/, never /tmp) and asserting the gate rejects each.
+#
+# Without this, the static mode is an assertion nobody has ever seen fail
+# — which is the same "decorative control" defect #2449 is about, one
+# level up.
+# ---------------------------------------------------------------------------
+stage_repo_copy() {
+    local dst="$1"
+    rm -rf "$dst"
+    mkdir -p "${dst}/scripts" "${dst}/.github/workflows"
+    cp "${BASH_SOURCE[0]}" "${dst}/scripts/check-install-checksum.sh"
+    cp "$INSTALLER"        "${dst}/install.sh"
+    cp "$INSTALLER_PS1"    "${dst}/install.ps1"
+    cp "$WORKFLOW"         "${dst}/.github/workflows/release.yml"
+    chmod +x "${dst}/scripts/check-install-checksum.sh"
+}
+
+expect_static() {
+    # $1 = label, $2 = staged dir, $3 = pass|fail
+    local label="$1" dir="$2" want="$3" rc=0
+    "${dir}/scripts/check-install-checksum.sh" >/dev/null 2>&1 || rc=$?
+    if [[ "$want" == "pass" ]]; then
+        if (( rc != 0 )); then
+            violation "static self-test '${label}': the gate FAILED on an unmutated copy (exit ${rc}) — every subsequent plant would 'pass' for the wrong reason."
+        else
+            printf '  [static:%-26s] unmutated copy accepted (control)\n' "$label"
+        fi
+    else
+        if (( rc == 0 )); then
+            violation "static self-test '${label}': the gate PASSED on a planted regression — the static gate is decorative, not load-bearing."
+        else
+            printf '  [static:%-26s] planted regression rejected\n' "$label"
+        fi
+    fi
+}
+
+run_static_self_test() {
+    local base="${SCRATCH_ROOT}/$$-static" d
+
+    # Control first: an untouched copy MUST pass, or the plants below
+    # prove nothing.
+    d="${base}/control"; stage_repo_copy "$d"; expect_static "control (unmutated)" "$d" pass
+
+    # P1 — the whole fail-closed region deleted from install.sh.
+    d="${base}/p1"; stage_repo_copy "$d"
+    awk -v b="$GATE_BEGIN" -v e="$GATE_END" '
+        index($0, b) { skip = 1 }
+        !skip        { print }
+        index($0, e) { skip = 0 }
+    ' "${d}/install.sh" >"${d}/install.sh.tmp" && mv "${d}/install.sh.tmp" "${d}/install.sh"
+    expect_static "install.sh gate deleted" "$d" fail
+
+    # P2 — the exact #2449 warn-and-continue branch put back.
+    d="${base}/p2"; stage_repo_copy "$d"
+    sed -i 's|^    echo "Verifying checksum\.\.\."$|    echo "Warning: Checksum file not available, skipping verification."|' "${d}/install.sh"
+    expect_static "install.sh fail-open phrase" "$d" fail
+
+    # P3 — an abort branch removed (the gate counts abort sites, so
+    # weakening the region without deleting it is still caught).
+    d="${base}/p3"; stage_repo_copy "$d"
+    python3 - "$d" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]) / "install.sh"
+s = p.read_text()
+# Drop two of the five abort sites.
+p.write_text(s.replace("        abort_unverified\n", "        :\n", 2))
+PY
+    expect_static "install.sh abort branch removed" "$d" fail
+
+    # P4 — the fail-closed region deleted from install.ps1.
+    d="${base}/p4"; stage_repo_copy "$d"
+    awk -v b="$GATE_BEGIN" -v e="$GATE_END" '
+        index($0, b) { skip = 1 }
+        !skip        { print }
+        index($0, e) { skip = 0 }
+    ' "${d}/install.ps1" >"${d}/install.ps1.tmp" && mv "${d}/install.ps1.tmp" "${d}/install.ps1"
+    expect_static "install.ps1 gate deleted" "$d" fail
+
+    # P5 — the release.yml checksum sweep steps deleted, which is how the
+    # glob-published tarballs silently lose their .sha256 again.
+    d="${base}/p5"; stage_repo_copy "$d"
+    sed -i "s|# ${SWEEP_SENTINEL}||g" "${d}/.github/workflows/release.yml"
+    expect_static "release.yml sweep removed" "$d" fail
+
+    # P6 — a concrete artifact published with its sibling .sha256 entry
+    # dropped from the same files: list (how a NEW artifact type would
+    # ship unverified).
+    d="${base}/p6"; stage_repo_copy "$d"
+    sed -i '/dist\/ai-memory-ios\.xcframework\.tar\.gz\.sha256/d' "${d}/.github/workflows/release.yml"
+    expect_static "release.yml sibling dropped" "$d" fail
+
+    rm -rf "$base"
+}
+
 run_self_test() {
     info "Installer checksum gate: self-test mode (#2449) — planting failures against the REAL install.sh"
     info "  installer under test: ${INSTALLER}"
@@ -435,6 +535,9 @@ run_self_test() {
     # accepted everything would be the original bug in a new shape.
     run_scenario openssl-rung-valid    "$INSTALLER" good accept openssl
     run_scenario openssl-rung-mismatch "$INSTALLER" bad  reject openssl
+
+    info "  --- static gate, planted regressions ---"
+    run_static_self_test
 
     rmdir "$SCRATCH_ROOT" 2>/dev/null || true
 

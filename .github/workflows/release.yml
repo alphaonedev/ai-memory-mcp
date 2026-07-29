@@ -162,6 +162,84 @@ jobs:
         env:
           TAG: ${{ needs.preflight.outputs.tag }}
 
+      # ------------------------------------------------------------------
+      # #2449 - publish a SHA-256 for every artifact an installer verifies.
+      #
+      # Before #2449 this job published the tarballs/zip/deb/rpm with NO
+      # .sha256 asset at all (only the SBOM, iOS and Android jobs emitted
+      # one), so install.sh's checksum fetch 404'd on every ordinary
+      # install and its verification step passed by doing nothing.
+      #
+      # This is a whole-directory SWEEP, not an enumerated list, and it
+      # lives in the same job that packages the artifacts - so a future
+      # artifact type added to this job is checksummed automatically
+      # rather than shipping unverified because someone forgot a line.
+      # The `files: dist/ai-memory*` glob below then publishes the
+      # checksums for free. Output shape is sha256sum's `<hash>  <name>`,
+      # matching the existing SBOM/iOS/Android assets and install.sh's
+      # `awk '{ print $1 }'` extraction.
+      #
+      # EXCLUDED: the bare `ai-memory` / `ai-memory.exe` binary that the
+      # packaging step leaves in dist/. It is NOT architecture-qualified,
+      # so all five matrix legs publish an asset of that same name and
+      # overwrite each other. A checksum for it could be raced against a
+      # different leg's binary, and a WRONG checksum is worse than none.
+      # No installer path fetches it (install.sh and install.ps1 both
+      # fetch the arch-qualified archive). Tracked separately.
+      # ------------------------------------------------------------------
+      - name: Checksum every release artifact (unix)  # checksum-sweep (#2449)
+        if: ${{ !contains(matrix.target, 'windows') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          emitted=0
+          for f in *; do
+            [ -f "$f" ] || continue
+            case "$f" in
+              *.sha256)          continue ;;
+              ai-memory)         echo "::notice::skipping checksum for non-arch-qualified '$f' (collides across matrix legs)"; continue ;;
+            esac
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$f" > "$f.sha256"
+            else
+              shasum -a 256 "$f" > "$f.sha256"
+            fi
+            emitted=$((emitted + 1))
+          done
+          # Fail loudly rather than publishing a release with no checksums:
+          # a sweep that silently emitted nothing would be the exact
+          # "reports success when it did nothing" defect #2449 is about.
+          if [ "$emitted" -eq 0 ]; then
+            echo "::error::checksum sweep produced nothing - refusing to publish unverifiable artifacts"
+            exit 1
+          fi
+          echo "checksummed ${emitted} artifact(s)"
+          ls -la
+
+      - name: Checksum every release artifact (windows)  # checksum-sweep (#2449)
+        if: contains(matrix.target, 'windows')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $emitted = 0
+          Get-ChildItem -Path dist -File |
+            Where-Object { $_.Name -notlike '*.sha256' -and $_.Name -ne 'ai-memory.exe' } |
+            ForEach-Object {
+              $h = (Get-FileHash -Algorithm SHA256 -Path $_.FullName).Hash.ToLower()
+              # sha256sum-compatible shape so install.sh/install.ps1 parse
+              # it identically to the unix-emitted files. Encoding must be
+              # pinned: Out-File defaults to UTF-16 on Windows PowerShell.
+              Set-Content -Path "$($_.FullName).sha256" -Value "$h  $($_.Name)" -Encoding ascii
+              $emitted++
+            }
+          if ($emitted -eq 0) {
+            Write-Host "::error::checksum sweep produced nothing - refusing to publish unverifiable artifacts"
+            exit 1
+          }
+          Write-Host "checksummed $emitted artifact(s)"
+          Get-ChildItem dist
+
       - name: Upload release artifact
         uses: actions/upload-artifact@v5
         with:
