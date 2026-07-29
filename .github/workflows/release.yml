@@ -907,10 +907,36 @@ jobs:
           VERSION=${{ steps.version.outputs.version }}
           mkdir -p ~/rpmbuild/{SOURCES,SPECS,SRPMS}
 
-          curl -sL -o ~/rpmbuild/SOURCES/ai-memory-x86_64-unknown-linux-gnu.tar.gz \
-            "https://github.com/alphaonedev/ai-memory-mcp/releases/download/v${VERSION}/ai-memory-x86_64-unknown-linux-gnu.tar.gz"
-          curl -sL -o ~/rpmbuild/SOURCES/ai-memory-aarch64-unknown-linux-gnu.tar.gz \
-            "https://github.com/alphaonedev/ai-memory-mcp/releases/download/v${VERSION}/ai-memory-aarch64-unknown-linux-gnu.tar.gz"
+          # #2449 - verify each tarball against its published .sha256 before
+          # it is baked into the SRPM.
+          #
+          # These are the SAME two prebuilt tarballs install.sh downloads, and
+          # ai-memory.spec consumes them as Source0/Source1 with no %prep-stage
+          # verification of its own - so whatever bytes land here are what
+          # every `dnf install` from the COPR repo ultimately executes, with no
+          # chain of custody back to the GitHub release. The previous
+          # `curl -sL` also lacked `-f`, so an HTTP error body would have been
+          # packaged as if it were the binary.
+          BASE="https://github.com/alphaonedev/ai-memory-mcp/releases/download/v${VERSION}"
+          for TARGET in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            ASSET="ai-memory-${TARGET}.tar.gz"
+            curl -fsSL -o ~/rpmbuild/SOURCES/"$ASSET" "${BASE}/${ASSET}"
+            curl -fsSL -o ~/rpmbuild/SOURCES/"${ASSET}.sha256" "${BASE}/${ASSET}.sha256"
+
+            EXPECTED=$(awk 'NR == 1 { print $1 }' ~/rpmbuild/SOURCES/"${ASSET}.sha256" | tr -d '\r' | tr 'A-F' 'a-f')
+            ACTUAL=$(sha256sum ~/rpmbuild/SOURCES/"$ASSET" | cut -d' ' -f1)
+
+            if ! printf '%s' "$EXPECTED" | grep -Eq '^[0-9a-f]{64}$'; then
+              echo "::error::${ASSET}.sha256 does not contain a valid SHA-256 digest"
+              exit 1
+            fi
+            if [ "$EXPECTED" != "$ACTUAL" ]; then
+              echo "::error::checksum mismatch for ${ASSET} (published ${EXPECTED}, downloaded ${ACTUAL}) - refusing to build an SRPM"
+              exit 1
+            fi
+            # The .sha256 is not a spec Source, so keep SOURCES/ clean.
+            rm -f ~/rpmbuild/SOURCES/"${ASSET}.sha256"
+          done
 
           if [[ "$VERSION" == *-* ]]; then
             RPM_VERSION="${VERSION%%-*}"
