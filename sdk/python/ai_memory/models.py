@@ -148,6 +148,13 @@ class CreateMemory(_Base):
     server will stamp ``metadata.agent_id`` from the body, the
     ``X-Agent-Id`` header, or a per-request anonymous id — callers only
     need to set it when they want a specific NHI claim.
+
+    #2455 — ``signature`` / ``created_at`` / ``kind`` were MISSING here,
+    which made a successful store impossible against a stock daemon:
+    ``POST /api/v1/memories`` is ``WriteSurface::HttpDirect`` and fails
+    CLOSED by default, so an unsigned write is ``403 ATTESTATION_FAILED``.
+    Use :func:`ai_memory.attestation.attestation_fields` (or pass
+    ``signing_key=`` to :meth:`AiMemoryClient.store`) to populate them.
     """
 
     title: str
@@ -163,10 +170,33 @@ class CreateMemory(_Base):
     metadata: dict[str, Any] = Field(default_factory=dict)
     agent_id: str | None = None
     scope: str | None = None
+    # #1385 — Batman-taxonomy memory-kind selector. Absent/unknown values are
+    # treated as omission by the server, which then stores ``observation``.
+    # It is INSIDE the signed envelope, so a signed write must send the same
+    # kind it signed.
+    kind: str | None = None
+    # #626 Layer-3 — detached Ed25519 attestation over the ``SignableWrite``
+    # envelope, STANDARD base64. When set, ``created_at`` is REQUIRED (the
+    # signer cannot predict the server clock).
+    signature: str | None = None
+    # RFC3339 timestamp the caller signed. Validated against the server's
+    # +/-300s attestation freshness window, then adopted verbatim.
+    created_at: str | None = None
 
 
 class UpdateMemory(_Base):
-    """Request body for ``PUT /api/v1/memories/{id}`` — all fields optional."""
+    """Request body for ``PUT /api/v1/memories/{id}`` — all fields optional.
+
+    **Optimistic concurrency is a HEADER, not a body field.** The server
+    reads the expected row version from ``If-Match`` (bare integer or a
+    quoted ETag-style value) — see ``src/handlers/memories.rs:245-260``;
+    ``struct UpdateMemory`` in ``src/models/memory.rs:1602`` has no
+    ``version`` field at all. A ``version`` key placed in this body would be
+    silently swallowed by ``extra="allow"`` and ignored by the server,
+    giving the caller a false sense of lost-update protection while the
+    write remained last-write-wins. Pass ``expected_version=`` to
+    :meth:`AiMemoryClient.update` instead; a stale version yields ``409``.
+    """
 
     title: str | None = None
     content: str | None = None

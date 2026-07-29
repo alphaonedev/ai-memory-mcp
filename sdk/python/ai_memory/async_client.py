@@ -10,15 +10,17 @@ are otherwise identical.
 from __future__ import annotations
 
 from types import TracebackType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
 from ai_memory._common import (
     DEFAULT_BASE_URL,
     DEFAULT_TIMEOUT,
+    build_create_body,
     build_httpx_kwargs,
     handle_response,
+    if_match_headers,
     prep_json,
     wrap_transport_error,
 )
@@ -35,6 +37,9 @@ from ai_memory.models import (
     SubscriptionRequest,
     UpdateMemory,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ai_memory.attestation import AgentSigningKey
 
 
 class AsyncAiMemoryClient:
@@ -90,6 +95,7 @@ class AsyncAiMemoryClient:
         *,
         json_body: Any = None,
         params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> Any:
         try:
             response = await self._client.request(
@@ -97,6 +103,7 @@ class AsyncAiMemoryClient:
                 path,
                 json=prep_json(json_body) if json_body is not None else None,
                 params={k: v for k, v in (params or {}).items() if v is not None} or None,
+                headers=headers,
             )
         except httpx.HTTPError as exc:
             raise wrap_transport_error(exc) from exc
@@ -126,26 +133,36 @@ class AsyncAiMemoryClient:
         metadata: dict[str, Any] | None = None,
         agent_id: str | None = None,
         scope: str | None = None,
+        kind: str | None = None,
+        signing_key: AgentSigningKey | None = None,
+        signature: str | None = None,
+        created_at: str | None = None,
     ) -> dict[str, Any]:
-        body = CreateMemory(
+        """``POST /api/v1/memories``. See :meth:`AiMemoryClient.store`.
+
+        #2455 — this endpoint fails CLOSED by default; pass ``signing_key``
+        (plus a matching ``agent_id``) or the daemon answers ``403
+        ATTESTATION_FAILED``.
+        """
+        body = build_create_body(
             title=title,
             content=content,
-            **{
-                k: v
-                for k, v in {
-                    "tier": tier,
-                    "namespace": namespace,
-                    "tags": tags,
-                    "priority": priority,
-                    "confidence": confidence,
-                    "source": source,
-                    "expires_at": expires_at,
-                    "ttl_secs": ttl_secs,
-                    "metadata": metadata,
-                    "agent_id": agent_id,
-                    "scope": scope,
-                }.items()
-                if v is not None
+            signing_key=signing_key,
+            fields={
+                "tier": tier,
+                "namespace": namespace,
+                "tags": tags,
+                "priority": priority,
+                "confidence": confidence,
+                "source": source,
+                "expires_at": expires_at,
+                "ttl_secs": ttl_secs,
+                "metadata": metadata,
+                "agent_id": agent_id,
+                "scope": scope,
+                "kind": kind,
+                "signature": signature,
+                "created_at": created_at,
             },
         )
         return await self._request("POST", "/api/v1/memories", json_body=body)
@@ -162,9 +179,23 @@ class AsyncAiMemoryClient:
         return Memory.model_validate(raw)
 
     async def update(
-        self, memory_id: str, update: UpdateMemory | dict[str, Any]
+        self,
+        memory_id: str,
+        update: UpdateMemory | dict[str, Any],
+        *,
+        expected_version: int | str | None = None,
     ) -> dict[str, Any]:
-        return await self._request("PUT", f"/api/v1/memories/{memory_id}", json_body=update)
+        """``PUT /api/v1/memories/{id}``. See :meth:`AiMemoryClient.update`.
+
+        ``expected_version`` rides the ``If-Match`` header — the daemon's only
+        optimistic-concurrency gate for this route.
+        """
+        return await self._request(
+            "PUT",
+            f"/api/v1/memories/{memory_id}",
+            json_body=update,
+            headers=if_match_headers(expected_version),
+        )
 
     async def delete(self, memory_id: str) -> dict[str, Any]:
         return await self._request("DELETE", f"/api/v1/memories/{memory_id}")
@@ -388,4 +419,14 @@ class AsyncAiMemoryClient:
                 "agent_type": agent_type,
                 "capabilities": capabilities or [],
             },
+        )
+
+    async def bind_agent_pubkey(self, agent_id: str, pubkey_b64: str) -> dict[str, Any]:
+        """``PUT /api/v1/agents/{id}/pubkey``. See
+        :meth:`AiMemoryClient.bind_agent_pubkey` — admin-gated, and required
+        once before a signed :meth:`store` can attest."""
+        return await self._request(
+            "PUT",
+            f"/api/v1/agents/{agent_id}/pubkey",
+            json_body={"pubkey_b64": pubkey_b64},
         )

@@ -3089,6 +3089,36 @@ mod tests {
 
     // ---------------- HMAC / sha256 helpers ----------------
 
+    /// #2455 — PIN `sdk/fixtures/webhook_hmac_vector.json`, the ONLY thing
+    /// binding the Python + TypeScript verifiers to this signer. Asserts
+    /// against the fixture FILE, never inlined copies of its values: a test
+    /// pinning the signer to literals still passes after someone regenerates
+    /// the JSON, so the SDKs would read bytes nothing compares to this code —
+    /// the #2453 defect one layer up. On failure REGENERATE the fixture and
+    /// re-run both SDK suites; never edit the expectation to match it.
+    #[test]
+    fn webhook_hmac_fixture_matches_the_shipped_signer_2455() {
+        let fx: serde_json::Value =
+            serde_json::from_str(include_str!("../sdk/fixtures/webhook_hmac_vector.json"))
+                .expect("webhook fixture is valid JSON");
+        let f = |k: &str| fx[k].as_str().expect("fixture field is a string");
+        // key = SHA256(plaintext secret), message "{ts}.{body}". `timestamp`
+        // is a JSON STRING — as_str, not Value::to_string (which re-quotes).
+        let secret_hash = sha256_hex(f("secret"));
+        assert_eq!(
+            secret_hash,
+            f("secret_sha256_hex"),
+            "fixture secret_sha256_hex disagrees with the shipped signer"
+        );
+        let sig = hmac_sha256_hex(&secret_hash, &format!("{}.{}", f("timestamp"), f("body")));
+        assert_eq!(
+            format!("sha256={sig}"),
+            f("signature_header"),
+            "fixture signature_header disagrees with the shipped signer — REGENERATE the \
+             fixture and re-run both SDK suites; do NOT edit the expectation to match"
+        );
+    }
+
     #[test]
     fn sha256_hex_known_vector() {
         // SHA256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855

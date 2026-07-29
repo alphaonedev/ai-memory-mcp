@@ -11,11 +11,23 @@ objects using either snake_case aliases (wire form) or Pythonic names.
 Example
 -------
 >>> from ai_memory import AiMemoryClient, Tier
->>> with AiMemoryClient(base_url="http://localhost:9077") as c:
-...     created = c.store(title="hello", content="world", tier=Tier.MID)
+>>> from ai_memory.attestation import AgentSigningKey
+>>> key = AgentSigningKey.generate()  # doctest: +SKIP
+>>> with AiMemoryClient(base_url="http://localhost:9077") as c:  # doctest: +SKIP
+...     c.bind_agent_pubkey("svc", key.public_key_b64())  # once, admin-gated
+...     created = c.store(
+...         title="hello", content="world", tier=Tier.MID,
+...         agent_id="svc", signing_key=key,
+...     )
 ...     hits = c.recall(context="hello")
+
+Signing is not optional decoration: ``POST /api/v1/memories`` is
+``WriteSurface::HttpDirect`` and fails CLOSED by default, so an unsigned
+store returns ``403 ATTESTATION_FAILED`` unless the operator has set
+``AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0``. See :mod:`ai_memory.attestation`.
 """
 
+from ai_memory._common import SDK_VERSION
 from ai_memory.async_client import AsyncAiMemoryClient
 from ai_memory.client import AiMemoryClient
 from ai_memory.errors import (
@@ -55,9 +67,13 @@ from ai_memory.profile import (
     require_profile_async,
     resolve_required_families,
 )
-from ai_memory.webhooks import verify_webhook_signature
+from ai_memory.webhooks import sign_webhook_body, verify_webhook_signature
 
-__version__ = "0.8.0"
+# #2455 — single-sourced from the installed package metadata (pyproject.toml
+# `version`). Previously this was a hand-maintained literal that had drifted
+# to "0.8.0" while pyproject said "1.0.0" and the User-Agent said
+# "0.6.0-alpha.0" — three different answers to "what version is this?".
+__version__ = SDK_VERSION
 
 __all__ = [
     "AgentRegistration",
@@ -94,5 +110,6 @@ __all__ = [
     "require_profile",
     "require_profile_async",
     "resolve_required_families",
+    "sign_webhook_body",
     "verify_webhook_signature",
 ]
