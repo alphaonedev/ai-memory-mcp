@@ -1295,6 +1295,22 @@ pub async fn sync_push(
     // (defense-in-depth: a foreign-space vector is stored+flagged but NEVER
     // indexed, even if it somehow reached this vec).
     let mut hnsw_updates: Vec<(String, Vec<f32>, String)> = Vec::new();
+    // #2447 (CWE-284) — loop-invariant inputs to the inbound-WRITE namespace
+    // scope gate. `ns_scope_needs_existing` also short-circuits the per-memory
+    // existing-row probe below: when Layer 1 is not armed for this peer the
+    // stored namespace cannot change the verdict, so zero-config deployments
+    // pay ZERO extra reads on the federation hot path.
+    let require_push_ns_scope =
+        crate::federation::receive_auth::require_push_namespace_scope_enabled();
+    let ns_scope_needs_existing =
+        crate::federation::receive_auth::inbound_write_needs_existing_namespace(
+            peer_header_owned.as_deref(),
+            &attest_cfg,
+        );
+    // The by-id sibling lanes (`archives[]` / `restores[]`) probe under the
+    // whole ENROLLED posture, not just a declared scope, so Layer 2's
+    // disposition of an unscoped enrolled peer is IDENTICAL on every lane.
+    let ns_gate_enrolled = attest_cfg.has_allowlist();
     for mem in &body.memories {
         if let Err(e) = validate::RequestValidator::validate_memory(mem) {
             tracing::warn!("sync_push: skipping memory {} ({}): {e}", mem.id, mem.title);
@@ -1309,6 +1325,49 @@ pub async fn sync_push(
         }
         if body.dry_run {
             noop += 1;
+            continue;
+        }
+        // #2447 (CWE-284, security-high) — confine the inbound WRITE lane to
+        // the peer's per-peer `allowed_namespaces` scope, like the read
+        // (`/sync/since`) and delete (#1934) lanes. Pre-fix this loop consulted
+        // NEITHER the peer's namespace scope NOR the target row's, so a peer
+        // scoped to `public/*` could push a row whose `namespace` is
+        // `secure/ops` (and, because `merge_memory` LWWs the `namespace` field,
+        // could RELOCATE + clobber an existing `secure/ops` row by pushing its
+        // id under an in-scope namespace). Resolve the existing row's namespace
+        // when Layer 1 is armed and refuse either namespace out of scope.
+        // Reject-before-apply: nothing is written and the batch survives.
+        let existing_ns = if ns_scope_needs_existing {
+            match db::namespace_by_id(&lock.0, &mem.id) {
+                Ok(ns) => ns,
+                Err(e) => {
+                    // Fail CLOSED: an unresolvable existence probe cannot be
+                    // reported as "provably no local row" — that is exactly the
+                    // input the merge-clobber bypass needs.
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        memory_id = %mem.id,
+                        "sync_push: namespace-scope pre-resolve failed for {}: {e}; \
+                         refusing the write (#2447 fail-closed)",
+                        mem.id
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        if !crate::federation::receive_auth::inbound_write_namespace_authorized(
+            "memories",
+            &mem.id,
+            &mem.namespace,
+            existing_ns.as_deref(),
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+            require_push_ns_scope,
+        ) {
+            skipped += 1;
             continue;
         }
         // v0.7.0 S6-M2 — per-agent quota gate. F7 (#639) closed this
@@ -1691,7 +1750,14 @@ pub async fn sync_push(
         }
         // #1934 (CWE-284) — confine deletions to the peer's per-peer
         // `allowed_namespaces` scope, like the read (`/sync/since`) and
-        // write (`memories[]` via `resolve_inbound_attribution`) lanes.
+        // write (`memories[]`, #2447) lanes.
+        //
+        // The pre-#2447 form of this comment claimed the write lane was
+        // already confined "via `resolve_inbound_attribution`". That was
+        // FALSE — that resolver gates WHO you may claim to be, never WHICH
+        // namespace you may write into — and the false claim is why #1934
+        // closed believing the whole class was covered while the write lane
+        // stayed wide open. #2447 actually confines it.
         // Pre-fix the delete loop consulted NEITHER the peer's namespace
         // scope NOR per-row ownership, so a peer scoped to `public/*`
         // could hard-delete rows in `secure/ops` or any other agent's
@@ -1750,6 +1816,44 @@ pub async fn sync_push(
             noop += 1;
             continue;
         }
+        // #2447 — `archives[]` is the same by-id reach into a foreign namespace
+        // the #1934 delete gate closed, one step softer (a recoverable move to
+        // `archived_memories` rather than a hard DELETE) — but it still removes
+        // the row from every live read of a namespace the peer was denied, and
+        // an ARCHIVED row is the input `restores[]` below resurrects. Confine
+        // it to the peer's scope with the same resolve-then-refuse shape. A
+        // missing row stays a no-op; an unresolvable one fails closed.
+        if ns_gate_enrolled {
+            match db::namespace_by_id(&lock.0, arch_id) {
+                Ok(Some(namespace)) => {
+                    if !crate::federation::receive_auth::inbound_by_id_namespace_authorized(
+                        "archives",
+                        arch_id,
+                        &namespace,
+                        &attest_cfg,
+                        peer_header_owned.as_deref(),
+                        require_push_ns_scope,
+                    ) {
+                        skipped += 1;
+                        continue;
+                    }
+                }
+                Ok(None) => {
+                    noop += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        memory_id = %arch_id,
+                        "sync_push: archive pre-resolve failed for {arch_id}: {e}; \
+                         refusing the archive (#2447 fail-closed)"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            }
+        }
         match db::archive_memory(&lock.0, arch_id, Some("sync_push")) {
             Ok(true) => archived += 1,
             Ok(false) => noop += 1,
@@ -1780,6 +1884,44 @@ pub async fn sync_push(
         // forget by pushing a restore of a tombstoned id — so the G30 tombstone
         // gate lives HERE, not on the operator restore_archived (an authorized
         // un-forget per #1771). Tombstoned → no-op (matches the loop's posture).
+        // #2447 — `restores[]` is the resurrection twin of `archives[]`: it
+        // moves a row BACK into the live `memories` table, so an unscoped
+        // restore lets a `public/*` peer re-materialise rows in a namespace it
+        // was denied (including the pre-merge snapshot the #2447 clobber path
+        // would have left behind). The row lives in `archived_memories` at this
+        // point, hence the archive-table twin of the namespace probe. The G30
+        // tombstone gate below is orthogonal and still runs.
+        if ns_gate_enrolled {
+            match db::archived_namespace_by_id(&lock.0, res_id) {
+                Ok(Some(namespace)) => {
+                    if !crate::federation::receive_auth::inbound_by_id_namespace_authorized(
+                        "restores",
+                        res_id,
+                        &namespace,
+                        &attest_cfg,
+                        peer_header_owned.as_deref(),
+                        require_push_ns_scope,
+                    ) {
+                        skipped += 1;
+                        continue;
+                    }
+                }
+                Ok(None) => {
+                    noop += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        memory_id = %res_id,
+                        "sync_push: restore pre-resolve failed for {res_id}: {e}; \
+                         refusing the restore (#2447 fail-closed)"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            }
+        }
         match db::memory_is_tombstoned(&lock.0, res_id) {
             Ok(true) => {
                 noop += 1;

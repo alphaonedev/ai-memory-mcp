@@ -39,6 +39,37 @@ use super::federation_receive::{
 #[cfg(feature = "sal")]
 use crate::validate;
 
+/// #2447 / #1934 (CWE-284) — resolve a stored row's namespace by id for the
+/// postgres receive twin's namespace-scope gates, BYPASSING the #910
+/// `scope=private` SAL visibility filter.
+///
+/// [`crate::store::postgres::PostgresStore::get`] deliberately folds a
+/// visibility denial into [`crate::store::StoreError::NotFound`] so the trait
+/// never leaks existence to a caller lacking read permission. That is correct
+/// for a tenant read and FATAL here: a tenant-scoped context would report a
+/// hidden foreign row as "no such row", which is exactly the fail-OPEN input
+/// the scope gates must never see — `Ok(None)` MUST mean "provably no local
+/// row". The federation receive path is a peer/operator surface, never a
+/// tenant-facing handler, and the resolved value is used ONLY to render a
+/// REFUSAL decision: the row itself is never returned to the peer. This mirrors
+/// the sqlite twin, which reads through the unscoped `db::get`.
+///
+/// `Ok(None)` = provably no row. `Err(_)` = unresolvable; every caller MUST
+/// fail closed (skip the item) rather than treat it as absent.
+#[cfg(feature = "sal")]
+async fn resolve_stored_namespace(
+    app: &AppState,
+    probe_principal: String,
+    id: &str,
+) -> Result<Option<String>, crate::store::StoreError> {
+    let ns_probe_ctx = crate::store::CallerContext::for_admin(probe_principal);
+    match app.store.get(&ns_probe_ctx, id).await {
+        Ok(row) => Ok(Some(row.namespace)),
+        Err(crate::store::StoreError::NotFound { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(feature = "sal")]
 #[allow(clippy::too_many_lines)]
 pub(super) async fn sync_push_via_store(
@@ -148,6 +179,19 @@ pub(super) async fn sync_push_via_store(
     let mut deferred_embed: Vec<(String, String)> = Vec::new();
 
     // ---- memories ----------------------------------------------------
+    // #2447 (CWE-284) — loop-invariant inputs to the inbound-WRITE namespace
+    // scope gate (sqlite-twin parity; the verdict function is shared verbatim
+    // so both backends behave identically). `ns_scope_needs_existing` also
+    // short-circuits the per-memory stored-namespace probe: when Layer 1 is not
+    // armed for this peer the stored namespace cannot change the verdict, so a
+    // zero-config deployment pays ZERO extra round-trips.
+    let require_push_ns_scope =
+        crate::federation::receive_auth::require_push_namespace_scope_enabled();
+    let ns_scope_needs_existing =
+        crate::federation::receive_auth::inbound_write_needs_existing_namespace(
+            peer_header_owned.as_deref(),
+            &attest_cfg,
+        );
     for mem in &body.memories {
         if let Err(e) = validate::RequestValidator::validate_memory(mem) {
             tracing::warn!("sync_push: skipping memory {} ({}): {e}", mem.id, mem.title);
@@ -162,6 +206,44 @@ pub(super) async fn sync_push_via_store(
         }
         if body.dry_run {
             noop += 1;
+            continue;
+        }
+        // #2447 (CWE-284, security-high) — confine the inbound WRITE lane to
+        // the peer's `allowed_namespaces` scope (sqlite-twin parity). Both the
+        // CLAIMED namespace and — because `merge_memory` LWWs the `namespace`
+        // field and `PostgresStore::merge_inbound` field-merges any inbound row
+        // whose `id` matches an existing local row — the STORED namespace of a
+        // colliding row must be in scope, or a `public/*`-scoped peer could
+        // relocate + clobber a `secure/ops` row by pushing its id. A failed
+        // probe fails CLOSED. Reject-before-apply: nothing reaches the store.
+        let existing_ns = if ns_scope_needs_existing {
+            match resolve_stored_namespace(&app, body.sender_agent_id.clone(), &mem.id).await {
+                Ok(ns) => ns,
+                Err(e) => {
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        memory_id = %mem.id,
+                        "sync_push: namespace-scope pre-resolve failed for {}: {e}; \
+                         refusing the write (#2447 fail-closed)",
+                        mem.id
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        if !crate::federation::receive_auth::inbound_write_namespace_authorized(
+            "memories",
+            &mem.id,
+            &mem.namespace,
+            existing_ns.as_deref(),
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+            require_push_ns_scope,
+        ) {
+            skipped += 1;
             continue;
         }
         // v0.7.0 S6-M2 — per-agent quota gate. `agent_quotas` lives on
@@ -538,6 +620,51 @@ pub(super) async fn sync_push_via_store(
         if body.dry_run {
             noop += 1;
             continue;
+        }
+        // #1934 (CWE-284) POSTGRES PARITY, landed with #2447 — the #1934 fix
+        // confined the SQLITE delete loop to the peer's `allowed_namespaces`
+        // but never reached this twin, so a `public/*`-scoped peer could
+        // hard-delete a `secure/ops` row on any postgres-backed node by
+        // guessing ids. `PostgresStore::apply_remote_deletion` discards its
+        // `_ctx` entirely, so nothing downstream re-checks. Resolve the target
+        // row's namespace and refuse ids outside scope, exactly as the sqlite
+        // twin does. A missing row stays a no-op (the peer may have GC'd it);
+        // an UNRESOLVABLE row fails closed.
+        if ns_scope_needs_existing {
+            match resolve_stored_namespace(&app, body.sender_agent_id.clone(), del_id).await {
+                Ok(Some(namespace)) => {
+                    if !crate::federation::peer_attestation::namespace_allowed(
+                        peer_header_owned.as_deref(),
+                        &namespace,
+                        &attest_cfg,
+                    ) {
+                        tracing::warn!(
+                            target: ATTESTATION_TRACE_TARGET,
+                            memory_id = %del_id,
+                            namespace = %namespace,
+                            peer_id = %peer_header_owned.as_deref().unwrap_or(""),
+                            "sync_push: refusing federated deletion outside the peer's \
+                             namespace scope (#1934, postgres parity via #2447)"
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                }
+                Ok(None) => {
+                    noop += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        memory_id = %del_id,
+                        "sync_push: delete pre-resolve failed for {del_id}: {e}; \
+                         refusing the deletion (#1934 fail-closed)"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            }
         }
         match app.store.apply_remote_deletion(&ctx, del_id).await {
             Ok(true) => deleted += 1,
