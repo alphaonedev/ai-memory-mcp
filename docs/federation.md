@@ -269,11 +269,40 @@ independently — these are layered on top.
   handshake-signature check. The daemon quorum client is
   **fail-closed** on an unpinned host (`UnpinnedHostPolicy::Reject` —
   once you opt in, every peer must be pinned, and `--quorum-ca-cert` is
-  bypassed); the `ai-memory sync` CLI keeps **accept-any**
-  (`UnpinnedHostPolicy::AcceptAny`). An empty-but-present file is a
-  fail-closed parse error.
+  bypassed); on the `ai-memory sync` CLI an unpinned host falls through
+  to that path's own default, which since
+  [#1794](https://github.com/alphaonedev/ai-memory-mcp/issues/1794) is
+  **CA validation**, not accept-any (`UnpinnedHostPolicy::AcceptAny`
+  there means "no downgrade relative to the pre-pinning path", and the
+  accept-any disposition itself is now gated — see below). An
+  empty-but-present file is a fail-closed parse error.
   [`src/tls.rs`](../src/tls.rs) (`FED_PEER_FINGERPRINTS_ENV`,
   `FingerprintPinServerVerifier`).
+
+- **Outbound server-cert verification is fail-closed
+  ([#2448](https://github.com/alphaonedev/ai-memory-mcp/issues/2448)).**
+  Federation replicates **plaintext** memory content (it is NOT
+  end-to-end encrypted —
+  [#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968)), so
+  an unverified peer *server* certificate is a direct content-disclosure
+  surface for an adversary in DNS or BGP position. The mTLS control cuts
+  the other way: the peer fingerprint-pinning **our** client cert
+  protects the *peer* from an impostor *client*; it does not protect
+  *us* from an impostor *server*.
+
+  Precedence on the outbound path is **pinning > accept-any >
+  CA-validate**, with CA-validate the default. The accept-any arm is
+  reachable only when the operator supplies **all four** of:
+  `--insecure-skip-server-verify`, `--client-cert`, `--client-key`, and
+  an explicit falsy `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY`
+  (`0`/`false`/`no`/`off`). With the env var unset — the default — the
+  flag is REFUSED at daemon boot with an error naming `--ca-cert` and
+  `AI_MEMORY_FED_PEER_FINGERPRINTS` as the fixes. Under the `asi-hard`
+  security posture the knob is pinned to `1`, so the escape hatch itself
+  is no-disable there.
+  [`src/tls.rs`](../src/tls.rs)
+  (`FED_REQUIRE_SERVER_VERIFY_ENV`, `server_verify_required`,
+  `select_sync_tls_mode`), `src/cli/sync.rs::build_sync_client`.
 
 - **Push-DLQ depth alert + receive-quota narrowing
   ([#1544](https://github.com/alphaonedev/ai-memory-mcp/issues/1544)).**

@@ -744,8 +744,13 @@ async fn run_daemon_mtls_client_path_runs_through_tls_builder() {
     let _ = res;
 }
 
+/// #2448 — `--insecure-skip-server-verify` WITH a full mTLS identity used to
+/// build an accept-any client and enter the sync loop. It is now refused by
+/// default; the accept-any arm is reachable only with the explicit escape
+/// hatch. Both halves are asserted here so the coverage this test provided is
+/// preserved AND the new posture is pinned at the same call site.
 #[tokio::test]
-async fn run_daemon_mtls_with_insecure_skip_logs_warning_and_runs() {
+async fn run_daemon_mtls_with_insecure_skip_is_refused_by_default_2448() {
     let env = Env::fresh();
     let db = env.db_path.clone();
     let cert = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -757,15 +762,47 @@ async fn run_daemon_mtls_with_insecure_skip_logs_warning_and_runs() {
         interval: 1,
         api_key: None,
         batch_size: 10,
+        client_cert: Some(cert.clone()),
+        client_key: Some(key.clone()),
+        insecure_skip_server_verify: true,
+        ca_cert: None,
+    };
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let err = run_daemon(&db, args, Some("alice"))
+        .await
+        .expect_err("insecure-skip must be refused while server verification is required");
+    assert!(
+        err.to_string()
+            .contains(ai_memory::tls::FED_REQUIRE_SERVER_VERIFY_ENV),
+        "refusal must name the escape hatch: {err}"
+    );
+
+    // With the escape hatch set, the accept-any arm builds and the daemon
+    // proceeds into its loop (the pre-#2448 behaviour this test used to
+    // cover) — exercised through `build_sync_client` so no infinite loop is
+    // entered and no env mutation races the daemon task.
+    // SAFETY: this test binary is the only reader of this var; the sibling
+    // R-203 suite lives in its own binary with its own lock.
+    unsafe {
+        std::env::set_var(ai_memory::tls::FED_REQUIRE_SERVER_VERIFY_ENV, "0");
+    }
+    let permissive = SyncDaemonArgs {
+        peers: vec!["http://127.0.0.1:1/".to_string()],
+        interval: 1,
+        api_key: None,
+        batch_size: 10,
         client_cert: Some(cert),
         client_key: Some(key),
         insecure_skip_server_verify: true, // logs warn + sets danger_accept
         ca_cert: None,
     };
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let fut = run_daemon(&db, args, Some("alice"));
-    let res = tokio::time::timeout(std::time::Duration::from_millis(900), fut).await;
-    let _ = res;
+    ai_memory::cli::sync::build_sync_client(&permissive)
+        .await
+        .expect("escape hatch must permit the accept-any client");
+    // SAFETY: same single-reader argument as above.
+    unsafe {
+        std::env::remove_var(ai_memory::tls::FED_REQUIRE_SERVER_VERIFY_ENV);
+    }
 }
 
 #[tokio::test]

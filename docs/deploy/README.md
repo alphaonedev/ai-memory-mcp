@@ -39,6 +39,9 @@ floor (the "no-disable" contract). SSOT: `src/security_profile.rs::KNOBS`.
 - `AI_MEMORY_REQUIRE_CAUSE_BINDING=1`
 - `AI_MEMORY_REQUIRE_ROLE_SEPARATION=1`
 - `AI_MEMORY_REQUIRE_IDENTITY_LINEAGE=1`
+- `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY=1` (#2448 — outbound federation TLS
+  must verify the peer's SERVER cert; `ai-memory sync-daemon
+  --insecure-skip-server-verify` is refused under this posture)
 - `AI_MEMORY_DB_SYNCHRONOUS=FULL` (power-loss durability)
 - plus `[governance].require_operator_pubkey=true` (bridged at the
   governance boot check).

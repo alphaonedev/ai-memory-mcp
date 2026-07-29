@@ -85,9 +85,10 @@ fn args_for(peer_url: &str, insecure: bool) -> SyncDaemonArgs {
 /// Returns `(base_url, shutdown_notify)`.
 async fn spawn_self_signed_peer() -> (String, Arc<Notify>) {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let tls_config = tls::load_rustls_config(&fixture("valid_cert.pem"), &fixture("valid_key_pkcs8.pem"))
-        .await
-        .expect("self-signed fixture server config");
+    let tls_config =
+        tls::load_rustls_config(&fixture("valid_cert.pem"), &fixture("valid_key_pkcs8.pem"))
+            .await
+            .expect("self-signed fixture server config");
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let port = listener.local_addr().expect("local addr").port();
