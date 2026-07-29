@@ -697,3 +697,94 @@ fn bootstrap_never_indexes_a_ladder_added_column() {
         }
     }
 }
+
+/// v1.0.0 #2445 — ALWAYS-COMPILED, ALWAYS-RUN parity guard for the
+/// open-time schema-DOWNGRADE guard, on BOTH backends.
+///
+/// The postgres end-to-end proof is necessarily `#[ignore]` + live-PG, so
+/// on its own it would let a future refactor silently drop the guard from
+/// a postgres lane and stay green through a normal CI run. This
+/// source-text check is the CI-visible half: it asserts, by byte offset,
+/// that the refusal is reached BEFORE the thing it is protecting, on all
+/// four enforcement points.
+///
+/// **Ordering is the whole point.** Both adapters replay their BOOTSTRAP
+/// schema on EVERY open, ALWAYS before the ladder, and `IF NOT EXISTS`
+/// keys on the object NAME — so a guard placed only inside `migrate` /
+/// `migrate_locked` would still let an older binary author DDL against a
+/// newer database before refusing. Hence the pre-bootstrap probes; hence
+/// checking the ORDER, not merely the presence, of each call.
+#[test]
+fn guardrail_2445_downgrade_guard_precedes_bootstrap_and_ladder_on_both_backends() {
+    /// Assert `needle` appears within `haystack[start..]` and BEFORE
+    /// `barrier` (also searched from `start`).
+    fn assert_precedes(src: &str, what: &str, anchor: &str, needle: &str, barrier: &str) {
+        let start = src.find(anchor).unwrap_or_else(|| {
+            panic!(
+                "#2445 [{what}]: anchor `{anchor}` not found — the guard's \
+                 enforcement point moved; re-point this parity check at the new one."
+            )
+        });
+        let rest = &src[start..];
+        let guard_at = rest.find(needle).unwrap_or_else(|| {
+            panic!(
+                "#2445 [{what}]: the schema-DOWNGRADE guard (`{needle}`) is GONE from this lane. \
+                 Without it an OLDER binary silently opens and WRITES a NEWER database — the \
+                 exact defect #2445 reports. Restore the call or delete this guard deliberately \
+                 with an operator-signed rationale."
+            )
+        });
+        let barrier_at = rest.find(barrier).unwrap_or_else(|| {
+            panic!("#2445 [{what}]: barrier `{barrier}` not found after `{anchor}`.")
+        });
+        assert!(
+            guard_at < barrier_at,
+            "#2445 [{what}]: the downgrade guard runs AFTER `{barrier}`. It must run BEFORE — a \
+             guard that fires after the bootstrap DDL / ladder has already touched a newer \
+             database is not fail-closed."
+        );
+    }
+
+    let sqlite_open = read_src("src/storage/connection.rs");
+    assert_precedes(
+        &sqlite_open,
+        "sqlite db::open",
+        "pub fn open(path: &Path)",
+        "ensure_no_schema_downgrade(",
+        "execute_batch(SCHEMA)",
+    );
+
+    let sqlite_ladder = read_src("src/storage/migrations.rs");
+    assert_precedes(
+        &sqlite_ladder,
+        "sqlite migrate",
+        "pub(crate) fn migrate(conn: &Connection)",
+        "ensure_no_schema_downgrade(",
+        "if version >= CURRENT_SCHEMA_VERSION",
+    );
+
+    let pg = read_src("src/store/postgres.rs");
+    assert_precedes(
+        &pg,
+        "postgres connect bootstrap",
+        "let bootstrap_result:",
+        "pg_ensure_no_schema_downgrade(",
+        "render_schema_sql(INIT_SCHEMA",
+    );
+    assert_precedes(
+        &pg,
+        "postgres migrate_locked",
+        "async fn migrate_locked(&self)",
+        "pg_ensure_no_schema_downgrade(",
+        "if current_version >= CURRENT_SCHEMA_VERSION",
+    );
+
+    // Cross-backend text parity: postgres must not grow its own dialect of
+    // the refusal. Both arms route through the sqlite-side SSOT so an
+    // operator reads the identical remedy ladder on either backend.
+    assert!(
+        pg.contains("crate::storage::migrations::ensure_no_schema_downgrade("),
+        "#2445: the postgres arm must delegate to the backend-neutral SSOT in \
+         `crate::storage::migrations`, not carry a second copy of the refusal text."
+    );
+}
