@@ -1,3 +1,24 @@
+# FROZEN HISTORICAL ARTEFACT — DO NOT "FIX" THIS FILE.
+#
+# This is `scripts/qc-allowlists/required-contexts-release.txt` exactly as it
+# stood BEFORE the #2494 residual declared the two decider contexts
+# (`Classify changes`, `Coverage classify (docs-only short-circuit)`). It is the
+# R-203 regression baseline for SECTION C of
+# `scripts/test/test-ci-workflow-invariants.sh`, which asserts:
+#
+#   * this frozen mirror does NOT declare either decider (proving the SECTION C
+#     declaration assertions are load-bearing rather than tautological); and
+#   * with this mirror, a job-level `if:` planted on `ci.yml`'s `classify` job —
+#     the decider that nine dependent jobs `needs:` — passes the soundness gate
+#     SILENTLY, because a context the mirror never declares is a context no rule
+#     is ever applied to. That is the defect the declaration closes, and rule
+#     (b4) is what keeps it closed.
+#
+# Repairing this file (adding the two contexts) would make both legs vacuous.
+# A committed fixture rather than a `git show` so the legs survive CI's shallow
+# checkout instead of silently SKIPping — the #2496 lesson.
+#
+# ---------------------------------------------------------------------------
 # required-contexts-release.txt — the DECLARED required-status-check set for
 # the protected branch `release/v1.0.0`, verified by
 # `scripts/check-required-contexts.sh` (#2494 / #2496).
@@ -46,46 +67,9 @@
 #   change and this mirror together, and state the intent — not the API
 #   response — in the commit message.
 #
-#   ORDER, when the two halves cannot be atomic (they cannot — the mirror is a
-#   PR and protection is an API call). For an ADDITION: land the mirror FIRST,
-#   then add the context to protection. The gate can only prove a context sound
-#   once the mirror declares it, so mirror-first means the soundness proof is
-#   green in CI BEFORE the context becomes load-bearing — prove, then enforce.
-#   The intermediate state (declared, not yet required) over-claims enforcement
-#   for one visible, diffable window and blocks nothing, because GitHub never
-#   reads this file. The reverse order produces the strictly worse state: a
-#   live-required context that NO in-repo file declares, which this gate cannot
-#   detect (it has no API access, by design) — so its rule coverage silently
-#   narrows while it still exits 0. For a REMOVAL the order inverts for the same
-#   reason: drop it from protection first, then from the mirror.
-#
 # ---------------------------------------------------------------------------
 # Carried by .github/workflows/ci.yml
 # ---------------------------------------------------------------------------
-# THE DECIDER (#2494 residual). `classify` has no `needs:`, no job-level `if:`,
-# no `strategy: matrix` and sits behind no `paths:` filter, so it ALWAYS runs
-# and always reports a real `success`/`failure` — including on a docs-only diff,
-# where it is one of only two contexts in this pipeline that report a genuine
-# `success` instead of `skipped`. Probed on 45ba8741, the docs-only commit that
-# PROVED the #2494 wedge: `success  Classify changes`. So requiring it is free
-# of wedge risk and load-bearing at the same time — this ONE job decides
-# `docs_only` for the seven ratcheted ci.yml contexts below, and until this
-# entry landed it was not itself required: one unrequired job governed the
-# disposition of eleven required ones. Rule (b4) HARD-FAILS — never
-# allowlistable — if a decider ever acquires a job-level `if:`, because a
-# skipped decider skips every dependent and satisfies them all at once.
-#
-# The #2508 cancelled-duplicate hazard does NOT apply. `ci.yml`'s `push:`
-# branches are `main` / `develop` / `release/**` plus `v*` tags, none of which
-# can match a PR HEAD branch, so a push to `fix/x` fires no push-event run and
-# exactly ONE run exists per SHA. Probed on the heads of PRs #2497 / #2505 /
-# #2499: `Classify changes` appears exactly once each. Contrast
-# `tool-count-drift.yml`, whose push branches include `fix/**` / `feat/**` — on
-# PR #2505's head 3fa45067 its `tool-count grep gate` appears TWICE, once
-# `cancelled` and once `success`. That is #2508, and it is why "both jobs always
-# run" is necessary but not sufficient for a context to be safe to require.
-Classify changes
-#
 # Non-matrix jobs with a job-level `if:` — these report `skipped` on a
 # docs-only diff, which branch protection COUNTS AS SATISFIED. Each is
 # recorded in the burn-down ratchet
@@ -126,16 +110,6 @@ Test-env $HOME-lock gate (#2146)
 # ---------------------------------------------------------------------------
 # Carried by .github/workflows/coverage.yml
 # ---------------------------------------------------------------------------
-# The SECOND decider (#2494 residual) — same shape, same argument as
-# `Classify changes` above: no `needs:`, no job-level `if:`, no matrix, no
-# `paths:` filter, `release/**` on the `pull_request` trigger, and a `push:`
-# branch list (`main` / `develop` / `release/**` / `feat/v0.7.0-grand-slam`)
-# that cannot match a PR head branch, so one run per SHA. Probed `success` on
-# the same three PR heads and on the docs-only 45ba8741. It decides `docs_only`
-# for `Per-Module Coverage Thresholds` below, which IS required — so before this
-# entry the required coverage gate's disposition was set by an unrequired job.
-Coverage classify (docs-only short-circuit)
-#
 # Job-level `if:`; ratcheted like the ci.yml seven above.
 Per-Module Coverage Thresholds
 #
@@ -144,11 +118,12 @@ Per-Module Coverage Thresholds
 # Closing any of them is a branch-protection edit, deliberately NOT done in
 # this change.
 # ---------------------------------------------------------------------------
-#   * CLOSED (#2494 residual) — `Classify changes` + `Coverage classify
-#     (docs-only short-circuit)` are now DECLARED above. Until the companion
-#     branch-protection API call lands they are declared-but-not-yet-required;
-#     see "ORDER" in HOW TO CHANGE THIS FILE for why that is the safe half to
-#     land first. The live set is 22 contexts until that call, 24 after.
+#   * `Classify changes` (ci.yml) and `Coverage classify (docs-only
+#     short-circuit)` (coverage.yml) are NOT required, yet between them they
+#     decide the disposition of the eight ratcheted contexts above. Both
+#     always run — no `needs:`, no job-level `if:`, `release/**` in
+#     `branches:` — so requiring them is free and carries zero wedge risk.
+#     THE natural companion fix to #2496; follow-up, protection-frozen here.
 #   * Two c8-precheck integrity gates run on every PR but are not required:
 #     `Installer checksum fail-closed gate (#2449)` and
 #     `Non-Rust conformance-reader proof gate (#2452)`.

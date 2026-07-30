@@ -344,6 +344,202 @@ else
         || bad "B: a watchdog-fallback arm lacks --no-fail-fast" "$fallback_bad"
 fi
 
+# ===========================================================================
+# SECTION C — #2494 RESIDUAL: the two DECIDER contexts are declared, reporting,
+# and structurally kept that way.
+#
+# WHAT LANDED IN #2505. The wedge and the classifier were fixed, and the
+# soundness gate + this harness shipped. What #2505 deliberately did NOT do was
+# require the two jobs that DECIDE the docs-only short-circuit:
+# `Classify changes` (ci.yml) and `Coverage classify (docs-only short-circuit)`
+# (coverage.yml). One unrequired job pair governed the disposition of eleven
+# required contexts.
+#
+# WHY REQUIRING THEM IS SAFE — the premise, asserted here rather than assumed.
+# Both jobs have no `needs:`, no job-level `if:`, no `strategy:` and sit behind
+# no `paths:` filter, so they ALWAYS run and always report a real
+# success/failure. On the docs-only commit 45ba8741 that PROVED the #2494 wedge,
+# both reported `success` — they are the only two contexts in these pipelines
+# that report a genuine success on a docs-only diff rather than `skipped`.
+# And the #2508 cancelled-duplicate hazard does not apply, because neither
+# carrier's `push:` branch list can match a PR HEAD branch, so exactly one run
+# exists per SHA. (Contrast `tool-count-drift.yml`, whose push branches include
+# `fix/**` — on PR #2505's head 3fa45067 its context appears twice, once
+# `cancelled` and once `success`. That is #2508. Deliberately NOT asserted here:
+# coupling this leg to that file would make L0-b's fix fail this test.)
+#
+# Each of those four premises is a live property of the workflows, so each is
+# checked, not trusted. C1 additionally re-derives the context STRINGS from the
+# workflows through the gate's own audited parser (`--dump`) instead of a
+# hand-copied literal, so a job rename that is not mirrored fails here as well
+# as at gate rule (a) — the #2473 class applied to the new contexts.
+# ===========================================================================
+echo "  --- Section C: #2494 residual — the two decider contexts ---"
+
+GATE="$ROOT/scripts/check-required-contexts.sh"
+MIRROR="${RQC_MIRROR_FILE:-$ROOT/scripts/qc-allowlists/required-contexts-release.txt}"
+PREFIX_MIRROR="${REQUIRED_CONTEXTS_BASELINE_FILE:-$ROOT/scripts/test/fixtures/required-contexts-prefix-2494.txt}"
+# Overridable so each leg below can be mutation-tested against a planted copy
+# without touching the real workflows.
+WF_DIR="${RQC_WORKFLOW_DIR:-$ROOT/.github/workflows}"
+
+# job_fact <workflow-basename> <job-id> <field>
+# field: name | if | matrix | needs. Reads the audited parser's record stream so
+# this harness cannot disagree with the gate about what the YAML says.
+job_fact() {
+    RQC_WORKFLOW_DIR="$WF_DIR" bash "$GATE" --dump 2>/dev/null | awk -F'\t' -v w="$1" -v j="$2" -v f="$3" '
+        $1 == "JOB" && $2 == w && $3 == j {
+            if (f == "name")   print $4
+            if (f == "if")     print $5
+            if (f == "matrix") print $6
+            if (f == "needs")  print $7
+        }'
+}
+
+# pr_branches <workflow-basename> / pr_paths <workflow-basename>
+wf_fact() {
+    RQC_WORKFLOW_DIR="$WF_DIR" bash "$GATE" --dump 2>/dev/null | awk -F'\t' -v w="$1" -v f="$2" '
+        $1 == "WF" && $2 == w {
+            if (f == "pr")       print $3
+            if (f == "paths")    print $4
+            if (f == "branches") print $5
+        }'
+}
+
+# push_branches <workflow-path> — the gate's parser records only the
+# pull_request branch list, so read the push list directly.
+push_branches() {
+    awk '
+      function indent(l,  n) { n = 0; while (substr(l, n + 1, 1) == " ") n++; return n }
+      /^[A-Za-z]/ { section = $0; sub(/:.*/, "", section) }
+      section == "on" {
+        ind = indent($0)
+        line = $0; sub(/^[ \t]+/, "", line)
+        if (ind == 2) { onkey = line; sub(/:.*/, "", onkey) }
+        else if (ind == 4 && onkey == "push" && line ~ /^branches:/) {
+          sub(/^branches:[ \t]*/, "", line); print line; exit
+        }
+      }
+    ' "$1"
+}
+
+# declared_in_mirror <mirror-file> <context>
+# Same comment rules as the gate's read_list: whole-line `#` only, so a context
+# mentioned inside a KNOWN-GAPS comment does NOT count as declared. That
+# distinction is the entire point of the regression leg below.
+declared_in_mirror() {
+    awk -v want="$2" '
+        { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+        line == "" { next }
+        substr(line, 1, 1) == "#" { next }
+        line == want { found = 1 }
+        END { exit(found ? 0 : 1) }
+    ' "$1"
+}
+
+# The two deciders: <workflow-basename> <job-id> <expected-mirror-context>
+DECIDERS=(
+    "ci.yml classify"
+    "coverage.yml classify"
+)
+
+for entry in "${DECIDERS[@]}"; do
+    set -- $entry
+    dwf="$1"; djob="$2"
+    dname="$(job_fact "$dwf" "$djob" name)"
+
+    # C1 — the name the workflow actually reports is DECLARED in the mirror.
+    if [ -z "$dname" ]; then
+        bad "C1 $dwf job '$djob' could not be parsed" \
+            "the harness or the parser is broken, not the workflow"
+    elif declared_in_mirror "$MIRROR" "$dname"; then
+        ok "C1 $dwf decider name '$dname' is DECLARED in the mirror"
+    else
+        bad "C1 $dwf decider '$dname' is NOT declared in $MIRROR" \
+            "a required decider that the mirror does not declare is a context no gate rule is ever applied to (#2494 residual); if the job was renamed, update the mirror in the SAME change"
+    fi
+
+    # C2 — the premise that makes requiring it safe: it always runs.
+    if [ "$(job_fact "$dwf" "$djob" if)" = "0" ] && [ "$(job_fact "$dwf" "$djob" matrix)" = "0" ]; then
+        ok "C2 $dwf|$djob has NO job-level 'if:' and NO matrix (always runs, reports a real success/failure)"
+    else
+        bad "C2 $dwf|$djob acquired a job-level 'if:' or a matrix" \
+            "a skipped decider skips every dependent, and each skipped required dependent counts as SATISFIED — gate rule (b4) hard-fails this"
+    fi
+
+    # C3 — the carrier fires on PRs to release/**, unfiltered.
+    if [ "$(wf_fact "$dwf" pr)" = "1" ] && [ "$(wf_fact "$dwf" paths)" = "0" ] \
+        && case ",$(wf_fact "$dwf" branches)," in *",release/**,"*) true ;; *) false ;; esac; then
+        ok "C3 $dwf pull_request trigger covers release/** with no paths: filter"
+    else
+        bad "C3 $dwf pull_request trigger no longer covers release/** unfiltered" \
+            "pr=$(wf_fact "$dwf" pr) paths=$(wf_fact "$dwf" paths) branches=$(wf_fact "$dwf" branches) — an unreportable required context wedges the branch"
+    fi
+
+    # C4 — the #2508 precondition: no push-branch pattern may match a PR head
+    # branch, or every SHA carries a second `cancelled` row for this context.
+    # Ratchet-shaped: the list must stay within the protected-branch patterns
+    # below. `feat/v0.7.0-grand-slam` is a grandfathered LITERAL (a legacy pin
+    # in coverage.yml), not a wildcard, so it cannot match a class of heads.
+    pushb="$(push_branches "$WF_DIR/$dwf")"
+    unexpected=""
+    for tok in $(printf '%s' "$pushb" | tr -d '[]"' | tr ',' ' '); do
+        case "$tok" in
+            main | develop | 'release/**' | feat/v0.7.0-grand-slam) ;;
+            "") ;;
+            *) unexpected="$unexpected $tok" ;;
+        esac
+    done
+    if [ -z "$unexpected" ]; then
+        ok "C4 $dwf push branches are protected-branch-only ($pushb) — one run per SHA, no #2508 cancelled twin"
+    else
+        bad "C4 $dwf push: trigger gained branch pattern(s):$unexpected" \
+            "if any of those can match a PR HEAD branch, this context gets a duplicate CANCELLED check-run on every SHA (#2508) and must not stay a required context in that shape"
+    fi
+done
+
+# --- Regression leg (R-203): the frozen PRE-FIX mirror must FAIL C1. --------
+# Fail-closed: a missing or repaired fixture is a FAILURE, never a SKIP.
+if [ ! -s "$PREFIX_MIRROR" ]; then
+    bad "C regression leg: frozen pre-fix mirror fixture missing" "$PREFIX_MIRROR"
+elif declared_in_mirror "$PREFIX_MIRROR" "Classify changes" \
+    || declared_in_mirror "$PREFIX_MIRROR" "Coverage classify (docs-only short-circuit)"; then
+    bad "C regression leg: the frozen pre-fix mirror was 'repaired'" \
+        "$PREFIX_MIRROR is a historical artefact and must keep BOTH deciders undeclared, or C1 becomes tautological"
+else
+    ok "C regression: the frozen PRE-FIX mirror declares NEITHER decider — C1 is load-bearing"
+
+    # The behavioural half. Plant a job-level `if:` on ci.yml's decider in a
+    # throwaway copy and run the REAL gate twice: with the live mirror it must
+    # hard-fail rule (b4); with the frozen pre-fix mirror it must pass — which
+    # is exactly the blind spot the declaration closes.
+    MUT="$SCRATCH/mutated-wf"
+    mkdir -p "$MUT"
+    cp "$WF_DIR"/*.yml "$MUT"/
+    awk '
+      { print }
+      /^    name: Classify changes$/ && !done { print "    if: github.event_name != '\''schedule'\''"; done = 1 }
+    ' "$WF_DIR/ci.yml" > "$MUT/ci.yml"
+    if ! grep -q "^    if: github.event_name" "$MUT/ci.yml"; then
+        bad "C regression leg: could not plant the decider 'if:' fixture" \
+            "the harness is broken, not the workflow"
+    else
+        live_rc=0
+        RQC_WORKFLOW_DIR="$MUT" bash "$GATE" >/dev/null 2>&1 || live_rc=$?
+        prefix_rc=0
+        RQC_WORKFLOW_DIR="$MUT" RQC_MIRROR_FILE="$PREFIX_MIRROR" bash "$GATE" >/dev/null 2>&1 || prefix_rc=$?
+        if [ "$live_rc" -ne 0 ] && [ "$prefix_rc" -eq 0 ]; then
+            ok "C regression: a decider 'if:' is CAUGHT under the live mirror (b4) and passes SILENTLY under the frozen pre-fix mirror — the declaration is what makes the rule reachable"
+        elif [ "$live_rc" -eq 0 ]; then
+            bad "C regression: a job-level 'if:' on the ci.yml decider did NOT fail the gate" \
+                "rule (b4) has gone blind — nine dependent required contexts could all go skipped-and-satisfied at once"
+        else
+            bad "C regression: the frozen pre-fix mirror also rejected the decider 'if:'" \
+                "the baseline no longer reproduces the pre-fix blind spot (exit $prefix_rc) — the fixture may have been repaired"
+        fi
+    fi
+fi
+
 echo ""
 if [ "$FAIL" -eq 0 ]; then
     echo "ci.yml invariants: $PASS/$PASS PASS"

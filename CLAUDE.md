@@ -1167,14 +1167,30 @@ required contexts carry a job-level `if:` and report `skipped`, which
 branch protection COUNTS AS SATISFIED — tolerable only while the
 classifier is right, and it was not (#2496). **The unreportable
 context:** a `paths:` filter on the carrying workflow's `pull_request`
-trigger wedges the branch identically, with no `if:` in sight.
-HARD-BLOCKS all three statically against a HAND-AUTHORED mirror at
+trigger wedges the branch identically, with no `if:` in sight. **The
+unrequired decider** (#2494 residual): the job that DECIDED the
+skipped-vs-ran disposition of the fail-open was not itself required —
+`Classify changes` (ci.yml) and `Coverage classify (docs-only
+short-circuit)` (coverage.yml) between them governed ELEVEN required
+contexts while being required by nothing. Both are now DECLARED in the
+mirror (24 declared contexts; the live set is 22 until the companion
+branch-protection API call lands — for an ADDITION the mirror lands
+FIRST, because the gate can only prove a context sound once the mirror
+declares it, so mirror-first means "prove, then enforce"; the reverse
+order leaves a live-required context that no in-repo file declares,
+which this gate cannot detect and so silently narrows its own coverage).
+HARD-BLOCKS all of it statically against the HAND-AUTHORED mirror at
 `scripts/qc-allowlists/required-contexts-release.txt`: **(a)** every
 mirror context equals a parsed static job `name` or an expanded matrix
 name from a workflow whose `pull_request.branches` covers the protected
 branch; **(b1) HARD-FAIL, never allowlistable** — matrix AND job-level
-`if:` together (the exact wedge); **(b2)** a job-level `if:` at all fails
-unless listed in the burn-down ratchet
+`if:` together (the exact wedge); **(b4) HARD-FAIL, never
+allowlistable** — the job is a DECIDER (another job in the same workflow
+declares `needs:` it) AND carries a job-level `if:`; a skipped decider
+skips its whole dependent subtree and every skipped member then counts
+as SATISFIED, so ONE allowlist entry would buy the subtree, which is
+exactly why (b4) is not ratchetable the way (b2) is; **(b2)** a
+job-level `if:` at all fails unless listed in the burn-down ratchet
 `required-contexts-joblevel-if-allow.txt`, where a STALE entry also fails
 so the ledger cannot rot; **(c)** the carrier's `pull_request` trigger
 exists and has no `paths:`/`paths-ignore:` filter; **(b3)** in any
@@ -1191,8 +1207,10 @@ implements the real YAML scalar rule (a `#` preceded by whitespace opens
 a comment; `(#1174 PR10)` does not) and was cross-checked against PyYAML
 on all 58 jobs across all 17 workflows with zero mismatches.
 `--self-test` plants the (b1) wedge, an (a) unmatched context, a (c)
-path-filtered carrier, a (b3) unguarded step and both directions of the
-(b2) ratchet in a throwaway copy UNDER the repo (never system `/tmp`);
+path-filtered carrier, a (b3) unguarded step, a (b4) decider `if:`
+(rejected EVEN WHEN allowlisted — the property that separates (b4) from
+(b2)) and both directions of the (b2) ratchet in a throwaway copy UNDER
+the repo (never system `/tmp`);
 `--dump` prints the raw parse stream. The job is wired UNCONDITIONALLY —
 no `needs: classify`, no job-level `if:`, no `paths:` — because a gate
 policing the docs-only short-circuit must not be subject to it. Its
@@ -1201,8 +1219,19 @@ EXTRACTS the `classify` shell verbatim from `ci.yml` and drives it over
 throwaway git fixtures, then runs the same fixtures against the pre-fix
 block frozen at `scripts/test/fixtures/ci-classify-prefix-2496.sh` — a
 code-then-docs PR must classify `docs_only=false` live and `true` frozen,
-so a silently-broken extraction cannot make the assertions vacuous.
-Data-integrity guardrail (North Star: a control that reports success
+so a silently-broken extraction cannot make the assertions vacuous. Its
+SECTION C (#2494 residual) holds the four live premises that make
+requiring a decider safe — name declared in the mirror (re-derived from
+the workflow through the gate's own `--dump` parser, never a hand-copied
+literal, so an unmirrored rename fails here too), no job-level `if:` and
+no matrix, `pull_request` covering `release/**` unfiltered, and a `push:`
+branch list that cannot match a PR HEAD branch (the #2508 precondition:
+one run per SHA, no `cancelled` twin) — with an R-203 regression leg
+against the mirror frozen at
+`scripts/test/fixtures/required-contexts-prefix-2494.txt`: under that
+pre-fix mirror a planted decider `if:` passes the gate SILENTLY, which is
+the blind spot the declaration closes and the proof the leg is not
+tautological. Data-integrity guardrail (North Star: a control that reports success
 while doing nothing is worse than a missing control, because 22 green
 checks actively imply rigor that is not present).
 
