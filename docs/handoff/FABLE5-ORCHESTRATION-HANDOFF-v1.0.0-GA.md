@@ -64,12 +64,14 @@ Also forbidden: `workflow_dispatch` on any of the three workflows above.
 
 ### 2.2 IN FLIGHT — awaiting Fable 5 approval, do not assume state
 
-| PR | Head | State at handoff | Notes |
-|---|---|---|---|
-| **#2499** | `c16e2d50`+update | `MERGEABLE/BLOCKED`, **7 required contexts pending, 0 failures** | Prerelease guard on `publish-sdks.yml` + comment truth-fix. Was fully green at `c8598c36` before the base moved. |
-| **#2507** | `f9c1962b`+update | `MERGEABLE/BLOCKED`, **7 required contexts pending, 0 failures** | Evidence-only (JSON under `governance/control-plane/`). Had one crates.io network flake (`[18] Transferred a partial file` on `async-trait`) — rerun, not a code defect. |
+**CI has SETTLED. Both are fully green and ready for adjudication.** Verified per §5 (per-context against the live required list), not read off a summary:
 
-The 7 pending on each are the heavy gates: `Check (ubuntu/macos/windows-latest)`, `Per-Module Coverage Thresholds`, `Postgres feature gate`, `SAL-only feature gate`, `vectorlite feature gate`.
+| PR | Head | State | Required contexts | Notes |
+|---|---|---|---|---|
+| **#2499** | `4671610f` | `MERGEABLE/**UNSTABLE**` | **22/22 green, 0 absent, 0 not-green** | Prerelease guard on `publish-sdks.yml` + comment truth-fix. `UNSTABLE` is caused **solely** by `tool-count grep gate(CANCELLED)` — the #2508 dual-trigger duplicate, **not a required context**. Benign; do not rerun chasing it. |
+| **#2507** | `debcd3aa` | `MERGEABLE/**CLEAN**` | **22/22 green, 0 absent, 0 not-green** | Evidence-only (JSON under `governance/control-plane/`). Its earlier `vectorlite feature gate` FAILURE was a crates.io network flake (`curl failed / [18] Transferred a partial file` on `async-trait`); rerun passed. Not a code defect. |
+
+**#2499 is the concrete worked example of #2508.** Its `UNSTABLE` status is a cancelled duplicate that `gh pr checks` would render as `pass`, on a PR where every required context is genuinely green. Use it to confirm the §5 procedure distinguishes the two before trusting that procedure on security work.
 
 **`strict: true` is set on the branch**, so each merge puts every other open PR `BEHIND` and requires `update-branch` + a fresh CI cycle. Sequence merges deliberately; do not batch.
 
@@ -324,7 +326,7 @@ Before approving any merge:
 
 ## 6. FIRST FIVE ACTIONS FOR FABLE 5
 
-1. **Adjudicate #2499 and #2507** (§2.2). Both were green before their base moved; CI is re-running. Verify per §5, then approve or reject.
+1. **Adjudicate #2499 and #2507** (§2.2). **CI has settled: both are 22/22 green on required contexts, 0 absent.** #2507 is `CLEAN`; #2499 is `UNSTABLE` solely from the #2508 cancelled duplicate, which is not a required context. Nothing is pending and nothing needs rerunning — this is purely an approval decision.
 2. **Dispatch L0-a (#2494 residual)** to Opus 5 — require the two classify contexts + update the hand-authored mirror in the same change. The safety analysis is already done (§3.2); it needs implementing, not re-deciding.
 3. **Dispatch L0-b (#2508)** — split it: the `tool-count-drift.yml` push-branch narrowing to Sonnet 5, the structural gate rule to Opus 5.
 4. **Dispatch L1-a** — the 6 keyword-never-fired issues. Verify each at its merged SHA. This is pure ledger accuracy and it is currently wrong.
