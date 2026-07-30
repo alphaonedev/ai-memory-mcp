@@ -32,14 +32,38 @@
 name: tool-count-drift
 
 on:
+  # push.branches is deliberately restricted to branches that are NEVER a
+  # PR HEAD (#2508). It used to include `feat/**` + `fix/**`, which DO
+  # overlap PR head-branch names: every push to a PR's head branch fired
+  # BOTH a push-event run and a pull_request-event run, and the
+  # concurrency key below resolves to the SAME value for both (the push
+  # event has no `pull_request` context, so the ternary falls through to
+  # `github.ref_name` = the head branch; the same-repo pull_request event
+  # resolves to `head.ref` = the same string). With
+  # `cancel-in-progress: true` that collision is guaranteed, not
+  # occasional, so one of the two runs was ALWAYS cancelled and the
+  # cancelled check-run row is permanent. `cancelled` is a disposition
+  # that reads as pass in `gh pr checks` while blocking a merge if the
+  # context is ever added to `required_status_checks.contexts` — a latent
+  # branch wedge whose cause is invisible in the obvious place.
+  #
+  # Narrowing costs no coverage: the pull_request run already gates every
+  # PR (its `branches:` list is a BASE-branch filter, so a PR from any
+  # head branch into main/develop/feat/**/release/** is still gated), and
+  # the PR run is where this gate's verdict is consumed. This mirrors the
+  # shape `ci.yml` and `coverage.yml` already use, which is why their
+  # always-run jobs are safe to require while this one was not.
   push:
-    branches: [main, develop, "feat/**", "fix/**", "release/**"]
+    branches: [main, develop, "release/**"]
   pull_request:
     branches: [main, develop, "feat/**", "release/**"]
 
 # Fork-PR-safe concurrency key: coalesces push + same-branch internal
 # PR events; isolates fork PRs by PR number so they cannot collide
 # with protected-branch keys. See ci.yml for full rationale.
+# Semantics are UNCHANGED by #2508 — the fix is the trigger narrowing
+# above, which removes the collision at the source rather than papering
+# over it with a per-event key suffix.
 concurrency:
   group: tool-count-drift-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
   cancel-in-progress: true
