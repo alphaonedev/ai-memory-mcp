@@ -1,0 +1,56 @@
+# dual-trigger-cancel-allow.txt — PENDING-FIX LEDGER for rule (d) of
+# `scripts/check-required-contexts.sh` (#2508).
+#
+# WHAT AN ENTRY HERE MEANS. This workflow triggers on BOTH `push` and
+# `pull_request`, one of its `push.branches` patterns CAN match a PR HEAD
+# branch, and its `concurrency` group cancels in-progress runs on a key that
+# resolves to the SAME value for both events. So every push to such a head
+# branch starts two runs for ONE sha in one group, one of them is ALWAYS
+# cancelled, and the cancelled check-run row is PERMANENT. `cancelled` READS AS
+# PASS in `gh pr checks` while branch protection does not count it as
+# satisfied — so the day that context is added to
+# `required_status_checks.contexts`, the branch wedges on every PR from such a
+# branch and the standard triage command conceals the cause.
+#
+# An entry is therefore an ACKNOWLEDGED, TRACKED defect — never an absolution,
+# and never a design choice. The remedy is always one of:
+#   * narrow `push.branches` to branches that are never a PR head — main /
+#     develop / release/** — which is what #2509 did to `tool-count-drift.yml`
+#     and the shape `ci.yml` / `coverage.yml` already use. No coverage is lost:
+#     the `pull_request` trigger's `branches:` list is a BASE-branch filter, so
+#     every PR is still gated from any head branch.
+#   * or, when the push-event run genuinely must exist on head branches, fold
+#     `${{ github.event_name }}` into the concurrency group so the two events
+#     cannot share a key — at the cost of keeping BOTH runs per push.
+#
+# FORMAT (enforced; a malformed line FAILS the gate):
+#     <workflow-file> <push-branches-pattern> #<issue> [free-text note]
+# The PATTERN scopes the excuse to the one overlap that was actually reviewed:
+# if the workflow later acquires a DIFFERENT overlapping pattern, that pattern
+# has no entry and the gate fails normally. The ISSUE is the thing that closes
+# the entry, so the ledger cannot rot into an unexplained suppression.
+#
+# STALENESS. When a listed carrier is fixed, its entry stops matching and the
+# gate prints a loud NOTICE naming the line to delete — it is NOT a failure.
+# Unlike the (b2) burn-down ratchet (where a stale line could absolve a
+# DIFFERENT context), an entry here excuses exactly one (workflow, pattern)
+# pair, so once the carrier is fixed the line can only suppress a failure that
+# no longer happens. Failing on it would red whichever PR merely LOST THE RACE
+# to the carrier fix — a false alarm charged to the wrong author. Delete stale
+# lines on sight; the gate will keep asking.
+#
+# ---------------------------------------------------------------------------
+# 2026-07-30 (#2508 structural half) — the one carrier still in this state when
+# rule (d) landed. `tool-count-drift.yml` (the carrier that surfaced the class)
+# was fixed in #2509; `c8-precheck.yml`'s `local/**` overlap is fixed in the
+# same commit as this file.
+#
+# token-budget.yml is DELIBERATELY NOT FIXED HERE: #2506 is repairing it in
+# parallel, and its repair is not the one-line narrowing the others took — its
+# `pull_request.branches` omits `release/**`, so narrowing `push.branches`
+# alone would leave a `feat/**` -> `release/v1.0.0` PR with NO token-budget run
+# at all, a fail-OPEN traded for a cancelled row. Two agents editing that file
+# concurrently is how one of the two fixes gets silently reverted, so this
+# entry holds the line until #2506 lands, and then it goes.
+# ---------------------------------------------------------------------------
+token-budget.yml feat/** #2506 push.branches includes feat/**, which is a PR head prefix; fix must also widen pull_request.branches to release/**
