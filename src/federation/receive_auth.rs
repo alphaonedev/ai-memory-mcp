@@ -1305,6 +1305,119 @@ mod tests {
         );
     }
 
+    /// #2488 — the by-id verdict's `Option<&str>` contract, exercised without
+    /// any HTTP/DB plumbing. The `None` arms are the whole point of the type
+    /// change: one must reach Layer 2 (the shape whose gate #2488 skipped), the
+    /// other must fail CLOSED (the shape a fabricated `unwrap_or("")` would have
+    /// silently glob-matched into a Layer-1 accept-or-refuse on an empty string).
+    #[test]
+    fn inbound_by_id_verdict_option_contract_2488() {
+        use crate::federation::peer_attestation::{PeerAttestationConfig, PeerScope};
+
+        // ZERO-CONFIG — #2491. A verbatim `namespace_allowed` call returns false
+        // here (its `scope_for == None` arm falls through to the default-off
+        // `sync_trust_peer_bypass`), which is exactly the silent
+        // delete-replication outage. The verdict must short-circuit to `true`
+        // regardless of whether the caller resolved a namespace.
+        let zero_config = PeerAttestationConfig::default();
+        for stored in [None, Some("secure/ops")] {
+            assert!(
+                inbound_by_id_namespace_authorized(
+                    LANE_DELETIONS,
+                    "id-1",
+                    stored,
+                    &zero_config,
+                    Some("peer-1"),
+                    true,
+                ),
+                "zero-config must replicate the deletion (#2491), stored={stored:?}"
+            );
+        }
+
+        // ENROLLED + UNSCOPED — #2488. Layer 1 is NOT armed, so the caller
+        // legitimately elides the probe and passes `None`; the verdict must
+        // still reach Layer 2 rather than skipping all checking.
+        let mut unscoped = PeerAttestationConfig::default();
+        unscoped.peers.insert(
+            "peer-1".to_string(),
+            PeerScope {
+                allowed_sender_agent_ids: vec!["a".to_string()],
+                allowed_namespaces: vec![],
+            },
+        );
+        assert!(
+            !inbound_by_id_namespace_authorized(
+                LANE_DELETIONS,
+                "id-1",
+                None,
+                &unscoped,
+                Some("peer-1"),
+                true,
+            ),
+            "#2488: an enrolled peer declaring no scope must be REFUSED on the \
+             by-id lane even though the stored namespace was never read — this is \
+             the arm the read-elision predicate made unreachable"
+        );
+        assert!(
+            inbound_by_id_namespace_authorized(
+                LANE_DELETIONS,
+                "id-1",
+                None,
+                &unscoped,
+                Some("peer-1"),
+                false,
+            ),
+            "#2488: the env-row-147 rollout opt-out must be REACHABLE on this lane"
+        );
+
+        // ENROLLED + SCOPED — Layer 1 armed. `Some` behaves as before, and
+        // `None` (a caller that wrongly elided a load-bearing probe) must fail
+        // CLOSED rather than be waved through.
+        let mut scoped = PeerAttestationConfig::default();
+        scoped.peers.insert(
+            "peer-1".to_string(),
+            PeerScope {
+                allowed_sender_agent_ids: vec![],
+                allowed_namespaces: vec!["public/*".to_string()],
+            },
+        );
+        assert!(
+            inbound_by_id_namespace_authorized(
+                LANE_DELETIONS,
+                "id-1",
+                Some("public/ok"),
+                &scoped,
+                Some("peer-1"),
+                true,
+            ),
+            "Layer 1: an in-scope stored namespace is applied"
+        );
+        assert!(
+            !inbound_by_id_namespace_authorized(
+                LANE_DELETIONS,
+                "id-1",
+                Some("secure/ops"),
+                &scoped,
+                Some("peer-1"),
+                true,
+            ),
+            "Layer 1: an out-of-scope stored namespace is refused (#1934)"
+        );
+        assert!(
+            !inbound_by_id_namespace_authorized(
+                LANE_DELETIONS,
+                "id-1",
+                None,
+                &scoped,
+                Some("peer-1"),
+                true,
+            ),
+            "#2488 fail-closed: `None` while Layer 1 IS armed means the caller \
+             elided a load-bearing probe; the stored namespace decides on that \
+             path, so an absent value must never be admitted"
+        );
+    }
+
     #[test]
     fn fed_require_sig_defaults_flipped_strict_at_v1_0_0() {
         // #1801→#1954 item 5 — the v1.0.0 flip: BOTH lane consts are now `true`
