@@ -789,6 +789,25 @@ pub(super) async fn sync_push_via_store(
     // MCP/epoch-apply-native checkpoint path) applies them fully. Full
     // postgres-backed checkpoint-resolution federation is a tracked follow-up
     // (a new `apply_remote_checkpoint_resolution` trait method).
+    // #2478 (CWE-284) — this bucketing is what makes the federated
+    // arbitrary-namespace pending-execution lane STRUCTURALLY UNREACHABLE on
+    // postgres: `sync_push` hands the whole request to this funnel before the
+    // sqlite `pendings[]` / `pending_decisions[]` loops run, and nothing here
+    // calls `decide_pending_action` / `approve_with_approver_type` /
+    // `execute_pending_action`. The disposition is fail-closed AND honest —
+    // `unsupported_on_postgres > 0` is a sender-side non-ack, never a silent
+    // drop. Pinned by `tests/federation_pending_ns_scope_2478_pg.rs`.
+    //
+    // The claim is about the FEDERATION lane only: `execute_pending_action` IS
+    // reachable on a postgres deployment through the LOCAL approve surfaces
+    // (`handlers::approvals` / `handlers::governance`), which are governed by
+    // local authz rather than peer scope.
+    //
+    // Any future trait-covered federation of these subcollections MUST route
+    // through `federation_receive::pending_namespaces_authorized` (or the shared
+    // `receive_auth` verdict it wraps) BEFORE approving — the #2488 lesson is
+    // that the two backends break in opposite directions when a lane is
+    // confined on one funnel only.
     unsupported_on_postgres += body.archives.len()
         + body.restores.len()
         + body.pendings.len()
