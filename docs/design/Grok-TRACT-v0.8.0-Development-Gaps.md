@@ -277,7 +277,7 @@ FED-RQ-02..05 OPEN: epoch manifest federation, `/sync/since` checkpoint catch-up
 
 ### G-P2-13 · Postgres snapshot/restore link edges (v70)
 
-`archived_memory_links` table exists; postgres snapshot/restore wiring tracked follow-up.
+`archived_memory_links` table exists; postgres snapshot/restore wiring tracked follow-up. **[Superseded 2026-07-30, #2318: the postgres wiring had in fact already shipped — `forget` / `archive_by_ids` snapshot and `archive_restore` re-inserts, pinned by `archive_restore_preserves_links_pg_1771`. Finding left verbatim: this document is a dated 2026-06-28 assessment of `release/v0.8.0 @ 14a34566` and is not retroactively edited.]**
 
 ### G-P2-14 · Capability honesty (#1672–#1674)
 
