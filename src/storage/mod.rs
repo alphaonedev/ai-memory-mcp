@@ -12479,6 +12479,7 @@ pub fn list_archived(
 /// preserved edge whose endpoints still exist, and the behaviour is pinned
 /// by `archive_restore_preserves_links_pg_1771`. Both backends wire
 /// snapshot/restore.
+///
 /// v1.0.0 #2418 (L-EXPIRY-CANON) — read `archived_memories.original_expires_at`
 /// and return it in the ONE canonical fixed-UTC rendering.
 ///
