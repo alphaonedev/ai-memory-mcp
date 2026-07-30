@@ -34,6 +34,20 @@
 #       Rule (b2) is therefore a RATCHET, not a ban: the existing eight are
 #       allowlisted with a dated justification and the list may only SHRINK.
 #
+#   (2-bis) THE UNREQUIRED DECIDER (#2494 residual). The job that DECIDES the
+#       skipped/ran disposition of case (2) was not itself a required context.
+#       `Classify changes` (ci.yml) and `Coverage classify (docs-only
+#       short-circuit)` (coverage.yml) between them governed ELEVEN required
+#       contexts while being required by nothing — so the whole ratchet in
+#       case (2) rested on a job no gate protected. Both are now declared in
+#       the mirror. Requiring a decider is free (it always runs; it reported
+#       `success` even on the docs-only commit 45ba8741 that wedged the branch)
+#       but it creates a NEW obligation, which rule (b4) enforces: a decider
+#       must never acquire a job-level `if:`. A skipped decider skips every
+#       dependent, and each skipped dependent counts as SATISFIED — so ONE
+#       allowlisted decider would neutralise its entire dependent subtree at
+#       once. That is why (b4) is a hard fail and NOT ratchetable, unlike (b2).
+#
 #   (3) THE UNREPORTABLE CONTEXT. A required context whose carrying workflow
 #       has a `paths:` / `paths-ignore:` filter on its `pull_request` trigger
 #       simply never runs for an out-of-filter PR — the context is never
@@ -73,6 +87,11 @@
 #       covers the protected branch the mirror scopes to.
 #   (b1) HARD-FAIL, never allowlistable: a required context's job has BOTH
 #       `strategy.matrix` AND a job-level `if:` — the exact #2494 wedge shape.
+#   (b4) HARD-FAIL, never allowlistable: a required context's job is a
+#       DECIDER — at least one other job in the same workflow declares
+#       `needs: <that job id>` — AND it carries a job-level `if:`. See
+#       case (2-bis): a skipped decider skips its whole dependent subtree,
+#       every member of which then counts as satisfied.
 #   (b2) a required context's job has a job-level `if:` at all (the
 #       skipped-counts-as-satisfied class) => fail unless the context is
 #       listed in the burn-down ratchet
@@ -94,8 +113,10 @@
 #   scripts/check-required-contexts.sh --self-test  — plant the historical
 #       shapes in a throwaway copy UNDER the repo (never system /tmp) and
 #       confirm the gate rejects EACH: the (b1) matrix+`if:` wedge, an (a)
-#       mirror context matching no job, a (c) `paths:`-filtered carrier, and a
-#       (b3) unguarded step in a `needs: classify` job — plus a clean control
+#       mirror context matching no job, a (c) `paths:`-filtered carrier, a
+#       (b3) unguarded step in a `needs: classify` job, and a (b4) decider
+#       carrying a job-level `if:` (rejected EVEN WHEN allowlisted, which is
+#       the property that distinguishes (b4) from (b2)) — plus a clean control
 #       that must PASS. Proves the gate is load-bearing, not decorative.
 #   scripts/check-required-contexts.sh --dump       — print the raw parse
 #       record stream (diagnostic; shows which job `name:` was resolved).
@@ -470,7 +491,26 @@ run_gate() {
         fi
     done
 
-    # ---- rules (a) / (b1) / (b2) / (c), per required context --------------
+    # ---- index the DECIDER relation (rule b4) ------------------------------
+    # A job is a DECIDER when at least one other job in the SAME workflow
+    # declares `needs: <its id>`. Derived from the parsed `needs:` edges rather
+    # than a hardcoded job-id list, so a renamed or newly-added decider is
+    # covered automatically.
+    declare -A DEPENDED=()   # "file|jobid" -> space-joined dependent job ids
+    local dwf djobid dneed
+    local -a _dneeds=()
+    for jk in "${JOBKEYS[@]}"; do
+        dwf="${JOB_FILE[$jk]}"
+        djobid="${jk#*|}"
+        IFS=',' read -r -a _dneeds <<< "${JOB_NEEDS[$jk]}"
+        for dneed in "${_dneeds[@]}"; do
+            [ -n "$dneed" ] || continue
+            [ "$dneed" != "$djobid" ] || continue
+            DEPENDED["$dwf|$dneed"]="${DEPENDED[$dwf|$dneed]:-} $djobid"
+        done
+    done
+
+    # ---- rules (a) / (b1) / (b4) / (b2) / (c), per required context --------
     declare -A ALLOWED=()
     local ctx
     for ctx in "${allow[@]}"; do ALLOWED["$ctx"]=1; done
@@ -496,6 +536,15 @@ run_gate() {
             fail "RULE (b1) HARD-FAIL — required context '$ctx' comes from $jk, which has BOTH 'strategy.matrix' AND a job-level 'if:' (the #2494 wedge)."
             echo "     GitHub evaluates a job-level 'if:' BEFORE matrix expansion, so when that 'if:' is false the job emits ONE check-run with the UNEXPANDED template name and '$ctx' is NEVER CREATED — pending forever, unmergeable." >&2
             echo "     FIX: delete the job-level 'if:', keep 'needs:', and move that condition onto EVERY step (the 'check' job in ci.yml is the proven pattern). NOT 'if: always()' — that reports success even when the dependency failed." >&2
+            continue
+        fi
+
+        # (b4) the DECIDER shape — never allowlistable, checked BEFORE the
+        # (b2) ratchet so a decider can never be absolved by an allowlist entry.
+        if [ -n "${DEPENDED[$jk]:-}" ] && [ "${JOB_IF[$jk]}" = "1" ]; then
+            fail "RULE (b4) HARD-FAIL — required context '$ctx' comes from $jk, a DECIDER (job(s) [${DEPENDED[$jk]# }] declare 'needs: ${jk#*|}'), and it carries a job-level 'if:'."
+            echo "     When that 'if:' is false the decider reports 'skipped', which skips EVERY dependent job — and branch protection counts each skipped required dependent as SATISFIED. One skipped decider therefore neutralises its whole dependent subtree at once, which is why this is NOT allowlistable via $ALLOW_FILE (contrast rule (b2))." >&2
+            echo "     FIX: delete the job-level 'if:' and move that condition onto every step, or stop requiring '$ctx' (drop it from the mirror AND from branch protection, in that order)." >&2
             continue
         fi
 
@@ -572,7 +621,7 @@ run_gate() {
 
 # --- self-test --------------------------------------------------------------
 selftest() {
-    echo "required-contexts gate: self-test (clean control -> PASS; #2494 (b1) matrix+if wedge -> FAIL; (a) unmatched mirror context -> FAIL; (c) paths-filtered carrier -> FAIL; (b3) unguarded step -> FAIL)"
+    echo "required-contexts gate: self-test (clean control -> PASS; #2494 (b1) matrix+if wedge -> FAIL; (a) unmatched mirror context -> FAIL; (c) paths-filtered carrier -> FAIL; (b3) unguarded step -> FAIL; (b4) decider with job-level if -> FAIL even when allowlisted)"
 
     local scratch
     scratch="$(mktemp -d "$ROOT/.required-contexts-selftest.XXXXXX")"
@@ -658,6 +707,7 @@ jobs:
 YAML
         cat > "$mi" <<'TXT'
 # self-test mirror
+Classify changes
 Check (ubuntu-latest)
 Check (windows-latest)
 Cross-compile (aarch64-apple-ios)
@@ -737,6 +787,30 @@ TXT
     fi
     echo "  [b3] unguarded step in a 'needs: classify' job with no job-level 'if:': CAUGHT"
 
+    # ---- (b4) a DECIDER carrying a job-level if: — hard fail, NOT ratchetable
+    # `classify` is `needs:`-ed by `check` + `mobile` in the fixture, so it is a
+    # decider. Skipping it skips both dependents, and each skipped required
+    # dependent counts as SATISFIED — the fail-open that (b2)'s ratchet exists
+    # to acknowledge, except here ONE entry would buy the whole subtree. The
+    # second half of this leg is the load-bearing half: the gate must STILL
+    # reject the shape when the context is allowlisted.
+    write_clean
+    perl -0pi -e 's/(  classify:\n    name: Classify changes\n)/$1    if: github.event_name != \x27schedule\x27\n/' "$wf/ci.yml"
+    grep -q "^    if: github.event_name" "$wf/ci.yml" || {
+        echo "  [b4] fixture injection FAILED (self-test is broken, not the gate)" >&2; return 2; }
+    rc="$(run_fixture)"
+    if [ "$rc" = "0" ]; then
+        echo "  [b4] decider with a job-level 'if:': NOT CAUGHT (gate passed) — FAIL" >&2
+        return 2
+    fi
+    printf 'Classify changes\n' > "$al"
+    rc="$(run_fixture)"
+    if [ "$rc" = "0" ]; then
+        echo "  [b4] an ALLOWLISTED decider 'if:' was accepted — (b4) must outrank the (b2) ratchet — FAIL" >&2
+        return 2
+    fi
+    echo "  [b4] decider (another job declares 'needs:' it) carrying a job-level 'if:': CAUGHT, and NOT allowlistable"
+
     # ---- (b2) ratchet: allowlisted passes, stale entry fails
     write_clean
     perl -0pi -e 's/(  parens:\n    name: Paren gate \(#1174 PR10\)\n)/$1    needs: classify\n    if: needs.classify.outputs.docs_only != \x27true\x27\n/' "$wf/ci.yml"
@@ -759,7 +833,7 @@ TXT
     fi
     echo "  [b2] job-level 'if:' fail-open ratchet (un-allowlisted FAILS, allowlisted PASSES, stale entry FAILS): CAUGHT"
 
-    echo "required-contexts gate self-test: PASS (load-bearing — catches the #2494 (b1) wedge, the (a) unmatched-context class, the (c) path-filtered carrier, the (b3) unguarded step, and both directions of the (b2) ratchet; spares a clean tree)"
+    echo "required-contexts gate self-test: PASS (load-bearing — catches the #2494 (b1) wedge, the (a) unmatched-context class, the (c) path-filtered carrier, the (b3) unguarded step, the (b4) unallowlistable decider 'if:', and both directions of the (b2) ratchet; spares a clean tree)"
 }
 
 if [ "${1:-}" = "--self-test" ]; then
@@ -781,7 +855,7 @@ if [ "${1:-}" != "" ]; then
 fi
 
 if run_gate; then
-    echo "check-required-contexts: OK (${PROTECTED_BRANCH}: every mirrored required context maps to a reporting job; no matrix+if wedge; no path-filtered carrier; every needs-${CLASSIFY_JOB} step guarded)"
+    echo "check-required-contexts: OK (${PROTECTED_BRANCH}: every mirrored required context maps to a reporting job; no matrix+if wedge; no decider with a job-level if; no path-filtered carrier; every needs-${CLASSIFY_JOB} step guarded)"
     exit 0
 fi
 
