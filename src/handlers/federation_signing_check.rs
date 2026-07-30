@@ -56,6 +56,20 @@ use crate::validate;
 ///
 /// `Ok(None)` = provably no row. `Err(_)` = unresolvable; every caller MUST
 /// fail closed (skip the item) rather than treat it as absent.
+///
+/// ## #2488 — a SCALAR projection, never `get`
+///
+/// This routes through [`crate::store::MemoryStore::namespace_by_id`] (`SELECT
+/// namespace, version FROM memories WHERE id = $1`) rather than
+/// `MemoryStore::get` (`SELECT *`). Two reasons, both of which were live
+/// defects before #2488, and both documented in full on the trait method:
+/// the `SELECT *` shipped the embedding vector + stored `tsv` + full content +
+/// `encrypted_envelope` per probed id to learn one string, and — the
+/// load-bearing one — the full-row mapper is pinned to
+/// `DecryptFailurePolicy::FailClosed`, so a row whose at-rest envelope will not
+/// open on this node returned `Err`, landing in this gate's fail-closed arm and
+/// making that row PERMANENTLY un-erasable by federation with no operator
+/// escape hatch. `SELECT namespace` cannot fail for the decrypt reason at all.
 #[cfg(feature = "sal")]
 async fn resolve_stored_namespace(
     app: &AppState,
@@ -63,11 +77,7 @@ async fn resolve_stored_namespace(
     id: &str,
 ) -> Result<Option<String>, crate::store::StoreError> {
     let ns_probe_ctx = crate::store::CallerContext::for_admin(probe_principal);
-    match app.store.get(&ns_probe_ctx, id).await {
-        Ok(row) => Ok(Some(row.namespace)),
-        Err(crate::store::StoreError::NotFound { .. }) => Ok(None),
-        Err(e) => Err(e),
-    }
+    app.store.namespace_by_id(&ns_probe_ctx, id).await
 }
 
 #[cfg(feature = "sal")]
@@ -624,46 +634,65 @@ pub(super) async fn sync_push_via_store(
         // #1934 (CWE-284) POSTGRES PARITY, landed with #2447 — the #1934 fix
         // confined the SQLITE delete loop to the peer's `allowed_namespaces`
         // but never reached this twin, so a `public/*`-scoped peer could
-        // hard-delete a `secure/ops` row on any postgres-backed node by
-        // guessing ids. `PostgresStore::apply_remote_deletion` discards its
-        // `_ctx` entirely, so nothing downstream re-checks. Resolve the target
-        // row's namespace and refuse ids outside scope, exactly as the sqlite
-        // twin does. A missing row stays a no-op (the peer may have GC'd it);
-        // an UNRESOLVABLE row fails closed.
-        if ns_scope_needs_existing {
-            match resolve_stored_namespace(&app, body.sender_agent_id.clone(), del_id).await {
-                Ok(Some(namespace)) => {
-                    if !crate::federation::peer_attestation::namespace_allowed(
-                        peer_header_owned.as_deref(),
-                        &namespace,
-                        &attest_cfg,
-                    ) {
+        // hard-delete a `secure/ops` row on any postgres-backed node by id.
+        // `PostgresStore::apply_remote_deletion` discards its `_ctx` entirely
+        // (deliberately — see the trait doc), so nothing downstream re-checks.
+        //
+        // #2488 (CWE-284, GA blocker) — the #2447 form wrapped this whole gate
+        // in `ns_scope_needs_existing`, i.e. in `inbound_write_needs_existing_
+        // namespace`, which is the read-ELISION predicate and returns FALSE for
+        // an enrolled peer whose `allowed_namespaces` is empty — exactly the
+        // peer shape Layer 2 was voted in to refuse. So the gate was
+        // structurally unreachable for that shape and `apply_remote_deletion`
+        // ran unguarded: the peer that may not write anywhere could still
+        // destroy anything. The guard is now the ENROLLED posture
+        // (`has_allowlist()`), the shared verdict decides, and the probe stays
+        // elided on the Layer-2-only shapes where its answer cannot change the
+        // verdict — so the fix costs ZERO extra reads versus pre-#2488.
+        // A missing row stays a no-op (the peer may have GC'd it); an
+        // UNRESOLVABLE row fails closed with a distinguishable cause.
+        // Fable 5 1×7 vote (4d3ea1c5).
+        if attest_cfg.has_allowlist() {
+            let needs_stored = crate::federation::receive_auth::peer_declares_namespace_scope(
+                peer_header_owned.as_deref(),
+                &attest_cfg,
+            );
+            let stored_ns = if needs_stored {
+                match resolve_stored_namespace(&app, body.sender_agent_id.clone(), del_id).await {
+                    Ok(Some(namespace)) => Some(namespace),
+                    Ok(None) => {
+                        noop += 1;
+                        continue;
+                    }
+                    Err(e) => {
                         tracing::warn!(
                             target: ATTESTATION_TRACE_TARGET,
                             memory_id = %del_id,
-                            namespace = %namespace,
-                            peer_id = %peer_header_owned.as_deref().unwrap_or(""),
-                            "sync_push: refusing federated deletion outside the peer's \
-                             namespace scope (#1934, postgres parity via #2447)"
+                            cause = crate::federation::receive_auth::CAUSE_NAMESPACE_PROBE_UNRESOLVABLE,
+                            error = %e,
+                            "sync_push: refusing federated deletion of {del_id} — the target \
+                             row's namespace is UNRESOLVABLE on this node, so the scope gate \
+                             cannot decide (#1934/#2488 fail-closed). This row cannot be \
+                             federated-deleted until the read succeeds; investigate the \
+                             storage error rather than the peer's scope."
                         );
                         skipped += 1;
                         continue;
                     }
                 }
-                Ok(None) => {
-                    noop += 1;
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: ATTESTATION_TRACE_TARGET,
-                        memory_id = %del_id,
-                        "sync_push: delete pre-resolve failed for {del_id}: {e}; \
-                         refusing the deletion (#1934 fail-closed)"
-                    );
-                    skipped += 1;
-                    continue;
-                }
+            } else {
+                None
+            };
+            if !crate::federation::receive_auth::inbound_by_id_namespace_authorized(
+                crate::federation::receive_auth::LANE_DELETIONS,
+                del_id,
+                stored_ns.as_deref(),
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+                require_push_ns_scope,
+            ) {
+                skipped += 1;
+                continue;
             }
         }
         match app.store.apply_remote_deletion(&ctx, del_id).await {
