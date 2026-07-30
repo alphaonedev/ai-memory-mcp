@@ -26,10 +26,35 @@
 name: token-budget
 
 on:
+  # BOTH lists are edited together on purpose (#2506). Before this commit
+  # the two were asymmetric in a way that made the gate useless on the
+  # branch that actually ships: `push` watched `release/**` but
+  # `pull_request` was scoped to `[main, develop]`, so on `release/v1.0.0`
+  # the budget was only ever evaluated AFTER a PR merged — post-hoc
+  # notification, never prevention, and the red landed on the shared
+  # branch attributable to no PR.
+  #
+  # `push.branches` additionally carried `feat/**`, a pattern that OVERLAPS
+  # PR HEAD branch names, which is the #2508 duplicate-cancellation class
+  # (#2509 removed the same overlap from `tool-count-drift.yml`): the push
+  # and same-repo pull_request events resolve the concurrency key below to
+  # the SAME string, so with `cancel-in-progress: true` one of the two runs
+  # is always cancelled and the cancelled check-run row is permanent.
+  #
+  # Narrowing `push` ALONE would have been a fail-open: a `feat/**` ->
+  # `release/v1.0.0` PR would then get NO token-budget run at all. So the
+  # `pull_request` base-branch filter is widened to `release/**` in the
+  # same commit — the shape `ci.yml` / `coverage.yml` / `c8-precheck.yml`
+  # already use. Net effect: every PR into main/develop/release/** is now
+  # gated BEFORE merge, and each SHA produces exactly one run.
+  #
+  # No `paths:` / `paths-ignore:` filter here, by design: the tools/list
+  # wire payload is derived from `src/` + tool descriptions, and a
+  # path-filtered trigger on a gate is its own wedge class (#2494 rule c).
   push:
-    branches: [main, develop, "feat/**", "release/**"]
+    branches: [main, develop, "release/**"]
   pull_request:
-    branches: [main, develop]
+    branches: [main, develop, "release/**"]
 
 # Fork-PR-safe concurrency key: coalesces push + same-branch internal
 # PR events; isolates fork PRs by PR number. See ci.yml for full
