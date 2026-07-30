@@ -302,3 +302,50 @@ jobs:
         # the shared one (the #1998/#2115/#2127 recurrent shape); the
         # gate must reject both and spare a compliant control fixture.
         run: bash scripts/check-test-env-lock.sh --self-test
+
+  required-contexts-gate:
+    # Issues #2494 / #2496 — required-status-check SOUNDNESS. The required set
+    # on `release/v1.0.0` read as 22 gates and functioned as far fewer, in
+    # three independent ways, all confirmed on live check-run data:
+    #   * THE WEDGE. `ci.yml`'s `mobile-cross-compile` was BOTH a matrix job
+    #     AND carried a job-level `if:`. GitHub evaluates a job-level `if:`
+    #     BEFORE matrix expansion, so on docs-only commit 45ba8741 it emitted
+    #     ONE check-run named `Cross-compile (${{ matrix.target }})` and the
+    #     two REQUIRED expanded names were never created — pending forever,
+    #     and `enforce_admins: true` means no admin merge clears it.
+    #   * THE FAIL-OPEN. Eight required contexts carry a job-level `if:` and
+    #     report `skipped`, which branch protection COUNTS AS SATISFIED.
+    #   * THE UNREPORTABLE CONTEXT. A `paths:` filter on the carrying
+    #     workflow's `pull_request` trigger wedges the branch identically,
+    #     with no `if:` anywhere in sight.
+    # HARD-BLOCKS all three statically, against a HAND-AUTHORED mirror of the
+    # required set (never generated from live API state — see the mirror's
+    # header for why that distinction is load-bearing). Unconditional: NO
+    # `needs: classify`, no job-level `if:`, no `paths:` filter — a gate that
+    # polices the docs-only short-circuit must not be subject to it.
+    name: Required-context + classify-base soundness gate (#2494/#2496)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run required-contexts gate
+        run: bash scripts/check-required-contexts.sh
+      - name: Self-test the gate (regression evidence)
+        # --self-test plants each historical shape in a throwaway copy UNDER
+        # the repo (never system /tmp): the (b1) matrix+`if:` wedge, an (a)
+        # mirror context matching no job, a (c) `paths:`-filtered carrier, a
+        # (b3) unguarded step in a `needs: classify` job, and both directions
+        # of the (b2) burn-down ratchet. The clean control additionally
+        # asserts the parser reproduces BOTH YAML scalar outcomes — ` #`
+        # truncates (the live `§25.3 S5 / RQ-10` context), `(#` does not —
+        # so a laundered mirror cannot make the gate a tautology.
+        run: bash scripts/check-required-contexts.sh --self-test
+      - name: Classify-base split behavioural proof (R-203)
+        # The other half of the atomic fix. EXTRACTS the classifier shell block
+        # verbatim from ci.yml and runs it against throwaway git fixtures, then
+        # runs the SAME fixtures against the frozen pre-fix block at
+        # scripts/test/fixtures/ci-classify-prefix-2496.sh. A PR with code
+        # earlier and a docs-only last push must classify docs_only=FALSE
+        # against the live workflow and TRUE against the frozen block — so a
+        # silently-broken extraction cannot make the assertions vacuous.
+        run: bash scripts/test/test-ci-workflow-invariants.sh
