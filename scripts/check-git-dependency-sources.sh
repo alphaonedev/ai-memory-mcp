@@ -99,6 +99,17 @@ allowed() {
 
 # scan <dir> — prints offenders to stderr; returns 0 when CLEAN, 1 when a git
 # source was found. (Same return convention as check-cloud-init-ascii.sh.)
+#
+# NOTE ON THE `.local-runs` EXCLUSION BELOW — it is deliberately ANCHORED to
+# `$dir` (`"${dir}/.local-runs/*"`) rather than written as the free glob
+# `'*/.local-runs/*'`. `--self-test` stages its fixtures under
+# `$ROOT/.local-runs/` (project hard rule: scratch under the repo, never system
+# /tmp), so a free glob would make every staged fixture INVISIBLE to this
+# function — the three violation assertions would then pass VACUOUSLY and the
+# gate would report a green self-test while detecting nothing. Anchoring keeps
+# both properties: the live scan (`$dir` == `$ROOT`) still skips the real
+# scratch directory, and a fixture root nested inside it is still scanned.
+# Do not "simplify" this back to a free glob.
 scan() {
   local dir="$1" found=0 f rel line
 
@@ -110,7 +121,7 @@ scan() {
       echo "GIT SOURCE in ${rel}:${line}" >&2
     done < <(grep -nE "$MANIFEST_RE" "$f" || true)
   done < <(find "$dir" -type f -name Cargo.toml \
-             -not -path '*/target/*' -not -path '*/.local-runs/*' \
+             -not -path '*/target/*' -not -path "${dir}/.local-runs/*" \
              -not -path '*/.git/*' | sort)
 
   while IFS= read -r f; do
@@ -121,14 +132,20 @@ scan() {
       echo "GIT SOURCE in ${rel}:${line}" >&2
     done < <(grep -nE "$LOCK_RE" "$f" || true)
   done < <(find "$dir" -type f -name Cargo.lock \
-             -not -path '*/target/*' -not -path '*/.local-runs/*' \
+             -not -path '*/target/*' -not -path "${dir}/.local-runs/*" \
              -not -path '*/.git/*' | sort)
 
   return $found
 }
 
 if [ "${1:-}" = "--self-test" ]; then
-  tmp="$(mktemp -d)"
+  # Project hard rule: scratch UNDER the repo, never system /tmp (zero-strike).
+  # Mirrors `check-migration-ladder.sh` / `check-required-contexts.sh`, the two
+  # newest gates. `.local-runs/` is gitignored (`.gitignore:53` — `/.local-runs/*`),
+  # so a staged fixture can never be committed, and `$$` keeps concurrent runs
+  # from colliding.
+  tmp="${ROOT}/.local-runs/gitdep-selftest-$$"
+  mkdir -p "$tmp"
   trap 'rm -rf "$tmp"' EXIT
 
   # (1) The exact #2050 shape: a `[patch.crates-io]` git+rev pin.
