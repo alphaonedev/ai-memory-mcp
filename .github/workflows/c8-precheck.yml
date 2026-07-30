@@ -31,8 +31,32 @@
 name: c8-precheck
 
 on:
+  # push.branches is deliberately restricted to branches that are NEVER a PR
+  # HEAD (#2523, the #2508 class). It used to include `local/**`, which DOES
+  # overlap PR head-branch names in this repo — `local/install-815-816` was
+  # opened as a PR into `release/v0.7.0`. Every push to such a head branch
+  # fired BOTH a push-event run and a pull_request-event run, and the
+  # concurrency key below resolves to the SAME value for both (the push event
+  # has no `pull_request` context, so the ternary falls through to
+  # `github.ref_name` = the head branch; the same-repo pull_request event
+  # resolves to `head.ref` = the identical string). With
+  # `cancel-in-progress: true` that collision is guaranteed, not occasional,
+  # so one of the two runs was ALWAYS cancelled and the cancelled check-run row
+  # is permanent — a disposition that reads as pass in `gh pr checks` while
+  # branch protection does not count it as satisfied. This workflow carries
+  # EIGHT gate contexts, several of them required, so the latent wedge was
+  # eight contexts wide.
+  #
+  # Narrowing costs no coverage: the pull_request run already gates every PR
+  # (its `branches:` list is a BASE-branch filter, so a PR from any head branch
+  # into main/develop/release/** is still gated), and the PR run is where these
+  # gates' verdicts are consumed. The only runs lost are push-event runs on a
+  # `local/**` branch with no PR open. Same fix #2509 applied to
+  # tool-count-drift.yml; same shape ci.yml and coverage.yml already use.
+  # Statically enforced from here on by rule (d) of
+  # scripts/check-required-contexts.sh, which runs in this very workflow.
   push:
-    branches: [main, develop, "release/**", "local/**"]
+    branches: [main, develop, "release/**"]
   pull_request:
     branches: [main, develop, "release/**"]
 
@@ -323,7 +347,19 @@ jobs:
     # header for why that distinction is load-bearing). Unconditional: NO
     # `needs: classify`, no job-level `if:`, no `paths:` filter — a gate that
     # polices the docs-only short-circuit must not be subject to it.
-    name: Required-context + classify-base soundness gate (#2494/#2496)
+    #
+    # Issue #2508 added rule (d), the CANCELLED DUPLICATE: a workflow on BOTH
+    # `push` and `pull_request` whose `push.branches` can match a PR HEAD
+    # branch, under a concurrency group that resolves to the same key for both
+    # events with `cancel-in-progress: true`. Two runs per sha, one always
+    # cancelled, and the cancelled row is permanent — a disposition that reads
+    # as pass in `gh pr checks` while branch protection does not count it as
+    # satisfied. Rule (d) sweeps EVERY workflow here, not only today's
+    # required-context carriers, because that artefact pollutes any PR's
+    # rollup and becomes a wedge the moment the context is required. This
+    # workflow's own `push.branches` lost `local/**` for exactly that reason
+    # (#2523); `tool-count-drift.yml` was fixed in #2509.
+    name: Required-context + classify-base soundness gate (#2494/#2496/#2508)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -343,6 +379,14 @@ jobs:
         # asserts the parser reproduces BOTH YAML scalar outcomes — ` #`
         # truncates (the live `§25.3 S5 / RQ-10` context), `(#` does not —
         # so a laundered mirror cannot make the gate a tautology.
+        # The (d) leg (#2508) plants the VERBATIM pre-#2509
+        # `tool-count-drift.yml` trigger + concurrency block (R-203) and
+        # requires a rejection, alongside FOUR near-miss shapes that must each
+        # PASS — the #2509-narrowed triggers, `cancel-in-progress: false`, a
+        # push-only workflow, and an `event_name`-keyed group — so the rule is
+        # proven to fire on the defect and not on its neighbourhood, plus the
+        # three pending-fix-ledger directions (correct entry passes, an entry
+        # for a DIFFERENT pattern does not absolve, an issue-less entry fails).
         run: bash scripts/check-required-contexts.sh --self-test
       - name: Classify-base split behavioural proof (R-203)
         # The other half of the atomic fix. EXTRACTS the classifier shell block
