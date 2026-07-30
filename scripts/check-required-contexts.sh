@@ -633,8 +633,17 @@ run_gate() {
     declare -A MXKEYS=()   # "file|job|key" -> space-joined values
     declare -a JOBKEYS=() WFKEYS=()
 
+    # Split on US (0x1f), NOT on TAB. `read` treats space/tab/newline in IFS as
+    # IFS WHITESPACE and collapses runs of them into ONE delimiter, so with a
+    # tab IFS an EMPTY MIDDLE field silently shifts every later field left —
+    # e.g. a JOB record for a job with no `needs:` handed the name-truncation
+    # flag to `f` and left `g` empty, which made rule (e) blind on exactly the
+    # jobs it exists for (every c8-precheck gate has no `needs:`). 0x1f is not
+    # IFS whitespace, so empty fields are preserved positionally. The record
+    # stream itself stays TAB-delimited — `--dump` and its awk consumers
+    # (`-F'\t'`, which never collapses) are unaffected.
     local rec kind a b c d e f g
-    while IFS=$'\t' read -r kind a b c d e f g; do
+    while IFS=$'\x1f' read -r kind a b c d e f g; do
         case "$kind" in
             WF)
                 WFKEYS+=("$a")
@@ -658,7 +667,7 @@ run_gate() {
                 MXKEYS["$mk"]="${MXKEYS[$mk]:-} $d"
                 ;;
         esac
-    done <<< "$records"
+    done <<< "${records//$'\t'/$'\x1f'}"
 
     # ---- rule (e): a job name that YAML silently truncates (#2473) --------
     #
@@ -828,7 +837,10 @@ run_gate() {
             continue
         fi
         local sidx shasif sguard suses sname
-        while IFS=$'\t' read -r _ _ _ sidx shasif sguard suses sname; do
+        # 0x1f for the same reason as the JOB loop above: a `run:` step has an
+        # EMPTY `uses` field in the middle of the record, and a tab IFS would
+        # collapse it and slide the step NAME into `suses`.
+        while IFS=$'\x1f' read -r _ _ _ sidx shasif sguard suses sname; do
             [ -n "$sidx" ] || continue
             if [ "$sguard" = "1" ]; then continue; fi
             # Structural exemption: a bare checkout, exactly as the proven
@@ -837,7 +849,7 @@ run_gate() {
             fail "RULE (b3) — job $jk (needs: $CLASSIFY_JOB, no job-level 'if:') has step #$sidx ['${sname:-${suses:-<unnamed>}}'] with NO '${CLASSIFY_JOB}.outputs.docs_only' guard."
             echo "     This job's contract is 'runs always, no-ops on docs-only'. An unguarded step silently executes the heavy work on every docs-only PR — burning runner time and, worse, half-running a job whose other steps skipped." >&2
             echo "     FIX: add 'if: needs.${CLASSIFY_JOB}.outputs.docs_only != '\''true'\''' (or the '== '\''true'\''' short-circuit notice form) to that step. Only a bare 'actions/checkout@*' step is exempt." >&2
-        done <<< "$step_recs"
+        done <<< "${step_recs//$'\t'/$'\x1f'}"
     done
 
     # ---- rule (d): the #2508 cancelled-duplicate carrier class -------------
@@ -1079,7 +1091,7 @@ TXT
         } > "$wf/dup.yml"
     }
 
-    local rc parsed_name
+    local rc parsed_name e_out
 
     # ---- control: clean tree must PASS (and must exercise both YAML rules)
     write_clean
@@ -1093,15 +1105,27 @@ TXT
     echo "  [control] clean fixture PASSES (incl. the QUOTED ' #' name + the unquoted '(#' non-truncation YAML rule)"
 
     # ---- (e) the #2473 truncation shape: UNQUOTE the quoted job's name.
-    # Two assertions, because "the gate went red" is not the same claim as
-    # "the parser still implements the YAML rule": first prove via --dump
-    # that the parse TRUNCATES at the '#' (if the parser silently stopped
-    # truncating, rule (e) could fire for the wrong reason and the (a)
-    # machinery would quietly change meaning), then prove the gate rejects it.
+    #
+    # THREE assertions, and the third is the one that matters. "The gate went
+    # red" is NOT the claim being made — a bare unquoting also makes the mirror
+    # entry unmatchable, so rule (a) fires and the leg would pass while rule
+    # (e) was stone blind. (That is not hypothetical: it is exactly what this
+    # leg did before the 0x1f field-split fix, on a tree where every
+    # required-context job has no `needs:`.) So the mirror is ALSO rewound to
+    # the TRUNCATED string, which is the historically faithful state — every
+    # other rule is satisfied, rule (e) is the only thing left that can fail —
+    # and the failure output is required to NAME rule (e).
+    #
+    # Assertion 1 (--dump): the parse really does truncate at the '#'. If the
+    # parser silently stopped implementing the YAML rule, rule (e) could fire
+    # for the wrong reason while rule (a)'s meaning changed underneath it.
     write_clean
     perl -0pi -e 's/^    name: "Quoted gate \(§X \/ RQ-10 #1853\)"$/    name: Quoted gate (§X \/ RQ-10 #1853)/m' "$wf/ci.yml"
     grep -q '^    name: Quoted gate ' "$wf/ci.yml" || {
         echo "  [e] fixture injection FAILED (self-test is broken, not the gate)" >&2; return 2; }
+    perl -0pi -e 's/^Quoted gate \(§X \/ RQ-10 #1853\)$/Quoted gate (§X \/ RQ-10/m' "$mi"
+    grep -qx 'Quoted gate (§X / RQ-10' "$mi" || {
+        echo "  [e] mirror rewind FAILED (self-test is broken, not the gate)" >&2; return 2; }
     parsed_name="$(RQC_WORKFLOW_DIR="$wf" RQC_MIRROR_FILE="$mi" RQC_ALLOW_FILE="$al" \
         RQC_DUPTRIG_ALLOW_FILE="$dal" RQC_PROTECTED_BRANCH="release/v1.0.0" \
         bash "${BASH_SOURCE[0]}" --dump 2>/dev/null \
@@ -1110,12 +1134,30 @@ TXT
         echo "  [e] parser no longer truncates an unquoted ' #' name (got '$parsed_name') — the YAML rule this gate turns on has regressed" >&2
         return 2
     fi
+    # Assertions 2 + 3: the gate rejects, and it rejects BY RULE (e).
+    e_out="$(RQC_WORKFLOW_DIR="$wf" RQC_MIRROR_FILE="$mi" RQC_ALLOW_FILE="$al" \
+        RQC_DUPTRIG_ALLOW_FILE="$dal" RQC_PROTECTED_BRANCH="release/v1.0.0" \
+        bash "${BASH_SOURCE[0]}" 2>&1 || true)"
     rc="$(run_fixture)"
     if [ "$rc" = "0" ]; then
         echo "  [e] unquoted job name containing ' #' (the #2473 truncation): NOT CAUGHT (gate passed) — FAIL" >&2
         return 2
     fi
-    echo "  [e] #2473 unquoted ' #' job name (declared != reported check-run): CAUGHT, and the parse is confirmed truncated at '#'"
+    case "$e_out" in
+        *"RULE (e)"*) ;;
+        *)
+            echo "  [e] the gate rejected the tree but NOT via rule (e) — the leg would pass for the wrong reason. Output was:" >&2
+            printf '%s\n' "$e_out" >&2
+            return 2
+            ;;
+    esac
+    case "$e_out" in
+        *"RULE (a)"*)
+            echo "  [e] rule (a) also fired — the mirror rewind did not take, so this leg is not isolating rule (e)" >&2
+            return 2
+            ;;
+    esac
+    echo "  [e] #2473 unquoted ' #' job name: CAUGHT BY RULE (e) ALONE (mirror rewound to the truncated string so every other rule is satisfied), with the parse confirmed truncated at '#'"
 
     # ---- (b1) the #2494 wedge: add a job-level if: to the matrix job
     write_clean
