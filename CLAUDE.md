@@ -1196,7 +1196,40 @@ so the ledger cannot rot; **(c)** the carrier's `pull_request` trigger
 exists and has no `paths:`/`paths-ignore:` filter; **(b3)** in any
 `needs: classify` job with no job-level `if:`, EVERY step carries the
 `docs_only` guard (bare `actions/checkout@*` is the single structural
-exemption). **The mirror is hand-authored from intent and must NEVER be
+exemption). **(d) HARD-FAIL, applied to EVERY workflow in
+`.github/workflows/` and not only to required-context carriers** — the
+#2508 CANCELLED DUPLICATE: the workflow triggers on BOTH `push` and
+`pull_request`, at least one `push.branches` pattern can match a PR HEAD
+branch, and it declares a `concurrency.group` with
+`cancel-in-progress: true` whose key is not event-distinct. On a push
+there is no `pull_request` context, so the house key's ternary falls
+through to `github.ref_name` = the head branch while the same-repo
+`pull_request` event resolves to `head.ref` = the identical string —
+one group, two runs per SHA, one ALWAYS cancelled, and the cancelled
+check-run row is permanent. `cancelled` READS AS PASS in `gh pr checks`
+while branch protection does not count it as satisfied, so the branch
+wedges the day that context is required and the standard triage command
+conceals the cause; the scope is repo-wide precisely because the
+artefact must be dead before anyone reaches for that hardening step.
+Head-branch overlap is decided by `glob_match`-ing each pattern against
+the declared `PR_HEAD_PROBES` corpus (the commit-type vocabulary above,
+cross-checked against measured PR head prefixes); `main` / `develop` /
+`release/**` are deliberately not probes, and an exact literal like
+`feat/v0.7.0-grand-slam` matches nothing because it cannot match a
+CLASS of heads. Event-distinctness is a conservative STRUCTURAL test —
+a group containing `${{ github.event_name }}` is exempt, everything
+else is treated as colliding — since the house key is exactly the shape
+that looks event-aware and collides anyway. `cancel-in-progress: false`
+(or no concurrency block) is NOT flagged: two SUCCESS runs are
+wasteful, not the defect. The carrier that surfaced the class was fixed
+in #2509; `c8-precheck.yml`'s own `local/**` overlap in #2523;
+`token-budget.yml` is held in the PENDING-FIX ledger
+`scripts/qc-allowlists/dual-trigger-cancel-allow.txt` (`<workflow-file>
+<push-pattern> #<issue>`, format enforced so the ledger cannot rot,
+per-pattern so a newly-acquired overlap is not absolved) while #2506
+repairs it — a stale entry there is a loud NOTICE, not a failure,
+because it can only suppress a failure that no longer happens and
+failing on it would red whichever PR lost the race to the carrier fix. **The mirror is hand-authored from intent and must NEVER be
 regenerated from live API state:** one required context is
 `L3-boundary perma-ban gate (§25.3 S5 / RQ-10`, a YAML truncation
 artefact where the unquoted ` #1853)` at `c8-precheck.yml:75` opens a
@@ -1209,8 +1242,13 @@ on all 58 jobs across all 17 workflows with zero mismatches.
 `--self-test` plants the (b1) wedge, an (a) unmatched context, a (c)
 path-filtered carrier, a (b3) unguarded step, a (b4) decider `if:`
 (rejected EVEN WHEN allowlisted — the property that separates (b4) from
-(b2)) and both directions of the (b2) ratchet in a throwaway copy UNDER
-the repo (never system `/tmp`);
+(b2)), both directions of the (b2) ratchet, and — for (d) — the VERBATIM
+pre-#2509 `tool-count-drift.yml` trigger+concurrency block (R-203)
+alongside four NEAR MISSES that must each PASS (the #2509-narrowed
+triggers, `cancel-in-progress: false`, a push-only workflow, an
+`event_name`-keyed group) so the rule fires on the defect and not on its
+neighbourhood, in a throwaway copy under `.local-runs/` (never system
+`/tmp`, never `mktemp -d`);
 `--dump` prints the raw parse stream. The job is wired UNCONDITIONALLY —
 no `needs: classify`, no job-level `if:`, no `paths:` — because a gate
 policing the docs-only short-circuit must not be subject to it. Its
