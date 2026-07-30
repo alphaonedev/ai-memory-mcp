@@ -1773,9 +1773,25 @@ pub trait MemoryStore: Send + Sync {
     /// approver it controls and then self-approve. Both are tracked as **#2478**
     /// and **#2479**, both are sqlite-reachable under DEFAULT config, and neither
     /// increments the `deleted` counter, so such a delete is invisible in the
-    /// 200 response, the refusal WARN, and the DLQ cause set. Namespace scope is
-    /// the control on THIS funnel; it is not yet the control on the destructive
-    /// capability as a whole.
+    /// 200 response, the refusal WARN, and the DLQ cause set.
+    ///
+    /// And a THIRD hole (**#2503**) runs straight THROUGH the confined funnel, so
+    /// even "this funnel is confined" is too strong a reading:
+    /// [`crate::storage::delete`] unconditionally executes
+    /// `DELETE FROM namespace_meta WHERE standard_id = ?1` with NO namespace
+    /// predicate (the #1642 dangling-pointer fix), and `set_namespace_standard`
+    /// permits cross-namespace binding — so an in-scope deletion this gate
+    /// CORRECTLY allows can strip the governance policy of a namespace the peer
+    /// is denied, and via a global `*` standard the whole namespace tree at once,
+    /// with `resolve_governance_policy` then failing OPEN while the envelope
+    /// reports `deleted: 1, namespace_meta_cleared: 0`.
+    ///
+    /// Stated precisely: **namespace scope is the control on WHICH ROW this
+    /// funnel erases; it is NOT the control on WHAT THAT ERASURE DESTROYS**, and
+    /// it is not yet the control on the destructive capability as a whole. All
+    /// three holes are pre-existing and none is introduced by #2488/#2497 — they
+    /// are named here so this doc cannot be read as certifying more than the
+    /// row-selection gate it describes.
     async fn apply_remote_deletion(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
         match self.delete(ctx, id).await {
             Ok(()) => Ok(true),

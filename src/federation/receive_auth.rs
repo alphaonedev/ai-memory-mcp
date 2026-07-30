@@ -668,6 +668,23 @@ pub const REQUIRE_PUSH_NAMESPACE_SCOPE_ENV: &str = "AI_MEMORY_FED_REQUIRE_PUSH_N
 /// admitted removes the allowlist (zero-config, which short-circuits earlier) or
 /// enrolls the peer; this knob is never that lever.
 ///
+/// ## AVAILABILITY NOTE — a falsy value is NOT a general rollout hatch (#2497)
+///
+/// Because the unconditional refusal lives in the SHARED Layer 2, it applies to
+/// every lane that reaches the verdict — not only `deletions[]`. For the
+/// `{allowlist configured} × {header-less legacy peer} × {this knob = 0}`
+/// combination, `memories[]` / `archives[]` / `restores[]` entries that were
+/// APPLIED before #2497 are REFUSED now. That is the correct direction, but an
+/// operator sitting on exactly the posture this knob exists to serve loses
+/// writes as well as deletes on upgrade — silently, inside an HTTP 200, with no
+/// DLQ enqueue (#2498) — so the loss is not retried and not surfaced as an error.
+///
+/// The remedy is to make the peer IDENTIFIABLE (enroll it, `["**"]` for a
+/// deliberate per-peer allow-all) or to remove the allowlist entirely for the
+/// zero-config posture. Note that for a header-LESS push "enroll the peer" is
+/// not an actionable remedy at all: a per-peer scope cannot be applied to a peer
+/// that cannot be identified.
+///
 /// Two recoveries, both without a restart-blocking rewrite: declare the peer's
 /// real scope (or `["**"]` for deliberate allow-all — the PER-PEER escape,
 /// [`crate::federation::peer_attestation::namespace_allowed_test_glob`] treats
