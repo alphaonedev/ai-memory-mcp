@@ -1,0 +1,33 @@
+# git-dependency-sources-allow.txt — RATCHET for `scripts/check-git-dependency-sources.sh`
+# (#2050 / #2512).
+#
+# WHAT AN ENTRY HERE MEANS. This repo depends on cargo source code whose
+# CONTINUED EXISTENCE is controlled by someone else's git remote. `rev` pinning
+# fixes the content; it does not stop the repository being deleted, made
+# private, renamed, or transferred. If that happens, every cold `cargo`
+# resolve in this repo fails permanently and no artifact built from this commit
+# can be rebuilt, audited, or bisected again.
+#
+# That is not hypothetical. `alphaonedev/paste` — pinned at rev `6a30252` under
+# `[patch.crates-io]` as the RUSTSEC-2024-0436 workaround — was deleted
+# out-of-band on 2026-07-15. `git ls-remote` returns "Repository not found";
+# `GET /repos/alphaonedev/paste` returns 404. GitHub does not preserve a deleted
+# repository's objects. #2051 recovered by vendoring `paste` 1.0.15 into
+# `vendor/paste/` (byte-identical to upstream `dtolnay/paste` @ 6a302522, which
+# still holds that commit as `master`) — recovery was possible ONLY because the
+# fork was an unmodified mirror of a still-live upstream. A fork carrying real
+# local modifications would have been unrecoverable.
+#
+# RATCHET SEMANTICS (`hardcoded-literals-baseline.txt` style):
+#   * Entries may only be REMOVED. Removing one means the dependency moved to
+#     crates.io or was vendored under `vendor/`.
+#   * ADDING an entry requires an explicit review decision recording WHO
+#     guarantees that remote stays reachable for the lifetime of every artifact
+#     built from it, and WHY vendoring under `vendor/` was not viable. Vendoring
+#     is nearly always viable — that is the point of the gate.
+#
+# FORMAT: one `<repo-relative-path>:<line-number>` per line, plus a dated
+# comment above it naming the issue that authorised the exception.
+#
+# CURRENT STATE: EMPTY. Every third-party source this repo depends on comes
+# from crates.io or lives in-tree under `vendor/`. Keep it that way.

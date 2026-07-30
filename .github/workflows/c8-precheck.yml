@@ -360,3 +360,42 @@ jobs:
         # own frozen-pre-fix-mirror regression leg at
         # scripts/test/fixtures/required-contexts-prefix-2494.txt.
         run: bash scripts/test/test-ci-workflow-invariants.sh
+
+  git-dependency-source-gate:
+    # Issues #2050 / #2512 — SUPPLY-CHAIN reproducibility. `Cargo.toml` pinned
+    # `paste = { git = "https://github.com/alphaonedev/paste", rev = "6a30252" }`
+    # as the RUSTSEC-2024-0436 workaround. On 2026-07-15 the fork REPOSITORY was
+    # deleted out-of-band (`git ls-remote` → "Repository not found"; the API
+    # returns 404), and every cold cargo resolve in this repo began failing
+    # permanently on a rev that can never come back. Nothing in this repo had
+    # changed. `rev` pinning buys immutability of CONTENT, never of EXISTENCE.
+    #
+    # It read as flake before it read as breakage: warm `~/.cargo/git` caches
+    # kept passing, so #2050 was first filed against two unrelated PRs. Then it
+    # SURVIVED ITS OWN FIX for 15 days — #2051 vendored `paste` into
+    # `vendor/paste/` on `release/v1.0.0`, but `main` (the DEFAULT branch, and
+    # therefore the only branch GitHub runs `schedule:` workflows from) never
+    # received it, so `postgres-parity-nightly` stayed hard-red on the identical
+    # error every night and was rediscovered from scratch as #2512.
+    #
+    # This gate makes the #2051 posture STRUCTURAL rather than a convention in a
+    # manifest comment: third-party source we depend on comes from crates.io or
+    # lives in-tree under `vendor/`, where it is reviewable, diffable, and
+    # resolvable with no network at all. Static and offline by design — probing
+    # remotes at PR time would make this repo's CI depend on third-party
+    # availability and teach reviewers to ignore a red gate.
+    name: Git-dependency-source supply-chain gate (#2050/#2512)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run git-dependency-source gate
+        run: bash scripts/check-git-dependency-sources.sh
+      - name: Self-test the gate (regression evidence)
+        # --self-test stages three violation shapes in a tmpdir — the exact
+        # #2050 inline `git`+`rev` pin, the `[dependencies.x]` section form, and
+        # the resolved `source = "git+…"` that outlives a reverted manifest edit
+        # (a Cargo.toml fix with a stale Cargo.lock still breaks `--locked`) —
+        # plus a clean control carrying `repository`/`homepage` URLs and the
+        # post-#2051 `path = "vendor/paste"` shape, which must NOT trip.
+        run: bash scripts/check-git-dependency-sources.sh --self-test
