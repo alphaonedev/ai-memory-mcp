@@ -998,10 +998,16 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // the residual. Four new inline unit tests (classifier both directions,
     // the valid_until guard incl. fail-closed, the entity-list decoder, the
     // last-edge relation) replace the deleted `age_params_literal` test.
-    // MEASURED post-change: 31_843. Per this entry's own doctrine (measure
-    // after the change; concurrent lanes STACK) bumped 31_320 -> 31_960 =
-    // 31_843 + 117 headroom. Real relief is the #650-class module split.
-    ("src/store/postgres.rs", 31_960),
+    // `lineage_cypher` additionally drops AGE's unimplemented
+    // relationship-type ALTERNATION for an untyped pattern plus a Rust-side
+    // provenance-subset filter (`age_edge_is_lineage_relation`), and every
+    // agtype RESULT cell moves onto the `age_cell_text` reader (the
+    // `try_get::<String, _>`-on-agtype decode was latently broken from
+    // v0.7.0 and only became reachable once the statements executed).
+    // MEASURED post-change: 31_941. Per this entry's own doctrine (measure
+    // after the change; concurrent lanes STACK) bumped 31_320 -> 32_060 =
+    // 31_941 + 119 headroom. Real relief is the #650-class module split.
+    ("src/store/postgres.rs", 32_060),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
