@@ -45,12 +45,9 @@
 # was fixed in #2509; `c8-precheck.yml`'s `local/**` overlap is fixed in the
 # same commit as this file.
 #
-# token-budget.yml is DELIBERATELY NOT FIXED HERE: #2506 is repairing it in
-# parallel, and its repair is not the one-line narrowing the others took — its
-# `pull_request.branches` omits `release/**`, so narrowing `push.branches`
-# alone would leave a `feat/**` -> `release/v1.0.0` PR with NO token-budget run
-# at all, a fail-OPEN traded for a cancelled row. Two agents editing that file
-# concurrently is how one of the two fixes gets silently reverted, so this
-# entry holds the line until #2506 lands, and then it goes.
+# token-budget.yml WAS ledgered here while #2506 repaired it in parallel
+# (its fix had to widen pull_request.branches to release/** in the SAME
+# commit as the push narrowing, not the one-line treatment). #2506 landed
+# via PR #2522 (98a2bc31); the entry was deleted per the rule (d) stale
+# NOTICE. The ledger is EMPTY again, by design.
 # ---------------------------------------------------------------------------
-token-budget.yml feat/** #2506 push.branches includes feat/**, which is a PR head prefix; fix must also widen pull_request.branches to release/**
