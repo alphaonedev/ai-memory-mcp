@@ -8594,32 +8594,44 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err(CTX_SET_SEARCH_PATH, e))?;
 
-        // The projection types each edge by its relation label
-        // (`project_link_into_age`), so the P filter is a label
-        // alternation on the variable-length pattern. `max_depth` is
-        // clamped upstream (no injection surface); the start id binds
-        // through AGE's `$vars` JSON.
-        let labels = crate::models::MemoryLinkRelation::LINEAGE
-            .iter()
-            .map(|r| r.as_str())
-            .collect::<Vec<_>>()
-            .join("|");
+        // #2511 — the pattern is UNTYPED (`-[r*1..N]->`) and the
+        // provenance-subset P filter is applied Rust-side per edge.
+        //
+        // Pre-#2511 this built a relationship-type ALTERNATION
+        // (`-[r:derived_from|reflects_on|derives_from*1..N]->`), which
+        // Apache AGE's cypher parser does not implement AT ALL —
+        // `ERROR: syntax error at or near "|"`, with or without a
+        // variable-length quantifier, verified live on AGE 1.7.0. Together
+        // with `length(r)` (which parses but raises `length() argument must
+        // resolve to a scalar` at RUNTIME on a var-length pattern's
+        // relationship list) that made the whole statement unusable, so
+        // `lineage` on AGE has always fallen through to `lineage_cte`.
+        //
+        // The Rust-side P filter is STRICTER than a per-hop label match has
+        // to be, and deliberately so: EVERY edge on the path must be in P,
+        // mirroring `lineage_cte`'s `relation IN (...)` on both the seed and
+        // the recursive step. An untyped traversal would otherwise surface a
+        // path that hops through a `related_to` edge, which the CTE can
+        // never return — a wrong result, not merely a different one.
+        //
+        // `max_depth` is clamped upstream (no injection surface); the start
+        // id binds through AGE's `$vars` JSON.
         let pattern = if ancestors {
-            format!("(a)-[r:{labels}*1..{max_depth}]->(b)")
+            format!("(a)-[r*1..{max_depth}]->(b)")
         } else {
-            format!("(a)<-[r:{labels}*1..{max_depth}]-(b)")
+            format!("(a)<-[r*1..{max_depth}]-(b)")
         };
         let cypher = format!(
             "MATCH p = {pattern} WHERE a.id = $start_id \
-             RETURN b.id AS node_id, last(r).relation AS relation, length(r) AS depth"
+             RETURN b.id AS node_id, relationships(p) AS path_edges"
         );
         // #2511 — bare `agtype`-typed `$1` Param, not an inlined
         // `'{…}'::agtype` literal (which AGE's analyzer rejects). See
         // [`Agtype`].
         let params = age_params_jsonb(&[("start_id", root_id)]);
         let sql = format!(
-            "SELECT node_id, relation, depth FROM cypher('memory_graph', $$ {cypher} $$, \
-             $1) AS (node_id agtype, relation agtype, depth agtype)"
+            "SELECT node_id, path_edges FROM cypher('memory_graph', $$ {cypher} $$, \
+             $1) AS (node_id agtype, path_edges agtype)"
         );
 
         // #1482 — per-call-unique cypher text (label alternation +
@@ -8641,15 +8653,24 @@ impl PostgresStore {
         for r in &rows {
             // #2511 — agtype cells, not `String` cells (see `age_cell_text`).
             let node_id = age_cell_text(r, "node_id", "read node_id")?;
-            let relation = age_cell_text(r, READ_RELATION_COL, READ_RELATION)?;
-            let depth_raw = age_cell_text(r, "depth", READ_DEPTH)?;
-            let depth: usize = strip_agtype_quotes(&depth_raw).parse().map_err(|_| {
-                StoreError::IntegrityFailed {
-                    detail: format!("non-numeric AGE depth: {depth_raw}"),
-                }
-            })?;
+            let edges_raw = age_cell_text(r, "path_edges", "read lineage path_edges")?;
+            let edges = age_decode_entity_list("path_edges", &edges_raw)?;
+            if edges.is_empty() {
+                // A `*1..N` pattern cannot match a zero-length path.
+                return Err(StoreError::IntegrityFailed {
+                    detail: "AGE lineage path carried no relationships".to_string(),
+                });
+            }
+            // #2511 — the provenance-subset P filter AGE's parser cannot
+            // express as a label alternation. EVERY edge must be in P, so a
+            // path that hops through a non-lineage relation is dropped
+            // exactly as `lineage_cte` drops it.
+            if !edges.iter().all(age_edge_is_lineage_relation) {
+                continue;
+            }
+            let depth = edges.len();
             let node_id = strip_agtype_quotes(&node_id).to_string();
-            let relation = strip_agtype_quotes(&relation).to_string();
+            let relation = age_last_edge_relation(&edges);
             match best.get(&node_id) {
                 Some((_, d)) if *d <= depth => {}
                 _ => {
@@ -13531,6 +13552,33 @@ fn build_kg_query_current_view_cypher(max_depth: usize) -> String {
 /// projection sets to the identical SAL relation value — so a
 /// pre-#2377 edge that carries no property still reports its relation
 /// rather than an empty string.
+/// #2511 — is this decoded AGE edge one of the derivation-provenance
+/// relations `MemoryLinkRelation::LINEAGE` (`P`)?
+///
+/// The Rust-side twin of the relationship-type ALTERNATION
+/// (`-[r:derived_from|reflects_on|derives_from*1..N]->`) that Apache AGE's
+/// parser does not implement. Reads the same SSOT set `lineage_cte`'s
+/// `relation IN (...)` list is built from, so the two branches can never
+/// drift on which relations count as provenance.
+///
+/// Prefers the `relation` PROPERTY and falls back to the edge LABEL — the
+/// projection writes the identical SAL relation value to both.
+fn age_edge_is_lineage_relation(edge: &serde_json::Value) -> bool {
+    let name = edge
+        .get(field_names::PROPERTIES)
+        .and_then(|p| p.get("relation"))
+        .and_then(|r| r.as_str())
+        .or_else(|| edge.get("label").and_then(|l| l.as_str()));
+    let Some(name) = name else {
+        // Fail CLOSED: an edge whose relation cannot be read is NOT
+        // provably in P, so it must not widen a provenance walk.
+        return false;
+    };
+    crate::models::MemoryLinkRelation::LINEAGE
+        .iter()
+        .any(|r| r.as_str() == name)
+}
+
 fn age_last_edge_relation(edges: &[serde_json::Value]) -> String {
     edges
         .last()
@@ -27185,6 +27233,50 @@ mod tests {
         // Empty list is not reachable for a `*1..N` pattern (the caller
         // rejects it as IntegrityFailed), but must not panic.
         assert_eq!(age_last_edge_relation(&[]), "");
+    }
+
+    #[test]
+    fn issue_2511_lineage_p_filter_matches_the_cte_relation_set() {
+        // #2511 — Rust-side twin of the relationship-type ALTERNATION AGE's
+        // parser does not implement. It MUST admit exactly
+        // `MemoryLinkRelation::LINEAGE` (the same SSOT `lineage_cte`'s
+        // `relation IN (...)` list is built from) and fail CLOSED on an edge
+        // whose relation cannot be read — an unreadable edge is not PROVABLY
+        // provenance, so it must not widen a lineage walk.
+        let by_prop = |r: &str| serde_json::json!({ "properties": { "relation": r } });
+        let by_label = |r: &str| serde_json::json!({ "label": r, "properties": {} });
+
+        for rel in crate::models::MemoryLinkRelation::LINEAGE {
+            assert!(
+                age_edge_is_lineage_relation(&by_prop(rel.as_str())),
+                "P must admit {} via the relation property",
+                rel.as_str()
+            );
+            assert!(
+                age_edge_is_lineage_relation(&by_label(rel.as_str())),
+                "P must admit {} via the edge label",
+                rel.as_str()
+            );
+        }
+
+        // Every NON-lineage relation in the closed taxonomy must be rejected,
+        // so adding a relation to the enum without adding it to LINEAGE cannot
+        // silently widen the provenance walk.
+        for rel in crate::models::MemoryLinkRelation::all() {
+            let in_p = rel.is_lineage();
+            assert_eq!(
+                age_edge_is_lineage_relation(&by_prop(rel.as_str())),
+                in_p,
+                "P membership for {} must match MemoryLinkRelation::LINEAGE",
+                rel.as_str()
+            );
+        }
+
+        // Fail closed on an unreadable relation.
+        assert!(!age_edge_is_lineage_relation(&serde_json::json!({})));
+        assert!(!age_edge_is_lineage_relation(&serde_json::json!({
+            "properties": { "relation": 7 }
+        })));
     }
 
     #[test]

@@ -40,10 +40,18 @@
 //! * `r203_kg_query_reflects_an_age_side_deletion_the_cte_still_shows` — the
 //!   mirror case: the `memory_links` row survives, the AGE edge is deleted.
 //!   The CTE returns the edge; AGE returns nothing.
+//! * `r203_lineage_reflects_an_age_only_provenance_edge_and_filters_non_p` —
+//!   the same shape for `lineage_ancestors`, which was ALSO unusable for two
+//!   further reasons AGE's parser imposes: relationship-type ALTERNATION
+//!   (`-[r:derived_from|reflects_on|derives_from*1..N]->`) is not implemented
+//!   at all, and `length(r)` over a variable-length pattern's relationship
+//!   list raises `length() argument must resolve to a scalar` at runtime. It
+//!   also asserts the Rust-side provenance-subset filter that replaced the
+//!   alternation actually drops a non-`P` hop.
 //!
-//! Both FAIL at the parent commit (the CTE answer wins because AGE never ran)
-//! and pass with the typed-Param bind. `r203_age_rejects_the_inlined_agtype_
-//! literal_third_arg` pins the substrate premise itself.
+//! All three FAIL at the parent commit (the CTE answer wins because AGE never
+//! ran). `r203_age_rejects_the_inlined_agtype_literal_third_arg` pins the
+//! substrate premise itself.
 //!
 //! ## Gating
 //!
@@ -380,6 +388,101 @@ async fn r203_kg_query_reflects_an_age_only_edge_the_cte_cannot_see() {
         "#2511: kg_query must be served by AGE and return the AGE-only edge \
          {a_id} -> {b_id}. An EMPTY result means the relational CTE answered \
          while Capabilities.kg_backend reported `age`. Got: {rows:?}"
+    );
+}
+
+/// **R-203 lineage regression.** `lineage_ancestors` on AGE was unusable for a
+/// THIRD reason on top of the #2511 third-argument defect: the builder emitted
+/// a relationship-type ALTERNATION
+/// (`-[r:derived_from|reflects_on|derives_from*1..N]->`), which AGE's parser
+/// does not implement at all (`syntax error at or near "|"`), plus `length(r)`
+/// over a variable-length pattern's relationship list (which parses but raises
+/// `length() argument must resolve to a scalar` at RUNTIME on a real match).
+///
+/// Same divergence shape as the `kg_query` test: a `derived_from` edge that
+/// exists ONLY in the AGE projection, so a non-empty answer proves AGE served
+/// the walk. Also asserts the Rust-side provenance-subset (`P`) filter that
+/// replaced the alternation actually filters: a `related_to` edge projected
+/// alongside it must NOT surface as lineage.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a live Apache AGE postgres (AI_MEMORY_TEST_AGE_URL); run with --include-ignored"]
+async fn r203_lineage_reflects_an_age_only_provenance_edge_and_filters_non_p() {
+    let test = "r203_lineage_reflects_an_age_only_provenance_edge_and_filters_non_p";
+    let Some((store, pool)) = age_store_or_skip(test).await else {
+        return;
+    };
+
+    let ctx = CallerContext::for_agent("t-2511".to_string());
+    let ns = format!("t2511-{}", uuid::Uuid::new_v4());
+    let child = store
+        .store(&ctx, &mk_memory(&ns, "lineage-child"))
+        .await
+        .expect("store child");
+    let parent = store
+        .store(&ctx, &mk_memory(&ns, "lineage-parent"))
+        .await
+        .expect("store parent");
+    let sibling = store
+        .store(&ctx, &mk_memory(&ns, "lineage-non-p"))
+        .await
+        .expect("store sibling");
+
+    for id in [&child, &parent, &sibling] {
+        direct_cypher(
+            &pool,
+            "MERGE (n:Memory {id: $id}) RETURN n",
+            &serde_json::json!({ "id": id }),
+        )
+        .await;
+    }
+    // In P: child -[derived_from]-> parent (the ancestors direction).
+    direct_cypher(
+        &pool,
+        "MATCH (a:Memory {id: $src}), (b:Memory {id: $dst}) \
+         MERGE (a)-[r:derived_from {relation: 'derived_from'}]->(b) RETURN r",
+        &serde_json::json!({ "src": &child, "dst": &parent }),
+    )
+    .await;
+    // NOT in P: child -[related_to]-> sibling. An untyped AGE traversal
+    // reaches it; the Rust-side P filter must drop it, exactly as
+    // `lineage_cte`'s `relation IN (...)` does.
+    direct_cypher(
+        &pool,
+        "MATCH (a:Memory {id: $src}), (b:Memory {id: $dst}) \
+         MERGE (a)-[r:related_to {relation: 'related_to'}]->(b) RETURN r",
+        &serde_json::json!({ "src": &child, "dst": &sibling }),
+    )
+    .await;
+
+    // Neither edge exists relationally, so the CTE branch can only return
+    // nothing — a non-empty answer is proof AGE served the walk.
+    let (relational,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM memory_links WHERE source_id = $1")
+            .bind(&child)
+            .fetch_one(&pool)
+            .await
+            .expect("count memory_links");
+    assert_eq!(
+        relational, 0,
+        "fixture invariant: no memory_links rows for this pair"
+    );
+
+    let rows = store
+        .lineage_ancestors(&child, 3)
+        .await
+        .expect("lineage_ancestors");
+    assert!(
+        rows.iter()
+            .any(|n| n.id == parent && n.relation == "derived_from" && n.depth == 1),
+        "#2511: lineage must be served by AGE and return the AGE-only \
+         derived_from ancestor {parent} at depth 1. An EMPTY result means the \
+         relational CTE answered. Got: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|n| n.id == sibling),
+        "#2511: the Rust-side P filter replacing AGE's unsupported label \
+         alternation MUST drop a non-provenance (`related_to`) hop — \
+         `lineage_cte` never returns one. Got: {rows:?}"
     );
 }
 
