@@ -70,7 +70,6 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
 
 use ai_memory::db;
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
@@ -79,16 +78,22 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
-// Subprocess timing
+// Subprocess timing (#2525)
 //
-// 10s mirrors `tests/mcp_integration.rs::READ_TIMEOUT`. The `initialize`
-// handshake is the load-bearing latency — a cold cargo-bin spawn under
-// release+thin-LTO compile pressure can run 2-3s on the first call;
-// every subsequent `tools/call` is sub-100ms. 10s leaves comfortable
-// headroom for both.
+// The `initialize` handshake is the load-bearing latency — a cold
+// cargo-bin spawn plus schema bootstrap runs 2-3s on the first call;
+// every subsequent `tools/call` is sub-100ms. This file used to bound
+// that with a FIXED 10s `READ_TIMEOUT`, which a loaded ubuntu-latest
+// runner blew through on PR #2522 (issue #2525) —
+// `cli_mcp_subprocess_reflect_empty_metadata_preserves_canonical_shape`
+// panicked at 10.21s while its sibling in the same binary passed and a
+// full re-run was green. The bound now comes from the shared elastic
+// helper; see `tests/common/mcp_wait.rs` for why that is not merely a
+// bigger constant.
 // ---------------------------------------------------------------------------
 
-const READ_TIMEOUT: Duration = Duration::from_secs(10);
+#[path = "common/mcp_wait.rs"]
+mod mcp_wait;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -193,16 +198,14 @@ fn spawn_mcp(db: &std::path::Path) -> (McpChild, mpsc::Receiver<String>) {
     )
 }
 
-/// Send a JSON-RPC request line to the MCP child's stdin, then wait up
-/// to `READ_TIMEOUT` for the next response line. Panics with a clear
-/// signature on timeout (mirrors `tests/mcp_integration.rs`).
+/// Send a JSON-RPC request line to the MCP child's stdin, then wait for
+/// the next response line against the shared elastic budget (#2525).
 fn send_and_recv(stdin: &mut ChildStdin, rx: &mpsc::Receiver<String>, payload: &Value) -> Value {
     let line = serde_json::to_string(payload).unwrap();
+    let ctx = payload["method"].as_str().unwrap_or("<unknown method>");
     writeln!(stdin, "{line}").expect("write to mcp stdin");
     stdin.flush().expect("flush mcp stdin");
-    let resp = rx
-        .recv_timeout(READ_TIMEOUT)
-        .expect("mcp response did not arrive within READ_TIMEOUT");
+    let resp = mcp_wait::recv_mcp_response(rx, ctx);
     serde_json::from_str(&resp).unwrap_or_else(|e| panic!("parse mcp response: {e}: {resp}"))
 }
 
