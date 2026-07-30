@@ -29,6 +29,21 @@
 //! only used by a subset of suites); the module-level
 //! `#![allow(dead_code)]` below silences the per-binary
 //! `dead_code` warnings that would otherwise fire.
+//!
+//! ## Sibling leaf helper — `common/mcp_wait.rs` (#2525)
+//!
+//! The MCP-stdio subprocess suites share their per-response wait
+//! through `tests/common/mcp_wait.rs`, which is deliberately NOT
+//! declared here: this module pulls `reqwest` + `ed25519_dalek` +
+//! `rusqlite` into every binary that says `mod common;`, and those
+//! suites need none of it (see the #1381 `postgres_env` link-weight
+//! lesson below). They take it via the `#[path]` submodule idiom
+//! instead:
+//!
+//! ```ignore
+//! #[path = "common/mcp_wait.rs"]
+//! mod mcp_wait;
+//! ```
 
 #![allow(dead_code)]
 
