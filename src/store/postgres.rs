@@ -30144,18 +30144,39 @@ mod tests {
         let dst = sample_memory(&format!("tl-dst-{unique}"), &ns, "tl-dst", "dst body");
         let src_id = store.store(&ctx, &src).await.expect("store src");
         let dst_id = store.store(&ctx, &dst).await.expect("store dst");
-        // Insert a link with valid_from set so kg_timeline picks it up
-        // (the SAL `link` trait method does not surface valid_from).
-        sqlx::query(
-            "INSERT INTO memory_links \
-             (source_id, target_id, relation, created_at, valid_from, attest_level) \
-             VALUES ($1, $2, 'related_to', NOW(), '2030-01-01 00:00:00+00', 'unsigned')",
-        )
-        .bind(&src_id)
-        .bind(&dst_id)
-        .execute(&store.pool)
-        .await
-        .expect("insert timeline link");
+        // #2511 — create the link through the SAL `link` trait method, the
+        // ONLY production path that writes an edge. It sets `valid_from` on
+        // BOTH representations coherently: the relational `memory_links`
+        // bind AND, in sync mode, the AGE `memory_graph` projection
+        // (`project_link_into_age(.., Some(valid_from_str), ..)`, #2377
+        // FIX #9). `MemoryLink.valid_from` is honoured verbatim when
+        // supplied and defaults to now otherwise.
+        //
+        // The prior fixture raw-INSERTed into `memory_links` ONLY, on the
+        // stale premise that "the SAL `link` trait method does not surface
+        // valid_from" — false since #2377. That produced state NO
+        // production path can produce (a relational edge with no AGE
+        // projection), which was invisible while the AGE cypher was
+        // rejected at parse time and every kg_timeline silently fell back
+        // to the CTE. Once #2511 made the AGE statement execute, AGE
+        // correctly reported no such edge and the assertion failed — the
+        // fixture was the defect, not the product.
+        let link = crate::models::MemoryLink {
+            source_id: src_id.clone(),
+            target_id: dst_id.clone(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            // Explicit (the original fixture's stamp) so the assertion does
+            // not lean on the default-to-now arm.
+            valid_from: Some("2030-01-01T00:00:00Z".to_string()),
+            valid_until: None,
+            observed_by: None,
+            signature: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        };
+        store.link(&ctx, &link).await.expect("create timeline link");
         let events = <PostgresStore as MemoryStore>::kg_timeline(&store, &src_id, None, None, None)
             .await
             .expect("kg_timeline trait");
