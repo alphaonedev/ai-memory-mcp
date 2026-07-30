@@ -18,6 +18,25 @@
 # A committed fixture rather than a `git show` so the legs survive CI's shallow
 # checkout instead of silently SKIPping — the #2496 lesson.
 #
+# WHAT "FROZEN" DOES AND DOES NOT MEAN HERE (#2473).
+# The frozen property is the DECIDER ABSENCE, and it is asserted mechanically:
+# SECTION C fails if either decider ever appears below. Everything else in this
+# file is NOT frozen and CANNOT be, because the second leg runs the REAL gate
+# with this mirror against the REAL (live) workflow directory and requires it to
+# EXIT 0 — so any job rename anywhere in `.github/workflows/` that this file
+# does not track makes rule (a) fail and the regression leg unrunnable, which
+# would look like "the baseline no longer reproduces the blind spot" when in
+# fact nothing about the blind spot changed.
+#
+# That is exactly what #2473 forced: `l3-boundary-gate`'s name is now QUOTED in
+# `c8-precheck.yml`, so the workflow reports the FULL
+# `L3-boundary perma-ban gate (§25.3 S5 / RQ-10 #1853)` and the truncated entry
+# this file used to carry matches no job. The entry below was updated to the
+# full name for that reason ALONE. It is not a "repair" in the sense this
+# header warns against: the two deciders remain undeclared, both SECTION C
+# legs remain load-bearing, and the historical truncation is preserved in the
+# commentary below rather than in a line that would now break the harness.
+#
 # ---------------------------------------------------------------------------
 # required-contexts-release.txt — the DECLARED required-status-check set for
 # the protected branch `release/v1.0.0`, verified by
@@ -31,23 +50,24 @@
 # gate's job is to prove the artefact is sound; if the declaration is minted
 # from the artefact, the gate proves nothing and passes forever.
 #
-# That is not hypothetical here. The entry
+# That is not hypothetical here. AT THE TIME THIS FIXTURE WAS FROZEN the entry
+# below read
 #
 #     L3-boundary perma-ban gate (§25.3 S5 / RQ-10
 #
-# is TRUNCATED, and the truncation is LOAD-BEARING — do not "fix" it.
-# `.github/workflows/c8-precheck.yml:75` writes the job name UNQUOTED:
+# — TRUNCATED, because `.github/workflows/c8-precheck.yml` wrote the job name
+# UNQUOTED:
 #
 #     name: L3-boundary perma-ban gate (§25.3 S5 / RQ-10 #1853)
 #
 # In YAML a `#` PRECEDED BY WHITESPACE opens a comment, so the parsed job name
-# — and therefore the check-run name GitHub actually reports — stops at
-# `RQ-10`. The live required context carries the truncated form, so it matches
-# and the gate is green. Tracked as #2473. Two ways to make it well-formed,
-# BOTH of which are branch-protection edits and are therefore out of scope
-# here: quote the name in the workflow AND update this mirror AND update
-# protection, in that order, atomically. Changing only the workflow renames the
-# check-run and instantly wedges the branch on an absent required context.
+# — and therefore the check-run name GitHub actually reported — stopped at
+# `RQ-10`. The live required context carried the truncated form, so it matched
+# and the gate was green on a name nobody wrote. Tracked as #2473, and CLOSED
+# by it: the workflow name is quoted, both mirrors declare the full string, and
+# the gate gained rule (e) — HARD-FAIL on any unquoted job `name:` containing
+# whitespace-then-`#`. See "WHAT 'FROZEN' DOES AND DOES NOT MEAN HERE" at the
+# top of this file for why the entry below tracks that rename.
 #
 # (Contrast the entries that contain `(#1174 PR10)`, `(#1989)`, `(#2146)`:
 # those do NOT truncate, because there the `#` is preceded by `(`, not
@@ -99,7 +119,7 @@ Cross-compile (aarch64-linux-android)
 # filter. These are the nine contexts that genuinely run on every PR.
 C8 caller-context allowlist check
 Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10)
-L3-boundary perma-ban gate (§25.3 S5 / RQ-10
+L3-boundary perma-ban gate (§25.3 S5 / RQ-10 #1853)
 Hardcoded-literal duplication ratchet (pm-v3.1)
 Docs vs SSOT drift gate
 Cloud-init ASCII gate

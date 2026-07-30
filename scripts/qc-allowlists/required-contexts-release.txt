@@ -10,23 +10,51 @@
 # gate's job is to prove the artefact is sound; if the declaration is minted
 # from the artefact, the gate proves nothing and passes forever.
 #
-# That is not hypothetical here. The entry
+# That is not hypothetical here. Until #2473 landed, the entry read
 #
 #     L3-boundary perma-ban gate (§25.3 S5 / RQ-10
 #
-# is TRUNCATED, and the truncation is LOAD-BEARING — do not "fix" it.
-# `.github/workflows/c8-precheck.yml:75` writes the job name UNQUOTED:
+# — TRUNCATED, because `.github/workflows/c8-precheck.yml` wrote the job name
+# UNQUOTED:
 #
 #     name: L3-boundary perma-ban gate (§25.3 S5 / RQ-10 #1853)
 #
 # In YAML a `#` PRECEDED BY WHITESPACE opens a comment, so the parsed job name
-# — and therefore the check-run name GitHub actually reports — stops at
-# `RQ-10`. The live required context carries the truncated form, so it matches
-# and the gate is green. Tracked as #2473. Two ways to make it well-formed,
-# BOTH of which are branch-protection edits and are therefore out of scope
-# here: quote the name in the workflow AND update this mirror AND update
-# protection, in that order, atomically. Changing only the workflow renames the
-# check-run and instantly wedges the branch on an absent required context.
+# — and therefore the check-run name GitHub actually reported, and therefore
+# the string an operator copied off a PR into branch protection — stopped at
+# `RQ-10`. It MATCHED, so this gate was green on a name nobody wrote. The
+# truncation was left in place deliberately (see the paragraph above) rather
+# than "repaired" here, because repairing the DECLARATION without the WORKFLOW
+# would have laundered the artifact into the intent.
+#
+# #2473 CLOSES it. The workflow name is now QUOTED, this file declares the FULL
+# string below, and `scripts/check-required-contexts.sh` gained rule (e):
+# HARD-FAIL, never allowlistable, for ANY job in ANY workflow whose UNQUOTED
+# `name:` contains whitespace-then-`#`. The class cannot re-land silently.
+#
+# THE LANDING ORDER FOR THIS PARTICULAR CHANGE (#2473) — it is a SWAP, not an
+# addition, and its two halves pull in opposite directions:
+#
+#   * The OLD (truncated) context must be REMOVED from live protection BEFORE
+#     the workflow rename merges. Once the rename is on the base branch, every
+#     PR's cycle reports only the NEW name, so the old required context is
+#     ABSENT — pending forever under `enforce_admins: true` — on every PR
+#     including the one that renamed it. (Removal ⇒ protection first: the
+#     REMOVAL half of the ORDER doctrine below.)
+#   * The NEW (full) context must be ADDED to live protection AFTER the rename
+#     merges, because until the base carries the rename no PR reports that name
+#     and requiring it would wedge every open PR instead. (Addition ⇒ mirror
+#     first: the ADDITION half of the doctrine.)
+#
+# So the sequence is: (1) protection DROPS the truncated context — 23 required;
+# (2) this PR merges — mirror declares the full name, workflow reports it, and
+# neither half of the swap is required, so nothing can wedge; (3) protection
+# ADDS the full context — 24 required again. Step (2) between (1) and (3) is a
+# short window in which the L3 gate RUNS on every PR and is visible, but is not
+# REQUIRED; that is the cost, and it is strictly cheaper than the alternative
+# orderings, every one of which wedges `release/v1.0.0` on an absent required
+# context that `enforce_admins: true` cannot clear. Full analysis in the #2473
+# PR body.
 #
 # (Contrast the entries that contain `(#1174 PR10)`, `(#1989)`, `(#2146)`:
 # those do NOT truncate, because there the `#` is preceded by `(`, not
@@ -115,7 +143,7 @@ Cross-compile (aarch64-linux-android)
 # filter. These are the nine contexts that genuinely run on every PR.
 C8 caller-context allowlist check
 Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10)
-L3-boundary perma-ban gate (§25.3 S5 / RQ-10
+L3-boundary perma-ban gate (§25.3 S5 / RQ-10 #1853)
 Hardcoded-literal duplication ratchet (pm-v3.1)
 Docs vs SSOT drift gate
 Cloud-init ASCII gate
@@ -145,10 +173,21 @@ Per-Module Coverage Thresholds
 # this change.
 # ---------------------------------------------------------------------------
 #   * CLOSED (#2494 residual) — `Classify changes` + `Coverage classify
-#     (docs-only short-circuit)` are now DECLARED above. Until the companion
-#     branch-protection API call lands they are declared-but-not-yet-required;
-#     see "ORDER" in HOW TO CHANGE THIS FILE for why that is the safe half to
-#     land first. The live set is 22 contexts until that call, 24 after.
+#     (docs-only short-circuit)` are DECLARED above AND the companion
+#     branch-protection API call has landed: live `required_status_checks` is
+#     24 contexts (verified 2026-07-30, all pinned to app_id 15368,
+#     `strict: true`, `enforce_admins: true`).
+#   * IN FLIGHT (#2473) — this file now declares
+#     `L3-boundary perma-ban gate (§25.3 S5 / RQ-10 #1853)` (the FULL name)
+#     while live protection still requires the TRUNCATED
+#     `L3-boundary perma-ban gate (§25.3 S5 / RQ-10`. That is the intended
+#     intermediate state and it is the SAFE half: this gate compares the
+#     mirror against the WORKFLOWS only (it has no API access, by design), so
+#     it is green either way, and a declared-but-not-required context blocks
+#     nothing. The two protection calls that close it — DROP truncated BEFORE
+#     this PR merges, ADD full AFTER — are in "THE LANDING ORDER FOR THIS
+#     PARTICULAR CHANGE" above. Live count: 24 now, 23 between the calls, 24
+#     after.
 #   * Two c8-precheck integrity gates run on every PR but are not required:
 #     `Installer checksum fail-closed gate (#2449)` and
 #     `Non-Rust conformance-reader proof gate (#2452)`.
