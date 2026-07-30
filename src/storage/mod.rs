@@ -12470,8 +12470,16 @@ pub fn list_archived(
 /// empty edge graph. Other `ON DELETE CASCADE` provenance
 /// (`recall_observations`, confidence-calibration rows,
 /// `memory_transcript_links`) is regenerable telemetry and is NOT
-/// preserved by design. POSTGRES edge restore is a tracked follow-up
-/// (this commit wires sqlite only).
+/// preserved by design.
+///
+/// #2318 truth-fix: this comment long read "POSTGRES edge restore is a
+/// tracked follow-up (this commit wires sqlite only)". That is FALSE and
+/// has been since v70 shipped — `PostgresStore::forget` and
+/// `archive_by_ids` snapshot edges, `archive_restore` re-inserts every
+/// preserved edge whose endpoints still exist, and the behaviour is pinned
+/// by `archive_restore_preserves_links_pg_1771`. Both backends wire
+/// snapshot/restore.
+///
 /// v1.0.0 #2418 (L-EXPIRY-CANON) — read `archived_memories.original_expires_at`
 /// and return it in the ONE canonical fixed-UTC rendering.
 ///

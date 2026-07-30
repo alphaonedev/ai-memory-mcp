@@ -308,7 +308,9 @@ fn dlq_depth_warn_threshold() -> i64 {
 /// drown the very signal it is meant to be. `0` = below, `1` = at/over.
 static DLQ_DEPTH_OVER_THRESHOLD: AtomicI64 = AtomicI64::new(0);
 
-use crate::federation::receive_auth::CAUSE_UNENROLLED_AUTHOR_STRICT;
+use crate::federation::receive_auth::{
+    CAUSE_NAMESPACE_PROBE_UNRESOLVABLE, CAUSE_UNENROLLED_AUTHOR_STRICT,
+};
 
 /// #1544 — map a free-text DLQ `last_error` to a CLOSED-set quarantine
 /// cause label so the Prometheus label cardinality is bounded by
@@ -326,6 +328,16 @@ fn classify_quarantine_cause(last_error: &str) -> &'static str {
         // Operator-actionable — enroll the author's key at the receiving node
         // (the manual substitute for the deferred TOFU key distribution).
         CAUSE_UNENROLLED_AUTHOR_STRICT
+    } else if last_error.contains(CAUSE_NAMESPACE_PROBE_UNRESOLVABLE) {
+        // #2488 — the receiver could not RESOLVE the target row's namespace, so
+        // the federated-delete scope gate failed closed. Distinct from a scope
+        // refusal: the peer's config is fine and the row is un-erasable until
+        // the read succeeds. Operator-actionable at the RECEIVER's storage, not
+        // at the sender's allowlist. Dormant until the delete lane gains a DLQ
+        // enqueue (#2498); classified here so the closed label set is already
+        // correct when it does, and so the token has exactly one meaning across
+        // the substrate.
+        CAUSE_NAMESPACE_PROBE_UNRESOLVABLE
     } else if last_error.contains("401") || last_error.contains("403") {
         // The replay last_error is the `http {status}` shape, so 401/403
         // is the enrolment/auth signal (the peer's JSON `peer_not_enrolled`
@@ -1010,9 +1022,10 @@ mod replay_arm_tests {
     //! the worker at a peer URL that refuses TCP.
 
     use super::{
-        CAUSE_UNENROLLED_AUTHOR_STRICT, DEFAULT_REPLAY_MAX_BATCH, ENV_FED_DLQ_REPLAY_MAX_BATCH,
-        FederationDlqSink, FederationPushDlqRow, MAX_REPLAY_ATTEMPTS, REPLAY_BATCH_SIZE,
-        classify_quarantine_cause, replay_max_batch, replay_once,
+        CAUSE_NAMESPACE_PROBE_UNRESOLVABLE, CAUSE_UNENROLLED_AUTHOR_STRICT,
+        DEFAULT_REPLAY_MAX_BATCH, ENV_FED_DLQ_REPLAY_MAX_BATCH, FederationDlqSink,
+        FederationPushDlqRow, MAX_REPLAY_ATTEMPTS, REPLAY_BATCH_SIZE, classify_quarantine_cause,
+        replay_max_batch, replay_once,
     };
     use crate::federation::{FederationConfig, PeerEndpoint};
     use crate::replication::QuorumPolicy;
@@ -1389,6 +1402,16 @@ mod replay_arm_tests {
                 "sync_push: honored third-party relay refused (unenrolled_author_strict)"
             ),
             CAUSE_UNENROLLED_AUTHOR_STRICT
+        );
+        // #2488 — an un-erasable row (the receiver could not RESOLVE the target
+        // row's namespace, so the federated-delete scope gate failed closed) is
+        // its own closed-set label. Distinct from a scope refusal: the peer's
+        // config is fine and the remedy lives at the RECEIVER's storage.
+        assert_eq!(
+            classify_quarantine_cause(
+                "sync_push: refusing federated deletion (namespace_probe_unresolvable)"
+            ),
+            CAUSE_NAMESPACE_PROBE_UNRESOLVABLE
         );
         assert_eq!(
             classify_quarantine_cause("connection reset by peer"),
