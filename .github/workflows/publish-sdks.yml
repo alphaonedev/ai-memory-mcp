@@ -7,17 +7,39 @@ name: publish-sdks
 #
 # Both jobs declare a GitHub Environment (`pypi-publish` / `npm-publish`).
 #
-# ⚠ #2467 TRUTH-FIX — those environments have NO protection rules configured
-# (`gh api repos/:owner/:repo/environments` -> `protection_rules: []` on both),
-# so declaring them does NOT create an approval gate. This comment previously
-# asserted "a maintainer must approve each publish", which was false: nothing
-# holds a publish for review today. Contrast `github-pages`, which does carry a
-# protection rule -- the mechanism works and was simply never applied here.
+# ⚠ #2467 — WHAT THOSE ENVIRONMENTS ACTUALLY ENFORCE. Declaring an
+# `environment:` does NOT by itself create an approval gate; the protection
+# rules are repository SETTINGS, not workflow config, so this comment can only
+# describe them -- never establish them. Verify, don't trust this text:
 #
-# Adding required reviewers is a repository-SETTINGS change, not a workflow
-# change, so it cannot be fixed in this file. Until it is, the prerelease guard
-# below is the only thing standing between a tag push and an irreversible
-# publish to two public registries.
+#     gh api repos/:owner/:repo/environments/pypi-publish --jq .protection_rules
+#     gh api repos/:owner/:repo/environments/npm-publish  --jq .protection_rules
+#
+# As of 2026-07-30 both carry `wait_timer=30` with `can_admins_bypass=false`
+# (applied via the API; before/after snapshots committed under
+# `governance/control-plane/` by #2507). The `can_admins_bypass=false` half is
+# the load-bearing one: with it true the timer is advisory and the same
+# identity that pushed the tag can skip it. Until that change BOTH environments
+# were `protection_rules: []` -- nothing held a publish for review -- while
+# this comment asserted "a maintainer must approve each publish." It was false.
+#
+# Required REVIEWERS are deliberately NOT configured: the reviewer pool is one
+# account (sole collaborator), so required-reviewers would block EVERY publish
+# rather than gate one -- the CODEOWNERS deadlock in a new costume (#2475). A
+# wait timer cannot deadlock; it always proceeds. (An earlier revision of this
+# comment cited `github-pages` as proof "the mechanism works and was simply
+# never applied here." That environment carries `branch_policy`, not required
+# reviewers -- a different mechanism. The precedent did not say that.)
+#
+# HONEST SCOPE -- this buys a 30-minute cancellation window, NOT a gate:
+#   - no tag protection (`/tags/protection` -> 404) and no tag ruleset (the
+#     sole ruleset is `target: "branch"`, so it does not reach tag refs)
+#   - `release.yml`'s preflight validates SemVer SHAPE only (:66-82) -- never
+#     tag ancestry, never CI status on the tagged commit
+# So a stable-shaped tag at ANY commit still publishes after 30 minutes. The
+# durable fix is deriving SDK versions from the tag (see the guard below for
+# why hardcoded manifests are what makes a wrong tag unrecoverable). Remaining
+# controls tracked on #2467.
 #
 # #2455 — TEST-BEFORE-PUBLISH. This workflow triggers on `push: tags: v*`, so
 # cutting the GA tag publishes both SDKs. Before #2455 the steps were
