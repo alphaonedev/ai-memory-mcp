@@ -50,6 +50,18 @@ Two failure modes for the AGE branch:
    as the AGE branch — and the operator sees the degraded-mode event
    in the daemon log.
 
+3. **Adapter statement defect** (added #2511). AGE is reachable and
+   healthy but it *rejects the statement the adapter built* — e.g. AGE's
+   `convert_cypher_to_subquery` analyzer refusing a `cypher()` third
+   argument that is not a bare `agtype`-typed parameter. This is NOT a
+   degradation of the deployment: it is a permanent code defect that
+   affects every AGE deployment on that build, on every request. The
+   request still falls back to the CTE (degrade, never hard-fail a live
+   KG surface), but it is logged as a distinct, developer-actionable
+   class — see below. #2511 is the reference case: all four AGE READ
+   paths were rejected on AGE 1.6.0 *and* 1.7.0 and had been silently
+   CTE-served since v0.7.0.
+
 The fallback is **per-request**, not latched: every subsequent KG call
 tries AGE first. If the operator restores the extension, the next
 request returns to the cypher path automatically. No daemon restart is
@@ -58,27 +70,59 @@ discipline.
 
 ### What gets logged
 
-When the dispatcher falls back, it emits a `tracing::warn!` event on
-the `store::postgres::kg` target with these structured fields:
+When the dispatcher falls back it emits a `tracing::warn!` event whose
+**target depends on the cause** (#2511) — the two need different
+responses, so they are filterable apart:
+
+| Cause | Target | `reason` field |
+|---|---|---|
+| AGE substrate unreachable (cases 1–2 above) — *operator*-actionable, usually transient | `store::postgres::kg` | `age_substrate_unreachable` |
+| AGE rejected the statement this adapter built (case 3) — *developer*-actionable, permanent | `store::postgres::kg::adapter_defect` | `adapter_statement_rejected` |
+
+Both carry the same structured fields:
 
 | Field          | Value                                                 |
 |----------------|-------------------------------------------------------|
-| `op`           | `kg_query` / `kg_timeline` / `kg_invalidate` / `find_paths` |
+| `op`           | `kg_query` / `kg_timeline` / `kg_invalidate` / `find_paths` / `lineage` |
 | `source_id`    | The traversal start id                                |
 | `target_id`    | Only for `find_paths` (its second id argument)        |
 | `backend`      | `age`                                                 |
 | `fallback`     | `cte`                                                 |
-| `error`        | The underlying `StoreError` (rendered)                |
+| `reason`       | See the table above                                   |
+| `error`        | The underlying `StoreError` (rendered, includes the postgres/AGE error text) |
 
-Example message body:
+Example message bodies:
 
 ```
 AGE backend unreachable; falling back to CTE for kg_query=<mem-abc-001>
 ```
 
-A repeated stream of these warnings means AGE is durably down —
-operator should investigate and restore. A single isolated warning may
-just be a transient pool blip; the next request will retry AGE.
+```
+AGE REJECTED THE STATEMENT THIS ADAPTER BUILT (AGE is reachable — this is
+NOT a substrate outage): kg_kg_query=<mem-abc-001> was served by the
+relational CTE while the reported kg_backend stays `age`. Permanent
+adapter defect, not a transient degradation — report it with the error
+text (#2511).
+```
+
+A repeated stream of `age_substrate_unreachable` warnings means AGE is
+durably down — the operator should investigate and restore. A single
+isolated one may just be a transient pool blip; the next request will
+retry AGE.
+
+**Any** `adapter_statement_rejected` warning is a bug report, not an ops
+task. Because the classifier keys off the AGE error text it can only
+ever *under*-report (an unrecognised error is logged as
+`age_substrate_unreachable`), so treat a sustained
+`age_substrate_unreachable` stream whose `error` field is identical on
+every request as a probable mis-classified statement defect and read the
+error text.
+
+`RUST_LOG` note (see also `docs/production-deployment.md`): these targets
+are literal `store::postgres…` strings, so an `ai_memory=warn` filter
+does **not** match them. Use e.g.
+`RUST_LOG=ai_memory=info,store::postgres::kg=warn` to capture both
+classes.
 
 ## Operator checks
 
