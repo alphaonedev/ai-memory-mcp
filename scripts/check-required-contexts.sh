@@ -89,15 +89,25 @@
 # set at `scripts/qc-allowlists/required-contexts-release.txt`.
 #
 #   *** THE MIRROR IS HAND-AUTHORED FROM INTENT. NEVER GENERATE IT FROM LIVE
-#   *** API STATE. One required context is currently
+#   *** API STATE. The canonical demonstration is #2473: one required context
+#   *** WAS
 #   ***     L3-boundary perma-ban gate (§25.3 S5 / RQ-10
-#   *** which is a YAML TRUNCATION ARTIFACT: `c8-precheck.yml:75` writes the
-#   *** name UNQUOTED as `... / RQ-10 #1853)`, and in YAML a `#` PRECEDED BY
-#   *** WHITESPACE opens a comment, so the parsed job name stops at `RQ-10`.
-#   *** It MATCHES today and is deliberately left alone (see #2473). If the
-#   *** mirror is ever regenerated from live state, that truncation is
-#   *** laundered into the declaration and rule (a) becomes a tautology that
-#   *** passes forever. That is the failure mode this warning exists for.
+#   *** a YAML TRUNCATION ARTIFACT — `c8-precheck.yml` wrote the job name
+#   *** UNQUOTED as `... / RQ-10 #1853)`, and in YAML a `#` PRECEDED BY
+#   *** WHITESPACE opens a comment, so the parsed job name (and therefore the
+#   *** check-run GitHub reported, and therefore the required context an
+#   *** operator copied off a PR) stopped at `RQ-10`. It MATCHED, so the gate
+#   *** was green on a name nobody intended. Had the mirror been regenerated
+#   *** from live state the truncation would have been laundered into the
+#   *** declaration and rule (a) would be a tautology that passes forever —
+#   *** that is the failure mode this warning exists for, and it is why the
+#   *** truncation was deliberately preserved here until the coupled fix.
+#   ***
+#   *** #2473 CLOSED it: the workflow name is now QUOTED, this mirror declares
+#   *** the FULL string, and NEW RULE (e) hard-fails ANY job whose unquoted
+#   *** `name:` contains ` #`, so the class cannot re-land silently. The
+#   *** hand-authored-from-intent rule is UNCHANGED and is the reason the
+#   *** defect was visible at all.
 #
 #   (Contrast: `(#1174 PR10)` / `(#2146)` / `(#1989)` names do NOT truncate,
 #   because there the `#` is preceded by `(`, not whitespace. This parser
@@ -122,6 +132,23 @@
 #       REMOVED; a STALE entry — one whose job no longer has a job-level
 #       `if:`, or which is no longer a required context — also fails, so the
 #       ratchet cannot silently rot).
+#   (e) HARD-FAIL, never allowlistable, for ANY job in ANY workflow in the
+#       directory (not only required-context carriers): a job `name:` written
+#       as an UNQUOTED scalar whose raw value contains whitespace-then-`#`.
+#       That is the #2473 shape — YAML silently truncates the name at the
+#       `#`, so the DECLARED name and the check-run GitHub actually reports
+#       differ, and an operator copying the reported name into branch
+#       protection pins the truncation. The remedy is one character of
+#       quoting, so there is no legitimate instance and no ratchet: write
+#       `name: "… #1853)"`. A name whose `#` is preceded by `(` — the
+#       `(#1174 PR10)` / `(#2146)` / `(#1989)` family — does NOT truncate and
+#       is NOT flagged, which is what keeps this rule aimed at the defect
+#       rather than at the neighbourhood. A deliberate trailing YAML comment
+#       on a name line is still expressible: quote the scalar first
+#       (`name: "Foo"  # note`) and the rule passes.
+#       Scope is repo-wide by the rule-(d) argument: a truncated name is a
+#       declared≠actual lie in every UI today and becomes a branch wedge the
+#       moment someone requires that context.
 #   (c) the carrying workflow's `pull_request` trigger exists and has NO
 #       `paths:` / `paths-ignore:` filter.
 #   (b3) in ANY job with `needs: classify` and NO job-level `if:`, EVERY step
@@ -166,7 +193,10 @@
 #   scripts/check-required-contexts.sh --self-test  — plant the historical
 #       shapes in a throwaway copy UNDER the repo (never system /tmp) and
 #       confirm the gate rejects EACH: the (b1) matrix+`if:` wedge, an (a)
-#       mirror context matching no job, a (c) `paths:`-filtered carrier, a
+#       mirror context matching no job, the (e) #2473 unquoted ` #` job name
+#       (which first asserts through `--dump` that the parse IS truncated at
+#       the `#`, so a parser that quietly stopped truncating could not make
+#       the rule fire for the wrong reason), a (c) `paths:`-filtered carrier, a
 #       (b3) unguarded step in a `needs: classify` job, and a (b4) decider
 #       carrying a job-level `if:` (rejected EVEN WHEN allowlisted, which is
 #       the property that distinguishes (b4) from (b2)), and the (d) #2508
@@ -272,7 +302,7 @@ fail() {
 #   WF   <file> <pr_trigger> <pr_paths> <branches-csv>
 #   PUSH <file> <push_trigger> <push-branches-csv>
 #   CONC <file> <has_concurrency> <cancel_in_progress> <group-expr>
-#   JOB  <file> <jobid> <name> <job_if> <has_matrix> <needs-csv>
+#   JOB  <file> <jobid> <name> <job_if> <has_matrix> <needs-csv> <name_truncation_risk>
 #   MX   <file> <jobid> <key> <value>
 #   STEP <file> <jobid> <idx> <has_if> <guarded> <uses> <name>
 parse_workflows() {
@@ -322,11 +352,30 @@ parse_workflows() {
                 printf "STEP\t%s\t%s\t%d\t%d\t%d\t%s\t%s\n", FNAME, job, cur_step, s_hasif, s_guard, s_uses, s_name
             cur_step = 0; s_hasif = 0; s_guard = 0; s_uses = ""; s_name = ""
         }
+        # RULE (e) probe. 1 iff a job `name:` is an UNQUOTED scalar whose RAW
+        # value contains whitespace-then-`#` — i.e. YAML silently truncated it
+        # (the #2473 shape). Computed on the RAW tail, deliberately BEFORE
+        # scalar() strips the comment, because after stripping the evidence is
+        # gone. A quoted scalar is exempt: quoting is the fix, and it is also
+        # how a deliberate trailing comment stays expressible.
+        function name_truncation_risk(v,   ch, i, p) {
+            v = trim(v)
+            if (v == "") return 0
+            ch = substr(v, 1, 1)
+            if (ch == "\"" || ch == "'"'"'") return 0
+            for (i = 2; i <= length(v); i++) {
+                if (substr(v, i, 1) != "#") continue
+                p = substr(v, i - 1, 1)
+                if (p == " " || p == "\t") return 1
+            }
+            return 0
+        }
         function flushjob() {
             flushstep()
             if (job != "")
-                printf "JOB\t%s\t%s\t%s\t%d\t%d\t%s\n", FNAME, job, j_name, j_if, j_matrix, j_needs
+                printf "JOB\t%s\t%s\t%s\t%d\t%d\t%s\t%d\n", FNAME, job, j_name, j_if, j_matrix, j_needs, j_namerisk
             job = ""; j_name = ""; j_if = 0; j_matrix = 0; j_needs = ""
+            j_namerisk = 0
             in_steps = 0; in_strategy = 0; in_matrix = 0; in_include = 0
         }
         BEGIN {
@@ -334,7 +383,7 @@ parse_workflows() {
             pr_trigger = 0; pr_paths = 0; branches = ""
             push_trigger = 0; push_branches = ""
             conc_seen = 0; conc_cancel = 0; conc_group = ""
-            job = ""; cur_step = 0
+            job = ""; cur_step = 0; j_namerisk = 0
             seqkey = ""; seqind = -1
         }
         {
@@ -446,7 +495,7 @@ parse_workflows() {
             if (ind == 4) {
                 flushstep()
                 in_steps = 0; in_strategy = 0; in_matrix = 0; in_include = 0
-                if (key == "name") j_name = scalar(rawval)
+                if (key == "name") { j_name = scalar(rawval); j_namerisk = name_truncation_risk(rawval) }
                 else if (key == "if") j_if = 1
                 else if (key == "needs") {
                     delete ns; ns[0] = 0
@@ -577,14 +626,24 @@ run_gate() {
 
     # ---- index the parsed records -----------------------------------------
     declare -A JOB_NAME=() JOB_IF=() JOB_MATRIX=() JOB_NEEDS=() JOB_FILE=()
+    declare -A JOB_NAMERISK=()
     declare -A WF_PR=() WF_PATHS=() WF_BRANCHES=()
     declare -A WF_PUSH=() WF_PUSHBR=()
     declare -A WF_CONC=() WF_CANCEL=() WF_GROUP=()
     declare -A MXKEYS=()   # "file|job|key" -> space-joined values
     declare -a JOBKEYS=() WFKEYS=()
 
+    # Split on US (0x1f), NOT on TAB. `read` treats space/tab/newline in IFS as
+    # IFS WHITESPACE and collapses runs of them into ONE delimiter, so with a
+    # tab IFS an EMPTY MIDDLE field silently shifts every later field left —
+    # e.g. a JOB record for a job with no `needs:` handed the name-truncation
+    # flag to `f` and left `g` empty, which made rule (e) blind on exactly the
+    # jobs it exists for (every c8-precheck gate has no `needs:`). 0x1f is not
+    # IFS whitespace, so empty fields are preserved positionally. The record
+    # stream itself stays TAB-delimited — `--dump` and its awk consumers
+    # (`-F'\t'`, which never collapses) are unaffected.
     local rec kind a b c d e f g
-    while IFS=$'\t' read -r kind a b c d e f g; do
+    while IFS=$'\x1f' read -r kind a b c d e f g; do
         case "$kind" in
             WF)
                 WFKEYS+=("$a")
@@ -601,13 +660,35 @@ run_gate() {
                 JOBKEYS+=("$jk")
                 JOB_FILE["$jk"]="$a"; JOB_NAME["$jk"]="$c"
                 JOB_IF["$jk"]="$d"; JOB_MATRIX["$jk"]="$e"; JOB_NEEDS["$jk"]="$f"
+                JOB_NAMERISK["$jk"]="$g"
                 ;;
             MX)
                 local mk="$a|$b|$c"
                 MXKEYS["$mk"]="${MXKEYS[$mk]:-} $d"
                 ;;
         esac
-    done <<< "$records"
+    done <<< "${records//$'\t'/$'\x1f'}"
+
+    # ---- rule (e): a job name that YAML silently truncates (#2473) --------
+    #
+    # Checked FIRST, and repo-wide rather than per-required-context, for two
+    # reasons. (1) A truncated name makes the DECLARED name and the REPORTED
+    # check-run name differ, so every downstream verdict in this gate is
+    # reasoning about a string the workflow author never wrote — including
+    # rule (a), which would otherwise report the confusing "matches NO parsed
+    # job name" for a job that plainly exists. (2) Scope: a job that is not a
+    # required context today becomes one the moment somebody adds it to
+    # `required_status_checks.contexts`, and the operator will copy the
+    # TRUNCATED name off the PR because that is the only name GitHub shows.
+    # That is precisely how the #2473 artifact entered the live set.
+    local risky_jk
+    for risky_jk in "${JOBKEYS[@]}"; do
+        [ "${JOB_NAMERISK[$risky_jk]:-0}" = "1" ] || continue
+        fail "RULE (e) HARD-FAIL — job $risky_jk has an UNQUOTED 'name:' containing whitespace-then-'#', so YAML TRUNCATES it at the '#'. Parsed name: '${JOB_NAME[$risky_jk]}'."
+        echo "     The name GitHub reports as the check-run — and therefore the string branch protection would pin — is the truncated one, NOT what the workflow appears to declare (#2473: 'L3-boundary perma-ban gate (§25.3 S5 / RQ-10 #1853)' reported as 44 chars ending at 'RQ-10')." >&2
+        echo "     FIX: quote the scalar — name: \"…\". One character each side; there is no legitimate instance and no allowlist. To keep a genuine trailing YAML comment, quote the name FIRST: name: \"Foo\"  # note." >&2
+        echo "     NOT flagged, and deliberately so: a '#' preceded by '(' — the '(#1174 PR10)' / '(#2146)' / '(#1989)' family — is not a comment in YAML and reports verbatim." >&2
+    done
 
     # ---- expand job names into the concrete context names they report -----
     declare -A CTX_JOB=()      # context name -> "file|job"
@@ -756,7 +837,10 @@ run_gate() {
             continue
         fi
         local sidx shasif sguard suses sname
-        while IFS=$'\t' read -r _ _ _ sidx shasif sguard suses sname; do
+        # 0x1f for the same reason as the JOB loop above: a `run:` step has an
+        # EMPTY `uses` field in the middle of the record, and a tab IFS would
+        # collapse it and slide the step NAME into `suses`.
+        while IFS=$'\x1f' read -r _ _ _ sidx shasif sguard suses sname; do
             [ -n "$sidx" ] || continue
             if [ "$sguard" = "1" ]; then continue; fi
             # Structural exemption: a bare checkout, exactly as the proven
@@ -765,7 +849,7 @@ run_gate() {
             fail "RULE (b3) — job $jk (needs: $CLASSIFY_JOB, no job-level 'if:') has step #$sidx ['${sname:-${suses:-<unnamed>}}'] with NO '${CLASSIFY_JOB}.outputs.docs_only' guard."
             echo "     This job's contract is 'runs always, no-ops on docs-only'. An unguarded step silently executes the heavy work on every docs-only PR — burning runner time and, worse, half-running a job whose other steps skipped." >&2
             echo "     FIX: add 'if: needs.${CLASSIFY_JOB}.outputs.docs_only != '\''true'\''' (or the '== '\''true'\''' short-circuit notice form) to that step. Only a bare 'actions/checkout@*' step is exempt." >&2
-        done <<< "$step_recs"
+        done <<< "${step_recs//$'\t'/$'\x1f'}"
     done
 
     # ---- rule (d): the #2508 cancelled-duplicate carrier class -------------
@@ -868,7 +952,7 @@ run_gate() {
 
 # --- self-test --------------------------------------------------------------
 selftest() {
-    echo "required-contexts gate: self-test (clean control -> PASS; #2494 (b1) matrix+if wedge -> FAIL; (a) unmatched mirror context -> FAIL; (c) paths-filtered carrier -> FAIL; (b3) unguarded step -> FAIL; (b4) decider with job-level if -> FAIL even when allowlisted; #2508 (d) verbatim cancelled-duplicate carrier -> FAIL, its four near-miss shapes -> PASS)"
+    echo "required-contexts gate: self-test (clean control -> PASS; #2494 (b1) matrix+if wedge -> FAIL; (a) unmatched mirror context -> FAIL; #2473 (e) unquoted ' #' job name -> FAIL (and the parse is asserted truncated); (c) paths-filtered carrier -> FAIL; (b3) unguarded step -> FAIL; (b4) decider with job-level if -> FAIL even when allowlisted; #2508 (d) verbatim cancelled-duplicate carrier -> FAIL, its four near-miss shapes -> PASS)"
 
     # Fixtures are staged under the repo's gitignored `.local-runs/` scratch
     # root — never system /tmp (project hard rule), and never `mktemp -d`,
@@ -951,7 +1035,7 @@ jobs:
         if: needs.classify.outputs.docs_only != 'true'
         run: echo build
   quoted:
-    name: Truncating gate (§X / RQ-10 #1853)
+    name: "Quoted gate (§X / RQ-10 #1853)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -972,7 +1056,7 @@ Check (ubuntu-latest)
 Check (windows-latest)
 Cross-compile (aarch64-apple-ios)
 Cross-compile (aarch64-linux-android)
-Truncating gate (§X / RQ-10
+Quoted gate (§X / RQ-10 #1853)
 Paren gate (#1174 PR10)
 TXT
         : > "$al"
@@ -1007,7 +1091,7 @@ TXT
         } > "$wf/dup.yml"
     }
 
-    local rc
+    local rc parsed_name e_out
 
     # ---- control: clean tree must PASS (and must exercise both YAML rules)
     write_clean
@@ -1018,7 +1102,62 @@ TXT
             RQC_PROTECTED_BRANCH="release/v1.0.0" bash "${BASH_SOURCE[0]}" >&2 || true
         return 2
     fi
-    echo "  [control] clean fixture PASSES (incl. the ' #' truncation + the '(#' non-truncation YAML rules)"
+    echo "  [control] clean fixture PASSES (incl. the QUOTED ' #' name + the unquoted '(#' non-truncation YAML rule)"
+
+    # ---- (e) the #2473 truncation shape: UNQUOTE the quoted job's name.
+    #
+    # THREE assertions, and the third is the one that matters. "The gate went
+    # red" is NOT the claim being made — a bare unquoting also makes the mirror
+    # entry unmatchable, so rule (a) fires and the leg would pass while rule
+    # (e) was stone blind. (That is not hypothetical: it is exactly what this
+    # leg did before the 0x1f field-split fix, on a tree where every
+    # required-context job has no `needs:`.) So the mirror is ALSO rewound to
+    # the TRUNCATED string, which is the historically faithful state — every
+    # other rule is satisfied, rule (e) is the only thing left that can fail —
+    # and the failure output is required to NAME rule (e).
+    #
+    # Assertion 1 (--dump): the parse really does truncate at the '#'. If the
+    # parser silently stopped implementing the YAML rule, rule (e) could fire
+    # for the wrong reason while rule (a)'s meaning changed underneath it.
+    write_clean
+    perl -0pi -e 's/^    name: "Quoted gate \(§X \/ RQ-10 #1853\)"$/    name: Quoted gate (§X \/ RQ-10 #1853)/m' "$wf/ci.yml"
+    grep -q '^    name: Quoted gate ' "$wf/ci.yml" || {
+        echo "  [e] fixture injection FAILED (self-test is broken, not the gate)" >&2; return 2; }
+    perl -0pi -e 's/^Quoted gate \(§X \/ RQ-10 #1853\)$/Quoted gate (§X \/ RQ-10/m' "$mi"
+    grep -qx 'Quoted gate (§X / RQ-10' "$mi" || {
+        echo "  [e] mirror rewind FAILED (self-test is broken, not the gate)" >&2; return 2; }
+    parsed_name="$(RQC_WORKFLOW_DIR="$wf" RQC_MIRROR_FILE="$mi" RQC_ALLOW_FILE="$al" \
+        RQC_DUPTRIG_ALLOW_FILE="$dal" RQC_PROTECTED_BRANCH="release/v1.0.0" \
+        bash "${BASH_SOURCE[0]}" --dump 2>/dev/null \
+        | awk -F'\t' '$1 == "JOB" && $3 == "quoted" { print $4 }')"
+    if [ "$parsed_name" != "Quoted gate (§X / RQ-10" ]; then
+        echo "  [e] parser no longer truncates an unquoted ' #' name (got '$parsed_name') — the YAML rule this gate turns on has regressed" >&2
+        return 2
+    fi
+    # Assertions 2 + 3: the gate rejects, and it rejects BY RULE (e).
+    e_out="$(RQC_WORKFLOW_DIR="$wf" RQC_MIRROR_FILE="$mi" RQC_ALLOW_FILE="$al" \
+        RQC_DUPTRIG_ALLOW_FILE="$dal" RQC_PROTECTED_BRANCH="release/v1.0.0" \
+        bash "${BASH_SOURCE[0]}" 2>&1 || true)"
+    rc="$(run_fixture)"
+    if [ "$rc" = "0" ]; then
+        echo "  [e] unquoted job name containing ' #' (the #2473 truncation): NOT CAUGHT (gate passed) — FAIL" >&2
+        return 2
+    fi
+    case "$e_out" in
+        *"RULE (e)"*) ;;
+        *)
+            echo "  [e] the gate rejected the tree but NOT via rule (e) — the leg would pass for the wrong reason. Output was:" >&2
+            printf '%s\n' "$e_out" >&2
+            return 2
+            ;;
+    esac
+    case "$e_out" in
+        *"RULE (a)"*)
+            echo "  [e] rule (a) also fired — the mirror rewind did not take, so this leg is not isolating rule (e)" >&2
+            return 2
+            ;;
+    esac
+    echo "  [e] #2473 unquoted ' #' job name: CAUGHT BY RULE (e) ALONE (mirror rewound to the truncated string so every other rule is satisfied), with the parse confirmed truncated at '#'"
 
     # ---- (b1) the #2494 wedge: add a job-level if: to the matrix job
     write_clean
