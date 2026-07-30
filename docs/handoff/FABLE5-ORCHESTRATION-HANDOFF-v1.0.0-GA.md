@@ -3,7 +3,7 @@
 **Handoff written:** 2026-07-30
 **Written by:** Opus 5 (outgoing session orchestrator)
 **Base branch:** `release/v1.0.0` @ `4f063d92`
-**Status:** clean stop — nothing half-landed, nothing mid-edit, no dirty worktree holding unique work
+**Status:** clean stop — nothing half-landed, nothing mid-edit, nothing existing only on this box. Four worktrees ARE dirty and one holds a diff that must be discarded rather than committed — see §2.6.
 
 ---
 
