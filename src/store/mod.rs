@@ -1679,11 +1679,86 @@ pub trait MemoryStore: Send + Sync {
         self.link(ctx, link).await
     }
 
+    /// #2488 / #2491 — resolve a live row's `namespace` by id, and NOTHING else.
+    ///
+    /// The federation receive-side namespace-scope gates need exactly one TEXT
+    /// column per id to reach a verdict. Routing that through
+    /// [`get`](MemoryStore::get) is wrong on two counts, both of which shipped
+    /// as live defects:
+    ///
+    /// 1. **Cost.** `PostgresStore::get` is `SELECT * FROM memories WHERE id =
+    ///    $1`, which ships the `embedding vector(N)` (~12 KB at 3072-d), the
+    ///    stored generated `tsv`, the full `content`, and the
+    ///    `encrypted_envelope` across the wire to learn one string — once per
+    ///    pushed id, up to `max_page_size` ids per request, un-pipelined. A
+    ///    refused deletion leaves the row in place, so the same fattest rows
+    ///    can be re-probed indefinitely.
+    /// 2. **The decrypt trap (the load-bearing one).** Both adapters' full-row
+    ///    mappers run under `DecryptFailurePolicy::FailClosed`, so a row whose
+    ///    `encrypted_envelope` will not open on THIS node returns `Err` — and a
+    ///    fail-closed authorization gate turns that into "this row can never be
+    ///    federated-deleted", permanently, with no operator escape hatch
+    ///    (`AI_MEMORY_STRICT_DECRYPT_READS` only hardens, never relaxes). A row
+    ///    whose content this node cannot read is precisely the row an operator
+    ///    most urgently wants gone. A scalar `SELECT namespace` cannot fail for
+    ///    that reason at all, which is what stops an authz gate from doubling as
+    ///    an erasure-denial gate. See also
+    ///    `crate::storage::namespace_by_id`, which documents the same hazard for
+    ///    the sqlite free-function twin.
+    ///
+    /// `Ok(None)` means PROVABLY no live row with that id. `Err` means
+    /// UNRESOLVABLE — a caller on a security gate MUST fail closed on `Err` and
+    /// must never collapse it into "no row".
+    ///
+    /// The probe must observe the TRUE stored state, so implementations do not
+    /// apply the #910 visibility filter (which folds a denial into `NotFound`
+    /// and would fail the gate OPEN on exactly the `scope=private` rows it
+    /// protects); pass an admin/bypass `ctx`.
+    ///
+    /// Default implementation composes [`get`](MemoryStore::get) so third-party
+    /// `MemoryStore` impls keep compiling; both shipped adapters override it with
+    /// a single-column projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` for storage errors. Does NOT return `NotFound` — a
+    /// missing row is `Ok(None)`.
+    async fn namespace_by_id(&self, ctx: &CallerContext, id: &str) -> StoreResult<Option<String>> {
+        match self.get(ctx, id).await {
+            Ok(row) => Ok(Some(row.namespace)),
+            Err(StoreError::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Hard-delete a memory by id, returning `true` when a row was
     /// removed and `false` when no row matched (already-deleted /
     /// never-existed). Default implementation lifts the trait `delete`
     /// surface — which returns `NotFound` on miss — into a boolean for
     /// federation's no-op-on-missing-row contract.
+    ///
+    /// ## Why both shipped adapters DISCARD `ctx` (#2488 — do not "fix" this)
+    ///
+    /// `SqliteStore` and `PostgresStore` both bind `_ctx` and apply the deletion
+    /// without a per-row ownership check. That is a deliberate, load-bearing
+    /// design choice for a REPLICATION lane, not an oversight:
+    ///
+    /// - `ctx` here carries the PUSHING NODE's `sender_agent_id`, not the
+    ///   erased row's author. Enforcing `existing_owner == effective_principal`
+    ///   would refuse every multi-hop relay of a third-party author's deletion
+    ///   and every deletion of a row authored by another agent on the mesh —
+    ///   silent permanent divergence returned as HTTP 200, i.e. #2491
+    ///   re-created deliberately.
+    /// - A row present with NO `agent_id` stamp (legacy / migrated) would become
+    ///   permanently un-deletable by federation.
+    /// - sqlite's arm has never had an owner gate, so adding one on postgres
+    ///   only would manufacture a fresh cross-backend divergence.
+    ///
+    /// The correct control on this lane is NAMESPACE SCOPE, enforced
+    /// reject-before-apply in the receive funnels via
+    /// [`crate::federation::receive_auth::inbound_by_id_namespace_authorized`]
+    /// (#1934 / #2447 / #2488), not per-row ownership. Refuted by the Fable 5
+    /// 1×7 vote (`4d3ea1c5`).
     async fn apply_remote_deletion(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
         match self.delete(ctx, id).await {
             Ok(()) => Ok(true),
