@@ -98,8 +98,10 @@ the `x-peer-id` HTTP header) to a `PeerScope`
   `Memory::namespace` on **every lane that can reach a write**: the
   `/sync/since` pull projection, the `/sync/push` `deletions[]` lane
   (#1934), the `/sync/push` `memories[]` WRITE lane plus its
-  `archives[]` / `restores[]` siblings (#2447), and — since #2478 — the
-  `/sync/push` GOVERNANCE lanes `pendings[]` + `pending_decisions[]`.
+  `archives[]` / `restores[]` siblings (#2447), the `/sync/push`
+  GOVERNANCE lanes `pendings[]` + `pending_decisions[]` (#2478), and —
+  since #2479 — the `/sync/push` GOVERNANCE-STANDARD lanes
+  `namespace_meta[]` + `namespace_meta_clears[]`.
   On the governance lanes the subject is not one namespace but the UNION
   of every namespace the approved action's execution would touch, because
   `db::execute_pending_action` never reads the pending row's own declared
@@ -111,6 +113,32 @@ the `x-peer-id` HTTP header) to a `PeerScope`
   (`**` is an unconditional allow-all, and is the supported way to
   declare a deliberately unscoped peer). Empty = default-deny on every
   lane: the peer may not pull, delete, or write any rows.
+
+  On the governance-STANDARD lanes the subject is the row's own
+  `namespace` **and** its declared `parent_namespace`: the parent is
+  persisted into the chain `build_namespace_chain` walks, which is what
+  `resolve_governance_policy` consumes, so it changes which OTHER
+  namespace's policy governs **by reference** rather than by value. Two
+  properties are worth knowing before you configure a scope around this.
+  First, that parent link is consulted only on the ROOT `/` segment of a
+  queried namespace, so a parent stored on `a/b` is inert for `a/b`'s own
+  chain, and a parent of literal `*` is inert too (the walk skips it) yet
+  is still gated — if a refusal names one, drop the redundant field, since
+  the global standard is already in every chain. Second, a standard bound
+  at an ANCESTOR still supplies the DEFAULT policy of its descendants:
+  `resolve_governance_policy` walks leaf-first and returns the first level
+  carrying a policy, so a peer scoped exactly `["secure"]` governs every
+  `secure/**` namespace that carries none of its own. Scope a peer to the
+  namespaces whose GOVERNANCE you intend it to set, not merely the ones
+  whose rows you intend it to write.
+
+  The literal global standard `*` is a special case: it is the
+  substrate-wide default that `build_namespace_chain` prepends to EVERY
+  namespace's chain, so a `namespace_meta` row on it is refused unless the
+  peer declared `**`. Note this is NOT the same as a scope of `["*"]` —
+  that pattern means "any TOP-LEVEL namespace" (#1902), and it would
+  otherwise glob-match the literal key `"*"` and hand the peer governance
+  authority over deep namespaces it may not write (#2479 Amendment E).
 
   On the write lane BOTH the inbound row's claimed `namespace` AND the
   stored namespace of any existing local row with the same `id` must
