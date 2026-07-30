@@ -1764,31 +1764,67 @@ pub async fn sync_push(
         // namespace by guessing ids. Resolve the target row's namespace
         // and refuse ids outside the peer's scope. A missing row stays a
         // no-op (unchanged — the peer may have already GC'd it).
-        match db::get(&lock.0, del_id) {
-            Ok(Some(row)) => {
-                if !peer_attestation::namespace_allowed(
-                    peer_header_owned.as_deref(),
-                    &row.namespace,
-                    &attest_cfg,
-                ) {
-                    tracing::warn!(
-                        target: ATTESTATION_TRACE_TARGET,
-                        memory_id = %del_id,
-                        namespace = %row.namespace,
-                        peer_id = %peer_header_owned.as_deref().unwrap_or(""),
-                        "sync_push: refusing federated deletion outside the peer's namespace \
-                         scope (#1934)"
-                    );
-                    skipped += 1;
-                    continue;
+        //
+        // #2491 (data-integrity, live outage) — the #1934 form called
+        // `peer_attestation::namespace_allowed` UNCONDITIONALLY, with no
+        // enrolled-posture wrapper. Its `scope_for(peer) == None` arm falls
+        // through to `sync_trust_peer_bypass()`, which is FALSE by default, so
+        // in the zero-config posture (and on any header-absent push) EVERY
+        // federated deletion was refused and counted `skipped` inside an HTTP
+        // 200 — no DLQ, no retry, replicas diverging permanently while the
+        // origin believed the erasure propagated. This is the same trap
+        // `receive_auth.rs` already documented for the write lane; the delete
+        // lane never got the `has_allowlist()` guard.
+        //
+        // #2488 — route through the SHARED by-id verdict (not a third hand-
+        // rolled variant) so this lane's disposition of all four peer shapes
+        // (zero-config, enrolled-scoped, enrolled-unscoped, header-absent) is
+        // byte-identical to the `memories[]` / `archives[]` / `restores[]`
+        // lanes and to the postgres twin, and so the empty-scope case honours
+        // `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE` instead of hard-coding
+        // deny. The probe is the SCALAR `db::namespace_by_id` — `db::get` maps
+        // through `row_to_memory`'s fail-closed at-rest decrypt, which made a
+        // row with an unopenable envelope permanently un-erasable (see the
+        // `namespace_by_id` doc). Fable 5 1×7 vote (4d3ea1c5).
+        if ns_gate_enrolled {
+            let needs_stored = crate::federation::receive_auth::peer_declares_namespace_scope(
+                peer_header_owned.as_deref(),
+                &attest_cfg,
+            );
+            let stored_ns = if needs_stored {
+                match db::namespace_by_id(&lock.0, del_id) {
+                    Ok(Some(namespace)) => Some(namespace),
+                    Ok(None) => {
+                        noop += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: ATTESTATION_TRACE_TARGET,
+                            memory_id = %del_id,
+                            cause = crate::federation::receive_auth::CAUSE_NAMESPACE_PROBE_UNRESOLVABLE,
+                            error = %e,
+                            "sync_push: refusing federated deletion of {del_id} — the target \
+                             row's namespace is UNRESOLVABLE on this node, so the scope gate \
+                             cannot decide (#1934/#2488 fail-closed). This row cannot be \
+                             federated-deleted until the read succeeds; investigate the \
+                             storage error rather than the peer's scope."
+                        );
+                        skipped += 1;
+                        continue;
+                    }
                 }
-            }
-            Ok(None) => {
-                noop += 1;
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!("sync_push: delete pre-resolve failed for {del_id}: {e}");
+            } else {
+                None
+            };
+            if !crate::federation::receive_auth::inbound_by_id_namespace_authorized(
+                crate::federation::receive_auth::LANE_DELETIONS,
+                del_id,
+                stored_ns.as_deref(),
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+                require_push_ns_scope,
+            ) {
                 skipped += 1;
                 continue;
             }
@@ -1829,7 +1865,7 @@ pub async fn sync_push(
                     if !crate::federation::receive_auth::inbound_by_id_namespace_authorized(
                         "archives",
                         arch_id,
-                        &namespace,
+                        Some(&namespace),
                         &attest_cfg,
                         peer_header_owned.as_deref(),
                         require_push_ns_scope,
@@ -1897,7 +1933,7 @@ pub async fn sync_push(
                     if !crate::federation::receive_auth::inbound_by_id_namespace_authorized(
                         "restores",
                         res_id,
-                        &namespace,
+                        Some(&namespace),
                         &attest_cfg,
                         peer_header_owned.as_deref(),
                         require_push_ns_scope,

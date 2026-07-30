@@ -537,9 +537,11 @@ CREATE INDEX IF NOT EXISTS archived_memories_archived_at_idx ON archived_memorie
 -- FK (it is an archive table, like archived_memories itself) plus an
 -- `archived_at` stamp. The explicit/recovery-expected delete paths
 -- snapshot a memory's edges here BEFORE the cascade DELETE so restore can
--- re-insert them. SQLite wires snapshot/restore this commit; the postgres
--- snapshot/restore wiring is a tracked follow-up — this table is created
--- on both backends now for adapter-schema consistency. Fresh installs get
+-- re-insert them. BOTH backends wire snapshot/restore: `PostgresStore::forget`
+-- and `archive_by_ids` snapshot, `archive_restore` re-inserts, pinned by
+-- `archive_restore_preserves_links_pg_1771`. (#2318 truth-fix — this comment
+-- long called the postgres wiring "a tracked follow-up" after it had
+-- shipped.) The table is created on both backends. Fresh installs get
 -- it inline here; upgraded installs via PostgresStore::migrate_v70.
 -- ─────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS archived_memory_links (
