@@ -32,6 +32,20 @@
 # state matches this manifest as a nightly job. Tracking under #807
 # follow-up.
 #
+# *** THIS FILE IS NOT THE GATE-VERIFIED MIRROR. It has drifted (#2443):
+# *** the `release/**` block below lists FIVE checks, three of which use a
+# *** `<workflow> / <job>` prefixed form that branch protection does not
+# *** report, while live protection on `release/v1.0.0` requires 22 (24 once
+# *** the #2494-residual decider contexts are applied). The declaration that
+# *** IS mechanically verified — by `scripts/check-required-contexts.sh` in
+# *** `c8-precheck.yml`, on every PR — is
+# ***     scripts/qc-allowlists/required-contexts-release.txt
+# *** Add or remove a required context THERE (and read its "HOW TO CHANGE
+# *** THIS FILE" section for the mirror-vs-protection landing order first).
+# *** Reconciling this manifest against live state is #2443's scope and is
+# *** deliberately NOT done piecemeal — a partial edit here would imply a
+# *** required-set size that is wrong in a new way.
+#
 # Why this is "Gap #2 / Batman Mode CRITICAL":
 # PR #775 shipped an L1-6 governance posture that silently passed
 # verification because the canonical-bytes encoding mismatched
