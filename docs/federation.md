@@ -95,10 +95,19 @@ the `x-peer-id` HTTP header) to a `PeerScope`
   may claim as `body.sender_agent_id` on `/sync/push`. Empty = peer
   may only author as itself (`body.sender_agent_id == peer-id`).
 - **`allowed_namespaces`** — glob patterns matched against
-  `Memory::namespace` on **all three lanes**: the `/sync/since` pull
-  projection, the `/sync/push` `deletions[]` lane (#1934), and — since
-  #2447 — the `/sync/push` `memories[]` WRITE lane plus its `archives[]`
-  / `restores[]` siblings. `*` = single segment, `**` = any suffix
+  `Memory::namespace` on **every lane that can reach a write**: the
+  `/sync/since` pull projection, the `/sync/push` `deletions[]` lane
+  (#1934), the `/sync/push` `memories[]` WRITE lane plus its
+  `archives[]` / `restores[]` siblings (#2447), and — since #2478 — the
+  `/sync/push` GOVERNANCE lanes `pendings[]` + `pending_decisions[]`.
+  On the governance lanes the subject is not one namespace but the UNION
+  of every namespace the approved action's execution would touch, because
+  `db::execute_pending_action` never reads the pending row's own declared
+  `namespace`: the payload's `namespace` (store / reflect), the payload's
+  `to_namespace` (promote — that arm CLONES, so the destination is a
+  write), and the STORED namespace of `memory_id` (delete / promote) and
+  of every `source_ids[i]` (reflect writes a `reflects_on` edge onto each
+  source). ALL must match. `*` = single segment, `**` = any suffix
   (`**` is an unconditional allow-all, and is the supported way to
   declare a deliberately unscoped peer). Empty = default-deny on every
   lane: the peer may not pull, delete, or write any rows.
