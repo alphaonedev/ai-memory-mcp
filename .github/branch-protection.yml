@@ -1,108 +1,117 @@
 # .github/branch-protection.yml
 #
-# v0.7.0 issue #807 — Batman Mode CI gate as a HARD PR gate.
+# =============================================================================
+# *** STATUS: DOCUMENTATION ONLY. THIS FILE ENFORCES NOTHING, IS APPLIED BY
+# *** NOTHING, AND IS **NOT** THE REQUIRED-STATUS-CHECK DECLARATION.
+# ***
+# *** The declaration is  scripts/qc-allowlists/required-contexts-release.txt
+# *** — hand-authored from intent, and mechanically verified against the
+# *** workflows on EVERY PR by scripts/check-required-contexts.sh (the
+# *** `Required-context + classify-base soundness gate (#2494/#2496/#2508)`
+# *** job in .github/workflows/c8-precheck.yml).
+# ***
+# *** Add or remove a required context THERE, never here. Read that file's
+# *** "HOW TO CHANGE THIS FILE" section first — the mirror and the protection
+# *** API call cannot be atomic, and the safe landing ORDER differs between an
+# *** ADDITION (mirror first) and a REMOVAL (protection first).
+# =============================================================================
 #
-# This file is the SOURCE-OF-TRUTH manifest for the branch-protection
-# rules an operator with admin access must wire into the repository's
-# Settings > Branches page. GitHub does NOT honor a checked-in file
-# automatically — branch protection lives on the API and requires an
-# admin token. The file lives here so:
-#   - the rules are version-controlled alongside the code they protect;
-#   - any drift between "what the workflow ships" and "what the repo
-#     enforces" is auditable via `git log`;
-#   - a fresh fork or a re-cloned repo carries the operator follow-up
-#     steps inline rather than relying on tribal knowledge.
+# WHO READS THIS FILE (#2443 — answered mechanically, not from memory).
+# Nobody. `grep -rn 'branch-protection' .` over the whole tree returns exactly
+# two references to this path, and both are prose: this header, and a comment
+# in `.github/workflows/batman-mode-acceptance.yml` pointing at the
+# `nightly_schedule` block below. No workflow step, no script under scripts/,
+# and no action parses it; there is no `gh api .../protection` write anywhere
+# in the repository. GitHub itself never reads a checked-in file — branch
+# protection lives on the API and requires an admin token.
 #
-# Operator follow-up (one-shot per protected branch):
+# Two consequences follow, and both are load-bearing:
 #
-#   1. Repo Settings > Branches > Add branch protection rule
-#   2. Branch name pattern: copy from "branches[].pattern" below.
-#   3. "Require status checks to pass before merging" → ON.
-#      "Require branches to be up to date before merging" → ON.
-#   4. Required status checks: add EVERY entry from
-#      "branches[].required_checks[]" verbatim. Each name MUST match
-#      the corresponding `jobs.<id>.name` in the workflow file.
-#   5. "Do not allow bypassing the above settings" → ON for
-#      release/v0.7.0 and main (operator may permit force-push on
-#      develop for triage; document the exception inline).
-#   6. Save.
+#   1. Reconciling this file CANNOT mutate live protection. It is safe to edit.
+#   2. This file can never be an attestation of anything. Whatever it says
+#      about enforcement is a CLAIM with no mechanism behind it.
 #
-# Drift detection: a future v0.7.x or v0.8.0 follow-up should wire
-# the GitHub Apps / API call that asserts the live branch-protection
-# state matches this manifest as a nightly job. Tracking under #807
-# follow-up.
+# WHY IT WAS RECONCILED (#2443). Until this change the header called this file
+# "the SOURCE-OF-TRUTH manifest for the branch-protection rules" and listed
+# five `required_checks` for each of `main`, `release/**` and `develop`. That
+# declaration was wrong in both directions at once:
 #
-# *** THIS FILE IS NOT THE GATE-VERIFIED MIRROR. It has drifted (#2443):
-# *** the `release/**` block below lists FIVE checks, three of which use a
-# *** `<workflow> / <job>` prefixed form that branch protection does not
-# *** report, while live protection on `release/v1.0.0` requires 22 (24 once
-# *** the #2494-residual decider contexts are applied). The declaration that
-# *** IS mechanically verified — by `scripts/check-required-contexts.sh` in
-# *** `c8-precheck.yml`, on every PR — is
-# ***     scripts/qc-allowlists/required-contexts-release.txt
-# *** Add or remove a required context THERE (and read its "HOW TO CHANGE
-# *** THIS FILE" section for the mirror-vs-protection landing order first).
-# *** Reconciling this manifest against live state is #2443's scope and is
-# *** deliberately NOT done piecemeal — a partial edit here would imply a
-# *** required-set size that is wrong in a new way.
+#   * OVER-declared, unrequireable. Three of the five per branch were written
+#     as `Batman Mode acceptance gate / <job>` — a `<workflow> / <job>` form
+#     that a GitHub Actions job NEVER reports. The check-run name is the JOB
+#     name alone (`Rust integration (issue_800_batman_mode)`), so the prefixed
+#     string names no context that exists. Pinning it into protection would
+#     leave it `Expected — waiting` forever, and `enforce_admins: true` means
+#     no admin merge clears it: the branch wedges. It is unrequireable a
+#     SECOND time over independently, because the carrying workflow's
+#     `pull_request` trigger is `paths:`-filtered, so on any PR outside that
+#     path list the job produces no check-run at all. That is rule (c) of
+#     scripts/check-required-contexts.sh, and both halves are the same defect
+#     class #2494 found and closed on the release branch.
+#   * UNDER-declared. It named two contexts that do exist and are live-required
+#     (`C8 caller-context allowlist check`, `Vendor-monoculture + SECS_PER_*
+#     lint-gate (#1174 PR10)`) while omitting the other twenty-two that
+#     `release/v1.0.0` actually requires.
 #
-# Why this is "Gap #2 / Batman Mode CRITICAL":
-# PR #775 shipped an L1-6 governance posture that silently passed
-# verification because the canonical-bytes encoding mismatched
-# between the rule signer and the rule verifier. The bypass lived
-# ~24 hours post-tag at v0.7.0. The fix (PR #801) shipped integration
-# tests + an acceptance workflow but those tests don't gate merges
-# unless they are pinned as REQUIRED checks in branch protection.
-# This file is the audit trail for that pinning.
+# A committed policy file asserting `enforce_admins: true` over a check set
+# that cannot report is worse than having no policy file: an enterprise
+# reviewer reads the file, not the API, so the file MANUFACTURES assurance.
+# The fix is not a better list here — a second hand-maintained list is how
+# #2443 happened. The fix is that there is now exactly ONE declaration, it is
+# gate-verified, and this file points at it.
+#
+# WHAT REMAINS BELOW. Only the two contracts that are genuinely documented
+# here and nowhere else — the Batman nightly-schedule contract and the
+# CODEOWNERS cross-link — plus per-branch POLICY INTENT (admin enforcement,
+# force-push, up-to-date). Policy intent is recorded as intent, not as an
+# attestation of live state; no required-context list is duplicated.
 
-version: 1
+version: 2
+
+# The required-status-check declaration for this repository. One place.
+required_checks_declaration:
+  release_branches:
+    file: scripts/qc-allowlists/required-contexts-release.txt
+    verified_by: scripts/check-required-contexts.sh
+    verified_in: .github/workflows/c8-precheck.yml
+    job: "Required-context + classify-base soundness gate (#2494/#2496/#2508)"
+  main_and_develop:
+    file: null
+    note: |
+      There is no gate-verified mirror for `main` or `develop`. That gap is
+      recorded in the KNOWN GAPS section of the release mirror above and
+      tracked as the #2496 exposure: those branches require only the
+      `Check (…-latest)` matrix, so the branch that ships production tags is
+      in fact the least gated. Closing it is a branch-protection edit
+      (Sensitive class, docs/AI_DEVELOPER_GOVERNANCE.md) and is deliberately
+      NOT done by editing this file, which enforces nothing.
 
 branches:
   - pattern: main
     description: |
-      Production release tags only. Every merge to main must clear the
-      full Batman Mode gate; aligns with v0.7.0 release gate tier 1
-      (issue #836).
-    required_checks:
-      - "Batman Mode acceptance gate / Rust integration (issue_800_batman_mode)"
-      - "Batman Mode acceptance gate / Bash integration (test-batman-mode-suite.sh)"
-      - "Batman Mode acceptance gate / Surface stability (load-bearing symbols)"
-      - "C8 caller-context allowlist check"
-      - "Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10)"
+      Production release tags only. POLICY INTENT: admin enforcement on, no
+      force-push, PRs must be up to date before merging. The required-check
+      set is NOT declared here — see `required_checks_declaration` above.
     require_up_to_date: true
     enforce_admins: true
     allow_force_push: false
 
   - pattern: release/**
     description: |
-      Release-cut branches (release/v0.7.0, release/v0.7.1, …). The
-      Batman Mode gate is HARD-REQUIRED on every release branch so the
-      canonical-bytes mismatch class (PR #775 → PR #801) cannot
-      re-surface on a release candidate.
-    required_checks:
-      - "Batman Mode acceptance gate / Rust integration (issue_800_batman_mode)"
-      - "Batman Mode acceptance gate / Bash integration (test-batman-mode-suite.sh)"
-      - "Batman Mode acceptance gate / Surface stability (load-bearing symbols)"
-      - "C8 caller-context allowlist check"
-      - "Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10)"
+      Release-cut branches (release/v1.0.0, …). POLICY INTENT: admin
+      enforcement on, no force-push, PRs must be up to date before merging.
+      The required-check set is declared ONLY in
+      scripts/qc-allowlists/required-contexts-release.txt.
     require_up_to_date: true
     enforce_admins: true
     allow_force_push: false
 
   - pattern: develop
     description: |
-      Integration branch. Batman Mode gate is required so a Form 7
-      regression cannot enter the develop integration window. The
-      surface-stability job catches symbol drift before the downstream
-      integration tests fail with confusing errors.
-    required_checks:
-      - "Batman Mode acceptance gate / Rust integration (issue_800_batman_mode)"
-      - "Batman Mode acceptance gate / Bash integration (test-batman-mode-suite.sh)"
-      - "Batman Mode acceptance gate / Surface stability (load-bearing symbols)"
-      - "C8 caller-context allowlist check"
-      - "Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10)"
+      Integration branch. POLICY INTENT: no force-push, PRs must be up to date
+      before merging. The required-check set is NOT declared here.
     require_up_to_date: true
-    enforce_admins: false
+    enforce_admins: true
     allow_force_push: false
 
 # Auxiliary policy: nightly run-against-develop.
@@ -111,6 +120,11 @@ branches:
 # fell outside the path filter (refactors elsewhere in src/governance
 # that change the canonical-bytes shape, etc.). The workflow file
 # carries the schedule entry; this manifest records the contract.
+#
+# NOTE (#2443): that path filter is exactly why none of this workflow's three
+# jobs can be a required status check on any branch. The nightly schedule is
+# the compensating control, and it is a DETECTION control (a red nightly run),
+# never a merge gate.
 nightly_schedule:
   workflow: .github/workflows/batman-mode-acceptance.yml
   cron: "0 8 * * *"  # 08:00 UTC daily
@@ -135,3 +149,14 @@ codeowners_gate:
     rules engine or the rules signer requires a CODEOWNERS sign-off
     so the bypass class that #807 closes cannot reappear under a
     routine refactor merge.
+
+# HISTORICAL CONTEXT — why this file was created (v0.7.0 issue #807).
+# PR #775 shipped an L1-6 governance posture that silently passed
+# verification because the canonical-bytes encoding mismatched between the
+# rule signer and the rule verifier. The bypass lived ~24 hours post-tag at
+# v0.7.0. The fix (PR #801) shipped integration tests + an acceptance
+# workflow, and this file was written to be the audit trail for pinning
+# those tests as required checks. That pinning never happened and — per the
+# analysis at the top of this file — could not have, in the form declared.
+# The tests still run: on every path-matching PR, on every push to
+# main/develop/release/**, and nightly against develop.
