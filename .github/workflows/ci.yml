@@ -66,6 +66,34 @@ jobs:
   # matrix instead of waiting ~12 min for Windows. Required status checks
   # are still satisfied because the matrix jobs keep their names AND
   # complete with status SUCCESS — they just no-op on docs-only diffs.
+  #
+  # THE INVARIANT THIS JOB'S CONSUMERS MUST HONOUR (#2494 / #2496):
+  # A job that carries a REQUIRED context name must NEVER take a
+  # job-level `if:` when it is ALSO a `strategy: matrix` job. GitHub
+  # evaluates the job-level `if:` BEFORE matrix expansion, so a skipped
+  # matrix job emits exactly ONE check-run bearing the UNEXPANDED
+  # template name (verified live on docs-only commit 45ba8741:
+  # `Cross-compile (${{ matrix.target }})` skipped, while BOTH
+  # `Cross-compile (aarch64-apple-ios)` and
+  # `Cross-compile (aarch64-linux-android)` were never created). An
+  # ABSENT required context is `pending` forever and `enforce_admins:
+  # true` means no admin merge clears it — the branch wedges. The
+  # correct shape is the `check` job below: NO job-level `if:`, the
+  # docs-only guard on EVERY step, matrix names expand, contexts report
+  # `success` in <30 s. `scripts/check-required-contexts.sh` (rule b1)
+  # statically enforces this so the class cannot re-land.
+  #
+  # TWO BASES, NOT ONE (#2496 — the classifier fail-open):
+  # `docs_only` CLASSIFICATION and test-impact SELECTION want different
+  # diff bases and must never share one. Classification is a property of
+  # the WHOLE PR (base..head); selection may legitimately use the
+  # incremental previous head. Sharing one base let a PR whose LAST push
+  # was docs-only classify docs-only for its entire head — which merged
+  # PR #2031 into `main` with zero compilation/tests/clippy, and fired
+  # again live on the #2497 security fix (a CLAUDE.md-only third commit
+  # skipped Lint/MSRV/Postgres/SAL/vectorlite on a 12-file backend
+  # change). `coverage.yml`'s classifier already used the PR base and
+  # correctly reported `docs_only=false` on that same commit.
   classify:
     name: Classify changes
     runs-on: ubuntu-latest
@@ -99,33 +127,57 @@ jobs:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_ACTION: ${{ github.event.action }}
         run: |
-          # For test-impact selection we want the SMALLEST defensible
-          # diff base — i.e. the previous head, not the merge base —
-          # so per-push impact selection stays effective.
-          # Event-by-event base resolution:
-          #   - push: $EVENT_BEFORE = previous branch tip (small)
-          #   - pull_request synchronize: $PR_BEFORE = previous PR head
-          #     (small — only the just-pushed commits) when present;
-          #     fall back to $PR_BASE_SHA (main tip) for opened /
-          #     reopened where $PR_BEFORE is absent.
+          # TWO SEPARATE BASES (#2496). Sharing one was the defect.
+          #
+          #   cls_base    — CLASSIFICATION base. Must span the WHOLE
+          #                 change under review, because `docs_only`
+          #                 decides whether eight required contexts run
+          #                 at all. On `pull_request` that is ALWAYS the
+          #                 PR base ($PR_BASE_SHA), for every action
+          #                 (opened / reopened / synchronize alike).
+          #   impact_base — test-impact SELECTION base. Wants the
+          #                 SMALLEST defensible diff so per-push
+          #                 selection stays effective, so on
+          #                 `synchronize` it may use $PR_BEFORE (the
+          #                 previous PR head). Narrowing which
+          #                 tests/*.rs binaries run is a cost
+          #                 optimisation inside an already-running job;
+          #                 it never decides whether a gate runs.
+          #
+          # Event-by-event:
+          #   - pull_request: cls_base = $PR_BASE_SHA always;
+          #     impact_base = $PR_BEFORE on synchronize when present,
+          #     else $PR_BASE_SHA.
+          #   - push: no PR base exists, so both = $EVENT_BEFORE
+          #     (=$PR_BEFORE here; `github.event.before` carries the
+          #     previous branch tip). A push delta genuinely IS the
+          #     change being introduced to the branch, and push events
+          #     do not gate merges — required contexts are matched on
+          #     the PR head commit.
+          ZERO=0000000000000000000000000000000000000000
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            if [ -n "$PR_BEFORE" ] && [ "$PR_BEFORE" != "0000000000000000000000000000000000000000" ] && [ "$PR_ACTION" = "synchronize" ]; then
-              base="$PR_BEFORE"
+            cls_base="$PR_BASE_SHA"
+            if [ -n "$PR_BEFORE" ] && [ "$PR_BEFORE" != "$ZERO" ] && [ "$PR_ACTION" = "synchronize" ]; then
+              impact_base="$PR_BEFORE"
             else
-              base="$PR_BASE_SHA"
+              impact_base="$PR_BASE_SHA"
             fi
           elif [ "$EVENT_NAME" = "push" ]; then
-            base="$PR_BEFORE"
+            cls_base="$PR_BEFORE"
+            impact_base="$PR_BEFORE"
           else
-            base=""
+            cls_base=""
+            impact_base=""
           fi
-          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] || ! git rev-parse "$base" >/dev/null 2>&1; then
+          # FAIL CLOSED on an unresolvable CLASSIFICATION base: without a
+          # base we cannot prove the diff is docs-only, so run everything.
+          if [ -z "$cls_base" ] || [ "$cls_base" = "$ZERO" ] || ! git rev-parse "$cls_base" >/dev/null 2>&1; then
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
             echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
             echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"
             echo "test_impact_total=ALL" >> "$GITHUB_OUTPUT"
             echo "test_impact_reason=base-unreachable" >> "$GITHUB_OUTPUT"
-            echo "::notice::cannot resolve base commit ($base) — running full pipeline"
+            echo "::notice::cannot resolve classification base commit ($cls_base) — running full pipeline"
             exit 0
           fi
           # Per issue #1193 PR #1203 — `fetch-depth: 2` is too shallow
@@ -136,28 +188,43 @@ jobs:
           # `fatal: bad object`. Fetch the base commit on demand
           # before the diff. This is a no-op when fetch-depth was
           # already deep enough.
-          if ! git cat-file -e "$base^{tree}" 2>/dev/null; then
-            git fetch --depth=50 origin "$base" 2>/dev/null || \
-              git fetch --depth=200 origin "$base" 2>/dev/null || \
+          fetch_base_tree() {
+            if git cat-file -e "$1^{tree}" 2>/dev/null; then return 0; fi
+            git fetch --depth=50 origin "$1" 2>/dev/null || \
+              git fetch --depth=200 origin "$1" 2>/dev/null || \
               git fetch --unshallow origin 2>/dev/null || true
-          fi
-          if ! git cat-file -e "$base^{tree}" 2>/dev/null; then
+            git cat-file -e "$1^{tree}" 2>/dev/null
+          }
+          if ! fetch_base_tree "$cls_base"; then
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
             echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
             echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"
             echo "test_impact_total=ALL" >> "$GITHUB_OUTPUT"
             echo "test_impact_reason=base-fetch-failed" >> "$GITHUB_OUTPUT"
-            echo "::notice::cannot fetch base tree ($base) after retry — running full pipeline"
+            echo "::notice::cannot fetch classification base tree ($cls_base) after retry — running full pipeline"
             exit 0
           fi
-          changed=$(git diff --name-only "$base" HEAD)
+          # The impact base is a cost optimisation only. If it is
+          # unreachable, widen to the classification base (an
+          # OVER-inclusive test selection, never an under-inclusive one).
+          if [ "$impact_base" != "$cls_base" ] && ! fetch_base_tree "$impact_base"; then
+            echo "::notice::cannot fetch impact base tree ($impact_base) — widening impact selection to the classification base"
+            impact_base="$cls_base"
+          fi
+          changed=$(git diff --name-only "$cls_base" HEAD)
           if [ -z "$changed" ]; then
-            echo "docs_only=true" >> "$GITHUB_OUTPUT"
-            echo "test_impact=__SKIP__" >> "$GITHUB_OUTPUT"
-            echo "test_impact_count=0" >> "$GITHUB_OUTPUT"
-            echo "test_impact_total=0" >> "$GITHUB_OUTPUT"
-            echo "test_impact_reason=empty-diff" >> "$GITHUB_OUTPUT"
-            echo "::notice::no diff vs base — treating as docs-only no-op"
+            # FAIL CLOSED (#2494 §3 / #2496 fix 4). An empty diff vs the
+            # PR base means "no NET changes", which is NOT "docs only" —
+            # and a `git commit --amend && git push --force` produces a
+            # fresh SHA with an identical tree, so the old
+            # `docs_only=true` arm let an amend-force-push neutralise
+            # eight required gates on a PR that is not docs-only at all.
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
+            echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"
+            echo "test_impact_total=ALL" >> "$GITHUB_OUTPUT"
+            echo "test_impact_reason=empty-diff-fail-closed" >> "$GITHUB_OUTPUT"
+            echo "::notice::no net diff vs classification base — failing CLOSED (full pipeline), NOT docs-only"
             exit 0
           fi
           # docs-only iff every changed file matches docs/** OR *.md anywhere
@@ -168,7 +235,7 @@ jobs:
             echo "docs_only=true" >> "$GITHUB_OUTPUT"
             echo "::notice::docs-only diff — skipping Rust pipeline"
           fi
-          echo "--- Changed files ($(echo "$changed" | wc -l) files) ---"
+          echo "--- Changed files vs classification base $cls_base ($(echo "$changed" | wc -l) files) ---"
           echo "$changed"
 
           # v0.7.0 Task #12 (#1399) — compute test-impact set.
@@ -176,13 +243,27 @@ jobs:
           # the output based on docs_only. The script is self-contained
           # POSIX-compatible bash; full discipline + foundational list
           # documented inline in scripts/ci-test-impact.sh.
+          # NOTE the base: SELECTION uses $impact_base (may be the
+          # incremental previous head), never $cls_base's classification
+          # role. See the two-bases comment above.
           chmod +x scripts/ci-test-impact.sh
-          scripts/ci-test-impact.sh "$base" "HEAD"
+          scripts/ci-test-impact.sh "$impact_base" "HEAD"
 
   # Fast lint job — fmt + clippy on ubuntu only. Toolchain-portable, no
   # need to run on macOS/Windows where it just duplicates work and burns
-  # ~3 min per platform. Advisory (not in required-status-checks) so
-  # safe to skip entirely on docs-only diffs at the job level.
+  # ~3 min per platform.
+  #
+  # #2494 doc-vs-reality fix: this comment previously read "Advisory (not
+  # in required-status-checks)". FALSE — live branch protection on
+  # `release/v1.0.0` REQUIRES `Lint (fmt + clippy)`. Because it is
+  # required AND carries a job-level `if:`, a docs-only classification
+  # makes it report `skipped`, which GitHub counts as SATISFIED — it
+  # fails OPEN. That is tolerable ONLY while the classifier is correct,
+  # which is why the two-base split above had to land in the same commit.
+  # This job is NOT a matrix job, so the job-level `if:` does not wedge
+  # the branch the way it did on `mobile-cross-compile`; it is tracked as
+  # a burn-down entry in
+  # `scripts/qc-allowlists/required-contexts-joblevel-if-allow.txt`.
   lint:
     name: Lint (fmt + clippy)
     needs: classify
@@ -223,8 +304,13 @@ jobs:
   # disabled (`-shellcheck=`) so the bundled bash-style SC* warnings across the
   # ~15 legacy workflows don't drown out that guard — the injection check is
   # built into actionlint and does not depend on shellcheck. `ubuntu-24.04-arm`
-  # is whitelisted via `.github/actionlint.yaml`. Advisory until added to branch
-  # protection, mirroring the `msrv` job.
+  # is whitelisted via `.github/actionlint.yaml`.
+  #
+  # #2494 doc-vs-reality fix: previously "Advisory until added to branch
+  # protection". It IS required on `release/v1.0.0` now
+  # (`actionlint (workflow-injection guard)`) — see the `lint` job's note
+  # above for the skipped-counts-as-satisfied consequence and the
+  # burn-down allowlist entry.
   actionlint:
     name: actionlint (workflow-injection guard)
     needs: classify
@@ -243,7 +329,11 @@ jobs:
   # actually exercised: a stray use of a >1.96 API would only surface
   # downstream. This job installs exactly 1.96.0 and `cargo check`s the
   # whole crate against it, failing CI if the real minimum drifts above
-  # the declared one. Advisory until added to branch protection.
+  # the declared one.
+  #
+  # #2494 doc-vs-reality fix: previously "Advisory until added to branch
+  # protection". It IS required on `release/v1.0.0` now
+  # (`MSRV (Rust 1.96)`) — see the `lint` job's note above.
   msrv:
     name: MSRV (Rust 1.96)
     needs: classify
@@ -497,10 +587,19 @@ jobs:
             # completion). The job-level `timeout-minutes` cap still bounds the
             # build. A genuine runtime hang still trips the 1500s below.
             cargo test --no-run "$@" || return "$?"
+            # `--no-fail-fast` (#2500) — see the identical rationale on
+            # `pg_test` in the postgres-feature job below. Cargo otherwise
+            # exits after the FIRST failing test executable, so on the
+            # `__ALL__` path a single transient flake discards the results of
+            # every later binary. Probed: the flag does not change the exit
+            # code (a failing run stays non-zero), so it cannot mask a real
+            # failure — it only stops the run from throwing away evidence.
+            # Runtime stays bounded by the 1500s per-invocation watchdog
+            # below plus the job-level `timeout-minutes`.
             if [ -n "$TIMEOUT_BIN" ]; then
-              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 1500 cargo test "$@" || rc=$?
+              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 1500 cargo test --no-fail-fast "$@" || rc=$?
             else
-              cargo test "$@" || rc=$?
+              cargo test --no-fail-fast "$@" || rc=$?
             fi
             if [ "$rc" -ne 0 ]; then
               if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
@@ -778,10 +877,37 @@ jobs:
           pg_test() {
             local label="$1"; shift
             local rc=0
+            # `--no-fail-fast` (#2500) — DIAGNOSTIC COMPLETENESS. Without it,
+            # cargo exits after the FIRST failing test executable and every
+            # later binary is never run. That is not hypothetical: on PR
+            # #2497's run 30518877707 ATTEMPT 1 (job 90794703373 — the
+            # attempt the default `/runs/{id}/jobs` endpoint hides, since it
+            # returns only the latest attempt), `e2_post_ship_dry_run` failed
+            # on a crates.io `[16] Error in the HTTP2 framing layer` during
+            # its nested `cargo build`, the invocation aborted, and the job
+            # log ENDS there — `tests/federation_delete_ns_scope_2488_pg.rs`,
+            # the binary that proves a CWE-284 GA-blocker closed on postgres,
+            # appears nowhere in it. A network hiccup in an unrelated tool
+            # crate silently withheld the evidence the PR existed to produce.
+            #
+            # SAFE, and probed rather than assumed: `--no-fail-fast` does NOT
+            # change the verdict. Measured on a 2-binary throwaway crate —
+            # default: 2 binaries run, the later one never reached, exit 101;
+            # with the flag: 3 run, the later one reached, exit STILL 101. It
+            # can only ever turn a red run into a red run with more evidence,
+            # never a red run green.
+            #
+            # The usual argument for fail-fast — bounding runtime on a broken
+            # build — is already covered by the #1492 watchdog above, which
+            # caps EACH invocation at 2100s independently of how many binaries
+            # it runs, with `timeout-minutes` as the outer bound. With a
+            # per-invocation cap in place, fail-fast buys early termination at
+            # the cost of diagnostic completeness, and the discarded remainder
+            # is exactly where the proof lives.
             if [ -n "$TIMEOUT_BIN" ]; then
-              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 2100 cargo test "$@" || rc=$?
+              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 2100 cargo test --no-fail-fast "$@" || rc=$?
             else
-              cargo test "$@" || rc=$?
+              cargo test --no-fail-fast "$@" || rc=$?
             fi
             if [ "$rc" -ne 0 ]; then
               if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
@@ -820,13 +946,32 @@ jobs:
   # silently breaking integration when a downstream app developer tries
   # to consume the v0.7.x release artifacts. The job is `--lib` only —
   # we never build a CLI binary for mobile; the consumer is FFI from an
-  # iOS / Android app. Skipped on docs-only PRs alongside the rest of
+  # iOS / Android app. No-ops on docs-only PRs alongside the rest of
   # the heavy matrix. CI cost: ~5-8 min per target on a cold cache, ~1
   # min on a warm cache; well under the $5/mo budget the issue projected.
+  #
+  # #2494 UN-WEDGE — DO NOT ADD A JOB-LEVEL `if:` TO THIS JOB.
+  # `Cross-compile (aarch64-apple-ios)` and
+  # `Cross-compile (aarch64-linux-android)` are REQUIRED contexts on
+  # `release/v1.0.0`. This job is a `strategy: matrix` job, and GitHub
+  # evaluates a job-level `if:` BEFORE matrix expansion — so the former
+  # `if: needs.classify.outputs.docs_only != 'true'` made a docs-only PR
+  # emit ONE check-run named `Cross-compile (${{ matrix.target }})` while
+  # the two required names were NEVER CREATED. An absent required context
+  # is `pending` forever and `enforce_admins: true` blocks the admin
+  # override, so the branch wedged for every docs-only PR shape (proven
+  # live on commit 45ba8741). It now follows the `check` job's pattern:
+  # NO job-level `if:` (so it still runs only when `needs: classify`
+  # SUCCEEDED — a failed/cancelled classify skips it and the required
+  # contexts go absent, which fails CLOSED by blocking the merge rather
+  # than reporting green on an unclassified diff), with the docs-only
+  # guard on EVERY step. `if: always()` was REJECTED for exactly that
+  # reason: it would report success even when classify never ran.
+  # `scripts/check-required-contexts.sh` rules (b1)+(b3) enforce both
+  # halves statically.
   mobile-cross-compile:
     name: Cross-compile (${{ matrix.target }})
     needs: classify
-    if: needs.classify.outputs.docs_only != 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -845,12 +990,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: docs-only short-circuit
+        if: needs.classify.outputs.docs_only == 'true'
+        run: echo "::notice::docs-only PR — ${{ matrix.target }} cross-compile is a no-op"
+
       - name: Install Rust 1.96.0 (target ${{ matrix.target }}, matches rust-toolchain.toml pin)
+        if: needs.classify.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
+        if: needs.classify.outputs.docs_only != 'true'
         with:
           key: mobile-${{ matrix.target }}
 
@@ -860,7 +1011,7 @@ jobs:
       # instead of the host's. r26d is the latest LTS at the time of
       # writing; bumps tracked alongside Rust stable cadence.
       - name: Install Android NDK r26d
-        if: matrix.target == 'aarch64-linux-android'
+        if: needs.classify.outputs.docs_only != 'true' && matrix.target == 'aarch64-linux-android'
         id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
@@ -868,7 +1019,7 @@ jobs:
           add-to-path: false
 
       - name: Configure NDK toolchain for cargo
-        if: matrix.target == 'aarch64-linux-android'
+        if: needs.classify.outputs.docs_only != 'true' && matrix.target == 'aarch64-linux-android'
         shell: bash
         run: |
           set -euo pipefail
@@ -894,6 +1045,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: cargo check (--lib --features sqlite-bundled)
+        if: needs.classify.outputs.docs_only != 'true'
         run: |
           cargo check \
             --target ${{ matrix.target }} \

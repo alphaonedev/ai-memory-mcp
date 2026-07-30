@@ -1,0 +1,52 @@
+# required-contexts-joblevel-if-allow.txt — BURN-DOWN RATCHET for rule (b2) of
+# `scripts/check-required-contexts.sh` (#2494 / #2496).
+#
+# WHAT AN ENTRY HERE MEANS. This context's job carries a job-level `if:`, so on
+# a docs-only diff it reports `skipped` — and GitHub branch protection COUNTS A
+# SKIPPED REQUIRED CONTEXT AS SATISFIED. The gate is therefore FAIL-OPEN for
+# that diff shape. Each line below is an acknowledged, dated fail-open, not an
+# absolution.
+#
+# WHY THAT IS TOLERABLE AT ALL. It rests entirely on the `classify` job being
+# right about what "docs-only" means. It was NOT right: `ci.yml` classified
+# `docs_only` against the INCREMENTAL previous head, so a PR whose last push
+# was docs-only skipped every gate below for its whole head (#2496 — merged PR
+# #2031 into `main` with 22 non-docs files and zero compilation; fired again on
+# the #2497 security fix). The classification-base split landed in the same
+# commit as this file for exactly that reason. If you are reading this because
+# you are about to widen the docs-only fast path, re-read #2496 first.
+#
+# RATCHET SEMANTICS (`hardcoded-literals-baseline.txt` style):
+#   * Entries may only be REMOVED. Removing one means the job was converted to
+#     the per-step-guard pattern (`check` job in ci.yml) so it RUNS and reports
+#     a real `success`/`failure` instead of `skipped`.
+#   * A STALE entry FAILS the gate: if a listed context is no longer required,
+#     or its job no longer has a job-level `if:`, the line must be deleted.
+#     The ledger cannot silently rot into a junk drawer.
+#   * There is no allowlist for rule (b1). A matrix job with a job-level `if:`
+#     is a hard fail, always — it does not merely fail open, it WEDGES the
+#     branch on a required context that is never created.
+#
+# FORMAT: whole-line `#` comments and blanks ignored; every other line is one
+# context name verbatim. An inline `#` is NOT a comment.
+#
+# ---------------------------------------------------------------------------
+# 2026-07-30 (#2494/#2496) — the eight contexts inherited in this state.
+# All are NON-matrix, so none can wedge the branch; all are `needs: classify`
+# with `if: needs.classify.outputs.docs_only != 'true'`.
+# ---------------------------------------------------------------------------
+Lint (fmt + clippy)
+actionlint (workflow-injection guard)
+MSRV (Rust 1.96)
+Postgres feature gate
+SAL-only feature gate
+vectorlite feature gate
+# dockerfile-validate's `if:` is compound — it ALSO skips on tag pushes
+# (`!startsWith(github.ref, 'refs/tags/v')`), which is deliberate: release.yml
+# owns the tag-time image build.
+Dockerfile build (no push)
+# coverage.yml's `per-module-thresholds`. Its classifier already used the PR
+# base (the correct shape ci.yml now matches), so its fail-open window was
+# narrower than the ci.yml seven — but the empty-diff arm was still open until
+# #2494/#2496, and it is still `skipped`-on-docs-only today.
+Per-Module Coverage Thresholds
