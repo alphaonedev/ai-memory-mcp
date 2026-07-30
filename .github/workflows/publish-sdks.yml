@@ -5,8 +5,41 @@ name: publish-sdks
 # - npm: `npm publish --provenance --access public` using `id-token: write`
 #   against a Trusted Publisher configured at npmjs.com.
 #
-# Both jobs run inside protected GitHub Environments so a maintainer
-# must approve each publish.
+# Both jobs declare a GitHub Environment (`pypi-publish` / `npm-publish`).
+#
+# ⚠ #2467 — WHAT THOSE ENVIRONMENTS ACTUALLY ENFORCE. Declaring an
+# `environment:` does NOT by itself create an approval gate; the protection
+# rules are repository SETTINGS, not workflow config, so this comment can only
+# describe them -- never establish them. Verify, don't trust this text:
+#
+#     gh api repos/:owner/:repo/environments/pypi-publish --jq .protection_rules
+#     gh api repos/:owner/:repo/environments/npm-publish  --jq .protection_rules
+#
+# As of 2026-07-30 both carry `wait_timer=30` with `can_admins_bypass=false`
+# (applied via the API; before/after snapshots committed under
+# `governance/control-plane/` by #2507). The `can_admins_bypass=false` half is
+# the load-bearing one: with it true the timer is advisory and the same
+# identity that pushed the tag can skip it. Until that change BOTH environments
+# were `protection_rules: []` -- nothing held a publish for review -- while
+# this comment asserted "a maintainer must approve each publish." It was false.
+#
+# Required REVIEWERS are deliberately NOT configured: the reviewer pool is one
+# account (sole collaborator), so required-reviewers would block EVERY publish
+# rather than gate one -- the CODEOWNERS deadlock in a new costume (#2475). A
+# wait timer cannot deadlock; it always proceeds. (An earlier revision of this
+# comment cited `github-pages` as proof "the mechanism works and was simply
+# never applied here." That environment carries `branch_policy`, not required
+# reviewers -- a different mechanism. The precedent did not say that.)
+#
+# HONEST SCOPE -- this buys a 30-minute cancellation window, NOT a gate:
+#   - no tag protection (`/tags/protection` -> 404) and no tag ruleset (the
+#     sole ruleset is `target: "branch"`, so it does not reach tag refs)
+#   - `release.yml`'s preflight validates SemVer SHAPE only (:66-82) -- never
+#     tag ancestry, never CI status on the tagged commit
+# So a stable-shaped tag at ANY commit still publishes after 30 minutes. The
+# durable fix is deriving SDK versions from the tag (see the guard below for
+# why hardcoded manifests are what makes a wrong tag unrecoverable). Remaining
+# controls tracked on #2467.
 #
 # #2455 — TEST-BEFORE-PUBLISH. This workflow triggers on `push: tags: v*`, so
 # cutting the GA tag publishes both SDKs. Before #2455 the steps were
@@ -36,7 +69,18 @@ permissions: {}
 
 jobs:
   publish-pypi:
-    if: ${{ github.event_name == 'push' || github.event.inputs.target == 'both' || github.event.inputs.target == 'pypi' }}
+    # #2467 — PRERELEASE GUARD. `github.event_name == 'push'` alone is true for
+    # EVERY `v*` tag, so before this guard `git push origin v1.0.0-rc.1` published
+    # the STABLE slot: the SDK versions are hardcoded in the manifests
+    # (`sdk/python/ai_memory/_version.py`, `sdk/typescript/package.json`), not
+    # derived from the tag. Registry version slots are not reusable -- the 0.9.0
+    # slot was burned exactly this way (`987f24fb`), forcing 0.9.0.post1 / 0.9.1.
+    #
+    # SemVer prereleases carry a hyphen (`v1.0.0-rc.1`, `v1.0.0-alpha.2`); the
+    # test mirrors `release.yml`'s preflight (`if [[ "$TAG" == *-* ]]`, :76-82).
+    # `release.yml` guards SIX publishing jobs this way but is `workflow_dispatch`-
+    # only -- the automatic publisher was the unguarded one.
+    if: ${{ (github.event_name == 'push' && !contains(github.ref_name, '-')) || github.event.inputs.target == 'both' || github.event.inputs.target == 'pypi' }}
     name: publish ai-memory to PyPI
     runs-on: ubuntu-latest
     environment:
@@ -75,7 +119,8 @@ jobs:
           skip-existing: true
 
   publish-npm:
-    if: ${{ github.event_name == 'push' || github.event.inputs.target == 'both' || github.event.inputs.target == 'npm' }}
+    # #2467 — PRERELEASE GUARD; see the rationale on `publish-pypi` above.
+    if: ${{ (github.event_name == 'push' && !contains(github.ref_name, '-')) || github.event.inputs.target == 'both' || github.event.inputs.target == 'npm' }}
     name: publish @alphaone/ai-memory to npm
     runs-on: ubuntu-latest
     environment:
