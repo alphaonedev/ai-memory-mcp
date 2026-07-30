@@ -1,0 +1,111 @@
+# required-contexts-release.txt — the DECLARED required-status-check set for
+# the protected branch `release/v1.0.0`, verified by
+# `scripts/check-required-contexts.sh` (#2494 / #2496).
+#
+# ============================================================================
+# *** HAND-AUTHORED FROM INTENT. NEVER GENERATE THIS FILE FROM LIVE API STATE.
+# ============================================================================
+#
+# This file is the DECLARATION. Live branch protection is the ARTEFACT. The
+# gate's job is to prove the artefact is sound; if the declaration is minted
+# from the artefact, the gate proves nothing and passes forever.
+#
+# That is not hypothetical here. The entry
+#
+#     L3-boundary perma-ban gate (§25.3 S5 / RQ-10
+#
+# is TRUNCATED, and the truncation is LOAD-BEARING — do not "fix" it.
+# `.github/workflows/c8-precheck.yml:75` writes the job name UNQUOTED:
+#
+#     name: L3-boundary perma-ban gate (§25.3 S5 / RQ-10 #1853)
+#
+# In YAML a `#` PRECEDED BY WHITESPACE opens a comment, so the parsed job name
+# — and therefore the check-run name GitHub actually reports — stops at
+# `RQ-10`. The live required context carries the truncated form, so it matches
+# and the gate is green. Tracked as #2473. Two ways to make it well-formed,
+# BOTH of which are branch-protection edits and are therefore out of scope
+# here: quote the name in the workflow AND update this mirror AND update
+# protection, in that order, atomically. Changing only the workflow renames the
+# check-run and instantly wedges the branch on an absent required context.
+#
+# (Contrast the entries that contain `(#1174 PR10)`, `(#1989)`, `(#2146)`:
+# those do NOT truncate, because there the `#` is preceded by `(`, not
+# whitespace. The gate's parser implements the real YAML rule and reproduces
+# both outcomes — the `--self-test` clean control asserts exactly that.)
+#
+# FORMAT
+#   * A line whose first non-space character is `#` is a comment. Blank lines
+#     are ignored.
+#   * Every other line is ONE required context name, verbatim.
+#   * An INLINE `#` is NOT a comment — several context names legitimately
+#     contain one (see the `(#1174 PR10)` entries below).
+#
+# HOW TO CHANGE THIS FILE
+#   Adding or removing a required context is a branch-protection edit
+#   (Sensitive class, `docs/AI_DEVELOPER_GOVERNANCE.md`). Land the protection
+#   change and this mirror together, and state the intent — not the API
+#   response — in the commit message.
+#
+# ---------------------------------------------------------------------------
+# Carried by .github/workflows/ci.yml
+# ---------------------------------------------------------------------------
+# Non-matrix jobs with a job-level `if:` — these report `skipped` on a
+# docs-only diff, which branch protection COUNTS AS SATISFIED. Each is
+# recorded in the burn-down ratchet
+# `required-contexts-joblevel-if-allow.txt` with its justification.
+Lint (fmt + clippy)
+actionlint (workflow-injection guard)
+MSRV (Rust 1.96)
+Postgres feature gate
+SAL-only feature gate
+vectorlite feature gate
+Dockerfile build (no push)
+#
+# Matrix jobs following the proven pattern — NO job-level `if:`, docs-only
+# guard on every step — so the EXPANDED names always report. Adding a
+# job-level `if:` to either job re-opens the #2494 branch wedge and rule (b1)
+# hard-fails for it.
+Check (ubuntu-latest)
+Check (macos-latest)
+Check (windows-latest)
+Cross-compile (aarch64-apple-ios)
+Cross-compile (aarch64-linux-android)
+#
+# ---------------------------------------------------------------------------
+# Carried by .github/workflows/c8-precheck.yml
+# ---------------------------------------------------------------------------
+# Unconditional integrity gates: no `needs:`, no job-level `if:`, no `paths:`
+# filter. These are the nine contexts that genuinely run on every PR.
+C8 caller-context allowlist check
+Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10)
+L3-boundary perma-ban gate (§25.3 S5 / RQ-10
+Hardcoded-literal duplication ratchet (pm-v3.1)
+Docs vs SSOT drift gate
+Cloud-init ASCII gate
+Test-reachable stdin-read gate (#1989)
+Migration-ladder-uniqueness gate (guardrail-D)
+Test-env $HOME-lock gate (#2146)
+#
+# ---------------------------------------------------------------------------
+# Carried by .github/workflows/coverage.yml
+# ---------------------------------------------------------------------------
+# Job-level `if:`; ratcheted like the ci.yml seven above.
+Per-Module Coverage Thresholds
+#
+# ---------------------------------------------------------------------------
+# KNOWN GAPS — declared here so they are not mistaken for oversights.
+# Closing any of them is a branch-protection edit, deliberately NOT done in
+# this change.
+# ---------------------------------------------------------------------------
+#   * `Classify changes` (ci.yml) and `Coverage classify (docs-only
+#     short-circuit)` (coverage.yml) are NOT required, yet between them they
+#     decide the disposition of the eight ratcheted contexts above. Both
+#     always run — no `needs:`, no job-level `if:`, `release/**` in
+#     `branches:` — so requiring them is free and carries zero wedge risk.
+#     THE natural companion fix to #2496; follow-up, protection-frozen here.
+#   * Two c8-precheck integrity gates run on every PR but are not required:
+#     `Installer checksum fail-closed gate (#2449)` and
+#     `Non-Rust conformance-reader proof gate (#2452)`.
+#   * `main` and `develop` require only `Check (ubuntu/macos/windows-latest)`.
+#     That is the #2496 exposure: those three are the vacuous-success job, so
+#     the branch that ships is the least protected in fact. Out of scope here.
