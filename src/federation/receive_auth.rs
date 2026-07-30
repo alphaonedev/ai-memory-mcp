@@ -800,6 +800,37 @@ pub fn inbound_write_needs_existing_namespace(
 /// selects the delete-lane wording cannot drift from the string the funnels pass.
 pub const LANE_DELETIONS: &str = "deletions";
 
+/// #2478 — lane token for the `/sync/push` `pendings[]` subcollection (the
+/// inbound governance-row upsert), distinct from [`LANE_PENDING_DECISIONS`]
+/// because refusing an INJECTION and refusing an EXECUTION are different
+/// operator remedies and must not share a log line.
+pub const LANE_PENDINGS: &str = "pendings";
+
+/// #2478 — lane token for the NON-destructive arms of the `/sync/push`
+/// `pending_decisions[]` subcollection (`store` / `promote` / `reflect`).
+pub const LANE_PENDING_DECISIONS: &str = "pending_decisions";
+
+/// #2478 — lane token for the DESTRUCTIVE arm of `pending_decisions[]`.
+///
+/// Split from [`LANE_PENDING_DECISIONS`] for one reason only:
+/// [`layer2_unscoped_peer_authorized`] selects its `scope_note` prose from the
+/// lane token, and the #2488 lesson is that a destructive lane must never be
+/// refused with the write-lane wording ("your write scope would be unbounded")
+/// — an operator reading that about a hard `DELETE` is being told the wrong
+/// thing. Approving a `delete`-typed pending action reaches `storage::delete`
+/// exactly as `deletions[]` does, so it takes the same prose.
+pub const LANE_PENDING_DECISION_DELETE: &str = "pending_decisions (delete)";
+
+/// Whether `lane` names a funnel whose refusal prose must describe a
+/// DESTRUCTIVE effect rather than a write.
+///
+/// One predicate rather than an `==` at the branch so that adding a third
+/// destructive lane is a single edit here and cannot silently inherit the
+/// write-lane wording (#2478, extending the #2488 prose fix).
+fn lane_is_destructive(lane: &str) -> bool {
+    matches!(lane, LANE_DELETIONS | LANE_PENDING_DECISION_DELETE)
+}
+
 /// #2488 — distinguishable refusal cause for a federated deletion that was
 /// refused because the target row's namespace could not be RESOLVED, as opposed
 /// to resolved-and-out-of-scope.
@@ -1004,7 +1035,7 @@ fn layer2_unscoped_peer_authorized(
     // the operator nothing actionable. It is also no longer factually true of
     // the delete lane: since #2488 the delete disposition is governed by this
     // very knob rather than hard-coded deny-on-empty.
-    let scope_note = if lane == LANE_DELETIONS {
+    let scope_note = if lane_is_destructive(lane) {
         "so its read (/sync/since) and write scopes are both empty — a peer that may \
          neither read nor write in ANY namespace may not hard-DELETE in one either"
     } else {
