@@ -960,13 +960,14 @@ but new public operations live on the trait.
 
 ### Lint gates (issue #1174 PR10 — pm-v3.1 vendor-monoculture + SECS_PER_*)
 
-Seven numbered script-based lint gates run in CI alongside the four
+Eight numbered script-based lint gates run in CI alongside the four
 cargo gates (fmt / clippy / test / audit) and the two test-guard jobs
 (`test-stdin-gate` #1989, `test-env-lock-gate` #2146). All are
 HARD-BLOCK and are wired into `.github/workflows/c8-precheck.yml`
 (`c8-precheck`, `vendor-literal-gate`, `l3-boundary-gate`,
 `hardcoded-literal-gate`, `docs-vs-ssot-drift`, `cloud-init-ascii-gate`,
-`migration-ladder-gate`, plus the two test-guard jobs above).
+`migration-ladder-gate`, `required-contexts-gate`, plus the two
+test-guard jobs above).
 
 **0. Hardcoded-literal duplication ratchet (pm-v3.1)** —
 `scripts/check-hardcoded-literals.sh`. The mechanical enforcement of the
@@ -1148,6 +1149,62 @@ legacy database replayed to the tip, then compared column-for-column and
 `indexdef`-for-`indexdef` against a greenfield install — is
 `tests/postgres_ladder_replay.rs`. Data-integrity guardrail (North Star:
 degrade — a loud non-zero exit — never corrupt the ladder).
+
+**7. Required-context + classify-base soundness gate** (#2494 /
+#2496) — `scripts/check-required-contexts.sh`. The required-status-check
+set on `release/v1.0.0` read as 22 gates and functioned as far fewer, in
+three independent ways, all confirmed on live check-run data. **The
+wedge:** `ci.yml`'s `mobile-cross-compile` was BOTH a `strategy: matrix`
+job AND carried a job-level `if:`. GitHub evaluates a job-level `if:`
+BEFORE matrix expansion, so on docs-only commit `45ba8741` it emitted ONE
+check-run named `Cross-compile (${{ matrix.target }})` and the two
+REQUIRED expanded names were never created — pending forever, and
+`enforce_admins: true` means no admin merge clears it. The same commit
+proves the correct shape: `Check (ubuntu/macos/windows-latest)` all
+EXPANDED and reported `success`, because the `check` job carries NO
+job-level `if:` and guards every STEP instead. **The fail-open:** eight
+required contexts carry a job-level `if:` and report `skipped`, which
+branch protection COUNTS AS SATISFIED — tolerable only while the
+classifier is right, and it was not (#2496). **The unreportable
+context:** a `paths:` filter on the carrying workflow's `pull_request`
+trigger wedges the branch identically, with no `if:` in sight.
+HARD-BLOCKS all three statically against a HAND-AUTHORED mirror at
+`scripts/qc-allowlists/required-contexts-release.txt`: **(a)** every
+mirror context equals a parsed static job `name` or an expanded matrix
+name from a workflow whose `pull_request.branches` covers the protected
+branch; **(b1) HARD-FAIL, never allowlistable** — matrix AND job-level
+`if:` together (the exact wedge); **(b2)** a job-level `if:` at all fails
+unless listed in the burn-down ratchet
+`required-contexts-joblevel-if-allow.txt`, where a STALE entry also fails
+so the ledger cannot rot; **(c)** the carrier's `pull_request` trigger
+exists and has no `paths:`/`paths-ignore:` filter; **(b3)** in any
+`needs: classify` job with no job-level `if:`, EVERY step carries the
+`docs_only` guard (bare `actions/checkout@*` is the single structural
+exemption). **The mirror is hand-authored from intent and must NEVER be
+regenerated from live API state:** one required context is
+`L3-boundary perma-ban gate (§25.3 S5 / RQ-10`, a YAML truncation
+artefact where the unquoted ` #1853)` at `c8-precheck.yml:75` opens a
+comment (#2473). It matches today and is deliberately left alone —
+regenerating the mirror would launder the truncation into the declaration
+and make rule (a) a tautology that passes forever. The awk parser
+implements the real YAML scalar rule (a `#` preceded by whitespace opens
+a comment; `(#1174 PR10)` does not) and was cross-checked against PyYAML
+on all 58 jobs across all 17 workflows with zero mismatches.
+`--self-test` plants the (b1) wedge, an (a) unmatched context, a (c)
+path-filtered carrier, a (b3) unguarded step and both directions of the
+(b2) ratchet in a throwaway copy UNDER the repo (never system `/tmp`);
+`--dump` prints the raw parse stream. The job is wired UNCONDITIONALLY —
+no `needs: classify`, no job-level `if:`, no `paths:` — because a gate
+policing the docs-only short-circuit must not be subject to it. Its
+sibling step runs `scripts/test/test-ci-workflow-invariants.sh`, which
+EXTRACTS the `classify` shell verbatim from `ci.yml` and drives it over
+throwaway git fixtures, then runs the same fixtures against the pre-fix
+block frozen at `scripts/test/fixtures/ci-classify-prefix-2496.sh` — a
+code-then-docs PR must classify `docs_only=false` live and `true` frozen,
+so a silently-broken extraction cannot make the assertions vacuous.
+Data-integrity guardrail (North Star: a control that reports success
+while doing nothing is worse than a missing control, because 22 green
+checks actively imply rigor that is not present).
 
 ## Prime directive (operator-set, 2026-05-17)
 
