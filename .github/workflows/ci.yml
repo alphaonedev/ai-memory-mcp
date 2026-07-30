@@ -229,12 +229,13 @@ jobs:
           fi
           # docs-only iff every changed file matches docs/** OR *.md anywhere
           if echo "$changed" | grep -qvE '^(docs/|.*\.md$)'; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            docs_only=false
             echo "::notice::code changes detected — running full pipeline"
           else
-            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+            docs_only=true
             echo "::notice::docs-only diff — skipping Rust pipeline"
           fi
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
           echo "--- Changed files vs classification base $cls_base ($(echo "$changed" | wc -l) files) ---"
           echo "$changed"
 
@@ -247,7 +248,41 @@ jobs:
           # incremental previous head), never $cls_base's classification
           # role. See the two-bases comment above.
           chmod +x scripts/ci-test-impact.sh
-          scripts/ci-test-impact.sh "$impact_base" "HEAD"
+          # SECOND-ORDER FAIL-OPEN, closed here (#2496). Splitting the two
+          # bases is NECESSARY BUT NOT SUFFICIENT, and this was caught by
+          # probing the fix's own CI run rather than by reading it. The
+          # `__SKIP__` sentinel is a DOCS-ONLY VERDICT — the consumer steps
+          # (`Run tests (impact-aware)` in `check`, `pg_test` in
+          # `postgres-feature`) treat it as "no-op the test step". But
+          # `ci-test-impact.sh` derives it from the INCREMENTAL base, so on a
+          # code PR whose last push is docs-only it still emitted `__SKIP__`
+          # even with `docs_only=false`. Measured on this very fix's first
+          # run (head 13f0b53d, a CHANGELOG-only last commit over 9 non-docs
+          # files): every heavy gate correctly RAN, and `Check (macos-latest)`
+          # then logged `TEST_IMPACT: __SKIP__` / `docs-only diff — test step
+          # is a no-op` — compilation and clippy were restored while
+          # `cargo test` still ran ZERO tests. So the impact lane carried its
+          # own copy of the same fail-open one layer down.
+          #
+          # A verdict the classifier did not reach must never be inferred from
+          # a narrower diff: `__SKIP__` is honoured ONLY when `docs_only` is
+          # genuinely true, and otherwise degrades to `__ALL__` (run more, not
+          # fewer). The script is run with GITHUB_OUTPUT redirected to scratch
+          # so its emission is inspected BEFORE it can reach the real outputs
+          # — the guard is structural, not a hope that a later duplicate key
+          # wins.
+          impact_out="${RUNNER_TEMP:-.}/ci-test-impact.out"
+          : > "$impact_out"
+          GITHUB_OUTPUT="$impact_out" scripts/ci-test-impact.sh "$impact_base" "HEAD"
+          if [ "$docs_only" != "true" ] && grep -q '^test_impact=__SKIP__$' "$impact_out"; then
+            echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
+            echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"
+            echo "test_impact_total=ALL" >> "$GITHUB_OUTPUT"
+            echo "test_impact_reason=impact-skip-overridden-not-docs-only" >> "$GITHUB_OUTPUT"
+            echo "::notice::impact selection returned __SKIP__ from the incremental base ($impact_base) but the PR is NOT docs-only — overriding to __ALL__ (fail closed)"
+          else
+            cat "$impact_out" >> "$GITHUB_OUTPUT"
+          fi
 
   # Fast lint job — fmt + clippy on ubuntu only. Toolchain-portable, no
   # need to run on macOS/Windows where it just duplicates work and burns

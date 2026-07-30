@@ -101,11 +101,24 @@ build_fixture() {
         # Passthrough stub: records the base it was handed, then emits the
         # outputs the real script would. Asserting on this is how we prove the
         # SELECTION base stayed incremental while CLASSIFICATION widened.
+        # Passthrough stub that MIRRORS the real script's `__SKIP__` rule: it
+        # emits `__SKIP__` when ITS OWN (incremental) diff is all-docs. That is
+        # what makes scenario 1 exercise the second-order guard — the real
+        # script did exactly this on the live run and no-op'd `cargo test` on a
+        # 9-non-docs-file PR. It also records the base it was handed, which is
+        # how we prove SELECTION stayed incremental while CLASSIFICATION widened.
         cat > scripts/ci-test-impact.sh <<'STUB'
 #!/usr/bin/env bash
 echo "impact_base_received=$1"
-echo "test_impact=__STUB__" >> "$GITHUB_OUTPUT"
 echo "impact_base_received=$1" >> "$GITHUB_OUTPUT"
+inc="$(git diff --name-only "$1" HEAD)"
+if [ -n "$inc" ] && ! printf '%s\n' "$inc" | grep -qvE '^(docs/|.*\.md$)'; then
+  echo "test_impact=__SKIP__" >> "$GITHUB_OUTPUT"
+  echo "test_impact_reason=docs-only" >> "$GITHUB_OUTPUT"
+else
+  echo "test_impact=__STUB__" >> "$GITHUB_OUTPUT"
+  echo "test_impact_reason=stub" >> "$GITHUB_OUTPUT"
+fi
 STUB
         chmod +x scripts/ci-test-impact.sh
         git add -A && git commit -qm base
@@ -131,13 +144,18 @@ STUB
 }
 
 # run_cls <fixture-dir> <block-file> <env assignments...>
-# Executes the extracted block inside the fixture and prints its GITHUB_OUTPUT.
+# Executes the extracted block inside the fixture and prints its STDOUT
+# followed by its GITHUB_OUTPUT. Order matters: `getout` takes the LAST match,
+# so GITHUB_OUTPUT (what the job actually consumes) authoritatively wins over
+# any same-named key a sub-script merely echoed to the log. Stdout is included
+# because the impact script reports there too, and the second-order guard
+# deliberately does NOT forward its scratch keys to the real outputs.
 run_cls() {
     local dir="$1" block="$2"; shift 2
     (
         cd "$dir"
         : > .gh_output
-        env GITHUB_OUTPUT="$PWD/.gh_output" "$@" bash "$block" >/dev/null 2>&1 || true
+        env GITHUB_OUTPUT="$PWD/.gh_output" "$@" bash "$block" 2>/dev/null || true
         cat .gh_output
     )
 }
@@ -169,6 +187,15 @@ OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BA
 [ "$(getout "$OUT" impact_base_received)" = "$C1" ] \
     && ok "s1 test-impact SELECTION still uses the incremental previous head" \
     || bad "s1 impact base must stay incremental (the optimisation must survive)" "expected $C1, got $(getout "$OUT" impact_base_received)"
+# The SECOND-ORDER guard: the impact lane derived `__SKIP__` from the
+# incremental (all-docs) diff. Honouring it would no-op `cargo test` on a code
+# PR — exactly what the live run did before this guard existed.
+[ "$(getout "$OUT" test_impact)" = "__ALL__" ] \
+    && ok "s1 __SKIP__ from the incremental base is OVERRIDDEN to __ALL__ (tests are NOT no-op'd on a code PR)" \
+    || bad "s1 test_impact must not stay __SKIP__ when the PR is not docs-only" "got test_impact=$(getout "$OUT" test_impact)"
+[ "$(getout "$OUT" test_impact_reason)" = "impact-skip-overridden-not-docs-only" ] \
+    && ok "s1 reports the second-order override reason token" \
+    || bad "s1 override reason token" "got $(getout "$OUT" test_impact_reason)"
 
 # --- Scenario 2: a genuinely docs-only PR must still short-circuit.
 F="$SCRATCH/s2"; build_fixture "$F" docs docs
@@ -177,6 +204,11 @@ OUT="$(run_cls "$F" "$BLOCK" EVENT_NAME=pull_request PR_ACTION=synchronize PR_BA
 [ "$(getout "$OUT" docs_only)" = "true" ] \
     && ok "s2 genuinely docs-only PR still classifies docs_only=true (fast path preserved)" \
     || bad "s2 all-docs PR should still short-circuit" "got docs_only=$(getout "$OUT" docs_only)"
+# The override must NOT fire here: __SKIP__ is legitimate when the classifier
+# genuinely reached docs-only, and suppressing it would destroy the fast path.
+[ "$(getout "$OUT" test_impact)" = "__SKIP__" ] \
+    && ok "s2 __SKIP__ is HONOURED on a genuinely docs-only PR (override is not over-broad)" \
+    || bad "s2 __SKIP__ must survive when docs_only is genuinely true" "got test_impact=$(getout "$OUT" test_impact)"
 
 # --- Scenario 3: empty diff vs the PR base (the amend-force-push shape).
 F="$SCRATCH/s3"; build_fixture "$F" code revert
