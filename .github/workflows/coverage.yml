@@ -73,6 +73,15 @@ jobs:
       - id: cls
         shell: bash
         run: |
+          # LOAD-BEARING (#2496): on `pull_request` this base is the PR
+          # BASE, spanning the WHOLE PR — NOT `github.event.before` (the
+          # previous PR head). Do NOT "harmonise" it to ci.yml's former
+          # shape: that incremental base is exactly what let a PR whose
+          # last push was docs-only classify docs-only for its entire
+          # head. On PR #2497's head 6d73ff0b this classifier correctly
+          # said docs_only=false (12-file backend change) while ci.yml's
+          # incremental one said true (CLAUDE.md-only last commit) — the
+          # in-repo A/B that proved the defect. ci.yml now matches this.
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             base="${{ github.event.pull_request.base.sha }}"
           elif [ "${{ github.event_name }}" = "push" ]; then
@@ -100,8 +109,14 @@ jobs:
           fi
           changed=$(git diff --name-only "$base" HEAD)
           if [ -z "$changed" ]; then
-            echo "docs_only=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::no diff vs base — treating as docs-only no-op"
+            # FAIL CLOSED (#2494 §3 / #2496). "No net changes" is NOT
+            # "docs only": an amend-force-push yields a fresh SHA with an
+            # identical tree, and `Per-Module Coverage Thresholds` is a
+            # REQUIRED context whose job carries a job-level `if:`, so a
+            # `docs_only=true` here made it report `skipped` — counted as
+            # SATISFIED — on a PR that is not docs-only at all.
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no net diff vs base — failing CLOSED (full coverage sweep), NOT docs-only"
             exit 0
           fi
           # docs-only iff every changed file matches docs/** OR *.md anywhere
