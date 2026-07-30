@@ -68,6 +68,16 @@ const TRACE_TARGET: &str = "store::postgres";
 /// Tracing target for the postgres KG (Apache AGE) subsystem.
 const TRACE_TARGET_KG: &str = "store::postgres::kg";
 
+/// #2511 — dedicated tracing target for an AGE→CTE fallback whose cause
+/// is a statement THIS ADAPTER built wrong, not an unreachable AGE
+/// substrate. Separated from [`TRACE_TARGET_KG`] because the two need
+/// different responses: a substrate outage pages the OPERATOR (restore
+/// AGE), a rejected statement pages a DEVELOPER (the adapter has a
+/// permanent bug and every AGE deployment is being served by the CTE
+/// while `Capabilities.kg_backend` still reports `age`). Filter with
+/// `RUST_LOG=store::postgres::kg::adapter_defect=warn`.
+const TRACE_TARGET_KG_ADAPTER_DEFECT: &str = "store::postgres::kg::adapter_defect";
+
 use crate::quotas::{QuotaStatus, quota_defaults};
 
 // ── #1558 batch 6 — file-local SQL / context-label SSOT ────────────────
@@ -7510,32 +7520,36 @@ impl PostgresStore {
         // `kg_invalidate_cypher` SETs `r.valid_until` (it does NOT delete
         // the edge), so without this filter a current-view query returns
         // edges that were already invalidated — the same defect the CTE
-        // path carried. The cut-off is the relational-mirror's RFC3339
-        // form (`to_rfc3339`, `+00:00` offset) so the agtype string
-        // comparison matches the dual-written value byte-for-byte.
-        // Defense in depth: if a given AGE build rejects the
-        // `relationships()`/`ALL()` predicate, the dispatcher's
-        // `is_age_runtime_failure` arm in `kg_query_with_history` falls
-        // back to the already-correct `kg_query_cte_filtered`.
+        // path carried. #2511: AGE's parser cannot express the
+        // `ALL(e IN relationships(p) …)` predicate, so the guard is
+        // applied Rust-side over `relationships(p)` by
+        // `age_path_edges_all_current` — same cut-off, same
+        // byte-for-byte RFC3339 comparison basis.
         let now_stamp = Utc::now().to_rfc3339();
 
-        // v0.7.0 Wave-3 Continuation 5 — AGE rejects `$1::agtype` (the
-        // third arg to `cypher()` must be a bare Param node, not a
-        // FuncExpr cast). Inline the params object as a literal
-        // agtype constant; `source_id` is UUID-validated upstream so
-        // this is safe. The dollar-quoted string body uses `$$`; the
-        // params literal lives outside it.
-        let params_lit = age_params_literal(&[("start_id", source_id), ("now", &now_stamp)]);
+        // #2511 — the third argument to `cypher()` MUST reach AGE's
+        // parse analysis as a bare, `agtype`-TYPED `Param` node. See
+        // [`Agtype`] for the full contract; the inlined
+        // `'{…}'::agtype` literal this site used pre-#2511 is rejected
+        // by AGE 1.6.0 AND 1.7.0 alike, which silently degraded EVERY
+        // AGE-routed `kg_query` to the relational CTE.
+        let params = age_params_jsonb(&[("start_id", source_id)]);
         let sql = format!(
-            "SELECT target_id, relation, depth, path FROM cypher('memory_graph', $$ {cypher} $$, \
-             {params_lit}) AS (target_id agtype, relation agtype, depth agtype, path agtype)"
+            "SELECT target_id, path_nodes, path_edges \
+             FROM cypher('memory_graph', $$ {cypher} $$, $1) AS \
+             (target_id agtype, path_nodes agtype, path_edges agtype)"
         );
 
-        // #1482 — the cypher text is per-call-unique (inlined ids +
+        // #1482 — the cypher text is per-call-unique (interpolated
         // depth), so caching it as a named prepared statement only
         // pollutes the bounded per-connection LRU and evicts genuinely
         // reusable hot statements. Run it via the unnamed statement.
+        // #2511 — `persistent(false)` is compatible with the typed-Param
+        // requirement: sqlx resolves declared parameter type OIDs
+        // (`Agtype` → `ag_catalog.agtype`) BEFORE it writes `Parse`,
+        // for the unnamed statement exactly as for a named one.
         let rows = sqlx::query(&sql)
+            .bind(Agtype(params))
             .persistent(false)
             .fetch_all(&mut *tx)
             .await
@@ -7545,38 +7559,101 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err(CTX_COMMIT_AGE_TX, e))?;
 
-        rows.iter()
-            .map(|r| {
-                // AGE returns `agtype`. sqlx has no first-class agtype
-                // decoder; we read each cell as String and trim AGE's
-                // quoting (`"id"` -> `id`, `2` stays `2`). This keeps
-                // the dependency surface minimal — pulling a dedicated
-                // agtype crate would balloon CI for one type tag.
-                let target_id: String = r
-                    .try_get::<String, _>("target_id")
-                    .map_err(|e| to_store_err(READ_TARGET_ID, e))?;
-                let relation: String = r
-                    .try_get::<String, _>("relation")
-                    .map_err(|e| to_store_err(READ_RELATION, e))?;
-                let depth_raw: String = r
-                    .try_get::<String, _>("depth")
-                    .map_err(|e| to_store_err(READ_DEPTH, e))?;
-                let path: String = r
-                    .try_get::<String, _>("path")
-                    .map_err(|e| to_store_err("read path", e))?;
-                let depth: usize = strip_agtype_quotes(&depth_raw).parse().map_err(|_| {
-                    StoreError::IntegrityFailed {
-                        detail: format!("non-numeric AGE depth: {depth_raw}"),
-                    }
-                })?;
-                Ok(KgQueryRow {
-                    target_id: strip_agtype_quotes(&target_id).to_string(),
-                    relation: strip_agtype_quotes(&relation).to_string(),
-                    depth,
-                    path: strip_agtype_quotes(&path).to_string(),
-                })
-            })
-            .collect()
+        // #2511 — decode, then apply Rust-side the three traversal
+        // semantics AGE's parser cannot express, so the AGE branch stays
+        // row-for-row equivalent to `kg_query_cte_filtered` (the #648
+        // parity contract) now that it ACTUALLY executes:
+        //
+        //   1. the #1689 per-edge temporal-validity guard
+        //      (`age_path_edges_all_current`);
+        //   2. node-uniqueness / cycle rejection — the CTE's
+        //      `NOT (ml.target_id = ANY(t.nodes))` arm. Cypher's
+        //      variable-length pattern only guarantees RELATIONSHIP
+        //      isomorphism, so `a->b->a` would otherwise surface as a
+        //      depth-2 hit on AGE and not on the CTE;
+        //   3. `relation` (`age_last_edge_relation`, the `last(r).relation`
+        //      twin), `depth` (the relationship count, since `length(r)`
+        //      is rejected over a list), and the path string rebuilt from
+        //      `nodes(p)` because `reduce` is unparseable on AGE — the
+        //      same `->` join, so byte-identical to the CTE's
+        //      `array_to_string(nodes, '->')`.
+        //
+        // The #1948 lifecycle allow-list is applied after this, in one
+        // round-trip against `memories` (the relational source of truth).
+        let mut decoded: Vec<KgQueryRow> = Vec::with_capacity(rows.len());
+        for r in &rows {
+            // AGE returns `agtype`; every cell goes through
+            // `age_cell_text` (the [`Agtype`] wrapper) and scalars are
+            // then trimmed of AGE's quoting (`"id"` -> `id`). See
+            // `age_cell_text` for why `try_get::<String, _>` is wrong.
+            let target_id = age_cell_text_required(r, "target_id", READ_TARGET_ID)?;
+
+            let edges_raw = age_cell_text_required(r, AGE_COL_PATH_EDGES, READ_PATH_EDGES)?;
+            let edges = age_decode_entity_list(AGE_COL_PATH_EDGES, &edges_raw)?;
+            if !age_path_edges_all_current(&edges, &now_stamp) {
+                continue;
+            }
+            if edges.is_empty() {
+                // A `*1..N` pattern cannot match a zero-length path; an
+                // empty edge list means the payload contract changed.
+                return Err(StoreError::IntegrityFailed {
+                    detail: "AGE kg_query path carried no relationships".to_string(),
+                });
+            }
+
+            let nodes_raw = age_cell_text_required(r, AGE_COL_PATH_NODES, "read path_nodes")?;
+            let node_ids = age_vertex_ids(&age_decode_entity_list(AGE_COL_PATH_NODES, &nodes_raw)?);
+            if node_ids.is_empty() {
+                return Err(StoreError::IntegrityFailed {
+                    detail: "AGE kg_query path has no extractable node ids".to_string(),
+                });
+            }
+            let unique: std::collections::BTreeSet<&String> = node_ids.iter().collect();
+            if unique.len() != node_ids.len() {
+                // Cycle: the CTE's node-uniqueness arm rejects this path.
+                continue;
+            }
+
+            decoded.push(KgQueryRow {
+                target_id: strip_agtype_quotes(&target_id).to_string(),
+                relation: age_last_edge_relation(&edges),
+                depth: edges.len(),
+                path: node_ids.join("->"),
+            });
+        }
+
+        // v1.0.0 R19/A3 (#1948) — fail-CLOSED lifecycle allow-list, and
+        // the require-target-exists convergence with SQLite. The CTE
+        // branch enforces both via its `EXISTS (SELECT 1 FROM memories …
+        // lifecycle_visible_clause)` tail; the AGE projection carries no
+        // lifecycle state, so the AGE branch has to re-derive it from the
+        // relational source of truth. Pre-#2511 this divergence was
+        // unobservable (the AGE branch never returned a row); making the
+        // branch actually execute WITHOUT this filter would have widened
+        // KG visibility to tombstoned/erased targets on every AGE
+        // deployment.
+        if decoded.is_empty() {
+            return Ok(decoded);
+        }
+        let candidate_ids: Vec<String> = decoded
+            .iter()
+            .map(|r| r.target_id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let visible_sql = format!(
+            "SELECT id FROM memories WHERE id = ANY($1) {}",
+            crate::models::lifecycle_visible_clause("memories")
+        );
+        let visible: std::collections::BTreeSet<String> = sqlx::query_scalar(&visible_sql)
+            .bind(&candidate_ids)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("kg_query AGE lifecycle filter", e))?
+            .into_iter()
+            .collect();
+        decoded.retain(|r| visible.contains(&r.target_id));
+        Ok(decoded)
     }
 
     /// Recursive-CTE fallback for `kg_query` on Postgres.
@@ -7831,9 +7908,10 @@ impl PostgresStore {
              LIMIT {cap}"
         );
 
-        // Inline the params dict as an AGE literal — see
-        // `age_params_literal` for the rationale (AGE rejects
-        // `$1::agtype` as a FuncExpr).
+        // #2511 — bind the params dict as a bare `agtype`-typed `$1`
+        // Param (see [`Agtype`]); the pre-#2511 inlined
+        // `'{…}'::agtype` literal is rejected by AGE's analyzer, which
+        // silently degraded every AGE-routed `kg_timeline` to the CTE.
         let mut pairs: Vec<(&str, &str)> = vec![("start_id", source_id)];
         if let Some(s) = since {
             pairs.push(("since", s));
@@ -7841,18 +7919,19 @@ impl PostgresStore {
         if let Some(u) = until {
             pairs.push(("until", u));
         }
-        let params_lit = age_params_literal(&pairs);
+        let params = age_params_jsonb(&pairs);
         let sql = format!(
             "SELECT target_id, relation, valid_from, valid_until, observed_by \
-             FROM cypher('memory_graph', $$ {cypher} $$, {params_lit}) AS \
+             FROM cypher('memory_graph', $$ {cypher} $$, $1) AS \
              (target_id agtype, relation agtype, valid_from agtype, \
               valid_until agtype, observed_by agtype)"
         );
 
-        // #1482 — per-call-unique cypher text (inlined id + since/until
-        // + cap); run unnamed so it never enters the prepared-statement
+        // #1482 — per-call-unique cypher text (since/until predicate +
+        // cap); run unnamed so it never enters the prepared-statement
         // cache and evicts reusable hot statements.
         let rows = sqlx::query(&sql)
+            .bind(Agtype(params))
             .persistent(false)
             .fetch_all(&mut *tx)
             .await
@@ -7866,28 +7945,36 @@ impl PostgresStore {
         // a `memories` rename.
         let mut decoded: Vec<KgTimelineRow> = Vec::with_capacity(rows.len());
         for r in &rows {
-            let target_id_raw: String = r
-                .try_get::<String, _>("target_id")
-                .map_err(|e| to_store_err(READ_TARGET_ID, e))?;
-            let relation_raw: String = r
-                .try_get::<String, _>("relation")
-                .map_err(|e| to_store_err(READ_RELATION, e))?;
-            let valid_from_raw: String = r
-                .try_get::<String, _>(field_names::VALID_FROM)
-                .map_err(|e| to_store_err(READ_VALID_FROM, e))?;
-            let valid_until_raw: String = r
-                .try_get::<String, _>(field_names::VALID_UNTIL)
-                .map_err(|e| to_store_err(READ_VALID_UNTIL, e))?;
-            let observed_by_raw: String = r
-                .try_get::<String, _>(field_names::OBSERVED_BY)
-                .map_err(|e| to_store_err(READ_OBSERVED_BY, e))?;
+            // #2511 — every agtype cell reads through `age_cell_text_*`
+            // (see that helper: a `String` decode of AGE's BINARY wire
+            // form keeps the leading `0x01` version byte, AND an absent
+            // property arrives as SQL NULL rather than agtype `null`).
+            //
+            // `valid_until` / `observed_by` are OPTIONAL on the projected
+            // edge — `project_link_into_age` SETs each only when non-NULL
+            // (#2377 FIX #9), precisely so a never-invalidated edge keeps
+            // the `valid_until IS NULL` fast path. Reading them as
+            // REQUIRED made every timeline row over an ordinary edge raise
+            // `UnexpectedNull` → `BackendUnavailable` → silent CTE
+            // fallback, which is the same vacuity class #2511 exists to
+            // kill. The `agtype_optional_string` pass still runs for the
+            // case where AGE hands back a literal `null` scalar.
+            let target_id_raw = age_cell_text_required(r, "target_id", READ_TARGET_ID)?;
+            let relation_raw = age_cell_text_required(r, "relation", READ_RELATION)?;
+            let valid_from_raw =
+                age_cell_text_required(r, field_names::VALID_FROM, READ_VALID_FROM)?;
+            let valid_until_raw = age_cell_text_opt(r, field_names::VALID_UNTIL, READ_VALID_UNTIL)?;
+            let observed_by_raw = age_cell_text_opt(r, field_names::OBSERVED_BY, READ_OBSERVED_BY)?;
 
             decoded.push(KgTimelineRow {
                 target_id: strip_agtype_quotes(&target_id_raw).to_string(),
                 relation: strip_agtype_quotes(&relation_raw).to_string(),
                 valid_from: strip_agtype_quotes(&valid_from_raw).to_string(),
-                valid_until: agtype_optional_string(&valid_until_raw),
-                observed_by: agtype_optional_string(&observed_by_raw),
+                // SQL NULL (absent property) and the agtype scalar `null`
+                // both collapse to `None` — the wire shape the CTE twin
+                // returns for a never-invalidated / unobserved edge.
+                valid_until: valid_until_raw.as_deref().and_then(agtype_optional_string),
+                observed_by: observed_by_raw.as_deref().and_then(agtype_optional_string),
                 // Filled in below by the `memories` join.
                 title: String::new(),
                 target_namespace: String::new(),
@@ -8186,14 +8273,16 @@ impl PostgresStore {
         let read_cypher = "MATCH (a)-[r:related_to]->(b) \
              WHERE a.id = $src AND b.id = $dst AND r.relation = $rel \
              RETURN r.valid_until AS prior";
-        // Inline the params dict — see `age_params_literal`.
-        let read_params_lit =
-            age_params_literal(&[("src", source_id), ("dst", target_id), ("rel", relation)]);
+        // #2511 — bare `agtype`-typed `$1` Param, not an inlined
+        // `'{…}'::agtype` literal (which AGE's analyzer rejects). See
+        // [`Agtype`].
+        let read_params =
+            age_params_jsonb(&[("src", source_id), ("dst", target_id), ("rel", relation)]);
         let read_sql = format!(
-            "SELECT prior FROM cypher('memory_graph', $$ {read_cypher} $$, {read_params_lit}) AS \
-             (prior agtype)"
+            "SELECT prior FROM cypher('memory_graph', $$ {read_cypher} $$, $1) AS (prior agtype)"
         );
         let prior_rows = sqlx::query(&read_sql)
+            .bind(Agtype(read_params))
             .fetch_all(&mut *tx)
             .await
             .map_err(|e| to_store_err("cypher kg_invalidate read", e))?;
@@ -8222,10 +8311,17 @@ impl PostgresStore {
                 .await;
         }
 
-        let prior_raw: String = prior_rows[0]
-            .try_get::<String, _>("prior")
-            .map_err(|e| to_store_err("read prior valid_until", e))?;
-        let previous_valid_until = agtype_optional_string(&prior_raw);
+        // #2511 — `r.valid_until` is ABSENT on every never-yet-invalidated
+        // edge, and AGE returns an absent property as SQL NULL. Reading it
+        // as REQUIRED raised `UnexpectedNull` → `BackendUnavailable` →
+        // `is_age_runtime_failure` → the WHOLE cypher invalidation fell
+        // back to `kg_invalidate_cte`, which updates the RELATIONAL mirror
+        // ONLY — so the AGE edge kept no `valid_until` and `kg_query`'s
+        // current view (correctly) kept returning the invalidated edge.
+        // That is the #2511 follow-up regression; NULL means "no previous
+        // valid_until", which is exactly `None`.
+        let prior_raw = age_cell_text_opt(&prior_rows[0], "prior", "read prior valid_until")?;
+        let previous_valid_until = prior_raw.as_deref().and_then(agtype_optional_string);
 
         // Step 2: SET r.valid_until = $now and count the affected
         // edge. We rely on AGE's identity to atomically rewrite the
@@ -8239,17 +8335,23 @@ impl PostgresStore {
              WHERE a.id = $src AND b.id = $dst AND r.relation = $rel \
              SET r.valid_until = $now \
              RETURN count(r) AS affected";
-        let write_params_lit = age_params_literal(&[
+        // #2511 — bare `agtype`-typed `$1` Param (see [`Agtype`]). Pre-fix
+        // this SET never executed on ANY AGE deployment: the analyzer
+        // rejected the statement and the dispatcher re-ran the whole
+        // invalidation through `kg_invalidate_cte`, leaving the AGE-side
+        // edge property un-invalidated while the relational mirror moved.
+        let write_params = age_params_jsonb(&[
             ("src", source_id),
             ("dst", target_id),
             ("rel", relation),
             ("now", &stamp),
         ]);
         let write_sql = format!(
-            "SELECT affected FROM cypher('memory_graph', $$ {write_cypher} $$, {write_params_lit}) AS \
+            "SELECT affected FROM cypher('memory_graph', $$ {write_cypher} $$, $1) AS \
              (affected agtype)"
         );
         let _ = sqlx::query(&write_sql)
+            .bind(Agtype(write_params))
             .fetch_all(&mut *tx)
             .await
             .map_err(|e| to_store_err("cypher kg_invalidate set", e))?;
@@ -8259,8 +8361,19 @@ impl PostgresStore {
         // projection lags behind a relational `UPDATE` in deployments
         // that lack a sync trigger; doing both writes here is the same
         // dual-write contract J2/J3 already rely on for the read path.
+        // #2511 — `$4::TIMESTAMPTZ`, matching `kg_invalidate_cte`'s twin
+        // exactly. `stamp` is an RFC3339 STRING and `memory_links.valid_until`
+        // is `TIMESTAMPTZ`; postgres refuses a bare `text` parameter there
+        // (`column "valid_until" is of type timestamp with time zone but
+        // expression is of type text`). This mirror UPDATE runs AFTER the AGE
+        // `SET r.valid_until` in the SAME transaction, so the error rolled the
+        // AGE write back too and `is_age_runtime_failure` then re-ran the whole
+        // invalidation through `kg_invalidate_cte` — relational-only. Net
+        // effect: the AGE edge was NEVER invalidated and `kg_query`'s
+        // current view kept serving it. Latent since v0.7.0 because the cypher
+        // read above was parse-rejected long before control reached this line.
         sqlx::query(
-            "UPDATE memory_links SET valid_until = $4 \
+            "UPDATE memory_links SET valid_until = $4::TIMESTAMPTZ \
              WHERE source_id = $1 AND target_id = $2 AND relation = $3",
         )
         .bind(source_id)
@@ -8515,33 +8628,50 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err(CTX_SET_SEARCH_PATH, e))?;
 
-        // The projection types each edge by its relation label
-        // (`project_link_into_age`), so the P filter is a label
-        // alternation on the variable-length pattern. `max_depth` is
-        // clamped upstream (no injection surface); the start id binds
-        // through AGE's `$vars` JSON.
-        let labels = crate::models::MemoryLinkRelation::LINEAGE
-            .iter()
-            .map(|r| r.as_str())
-            .collect::<Vec<_>>()
-            .join("|");
+        // #2511 — the pattern is UNTYPED (`-[r*1..N]->`) and the
+        // provenance-subset P filter is applied Rust-side per edge.
+        //
+        // Pre-#2511 this built a relationship-type ALTERNATION
+        // (`-[r:derived_from|reflects_on|derives_from*1..N]->`), which
+        // Apache AGE's cypher parser does not implement AT ALL —
+        // `ERROR: syntax error at or near "|"`, with or without a
+        // variable-length quantifier, verified live on AGE 1.7.0. Together
+        // with `length(r)` (which parses but raises `length() argument must
+        // resolve to a scalar` at RUNTIME on a var-length pattern's
+        // relationship list) that made the whole statement unusable, so
+        // `lineage` on AGE has always fallen through to `lineage_cte`.
+        //
+        // The Rust-side P filter is STRICTER than a per-hop label match has
+        // to be, and deliberately so: EVERY edge on the path must be in P,
+        // mirroring `lineage_cte`'s `relation IN (...)` on both the seed and
+        // the recursive step. An untyped traversal would otherwise surface a
+        // path that hops through a `related_to` edge, which the CTE can
+        // never return — a wrong result, not merely a different one.
+        //
+        // `max_depth` is clamped upstream (no injection surface); the start
+        // id binds through AGE's `$vars` JSON.
         let pattern = if ancestors {
-            format!("(a)-[r:{labels}*1..{max_depth}]->(b)")
+            format!("(a)-[r*1..{max_depth}]->(b)")
         } else {
-            format!("(a)<-[r:{labels}*1..{max_depth}]-(b)")
+            format!("(a)<-[r*1..{max_depth}]-(b)")
         };
         let cypher = format!(
             "MATCH p = {pattern} WHERE a.id = $start_id \
-             RETURN b.id AS node_id, last(r).relation AS relation, length(r) AS depth"
+             RETURN b.id AS node_id, relationships(p) AS path_edges"
         );
-        let params_lit = age_params_literal(&[("start_id", root_id)]);
+        // #2511 — bare `agtype`-typed `$1` Param, not an inlined
+        // `'{…}'::agtype` literal (which AGE's analyzer rejects). See
+        // [`Agtype`].
+        let params = age_params_jsonb(&[("start_id", root_id)]);
         let sql = format!(
-            "SELECT node_id, relation, depth FROM cypher('memory_graph', $$ {cypher} $$, \
-             {params_lit}) AS (node_id agtype, relation agtype, depth agtype)"
+            "SELECT node_id, path_edges FROM cypher('memory_graph', $$ {cypher} $$, \
+             $1) AS (node_id agtype, path_edges agtype)"
         );
 
-        // #1482 — per-call-unique cypher text; run unnamed.
+        // #1482 — per-call-unique cypher text (label alternation +
+        // interpolated depth); run unnamed.
         let rows = sqlx::query(&sql)
+            .bind(Agtype(params))
             .persistent(false)
             .fetch_all(&mut *tx)
             .await
@@ -8555,23 +8685,26 @@ impl PostgresStore {
         let mut best: std::collections::BTreeMap<String, (String, usize)> =
             std::collections::BTreeMap::new();
         for r in &rows {
-            use sqlx::Row;
-            let node_id: String = r
-                .try_get::<String, _>("node_id")
-                .map_err(|e| to_store_err("read node_id", e))?;
-            let relation: String = r
-                .try_get::<String, _>(READ_RELATION_COL)
-                .map_err(|e| to_store_err(READ_RELATION, e))?;
-            let depth_raw: String = r
-                .try_get::<String, _>("depth")
-                .map_err(|e| to_store_err(READ_DEPTH, e))?;
-            let depth: usize = strip_agtype_quotes(&depth_raw).parse().map_err(|_| {
-                StoreError::IntegrityFailed {
-                    detail: format!("non-numeric AGE depth: {depth_raw}"),
-                }
-            })?;
+            // #2511 — agtype cells, not `String` cells (see `age_cell_text_opt`).
+            let node_id = age_cell_text_required(r, "node_id", "read node_id")?;
+            let edges_raw = age_cell_text_required(r, AGE_COL_PATH_EDGES, READ_PATH_EDGES)?;
+            let edges = age_decode_entity_list(AGE_COL_PATH_EDGES, &edges_raw)?;
+            if edges.is_empty() {
+                // A `*1..N` pattern cannot match a zero-length path.
+                return Err(StoreError::IntegrityFailed {
+                    detail: "AGE lineage path carried no relationships".to_string(),
+                });
+            }
+            // #2511 — the provenance-subset P filter AGE's parser cannot
+            // express as a label alternation. EVERY edge must be in P, so a
+            // path that hops through a non-lineage relation is dropped
+            // exactly as `lineage_cte` drops it.
+            if !edges.iter().all(age_edge_is_lineage_relation) {
+                continue;
+            }
+            let depth = edges.len();
             let node_id = strip_agtype_quotes(&node_id).to_string();
-            let relation = strip_agtype_quotes(&relation).to_string();
+            let relation = age_last_edge_relation(&edges);
             match best.get(&node_id) {
                 Some((_, d)) if *d <= depth => {}
                 _ => {
@@ -12004,6 +12137,17 @@ const READ_RELATION: &str = "read relation";
 const READ_RELATION_COL: &str = "relation";
 /// v0.9.0 G13-mem (#1859) — shared `read depth` decode-context label.
 const READ_DEPTH: &str = "read depth";
+/// #2511 — shared `relationships(p)` result-column name. Every AGE read that
+/// re-derives a path's semantics Rust-side (`kg_query_cypher`,
+/// `lineage_cypher`) projects the edge list under this ONE name, so the
+/// `AS (…)` column list, the `age_cell_text` lookup and the
+/// `age_decode_entity_list` error context cannot drift apart.
+const AGE_COL_PATH_EDGES: &str = "path_edges";
+/// #2511 — shared `nodes(p)` result-column name. Twin of
+/// [`AGE_COL_PATH_EDGES`].
+const AGE_COL_PATH_NODES: &str = "path_nodes";
+/// #2511 — decode-context label for the [`AGE_COL_PATH_EDGES`] cell.
+const READ_PATH_EDGES: &str = "read path_edges";
 const READ_TARGET_ID: &str = "read target_id";
 const READ_VALID_FROM: &str = "read valid_from";
 const READ_VALID_UNTIL: &str = "read valid_until";
@@ -12918,6 +13062,54 @@ fn is_age_runtime_failure(err: &StoreError) -> bool {
     matches!(err, StoreError::BackendUnavailable { .. })
 }
 
+/// #2511 — `reason` field value for a fallback caused by an unreachable
+/// AGE substrate (extension dropped, `LOAD` refused, projection gone).
+/// Transient / operator-actionable.
+const AGE_FALLBACK_REASON_UNREACHABLE: &str = "age_substrate_unreachable";
+
+/// #2511 — `reason` field value for a fallback caused by AGE REJECTING a
+/// statement this adapter built. Permanent / developer-actionable.
+const AGE_FALLBACK_REASON_STATEMENT_DEFECT: &str = "adapter_statement_rejected";
+
+/// #2511 — substrings that identify an AGE failure as a MALFORMED
+/// STATEMENT built by this adapter rather than an unreachable substrate.
+///
+/// `to_store_err` collapses every sqlx failure into
+/// `StoreError::BackendUnavailable`, dropping the SQLSTATE, so
+/// [`is_age_runtime_failure`] cannot tell "AGE is gone" (transient,
+/// operator-actionable, correctly reported as a degradation) apart from
+/// "AGE refused the SQL we generated" (permanent, developer-actionable,
+/// and MIS-reported as a degradation for every request on every AGE
+/// deployment — the #2511 data-honesty defect). Classifying on the
+/// message text is the only signal left at this layer.
+///
+/// Deliberately narrow: each entry is a shape only AGE's own parser /
+/// analyzer emits for a statement we constructed. An unrecognised error
+/// falls through to the substrate-unreachable arm, so the classifier can
+/// only ever UNDER-report the defect class — never mislabel a genuine
+/// outage as a code bug. Degrade, never corrupt.
+const AGE_STATEMENT_DEFECT_SIGNATURES: &[&str] = &[
+    // `convert_cypher_to_subquery` rejecting a non-`Param` third
+    // argument — the #2511 defect verified on AGE 1.6.0 and 1.7.0.
+    "third argument of cypher function must be a parameter",
+    // AGE requires the `AS (col agtype)` column definition list.
+    "a column definition list is required",
+    // The cypher body itself failed to parse.
+    "syntax error at or near",
+];
+
+/// #2511 — true when an AGE-side failure is a statement this adapter
+/// built wrong. See [`AGE_STATEMENT_DEFECT_SIGNATURES`].
+fn is_age_adapter_statement_defect(err: &StoreError) -> bool {
+    let StoreError::BackendUnavailable { detail, .. } = err else {
+        return false;
+    };
+    let lowered = detail.to_ascii_lowercase();
+    AGE_STATEMENT_DEFECT_SIGNATURES
+        .iter()
+        .any(|sig| lowered.contains(sig))
+}
+
 /// v0.9.0 G13-mem (#1859) — validate a lineage-walk depth against the
 /// shared [`crate::storage::LINEAGE_MAX_DEPTH`] budget (postgres twin of
 /// the `db::lineage_traverse` gate, byte-identical error text).
@@ -12957,12 +13149,30 @@ fn lineage_relation_in_list() -> String {
 /// The matching operator-side surface is documented in
 /// `docs/kg-backend-fallback.md`.
 fn warn_age_fallback(op: &str, source_id: &str, err: &StoreError) {
+    if is_age_adapter_statement_defect(err) {
+        tracing::warn!(
+            target: TRACE_TARGET_KG_ADAPTER_DEFECT,
+            op = op,
+            source_id = source_id,
+            backend = "age",
+            fallback = "cte",
+            reason = AGE_FALLBACK_REASON_STATEMENT_DEFECT,
+            error = %err,
+            "AGE REJECTED THE STATEMENT THIS ADAPTER BUILT (AGE is reachable \
+             — this is NOT a substrate outage): kg_{op}=<{source_id}> was \
+             served by the relational CTE while the reported kg_backend \
+             stays `age`. Permanent adapter defect, not a transient \
+             degradation — report it with the error text (#2511)."
+        );
+        return;
+    }
     tracing::warn!(
         target: TRACE_TARGET_KG,
         op = op,
         source_id = source_id,
         backend = "age",
         fallback = "cte",
+        reason = AGE_FALLBACK_REASON_UNREACHABLE,
         error = %err,
         "AGE backend unreachable; falling back to CTE for kg_{op}=<{source_id}>"
     );
@@ -12972,6 +13182,25 @@ fn warn_age_fallback(op: &str, source_id: &str, err: &StoreError) {
 /// the two-id `find_paths` operation, where the structured event
 /// needs both `source_id` and `target_id`.
 fn warn_age_fallback_pair(op: &str, source_id: &str, target_id: &str, err: &StoreError) {
+    if is_age_adapter_statement_defect(err) {
+        tracing::warn!(
+            target: TRACE_TARGET_KG_ADAPTER_DEFECT,
+            op = op,
+            source_id = source_id,
+            target_id = target_id,
+            backend = "age",
+            fallback = "cte",
+            reason = AGE_FALLBACK_REASON_STATEMENT_DEFECT,
+            error = %err,
+            "AGE REJECTED THE STATEMENT THIS ADAPTER BUILT (AGE is reachable \
+             — this is NOT a substrate outage): \
+             kg_{op}=<{source_id}->{target_id}> was served by the relational \
+             CTE while the reported kg_backend stays `age`. Permanent adapter \
+             defect, not a transient degradation — report it with the error \
+             text (#2511)."
+        );
+        return;
+    }
     tracing::warn!(
         target: TRACE_TARGET_KG,
         op = op,
@@ -12979,6 +13208,7 @@ fn warn_age_fallback_pair(op: &str, source_id: &str, target_id: &str, err: &Stor
         target_id = target_id,
         backend = "age",
         fallback = "cte",
+        reason = AGE_FALLBACK_REASON_UNREACHABLE,
         error = %err,
         "AGE backend unreachable; falling back to CTE for kg_{op}=<{source_id}->{target_id}>"
     );
@@ -13308,27 +13538,186 @@ fn assert_age_id_safe(id: &str) -> Result<(), String> {
 ///
 /// `max_depth` is interpolated into the variable-length pattern (Cypher
 /// forbids a parameter there); it is clamped by `validate_depth` upstream
-/// so it carries no injection surface. The start id and the `$now`
-/// as-of cut-off are bound through AGE's `$vars` JSON
-/// (`age_params_literal`), never interpolated.
+/// so it carries no injection surface. The start id is bound through
+/// AGE's `$vars` JSON (`age_params_jsonb` + the [`Agtype`] bind, #2511),
+/// never interpolated.
 ///
-/// The `ALL(e IN relationships(p) ...)` guard drops any path that
-/// traverses an edge whose `valid_until` is non-null and not in the
-/// future, mirroring the relational CTE's
-/// `valid_until IS NULL OR valid_until > NOW()` filter. The comparison
-/// is a lexicographic agtype string compare against an RFC3339 `+00:00`
-/// stamp, which orders chronologically because the invalidate write
-/// path stores `valid_until` in the same `to_rfc3339` form.
+/// # #2511 — only AGE-PARSEABLE constructs may appear here
+///
+/// The pre-#2511 body used two constructs Apache AGE's Cypher parser
+/// does NOT implement, verified live against AGE 1.7.0 (and matching the
+/// v0.7.0 ship-hardening note on `find_paths_cypher`, which hit the same
+/// wall for `reduce`):
+///
+/// * `ALL(e IN relationships(p) WHERE …)` — the list predicate for the
+///   #1689 temporal-validity guard. `ERROR: syntax error at or near "("`.
+///   `ANY` / `NONE` / `filter(…)` / list comprehensions
+///   (`[e IN … WHERE …]`) are all equally unsupported.
+/// * `reduce(s = a.id, n IN nodes(p)[1..] | s + '->' + n.id)` — the
+///   `a->b->c` path-string builder. `ERROR: syntax error at or near "|"`.
+///   `extract(…|…)` fails identically.
+/// * `length(r)` over a variable-length pattern's relationship LIST —
+///   `ERROR: length() argument must resolve to a scalar`.
+///
+/// Any ONE of those made the statement unparseable, so the AGE branch
+/// could never return a row on ANY deployment — the dispatcher's
+/// `is_age_runtime_failure` arm silently re-served every request from
+/// the relational CTE while `Capabilities.kg_backend` reported `Age`.
+/// (Fixing only #2511's `'{…}'::agtype` third argument would have left
+/// that intact.)
+///
+/// The body is now reduced to the SMALLEST AGE surface that can carry the
+/// contract — a plain variable-length `MATCH`, one scalar (`b.id`), and
+/// `nodes(p)` / `relationships(p)`, which return the full vertex / edge
+/// payloads. Everything derived (`relation`, `depth`, the path string,
+/// the temporal filter, node-uniqueness) is computed Rust-side in
+/// [`PostgresStore::kg_query_cypher`] from those payloads, so the
+/// traversal semantics stay identical to `kg_query_cte_filtered` (the
+/// #648 parity contract) instead of being dropped — and there is far
+/// less Cypher surface left for a future AGE version to reject.
+///
+/// Anything added here MUST be probed against the certified AGE build
+/// first: an unsupported construct does not fail loudly, it degrades the
+/// whole backend to the CTE.
 fn build_kg_query_current_view_cypher(max_depth: usize) -> String {
     format!(
         "MATCH p = (a)-[r:related_to*1..{max_depth}]->(b) \
          WHERE a.id = $start_id \
-           AND ALL(e IN relationships(p) WHERE e.valid_until IS NULL OR e.valid_until > $now) \
          RETURN b.id AS target_id, \
-                last(r).relation AS relation, \
-                length(r) AS depth, \
-                reduce(s = a.id, n IN nodes(p)[1..] | s + '->' + n.id) AS path"
+                nodes(p) AS path_nodes, \
+                relationships(p) AS path_edges"
     )
+}
+
+/// #2511 — the relation of the LAST edge on a decoded `relationships(p)`
+/// payload, the Rust-side twin of the `last(r).relation` projection.
+///
+/// Prefers the `relation` PROPERTY (`project_link_into_age` writes it on
+/// every MERGEd edge) and falls back to the edge LABEL, which the same
+/// projection sets to the identical SAL relation value — so a
+/// pre-#2377 edge that carries no property still reports its relation
+/// rather than an empty string.
+/// #2511 — is this decoded AGE edge one of the derivation-provenance
+/// relations `MemoryLinkRelation::LINEAGE` (`P`)?
+///
+/// The Rust-side twin of the relationship-type ALTERNATION
+/// (`-[r:derived_from|reflects_on|derives_from*1..N]->`) that Apache AGE's
+/// parser does not implement. Reads the same SSOT set `lineage_cte`'s
+/// `relation IN (...)` list is built from, so the two branches can never
+/// drift on which relations count as provenance.
+///
+/// Prefers the `relation` PROPERTY and falls back to the edge LABEL — the
+/// projection writes the identical SAL relation value to both.
+fn age_edge_is_lineage_relation(edge: &serde_json::Value) -> bool {
+    let name = edge
+        .get(field_names::PROPERTIES)
+        .and_then(|p| p.get("relation"))
+        .and_then(|r| r.as_str())
+        .or_else(|| edge.get("label").and_then(|l| l.as_str()));
+    let Some(name) = name else {
+        // Fail CLOSED: an edge whose relation cannot be read is NOT
+        // provably in P, so it must not widen a provenance walk.
+        return false;
+    };
+    crate::models::MemoryLinkRelation::LINEAGE
+        .iter()
+        .any(|r| r.as_str() == name)
+}
+
+fn age_last_edge_relation(edges: &[serde_json::Value]) -> String {
+    edges
+        .last()
+        .and_then(|e| {
+            e.get(field_names::PROPERTIES)
+                .and_then(|p| p.get("relation"))
+                .and_then(|r| r.as_str())
+                .or_else(|| e.get("label").and_then(|l| l.as_str()))
+        })
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// #2511 — AGE renders a list of graph entities in its own text format,
+/// which is JSON plus a `::vertex` / `::edge` / `::path` type tag after
+/// each element. Strip the tags, parse, and return the elements.
+///
+/// Shared by [`PostgresStore::kg_query_cypher`] and
+/// [`PostgresStore::find_paths_cypher`] so the two AGE readers cannot
+/// drift on the payload contract.
+fn age_decode_entity_list(what: &str, raw: &str) -> StoreResult<Vec<serde_json::Value>> {
+    // QC Obs #8 (2026-05-20) / #1895 — cap the echoed payload at 200
+    // CHARS (never a raw byte index: `&s[..200]` panics mid-UTF-8) so an
+    // unbounded or adversarial AGE response can't blow up the log body.
+    let preview = |s: &str| -> String {
+        if s.len() <= 200 {
+            s.to_string()
+        } else {
+            let end = s.char_indices().nth(200).map_or(s.len(), |(i, _)| i);
+            format!("{}…<{}b truncated>", &s[..end], s.len() - end)
+        }
+    };
+    let json_payload = raw
+        .replace("::vertex", "")
+        .replace("::edge", "")
+        .replace("::path", "");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&json_payload).map_err(|e| StoreError::IntegrityFailed {
+            detail: format!("non-JSON AGE {what} payload: {}: {e}", preview(raw)),
+        })?;
+    match parsed {
+        serde_json::Value::Array(items) => Ok(items),
+        _ => Err(StoreError::IntegrityFailed {
+            detail: format!("AGE {what} is not an array: {}", preview(raw)),
+        }),
+    }
+}
+
+/// #2511 — pull `properties.id` out of each vertex of a decoded
+/// `nodes(p)` payload, in traversal order.
+fn age_vertex_ids(entities: &[serde_json::Value]) -> Vec<String> {
+    entities
+        .iter()
+        .filter_map(|v| {
+            v.get(field_names::PROPERTIES)
+                .and_then(|p| p.get("id"))
+                .and_then(|i| i.as_str())
+                .map(String::from)
+        })
+        .collect()
+}
+
+/// #2511 — Rust-side twin of the #1689 per-edge temporal-validity guard
+/// that AGE's parser cannot express (`ALL(e IN relationships(p) WHERE
+/// e.valid_until IS NULL OR e.valid_until > $now)`).
+///
+/// `true` when EVERY edge on the path is currently valid. An edge with no
+/// `valid_until` property was never invalidated and stays visible (the
+/// `IS NULL` arm is load-bearing: relations like `supersedes`, and any
+/// never-retracted `related_to`, carry no such property — without it the
+/// filter would silently drop uninvalidated paths). A non-null
+/// `valid_until` at or before `now` hides the path, mirroring the
+/// relational `valid_until IS NULL OR valid_until > NOW()`.
+///
+/// The comparison is a lexicographic string compare against an RFC3339
+/// `+00:00` stamp, which orders chronologically because the invalidate
+/// write path (`kg_invalidate_cypher`) and the projection
+/// (`project_link_into_age`, #2377) both store `valid_until` in the same
+/// `to_rfc3339()` form byte-for-byte.
+///
+/// Fail-CLOSED on a malformed stamp: a `valid_until` that is present but
+/// not a string is treated as INVALIDATING the path. A derived-graph read
+/// must never widen visibility on unparseable data.
+fn age_path_edges_all_current(edges: &[serde_json::Value], now_stamp: &str) -> bool {
+    edges.iter().all(|e| {
+        match e
+            .get(field_names::PROPERTIES)
+            .and_then(|p| p.get(field_names::VALID_UNTIL))
+        {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::String(vu)) => vu.as_str() > now_stamp,
+            Some(_) => false,
+        }
+    })
 }
 
 /// #1689 — builds the current-view `find_paths` Cypher body for the AGE
@@ -13347,6 +13736,28 @@ fn build_kg_query_current_view_cypher(max_depth: usize) -> String {
 /// (relations like `supersedes`, or never-retracted `related_to`, have no
 /// `valid_until` property), so the filter only drops genuinely-invalidated
 /// edges — it can never silently drop uninvalidated paths.
+///
+/// # KNOWN DEFECT — same class as #2511, deliberately NOT fixed here
+///
+/// `ALL(e IN relationships(p) WHERE …)` is **unparseable on Apache AGE**
+/// (`ERROR: syntax error at or near "("`, verified live on AGE 1.7.0 —
+/// `ANY` / `NONE` / `filter(…)` / list comprehensions fail identically).
+/// So this whole statement is rejected at parse time and
+/// [`PostgresStore::find_paths`]'s `is_age_runtime_failure` arm has been
+/// silently serving EVERY AGE-routed `find_paths` from
+/// `find_paths_cte` — the #2511 defect class, reached through a different
+/// door (this builder uses the 2-arg `cypher()` form, so the #2511
+/// third-argument fix does not touch it).
+///
+/// The `kg_query` twin was fixed by moving the guard Rust-side (see
+/// [`build_kg_query_current_view_cypher`] +
+/// [`age_path_edges_all_current`]). Porting that here needs two decisions
+/// that warrant their own review and are NOT taken in #2511's scope:
+/// (a) `LIMIT {cap}` currently applies BEFORE the guard, so a Rust-side
+/// filter can return fewer than `cap` paths unless the fetch over-fetches;
+/// (b) whether `find_paths_cte`'s visibility/lifecycle semantics need the
+/// same explicit re-derivation `kg_query_cypher` now performs. Tracked as
+/// a residual on #2511.
 fn build_find_paths_current_view_cypher(
     source_id: &str,
     target_id: &str,
@@ -13373,40 +13784,42 @@ fn build_find_paths_current_view_cypher(
     ))
 }
 
-fn age_params_literal(pairs: &[(&str, &str)]) -> String {
-    let mut map = serde_json::Map::with_capacity(pairs.len());
-    for (k, v) in pairs {
-        map.insert(
-            (*k).to_string(),
-            serde_json::Value::String((*v).to_string()),
-        );
-    }
-    let json = serde_json::Value::Object(map).to_string();
-    // SQL-escape single quotes by doubling them.
-    let escaped = json.replace('\'', "''");
-    format!("'{escaped}'::agtype")
-}
-
 /// v0.7.0.1 G2 — sqlx-bindable wrapper for AGE's `agtype` parameter
-/// type.
+/// type. **The ONLY supported way this adapter passes a params dict to
+/// `cypher()`** (#2511).
 ///
 /// The cypher() set-returning function's third argument is a `cstring`
-/// at the catalog level but AGE 1.5.0's `convert_cypher_to_subquery`
-/// analyzer rejects ANY non-`Param` node there: literals
-/// (`'…'::agtype`), casts (`$1::agtype`), and scalar subqueries all
-/// fail with `third argument of cypher function must be a parameter`.
+/// at the catalog level but AGE's `convert_cypher_to_subquery` analyzer
+/// rejects ANY non-`Param` node there: literals (`'…'::agtype`), casts
+/// over a `text`-declared param (`$1::agtype`), and scalar subqueries
+/// all fail with `third argument of cypher function must be a
+/// parameter`. Verified live on AGE **1.6.0** (the CI-certified image)
+/// and **1.7.0** (the SSOT-pinned version) — a `PREPARE q(agtype) …
+/// cypher(…, $1)` round-trip is accepted, while both
+/// `'{…}'::agtype` and `PREPARE q(text) … cypher(…, $1::agtype)` are
+/// rejected at parse analysis.
 ///
-/// PostgreSQL's prepared-statement parameter inference DOES resolve a
-/// bare `$N` to `agtype` from the function signature when the caller
-/// declares the parameter as untyped (`unknown` OID `705`). sqlx's
-/// default `String` encoder declares the parameter as `text`, which
-/// overrides inference and re-introduces the literal-cast shape.
+/// The parameter must therefore reach parse analysis as a BARE,
+/// `agtype`-TYPED `Param`. This wrapper declares its sqlx type as
+/// `ag_catalog.agtype` by name, so sqlx resolves the real type OID and
+/// sends it in the `Parse` message — the wire equivalent of
+/// `PREPARE q(agtype)` — and the call sites write a bare `$1` with no
+/// SQL-side cast. (`resolve_type_id` runs before `Parse` for the
+/// UNNAMED statement too, so `.persistent(false)` is safe.)
 ///
-/// This wrapper carries a JSON-encoded params dictionary and binds
-/// itself with the `agtype` type oid name so PostgreSQL ships the
-/// parameter as the correct type without needing a SQL-side cast at
-/// the cypher() call site. The on-wire format for `agtype` text is
-/// the same JSON shape AGE accepts inline (e.g. `{"start_id":"…"}`).
+/// #2511 postmortem: a former `age_params_literal` helper inlined the
+/// dict as `'{…}'::agtype` at the four AGE READ sites on the strength of
+/// a v0.7.0 comment that mis-attributed the rejection to the CAST rather
+/// than to the parameter's declared type. Every AGE-routed `kg_query` /
+/// `kg_timeline` / `lineage` / `kg_invalidate` therefore failed at parse
+/// analysis and was silently re-served by the relational CTE while
+/// `Capabilities.kg_backend` still reported `Age`. The helper is deleted
+/// rather than deprecated so the rejected shape cannot be reintroduced;
+/// `tests/age_cypher_param_binding_2511.rs` pins that mechanically.
+///
+/// The on-wire text format for `agtype` is the same JSON shape AGE
+/// accepts inline (e.g. `{"start_id":"…"}`) — build it with
+/// [`age_params_jsonb`].
 struct Agtype(String);
 
 impl sqlx::Type<sqlx::Postgres> for Agtype {
@@ -13951,6 +14364,77 @@ async fn unproject_link_from_age(
         .await
         .map_err(|e| to_store_err("unproject link edge from AGE", e))?;
     Ok(())
+}
+
+/// #2511 — read one `agtype` cell as its raw text payload.
+///
+/// sqlx has no first-class `agtype` decoder, and `try_get::<String, _>`
+/// is NOT a substitute: sqlx sends every parameter and receives every
+/// result in PostgreSQL's BINARY format, and AGE's binary wire form is a
+/// `version` byte (`0x01`) followed by the text payload. A `String`
+/// decode therefore either fails the type check outright or yields a
+/// leading `0x01` byte glued to the value.
+///
+/// That bug sat latent from v0.7.0 until #2511: the AGE read branches
+/// were rejected at parse analysis, so `rows` was always empty and the
+/// decode loops never ran. Fixing the statements made the decode
+/// reachable for the first time. Route every agtype cell through the
+/// [`Agtype`] wrapper, which strips the version byte in binary mode and
+/// passes text mode through unchanged.
+///
+/// Returns the payload verbatim (AGE's own quoting intact) so callers can
+/// apply [`strip_agtype_quotes`] or [`agtype_optional_string`] exactly as
+/// the shape requires.
+///
+/// # An ABSENT property is SQL NULL, not the agtype text `null`
+///
+/// Verified live on AGE 1.7.0: projecting a property a node/edge does not
+/// carry (`RETURN n.missing AS x`) yields a **SQL NULL** `agtype` cell
+/// (`x IS NULL` → true), NOT an agtype scalar spelling `null`. So this
+/// reader is `Option`-returning and every caller must state which it
+/// wants. `try_get::<Agtype, _>` (or the pre-#2511
+/// `try_get::<String, _>`) on such a cell raises sqlx's `UnexpectedNull`,
+/// which [`to_store_err`] maps to `BackendUnavailable` — i.e.
+/// [`is_age_runtime_failure`] treats a perfectly normal absent property as
+/// an AGE OUTAGE and silently re-serves the request from the CTE.
+///
+/// That is exactly how #2511's follow-up regression happened:
+/// `kg_invalidate_cypher` reads `prior` = `r.valid_until`, which is ABSENT
+/// on every never-yet-invalidated edge, so the read errored, the whole
+/// cypher invalidation fell back to `kg_invalidate_cte`, and only the
+/// RELATIONAL mirror got `valid_until` — leaving the AGE edge permanently
+/// un-invalidated while `kg_query`'s current view (correctly) kept
+/// returning it. The bug pre-dates #2511 but was unreachable while the
+/// statements were rejected at parse analysis.
+fn age_cell_text_opt(
+    row: &sqlx::postgres::PgRow,
+    col: &str,
+    what: &str,
+) -> StoreResult<Option<String>> {
+    use sqlx::Row as _;
+    let raw: Option<Agtype> = row
+        .try_get::<Option<Agtype>, _>(col)
+        .map_err(|e| to_store_err(what, e))?;
+    Ok(raw.map(|a| a.0))
+}
+
+/// #2511 — [`age_cell_text_opt`] for a cell the projection contract says is
+/// ALWAYS present (a matched node's `id`, a path's `nodes(p)`/
+/// `relationships(p)`).
+///
+/// A NULL here is a genuine projection-integrity violation, so it raises
+/// `IntegrityFailed` — which is deliberately NOT an
+/// [`is_age_runtime_failure`], so it propagates to the caller instead of
+/// being laundered into another silent CTE fallback. Fail loudly on
+/// corrupt derived state; never serve a wrong answer quietly.
+fn age_cell_text_required(
+    row: &sqlx::postgres::PgRow,
+    col: &str,
+    what: &str,
+) -> StoreResult<String> {
+    age_cell_text_opt(row, col, what)?.ok_or_else(|| StoreError::IntegrityFailed {
+        detail: format!("AGE returned NULL for the required column {col:?} ({what})"),
+    })
 }
 
 /// from sqlx; the AGE branch needs this helper to mirror the same
@@ -26560,42 +27044,153 @@ mod tests {
     }
 
     #[test]
-    fn age_params_literal_renders_json_dict() {
-        // v0.7.0 Wave-3 Continuation 5 — wire-shape contract for the
-        // AGE `cypher()` third-arg helper. AGE rejects `$1::agtype`
-        // (the third arg must be a bare Param, not a FuncExpr cast),
-        // so we inline the params as a SQL agtype literal. Single
-        // quotes in the JSON value must be SQL-escaped (`''`); the
-        // outer wrap is `'…'::agtype`.
-        assert_eq!(age_params_literal(&[("k", "v")]), "'{\"k\":\"v\"}'::agtype");
+    fn age_params_jsonb_renders_bare_json_dict_for_the_agtype_bind() {
+        // #2511 — wire-shape contract for the AGE `cypher()` third-arg
+        // params dict. The value is BOUND through the [`Agtype`] sqlx
+        // wrapper as a bare `agtype`-typed `$1` Param, so the helper
+        // must emit PLAIN JSON: no surrounding single quotes, no
+        // `::agtype` cast, and NO SQL quote-doubling (an apostrophe is
+        // ordinary payload on the binary bind path — doubling it would
+        // CORRUPT the value, which is exactly what the deleted
+        // `age_params_literal` did to any id/timestamp containing one).
+        assert_eq!(age_params_jsonb(&[("k", "v")]), "{\"k\":\"v\"}");
         assert_eq!(
-            age_params_literal(&[("a", "1"), ("b", "two")]),
-            "'{\"a\":\"1\",\"b\":\"two\"}'::agtype"
+            age_params_jsonb(&[("a", "1"), ("b", "two")]),
+            "{\"a\":\"1\",\"b\":\"two\"}"
         );
-        // SQL-escape: a literal apostrophe in the value gets doubled.
         assert_eq!(
-            age_params_literal(&[("name", "O'Reilly")]),
-            "'{\"name\":\"O''Reilly\"}'::agtype"
+            age_params_jsonb(&[("name", "O'Reilly")]),
+            "{\"name\":\"O'Reilly\"}"
         );
         // Empty dict is harmless (AGE accepts an empty params object).
-        assert_eq!(age_params_literal(&[]), "'{}'::agtype");
+        assert_eq!(age_params_jsonb(&[]), "{}");
+        // Belt-and-braces: the rejected shape must never reappear.
+        for rendered in [
+            age_params_jsonb(&[("k", "v")]),
+            age_params_jsonb(&[]),
+            age_params_jsonb(&[("name", "O'Reilly")]),
+        ] {
+            assert!(
+                !rendered.contains("::agtype") && !rendered.starts_with('\''),
+                "params dict must be a bare JSON bind payload, not a SQL \
+                 agtype literal (#2511): {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_2511_adapter_statement_defect_classifier_splits_the_two_causes() {
+        // #2511 fallback honesty. An AGE analyzer/parser rejection of a
+        // statement THIS ADAPTER built is a permanent developer-facing
+        // defect and must be reported as such, NOT as the transient
+        // "AGE backend unreachable" degradation it was laundered into.
+        let rejected = StoreError::BackendUnavailable {
+            backend: "postgres".to_string(),
+            detail: "cypher kg_query: error returned from database: third \
+                     argument of cypher function must be a parameter"
+                .to_string(),
+        };
+        assert!(
+            is_age_adapter_statement_defect(&rejected),
+            "the #2511 analyzer rejection must classify as an adapter defect"
+        );
+        // Still an AGE runtime failure, so the CTE fallback still fires:
+        // degrade, never hard-fail a live KG surface.
+        assert!(is_age_runtime_failure(&rejected));
+
+        // A genuine substrate outage must NOT be relabelled as a code
+        // bug — the classifier may only ever under-report.
+        for detail in [
+            "cypher kg_query: error returned from database: relation \
+             \"ag_catalog.ag_graph\" does not exist",
+            "begin age tx: pool timed out while waiting for an open connection",
+            "cypher kg_query: error returned from database: permission denied \
+             for schema ag_catalog",
+        ] {
+            let outage = StoreError::BackendUnavailable {
+                backend: "postgres".to_string(),
+                detail: detail.to_string(),
+            };
+            assert!(
+                !is_age_adapter_statement_defect(&outage),
+                "a substrate outage must not be reported as an adapter defect: {detail}"
+            );
+            assert!(is_age_runtime_failure(&outage));
+        }
+
+        // Non-`BackendUnavailable` errors never reach the fallback arm.
+        assert!(!is_age_adapter_statement_defect(
+            &StoreError::InvalidInput {
+                detail: "third argument of cypher function must be a parameter".to_string(),
+            }
+        ));
+    }
+
+    #[test]
+    fn issue_2511_reason_labels_are_distinct_and_stable() {
+        // Operators alert on these `reason` values; keep them pinned so a
+        // rename shows up in review alongside the dashboard/doc update.
+        assert_eq!(AGE_FALLBACK_REASON_UNREACHABLE, "age_substrate_unreachable");
+        assert_eq!(
+            AGE_FALLBACK_REASON_STATEMENT_DEFECT,
+            "adapter_statement_rejected"
+        );
+        assert_eq!(
+            TRACE_TARGET_KG_ADAPTER_DEFECT,
+            "store::postgres::kg::adapter_defect"
+        );
+        assert!(TRACE_TARGET_KG_ADAPTER_DEFECT.starts_with(TRACE_TARGET_KG));
     }
 
     #[test]
     fn issue_1689_kg_query_cypher_excludes_invalidated_edges() {
-        // #1689 — the AGE current-view kg_query body MUST carry a
-        // per-edge temporal-validity guard so invalidated edges (which
-        // `kg_invalidate_cypher` SETs `valid_until` on rather than
-        // deleting) never appear in a current-view traversal. This pins
-        // the query text without needing a live AGE instance; the
-        // dispatcher's CTE fallback covers the runtime-rejection case.
+        // #1689 — invalidated edges (which `kg_invalidate_cypher` SETs
+        // `valid_until` on rather than deleting) must never appear in a
+        // current-view traversal.
+        //
+        // #2511 — the guard is NO LONGER in the Cypher text: AGE's parser
+        // does not implement `ALL(e IN … WHERE …)` (nor `ANY`/`NONE`/
+        // `filter`/list comprehensions), so pinning it there pinned a
+        // statement AGE rejects wholesale — which is exactly how the
+        // guard's own regression test kept passing while the entire AGE
+        // branch was being silently served by the CTE. The body must now
+        // carry `relationships(p)` so the Rust-side twin
+        // (`age_path_edges_all_current`, unit-tested directly) can apply
+        // it, and it must NOT reintroduce an unparseable construct.
         let depth = 3usize;
         let cypher = build_kg_query_current_view_cypher(depth);
         assert!(
-            cypher.contains(
-                "ALL(e IN relationships(p) WHERE e.valid_until IS NULL OR e.valid_until > $now)"
-            ),
-            "current-view kg_query Cypher missing the valid_until guard: {cypher}"
+            cypher.contains("relationships(p) AS path_edges"),
+            "current-view kg_query Cypher must return relationships(p) so the \
+             Rust-side valid_until guard has its input: {cypher}"
+        );
+        assert!(
+            cypher.contains("nodes(p) AS path_nodes"),
+            "current-view kg_query Cypher must return nodes(p) so the path \
+             string can be rebuilt (AGE cannot parse `reduce`): {cypher}"
+        );
+        // Constructs verified REJECTED by AGE 1.7.0's cypher parser (the
+        // first four raise `syntax error`, `length()` over a
+        // variable-length pattern's relationship LIST raises
+        // `length() argument must resolve to a scalar`).
+        for unsupported in [
+            "ALL(", "ANY(", "NONE(", "reduce(", "extract(", "filter(", "length(",
+        ] {
+            assert!(
+                !cypher.contains(unsupported),
+                "#2511: `{unsupported}` is unparseable on Apache AGE — it makes \
+                 the WHOLE statement fail and silently degrades kg_query to the \
+                 relational CTE: {cypher}"
+            );
+        }
+        // `last()` DOES parse, but the body deliberately keeps the AGE
+        // surface minimal: `relation` is derived Rust-side from the
+        // `relationships(p)` payload (`age_last_edge_relation`) so a
+        // future AGE version has less to reject.
+        assert!(
+            !cypher.contains("last("),
+            "current-view kg_query Cypher should derive `relation` Rust-side \
+             from relationships(p), not via last(): {cypher}"
         );
         // The bounded depth is interpolated, not parameterised.
         assert!(
@@ -26607,6 +27202,199 @@ mod tests {
             cypher.contains("a.id = $start_id"),
             "start id not parameterised: {cypher}"
         );
+    }
+
+    #[test]
+    fn issue_2511_rust_side_valid_until_guard_matches_the_cte_predicate() {
+        // #2511 — `age_path_edges_all_current` is the Rust-side twin of the
+        // #1689 Cypher predicate AGE cannot parse. It must reproduce
+        // `valid_until IS NULL OR valid_until > NOW()` exactly, including
+        // the load-bearing IS-NULL arm, and fail CLOSED on garbage.
+        let now = "2026-07-30T12:00:00+00:00";
+        let edge = |vu: serde_json::Value| -> serde_json::Value {
+            serde_json::json!({ "label": "related_to", "properties": { "valid_until": vu } })
+        };
+
+        // No `valid_until` property at all — never invalidated, VISIBLE.
+        assert!(age_path_edges_all_current(
+            &[serde_json::json!({ "properties": { "relation": "related_to" } })],
+            now
+        ));
+        // Explicit null — same.
+        assert!(age_path_edges_all_current(
+            &[edge(serde_json::Value::Null)],
+            now
+        ));
+        // Future cut-off — still valid.
+        assert!(age_path_edges_all_current(
+            &[edge(serde_json::json!("2026-08-01T00:00:00+00:00"))],
+            now
+        ));
+        // Past cut-off — invalidated, path hidden.
+        assert!(!age_path_edges_all_current(
+            &[edge(serde_json::json!("2026-07-01T00:00:00+00:00"))],
+            now
+        ));
+        // Boundary: `> now` is strict, so exactly-now is invalidated.
+        assert!(!age_path_edges_all_current(
+            &[edge(serde_json::json!(now))],
+            now
+        ));
+        // ONE invalidated edge anywhere on the path hides the whole path
+        // (the `ALL` semantics), regardless of position.
+        assert!(!age_path_edges_all_current(
+            &[
+                edge(serde_json::Value::Null),
+                edge(serde_json::json!("2020-01-01T00:00:00+00:00")),
+                edge(serde_json::json!("2099-01-01T00:00:00+00:00")),
+            ],
+            now
+        ));
+        // Fail CLOSED: a present-but-non-string stamp must never widen
+        // visibility.
+        assert!(!age_path_edges_all_current(
+            &[edge(serde_json::json!(1_753_000_000))],
+            now
+        ));
+        // An empty relationship list cannot happen for a *1..N pattern, but
+        // vacuous truth is the right answer if it ever does.
+        assert!(age_path_edges_all_current(&[], now));
+    }
+
+    #[test]
+    fn issue_2511_age_entity_list_decoder_strips_type_tags() {
+        // #2511 — AGE's text format is JSON + a `::vertex` / `::edge` tag
+        // per element, which is NOT valid JSON. The shared decoder must
+        // strip the tags, and must surface a typed IntegrityFailed (never
+        // panic, never silently return an empty set) on garbage.
+        let payload = "[{\"id\": 1, \"label\": \"Memory\", \"properties\": \
+             {\"id\": \"aaa\"}}::vertex, {\"id\": 2, \"properties\": \
+             {\"id\": \"bbb\"}}::vertex]";
+        let items = age_decode_entity_list("path_nodes", payload).expect("decode vertex list");
+        assert_eq!(items.len(), 2);
+        assert_eq!(age_vertex_ids(&items), vec!["aaa", "bbb"]);
+
+        // Order is traversal order — the path string depends on it.
+        assert_eq!(age_vertex_ids(&items).join("->"), "aaa->bbb");
+
+        // A vertex with no `properties.id` is skipped rather than
+        // producing an empty-string id (the caller treats a fully-empty
+        // id list as IntegrityFailed).
+        assert!(age_vertex_ids(&[serde_json::json!({ "label": "Memory" })]).is_empty());
+
+        assert!(matches!(
+            age_decode_entity_list("path_nodes", "not json"),
+            Err(StoreError::IntegrityFailed { .. })
+        ));
+        assert!(matches!(
+            age_decode_entity_list("path_nodes", "{\"not\": \"an array\"}"),
+            Err(StoreError::IntegrityFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn issue_2511_last_edge_relation_prefers_property_then_label() {
+        // #2511 — Rust-side twin of the `last(r).relation` projection.
+        // The LAST edge on the path decides the row's `relation`, matching
+        // the CTE's `ml.relation` of the final step.
+        let edge = |label: &str, prop: Option<&str>| -> serde_json::Value {
+            match prop {
+                Some(p) => {
+                    serde_json::json!({ "label": label, "properties": { "relation": p } })
+                }
+                None => serde_json::json!({ "label": label, "properties": {} }),
+            }
+        };
+        assert_eq!(
+            age_last_edge_relation(&[
+                edge("related_to", Some("related_to")),
+                edge("supersedes", Some("supersedes")),
+            ]),
+            "supersedes"
+        );
+        // Property missing (a pre-#2377 projected edge) → fall back to the
+        // edge LABEL, which `project_link_into_age` sets to the same SAL
+        // relation value. Never an empty string.
+        assert_eq!(
+            age_last_edge_relation(&[edge("derived_from", None)]),
+            "derived_from"
+        );
+        // Empty list is not reachable for a `*1..N` pattern (the caller
+        // rejects it as IntegrityFailed), but must not panic.
+        assert_eq!(age_last_edge_relation(&[]), "");
+    }
+
+    #[test]
+    fn issue_2511_agtype_optional_string_maps_absent_and_null_to_none() {
+        // #2511 follow-up — an ABSENT AGE property arrives as SQL NULL
+        // (verified live on AGE 1.7.0: `RETURN n.missing AS x` yields
+        // `x IS NULL = true`, NOT the agtype text `null`), so the read path
+        // must treat NULL as "no value" rather than as a decode failure.
+        // Reading `r.valid_until` as REQUIRED made every never-invalidated
+        // edge raise `UnexpectedNull` → `BackendUnavailable` →
+        // `is_age_runtime_failure` → silent CTE fallback, which is how the
+        // AGE-side `SET r.valid_until` never ran.
+        //
+        // Both spellings of "no value" must collapse to `None`:
+        let sql_null: Option<String> = None;
+        assert_eq!(sql_null.as_deref().and_then(agtype_optional_string), None);
+        assert_eq!(
+            Some("null".to_string())
+                .as_deref()
+                .and_then(agtype_optional_string),
+            None
+        );
+        // A real value survives, quotes stripped.
+        assert_eq!(
+            Some("\"2026-07-30T12:00:00+00:00\"".to_string())
+                .as_deref()
+                .and_then(agtype_optional_string),
+            Some("2026-07-30T12:00:00+00:00".to_string())
+        );
+    }
+
+    #[test]
+    fn issue_2511_lineage_p_filter_matches_the_cte_relation_set() {
+        // #2511 — Rust-side twin of the relationship-type ALTERNATION AGE's
+        // parser does not implement. It MUST admit exactly
+        // `MemoryLinkRelation::LINEAGE` (the same SSOT `lineage_cte`'s
+        // `relation IN (...)` list is built from) and fail CLOSED on an edge
+        // whose relation cannot be read — an unreadable edge is not PROVABLY
+        // provenance, so it must not widen a lineage walk.
+        let by_prop = |r: &str| serde_json::json!({ "properties": { "relation": r } });
+        let by_label = |r: &str| serde_json::json!({ "label": r, "properties": {} });
+
+        for rel in crate::models::MemoryLinkRelation::LINEAGE {
+            assert!(
+                age_edge_is_lineage_relation(&by_prop(rel.as_str())),
+                "P must admit {} via the relation property",
+                rel.as_str()
+            );
+            assert!(
+                age_edge_is_lineage_relation(&by_label(rel.as_str())),
+                "P must admit {} via the edge label",
+                rel.as_str()
+            );
+        }
+
+        // Every NON-lineage relation in the closed taxonomy must be rejected,
+        // so adding a relation to the enum without adding it to LINEAGE cannot
+        // silently widen the provenance walk.
+        for rel in crate::models::MemoryLinkRelation::all() {
+            let in_p = rel.is_lineage();
+            assert_eq!(
+                age_edge_is_lineage_relation(&by_prop(rel.as_str())),
+                in_p,
+                "P membership for {} must match MemoryLinkRelation::LINEAGE",
+                rel.as_str()
+            );
+        }
+
+        // Fail closed on an unreadable relation.
+        assert!(!age_edge_is_lineage_relation(&serde_json::json!({})));
+        assert!(!age_edge_is_lineage_relation(&serde_json::json!({
+            "properties": { "relation": 7 }
+        })));
     }
 
     #[test]
@@ -29463,18 +30251,39 @@ mod tests {
         let dst = sample_memory(&format!("tl-dst-{unique}"), &ns, "tl-dst", "dst body");
         let src_id = store.store(&ctx, &src).await.expect("store src");
         let dst_id = store.store(&ctx, &dst).await.expect("store dst");
-        // Insert a link with valid_from set so kg_timeline picks it up
-        // (the SAL `link` trait method does not surface valid_from).
-        sqlx::query(
-            "INSERT INTO memory_links \
-             (source_id, target_id, relation, created_at, valid_from, attest_level) \
-             VALUES ($1, $2, 'related_to', NOW(), '2030-01-01 00:00:00+00', 'unsigned')",
-        )
-        .bind(&src_id)
-        .bind(&dst_id)
-        .execute(&store.pool)
-        .await
-        .expect("insert timeline link");
+        // #2511 — create the link through the SAL `link` trait method, the
+        // ONLY production path that writes an edge. It sets `valid_from` on
+        // BOTH representations coherently: the relational `memory_links`
+        // bind AND, in sync mode, the AGE `memory_graph` projection
+        // (`project_link_into_age(.., Some(valid_from_str), ..)`, #2377
+        // FIX #9). `MemoryLink.valid_from` is honoured verbatim when
+        // supplied and defaults to now otherwise.
+        //
+        // The prior fixture raw-INSERTed into `memory_links` ONLY, on the
+        // stale premise that "the SAL `link` trait method does not surface
+        // valid_from" — false since #2377. That produced state NO
+        // production path can produce (a relational edge with no AGE
+        // projection), which was invisible while the AGE cypher was
+        // rejected at parse time and every kg_timeline silently fell back
+        // to the CTE. Once #2511 made the AGE statement execute, AGE
+        // correctly reported no such edge and the assertion failed — the
+        // fixture was the defect, not the product.
+        let link = crate::models::MemoryLink {
+            source_id: src_id.clone(),
+            target_id: dst_id.clone(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            // Explicit (the original fixture's stamp) so the assertion does
+            // not lean on the default-to-now arm.
+            valid_from: Some("2030-01-01T00:00:00Z".to_string()),
+            valid_until: None,
+            observed_by: None,
+            signature: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        };
+        store.link(&ctx, &link).await.expect("create timeline link");
         let events = <PostgresStore as MemoryStore>::kg_timeline(&store, &src_id, None, None, None)
             .await
             .expect("kg_timeline trait");

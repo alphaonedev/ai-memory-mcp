@@ -980,7 +980,40 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // doctrine (measure after resolving; concurrent lanes STACK), bumped
     // 31_200 -> 31_320 = 31_199 + 121 headroom. Real relief is the #650-class
     // module split.
-    ("src/store/postgres.rs", 31_320),
+    // 2026-07-30 (#2511 AGE cypher reads never executed) — the five
+    // `age_params_literal` call sites move to the `Agtype` typed-Param bind,
+    // `kg_query`'s Cypher body drops the AGE-unparseable `ALL(...)` /
+    // `reduce(...)` / `length(r)` constructs in favour of
+    // `nodes(p)`/`relationships(p)`, and the semantics they carried are
+    // re-derived Rust-side (four new free fns: `age_decode_entity_list`,
+    // `age_vertex_ids`, `age_path_edges_all_current`,
+    // `age_last_edge_relation`) plus the #1948 lifecycle allow-list
+    // re-derivation on the AGE branch and the fallback-honesty classifier
+    // (`is_age_adapter_statement_defect` + its signature table + the second
+    // WARN arm in both `warn_age_fallback*`). Roughly half the delta is
+    // documentation: the postmortem on the three independent causes lives in
+    // the `Agtype` / `build_kg_query_current_view_cypher` rustdoc so the next
+    // agent does not re-derive it from a live AGE probe, and
+    // `build_find_paths_current_view_cypher` gains the KNOWN-DEFECT note for
+    // the residual. Four new inline unit tests (classifier both directions,
+    // the valid_until guard incl. fail-closed, the entity-list decoder, the
+    // last-edge relation) replace the deleted `age_params_literal` test.
+    // `lineage_cypher` additionally drops AGE's unimplemented
+    // relationship-type ALTERNATION for an untyped pattern plus a Rust-side
+    // provenance-subset filter (`age_edge_is_lineage_relation`), and every
+    // agtype RESULT cell moves onto the `age_cell_text` reader (the
+    // `try_get::<String, _>`-on-agtype decode was latently broken from
+    // v0.7.0 and only became reachable once the statements executed).
+    // The #2511 follow-up (coverage-gate regression) adds the NULL-tolerant
+    // agtype cell reader split (`age_cell_text_opt` / `age_cell_text_required`
+    // — an ABSENT AGE property arrives as SQL NULL, which the pre-fix REQUIRED
+    // read turned into a silent CTE fallback) plus the `$4::TIMESTAMPTZ` cast
+    // on the `kg_invalidate_cypher` relational mirror, each with its
+    // postmortem comment, and one new inline unit test.
+    // MEASURED post-change: 32_080. Per this entry's own doctrine (measure
+    // after the change; concurrent lanes STACK) bumped 31_320 -> 32_200 =
+    // 32_080 + 120 headroom. Real relief is the #650-class module split.
+    ("src/store/postgres.rs", 32_200),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
