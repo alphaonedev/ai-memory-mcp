@@ -171,6 +171,7 @@ jobs:
       - name: Run AGE-gated Cypher/KG + pgvector suites (live certified stack)
         run: |
           cargo test --features sal,sal-postgres \
+            --test age_cypher_param_binding_2511 \
             --test age_cte_equivalence \
             --test g2_postgres_find_paths_age_param_binding \
             --test g4_postgres_link_projects_into_age_graph \
