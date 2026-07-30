@@ -18257,6 +18257,24 @@ impl MemoryStore for PostgresStore {
         Ok(())
     }
 
+    /// #2488 — scalar namespace projection over the SAME
+    /// `SQL_SELECT_NS_VERSION_BY_ID` shape `apply_remote_deletion` already uses
+    /// internally, replacing the `SELECT *` + fail-closed-decrypt round trip the
+    /// `get`-composing trait default would take. See the trait doc for the cost
+    /// and erasure-denial rationale. No visibility predicate by design: the gate
+    /// must observe the TRUE stored namespace, including `scope=private` rows
+    /// owned by another agent.
+    async fn namespace_by_id(&self, _ctx: &CallerContext, id: &str) -> StoreResult<Option<String>> {
+        let row = sqlx::query_as::<_, (String, i64)>(SQL_SELECT_NS_VERSION_BY_ID)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("namespace_by_id", e))?;
+        Ok(row.map(|(ns, _ver)| ns))
+    }
+
+    /// `_ctx` is deliberately discarded — see the trait doc on
+    /// [`MemoryStore::apply_remote_deletion`] (#2488).
     async fn apply_remote_deletion(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
         self.gate_record_stop()?;
         // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact TOMBSTONE

@@ -449,8 +449,19 @@ per-tick), naming the depth, likely quota cause, and remediation; the
 pre-#1544 stall was silent. The cause-labeled
 `ai_memory_federation_push_dlq_quarantined_by_cause_total{cause}`
 counter (closed label set
-`quota`|`unenrolled_peer`|`id_drift`|`permanent`|`peer_removed`|`other`)
-is the companion. #1544 also narrows the federation RECEIVE quota: the
+`quota`|`unenrolled_peer`|`unenrolled_author_strict`|`namespace_probe_unresolvable`|`id_drift`|`permanent`|`peer_removed`|`other`)
+is the companion. The set has grown twice since #1544 and this
+enumeration had drifted behind both: `unenrolled_author_strict`
+(#1464/#1801) labels an honored third-party relayed write refused because
+the ORIGIN author has no locally-enrolled key, and
+`namespace_probe_unresolvable` (#2488) labels a federated deletion refused
+because the receiver could not RESOLVE the target row's namespace, so the
+scope gate failed closed — the second is operator-actionable at the
+RECEIVER's storage rather than the sender's allowlist, and is dormant
+until the delete lane gains a DLQ enqueue (#2498). The label set is
+enumerated in exactly one place in code
+(`push_dlq::classify_quarantine_cause`); treat that as the SSOT and this
+list as a mirror. #1544 also narrows the federation RECEIVE quota: the
 receive path now charges the per-agent **storage-bytes** ceiling ONLY,
 not the daily memory write-count (`AI_MEMORY_MAX_MEMORIES_PER_DAY`) —
 replication is not net-new authorship, so corpus-scale federation under
