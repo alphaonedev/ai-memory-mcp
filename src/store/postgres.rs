@@ -7586,9 +7586,9 @@ impl PostgresStore {
             // `age_cell_text` (the [`Agtype`] wrapper) and scalars are
             // then trimmed of AGE's quoting (`"id"` -> `id`). See
             // `age_cell_text` for why `try_get::<String, _>` is wrong.
-            let target_id = age_cell_text(r, "target_id", READ_TARGET_ID)?;
+            let target_id = age_cell_text_required(r, "target_id", READ_TARGET_ID)?;
 
-            let edges_raw = age_cell_text(r, AGE_COL_PATH_EDGES, READ_PATH_EDGES)?;
+            let edges_raw = age_cell_text_required(r, AGE_COL_PATH_EDGES, READ_PATH_EDGES)?;
             let edges = age_decode_entity_list(AGE_COL_PATH_EDGES, &edges_raw)?;
             if !age_path_edges_all_current(&edges, &now_stamp) {
                 continue;
@@ -7601,7 +7601,7 @@ impl PostgresStore {
                 });
             }
 
-            let nodes_raw = age_cell_text(r, AGE_COL_PATH_NODES, "read path_nodes")?;
+            let nodes_raw = age_cell_text_required(r, AGE_COL_PATH_NODES, "read path_nodes")?;
             let node_ids = age_vertex_ids(&age_decode_entity_list(AGE_COL_PATH_NODES, &nodes_raw)?);
             if node_ids.is_empty() {
                 return Err(StoreError::IntegrityFailed {
@@ -7945,21 +7945,36 @@ impl PostgresStore {
         // a `memories` rename.
         let mut decoded: Vec<KgTimelineRow> = Vec::with_capacity(rows.len());
         for r in &rows {
-            // #2511 — every agtype cell reads through `age_cell_text`
+            // #2511 — every agtype cell reads through `age_cell_text_*`
             // (see that helper: a `String` decode of AGE's BINARY wire
-            // form keeps the leading `0x01` version byte).
-            let target_id_raw = age_cell_text(r, "target_id", READ_TARGET_ID)?;
-            let relation_raw = age_cell_text(r, "relation", READ_RELATION)?;
-            let valid_from_raw = age_cell_text(r, field_names::VALID_FROM, READ_VALID_FROM)?;
-            let valid_until_raw = age_cell_text(r, field_names::VALID_UNTIL, READ_VALID_UNTIL)?;
-            let observed_by_raw = age_cell_text(r, field_names::OBSERVED_BY, READ_OBSERVED_BY)?;
+            // form keeps the leading `0x01` version byte, AND an absent
+            // property arrives as SQL NULL rather than agtype `null`).
+            //
+            // `valid_until` / `observed_by` are OPTIONAL on the projected
+            // edge — `project_link_into_age` SETs each only when non-NULL
+            // (#2377 FIX #9), precisely so a never-invalidated edge keeps
+            // the `valid_until IS NULL` fast path. Reading them as
+            // REQUIRED made every timeline row over an ordinary edge raise
+            // `UnexpectedNull` → `BackendUnavailable` → silent CTE
+            // fallback, which is the same vacuity class #2511 exists to
+            // kill. The `agtype_optional_string` pass still runs for the
+            // case where AGE hands back a literal `null` scalar.
+            let target_id_raw = age_cell_text_required(r, "target_id", READ_TARGET_ID)?;
+            let relation_raw = age_cell_text_required(r, "relation", READ_RELATION)?;
+            let valid_from_raw =
+                age_cell_text_required(r, field_names::VALID_FROM, READ_VALID_FROM)?;
+            let valid_until_raw = age_cell_text_opt(r, field_names::VALID_UNTIL, READ_VALID_UNTIL)?;
+            let observed_by_raw = age_cell_text_opt(r, field_names::OBSERVED_BY, READ_OBSERVED_BY)?;
 
             decoded.push(KgTimelineRow {
                 target_id: strip_agtype_quotes(&target_id_raw).to_string(),
                 relation: strip_agtype_quotes(&relation_raw).to_string(),
                 valid_from: strip_agtype_quotes(&valid_from_raw).to_string(),
-                valid_until: agtype_optional_string(&valid_until_raw),
-                observed_by: agtype_optional_string(&observed_by_raw),
+                // SQL NULL (absent property) and the agtype scalar `null`
+                // both collapse to `None` — the wire shape the CTE twin
+                // returns for a never-invalidated / unobserved edge.
+                valid_until: valid_until_raw.as_deref().and_then(agtype_optional_string),
+                observed_by: observed_by_raw.as_deref().and_then(agtype_optional_string),
                 // Filled in below by the `memories` join.
                 title: String::new(),
                 target_namespace: String::new(),
@@ -8296,9 +8311,17 @@ impl PostgresStore {
                 .await;
         }
 
-        // #2511 — agtype cell, not a `String` cell (see `age_cell_text`).
-        let prior_raw = age_cell_text(&prior_rows[0], "prior", "read prior valid_until")?;
-        let previous_valid_until = agtype_optional_string(&prior_raw);
+        // #2511 — `r.valid_until` is ABSENT on every never-yet-invalidated
+        // edge, and AGE returns an absent property as SQL NULL. Reading it
+        // as REQUIRED raised `UnexpectedNull` → `BackendUnavailable` →
+        // `is_age_runtime_failure` → the WHOLE cypher invalidation fell
+        // back to `kg_invalidate_cte`, which updates the RELATIONAL mirror
+        // ONLY — so the AGE edge kept no `valid_until` and `kg_query`'s
+        // current view (correctly) kept returning the invalidated edge.
+        // That is the #2511 follow-up regression; NULL means "no previous
+        // valid_until", which is exactly `None`.
+        let prior_raw = age_cell_text_opt(&prior_rows[0], "prior", "read prior valid_until")?;
+        let previous_valid_until = prior_raw.as_deref().and_then(agtype_optional_string);
 
         // Step 2: SET r.valid_until = $now and count the affected
         // edge. We rely on AGE's identity to atomically rewrite the
@@ -8338,8 +8361,19 @@ impl PostgresStore {
         // projection lags behind a relational `UPDATE` in deployments
         // that lack a sync trigger; doing both writes here is the same
         // dual-write contract J2/J3 already rely on for the read path.
+        // #2511 — `$4::TIMESTAMPTZ`, matching `kg_invalidate_cte`'s twin
+        // exactly. `stamp` is an RFC3339 STRING and `memory_links.valid_until`
+        // is `TIMESTAMPTZ`; postgres refuses a bare `text` parameter there
+        // (`column "valid_until" is of type timestamp with time zone but
+        // expression is of type text`). This mirror UPDATE runs AFTER the AGE
+        // `SET r.valid_until` in the SAME transaction, so the error rolled the
+        // AGE write back too and `is_age_runtime_failure` then re-ran the whole
+        // invalidation through `kg_invalidate_cte` — relational-only. Net
+        // effect: the AGE edge was NEVER invalidated and `kg_query`'s
+        // current view kept serving it. Latent since v0.7.0 because the cypher
+        // read above was parse-rejected long before control reached this line.
         sqlx::query(
-            "UPDATE memory_links SET valid_until = $4 \
+            "UPDATE memory_links SET valid_until = $4::TIMESTAMPTZ \
              WHERE source_id = $1 AND target_id = $2 AND relation = $3",
         )
         .bind(source_id)
@@ -8651,9 +8685,9 @@ impl PostgresStore {
         let mut best: std::collections::BTreeMap<String, (String, usize)> =
             std::collections::BTreeMap::new();
         for r in &rows {
-            // #2511 — agtype cells, not `String` cells (see `age_cell_text`).
-            let node_id = age_cell_text(r, "node_id", "read node_id")?;
-            let edges_raw = age_cell_text(r, AGE_COL_PATH_EDGES, READ_PATH_EDGES)?;
+            // #2511 — agtype cells, not `String` cells (see `age_cell_text_opt`).
+            let node_id = age_cell_text_required(r, "node_id", "read node_id")?;
+            let edges_raw = age_cell_text_required(r, AGE_COL_PATH_EDGES, READ_PATH_EDGES)?;
             let edges = age_decode_entity_list(AGE_COL_PATH_EDGES, &edges_raw)?;
             if edges.is_empty() {
                 // A `*1..N` pattern cannot match a zero-length path.
@@ -14351,12 +14385,56 @@ async fn unproject_link_from_age(
 /// Returns the payload verbatim (AGE's own quoting intact) so callers can
 /// apply [`strip_agtype_quotes`] or [`agtype_optional_string`] exactly as
 /// the shape requires.
-fn age_cell_text(row: &sqlx::postgres::PgRow, col: &str, what: &str) -> StoreResult<String> {
+///
+/// # An ABSENT property is SQL NULL, not the agtype text `null`
+///
+/// Verified live on AGE 1.7.0: projecting a property a node/edge does not
+/// carry (`RETURN n.missing AS x`) yields a **SQL NULL** `agtype` cell
+/// (`x IS NULL` → true), NOT an agtype scalar spelling `null`. So this
+/// reader is `Option`-returning and every caller must state which it
+/// wants. `try_get::<Agtype, _>` (or the pre-#2511
+/// `try_get::<String, _>`) on such a cell raises sqlx's `UnexpectedNull`,
+/// which [`to_store_err`] maps to `BackendUnavailable` — i.e.
+/// [`is_age_runtime_failure`] treats a perfectly normal absent property as
+/// an AGE OUTAGE and silently re-serves the request from the CTE.
+///
+/// That is exactly how #2511's follow-up regression happened:
+/// `kg_invalidate_cypher` reads `prior` = `r.valid_until`, which is ABSENT
+/// on every never-yet-invalidated edge, so the read errored, the whole
+/// cypher invalidation fell back to `kg_invalidate_cte`, and only the
+/// RELATIONAL mirror got `valid_until` — leaving the AGE edge permanently
+/// un-invalidated while `kg_query`'s current view (correctly) kept
+/// returning it. The bug pre-dates #2511 but was unreachable while the
+/// statements were rejected at parse analysis.
+fn age_cell_text_opt(
+    row: &sqlx::postgres::PgRow,
+    col: &str,
+    what: &str,
+) -> StoreResult<Option<String>> {
     use sqlx::Row as _;
-    let raw: Agtype = row
-        .try_get::<Agtype, _>(col)
+    let raw: Option<Agtype> = row
+        .try_get::<Option<Agtype>, _>(col)
         .map_err(|e| to_store_err(what, e))?;
-    Ok(raw.0)
+    Ok(raw.map(|a| a.0))
+}
+
+/// #2511 — [`age_cell_text_opt`] for a cell the projection contract says is
+/// ALWAYS present (a matched node's `id`, a path's `nodes(p)`/
+/// `relationships(p)`).
+///
+/// A NULL here is a genuine projection-integrity violation, so it raises
+/// `IntegrityFailed` — which is deliberately NOT an
+/// [`is_age_runtime_failure`], so it propagates to the caller instead of
+/// being laundered into another silent CTE fallback. Fail loudly on
+/// corrupt derived state; never serve a wrong answer quietly.
+fn age_cell_text_required(
+    row: &sqlx::postgres::PgRow,
+    col: &str,
+    what: &str,
+) -> StoreResult<String> {
+    age_cell_text_opt(row, col, what)?.ok_or_else(|| StoreError::IntegrityFailed {
+        detail: format!("AGE returned NULL for the required column {col:?} ({what})"),
+    })
 }
 
 /// from sqlx; the AGE branch needs this helper to mirror the same
@@ -27244,6 +27322,35 @@ mod tests {
         // Empty list is not reachable for a `*1..N` pattern (the caller
         // rejects it as IntegrityFailed), but must not panic.
         assert_eq!(age_last_edge_relation(&[]), "");
+    }
+
+    #[test]
+    fn issue_2511_agtype_optional_string_maps_absent_and_null_to_none() {
+        // #2511 follow-up — an ABSENT AGE property arrives as SQL NULL
+        // (verified live on AGE 1.7.0: `RETURN n.missing AS x` yields
+        // `x IS NULL = true`, NOT the agtype text `null`), so the read path
+        // must treat NULL as "no value" rather than as a decode failure.
+        // Reading `r.valid_until` as REQUIRED made every never-invalidated
+        // edge raise `UnexpectedNull` → `BackendUnavailable` →
+        // `is_age_runtime_failure` → silent CTE fallback, which is how the
+        // AGE-side `SET r.valid_until` never ran.
+        //
+        // Both spellings of "no value" must collapse to `None`:
+        let sql_null: Option<String> = None;
+        assert_eq!(sql_null.as_deref().and_then(agtype_optional_string), None);
+        assert_eq!(
+            Some("null".to_string())
+                .as_deref()
+                .and_then(agtype_optional_string),
+            None
+        );
+        // A real value survives, quotes stripped.
+        assert_eq!(
+            Some("\"2026-07-30T12:00:00+00:00\"".to_string())
+                .as_deref()
+                .and_then(agtype_optional_string),
+            Some("2026-07-30T12:00:00+00:00".to_string())
+        );
     }
 
     #[test]

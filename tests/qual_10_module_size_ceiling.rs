@@ -1004,10 +1004,16 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // agtype RESULT cell moves onto the `age_cell_text` reader (the
     // `try_get::<String, _>`-on-agtype decode was latently broken from
     // v0.7.0 and only became reachable once the statements executed).
-    // MEASURED post-change: 31_941. Per this entry's own doctrine (measure
-    // after the change; concurrent lanes STACK) bumped 31_320 -> 32_060 =
-    // 31_941 + 119 headroom. Real relief is the #650-class module split.
-    ("src/store/postgres.rs", 32_060),
+    // The #2511 follow-up (coverage-gate regression) adds the NULL-tolerant
+    // agtype cell reader split (`age_cell_text_opt` / `age_cell_text_required`
+    // — an ABSENT AGE property arrives as SQL NULL, which the pre-fix REQUIRED
+    // read turned into a silent CTE fallback) plus the `$4::TIMESTAMPTZ` cast
+    // on the `kg_invalidate_cypher` relational mirror, each with its
+    // postmortem comment, and one new inline unit test.
+    // MEASURED post-change: 32_080. Per this entry's own doctrine (measure
+    // after the change; concurrent lanes STACK) bumped 31_320 -> 32_200 =
+    // 32_080 + 120 headroom. Real relief is the #650-class module split.
+    ("src/store/postgres.rs", 32_200),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

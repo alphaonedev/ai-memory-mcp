@@ -192,6 +192,26 @@ impl sqlx::Encode<'_, sqlx::Postgres> for Agtype {
     }
 }
 
+impl<'r> sqlx::Decode<'r, sqlx::Postgres> for Agtype {
+    fn decode(value: sqlx::postgres::PgValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
+        // Mirror of the encoder: binary mode is a version byte (1) followed
+        // by the JSON text payload; text mode is the payload verbatim.
+        match value.format() {
+            sqlx::postgres::PgValueFormat::Binary => {
+                let bytes = value.as_bytes()?;
+                let Some((&version, rest)) = bytes.split_first() else {
+                    return Err("empty agtype payload".into());
+                };
+                if version != 1 {
+                    return Err(format!("unsupported agtype version: {version}").into());
+                }
+                Ok(Agtype(std::str::from_utf8(rest)?.to_string()))
+            }
+            sqlx::postgres::PgValueFormat::Text => Ok(Agtype(value.as_str()?.to_string())),
+        }
+    }
+}
+
 fn pg_url() -> Option<String> {
     std::env::var("AI_MEMORY_TEST_AGE_URL")
         .ok()
@@ -247,6 +267,36 @@ async fn direct_cypher(pool: &sqlx::PgPool, body: &str, params: &serde_json::Val
         .unwrap_or_else(|e| panic!("direct cypher failed: {e}\nbody: {body}"));
     tx.commit().await.expect("commit direct cypher tx");
     rows.len()
+}
+
+/// Like [`direct_cypher`] but returns each row's single `agtype` cell as
+/// `Option<String>` — `None` for a SQL NULL, which is how AGE renders an
+/// ABSENT property (`RETURN n.missing`). Lets a test distinguish
+/// "property not set" from "property set to something".
+async fn direct_cypher_rows(
+    pool: &sqlx::PgPool,
+    body: &str,
+    params: &serde_json::Value,
+) -> Vec<Option<String>> {
+    use sqlx::Row as _;
+    let mut tx = age_tx(pool).await;
+    let sql = format!("SELECT c FROM cypher('memory_graph', $$ {body} $$, $1) AS (c agtype)");
+    let rows = sqlx::query(&sql)
+        .bind(Agtype(params.to_string()))
+        .persistent(false)
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap_or_else(|e| panic!("direct cypher failed: {e}\nbody: {body}"));
+    let out = rows
+        .iter()
+        .map(|r| {
+            r.try_get::<Option<Agtype>, _>("c")
+                .expect("decode agtype cell")
+                .map(|a| a.0)
+        })
+        .collect();
+    tx.commit().await.expect("commit direct cypher tx");
+    out
 }
 
 fn mk_memory(namespace: &str, title: &str) -> Memory {
@@ -483,6 +533,113 @@ async fn r203_lineage_reflects_an_age_only_provenance_edge_and_filters_non_p() {
         "#2511: the Rust-side P filter replacing AGE's unsupported label \
          alternation MUST drop a non-provenance (`related_to`) hop — \
          `lineage_cte` never returns one. Got: {rows:?}"
+    );
+}
+
+/// **R-203 invalidate regression.** `kg_invalidate` on the AGE backend must
+/// actually SET `valid_until` on the AGE EDGE, not merely on the relational
+/// mirror — otherwise `kg_query`'s current view (which reads the AGE edge)
+/// keeps returning an edge the operator invalidated.
+///
+/// Asserted through DIRECT Cypher on the edge's own properties, so a fallback
+/// to `kg_invalidate_cte` (which updates ONLY `memory_links`) cannot pass it.
+/// This is the shape that escaped the first #2511 pass: `r.valid_until` is
+/// ABSENT on a never-yet-invalidated edge and AGE returns an absent property
+/// as SQL NULL, so the cypher read raised `UnexpectedNull` and the whole
+/// invalidation silently degraded to the relational-only CTE path.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a live Apache AGE postgres (AI_MEMORY_TEST_AGE_URL); run with --include-ignored"]
+async fn r203_kg_invalidate_sets_valid_until_on_the_age_edge() {
+    let test = "r203_kg_invalidate_sets_valid_until_on_the_age_edge";
+    let Some((store, pool)) = age_store_or_skip(test).await else {
+        return;
+    };
+
+    let ctx = CallerContext::for_agent("t-2511".to_string());
+    let ns = format!("t2511-{}", uuid::Uuid::new_v4());
+    let now = chrono::Utc::now().to_rfc3339();
+    let a_id = store
+        .store(&ctx, &mk_memory(&ns, "invalidate-src"))
+        .await
+        .expect("store a");
+    let b_id = store
+        .store(&ctx, &mk_memory(&ns, "invalidate-dst"))
+        .await
+        .expect("store b");
+    store
+        .link(
+            &ctx,
+            &MemoryLink {
+                source_id: a_id.clone(),
+                target_id: b_id.clone(),
+                relation: MemoryLinkRelation::RelatedTo,
+                created_at: now,
+                valid_from: None,
+                valid_until: None,
+                observed_by: None,
+                signature: None,
+                attest_level: None,
+                source_cid: None,
+                target_cid: None,
+            },
+        )
+        .await
+        .expect("link a->b");
+
+    // Ground truth BEFORE: the projected edge carries NO `valid_until` (the
+    // #2377 projection SETs it only when non-NULL) — which is precisely the
+    // SQL-NULL read the cypher invalidate path has to tolerate.
+    let before = direct_cypher_rows(
+        &pool,
+        "MATCH (a:Memory {id: $src})-[r:related_to]->(b:Memory {id: $dst}) \
+         RETURN r.valid_until",
+        &serde_json::json!({ "src": &a_id, "dst": &b_id }),
+    )
+    .await;
+    assert_eq!(before.len(), 1, "fixture: exactly one projected edge");
+    assert!(
+        before[0].is_none(),
+        "fixture invariant: a never-invalidated edge has NO valid_until \
+         property (AGE returns SQL NULL), got {before:?}"
+    );
+
+    // Drive the cypher path DIRECTLY so a fallback cannot mask the error.
+    let row = store
+        .kg_invalidate_cypher(&a_id, &b_id, "related_to", None)
+        .await
+        .expect("kg_invalidate_cypher must succeed against a live AGE edge");
+    assert!(
+        row.found,
+        "the edge exists, so the invalidation must find it"
+    );
+
+    // Ground truth AFTER, via DIRECT Cypher on the AGE edge itself.
+    let after = direct_cypher_rows(
+        &pool,
+        "MATCH (a:Memory {id: $src})-[r:related_to]->(b:Memory {id: $dst}) \
+         RETURN r.valid_until",
+        &serde_json::json!({ "src": &a_id, "dst": &b_id }),
+    )
+    .await;
+    assert_eq!(
+        after.len(),
+        1,
+        "the edge must still exist (SET, not DELETE)"
+    );
+    assert!(
+        after[0].is_some(),
+        "#2511: kg_invalidate must SET valid_until on the AGE EDGE. A NULL \
+         here means the cypher path errored and only the relational mirror \
+         moved — so kg_query's current view keeps serving the invalidated \
+         edge. Got: {after:?}"
+    );
+
+    // And the current view must now exclude it.
+    let rows = store.kg_query(&a_id, 1).await.expect("kg_query depth 1");
+    assert!(
+        !rows.iter().any(|r| r.target_id == b_id),
+        "#2511: an invalidated edge must not appear in the current view. \
+         Got: {rows:?}"
     );
 }
 
