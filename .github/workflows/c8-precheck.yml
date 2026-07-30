@@ -334,7 +334,11 @@ jobs:
         # --self-test plants each historical shape in a throwaway copy UNDER
         # the repo (never system /tmp): the (b1) matrix+`if:` wedge, an (a)
         # mirror context matching no job, a (c) `paths:`-filtered carrier, a
-        # (b3) unguarded step in a `needs: classify` job, and both directions
+        # (b3) unguarded step in a `needs: classify` job, a (b4) DECIDER
+        # carrying a job-level `if:` — rejected EVEN WHEN allowlisted, which
+        # is the property that separates (b4) from (b2), because a skipped
+        # decider skips its whole dependent subtree and every skipped member
+        # then counts as satisfied (#2494 residual) — and both directions
         # of the (b2) burn-down ratchet. The clean control additionally
         # asserts the parser reproduces BOTH YAML scalar outcomes — ` #`
         # truncates (the live `§25.3 S5 / RQ-10` context), `(#` does not —
@@ -348,6 +352,13 @@ jobs:
         # earlier and a docs-only last push must classify docs_only=FALSE
         # against the live workflow and TRUE against the frozen block — so a
         # silently-broken extraction cannot make the assertions vacuous.
+        # SECTION C (#2494 residual) additionally pins the four live premises
+        # that make requiring the two DECIDER contexts safe — declared in the
+        # mirror, no job-level `if:`/matrix, `pull_request` covering
+        # `release/**` unfiltered, and a `push:` branch list that cannot match
+        # a PR HEAD branch (the #2508 one-run-per-SHA precondition) — with its
+        # own frozen-pre-fix-mirror regression leg at
+        # scripts/test/fixtures/required-contexts-prefix-2494.txt.
         run: bash scripts/test/test-ci-workflow-invariants.sh
 
   git-dependency-source-gate:
