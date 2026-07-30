@@ -781,6 +781,17 @@ impl MemoryStore for SqliteStore {
         db::create_link_inbound(&conn, link, attest_level).map_err(box_err)
     }
 
+    /// #2488 — scalar namespace projection (`SELECT namespace FROM memories
+    /// WHERE id = ?1`). Overrides the `get`-composing trait default so the
+    /// federation namespace gates never route through `row_to_memory`'s
+    /// fail-closed at-rest decrypt; see the trait doc for why that matters.
+    async fn namespace_by_id(&self, _ctx: &CallerContext, id: &str) -> StoreResult<Option<String>> {
+        let conn = self.state.lock().await;
+        db::namespace_by_id(&conn, id).map_err(box_err)
+    }
+
+    /// `_ctx` is deliberately discarded — see the trait doc on
+    /// [`MemoryStore::apply_remote_deletion`] (#2488).
     async fn apply_remote_deletion(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;

@@ -98,6 +98,33 @@ is_foundational() {
         src/models/memory.rs|src/models/link.rs|src/models/mod.rs) return 0 ;;
         # HTTP topology (every handler depends on transport)
         src/handlers/transport.rs|src/handlers/mod.rs|src/handlers/http.rs) return 0 ;;
+        # Federation RECEIVE authorization surface (#2488/#2491). These three
+        # files are the two `/sync/push` funnels and the shared verdict they
+        # both route through — a security gate whose regressions are silent
+        # (a refused item is a counter bump inside an HTTP 200, and an
+        # unreachable gate is invisible to every green test). The token
+        # heuristic does not reliably select the cross-backend federation test
+        # binaries from an edit to one of them, so a future PR that re-breaks
+        # the namespace gate could ship without re-running the proof. Forcing
+        # __ALL__ here keeps the #2447/#2488/#2491 pins load-bearing beyond
+        # their own landing commits.
+        src/handlers/federation_receive.rs|src/handlers/federation_signing_check.rs) return 0 ;;
+        src/federation/receive_auth.rs) return 0 ;;
+        # SAL ADAPTER implementations (#2488 rot fix). `src/store/mod.rs` (the
+        # trait surface) has been foundational since this list was written, but
+        # the two ADAPTERS were not — and the token heuristic does not select
+        # the cross-backend federation binaries from them: an edit to
+        # `src/store/postgres.rs` impact-selects 58/527 WITHOUT
+        # `federation_delete_ns_scope_2488_pg`, because the tokeniser matches
+        # the `postgres` token and the pin's basename ends in `_pg`. Same for
+        # `src/store/sqlite.rs` -> 21/527 without `..._2488`. So deleting the
+        # `namespace_by_id` override from either adapter would silently let the
+        # `get`-composing trait default take over — reinstating the
+        # erasure-denial trap (a row with an unopenable at-rest envelope becomes
+        # permanently un-deletable by federation) WITHOUT re-running the test
+        # that pins it. These files are the SAL implementations of a
+        # data-integrity contract; treat them like the substrate they are.
+        src/store/sqlite.rs|src/store/postgres.rs) return 0 ;;
         # CI + gate scripts (changes to CI itself need full validation)
         .github/workflows/ci.yml|.github/workflows/c8-precheck.yml) return 0 ;;
         scripts/check-vendor-literals.sh|scripts/qc-codegraph-precheck.sh|scripts/ci-test-impact.sh) return 0 ;;

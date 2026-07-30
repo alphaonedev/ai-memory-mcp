@@ -656,9 +656,34 @@ pub const REQUIRE_PUSH_NAMESPACE_SCOPE_ENV: &str = "AI_MEMORY_FED_REQUIRE_PUSH_N
 /// no `AI_MEMORY_FED_PEER_ATTESTATION` configured the check never runs. Its
 /// entire blast radius is ONE config shape — the operator wrote the peer JSON,
 /// enrolled this peer, and left `allowed_namespaces` empty/absent (it is
-/// `#[serde(default)]`, so an omitted field silently yields `[]`). That shape
-/// today grants the peer ZERO read scope and ZERO delete scope while leaving
-/// its WRITE scope unbounded; the flip makes the three lanes agree.
+/// `#[serde(default)]`, so an omitted field silently yields `[]`).
+///
+/// **That claim is STRUCTURALLY ENFORCED, not merely asserted (#2497).**
+/// [`layer2_unscoped_peer_authorized`] refuses the header-absent and
+/// not-in-a-non-empty-allowlist shapes UNCONDITIONALLY, before it consults this
+/// knob at all — see [`peer_enrolled_in_allowlist`] for the shape table and the
+/// regression that skipping that split caused (a falsy knob plus
+/// `AI_MEMORY_FED_TRUST_BODY_AGENT_ID=1` briefly granted an ANONYMOUS peer
+/// unbounded federated delete-by-id). An operator who wants an unlisted peer
+/// admitted removes the allowlist (zero-config, which short-circuits earlier) or
+/// enrolls the peer; this knob is never that lever.
+///
+/// ## AVAILABILITY NOTE — a falsy value is NOT a general rollout hatch (#2497)
+///
+/// Because the unconditional refusal lives in the SHARED Layer 2, it applies to
+/// every lane that reaches the verdict — not only `deletions[]`. For the
+/// `{allowlist configured} × {header-less legacy peer} × {this knob = 0}`
+/// combination, `memories[]` / `archives[]` / `restores[]` entries that were
+/// APPLIED before #2497 are REFUSED now. That is the correct direction, but an
+/// operator sitting on exactly the posture this knob exists to serve loses
+/// writes as well as deletes on upgrade — silently, inside an HTTP 200, with no
+/// DLQ enqueue (#2498) — so the loss is not retried and not surfaced as an error.
+///
+/// The remedy is to make the peer IDENTIFIABLE (enroll it, `["**"]` for a
+/// deliberate per-peer allow-all) or to remove the allowlist entirely for the
+/// zero-config posture. Note that for a header-LESS push "enroll the peer" is
+/// not an actionable remedy at all: a per-peer scope cannot be applied to a peer
+/// that cannot be identified.
 ///
 /// Two recoveries, both without a restart-blocking rewrite: declare the peer's
 /// real scope (or `["**"]` for deliberate allow-all — the PER-PEER escape,
@@ -698,6 +723,52 @@ pub fn peer_declares_namespace_scope(
         .is_some_and(|scope| !scope.allowed_namespaces.is_empty())
 }
 
+/// Whether this push presents a peer id that is ENROLLED in a non-empty
+/// `AI_MEMORY_FED_PEER_ATTESTATION` allowlist — regardless of whether that
+/// peer's row declares any `allowed_namespaces`.
+///
+/// The sibling of [`peer_declares_namespace_scope`], and the predicate that
+/// separates the ONE peer shape [`require_push_namespace_scope_enabled`]
+/// governs from the two it must NEVER govern.
+///
+/// # Why this exists (the #2497 regression it closes)
+///
+/// Under an enrolled posture, THREE distinct peer shapes fall through to
+/// Layer 2 — and only ONE of them is the shape the knob was written for:
+///
+/// | shape | `scope_for(peer)` | governed by knob 147? |
+/// |---|---|---|
+/// | enrolled, `allowed_namespaces: []` | `Some(empty)` | **YES** — the #2447 Layer-2 shape |
+/// | peer id ABSENT (or whitespace-only) | n/a | **NO** — refuse unconditionally |
+/// | peer NOT in a non-empty allowlist | `None` | **NO** — refuse unconditionally |
+///
+/// The first #2488 fix routed all three through the knob, so
+/// `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0` — a documented rollout
+/// hatch — granted an ANONYMOUS or UNKNOWN peer unbounded delete-by-id on a
+/// node that had declared an allowlist. That both regressed the parent's
+/// behaviour for those shapes (`namespace_allowed` refused them via
+/// `sync_trust_peer_bypass()`'s default-false) and falsified this module's own
+/// documented claim that the knob's blast radius is ONE config shape. A
+/// malformed header makes it worse: `extract_peer_id` drops a whitespace-only
+/// `X-Peer-Id` to `None`, and the #1056 TOFU enrollment guard is
+/// `if let Some(peer_id)`, so "malformed" and "absent" are indistinguishable
+/// to that gate and neither is caught there.
+///
+/// An operator who genuinely wants an unlisted peer admitted removes the
+/// allowlist (the zero-config posture, which short-circuits before Layer 2) or
+/// enrolls the peer — never a knob whose documented scope is a different shape.
+#[must_use]
+pub fn peer_enrolled_in_allowlist(
+    peer_id: Option<&str>,
+    attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
+) -> bool {
+    peer_id
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .and_then(|p| attest_cfg.scope_for(p))
+        .is_some()
+}
+
 /// Whether the write-lane gate needs the EXISTING local row's namespace
 /// resolved before [`inbound_write_namespace_authorized`] can decide.
 ///
@@ -705,6 +776,17 @@ pub fn peer_declares_namespace_scope(
 /// when Layer 1 is not armed for this peer the stored namespace cannot change
 /// the verdict (Layer 2 refuses — or accepts — on the peer's scope alone).
 /// Zero-config deployments therefore pay ZERO extra reads.
+///
+/// # This is an ELISION predicate, never a GATE predicate (#2488)
+///
+/// It answers "may I skip the probe?", NOT "must I check this peer?". Wrapping
+/// a whole gate in it — as the postgres delete lane did between #2447 and
+/// #2488 — makes the gate UNREACHABLE for exactly the peer shapes Layer 2 was
+/// written to refuse (enrolled-unscoped, header-absent), because those are the
+/// shapes for which it returns `false`. The correct structure is
+/// `if attest_cfg.has_allowlist() { let stored = if needs { probe()? } else { None };
+/// verdict(stored) }` — the enrolled posture gates, this predicate only elides
+/// the read whose answer cannot change the verdict.
 #[must_use]
 pub fn inbound_write_needs_existing_namespace(
     peer_id: Option<&str>,
@@ -712,6 +794,23 @@ pub fn inbound_write_needs_existing_namespace(
 ) -> bool {
     attest_cfg.has_allowlist() && peer_declares_namespace_scope(peer_id, attest_cfg)
 }
+
+/// Lane token for the `/sync/push` `deletions[]` subcollection. Shared by both
+/// receive funnels and by the Layer-2 refusal prose (#2488) so the string that
+/// selects the delete-lane wording cannot drift from the string the funnels pass.
+pub const LANE_DELETIONS: &str = "deletions";
+
+/// #2488 — distinguishable refusal cause for a federated deletion that was
+/// refused because the target row's namespace could not be RESOLVED, as opposed
+/// to resolved-and-out-of-scope.
+///
+/// Both dispositions increment the same `skipped` counter in a 200 response, so
+/// without a cause token an operator cannot tell "your peer lacks scope" (fix
+/// the config) from "this node cannot resolve that row" (an un-erasable row —
+/// investigate the storage). Emitted as the `cause` field on the refusal WARN
+/// and classified by `crate::federation::push_dlq::classify_quarantine_cause`,
+/// following the [`CAUSE_UNENROLLED_AUTHOR_STRICT`] precedent.
+pub const CAUSE_NAMESPACE_PROBE_UNRESOLVABLE: &str = "namespace_probe_unresolvable";
 
 /// #2447 (CWE-284, security-high) — namespace confinement for an inbound
 /// relayed MEMORY write, shared verbatim by the sqlite (`sync_push`) and
@@ -827,56 +926,185 @@ pub fn inbound_write_namespace_authorized(
     }
 
     // Layer 2 — enrolled peer that declared no namespace scope at all.
-    if require_push_namespace_scope {
-        tracing::warn!(
-            target: ATTESTATION_TRACE_TARGET,
-            memory_id = %memory_id,
-            namespace = %claimed_namespace,
-            peer_id = %peer_id.unwrap_or(""),
-            "sync_push: peer is enrolled but declares no allowed_namespaces, so its write \
-             scope is unbounded while its read + delete scope are already empty — refusing \
-             this {lane} entry (#2447). Declare the peer's namespace scope in \
-             AI_MEMORY_FED_PEER_ATTESTATION (use [\"**\"] for a deliberate allow-all), or \
-             set AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0 for a rollout window."
-        );
-        return false;
-    }
-    true
-}
-
-/// #2447 — the by-id sibling of [`inbound_write_namespace_authorized`], for the
-/// `/sync/push` lanes that act on an EXISTING row rather than a caller-supplied
-/// one (`archives[]`, `restores[]`): there is no claimed namespace to check,
-/// only the row's stored one.
-///
-/// Kept as a thin wrapper rather than a second policy so the two layers — and
-/// therefore the disposition of an enrolled peer that declares no scope — stay
-/// IDENTICAL across every lane. Without it, Layer 2 would deny such a peer's
-/// `memories[]` write and its `deletions[]` (which #1934 routes through the
-/// deny-on-empty `namespace_allowed`) while silently permitting the archive
-/// that removes the same row from every live read.
-///
-/// `stored_namespace` is `None` only when the caller has ALREADY established
-/// there is no such row (and has counted it as a no-op); a failed lookup must
-/// fail closed at the call site, never arrive here as `None`.
-#[must_use]
-pub fn inbound_by_id_namespace_authorized(
-    lane: &str,
-    memory_id: &str,
-    stored_namespace: &str,
-    attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
-    peer_id: Option<&str>,
-    require_push_namespace_scope: bool,
-) -> bool {
-    inbound_write_namespace_authorized(
+    layer2_unscoped_peer_authorized(
         lane,
         memory_id,
-        stored_namespace,
-        None,
+        Some(claimed_namespace),
         attest_cfg,
         peer_id,
         require_push_namespace_scope,
     )
+}
+
+/// Layer 2 of the inbound namespace gate — the disposition of an ENROLLED peer
+/// that declared no `allowed_namespaces` at all. Factored out of
+/// [`inbound_write_namespace_authorized`] so every lane (`memories[]`,
+/// `archives[]`, `restores[]`, `deletions[]`) refuses through ONE site and the
+/// refusal prose cannot fork per lane.
+///
+/// Returns `true` when the entry may proceed (the documented
+/// `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0` rollout window), `false` with
+/// the operator-actionable WARN already emitted.
+///
+/// `namespace` is for the log line only — it is never consulted for the verdict,
+/// which is why the caller may legitimately pass `None` after eliding the probe
+/// (see [`inbound_write_needs_existing_namespace`]).
+///
+/// ## Only the ENROLLED-UNSCOPED shape is knob-governed (#2497)
+///
+/// Three peer shapes reach here under an enrolled posture, and
+/// `require_push_namespace_scope` governs exactly ONE of them — see
+/// [`peer_enrolled_in_allowlist`] for the table and the regression that
+/// conflating them caused. A header-absent or not-in-the-allowlist push is
+/// refused UNCONDITIONALLY, so the rollout hatch can never widen into an
+/// anonymous-or-unknown-peer grant.
+fn layer2_unscoped_peer_authorized(
+    lane: &str,
+    memory_id: &str,
+    namespace: Option<&str>,
+    attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
+    peer_id: Option<&str>,
+    require_push_namespace_scope: bool,
+) -> bool {
+    use crate::handlers::federation_receive::ATTESTATION_TRACE_TARGET;
+
+    // #2497 — the two shapes the knob must NEVER govern. Refuse UNCONDITIONALLY.
+    // `peer_id` here is already the post-`extract_peer_id` value, so a
+    // whitespace-only header has collapsed to `None` and lands in the same arm.
+    if !peer_enrolled_in_allowlist(peer_id, attest_cfg) {
+        let shape = if peer_id.map(str::trim).is_none_or(str::is_empty) {
+            "no x-peer-id header was presented (or it was empty/whitespace)"
+        } else {
+            "the presented x-peer-id is not enrolled in AI_MEMORY_FED_PEER_ATTESTATION"
+        };
+        tracing::warn!(
+            target: ATTESTATION_TRACE_TARGET,
+            memory_id = %memory_id,
+            namespace = %namespace.unwrap_or(""),
+            peer_id = %peer_id.unwrap_or(""),
+            "sync_push: refusing federated {lane} entry — this node declares a peer \
+             allowlist and {shape}, so the peer has NO namespace scope to act within \
+             (#2447/#2497). This refusal is UNCONDITIONAL: \
+             AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE governs only an ENROLLED peer \
+             that declared no allowed_namespaces, never an anonymous or unenrolled \
+             one. Enroll the peer in AI_MEMORY_FED_PEER_ATTESTATION (with a real \
+             scope, or [\"**\"] for a deliberate per-peer allow-all), or remove the \
+             allowlist entirely for the zero-config posture."
+        );
+        return false;
+    }
+
+    if !require_push_namespace_scope {
+        return true;
+    }
+    // #2488 — the refusal prose must not contradict the lane it is refusing.
+    // The pre-#2488 text ("its read + delete scope are already empty — refusing
+    // this deletions entry") read as "your delete scope is already empty,
+    // therefore I refuse your delete", which is circular on this lane and told
+    // the operator nothing actionable. It is also no longer factually true of
+    // the delete lane: since #2488 the delete disposition is governed by this
+    // very knob rather than hard-coded deny-on-empty.
+    let scope_note = if lane == LANE_DELETIONS {
+        "so its read (/sync/since) and write scopes are both empty — a peer that may \
+         neither read nor write in ANY namespace may not hard-DELETE in one either"
+    } else {
+        "so its write scope would be unbounded while its read (/sync/since) scope is \
+         already empty"
+    };
+    tracing::warn!(
+        target: ATTESTATION_TRACE_TARGET,
+        memory_id = %memory_id,
+        namespace = %namespace.unwrap_or(""),
+        peer_id = %peer_id.unwrap_or(""),
+        "sync_push: peer is enrolled but declares no allowed_namespaces, {scope_note} — \
+         refusing this {lane} entry (#2447). Declare the peer's namespace scope in \
+         AI_MEMORY_FED_PEER_ATTESTATION (use [\"**\"] for a deliberate allow-all), or \
+         set AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0 for a rollout window."
+    );
+    false
+}
+
+/// #2447 — the by-id sibling of [`inbound_write_namespace_authorized`], for the
+/// `/sync/push` lanes that act on an EXISTING row rather than a caller-supplied
+/// one (`archives[]`, `restores[]`, and since #2488 `deletions[]`): there is no
+/// claimed namespace to check, only the row's stored one.
+///
+/// Kept as a thin wrapper rather than a second policy so the two layers — and
+/// therefore the disposition of an enrolled peer that declares no scope — stay
+/// IDENTICAL across every lane. Before #2488 the `deletions[]` lane was the
+/// exception: sqlite called the deny-on-empty
+/// [`crate::federation::peer_attestation::namespace_allowed`] verbatim (refusing
+/// EVERY zero-config deletion — a silent delete-replication outage, #2491) while
+/// postgres wrapped the whole gate in the read-ELISION predicate
+/// [`inbound_write_needs_existing_namespace`] (skipping the gate entirely for the
+/// enrolled-unscoped peer Layer 2 exists to refuse, #2488). Both now route here,
+/// so all four lanes share one verdict on all four peer shapes.
+///
+/// ## `stored_namespace: Option<&str>` (#2488)
+///
+/// `None` means "the caller deliberately did NOT read the stored namespace,
+/// because [`inbound_write_needs_existing_namespace`] said its answer cannot
+/// change the verdict" — i.e. Layer 1 is not armed for this peer and Layer 2
+/// decides on the peer's posture alone. The parameter is typed `Option` rather
+/// than taking a `&str` the caller fabricates with `unwrap_or("")` so that
+/// "unread on the Layer-2 path" is enforced by the compiler instead of by
+/// convention: a caller cannot accidentally feed an empty string into a Layer-1
+/// glob match, and this function cannot accidentally consult a namespace that
+/// was never resolved.
+///
+/// A caller whose probe FAILED must fail closed at the call site (skip the item)
+/// and must never arrive here as `None`; a caller that PROVED there is no such
+/// row must count the no-op and never reach here at all. If `None` arrives while
+/// Layer 1 IS armed the verdict is a fail-closed `false` — the stored namespace
+/// is load-bearing on that path, so an absent value cannot be waved through.
+#[must_use]
+pub fn inbound_by_id_namespace_authorized(
+    lane: &str,
+    memory_id: &str,
+    stored_namespace: Option<&str>,
+    attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
+    peer_id: Option<&str>,
+    require_push_namespace_scope: bool,
+) -> bool {
+    // Zero-config: byte-identical faith-based replication (see the doc on
+    // `inbound_write_namespace_authorized`).
+    if !attest_cfg.has_allowlist() {
+        return true;
+    }
+    match stored_namespace {
+        // Layer 1 is (or may be) armed and the caller resolved the row — the
+        // stored namespace is the subject of the scope check on a by-id lane.
+        Some(namespace) => inbound_write_namespace_authorized(
+            lane,
+            memory_id,
+            namespace,
+            None,
+            attest_cfg,
+            peer_id,
+            require_push_namespace_scope,
+        ),
+        None if peer_declares_namespace_scope(peer_id, attest_cfg) => {
+            tracing::warn!(
+                target: crate::handlers::federation_receive::ATTESTATION_TRACE_TARGET,
+                memory_id = %memory_id,
+                peer_id = %peer_id.unwrap_or(""),
+                "sync_push: refusing federated {lane} entry — Layer 1 is armed for this \
+                 peer, so the target row's stored namespace is load-bearing, but the \
+                 caller elided the probe (#2488 fail-closed)"
+            );
+            false
+        }
+        // Layer-2-only shape: the stored namespace was never read because it
+        // cannot change the verdict.
+        None => layer2_unscoped_peer_authorized(
+            lane,
+            memory_id,
+            None,
+            attest_cfg,
+            peer_id,
+            require_push_namespace_scope,
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1184,6 +1412,182 @@ mod tests {
             ),
             "Layer 2 OFF: the staged-rollout opt-out restores the legacy posture"
         );
+    }
+
+    /// #2488 — the by-id verdict's `Option<&str>` contract, exercised without
+    /// any HTTP/DB plumbing. The `None` arms are the whole point of the type
+    /// change: one must reach Layer 2 (the shape whose gate #2488 skipped), the
+    /// other must fail CLOSED (the shape a fabricated `unwrap_or("")` would have
+    /// silently glob-matched into a Layer-1 accept-or-refuse on an empty string).
+    #[test]
+    fn inbound_by_id_verdict_option_contract_2488() {
+        use crate::federation::peer_attestation::{PeerAttestationConfig, PeerScope};
+
+        // ZERO-CONFIG — #2491. A verbatim `namespace_allowed` call returns false
+        // here (its `scope_for == None` arm falls through to the default-off
+        // `sync_trust_peer_bypass`), which is exactly the silent
+        // delete-replication outage. The verdict must short-circuit to `true`
+        // regardless of whether the caller resolved a namespace.
+        let zero_config = PeerAttestationConfig::default();
+        for stored in [None, Some("secure/ops")] {
+            assert!(
+                inbound_by_id_namespace_authorized(
+                    LANE_DELETIONS,
+                    "id-1",
+                    stored,
+                    &zero_config,
+                    Some("peer-1"),
+                    true,
+                ),
+                "zero-config must replicate the deletion (#2491), stored={stored:?}"
+            );
+        }
+
+        // ENROLLED + UNSCOPED — #2488. Layer 1 is NOT armed, so the caller
+        // legitimately elides the probe and passes `None`; the verdict must
+        // still reach Layer 2 rather than skipping all checking.
+        let mut unscoped = PeerAttestationConfig::default();
+        unscoped.peers.insert(
+            "peer-1".to_string(),
+            PeerScope {
+                allowed_sender_agent_ids: vec!["a".to_string()],
+                allowed_namespaces: vec![],
+            },
+        );
+        assert!(
+            !inbound_by_id_namespace_authorized(
+                LANE_DELETIONS,
+                "id-1",
+                None,
+                &unscoped,
+                Some("peer-1"),
+                true,
+            ),
+            "#2488: an enrolled peer declaring no scope must be REFUSED on the \
+             by-id lane even though the stored namespace was never read — this is \
+             the arm the read-elision predicate made unreachable"
+        );
+        assert!(
+            inbound_by_id_namespace_authorized(
+                LANE_DELETIONS,
+                "id-1",
+                None,
+                &unscoped,
+                Some("peer-1"),
+                false,
+            ),
+            "#2488: the env-row-147 rollout opt-out must be REACHABLE on this lane"
+        );
+
+        // ENROLLED + SCOPED — Layer 1 armed. `Some` behaves as before, and
+        // `None` (a caller that wrongly elided a load-bearing probe) must fail
+        // CLOSED rather than be waved through.
+        let mut scoped = PeerAttestationConfig::default();
+        scoped.peers.insert(
+            "peer-1".to_string(),
+            PeerScope {
+                allowed_sender_agent_ids: vec![],
+                allowed_namespaces: vec!["public/*".to_string()],
+            },
+        );
+        assert!(
+            inbound_by_id_namespace_authorized(
+                LANE_DELETIONS,
+                "id-1",
+                Some("public/ok"),
+                &scoped,
+                Some("peer-1"),
+                true,
+            ),
+            "Layer 1: an in-scope stored namespace is applied"
+        );
+        assert!(
+            !inbound_by_id_namespace_authorized(
+                LANE_DELETIONS,
+                "id-1",
+                Some("secure/ops"),
+                &scoped,
+                Some("peer-1"),
+                true,
+            ),
+            "Layer 1: an out-of-scope stored namespace is refused (#1934)"
+        );
+        assert!(
+            !inbound_by_id_namespace_authorized(
+                LANE_DELETIONS,
+                "id-1",
+                None,
+                &scoped,
+                Some("peer-1"),
+                true,
+            ),
+            "#2488 fail-closed: `None` while Layer 1 IS armed means the caller \
+             elided a load-bearing probe; the stored namespace decides on that \
+             path, so an absent value must never be admitted"
+        );
+
+        // #2497 — the two peer shapes the knob must NEVER govern. Under an
+        // ENROLLED posture, a header-absent (`None`) or unenrolled peer is
+        // refused UNCONDITIONALLY: both knob states, both allowlist shapes,
+        // both `stored_namespace` values. The knob-OFF arms are the
+        // regression — the first #2488 fix returned `true` for every one of
+        // them, granting an anonymous or unknown peer unbounded delete-by-id.
+        for cfg in [&unscoped, &scoped] {
+            for peer in [None, Some("peer-not-enrolled"), Some("   ")] {
+                for require in [true, false] {
+                    for stored in [None, Some("public/ok"), Some("secure/ops")] {
+                        assert!(
+                            !inbound_by_id_namespace_authorized(
+                                LANE_DELETIONS,
+                                "id-1",
+                                stored,
+                                cfg,
+                                peer,
+                                require,
+                            ),
+                            "#2497: under an enrolled posture a header-absent / \
+                             unenrolled / whitespace-only peer must be REFUSED \
+                             unconditionally — the rollout knob governs only an \
+                             ENROLLED peer that declared no allowed_namespaces. \
+                             peer={peer:?} require={require} stored={stored:?}"
+                        );
+                        // Same contract on the WRITE lane's shared entry point,
+                        // so the two lanes cannot disagree about these shapes.
+                        assert!(
+                            !inbound_write_namespace_authorized(
+                                "memories",
+                                "id-1",
+                                "public/ok",
+                                stored,
+                                cfg,
+                                peer,
+                                require,
+                            ),
+                            "#2497: the write lane must refuse the same shapes \
+                             identically. peer={peer:?} require={require}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // And the ZERO-CONFIG posture is untouched by all of that: with no
+        // allowlist configured, a header-absent push still replicates (that is
+        // #2491, and it must not be re-broken by the #2497 tightening).
+        for peer in [None, Some("peer-not-enrolled")] {
+            assert!(
+                inbound_by_id_namespace_authorized(
+                    LANE_DELETIONS,
+                    "id-1",
+                    None,
+                    &zero_config,
+                    peer,
+                    true,
+                ),
+                "#2491: zero-config replicates regardless of the peer header — the \
+                 #2497 tightening applies ONLY under an enrolled posture. peer={peer:?}"
+            );
+        }
     }
 
     #[test]
