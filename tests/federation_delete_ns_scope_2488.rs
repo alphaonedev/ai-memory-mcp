@@ -12,10 +12,13 @@
 //! * **#2491 (sqlite, data-integrity):** the #1934 delete gate called
 //!   `peer_attestation::namespace_allowed` UNCONDITIONALLY. Its
 //!   `scope_for(peer) == None` arm falls through to `sync_trust_peer_bypass()`
-//!   (default FALSE), so in the ZERO-CONFIG posture — and on any header-absent
-//!   push — EVERY federated deletion was refused and counted `skipped` inside an
-//!   HTTP 200. No DLQ, no retry: replicas diverged permanently while the origin
-//!   believed the erasure had propagated.
+//!   (default FALSE), so in the ZERO-CONFIG posture EVERY federated deletion was
+//!   refused and counted `skipped` inside an HTTP 200. Since #2341 a
+//!   `skipped > 0` report IS a non-ack, so the origin does not mis-count it as
+//!   replicated — but the delete lane logs a warn-only `Fail` and NEVER retries
+//!   (no DLQ enqueue, #2498), `/sync/since` carries no tombstones, and quorum
+//!   arithmetic can still satisfy `W` from the local commit plus one healthy
+//!   peer. Replicas diverge permanently and silently.
 //! * **#2488 (postgres, CWE-284):** the twin wrapped the whole gate in the
 //!   read-ELISION predicate, making it unreachable for the enrolled-unscoped
 //!   peer Layer 2 exists to refuse. Pinned in
@@ -283,8 +286,10 @@ async fn zero_config_federated_deletion_applies_2491() {
     assert!(
         !row_exists(&db, &id).await,
         "#2491: a zero-config federated deletion MUST be applied — the row \
-         surviving here is the live delete-replication outage (replicas diverge \
-         permanently while the origin is told the erasure propagated)"
+         surviving here is the live delete-replication outage. Since #2341 the \
+         origin does NOT mis-count the refusal as an ack; what it does is log a \
+         warn-only Fail and never retry (no DLQ enqueue, #2498), so the divergence \
+         is permanent and silent rather than mis-reported"
     );
     assert_eq!(
         counter(&report, "deleted"),
@@ -470,5 +475,153 @@ async fn undecryptable_envelope_row_is_still_federated_deleted_2488() {
         counter(&report, "deleted"),
         1,
         "#2488: the undecryptable row must be COUNTED deleted, not skipped"
+    );
+}
+
+// ---------------------------------------------------------------------
+// R-203 #6 (#2497) — the shapes the KNOB MUST NEVER GOVERN.
+//
+// Two lenses of the #2497 review converged on this hole from opposite
+// sides: one found that the first #2488 fix WIDENED the header-absent
+// shape from refuse to allow, the other found the not-in-allowlist
+// REFUSAL path had zero assertions on either backend on any lane
+// (`tests/federation_write_ns_scope_2447.rs` never uses a non-allowlisted
+// peer header either). Both point at the same gap.
+//
+// The failure scenario these prevent is specific: an operator reports
+// deletions silently stopped replicating, someone reads the fail-closed
+// `None` arm as over-refusal and returns `true` for the not-in-allowlist
+// shape — and every unknown peer regains unbounded delete-by-id on an
+// enrolled node while all the other tests plus the unit pin stay green.
+// #2488 reopened for a different peer shape, with the R-203 proof intact
+// and blind to it.
+//
+// Each cell is asserted under BOTH knob states, because the whole point
+// is that these shapes are refused UNCONDITIONALLY —
+// AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE governs only the ENROLLED
+// peer that declared no scope, never an anonymous or unenrolled one.
+// ---------------------------------------------------------------------
+
+/// A peer id that is NOT a key in either allowlist const above.
+const UNKNOWN_PEER_ID: &str = "ai:unknown";
+
+#[tokio::test]
+async fn unknown_peer_federated_deletion_refused_under_enrolled_posture_2497() {
+    let _g = ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+
+    // PROBED, not reasoned from source shape: on this surface an unknown peer
+    // never reaches the namespace gate at all. The #1056 TOFU guard
+    // (`federation_receive.rs:951-968`) refuses a PRESENT-but-unlisted
+    // `x-peer-id` with a typed `401 x_peer_id_not_in_allowlist` before any
+    // subcollection loop runs, and that guard has NO knob — it fires whenever
+    // `has_allowlist()`, independent of `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT`
+    // (which this posture sets to `0`) and of the namespace-scope knob. So the
+    // disposition is a LOUD, sender-visible refusal of the whole push.
+    //
+    // The namespace gate's own refusal of this shape is therefore
+    // DEFENCE-IN-DEPTH, and it is pinned purely (no HTTP) by
+    // `receive_auth::tests::inbound_by_id_verdict_option_contract_2488`. That
+    // matters because the ordering here is the ONLY thing making the gate arm
+    // unreachable: relax #1056, or add a receive surface that skips it, and the
+    // namespace gate becomes the last line. Asserting both layers means neither
+    // can be removed silently.
+    //
+    // Four cells: {UNSCOPED, SCOPED} x {knob default ON, knob=0} — the
+    // disposition must not depend on the rollout knob in any of them.
+    for (allowlist, label) in [
+        (UNSCOPED_ALLOWLIST, "enrolled-unscoped allowlist"),
+        (SCOPED_ALLOWLIST, "enrolled-scoped allowlist"),
+    ] {
+        for knob in [None, Some("0")] {
+            set_posture(Some(allowlist), knob);
+            let (router, db) = build_router_with_db();
+            let id = seed_row(&router, VICTIM_NS, "unknown-peer-target").await;
+
+            let (status, _report) = push_deletions(&router, Some(UNKNOWN_PEER_ID), &[&id]).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "#2497/#1056: a peer NOT in a non-empty allowlist must be refused \
+                 LOUDLY at the envelope layer, and that refusal must not depend on \
+                 the namespace-scope rollout knob. posture={label}, \
+                 AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE={knob:?}"
+            );
+            assert!(
+                row_exists(&db, &id).await,
+                "#2497: nothing is deleted when the envelope gate refuses the push. \
+                 posture={label}, knob={knob:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn header_absent_federated_deletion_refused_under_enrolled_posture_2497() {
+    let _g = ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+
+    // THE #2497 REGRESSION. Reachability needs both documented rollout
+    // hatches: TRUST_BODY_AGENT_ID=1 (without it the #238 envelope gate
+    // returns 403 peer_id_header_missing before any subcollection loop) and
+    // knob 147 falsy. With both set, the first #2488 fix let an ANONYMOUS
+    // push hard-delete a secure/ops row on a node whose only enrolled peer
+    // is scoped public/* — `deleted: 1`. The parent refused it, because
+    // `namespace_allowed(None, ..)` returns `sync_trust_peer_bypass()`,
+    // false by default. AI_MEMORY_FED_SYNC_TRUST_PEER stays REMOVED
+    // throughout (set_posture clears it), so this is not the legacy bypass.
+    for (allowlist, label) in [
+        (UNSCOPED_ALLOWLIST, "enrolled-unscoped allowlist"),
+        (SCOPED_ALLOWLIST, "enrolled-scoped allowlist"),
+    ] {
+        for knob in [None, Some("0")] {
+            set_posture(Some(allowlist), knob);
+            unsafe {
+                std::env::set_var(TRUST_BODY_AGENT_ID_ENV, "1");
+            }
+            let (router, db) = build_router_with_db();
+            let id = seed_row(&router, VICTIM_NS, "anonymous-delete-target").await;
+
+            let (status, report) = push_deletions(&router, None, &[&id]).await;
+            assert!(
+                status.is_success(),
+                "the legacy header-absent opt-out lets the push reach the loops; \
+                 got {status} {report}"
+            );
+            assert!(
+                row_exists(&db, &id).await,
+                "#2497: an ANONYMOUS push (no x-peer-id) must NOT be able to \
+                 hard-delete by id on a node that declares a peer allowlist. This \
+                 refusal is UNCONDITIONAL — the rollout knob governs only an ENROLLED \
+                 peer that declared no allowed_namespaces, so it must NOT widen into \
+                 an anonymous-delete grant. posture={label}, \
+                 AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE={knob:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn malformed_whitespace_peer_id_is_treated_as_absent_and_refused_2497() {
+    let _g = ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+    // `extract_peer_id` drops a whitespace-only `X-Peer-Id` to `None`, and the
+    // #1056 TOFU enrollment guard is `if let Some(peer_id)` — so it is SKIPPED
+    // entirely and "malformed header" is indistinguishable from "no header" to
+    // that gate. The namespace gate must therefore treat it as anonymous.
+    set_posture(Some(SCOPED_ALLOWLIST), Some("0"));
+    unsafe {
+        std::env::set_var(TRUST_BODY_AGENT_ID_ENV, "1");
+    }
+    let (router, db) = build_router_with_db();
+    let id = seed_row(&router, VICTIM_NS, "whitespace-peer-target").await;
+
+    let (status, _report) = push_deletions(&router, Some("   "), &[&id]).await;
+    assert!(status.is_success() || status == StatusCode::FORBIDDEN);
+    assert!(
+        row_exists(&db, &id).await,
+        "#2497: a whitespace-only x-peer-id collapses to None before the gate sees \
+         it, so it must land in the same UNCONDITIONAL refusal as a truly absent \
+         header — never in the knob-governed enrolled-unscoped arm"
     );
 }

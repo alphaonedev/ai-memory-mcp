@@ -656,9 +656,17 @@ pub const REQUIRE_PUSH_NAMESPACE_SCOPE_ENV: &str = "AI_MEMORY_FED_REQUIRE_PUSH_N
 /// no `AI_MEMORY_FED_PEER_ATTESTATION` configured the check never runs. Its
 /// entire blast radius is ONE config shape — the operator wrote the peer JSON,
 /// enrolled this peer, and left `allowed_namespaces` empty/absent (it is
-/// `#[serde(default)]`, so an omitted field silently yields `[]`). That shape
-/// today grants the peer ZERO read scope and ZERO delete scope while leaving
-/// its WRITE scope unbounded; the flip makes the three lanes agree.
+/// `#[serde(default)]`, so an omitted field silently yields `[]`).
+///
+/// **That claim is STRUCTURALLY ENFORCED, not merely asserted (#2497).**
+/// [`layer2_unscoped_peer_authorized`] refuses the header-absent and
+/// not-in-a-non-empty-allowlist shapes UNCONDITIONALLY, before it consults this
+/// knob at all — see [`peer_enrolled_in_allowlist`] for the shape table and the
+/// regression that skipping that split caused (a falsy knob plus
+/// `AI_MEMORY_FED_TRUST_BODY_AGENT_ID=1` briefly granted an ANONYMOUS peer
+/// unbounded federated delete-by-id). An operator who wants an unlisted peer
+/// admitted removes the allowlist (zero-config, which short-circuits earlier) or
+/// enrolls the peer; this knob is never that lever.
 ///
 /// Two recoveries, both without a restart-blocking rewrite: declare the peer's
 /// real scope (or `["**"]` for deliberate allow-all — the PER-PEER escape,
@@ -696,6 +704,52 @@ pub fn peer_declares_namespace_scope(
         .filter(|p| !p.is_empty())
         .and_then(|p| attest_cfg.scope_for(p))
         .is_some_and(|scope| !scope.allowed_namespaces.is_empty())
+}
+
+/// Whether this push presents a peer id that is ENROLLED in a non-empty
+/// `AI_MEMORY_FED_PEER_ATTESTATION` allowlist — regardless of whether that
+/// peer's row declares any `allowed_namespaces`.
+///
+/// The sibling of [`peer_declares_namespace_scope`], and the predicate that
+/// separates the ONE peer shape [`require_push_namespace_scope_enabled`]
+/// governs from the two it must NEVER govern.
+///
+/// # Why this exists (the #2497 regression it closes)
+///
+/// Under an enrolled posture, THREE distinct peer shapes fall through to
+/// Layer 2 — and only ONE of them is the shape the knob was written for:
+///
+/// | shape | `scope_for(peer)` | governed by knob 147? |
+/// |---|---|---|
+/// | enrolled, `allowed_namespaces: []` | `Some(empty)` | **YES** — the #2447 Layer-2 shape |
+/// | peer id ABSENT (or whitespace-only) | n/a | **NO** — refuse unconditionally |
+/// | peer NOT in a non-empty allowlist | `None` | **NO** — refuse unconditionally |
+///
+/// The first #2488 fix routed all three through the knob, so
+/// `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0` — a documented rollout
+/// hatch — granted an ANONYMOUS or UNKNOWN peer unbounded delete-by-id on a
+/// node that had declared an allowlist. That both regressed the parent's
+/// behaviour for those shapes (`namespace_allowed` refused them via
+/// `sync_trust_peer_bypass()`'s default-false) and falsified this module's own
+/// documented claim that the knob's blast radius is ONE config shape. A
+/// malformed header makes it worse: `extract_peer_id` drops a whitespace-only
+/// `X-Peer-Id` to `None`, and the #1056 TOFU enrollment guard is
+/// `if let Some(peer_id)`, so "malformed" and "absent" are indistinguishable
+/// to that gate and neither is caught there.
+///
+/// An operator who genuinely wants an unlisted peer admitted removes the
+/// allowlist (the zero-config posture, which short-circuits before Layer 2) or
+/// enrolls the peer — never a knob whose documented scope is a different shape.
+#[must_use]
+pub fn peer_enrolled_in_allowlist(
+    peer_id: Option<&str>,
+    attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
+) -> bool {
+    peer_id
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .and_then(|p| attest_cfg.scope_for(p))
+        .is_some()
 }
 
 /// Whether the write-lane gate needs the EXISTING local row's namespace
@@ -859,6 +913,7 @@ pub fn inbound_write_namespace_authorized(
         lane,
         memory_id,
         Some(claimed_namespace),
+        attest_cfg,
         peer_id,
         require_push_namespace_scope,
     )
@@ -877,14 +932,50 @@ pub fn inbound_write_namespace_authorized(
 /// `namespace` is for the log line only — it is never consulted for the verdict,
 /// which is why the caller may legitimately pass `None` after eliding the probe
 /// (see [`inbound_write_needs_existing_namespace`]).
+///
+/// ## Only the ENROLLED-UNSCOPED shape is knob-governed (#2497)
+///
+/// Three peer shapes reach here under an enrolled posture, and
+/// `require_push_namespace_scope` governs exactly ONE of them — see
+/// [`peer_enrolled_in_allowlist`] for the table and the regression that
+/// conflating them caused. A header-absent or not-in-the-allowlist push is
+/// refused UNCONDITIONALLY, so the rollout hatch can never widen into an
+/// anonymous-or-unknown-peer grant.
 fn layer2_unscoped_peer_authorized(
     lane: &str,
     memory_id: &str,
     namespace: Option<&str>,
+    attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
     peer_id: Option<&str>,
     require_push_namespace_scope: bool,
 ) -> bool {
     use crate::handlers::federation_receive::ATTESTATION_TRACE_TARGET;
+
+    // #2497 — the two shapes the knob must NEVER govern. Refuse UNCONDITIONALLY.
+    // `peer_id` here is already the post-`extract_peer_id` value, so a
+    // whitespace-only header has collapsed to `None` and lands in the same arm.
+    if !peer_enrolled_in_allowlist(peer_id, attest_cfg) {
+        let shape = if peer_id.map(str::trim).is_none_or(str::is_empty) {
+            "no x-peer-id header was presented (or it was empty/whitespace)"
+        } else {
+            "the presented x-peer-id is not enrolled in AI_MEMORY_FED_PEER_ATTESTATION"
+        };
+        tracing::warn!(
+            target: ATTESTATION_TRACE_TARGET,
+            memory_id = %memory_id,
+            namespace = %namespace.unwrap_or(""),
+            peer_id = %peer_id.unwrap_or(""),
+            "sync_push: refusing federated {lane} entry — this node declares a peer \
+             allowlist and {shape}, so the peer has NO namespace scope to act within \
+             (#2447/#2497). This refusal is UNCONDITIONAL: \
+             AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE governs only an ENROLLED peer \
+             that declared no allowed_namespaces, never an anonymous or unenrolled \
+             one. Enroll the peer in AI_MEMORY_FED_PEER_ATTESTATION (with a real \
+             scope, or [\"**\"] for a deliberate per-peer allow-all), or remove the \
+             allowlist entirely for the zero-config posture."
+        );
+        return false;
+    }
 
     if !require_push_namespace_scope {
         return true;
@@ -992,6 +1083,7 @@ pub fn inbound_by_id_namespace_authorized(
             lane,
             memory_id,
             None,
+            attest_cfg,
             peer_id,
             require_push_namespace_scope,
         ),
@@ -1416,6 +1508,69 @@ mod tests {
              elided a load-bearing probe; the stored namespace decides on that \
              path, so an absent value must never be admitted"
         );
+
+        // #2497 — the two peer shapes the knob must NEVER govern. Under an
+        // ENROLLED posture, a header-absent (`None`) or unenrolled peer is
+        // refused UNCONDITIONALLY: both knob states, both allowlist shapes,
+        // both `stored_namespace` values. The knob-OFF arms are the
+        // regression — the first #2488 fix returned `true` for every one of
+        // them, granting an anonymous or unknown peer unbounded delete-by-id.
+        for cfg in [&unscoped, &scoped] {
+            for peer in [None, Some("peer-not-enrolled"), Some("   ")] {
+                for require in [true, false] {
+                    for stored in [None, Some("public/ok"), Some("secure/ops")] {
+                        assert!(
+                            !inbound_by_id_namespace_authorized(
+                                LANE_DELETIONS,
+                                "id-1",
+                                stored,
+                                cfg,
+                                peer,
+                                require,
+                            ),
+                            "#2497: under an enrolled posture a header-absent / \
+                             unenrolled / whitespace-only peer must be REFUSED \
+                             unconditionally — the rollout knob governs only an \
+                             ENROLLED peer that declared no allowed_namespaces. \
+                             peer={peer:?} require={require} stored={stored:?}"
+                        );
+                        // Same contract on the WRITE lane's shared entry point,
+                        // so the two lanes cannot disagree about these shapes.
+                        assert!(
+                            !inbound_write_namespace_authorized(
+                                "memories",
+                                "id-1",
+                                "public/ok",
+                                stored,
+                                cfg,
+                                peer,
+                                require,
+                            ),
+                            "#2497: the write lane must refuse the same shapes \
+                             identically. peer={peer:?} require={require}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // And the ZERO-CONFIG posture is untouched by all of that: with no
+        // allowlist configured, a header-absent push still replicates (that is
+        // #2491, and it must not be re-broken by the #2497 tightening).
+        for peer in [None, Some("peer-not-enrolled")] {
+            assert!(
+                inbound_by_id_namespace_authorized(
+                    LANE_DELETIONS,
+                    "id-1",
+                    None,
+                    &zero_config,
+                    peer,
+                    true,
+                ),
+                "#2491: zero-config replicates regardless of the peer header — the \
+                 #2497 tightening applies ONLY under an enrolled posture. peer={peer:?}"
+            );
+        }
     }
 
     #[test]

@@ -334,9 +334,9 @@ fn classify_quarantine_cause(last_error: &str) -> &'static str {
         // refusal: the peer's config is fine and the row is un-erasable until
         // the read succeeds. Operator-actionable at the RECEIVER's storage, not
         // at the sender's allowlist. Dormant until the delete lane gains a DLQ
-        // enqueue (tracked separately); classified here so the closed label set
-        // is already correct when it does, and so the token has exactly one
-        // meaning across the substrate.
+        // enqueue (#2498); classified here so the closed label set is already
+        // correct when it does, and so the token has exactly one meaning across
+        // the substrate.
         CAUSE_NAMESPACE_PROBE_UNRESOLVABLE
     } else if last_error.contains("401") || last_error.contains("403") {
         // The replay last_error is the `http {status}` shape, so 401/403

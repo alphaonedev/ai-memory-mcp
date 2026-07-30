@@ -1754,11 +1754,28 @@ pub trait MemoryStore: Send + Sync {
     /// - sqlite's arm has never had an owner gate, so adding one on postgres
     ///   only would manufacture a fresh cross-backend divergence.
     ///
-    /// The correct control on this lane is NAMESPACE SCOPE, enforced
-    /// reject-before-apply in the receive funnels via
+    /// The control on the `deletions[]` funnel is NAMESPACE SCOPE, enforced
+    /// reject-before-apply in both receive funnels via
     /// [`crate::federation::receive_auth::inbound_by_id_namespace_authorized`]
     /// (#1934 / #2447 / #2488), not per-row ownership. Refuted by the Fable 5
     /// 1×7 vote (`4d3ea1c5`).
+    ///
+    /// ## Scope of that statement — do NOT read it as "this method is confined"
+    ///
+    /// It describes the `deletions[]` subcollection ONLY. `apply_remote_deletion`
+    /// is one of several receive-side funnels that can reach a hard `delete`, and
+    /// the others are NOT namespace-gated: `pending_decisions[]` reaches
+    /// `crate::storage::delete` on an attacker-chosen `memory_id` with no
+    /// namespace check (`pending_author_authorized` inspects `requested_by` and
+    /// the payload's `metadata.agent_id`, never `pa.namespace`, and never
+    /// resolves `pa.memory_id`), and `namespace_meta[]` has no scope gate at all
+    /// — which lets a peer rebind a foreign namespace's governance standard to an
+    /// approver it controls and then self-approve. Both are tracked as **#2478**
+    /// and **#2479**, both are sqlite-reachable under DEFAULT config, and neither
+    /// increments the `deleted` counter, so such a delete is invisible in the
+    /// 200 response, the refusal WARN, and the DLQ cause set. Namespace scope is
+    /// the control on THIS funnel; it is not yet the control on the destructive
+    /// capability as a whole.
     async fn apply_remote_deletion(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
         match self.delete(ctx, id).await {
             Ok(()) => Ok(true),

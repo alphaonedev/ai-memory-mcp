@@ -64,6 +64,7 @@ static FED_ENV_LOCK: Mutex<()> = Mutex::const_new(());
 const REQUIRE_ATTEST_ENV: &str = "AI_MEMORY_REQUIRE_AGENT_ATTESTATION";
 const REQUIRE_ENROLLMENT_ENV: &str = "AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT";
 const SYNC_TRUST_PEER_ENV: &str = "AI_MEMORY_FED_SYNC_TRUST_PEER";
+const TRUST_BODY_AGENT_ID_ENV: &str = "AI_MEMORY_FED_TRUST_BODY_AGENT_ID";
 
 /// RAII posture guard — an assertion panic must not leak an enrolled allowlist
 /// into the next test in this binary (`clear_posture()` at the end of a test
@@ -148,6 +149,7 @@ fn set_unscoped_posture(peer: &str, require_scope: Option<&str>) {
         std::env::set_var(REQUIRE_ATTEST_ENV, "0");
         std::env::set_var(REQUIRE_ENROLLMENT_ENV, "0");
         std::env::remove_var(SYNC_TRUST_PEER_ENV);
+        std::env::remove_var(TRUST_BODY_AGENT_ID_ENV);
         std::env::set_var(
             ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV,
             format!(r#"{{"{peer}":{{"allowed_sender_agent_ids":["{peer}"]}}}}"#),
@@ -170,6 +172,7 @@ fn set_scoped_posture(peer: &str, public_ns_root: &str) {
         std::env::set_var(REQUIRE_ATTEST_ENV, "0");
         std::env::set_var(REQUIRE_ENROLLMENT_ENV, "0");
         std::env::remove_var(SYNC_TRUST_PEER_ENV);
+        std::env::remove_var(TRUST_BODY_AGENT_ID_ENV);
         std::env::set_var(
             ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV,
             format!(
@@ -188,6 +191,7 @@ fn set_zero_config_posture() {
         std::env::set_var(REQUIRE_ATTEST_ENV, "0");
         std::env::set_var(REQUIRE_ENROLLMENT_ENV, "0");
         std::env::remove_var(SYNC_TRUST_PEER_ENV);
+        std::env::remove_var(TRUST_BODY_AGENT_ID_ENV);
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
         std::env::remove_var(ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV);
     }
@@ -199,6 +203,7 @@ fn clear_posture() {
         std::env::remove_var(REQUIRE_ENROLLMENT_ENV);
         std::env::remove_var(REQUIRE_ATTEST_ENV);
         std::env::remove_var(ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV);
+        std::env::remove_var(TRUST_BODY_AGENT_ID_ENV);
     }
 }
 
@@ -281,6 +286,30 @@ async fn push_deletions(
 
 fn counter(report: &Value, key: &str) -> i64 {
     report.get(key).and_then(Value::as_i64).unwrap_or(-1)
+}
+
+/// #2497 — a deletions push carrying NO `X-Peer-Id` header at all.
+async fn push_deletions_no_peer_header(router: &axum::Router, ids: &[&str]) -> (StatusCode, Value) {
+    let body = json!({
+        "sender_agent_id": "ai:anonymous-2497",
+        "sender_clock": {"entries": {}},
+        "memories": [],
+        "deletions": ids,
+        "dry_run": false,
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/sync/push")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let report: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, report)
 }
 
 // ---------------------------------------------------------------------
@@ -494,4 +523,120 @@ async fn undecryptable_envelope_row_is_still_federated_deleted_2488_pg() {
         1,
         "#2488 (pg): the undecryptable row must be COUNTED deleted, not skipped"
     );
+}
+
+// ---------------------------------------------------------------------
+// R-203 #6 (#2497) — the shapes the KNOB MUST NEVER GOVERN (postgres).
+//
+// Postgres twin of the sqlite cells. On this backend the parent
+// (`4f28f1d8`) ALSO allowed both shapes — `peer_declares_namespace_scope`
+// is false for an unknown/absent peer, so the read-elision predicate
+// skipped the whole gate — which makes these the #2488 fail-open for two
+// MORE peer shapes, not only a #2497 regression. They must be refused
+// UNCONDITIONALLY: the rollout knob governs only an ENROLLED peer that
+// declared no allowed_namespaces.
+// ---------------------------------------------------------------------
+
+/// A peer id that is never enrolled by any posture helper in this file.
+const UNKNOWN_PEER_ID: &str = "ai:unknown-2497";
+
+#[tokio::test]
+async fn unknown_peer_federated_deletion_refused_under_enrolled_posture_2497_pg() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP unknown_peer_federated_deletion_refused_under_enrolled_posture_2497_pg: no AI_MEMORY_TEST_POSTGRES_URL"
+        );
+        return;
+    };
+    let _g = FED_ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+    let enrolled = uniq("ai:enrolled");
+    let public_root = uniq("public");
+    let pool = raw_pool(&url).await;
+
+    // PROBED (see the sqlite twin for the full note): the #1056 TOFU guard
+    // lives in the SHARED outer `sync_push` entry, ahead of the postgres
+    // dispatch, so a PRESENT-but-unlisted `x-peer-id` is refused with a typed
+    // `401 x_peer_id_not_in_allowlist` on this backend too — it never reaches
+    // the namespace gate. The gate's own refusal of this shape is
+    // defence-in-depth, pinned purely by
+    // `receive_auth::tests::inbound_by_id_verdict_option_contract_2488`.
+    for knob in [None, Some("0")] {
+        for scoped in [false, true] {
+            if scoped {
+                set_scoped_posture(&enrolled, &public_root);
+                if let Some(v) = knob {
+                    unsafe {
+                        std::env::set_var(
+                            ai_memory::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+                            v,
+                        );
+                    }
+                }
+            } else {
+                set_unscoped_posture(&enrolled, knob);
+            }
+            let (router, store) = pg_router(&url).await;
+            let victim_ns = uniq("secure/ops");
+            let victim_id = uuid::Uuid::new_v4().to_string();
+            seed_row(&store, &victim_id, &victim_ns, &uniq("unknown-peer-victim")).await;
+
+            let (status, _report) =
+                push_deletions(&router, UNKNOWN_PEER_ID, UNKNOWN_PEER_ID, &[&victim_id]).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "#2497/#1056 (pg): a peer NOT in a non-empty allowlist must be refused \
+                 LOUDLY at the shared envelope layer, independent of the \
+                 namespace-scope rollout knob. scoped={scoped}, knob={knob:?}"
+            );
+            assert!(
+                row_exists(&pool, &victim_id).await,
+                "#2497 (pg): nothing is deleted when the envelope gate refuses the \
+                 push. scoped={scoped}, knob={knob:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn header_absent_federated_deletion_refused_under_enrolled_posture_2497_pg() {
+    let Some(url) = pg_url() else {
+        eprintln!(
+            "SKIP header_absent_federated_deletion_refused_under_enrolled_posture_2497_pg: no AI_MEMORY_TEST_POSTGRES_URL"
+        );
+        return;
+    };
+    let _g = FED_ENV_LOCK.lock().await;
+    let _posture = PostureGuard;
+    let enrolled = uniq("ai:enrolled");
+    let pool = raw_pool(&url).await;
+
+    // Reachability needs both documented rollout hatches (see the sqlite twin).
+    // AI_MEMORY_FED_SYNC_TRUST_PEER stays REMOVED (the posture helpers clear
+    // it), so this is not the legacy bypass.
+    for knob in [None, Some("0")] {
+        set_unscoped_posture(&enrolled, knob);
+        unsafe {
+            std::env::set_var(TRUST_BODY_AGENT_ID_ENV, "1");
+        }
+        let (router, store) = pg_router(&url).await;
+        let victim_ns = uniq("secure/ops");
+        let victim_id = uuid::Uuid::new_v4().to_string();
+        seed_row(&store, &victim_id, &victim_ns, &uniq("anonymous-victim")).await;
+
+        let (status, report) = push_deletions_no_peer_header(&router, &[&victim_id]).await;
+        assert!(
+            status.is_success(),
+            "the legacy header-absent opt-out lets the push reach the loops; \
+             got {status} {report}"
+        );
+        assert!(
+            row_exists(&pool, &victim_id).await,
+            "#2497 (pg): an ANONYMOUS push (no x-peer-id) must NOT be able to \
+             hard-delete by id on a node that declares a peer allowlist — \
+             UNCONDITIONALLY, never widened by the rollout knob. \
+             AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE={knob:?}"
+        );
+    }
 }
