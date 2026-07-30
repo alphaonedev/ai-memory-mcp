@@ -5,8 +5,19 @@ name: publish-sdks
 # - npm: `npm publish --provenance --access public` using `id-token: write`
 #   against a Trusted Publisher configured at npmjs.com.
 #
-# Both jobs run inside protected GitHub Environments so a maintainer
-# must approve each publish.
+# Both jobs declare a GitHub Environment (`pypi-publish` / `npm-publish`).
+#
+# ⚠ #2467 TRUTH-FIX — those environments have NO protection rules configured
+# (`gh api repos/:owner/:repo/environments` -> `protection_rules: []` on both),
+# so declaring them does NOT create an approval gate. This comment previously
+# asserted "a maintainer must approve each publish", which was false: nothing
+# holds a publish for review today. Contrast `github-pages`, which does carry a
+# protection rule -- the mechanism works and was simply never applied here.
+#
+# Adding required reviewers is a repository-SETTINGS change, not a workflow
+# change, so it cannot be fixed in this file. Until it is, the prerelease guard
+# below is the only thing standing between a tag push and an irreversible
+# publish to two public registries.
 #
 # #2455 — TEST-BEFORE-PUBLISH. This workflow triggers on `push: tags: v*`, so
 # cutting the GA tag publishes both SDKs. Before #2455 the steps were
@@ -36,7 +47,18 @@ permissions: {}
 
 jobs:
   publish-pypi:
-    if: ${{ github.event_name == 'push' || github.event.inputs.target == 'both' || github.event.inputs.target == 'pypi' }}
+    # #2467 — PRERELEASE GUARD. `github.event_name == 'push'` alone is true for
+    # EVERY `v*` tag, so before this guard `git push origin v1.0.0-rc.1` published
+    # the STABLE slot: the SDK versions are hardcoded in the manifests
+    # (`sdk/python/ai_memory/_version.py`, `sdk/typescript/package.json`), not
+    # derived from the tag. Registry version slots are not reusable -- the 0.9.0
+    # slot was burned exactly this way (`987f24fb`), forcing 0.9.0.post1 / 0.9.1.
+    #
+    # SemVer prereleases carry a hyphen (`v1.0.0-rc.1`, `v1.0.0-alpha.2`); the
+    # test mirrors `release.yml`'s preflight (`if [[ "$TAG" == *-* ]]`, :76-82).
+    # `release.yml` guards SIX publishing jobs this way but is `workflow_dispatch`-
+    # only -- the automatic publisher was the unguarded one.
+    if: ${{ (github.event_name == 'push' && !contains(github.ref_name, '-')) || github.event.inputs.target == 'both' || github.event.inputs.target == 'pypi' }}
     name: publish ai-memory to PyPI
     runs-on: ubuntu-latest
     environment:
@@ -75,7 +97,8 @@ jobs:
           skip-existing: true
 
   publish-npm:
-    if: ${{ github.event_name == 'push' || github.event.inputs.target == 'both' || github.event.inputs.target == 'npm' }}
+    # #2467 — PRERELEASE GUARD; see the rationale on `publish-pypi` above.
+    if: ${{ (github.event_name == 'push' && !contains(github.ref_name, '-')) || github.event.inputs.target == 'both' || github.event.inputs.target == 'npm' }}
     name: publish @alphaone/ai-memory to npm
     runs-on: ubuntu-latest
     environment:
