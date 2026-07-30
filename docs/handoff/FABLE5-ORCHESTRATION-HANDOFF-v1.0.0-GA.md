@@ -101,8 +101,19 @@ Ruleset `17752665` (`enforcement:active`, `bypass_actors:[]`, `refs/heads/releas
 
 ### 2.5 Housekeeping
 
-- **22 git worktrees** exist; disk at **37% (554 G free)**. Several are merged-PR leftovers and are reclaimable via `git worktree remove` (never `rm -rf`).
+- **23 git worktrees** exist; disk at **37% (553 G free)**. Several are merged-PR leftovers and are reclaimable via `git worktree remove` (never `rm -rf`).
 - Open issues: **107 total** → **23 explicitly `[v1.x]`-deferred** → **84 v1.0.0-scope candidates**.
+
+### 2.6 Dirty worktrees at the boundary — read this before touching them
+
+An earlier draft of this document claimed "no dirty worktree holds unique work." **That was wrong, and the check that falsified it is worth repeating.** Four worktrees are dirty:
+
+| Worktree | Repo | State | Action |
+|---|---|---|---|
+| `.local-runs/wt-2445-downgrade` | **this repo**, branch `fix/2445-downgrade-guard` | 2 commits, **already pushed** (not box-only). Working tree carries an **uncommitted R-203 parent-behaviour simulation** that deliberately *removes* the downgrade guard (`// R-203 PARENT-BEHAVIOUR SIMULATION: enforcement removed.`) | **DISCARD the uncommitted diff — never commit it.** It exists to prove the regression test fails at the parent. Committing it would ship #2445 as a no-op that reports success. |
+| `/home/fate_two/v07/v07-f5` + its 2 `agent-*` sub-worktrees | **different repo** (the publishable `ai-memory` crate) | modified `src/cli/*`, `src/federation/push_dlq.rs`, `src/identity/attest.rs`, `CHANGELOG.md` | Out of scope for this campaign. Do not merge across repos. Triage separately. |
+
+**Live #2486 instance found by that same check:** on `fix/2445-downgrade-guard`, commit `91573bdb` is signed (`G`) but **`2bf36c3f` is UNSIGNED (`N`)** — the actual #2445 fix commit. Verify with `git log --format='%h %G? %s'`. This is exactly the silent signing regression #2486 tracks, caught in the wild. **Fable 5 should treat `%G?` as part of the approval gate**, not an afterthought — a `N` in a security fix's own history undermines the audit trail it exists to create.
 
 ---
 
@@ -333,4 +344,6 @@ Three things a reviewer should know that are not defects:
 
 ---
 
-*Prepared at a deliberate clean stop: no dirty worktree holds unique work, no PR is half-landed, no control-plane change is unrecorded, and the two in-flight PRs were left for Fable 5's approval rather than merged under the outgoing authority.*
+*Prepared at a deliberate clean stop: no PR is half-landed, no control-plane change is unrecorded, no work exists only on this box (verified by pushing every branch), and the two in-flight PRs were left for Fable 5's approval rather than merged under the outgoing authority.*
+
+*Four worktrees ARE dirty — see §2.6. An earlier draft of this line claimed otherwise; the verification that falsified it also surfaced a live #2486 unsigned-commit instance and an uncommitted R-203 simulation that would ship #2445 as a silent no-op if committed. Both are recorded in §2.6 rather than smoothed over, because a handoff that overstates its own cleanliness is the same defect class as everything in §4.1.*
