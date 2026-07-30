@@ -646,6 +646,274 @@ pub(super) fn pending_author_authorized(
     authorized(&pa.requested_by) && payload_agent.is_none_or(authorized)
 }
 
+/// #2478 — payload key naming the namespace a `store` / `reflect` pending
+/// action writes into.
+///
+/// Mirrors the key [`crate::storage::execute_pending_action`] and its
+/// `execute_reflect_from_payload` helper read out of `pa.payload`. The two MUST
+/// stay in lockstep: this resolver is only a correct security gate for as long
+/// as it names the same key the executor obeys.
+const PENDING_PAYLOAD_NAMESPACE_KEY: &str = "namespace";
+
+/// The namespaces an approved `pending_actions` row would actually TOUCH when
+/// [`crate::storage::execute_pending_action`] replays it (#2478).
+///
+/// `claimed` are namespaces the execution DECLARES or WRITES INTO; `by_id` are
+/// ids of EXISTING local rows it destroys, mutates, or derives from, whose
+/// STORED namespace the wire never names and must therefore be resolved.
+pub(super) struct PendingEffect<'a> {
+    claimed: Vec<&'a str>,
+    by_id: Vec<&'a str>,
+    /// The `delete` arm — selects the DESTRUCTIVE Layer-2 refusal prose.
+    destructive: bool,
+}
+
+/// Read a string field out of a pending action's payload.
+fn pending_payload_str<'a>(pa: &'a crate::models::PendingAction, key: &str) -> Option<&'a str> {
+    pa.payload.get(key).and_then(serde_json::Value::as_str)
+}
+
+/// Parse an `action_type` string into the closed [`crate::models::GovernedAction`]
+/// vocabulary, keyed off that enum's own `as_str` SSOT so no literal is
+/// re-declared here. `None` for anything else — the caller treats that as a
+/// refusal (default-deny).
+fn governed_action_of(action_type: &str) -> Option<crate::models::GovernedAction> {
+    use crate::models::GovernedAction as G;
+    [G::Store, G::Delete, G::Promote, G::Reflect]
+        .into_iter()
+        .find(|candidate| candidate.as_str() == action_type)
+}
+
+/// #2478 (CWE-284) — resolve every namespace the execution of `pa` would reach.
+///
+/// # Why `pa.namespace` alone would be theatre
+///
+/// [`crate::storage::execute_pending_action`] **never reads `pa.namespace`**.
+/// Its `store` arm deserialises `pa.payload` into a `Memory` and inserts
+/// `mem.namespace`; its `promote` arm clones the target into
+/// `payload.to_namespace`; its `reflect` arm writes into `payload.namespace`
+/// (falling back to `pa.namespace`) and mints a signed `reflects_on` edge onto
+/// every `payload.source_ids[i]`; only its `delete` arm touches
+/// `pa.memory_id`. A gate on the row's own declared namespace would let a peer
+/// scoped to `public/**` send `namespace: "public/ok"` with
+/// `payload.namespace: "secure/ops"` and land the arbitrary-namespace write
+/// exactly as before — while a regression test asserting "the pendings lane is
+/// namespace-confined" went green over it. This resolver returns the UNION of
+/// everything the executor can reach and the caller requires ALL of it to be in
+/// scope.
+///
+/// # Default-deny on an unknown arm
+///
+/// The `action_type` is parsed into [`crate::models::GovernedAction`] and
+/// matched EXHAUSTIVELY, so adding a variant to that enum is a compile error
+/// here rather than an arm that silently slips past the gate; an unparseable
+/// `action_type` yields `None`, which the caller refuses. Nothing legitimate is
+/// lost — the executor's own fall-through arm errors on it anyway.
+pub(super) fn pending_action_effect(
+    pa: &crate::models::PendingAction,
+) -> Option<PendingEffect<'_>> {
+    use crate::models::GovernedAction as G;
+
+    let action = governed_action_of(&pa.action_type)?;
+
+    // The row's own declared namespace is where `upsert_pending_action` files
+    // it AND the `reflect` arm's namespace fallback, so it is always in the
+    // set. An EMPTY value is left in DELIBERATELY: it matches no glob, so a
+    // scoped peer is refused rather than waved through, and no legitimate
+    // sender produces one (`queue_pending_action` requires a namespace).
+    let mut claimed: Vec<&str> = vec![pa.namespace.as_str()];
+    let mut by_id: Vec<&str> = Vec::new();
+    let mut destructive = false;
+
+    match action {
+        G::Store => claimed.extend(pending_payload_str(pa, PENDING_PAYLOAD_NAMESPACE_KEY)),
+        G::Delete => {
+            destructive = true;
+            by_id.extend(pa.memory_id.as_deref());
+        }
+        G::Promote => {
+            // BOTH branches reach an existing row by id: with `to_namespace`
+            // present `promote_to_namespace` CLONES it into that namespace (so
+            // the destination is a write and must be in scope too); without it
+            // the arm is a tier-bump + expiry-clear on that same row.
+            by_id.extend(pa.memory_id.as_deref());
+            claimed.extend(pending_payload_str(
+                pa,
+                crate::models::field_names::TO_NAMESPACE,
+            ));
+        }
+        G::Reflect => {
+            claimed.extend(pending_payload_str(pa, PENDING_PAYLOAD_NAMESPACE_KEY));
+            // `reflect` READS every source row and writes a signed
+            // `reflects_on` edge onto it, so each source's stored namespace is
+            // touched even though the wire never names it.
+            by_id.extend(
+                pa.payload
+                    .get(crate::models::field_names::SOURCE_IDS)
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str),
+            );
+        }
+    }
+
+    Some(PendingEffect {
+        claimed,
+        by_id,
+        destructive,
+    })
+}
+
+/// #2478 (CWE-284) — namespace confinement for the `/sync/push` governance
+/// lanes (`pendings[]` + `pending_decisions[]`), routed through the SAME shared
+/// Layer-1/Layer-2 verdict the `memories[]` / `deletions[]` / `archives[]` /
+/// `restores[]` lanes use, so this lane's disposition of all four peer shapes
+/// is byte-identical to theirs and the empty-scope case honours
+/// `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE` instead of hard-coding a verdict.
+///
+/// Callers MUST wrap this in the ENROLLED posture (`attest_cfg.has_allowlist()`)
+/// exactly as the sibling lanes do — with no allowlist configured the shared
+/// helpers already return `true`, but the wrap is what keeps the zero-config
+/// posture free of the probes below (the #2491 outage was a gate that ran
+/// unconditionally).
+///
+/// `stored_pending_namespace` is the namespace of the pending row ALREADY at
+/// `pa.id`, or `None` when there provably is none. It is load-bearing, not
+/// belt-and-braces: `upsert_pending_action` is `ON CONFLICT(id) DO UPDATE` over
+/// every column including `namespace`, so a claimed-only gate would let a
+/// `public/**` peer RELOCATE and overwrite a `secure/ops` governance row by
+/// pushing its id under an in-scope namespace — the same merge-clobber vector
+/// Layer 1's stored-namespace check closes for `memories[]` (#2447).
+///
+/// # Probe stability
+///
+/// The receive handler holds the sqlite mutex across the whole request, and no
+/// primitive re-namespaces a row in place (`update` takes no namespace;
+/// `promote_to_namespace` CLONES), so the by-id probe answers here are stable
+/// through to the execute. A future in-place re-namespace primitive would void
+/// that and must revisit this gate.
+///
+/// Returns `true` when the entry may proceed; `false` with an
+/// operator-actionable WARN already emitted, in which case the caller must
+/// `skipped += 1; continue`.
+#[must_use]
+pub(super) fn pending_namespaces_authorized(
+    conn: &rusqlite::Connection,
+    base_lane: &str,
+    pa: &crate::models::PendingAction,
+    stored_pending_namespace: Option<&str>,
+    attest_cfg: &PeerAttestationConfig,
+    peer_id: Option<&str>,
+    require_push_namespace_scope: bool,
+) -> bool {
+    use crate::federation::receive_auth::{
+        LANE_PENDING_DECISION_DELETE, LANE_PENDING_DECISIONS, inbound_by_id_namespace_authorized,
+        inbound_write_namespace_authorized, peer_declares_namespace_scope,
+    };
+
+    let Some(effect) = pending_action_effect(pa) else {
+        tracing::warn!(
+            target: ATTESTATION_TRACE_TARGET,
+            pending_id = %pa.id,
+            action_type = %pa.action_type,
+            peer_id = %peer_id.unwrap_or(""),
+            "sync_push: refusing federated {base_lane} entry — unknown pending action_type, \
+             so the namespaces its execution would touch cannot be resolved (#2478 \
+             default-deny). A new action_type must be taught to `pending_action_effect` \
+             before it may cross a federation boundary."
+        );
+        return false;
+    };
+
+    // Approving a `delete`-typed pending reaches `storage::delete` exactly as
+    // `deletions[]` does, so it takes the destructive refusal prose. Injecting
+    // one into `pendings[]` only files a row, so that lane keeps its own.
+    let lane = if effect.destructive && base_lane == LANE_PENDING_DECISIONS {
+        LANE_PENDING_DECISION_DELETE
+    } else {
+        base_lane
+    };
+
+    // Every namespace the execution declares or writes into.
+    for namespace in effect.claimed {
+        if !inbound_write_namespace_authorized(
+            lane,
+            &pa.id,
+            namespace,
+            None,
+            attest_cfg,
+            peer_id,
+            require_push_namespace_scope,
+        ) {
+            return false;
+        }
+    }
+
+    // #2488 ELISION (not a gate): Layer 1 unarmed ⇒ no stored namespace can
+    // change the verdict, and the loop above has already applied the Layer-2
+    // verdict for this peer. Skipping here is what keeps the enrolled-unscoped
+    // and header-absent shapes at ZERO extra reads.
+    if !peer_declares_namespace_scope(peer_id, attest_cfg) {
+        return true;
+    }
+
+    // The governance row this upsert would overwrite (see the doc above).
+    if stored_pending_namespace.is_some()
+        && !inbound_by_id_namespace_authorized(
+            lane,
+            &pa.id,
+            stored_pending_namespace,
+            attest_cfg,
+            peer_id,
+            require_push_namespace_scope,
+        )
+    {
+        return false;
+    }
+
+    // Existing rows the execution destroys, mutates, or derives from. The probe
+    // is the SCALAR `db::namespace_by_id`: `db::get` maps through
+    // `row_to_memory`'s fail-closed at-rest decrypt, which would make a row with
+    // an unopenable envelope permanently un-actionable by federation (#2497).
+    for memory_id in effect.by_id {
+        let stored = match db::namespace_by_id(conn, memory_id) {
+            Ok(Some(namespace)) => namespace,
+            // Provably no such local row — there is nothing in any namespace to
+            // protect. The arm itself is then a no-op (`delete`) or errors
+            // downstream (`promote` / `reflect`); either way this gate has no
+            // subject and must not manufacture a refusal.
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    pending_id = %pa.id,
+                    memory_id = %memory_id,
+                    cause = crate::federation::receive_auth::CAUSE_NAMESPACE_PROBE_UNRESOLVABLE,
+                    error = %e,
+                    "sync_push: refusing federated {lane} entry — a row its execution would \
+                     touch has an UNRESOLVABLE namespace on this node, so the scope gate \
+                     cannot decide (#2478 fail-closed). Investigate the storage error rather \
+                     than the peer's scope."
+                );
+                return false;
+            }
+        };
+        if !inbound_by_id_namespace_authorized(
+            lane,
+            memory_id,
+            Some(&stored),
+            attest_cfg,
+            peer_id,
+            require_push_namespace_scope,
+        ) {
+            return false;
+        }
+    }
+
+    true
+}
+
 /// v0.7.0 S6-M2 — compute the next UTC midnight in RFC3339, used as
 /// the `X-Quota-Reset-At` header value when a federation receive is
 /// refused for hitting `memories_per_day` or `links_per_day`. Storage
@@ -2108,6 +2376,49 @@ pub async fn sync_push(
             skipped += 1;
             continue;
         }
+        // #2478 (CWE-284) — #1920 gates WHO a pending may be attributed to; it
+        // never consults a namespace. Confine the injection to the peer's scope
+        // through the SAME shared verdict the memories/deletions lanes use, so
+        // an out-of-scope governance row cannot be parked here for a later
+        // approval (by the `pending_decisions[]` loop below, or by a LOCAL
+        // operator through an approve surface that has no peer scope to consult).
+        //
+        // ZERO-CONFIG RESIDUAL, stated rather than implied: like every sibling
+        // lane this whole gate short-circuits on `has_allowlist()`, so a
+        // deployment with no `AI_MEMORY_FED_PEER_ATTESTATION` keeps the
+        // arbitrary-namespace primitive. That is parity with #2447/#2488, not an
+        // oversight — but this lane's sink is strictly more destructive than
+        // `memories[]`, so it is named here and in the PR body.
+        if ns_gate_enrolled {
+            let stored_pending_ns = match db::get_pending_action(&lock.0, &pa.id) {
+                Ok(existing) => existing.map(|row| row.namespace),
+                Err(e) => {
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        pending_id = %pa.id,
+                        cause = crate::federation::receive_auth::CAUSE_NAMESPACE_PROBE_UNRESOLVABLE,
+                        error = %e,
+                        "sync_push: refusing federated pendings entry — the governance row \
+                         this upsert would overwrite is UNRESOLVABLE on this node, so the \
+                         scope gate cannot decide (#2478 fail-closed)."
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
+            if !pending_namespaces_authorized(
+                &lock.0,
+                crate::federation::receive_auth::LANE_PENDINGS,
+                pa,
+                stored_pending_ns.as_deref(),
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+                require_push_ns_scope,
+            ) {
+                skipped += 1;
+                continue;
+            }
+        }
         match db::upsert_pending_action(&lock.0, pa) {
             Ok(()) => {
                 pendings_applied += 1;
@@ -2160,6 +2471,75 @@ pub async fn sync_push(
         // originator's rejected state) and grants no authority, so it keeps
         // the idempotent `decide_pending_action(false)` transition.
         if dec.approved {
+            // #2478 (CWE-284) — the APPROVE arm is the one that EXECUTES, and
+            // `db::execute_pending_action` reaches `insert()` in the payload's
+            // namespace, `delete()` on `pa.memory_id`, `promote_to_namespace()`
+            // into `payload.to_namespace`, and `reflect()` over every
+            // `payload.source_ids[i]` — none of which any pre-#2478 gate on this
+            // lane consulted (`pending_author_authorized` inspects only
+            // `requested_by` and the payload's `metadata.agent_id`).
+            //
+            // The pending row is resolved from LOCAL STORAGE, never from the
+            // `pendings[]` entry of this same request: that entry is
+            // attacker-controlled, so gating against it would be a TOCTOU on the
+            // gate's own input. It is also resolved BEFORE
+            // `approve_with_approver_type`, never between approve and execute —
+            // the consensus arm durably appends the vote and can flip `status`
+            // to `approved` at threshold, so a refusal landing after it would
+            // leave an approved-but-unexecuted row: divergence plus a landmine
+            // for whoever approves next.
+            let pa = match db::get_pending_action(&lock.0, &dec.id) {
+                Ok(Some(pa)) => pa,
+                // Unknown pending — the converged no-op that
+                // `ApproveOutcome::NotFound` already counted below. Counting it
+                // `skipped` instead would make every converged replica non-ack
+                // forever, which is the #2491 class this campaign closed.
+                Ok(None) => {
+                    noop += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        pending_id = %dec.id,
+                        cause = crate::federation::receive_auth::CAUSE_NAMESPACE_PROBE_UNRESOLVABLE,
+                        error = %e,
+                        "sync_push: refusing federated pending decision — the target \
+                         governance row is UNRESOLVABLE on this node, so the namespaces its \
+                         execution would touch cannot be resolved (#2478 fail-closed)."
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
+            if ns_gate_enrolled
+                && !pending_namespaces_authorized(
+                    &lock.0,
+                    crate::federation::receive_auth::LANE_PENDING_DECISIONS,
+                    &pa,
+                    None,
+                    &attest_cfg,
+                    peer_header_owned.as_deref(),
+                    require_push_ns_scope,
+                )
+            {
+                skipped += 1;
+                continue;
+            }
+            // #2478 — the `deleted` counter must report rows DESTROYED, not
+            // deletes attempted, or the 200 envelope lies in the other
+            // direction. The executor's delete arm discards `db::delete`'s
+            // boolean (`delete(conn, &mid)?; Some(mid)`), so after the fact the
+            // handler cannot tell a removal from a no-op on an absent id —
+            // hence this pre-probe. The sqlite mutex is held across the whole
+            // handler, so the probe and the execute observe the same row set. An
+            // Err resolves to `false`, which UNDER-reports rather than claiming
+            // a destruction that may not have happened.
+            let delete_target_existed =
+                pa.action_type == crate::models::GovernedAction::Delete.as_str()
+                    && pa.memory_id.as_deref().is_some_and(|mid| {
+                        matches!(db::namespace_by_id(&lock.0, mid), Ok(Some(_)))
+                    });
             match db::approve_with_approver_type(
                 &lock.0,
                 &dec.id,
@@ -2171,11 +2551,29 @@ pub async fn sync_push(
                     // Replay the pending payload so the target write lands
                     // on this peer — matches the originator's post-approve
                     // state.
-                    if let Err(e) = db::execute_pending_action(&lock.0, &dec.id) {
-                        tracing::warn!(
-                            "sync_push: execute_pending_action failed for {}: {e}",
-                            dec.id
-                        );
+                    match db::execute_pending_action(&lock.0, &dec.id) {
+                        Ok(_) => {
+                            // #2478 — a pending-executed hard DELETE was
+                            // previously invisible in the 200: it incremented no
+                            // destructive counter at all, so an operator reading
+                            // the envelope could not tell that rows had been
+                            // erased by this push.
+                            if delete_target_existed {
+                                deleted += 1;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "sync_push: execute_pending_action failed for {}: {e}",
+                                dec.id
+                            );
+                            // #2478 — without this the decision counted APPLIED
+                            // while its side effect never landed and `skipped`
+                            // stayed 0, so `success_report_non_ack_reason` saw a
+                            // clean report and the sender ACKed a write that does
+                            // not exist here.
+                            skipped += 1;
+                        }
                     }
                 }
                 // Consensus-gated: the relayed vote was recorded but quorum
@@ -2202,6 +2600,18 @@ pub async fn sync_push(
                 }
             }
         } else {
+            // #2478 — the REJECT arm is DELIBERATELY left outside the namespace
+            // gate, and that is a security decision, not an omission (5-agent
+            // vote 4d3ea1c5). Gating it would make the posture WORSE: a reject
+            // is the only message that moves a row out of `pending`, and
+            // `execute_pending_action` gates solely on `status == "approved"`.
+            // Refuse the reject and the row stays `pending` here — therefore
+            // still APPROVABLE here — so the gate would keep alive precisely the
+            // authority-granting action the originator killed, while the sender
+            // saw `skipped` → a non-ack it can never clear. A reject grants no
+            // authority and writes only `pending_actions.status`; the residual
+            // (an enrolled peer vetoing a foreign namespace's approval queue) is
+            // an availability concern tracked separately, not a confinement one.
             match db::decide_pending_action(&lock.0, &dec.id, false, &dec.decider) {
                 Ok(true) => pending_decisions_applied += 1,
                 Ok(false) => noop += 1, // already decided — converged state
