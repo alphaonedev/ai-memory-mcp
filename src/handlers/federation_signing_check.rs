@@ -803,6 +803,29 @@ pub(super) async fn sync_push_via_store(
     // (`handlers::approvals` / `handlers::governance`), which are governed by
     // local authz rather than peer scope.
     //
+    // #2479 (CWE-284) — the same bucketing is what makes the federated
+    // GOVERNANCE-STANDARD lanes (`namespace_meta[]` + `namespace_meta_clears[]`)
+    // structurally unreachable on postgres. `sync_push` hands the whole request
+    // to this funnel and RETURNS before the sqlite `namespace_meta` loops run,
+    // and nothing in this funnel calls `MemoryStore::set_namespace_standard` /
+    // `clear_namespace_standard`. Pinned by an EXECUTABLE assertion (row state,
+    // not counters) in `tests/federation_ns_meta_scope_2479_pg.rs` rather than
+    // asserted in prose — the #2528 precedent.
+    //
+    // The claim is again about the FEDERATION lane ONLY. Those two trait methods
+    // ARE reachable on a postgres deployment through the LOCAL surfaces
+    // (`handlers::hook_subscribers::{set_namespace_standard,
+    // clear_namespace_standard}` and the MCP `memory_namespace_set_standard` /
+    // `_clear_standard` tools), which are governed by local authz rather than
+    // peer scope and are deliberately out of #2479's scope.
+    //
+    // Any future trait-covered federation of these subcollections MUST route
+    // through `receive_auth::inbound_namespace_meta_authorized` BEFORE the trait
+    // write. That verdict is backend-BLIND (it takes no connection and performs
+    // no probe, because `namespace_meta`'s PRIMARY KEY is the namespace itself),
+    // so the pg funnel can call it verbatim — there is no second implementation
+    // for the two backends to drift apart on.
+    //
     // Any future trait-covered federation of these subcollections MUST route
     // through `federation_receive::pending_namespaces_authorized` (or the shared
     // `receive_auth` verdict it wraps) BEFORE approving — the #2488 lesson is
