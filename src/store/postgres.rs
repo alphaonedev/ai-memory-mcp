@@ -7588,8 +7588,8 @@ impl PostgresStore {
             // `age_cell_text` for why `try_get::<String, _>` is wrong.
             let target_id = age_cell_text(r, "target_id", READ_TARGET_ID)?;
 
-            let edges_raw = age_cell_text(r, "path_edges", "read path_edges")?;
-            let edges = age_decode_entity_list("path_edges", &edges_raw)?;
+            let edges_raw = age_cell_text(r, AGE_COL_PATH_EDGES, READ_PATH_EDGES)?;
+            let edges = age_decode_entity_list(AGE_COL_PATH_EDGES, &edges_raw)?;
             if !age_path_edges_all_current(&edges, &now_stamp) {
                 continue;
             }
@@ -7601,8 +7601,8 @@ impl PostgresStore {
                 });
             }
 
-            let nodes_raw = age_cell_text(r, "path_nodes", "read path_nodes")?;
-            let node_ids = age_vertex_ids(&age_decode_entity_list("path_nodes", &nodes_raw)?);
+            let nodes_raw = age_cell_text(r, AGE_COL_PATH_NODES, "read path_nodes")?;
+            let node_ids = age_vertex_ids(&age_decode_entity_list(AGE_COL_PATH_NODES, &nodes_raw)?);
             if node_ids.is_empty() {
                 return Err(StoreError::IntegrityFailed {
                     detail: "AGE kg_query path has no extractable node ids".to_string(),
@@ -8653,8 +8653,8 @@ impl PostgresStore {
         for r in &rows {
             // #2511 — agtype cells, not `String` cells (see `age_cell_text`).
             let node_id = age_cell_text(r, "node_id", "read node_id")?;
-            let edges_raw = age_cell_text(r, "path_edges", "read lineage path_edges")?;
-            let edges = age_decode_entity_list("path_edges", &edges_raw)?;
+            let edges_raw = age_cell_text(r, AGE_COL_PATH_EDGES, READ_PATH_EDGES)?;
+            let edges = age_decode_entity_list(AGE_COL_PATH_EDGES, &edges_raw)?;
             if edges.is_empty() {
                 // A `*1..N` pattern cannot match a zero-length path.
                 return Err(StoreError::IntegrityFailed {
@@ -12103,6 +12103,17 @@ const READ_RELATION: &str = "read relation";
 const READ_RELATION_COL: &str = "relation";
 /// v0.9.0 G13-mem (#1859) — shared `read depth` decode-context label.
 const READ_DEPTH: &str = "read depth";
+/// #2511 — shared `relationships(p)` result-column name. Every AGE read that
+/// re-derives a path's semantics Rust-side (`kg_query_cypher`,
+/// `lineage_cypher`) projects the edge list under this ONE name, so the
+/// `AS (…)` column list, the `age_cell_text` lookup and the
+/// `age_decode_entity_list` error context cannot drift apart.
+const AGE_COL_PATH_EDGES: &str = "path_edges";
+/// #2511 — shared `nodes(p)` result-column name. Twin of
+/// [`AGE_COL_PATH_EDGES`].
+const AGE_COL_PATH_NODES: &str = "path_nodes";
+/// #2511 — decode-context label for the [`AGE_COL_PATH_EDGES`] cell.
+const READ_PATH_EDGES: &str = "read path_edges";
 const READ_TARGET_ID: &str = "read target_id";
 const READ_VALID_FROM: &str = "read valid_from";
 const READ_VALID_UNTIL: &str = "read valid_until";
