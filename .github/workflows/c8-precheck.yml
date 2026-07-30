@@ -96,7 +96,14 @@ jobs:
         run: bash scripts/check-vendor-literals.sh --self-test
 
   l3-boundary-gate:
-    name: L3-boundary perma-ban gate (§25.3 S5 / RQ-10 #1853)
+    # QUOTED DELIBERATELY (#2473). Unquoted, the ` #1853)` opened a YAML
+    # comment and the job name parsed as 44 chars — GitHub reported the
+    # check-run as `L3-boundary perma-ban gate (§25.3 S5 / RQ-10` and THAT
+    # truncation was what branch protection required. Quoting is now
+    # MECHANICALLY REQUIRED for any job name containing ` #`: rule (e) of
+    # scripts/check-required-contexts.sh hard-fails the unquoted form
+    # repo-wide, so this cannot silently re-land.
+    name: "L3-boundary perma-ban gate (§25.3 S5 / RQ-10 #1853)"
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # v0.9.0 §25.3 S5 — the epoch-closure lane ships under strictly ruled

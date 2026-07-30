@@ -1229,20 +1229,48 @@ in #2509; `c8-precheck.yml`'s own `local/**` overlap in #2523;
 per-pattern so a newly-acquired overlap is not absolved) while #2506
 repairs it — a stale entry there is a loud NOTICE, not a failure,
 because it can only suppress a failure that no longer happens and
-failing on it would red whichever PR lost the race to the carrier fix. **The mirror is hand-authored from intent and must NEVER be
-regenerated from live API state:** one required context is
-`L3-boundary perma-ban gate (§25.3 S5 / RQ-10`, a YAML truncation
-artefact where the unquoted ` #1853)` at `c8-precheck.yml:75` opens a
-comment (#2473). It matches today and is deliberately left alone —
-regenerating the mirror would launder the truncation into the declaration
-and make rule (a) a tautology that passes forever. The awk parser
+failing on it would red whichever PR lost the race to the carrier fix.
+**(e) HARD-FAIL, never allowlistable, repo-wide** — a job `name:` written
+as an UNQUOTED scalar whose raw value contains whitespace-then-`#`. That
+is the #2473 shape: YAML truncates the name at the `#`, so the DECLARED
+name and the check-run GitHub reports differ, and an operator copying the
+reported name into branch protection pins the truncation — which is
+literally how the malformed context entered the live set. The remedy is
+one character of quoting, so there is no legitimate instance and no
+ratchet; a deliberate trailing comment stays expressible by quoting the
+scalar first (`name: "Foo"  # note`). Scoped repo-wide by the rule (d)
+argument: a truncated name is a declared≠actual lie in every UI today and
+becomes a wedge the moment that context is required. The `(#1174 PR10)` /
+`(#2146)` / `(#1989)` family is NOT flagged — a `#` preceded by `(` is
+not a YAML comment — which is what aims the rule at the defect rather
+than the neighbourhood. **The mirror is hand-authored from intent and
+must NEVER be regenerated from live API state:** the canonical
+demonstration is #2473, where one required context was
+`L3-boundary perma-ban gate (§25.3 S5 / RQ-10` because the unquoted
+` #1853)` in `c8-precheck.yml` opened a comment. It MATCHED, so the gate
+was green on a name nobody wrote; regenerating the mirror would have
+laundered the truncation into the declaration and made rule (a) a
+tautology that passes forever, which is why the artefact was preserved
+rather than "repaired" until the coupled fix. #2473 CLOSED it — the
+workflow name is quoted, both mirrors declare the full string, and rule
+(e) keeps the class from re-landing. Its landing order is documented in
+the mirror: the swap's two halves pull opposite ways (drop the TRUNCATED
+context from protection BEFORE the rename merges, add the FULL one
+AFTER), because after the rename lands no PR reports the old name and
+before it lands no PR reports the new one. The awk parser
 implements the real YAML scalar rule (a `#` preceded by whitespace opens
 a comment; `(#1174 PR10)` does not) and was cross-checked against PyYAML
-on all 58 jobs across all 17 workflows with zero mismatches.
-`--self-test` plants the (b1) wedge, an (a) unmatched context, a (c)
-path-filtered carrier, a (b3) unguarded step, a (b4) decider `if:`
-(rejected EVEN WHEN allowlisted — the property that separates (b4) from
-(b2)), both directions of the (b2) ratchet, and — for (d) — the VERBATIM
+on all 59 jobs across all 17 workflows with zero mismatches (re-run at
+#2473; the count moved 58 -> 59 as jobs were added, and the cross-check
+is the standing proof that rule (e)'s premise about YAML is real).
+`--self-test` plants the (b1) wedge, an (a) unmatched context, an (e)
+unquoted ` #` job name (asserting via `--dump` that the parse really is
+truncated at the `#` BEFORE asserting the gate rejects it, so a parser
+that stopped truncating could not make the rule fire for the wrong
+reason), a (c) path-filtered carrier, a (b3) unguarded step, a (b4)
+decider `if:` (rejected EVEN WHEN allowlisted — the property that
+separates (b4) from (b2)), both directions of the (b2) ratchet, and —
+for (d) — the VERBATIM
 pre-#2509 `tool-count-drift.yml` trigger+concurrency block (R-203)
 alongside four NEAR MISSES that must each PASS (the #2509-narrowed
 triggers, `cancel-in-progress: false`, a push-only workflow, an

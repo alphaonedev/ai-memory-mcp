@@ -500,6 +500,15 @@ done
 
 # --- Regression leg (R-203): the frozen PRE-FIX mirror must FAIL C1. --------
 # Fail-closed: a missing or repaired fixture is a FAILURE, never a SKIP.
+#
+# SCOPE OF "FROZEN" (#2473). The behavioural half below runs the REAL gate with
+# the frozen mirror against the REAL workflow directory and requires exit 0, so
+# the fixture must stay rule-(a)-consistent with the LIVE workflows for every
+# context OTHER than the two under test. A job rename that the fixture does not
+# track therefore fails this leg — correctly, but with a misleading message, so
+# the fixture header states which of its properties is frozen (the decider
+# absence, asserted mechanically just below) and which merely tracks reality.
+# #2473's quoting of `l3-boundary-gate`'s name is the first instance.
 if [ ! -s "$PREFIX_MIRROR" ]; then
     bad "C regression leg: frozen pre-fix mirror fixture missing" "$PREFIX_MIRROR"
 elif declared_in_mirror "$PREFIX_MIRROR" "Classify changes" \
