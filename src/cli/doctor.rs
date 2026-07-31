@@ -710,6 +710,37 @@ fn section_index(conn: &rusqlite::Connection) -> ReportSection {
         ));
     }
 
+    // v1.0.0 #2579 — the FULL FTS5 integrity check, on the explicit
+    // operator-invoked surface. `/health` used to run this on every probe,
+    // which is O(corpus) and holds the WAL write lock; `doctor` is the verb
+    // an operator reaches for on demand, and this section is already
+    // corpus-proportional (the census aggregations below), so the cost is
+    // the point rather than a surprise. The daemon runs the same check on a
+    // paced background cadence and surfaces its cached verdict at
+    // `/api/v1/health.fts_integrity`.
+    //
+    // Before this landed, `doctor` did NOT check the FTS index at all — so
+    // making `/health` cheap without adding it here would have deleted the
+    // codebase's only integrity signal (#2444: a control that reports
+    // success while doing nothing is worse than no control).
+    match crate::db::fts_integrity_check(conn) {
+        Ok(()) => facts.push((
+            "fts_index_integrity".into(),
+            "verified (index agrees with the memories table)".into(),
+        )),
+        Err(e) => {
+            severity = Severity::Critical;
+            facts.push(("fts_index_integrity".into(), format!("FAILED: {e}")));
+            note = Some(
+                "the FTS5 index disagrees with the memories table — keyword recall will \
+                 silently return FEWER rows than it should. The durable memory TEXT is \
+                 intact; the index is derived and regenerable. Rebuild it with: \
+                 sqlite3 <db> \"INSERT INTO memories_fts(memories_fts) VALUES('rebuild');\""
+                    .to_string(),
+            );
+        }
+    }
+
     ReportSection {
         name: "Index".into(),
         severity,

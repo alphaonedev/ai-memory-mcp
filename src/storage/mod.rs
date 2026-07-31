@@ -12019,7 +12019,7 @@ pub fn append_recovery(
 }
 
 pub fn stats(conn: &Connection, db_path: &Path) -> Result<Stats> {
-    let total: usize = conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))?;
+    let total: usize = conn.query_row(crate::SQL_COUNT_MEMORIES, [], |r| r.get(0))?;
 
     // v1.0.0 #2334 (FBL-15) — reconcile the three 'total' predicates: boot
     // counts LIVE (non-expired) rows, export filters expiry + lifecycle,
@@ -16960,14 +16960,96 @@ pub fn memories_updated_since(
         .map_err(Into::into)
 }
 
-/// Deep health check — verifies DB is accessible and FTS is functional.
+/// v1.0.0 #2579 — the FTS5 external-content integrity-check command.
+/// DELIBERATELY not on any per-request path: it re-tokenizes every row of
+/// `memories` and is prepared as a WRITER, so it holds the WAL write lock
+/// for its whole O(corpus) duration. Reached only from
+/// [`crate::background::fts_integrity`] (paced) and `ai-memory doctor`
+/// (explicit, operator-invoked).
+const SQL_FTS_INTEGRITY_CHECK: &str =
+    "INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')";
+
+/// A term deliberately absent from any real corpus, so the liveness probe
+/// below is a single miss in the FTS5 segment index rather than a doclist walk.
+const FTS_LIVENESS_PROBE_TERM: &str = "aimemoryftslivenessprobe";
+
+/// v1.0.0 #2579 — the O(1) FTS5 REACHABILITY probe.
+const SQL_FTS_LIVENESS_PROBE: &str =
+    "SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?1 LIMIT 1";
+
+/// v1.0.0 #2579 — O(1) connection probe: prove the handle answers SQL at all.
+///
+/// # Errors
+///
+/// Propagates the rusqlite error when the connection is unusable.
+pub fn ping(conn: &Connection) -> Result<()> {
+    let _: i64 = conn.query_row("SELECT 1", [], |r| r.get(0))?;
+    Ok(())
+}
+
+/// v1.0.0 #2579 — O(1) FTS5 REACHABILITY probe.
+///
+/// A `MATCH` for a term that is not in the vocabulary resolves to one lookup
+/// in the segment b-tree: it proves the `fts5` module is registered and the
+/// shadow tables (`memories_fts_data` / `_idx` / `_config`) are readable,
+/// which is a real signal — a dropped sync trigger or a missing shadow table
+/// surfaces here. It is a `SELECT`, so it takes no write lock, and its cost
+/// is independent of corpus size (measured <0.1 ms warm at both 8k and 130k
+/// rows).
+///
+/// It proves the index is REACHABLE. It does NOT prove the index AGREES with
+/// the `memories` table — that is [`fts_integrity_check`], and `/health`
+/// reports its cached verdict separately so the two are never conflated.
+///
+/// # Errors
+///
+/// Propagates the rusqlite error when the FTS5 index cannot be queried.
+pub fn fts_probe(conn: &Connection) -> Result<()> {
+    use rusqlite::OptionalExtension;
+    let _: Option<i64> = conn
+        .query_row(
+            SQL_FTS_LIVENESS_PROBE,
+            params![FTS_LIVENESS_PROBE_TERM],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(())
+}
+
+/// LIVENESS probe — O(1), fixed statement set, no write lock.
+///
+/// v1.0.0 #2579: this used to run `SELECT COUNT(*) FROM memories` plus the
+/// full FTS5 `'integrity-check'`, i.e. O(corpus) work on the endpoint
+/// Kubernetes/systemd scrape on a fixed interval — 69.6 ms at 7.9k rows,
+/// extrapolating to seconds at 1M, at which point the orchestrator kills
+/// HEALTHY pods on exactly the largest nodes. The deep check now runs on a
+/// paced background cadence ([`crate::background::fts_integrity`]) and
+/// `/health` renders its CACHED verdict, so the fail-closed contract is
+/// preserved while the probe itself is constant-time.
+///
+/// # Errors
+///
+/// Propagates the rusqlite error when either probe fails.
 pub fn health_check(conn: &Connection) -> Result<bool> {
-    let _: i64 = conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))?;
-    conn.execute(
-        "INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')",
-        [],
-    )?;
+    ping(conn)?;
+    fts_probe(conn)?;
     Ok(true)
+}
+
+/// DEEP check — verify the FTS5 index against its content table.
+///
+/// O(corpus) by construction, and a WRITER. Callers must be paced and
+/// off the request path; see [`SQL_FTS_INTEGRITY_CHECK`].
+///
+/// # Errors
+///
+/// Propagates the rusqlite error. A `SQLITE_CORRUPT` / `SQLITE_CORRUPT_VTAB`
+/// code means the index disagrees with `memories`; anything else is
+/// operational (lock contention, an unopenable file) and callers MUST NOT
+/// treat it as a corruption verdict.
+pub fn fts_integrity_check(conn: &Connection) -> Result<()> {
+    conn.execute(SQL_FTS_INTEGRITY_CHECK, [])?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
