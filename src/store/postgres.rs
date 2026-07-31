@@ -149,6 +149,22 @@ const SQL_HEAL_DANGLING_NAMESPACE_META: &str = "UPDATE namespace_meta \
        AND NOT EXISTS (SELECT 1 FROM memories WHERE memories.id = namespace_meta.standard_id)";
 const SQL_SELECT_MEMORY_ID_BY_ID: &str = "SELECT id FROM memories WHERE id = $1";
 
+/// v1.0.0 #2578 (pm-v3.1 literal de-dup) — clear the per-session
+/// `statement_timeout` on a connection that must outlive
+/// [`DEFAULT_STATEMENT_TIMEOUT_SECS`]. Used by the bootstrap advisory-lock
+/// connection (a ladder replay can legitimately exceed 30 s) and by the
+/// migrate path's lock acquisition. Split into two single-statement consts
+/// because sqlx's prepared protocol rejects multi-statement SQL.
+const SQL_CLEAR_STATEMENT_TIMEOUT: &str = "SET statement_timeout = 0";
+
+/// v1.0.0 #2578 (pm-v3.1 literal de-dup) — clear the per-session
+/// `lock_timeout`. Load-bearing on THREE connections: the two bootstrap /
+/// migrate advisory-lock sites, and the v88 index-build connection, where the
+/// pool default of [`DEFAULT_LOCK_TIMEOUT_SECS`] would abort a
+/// `CREATE INDEX CONCURRENTLY` after 5 s against any table with an ordinary
+/// in-flight writer.
+const SQL_CLEAR_LOCK_TIMEOUT: &str = "SET lock_timeout = 0";
+
 /// v1.0.0 #2578 — bounded `statement_timeout` (ms) for a v88 composite-index
 /// build. NOT cleared to `0`: an unbounded wait would hang `connect()` past a
 /// supervisor's start deadline (systemd's `TimeoutStartSec` defaults to 90 s),
@@ -1281,14 +1297,14 @@ impl PostgresStore {
         // Multi-statement SQL would trip sqlx's prepared-statement
         // protocol ("cannot insert multiple commands into a prepared
         // statement"); split into two separate executes.
-        sqlx::query("SET statement_timeout = 0")
+        sqlx::query(SQL_CLEAR_STATEMENT_TIMEOUT)
             .execute(&mut *bootstrap_lock_conn)
             .await
             .map_err(|e| StoreError::BackendUnavailable {
                 backend: "postgres".to_string(),
                 detail: format!("clear statement_timeout on bootstrap lock connection: {e}"),
             })?;
-        sqlx::query("SET lock_timeout = 0")
+        sqlx::query(SQL_CLEAR_LOCK_TIMEOUT)
             .execute(&mut *bootstrap_lock_conn)
             .await
             .map_err(|e| StoreError::BackendUnavailable {
@@ -1887,11 +1903,11 @@ impl PostgresStore {
         // aborted under contention (per-session default is 30s from
         // `after_connect`). Split into two separate executes — sqlx
         // prepared-statement protocol rejects multi-statement SQL.
-        sqlx::query("SET statement_timeout = 0")
+        sqlx::query(SQL_CLEAR_STATEMENT_TIMEOUT)
             .execute(&mut *lock_conn)
             .await
             .map_err(|e| to_store_err("clear statement_timeout on migration lock connection", e))?;
-        sqlx::query("SET lock_timeout = 0")
+        sqlx::query(SQL_CLEAR_LOCK_TIMEOUT)
             .execute(&mut *lock_conn)
             .await
             .map_err(|e| to_store_err("clear lock_timeout on migration lock connection", e))?;
@@ -4981,7 +4997,7 @@ impl PostgresStore {
         // the next boot retries. Two separate executes: sqlx's prepared
         // protocol rejects multi-statement SQL (the :1094 precedent).
         for stmt in [
-            "SET lock_timeout = 0",
+            SQL_CLEAR_LOCK_TIMEOUT,
             &format!("SET statement_timeout = {INDEX_BUILD_TIMEOUT_MS}"),
         ] {
             if let Err(e) = sqlx::query(stmt).execute(&mut *conn).await {
