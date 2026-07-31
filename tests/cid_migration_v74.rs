@@ -64,7 +64,7 @@ fn v74_columns_and_version_both_backends() {
     // kind_provenance + #2332 expiry-rendering heal; was v86 = #1834
     // valid-time canonicalization) — the v74 cid columns asserted below
     // still exist, only the tip moved.
-    assert_eq!(db::migrations::current_schema_version_for_tests(), 87);
+    assert_eq!(db::migrations::current_schema_version_for_tests(), 88);
     // The additive columns exist and are queryable.
     assert!(
         conn.prepare("SELECT cid, cid_genesis FROM memories LIMIT 0")
