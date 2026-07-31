@@ -57,6 +57,40 @@ impl Embed for CountingEmbedder {
     fn space_fingerprint(&self) -> String {
         self.space.clone()
     }
+
+    /// This double DECLARES a cacheable space, which is what opts it into
+    /// the cache. The declaration is deliberate: the trait default is
+    /// `None` (do not cache), so a test double that forgot this would
+    /// silently exercise the uncached path and every hit assertion below
+    /// would fail loudly rather than passing vacuously.
+    fn query_cache_space(&self) -> Option<String> {
+        Some(self.space.clone())
+    }
+}
+
+/// An embedder that reports a space but does NOT declare a cacheable one —
+/// the shape of every `dyn Embed` in the tree that has not opted in.
+struct UndeclaredSpaceEmbedder {
+    calls: Arc<AtomicUsize>,
+}
+
+impl Embed for UndeclaredSpaceEmbedder {
+    fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![1.0, 2.0, 3.0])
+    }
+    // `space_fingerprint` and `query_cache_space` both left at their
+    // defaults, exactly like the ~15 mock embedders in `src/`.
+}
+
+/// An embedder that always fails — the exact shape that CI caught being
+/// served a cached vector it never produced.
+struct AlwaysFailsEmbedder;
+
+impl Embed for AlwaysFailsEmbedder {
+    fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+        Err(anyhow::anyhow!("synthetic embed failure"))
+    }
 }
 
 fn embedder(calls: &Arc<AtomicUsize>, space: &str) -> CountingEmbedder {
@@ -190,4 +224,85 @@ fn zero_capacity_disables_the_cache_2577() {
 
     ai_memory::embeddings::set_query_embed_cache_capacity_for_test(None);
     clear_query_embed_cache();
+}
+
+/// **Regression, caught by CI on this feature's first run.**
+///
+/// `Embed::space_fingerprint`'s DEFAULT returns one constant sentinel for
+/// every implementor that does not override it. Keying the cache on that
+/// value let one embedder be served another's vectors: a deliberately
+/// FAILING embedder was never called at all and the recall reported
+/// `mode:hybrid` instead of degrading to `mode:keyword`.
+///
+/// A cache that masks an embedder failure and then claims a semantic
+/// ranking it never performed is a WRONG RESULT, not a slow one. Caching
+/// is therefore opt-IN via `query_cache_space`, defaulting to `None`.
+#[test]
+fn an_undeclared_space_is_never_cached_so_a_failure_cannot_be_masked_2577() {
+    let _serial = serial();
+    clear_query_embed_cache();
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    // A working embedder that has NOT opted in populates nothing.
+    let working = UndeclaredSpaceEmbedder {
+        calls: Arc::clone(&calls),
+    };
+    let query = "a query both embedders see";
+    assert!(recall_query_embedding(&working, query).is_some());
+    assert!(recall_query_embedding(&working, query).is_some());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "an embedder that does not declare a cacheable space must be \
+         re-embedded every time, never served from cache"
+    );
+
+    // The failing embedder must therefore actually FAIL, not inherit the
+    // working embedder's vector through a shared default fingerprint.
+    let failing = AlwaysFailsEmbedder;
+    assert!(
+        recall_query_embedding(&failing, query).is_none(),
+        "a failing embedder MUST degrade to keyword (None). Being handed a \
+         cached vector here would make the response claim mode:hybrid for a \
+         ranking that never happened (#2577)"
+    );
+}
+
+/// The PRODUCTION embedder must declare a cacheable space, or the cache is
+/// silently dead fleet-wide while every knob and metric still claims it is
+/// on — the #2233 "defaults lie" class.
+///
+/// Both production surfaces reach the funnel by coercing a concrete
+/// `Embedder` to `&dyn Embed` (`src/mcp/mod.rs`, `src/cli/recall.rs`, and
+/// `src/handlers/recall.rs`), so this asserts through the TRAIT object,
+/// which is the dispatch that actually happens at run time.
+#[test]
+fn the_production_embedder_declares_a_cacheable_space_2577() {
+    let client = ai_memory::llm::OllamaClient::new_with_url_no_health_check(
+        "http://127.0.0.1:1",
+        "nomic-embed-text-v1.5",
+    )
+    .expect("build client");
+    let embedder = ai_memory::embeddings::Embedder::Ollama {
+        client: std::sync::Arc::new(client),
+        model_name: "nomic-embed-text-v1.5".to_string(),
+        dim: 768,
+        degraded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+
+    let as_trait: &dyn Embed = &embedder;
+    let declared = as_trait.query_cache_space();
+    assert!(
+        declared.is_some(),
+        "the production Embedder must opt into query-embedding caching; \
+         without it AI_MEMORY_QUERY_EMBED_CACHE_ENTRIES is dead config and \
+         every recall pays the full remote round trip (#2577)"
+    );
+    assert_eq!(
+        declared.as_deref(),
+        Some(as_trait.space_fingerprint()).as_deref(),
+        "the declared cache space must BE the #2167 embedding-space \
+         fingerprint, so a model swap is a cache MISS rather than a \
+         foreign-space hit"
+    );
 }
