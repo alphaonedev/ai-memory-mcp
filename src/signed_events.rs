@@ -303,6 +303,25 @@ pub mod event_types {
     /// crypto-erase-vs-delete boundary lives in the erasure-kind field.
     pub const SUBSTRATE_CRYPTO_ERASE: &str = "substrate.crypto_erase";
 
+    /// #2503 — `signed_events.event_type` for a GOVERNANCE-BINDING SEVERANCE:
+    /// a memory reap (delete / archive / size-gc eviction) that severed one or
+    /// more `namespace_meta.standard_id` bindings, or a gc sweep that healed a
+    /// legacy dangling pointer into the same severed state.
+    ///
+    /// **Why this event exists.** The reap silently changed the governance
+    /// CONFIGURATION of namespaces that may be nowhere near the deleted row's
+    /// own namespace — `set_namespace_standard` permits cross-namespace
+    /// binding, and the global `*` standard sits in every namespace's chain.
+    /// Pre-#2503 that mutation was invisible in the response envelope, the
+    /// WARN log, and the DLQ cause set: a governance-config change reporting
+    /// nothing at all. Commits `{standard memory id, severed namespaces,
+    /// timestamp}` so an operator can reconstruct WHICH bindings a given
+    /// deletion disarmed and re-point them.
+    ///
+    /// Emitted ONLY when at least one row was actually severed, so the
+    /// overwhelmingly common delete-of-a-non-standard-memory costs nothing.
+    pub const SUBSTRATE_NAMESPACE_STANDARD_SEVERED: &str = "substrate.namespace_standard_severed";
+
     /// v0.9.0 §25.3 S3 (F-40, #1853) — `signed_events.event_type` for an
     /// operator-authorized governance-rule DISABLE via
     /// `ai-memory rules disable --sign`

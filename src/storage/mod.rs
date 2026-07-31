@@ -20,8 +20,33 @@ const SQL_DELETE_MEMORY_BY_ID: &str = "DELETE FROM memories WHERE id = ?1";
 /// Reused dynamic-query namespace-filter fragment (pm-v3.1 no-scattered-literals
 /// gate — one named const referenced by the `list` + `reembed` keyset builders).
 const SQL_FRAGMENT_AND_NAMESPACE_EQ: &str = " AND namespace = ?";
-const SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID: &str =
-    "DELETE FROM namespace_meta WHERE standard_id = ?1";
+/// #2503 — the ONE `tracing` target for governance-binding severance events:
+/// the reap-time WARN, its audit-append failure WARN, and the resolve-time
+/// severed-floor WARN. Named once so an operator greps a single string to see
+/// the whole lifecycle, and so the value cannot drift between the three sites
+/// (pm-v3.1 no-scattered-literals gate).
+pub(crate) const TRACE_TARGET_STANDARD_SEVERED: &str = "ai_memory::governance::standard_severed";
+
+/// #2503 — SEVER (not DELETE) every `namespace_meta` binding that points at a
+/// memory being reaped. See [`sever_namespace_standards`] for the full
+/// rationale; the postgres twin is
+/// `store::postgres::SQL_SEVER_NAMESPACE_META_BY_STANDARD_ID`.
+const SQL_SEVER_NAMESPACE_META_BY_STANDARD_ID: &str =
+    "UPDATE namespace_meta SET standard_id = NULL, updated_at = ?2 WHERE standard_id = ?1";
+/// #2503 — the namespaces whose binding a reap is about to sever, read BEFORE
+/// the UPDATE so the WARN + signed event can name them.
+const SQL_SELECT_NAMESPACES_BY_STANDARD_ID: &str =
+    "SELECT namespace FROM namespace_meta WHERE standard_id = ?1";
+/// #2503 — HEAL a legacy DANGLING pointer (a row naming a memory that no
+/// longer exists) into the same SEVERED state a reap now produces, instead of
+/// DELETING the row. Guarded on `standard_id IS NOT NULL` so an
+/// already-severed row is never re-touched (no `updated_at` churn, no
+/// federation-fanout storm), and so the sweep is MONOTONE — each dangling row
+/// heals once and leaves the set.
+const SQL_HEAL_DANGLING_NAMESPACE_META: &str = "UPDATE namespace_meta \
+     SET standard_id = NULL, updated_at = ?1 \
+     WHERE standard_id IS NOT NULL \
+       AND NOT EXISTS (SELECT 1 FROM memories WHERE memories.id = namespace_meta.standard_id)";
 const SQL_MEMORY_EXISTS_COUNT: &str = "SELECT COUNT(*) > 0 FROM memories WHERE id = ?1";
 const SQL_MEMORY_EXISTS: &str = "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)";
 const SQL_SELECT_MEMORY_ROW_BY_ID: &str = "SELECT * FROM memories WHERE id = ?1";
@@ -3477,11 +3502,144 @@ pub fn update_with_archive_on_supersede(
     })
 }
 
+/// #2503 (CWE-284 / data-integrity) — SEVER every `namespace_meta` binding
+/// that points at the memory `id` about to be reaped, instead of DELETING the
+/// binding rows. Returns the number of bindings severed.
+///
+/// # The defect this replaces
+///
+/// Every reap funnel used to run an UNQUALIFIED
+/// `DELETE FROM namespace_meta WHERE standard_id = ?1`. Because
+/// [`set_namespace_standard`] deliberately permits CROSS-NAMESPACE binding
+/// ("allow cross-namespace — shared policy"), and because `build_namespace_chain`
+/// prepends the global `*` standard to EVERY namespace's chain, deleting one
+/// in-scope memory destroyed the governance binding rows of namespaces
+/// anywhere in the tree — including namespaces the deleting principal is
+/// explicitly denied. A federated `deletions[]` push that the #2447/#2488
+/// namespace gate CORRECTLY ALLOWS could therefore disarm policy resolution
+/// for the whole node via a single `*`-bound standard.
+///
+/// # Why SEVER and not DELETE
+///
+/// A `namespace_meta` row carries TWO independent operator configurations:
+/// `standard_id` (which memory holds the policy) and `parent_namespace` (the
+/// explicit inheritance link `build_namespace_chain` walks). Only the first
+/// has anything to do with the memory being reaped. Deleting the whole row
+/// destroyed the second as COLLATERAL — unintentional data loss of
+/// configuration that the deletion had no authority over and no reason to
+/// touch. Severing sets `standard_id = NULL` and leaves the row, so the
+/// inheritance link survives and the namespace remains a first-class,
+/// repairable governance subject.
+///
+/// # The #1642 dangling-pointer invariant is PRESERVED, not traded away
+///
+/// The unqualified DELETE existed as the #1642 fix: a reap must not leave a
+/// `namespace_meta.standard_id` pointing at a memory that no longer exists.
+/// Severing satisfies that LITERALLY — the pointer is set to `NULL`, so no row
+/// names a nonexistent memory; there is no dangle to leave. The OBSERVABLE
+/// #1642's own regression test pins (`get_namespace_standard` returns `None`
+/// after the standard memory is deleted) is byte-identical, because both
+/// adapters map a NULL `standard_id` to "no standard bound" — which is exactly
+/// what a severed row means.
+///
+/// What #1642's remedy never actually fixed is its own STATED harm
+/// ("protection silently lapses"): a dangling row and an absent row were
+/// INDISTINGUISHABLE to [`resolve_governance_policy`], so both fell through
+/// the leaf-first walk to allow-on-silence. Severing is what makes the two
+/// states distinguishable, and [`resolve_governance_policy`]'s severed floor
+/// is what finally closes the fail-open. See
+/// [`crate::models::GovernancePolicy::with_severed_standard_floor`].
+///
+/// # Scope honesty
+///
+/// This does NOT preserve the victim namespace's POLICY. The policy lived in
+/// the deleted memory's `metadata.governance`; once that memory is gone the
+/// policy is genuinely unrecoverable, and no metadata bookkeeping can change
+/// that. What it prevents is the deletion silently WIDENING the victim's
+/// authority: the surviving row is durable evidence that a policy was
+/// configured, which the resolver reads as fail-closed rather than
+/// allow-on-silence.
+pub(crate) fn sever_namespace_standards(conn: &Connection, id: &str) -> Result<usize> {
+    // Name the affected namespaces BEFORE the UPDATE — afterwards the
+    // `standard_id = ?1` predicate matches nothing and the evidence is gone.
+    let severed: Vec<String> = {
+        let mut stmt = conn.prepare(SQL_SELECT_NAMESPACES_BY_STANDARD_ID)?;
+        let rows = stmt.query_map(params![id], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if severed.is_empty() {
+        // The overwhelmingly common case: the reaped memory is nobody's
+        // standard. Byte-identical to the pre-#2503 no-op DELETE — no UPDATE,
+        // no WARN, no signed event, no extra write.
+        return Ok(0);
+    }
+    let now = Utc::now().to_rfc3339();
+    let changed = conn.execute(SQL_SEVER_NAMESPACE_META_BY_STANDARD_ID, params![id, now])?;
+
+    tracing::warn!(
+        target: TRACE_TARGET_STANDARD_SEVERED,
+        standard_id = %id,
+        namespaces = %severed.join(","),
+        count = changed,
+        "reaping this memory SEVERED the governance-standard binding of the \
+         listed namespace(s); their policy is unrecoverable and they now \
+         resolve to the severed floor (write/promote/delete >= owner) instead \
+         of allow-on-silence. Re-point with `memory_namespace_set_standard`, \
+         or clear deliberately with `memory_namespace_clear_standard`."
+    );
+
+    // Best-effort audit. A signed-event failure must NOT abort the reap: the
+    // memory delete is the caller's intent and is already fenced by
+    // `record_stop`; losing the audit row degrades observability, whereas
+    // aborting here would leave the caller unable to delete at all. The WARN
+    // above is the non-best-effort record.
+    let signable = namespace_standard_severed_signable_bytes(id, &severed, &now);
+    let payload_hash = crate::signed_events::payload_hash(&signable);
+    let event = crate::signed_events::SignedEvent::with_daemon_signature(
+        payload_hash,
+        crate::identity::sentinels::DAEMON_PRINCIPAL.to_string(),
+        crate::signed_events::event_types::SUBSTRATE_NAMESPACE_STANDARD_SEVERED.to_string(),
+        now,
+        None,
+    );
+    if let Err(e) = crate::signed_events::append_signed_event_no_tx(conn, &event) {
+        tracing::warn!(
+            target: TRACE_TARGET_STANDARD_SEVERED,
+            standard_id = %id,
+            error = %e,
+            "failed to append the namespace-standard severance audit row"
+        );
+    }
+    Ok(changed)
+}
+
+/// #2503 — canonical signable bytes for a governance-binding severance:
+/// `standard_id \0 ns1 \0 ns2 ... \0 timestamp`. The namespace list is SORTED
+/// so the digest is independent of SQL row order (an unordered `SELECT` must
+/// not make the same severance hash differently on two nodes).
+fn namespace_standard_severed_signable_bytes(
+    standard_id: &str,
+    namespaces: &[String],
+    severed_at: &str,
+) -> Vec<u8> {
+    let mut sorted: Vec<&str> = namespaces.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let mut out = Vec::new();
+    out.extend_from_slice(standard_id.as_bytes());
+    for ns in sorted {
+        out.push(0);
+        out.extend_from_slice(ns.as_bytes());
+    }
+    out.push(0);
+    out.extend_from_slice(severed_at.as_bytes());
+    out
+}
+
 pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
     // #1955 R45 — record-stop fence for the delete funnel.
     crate::storage::record_stop::gate_storage_conn(conn)?;
-    // Clean up namespace_meta if this memory was a namespace standard
-    conn.execute(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID, params![id])?;
+    // #2503 — SEVER (never DELETE) any namespace_meta binding pointing here.
+    sever_namespace_standards(conn, id)?;
     // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact: append ONE
     // identity-only TOMBSTONE leaf BEFORE the delete. The ns/version lookup
     // runs only under the flag, so flag-OFF is byte-identical.
@@ -3833,9 +3991,11 @@ pub(crate) fn archive_memory_no_tx(
         // #1771 — snapshot the row's memory_links BEFORE the cascade DELETE
         // reaps them, so restore_archived can re-insert the edge graph.
         archive_links_for_memory(conn, id)?;
-        // Clean up namespace_meta — mirrors `delete`'s cleanup so an archived
-        // row is not still referenced as the namespace standard.
-        conn.execute(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID, params![id])?;
+        // #2503 — mirrors `delete`'s SEVER so an archived row is not still
+        // referenced as a namespace standard, WITHOUT destroying the binding
+        // row (and its `parent_namespace` inheritance link) of every namespace
+        // that pointed at it. See `sever_namespace_standards`.
+        sever_namespace_standards(conn, id)?;
         // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact: append
         // ONE identity-only ARCHIVE leaf IN THIS tx BEFORE the delete (the
         // cold-storage copy already landed above). Gated → flag-OFF unchanged.
@@ -4275,9 +4435,11 @@ pub fn archive_memory_for_caller(
              FROM memories WHERE id = ?3",
             params![now, reason, id],
         )?;
-        // Clean up namespace_meta — mirrors `delete`'s cleanup so an archived
-        // row is not still referenced as the namespace standard.
-        conn.execute(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID, params![id])?;
+        // #2503 — mirrors `delete`'s SEVER so an archived row is not still
+        // referenced as a namespace standard, WITHOUT destroying the binding
+        // row (and its `parent_namespace` inheritance link) of every namespace
+        // that pointed at it. See `sever_namespace_standards`.
+        sever_namespace_standards(conn, id)?;
         // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact: append
         // ONE identity-only ARCHIVE leaf IN THIS tx BEFORE the delete (the
         // cold-storage copy already landed above). Gated → flag-OFF unchanged.
@@ -12135,16 +12297,33 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
             }
         }
     }
-    // Clean up namespace_meta rows pointing to deleted memories.
+    // HEAL namespace_meta rows pointing to deleted memories.
     // #1579 B6 — correlated NOT EXISTS instead of the former
     // `standard_id NOT IN (SELECT id FROM memories)`, which
     // materialised the full id set on every sweep; the rewrite is one
     // primary-key probe per namespace_meta row (a small table — one
     // row per namespace standard).
+    //
+    // #2503 — this sweep used to DELETE the dangling row, which made it the
+    // BACK DOOR onto the confinement the reap funnels now enforce: a severance
+    // the delete path deliberately preserved would be destroyed by the next gc
+    // tick, ~30 minutes later, silently restoring allow-on-silence. It now
+    // performs the SAME sever the reap funnels do, so a legacy dangling
+    // pointer is HEALED into the severed state rather than erased, and every
+    // path converges on one rule — a dangle always becomes SEVERED, never
+    // ABSENT.
+    //
+    // Two guards matter. `standard_id IS NOT NULL` is load-bearing on sqlite
+    // in a way it is not on postgres: `NOT EXISTS (… id = NULL)` is TRUE, so
+    // the pre-#2503 predicate matched ALREADY-SEVERED rows and would have
+    // deleted every one of them on the next tick (postgres' `NOT IN` form
+    // evaluates to NULL on a NULL left side and never matched them — the two
+    // backends were already divergent here). It also makes the sweep MONOTONE:
+    // each dangling row heals exactly once and leaves the matching set, so
+    // there is no per-tick `updated_at` churn and no federation-fanout storm.
     let _ = conn.execute(
-        "DELETE FROM namespace_meta WHERE NOT EXISTS \
-         (SELECT 1 FROM memories WHERE memories.id = namespace_meta.standard_id)",
-        [],
+        SQL_HEAL_DANGLING_NAMESPACE_META,
+        params![Utc::now().to_rfc3339()],
     );
     Ok(total)
 }
@@ -12232,7 +12411,8 @@ pub fn size_gc(
                 // reusing the same primitive the supersede / GC paths use.
                 archive_memory_no_tx(conn, &id, Some(SIZE_GC_ARCHIVE_REASON))?;
             } else {
-                conn.execute(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID, params![id])?;
+                // #2503 — SEVER, never DELETE (see `sever_namespace_standards`).
+                sever_namespace_standards(conn, &id)?;
                 // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
                 // append ONE identity-only EVICT leaf IN THIS tx BEFORE the
                 // non-archiving delete (the archive branch above routes
@@ -16928,24 +17108,82 @@ pub fn build_namespace_chain(conn: &Connection, namespace: &str) -> Vec<String> 
     chain
 }
 
-/// Read the explicit governance policy attached to a single namespace's
-/// standard memory. Does **not** walk the inheritance chain — callers
-/// that want hierarchical resolution should use
-/// [`resolve_governance_policy`] instead.
+/// #2503 — what ONE level of the namespace chain contributes to governance
+/// resolution. Replaces the pre-#2503 `Option<GovernancePolicy>`, which
+/// collapsed three materially different states into one `None`.
 ///
-/// **NHI-P4-T19 (v0.7.0 NHI testing):** returns `None` when the
-/// standard carries no explicit `metadata.governance`. Operators who
-/// want enforcement-by-default can either (a) write
-/// `metadata.governance = {"write": "owner", ...}` into their standard
-/// memory, or (b) use the
-/// [`crate::models::GovernancePolicy::default_for_managed_namespace`]
-/// helper as a starting template. Changing the implicit fallback to
-/// Owner is deferred to v0.7.1 because it can break inheritance chains
-/// where a parent's standard was registered under a distinct agent
-/// identity from descendant operations.
-fn read_namespace_policy(conn: &Connection, namespace: &str) -> Option<GovernancePolicy> {
-    let standard_id = get_namespace_standard(conn, namespace).ok()??;
-    let mem = get(conn, &standard_id).ok()??;
+/// The collapse WAS the vulnerability: a namespace with no configuration at
+/// all and a namespace whose operator-configured standard had been reaped were
+/// indistinguishable, so both fell through the walk to allow-on-silence
+/// (#1569). Splitting `Severed` out is what lets the resolver tell "nobody
+/// governed this" from "somebody governed this and the policy is gone".
+#[derive(Debug)]
+enum NamespaceLevel {
+    /// No `namespace_meta` row, or a row whose standard carries no
+    /// `metadata.governance`. Contributes nothing; the walk continues. This is
+    /// the documented allow-on-silence branch and is UNCHANGED by #2503.
+    NoPolicy,
+    /// A `namespace_meta` row EXISTS but its standard cannot be resolved —
+    /// `standard_id IS NULL` (severed by a reap, see
+    /// [`sever_namespace_standards`]) or non-NULL but naming a memory that no
+    /// longer exists (a legacy dangle predating #2503, or one produced by a
+    /// raw out-of-band `DELETE`). Both mean the same thing: an operator
+    /// deliberately governed this namespace and the policy is gone.
+    Severed,
+    /// A resolved, parsed policy. Most-specific wins; the walk stops here.
+    Policy(Box<GovernancePolicy>),
+}
+
+/// #2503 — read a single chain level, distinguishing SEVERED from ABSENT.
+///
+/// Deliberately probes `namespace_meta` directly rather than reusing
+/// [`get_namespace_standard`], whose contract collapses a NULL `standard_id`
+/// into `None` ("no standard bound") — correct for its own callers and for the
+/// #1642 observable, but exactly the distinction this function exists to make.
+fn read_namespace_level(conn: &Connection, namespace: &str) -> NamespaceLevel {
+    use rusqlite::OptionalExtension;
+    // `Option<Option<String>>`: outer = row present?, inner = standard bound?
+    let row: Option<Option<String>> = conn
+        .query_row(
+            "SELECT standard_id FROM namespace_meta WHERE namespace = ?1",
+            params![namespace],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .unwrap_or(None);
+    let Some(bound) = row else {
+        return NamespaceLevel::NoPolicy; // no row — never configured
+    };
+    let Some(standard_id) = bound else {
+        return NamespaceLevel::Severed; // row survives, pointer severed
+    };
+    match get(conn, &standard_id) {
+        Ok(Some(mem)) => match read_policy_from_standard(namespace, &standard_id, &mem) {
+            Some(p) => NamespaceLevel::Policy(Box::new(p)),
+            None => NamespaceLevel::NoPolicy,
+        },
+        // The row names a memory that is not there: a dangling pointer. Same
+        // meaning as an explicit severance — governed, policy gone.
+        Ok(None) => NamespaceLevel::Severed,
+        // A read fault is NOT evidence that the standard is gone, so it must
+        // not be reported as `Severed` (that would fail closed on a transient
+        // I/O error). Falling through as `NoPolicy` preserves the pre-#2503
+        // behaviour of this arm exactly.
+        Err(_) => NamespaceLevel::NoPolicy,
+    }
+}
+
+/// Parse the policy out of an already-resolved standard memory.
+///
+/// #2503 — extracted verbatim from the former `read_namespace_policy` so the
+/// severed-aware [`read_namespace_level`] reuses the SAME #1384 parse-drift
+/// observability instead of forking a second copy of it. The parse semantics
+/// (including the WARN and the `None` fall-through) are byte-identical.
+fn read_policy_from_standard(
+    namespace: &str,
+    standard_id: &str,
+    mem: &crate::models::Memory,
+) -> Option<GovernancePolicy> {
     match GovernancePolicy::from_metadata(&mem.metadata) {
         Some(Ok(p)) => Some(p),
         // #1384 — observability for stored-corruption. The write path
@@ -17026,27 +17264,95 @@ fn read_namespace_policy(conn: &Connection, namespace: &str) -> Option<Governanc
 /// Cycle-safety is inherited from `build_namespace_chain`
 /// (`MAX_EXPLICIT_DEPTH = 8` + visited set). No new cache is
 /// introduced — profile-driven optimization is a v0.7 item.
+/// **#2503 — the SEVERED FLOOR.** A level whose `namespace_meta` row EXISTS
+/// but whose standard cannot be resolved (severed by a reap, or a legacy
+/// dangling pointer) no longer contributes `None`. It is remembered, the walk
+/// CONTINUES, and whatever the walk finally resolves is returned with
+/// `write`/`promote`/`delete` raised to at least `Owner`
+/// ([`GovernancePolicy::with_severed_standard_floor`]); if the walk finds
+/// nothing at all, the floor over the default policy is returned instead of
+/// `None`.
+///
+/// Three properties make this the right shape:
+///
+/// 1. **It can only tighten.** The floor is applied OVER the resolved policy,
+///    never INSTEAD of it, so an intact ancestor `write: Approve` survives
+///    intact. Short-circuiting on the severed level would have let a severed
+///    child silently DOWNGRADE a governed parent — inverting the fix and
+///    breaking the inheritance feature `parent_namespace` exists for.
+/// 2. **It costs nothing.** Severances are only observed on levels the walk
+///    already visits, and the walk still stops at the first policy — so a
+///    corpus with no severed rows performs exactly the reads it did before and
+///    returns exactly what it did before.
+/// 3. **Only levels BELOW the winning policy matter.** If the leaf carries its
+///    own policy, an ancestor severance is irrelevant because that ancestor
+///    would never have been consulted. Tracking severance only until the first
+///    policy is found is therefore precise, not an approximation.
 pub fn resolve_governance_policy(conn: &Connection, namespace: &str) -> Option<GovernancePolicy> {
     // build_namespace_chain returns top-down (`["*", root, ..., leaf]`).
     // Governance resolution wants leaf-first (most specific first), so
     // we reverse before walking.
     let chain = build_namespace_chain(conn, namespace);
+    let mut severed_level: Option<String> = None;
     for level in chain.into_iter().rev() {
-        // Most-specific match wins. Returning immediately here means
-        // an explicit policy at the leaf (or any descendant level
-        // with a policy) authoritatively overrides anything above —
-        // which is precisely the inherit=false semantic, applied
-        // implicitly. The inherit=false flag is preserved on the
-        // returned policy so callers (e.g. the pending_action
-        // approver resolver) don't accidentally re-walk to a parent.
-        if let Some(policy) = read_namespace_policy(conn, &level) {
-            return Some(policy);
+        match read_namespace_level(conn, &level) {
+            // Most-specific match wins. Returning here means an explicit
+            // policy at the leaf (or any descendant level with a policy)
+            // authoritatively overrides anything above — precisely the
+            // inherit=false semantic, applied implicitly. The inherit=false
+            // flag is preserved on the returned policy so callers (e.g. the
+            // pending_action approver resolver) don't re-walk to a parent.
+            NamespaceLevel::Policy(policy) => {
+                let policy = *policy;
+                return Some(match severed_level {
+                    None => policy,
+                    Some(ns) => {
+                        warn_severed_floor_applied(&ns, namespace);
+                        policy.with_severed_standard_floor()
+                    }
+                });
+            }
+            // #2503 — governed, but the policy is gone. Remember it and keep
+            // walking so an intact ancestor policy is still found and honoured.
+            NamespaceLevel::Severed => {
+                if severed_level.is_none() {
+                    severed_level = Some(level);
+                }
+            }
+            // Implicit branch: no policy at this level → keep walking toward
+            // the root. This is the "default inherit" behavior that closes G1.
+            NamespaceLevel::NoPolicy => {}
         }
-        // Implicit branch: no policy at this level → keep walking
-        // toward the root. This is the "default inherit" behavior
-        // that closes G1.
     }
-    None
+    // Walked off the top of the chain. Pre-#2503 this always returned `None`
+    // (enforcement stays opt-in for namespaces with no governance configured
+    // anywhere in the chain) — still true when nothing was severed. When a
+    // level WAS severed, returning `None` is what handed the attacker
+    // allow-on-silence over a namespace an operator had deliberately governed;
+    // the floor is returned instead.
+    match severed_level {
+        None => None,
+        Some(ns) => {
+            warn_severed_floor_applied(&ns, namespace);
+            Some(GovernancePolicy::default().with_severed_standard_floor())
+        }
+    }
+}
+
+/// #2503 — one structured line per resolution that had to fall back to the
+/// severed floor, so an operator can tell an intentional policy from a
+/// lockout caused by a reaped standard, and knows the one-command remedy.
+fn warn_severed_floor_applied(severed_namespace: &str, resolving_for: &str) {
+    tracing::warn!(
+        target: TRACE_TARGET_STANDARD_SEVERED,
+        severed_namespace = %severed_namespace,
+        resolving_for = %resolving_for,
+        "governance resolution applied the SEVERED FLOOR (write/promote/delete \
+         >= owner): the namespace_meta row for the severed namespace survives \
+         but its standard memory was reaped, so its policy is unrecoverable. \
+         Re-point with `memory_namespace_set_standard`, or clear deliberately \
+         with `memory_namespace_clear_standard`."
+    );
 }
 
 /// v0.7.0 L1-8 — read `governance.require_approval_above_depth` from the

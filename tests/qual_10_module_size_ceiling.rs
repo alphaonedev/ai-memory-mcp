@@ -399,7 +399,21 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // the `canonical_archived_expiry` helper that heals a legacy
     // `original_expires_at` on BOTH `restore_archived*` funnels. Lands the
     // file at 27_251 — ONE line over. Ceiling 27_250 -> 27_400 (+149).
-    ("src/storage/mod.rs", 27_400),
+    // 2026-07-30 (#2503 delete-governance-strip, L2 SECURITY CONFINEMENT) —
+    // the unqualified `DELETE FROM namespace_meta WHERE standard_id = ?1` on
+    // all FOUR reap funnels (`delete` / `archive_memory_no_tx` /
+    // `archive_memory_for_caller` / `size_gc`) becomes the audited
+    // `sever_namespace_standards` primitive (name-then-sever + WARN + signed
+    // `substrate.namespace_standard_severed` event + canonical signable
+    // bytes), the gc dangling sweep becomes a HEAL, and the resolver gains the
+    // severed tri-state (`NamespaceLevel` + `read_namespace_level` +
+    // `read_policy_from_standard` extraction + the floor-tracking walk). The
+    // bulk is the WHY comments: this is a fail-open→fail-closed posture flip
+    // on a security boundary, so each site states what it prevents and what it
+    // deliberately does not claim. MEASURED post-change: 27_609.
+    // Ceiling 27_400 -> 27_700 (+91 headroom). Bumped in LOCKSTEP with the
+    // postgres.rs entry below (same commit, same issue).
+    ("src/storage/mod.rs", 27_700),
     // 2026-07-21 (#1802 R-05 S1) — NEW submodule extracted from
     // storage/mod.rs (doctor / observability probes). Measured 698;
     // ceiling 800 (+102).
@@ -1013,7 +1027,18 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // MEASURED post-change: 32_080. Per this entry's own doctrine (measure
     // after the change; concurrent lanes STACK) bumped 31_320 -> 32_200 =
     // 32_080 + 120 headroom. Real relief is the #650-class module split.
-    ("src/store/postgres.rs", 32_200),
+    // 2026-07-30 (#2503, LOCKSTEP with the storage/mod.rs bump above) — the
+    // postgres half of the governance-binding severance: SEVER/HEAL consts,
+    // `PostgresStore::delete` converted, the sever ADDED to the two #2493 arms
+    // that omitted it entirely (`apply_remote_deletion` — the
+    // attacker-reachable federated lane — and `archive_by_ids`), the NULL
+    // `standard_id` decode repaired in `get_namespace_standard` (it was a hard
+    // `ColumnDecode` error, i.e. a 5xx on a state the substrate now creates),
+    // and the severed floor threaded through BOTH pg governance walks
+    // (`resolve_governance_policy` + the in-tx walk inside
+    // `enforce_governance_action`). MEASURED post-change: 32_196.
+    // Ceiling 32_200 -> 32_300 (+104 headroom).
+    ("src/store/postgres.rs", 32_300),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
