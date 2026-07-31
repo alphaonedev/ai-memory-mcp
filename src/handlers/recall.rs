@@ -408,17 +408,17 @@ async fn recall_response(
         // Embed the query before issuing the trait call. None when the
         // embedder is unavailable; the trait's recall_hybrid degrades
         // to the FTS-only pool with a synthetic semantic component.
-        let query_emb: Option<Vec<f32>> = if let Some(emb) = app.embedder.as_ref().as_ref() {
-            match emb.embed_query(context) {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    tracing::warn!("recall (postgres): embed failed, keyword-only: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        // v1.0.0 #2577 — route through the ONE bounded funnel
+        // (`recall_query_embedding`): process-local cache, then a
+        // wall-clock budget, then degrade to keyword. The funnel owns the
+        // WARN + the `ai_memory_recall_embed_degraded_total` counter, so a
+        // slow provider bounds the read instead of hanging it (and, on the
+        // HTTP daemon, instead of holding an admission permit for 30 s).
+        let query_emb: Option<Vec<f32>> = app
+            .embedder
+            .as_ref()
+            .as_ref()
+            .and_then(|emb| crate::embeddings::recall_query_embedding(emb, context));
         let mode = if query_emb.is_some() {
             crate::models::RECALL_MODE_HYBRID
         } else {
@@ -638,17 +638,13 @@ async fn recall_response(
 
     // Embed the query BEFORE grabbing the DB lock — embed() is CPU-heavy
     // and holding the SQLite mutex across it serialises unrelated writes.
-    let query_emb: Option<Vec<f32>> = if let Some(emb) = app.embedder.as_ref().as_ref() {
-        match emb.embed_query(context) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                tracing::warn!("recall: embedder query failed, falling back to keyword-only: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // v1.0.0 #2577 — bounded funnel (cache -> budget -> degrade-to-keyword).
+    // See the postgres branch above; the funnel owns the WARN + counter.
+    let query_emb: Option<Vec<f32>> = app
+        .embedder
+        .as_ref()
+        .as_ref()
+        .and_then(|emb| crate::embeddings::recall_query_embedding(emb, context));
 
     // FX-4 / PERF-2 (2026-05-26) — release the DB mutex across the
     // HNSW search + post-recall decoration. Pre-fix the handler held

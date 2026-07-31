@@ -29,6 +29,342 @@ pub fn embedding_document(
     format!("{title} {content}")
 }
 
+// ---------------------------------------------------------------------------
+// v1.0.0 #2577 — recall-path query-embedding budget + bounded cache
+// ---------------------------------------------------------------------------
+
+/// #2577 — wall-clock budget for the query-embedding call on the RECALL
+/// (read) path, in milliseconds.
+///
+/// **Why a read needs its own budget.** The remote embed client is built
+/// with `GENERATE_TIMEOUT` (30 s) — a *generation* budget sized for chat
+/// completions — and `CONNECT_TIMEOUT` (5 s). Applying a 30 s generation
+/// budget to a READ means a slow provider converts `memory_recall` into a
+/// 30 s hang. That is an AVAILABILITY defect, not merely a latency one:
+///
+/// * On **MCP stdio** the loop is single-threaded by JSON-RPC protocol
+///   design (one request in, one response out — the #965 audit), so the
+///   stall blocks EVERY subsequent tool call, including `memory_store`.
+///   A stall longer than the host's request timeout presents as the MCP
+///   server dropping its connection.
+/// * On the **HTTP daemon** each stalled recall holds an admission permit
+///   for its whole duration (`AI_MEMORY_MAX_INFLIGHT_REQUESTS`, default-on
+///   since #2032 M3), so sustained provider latency saturates the in-flight
+///   cap and sheds HEALTHY traffic — including durable-truth writes — with
+///   503s.
+///
+/// On expiry the recall **degrades to keyword** and reports `mode:keyword`
+/// honestly, which is the #1593 posture applied to SLOWNESS rather than
+/// only to embedder-CONSTRUCTION failure. That is a DEGRADE (fewer, less
+/// refined results), never a wrong result: the durable memory text is
+/// untouched, recall is pure (#1869/#1953), and the response tells the
+/// caller which ranking it got.
+///
+/// Tri-state, mirroring `AI_MEMORY_MAX_INFLIGHT_REQUESTS` (#2032 M3):
+/// unset ⇒ [`RECALL_EMBED_BUDGET_MS_DEFAULT`]; an explicit `0` ⇒ DISABLED
+/// (restores the pre-#2577 unbounded-until-30 s behaviour); unparseable ⇒
+/// the default (an unrecognised token must never silently WIDEN the
+/// failure window — the #131/FBL-14 rule).
+pub const ENV_RECALL_EMBED_BUDGET_MS: &str = "AI_MEMORY_RECALL_EMBED_BUDGET_MS";
+
+/// #2577 — compiled default for [`ENV_RECALL_EMBED_BUDGET_MS`].
+///
+/// 2000 ms is ~4x the p99 (492 ms) and ~13x the p50 (156 ms) measured for
+/// a healthy `openrouter` round trip on the #2576/#2577 reference corpus,
+/// so under the measured distribution it fires on approximately nothing —
+/// it is a TAIL cutter aimed at the sampled 39.3 s stall, not a throughput
+/// governor. It is also the substrate's own declared read-class ceiling
+/// (`crate::hooks::timeouts::READ_CLASS_DEADLINE_MS`), so the codebase does
+/// not now hold two different answers to "how long may a read spend on an
+/// out-of-process side quest".
+pub const RECALL_EMBED_BUDGET_MS_DEFAULT: u64 = 2_000;
+
+/// #2577 — capacity (entries) of the process-wide query-embedding cache.
+/// `0` disables caching entirely.
+pub const ENV_QUERY_EMBED_CACHE_ENTRIES: &str = "AI_MEMORY_QUERY_EMBED_CACHE_ENTRIES";
+
+/// #2577 — compiled default for [`ENV_QUERY_EMBED_CACHE_ENTRIES`].
+///
+/// 512 entries bounds the cache at ~1.5 MB for a 768-dim model and ~6 MB
+/// for a 3072-dim model — a fixed ceiling that does not grow with corpus,
+/// namespace, or tenant count.
+pub const QUERY_EMBED_CACHE_ENTRIES_DEFAULT: usize = 512;
+
+/// #2577 — how long a cached query vector may be reused, in seconds.
+///
+/// A query embedding is a pure function of `(text, model, prefix scheme)`,
+/// and the cache key carries the model + prefix scheme via the
+/// [`embedding_space_fingerprint`], so a LOCAL model swap can never serve a
+/// foreign-space vector — it is a key change, hence a miss. The TTL exists
+/// for the one hazard the key cannot express: a REMOTE provider silently
+/// re-training or re-pointing a model behind a stable id, which would leave
+/// cached query vectors in the old space while newly-written ROW vectors
+/// land in the new one. A bounded TTL caps that divergence window.
+const QUERY_EMBED_CACHE_TTL_SECS: u64 = 900;
+
+/// Cached resolution of [`ENV_RECALL_EMBED_BUDGET_MS`]. Read on every
+/// recall, so resolved once and cached — the `strict_dim_enabled` /
+/// `strict_embed_model_match_enabled` direct-read pattern (`src/hnsw.rs`).
+///
+/// Deliberately NOT a boot-seeded `OnceLock`: a seed-based knob is inert in
+/// any process that does not cross the seeding funnel, which is the #2233
+/// "defaults lie" class. A direct cached read is correct in every process,
+/// including CLI one-shots and library embedders.
+///
+/// `u64::MAX` is the uninitialised sentinel (an unreachable budget value).
+static RECALL_EMBED_BUDGET_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// The effective recall-path query-embed budget for this process.
+/// `None` when the operator explicitly disabled it with `0`.
+#[must_use]
+pub fn recall_embed_budget() -> Option<std::time::Duration> {
+    let cached = RECALL_EMBED_BUDGET_MS.load(std::sync::atomic::Ordering::Relaxed);
+    let ms = if cached == u64::MAX {
+        let resolved = match std::env::var(ENV_RECALL_EMBED_BUDGET_MS) {
+            Err(_) => RECALL_EMBED_BUDGET_MS_DEFAULT,
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                // Explicit 0 = disabled (tri-state, #2032 M3 precedent).
+                Ok(v) => v,
+                Err(_) => {
+                    tracing::warn!(
+                        target: "recall.embed.budget",
+                        value = %raw,
+                        default_ms = RECALL_EMBED_BUDGET_MS_DEFAULT,
+                        "unparseable {ENV_RECALL_EMBED_BUDGET_MS}; falling back to the \
+                         compiled default (an unrecognised token must never widen the \
+                         failure window)"
+                    );
+                    RECALL_EMBED_BUDGET_MS_DEFAULT
+                }
+            },
+        };
+        RECALL_EMBED_BUDGET_MS.store(resolved, std::sync::atomic::Ordering::Relaxed);
+        resolved
+    } else {
+        cached
+    };
+    if ms == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_millis(ms))
+    }
+}
+
+/// Test-only override for the #2577 budget cache (the
+/// `set_strict_dim_for_test` twin — avoids the #2115/#2146 env-lock
+/// hazard). `None` re-reads the env on the next call. Process-global:
+/// restore `None` before returning.
+#[doc(hidden)]
+pub fn set_recall_embed_budget_for_test(forced: Option<u64>) {
+    RECALL_EMBED_BUDGET_MS.store(
+        forced.unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Cached resolution of [`ENV_QUERY_EMBED_CACHE_ENTRIES`]. `usize::MAX` is
+/// the uninitialised sentinel.
+static QUERY_EMBED_CACHE_ENTRIES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// The effective query-embedding cache capacity for this process.
+#[must_use]
+pub fn query_embed_cache_capacity() -> usize {
+    let cached = QUERY_EMBED_CACHE_ENTRIES.load(std::sync::atomic::Ordering::Relaxed);
+    if cached != usize::MAX {
+        return cached;
+    }
+    let resolved = std::env::var(ENV_QUERY_EMBED_CACHE_ENTRIES)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(QUERY_EMBED_CACHE_ENTRIES_DEFAULT);
+    QUERY_EMBED_CACHE_ENTRIES.store(resolved, std::sync::atomic::Ordering::Relaxed);
+    resolved
+}
+
+/// Test-only override for the #2577 cache-capacity cache.
+#[doc(hidden)]
+pub fn set_query_embed_cache_capacity_for_test(forced: Option<usize>) {
+    QUERY_EMBED_CACHE_ENTRIES.store(
+        forced.unwrap_or(usize::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// #2577 — cache key for a query embedding.
+///
+/// The query text is stored as a SHA-256 digest, never in cleartext: the
+/// cache is a long-lived process-global, and recall context is caller-
+/// supplied free text that may carry sensitive material. Hashing keeps raw
+/// query strings out of a heap dump / core file without changing the
+/// lookup semantics.
+///
+/// The digest is over the EXACT bytes handed to the embedder — no case
+/// folding, no whitespace collapsing, no unicode normalisation. A lossy
+/// fold would let two DIFFERENT queries collide onto one vector, which is
+/// the only way this cache could produce a wrong result.
+///
+/// `space` is the [`embedding_space_fingerprint`] of the embedder, read at
+/// LOOKUP time. It carries the canonical model id and the prefix scheme, so
+/// (a) a model swap changes the key rather than requiring an invalidation
+/// event that some funnel could forget to fire, and (b) an asymmetric
+/// (nomic) query vector can never be served where a document vector is
+/// expected, or vice versa.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct QueryEmbedKey {
+    digest: [u8; 32],
+    space: String,
+}
+
+struct QueryEmbedCacheEntry {
+    vector: Arc<Vec<f32>>,
+    inserted: std::time::Instant,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct QueryEmbedCache {
+    entries: std::collections::HashMap<QueryEmbedKey, QueryEmbedCacheEntry>,
+    tick: u64,
+    hits: u64,
+    misses: u64,
+}
+
+static QUERY_EMBED_CACHE: std::sync::OnceLock<std::sync::Mutex<QueryEmbedCache>> =
+    std::sync::OnceLock::new();
+
+fn query_embed_cache() -> &'static std::sync::Mutex<QueryEmbedCache> {
+    QUERY_EMBED_CACHE.get_or_init(|| std::sync::Mutex::new(QueryEmbedCache::default()))
+}
+
+fn query_embed_key(text: &str, space: &str) -> QueryEmbedKey {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    QueryEmbedKey {
+        digest,
+        space: space.to_string(),
+    }
+}
+
+/// #2577 — observed cache statistics `(hits, misses, live entries)`.
+/// Exposed for tests and for the operator-facing counters; carries NO
+/// cache CONTENT, so it can never surface a query string.
+#[must_use]
+#[doc(hidden)]
+pub fn query_embed_cache_stats() -> (u64, u64, usize) {
+    query_embed_cache()
+        .lock()
+        .map_or((0, 0, 0), |c| (c.hits, c.misses, c.entries.len()))
+}
+
+/// #2577 — drop every cached query vector. Test-only; the cache is a
+/// disposable derived artifact, so clearing it can never lose data.
+#[doc(hidden)]
+pub fn clear_query_embed_cache() {
+    if let Ok(mut c) = query_embed_cache().lock() {
+        c.entries.clear();
+        c.tick = 0;
+        c.hits = 0;
+        c.misses = 0;
+    }
+}
+
+/// #2577 — the ONE funnel every recall surface crosses to turn a query
+/// string into a query vector.
+///
+/// Applies, in order: the bounded cache ([`ENV_QUERY_EMBED_CACHE_ENTRIES`])
+/// and the wall-clock budget ([`ENV_RECALL_EMBED_BUDGET_MS`]). Returns
+/// `None` when no vector could be produced within budget — the caller then
+/// runs keyword-only and reports `mode:keyword`, which is the #1593 degrade
+/// posture applied to slowness.
+///
+/// Callers MUST route through this rather than calling
+/// [`Embed::embed_query`] directly on a read path; the funnel is pinned by
+/// `tests/embed_budget_funnel_ceiling_2577.rs`.
+#[must_use]
+pub fn recall_query_embedding(embedder: &dyn Embed, text: &str) -> Option<Vec<f32>> {
+    let capacity = query_embed_cache_capacity();
+    let space = embedder.space_fingerprint();
+    let key = (capacity > 0).then(|| query_embed_key(text, &space));
+
+    if let Some(k) = key.as_ref()
+        && let Ok(mut cache) = query_embed_cache().lock()
+    {
+        cache.tick = cache.tick.wrapping_add(1);
+        let tick = cache.tick;
+        let ttl = std::time::Duration::from_secs(QUERY_EMBED_CACHE_TTL_SECS);
+        let fresh = cache
+            .entries
+            .get(k)
+            .is_some_and(|e| e.inserted.elapsed() < ttl);
+        if fresh {
+            if let Some(e) = cache.entries.get_mut(k) {
+                e.last_used = tick;
+                let hit = Arc::clone(&e.vector);
+                cache.hits = cache.hits.saturating_add(1);
+                drop(cache);
+                crate::metrics::inc_query_embed_cache_hit();
+                return Some((*hit).clone());
+            }
+        } else {
+            // Expired entries are evicted on observation so a stale vector
+            // can never be served after the TTL window.
+            cache.entries.remove(k);
+        }
+        cache.misses = cache.misses.saturating_add(1);
+    }
+
+    let budget = recall_embed_budget();
+    let started = std::time::Instant::now();
+    let vector = match embedder.embed_query_bounded(text, budget) {
+        Ok(v) => v,
+        Err(e) => {
+            // DEGRADE, never fail the read: the caller falls back to
+            // keyword/FTS and says so on the wire.
+            tracing::warn!(
+                target: "recall.embed.degraded",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                budget_ms = budget.map_or(0, |b| b.as_millis() as u64),
+                error = %e,
+                "query embedding unavailable within budget; recall degrades to keyword \
+                 (#2577). Results will be FEWER and FTS-ranked, never wrong — the \
+                 response reports mode:keyword."
+            );
+            crate::metrics::inc_recall_embed_degraded();
+            return None;
+        }
+    };
+
+    if let Some(k) = key
+        && let Ok(mut cache) = query_embed_cache().lock()
+    {
+        cache.tick = cache.tick.wrapping_add(1);
+        let tick = cache.tick;
+        if cache.entries.len() >= capacity
+            && !cache.entries.contains_key(&k)
+            && let Some(victim) = cache
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, _)| k.clone())
+        {
+            cache.entries.remove(&victim);
+        }
+        cache.entries.insert(
+            k,
+            QueryEmbedCacheEntry {
+                vector: Arc::new(vector.clone()),
+                inserted: std::time::Instant::now(),
+                last_used: tick,
+            },
+        );
+    }
+    Some(vector)
+}
+
 const MINILM_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
 #[allow(dead_code)]
 const MINILM_DIM: usize = 384;
@@ -482,6 +818,34 @@ pub trait Embed: Send + Sync {
         self.embed(text)
     }
 
+    /// v1.0.0 #2577 — [`Embed::embed_query`] under a wall-clock budget.
+    ///
+    /// The default implementation IGNORES `budget` and delegates, which is
+    /// correct for every implementor that cannot stall on a network: the
+    /// local candle MiniLM backend is CPU-bound and bounded by its own
+    /// sequence cap, and the test `MockEmbedder` is immediate. Only the
+    /// REMOTE arm of the production [`Embedder`] can hang on a third party,
+    /// and only it overrides this.
+    ///
+    /// This asymmetry is deliberate rather than an omission. A budget can
+    /// only be honoured where the work is CANCELLABLE — an in-flight
+    /// `reqwest` future is (dropping it aborts the request); a synchronous
+    /// candle forward pass is not, and "bounding" it would mean abandoning
+    /// a thread that keeps burning CPU, which is worse than waiting.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Embed::embed_query`], plus a budget-expiry error from
+    /// implementors that honour `budget`.
+    fn embed_query_bounded(
+        &self,
+        text: &str,
+        budget: Option<std::time::Duration>,
+    ) -> Result<Vec<f32>> {
+        let _ = budget;
+        self.embed_query(text)
+    }
+
     /// Produce embedding vectors for a batch of texts. Default
     /// implementation calls [`Embed::embed`] in a loop; implementors
     /// may override to do native batching.
@@ -857,6 +1221,49 @@ impl Embedder {
     /// the role.
     pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
         self.embed_with_role(text, EmbedRole::Query)
+    }
+
+    /// v1.0.0 #2577 — [`Self::embed_query`] under a wall-clock budget.
+    ///
+    /// The `Local` arm ignores the budget: a candle forward is CPU-bound,
+    /// bounded by [`MAX_SEQ_LEN`], and has no cancellation point. The
+    /// `Ollama` (remote) arm threads the budget into the HTTP call, where
+    /// dropping the in-flight future genuinely aborts the request.
+    ///
+    /// A budget expiry is latched as a degrade on the `degraded` flag —
+    /// identical to any other embed failure — so the capabilities surface
+    /// reports the remote endpoint's real posture (#1594), and it is
+    /// reported to the circuit breaker so repeated stalls fast-fail
+    /// instead of each paying the full budget.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the embed failure, or a budget-expiry error.
+    pub fn embed_query_bounded(
+        &self,
+        text: &str,
+        budget: Option<std::time::Duration>,
+    ) -> Result<Vec<f32>> {
+        match self {
+            Self::Local { .. } => self.embed_with_role(text, EmbedRole::Query),
+            Self::Ollama {
+                client,
+                model_name,
+                degraded,
+                ..
+            } => {
+                let owned;
+                let payload = if Self::model_requires_nomic_prefix(model_name) {
+                    owned = format!("{}{}", EmbedRole::Query.nomic_prefix(), text);
+                    owned.as_str()
+                } else {
+                    text
+                };
+                let result = client.embed_text_with_budget(payload, model_name, budget);
+                degraded.store(result.is_err(), std::sync::atomic::Ordering::Relaxed);
+                result
+            }
+        }
     }
 
     /// Generate an embedding for `text` under an explicit retrieval
@@ -1376,6 +1783,14 @@ impl Embed for Embedder {
 
     fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
         Self::embed_query(self, text)
+    }
+
+    fn embed_query_bounded(
+        &self,
+        text: &str,
+        budget: Option<std::time::Duration>,
+    ) -> Result<Vec<f32>> {
+        Self::embed_query_bounded(self, text, budget)
     }
 
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {

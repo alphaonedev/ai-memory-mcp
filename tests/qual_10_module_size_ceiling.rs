@@ -1488,7 +1488,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // method + 8 wiremock/unit tool-calling tests (file grew to 6_012);
     // 6_060 = 48 headroom. Refactor-split into `src/llm/{…}.rs` remains the
     // tracked post-ship ARCH cleanup.
-    ("src/llm.rs", 6_060),
+    // 2026-07-31 (#2577): 6_060 -> 6_080. +15 LOC for the recall-scoped
+    // embed budget primitives (`embed_text_with_budget` /
+    // `embed_text_async_with_budget`) — the read path needs a bound the
+    // 30 s `GENERATE_TIMEOUT` does not give it, and the budget must live
+    // beside the client that owns the cancellable future. Bumped in
+    // lockstep per the QUAL-10 contract; thresholds rise, never fall.
+    ("src/llm.rs", 6_080),
 ];
 
 #[test]
