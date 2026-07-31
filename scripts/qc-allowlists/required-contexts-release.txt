@@ -177,17 +177,17 @@ Per-Module Coverage Thresholds
 #     branch-protection API call has landed: live `required_status_checks` is
 #     24 contexts (verified 2026-07-30, all pinned to app_id 15368,
 #     `strict: true`, `enforce_admins: true`).
-#   * IN FLIGHT (#2473) — this file now declares
-#     `L3-boundary perma-ban gate (§25.3 S5 / RQ-10 #1853)` (the FULL name)
-#     while live protection still requires the TRUNCATED
-#     `L3-boundary perma-ban gate (§25.3 S5 / RQ-10`. That is the intended
-#     intermediate state and it is the SAFE half: this gate compares the
-#     mirror against the WORKFLOWS only (it has no API access, by design), so
-#     it is green either way, and a declared-but-not-required context blocks
-#     nothing. The two protection calls that close it — DROP truncated BEFORE
-#     this PR merges, ADD full AFTER — are in "THE LANDING ORDER FOR THIS
-#     PARTICULAR CHANGE" above. Live count: 24 now, 23 between the calls, 24
-#     after.
+#   * CLOSED (#2473) — the swap described in "THE LANDING ORDER FOR THIS
+#     PARTICULAR CHANGE" above has completed in BOTH halves. The workflow
+#     rename merged (`c8-precheck.yml` quotes the job name), this file
+#     declares the FULL `L3-boundary perma-ban gate (§25.3 S5 / RQ-10 #1853)`,
+#     and the two protection calls landed: the TRUNCATED context was dropped
+#     and the FULL one added. Live `required_status_checks` carries the FULL
+#     51-character name and is back to 24 contexts (verified 2026-07-30).
+#     Note this entry is a NARRATIVE record, not an attestation: this gate
+#     compares the mirror against the WORKFLOWS only — it has no API access,
+#     by design — so nothing here re-checks the live set. Do not treat a
+#     dated live-state line in a comment as a control.
 #   * Two c8-precheck integrity gates run on every PR but are not required:
 #     `Installer checksum fail-closed gate (#2449)` and
 #     `Non-Rust conformance-reader proof gate (#2452)`.
