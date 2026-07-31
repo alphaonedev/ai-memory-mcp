@@ -358,6 +358,14 @@ pub const SOURCE_SPAN: &str = "source_span";
 pub const SOURCE_URI: &str = "source_uri";
 /// `standard_id` — wire/row field name.
 pub const STANDARD_ID: &str = "standard_id";
+/// `standards_withheld` — wire field name (#2537). Count-only disclosure of
+/// namespace standards that resolved for the recalled namespace chain but
+/// were NOT injected because the caller fails
+/// [`crate::visibility::is_visible_to_caller`]. Deliberately a bare integer:
+/// emitting the withheld standard's id / owner / namespace would turn the
+/// honesty marker into a cross-tenant existence oracle. Mirrors the
+/// count-only shape of the `confidence_filtered_out` recall-meta disclosure.
+pub const STANDARDS_WITHHELD: &str = "standards_withheld";
 /// `storage_backend` — wire/row field name.
 pub const STORAGE_BACKEND: &str = "storage_backend";
 /// `subscription_id` — wire/row field name.

@@ -136,7 +136,7 @@ pub(crate) fn handle_session_start(
     // Uncomment or gate behind a config flag if desired.
 
     // Auto-prepend namespace standard (after LLM summary, separate field)
-    super::inject_namespace_standard(conn, namespace, &mut response);
+    super::inject_namespace_standard(conn, namespace, caller, &mut response);
 
     Ok(response)
 }
