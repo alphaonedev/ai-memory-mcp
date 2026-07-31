@@ -109,7 +109,13 @@ Backup cadence target: hourly snapshots, 48-hour rotation, weekly off-host trans
 
 ## 5. Schema migrations
 
-Migrations are forward-only and run automatically on the first daemon start after an upgrade. There is no offline migration step. The substrate refuses to start against a database newer than the binary expects (downgrade refusal) and progresses through every intermediate version on upgrade — never skips.
+Migrations are forward-only and run automatically on the first daemon start after an upgrade. There is no offline migration step. The substrate refuses to start against a database newer than the binary expects (**downgrade refusal**, [#2445](https://github.com/alphaonedev/ai-memory-mcp/issues/2445)) and progresses through every intermediate version on upgrade — never skips.
+
+**What the downgrade refusal actually does.** When a database's recorded schema version is strictly greater than the running binary's ladder tip, every path that could WRITE it refuses — on both backends, and *before* the binary replays its own bootstrap DDL, so a refused open leaves the database byte-identical. The refusal is a typed, greppable state (`SCHEMA_AHEAD_OF_BINARY`, HTTP `503`) so an orchestrator can park the node instead of crash-looping it. **Reads and egress deliberately survive:** `ai-memory backup`, `ai-memory boot` and `ai-memory doctor` all keep working against a schema-ahead database, because snapshotting the durable text is the first thing to do in this incident and `doctor` is how you find out which binary version to install.
+
+On **postgres the schema is SHARED by every daemon on the cluster**, so one node's upgrade moves it for all of them. Upgrade every binary that shares a DSN together, or drain the un-upgraded readers first; a mixed fleet will see the un-upgraded nodes refuse on their next restart. On **sqlite the same applies per FILE** — the MCP stdio process, the `curator` unit, `serve`, and every CLI invocation share one file, so upgrading one of them moves the schema for all of them.
+
+**Escape hatch (last resort).** `AI_MEMORY_ALLOW_SCHEMA_AHEAD=<exact observed version>` permits one process to operate a schema-ahead database. It takes the *exact* version, never a boolean: a boolean pasted into a unit file during one incident would silently permit every future downgrade, whereas an exact-version hatch stops applying the moment the database moves again and is greppable in a fleet audit. A malformed or mismatched value fails closed. Under the hatch the bootstrap schema and the migration ladder are BOTH skipped — the database is handed back exactly as found — and any write may still corrupt rows the newer schema owns. The `asi-hard` security profile refuses to boot with the hatch set at all.
 
 **Forward-only is by design; snapshot-restore is the rollback** ([#1576](https://github.com/alphaonedev/ai-memory-mcp/issues/1576)). Before any schema-mutating upgrade runs, the binary automatically snapshots the live SQLite file as a sibling of the database: `<db-file>.pre-migration-v<FROM>-to-v<TO>-<token>.bak` (`snapshot_before_migration` / `PRE_MIGRATION_BACKUP_INFIX` in `src/storage/migrations.rs`). The snapshot is produced with `VACUUM INTO` — transactionally consistent, folds pending WAL frames, inherits the source's SQLCipher keying — and the migration refuses to mutate the schema if the snapshot fails. To roll back: stop the daemon, reinstall the previous binary, copy the `.pre-migration-…bak` snapshot over the live DB file (removing stale `-wal`/`-shm` siblings), and start. See [`ADMIN_GUIDE.md` §Migration](ADMIN_GUIDE.html) for the step-by-step procedure.
 
@@ -273,7 +279,9 @@ systemctl start ai-memory
 ai-memory doctor
 ```
 
-Rollback: stop the daemon, restore the pre-upgrade snapshot, downgrade the binary. The substrate refuses to start against a database newer than the binary expects, so a partial rollback fails loudly rather than silently corrupting data.
+Rollback: stop the daemon, restore the pre-upgrade snapshot, THEN downgrade the binary. The substrate refuses to start against a database newer than the binary expects ([#2445](https://github.com/alphaonedev/ai-memory-mcp/issues/2445)), so a partial rollback — old binary, un-restored database — fails loudly rather than silently corrupting data.
+
+The order matters. If you downgrade the binary FIRST, the old binary will refuse the still-new database and the node will not start; that refusal is the guard working, not a fault. Recover by either restoring the snapshot (§5) or reinstalling the newer binary. If no snapshot exists — postgres has no automatic pre-migration snapshot, and the sqlite one is skipped on a database the newer binary CREATED rather than upgraded — take one now with `ai-memory backup`, which keeps working against a schema-ahead database precisely so this is possible.
 
 ---
 

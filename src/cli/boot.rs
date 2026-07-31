@@ -531,8 +531,23 @@ pub fn run(
                 )?;
             }
             if !args.no_header {
-                let manifest = BootManifest::build(
+                // v1.0.0 #2445 — a schema-AHEAD refusal is reported as the
+                // schema-drift warn it actually is, NOT as "db unavailable".
+                // `boot` is one of the two verbs an operator reaches for to
+                // find out WHY a downgraded node will not start; degrading it
+                // to an opaque unavailability message would take the answer
+                // away at the exact moment it is needed. ABOVE-MAX is the only
+                // reachable `WarnSchemaUnsupported` (see
+                // `boot_warns_on_schema_below_min`), so without this arm the
+                // status becomes structurally dead code.
+                let status = crate::storage::schema_guard::schema_ahead_of(&e).map_or(
                     BootStatus::WarnDbUnavailable,
+                    |ahead| BootStatus::WarnSchemaUnsupported {
+                        db_schema: u32::try_from(ahead.observed).unwrap_or(u32::MAX),
+                    },
+                );
+                let manifest = BootManifest::build(
+                    status,
                     &namespace,
                     0,
                     db_path,
@@ -1440,9 +1455,22 @@ mod tests {
         .unwrap();
     }
 
+    /// v1.0.0 #2445 — the schema-drift warn now arrives via the DOWNGRADE
+    /// GUARD rather than via a successful open followed by a version read:
+    /// `db::open` REFUSES an above-MAX database, and `run` downcasts that
+    /// typed refusal back into `WarnSchemaUnsupported`. Without that downcast
+    /// `BootStatus::WarnSchemaUnsupported` becomes structurally unreachable
+    /// (below-MIN is documented unreachable by
+    /// `boot_warns_on_schema_below_min`), so this test is what keeps the
+    /// operator's "why won't my downgraded node start?" answer alive.
     #[test]
     fn boot_warns_on_schema_above_max() {
         let _g = test_lock();
+        let _guard_env = crate::storage::schema_guard::test_env_lock();
+        // SAFETY: process-wide env mutation, serialised by `_guard_env`.
+        unsafe {
+            std::env::remove_var(crate::storage::schema_guard::ENV_ALLOW_SCHEMA_AHEAD);
+        }
         let mut env = TestEnv::fresh();
         seed_memory(&env.db_path, "ns-drift", "row", "x");
         // Bump schema beyond MAX_SUPPORTED_SCHEMA. Cast through i64 to
@@ -1543,6 +1571,11 @@ mod tests {
     fn boot_json_includes_schema_supported_flag() {
         // Happy path — schema in range → schema_supported = true.
         let _g = test_lock();
+        let _guard_env = crate::storage::schema_guard::test_env_lock();
+        // SAFETY: process-wide env mutation, serialised by `_guard_env`.
+        unsafe {
+            std::env::remove_var(crate::storage::schema_guard::ENV_ALLOW_SCHEMA_AHEAD);
+        }
         let mut env = TestEnv::fresh();
         seed_memory(&env.db_path, "ns-ssj", "row", "x");
         let db_path = env.db_path.clone();
@@ -1576,6 +1609,18 @@ mod tests {
             "drift path → schema_supported=false: {stdout2}"
         );
         assert_eq!(parsed2["status"], "warn");
+        // v1.0.0 #2445 — this assertion is why the test is not vacuous:
+        // `WarnDbUnavailable` ALSO yields status=warn + schema_supported=false,
+        // so without pinning the NOTE the drift path and the "db is gone" path
+        // are indistinguishable and a regression in the typed downcast would
+        // pass silently.
+        assert!(
+            parsed2["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unsupported by binary"),
+            "drift path must report SCHEMA drift, not generic unavailability: {stdout2}"
+        );
     }
 
     // -----------------------------------------------------------------
