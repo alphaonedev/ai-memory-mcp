@@ -83,16 +83,21 @@ pub fn resolve_interval() -> Duration {
     }
 }
 
-/// Publish `total` (and the wall-clock instant it was computed) onto the
-/// process metrics registry.
+/// Publish `total` (and the wall-clock instant it was computed) onto an
+/// EXPLICIT metrics handle.
 ///
-/// Split out from the query so the publish contract is unit-testable
-/// without a database, and so the scrape-path cold prime and the loop
-/// cannot drift in what they publish.
+/// Taking the handle rather than reaching for the process-global registry is
+/// what makes the publish contract testable: the two gauges must move
+/// together or not at all, and asserting that on a process-global that every
+/// other test in the binary also mutates is a race, not a test.
+pub fn publish_into(metrics: &crate::metrics::Metrics, total: i64, now_unix: i64) {
+    metrics.memories_gauge.set(total);
+    metrics.memories_gauge_refreshed_at.set(now_unix);
+}
+
+/// Publish onto the process metrics registry — the production entry point.
 pub fn publish(total: i64, now_unix: i64) {
-    let r = crate::metrics::registry();
-    r.memories_gauge.set(total);
-    r.memories_gauge_refreshed_at.set(now_unix);
+    publish_into(crate::metrics::registry(), total, now_unix);
 }
 
 /// Read the corpus size with ONE statement.
@@ -109,12 +114,18 @@ pub fn read_total(conn: &rusqlite::Connection) -> rusqlite::Result<i64> {
     conn.query_row(crate::SQL_COUNT_MEMORIES, [], |r| r.get(0))
 }
 
-/// Run one refresh against an already-open connection. Returns the count
-/// it published, or `None` when the read failed (previous value retained).
-pub fn refresh_once(conn: &rusqlite::Connection, now_unix: i64) -> Option<i64> {
+/// Run one refresh against an already-open connection, publishing onto an
+/// EXPLICIT metrics handle. Returns the count it published, or `None` when
+/// the read failed — in which case NOTHING is published, so the previous
+/// value and its freshness stamp are both retained.
+pub fn refresh_once_into(
+    metrics: &crate::metrics::Metrics,
+    conn: &rusqlite::Connection,
+    now_unix: i64,
+) -> Option<i64> {
     match read_total(conn) {
         Ok(total) => {
-            publish(total, now_unix);
+            publish_into(metrics, total, now_unix);
             Some(total)
         }
         Err(e) => {
@@ -127,6 +138,12 @@ pub fn refresh_once(conn: &rusqlite::Connection, now_unix: i64) -> Option<i64> {
             None
         }
     }
+}
+
+/// Run one refresh against the process metrics registry — the production
+/// entry point (the paced loop and the scrape-path cold prime).
+pub fn refresh_once(conn: &rusqlite::Connection, now_unix: i64) -> Option<i64> {
+    refresh_once_into(crate::metrics::registry(), conn, now_unix)
 }
 
 /// The daemon's shared-connection tuple, as owned by
@@ -176,14 +193,21 @@ pub fn spawn(state: Arc<Mutex<DbTuple>>, interval: Duration) -> JoinHandle<()> {
 mod tests {
     use super::*;
 
+    /// An ISOLATED registry per test. The process-global `registry()` is
+    /// mutated by every other test in this binary (`metrics.rs` sets
+    /// `memories_gauge` to 42), so asserting exact values on it is a race
+    /// with whatever else the harness happens to be running in parallel —
+    /// which is precisely how this cell first failed.
+    fn isolated() -> crate::metrics::Metrics {
+        crate::metrics::Metrics::try_new().expect("build isolated metrics registry")
+    }
+
     #[test]
     fn publish_sets_both_gauges() {
-        publish(7, 1_234);
-        let r = crate::metrics::registry();
-        assert_eq!(r.memories_gauge.get(), 7);
-        assert_eq!(r.memories_gauge_refreshed_at.get(), 1_234);
-        // Restore so sibling tests in this binary see a neutral registry.
-        publish(0, 0);
+        let m = isolated();
+        publish_into(&m, 7, 1_234);
+        assert_eq!(m.memories_gauge.get(), 7);
+        assert_eq!(m.memories_gauge_refreshed_at.get(), 1_234);
     }
 
     #[test]
@@ -193,18 +217,31 @@ mod tests {
 
     #[test]
     fn a_failed_read_retains_the_previous_value() {
-        publish(99, 1_000);
+        let m = isolated();
+        publish_into(&m, 99, 1_000);
         // A connection with no `memories` table: the read errors.
         let conn = rusqlite::Connection::open_in_memory().expect("open");
-        assert_eq!(refresh_once(&conn, 2_000), None);
-        let r = crate::metrics::registry();
-        assert_eq!(r.memories_gauge.get(), 99, "stale-but-true beats zeroed");
+        assert_eq!(refresh_once_into(&m, &conn, 2_000), None);
+        assert_eq!(m.memories_gauge.get(), 99, "stale-but-true beats zeroed");
         assert_eq!(
-            r.memories_gauge_refreshed_at.get(),
+            m.memories_gauge_refreshed_at.get(),
             1_000,
             "the freshness stamp must NOT advance on a failed read — that is the whole \
              point of publishing it"
         );
-        publish(0, 0);
+    }
+
+    #[test]
+    fn a_successful_read_moves_both_gauges_together() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = crate::storage::open(&dir.path().join("gauge.db")).expect("open");
+        let m = isolated();
+        assert_eq!(refresh_once_into(&m, &conn, 5_000), Some(0));
+        assert_eq!(m.memories_gauge.get(), 0, "an empty corpus really is 0");
+        assert_eq!(
+            m.memories_gauge_refreshed_at.get(),
+            5_000,
+            "an empty corpus is distinguishable from `never computed` ONLY by this stamp"
+        );
     }
 }
