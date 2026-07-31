@@ -217,3 +217,75 @@ fn the_production_test_boundary_heuristic_is_load_bearing_2445() {
         "a commented reference must NOT be counted"
     );
 }
+
+/// v1.0.0 #2445 — ALWAYS-COMPILED, ALWAYS-RUN structural guard that both
+/// backends still gate BEFORE their bootstrap DDL.
+///
+/// The behavioural postgres suite (`tests/postgres_schema_downgrade_guard_2445.rs`)
+/// self-skips without `AI_MEMORY_TEST_POSTGRES_URL`, so on an ordinary CI run —
+/// which is most of them — deleting the postgres guard would be caught by
+/// nothing at all. This is a source-text assertion precisely because it must
+/// hold with no live server: it costs one file read and it reds a normal run.
+///
+/// It asserts ORDER, not mere presence. "The guard exists somewhere in the
+/// file" is satisfied by a guard placed AFTER the bootstrap replays, which is
+/// the exact variant #2445 rejected (an older binary's `CREATE … IF NOT EXISTS`
+/// set running over a newer database is the #2424 class).
+///
+/// Credit: the ordering-and-parity idea is carried forward from the WIP branch
+/// `fix/2445-downgrade-guard` @ `91573bdb`, preserved by the orchestrator when
+/// an earlier lane on this issue terminated mid-R-203.
+#[test]
+fn both_backends_gate_before_their_bootstrap_ddl_2445() {
+    let root = repo_root();
+    let read = |rel: &str| std::fs::read_to_string(root.join(rel)).expect("read source");
+
+    // ---- sqlite: db::open ----
+    let sqlite = read("src/storage/connection.rs");
+    let guard = sqlite
+        .find("resolve_schema_posture(&conn,")
+        .expect("src/storage/connection.rs must call the downgrade guard in `open`");
+    let bootstrap = sqlite
+        .find("conn.execute_batch(SCHEMA)")
+        .expect("`open` must still apply the bootstrap SCHEMA");
+    assert!(
+        guard < bootstrap,
+        "sqlite: the #2445 downgrade guard must run BEFORE `execute_batch(SCHEMA)` — a \
+         guard placed after it lets an older binary's bootstrap replay over a newer \
+         database (the #2424 class), which is the variant #2445 rejected"
+    );
+
+    // ---- postgres: connect bootstrap ----
+    let pg = read("src/store/postgres.rs");
+    let pg_guard = pg
+        .find("crate::storage::schema_guard::evaluate(")
+        .expect("src/store/postgres.rs must call the downgrade guard in the connect bootstrap");
+    let pg_bootstrap = pg
+        .find("sqlx::raw_sql(&init_sql)")
+        .expect("the connect bootstrap must still apply INIT_SCHEMA");
+    assert!(
+        pg_guard < pg_bootstrap,
+        "postgres: the #2445 downgrade guard must run BEFORE `raw_sql(init_sql)`"
+    );
+
+    // ---- both L2 funnels keep the strictly-greater refusal ----
+    assert!(
+        read("src/storage/migrations.rs").contains("if version > CURRENT_SCHEMA_VERSION"),
+        "sqlite `migrate` must keep the `>` refusal (defense-in-depth behind `db::open`)"
+    );
+    assert!(
+        pg.contains("if current_version > CURRENT_SCHEMA_VERSION"),
+        "`migrate_locked` must keep the `>` refusal (defense-in-depth behind `connect`)"
+    );
+
+    // ---- the `==` fast path must survive on both, byte-for-byte ----
+    assert!(
+        read("src/storage/migrations.rs").contains("if version == CURRENT_SCHEMA_VERSION"),
+        "sqlite must keep the `==` no-op fast path — collapsing it back into `>=` is the \
+         defect #2445 fixed"
+    );
+    assert!(
+        pg.contains("if current_version == CURRENT_SCHEMA_VERSION"),
+        "postgres must keep the `==` no-op fast path"
+    );
+}
