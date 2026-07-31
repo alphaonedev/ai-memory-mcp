@@ -22,11 +22,14 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
 
 use ai_memory::db;
 
-const READ_TIMEOUT: Duration = Duration::from_secs(20);
+// #2525 — the per-response bound comes from the shared elastic helper
+// (base x `AI_MEMORY_TEST_TIMING_BUDGET_MULT`, with fail-fast child-death
+// detection) instead of the fixed 20s constant this file used to carry.
+#[path = "common/mcp_wait.rs"]
+mod mcp_wait;
 // A realistic-looking but non-live OpenAI-style key (high entropy, sk- prefix).
 const FAKE_OPENAI_KEY: &str = "sk-proj-Ab12Cd34Ef56Gh78Ij90Kl12Mn34Op56";
 const REDACTION_MARKER: &str = "[REDACTED:secret]";
@@ -136,7 +139,8 @@ fn send_and_recv(
 ) -> serde_json::Value {
     writeln!(stdin, "{}", serde_json::to_string(payload).unwrap()).unwrap();
     stdin.flush().unwrap();
-    let resp = rx.recv_timeout(READ_TIMEOUT).expect("mcp response timeout");
+    let ctx = payload["method"].as_str().unwrap_or("<unknown method>");
+    let resp = mcp_wait::recv_mcp_response(rx, ctx);
     serde_json::from_str(&resp).unwrap_or_else(|e| panic!("parse: {e}: {resp}"))
 }
 
