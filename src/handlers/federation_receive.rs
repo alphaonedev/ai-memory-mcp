@@ -914,6 +914,101 @@ pub(super) fn pending_namespaces_authorized(
     true
 }
 
+/// #2479 — OBSERVABILITY ONLY: warn when an inbound `namespace_meta` write or
+/// clear would SEVER an inheritance link to a namespace OUTSIDE the peer's
+/// scope. Never returns a verdict and never changes one.
+///
+/// # The loss this makes visible
+///
+/// `set_namespace_standard` is `ON CONFLICT(namespace) DO UPDATE SET … ,
+/// parent_namespace = ?4`, and when the wire carries no parent the value it
+/// writes comes from `auto_detect_parent` — which resolves from the namespace
+/// STRING, not from what is already stored. So an entirely in-scope push can
+/// silently NULL an operator-configured link to an out-of-scope ancestor, and a
+/// clear deletes it outright. Both are unintentional config loss (the North Star
+/// constraint), and neither is visible anywhere today.
+///
+/// # Why a WARN and not a refusal
+///
+/// The #2479 vote weighed refusing on the STORED parent and rejected it twice
+/// over. It would BRICK the row: a namespace whose operator-set parent is out of
+/// a peer's scope could never be updated by that peer again, which is the
+/// stale-stricter failure made permanent (#2491/#2497 availability lesson). And
+/// it would not even hold — the loop applies entries in wire order, so entry #1
+/// could rewrite the parent to an in-scope value and entry #2 would then pass
+/// the probe, laundering the gate inside a single request. A verdict that can be
+/// laundered in-batch is worse than an honest log line, because it reads as a
+/// control while providing none.
+///
+/// Consequently this read is DELIBERATELY best-effort in the fail-OPEN
+/// direction: a storage error logs and proceeds. That is safe here precisely
+/// because nothing downstream consults the result — the inverse of the
+/// `CAUSE_NAMESPACE_PROBE_UNRESOLVABLE` sites, where an unresolvable probe MUST
+/// fail closed because a verdict depends on it.
+///
+/// # Honest note on the `Err` arm — it is UNREACHABLE today
+///
+/// Both `namespace_meta` accessors currently collapse a read error into "no
+/// row": `db::get_namespace_parent` ends in a bare `.ok()`, and
+/// `db::get_namespace_meta_entry` — despite its `Result` signature — is
+/// `#[allow(clippy::unnecessary_wraps)]` and does the same before wrapping in
+/// `Ok`. So the `Err` arm below cannot fire as the code stands, and a genuine
+/// storage fault is indistinguishable from "this namespace has no meta row",
+/// which silently costs this WARN. It reads through `get_namespace_meta_entry`
+/// anyway for two reasons: it returns the whole row (the caller needs the
+/// parent AND the fact a row exists), and its signature can already CARRY an
+/// error, so tightening that accessor later is a one-line change there rather
+/// than a call-site rewrite here. Do not restate this site as "fails closed on
+/// a read error" — it does not, by design and, today, by accessor.
+fn warn_on_severed_out_of_scope_parent(
+    conn: &rusqlite::Connection,
+    lane: &str,
+    namespace: &str,
+    declared_parent: Option<&str>,
+    attest_cfg: &PeerAttestationConfig,
+    peer_id: Option<&str>,
+) {
+    let stored_parent = match db::get_namespace_meta_entry(conn, namespace) {
+        Ok(Some(row)) => row.parent_namespace,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(
+                target: ATTESTATION_TRACE_TARGET,
+                namespace = %namespace,
+                peer_id = %peer_id.unwrap_or(""),
+                error = %e,
+                "sync_push: could not read the existing namespace_meta row before a federated \
+                 {lane} entry, so a severed out-of-scope parent link would go unreported \
+                 (#2479 observability-only; the scope verdict itself is unaffected)"
+            );
+            return;
+        }
+    };
+    let Some(stored_parent) = stored_parent else {
+        return;
+    };
+    // Unchanged link — nothing is severed.
+    if declared_parent == Some(stored_parent.as_str()) {
+        return;
+    }
+    if crate::federation::peer_attestation::namespace_allowed(peer_id, &stored_parent, attest_cfg) {
+        return;
+    }
+    tracing::warn!(
+        target: ATTESTATION_TRACE_TARGET,
+        namespace = %namespace,
+        stored_parent = %stored_parent,
+        declared_parent = %declared_parent.unwrap_or(""),
+        peer_id = %peer_id.unwrap_or(""),
+        "sync_push: federated {lane} entry REPLACES an inheritance link to a namespace outside \
+         this peer's scope — '{namespace}' currently inherits from '{stored_parent}', which the \
+         peer may not act in, and this entry drops or re-points that link (#2479). The entry is \
+         APPLIED: the peer is in scope for '{namespace}' itself, and refusing here would leave \
+         the row permanently un-updatable by this peer. If the link is load-bearing, re-assert \
+         it locally or widen the peer's allowed_namespaces to cover '{stored_parent}'."
+    );
+}
+
 /// v0.7.0 S6-M2 — compute the next UTC midnight in RFC3339, used as
 /// the `X-Quota-Reset-At` header value when a federation receive is
 /// refused for hitting `memories_per_day` or `links_per_day`. Storage
@@ -2902,6 +2997,15 @@ pub async fn sync_push(
     // rides on the same push via `memories` (or arrived earlier through
     // `broadcast_store_quorum`); the namespace-meta row closes the gap.
     let mut namespace_meta_applied = 0usize;
+    // #2479 (CWE-284) — sender-visible refusal count for BOTH governance-standard
+    // lanes. It is deliberately NOT folded into `skipped`: this funnel enqueues
+    // nothing to the push DLQ (#2498), so a refused entry is LOST rather than
+    // retried, and `skipped` already aggregates malformed ids, absent standard
+    // memories and quota refusals — the sender, the only party that can retry,
+    // could not attribute it. A governance-replication stop is invisible in a
+    // way a memory-replication stop is not: both nodes keep answering
+    // `get_standard` confidently with divergent policy.
+    let mut namespace_meta_refused = 0usize;
     for entry in &body.namespace_meta {
         if validate::validate_namespace(&entry.namespace).is_err()
             || validate::validate_id(&entry.standard_id).is_err()
@@ -2912,6 +3016,39 @@ pub async fn sync_push(
         if body.dry_run {
             noop += 1;
             continue;
+        }
+        // #2479 (CWE-284) — confine the governance-STANDARD bind to the peer's
+        // namespace scope. `set_namespace_standard` writes the explicit parent
+        // that `build_namespace_chain` walks, and that chain is what
+        // `resolve_governance_policy` consumes, so an ungated row re-writes the
+        // rules every subsequent LOCAL write to that namespace is judged
+        // against. Gates the UNION of the row's own namespace and the parent it
+        // splices above it; see `inbound_namespace_meta_authorized` for the
+        // reach this does NOT close (descendants by inheritance; the namespace
+        // the `standard_id` memory itself lives in).
+        if ns_gate_enrolled {
+            if !crate::federation::receive_auth::inbound_namespace_meta_authorized(
+                crate::federation::receive_auth::LANE_NAMESPACE_META,
+                &entry.namespace,
+                entry.parent_namespace.as_deref(),
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+                require_push_ns_scope,
+            ) {
+                namespace_meta_refused += 1;
+                skipped += 1;
+                continue;
+            }
+            // AFTER the verdict, never before: a refused entry severs nothing,
+            // so warning about it would be false.
+            warn_on_severed_out_of_scope_parent(
+                &lock.0,
+                crate::federation::receive_auth::LANE_NAMESPACE_META,
+                &entry.namespace,
+                entry.parent_namespace.as_deref(),
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+            );
         }
         match db::set_namespace_standard(
             &lock.0,
@@ -2943,6 +3080,37 @@ pub async fn sync_push(
         if body.dry_run {
             noop += 1;
             continue;
+        }
+        // #2479 (CWE-284) — the DESTRUCTIVE twin. `clear_namespace_standard` is
+        // a bare `DELETE FROM namespace_meta WHERE namespace = ?` with no
+        // existence precondition and no tombstone: it removes the standard AND
+        // the parent link in one statement, and because governance is
+        // allow-on-silence an absent policy resolves PERMISSIVE — so this lane
+        // DISARMS a namespace (and, by inheritance, its descendants) rather than
+        // merely rewriting it. There is no `standard_id` on this lane, hence no
+        // parent to gate: the namespace is the whole subject.
+        if ns_gate_enrolled {
+            if !crate::federation::receive_auth::inbound_namespace_meta_authorized(
+                crate::federation::receive_auth::LANE_NAMESPACE_META_CLEARS,
+                ns,
+                None,
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+                require_push_ns_scope,
+            ) {
+                namespace_meta_refused += 1;
+                skipped += 1;
+                continue;
+            }
+            // AFTER the verdict — see the sibling loop above.
+            warn_on_severed_out_of_scope_parent(
+                &lock.0,
+                crate::federation::receive_auth::LANE_NAMESPACE_META_CLEARS,
+                ns,
+                None,
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+            );
         }
         match db::clear_namespace_standard(&lock.0, ns) {
             Ok(true) => namespace_meta_cleared += 1,
@@ -3039,6 +3207,9 @@ pub async fn sync_push(
             "checkpoints_conflicted": checkpoints_conflicted,
             "namespace_meta_applied": namespace_meta_applied,
             "namespace_meta_cleared": namespace_meta_cleared,
+            // #2479 — additive; see the declaration for why this is not folded
+            // into `skipped`.
+            "namespace_meta_refused": namespace_meta_refused,
             "noop": noop,
             (crate::handlers::SKIPPED_FIELD): skipped,
             (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
