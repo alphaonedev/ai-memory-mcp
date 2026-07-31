@@ -123,12 +123,30 @@ const SQL_ARCHIVE_ON_CONFLICT_LAST_WINS: &str = "ON CONFLICT (id) DO UPDATE SET 
      lifecycle_state = EXCLUDED.lifecycle_state, \
      encrypted_envelope = EXCLUDED.encrypted_envelope, valid_from = EXCLUDED.valid_from, \
      valid_until = EXCLUDED.valid_until";
-/// #1642 — postgres twin of `storage::SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID`
-/// (`src/storage/mod.rs`): deleting a memory that serves as a namespace
-/// standard must also remove the `namespace_meta` row that points at it,
-/// or the namespace keeps enforcing a standard whose backing memory is gone.
-const SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID: &str =
-    "DELETE FROM namespace_meta WHERE standard_id = $1";
+/// #1642 / #2503 — postgres twin of
+/// `storage::SQL_SEVER_NAMESPACE_META_BY_STANDARD_ID` (`src/storage/mod.rs`).
+///
+/// Reaping a memory that serves as a namespace standard must not leave a
+/// `namespace_meta.standard_id` pointing at a memory that is gone (#1642) —
+/// but it must equally not DESTROY the binding rows of every namespace that
+/// pointed at it (#2503), because `set_namespace_standard` permits
+/// cross-namespace binding and those rows also carry the operator's
+/// `parent_namespace` inheritance link. SEVER satisfies both: the pointer goes
+/// NULL, the row and its parent link survive. Full rationale on
+/// `storage::sever_namespace_standards`.
+const SQL_SEVER_NAMESPACE_META_BY_STANDARD_ID: &str =
+    "UPDATE namespace_meta SET standard_id = NULL, updated_at = NOW() WHERE standard_id = $1";
+/// #2503 — HEAL a legacy DANGLING pointer into the SEVERED state, replacing
+/// the gc sweeps' former `DELETE … WHERE standard_id NOT IN (SELECT id FROM
+/// memories)`. The explicit `IS NOT NULL` guard is redundant on postgres (a
+/// NULL left side makes `NOT IN` evaluate to NULL, which never matched) but is
+/// stated anyway so the predicate reads IDENTICALLY to its sqlite twin, where
+/// it is load-bearing — the two backends silently disagreed on NULL handling
+/// before #2503 and that divergence is exactly the #2488 class.
+const SQL_HEAL_DANGLING_NAMESPACE_META: &str = "UPDATE namespace_meta \
+     SET standard_id = NULL, updated_at = NOW() \
+     WHERE standard_id IS NOT NULL \
+       AND NOT EXISTS (SELECT 1 FROM memories WHERE memories.id = namespace_meta.standard_id)";
 const SQL_SELECT_MEMORY_ID_BY_ID: &str = "SELECT id FROM memories WHERE id = $1";
 /// Full-row select of a single memory by id. Shared by `get`,
 /// `merge_inbound`, and the lifecycle-state reader so the projection
@@ -17226,18 +17244,19 @@ impl MemoryStore for PostgresStore {
         self.assert_caller_owns_for_mutation(ctx, id, "delete", REASON_UNSTAMPED_TENANT_DELETE)
             .await?;
 
-        // #1642 — parity with sqlite `storage::delete`
-        // (`src/storage/mod.rs:1747-1751`): if this memory is registered
-        // as a namespace standard, drop the `namespace_meta` row(s)
-        // pointing at it BEFORE deleting the memory, mirroring the
-        // sqlite ordering. Pre-fix the postgres delete left a dangling
-        // `namespace_meta.standard_id` so governance kept resolving a
-        // standard whose backing memory no longer existed.
-        sqlx::query(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID)
+        // #1642 / #2503 — parity with sqlite `storage::delete`: if this memory
+        // is registered as a namespace standard, SEVER the `namespace_meta`
+        // binding(s) pointing at it BEFORE deleting the memory, mirroring the
+        // sqlite ordering. Pre-#1642 the postgres delete left a dangling
+        // `standard_id`; pre-#2503 both backends DELETED the binding rows,
+        // destroying the governance configuration (and `parent_namespace`
+        // inheritance link) of every namespace that pointed here — including
+        // namespaces the deleting principal has no authority over.
+        sqlx::query(SQL_SEVER_NAMESPACE_META_BY_STANDARD_ID)
             .bind(id)
             .execute(&self.pool)
             .await
-            .map_err(|e| to_store_err("delete: namespace_meta cleanup", e))?;
+            .map_err(|e| to_store_err("delete: namespace_meta sever", e))?;
 
         // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact TOMBSTONE:
         // under the flag, run the leaf + the memory delete in ONE tx so they
@@ -18761,6 +18780,24 @@ impl MemoryStore for PostgresStore {
     /// [`MemoryStore::apply_remote_deletion`] (#2488).
     async fn apply_remote_deletion(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
         self.gate_record_stop()?;
+        // #2493 / #2503 — this override reimplements the delete rather than
+        // composing `self.delete`, and it OMITTED the `namespace_meta`
+        // maintenance its own `delete` performs. So the IDENTICAL federated
+        // `deletions[]` push cleaned the binding on sqlite and left it
+        // DANGLING on postgres — reinstating the #1642 bug on the one lane
+        // with an attacker-reachable trigger, and diverging the two backends
+        // on the lane #2497 exists to converge. Severing here restores parity
+        // in the SAME direction as every other reap funnel.
+        //
+        // Deliberately BEFORE the existence check: the federated pending-execute
+        // arm discards `db::delete`'s boolean, so a push naming an id with no
+        // local row must still leave `namespace_meta` in a coherent state
+        // rather than depending on whether the row happened to be present.
+        sqlx::query(SQL_SEVER_NAMESPACE_META_BY_STANDARD_ID)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("apply_remote_deletion: namespace_meta sever", e))?;
         // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact TOMBSTONE
         // (origin=remote). This is the headline data-loss fix: the legacy
         // path hard-deletes the row pool-direct (no tx, no audit trail).
@@ -19255,14 +19292,22 @@ impl MemoryStore for PostgresStore {
         _ctx: &CallerContext,
         namespace: &str,
     ) -> StoreResult<Option<(String, Option<String>)>> {
-        let row: Option<(String, Option<String>)> = sqlx::query_as(
+        // #2503 — `standard_id` is NULLABLE and a SEVERED row (its standard
+        // memory reaped) holds NULL. Decoding it as a non-nullable `String`
+        // made every severed row a sqlx `ColumnDecode` error out of this
+        // method — a 5xx for a state the substrate now creates deliberately.
+        // Decode as `Option` and collapse NULL to "no standard bound": that is
+        // what a severed row means, it is what the sqlite twin reports, and it
+        // keeps the #1642 observable (`get_namespace_standard` is `None` once
+        // the standard memory is deleted) byte-identical on both backends.
+        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT standard_id, parent_namespace FROM namespace_meta WHERE namespace = $1",
         )
         .bind(namespace)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| to_store_err("get_namespace_standard", e))?;
-        Ok(row)
+        Ok(row.and_then(|(standard_id, parent)| standard_id.map(|s| (s, parent))))
     }
 
     async fn touch_after_recall(&self, ids: &[String]) -> StoreResult<()> {
@@ -22555,13 +22600,15 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("gc commit", e))?;
 
-        // Best-effort cleanup of namespace_meta dangling references.
-        let _ = sqlx::query(
-            "DELETE FROM namespace_meta \
-             WHERE standard_id NOT IN (SELECT id FROM memories)",
-        )
-        .execute(&self.pool)
-        .await;
+        // #2503 — best-effort HEAL of namespace_meta dangling references.
+        // This sweep used to DELETE the dangling row, which made it the back
+        // door onto the reap-path confinement: a severance the delete path
+        // deliberately preserved would be erased on the next gc tick, silently
+        // restoring allow-on-silence. It now performs the SAME sever, so a
+        // dangle always becomes SEVERED, never ABSENT, on both backends.
+        let _ = sqlx::query(SQL_HEAL_DANGLING_NAMESPACE_META)
+            .execute(&self.pool)
+            .await;
 
         Ok(evicted.len())
     }
@@ -22696,14 +22743,11 @@ impl MemoryStore for PostgresStore {
             corpus -= row_bytes;
         }
 
-        // Best-effort cleanup of namespace_meta dangling references, same
-        // shape as run_gc's trailing sweep.
-        let _ = sqlx::query(
-            "DELETE FROM namespace_meta \
-             WHERE standard_id NOT IN (SELECT id FROM memories)",
-        )
-        .execute(&self.pool)
-        .await;
+        // #2503 — best-effort HEAL of namespace_meta dangling references, same
+        // shape as run_gc's trailing sweep (sever, never delete).
+        let _ = sqlx::query(SQL_HEAL_DANGLING_NAMESPACE_META)
+            .execute(&self.pool)
+            .await;
 
         Ok(evicted)
     }
@@ -23163,6 +23207,20 @@ impl MemoryStore for PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("archive_by_ids snapshot links", e))?;
+            // #2503 — SEVER any namespace_meta binding pointing at this row,
+            // parity with BOTH sqlite archive funnels (`archive_memory_no_tx`
+            // / `archive_memory_for_caller`), which have mirrored `delete`'s
+            // cleanup since #1642. This pg funnel never did: archiving a
+            // standard memory on postgres left the binding pointing at a row
+            // that is no longer in `memories` — another arm of the #2493
+            // class, in the same direction as `apply_remote_deletion`. Runs
+            // INSIDE the per-batch tx so the sever commits atomically with the
+            // archive+delete it accompanies.
+            sqlx::query(SQL_SEVER_NAMESPACE_META_BY_STANDARD_ID)
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("archive_by_ids: namespace_meta sever", e))?;
             // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
             // append ONE identity-only ARCHIVE leaf IN THIS tx BEFORE the
             // delete (the cold-storage copy already landed above). Gated →
@@ -23382,7 +23440,16 @@ impl MemoryStore for PostgresStore {
         namespace: &str,
     ) -> StoreResult<Option<crate::models::GovernancePolicy>> {
         // Walk leaf → root and return the most-specific policy.
+        //
+        // #2503 — a level whose `namespace_meta` row EXISTS but whose standard
+        // is unresolvable (severed, or a legacy dangling pointer) is remembered
+        // and the walk CONTINUES; the resolved policy is then returned with the
+        // severed floor applied. Mirrors the sqlite
+        // `storage::resolve_governance_policy` semantics exactly — see its doc
+        // comment for why the floor composes over the walk instead of
+        // short-circuiting it.
         let chain = self.build_namespace_chain(namespace).await?;
+        let mut severed = false;
         for ns in chain.into_iter().rev() {
             // Look up the standard memory.
             let row: Option<(Option<String>,)> =
@@ -23391,8 +23458,15 @@ impl MemoryStore for PostgresStore {
                     .fetch_optional(&self.pool)
                     .await
                     .map_err(|e| to_store_err("resolve_governance_policy lookup", e))?;
-            let Some((Some(standard_id),)) = row else {
-                continue;
+            let standard_id = match row {
+                // Row present, pointer severed → governed, policy gone.
+                Some((None,)) => {
+                    severed = true;
+                    continue;
+                }
+                Some((Some(id),)) => id,
+                // No row at all → never configured; allow-on-silence branch.
+                None => continue,
             };
             // Read the standard's metadata.
             //
@@ -23410,12 +23484,26 @@ impl MemoryStore for PostgresStore {
             let ctx = CallerContext::for_admin(crate::identity::sentinels::GOVERNANCE_INTERNAL);
             let mem = match self.get(&ctx, &standard_id).await {
                 Ok(m) => m,
-                Err(StoreError::NotFound { .. }) => continue,
+                // #2503 — the row names a memory that is not there: a dangling
+                // pointer, same meaning as an explicit severance.
+                Err(StoreError::NotFound { .. }) => {
+                    severed = true;
+                    continue;
+                }
                 Err(e) => return Err(e),
             };
             if let Some(Ok(p)) = crate::models::GovernancePolicy::from_metadata(&mem.metadata) {
-                return Ok(Some(p));
+                return Ok(Some(if severed {
+                    p.with_severed_standard_floor()
+                } else {
+                    p
+                }));
             }
+        }
+        if severed {
+            return Ok(Some(
+                crate::models::GovernancePolicy::default().with_severed_standard_floor(),
+            ));
         }
         Ok(None)
     }
@@ -23676,8 +23764,15 @@ impl MemoryStore for PostgresStore {
         // Resolve the policy via the leaf-first walk — inline here so
         // every namespace_meta + memories.metadata read shares the same
         // tx snapshot as the INSERT below.
+        // #2503 — THIRD governance walk (the in-tx twin of
+        // `resolve_governance_policy`, re-implemented here so the resolve and
+        // the conditional pending_actions INSERT share one snapshot). It gets
+        // the SAME severed-floor treatment; leaving it out would make the
+        // enforcement decision disagree with the resolver on the very state
+        // this issue is about, which is the #2488 opposite-directions class.
         let chain = build_namespace_chain_in_tx(&mut tx, namespace).await?;
         let mut resolved_policy: Option<crate::models::GovernancePolicy> = None;
+        let mut severed = false;
         for ns in chain.iter().rev() {
             let row: Option<(Option<String>,)> =
                 sqlx::query_as("SELECT standard_id FROM namespace_meta WHERE namespace = $1")
@@ -23685,8 +23780,15 @@ impl MemoryStore for PostgresStore {
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(|e| to_store_err("resolve_governance_policy lookup (tx)", e))?;
-            let Some((Some(standard_id),)) = row else {
-                continue;
+            let standard_id = match row {
+                // Row present, pointer severed → governed, policy gone.
+                Some((None,)) => {
+                    severed = true;
+                    continue;
+                }
+                Some((Some(id),)) => id,
+                // No row at all → never configured; allow-on-silence branch.
+                None => continue,
             };
             let meta: Option<(serde_json::Value,)> =
                 sqlx::query_as("SELECT metadata FROM memories WHERE id = $1")
@@ -23694,13 +23796,27 @@ impl MemoryStore for PostgresStore {
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(|e| to_store_err("read governance standard metadata", e))?;
-            if let Some((m,)) = meta
-                && let Some(Ok(p)) = crate::models::GovernancePolicy::from_metadata(&m)
-            {
+            let Some((m,)) = meta else {
+                // Dangling pointer — the standard memory is gone.
+                severed = true;
+                continue;
+            };
+            if let Some(Ok(p)) = crate::models::GovernancePolicy::from_metadata(&m) {
                 resolved_policy = Some(p);
                 break;
             }
         }
+        let resolved_policy = match (resolved_policy, severed) {
+            (Some(p), true) => Some(p.with_severed_standard_floor()),
+            (Some(p), false) => Some(p),
+            // Nothing resolved but a level WAS severed: an operator governed
+            // this chain and the policy is unrecoverable. Fail closed to the
+            // floor instead of the allow-on-silence `Allow` below.
+            (None, true) => {
+                Some(crate::models::GovernancePolicy::default().with_severed_standard_floor())
+            }
+            (None, false) => None,
+        };
         let Some(policy) = resolved_policy else {
             // No policy in the chain → Allow. Drop the tx (no writes).
             return Ok(GovernanceDecision::Allow);
@@ -23811,7 +23927,33 @@ impl MemoryStore for PostgresStore {
                         .with_namespace(namespace)
                         .with_owner(o),
                     ),
-                    None => GovernanceDecision::Allow,
+                    // #2503 CROSS-BACKEND DIVERGENCE, discovered while proving
+                    // the severed floor on live postgres. This arm — an
+                    // Owner-level policy with NO resolvable owner — has always
+                    // been `Deny` on sqlite
+                    // (`storage::enforce_governance`: "owner-level action has
+                    // no resolvable owner") and `Allow` here: the two backends
+                    // fail in OPPOSITE directions on the same state, which is
+                    // precisely the #2488 class.
+                    //
+                    // It is fixed HERE rather than deferred because #2503's
+                    // severed floor makes the arm materially more reachable: a
+                    // severed namespace resolves `write: Owner`, but its owner
+                    // was read from the very standard memory that was reaped,
+                    // so `ns_owner` is `None` and a `Store` would sail through
+                    // — the pg half of the fail-closed floor would have been
+                    // security theatre while the sqlite half worked. Aligned to
+                    // the sqlite precedent verbatim, message included, so the
+                    // two adapters cannot drift again.
+                    None => GovernanceDecision::Deny(
+                        crate::governance::GovernanceRefusal::new(
+                            model_action,
+                            GovernanceLevel::Owner,
+                            agent_id,
+                            "owner-level action has no resolvable owner",
+                        )
+                        .with_namespace(namespace),
+                    ),
                 }
             }
             GovernanceLevel::Approve => {
