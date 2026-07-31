@@ -1045,13 +1045,26 @@ impl MemoryStore for SqliteStore {
                 "SELECT standard_id, parent_namespace FROM namespace_meta WHERE namespace = ?1",
             )
             .map_err(box_err)?;
+        // #2503 — `standard_id` is NULLABLE and a SEVERED row (its standard
+        // memory reaped; see `storage::sever_namespace_standards`) holds NULL.
+        // Decoding it as a non-nullable `String` made every severed row a
+        // hard `Err` out of this method — i.e. a 5xx on the HTTP surface for a
+        // state the substrate now creates deliberately. Decode as `Option` and
+        // collapse NULL to "no standard bound", which is what a severed row
+        // means and what the sqlite free-function `db::get_namespace_standard`
+        // already reports; the postgres twin does the same, so the two
+        // backends agree.
         let mut rows = stmt
             .query_map(rusqlite::params![namespace], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
             })
             .map_err(box_err)?;
         match rows.next() {
-            Some(Ok(tuple)) => Ok(Some(tuple)),
+            Some(Ok((Some(standard_id), parent))) => Ok(Some((standard_id, parent))),
+            Some(Ok((None, _))) => Ok(None),
             Some(Err(e)) => Err(box_err(e)),
             None => Ok(None),
         }

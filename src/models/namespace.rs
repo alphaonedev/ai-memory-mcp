@@ -396,6 +396,37 @@ impl GovernanceLevel {
             Self::Approve => "approve",
         }
     }
+
+    /// #2503 — total order on how RESTRICTIVE a level is, ascending:
+    /// `Any` (0) < `Registered` (1) < `Owner` (2) < `Approve` (3).
+    ///
+    /// Deliberately a rank accessor rather than a `#[derive(PartialOrd)]`
+    /// on the enum: derived ordering would silently follow *declaration
+    /// order*, so re-ordering a variant for readability would silently
+    /// change a security comparison. An explicit rank makes the ordering a
+    /// stated contract that a variant addition must consciously place.
+    ///
+    /// Adding a variant is a compile error here (the match is exhaustive),
+    /// which is the point.
+    #[must_use]
+    pub const fn strictness(&self) -> u8 {
+        match self {
+            Self::Any => 0,
+            Self::Registered => 1,
+            Self::Owner => 2,
+            Self::Approve => 3,
+        }
+    }
+
+    /// #2503 — the stricter of two levels (ties return `self`).
+    #[must_use]
+    pub fn max_strictness(self, other: Self) -> Self {
+        if other.strictness() > self.strictness() {
+            other
+        } else {
+            self
+        }
+    }
 }
 
 /// Who approves actions gated by [`GovernanceLevel::Approve`].
@@ -933,6 +964,44 @@ impl GovernancePolicy {
             },
             ..Self::default()
         }
+    }
+
+    /// #2503 — the SEVERED-STANDARD FLOOR: raise `write` / `promote` /
+    /// `delete` to at least [`GovernanceLevel::Owner`], leaving every other
+    /// field (and any STRICTER level already present) untouched.
+    ///
+    /// **What a severed standard is.** A `namespace_meta` row that EXISTS —
+    /// so an operator deliberately governed this namespace — whose backing
+    /// standard memory can no longer be resolved, because the memory was
+    /// reaped by a delete / archive / eviction. The governance policy lived
+    /// in that memory's `metadata.governance`, so it is genuinely gone; no
+    /// remedy can resurrect it from the `namespace_meta` row alone.
+    ///
+    /// **Why a FLOOR and not a replacement.** The resolver walks leaf-first
+    /// and returns the first level carrying a policy. If a severed level
+    /// *replaced* the walk's result, an intact ancestor policy of
+    /// `write: Approve` would be silently DOWNGRADED to `Owner` — a severed
+    /// child would weaken a governed parent, inverting the fix. Applying the
+    /// result as a floor over whatever the walk resolves can only ever
+    /// tighten, never loosen, so it composes with inheritance instead of
+    /// fighting it.
+    ///
+    /// **Why `Owner` and not `Approve`.** `Approve` does not merely refuse —
+    /// it QUEUES a `pending_actions` row per attempted write, so a severed
+    /// global `*` standard would flood the approval queue from every
+    /// namespace at once, and a floored `delete: Approve` would block
+    /// erasure/`forget` on rows nobody can approve. `Owner` is strictly
+    /// stricter than the allow-on-silence default (#1569: write/promote
+    /// `Any`) while leaving the owning agent able to operate and to REPAIR
+    /// the binding via `memory_namespace_set_standard`. Degrade, never
+    /// corrupt; refuse loudly, but never brick the recovery path.
+    #[must_use]
+    pub fn with_severed_standard_floor(mut self) -> Self {
+        const FLOOR: GovernanceLevel = GovernanceLevel::Owner;
+        self.core.write = self.core.write.max_strictness(FLOOR);
+        self.core.promote = self.core.promote.max_strictness(FLOOR);
+        self.core.delete = self.core.delete.max_strictness(FLOOR);
+        self
     }
 
     /// v0.7.0 recursive-learning Task 2/8 (issue #655): resolve the
