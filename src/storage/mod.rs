@@ -20,6 +20,13 @@ const SQL_DELETE_MEMORY_BY_ID: &str = "DELETE FROM memories WHERE id = ?1";
 /// Reused dynamic-query namespace-filter fragment (pm-v3.1 no-scattered-literals
 /// gate — one named const referenced by the `list` + `reembed` keyset builders).
 const SQL_FRAGMENT_AND_NAMESPACE_EQ: &str = " AND namespace = ?";
+/// #2503 — the ONE `tracing` target for governance-binding severance events:
+/// the reap-time WARN, its audit-append failure WARN, and the resolve-time
+/// severed-floor WARN. Named once so an operator greps a single string to see
+/// the whole lifecycle, and so the value cannot drift between the three sites
+/// (pm-v3.1 no-scattered-literals gate).
+pub(crate) const TRACE_TARGET_STANDARD_SEVERED: &str = "ai_memory::governance::standard_severed";
+
 /// #2503 — SEVER (not DELETE) every `namespace_meta` binding that points at a
 /// memory being reaped. See [`sever_namespace_standards`] for the full
 /// rationale; the postgres twin is
@@ -3570,7 +3577,7 @@ pub(crate) fn sever_namespace_standards(conn: &Connection, id: &str) -> Result<u
     let changed = conn.execute(SQL_SEVER_NAMESPACE_META_BY_STANDARD_ID, params![id, now])?;
 
     tracing::warn!(
-        target: "ai_memory::governance::standard_severed",
+        target: TRACE_TARGET_STANDARD_SEVERED,
         standard_id = %id,
         namespaces = %severed.join(","),
         count = changed,
@@ -3597,7 +3604,7 @@ pub(crate) fn sever_namespace_standards(conn: &Connection, id: &str) -> Result<u
     );
     if let Err(e) = crate::signed_events::append_signed_event_no_tx(conn, &event) {
         tracing::warn!(
-            target: "ai_memory::governance::standard_severed",
+            target: TRACE_TARGET_STANDARD_SEVERED,
             standard_id = %id,
             error = %e,
             "failed to append the namespace-standard severance audit row"
@@ -17337,7 +17344,7 @@ pub fn resolve_governance_policy(conn: &Connection, namespace: &str) -> Option<G
 /// lockout caused by a reaped standard, and knows the one-command remedy.
 fn warn_severed_floor_applied(severed_namespace: &str, resolving_for: &str) {
     tracing::warn!(
-        target: "ai_memory::governance::standard_severed",
+        target: TRACE_TARGET_STANDARD_SEVERED,
         severed_namespace = %severed_namespace,
         resolving_for = %resolving_for,
         "governance resolution applied the SEVERED FLOOR (write/promote/delete \
