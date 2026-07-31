@@ -81,6 +81,15 @@ pub mod error_codes {
     /// [`crate::storage::StorageError::RecordStopped`] so the HTTP / MCP /
     /// CLI surfaces emit one canonical code.
     pub const RECORD_STOPPED: &str = "RECORD_STOPPED";
+
+    /// v1.0.0 #2445 — this database's schema is AHEAD of the running binary's
+    /// migration ladder, so the substrate refuses to operate it rather than
+    /// write rows an older code path shapes wrongly. Un-prefixed (the
+    /// [`RECORD_STOPPED`] precedent): like the record-stop this is a
+    /// deliberate refusal STATE shared across surfaces, not a backend fault,
+    /// so a `STORE_`-prefixed constant with a different wire value would be
+    /// misleading.
+    pub const SCHEMA_AHEAD_OF_BINARY: &str = "SCHEMA_AHEAD_OF_BINARY";
 }
 
 // ---------------------------------------------------------------------------
@@ -299,6 +308,9 @@ mod arch_9_slug_tests {
         assert_eq!(STORE_UNSUPPORTED_CAPABILITY, "UNSUPPORTED_CAPABILITY");
         assert_eq!(STORE_OPERATION_FAILED, "STORE_OPERATION_FAILED");
         assert_eq!(STORE_VERSION_CONFLICT, "VERSION_CONFLICT");
+        // #2445 — un-prefixed, like RECORD_STOPPED: a deliberate refusal state
+        // shared across surfaces, not a backend fault.
+        assert_eq!(SCHEMA_AHEAD_OF_BINARY, "SCHEMA_AHEAD_OF_BINARY");
     }
 
     // FX-E1 (2026-05-27) — `crate::store` is gated behind
@@ -338,6 +350,7 @@ mod arch_9_slug_tests {
                 issued_by: "ai:operator".into(),
                 scope: "record-plane".into(),
             },
+            StoreError::SchemaAheadOfBinary { detail: "d".into() },
             StoreError::Backend(BoxBackendError::new("boom")),
         ];
         let expected = [
@@ -351,8 +364,18 @@ mod arch_9_slug_tests {
             STORE_OPERATION_FAILED,
             CONFLICT,
             RECORD_STOPPED,
+            SCHEMA_AHEAD_OF_BINARY,
             DATABASE_ERROR,
         ];
+        // #2445 — `zip` TRUNCATES to the shorter side, so a variant added to
+        // one array and not the other would be silently un-exercised (the
+        // whole point of this test). Pin the lengths first.
+        assert_eq!(
+            variants.len(),
+            expected.len(),
+            "ARCH-9 arrays out of step — a new StoreError variant was added to \
+             only one of them, so `zip` would silently skip it"
+        );
         for (got, want) in variants.iter().zip(expected.iter()) {
             assert_eq!(got.code(), *want, "ARCH-9 StoreError code drift");
         }

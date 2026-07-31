@@ -734,7 +734,24 @@ pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
         // reads are unaffected. The message is caller-safe (no adapter
         // internals) so no sanitisation is needed.
         StoreError::Stopped { .. } => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
-        _ => {
+        // v1.0.0 #2445 — the database is newer than this binary. 503, not 500:
+        // this is not OUR fault and not a transient backend fault, it is a
+        // deliberate refusal that persists until an operator upgrades the
+        // binary — the same disposition as `Stopped` above, and the shape an
+        // orchestrator needs so it parks the node instead of crash-looping it.
+        // The message carries two integers and a version string (no URL, no
+        // path, no adapter internals), so it is emitted unsanitised.
+        StoreError::SchemaAheadOfBinary { .. } => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+        // #1795 — UNREACHABLE in practice: the `if let` above returns the full
+        // 429 QUOTA_EXCEEDED envelope before this match runs. Named here only
+        // because #2445 replaced the `_` wildcard with an exhaustive terminal
+        // arm; the status mirrors the early return so the two can never
+        // disagree if that guard is ever refactored away.
+        StoreError::QuotaExceeded { .. } => (StatusCode::TOO_MANY_REQUESTS, e.to_string()),
+        // v1.0.0 #2445 — EXPLICIT terminal arm, not `_`. A bare wildcard let
+        // every FUTURE `StoreError` variant land silently in a generic 500;
+        // naming the variant makes the next one a compile error instead.
+        StoreError::Backend(_) => {
             tracing::error!("store backend error: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
