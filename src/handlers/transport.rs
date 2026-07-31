@@ -533,7 +533,10 @@ impl AppState {
             return None;
         }
         let embedder = self.embedder.as_ref().as_ref()?;
-        let intent_vec = embedder.embed_query(intent).ok()?;
+        // v1.0.0 #2577 — bounded funnel; see the MCP twin in
+        // `mcp/tools/load_family.rs`. `None` already meant "use the
+        // non-embedding family match".
+        let intent_vec = crate::embeddings::recall_query_embedding(embedder, intent)?;
         let mut best: Option<(Family, f32)> = None;
         for (family, descriptor_vec) in cache.iter() {
             let score = Embedder::cosine_similarity(&intent_vec, descriptor_vec);

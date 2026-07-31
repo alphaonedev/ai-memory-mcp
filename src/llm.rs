@@ -2036,6 +2036,69 @@ impl OllamaClient {
         block_on_local(|| self.embed_text_async(text, embed_model))
     }
 
+    /// v1.0.0 #2577 — [`Self::embed_text`] under an explicit wall-clock
+    /// budget, for the RECALL (read) path.
+    ///
+    /// `None` is byte-identical to [`Self::embed_text`]. `Some(budget)`
+    /// bounds the whole call — DNS, connect, TLS, request, response — at
+    /// `budget`, which is what the client-level [`GENERATE_TIMEOUT`] (30 s,
+    /// a *generation* budget) does not do for a read.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`Self::embed_text_async`] error, or a budget-expiry
+    /// error naming the elapsed budget.
+    pub fn embed_text_with_budget(
+        &self,
+        text: &str,
+        embed_model: &str,
+        budget: Option<Duration>,
+    ) -> Result<Vec<f32>> {
+        match budget {
+            None => self.embed_text(text, embed_model),
+            Some(b) => block_on_local(|| self.embed_text_async_with_budget(text, embed_model, b)),
+        }
+    }
+
+    /// v1.0.0 #2577 — async twin of [`Self::embed_text_with_budget`].
+    ///
+    /// Dropping the inner future on expiry ABORTS the in-flight request
+    /// (reqwest cancels on drop), so the budget releases the caller AND the
+    /// socket — it does not merely stop waiting while the work continues.
+    ///
+    /// A budget expiry is reported to the circuit breaker via
+    /// [`Self::note_failure`]. Without that, a persistently slow provider
+    /// would make EVERY recall pay the full budget forever; with it, the
+    /// existing breaker (`CIRCUIT_BREAKER_THRESHOLD` consecutive failures,
+    /// `CIRCUIT_BREAKER_COOLDOWN` cooldown) opens and subsequent recalls
+    /// fast-fail to keyword instead. A slow provider is, for a read, a
+    /// failing provider.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`Self::embed_text_async`] error, or a budget-expiry
+    /// error naming the elapsed budget.
+    pub async fn embed_text_async_with_budget(
+        &self,
+        text: &str,
+        embed_model: &str,
+        budget: Duration,
+    ) -> Result<Vec<f32>> {
+        match tokio::time::timeout(budget, self.embed_text_async(text, embed_model)).await {
+            Ok(inner) => inner,
+            Err(_elapsed) => {
+                self.note_failure();
+                Err(anyhow!(
+                    "embed request exceeded the recall budget of {} ms ({}); \
+                     recall degrades to keyword — raise or disable the budget with {}",
+                    budget.as_millis(),
+                    self.base_url,
+                    crate::embeddings::ENV_RECALL_EMBED_BUDGET_MS,
+                ))
+            }
+        }
+    }
+
     /// PERF-9 (v0.7.0 FX-C1) — async variant of [`Self::embed_text`].
     /// Production callers (HTTP handlers, daemon) should prefer this
     /// over the sync wrapper.
