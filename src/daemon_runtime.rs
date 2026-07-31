@@ -9472,15 +9472,87 @@ mod tests {
         run(cli, &cfg).await.unwrap();
     }
 
+    /// v1.0.0 #2490 — dispatching `export` at a `--db` path that does not
+    /// exist must REFUSE.
+    ///
+    /// This cell previously called `run(..).await.unwrap()` against a
+    /// `TestEnv::fresh()` tmpdir where **no database was ever created**, so it
+    /// asserted the defect as expected behaviour: `db::open` conjured an
+    /// 802,816-byte SQLite file, ran the whole migration ladder on it, emitted
+    /// a structurally valid `count: 0` artifact and exited 0. Same class as
+    /// the #2518 fixture — a test that passed only because the product was
+    /// broken. It now asserts the refusal, and on its REASON rather than on
+    /// mere failure, so a future unrelated error cannot make it pass for the
+    /// wrong reason.
     #[tokio::test]
-    async fn test_run_dispatch_export_command() {
+    async fn test_run_dispatch_export_refuses_a_missing_database_2490() {
         let _g = no_config_env();
         let env = TestEnv::fresh();
         let cfg = AppConfig::default();
         let cli =
             Cli::try_parse_from(["ai-memory", "--db", env.db_path.to_str().unwrap(), "export"])
                 .unwrap();
+        let err = run(cli, &cfg)
+            .await
+            .expect_err("export must refuse a --db path that does not exist (#2490)");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing to create one"),
+            "the refusal must explain that a conjured database yields a valid-looking \
+             empty artifact; got: {msg}"
+        );
+        assert!(
+            !env.db_path.exists(),
+            "FAIL CLOSED: the database must NOT have been created at {}",
+            env.db_path.display()
+        );
+    }
+
+    /// CONTROL for [`test_run_dispatch_export_refuses_a_missing_database_2490`]
+    /// — the happy path must still export.
+    ///
+    /// Without this, the refusal cell above only proves the dispatch arm can
+    /// fail; it proves nothing about whether `export` still works. The corpus
+    /// is deliberately CLEAN (one ordinary seeded row, nothing the export
+    /// confidentiality boundary would withhold) for two reasons: it exercises
+    /// the exit-0 branch, and the dispatch arm calls `std::process::exit` on a
+    /// non-zero code — which in a unit test would terminate the whole test
+    /// binary rather than fail one cell.
+    #[tokio::test]
+    async fn test_run_dispatch_export_command() {
+        let _g = no_config_env();
+        let env = TestEnv::fresh();
+        crate::cli::test_utils::seed_memory(&env.db_path, "ns-export", "t", "c");
+        let cfg = AppConfig::default();
+        let cli =
+            Cli::try_parse_from(["ai-memory", "--db", env.db_path.to_str().unwrap(), "export"])
+                .unwrap();
         run(cli, &cfg).await.unwrap();
+
+        // The dispatch arm writes the artifact to the process stdout, which a
+        // unit test cannot capture — so assert the export is genuinely
+        // possible through the library entry point the arm calls, on the SAME
+        // database, and that it reports the seeded row with nothing withheld.
+        let mut out_env = TestEnv::fresh();
+        let code = {
+            let mut out = out_env.output();
+            cli::io::export(&env.db_path, &cli::io::ExportArgs::default(), &mut out)
+                .expect("export on a real database must succeed")
+        };
+        assert_eq!(code, 0, "a clean corpus must export with exit 0");
+        let v: serde_json::Value =
+            serde_json::from_str(out_env.stdout_str().trim()).expect("stdout is valid JSON");
+        assert_eq!(v["count"].as_u64(), Some(1), "the seeded row must export");
+        assert_eq!(
+            v["memories"].as_array().map(Vec::len),
+            Some(1),
+            "the artifact must carry the row, not just claim a count"
+        );
+        assert_eq!(
+            v[crate::models::field_names::WITHHELD]["withheld"].as_u64(),
+            Some(0),
+            "nothing may be withheld from a clean corpus"
+        );
     }
 
     #[tokio::test]
