@@ -532,7 +532,7 @@ pub(crate) fn import_from_str(
         // the destination row is itself already masked (no information is
         // lost). This is the guard that makes the "report redaction, exit 0"
         // export disposition safe (5-agent vote 4d3ea1c5, objection O7).
-        if let Some(reason) = redaction_would_clobber(&conn, &mem)? {
+        if let Some(reason) = redaction_would_clobber(&conn, &mem) {
             errors.push(format!("{}: refused — {reason}", mem.id));
             refused += 1;
             continue;
@@ -762,37 +762,76 @@ fn parse_links_leniently(
 /// has nothing loses no information (the artifact is all that survives), and
 /// a masked row landing on an already-masked row is a no-op. Both are
 /// admitted.
+///
+/// # The probe NEVER aborts the import
+///
+/// `db::get` is pinned to [`crate::storage::DecryptFailurePolicy::FailClosed`]
+/// (env #146), so a destination row whose at-rest envelope will not open
+/// returns `Err`. Propagating that would let ONE poisoned destination row
+/// abort the whole restore — the #2497 lesson about building a gate on a
+/// full-row read. The probe therefore returns a PER-ROW refusal instead:
+/// when the destination cannot be inspected we cannot prove the overwrite is
+/// safe, so the masked incoming row is refused (fail-closed on the one row)
+/// while every other row in the bundle still applies.
 fn redaction_would_clobber(
     conn: &rusqlite::Connection,
     incoming: &models::Memory,
-) -> Result<Option<String>> {
+) -> Option<String> {
     let placeholder = crate::secret_screen::REDACTION_PLACEHOLDER;
     if !incoming.content.contains(placeholder) && !incoming.title.contains(placeholder) {
-        return Ok(None);
+        return None;
     }
     // The destination row this write would land on: same id first (the
     // ConflictMode::Merge upsert keys on `(title, namespace)`, but an id
     // collision is the more direct clobber).
-    let existing = db::get(conn, &incoming.id)?.or(db::find_by_title_namespace(
-        conn,
-        &incoming.title,
-        &incoming.namespace,
-    )?
-    .and_then(|id| db::get(conn, &id).ok().flatten()));
-    let Some(existing) = existing else {
-        return Ok(None);
+    let by_id = match db::get(conn, &incoming.id) {
+        Ok(row) => row,
+        Err(e) => {
+            return Some(format!(
+                "the incoming row carries the secret-screen placeholder `{placeholder}`, and \
+                 the destination row with the same id could not be read to check whether it \
+                 holds unmasked content ({e}). Refusing this ONE row rather than risk \
+                 persisting the mask over readable data; the rest of the bundle still \
+                 applies (#2490)"
+            ));
+        }
     };
+    let existing = match by_id {
+        Some(row) => Some(row),
+        None => match db::find_by_title_namespace(conn, &incoming.title, &incoming.namespace) {
+            Ok(Some(id)) => match db::get(conn, &id) {
+                Ok(row) => row,
+                Err(e) => {
+                    return Some(format!(
+                        "the incoming row carries the secret-screen placeholder \
+                         `{placeholder}`, and the colliding destination row {id} could not be \
+                         read to check whether it holds unmasked content ({e}). Refusing this \
+                         ONE row; the rest of the bundle still applies (#2490)"
+                    ));
+                }
+            },
+            Ok(None) => None,
+            Err(e) => {
+                return Some(format!(
+                    "the incoming row carries the secret-screen placeholder `{placeholder}` \
+                     and the destination collision probe failed ({e}). Refusing this ONE row; \
+                     the rest of the bundle still applies (#2490)"
+                ));
+            }
+        },
+    };
+    let existing = existing?;
     if existing.content.contains(placeholder) {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(format!(
+    Some(format!(
         "the incoming row's content carries the secret-screen placeholder `{placeholder}` \
          but the destination row {} holds unmasked content. Applying it would persist the \
          mask as the durable source of truth, destroying readable data that this import \
          cannot restore. Re-export from the source with AI_MEMORY_SECRET_SCREEN_MODE=off, \
          or delete the destination row first if the mask is intended (#2490)",
         existing.id
-    )))
+    ))
 }
 
 /// `mine` handler.
