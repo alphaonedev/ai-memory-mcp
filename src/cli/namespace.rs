@@ -214,7 +214,13 @@ fn get_standard(
         "namespace": namespace,
         "inherit": inherit,
     });
-    let resp = handle_namespace_get_standard(&conn, &params).map_err(|e| anyhow::anyhow!(e))?;
+    // v1.0.0 #2537 — `None` visibility caller: the CLI is operator-as-actor
+    // (the same posture that exempts it from quotas + the L1-6 governance
+    // hook). A caller holding shell access to the DB file is not a security
+    // boundary, and this verb is the operator's remediation path when a
+    // standard is bound to a row the fleet's agents cannot read.
+    let resp =
+        handle_namespace_get_standard(&conn, &params, None).map_err(|e| anyhow::anyhow!(e))?;
     emit(out, json_out, &resp, |o, r| {
         if let Some(chain) = r.get("chain").and_then(Value::as_array) {
             writeln!(

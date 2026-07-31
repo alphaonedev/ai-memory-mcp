@@ -159,9 +159,12 @@ fn set_standard_accepts_known_variants_round_trips_typed_policy() {
         .expect("set_standard MUST accept the known-variants happy path");
     assert_eq!(resp["set"], json!(true));
 
-    let get_resp =
-        handle_namespace_get_standard(&conn, &json!({"namespace": namespace, "inherit": false}))
-            .expect("get_standard");
+    let get_resp = handle_namespace_get_standard(
+        &conn,
+        &json!({"namespace": namespace, "inherit": false}),
+        None,
+    )
+    .expect("get_standard");
     let policy = get_resp
         .get("governance")
         .and_then(Value::as_object)
@@ -205,9 +208,12 @@ fn set_standard_tolerates_unknown_off_struct_fields_for_forward_compat() {
     handle_namespace_set_standard(&conn, &params)
         .expect("set_standard MUST tolerate off-struct extension keys (#1326 forward-compat)");
 
-    let get_resp =
-        handle_namespace_get_standard(&conn, &json!({"namespace": namespace, "inherit": false}))
-            .expect("get_standard");
+    let get_resp = handle_namespace_get_standard(
+        &conn,
+        &json!({"namespace": namespace, "inherit": false}),
+        None,
+    )
+    .expect("get_standard");
     let policy = get_resp
         .get("governance")
         .and_then(Value::as_object)

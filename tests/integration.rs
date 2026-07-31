@@ -2884,16 +2884,20 @@ fn test_mcp_namespace_standard_auto_prepend() {
     assert_eq!(recall_data["standard"]["id"], std_id);
     assert_eq!(recall_data["standard"]["title"], "NS Standard");
 
-    // Standard should NOT be duplicated in the memories array
-    if let Some(memories) = recall_data["memories"].as_array() {
-        for m in memories {
-            assert_ne!(
-                m["id"].as_str().unwrap_or(""),
-                &std_id,
-                "standard should be deduplicated from memories array"
-            );
-        }
-    }
+    // v1.0.0 #2537 (5-agent vote `4d3ea1c5`, sub-decision H2-b) — the
+    // standard is NO LONGER retained out of the `memories` array. Pre-fix,
+    // `inject_namespace_standard` dropped every bound id from the results
+    // and rewrote `count`, so a namespace binding was an attacker-influenced
+    // retrieval-suppression primitive over what every caller saw. `count`
+    // must now equal `memories.len()` and reflect what actually matched.
+    let memories = recall_data["memories"]
+        .as_array()
+        .expect("recall response carries a memories array");
+    assert_eq!(
+        recall_data["count"].as_u64(),
+        u64::try_from(memories.len()).ok(),
+        "#2537: `count` must be the true match count"
+    );
 
     let _ = std::fs::remove_file(&db_path);
 }
