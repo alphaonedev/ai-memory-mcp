@@ -335,8 +335,30 @@ pub enum StoreError {
     )]
     Stopped { issued_by: String, scope: String },
 
+    /// v1.0.0 #2445 — this database's schema is AHEAD of what this binary's
+    /// migration ladder produces, so operating it would write rows an older
+    /// code path shapes wrongly (columns that moved, invariants the newer
+    /// migrations established). Refused BEFORE any bootstrap DDL replays.
+    ///
+    /// Carries a rendered `detail` rather than the raw integers, following the
+    /// [`Self::LinkRefused`] / [`Self::InvalidTransition`] convention: the
+    /// sqlite funnel produces the SAME string via
+    /// [`crate::storage::schema_guard::SchemaAheadOfBinary`], so cross-backend
+    /// parity is provable by assertion rather than by inspection.
+    #[error("{detail}")]
+    SchemaAheadOfBinary { detail: String },
+
     #[error("underlying backend error: {0}")]
     Backend(#[from] BoxBackendError),
+}
+
+/// v1.0.0 #2445 — lift the shared, backend-blind verdict into the SAL error
+/// type so `?` works verbatim in the postgres funnels and both backends emit a
+/// byte-identical message.
+impl From<crate::storage::schema_guard::SchemaAheadOfBinary> for StoreError {
+    fn from(e: crate::storage::schema_guard::SchemaAheadOfBinary) -> Self {
+        Self::SchemaAheadOfBinary { detail: e.detail }
+    }
 }
 
 impl StoreError {
@@ -372,6 +394,11 @@ impl StoreError {
             // slug with the sqlite handler path's quota breach.
             Self::QuotaExceeded { .. } => error_codes::QUOTA_EXCEEDED,
             Self::Stopped { .. } => error_codes::RECORD_STOPPED,
+            // #2445 — a downgrade refusal is not a backend FAULT (the backend
+            // is reachable and healthy) and not an unsupported CAPABILITY (the
+            // adapter can do this; the BINARY is too old), so it carries its
+            // own slug rather than being folded into either.
+            Self::SchemaAheadOfBinary { .. } => error_codes::SCHEMA_AHEAD_OF_BINARY,
             Self::Backend(_) => error_codes::DATABASE_ERROR,
         }
     }

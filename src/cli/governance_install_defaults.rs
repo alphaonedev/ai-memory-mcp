@@ -104,6 +104,10 @@ pub fn run(
             db_path.display()
         )
     })?;
+    // v1.0.0 #2445 — raw-open WRITE funnel (`UPDATE governance_rules SET
+    // enabled = 1`). Enabling authz rules against a schema this binary does not
+    // understand is an authz-config write on an unknown-shape table.
+    crate::storage::assert_schema_not_ahead(&conn, &db_path.display().to_string())?;
 
     // Confirm the four rules exist + grab their current state so we
     // can render the preview block and decide what to activate.
