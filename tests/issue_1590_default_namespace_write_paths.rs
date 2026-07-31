@@ -24,9 +24,12 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
 
-const READ_TIMEOUT: Duration = Duration::from_secs(15);
+// #2525 — the per-response bound comes from the shared elastic helper
+// (base x `AI_MEMORY_TEST_TIMING_BUDGET_MULT`, with fail-fast child-death
+// detection) instead of the fixed 15s constant this file used to carry.
+#[path = "common/mcp_wait.rs"]
+mod mcp_wait;
 
 struct McpChild {
     child: Option<Child>,
@@ -156,11 +159,10 @@ fn send_and_recv(
     payload: &serde_json::Value,
 ) -> serde_json::Value {
     let line = serde_json::to_string(payload).unwrap();
+    let ctx = payload["method"].as_str().unwrap_or("<unknown method>");
     writeln!(stdin, "{line}").expect("write to mcp stdin");
     stdin.flush().expect("flush mcp stdin");
-    let resp = rx
-        .recv_timeout(READ_TIMEOUT)
-        .expect("mcp response did not arrive within READ_TIMEOUT");
+    let resp = mcp_wait::recv_mcp_response(rx, ctx);
     serde_json::from_str(&resp).unwrap_or_else(|e| panic!("parse mcp response: {e}: {resp}"))
 }
 
