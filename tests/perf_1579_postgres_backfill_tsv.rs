@@ -420,6 +420,8 @@ async fn b2_search_still_returns_matches_through_sal() {
         valid_at: None,
         limit: 10,
         active_embedding_space: None,
+        // #2580 — metadata-equality pushdown axis unused on this path.
+        metadata_eq: None,
     };
     let hits = store
         .search(&ctx, "substrate recall", &filter)

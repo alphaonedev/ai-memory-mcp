@@ -5889,6 +5889,11 @@ pub fn build_list_query(
     // rows whose half-open [valid_from, valid_until) window (END-EXCLUSIVE;
     // NULL bounds = unbounded) contains the instant. `None` = no filter.
     valid_at: Option<&str>,
+    // v1.0.0 #2580 — exact top-level `metadata.<key> == "<value>"` narrowing,
+    // the sqlite twin of the postgres `metadata @> jsonb_build_object(...)`
+    // pushdown. `None` = no narrowing (byte-identical legacy SQL). See
+    // `crate::store::MetadataEq`.
+    metadata_eq: Option<(&str, &str)>,
     limit: usize,
     offset: usize,
 ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
@@ -5936,6 +5941,24 @@ pub fn build_list_query(
         params_vec.push(Box::new(v_canon.clone()));
         params_vec.push(Box::new(v_canon));
     }
+    // v1.0.0 #2580 — exact top-level metadata string-equality narrowing.
+    // Deliberately expressed via `json_each` (mirroring the `tags_any`
+    // fragment above) rather than `json_extract(metadata, '$.' || key)`:
+    // the key rides as a BOUND PARAMETER, so no key value can escape into
+    // the JSON-path grammar. `json_each.type = 'text'` restricts the match
+    // to JSON STRING values, making the predicate byte-exact with the Rust
+    // twin `metadata.get(k).and_then(Value::as_str) == Some(v)` and with
+    // the postgres `metadata @> jsonb_build_object($k::text, $v::text)`
+    // containment shape (a numeric/null/array/object value never matches
+    // on any of the three).
+    if let Some((k, v)) = metadata_eq {
+        sql.push_str(
+            " AND EXISTS (SELECT 1 FROM json_each(memories.metadata) \
+             WHERE json_each.key = ? AND json_each.value = ? AND json_each.type = 'text')",
+        );
+        params_vec.push(Box::new(k.to_string()));
+        params_vec.push(Box::new(v.to_string()));
+    }
     // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list hides
     // Tombstoned/Quarantined (and any unknown state) from list. No alias in
     // SQL_LIST_BASE, so the unqualified column is used.
@@ -5962,6 +5985,52 @@ pub fn list(
     // v1.0.0 #1834 — claim-bitemporal AS-OF. See [`build_list_query`].
     valid_at: Option<&str>,
 ) -> Result<Vec<Memory>> {
+    // v1.0.0 #2580 — the historical 11-arg shape, preserved verbatim so the
+    // ~30 existing call sites are untouched. The metadata-equality axis is
+    // reached through `list_filtered`.
+    list_filtered(
+        conn,
+        namespace,
+        tier,
+        limit,
+        offset,
+        min_priority,
+        since,
+        until,
+        tags_filter,
+        agent_id,
+        valid_at,
+        None,
+    )
+}
+
+/// v1.0.0 #2580 — [`list`] plus the exact top-level metadata-equality
+/// narrowing axis (`crate::store::MetadataEq`), pushed into the SAME
+/// `build_list_query` shape every other `list` filter rides.
+///
+/// Landing the predicate in the shared builder rather than in a bespoke
+/// query is the load-bearing property: the fail-closed lifecycle
+/// allow-list (#1948), the expiry guard, the sargable namespace arm
+/// (#1579 A2), the claim-bitemporal AS-OF window (#1834), and the
+/// `row_to_memory_scan` undecryptable-row skip (#2383) all apply
+/// unchanged. A separate hand-written query would have to re-derive every
+/// one of them, and a single omission returns rows the caller must never
+/// see.
+#[allow(clippy::too_many_arguments)]
+pub fn list_filtered(
+    conn: &Connection,
+    namespace: Option<&str>,
+    tier: Option<&Tier>,
+    limit: usize,
+    offset: usize,
+    min_priority: Option<i32>,
+    since: Option<&str>,
+    until: Option<&str>,
+    tags_filter: Option<&str>,
+    agent_id: Option<&str>,
+    valid_at: Option<&str>,
+    metadata_eq: Option<(&str, &str)>,
+) -> Result<Vec<Memory>> {
     let now = Utc::now().to_rfc3339();
     let (sql, params_vec) = build_list_query(
         namespace,
@@ -5973,6 +6042,7 @@ pub fn list(
         tags_filter,
         agent_id,
         valid_at,
+        metadata_eq,
         limit,
         offset,
     );
