@@ -177,20 +177,31 @@ mod tests {
 
     // ── Path 2 — the CLI `export` command end-to-end (the GA-blocker) ─────
 
-    /// Drive `cli::io::export` against a file-backed DB and capture stdout.
-    fn run_cli_export(db_path: &std::path::Path) -> String {
+    /// Drive `cli::io::export` against a file-backed DB and capture
+    /// `(stdout, stderr, exit_code)`.
+    ///
+    /// v1.0.0 #2490 — `export` now returns an exit code so a PARTIAL export
+    /// (rows withheld by the fail-closed forbidden-class gate below) cannot
+    /// present as a complete one. The pre-#2490 helper discarded the result
+    /// and asserted only on stdout, which is exactly how the silent-drop
+    /// class stayed invisible; these tests now pin the loud half too.
+    fn run_cli_export_full(db_path: &std::path::Path) -> (String, String, i32) {
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
-        {
+        let code = {
             let mut out = ai_memory::cli::CliOutput::from_std(&mut stdout, &mut stderr);
             ai_memory::cli::io::export(
                 db_path,
                 &ai_memory::cli::io::ExportArgs::default(),
                 &mut out,
             )
-            .expect("cli export");
-        }
-        String::from_utf8(stdout).expect("stdout is utf8")
+            .expect("cli export")
+        };
+        (
+            String::from_utf8(stdout).expect("stdout is utf8"),
+            String::from_utf8(stderr).expect("stderr is utf8"),
+            code,
+        )
     }
 
     #[test]
@@ -216,9 +227,37 @@ mod tests {
             .expect("insert biometric");
         }
 
-        let stdout = run_cli_export(&dbp);
+        let (stdout, stderr, code) = run_cli_export_full(&dbp);
         // stdout MUST be valid JSON (a piped `export > backup.json` stays parseable).
         let v: Value = serde_json::from_str(stdout.trim()).expect("stdout is valid JSON");
+
+        // v1.0.0 #2490 — the drop must be LOUD. Pre-fix this exact fixture
+        // exported `count: 1` with exit 0 and an empty operator channel, so
+        // the artifact was internally self-consistent and the loss was
+        // unfalsifiable from the bundle alone.
+        assert_eq!(
+            code,
+            ai_memory::export_scope::EXIT_EXPORT_INCOMPLETE,
+            "a withheld row must make the export exit INCOMPLETE, not 0"
+        );
+        assert!(
+            stderr.contains(ai_memory::export_scope::EXPORT_REPORT_EVENT),
+            "the structured export report must reach the operator channel; stderr was: {stderr}"
+        );
+        assert!(
+            stderr.contains("bio"),
+            "the withheld id belongs on the operator channel so a DR operator can \
+             enumerate what the artifact is missing; stderr was: {stderr}"
+        );
+        // ...but NEVER in the artifact: the ids of rows withheld for
+        // carrying key material must not ride the portable bundle.
+        assert!(
+            !stdout.contains("\"bio\""),
+            "the withheld id must NOT be published into the export artifact"
+        );
+        let withheld = &v[ai_memory::models::field_names::WITHHELD];
+        assert_eq!(withheld["withheld"].as_u64(), Some(1));
+        assert_eq!(withheld["quarantined"].as_u64(), Some(0));
 
         // Forbidden row dropped; clean row present; count reflects survivors.
         let mems = v["memories"].as_array().expect("memories array");
@@ -272,7 +311,7 @@ mod tests {
             .expect("raw update inject");
         }
 
-        let stdout = run_cli_export(&dbp);
+        let (stdout, stderr, code) = run_cli_export_full(&dbp);
         assert!(
             !stdout.contains(AWS_KEY),
             "CLI export leaked a verbatim credential in title/metadata"
@@ -281,6 +320,24 @@ mod tests {
         let m = &v["memories"].as_array().unwrap()[0];
         assert!(m["title"].as_str().unwrap().contains(REDACTED));
         assert!(m["metadata"]["note"].as_str().unwrap().contains(REDACTED));
+
+        // v1.0.0 #2490 — a MUTATED row is reported but does NOT fail the
+        // export (D4 = A, 4-1). Redaction is mode-dependent and steady-state
+        // on any corpus holding one legacy credential row, and a non-zero
+        // exit here would create pressure to set
+        // `AI_MEMORY_SECRET_SCREEN_MODE=off` — which also disables the
+        // pre-WRITE screen on every surface. The restore-side corruption it
+        // would otherwise cause is blocked at import instead.
+        assert_eq!(code, 0, "a redaction-only export must still exit 0");
+        assert!(
+            stderr.contains(ai_memory::export_scope::EXPORT_REPORT_EVENT),
+            "the mutation must still be REPORTED; stderr was: {stderr}"
+        );
+        assert_eq!(
+            v[ai_memory::models::field_names::WITHHELD]["redacted"].as_u64(),
+            Some(1),
+            "the in-band marker must count the row whose stored bytes were altered"
+        );
     }
 
     // ── Path 3 — the forensic bundle ─────────────────────────────────────
