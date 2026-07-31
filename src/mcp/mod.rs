@@ -1043,16 +1043,76 @@ fn build_namespace_chain(conn: &rusqlite::Connection, namespace: &str) -> Vec<St
     db::build_namespace_chain(conn, namespace)
 }
 
+/// Outcome of resolving ONE namespace-chain link's bound standard (#2537).
+///
+/// The three arms are deliberately distinct so the caller can tell "no
+/// standard is bound here" apart from "a standard IS bound but you may not
+/// read it" — the second is disclosed as a bare count
+/// ([`field_names::STANDARDS_WITHHELD`]) rather than silently swallowed.
+enum StandardLookup {
+    /// No standard bound at this link, or the bound memory no longer exists.
+    Absent,
+    /// A standard is bound but the caller fails the canonical visibility
+    /// predicate. The body is NOT injected.
+    Withheld,
+    /// The bound standard, serialized, admitted for this caller.
+    Visible(Value),
+}
+
 /// Inject namespace standards into a `recall/session_start` response.
 /// N-level rule layering: global ("*") → root → ... → namespace-specific.
 /// Uses [`build_namespace_chain`] to resolve the full ancestor path.
+///
+/// # v1.0.0 #2537 — the injected standard is visibility-filtered
+///
+/// `set_namespace_standard` deliberately permits binding a standard memory
+/// that lives in a DIFFERENT namespace (the documented shared-policy
+/// feature: one `global/policies` standard shared by many namespaces).
+/// Pre-fix, the READ path turned that into a cross-tenant read primitive:
+/// [`lookup_namespace_standard`] `db::get`-ed the bound memory with NO
+/// visibility filter and injected the FULL serialized `Memory` — title,
+/// content, tags, metadata, owning namespace — into EVERY `memory_recall`
+/// and `memory_session_start` response for the bound namespace. A caller
+/// with no entitlement to namespace `B` received `B`'s memory content
+/// verbatim by recalling in namespace `A`.
+///
+/// The fix is the SAME canonical predicate every other read path already
+/// applies to the `memories` array — [`crate::visibility::is_visible_to_caller`]
+/// (#951 single-implementation rule; #1468 / #1720 / #1420 precedent) — NOT
+/// a bespoke namespace-chain carve-out. The 5-agent adversarial vote
+/// (`4d3ea1c5`) ranked the carve-out LAST 4-of-5: `"*"` is a link in EVERY
+/// chain, the recall `namespace` argument is caller-supplied and
+/// unauthenticated, and `namespace_meta.parent_namespace` is caller-supplied
+/// via `set_standard(parent=…)` — so a chain-membership admit arm is
+/// attacker-reachable three separate ways.
+///
+/// `caller.is_none()` keeps the documented single-tenant MCP-stdio
+/// trust-all posture byte-identical (the `None` arm of
+/// `crate::identity::resolve_read_visibility_caller`).
+///
+/// # v1.0.0 #2537 — the results array is no longer silently shrunk
+///
+/// Pre-fix the function also `retain`-dropped every bound standard id from
+/// `response["memories"]` and rewrote `response["count"]`, so whoever
+/// controlled a namespace's binding controlled which row left the results
+/// array for EVERY caller recalling that namespace — silently, with the
+/// count adjusted so nothing looked missing, and with the row's
+/// `decorate_memory_many` trust decoration (`score`, `provenance_tier`,
+/// `confidence_tier`, `freshness_state`) stripped on the way to
+/// `response["standard"]`. The retain is GONE: a matched row stays in
+/// `memories` and `count` is the true match count. When the standard IS
+/// among the results, its already-decorated value is reused as the
+/// `standard` payload so the governing row never ships with weaker trust
+/// signals than the rows it governs.
 fn inject_namespace_standard(
     conn: &rusqlite::Connection,
     namespace: Option<&str>,
+    caller: Option<&str>,
     response: &mut Value,
 ) {
     let mut standards: Vec<Value> = Vec::new();
     let mut standard_ids: Vec<String> = Vec::new();
+    let mut withheld: usize = 0;
 
     // Helper: add a standard if not already present (dedup by memory ID)
     let add_standard = |std: Value, ids: &mut Vec<String>, stds: &mut Vec<Value>| {
@@ -1071,22 +1131,45 @@ fn inject_namespace_standard(
     };
 
     for link in chain {
-        if let Some(std) = lookup_namespace_standard(conn, &link) {
-            add_standard(std, &mut standard_ids, &mut standards);
+        match lookup_namespace_standard(conn, &link, caller) {
+            StandardLookup::Absent => {}
+            // #2537 — a withheld standard NEVER enters `standard_ids`, so it
+            // can never influence what the caller receives in `memories`.
+            StandardLookup::Withheld => withheld += 1,
+            StandardLookup::Visible(std) => {
+                add_standard(std, &mut standard_ids, &mut standards);
+            }
         }
+    }
+
+    // #2537 — count-only honesty marker. Deliberately carries NO id, owner,
+    // or namespace: those would make the marker a cross-tenant existence
+    // oracle over the resolved ancestor chain the caller never supplied.
+    if withheld > 0 {
+        response[field_names::STANDARDS_WITHHELD] = json!(withheld);
     }
 
     if standards.is_empty() {
         return;
     }
 
-    // Deduplicate: remove standard memories from results array
-    if let Some(memories) = response["memories"].as_array_mut() {
-        memories.retain(|m| {
-            let mid = m["id"].as_str().unwrap_or_default();
-            !standard_ids.iter().any(|sid| sid == mid)
-        });
-        response["count"] = json!(memories.len());
+    // #2537 — prefer the DECORATED value when the standard also matched the
+    // caller's query. `lookup_namespace_standard` serializes a bare `Memory`;
+    // `decorate_memory_many` (#1709 §2.5 T2) attaches the trust signals
+    // (`score` / `provenance_tier` / `confidence_tier` / `freshness_state`)
+    // that a consumer uses to decide how much to trust a row. The row
+    // promoted to governing authority must not be the one row delivered
+    // without them.
+    if let Some(memories) = response["memories"].as_array() {
+        for std in &mut standards {
+            let id = std["id"].as_str().unwrap_or_default();
+            if id.is_empty() {
+                continue;
+            }
+            if let Some(decorated) = memories.iter().find(|m| m["id"].as_str() == Some(id)) {
+                *std = decorated.clone();
+            }
+        }
     }
 
     // Return as single object if one standard, array if multiple
@@ -1115,12 +1198,44 @@ fn inject_namespace_standard(
 /// `handle_recall` directly — this wrapper is opt-in.
 #[allow(clippy::too_many_arguments)]
 
-/// Look up the namespace standard and return it as a serialized Memory, or None.
-
-fn lookup_namespace_standard(conn: &rusqlite::Connection, namespace: &str) -> Option<Value> {
-    let standard_id = db::get_namespace_standard(conn, namespace).ok()??;
-    let mem = db::get(conn, &standard_id).ok()??;
-    serde_json::to_value(&mem).ok()
+/// Look up the namespace standard bound at `namespace` and return it as a
+/// serialized `Memory`, THROUGH the caller's read-visibility predicate.
+///
+/// v1.0.0 #2537 — this is the ONE chokepoint every standard-body read goes
+/// through ([`inject_namespace_standard`] for recall / session_start, and
+/// both branches of
+/// [`crate::mcp::tools::namespace::handle_namespace_get_standard`]), so the
+/// predicate cannot drift between them (the #951 lesson: three divergent
+/// copies of `is_visible_to_caller`, one of which had silently lost the
+/// inbox carve-out).
+///
+/// `caller == None` preserves the documented single-tenant trust-all read
+/// posture byte-for-byte (see [`crate::identity::resolve_read_visibility_caller`]);
+/// `Some(c)` applies the canonical
+/// [`crate::visibility::is_visible_to_caller`] predicate to the bound
+/// memory before ANY of its bytes reach the response.
+fn lookup_namespace_standard(
+    conn: &rusqlite::Connection,
+    namespace: &str,
+    caller: Option<&str>,
+) -> StandardLookup {
+    let Ok(Some(standard_id)) = db::get_namespace_standard(conn, namespace) else {
+        return StandardLookup::Absent;
+    };
+    let Ok(Some(mem)) = db::get(conn, &standard_id) else {
+        return StandardLookup::Absent;
+    };
+    // #2537 — run the predicate on the typed `Memory` BEFORE serialization,
+    // so a withheld standard's bytes are never materialised at all.
+    if caller.is_some_and(|c| !crate::visibility::is_visible_to_caller(&mem, c)) {
+        tracing::debug!(
+            target: "namespace.standard.withheld",
+            namespace = %namespace,
+            "#2537: namespace standard withheld — not visible to caller"
+        );
+        return StandardLookup::Withheld;
+    }
+    serde_json::to_value(&mem).map_or(StandardLookup::Absent, StandardLookup::Visible)
 }
 
 // ---------------------------------------------------------------------------
@@ -2310,7 +2425,13 @@ fn dispatch_memory_namespace_set_standard(ctx: &ToolDispatchCtx<'_>) -> Result<V
 }
 
 fn dispatch_memory_namespace_get_standard(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_namespace_get_standard(ctx.conn, ctx.arguments)
+    // v1.0.0 #2537 — resolve the read-path visibility caller so the standard
+    // BODY this tool returns is gated by the same predicate that gates the
+    // body `memory_recall` / `memory_session_start` inject. Mirrors
+    // `dispatch_memory_recall` (#1468); `None` (no `AI_MEMORY_AGENT_ID`)
+    // keeps the single-tenant trust-all posture.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_namespace_get_standard(ctx.conn, ctx.arguments, caller.as_deref())
 }
 
 fn dispatch_memory_namespace_clear_standard(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -8050,7 +8171,7 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let std_id = seed_namespace_standard(&conn, "m9-inject-attach", "S");
         let mut resp = make_recall_response(vec![]);
-        super::inject_namespace_standard(&conn, Some("m9-inject-attach"), &mut resp);
+        super::inject_namespace_standard(&conn, Some("m9-inject-attach"), None, &mut resp);
         assert!(resp["standard"].is_object(), "expected attached standard");
         assert_eq!(resp["standard"]["id"].as_str().unwrap(), std_id);
     }
@@ -8062,7 +8183,7 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let mut resp = make_recall_response(vec![]);
         let before = resp.clone();
-        super::inject_namespace_standard(&conn, Some("m9-inject-empty"), &mut resp);
+        super::inject_namespace_standard(&conn, Some("m9-inject-empty"), None, &mut resp);
         assert_eq!(resp, before);
         assert!(resp.get("standard").is_none());
         assert!(resp.get("standards").is_none());
@@ -8070,21 +8191,33 @@ mod tests {
 
     #[test]
     fn test_inject_namespace_standard_top_of_recall_response() {
-        // The standard's own memory must be filtered OUT of the
-        // `memories` array so the client doesn't see the policy
-        // duplicated as a result + as the `standard` field.
+        // v1.0.0 #2537 (5-agent vote `4d3ea1c5`, sub-decision H2-b) — the
+        // standard's own memory is NO LONGER filtered out of `memories`.
+        // Pre-fix this function ran `memories.retain(...)` + rewrote
+        // `response["count"]`, so whoever controlled a namespace's binding
+        // controlled which row left the results array for EVERY caller
+        // recalling that namespace — silently, with the count adjusted so
+        // nothing looked missing. `count` is now the TRUE match count and
+        // the row the caller matched stays where the caller asked for it.
+        // The standard body is still surfaced under `standard`; the only
+        // cost is one duplicated row in the exact case where the caller's
+        // own query matched the policy.
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let std_id = seed_namespace_standard(&conn, "m9-inject-dedup", "S");
         // Pretend recall returned the standard as one of its hits.
         let dup = json!({"id": std_id, "title": "S", "content": "policy text"});
         let other = json!({"id": "other-id", "title": "noise", "content": "x"});
         let mut resp = make_recall_response(vec![dup.clone(), other.clone()]);
-        super::inject_namespace_standard(&conn, Some("m9-inject-dedup"), &mut resp);
+        super::inject_namespace_standard(&conn, Some("m9-inject-dedup"), None, &mut resp);
         assert_eq!(resp["standard"]["id"].as_str().unwrap(), std_id);
         let memories = resp["memories"].as_array().unwrap();
-        assert_eq!(memories.len(), 1);
-        assert_eq!(memories[0]["id"], "other-id");
-        assert_eq!(resp["count"], 1);
+        assert_eq!(memories.len(), 2, "#2537 H2-b: no row is retained out");
+        assert_eq!(memories[0]["id"], std_id);
+        assert_eq!(memories[1]["id"], "other-id");
+        assert_eq!(
+            resp["count"], 2,
+            "#2537 H2-b: count is the true match count"
+        );
     }
 
     #[test]
@@ -8098,7 +8231,7 @@ mod tests {
             "mode": "hybrid",
             "diagnostics": {"latency_ms": 42},
         });
-        super::inject_namespace_standard(&conn, Some("m9-inject-preserve"), &mut resp);
+        super::inject_namespace_standard(&conn, Some("m9-inject-preserve"), None, &mut resp);
         assert_eq!(resp["mode"], "hybrid");
         assert_eq!(resp["diagnostics"]["latency_ms"], 42);
         assert!(resp["standard"].is_object());
@@ -8111,7 +8244,7 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         seed_namespace_standard(&conn, "*", "global standard");
         let mut resp = make_recall_response(vec![]);
-        super::inject_namespace_standard(&conn, None, &mut resp);
+        super::inject_namespace_standard(&conn, None, None, &mut resp);
         assert_eq!(resp["standard"]["title"], "global standard");
     }
 
@@ -8124,7 +8257,7 @@ mod tests {
         seed_namespace_standard(&conn, "*", "GLOBAL");
         seed_namespace_standard(&conn, "m9-multi", "LOCAL");
         let mut resp = make_recall_response(vec![]);
-        super::inject_namespace_standard(&conn, Some("m9-multi"), &mut resp);
+        super::inject_namespace_standard(&conn, Some("m9-multi"), None, &mut resp);
         assert!(resp["standards"].is_array());
         let arr = resp["standards"].as_array().unwrap();
         assert_eq!(arr.len(), 2);
@@ -9769,7 +9902,7 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let mut resp = make_recall_response(vec![]);
         let before = resp.clone();
-        super::inject_namespace_standard(&conn, None, &mut resp);
+        super::inject_namespace_standard(&conn, None, None, &mut resp);
         assert_eq!(resp, before);
     }
 
@@ -11062,8 +11195,11 @@ mod tests {
 
     #[test]
     fn test_inject_namespace_standard_dedup_keeps_originals_order() {
-        // When the standard is one of the recall hits, dedup removes it
-        // but preserves the relative order of remaining results.
+        // v1.0.0 #2537 (H2-b) — injection is now ORDER- AND
+        // MEMBERSHIP-PRESERVING on the `memories` array: it neither drops
+        // the bound row nor reorders its siblings. Pre-fix the middle
+        // element was silently removed (see
+        // `test_inject_namespace_standard_top_of_recall_response`).
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let std_id = seed_namespace_standard(&conn, "w12-order", "S");
         let mems = vec![
@@ -11072,11 +11208,12 @@ mod tests {
             json!({"id": "third", "title": "t"}),
         ];
         let mut resp = make_recall_response(mems);
-        super::inject_namespace_standard(&conn, Some("w12-order"), &mut resp);
+        super::inject_namespace_standard(&conn, Some("w12-order"), None, &mut resp);
         let memories = resp["memories"].as_array().unwrap();
-        assert_eq!(memories.len(), 2);
+        assert_eq!(memories.len(), 3);
         assert_eq!(memories[0]["id"], "first");
-        assert_eq!(memories[1]["id"], "third");
+        assert_eq!(memories[1]["id"], std_id);
+        assert_eq!(memories[2]["id"], "third");
     }
 
     // =====================================================================
