@@ -1042,7 +1042,17 @@ pub async fn get_namespace_standard_qs(
         params["inherit"] = json!(inh);
     }
     let lock = app.db.lock().await;
-    let result = crate::mcp::handle_namespace_get_standard(&lock.0, &params);
+    // v1.0.0 #2537 — `None` visibility caller, DELIBERATE and scope-bounded.
+    // #2537 closes the UNSOLICITED injection of a standard body into every
+    // recall / session_start response. This route is the EXPLICIT
+    // per-namespace standard fetch, whose no-caller-gate posture is a
+    // pre-existing, in-tree, documented product decision with its own filed
+    // follow-up: see the `#945-sibling` note above and the postgres arm's
+    // `CallerContext::for_admin` ("namespace standards are governance POLICY
+    // — readable by any caller that can query the namespace itself"). Gating
+    // only the sqlite arm here would ALSO fork sqlite/postgres behaviour on
+    // one route. Tracked as its own issue against #959.
+    let result = crate::mcp::handle_namespace_get_standard(&lock.0, &params, None);
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),

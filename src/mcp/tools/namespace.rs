@@ -313,9 +313,28 @@ pub fn handle_namespace_set_standard(
     Ok(resp)
 }
 
+/// Read the standard bound at `namespace` (optionally the whole inherited
+/// chain).
+///
+/// v1.0.0 #2537 — `caller` is the read-visibility principal (see
+/// [`crate::identity::resolve_read_visibility_caller`]). This surface reads
+/// the SAME standard bodies `inject_namespace_standard` serves, so it routes
+/// through the SAME chokepoint ([`super::lookup_namespace_standard`]) and
+/// therefore the SAME canonical
+/// [`crate::visibility::is_visible_to_caller`] predicate — an
+/// injection-only fix would have left an equivalent tool call open. A
+/// withheld standard yields a body-free
+/// [`field_names::STANDARDS_WITHHELD`] count and NO id / title / content /
+/// governance.
+///
+/// `None` preserves the trust-all posture (single-tenant MCP stdio, and the
+/// `ai-memory namespace get-standard` CLI, which is operator-as-actor — a
+/// caller with shell access to the DB file is not a security boundary, and
+/// the CLI is the operator's remediation path for a mis-scoped standard).
 pub fn handle_namespace_get_standard(
     conn: &rusqlite::Connection,
     params: &Value,
+    caller: Option<&str>,
 ) -> Result<Value, String> {
     let namespace = params["namespace"]
         .as_str()
@@ -327,62 +346,81 @@ pub fn handle_namespace_get_standard(
     if inherit {
         let chain = super::build_namespace_chain(conn, namespace);
         let mut standards: Vec<Value> = Vec::new();
+        let mut withheld: usize = 0;
         for link in &chain {
-            if let Some(std) = super::lookup_namespace_standard(conn, link) {
-                let gov = extract_governance(&std);
-                let entry = json!({
-                    "namespace": link,
-                    (field_names::STANDARD_ID): std["id"].clone(),
-                    "title": std["title"].clone(),
-                    "content": std["content"].clone(),
-                    "priority": std["priority"].clone(),
-                    (field_names::GOVERNANCE): gov,
-                });
-                standards.push(entry);
+            match super::lookup_namespace_standard(conn, link, caller) {
+                super::StandardLookup::Absent => {}
+                // #2537 — a chain link the caller may not read contributes a
+                // count and nothing else (never the namespace name, which
+                // would leak the resolved ancestor path).
+                super::StandardLookup::Withheld => withheld += 1,
+                super::StandardLookup::Visible(std) => {
+                    let gov = extract_governance(&std);
+                    let entry = json!({
+                        "namespace": link,
+                        (field_names::STANDARD_ID): std["id"].clone(),
+                        "title": std["title"].clone(),
+                        "content": std["content"].clone(),
+                        "priority": std["priority"].clone(),
+                        (field_names::GOVERNANCE): gov,
+                    });
+                    standards.push(entry);
+                }
             }
         }
-        return Ok(json!({
+        let mut resp = json!({
             "namespace": namespace,
             "chain": chain,
             "standards": standards,
             "count": standards.len(),
-        }));
+        });
+        if withheld > 0 {
+            resp[field_names::STANDARDS_WITHHELD] = json!(withheld);
+        }
+        return Ok(resp);
     }
 
+    // The binding is probed separately from the body so a DANGLING binding
+    // (id set, memory deleted) keeps its distinct `warning` shape.
     let standard_id = db::get_namespace_standard(conn, namespace).map_err(|e| e.to_string())?;
     match standard_id {
-        Some(id) => {
-            let mem = db::get(conn, &id).map_err(|e| e.to_string())?;
-            match mem {
-                Some(m) => {
-                    // v0.7.0 #1326 — surface the FULL `metadata.governance`
-                    // blob, not just the typed `GovernancePolicy` whitelist.
-                    // The typed struct omits caller-supplied free fields
-                    // like `require_approval_above_depth` (read by
-                    // `storage::resolve_require_approval_above_depth`)
-                    // which means set_standard would silently round-trip
-                    // them into the DB while get_standard returned a
-                    // policy blob that didn't surface them. The fix:
-                    // start from the typed policy as the base (so default
-                    // fields like `write`/`promote`/`delete`/`approver`/
-                    // `inherit` populate), then layer the raw blob keys
-                    // back on top — preserving every field the operator
-                    // sent on set, including off-struct fields.
-                    let gov = merge_governance_for_response(&m.metadata);
-                    Ok(json!({
-                        "namespace": namespace,
-                        (field_names::STANDARD_ID): id,
-                        "title": m.title,
-                        "content": m.content,
-                        "priority": m.priority,
-                        (field_names::GOVERNANCE): gov,
-                    }))
-                }
-                None => Ok(
-                    json!({"namespace": namespace, (field_names::STANDARD_ID): id, "warning": "standard memory not found — may have been deleted"}),
-                ),
+        Some(id) => match super::lookup_namespace_standard(conn, namespace, caller) {
+            super::StandardLookup::Visible(std) => {
+                // v0.7.0 #1326 — surface the FULL `metadata.governance`
+                // blob, not just the typed `GovernancePolicy` whitelist.
+                // The typed struct omits caller-supplied free fields
+                // like `require_approval_above_depth` (read by
+                // `storage::resolve_require_approval_above_depth`)
+                // which means set_standard would silently round-trip
+                // them into the DB while get_standard returned a
+                // policy blob that didn't surface them. The fix:
+                // start from the typed policy as the base (so default
+                // fields like `write`/`promote`/`delete`/`approver`/
+                // `inherit` populate), then layer the raw blob keys
+                // back on top — preserving every field the operator
+                // sent on set, including off-struct fields.
+                let gov = merge_governance_for_response(&std["metadata"]);
+                Ok(json!({
+                    "namespace": namespace,
+                    (field_names::STANDARD_ID): id,
+                    "title": std["title"].clone(),
+                    "content": std["content"].clone(),
+                    "priority": std["priority"].clone(),
+                    (field_names::GOVERNANCE): gov,
+                }))
             }
-        }
+            // #2537 — honest, body-free, and NOT an existence oracle: the id
+            // is withheld too, so the caller learns only that a standard
+            // exists here which they may not read.
+            super::StandardLookup::Withheld => Ok(json!({
+                "namespace": namespace,
+                (field_names::STANDARD_ID): null,
+                (field_names::STANDARDS_WITHHELD): 1,
+            })),
+            super::StandardLookup::Absent => Ok(
+                json!({"namespace": namespace, (field_names::STANDARD_ID): id, "warning": "standard memory not found — may have been deleted"}),
+            ),
+        },
         None => Ok(json!({"namespace": namespace, (field_names::STANDARD_ID): null})),
     }
 }
@@ -871,7 +909,7 @@ mod tests {
     #[test]
     fn get_standard_missing_namespace_errors() {
         let conn = fresh_conn();
-        let err = handle_namespace_get_standard(&conn, &json!({})).unwrap_err();
+        let err = handle_namespace_get_standard(&conn, &json!({}), None).unwrap_err();
         assert!(err.contains("namespace"), "got: {err}");
     }
 
@@ -879,8 +917,8 @@ mod tests {
     #[test]
     fn get_standard_unknown_namespace_returns_null() {
         let conn = fresh_conn();
-        let resp =
-            handle_namespace_get_standard(&conn, &json!({"namespace": "no-such"})).expect("ok");
+        let resp = handle_namespace_get_standard(&conn, &json!({"namespace": "no-such"}), None)
+            .expect("ok");
         assert!(resp["standard_id"].is_null());
     }
 
@@ -890,8 +928,8 @@ mod tests {
         let conn = fresh_conn();
         let id = insert_one(&conn, "ns-get", "got");
         db::set_namespace_standard(&conn, "ns-get", &id, None).unwrap();
-        let resp =
-            handle_namespace_get_standard(&conn, &json!({"namespace": "ns-get"})).expect("ok");
+        let resp = handle_namespace_get_standard(&conn, &json!({"namespace": "ns-get"}), None)
+            .expect("ok");
         assert_eq!(resp["standard_id"].as_str(), Some(id.as_str()));
         assert_eq!(resp["title"].as_str(), Some("got"));
         // governance defaults filled in.
@@ -907,8 +945,8 @@ mod tests {
         // Now physically delete the memory row.
         conn.execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![&id])
             .unwrap();
-        let resp =
-            handle_namespace_get_standard(&conn, &json!({"namespace": "ns-dangling"})).expect("ok");
+        let resp = handle_namespace_get_standard(&conn, &json!({"namespace": "ns-dangling"}), None)
+            .expect("ok");
         assert!(resp["warning"].is_string());
     }
 
@@ -920,9 +958,12 @@ mod tests {
         db::set_namespace_standard(&conn, "*", &global_id, None).unwrap();
         let leaf_id = insert_one(&conn, "leaf-ns", "leaf");
         db::set_namespace_standard(&conn, "leaf-ns", &leaf_id, None).unwrap();
-        let resp =
-            handle_namespace_get_standard(&conn, &json!({"namespace": "leaf-ns", "inherit": true}))
-                .expect("ok");
+        let resp = handle_namespace_get_standard(
+            &conn,
+            &json!({"namespace": "leaf-ns", "inherit": true}),
+            None,
+        )
+        .expect("ok");
         assert!(resp["chain"].is_array());
         assert!(resp["count"].as_u64().unwrap() >= 1);
     }

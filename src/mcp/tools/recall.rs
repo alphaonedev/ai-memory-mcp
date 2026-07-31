@@ -1280,7 +1280,7 @@ pub fn handle_recall_dto(
                     if confidence_tier_filter.is_some() {
                         insert_confidence_filter_meta(&mut resp, confidence_filtered_out);
                     }
-                    super::inject_namespace_standard(conn, namespace, &mut resp);
+                    super::inject_namespace_standard(conn, namespace, caller, &mut resp);
                     return Ok(resp);
                 }
 
@@ -1320,7 +1320,7 @@ pub fn handle_recall_dto(
                 if confidence_tier_filter.is_some() {
                     insert_confidence_filter_meta(&mut resp, confidence_filtered_out);
                 }
-                super::inject_namespace_standard(conn, namespace, &mut resp);
+                super::inject_namespace_standard(conn, namespace, caller, &mut resp);
                 return Ok(resp);
             }
             Err(e) => {
@@ -1396,7 +1396,7 @@ pub fn handle_recall_dto(
     if confidence_tier_filter.is_some() {
         insert_confidence_filter_meta(&mut resp, confidence_filtered_out);
     }
-    super::inject_namespace_standard(conn, namespace, &mut resp);
+    super::inject_namespace_standard(conn, namespace, caller, &mut resp);
     Ok(resp)
 }
 
