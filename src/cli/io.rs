@@ -441,13 +441,25 @@ pub(crate) fn import_from_str(
         // they are steady-state on any repeated restore, and an
         // in-place-edited row lands in `archived_memories` by #1725, so
         // counting them would pin a re-import forever-red (objection O9).
-        let refused = report.invalid_skipped
+        let covenant =
+            report.tombstoned_skipped + report.archived_skipped + report.tombstones_skipped_live;
+        let mut refused = report.invalid_skipped
             + report.invalid_links_skipped
-            + report.links_skipped_missing_endpoint
             + report.conflicts_skipped
             + report.forged_signature_skipped
             + report.governance_rejected;
-        return Ok(import_exit_code(refused, out)?);
+        // An endpoint-missing link skip is a reconstruction FAILURE only when
+        // no covenant skip fired in this bundle. Otherwise it is the
+        // downstream consequence of an honoured erasure / archival — and
+        // because #1725 puts every in-place-edited row into
+        // `archived_memories`, counting it would pin a repeat restore of an
+        // edited corpus forever-red, which ends as `|| true`. The v2 report
+        // does not attribute WHICH endpoint went missing, so attribute
+        // conservatively rather than manufacture a permanent alarm.
+        if covenant == 0 {
+            refused += report.links_skipped_missing_endpoint;
+        }
+        return import_exit_code(refused, out);
     }
 
     let memories: Vec<models::Memory> =
