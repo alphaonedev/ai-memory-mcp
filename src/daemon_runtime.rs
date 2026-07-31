@@ -5889,7 +5889,24 @@ pub async fn bootstrap_serve(
     // connection, so its multi-second O(corpus) pass can never block the
     // O(1) probe (which would silently re-create the probe-timeout kill
     // this change exists to remove).
-    let fts_integrity_interval = crate::background::fts_integrity::resolve_interval();
+    //
+    // SQLITE ONLY, and that is a correctness gate rather than an
+    // optimisation: `db_path` names the local sqlite file, which on a
+    // `--store-url postgres://…` daemon is a near-empty sidecar, NOT the
+    // corpus being served. Checking it there and rendering the verdict at
+    // `/health` would assert integrity over a database nobody reads — the
+    // #2444 "reports success while doing nothing" shape, manufactured by
+    // the very change that removes it. A postgres daemon leaves the status
+    // at its `Default` (interval `0`), so `/health` renders
+    // `fts_integrity: disabled` next to `checks.fts_index: not_applicable`
+    // (postgres has no FTS5 index — it uses a stored `tsvector` + GIN).
+    let fts_integrity_enabled =
+        !matches!(storage_backend, crate::handlers::StorageBackend::Postgres);
+    let fts_integrity_interval = if fts_integrity_enabled {
+        crate::background::fts_integrity::resolve_interval()
+    } else {
+        Duration::from_secs(0)
+    };
     let fts_integrity_status =
         Arc::clone(&crate::runtime_context::RuntimeContext::global_arc().fts_integrity);
     fts_integrity_status.set_interval_secs(fts_integrity_interval.as_secs());
@@ -6032,6 +6049,9 @@ pub async fn bootstrap_serve(
     // prepared as a WRITER: under the daemon's single mutex it would block
     // every reader — `/health` included — for its whole O(corpus) duration.
     // Jittered so a fleet restarting together does not check in lockstep.
+    // A zero interval (postgres backend, or an operator opt-out) makes the
+    // spawned task return immediately; the handle is still pushed so the
+    // spawn list stays uniform.
     task_handles.push(crate::background::fts_integrity::spawn(
         db_path.to_path_buf(),
         Arc::clone(&fts_integrity_status),
@@ -6042,10 +6062,19 @@ pub async fn bootstrap_serve(
     // scrape renders a pre-computed number instead of running `db::stats`
     // (eight statements, of which the scrape used one) per request while
     // holding the DB mutex.
-    task_handles.push(crate::background::memories_gauge::spawn(
-        db_state.clone(),
-        crate::background::memories_gauge::resolve_interval(),
-    ));
+    //
+    // SQLITE ONLY, for the same reason as the checker above: `db_state` is
+    // the local sqlite handle, so on a postgres-backed daemon a count taken
+    // here would describe the sidecar rather than the served corpus. That
+    // is a PRE-EXISTING defect of this gauge — `prometheus_metrics` has
+    // always read the sqlite `Db` regardless of backend — and it is filed
+    // separately rather than entrenched here by pacing a wrong number.
+    if !matches!(storage_backend, crate::handlers::StorageBackend::Postgres) {
+        task_handles.push(crate::background::memories_gauge::spawn(
+            db_state.clone(),
+            crate::background::memories_gauge::resolve_interval(),
+        ));
+    }
 
     // v0.9.0 P0-1 (#1869) — recall-access FOLD loops. The dedicated
     // sqlite-ledger loop (default 60 s) + the postgres SAL loop each live
@@ -8909,21 +8938,34 @@ mod tests {
         assert!(bs.app_state.embedder.is_none());
         let vi = bs.app_state.vector_index.lock().await;
         assert!(vi.is_none());
-        // Nine task handles spawned (v0.7 policy-engine item 3 added
-        // the deferred-audit supervisor + gc + wal_checkpoint +
-        // v0.7 K2 pending_actions timeout sweep + v0.7 I3 transcript
-        // archive→prune lifecycle sweep + v0.7 K8 agent_quotas
-        // daily-counter reset sweep + #1690 offloaded_blobs TTL sweep +
-        // #1709 Pillar-1 expired-lease reclaim sweep + #1869 P0-1
-        // recall-access fold loop, spawned whenever
-        // AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS != 0 — the default).
+        // TEN task handles on a sqlite keyword-tier boot: the v0.7
+        // policy-engine item-3 deferred-audit supervisor + gc +
+        // wal_checkpoint + v0.7 K2 pending_actions timeout sweep +
+        // v0.7 I3 transcript archive→prune lifecycle sweep + v0.7 K8
+        // agent_quotas daily-counter reset sweep + #1690 offloaded_blobs
+        // TTL sweep + #1709 Pillar-1 expired-lease reclaim sweep +
+        // #1869 P0-1 recall-access fold loop (spawned whenever
+        // AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS != 0 — the default) +
+        // #2579 the paced FTS5 integrity checker + #2583 the paced
+        // corpus-size gauge refresher.
+        //
+        // 2026-07-31 (#2579/#2583) — 8 -> 10. The prose above previously
+        // read "Nine" while the assertion read 8, so the count is now
+        // spelled ONCE, in the assertion, and this comment enumerates the
+        // members rather than restating the total. The #2579 checker's
+        // handle is pushed even when its interval is 0 (postgres backend,
+        // or an operator opt-out): the task returns immediately, but the
+        // spawn list stays uniform so this pin does not become
+        // backend-dependent. The #2583 refresher is NOT pushed on a
+        // postgres backend — it would be counting the sqlite sidecar (see
+        // the gate site + #2621) — so a postgres boot has one fewer.
+        //
         // v0.7 B3-fix2 gates the family-descriptor embedding precompute
         // behind `AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS=1` (default OFF)
         // so it does not contend with HTTP request-path embeds under
         // parallel CI load — see the gate site in `bootstrap_serve`
-        // for the rationale. The task count reverts to nine when the
-        // env var is unset.
-        assert_eq!(bs.task_handles.len(), 8);
+        // for the rationale; it is NOT one of the ten.
+        assert_eq!(bs.task_handles.len(), 10);
         // Cleanly abort the spawned tasks so they don't leak across tests.
         for h in bs.task_handles {
             h.abort();
