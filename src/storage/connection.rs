@@ -198,14 +198,43 @@ pub fn probe_schema_stamp(conn: &Connection) -> Result<SchemaStamp> {
 /// than this binary's ladder produces, or the probe failure when the recorded
 /// version cannot be read.
 pub fn assert_schema_not_ahead(conn: &Connection, target: &str) -> Result<()> {
-    let stamp = probe_schema_stamp(conn)?;
-    super::schema_guard::evaluate(
-        stamp.version(),
-        super::migrations::current_schema_version(),
-        BACKEND_SQLITE,
-        target,
-    )?;
-    Ok(())
+    resolve_schema_posture(conn, target).map(|_| ())
+}
+
+/// v1.0.0 #2445 — the guard's verdict, for the ONE caller that must act on the
+/// difference between "permitted normally" and "permitted only by the hatch".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaPosture {
+    /// `observed <= supported` — the ordinary steady-state / upgrade case.
+    Normal,
+    /// `observed > supported`, admitted ONLY because the operator hatch names
+    /// this exact version. The database must be handed back EXACTLY as found.
+    AheadButAuthorised,
+}
+
+/// v1.0.0 #2445 — evaluate the guard and report WHICH way it passed.
+///
+/// [`assert_schema_not_ahead`] is the ergonomic wrapper for call sites that
+/// only need pass/fail. [`open`] needs the distinction: under the hatch it must
+/// SKIP the bootstrap DDL, the ladder and the trigger install, because
+/// replaying an older binary's `CREATE … IF NOT EXISTS` set over a newer
+/// database is the #2424 class — the exact window the guard exists to close. A
+/// hatch that re-opened it would be worse than no guard at all.
+///
+/// # Errors
+///
+/// [`super::schema_guard::SchemaAheadOfBinary`] when the database is newer than
+/// this binary's ladder produces and no matching hatch is in force, or the
+/// probe failure when the recorded version cannot be read.
+pub fn resolve_schema_posture(conn: &Connection, target: &str) -> Result<SchemaPosture> {
+    let observed = probe_schema_stamp(conn)?.version();
+    let supported = super::migrations::current_schema_version();
+    super::schema_guard::evaluate(observed, supported, BACKEND_SQLITE, target)?;
+    Ok(if observed > supported {
+        SchemaPosture::AheadButAuthorised
+    } else {
+        SchemaPosture::Normal
+    })
 }
 
 /// Shared pragma application for [`open`] and [`open_unmigrated`] so the two
@@ -264,7 +293,19 @@ pub fn open(path: &Path) -> Result<Connection> {
     // EXISTS` bootstrap set replaying over a NEWER database first, which can
     // resurrect a table or index the newer ladder deliberately removed. #2424
     // proved bootstrap-vs-ladder shape disagreement is a live class here.
-    assert_schema_not_ahead(&conn, &path.display().to_string())?;
+    if resolve_schema_posture(&conn, &path.display().to_string())?
+        == SchemaPosture::AheadButAuthorised
+    {
+        // The operator hatch authorised THIS database. Hand it back exactly as
+        // found: no bootstrap replay, no ladder, no trigger install, and no
+        // rollback-evidence check (that check APPENDS a signed evidence row,
+        // and appending to `signed_events` — one of the very tables whose shape
+        // is in question — is precisely what must not happen here). Skipping
+        // the bootstrap is not an optimisation: replaying an older binary's
+        // `CREATE … IF NOT EXISTS` set over a newer schema is the #2424 class,
+        // so a hatch that ran it would re-open the window the guard closes.
+        return Ok(conn);
+    }
     conn.execute_batch(SCHEMA)
         .context("failed to initialize schema")?;
     migrate(&conn)?;

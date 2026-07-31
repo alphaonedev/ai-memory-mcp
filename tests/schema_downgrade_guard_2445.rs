@@ -264,7 +264,22 @@ fn the_exact_version_hatch_admits_and_skips_the_bootstrap_replay() {
         conn.execute_batch("CREATE TABLE future_v92_table (x TEXT)")
             .unwrap();
     }
+    // Drop an index the BOOTSTRAP `SCHEMA` const creates. This is what makes
+    // the assertion below non-vacuous: if the hatch replayed the bootstrap, the
+    // index would come back. Asserting only "the fingerprint did not change"
+    // passes even when the bootstrap DOES run, because every statement in it is
+    // `IF NOT EXISTS` and therefore a no-op on an already-complete database —
+    // i.e. the obvious assertion cannot tell the two implementations apart.
+    {
+        let conn = ai_memory::db::open_unmigrated(&path).unwrap();
+        conn.execute_batch("DROP INDEX IF EXISTS idx_memories_tier")
+            .unwrap();
+    }
     let before = structure_fingerprint(&path);
+    assert!(
+        !before.0.iter().any(|(n, _)| n == "idx_memories_tier"),
+        "fixture precondition: the bootstrap index must be absent before the open"
+    );
 
     // SAFETY: serialised by `_g`.
     unsafe { std::env::set_var(ENV_ALLOW_SCHEMA_AHEAD, ahead.to_string()) };
@@ -280,11 +295,16 @@ fn the_exact_version_hatch_admits_and_skips_the_bootstrap_replay() {
     // SAFETY: serialised by `_g`.
     unsafe { std::env::remove_var(ENV_ALLOW_SCHEMA_AHEAD) };
 
+    let after = structure_fingerprint(&path);
+    assert!(
+        !after.0.iter().any(|(n, _)| n == "idx_memories_tier"),
+        "the hatch must NOT replay this binary's bootstrap DDL over a newer \
+         database — the dropped bootstrap index came back, so `execute_batch(SCHEMA)` ran"
+    );
     assert_eq!(
-        structure_fingerprint(&path),
-        before,
-        "the hatch must NOT replay this binary's bootstrap DDL or ladder over a \
-         newer database — that is the very window the guard exists to close"
+        after, before,
+        "the hatch must leave the database EXACTLY as found — no bootstrap, no \
+         ladder, no trigger install"
     );
 }
 
