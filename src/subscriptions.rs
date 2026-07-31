@@ -938,6 +938,8 @@ pub fn dispatch_event_to_subs(
             // thread exit. Same audit posture as the pre-#1072
             // path — every write site is best-effort and logs on
             // failure.
+            // #2445 — raw open, ORDERING-covered only; see the disposition +
+            // pinned count in tests/db_open_funnel_ceiling_2445.rs.
             let worker_conn = match Connection::open(&db_path) {
                 Ok(c) => Some(c),
                 Err(e) => {

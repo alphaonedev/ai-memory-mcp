@@ -554,14 +554,34 @@ fn run_local(db_path: &Path) -> Report {
     let conn = match db::open(db_path) {
         Ok(c) => c,
         Err(e) => {
+            // v1.0.0 #2445 — name the schema-AHEAD refusal explicitly. `doctor`
+            // is the other verb (with `boot`) an operator reaches for when a
+            // downgraded node will not start, so the one diagnosis it must not
+            // flatten into "could not open database" is the one that says
+            // exactly which binary version to install.
+            let ahead = crate::storage::schema_guard::schema_ahead_of(&e);
+            let mut facts = vec![("error".into(), e.to_string())];
+            if let Some(a) = ahead {
+                facts.push(("db_schema".into(), a.observed.to_string()));
+                facts.push(("binary_supports_schema".into(), a.supported.to_string()));
+            }
             sections.push(ReportSection {
                 name: "Storage".into(),
                 severity: Severity::Critical,
-                facts: vec![("error".into(), e.to_string())],
-                note: Some(format!(
-                    "could not open database at {} — every other section is N/A",
-                    db_path.display()
-                )),
+                facts,
+                note: Some(if ahead.is_some() {
+                    format!(
+                        "database at {} is on a schema NEWER than this binary — refusing \
+                         to operate it. Every other section is N/A. `ai-memory backup` \
+                         still works against this database.",
+                        db_path.display()
+                    )
+                } else {
+                    format!(
+                        "could not open database at {} — every other section is N/A",
+                        db_path.display()
+                    )
+                }),
             });
             return Report {
                 mode: "local".into(),

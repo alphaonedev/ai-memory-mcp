@@ -754,7 +754,11 @@ pub mod model_attest;
 /// the sal-gated `crate::store`) so record-stop compiles + works in the
 /// default (non-`sal`) sqlite build. The sal surface wraps it.
 pub mod record_stop;
+// v1.0.0 #2445 — the schema DOWNGRADE guard (an OLDER binary must not
+// silently open and WRITE a NEWER database). Its own module so the pure
+// verdict is shared verbatim by the sqlite and postgres funnels.
 pub(crate) mod reflect;
+pub mod schema_guard;
 
 // #1802 S1 — itemized re-export shim for the extracted doctor module
 // (M-NO-GLOB-REEXPORTS: explicit list, so any accidental visibility
@@ -775,6 +779,8 @@ pub use doctor::{
 pub use connection::open;
 // #1580 — read-only connection opener for the HTTP WAL read-pool.
 pub use connection::open_read_only;
+// v1.0.0 #2445 — the EGRESS + guard surface (see `schema_guard` module docs).
+pub use connection::{assert_schema_not_ahead, open_unmigrated, probe_schema_stamp};
 // #1579 B7 — mmap_size knob. `set_db_mmap_size` is the boot-time
 // seeding hook (`daemon_runtime::run`); the DEFAULT const is the
 // compiled fallback the `AppConfig::resolve_storage()` ladder bottoms

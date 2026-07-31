@@ -309,7 +309,29 @@ pub fn run_backup(
     // SQLite VACUUM INTO is hot-backup-safe and produces a defragmented
     // file. Equivalent to `sqlite3 source '.backup dest'` in effect but
     // runs in-process via our existing connection.
-    let conn = db::open(&source_db).context("opening source DB for backup")?;
+    // v1.0.0 #2445 — EGRESS FALLBACK. `db::open` now REFUSES a database whose
+    // schema is ahead of this binary, and that refusal must never cost the
+    // operator their backup: snapshotting the durable text is the FIRST thing
+    // a competent operator does in exactly this incident, and `VACUUM INTO`
+    // copies bytes it does not have to understand. So on that ONE typed error
+    // we re-open through the unmigrated funnel (no bootstrap DDL, no ladder,
+    // no trigger install) and proceed. Every other open failure still
+    // propagates. `open_read_only` cannot serve this path — `PRAGMA
+    // query_only = ON` refuses `VACUUM INTO` (verified, not assumed).
+    let conn = match db::open(&source_db) {
+        Ok(conn) => conn,
+        Err(e) if crate::storage::schema_guard::schema_ahead_of(&e).is_some() => {
+            tracing::warn!(
+                target: crate::storage::schema_guard::TRACE_TARGET,
+                error = %e,
+                "database schema is ahead of this binary — taking the snapshot anyway \
+                 through the read-oriented funnel so the durable text is preserved"
+            );
+            db::open_unmigrated(&source_db)
+                .context("opening source DB for backup (schema-ahead fallback)")?
+        }
+        Err(e) => return Err(e.context("opening source DB for backup")),
+    };
     // #2444 — provenance recorded INTO the manifest so the artifact is
     // self-describing: which backend produced it, which migration ladder it is
     // on, and how many memories it actually contains.
@@ -588,6 +610,28 @@ pub fn run_restore(
                     snapshot_path.display()
                 )
             })?;
+        // v1.0.0 #2445 — MANIFEST-INDEPENDENT forward-schema refusal. The
+        // #2444 check above reads `manifest.schema_version`, and the whole
+        // manifest block is nested inside `if !args.skip_verify` — so
+        // `restore --skip-verify` (the ONLY way to restore the manifest-less
+        // pre-migration snapshot that `snapshot_before_migration` writes)
+        // bypassed it entirely and could plant a database nothing on this host
+        // can then open. The probe connection is already here and already
+        // read-only, so re-deriving the truth from the FILE costs one query
+        // and cannot be skipped.
+        let stamp = crate::storage::probe_schema_stamp(&probe).with_context(|| {
+            format!(
+                "cannot read the schema version of snapshot {} — refusing to \
+                 restore it over the live corpus (#2445)",
+                snapshot_path.display()
+            )
+        })?;
+        crate::storage::schema_guard::evaluate(
+            stamp.version(),
+            crate::storage::migrations::current_schema_version(),
+            crate::storage::schema_guard::BACKEND_SQLITE,
+            &snapshot_path.display().to_string(),
+        )?;
     }
 
     // Move current DB aside as a safety net (only if it exists).

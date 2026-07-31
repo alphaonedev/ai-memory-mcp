@@ -39,6 +39,7 @@
 //! | Env knob | Hard floor | What it forces |
 //! |---|---|---|
 //! | `AI_MEMORY_SECRET_SCREEN_MODE` | `refuse` | pre-write credential screen refuses secrets (not `off`/`redact`) |
+//! | `AI_MEMORY_ALLOW_SCHEMA_AHEAD` | (unset) | the #2445 schema-downgrade hatch is refused — an older binary may not open/write a newer database |
 //! | `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` | `1` | unsigned direct writes refused on EVERY surface |
 //! | `AI_MEMORY_FED_REQUIRE_WRITE_SIG` | `1` | inbound relayed memories must carry a verified per-write signature |
 //! | `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG` | `1` | inbound relayed signals must verify against the enrolled author key |
@@ -178,6 +179,18 @@ fn synchronous_meets_floor(v: &str) -> bool {
     matches!(v.trim().to_ascii_uppercase().as_str(), "FULL" | "EXTRA")
 }
 
+/// v1.0.0 #2445 — `AI_MEMORY_ALLOW_SCHEMA_AHEAD` floor: it must be UNSET (or
+/// blank). This is the first PERMISSIVE knob in the table, so its floor is the
+/// inverse shape of the others — "hard" means the hatch is not in force.
+///
+/// Without this entry an `asi-hard` deployment would still permit an older
+/// binary to open and write a newer database, i.e. the hardened PROCUREMENT
+/// posture would be silently weaker than the no-disable contract advertises —
+/// the exact defect #2448 fixed for `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY`.
+fn schema_ahead_hatch_meets_floor(v: &str) -> bool {
+    v.trim().is_empty()
+}
+
 /// The pinned-knob table. SSOT for the module docs table above and the
 /// [`pinned_knobs`] accessor; the `asi_hard_pins_documented_set` test pins
 /// the two in agreement.
@@ -186,6 +199,11 @@ const KNOBS: &[KnobSpec] = &[
         env: "AI_MEMORY_SECRET_SCREEN_MODE",
         hard_value: "refuse",
         meets_floor: secret_screen_meets_floor,
+    },
+    KnobSpec {
+        env: crate::storage::schema_guard::ENV_ALLOW_SCHEMA_AHEAD,
+        hard_value: "",
+        meets_floor: schema_ahead_hatch_meets_floor,
     },
     KnobSpec {
         env: "AI_MEMORY_REQUIRE_AGENT_ATTESTATION",
@@ -621,7 +639,7 @@ mod tests {
         // The pinned set must match the documented count so the module
         // docs table and the KNOBS SSOT cannot silently drift.
         let pins = pinned_knobs();
-        assert_eq!(pins.len(), 15, "documented asi-hard knob count");
+        assert_eq!(pins.len(), 16, "documented asi-hard knob count");
         // Every pin's env name is non-empty and the durability pin is FULL.
         assert!(pins.iter().all(|(e, _)| !e.is_empty()));
         assert!(
