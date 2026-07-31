@@ -216,6 +216,31 @@ pub const PORTABILITY_COMPLETE: &str = "portability_complete";
 /// `excludes` — additive `ai-memory export` marker (#1944): the signed
 /// record classes the JSON convenience export omits.
 pub const EXCLUDES: &str = "excludes";
+/// `withheld` — additive `ai-memory export` marker (#2490): the
+/// machine-readable accounting of rows present in the corpus that the
+/// artifact does NOT carry (forbidden-class drops + quarantined), plus the
+/// count of rows whose bytes the secret screen ALTERED. Counts and a class
+/// histogram only — the ids ride the operator stderr channel, never the
+/// portable artifact.
+pub const WITHHELD: &str = "withheld";
+/// `withheld_by_class` — the class histogram nested under [`WITHHELD`].
+pub const WITHHELD_BY_CLASS: &str = "withheld_by_class";
+/// `withheld_ids` — operator-channel-only list of withheld ids (#2490).
+/// NEVER written into the portable export artifact.
+pub const WITHHELD_IDS: &str = "withheld_ids";
+/// `redacted` — count of exported rows whose stored bytes the secret screen
+/// ALTERED (#2490).
+pub const REDACTED: &str = "redacted";
+/// `redacted_ids` — operator-channel-only sibling of [`REDACTED`] (#2490).
+pub const REDACTED_IDS: &str = "redacted_ids";
+/// `quarantined` — count of live rows the SQL lifecycle allow-list excluded
+/// from the export because they are quarantined (#2490 / #1948).
+pub const QUARANTINED: &str = "quarantined";
+/// `tombstoned` — count of live rows excluded as tombstoned (#2490).
+pub const TOMBSTONED: &str = "tombstoned";
+/// `expired` — count of live rows excluded because their TTL has passed
+/// (#2490).
+pub const EXPIRED: &str = "expired";
 /// `from_agent_id` — wire/row field name.
 pub const FROM_AGENT_ID: &str = "from_agent_id";
 /// `generated_at` — wire/row field name.

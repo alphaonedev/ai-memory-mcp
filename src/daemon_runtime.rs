@@ -1443,7 +1443,13 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            cli::io::export(&db_path, &a, &mut out)
+            // #2490 — `export` returns a code so a PARTIAL export exits
+            // non-zero (distinctly from a crash) while still emitting the
+            // artifact. Mirrors the `Command::Config` precedent above.
+            match cli::io::export(&db_path, &a, &mut out)? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
         }
         Command::Import(a) => {
             let stdout = std::io::stdout();
@@ -1451,7 +1457,12 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            cli::io::import(&db_path, &a, j, cli_agent_id.as_deref(), &mut out)
+            // #2490 — non-zero when the bundle could not be faithfully
+            // reconstructed at the destination.
+            match cli::io::import(&db_path, &a, j, cli_agent_id.as_deref(), &mut out)? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
         }
         Command::Completions(a) => {
             generate(
