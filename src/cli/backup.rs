@@ -125,10 +125,62 @@ pub struct BackupManifest {
 /// (`AI_MEMORY_STORE_URL_FILE` > `AI_MEMORY_STORE_URL` > the `--store-url`
 /// argument, #1927) — so `backup` reads the store from the same channels
 /// `serve` does rather than re-deriving its own notion of it.
+/// v1.0.0 #2490 — what [`resolve_sqlite_store`] does when a `sqlite://`
+/// store URL names a DIFFERENT file than `--db`.
+///
+/// The #2444 disposition (kept for `backup` / `restore` / `export`) is to
+/// act on the CONFIGURED store and say so loudly, because the store URL is
+/// authoritative for `serve`. That is right for a READ: the worst case is
+/// snapshotting the wrong file, which costs time.
+///
+/// It is NOT right for a WRITE. `docs/postgres-age-guide.md` and
+/// `docs/production-deployment.md` both instruct operators to `export
+/// AI_MEMORY_STORE_URL` at shell/cron scope, so an ambient sqlite store URL
+/// would silently redirect `ai-memory --db ./scratch.db import < bundle.json`
+/// into the deployment's REAL database — turning a scratch import into a
+/// production write behind a one-line `note:`. A write verb REFUSES the
+/// disagreement instead (5-agent vote 4d3ea1c5, falsification-lens F5, the
+/// single biggest risk identified in the review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoreDisagreement {
+    /// READ verbs: act on the configured store, note it on stderr (#2444).
+    RedirectWithNote,
+    /// WRITE verbs: refuse rather than write to a file the operator did not
+    /// name on the command line.
+    Refuse,
+}
+
+/// `backup` / `restore` entry point — the #2444 read-verb disposition.
 fn resolve_sqlite_source(
     db_path: &Path,
     store_url_arg: Option<&str>,
     verb: &str,
+    out: &mut CliOutput<'_>,
+) -> Result<PathBuf> {
+    resolve_sqlite_store(
+        db_path,
+        store_url_arg,
+        verb,
+        StoreDisagreement::RedirectWithNote,
+        out,
+    )
+}
+
+/// v1.0.0 #2490 — the shared store-resolution gate, reused verbatim by
+/// `export` / `export --full` / `import` so the refusal SET cannot drift
+/// between the durability verbs.
+///
+/// # Errors
+///
+/// Refuses (never falls back to `--db`) on: a Postgres store URL, an
+/// unrecognised scheme, an argv/env store-URL disagreement, an empty
+/// `sqlite://` path, and — under [`StoreDisagreement::Refuse`] — a
+/// `sqlite://` path that disagrees with `--db`.
+pub(crate) fn resolve_sqlite_store(
+    db_path: &Path,
+    store_url_arg: Option<&str>,
+    verb: &str,
+    disagreement: StoreDisagreement,
     out: &mut CliOutput<'_>,
 ) -> Result<PathBuf> {
     use crate::daemon_runtime::{SQLITE_URL_SCHEME, is_postgres_url, resolve_store_url};
@@ -162,11 +214,11 @@ fn resolve_sqlite_source(
 
     if is_postgres_url(&url) {
         anyhow::bail!(
-            "`ai-memory {verb}` captures a local SQLite database only, but this \
+            "`ai-memory {verb}` acts on a local SQLite database only, but this \
              deployment's configured store is Postgres ({}). Refusing — a SQLite \
-             snapshot would NOT contain the corpus, and a restore from it would \
+             artifact would NOT contain the corpus, and a restore from it would \
              silently return nothing. Use `pg_dump` (or `pg_basebackup` + WAL \
-             archiving) instead; see docs/production-deployment.md (#2444).",
+             archiving) instead; see docs/production-deployment.md (#2444, #2490).",
             redact_url_password(&url)
         );
     }
@@ -186,15 +238,34 @@ fn resolve_sqlite_source(
         }
         let resolved = PathBuf::from(clean);
         if resolved != db_path {
-            // The store URL is authoritative for `serve` (`build_store_handle`
-            // takes it over `--db`), so it is authoritative here too. Say so
-            // loudly rather than silently capturing a different file.
-            writeln!(
-                out.stderr,
-                "note: acting on the configured store {} (the --db path {} is not the store)",
-                resolved.display(),
-                db_path.display()
-            )?;
+            match disagreement {
+                StoreDisagreement::RedirectWithNote => {
+                    // The store URL is authoritative for `serve`
+                    // (`build_store_handle` takes it over `--db`), so it is
+                    // authoritative here too. Say so loudly rather than
+                    // silently capturing a different file.
+                    writeln!(
+                        out.stderr,
+                        "note: acting on the configured store {} (the --db path {} is not the store)",
+                        resolved.display(),
+                        db_path.display()
+                    )?;
+                }
+                StoreDisagreement::Refuse => {
+                    // #2490 — `{verb}` WRITES. Redirecting a write to a file
+                    // the operator did not name is worse than refusing it.
+                    anyhow::bail!(
+                        "ambiguous target: the configured store is {} but --db names {}. \
+                         Refusing — `ai-memory {verb}` WRITES, and an ambient \
+                         AI_MEMORY_STORE_URL (the documented cron/shell posture) would \
+                         otherwise redirect this write into a database you did not name \
+                         on the command line. Point --db at the configured store, or \
+                         unset the store URL for this invocation (#2490).",
+                        resolved.display(),
+                        db_path.display()
+                    );
+                }
+            }
         }
         return Ok(resolved);
     }

@@ -13360,6 +13360,60 @@ pub fn export_all(conn: &Connection) -> Result<Vec<Memory>> {
         .map_err(Into::into)
 }
 
+/// v1.0.0 #2490 — the rows `export_all` excluded IN SQL, before any
+/// screening ran: `(quarantined, tombstoned, expired)`.
+///
+/// # Why this exists
+///
+/// [`export_all`]'s predicate drops expired rows and applies the fail-closed
+/// [`crate::models::lifecycle_visible_clause`] allow-list, so `Quarantined`
+/// and `Tombstoned` rows never reach
+/// [`crate::export_taxonomy::screen_memories_for_export_audited`] and would
+/// be invisible to a withheld-count derived from the screen alone. On a node
+/// running `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED=1` (#1948) that is real
+/// corpus data missing from the artifact while the export reports `0`
+/// withheld — the same false-success shape #2490 exists to close, merely
+/// relocated one layer down (5-agent vote 4d3ea1c5, objection O4).
+///
+/// The three are returned SEPARATELY because they are not the same event:
+/// a quarantined row is data this node is withholding pending attestation
+/// (partial), while a tombstone IS the erasure receipt and an expiry IS the
+/// retention policy (reported, never counted as loss).
+///
+/// # Errors
+///
+/// Propagates the underlying sqlite error.
+pub fn export_excluded_counts(conn: &Connection) -> Result<(usize, usize, usize)> {
+    use crate::models::LifecycleState;
+    let now = Utc::now().to_rfc3339();
+    let mut stmt = conn.prepare(
+        "SELECT
+            SUM(CASE WHEN lifecycle_state = ?2 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN lifecycle_state = ?3 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN expires_at IS NOT NULL AND expires_at <= ?1 THEN 1 ELSE 0 END)
+         FROM memories",
+    )?;
+    let row = stmt.query_row(
+        params![
+            now,
+            LifecycleState::Quarantined.as_str(),
+            LifecycleState::Tombstoned.as_str()
+        ],
+        |r| {
+            Ok((
+                r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+            ))
+        },
+    )?;
+    Ok((
+        usize::try_from(row.0).unwrap_or(0),
+        usize::try_from(row.1).unwrap_or(0),
+        usize::try_from(row.2).unwrap_or(0),
+    ))
+}
+
 pub fn export_links(conn: &Connection) -> Result<Vec<MemoryLink>> {
     let now = Utc::now().to_rfc3339();
     // v0.7 H3 — also pull the signature blob, the `observed_by` claim,

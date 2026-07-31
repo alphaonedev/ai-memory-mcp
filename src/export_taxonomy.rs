@@ -417,7 +417,34 @@ pub fn screen_memories_for_export(
     memories: Vec<crate::models::Memory>,
     audit_conn: Option<&Connection>,
 ) -> Vec<crate::models::Memory> {
-    memories
+    screen_memories_for_export_audited(memories, audit_conn).0
+}
+
+/// v1.0.0 #2490 — the ACCOUNTING sibling of
+/// [`screen_memories_for_export`]: identical screening, plus the ledger of
+/// exactly what was dropped and what was mutated.
+///
+/// The screen is a fail-closed confidentiality control and the drop itself
+/// is correct; what was a defect is that the drop was recorded ONLY via
+/// `tracing::warn!` (invisible on the CLI export path) and the signed
+/// refusal row lands in the SOURCE database — the one artefact a DR operator
+/// no longer has. The caller now has the counts to report on the operator
+/// channel and to set a non-zero exit, so a partial export can never again
+/// present as a complete one.
+///
+/// Behaviour is byte-identical to the pre-#2490 function for the surviving
+/// rows; [`screen_memories_for_export`] delegates here and discards the
+/// ledger, so every existing caller is unchanged.
+#[must_use]
+pub fn screen_memories_for_export_audited(
+    memories: Vec<crate::models::Memory>,
+    audit_conn: Option<&Connection>,
+) -> (
+    Vec<crate::models::Memory>,
+    crate::export_scope::ExportWithholdLedger,
+) {
+    let mut ledger = crate::export_scope::ExportWithholdLedger::default();
+    let kept = memories
         .into_iter()
         .filter_map(|m| {
             // (1) forbidden-class fail-closed drop (+ signed refusal, #1838).
@@ -445,12 +472,27 @@ pub fn screen_memories_for_export(
                     "export boundary dropped a {} memory — {path} withheld fail-closed",
                     class.as_str()
                 );
+                ledger.withheld_ids.push(m.id.clone());
+                *ledger
+                    .withheld_by_class
+                    .entry(class.as_str().to_string())
+                    .or_default() += 1;
                 return None;
             }
             // (2) secret-screen the survivor: content + title + tags + metadata.
-            Some(crate::secret_screen::redact_memory_for_storage(&m).unwrap_or(m))
+            // A `Some` return from `redact_memory_for_storage` means the row's
+            // stored bytes were ALTERED — record it, because re-importing that
+            // artifact would persist the masked text as the durable truth.
+            match crate::secret_screen::redact_memory_for_storage(&m) {
+                Some(redacted) => {
+                    ledger.redacted_ids.push(redacted.id.clone());
+                    Some(redacted)
+                }
+                None => Some(m),
+            }
         })
-        .collect()
+        .collect();
+    (kept, ledger)
 }
 
 #[cfg(test)]
