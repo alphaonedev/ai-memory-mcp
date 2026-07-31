@@ -1297,6 +1297,8 @@ pub async fn session_start(
             valid_at: None,
             limit,
             active_embedding_space: None,
+            // #2580 — metadata-equality pushdown axis unused on this path.
+            metadata_eq: None,
         };
         let ctx = crate::store::CallerContext::for_agent(&caller);
         return match app.store.list(&ctx, &filter).await {
