@@ -204,6 +204,27 @@ fn agent_not_registered_for_bind(agent_id: &str) -> StoreError {
 /// Bootstrap schema run at adapter init — idempotent via IF NOT EXISTS.
 const INIT_SCHEMA: &str = include_str!("postgres_schema.sql");
 
+/// v1.0.0 #2445 — presence probe for the `schema_version` relation. `NULL`
+/// means a genuinely FRESH database; the sqlite twin is
+/// `crate::storage::connection::probe_schema_stamp`.
+const SELECT_SCHEMA_VERSION_RELATION_SQL: &str = "SELECT to_regclass('schema_version')::text";
+
+/// v1.0.0 #2445 — the recorded version widened to `bigint` so the guard
+/// compares in ONE integer width on both backends. The column is `integer`, so
+/// the cast cannot overflow; without it sqlx would decode `INT4` and the two
+/// adapters would carry different widths through the same shared verdict.
+const SELECT_SCHEMA_VERSION_BIGINT_SQL: &str =
+    "SELECT COALESCE(MAX(version), 0)::bigint FROM schema_version";
+
+/// Context label for a failed `schema_version` relation probe (#2445).
+const MSG_PROBE_SCHEMA_VERSION_RELATION: &str = "probe for the schema_version relation";
+
+/// v1.0.0 #2445 — store label used by `migrate_locked`'s defense-in-depth
+/// guard, which has no DSN in scope. The `connect_*` gate that fires FIRST on
+/// every real open carries the redacted URL; this arm is only reachable by a
+/// direct trait-level `migrate()` call.
+const POSTGRES_STORE_LABEL: &str = "the configured postgres store";
+
 /// v0.7.0 Task 1/8 (recursive learning) — add `memories.reflection_depth`.
 /// Mirrors the SQLite v29 migration in `src/db.rs`. The body is in a
 /// separate SQL file so operators can inspect and replay the DDL outside
@@ -1102,7 +1123,45 @@ impl PostgresStore {
         // construction can consume it. `bootstrap_lock_conn` lives in
         // the outer scope with its own Arc ref to the pool, so the move
         // doesn't invalidate the lock-holding connection.
+        // v1.0.0 #2445 — operator-facing label for the downgrade guard, with
+        // any embedded DSN password scrubbed (#1579 A3 discipline).
+        let store_label = crate::logging::redact_urls_in_message(url);
+
         let bootstrap_result: StoreResult<Self> = async move {
+            // v1.0.0 #2445 — DOWNGRADE guard. Placed HERE: inside the bootstrap
+            // block so it holds `MIGRATION_ADVISORY_LOCK_KEY` (two racing
+            // daemons cannot both pass a check that is not under the lock), and
+            // BEFORE `raw_sql(init_sql)` so this binary's bootstrap DDL is
+            // never replayed over a NEWER database. `to_regclass` NULL means a
+            // genuinely fresh database; a failed READ propagates rather than
+            // being coerced to 0 (the sqlite `.unwrap_or(0)` defect this issue
+            // also fixed).
+            let relation: Option<String> =
+                sqlx::query_scalar(SELECT_SCHEMA_VERSION_RELATION_SQL)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|e| to_store_err(MSG_PROBE_SCHEMA_VERSION_RELATION, e))?;
+            let mut schema_ahead = false;
+            if relation.is_some() {
+                let observed: i64 = sqlx::query_scalar(SELECT_SCHEMA_VERSION_BIGINT_SQL)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|e| to_store_err(crate::errors::msg::READ_SCHEMA_VERSION, e))?;
+                crate::storage::schema_guard::evaluate(
+                    observed,
+                    i64::from(CURRENT_SCHEMA_VERSION),
+                    crate::storage::schema_guard::BACKEND_POSTGRES,
+                    &store_label,
+                )?;
+                // Reaching here with `observed` still ahead means the operator
+                // hatch authorised THIS database. Hand it back exactly as
+                // found: replaying an older binary's bootstrap DDL over a newer
+                // schema is the #2424 class and is precisely the window the
+                // guard exists to close, so a hatch that re-opened it would be
+                // worse than no guard at all.
+                schema_ahead = observed > i64::from(CURRENT_SCHEMA_VERSION);
+            }
+
             // Bootstrap schema — idempotent. The bundled template uses
             // `vector({EMBEDDING_DIM})` for the two vector columns; we
             // substitute the caller's chosen dim here. CREATE TABLE IF NOT
@@ -1114,7 +1173,11 @@ impl PostgresStore {
             // (e.g., a third process bypassing the lock entirely).
             let init_sql = render_schema_sql(INIT_SCHEMA, dim);
             let mut last_err: Option<sqlx::Error> = None;
-            for attempt in 0..5_u32 {
+            // v1.0.0 #2445 — `0` attempts when the operator hatch authorised a
+            // schema-AHEAD database: this binary's bootstrap set must not be
+            // replayed over a newer one (see the guard block above).
+            let init_attempts = if schema_ahead { 0 } else { 5_u32 };
+            for attempt in 0..init_attempts {
                 match sqlx::raw_sql(&init_sql).execute(&pool).await {
                     Ok(_) => {
                         last_err = None;
@@ -1247,7 +1310,12 @@ impl PostgresStore {
                 kg_backend,
                 record_stop: crate::store::record_stop::RecordStopFlag::default(),
             };
-            store.migrate_locked().await?;
+            // v1.0.0 #2445 — the ladder is skipped under the operator hatch for
+            // the same reason the bootstrap is: the database is AHEAD, so there
+            // is nothing to migrate and everything to preserve.
+            if !schema_ahead {
+                store.migrate_locked().await?;
+            }
             // #1955 R45 — derive the persisted record-stop state from the
             // audit chain so a stop set before this connect is honored.
             store.seed_record_stop().await;
@@ -1669,7 +1737,21 @@ impl PostgresStore {
 
         let current_version = current_version.unwrap_or(0);
 
-        if current_version >= CURRENT_SCHEMA_VERSION {
+        // v1.0.0 #2445 — DOWNGRADE guard, defense-in-depth behind the
+        // pre-bootstrap gate in `connect_*`. `>` refuses (an older binary
+        // writing a newer schema drops columns it does not know); `==` keeps
+        // the historical no-op fast path byte-for-byte.
+        if current_version > CURRENT_SCHEMA_VERSION {
+            crate::storage::schema_guard::evaluate(
+                i64::from(current_version),
+                i64::from(CURRENT_SCHEMA_VERSION),
+                crate::storage::schema_guard::BACKEND_POSTGRES,
+                POSTGRES_STORE_LABEL,
+            )?;
+            // Hatched: leave the database exactly as found (see `connect_*`).
+            return Ok(());
+        }
+        if current_version == CURRENT_SCHEMA_VERSION {
             return Ok(());
         }
 

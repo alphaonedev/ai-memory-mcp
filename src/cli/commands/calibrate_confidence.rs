@@ -97,6 +97,9 @@ pub fn run(db_path: &Path, args: &CalibrateConfidenceArgs, out: &mut CliOutput<'
     }
 
     let conn = Connection::open(db_path)?;
+    // v1.0.0 #2445 — raw-open WRITE funnel (`calibrate_from_shadow` UPDATEs
+    // `confidence_shadow_observations`).
+    crate::storage::assert_schema_not_ahead(&conn, &db_path.display().to_string())?;
     let report = calibrate_from_shadow(&conn, args.days, chrono::Utc::now())?;
 
     let buf = match args.output_format {

@@ -1038,7 +1038,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // (`resolve_governance_policy` + the in-tx walk inside
     // `enforce_governance_action`). MEASURED post-change: 32_196.
     // Ceiling 32_200 -> 32_300 (+104 headroom).
-    ("src/store/postgres.rs", 32_300),
+    ("src/store/postgres.rs", 32_400), /* 2026-07-31 #2445 schema-downgrade guard: pre-bootstrap probe + gate in the connect bootstrap, the migrate_locked `>` refusal split, and the four SSOT consts; measured 32_304 */
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -1366,7 +1366,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // the daemon_runtime.rs per-module COVERAGE floor. Combined with #2045 L6
     // this lands daemon_runtime.rs at 10_676; ceiling 10_500 → 10_750.
     ("src/daemon_runtime.rs", 11_640), /* 2026-07-17 #2167 extract run_sqlite_embedding_space_boot_maintenance helper + both-open-arms unit test to cover the boot-open Err arm (10_783). 2026-07-19 #2064 erasure gc-tick wiring stacked on the #2205 export --full + #1860 vectorlite serve/mcp boot funnels lands the merged file at 10_853; ceiling 10_850 -> 10_900 (lockstep). 2026-07-19 pre-ship 3x7: erasure sweep moved OFF the handler mutex (detached spawn_blocking arm + shared log helper) lands the file at 10_931; ceiling 10_900 -> 10_950 (lockstep). 2026-07-19 merged with the #2233/#2235 lineage boot-seed (+26) -> 10_957; ceiling 10_950 -> 11_000 (lockstep). 2026-07-19 #2271 consultation-posture mutation seam + behavior pin lands at 11_032; ceiling 11_000 -> 11_050 (lockstep). 2026-07-20 #2271 shutdown lifecycle hardening tracks every writer, bounds plain/TLS quiescence, drains deferred audit, and makes final witness/WAL certification fail closed; production plus regression coverage lands at 11_326, ceiling 11_050 -> 11_400 (+74 headroom, lockstep). 2026-07-21 #2290 sign the sync_cycle_once /sync/since pull GET (load daemon signing key + attach X-Memory-Sig/X-Memory-Nonce) lands the file at 11_406; ceiling 11_400 -> 11_450 (+44 headroom, lockstep). 2026-07-23 FBL-22 postgres serve maintenance loop (spawn_postgres_maintenance_loop_if_enabled gc + archive-purge + lease-sweep pg twin + bootstrap wiring + 2 spawn/skip unit tests) lands the file at 11_573; ceiling 11_450 -> 11_640 (+67 headroom, lockstep). */
-    ("src/subscriptions.rs", 4_500),
+    ("src/subscriptions.rs", 4_520), /* 2026-07-31 #2445 — 2-line disposition note on the ordering-covered raw open; measured 4_502 */
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
     // migration-capability work: the operator-directed in-process

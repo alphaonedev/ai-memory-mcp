@@ -10,6 +10,22 @@ use rusqlite::Connection;
 use std::path::Path;
 
 use super::migrations::{SCHEMA, migrate};
+use super::schema_guard::{BACKEND_SQLITE, SchemaStamp};
+
+/// Shared `anyhow` context for the valid-time UDF registration, referenced by
+/// name at every open funnel (`open`, `open_read_only`, `open_unmigrated`)
+/// rather than repeated as a literal — pm-v3.1 no-hardcoded-literals.
+const MSG_REGISTER_VALID_TIME_FNS: &str = "register valid-time SQL functions";
+
+/// v1.0.0 #2445 — probe for the presence of the `schema_version` relation.
+///
+/// A missing relation is a genuinely FRESH database; a relation that is
+/// present but unreadable is damage. Separating the two is what lets
+/// [`probe_schema_stamp`] be tri-state instead of coercing every failure to
+/// zero — see the [`super::schema_guard`] module docs for why that
+/// distinction is load-bearing.
+const SQL_SCHEMA_VERSION_TABLE_PRESENT: &str =
+    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'";
 
 /// #2266 — exact, parse-tolerant RFC3339 instant projection for SQLite KG
 /// predicates. Returning NULL for malformed text makes comparisons fail
@@ -141,10 +157,61 @@ pub fn db_synchronous() -> &'static str {
     }
 }
 
-pub fn open(path: &Path) -> Result<Connection> {
-    let conn = Connection::open(path).context("failed to open database")?;
-    apply_sqlcipher_key(&conn)?;
-    register_valid_time_functions(&conn).context("register valid-time SQL functions")?;
+/// v1.0.0 #2445 — read the recorded schema version WITHOUT coercing a failure
+/// into "fresh".
+///
+/// # Errors
+///
+/// Propagates the probe / read failure. A read error is NOT the same as an
+/// absent relation: coercing it to `0` would send a POPULATED database
+/// through the entire v1 → tip ladder with the pre-migration safety snapshot
+/// suppressed (it is gated on `version > 0`). See [`super::schema_guard`].
+pub fn probe_schema_stamp(conn: &Connection) -> Result<SchemaStamp> {
+    let present: i64 = conn
+        .query_row(SQL_SCHEMA_VERSION_TABLE_PRESENT, [], |r| r.get(0))
+        .context("probe for the schema_version relation")?;
+    if present == 0 {
+        return Ok(SchemaStamp::Fresh);
+    }
+    let version: i64 = conn
+        .query_row(super::migrations::SELECT_SCHEMA_VERSION_SQL, [], |r| {
+            r.get(0)
+        })
+        .context("read the recorded schema version")?;
+    Ok(SchemaStamp::Known(version))
+}
+
+/// v1.0.0 #2445 — the shared downgrade guard for EVERY sqlite funnel that
+/// opens a connection this process will WRITE through.
+///
+/// [`open`] applies it before any bootstrap DDL, and the handful of
+/// production sites that construct a raw [`Connection`] outside this module
+/// (the governance hook, `governance install-defaults`, `calibrate
+/// confidence`, the webhook dispatcher) call it directly — `db::open` is the
+/// funnel every INTERFACE crosses, but it is not the funnel every WRITE
+/// crosses, and a guard that only covers the former is the #2488 lesson
+/// waiting to repeat.
+///
+/// # Errors
+///
+/// [`super::schema_guard::SchemaAheadOfBinary`] when the database is newer
+/// than this binary's ladder produces, or the probe failure when the recorded
+/// version cannot be read.
+pub fn assert_schema_not_ahead(conn: &Connection, target: &str) -> Result<()> {
+    let stamp = probe_schema_stamp(conn)?;
+    super::schema_guard::evaluate(
+        stamp.version(),
+        super::migrations::current_schema_version(),
+        BACKEND_SQLITE,
+        target,
+    )?;
+    Ok(())
+}
+
+/// Shared pragma application for [`open`] and [`open_unmigrated`] so the two
+/// funnels can never drift in connection posture — only in whether they go on
+/// to apply the bootstrap schema + ladder.
+fn apply_writer_pragmas(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     // v1.0.0 #1961 (R23/R7) — resolved `PRAGMA synchronous`. Default
@@ -155,14 +222,62 @@ pub fn open(path: &Path) -> Result<Connection> {
     // the P1 A/B evidence + override ladder.
     conn.pragma_update(None, "mmap_size", db_mmap_size())?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    Ok(())
+}
+
+/// v1.0.0 #2445 — open an EXISTING database WITHOUT applying the bootstrap
+/// schema, the migration ladder, the CHECK triggers, or the downgrade guard.
+///
+/// This is the EGRESS funnel. When [`open`] refuses a schema-ahead database,
+/// `ai-memory backup` falls back to this so an operator can still snapshot
+/// their durable text with the binary they have on hand — the North Star reads
+/// the memory TEXT as the source of truth and the schema shape as a derived
+/// property of it, so a guard whose observable effect is "you may not take a
+/// backup" would invert the very directive it serves.
+///
+/// It is NOT a read-only connection: `VACUUM INTO` is refused under
+/// `PRAGMA query_only = ON` (verified), so [`open_read_only`] cannot serve the
+/// backup path. Callers MUST NOT use this funnel to write memory rows.
+///
+/// # Errors
+///
+/// Propagates connection-open failures, the SQLCipher unlock failure, or any
+/// PRAGMA failure.
+pub fn open_unmigrated(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path).context("failed to open database")?;
+    apply_sqlcipher_key(&conn)?;
+    register_valid_time_functions(&conn).context(MSG_REGISTER_VALID_TIME_FNS)?;
+    apply_writer_pragmas(&conn)?;
+    Ok(conn)
+}
+
+pub fn open(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path).context("failed to open database")?;
+    apply_sqlcipher_key(&conn)?;
+    register_valid_time_functions(&conn).context(MSG_REGISTER_VALID_TIME_FNS)?;
+    apply_writer_pragmas(&conn)?;
+    // v1.0.0 #2445 — the DOWNGRADE guard, deliberately placed HERE: after the
+    // pragma block (so `busy_timeout` is already in force and ordinary
+    // write-lock contention is retried rather than misread as damage) and
+    // BEFORE `execute_batch(SCHEMA)`. Refusing inside `migrate` alone — the
+    // issue's literal suggestion — would leave this binary's `CREATE … IF NOT
+    // EXISTS` bootstrap set replaying over a NEWER database first, which can
+    // resurrect a table or index the newer ladder deliberately removed. #2424
+    // proved bootstrap-vs-ladder shape disagreement is a live class here.
+    assert_schema_not_ahead(&conn, &path.display().to_string())?;
     conn.execute_batch(SCHEMA)
         .context("failed to initialize schema")?;
     migrate(&conn)?;
     apply_check_constraint_triggers(&conn)
         .context("failed to apply R1-M2 CHECK-constraint triggers")?;
     // v1.0.0 #1946 (A1) — OPEN-TIME rollback-evidence head check. `db::open`
-    // is the funnel every interface (CLI per-command, HTTP daemon, MCP stdio)
-    // crosses; `open_read_only` is exempt (the writer's open already checked).
+    // is the funnel every interface BOOT (CLI per-command, HTTP daemon, MCP
+    // stdio) crosses — but NOT every write: #2445 catalogued the production
+    // sites that construct a raw `rusqlite::Connection` and write through it
+    // (`src/cli/governance_check_action.rs`, `governance_install_defaults.rs`,
+    // `commands/calibrate_confidence.rs`, `src/subscriptions.rs`), which this
+    // check does not reach either. `open_read_only` is exempt (the writer's
+    // open already checked).
     // DEFAULT: emit evidence + WARN and CONTINUE (no self-DOS on legit DR).
     // REQUIRE-MODE (`AI_MEMORY_REQUIRE_ROLLBACK_CHECK`): refuse the open. A
     // deployment with no enrolled witness key has no off-table anchor → the
@@ -205,7 +320,7 @@ pub fn open_read_only(path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, flags)
         .context("failed to open read-only database connection")?;
     apply_sqlcipher_key(&conn)?;
-    register_valid_time_functions(&conn).context("register valid-time SQL functions")?;
+    register_valid_time_functions(&conn).context(MSG_REGISTER_VALID_TIME_FNS)?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     // #1579 B7 — mirror the writer's memory-mapped I/O budget so the
     // read-pool shares the OS page cache reservation.

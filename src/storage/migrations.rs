@@ -1524,11 +1524,29 @@ const MIGRATION_V83_SQLITE: &str =
 // semantic SQL-fault injection.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
-    let version: i64 = conn
-        .query_row(SELECT_SCHEMA_VERSION_SQL, [], |r| r.get(0))
-        .unwrap_or(0);
+    // v1.0.0 #2445 — tri-state, never `.unwrap_or(0)`. The pre-#2445 form
+    // collapsed a READ ERROR into "fresh", and the pre-migration safety
+    // snapshot below is gated on `version > 0` — so an unreadable stamp
+    // replayed the whole v1 -> tip ladder over a POPULATED database WITH THE
+    // SNAPSHOT SUPPRESSED. An absent `schema_version` relation still reads as
+    // 0 (a genuinely fresh database); a failed READ now propagates.
+    let version = super::connection::probe_schema_stamp(conn)?.version();
 
-    if version >= CURRENT_SCHEMA_VERSION {
+    // v1.0.0 #2445 — DOWNGRADE guard, defense-in-depth behind the pre-bootstrap
+    // gate in `db::open`. `>` refuses (this binary would write a schema it does
+    // not understand); `==` keeps the historical no-op fast path byte-for-byte.
+    if version > CURRENT_SCHEMA_VERSION {
+        super::schema_guard::evaluate(
+            version,
+            CURRENT_SCHEMA_VERSION,
+            super::schema_guard::BACKEND_SQLITE,
+            &conn.path().unwrap_or("<in-memory>").to_string(),
+        )?;
+        // The hatch authorised this database: leave it EXACTLY as found. The
+        // ladder must not run, and the bootstrap DDL must not be replayed.
+        return Ok(());
+    }
+    if version == CURRENT_SCHEMA_VERSION {
         return Ok(());
     }
 
@@ -4770,8 +4788,35 @@ mod tests {
 
     #[test]
     fn migrate_no_op_when_version_already_current() {
-        // Fast-path: `version >= CURRENT_SCHEMA_VERSION` returns
-        // immediately without entering the EXCLUSIVE transaction.
+        // Fast-path: `version == CURRENT_SCHEMA_VERSION` returns immediately
+        // without entering the EXCLUSIVE transaction. #2445 split the former
+        // `>=` into `==` (this test) and `>` (the refusal below); the `==`
+        // behaviour is byte-identical to pre-#2445.
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        conn.execute("DELETE FROM schema_version", []).unwrap();
+        conn.execute(
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            params![CURRENT_SCHEMA_VERSION],
+        )
+        .unwrap();
+        super::migrate(&conn).expect("at-current is a no-op");
+        assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
+    }
+
+    /// v1.0.0 #2445 — the arm this test used to PIN THE DEFECT for. Its
+    /// predecessor asserted `super::migrate(&conn).expect("ahead-of-current is
+    /// a no-op")` at `CURRENT + 5`, with the message "fast-path must not
+    /// overwrite a newer version stamp" — encoding the silent-corruption
+    /// behaviour as the contract. It is now a refusal, and the stamp must
+    /// STILL be left alone (that half of the old contract was always right).
+    #[test]
+    fn migrate_refuses_when_version_is_ahead_of_this_binary_2445() {
+        let _g = crate::storage::schema_guard::test_env_lock();
+        // SAFETY: process-wide env mutation, serialised by `_g`.
+        unsafe {
+            std::env::remove_var(crate::storage::schema_guard::ENV_ALLOW_SCHEMA_AHEAD);
+        }
         let conn = Connection::open_in_memory().expect("in-memory db");
         conn.execute_batch(SCHEMA).expect("apply SCHEMA");
         conn.execute("DELETE FROM schema_version", []).unwrap();
@@ -4780,13 +4825,15 @@ mod tests {
             params![CURRENT_SCHEMA_VERSION + 5],
         )
         .unwrap();
-        // Even when ahead of current, the no-op path returns Ok().
-        super::migrate(&conn).expect("ahead-of-current is a no-op");
-        let v = current_version(&conn);
+        let err = super::migrate(&conn).expect_err("ahead-of-current must REFUSE");
+        assert!(
+            crate::storage::schema_guard::schema_ahead_of(&err).is_some(),
+            "must be the typed verdict: {err:#}"
+        );
         assert_eq!(
-            v,
+            current_version(&conn),
             CURRENT_SCHEMA_VERSION + 5,
-            "fast-path must not overwrite a newer version stamp"
+            "a refusal must not overwrite a newer version stamp"
         );
     }
 
