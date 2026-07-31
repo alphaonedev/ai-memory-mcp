@@ -5883,6 +5883,17 @@ pub async fn bootstrap_serve(
         }
     };
 
+    // v1.0.0 #2579 — the cached FTS5 integrity verdict `/health` renders.
+    // Built BEFORE the router so the handler and the background checker
+    // share one `Arc`; the checker itself is spawned below, on its own
+    // connection, so its multi-second O(corpus) pass can never block the
+    // O(1) probe (which would silently re-create the probe-timeout kill
+    // this change exists to remove).
+    let fts_integrity_interval = crate::background::fts_integrity::resolve_interval();
+    let fts_integrity_status =
+        Arc::clone(&crate::runtime_context::RuntimeContext::global_arc().fts_integrity);
+    fts_integrity_status.set_interval_secs(fts_integrity_interval.as_secs());
+
     let app_state = AppState {
         db: db_state.clone(),
         embedder: embedder_arc,
@@ -6013,6 +6024,27 @@ pub async fn bootstrap_serve(
     task_handles.push(crate::background::lease_sweep::spawn(
         db_state.clone(),
         crate::background::lease_sweep::DEFAULT_INTERVAL,
+    ));
+
+    // v1.0.0 #2579 — the paced FTS5 integrity checker whose CACHED verdict
+    // `/health` renders. It runs on its OWN connection (the db PATH, not the
+    // shared `Db` handle) because the FTS5 `'integrity-check'` command is
+    // prepared as a WRITER: under the daemon's single mutex it would block
+    // every reader — `/health` included — for its whole O(corpus) duration.
+    // Jittered so a fleet restarting together does not check in lockstep.
+    task_handles.push(crate::background::fts_integrity::spawn(
+        db_path.to_path_buf(),
+        Arc::clone(&fts_integrity_status),
+        fts_integrity_interval,
+    ));
+
+    // v1.0.0 #2583 — the paced corpus-size gauge refresher, so a Prometheus
+    // scrape renders a pre-computed number instead of running `db::stats`
+    // (eight statements, of which the scrape used one) per request while
+    // holding the DB mutex.
+    task_handles.push(crate::background::memories_gauge::spawn(
+        db_state.clone(),
+        crate::background::memories_gauge::resolve_interval(),
     ));
 
     // v0.9.0 P0-1 (#1869) — recall-access FOLD loops. The dedicated

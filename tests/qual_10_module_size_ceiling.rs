@@ -413,7 +413,17 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // deliberately does not claim. MEASURED post-change: 27_609.
     // Ceiling 27_400 -> 27_700 (+91 headroom). Bumped in LOCKSTEP with the
     // postgres.rs entry below (same commit, same issue).
-    ("src/storage/mod.rs", 27_700),
+    // 2026-07-31 (#2579 liveness-probe O(corpus)) — `health_check` ran a full
+    // FTS5 `'integrity-check'` (which re-tokenizes the whole corpus AND is
+    // prepared as a WRITER) plus a `COUNT(*)` on EVERY `/health` request. It
+    // splits into `ping` + `fts_probe` (both O(1), both SELECTs) and the deep
+    // `fts_integrity_check`, which now has exactly two callers: the paced
+    // `background::fts_integrity` loop and `ai-memory doctor`. The line count
+    // is mostly the WHY: this is a posture change on a control, so each
+    // function states what it proves, what it deliberately does NOT prove,
+    // and where the signal it dropped now lives. MEASURED post-change:
+    // 27_755. Ceiling 27_700 -> 27_820 (+65 headroom).
+    ("src/storage/mod.rs", 27_820),
     // 2026-07-21 (#1802 R-05 S1) — NEW submodule extracted from
     // storage/mod.rs (doctor / observability probes). Measured 698;
     // ceiling 800 (+102).

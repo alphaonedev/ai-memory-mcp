@@ -3303,13 +3303,28 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
-    /// Deep health check — verifies the underlying store is reachable
-    /// AND the full-text index (or postgres equivalent) is functional.
-    /// Closes `db::health_check` (handler reach at `transport.rs:840`).
+    /// LIVENESS check — the underlying store is reachable and its
+    /// full-text index (or postgres equivalent) answers.
+    /// Closes `db::health_check` (handler reach in `transport.rs::health`).
     ///
-    /// Returns `Ok(true)` on success. Implementations SHOULD perform a
-    /// cheap write-side probe (e.g. SQLite FTS integrity-check) so
-    /// degradation surfaces before the next user-facing recall fails.
+    /// Returns `Ok(true)` on success.
+    ///
+    /// **v1.0.0 #2579 — this contract CHANGED.** It previously read
+    /// "implementations SHOULD perform a cheap write-side probe (e.g.
+    /// SQLite FTS integrity-check)". That advice was wrong twice over: the
+    /// FTS5 `'integrity-check'` command is not cheap (it re-tokenizes the
+    /// whole corpus — O(corpus), measured 22-30 us/row) and not a probe
+    /// (SQLite prepares it as a WRITER, so it holds the WAL write lock for
+    /// its whole duration). Following it put O(corpus) work on the endpoint
+    /// orchestrators scrape on a fixed interval, which kills HEALTHY pods
+    /// once the probe exceeds its timeout.
+    ///
+    /// Implementations MUST now keep this method O(1) in corpus size and
+    /// MUST NOT take a write lock. Verifying that a derived index AGREES
+    /// with its content is a MAINTENANCE operation: on sqlite it runs on
+    /// the paced [`crate::background::fts_integrity`] cadence and `/health`
+    /// renders the cached verdict; a cached failure still answers `503`, so
+    /// the fail-closed posture is preserved, not dropped.
     ///
     /// # Errors
     ///

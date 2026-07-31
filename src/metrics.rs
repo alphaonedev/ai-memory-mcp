@@ -118,6 +118,17 @@ pub struct Metrics {
     pub webhook_dispatched_total: IntCounter,
     pub webhook_failed_total: IntCounter,
     pub memories_gauge: IntGauge,
+    /// v1.0.0 #2583 — UNIX seconds at which `memories_gauge` was last
+    /// recomputed; `0` = never. Published in lockstep with the count by
+    /// [`crate::background::memories_gauge::publish`].
+    ///
+    /// This is NOT decoration. Once the corpus count is pre-computed rather
+    /// than recomputed per scrape, a refresher that dies would otherwise
+    /// freeze `ai_memory_memories` at a plausible-looking value forever —
+    /// including straight through a mass deletion — while Prometheus `up`
+    /// stays 1. That is the #2444 "reports success while doing nothing"
+    /// shape. Alert on `time() - ai_memory_memories_refreshed_at_seconds`.
+    pub memories_gauge_refreshed_at: IntGauge,
     pub hnsw_size_gauge: IntGauge,
     pub subscriptions_active_gauge: IntGauge,
     pub curator_cycles_total: IntCounter,
@@ -394,6 +405,12 @@ impl Metrics {
             "Current count of non-archived memories.",
         )?;
         registry.register(Box::new(memories_gauge.clone()))?;
+
+        let memories_gauge_refreshed_at = IntGauge::new(
+            "ai_memory_memories_refreshed_at_seconds",
+            "UNIX time at which ai_memory_memories was last recomputed (0 = never).",
+        )?;
+        registry.register(Box::new(memories_gauge_refreshed_at.clone()))?;
 
         let hnsw_size_gauge = IntGauge::new(
             "ai_memory_hnsw_size",
@@ -673,6 +690,7 @@ impl Metrics {
             webhook_dispatched_total,
             webhook_failed_total,
             memories_gauge,
+            memories_gauge_refreshed_at,
             hnsw_size_gauge,
             subscriptions_active_gauge,
             curator_cycles_total,
@@ -910,6 +928,7 @@ mod tests {
         registry().contradiction_detected_total.inc();
         registry().webhook_dispatched_total.inc();
         registry().memories_gauge.set(42);
+        registry().memories_gauge_refreshed_at.set(1);
         registry().hnsw_size_gauge.set(42);
         registry().subscriptions_active_gauge.set(3);
         registry().federation_push_dlq_depth.set(0);
@@ -929,6 +948,8 @@ mod tests {
             "ai_memory_webhook_dispatched_total",
             "ai_memory_webhook_failed_total",
             "ai_memory_memories",
+            // v1.0.0 #2583 — the freshness twin of the pre-computed count.
+            "ai_memory_memories_refreshed_at_seconds",
             "ai_memory_hnsw_size",
             "ai_memory_subscriptions_active",
             // v0.7.0 Track D #933 — federation push DLQ depth gauge.

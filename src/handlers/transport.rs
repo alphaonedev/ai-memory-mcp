@@ -210,6 +210,7 @@ pub struct AppState {
     /// dispatch through `app.store` or fall back to the legacy
     /// `db::*` free-function code path.
     pub storage_backend: StorageBackend,
+
     /// v0.7.0 Wave-3 — polymorphic [`MemoryStore`] handle.
     ///
     /// Always populated. For [`StorageBackend::Sqlite`] it wraps a
@@ -976,69 +977,170 @@ pub async fn api_key_auth(
     next.run(req).await.into_response()
 }
 
-pub async fn health(State(app): State<AppState>) -> impl IntoResponse {
-    // v0.7.0 ARCH-2 followup (FX-C2-batch3) — Postgres-backed daemons
-    // ride the new `MemoryStore::health_check` trait method which is
-    // natively async (sqlx round-trip), so we can skip the blocking
-    // pool for that path entirely. SQLite-backed daemons stay on the
-    // `db_op` blocking-pool route per PERF-1 (FX-3); /health is the
-    // most-frequently scraped endpoint and pinning a tokio worker on
-    // a sync sqlite PRAGMA query would starve the runtime under
-    // concurrent scrape load.
-    #[cfg(feature = "sal-postgres")]
-    let ok = if matches!(app.storage_backend, StorageBackend::Postgres) {
-        app.store.health_check().await.unwrap_or(false)
-    } else {
-        db_op(app.db.clone(), |guard| {
-            db::health_check(&guard.0).unwrap_or(false)
-        })
-        .await
-    };
-    #[cfg(not(feature = "sal-postgres"))]
-    let ok = db_op(app.db.clone(), |guard| {
-        db::health_check(&guard.0).unwrap_or(false)
-    })
-    .await;
-    let embedder_ready = app.embedder.as_ref().is_some();
-    let federation_enabled = app.federation.as_ref().is_some();
-    let code = if ok {
+/// `checks.*` value for a probe that answered.
+pub const PROBE_OK: &str = "ok";
+/// `checks.fts_index` value: the FTS5 index answered a bounded MATCH.
+/// REACHABLE, not VERIFIED — the deep verdict is `fts_integrity`.
+pub const PROBE_REACHABLE: &str = "reachable";
+/// `checks.*` value for a probe that errored.
+pub const PROBE_ERROR: &str = "error";
+/// `checks.fts_index` on a postgres-backed daemon: there is no FTS5 index
+/// (postgres uses a stored `tsvector` + GIN), so the probe does not apply.
+pub const PROBE_NOT_APPLICABLE: &str = "not_applicable";
+
+/// v1.0.0 #2579 — the pure `/health` status mapping, hoisted so the
+/// posture is unit-testable without a daemon.
+///
+/// `live` is the O(1) liveness result (the connection answers AND the FTS5
+/// index is reachable). `verdict` is the CACHED deep-integrity verdict.
+/// Only a CONFIRMED corruption adds a failure — `Pending` / `Stale` /
+/// `Disabled` are "no assertion", not "failed assertion", and 503-ing on
+/// those would deadlock a rolling fleet restart before any node had
+/// completed its first background check.
+#[must_use]
+pub fn health_status_code(
+    live: bool,
+    verdict: crate::background::fts_integrity::Verdict,
+) -> StatusCode {
+    if live && !verdict.is_unhealthy() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+/// `GET /api/v1/health` — the LIVENESS probe.
+///
+/// v1.0.0 #2579: this endpoint used to run a full FTS5 integrity check on
+/// every request (`db::health_check`), which is O(corpus) — 69.6 ms at 7.9k
+/// rows, seconds at 1M — while holding the daemon's single
+/// `Arc<Mutex<Connection>>` AND the WAL write lock (the FTS5 command is
+/// prepared as a writer). A liveness probe whose cost grows with the corpus
+/// eventually exceeds its orchestrator timeout and gets HEALTHY pods killed
+/// on exactly the largest, most valuable nodes.
+///
+/// **What it proves now.** That the connection answers SQL, and that the
+/// FTS5 index is REACHABLE (module registered, shadow tables readable) via
+/// a bounded MATCH. Both are constant-time.
+///
+/// **What it no longer proves per-request, and where that signal lives.**
+/// That the FTS5 index AGREES with the `memories` table. That check now runs
+/// on a paced, jittered background cadence
+/// ([`crate::background::fts_integrity`]) on its own connection, and this
+/// endpoint renders its CACHED verdict under `fts_integrity` — including
+/// `checked_at`, so the age of the assertion is visible rather than implied.
+/// A cached `failed` verdict still answers `503`: the pre-#2579 fail-closed
+/// contract is preserved, sourced from a completed check instead of a
+/// per-probe scan. `ai-memory doctor` runs the same deep check on demand.
+pub async fn health(State(app): State<AppState>) -> impl IntoResponse {
+    // v0.7.0 ARCH-2 followup (FX-C2-batch3) — Postgres-backed daemons
+    // ride the `MemoryStore::health_check` trait method which is natively
+    // async (sqlx round-trip), so we skip the blocking pool for that path.
+    // SQLite-backed daemons stay on the `db_op` blocking-pool route per
+    // PERF-1 (FX-3).
+    #[cfg(feature = "sal-postgres")]
+    let (connection_ok, fts_state) = if matches!(app.storage_backend, StorageBackend::Postgres) {
+        (
+            app.store.health_check().await.unwrap_or(false),
+            PROBE_NOT_APPLICABLE,
+        )
+    } else {
+        sqlite_liveness(&app).await
     };
+    #[cfg(not(feature = "sal-postgres"))]
+    let (connection_ok, fts_state) = sqlite_liveness(&app).await;
+
+    let now = chrono::Utc::now();
+    let verdict = app.runtime.fts_integrity.verdict_at(now.timestamp());
+    let live = connection_ok && fts_state != PROBE_ERROR;
+    let code = health_status_code(live, verdict);
+    let ok = code == StatusCode::OK;
+
+    let checked_at = app
+        .runtime
+        .fts_integrity
+        .checked_at_unix()
+        .and_then(|s| chrono::DateTime::from_timestamp(s, 0))
+        .map(|d| d.to_rfc3339());
+
     // v0.6.2 (#327): expose embedder status so operators can tell from
     // /health alone whether semantic recall is wired up on this node.
     (
         code,
         Json(json!({
-            "status": if ok { "ok" } else { "error" },
+            "status": if ok { PROBE_OK } else { PROBE_ERROR },
             "service": "ai-memory",
             "version": crate::PKG_VERSION,
-            "embedder_ready": embedder_ready,
-            "federation_enabled": federation_enabled,
+            "embedder_ready": app.embedder.as_ref().is_some(),
+            "federation_enabled": app.federation.as_ref().is_some(),
+            // #2579 — state WHAT this probe verified, so a shallow pass can
+            // never be mistaken for a deep one (#2444/#2445).
+            "checks": {
+                "connection": if connection_ok { PROBE_OK } else { PROBE_ERROR },
+                "fts_index": fts_state,
+            },
+            // #2579 — the deep verdict, with its age. `pending` = no check
+            // has completed yet; `stale` = the checker stopped running.
+            "fts_integrity": {
+                "status": verdict.as_str(),
+                "checked_at": checked_at,
+                "interval_secs": app.runtime.fts_integrity.interval_secs(),
+            },
         })),
     )
         .into_response()
 }
 
-/// v0.6.0.0 — Prometheus scrape endpoint. Refreshes gauge samples
-/// (`ai_memory_memories`) against the current DB before rendering so
-/// scrapers see up-to-date counts without needing a background refresh
-/// task.
-pub async fn prometheus_metrics(State(state): State<Db>) -> impl IntoResponse {
-    // PERF-1 (FX-3): route the rusqlite stats query through `db_op`.
-    // The stats query touches `memories` + `archived_memories` for COUNTs
-    // and can take 10-50ms on a populated DB; scrape cadence is every
-    // 10-30s, so without spawn_blocking this would periodically pin a
-    // tokio worker mid-scrape.
-    db_op(state, |guard| {
-        if let Ok(stats) = db::stats(&guard.0, &guard.1) {
-            crate::metrics::registry()
-                .memories_gauge
-                .set(stats.total.try_into().unwrap_or(i64::MAX));
+/// The sqlite half of [`health`]: one blocking-pool hop, two fixed
+/// statements, no write lock.
+async fn sqlite_liveness(app: &AppState) -> (bool, &'static str) {
+    db_op(app.db.clone(), |guard| {
+        if db::ping(&guard.0).is_err() {
+            return (false, PROBE_ERROR);
         }
+        if db::fts_probe(&guard.0).is_err() {
+            return (true, PROBE_ERROR);
+        }
+        (true, PROBE_REACHABLE)
     })
-    .await;
+    .await
+}
+
+/// v0.6.0.0 — Prometheus scrape endpoint.
+///
+/// v1.0.0 #2583: this used to call `db::stats` on EVERY scrape and use
+/// exactly ONE of the ten fields it computes. `db::stats` issues eight
+/// statements — three `COUNT`s over `memories`, two full `GROUP BY`
+/// aggregations, an expiring-soon `COUNT`, a `COUNT` over `memory_links`,
+/// and `dim_violations`, which walks every row's `embedding` BLOB. Measured
+/// ~15 ms at 8k rows and ~130 ms at 130k, of which `dim_violations` alone
+/// was 11 ms and 98 ms — all discarded except the first count. It ran while
+/// holding the daemon's single `Arc<Mutex<Connection>>`, and `/metrics` is
+/// EXEMPT from admission control, so scrape rate (which the daemon does not
+/// control) multiplied a corpus-proportional mutex hold.
+///
+/// The corpus count is now published by the paced
+/// [`crate::background::memories_gauge`] refresher and this path renders
+/// pre-computed values: zero database work, zero mutex acquisition, cost
+/// independent of both corpus size and scrape rate. `ai_memory_memories` is
+/// a gauge Prometheus already samples at 15-60 s, so bounded staleness costs
+/// nothing an operator did not already have — and
+/// `ai_memory_memories_refreshed_at_seconds` makes that staleness alertable
+/// rather than invisible.
+///
+/// The one exception is a COLD prime: a process whose refresher never ran
+/// (a router built without the daemon loop, or an operator who disabled the
+/// cadence) would otherwise serve a gauge of `0` that is indistinguishable
+/// from an empty corpus. The first scrape in such a process pays ONE
+/// `COUNT`; every subsequent scrape is free.
+pub async fn prometheus_metrics(State(state): State<Db>) -> impl IntoResponse {
+    if crate::metrics::registry().memories_gauge_refreshed_at.get() == 0 {
+        let now = chrono::Utc::now().timestamp();
+        db_op(state, move |guard| {
+            crate::background::memories_gauge::refresh_once(&guard.0, now);
+        })
+        .await;
+    }
     let body = crate::metrics::render();
     (
         StatusCode::OK,
