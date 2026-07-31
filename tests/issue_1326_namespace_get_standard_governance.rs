@@ -106,7 +106,8 @@ fn issue_1326_require_approval_above_depth_round_trips() {
     );
 
     let get_resp =
-        handle_namespace_get_standard(&conn, &json!({"namespace": "ns-1326-leaf"})).expect("get");
+        handle_namespace_get_standard(&conn, &json!({"namespace": "ns-1326-leaf"}), None)
+            .expect("get");
     let gov = &get_resp["governance"];
     assert!(
         gov.is_object(),
@@ -162,6 +163,7 @@ fn issue_1326_off_struct_fields_survive_inherit_chain() {
     let get_resp = handle_namespace_get_standard(
         &conn,
         &json!({"namespace": "ns-1326-leaf-2", "inherit": true}),
+        None,
     )
     .expect("inherit-chain get must succeed");
     let standards = get_resp["standards"]
@@ -213,8 +215,9 @@ fn issue_1326_typed_defaults_still_populate_alongside_off_struct() {
     )
     .expect("set");
 
-    let get_resp = handle_namespace_get_standard(&conn, &json!({"namespace": "ns-1326-defaults"}))
-        .expect("get");
+    let get_resp =
+        handle_namespace_get_standard(&conn, &json!({"namespace": "ns-1326-defaults"}), None)
+            .expect("get");
     let gov = &get_resp["governance"];
     // Off-struct field survived.
     assert_eq!(gov["require_approval_above_depth"], 3, "off-struct field");
