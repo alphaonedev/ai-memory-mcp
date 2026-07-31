@@ -13,6 +13,13 @@ use clap::{Args, ValueEnum};
 use models::Tier;
 use std::path::{Path, PathBuf};
 
+/// Verb name carried into the #2490 store-guard refusal messages so the
+/// operator is told which command refused. Mirrors `cli::backup`'s
+/// `VERB_BACKUP` / `VERB_RESTORE` consts.
+const VERB_EXPORT: &str = "export";
+/// See [`VERB_EXPORT`].
+const VERB_IMPORT: &str = "import";
+
 /// `--on-conflict <mode>` selector for `import` / `mine` writes (#1780,
 /// 5-agent vote 4d3ea1c5). A `(title, namespace)` collision is the
 /// substrate's silent-clobber footgun: the legacy `db::insert`
@@ -58,6 +65,26 @@ pub struct ExportArgs {
     /// memories+links convenience view.
     #[arg(long, default_value_t = false)]
     pub full: bool,
+    /// v1.0.0 #2490 — the configured store, read through the SAME channels
+    /// `serve` uses (`AI_MEMORY_STORE_URL_FILE` > `AI_MEMORY_STORE_URL` >
+    /// this flag, #1927). `export` acts on a local SQLite database; naming a
+    /// Postgres store here makes the command REFUSE instead of conjuring an
+    /// empty SQLite file and emitting a `count: 0` artifact that exits 0.
+    #[arg(long)]
+    pub store_url: Option<String>,
+    /// v1.0.0 #2490 — acknowledge up to N rows withheld by the export
+    /// confidentiality boundary without failing the command.
+    ///
+    /// A partial export exits [`crate::export_scope::EXIT_EXPORT_INCOMPLETE`]
+    /// so a backup job cannot mistake it for a complete one. On a corpus that
+    /// permanently holds, say, one quarantined row that would pin the job red
+    /// forever — and a forever-red job becomes `|| true`, which silences the
+    /// NEXT withholding too. This is a RATCHET, not a mute: the exit stays 0
+    /// while `withheld <= N` and goes non-zero the moment it EXCEEDS the
+    /// number the operator acknowledged, so a new withholding still alarms.
+    /// The in-band counts are emitted either way.
+    #[arg(long)]
+    pub expect_withheld: Option<usize>,
 }
 
 #[derive(Args)]
@@ -66,6 +93,14 @@ pub struct ImportArgs {
     /// Only use this when importing a JSON export you fully trust (e.g., your own backup).
     #[arg(long, default_value_t = false)]
     pub trust_source: bool,
+    /// v1.0.0 #2490 — the configured store, read through the SAME channels
+    /// `serve` uses. `import` WRITES to a local SQLite database; naming a
+    /// Postgres store makes the command REFUSE instead of writing rows into a
+    /// conjured SQLite file the served store never reads. A `sqlite://` URL
+    /// that DISAGREES with `--db` is also refused (never silently redirected)
+    /// — see [`crate::cli::backup::StoreDisagreement`].
+    #[arg(long)]
+    pub store_url: Option<String>,
     /// Disposition on a `(title, namespace)` collision with an existing
     /// memory: `version` (default — auto-suffix `title (N)`, never
     /// clobber), `merge` (legacy silent idempotent upsert), or `error`
@@ -120,10 +155,41 @@ pub struct MineArgs {
 /// The full integrity-complete exporter defers to v1.x (see
 /// `docs/spec/PORTABILITY-V2.md` §V2-7). The serialization core
 /// (`db::export_all` / `db::export_links`) is deliberately untouched.
-pub fn export(db_path: &Path, args: &ExportArgs, out: &mut CliOutput<'_>) -> Result<()> {
+pub fn export(db_path: &Path, args: &ExportArgs, out: &mut CliOutput<'_>) -> Result<i32> {
     use crate::export_scope;
     use crate::models::field_names;
-    let conn = db::open(db_path)?;
+
+    // v1.0.0 #2490 — resolve (and where necessary REFUSE) the configured
+    // store BEFORE anything is created on disk, exactly as #2444 did for
+    // `backup`. Executed evidence at the parent commit: with
+    // `AI_MEMORY_STORE_URL=postgres://…` and no `--db` file present, `export`
+    // exited 0, CREATED an 802,816-byte SQLite database, and emitted
+    // `{"count":0,"memories":[],"links":[]}` — a successful-looking, EMPTY,
+    // apparently-valid export of a Postgres corpus. `export --full` was
+    // worse: the conjured file bootstraps real default governance rules, so
+    // the v2 envelope carried `db_schema_version: 87` + 4 `governance_rules`
+    // + 1 `trust_anchor` around `memories: []`, and emitted no stderr at all.
+    let source_db = crate::cli::backup::resolve_sqlite_store(
+        db_path,
+        args.store_url.as_deref(),
+        VERB_EXPORT,
+        crate::cli::backup::StoreDisagreement::RedirectWithNote,
+        out,
+    )?;
+    // #2444 shape — `db::open` CREATES the file when absent and then runs the
+    // whole migration ladder on it, so the created file is NOT distinguishable
+    // from a real database by any schema probe. Non-existence is the only
+    // honest discriminator, and it is destroyed by the first invocation.
+    if !source_db.exists() {
+        anyhow::bail!(
+            "no SQLite database at {} — refusing to create one and export it. \
+             An export of a database that does not exist would emit a \
+             structurally VALID `count: 0` artifact and exit 0, which is \
+             indistinguishable from a genuinely empty corpus (#2490).",
+            source_db.display()
+        );
+    }
+    let conn = db::open(&source_db)?;
 
     // v1.0.0 #2006 — the integrity portability path. `--full` emits the full
     // Portability-v2 envelope (every signed record class byte-preserved +
@@ -133,13 +199,26 @@ pub fn export(db_path: &Path, args: &ExportArgs, out: &mut CliOutput<'_>) -> Res
     // memories are still screened by `build_full_envelope` (same
     // confidentiality boundary).
     if args.full {
-        let envelope = crate::portability::emit::build_full_envelope(
+        let (mut envelope, ledger) = crate::portability::emit::build_full_envelope_audited(
             &conn,
             "ai-memory",
             &Utc::now().to_rfc3339(),
         )?;
+        // v1.0.0 #2490 — `portability_complete` was computed ONLY from the
+        // audit-chain re-verify + operator anchor, so it was structurally
+        // blind to the rows the confidentiality boundary withheld: an
+        // artifact could assert `portability_complete: true` over a corpus it
+        // provably did not carry. Make the marker an AND. This is a VALUE
+        // correction to an EXISTING field, so it costs zero cross-version
+        // compatibility — the envelope is parsed with
+        // `#[serde(deny_unknown_fields)]` under `spec_version = "2"`, so
+        // ADDING a field would make every already-shipped binary refuse the
+        // new bundle (5-agent vote 4d3ea1c5, objection O2; D7 = A).
+        if ledger.is_partial() {
+            envelope.portability_complete = false;
+        }
         writeln!(out.stdout, "{}", serde_json::to_string_pretty(&envelope)?)?;
-        return Ok(());
+        return finish_export_report(&ledger, &source_db, envelope.count, args, out);
     }
 
     let memories = db::export_all(&conn)?;
@@ -156,10 +235,29 @@ pub fn export(db_path: &Path, args: &ExportArgs, out: &mut CliOutput<'_>) -> Res
     // and mask credential VALUES in content/title/tags/metadata); the surviving
     // rows keep the #1944 in-band scope markers below and stdout stays valid
     // JSON.
-    let memories = crate::export_taxonomy::screen_memories_for_export(memories, Some(&conn));
+    let (memories, mut ledger) =
+        crate::export_taxonomy::screen_memories_for_export_audited(memories, Some(&conn));
+    let (quarantined, tombstoned, expired) = db::export_excluded_counts(&conn)?;
+    ledger.quarantined = quarantined;
+    ledger.tombstoned = tombstoned;
+    ledger.expired = expired;
     let links = db::export_links(&conn)?;
     // In-band, additive, non-breaking scope markers (critical: the stderr
     // WARN below is invisible to a pipe-to-file consumer).
+    //
+    // v1.0.0 #2490 — `withheld` joins them. `count` alone is
+    // self-CONSISTENT (`count == memories.len()` always), so the loss was
+    // unfalsifiable from the bundle: a 3-row corpus whose PEM row the
+    // forbidden-class gate dropped emitted `count: 2` with nothing to
+    // contradict it. COUNTS + a class histogram only — never the withheld
+    // ids, which would publish a precise index into the source corpus's key
+    // material into the very artifact that crosses trust boundaries
+    // (5-agent vote 4d3ea1c5, security objection O3). The ids go to stderr.
+    //
+    // Extra top-level keys are safe on THIS wire form: `import_from_str`
+    // reads only `data["memories"]` / `data["links"]`, and there is no
+    // `spec_version`, so the strict v2 envelope parse is never reached.
+    // Pinned by `tests/export_import_false_success_2490.rs`.
     writeln!(
         out.stdout,
         "{}",
@@ -169,11 +267,69 @@ pub fn export(db_path: &Path, args: &ExportArgs, out: &mut CliOutput<'_>) -> Res
             (field_names::EXPORT_SCOPE): export_scope::SCOPE_MEMORIES_LINKS,
             (field_names::PORTABILITY_COMPLETE): export_scope::PORTABILITY_COMPLETE,
             (field_names::EXCLUDES): export_scope::OMITTED_SIGNED_CLASSES,
+            (field_names::WITHHELD): ledger.in_band_marker(),
         }))?
     )?;
     // Prominent WARN to STDERR only, so the stdout JSON stays pipeline-valid.
     writeln!(out.stderr, "{}", export_scope::export_scope_warn())?;
-    Ok(())
+    let exported = memories.len();
+    finish_export_report(&ledger, &source_db, exported, args, out)
+}
+
+/// v1.0.0 #2490 — emit the structured export report and decide the exit code.
+///
+/// Two channels, deliberately:
+/// * ONE structured stderr line under the stable
+///   [`crate::export_scope::EXPORT_REPORT_EVENT`] key, carrying the ids, so a
+///   fleet controller aggregates 10^6 nodes without regexing prose. The
+///   signed refusal row the screen already emits lands in the SOURCE
+///   database — which in a disaster is exactly the artefact the operator no
+///   longer has — so stdout/stderr/exit-code is the ENTIRE signal surface.
+/// * A distinct exit code, so `cmd > out.tmp && mv out.tmp out` can be
+///   branched on rather than collapsing "incomplete but valid" into "crashed".
+///
+/// The artifact is ALWAYS written first: DEGRADE, never withhold what IS
+/// exportable.
+fn finish_export_report(
+    ledger: &crate::export_scope::ExportWithholdLedger,
+    source_db: &Path,
+    exported: usize,
+    args: &ExportArgs,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
+    if ledger.is_partial() || ledger.redacted_total() > 0 {
+        writeln!(
+            out.stderr,
+            "{}",
+            ledger.stderr_report_line(&source_db.to_string_lossy(), exported)
+        )?;
+    }
+    if !ledger.is_partial() {
+        return Ok(0);
+    }
+    let withheld = ledger.withheld_total() + ledger.quarantined;
+    let acknowledged = args.expect_withheld.unwrap_or(0);
+    if withheld <= acknowledged {
+        writeln!(
+            out.stderr,
+            "note: {withheld} withheld row(s) are within the --expect-withheld {acknowledged} \
+             baseline; exiting 0. This export is NOT a complete copy of the corpus (#2490)."
+        )?;
+        return Ok(0);
+    }
+    writeln!(
+        out.stderr,
+        "ERROR: this export is INCOMPLETE — {withheld} row(s) present in the corpus were \
+         withheld ({} by the export confidentiality boundary, {} quarantined). The artifact \
+         WAS written and is internally valid, but it is not a faithful copy: restoring from \
+         it would silently return fewer memories than exist. Exiting {} so a backup job \
+         cannot mistake it for a complete one. Acknowledge a known steady-state count with \
+         --expect-withheld <N> (#2490).",
+        ledger.withheld_total(),
+        ledger.quarantined,
+        crate::export_scope::EXIT_EXPORT_INCOMPLETE
+    )?;
+    Ok(crate::export_scope::EXIT_EXPORT_INCOMPLETE)
 }
 
 /// `import` handler. Reads JSON from `import_reader` (defaulting to
@@ -184,7 +340,7 @@ pub fn import(
     json_out: bool,
     cli_agent_id: Option<&str>,
     out: &mut CliOutput<'_>,
-) -> Result<()> {
+) -> Result<i32> {
     let mut buf = String::new();
     use std::io::Read as _;
     std::io::stdin().read_to_string(&mut buf)?;
@@ -193,6 +349,7 @@ pub fn import(
 
 /// Stdin-decoupled half of `import`. Tests call this directly with a
 /// literal payload instead of redirecting the process's stdin.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn import_from_str(
     payload: &str,
     db_path: &Path,
@@ -200,7 +357,30 @@ pub(crate) fn import_from_str(
     json_out: bool,
     cli_agent_id: Option<&str>,
     out: &mut CliOutput<'_>,
-) -> Result<()> {
+) -> Result<i32> {
+    // v1.0.0 #2490 — resolve (and where necessary REFUSE) the configured
+    // store BEFORE any row is written. Executed evidence at the parent
+    // commit: with `AI_MEMORY_STORE_URL=postgres://…` and no `--db` file
+    // present, `import` exited 0 reporting `{"imported":1}` — into a
+    // freshly-conjured SQLite file the served Postgres store never reads.
+    // The write is not "diverged", it is simply LOST, at the moment the
+    // operator is told it landed.
+    //
+    // `import` WRITES, so a `sqlite://` URL that disagrees with `--db` is
+    // REFUSED rather than silently redirected — the read-verb redirect would
+    // send a scratch import into the deployment's real database (F5).
+    let target_db = crate::cli::backup::resolve_sqlite_store(
+        db_path,
+        args.store_url.as_deref(),
+        VERB_IMPORT,
+        crate::cli::backup::StoreDisagreement::Refuse,
+        out,
+    )?;
+    // Deliberately NO `!exists` refusal here (unlike `export`): importing
+    // into a fresh local database is the documented restore path
+    // (`docs/USER_GUIDE.md` §"Export and Backup"), so creating the file is
+    // the operation, not a false-success.
+    let db_path = target_db.as_path();
     let data: serde_json::Value = serde_json::from_str(payload)?;
 
     // v1.0.0 #2006 — a v2 integrity envelope carries `spec_version`. Route it
@@ -253,13 +433,36 @@ pub(crate) fn import_from_str(
                 "warning: --trust-source: agent_id from imported JSON was preserved as-is"
             )?;
         }
-        return Ok(());
+        // v1.0.0 #2490 — the v2 importer already counts every per-row
+        // refusal in its report, but returned `Ok(())` unconditionally, so a
+        // bundle whose rows were ALL refused still exited 0. Refusals are a
+        // failure to reconstruct the bundle; the covenant-honoured skips
+        // (a destination forget tombstone, a dest-archived id) are NOT —
+        // they are steady-state on any repeated restore, and an
+        // in-place-edited row lands in `archived_memories` by #1725, so
+        // counting them would pin a re-import forever-red (objection O9).
+        let refused = report.invalid_skipped
+            + report.invalid_links_skipped
+            + report.links_skipped_missing_endpoint
+            + report.conflicts_skipped
+            + report.forged_signature_skipped
+            + report.governance_rejected;
+        return Ok(import_exit_code(refused, out)?);
     }
 
     let memories: Vec<models::Memory> =
         serde_json::from_value(data.get("memories").cloned().unwrap_or_default())?;
-    let links: Vec<models::MemoryLink> =
-        serde_json::from_value(data.get("links").cloned().unwrap_or_default()).unwrap_or_default();
+    // v1.0.0 #2490 — PER-ELEMENT link parse.
+    //
+    // The pre-fix line was
+    // `serde_json::from_value::<Vec<MemoryLink>>(..).unwrap_or_default()`,
+    // so a SINGLE edge serde could not deserialize — an unrecognised
+    // `relation` token, a missing field — collapsed the WHOLE array to
+    // empty. Every other edge in the bundle vanished with it, uncounted and
+    // unreported, and the import still exited 0. Parsing element-by-element
+    // confines the failure to the edge that caused it and lets it be
+    // reported like any other refusal.
+    let (links, mut malformed_links) = parse_links_leniently(data.get("links"));
 
     let caller_id = identity::resolve_agent_id(cli_agent_id, None)?;
     let conflict_mode: ConflictMode = args.on_conflict.into();
@@ -268,6 +471,21 @@ pub(crate) fn import_from_str(
     let mut imported = 0usize;
     let mut restamped = 0usize;
     let mut errors = Vec::new();
+    // v1.0.0 #2490 — split the per-row dispositions. `errors` used to hold
+    // BOTH kinds and the command exited 0 regardless; the counters below are
+    // what the exit code is computed from.
+    //
+    // `covenant_skipped` = a destination forget tombstone or a dest-archived
+    // id refused re-admission. These are the substrate HONOURING an erasure /
+    // archival decision, they are steady-state on any repeat restore, and
+    // #1725 puts every in-place-edited row into `archived_memories` — so
+    // treating them as failures would make a re-import forever-red and the
+    // alarm would be `|| true`-ed away (objection O9).
+    let mut covenant_skipped = 0usize;
+    let mut covenant_skipped_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    // `refused` = the bundle could NOT be faithfully reconstructed here.
+    let mut refused = 0usize;
     for mut mem in memories {
         // #2208 re-audit N1 — the v1 wire-form must honour the SAME forget
         // covenant as the v2 route: stripping `spec_version` from a bundle
@@ -279,6 +497,8 @@ pub(crate) fn import_from_str(
                 "{}: skipped — a destination forget tombstone forbids re-admission",
                 mem.id
             ));
+            covenant_skipped += 1;
+            covenant_skipped_ids.insert(mem.id.clone());
             continue;
         }
         // #2208 N1 mirror — a dest-ARCHIVED id must not be re-admitted live
@@ -289,6 +509,32 @@ pub(crate) fn import_from_str(
                  (restore via memory_archive_restore, not import)",
                 mem.id
             ));
+            covenant_skipped += 1;
+            covenant_skipped_ids.insert(mem.id.clone());
+            continue;
+        }
+        // v1.0.0 #2490 — REDACTION-OVERWRITE REFUSAL.
+        //
+        // `ai-memory export` runs the secret screen over every surviving row
+        // and silently MUTATES `content` / `title` / `tags` / metadata string
+        // leaves, replacing credential values with
+        // `secret_screen::REDACTION_PLACEHOLDER`. Executed at the parent
+        // commit: a row stored as `aws key AKIA… token ghp_…` exported as
+        // `aws key [REDACTED:secret] token [REDACTED:secret]`, and importing
+        // that artifact back PERSISTED the masked string as the durable
+        // content. That is the one path where an export-time confidentiality
+        // control turns into destruction of the source of truth at restore
+        // time — the sharpest possible reading of "never corrupt".
+        //
+        // So: refuse to REPLACE a live, unmasked destination row with a
+        // masked incoming one. A masked row is still admitted when the
+        // destination has no such row (nothing is being destroyed) or when
+        // the destination row is itself already masked (no information is
+        // lost). This is the guard that makes the "report redaction, exit 0"
+        // export disposition safe (5-agent vote 4d3ea1c5, objection O7).
+        if let Some(reason) = redaction_would_clobber(&conn, &mem)? {
+            errors.push(format!("{}: refused — {reason}", mem.id));
+            refused += 1;
             continue;
         }
         if !args.trust_source {
@@ -335,6 +581,7 @@ pub(crate) fn import_from_str(
         }
         if let Err(e) = validate::validate_memory(&mem) {
             errors.push(format!("{}: {}", mem.id, e));
+            refused += 1;
             continue;
         }
         // #1780 — honour the operator's collision disposition instead
@@ -343,21 +590,67 @@ pub(crate) fn import_from_str(
         // continues; the whole import is never aborted on one row.
         match db::insert_with_conflict(&conn, &mem, conflict_mode) {
             Ok(_) => imported += 1,
-            Err(e) => errors.push(format!("{}: {}", mem.id, e)),
+            Err(e) => {
+                errors.push(format!("{}: {}", mem.id, e));
+                refused += 1;
+            }
         }
     }
+    // v1.0.0 #2490 — LINKS WERE TOTALLY SILENT. The pre-fix loop was
+    // `if validate_link(..).is_err() { continue; }` followed by
+    // `let _ = db::create_link(..)`, and links were never counted in the
+    // report at all. Executed at the parent commit: importing a bundle whose
+    // link has a missing endpoint reported `{"imported":1,"errors":[]}`,
+    // exit 0, EMPTY stderr — and zero links landed. Same for an unrecognised
+    // relation. A restore whose entire graph vanished reported success.
+    let mut links_imported = 0usize;
+    let mut links_refused = 0usize;
+    let mut links_skipped_by_covenant = 0usize;
+    for reason in malformed_links.drain(..) {
+        errors.push(reason);
+        links_refused += 1;
+    }
     for link in links {
-        if validate::validate_link(&link.source_id, &link.target_id, link.relation.as_str())
-            .is_err()
+        if let Err(e) =
+            validate::validate_link(&link.source_id, &link.target_id, link.relation.as_str())
         {
+            errors.push(format!(
+                "link {}->{}: refused — failed validation: {e}",
+                link.source_id, link.target_id
+            ));
+            links_refused += 1;
             continue;
         }
-        let _ = db::create_link(
+        // An edge whose endpoint was withheld by the forget/archive covenant
+        // above is a DOWNSTREAM consequence of an honoured erasure, not a
+        // reconstruction failure — count it separately so a repeat restore of
+        // an edited corpus does not go red (objection O9).
+        if covenant_skipped_ids.contains(&link.source_id)
+            || covenant_skipped_ids.contains(&link.target_id)
+        {
+            errors.push(format!(
+                "link {}->{}: skipped — an endpoint was withheld by the destination \
+                 forget/archive covenant",
+                link.source_id, link.target_id
+            ));
+            links_skipped_by_covenant += 1;
+            continue;
+        }
+        match db::create_link(
             &conn,
             &link.source_id,
             &link.target_id,
             link.relation.as_str(),
-        );
+        ) {
+            Ok(()) => links_imported += 1,
+            Err(e) => {
+                errors.push(format!(
+                    "link {}->{}: refused — {e}",
+                    link.source_id, link.target_id
+                ));
+                links_refused += 1;
+            }
+        }
     }
     if json_out {
         writeln!(
@@ -367,13 +660,22 @@ pub(crate) fn import_from_str(
                 "imported": imported,
                 "restamped": restamped,
                 "trusted_source": args.trust_source,
+                // #2490 — links are now REPORTED. `links_imported` is the
+                // count that actually landed; the two skip counters carry the
+                // reason so a restore can be audited from the report alone.
+                "links_imported": links_imported,
+                "links_refused": links_refused,
+                "links_skipped_by_covenant": links_skipped_by_covenant,
+                "refused": refused,
+                "skipped_by_covenant": covenant_skipped,
                 "errors": errors
             })
         )?;
     } else {
         writeln!(
             out.stdout,
-            "imported: {imported} (restamped agent_id on {restamped})"
+            "imported: {imported} (restamped agent_id on {restamped}), \
+             links: {links_imported}"
         )?;
         if args.trust_source {
             writeln!(
@@ -387,7 +689,110 @@ pub(crate) fn import_from_str(
             }
         }
     }
-    Ok(())
+    import_exit_code(refused + links_refused, out)
+}
+
+/// v1.0.0 #2490 — decide the `import` exit code from the count of rows /
+/// edges the destination could NOT faithfully reconstruct.
+///
+/// Pre-fix, `import` returned `Ok(())` unconditionally: a bundle in which
+/// every memory was refused and every link silently vanished still reported
+/// success. That is the #2444 false-success class on the RESTORE side, which
+/// is strictly worse than on the backup side — it is the moment the operator
+/// has already lost the original.
+///
+/// Covenant-honoured skips are deliberately NOT counted by the caller (see
+/// the call sites): a destination forget tombstone and a dest-archived id are
+/// the substrate doing its job, and they recur on every repeat restore.
+fn import_exit_code(refused: usize, out: &mut CliOutput<'_>) -> Result<i32> {
+    if refused == 0 {
+        return Ok(0);
+    }
+    writeln!(
+        out.stderr,
+        "ERROR: this import was INCOMPLETE — {refused} row(s)/edge(s) in the bundle could not \
+         be applied (see the per-row reasons above). The destination does NOT hold a faithful \
+         copy of the bundle. Exiting {} so a restore job cannot mistake it for a complete one \
+         (#2490).",
+        crate::export_scope::EXIT_EXPORT_INCOMPLETE
+    )?;
+    Ok(crate::export_scope::EXIT_EXPORT_INCOMPLETE)
+}
+
+/// v1.0.0 #2490 — deserialize the `links` array ELEMENT BY ELEMENT.
+///
+/// Returns the edges that parsed plus one operator-facing reason per edge
+/// that did not. The pre-fix whole-array `unwrap_or_default()` meant one
+/// bad edge silently discarded every good one; confining the failure keeps
+/// the rest of the graph and makes the loss reportable.
+fn parse_links_leniently(
+    raw: Option<&serde_json::Value>,
+) -> (Vec<models::MemoryLink>, Vec<String>) {
+    let mut parsed = Vec::new();
+    let mut malformed = Vec::new();
+    let Some(serde_json::Value::Array(items)) = raw else {
+        return (parsed, malformed);
+    };
+    for (idx, item) in items.iter().enumerate() {
+        match serde_json::from_value::<models::MemoryLink>(item.clone()) {
+            Ok(link) => parsed.push(link),
+            Err(e) => malformed.push(format!(
+                "link[{idx}] {}->{}: refused — the bundle entry did not parse ({e}); \
+                 the rest of the graph was still applied (#2490)",
+                item.get("source_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("<absent>"),
+                item.get("target_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("<absent>"),
+            )),
+        }
+    }
+    (parsed, malformed)
+}
+
+/// v1.0.0 #2490 — would applying `incoming` REPLACE a live, unmasked
+/// destination row with a secret-screen-masked one?
+///
+/// Returns the operator-facing reason when the write would destroy readable
+/// content, `None` when it is safe.
+///
+/// The check is deliberately narrow: masking is only a problem when it
+/// OVERWRITES something better. A masked row landing where the destination
+/// has nothing loses no information (the artifact is all that survives), and
+/// a masked row landing on an already-masked row is a no-op. Both are
+/// admitted.
+fn redaction_would_clobber(
+    conn: &rusqlite::Connection,
+    incoming: &models::Memory,
+) -> Result<Option<String>> {
+    let placeholder = crate::secret_screen::REDACTION_PLACEHOLDER;
+    if !incoming.content.contains(placeholder) && !incoming.title.contains(placeholder) {
+        return Ok(None);
+    }
+    // The destination row this write would land on: same id first (the
+    // ConflictMode::Merge upsert keys on `(title, namespace)`, but an id
+    // collision is the more direct clobber).
+    let existing = db::get(conn, &incoming.id)?.or(db::find_by_title_namespace(
+        conn,
+        &incoming.title,
+        &incoming.namespace,
+    )?
+    .and_then(|id| db::get(conn, &id).ok().flatten()));
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
+    if existing.content.contains(placeholder) {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "the incoming row's content carries the secret-screen placeholder `{placeholder}` \
+         but the destination row {} holds unmasked content. Applying it would persist the \
+         mask as the durable source of truth, destroying readable data that this import \
+         cannot restore. Re-export from the source with AI_MEMORY_SECRET_SCREEN_MODE=off, \
+         or delete the destination row first if the mask is intended (#2490)",
+        existing.id
+    )))
 }
 
 /// `mine` handler.
@@ -702,6 +1107,7 @@ mod tests {
         let dst_db = dst.db_path.clone();
         let args = ImportArgs {
             trust_source: false,
+            store_url: None,
             on_conflict: OnConflict::Version,
         };
         {
@@ -753,6 +1159,7 @@ mod tests {
         let dst_db = dst.db_path.clone();
         let args = ImportArgs {
             trust_source: false,
+            store_url: None,
             on_conflict: OnConflict::Version,
         };
         {
@@ -826,6 +1233,7 @@ mod tests {
                 &default_db,
                 &ImportArgs {
                     trust_source: false,
+                    store_url: None,
                     on_conflict: OnConflict::Version,
                 },
                 true,
@@ -866,6 +1274,7 @@ mod tests {
                 &trusted_db,
                 &ImportArgs {
                     trust_source: true,
+                    store_url: None,
                     on_conflict: OnConflict::Version,
                 },
                 true,
@@ -915,6 +1324,7 @@ mod tests {
         let dst_db = dst.db_path.clone();
         let args = ImportArgs {
             trust_source: true,
+            store_url: None,
             on_conflict: OnConflict::Version,
         };
         {
@@ -955,6 +1365,7 @@ mod tests {
         let dst_db = dst.db_path.clone();
         let args = ImportArgs {
             trust_source: false,
+            store_url: None,
             on_conflict: OnConflict::Version,
         };
         {
@@ -1019,7 +1430,16 @@ mod tests {
         let mut buf = Vec::<u8>::new();
         let mut errbuf = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut buf, &mut errbuf);
-        export(db_path, &ExportArgs { full: true }, &mut out).unwrap();
+        export(
+            db_path,
+            &ExportArgs {
+                full: true,
+                store_url: None,
+                expect_withheld: None,
+            },
+            &mut out,
+        )
+        .unwrap();
         String::from_utf8(buf).unwrap()
     }
 
@@ -1048,6 +1468,7 @@ mod tests {
                 &v1_db,
                 &ImportArgs {
                     trust_source: false,
+                    store_url: None,
                     on_conflict: OnConflict::Version,
                 },
                 true,
@@ -1089,6 +1510,7 @@ mod tests {
                 &v2_db,
                 &ImportArgs {
                     trust_source: false,
+                    store_url: None,
                     on_conflict: OnConflict::Version,
                 },
                 true,
@@ -1138,6 +1560,7 @@ mod tests {
         .to_string();
         let args = ImportArgs {
             trust_source: false,
+            store_url: None,
             on_conflict: OnConflict::Version,
         };
         let err = {
@@ -1168,6 +1591,7 @@ mod tests {
         let dst_db = dst.db_path.clone();
         let args = ImportArgs {
             trust_source: false,
+            store_url: None,
             on_conflict: OnConflict::Version,
         };
         let err = {
@@ -1218,6 +1642,7 @@ mod tests {
         let dst_db = dst.db_path.clone();
         let args = ImportArgs {
             trust_source: false,
+            store_url: None,
             on_conflict: OnConflict::Version,
         };
         {
@@ -1297,6 +1722,7 @@ mod tests {
         .to_string();
         let args = ImportArgs {
             trust_source: true,
+            store_url: None,
             on_conflict: OnConflict::Version,
         };
         {
@@ -1329,6 +1755,7 @@ mod tests {
         .to_string();
         let args = ImportArgs {
             trust_source: true,
+            store_url: None,
             on_conflict: OnConflict::Version,
         };
         {
@@ -1355,6 +1782,7 @@ mod tests {
         let dst_db = dst.db_path.clone();
         let args = ImportArgs {
             trust_source: true,
+            store_url: None,
             on_conflict: OnConflict::Merge,
         };
         {
@@ -1418,6 +1846,7 @@ mod tests {
         );
         let args = ImportArgs {
             trust_source: true,
+            store_url: None,
             on_conflict: OnConflict::Version,
         };
         {
@@ -1460,6 +1889,7 @@ mod tests {
         );
         let args = ImportArgs {
             trust_source: true,
+            store_url: None,
             on_conflict: OnConflict::Error,
         };
         {
@@ -1790,6 +2220,7 @@ mod tests {
         .to_string();
         let args = ImportArgs {
             trust_source: true,
+            store_url: None,
             on_conflict: OnConflict::Version,
         };
         {
@@ -1834,6 +2265,7 @@ mod tests {
         .to_string();
         let args = ImportArgs {
             trust_source: true,
+            store_url: None,
             on_conflict: OnConflict::Version,
         };
         {
@@ -1871,6 +2303,7 @@ mod tests {
         .to_string();
         let args = ImportArgs {
             trust_source: true,
+            store_url: None,
             on_conflict: OnConflict::Version,
         };
         {
@@ -1916,6 +2349,7 @@ mod tests {
         .to_string();
         let args = ImportArgs {
             trust_source: false,
+            store_url: None,
             on_conflict: OnConflict::Version,
         };
         {
@@ -1960,6 +2394,7 @@ mod tests {
         .to_string();
         let args = ImportArgs {
             trust_source: false,
+            store_url: None,
             on_conflict: OnConflict::Version,
         };
         {

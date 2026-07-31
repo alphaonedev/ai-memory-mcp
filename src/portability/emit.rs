@@ -179,11 +179,37 @@ pub fn build_full_envelope(
     source: &str,
     exported_at: &str,
 ) -> Result<ExportEnvelope> {
+    Ok(build_full_envelope_audited(conn, source, exported_at)?.0)
+}
+
+/// v1.0.0 #2490 — the ACCOUNTING sibling of [`build_full_envelope`].
+///
+/// Identical envelope, plus the ledger of what the export confidentiality
+/// boundary withheld or mutated. `export --full` needs it because the
+/// envelope's own `portability_complete` marker is computed solely from the
+/// audit-chain re-verify + operator anchor and is therefore structurally
+/// blind to withheld rows — so an artifact could assert completeness over a
+/// corpus it provably did not carry.
+///
+/// # Errors
+///
+/// Propagates the underlying read / verify errors.
+pub fn build_full_envelope_audited(
+    conn: &Connection,
+    source: &str,
+    exported_at: &str,
+) -> Result<(ExportEnvelope, crate::export_scope::ExportWithholdLedger)> {
     // v1 data classes (screened for the confidentiality boundary).
-    let memories = crate::export_taxonomy::screen_memories_for_export(
+    let (memories, mut ledger) = crate::export_taxonomy::screen_memories_for_export_audited(
         crate::storage::export_all(conn)?,
         Some(conn),
     );
+    // The SQL-level lifecycle/expiry exclusions never reach the screen, so
+    // account for them separately or the ledger under-reports (#2490 O4).
+    let (quarantined, tombstoned, expired) = crate::storage::export_excluded_counts(conn)?;
+    ledger.quarantined = quarantined;
+    ledger.tombstoned = tombstoned;
+    ledger.expired = expired;
     let links = crate::storage::export_links(conn)?;
 
     // Signed classes → byte-preserved DTOs.
@@ -297,25 +323,28 @@ pub fn build_full_envelope(
     };
 
     let count = memories.len();
-    Ok(ExportEnvelope {
-        spec_version: SPEC_VERSION_V2.to_string(),
-        db_schema_version: db_schema_version(conn)?,
-        source: source.to_string(),
-        exported_at: exported_at.to_string(),
-        memories,
-        links,
-        signed_events,
-        memory_revisions,
-        forget_tombstones,
-        agent_lineage,
-        model_attestations,
-        governance_rules,
-        trust_anchors,
-        portability_complete: conformance_level == ConformanceLevel::L3,
-        conformance_level: conformance_level.as_str().to_string(),
-        conformance_by_class: by_class,
-        count,
-    })
+    Ok((
+        ExportEnvelope {
+            spec_version: SPEC_VERSION_V2.to_string(),
+            db_schema_version: db_schema_version(conn)?,
+            source: source.to_string(),
+            exported_at: exported_at.to_string(),
+            memories,
+            links,
+            signed_events,
+            memory_revisions,
+            forget_tombstones,
+            agent_lineage,
+            model_attestations,
+            governance_rules,
+            trust_anchors,
+            portability_complete: conformance_level == ConformanceLevel::L3 && !ledger.is_partial(),
+            conformance_level: conformance_level.as_str().to_string(),
+            conformance_by_class: by_class,
+            count,
+        },
+        ledger,
+    ))
 }
 
 #[cfg(test)]
