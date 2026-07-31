@@ -821,6 +821,18 @@ pub const LANE_PENDING_DECISIONS: &str = "pending_decisions";
 /// exactly as `deletions[]` does, so it takes the same prose.
 pub const LANE_PENDING_DECISION_DELETE: &str = "pending_decisions (delete)";
 
+/// #2479 — lane token for the `/sync/push` `namespace_meta[]` subcollection
+/// (the inbound governance-STANDARD bind / re-parent).
+pub const LANE_NAMESPACE_META: &str = "namespace_meta";
+
+/// #2479 — lane token for the DESTRUCTIVE `/sync/push` `namespace_meta_clears[]`
+/// subcollection. Kept distinct from [`LANE_NAMESPACE_META`] because clearing a
+/// standard is a bare `DELETE FROM namespace_meta` that DISARMS a namespace's
+/// governance (absent policy resolves permissive, the allow-on-silence default),
+/// which is a different operator remedy from a refused bind — and because
+/// [`lane_is_destructive`] must give it the destructive refusal prose.
+pub const LANE_NAMESPACE_META_CLEARS: &str = "namespace_meta_clears";
+
 /// Whether `lane` names a funnel whose refusal prose must describe a
 /// DESTRUCTIVE effect rather than a write.
 ///
@@ -828,7 +840,60 @@ pub const LANE_PENDING_DECISION_DELETE: &str = "pending_decisions (delete)";
 /// destructive lane is a single edit here and cannot silently inherit the
 /// write-lane wording (#2478, extending the #2488 prose fix).
 fn lane_is_destructive(lane: &str) -> bool {
-    matches!(lane, LANE_DELETIONS | LANE_PENDING_DECISION_DELETE)
+    matches!(
+        lane,
+        LANE_DELETIONS | LANE_PENDING_DECISION_DELETE | LANE_NAMESPACE_META_CLEARS
+    )
+}
+
+/// The GLOBAL namespace standard's key — the row
+/// `crate::storage::build_namespace_chain` unconditionally prepends to the
+/// inheritance chain of EVERY namespace in the substrate.
+///
+/// Declared here (rather than re-spelled at each branch) because #2479's
+/// Amendment E turns it into a security-relevant token: a `namespace_meta` row
+/// on this key is not one namespace's policy, it is the substrate-wide default.
+pub const GLOBAL_STANDARD_NAMESPACE: &str = "*";
+
+/// The one `allowed_namespaces` pattern that means "this peer may act in EVERY
+/// namespace" — the deliberate per-peer allow-all the #2447/#2497 docs name as
+/// the recovery for an over-tight scope.
+///
+/// `crate::federation::peer_attestation::glob_match` gives it that meaning; this
+/// const exists so #2479's Amendment E can test for the pattern LITERALLY (see
+/// [`peer_scope_is_allow_all`]) instead of asking `namespace_allowed` whether the
+/// peer may write the namespace `*`, which is the very question that is unsafe.
+pub const ALLOW_ALL_NAMESPACE_PATTERN: &str = "**";
+
+/// #2479 Amendment E — whether the operator DECLARED an unconditional allow-all
+/// scope for this peer.
+///
+/// # Why this is not `namespace_allowed(peer, "*", cfg)`
+///
+/// `glob_match` treats a bare `*` as "any SINGLE-segment target" (#1902), and
+/// the literal string `"*"` contains no `/` — so `glob_match("*", "*")` is
+/// `true`. An operator who writes `allowed_namespaces: ["*"]`, documented as
+/// "any top-level namespace", would therefore also be granting the GLOBAL
+/// standard, whose reach is every DEEP namespace the peer explicitly may NOT
+/// write. That is precisely the whole-tree widening #1902 closed inside
+/// `glob_match`, re-opened by a different door. So Amendment E asks a different
+/// question — "did the operator declare `**`?" — and answers it by literal
+/// comparison, with no glob semantics involved.
+#[must_use]
+pub fn peer_scope_is_allow_all(
+    peer_id: Option<&str>,
+    attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
+) -> bool {
+    peer_id
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .and_then(|p| attest_cfg.scope_for(p))
+        .is_some_and(|scope| {
+            scope
+                .allowed_namespaces
+                .iter()
+                .any(|p| p == ALLOW_ALL_NAMESPACE_PATTERN)
+        })
 }
 
 /// #2488 — distinguishable refusal cause for a federated deletion that was
@@ -1136,6 +1201,140 @@ pub fn inbound_by_id_namespace_authorized(
             require_push_namespace_scope,
         ),
     }
+}
+
+/// #2479 (CWE-284) — namespace confinement for the `/sync/push` GOVERNANCE-
+/// STANDARD lanes (`namespace_meta[]` + `namespace_meta_clears[]`), routed
+/// through the SAME shared Layer-1/Layer-2 verdict every other confined lane
+/// uses so this lane's disposition of all four peer shapes is byte-identical to
+/// theirs and the empty-scope case honours
+/// `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE` rather than hard-coding one.
+///
+/// ## The hole this closes
+///
+/// The two loops validated `validate_namespace` / `validate_id` and nothing
+/// else, then called `db::set_namespace_standard` / `db::clear_namespace_standard`
+/// directly. Neither consulted the peer's `allowed_namespaces`. That is an
+/// authz-CONFIG takeover rather than a data write: the row selects the standard
+/// memory whose `metadata.governance` `resolve_governance_policy` returns, so it
+/// rewrites the rules every subsequent LOCAL write to that namespace is judged
+/// against — approval level, approver identity, delete gating — and the clear
+/// lane is the same reach in the destructive direction.
+///
+/// ## Which namespaces this gates, and which it provably cannot
+///
+/// The apply-path touches, and this function gates, the UNION of:
+///
+/// - **`namespace`** — the `namespace_meta` row written or deleted. It is the
+///   table's PRIMARY KEY, so unlike `memories[]` there is no id under which a
+///   row could be RELOCATED: declared and stored are the same string and the
+///   #2447 merge-clobber probe has no subject here. That is why this lane needs
+///   no by-id probe at all and this function is backend-blind.
+/// - **`declared_parent`** — spliced into that namespace's inheritance chain, so
+///   it changes which OTHER namespace's policy governs by reference rather than
+///   by value. Gated per the issue's own acceptance criterion ("a peer must not
+///   attach a namespace it owns as the parent of one it does not, nor vice
+///   versa"). Two honest caveats: (a) `build_namespace_chain` consults the
+///   explicit parent only on the ROOT `/` segment of a queried namespace, so a
+///   parent stored on `a/b` is inert for `a/b`'s own chain and this gate is
+///   behaviour-relevant only for single-segment namespaces; (b) a parent of
+///   literal `*` is likewise inert (the chain walk skips it) yet is still gated
+///   here for uniformity — an operator hitting that refusal should drop the
+///   redundant field, since the global standard is already in every chain.
+///
+/// It does NOT and cannot gate:
+///
+/// - **the DESCENDANTS of `namespace`.** `resolve_governance_policy` walks
+///   leaf-first and returns the first level carrying a policy, so a peer scoped
+///   to an ANCESTOR (e.g. exactly `["secure"]`) sets the DEFAULT policy of every
+///   `secure/**` namespace that carries none of its own. Closing that needs
+///   pattern-vs-pattern subsumption, which the shared `glob_match` primitive
+///   structurally cannot express (it matches a pattern against a CONCRETE
+///   target), so a subtree variant was ranked LAST by the #2479 vote and is
+///   tracked separately rather than forked off the one #239 glob SSOT.
+/// - **the namespace the `standard_id` memory LIVES IN.** `set_namespace_standard`
+///   deliberately permits cross-namespace binding ("shared policy"), so gating it
+///   would break a documented feature; the read-amplification that binding a
+///   foreign memory enables is tracked separately.
+///
+/// ## Amendment E — the global standard is not just another namespace
+///
+/// A row on [`GLOBAL_STANDARD_NAMESPACE`] is the substrate-wide default policy,
+/// so it is refused UNLESS the operator declared an unconditional allow-all
+/// scope ([`peer_scope_is_allow_all`]). That check runs BEFORE the layered
+/// verdict and is therefore NOT governed by
+/// `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE`: the knob is a per-peer rollout
+/// hatch for one config shape, and a hatch that hands a peer the governance
+/// default of every namespace on the node is not that. See
+/// [`peer_scope_is_allow_all`] for why `glob_match("*", "*") == true` makes the
+/// naive check unsafe.
+///
+/// ## Zero-config
+///
+/// Short-circuits on [`PeerAttestationConfig::has_allowlist`] exactly like every
+/// sibling lane, so a node with no `AI_MEMORY_FED_PEER_ATTESTATION` replicates
+/// governance standards byte-identically to pre-#2479. Callers MUST ALSO wrap the
+/// call in that same predicate (the #2491 lesson is that a gate which runs
+/// unconditionally is how a lane goes silently dark).
+///
+/// [`PeerAttestationConfig::has_allowlist`]: crate::federation::peer_attestation::PeerAttestationConfig::has_allowlist
+///
+/// Returns `true` when the entry may proceed; `false` with an
+/// operator-actionable WARN already emitted, in which case the caller must count
+/// the refusal and `continue`.
+#[must_use]
+pub fn inbound_namespace_meta_authorized(
+    lane: &str,
+    namespace: &str,
+    declared_parent: Option<&str>,
+    attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
+    peer_id: Option<&str>,
+    require_push_namespace_scope: bool,
+) -> bool {
+    use crate::handlers::federation_receive::ATTESTATION_TRACE_TARGET;
+
+    // Zero-config: byte-identical faith-based replication.
+    if !attest_cfg.has_allowlist() {
+        return true;
+    }
+
+    // Amendment E — before, and independent of, the layered verdict.
+    if namespace == GLOBAL_STANDARD_NAMESPACE && !peer_scope_is_allow_all(peer_id, attest_cfg) {
+        tracing::warn!(
+            target: ATTESTATION_TRACE_TARGET,
+            namespace = %namespace,
+            peer_id = %peer_id.unwrap_or(""),
+            "sync_push: refusing federated {lane} entry on the GLOBAL standard '*' — that row \
+             is not one namespace's policy, it is the substrate-wide default that \
+             build_namespace_chain prepends to EVERY namespace's inheritance chain, including \
+             deep namespaces this peer may not write (#2479 Amendment E). This refusal is \
+             UNCONDITIONAL: AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE does not govern it. \
+             Note a bare \"*\" in allowed_namespaces means ONE top-level segment (#1902), not \
+             allow-all — declare \"**\" for this peer if it is genuinely trusted to set the \
+             substrate-wide governance default."
+        );
+        return false;
+    }
+
+    // The row's own namespace, then the parent it splices above that namespace.
+    // `namespace` is the table PRIMARY KEY, so there is no stored-vs-claimed
+    // split to resolve and no probe to elide — both subjects are on the wire.
+    for candidate in [Some(namespace), declared_parent] {
+        let Some(candidate) = candidate else { continue };
+        if !inbound_write_namespace_authorized(
+            lane,
+            namespace,
+            candidate,
+            None,
+            attest_cfg,
+            peer_id,
+            require_push_namespace_scope,
+        ) {
+            return false;
+        }
+    }
+
+    true
 }
 
 #[cfg(test)]
