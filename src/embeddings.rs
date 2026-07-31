@@ -287,8 +287,15 @@ pub fn clear_query_embed_cache() {
 #[must_use]
 pub fn recall_query_embedding(embedder: &dyn Embed, text: &str) -> Option<Vec<f32>> {
     let capacity = query_embed_cache_capacity();
-    let space = embedder.space_fingerprint();
-    let key = (capacity > 0).then(|| query_embed_key(text, &space));
+    // #2577 — cache ONLY when the embedder declares a space that is a
+    // faithful identifier of its vectors. `None` (the trait default) opts
+    // out: see [`Embed::query_cache_space`] for why keying on
+    // `space_fingerprint` alone is unsound and how it produced a
+    // `mode:hybrid` response from an embedder that never ran.
+    let key = embedder
+        .query_cache_space()
+        .filter(|_| capacity > 0)
+        .map(|space| query_embed_key(text, &space));
 
     if let Some(k) = key.as_ref()
         && let Ok(mut cache) = query_embed_cache().lock()
@@ -876,6 +883,36 @@ pub trait Embed: Send + Sync {
     /// scored against a live query in production).
     fn space_fingerprint(&self) -> String {
         embedding_space_fingerprint("mock-embedder")
+    }
+
+    /// v1.0.0 #2577 — the key under which this embedder's query vectors may
+    /// be cached process-wide, or `None` to opt OUT of caching entirely.
+    ///
+    /// **Defaults to `None`, and that default is load-bearing.** The cache
+    /// is shared by the whole process and keyed on the embedding SPACE, so
+    /// caching is only sound when the reported space is a faithful
+    /// identifier of the vectors produced — i.e. when two embedders that
+    /// report the same space really do produce the same vector for the same
+    /// text. [`Embed::space_fingerprint`]'s own default returns a single
+    /// CONSTANT sentinel for every implementor that does not override it,
+    /// so that value CANNOT serve as a cache key: two unrelated embedders
+    /// would collide, and one could be served the other's vectors.
+    ///
+    /// That is not a hypothetical. It was caught by CI on the first run of
+    /// this feature: with the cache keyed on `space_fingerprint`, a
+    /// deliberately-FAILING embedder was served a previous test's cached
+    /// vector, never called at all, and the recall reported `mode:hybrid`
+    /// when it should have degraded to `mode:keyword`. A cache that can
+    /// mask an embedder failure and then claim a semantic ranking it never
+    /// performed is a WRONG RESULT on the wire, not a slow one.
+    ///
+    /// So the opt-in is explicit and the fail-safe direction is "do not
+    /// cache": an implementor that has not reasoned about this gets correct
+    /// behaviour at the cost of a remote round trip. Only the production
+    /// [`Embedder`] overrides it, because only its fingerprint is derived
+    /// from the resolved model id + prefix scheme.
+    fn query_cache_space(&self) -> Option<String> {
+        None
     }
 }
 
@@ -1804,6 +1841,13 @@ impl Embed for Embedder {
     fn space_fingerprint(&self) -> String {
         // Delegate to the inherent #2168 method (returns the SSOT fingerprint).
         Embedder::space_fingerprint(self)
+    }
+
+    fn query_cache_space(&self) -> Option<String> {
+        // The production embedder derives its fingerprint from the RESOLVED
+        // model id + prefix scheme, so two instances sharing it genuinely
+        // produce the same vectors. Safe to cache across instances.
+        Some(Embedder::space_fingerprint(self))
     }
 }
 
