@@ -555,12 +555,15 @@ scope gate failed closed — the second is operator-actionable at the
 RECEIVER's storage rather than the sender's allowlist, and is dormant
 until the delete lane gains a DLQ enqueue (#2498). **#2442** deliberately did NOT add a cause label for legacy positional
 routing keys. That condition is decided from the SHAPE of `peer_id`
-(structured input) rather than from a substring of `last_error`, because
-`classify_quarantine_cause` is an ORDERED SUBSTRING matcher over a string
-that peer-supplied text can reach — an arm there would hand a hostile peer
-a way to disguise a systematic refusal as an upgrade artifact operators
-have been told to ignore, and it would override the row's REAL cause (a
-legacy-keyed row that was already failing `http 400` is still `permanent`).
+(structured input a peer cannot influence) rather than from a substring of
+`last_error`, because `classify_quarantine_cause` is an ORDERED SUBSTRING
+matcher and a peer-supplied INTEGER already reaches that string: the
+receiver's own `skipped` count is interpolated into the failure reason, so
+a peer answering 200 with `{"skipped": 429}` mints a `429` substring that
+matches this classifier's first arm AND `reset_throttled_quarantine`'s
+`LIKE '%429%'` (#2672). An arm keyed on a token in `last_error` would widen
+that laundering surface, and it would override the row's REAL cause (a
+legacy-keyed row already failing `http 400` is still `permanent`).
 It has its own counter instead:
 `ai_memory_federation_push_dlq_legacy_positional_total`, incremented once
 per affected row per replay pass. Non-zero after an upgrade means rows

@@ -202,10 +202,13 @@ pub struct Metrics {
     ///
     /// Deliberately its own counter rather than a new `cause` label on
     /// [`Self::federation_push_dlq_quarantined_by_cause`]: that label is
-    /// derived by ordered substring matching over `last_error`, which
-    /// peer-supplied text can reach, and the legacy condition is decided from
-    /// the SHAPE of `peer_id` instead. Keeping them separate also stops the
-    /// routing-key fact from overriding a row's REAL quarantine cause.
+    /// derived by ordered substring matching over `last_error`, which a
+    /// peer-supplied INTEGER can reach (the receiver's own `skipped` count is
+    /// interpolated into the failure reason, so `{"skipped": 429}` mints a
+    /// `429` substring — see #2672), whereas the legacy condition is decided
+    /// from the SHAPE of `peer_id`, which a peer cannot influence. Keeping
+    /// them separate also stops the routing-key fact from overriding a row's
+    /// REAL quarantine cause.
     ///
     /// Increments once per affected row per replay pass, so this is a rate,
     /// not a population count. A non-zero rate after an upgrade means legacy

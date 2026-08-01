@@ -317,17 +317,22 @@ use crate::federation::receive_auth::{
 /// a pre-#2442 POSITIONAL routing key.
 ///
 /// Deliberately NOT fed to [`classify_quarantine_cause`]. That classifier is
-/// an ORDERED SUBSTRING matcher over a string that peer-supplied text can
-/// reach (`sync::success_report_non_ack_reason` interpolates receiver-reported
-/// counts into the failure reason), so adding an arm for this marker would
-/// hand a hostile peer a way to disguise a genuine systematic refusal as an
-/// upgrade artifact operators have been told to ignore. It would ALSO
+/// an ORDERED SUBSTRING matcher over `last_error`, and while no peer-supplied
+/// TEXT reaches that string (every producer formats only counts, a status
+/// code, or a local error), a peer-supplied INTEGER does:
+/// `sync::success_report_non_ack_reason` interpolates the receiver's own
+/// `skipped` count via `as_u64`. A peer answering 200 with `{"skipped": 429}`
+/// therefore mints a `last_error` containing `429` — which already matches
+/// this classifier's FIRST arm (`quota`) and `reset_throttled_quarantine`'s
+/// `LIKE '%429%'` on both backends, resetting `attempt_count = 0` forever and
+/// defeating the quarantine ceiling (#2672). Adding an arm keyed on a token in
+/// this string would widen that same laundering surface. It would ALSO
 /// override the row's real quarantine cause: a legacy-keyed row that was
 /// already failing `http 400` is still a `permanent` row, and the routing key
 /// is the secondary fact. The legacy condition is decided from the SHAPE of
-/// `row.peer_id` — structured input — and surfaced on its own counter
-/// (`ai_memory_federation_push_dlq_legacy_positional_total`), never by
-/// string-matching an error message.
+/// `row.peer_id` — structured input a peer cannot influence — and surfaced on
+/// its own counter (`ai_memory_federation_push_dlq_legacy_positional_total`),
+/// never by string-matching an error message.
 const LEGACY_PEER_ID_MARKER: &str = "[#2442 legacy positional peer_id]";
 
 /// #2442 — has this row's `last_error` already been annotated with
