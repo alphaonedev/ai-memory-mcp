@@ -191,29 +191,27 @@ fn pending_peer_rows(path: &std::path::Path) -> Vec<(String, String, serde_json:
              WHERE peer_id <> ?1 AND replayed_at IS NULL ORDER BY memory_id, peer_id",
         )
         .expect("prepare peer-row query");
-    let rows = stmt
-        .query_map(rusqlite::params![SENTINEL_PEER_ID], |r| {
-            let id: String = r.get(0)?;
-            let peer: String = r.get(1)?;
-            let payload: String = r.get(2)?;
-            Ok((id, peer, payload))
-        })
-        .expect("query peer rows")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect peer rows")
-        .into_iter()
-        // The drainability marker rides in this table with `replayed_at`
-        // pre-set, so it can never appear here — assert that by filtering
-        // nothing and letting the count assertions speak.
-        .map(|(id, peer, payload)| {
-            (
-                id,
-                peer,
-                serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
-            )
-        })
-        .collect();
-    rows
+    // The drainability marker rides in this table with `replayed_at`
+    // pre-set, so it can never appear here — nothing is filtered out and
+    // the count assertions speak for themselves.
+    stmt.query_map(rusqlite::params![SENTINEL_PEER_ID], |r| {
+        let id: String = r.get(0)?;
+        let peer: String = r.get(1)?;
+        let payload: String = r.get(2)?;
+        Ok((id, peer, payload))
+    })
+    .expect("query peer rows")
+    .collect::<Result<Vec<_>, _>>()
+    .expect("collect peer rows")
+    .into_iter()
+    .map(|(id, peer, payload)| {
+        (
+            id,
+            peer,
+            serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+        )
+    })
+    .collect()
 }
 
 fn memory_exists(path: &std::path::Path, id: &str) -> bool {
@@ -233,7 +231,7 @@ fn memory_exists(path: &std::path::Path, id: &str) -> bool {
 
 /// Drive the REAL `ai-memory mcp` stdio binary through one `tools/call`
 /// and return the JSON-RPC response for it.
-fn mcp_tool_call(db_path: &std::path::Path, tool: &str, arguments: serde_json::Value) -> String {
+fn mcp_tool_call(db_path: &std::path::Path, tool: &str, arguments: &serde_json::Value) -> String {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
         .arg("mcp")
         .arg("--profile")
@@ -328,14 +326,16 @@ async fn spawn_mock_peer(state: PeerState) -> String {
     format!("http://{addr}")
 }
 
-fn build_cfg(peer_url: &str, sink: Arc<dyn ai_memory::federation::FederationDlqSink>) -> FederationConfig {
+fn build_cfg(
+    peer_url: &str,
+    sink: Arc<dyn ai_memory::federation::FederationDlqSink>,
+) -> FederationConfig {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(2000))
+        .timeout(Duration::from_secs(2))
         .build()
         .expect("build reqwest client");
     FederationConfig {
-        policy: QuorumPolicy::new(2, 2, Duration::from_millis(2000), Duration::from_secs(30))
-            .unwrap(),
+        policy: QuorumPolicy::new(2, 2, Duration::from_secs(2), Duration::from_secs(30)).unwrap(),
         peers: vec![PeerEndpoint {
             id: "peer-0".to_string(),
             sync_push_url: format!("{peer_url}/api/v1/sync/push"),
@@ -361,7 +361,11 @@ fn mcp_memory_delete_queues_an_erasure_outbox_row_2446() {
     let db = tmp.path().join("m.db");
     seed_db(&db, &["mcp-del-1"], true);
 
-    let resp = mcp_tool_call(&db, "memory_delete", serde_json::json!({"id": "mcp-del-1"}));
+    let resp = mcp_tool_call(
+        &db,
+        "memory_delete",
+        &serde_json::json!({"id": "mcp-del-1"}),
+    );
     assert!(
         !resp.contains("\"error\""),
         "#2446: memory_delete must succeed; got {resp}"
@@ -394,13 +398,16 @@ fn mcp_memory_forget_queues_erasure_outbox_rows_2446() {
     let db = tmp.path().join("m.db");
     seed_db(&db, &["mcp-fgt-1", "mcp-fgt-2", "mcp-fgt-3"], true);
 
-    let resp = mcp_tool_call(&db, "memory_forget", serde_json::json!({"namespace": NS}));
+    let resp = mcp_tool_call(&db, "memory_forget", &serde_json::json!({"namespace": NS}));
     assert!(
         !resp.contains("\"error\""),
         "#2446: memory_forget must succeed; got {resp}"
     );
 
-    let mut ids: Vec<String> = pending_sentinels(&db).into_iter().map(|(id, _)| id).collect();
+    let mut ids: Vec<String> = pending_sentinels(&db)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
     ids.sort();
     assert_eq!(
         ids,
@@ -475,7 +482,10 @@ fn cli_forget_queues_erasure_outbox_rows_2446() {
     )
     .expect("#2446: a local CLI forget must never start failing");
 
-    let mut ids: Vec<String> = pending_sentinels(&db).into_iter().map(|(id, _)| id).collect();
+    let mut ids: Vec<String> = pending_sentinels(&db)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
     ids.sort();
     assert_eq!(
         ids,
@@ -521,6 +531,35 @@ fn unconfigured_deployment_erasure_succeeds_and_queues_nothing_2446() {
     assert!(
         pending_peer_rows(&db).is_empty(),
         "#2446: and no per-peer rows either"
+    );
+
+    // Deliberately NOT a bare "nothing is queued" assertion — that is
+    // vacuously green at the parent commit, where nothing is EVER queued.
+    // The paired DRAINABLE database proves the marker is the actual
+    // discriminator, so this test can only pass when the bound is real
+    // AND the mechanism works.
+    let drainable = tmp.path().join("drainable.db");
+    seed_db(&drainable, &["paired-1"], true);
+    let mut out2 = Vec::new();
+    let mut err2 = Vec::new();
+    let mut cli_out2 = ai_memory::cli::io_writer::CliOutput::from_std(&mut out2, &mut err2);
+    ai_memory::cli::crud::cmd_delete(
+        &drainable,
+        &ai_memory::cli::crud::DeleteArgs {
+            id: "paired-1".to_string(),
+            capability: None,
+        },
+        true,
+        None,
+        &mut cli_out2,
+    )
+    .expect("erasure on the drainable twin");
+    assert_eq!(
+        pending_sentinels(&drainable).len(),
+        1,
+        "#2446: the SAME erasure on a DRAINABLE database must queue exactly one \
+         row — the drainability marker is the discriminator, not a blanket \
+         never-queue"
     );
 }
 
@@ -777,5 +816,109 @@ fn sentinel_and_real_peer_row_coexist_for_the_same_memory_2446() {
         pending_peer_rows(&db).len(),
         1,
         "#2446: and the pre-existing per-peer row must be untouched"
+    );
+}
+
+// ---------------------------------------------------------------------
+// (6) Postgres drain-side parity (live PG, opt-in)
+// ---------------------------------------------------------------------
+
+/// #2446 — the DRAIN side must be backend-blind. Nothing writes an
+/// erasure sentinel into the POSTGRES `federation_push_dlq` today (MCP
+/// stdio is sqlite-only by construction, CLAUDE.md #1675/n24, and the CLI
+/// erasure verbs open a local rusqlite connection), so this arm is not
+/// production-reachable — which is exactly why it needs a test: an
+/// invalid SQL string on an unreachable path ships undetected until the
+/// day it becomes reachable.
+///
+/// Runs only against a live PG named by `AI_MEMORY_TEST_POSTGRES_URL`;
+/// leaves ZERO residue (every row it writes carries the `pg-2446-` id
+/// prefix and is deleted at the end).
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+#[ignore = "requires a live postgres (AI_MEMORY_TEST_POSTGRES_URL)"]
+async fn pg_expand_erasure_sentinel_parity_2446() {
+    use ai_memory::federation::SentinelExpansion;
+    use ai_memory::federation::push_dlq::{FederationDlqSink, PostgresDlqSink};
+
+    let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+        eprintln!("pg parity skipped: AI_MEMORY_TEST_POSTGRES_URL unset");
+        return;
+    };
+    let store = ai_memory::store::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("connect live PG");
+    let pool = store.pool().clone();
+    let mem_id = format!("pg-2446-{}", chrono::Utc::now().timestamp_millis());
+
+    // Clean slate, then queue a sentinel exactly as a postgres-side writer
+    // would.
+    sqlx::query("DELETE FROM federation_push_dlq WHERE memory_id LIKE 'pg-2446-%'")
+        .execute(&pool)
+        .await
+        .expect("pre-clean");
+    let row_id: (i64,) = sqlx::query_as(
+        "INSERT INTO federation_push_dlq \
+             (memory_id, peer_id, payload_json, attempt_count, last_error) \
+         VALUES ($1, $2, $3::jsonb, 1, 'queued') RETURNING id",
+    )
+    .bind(&mem_id)
+    .bind(SENTINEL_PEER_ID)
+    .bind(serde_json::json!({"memories": [], "deletions": [mem_id.clone()]}).to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("queue pg sentinel");
+
+    let sink = PostgresDlqSink::new(std::sync::Arc::new(store.clone()));
+    let body = serde_json::json!({
+        "sender_agent_id": "ai:erasure-2446",
+        "memories": [],
+        "deletions": [mem_id.clone()],
+        "dry_run": false,
+    });
+    let outcome = sink
+        .expand_erasure_sentinel(
+            row_id.0,
+            1,
+            &mem_id,
+            &["peer-0".to_string(), "peer-1".to_string()],
+            &body,
+            "expanded",
+        )
+        .await
+        .expect("pg expansion must succeed");
+    assert_eq!(
+        outcome,
+        SentinelExpansion::Expanded(2),
+        "#2446: the postgres arm must expand the sentinel into one row per peer"
+    );
+
+    let pending: Vec<(String,)> = sqlx::query_as(
+        "SELECT peer_id FROM federation_push_dlq \
+         WHERE memory_id = $1 AND replayed_at IS NULL ORDER BY peer_id",
+    )
+    .bind(&mem_id)
+    .fetch_all(&pool)
+    .await
+    .expect("read back");
+    assert_eq!(
+        pending.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+        vec!["peer-0".to_string(), "peer-1".to_string()],
+        "#2446: the sentinel must be cleared and exactly the per-peer rows left"
+    );
+
+    // ZERO residue.
+    sqlx::query("DELETE FROM federation_push_dlq WHERE memory_id LIKE 'pg-2446-%'")
+        .execute(&pool)
+        .await
+        .expect("post-clean");
+    let residue: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM federation_push_dlq WHERE memory_id LIKE 'pg-2446-%'")
+            .fetch_one(&pool)
+            .await
+            .expect("residue check");
+    assert_eq!(
+        residue.0, 0,
+        "#2446: the pg parity test must leave no residue"
     );
 }

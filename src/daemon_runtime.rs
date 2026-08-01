@@ -5691,22 +5691,19 @@ pub async fn bootstrap_serve(
     }
 
     // v1.0.0 #2446 — erasure-outbox drainability marker. The MCP / CLI
-    // erasure funnels (`memory_delete` / `memory_forget` / `ai-memory
-    // delete` / `ai-memory forget`) queue a federated erasure ONLY when
-    // this marker is present, so the marker is what BOUNDS the outbox:
-    // a deployment nothing will drain accumulates ZERO rows, forever.
+    // erasure funnels queue a federated erasure ONLY when this marker is
+    // present, so the marker is what BOUNDS the outbox: a deployment
+    // nothing will drain accumulates ZERO rows, forever.
     //
-    // Stamped <=> all three hold: federation is configured, the build
-    // carries `--features sal` (the whole push-DLQ surface is gated on
-    // it, so a default-features binary has no replay worker), and the
-    // resolved DLQ sink is the SQLITE one — i.e. the worker drains the
-    // SAME database file the MCP / CLI processes write to. A
-    // postgres-backed `serve` drains the POSTGRES `federation_push_dlq`
-    // and never this sqlite file, so promising propagation there would be
-    // a lie (and MCP stdio is sqlite-only by construction anyway,
-    // CLAUDE.md #1675/n24). Every other boot CLEARS it, so turning
-    // federation off self-heals on the next start instead of
-    // accumulating rows nothing will ever drain.
+    // Stamped only when ALL THREE hold: federation is configured, the
+    // build carries `--features sal` (the whole push-DLQ surface is gated
+    // on it, so a default-features binary has no replay worker), and the
+    // resolved sink is the SQLITE one — i.e. the worker drains the SAME
+    // file the MCP / CLI processes write to. A postgres-backed `serve`
+    // drains the POSTGRES table and never this sqlite file, so promising
+    // propagation there would be a lie (and MCP stdio is sqlite-only by
+    // construction anyway, CLAUDE.md #1675/n24). Every other boot CLEARS
+    // it, so turning federation off self-heals on the next start.
     {
         #[cfg(feature = "sal")]
         let drainable_peers: Option<usize> = federation.as_ref().and_then(|fed| {
@@ -5716,34 +5713,7 @@ pub async fn bootstrap_serve(
         #[cfg(not(feature = "sal"))]
         let drainable_peers: Option<usize> = None;
         let guard = db_state.lock().await;
-        match drainable_peers {
-            Some(peer_count) => {
-                match federation::erasure_outbox::mark_federation_drainable(&guard.0, peer_count) {
-                    Ok(()) => tracing::info!(
-                        peer_count,
-                        "federation erasure outbox ENABLED: MCP/CLI erasures on this database \
-                         queue for fan-out to {peer_count} peer(s) (#2446)"
-                    ),
-                    Err(e) => tracing::warn!(
-                        "federation erasure outbox: could not stamp the drainability marker; \
-                         MCP/CLI erasures will stay LOCAL-ONLY until the next successful \
-                         serve boot (#2446): {e}"
-                    ),
-                }
-            }
-            None => match federation::erasure_outbox::clear_federation_drainable(&guard.0) {
-                Ok(n) if n > 0 => tracing::info!(
-                    "federation erasure outbox DISABLED for this database (federation off, \
-                     postgres-backed, or a non-sal build): cleared the drainability marker \
-                     so MCP/CLI erasures stop queueing (#2446)"
-                ),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(
-                    "federation erasure outbox: could not clear the drainability marker (#2446): \
-                     {e}"
-                ),
-            },
-        }
+        federation::erasure_outbox::apply_drainability(&guard.0, drainable_peers);
     }
 
     // v0.7.0 M3 — spawn the federation catchup loop now that the SAL

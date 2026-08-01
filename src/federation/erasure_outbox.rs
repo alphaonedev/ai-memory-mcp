@@ -230,9 +230,46 @@ pub fn mark_federation_drainable(conn: &Connection, peer_count: usize) -> rusqli
 
 /// Explanatory text carried on the marker row so an operator reading the
 /// DLQ table by hand immediately understands why it is there.
-const MARKER_LAST_ERROR: &str =
-    "not a queue entry — #2446 erasure-outbox drainability marker (replayed_at is pre-set so \
+const MARKER_LAST_ERROR: &str = "not a queue entry — #2446 erasure-outbox drainability marker (replayed_at is pre-set so \
      every push_dlq query and the partial unique index ignore this row)";
+
+/// Apply the boot-time drainability verdict: stamp the marker when
+/// `drainable_peers` is `Some(n)` (a federated, `--features sal`,
+/// sqlite-backed `serve` will drain THIS database), clear it otherwise.
+///
+/// Infallible + best-effort: a marker write failure degrades to
+/// "erasures stay local-only" with a loud WARN, never a boot failure.
+/// Called once from `daemon_runtime::bootstrap_serve`.
+pub fn apply_drainability(conn: &Connection, drainable_peers: Option<usize>) {
+    match drainable_peers {
+        Some(peer_count) => match mark_federation_drainable(conn, peer_count) {
+            Ok(()) => tracing::info!(
+                target: ERASURE_OUTBOX_TRACE_TARGET,
+                peer_count,
+                "federation erasure outbox ENABLED: MCP/CLI erasures on this database queue \
+                 for fan-out to {peer_count} peer(s) (#2446)"
+            ),
+            Err(e) => tracing::warn!(
+                target: ERASURE_OUTBOX_TRACE_TARGET,
+                "federation erasure outbox: could not stamp the drainability marker; MCP/CLI \
+                 erasures stay LOCAL-ONLY until the next successful serve boot (#2446): {e}"
+            ),
+        },
+        None => match clear_federation_drainable(conn) {
+            Ok(n) if n > 0 => tracing::info!(
+                target: ERASURE_OUTBOX_TRACE_TARGET,
+                "federation erasure outbox DISABLED for this database (federation off, \
+                 postgres-backed, or a non-sal build): cleared the drainability marker so \
+                 MCP/CLI erasures stop queueing (#2446)"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                target: ERASURE_OUTBOX_TRACE_TARGET,
+                "federation erasure outbox: could not clear the drainability marker (#2446): {e}"
+            ),
+        },
+    }
+}
 
 /// Remove the drainability marker: this database is NOT drained by a
 /// federated sqlite-backed `serve`.
@@ -581,7 +618,8 @@ mod tests {
     fn a_broken_outbox_never_fails_the_erasure() {
         let conn = db();
         mark_federation_drainable(&conn, 1).unwrap();
-        conn.execute_batch("DROP TABLE federation_push_dlq;").unwrap();
+        conn.execute_batch("DROP TABLE federation_push_dlq;")
+            .unwrap();
         // No panic, no error type: just `false`.
         assert!(!enqueue_erasure(&conn, "m-1", "mcp:memory_delete"));
         assert_eq!(enqueue_erasures(&conn, &["m-2".into()], "cli:forget"), 0);
@@ -592,7 +630,10 @@ mod tests {
     #[test]
     fn deletion_body_matches_the_broadcast_shape() {
         let body = deletion_body("host:leader", "m-9");
-        assert_eq!(body[crate::models::field_names::SENDER_AGENT_ID], "host:leader");
+        assert_eq!(
+            body[crate::models::field_names::SENDER_AGENT_ID],
+            "host:leader"
+        );
         assert_eq!(body["memories"], serde_json::json!([]));
         assert_eq!(body["deletions"], serde_json::json!(["m-9"]));
         assert_eq!(body["dry_run"], serde_json::json!(false));
