@@ -68,17 +68,15 @@ use ai_memory::replication::QuorumPolicy;
 
 const NS: &str = "erasure-2446";
 
-// The three reserved `federation_push_dlq` tokens are mirrored here as
-// LITERALS rather than imported from
-// `ai_memory::federation::erasure_outbox`, deliberately: this suite must
-// COMPILE at the parent commit `03bbd556` so its assertions fail
-// BEHAVIOURALLY (zero rows) instead of failing to build (R-203 — a
-// compile error proves an API is absent, not that a behaviour is). Their
-// values are pinned against the module consts by the unit tests in
-// `src/federation/erasure_outbox.rs`.
+// The two reserved tokens are mirrored here as LITERALS rather than
+// imported from `ai_memory::federation::erasure_outbox`, deliberately:
+// this suite must COMPILE at the parent commit `03bbd556` so its
+// assertions fail BEHAVIOURALLY (zero rows) instead of failing to build
+// (R-203 — a compile error proves an API is absent, not that a behaviour
+// is). Their values are pinned against the module consts by the unit
+// tests in `src/federation/erasure_outbox.rs`.
 const SENTINEL_PEER_ID: &str = "__ai_memory_all_peers__";
-const MARKER_MEMORY_ID: &str = "__ai_memory_federation_marker__";
-const MARKER_PEER_ID: &str = "__ai_memory_erasure_outbox_drainable__";
+const MARKER_SUFFIX: &str = ".federation-outbox";
 
 // ---------------------------------------------------------------------
 // Fixtures
@@ -133,25 +131,26 @@ fn seed_db(path: &std::path::Path, ids: &[&str], drainable: bool) {
     for (i, id) in ids.iter().enumerate() {
         ai_memory::db::insert(&conn, &sample_memory(id, &format!("probe-{i}"))).expect("seed");
     }
+    drop(conn);
     // Stamp the drainability marker exactly the way a federated,
-    // sqlite-backed `serve` boot does — by raw SQL, so this suite compiles
-    // at the parent commit (see the const block above).
-    conn.execute(
-        "DELETE FROM federation_push_dlq WHERE memory_id = ?1 AND peer_id = ?2",
-        rusqlite::params![MARKER_MEMORY_ID, MARKER_PEER_ID],
-    )
-    .expect("clear drainability marker");
+    // sqlite-backed `serve` boot does — by writing the sidecar directly,
+    // so this suite compiles at the parent commit (see the const block
+    // above). The marker is deliberately NOT a row in
+    // `federation_push_dlq`: all three indexes on that table are partial
+    // `WHERE replayed_at IS NULL`, so an in-table marker would be
+    // invisible to every one of them and each probe would be a full scan.
+    let marker = marker_path(path);
+    let _ = std::fs::remove_file(&marker);
     if drainable {
-        let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "INSERT INTO federation_push_dlq \
-                 (memory_id, peer_id, payload_json, attempt_count, last_error, failed_at, \
-                  replayed_at) \
-             VALUES (?1, ?2, '{}', 0, 'marker', ?3, ?3)",
-            rusqlite::params![MARKER_MEMORY_ID, MARKER_PEER_ID, now],
-        )
-        .expect("stamp drainability marker");
+        std::fs::write(&marker, r#"{"peer_count":1}"#).expect("stamp drainability marker");
     }
+}
+
+/// The sidecar drainability-marker path for a database file.
+fn marker_path(db: &std::path::Path) -> std::path::PathBuf {
+    let mut name = db.file_name().expect("db file name").to_os_string();
+    name.push(MARKER_SUFFIX);
+    db.with_file_name(name)
 }
 
 /// Every PENDING erasure-outbox sentinel row: `(memory_id, payload_json)`.

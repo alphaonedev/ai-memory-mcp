@@ -82,6 +82,10 @@
 //!   propagation would be a lie. See the module docs of
 //!   `federation::push_dlq` and the #2446 PR body for the full statement.
 //!
+//! The marker is a SIDECAR beside the database file, not a row in
+//! `federation_push_dlq` — see [`MARKER_SUFFIX`] for why that is a
+//! correctness-relevant choice and not a stylistic one.
+//!
 //! ## Failure posture
 //!
 //! Every function here is **best-effort and infallible to the caller**: a
@@ -108,13 +112,28 @@ pub(crate) const ERASURE_OUTBOX_TRACE_TARGET: &str = "ai_memory::federation::era
 /// rather than fanning out ambiguously.
 pub const ALL_PEERS_SENTINEL_PEER_ID: &str = "__ai_memory_all_peers__";
 
-/// Reserved `memory_id` of the drainability marker row. Not a valid
-/// memory id (ids are ULID-shaped), so it can never collide with a real
-/// erasure row.
-const MARKER_MEMORY_ID: &str = "__ai_memory_federation_marker__";
-
-/// Reserved `peer_id` of the drainability marker row.
-const MARKER_PEER_ID: &str = "__ai_memory_erasure_outbox_drainable__";
+/// Filename suffix of the drainability MARKER, a sidecar beside the
+/// sqlite database file (`<db>.federation-outbox`).
+///
+/// **Why not a row in `federation_push_dlq`.** A marker row would have to
+/// pre-set `replayed_at` so the pending-queue queries and the partial
+/// unique index ignore it — but ALL THREE indexes on that table are
+/// partial `WHERE replayed_at IS NULL`, so such a row is invisible to
+/// every index and each probe degrades to a FULL TABLE SCAN. That probe
+/// runs on every MCP / CLI erasure and once on the `serve` boot path
+/// under the shared writer mutex, and the #1535 atlas-corpus burst left
+/// ~75k rows in this table — a scan per erasure would be a hot-path
+/// regression on the exact operation this module makes durable. Giving
+/// the marker its own index would mean a schema change, and creating one
+/// outside the migration ladder is precisely the bootstrap-vs-ladder
+/// divergence the #2424 guardrail exists to prevent.
+///
+/// A sidecar makes the probe ONE `stat` — O(1), independent of DLQ depth
+/// — and it is also the more honest home: drainability describes THIS
+/// HOST's daemon topology, not the corpus. A database copied or restored
+/// elsewhere correctly does not inherit it, and the next `serve` boot on
+/// the new host decides afresh.
+const MARKER_SUFFIX: &str = ".federation-outbox";
 
 /// `last_error` text stamped on a freshly-queued sentinel row.
 ///
@@ -184,54 +203,54 @@ fn queued_payload(memory_id: &str) -> serde_json::Value {
     })
 }
 
-/// Stamp the drainability marker: "a federated `serve` drains the
-/// `federation_push_dlq` of THIS sqlite database".
+/// Resolve the sidecar marker path for the database `conn` is open on.
 ///
-/// Idempotent. The row is written with `replayed_at` SET, which makes it
-/// invisible to every existing query in `push_dlq` — all of them filter
-/// `WHERE replayed_at IS NULL` (`take_pending_dlq_rows`,
-/// `pending_dlq_count`, `mark_dlq_row_replayed`, `bump_dlq_attempt`,
-/// `note_dlq_throttled`, `reset_throttled_quarantine`) — and to the
-/// partial unique index, which is likewise partial on `replayed_at IS
-/// NULL`. So the marker never enters the queue, never counts toward the
-/// depth gauge, and never reaches the replay worker.
+/// `None` for a connection with no on-disk file (`:memory:`, a temporary
+/// database) — such a deployment can never be drained by a separate
+/// `serve` process anyway, so it is correctly never drainable.
+fn marker_path(conn: &Connection) -> Option<std::path::PathBuf> {
+    let path = conn.path()?;
+    if path.is_empty() || path == ":memory:" {
+        return None;
+    }
+    let mut name = std::ffi::OsString::from(std::path::Path::new(path).file_name()?);
+    name.push(MARKER_SUFFIX);
+    Some(std::path::Path::new(path).with_file_name(name))
+}
+
+/// Stamp the drainability marker: "a federated, `--features sal`,
+/// sqlite-backed `serve` drains the `federation_push_dlq` of THIS
+/// database file".
+///
+/// Idempotent. The contents are OBSERVABILITY ONLY — every consumer
+/// checks EXISTENCE — so a torn write can never change a verdict.
 ///
 /// # Errors
 ///
-/// Propagates the rusqlite error; the caller (`bootstrap_serve`) logs and
-/// continues — a marker write failure must not prevent the daemon from
-/// starting.
-pub fn mark_federation_drainable(conn: &Connection, peer_count: usize) -> rusqlite::Result<()> {
-    let now = chrono::Utc::now().to_rfc3339();
-    let payload = serde_json::json!({
+/// Propagates the I/O error (unwritable directory, no resolvable path);
+/// the caller logs and continues — a marker write failure must never
+/// prevent the daemon from starting.
+pub fn mark_federation_drainable(conn: &Connection, peer_count: usize) -> std::io::Result<()> {
+    let path = marker_path(conn).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "erasure outbox: the connection has no on-disk database file to mark",
+        )
+    })?;
+    let body = serde_json::json!({
         "peer_count": peer_count,
-        "stamped_at": now,
+        "stamped_at": chrono::Utc::now().to_rfc3339(),
+        "note": MARKER_NOTE,
     })
     .to_string();
-    conn.execute(
-        "DELETE FROM federation_push_dlq WHERE memory_id = ?1 AND peer_id = ?2",
-        rusqlite::params![MARKER_MEMORY_ID, MARKER_PEER_ID],
-    )?;
-    conn.execute(
-        "INSERT INTO federation_push_dlq \
-             (memory_id, peer_id, payload_json, attempt_count, last_error, failed_at, \
-              replayed_at) \
-         VALUES (?1, ?2, ?3, 0, ?4, ?5, ?5)",
-        rusqlite::params![
-            MARKER_MEMORY_ID,
-            MARKER_PEER_ID,
-            payload,
-            MARKER_LAST_ERROR,
-            now
-        ],
-    )?;
-    Ok(())
+    std::fs::write(path, body)
 }
 
-/// Explanatory text carried on the marker row so an operator reading the
-/// DLQ table by hand immediately understands why it is there.
-const MARKER_LAST_ERROR: &str = "not a queue entry — #2446 erasure-outbox drainability marker (replayed_at is pre-set so \
-     every push_dlq query and the partial unique index ignore this row)";
+/// Explanatory text carried inside the marker file so an operator who
+/// finds it beside their database immediately understands what it is.
+const MARKER_NOTE: &str = "#2446 erasure-outbox drainability marker: MCP/CLI erasures on this database queue for \
+     federated fan-out while this file exists. Written and removed by `ai-memory serve` at boot; \
+     safe to delete (the next serve boot re-decides).";
 
 /// Apply the boot-time drainability verdict: stamp the marker when
 /// `drainable_peers` is `Some(n)` (a federated, `--features sal`,
@@ -239,13 +258,18 @@ const MARKER_LAST_ERROR: &str = "not a queue entry — #2446 erasure-outbox drai
 ///
 /// Infallible + best-effort: a marker write failure degrades to
 /// "erasures stay local-only" with a loud WARN, never a boot failure.
-/// Called once from `daemon_runtime::bootstrap_serve`.
 ///
-/// The unfederated arm is READ-ONLY on the overwhelmingly common path:
-/// it probes for the marker and only issues the DELETE when one is
-/// actually present. Every `serve` boot crosses this, so an
-/// unconditional write here would add a write-lock acquisition to the
-/// startup of every single-node daemon in exchange for deleting nothing.
+/// **Runs on the `serve` BOOT PATH, before the daemon binds and reports
+/// ready**, so its cost is bounded by construction and not by argument:
+/// the unfederated case (the overwhelmingly common one) is a single
+/// `stat` and returns without touching the filesystem again; the
+/// federated case adds one small `write`. Neither touches the database,
+/// so neither can contend the shared writer mutex or scan
+/// `federation_push_dlq` — which an earlier in-table marker did, since
+/// all three indexes on that table are partial `WHERE replayed_at IS
+/// NULL` (see [`MARKER_SUFFIX`]).
+///
+/// Called once from `daemon_runtime::bootstrap_serve`.
 pub fn apply_drainability(conn: &Connection, drainable_peers: Option<usize>) {
     if drainable_peers.is_none() && !is_drainable(conn) {
         return;
@@ -265,13 +289,13 @@ pub fn apply_drainability(conn: &Connection, drainable_peers: Option<usize>) {
             ),
         },
         None => match clear_federation_drainable(conn) {
-            Ok(n) if n > 0 => tracing::info!(
+            Ok(true) => tracing::info!(
                 target: ERASURE_OUTBOX_TRACE_TARGET,
                 "federation erasure outbox DISABLED for this database (federation off, \
                  postgres-backed, or a non-sal build): cleared the drainability marker so \
                  MCP/CLI erasures stop queueing (#2446)"
             ),
-            Ok(_) => {}
+            Ok(false) => {}
             Err(e) => tracing::warn!(
                 target: ERASURE_OUTBOX_TRACE_TARGET,
                 "federation erasure outbox: could not clear the drainability marker (#2446): {e}"
@@ -286,28 +310,29 @@ pub fn apply_drainability(conn: &Connection, drainable_peers: Option<usize>) {
 /// # Errors
 ///
 /// Propagates the rusqlite error; the caller logs and continues.
-pub fn clear_federation_drainable(conn: &Connection) -> rusqlite::Result<usize> {
-    conn.execute(
-        "DELETE FROM federation_push_dlq WHERE memory_id = ?1 AND peer_id = ?2",
-        rusqlite::params![MARKER_MEMORY_ID, MARKER_PEER_ID],
-    )
+pub fn clear_federation_drainable(conn: &Connection) -> std::io::Result<bool> {
+    let Some(path) = marker_path(conn) else {
+        return Ok(false);
+    };
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Is this database drained by a federated, sqlite-backed `serve`?
 ///
-/// Any error (missing table on a pre-v48 database, unreadable file)
-/// resolves to `false` — fail-quiet in the "write nothing" direction,
-/// which is the safe one: the local erasure already committed and an
-/// unqueued row can be re-issued, whereas a bogus queued row cannot be
-/// distinguished from a real pending erasure.
+/// ONE `stat` — O(1), independent of `federation_push_dlq` depth. That
+/// bound is the point: this runs on every MCP / CLI erasure.
+///
+/// Any failure to resolve resolves to `false` — fail-quiet in the "write
+/// nothing" direction, which is the safe one: the local erasure already
+/// committed and an unqueued row can be re-issued, whereas a bogus queued
+/// row cannot be distinguished from a real pending erasure.
 #[must_use]
 pub fn is_drainable(conn: &Connection) -> bool {
-    conn.query_row(
-        "SELECT 1 FROM federation_push_dlq WHERE memory_id = ?1 AND peer_id = ?2 LIMIT 1",
-        rusqlite::params![MARKER_MEMORY_ID, MARKER_PEER_ID],
-        |_| Ok(()),
-    )
-    .is_ok()
+    marker_path(conn).is_some_and(|p| p.exists())
 }
 
 /// Queue ONE erased memory id for federated fan-out. Best-effort and
@@ -452,8 +477,15 @@ fn enqueue_unchecked(conn: &Connection, memory_id: &str, surface: &str) -> bool 
 mod tests {
     use super::*;
 
-    fn db() -> Connection {
-        let conn = Connection::open_in_memory().expect("open in-memory db");
+    /// A FILE-backed database (never `:memory:`): the drainability marker
+    /// is a sidecar beside the db file, so a memoryless connection is by
+    /// design never drainable.
+    fn db() -> (tempfile::TempDir, Connection) {
+        let tmp = tempfile::Builder::new()
+            .prefix("erasure-outbox-2446-")
+            .tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/.local-runs"))
+            .expect("create .local-runs tempdir");
+        let conn = Connection::open(tmp.path().join("m.db")).expect("open file-backed db");
         conn.execute_batch(
             "CREATE TABLE federation_push_dlq (
                  id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -470,7 +502,7 @@ mod tests {
                  WHERE replayed_at IS NULL;",
         )
         .expect("create dlq table");
-        conn
+        (tmp, conn)
     }
 
     fn pending_count(conn: &Connection) -> i64 {
@@ -489,15 +521,41 @@ mod tests {
     #[test]
     fn reserved_tokens_are_wire_stable() {
         assert_eq!(ALL_PEERS_SENTINEL_PEER_ID, "__ai_memory_all_peers__");
-        assert_eq!(MARKER_MEMORY_ID, "__ai_memory_federation_marker__");
-        assert_eq!(MARKER_PEER_ID, "__ai_memory_erasure_outbox_drainable__");
+        assert_eq!(MARKER_SUFFIX, ".federation-outbox");
+    }
+
+    /// The marker never enters `federation_push_dlq`, so it can never be
+    /// scanned for, counted by the depth gauge, or drained. Pins the
+    /// property the sidecar exists to guarantee.
+    #[test]
+    fn the_marker_never_lands_in_the_dlq_table() {
+        let (_tmp, conn) = db();
+        mark_federation_drainable(&conn, 3).unwrap();
+        assert!(is_drainable(&conn));
+        let all: i64 = conn
+            .query_row("SELECT COUNT(*) FROM federation_push_dlq", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            all, 0,
+            "the marker must not be a row in the DLQ table at all"
+        );
+    }
+
+    /// A connection with no on-disk file can never be drainable — a
+    /// separate `serve` process could not share it anyway.
+    #[test]
+    fn a_memory_backed_connection_is_never_drainable() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(!is_drainable(&conn));
+        assert!(mark_federation_drainable(&conn, 1).is_err());
+        assert!(!clear_federation_drainable(&conn).unwrap());
     }
 
     /// The heart of the #2446 bound: with NO marker, an erasure writes
     /// nothing at all. A single-node MCP deployment can never accumulate.
     #[test]
     fn erasure_writes_nothing_without_the_drainability_marker() {
-        let conn = db();
+        let (_tmp, conn) = db();
         assert!(!is_drainable(&conn));
         assert!(!enqueue_erasure(&conn, "m-1", "mcp:memory_delete"));
         assert_eq!(
@@ -511,31 +569,28 @@ mod tests {
         );
     }
 
-    /// The marker itself never enters the queue: it is written with
-    /// `replayed_at` set, so every `WHERE replayed_at IS NULL` query and
-    /// the partial unique index skip it.
+    /// Stamping is idempotent and clearing is exact.
     #[test]
-    fn marker_row_is_invisible_to_the_pending_queue() {
-        let conn = db();
+    fn marker_stamp_is_idempotent_and_clear_is_exact() {
+        let (_tmp, conn) = db();
         mark_federation_drainable(&conn, 3).unwrap();
         assert!(is_drainable(&conn));
+        mark_federation_drainable(&conn, 4).unwrap();
+        assert!(
+            is_drainable(&conn),
+            "re-stamping replaces rather than stacks"
+        );
         assert_eq!(
             pending_count(&conn),
             0,
-            "the marker must not count as a pending DLQ row"
+            "and never enters the pending queue"
         );
-        // Idempotent re-stamp does not duplicate.
-        mark_federation_drainable(&conn, 4).unwrap();
-        let markers: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM federation_push_dlq WHERE memory_id = ?1",
-                rusqlite::params![MARKER_MEMORY_ID],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(markers, 1, "re-stamping replaces rather than stacks");
-        assert_eq!(clear_federation_drainable(&conn).unwrap(), 1);
+        assert!(clear_federation_drainable(&conn).unwrap());
         assert!(!is_drainable(&conn));
+        assert!(
+            !clear_federation_drainable(&conn).unwrap(),
+            "clearing an absent marker is a no-op, not an error"
+        );
     }
 
     /// A queued erasure lands exactly one pending sentinel row carrying a
@@ -543,7 +598,7 @@ mod tests {
     /// WITHOUT burning the attempt budget.
     #[test]
     fn queued_erasure_lands_one_sentinel_row_and_coalesces() {
-        let conn = db();
+        let (_tmp, conn) = db();
         mark_federation_drainable(&conn, 1).unwrap();
         assert!(enqueue_erasure(&conn, "m-1", "mcp:memory_forget"));
         assert!(enqueue_erasure(&conn, "m-1", "mcp:memory_forget"));
@@ -570,7 +625,7 @@ mod tests {
     /// coexist: the partial unique index is keyed on the PAIR.
     #[test]
     fn sentinel_does_not_collide_with_a_real_per_peer_row() {
-        let conn = db();
+        let (_tmp, conn) = db();
         mark_federation_drainable(&conn, 1).unwrap();
         conn.execute(
             "INSERT INTO federation_push_dlq \
@@ -592,7 +647,7 @@ mod tests {
     /// catch-all, never as a fabricated quota / auth / permanent cause.
     #[test]
     fn queued_last_error_does_not_lie_to_the_cause_classifier() {
-        let mut texts = vec![QUEUED_LAST_ERROR.to_string(), MARKER_LAST_ERROR.to_string()];
+        let mut texts = vec![QUEUED_LAST_ERROR.to_string()];
         for surface in [
             surfaces::MCP_DELETE,
             surfaces::MCP_FORGET,
@@ -625,7 +680,7 @@ mod tests {
     /// erasure has already committed and must keep reporting success.
     #[test]
     fn a_broken_outbox_never_fails_the_erasure() {
-        let conn = db();
+        let (_tmp, conn) = db();
         mark_federation_drainable(&conn, 1).unwrap();
         conn.execute_batch("DROP TABLE federation_push_dlq;")
             .unwrap();
