@@ -533,18 +533,27 @@ else
         bad "C regression leg: could not plant the decider 'if:' fixture" \
             "the harness is broken, not the workflow"
     else
-        live_rc=0
-        RQC_WORKFLOW_DIR="$MUT" bash "$GATE" >/dev/null 2>&1 || live_rc=$?
-        prefix_rc=0
-        RQC_WORKFLOW_DIR="$MUT" RQC_MIRROR_FILE="$PREFIX_MIRROR" bash "$GATE" >/dev/null 2>&1 || prefix_rc=$?
-        if [ "$live_rc" -ne 0 ] && [ "$prefix_rc" -eq 0 ]; then
-            ok "C regression: a decider 'if:' is CAUGHT under the live mirror (b4) and passes SILENTLY under the frozen pre-fix mirror — the declaration is what makes the rule reachable"
-        elif [ "$live_rc" -eq 0 ]; then
-            bad "C regression: a job-level 'if:' on the ci.yml decider did NOT fail the gate" \
+        # The assertion is on WHICH RULE fires, not on the exit code (#2636).
+        # Exit codes stopped being able to express this claim the moment rule
+        # (f) landed: under the frozen mirror the undeclared jobs are exactly
+        # what (f) exists to catch, so the pre-fix run now exits non-zero for a
+        # reason that has nothing to do with the blind spot under test. Keying
+        # on the rule name states the real property — "rule (b4) cannot see
+        # this decider until the mirror declares it" — and is strictly stronger
+        # than the exit-code form it replaces, which a single unrelated new
+        # rule was able to invalidate.
+        live_out="$(RQC_WORKFLOW_DIR="$MUT" bash "$GATE" 2>&1 || true)"
+        prefix_out="$(RQC_WORKFLOW_DIR="$MUT" RQC_MIRROR_FILE="$PREFIX_MIRROR" bash "$GATE" 2>&1 || true)"
+        case "$live_out" in *"RULE (b4)"*) live_b4=1 ;; *) live_b4=0 ;; esac
+        case "$prefix_out" in *"RULE (b4)"*) prefix_b4=1 ;; *) prefix_b4=0 ;; esac
+        if [ "$live_b4" -eq 1 ] && [ "$prefix_b4" -eq 0 ]; then
+            ok "C regression: a decider 'if:' is CAUGHT BY RULE (b4) under the live mirror and is INVISIBLE to (b4) under the frozen pre-fix mirror — the declaration is what makes the rule reachable"
+        elif [ "$live_b4" -eq 0 ]; then
+            bad "C regression: a job-level 'if:' on the ci.yml decider did NOT trip rule (b4)" \
                 "rule (b4) has gone blind — nine dependent required contexts could all go skipped-and-satisfied at once"
         else
-            bad "C regression: the frozen pre-fix mirror also rejected the decider 'if:'" \
-                "the baseline no longer reproduces the pre-fix blind spot (exit $prefix_rc) — the fixture may have been repaired"
+            bad "C regression: the frozen pre-fix mirror ALSO tripped rule (b4)" \
+                "the baseline no longer reproduces the pre-fix blind spot — the fixture may have been repaired"
         fi
     fi
 fi
