@@ -39,22 +39,64 @@
 //!       `_inbox/<recipient>` row so the recipient can read their own
 //!       inbox even though the row is scope=private under the sender's
 //!       ownership);
-//!     - any UNKNOWN / legacy scope string (e.g. "shared") → visible
-//!       (broadly). This is the documented shareable-shape posture the
-//!       federation projection lane relies on (`#948` / `#978` — a
-//!       `scope=shared` row projects to any allowlisted peer). #1921
-//!       DELIBERATELY does NOT tighten this arm: the CWE-863 exploit it
-//!       closes is the team/unit/org SUBTREE disclosure, and failing
-//!       unknown scopes closed would break legitimate federation
-//!       sharing. An owner making their OWN row broadly readable leaks
-//!       no other tenant's data.
+//!     - the CLOSED legacy/internal token set [`LEGACY_BROAD_SCOPES`]
+//!       (currently exactly `"shared"`) → visible (broadly). This is the
+//!       documented shareable-shape posture the federation projection
+//!       lane relies on (`#948` / `#978` — a `scope=shared` row projects
+//!       to any allowlisted peer) and the marker the substrate itself
+//!       stamps on `_standard:<ns>` governance-policy placeholder rows;
+//!     - **#2633** — any OTHER unrecognised token (a typo: `"privat"`,
+//!       `"sharedd"`, `"Private"`) → treated exactly as an ABSENT scope
+//!       key, i.e. owner-keyed private. Pre-#2633 this arm returned
+//!       `true` unconditionally, so a one-character misspelling made a
+//!       row world-readable while the correctly-spelled `"private"` and
+//!       the ABSENT key both kept it owner-only — one character apart,
+//!       opposite postures.
 //!
 //! #1921 scope note: the private-owner fix (#1720) and the
-//! collective/unknown broad-visibility semantics are unchanged; the ONLY
-//! behavioural change is that team/unit/org are now subtree-restricted
-//! (was: world-readable).
+//! collective broad-visibility semantics are unchanged; the #1921
+//! behavioural change was that team/unit/org became subtree-restricted
+//! (was: world-readable). #2633 additionally narrows the unrecognised-token
+//! arm to the absent-key default.
 
 use crate::models::Memory;
+
+/// #2633 — the CLOSED set of scope tokens that are NOT members of
+/// [`crate::models::namespace::MemoryScope`] but ARE still honoured as
+/// broadly-visible on the in-process read path.
+///
+/// **Why a const slice here rather than a sixth `MemoryScope` variant.**
+/// A 3x3 adversarial vote (9 lenses, `4d3ea1c5` protocol; Q1 Option B,
+/// 8-1) rejected reifying `shared` as an enum variant because
+/// [`crate::models::namespace::MemoryScope::from_str`] is NOT
+/// visibility-private — `crate::governance::refusal::required_scope_refusal`
+/// funnels through it and coerces an unparseable token to `Private`, so a
+/// parsing `Shared` variant flips every `scope:"shared"` write from
+/// SATISFYING a `required_scope = private` policy to being REFUSED by it.
+/// The rows that carry `scope:"shared"` are the `_standard:<ns>`
+/// governance-policy placeholders (`crate::handlers::hook_subscribers`
+/// first-write + ownership-restamp, and `crate::mcp::tools::namespace`
+/// set-standard restamp), i.e. the policy CARRIER itself — so the enum
+/// route bricks `set_standard` in exactly the namespaces that pin a
+/// required scope. It would also make `"shared"` serde-reachable as a
+/// `CorePolicy::required_scope` value, widening a v1.0.0 public contract.
+///
+/// Keeping the legacy token out of the enum confines this defect's fix to
+/// the read predicate that actually has it, changes ZERO SSOT pins
+/// (`MemoryScope::COUNT`, `all()`, `all_strs()`, `VALID_SCOPES` and the
+/// "5 visibility scopes" docs narrative all stay as-is), and leaves
+/// `crate::storage::is_visible` + the SQL `visibility_clause` byte-identical.
+///
+/// **This is still a closed set** — that is the whole point of #2633. The
+/// catch-all below it denies (falls back to owner-keyed private); only the
+/// tokens enumerated here are honoured broadly.
+pub const LEGACY_BROAD_SCOPES: &[&str] = &["shared"];
+
+/// `true` when `scope` is a member of the closed [`LEGACY_BROAD_SCOPES`] set.
+#[must_use]
+pub fn is_legacy_broad_scope(scope: &str) -> bool {
+    LEGACY_BROAD_SCOPES.contains(&scope)
+}
 
 /// Returns `true` when the caller is entitled to see the memory.
 ///
@@ -79,13 +121,32 @@ pub fn is_visible_to_caller(mem: &Memory, caller: &str) -> bool {
     // The change is SURGICAL — only the team/unit/org arms move from
     // "always true" to a `matches_subtree` check (mirroring
     // `crate::storage::is_visible`). `collective` stays world-readable (it
-    // is DESIGNED that way), `private` stays owner-keyed (#1720), and any
-    // UNKNOWN / legacy scope string (e.g. "shared") stays broadly visible
-    // — that is the documented federation shareable-shape posture the
-    // `/sync/since` projection lane relies on (#948 / #978). Failing
-    // unknown scopes closed would break legitimate federation sharing, so
-    // #1921 leaves that arm untouched (an owner broadening their OWN row
-    // leaks no other tenant's data).
+    // is DESIGNED that way), and `private` stays owner-keyed (#1720).
+    //
+    // #2633 (CWE-863, FBL-14) — the unrecognised-token arm below was
+    // `Some(None) => true`: "present but unknown ⇒ WIDEST posture". Any
+    // writer who could put an arbitrary string into `metadata.scope`,
+    // INCLUDING BY TYPO (`"privat"`, `"sharedd"`, `"Private"`), made the
+    // row world-readable on every non-SQL read path — and on postgres this
+    // predicate is the ONLY scope gate (`PostgresStore` has no SQL
+    // `visibility_clause`; it filters in Rust through this function). A row
+    // with NO scope key defaulted to private and a row with a MISSPELLED
+    // one was public: one character apart, opposite postures.
+    //
+    // The house rule is the opposite — an unrecognised token takes the
+    // NARROWEST posture (`receive_auth::env_flag_default_on` keeps the
+    // secure default; `AI_MEMORY_INFERENCE_EGRESS` WARNs and fails closed
+    // to `deny` on a typo). The arm is now a CLOSED set: the legitimate
+    // `#948`/`#978` federation shareable token stays broadly visible via
+    // `LEGACY_BROAD_SCOPES`, and everything else falls through to the
+    // ABSENT-key default.
+    //
+    // Disposition is `private_visible`, NOT a bare `false`: the narrowest
+    // posture that closes the cross-tenant hole still lets the row's OWN
+    // owner (and an inbox target) read it, so a typo costs the writer a
+    // warning and their row's reach — never access to their own data.
+    // Fail-closed to `false` would make a misspelled row unreachable by
+    // anyone, including the one principal who can fix it.
     use crate::models::namespace::MemoryScope;
     let scope_str = mem
         .metadata
@@ -94,9 +155,25 @@ pub fn is_visible_to_caller(mem: &Memory, caller: &str) -> bool {
     match scope_str.map(MemoryScope::from_str) {
         // Field absent → default private (owner-keyed).
         None => private_visible(mem, caller),
-        // Present but unknown / legacy (e.g. "shared") → broadly visible
-        // (federation shareable shape; pre-#1921 behaviour preserved).
-        Some(None) => true,
+        // Present but not a `MemoryScope`: the closed legacy set is honoured
+        // broadly; every other token degrades to the absent-key default.
+        Some(None) => {
+            let raw = scope_str.unwrap_or_default();
+            if is_legacy_broad_scope(raw) {
+                true
+            } else {
+                tracing::warn!(
+                    target: "visibility.unknown_scope",
+                    memory_id = %mem.id,
+                    namespace = %mem.namespace,
+                    scope = %raw,
+                    "unrecognised metadata.scope token; treating as private (#2633). \
+                     Valid scopes: {}",
+                    crate::models::namespace::VALID_SCOPES.join(", ")
+                );
+                private_visible(mem, caller)
+            }
+        }
         Some(Some(MemoryScope::Private)) => private_visible(mem, caller),
         // Visible to every authenticated caller, regardless of namespace.
         Some(Some(MemoryScope::Collective)) => true,

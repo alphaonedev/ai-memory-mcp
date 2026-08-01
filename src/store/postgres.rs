@@ -24268,6 +24268,37 @@ impl MemoryStore for PostgresStore {
                         "designated approver is '{required}'; got '{approver_agent_id}'"
                     )));
                 }
+                // #2538 (CWE-863) — pre-fix this arm was a BARE STRING COMPARE
+                // on BOTH backends: no self-approval refusal, no
+                // registered-agent check, while the Human arm above carries
+                // both and the Consensus arm below carries the registered
+                // check. `approver_agent_id` arrives from the per-request
+                // `X-Agent-Id`, a CLAIMED (not attested) principal, so a
+                // requester who is also the namespace's designated approver
+                // could self-approve their own governance-gated action.
+                //
+                // UNCONDITIONAL here, exactly like the #1793 Human arm above:
+                // the postgres SAL is reachable only via the inherently
+                // multi-tenant HTTP daemon, so there is no single-operator
+                // self-lock to avoid and the sqlite `ApproveSurface`
+                // opt-in has no analogue.
+                //
+                // TRAP NOTE: `approve_with_approver_type` is overridden by
+                // SqliteStore ONLY — postgres reaches this arm through the
+                // trait default in `src/store/mod.rs` which delegates to THIS
+                // method, so a fix landed in the sqlite override alone would
+                // never execute here. Both paths are pinned by
+                // `tests/authz_named_approver_2538_pg.rs`.
+                if approver_agent_id == pa.requested_by {
+                    return Ok(super::ApproveOutcome::Rejected(
+                        crate::errors::msg::SELF_APPROVAL_REFUSED.to_string(),
+                    ));
+                }
+                if !self.is_registered_agent(approver_agent_id).await? {
+                    return Ok(super::ApproveOutcome::Rejected(format!(
+                        "designated approver '{approver_agent_id}' is not a registered agent"
+                    )));
+                }
                 let ok = self
                     .pending_decide(ctx, pending_id, true, approver_agent_id)
                     .await?;

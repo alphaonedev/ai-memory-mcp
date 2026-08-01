@@ -441,7 +441,19 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // the merged truth and the coincidentally-equal ceiling is NOT evidence
     // the merge fits. Re-MEASURED on the merged file: 27_828.
     // Ceiling 27_820 -> 27_900 (+72 headroom).
-    ("src/storage/mod.rs", 27_900),
+    // 2026-08-01 (#2538) — the named-approver (`ApproverType::Agent`) arm of
+    // `approve_with_approver_type` gains the self-approval refusal + the
+    // registered-approver check it never had (the Human arm above it and the
+    // Consensus arm below it both already carried them), the surface-keyed
+    // predicate is hoisted out of the Human arm into the shared
+    // `enforce_approver_identity_gate`, and two in-module regression tests
+    // (the CWE-863 proof + the LocalOperator no-self-lock liveness leg) land
+    // alongside a governance-standard seeding helper. Most of the added lines
+    // are the WHY: this is an authorization posture change, so the arm states
+    // what it now refuses, why the disposition is surface-keyed rather than
+    // unconditional (3x3 vote 7-2), and which residual is deliberate.
+    // MEASURED post-change: 28_047. Ceiling 27_900 -> 28_120 (+73 headroom).
+    ("src/storage/mod.rs", 28_120),
     // 2026-07-21 (#1802 R-05 S1) — NEW submodule extracted from
     // storage/mod.rs (doctor / observability probes). Measured 698;
     // ceiling 800 (+102).
