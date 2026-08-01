@@ -398,21 +398,23 @@ pub(crate) fn run_with_embedder(
 
     // Perform recall: hybrid if embedder available, keyword otherwise
     let (results, outcome, mode) = if let Some(emb) = embedder {
-        match emb.embed_query(&args.context) {
-            Ok(primary_emb) => {
+        // v1.0.0 #2577 — bounded funnel (cache -> wall-clock budget ->
+        // degrade-to-keyword), shared with the HTTP + MCP recall surfaces.
+        match crate::embeddings::recall_query_embedding(emb, &args.context) {
+            Some(primary_emb) => {
                 let query_emb = match args.context_tokens.as_deref() {
                     Some(tokens) if !tokens.is_empty() => {
                         let joined = tokens.join(" ");
-                        match emb.embed_query(&joined) {
-                            Ok(ctx_emb) => embeddings::Embedder::fuse(
+                        match crate::embeddings::recall_query_embedding(emb, &joined) {
+                            Some(ctx_emb) => embeddings::Embedder::fuse(
                                 &primary_emb,
                                 &ctx_emb,
                                 crate::RECALL_PRIMARY_CTX_BLEND,
                             ),
-                            Err(e) => {
+                            None => {
                                 writeln!(
                                     out.stderr,
-                                    "ai-memory: context_tokens embed failed: {e}, using primary only"
+                                    "ai-memory: context_tokens embed unavailable, using primary only"
                                 )?;
                                 primary_emb
                             }
@@ -457,10 +459,13 @@ pub(crate) fn run_with_embedder(
                     (results, outcome, "hybrid")
                 }
             }
-            Err(e) => {
+            None => {
+                // v1.0.0 #2577 — the structured WARN + counter are emitted
+                // by `recall_query_embedding`; this line keeps the
+                // human-facing CLI message operators already parse.
                 writeln!(
                     out.stderr,
-                    "ai-memory: embedding query failed: {e}, falling back to keyword"
+                    "ai-memory: embedding query unavailable within budget, falling back to keyword"
                 )?;
                 let (results, outcome) = db::recall(
                     conn,
@@ -1241,8 +1246,15 @@ limit = 25
             .unwrap();
         }
         let stderr = env.stderr_str();
+        // v1.0.0 #2577 — wording changed with the bounded funnel: the CLI
+        // line no longer interpolates the embedder error (the structured
+        // `recall.embed.degraded` WARN carries it), and now names the
+        // BUDGET, because "unavailable within budget" is the new cause an
+        // operator has to act on. The invariant under test is unchanged:
+        // an embed failure emits a visible banner and the recall degrades
+        // to keyword.
         assert!(
-            stderr.contains("embedding query failed"),
+            stderr.contains("embedding query unavailable within budget"),
             "expected fallback banner; got: {stderr}"
         );
         let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
@@ -1279,8 +1291,9 @@ limit = 25
             .unwrap();
         }
         let stderr = env.stderr_str();
+        // v1.0.0 #2577 — see the wording note above; same invariant.
         assert!(
-            stderr.contains("context_tokens embed failed"),
+            stderr.contains("context_tokens embed unavailable"),
             "got: {stderr}"
         );
     }

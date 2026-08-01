@@ -5497,7 +5497,21 @@ pub async fn bootstrap_serve(
     // `app.runtime.reranker()`. Keyword/semantic/smart tiers leave the
     // slot empty and recall runs without the rerank stage, exactly as
     // before.
-    if tier_config.cross_encoder {
+    // v1.0.0 #2576 — ALSO gate on a live embedder. `maybe_apply_rerank`
+    // only fires when the recall reached `mode == "hybrid"`, and recall can
+    // only reach hybrid when a query embedding was produced. With no
+    // embedder (construction failed per #1593, or
+    // `AI_MEMORY_INFERENCE_EGRESS=deny`/`loopback-only` refused the API
+    // backend per env #131) every recall returns `mode:keyword` and the
+    // cross-encoder is UNREACHABLE — yet pre-#2576 the tier alone decided,
+    // so a degraded-embedder deployment still paid the model load and its
+    // resident memory for a stage that can never run. Gate on the RESOLVED
+    // embedder, never on the tier: the tier still says "autonomous" when
+    // the embedder failed, which is precisely the bug.
+    if crate::reranker::should_build_cross_encoder(
+        tier_config.cross_encoder,
+        embedder_arc.is_some(),
+    ) {
         tracing::info!("serve: loading neural cross-encoder (#1691 HTTP recall rerank)");
         let ce = crate::reranker::CrossEncoder::new_neural();
         if ce.is_neural() {
@@ -5508,12 +5522,24 @@ pub async fn bootstrap_serve(
         // #1691/n14 — apply the operator-configured score floor
         // (env > [reranker].score_floor > Off) on the HTTP recall reranker
         // too, matching the MCP build site.
-        crate::runtime_context::RuntimeContext::global().install_reranker(Arc::new(
-            crate::reranker::BatchedReranker::with_score_floor(
-                ce,
-                app_config.resolve_reranker_score_floor(),
-            ),
+        let reranker = Arc::new(crate::reranker::BatchedReranker::with_score_floor(
+            ce,
+            app_config.resolve_reranker_score_floor(),
         ));
+        // v1.0.0 #2576 — warm the forward path OFF the request thread so
+        // the first user recall does not pay the cold-start cliff. Detached:
+        // it must never gate the listener coming up.
+        let warm = Arc::clone(&reranker);
+        std::thread::spawn(move || warm.encoder().warm_up());
+        crate::runtime_context::RuntimeContext::global().install_reranker(reranker);
+    } else if tier_config.cross_encoder {
+        tracing::warn!(
+            "serve: tier enables the cross-encoder but no embedder is available — \
+             skipping cross-encoder load (#2576). Recall degrades to keyword, so the \
+             rerank stage is unreachable and its model load + resident memory would \
+             be paid for nothing. Restore the embedder (`ai-memory doctor`) to \
+             re-enable neural reranking."
+        );
     }
 
     let precompute_family_embeddings_enabled =
