@@ -1457,8 +1457,29 @@ mod tests {
         .unwrap()
         .expect("config should be Some when w>0 and peers nonempty");
         assert_eq!(cfg.peer_count(), 2);
-        assert_eq!(cfg.peers[0].id, "peer-0");
-        assert_eq!(cfg.peers[1].id, "peer-1");
+        // #2442 — ids are derived from peer IDENTITY (the normalised URL),
+        // never from the flag position. Assert the SHAPE and the distinctness,
+        // not a hard-coded digest: pinning the literal here would turn a
+        // silent change to the derivation (which re-keys every persisted
+        // federation_push_dlq row) into a one-line test edit instead of the
+        // migration it actually is. The frozen-wire-format contract is pinned
+        // deliberately, once, in tests/federation_stable_peer_id_2442.rs.
+        for peer in &cfg.peers {
+            assert!(
+                peer.id.starts_with("peer-h"),
+                "peer id must carry the #2442 stable-identity prefix, got {}",
+                peer.id
+            );
+            assert!(
+                !crate::federation::peer::is_legacy_positional_peer_id(&peer.id),
+                "a minted peer id must never impersonate the legacy positional shape, got {}",
+                peer.id
+            );
+        }
+        assert_ne!(
+            cfg.peers[0].id, cfg.peers[1].id,
+            "distinct peers must mint distinct routing keys"
+        );
         // Trailing slash is stripped during URL normalization.
         assert_eq!(
             cfg.peers[0].sync_push_url,
