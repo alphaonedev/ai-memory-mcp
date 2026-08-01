@@ -110,6 +110,23 @@ pub struct RuntimeContext {
     /// `RuntimeContext: Default` so no `AppState` construction site has to
     /// change to carry the handle.
     pub reranker: OnceLock<Arc<crate::reranker::BatchedReranker>>,
+
+    /// v1.0.0 #2579 — cached verdict of the paced FTS5 integrity checker.
+    ///
+    /// `GET /api/v1/health` reads it with a few relaxed atomic loads, so the
+    /// liveness probe stays O(1) in corpus size no matter the scrape rate
+    /// (it previously ran a full FTS5 `'integrity-check'` per request —
+    /// O(corpus), and a WRITER). The background checker in
+    /// [`crate::background::fts_integrity`] publishes into the same handle.
+    ///
+    /// It lives HERE rather than on `AppState` for the reason the
+    /// `reranker` field above states: interior mutability keeps
+    /// `RuntimeContext: Default`, so no `AppState` construction site — and
+    /// there are ~50 of them across `tests/` — has to change to carry the
+    /// handle. A process that never spawns the checker leaves this at its
+    /// `Default` (interval `0`), which renders `disabled`: honest about the
+    /// absent control rather than presenting an unearned pass.
+    pub fts_integrity: Arc<crate::background::fts_integrity::IntegrityStatus>,
 }
 
 impl std::fmt::Debug for RuntimeContext {
