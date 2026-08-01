@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 87).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 88).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -864,7 +864,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 87;
+const CURRENT_SCHEMA_VERSION: i64 = 88;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -3742,7 +3742,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             }
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 87 {
             // v87 (#2333 FBL-03 + #2332 FBL-02, v1.0.0) — two coordinated
             // heals, both additive / instant-preserving, NO table rebuild:
             //
@@ -3813,6 +3813,20 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                 }
             }
         }
+
+        // v88 (#2578, v1.0.0: composite list/archive ordering indexes on
+        // POSTGRES) is a SQLite NO-OP. SQLite has carried all three indexes
+        // since v56 (#1579 A2 + B6d) — `idx_memories_list_order`,
+        // `idx_memories_ns_list_order`, `idx_archived_ns_archived_at`, see
+        // `migrations/sqlite/0047_v56_list_composite_indexes.sql`. It was the
+        // POSTGRES twin that was recorded as a version-stamp no-op and never
+        // followed up, so a namespace-scoped `list` there read every row in
+        // the namespace and sorted it for the whole v56..v87 range. v88 is
+        // postgres catching up (`PostgresStore::migrate_v88`); there is
+        // nothing for this ladder to do. The unconditional stamp below moves
+        // the SQLite schema to v88 so both adapters keep ONE logical number
+        // (the v69 `kg_projection_outbox` precedent).
+        // Doc twin: migrations/sqlite/0072_v88_list_composite_indexes.sql.
 
         conn.execute("DELETE FROM schema_version", [])?;
         conn.execute(
