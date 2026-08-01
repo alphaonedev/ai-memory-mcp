@@ -558,6 +558,103 @@ else
     fi
 fi
 
+# ===========================================================================
+# SECTION D — #2657: the watchdog must time test RUNTIME, not compile+run.
+#
+# THE DEFECT. `ci.yml` carries TWO near-identical test-runner shell functions:
+# `run_tests` in the `check` job and `pg_test` in the `Postgres feature gate`
+# job. #1989 hoisted compilation OUT of the timed window in `run_tests` and
+# never touched its twin, so for the whole of the v1.0.0 epic the postgres
+# gate's 2100s cap measured compile+run.
+#
+# MEASURED on run 30718303500 attempt 2: the timed invocation began 22:16:43
+# and the first `Running tests/...` line appeared at 22:24:41 — 478s (23% of
+# the cap) spent compiling 316 crates INSIDE the window. Tests then ran 1605s
+# before the SIGTERM; 478 + 1605 = 2083s against a 2100s cap, and the kill
+# landed 99% of the way through (547 of 550 binaries had run). Nothing hung.
+#
+# WHY IT IS A SEPARATE INVARIANT FROM SECTION B. B is about diagnostic
+# completeness — a run that DID report should reach the binary carrying the
+# proof. This is about a MEASUREMENT being of the wrong quantity: the cap is
+# hang-detection, and a hang is a property of the RUN. Worse, the error it
+# produces is a `::error::[#1492 watchdog] ... exceeded the timeout` naming a
+# hang that did not occur, so the misfire actively misdirects triage.
+#
+# WHY IT MUST BE A GATE RATHER THAN A FIX. The failure mode is TWIN DRIFT: two
+# copies of one discipline, one fixed and one silently left behind. Fixing
+# `pg_test` alone would leave the class open the next time a runner is added.
+# So this rule is stated over EVERY watchdog-wrapped invocation, not over the
+# two functions that exist today.
+#
+# WHY THE SHORT-CIRCUIT IS PART OF THE RULE. The prebuild must be
+# `... || return "$?"`: a compile failure has to fail the job at the prebuild,
+# not fall through into a `timeout` run that reports a second, confusing error.
+# ===========================================================================
+echo "  --- Section D: #2657 watchdog measures RUNTIME, not compile+run ---"
+
+# d_scan <ci.yml-path> — prints "<bad>/<total>" over the watchdog-wrapped
+# `cargo test` invocations in that file. A wrapped invocation is COVERED when a
+# short-circuiting `--no-run` prebuild appears between the opener of its own
+# enclosing shell function and the invocation itself. Factored out so the R-203
+# regression leg below can run the IDENTICAL logic against a mutated copy.
+d_scan() {
+    local file="$1" total=0 bad=0 line w opener prebuild
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        total=$((total + 1))
+        w="${line%%:*}"
+        # Nearest enclosing `name() {` opener above the invocation.
+        opener="$(awk -v w="$w" '
+            NR < w && /^[[:space:]]+[A-Za-z_][A-Za-z0-9_]*\(\)[[:space:]]*\{[[:space:]]*$/ { n = NR }
+            END { print n + 0 }' "$file")"
+        if [ "$opener" -eq 0 ]; then
+            bad=$((bad + 1))
+            printf '         watchdog line %s is not inside a shell function\n' "$w" >&2
+            continue
+        fi
+        prebuild="$(awk -v a="$opener" -v b="$w" '
+            NR > a && NR < b && /cargo test --no-run "\$@" \|\| return "\$\?"/ { n = NR }
+            END { print n + 0 }' "$file")"
+        if [ "$prebuild" -eq 0 ]; then
+            bad=$((bad + 1))
+            printf '         no short-circuiting `cargo test --no-run "$@" || return "$?"` between the function opener (line %s) and the timed invocation (line %s)\n' \
+                "$opener" "$w" >&2
+        fi
+    done <<< "$(grep -nE '(TIMEOUT_BIN|--kill-after=60)[^|]*cargo test' "$file" || true)"
+    printf '%s/%s' "$bad" "$total"
+}
+
+d_result="$(d_scan "$CI_YML")"
+d_bad="${d_result%%/*}"
+d_total="${d_result##*/}"
+if [ "$d_total" -eq 0 ]; then
+    bad "D: found no watchdog-wrapped 'cargo test' invocation in $CI_YML" \
+        "the #1492 watchdog wrapper was removed or renamed — this guard has gone blind"
+elif [ "$d_bad" -eq 0 ]; then
+    ok "D: all $d_total watchdog-wrapped 'cargo test' invocations hoist compilation out of the timed window"
+else
+    bad "D: $d_bad of $d_total watchdog-wrapped 'cargo test' invocations compile INSIDE the timed window" \
+        "the per-invocation cap then measures compile+run and shrinks as test files are added, and its ::error:: names a hang that did not occur (#2657; #1989 fixed only the check-job twin)"
+fi
+
+# R-203 regression leg: strip the prebuild from a throwaway copy and require
+# the scan to CATCH it. Without this, a scan whose regex silently stopped
+# matching would report 0/0-clean forever — the same vacuous-assertion hazard
+# Sections A and C each carry a frozen-fixture leg against. Scratch lives under
+# the repo (never system /tmp), trap-cleaned by the SCRATCH dir above.
+if [ "$d_total" -gt 0 ]; then
+    D_MUT="$SCRATCH/ci-2657-mutant.yml"
+    grep -v 'cargo test --no-run "\$@" || return "\$?"' "$CI_YML" > "$D_MUT"
+    d_mut_result="$(d_scan "$D_MUT" 2>/dev/null)"
+    d_mut_bad="${d_mut_result%%/*}"
+    if [ "$d_mut_bad" -eq "$d_total" ]; then
+        ok "D regression: stripping every --no-run prebuild makes ALL $d_total invocations fail the scan — the rule is load-bearing"
+    else
+        bad "D regression: the prebuild-stripped mutant did not fail the scan ($d_mut_result)" \
+            "the scan has gone blind — every assertion above is vacuous"
+    fi
+fi
+
 echo ""
 if [ "$FAIL" -eq 0 ]; then
     echo "ci.yml invariants: $PASS/$PASS PASS"
