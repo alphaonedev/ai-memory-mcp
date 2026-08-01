@@ -401,3 +401,54 @@ mod tests {
         assert!(body.contains("serialisation failed"));
     }
 }
+
+/// #2588 — classify a TYPED SAL error into its bulk row class by its
+/// canonical `code()` slug rather than by its prose.
+///
+/// The postgres bulk branch rejects rows with `StoreError`, which already
+/// carries the same `crate::errors::error_codes` slug the single-row surface
+/// maps to a status. Round-tripping it through
+/// [`classify_bulk_row_error`]'s substring matcher was a lossy inference over
+/// a value we hold — and it FAILED concretely: `StoreError::QuotaExceeded`
+/// renders as `"quota exceeded for <a> in <ns>: memories_per_day 5/5"`, which
+/// matches no allowlisted arm and so classified as a retryable
+/// `500 internal error`. That is the #2588 defect on the postgres branch
+/// specifically: a quota rollback that dropped the whole batch reported an
+/// opaque internal failure, so the sqlite and postgres backends disagreed
+/// about the SAME condition on the SAME request.
+#[cfg(feature = "sal")]
+#[must_use]
+pub fn classify_store_err(e: &crate::store::StoreError) -> BulkRowErrorClass {
+    use crate::errors::error_codes as codes;
+    let code = e.code();
+    let (label, status, retryable) = if code == codes::QUOTA_EXCEEDED {
+        ("quota exceeded", StatusCode::TOO_MANY_REQUESTS, true)
+    } else if code == codes::CONFLICT {
+        ("conflict: already exists", StatusCode::CONFLICT, false)
+    } else if code == codes::NOT_FOUND {
+        ("not found", StatusCode::NOT_FOUND, false)
+    } else if code == codes::GOVERNANCE_REFUSED {
+        ("forbidden", StatusCode::FORBIDDEN, false)
+    } else if code == codes::VALIDATION_FAILED {
+        ("validation failed", StatusCode::BAD_REQUEST, false)
+    } else if code == codes::STORE_BACKEND_UNAVAILABLE
+        || code == codes::RECORD_STOPPED
+        || code == codes::SCHEMA_AHEAD_OF_BINARY
+    {
+        // Reachable again once the operator resolves the posture, so a fleet
+        // loader SHOULD back off and retry rather than quarantine the rows.
+        (
+            "replication unavailable",
+            StatusCode::SERVICE_UNAVAILABLE,
+            true,
+        )
+    } else {
+        ("internal error", StatusCode::INTERNAL_SERVER_ERROR, true)
+    };
+    BulkRowErrorClass {
+        code,
+        label,
+        status,
+        retryable,
+    }
+}

@@ -77,6 +77,8 @@ use super::BULK_FANOUT_CONCURRENCY;
 #[cfg(feature = "sal")]
 use super::StorageBackend;
 use super::create::{build_create_memory, resolve_create_caller, resolve_create_metadata};
+#[cfg(feature = "sal")]
+use super::errors::classify_store_err;
 use super::errors::{BulkRowErrorClass, classify_bulk_row_error};
 
 /// #2594 — how many rows are handed to `Embedder::embed_batch` per call.
@@ -1018,7 +1020,7 @@ async fn bulk_create_postgres(
             )
             .await
         {
-            ledger.reject(row.index, "quota", &e.to_string());
+            ledger.reject_class(row.index, "quota", classify_store_err(&e), &e.to_string());
             continue;
         }
 
@@ -1076,10 +1078,11 @@ async fn bulk_create_postgres(
                 // shape. Every lost row now gets its own typed, indexed
                 // rejection, and `BulkLedger::status` turns the total loss
                 // into the dominant cause's status (429 for quota).
+                let class = classify_store_err(&e);
                 let detail = e.to_string();
                 tracing::warn!("bulk_create(postgres): store_batch failed: {detail}");
                 for row in &allowed {
-                    ledger.reject(row.index, "store", &detail);
+                    ledger.reject_class(row.index, "store", class, &detail);
                 }
             }
         }
