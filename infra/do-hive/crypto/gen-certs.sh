@@ -45,15 +45,41 @@ cd "$OUT_DIR"
 
 fp() { openssl x509 -in "$1" -outform DER | openssl dgst -sha256 | awk '{print $NF}'; }
 
+# --- Key algorithms ----------------------------------------------------------
+# The CA is RSA-2048, NOT Ed25519, and this is load-bearing for the postgres leg.
+#
+# A leaf certificate's SIGNATURE algorithm is the CA's, not the leaf's. libpq
+# computes the SCRAM channel-binding value `tls-server-end-point`, which hashes
+# the server cert using the digest of that signature algorithm -- and Ed25519
+# has NO associated digest (NID_undef). An Ed25519-signed server cert therefore
+# makes EVERY TLS mode fail at the client with
+#     could not find digest for NID UNDEF
+# even though `openssl s_client -starttls postgres` handshakes the same cert
+# happily (openssl does not do channel binding). Measured 2026-08-01 against
+# PG 18.4 + libpq 16.14 / OpenSSL 3.0.13: sslmode=require, verify-ca and
+# verify-full ALL failed; the certified local stack uses RSA-2048 for exactly
+# this reason. The other leaves keep Ed25519 keys (rustls is happy either way);
+# only the signing algorithm had to change, and RSA-2048 is universally accepted.
+CA_KEY_ALG="${CA_KEY_ALG:-rsa}"        # do NOT set to ed25519 if any leaf serves postgres
+PG_KEY_ALG="${PG_KEY_ALG:-rsa}"        # matches the certified pg-age-stack certs
+
+genkey() {  # genkey <out-file> <alg>
+  case "$2" in
+    rsa) openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$1" ;;
+    *)   openssl genpkey -algorithm "$2" -out "$1" ;;
+  esac
+}
+
 # --- Root CA -----------------------------------------------------------------
-openssl genpkey -algorithm ed25519 -out ca.key
+genkey ca.key "$CA_KEY_ALG"
 openssl req -x509 -new -key ca.key -days "$DAYS" -out ca.crt \
   -subj "/CN=ai-memory-do-round-CA"
+chmod 600 ca.key
 
-# helper: mint a leaf cert <name> <CN> <SAN-extfile-body>
+# helper: mint a leaf cert <name> <CN> <SAN-extfile-body> [key-alg]
 mint() {
-  local name="$1" cn="$2" san="$3"
-  openssl genpkey -algorithm ed25519 -out "${name}.key"
+  local name="$1" cn="$2" san="$3" alg="${4:-ed25519}"
+  genkey "${name}.key" "$alg"
   openssl req -new -key "${name}.key" -out "${name}.csr" -subj "/CN=${cn}"
   cat > "${name}.ext" <<EOF
 subjectAltName=${san}
@@ -85,7 +111,7 @@ mint peerB "ai-memory-peerB" "$PEERB_SAN"
 # verify-full checks hostname == cert SAN/CN, so CN + SAN must be $PG_HOST.
 PG_SAN="DNS:${PG_HOST}"
 case "$PG_HOST" in *[0-9].[0-9]*) PG_SAN="IP:${PG_HOST},DNS:${PG_HOST}";; esac
-mint pg-server "$PG_HOST" "$PG_SAN"
+mint pg-server "$PG_HOST" "$PG_SAN" "$PG_KEY_ALG"
 # postgres wants key owned by the postgres user, mode 0600; caller chowns.
 
 # --- Allowlists --------------------------------------------------------------
