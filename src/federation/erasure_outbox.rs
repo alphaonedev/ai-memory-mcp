@@ -240,7 +240,16 @@ const MARKER_LAST_ERROR: &str = "not a queue entry — #2446 erasure-outbox drai
 /// Infallible + best-effort: a marker write failure degrades to
 /// "erasures stay local-only" with a loud WARN, never a boot failure.
 /// Called once from `daemon_runtime::bootstrap_serve`.
+///
+/// The unfederated arm is READ-ONLY on the overwhelmingly common path:
+/// it probes for the marker and only issues the DELETE when one is
+/// actually present. Every `serve` boot crosses this, so an
+/// unconditional write here would add a write-lock acquisition to the
+/// startup of every single-node daemon in exchange for deleting nothing.
 pub fn apply_drainability(conn: &Connection, drainable_peers: Option<usize>) {
+    if drainable_peers.is_none() && !is_drainable(conn) {
+        return;
+    }
     match drainable_peers {
         Some(peer_count) => match mark_federation_drainable(conn, peer_count) {
             Ok(()) => tracing::info!(
