@@ -376,6 +376,89 @@ burst) can be drained the same way — drop the `attempt_count`
 predicate after verifying convergence. The replay worker handles
 everything else on its own.
 
+#### Legacy positional `peer_id` rows after upgrading past #2442 {#legacy-positional-peer-id}
+
+**Symptom**: after upgrading, the daemon logs *once per process*
+
+> `replay: DLQ row N is keyed by a PRE-#2442 POSITIONAL peer id (peer-1)`
+
+and the `ai_memory_federation_push_dlq_legacy_positional_total`
+counter climbs on every replay tick.
+
+**What changed.** Before #2442 the DLQ routing key was
+`format!("peer-{i}")` — the *position* of a peer in the
+`--quorum-peers` flag. That key is durable but the position is not:
+removing one peer shifted every higher index down, so a queued row for
+the old `peer-3` resolved to a **different host**, was POSTed there,
+and was then stamped `replayed_at`. Cross-tenant content disclosure and
+silent write loss, from an ordinary decommission. Peer ids are now
+derived from peer identity (`peer-h1<32 hex>` =
+`SHA-256("ai-memory:peer-id:v1\0" || <normalised url>)`), so a
+surviving peer is never re-keyed.
+
+**What that costs you.** Rows written by the OLD binary carry
+`peer-0`, `peer-1`, … which resolve to nothing. They are **skipped, not
+delivered, and not deleted** — the payload stays in the table — and
+after `MAX_REPLAY_ATTEMPTS` (100) they quarantine and stop being
+retried automatically. They are NOT auto-remapped onto
+`config.peers[N]`: that mapping is only correct if your peer list never
+changed, and a binary upgrade is exactly when operators change it, so
+guessing would re-commit the defect. Until you act, those writes reach
+the peer only if its own `/sync/since` catch-up carries them.
+
+**Remediation (operator-gated).** You supply the mapping; nothing in
+the database can reconstruct it, because the old index→URL
+correspondence lived only in your flags at the time the row was
+written.
+
+1. Recover which URL each old index referred to, from your pre-upgrade
+   `--quorum-peers` ordering (deploy manifest, systemd unit, shell
+   history). If you cannot attribute a row, **drain it — do not guess.**
+2. Compute that URL's stable peer id. It is a pure function of the URL,
+   so you do not need the daemon:
+
+   ```bash
+   # normalise exactly as the daemon does: strip trailing '/', lowercase
+   url='https://peer-b.example:8443/base'
+   norm=$(printf '%s' "$url" | sed 's:/*$::' | tr 'A-Z' 'a-z')
+   printf 'peer-h1%s\n' \
+     "$(printf 'ai-memory:peer-id:v1\0%s' "$norm" | sha256sum | cut -c1-32)"
+   ```
+
+   The daemon also logs the whole map at boot, one INFO line per peer:
+   `registered peer … peer_id=peer-h1… url=…`.
+3. Re-key the rows. **`attempt_count = 0` is not optional** — pending
+   rows are drained `WHERE attempt_count < 100`, so a quarantined row
+   that is only re-keyed stays excluded forever:
+
+   ```sql
+   UPDATE federation_push_dlq
+      SET peer_id = 'peer-h1<the 32-hex id from step 2>',
+          attempt_count = 0,
+          last_error = 'operator re-key (#2442)'
+    WHERE replayed_at IS NULL
+      AND peer_id = 'peer-1';   -- one old index at a time
+   ```
+
+**Do NOT mirror this onto `sync_state`.** The catch-up vector clock is
+keyed by the same id and its legacy entries are orphaned too — but that
+orphan is *self-healing*: a missing entry makes the next catch-up pull
+from the beginning (bounded to 500 rows/tick, oldest-first, idempotent
+via `insert_if_newer`), so it converges on its own at the cost of one
+bounded re-pull per peer. `sync_state_observe` is **monotonic** — it
+takes the max and has no API that walks a clock backwards — so a
+re-key that names the wrong peer permanently advances a cursor past
+rows that were never pulled, converting a benign orphan into silent,
+irreversible write loss. The DLQ and `sync_state` have opposite correct
+answers here: re-key the first, never touch the second.
+
+**Transitional double-count.** The pending unique index is
+`(memory_id, peer_id) WHERE replayed_at IS NULL`, so during the window
+a memory can hold two pending rows for the same physical peer — the
+legacy one burning its attempt budget, and a fresh one replaying
+normally. DLQ depth roughly doubling right after an upgrade is this,
+not a new fault.
+
 ## Performance
 
 ### `recall` is slow (> 2 s)
