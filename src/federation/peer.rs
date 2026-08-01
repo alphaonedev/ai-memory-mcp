@@ -78,6 +78,21 @@ impl FederationConfig {
         // lowercase scheme+host) before comparing.
         let mut seen_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
         for raw in peer_urls {
+            // #2477 — refuse a peer that would carry PLAINTEXT memory
+            // content off-host BEFORE anything else uses the URL. Pre-fix
+            // this loop validated only for duplicates and the raw string
+            // went straight into `sync_push_url`, so `http://peer:9077`
+            // replicated content in the clear — trivially bypassing the
+            // four-condition ceremony #2448 built for the strictly weaker
+            // accept-any-server-cert case.
+            //
+            // Refusal is WHOLE-BOOT, never per-peer skip-and-continue:
+            // `n = 1 + peer_urls.len()` below feeds `QuorumPolicy::new`, so
+            // silently dropping a peer would change the quorum guarantee
+            // without saying so — and `PeerEndpoint.id` is a positional
+            // index (#2442), so a shrunken list also re-keys every DLQ row
+            // above the gap.
+            crate::tls::validate_peer_url_scheme(raw).map_err(|e| anyhow::anyhow!("{e}"))?;
             let normalized = raw.trim_end_matches('/').to_ascii_lowercase();
             if !seen_urls.insert(normalized.clone()) {
                 return Err(anyhow::anyhow!(
