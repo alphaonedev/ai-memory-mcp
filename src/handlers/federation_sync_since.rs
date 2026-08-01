@@ -30,6 +30,76 @@ use super::federation_signing_check::verify_get_signature_or_reject;
 #[cfg(feature = "sal")]
 use super::{StorageBackend, store_err_to_response};
 
+/// #2441 — compute the honest PULL CURSOR for one `/sync/since` page.
+///
+/// `examined` is the row set the SQL `LIMIT` returned, **before** the
+/// per-peer namespace allowlist and the `scope=private` visibility
+/// filter run in memory. Both backends order it `updated_at ASC`
+/// (`db::memories_updated_since` / `MemoryStore::list_memories_updated_since`,
+/// both `#1476`-sargable with a strict `updated_at > since` predicate),
+/// so the last element carries the largest timestamp examined.
+///
+/// Why the cursor must come from EXAMINED rows: the `LIMIT` is applied
+/// in SQL and the two filters run after it, so a window composed
+/// entirely of out-of-scope rows projects `count: 0`. A puller that
+/// derives its next `since` from the PROJECTED rows therefore never
+/// advances, re-requests the identical window forever, and never
+/// converges — a permanent, silent, unbounded replica divergence that
+/// answers HTTP 200 and reads as "in sync".
+///
+/// Tie-group safety (the reason this is not simply `examined.last()`):
+/// the cursor predicate is strict `>`, so advancing to a timestamp that
+/// several rows share SKIPS every sharer that fell beyond the `LIMIT`.
+/// When the page came back FULL (`len >= limit`) it may have been cut
+/// mid-tie-group, so the trailing tie group is dropped and the cursor
+/// lands on the largest strictly-smaller timestamp examined; those rows
+/// are simply re-examined on the next pull (idempotent — the receiver
+/// applies `insert_if_newer`). A short page cannot have been cut, so it
+/// advances to the last row. A FULL page whose rows ALL share one
+/// timestamp yields `None`: refusing to advance stalls (loudly, at the
+/// call site), whereas advancing would silently drop rows — DEGRADE,
+/// never lose data.
+///
+/// Residual, documented rather than hidden: the postgres SAL adapter
+/// additionally clamps its own `LIMIT` internally, so an operator who
+/// raises `AI_MEMORY_MAX_PAGE_SIZE` above that clamp can make a
+/// genuinely-cut page look short here and re-open the tie hazard on
+/// that backend. That is the pre-#2441 behaviour of every puller, so it
+/// is not a regression; the guard simply does not extend to it.
+fn next_since_watermark(examined: &[Memory], limit: usize) -> Option<String> {
+    let last = examined.last()?;
+    if examined.len() < limit {
+        // Page was not truncated: no row beyond it can share `last`.
+        return Some(last.updated_at.clone());
+    }
+    // Page may have been cut mid-tie-group. Walk back to the newest
+    // strictly-older timestamp; `None` when the whole page is one group.
+    examined
+        .iter()
+        .rev()
+        .find(|m| m.updated_at != last.updated_at)
+        .map(|m| m.updated_at.clone())
+}
+
+/// #2441 — the ONE case [`next_since_watermark`] cannot advance without
+/// risking row loss: a FULL page whose every row shares one
+/// `updated_at`. The puller will re-request the identical window, so the
+/// stall is real and must be loud rather than silent — raise
+/// `?limit=` (or `AI_MEMORY_MAX_PAGE_SIZE`) past the size of that
+/// timestamp's tie group and the pull converges on the next cycle.
+fn warn_if_cursor_pinned(next_since: Option<&str>, examined: usize, limit: usize) {
+    if next_since.is_none() && examined > 0 && examined >= limit {
+        tracing::warn!(
+            target: "federation::scope",
+            examined,
+            limit,
+            "sync_since: every row in a FULL page shares one updated_at; the pull \
+             cursor cannot advance without skipping rows, so it is held. The peer \
+             will re-request this window until `limit` exceeds that tie group."
+        );
+    }
+}
+
 pub async fn sync_since(
     State(app): State<AppState>,
     headers: HeaderMap,
@@ -212,6 +282,12 @@ pub async fn sync_since(
                 (field_names::UPDATED_SINCE): q.since,
                 (field_names::EARLIEST_UPDATED_AT): serde_json::Value::Null,
                 (field_names::LATEST_UPDATED_AT): serde_json::Value::Null,
+                // #2441 — this arm never reads the DB, so there is no
+                // examined row set to derive a cursor from. `null` is
+                // the honest answer: the peer is default-denied and
+                // `scope_status` already says so, so a pinned cursor
+                // here is a correct refusal, not a silent stall.
+                (field_names::NEXT_SINCE): serde_json::Value::Null,
                 "memories": Vec::<Memory>::new(),
                 (field_names::EXCLUDED_FOR_SCOPE): 0,
                 (field_names::EXCLUDED_FOR_SCOPE_PRIVATE): 0,
@@ -250,6 +326,10 @@ pub async fn sync_since(
             Err(e) => return store_err_to_response(e),
         };
         let total = mems.len();
+        // #2441 — derive the pull cursor from rows EXAMINED, before the
+        // two in-memory filters below shrink the page (possibly to zero).
+        let next_since = next_since_watermark(&mems, limit);
+        warn_if_cursor_pinned(next_since.as_deref(), total, limit);
         let ns_filtered: Vec<Memory> = mems.into_iter().filter(|m| allowed(&m.namespace)).collect();
         let after_ns = ns_filtered.len();
         let excluded = total.saturating_sub(after_ns);
@@ -270,6 +350,7 @@ pub async fn sync_since(
                 (field_names::UPDATED_SINCE): q.since,
                 (field_names::EARLIEST_UPDATED_AT): earliest_updated_at,
                 (field_names::LATEST_UPDATED_AT): latest_updated_at,
+                (field_names::NEXT_SINCE): next_since,
                 "memories": filtered,
                 (field_names::STORAGE_BACKEND): "postgres",
                 (field_names::EXCLUDED_FOR_SCOPE): excluded,
@@ -298,6 +379,12 @@ pub async fn sync_since(
     // the response (callers see a partial view + an honest
     // `excluded_for_scope` count).
     let total = mems.len();
+    // #2441 — derive the pull cursor from rows EXAMINED, before the two
+    // in-memory filters below shrink the page (possibly to zero). This
+    // value is ALSO what the server records as the peer's observed
+    // watermark below, so a fully-filtered window advances both sides.
+    let next_since = next_since_watermark(&mems, limit);
+    warn_if_cursor_pinned(next_since.as_deref(), total, limit);
     let mems: Vec<Memory> = mems.into_iter().filter(|m| allowed(&m.namespace)).collect();
     let excluded = total.saturating_sub(mems.len());
 
@@ -320,12 +407,17 @@ pub async fn sync_since(
     let header_agent_id = headers
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
+    // #2441 — the durable per-peer clock entry must advance on rows
+    // EXAMINED, exactly like the wire cursor. Pre-fix this used
+    // `mems.last()` (post namespace + visibility filter), so a window
+    // that filtered to empty left the server's own record of the peer's
+    // watermark pinned as well — the stall was recorded on BOTH sides.
     if let (Some(peer), Ok(local_agent_id)) = (
         q.peer.as_deref(),
         crate::identity::resolve_http_agent_id(None, header_agent_id),
     ) && validate::validate_agent_id(peer).is_ok()
-        && let Some(last) = mems.last()
-        && let Err(e) = db::sync_state_observe(&lock.0, &local_agent_id, peer, &last.updated_at)
+        && let Some(watermark) = next_since.as_deref()
+        && let Err(e) = db::sync_state_observe(&lock.0, &local_agent_id, peer, watermark)
     {
         tracing::debug!("sync_since: sync_state_observe failed: {e}");
     }
@@ -352,6 +444,7 @@ pub async fn sync_since(
             (field_names::UPDATED_SINCE): q.since,
             (field_names::EARLIEST_UPDATED_AT): earliest_updated_at,
             (field_names::LATEST_UPDATED_AT): latest_updated_at,
+            (field_names::NEXT_SINCE): next_since,
             "memories": mems,
             (field_names::EXCLUDED_FOR_SCOPE): excluded,
             (field_names::EXCLUDED_FOR_SCOPE_PRIVATE): excluded_for_scope_private,
