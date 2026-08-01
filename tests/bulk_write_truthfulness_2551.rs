@@ -600,3 +600,37 @@ async fn bulk_refuses_disagreeing_agent_id_claim_2550() {
     );
     assert_reconciles(&v);
 }
+
+/// #2588 — the total-rejection status tracks the CAUSE, it is not merely
+/// "something that isn't 200".
+///
+/// Twin of `bulk_total_rejection_is_not_200_2588`, which drives the same
+/// nothing-persisted path to a **429** via the quota. Here the only cause is
+/// `validate_create`, so the dominant cause is `VALIDATION_FAILED` and the
+/// status is **400** — byte-identical to what the SAME body gets from
+/// single-create `POST /api/v1/memories`.
+///
+/// Pinned as its own cell because a single not-200 assertion would pass
+/// against a handler that returned one blanket error status for every cause,
+/// which is exactly the behaviour the retryable-first precedence exists to
+/// prevent: a quota-throttled batch must be distinguishable from an
+/// unfixable one, or a fleet loader cannot tell "back off" from "never retry".
+#[tokio::test]
+async fn bulk_total_rejection_status_tracks_the_cause_2588() {
+    let (router, db_path, _keep) = build_test_router();
+    let ns = "cause-2588";
+    let batch = json!([row(ns, "", "x"), row(ns, "", "y")]); // empty titles
+    let (status, v) = post(&router, "/api/v1/memories/bulk", &batch).await;
+
+    assert_eq!(db_row_count(&db_path, ns), 0, "nothing landed: {v}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "#2588: a batch rejected solely by validation reports 400, not the \
+         429 its quota-rejected twin reports: {v}"
+    );
+    for e in v["errors"].as_array().expect("errors[]") {
+        assert_eq!(e["code"], "VALIDATION_FAILED", "{v}");
+    }
+    assert_reconciles(&v);
+}
