@@ -188,6 +188,43 @@
 #       `cancel-in-progress: false`, is NOT flagged: it produces two SUCCESS
 #       runs — wasteful, but no `cancelled` row, so not this defect class.
 #
+#   (f) HARD-FAIL: every job in a GATING workflow (`COVERED_WORKFLOWS` below —
+#       `ci.yml`, `c8-precheck.yml`, `coverage.yml`) must be declared EITHER in
+#       the mirror OR in the dated not-required ledger
+#       `scripts/qc-allowlists/required-contexts-not-required.txt`.
+#
+#       WHY IT IS A DIFFERENT KIND OF RULE. Rules (a)-(e) all reason from the
+#       mirror OUTWARD: given a required context, is it sound? Not one of them
+#       can see a job that is simply ABSENT from the mirror. So a newly-added
+#       integrity gate lands unrequired, in silence, and nothing notices — and
+#       nothing did. That is case (5):
+#
+#   (5) THE UNREQUIRED GATE (#2636). FOUR `c8-precheck.yml` integrity gates ran
+#       on every PR and were required by nothing:
+#           Installer checksum fail-closed gate (#2449)
+#           Non-Rust conformance-reader proof gate (#2452)
+#           Required-context + classify-base soundness gate (#2494/#2496/#2508)
+#           Git-dependency-source supply-chain gate (#2050/#2512)
+#       The THIRD is THIS GATE — the sole mechanical proof that the other
+#       required contexts are creatable, reachable, non-skipping, non-cancelled
+#       and non-truncated. A pull request that broke the gate proving the gates
+#       work could merge. The prose "KNOWN GAPS" note meant to record this
+#       named only TWO of the four and had gone stale unnoticed, which is the
+#       whole argument for a machine-parsed ledger over a comment: prose cannot
+#       fail CI.
+#
+#       PARTIAL MATRIX COVERAGE FAILS. A matrix job with 2 of 3 expansions
+#       declared is a silent gap — the third leg can fail and merge while its
+#       siblings look green.
+#
+#       STALE ENTRIES ARE FATAL HERE, unlike the rule (d) pending-fix ledger
+#       where a stale line can only suppress a failure that no longer happens.
+#       A stale line in THIS ledger pre-absolves whatever job next takes that
+#       job id, in the workflow where the integrity gates live. Both staleness
+#       directions fail: an entry for a job that no longer exists, and an entry
+#       for a job whose context IS in the mirror (required and
+#       deliberately-unrequired at once is a contradiction).
+#
 # CLI:
 #   scripts/check-required-contexts.sh              — run the gate (exit 0/1)
 #   scripts/check-required-contexts.sh --self-test  — plant the historical
@@ -216,6 +253,8 @@
 #   RQC_MIRROR_FILE       (default <root>/scripts/qc-allowlists/required-contexts-release.txt)
 #   RQC_ALLOW_FILE        (default <root>/scripts/qc-allowlists/required-contexts-joblevel-if-allow.txt)
 #   RQC_DUPTRIG_ALLOW_FILE (default <root>/scripts/qc-allowlists/dual-trigger-cancel-allow.txt)
+#   RQC_NOTREQ_FILE       (default <root>/scripts/qc-allowlists/required-contexts-not-required.txt)
+#   RQC_COVERED_WORKFLOWS (default "ci.yml c8-precheck.yml coverage.yml") — rule (f) scope
 #   RQC_PROTECTED_BRANCH  (default release/v1.0.0)
 #   RQC_CLASSIFY_JOB      (default classify)  — the job id rule (b3) keys on
 #
@@ -230,8 +269,32 @@ WORKFLOW_DIR="${RQC_WORKFLOW_DIR:-$ROOT/.github/workflows}"
 MIRROR_FILE="${RQC_MIRROR_FILE:-$ROOT/scripts/qc-allowlists/required-contexts-release.txt}"
 ALLOW_FILE="${RQC_ALLOW_FILE:-$ROOT/scripts/qc-allowlists/required-contexts-joblevel-if-allow.txt}"
 DUPTRIG_ALLOW_FILE="${RQC_DUPTRIG_ALLOW_FILE:-$ROOT/scripts/qc-allowlists/dual-trigger-cancel-allow.txt}"
+NOTREQ_FILE="${RQC_NOTREQ_FILE:-$ROOT/scripts/qc-allowlists/required-contexts-not-required.txt}"
 PROTECTED_BRANCH="${RQC_PROTECTED_BRANCH:-release/v1.0.0}"
 CLASSIFY_JOB="${RQC_CLASSIFY_JOB:-classify}"
+
+# --- rule (f) SCOPE: the GATING workflows ----------------------------------
+#
+# The workflows that carry required contexts — the pull-request gating
+# pipeline. Every job in these must be declared in the mirror or in the
+# not-required ledger; none may DEFAULT to unenforced.
+#
+# Deliberately NOT repo-wide, unlike rules (d) and (e). Those detect STATIC
+# DEFECTS, wrong wherever they appear. Rule (f) encodes a POLICY JUDGEMENT
+# ("should this job be required?") that has to be authored per workflow, and
+# sweeping in `release.yml` / `publish-sdks.yml` / `yank.yml` and the rest
+# would mean inventorying ~45 jobs that never fire on `pull_request` at all —
+# a junk drawer that teaches readers to skim past the ledger, which is how a
+# ledger stops being read.
+#
+# Deliberately DECLARED rather than derived from "workflows carrying a mirror
+# context": deriving it would make the scope a function of the mirror, so
+# dropping a workflow's last required context would silently remove that
+# workflow from rule (f)'s reach at the very moment it stopped being covered by
+# rules (a)-(c). Declared, the two can be cross-checked — and the gate DOES
+# cross-check, in both directions: a declared workflow with no parsed jobs
+# fails, and a mirror context carried by an undeclared workflow fails.
+COVERED_WORKFLOWS="${RQC_COVERED_WORKFLOWS:-ci.yml c8-precheck.yml coverage.yml}"
 
 # --- rule (d) PR-HEAD PROBE CORPUS -----------------------------------------
 #
@@ -692,6 +755,7 @@ run_gate() {
 
     # ---- expand job names into the concrete context names they report -----
     declare -A CTX_JOB=()      # context name -> "file|job"
+    declare -A JOB_CTXS=()     # "file|job" -> newline-joined reported names (rule f)
     declare -a UNEXPANDABLE=()
     local jk name mvar vals v expanded
     for jk in "${JOBKEYS[@]}"; do
@@ -699,6 +763,7 @@ run_gate() {
         [ -n "$name" ] || continue
         if [[ "$name" != *'${{'* ]]; then
             [ -n "${CTX_JOB[$name]:-}" ] || CTX_JOB["$name"]="$jk"
+            JOB_CTXS["$jk"]="$name"
             continue
         fi
         # Exactly one `${{ matrix.<key> }}` is expandable; anything else is
@@ -718,6 +783,7 @@ run_gate() {
             for v in $vals; do
                 expanded="${pre}${v}${post}"
                 [ -n "${CTX_JOB[$expanded]:-}" ] || CTX_JOB["$expanded"]="$jk"
+                JOB_CTXS["$jk"]="${JOB_CTXS[$jk]:-}${JOB_CTXS[$jk]:+$'\n'}$expanded"
             done
         else
             UNEXPANDABLE+=("$jk :: $name")
@@ -947,12 +1013,126 @@ run_gate() {
         echo "ℹ️  required-contexts: RULE (d) PENDING-FIX ENTRY IS NOW STALE — '${akey%%|*}' pattern '${akey#*|}' (${DUPTRIG_REF[$akey]:-<no issue>}) no longer trips rule (d). The carrier was fixed: DELETE that line from $DUPTRIG_ALLOW_FILE." >&2
     done
 
+    # ---- rule (f): no job in a gating workflow may DEFAULT to unenforced ---
+    #
+    # Rules (a)-(e) all reason from the mirror OUTWARD: given a required
+    # context, is it sound? None of them can see a job that is simply ABSENT
+    # from the mirror — so a newly-added integrity gate lands unrequired, in
+    # silence, and nothing ever notices. That is #2636: four c8-precheck gates
+    # ran on every PR required by nothing, INCLUDING this very gate, the only
+    # mechanical proof that the other required contexts are sound. A PR that
+    # broke it merged. Rule (f) reasons from the WORKFLOWS inward and closes
+    # the direction the other five cannot see.
+    #
+    # A job is accounted for when EVERY context name it reports is declared in
+    # the mirror, or when it carries an entry in the not-required ledger.
+    # Partial matrix coverage FAILS: a matrix job with 2 of 3 expansions
+    # required is a real, silent gap — the third leg can fail and merge.
+    declare -A NOTREQ=() NOTREQ_REF=() NOTREQ_USED=()
+    local -a notreq_lines=()
+    mapfile -t notreq_lines < <(read_list "$NOTREQ_FILE")
+    local nline nfile njob ndate nref
+    for nline in "${notreq_lines[@]}"; do
+        # FORMAT: <workflow-file> <job-id> <YYYY-MM-DD> #<issue> [note…]
+        read -r nfile njob ndate nref _ <<< "$nline"
+        if [ -z "$nfile" ] || [ -z "$njob" ] \
+            || [[ ! "$ndate" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+            || [[ ! "$nref" =~ ^#[0-9]+$ ]]; then
+            fail "NOT-REQUIRED LEDGER MALFORMED — '$nline' in $NOTREQ_FILE."
+            echo "     Every entry MUST be '<workflow-file> <job-id> <YYYY-MM-DD> #<issue>'. The date records WHEN the decision was taken and the issue is what closes it; without both, an entry rots into an unexplained suppression — which is exactly the prose 'KNOWN GAPS' failure this ledger replaces." >&2
+            continue
+        fi
+        NOTREQ["$nfile|$njob"]=1
+        NOTREQ_REF["$nfile|$njob"]="$ndate $nref"
+    done
+
+    # The covered set must not silently narrow while the required set widens:
+    # a mirror context carried by a workflow OUTSIDE it means rule (f) has a
+    # blind spot in a pipeline that is already trusted with required contexts.
+    declare -A COVERED=()
+    local cw
+    for cw in $COVERED_WORKFLOWS; do
+        COVERED["$cw"]=1
+        local seen_cw=0 _jk
+        for _jk in "${JOBKEYS[@]}"; do
+            if [ "${JOB_FILE[$_jk]}" = "$cw" ]; then seen_cw=1; break; fi
+        done
+        if [ "$seen_cw" != "1" ]; then
+            fail "RULE (f) — declared gating workflow '$cw' has NO parsed jobs in $WORKFLOW_DIR (renamed, deleted, or unparseable)."
+            echo "     Refusing to pass a scope declaration that covers nothing (fail-closed): a stale name here silently shrinks rule (f)'s reach to the workflows that happen to still match. FIX: update COVERED_WORKFLOWS in this script." >&2
+        fi
+    done
+    for ctx in "${contexts[@]}"; do
+        jk="${CTX_JOB[$ctx]:-}"
+        [ -n "$jk" ] || continue
+        wf="${JOB_FILE[$jk]}"
+        [ -z "${COVERED[$wf]:-}" ] || continue
+        fail "RULE (f) SCOPE — required context '$ctx' is carried by '$wf', which is NOT in this gate's COVERED_WORKFLOWS ($COVERED_WORKFLOWS)."
+        echo "     A workflow trusted to carry a required context must have ALL of its jobs accounted for, or rule (f) has a blind spot in exactly the pipeline that matters. FIX: add '$wf' to COVERED_WORKFLOWS and declare each of its jobs in the mirror or in $NOTREQ_FILE." >&2
+    done
+
+    declare -A CTX_DECLARED=()
+    for ctx in "${contexts[@]}"; do CTX_DECLARED["$ctx"]=1; done
+
+    local fjk fwf fjob fname missing declared_any
+    for fjk in "${JOBKEYS[@]}"; do
+        fwf="${JOB_FILE[$fjk]}"
+        [ -n "${COVERED[$fwf]:-}" ] || continue
+        fjob="${fjk#*|}"
+
+        if [ -n "${NOTREQ[$fwf|$fjob]:-}" ]; then
+            NOTREQ_USED["$fwf|$fjob"]=1
+            # Declared BOTH required and not-required is a contradiction, and
+            # the harmful half is the stale line: it would pre-absolve a future
+            # job that reuses this id.
+            declared_any=0
+            while IFS= read -r fname; do
+                [ -n "$fname" ] || continue
+                [ -z "${CTX_DECLARED[$fname]:-}" ] || declared_any=1
+            done <<< "${JOB_CTXS[$fjk]:-}"
+            if [ "$declared_any" = "1" ]; then
+                fail "NOT-REQUIRED LEDGER CONTRADICTION — $fwf job '$fjob' is listed in $NOTREQ_FILE (${NOTREQ_REF[$fwf|$fjob]}) but its reported name IS declared in $MIRROR_FILE."
+                echo "     A job cannot be both required and deliberately-unrequired. The entry is STALE: it was presumably kept when the job was promoted. DELETE it — left in place it silently pre-absolves whatever job next takes the id '$fjob'." >&2
+            fi
+            continue
+        fi
+
+        missing=""
+        while IFS= read -r fname; do
+            [ -n "$fname" ] || continue
+            [ -n "${CTX_DECLARED[$fname]:-}" ] || missing="${missing}${missing:+, }'$fname'"
+        done <<< "${JOB_CTXS[$fjk]:-}"
+
+        if [ -z "${JOB_CTXS[$fjk]:-}" ]; then
+            fail "RULE (f) — $fwf job '$fjob' reports a job name this parser cannot resolve, so it can be neither verified nor declared."
+            echo "     Refusing to pass an unaccountable job in a gating workflow (fail-closed). FIX: give the job a name this gate can expand (a static name, or exactly one \${{ matrix.<key> }}), then declare it." >&2
+            continue
+        fi
+
+        [ -n "$missing" ] || continue
+
+        fail "RULE (f) — $fwf job '$fjob' reports context(s) $missing, which are declared NEITHER in $MIRROR_FILE nor in $NOTREQ_FILE."
+        echo "     A job in a gating workflow that appears in neither file is UNENFORCED BY DEFAULT — it runs on every PR, looks like a gate, and blocks nothing. That is #2636: four c8-precheck integrity gates were in exactly this state, including THIS gate, the only mechanical proof that the other required contexts are sound, so a PR that broke it could merge." >&2
+        echo "     FIX (almost always the right one): add the reported name(s) verbatim to $MIRROR_FILE, then make the branch-protection call — mirror FIRST, protection after (the ORDER doctrine in that file's header: prove, then enforce)." >&2
+        echo "     OR, if leaving it unrequired is a deliberate, dated, tracked decision: add '$fwf $fjob $(date -u +%Y-%m-%d) #<issue>' to $NOTREQ_FILE. That is a decision record, not an absolution." >&2
+        if [ "${JOB_MATRIX[$fjk]}" = "1" ]; then
+            echo "     NOTE: this is a MATRIX job. PARTIAL coverage fails deliberately — an expansion that no one declared can fail and merge while its siblings look green." >&2
+        fi
+    done
+
+    local nkey
+    for nkey in "${!NOTREQ[@]}"; do
+        [ -z "${NOTREQ_USED[$nkey]:-}" ] || continue
+        fail "NOT-REQUIRED LEDGER STALE — '${nkey%%|*}' job '${nkey#*|}' (${NOTREQ_REF[$nkey]:-<no ref>}) is listed in $NOTREQ_FILE but no such job exists in a covered workflow."
+        echo "     Unlike the rule (d) pending-fix ledger — where a stale line can only suppress a failure that no longer happens — a stale line HERE pre-absolves whatever job next takes that id, in the workflow where integrity gates live. It is therefore fatal, not advisory. FIX: delete the line." >&2
+    done
+
     [ "$FAILURES" -eq 0 ]
 }
 
 # --- self-test --------------------------------------------------------------
 selftest() {
-    echo "required-contexts gate: self-test (clean control -> PASS; #2494 (b1) matrix+if wedge -> FAIL; (a) unmatched mirror context -> FAIL; #2473 (e) unquoted ' #' job name -> FAIL (and the parse is asserted truncated); (c) paths-filtered carrier -> FAIL; (b3) unguarded step -> FAIL; (b4) decider with job-level if -> FAIL even when allowlisted; #2508 (d) verbatim cancelled-duplicate carrier -> FAIL, its four near-miss shapes -> PASS)"
+    echo "required-contexts gate: self-test (clean control -> PASS; #2494 (b1) matrix+if wedge -> FAIL; (a) unmatched mirror context -> FAIL; #2473 (e) unquoted ' #' job name -> FAIL (and the parse is asserted truncated); (c) paths-filtered carrier -> FAIL; (b3) unguarded step -> FAIL; (b4) decider with job-level if -> FAIL even when allowlisted; #2508 (d) verbatim cancelled-duplicate carrier -> FAIL, its four near-miss shapes -> PASS; #2636 (f) a gating-workflow job declared in NEITHER the mirror nor the not-required ledger -> FAIL)"
 
     # Fixtures are staged under the repo's gitignored `.local-runs/` scratch
     # root — never system /tmp (project hard rule), and never `mktemp -d`,
@@ -971,10 +1151,18 @@ selftest() {
     trap "rm -rf '$scratch'" RETURN
 
     local wf="$scratch/wf" al="$scratch/allow.txt" mi="$scratch/mirror.txt"
-    local dal="$scratch/duptrig-allow.txt"
+    local dal="$scratch/duptrig-allow.txt" nrq="$scratch/not-required.txt"
     mkdir -p "$wf"
     : > "$al"
     : > "$dal"
+    : > "$nrq"
+
+    # Rule (f)'s scope is pointed at the fixture's ONE workflow. The real
+    # default names three workflows that do not exist in this scratch tree, and
+    # the gate correctly fails closed on a declared-but-absent covered
+    # workflow — so without this override every leg would go red for a reason
+    # that has nothing to do with the shape under test.
+    local covered="ci.yml"
 
     # A minimal but structurally faithful fixture: one matrix job following
     # the proven per-step-guard pattern, plus a plain required job.
@@ -1061,6 +1249,8 @@ Paren gate (#1174 PR10)
 TXT
         : > "$al"
         : > "$dal"
+        : > "$nrq"
+        covered="ci.yml"
         rm -f "$wf/dup.yml"
     }
 
@@ -1068,7 +1258,8 @@ TXT
         (
             set +e
             RQC_WORKFLOW_DIR="$wf" RQC_MIRROR_FILE="$mi" RQC_ALLOW_FILE="$al" \
-                RQC_DUPTRIG_ALLOW_FILE="$dal" \
+                RQC_DUPTRIG_ALLOW_FILE="$dal" RQC_NOTREQ_FILE="$nrq" \
+                RQC_COVERED_WORKFLOWS="$covered" \
                 RQC_PROTECTED_BRANCH="release/v1.0.0" \
                 bash "${BASH_SOURCE[0]}" >/dev/null 2>&1
             echo $?
@@ -1099,6 +1290,8 @@ TXT
     if [ "$rc" != "0" ]; then
         echo "  [control] clean fixture REJECTED (exit $rc) — the gate is over-strict; a false positive is as bad as a miss" >&2
         RQC_WORKFLOW_DIR="$wf" RQC_MIRROR_FILE="$mi" RQC_ALLOW_FILE="$al" \
+            RQC_DUPTRIG_ALLOW_FILE="$dal" RQC_NOTREQ_FILE="$nrq" \
+            RQC_COVERED_WORKFLOWS="$covered" \
             RQC_PROTECTED_BRANCH="release/v1.0.0" bash "${BASH_SOURCE[0]}" >&2 || true
         return 2
     fi
@@ -1127,7 +1320,8 @@ TXT
     grep -qx 'Quoted gate (§X / RQ-10' "$mi" || {
         echo "  [e] mirror rewind FAILED (self-test is broken, not the gate)" >&2; return 2; }
     parsed_name="$(RQC_WORKFLOW_DIR="$wf" RQC_MIRROR_FILE="$mi" RQC_ALLOW_FILE="$al" \
-        RQC_DUPTRIG_ALLOW_FILE="$dal" RQC_PROTECTED_BRANCH="release/v1.0.0" \
+        RQC_DUPTRIG_ALLOW_FILE="$dal" RQC_NOTREQ_FILE="$nrq" \
+        RQC_COVERED_WORKFLOWS="$covered" RQC_PROTECTED_BRANCH="release/v1.0.0" \
         bash "${BASH_SOURCE[0]}" --dump 2>/dev/null \
         | awk -F'\t' '$1 == "JOB" && $3 == "quoted" { print $4 }')"
     if [ "$parsed_name" != "Quoted gate (§X / RQ-10" ]; then
@@ -1136,7 +1330,8 @@ TXT
     fi
     # Assertions 2 + 3: the gate rejects, and it rejects BY RULE (e).
     e_out="$(RQC_WORKFLOW_DIR="$wf" RQC_MIRROR_FILE="$mi" RQC_ALLOW_FILE="$al" \
-        RQC_DUPTRIG_ALLOW_FILE="$dal" RQC_PROTECTED_BRANCH="release/v1.0.0" \
+        RQC_DUPTRIG_ALLOW_FILE="$dal" RQC_NOTREQ_FILE="$nrq" \
+        RQC_COVERED_WORKFLOWS="$covered" RQC_PROTECTED_BRANCH="release/v1.0.0" \
         bash "${BASH_SOURCE[0]}" 2>&1 || true)"
     rc="$(run_fixture)"
     if [ "$rc" = "0" ]; then
@@ -1357,7 +1552,191 @@ YAML
     fi
     echo "  [d] pending-fix ledger (correct entry PASSES, wrong-pattern entry FAILS, issue-less entry FAILS): per-pattern and self-documenting"
 
-    echo "required-contexts gate self-test: PASS (load-bearing — catches the #2494 (b1) wedge, the (a) unmatched-context class, the (c) path-filtered carrier, the (b3) unguarded step, the (b4) unallowlistable decider 'if:', both directions of the (b2) ratchet, and the (d) #2508 cancelled-duplicate carrier in its verbatim historical form; spares a clean tree and all four near-miss shapes)"
+    # ---- (f) a job in a gating workflow declared in NEITHER file ------------
+    #
+    # Rules (a)-(e) all reason mirror -> job, so NONE of them can see a job
+    # that is simply absent from the mirror. This leg plants exactly that:
+    # a new, perfectly well-formed gate job — no matrix, no job-level `if:`,
+    # no `needs:`, an unfiltered trigger — that every other rule is happy to
+    # ignore, which is precisely why four real integrity gates sat unrequired.
+    local f_out
+    run_out() {
+        RQC_WORKFLOW_DIR="$wf" RQC_MIRROR_FILE="$mi" RQC_ALLOW_FILE="$al" \
+            RQC_DUPTRIG_ALLOW_FILE="$dal" RQC_NOTREQ_FILE="$nrq" \
+            RQC_COVERED_WORKFLOWS="$covered" \
+            RQC_PROTECTED_BRANCH="release/v1.0.0" \
+            bash "${BASH_SOURCE[0]}" 2>&1 || true
+    }
+    plant_undeclared_job() {
+        printf '  newgate:\n    name: Brand New Integrity Gate (#9999)\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - name: run\n        run: echo ok\n' >> "$wf/ci.yml"
+        grep -q "Brand New Integrity Gate" "$wf/ci.yml" || {
+            echo "  [f] fixture injection FAILED (self-test is broken, not the gate)" >&2; return 2; }
+    }
+
+    write_clean
+    plant_undeclared_job || return 2
+    f_out="$(run_out)"
+    rc="$(run_fixture)"
+    if [ "$rc" = "0" ]; then
+        echo "  [f] a job declared in NEITHER the mirror nor the not-required ledger: NOT CAUGHT (gate passed) — FAIL" >&2
+        return 2
+    fi
+    case "$f_out" in
+        *"RULE (f) — ci.yml job 'newgate'"*) ;;
+        *)
+            echo "  [f] the gate rejected the tree but NOT via rule (f) — the leg would pass for the wrong reason. Output was:" >&2
+            printf '%s\n' "$f_out" >&2
+            return 2
+            ;;
+    esac
+    case "$f_out" in
+        *"RULE (a)"*|*"RULE (b"*|*"RULE (c)"*|*"RULE (d)"*|*"RULE (e)"*)
+            echo "  [f] another rule ALSO fired — this leg is not isolating rule (f). Output was:" >&2
+            printf '%s\n' "$f_out" >&2
+            return 2
+            ;;
+    esac
+
+    # R-203, in-harness. The isolation assertion above already shows no OTHER
+    # rule fired, but that is an argument about this gate's output; this is the
+    # positive control. The byte-identical job, planted in a workflow OUTSIDE
+    # rule (f)'s scope, must go GREEN — proving the shape is invisible to every
+    # rule that existed before #2636, which is exactly why four real integrity
+    # gates could sit unrequired without any gate noticing.
+    #
+    # (Note the deliberately-unusable alternative: emptying COVERED_WORKFLOWS
+    # does NOT emulate the pre-fix state, because an empty scope leaves every
+    # mirror context carried by an uncovered workflow and the SCOPE
+    # cross-check correctly fails. A gate whose scope can be silently zeroed
+    # would be a control that reports success while doing nothing.)
+    write_clean
+    write_dup '[main]' 'false' 'x-${{ github.ref }}'
+    printf '  newgate:\n    name: Brand New Integrity Gate (#9999)\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - name: run\n        run: echo ok\n' >> "$wf/dup.yml"
+    rc="$(run_fixture)"
+    if [ "$rc" != "0" ]; then
+        echo "  [f] R-203: the SAME undeclared job in an UNCOVERED workflow was rejected (exit $rc) — some other rule sees this shape, so the (f) leg is not proving what it claims" >&2
+        run_out >&2
+        return 2
+    fi
+    echo "  [f] a job in a gating workflow declared in NEITHER file: CAUGHT BY RULE (f) ALONE (R-203: the byte-identical job in an UNCOVERED workflow passes, so no pre-#2636 rule could see it)"
+
+    # ---- (f) the two legitimate dispositions must both PASS ---------------
+    write_clean
+    plant_undeclared_job || return 2
+    printf 'Brand New Integrity Gate (#9999)\n' >> "$mi"
+    rc="$(run_fixture)"
+    if [ "$rc" != "0" ]; then
+        echo "  [f] declaring the job in the MIRROR still REJECTED (exit $rc) — the required disposition does not work" >&2
+        return 2
+    fi
+    write_clean
+    plant_undeclared_job || return 2
+    printf 'ci.yml newgate 2026-08-01 #9999 deliberate, tracked\n' > "$nrq"
+    rc="$(run_fixture)"
+    if [ "$rc" != "0" ]; then
+        echo "  [f] declaring the job in the NOT-REQUIRED ledger still REJECTED (exit $rc) — the ledger does not work" >&2
+        return 2
+    fi
+    echo "  [f] both dispositions PASS: declared in the mirror, or dated+tracked in the not-required ledger"
+
+    # ---- (f) the ledger cannot rot ----------------------------------------
+    write_clean
+    plant_undeclared_job || return 2
+    printf 'ci.yml newgate\n' > "$nrq"
+    rc="$(run_fixture)"
+    if [ "$rc" = "0" ]; then
+        echo "  [f] a ledger entry with NO date and NO tracking issue was accepted — an unexplained suppression — FAIL" >&2
+        return 2
+    fi
+    printf 'ci.yml newgate 2026-08-01 9999\n' > "$nrq"
+    rc="$(run_fixture)"
+    if [ "$rc" = "0" ]; then
+        echo "  [f] a ledger entry whose issue reference is not '#<n>' was accepted — FAIL" >&2
+        return 2
+    fi
+    printf 'ci.yml newgate 08/01/2026 #9999\n' > "$nrq"
+    rc="$(run_fixture)"
+    if [ "$rc" = "0" ]; then
+        echo "  [f] a ledger entry with a non-ISO date was accepted — FAIL" >&2
+        return 2
+    fi
+    # STALE: an entry naming a job that does not exist. Fatal here (unlike the
+    # rule (d) ledger) because it pre-absolves whatever job next takes the id.
+    write_clean
+    printf 'ci.yml ghost-job 2026-08-01 #9999\n' > "$nrq"
+    rc="$(run_fixture)"
+    if [ "$rc" = "0" ]; then
+        echo "  [f] a STALE ledger entry (no such job) was accepted — it would pre-absolve a future job reusing that id — FAIL" >&2
+        return 2
+    fi
+    # CONTRADICTION: declared required AND deliberately-unrequired at once.
+    write_clean
+    printf 'ci.yml parens 2026-08-01 #9999\n' > "$nrq"
+    rc="$(run_fixture)"
+    if [ "$rc" = "0" ]; then
+        echo "  [f] a job declared in BOTH the mirror and the not-required ledger was accepted — FAIL" >&2
+        return 2
+    fi
+    echo "  [f] ledger hygiene: undated / issue-less / non-ISO / stale / mirror-contradicting entries all FAIL"
+
+    # ---- (f) partial matrix coverage --------------------------------------
+    # 2 of 3 expansions declared is a silent gap: the undeclared leg can fail
+    # and merge while its siblings look green. Dropping the entry from the
+    # mirror does NOT trip rule (a), which only walks mirror -> job, so this
+    # shape was invisible before rule (f).
+    write_clean
+    perl -0pi -e 's/^Check \(windows-latest\)\n//m' "$mi"
+    grep -qx 'Check (windows-latest)' "$mi" && {
+        echo "  [f] mirror edit FAILED (self-test is broken, not the gate)" >&2; return 2; }
+    f_out="$(run_out)"
+    rc="$(run_fixture)"
+    if [ "$rc" = "0" ]; then
+        echo "  [f] PARTIAL matrix coverage (one expansion declared nowhere) was accepted — FAIL" >&2
+        return 2
+    fi
+    case "$f_out" in
+        *"'Check (windows-latest)'"*) ;;
+        *)
+            echo "  [f] partial matrix coverage was rejected but the message did not name the missing expansion:" >&2
+            printf '%s\n' "$f_out" >&2
+            return 2
+            ;;
+    esac
+    echo "  [f] PARTIAL matrix coverage: CAUGHT, and the failure names the undeclared expansion"
+
+    # ---- (f) the scope declaration is cross-checked in both directions -----
+    # A required context carried by an UNCOVERED workflow means rule (f) has a
+    # blind spot in a pipeline already trusted with required contexts...
+    write_clean
+    write_dup '[main]' 'false' 'x-${{ github.ref }}'
+    printf 'dup carrier gate\n' >> "$mi"
+    f_out="$(run_out)"
+    rc="$(run_fixture)"
+    if [ "$rc" = "0" ]; then
+        echo "  [f] a required context carried by a workflow OUTSIDE the covered set was accepted — rule (f) would have a blind spot there — FAIL" >&2
+        return 2
+    fi
+    case "$f_out" in
+        *"RULE (f) SCOPE"*) ;;
+        *)
+            echo "  [f] the uncovered-carrier tree was rejected, but not via the SCOPE check:" >&2
+            printf '%s\n' "$f_out" >&2
+            return 2
+            ;;
+    esac
+    # ...and a covered workflow that does not exist means the scope silently
+    # shrank to whatever still matches.
+    write_clean
+    covered="ci.yml renamed-away.yml"
+    rc="$(run_fixture)"
+    covered="ci.yml"
+    if [ "$rc" = "0" ]; then
+        echo "  [f] a declared covered workflow with NO parsed jobs was accepted — a stale scope name silently narrows the rule — FAIL" >&2
+        return 2
+    fi
+    echo "  [f] scope cross-check (uncovered carrier FAILS, vanished covered workflow FAILS): the scope cannot silently narrow"
+
+    echo "required-contexts gate self-test: PASS (load-bearing — catches the #2494 (b1) wedge, the (a) unmatched-context class, the (c) path-filtered carrier, the (b3) unguarded step, the (b4) unallowlistable decider 'if:', both directions of the (b2) ratchet, the (d) #2508 cancelled-duplicate carrier in its verbatim historical form, and the (f) #2636 unenforced-by-default job with its ledger-rot and scope cross-checks; spares a clean tree, all four (d) near-miss shapes, and both legitimate (f) dispositions)"
 }
 
 if [ "${1:-}" = "--self-test" ]; then
@@ -1379,7 +1758,7 @@ if [ "${1:-}" != "" ]; then
 fi
 
 if run_gate; then
-    echo "check-required-contexts: OK (${PROTECTED_BRANCH}: every mirrored required context maps to a reporting job; no matrix+if wedge; no decider with a job-level if; no path-filtered carrier; every needs-${CLASSIFY_JOB} step guarded; no dual-trigger cancelled-duplicate carrier)"
+    echo "check-required-contexts: OK (${PROTECTED_BRANCH}: every mirrored required context maps to a reporting job; no matrix+if wedge; no decider with a job-level if; no path-filtered carrier; every needs-${CLASSIFY_JOB} step guarded; no dual-trigger cancelled-duplicate carrier; every job in ${COVERED_WORKFLOWS} declared required or dated-and-tracked as not-required)"
     exit 0
 fi
 
@@ -1388,5 +1767,6 @@ echo "FAIL (#2494/#2496/#2508): the required-status-check set is not sound — s
 echo "Mirror:    $MIRROR_FILE  (HAND-AUTHORED from intent — never regenerate from live API state)" >&2
 echo "Ratchet:   $ALLOW_FILE   (burn-down; entries may only be removed)" >&2
 echo "Pending:   $DUPTRIG_ALLOW_FILE   (rule (d) pending-fix ledger; each entry names its tracking issue)" >&2
+echo "Not-req:   $NOTREQ_FILE   (rule (f) ledger; each entry is dated and names its tracking issue)" >&2
 echo "Self-test: scripts/check-required-contexts.sh --self-test" >&2
 exit 1
