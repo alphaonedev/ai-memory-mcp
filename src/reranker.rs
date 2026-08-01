@@ -449,6 +449,73 @@ fn rerank_max_seq() -> usize {
     *RERANK_MAX_SEQ.get().unwrap_or(&RERANK_MAX_SEQ_DEFAULT)
 }
 
+/// v1.0.0 #2576 — should this process construct the neural cross-encoder?
+///
+/// The rerank stage only runs when recall reached `mode == "hybrid"`, and
+/// recall only reaches hybrid when a query embedding was produced. So with
+/// no embedder the cross-encoder is UNREACHABLE — every recall returns
+/// `mode:keyword` — yet pre-#2576 both boot sites decided on
+/// `tier_config.cross_encoder` ALONE, so a deployment whose embedder failed
+/// (#1593) or whose API embedder was refused by
+/// `AI_MEMORY_INFERENCE_EGRESS` (env #131) still paid the ms-marco model
+/// load and its resident memory for a stage that could never fire. On MCP
+/// stdio it also paid that load before it could answer `initialize`.
+///
+/// Gate on the RESOLVED embedder, never on the tier: the tier still reads
+/// "autonomous" when the embedder failed, which is precisely the bug.
+///
+/// Extracted as a pure predicate so the decision is assertable in CI
+/// without model weights — a CI host always degrades `new_neural()` to the
+/// lexical variant, so a test that asserted the resulting VARIANT would
+/// pass vacuously.
+#[must_use]
+pub fn should_build_cross_encoder(
+    tier_enables_cross_encoder: bool,
+    embedder_present: bool,
+) -> bool {
+    tier_enables_cross_encoder && embedder_present
+}
+
+/// v1.0.0 #2576 — build the padding + truncation configured tokenizer the
+/// batched cross-encoder forward consumes.
+///
+/// Extracted as a pure function of `(source tokenizer, max_seq)` so the
+/// configuration is assertable in CI without model weights: the neural
+/// forward itself is unreachable on a CI host (no HF cache, no egress), but
+/// the tokenizer configuration that governs its input shape is not.
+///
+/// **Padding is [`tokenizers::PaddingStrategy::BatchLongest`], NOT a fixed
+/// pad to `max_seq`.** This distinction is load-bearing and was mis-stated
+/// in the #1604 rationale: the batch is padded to the longest sequence
+/// *present in that batch*, so a corpus of short memories never pays for
+/// the cap. `max_seq` is a TRUNCATION bound — it only binds when a pair
+/// actually tokenizes longer than the cap, and when it binds it DISCARDS
+/// document tokens the cross-encoder would otherwise have scored.
+///
+/// # Errors
+///
+/// Propagates a tokenizer error from `with_truncation`.
+fn build_batch_tokenizer(source: &Tokenizer, max_seq: usize) -> Result<Tokenizer> {
+    let mut configured = source.clone();
+    let padding = tokenizers::PaddingParams {
+        strategy: tokenizers::PaddingStrategy::BatchLongest,
+        direction: tokenizers::PaddingDirection::Right,
+        pad_id: 0,
+        pad_type_id: 0,
+        pad_token: "[PAD]".to_string(),
+        ..Default::default()
+    };
+    configured.with_padding(Some(padding));
+    let truncation = tokenizers::TruncationParams {
+        max_length: max_seq,
+        ..Default::default()
+    };
+    configured
+        .with_truncation(Some(truncation))
+        .map_err(|e| anyhow::anyhow!("failed to set rerank truncation: {e}"))?;
+    Ok(configured)
+}
+
 /// v0.7.0 L2-8 — default multiplicative boost applied to `Reflection`-kind
 /// memories AFTER cross-encoder reranking. Reflections summarise multiple
 /// observations, so abstraction-shaped queries ("what patterns...",
@@ -583,6 +650,26 @@ pub enum CrossEncoder {
     Neural {
         model: Arc<BertModel>,
         tokenizer: Arc<Tokenizer>,
+        /// v1.0.0 #2576 — the padding+truncation-configured tokenizer used
+        /// by the batched forward, built at most ONCE per encoder.
+        ///
+        /// Pre-#2576 [`Self::neural_score_pairs`] did
+        /// `tokenizer.clone()` on EVERY rerank call and re-applied
+        /// `with_padding` + `with_truncation` each time — a deep clone of
+        /// the 30k-entry WordPiece vocabulary per recall. The configured
+        /// tokenizer is invariant after boot because [`rerank_max_seq`]
+        /// reads a process-wide `OnceLock`, so the clone is pure waste.
+        ///
+        /// This is a `OnceLock` populated at FIRST USE, deliberately NOT
+        /// at construction: `rerank_max_seq()` is seeded by
+        /// `set_rerank_max_seq` during boot, and building the tokenizer
+        /// eagerly in the constructor would bake whatever value was
+        /// resolved at construction time. Baking it would silently turn
+        /// an operator's `AI_MEMORY_RERANK_MAX_SEQ` into a no-op if a
+        /// future refactor ever moved encoder construction ahead of the
+        /// seed — the "defaults lie" class of #2233. First-use
+        /// initialisation preserves the pre-#2576 read timing exactly.
+        batch_tokenizer: Arc<std::sync::OnceLock<Tokenizer>>,
         classifier_weight: Tensor,
         classifier_bias: Tensor,
         device: Device,
@@ -630,6 +717,58 @@ impl CrossEncoder {
                 Self::Lexical { degraded: true }
             }
         }
+    }
+
+    /// v1.0.0 #2576 — pay the cross-encoder's first-forward cost HERE
+    /// instead of on the first user recall.
+    ///
+    /// The encoder is constructed at boot ("neural cross-encoder ready"),
+    /// but construction only mmaps the safetensors; the FIRST forward pass
+    /// is what faults the weight pages in and selects the gemm kernels for
+    /// the batch shape. Measured on the #2576 corpus that made the first
+    /// autonomous recall ~6.1 s against a ~1.3 s warm p50 — a 4-5x cold
+    /// cliff paid by whichever caller happened to arrive first.
+    ///
+    /// Runs one tiny synthetic `[1, L]` forward over throwaway text. It
+    /// also populates the `batch_tokenizer` `OnceLock`, so the first real
+    /// recall pays neither the tokenizer build nor the cold forward.
+    ///
+    /// **Never call this on a request thread, and never let it gate a
+    /// readiness signal** — on MCP stdio a multi-second inline warm-up
+    /// before `initialize` answers would be strictly worse than one slow
+    /// recall (a host that times out leaves the operator with no substrate
+    /// at all). Both production call sites dispatch it onto a detached
+    /// background thread.
+    ///
+    /// A no-op on the lexical variant. Failures are logged at debug and
+    /// swallowed: warm-up is an optimisation, and a warm-up that could
+    /// break recall would be a worse defect than the latency it removes.
+    pub fn warm_up(&self) {
+        let Self::Neural { .. } = self else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        // One representative pair. Content length is irrelevant to the
+        // kernels selected (BatchLongest pads to the batch, not to
+        // max_seq), so a short synthetic pair is sufficient to fault in
+        // the weights and warm the gemm path.
+        let scores = self.pair_scores(
+            "warm up query",
+            &[(
+                Memory {
+                    title: "warm up".to_string(),
+                    content: "cross encoder warm up document".to_string(),
+                    ..Memory::default()
+                },
+                0.0,
+            )],
+        );
+        tracing::debug!(
+            target: "reranker.warmup",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            scored = scores.len(),
+            "cross-encoder warm-up forward complete"
+        );
     }
 
     /// #2086 (unlock condition (i) named by #1867/#1969) — resolve the
@@ -803,6 +942,7 @@ impl CrossEncoder {
         Ok(Self::Neural {
             model: Arc::new(model),
             tokenizer: Arc::new(tokenizer),
+            batch_tokenizer: Arc::new(std::sync::OnceLock::new()),
             classifier_weight,
             classifier_bias,
             device,
@@ -821,6 +961,7 @@ impl CrossEncoder {
                 classifier_weight,
                 classifier_bias,
                 device,
+                ..
             } => {
                 // v0.7.0 #1084 — no mutex acquisition: `Arc<BertModel>`
                 // shared across threads; `BertModel::forward(&self, ...)`
@@ -1014,6 +1155,7 @@ impl CrossEncoder {
             Self::Neural {
                 model,
                 tokenizer,
+                batch_tokenizer,
                 classifier_weight,
                 classifier_bias,
                 device,
@@ -1030,6 +1172,7 @@ impl CrossEncoder {
                 match Self::neural_score_pairs(
                     model,
                     tokenizer,
+                    batch_tokenizer,
                     classifier_weight,
                     classifier_bias,
                     device,
@@ -1096,6 +1239,7 @@ impl CrossEncoder {
             Self::Neural {
                 model,
                 tokenizer,
+                batch_tokenizer,
                 classifier_weight,
                 classifier_bias,
                 device,
@@ -1123,6 +1267,7 @@ impl CrossEncoder {
                 match Self::neural_rerank_batch(
                     model,
                     tokenizer,
+                    batch_tokenizer,
                     classifier_weight,
                     classifier_bias,
                     device,
@@ -1188,6 +1333,7 @@ impl CrossEncoder {
     fn neural_rerank_batch(
         model: &BertModel,
         tokenizer: &Tokenizer,
+        batch_tokenizer: &std::sync::OnceLock<Tokenizer>,
         classifier_weight: &Tensor,
         classifier_bias: &Tensor,
         device: &Device,
@@ -1204,6 +1350,7 @@ impl CrossEncoder {
         Self::neural_score_pairs(
             model,
             tokenizer,
+            batch_tokenizer,
             classifier_weight,
             classifier_bias,
             device,
@@ -1219,6 +1366,7 @@ impl CrossEncoder {
     fn neural_score_pairs(
         model: &BertModel,
         tokenizer: &Tokenizer,
+        batch_tokenizer: &std::sync::OnceLock<Tokenizer>,
         classifier_weight: &Tensor,
         classifier_bias: &Tensor,
         device: &Device,
@@ -1228,32 +1376,25 @@ impl CrossEncoder {
             return Ok(Vec::new());
         }
 
-        // Variable-length pairs require padding for a single forward pass.
-        // Clone the tokenizer so we can mutate padding settings without
-        // racing other threads on the shared `Arc<Tokenizer>`.
-        let mut batch_tokenizer = tokenizer.clone();
-        let padding = tokenizers::PaddingParams {
-            strategy: tokenizers::PaddingStrategy::BatchLongest,
-            direction: tokenizers::PaddingDirection::Right,
-            pad_id: 0,
-            pad_type_id: 0,
-            pad_token: "[PAD]".to_string(),
-            ..Default::default()
+        // v1.0.0 #2576 — build the padding+truncation-configured tokenizer
+        // at most ONCE per encoder instead of deep-cloning the 30k-entry
+        // WordPiece vocabulary on every rerank call. `rerank_max_seq()` is
+        // read HERE, on first use, exactly as it was pre-#2576, so a boot
+        // seed that lands after encoder construction is still honoured.
+        let batch_tokenizer = match batch_tokenizer.get() {
+            Some(t) => t,
+            None => {
+                let built = build_batch_tokenizer(tokenizer, rerank_max_seq())?;
+                // Racing initialisers produce byte-identical tokenizers
+                // (same source tokenizer, same process-wide max_seq), so
+                // first-writer-wins is safe and the loser's value is
+                // simply dropped.
+                let _ = batch_tokenizer.set(built);
+                batch_tokenizer
+                    .get()
+                    .expect("batch tokenizer initialised above")
+            }
         };
-        batch_tokenizer.with_padding(Some(padding));
-        // #1604 — rerank inputs truncate at the resolved rerank cap
-        // (default RERANK_MAX_SEQ_DEFAULT), tighter than the
-        // architecture-ceiling CROSS_ENCODER_MAX_SEQ the shared
-        // tokenizer carries: long-content rows otherwise pad the whole
-        // batch to 512 tokens and the candle CPU forward dominates
-        // recall latency (~3.2 s/recall measured on the #1588 re-run).
-        let truncation = tokenizers::TruncationParams {
-            max_length: rerank_max_seq(),
-            ..Default::default()
-        };
-        batch_tokenizer
-            .with_truncation(Some(truncation))
-            .map_err(|e| anyhow::anyhow!("failed to set rerank truncation: {e}"))?;
 
         let encodings = batch_tokenizer
             .encode_batch(
@@ -1973,6 +2114,15 @@ impl BatchedReranker {
     /// want to bypass the coalescer (tests, benchmarks).
     pub fn encoder(&self) -> &CrossEncoder {
         &self.encoder
+    }
+
+    /// v1.0.0 #2576 — an owned handle to the wrapped encoder, so a boot
+    /// site can hand it to a detached warm-up thread
+    /// ([`CrossEncoder::warm_up`]) without keeping the whole
+    /// [`BatchedReranker`] alive on that thread.
+    #[must_use]
+    pub fn encoder_arc(&self) -> Arc<CrossEncoder> {
+        Arc::clone(&self.encoder)
     }
 
     /// Convenience shortcut for `self.encoder().is_neural()`. Most
