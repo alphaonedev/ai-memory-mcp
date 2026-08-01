@@ -136,8 +136,25 @@ fn ident(tok: &str) -> String {
 }
 
 /// Index into `tokens` of the identifier following position `i`, skipping an
-/// optional `IF [NOT] EXISTS` guard.
+/// optional `CONCURRENTLY` modifier and an optional `IF [NOT] EXISTS` guard.
+///
+/// v1.0.0 #2578 — `CONCURRENTLY` handling is load-bearing, not cosmetic. The
+/// v88 arm is the ladder's first `CREATE INDEX CONCURRENTLY`, and without this
+/// skip the scanner captured the literal token `CONCURRENTLY` as the INDEX
+/// NAME. `rewind_to_version` then issued `DROP INDEX IF EXISTS CONCURRENTLY`,
+/// which postgres rejects (`syntax error at or near "CONCURRENTLY"`) — so the
+/// whole populated-legacy-replay suite died before it could assert anything.
+/// A silent variant of the same bug would be worse: had the DROP succeeded on
+/// a wrong name, the synthesised "legacy" database would have kept a v88 index
+/// it should not have, and the greenfield-vs-replay `indexdef` comparison
+/// would have passed VACUOUSLY.
 fn ident_pos(tokens: &[&str], mut i: usize) -> Option<usize> {
+    if tokens
+        .get(i)
+        .is_some_and(|t| t.eq_ignore_ascii_case("CONCURRENTLY"))
+    {
+        i += 1;
+    }
     if tokens.get(i).is_some_and(|t| t.eq_ignore_ascii_case("IF")) {
         i += 1;
         if tokens.get(i).is_some_and(|t| t.eq_ignore_ascii_case("NOT")) {

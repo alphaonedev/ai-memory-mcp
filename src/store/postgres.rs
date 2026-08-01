@@ -148,10 +148,195 @@ const SQL_HEAL_DANGLING_NAMESPACE_META: &str = "UPDATE namespace_meta \
      WHERE standard_id IS NOT NULL \
        AND NOT EXISTS (SELECT 1 FROM memories WHERE memories.id = namespace_meta.standard_id)";
 const SQL_SELECT_MEMORY_ID_BY_ID: &str = "SELECT id FROM memories WHERE id = $1";
+
+/// v1.0.0 #2578 (pm-v3.1 literal de-dup) — clear the per-session
+/// `statement_timeout` on a connection that must outlive
+/// [`DEFAULT_STATEMENT_TIMEOUT_SECS`]. Used by the bootstrap advisory-lock
+/// connection (a ladder replay can legitimately exceed 30 s) and by the
+/// migrate path's lock acquisition. Split into two single-statement consts
+/// because sqlx's prepared protocol rejects multi-statement SQL.
+const SQL_CLEAR_STATEMENT_TIMEOUT: &str = "SET statement_timeout = 0";
+
+/// v1.0.0 #2578 (pm-v3.1 literal de-dup) — clear the per-session
+/// `lock_timeout`. Load-bearing on THREE connections: the two bootstrap /
+/// migrate advisory-lock sites, and the v88 index-build connection, where the
+/// pool default of [`DEFAULT_LOCK_TIMEOUT_SECS`] would abort a
+/// `CREATE INDEX CONCURRENTLY` after 5 s against any table with an ordinary
+/// in-flight writer.
+const SQL_CLEAR_LOCK_TIMEOUT: &str = "SET lock_timeout = 0";
+
+/// v1.0.0 #2578 — bounded `statement_timeout` (ms) for a v88 composite-index
+/// build. NOT cleared to `0`: an unbounded wait would hang `connect()` past a
+/// supervisor's start deadline (systemd's `TimeoutStartSec` defaults to 90 s),
+/// turning a clean wait into a crash-loop across the fleet. A trip is a WARN +
+/// fail-open, retried on the next connect. Calibration on the certified tier:
+/// 3,000,000 rows / 1,520 MB built in 5.24 s plain, 5.57 s CONCURRENTLY.
+const INDEX_BUILD_TIMEOUT_MS: u64 = 900_000;
+
+/// v1.0.0 #2578 — one v88 composite ordering index. `create_sql` and
+/// `drop_sql` are single statements by construction: `CREATE INDEX
+/// CONCURRENTLY` is rejected inside a transaction block, and sqlx's simple
+/// -query path wraps a MULTI-statement string in an implicit one.
+struct ListOrderIndex {
+    name: &'static str,
+    create_sql: &'static str,
+    drop_sql: &'static str,
+}
+
+/// v1.0.0 #2578 — the three composite ordering indexes SQLite has carried
+/// since v56 and postgres never received. Canonical doc twin:
+/// `migrations/postgres/0045_v88_list_composite_indexes.sql`.
+/// The UNSCOPED sibling `idx_memories_list_order (priority DESC, updated_at
+/// DESC)` — which SQLite's v56 DOES carry — is DELIBERATELY NOT here. It was
+/// in the first draft and an adversarial re-measurement killed it: in a
+/// namespace whose rows are expired-but-not-yet-GC'd, its presence makes the
+/// planner ABANDON the namespace-scoped composite and walk the unscoped index
+/// ACROSS EVERY NAMESPACE, turning an O(namespace) scan into an O(table) one.
+/// Measured on an isolated copy of the live corpus (`atlas-corpus`, 7,000 of
+/// 7,855 rows expired), namespace-scoped `LIMIT 10`, buffers — the
+/// load-independent signal:
+///
+///   before (no composites)      1,989 buffers, 7,000 rows filtered in-namespace
+///   ns-scoped composite ONLY    1,854 buffers, 6,882 rows filtered in-namespace
+///   BOTH composites             3,041 buffers, 9,621 rows filtered ACROSS ALL
+///                                              namespaces (Index Scan using
+///                                              idx_memories_list_order)
+///
+/// Its only benefit is the UNSCOPED `list LIMIT 10` (0.641 -> 0.059 ms, a
+/// 0.58 ms absolute win on the rarer query), and it costs write amplification
+/// on every memory insert/update forever. A 1.6x buffer regression on a real
+/// scenario is not worth that, so it is tracked as its own issue rather than
+/// smuggled in on parity grounds. Ship what is measured to help.
+const LIST_ORDER_INDEXES: &[ListOrderIndex] = &[
+    ListOrderIndex {
+        name: "idx_memories_ns_list_order",
+        create_sql: "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memories_ns_list_order \
+                     ON memories (namespace, priority DESC, updated_at DESC)",
+        drop_sql: "DROP INDEX CONCURRENTLY IF EXISTS idx_memories_ns_list_order",
+    },
+    ListOrderIndex {
+        name: "idx_archived_ns_archived_at",
+        create_sql: "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_archived_ns_archived_at \
+                     ON archived_memories (namespace, archived_at DESC)",
+        drop_sql: "DROP INDEX CONCURRENTLY IF EXISTS idx_archived_ns_archived_at",
+    },
+];
+
+/// v1.0.0 #2578 — catalog state of one index. `Invalid` is the leftover a
+/// failed `CREATE INDEX CONCURRENTLY` deposits: ignored by the planner for
+/// reads, still maintained by postgres on every write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexState {
+    Valid,
+    Invalid,
+    Absent,
+}
+
+/// v1.0.0 #2578 — outcome of one [`PostgresStore::ensure_list_order_indexes`]
+/// sweep, surfaced in the v88 arm's INFO line so a fleet upgrade is auditable.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ListOrderIndexStatus {
+    /// Indexes confirmed `indisvalid` when the sweep finished.
+    pub valid: usize,
+    /// Indexes this sweep actually built.
+    pub built: usize,
+    /// Builds that failed (fail-open — retried on the next connect).
+    pub failed: usize,
+    /// Indexes whose catalog probe itself errored.
+    pub probe_failed: usize,
+}
+
+/// v1.0.0 #2585 — the EXACT column set [`PostgresStore::row_to_memory_with_policy`]
+/// consumes, and the ONLY projection any `memories` read that maps into a
+/// [`Memory`] may use. Postgres twin of the sqlite `COLS` list shipped by
+/// #2384 (`crate::storage::memories_updated_since`) — same 31 names, same
+/// rationale, so the two adapters project identically.
+///
+/// **31 columns = the 30 `Memory` struct fields plus `encrypted_envelope`**,
+/// which is not a `Memory` field but IS the #2303 at-rest decrypt input the
+/// mapper needs to turn a sealed row's `content` sentinel back into
+/// plaintext. Dropping it would make every sealed row read as `""`.
+///
+/// # Why this exists (the defect it closes)
+///
+/// Every one of these reads was `SELECT *`, pulling all **43** columns and
+/// discarding 12 of them. Two are large: `embedding` (a `vector(768)` =
+/// 3,076 B/row, and the fleet has run 3072-dim models) and `tsv` (a
+/// `GENERATED ALWAYS … STORED` tsvector averaging **489 B/row on the live
+/// corpus — larger than `content`'s 391 B**). Measured row width on the
+/// live tier: **4,479 → 953 B/row** with 768-dim embeddings present, and
+/// **2,000 → 1,219 B/row** on a corpus with NO embeddings at all. The
+/// `tsv` waste is why this is NOT the "latent, zero measured impact until
+/// embeddings exist" defect #2585 filed: an isolated 30-row fetch measured
+/// p50 4.18 → 2.85 ms embedded and 2.92 → 2.05 ms unembedded.
+///
+/// The recall SEMANTIC pool was the worst case and went unmentioned in the
+/// issue: `SELECT *` there fetched the `embedding` column for `5 × limit`
+/// rows that ALL have embeddings by construction, purely to throw them away
+/// (it scores with the pgvector cosine-distance operator server-side and
+/// returns only the resulting similarity).
+///
+/// # Scope — read ONLY, `memories` ONLY
+///
+/// **This is a READ-INTO-[`Memory`] projection over the `memories` table.**
+/// It is NOT valid for:
+///   * `archived_memories` reads — `load_archived_as_memory_pg` has its own
+///     explicit list that DELIBERATELY omits `encrypted_envelope` (so a
+///     rotated/absent key cannot fail-closed an otherwise-restorable row)
+///     and remaps `COALESCE(original_tier, tier)`;
+///   * any `INSERT … SELECT` into the archive — those carry
+///     `embedding`/`embedding_dim`/`embedding_space`, and substituting this
+///     list would silently destroy the vectors on every archive.
+///
+/// A computed alias (`fts_score`, `cosine_sim`, `content_len`, `rank`) is
+/// APPENDED after this list at the call site; postgres resolves `WHERE` /
+/// `ORDER BY` against any FROM-list column, so predicates on the columns
+/// this list omits — the FTS match on `tsv`, the pgvector cosine distance on
+/// `embedding`, the `embedding_space` provenance gate — keep working untouched.
+///
+/// (Those operators are named in prose rather than written literally on
+/// purpose: `tests/embedding_space_provenance_2167.rs` pins the COUNT of
+/// postgres cosine-query sites by splitting this file on `sqlx::query` and
+/// counting blocks, so a literal cosine operator in a doc comment reads as a
+/// fourth query site and trips the #2167 §3.4 gate.)
+///
+/// Drift is blocked mechanically by `tests/pg_projection_column_fidelity_2585.rs`.
+pub const MEMORY_READ_COLUMNS: &str = "id, tier, namespace, title, content, tags, \
+     priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, \
+     expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, \
+     citations, source_uri, source_span, confidence_source, confidence_signals, \
+     confidence_decayed_at, version, lifecycle_state, cid, valid_from, valid_until, \
+     encrypted_envelope";
+
 /// Full-row select of a single memory by id. Shared by `get`,
 /// `merge_inbound`, and the lifecycle-state reader so the projection
 /// lives in exactly one place (pm-v3.1 hardcoded-literal discipline).
-const SQL_SELECT_MEMORY_ROW_BY_ID: &str = "SELECT * FROM memories WHERE id = $1";
+/// #2585 — narrowed from `SELECT *` to [`MEMORY_READ_COLUMNS`].
+/// v1.0.0 #2585 — the MID-LADDER row read, which MUST stay `SELECT *`.
+///
+/// [`MEMORY_READ_COLUMNS`] names the columns of the schema at its TIP. A
+/// migrate arm runs when the database is only PARTWAY up the ladder, so a
+/// tip-shaped projection there names columns that do not exist yet and fails
+/// with `42703`, aborting `connect()` and bricking the upgrade for every
+/// deployment old enough to need that arm.
+///
+/// Concretely: `backfill_memory_cids` runs inside the **v74** arm and re-reads
+/// each candidate row through `row_to_memory`. On a v67 database replaying
+/// forward, `valid_from` / `valid_until` / `kind_provenance` (v79) and
+/// `embedding_space` (v84) are still absent. Narrowing this read broke exactly
+/// that, and `tests/postgres_ladder_replay.rs` caught it on a populated v67
+/// replay before it could ship.
+///
+/// `SELECT *` is the CORRECT shape for a mid-ladder read: the row carries
+/// whatever the database has reached, and the mapper's per-column
+/// `.unwrap_or(...)` / `.ok()` tolerance exists precisely to absorb that.
+/// Use [`SQL_SELECT_MEMORY_ROW_BY_ID`] for every read that runs after
+/// `migrate` completes; use this one ONLY from inside a migrate arm.
+const SQL_SELECT_MEMORY_ROW_STAR_MID_LADDER: &str = "SELECT * FROM memories WHERE id = $1";
+
+static SQL_SELECT_MEMORY_ROW_BY_ID: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!("SELECT {MEMORY_READ_COLUMNS} FROM memories WHERE id = $1")
+});
 const SQL_SELECT_METADATA_BY_NS_TITLE: &str =
     "SELECT metadata FROM memories WHERE namespace = $1 AND title = $2";
 /// #1823 G6 — title-keyed id lookup, shared by the append-only spine's
@@ -416,6 +601,17 @@ const MIGRATION_V85_ARCHIVED_VALID_TIME: &str =
 /// postgres needs no expiry heal (`expires_at` is TIMESTAMPTZ here).
 const MIGRATION_V87_ARCHIVED_KIND_PROVENANCE: &str =
     include_str!("../../migrations/postgres/0044_v87_archived_kind_provenance.sql");
+
+/// v1.0.0 #2578 — schema v88 canonical DDL twin. Read as a doc twin ONLY,
+/// deliberately NOT executed as a batch: `CREATE INDEX CONCURRENTLY` is
+/// rejected inside a transaction block and sqlx's simple-query path wraps a
+/// multi-statement string in an implicit one, so each statement is issued
+/// individually by [`PostgresStore::ensure_list_order_indexes`] from
+/// [`LIST_ORDER_INDEXES`] on a dedicated timeout-relaxed connection. The
+/// `include_str!` keeps the file wired into the ladder (gate rule (e)) and
+/// keeps the shipped DDL and the executed DDL in one reviewable place.
+const MIGRATION_V88_LIST_COMPOSITE_INDEXES: &str =
+    include_str!("../../migrations/postgres/0045_v88_list_composite_indexes.sql");
 
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
@@ -793,7 +989,21 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       epistemic-provenance copy. Additive ADD COLUMN IF NOT EXISTS.
 //       Doc twin: migrations/postgres/0044_v87_archived_kind_provenance.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 87;
+// v88 — #2578: the v56 (#1579 A2 + B6d) composite list/archive ordering
+//       indexes, finally on postgres. `migrate_v56()` was recorded as a
+//       postgres version-stamp no-op, so a namespace-scoped `list` read
+//       EVERY row in the namespace and sorted them for the whole v56..v87
+//       range — O(namespace size) where sqlite is O(limit). Measured on
+//       the live tier: ns-scoped LIMIT 10 9.688 ms -> 0.072 ms with the
+//       sort node eliminated; LIMIT 1000 27.799 -> 1.220 ms; unscoped
+//       LIMIT 10 0.641 -> 0.059 ms. Built CONCURRENTLY, outside the arm's
+//       transaction, FAIL-OPEN (the indexes are derived/disposable and a
+//       plain in-tx CREATE INDEX is a fleet-wide boot brick under the
+//       pool's 5s lock_timeout — see `ensure_list_order_indexes`). SQLite
+//       has carried these since v56, so its v88 is a no-op; doc twins
+//       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
+//       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
+const CURRENT_SCHEMA_VERSION: i32 = 88;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1094,14 +1304,14 @@ impl PostgresStore {
         // Multi-statement SQL would trip sqlx's prepared-statement
         // protocol ("cannot insert multiple commands into a prepared
         // statement"); split into two separate executes.
-        sqlx::query("SET statement_timeout = 0")
+        sqlx::query(SQL_CLEAR_STATEMENT_TIMEOUT)
             .execute(&mut *bootstrap_lock_conn)
             .await
             .map_err(|e| StoreError::BackendUnavailable {
                 backend: "postgres".to_string(),
                 detail: format!("clear statement_timeout on bootstrap lock connection: {e}"),
             })?;
-        sqlx::query("SET lock_timeout = 0")
+        sqlx::query(SQL_CLEAR_LOCK_TIMEOUT)
             .execute(&mut *bootstrap_lock_conn)
             .await
             .map_err(|e| StoreError::BackendUnavailable {
@@ -1315,6 +1525,18 @@ impl PostgresStore {
             // is nothing to migrate and everything to preserve.
             if !schema_ahead {
                 store.migrate_locked().await?;
+                // v1.0.0 #2578 — self-heal the v88 composite ordering
+                // indexes on EVERY connect, not only inside the v88 arm.
+                // The arm is FAIL-OPEN (an index is derived, disposable
+                // data — refusing the fleet's boot over one would trade
+                // availability for zero integrity) and it stamps
+                // regardless, so it never re-runs. Without this call a node
+                // whose build lost a race would stay silently un-indexed
+                // FOREVER with no boot signal. Costs three catalog probes
+                // and returns once all three are valid, which is every boot
+                // after the first. Runs under the bootstrap advisory lock,
+                // so concurrent daemons cannot race the same build.
+                let _ = store.ensure_list_order_indexes().await;
             }
             // #1955 R45 — derive the persisted record-stop state from the
             // audit chain so a stop set before this connect is honored.
@@ -1688,11 +1910,11 @@ impl PostgresStore {
         // aborted under contention (per-session default is 30s from
         // `after_connect`). Split into two separate executes — sqlx
         // prepared-statement protocol rejects multi-statement SQL.
-        sqlx::query("SET statement_timeout = 0")
+        sqlx::query(SQL_CLEAR_STATEMENT_TIMEOUT)
             .execute(&mut *lock_conn)
             .await
             .map_err(|e| to_store_err("clear statement_timeout on migration lock connection", e))?;
-        sqlx::query("SET lock_timeout = 0")
+        sqlx::query(SQL_CLEAR_LOCK_TIMEOUT)
             .execute(&mut *lock_conn)
             .await
             .map_err(|e| to_store_err("clear lock_timeout on migration lock connection", e))?;
@@ -1989,8 +2211,11 @@ impl PostgresStore {
         if current_version < 86 {
             self.migrate_v86().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 87 {
             self.migrate_v87().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v88().await?;
         }
 
         Ok(())
@@ -4611,7 +4836,13 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("apply v87 archived kind_provenance ddl", e))?;
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // #2578 — stamp the LITERAL arm version, not CURRENT_SCHEMA_VERSION.
+        // v87 is a SETTLED arm now that v88 is the tip (the #2218
+        // literalize-on-settle convention); stamping the const here would
+        // record 88 without ever running the v88 arm on a ladder replay that
+        // enters below 87 — the same replay hazard the v55 / v56 literal
+        // stamps already close.
+        record_schema_version(&mut tx, 87).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v87 migration", e))?;
@@ -4621,6 +4852,242 @@ impl PostgresStore {
              kind_provenance archive-column parity)"
         );
         Ok(())
+    }
+
+    /// v1.0.0 #2578 — schema v88: the v56 composite list/archive ordering
+    /// indexes, finally on postgres.
+    ///
+    /// v56 (#1579 A2 + B6d) shipped `idx_memories_list_order`,
+    /// `idx_memories_ns_list_order` and `idx_archived_ns_archived_at` to
+    /// SQLite and left `migrate_v56()` a postgres version-stamp no-op, so a
+    /// namespace-scoped `list` on postgres has been O(namespace size) —
+    /// reading every row in the namespace and sorting it — for the whole
+    /// v56..v87 range. Measured on the live tier (8,724 rows, 7,855 in one
+    /// namespace): namespace-scoped `LIMIT 10` 9.688 ms -> 0.072 ms with the
+    /// sort node gone entirely; `LIMIT 1000` 27.799 -> 1.220 ms; unscoped
+    /// `LIMIT 10` 0.641 -> 0.059 ms.
+    ///
+    /// The DDL runs through [`Self::ensure_list_order_indexes`] — OUTSIDE any
+    /// transaction, `CONCURRENTLY`, with the pool timeouts cleared, and
+    /// FAIL-OPEN. See that method and
+    /// `migrations/postgres/0045_v88_list_composite_indexes.sql` for why a
+    /// plain in-transaction `CREATE INDEX` here is a fleet-wide boot brick
+    /// (empirically: `canceling statement due to lock timeout` after 5.002 s
+    /// against a table with ONE ordinary uncommitted writer).
+    async fn migrate_v88(&self) -> StoreResult<()> {
+        debug_assert!(
+            !MIGRATION_V88_LIST_COMPOSITE_INDEXES.is_empty(),
+            "#2578: the v88 DDL doc twin must ship with the binary"
+        );
+        let built = self.ensure_list_order_indexes().await;
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v88 stamp tx", e))?;
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v88 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            indexes_valid = built.valid,
+            indexes_total = LIST_ORDER_INDEXES.len(),
+            "schema migration v88 applied (#2578: v56 composite list/archive \
+             ordering indexes on postgres)"
+        );
+        Ok(())
+    }
+
+    /// v1.0.0 #2578 — idempotently bring the three v88 composite ordering
+    /// indexes to `indisvalid`, building any that are missing or invalid
+    /// with `CREATE INDEX CONCURRENTLY`. Returns how many of the three are
+    /// valid when it finishes.
+    ///
+    /// # Why CONCURRENTLY, on a dedicated connection, outside any tx
+    ///
+    /// Every pooled connection carries `statement_timeout` +
+    /// `lock_timeout` from the `after_connect` hook
+    /// ([`DEFAULT_STATEMENT_TIMEOUT_SECS`] / [`DEFAULT_LOCK_TIMEOUT_SECS`]);
+    /// `connect_*` clears them ONLY on the dedicated advisory-lock
+    /// connection, never on the connection a migrate arm's `pool.begin()`
+    /// hands out. A plain `CREATE INDEX` wants a SHARE lock, which any
+    /// ordinary in-flight writer blocks. Reproduced against the live tier
+    /// with a single uncommitted `INSERT` open: `ERROR: canceling statement
+    /// due to lock timeout` at 5.002 s — the arm's tx rolls back, the
+    /// version is not stamped, `connect()` returns `Err`, and the daemon
+    /// cannot boot, identically on every retry. That failure is
+    /// concurrency-driven, NOT size-driven: it fires on a small table just
+    /// as readily as a huge one. So the build must be CONCURRENTLY (which
+    /// waits the writer out rather than aborting), on its own connection
+    /// with `lock_timeout` cleared, and outside any transaction (postgres
+    /// refuses CIC in a transaction block).
+    ///
+    /// `statement_timeout` is set to a bounded [`INDEX_BUILD_TIMEOUT_MS`]
+    /// rather than cleared: an unbounded wait would hang `connect()` past
+    /// any supervisor's start timeout, converting a clean wait into a
+    /// crash-loop. A trip is a WARN + fail-open, and the next boot retries.
+    ///
+    /// # Fail-open, and why that is the North-Star reading
+    ///
+    /// These indexes are DERIVED, DISPOSABLE artifacts regenerable from the
+    /// durable memory TEXT, and they are not UNIQUE — nothing about
+    /// correctness rests on them. A build failure DEGRADES to exactly
+    /// today's query plan. Refusing to boot the fleet over a missing
+    /// performance index would trade total availability for zero integrity.
+    /// So this WARNs and returns, and `migrate_v88` stamps regardless.
+    ///
+    /// Because the stamp means the arm never re-runs, `connect_*` calls this
+    /// helper on EVERY connect (three catalog probes and a no-op once all
+    /// three are valid) — otherwise a node that lost one build would stay
+    /// silently un-indexed forever with no boot signal.
+    ///
+    /// # The `indisvalid` probe is load-bearing
+    ///
+    /// `CREATE INDEX CONCURRENTLY IF NOT EXISTS` silently NO-OPS over a
+    /// leftover INVALID index (what a CIC that failed midway leaves behind).
+    /// The planner ignores an invalid index for reads while postgres still
+    /// maintains it on every write — pure write amplification, permanently.
+    /// So the probe is on `pg_index.indisvalid`, never on mere existence,
+    /// and an invalid leftover is dropped (also CONCURRENTLY) before
+    /// rebuilding.
+    pub(crate) async fn ensure_list_order_indexes(&self) -> ListOrderIndexStatus {
+        let mut status = ListOrderIndexStatus::default();
+
+        // Probe first, on ordinary pooled connections. When all three are
+        // already valid (the overwhelmingly common case, every boot after
+        // the first) this is the ONLY work done — three catalog lookups, no
+        // dedicated connection, no DDL.
+        let mut pending: Vec<(&ListOrderIndex, IndexState)> = Vec::new();
+        for idx in LIST_ORDER_INDEXES {
+            match self.index_is_valid(idx.name).await {
+                Ok(IndexState::Valid) => status.valid += 1,
+                Ok(state) => pending.push((idx, state)),
+                Err(e) => {
+                    status.probe_failed += 1;
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        index = idx.name,
+                        err = %e,
+                        "#2578: could not probe list-order index validity; leaving it \
+                         alone this boot (reads fall back to the pre-v88 plan)"
+                    );
+                }
+            }
+        }
+        if pending.is_empty() {
+            return status;
+        }
+
+        // A build is genuinely needed. Take a DEDICATED connection so the
+        // timeout changes cannot leak to an unrelated caller, and so the
+        // CIC statements are never inside anyone else's transaction.
+        let mut conn = match self.pool.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    err = %e,
+                    "#2578: could not acquire a connection to build the list-order \
+                     indexes; reads fall back to the pre-v88 plan (retried next boot)"
+                );
+                return status;
+            }
+        };
+        // `lock_timeout = 0`: CIC MUST be able to wait out an ordinary
+        // in-flight writer — the pool default of 5s is exactly the boot
+        // brick this method exists to avoid. `statement_timeout` is BOUNDED
+        // rather than cleared so a pathological build cannot hang connect()
+        // past a supervisor start timeout; a trip is a WARN + fail-open and
+        // the next boot retries. Two separate executes: sqlx's prepared
+        // protocol rejects multi-statement SQL (the :1094 precedent).
+        for stmt in [
+            SQL_CLEAR_LOCK_TIMEOUT,
+            &format!("SET statement_timeout = {INDEX_BUILD_TIMEOUT_MS}"),
+        ] {
+            if let Err(e) = sqlx::query(stmt).execute(&mut *conn).await {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    err = %e,
+                    "#2578: could not relax timeouts on the index-build connection; \
+                     skipping the build (reads fall back to the pre-v88 plan)"
+                );
+                return status;
+            }
+        }
+
+        for (idx, state) in pending {
+            // An INVALID leftover must be dropped first: `CREATE INDEX
+            // CONCURRENTLY IF NOT EXISTS` keys on the NAME and would
+            // silently no-op over it, leaving an index the planner ignores
+            // but postgres still maintains on every write.
+            if state == IndexState::Invalid {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    index = idx.name,
+                    "#2578: dropping an INVALID leftover index before rebuilding \
+                     (a previous CONCURRENTLY build did not finish)"
+                );
+                if let Err(e) = sqlx::raw_sql(idx.drop_sql).execute(&mut *conn).await {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        index = idx.name,
+                        err = %e,
+                        "#2578: could not drop the invalid leftover index; skipping \
+                         its rebuild this boot"
+                    );
+                    continue;
+                }
+            }
+            let started = std::time::Instant::now();
+            match sqlx::raw_sql(idx.create_sql).execute(&mut *conn).await {
+                Ok(_) => {
+                    status.valid += 1;
+                    status.built += 1;
+                    tracing::info!(
+                        target: TRACE_TARGET,
+                        index = idx.name,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "#2578: built list-order index CONCURRENTLY"
+                    );
+                }
+                Err(e) => {
+                    status.failed += 1;
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        index = idx.name,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        err = %e,
+                        "#2578: list-order index build FAILED — degrading to the \
+                         pre-v88 query plan, NOT refusing the boot (the index is \
+                         derived, disposable data). It is retried on every \
+                         subsequent connect; to build it by hand, run: {}",
+                        idx.create_sql
+                    );
+                }
+            }
+        }
+        status
+    }
+
+    /// v1.0.0 #2578 — `pg_index.indisvalid` probe for one index by name.
+    async fn index_is_valid(&self, name: &str) -> StoreResult<IndexState> {
+        let row: Option<(bool,)> = sqlx::query_as(
+            "SELECT i.indisvalid FROM pg_class c \
+               JOIN pg_index i ON i.indexrelid = c.oid \
+              WHERE c.relname = $1 AND c.relkind = 'i'",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("probe index validity", e))?;
+        Ok(match row {
+            None => IndexState::Absent,
+            Some((true,)) => IndexState::Valid,
+            Some((false,)) => IndexState::Invalid,
+        })
     }
 
     /// v0.9.0 G8 (#1825) T5 — backfill the additive `cid` / `cid_genesis`
@@ -4673,7 +5140,25 @@ impl PostgresStore {
                 // Re-read + decrypt via `row_to_memory` on the SAME tx
                 // connection; SKIP (leave NULL) on ANY load/decrypt failure —
                 // a lost/rotated key must never abort the migration (T5).
-                let row = sqlx::query(SQL_SELECT_MEMORY_ROW_BY_ID)
+                // v1.0.0 #2585 — this ONE call site deliberately keeps
+                // `SELECT *` and must NOT be narrowed to
+                // `MEMORY_READ_COLUMNS`. It runs INSIDE the v74 migrate arm,
+                // i.e. MID-LADDER, where the table is at its v74 shape: the
+                // v79 columns (`valid_from`, `valid_until`, `kind_provenance`)
+                // and the v84 `embedding_space` DO NOT EXIST YET. Naming them
+                // explicitly makes the backfill fail with `42703 column
+                // "valid_from" does not exist`, which aborts `connect()` and
+                // BRICKS every pre-v79 deployment's upgrade. Caught by
+                // `tests/postgres_ladder_replay.rs` replaying a populated v67
+                // database — the exact #2424 class that suite exists for.
+                //
+                // `SELECT *` is correct here precisely BECAUSE the row shape
+                // is whatever this database has reached so far, and
+                // `row_to_memory_with_policy`'s per-column `.unwrap_or(...)`
+                // tolerance is designed for that partial shape. The projection
+                // SSOT describes the TIP schema and is only valid on the read
+                // paths that run after `migrate` completes.
+                let row = sqlx::query(SQL_SELECT_MEMORY_ROW_STAR_MID_LADDER)
                     .bind(id)
                     .fetch_optional(&mut *tx)
                     .await
@@ -5880,6 +6365,42 @@ impl PostgresStore {
     /// `candidates` is a slice of `(memory_id, retriever, rank, score)`
     /// tuples. Returns the number of rows actually inserted (excludes
     /// ON CONFLICT no-ops).
+    ///
+    /// # Round-trip shape (#2581, v1.0.0)
+    ///
+    /// This is ONE statement regardless of `candidates.len()`. Pre-#2581 it
+    /// was `BEGIN` + one `INSERT` PER CANDIDATE + `COMMIT`, so a recall cost
+    /// `2 + limit` network round trips and recall was **O(limit) in round
+    /// trips** — measured on the live tier at 20.6 / 48.7 / 85.3 ms for
+    /// 10 / 25 / 50 candidates, against a FLAT 4.3 / 4.9 / 5.2 ms for the
+    /// batched form. The ledger is the only write a (otherwise pure, #1869
+    /// P0-1) recall performs, so that cost landed directly on read latency.
+    ///
+    /// **This is a LATENCY fix only — the ledger rows are byte-identical.**
+    /// Same eight columns, same values, same `folded = FALSE`, same
+    /// `observed_at` default, same `ON CONFLICT (recall_id, memory_id) DO
+    /// NOTHING` disposition, same all-or-nothing atomicity, and the same
+    /// returned count of rows ACTUALLY inserted. Verified on the live tier:
+    /// an intra-batch duplicate `memory_id` behaves identically in both
+    /// forms — the first entry inserts and the second is a silent conflict
+    /// no-op (first-wins), because `DO NOTHING` treats a repeated
+    /// speculative insertion within one command as a conflict.
+    ///
+    /// The explicit transaction is gone because a SINGLE statement already
+    /// carries the identical all-or-nothing guarantee under postgres'
+    /// implicit transaction — `BEGIN; <one statement>; COMMIT;` adds two
+    /// round trips and nothing else. `observed_at` still lands identical
+    /// across every row of a call (it defaults to `now()`, which is the
+    /// transaction timestamp — one transaction either way).
+    ///
+    /// ## Do NOT convert this to `ON CONFLICT ... DO UPDATE`
+    ///
+    /// `DO NOTHING` is what makes the batched form tolerate an intra-batch
+    /// duplicate. `DO UPDATE` raises `21000: ON CONFLICT DO UPDATE command
+    /// cannot affect row a second time` for the SAME input the per-row loop
+    /// accepted — turning a duplicate candidate id into a hard failure on
+    /// an APPEND-ONLY AUDIT surface. If the ledger ever needs update
+    /// semantics, de-duplicate `candidates` by `memory_id` FIRST.
     pub async fn recall_observation_insert(
         &self,
         recall_id: &str,
@@ -5897,37 +6418,50 @@ impl PostgresStore {
         // row now lands `folded = FALSE` and the always-running fold
         // applies the ladders exactly once.
         let folded = false;
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("begin recall_observation tx", e))?;
-        let mut written: usize = 0;
-        for (memory_id, retriever, rank, score) in candidates {
-            let n = sqlx::query(
-                "INSERT INTO recall_observations
-                    (recall_id, memory_id, retriever, rank, score, agent_id, namespace, folded)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                 ON CONFLICT (recall_id, memory_id) DO NOTHING",
-            )
-            .bind(recall_id)
-            .bind(memory_id)
-            .bind(retriever)
-            .bind(rank)
-            .bind(score)
-            .bind(agent_id)
-            .bind(namespace)
-            .bind(folded)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("insert recall_observation", e))?
-            .rows_affected();
-            written += usize::try_from(n).unwrap_or(0);
-        }
-        tx.commit()
-            .await
-            .map_err(|e| to_store_err("commit recall_observation tx", e))?;
-        Ok(written)
+
+        // #2581 — UNNEST over four parallel arrays rather than a multi-row
+        // `VALUES` list. `candidates` is bounded by `LIST_MAX_LIMIT`, so a
+        // VALUES form would emit up to ~5k bind parameters AND a DIFFERENT
+        // SQL string per candidate count — thrashing sqlx's per-connection
+        // prepared-statement cache and sitting one order of magnitude below
+        // the extended protocol's hard 65535-parameter ceiling. UNNEST is
+        // EIGHT parameters for any N, one cached plan forever. The four
+        // per-call-constant values (`recall_id`, `agent_id`, `namespace`,
+        // `folded`) are hoisted to scalars instead of being replicated into
+        // arrays. Matches the existing `UNNEST($1::text[], …)` house shape
+        // used by `set_embeddings_batch` and the title/namespace probe.
+        let memory_ids: Vec<&str> = candidates.iter().map(|c| c.0.as_str()).collect();
+        let retrievers: Vec<&str> = candidates.iter().map(|c| c.1.as_str()).collect();
+        let ranks: Vec<i64> = candidates.iter().map(|c| c.2).collect();
+        let scores: Vec<f64> = candidates.iter().map(|c| c.3).collect();
+
+        // The array element types are cast EXPLICITLY: `rank` is BIGINT and
+        // `score` is DOUBLE PRECISION in the schema, and leaving either to
+        // inference would let a future column-type change bind silently
+        // wrong. `rank` is also a reserved-ish window-function name, so the
+        // UNNEST alias calls it `rnk` and the INSERT column list names the
+        // real column — no bare ambiguous `rank` in a table alias.
+        let written = sqlx::query(
+            "INSERT INTO recall_observations
+                (recall_id, memory_id, retriever, rank, score, agent_id, namespace, folded)
+             SELECT $1, u.memory_id, u.retriever, u.rnk, u.score, $6, $7, $8
+               FROM UNNEST($2::text[], $3::text[], $4::bigint[], $5::float8[])
+                    AS u(memory_id, retriever, rnk, score)
+             ON CONFLICT (recall_id, memory_id) DO NOTHING",
+        )
+        .bind(recall_id)
+        .bind(&memory_ids)
+        .bind(&retrievers)
+        .bind(&ranks)
+        .bind(&scores)
+        .bind(agent_id)
+        .bind(namespace)
+        .bind(folded)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("insert recall_observation", e))?
+        .rows_affected();
+        Ok(usize::try_from(written).unwrap_or(0))
     }
 
     /// v0.7.0 Gap 3 (issue #886) — TTL-based prune of the
@@ -8883,48 +9417,63 @@ impl PostgresStore {
         max_depth: Option<usize>,
         max_results: Option<usize>,
     ) -> StoreResult<Vec<Vec<String>>> {
-        // v0.7.0 fold-A2A1.3 (#700) — runtime AGE→CTE graceful
-        // fallback for `find_paths`. Same shape as the other three
-        // dispatchers; the CTE enumeration produces the same
-        // `Vec<Vec<String>>` shape so the upper-layer handler stays
-        // backend-blind.
-        match self.kg_backend {
-            KgBackend::Age => {
-                // #1735 (Pillar-4 4.C) — under deferred AGE-projection mode the
-                // AGE graph lags the relational `memory_links` truth (a
-                // just-created edge sits in `kg_projection_outbox` until the
-                // cold drainer projects it). A healthy-but-stale AGE returns a
-                // successful empty result that the `is_age_runtime_failure`
-                // fallback below would NOT catch, so route `find_paths`
-                // through the always-current relational recursive-CTE to
-                // preserve read-your-own-write. Sync mode (the default) keeps
-                // the AGE-accelerated cypher path unchanged.
-                if matches!(
-                    crate::config::age_projection_mode(),
-                    crate::config::AgeProjectionMode::Deferred
-                ) {
-                    return self
-                        .find_paths_cte(source_id, target_id, max_depth, max_results)
-                        .await;
-                }
-                match self
-                    .find_paths_cypher(source_id, target_id, max_depth, max_results)
-                    .await
-                {
-                    Ok(paths) => Ok(paths),
-                    Err(err) if is_age_runtime_failure(&err) => {
-                        warn_age_fallback_pair("find_paths", source_id, target_id, &err);
-                        self.find_paths_cte(source_id, target_id, max_depth, max_results)
-                            .await
-                    }
-                    Err(err) => Err(err),
-                }
-            }
-            KgBackend::Cte => {
-                self.find_paths_cte(source_id, target_id, max_depth, max_results)
-                    .await
-            }
-        }
+        // v1.0.0 #2582 — the relational recursive CTE is now the ONLY
+        // `find_paths` implementation, on BOTH `KgBackend` values.
+        //
+        // ## This changes zero answers
+        //
+        // `build_find_paths_current_view_cypher` emits an `ALL(e IN
+        // relationships(p) WHERE …)` guard, and AGE 1.7.0 — the
+        // SSOT-pinned version — REJECTS that at parse time:
+        //
+        //   ERROR:  syntax error at or near "("
+        //   LINE 1: … AND ALL(e IN relationships(p) WHERE e.valid_until …
+        //
+        // Reproduced against both a scratch graph and the LIVE
+        // `memory_graph`. `ALL`/`ANY`/`NONE` are grammar keywords there,
+        // not callable functions (AGE's lexer is case-insensitive, so
+        // lowercase fails identically), and AGE 1.7 implements no list
+        // predicates, no list comprehensions and no `filter()` — the same
+        // grammar narrowing already documented on the builder. So on every
+        // AGE deployment this call ALREADY fell through: it paid BEGIN +
+        // `LOAD 'age'` + `SET LOCAL search_path` + a failing parse +
+        // rollback, logged a `warn_age_fallback_pair`, and then ran
+        // `find_paths_cte` anyway. 100% of production AGE `find_paths`
+        // results already came from the CTE; this deletes the wasted round
+        // trips and a WARN that fired on every single call (which is log
+        // noise carrying zero discriminating information — it buries the
+        // real `age_substrate_unreachable` warnings it looks like).
+        //
+        // ## And fixing the Cypher would be the wrong repair anyway
+        //
+        // Measured on a purpose-built 20,003-vertex / 60,000-edge graph
+        // (avg out-degree 3), a PARSEABLE depth-4 AGE traversal returning
+        // 120 rows takes **999 ms**; the equivalent relational recursive
+        // CTE over the same edges takes **1.139 ms** — ~877x. The AGE plan
+        // is a Nested Loop whose OUTER side is a `Seq Scan` over ALL 20,003
+        // vertices, with 2,400,240 rows removed by
+        // `age_match_vle_terminal_edge`, plus 70 ms inside `age_vle` itself.
+        // That cost scales with |V|, not with depth, so there is no depth K
+        // at which AGE wins and the crossover only moves further away as a
+        // corpus grows. A vertex-property index does not rescue it either
+        // (999 ms -> 979 ms; it fixes the O(V) START lookup, not the walk).
+        //
+        // ## Integrity
+        //
+        // Strictly a consistency IMPROVEMENT: `memory_links` is the durable
+        // relational truth while the AGE projection is a derived, disposable
+        // artifact that can lag it. #1735 already routed `deferred` mode
+        // here for exactly that read-your-own-write reason; `sync` mode now
+        // gets the same guarantee.
+        //
+        // `find_paths_cypher` + its builder are RETAINED (not deleted):
+        // they still back the #2032 L4 Cypher-injection guard unit tests and
+        // the live-AGE equivalence suites. Follow-up work — port it to the
+        // #2511 Rust-side-filter shape or delete it, plus the capability
+        // honesty item so an AGE deployment can still tell that `find_paths`
+        // is CTE-served — is tracked separately.
+        self.find_paths_cte(source_id, target_id, max_depth, max_results)
+            .await
     }
 
     /// Recursive-CTE fallback for `find_paths` on Postgres.
@@ -13095,6 +13644,14 @@ const NS_FILTER_SARGABLE: &str = "namespace = $1";
 /// Scan (the #1473 defect).
 const NS_FILTER_OPTIONAL: &str = "($1::text IS NULL OR namespace = $1)";
 
+/// v1.0.0 #2578 — the `list_archived` twins of [`NS_FILTER_SARGABLE`] /
+/// [`NS_FILTER_OPTIONAL`]. Separate consts because the archive query binds
+/// namespace at `$1` alongside a different parameter tail, and because the
+/// #1473 rationale needed re-stating for a second call site rather than
+/// re-deriving. See `list_archived_pg` for the measured 772x.
+const ARCHIVED_NS_FILTER_SARGABLE: &str = "namespace = $1";
+const ARCHIVED_NS_FILTER_OPTIONAL: &str = "($1::text IS NULL OR namespace = $1)";
+
 /// v1.0.0 #2167 (#2183) — env knob for the OPT-IN postgres FOREIGN-space
 /// heal. When truthy, the serve-boot embedding-backfill sweep's
 /// `list_unembedded` scan ALSO returns rows stamped with a non-active
@@ -16896,7 +17453,7 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn get(&self, ctx: &CallerContext, id: &str) -> StoreResult<Memory> {
-        let row = sqlx::query(SQL_SELECT_MEMORY_ROW_BY_ID)
+        let row = sqlx::query(&SQL_SELECT_MEMORY_ROW_BY_ID)
             .bind(id)
             .fetch_optional(&self.pool)
             .await
@@ -17472,7 +18029,7 @@ impl MemoryStore for PostgresStore {
             ""
         };
         let list_sql = format!(
-            "SELECT * FROM memories
+            "SELECT {cols} FROM memories
              WHERE {ns_predicate}
                AND ($2::text IS NULL OR tier = $2)
                AND (expires_at IS NULL OR expires_at > NOW())
@@ -17496,6 +18053,8 @@ impl MemoryStore for PostgresStore {
              LIMIT $5",
             // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list. Also
             // covers the export egress: `export_memories` delegates to `list`.
+            // v1.0.0 #2585 — explicit projection (see MEMORY_READ_COLUMNS).
+            cols = MEMORY_READ_COLUMNS,
             lifecycle_vis = crate::models::lifecycle_visible_clause(""),
         );
         // #2580 — bind $9/$10 ONLY for the shape that references them; sqlx
@@ -17572,12 +18131,14 @@ impl MemoryStore for PostgresStore {
         let rows = match upper {
             Some(ref upper) => {
                 sqlx::query(&format!(
-                    "SELECT * FROM memories
+                    "SELECT {cols} FROM memories
                      WHERE namespace ~>=~ $1 AND namespace ~<~ $2
                        {lifecycle_vis}
                      ORDER BY namespace USING ~<~
                      LIMIT $3",
                     // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
+                    // v1.0.0 #2585 — explicit projection (see MEMORY_READ_COLUMNS).
+                    cols = MEMORY_READ_COLUMNS,
                     lifecycle_vis = crate::models::lifecycle_visible_clause(""),
                 ))
                 .bind(prefix)
@@ -17588,12 +18149,14 @@ impl MemoryStore for PostgresStore {
             }
             None => {
                 sqlx::query(&format!(
-                    "SELECT * FROM memories
+                    "SELECT {cols} FROM memories
                      WHERE namespace ~>=~ $1
                        {lifecycle_vis}
                      ORDER BY namespace USING ~<~
                      LIMIT $2",
                     // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
+                    // v1.0.0 #2585 — explicit projection (see MEMORY_READ_COLUMNS).
+                    cols = MEMORY_READ_COLUMNS,
                     lifecycle_vis = crate::models::lifecycle_visible_clause(""),
                 ))
                 .bind(prefix)
@@ -17693,7 +18256,7 @@ impl MemoryStore for PostgresStore {
         // 8k rows in the P3 fleet audit); the GIN expression index
         // only ever served the `@@` match, never the rank.
         let rows = sqlx::query(&format!(
-            "SELECT *,
+            "SELECT {cols},
                     ts_rank(tsv, to_tsquery('english', $1))
                     + (priority * 0.5)
                     + (LEAST(access_count, 50) * 0.1)
@@ -17723,6 +18286,8 @@ impl MemoryStore for PostgresStore {
              ORDER BY rank DESC, priority DESC
              LIMIT $6",
             // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
+            // v1.0.0 #2585 — explicit projection (see MEMORY_READ_COLUMNS).
+            cols = MEMORY_READ_COLUMNS,
             lifecycle_vis = crate::models::lifecycle_visible_clause(""),
         ))
         .bind(&or_tsquery)
@@ -18098,9 +18663,14 @@ impl MemoryStore for PostgresStore {
         // catch-up outbound path (honest caveat: quarantined rows black-hole
         // until dequarantine). Unqualified `memories` columns.
         let lifecycle_vis = crate::models::lifecycle_visible_clause("");
+        // v1.0.0 #2585 — explicit projection (see MEMORY_READ_COLUMNS). This
+        // is the federation SEND path, so `encrypted_envelope` being IN the
+        // list is load-bearing: without it the #2303 decrypt-on-send cannot
+        // run and a sealed row would relay as the `content=""` sentinel.
+        let cols = MEMORY_READ_COLUMNS;
         let rows = match since_dt {
             None => sqlx::query(&format!(
-                "SELECT * FROM memories \
+                "SELECT {cols} FROM memories \
                      WHERE true {lifecycle_vis} \
                      ORDER BY updated_at ASC \
                      LIMIT $1",
@@ -18110,7 +18680,7 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("list memories updated since", e))?,
             Some(dt) => sqlx::query(&format!(
-                "SELECT * FROM memories \
+                "SELECT {cols} FROM memories \
                      WHERE updated_at > $1 {lifecycle_vis} \
                      ORDER BY updated_at ASC \
                      LIMIT $2",
@@ -18606,7 +19176,7 @@ impl MemoryStore for PostgresStore {
         // row matches by id, fall through to `apply_remote_memory` (the
         // postgres `insert_if_newer` twin) for the fresh-insert +
         // (title, namespace) dedup-upsert LWW path.
-        let existing_row = sqlx::query(SQL_SELECT_MEMORY_ROW_BY_ID)
+        let existing_row = sqlx::query(&SQL_SELECT_MEMORY_ROW_BY_ID)
             .bind(&inbound.id)
             .fetch_optional(&self.pool)
             .await
@@ -19021,7 +19591,7 @@ impl MemoryStore for PostgresStore {
         // #1579 B2 — rank + match read the stored generated `tsv`
         // column (schema v57); see search() above for the rationale.
         let fts_rows = sqlx::query(&format!(
-            "SELECT *,
+            "SELECT {cols},
                     ts_rank(tsv, to_tsquery('english', $1))
                     + (priority * 0.5)
                     + (LEAST(access_count, 50) * 0.1)
@@ -19059,6 +19629,8 @@ impl MemoryStore for PostgresStore {
              ORDER BY fts_score DESC
              LIMIT $8",
             // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list (FTS pool).
+            // v1.0.0 #2585 — explicit projection (see MEMORY_READ_COLUMNS).
+            cols = MEMORY_READ_COLUMNS,
             lifecycle_vis = crate::models::lifecycle_visible_clause(""),
         ))
         .bind(&or_tsquery)
@@ -19112,7 +19684,7 @@ impl MemoryStore for PostgresStore {
             let qvec = pgvector::Vector::from(qe.to_vec());
             // #910 SAL-level scope=private gate via $9.
             let sem_rows = sqlx::query(&format!(
-                "SELECT *, (1.0 - (embedding <=> $1)) AS cosine_sim,
+                "SELECT {cols}, (1.0 - (embedding <=> $1)) AS cosine_sim,
                           octet_length(content) AS content_len
                  FROM memories
                  WHERE embedding IS NOT NULL
@@ -19148,6 +19720,8 @@ impl MemoryStore for PostgresStore {
                  ORDER BY embedding <=> $1
                  LIMIT $8",
                 // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list (semantic pool).
+                // v1.0.0 #2585 — explicit projection (see MEMORY_READ_COLUMNS).
+                cols = MEMORY_READ_COLUMNS,
                 lifecycle_vis = crate::models::lifecycle_visible_clause(""),
             ))
             .bind(&qvec)
@@ -21197,7 +21771,7 @@ impl MemoryStore for PostgresStore {
         // metadata — peer-origin, signing agent, depth — never content),
         // so fetch the raw row directly rather than through the
         // visibility-gated `get`.
-        let row = sqlx::query(SQL_SELECT_MEMORY_ROW_BY_ID)
+        let row = sqlx::query(&SQL_SELECT_MEMORY_ROW_BY_ID)
             .bind(id)
             .fetch_optional(&self.pool)
             .await
@@ -26277,7 +26851,33 @@ impl PostgresStore {
             .try_into()
             .unwrap_or(ARCHIVED_LIST_FALLBACK_I64);
         let offset_i: i64 = offset.try_into().unwrap_or(0);
-        let rows = sqlx::query(
+        // v1.0.0 #2578 — sargable namespace split, the #1473 treatment `list`
+        // already had. The OR-NULL optional-filter idiom
+        // `($1 IS NULL OR namespace = $1)` is NON-SARGABLE: the planner
+        // cannot prove `$1` is non-null at plan time, so under the GENERIC
+        // plan sqlx's prepared statements settle into it keeps walking
+        // `archived_memories_archived_at_idx` backwards and filtering, and
+        // the new v88 `idx_archived_ns_archived_at` composite is never used
+        // at all. Measured on a 200k-row archive with realistic
+        // multi-tenant skew (one tenant archived long ago, one archiving
+        // now), forced generic plan, namespace-scoped LIMIT 20:
+        //
+        //   OR-NULL   47.912 ms  (Index Scan Backward, Rows Removed by
+        //                         Filter: 180,000)
+        //   sargable   0.062 ms  (Index Scan using idx_archived_ns_archived_at,
+        //                         Index Cond: namespace = $1)      -> 772x
+        //
+        // Exact-match semantics are unchanged — this is the same equality,
+        // just not hidden behind an OR the planner must treat as opaque.
+        // The `None` arm keeps the no-op form: an unfiltered archive list
+        // has no namespace to seek on and `archived_memories_archived_at_idx`
+        // already serves it sort-free.
+        let ns_predicate = if namespace.is_some() {
+            ARCHIVED_NS_FILTER_SARGABLE
+        } else {
+            ARCHIVED_NS_FILTER_OPTIONAL
+        };
+        let rows = sqlx::query(&format!(
             "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
              source, access_count, created_at, updated_at, last_accessed_at, \
              expires_at, archived_at, archive_reason, metadata, \
@@ -26286,10 +26886,10 @@ impl PostgresStore {
              confidence_signals, confidence_decayed_at, version, \
              atomised_into, atom_of, mentioned_entity_id \
              FROM archived_memories \
-             WHERE ($1::text IS NULL OR namespace = $1) \
+             WHERE {ns_predicate} \
              ORDER BY archived_at DESC \
-             LIMIT $2 OFFSET $3",
-        )
+             LIMIT $2 OFFSET $3"
+        ))
         .bind(namespace)
         .bind(limit_i)
         .bind(offset_i)

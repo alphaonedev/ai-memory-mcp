@@ -1,0 +1,29 @@
+-- Copyright 2026 AlphaOne LLC
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- v1.0.0 #2578 — schema v88 is a SQLite NO-OP.
+--
+-- v88 lands the three composite list/archive ordering indexes on
+-- POSTGRES. SQLite has carried them since v56 (#1579 A2 + B6d,
+-- `migrations/sqlite/0047_v56_list_composite_indexes.sql`) — it was the
+-- postgres twin that was recorded as a version-stamp no-op and never
+-- followed up. So the parity direction here is postgres-catches-up, and
+-- there is nothing for the SQLite ladder to do.
+--
+-- No SQLite arm exists for v88: the ladder's tail already stamps
+-- `CURRENT_SCHEMA_VERSION` unconditionally, so a SQLite database moves
+-- 87 -> 88 with no DDL. This mirrors the v69 (`kg_projection_outbox`,
+-- postgres/AGE-only) precedent, where the SQLite side is a comment in
+-- `src/storage/migrations.rs` naming this file and nothing more.
+--
+-- The two adapters keep ONE logical schema number, which is what
+-- `scripts/check-migration-ladder.sh` rule (d) enforces — and that rule
+-- also requires the highest-prefix migration file in EACH backend to
+-- carry the current `vNN` tag, which is why this file exists at all.
+--
+-- The indexes SQLite already has, for reference (do NOT re-create them
+-- here — they are owned by 0047_v56):
+--
+--   idx_memories_list_order      (priority DESC, updated_at DESC)
+--   idx_memories_ns_list_order   (namespace, priority DESC, updated_at DESC)
+--   idx_archived_ns_archived_at  (namespace, archived_at DESC)
