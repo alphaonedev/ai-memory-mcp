@@ -8,8 +8,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ai-memory · Performance — bench tool, p95 budgets, regression gating</title>
-<meta name="description" content="ai-memory v0.9.0 performance surface. bench tool with --baseline, --regression-threshold, --history, --json flags. p95 latency budgets in PERFORMANCE.md. CI bench job that fails on regressions. v0.6.3 Stream E + F.">
+<title>ai-memory · Performance — bench tool, p95 budgets, advisory CI signal</title>
+<meta name="description" content="ai-memory performance surface. bench tool with --baseline, --regression-threshold, --history, --json flags. p95 latency budgets in PERFORMANCE.md, single-sourced in src/bench.rs. The CI bench job is advisory — it reddens on a budget breach, it does not block merges.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/performance.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -230,12 +230,12 @@ footer a{color:var(--text-muted)}
 </nav>
 
 <section class="hero">
-  <h1>Performance — measured, gated, public.</h1>
-  <p class="tagline">v0.6.3 ships a <strong>bench tool</strong> with three operator-friendly flags: <code>--baseline</code> for regression detection (with <code>--regression-threshold</code>, default 10%), <code>--history</code> for JSONL accumulation, <code>--json</code> for machine-readable output. CI runs the bench on every PR. Regressions &gt;N% fail the gate. The numbers in <code>PERFORMANCE.md</code> are the public contract.</p>
+  <h1>Performance — measured, published, advisory in CI.</h1>
+  <p class="tagline">A <strong>bench tool</strong> with three operator-friendly flags: <code>--baseline</code> for regression detection (with <code>--regression-threshold</code>, default 10%), <code>--history</code> for JSONL accumulation, <code>--json</code> for machine-readable output. CI runs the bench on every non-docs PR and reddens the run when a p95 exceeds its budget by more than 10%. <strong>That run is advisory — it does not block a merge.</strong> The numbers in <code>PERFORMANCE.md</code>, single-sourced in <code>src/bench.rs</code>, are the public contract.</p>
   <div class="pills">
     <span class="pill">bench tool (Stream E)</span>
     <span class="pill">PERFORMANCE.md (Stream F)</span>
-    <span class="pill">CI bench gate</span>
+    <span class="pill">CI bench signal (advisory)</span>
     <span class="pill">3 operator flags</span>
   </div>
 </section>
@@ -244,29 +244,28 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">Public p95 budgets</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">The numbers, committed to source.</h2>
-    <p class="lede">Every operation has a target p95 latency budget on a reference machine (Apple M4, 32 GB unified memory, SQLite — per <code>PERFORMANCE.md</code>). PRs that regress beyond a configurable threshold fail the bench CI gate. v0.7's Apache AGE work will extend this with KG-query budgets; v0.8 adds task-queue p95.</p>
-    <p class="lede" style="font-size:.95rem;color:var(--text-dim)">Rows tagged <em>[advisory]</em> are published targets without a matching bench in <code>src/bench.rs</code> yet (Stream E follow-up — embedder-bound, background-job, or federation paths). Unmarked rows are exercised by <code>ai-memory bench</code> on every PR. <code>PERFORMANCE.md</code> is the canonical budget contract.</p>
+    <p class="lede">Every budget below is a target p95 on a reference machine (Apple M4, 32 GB unified memory, SQLite — per <code>PERFORMANCE.md</code>). The bench job runs on every non-docs PR and reddens when a measured p95 exceeds its budget by more than 10%; it is <strong>advisory</strong> and does not block the merge.</p>
+    <p class="lede" style="font-size:.95rem;color:var(--text-dim)">The table below is the <strong>pinned</strong> set: every row has a real <code>Operation</code> variant in <code>src/bench.rs</code>, is measured by <code>ai-memory bench</code>, and is mechanically pinned to <code>PERFORMANCE.md</code> by the <code>operation_targets_match_performance_md</code> test. <code>PERFORMANCE.md</code> is the canonical budget contract.</p>
     <table class="budget-table">
-      <thead><tr><th>Operation</th><th>Tier</th><th style="text-align:right">p95 budget</th><th>Notes</th></tr></thead>
+      <thead><tr><th>Operation (<code>src/bench.rs</code>)</th><th>Workload</th><th style="text-align:right">p95 budget</th><th>Notes</th></tr></thead>
       <tbody>
-        <tr><td class="op">memory_store</td><td>keyword</td><td class="num">≤ 5 ms</td><td>FTS5 only · single-row insert</td></tr>
-        <tr><td class="op">memory_store</td><td>semantic</td><td class="num">≤ 25 ms</td><td><em>[advisory]</em> + MiniLM embedding (384d)</td></tr>
-        <tr><td class="op">memory_store</td><td>autonomous</td><td class="num">≤ 60 ms</td><td><em>[advisory]</em> + nomic embedding (768d)</td></tr>
-        <tr><td class="op">memory_get</td><td>any</td><td class="num">≤ 2 ms</td><td><em>[advisory]</em> indexed PK lookup + access bump</td></tr>
-        <tr><td class="op">memory_search</td><td>keyword</td><td class="num">≤ 8 ms</td><td>FTS5 query, top-20</td></tr>
-        <tr><td class="op">memory_recall</td><td>semantic</td><td class="num">≤ 35 ms</td><td><em>[advisory]</em> adaptive FTS5+HNSW fusion (semantic weight 0.50→0.15 by content length)</td></tr>
-        <tr><td class="op">memory_recall</td><td>autonomous</td><td class="num">≤ 90 ms</td><td><em>[advisory]</em> + cross-encoder rerank (top-100→top-10)</td></tr>
-        <tr><td class="op">memory_link</td><td>any</td><td class="num">≤ 4 ms</td><td><em>[advisory]</em> FK insert + idempotency check</td></tr>
-        <tr><td class="op">memory_promote</td><td>any</td><td class="num">≤ 8 ms</td><td><em>[advisory]</em> + governance verdict</td></tr>
-        <tr><td class="op">memory_consolidate</td><td>smart</td><td class="num warn">≤ 1500 ms</td><td><em>[advisory]</em> LLM-bound · <code>gemma4:e4b</code> reference</td></tr>
-        <tr><td class="op">memory_kg_query</td><td>any</td><td class="num">≤ 50 ms</td><td>recursive CTE · depth 3 · &lt; 1k edges</td></tr>
-        <tr><td class="op">memory_get_taxonomy</td><td>any</td><td class="num">≤ 30 ms</td><td><em>[advisory]</em> tree walk · default depth 8 · limit 1000</td></tr>
-        <tr><td class="op">memory_archive_purge</td><td>any</td><td class="num">≤ 200 ms</td><td><em>[advisory]</em> per 1000 archived rows</td></tr>
-        <tr><td class="op">sync_push (per row)</td><td>any</td><td class="num">≤ 15 ms</td><td><em>[advisory]</em> peer-to-peer · TLS 1.3</td></tr>
-        <tr><td class="op">bulk_create</td><td>any</td><td class="num">≤ 2000 ms</td><td><em>[advisory]</em> 100 rows + fanout · concurrent post W12</td></tr>
+        <tr><td class="op">memory_store</td><td>default</td><td class="num">≤ 20 ms</td><td>no embedding · FTS5 trigger sync · <code>StoreNoEmbedding</code></td></tr>
+        <tr><td class="op">memory_store</td><td>--scale 10000</td><td class="num">≤ 120 ms</td><td>same op over a 10k-row seeded corpus</td></tr>
+        <tr><td class="op">memory_search</td><td>default</td><td class="num">≤ 100 ms</td><td>FTS5 keyword baseline · <code>SearchFts</code></td></tr>
+        <tr><td class="op">memory_search</td><td>--scale 10000</td><td class="num">≤ 60 ms</td><td>tighter at scale — the 10k row was pinned from a measured run</td></tr>
+        <tr><td class="op">memory_recall</td><td>default</td><td class="num">≤ 50 ms</td><td>hot, depth=1 · <code>RecallHot</code></td></tr>
+        <tr><td class="op">memory_recall</td><td>--scale 10000</td><td class="num">≤ 80 ms</td><td>hot keyword recall at 10k rows</td></tr>
+        <tr><td class="op">memory_recall (rerank stage)</td><td>default</td><td class="num">≤ 60 ms</td><td>recall + handler-layer rerank pass · <strong>lexical stand-in</strong> cross-encoder, not the neural model · <code>RecallRerankHot</code></td></tr>
+        <tr><td class="op">memory_recall (rerank stage)</td><td>--scale 10000</td><td class="num">≤ 100 ms</td><td>rerank stage is scale-invariant; the recall portion is not</td></tr>
+        <tr><td class="op">memory_kg_query</td><td>depth 1 / depth 3</td><td class="num">≤ 100 ms</td><td>recursive CTE · fan-out + chain fixtures · scale-independent</td></tr>
+        <tr><td class="op">memory_kg_query</td><td>depth 5</td><td class="num">≤ 250 ms</td><td>tail case · chain fixture (50 × 5 hops)</td></tr>
+        <tr><td class="op">memory_kg_timeline</td><td>any</td><td class="num">≤ 100 ms</td><td>ordered timeline for a single source</td></tr>
+        <tr><td class="op">memory_store (verified)</td><td>--verified</td><td class="num">≤ 30 ms</td><td>store budget + fixed 10 ms Ed25519 sign headroom (corpus-scale-invariant)</td></tr>
+        <tr><td class="op">memory_recall (verified)</td><td>--verified</td><td class="num">≤ 70 ms</td><td>recall budget + fixed 20 ms Ed25519 verify headroom</td></tr>
       </tbody>
     </table>
-    <p class="lede" style="margin-top:1rem"><em>Reference machine: Apple M4, 32 GB unified memory, macOS, SQLite default settings, single-process daemon. Numbers degrade gracefully on lower-spec hardware; budgets are headroom-aware. Live numbers under <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/PERFORMANCE.md" style="color:var(--p1)">PERFORMANCE.md</a>.</em></p>
+    <p class="lede" style="font-size:.95rem;color:var(--text-dim);margin-top:1rem"><strong>Not measured, not gated by anything.</strong> The following operations have <em>no</em> <code>Operation</code> variant in <code>src/bench.rs</code>, so no harness produces a number for them: <code>memory_store</code> with embedding, <code>memory_get</code>, cold/full-hybrid and neural-cross-encoder <code>memory_recall</code>, <code>memory_link</code>, <code>memory_promote</code>, <code>memory_consolidate</code>, <code>memory_get_taxonomy</code>, <code>memory_archive_purge</code>, <code>sync_push</code>, <code>bulk_create</code>, <code>memory_check_duplicate</code>, <code>memory_session_start</code>, the curator cycle and the federation ack. Where a design target is still published for those, it is marked <em>[advisory]</em> in <code>PERFORMANCE.md</code> — an operator-facing intent, never a measurement.</p>
+    <p class="lede" style="margin-top:1rem"><em>Reference machine: Apple M4, 32 GB unified memory, macOS, SQLite default settings, single-process daemon — the same machine <code>PERFORMANCE.md §Hardware Baseline</code> names for every latency budget. (The Apple M2 / 16 GB Mac mini in <code>benchmarks/longmemeval/methodology.md</code> is a different measurement family — retrieval quality, not latency.) <strong>On macOS the bench applies <code>MACOS_BUDGET_MULT = 3.0</code>, so a macOS pass bar is 3.3× the published number</strong> — recall PASSes at 165 ms against a published &lt; 50 ms. The advisory CI run is on <code>ubuntu-latest</code>, where the multiplier is 1.0. Live numbers under <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/PERFORMANCE.md" style="color:var(--p1)">PERFORMANCE.md</a>.</em></p>
   </div>
 </section>
 
@@ -277,7 +276,7 @@ footer a{color:var(--text-muted)}
 
     <div class="flag baseline">
       <div class="flag-head"><span class="flag-name">--baseline &lt;path&gt;</span></div>
-      <div class="flag-desc">Compare this run against a saved baseline JSON. Flags any operation whose p95 increased by more than the configured threshold (default 10%). Used by the CI bench gate to refuse regressions before merge.</div>
+      <div class="flag-desc">Compare this run against a saved baseline JSON. Flags any operation whose p95 increased by more than the configured threshold (default 10% — <code>DEFAULT_REGRESSION_THRESHOLD_PCT</code> in <code>src/bench.rs</code>) and exits non-zero. The CI workflow runs this as an <strong>advisory</strong> step at threshold 50% that swallows the exit code, so it never refuses a merge — and while the committed <code>performance/baseline.json</code> carries <code>bootstrap: true</code> it skips the comparison entirely. Blocking promotion is gated on a soak proving a &lt;1% false-positive rate over ≥20 runs.</div>
       <div class="snip"><span class="ok">$</span> ai-memory bench --baseline ./bench/baseline-v0.6.3.json
 <span class="ok">→ memory_store     keyword     baseline 4.2ms  current 4.4ms   ✓ within +5%</span>
 <span class="ok">→ memory_recall    semantic    baseline 31ms   current 33ms    ✓ within +6%</span>
@@ -301,14 +300,14 @@ footer a{color:var(--text-muted)}
 
     <div class="flag update">
       <div class="flag-head"><span class="flag-name">--json</span></div>
-      <div class="flag-desc">Emit results as machine-readable JSON instead of the human table. A saved <code>--json</code> payload is exactly what <code>--baseline</code> consumes on the next run, so the release workflow is: bench on the reference machine, save the JSON, feed it back as the baseline for every PR. <code>PERFORMANCE.md</code> is updated by hand from a reviewed known-good run.</div>
+      <div class="flag-desc">Emit results as machine-readable JSON instead of the human table. A saved <code>--json</code> payload is exactly what <code>--baseline</code> consumes on the next run. The baseline must be captured on the runner class it will be compared against — the <code>regenerate-baseline</code> <code>workflow_dispatch</code> job takes a median-of-3 on <code>ubuntu-latest</code> and uploads it for an operator to commit; a dev-machine capture compared against CI is pure hardware noise, which is why the committed bootstrap file makes the compare self-skip. <code>PERFORMANCE.md</code> is updated by hand from a reviewed known-good run.</div>
       <div class="snip"><span class="ok">$</span> ai-memory bench --json &gt; ./bench/baseline-v0.7.0.json
 
 <span class="cm"># Workflow:
 #   1. cut a release candidate
-#   2. run bench on the reference machine with --json
-#   3. review + commit the baseline JSON
-#   4. CI feeds it back via --baseline on every PR
+#   2. run the regenerate-baseline workflow_dispatch job (median-of-3, ubuntu-latest)
+#   3. review + commit the artifact as performance/baseline.json with bootstrap:false
+#   4. CI feeds it back via --baseline as an ADVISORY compare on every non-docs PR
 #   5. update PERFORMANCE.md from the reviewed run</span></div>
     </div>
   </div>
@@ -316,26 +315,30 @@ footer a{color:var(--text-muted)}
 
 <section>
   <div class="container">
-    <span class="eyebrow">CI bench gate</span>
-    <h2 style="font-family:var(--font-sans);font-size:1.75rem">Regressions fail the build.</h2>
-    <p class="lede">Every PR runs the bench job (<code>.github/workflows/bench.yml</code>) on a fixed-spec runner. The job pulls the baseline from the previous release tag, runs the bench, compares. Regressions &gt; threshold fail the job and block merge.</p>
-    <div class="snip"><span class="cm"># .github/workflows/bench.yml — pseudocode</span>
+    <span class="eyebrow">CI bench signal</span>
+    <h2 style="font-family:var(--font-sans);font-size:1.75rem">Budget breaches turn the run red. They do not block the merge.</h2>
+    <p class="lede">Every PR that touches something other than docs runs the bench job (<code>.github/workflows/bench.yml</code>) on <code>ubuntu-latest</code>. Two absolute-budget steps — the default workload and <code>--scale 10000</code> — exit non-zero when a measured p95 exceeds its budget by more than 10%, which fails the job.</p>
+    <p class="lede"><strong>The workflow is advisory.</strong> Its own header states it verbatim — <em>"Bench is advisory (not in required-status-checks)"</em> — and it appears zero times in <code>scripts/qc-allowlists/required-contexts-release.txt</code>, the mirror of the required-status-check set on the release branch. A red Bench run is a loud signal to a reviewer; branch protection does not act on it. Both triggers also carry <code>paths-ignore: ['docs/**', '**/*.md']</code>, so a docs-only PR never runs it.</p>
+    <p class="lede">The baseline compare is a <strong>third, separately advisory</strong> step. It does not pull from a release tag: the baseline is a <em>committed file</em>, <code>performance/baseline.json</code>. That file currently ships as a dev-machine <code>bootstrap: true</code> capture, which makes the step <strong>skip the comparison entirely</strong>. Capturing a real one is the <code>regenerate-baseline</code> <code>workflow_dispatch</code> job.</p>
+    <div class="snip"><span class="cm"># .github/workflows/bench.yml — real shape (abridged)</span>
 on:
   pull_request:
-    branches: [main, "release/**"]
+    branches: [main, develop, "release/**"]
+    <span class="key">paths-ignore</span>: ['docs/**', '**/*.md']   <span class="cm"># docs-only PRs never run the bench</span>
 
 jobs:
   bench:
-    runs-on: ubuntu-latest          <span class="cm"># consistent runner — bench is comparative</span>
+    <span class="key">name</span>: ai-memory bench (ubuntu-latest)   <span class="cm"># NOT a required status check</span>
+    runs-on: ubuntu-latest
     steps:
-      - <span class="key">name</span>: Checkout
-      - <span class="key">name</span>: Build release
-      - <span class="key">name</span>: Pull baseline
-        <span class="key">run</span>: gh release download v0.6.3 --pattern bench-baseline.json
-      - <span class="key">name</span>: Run bench
-        <span class="key">run</span>: ./target/release/ai-memory bench --baseline bench-baseline.json --history bench-history.jsonl
-      - <span class="key">name</span>: Upload history (artifact)
+      - <span class="key">name</span>: Run bench (gate)                  <span class="cm"># exit != 0 on &gt;10% over budget</span>
+      - <span class="key">name</span>: Run bench at 10k scale (gate)     <span class="cm"># same, against the [scale] budgets</span>
+      - <span class="key">name</span>: Baseline regression (advisory, #1987)
+        <span class="cm"># reads the COMMITTED performance/baseline.json;
+        # self-skips while bootstrap:true; `exit 0` unconditionally</span>
+      - <span class="key">name</span>: Upload bench artifact
         <span class="key">uses</span>: actions/upload-artifact@v5</div>
+    <p class="lede" style="font-size:.95rem;color:var(--text-dim)">Turning this into a real merge gate is one line in <code>required-contexts-release.txt</code> plus the matching branch-protection entry. Until that lands, the budgets are enforced by review and by an unmissable red run — and this page says so rather than implying otherwise.</p>
   </div>
 </section>
 
