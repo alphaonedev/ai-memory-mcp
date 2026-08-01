@@ -413,7 +413,19 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // deliberately does not claim. MEASURED post-change: 27_609.
     // Ceiling 27_400 -> 27_700 (+91 headroom). Bumped in LOCKSTEP with the
     // postgres.rs entry below (same commit, same issue).
-    ("src/storage/mod.rs", 27_700),
+    //
+    // 2026-07-31 (#2580) — `build_list_query` gains the exact
+    // metadata-equality axis (the GIN/`json_each` pushdown that stops
+    // `memory_load_family` materialising 1000 rows to return 0) and `list`
+    // splits into the historical 11-arg shape plus `list_filtered`, so the
+    // ~30 existing `db::list` call sites stay untouched. The bulk is the
+    // WHY comment: the predicate rides the SHARED builder precisely so the
+    // #1948 lifecycle allow-list, the expiry guard, the #1579 sargable
+    // namespace arm, the #1834 AS-OF window and the #2383 undecryptable-row
+    // skip all keep applying — a bespoke query would have to re-derive
+    // every one of them. MEASURED post-change: 27_746.
+    // Ceiling 27_700 -> 27_820 (+74 headroom).
+    ("src/storage/mod.rs", 27_820),
     // 2026-07-21 (#1802 R-05 S1) — NEW submodule extracted from
     // storage/mod.rs (doctor / observability probes). Measured 698;
     // ceiling 800 (+102).
@@ -1038,7 +1050,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // (`resolve_governance_policy` + the in-tx walk inside
     // `enforce_governance_action`). MEASURED post-change: 32_196.
     // Ceiling 32_200 -> 32_300 (+104 headroom).
-    ("src/store/postgres.rs", 32_950), /* 2026-07-31 #2578/#2581/#2582/#2585 postgres read-path perf: the v88 composite-index arm + its CONCURRENTLY/indisvalid self-heal helper, the MEMORY_READ_COLUMNS read projection replacing eight `SELECT *` shapes, the UNNEST-batched recall ledger, the find_paths CTE routing, and the list_archived sargable split; measured 32_841 */
+    ("src/store/postgres.rs", 33_050), /* 2026-07-31 #2578/#2581/#2582/#2585 postgres read-path perf: the v88 composite-index arm + its CONCURRENTLY/indisvalid self-heal helper, the MEMORY_READ_COLUMNS read projection replacing eight `SELECT *` shapes, the UNNEST-batched recall ledger, the find_paths CTE routing, and the list_archived sargable split; measured 32_841 pre-merge. RE-MEASURED 32_937 after merging #2603 (#2580 pushed load_family's family predicate into SQL in this same file), so the number is the MERGED tree's, not either side's. #2627: a ceiling that arrives through a clean auto-merge is UNVERIFIED, not agreed — two branches can bump to an identical token from different pre-merge measurements and git raises no conflict. Always re-measure the merged file. */
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
