@@ -933,14 +933,48 @@ pub async fn load_family_handler(
     let k = usize::try_from(k_raw).unwrap_or(usize::MAX).clamp(1, 100);
     let family_name = family.name();
 
-    // v0.7.0 Wave-3 — postgres path. Pull a generous superset via the
-    // SAL trait then filter on `metadata.family` in memory; the trait
-    // filter axes don't yet include metadata fields. Cap the prefetch
-    // at MAX_BULK_SIZE so a postgres daemon can't be coerced into
-    // loading the whole table on a small `k`.
+    // v0.7.0 Wave-3 / v1.0.0 #2580 — postgres path.
+    //
+    // Pre-#2580 this pulled `MAX_BULK_SIZE` (=1000) FULL rows regardless of
+    // `k` and filtered them on `metadata.family` in Rust, because the SAL
+    // `Filter` had no metadata axis. Measured on the 8k-row Atlas corpus:
+    // ~982 kB of content+metadata moved per call to return ZERO rows,
+    // 54.3 ms p50 — the slowest surface on the postgres backend, on an
+    // ALWAYS-ON core-profile tool.
+    //
+    // The predicate now rides the SAL `Filter::metadata_eq` axis into the
+    // SAME hardened `list` query (see `crate::store::MetadataEq`), served
+    // by the pre-existing `memories_metadata_gin` index. Two properties are
+    // load-bearing and deliberately NOT traded away for the speed:
+    //
+    //  1. FAIL-CLOSED RE-CHECK. The in-process `metadata.family` predicate
+    //     is RETAINED (`MetadataEq::matches`), mirroring the belt-and-
+    //     suspenders `is_visible_to_caller` re-apply inside
+    //     `PostgresStore::list`. The pushdown can therefore only ever
+    //     NARROW: an adapter that ignored the axis would degrade to fewer
+    //     results, never widen the set with rows the caller did not ask
+    //     for.
+    //  2. NEVER FEWER RESULTS THAN PRE-#2580. The fast path asks for
+    //     exactly `k` rows, but the SAL `list` applies the strictly-NARROWER
+    //     Rust `is_visible_to_caller` (the #1921 team/unit/org subtree gate
+    //     has no SQL twin in the `$6` clause) AFTER the SQL `LIMIT`, so a
+    //     bare `LIMIT k` could under-return where the old 1000-row window
+    //     did not. When the narrowed set is short of `k` we therefore
+    //     re-ask at the historical `MAX_BULK_SIZE` window. That escalated
+    //     answer is a strict SUPERSET of the pre-#2580 answer: restricting
+    //     the ordering to family-tagged rows can only move a family row UP
+    //     in rank, so every family row inside the old top-1000 is inside
+    //     the new top-1000 — and family rows the old code silently dropped
+    //     past rank 1000 (a real pre-existing under-return on namespaces
+    //     larger than 1000 rows, which sqlite never had) are now returned.
+    //
+    // Cost of the escalation is bounded by TWO round trips, and the second
+    // one transfers only family-tagged rows — in the measured zero-match
+    // case both queries move zero rows.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let filter = crate::store::Filter {
+        let family_eq = crate::store::MetadataEq::new(crate::META_KEY_FAMILY, family_name);
+        let build_filter = |limit: usize| crate::store::Filter {
             namespace: body.namespace.clone(),
             tier: None,
             tags_any: Vec::new(),
@@ -948,9 +982,11 @@ pub async fn load_family_handler(
             since: None,
             until: None,
             valid_at: None,
-            limit: MAX_BULK_SIZE,
+            limit,
             // #2167 — load_family listing never runs the recall space gate.
             active_embedding_space: None,
+            // #2580 — GIN-served pushdown of the family predicate.
+            metadata_eq: Some(family_eq.clone()),
         };
         // QC P1 fix (2026-05-20): load_family lists every memory in
         // the namespace tagged with a `family` metadata field. With
@@ -960,34 +996,36 @@ pub async fn load_family_handler(
         // result set to the caller's own memories (+ scope=shared/
         // public, which the filter passes through).
         let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
-        return match app.store.list(&ctx, &filter).await {
-            Ok(all) => {
-                let mut filtered: Vec<Memory> = all
-                    .into_iter()
-                    .filter(|m| {
-                        m.metadata.get("family").and_then(serde_json::Value::as_str)
-                            == Some(family_name)
-                    })
-                    .collect();
-                // priority DESC, updated_at DESC (mirrors handle_load_family).
-                filtered.sort_by(|a, b| {
-                    b.priority
-                        .cmp(&a.priority)
-                        .then_with(|| b.updated_at.cmp(&a.updated_at))
-                });
-                filtered.truncate(k);
-                let count = filtered.len();
-                Json(json!({
-                    "family": family_name,
-                    "namespace": body.namespace,
-                    "k": k,
-                    "count": count,
-                    "memories": filtered,
-                }))
-                .into_response()
-            }
-            Err(e) => store_err_to_response(e),
+        let narrow = |rows: Vec<Memory>| -> Vec<Memory> {
+            let mut kept: Vec<Memory> = rows.into_iter().filter(|m| family_eq.matches(m)).collect();
+            // priority DESC, updated_at DESC (mirrors handle_load_family).
+            kept.sort_by(|a, b| {
+                b.priority
+                    .cmp(&a.priority)
+                    .then_with(|| b.updated_at.cmp(&a.updated_at))
+            });
+            kept
         };
+        let mut filtered = match app.store.list(&ctx, &build_filter(k)).await {
+            Ok(rows) => narrow(rows),
+            Err(e) => return store_err_to_response(e),
+        };
+        if filtered.len() < k {
+            filtered = match app.store.list(&ctx, &build_filter(MAX_BULK_SIZE)).await {
+                Ok(rows) => narrow(rows),
+                Err(e) => return store_err_to_response(e),
+            };
+        }
+        filtered.truncate(k);
+        let count = filtered.len();
+        return Json(json!({
+            "family": family_name,
+            "namespace": body.namespace,
+            "k": k,
+            "count": count,
+            "memories": filtered,
+        }))
+        .into_response();
     }
 
     // Sqlite path — reuse the MCP `handle_load_family` SQL verbatim by
