@@ -277,6 +277,33 @@ pub struct Metrics {
     /// (the cap defaults to disabled).
     pub admission_shed_total: IntCounter,
 
+    /// #2577 — monotonic count of recalls whose query embedding could not
+    /// be produced within [`crate::embeddings::ENV_RECALL_EMBED_BUDGET_MS`]
+    /// (or failed outright), so the recall degraded to keyword/FTS.
+    ///
+    /// This is the operator's ONLY numeric view of the #2577 fail-open. A
+    /// degrade nobody can see is operationally indistinguishable from a
+    /// lie: the results are honest (`mode:keyword` on the wire) but a
+    /// sustained non-zero rate means the fleet's semantic recall is
+    /// silently off. Alert on the RATE, not the value — a handful of trips
+    /// is a provider hiccup; a sustained rate means the budget is
+    /// mis-sized for this deployment's provider or the provider is sick.
+    ///
+    /// Always zero on keyword-tier deployments and on any deployment whose
+    /// provider stays inside the budget.
+    ///
+    /// **Scope caveat:** MCP stdio serves no `/metrics` endpoint, so on
+    /// that surface the stderr WARN (`recall.embed.degraded`) is the only
+    /// channel.
+    pub recall_embed_degraded_total: IntCounter,
+
+    /// #2577 — monotonic count of recall query embeddings served from the
+    /// process-local cache instead of a remote round trip. Rising with
+    /// traffic is the healthy shape (agent fleets repeat queries heavily);
+    /// a flat zero under repeated traffic means the cache is disabled
+    /// (`AI_MEMORY_QUERY_EMBED_CACHE_ENTRIES=0`) or every query is unique.
+    pub query_embed_cache_hits_total: IntCounter,
+
     /// #1735 (Pillar-4 4.C) — current depth of the `kg_projection_outbox`
     /// (pending AGE projections not yet drained: `projected_at IS NULL`).
     /// Refreshed each cold-drainer tick. Sustained non-zero depth means the
@@ -654,6 +681,28 @@ impl Metrics {
         )?;
         registry.register(Box::new(admission_shed_total.clone()))?;
 
+        let recall_embed_degraded_total = IntCounter::new(
+            "ai_memory_recall_embed_degraded_total",
+            "Monotonic counter of recalls that fell back to keyword/FTS because \
+             the query-embedding call failed or exceeded \
+             AI_MEMORY_RECALL_EMBED_BUDGET_MS (#2577). The results are honest \
+             (the response reports mode:keyword) but semantic ranking is OFF for \
+             those requests. Alert on a sustained increment rate: a few trips is \
+             a provider hiccup, a sustained rate means the budget is mis-sized \
+             for this deployment's embedding provider or the provider is \
+             unhealthy. Always zero on keyword-tier deployments.",
+        )?;
+        registry.register(Box::new(recall_embed_degraded_total.clone()))?;
+
+        let query_embed_cache_hits_total = IntCounter::new(
+            "ai_memory_query_embed_cache_hits_total",
+            "Monotonic counter of recall query embeddings served from the \
+             process-local bounded cache instead of a remote round trip \
+             (#2577). Zero under repeated traffic means the cache is disabled \
+             (AI_MEMORY_QUERY_EMBED_CACHE_ENTRIES=0) or every query is unique.",
+        )?;
+        registry.register(Box::new(query_embed_cache_hits_total.clone()))?;
+
         let age_projection_pending_depth = IntGauge::new(
             "ai_memory_age_projection_pending_depth",
             "Current depth of the kg_projection_outbox (pending deferred AGE \
@@ -712,6 +761,8 @@ impl Metrics {
             federation_cred_max_age_seconds,
             federation_renewal_lag_seconds,
             admission_shed_total,
+            recall_embed_degraded_total,
+            query_embed_cache_hits_total,
             age_projection_pending_depth,
             age_projection_failed_total,
             age_projection_quarantined_total,
@@ -818,6 +869,21 @@ pub fn record_corrupt_provenance(column: &str) {
 /// the same signal.
 pub fn record_auto_export_spawn_failed() {
     registry().auto_export_spawn_failed_total.inc();
+}
+
+/// v1.0.0 #2577 — record one recall that degraded to keyword/FTS because
+/// the query embedding was unavailable within
+/// [`crate::embeddings::ENV_RECALL_EMBED_BUDGET_MS`]. Pairs with the
+/// `recall.embed.degraded` WARN at the call site, which is the only
+/// channel on MCP stdio (no `/metrics` endpoint there).
+pub fn inc_recall_embed_degraded() {
+    registry().recall_embed_degraded_total.inc();
+}
+
+/// v1.0.0 #2577 — record one recall query embedding served from the
+/// process-local bounded cache instead of a remote round trip.
+pub fn inc_query_embed_cache_hit() {
+    registry().query_embed_cache_hits_total.inc();
 }
 
 /// v0.7-polish SEC-15 / COR-11 (issue #780) — read the current value
