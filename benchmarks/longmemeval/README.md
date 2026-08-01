@@ -33,12 +33,31 @@ Evaluates ai-memory's recall engine against the [LongMemEval](https://github.com
 
 Four harnesses are provided, each building on the last:
 
-| Harness | Strategy | Speed | Peak R@5 |
+> **Throughput attributions corrected 2026-08-01 (CERT GATE 2).** This
+> table previously shifted every speed figure **up one row** — it credited
+> `harness.py` with 57 q/s (which is `harness_fast.py`'s number) and
+> `harness_fast.py` with 232 q/s (which is `harness_99.py --no-expand`'s).
+> The corrected values below are each cross-checked against the elapsed
+> time for the full 500-question run: published q/s == 500 / elapsed.
+> `docs/DEVELOPER_GUIDE.md` carried the correct attribution throughout.
+
+| Harness | Strategy | Speed (500 q) | Peak R@5 |
 |---|---|---|---|
-| `harness.py` | CLI subprocess per operation | ~57 q/s | baseline |
-| `harness_fast.py` | Native Python+SQLite, zero subprocesses | 232 q/s (parallel) | 97.0% |
-| `harness_blazing.py` | Multi-strategy FTS5 with enhanced titles | -- | ~96% |
-| `harness_99.py` | LLM query expansion + parallel FTS5 | 142 q/s | 97.2% (Gemma 4 anchor; `gemma3:4b` historical 97.8%) |
+| `harness.py` | CLI subprocess per operation — **binary-faithful** | **1.2 q/s** (414 s) | 96.4% keyword / 96.8% semantic / 95.8% autonomous |
+| `harness_fast.py` | Native Python+SQLite, zero subprocesses — **shadow** | 57 q/s (8.8 s) | 96.2% |
+| `harness_blazing.py` | Multi-strategy FTS5 with enhanced titles — **shadow** | -- | ~96% |
+| `harness_99.py --no-expand` | Parallel FTS5, 10 cores — **shadow** | 232 q/s (2.2 s) | 97.0% |
+| `harness_99.py` | LLM query expansion + parallel FTS5 — **shadow** | 142 q/s (3.5 s) | 97.2% (Gemma 4 anchor; `gemma3:4b` historical 97.8%) |
+
+**Read the Speed column with the harness shape in mind.** `harness.py`'s
+1.2 q/s is **subprocess-spawn dominated, not recall dominated** — it forks
+a fresh `ai-memory recall` process for every one of the 500 questions. It
+is the cost of this harness's shape, not a property of the recall path an
+integrator hits: an MCP-stdio or HTTP client pays no per-query process
+spawn. Conversely the 232 q/s row is a 10-core parallel Python
+reimplementation of scoring that never enters the shipped binary. **Numbers
+are comparable only WITHIN a harness, never across** — and only the
+`harness.py` row describes the shipped code path.
 
 ### harness.py -- Original CLI harness
 

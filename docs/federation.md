@@ -7,11 +7,22 @@ layout: doc
 > **transport/identity hardening** layer — mTLS allowlist, X-API-Key, and
 > the per-peer attestation JSON. The newer **CA-rooted, attestation-issued,
 > short-lived credential** system that replaces O(N²) manual `.pub`
-> enrollment with O(1) "trust the CA" — the enterprise zero-touch trust
-> capability that scales a fleet from 1 to ~1,000,000 agents — is
-> documented in **[`docs/federation-identity.md`](federation-identity.html)**.
+> enrollment with O(1) "trust the CA" is documented in
+> **[`docs/federation-identity.md`](federation-identity.html)**.
 > The two layers compose: mTLS is the transport boundary, zero-touch
 > credentials are the application identity carried *inside* it.
+>
+> **Certified scale envelope.** The enrollment surface is O(1) in peer
+> count, but *enrollment* is not the binding constraint — mesh topology
+> is. The certified claim is a **500–1000 agent cluster**, composed
+> **modularly in 500-agent blocks**: scale past one cluster by adding
+> independent clusters, never by growing one mesh. The peer-to-peer
+> mesh model is the **wrong shape past ~50 peers** (see
+> §"Multi-peer scaling guidance" below, which has said so since v0.7.0).
+> A previous revision of this paragraph advertised "1 to ~1,000,000
+> agents"; that figure was three orders of magnitude beyond anything
+> this document's own topology tables support and is retired
+> ([#2438](https://github.com/alphaonedev/ai-memory-mcp/issues/2438)).
 
 v0.7.0 hardens the v0.6.x federation surface with three concurrent
 authentication layers and three new `AI_MEMORY_FED_*` env vars. Peers
@@ -59,9 +70,12 @@ api_key = "…"   # e.g. contents of /etc/ai-memory/api.key
 ```
 
 When set, every endpoint except `/api/v1/health` requires the
-`X-API-Key` header — the supported credential channel. (The
-`?api_key=` query-parameter form is deprecated at v0.7.0 and slated
-for v0.8 rejection; see
+`X-API-Key` header — the **only** supported credential channel. (The
+`?api_key=` query-parameter form is **no longer accepted** as of
+v1.0.0 — [#2032](https://github.com/alphaonedev/ai-memory-mcp/issues/2032)
+L1 removed it; a caller still on that path gets a `401` with no
+fallback. Earlier revisions of this paragraph described the removal as
+still upcoming. See
 [#1574](https://github.com/alphaonedev/ai-memory-mcp/issues/1574) and
 [`production-deployment.md` §3b](production-deployment.html).) When the
 mTLS allowlist is enforced, the `/api/v1/sync/*` federation endpoints
@@ -89,19 +103,20 @@ export AI_MEMORY_FED_PEER_ATTESTATION='{
 
 The env var is a JSON object mapping a claimed peer-id (delivered on
 the `x-peer-id` HTTP header) to a `PeerScope`
-([`src/federation/peer_attestation.rs:107-118`](../src/federation/peer_attestation.rs)).
+([`src/federation/peer_attestation.rs::PeerScope`](../src/federation/peer_attestation.rs)).
 
 - **`allowed_sender_agent_ids`** — exact strings (no glob) the peer
   may claim as `body.sender_agent_id` on `/sync/push`. Empty = peer
   may only author as itself (`body.sender_agent_id == peer-id`).
 - **`allowed_namespaces`** — glob patterns matched against
-  `Memory::namespace` on **every lane that can reach a write**: the
+  `Memory::namespace` on **the following lanes, and only these**: the
   `/sync/since` pull projection, the `/sync/push` `deletions[]` lane
   (#1934), the `/sync/push` `memories[]` WRITE lane plus its
   `archives[]` / `restores[]` siblings (#2447), the `/sync/push`
   GOVERNANCE lanes `pendings[]` + `pending_decisions[]` (#2478), and —
   since #2479 — the `/sync/push` GOVERNANCE-STANDARD lanes
   `namespace_meta[]` + `namespace_meta_clears[]`.
+
   On the governance lanes the subject is not one namespace but the UNION
   of every namespace the approved action's execution would touch, because
   `db::execute_pending_action` never reads the pending row's own declared
@@ -151,12 +166,41 @@ the `x-peer-id` HTTP header) to a `PeerScope`
   (`AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE`) for the disposition of
   an enrolled peer that declares no namespaces at all.
 
-The attestation core is `attest_sender`
-([`src/federation/peer_attestation.rs:257`](../src/federation/peer_attestation.rs))
-on the inbound `/sync/push` path and `namespace_allowed`
-([`src/federation/peer_attestation.rs:348`](../src/federation/peer_attestation.rs))
-on the outbound `/sync/since` path. Both are pure functions over
-operator-configured allowlist rows; both default-deny.
+> ⚠️ **Three inbound write lanes are NOT namespace-scoped today.**
+> A previous revision of this sentence read "every lane that can
+> reach a write". That universal quantifier was false, and it is the
+> sentence an operator builds tenant isolation on, so it is stated
+> plainly here instead:
+>
+> | Unscoped lane | Code | Tracking |
+> |---|---|---|
+> | `/sync/push` `links[]` | `src/handlers/federation_receive.rs` — the `links` loop reaches `db::create_link_inbound` with no scope check | [#2489](https://github.com/alphaonedev/ai-memory-mcp/issues/2489) |
+> | `/sync/push` `signals[]` | same file — `sig.namespace` is read only at the quota call, never compared to `allowed_namespaces` | [#2489](https://github.com/alphaonedev/ai-memory-mcp/issues/2489) |
+> | the entire **pull-accept** path | `src/federation/receive.rs` builds `CallerContext::for_admin(sentinels::FEDERATION_CATCHUP)` (`bypass_visibility = true`) and inserts; `PeerAttestationConfig` is never consulted in that file | [#2480](https://github.com/alphaonedev/ai-memory-mcp/issues/2480) |
+>
+> **What that means concretely.** A peer scoped `["public/*"]` can
+> still write graph edges into a namespace it is denied, deliver
+> signals into a denied inbox, and — on any node that *pulls* from
+> it — insert rows into any namespace. Because `contradicts` /
+> `supersedes` edges feed the recall down-weight, the `links[]` gap
+> is a **read-path influence primitive against data the peer cannot
+> read**. The accepted threat model for #2480 is "a configured peer
+> turns hostile / is compromised" — exactly this case.
+>
+> Until #2489 and #2480 land, do **not** rely on `allowed_namespaces`
+> as a boundary between mutually distrusting tenants. See
+> §"Multi-peer scaling guidance" for the delivered boundary.
+
+The attestation core is
+[`peer_attestation::attest_sender`](../src/federation/peer_attestation.rs)
+on the inbound `/sync/push` path. On the outbound `/sync/since` path the
+gate is the glob predicate
+[`peer_attestation::namespace_allowed_test_glob`](../src/federation/peer_attestation.rs),
+which `src/handlers/federation_sync_since.rs` calls **inline** — note it
+does *not* go through the sibling `namespace_allowed`, which earlier
+revisions of this document named here. Behaviour is equivalent; the
+pointer was wrong. Both are pure functions over operator-configured
+allowlist rows; both default-deny.
 
 A peer without an `x-peer-id` header is rejected with
 `peer_id_header_missing` unless one of the bypass envs is set. A peer
@@ -175,7 +219,8 @@ Pinned by [`tests/federation_b2_hardening.rs`](../tests/federation_b2_hardening.
 | `AI_MEMORY_FED_SYNC_TRUST_PEER` | unset (deny) | When set to `"1"`, widens "no scope row" cases on `/sync/since` to legacy full-dump behavior. Once a scope row exists for a peer, its namespace list is the authoritative gate and the bypass is ignored. |
 | `AI_MEMORY_FED_TRUST_BODY_AGENT_ID` | unset (deny) | When set to `"1"`, the substrate trusts the wire body's `agent_id` claim instead of the authenticated peer-id. Default: header wins. |
 
-Constants: [`src/federation/peer_attestation.rs:75-88`](../src/federation/peer_attestation.rs).
+Constants: the `*_ENV` consts in [`src/federation/peer_attestation.rs`](../src/federation/peer_attestation.rs)
+(`PEER_ATTESTATION_ENV`, `TRUST_BODY_AGENT_ID_ENV`, `SYNC_TRUST_PEER_ENV`).
 
 The default posture is **strict**: an inbound write from an authenticated
 peer is treated as the peer's write, not as the underlying agent's
@@ -183,12 +228,12 @@ write, unless the operator explicitly opts in to the peer's claim via
 the two `TRUST_*` flags. Bypass detection:
 `trust_body_agent_id_bypass()` /
 `sync_trust_peer_bypass()` at
-[`src/federation/peer_attestation.rs:221-228`](../src/federation/peer_attestation.rs).
+[`src/federation/peer_attestation.rs`](../src/federation/peer_attestation.rs).
 
 A malformed `AI_MEMORY_FED_PEER_ATTESTATION` JSON value is treated as
 an empty allowlist (default-deny) plus a `tracing::warn!` so the
 operator sees the typo immediately
-([`src/federation/peer_attestation.rs:171-198`](../src/federation/peer_attestation.rs)).
+([`peer_attestation::PeerAttestationConfig::from_env`](../src/federation/peer_attestation.rs)).
 Refusing to start on a malformed allowlist would be a self-DOS hazard
 during config rollouts.
 
@@ -371,7 +416,7 @@ v0.7.0 adds reflection-aware bookkeeping
 ([`src/federation/reflection_bookkeeping.rs`](../src/federation/reflection_bookkeeping.rs))
 so federated reflection writes carry origin metadata that prevents
 depth-cap laundering. `enforce_local_cap_on_derived`
-([`src/federation/reflection_bookkeeping.rs:211`](../src/federation/reflection_bookkeeping.rs))
+([`src/federation/reflection_bookkeeping.rs`](../src/federation/reflection_bookkeeping.rs))
 refuses an inbound reflection memory whose derived depth exceeds the
 local namespace cap, even if the sending peer's local cap is higher.
 
@@ -393,10 +438,23 @@ local namespace cap, even if the sending peer's local cap is higher.
    set both — see
    [`src/handlers/tests.rs`](../src/handlers/tests.rs) for the
    legacy-test bypass installation pattern).
-6. **Verify** with
-   `curl --cert peer.crt --key peer.key -H "x-peer-id: peer-node-1" \
-   https://memory.prod/api/v1/health` — a 200 with `{"status":"ok"}`
-   means TLS + mTLS + API key all aligned.
+6. **Verify — and know what the verification proves.** `/api/v1/health`
+   is deliberately EXEMPT from the api-key layer (`api_key_auth` skips
+   `HEALTH`) and its handler takes no `HeaderMap` at all, so it never
+   reads `x-peer-id`. A 200 from
+   `curl --cert peer.crt --key peer.key https://memory.prod/api/v1/health`
+   therefore proves **TLS + mTLS only** — it says nothing about the API
+   key or peer attestation. Earlier revisions of this step claimed it
+   proved "TLS + mTLS + API key all aligned"; an operator following that
+   got a green light for an auth stack that was never exercised.
+   To verify the **full** stack, call a gated endpoint instead:
+   `curl --cert peer.crt --key peer.key -H "X-API-Key: $KEY" \
+   -H "x-peer-id: peer-node-1" https://memory.prod/api/v1/sync/since?since=...`
+   — note that under an enforced mTLS posture `/api/v1/sync/*` **also**
+   bypasses the api-key layer by design
+   ([#702](https://github.com/alphaonedev/ai-memory-mcp/issues/702)), so
+   to exercise the api-key layer specifically, use a NON-federation
+   gated route such as `GET /api/v1/memories`.
 7. **Watch** the daemon log for `peer_id_header_missing` /
    `sender_agent_id_mismatch` lines — those are real rejections.
 
@@ -411,10 +469,10 @@ ai-memory daemon doesn't carry the X.509 verification cost on every
 fresh connection.
 
 **Sync interval.** `spawn_catchup_loop`
-([`src/federation/receive.rs:69`](../src/federation/receive.rs))
+([`src/federation/receive.rs`](../src/federation/receive.rs))
 drives the periodic pull from peers; cadence is operator-set via
 `--catchup-interval-secs` (default 30s) on the `FederationConfig`
-([`src/federation/mod.rs:99`](../src/federation/mod.rs)).
+([`federation::FederationConfig`](../src/federation/mod.rs)).
 For small meshes (2-5 peers, modest write volume), 30s is fine. For
 large meshes, increase to 60-300s to spread the pull traffic.
 
@@ -592,11 +650,40 @@ leaf. |
 
 Vector-clock storage scales linearly with peer count. The CRDT-lite
 merge cost is bounded by row count, not peer count — adding peers
-does not asymptotically hurt merge throughput. The blast radius of a
-single compromised peer scales with what the operator wired into its
-`PeerScope`; default-deny on both `allowed_namespaces` and
-`allowed_sender_agent_ids` keeps a compromised peer from authoring as
-other agents or pulling unrelated namespaces.
+does not asymptotically hurt merge throughput.
+
+**Certified scale envelope.** A **500–1000 agent cluster**, composed
+modularly in **500-agent blocks**. Scale past one cluster by adding
+independent clusters, never by growing one mesh past the ~50-peer
+ceiling above. `docs/enterprise-deployment.md` §11 states the same
+rule from the capacity side ("compose independent modules, never
+raise one daemon's caps") and marks its per-tier agent counts
+PROVISIONAL — believe that marking.
+
+**Blast radius of a single compromised peer.** Default-deny on both
+`allowed_namespaces` and `allowed_sender_agent_ids` keeps a compromised
+peer from **authoring as other agents** and from **pulling unrelated
+namespaces**. Those two verbs are genuinely contained. What is **not**
+contained today: per the unscoped-lane table in §"Peer attestation"
+above, a compromised peer can still write graph edges into a denied
+namespace (#2489), deliver signals into a denied inbox (#2489), and
+inject rows into any namespace on a node that pulls from it (#2480).
+It can also read the plaintext of everything replicated to it —
+federation is **not** end-to-end encrypted
+([#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968); see
+§"At-rest encryption and federation" below).
+
+**Delivered boundary vs documented boundary.** The boundary this
+substrate delivers today is **separately-administered peers inside one
+organisation**. It is *not* a boundary between mutually distrusting
+tenants: `trust_domain` is a credential-replay scope only (it rejects a
+credential minted for another fleet and enforces nothing between
+tenants *inside* one domain — it is consulted only under
+`src/federation/identity/`, never on the receive path), and the stated
+in-domain confinement primitive is `PeerScope.allowed_namespaces`,
+which the three lanes above never consult. For heterogeneous trust,
+§8.8 of `docs/enterprise-deployment.md` gives the correct answer:
+**use multiple disjoint swarms**, not one mesh with scopes.
 
 ## Troubleshooting
 
