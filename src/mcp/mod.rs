@@ -11246,7 +11246,7 @@ mod tests {
         conn.execute(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, created_at, updated_at, metadata
-             ) VALUES (?1, 'short', 'team/eng', ?2, 'body', ?3, ?3, '{\"scope\":\"public\"}')",
+             ) VALUES (?1, 'short', 'team/eng', ?2, 'body', ?3, ?3, '{\"scope\":\"collective\"}')",
             rusqlite::params![id, format!("title-{id}"), now],
         )
         .unwrap();
@@ -13300,10 +13300,14 @@ mod tests {
             updated_at: now,
             last_accessed_at: None,
             expires_at: None,
-            // v0.7.0 #1075 — public scope so chunkc fixtures survive
+            // v0.7.0 #1075 — world-readable scope so chunkc fixtures survive
             // the visibility gate added on memory_replay regardless of
             // which agent_id the caller resolves to in tests.
-            metadata: json!({"agent_id": "test-agent-chunkc", "scope": "public"}),
+            // #2633 — was the literal `"public"`, which is NOT a `MemoryScope`
+            // and only passed because the pre-#2633 read path treated every
+            // unrecognised token as world-readable. `collective` is the real
+            // world-readable scope this fixture always meant.
+            metadata: json!({"agent_id": "test-agent-chunkc", "scope": "collective"}),
             reflection_depth: 0,
             memory_kind: crate::models::MemoryKind::Observation,
             entity_id: None,
@@ -14304,11 +14308,14 @@ mod tests {
         // Insert a memory whose namespace doesn't matter — what
         // matters is the transcript's namespace which we control here.
         let now = chrono::Utc::now().to_rfc3339();
-        // v0.7.0 #1075 — public scope so the visibility gate passes,
+        // v0.7.0 #1075 — world-readable scope so the visibility gate passes.
+        // #2633 — was the literal `"public"`, which is NOT a `MemoryScope`; it
+        // only passed because the pre-#2633 read path treated any unrecognised
+        // token as world-readable. `collective` is the real world-readable scope.
         // exercising the permission-rule branch that this test pins.
         conn.execute(
             "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at, metadata)
-             VALUES (?1, 'short', 'team/eng-denyrule', ?2, 'body', ?3, ?3, '{\"scope\":\"public\"}')",
+             VALUES (?1, 'short', 'team/eng-denyrule', ?2, 'body', ?3, ?3, '{\"scope\":\"collective\"}')",
             rusqlite::params!["mem-deny-uniq", "title-mem-deny-uniq", now],
         )
         .unwrap();
@@ -14340,11 +14347,14 @@ mod tests {
         }]);
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let now = chrono::Utc::now().to_rfc3339();
-        // v0.7.0 #1075 — public scope so the visibility gate passes,
+        // v0.7.0 #1075 — world-readable scope so the visibility gate passes.
+        // #2633 — was the literal `"public"`, which is NOT a `MemoryScope`; it
+        // only passed because the pre-#2633 read path treated any unrecognised
+        // token as world-readable. `collective` is the real world-readable scope.
         // exercising the permission-rule Ask branch this test pins.
         conn.execute(
             "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at, metadata)
-             VALUES (?1, 'short', 'team/eng-askrule', ?2, 'body', ?3, ?3, '{\"scope\":\"public\"}')",
+             VALUES (?1, 'short', 'team/eng-askrule', ?2, 'body', ?3, ?3, '{\"scope\":\"collective\"}')",
             rusqlite::params!["mem-ask-uniq", "title-mem-ask-uniq", now],
         )
         .unwrap();

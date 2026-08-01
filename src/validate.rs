@@ -497,6 +497,57 @@ pub fn validate_scope(scope: &str) -> Result<()> {
     Ok(())
 }
 
+/// #2633 — validate an INLINE `metadata.scope` on a CALLER-ORIGIN write.
+///
+/// [`validate_scope`] only ever guarded the surfaces that take an explicit
+/// top-level `scope` PARAMETER (`handlers::create`, `mcp::tools::store`,
+/// `cli::store`). A caller who instead wrote the key straight into
+/// `metadata` bypassed it entirely — and pre-#2633 an unrecognised token
+/// made the row world-readable on every non-SQL read path
+/// (`crate::visibility::is_visible_to_caller`), so a one-character typo was
+/// a disclosure. The read path now degrades an unrecognised token to the
+/// owner-keyed default; this refuses it at INGRESS so the writer finds out
+/// at write time instead of silently getting a row nobody else can see.
+///
+/// **Accepted set** = [`VALID_SCOPES`] ∪ [`crate::visibility::LEGACY_BROAD_SCOPES`].
+/// The legacy token must be accepted here because the substrate ITSELF
+/// stamps `scope: "shared"` on the `_standard:<ns>` governance-policy
+/// placeholder rows (`crate::handlers::hook_subscribers` first-write +
+/// ownership-restamp; `crate::mcp::tools::namespace` set-standard restamp),
+/// and some of those writes route through a caller-origin funnel.
+///
+/// **Deliberately NOT wired into [`validate_metadata`] / [`validate_memory`].**
+/// Those two are on the federation-receive, import, reflect and consolidate
+/// funnels, where a REFUSAL diverges replicas — the #1821 secret-screen
+/// lesson (caller-origin refuses; federation/recovery degrades). An inbound
+/// peer row with a typo'd scope is stored verbatim and simply reads as
+/// private locally: DEGRADE, never diverge.
+///
+/// A non-string `scope` value is left alone: it cannot be a valid token, it
+/// parses to `None` on every read path (owner-keyed private, fail-closed),
+/// and refusing it would reject legitimately-shaped metadata whose `scope`
+/// key means something else to the caller.
+///
+/// # Errors
+///
+/// Returns an error naming the offending token and the valid set.
+pub fn validate_metadata_scope(metadata: &serde_json::Value) -> Result<()> {
+    let Some(scope) = metadata
+        .get(crate::META_KEY_SCOPE)
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(());
+    };
+    if VALID_SCOPES.contains(&scope) || crate::visibility::is_legacy_broad_scope(scope) {
+        return Ok(());
+    }
+    bail!(
+        "invalid metadata.scope '{}' — must be one of: {}",
+        scope,
+        VALID_SCOPES.join(", ")
+    );
+}
+
 /// Validate a [`GovernancePolicy`] (Task 1.8). Closed-set tag checks are
 /// already handled by serde on deserialization; this adds semantic bounds:
 /// consensus quorum must be ≥ 1, Agent references must pass
@@ -1076,6 +1127,12 @@ pub fn validate_create(mem: &CreateMemory) -> Result<()> {
     validate_expires_at(mem.expires_at.as_deref())?;
     validate_ttl_secs(mem.ttl_secs)?;
     validate_metadata(&mem.metadata)?;
+    // #2633 — an inline `metadata.scope` never reached `validate_scope`
+    // (which only guards the top-level `scope` PARAMETER), so a typo'd
+    // token rode straight through to the read path. Caller-origin funnel
+    // ⇒ refuse at ingress; see `validate_metadata_scope` for why this is
+    // NOT inside `validate_metadata` (federation must degrade, not diverge).
+    validate_metadata_scope(&mem.metadata)?;
     // v0.7.0 #1467 — reject an explicit, non-parseable Form-6 `kind` at
     // the DTO boundary so the HTTP / MCP write surfaces stop silently
     // coercing it to `Observation` (CLI already rejects). The downstream
@@ -1256,6 +1313,9 @@ pub fn validate_update(update: &UpdateMemory) -> Result<()> {
     }
     if let Some(ref meta) = update.metadata {
         validate_metadata(meta)?;
+        // #2633 — same caller-origin ingress gate as `validate_create`; an
+        // UPDATE that rewrites `metadata.scope` is a scope write.
+        validate_metadata_scope(meta)?;
     }
     if let Some(ref uri) = update.source_uri {
         validate_source_uri(uri)?;
