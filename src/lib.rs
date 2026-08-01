@@ -114,6 +114,14 @@ pub const REDACTED_PLACEHOLDER: &str = "<redacted>";
 pub const SQL_COUNT_EMBEDDED_MEMORIES: &str =
     "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL";
 
+/// Canonical corpus-size COUNT. v1.0.0 #2583 hoisted it here when the
+/// `/metrics` scrape path stopped calling `db::stats` (eight statements, of
+/// which it used one) and started reading this single count from a paced
+/// background refresher — so `storage::stats` and
+/// `background::memories_gauge` now spell it once, by name, per the pm-v3.1
+/// no-hardcoded-literal-duplication discipline.
+pub const SQL_COUNT_MEMORIES: &str = "SELECT COUNT(*) FROM memories";
+
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner F finding F-F-ROUTE-1) —
 // canonical HTTP route-path consts. The substrate's HTTP router

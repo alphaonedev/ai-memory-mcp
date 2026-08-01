@@ -671,6 +671,23 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
     }
 }
 
+/// v1.0.0 #2579 — COMPOSE a section note instead of replacing it.
+///
+/// A `ReportSection` has ONE note slot but a section can surface several
+/// independent findings (the HNSW-cap advisory and the FTS-integrity verdict
+/// both live in `Index`). A bare `note = Some(..)` silently erases whatever
+/// an earlier probe reported — the second finding hides the first, and which
+/// one survives depends on source order rather than on severity.
+fn append_note(note: &mut Option<String>, extra: &str) {
+    match note {
+        Some(existing) => {
+            existing.push_str(" | ");
+            existing.push_str(extra);
+        }
+        None => *note = Some(extra.to_string()),
+    }
+}
+
 fn section_index(conn: &rusqlite::Connection) -> ReportSection {
     let mut facts = Vec::new();
     let mut severity = Severity::Info;
@@ -709,6 +726,62 @@ fn section_index(conn: &rusqlite::Connection) -> ReportSection {
              P3 will start emitting eviction events"
         ));
     }
+
+    // v1.0.0 #2579 — the FULL FTS5 integrity check, on the explicit
+    // operator-invoked surface. `/health` used to run this on every probe,
+    // which is O(corpus) and holds the WAL write lock; `doctor` is the verb
+    // an operator reaches for on demand, and this section is already
+    // corpus-proportional (the census aggregations below), so the cost is
+    // the point rather than a surprise. The daemon runs the same check on a
+    // paced background cadence and surfaces its cached verdict at
+    // `/api/v1/health.fts_integrity`.
+    //
+    // Before this landed, `doctor` did NOT check the FTS index at all — so
+    // making `/health` cheap without adding it here would have deleted the
+    // codebase's only integrity signal (#2444: a control that reports
+    // success while doing nothing is worse than no control).
+    // The Corrupt-vs-Unavailable split is the SAME discipline the background
+    // checker applies, and for the same reason: "the index disagrees with its
+    // content" and "the check could not be completed" are different findings,
+    // and reporting the second as the first manufactures a corruption alarm out
+    // of (say) lock contention or a connection this process could not use.
+    // The three dispositions differ in VALUE, severity and note — not in which
+    // fact they report — so the key is written ONCE and the match yields the
+    // value. Pushing the same fact in three arms would scatter the key across
+    // three sites (the pm-v3.1 duplication the hardcoded-literal ratchet
+    // blocks) for no gain.
+    let fts_verdict = match crate::db::fts_integrity_check(conn) {
+        Ok(()) => "verified (index agrees with the memories table)".to_string(),
+        Err(e) => match crate::background::fts_integrity::classify_error(&e) {
+            crate::background::fts_integrity::Outcome::Corrupt => {
+                severity = Severity::Critical;
+                append_note(
+                    &mut note,
+                    "the FTS5 index disagrees with the memories table — keyword recall will \
+                     silently return FEWER rows than it should. The durable memory TEXT is \
+                     intact; the index is derived and regenerable. Rebuild it with: \
+                     sqlite3 <db> \"INSERT INTO memories_fts(memories_fts) VALUES('rebuild');\"",
+                );
+                format!("FAILED: {e}")
+            }
+            _ => {
+                // NOT a corruption verdict — do not escalate past Warning, and
+                // never downgrade a Critical some earlier probe already set.
+                if severity != Severity::Critical {
+                    severity = Severity::Warning;
+                }
+                append_note(
+                    &mut note,
+                    "the FTS5 integrity check could not COMPLETE — this is NOT a corruption \
+                     verdict and says nothing about whether the index agrees with the \
+                     memories table. Re-run `ai-memory doctor` when the database is not \
+                     under a concurrent write.",
+                );
+                format!("not verified (check could not complete): {e}")
+            }
+        },
+    };
+    facts.push(("fts_index_integrity".into(), fts_verdict));
 
     ReportSection {
         name: "Index".into(),
