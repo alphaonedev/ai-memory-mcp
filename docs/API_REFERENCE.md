@@ -541,8 +541,21 @@ items (compiled default **1000**; operator-tunable via
 `[limits].max_page_size` / `AI_MEMORY_MAX_PAGE_SIZE`). Exceeding the cap
 returns **400 Bad Request** with an error echoing the configured cap.
 
+The response is a truthful per-row ledger (#2550/#2551/#2552/#2588/#2594):
+
 ```json
-{ "created": 998, "errors": ["item 17: title is required", … ] }
+{
+  "sent": 1000, "created": 996, "updated": 1, "deduped": 1, "rejected": 2,
+  "errors": [
+    { "index": 17, "code": "VALIDATION_FAILED", "field": "create",
+      "error": "validation failed" },
+    { "index": 402, "code": "QUOTA_EXCEEDED", "field": "quota",
+      "error": "quota exceeded" }
+  ],
+  "deduped_rows": [ { "index": 88, "superseded_by": 401 } ],
+  "pending": [],
+  "warnings": []
+}
 ```
 
 Postgres-backed daemons additionally carry `"pending": [ … ]` — the rows
@@ -576,6 +589,27 @@ a governance standard routed to approval instead of writing.
 > [#2588](https://github.com/alphaonedev/ai-memory-mcp/issues/2588). Until
 > that lands, the contract above is what the daemon does — write your
 > client against it.
+`created + updated + deduped + rejected + pending.length === sent` is a
+reconciliation identity a loader can assert on every batch.
+
+| field | meaning |
+|---|---|
+| `created` | rows this call INSERTED |
+| `updated` | rows it upserted onto an existing `(title, namespace)` |
+| `deduped` | input rows whose content was superseded by a LATER row in the SAME batch — the row is NOT what you sent; `deduped_rows[]` gives the input indices |
+| `rejected` | rows not persisted; `errors[]` carries `{index, code, field?, error}` |
+| `pending` | rows queued for governance approval |
+| `warnings` | post-commit replication problems; the rows ARE durable locally |
+
+Optional `embed_status` / `embed_status_reason` appear only when vectorisation
+degraded — the rows are stored but not yet semantically recallable.
+
+**Status.** `200` only when every submitted row landed as its own distinct
+row. `207 Multi-Status` on any partial application. `202 Accepted` when every
+row is queued for approval. When NOTHING was persisted the status is the
+dominant cause, with retryable causes winning: `429` (quota), `503`
+(replication / backend), `500`, `403`, `409`, `400`. A batch that persisted
+nothing is never `200`.
 
 ## Recall + search
 
