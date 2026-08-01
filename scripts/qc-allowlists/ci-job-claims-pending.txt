@@ -60,8 +60,11 @@ ROADMAP.md ci.yml:Code Coverage   #2629 C-24 the possessive citation on the same
 # --- C-23 -------------------------------------------------------------
 docs/v1.0.0/release-notes.md postgres-age  #2629 C-23 job deleted in da3fb9cc
 
-# --- C-21 -------------------------------------------------------------
-PERFORMANCE.md bench.yml:AGE      #2629 C-21 bench.yml declares no AGE job
+# --- C-21 — BURNED DOWN 2026-08-01 ------------------------------------
+# The PERFORMANCE.md correction lane removed the AGE-job citation, so the
+# entry went STALE (NOTICE, gate still green) and came out. The rule is
+# now unsuppressed for that file: naming a job inside a workflow that
+# does not declare it fails outright.
 
 # --- C-31 -------------------------------------------------------------
 PERFORMANCE.md bench.yml          #2629 C-31 advisory workflow described as gating (5 sites)
