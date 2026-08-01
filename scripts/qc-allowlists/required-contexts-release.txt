@@ -136,11 +136,24 @@ Check (windows-latest)
 Cross-compile (aarch64-apple-ios)
 Cross-compile (aarch64-linux-android)
 #
+# THE SUPPLY-CHAIN GATE (#2635). Until #2635 this ran as a STEP inside
+# `Lint (fmt + clippy)` above — which is to say it inherited that job's
+# job-level `if:` and reported `skipped` on a docs-only diff, satisfied. A gate
+# whose entire purpose is to refuse an unexamined `build.rs` was switchable off
+# by a classifier verdict about markdown. It is now its own job with NO
+# job-level `if:` and no `needs:`, so it always runs and always reports a real
+# success/failure — which is what makes it safe to require, on the same
+# argument as the two deciders above.
+Build-script custom-build ledger gate (#2635)
+#
 # ---------------------------------------------------------------------------
 # Carried by .github/workflows/c8-precheck.yml
 # ---------------------------------------------------------------------------
 # Unconditional integrity gates: no `needs:`, no job-level `if:`, no `paths:`
-# filter. These are the nine contexts that genuinely run on every PR.
+# filter. ALL THIRTEEN of this workflow's jobs genuinely run on every PR, and
+# as of #2636 all thirteen are declared here — enforced from now on by rule
+# (f), which fails if any job in a gating workflow is declared neither here nor
+# in the dated ledger `required-contexts-not-required.txt`.
 C8 caller-context allowlist check
 Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10)
 L3-boundary perma-ban gate (§25.3 S5 / RQ-10 #1853)
@@ -150,6 +163,18 @@ Cloud-init ASCII gate
 Test-reachable stdin-read gate (#1989)
 Migration-ladder-uniqueness gate (guardrail-D)
 Test-env $HOME-lock gate (#2146)
+#
+# THE FOUR UNREQUIRED GATES (#2636). These ran on every PR and were required by
+# nothing. The third is THIS GATE — the sole mechanical proof that the other
+# required contexts are creatable, reachable, non-skipping, non-cancelled and
+# non-truncated — so a PR that broke the gate proving the gates work could
+# merge. All four have the same shape as the nine above (no `needs:`, no
+# job-level `if:`, no `paths:` filter), so requiring them carries no wedge risk;
+# the only thing that was ever missing was the declaration.
+Installer checksum fail-closed gate (#2449)
+Non-Rust conformance-reader proof gate (#2452)
+Required-context + classify-base soundness gate (#2494/#2496/#2508)
+Git-dependency-source supply-chain gate (#2050/#2512)
 #
 # ---------------------------------------------------------------------------
 # Carried by .github/workflows/coverage.yml
@@ -166,6 +191,9 @@ Coverage classify (docs-only short-circuit)
 #
 # Job-level `if:`; ratcheted like the ci.yml seven above.
 Per-Module Coverage Thresholds
+Doc symbol/path anchor gate (#2629)
+SDK-path vs routes.rs membership gate (#2629)
+Named-CI-job existence + enforcement-truthfulness gate (#2629)
 #
 # ---------------------------------------------------------------------------
 # KNOWN GAPS — declared here so they are not mistaken for oversights.
@@ -188,9 +216,41 @@ Per-Module Coverage Thresholds
 #     compares the mirror against the WORKFLOWS only — it has no API access,
 #     by design — so nothing here re-checks the live set. Do not treat a
 #     dated live-state line in a comment as a control.
-#   * Two c8-precheck integrity gates run on every PR but are not required:
-#     `Installer checksum fail-closed gate (#2449)` and
-#     `Non-Rust conformance-reader proof gate (#2452)`.
+#   * CLOSED IN THIS FILE, PENDING PROTECTION (#2636 / #2635) — the previous
+#     revision of this section read "Two c8-precheck integrity gates run on
+#     every PR but are not required" and named only #2449 and #2452. That was
+#     WRONG BY TWO, and had been for some time: `Git-dependency-source
+#     supply-chain gate (#2050/#2512)` was never listed, and neither was
+#     `Required-context + classify-base soundness gate (#2494/#2496/#2508)` —
+#     THIS GATE, the sole mechanical proof that every other required context is
+#     sound. The note that was supposed to record the gap was itself the gap.
+#     That is the argument for the machine-parsed ledger that replaced it:
+#     prose cannot fail CI, so prose rots, and a rotted gap note reads exactly
+#     like a closed one.
+#
+#     All four are now DECLARED above, plus `Build-script custom-build ledger
+#     gate (#2635)`, taking this mirror from 24 to 29 declared contexts. Live
+#     `required_status_checks` remains at 24 until the operator makes the
+#     branch-protection call — the ADDITION half of the ORDER doctrine above
+#     (mirror first, protection after: prove, then enforce). The intermediate
+#     state over-claims enforcement for one visible, diffable window and blocks
+#     nothing, because GitHub never reads this file.
+#
+#     Rule (f) of `scripts/check-required-contexts.sh` now makes this class
+#     unable to re-land: every job in `ci.yml` / `c8-precheck.yml` /
+#     `coverage.yml` must be declared here or in
+#     `required-contexts-not-required.txt`, dated and issue-tracked. That
+#     ledger is EMPTY today, which is the passing state — every job in every
+#     gating workflow is declared required.
+#   * NOT COVERED by rule (f), and named here rather than left implicit: the
+#     ~45 jobs in the other fourteen workflows (`release.yml`,
+#     `publish-sdks.yml`, `yank.yml`, `bench.yml`, `fuzz.yml`, …). They do not
+#     fire on `pull_request` and are not gating, so requiring them is not
+#     meaningful; sweeping them into the ledger would produce a junk drawer
+#     that teaches readers to skim past it. Rules (d) and (e) DO sweep them,
+#     because those detect static defects rather than policy judgements. The
+#     gate hard-fails if a mirror context ever appears in a workflow outside
+#     the covered set, so this scope cannot silently narrow.
 #   * `main` and `develop` require only `Check (ubuntu/macos/windows-latest)`.
 #     That is the #2496 exposure: those three are the vacuous-success job, so
 #     the branch that ships is the least protected in fact. Out of scope here.
