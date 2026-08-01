@@ -1453,8 +1453,32 @@ to `{}`. That step is what makes it catch C-20: a raw-string membership
 test PASSES it (the collection path IS registered) and a
 parameter-blind test passes it too; only normalisation makes
 `/api/v1/subscriptions/{}` a non-member while
-`/api/v1/memories/{}` stays a member. PENDING-FIX ledger
-`scripts/qc-allowlists/sdk-route-paths-pending.txt`. `--self-test`
+`/api/v1/memories/{}` stays a member.
+
+**A path is a CLAIM only where it is a CALL.** This is the property
+that decides whether the gate is usable at all: a rule that greps RAW
+FILE TEXT fails on the CORRECTED tree, not the broken one. The
+C-19/C-20 fix deletes the three dead methods and repoints
+`unsubscribe`, but its BREAKING-CHANGE notes NAME the dead paths in
+order to explain them — ``// `cluster()` was REMOVED at v1.0.0. It
+posted to `/api/v1/cluster` …`` in the clients, a docstring narrating
+the old `unsubscribe` shape, a migration paragraph in each README.
+Failing those would force the removal notes to be deleted, and the
+migration note is precisely the thing that stops an integrator
+re-adding the method. So extraction is scoped by construction, not by
+allowlist: `.ts`/`.js` with comments stripped (`//`, `/* */`, JSDoc
+`*` continuations), `.py` with `#` comments AND triple-quoted
+docstrings stripped, and READMEs restricted to TABLE ROWS and FENCED
+CODE (a method-signature cell documents a live call; a prose paragraph
+explaining a removal does not). **The acceptance criterion is the
+PAIR** — RED on the pre-fix tree, GREEN on the corrected one — and the
+self-test's clean-control leg carries the verbatim removal-note shapes
+so a regression to raw-text matching fails there immediately. The scan
+set is `sdk/**` BY PATTERN, never an enumerated file list:
+`sdk/python/ai_memory/async_client.py` carried all four defects and
+appears nowhere in the 429-line claims register, so a gate scoped to
+the files the register named would have missed it entirely. PENDING-FIX
+ledger `scripts/qc-allowlists/sdk-route-paths-pending.txt`. `--self-test`
 plants C-19 in the TS client, the python client and BOTH READMEs and
 C-20 in the TS client and its README, with near-miss controls that must
 PASS: a correctly-templated member path in each SDK dialect, a

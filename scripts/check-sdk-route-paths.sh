@@ -128,6 +128,39 @@ MDEOF
         cat > "$FIX/sdk/python/README.md" <<'MDEOF'
 | `health()` | `/api/v1/health` | Liveness. |
 MDEOF
+        # REMOVAL-NOTE CONTROLS. These are the VERBATIM shapes the
+        # C-19/C-20 correction leaves behind, and every one must PASS.
+        # A gate that greps raw text fails HERE -- on the FIXED tree --
+        # and the only way to green it would be to delete the migration
+        # notes, which are the thing that stops an integrator re-adding
+        # the method. Acceptance for this rule is the PAIR: RED on the
+        # pre-fix tree, GREEN on the corrected one.
+        cat >> "$FIX/sdk/typescript/src/client.ts" <<'TSEOF'
+  /**
+   * `unsubscribe` no longer sends `DELETE /api/v1/subscriptions/:id`,
+   * which no route matches: the id rides the query string.
+   */
+  // `grant()` and `revoke()` were REMOVED at v1.0.0. They posted to
+  // `/api/v1/memories/:id/grant` and `/api/v1/memories/:id/revoke`,
+  // which the daemon does not register.
+  // `cluster()` was REMOVED at v1.0.0. It posted to `/api/v1/cluster`.
+TSEOF
+        cat >> "$FIX/sdk/python/ai_memory/client.py" <<'PYEOF'
+def _migration_notes():
+    """The pre-v1.0.0 SDK sent ``DELETE /api/v1/subscriptions/{id}``,
+    which no route matches."""
+    # Removed at v1.0.0: ``/api/v1/memories/{id}/grant``,
+    # ``/api/v1/memories/{id}/revoke`` and ``/api/v1/cluster`` -- the
+    # daemon registers none of them.
+    return None
+PYEOF
+        cat >> "$FIX/sdk/typescript/README.md" <<'MDEOF'
+
+`grant()` / `revoke()` / `cluster()` were removed at v1.0.0. They posted to
+`/api/v1/memories/:id/grant`, `/api/v1/memories/:id/revoke` and
+`/api/v1/cluster`, none of which the daemon registers. `unsubscribe` no
+longer sends `DELETE /api/v1/subscriptions/:id`.
+MDEOF
     }
 
     write_clean
@@ -305,11 +338,151 @@ if not registered:
     print("SSOT\t-\t0\t-\troutes.rs yielded ZERO path consts")
     raise SystemExit(0)
 
-# ---- 2/3. SDK literals, normalised the same way ----------------------
-# A template literal's `${...}` may itself contain `/`, `)` and quotes
-# (`${encodeURIComponent(id)}`), so `${...}` is consumed as one unit
-# BEFORE the ordinary terminator class applies.
-LITERAL = re.compile(r"/api/v1/(?:\$\{[^}]*\}|[^\s\"'`)\]|,;<>]|<[^>]*>)*")
+# ---- 2/3. SDK literals, from CALL SITES ONLY -------------------------
+#
+# THE SUBTLETY THAT DECIDES WHETHER THIS GATE IS USABLE. A gate that
+# greps RAW FILE TEXT for `/api/v1/...` and asserts membership fails on
+# the CORRECTED tree, not the broken one. The C-19/C-20 fix deletes the
+# three dead methods and repoints `unsubscribe`, but its BREAKING-CHANGE
+# notes NAME the dead paths in order to explain them -- `// cluster() was
+# REMOVED at v1.0.0. It posted to /api/v1/cluster ...` in the clients,
+# and a migration paragraph in each README. Failing those would force
+# the removal notes to be deleted, and the migration note is precisely
+# the thing that stops an integrator re-adding the method. So a path is
+# a CLAIM only where it is a CALL:
+#
+#   .ts/.js   comments stripped (`//`, `/* */`, and the JSDoc `*`
+#             continuations they contain), then any quoted or template
+#             literal in the remaining CODE. That covers BOTH the `path:`
+#             property of a `this.call({...})` object literal AND a bare
+#             positional argument on its own line inside a multi-line
+#             `client.raw<T>("GET", "/api/v1/capabilities")`.
+#   .py       `#` comments AND triple-quoted docstrings stripped, then
+#             any quoted or f-string literal. The docstring strip is
+#             load-bearing, not tidiness: the CORRECTED `unsubscribe`
+#             docstring narrates the OLD path, and `profile.py`'s
+#             Protocol docstring quotes a `_request(...)` call shape.
+#   README.md TABLE ROWS and FENCED CODE ONLY. A method-signature table
+#             cell documents a live call; a prose paragraph explaining a
+#             removal does not.
+#
+# Everything in a comment, a docstring, a blockquote or a prose
+# paragraph is therefore out of scope BY CONSTRUCTION rather than by
+# allowlist -- which is the only form of the rule that can be GREEN on
+# the fixed tree and RED on the broken one.
+QUOTED = re.compile(
+    r"""(?P<q>["'`])(?P<p>/api/v1/(?:\$\{[^}]*\}|(?!(?P=q))[^\n])*)(?P=q)""")
+MD_LITERAL = re.compile(r"/api/v1/(?:\{[^}]*\}|[^\s\"'`)\]|,;<>]|<[^>]*>)*")
+
+
+def strip_ts_comments(text):
+    """Blank `//` and `/* */` comments, preserving line numbering.
+
+    String state is tracked so a `//` inside a literal (a URL in a
+    default value) does not open a comment.
+    """
+    out = []
+    i, n = 0, len(text)
+    in_block = False
+    in_line = False
+    in_str = None
+    while i < n:
+        c = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if in_line:
+            if c == "\n":
+                in_line = False
+                out.append(c)
+            else:
+                out.append(" ")
+        elif in_block:
+            if c == "*" and nxt == "/":
+                in_block = False
+                out.append("  ")
+                i += 2
+                continue
+            out.append("\n" if c == "\n" else " ")
+        elif in_str is not None:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == in_str:
+                in_str = None
+        elif c == "/" and nxt == "/":
+            in_line = True
+            out.append("  ")
+            i += 2
+            continue
+        elif c == "/" and nxt == "*":
+            in_block = True
+            out.append("  ")
+            i += 2
+            continue
+        else:
+            if c in ('"', "'", "`"):
+                in_str = c
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+TRIPLE = ('"""', "'''")
+
+
+def strip_py_comments(text):
+    """Blank `#` comments and triple-quoted docstrings, line-preserving."""
+    out = []
+    fence = None
+    for line in text.split("\n"):
+        if fence is not None:
+            if fence in line:
+                fence = None
+            out.append("")
+            continue
+        opened = None
+        for q in TRIPLE:
+            idx = line.find(q)
+            if idx != -1 and (opened is None or idx < line.find(opened)):
+                opened = q
+        if opened is not None:
+            head, _, rest = line.partition(opened)
+            if opened in rest:
+                # Opens and closes on one line: keep only the code head.
+                out.append(head)
+            else:
+                out.append(head)
+                fence = opened
+            continue
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            out.append("")
+            continue
+        if "#" in line:
+            # No SDK path literal contains `#`, so splitting at the first
+            # `#` is exact here; the acceptance run against the corrected
+            # branch is the standing proof.
+            line = line.split("#", 1)[0]
+        out.append(line)
+    return "\n".join(out)
+
+
+def md_call_sites(text):
+    """Keep table rows and fenced code; blank prose, line-preserving."""
+    out = []
+    fenced = False
+    for line in text.split("\n"):
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+            out.append("")
+            continue
+        if fenced or line.lstrip().startswith("|"):
+            out.append(line)
+        else:
+            out.append("")
+    return "\n".join(out)
+
 
 for f in sdk_files:
     try:
@@ -317,13 +490,20 @@ for f in sdk_files:
     except OSError:
         continue
     rel = f[len(root) + 1:] if f.startswith(root + "/") else f
-    for ln, line in enumerate(text.splitlines(), 1):
-        for hit in LITERAL.finditer(line):
-            raw = hit.group(0)
+    if f.endswith((".ts", ".js")):
+        scanned, quoted_only = strip_ts_comments(text), True
+    elif f.endswith(".py"):
+        scanned, quoted_only = strip_py_comments(text), True
+    else:
+        scanned, quoted_only = md_call_sites(text), False
+    pattern = QUOTED if quoted_only else MD_LITERAL
+    for ln, line in enumerate(scanned.split("\n"), 1):
+        for hit in pattern.finditer(line):
+            raw = hit.group("p") if quoted_only else hit.group(0)
             norm = normalise(raw)
             # A bare `/api/v1` / `/api/v1/` is the base-URL prefix, not a
-            # route claim (it appears in SDK prose and in the client's
-            # own base-path constant).
+            # route claim (it appears in the client's own base-path
+            # constant and in SDK prose).
             if norm in ("/api/v1", "/api/v1/"):
                 continue
             if norm in registered:

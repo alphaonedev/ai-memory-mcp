@@ -64,6 +64,74 @@ fn normalise_path(raw: &str) -> String {
         .join("/")
 }
 
+/// Keep only the CALL-SITE lines of an SDK file.
+///
+/// A raw-text scan fails on the CORRECTED tree, not the broken one: the
+/// C-19/C-20 fix deletes the dead methods but its BREAKING-CHANGE notes
+/// NAME the dead paths in order to explain them (`// cluster() was
+/// REMOVED at v1.0.0. It posted to /api/v1/cluster ...`, a docstring
+/// narrating the old `unsubscribe` shape, a README migration
+/// paragraph). Failing those would force the removal notes to be
+/// deleted — and the migration note is the thing that stops an
+/// integrator re-adding the method. So comments, docstrings and prose
+/// are out of scope BY CONSTRUCTION. This mirrors
+/// `scripts/check-sdk-route-paths.sh`; the two are checked against each
+/// other by both being run on the same tree.
+fn call_site_lines(path: &Path, text: &str) -> Vec<(usize, String)> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let is_md = name.ends_with(".md");
+    let is_py = name.ends_with(".py");
+    let mut out = Vec::new();
+    let mut fenced = false;
+    let mut docstring: Option<&str> = None;
+    for (idx, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if is_md {
+            if trimmed.starts_with("```") {
+                fenced = !fenced;
+                continue;
+            }
+            if fenced || trimmed.starts_with('|') {
+                out.push((idx + 1, line.to_string()));
+            }
+            continue;
+        }
+        if is_py {
+            if let Some(fence) = docstring {
+                if line.contains(fence) {
+                    docstring = None;
+                }
+                continue;
+            }
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            let opener = ["\"\"\"", "'''"]
+                .into_iter()
+                .filter(|q| line.contains(q))
+                .min_by_key(|q| line.find(q).unwrap_or(usize::MAX));
+            if let Some(q) = opener {
+                let (head, rest) = line.split_once(q).unwrap_or((line, ""));
+                if !rest.contains(q) {
+                    docstring = Some(q);
+                }
+                out.push((idx + 1, head.to_string()));
+                continue;
+            }
+            let code = line.split('#').next().unwrap_or(line);
+            out.push((idx + 1, code.to_string()));
+            continue;
+        }
+        // .ts / .js: line comments and JSDoc continuations carry the
+        // removal notes; the call sites never start with them.
+        if trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("/*") {
+            continue;
+        }
+        out.push((idx + 1, line.to_string()));
+    }
+    out
+}
+
 /// Every `/api/v1/...` literal on a line, with `${...}` consumed whole
 /// so a TS template expression containing `(` or `)` stays one segment.
 fn extract_api_paths(line: &str) -> Vec<String> {
@@ -199,8 +267,9 @@ fn sdk_route_paths_resolve_against_routes_rs_2629() {
             .unwrap_or(file)
             .to_string_lossy()
             .replace('\\', "/");
-        for (ln, line) in read(file).lines().enumerate() {
-            for raw in extract_api_paths(line) {
+        let text = read(file);
+        for (ln, line) in call_site_lines(file, &text) {
+            for raw in extract_api_paths(&line) {
                 let norm = normalise_path(&raw);
                 if norm == "/api/v1" || norm == "/api/v1/" || registered.contains(&norm) {
                     continue;
