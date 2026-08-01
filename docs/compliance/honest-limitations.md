@@ -122,9 +122,9 @@ During Task I deep-verification of issue #1153, three substrate-level gap-fix ca
 
 | # | Candidate | NSA-CSI-related concern tightened | Current posture | v0.7.x landing |
 |---|---|---|---|---|
-| 1 | **Daemon `serverInfo` Ed25519 signing at MCP initialize handshake** | Tool invocation path confusion (NSA concern j) | ✅ **CLOSED via #1154 in this PR** — `src/mcp/server_identity.rs` ships daemon-Ed25519-signed `ai_memory_identity` block at MCP initialize handshake; 47 dedicated tests pin the contract | #1154 SHIPPED |
-| 2 | **`Accept-Provenance: verbose` capability negotiation flag** | Filter/monitor output pipelines (NSA recommendation f) — closes consumer-default friction | MCP wire default `verbose_provenance=true` already ships at v0.7.0 per `src/mcp/tools/recall.rs:490`. Only the HTTP `Accept-Provenance` header remains as net-new wire surface — minor polish, NOT a coverage gap. | #1155, v0.7.x follow-up |
-| 3 | **Per-namespace rate-limit dimension extension (K8 quota → (agent_id, namespace) compound)** | Denial of service (NSA concern h) — defense-in-depth | K8 quota dimension is per-agent only | #1156, v0.7.x follow-up (requires schema v50 migration) |
+| 1 | **Daemon `serverInfo` Ed25519 signing at MCP initialize handshake** | Tool invocation path confusion (NSA concern j) | ✅ **CLOSED via #1154** — `src/mcp/server_identity.rs` ships daemon-Ed25519-signed `ai_memory_identity` block at MCP initialize handshake; 47 dedicated tests pin the contract | #1154 SHIPPED |
+| 2 | **`Accept-Provenance: verbose` capability negotiation flag** | Filter/monitor output pipelines (NSA recommendation f) — closes consumer-default friction | MCP wire default `verbose_provenance=true` already ships (the recall tool's verbose-provenance default, `mcp::tools::recall`). Only the HTTP `Accept-Provenance` header remains as net-new wire surface — minor polish, NOT a coverage gap. | #1155 SHIPPED |
+| 3 | **Per-namespace rate-limit dimension extension (K8 quota → (agent_id, namespace) compound)** | Denial of service (NSA concern h) — defense-in-depth | K8 quota dimension is per-agent only | #1156 SHIPPED (schema v50) |
 
 All three shipped. With #1154, concern (j) has no partial-coverage edge left; #1155 and #1156 are defense-in-depth on recommendation (f) and concern (h).
 
