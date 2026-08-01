@@ -413,6 +413,18 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // deliberately does not claim. MEASURED post-change: 27_609.
     // Ceiling 27_400 -> 27_700 (+91 headroom). Bumped in LOCKSTEP with the
     // postgres.rs entry below (same commit, same issue).
+    //
+    // 2026-07-31 (#2580) — `build_list_query` gains the exact
+    // metadata-equality axis (the GIN/`json_each` pushdown that stops
+    // `memory_load_family` materialising 1000 rows to return 0) and `list`
+    // splits into the historical 11-arg shape plus `list_filtered`, so the
+    // ~30 existing `db::list` call sites stay untouched. The bulk is the
+    // WHY comment: the predicate rides the SHARED builder precisely so the
+    // #1948 lifecycle allow-list, the expiry guard, the #1579 sargable
+    // namespace arm, the #1834 AS-OF window and the #2383 undecryptable-row
+    // skip all keep applying — a bespoke query would have to re-derive
+    // every one of them. MEASURED post-change: 27_746.
+    // Ceiling 27_700 -> 27_820 (+74 headroom).
     // 2026-07-31 (#2579 liveness-probe O(corpus)) — `health_check` ran a full
     // FTS5 `'integrity-check'` (which re-tokenizes the whole corpus AND is
     // prepared as a WRITER) plus a `COUNT(*)` on EVERY `/health` request. It
@@ -423,7 +435,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // function states what it proves, what it deliberately does NOT prove,
     // and where the signal it dropped now lives. MEASURED post-change:
     // 27_755. Ceiling 27_700 -> 27_820 (+65 headroom).
-    ("src/storage/mod.rs", 27_820),
+    // 2026-07-31 MERGE (#2580 + #2579) — both lanes bumped this ceiling to
+    // 27_820 independently, from DIFFERENT pre-merge measurements (27_746 and
+    // 27_755). Both sets of lines are now in the file, so neither figure is
+    // the merged truth and the coincidentally-equal ceiling is NOT evidence
+    // the merge fits. Re-MEASURED on the merged file: 27_828.
+    // Ceiling 27_820 -> 27_900 (+72 headroom).
+    ("src/storage/mod.rs", 27_900),
     // 2026-07-21 (#1802 R-05 S1) — NEW submodule extracted from
     // storage/mod.rs (doctor / observability probes). Measured 698;
     // ceiling 800 (+102).
