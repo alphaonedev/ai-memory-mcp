@@ -44,12 +44,16 @@
 #   current release 1.0.0 (Cargo.toml)
 # ---------------------------------------------------------------------
 
-# --- README.md (register 3.3.1 — the five shapes that slipped) --------
-README.md CURRENT_RELEASE_ATTRIBUTION v0.9.0            #2492 "v0.9.0 - current release" paragraph lead; carries schema v78 / 101 tools / 92 routes / 89-87 CLI / 28-field Memory
-README.md EXPECTED_PRODUCTION_ROUTES_COUNT 93           #2492 "93 REST route registrations (80 unique URL paths)" x4
-README.md EXPECTED_PRODUCTION_ROUTES_COUNT 92           #2492 "**92** HTTP routes (**78** unique paths)"
-README.md EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT 78     #2492 same line as the 92-routes claim
-README.md Profile::full().expected_tool_count() 101     #2492 "101-entry surface" x3 in the feature-tier table
+# --- README.md — BURNED DOWN 2026-08-01 -------------------------------
+# All five README entries were deleted when the README-correction lane
+# merged (#2654). Their NOTICEs were the instruction to delete them, and
+# this is the first live exercise of that loop: the lane landed, the
+# gate went from "5 suppressed" to "5 stale NOTICEs, still green", and
+# the lines came out. The five claims are now HARD-ENFORCED with no
+# suppression: 94 routes / 80 unique paths / 103 tools at
+# `--profile full` / 30-field Memory / schema 88 / 89 CLI default + 91
+# sal, and any paragraph calling itself the current release must name
+# the Cargo.toml version.
 
 # --- ROADMAP.md -------------------------------------------------------
 ROADMAP.md Profile::full().expected_tool_count() 101    #2492 ":13 Production version: v0.9.0 (schema v78, 101 MCP tools at `--profile full`)"
