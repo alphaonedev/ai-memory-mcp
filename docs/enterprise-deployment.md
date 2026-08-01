@@ -1,7 +1,19 @@
 ---
 layout: doc
 ---
-# Enterprise deployment topologies for ai-memory v0.7.0
+# Enterprise deployment topologies for ai-memory v1.0.0
+
+> **Version currency.** This document was authored against v0.7.0 and
+> carries v0.7.0-era references throughout. It has been re-adjudicated
+> against v1.0.0 for its **claims** (§9.4 topology, §11.1 capacity,
+> §11.2 vector sizing, §14.6 encryption, §7.4 residency, §6.6 DLQ, and
+> the auth-layer summary in §1), but the surrounding narrative — gap
+> lists, tier tables, and version-stamped runbooks — still describes the
+> v0.7.0 substrate unless a callout says otherwise. Where this document
+> and [`federation.md`](federation.html) /
+> [`production-deployment.md`](production-deployment.html) disagree,
+> **those are newer**. Several v1.0.0 fail-closed defaults are NOT
+> reflected in the v0.7.0-stamped checklists below; §14.3 lists them.
 
 **Audience.** Subject-matter-expert software engineers and architects
 landing `ai-memory` + agents into a production fleet. Reading-time:
@@ -40,11 +52,21 @@ cross-reference for "how do I wire the LLM at T2+ topologies."
    Identity material, mTLS allowlists, storage backend choice, topology,
    and backup cadence are operator decisions ([`production-deployment.md`
    §1](production-deployment.html)).
-2. Federation peers default-deny. The three concurrent auth layers
-   (mTLS allowlist at the transport, `X-API-Key` at the application,
-   per-peer attestation at identity) are enforced together — a peer
-   that satisfies two but not the third **cannot push or fan-out**
-   into the local store ([`federation.md`](federation.html)).
+2. Federation peers default-deny across three auth layers — mTLS
+   allowlist at the transport, `X-API-Key` at the application, and
+   per-peer attestation at identity. **They are not all enforced on
+   every path.** Under an enforced mTLS posture the `/api/v1/sync/*`
+   federation endpoints **bypass the api-key layer by design**
+   ([#702](https://github.com/alphaonedev/ai-memory-mcp/issues/702)) —
+   the peer has already cleared a stronger transport gate, and the
+   `X-Memory-Sig` requirement binds the claimed peer-id to an enrolled
+   key. So on the federation path the enforced stack is
+   **mTLS + signature + nonce + attestation**, not mTLS + api-key +
+   attestation. All non-federation surfaces do require the key. An
+   earlier revision of this line claimed a peer satisfying "two but not
+   the third cannot push or fan-out"; [`federation.md`](federation.html)
+   §"Layer 2" documents the bypass correctly and this line now agrees
+   with it.
 3. Per-message Ed25519 signing (`X-Memory-Sig`) + nonce freshness
    (`X-Memory-Nonce`) are the v0.7.0 defaults on `/sync/push` (env
    vars `AI_MEMORY_FED_REQUIRE_SIG=1` + `AI_MEMORY_FED_REQUIRE_NONCE=1`,
@@ -138,16 +160,38 @@ mutex is required. The HTTP daemon uses `Arc<Mutex<Connection>>`
 lock contention is the bottleneck under concurrent HTTP load but at
 T1 scale (1 agent, single-host) the contention is unobservable.
 
-### 2.4 Resource footprint (reference: Apple M2, 16 GB)
+### 2.4 Resource footprint
+
+> **Provenance.** This table is an **order-of-magnitude sizing estimate**,
+> not a recorded benchmark run: no host spec, binary revision, date, or
+> iteration count was captured with it, and no in-tree harness produces
+> it. An earlier revision attributed it to "Apple M2, 16 GB" — that
+> machine is the **LongMemEval retrieval-quality** reference
+> (`benchmarks/longmemeval/methodology.md` §1), a different measurement
+> family, and the attribution could not be substantiated for these
+> figures. Treat the rows as magnitudes to plan around and measure your
+> own; the latency budgets in [`PERFORMANCE.md`](../PERFORMANCE.md) are
+> the numbers that are actually pinned.
 
 | Resource | Cold | 100k memories | 1M memories |
 |---|---|---|---|
 | RSS | ~25 MB | ~80 MB | ~250 MB |
 | DB on disk | ~2 MB | ~120 MB | ~1.1 GB |
-| HNSW in RAM | n/a | ~40 MB | ~400 MB |
+| HNSW in RAM | n/a | ~40 MB | **see note** |
 | FTS5 index | ~0.5 MB | ~25 MB | ~220 MB |
 | First-recall latency | <5 ms | 8–12 ms | 15–25 ms |
 | HNSW rebuild (async, background) | n/a | <100 ms | ~3 s |
+
+> ⚠️ **The 1M-memory HNSW cell is not a footprint you will observe by
+> default.** The in-memory index is capped at
+> `hnsw::DEFAULT_MAX_ENTRIES = 100_000` and **evicts oldest** past the
+> cap, so a stock daemon at 1M memories holds the ~40 MB 100k index, not
+> a ~400 MB one — and 900k rows are outside ANN reach while remaining
+> fully FTS/keyword-recallable. An earlier revision published ~400 MB
+> here, which implied a residency this build does not provide. Raise
+> `AI_MEMORY_VECTOR_INDEX_CAPACITY` to buy the larger index (and pay the
+> RAM), or set `AI_MEMORY_VECTOR_INDEX_HARD_FAIL=1` to be refused loudly
+> at the cap instead of silently degraded. See §11.2.
 
 The HNSW double-buffer (`active` / `warming`) lands at v0.7.x
 post-#968: `active` continues to serve reads while the next-graph
@@ -868,8 +912,27 @@ cost stays predictable).
 ### 6.6 Federation push DLQ
 
 A push to a peer that fails (network error, peer down, peer-side
-refusal) is **not lost** — it lands in the `federation_push_dlq`
+refusal) is **durably queued** — it lands in the `federation_push_dlq`
 table (added schema v48; `src/federation/sync.rs:464+`). A
+
+> ⚠️ **The queued payload can be replayed to the WRONG peer.** The
+> durable DLQ key is a **positional index**: peers are identified as
+> `format!("peer-{i}")` (`src/federation/peer.rs`) with the URL dropped
+> from the identity, and replay resolves the row by
+> `config.peers.iter().find(|p| p.id == row.peer_id)`
+> (`src/federation/push_dlq.rs`). **Removing one peer from
+> `--quorum-peers` reindexes every id above it**, so `find()` succeeds
+> against a different host: the queued full memory payload is delivered
+> to an unintended peer and the intended peer never receives it — with
+> no counter and no error
+> ([#2442](https://github.com/alphaonedev/ai-memory-mcp/issues/2442)).
+> Until that lands, treat any edit to the peer list as requiring a
+> **drained DLQ first** (`ai_memory_federation_push_dlq_depth == 0`),
+> and never reorder or remove peers with rows in flight. "Not lost" is
+> therefore not a guarantee this document can make; "durably queued,
+> replayed by position" is.
+
+A
 background worker (`replay_federation_push_dlq`) re-attempts the
 push on a fixed cadence; after exhausting the operator-configured
 retry budget the row is quarantined (counted via the
@@ -994,8 +1057,30 @@ ai-memory does not provide a turnkey GDPR layer; it provides the
 
 The operator's data-residency policy is encoded in the **namespace
 allowlist** + the **federation peer attestation** + the **`forget`
-operation** + the **archive-purge cadence**. The substrate enforces
-the policy; the operator owns the policy.
+operation** + the **archive-purge cadence**. The operator owns the
+policy; the substrate enforces it **in one direction**.
+
+> ⚠️ **Residency has two directions and only the outbound one is
+> gated.** On the **SERVE** direction (`/sync/since`, a peer pulling
+> from you) `namespace_allowed_test_glob` is applied default-deny
+> before any row crosses the wire — that half is real. On the
+> **ACCEPT** direction the pull-accept path
+> (`src/federation/receive.rs`) runs as
+> `CallerContext::for_admin(FEDERATION_CATCHUP)` with
+> `bypass_visibility = true` and never consults `PeerAttestationConfig`
+> at all, so a peer you pull from can place rows into any namespace on
+> your node — including `(title, namespace)` dedup-overwrites of rows
+> already there
+> ([#2480](https://github.com/alphaonedev/ai-memory-mcp/issues/2480)).
+> The `links[]` and `signals[]` push lanes are likewise unscoped
+> ([#2489](https://github.com/alphaonedev/ai-memory-mcp/issues/2489)).
+>
+> For a residency control, that means: **what leaves your region is
+> gated; what arrives is not.** If your obligation is only "our data
+> must not leave region X", the serve-direction gate meets it. If it is
+> also "no foreign-origin data may land in region X's namespaces", the
+> substrate does not yet enforce that — pull only from peers you
+> administer.
 
 ### 7.5 DNS + routing strategy
 
@@ -1235,7 +1320,17 @@ A production hive needs more than what v0.7.0 ships. The gaps:
 
 For an operator piloting a hive in v0.7.0, the responsible shape is:
 
-1. **Three T5 clusters** (one per region or per tenant), each running its own Postgres + AGE + ai-memory peers.
+1. **Three T5 clusters** (one per region), each running its own Postgres + AGE + ai-memory peers.
+   **Not one per tenant.** An earlier revision of this line offered
+   "one per region **or per tenant**", which contradicts §8.8 of this
+   same document: *"if subsets of peers should NOT see each other's
+   data, the swarm shape is wrong."* Cross-cluster federation replicates
+   **plaintext** memory content ([#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968))
+   and `PeerScope.allowed_namespaces` is not consulted on three inbound
+   write lanes ([`federation.md`](federation.html) §"Layer 3 — Peer
+   attestation"), so a per-tenant mesh is a topology this substrate
+   disclaims elsewhere. For mutually distrusting tenants use **separate
+   deployments**, not one federated hive with scopes.
 2. **Mesh federation between the three** via the T6 wire shape (signed + nonce + attestation).
 3. **Strict trust gates** — every cross-cluster `PeerScope` row narrows to specific allowed namespaces. No `**` globs cross-cluster.
 4. **Per-cluster signed-events chain** — each cluster verifies independently. No global chain; V-4 is per-host tamper-evidence.
@@ -1386,28 +1481,45 @@ against a silent AGE-perf regression.
 
 ## 11. Capacity planning
 
-### 11.1 Memory rows / second sustained throughput
+### 11.1 Sustained throughput — NOT PUBLISHED
 
-Reference numbers from the in-tree benchmark suite (`benches/recall.rs`,
-`benches/reflect.rs`, `benches/reranker_throughput.rs`,
-`benches/hnsw_rebuild_async.rs`,
-`benches/age_vs_cte.rs`,
-`benches/longmemeval_reflection.rs`,
-`benches/harness_bench.rs`):
+**This section previously carried a 14-cell ops/s table attributed to
+the in-tree benchmark suite. Eleven of those fourteen cells had no
+producer in `benches/` at all, and the entire Postgres+AGE column came
+from a bench that `exit 0`s unless `AI_MEMORY_TEST_AGE_URL` is
+exported. The table is removed rather than annotated: an unproduced
+number is not data, and this is the section a capacity plan is built
+from.**
 
-| Workload | SQLite (M2, 16 GB) | Postgres+AGE (8c/32 GB NVMe) |
+What the seven in-tree benches actually measure, verified at HEAD:
+
+| Bench | What it produces | Does it produce ops/s for a workload below? |
 |---|---|---|
-| `memory_store` (single, no embedder) | 1500 ops/s | 800 ops/s |
-| `memory_store` (single, with embedder) | 80 ops/s (CPU-bound on MiniLM) | 80 ops/s (same) |
-| `memory_recall` (hybrid, hot HNSW) | 250 ops/s | 400 ops/s |
-| `memory_recall` (cold) | 50 ops/s | 120 ops/s |
-| HNSW rebuild (async, 100k vectors) | 3 s background; reads served from `active` | 5 s background; pgvector index rebuild |
-| `kg_query` (depth=5, 1k entities) | 80 ops/s (CTE) | 120 ops/s (AGE Cypher, ≥30% faster — S76 gate) |
-| Federation `/sync/push` (5-memory batch) | 40 ops/s | 80 ops/s |
+| `benches/recall.rs`, `reflect.rs`, `reranker_throughput.rs`, `longmemeval_reflection.rs`, `harness_bench.rs` | Criterion **latency** distributions on SQLite | No |
+| `benches/hnsw_rebuild_async.rs` | Async HNSW rebuild wall-clock at a **5,000**-vector default fixture (`DEFAULT_FIXTURE_SIZE`) | No — and note it is 5k, not the 100k an earlier revision extrapolated to |
+| `benches/age_vs_cte.rs` | `kg_query` depth=5, AGE vs relational CTE — the **only** Postgres-touching bench; **self-skips with `exit 0`** unless `AI_MEMORY_TEST_AGE_URL` is set | Only under a live AGE instance an operator supplies |
+| — | `memory_store` ops/s, `memory_recall` cold/hot ops/s, `/sync/push` ops/s, on **either** backend | **No producer exists.** |
 
-Parity is enforced by `tests/recall_scoring_parity.rs` (Wave 1 Stream
-A) — the same query returns the same top-K with the same per-factor
-score breakdown within FP tolerance across both backends.
+**What to size against instead.** Use the published **latency budgets**
+— those are real, mechanically pinned in both directions against
+`src/bench.rs`, and reproducible on your own hardware:
+
+```sh
+ai-memory bench --scale 10000 --json    # record CPU / RAM / disk alongside the output
+```
+
+See [`PERFORMANCE.md`](../PERFORMANCE.md) for the budget tables and the
+methodology, and treat throughput as something you must measure on your
+own hardware and workload mix. If you need a committed throughput
+figure for a procurement gate, run the measurement and record the host —
+do not carry a number forward from this document, because there is no
+longer one here to carry.
+
+**What is still true and enforced:** cross-backend recall parity. The
+same query returns the same top-K with the same per-factor score
+breakdown within FP tolerance across SQLite and Postgres, pinned by
+`tests/recall_scoring_parity.rs` (Wave 1 Stream A). That is a
+correctness guarantee, not a performance one.
 
 ### 11.2 HNSW vector index footprint per million memories
 
@@ -1420,8 +1532,25 @@ score breakdown within FP tolerance across both backends.
 
 Pgvector lives on disk and pages on demand — corpora of 10M+ memories
 are practical on Postgres but require ≥64 GB RAM for hot working set.
-SQLite's in-memory HNSW caps at host RAM — practical for ≤5 M
-memories at 16 GB.
+
+> ⚠️ **The SQLite in-memory index is capped at 100,000 entries by
+> default, not by host RAM.** `hnsw::DEFAULT_MAX_ENTRIES = 100_000`;
+> past the cap the index **evicts the oldest entries** (loud WARN +
+> `on_index_eviction` hook). An enterprise sized at 1M–5M memories on
+> SQLite gets **semantic recall silently truncated to the newest ~100k
+> rows** unless the cap is raised — the rest stay keyword/FTS-recallable
+> but drop out of ANN. Earlier revisions of this section sized against
+> host RAM and never named the knob.
+>
+> The knob is `AI_MEMORY_VECTOR_INDEX_CAPACITY` (or
+> `[limits].vector_index_capacity`). Raising it moves the cliff; it does
+> not remove it, and the RAM table above is what you pay per million
+> entries once you do. `AI_MEMORY_VECTOR_INDEX_HARD_FAIL=1` converts
+> silent eviction into a loud refusal at the cap — preferable on a
+> corpus you have sized deliberately, because it fails visibly instead
+> of degrading recall quality invisibly.
+>
+> Postgres is unaffected: pgvector is on-disk and has no residency cap.
 
 ### 11.3 Signed events chain footprint
 
@@ -1639,6 +1768,23 @@ for the single-instance baseline.
 - [ ] `AI_MEMORY_FED_TRUST_BODY_AGENT_ID` and `AI_MEMORY_FED_SYNC_TRUST_PEER` both unset (the two bypass envs default to deny — only test harnesses set them).
 - [ ] `AI_MEMORY_FED_REQUIRE_SIG=1` and `AI_MEMORY_FED_REQUIRE_NONCE=1` (v0.7.0 secure defaults; ensures `X-Memory-Sig` + `X-Memory-Nonce` enforcement).
 
+**v1.0.0 fail-closed federation defaults** — these all became secure-by-default
+AFTER this checklist was written, and are listed here so an operator
+auditing against it does not conclude they are unset:
+
+- [ ] `AI_MEMORY_FED_REQUIRE_WRITE_SIG` — **defaults ON** at v1.0.0 (per-write content attestation on inbound relayed memories). Multi-hop relay of third-party content now needs the origin author's key enrolled at each receiving node.
+- [ ] `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG` — **defaults ON** at v1.0.0 (per-signal author attestation).
+- [ ] `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` — **defaults ON** (authority-lane, per-resolution signature).
+- [ ] `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG` — **defaults ON** (authority-lane, per-transition signature).
+- [ ] `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE` — **defaults ON**; an ENROLLED peer that declares an empty `allowed_namespaces` is refused. Read the knob's full contract before setting it falsy — it is **not** a general rollout hatch.
+- [ ] `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY` — **defaults ON**; `--insecure-skip-server-verify` no longer suffices on its own.
+- [ ] `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT` — **defaults ON** for a *detected*-stale peer policy epoch (absent/undeterminable is fail-open by design).
+
+Each has a documented staged-rollout escape hatch; see the env-var table
+in `CLAUDE.md` for the exact grammar and the per-knob caveats. Setting
+any of them falsy is a deliberate, time-boxed rollout decision — record
+it, and flip it back.
+
 ### 14.4 Governance + audit chain
 
 - [ ] `AI_MEMORY_PERMISSIONS_MODE=enforce` and `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=0` (v0.7.0 secure defaults).
@@ -1652,6 +1798,19 @@ for the single-instance baseline.
 
 ### 14.6 At-rest encryption (regulated workloads)
 
+> ⚠️ **At-rest encryption is NOT end-to-end across federation**
+> ([#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968)).
+> Federation catch-up **decrypts** content and the receiving peer
+> **re-seals under its own per-node key**, so a federated peer holds
+> **plaintext transiently at apply time**, and the ciphertext at rest on
+> peer B is sealed to peer B's key — not to yours.
+> [`federation.md`](federation.html) has always disclosed this; this
+> 1700-line document — the one an architect reads as their compliance
+> gate — did not. If your control requires that no peer ever holds
+> plaintext, **do not federate that namespace**: scope it out with
+> `allowed_namespaces`, or run a separate non-federated deployment.
+
+- [ ] Federated namespaces reviewed against the plaintext-at-peer property above; namespaces under a no-plaintext control are excluded from federation scope.
 - [ ] Binary built with `--features sqlcipher`; `AI_MEMORY_ENCRYPT_AT_REST=1`.
 - [ ] `AI_MEMORY_DB_PASSPHRASE` loaded via `--db-passphrase-file` (mode 0400; v0.7.0 refuses lax perms).
 - [ ] `AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS` unset.
