@@ -109,6 +109,32 @@ pub fn is_legacy_broad_scope(scope: &str) -> bool {
 /// inbox row hit a list+filter path).
 #[must_use]
 pub fn is_visible_to_caller(mem: &Memory, caller: &str) -> bool {
+    is_visible_by_fields(&mem.id, &mem.namespace, &mem.metadata, caller)
+}
+
+/// #2633 — the field-level form of [`is_visible_to_caller`], for the one call
+/// site that holds a row's `(id, namespace, metadata)` but not a full
+/// [`Memory`]: the postgres `find_paths` path-traversal filter, which reads
+/// `SELECT id, namespace, metadata` per graph node.
+///
+/// That site previously carried an INLINE re-implementation
+/// (`if scope != "private" { true } else { owner == caller }`) whose comment
+/// claimed parity with this predicate. It had drifted twice: it never received
+/// the #1921 subtree restriction (so `team` / `unit` / `org` rows were
+/// world-readable on the postgres kg path long after every other read path was
+/// narrowed), and it carried the #2633 "unknown ⇒ widest posture" widening.
+/// Routing it through this function converges it — which is the #951 rule the
+/// module doc opens with: drift between copies of this predicate is a real
+/// defect, and a copy that only LOOKS canonical is the worst kind.
+///
+/// `id` is used only for the unrecognised-token WARN.
+#[must_use]
+pub fn is_visible_by_fields(
+    id: &str,
+    namespace: &str,
+    metadata: &serde_json::Value,
+    caller: &str,
+) -> bool {
     // #1921 (CWE-863, tenant-isolation) — enforce the scope hierarchy so
     // team/unit/org memories are visible ONLY to callers in the matching
     // namespace SUBTREE, instead of the pre-fix `scope != "private" =>
@@ -148,13 +174,12 @@ pub fn is_visible_to_caller(mem: &Memory, caller: &str) -> bool {
     // Fail-closed to `false` would make a misspelled row unreachable by
     // anyone, including the one principal who can fix it.
     use crate::models::namespace::MemoryScope;
-    let scope_str = mem
-        .metadata
+    let scope_str = metadata
         .get(crate::META_KEY_SCOPE)
         .and_then(serde_json::Value::as_str);
     match scope_str.map(MemoryScope::from_str) {
         // Field absent → default private (owner-keyed).
-        None => private_visible(mem, caller),
+        None => private_visible(metadata, caller),
         // Present but not a `MemoryScope`: the closed legacy set is honoured
         // broadly; every other token degrades to the absent-key default.
         Some(None) => {
@@ -164,17 +189,17 @@ pub fn is_visible_to_caller(mem: &Memory, caller: &str) -> bool {
             } else {
                 tracing::warn!(
                     target: "visibility.unknown_scope",
-                    memory_id = %mem.id,
-                    namespace = %mem.namespace,
+                    memory_id = %id,
+                    namespace = %namespace,
                     scope = %raw,
                     "unrecognised metadata.scope token; treating as private (#2633). \
                      Valid scopes: {}",
                     crate::models::namespace::VALID_SCOPES.join(", ")
                 );
-                private_visible(mem, caller)
+                private_visible(metadata, caller)
             }
         }
-        Some(Some(MemoryScope::Private)) => private_visible(mem, caller),
+        Some(Some(MemoryScope::Private)) => private_visible(metadata, caller),
         // Visible to every authenticated caller, regardless of namespace.
         Some(Some(MemoryScope::Collective)) => true,
         // #1921 — subtree-restricted: the memory's namespace must fall
@@ -182,24 +207,22 @@ pub fn is_visible_to_caller(mem: &Memory, caller: &str) -> bool {
         // agent id, which IS the agent's namespace prefix. A missing
         // ancestor (the caller's namespace is too shallow, or `caller` is
         // a synthetic `anonymous:req-…` id with no `/`) → deny.
-        Some(Some(MemoryScope::Team)) => scope_subtree_visible(mem, caller, 1),
-        Some(Some(MemoryScope::Unit)) => scope_subtree_visible(mem, caller, 2),
-        Some(Some(MemoryScope::Org)) => scope_subtree_visible(mem, caller, 3),
+        Some(Some(MemoryScope::Team)) => scope_subtree_visible(namespace, caller, 1),
+        Some(Some(MemoryScope::Unit)) => scope_subtree_visible(namespace, caller, 2),
+        Some(Some(MemoryScope::Org)) => scope_subtree_visible(namespace, caller, 3),
     }
 }
 
 /// Owner / inbox-target check for a `scope=private` (or default) row.
-fn private_visible(mem: &Memory, caller: &str) -> bool {
-    let owner = mem
-        .metadata
+fn private_visible(metadata: &serde_json::Value, caller: &str) -> bool {
+    let owner = metadata
         .get(crate::META_KEY_AGENT_ID)
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     if owner == caller {
         return true;
     }
-    let target = mem
-        .metadata
+    let target = metadata
         .get(crate::META_KEY_TARGET_AGENT_ID)
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
@@ -211,12 +234,12 @@ fn private_visible(mem: &Memory, caller: &str) -> bool {
 /// (index 0 is the caller's own namespace / private position). The memory
 /// is visible iff its namespace equals, or is nested under, that ancestor.
 /// Mirrors `crate::storage::is_visible` + `matches_subtree` exactly.
-fn scope_subtree_visible(mem: &Memory, caller: &str, ancestor_idx: usize) -> bool {
+fn scope_subtree_visible(namespace: &str, caller: &str, ancestor_idx: usize) -> bool {
     let ancestors = crate::models::namespace_ancestors(caller);
     let Some(prefix) = ancestors.get(ancestor_idx) else {
         return false;
     };
-    mem.namespace == *prefix || mem.namespace.starts_with(&format!("{prefix}/"))
+    namespace == *prefix || namespace.starts_with(&format!("{prefix}/"))
 }
 
 /// #1786 — ownership predicate for MUTATION gating (delete / update / promote /
