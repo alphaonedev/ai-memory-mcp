@@ -745,15 +745,16 @@ fn section_index(conn: &rusqlite::Connection) -> ReportSection {
     // content" and "the check could not be completed" are different findings,
     // and reporting the second as the first manufactures a corruption alarm out
     // of (say) lock contention or a connection this process could not use.
-    match crate::db::fts_integrity_check(conn) {
-        Ok(()) => facts.push((
-            "fts_index_integrity".into(),
-            "verified (index agrees with the memories table)".into(),
-        )),
+    // The three dispositions differ in VALUE, severity and note — not in which
+    // fact they report — so the key is written ONCE and the match yields the
+    // value. Pushing the same fact in three arms would scatter the key across
+    // three sites (the pm-v3.1 duplication the hardcoded-literal ratchet
+    // blocks) for no gain.
+    let fts_verdict = match crate::db::fts_integrity_check(conn) {
+        Ok(()) => "verified (index agrees with the memories table)".to_string(),
         Err(e) => match crate::background::fts_integrity::classify_error(&e) {
             crate::background::fts_integrity::Outcome::Corrupt => {
                 severity = Severity::Critical;
-                facts.push(("fts_index_integrity".into(), format!("FAILED: {e}")));
                 append_note(
                     &mut note,
                     "the FTS5 index disagrees with the memories table — keyword recall will \
@@ -761,6 +762,7 @@ fn section_index(conn: &rusqlite::Connection) -> ReportSection {
                      intact; the index is derived and regenerable. Rebuild it with: \
                      sqlite3 <db> \"INSERT INTO memories_fts(memories_fts) VALUES('rebuild');\"",
                 );
+                format!("FAILED: {e}")
             }
             _ => {
                 // NOT a corruption verdict — do not escalate past Warning, and
@@ -768,10 +770,6 @@ fn section_index(conn: &rusqlite::Connection) -> ReportSection {
                 if severity != Severity::Critical {
                     severity = Severity::Warning;
                 }
-                facts.push((
-                    "fts_index_integrity".into(),
-                    format!("not verified (check could not complete): {e}"),
-                ));
                 append_note(
                     &mut note,
                     "the FTS5 integrity check could not COMPLETE — this is NOT a corruption \
@@ -779,9 +777,11 @@ fn section_index(conn: &rusqlite::Connection) -> ReportSection {
                      memories table. Re-run `ai-memory doctor` when the database is not \
                      under a concurrent write.",
                 );
+                format!("not verified (check could not complete): {e}")
             }
         },
-    }
+    };
+    facts.push(("fts_index_integrity".into(), fts_verdict));
 
     ReportSection {
         name: "Index".into(),

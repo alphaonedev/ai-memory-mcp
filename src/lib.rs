@@ -306,6 +306,16 @@ pub const META_KEY_MINED_FROM: &str = "mined_from";
 /// the named target to see otherwise-private rows alongside the owner.
 pub const META_KEY_TARGET_AGENT_ID: &str = "target_agent_id";
 
+/// `metadata.family` — the MCP TOOL-family tag (`core` / `lifecycle` /
+/// `graph` / `governance` / `power` / `meta` / `archive` / `other`, per
+/// `crate::profile::Family`; issue #864 — NOT the `memory_kind`
+/// taxonomy). It is the sole selector of the always-on core-profile
+/// `memory_load_family` / `memory_smart_load` loaders, and since #2580 it
+/// is the key the postgres branch pushes into SQL through the SAL
+/// `Filter::metadata_eq` axis instead of materialising 1000 rows and
+/// filtering them in Rust.
+pub const META_KEY_FAMILY: &str = "family";
+
 // ---------------------------------------------------------------------------
 // ARCH-14 (FX-C4-batch2, 2026-05-26) — canonical route-count constant.
 //

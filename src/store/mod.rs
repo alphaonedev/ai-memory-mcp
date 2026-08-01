@@ -670,6 +670,68 @@ pub trait Transaction: Send {
     async fn rollback(self: Box<Self>) -> StoreResult<()>;
 }
 
+/// v1.0.0 #2580 — one exact `metadata.<key> == "<value>"` narrowing pair
+/// for the [`Filter::metadata_eq`] axis.
+///
+/// Semantics are deliberately NARROW and identical on every adapter: the
+/// row matches iff its `metadata` object carries `key` at the TOP LEVEL
+/// with a JSON **string** value byte-equal to `value`. A numeric, null,
+/// array, object, or absent value never matches — exactly the Rust
+/// predicate `m.metadata.get(key).and_then(Value::as_str) == Some(value)`
+/// that the pre-#2580 `memory_load_family` postgres branch applied
+/// in-process over a 1000-row prefetch.
+///
+/// Adapter implementations:
+/// - postgres → `metadata @> jsonb_build_object($k::text, $v::text)`,
+///   served by the pre-existing `memories_metadata_gin` GIN index
+///   (measured 0.29 ms vs 17.8 ms for the non-indexable
+///   `metadata->>'family' = $v` shape on the 8k-row Atlas corpus).
+/// - sqlite → `EXISTS (SELECT 1 FROM json_each(memories.metadata)
+///   WHERE json_each.key = ? AND json_each.value = ? AND json_each.type
+///   = 'text')`, mirroring the sibling `tags_any` `json_each` fragment.
+///
+/// Both bind the KEY as a query parameter (never string-interpolated into
+/// a JSON path), so no key value can alter the shape of the predicate.
+///
+/// **Fail-closed contract for callers.** This axis is a performance
+/// pushdown, never the sole correctness gate. A caller that relies on the
+/// narrowing MUST re-apply the equivalent Rust predicate to the returned
+/// rows — the same belt-and-suspenders discipline
+/// [`MemoryStore::list`]'s postgres implementation uses for the
+/// scope=private visibility clause. That makes the pushdown STRICTLY
+/// NARROWING: a hypothetical adapter that ignored the axis could then
+/// only DEGRADE (return fewer rows), never widen the result set with rows
+/// the caller did not ask for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataEq {
+    /// Top-level `metadata` object key.
+    pub key: String,
+    /// Required JSON-string value at `key`.
+    pub value: String,
+}
+
+impl MetadataEq {
+    /// Build a narrowing pair.
+    #[must_use]
+    pub fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+
+    /// True when `mem`'s metadata satisfies this pair. The canonical
+    /// in-process twin of the SQL predicate every adapter pushes down —
+    /// callers use it for the mandatory fail-closed re-check.
+    #[must_use]
+    pub fn matches(&self, mem: &crate::models::Memory) -> bool {
+        mem.metadata
+            .get(&self.key)
+            .and_then(serde_json::Value::as_str)
+            == Some(self.value.as_str())
+    }
+}
+
 /// Filter shape passed to `list` / `search` / `recall`. Each field
 /// narrows the result set; `None` / empty means "don't narrow on this
 /// axis".
@@ -699,6 +761,16 @@ pub struct Filter {
     /// `recall_hybrid` call sites that build a `Filter` are unchanged.
     /// Set ONLY on the recall path; ignored by `list` / `search`.
     pub active_embedding_space: Option<String>,
+    /// v1.0.0 #2580 — exact top-level `metadata.<key> == "<value>"`
+    /// narrowing, pushed into SQL by BOTH adapters. `None` = no narrowing
+    /// (byte-identical to pre-#2580 behaviour on every existing call
+    /// site, which construct `Filter` with `..Default::default()` or an
+    /// explicit `metadata_eq: None`).
+    ///
+    /// Honoured by `list` on both backends. See [`MetadataEq`] for the
+    /// exact semantics and the MANDATORY caller-side fail-closed
+    /// re-check.
+    pub metadata_eq: Option<MetadataEq>,
 }
 
 /// The core trait. Every backend implements this; ai-memory's HTTP /

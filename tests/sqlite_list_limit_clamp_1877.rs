@@ -44,6 +44,8 @@ async fn sqlite_list_clamps_limit_to_list_max_limit_1877() {
         valid_at: None,
         limit: 5000, // > LIST_MAX_LIMIT
         active_embedding_space: None,
+        // #2580 — metadata-equality pushdown axis unused on this path.
+        metadata_eq: None,
     };
 
     let rows = store.list(&ctx, &filter).await.expect("list");
