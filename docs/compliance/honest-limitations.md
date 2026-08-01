@@ -1,19 +1,29 @@
 ---
 layout: doc
 ---
-# ai-memory v0.7.0 — Honest Limitations
+# ai-memory v1.0.0 — Honest Limitations
 
 **Document classification:** Public-facing, procurement-grade.
-**Date:** 2026-05-23.
-**ai-memory version:** v0.7.0 (sqlite + postgres schema **v57**, lockstep).
+**Date:** first published 2026-05-23; version stamp, mitigation claims, and code
+anchors re-verified against `release/v1.0.0` HEAD on 2026-08-01.
+**ai-memory version:** v1.0.0 (sqlite + postgres schema **v88**, lockstep).
 **Companion document:** [`docs/compliance/nsa-csi-mcp-security-mapping.md`](nsa-csi-mcp-security-mapping.html) — the NSA CSI concern + recommendation mapping that Task E ships.
 **Source-of-truth inventory:** [`docs/compliance/_inventory/v0.7.0-capabilities.json`](_inventory/v0.7.0-capabilities.json).
 
+> **Currency note.** The linked capability inventory is a **v0.7.0-tree
+> artefact** and has not been re-derived against the v0.8.x / v0.9.0 / v1.0.0
+> source tree; a v1.0.0 refresh is tracked under
+> [#1938](https://github.com/alphaonedev/ai-memory-mcp/issues/1938). What was
+> re-verified at v1.0.0 HEAD is this document's own prose: every substrate
+> claim below is stated against a **symbol** (module / type / function name)
+> rather than a file:line anchor, because line anchors drift with every commit
+> and an anchor that misses costs a reviewer more trust than it buys.
+
 ## Statement of intent — what this document is and is not
 
-The [NSA CSI MCP Security mapping](nsa-csi-mcp-security-mapping.html) claims ai-memory v0.7.x addresses every one of the ten NSA-enumerated MCP security concerns and every one of the seven NSA recommendations structurally at the substrate layer. That claim is grep-verifiable against the codegraph-derived [capability inventory](_inventory/v0.7.0-capabilities.json).
+The [NSA CSI MCP Security mapping](nsa-csi-mcp-security-mapping.html) maps ai-memory's substrate design to the ten NSA-enumerated MCP security concerns and the seven NSA recommendations. **Nine of the ten concerns are claimed structurally addressed as shipped; concern (a) access control is claimed structurally addressed only under the `enforce` identity-binding posture with per-agent keys enrolled** — the shipped default (`AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=advisory`, zero per-agent keys) is the posture the project's own [v1.0.0 adversarial security assessment](v1.0.0-security-assessment.html) rates finding **H1 (High)**. That qualification is stated in the mapping document's concern (a) row and §3.1, and it is the reason this pair no longer publishes a flat "10 of 10" headline.
 
-**This document is NOT a list of NSA CSI gaps.** There are none — concern j (tool invocation path confusion) was the last partial-coverage edge at v0.7.0 and is now closed via #1154 (daemon-Ed25519-signed `ai_memory_identity` block at MCP initialize handshake, shipped in `src/mcp/server_identity.rs` with 47 dedicated regression tests).
+**This document is NOT a list of NSA CSI gaps.** It is a list of substrate boundaries. Concern (j) (tool invocation path confusion) was the last partial-coverage edge at v0.7.0 and is closed via #1154 (daemon-Ed25519-signed `ai_memory_identity` block at MCP initialize handshake, shipped in `src/mcp/server_identity.rs`).
 
 **This document IS a list of substrate boundaries** — things the substrate fundamentally cannot defend against regardless of which compliance framework is in front of it. Operating system kernel vulnerabilities, side-channel attacks on cryptographic primitives, large language model hallucination on the consumer side of the substrate, operator-authored permissive policy. These boundaries exist whether NSA CSI exists or not. They define the substrate's honest perimeter.
 
@@ -93,10 +103,15 @@ The boundaries above are honest perimeters, not invitations to abandon disciplin
 3. **Form 7 + L1-6 governance for agent-EXTERNAL actions.** Express the operator's policy as signed governance rules consulted on every write. Default-CLOSED v0.7.0 posture refuses non-compliant writes.
 4. **Namespace isolation for multi-tenancy.** Validate every namespace assignment at the storage layer. Per-tenant audit gates on subscription enumeration and DLQ access (#870, #872).
 5. **Encryption at rest via `--features sqlcipher`.** AES-256 encryption with mode-0400 passphrase file enforcement (#1055).
-6. **Federation mTLS with explicit peer allowlist.** The sync daemon refuses to start without mTLS unless an explicit insecure flag is set; an empty peer allowlist refuses every peer.
+6. **Federation transport — what is required, and what is opt-in.** Stated precisely, because an earlier revision of this list asserted the inverse of the shipped control ("the sync daemon refuses to start without mTLS unless an explicit insecure flag is set"). It does not, and no procurement reviewer should size a deployment against that sentence.
+   - **Outbound peer server-certificate verification IS required by default.** `tls::server_verify_required()` resolves to *required* when unset, and the accept-any disposition is refused inside the pure mode selector `tls::select_sync_tls_mode` — so `--insecure-skip-server-verify` does not suffice on its own. Accept-any needs four conditions together: the flag, **both** `--client-cert` and `--client-key` as a compensating mTLS control, and an explicit falsy `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY`. The `asi-hard` security profile pins that knob on, making the escape hatch itself no-disable. Precedence is pinning (`AI_MEMORY_FED_PEER_FINGERPRINTS`) > accept-any > CA validation; **CA validation is the default path**.
+   - **Client-side mTLS is OPT-IN, on both ends.** With neither client-cert flags nor the insecure flag set, `ai-memory sync-daemon` starts normally on the CA-validated path **with no client certificate** (`sync_client_identity` returns `None` unless both PEM paths are supplied). Server side, `--mtls-allowlist` is an `Option<PathBuf>`: absent ⇒ no client-certificate verification is installed at all. Operators who need mutual authentication must configure it; the substrate does not configure it for them.
+   - **What the empty-allowlist refusal actually covers.** Once mTLS *has* been chosen, an empty allowlist file is a fail-closed boot refusal — "refuse to start rather than silently accept all peers". It is a guard on a control the operator already enabled, not a control that enables itself.
+   - **Once enabled, mTLS Layer 1 is exactly as advertised.** `tls::FingerprintAllowlistVerifier` returns `client_auth_mandatory() -> true`, compares SHA-256 over the presented client certificate's DER against the operator allowlist in constant time, and rejects **inside the TLS handshake** — before any Axum layer, middleware, or handler runs.
+   - **Federation replicates PLAINTEXT memory content.** The at-rest encryption envelope is per-node and is **not** a wire field: federation catch-up decrypts `content` and the receiving peer re-seals under its own per-node key, so a federated peer holds plaintext at apply time (`src/encryption/mod.rs`; end-to-end federation encryption is open as #1968). The wire is TLS/mTLS-protected and enrolled-peer-gated, and inbound writes are namespace-scoped per `PeerScope` — that transport protection plus peer scoping is the **entire** confidentiality story between peers. Tenant isolation in a federated deployment rests on it. There is no end-to-end encryption across federation at v1.0.0, and a peer you federate with can read what you replicate to it.
 7. **Federation nonce + signature defense (#922, #791).** Default-on in v0.7.0; `AI_MEMORY_FED_REQUIRE_NONCE=1` and `AI_MEMORY_FED_REQUIRE_SIG=1` are the secure-posture defaults.
 8. **Subscribe to the ai-memory security advisory channel.** GitHub Security Advisories at `github.com/alphaonedev/ai-memory-mcp/security/advisories`. Email `security@alpha-one.mobi` per [`SECURITY.md`](../../SECURITY.md).
-9. **Run cargo-audit + dependency scanners.** The substrate's dependency surface is enumerated in `Cargo.lock` (~5,479 lines). The CI gates include `cargo audit` against the RustSec advisory database. Operators deploying ai-memory should additionally scan their build output via their preferred SBOM tooling.
+9. **Run cargo-audit + dependency scanners.** The substrate's dependency surface is enumerated in `Cargo.lock` (5,747 lines at v1.0.0). The CI gates include `cargo audit` against the RustSec advisory database. Operators deploying ai-memory should additionally scan their build output via their preferred SBOM tooling.
 10. **Hardware-backed key custody via AgenticMem.** For procurement-grade key handling beyond OSS file-based storage (mode 0600), the AgenticMem commercial layer integrates TPM 2.0, HSM, and Secure-Enclave / StrongBox custody.
 
 ---
@@ -111,7 +126,9 @@ During Task I deep-verification of issue #1153, three substrate-level gap-fix ca
 | 2 | **`Accept-Provenance: verbose` capability negotiation flag** | Filter/monitor output pipelines (NSA recommendation f) — closes consumer-default friction | MCP wire default `verbose_provenance=true` already ships at v0.7.0 per `src/mcp/tools/recall.rs:490`. Only the HTTP `Accept-Provenance` header remains as net-new wire surface — minor polish, NOT a coverage gap. | #1155, v0.7.x follow-up |
 | 3 | **Per-namespace rate-limit dimension extension (K8 quota → (agent_id, namespace) compound)** | Denial of service (NSA concern h) — defense-in-depth | K8 quota dimension is per-agent only | #1156, v0.7.x follow-up (requires schema v50 migration) |
 
-After #1154 landed in this PR, the substrate's structural NSA CSI MCP coverage reached 100% (10/10 concerns + 7/7 recommendations, zero partial-coverage edges). #1155 and #1156 are defense-in-depth + polish improvements scheduled for v0.7.x follow-up; neither blocks the 100% structural coverage claim of the NSA framework.
+All three shipped. With #1154, concern (j) has no partial-coverage edge left; #1155 and #1156 are defense-in-depth on recommendation (f) and concern (h).
+
+**The coverage tally, stated honestly at v1.0.0.** This document previously read "100% (10/10 concerns + 7/7 recommendations, zero partial-coverage edges)". That flat tally no longer stands, for one specific and disclosed reason: **concern (a) access control is posture-conditional.** The HTTP surface's per-agent-key principal binding shipped (#2044/#2129/#2154, schema v83 `agent_api_keys`), but its default is `advisory` with zero keys enrolled, and in that default posture — per the project's own CHANGELOG — "H1/M1 behave EXACTLY as pre-#2044; the gate is fully inert until an operator enrolls per-agent keys AND sets `enforce`." So: **nine concerns and seven recommendations are structurally addressed as shipped; concern (a) is structurally addressed under `enforce` with per-agent keys enrolled, and is finding H1 in the shipped default.** That default was chosen deliberately (`enforce`-by-default with zero keys would break every existing shared-key deployment), and it is a posture an operator can close in one configuration step — but until they take that step, the honest count is 9 + 1-conditional, not 10.
 
 ---
 
@@ -140,7 +157,7 @@ An operator deploys ai-memory but does not enable the governance rules engine �
 
 **Disclaimer of endorsement:** Per the NSA document's reproduction guidance, no NSA endorsement of ai-memory, AgenticMem, AlphaOne LLC, or any commercial product or service is implied. References to Microsoft AGT and the Ortega/de Freitas reference are bibliographic; no endorsement by those parties is implied.
 
-**Honesty discipline:** Every claim in this document about substrate behaviour traces to a `capability_id` in [`docs/compliance/_inventory/v0.7.0-capabilities.json`](_inventory/v0.7.0-capabilities.json) or to a documented boundary (filesystem, kernel, hardware, LLM-side). Aspirational claims and forward-looking statements have been removed during procurement-grade review.
+**Honesty discipline:** Every claim in this document about substrate behaviour traces either to a **named symbol** in the source tree (module / type / function) or to a documented boundary (filesystem, kernel, hardware, LLM-side); the older v0.7.0 claims additionally trace to a `capability_id` in [`docs/compliance/_inventory/v0.7.0-capabilities.json`](_inventory/v0.7.0-capabilities.json), which is a v0.7.0-tree artefact per the currency note at the top of this document. **This document deliberately publishes no `file:line` anchors.** Line numbers drift with every commit, and a procurement reviewer who follows a stale anchor to unrelated code loses trust that a correction cannot buy back; a symbol name either resolves or is provably gone. Aspirational claims and forward-looking statements have been removed during procurement-grade review.
 
 ---
 

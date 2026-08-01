@@ -14,7 +14,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory — Compliance & Procurement</title>
-<meta name="description" content="ai-memory v0.7.0 procurement-grade compliance evidence: NSA CSI MCP security mapping (10/10 concerns + 7/7 recommendations structurally addressed), honest-limitations companion document, Memory Portability Spec v1, ship-gate certification, A2A gate evidence, MCP Registry presence.">
+<meta name="description" content="ai-memory v1.0.0 procurement-grade compliance evidence: NSA CSI MCP security mapping (9 of 10 concerns structurally addressed as shipped; concern (a) access control addressed under the enforce identity-binding posture; 7/7 recommendations), honest-limitations companion document, Memory Portability Spec v1, ship-gate certification, A2A gate evidence, MCP Registry presence.">
 <meta name="theme-color" content="#0d1117">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/compliance/">
 <style>
@@ -88,7 +88,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">▸ Procurement-grade evidence · Public-facing</span>
     <h1>Compliance &amp; Procurement</h1>
-    <p class="tagline">ai-memory v0.7.0 ships procurement-grade compliance evidence as a paired document set: the NSA CSI MCP security mapping (every concern + recommendation structurally addressed) and the honest-limitations companion (every substrate boundary plainly stated). Plus the Memory Portability Spec v1, ship-gate certification, the A2A-gate evidence, and the MCP Registry presence. Every artefact codegraph-anchored to <code>release/v0.7.0</code> HEAD.</p>
+    <p class="tagline">ai-memory ships procurement-grade compliance evidence as a paired document set: the NSA CSI MCP security mapping and the honest-limitations companion (every substrate boundary plainly stated). Plus the Memory Portability Spec v1, ship-gate certification, the A2A-gate evidence, and the MCP Registry presence. <strong>The pair is re-stamped to v1.0.0 (schema v88);</strong> nine of the ten NSA concerns are structurally addressed as shipped, and concern (a) access control is addressed under the <code>enforce</code> identity-binding posture with per-agent keys enrolled — the shipped default is finding H1 of the v1.0.0 assessment below. The pair now cites <strong>symbols, not <code>file:line</code> anchors</strong>.</p>
   </div>
 </header>
 
@@ -103,7 +103,7 @@ footer a{color:var(--text-muted)}
         <div class="card featured">
           <div class="card-eyebrow">▸ Featured · NSA CSI MCP Security</div>
           <h3>NSA CSI MCP Security Compliance</h3>
-          <p class="card-body"><strong>10 of 10 NSA security concerns structurally addressed at the substrate layer. 7 of 7 NSA recommendations implemented.</strong> Closure of concern (j) tool invocation path confusion landed via #1154 (daemon serverInfo Ed25519 signing at MCP initialize) — 47 dedicated tests pin the contract. Every claim traces to a codegraph-verified <code>capability_id</code> in the inventory. Public-facing procurement-grade page with per-concern anchors, file references, and verification commands for independent review.</p>
+          <p class="card-body"><strong>9 of 10 NSA security concerns structurally addressed as shipped; concern (a) access control structurally addressed under the <code>enforce</code> identity-binding posture with per-agent keys enrolled. 7 of 7 NSA recommendations implemented.</strong> The shipped default for concern (a) — <code>AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=advisory</code> with zero keys enrolled — is finding H1 of the v1.0.0 adversarial assessment; the mapping's §3.1 states which posture the claim describes and how to close it. Concern (j) closed via #1154 (daemon serverInfo Ed25519 signing at MCP initialize), 47 dedicated tests. The <strong>Markdown</strong> mapping (<code>nsa-csi-mcp-security-mapping.md</code>) is the re-verified v1.0.0 text; this HTML mirror still carries the v0.7.0 rendering.</p>
           <div class="card-arrow">nsa-csi-mcp.html →</div>
         </div>
       </a>
@@ -139,7 +139,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="section-eyebrow">▸ Source-of-truth artefacts</span>
     <h2>Codegraph-verified inventory.</h2>
-    <p class="lede">Every claim in the mapping document traces to a <code>capability_id</code> in this inventory. The inventory in turn traces every <code>capability_id</code> to a file path + line number + (where applicable) GitHub issue or PR reference. Reproducible from a fresh checkout at commit <code>4add7a852</code>.</p>
+    <p class="lede">The mapping document's v0.7.0-era claims each carry a <code>capability_id</code> in this inventory, which traces it to a file path + line number + (where applicable) GitHub issue or PR reference, reproducible from a fresh checkout at commit <code>4add7a852</code>. <strong>Those line numbers are v0.7.0 coordinates and have drifted.</strong> The mapping document itself no longer publishes <code>file:line</code> anchors — it cites symbols, which either resolve at HEAD or are provably gone — because a stale anchor that lands on unrelated code costs a reviewer more than it buys.</p>
 
     <div class="grid-2">
       <a href="_inventory/v0.7.0-capabilities.json" style="text-decoration:none">
@@ -232,7 +232,7 @@ footer a{color:var(--text-muted)}
       <div class="card">
         <div class="card-eyebrow">▸ #1154 · Shipped</div>
         <h3>Daemon serverInfo Ed25519 signing at MCP initialize</h3>
-        <p class="card-body">Closes the partial-coverage edge on NSA concern (j) Tool invocation path confusion. Substrate already has <code>load_daemon_signing_key</code> at <code>src/governance/audit.rs:558</code>; #1154 threads it into the MCP initialize response so clients can TOFU-pin daemon identity on first connect.</p>
+        <p class="card-body">Closes the partial-coverage edge on NSA concern (j) Tool invocation path confusion. Substrate already has <code>governance::audit::load_daemon_signing_key</code>; #1154 threads it into the MCP initialize response so clients can TOFU-pin daemon identity on first connect.</p>
       </div>
       <div class="card">
         <div class="card-eyebrow">▸ #1155 · Shipped</div>
@@ -250,8 +250,8 @@ footer a{color:var(--text-muted)}
 
 <footer>
   <div class="container">
-    <p style="margin-bottom:.5rem"><strong>ai-memory v0.7.0</strong> · Compliance &amp; Procurement landing page · public-facing · maintained by AlphaOne LLC under Apache 2.0.</p>
-    <p>Verification commit: <code>4add7a8528d4c16d696b391ec6e2890269669a84</code> on <code>release/v0.7.0</code> · Audit issue: <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1153">#1153</a>.</p>
+    <p style="margin-bottom:.5rem"><strong>ai-memory v1.0.0</strong> · Compliance &amp; Procurement landing page · public-facing · maintained by AlphaOne LLC under Apache 2.0.</p>
+    <p>Procurement pair (<code>nsa-csi-mcp-security-mapping.md</code> + <code>honest-limitations.md</code>) re-verified against <code>release/v1.0.0</code> HEAD on 2026-08-01 · underlying capability inventory verified at <code>4add7a8528d4c16d696b391ec6e2890269669a84</code> on <code>release/v0.7.0</code> and not yet re-derived (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1938">#1938</a>) · Audit issue: <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1153">#1153</a>.</p>
   </div>
 </footer>
 
