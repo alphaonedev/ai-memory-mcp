@@ -204,6 +204,46 @@ fn legacy_shared_token_stays_broadly_visible() {
     }
 }
 
+/// The read-path broad set and the write-path validator must not CONTRADICT
+/// each other. `validate::validate_scope` REFUSES `"public"` and `"personal"`
+/// on every write surface — asserted by the pre-existing
+/// `validate::tests::test_invalid_scope` — so the read path must not turn
+/// around and treat a row carrying one of them as world-readable. That
+/// combination is exactly the write/read incoherence #2633 exists to remove:
+/// the substrate would refuse to let an operator WRITE the token while
+/// publishing to everyone any row that somehow carries it.
+///
+/// `"shared"` is the one deliberate exception and it is NOT arbitrary: five
+/// PRODUCTION sites still write it (`handlers::hook_subscribers` first-write +
+/// the #2541 ownership-restamp; `mcp::tools::namespace` set-standard restamp)
+/// onto the `_standard:<ns>` governance-policy placeholder rows, and it is the
+/// documented #948/#978 federation shareable shape. `"public"` and
+/// `"personal"` are written by NO production code and appear zero times in the
+/// live certified corpus — they exist only in test fixtures that were authored
+/// against the pre-#2633 "unknown ⇒ world-readable" arm.
+///
+/// If a future change wants to broaden this set, this test is the place that
+/// forces the widening to be a DECISION rather than a side effect.
+#[test]
+fn broad_set_does_not_contradict_the_write_validator() {
+    for refused_on_write in ["public", "personal", "PRIVATE", ""] {
+        assert!(
+            ai_memory::validate::validate_scope(refused_on_write).is_err(),
+            "precondition: validate_scope must refuse {refused_on_write:?}"
+        );
+        assert!(
+            !ai_memory::visibility::is_legacy_broad_scope(refused_on_write),
+            "{refused_on_write:?} is REFUSED on every write surface, so the read path \
+             must not treat it as broadly visible (#2633 write/read coherence)"
+        );
+        let row = row_with_scope("ai:victim", Some(refused_on_write));
+        assert!(
+            !is_visible_to_caller(&row, "ai:mallory"),
+            "{refused_on_write:?} must not be world-readable"
+        );
+    }
+}
+
 /// No-regression — every REAL `MemoryScope` keeps its exact prior posture.
 #[test]
 fn known_scopes_unchanged() {

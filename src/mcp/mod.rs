@@ -4218,7 +4218,18 @@ pub fn run_mcp_server(
     // recall requests coalesce into a single tokenize+forward pass on
     // the BERT model, instead of serializing through the per-candidate
     // `Arc<Mutex<BertModel>>`.
-    let reranker = if tier_config.cross_encoder {
+    // v1.0.0 #2576 — ALSO gate on a live embedder, mirroring the `serve`
+    // build site. The MCP recall path only reaches the rerank stage when a
+    // query embedding was produced; with no embedder every recall returns
+    // `mode:keyword` and the cross-encoder is UNREACHABLE. Pre-#2576 the
+    // tier alone decided, so an `AI_MEMORY_INFERENCE_EGRESS=deny` (env
+    // #131) or #1593-degraded deployment paid the model load and resident
+    // memory for a stage that could never run — and on MCP stdio it also
+    // paid that load before the server could answer `initialize`.
+    let reranker = if crate::reranker::should_build_cross_encoder(
+        tier_config.cross_encoder,
+        embedder.is_some(),
+    ) {
         eprintln!("ai-memory: loading neural cross-encoder (ms-marco-MiniLM-L-6-v2)...");
         let ce = CrossEncoder::new_neural();
         if ce.is_neural() {
@@ -4230,11 +4241,23 @@ pub fn run_mcp_server(
         // (env > [reranker].score_floor > Off) instead of the hardcoded
         // Off the bare `new` constructor used; this is what makes the
         // with_score_floor capability reachable on the MCP recall path.
-        Some(BatchedReranker::with_score_floor(
-            ce,
-            app_config.resolve_reranker_score_floor(),
-        ))
+        let batched =
+            BatchedReranker::with_score_floor(ce, app_config.resolve_reranker_score_floor());
+        // v1.0.0 #2576 — warm the forward path on a DETACHED background
+        // thread. The stdio loop is single-threaded by protocol design, so
+        // an inline warm-up would delay `initialize` by seconds; a detached
+        // warm-up overlaps with the client's own start-up instead.
+        let warm = batched.encoder_arc();
+        std::thread::spawn(move || warm.warm_up());
+        Some(batched)
     } else {
+        if tier_config.cross_encoder {
+            eprintln!(
+                "ai-memory: tier enables the cross-encoder but no embedder is available — \
+                 skipping cross-encoder load (#2576); recall degrades to keyword so the \
+                 rerank stage is unreachable"
+            );
+        }
         None
     };
 
@@ -11235,14 +11258,20 @@ mod tests {
         // tier ∈ {short, mid, long}. The pre-fix label "short_term"
         // pre-dated the closed-set enum and was silently accepted.
         //
-        // v0.7.0 #1075 (SR-1 #1, HIGH) — seed `scope: "public"` so
+        // v0.7.0 #1075 (SR-1 #1, HIGH) — seed a world-readable scope so
         // these fixtures pass the visibility gate added to
         // `memory_replay` regardless of which agent_id the caller
         // resolves to (test caller resolution depends on env / PID).
         // Real-world rows owned by a specific agent rely on the
-        // owner check; the test fixtures use the public-scope branch
+        // owner check; the test fixtures use the world-readable branch
         // so they survive the gate without taking a dependency on a
         // stable caller identity.
+        //
+        // #2633 — this said `scope: "public"` and seeded that literal.
+        // `public` is NOT a `MemoryScope`; `validate_scope` refuses it on
+        // every write surface, and it only survived the gate because the
+        // pre-#2633 read path treated any unrecognised token as
+        // world-readable. `collective` is the real world-readable scope.
         conn.execute(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, created_at, updated_at, metadata

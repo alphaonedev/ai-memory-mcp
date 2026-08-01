@@ -1182,24 +1182,29 @@ pub fn handle_recall_dto(
 
     // Use hybrid recall if embedder is available
     if let Some(emb) = embedder {
-        match emb.embed_query(context) {
-            Ok(primary_emb) => {
+        // v1.0.0 #2577 — bounded funnel (cache -> wall-clock budget ->
+        // degrade-to-keyword). This matters most HERE: the MCP stdio loop
+        // is single-threaded by JSON-RPC protocol design (#965 audit), so
+        // an unbounded embed stall blocks EVERY subsequent tool call on
+        // this server, not just this recall.
+        match crate::embeddings::recall_query_embedding(emb, context) {
+            Some(primary_emb) => {
                 // v0.6.0.0: fuse primary query with context-token embedding
                 // at 70/30 when caller supplied conversation tokens.
                 let query_emb = if context_tokens.is_empty() {
                     primary_emb
                 } else {
                     let joined = context_tokens.join(" ");
-                    match emb.embed_query(&joined) {
-                        Ok(ctx_emb) => crate::embeddings::Embedder::fuse(
+                    match crate::embeddings::recall_query_embedding(emb, &joined) {
+                        Some(ctx_emb) => crate::embeddings::Embedder::fuse(
                             &primary_emb,
                             &ctx_emb,
                             crate::RECALL_PRIMARY_CTX_BLEND,
                         ),
-                        Err(e) => {
-                            tracing::warn!("context_tokens embed failed, using primary only: {e}");
-                            primary_emb
-                        }
+                        // The funnel already WARNed + counted; the primary
+                        // embedding alone is a complete, correct query
+                        // vector, so this stays a hybrid recall.
+                        None => primary_emb,
                     }
                 };
                 // v1.0.0 #2167 §3 — the active embedder fingerprint gates
@@ -1323,14 +1328,18 @@ pub fn handle_recall_dto(
                 super::inject_namespace_standard(conn, namespace, caller, &mut resp);
                 return Ok(resp);
             }
-            Err(e) => {
+            None => {
                 // v0.6.3.1 (P3, G11): the embedder being present but the
                 // per-query embed failing is a different silent-degrade
-                // path than "embedder unavailable at startup" — preserve
-                // the existing tracing event and fall through to
-                // keyword_only mode below, which is what the meta block
-                // will report.
-                tracing::warn!("embedding failed, falling back to FTS: {}", e);
+                // path than "embedder unavailable at startup" — fall
+                // through to keyword_only mode below, which is what the
+                // meta block will report.
+                //
+                // v1.0.0 #2577 — the WARN + the
+                // `ai_memory_recall_embed_degraded_total` counter are
+                // emitted by `recall_query_embedding` itself, so every
+                // surface reports the degrade identically instead of each
+                // call site inventing its own message.
             }
         }
     }
