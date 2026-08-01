@@ -6,29 +6,50 @@ time IS the user experience.** Operators must be able to know — without
 reading source code — what each tool is allowed to cost and whether the
 build still meets that cost.
 
-This document is the authoritative budget table. The CI guard
-(`.github/workflows/bench.yml`, Stream F) and the `ai-memory bench`
-subcommand (Stream E) both read from these targets — every pull
-request against `main`, `develop`, or `release/**` runs the bench
-workload on `ubuntu-latest` and fails when any p95 exceeds its
-target by more than the published 10% tolerance.
+This document is the authoritative budget table. The `ai-memory bench`
+subcommand (Stream E) and the Bench workflow (`.github/workflows/bench.yml`,
+Stream F) both read from these targets. `ai-memory bench` exits non-zero
+when any measured p95 exceeds its target by more than the published 10%
+tolerance (`P95_TOLERANCE = 1.10`, `src/bench.rs`), and the workflow
+propagates that exit code.
+
+> **The Bench workflow is ADVISORY — it does not block a merge.** Its own
+> header says so verbatim ("Bench is advisory (not in required-status-checks)",
+> `.github/workflows/bench.yml:18`) and it appears **zero** times in
+> `scripts/qc-allowlists/required-contexts-release.txt`, the mirror of the
+> required-status-check set on `release/v1.0.0`. A budget breach turns the
+> Bench run red and lands the failing table in the run summary; it does not
+> stop the pull request. Treat these budgets as a published contract plus a
+> loud, unmissable signal — not as a merge gate.
 
 ## Budget Table
 
-Rows marked **\*[advisory]\*** are published targets that do not yet have a
-corresponding bench in `src/bench.rs` — they are operator-facing performance
-contracts pending the Stream E embedder fixture and related follow-ups (see
-Status table below). Rows without the marker are exercised by
-`ai-memory bench` on every PR via `.github/workflows/bench.yml`.
+Every row below sits in **exactly one** of four buckets, marked inline:
 
-In the current table: **7 of 14 rows are bench-verified**; the remaining 7
-are advisory targets.
+- **(no marker)** — exercised by `ai-memory bench` in the advisory Bench
+  workflow on every non-docs PR + trunk push. These rows have a real
+  `Operation` variant in `src/bench.rs` and a mechanically-pinned budget
+  (`operation_targets_match_performance_md`).
+- **\*[advisory]\*** — a published target with **no** bench in `src/bench.rs`.
+  Nothing measures it and nothing enforces it; it is an operator-facing
+  contract pending the Stream E embedder fixture and related follow-ups
+  (see the Status table below).
+- **\*[bench: `hnsw_rebuild_async`]\*** — measured by a **separate** manual
+  bench target (`cargo bench --bench hnsw_rebuild_async`), not by
+  `ai-memory bench` and not by any CI job.
+- **\*[not a budget]\*** — an audit note recorded in the table for context;
+  it publishes no target.
+
+Counted at HEAD, the table holds **17 rows: 7 exercised by `ai-memory bench`
+(8 `Operation` variants — the "depth ≤ 3" row covers both `KgQueryDepth1`
+and `KgQueryDepth3`), 8 advisory with no producer, 1 measured by the
+separate `hnsw_rebuild_async` bench, and 1 that is not a budget at all.**
 
 | Operation | Target (p95) | Target (p99) | Notes |
 |---|---|---|---|
 | `memory_session_start` hook | < 100 ms | < 200 ms | *[advisory]* Claude Code hook critical path |
 | `memory_recall` (hot, depth=1) | < 50 ms | < 150 ms | Felt during agent reasoning |
-| `memory_recall` (rerank stage, depth=1) | < 60 ms | < 180 ms | #1871 — keyword recall + the handler-layer cross-encoder rerank pass (lexical stand-in in the bench). Recall budget + rerank-stage headroom; makes the rerank STAGE COST visible to the Bench p95 gate. |
+| `memory_recall` (rerank stage, depth=1) | < 60 ms | < 180 ms | #1871 — keyword recall + the handler-layer cross-encoder rerank pass (lexical stand-in in the bench). Recall budget + rerank-stage headroom; makes the rerank STAGE COST visible to the Bench p95 check. |
 | `memory_recall` (cold, full hybrid) | < 200 ms | < 500 ms | *[advisory]* First-query path |
 | `memory_recall` (budget, `budget_tokens=4096`) | < 90 ms | < 200 ms | *[advisory]* v0.6.3.1 R1 — autonomous tier budget. Adds cl100k_base BPE tokenization on the survivors only; budget-unset path is unchanged (skips BPE, falls back to a byte heuristic for the `tokens_used` tally). The first call in a process pays a one-shot ~200 ms BPE table parse, amortized away from the steady-state p95. |
 | `memory_store` (no embedding) | < 20 ms | < 50 ms | Pure write |
@@ -41,14 +62,15 @@ are advisory targets.
 | `memory_get_taxonomy` (full tree) | < 100 ms | < 250 ms | *[advisory]* New v0.6.3 |
 | `curator cycle` (1k memories) | < 60 s | < 120 s | *[advisory]* Background |
 | `federation ack` (W=2 quorum) | < 2 s | < 5 s | *[advisory]* Multi-machine |
-| `memory_recall` during HNSW rebuild | < 35 ms | < 100 ms | #968 Wave-2 Tier-C3. v0.6 baseline (synchronous rebuild) blocked search for ~3-10 s on a 100k-vector rebuild; v0.7.x post-#968 uses the async-rebuild + double-buffer pattern so search p95 stays under 35 ms during a rebuild. Bench-verified by `cargo bench --bench hnsw_rebuild_async` (release build, 2k-vector fixture: p95 43 µs, p99 56 µs). |
-| MCP tool dispatch (serial, p95 vs slowest-tool wall-clock) | N/A — bounded by slowest tool | N/A | #965 Wave-2 Tier-B5 audit (2026-05-21). MCP stdio is single-threaded by JSON-RPC protocol design (a length-capped `read_until(b'\n')` reader in `src/mcp/mod.rs` post-#1249 DoS guard, `MCP_MAX_LINE_BYTES`; the pre-#1249 form was `for line in stdin.lock().lines()`); throughput is bounded by the slowest tool's wall-clock latency, NOT by lock contention. There is no `Arc<Mutex<Connection>>` in the MCP path — `handle_request` takes a plain `&Connection`. The "73 tools serialize on a mutex" framing in #842 Tier-B5 / #965 conflated the HTTP daemon's `Arc<Mutex<...>>` shape with MCP; corrected at audit. Regression-pinned by `src/mcp/mod.rs::tests::issue_965_audit_*` (3 tests, all green). HTTP path lock contention IS a real perf concern and is tracked separately. |
+| `memory_recall` during HNSW rebuild | < 35 ms | < 100 ms | *[bench: `hnsw_rebuild_async`]* #968 Wave-2 Tier-C3. v0.7.x post-#968 uses the async-rebuild + double-buffer pattern so search stays served off the `active` graph while `warming` builds. Budget pinned in the bench itself (`benches/hnsw_rebuild_async.rs::P95_BUDGET = 35 ms`). **Measured at a 2,000-vector fixture** (release build, v0.7.0 run recorded in `CHANGELOG.md` + `docs/v0.7.0/release-notes.md`): p95 43 µs, p99 56 µs. The bench's DEFAULT fixture is **5,000** vectors (`DEFAULT_FIXTURE_SIZE`); 2,000 is reached with `HNSW_BENCH_SIZE=2000`. **No run at any larger corpus has been recorded, and none is extrapolated here** — a 100k-vector figure would be a 20–50× extrapolation, not a measurement. Not run by any CI job. |
+| MCP tool dispatch (serial, p95 vs slowest-tool wall-clock) | N/A — bounded by slowest tool | N/A | *[not a budget]* #965 Wave-2 Tier-B5 audit (2026-05-21). MCP stdio is single-threaded by JSON-RPC protocol design (a length-capped `read_until(b'\n')` reader in `src/mcp/mod.rs` post-#1249 DoS guard, `MCP_MAX_LINE_BYTES`; the pre-#1249 form was `for line in stdin.lock().lines()`); throughput is bounded by the slowest tool's wall-clock latency, NOT by lock contention. There is no `Arc<Mutex<Connection>>` in the MCP path — `handle_request` takes a plain `&Connection`. The "73 tools serialize on a mutex" framing in #842 Tier-B5 / #965 conflated the HTTP daemon's `Arc<Mutex<...>>` shape with MCP; corrected at audit. Regression-pinned by `src/mcp/mod.rs::tests::issue_965_audit_*` (3 tests, all green). HTTP path lock contention IS a real perf concern and is tracked separately. |
 
 > **See also:** `docs/performance.html` publishes a complementary,
 > per-feature-tier view (keyword / semantic / autonomous) of these
 > budgets — equal-or-tighter targets stratified by which capabilities
 > are loaded. Both surfaces are kept in agreement; this file is the
-> canonical aggregate contract that the `bench.yml` CI guard reads.
+> canonical aggregate contract, and `src/bench.rs` is the machine-readable
+> SSOT the advisory `bench.yml` workflow actually executes.
 
 > **v0.9.0 P0-1 (#1869) — pure recall (informational, budgets
 > unchanged):** recall no longer performs its synchronous write-back
@@ -107,7 +129,7 @@ and uses the recall pipeline's linear-scan fallback, which answers in
 
 ## Corpus-scale budgets (#1579 B8)
 
-The budget table above is enforced by the **default** `ai-memory bench`
+The budget table above is exercised by the **default** `ai-memory bench`
 workload, which (per-op seeding included) never grows past ~500 rows —
 small enough that corpus-scale regressions are invisible (the #1579 P1
 perf audit measured `memory_recall` p95 at **361 ms vs the 50 ms
@@ -153,13 +175,23 @@ Measured on this branch at `--scale 10000` (release build):
 | `memory_search` (FTS5) | 1.42 ms | 60 ms | ~42× |
 | `memory_recall` (hot, keyword) | 15.44 ms | 80 ms | ~5.2× |
 
-### CI enforcement
+### CI coverage (advisory)
 
-`.github/workflows/bench.yml` runs `ai-memory bench --scale 10000`
-as a dedicated gate step on every PR + trunk push (alongside the
-default-workload gate) and uploads `bench-results-10k.json` with the
-artifact set. The run fails when any operation's measured p95 exceeds
-its scale budget by more than the published 10% tolerance.
+`.github/workflows/bench.yml` runs `ai-memory bench --scale 10000` as a
+dedicated step alongside the default-workload step, and uploads
+`bench-results-10k.json` with the artifact set. The step exits non-zero —
+turning the Bench run red — when any operation's measured p95 exceeds its
+scale budget by more than the published 10% tolerance.
+
+Two limits on that coverage, both load-bearing:
+
+1. **It does not run on every PR.** Both the `pull_request` and `push`
+   triggers carry `paths-ignore: ['docs/**', '**/*.md']`
+   (`.github/workflows/bench.yml:20-28`), so a PR touching only docs or
+   Markdown never runs the bench at all.
+2. **A failure blocks nothing.** The Bench workflow is advisory and is not
+   in the required-status-check set (see the note at the top of this
+   document). A red Bench run is a signal to a human, not a merge block.
 
 ### Baseline regression guard (#1987)
 
@@ -225,9 +257,10 @@ honest posture, per the #1961 acceptance criteria:
   already admits 1,000,000. The two verified operations + their
   budgets are unit-tested (`src/bench.rs` `verified_run_appends_*`,
   `verified_scale_budgets_add_crypto_headroom`).
-- **CI-gated scale — SHIPPED.** The `--scale 10000` gate (above) runs
-  every PR; adding `--verified` to it exercises the attested path at
-  the CI-affordable scale.
+- **CI-exercised scale — SHIPPED.** The `--scale 10000` step (above) runs
+  on every non-docs PR in the advisory Bench workflow; adding `--verified`
+  to it would exercise the attested path at the CI-affordable scale.
+  Advisory, like the rest of that workflow — it reddens, it does not block.
 - **1M numbers — REPRODUCIBLE-METHODOLOGY, not pinned.** This document
   deliberately does **not** pin fabricated 1M p95 budgets. Beyond the
   largest pinned `SCALE_BUDGETS` row (10k) the resolver reuses that
@@ -339,37 +372,56 @@ In **Batman-active mode** every `memory_store` runs through:
 - **Form 2** — synchronous atomise-before-embed.
 - **Form 6** — `regex_then_llm` kind classification (one prompt).
 
-All three are blocking on the write path. Until #654's distilled
-300M hot-path model lands, these are the **measured** budgets against
-`gemma4:e4b` on the Apple M4 reference baseline:
+All three are blocking on the write path.
 
-| Form | Stage | p50 warm | p95 warm | p99 cold | Knob to bypass |
+### Per-Form stage figures — ESTIMATED DESIGN FIGURES, NOT MEASURED
+
+> **No instrumentation produces the per-Form numbers below.** The only
+> harness on this path is `scripts/batman-bench.sh`, and it times the
+> **end-to-end `ai-memory store` subprocess wall clock** across four
+> content-size buckets (tiny 128 B / medium 2 KiB / large 8 KiB / huge
+> 32 KiB), emitting one `p50/p95/p99/min/max` line per bucket
+> (`:69-93`, `:116-121`, `:150-157`). It has **no per-Form breakdown, no
+> LLM cold-start timer, no JSON-re-extract counter and no dedup-pass
+> timer.** The table below is the design model that motivated the three
+> bypass knobs — it is an engineering estimate against `gemma4:e4b`, not
+> a measurement, and no run has ever produced it. Do not quote these
+> cells as measured latency. To get real numbers on this path, run
+> `scripts/batman-bench.sh` and read its four bucket lines.
+
+| Form | Stage | p50 warm *(est.)* | p95 warm *(est.)* | p99 cold *(est.)* | Knob to bypass |
 |------|-------|----------|----------|----------|----------------|
 | Form 1 | synthesis batch | 0.5 s | 3 s   | 30 s | `autonomous_hooks=false` (per-namespace) |
 | Form 2 | atomise sync    | 0.4 s | 2.5 s | 25 s | `auto_atomise_mode = "deferred"` |
 | Form 6 | kind classify   | 0.2 s | 1.5 s | 15 s | `auto_classify_kind = "regex_only"` |
-| **End-to-end `memory_store`** | (sum) | **~1.1 s** | **~7 s** | **~70 s** | All three |
+| **End-to-end `memory_store`** | (sum) | **~1.1 s** *(est.)* | **~7 s** *(est.)* | **~70 s** *(est.)* | All three |
 
-The p99 cold ceiling is the load-bearing number — a thinking-mode
-gemma cold start blocks an entire 70 s on the worst case. The same
-write without Batman-active mode is < 50 ms.
+The p99 cold estimate is the load-bearing number for capacity planning —
+a thinking-mode gemma cold start is modelled as blocking the write for
+tens of seconds in the worst case. The same write with Batman-active mode
+off is the plain keyword-tier write path, whose **pinned, bench-exercised**
+budget is **< 20 ms p95** (`Operation::StoreNoEmbedding`, `src/bench.rs`).
 
 ### Operator knobs (interim, while #654 TABLED)
 
 Three documented operator escape hatches let a Batman-active deployment
-trade latency for capability without re-compiling:
+trade latency for capability without re-compiling. The knobs are real and
+shipped; the recovery figures are the **same estimated design model** as
+the table above (each is that Form's estimated stage cost), **not measured
+savings**:
 
 1. `auto_classify_kind = "regex_only"` (per-namespace `GovernancePolicy`)
-   — removes Form 6 entirely. Recovers ~1.5 s p95 / 15 s p99 cold.
+   — removes Form 6 entirely. Est. recovery ~1.5 s p95 / 15 s p99 cold.
 2. `auto_atomise_mode = "deferred"` — Form 2 runs in a background
-   worker. Recovers ~2.5 s p95 / 25 s p99 cold. The atomise-result
+   worker. Est. recovery ~2.5 s p95 / 25 s p99 cold. The atomise-result
    row appears via the curator sweep within 60 s.
 3. `AI_MEMORY_AUTO_CONFIDENCE=0` — disables Form 5 calibration on the
-   write path. Recovers ~100 ms p95 (small; Form 5 is the cheapest of
+   write path. Est. recovery ~100 ms p95 (small; Form 5 is the cheapest of
    the four).
 
-A namespace that sets all three knobs falls back to the keyword-tier
-write budget (< 50 ms p95).
+A namespace that sets all three knobs falls back to the plain keyword-tier
+write path, whose pinned budget is **< 20 ms p95**
+(`Operation::StoreNoEmbedding`).
 
 ### Reranker worker-pool memory footprint (#1867 B7-RR-2 / G7-step2)
 
@@ -399,18 +451,22 @@ throughput; operators on memory- or thread-constrained endpoints can pin
 `AI_MEMORY_RERANK_POOL_SIZE=1` to restore the pre-#1867 single-worker
 footprint.
 
-### v0.7.0 attack plan — measured contributors
+### v0.7.0 attack plan — ESTIMATED contributor ranking, NOT MEASURED
 
-The **worst single contributor** measured on `scripts/batman-bench.sh`
-is Form 1 synthesis cold start (LLM round-trip + JSON-extract).
-Ranked by p99 contribution:
+> **`scripts/batman-bench.sh` does not produce this ranking.** It emits
+> four end-to-end wall-clock stat lines by content size; it does not
+> attribute latency to a contributor. There is no LLM-cold-start timer,
+> no JSON-re-extract counter and no atom-dedup timer anywhere in the
+> tree. The ordering below is the design hypothesis the v0.7.1 work queue
+> was built from — it is **not** a profile, and the "bench-verified" note
+> that previously sat on row 4 was wrong and has been removed.
 
-| Rank | Contributor                       | p99 cold | v0.7.1 attack |
+| Rank | Contributor                       | p99 cold *(est.)* | v0.7.1 attack |
 |------|-----------------------------------|----------|---------------|
 | 1    | LLM cold start (model load)       | ~25 s    | model-keep-alive warmup hook in curator |
 | 2    | gemma thinking-mode generation    | ~12 s    | thinking-mode opt-out per Form (Form 1 doesn't need it) |
 | 3    | Form 1 JSON re-extract loop       | ~0.8 s   | switch to strict-JSON Ollama mode (already supported); we currently re-extract on the failure path |
-| 4    | Form 2 atom de-dup pass           | ~0.6 s   | bench-verified; in scope for v0.7.1 PERF-17 |
+| 4    | Form 2 atom de-dup pass           | ~0.6 s   | in scope for v0.7.1 PERF-17 |
 | 5    | Form 6 regex pre-pass             | ~0.05 s  | already optimal |
 
 ### v0.7.1 work queue
@@ -427,21 +483,44 @@ These three changes target the top-3 contributors and are estimated
 at ~150 LOC total. They land in v0.7.1 if #654 stays TABLED past the
 v0.7.0 ship date.
 
-### Bench harness
+### Bench harness — what it actually measures
 
-`scripts/batman-bench.sh` produces the JSON measurement table; the
-shape is suitable for ingestion by the bench-results artifact already
-attached to `bench.yml`. The script is reproducible (operator runs
-it locally, on the dogfood node, or in CI nightly).
+`scripts/batman-bench.sh` is the only harness on this path. It shells out
+to `ai-memory store` and times the **subprocess wall clock** end to end,
+`$SAMPLES` times per content-size bucket, across four buckets — tiny
+(128 B), medium (2 KiB), large (8 KiB), huge (32 KiB) — and prints one
+human-readable `p50=… p95=… p99=… min=… max=…` line per bucket, with
+failed/governance-refused stores excluded from the percentiles and
+counted separately (#1616).
 
-## CI Guard Threshold
+It emits **text, not JSON**, it is **not** wired into `bench.yml`, and it
+produces **no per-Form, per-contributor, or cold-start attribution** — an
+operator who needs those numbers has to build the instrumentation first.
+The script is reproducible: an operator runs it locally or on the dogfood
+node against a Batman-active namespace.
 
-The `bench.yml` workflow (Stream F) runs `ai-memory bench` on every
-PR against `main`, `develop`, or `release/**` and on every push to
-those branches. It **fails the build when any operation's measured
-p95 exceeds its target by more than 10%.** The full table lands in
-the workflow run summary; the JSON document is uploaded as a
-`bench-results` artifact for downstream tooling.
+## CI Guard Threshold — advisory
+
+The `bench.yml` workflow (Stream F) runs `ai-memory bench` on PRs against
+`main`, `develop`, or `release/**` and on pushes to those branches — minus
+the docs-only PRs its `paths-ignore` filter excludes. The bench step
+**exits non-zero, turning the Bench run red, when any operation's measured
+p95 exceeds its target by more than 10%.** The full table lands in the
+workflow run summary; the JSON document is uploaded as a `bench-results`
+artifact for downstream tooling.
+
+**That red run does not block the merge.** `bench.yml:18` states it
+verbatim — "Bench is advisory (not in required-status-checks)" — and the
+workflow contributes zero entries to
+`scripts/qc-allowlists/required-contexts-release.txt`. Adding
+`ai-memory bench (ubuntu-latest)` to that mirror (and to branch
+protection) is what would turn this into a merge gate; until then, treat
+the budget table as a published contract enforced by review, not by
+mechanism.
+
+The 10% figure is real and single-sourced: `P95_TOLERANCE = 1.10` in
+`src/bench.rs`, and the independent relative-regression default is
+`DEFAULT_REGRESSION_THRESHOLD_PCT = 10.0`.
 
 p99 targets in the table above are **informational** until the v0.6.3
 soak window closes. They are recorded here to make the long-tail goal
@@ -461,6 +540,42 @@ The targets in the table above are calibrated for:
   10% guard band. macOS and Windows runners are exercised for
   correctness but are not the latency reference.
 
+Apple M4 / 32 GB is the reference machine for **every latency budget in
+this document** and in `docs/performance.html`. It is not the machine
+behind the LongMemEval retrieval-quality numbers — those are anchored to
+an Apple Mac mini (2023), M2, 16 GB, macOS 14.5, recorded in
+`benchmarks/longmemeval/methodology.md §1`. Two different measurement
+families, two different machines; do not read one machine's numbers
+against the other's contract.
+
+### macOS runs are held to a 3× looser bar — `MACOS_BUDGET_MULT = 3.0`
+
+**The published budget is not the pass bar on macOS.** `src/bench.rs`
+compiles a platform multiplier:
+
+```rust
+#[cfg(target_os = "macos")]  pub const MACOS_BUDGET_MULT: f64 = 3.0;
+#[cfg(not(target_os = "macos"))] pub const MACOS_BUDGET_MULT: f64 = 1.0;
+```
+
+The pass/fail verdict uses `effective_target_p95_ms() = target_p95_ms() *
+MACOS_BUDGET_MULT`, then applies the 10% tolerance on top. So on macOS the
+real pass bar is **3.3× the published budget**:
+
+> `memory_recall (hot, depth=1)` publishes **< 50 ms**. On macOS it PASSES
+> at a measured p95 of **165 ms** (50 × 3.0 × 1.10). On Linux and Windows
+> it fails above 55 ms.
+
+This was introduced under #1193 because the `macos-latest` GHA pool has
+substantially higher I/O and cold-start variance at the small iteration
+counts the end-to-end CLI test drives. It is disclosed here because macOS
+(Apple M4) is the very platform this document names as the reference
+baseline — an operator self-verifying on a Mac gets a 3.3× wider pass
+band than the published number implies. The JSON envelope's
+`target_p95_ms` field still reports the canonical published budget, so
+dashboards and baselines are unaffected; only the PASS/FAIL verdict moves.
+The advisory CI gate runs on `ubuntu-latest`, where the multiplier is 1.0.
+
 If you measure on materially slower hardware (older laptops, heavily
 contended cloud instances, ARM developer boards) and see numbers above
 the targets, that is expected — these are *target* budgets for
@@ -475,7 +590,8 @@ reference hardware, not absolute floors for every machine.
 | Per-tool MCP `tracing` spans | ✅ landed | `src/mcp.rs` `handle_request` — `mcp_tool_call` span carries `tool` + `rpc_id`; `elapsed_ms` emitted at exit |
 | KG operations in `bench` | ✅ landed | `src/bench.rs` — fan-out fixture (50 × 4 outbound, every link `valid_from`-stamped) drives `kg_query` depth=1 + `kg_timeline`; chain fixture (50 chains × 5 hops) drives `kg_query` depth=3 + depth=5 |
 | Embedding-bound operations in `bench` | 🚧 Stream E follow-up | needs an embedder fixture decision (opt-in flag vs cfg(test) fake vs pre-cached model) — see iter-0017 handoff |
-| `bench.yml` CI workflow | ✅ landed | `.github/workflows/bench.yml` — gates every PR and trunk push on `ubuntu-latest`; uploads `bench-results` artifact (JSON + table) |
+| `bench.yml` CI workflow | ✅ landed, **advisory** | `.github/workflows/bench.yml` — runs on `ubuntu-latest` for PRs + trunk pushes that are not docs-only (`paths-ignore`); uploads `bench-results` artifact (JSON + table). **Not in required-status-checks — a red run does not block a merge** |
+| Baseline relative-regression compare | ✅ landed, **advisory + currently self-skipping** | `.github/workflows/bench.yml` "Baseline regression (advisory, #1987)" — never fails the build, and skips the compare entirely while `performance/baseline.json` carries `bootstrap: true` |
 | Measured numbers in CI history | ✅ collecting | each workflow run's summary carries the table; the JSON artifact is retained per GitHub Actions retention policy |
 
 The status table is updated as each Stream lands within the v0.6.3
@@ -488,8 +604,18 @@ The `ai-memory bench` subcommand seeds an in-memory disposable
 SQLite database (the operator's main DB is untouched) and reports
 per-operation p50/p95/p99 against the budgets above. Exit code is
 non-zero when any p95 exceeds its budget by more than the published
-10% tolerance — the same binary the `bench.yml` CI guard runs on
-every pull request.
+10% tolerance — the same subcommand the advisory `bench.yml` workflow
+runs.
+
+Two caveats before you compare your run to the published table:
+
+- **On macOS your pass bar is 3.3× the published budget**, not 1.1× —
+  see `MACOS_BUDGET_MULT` above. The `Status` column is computed against
+  the platform-effective bar; the `Target (p95)` column shown is the
+  canonical published number. A macOS PASS is therefore not evidence the
+  published budget was met.
+- **`bench.yml` is advisory.** A non-zero exit there reddens the run; it
+  does not block a merge.
 
 ```
 $ ai-memory bench
@@ -542,40 +668,72 @@ remains unchanged and is the supported single-binary path; AGE is opt-in
 for deployments that already run Postgres and benefit from native
 graph-traversal acceleration.
 
-The table below records the **v0.7.0 target budgets** for both backends
-on the canonical 1000-memory fixture (`benchmarks/v063/canonical_workload.json`).
-These are aspirational p95 budgets, not measured numbers — they define
-the contract the J8 CI gate enforces against the AGE-vs-CTE bench.
+### AGE-vs-CTE speedup — what exists, and what does not
 
-| depth | CTE p95 | AGE p95 | speedup |
-|---|---|---|---|
-| 1 | 8 ms   | 6 ms  | 1.3x |
-| 3 | 35 ms  | 18 ms | 1.9x |
-| 5 | 120 ms | 70 ms | 1.7x |
+**There is no AGE job in CI, and no per-depth AGE budget table.**
 
-> The **J8 CI gate** (see `.github/workflows/bench.yml`, AGE job)
-> enforces **≥ 30% AGE-over-CTE speedup at depth=5** on every PR that
-> touches the KG path. If AGE ever fails to clear that bar, the AGE
-> backend is dropped per the v0.7 epic exit criteria — the complexity
-> only earns its keep when it pays for itself.
+What **does** exist is `benches/age_vs_cte.rs`, a manually-run bench that
+measures `kg_query` at **depth = 5 only** (`DEPTH: usize = 5`) against both
+backends over a 200-node / ~800-edge fixture, 30 measured iterations after
+a 5-iteration warm-up. It carries the ≥30% threshold as a real, in-source
+constant:
 
-**Workload:** 1k canonical memories, fan-out fixture (50 × 4) for
-depth=1, chain fixture (50 × 5 hops) for depth=3 / depth=5. Same
-fixtures the SQLite-CTE bench rows above use, so the two backends are
-measured against an identical traversal shape.
-
-**Reproduce locally:**
-
-```bash
-# CTE (default, no extra services)
-cargo bench --bench kg_bench
-
-# AGE (requires Postgres + AGE extension on PG_DSN)
-cargo bench --bench kg_bench --features=age
+```rust
+/// AGE p95 must be at most this fraction of the CTE p95 — i.e. >= 30% faster.
+const AGE_SPEEDUP_RATIO: f64 = 0.70;
 ```
 
-The AGE bench skips cleanly when the `age` feature is not enabled or
-when no `PG_DSN` is exported, so the default CI matrix is unaffected.
+When **both halves ran** and AGE misses that ratio, the bench exits
+non-zero and writes `status: "failed_age_too_slow"` into
+`target/bench/age-vs-cte.json`. That threshold is honest and is worth
+keeping.
+
+What must not be claimed:
+
+- **No CI job runs it.** `.github/workflows/bench.yml` declares exactly two
+  jobs (`bench`, `regenerate-baseline`); `grep -rni 'age'` over that file
+  returns **zero** hits, and `grep -rn 'age_vs_cte' .github/` returns zero.
+  There is no "J8 CI gate" and no "AGE job". The previously-published exit
+  criterion — "if AGE ever fails to clear that bar, the AGE backend is
+  dropped" — could never fire, because nothing in CI ever evaluates the
+  bar. Whether to wire an AGE bench job (and restore a `postgres-age`
+  nightly) is an open product decision, not a shipped control.
+- **No per-depth AGE budgets are published here any more.** The previous
+  depth-1 / depth-3 / depth-5 CTE-vs-AGE p95 table had no producer at all:
+  the bench measures depth 5 exclusively, so depths 1 and 3 were never
+  measurable by it, and no recorded run exists for any of the six cells.
+  Unproduced numbers are not data, so the table is gone rather than
+  relabelled.
+- **The bench self-skips silently.** Without `AI_MEMORY_TEST_AGE_URL` it
+  prints `skipped: no Postgres URL` and **exits 0**; built without
+  `--features sal-postgres` it exits 0 with
+  `skipped: built without sal-postgres feature`. Running it in CI
+  unconditionally would therefore be green-on-nothing unless a live
+  Postgres+AGE fixture is provisioned first.
+
+**Workload:** 200 fixture memories, 4 directed edges each (~800 edges),
+depth-5 traversal; 30 iterations after 5 warm-up.
+
+**Reproduce locally** (verified against `cargo metadata` at HEAD — the bench
+target is `age_vs_cte`, and the only relevant cargo feature is
+`sal-postgres`; there is **no** `kg_bench` target and **no** `age` feature):
+
+```bash
+# Both halves. Requires a live Postgres with the AGE extension installed
+# and the `memory_graph` projection bootstrapped (J1).
+AI_MEMORY_TEST_AGE_URL=postgresql://user:pass@host/db \
+  cargo bench --features sal-postgres --bench age_vs_cte
+
+# CTE half only (vanilla Postgres, no AGE). Prints
+# "skipped AGE half: extension not installed" and exits 0.
+AI_MEMORY_TEST_POSTGRES_URL=postgresql://user:pass@host/db \
+  cargo bench --features sal-postgres --bench age_vs_cte
+```
+
+Outputs `target/bench/age-vs-cte.json` plus a markdown table on stdout.
+Note the gating env vars are `AI_MEMORY_TEST_AGE_URL` /
+`AI_MEMORY_TEST_POSTGRES_URL` — **not** `PG_DSN`, which the bench never
+reads.
 
 Design rationale, dual-path test strategy, and the rollback criterion
 live in [`docs/v0.7/rfc-attested-cortex.md`](docs/v0.7/rfc-attested-cortex.md)
@@ -610,9 +768,10 @@ Three reasons, in order of importance:
    start cannot afford silent latency. Publishing budgets — even
    before all measurements are live — signals operational maturity
    and gives operators a number to argue with.
-2. **Regression guard.** A Rust binary can quietly get slower over
-   many releases. Explicit per-operation budgets, gated in CI, make
-   regressions visible in the PR that introduces them.
+2. **Regression signal.** A Rust binary can quietly get slower over
+   many releases. Explicit per-operation budgets, checked by an advisory
+   CI run, make regressions **visible** in the PR that introduces them.
+   Visible, not blocked — see "CI Guard Threshold — advisory" below.
 3. **Capacity planning.** Operators choosing where to host
    ai-memory (laptop, VPS, beefy server) need a comparison point.
    "p95 < 100 ms on M4" beats "should be fast enough."
