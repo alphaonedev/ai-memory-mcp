@@ -99,6 +99,19 @@ const BULK_EMBED_CHUNK: usize = 100;
 /// cannot flood the log.
 const BULK_TRACE_TARGET: &str = "bulk_create";
 
+/// #2588 — how many per-row detail lines one call may emit before the rest are
+/// suppressed.
+///
+/// Two obligations pull against each other here. #851 requires the FULL raw
+/// detail to reach the operator log, because only the sanitized label reaches
+/// the wire and an operator otherwise cannot debug at all. #2588 requires that
+/// a 500-row rejection not flood the log. The resolution is a bounded prefix
+/// plus the always-emitted per-call summary: the first failures carry their
+/// full detail, the rest are counted rather than printed, and the summary line
+/// always reports the true totals — so the log is never a lie about how many
+/// rows failed, only about which of them it chose to spell out.
+const BULK_ROW_LOG_LIMIT: usize = 20;
+
 // ---------------------------------------------------------------------------
 // #2551 / #2552 — the per-row outcome ledger.
 // ---------------------------------------------------------------------------
@@ -120,6 +133,8 @@ struct BulkLedger {
     warnings: Vec<&'static str>,
     /// Highest-precedence rejection class seen, for the whole-request status.
     worst: Option<BulkRowErrorClass>,
+    /// #2588 — per-row detail lines emitted so far (see `BULK_ROW_LOG_LIMIT`).
+    logged: usize,
     embed_status: EmbedStatus,
 }
 
@@ -134,6 +149,7 @@ impl BulkLedger {
             pending: Vec::new(),
             warnings: Vec::new(),
             worst: None,
+            logged: 0,
             embed_status: EmbedStatus::Indexed,
         }
     }
@@ -151,12 +167,22 @@ impl BulkLedger {
     /// #2552 — record a rejection whose typed class the caller already knows
     /// (see [`super::create::CreateFieldError::as_bulk_class`]).
     fn reject_class(&mut self, index: usize, field: &str, class: BulkRowErrorClass, raw: &str) {
-        tracing::warn!(
-            target: BULK_TRACE_TARGET,
-            row = index,
-            code = class.code,
-            "bulk_create: row rejected: {raw}"
-        );
+        self.logged += 1;
+        if self.logged <= BULK_ROW_LOG_LIMIT {
+            tracing::warn!(
+                target: BULK_TRACE_TARGET,
+                row = index,
+                code = class.code,
+                "bulk_create: row rejected: {raw}"
+            );
+        } else if self.logged == BULK_ROW_LOG_LIMIT + 1 {
+            tracing::warn!(
+                target: BULK_TRACE_TARGET,
+                limit = BULK_ROW_LOG_LIMIT,
+                "bulk_create: further per-row detail suppressed for this call; \
+                 the summary line below carries the true totals"
+            );
+        }
         let mut entry = json!({
             "index": index,
             "code": class.code,
@@ -243,6 +269,10 @@ impl BulkLedger {
     fn into_response(self) -> axum::response::Response {
         let status = self.status();
         let (deduped, rejected) = (self.deduped(), self.rejected());
+        // #2588 — ALWAYS emitted when the batch did not fully apply, and
+        // never suppressed: it is the one line an operator correlating a lost
+        // corpus load can rely on. Pre-#2588 a call that rejected every row
+        // logged nothing at any level.
         if status != StatusCode::OK {
             // #2588 item 3 — ONE structured summary line per call.
             tracing::warn!(
@@ -1275,5 +1305,25 @@ mod tests {
         assert!(!l.embed_status.is_degraded());
         l.embed_status = EmbedStatus::Failed("boom".to_string());
         assert!(l.embed_status.is_degraded());
+    }
+}
+
+#[cfg(test)]
+mod log_bound_tests {
+    use super::*;
+
+    /// #2588 — per-row detail is bounded, but the COUNTERS never are: the
+    /// summary must report every rejection even when most detail lines were
+    /// suppressed, or the log would understate the loss.
+    #[test]
+    fn per_row_logging_is_bounded_but_counters_are_not() {
+        let n = BULK_ROW_LOG_LIMIT * 3;
+        let mut l = BulkLedger::new(n);
+        for i in 0..n {
+            l.reject(i, "create", "title cannot be empty");
+        }
+        assert_eq!(l.rejected(), n, "every rejection is counted");
+        assert_eq!(l.logged, n, "and every one is accounted for");
+        assert_eq!(l.errors.len(), n, "and every one reaches the caller");
     }
 }
