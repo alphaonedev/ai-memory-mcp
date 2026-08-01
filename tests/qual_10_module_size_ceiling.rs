@@ -413,7 +413,19 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // deliberately does not claim. MEASURED post-change: 27_609.
     // Ceiling 27_400 -> 27_700 (+91 headroom). Bumped in LOCKSTEP with the
     // postgres.rs entry below (same commit, same issue).
-    ("src/storage/mod.rs", 27_700),
+    //
+    // 2026-07-31 (#2580) — `build_list_query` gains the exact
+    // metadata-equality axis (the GIN/`json_each` pushdown that stops
+    // `memory_load_family` materialising 1000 rows to return 0) and `list`
+    // splits into the historical 11-arg shape plus `list_filtered`, so the
+    // ~30 existing `db::list` call sites stay untouched. The bulk is the
+    // WHY comment: the predicate rides the SHARED builder precisely so the
+    // #1948 lifecycle allow-list, the expiry guard, the #1579 sargable
+    // namespace arm, the #1834 AS-OF window and the #2383 undecryptable-row
+    // skip all keep applying — a bespoke query would have to re-derive
+    // every one of them. MEASURED post-change: 27_746.
+    // Ceiling 27_700 -> 27_820 (+74 headroom).
+    ("src/storage/mod.rs", 27_820),
     // 2026-07-21 (#1802 R-05 S1) — NEW submodule extracted from
     // storage/mod.rs (doctor / observability probes). Measured 698;
     // ceiling 800 (+102).

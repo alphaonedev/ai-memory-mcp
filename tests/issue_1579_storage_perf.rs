@@ -100,8 +100,9 @@ fn a2_migration_v56_creates_composite_indexes() {
 fn a2_bare_list_walks_composite_index_without_sort() {
     let conn = open_test_db();
     let now = chrono::Utc::now().to_rfc3339();
-    let (sql, _params) =
-        db::build_list_query(None, None, None, &now, None, None, None, None, None, 10, 0);
+    let (sql, _params) = db::build_list_query(
+        None, None, None, &now, None, None, None, None, None, None, 10, 0,
+    );
     let plan = explain(&conn, &sql);
     assert!(
         plan.contains("USING INDEX idx_memories_list_order"),
@@ -127,6 +128,7 @@ fn a2_namespace_list_uses_ns_composite_index_without_sort() {
         None,
         None,
         None, // #1834 valid_at
+        None, // #2580 metadata_eq
         10,
         0,
     );
@@ -156,6 +158,7 @@ fn a2_namespace_tier_minpriority_list_stays_sort_free() {
         None,
         None,
         None, // #1834 valid_at
+        None, // #2580 metadata_eq
         10,
         0,
     );
@@ -184,6 +187,7 @@ fn a2_min_priority_only_list_range_scans_composite_index() {
         None,
         None,
         None,
+        None, // #2580 metadata_eq
         10,
         0,
     );

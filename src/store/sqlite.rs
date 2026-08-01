@@ -316,7 +316,16 @@ impl MemoryStore for SqliteStore {
         let tags_first = filter.tags_any.first().map(String::as_str);
         let since = filter.since.map(|d| d.to_rfc3339());
         let until = filter.until.map(|d| d.to_rfc3339());
-        let rows = db::list(
+        // v1.0.0 #2580 — thread the exact metadata-equality axis into the
+        // SAME `build_list_query` shape (SQL pushdown, not a post-filter) so
+        // sqlite and postgres apply the narrowing at the identical point in
+        // the pipeline: BEFORE the SQL `LIMIT`, hence identical row windows
+        // and identical counts across backends.
+        let metadata_eq = filter
+            .metadata_eq
+            .as_ref()
+            .map(|m| (m.key.as_str(), m.value.as_str()));
+        let rows = db::list_filtered(
             &conn,
             filter.namespace.as_deref(),
             filter.tier.as_ref(),
@@ -337,6 +346,7 @@ impl MemoryStore for SqliteStore {
             filter.agent_id.as_deref(),
             // v1.0.0 #1834 — claim-bitemporal AS-OF from the SAL Filter.
             filter.valid_at.as_deref(),
+            metadata_eq,
         )
         .map_err(box_err)?;
         // #910 SAL-level scope=private gate (see `is_visible_to_caller`
