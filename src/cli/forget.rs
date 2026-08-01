@@ -101,6 +101,16 @@ pub fn cmd_forget(
 
     let tier = args.tier.as_deref().and_then(Tier::from_str);
     let conn = db::open(db_path)?;
+    // v1.0.0 #2446 — resolve the FULL matched id set BEFORE the delete
+    // commits (same connection, synchronous), so the federated erasure
+    // outbox can queue every erased id. Empty + free when undrainable.
+    let outbox_ids = crate::federation::erasure_outbox::collect_forget_ids(
+        &conn,
+        args.namespace.as_deref(),
+        args.pattern.as_deref(),
+        tier.as_ref(),
+        None,
+    );
     match db::forget(
         &conn,
         args.namespace.as_deref(),
@@ -109,6 +119,13 @@ pub fn cmd_forget(
         true, // always archive from CLI
     ) {
         Ok(n) => {
+            // Best-effort + infallible: never converts a previously-local,
+            // always-succeeding erasure into an error.
+            crate::federation::erasure_outbox::enqueue_erasures(
+                &conn,
+                &outbox_ids,
+                crate::federation::erasure_outbox::surfaces::CLI_FORGET,
+            );
             if json_out {
                 writeln!(out.stdout, "{}", serde_json::json!({"deleted": n}))?;
             } else {

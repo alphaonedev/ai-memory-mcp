@@ -216,6 +216,15 @@ pub fn cmd_delete(
     }
 
     if db::delete(&conn, &target.id)? {
+        // v1.0.0 #2446 — queue the erasure for federated fan-out. The CLI
+        // never constructs a `FederationConfig` (HTTP `serve` only), so a
+        // local delete used to leave every replica holding the row.
+        // Best-effort + infallible; writes nothing when undrainable.
+        crate::federation::erasure_outbox::enqueue_erasure(
+            &conn,
+            &target.id,
+            crate::federation::erasure_outbox::surfaces::CLI_DELETE,
+        );
         // PR-5 (issue #487): security audit trail.
         crate::audit::emit(crate::audit::EventBuilder::new(
             crate::audit::AuditAction::Delete,
