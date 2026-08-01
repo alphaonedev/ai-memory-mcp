@@ -26,8 +26,8 @@
 
   <!-- R@5 -->
   <g class="stat1">
-    <text x="100" y="105" text-anchor="middle" class="num-green">97.0%</text>
-    <text x="100" y="128" text-anchor="middle" class="lbl">R@5 (485/500)</text>
+    <text x="100" y="105" text-anchor="middle" class="num-green">96.4%</text>
+    <text x="100" y="128" text-anchor="middle" class="lbl">R@5 (482/500)</text>
   </g>
 
   <!-- R@10 -->
@@ -44,7 +44,7 @@
 
   <!-- Speed -->
   <g class="stat4">
-    <text x="580" y="105" text-anchor="middle" class="num-blue">232 q/s</text>
+    <text x="580" y="105" text-anchor="middle" class="num-blue">1.2 q/s</text>
     <text x="580" y="128" text-anchor="middle" class="lbl">keyword FTS5 recall (2.2s/500)</text>
   </g>
 
@@ -54,5 +54,5 @@
     <text x="720" y="128" text-anchor="middle" class="lbl">Cloud API costs</text>
   </g>
 
-  <text x="410" y="170" text-anchor="middle" class="footer">SQLite FTS5 BM25 keyword tier — LLM-independent, local-only, zero cloud API costs · smart-tier anchor 97.2% R@5 (Gemma 4, API venue, #1975)</text>
+  <text x="410" y="170" text-anchor="middle" class="footer">SQLite FTS5 BM25 keyword tier, measured through the shipped binary (harness.py) — LLM-independent, local-only, zero cloud API costs · smart-tier anchor 97.2% R@5 (Gemma 4, shadow harness, API venue, #1975)</text>
 </svg>
