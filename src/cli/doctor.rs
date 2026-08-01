@@ -671,6 +671,23 @@ fn section_storage(conn: &rusqlite::Connection, db_path: &Path) -> ReportSection
     }
 }
 
+/// v1.0.0 #2579 — COMPOSE a section note instead of replacing it.
+///
+/// A `ReportSection` has ONE note slot but a section can surface several
+/// independent findings (the HNSW-cap advisory and the FTS-integrity verdict
+/// both live in `Index`). A bare `note = Some(..)` silently erases whatever
+/// an earlier probe reported — the second finding hides the first, and which
+/// one survives depends on source order rather than on severity.
+fn append_note(note: &mut Option<String>, extra: &str) {
+    match note {
+        Some(existing) => {
+            existing.push_str(" | ");
+            existing.push_str(extra);
+        }
+        None => *note = Some(extra.to_string()),
+    }
+}
+
 fn section_index(conn: &rusqlite::Connection) -> ReportSection {
     let mut facts = Vec::new();
     let mut severity = Severity::Info;
@@ -723,22 +740,47 @@ fn section_index(conn: &rusqlite::Connection) -> ReportSection {
     // making `/health` cheap without adding it here would have deleted the
     // codebase's only integrity signal (#2444: a control that reports
     // success while doing nothing is worse than no control).
+    // The Corrupt-vs-Unavailable split is the SAME discipline the background
+    // checker applies, and for the same reason: "the index disagrees with its
+    // content" and "the check could not be completed" are different findings,
+    // and reporting the second as the first manufactures a corruption alarm out
+    // of (say) lock contention or a connection this process could not use.
     match crate::db::fts_integrity_check(conn) {
         Ok(()) => facts.push((
             "fts_index_integrity".into(),
             "verified (index agrees with the memories table)".into(),
         )),
-        Err(e) => {
-            severity = Severity::Critical;
-            facts.push(("fts_index_integrity".into(), format!("FAILED: {e}")));
-            note = Some(
-                "the FTS5 index disagrees with the memories table — keyword recall will \
-                 silently return FEWER rows than it should. The durable memory TEXT is \
-                 intact; the index is derived and regenerable. Rebuild it with: \
-                 sqlite3 <db> \"INSERT INTO memories_fts(memories_fts) VALUES('rebuild');\""
-                    .to_string(),
-            );
-        }
+        Err(e) => match crate::background::fts_integrity::classify_error(&e) {
+            crate::background::fts_integrity::Outcome::Corrupt => {
+                severity = Severity::Critical;
+                facts.push(("fts_index_integrity".into(), format!("FAILED: {e}")));
+                append_note(
+                    &mut note,
+                    "the FTS5 index disagrees with the memories table — keyword recall will \
+                     silently return FEWER rows than it should. The durable memory TEXT is \
+                     intact; the index is derived and regenerable. Rebuild it with: \
+                     sqlite3 <db> \"INSERT INTO memories_fts(memories_fts) VALUES('rebuild');\"",
+                );
+            }
+            _ => {
+                // NOT a corruption verdict — do not escalate past Warning, and
+                // never downgrade a Critical some earlier probe already set.
+                if severity != Severity::Critical {
+                    severity = Severity::Warning;
+                }
+                facts.push((
+                    "fts_index_integrity".into(),
+                    format!("not verified (check could not complete): {e}"),
+                ));
+                append_note(
+                    &mut note,
+                    "the FTS5 integrity check could not COMPLETE — this is NOT a corruption \
+                     verdict and says nothing about whether the index agrees with the \
+                     memories table. Re-run `ai-memory doctor` when the database is not \
+                     under a concurrent write.",
+                );
+            }
+        },
     }
 
     ReportSection {
