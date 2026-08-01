@@ -1,0 +1,48 @@
+# BURN-DOWN allowlist for scripts/check-doc-symbol-anchors.sh (#2629).
+#
+# FORMAT, one entry per line, everything from the first `#` is comment:
+#
+#     <doc-file> <anchor-token> #<issue> <note>
+#
+# `<anchor-token>` is exactly what the gate prints between the quotes.
+#
+# A MALFORMED entry HARD-FAILS. **A STALE ENTRY ALSO FAILS** — this is
+# a BURN-DOWN ledger, not a pending-fix hold, so it follows the #2494
+# `required-contexts-joblevel-if-allow.txt` discipline rather than the
+# `dual-trigger-cancel-allow.txt` one. The distinction is deliberate:
+# the two PENDING-FIX ledgers this campaign ships
+# (`doc-numeric-claims-pending.txt`, `sdk-route-paths-pending.txt`,
+# `ci-job-claims-pending.txt`) hold claims that a CONCURRENT correction
+# lane is already fixing, so a stale entry there is a race artefact and
+# only a NOTICE. Nothing is concurrently fixing the anchors below, so a
+# stale entry here is pure rot and must fail.
+#
+# ---------------------------------------------------------------------
+# WHY THESE EXIST (2026-08-01, #2629).
+#
+# Each is a documented anchor that does not resolve at `03bbd556` —
+# the class the 3x7 audit graded DISQUALIFYING after sampling 6/6
+# anchors that MISS at HEAD. Most are pre-modularisation paths that
+# survived the Wave-1 `src/handlers.rs` -> `src/handlers/`,
+# `src/mcp.rs` -> `src/mcp/`, and `src/db.rs` -> `src/storage/` splits.
+#
+# HOW TO BURN ONE DOWN: repoint the anchor at HEAD, or drop the path
+# and cite the symbol only, then DELETE the line. The register's
+# ruling applies — "either regenerate the anchors against HEAD or
+# remove the line numbers and cite symbols only. Anchors that miss 6/6
+# are worse than no anchors."
+#
+# MERGE-ORDER NOTE: two of these live in files a concurrent
+# document-correction lane owns (`PERFORMANCE.md`,
+# `docs/security/build-script-vetting.md`). If that lane repoints the
+# anchor, THIS FILE must lose the line in the same merge or the gate
+# reds on a stale entry. That coupling is the price of stale-fails, and
+# it is the right price here.
+# ---------------------------------------------------------------------
+
+PERFORMANCE.md src/mcp.rs                                          #2629 pre-modularisation path; the loop is src/mcp/mod.rs
+docs/ADR-0003-kg-invalidation-eventual-consistency.md src/db.rs    #2629 src/db.rs is now the `pub use storage as db` alias of src/storage/
+docs/RECURSIVE_LEARNING.md src/db.rs                               #2629 same split
+docs/RUNBOOK-adapter-selection.md src/handlers.rs                  #2629 Wave-1 split into src/handlers/
+docs/security/build-script-vetting.md src/inner.rs                 #2629 no such file anywhere in src/
+docs/postgres-age-guide.md migrate_v78!=migrate_v88                #2629 the #2629 title's own example; tip is read from scripts/check-migration-ladder.sh

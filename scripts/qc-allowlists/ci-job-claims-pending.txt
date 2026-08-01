@@ -1,0 +1,67 @@
+# PENDING-FIX ledger for scripts/check-ci-job-claims.sh
+# (3x7 claims register 3.3.3 — C-21, C-23, C-24, C-31).
+#
+# FORMAT, one entry per line, everything from the first `#` is
+# commentary:
+#
+#     <doc-file> <token> #<issue> <note>
+#
+# `<token>` is exactly what the gate reports between the quotes: a
+# workflow file (`bench.yml`), a job name (`Code Coverage` — job names
+# contain spaces, so the token is EVERYTHING between the doc path and
+# the `#`), or `<workflow>:<job>` for a job claimed to live inside a
+# named workflow. It is not line-keyed, so the correcting lane's reflow
+# does not silently re-open a suppression.
+#
+# A MALFORMED entry HARD-FAILS. A STALE entry (one that suppresses
+# nothing) is a loud NOTICE and NOT a failure — the
+# `dual-trigger-cancel-allow.txt` rationale: it can only suppress a
+# violation that no longer happens, and failing on it would red
+# whichever PR lost the race to the document-correction lane.
+#
+# ---------------------------------------------------------------------
+# WHY THIS LEDGER EXISTS (2026-08-01).
+#
+# Every entry is a live FALSE claim at `03bbd556` — "a control was
+# removed and the prose was not" — held open only until its correcting
+# lane merges. Each is a claim of MORE ENFORCEMENT THAN EXISTS, which
+# is the systematic bias the register asked this gate to counter, so
+# none of them is a candidate for permanent suppression:
+#
+#   C-24  `Code Coverage` — removed from `ci.yml` in #1993, still cited
+#         as the live coverage gate in README.md and ROADMAP.md. The
+#         truthful residual gate is `Per-Module Coverage Thresholds`
+#         (coverage.yml), which IS a required context and which this
+#         gate already accepts.
+#   C-23  `postgres-age` — the nightly job was deleted in `da3fb9cc`;
+#         `postgres-parity-nightly.yml` says the coverage is "gone
+#         rather than repaired". The release notes still say the stack
+#         is "gated nightly" by it.
+#   C-21  `bench.yml:AGE` — PERFORMANCE.md cites an AGE bench job in
+#         bench.yml. `grep -rni 'age' .github/workflows/bench.yml` is
+#         zero hits.
+#   C-31  `bench.yml` as GATING — bench.yml:18 says of itself "Bench is
+#         advisory (not in required-status-checks)", and no bench
+#         context appears in required-contexts-release.txt. This is the
+#         entry the ENFORCEMENT rule exists for: the workflow EXISTS and
+#         its job EXISTS, so existence alone greens it.
+#
+# The honest correction for C-31 is to say bench is ADVISORY, or to add
+# a bench context to branch protection AND to the mirror. Deleting the
+# ledger line without doing one of those two things will simply re-red
+# the gate — which is the point.
+# ---------------------------------------------------------------------
+
+# --- C-24 -------------------------------------------------------------
+README.md Code Coverage           #2629 C-24 removed in #1993
+ROADMAP.md Code Coverage          #2629 C-24
+ROADMAP.md ci.yml:Code Coverage   #2629 C-24 the possessive citation on the same line
+
+# --- C-23 -------------------------------------------------------------
+docs/v1.0.0/release-notes.md postgres-age  #2629 C-23 job deleted in da3fb9cc
+
+# --- C-21 -------------------------------------------------------------
+PERFORMANCE.md bench.yml:AGE      #2629 C-21 bench.yml declares no AGE job
+
+# --- C-31 -------------------------------------------------------------
+PERFORMANCE.md bench.yml          #2629 C-31 advisory workflow described as gating (5 sites)
