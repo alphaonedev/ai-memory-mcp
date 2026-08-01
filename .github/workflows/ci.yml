@@ -952,6 +952,39 @@ jobs:
           pg_test() {
             local label="$1"; shift
             local rc=0
+            # #2657: COMPILE the test binaries OUTSIDE the watchdog first, so the
+            # 2100s per-invocation cap times test RUNTIME (the hang-detection
+            # purpose) rather than compile+run wall-time. This is the same fix
+            # #1989 applied to `run_tests` in the `check` job above; that issue
+            # fixed one of the two near-identical runners and left this twin
+            # untouched, so the postgres gate kept timing compile+run.
+            #
+            # MEASURED on run 30718303500 attempt 2: the timed invocation began
+            # 22:16:43 and the first `Running tests/...` line did not appear
+            # until 22:24:41 — 478s (23% of the 2100s cap) spent compiling 316
+            # crates INSIDE the window. Tests then ran 1605s before the kill;
+            # 478 + 1605 = 2083s against the 2100s cap, and the SIGTERM landed
+            # 99% of the way through (547 of 550 binaries had run; only
+            # wire_check_sole_path_pin, wt_1_a_schema_migration, wt1c_mcp_atomise
+            # and zeroize_secret_holders_1258 never started). Nothing hung — the
+            # watchdog was measuring the build.
+            #
+            # The failure mode this closes is a silent, GROWING one: compile time
+            # rises with every test file added, so each new binary shrinks the
+            # runtime budget the cap actually grants. Hoisting the build is the
+            # correct fix rather than raising the cap, which would only reset the
+            # same curve and have to be raised again; the cap must keep timing
+            # hang-detection alone. The job-level `timeout-minutes` still bounds
+            # the build, and a genuine runtime hang still trips the 2100s below.
+            #
+            # `|| return "$?"` is load-bearing: a compile failure must fail the
+            # job here, not fall through into a `timeout` run that would report a
+            # confusing second error. `cargo test --no-run` accepts (and ignores)
+            # the trailing `-- --test-threads=1` that every call site passes —
+            # verified on cargo 1.96.0 for all three arg shapes used below
+            # (bare, `--lib`, and repeated `--test <name>`): exit 0, zero tests
+            # executed.
+            cargo test --no-run "$@" || return "$?"
             # `--no-fail-fast` (#2500) — DIAGNOSTIC COMPLETENESS. Without it,
             # cargo exits after the FIRST failing test executable and every
             # later binary is never run. That is not hypothetical: on PR
