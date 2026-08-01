@@ -160,16 +160,38 @@ mutex is required. The HTTP daemon uses `Arc<Mutex<Connection>>`
 lock contention is the bottleneck under concurrent HTTP load but at
 T1 scale (1 agent, single-host) the contention is unobservable.
 
-### 2.4 Resource footprint (reference: Apple M2, 16 GB)
+### 2.4 Resource footprint
+
+> **Provenance.** This table is an **order-of-magnitude sizing estimate**,
+> not a recorded benchmark run: no host spec, binary revision, date, or
+> iteration count was captured with it, and no in-tree harness produces
+> it. An earlier revision attributed it to "Apple M2, 16 GB" — that
+> machine is the **LongMemEval retrieval-quality** reference
+> (`benchmarks/longmemeval/methodology.md` §1), a different measurement
+> family, and the attribution could not be substantiated for these
+> figures. Treat the rows as magnitudes to plan around and measure your
+> own; the latency budgets in [`PERFORMANCE.md`](../PERFORMANCE.md) are
+> the numbers that are actually pinned.
 
 | Resource | Cold | 100k memories | 1M memories |
 |---|---|---|---|
 | RSS | ~25 MB | ~80 MB | ~250 MB |
 | DB on disk | ~2 MB | ~120 MB | ~1.1 GB |
-| HNSW in RAM | n/a | ~40 MB | ~400 MB |
+| HNSW in RAM | n/a | ~40 MB | **see note** |
 | FTS5 index | ~0.5 MB | ~25 MB | ~220 MB |
 | First-recall latency | <5 ms | 8–12 ms | 15–25 ms |
 | HNSW rebuild (async, background) | n/a | <100 ms | ~3 s |
+
+> ⚠️ **The 1M-memory HNSW cell is not a footprint you will observe by
+> default.** The in-memory index is capped at
+> `hnsw::DEFAULT_MAX_ENTRIES = 100_000` and **evicts oldest** past the
+> cap, so a stock daemon at 1M memories holds the ~40 MB 100k index, not
+> a ~400 MB one — and 900k rows are outside ANN reach while remaining
+> fully FTS/keyword-recallable. An earlier revision published ~400 MB
+> here, which implied a residency this build does not provide. Raise
+> `AI_MEMORY_VECTOR_INDEX_CAPACITY` to buy the larger index (and pay the
+> RAM), or set `AI_MEMORY_VECTOR_INDEX_HARD_FAIL=1` to be refused loudly
+> at the cap instead of silently degraded. See §11.2.
 
 The HNSW double-buffer (`active` / `warming`) lands at v0.7.x
 post-#968: `active` continues to serve reads while the next-graph
