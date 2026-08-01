@@ -365,22 +365,29 @@ struct PreparedRow {
 /// screening / redaction) before the dedup key is taken, so a handler-side key
 /// recomputation would silently drift from the SAL.
 fn classify_persisted(outcomes: &[(usize, String, String)], ledger: &mut BulkLedger) {
-    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    // Group input positions by the id the persist stage actually returned,
+    // preserving submission order within each group.
+    let mut order: Vec<&str> = Vec::new();
+    let mut groups: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    // At most ONE input row can have minted the surviving id, so a single
+    // flag per group answers "did THIS call create the row?".
+    let mut minted_here: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (idx, minted, returned) in outcomes {
-        if let Some(entry) = groups.iter_mut().find(|(id, _)| id == returned) {
-            entry.1.push(*idx);
-        } else {
-            groups.push((returned.clone(), vec![*idx]));
+        let key = returned.as_str();
+        groups
+            .entry(key)
+            .or_insert_with(|| {
+                order.push(key);
+                Vec::new()
+            })
+            .push(*idx);
+        if minted == returned {
+            minted_here.insert(key);
         }
-        let _ = minted;
     }
-    for (returned, members) in &groups {
-        // At most ONE input row can have minted the surviving id, so this
-        // answers "did THIS call create the row?" for the whole group.
-        let created = outcomes
-            .iter()
-            .any(|(idx, minted, ret)| members.contains(idx) && ret == returned && minted == ret);
-        if created {
+    for returned in order {
+        let members = &groups[returned];
+        if minted_here.contains(returned) {
             ledger.created += 1;
         } else {
             ledger.updated += 1;
@@ -787,7 +794,22 @@ async fn bulk_create_sqlite(
                     {
                         tracing::warn!("failed to store embedding for {returned_id}: {e}");
                     }
-                    outcomes.push((row.index, row.mem.id.clone(), returned_id));
+                    outcomes.push((row.index, row.mem.id.clone(), returned_id.clone()));
+                    // Adopt the PERSISTED id before the row leaves this loop.
+                    // `db::insert` returns the EXISTING row's id when the
+                    // write landed on the `(title, namespace)` conflict arm,
+                    // and both consumers below key on it: the HNSW index would
+                    // otherwise be seeded with an id that resolves to NOTHING
+                    // in the database (recall returns a hit whose `get` 404s —
+                    // a WRONG result, not merely a missing one), and the
+                    // federation fanout would publish the minted id to peers,
+                    // creating a DIVERGENT row there for content that upserted
+                    // here. Single-create has done this since #866
+                    // (`fanout_and_assemble_create_response` sets
+                    // `mem_echo.id = actual_id`); bulk re-implemented the
+                    // funnel and omitted it, so an upsert drifted ids across
+                    // the fleet.
+                    row.mem.id = returned_id;
                     committed.push((row.mem, row.embedding));
                 }
                 Err(e) => {
@@ -1038,12 +1060,25 @@ async fn bulk_create_postgres(
                 // #2594 — stamp the vectors for the rows that actually landed.
                 // The batch is atomic, so this runs only on a committed batch.
                 if let Some(space) = embedding_space.as_deref() {
-                    let entries: Vec<(String, Vec<f32>)> = allowed
-                        .iter()
-                        .zip(ids.iter())
-                        .filter_map(|(row, id)| {
-                            row.embedding.as_ref().map(|v| (id.clone(), v.clone()))
-                        })
+                    // One entry per PERSISTED id, LAST-wins — the same rule
+                    // the upsert used to pick the surviving content. Several
+                    // input rows can share a returned id (in-batch
+                    // `(title, namespace)` collapse), and duplicate ids in one
+                    // multi-row UPDATE are the shape postgres refuses with
+                    // "cannot affect row a second time". Pairing the surviving
+                    // CONTENT with an earlier row's VECTOR would also make
+                    // semantic recall score a row against text it does not
+                    // hold — a wrong result, which outranks a missing one.
+                    let mut by_id: std::collections::HashMap<&str, &Vec<f32>> =
+                        std::collections::HashMap::new();
+                    for (row, id) in allowed.iter().zip(ids.iter()) {
+                        if let Some(v) = row.embedding.as_ref() {
+                            by_id.insert(id.as_str(), v);
+                        }
+                    }
+                    let entries: Vec<(String, Vec<f32>)> = by_id
+                        .into_iter()
+                        .map(|(id, v)| (id.to_string(), v.clone()))
                         .collect();
                     if !entries.is_empty()
                         && let Err(e) = app.store.set_embeddings_batch(&ctx, &entries, space).await
@@ -1103,4 +1138,142 @@ fn memory_quota_bytes(mem: &Memory) -> i64 {
                 .unwrap_or(0),
     )
     .unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build the `(input_index, minted_id, returned_id)` triples the persist
+    /// stage produces, from a compact `(minted, returned)` spec.
+    fn outcomes(spec: &[(&str, &str)]) -> Vec<(usize, String, String)> {
+        spec.iter()
+            .enumerate()
+            .map(|(i, (m, r))| (i, (*m).to_string(), (*r).to_string()))
+            .collect()
+    }
+
+    /// #2551 — a batch of distinct fresh rows is all `created`.
+    #[test]
+    fn classify_all_fresh_inserts_are_created() {
+        let mut l = BulkLedger::new(3);
+        classify_persisted(&outcomes(&[("a", "a"), ("b", "b"), ("c", "c")]), &mut l);
+        assert_eq!((l.created, l.updated, l.deduped()), (3, 0, 0));
+    }
+
+    /// #2551 — a row that upserted an EXISTING `(title, namespace)` is
+    /// `updated`, never `created`. The discriminator is that no input row
+    /// minted the id the persist stage returned.
+    #[test]
+    fn classify_upsert_of_preexisting_row_is_updated() {
+        let mut l = BulkLedger::new(1);
+        classify_persisted(&outcomes(&[("minted", "preexisting")]), &mut l);
+        assert_eq!((l.created, l.updated, l.deduped()), (0, 1, 0));
+    }
+
+    /// #2551 — the in-batch collapse, in the shape the POSTGRES branch
+    /// produces: `store_batch` drops all but the LAST duplicate before the
+    /// INSERT, so the surviving id is the LAST row's minted id.
+    #[test]
+    fn classify_in_batch_collapse_postgres_shape() {
+        let mut l = BulkLedger::new(3);
+        classify_persisted(
+            &outcomes(&[("r0", "r2"), ("r1", "r1"), ("r2", "r2")]),
+            &mut l,
+        );
+        assert_eq!((l.created, l.updated, l.deduped()), (2, 0, 1));
+        assert_eq!(l.deduped_rows[0]["index"], 0);
+        assert_eq!(l.deduped_rows[0]["superseded_by"], 2);
+    }
+
+    /// #2551 — the SAME request on the SQLITE branch, whose sequential
+    /// upserts make the surviving id the FIRST row's minted id. The counters
+    /// must come out IDENTICAL to the postgres shape above, or the two
+    /// backends would report different truth for the same batch.
+    #[test]
+    fn classify_in_batch_collapse_sqlite_shape_matches_postgres() {
+        let mut l = BulkLedger::new(3);
+        classify_persisted(
+            &outcomes(&[("r0", "r0"), ("r1", "r1"), ("r2", "r0")]),
+            &mut l,
+        );
+        assert_eq!((l.created, l.updated, l.deduped()), (2, 0, 1));
+        assert_eq!(l.deduped_rows[0]["index"], 0);
+        assert_eq!(
+            l.deduped_rows[0]["superseded_by"], 2,
+            "the LAST input position in the group is the one whose content survived"
+        );
+    }
+
+    /// #2588 — a retryable cause outranks a permanent one, so a mixed batch
+    /// that persisted nothing tells the fleet to back off rather than to
+    /// discard the rows it could still write.
+    #[test]
+    fn status_precedence_is_retryable_first_not_count_majority() {
+        let mut l = BulkLedger::new(3);
+        // Two permanent causes, then ONE retryable — a count-majority would
+        // pick 400 and permanently drop the quota-throttled row.
+        l.reject(0, "create", "title cannot be empty");
+        l.reject(1, "create", "title cannot be empty");
+        l.reject(
+            2,
+            "quota",
+            "QUOTA_EXCEEDED: agent a namespace n hit memories_per_day (5/5)",
+        );
+        assert_eq!(l.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// #2588 — the four status classes.
+    #[test]
+    fn status_classes() {
+        assert_eq!(BulkLedger::new(0).status(), StatusCode::OK);
+
+        let mut clean = BulkLedger::new(1);
+        classify_persisted(&outcomes(&[("a", "a")]), &mut clean);
+        assert_eq!(clean.status(), StatusCode::OK);
+
+        let mut partial = BulkLedger::new(2);
+        classify_persisted(&outcomes(&[("a", "a")]), &mut partial);
+        partial.reject(1, "create", "title cannot be empty");
+        assert_eq!(partial.status(), StatusCode::MULTI_STATUS);
+
+        let mut all_pending = BulkLedger::new(1);
+        all_pending.pending.push(json!({"index": 0}));
+        assert_eq!(all_pending.status(), StatusCode::ACCEPTED);
+    }
+
+    /// #2551 — a DEDUPED row is a partial application even though nothing
+    /// was rejected. Without this the #2551 batch (57 rows' content silently
+    /// discarded, `errors: []`) would answer 200 again.
+    #[test]
+    fn dedup_alone_is_a_partial_application() {
+        let mut l = BulkLedger::new(2);
+        classify_persisted(&outcomes(&[("a", "a"), ("b", "a")]), &mut l);
+        assert_eq!(l.rejected(), 0);
+        assert_eq!(l.deduped(), 1);
+        assert_eq!(l.status(), StatusCode::MULTI_STATUS);
+    }
+
+    /// #2552 — `field` is echoed only when it has the server-authored slug
+    /// shape, so no future refactor can route caller text through it.
+    #[test]
+    fn field_shape_guard_rejects_caller_influenced_text() {
+        assert!(is_server_authored_field("create"));
+        assert!(is_server_authored_field("metadata.agent_id"));
+        assert!(!is_server_authored_field(""));
+        assert!(!is_server_authored_field("Title With Spaces"));
+        assert!(!is_server_authored_field("<script>"));
+        assert!(!is_server_authored_field(&"x".repeat(65)));
+    }
+
+    /// #2594 — with no embedder the funnel is a no-op and reports NO
+    /// degradation: a keyword-tier deployment is not "degraded", it is
+    /// correctly configured.
+    #[test]
+    fn embed_is_inert_without_an_embedder() {
+        let mut l = BulkLedger::new(0);
+        assert!(!l.embed_status.is_degraded());
+        l.embed_status = EmbedStatus::Failed("boom".to_string());
+        assert!(l.embed_status.is_degraded());
+    }
 }
