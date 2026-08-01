@@ -169,6 +169,68 @@ pub trait FederationDlqSink: Send + Sync {
     /// quarantined (resetting those would resume infinite no-op POST
     /// amplification). Returns the number of rows un-quarantined.
     async fn reset_throttled_quarantine(&self) -> Result<u64, String>;
+
+    /// #2446 — expand ONE erasure-outbox sentinel row (a row whose
+    /// `peer_id` is [`crate::federation::erasure_outbox::ALL_PEERS_SENTINEL_PEER_ID`])
+    /// into per-peer delete rows, then clear the sentinel — all in ONE
+    /// transaction.
+    ///
+    /// The MCP / CLI erasure funnels cannot key a row per peer (they never
+    /// construct a `FederationConfig` — see the `erasure_outbox` module
+    /// docs), so they queue ONE sentinel meaning "fan out to every
+    /// currently-configured peer". The DAEMON owns the live peer set, so
+    /// the expansion happens here on the first drain tick. After it,
+    /// everything downstream — attempt budget, quarantine, cause labels,
+    /// depth gauge, operator drain — is the existing per-peer machinery,
+    /// unchanged.
+    ///
+    /// ## The restore-after-delete guard (data integrity)
+    ///
+    /// Implementations MUST first check whether `memory_id` is LIVE in
+    /// `memories` and, if so, return
+    /// [`SentinelExpansion::SupersededByLiveRow`] WITHOUT writing any
+    /// per-peer row (the sentinel is still cleared). A queued erasure that
+    /// replays AFTER the id was legitimately restored locally would
+    /// DESTROY the peer's copy of a row this node currently holds — the
+    /// highest-order harm under the repo's North Star. The outbox has a
+    /// drain delay the inline broadcast does not, so it can and must
+    /// re-check.
+    ///
+    /// `expected_attempt_count` is the optimistic-concurrency token
+    /// observed at take-time (same contract as [`Self::mark_dlq_row_replayed`]):
+    /// when the persisted row no longer carries it, implementations MUST
+    /// write nothing and return [`SentinelExpansion::Contended`] so the
+    /// next tick re-reads the row.
+    ///
+    /// # Errors
+    ///
+    /// Returns the formatted backend error when the transaction fails. The
+    /// caller leaves the sentinel pending and retries on the next tick.
+    async fn expand_erasure_sentinel(
+        &self,
+        row_id: i64,
+        expected_attempt_count: i32,
+        memory_id: &str,
+        peer_ids: &[String],
+        per_peer_payload: &serde_json::Value,
+        per_peer_last_error: &str,
+    ) -> Result<SentinelExpansion, String>;
+}
+
+/// #2446 — outcome of one erasure-outbox sentinel expansion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SentinelExpansion {
+    /// The sentinel was expanded into `n` per-peer rows and cleared.
+    Expanded(u64),
+    /// The memory id is LIVE again locally — a legitimate restore
+    /// superseded the queued erasure, so NO delete was fanned out and the
+    /// sentinel was cleared. Never propagating a stale erasure over a
+    /// restored row is the fail-safe direction: it leaves data intact
+    /// rather than destroying a replica.
+    SupersededByLiveRow,
+    /// A concurrent writer changed the row between take-time and now; the
+    /// sentinel is left pending for the next tick.
+    Contended,
 }
 
 /// Spawn the federation push DLQ replay worker.
@@ -481,6 +543,21 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
             continue;
         }
 
+        // #2446 — erasure-outbox sentinel expansion. This MUST run BEFORE
+        // the peer-resolution branch below: the sentinel is not a peer id,
+        // so `find(|p| p.id == row.peer_id)` would miss it and the row
+        // would be bumped every tick under the LIE `peer_removed` (a real
+        // `classify_quarantine_cause` label) until quarantine — an erasure
+        // silently converted into an operator-drain chore. It runs AFTER
+        // the quarantine ceiling above so a sentinel whose expansion is
+        // systematically failing still quarantines (its `last_error` is
+        // then a backend error, which classifies as the honest catch-all
+        // `other`, never a fabricated cause).
+        if row.peer_id == super::erasure_outbox::ALL_PEERS_SENTINEL_PEER_ID {
+            expand_erasure_sentinel_row(config, sink, &row).await;
+            continue;
+        }
+
         // Resolve the peer URL via the live FederationConfig. If the
         // peer has been removed from the config since the DLQ row was
         // written, log + bump attempt_count + leave the row for the
@@ -604,6 +681,113 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
     }
 
     refresh_depth_gauge(sink).await;
+}
+
+/// #2446 — `last_error` stamped on a per-peer row minted by expanding an
+/// erasure-outbox sentinel.
+///
+/// Load-bearing beyond observability, for the same reason as the queued
+/// sentinel's own text: it must contain NONE of
+/// [`classify_quarantine_cause`]'s tokens so a row that later quarantines
+/// classifies as the honest catch-all rather than a fabricated cause.
+const ERASURE_EXPANDED_LAST_ERROR: &str =
+    "queued erasure expanded to this peer (#2446); not yet attempted";
+
+/// #2446 — expand ONE erasure-outbox sentinel row into per-peer delete
+/// rows. Best-effort: every failure leaves the sentinel pending for the
+/// next tick (never drops the erasure).
+async fn expand_erasure_sentinel_row(
+    config: &FederationConfig,
+    sink: &dyn FederationDlqSink,
+    row: &FederationPushDlqRow,
+) {
+    let sentinel = super::erasure_outbox::ALL_PEERS_SENTINEL_PEER_ID;
+    // Fail-closed collision guard. The sentinel token is not a producible
+    // `PeerEndpoint::id` under the historical positional derivation nor
+    // the #2442 successor, but a mis-fan-out would be silent and
+    // unrecoverable, so verify against the LIVE peer set rather than
+    // trusting the derivation to stay that way.
+    if config.peers.iter().any(|p| p.id == sentinel) {
+        let _ = sink
+            .bump_dlq_attempt(
+                row.id,
+                "erasure sentinel collides with a configured peer id; refusing to fan out",
+            )
+            .await;
+        tracing::error!(
+            target: PUSH_DLQ_TRACE_TARGET,
+            row_id = row.id,
+            memory_id = %row.memory_id,
+            "replay: a configured peer id equals the reserved erasure sentinel {sentinel} — \
+             REFUSING to expand row {} (rename the peer; the erasure stays queued, not lost)",
+            row.id,
+        );
+        return;
+    }
+    let peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    if peer_ids.is_empty() {
+        // Unreachable in production (`FederationConfig::build` returns
+        // `None` on an empty peer list, so no worker is spawned), but a
+        // silent drop of an erasure is never acceptable: leave it pending.
+        tracing::warn!(
+            target: PUSH_DLQ_TRACE_TARGET,
+            row_id = row.id,
+            "replay: erasure sentinel row {} has no configured peers to expand to — \
+             leaving pending",
+            row.id,
+        );
+        return;
+    }
+    // The DAEMON owns the federation identity, so the canonical delete
+    // body is built HERE, not by the MCP / CLI writer (which has none).
+    let body = super::erasure_outbox::deletion_body(&config.sender_agent_id, &row.memory_id);
+    match sink
+        .expand_erasure_sentinel(
+            row.id,
+            row.attempt_count,
+            &row.memory_id,
+            &peer_ids,
+            &body,
+            ERASURE_EXPANDED_LAST_ERROR,
+        )
+        .await
+    {
+        Ok(SentinelExpansion::Expanded(n)) => tracing::info!(
+            target: PUSH_DLQ_TRACE_TARGET,
+            row_id = row.id,
+            memory_id = %row.memory_id,
+            peers = n,
+            "replay: expanded queued erasure for {} into {n} per-peer delete row(s) (#2446)",
+            row.memory_id,
+        ),
+        Ok(SentinelExpansion::SupersededByLiveRow) => tracing::warn!(
+            target: PUSH_DLQ_TRACE_TARGET,
+            row_id = row.id,
+            memory_id = %row.memory_id,
+            "replay: queued erasure for {} SUPERSEDED — the id is LIVE again locally (an \
+             archive restore or an authorized re-store), so the delete was NOT fanned out. \
+             Re-issue the erasure if it is still intended (#2446)",
+            row.memory_id,
+        ),
+        Ok(SentinelExpansion::Contended) => tracing::debug!(
+            target: PUSH_DLQ_TRACE_TARGET,
+            row_id = row.id,
+            "replay: erasure sentinel row {} changed mid-tick — retrying next tick",
+            row.id,
+        ),
+        Err(e) => {
+            let _ = sink
+                .bump_dlq_attempt(row.id, &format!("erasure sentinel expansion failed: {e}"))
+                .await;
+            tracing::warn!(
+                target: PUSH_DLQ_TRACE_TARGET,
+                row_id = row.id,
+                memory_id = %row.memory_id,
+                "replay: failed to expand erasure sentinel row {}: {e}",
+                row.id,
+            );
+        }
+    }
 }
 
 /// Refresh the `ai_memory_federation_push_dlq_depth` Prometheus gauge
@@ -839,6 +1023,99 @@ impl FederationDlqSink for SqliteDlqSink {
             .map_err(|e| format!("sqlite reset_throttled_quarantine: {e}"))?;
         Ok(n as u64)
     }
+
+    async fn expand_erasure_sentinel(
+        &self,
+        row_id: i64,
+        expected_attempt_count: i32,
+        memory_id: &str,
+        peer_ids: &[String],
+        per_peer_payload: &serde_json::Value,
+        per_peer_last_error: &str,
+    ) -> Result<SentinelExpansion, String> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let payload_str = per_peer_payload.to_string();
+        let conn = self.conn.lock().await;
+        // BEGIN IMMEDIATE (not DEFERRED): the body both reads and writes,
+        // and a deferred read-then-upgrade is the classic SQLITE_BUSY
+        // deadlock shape against the HTTP writer on the same file.
+        conn.execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE)
+            .map_err(|e| format!("sqlite expand_erasure_sentinel begin: {e}"))?;
+        let outcome = (|| -> rusqlite::Result<SentinelExpansion> {
+            // Optimistic-concurrency guard, same token as
+            // `mark_dlq_row_replayed`.
+            let still_ours: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM federation_push_dlq \
+                 WHERE id = ?1 AND attempt_count = ?2 AND replayed_at IS NULL",
+                rusqlite::params![row_id, expected_attempt_count],
+                |r| r.get(0),
+            )?;
+            if still_ours == 0 {
+                return Ok(SentinelExpansion::Contended);
+            }
+            // #2446 restore-after-delete guard — see the trait doc.
+            let live: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM memories WHERE id = ?1",
+                rusqlite::params![memory_id],
+                |r| r.get(0),
+            )?;
+            let expansion = if live > 0 {
+                SentinelExpansion::SupersededByLiveRow
+            } else {
+                let mut written = 0u64;
+                for peer_id in peer_ids {
+                    // On conflict with an EXISTING pending per-peer row (a
+                    // #2498/#2662 delete-lane landing, or a #933 store-lane
+                    // failure for the same memory), the delete body
+                    // SUPERSEDES: the erasure is the newer intent and
+                    // replaying a superseded store would resurrect a row the
+                    // origin erased. `attempt_count` is NOT bumped (an
+                    // erasure is not a delivery failure) and `failed_at` is
+                    // NOT refreshed, so an older pending row keeps its place
+                    // in the `ORDER BY failed_at ASC` drain queue instead of
+                    // being starved by fresh erasures.
+                    conn.execute(
+                        "INSERT INTO federation_push_dlq \
+                             (memory_id, peer_id, payload_json, attempt_count, last_error, \
+                              failed_at) \
+                         VALUES (?1, ?2, ?3, 0, ?4, ?5) \
+                         ON CONFLICT(memory_id, peer_id) WHERE replayed_at IS NULL \
+                         DO UPDATE SET \
+                           last_error   = excluded.last_error, \
+                           payload_json = excluded.payload_json",
+                        rusqlite::params![
+                            memory_id,
+                            peer_id,
+                            payload_str,
+                            per_peer_last_error,
+                            now
+                        ],
+                    )?;
+                    written += 1;
+                }
+                SentinelExpansion::Expanded(written)
+            };
+            // Clear the sentinel in the SAME transaction so the expansion
+            // and the clear are atomic.
+            conn.execute(
+                "UPDATE federation_push_dlq SET replayed_at = ?1 \
+                 WHERE id = ?2 AND attempt_count = ?3 AND replayed_at IS NULL",
+                rusqlite::params![now, row_id, expected_attempt_count],
+            )?;
+            Ok(expansion)
+        })();
+        match outcome {
+            Ok(v) => {
+                conn.execute_batch("COMMIT")
+                    .map_err(|e| format!("sqlite expand_erasure_sentinel commit: {e}"))?;
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(format!("sqlite expand_erasure_sentinel: {e}"))
+            }
+        }
+    }
 }
 
 /// Postgres implementation of [`FederationDlqSink`] backed by the
@@ -1009,6 +1286,87 @@ impl FederationDlqSink for PostgresDlqSink {
         .map_err(|e| format!("postgres reset_throttled_quarantine: {e}"))?;
         Ok(res.rows_affected())
     }
+
+    async fn expand_erasure_sentinel(
+        &self,
+        row_id: i64,
+        expected_attempt_count: i32,
+        memory_id: &str,
+        peer_ids: &[String],
+        per_peer_payload: &serde_json::Value,
+        per_peer_last_error: &str,
+    ) -> Result<SentinelExpansion, String> {
+        // Backend PARITY implementation. Today nothing writes an erasure
+        // sentinel into the POSTGRES `federation_push_dlq`: the MCP stdio
+        // surface is structurally sqlite-only (CLAUDE.md #1675/n24) and the
+        // CLI erasure verbs open a local rusqlite connection, so the write
+        // side is sqlite-by-construction. The DRAIN side must still be
+        // backend-blind — a postgres-backed `serve` drains the postgres
+        // table, and the moment any postgres-side writer queues a sentinel
+        // (a future pg CLI, or a peer relaying one) it MUST expand
+        // identically rather than quarantining as an unknown peer.
+        let pool = self.store.pool();
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| format!("postgres expand_erasure_sentinel begin: {e}"))?;
+        let still_ours: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM federation_push_dlq \
+             WHERE id = $1 AND attempt_count = $2 AND replayed_at IS NULL",
+        )
+        .bind(row_id)
+        .bind(expected_attempt_count)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| format!("postgres expand_erasure_sentinel guard: {e}"))?;
+        if still_ours.0 == 0 {
+            return Ok(SentinelExpansion::Contended);
+        }
+        // #2446 restore-after-delete guard — see the trait doc.
+        let live: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM memories WHERE id = $1")
+            .bind(memory_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| format!("postgres expand_erasure_sentinel liveness probe: {e}"))?;
+        let expansion = if live.0 > 0 {
+            SentinelExpansion::SupersededByLiveRow
+        } else {
+            let mut written = 0u64;
+            for peer_id in peer_ids {
+                sqlx::query(
+                    "INSERT INTO federation_push_dlq \
+                         (memory_id, peer_id, payload_json, attempt_count, last_error) \
+                     VALUES ($1, $2, $3::jsonb, 0, $4) \
+                     ON CONFLICT (memory_id, peer_id) WHERE replayed_at IS NULL \
+                     DO UPDATE SET \
+                       last_error   = EXCLUDED.last_error, \
+                       payload_json = EXCLUDED.payload_json",
+                )
+                .bind(memory_id)
+                .bind(peer_id)
+                .bind(per_peer_payload.to_string())
+                .bind(per_peer_last_error)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| format!("postgres expand_erasure_sentinel insert: {e}"))?;
+                written += 1;
+            }
+            SentinelExpansion::Expanded(written)
+        };
+        sqlx::query(
+            "UPDATE federation_push_dlq SET replayed_at = now() \
+             WHERE id = $1 AND attempt_count = $2 AND replayed_at IS NULL",
+        )
+        .bind(row_id)
+        .bind(expected_attempt_count)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("postgres expand_erasure_sentinel clear: {e}"))?;
+        tx.commit()
+            .await
+            .map_err(|e| format!("postgres expand_erasure_sentinel commit: {e}"))?;
+        Ok(expansion)
+    }
 }
 
 #[cfg(test)]
@@ -1024,8 +1382,8 @@ mod replay_arm_tests {
     use super::{
         CAUSE_NAMESPACE_PROBE_UNRESOLVABLE, CAUSE_UNENROLLED_AUTHOR_STRICT,
         DEFAULT_REPLAY_MAX_BATCH, ENV_FED_DLQ_REPLAY_MAX_BATCH, FederationDlqSink,
-        FederationPushDlqRow, MAX_REPLAY_ATTEMPTS, REPLAY_BATCH_SIZE, classify_quarantine_cause,
-        replay_max_batch, replay_once,
+        FederationPushDlqRow, MAX_REPLAY_ATTEMPTS, REPLAY_BATCH_SIZE, SentinelExpansion,
+        classify_quarantine_cause, replay_max_batch, replay_once,
     };
     use crate::federation::{FederationConfig, PeerEndpoint};
     use crate::replication::QuorumPolicy;
@@ -1054,6 +1412,11 @@ mod replay_arm_tests {
         count_should_err: bool,
         take_should_err: bool,
         take_calls: AtomicUsize,
+        // #2446 — memory ids the mock treats as LIVE locally, so a test can
+        // drive the restore-after-delete supersede arm.
+        live_ids: Mutex<Vec<String>>,
+        // #2446 — records `expand_erasure_sentinel` calls: (row_id, peers).
+        expanded: Mutex<Vec<(i64, Vec<String>)>>,
     }
 
     #[async_trait::async_trait]
@@ -1146,6 +1509,46 @@ mod replay_arm_tests {
                 }
             }
             Ok(n)
+        }
+
+        async fn expand_erasure_sentinel(
+            &self,
+            row_id: i64,
+            expected_attempt_count: i32,
+            memory_id: &str,
+            peer_ids: &[String],
+            per_peer_payload: &serde_json::Value,
+            per_peer_last_error: &str,
+        ) -> Result<SentinelExpansion, String> {
+            let mut rows = self.rows.lock().unwrap();
+            let Some(pos) = rows
+                .iter()
+                .position(|r| r.id == row_id && r.attempt_count == expected_attempt_count)
+            else {
+                return Ok(SentinelExpansion::Contended);
+            };
+            if self.live_ids.lock().unwrap().iter().any(|i| i == memory_id) {
+                rows.remove(pos);
+                return Ok(SentinelExpansion::SupersededByLiveRow);
+            }
+            rows.remove(pos);
+            let mut next_id = rows.iter().map(|r| r.id).max().unwrap_or(row_id) + 1;
+            for peer_id in peer_ids {
+                rows.push(FederationPushDlqRow {
+                    id: next_id,
+                    memory_id: memory_id.to_string(),
+                    peer_id: peer_id.clone(),
+                    payload_json: per_peer_payload.clone(),
+                    attempt_count: 0,
+                    last_error: per_peer_last_error.to_string(),
+                });
+                next_id += 1;
+            }
+            self.expanded
+                .lock()
+                .unwrap()
+                .push((row_id, peer_ids.to_vec()));
+            Ok(SentinelExpansion::Expanded(peer_ids.len() as u64))
         }
     }
 

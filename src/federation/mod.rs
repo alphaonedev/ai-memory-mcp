@@ -33,10 +33,26 @@
 //!   server is a single-tenant stdio client and the CLI is local; both
 //!   rely on the sync-daemon for eventual propagation. Only the HTTP
 //!   daemon is a federation node.
+//! - **ERASURE is the exception (#2446).** Anti-entropy catch-up can
+//!   propagate a WRITE but can never propagate a DELETE (there is no
+//!   row left to pull), so an MCP / CLI erasure used to leave every
+//!   replica holding data the origin had erased — a GDPR Article 17
+//!   failure and a permanent divergence. Those funnels now queue the
+//!   erasure into the durable [`erasure_outbox`], which the daemon's
+//!   existing push-DLQ replay worker drains and fans out. The erasure
+//!   itself stays local, network-free and always-succeeding.
 
 // v0.7.0 epic — federation identity at scale. Phase 1: `identity::resolver`
 // de-hardcodes the `host:<hostname>` bootstrap identity behind an explicit
 // precedence (env > operator config > hostname). See ADR-001.
+// v1.0.0 #2446 — the local erasure outbox. Deliberately NOT feature-gated
+// (unlike `push_dlq` below): the write side is raw `rusqlite` against the
+// v48 `federation_push_dlq` table, so the MCP / CLI erasure funnels can
+// queue on every build. Only the DRAIN side needs the SAL-gated sink
+// trait, and the drainability marker is stamped exclusively by a
+// `--features sal` sqlite-backed `serve` — so a build that cannot drain
+// never queues a row. See the module docs for the full bound.
+pub mod erasure_outbox;
 pub mod identity;
 pub mod peer;
 pub mod peer_attestation;
@@ -76,7 +92,7 @@ pub use sync::*;
 // integration tests.
 #[cfg(feature = "sal")]
 pub use push_dlq::{
-    FederationDlqSink, FederationPushDlqRow, REPLAY_BATCH_SIZE, replay_once,
+    FederationDlqSink, FederationPushDlqRow, REPLAY_BATCH_SIZE, SentinelExpansion, replay_once,
     spawn_replay_federation_push_dlq,
 };
 
