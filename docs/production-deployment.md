@@ -150,7 +150,23 @@ Hooks (`pre_store`, `post_store`, `post_recall`, `pre_governance_decision`, etc.
 
 **W-of-N federation.** Three or more peers, each holding its own SQLite, mesh-federating writes with a quorum commit requiring the local write plus W−1 peer acknowledgements within `--quorum-timeout-ms` before the write returns OK (per [`ADR-0001`](ADR-0001-quorum-replication.html); per-message Ed25519 signing rides on `AI_MEMORY_FED_REQUIRE_SIG`). Default 2000 ms assumes same-DC peers; cross-region (WAN) meshes need 5000-10000 ms — the do-1461 reference deployment uses 8000 (#1565). Resolves the "any single operator can rewrite history" problem. CRDT-based eventual consistency by default; opt-in MVCC strict-consistency mode ships in v1.0.
 
-Sizing guide (Apple M2, 16 GB, SQLite reference):
+Sizing guide — **design envelopes, not measured figures.** The agent and
+memory counts below are topology guidance; no benchmark produces them and
+they are not machine-dependent, so the "Apple M2, 16 GB" attribution an
+earlier revision carried here is withdrawn rather than restated (that
+machine is the LongMemEval retrieval-quality reference, a different
+measurement family). For numbers that ARE pinned, see
+[`PERFORMANCE.md`](../PERFORMANCE.md).
+
+> **Semantic recall does not scale with the "stored memories" column by
+> default.** The in-memory vector index is capped at
+> `hnsw::DEFAULT_MAX_ENTRIES = 100_000` and evicts oldest past the cap, so
+> on a SQLite deployment holding 1M rows, ANN search covers the newest
+> ~100k while the remainder stays keyword/FTS-recallable. Raise
+> `AI_MEMORY_VECTOR_INDEX_CAPACITY` (and pay the RAM), or set
+> `AI_MEMORY_VECTOR_INDEX_HARD_FAIL=1` to be refused loudly at the cap
+> rather than silently degraded. Postgres/pgvector is on-disk and has no
+> such cap.
 
 | Topology | Agents | Stored memories | Notes |
 |---|---|---|---|
