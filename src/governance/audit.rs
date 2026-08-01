@@ -33,7 +33,7 @@
 //! lexicographic order.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -474,10 +474,106 @@ fn daily_path(dir: &Path, when: &DateTime<Utc>) -> PathBuf {
     ))
 }
 
+/// v1.0.0 #2584 — how far back from EOF [`read_chain_tail`] reads while
+/// hunting the last parseable forensic row.
+///
+/// The chain tail is ONE line, so a bounded suffix is all that is needed
+/// in the healthy case. The window is generous enough to skip past a
+/// long run of damaged / truncated trailing lines (a real possibility
+/// after a SIGKILL mid-append) before the exact full-scan fallback
+/// engages, and small enough that reading it is a single-digit-
+/// microsecond operation on any corpus.
+const CHAIN_TAIL_WINDOW_BYTES: u64 = 256 * 1024;
+
+/// Resolve the hash of the LAST parseable row in the newest forensic
+/// file — the `prev_hash` the next appended row must carry.
+///
+/// # v1.0.0 #2584 — bounded tail read, exact-fallback
+///
+/// This runs on EVERY process start (`main.rs::init_forensic_audit` →
+/// [`init`]) — every CLI invocation, every MCP stdio boot, every daemon
+/// boot, and every firing of the `governance check-action` PreToolUse
+/// hook. Pre-#2584 it streamed the WHOLE newest file and ran
+/// `serde_json::from_str::<ForensicDecision>` on EVERY line just to keep
+/// the last one.
+///
+/// Measured on this node with a 16.5 MB same-day forensic log: 2 021 of
+/// the process's 2 052 `read` syscalls and **163 ms of a 174 ms**
+/// `ai-memory list` were this function (10.8 ms with an empty audit
+/// dir; 4.4 ms `--version` floor). The cost is O(TODAY'S LOG SIZE) and
+/// therefore GROWS ALL DAY and resets at UTC midnight — it was mistaken
+/// for a fixed ~130 ms constant in the original report, and the
+/// `futex`-dominated `strace -c` profile that accompanied it was an
+/// artefact of counting the tokio worker threads' PARKED time as syscall
+/// time.
+///
+/// ## Why this is exactly equivalent to the old forward scan
+///
+/// The old scan returned `self_hash()` of the last line that PARSED.
+/// Every line after that one is, by definition, unparseable. Walking
+/// backwards from EOF therefore encounters those same unparseable lines
+/// first and returns the very same row — PROVIDED the window reaches it.
+/// When the window is exhausted without a parse, we fall back to the
+/// original full forward scan, so the returned value is identical for
+/// EVERY input, including a file whose entire 256 KiB tail is corrupt.
+/// Skipping / trimming rules (blank-line skip, `\r\n` handling,
+/// invalid-UTF-8 tolerance) mirror `BufReader::lines()` line for line.
+///
+/// Data-integrity posture: this only ever selects WHICH stored row seeds
+/// `prev_hash`; it writes nothing, and a wrong answer would break the
+/// chain link loudly at `verify_since` rather than silently. The exact
+/// fallback means it cannot give a wrong answer at all.
 fn read_chain_tail(dir: &Path) -> Option<String> {
     let files = list_forensic_files(dir).ok()?;
     let last_file = files.last()?;
-    let f = File::open(last_file).ok()?;
+    read_chain_tail_from_suffix(last_file).or_else(|| read_chain_tail_full_scan(last_file))
+}
+
+/// Bounded backward hunt over the final [`CHAIN_TAIL_WINDOW_BYTES`] of
+/// `path`. `None` means "no parseable row found in the window" — NOT
+/// "no parseable row exists"; the caller must fall back.
+fn read_chain_tail_from_suffix(path: &Path) -> Option<String> {
+    let mut f = File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(CHAIN_TAIL_WINDOW_BYTES);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::with_capacity(usize::try_from(len - start).unwrap_or(0));
+    f.read_to_end(&mut buf).ok()?;
+
+    // When the window starts mid-file the first fragment is a partial
+    // line; drop it so a truncated prefix can never be mis-parsed.
+    let body: &[u8] = if start > 0 {
+        match buf.iter().position(|b| *b == b'\n') {
+            Some(nl) => &buf[nl + 1..],
+            // A 256 KiB run with no newline at all: nothing usable here.
+            None => return None,
+        }
+    } else {
+        &buf[..]
+    };
+
+    for raw in body.split(|b| *b == b'\n').rev() {
+        // `BufReader::lines()` strips a trailing CR as well as the LF.
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        // ... and the old scan skipped whitespace-only lines outright.
+        let Ok(text) = std::str::from_utf8(line) else {
+            // Invalid UTF-8 — the old scan's `Err(_) => continue` arm.
+            continue;
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        if let Ok(row) = serde_json::from_str::<ForensicDecision>(text) {
+            return Some(row.self_hash());
+        }
+    }
+    None
+}
+
+/// The pre-#2584 exact forward scan, retained VERBATIM as the fallback
+/// so the bounded hunt above can never change an answer — only skip work.
+fn read_chain_tail_full_scan(path: &Path) -> Option<String> {
+    let f = File::open(path).ok()?;
     let mut last_hash: Option<String> = None;
     for line in BufReader::new(f).lines() {
         let Ok(line) = line else { continue };
@@ -3410,6 +3506,169 @@ mod tests {
         let tail = read_chain_tail(tmp.path()).expect("tail present after record");
         assert!(!tail.is_empty());
         assert_ne!(tail, CHAIN_HEAD_PREV_HASH);
+    }
+
+    // -----------------------------------------------------------------
+    // v1.0.0 #2584 — bounded chain-tail read.
+    //
+    // `read_chain_tail` runs on EVERY process start (main.rs
+    // `init_forensic_audit`). Pre-#2584 it JSON-parsed every line of the
+    // newest forensic file to keep only the last: measured 163 ms of a
+    // 174 ms `ai-memory list` against a 16.5 MB same-day log (2 021 of
+    // the process's 2 052 `read` syscalls), growing all day.
+    //
+    // These pin BOTH halves of the contract: the bounded suffix hunt
+    // must ANSWER without a full scan (the perf property), and it must
+    // never CHANGE an answer (the correctness property) — including on
+    // the damaged tails a SIGKILL mid-append can leave behind.
+    // -----------------------------------------------------------------
+
+    /// Build a syntactically valid forensic row whose payload carries
+    /// `marker`, so the expected tail hash is identifiable.
+    fn tail_row(marker: &str) -> ForensicDecision {
+        ForensicDecision {
+            ts: "2026-07-31T00:00:00.000Z".to_string(),
+            actor: "ai:tail-2584".to_string(),
+            decision: "allow".to_string(),
+            kind: "bash".to_string(),
+            rule_id: "R001".to_string(),
+            payload: serde_json::json!({ "marker": marker }),
+            prev_hash: CHAIN_HEAD_PREV_HASH.to_string(),
+            sig: String::new(),
+        }
+    }
+
+    /// Every tail shape a crash / rotation / editor can leave behind.
+    /// `(label, file bytes, expected marker of the last PARSEABLE row)`.
+    fn tail_corpus() -> Vec<(&'static str, Vec<u8>, Option<&'static str>)> {
+        let a = serde_json::to_string(&tail_row("a")).unwrap();
+        let b = serde_json::to_string(&tail_row("b")).unwrap();
+        let mut out: Vec<(&'static str, Vec<u8>, Option<&'static str>)> = Vec::new();
+        out.push(("empty-file", Vec::new(), None));
+        out.push(("single-row", format!("{a}\n").into_bytes(), Some("a")));
+        out.push(("two-rows", format!("{a}\n{b}\n").into_bytes(), Some("b")));
+        out.push((
+            "no-trailing-newline",
+            format!("{a}\n{b}").into_bytes(),
+            Some("b"),
+        ));
+        out.push((
+            "blank-lines-after",
+            format!("{a}\n{b}\n\n   \n\n").into_bytes(),
+            Some("b"),
+        ));
+        out.push((
+            "crlf-line-endings",
+            format!("{a}\r\n{b}\r\n").into_bytes(),
+            Some("b"),
+        ));
+        out.push((
+            "truncated-last-row",
+            format!("{a}\n{b}\n{{\"ts\":\"2026-07-3").into_bytes(),
+            Some("b"),
+        ));
+        out.push((
+            "garbage-after",
+            format!("{a}\n{b}\nnot json at all\n!!!\n").into_bytes(),
+            Some("b"),
+        ));
+        out.push(("only-garbage", b"not json\nstill not json\n".to_vec(), None));
+        // Invalid UTF-8 trailing fragment — the old scan's
+        // `Err(_) => continue` arm.
+        let mut bad_utf8 = format!("{a}\n{b}\n").into_bytes();
+        bad_utf8.extend_from_slice(&[0xff, 0xfe, 0x0a]);
+        out.push(("invalid-utf8-tail", bad_utf8, Some("b")));
+        out
+    }
+
+    /// CORRECTNESS: the bounded hunt (with its exact fallback) must
+    /// return byte-for-byte what the pre-#2584 full forward scan
+    /// returns, for EVERY tail shape.
+    #[test]
+    fn chain_tail_bounded_read_matches_full_scan_on_every_tail_shape_2584() {
+        let tmp = TempDir::new().unwrap();
+        for (label, bytes, expected_marker) in tail_corpus() {
+            let p = tmp.path().join(format!("forensic-2026-07-31.jsonl"));
+            std::fs::write(&p, &bytes).unwrap();
+
+            let full = read_chain_tail_full_scan(&p);
+            let bounded = read_chain_tail_from_suffix(&p).or_else(|| read_chain_tail_full_scan(&p));
+            assert_eq!(
+                bounded, full,
+                "#2584 [{label}]: the bounded tail read must never CHANGE the answer the \
+                 pre-fix full forward scan gave — only skip work"
+            );
+
+            let expected = expected_marker.map(|m| tail_row(m).self_hash());
+            assert_eq!(
+                bounded, expected,
+                "#2584 [{label}]: expected the hash of the LAST PARSEABLE row"
+            );
+        }
+    }
+
+    /// PERF (R-203): on a file far larger than the window, the BOUNDED
+    /// path alone must produce the answer. If someone reverts to a full
+    /// scan (or zeroes the window) this fails, because the suffix hunt
+    /// would no longer be the thing that answers.
+    #[test]
+    fn chain_tail_suffix_answers_large_file_without_full_scan_2584() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("forensic-2026-07-31.jsonl");
+        let filler = serde_json::to_string(&tail_row("filler")).unwrap();
+        let last = serde_json::to_string(&tail_row("last")).unwrap();
+
+        let mut body = String::new();
+        while body.len() as u64 <= CHAIN_TAIL_WINDOW_BYTES * 3 {
+            body.push_str(&filler);
+            body.push('\n');
+        }
+        body.push_str(&last);
+        body.push('\n');
+        std::fs::write(&p, body.as_bytes()).unwrap();
+
+        let bounded = read_chain_tail_from_suffix(&p);
+        assert_eq!(
+            bounded,
+            Some(tail_row("last").self_hash()),
+            "#2584 REGRESSED: the bounded suffix read must resolve the chain tail of a \
+             multi-window file on its own — reading the whole file on every process \
+             start is the defect (163 ms of a 174 ms `ai-memory list` on a 16.5 MB log)"
+        );
+        // ...and it must agree with the exact scan it replaces.
+        assert_eq!(bounded, read_chain_tail_full_scan(&p));
+    }
+
+    /// FAIL-SAFE: when the ENTIRE window is unparseable the bounded hunt
+    /// declines (`None`) and the exact full scan still finds the real
+    /// tail. Worst case is today's behaviour, never a wrong answer.
+    #[test]
+    fn chain_tail_falls_back_to_full_scan_when_window_is_all_garbage_2584() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("forensic-2026-07-31.jsonl");
+        let good = serde_json::to_string(&tail_row("good")).unwrap();
+
+        let mut body = String::new();
+        body.push_str(&good);
+        body.push('\n');
+        let mut garbage_len: u64 = 0;
+        while garbage_len <= CHAIN_TAIL_WINDOW_BYTES * 2 {
+            body.push_str("this line is not a forensic row\n");
+            garbage_len += 32;
+        }
+        std::fs::write(&p, body.as_bytes()).unwrap();
+
+        assert_eq!(
+            read_chain_tail_from_suffix(&p),
+            None,
+            "a window containing no parseable row must DECLINE, not guess"
+        );
+        assert_eq!(
+            read_chain_tail(tmp.path()),
+            Some(tail_row("good").self_hash()),
+            "#2584: the exact full-scan fallback must still recover the true chain tail, \
+             so the optimisation cannot lose the chain link"
+        );
     }
 
     #[test]

@@ -133,6 +133,8 @@ async fn pg_recall_never_scores_foreign_space_2167() {
         limit: 50,
         active_embedding_space: Some(active.clone()),
         valid_at: None,
+        // #2580 — metadata-equality pushdown axis unused on this path.
+        metadata_eq: None,
     };
     let results = store
         .recall_hybrid(&ctx, "zzznomatchtokenzzz", Some(&vec), &filter)
