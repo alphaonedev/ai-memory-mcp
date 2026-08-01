@@ -273,7 +273,8 @@ pub(crate) struct ListOrderIndexStatus {
 /// The recall SEMANTIC pool was the worst case and went unmentioned in the
 /// issue: `SELECT *` there fetched the `embedding` column for `5 × limit`
 /// rows that ALL have embeddings by construction, purely to throw them away
-/// (it scores via `1.0 - (embedding <=> $1)`, computed server-side).
+/// (it scores with the pgvector cosine-distance operator server-side and
+/// returns only the resulting similarity).
 ///
 /// # Scope — read ONLY, `memories` ONLY
 ///
@@ -290,8 +291,14 @@ pub(crate) struct ListOrderIndexStatus {
 /// A computed alias (`fts_score`, `cosine_sim`, `content_len`, `rank`) is
 /// APPENDED after this list at the call site; postgres resolves `WHERE` /
 /// `ORDER BY` against any FROM-list column, so predicates on the columns
-/// this list omits (`tsv @@ …`, `embedding <=> $1`, `embedding_space = $10`)
-/// keep working untouched.
+/// this list omits — the FTS match on `tsv`, the pgvector cosine distance on
+/// `embedding`, the `embedding_space` provenance gate — keep working untouched.
+///
+/// (Those operators are named in prose rather than written literally on
+/// purpose: `tests/embedding_space_provenance_2167.rs` pins the COUNT of
+/// postgres cosine-query sites by splitting this file on `sqlx::query` and
+/// counting blocks, so a literal cosine operator in a doc comment reads as a
+/// fourth query site and trips the #2167 §3.4 gate.)
 ///
 /// Drift is blocked mechanically by `tests/pg_projection_column_fidelity_2585.rs`.
 pub const MEMORY_READ_COLUMNS: &str = "id, tier, namespace, title, content, tags, \
