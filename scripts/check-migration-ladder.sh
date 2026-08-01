@@ -151,7 +151,13 @@ LADDER_EXEMPT_FILES=(
 #                     `if current_version < 86`) and the new v87 tip arm
 #                     (archived_memories.kind_provenance + the #2332
 #                     expiry-rendering heal) takes the const slot.
-EXPECTED_CONST_ARMS_SQLITE=8
+# 2026-07-31 (#2578): sqlite 8 -> 7 — v88 lands composite list indexes on
+#                     POSTGRES only (sqlite has had them since v56), so there
+#                     is NO sqlite v88 arm; the settled v87 arm is LITERALIZED
+#                     to `if version < 87` and nothing takes the const slot.
+#                     postgres stays 1 (v87 literalized, migrate_v88 takes the
+#                     const tail slot).
+EXPECTED_CONST_ARMS_SQLITE=7
 EXPECTED_CONST_ARMS_POSTGRES=1
 
 # --- Helpers ----------------------------------------------------------------
@@ -712,7 +718,14 @@ run_self_test() {
     if out_c="$(LADDER_MIGRATIONS_RS="$duprs_c" run_gate 2>&1)"; then
         echo "  [c] D1a extra const-phrased arm: NOT CAUGHT (gate passed) — FAIL" >&2
         fail=1
-    elif printf '%s' "$out_c" | grep -q 'const-phrased arm count is 9 but the pin is 8'; then
+    # The expected counts are DERIVED from the live pin, never hard-coded:
+    # injecting one extra arm must report (pin + 1) against the pin. The
+    # literal form ("9 but the pin is 8") went stale the first time the pin
+    # moved (#2578: 8 -> 7), which made the self-test report FAIL while the
+    # gate underneath was working perfectly — a self-test that cries wolf on
+    # a correct gate is worse than none.
+    elif printf '%s' "$out_c" \
+        | grep -q "const-phrased arm count is $((EXPECTED_CONST_ARMS_SQLITE + 1)) but the pin is $EXPECTED_CONST_ARMS_SQLITE"; then
         echo "  [c] D1a extra const-phrased arm (invisible to literal scan): CAUGHT"
     else
         echo "  [c] D1a extra const-phrased arm: gate failed but without the count-pin message — FAIL" >&2

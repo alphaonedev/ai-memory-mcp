@@ -10,5 +10,7 @@
 //! daemon_runtime spawn surface.
 
 pub mod access_fold;
+pub mod fts_integrity;
 pub mod lease_sweep;
+pub mod memories_gauge;
 pub mod offload_ttl_sweep;
