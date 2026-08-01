@@ -965,14 +965,36 @@ but new public operations live on the trait.
 
 ### Lint gates (issue #1174 PR10 — pm-v3.1 vendor-monoculture + SECS_PER_*)
 
-Eight numbered script-based lint gates run in CI alongside the four
+Eleven numbered script-based lint gates run in CI alongside the four
 cargo gates (fmt / clippy / test / audit) and the two test-guard jobs
 (`test-stdin-gate` #1989, `test-env-lock-gate` #2146). All are
 HARD-BLOCK and are wired into `.github/workflows/c8-precheck.yml`
 (`c8-precheck`, `vendor-literal-gate`, `l3-boundary-gate`,
 `hardcoded-literal-gate`, `docs-vs-ssot-drift`, `cloud-init-ascii-gate`,
-`migration-ladder-gate`, `required-contexts-gate`, plus the two
-test-guard jobs above).
+`migration-ladder-gate`, `required-contexts-gate`,
+`doc-symbol-anchor-gate`, `sdk-route-path-gate`, `ci-job-claims-gate`,
+plus the two test-guard jobs above).
+
+**Gates 8, 9 and 10 are the CERT-GATE-2 published-claims set** (#2629 /
+#2492, 2026-08-01). They exist because a 265-claim audit
+(`docs/audit/3x7-claims-register-2026-08-01.md`) found **71
+FALSE/OVERCLAIMED published claims** while gate 4 was GREEN — and the
+register's diagnosis is the one that governs all three: *"the drift
+direction is consistently toward MORE CLAIMED ENFORCEMENT THAN EXISTS.
+That is not random staleness; it is a systematic bias that a gate must
+be built to counter."*
+
+**Two ledger dispositions, and the difference is deliberate.** Gates 4,
+9 and 10 carry PENDING-FIX ledgers where a **stale entry is a loud
+NOTICE, not a failure** — the `dual-trigger-cancel-allow.txt` precedent
+(rule (d) of gate 7): a stale entry can only suppress a failure that no
+longer happens, and failing on it would red whichever PR lost the race
+to the correction lane that removed the claim. Gate 8 carries a
+BURN-DOWN allowlist where a **stale entry FAILS** — the
+`required-contexts-joblevel-if-allow.txt` discipline (rule (b2)) —
+because nothing is concurrently correcting those anchors, so a stale
+entry there is pure rot. In every ledger a MALFORMED entry HARD-FAILS,
+so none of them can rot into prose.
 
 **0. Hardcoded-literal duplication ratchet (pm-v3.1)** —
 `scripts/check-hardcoded-literals.sh`. The mechanical enforcement of the
@@ -1084,15 +1106,65 @@ are gate-clean by construction. `--self-test` plants a violation
 in a tmpdir and confirms the gate rejects it.
 
 **4. Docs vs SSOT drift gate** (v0.7.0 operator directive
-2026-05-31) — `scripts/check-docs-vs-ssot.sh`. Markdown has no
+2026-05-31; **widened by #2492**, 2026-08-01) —
+`scripts/check-docs-vs-ssot.sh`. Markdown has no
 native variables, so this gate is the minimal-infra answer:
 parses the canonical Rust SSOT consts (`CURRENT_SCHEMA_VERSION`,
 `EXPECTED_PRODUCTION_ROUTES_COUNT`, `EXPECTED_CLI_SUBCOMMANDS_*`,
 `Profile::full().expected_tool_count()`, `Memory::FIELD_COUNT`,
 etc.), walks the operator-facing `.md` files for known
 narrative-count patterns, and HARD-BLOCKS when any cited value
-drifts from the canonical. `--self-test` stages a contrived
-stale-claim doc in a tmpdir and confirms the gate catches it.
+drifts from the canonical.
+
+**#2492 — the gate greened a page carrying FIVE stale SSOT values.**
+README.md is, and always was, in `DOC_FILES`, so the gap was never the
+file walk: it was the PATTERN SET. Every original rule is a
+hand-written regex pinned to one exact phrasing
+(`\*\*N production \`\.route\(\.\.\.\)\` registrations\*\*`), and a
+document that says the same thing in the seventh way nobody enumerated
+is invisible. README carried 94→92/93 routes, 88→78 schema, 30→28
+`Memory` fields, 103→101 tools and 91/89→89/87 CLI subcommands with
+this gate green — the #2444 "reports success while doing nothing"
+shape. The fix is a **generalised numeric-claim scanner**: for each
+SSOT const, a small set of NOUN-PHRASE ANCHORS (`HTTP route
+registrations`, `unique URL paths`, `unique paths`, `MCP tools at
+--profile full`, `-entry surface`, `CLI subcommands`,
+``-field `Memory` ``, `schema **v`) and ANY adjacent integer in bold /
+code / plain form. A re-worded sentence is caught by the anchor; only a
+genuinely new NOUN gets past, which is far rarer.
+
+**The historical guard is load-bearing and must not be weakened.**
+README legitimately carries release-narrative paragraphs
+(``**v0.8.0 (…) — prior release.** … At the v0.8.0 release, surface
+was: schema **v<then>**, **<N>** MCP tools …, a **<M>-field** `Memory`.``
+— with real numbers in place of the placeholders) and ROADMAP §11.3.1
+carries a self-correcting frozen v0.7.1 baseline. Those
+numbers are TRUE statements about a PAST release; re-pointing them at
+the canonical would falsify the record — the same reasoning that keeps
+CHANGELOG.md, the RFC files and the three frozen v0.7 migration guides
+out of `DOC_FILES` entirely. So a line that opens a release-narrative
+paragraph (`^**v<semver>`) attributed to a NON-current release, or that
+says `At the v<x> release` / `release, surface was` / `Ship state at
+v<x>` / `Frozen v<x> baseline`, is skipped by the numeric rules.
+
+That guard would be a hole on its own, so **rule N1** closes it: a
+paragraph labelled `— current release` MUST attribute the Cargo.toml
+version. That is what catches a README paragraph whose lead names a
+PRIOR version and still calls itself the current release — the single
+paragraph carrying four of the register's five shapes. Once it is honestly relabelled, its numbers are either history
+(skipped) or current (checked).
+
+**R-203 is mechanical here.** The pre-fix script is frozen VERBATIM at
+`scripts/test/fixtures/docs-vs-ssot-prefix-2492.sh` (the
+`ci-classify-prefix-2496.sh` / `required-contexts-prefix-2494.txt`
+precedent). `--self-test` plants the exact pre-fix README phrasings and
+asserts BOTH directions — the FROZEN gate ACCEPTS them (reproducing the
+defect) and the LIVE gate REJECTS all 11 planted claims. A self-test
+that only proved the new gate works would be tautological, since the
+whole finding was that the old gate greened them. Further legs pin the
+historical control (a prior-release paragraph, a frozen baseline and
+ladder mentions must still PASS), rule N1, and all three ledger
+directions. Scratch lives under `.local-runs/`, never `mktemp -d`.
 
 **5. Cloud-init ASCII gate** (#1880) — `scripts/check-cloud-init-ascii.sh`.
 A stray non-ASCII byte (a U+2014 em-dash) in a DigitalOcean
@@ -1305,6 +1377,154 @@ the blind spot the declaration closes and the proof the leg is not
 tautological. Data-integrity guardrail (North Star: a control that reports success
 while doing nothing is worse than a missing control, because 22 green
 checks actively imply rigor that is not present).
+
+**8. Doc symbol/path anchor gate** (#2629, CERT GATE 2) —
+`scripts/check-doc-symbol-anchors.sh`. Gate 4 pins VALUES; **nothing
+pinned SYMBOLS**. Documents cite `file:line` anchors, `path.rs::symbol`
+qualifications and ``[`sym`](../src/path.rs)`` links that rot silently
+on every rename and module split. The 3x7 audit sampled SIX anchors and
+found **6/6 MISS at HEAD**, including `decorate_memory` — a symbol that
+has not existed since the recall decorator was batched into
+`decorate_memory_many` (`src/mcp/tools/recall.rs:610`). The register's
+ruling: *"Anchors that miss 6/6 are worse than no anchors — they cost
+the reviewer trust they cannot get back."* The class is worse than
+value drift because a wrong VALUE is falsifiable in one grep, while a
+wrong ANCHOR sends the reader to the wrong place and then makes them
+doubt everything else. FOUR rules, all keyed on PATH-QUALIFIED grammar:
+**PATH** (a cited `src/<p>.rs` must exist — this is what caught the
+pre-modularisation `src/handlers.rs` / `src/mcp.rs` / `src/db.rs`
+anchors still live in the operator guides), **LINE** (a `src/<p>.rs:<N>`
+anchor must name a line the file has), **QUAL** (every identifier in
+`src/<p>.rs::<sym>` and `src/<p>.rs::{a, B::c, d}` must be defined IN
+THAT FILE — each `::` component is checked, so
+`VectorIndex::build_with_capacity` resolves only if both do), and
+**MDLINK** (a ``[`sym`](../src/<p>.rs)`` link must resolve, or `sym`
+must BE the module's file stem, which is a legitimate module citation).
+
+**What is deliberately NOT a rule:** a bare backticked identifier
+sharing a line with a `src/` path. Measured against the tree that
+grammar yields **1,827 hits over 879 distinct tokens** — MCP tool
+names, DB columns, wire strings, env vars — almost none of them Rust
+definitions. A rule with that false-positive rate gets switched off
+within a week, and a gate nobody can leave on is worse than no gate.
+Two further carve-outs are load-bearing: a line that DELIBERATELY names
+a path as absent (CLAUDE.md's own worktree pre-flight asserts
+`test ! -f src/handlers.rs`) is exempt, evaluated over a THREE-LINE
+window because this repo hard-wraps prose and the disclaimer routinely
+lands on the line above the path it disclaims; and frozen doc trees
+(`docs/v0.*/`, `docs/internal/`, `docs/audit/`, `docs/rfc/`, `docs/adr*`,
+`docs/BASELINE-*.md`, the `perfect-endpoint-assessment` wave artefacts)
+are out of scope for the CHANGELOG reason — they describe a tree AS IT
+WAS. **NO NEW SSOT** (operator direction): where the migration-ladder
+tip is needed the gate EXTRACTS and reuses `read_current_schema_version`
+from `scripts/check-migration-ladder.sh` rather than deriving the tip a
+third time, and fails loudly if that function is renamed. That rule
+immediately caught `docs/postgres-age-guide.md` naming a ten-versions-
+stale `migrate_vNN()` as the end of the postgres ladder — the #2629
+issue title's own example. Burn-down allowlist
+`scripts/qc-allowlists/doc-symbol-anchors-allow.txt`, where a **STALE
+entry FAILS**. `--self-test` plants the audit's own `decorate_memory`
+rename, a pre-modularisation path, a past-EOF line anchor, a stale
+`migrate_vNN` tip claim and a dead markdown symbol link, with
+near-miss controls (the correct symbol, a `Type::method` brace list, an
+in-range anchor, a module link, the absent-path assertion) that must
+each PASS.
+
+**9. SDK-path vs `routes.rs` membership gate** (#2629, CERT GATE 2;
+register 3.3.2) — `scripts/check-sdk-route-paths.sh`. **Nothing pinned
+the SDK READMEs or SDK client sources against
+`src/handlers/routes.rs`**, so two defect classes shipped: **C-19** —
+`grant()` / `revoke()` / `cluster()` in BOTH SDKs calling
+`/api/v1/memories/{id}/grant`, `…/revoke` and `/api/v1/cluster`, three
+paths with ZERO hits in `routes.rs`, i.e. three shipped, typed,
+documented methods that **404 at runtime** (the TS source even carries a
+comment saying "Some may not be merged server-side yet" — the knowledge
+was in the tree and no control acted on it); and **C-20** — TS
+`unsubscribe(id)` targeting `DELETE /api/v1/subscriptions/:id` when
+`src/lib.rs` registers delete on the COLLECTION path only and the id
+rides the query string (`src/handlers/subscriptions.rs`). The register
+calls the check "mechanically trivial", and it is; the value is
+catching both AT AUTHORING TIME rather than at a customer's first call.
+The gate builds the registered set from the `routes.rs` const SSOT,
+extracts every `/api/v1/…` literal from `sdk/*/README.md` + the client
+sources, and **NORMALISES path PARAMETERS on both sides** — `{id}`,
+`:id`, `${encodeURIComponent(id)}`, `{memory_id}`, `<id>` all collapse
+to `{}`. That step is what makes it catch C-20: a raw-string membership
+test PASSES it (the collection path IS registered) and a
+parameter-blind test passes it too; only normalisation makes
+`/api/v1/subscriptions/{}` a non-member while
+`/api/v1/memories/{}` stays a member. PENDING-FIX ledger
+`scripts/qc-allowlists/sdk-route-paths-pending.txt`. `--self-test`
+plants C-19 in the TS client, the python client and BOTH READMEs and
+C-20 in the TS client and its README, with near-miss controls that must
+PASS: a correctly-templated member path in each SDK dialect, a
+collection call with a QUERY STRING (the shape C-20's fix must adopt),
+and the bare `/api/v1/` base-URL prefix. An empty sdk scan set fails
+CLOSED so the gate cannot no-op to green.
+
+**10. Named-CI-job existence + enforcement-truthfulness gate** (#2629,
+CERT GATE 2; register 3.3.3) — `scripts/check-ci-job-claims.sh`. Four
+published claims, all the same shape — *"a control was removed and the
+prose was not"*: **C-24**, `ci.yml`'s "Code Coverage" job cited as the
+live coverage gate in BOTH README and ROADMAP after being REMOVED in
+#1993 (README even documents the removal two clauses after asserting
+the job enforces a ratchet); **C-23**, `docs/v1.0.0/release-notes.md`
+saying the postgres/AGE stack is "gated **nightly** by the
+`postgres-age` CI job" when that job was deleted in `da3fb9cc` and
+`postgres-parity-nightly.yml` says in its own header the coverage is
+"gone rather than repaired"; **C-21**, PERFORMANCE.md citing an AGE
+bench gate in `.github/workflows/bench.yml`, which has zero `age` hits;
+**C-31**, PERFORMANCE.md saying `bench.yml` "gates every PR and trunk
+push" when `bench.yml:18` says of ITSELF "Bench is advisory (not in
+required-status-checks)" and `grep -ic bench
+scripts/qc-allowlists/required-contexts-release.txt` is 0.
+
+TWO rules, in strength order. **EXISTENCE** (unambiguous): every
+workflow file and named CI job cited in `README.md`, `ROADMAP.md`,
+`PERFORMANCE.md` or `docs/v1.0.0/*.md` must resolve to a file under
+`.github/workflows/` or to a parsed job `name:` / job key / matrix
+expansion within one; the parse follows the SAME YAML scalar rule gate 7
+established (a `#` preceded by whitespace opens a comment, `(#1174
+PR10)` does not), because a job whose DECLARED name differs from the
+reported one is exactly how the #2473 truncated context entered the live
+required set. Catches C-24 and C-23 outright. **ENFORCEMENT-TRUTHFULNESS**
+is the rule that counters the register's stated systematic bias: a doc
+that says a named job or workflow *gates* / *blocks merge* / *fails the
+PR* / *is required* must resolve to a context actually declared in
+`scripts/qc-allowlists/required-contexts-release.txt`. Existence alone
+GREENS C-31 — `bench.yml` exists and its job exists, and the claim that
+it gates anything is still false. Two calibrations keep it aimed at the
+defect rather than its neighbourhood: the enforcement verb must sit
+within **90 characters** of the citation (a ROADMAP "Code anchors" line
+names five workflows and one gate, and only one of the five is the
+gate's subject), and `operator-gated` is excluded because that is a
+claim about HUMAN release authority, not a required status check —
+demanding that a `workflow_dispatch`-only `release.yml` be a required PR
+context would be incoherent, so `workflow_dispatch`-ONLY workflows are
+exempt from ENFORCEMENT (never from EXISTENCE; a `schedule:`-only
+nightly is NOT exempt, since claiming a nightly gates a PR is exactly
+the false-enforcement shape). Shipped as a ratchet with the PENDING-FIX
+ledger `scripts/qc-allowlists/ci-job-claims-pending.txt` because five
+document-correction lanes are in flight concurrently. `--self-test`
+plants all four claims; the C-31 leg asserts the rejection comes from
+the ENFORCEMENT rule specifically, and its paired near-miss — the same
+workflow described WITHOUT an enforcement verb — must PASS so the rule
+does not ban mentioning an advisory workflow at all.
+
+**`cargo test` twin for gates 4 / 8 / 9 / 10:**
+`tests/doc_claims_integrity.rs` (the
+`tests/migration_ladder_integrity.rs` precedent). All four shell gates
+live in ONE workflow, so a deleted job, a renamed script or a `paths:`
+filter would make every one of them silently stop running while the
+branch stayed green. The twin re-asserts the two invariants with a
+concrete RUNTIME consequence (SDK path membership; named-CI-job
+existence) plus two STRUCTURAL properties — every ledger parses, and
+every gate is wired into `c8-precheck.yml` **with its `--self-test`
+step**, with no `needs: classify`, no `paths:` filter and no job-level
+`if:`. It deliberately does NOT duplicate the full pattern sets: two
+definitions that can disagree teach reviewers to ignore both. Run it as
+`( umask 022; cargo test --test doc_claims_integrity )` — the bare
+`cargo test` umask trap is #2628.
 
 ## Prime directive (operator-set, 2026-05-17)
 
@@ -1873,7 +2093,7 @@ recommending:
 - A "OWASP Agent Memory Guard" project (real, but
   vgudur-dev is the dominant author with 105 of ~125
   commits; OWASP Incubator tier, self-applied)
-- A code snippet to drop into `src/mcp/tools/store.rs` (the
+- A code snippet to drop into `src/mcp/tools/store/` (the
   substrate's primary write path)
 
 Account profile: GitHub user ID 194662684 (high = recent
