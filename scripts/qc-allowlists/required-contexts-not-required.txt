@@ -1,0 +1,60 @@
+# required-contexts-not-required.txt — the DELIBERATELY-UNREQUIRED job ledger
+# for the gating workflows, enforced by rule (f) of
+# `scripts/check-required-contexts.sh` (#2636).
+#
+# ============================================================================
+# *** THIS FILE IS CURRENTLY EMPTY, AND THAT IS THE PASSING STATE. ***
+# ============================================================================
+# Empty means every job in every gating workflow is DECLARED REQUIRED in
+# `required-contexts-release.txt`. The teeth are in the rule, not the contents:
+# from now on a newly-added job in a gating workflow must be declared one way
+# or the other, and cannot DEFAULT to unenforced.
+#
+# WHY THE RULE EXISTS (#2636). Four `c8-precheck.yml` integrity gates ran on
+# every pull request and were required by nothing — including
+# `Required-context + classify-base soundness gate (#2494/#2496/#2508)`, the
+# sole mechanical proof that the OTHER required contexts are creatable,
+# reachable, non-skipping, non-cancelled and non-truncated. A pull request that
+# broke the gate that proves the gates work could merge. Worse, the prose
+# "KNOWN GAPS" note that was supposed to record this named only TWO of the four
+# and had gone stale without anyone noticing — which is the argument for a
+# machine-parsed ledger over a comment.
+#
+# SCOPE, and why it is not repo-wide. Rule (f) covers the workflows declared in
+# `COVERED_WORKFLOWS` in the gate: `ci.yml`, `c8-precheck.yml`, `coverage.yml`.
+# Those are the three that carry required contexts — the PR gating pipeline.
+# Rules (d) and (e) ARE repo-wide, and the difference is deliberate: (d) and
+# (e) detect STATIC DEFECTS that are wrong wherever they appear, whereas (f)
+# encodes a POLICY JUDGEMENT ("should this job be required?") that has to be
+# authored per workflow. Sweeping `release.yml`, `publish-sdks.yml`,
+# `yank.yml` and the rest into it would mean inventorying ~45 jobs that never
+# fire on `pull_request` at all — a junk drawer that teaches readers to skim
+# past the file, which is how a ledger stops being read. The gate hard-fails if
+# a mirror context ever appears in a workflow OUTSIDE this list, so the scope
+# cannot silently narrow while the required set widens.
+#
+# FORMAT
+#   <workflow-file> <job-id> <YYYY-MM-DD> #<issue> [free-text note]
+#
+#   * The key is the JOB ID, not the job name: ids have no spaces, and a job
+#     renamed for readability should not silently drop its entry.
+#   * The DATE is when the decision was taken. The ISSUE is what closes it.
+#     Both are mandatory and format-checked, so an entry can never rot into an
+#     unexplained suppression.
+#   * A line whose first non-space character is `#` is a comment.
+#
+# STALE ENTRIES HARD-FAIL, in both directions:
+#   * an entry naming a workflow/job that no longer exists, and
+#   * an entry for a job whose context IS declared in the mirror — a job cannot
+#     be required and deliberately-unrequired at once, and letting that pass
+#     would leave a line that could pre-absolve a FUTURE job reusing the id.
+#
+# THIS IS NOT AN ABSOLUTION. An entry says "we looked, and decided not to
+# require this job, on this date, tracked here". The correct disposition for an
+# integrity gate is almost always to REQUIRE it: add its exact reported name to
+# `required-contexts-release.txt` instead, then make the branch-protection call
+# (mirror FIRST, protection after — the ORDER doctrine in that file's header).
+#
+# ---------------------------------------------------------------------------
+# (no entries)
+# ---------------------------------------------------------------------------
