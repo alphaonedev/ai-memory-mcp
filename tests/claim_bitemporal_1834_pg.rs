@@ -89,6 +89,8 @@ fn filter(ns: &str, valid_at: Option<&str>) -> Filter {
         valid_at: valid_at.map(str::to_string),
         limit: 50,
         active_embedding_space: None,
+        // #2580 — metadata-equality pushdown axis unused on this path.
+        metadata_eq: None,
     }
 }
 
