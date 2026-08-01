@@ -196,6 +196,22 @@ pub struct Metrics {
     /// classifier maps the free-text `last_error` to one of the six
     /// values), never the raw string.
     pub federation_push_dlq_quarantined_by_cause: IntCounterVec,
+    /// #2442 — push-DLQ rows skipped because their durable routing key is a
+    /// pre-#2442 POSITIONAL peer id (`peer-0`, `peer-1`, …) that no longer
+    /// resolves to any configured peer.
+    ///
+    /// Deliberately its own counter rather than a new `cause` label on
+    /// [`Self::federation_push_dlq_quarantined_by_cause`]: that label is
+    /// derived by ordered substring matching over `last_error`, which
+    /// peer-supplied text can reach, and the legacy condition is decided from
+    /// the SHAPE of `peer_id` instead. Keeping them separate also stops the
+    /// routing-key fact from overriding a row's REAL quarantine cause.
+    ///
+    /// Increments once per affected row per replay pass, so this is a rate,
+    /// not a population count. A non-zero rate after an upgrade means legacy
+    /// rows are still present — see `docs/TROUBLESHOOTING.md`
+    /// §federation-push-DLQ. It should fall to zero and stay there.
+    pub federation_push_dlq_legacy_positional: IntCounter,
 
     /// pm-v3.1 PR8 (issue #1174) — cumulative HNSW oldest-eviction
     /// count since process start. Replaces the prior process-global
@@ -569,15 +585,41 @@ impl Metrics {
         let federation_push_dlq_quarantined_by_cause = IntCounterVec::new(
             prometheus::Opts::new(
                 "ai_memory_federation_push_dlq_quarantined_by_cause_total",
+                // #2442 — the enumeration below had drifted TWO causes behind
+                // `classify_quarantine_cause` (it was missing
+                // `unenrolled_author_strict` from #1464/#1801 and
+                // `namespace_probe_unresolvable` from #2488, both of which
+                // docs/federation.md already carried). Re-synced here; this
+                // HELP string, `classify_quarantine_cause`, and
+                // docs/federation.md are the three mirrors of one closed set.
                 "Federation push-DLQ rows quarantined, labeled by the \
-                 classified cause (quota|unenrolled_peer|id_drift|permanent|\
-                 peer_removed|other). `quota` is operator-actionable (raise \
-                 AI_MEMORY_MAX_MEMORIES_PER_DAY or wait for the daily reset); \
-                 `permanent` is a broken row needing a manual drain. #1544.",
+                 classified cause (quota|unenrolled_peer|\
+                 unenrolled_author_strict|namespace_probe_unresolvable|\
+                 id_drift|permanent|peer_removed|other). `quota` is \
+                 operator-actionable (raise AI_MEMORY_MAX_MEMORIES_PER_DAY or \
+                 wait for the daily reset); `permanent` is a broken row \
+                 needing a manual drain. #1544.",
             ),
             &["cause"],
         )?;
         registry.register(Box::new(federation_push_dlq_quarantined_by_cause.clone()))?;
+
+        // #2442 — legacy positional peer-id skips. Kept OFF the `cause` label
+        // set above on purpose: see the field doc on
+        // `federation_push_dlq_legacy_positional`.
+        let federation_push_dlq_legacy_positional = IntCounter::new(
+            "ai_memory_federation_push_dlq_legacy_positional_total",
+            "Federation push-DLQ rows skipped because their durable routing \
+             key is a pre-#2442 POSITIONAL peer id (the --quorum-peers flag \
+             index) that resolves to no configured peer. Written by binaries \
+             older than #2442. These rows are NEVER auto-remapped — \
+             `peer-N` -> peers[N] is only correct if the peer list never \
+             changed, and guessing would deliver the write to the wrong host. \
+             Payloads are retained, not deleted. Non-zero after an upgrade \
+             means legacy rows remain; see docs/TROUBLESHOOTING.md \
+             §federation-push-DLQ for the operator-gated re-key. #2442.",
+        )?;
+        registry.register(Box::new(federation_push_dlq_legacy_positional.clone()))?;
 
         // pm-v3.1 PR8 (issue #1174) — HNSW eviction observability moved
         // from process-global atomics in `src/hnsw.rs` into the metrics
@@ -753,6 +795,7 @@ impl Metrics {
             federation_push_dlq_depth,
             federation_push_dlq_quarantined,
             federation_push_dlq_quarantined_by_cause,
+            federation_push_dlq_legacy_positional,
             hnsw_evictions_total,
             hnsw_last_eviction_at_nanos,
             subscription_dlq_overflow_total,

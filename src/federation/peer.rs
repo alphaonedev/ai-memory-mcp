@@ -40,6 +40,174 @@ const FED_CLIENT_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 /// pm-v3.1 no-hardcoded-literal discipline), referenced by name everywhere.
 const FED_LOG_TARGET: &str = "federation";
 
+/// #2442 — prefix of the stable, identity-derived [`PeerEndpoint::id`].
+///
+/// Two characters are load-bearing, neither is decoration:
+///
+/// * `h` ("hash") makes a minted id STRUCTURALLY unable to collide with the
+///   pre-#2442 positional shape `peer-<digits>`. Hex nibbles are
+///   all-decimal-digits a non-trivial fraction of the time, so without the
+///   `h` a freshly minted id could impersonate a legacy DLQ routing key and
+///   be misread by [`is_legacy_positional_peer_id`]. `h` is a constant, never
+///   attacker-influenced, so no URL can be crafted to mint a legacy-looking
+///   id.
+/// * `1` is the DERIVATION VERSION, and it exists because the id is a durable
+///   key. See [`PEER_ID_DERIVATION_DOMAIN`] — if the derivation ever changes,
+///   the version must go to `2` so the shape is greppable and the two
+///   generations are structurally distinguishable in a `federation_push_dlq`
+///   table that will contain both.
+const STABLE_PEER_ID_PREFIX: &str = "peer-h1";
+
+/// #2442 — domain-separation + version tag hashed IN FRONT of the normalised
+/// URL, so the peer id is not a bare `SHA-256(url)` that could alias any other
+/// URL digest in the system, and so the derivation carries its own version.
+///
+/// This is the tripwire for the one failure mode that would otherwise be
+/// silent and fleet-wide. [`normalize_peer_url`] is deliberately shared with
+/// the duplicate-URL boot check, and those two consumers have OPPOSING
+/// long-run requirements: the duplicate check should normalise MORE over time
+/// (IDNA/punycode, default-port stripping, percent-decoding — all real
+/// hardening for the `#341` double-count guarantee), whereas the id must
+/// normalise IDENTICALLY FOREVER or every persisted DLQ row and `sync_state`
+/// entry is orphaned. Whoever correctly hardens the normalisation MUST bump
+/// this domain string and [`STABLE_PEER_ID_PREFIX`] to `v2`/`peer-h2` and
+/// ship it as a migration. The frozen-digest golden test in
+/// `tests/federation_stable_peer_id_2442.rs` exists precisely to go RED and
+/// force that decision rather than let it happen by accident.
+const PEER_ID_DERIVATION_DOMAIN: &[u8] = b"ai-memory:peer-id:v1\0";
+
+/// #2442 — hex nibbles of the SHA-256 digest retained in a peer id.
+///
+/// **32 nibbles = 128 bits.** The sizing argument is a SECOND-PREIMAGE
+/// argument, not a birthday argument, and that distinction is why this is
+/// not the 12 nibbles a pure fleet-size calculation would suggest:
+///
+/// * The naive argument says 48 bits is plenty. v1.0.0 certifies 500–1000
+///   agent clusters, i.e. TENS of federation peers; the birthday collision
+///   probability at n peers is ≈ n²/2 ÷ 2⁴⁸, which at n = 100 is ≈ 1.8×10⁻¹¹
+///   and even at a pathological n = 10 000 is ≈ 1.8×10⁻⁷.
+/// * That argument is WRONG here, because the hash input is
+///   OPERATOR-SUPPLIED and an adversary who can get one URL into
+///   `--quorum-peers` picks it freely (only the trailing slash and ASCII case
+///   are canonicalised — path, port, query and userinfo all survive). The
+///   profitable target is a peer that has been REMOVED from the config but
+///   whose rows are still sitting in `federation_push_dlq`: grind a URL whose
+///   id equals the departed peer's, and `push_dlq::replay_once` hands you
+///   another tenant's queued payloads. That is a second-preimage search
+///   against one fixed digest — ≈ 2⁴⁸ SHA-256 evaluations, hours of commodity
+///   GPU time — and the boot-time collision guard below CANNOT see it,
+///   because the victim is not in the config to be compared against.
+/// * At 128 bits that search is ≈ 2¹²⁸ and infeasible for any adversary. A
+///   *free* collision (both URLs attacker-chosen) is still the 64-bit
+///   birthday bound, but a free collision buys nothing: hijacking requires
+///   colliding with a SPECIFIC existing peer's URL.
+/// * The id must nevertheless stay SHORT and FIXED-WIDTH — it is a durable
+///   routing key in `federation_push_dlq.peer_id` and `sync_state.peer_id`,
+///   and a structured log field. `peer-h` + 32 = 38 ASCII characters,
+///   bounded and constant. Note the `#304` label-space concern that the
+///   pre-#2442 comment cited does NOT apply: `PeerEndpoint.id` reaches zero
+///   Prometheus labels at v1.0.0 (see the corrected comment in `build`), so
+///   widening the digest costs no cardinality.
+const STABLE_PEER_ID_HASH_NIBBLES: usize = 32;
+
+/// #2442 — canonical form of a peer URL for IDENTITY purposes.
+///
+/// This is the single source of truth shared by two callers that MUST agree:
+/// the duplicate-URL boot refusal (Ultrareview #341) and [`stable_peer_id`].
+/// If they disagreed, two spellings the duplicate check considers identical
+/// could mint two different ids — splitting one peer's DLQ rows across two
+/// routing keys — or, worse, two spellings it considers distinct could mint
+/// one id and MERGE two peers' rows.
+///
+/// Deliberately NOT used to build `sync_push_url`: lowercasing is safe for
+/// scheme+host comparison but would corrupt a case-sensitive path.
+#[must_use]
+fn normalize_peer_url(raw: &str) -> String {
+    raw.trim_end_matches('/').to_ascii_lowercase()
+}
+
+/// #2442 — mint the stable, position-independent [`PeerEndpoint::id`].
+///
+/// ## Why this exists
+///
+/// The pre-#2442 id was `format!("peer-{i}")` — the `.enumerate()` index of
+/// the `--quorum-peers` flag. That id is not a label; it is the DURABLE
+/// routing key of the federation push DLQ (`federation_push_dlq.peer_id`,
+/// enqueued in `sync.rs`, resolved in `push_dlq::replay_once` by
+/// `config.peers.iter().find(|p| p.id == row.peer_id)`) AND the key of the
+/// persisted catch-up vector clock (`sync_state`, see `receive.rs`).
+///
+/// Decommissioning one peer shifted every higher index down by one, so a row
+/// queued for the old `peer-3` resolved to a DIFFERENT HOST, was POSTed
+/// there, and was then stamped `replayed_at`. That is cross-tenant content
+/// disclosure and silent write loss from an ordinary operator action.
+///
+/// ## Contract
+///
+/// The output is a pure, total function of the peer's NORMALISED URL and of
+/// nothing else. It is therefore stable under adding, removing, or reordering
+/// peers — the property the DLQ needs. Because DLQ rows and `sync_state`
+/// entries minted under this id outlive the process, the derivation is a
+/// FROZEN WIRE FORMAT: `STABLE_PEER_ID_PREFIX` + the first
+/// `STABLE_PEER_ID_HASH_NIBBLES` lowercase hex nibbles of
+/// `SHA-256(normalize_peer_url(raw))`. Changing the hash, the truncation
+/// length, or [`normalize_peer_url`] re-keys every persisted row and MUST be
+/// treated as a migration, not a refactor.
+///
+/// SHA-256 (not blake3, not a non-cryptographic hash) because the input is
+/// operator-supplied: second-preimage resistance is the property that stops a
+/// crafted peer URL from being ground to collide with an existing peer's id
+/// and hijack its queued rows. A non-cryptographic hash (fnv/xxhash) would be
+/// collidable in milliseconds by anyone who can propose a peer URL, which
+/// disqualifies it for a routing key regardless of its speed.
+#[must_use]
+fn stable_peer_id(raw: &str) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(PEER_ID_DERIVATION_DOMAIN);
+    hasher.update(normalize_peer_url(raw).as_bytes());
+    let mut id = String::with_capacity(STABLE_PEER_ID_PREFIX.len() + STABLE_PEER_ID_HASH_NIBBLES);
+    id.push_str(STABLE_PEER_ID_PREFIX);
+    id.push_str(&hex::encode(hasher.finalize())[..STABLE_PEER_ID_HASH_NIBBLES]);
+    id
+}
+
+/// #2442 — first peer id minted twice, if any. Pure and total so the
+/// fail-closed branch in [`FederationConfig::build`] is unit-testable without
+/// standing up a reqwest client (same reason `resolve_daemon_signing_key` was
+/// extracted below).
+///
+/// Returns `Some((first_url, duplicate_url, shared_id))`.
+#[must_use]
+fn first_peer_id_collision<'a>(ids: &[(&'a str, &'a str)]) -> Option<(&'a str, &'a str, &'a str)> {
+    let mut seen: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::with_capacity(ids.len());
+    for (id, url) in ids {
+        if let Some(previous) = seen.insert(id, url) {
+            return Some((previous, url, id));
+        }
+    }
+    None
+}
+
+/// #2442 — true when `peer_id` carries the pre-#2442 POSITIONAL shape
+/// `peer-<decimal digits>`.
+///
+/// Used by the DLQ replay worker to tell "this row was written by a binary
+/// that keyed on the flag index" apart from "the operator removed this peer".
+/// Both leave the row unresolvable, but only the first is an upgrade artifact
+/// with a mechanical remediation, and conflating them sends operators hunting
+/// for a decommission that never happened.
+///
+/// Cannot false-positive on a minted id: every minted id starts with
+/// `peer-h` and `h` is not a decimal digit.
+#[must_use]
+pub fn is_legacy_positional_peer_id(peer_id: &str) -> bool {
+    peer_id
+        .strip_prefix("peer-")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
 impl FederationConfig {
     /// Build a `FederationConfig` from the serve-time CLI flags. Returns
     /// `None` when federation is disabled (`quorum_writes == 0` or the
@@ -76,9 +244,15 @@ impl FederationConfig {
         // both would count as distinct ack sources and the quorum
         // guarantee is violated. Normalize (trim trailing slash,
         // lowercase scheme+host) before comparing.
+        //
+        // #2442 — the normalisation is now the shared [`normalize_peer_url`]
+        // helper rather than an inline expression, because `stable_peer_id`
+        // derives the durable DLQ routing key from the SAME canonical form.
+        // Two spellings this check calls identical MUST mint one id, and two
+        // it calls distinct MUST mint two. One function, no drift.
         let mut seen_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
         for raw in peer_urls {
-            let normalized = raw.trim_end_matches('/').to_ascii_lowercase();
+            let normalized = normalize_peer_url(raw);
             if !seen_urls.insert(normalized.clone()) {
                 return Err(anyhow::anyhow!(
                     "duplicate peer URL in --quorum-peers: {raw} (normalized: {normalized}) \
@@ -93,23 +267,89 @@ impl FederationConfig {
             .iter()
             .enumerate()
             .map(|(i, raw)| {
-                // `id` is used as a Prometheus metric label; keep it
-                // low-cardinality. The full URL is logged separately.
-                // (#304 nit — prior form `peer-{i}:{url}` blew up the
-                // label space as deployment size grew.)
+                // #2442 — the id is NOT the enumerate index any more, and the
+                // comment that used to sit here was doubly wrong, so it is
+                // corrected rather than kept:
+                //
+                //  * It said "`id` is used as a Prometheus metric label; keep
+                //    it low-cardinality (#304 nit — prior form
+                //    `peer-{i}:{url}` blew up the label space)". VERIFIED
+                //    FALSE at v1.0.0: `PeerEndpoint.id` reaches ZERO metric
+                //    labels. Every `with_label_values` call in the federation
+                //    lane takes a closed-set token — `cause` in
+                //    `push_dlq.rs`, `outcome`/`reason` in `sync.rs` — and
+                //    `federation_partial_quorum_total` is a bare IntCounter.
+                //    The id is a structured LOG field and, far more
+                //    importantly, a DURABLE KEY.
+                //  * Treating it as "just a label" is what let it be
+                //    positional. It is the routing key of the push DLQ
+                //    (`federation_push_dlq.peer_id`) and of the `sync_state`
+                //    catch-up vector clock, so a positional key silently
+                //    re-pointed queued writes at a DIFFERENT HOST whenever a
+                //    peer was decommissioned — cross-tenant disclosure plus
+                //    silent write loss.
+                //
+                // It is now `stable_peer_id(raw)`: a function of peer IDENTITY
+                // (the normalised URL) and of nothing else, so adding,
+                // removing, or reordering peers never re-keys a survivor. The
+                // legitimate half of the #304 concern still holds and is still
+                // honoured — the id is short and FIXED-WIDTH (39 ASCII chars),
+                // never an unbounded URL.
                 let trimmed = raw.trim_end_matches('/');
-                tracing::debug!(
+                let id = stable_peer_id(raw);
+                // #2442 — promoted debug -> info. The id is now opaque, so
+                // this is the ONLY place an operator can resolve a DLQ row's
+                // `peer_id` (or a Prometheus label) back to a host. It fires
+                // once per peer at boot — tens of lines on the fleet sizes
+                // v1.0.0 certifies, not a hot path.
+                tracing::info!(
                     target: FED_LOG_TARGET,
                     peer_index = i,
+                    peer_id = %id,
                     url = trimmed,
-                    "registered peer"
+                    "registered peer (#2442: peer_id is derived from the URL, not the \
+                     flag position; this line is the id -> url map for DLQ triage)"
                 );
                 PeerEndpoint {
-                    id: format!("peer-{i}"),
+                    id,
                     sync_push_url: format!("{trimmed}/api/v1/sync/push"),
                 }
             })
             .collect();
+
+        // #2442 — fail CLOSED on an actually-observed peer-id collision.
+        //
+        // The 48-bit truncation makes this astronomically unlikely at the
+        // fleet sizes v1.0.0 certifies (see `STABLE_PEER_ID_HASH_NIBBLES`),
+        // but "unlikely" is not a data-integrity guarantee: two peers sharing
+        // a routing key would merge their DLQ rows and misroute content
+        // exactly the way the positional id did. Refusing to boot is the
+        // DEGRADE-not-CORRUPT answer, and it mirrors the duplicate-URL
+        // refusal above — the precedent for a boot-time refusal on this loop.
+        //
+        // This guard ALSO backstops any future drift between the duplicate-URL
+        // check and `stable_peer_id`: the only dangerous direction is "the
+        // duplicate check calls two URLs distinct but they mint one id", and
+        // that lands here.
+        //
+        // Scope, stated honestly: this compares peers WITHIN THE LIVE CONFIG.
+        // It cannot see a peer that has been REMOVED but whose rows are still
+        // in `federation_push_dlq`, so it is not the defence against a ground
+        // second-preimage — 128 bits of digest is (see
+        // `STABLE_PEER_ID_HASH_NIBBLES`). This guard is the accident case.
+        let id_url_pairs: Vec<(&str, &str)> = peers
+            .iter()
+            .zip(peer_urls.iter())
+            .map(|(peer, raw)| (peer.id.as_str(), raw.as_str()))
+            .collect();
+        if let Some((first, duplicate, id)) = first_peer_id_collision(&id_url_pairs) {
+            return Err(anyhow::anyhow!(
+                "federation peer-id collision in --quorum-peers: {first} and {duplicate} both \
+                 derive the stable peer id {id} — refusing to start, because a shared routing \
+                 key would merge the two peers' federation_push_dlq rows and deliver queued \
+                 writes to the wrong host (#2442). Change one peer's URL spelling."
+            ));
+        }
 
         // Federation client tuning.
         //
@@ -362,5 +602,65 @@ mod build_pinning_tests {
         }
         let cfg = built.expect("pinning build must succeed");
         assert!(cfg.is_some(), "quorum_writes=1 with a peer must yield Some");
+    }
+
+    /// #2442 — the fail-closed collision branch in `build` is unreachable in
+    /// practice (128 bits of SHA-256), which is exactly why the check is
+    /// extracted as a pure function: an unreachable guard that cannot be
+    /// exercised is a guard nobody can trust. Same reasoning as the
+    /// `resolve_daemon_signing_key` extraction above.
+    #[test]
+    fn first_peer_id_collision_detects_a_shared_routing_key() {
+        assert_eq!(
+            super::first_peer_id_collision(&[
+                ("peer-h1aaa", "https://a.example"),
+                ("peer-h1bbb", "https://b.example"),
+                ("peer-h1aaa", "https://c.example"),
+            ]),
+            Some(("https://a.example", "https://c.example", "peer-h1aaa")),
+            "a shared id must be reported with BOTH urls so the boot refusal \
+             can name what to change"
+        );
+    }
+
+    #[test]
+    fn first_peer_id_collision_is_none_for_distinct_ids() {
+        assert_eq!(
+            super::first_peer_id_collision(&[
+                ("peer-h1aaa", "https://a.example"),
+                ("peer-h1bbb", "https://b.example"),
+            ]),
+            None
+        );
+        assert_eq!(super::first_peer_id_collision(&[]), None);
+    }
+
+    /// #2442 — the id derivation and the `#341` duplicate-URL check MUST share
+    /// one normalisation. If they drift, a URL the duplicate check calls
+    /// identical could mint two routing keys (splitting one peer's DLQ rows)
+    /// or two it calls distinct could mint one (merging two peers').
+    #[test]
+    fn normalisation_is_shared_between_the_dup_check_and_the_id() {
+        for (a, b) in [
+            ("https://p.example/base", "https://p.example/base/"),
+            ("https://p.example/base", "HTTPS://P.EXAMPLE/BASE"),
+            ("https://p.example", "https://p.example///"),
+        ] {
+            assert_eq!(
+                super::normalize_peer_url(a),
+                super::normalize_peer_url(b),
+                "{a} and {b} must canonicalise identically"
+            );
+            assert_eq!(
+                super::stable_peer_id(a),
+                super::stable_peer_id(b),
+                "{a} and {b} must mint one routing key"
+            );
+        }
+        assert_ne!(
+            super::stable_peer_id("https://p.example:8443"),
+            super::stable_peer_id("https://p.example:9443"),
+            "a port change is a DIFFERENT peer and must mint a different key"
+        );
     }
 }
