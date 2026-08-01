@@ -18007,6 +18007,27 @@ impl MemoryStore for PostgresStore {
         } else {
             NS_FILTER_OPTIONAL
         };
+        // v1.0.0 #2580 — exact top-level metadata string-equality pushdown.
+        // Emitted ONLY when the caller sets the axis, so every pre-#2580
+        // `list` shape keeps its byte-identical SQL (and its cached plan).
+        //
+        // `metadata @> jsonb_build_object($9::text, $10::text)` is the
+        // GIN-servable form: the pre-existing `memories_metadata_gin` index
+        // answers it with a Bitmap Index Scan (measured 0.29 ms exec on the
+        // 8k-row Atlas corpus) while the equivalent `metadata->>$9 = $10`
+        // is NOT indexable and degenerates to a full namespace scan
+        // (17.8 ms, 10 724 rows removed by filter). Containment also matches
+        // the Rust twin EXACTLY: `jsonb_build_object` with two `text`
+        // arguments builds `{"<k>": "<v>"}` with a JSON STRING value, and
+        // top-level `@>` requires the same key with the same typed value —
+        // so `{"family": 123}` / `null` / `["core"]` / a NESTED
+        // `{"a":{"family":"core"}}` all correctly fail to match, identically
+        // to `metadata.get(k).and_then(Value::as_str) == Some(v)`.
+        let metadata_eq_predicate = if filter.metadata_eq.is_some() {
+            "AND metadata @> jsonb_build_object($9::text, $10::text)"
+        } else {
+            ""
+        };
         let list_sql = format!(
             "SELECT {cols} FROM memories
              WHERE {ns_predicate}
@@ -18026,6 +18047,7 @@ impl MemoryStore for PostgresStore {
                    OR ((valid_from IS NULL OR valid_from <= $8)
                        AND (valid_until IS NULL OR valid_until > $8))
                )
+               {metadata_eq_predicate}
                {lifecycle_vis}
              ORDER BY priority DESC, updated_at DESC
              LIMIT $5",
@@ -18035,6 +18057,12 @@ impl MemoryStore for PostgresStore {
             cols = MEMORY_READ_COLUMNS,
             lifecycle_vis = crate::models::lifecycle_visible_clause(""),
         );
+        // #2580 — bind $9/$10 ONLY for the shape that references them; sqlx
+        // rejects a bind count that exceeds the statement's placeholders.
+        let metadata_eq_binds = filter
+            .metadata_eq
+            .as_ref()
+            .map(|m| (m.key.clone(), m.value.clone()));
         let rows = sqlx::query(&list_sql)
             .bind(filter.namespace.as_ref())
             .bind(filter.tier.as_ref().map(Tier::as_str))
@@ -18049,7 +18077,12 @@ impl MemoryStore for PostgresStore {
             // comparison is exactly instant comparison.
             .bind(crate::validate::canonical_valid_time_opt(
                 filter.valid_at.as_deref(),
-            ))
+            ));
+        let rows = match metadata_eq_binds {
+            Some((k, v)) => rows.bind(k).bind(v),
+            None => rows,
+        };
+        let rows = rows
             .fetch_all(&self.pool)
             .await
             .map_err(|e| to_store_err("list", e))?;
