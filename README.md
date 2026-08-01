@@ -823,7 +823,7 @@ The `token-budget` workflow is a **required status check**. It enforces three cl
 
 Evaluated on the [ICLR 2025 LongMemEval-S](benchmarks/longmemeval/) dataset (500 questions, 6 categories). Against the **shipped binary**, the pure FTS5 keyword tier measures **96.4% R@5** — LLM-independent, fully local, zero cloud API calls, zero cost — and the semantic tier **96.8%**. LLM query expansion (smart tier) measures **97.2% R@5** with the current-generation Gemma 4 model, on the shadow harness and at a cloud-API venue.
 
-> **The image above is stale.** `docs/benchmark.svg` is regenerated separately and still renders the retired `harness_fast.py` figures (97.0% R@5 / 232 q/s). The table and prose in this section are the published numbers.
+> **The image above is stale.** `docs/benchmark.svg` is regenerated separately and still renders the retired shadow-harness figures (97.0% R@5 / 232 q/s), neither of which was produced by the shipped binary. The table and prose in this section are the published numbers.
 
 > **Benchmark-model note (updated 2026-07-10, [#1975](https://github.com/alphaonedev/ai-memory-mcp/issues/1975) ruling):** the historical 97.8% R@5 smart-tier figure was measured with **Gemma 3 4B** (still the *compiled* default expansion model) and is retired as the headline. The published current-generation anchor is the measured **OpenRouter Gemma 4** run: **97.2% R@5 / 99.6% R@10 / 99.8% R@20** (2026-05-31, 500 questions, 0 expansion failures). No local-Ollama Gemma-4 number exists — the reference benchmark host is CPU-only, where a valid full-protocol local run is infeasible (see [#1983](https://github.com/alphaonedev/ai-memory-mcp/issues/1983)); a local GPU re-run stays open post-v1.0. The **keyword-tier 96.4% R@5 is LLM-independent** and unaffected by this ruling — note it is a *binary-faithful* number and the 97.2% anchor is a *shadow-harness* number, so the two are not directly comparable.
 
@@ -836,7 +836,15 @@ Evaluated on the [ICLR 2025 LongMemEval-S](benchmarks/longmemeval/) dataset (500
 
 **Read the `autonomous` row.** On this dataset the cross-encoder reranker measures *below* both the semantic tier and the keyword baseline at every K. LongMemEval-S is lexical-match-heavy; paying for embeddings + rerank buys nothing here. We publish the row because a benchmark table that silently drops its worst tier is not a benchmark table.
 
-**Throughput.** The binary-faithful harness spawns one `ai-memory recall` subprocess per question and measures **~57 q/s** (`benchmarks/longmemeval/README.md`) — subprocess overhead, not recall cost. The frequently-quoted **232 q/s** is `harness_fast.py --parallel`: a 10-core, in-process Python + SQLite reimplementation with zero subprocesses, which is *not* the shipped code path. Neither figure is a production throughput contract; for hot-path latency see [Performance budgets](#performance-budgets).
+**Throughput — read the harness, not the number.** Three figures are in circulation and they measure three different programs; only one of them runs the shipped binary. Source: `docs/DEVELOPER_GUIDE.md` §LongMemEval, whose rows cross-check against their own elapsed times (q/s × elapsed ≈ 500 questions in every row — which is exactly what makes them auditable).
+
+| Harness | What it actually runs | Elapsed (500 q) | q/s |
+|---|---|---:|---:|
+| `harness.py` | **the shipped binary** — one `ai-memory recall` subprocess per question | 414 s | **1.2** |
+| `harness_fast.py` | single-process native Python + SQLite, no subprocesses | 8.8 s | 57 |
+| `harness_99.py --no-expand` | parallel FTS5, 10 cores, in-process | 2.2 s | 232 |
+
+**The 1.2 q/s is subprocess-spawn-dominated, not recall-dominated — and no real integrator pays it.** ~830 ms per question is the cost of forking a fresh `ai-memory` process, opening the database, resolving configuration and tearing the whole thing down again, **once per query**. That is a property of the benchmark harness's shape, not of the recall path. An MCP client holds one long-lived stdio process and an HTTP client holds one daemon; both issue N queries against a process that started once, and neither pays a per-query spawn. For the latency an integrator actually sees, use the hot-path budgets in [Performance budgets](#performance-budgets) (`memory_recall` hot, depth=1: p95 < 50 ms) — not any row in this table. Equally, **232 q/s is not a product number**: it is a 10-core parallel Python reimplementation of FTS5 scoring that never loads the Rust ranker at all.
 
 ### Performance budgets
 
