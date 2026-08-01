@@ -212,14 +212,51 @@ fn resolve_create_agent_id(
     headers: &HeaderMap,
     body: &CreateMemory,
 ) -> Result<(String, serde_json::Value), axum::response::Response> {
+    let agent_id = resolve_create_caller(headers).map_err(CreateFieldError::into_response)?;
+    let metadata =
+        resolve_create_metadata(&agent_id, body).map_err(CreateFieldError::into_response)?;
+    Ok((agent_id, metadata))
+}
+
+/// #2550 — a typed, per-field create-funnel refusal.
+///
+/// The single-create handler renders one of these as its whole HTTP response;
+/// `bulk_create` renders it as ONE ROW's entry in the response `errors[]`
+/// array. Before #2550 the two surfaces had no shared refusal vocabulary at
+/// all, which is precisely why the bulk path silently DROPPED the fields the
+/// single path validates (`scope`) or stamps (`kind_provenance`) — there was
+/// nothing to drop them *into*.
+///
+/// `field` is a SERVER-AUTHORED identifier from a closed set (never caller
+/// text) and `code` is a `crate::errors::error_codes` slug, so both are safe
+/// to echo to an unauthenticated caller; `message` is the human-readable
+/// reason and is sanitized before it reaches a bulk `errors[]` entry.
+pub(crate) struct CreateFieldError {
+    pub(crate) status: StatusCode,
+    pub(crate) code: &'static str,
+    pub(crate) field: &'static str,
+    pub(crate) message: String,
+}
+
+impl CreateFieldError {
+    fn into_response(self) -> axum::response::Response {
+        (
+            self.status,
+            Json(json!({ "code": self.code, "error": self.message })),
+        )
+            .into_response()
+    }
+}
+
+/// #2550 — resolve the authenticated caller for a create-family write.
+///
+/// Split out of [`resolve_create_agent_id`] so `bulk_create` resolves the
+/// principal EXACTLY once for the whole batch (its historical behaviour) while
+/// still sharing the per-row field resolution below.
+pub(crate) fn resolve_create_caller(headers: &HeaderMap) -> Result<String, CreateFieldError> {
     let header_agent_id = headers
         .get(crate::HEADER_AGENT_ID)
         .and_then(|v| v.to_str().ok());
-    let metadata_agent_id = body
-        .metadata
-        .get("agent_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
     // #907 (security-high, 2026-05-19) — sibling of #874/#901/#905.
     // The pre-#907 path preferred caller-supplied
     // `body.agent_id` / `metadata.agent_id` over the authenticated
@@ -233,53 +270,175 @@ fn resolve_create_agent_id(
     // Header-only authentication now; caller-supplied claims (if
     // present) must MATCH the authenticated caller else 403. The
     // metadata stamp is forced to the resolved caller below.
-    let agent_id = crate::identity::resolve_http_agent_id(None, header_agent_id).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
-        )
-            .into_response()
-    })?;
+    crate::identity::resolve_http_agent_id(None, header_agent_id).map_err(|e| CreateFieldError {
+        status: StatusCode::BAD_REQUEST,
+        code: crate::errors::error_codes::VALIDATION_FAILED,
+        field: "agent_id",
+        message: crate::errors::msg::invalid("agent_id", e),
+    })
+}
+
+/// #2550 — THE canonical per-row metadata resolution for every create-family
+/// write funnel (single-create sqlite + postgres, `bulk_create` sqlite +
+/// postgres).
+///
+/// Pre-#2550 this logic lived ONLY inside [`resolve_create_agent_id`], which
+/// `bulk_create` never called: both bulk branches hand-rolled a
+/// `metadata_stamped` that inserted `agent_id` and nothing else. The two
+/// consequences were a silent SECURITY-relevant field drop (a caller's
+/// top-level `scope: "collective"` was accepted, never read, and the row
+/// landed `scope_idx = 'private'` — invisible to every other agent) and a
+/// silent provenance drop (`kind_provenance` left NULL). Routing all four
+/// funnels through this one function makes the class structurally
+/// unreachable: a future field added here reaches bulk for free.
+///
+/// Performs, in order:
+/// 1. #907 — refuse a caller-supplied `agent_id` / `metadata.agent_id` that
+///    disagrees with the authenticated principal (403). Bulk previously
+///    OVERWROTE a disagreeing claim silently; a refusal is the single-create
+///    contract and the honest one.
+/// 2. Stamp the resolved principal into `metadata.agent_id`.
+/// 3. #151 — validate the top-level `scope` shortcut and merge it into
+///    `metadata.scope`.
+///
+/// # Errors
+///
+/// [`CreateFieldError`] carrying the HTTP status the single-create surface
+/// would have returned, plus the server-authored field name the bulk surface
+/// echoes per row.
+pub(crate) fn resolve_create_metadata(
+    agent_id: &str,
+    body: &CreateMemory,
+) -> Result<serde_json::Value, CreateFieldError> {
     if let Some(claimed) = body.agent_id.as_deref()
         && claimed != agent_id
     {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({"error": crate::errors::msg::AGENT_ID_BODY_MISMATCH})),
-        )
-            .into_response());
+        return Err(CreateFieldError {
+            status: StatusCode::FORBIDDEN,
+            code: crate::errors::error_codes::AGENT_ID_MISMATCH,
+            field: "agent_id",
+            message: crate::errors::msg::AGENT_ID_BODY_MISMATCH.to_string(),
+        });
     }
-    if let Some(claimed) = metadata_agent_id.as_deref()
+    if let Some(claimed) = body
+        .metadata
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
         && claimed != agent_id
     {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({"error": "metadata.agent_id does not match authenticated caller"})),
-        )
-            .into_response());
+        return Err(CreateFieldError {
+            status: StatusCode::FORBIDDEN,
+            code: crate::errors::error_codes::AGENT_ID_MISMATCH,
+            field: "metadata.agent_id",
+            message: METADATA_AGENT_ID_MISMATCH.to_string(),
+        });
     }
     let mut metadata = body.metadata.clone();
     if let Some(obj) = metadata.as_object_mut() {
         obj.insert(
             "agent_id".to_string(),
-            serde_json::Value::String(agent_id.clone()),
+            serde_json::Value::String(agent_id.to_string()),
         );
     }
     // #151 scope: validate + merge into metadata if supplied at the top
     // level (inline metadata.scope still works; top-level is a shortcut).
     if let Some(ref s) = body.scope {
-        validate::validate_scope(s).map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": e.to_string()})),
-            )
-                .into_response()
+        validate::validate_scope(s).map_err(|e| CreateFieldError {
+            status: StatusCode::BAD_REQUEST,
+            code: crate::errors::error_codes::VALIDATION_FAILED,
+            field: "scope",
+            message: e.to_string(),
         })?;
         if let Some(obj) = metadata.as_object_mut() {
             obj.insert("scope".to_string(), serde_json::Value::String(s.clone()));
         }
     }
-    Ok((agent_id, metadata))
+    Ok(metadata)
+}
+
+/// #2550 — the #907 metadata-claim refusal message, hoisted so the single
+/// and bulk funnels cannot drift (pm-v3.1 literal de-dup).
+pub(crate) const METADATA_AGENT_ID_MISMATCH: &str =
+    "metadata.agent_id does not match authenticated caller";
+
+/// #2550 — THE canonical `CreateMemory` -> [`Memory`] projection for every
+/// create-family write funnel.
+///
+/// Every field the wire accepts is resolved HERE, once. Pre-#2550 there were
+/// FOUR hand-maintained copies of this struct literal (single-create sqlite +
+/// postgres, bulk sqlite + postgres) and the two bulk copies had already
+/// drifted: they omitted the `kind_provenance` stamp entirely, so a
+/// bulk-written row carried a NULL provenance column while the byte-identical
+/// body posted to `/memories` carried `declared`. Collapsing them means a
+/// field can no longer be honoured on one funnel and dropped on another.
+///
+/// Callers supply the stage outputs that are NOT pure functions of `body`:
+/// the conflict-resolved `title`, the auto-tag-merged `tags`, the resolved
+/// `expires_at`, and the canonical `metadata` from
+/// [`resolve_create_metadata`].
+pub(crate) fn build_create_memory(
+    body: &CreateMemory,
+    metadata: serde_json::Value,
+    title: String,
+    tags: Vec<String>,
+    expires_at: Option<String>,
+    now: &chrono::DateTime<Utc>,
+) -> Memory {
+    let mut mem = Memory {
+        id: Uuid::new_v4().to_string(),
+        tier: body.tier.clone(),
+        namespace: body.namespace.clone(),
+        title,
+        content: body.content.clone(),
+        tags,
+        priority: body.priority.clamp(1, 10),
+        // #1591 — omitted confidence resolves to the compiled default with
+        // truthful `confidence_source = "default"` provenance.
+        confidence: body.resolved_confidence().clamp(0.0, 1.0),
+        source: body.source.clone(),
+        access_count: 0,
+        created_at: now.to_rfc3339(),
+        updated_at: now.to_rfc3339(),
+        last_accessed_at: None,
+        expires_at,
+        metadata,
+        reflection_depth: 0,
+        // #1385 — honour caller-supplied `kind`; unknown / absent falls
+        // through to `Observation` (forward-compat with future variants),
+        // matching the MCP `memory_store` contract.
+        memory_kind: body
+            .kind
+            .as_deref()
+            .and_then(crate::models::MemoryKind::from_str)
+            .unwrap_or_default(),
+        entity_id: None,
+        persona_version: None,
+        // #1411 — Form 4 fact provenance threaded through from the body.
+        citations: body.citations.clone(),
+        source_uri: body.source_uri.clone(),
+        source_span: body.source_span.clone(),
+        confidence_source: body.resolved_confidence_source(),
+        confidence_signals: None,
+        confidence_decayed_at: None,
+        version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
+        // v0.9.0 G8 (#1825) — stamped by the persist layer.
+        cid: None,
+        // #2258 / #1834 — claim-bitemporal VALID-time bounds (validated in
+        // `validate::validate_create`). Both backends keep `valid_from`
+        // immutably on upsert and COALESCE `valid_until`.
+        valid_from: body.valid_from.clone(),
+        valid_until: body.valid_until.clone(),
+    };
+    // v1.0.0 (#1945, spec §4) — epistemic-typing provenance: a caller-supplied
+    // `kind` is `declared`; caller silence (the system default) is
+    // `channel_derived`. HTTP does not run the auto-classify hook (MCP-only).
+    if body.kind.is_some() {
+        crate::models::KindProvenance::Declared.stamp(&mut mem.metadata);
+    } else {
+        crate::models::KindProvenance::ChannelDerived.stamp(&mut mem.metadata);
+    }
+    mem
 }
 
 /// #866 stage 3 — embed-before-lock. Issue #219: the embedder runs
@@ -874,73 +1033,18 @@ async fn create_memory_postgres(
             tier_default,
         )
     };
-    let mut mem = Memory {
-        id: Uuid::new_v4().to_string(),
-        tier: body.tier.clone(),
-        namespace: body.namespace.clone(),
-        title: body.title.clone(),
-        content: body.content.clone(),
-        tags: final_tags,
-        priority: body.priority,
-        // #1591 — omitted confidence resolves to the compiled default
-        // with truthful `confidence_source = "default"` provenance.
-        confidence: body.resolved_confidence(),
-        source: body.source.clone(),
-        access_count: 0,
-        created_at: now.to_rfc3339(),
-        updated_at: now.to_rfc3339(),
-        last_accessed_at: None,
-        expires_at,
+    // #2550 — THE shared create-funnel projection. Pre-#2550 this was a
+    // hand-maintained struct literal duplicated across four write funnels;
+    // the two `bulk_create` copies had already drifted (no `kind_provenance`
+    // stamp, no `scope` merge).
+    let mut mem = build_create_memory(
+        body,
         metadata,
-        reflection_depth: 0,
-        // #1385 — honour caller-supplied `kind` instead of the prior
-        // hardcoded `Observation`. Pre-#1385 the HTTP POST path
-        // dropped `body.kind` (the field didn't even exist on
-        // `CreateMemory`), so every HTTP-created row landed as
-        // `Observation` and the Form 6 recall `kinds` filter returned
-        // zero rows even when the caller had clearly stored a
-        // `claim` / `decision` / etc. Matches the MCP `memory_store`
-        // contract at `src/mcp/tools/store/validation.rs:207-240`:
-        // unknown / absent → silently fall through to `Observation`
-        // (forward-compat with future variants).
-        memory_kind: body
-            .kind
-            .as_deref()
-            .and_then(crate::models::MemoryKind::from_str)
-            .unwrap_or_default(),
-        entity_id: None,
-        persona_version: None,
-        // #1411 — Form 4 wire-truthfulness on the postgres branch.
-        // Pre-#1411 these were hardcoded `Vec::new()` / `None` /
-        // `None`, so HTTP POST /api/v1/memories validated the
-        // caller's `citations` / `source_uri` / `source_span` via
-        // `validate::validate_create` then silently dropped them
-        // on insert. Same shape as the #1385 `kind` drop; thread
-        // the validated body fields through to the inserted row.
-        citations: body.citations.clone(),
-        source_uri: body.source_uri.clone(),
-        source_span: body.source_span.clone(),
-        confidence_source: body.resolved_confidence_source(),
-        confidence_signals: None,
-        confidence_decayed_at: None,
-        version: 1,
-        lifecycle_state: crate::models::LifecycleState::Open,
-        cid: None,
-        // #2258 / #1834 — claim-bitemporal VALID-time bounds (validated in
-        // `validate::validate_create`). Postgres `store` ON CONFLICT keeps
-        // `valid_from` immutably and COALESCEs `valid_until` (parity with the
-        // sqlite branch below).
-        valid_from: body.valid_from.clone(),
-        valid_until: body.valid_until.clone(),
-    };
-    // v1.0.0 (#1945, spec §4) — epistemic-typing provenance: a caller-
-    // supplied `kind` is `declared`; caller silence (the system default) is
-    // `channel_derived`. HTTP does not run the auto-classify hook (MCP-only).
-    if body.kind.is_some() {
-        crate::models::KindProvenance::Declared.stamp(&mut mem.metadata);
-    } else {
-        crate::models::KindProvenance::ChannelDerived.stamp(&mut mem.metadata);
-    }
+        body.title.clone(),
+        final_tags,
+        expires_at,
+        &now,
+    );
     // #626 Layer-3 (C7) — agent-attestation gate (postgres SAL branch).
     // Same contract as the sqlite path, but the bound-key lookup goes
     // through the async `MemoryStore::agent_pubkey`. 400 for a malformed
@@ -1408,64 +1512,16 @@ pub async fn create_memory(
         }
     }
 
-    let mut mem = Memory {
-        cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
-        // #2258 / #1834 — claim-bitemporal VALID-time bounds (validated in
-        // `validate::validate_create`). `valid_from` is stamped at create and
-        // preserved immutably on upsert by the persist layer; `valid_until`
-        // COALESCEs and stays updatable via `PUT /memories/{id}`.
-        valid_from: body.valid_from.clone(),
-        valid_until: body.valid_until.clone(),
-        id: Uuid::new_v4().to_string(),
-        tier: body.tier.clone(),
-        namespace: body.namespace.clone(),
-        title: resolved_title,
-        content: body.content.clone(),
-        tags: merged_tags,
-        priority: body.priority.clamp(1, 10),
-        // #1591 — see the postgres branch above.
-        confidence: body.resolved_confidence().clamp(0.0, 1.0),
-        source: body.source.clone(),
-        access_count: 0,
-        created_at: now.to_rfc3339(),
-        updated_at: now.to_rfc3339(),
-        last_accessed_at: None,
-        expires_at,
+    // #2550 — THE shared create-funnel projection (sqlite branch); see the
+    // postgres branch above and `build_create_memory` for the rationale.
+    let mut mem = build_create_memory(
+        &body,
         metadata,
-        reflection_depth: 0,
-        // #1385 — sqlite branch parity. See the postgres branch above
-        // for the wire-truthfulness rationale: pre-#1385 every HTTP-
-        // created row landed as `Observation` regardless of the
-        // caller's `kind`. Same MCP-mirroring parse + fallback.
-        memory_kind: body
-            .kind
-            .as_deref()
-            .and_then(crate::models::MemoryKind::from_str)
-            .unwrap_or_default(),
-        entity_id: None,
-        persona_version: None,
-        // #1411 — Form 4 wire-truthfulness on the sqlite branch.
-        // See the postgres branch above for the full rationale:
-        // pre-#1411 every HTTP-created row landed with empty
-        // citations + null source_uri + null source_span even
-        // when the caller supplied them in the request body and
-        // `validate_create` accepted them.
-        citations: body.citations.clone(),
-        source_uri: body.source_uri.clone(),
-        source_span: body.source_span.clone(),
-        confidence_source: body.resolved_confidence_source(),
-        confidence_signals: None,
-        confidence_decayed_at: None,
-        version: 1,
-        lifecycle_state: crate::models::LifecycleState::Open,
-    };
-    // v1.0.0 (#1945, spec §4) — epistemic-typing provenance (sqlite branch
-    // parity with the postgres branch above).
-    if body.kind.is_some() {
-        crate::models::KindProvenance::Declared.stamp(&mut mem.metadata);
-    } else {
-        crate::models::KindProvenance::ChannelDerived.stamp(&mut mem.metadata);
-    }
+        resolved_title,
+        merged_tags,
+        expires_at,
+        &now,
+    );
 
     // #626 Layer-3 (C7) — agent-attestation gate on the HTTP store path.
     // Mirrors the MCP `handle_store` gate: a remote caller signs the
