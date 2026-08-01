@@ -143,7 +143,12 @@ impl BulkLedger {
     /// classification reaches the wire. The full detail is logged so operators
     /// can still debug.
     fn reject(&mut self, index: usize, field: &str, raw: &str) {
-        let class = classify_bulk_row_error(raw);
+        self.reject_class(index, field, classify_bulk_row_error(raw), raw);
+    }
+
+    /// #2552 — record a rejection whose typed class the caller already knows
+    /// (see [`super::create::CreateFieldError::as_bulk_class`]).
+    fn reject_class(&mut self, index: usize, field: &str, class: BulkRowErrorClass, raw: &str) {
         tracing::warn!(
             target: BULK_TRACE_TARGET,
             row = index,
@@ -314,7 +319,7 @@ fn status_precedence(class: &BulkRowErrorClass) -> u8 {
         codes::QUOTA_EXCEEDED => 0,
         codes::REPLICATION_UNAVAILABLE => 1,
         codes::INTERNAL_ERROR => 2,
-        codes::GOVERNANCE_REFUSED => 3,
+        codes::GOVERNANCE_REFUSED | codes::AGENT_ID_MISMATCH => 3,
         codes::CONFLICT => 4,
         codes::NOT_FOUND => 5,
         _ => 6,
@@ -559,7 +564,7 @@ pub async fn bulk_create(
         let metadata = match resolve_create_metadata(&caller, body) {
             Ok(m) => m,
             Err(e) => {
-                ledger.reject(index, e.field, &e.message);
+                ledger.reject_class(index, e.field, e.as_bulk_class(), &e.message);
                 continue;
             }
         };

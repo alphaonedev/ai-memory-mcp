@@ -239,6 +239,30 @@ pub(crate) struct CreateFieldError {
 }
 
 impl CreateFieldError {
+    /// #2552 — project this typed refusal into the bulk `errors[]` class
+    /// DIRECTLY, rather than round-tripping its message through the substring
+    /// classifier.
+    ///
+    /// The funnel already KNOWS the exact status and code; re-deriving them
+    /// from prose would be a lossy inference over a value we hold — and it
+    /// fails concretely: `AGENT_ID_BODY_MISMATCH` matches no classifier arm,
+    /// so a permanent 403 identity refusal would classify as a RETRYABLE
+    /// `500 internal error` and a fleet loader would retry a request that can
+    /// never succeed.
+    pub(crate) fn as_bulk_class(&self) -> crate::handlers::errors::BulkRowErrorClass {
+        crate::handlers::errors::BulkRowErrorClass {
+            code: self.code,
+            // #851 — the wire label stays inside the sanitized allowlist.
+            label: if self.status == StatusCode::FORBIDDEN {
+                "forbidden"
+            } else {
+                "validation failed"
+            },
+            status: self.status,
+            retryable: false,
+        }
+    }
+
     fn into_response(self) -> axum::response::Response {
         (
             self.status,
