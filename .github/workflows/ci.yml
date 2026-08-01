@@ -323,14 +323,54 @@ jobs:
       # pass above and the postgres-feature job's fully-compiled pass.
       - name: Clippy (all targets, sal — cfg-stripped doc-lint class)
         run: cargo clippy --all-targets --features sal -- -D warnings -D clippy::all -D clippy::pedantic
-      - name: Verify reviewed build-script pins and closure (#2259)
-        run: |
-          # `cargo metadata --offline` resolves the complete cross-platform
-          # graph, including target-only crates that this Linux clippy leg
-          # does not compile. Fetch the locked graph first; the verifier then
-          # remains offline and checksum-driven.
-          cargo fetch --locked
-          python3 scripts/check-build-script-vetting.py
+      # (#2635) The build-script vetting gate used to run HERE, as a step of
+      # this job. It now has its own job below — see the note there for why a
+      # step of `lint` was the wrong place for it.
+
+  # Build-script custom-build ledger gate (#2259 / #2635).
+  #
+  # WHY THIS IS ITS OWN JOB AND CARRIES NO JOB-LEVEL `if:`. Until #2635 this
+  # ran as a STEP of `Lint (fmt + clippy)` above, which carries
+  # `if: needs.classify.outputs.docs_only != 'true'` and therefore reports
+  # `skipped` on a docs-only pull request — and branch protection COUNTS
+  # `skipped` AS SATISFIED. A supply-chain gate that a docs-only diff can
+  # switch off is not a gate, and "docs-only" is a classifier verdict, not a
+  # proof that `Cargo.toml` / `Cargo.lock` are untouched (#2496 is the standing
+  # demonstration that the classifier can be wrong).
+  #
+  # It is deliberately NOT in `c8-precheck.yml` with the other integrity gates:
+  # those jobs are toolchain-free with 5-minute timeouts, and this one needs a
+  # pinned Rust toolchain plus a registry fetch. Importing that dependency into
+  # the workflow carrying nine required contexts would be the wrong trade. Here
+  # the toolchain and `Swatinem/rust-cache` are already the house pattern.
+  #
+  # No `needs:` at all, so rules (b3)/(b4) of scripts/check-required-contexts.sh
+  # do not apply, and it always runs — which is the entire point.
+  build-script-vetting:
+    name: "Build-script custom-build ledger gate (#2635)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch the locked dependency graph
+        # `cargo metadata --offline` resolves the complete CROSS-PLATFORM graph,
+        # including target-only crates (the windows_* / wasm / haiku families)
+        # that no single CI leg compiles — which is exactly the set a
+        # target-gated hostile build script would hide in. Fetch first; the
+        # verifier then runs offline and content-pinned.
+        run: cargo fetch --locked
+      - name: Verify every custom-build package is ledgered
+        run: python3 scripts/check-build-script-vetting.py
+      - name: Self-test (prove the gate is load-bearing)
+        # Runs AFTER the gate, mirroring the vendor-literal gate's convention:
+        # if the detection logic regresses, this trips even when the ledger
+        # happens to be clean. Includes the R-203 leg that runs the FROZEN
+        # pre-#2635 ledger-only algorithm over a planted unvetted package and
+        # requires it to MISS — so the leg cannot pass tautologically.
+        run: python3 scripts/check-build-script-vetting.py --self-test
 
   # actionlint — workflow-injection guard (#1851, audit follow-up #1855).
   # actionlint's NATIVE expression-injection check flags the #1851 class: an
