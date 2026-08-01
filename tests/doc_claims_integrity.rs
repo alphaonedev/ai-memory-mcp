@@ -498,7 +498,14 @@ fn possessive_job_citations(line: &str) -> Vec<(String, String)> {
 #[test]
 fn claims_gates_are_wired_into_ci_with_self_tests_2629() {
     let root = repo_root();
-    let workflow = read(&root.join(".github/workflows/c8-precheck.yml"));
+    // CRLF-NORMALISED. The assertions below anchor on `\n` to distinguish a
+    // real `run: bash <script>` invocation from a mention inside a longer
+    // command, and git on Windows checks this file out with CRLF, so an
+    // un-normalised `contains("bash …sh\n")` fails on `Check
+    // (windows-latest)` ONLY -- green on ubuntu + macOS, red on the one
+    // runner nobody reads first. A gate's own twin must not be
+    // platform-dependent.
+    let workflow = read(&root.join(".github/workflows/c8-precheck.yml")).replace("\r\n", "\n");
     for script in [
         "scripts/check-docs-vs-ssot.sh",
         "scripts/check-doc-symbol-anchors.sh",
@@ -517,6 +524,22 @@ fn claims_gates_are_wired_into_ci_with_self_tests_2629() {
              logic silently stops detecting reports success while doing nothing"
         );
     }
+
+    // R-203 for the normalisation itself: prove a CRLF checkout really
+    // WOULD have failed the un-normalised predicate, so this is a live
+    // guard rather than a defensive `.replace` nobody can justify. The
+    // `Check (windows-latest)` leg of PR #2659 failed on exactly this.
+    let crlf = workflow.replace('\n', "\r\n");
+    let probe = "bash scripts/check-docs-vs-ssot.sh\n";
+    assert!(
+        !crlf.contains(probe),
+        "the CRLF simulation did not reproduce the windows-latest failure; \
+         this leg is broken, not the normalisation"
+    );
+    assert!(
+        crlf.replace("\r\n", "\n").contains(probe),
+        "normalisation failed to recover the match on a CRLF checkout"
+    );
 
     // None of the four may be made conditional. A gate policing the
     // docs-only short-circuit must not be subject to it (the #2494
