@@ -542,7 +542,12 @@ fn best_family_via_embedder(
 ) -> Option<(crate::profile::Family, f32)> {
     use crate::profile::Family;
 
-    let intent_vec = emb.embed_query(intent).ok()?;
+    // v1.0.0 #2577 — the family-intent embed is on the `memory_smart_load`
+    // REQUEST path, so it carries the same provider-stall exposure as
+    // recall and routes through the same bounded funnel. `None` already
+    // meant "fall back to the non-embedding family match", so the degrade
+    // wiring is unchanged; only the unbounded wait is removed.
+    let intent_vec = crate::embeddings::recall_query_embedding(emb, intent)?;
     let mut best: Option<(Family, f32)> = None;
     for family in Family::all() {
         let descriptor = family_descriptor(*family);
