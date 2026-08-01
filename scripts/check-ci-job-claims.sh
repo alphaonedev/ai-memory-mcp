@@ -120,6 +120,8 @@ WFEOF
 The `Lint (fmt + clippy)` job (`.github/workflows/ci.yml`) gates every PR and blocks merge.
 The `bench` job runs on every PR.
 `.github/workflows/bench.yml` runs `ai-memory bench` and uploads an artifact.
+The `bench` job runs four `#[ignore]`-gated parity binaries.
+Release cuts through `.github/workflows/bench.yml` stay operator-gated.
 Compose lives in `stack-compose.yml`.
 MDEOF
         printf 'placeholder\n' > "$FIX/stack-compose.yml"
@@ -132,7 +134,7 @@ MDEOF
         run_fixture_out | sed 's/^/       /' >&2
         exit 1
     fi
-    echo "PASS: self-test control — a truthful enforcement claim, a yaml-key citation, a non-enforcement workflow mention, and a non-workflow .yml all PASS"
+    echo "PASS: self-test control — a truthful enforcement claim, a yaml-key citation, a non-enforcement workflow mention, a non-workflow .yml, and the HYPHEN-COMPOUND \`#[ignore]\`-gated / operator-gated adjectives all PASS"
 
     # ---- C-24: a job REMOVED in #1993, still cited as live -----------
     write_clean
@@ -368,14 +370,26 @@ NOT_A_JOB = {
 
 # A claim of ENFORCEMENT: the doc says the thing blocks something.
 #
-# `operator-gated` is deliberately EXCLUDED. That phrase is a claim
-# about HUMAN release authority (CLAUDE.md's tag-cut gate), not about a
-# required status check, and `release.yml` is `workflow_dispatch`-only
-# by design — flagging it would demand that a manual release workflow
-# be a required PR context, which is incoherent.
+# A HYPHEN-PREFIXED `-gated` is deliberately EXCLUDED, and the carve-out
+# is structural rather than a growing list of phrases. `X-gated` is a
+# COMPOUND ADJECTIVE naming what gates something, never a claim that a CI
+# job blocks a merge: `operator-gated` is human release authority
+# (CLAUDE.md's tag-cut gate), `#[ignore]-gated` is a Rust test attribute,
+# and `feature-gated` / `admin-gated` are compile and authz concepts.
+# Enumerating them one at a time would have failed on the next one — and
+# it did: the first cut excluded only `operator-gated` and then
+# false-flagged `docs/v1.0.0/release-notes.md` for the phrase "four
+# `#[ignore]`-gated cross-backend parity binaries", which makes no
+# enforcement claim at all.
+#
+# The real claims all read `gates <something>` / `gated <by|nightly>` with
+# a SPACE before the verb, so requiring a non-hyphen predecessor keeps
+# every true positive (C-31's "gates every PR and trunk push", C-23's
+# "gated **nightly** by the `postgres-age` CI job") while dropping the
+# adjectival class wholesale.
 ENFORCE = re.compile(
-    r"(?<!operator-)(?<!operator )\bgates?\b|(?<!operator-)(?<!operator )\bgating\b|"
-    r"(?<!operator-)(?<!operator )\bgated\b|blocks? merge|blocked from merging|"
+    r"(?<!-)(?<!operator )\bgates?\b|(?<!-)(?<!operator )\bgating\b|"
+    r"(?<!-)(?<!operator )\bgated\b|blocks? merge|blocked from merging|"
     r"fails? the PR|is required\b|required[- ]status|must pass\b|"
     r"hard[- ]block|CI gate\b|CI guard\b",
     re.IGNORECASE,
