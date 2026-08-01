@@ -38,7 +38,12 @@ const BACKENDS: [&str; 2] = ["sqlite", "postgres"];
 // LITERALIZED to `if version < 85` (the #2218 convention: settled arms enter
 // the monotonic literal lane, only the current tip stays symbolic); postgres
 // stays 1 (v85 renumbered to a literal arm, migrate_v86 takes the tail slot).
-const EXPECTED_CONST_ARMS_SQLITE: usize = 8;
+// 2026-07-31 (#2578): sqlite 8 -> 7 — v88 lands the composite list indexes on
+// POSTGRES only (sqlite has carried them since v56), so there is NO sqlite v88
+// arm; the settled v87 arm is LITERALIZED to `if version < 87` and nothing
+// takes the const slot. postgres stays 1 (v87 literalized, migrate_v88 takes
+// the const tail slot).
+const EXPECTED_CONST_ARMS_SQLITE: usize = 7;
 const EXPECTED_CONST_ARMS_POSTGRES: usize = 1;
 
 /// Read a repo-relative source file (the migration ladder sources) to a String.

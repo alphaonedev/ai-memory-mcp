@@ -1203,7 +1203,7 @@ fn v77_migration_backfills_preexisting_rows_folded() {
     // kind_provenance + #2332 expiry heal) with the v77 `folded` column
     // present.
     let conn = db::open(&path).expect("open");
-    assert_eq!(db::migrations::current_schema_version_for_tests(), 87);
+    assert_eq!(db::migrations::current_schema_version_for_tests(), 88);
     let version: i64 = conn
         .query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_version",
@@ -1211,7 +1211,7 @@ fn v77_migration_backfills_preexisting_rows_folded() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 87, "fresh open reaches the current tip");
+    assert_eq!(version, 88, "fresh open reaches the current tip");
     assert!(
         conn.prepare("SELECT folded FROM recall_observations LIMIT 0")
             .is_ok(),

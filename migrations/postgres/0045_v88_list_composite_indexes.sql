@@ -1,0 +1,133 @@
+-- Copyright 2026 AlphaOne LLC
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- v1.0.0 #2578 — schema v88: TWO of the three v56 (#1579 A2 + B6d)
+-- composite list/archive ordering indexes, on POSTGRES. (The third,
+-- unscoped one is deliberately withheld — see the NOTE below the header.)
+--
+-- ## The defect this closes
+--
+-- v56 shipped three such indexes to SQLite only
+-- (`migrations/sqlite/0047_v56_list_composite_indexes.sql`); the postgres
+-- twin `migrate_v56()` was recorded as a version-stamp NO-OP on the
+-- reasoning that "the postgres list path is owned by the postgres
+-- workstream". That workstream never landed them, so for the whole
+-- v56..v87 range a namespace-scoped `list` on postgres read EVERY row in
+-- the namespace and sorted them: O(namespace size) where SQLite is
+-- O(limit).
+--
+-- Measured on the live certified tier (PG 18.4 + AGE 1.7.0 + pgvector
+-- 0.8.6), `memories` = 8,724 rows of which 7,855 are in one namespace,
+-- EXPLAIN (ANALYZE, BUFFERS) of the exact statement `MemoryStore::list`
+-- issues, at steady state under a prepared statement. The BUFFER and
+-- ROWS-READ counts are the load-independent evidence and are quoted first;
+-- the wall-clock figures were taken on a heavily loaded box (six concurrent
+-- audit lanes, load ~20 on 14 cores) and are indicative only:
+--
+--   namespace-scoped LIMIT 10
+--     before: Buffers 1,880 | rows read 7,855 | top-N heapsort present
+--             (Index Scan using memories_namespace_idx)
+--     after:  Buffers     8 | rows read    10 | NO sort node at all
+--             (Index Scan using idx_memories_ns_list_order)
+--     => 235x fewer buffers, O(namespace) -> O(limit).  ~9.7 -> ~0.07 ms.
+--   namespace-scoped LIMIT 1000 (the `memory_load_family` shape)
+--     Buffers 2,079 -> 321.  ~27.8 -> ~1.2 ms.
+--
+-- The win is proportional to namespace size and is NOT universal: a
+-- 10-row namespace measures no win and no loss (the planner simply does
+-- not choose the composite there), and it is contingent on postgres
+-- keeping a CUSTOM plan — forced to a generic plan the composite is not
+-- chosen and the win is zero. Extra filters (tier / agent_id / since /
+-- until / valid_at) do NOT regress: the planner declines the composite
+-- and both index sets converge on the same plan.
+--
+-- `list_archived` scoped to a COLD tenant, measured on a purpose-built
+-- 200k-row archive with realistic multi-tenant skew (one tenant archived
+-- long ago, one archiving now) under a FORCED GENERIC PLAN, which is what
+-- sqlx's prepared statements actually get:
+--
+--   47.912 ms -> 0.062 ms (772x), rows filtered 180,000 -> 0
+--
+-- That last one needed the paired `list_archived` predicate change: the
+-- OR-NULL optional-namespace idiom `($1 IS NULL OR namespace = $1)` is
+-- NON-SARGABLE, so under a generic plan the planner cannot use the new
+-- composite at all and keeps walking `archived_memories_archived_at_idx`
+-- backwards. The #1473 sargable split (already applied to `list`) is
+-- applied to `list_archived` in the same commit, or this index would be
+-- pure write amplification for zero read benefit.
+--
+-- ## Why CREATE INDEX CONCURRENTLY, and why the arm is fail-OPEN
+--
+-- The DDL is executed by the in-code arm `PostgresStore::migrate_v88`,
+-- NOT by this file (this file is the canonical doc twin, per the
+-- 0043_v86 / 0044_v87 precedent), because it must run OUTSIDE a
+-- transaction and with the pool's per-connection timeouts cleared.
+--
+-- A plain `CREATE INDEX` inside the arm's transaction is a FLEET-WIDE
+-- BOOT BRICK, and it is NOT a large-table-only hazard. Every pooled
+-- connection carries `statement_timeout = 30s` + `lock_timeout = 5s`
+-- from the `after_connect` hook; those are cleared ONLY on the dedicated
+-- advisory-lock connection, never on the connection a migrate arm uses.
+-- `CREATE INDEX` needs a SHARE lock, which any ordinary in-flight writer
+-- holds off. Reproduced on the live tier with ONE uncommitted INSERT
+-- open against the table:
+--
+--   ERROR:  canceling statement due to lock timeout
+--   Time: 5002.006 ms
+--
+-- The arm's transaction then rolls back, the version is NOT stamped,
+-- `migrate_locked` returns Err, `connect()` returns Err, and the daemon
+-- cannot boot -- identically on every retry for as long as any writer is
+-- active. The same probe with CONCURRENTLY and the timeouts cleared
+-- waited the writer out and succeeded (16.4 s), leaving `indisvalid = t`.
+--
+-- Build cost for calibration, same host, 3,000,000 rows / 1,520 MB:
+-- plain 5.24 s, CONCURRENTLY 5.57 s, resulting index 111 MB.
+--
+-- These indexes are DERIVED, DISPOSABLE data — the durable memory TEXT is
+-- untouched and they are regenerable at any time. So a build failure
+-- DEGRADES (the planner falls back to exactly today's plan) rather than
+-- refusing the boot: refusing fleet availability over a missing
+-- performance index trades everything for nothing. The arm therefore
+-- WARNs and stamps. To keep that from becoming a silent permanent gap,
+-- the same idempotent helper re-runs on EVERY connect (it is three
+-- catalog probes and a no-op once the indexes are valid), so a node that
+-- lost the race self-heals on its next boot.
+--
+-- Self-heal detail: `CREATE INDEX CONCURRENTLY IF NOT EXISTS` silently
+-- no-ops over a leftover INVALID index (a CIC that failed midway), which
+-- the planner ignores for reads while postgres still maintains it on
+-- every write -- pure cost, forever. The helper therefore probes
+-- `pg_index.indisvalid`, not mere existence, and drops an invalid
+-- leftover before rebuilding.
+--
+-- ## Append-only ladder discipline
+--
+-- The now-redundant single-column prefixes (`memories_priority_idx`,
+-- `memories_namespace_idx`, `archived_memories_namespace_idx`) are
+-- deliberately NOT dropped -- the same call SQLite's v56 made for the
+-- same reason. Dropping an index is a destructive schema change and is
+-- not required by this fix.
+
+-- NOTE: the UNSCOPED sibling `idx_memories_list_order (priority DESC,
+-- updated_at DESC)` — which SQLite's v56 DOES carry — is DELIBERATELY NOT
+-- created here. It was in the first draft and an adversarial re-measurement
+-- killed it: in a namespace whose rows are expired-but-not-yet-GC'd its
+-- presence makes the planner ABANDON the namespace-scoped composite and walk
+-- the unscoped index ACROSS EVERY NAMESPACE — an O(namespace) scan becomes
+-- O(table). Buffers (the load-independent signal), namespace-scoped LIMIT 10
+-- on an isolated copy with 7,000 of `atlas-corpus`'s 7,855 rows expired:
+--
+--   before (no composites)     1,989 buffers, 7,000 filtered in-namespace
+--   ns-scoped composite ONLY   1,854 buffers, 6,882 filtered in-namespace
+--   BOTH composites            3,041 buffers, 9,621 filtered ACROSS ALL
+--                                             namespaces
+--
+-- Its only win is the UNSCOPED `list LIMIT 10` (0.58 ms absolute, the rarer
+-- query) against permanent write amplification. Tracked as its own issue.
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memories_ns_list_order
+    ON memories (namespace, priority DESC, updated_at DESC);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_archived_ns_archived_at
+    ON archived_memories (namespace, archived_at DESC);
