@@ -963,14 +963,27 @@ but new public operations live on the trait.
 
 ### Lint gates (issue #1174 PR10 — pm-v3.1 vendor-monoculture + SECS_PER_*)
 
-Eight numbered script-based lint gates run in CI alongside the four
+Nine numbered script-based lint gates run in CI alongside the four
 cargo gates (fmt / clippy / test / audit) and the two test-guard jobs
 (`test-stdin-gate` #1989, `test-env-lock-gate` #2146). All are
-HARD-BLOCK and are wired into `.github/workflows/c8-precheck.yml`
-(`c8-precheck`, `vendor-literal-gate`, `l3-boundary-gate`,
-`hardcoded-literal-gate`, `docs-vs-ssot-drift`, `cloud-init-ascii-gate`,
-`migration-ladder-gate`, `required-contexts-gate`, plus the two
-test-guard jobs above).
+HARD-BLOCK. Eight are wired into `.github/workflows/c8-precheck.yml`,
+whose THIRTEEN jobs are `c8-precheck`, `vendor-literal-gate`,
+`l3-boundary-gate`, `hardcoded-literal-gate`, `docs-vs-ssot-drift`,
+`cloud-init-ascii-gate`, `migration-ladder-gate`,
+`required-contexts-gate`, `install-checksum-gate`,
+`conformance-readers-gate`, `git-dependency-source-gate`, plus the two
+test-guard jobs above. (That job list was stale by three until #2636 —
+which is the same class of rot rule (f) now blocks mechanically, one
+layer down.) The ninth, gate **8** below, lives in
+`.github/workflows/ci.yml` because it needs a Rust toolchain that
+`c8-precheck.yml`'s deliberately toolchain-free jobs do not carry.
+
+As of #2636, every job in the three GATING workflows (`ci.yml`,
+`c8-precheck.yml`, `coverage.yml`) must be declared either in
+`scripts/qc-allowlists/required-contexts-release.txt` or in the dated
+`scripts/qc-allowlists/required-contexts-not-required.txt` — see rule
+(f) of gate 7. A newly-added integrity gate can no longer default to
+unenforced.
 
 **0. Hardcoded-literal duplication ratchet (pm-v3.1)** —
 `scripts/check-hardcoded-literals.sh`. The mechanical enforcement of the
@@ -1176,7 +1189,7 @@ skipped-vs-ran disposition of the fail-open was not itself required —
 `Classify changes` (ci.yml) and `Coverage classify (docs-only
 short-circuit)` (coverage.yml) between them governed ELEVEN required
 contexts while being required by nothing. Both are now DECLARED in the
-mirror (24 declared contexts; the live set is 22 until the companion
+mirror (29 declared contexts as of #2636/#2635; the live set is 24 until the companion
 branch-protection API call lands — for an ADDITION the mirror lands
 FIRST, because the gate can only prove a context sound once the mirror
 declares it, so mirror-first means "prove, then enforce"; the reverse
@@ -1263,9 +1276,10 @@ AFTER), because after the rename lands no PR reports the old name and
 before it lands no PR reports the new one. The awk parser
 implements the real YAML scalar rule (a `#` preceded by whitespace opens
 a comment; `(#1174 PR10)` does not) and was cross-checked against PyYAML
-on all 59 jobs across all 17 workflows with zero mismatches (re-run at
-#2473; the count moved 58 -> 59 as jobs were added, and the cross-check
-is the standing proof that rule (e)'s premise about YAML is real).
+on all jobs across all 17 workflows with zero mismatches (re-run at
+#2473; the job count is 59 at #2636 — it has drifted both ways since, so
+treat it as a measurement, not a pin — and the cross-check is the
+standing proof that rule (e)'s premise about YAML is real).
 `--self-test` plants the (b1) wedge, an (a) unmatched context, an (e)
 unquoted ` #` job name (asserting via `--dump` that the parse really is
 truncated at the `#` BEFORE asserting the gate rejects it, so a parser
@@ -1300,9 +1314,80 @@ against the mirror frozen at
 `scripts/test/fixtures/required-contexts-prefix-2494.txt`: under that
 pre-fix mirror a planted decider `if:` passes the gate SILENTLY, which is
 the blind spot the declaration closes and the proof the leg is not
-tautological. Data-integrity guardrail (North Star: a control that reports success
+tautological. **(f) HARD-FAIL, added #2636** — every job in a GATING
+workflow (`ci.yml`, `c8-precheck.yml`, `coverage.yml`, declared as
+`COVERED_WORKFLOWS` in the gate) must be declared EITHER in the mirror OR
+in the dated ledger
+`scripts/qc-allowlists/required-contexts-not-required.txt`
+(`<workflow-file> <job-id> <YYYY-MM-DD> #<issue>`). Rules (a)-(e) all
+reason mirror -> job, so not one of them can see a job that is simply
+ABSENT from the mirror: a newly-added integrity gate lands unrequired, in
+silence. It did. FOUR c8-precheck gates ran on every PR required by
+nothing — `Installer checksum fail-closed gate (#2449)`, `Non-Rust
+conformance-reader proof gate (#2452)`, `Git-dependency-source
+supply-chain gate (#2050/#2512)`, and `Required-context + classify-base
+soundness gate (#2494/#2496/#2508)`, which is THIS GATE, the sole
+mechanical proof that the other required contexts are sound; a PR that
+broke the gate proving the gates work could merge. The prose KNOWN GAPS
+note meant to record this named only TWO of the four and had gone stale
+unnoticed, which is the whole argument for a machine-parsed ledger over a
+comment: prose cannot fail CI. PARTIAL matrix coverage fails (an
+undeclared expansion can fail and merge while its siblings look green).
+Stale entries are FATAL here, unlike the rule (d) pending-fix ledger,
+because a stale line pre-absolves whatever job next takes that id in the
+workflow where the integrity gates live; both directions fail (a job that
+no longer exists, and a job whose context IS in the mirror). The SCOPE is
+cross-checked in both directions — a declared covered workflow with no
+parsed jobs fails, and a mirror context carried by an UNCOVERED workflow
+fails — so it cannot silently narrow. It is deliberately NOT repo-wide
+(contrast (d)/(e)): those detect static defects, wrong anywhere, while (f)
+encodes a policy judgement that must be authored per workflow, and
+sweeping in the ~45 jobs of `release.yml` / `publish-sdks.yml` / `yank.yml`
+etc. — none of which fire on `pull_request` — would build a junk drawer
+readers skim past. The ledger is EMPTY today, which is the passing state.
+Data-integrity guardrail (North Star: a control that reports success
 while doing nothing is worse than a missing control, because 22 green
 checks actively imply rigor that is not present).
+
+**8. Build-script custom-build ledger gate (#2259 / #2635)** —
+`scripts/check-build-script-vetting.py`, run by the `Build-script
+custom-build ledger gate (#2635)` job in `.github/workflows/ci.yml`. A
+cargo build script executes arbitrary code with the BUILDER's authority at
+compile time, on every CI runner and every operator machine; this gate is
+the mechanical enforcement of the operator's firmest standing rule, "no
+external code injection. EVER." (§ above), adopted after an external party
+attempted precisely this vector including a cargo-squat trap on a crate
+that did not yet exist. Until #2635 the gate iterated ONLY its own ledger
+(`for record in ledger["packages"]`), which held TWO packages while
+`cargo metadata` resolved 90 with a `custom-build` target out of 547 —
+there was NO reverse direction, so a new crate with a hostile `build.rs`
+was never examined and the gate printed `PASS (2 records verified)`. It
+now walks the resolved graph and HARD-BLOCKS on any custom-build package
+ABSENT from `supply-chain/build-script-vetting.json`: the ledger is an
+allowlist that must COVER REALITY. Records carry `reviewed` (source read;
+requires a dated `docs/security/build-script-vetting.md` anchor and a
+pinned build-dependency closure — 2 today) or `inventoried` (pinned and
+dated, NOT source-reviewed — 88), because stamping 90 `reviewed` records
+on unread source would buy a green check that actively asserts rigor which
+is not present; the PASS line always prints both counts and states what it
+does not attest. `inventoried_ceiling` is a monotone burn-down ratchet in
+the `hardcoded-literals-baseline.txt` shape: admitting an unreviewed build
+script requires BOTH a ledger line and raising a number that exists for no
+other purpose. Registry packages are pinned by `Cargo.lock` checksum;
+`vendor/paste` — the one package with no source, no checksum, in-tree and
+editable in any PR — is pinned by `tree_sha256` over its git-tracked tree,
+and a registry package may never be pinned that way (else "declare it
+vendored" becomes a universal bypass). `--self-test` plants an unvetted
+build-script package plus eight sibling defects against synthetic
+metadata, requires each rejection to NAME the right violation, spares six
+near-miss shapes, and carries an R-203 leg that runs the FROZEN pre-#2635
+ledger-only algorithm over the same fixture and requires it to MISS.
+`--update-checksums` refreshes EXISTING pins only and is structurally
+incapable of admitting a new build script. The job carries NO job-level
+`if:`: the gate used to be a STEP inside `Lint (fmt + clippy)`, which
+reports `skipped` on a docs-only diff — counted as SATISFIED — so a
+supply-chain gate was switchable off by a classifier verdict about
+markdown.
 
 ## Prime directive (operator-set, 2026-05-17)
 
