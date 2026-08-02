@@ -1428,8 +1428,8 @@ mod tests {
         let cfg = FederationConfig::build(
             2,
             &[
-                "http://peer-a.example/".to_string(),
-                "http://peer-b.example".to_string(),
+                "https://peer-a.example/".to_string(),
+                "https://peer-b.example".to_string(),
             ],
             Duration::from_millis(500),
             None,
@@ -1467,11 +1467,11 @@ mod tests {
         // Trailing slash is stripped during URL normalization.
         assert_eq!(
             cfg.peers[0].sync_push_url,
-            "http://peer-a.example/api/v1/sync/push"
+            "https://peer-a.example/api/v1/sync/push"
         );
         assert_eq!(
             cfg.peers[1].sync_push_url,
-            "http://peer-b.example/api/v1/sync/push"
+            "https://peer-b.example/api/v1/sync/push"
         );
         assert_eq!(cfg.sender_agent_id, "ai:builder");
     }
@@ -1481,8 +1481,8 @@ mod tests {
         let result = FederationConfig::build(
             2,
             &[
-                "http://peer.example".to_string(),
-                "http://peer.example/".to_string(),
+                "https://peer.example".to_string(),
+                "https://peer.example/".to_string(),
             ],
             Duration::from_millis(500),
             None,
@@ -1508,7 +1508,7 @@ mod tests {
         let bogus = std::path::PathBuf::from("/definitely/does/not/exist/ca.pem");
         let result = FederationConfig::build(
             2,
-            &["http://peer.example".to_string()],
+            &["https://peer.example".to_string()],
             Duration::from_millis(500),
             None,
             None,
@@ -1535,7 +1535,7 @@ mod tests {
         std::fs::write(&bad, b"this is not a valid pem certificate").unwrap();
         let result = FederationConfig::build(
             2,
-            &["http://peer.example".to_string()],
+            &["https://peer.example".to_string()],
             Duration::from_millis(500),
             None,
             None,
@@ -1560,7 +1560,7 @@ mod tests {
         let bogus_key = std::path::PathBuf::from("/definitely/missing/key.pem");
         let result = FederationConfig::build(
             2,
-            &["http://peer.example".to_string()],
+            &["https://peer.example".to_string()],
             Duration::from_millis(500),
             Some(&bogus_cert),
             Some(&bogus_key),
@@ -2202,7 +2202,7 @@ mod tests {
 
         let result = FederationConfig::build(
             2,
-            &["http://peer.example".to_string()],
+            &["https://peer.example".to_string()],
             Duration::from_millis(500),
             Some(&cert),
             Some(&key),
@@ -2234,7 +2234,7 @@ mod tests {
 
         let result = FederationConfig::build(
             2,
-            &["http://peer.example".to_string()],
+            &["https://peer.example".to_string()],
             Duration::from_millis(500),
             Some(&cert),
             Some(&bogus_key),
@@ -2620,8 +2620,8 @@ mod tests {
         let result = FederationConfig::build(
             2,
             &[
-                "http://peer.example".to_string(),
-                "http://peer.example/".to_string(),
+                "https://peer.example".to_string(),
+                "https://peer.example/".to_string(),
             ],
             Duration::from_millis(500),
             None,
@@ -2649,8 +2649,12 @@ mod tests {
         let result = FederationConfig::build(
             2,
             &[
-                "http://Peer.Example".to_string(),
-                "http://peer.example".to_string(),
+                // #2477 — both peers are https:// so the subject under test
+                // stays the CASE-INSENSITIVE duplicate check. The scheme
+                // guard runs first in the same loop, so a plaintext peer
+                // here would report the scheme refusal instead.
+                "https://Peer.Example".to_string(),
+                "https://peer.example".to_string(),
             ],
             Duration::from_millis(500),
             None,

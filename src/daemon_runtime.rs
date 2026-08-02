@@ -4823,12 +4823,11 @@ fn api_key_bind_guard(
 
 /// Same loopback host set [`api_key_bind_guard`] recognises. Factored so the
 /// posture-warning matrix below shares one definition with the bind guard.
+/// #2477 — delegates to the shared SSOT in [`crate::tls::host_is_loopback`]
+/// so the inbound bind guard and the outbound federation peer-scheme guard
+/// can never drift apart on what "loopback" means.
 fn host_is_loopback(host: &str) -> bool {
-    host == "127.0.0.1"
-        || host == "::1"
-        || host == "localhost"
-        || host == "0:0:0:0:0:0:0:1"
-        || host == "[::1]"
+    crate::tls::host_is_loopback(host)
 }
 
 /// R-04 / R-12 (#1798 full-spectrum review) — boot-time security-posture
