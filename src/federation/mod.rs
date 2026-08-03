@@ -43,9 +43,13 @@ pub mod peer_attestation;
 // v0.7.0 Track D #933 — federation push DLQ + replay worker.
 // #2678: the module is ungated on the default (sqlite-only) build so
 // failed fanouts land in `federation_push_dlq` rather than being
-// silently dropped. `async-trait` is a non-optional dep for the
-// object-safe sink trait; the Postgres sink remains
+// silently dropped. `async-trait` is a non-optional dep because the
+// sink is stored as `Arc<dyn FederationDlqSink>` (dyn dispatch for
+// sqlite vs postgres backends). Native AFIT is not object-safe yet
+// (rust-skills: async-fn-in-trait caveat 1) — keep `#[async_trait]`
+// until a dyn-compatible AFIT path lands. Postgres sink remains
 // `#[cfg(feature = "sal-postgres")]` inside the module.
+// proj-feature-additive: un-gating is additive; do NOT flip `default`.
 pub mod push_dlq;
 pub mod quorum;
 pub mod receive;
