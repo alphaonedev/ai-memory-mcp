@@ -2596,6 +2596,46 @@ pub fn resolve_store_url(cli_arg: Option<&str>) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// #2679 — refuse a `postgres://` store URL when this binary cannot open
+/// Postgres.
+///
+/// `resolve_store_url` itself is ungated (#1927 / #2444 hoist), but the only
+/// caller that *acted* on the resolved URL was `build_store_handle`, which is
+/// `#[cfg(feature = "sal")]`. On the default (sqlite-only) build the env and
+/// file channels were therefore **read and discarded**: `serve` opened the
+/// local `--db` SQLite path, created a real database with a WAL, logged
+/// `database: <path>`, and reported healthy — while the operator believed they
+/// were writing to Postgres (docs/postgres-age-guide.md and
+/// docs/production-deployment.md both instruct exporting `AI_MEMORY_STORE_URL`).
+///
+/// Scope is deliberately **postgres:// only**. `sqlite://` and bare paths stay
+/// permissive so a legitimate local-file deployment is never a GA-day outage.
+/// When `sal-postgres` is compiled in, this is a pure no-op — the existing
+/// `build_store_handle` path owns the real connect.
+///
+/// Call this from every ungated boot that would otherwise open SQLite after a
+/// store URL has been configured (today: [`bootstrap_serve`]).
+pub fn refuse_postgres_store_url_without_feature(cli_arg: Option<&str>) -> Result<()> {
+    let Some(url) = resolve_store_url(cli_arg)? else {
+        return Ok(());
+    };
+    if !is_postgres_url(&url) {
+        return Ok(());
+    }
+    #[cfg(feature = "sal-postgres")]
+    {
+        let _ = url;
+        return Ok(());
+    }
+    #[cfg(not(feature = "sal-postgres"))]
+    {
+        anyhow::bail!(
+            "configured store is Postgres ({}) but this binary was built WITHOUT              --features sal-postgres. Refusing to fall back to the local SQLite              --db path — that would write agent memory to the wrong store while              looking healthy (#2679). Rebuild with `--features sal-postgres`,              or unset AI_MEMORY_STORE_URL / AI_MEMORY_STORE_URL_FILE / --store-url.",
+            crate::logging::redact_url_password(&url),
+        );
+    }
+}
+
 /// #1927 — true when a `scheme://user:pass@host/...` URL carries a non-empty
 /// userinfo password component (`user:pass@`). Best-effort structural check
 /// (no full URL parse) used only to decide whether to warn about argv exposure.
@@ -5028,6 +5068,17 @@ pub async fn bootstrap_serve(
     // ORIGINAL string when it carries any non-whitespace content (secrets are
     // compared verbatim); only empty/blank collapses to `None`. Constructed
     // once here and fed to BOTH the bind guard and `ApiKeyState` below.
+    // #2679 — fail closed on a postgres:// store URL from ANY channel
+    // (AI_MEMORY_STORE_URL_FILE > AI_MEMORY_STORE_URL > --store-url) BEFORE
+    // `db::open` creates a local SQLite file and the daemon reports healthy.
+    // Ungated: the default build must refuse, not silently wrong-store-write.
+    // `ServeArgs::store_url` exists only under `feature = "sal"`; env/file
+    // channels are still resolved when the CLI flag is absent.
+    #[cfg(feature = "sal")]
+    refuse_postgres_store_url_without_feature(args.store_url.as_deref())?;
+    #[cfg(not(feature = "sal"))]
+    refuse_postgres_store_url_without_feature(None)?;
+
     let normalized_api_key: Option<String> =
         app_config.api_key.clone().filter(|k| !k.trim().is_empty());
     match api_key_bind_guard(
@@ -7475,6 +7526,59 @@ mod tests {
         ));
         assert!(!url_has_userinfo_password("postgres://db.internal/mem"));
         assert!(!url_has_userinfo_password("sqlite:///var/lib/mem.db"));
+    }
+
+
+    /// #2679 — a postgres:// URL on the env channel is refused on a binary
+    /// without sal-postgres (the default shipped build). sqlite:// stays ok.
+    #[test]
+    fn issue_2679_postgres_store_url_fails_closed_without_feature() {
+        let _g = store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unsafe {
+            std::env::remove_var(STORE_URL_ENV);
+            std::env::remove_var(STORE_URL_FILE_ENV);
+        }
+
+        // No URL → ok (local sqlite is the store).
+        refuse_postgres_store_url_without_feature(None).expect("no url must pass");
+
+        // sqlite:// → ok (explicit local file is still the store).
+        unsafe {
+            std::env::set_var(STORE_URL_ENV, "sqlite:///tmp/legit.db");
+        }
+        refuse_postgres_store_url_without_feature(None).expect("sqlite url must pass");
+        unsafe {
+            std::env::remove_var(STORE_URL_ENV);
+        }
+
+        // postgres:// → disposition depends on the compiled feature set.
+        let secret = "postgres://u:hunter2@db.internal/mem";
+        unsafe {
+            std::env::set_var(STORE_URL_ENV, secret);
+        }
+        let result = refuse_postgres_store_url_without_feature(None);
+        #[cfg(feature = "sal-postgres")]
+        {
+            result.expect("sal-postgres binary must accept postgres://");
+        }
+        #[cfg(not(feature = "sal-postgres"))]
+        {
+            let err = result.expect_err("default binary must refuse postgres:// (#2679)");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("#2679") || msg.contains("sal-postgres"),
+                "refusal must name the defect and the missing feature: {msg}"
+            );
+            assert!(
+                !msg.contains("hunter2"),
+                "refusal must redact the password (#1579 A3): {msg}"
+            );
+        }
+        unsafe {
+            std::env::remove_var(STORE_URL_ENV);
+        }
     }
 
     /// #1579 A3 (SECURITY) — regression pin: the Postgres SAL boot
