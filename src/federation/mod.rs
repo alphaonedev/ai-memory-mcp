@@ -51,6 +51,7 @@ pub mod peer_attestation;
 // `#[cfg(feature = "sal-postgres")]` inside the module.
 // proj-feature-additive: un-gating is additive; do NOT flip `default`.
 pub mod push_dlq;
+pub mod push_lanes;
 pub mod quorum;
 pub mod receive;
 pub mod receive_auth;
