@@ -71,7 +71,10 @@ impl SyncPushWriteLane {
             Self::Pendings | Self::PendingDecisions => ConfinementKind::PendingPayloadNamespace,
             Self::NamespaceMeta | Self::NamespaceMetaClears => ConfinementKind::NamespaceMeta,
             Self::Signals => ConfinementKind::ClaimedNamespace,
-            Self::ActionTransitions | Self::Checkpoints => ConfinementKind::ByIdStoredNamespace,
+            // #2649: stored action namespace (already loaded for signable).
+            Self::ActionTransitions => ConfinementKind::ByIdStoredNamespace,
+            // #2650: wire `cp.namespace` is the freeze-anchor write subject.
+            Self::Checkpoints => ConfinementKind::ClaimedNamespace,
         }
     }
 }
@@ -161,6 +164,27 @@ mod tests {
         assert_eq!(
             SyncPushWriteLane::Signals.confinement_kind(),
             ConfinementKind::ClaimedNamespace
+        );
+    }
+
+    /// #2649 / #2650 — crypto lanes must declare a namespace strategy (not "exempt").
+    #[test]
+    fn gate1_crypto_lanes_require_namespace_strategy() {
+        assert_eq!(
+            SyncPushWriteLane::ActionTransitions.confinement_kind(),
+            ConfinementKind::ByIdStoredNamespace
+        );
+        assert_eq!(
+            SyncPushWriteLane::Checkpoints.confinement_kind(),
+            ConfinementKind::ClaimedNamespace
+        );
+        assert_eq!(
+            SyncPushWriteLane::ActionTransitions.wire_field(),
+            LANE_ACTION_TRANSITIONS
+        );
+        assert_eq!(
+            SyncPushWriteLane::Checkpoints.wire_field(),
+            LANE_CHECKPOINTS
         );
     }
 }
