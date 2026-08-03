@@ -2372,6 +2372,84 @@ pub async fn sync_push(
             continue;
         }
 
+        // Gate 1 / #2489 — namespace confinement for links[] via the shared
+        // by-id choke (source AND target stored namespaces). Structural
+        // lane token: receive_auth::LANE_LINKS / push_lanes::Links.
+        // Zero-config (`!ns_gate_enrolled`) stays byte-identical faith replication.
+        if ns_gate_enrolled {
+            use crate::federation::receive_auth::{
+                LANE_LINKS, inbound_by_id_namespace_authorized, peer_declares_namespace_scope,
+            };
+            let needs_stored =
+                peer_declares_namespace_scope(peer_header_owned.as_deref(), &attest_cfg);
+            let probe = |id: &str| -> Result<Option<String>, anyhow::Error> {
+                if !needs_stored {
+                    return Ok(None);
+                }
+                match db::namespace_by_id(&lock.0, id) {
+                    Ok(ns) => Ok(ns),
+                    Err(e) => Err(e),
+                }
+            };
+            let src_ns = match probe(&link.source_id) {
+                Ok(ns) => ns,
+                Err(e) => {
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        memory_id = %link.source_id,
+                        error = %e,
+                        "sync_push: refusing federated link — source namespace unresolvable (#2489)"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let dst_ns = match probe(&link.target_id) {
+                Ok(ns) => ns,
+                Err(e) => {
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        memory_id = %link.target_id,
+                        error = %e,
+                        "sync_push: refusing federated link — target namespace unresolvable (#2489)"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
+            // Missing endpoint under Layer 1: fail closed (cannot prove scope).
+            if needs_stored && (src_ns.is_none() || dst_ns.is_none()) {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    source_id = %link.source_id,
+                    target_id = %link.target_id,
+                    "sync_push: refusing federated link — endpoint missing so scope cannot decide (#2489)"
+                );
+                skipped += 1;
+                continue;
+            }
+            let src_ok = inbound_by_id_namespace_authorized(
+                LANE_LINKS,
+                &link.source_id,
+                src_ns.as_deref(),
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+                require_push_ns_scope,
+            );
+            let dst_ok = inbound_by_id_namespace_authorized(
+                LANE_LINKS,
+                &link.target_id,
+                dst_ns.as_deref(),
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+                require_push_ns_scope,
+            );
+            if !src_ok || !dst_ok {
+                skipped += 1;
+                continue;
+            }
+        }
+
         // Decide attest_level via the H3 verify path before insert.
         let attest_level = match (link.signature.as_deref(), link.observed_by.as_deref()) {
             (Some(sig_bytes), Some(observed_by)) => {
@@ -2760,6 +2838,20 @@ pub async fn sync_push(
             &attest_cfg,
             peer_header_owned.as_deref(),
             require_signal_sig,
+        ) {
+            skipped += 1;
+            continue;
+        }
+        // Gate 1 / #2489 — namespace confinement for signals[] (claimed ns).
+        // Structural lane token: receive_auth::LANE_SIGNALS / push_lanes::Signals.
+        if !crate::federation::receive_auth::inbound_write_namespace_authorized(
+            crate::federation::receive_auth::LANE_SIGNALS,
+            &sig.id,
+            &sig.namespace,
+            None,
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+            require_push_ns_scope,
         ) {
             skipped += 1;
             continue;
