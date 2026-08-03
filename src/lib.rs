@@ -606,6 +606,8 @@ pub mod erasure;
 // (handlers, mcp, cli, autonomy, bench, store, curator, transcripts,
 // tests) so the rename is a pure refactor with zero callsite churn.
 pub mod storage;
+/// #1927/#2444/#2679 — store-URL channel resolution + fail-closed postgres scheme guard.
+pub mod store_url;
 
 // Backward-compat shim from L0.5-3 rename — preserves
 // `crate::db::*` paths used elsewhere in the codebase. To be
