@@ -5655,7 +5655,7 @@ pub async fn bootstrap_serve(
                     ))
                 } else {
                     tracing::warn!(
-                        "federation push DLQ: PostgresStore downcast failed;                          falling back to sqlite sink (DLQ writes WILL error                          on postgres-backed daemons until the cast is restored)"
+                        "federation push DLQ: PostgresStore downcast failed;                          falling back to sqlite sink (DLQ writes WILL error on                          postgres-backed daemons until the cast is restored)"
                     );
                     std::sync::Arc::new(
                         federation::push_dlq::SqliteDlqSink::new(db_state.clone())
