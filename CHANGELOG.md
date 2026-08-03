@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (GA BLOCKER: shipped binary silently dropped federation push failures and reported healthy)
+
+- **The default (sqlite-only) build now enqueues failed federation fanouts into `federation_push_dlq` and runs the replay worker** (refs [#2678](https://github.com/alphaonedev/ai-memory-mcp/issues/2678); DATA INTEGRITY / silent write loss + false-success metrics; the [#2444](https://github.com/alphaonedev/ai-memory-mcp/issues/2444) class). Pre-fix the DLQ trait, sink field, enqueue branch in `broadcast_store_quorum`, bootstrap wiring, and replay worker were all `#[cfg(feature = "sal")]` solely because `async-trait` was a SAL-only dep — while migrations created `federation_push_dlq` unconditionally, `ai_memory_federation_push_dlq_depth` registered with no `cfg` and pinned at 0 ("healthy"), and doctor had no DLQ section. Three affirmative all-clears over a sink that was compiled out. **Scoped fix:** make `async-trait` non-optional (+1 crate); un-gate `push_dlq` / `FederationConfig.dlq_sink` / the enqueue path / default-build `SqliteDlqSink` bootstrap + replay worker. Do **not** flip `default` features (would push 442 `cfg(feature="sal")` sites onto the shipped path). `PostgresDlqSink` stays `sal-postgres`-gated. Pinned by the existing `federation::push_dlq` unit suite (11 tests) which now compile and pass under the default feature set.
+
+
 ### Security (federation peer URLs accepted plaintext `http://` with no flag, cert, or acknowledgement)
 
 - **A federation peer URL that is not `https://` is now REFUSED at boot, on BOTH peer-URL doors** (refs [#2477](https://github.com/alphaonedev/ai-memory-mcp/issues/2477); CONTENT DISCLOSURE; 3x3 adversarial vote, 9 lenses, option D 6/9, citing the 5-agent vote `4d3ea1c5`).
