@@ -5234,9 +5234,6 @@ pub async fn bootstrap_serve(
     // Federation: parsed from --quorum-writes / --quorum-peers. Disabled
     // entirely when either is absent — daemon behaves exactly like
     // v0.6.0 in that case.
-    // #[cfg_attr] keeps the `mut` only when DLQ wire-up below is
-    // active — under default-features the binding is read-only.
-    #[cfg_attr(not(feature = "sal"), allow(unused_mut))]
     let mut federation = federation::FederationConfig::build(
         args.quorum_writes,
         &args.quorum_peers,
@@ -5518,24 +5515,16 @@ pub async fn bootstrap_serve(
     // spawned below so the same DLQ rows the broadcast wrote are the
     // ones the worker drains.
     //
-    // Feature-gated to `--features sal` — the DLQ trait surface
-    // requires `async-trait` which is a SAL-only dep. Default
-    // (sqlite-only) builds preserve pre-#933 behaviour.
-    #[cfg(feature = "sal")]
+    // #2678 — wire the federation push DLQ on EVERY build. Pre-fix this
+    // was `#[cfg(feature = "sal")]`, so the default shipped binary dropped
+    // failed fanouts while the table + depth gauge still advertised a
+    // healthy empty DLQ. SqliteDlqSink is not postgres-gated; only the
+    // PostgresDlqSink arm needs sal-postgres.
     if let Some(ref mut fed) = federation {
+        #[cfg(feature = "sal")]
         let sink: std::sync::Arc<dyn federation::FederationDlqSink> = match storage_backend {
             #[cfg(feature = "sal-postgres")]
             crate::handlers::StorageBackend::Postgres => {
-                // Recover the typed PostgresStore via the generic
-                // `as_any` downcast hatch (renamed from
-                // `as_any_for_postgres` per ARCH-15, FX-C4-batch2) so
-                // the sink can issue raw SQL through
-                // `PostgresStore::pool()`. Falls back to the sqlite
-                // sink (which would error on every INSERT because the
-                // postgres DB has no sqlite connection) when the
-                // downcast fails — unreachable in practice because the
-                // only backend returning `StorageBackend::Postgres` IS
-                // PostgresStore.
                 if let Some(pg) = store_handle
                     .as_any()
                     .downcast_ref::<crate::store::postgres::PostgresStore>()
@@ -5544,10 +5533,10 @@ pub async fn bootstrap_serve(
                         std::sync::Arc::new(pg.clone()),
                     ))
                 } else {
+                    // err-lowercase-msg / obs-structured-fields: single format
+                    // string (adjacent literals are NOT valid inside tracing! args).
                     tracing::warn!(
-                        "federation push DLQ: PostgresStore downcast failed; \
-                             falling back to sqlite sink (DLQ writes WILL error \
-                             on postgres-backed daemons until the cast is restored)"
+                        "federation push DLQ: PostgresStore downcast failed;                          falling back to sqlite sink (DLQ writes WILL error on                          postgres-backed daemons until the cast is restored)"
                     );
                     std::sync::Arc::new(
                         federation::push_dlq::SqliteDlqSink::new(db_state.clone())
@@ -5556,15 +5545,20 @@ pub async fn bootstrap_serve(
                     )
                 }
             }
-            // #1580 / F5.11 — the sqlite DLQ sink opens its OWN dedicated
-            // connection (learned from `db_state`'s path) so the replay
-            // worker never contends the shared HTTP writer mutex.
+            // #1580 / F5.11 — dedicated connection so the replay worker
+            // never contends the shared HTTP writer mutex.
             _ => std::sync::Arc::new(
                 federation::push_dlq::SqliteDlqSink::new(db_state.clone())
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?,
             ),
         };
+        #[cfg(not(feature = "sal"))]
+        let sink: std::sync::Arc<dyn federation::FederationDlqSink> = std::sync::Arc::new(
+            federation::push_dlq::SqliteDlqSink::new(db_state.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?,
+        );
         fed.dlq_sink = Some(sink);
     }
 
@@ -5620,7 +5614,7 @@ pub async fn bootstrap_serve(
         // re-attempts `post_once` against each peer until the row
         // Acks. The worker maintains the
         // `ai_memory_federation_push_dlq_depth` Prometheus gauge.
-        #[cfg(feature = "sal")]
+        // #2678 — replay worker follows the sink, not the sal feature.
         if let Some(sink) = fed.dlq_sink.clone() {
             task_handles.push(federation::spawn_replay_federation_push_dlq(
                 fed.clone(),
