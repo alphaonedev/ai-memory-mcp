@@ -57,6 +57,12 @@ services:
       # without touching the host network. This is the load-bearing
       # change for #878.
       AI_MEMORY_PEER_URLS: "http://ic-bob:19077,http://ic-carol:19077"
+      # #2477 — this compose fleet federates over PLAINTEXT container-hostname
+      # peers (a container bridge is NOT loopback), which the peer-scheme guard
+      # refuses by default. Acknowledged here because the bridge is a private,
+      # single-host Docker network used for parity/chaos testing only. Do NOT
+      # copy this line into a deployment whose peers cross a real network.
+      AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS: "1"
       AI_MEMORY_API_KEY: "${AI_MEMORY_API_KEY:-}"
       RUST_LOG: "${RUST_LOG:-ai_memory=info}"
     volumes:
@@ -92,6 +98,12 @@ services:
       AI_MEMORY_LLM_MODEL: "gemma4:e4b"
       AI_MEMORY_EMBED_MODEL: "nomic-embed-text"
       AI_MEMORY_PEER_URLS: "http://ic-alice:19077,http://ic-carol:19077"
+      # #2477 — this compose fleet federates over PLAINTEXT container-hostname
+      # peers (a container bridge is NOT loopback), which the peer-scheme guard
+      # refuses by default. Acknowledged here because the bridge is a private,
+      # single-host Docker network used for parity/chaos testing only. Do NOT
+      # copy this line into a deployment whose peers cross a real network.
+      AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS: "1"
       AI_MEMORY_API_KEY: "${AI_MEMORY_API_KEY:-}"
       RUST_LOG: "${RUST_LOG:-ai_memory=info}"
     volumes:
@@ -128,6 +140,12 @@ services:
       AI_MEMORY_LLM_MODEL: "gemma4:e4b"
       AI_MEMORY_EMBED_MODEL: "nomic-embed-text"
       AI_MEMORY_PEER_URLS: "http://ic-alice:19077,http://ic-bob:19077"
+      # #2477 — this compose fleet federates over PLAINTEXT container-hostname
+      # peers (a container bridge is NOT loopback), which the peer-scheme guard
+      # refuses by default. Acknowledged here because the bridge is a private,
+      # single-host Docker network used for parity/chaos testing only. Do NOT
+      # copy this line into a deployment whose peers cross a real network.
+      AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS: "1"
       AI_MEMORY_API_KEY: "${AI_MEMORY_API_KEY:-}"
       RUST_LOG: "${RUST_LOG:-ai_memory=info}"
     volumes:
