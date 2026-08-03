@@ -130,7 +130,6 @@ fn build_cfg(peer_url: &str, signing_key: Option<SigningKey>) -> FederationConfi
         sender_agent_id: "ai:nodeSQ".to_string(),
         api_key: None,
         signing_key: signing_key.map(Arc::new),
-        #[cfg(feature = "sal")]
         dlq_sink: None,
     }
 }
