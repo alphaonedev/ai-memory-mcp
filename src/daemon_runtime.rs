@@ -2473,145 +2473,13 @@ pub fn passphrase_from_file(path: &Path) -> Result<String> {
     Ok(passphrase)
 }
 
-/// Store-URL scheme prefix for the sqlite adapter.
-///
-/// \#2444 — HOISTED here out of [`crate::migrate`] (which is
-/// `#[cfg(feature = "sal")]`-gated, so it does not exist in a default build)
-/// because the ungated `backup` / `restore` fail-closed store guard has to
-/// sniff the configured store's scheme on EVERY build leg. `crate::migrate`
-/// re-exports this const, [`POSTGRES_URL_SCHEMES`] and [`is_postgres_url`]
-/// verbatim, so every pre-existing call site is unchanged and the literals
-/// still live in exactly one place (the pm-v3.1 no-hardcoded-literal rule).
-pub const SQLITE_URL_SCHEME: &str = "sqlite://";
-
-/// Store-URL scheme prefixes the postgres adapter accepts. See
-/// [`SQLITE_URL_SCHEME`] for why this lives here rather than in
-/// `crate::migrate`.
-pub const POSTGRES_URL_SCHEMES: [&str; 2] = ["postgres://", "postgresql://"];
-
-/// True when `url` selects the postgres adapter — the ONE scheme sniff
-/// shared by `migrate::open_store`, the daemon `--store-url` dispatch,
-/// `schema-init`, and the #2444 `backup` / `restore` store guard.
-#[must_use]
-pub fn is_postgres_url(url: &str) -> bool {
-    POSTGRES_URL_SCHEMES.iter().any(|s| url.starts_with(s))
-}
-
-/// #1927 (CWE-214) — env var carrying the store/Postgres connection URL out
-/// of band, so the DB credential need NOT be forced onto the world-readable
-/// `/proc/<pid>/cmdline`. `/proc/<pid>/environ` is owner-only (mode 0400),
-/// strictly better than argv (mode 0444).
-pub const STORE_URL_ENV: &str = "AI_MEMORY_STORE_URL";
-
-/// #1927 (CWE-214) — env var naming a `0600` file whose sole contents are the
-/// store URL: the most restrictive channel (never in argv, never in the
-/// process environment block, never in shell history).
-pub const STORE_URL_FILE_ENV: &str = "AI_MEMORY_STORE_URL_FILE";
-
-/// #1927 — read a store URL from a file, enforcing owner-only (`0600`)
-/// permissions exactly as [`passphrase_from_file`] does for the SQLCipher
-/// passphrase. The file holds a bare credential, so a group/world-readable
-/// mode is refused fail-closed (opt out with
-/// `AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS=1`).
-pub fn store_url_from_file(path: &Path) -> Result<String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let meta = std::fs::metadata(path).with_context(|| {
-            format!(
-                "stat store-url file {} for permission check (#1927)",
-                path.display()
-            )
-        })?;
-        let mode = meta.permissions().mode();
-        if mode & 0o077 != 0 {
-            let fail_open = std::env::var("AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            if fail_open {
-                tracing::warn!(
-                    path = %path.display(),
-                    mode = format!("{:o}", mode & 0o777),
-                    "store_url_from_file: file is group/world-readable; \
-                     AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS=1 — accepting (UNSAFE)."
-                );
-            } else {
-                anyhow::bail!(
-                    "store-url file {} has lax permissions (mode {:o}, group/world bits set); \
-                     tighten with `chmod 0600 {}` OR set \
-                     AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS=1 to opt out (#1927)",
-                    path.display(),
-                    mode & 0o777,
-                    path.display(),
-                );
-            }
-        }
-    }
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading store-url file {}", path.display()))?;
-    let url = raw.trim().to_string();
-    if url.is_empty() {
-        anyhow::bail!("store-url file {} is empty", path.display());
-    }
-    Ok(url)
-}
-
-/// #1927 (CWE-214) — resolve the store URL from a NON-argv channel when
-/// available, so the DB password need never appear on `--store-url` (which
-/// lands in world-readable `/proc/<pid>/cmdline`, `ps auxww`, shell history
-/// and systemd unit files, readable by any co-tenant local UID).
-///
-/// Resolution order (first hit wins):
-///   1. [`STORE_URL_FILE_ENV`] — read the URL from a `0600` file.
-///   2. [`STORE_URL_ENV`] — read the URL from the owner-only environment.
-///   3. the `--store-url` CLI argument (unchanged). When it carries a userinfo
-///      password a warning points at the /proc/cmdline exposure and the
-///      non-argv alternatives.
-///
-/// Returns `Ok(None)` when no channel supplies a URL (the caller then falls
-/// back to the local sqlite `--db` path).
-pub fn resolve_store_url(cli_arg: Option<&str>) -> Result<Option<String>> {
-    if let Ok(path) = std::env::var(STORE_URL_FILE_ENV) {
-        if !path.trim().is_empty() {
-            return Ok(Some(store_url_from_file(Path::new(path.trim()))?));
-        }
-    }
-    if let Ok(url) = std::env::var(STORE_URL_ENV) {
-        let trimmed = url.trim();
-        if !trimmed.is_empty() {
-            return Ok(Some(trimmed.to_string()));
-        }
-    }
-    if let Some(url) = cli_arg {
-        if url_has_userinfo_password(url) {
-            tracing::warn!(
-                "--store-url carries a password in argv, which is exposed via world-readable \
-                 /proc/<pid>/cmdline and `ps auxww` to any local UID (#1927). Prefer \
-                 AI_MEMORY_STORE_URL (owner-only /proc/environ) or AI_MEMORY_STORE_URL_FILE \
-                 (a 0600 file)."
-            );
-        }
-        return Ok(Some(url.to_string()));
-    }
-    Ok(None)
-}
-
-/// #1927 — true when a `scheme://user:pass@host/...` URL carries a non-empty
-/// userinfo password component (`user:pass@`). Best-effort structural check
-/// (no full URL parse) used only to decide whether to warn about argv exposure.
-fn url_has_userinfo_password(url: &str) -> bool {
-    let Some(after_scheme) = url.split_once("://").map(|(_, r)| r) else {
-        return false;
-    };
-    // userinfo is everything before the first '@' of the authority.
-    let Some(at) = after_scheme.find('@') else {
-        return false;
-    };
-    let userinfo = &after_scheme[..at];
-    // A password is present iff there is a ':' in the userinfo with something
-    // after it.
-    matches!(userinfo.split_once(':'), Some((_, pass)) if !pass.is_empty())
-}
+/// Store-URL helpers live in [`crate::store_url`] (QUAL-10 extraction, #2679).
+/// Re-exported here so historical `daemon_runtime::…` and `migrate::…` paths
+/// stay stable for callers and for the #2444 hoist contract.
+pub use crate::store_url::{
+    POSTGRES_URL_SCHEMES, SQLITE_URL_SCHEME, STORE_URL_ENV, STORE_URL_FILE_ENV, is_postgres_url,
+    refuse_postgres_store_url_without_feature, resolve_store_url, store_url_from_file,
+};
 
 /// Apply the configured `anonymize_default` to the runtime env: when the
 /// config asks for anonymization but the user hasn't already set
@@ -4823,12 +4691,11 @@ fn api_key_bind_guard(
 
 /// Same loopback host set [`api_key_bind_guard`] recognises. Factored so the
 /// posture-warning matrix below shares one definition with the bind guard.
+/// #2477 — delegates to the shared SSOT in [`crate::tls::host_is_loopback`]
+/// so the inbound bind guard and the outbound federation peer-scheme guard
+/// can never drift apart on what "loopback" means.
 fn host_is_loopback(host: &str) -> bool {
-    host == "127.0.0.1"
-        || host == "::1"
-        || host == "localhost"
-        || host == "0:0:0:0:0:0:0:1"
-        || host == "[::1]"
+    crate::tls::host_is_loopback(host)
 }
 
 /// R-04 / R-12 (#1798 full-spectrum review) — boot-time security-posture
@@ -5029,6 +4896,17 @@ pub async fn bootstrap_serve(
     // ORIGINAL string when it carries any non-whitespace content (secrets are
     // compared verbatim); only empty/blank collapses to `None`. Constructed
     // once here and fed to BOTH the bind guard and `ApiKeyState` below.
+    // #2679 — fail closed on a postgres:// store URL from ANY channel
+    // (AI_MEMORY_STORE_URL_FILE > AI_MEMORY_STORE_URL > --store-url) BEFORE
+    // `db::open` creates a local SQLite file and the daemon reports healthy.
+    // Ungated: the default build must refuse, not silently wrong-store-write.
+    // `ServeArgs::store_url` exists only under `feature = "sal"`; env/file
+    // channels are still resolved when the CLI flag is absent.
+    #[cfg(feature = "sal")]
+    refuse_postgres_store_url_without_feature(args.store_url.as_deref())?;
+    #[cfg(not(feature = "sal"))]
+    refuse_postgres_store_url_without_feature(None)?;
+
     let normalized_api_key: Option<String> =
         app_config.api_key.clone().filter(|k| !k.trim().is_empty());
     match api_key_bind_guard(
@@ -5356,9 +5234,6 @@ pub async fn bootstrap_serve(
     // Federation: parsed from --quorum-writes / --quorum-peers. Disabled
     // entirely when either is absent — daemon behaves exactly like
     // v0.6.0 in that case.
-    // #[cfg_attr] keeps the `mut` only when DLQ wire-up below is
-    // active — under default-features the binding is read-only.
-    #[cfg_attr(not(feature = "sal"), allow(unused_mut))]
     let mut federation = federation::FederationConfig::build(
         args.quorum_writes,
         &args.quorum_peers,
@@ -5640,24 +5515,16 @@ pub async fn bootstrap_serve(
     // spawned below so the same DLQ rows the broadcast wrote are the
     // ones the worker drains.
     //
-    // Feature-gated to `--features sal` — the DLQ trait surface
-    // requires `async-trait` which is a SAL-only dep. Default
-    // (sqlite-only) builds preserve pre-#933 behaviour.
-    #[cfg(feature = "sal")]
+    // #2678 — wire the federation push DLQ on EVERY build. Pre-fix this
+    // was `#[cfg(feature = "sal")]`, so the default shipped binary dropped
+    // failed fanouts while the table + depth gauge still advertised a
+    // healthy empty DLQ. SqliteDlqSink is not postgres-gated; only the
+    // PostgresDlqSink arm needs sal-postgres.
     if let Some(ref mut fed) = federation {
+        #[cfg(feature = "sal")]
         let sink: std::sync::Arc<dyn federation::FederationDlqSink> = match storage_backend {
             #[cfg(feature = "sal-postgres")]
             crate::handlers::StorageBackend::Postgres => {
-                // Recover the typed PostgresStore via the generic
-                // `as_any` downcast hatch (renamed from
-                // `as_any_for_postgres` per ARCH-15, FX-C4-batch2) so
-                // the sink can issue raw SQL through
-                // `PostgresStore::pool()`. Falls back to the sqlite
-                // sink (which would error on every INSERT because the
-                // postgres DB has no sqlite connection) when the
-                // downcast fails — unreachable in practice because the
-                // only backend returning `StorageBackend::Postgres` IS
-                // PostgresStore.
                 if let Some(pg) = store_handle
                     .as_any()
                     .downcast_ref::<crate::store::postgres::PostgresStore>()
@@ -5666,10 +5533,10 @@ pub async fn bootstrap_serve(
                         std::sync::Arc::new(pg.clone()),
                     ))
                 } else {
+                    // err-lowercase-msg / obs-structured-fields: single format
+                    // string (adjacent literals are NOT valid inside tracing! args).
                     tracing::warn!(
-                        "federation push DLQ: PostgresStore downcast failed; \
-                             falling back to sqlite sink (DLQ writes WILL error \
-                             on postgres-backed daemons until the cast is restored)"
+                        "federation push DLQ: PostgresStore downcast failed;                          falling back to sqlite sink (DLQ writes WILL error on                          postgres-backed daemons until the cast is restored)"
                     );
                     std::sync::Arc::new(
                         federation::push_dlq::SqliteDlqSink::new(db_state.clone())
@@ -5678,15 +5545,20 @@ pub async fn bootstrap_serve(
                     )
                 }
             }
-            // #1580 / F5.11 — the sqlite DLQ sink opens its OWN dedicated
-            // connection (learned from `db_state`'s path) so the replay
-            // worker never contends the shared HTTP writer mutex.
+            // #1580 / F5.11 — dedicated connection so the replay worker
+            // never contends the shared HTTP writer mutex.
             _ => std::sync::Arc::new(
                 federation::push_dlq::SqliteDlqSink::new(db_state.clone())
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?,
             ),
         };
+        #[cfg(not(feature = "sal"))]
+        let sink: std::sync::Arc<dyn federation::FederationDlqSink> = std::sync::Arc::new(
+            federation::push_dlq::SqliteDlqSink::new(db_state.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?,
+        );
         fed.dlq_sink = Some(sink);
     }
 
@@ -5742,7 +5614,7 @@ pub async fn bootstrap_serve(
         // re-attempts `post_once` against each peer until the row
         // Acks. The worker maintains the
         // `ai_memory_federation_push_dlq_depth` Prometheus gauge.
-        #[cfg(feature = "sal")]
+        // #2678 — replay worker follows the sink, not the sal feature.
         if let Some(sink) = fed.dlq_sink.clone() {
             task_handles.push(federation::spawn_replay_federation_push_dlq(
                 fed.clone(),
@@ -7387,96 +7259,6 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt as _;
-
-    /// #1927 (CWE-214) — ADVERSARIAL: a co-tenant reading `/proc/<pid>/cmdline`
-    /// recovers the DB password ONLY because it must ride on `--store-url`.
-    /// Proof the exploit is closed: a non-argv channel now resolves the URL, so
-    /// the operator can keep the credential OUT of argv entirely. Fail-before
-    /// (no channel) vs pass-after (env/file channel).
-    /// Shared lock for every test that reads or mutates the process-global
-    /// `AI_MEMORY_STORE_URL` / `_FILE` env channel (#1927). A per-test local
-    /// mutex does NOT serialise against a sibling test using its own mutex, so
-    /// all store-url-env tests must take THIS one (fixed a real cross-test
-    /// pollution race that failed `fx_f2_build_store_handle_no_url` under
-    /// parallel ordering).
-    fn store_url_env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        &LOCK
-    }
-
-    #[test]
-    fn issue_1927_non_argv_store_url_channel_exists() {
-        let _g = store_url_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Clean slate.
-        // SAFETY: env mutation is serialized by ENV_GUARD; these keys are read
-        // only by `resolve_store_url`, which no other test drives concurrently.
-        unsafe {
-            std::env::remove_var(STORE_URL_ENV);
-            std::env::remove_var(STORE_URL_FILE_ENV);
-        }
-
-        // FAIL-BEFORE analogue: with no env channel and no arg, nothing resolves
-        // (operator would be forced to put the secret on argv to get a URL).
-        assert_eq!(resolve_store_url(None).unwrap(), None);
-
-        // PASS-AFTER: the owner-only environment supplies the URL — never argv.
-        let secret = "postgres://u:hunter2@db.internal/mem";
-        // SAFETY: see above.
-        unsafe {
-            std::env::set_var(STORE_URL_ENV, secret);
-        }
-        assert_eq!(resolve_store_url(None).unwrap().as_deref(), Some(secret));
-        // SAFETY: see above.
-        unsafe {
-            std::env::remove_var(STORE_URL_ENV);
-        }
-    }
-
-    /// #1927 — a `0600` store-url file is accepted; a group/world-readable one
-    /// is refused fail-closed (the credential must not sit in a lax-perm file).
-    #[cfg(unix)]
-    #[test]
-    fn issue_1927_store_url_file_enforces_owner_only_perms() {
-        use std::io::Write as _;
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("dsn");
-        {
-            let mut f = std::fs::File::create(&path).expect("create");
-            writeln!(f, "postgres://u:hunter2@db.internal/mem").expect("write");
-        }
-
-        // Lax perms (0644) — refused.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod 644");
-        assert!(
-            store_url_from_file(&path).is_err(),
-            "group/world-readable store-url file must be refused (#1927)"
-        );
-
-        // Owner-only (0600) — accepted, trimmed.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
-        assert_eq!(
-            store_url_from_file(&path).unwrap(),
-            "postgres://u:hunter2@db.internal/mem"
-        );
-    }
-
-    /// #1927 — the argv-exposure warning fires only when a userinfo password is
-    /// actually present (so a passwordless DSN does not nag the operator).
-    #[test]
-    fn issue_1927_userinfo_password_detection() {
-        assert!(url_has_userinfo_password(
-            "postgres://user:hunter2@db.internal/mem"
-        ));
-        assert!(!url_has_userinfo_password(
-            "postgres://user@db.internal/mem"
-        ));
-        assert!(!url_has_userinfo_password("postgres://db.internal/mem"));
-        assert!(!url_has_userinfo_password("sqlite:///var/lib/mem.db"));
-    }
 
     /// #1579 A3 (SECURITY) — regression pin: the Postgres SAL boot
     /// path must log the REDACTED store URL. Pre-fix,
@@ -11584,7 +11366,7 @@ decision = "allow"
         // shared store-url env lock and clear the #1927 env vars so a
         // concurrent sibling test can't leak a postgres:// URL into this
         // fallthrough assertion (the pollution race this pins closed).
-        let _g = store_url_env_lock()
+        let _g = crate::store_url::store_url_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // SAFETY: env mutation serialised by store_url_env_lock.

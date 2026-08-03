@@ -51,6 +51,7 @@
 //! | `AI_MEMORY_REQUIRE_ROLE_SEPARATION` | `1` | three-key governance role separation required |
 //! | `AI_MEMORY_REQUIRE_IDENTITY_LINEAGE` | `1` | identity-lineage succession chain required |
 //! | `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY` | `1` | outbound federation TLS must verify the PEER SERVER cert — `--insecure-skip-server-verify` is refused (#2448) |
+//! | `AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS` | *(unset)* | the plaintext-peer hatch is NOT in force — an `http://` peer on a non-loopback host is refused (#2477) |
 //! | `AI_MEMORY_DB_SYNCHRONOUS` | `FULL` | power-loss durability (fsync every commit) — #1961 part C |
 //!
 //! In addition, `asi-hard` forces the config-backed governance knob
@@ -191,6 +192,25 @@ fn schema_ahead_hatch_meets_floor(v: &str) -> bool {
     v.trim().is_empty()
 }
 
+/// #2477 — floor for the plaintext-federation-peer hatch. The SECOND
+/// PERMISSIVE knob in this table (after the schema-ahead hatch), so "hard"
+/// again means the hatch is NOT in force. Any non-truthy value clears the
+/// floor, because [`crate::tls::plaintext_peers_allowed`] only opens on an
+/// explicit truthy token — so a knob left unset, empty, or set to `0` is
+/// already at the hard posture and must not refuse boot.
+///
+/// Without this entry an `asi-hard` deployment could still replicate
+/// memory CONTENT in the clear to a non-loopback peer, i.e. the hardened
+/// PROCUREMENT posture would be silently weaker than the no-disable
+/// contract advertises — the exact defect #2448 fixed for
+/// `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY`, one door over.
+fn plaintext_peers_hatch_meets_floor(v: &str) -> bool {
+    !matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// The pinned-knob table. SSOT for the module docs table above and the
 /// [`pinned_knobs`] accessor; the `asi_hard_pins_documented_set` test pins
 /// the two in agreement.
@@ -269,6 +289,11 @@ const KNOBS: &[KnobSpec] = &[
         env: crate::tls::FED_REQUIRE_SERVER_VERIFY_ENV,
         hard_value: "1",
         meets_floor: is_truthy,
+    },
+    KnobSpec {
+        env: crate::tls::FED_ALLOW_PLAINTEXT_PEERS_ENV,
+        hard_value: "",
+        meets_floor: plaintext_peers_hatch_meets_floor,
     },
     KnobSpec {
         env: crate::storage::ENV_DB_SYNCHRONOUS,
@@ -639,7 +664,7 @@ mod tests {
         // The pinned set must match the documented count so the module
         // docs table and the KNOBS SSOT cannot silently drift.
         let pins = pinned_knobs();
-        assert_eq!(pins.len(), 16, "documented asi-hard knob count");
+        assert_eq!(pins.len(), 17, "documented asi-hard knob count");
         // Every pin's env name is non-empty and the durability pin is FULL.
         assert!(pins.iter().all(|(e, _)| !e.is_empty()));
         assert!(
@@ -656,6 +681,17 @@ mod tests {
             pins.iter()
                 .any(|(e, v)| *e == crate::tls::FED_REQUIRE_SERVER_VERIFY_ENV && *v == "1"),
             "asi-hard must pin outbound server-cert verification (#2448)"
+        );
+        // #2477 — the SECOND network access-control pin, and the second
+        // PERMISSIVE one (hard floor = the hatch is NOT in force). Without
+        // it, `docs/deploy/asi-hard.env` verbatim still permitted
+        // `--quorum-peers http://peer:9077`, replicating memory CONTENT in
+        // the clear — strictly weaker than the accept-any-cert case #2448
+        // closed one door over.
+        assert!(
+            pins.iter()
+                .any(|(e, v)| *e == crate::tls::FED_ALLOW_PLAINTEXT_PEERS_ENV && v.is_empty()),
+            "asi-hard must pin the plaintext-peer hatch OFF (#2477)"
         );
     }
 }

@@ -473,6 +473,17 @@ pub async fn run_daemon(
 ///   (#2448 — the default).
 /// - Unreadable / unparseable pin file, `--ca-cert`, or client cert/key PEM.
 pub async fn build_sync_client(args: &SyncDaemonArgs) -> Result<reqwest::Client> {
+    // #2477 — the SECOND peer-URL door. `ai-memory sync-daemon --peers` is a
+    // fully independent path from `FederationConfig::build`: it wires the
+    // #2448 accept-any-cert ceremony but validated no scheme whatsoever, so
+    // `--peers http://host:9077` replicated plaintext memory content while
+    // the ceremony was still nominally in force. A refusal scoped to
+    // `federation/peer.rs` alone would have been theatre — this door and
+    // that one share ONE validator.
+    for peer in &args.peers {
+        crate::tls::validate_peer_url_scheme(peer).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
     if args.insecure_skip_server_verify && (args.client_cert.is_none() || args.client_key.is_none())
     {
         anyhow::bail!(
@@ -803,7 +814,7 @@ mod tests {
         let env = TestEnv::fresh();
         let db = env.db_path.clone();
         let args = SyncDaemonArgs {
-            peers: vec!["http://example.com:9077".to_string()],
+            peers: vec!["https://example.com:9077".to_string()],
             interval: 2,
             api_key: None,
             batch_size: 500,

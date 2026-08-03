@@ -553,7 +553,23 @@ the ORIGIN author has no locally-enrolled key, and
 because the receiver could not RESOLVE the target row's namespace, so the
 scope gate failed closed — the second is operator-actionable at the
 RECEIVER's storage rather than the sender's allowlist, and is dormant
-until the delete lane gains a DLQ enqueue (#2498). The label set is
+until the delete lane gains a DLQ enqueue (#2498). **#2442** deliberately did NOT add a cause label for legacy positional
+routing keys. That condition is decided from the SHAPE of `peer_id`
+(structured input a peer cannot influence) rather than from a substring of
+`last_error`, because `classify_quarantine_cause` is an ORDERED SUBSTRING
+matcher and a peer-supplied INTEGER already reaches that string: the
+receiver's own `skipped` count is interpolated into the failure reason, so
+a peer answering 200 with `{"skipped": 429}` mints a `429` substring that
+matches this classifier's first arm AND `reset_throttled_quarantine`'s
+`LIKE '%429%'` (#2672). An arm keyed on a token in `last_error` would widen
+that laundering surface, and it would override the row's REAL cause (a
+legacy-keyed row already failing `http 400` is still `permanent`).
+It has its own counter instead:
+`ai_memory_federation_push_dlq_legacy_positional_total`, incremented once
+per affected row per replay pass. Non-zero after an upgrade means rows
+written by a pre-#2442 binary are still present — see
+`docs/TROUBLESHOOTING.md` §federation-push-DLQ. It should fall to zero and
+stay there. The label set is
 enumerated in exactly one place in code
 (`push_dlq::classify_quarantine_cause`); treat that as the SSOT and this
 list as a mirror. #1544 also narrows the federation RECEIVE quota: the
