@@ -2921,6 +2921,23 @@ pub async fn sync_push(
                 continue;
             }
         };
+        // Gate 1 / #2649 — authentication is not authorization. Crypto authz
+        // (authorize_remote_transition) answers "who signed"; this choke answers
+        // "may this peer touch the stored action namespace". Subject is the
+        // **stored** namespace already loaded for the signable — no extra read.
+        // Zero-config (`!has_allowlist`) short-circuits inside the helper.
+        if !crate::federation::receive_auth::inbound_write_namespace_authorized(
+            crate::federation::receive_auth::LANE_ACTION_TRANSITIONS,
+            &op.action_id,
+            &local.namespace,
+            Some(local.namespace.as_str()),
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+            require_push_ns_scope,
+        ) {
+            skipped += 1;
+            continue;
+        }
         if body.dry_run {
             noop += 1;
             continue;
@@ -3029,6 +3046,24 @@ pub async fn sync_push(
         // Only RESOLVED checkpoints federate — a pending checkpoint carries no
         // resolution attestation, so there is nothing to authorize or apply.
         if cp.state == crate::models::CheckpointState::Pending {
+            skipped += 1;
+            continue;
+        }
+        // Gate 1 / #2650 — format validation is not scope. Resolver-key crypto
+        // answers "who resolved"; this choke answers "may this peer write a
+        // freeze-anchor resolution in `cp.namespace`". Wire namespace is the
+        // write subject (first-resolution-wins may create/update under that ns).
+        // Postgres still skips apply entirely (#2464) — confinement still runs
+        // so both backends refuse out-of-scope rows the same way.
+        if !crate::federation::receive_auth::inbound_write_namespace_authorized(
+            crate::federation::receive_auth::LANE_CHECKPOINTS,
+            &cp.id,
+            &cp.namespace,
+            None,
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+            require_push_ns_scope,
+        ) {
             skipped += 1;
             continue;
         }
