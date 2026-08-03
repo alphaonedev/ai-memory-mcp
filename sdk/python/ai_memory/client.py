@@ -433,8 +433,20 @@ class AiMemoryClient:
         return Subscription.model_validate(raw)
 
     def unsubscribe(self, subscription_id: str) -> dict[str, Any]:
-        """``DELETE /api/v1/subscriptions/{id}``."""
-        return self._request("DELETE", f"/api/v1/subscriptions/{subscription_id}")
+        """``DELETE /api/v1/subscriptions?id=<id>``.
+
+        The subscription id rides the QUERY STRING, not the path. The daemon
+        registers ``delete`` on the collection path ``/api/v1/subscriptions``
+        only (``src/lib.rs``, ``handlers::routes::SUBSCRIPTIONS``) and reads
+        the id from ``UnsubscribeQuery`` (``src/handlers/subscriptions.rs``).
+        The pre-v1.0.0 SDK sent ``DELETE /api/v1/subscriptions/{id}``, which no
+        route matches: the teardown answered 405/404 and the decommissioned
+        endpoint kept receiving signed deliveries indefinitely. Check the
+        returned ``deleted`` flag.
+        """
+        return self._request(
+            "DELETE", "/api/v1/subscriptions", params={"id": subscription_id}
+        )
 
     def subscriptions(self) -> list[Subscription]:
         """``GET /api/v1/subscriptions``."""
@@ -462,29 +474,15 @@ class AiMemoryClient:
         )
         return raw.get("messages", raw) if isinstance(raw, dict) else raw
 
-    # -- grant / revoke (per-memory ACL) -----------------------------------
-    def grant(
-        self, memory_id: str, agent_id: str, permission: str = "read"
-    ) -> dict[str, Any]:
-        """``POST /api/v1/memories/{id}/grant``."""
-        return self._request(
-            "POST",
-            f"/api/v1/memories/{memory_id}/grant",
-            json_body={"agent_id": agent_id, "permission": permission},
-        )
-
-    def revoke(self, memory_id: str, agent_id: str) -> dict[str, Any]:
-        """``POST /api/v1/memories/{id}/revoke``."""
-        return self._request(
-            "POST",
-            f"/api/v1/memories/{memory_id}/revoke",
-            json_body={"agent_id": agent_id},
-        )
-
-    # -- cluster ------------------------------------------------------------
-    def cluster(self, request: dict[str, Any] | None = None) -> dict[str, Any]:
-        """``POST /api/v1/cluster`` — cluster join/peer management."""
-        return self._request("POST", "/api/v1/cluster", json_body=request or {})
+    # ``grant()`` / ``revoke()`` / ``cluster()`` were REMOVED at v1.0.0. They
+    # posted to ``/api/v1/memories/{id}/grant``, ``/api/v1/memories/{id}/revoke``
+    # and ``/api/v1/cluster`` — none of which the daemon registers, and none of
+    # which it ever did, so every call 404'd. Per-memory access control is
+    # expressed through ``metadata.scope`` (``private`` / ``collective``) on the
+    # write plus namespace governance standards (``docs/governance.md``);
+    # federation peers are configured out of band and the HTTP federation
+    # surface is ``/api/v1/sync/push`` + ``/api/v1/sync/since``
+    # (``docs/federation.md``).
 
     # -- agents -------------------------------------------------------------
     def agents(self) -> list[AgentRegistration]:
