@@ -6,8 +6,20 @@ layout: doc
 > **Audience:** operators and platform/DevOps engineers deploying a
 > federated `ai-memory` fleet. This is the configuration **and** admin
 > reference for the CA-rooted, attestation-issued, short-lived
-> credential system that lets a fleet grow from **1 to ~1,000,000 AI
-> agents** without O(N²) manual key exchange.
+> credential system that removes O(N²) manual key exchange from fleet
+> growth.
+>
+> **Certified scale envelope: a 500–1000 agent cluster, composed
+> modularly in 500-agent blocks.** Scale past one cluster by adding
+> independent clusters — never by growing one mesh, which
+> [`docs/federation.md`](federation.html) §"Multi-peer scaling guidance"
+> puts at a ~50-peer ceiling. Enrollment being O(1) removes the
+> *key-exchange* limit; it does not remove the *topology* limit, and the
+> topology limit is the binding one. A previous revision of this
+> paragraph advertised "1 to ~1,000,000 AI agents" — three orders of
+> magnitude beyond the envelope this project's own topology tables
+> support. Retired per
+> [#2438](https://github.com/alphaonedev/ai-memory-mcp/issues/2438).
 >
 > For the older transport/identity hardening (mTLS allowlist, X-API-Key,
 > per-peer attestation JSON) that still applies underneath, see
@@ -55,7 +67,7 @@ the shipped decisions are mirrored in the module docs under
 
 | Concept | What it is | Code |
 |---|---|---|
-| **Trust domain** | A namespace for a fleet (multi-tenant isolation). A credential minted in one domain is rejected by a bundle scoped to another. | `trust_bundle.rs` |
+| **Trust domain** | A namespace for a fleet. A credential minted in one domain is rejected by a bundle scoped to another. **Scope: credential-replay only.** It is verified inside `TrustBundle::verify` and nowhere else — it is never consulted on the receive path, so it enforces nothing *between* parties inside one domain. See §"What `trust_domain` does and does not bound" below. | `trust_bundle.rs` |
 | **Federation identity** | The `sender_agent_id` a node signs and presents as. SPIFFE-style paths allowed (e.g. `region/nyc/node-1`). | `resolver.rs` |
 | **Credential** (`FederationCredential`) | A node's Ed25519 public key bound to its agent-id + validity window, **signed by a CA key**. Canonical-CBOR, versioned. | `credential.rs` |
 | **Issuer** (`FederationIssuer`) | A CA (root or intermediate) that mints credentials and intermediate certs. | `issuer.rs` |
@@ -71,6 +83,44 @@ exercised end-to-end through the public crate API by
 
 ---
 
+### What `trust_domain` does and does not bound
+
+This paragraph exists because earlier revisions of this document
+labelled `trust_domain` "multi-tenant isolation", and
+`docs/enterprise-deployment.md` composed that label with a
+one-cluster-per-tenant recommendation. Neither is supportable.
+
+**What it bounds (real, and useful).** `trust_domain` is a
+**credential-replay scope**. `TrustBundle::verify` refuses any
+credential whose `trust_domain` differs from the bundle's, even when
+the issuer signature is valid — so a credential minted for fleet A
+cannot be replayed into fleet B. That is a genuine and well-implemented
+control.
+
+**What it does not bound.** It is consulted **only** under
+`src/federation/identity/` — it appears nowhere on the receive path, in
+`src/handlers/`, or in the storage layer. Inside one trust domain it
+enforces nothing at all between the parties that hold valid credentials
+for it. The in-domain confinement primitive is
+`PeerScope.allowed_namespaces` — and three inbound write lanes do not
+consult that either (`links[]`, `signals[]`, and the pull-accept path;
+see [`docs/federation.md`](federation.html) §"Layer 3 — Peer
+attestation" for the table and the tracking issues).
+
+**Therefore:**
+
+| Boundary | Status |
+|---|---|
+| Separately-administered peers inside one organisation | **Delivered.** This is the boundary to design against. |
+| Mutually distrusting tenants inside one trust domain | **Not delivered.** Do not build on it. |
+| Mutually distrusting tenants in separate trust domains | Use **separate deployments** — disjoint swarms, not one mesh with scopes. `docs/enterprise-deployment.md` §8.8 gives the same answer for heterogeneous trust. |
+
+Federation also ships **plaintext memory content** — it is not
+end-to-end encrypted across peers
+([#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968);
+`docs/federation.md` §"At-rest encryption and federation" has the
+detail). A peer you federate with reads what you replicate to it.
+
 ## 3. The credential wire format
 
 A `FederationCredential` carries these signed fields (canonical-CBOR,
@@ -84,7 +134,7 @@ A `FederationCredential` carries these signed fields (canonical-CBOR,
 | `issuer_id` | `String` | The CA / intermediate identity that minted it. |
 | `not_before` | `i64` | Unix seconds — start of validity. |
 | `not_after` | `i64` | Unix seconds — end of validity (short TTL). |
-| `trust_domain` | `String` | Fleet namespace for multi-tenant isolation. |
+| `trust_domain` | `String` | Fleet namespace. Rejects a credential minted for another fleet; enforces nothing between parties inside one domain. |
 | `cred_version` | `u16` | Wire/format version (`CRED_VERSION = 1`). |
 
 On the wire it travels base64 next to the existing `X-Memory-Sig`, under
@@ -321,9 +371,25 @@ The renewal worker (`spawn_refresh_outbound_credential`) wakes every
 `DEFAULT_RENEWAL_INTERVAL_SECS` (60s) and re-issues the local credential
 once it enters the `DEFAULT_RENEWAL_LEAD_SECS` (15m) window before
 expiry. A missed renewal **fails closed for the lapsed node only** — the
-fleet is unaffected. **Revocation is "stop renewing"**: remove the node
-from the inventory and its credential simply expires; no peer visit
+fleet is unaffected. **Revocation is "stop renewing" — on the credential
+lane, and only there**: remove the node from the inventory and its
+credential expires within the leaf TTL (default 1 h), with no peer visit
 required.
+
+> ⚠️ **This does not describe the lane the shipped runbooks use.** Two
+> other identity lanes carry NO expiry and NO hot-reload:
+>
+> - the legacy per-peer `.pub` enrollment lane, and
+> - the **mTLS fingerprint allowlist** — the lane
+>   [`docs/federation.md`](federation.html) §"Cert-revocation procedure"
+>   actually prescribes.
+>
+> Revoking on the allowlist lane means editing
+> `peer-fingerprints.allow` **and restarting the daemon**: there is no
+> allowlist hot-reload surface (verified — the only `SIGHUP` reload in
+> the tree is the `[llm]` config path). Until a node is running the
+> credential lane, plan revocation as an allowlist edit plus a restart,
+> not as a TTL expiry.
 
 `refresh_once()` returns a `RenewalOutcome` and refreshes the SLO gauges
 (§7.7) on every tick.

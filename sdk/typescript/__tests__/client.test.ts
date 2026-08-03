@@ -47,6 +47,60 @@ describe("AiMemoryClient constructor", () => {
 });
 
 // ---------------------------------------------------------------------------
+// C-20 (3x7 claims register, 2026-08-01) — the daemon registers `delete` on
+// the COLLECTION path `/api/v1/subscriptions` only; the id rides the query
+// string (`UnsubscribeQuery` in `src/handlers/subscriptions.rs`). The SDK used
+// to send `DELETE /api/v1/subscriptions/:id`, which matches no route — so
+// webhook teardown appeared to fail safe while the decommissioned endpoint
+// kept receiving signed deliveries indefinitely.
+//
+// Offline: the client takes an injectable fetch as its second constructor arg,
+// so this asserts the URL the SDK builds without needing a daemon.
+// ---------------------------------------------------------------------------
+
+describe("AiMemoryClient.unsubscribe URL shape (C-20)", () => {
+  function captureUrl(): {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    fetchImpl: any;
+    seen: () => string;
+  } {
+    let captured = "";
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const fetchImpl = async (url: any, _init: any) => {
+      captured = String(url);
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        json: async () => ({ deleted: true }),
+        text: async () => '{"deleted":true}',
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any;
+    };
+    return { fetchImpl, seen: () => captured };
+  }
+
+  test("targets the collection path with ?id=<id>", async () => {
+    const { fetchImpl, seen } = captureUrl();
+    const client = new AiMemoryClient(
+      { baseUrl: "http://localhost:9077" },
+      fetchImpl,
+    );
+
+    const res = await client.unsubscribe("sub-abc-123");
+    expect(res).toEqual({ deleted: true });
+
+    const url = new URL(seen());
+    // The registered route is the bare collection path.
+    expect(url.pathname).toBe("/api/v1/subscriptions");
+    // The id is a query parameter, not a path segment.
+    expect(url.searchParams.get("id")).toBe("sub-abc-123");
+    // Guard the exact regression: no `/api/v1/subscriptions/<id>` form.
+    expect(seen()).not.toContain("/api/v1/subscriptions/");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Live integration tests — opt-in via AI_MEMORY_TEST_DAEMON=1.
 // ---------------------------------------------------------------------------
 

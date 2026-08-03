@@ -115,6 +115,135 @@ pub fn server_verify_required() -> bool {
         .is_none_or(|v| !matches!(v.trim(), "0" | "false" | "no" | "off"))
 }
 
+/// #2477 — the staged-rollout escape hatch for the plaintext-peer refusal.
+///
+/// PERMISSIVE knob (default OFF), the inverse shape of
+/// [`FED_REQUIRE_SERVER_VERIFY_ENV`]: truthy means "I accept plaintext
+/// federation transport to a NON-loopback peer". Pinned to its hard floor
+/// (unset / falsy) by `security_profile::KNOBS` under `asi-hard`, so the
+/// hatch itself is no-disable there.
+pub const FED_ALLOW_PLAINTEXT_PEERS_ENV: &str = "AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS";
+
+/// Whether the operator has acknowledged plaintext transport to a
+/// non-loopback federation peer (#2477).
+///
+/// Permissive-knob grammar (default OFF): enabled ONLY by an explicit
+/// truthy token (`1`/`true`/`yes`/`on`, trimmed, case-insensitive). Unset,
+/// empty, or an unrecognised word all keep the refusal in force — an
+/// unrecognised token must never silently widen the control (the FBL-14
+/// rule).
+#[must_use]
+pub fn plaintext_peers_allowed() -> bool {
+    std::env::var(FED_ALLOW_PLAINTEXT_PEERS_ENV)
+        .ok()
+        .is_some_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
+/// The loopback host set. SSOT shared by the daemon's inbound bind guard
+/// (`daemon_runtime::host_is_loopback`, #1458/#2032 M2) and the outbound
+/// federation peer-scheme guard (#2477) so the two cannot drift.
+///
+/// Deliberately LITERAL loopback only. A container-bridge hostname such as
+/// `http://alice:9077` resolves onto an interceptable virtual NIC and is
+/// NOT loopback — treating "feels local" as "is local" is exactly the
+/// category error this control exists to prevent.
+#[must_use]
+pub fn host_is_loopback(host: &str) -> bool {
+    host == "127.0.0.1"
+        || host == "::1"
+        || host == "localhost"
+        || host == "0:0:0:0:0:0:0:1"
+        || host == "[::1]"
+}
+
+/// #2477 — refuse a federation peer URL that would carry **plaintext**
+/// memory content across the network.
+///
+/// Federation replicates memory content that is NOT end-to-end encrypted
+/// (`src/encryption/mod.rs`; #1968 open), so an `http://` peer is a direct
+/// content-disclosure surface for anyone on the path — and it bypassed the
+/// entire four-condition opt-in ceremony #2448 built for the strictly
+/// WEAKER "accept any server cert" case. Pre-#2477 neither peer-URL door
+/// validated the scheme at all: `FederationConfig::build` formatted the raw
+/// operator string straight into `sync_push_url`, and
+/// `cli::sync::build_sync_client` applied the #2448 ceremony over whatever
+/// scheme it was handed.
+///
+/// Disposition:
+/// * `https://` — always accepted.
+/// * `http://` to a LITERAL loopback host — always accepted, no hatch
+///   needed. The bytes never leave the kernel, so none of the disclosure
+///   risk applies, and forcing a hatch-flip on every dev laptop and CI
+///   fixture would train reflexive hatch use (a worse long-run posture).
+///   Mirrors the inbound `tls_bind_guard`'s silent loopback exemption.
+/// * `http://` to any other host — REFUSED unless
+///   [`FED_ALLOW_PLAINTEXT_PEERS_ENV`] is explicitly truthy, in which case
+///   it is accepted with a loud WARN naming the exposure.
+/// * anything else (`ws://`, `file://`, a scheme-less `peer.example:9077`)
+///   — REFUSED. A scheme-less peer already failed at request time with an
+///   opaque relative-URL error; refusing at boot is strictly clearer.
+///
+/// The refusal message names the SECURE remedy first and the escape hatch
+/// last, so an operator is steered to fix the posture rather than to
+/// disable the control (the #2448 ordering discipline, pinned by a test).
+///
+/// # Errors
+///
+/// Returns the operator-facing refusal string when `raw` would carry
+/// plaintext to a non-loopback peer, or does not name a usable scheme.
+pub fn validate_peer_url_scheme(raw: &str) -> Result<(), String> {
+    let trimmed = raw.trim();
+    let parsed = reqwest::Url::parse(trimmed).map_err(|e| {
+        format!(
+            "federation peer URL {trimmed:?} is not a valid absolute URL ({e}). \
+             Peers must be given as `https://host:port` (or `http://127.0.0.1:port` \
+             for a loopback-only development mesh)."
+        )
+    })?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            let host = parsed.host_str().unwrap_or_default();
+            if host_is_loopback(host) {
+                return Ok(());
+            }
+            if plaintext_peers_allowed() {
+                tracing::warn!(
+                    target: "federation",
+                    peer_url = %trimmed,
+                    host = %host,
+                    "federation peer {trimmed} uses PLAINTEXT http:// to a non-loopback \
+                     host — replicated memory CONTENT crosses the network in the clear \
+                     and is readable/modifiable by anyone on the path. Accepted only \
+                     because {} is set. Move the peer to https:// .",
+                    FED_ALLOW_PLAINTEXT_PEERS_ENV,
+                );
+                return Ok(());
+            }
+            Err(format!(
+                "refusing federation peer {trimmed:?}: plaintext http:// to the \
+                 non-loopback host {host:?} would replicate memory CONTENT across \
+                 the network in the clear (federation is not end-to-end encrypted). \
+                 Use https:// for this peer — pair it with --quorum-ca-cert for a \
+                 self-signed fleet CA, or pin the peer via \
+                 AI_MEMORY_FED_PEER_FINGERPRINTS. Loopback peers \
+                 (http://127.0.0.1:PORT) are exempt. If TLS is genuinely terminated \
+                 by a sidecar on a trusted link, acknowledge it with \
+                 {FED_ALLOW_PLAINTEXT_PEERS_ENV}=1."
+            ))
+        }
+        other => Err(format!(
+            "refusing federation peer {trimmed:?}: unsupported scheme {other:?}. \
+             Federation peers speak HTTPS (or plaintext HTTP to loopback only)."
+        )),
+    }
+}
+
 /// v0.7.0 H3 — pin the rustls protocol-version floor to TLS 1.2 with TLS 1.3
 /// preferred. Listed in descending preference order; rustls negotiates the
 /// highest protocol both peers support. TLS 1.0 / 1.1 are deliberately
