@@ -20,17 +20,47 @@ deployments should always bind TLS: `--tls-cert` + `--tls-key`.
 When an `api_key` is configured (the top-level `api_key = "…"` field in
 `config.toml`, or injected via `AI_MEMORY_API_KEY` by the Plan-C
 container entrypoint — there is **no** `--api-key` CLI flag on `serve`),
-every endpoint except `/api/v1/health` requires one of:
+every endpoint except `/api/v1/health` requires the header:
 
-- Header: `x-api-key: <key>` — **the canonical credential channel**.
-- Query parameter: `?api_key=<key>` — **DEPRECATED**
-  ([#1574](https://github.com/alphaonedev/ai-memory-mcp/issues/1574)):
-  URL-embedded credentials leak into access logs, `Referer` headers,
-  and proxy logs. Still accepted at v0.7.0 for back-compat (the daemon
-  emits a once-per-process WARN on first use); slated for rejection at
-  v0.8.
+```
+x-api-key: <key>
+```
+
+The header is the **only** credential channel.
 
 Failure → **401** `{"error": "missing or invalid API key"}`.
+
+> **BREAKING CHANGE at v1.0.0 — `?api_key=` query credential REMOVED**
+> ([#2032](https://github.com/alphaonedev/ai-memory-mcp/issues/2032) L1;
+> deprecated since v0.7.0 by
+> [#1574](https://github.com/alphaonedev/ai-memory-mcp/issues/1574)).
+>
+> `GET /api/v1/memories?api_key=<key>` used to authenticate. It no longer
+> does: `api_key_auth` reads the credential from the `x-api-key` header
+> and nothing else (`src/handlers/transport.rs`), so a caller still
+> putting the key in the query string gets **401
+> `{"error": "missing or invalid API key"}`** — the same body a caller
+> with no credential at all gets.
+>
+> **Migration.** Move the credential from the query string to the header:
+>
+> ```bash
+> # before (v0.7.0 – v0.10.0) — now 401
+> curl "http://127.0.0.1:9077/api/v1/memories?api_key=$KEY"
+> # after (v1.0.0)
+> curl -H "x-api-key: $KEY" http://127.0.0.1:9077/api/v1/memories
+> ```
+>
+> **Diagnosing it.** The daemon emits a once-per-process WARN under the
+> `http::auth` target when any request arrives carrying an `api_key=`
+> query parameter, naming the header alternative. The per-request
+> response is still a bare 401 — the WARN is in the daemon log, not on
+> the wire. Grep for it before assuming a key-rotation problem.
+>
+> **Why.** URL-embedded credentials leak into access logs, `Referer`
+> headers, and proxy logs (OWASP A07/A09). Every caller on the removed
+> path is a credential already written to disk somewhere; rotate the key
+> after migrating.
 
 When mTLS fingerprint pinning is enforced (`--mtls-allowlist`), the
 `/api/v1/sync/*` federation paths bypass the api-key check — the mTLS
@@ -136,9 +166,43 @@ Status codes you'll commonly encounter:
 | 401 | Unauthorized — missing / invalid API key |
 | 403 | Forbidden — governance denied |
 | 404 | Not found |
-| 409 | Conflict — duplicate `(title, namespace)` |
+| 409 | Conflict — duplicate `(title, namespace)`, or stale `If-Match` |
+| 429 | Per-agent write quota exhausted — see below |
 | 500 | Internal server error |
-| 503 | Service unavailable |
+| 503 | Service unavailable — admission-control shed, or `/health` reporting unhealthy |
+
+### 429 — per-agent write quotas
+
+**429 is a real response code on the primary write surfaces.** It is
+returned when the calling agent's per-agent quota row (daily memories,
+storage bytes, or daily links — see Limits below) is exhausted. Body:
+
+```json
+{ "code": "QUOTA_EXCEEDED", "error": "…", "limit": "memories_per_day",
+  "current": 1000, "max": 1000, "agent_id": "alice" }
+```
+
+Emitting surfaces, verified in the daemon:
+
+| Surface | Site |
+|---|---|
+| `POST /api/v1/memories` | `src/handlers/create.rs` |
+| `PUT /api/v1/memories/{id}` (storage-byte growth on update) | `src/handlers/memories.rs` |
+| `POST /api/v1/links` | `src/handlers/links.rs` |
+| `POST /api/v1/consolidate` | `src/handlers/power_consolidation.rs` |
+| `POST /api/v1/signals` | `src/handlers/coordination.rs` |
+| `POST /api/v1/sync/push` (federation receive) | `src/handlers/federation_receive.rs`, `federation_signing_check.rs` |
+| any Postgres-backed route surfacing `StoreError::QuotaExceeded` | `src/handlers/postgres_gate.rs` |
+
+The federation-receive 429 additionally carries `x-quota-reset-at` (UTC
+midnight) and `x-quota-limit` headers.
+
+**`POST /api/v1/memories/bulk` does NOT return 429.** A quota-rejected row
+in a bulk batch is folded into the response `errors[]` array and the batch
+still answers 200 — see the bulk section below.
+
+Read paths (`GET /recall`, `/search`, `/memories`, …) are not quota-charged
+and never return 429.
 
 ## Limits
 
@@ -158,31 +222,54 @@ Status codes you'll commonly encounter:
   `max_storage_bytes` / `max_links_per_day` (or the matching
   `AI_MEMORY_MAX_*` env vars). Defaults: 1000 memories/day, 100 MiB,
   5000 links/day. See [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html).
-- No per-client rate limiting at the HTTP layer — all writes contend
-  for a single `Mutex<Connection>`. Batch or throttle at the caller.
+- **Per-agent write quotas are enforced and return 429** (see the 429
+  section above): daily memories, storage bytes, and daily links, charged
+  per authenticated agent. There is no requests-per-second throttle; the
+  quotas are daily counters plus a storage ceiling, not a rate limiter.
+- **A global in-flight concurrency cap is enforced by default and returns
+  503** (see Admission control below). It is global, not per-client.
+- All writes contend for a single `Mutex<Connection>` on the SQLite
+  backend. Batch or throttle at the caller.
 
-### Admission control — overload shedding (v0.8.0, #1733 Pillar-4 4.A)
+### Admission control — overload shedding (#1733 Pillar-4 4.A; default-on since #2032 M3)
 
-A global in-flight concurrency cap is **opt-in** via
-`[limits].max_inflight_requests` / `AI_MEMORY_MAX_INFLIGHT_REQUESTS`
-(precedence: env > config > compiled default `0` = disabled). When set
-to a positive `n`, the daemon admits at most `n` concurrent in-flight
-requests and **sheds** the rest at the outermost layer (before timeout,
-body decode, or handler work) with a typed **503**:
+**Admission control is ON by default.** The daemon admits at most `n`
+concurrent in-flight requests and **sheds** the rest at the outermost
+layer — before the timeout future, body decode, or any handler work.
+
+`n` resolves as a **tri-state** (`[limits].max_inflight_requests` /
+`AI_MEMORY_MAX_INFLIGHT_REQUESTS`; env > config > compiled default):
+
+| Value | Effective cap |
+|---|---|
+| **unset** (the default) | `clamp(available_parallelism × 64, 256, 4096)` — CPU-scaled, so 256 on a small node and up to 4096 on a large one |
+| positive `n` | exactly `n` |
+| **explicit `0`** | **disabled** — no admission layer is composed |
+
+Only an *explicit* `0` disables it. Unset resolves to the CPU-scaled
+default (`config::resolve_default_max_inflight_requests`), so a single
+authenticated caller cannot saturate the daemon's one
+`Arc<Mutex<Connection>>` for a denial of service. This is the safer
+posture and it is the one you get with no configuration.
+
+A shed request answers **503** with `Retry-After: 1`:
 
 ```json
-{ "error": "server_overloaded", "code": "OVERLOADED", "max_inflight": 64 }
+{ "error": "server_overloaded", "code": "OVERLOADED", "max_inflight": 512 }
 ```
 
-The shed response carries a `Retry-After: 1` header. `GET /api/v1/health`,
-`GET /api/v1/metrics`, and the bare `GET /metrics` are **EXEMPT** from the
-cap so liveness/readiness probes and Prometheus scrapes survive an
-overload (otherwise the orchestrator's health probe would be shed, the
-node killed, and graceful shedding would become a crash-loop). Shed
-events increment the `ai_memory_admission_shed_total` Prometheus counter
-and emit a sampled WARN. When the knob is unset / `0` / non-positive, no
-admission layer is composed and behaviour is byte-identical to a build
-without admission control.
+`GET /api/v1/health`, `GET /api/v1/metrics`, and the bare `GET /metrics`
+are **EXEMPT** from the cap so liveness/readiness probes and Prometheus
+scrapes survive an overload (otherwise the orchestrator's health probe
+would be shed, the node killed, and graceful shedding would become a
+crash-loop). Shed events increment the `ai_memory_admission_shed_total`
+Prometheus counter and emit a sampled WARN.
+
+**Sizing note.** A client that holds many long-lived concurrent requests
+(streaming, slow embedding round-trips) consumes permits for their whole
+duration. If you see 503/`OVERLOADED` under a load you consider normal,
+raise the cap explicitly rather than setting `0` — `0` removes the DoS
+floor for every caller.
 
 ## The `Memory` object
 
@@ -223,16 +310,90 @@ sync / consolidate.
 
 ### `GET /api/v1/health`
 
-No authentication required. Returns daemon liveness.
+No authentication required — this endpoint is exempt from the api-key
+middleware (`src/handlers/transport.rs::api_key_auth`) and from admission
+control, so probes survive an overload. It reads **no request headers**;
+`X-Agent-Id`, `X-Peer-Id` and mTLS peer identity are not consulted, so a
+200 here proves transport reachability only, never authentication.
 
-**Response**
+**Status codes**
+
+| Code | When |
+|---|---|
+| **200** | connection answers SQL, FTS5 index is reachable, and the cached FTS5 integrity verdict is not `failed` |
+| **503** | the DB connection or the FTS5 reachability probe errored, **or** the cached FTS5 integrity verdict is `failed` |
+
+That is the whole failure contract (`health_status_code`,
+`src/handlers/transport.rs`). Write your orchestrator probe against it:
+the endpoint **does** take the node out of rotation, so a probe that only
+checks for HTTP reachability will mask a corrupted FTS5 index.
+
+**Response body (200 and 503 alike)**
 
 ```json
-{ "status": "ok", "service": "ai-memory" }
+{
+  "status": "ok",
+  "service": "ai-memory",
+  "version": "1.0.0",
+  "embedder_ready": true,
+  "federation_enabled": false,
+  "checks": {
+    "connection": "ok",
+    "fts_index": "reachable"
+  },
+  "fts_integrity": {
+    "status": "ok",
+    "checked_at": "2026-07-30T04:11:22+00:00",
+    "interval_secs": 21600
+  }
+}
 ```
 
+| Field | Meaning |
+|---|---|
+| `status` | `"ok"` on 200, `"error"` on 503 |
+| `version` | the daemon's package version |
+| `embedder_ready` | an embedder is wired on this node (semantic recall available) |
+| `federation_enabled` | federation is configured on this node |
+| `checks.connection` | `"ok"` \| `"error"` — the SQL liveness ping |
+| `checks.fts_index` | `"reachable"` \| `"error"` \| `"not_applicable"` (Postgres backend) — a bounded MATCH proving the FTS5 module is registered and its shadow tables are readable. **REACHABLE, not VERIFIED.** |
+| `fts_integrity.status` | the deep verdict — see below |
+| `fts_integrity.checked_at` | RFC3339 instant the verdict was produced, or `null` if none has completed |
+| `fts_integrity.interval_secs` | the configured check cadence |
+
+**The FTS5 integrity verdict is CACHED, not per-request** (#2579). The
+full FTS5 `'integrity-check'` re-tokenizes the whole corpus and is
+prepared by SQLite as a writer, so running it per probe held the WAL
+write lock and blew past a Kubernetes default `timeoutSeconds: 1` on
+exactly the largest corpora. It now runs on its own connection on a
+background cadence — default **21600 s (6 h)**, tunable via
+`AI_MEMORY_FTS_INTEGRITY_INTERVAL_SECS`; `0` disables it. The first pass
+fires at a random offset within 5 minutes of boot and each subsequent
+pass carries ±20% jitter, so a fleet restart does not check in lockstep.
+
+| `fts_integrity.status` | Meaning | Effect on the HTTP code |
+|---|---|---|
+| `ok` | a check completed clean within the freshness window | 200 |
+| `pending` | no check has completed yet on this process | 200 |
+| `stale` | the last `ok` is older than 3 intervals — the checker stopped running | 200 |
+| `disabled` | `AI_MEMORY_FTS_INTEGRITY_INTERVAL_SECS=0` | 200 |
+| `failed` | a check returned `SQLITE_CORRUPT` / `SQLITE_CORRUPT_VTAB` | **503** |
+
+Only a confirmed corruption takes the node out of rotation. `pending` /
+`stale` / `disabled` are *no assertion*, not *failed assertion* —
+503-ing on those would deadlock a rolling restart across a fleet.
+Correspondingly, **a 200 does not mean the index was just verified**: it
+can be up to `interval_secs` old, or never checked at all. Alert on
+`fts_integrity.status` being `stale` or `disabled` separately from the
+HTTP code, and use `ai-memory doctor` to run the deep check on demand.
+
+An operational error such as `SQLITE_BUSY` retains the previous verdict
+rather than recording a failure, so the cadence introduces no false-503
+class.
+
 ```bash
-curl http://127.0.0.1:9077/api/v1/health
+curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9077/api/v1/health
+curl -sS http://127.0.0.1:9077/api/v1/health | jq .fts_integrity
 ```
 
 ### `GET /metrics` and `GET /api/v1/metrics`
@@ -384,12 +545,62 @@ returns **400 Bad Request** with an error echoing the configured cap.
 { "created": 998, "errors": ["item 17: title is required", … ] }
 ```
 
+Postgres-backed daemons additionally carry `"pending": [ … ]` — the rows
+a governance standard routed to approval instead of writing.
+
+> ⚠️ **A 200 from this endpoint does NOT mean any row was created.**
+>
+> Once the batch passes the size/auth/attestation preconditions, the
+> terminal response is a bare JSON body with **no status code override**
+> (`src/handlers/memories_query.rs`), so it is always **HTTP 200** —
+> whatever the per-row outcome was. Per-row failures do not fail the
+> request: validation errors, governance refusals, **per-agent quota
+> rejections**, and store errors are all accumulated into `errors[]` and
+> the corresponding rows are skipped.
+>
+> A batch in which *every* row was rejected by the per-agent daily write
+> quota answers **`200` with `{"created": 0, "errors": [ …one entry per
+> row… ]}`**. Nothing was written.
+>
+> **Callers MUST inspect `created` and `errors` — the status code is not
+> a success signal for this endpoint.** A retry policy keyed on
+> `response.ok` will treat a wholly-rejected batch as delivered and drop
+> the data. Key it on `created === body.length && errors.length === 0`
+> instead, and surface `errors[]` to the operator.
+>
+> Note this endpoint does **not** return 429 even though the single-write
+> `POST /api/v1/memories` does; the quota rejection is a per-row entry in
+> `errors[]` here.
+>
+> Returning `207 Multi-Status` (or 400 on total rejection) is tracked as
+> [#2588](https://github.com/alphaonedev/ai-memory-mcp/issues/2588). Until
+> that lands, the contract above is what the daemon does — write your
+> client against it.
+
 ## Recall + search
 
 ### `GET /api/v1/recall` and `POST /api/v1/recall`
 
-Hybrid recall (FTS5 + semantic + blend). **Mutates the database**
-(touches, auto-promotes).
+Hybrid recall (FTS5 + semantic + blend).
+
+**Recall is PURE.** It writes zero rows to `memories` — no access-count
+bump, no TTL extension, no tier promotion, on any surface, on either
+backend ([#1953](https://github.com/alphaonedev/ai-memory-mcp/issues/1953);
+the `AI_MEMORY_RECALL_TOUCH_SYNC` opt-back-in was removed at v1.0.0). The
+only write a recall performs is one row in the append-only
+`recall_observations` ledger. That makes recall safe to retry and safe to
+serve from a read replica.
+
+The access ladders still exist — they are applied out of band by the
+periodic **fold job** from unfolded ledger rows: access-count bump,
+per-tier TTL floor extension, mid→long promotion at 5 accesses, the
+priority decade ladder. **The fold job only runs inside `ai-memory
+serve`** (its own 60 s loop, `AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS`, plus a
+fold at the top of every GC tick). On an MCP-stdio or CLI-only topology
+with no daemon, nothing folds until a GC chokepoint runs — so
+`access_count`, `last_accessed_at` and tier promotion can lag arbitrarily
+there. That is a freshness property of the derived ranking signal, not of
+the memory text.
 
 Query / body fields: `context` (required), `namespace`, `limit`
 (default 10, max 50), `tags`, `since`, `until`, `as_agent`,
@@ -443,13 +654,16 @@ v0.7.0 #1579 B4, same semantics as recall above).
 > `format` parameter (`json` | `toon` | `toon_compact`). As of v0.7.0
 > (#1579 B4) the HTTP recall + search endpoints expose `format` too
 > (HTTP defaults to `json` for backwards compat; MCP defaults to
-> `toon_compact`). HTTP `memory_list` does not yet accept `format`.
+> `toon_compact`). `GET /api/v1/memories` (list) is the one surface that
+> does **not** accept `format` — `ListQuery` has no such field.
 > The MCP `memory_recall` tool requires the `context` parameter — the
 > `query` / `q` alias ladder is HTTP-only (#1606); an MCP call passing
-> `query` is refused with "context is required". MCP additionally
-> accepts a `context_tokens` array (v0.6.0.0 contextual recall — recent
-> conversation tokens biasing the query embedding at 70/30) that the
-> HTTP body does not surface.
+> `query` is refused with "context is required". `context_tokens`
+> (v0.6.0.0 contextual recall — recent conversation tokens biasing the
+> query embedding at 70/30) is available on **both** transports: the
+> `POST /api/v1/recall` body takes a JSON array, and the `GET` query
+> string takes the comma-separated form `context_tokens=alpha,beta`
+> (#1622).
 
 ## Lifecycle
 
@@ -496,7 +710,31 @@ Relations (nine at v0.8.0; was six at v0.7.0, four at v0.6.x): `related_to`, `su
 
 ### `GET /api/v1/links/{id}`
 
-Returns inbound + outbound links for a memory under `{"links": [...]}`. Each row in the array surfaces the full link envelope including the v0.7 temporal-validity columns (`valid_from`, `valid_until`, `observed_by`) and the attestation columns (`signature`, `attest_level`, `signed_at`) — wired through `db::get_links` per issue [#860](https://github.com/alphaonedev/ai-memory-mcp/issues/860).
+Returns inbound + outbound links for a memory under `{"links": [...]}`.
+
+Each row is the graph-view projection — **eight columns**, exactly what
+`db::get_links` selects ([#860](https://github.com/alphaonedev/ai-memory-mcp/issues/860)):
+
+| Field | Notes |
+|---|---|
+| `source_id`, `target_id` | the edge endpoints |
+| `relation` | one of the nine typed relations above |
+| `created_at` | RFC3339 |
+| `valid_from`, `valid_until` | v0.7 temporal validity; omitted when null |
+| `observed_by` | the `agent_id` asserting the edge; omitted when null |
+| `attest_level` | `"unsigned"` \| `"self_signed"` \| `"peer_attested"`; omitted when null |
+
+**`signature` is deliberately NOT surfaced here**, and `signed_at` does
+not exist — there is no such column on `memory_links` (the row's time
+fields are `created_at` / `valid_from` / `valid_until`).
+
+Withholding the signature is a design decision, not an omission: this is
+a read-only graph view, and the verification surface is owned by
+**`memory_verify`** — over HTTP, `POST /api/v1/links/verify`. That
+endpoint returns `{verified, attest_level, signature_present,
+observed_by, source_id, target_id, relation, findings}`. Build link
+attestation checks against it; `GET /api/v1/links/{id}` will never carry
+the bytes to verify against.
 
 ## Knowledge Graph + taxonomy (v0.6.3)
 
@@ -926,19 +1164,24 @@ authoritative for HTTP.
 
 | Tool | Param | HTTP | MCP | Notes |
 |---|---|---|---|---|
-| `memory_store` | `ttl_secs` | ✓ | ✗ | HTTP-only; the MCP tool exposes `expires_at` (also accepted by HTTP). |
-| `memory_store` | `expires_at` | ✓ | (via `update`) | HTTP body accepts; documented in the `POST /api/v1/memories` example. |
+| `memory_store` | `ttl_secs` | ✓ | ✗ | HTTP-only (`CreateMemory.ttl_secs`). The MCP `memory_store` tool exposes neither `ttl_secs` nor `expires_at` — set the expiry afterwards with MCP `memory_update` (`expires_at`), or let the tier default apply. |
+| `memory_store` | `expires_at` | ✓ | (via `update`) | HTTP body accepts; documented in the `POST /api/v1/memories` example. On MCP it lives on `memory_update`, not `memory_store`. |
 | `memory_store` | `signature` | ✓ | ✓ | #626 Layer-3 — std-base64 detached Ed25519 over the `SignableWrite` envelope; upgrades `agent_id` claimed→`agent_attested`. Same wire on both transports. |
 | `memory_store` | `created_at` | ✓ | ✓ | #626 Layer-3 — RFC 3339; **required when `signature` is present** (the signed timestamp, adopted verbatim; ±300 s freshness window). |
-| `memory_recall` | `format` | ✗ | ✓ | MCP-only; HTTP responses are always JSON. |
-| `memory_recall` | `context_tokens` | ✗ | ✓ | MCP-only (v0.6.0.0 contextual recall). |
-| `memory_search` | `format` | ✗ | ✓ | MCP-only. |
-| `memory_list` | `format` | ✗ | ✓ | MCP-only. |
+| `memory_recall` | `format` | ✓ | ✓ | Both transports (#1579 B4). `GET`/`POST /api/v1/recall` negotiate `json` (HTTP default) \| `toon` \| `toon_compact` before doing any work; an unrecognised value is a 400. MCP defaults to `toon_compact`. |
+| `memory_recall` | `context_tokens` | ✓ | ✓ | Both transports. The `POST` body takes a JSON array; the `GET` query string takes the comma-separated form `context_tokens=alpha,beta` (#1622). |
+| `memory_search` | `format` | ✓ | ✓ | Both transports (#1579 B4). `GET /api/v1/search` negotiates the same three values with the same 400-on-unknown rule. |
+| `memory_list` | `format` | ✗ | ✓ | **MCP-only.** `ListQuery` (`src/models/memory.rs`) carries no `format` field, so `GET /api/v1/memories` always answers JSON. |
 
-These gaps are intentional for v0.6.3.1 and tracked for parity
-follow-up — they are NOT drift in the doc surface, just transport-level
-surface-area differences captured here so operators don't re-derive
-them.
+**TOON on HTTP is worth taking.** The `toon` / `toon_compact` variants
+return `text/plain` rendered by the same encoder the MCP tools use;
+`toon_compact` runs roughly 79% smaller than the JSON envelope on the
+same result set. If you are paying for tokens on recall or search
+results, request it explicitly — HTTP defaults to `json` purely for
+backwards compatibility, not because it is the better wire.
+
+The single remaining gap (`memory_list` `format`) is a transport-level
+surface-area difference captured here so operators don't re-derive it.
 
 ## v0.7.0 net-new endpoints
 
@@ -971,16 +1214,32 @@ router in `src/lib.rs`.
 | `POST` | `/api/v1/memory_smart_load`, `/api/v1/memory_reflect`, `/api/v1/memory_recall_observations`, `/api/v1/memory_reflection_origin`, `/api/v1/memory_dependents_of_invalidated`, `/api/v1/memory_export_reflection`, `/api/v1/memory_atomise`, `/api/v1/memory_calibrate_confidence`, `/api/v1/memory_verify`, `/api/v1/memory_replay`, `/api/v1/memory_subscription_replay`, `/api/v1/memory_subscription_dlq_list`, `/api/v1/memory_rule_list`, `/api/v1/memory_check_agent_action` | #1111 — 14 thin HTTP wrappers around the same-named MCP substrate handlers (`src/handlers/route_1111.rs`); wire envelopes are byte-equal across MCP and HTTP. |
 | `GET`  | `/api/v1/tools/list` | MCP `tools/list` mirror for harness ops — returns the live tool surface for the daemon's profile (103 at `full`, 7 at `core`) — SSOT: `Profile::full()/core().expected_tool_count()` in `src/profile.rs`. |
 
-> Total HTTP surface: **80 unique URL paths** / 92 production
-> route registrations on the sqlite-backed daemon (and the
-> postgres-backed daemon under `--features sal-postgres`).
-> Authoritative count:
-> `grep -oE '"/[^"]*"' src/handlers/routes.rs | sort -u | wc -l` = 78
-> (77 `/api/v1/*` paths + the bare `/metrics`), pinned by
-> `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT` in `src/lib.rs`. The two
-> v0.8.0 net-new paths were the #1718 coordination write surfaces below;
-> the v0.9.0 #1859 G13-mem lineage read surface (`GET
-> /api/v1/memories/{id}/lineage`) added the 78th unique path.
+> **Total HTTP surface at v1.0.0: 80 unique URL paths across 94
+> production route registrations** (several paths carry more than one
+> method), on the sqlite-backed daemon and on the postgres-backed daemon
+> under `--features sal-postgres`. Both numbers are pinned in
+> `src/lib.rs` as `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = 80` and
+> `EXPECTED_PRODUCTION_ROUTES_COUNT = 94`, asserted by
+> `tests/route_count_invariant.rs`. Three further routes are
+> `#[cfg(test)]`-gated and never registered in a production build
+> (`EXPECTED_TEST_ROUTES_COUNT = 3`).
+>
+> Re-derive the path count yourself against the route-path SSOT:
+>
+> ```bash
+> grep -oE '"/[^"]*"' src/handlers/routes.rs | sort -u | wc -l   # 80
+> ```
+>
+> That is 79 `/api/v1/*` paths plus the bare `/metrics`. Do not count
+> `.route(` occurrences in `src/lib.rs` to get the registration total —
+> the router also registers test-only routes under `#[cfg(test)]`, so a
+> raw grep overcounts; the pinned const is the answer.
+>
+> **Postgres caveat.** Not every registered route is served on the
+> Postgres backend. `postgres_endpoint_supported()`
+> (`src/handlers/postgres_gate.rs`) is an explicit allowlist; a route
+> outside it answers a uniform **501 NOT IMPLEMENTED** on a
+> Postgres-backed daemon. Check the gate before assuming parity.
 
 ### v0.8.0 net-new endpoints
 
@@ -1010,7 +1269,17 @@ Highlights for HTTP-equivalent surfaces:
 | `memory_pending_list` / `memory_pending_approve` / `memory_pending_reject` | `GET /api/v1/pending`, `POST /api/v1/pending/{id}/approve`, `POST /api/v1/pending/{id}/reject` | K10. The MCP tool names changed from the v0.7-alpha drafts (`memory_approval_pending` / `memory_approval_decide`); the HTTP paths are stable. |
 | `memory_agent_register` / `memory_agent_list` | `POST /api/v1/agents`, `GET /api/v1/agents` | `meta` family. Register an NHI agent (`agent_type`, `capabilities`) in `_agents` (refreshes `last_seen_at`, preserves `registered_at`) and list every registered agent (ordered by `registered_at`). `agent_id` is CLAIMED, not attested — pair with attestation (#626 Layer-3) for a security boundary. |
 
-For the canonical full inventory (101 entries advertised at `--profile full` — 100 callable + the always-on `memory_capabilities`): `grep -oE 'crate::mcp::[a-z_]+::[A-Za-z]+Tool' src/mcp/registry.rs | sort -u | wc -l` returns 101 — the `registered_tools()` iterator in `src/mcp/registry.rs` is the source of truth. The v0.8.0 net-new tools were the coordination families `memory_action_*`, `memory_lease_*`, `memory_signal_*`, `memory_checkpoint_*`, and `memory_routine_*`.
+For the canonical full inventory — **103 entries advertised at `--profile full`** (102 callable tools plus the always-on `memory_capabilities` bootstrap), matching the `GET /api/v1/tools/list` row above:
+
+```bash
+grep -oE 'crate::mcp::[a-z_]+::[A-Za-z]+Tool' src/mcp/registry.rs | sort -u | wc -l   # 103
+```
+
+The `registered_tools()` iterator in `src/mcp/registry.rs` is the source of truth, and `Profile::full().expected_tool_count()` in `src/profile.rs` is the SSOT the registry is pinned against (`const_count_matches_full_profile`). `memory_capabilities` is counted inside the `full` families, which is why `full` is 103 and not 104.
+
+Default `--profile core` selects **7** family tools (`Profile::core().expected_tool_count()`), and `tools/list` then appends the always-on `memory_capabilities` (`profile::ALWAYS_ON_TOOLS`), so a `core` daemon advertises **8 entries on the wire**. Both numbers are correct and mean different things; cite the one you need.
+
+The v0.8.0 net-new tools were the coordination families `memory_action_*`, `memory_lease_*`, `memory_signal_*`, `memory_checkpoint_*`, and `memory_routine_*`.
 
 ## See also
 
