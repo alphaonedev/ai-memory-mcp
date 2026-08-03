@@ -2615,6 +2615,14 @@ pub fn resolve_store_url(cli_arg: Option<&str>) -> Result<Option<String>> {
 ///
 /// Call this from every ungated boot that would otherwise open SQLite after a
 /// store URL has been configured (today: [`bootstrap_serve`]).
+///
+/// # Errors
+///
+/// Returns an error when any store-URL channel resolves to a `postgres://`
+/// (or `postgresql://`) URL and this binary was built without
+/// `--features sal-postgres`. The error message redacts userinfo passwords
+/// ([#1579] A3 / obs-no-sensitive-data). Channel resolution failures from
+/// [`resolve_store_url`] / [`store_url_from_file`] are propagated unchanged.
 pub fn refuse_postgres_store_url_without_feature(cli_arg: Option<&str>) -> Result<()> {
     let Some(url) = resolve_store_url(cli_arg)? else {
         return Ok(());
@@ -2629,8 +2637,13 @@ pub fn refuse_postgres_store_url_without_feature(cli_arg: Option<&str>) -> Resul
     }
     #[cfg(not(feature = "sal-postgres"))]
     {
+        // err-lowercase-msg / err-result-over-panic / obs-no-sensitive-data
         anyhow::bail!(
-            "configured store is Postgres ({}) but this binary was built WITHOUT              --features sal-postgres. Refusing to fall back to the local SQLite              --db path — that would write agent memory to the wrong store while              looking healthy (#2679). Rebuild with `--features sal-postgres`,              or unset AI_MEMORY_STORE_URL / AI_MEMORY_STORE_URL_FILE / --store-url.",
+            "configured store is Postgres ({}) but this binary was built without \
+             --features sal-postgres; refusing to fall back to the local SQLite \
+             --db path (would write agent memory to the wrong store while looking \
+             healthy) (#2679). rebuild with `--features sal-postgres`, or unset \
+             AI_MEMORY_STORE_URL / AI_MEMORY_STORE_URL_FILE / --store-url",
             crate::logging::redact_url_password(&url),
         );
     }

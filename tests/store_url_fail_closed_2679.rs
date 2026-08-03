@@ -36,23 +36,7 @@ const PG_PASSWORD: &str = "hunter2";
 /// Spawn `ai-memory serve` with a short timeout. On success the daemon would
 /// listen forever; on the #2679 refuse path it exits non-zero quickly.
 fn serve_once(db: &Path, store_url: Option<&str>) -> std::process::Output {
-    let mut cmd = Command::new(cargo_bin("ai-memory"));
-    cmd.env("AI_MEMORY_NO_CONFIG", "1")
-        .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
-        .env_remove("AI_MEMORY_STORE_URL")
-        .env_remove("AI_MEMORY_STORE_URL_FILE")
-        .args([
-            "--db",
-            db.to_str().expect("utf-8 db path"),
-            "serve",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "0", // may not be valid — use high ephemeral
-        ]);
-    // Port 0 may be rejected by clap as invalid; use a high unused port.
-    // Override port after — rewrite args properly:
-    let _ = cmd;
+    // Fixed high port: clap rejects 0; refuse path exits before bind races matter.
     let mut cmd = Command::new(cargo_bin("ai-memory"));
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
         .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
