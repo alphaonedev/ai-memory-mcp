@@ -253,7 +253,11 @@ tempfile = "3"
 # standard for `Capabilities`-style bitmask types. `thiserror` gives
 # us the typed `StoreError` the red-team asked for on #222. All three
 # are small, pure-Rust, MIT/Apache dual-licensed.
-async-trait = { version = "0.1", optional = true }
+# #2678 — non-optional. The federation push-DLQ trait needs object-safe
+# async methods on the DEFAULT (sqlite-only) build; gating it under `sal`
+# compiled the sink out of every shipped binary while migrations still
+# created the table and metrics still advertised depth=0 as healthy.
+async-trait = "0.1"
 bitflags = { version = "2", optional = true }
 thiserror = { version = "2", optional = true }
 
@@ -286,7 +290,7 @@ sqlite-bundled = ["rusqlite/bundled"]
 sqlcipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
 # v0.7 — Storage Abstraction Layer. `sal` brings in the trait + SqliteStore
 # adapter. `sal-postgres` layers on the Postgres/pgvector backend.
-sal = ["dep:async-trait", "dep:bitflags", "dep:thiserror"]
+sal = ["dep:bitflags", "dep:thiserror"]
 sal-postgres = ["sal", "dep:sqlx", "dep:pgvector"]
 # W11/S11b — opt-in feature for tests that pull large model weights at runtime
 # (BERT cross-encoder, MiniLM, etc.). Off by default so CI doesn't download
