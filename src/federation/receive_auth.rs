@@ -833,6 +833,30 @@ pub const LANE_NAMESPACE_META: &str = "namespace_meta";
 /// [`lane_is_destructive`] must give it the destructive refusal prose.
 pub const LANE_NAMESPACE_META_CLEARS: &str = "namespace_meta_clears";
 
+/// Gate 1 — `/sync/push` `memories[]` subcollection.
+pub const LANE_MEMORIES: &str = "memories";
+
+/// Gate 1 — embeddings ride memories; no standalone apply.
+pub const LANE_EMBEDDINGS: &str = "embeddings";
+
+/// Gate 1 / #2489 — `/sync/push` `links[]` subcollection (endpoint-namespace confined).
+pub const LANE_LINKS: &str = "links";
+
+/// Gate 1 / #2489 — `/sync/push` `signals[]` subcollection (claimed-namespace confined).
+pub const LANE_SIGNALS: &str = "signals";
+
+/// Gate 1 / #2649 — `/sync/push` `action_transitions[]` (crypto + namespace).
+pub const LANE_ACTION_TRANSITIONS: &str = "action_transitions";
+
+/// Gate 1 / #2650 — `/sync/push` `checkpoints[]` (crypto + namespace).
+pub const LANE_CHECKPOINTS: &str = "checkpoints";
+
+/// Gate 1 — `/sync/push` `archives[]`.
+pub const LANE_ARCHIVES: &str = "archives";
+
+/// Gate 1 — `/sync/push` `restores[]`.
+pub const LANE_RESTORES: &str = "restores";
+
 /// Whether `lane` names a funnel whose refusal prose must describe a
 /// DESTRUCTIVE effect rather than a write.
 ///
