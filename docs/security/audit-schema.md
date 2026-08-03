@@ -26,7 +26,7 @@ NDJSON: one JSON object per line. UTF-8. No trailing whitespace.
 | `actor.agent_id` | string | yes | Resolved NHI agent_id (`ai:<client>@<host>:pid-<n>`, `host:<host>:pid-<n>-<uuid>`, etc.). |
 | `actor.scope` | string | optional | Visibility scope: `private \| team \| unit \| org \| collective`. |
 | `actor.synthesis_source` | string | yes | How `agent_id` was synthesized: `explicit \| env \| mcp_client_info \| host_fallback \| anonymous_fallback \| http_header \| http_body \| per_request \| default_fallback`. |
-| `action` | enum | yes | One of `recall \| store \| update \| delete \| link \| promote \| forget \| consolidate \| export \| import \| approve \| reject \| session_boot`. Adding a variant is non-breaking; renaming or removing one IS breaking. |
+| `action` | enum | yes | **14 values** — `recall \| store \| update \| delete \| link \| promote \| forget \| consolidate \| export \| import \| approve \| reject \| session_boot \| capture_lag`. There is **no** `search` / `list` / `get` value: those MCP tools emit `recall`. `export` and `import` are declared but have **no production emitter at v1.0.0** (reserved). `capture_lag` is the L1 capture-nag event (#1389 / #1398) and IS emitted on the wire. Adding a variant is non-breaking; renaming or removing one IS breaking. |
 | `target.memory_id` | string | yes | Memory id, or `"*"` for sweep operations. Capped at 128 chars. |
 | `target.namespace` | string | yes | Memory namespace at action time. Capped at 128 chars. |
 | `target.title` | string | optional | Memory title (advisory label, **not content**). Capped at 200 chars; control chars stripped. |
@@ -116,30 +116,41 @@ It does NOT defend against:
   immutable SIEM in real time and rely on the SIEM's tamper
   evidence. The chain is still useful here because the SIEM can
   cross-check its own ingest record against the on-host file.
-- **Truncation of the most recent N lines** (the truncation point
-  becomes the new tail and the chain is consistent up to that
-  point). Periodic `CHECKPOINT.sig` markers (cadence
-  `attestation_cadence_minutes`) bound how much history can be
-  silently discarded — a verifier with the prior checkpoint
-  signature can detect any rollback past it. v1 emits the marker
-  shape; full off-host attestation is reserved for v0.7+.
+- **Truncation of the most recent N lines.** The truncation point
+  becomes the new tail and the chain is consistent up to that point,
+  so `audit verify` reports OK. The `CHECKPOINT.sig` marker is
+  **RESERVED — no emission code exists** (`src/audit.rs`), and
+  `attestation_cadence_minutes` therefore bounds nothing; an
+  audit-enabled daemon emits a one-shot WARN saying so. The control
+  for this threat is real-time off-host shipping to an immutable
+  SIEM. (The substrate's separate in-DB `signed_events` chain *does*
+  detect its own tail truncation, via the #1850 off-table forensic
+  watermark high-water and the #1873/#2202 head-hash anchor — a
+  different subsystem with a different verifier,
+  `ai-memory verify-audit-trail`; see
+  [`audit-trail.md`](./audit-trail.html) §Threat model.)
 
 ## Compliance presets
 
 The compliance presets in `[audit.compliance.*]` are pure
 configuration. Setting `applied = true` propagates the documented
-retention / cadence values to the effective config. When multiple
-presets are active simultaneously, the **most-conservative** value
-wins (longest retention, shortest attestation cadence).
+**retention** value to the effective config. When multiple presets are
+active simultaneously, the longest retention wins.
 
-| Preset | Retention | Attestation | Notes |
-|---|---|---|---|
-| `soc2` | 730 days | 60 min | Trust Service Criteria CC7.2. |
-| `hipaa` | 2190 days (6 yrs) | — | 45 CFR §164.316(b)(2). Pair with `--features sqlcipher` for at-rest crypto. |
-| `gdpr` | 1095 days (3 yrs) | — | Reserved `pseudonymize_actors` for v0.7+. |
-| `fedramp` | 1095 days | 30 min | NIST SP 800-53 AU-11. |
+| Preset | Retention | Notes |
+|---|---|---|
+| `soc2` | 730 days | Trust Service Criteria CC7.2. |
+| `hipaa` | 2190 days (6 yrs) | 45 CFR §164.316(b)(2). Pair with `--features sqlcipher` for at-rest crypto. |
+| `gdpr` | 1095 days (3 yrs) | `pseudonymize_actors` is reserved — no implementation. |
+| `fedramp` | 1095 days | NIST SP 800-53 AU-11. |
 
-Note: the binary surfaces the **resolved** retention via
+The binary surfaces the **resolved** retention via
 `AuditConfig::effective_retention_days`; operators can verify the
 applied policy with `ai-memory doctor` (P7) or by inspecting the
 config block at runtime.
+
+**No attestation-cadence column.** The per-preset attestation cadence this
+table used to publish (SOC2 60 min, FedRAMP 30 min) is withdrawn:
+`effective_attestation_cadence_minutes` resolves a value, but no production
+code consumes it, because the `CHECKPOINT.sig` marker it would drive is
+unimplemented. It returns when the emission does.

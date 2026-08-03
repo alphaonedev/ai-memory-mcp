@@ -132,6 +132,12 @@ services:
       AI_MEMORY_STORE_URL: "postgres://ai_memory:ai_memory_test@pg-age:5432/ai_memory_test?options=-csearch_path%3Dic_alice%2Cag_catalog%2Cpublic&sslmode=disable"
       AI_MEMORY_EMBED_MODEL: "nomic-embed-text"
       AI_MEMORY_PEER_URLS: "http://ic-parity-bob:19077"
+      # #2477 — this compose fleet federates over PLAINTEXT container-hostname
+      # peers (a container bridge is NOT loopback), which the peer-scheme guard
+      # refuses by default. Acknowledged here because the bridge is a private,
+      # single-host Docker network used for parity/chaos testing only. Do NOT
+      # copy this line into a deployment whose peers cross a real network.
+      AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS: "1"
       # Operator directive 2026-05-31 (supersedes 2026-05-21 #1067 xAI
       # Grok 4.3 wiring): IronClaw containers run with OpenRouter
       # google/gemma-4-26b-a4b-it as the AI NHI brain. Cost+context
@@ -212,6 +218,12 @@ services:
       AI_MEMORY_STORE_URL: "postgres://ai_memory:ai_memory_test@pg-age:5432/ai_memory_test?options=-csearch_path%3Dic_bob%2Cag_catalog%2Cpublic&sslmode=disable"
       AI_MEMORY_EMBED_MODEL: "nomic-embed-text"
       AI_MEMORY_PEER_URLS: "http://ic-parity-alice:19077"
+      # #2477 — this compose fleet federates over PLAINTEXT container-hostname
+      # peers (a container bridge is NOT loopback), which the peer-scheme guard
+      # refuses by default. Acknowledged here because the bridge is a private,
+      # single-host Docker network used for parity/chaos testing only. Do NOT
+      # copy this line into a deployment whose peers cross a real network.
+      AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS: "1"
       # See alice's block for the 2026-05-31 OpenRouter Gemma 4 26B
       # rationale (supersedes the #1067 xAI Grok 4.3 wiring).
       AI_MEMORY_LLM_BACKEND: "openrouter"
