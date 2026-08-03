@@ -138,16 +138,36 @@ AiMemoryClient(base_url="http://localhost:9077", agent_id="ai:claude-opus-4.7@ho
 | `namespaces()` | `GET /api/v1/namespaces` | |
 | `gc()` | `POST /api/v1/gc` | |
 | `export()` / `import_()` | `GET` / `POST /api/v1/export|import` | |
-| `subscribe(req)` / `unsubscribe(id)` / `subscriptions()` | `/api/v1/subscriptions` | Webhook mgmt. |
+| `subscribe(req)` / `unsubscribe(id)` / `subscriptions()` | `POST` / `DELETE ?id=<id>` / `GET /api/v1/subscriptions` | Webhook mgmt. The delete takes the id in the QUERY STRING — the daemon registers `delete` on the collection path only. |
 | `notify(req)` / `inbox(...)` | `/api/v1/notify`, `/api/v1/inbox` | Agent-to-agent messaging. |
-| `grant(id, agent)` / `revoke(id, agent)` | `/api/v1/memories/{id}/grant|revoke` | Per-memory ACL. |
-| `cluster(req)` | `POST /api/v1/cluster` | Peer management. |
 | `agents()` / `register_agent(...)` | `/api/v1/agents` | NHI registry. |
 | `bind_agent_pubkey(id, b64)` | `PUT /api/v1/agents/{id}/pubkey` | Enroll an attestation key (admin). |
 
 `update(...)` takes an optional `expected_version=` for optimistic
 concurrency; it rides the `If-Match` header (the daemon's only version gate
 for that route) and a stale value raises `ConflictError` (409).
+
+### Removed at v1.0.0 — BREAKING
+
+`grant()`, `revoke()` and `cluster()` are gone from both `AiMemoryClient` and
+`AsyncAiMemoryClient`. They posted to `/api/v1/memories/{id}/grant`,
+`/api/v1/memories/{id}/revoke` and `/api/v1/cluster`, none of which the daemon
+registers — every call 404'd, in every release that shipped them. Replacements:
+
+- **Per-memory access control** — set `metadata.scope` (`"private"` |
+  `"collective"`) on the write, and attach a namespace governance standard for
+  policy. See `docs/governance.md`.
+- **Peer management** — federation peers are configured out of band
+  (`--quorum-peers`, the peer-attestation allowlist,
+  `AI_MEMORY_FED_INVENTORY_PATH`). The HTTP federation surface is
+  `POST /api/v1/sync/push` and `GET /api/v1/sync/since`. See
+  `docs/federation.md`.
+
+`unsubscribe(id)` now issues `DELETE /api/v1/subscriptions?id=<id>` instead of
+`DELETE /api/v1/subscriptions/{id}`. The old form matched no route, so webhook
+teardown appeared to fail safe while leaving the decommissioned endpoint
+receiving signed deliveries indefinitely. The method signature is unchanged;
+check the returned `deleted` flag.
 
 ## Webhook verification
 

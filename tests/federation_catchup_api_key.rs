@@ -125,7 +125,6 @@ fn build_cfg(peer_url: &str, api_key: Option<String>) -> FederationConfig {
         sender_agent_id: "ai:catchup-api-key-test".to_string(),
         api_key,
         signing_key: None,
-        #[cfg(feature = "sal")]
         dlq_sink: None,
     }
 }
