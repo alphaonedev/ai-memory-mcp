@@ -7528,7 +7528,6 @@ mod tests {
         assert!(!url_has_userinfo_password("sqlite:///var/lib/mem.db"));
     }
 
-
     /// #2679 — a postgres:// URL on the env channel is refused on a binary
     /// without sal-postgres (the default shipped build). sqlite:// stays ok.
     #[test]

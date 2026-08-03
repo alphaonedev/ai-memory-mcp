@@ -139,7 +139,9 @@ fn serve_refuses_postgres_store_url_env_without_creating_sqlite() {
         output.status
     );
     assert!(
-        combined.contains("#2679") || combined.contains("sal-postgres") || combined.contains("Postgres"),
+        combined.contains("#2679")
+            || combined.contains("sal-postgres")
+            || combined.contains("Postgres"),
         "refusal must name the defect: {combined}"
     );
     assert!(
@@ -204,5 +206,8 @@ fn serve_without_store_url_still_starts_sqlite_path_smoke() {
     }
     let _ = child.kill();
     let _ = child.wait();
-    assert!(booted, "legitimate sqlite serve must create --db (#2679 over-refuse guard)");
+    assert!(
+        booted,
+        "legitimate sqlite serve must create --db (#2679 over-refuse guard)"
+    );
 }
