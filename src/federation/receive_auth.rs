@@ -1668,6 +1668,75 @@ mod tests {
         );
     }
 
+    /// #2649 / #2650 — crypto lanes must share the same Layer-1 namespace choke
+    /// as memories (authentication is not authorization). Pins the lane tokens
+    /// the receive loop passes so a rename cannot silently drop confinement.
+    #[test]
+    fn inbound_write_namespace_refuses_crypto_lanes_out_of_scope_2649_2650() {
+        use crate::federation::peer_attestation::{PeerAttestationConfig, PeerScope};
+
+        let mut scoped = PeerAttestationConfig::default();
+        scoped.peers.insert(
+            "peer-1".to_string(),
+            PeerScope {
+                allowed_sender_agent_ids: vec![],
+                allowed_namespaces: vec!["public/*".to_string()],
+            },
+        );
+
+        // #2649 — action_transitions subject is the **stored** action namespace.
+        assert!(
+            inbound_write_namespace_authorized(
+                LANE_ACTION_TRANSITIONS,
+                "act-1",
+                "public/ok",
+                Some("public/ok"),
+                &scoped,
+                Some("peer-1"),
+                true,
+            ),
+            "in-scope stored action namespace accepted"
+        );
+        assert!(
+            !inbound_write_namespace_authorized(
+                LANE_ACTION_TRANSITIONS,
+                "act-1",
+                "secure/ops",
+                Some("secure/ops"),
+                &scoped,
+                Some("peer-1"),
+                true,
+            ),
+            "#2649: out-of-scope stored action namespace refused"
+        );
+
+        // #2650 — checkpoints subject is the wire-claimed freeze-anchor ns.
+        assert!(
+            inbound_write_namespace_authorized(
+                LANE_CHECKPOINTS,
+                "cp-1",
+                "public/ok",
+                None,
+                &scoped,
+                Some("peer-1"),
+                true,
+            ),
+            "in-scope checkpoint namespace accepted"
+        );
+        assert!(
+            !inbound_write_namespace_authorized(
+                LANE_CHECKPOINTS,
+                "cp-1",
+                "secure/ops",
+                None,
+                &scoped,
+                Some("peer-1"),
+                true,
+            ),
+            "#2650: out-of-scope checkpoint namespace refused"
+        );
+    }
+
     /// #2488 — the by-id verdict's `Option<&str>` contract, exercised without
     /// any HTTP/DB plumbing. The `None` arms are the whole point of the type
     /// change: one must reach Layer 2 (the shape whose gate #2488 skipped), the
