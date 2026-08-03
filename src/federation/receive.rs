@@ -44,6 +44,33 @@ fn log_catchup_sync_state_observe_failed(peer_id: &str, e: impl std::fmt::Displa
     tracing::warn!("catchup: sync_state_observe failed for {peer_id}: {e}");
 }
 
+/// Gate 1 / #2480 — may this catchup-pulled memory be applied from `peer_id`?
+///
+/// Admin `CallerContext` bypasses SAL *visibility* so the peer snapshot can
+/// round-trip; it must **not** bypass `AI_MEMORY_FED_PEER_ATTESTATION` namespace
+/// scope. Accept-scope reuses the same operator-authored `allowed_namespaces`
+/// as push (bidirectional decision: one list, both directions). Shared choke
+/// with `/sync/push` `memories[]` so dispositions cannot fork.
+///
+/// Zero-config (`!has_allowlist`) short-circuits inside the helper to true.
+#[must_use]
+fn catchup_memory_namespace_authorized(
+    attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
+    require_push_ns_scope: bool,
+    peer_id: &str,
+    mem: &crate::models::Memory,
+) -> bool {
+    crate::federation::receive_auth::inbound_write_namespace_authorized(
+        crate::federation::receive_auth::LANE_MEMORIES,
+        &mem.id,
+        &mem.namespace,
+        None,
+        attest_cfg,
+        Some(peer_id),
+        require_push_ns_scope,
+    )
+}
+
 /// #2290 — sign an outbound `/sync/since` catch-up GET so an ENROLLED peer
 /// accepts the pull under the default `AI_MEMORY_FED_REQUIRE_SIG=1` posture.
 ///
@@ -330,6 +357,10 @@ pub(super) async fn catchup_once_with_store(
         // #1687 — once an apply fails, stop advancing the catchup watermark so
         // sync_state never moves past an un-persisted row.
         let mut catchup_halted = false;
+        // #2480 — load peer-attestation once per peer tick (not per row).
+        let attest_cfg = crate::federation::peer_attestation::PeerAttestationConfig::from_env();
+        let require_push_ns_scope =
+            crate::federation::receive_auth::require_push_namespace_scope_enabled();
 
         // v0.7.0 M3 — when a SAL store handle is supplied (postgres-
         // backed daemons) we dispatch each row through
@@ -357,27 +388,13 @@ pub(super) async fn catchup_once_with_store(
                 if crate::validate::validate_memory(&mem).is_err() {
                     continue;
                 }
-                // Gate 1 / #2480 — pull path confinement. Admin CallerContext
-                // bypasses SAL *visibility* (metadata.scope) so the full peer
-                // snapshot can round-trip; it must NOT bypass *namespace scope*
-                // from AI_MEMORY_FED_PEER_ATTESTATION. Without this choke, an
-                // enrolled-but-untrusted peer can inject rows into any namespace
-                // via catchup even when push is confined. Same shared helper as
-                // /sync/push memories[].
-                {
-                    let attest_cfg =
-                        crate::federation::peer_attestation::PeerAttestationConfig::from_env();
-                    if !crate::federation::receive_auth::inbound_write_namespace_authorized(
-                        crate::federation::receive_auth::LANE_MEMORIES,
-                        &mem.id,
-                        &mem.namespace,
-                        None,
-                        &attest_cfg,
-                        Some(peer.id.as_str()),
-                        crate::federation::receive_auth::require_push_namespace_scope_enabled(),
-                    ) {
-                        continue;
-                    }
+                if !catchup_memory_namespace_authorized(
+                    &attest_cfg,
+                    require_push_ns_scope,
+                    peer.id.as_str(),
+                    &mem,
+                ) {
+                    continue;
                 }
                 // #1687 — advance the catchup watermark ONLY for rows that
                 // durably applied, halting at the first failure, so sync_state
@@ -417,21 +434,13 @@ pub(super) async fn catchup_once_with_store(
                 if crate::validate::validate_memory(&mem).is_err() {
                     continue;
                 }
-                // Gate 1 / #2480 — pull path confinement (legacy sqlite apply).
-                {
-                    let attest_cfg =
-                        crate::federation::peer_attestation::PeerAttestationConfig::from_env();
-                    if !crate::federation::receive_auth::inbound_write_namespace_authorized(
-                        crate::federation::receive_auth::LANE_MEMORIES,
-                        &mem.id,
-                        &mem.namespace,
-                        None,
-                        &attest_cfg,
-                        Some(peer.id.as_str()),
-                        crate::federation::receive_auth::require_push_namespace_scope_enabled(),
-                    ) {
-                        continue;
-                    }
+                if !catchup_memory_namespace_authorized(
+                    &attest_cfg,
+                    require_push_ns_scope,
+                    peer.id.as_str(),
+                    &mem,
+                ) {
+                    continue;
                 }
                 // #1687 — advance the catchup watermark only on a successful
                 // insert and halt at the first failure (see the SAL branch).
@@ -544,6 +553,10 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
         // #1687 — once an apply fails, stop advancing the catchup watermark so
         // sync_state never moves past an un-persisted row.
         let mut catchup_halted = false;
+        // #2480 — load peer-attestation once per peer tick (not per row).
+        let attest_cfg = crate::federation::peer_attestation::PeerAttestationConfig::from_env();
+        let require_push_ns_scope =
+            crate::federation::receive_auth::require_push_namespace_scope_enabled();
         {
             let lock = db.lock().await;
             for raw in &memories {
@@ -557,21 +570,13 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
                 if crate::validate::validate_memory(&mem).is_err() {
                     continue;
                 }
-                // Gate 1 / #2480 — pull path confinement (legacy sqlite apply).
-                {
-                    let attest_cfg =
-                        crate::federation::peer_attestation::PeerAttestationConfig::from_env();
-                    if !crate::federation::receive_auth::inbound_write_namespace_authorized(
-                        crate::federation::receive_auth::LANE_MEMORIES,
-                        &mem.id,
-                        &mem.namespace,
-                        None,
-                        &attest_cfg,
-                        Some(peer.id.as_str()),
-                        crate::federation::receive_auth::require_push_namespace_scope_enabled(),
-                    ) {
-                        continue;
-                    }
+                if !catchup_memory_namespace_authorized(
+                    &attest_cfg,
+                    require_push_ns_scope,
+                    peer.id.as_str(),
+                    &mem,
+                ) {
+                    continue;
                 }
                 // #1687 — advance the catchup watermark only on a successful
                 // insert and halt at the first failure (see the SAL branch).
@@ -705,6 +710,55 @@ pub(super) fn urlencoding_encode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod issue_2480_tests {
+    //! #2480 — catchup PULL must refuse out-of-scope namespaces under enrolled
+    //! allowlist (admin visibility bypass is not a namespace-scope bypass).
+    use super::catchup_memory_namespace_authorized;
+    use crate::federation::peer_attestation::{PeerAttestationConfig, PeerScope};
+    use crate::models::Memory;
+
+    fn mem(ns: &str) -> Memory {
+        Memory {
+            id: "m-2480".to_string(),
+            namespace: ns.to_string(),
+            title: "t".to_string(),
+            content: "c".to_string(),
+            created_at: "2026-08-03T00:00:00Z".to_string(),
+            ..Memory::default()
+        }
+    }
+
+    #[test]
+    fn zero_config_accepts_any_namespace_2480() {
+        let cfg = PeerAttestationConfig::default();
+        assert!(
+            catchup_memory_namespace_authorized(&cfg, true, "peer-1", &mem("secure/ops")),
+            "zero-config must stay byte-identical faith pull"
+        );
+    }
+
+    #[test]
+    fn enrolled_scoped_peer_refuses_out_of_scope_pull_2480() {
+        let mut cfg = PeerAttestationConfig::default();
+        cfg.peers.insert(
+            "peer-1".to_string(),
+            PeerScope {
+                allowed_sender_agent_ids: vec![],
+                allowed_namespaces: vec!["public/*".to_string()],
+            },
+        );
+        assert!(
+            catchup_memory_namespace_authorized(&cfg, true, "peer-1", &mem("public/ok")),
+            "in-scope pull accepted"
+        );
+        assert!(
+            !catchup_memory_namespace_authorized(&cfg, true, "peer-1", &mem("secure/ops")),
+            "#2480: out-of-scope catchup row must be refused"
+        );
+    }
 }
 
 #[cfg(test)]
