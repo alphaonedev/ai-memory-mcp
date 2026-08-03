@@ -833,6 +833,12 @@ pub const LANE_NAMESPACE_META: &str = "namespace_meta";
 /// [`lane_is_destructive`] must give it the destructive refusal prose.
 pub const LANE_NAMESPACE_META_CLEARS: &str = "namespace_meta_clears";
 
+/// Gate 1 — `/sync/push` `memories[]` subcollection.
+pub const LANE_MEMORIES: &str = "memories";
+
+/// Gate 1 — embeddings ride memories; no standalone apply.
+pub const LANE_EMBEDDINGS: &str = "embeddings";
+
 /// Gate 1 / #2489 — `/sync/push` `links[]` subcollection (endpoint-namespace confined).
 pub const LANE_LINKS: &str = "links";
 
