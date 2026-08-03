@@ -357,6 +357,28 @@ pub(super) async fn catchup_once_with_store(
                 if crate::validate::validate_memory(&mem).is_err() {
                     continue;
                 }
+                // Gate 1 / #2480 — pull path confinement. Admin CallerContext
+                // bypasses SAL *visibility* (metadata.scope) so the full peer
+                // snapshot can round-trip; it must NOT bypass *namespace scope*
+                // from AI_MEMORY_FED_PEER_ATTESTATION. Without this choke, an
+                // enrolled-but-untrusted peer can inject rows into any namespace
+                // via catchup even when push is confined. Same shared helper as
+                // /sync/push memories[].
+                {
+                    let attest_cfg =
+                        crate::federation::peer_attestation::PeerAttestationConfig::from_env();
+                    if !crate::federation::receive_auth::inbound_write_namespace_authorized(
+                        crate::federation::receive_auth::LANE_MEMORIES,
+                        &mem.id,
+                        &mem.namespace,
+                        None,
+                        &attest_cfg,
+                        Some(peer.id.as_str()),
+                        crate::federation::receive_auth::require_push_namespace_scope_enabled(),
+                    ) {
+                        continue;
+                    }
+                }
                 // #1687 — advance the catchup watermark ONLY for rows that
                 // durably applied, halting at the first failure, so sync_state
                 // never moves past an un-persisted row (which would silently
@@ -394,6 +416,22 @@ pub(super) async fn catchup_once_with_store(
                 };
                 if crate::validate::validate_memory(&mem).is_err() {
                     continue;
+                }
+                // Gate 1 / #2480 — pull path confinement (legacy sqlite apply).
+                {
+                    let attest_cfg =
+                        crate::federation::peer_attestation::PeerAttestationConfig::from_env();
+                    if !crate::federation::receive_auth::inbound_write_namespace_authorized(
+                        crate::federation::receive_auth::LANE_MEMORIES,
+                        &mem.id,
+                        &mem.namespace,
+                        None,
+                        &attest_cfg,
+                        Some(peer.id.as_str()),
+                        crate::federation::receive_auth::require_push_namespace_scope_enabled(),
+                    ) {
+                        continue;
+                    }
                 }
                 // #1687 — advance the catchup watermark only on a successful
                 // insert and halt at the first failure (see the SAL branch).
@@ -518,6 +556,22 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
                 };
                 if crate::validate::validate_memory(&mem).is_err() {
                     continue;
+                }
+                // Gate 1 / #2480 — pull path confinement (legacy sqlite apply).
+                {
+                    let attest_cfg =
+                        crate::federation::peer_attestation::PeerAttestationConfig::from_env();
+                    if !crate::federation::receive_auth::inbound_write_namespace_authorized(
+                        crate::federation::receive_auth::LANE_MEMORIES,
+                        &mem.id,
+                        &mem.namespace,
+                        None,
+                        &attest_cfg,
+                        Some(peer.id.as_str()),
+                        crate::federation::receive_auth::require_push_namespace_scope_enabled(),
+                    ) {
+                        continue;
+                    }
                 }
                 // #1687 — advance the catchup watermark only on a successful
                 // insert and halt at the first failure (see the SAL branch).
