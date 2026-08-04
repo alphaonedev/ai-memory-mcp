@@ -779,6 +779,21 @@ async fn replay_ack_leaves_row_pending_when_snapshot_is_stale_2360() {
         async fn reset_throttled_quarantine(&self) -> Result<u64, String> {
             Ok(0)
         }
+        /// #2446 — never exercised here (this sink models the store-lane
+        /// mark-vs-refresh race, not an erasure sentinel). `Contended` is
+        /// the no-op-and-retry outcome, so the stub can never silently
+        /// claim a fan-out that did not happen.
+        async fn expand_erasure_sentinel(
+            &self,
+            _row_id: i64,
+            _expected: i32,
+            _memory_id: &str,
+            _peer_ids: &[String],
+            _payload: &serde_json::Value,
+            _last_error: &str,
+        ) -> Result<ai_memory::federation::SentinelExpansion, String> {
+            Ok(ai_memory::federation::SentinelExpansion::Contended)
+        }
     }
 
     let peer = PeerState {

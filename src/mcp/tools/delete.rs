@@ -235,6 +235,17 @@ pub(super) fn handle_delete(
 
     let deleted = db::delete(conn, &target.id).map_err(|e| e.to_string())?;
     if deleted {
+        // v1.0.0 #2446 — queue the erasure for federated fan-out. The MCP
+        // surface never constructs a `FederationConfig` (it is HTTP-`serve`
+        // only), so a local delete used to leave every replica holding the
+        // row. Best-effort + infallible: an outbox failure NEVER converts
+        // this previously-local, always-succeeding operation into an error,
+        // and an unfederated deployment writes nothing at all.
+        crate::federation::erasure_outbox::enqueue_erasure(
+            conn,
+            &target.id,
+            crate::federation::erasure_outbox::surfaces::MCP_DELETE,
+        );
         if let Some(idx) = vector_index {
             idx.remove(&target.id);
         }
