@@ -1,12 +1,13 @@
 # Ready-to-tag certification note — ai-memory v1.0.0
 
 **Status:** READY-TO-TAG (operator-gated)  
-**Tip SHA (cut target):** `b95ad9780585e6a7354f9ae994e0d95829913567` — first tip that **includes this cert note**.  
-**Also valid to cut:** any later `release/v1.0.0` tip that is a **descendant of `b95ad978`** and still contains this file (e.g. tip-alignment edits).  
+**Recommended cut tip (current):** `52fcff95b2d27e7a9a297593e3a10b458f69435f` — includes Gate1 residual closes (#2529/#2536/#2532) + release/Docker `--features sal` assert (#2700).  
+**First cert-note tip:** `b95ad9780585e6a7354f9ae994e0d95829913567` — first tip that **includes this cert note**.  
+**Also valid to cut:** any `release/v1.0.0` tip that is a **descendant of `b95ad978`** and still contains this file.  
 **Do not cut:** `d742f331` — measure-binary parent; **omits** this cert note.  
 **Measure binary (Gate3):** `d742f331` (asserted `sal-postgres` build).  
 **Branch:** `release/v1.0.0`  
-**Date:** 2026-08-04T01:50:00Z  
+**Date:** 2026-08-04 (tip-aligned)  
 **Epic:** [#2682](https://github.com/alphaonedev/ai-memory-mcp/issues/2682)  
 **Authority:** AI NHI 100% engineering; **operator only** for tag cut + publish
 
@@ -28,7 +29,9 @@
 | #2685 | Gate1 pull #2480 |
 | #2655 → #2656 → #2668 → #2659 | Claims train (2659 last) |
 | #2686 | Feature self-report |
-| #2687 | Ready-to-tag cert note (tip becomes `b95ad978`) |
+| #2687 | Ready-to-tag cert note (first tip `b95ad978`) |
+| #2694 / #2696 / #2698 | Gate1 residuals #2529 / #2536 / #2532 |
+| #2700 | Release/Docker ship `--features sal` + assert |
 
 ## Explicit residual list (must appear on any tag checklist)
 
@@ -53,7 +56,7 @@
 
 1. Review this note + residual list  
 2. Optionally land residual security issues or accept as post-tag  
-3. **Cut** `v1.0.0` on tip **`b95ad978` or any descendant on `release/v1.0.0` that still contains this document** — **never** on `d742f331`  
+3. **Cut** `v1.0.0` on recommended tip **`52fcff95`** (or any later descendant that still contains this document; minimum ancestor `b95ad978`) — **never** on `d742f331`  
 4. **Dispatch** publish workflows  
 5. Agents **must not** create tags or dispatch release/publish
 
@@ -61,14 +64,19 @@
 
 ```bash
 git fetch origin && git log -1 --oneline origin/release/v1.0.0
-# tip must be b95ad978 or a descendant that includes this file (never cut d742f331)
+# recommended: 52fcff95 or descendant; must include this file (never cut d742f331)
 git merge-base --is-ancestor b95ad978 origin/release/v1.0.0 && echo "cert-note tip is ancestor of HEAD: OK"
+git merge-base --is-ancestor 52fcff95 origin/release/v1.0.0 && echo "recommended cut tip is ancestor of HEAD: OK"
 git tag -l 'v1.0.0*'   # expect empty until operator cuts
-cargo build --release --features sal-postgres
+# release channel (GHCR/deb/tarball):
+cargo build --release --features sal
 ./target/release/ai-memory features
-# expect features list to include sal-postgres (and sal, sqlite-bundled on default+sal-postgres builds)
+scripts/assert-compiled-features.sh ./target/release/ai-memory --require sqlite-bundled --require sal
+# Gate3 PG measure path (optional reproduce):
+cargo build --release --features sal-postgres
 scripts/assert-compiled-features.sh ./target/release/ai-memory --require sal-postgres
 ```
 
 ## Dual-checkpoint
 ai-memory namespace `ai-memory` tags `checkpoint,epic-pointer,rolling` updated through this beat.
+Engineering campaign complete for ready-to-tag; operator owns tag cut + publish.
