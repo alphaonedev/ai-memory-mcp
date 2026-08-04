@@ -14,7 +14,7 @@
 
 | Gate | Status | Evidence |
 |------|--------|----------|
-| **1 Structural confinement** | PASS with residuals | `push_lanes` exhaustiveness + shared `inbound_*`; links/signals/crypto lanes; pull path #2480 via #2685 `a9b77b24` |
+| **1 Structural confinement** | PASS | `push_lanes` exhaustiveness + shared `inbound_*`; links/signals/crypto lanes; pull path #2480 via #2685 `a9b77b24`; residuals #2529/#2536/#2532 closed (#2694/#2696/#2698) |
 | **2 Claims** | PASS | Merge order **#2655 → #2656 → #2668 → #2659 LAST** (… `f95d889e`) |
 | **Packaging #2676** | PASS with residual | #2686 `d742f331` — `ai-memory features` + `assert-compiled-features.sh` |
 | **3 Measured evidence** | PASS | DO do-perf: asserted sal-postgres binary @ `d742f331`; PG18+AGE+pgvector; hostssl cleartext REFUSED; TLS1.3 verify-full; 20 stores; droplets torn down |
@@ -33,11 +33,11 @@
 ## Explicit residual list (must appear on any tag checklist)
 
 ### Gate1 confinement residuals (open issues)
-1. **#2532** — federated REJECT of foreign-namespace pending is unauthorized veto (deliberately ungated by #2478; availability/DoS class — real fix needs disposition design, not a namespace refuse)
+**None remaining.** All tracked Gate1 confinement residuals closed this train:
 
-Closed this train:
 - **#2529** via #2694 (`88bf2bcf`) — refuse wire non-pending + local terminal; upsert never overwrites decision cols
 - **#2536** via #2696 (`5b0dbb8c`) — namespace_meta requires descendant tree-coverage probe
+- **#2532** via #2698 (`1c12c988`) — REJECT namespace-confined same as APPROVE (closes unauthorized foreign veto)
 
 ### Packaging / release-channel residual
 5. **Release.yml / Dockerfile default feature set** may still omit `sal` / `sal-postgres` — certification measured an **asserted** feature build; operators must not tag without verifying release artifact features via `ai-memory features` / assert script.
