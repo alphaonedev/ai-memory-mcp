@@ -33,10 +33,11 @@
 ## Explicit residual list (must appear on any tag checklist)
 
 ### Gate1 confinement residuals (open issues)
-1. **#2536** — federated `namespace_meta` at in-scope ancestor can set governance default of out-of-scope descendants  
-2. **#2532** — federated REJECT of foreign-namespace pending is unauthorized veto (deliberately ungated by #2478)  
+1. **#2532** — federated REJECT of foreign-namespace pending is unauthorized veto (deliberately ungated by #2478; availability/DoS class — real fix needs disposition design, not a namespace refuse)
 
-Closed this train: **#2529** via #2694 (`88bf2bcf`) — refuse wire non-pending + local terminal; upsert never overwrites decision cols.
+Closed this train:
+- **#2529** via #2694 (`88bf2bcf`) — refuse wire non-pending + local terminal; upsert never overwrites decision cols
+- **#2536** via #2696 (`5b0dbb8c`) — namespace_meta requires descendant tree-coverage probe
 
 ### Packaging / release-channel residual
 5. **Release.yml / Dockerfile default feature set** may still omit `sal` / `sal-postgres` — certification measured an **asserted** feature build; operators must not tag without verifying release artifact features via `ai-memory features` / assert script.
