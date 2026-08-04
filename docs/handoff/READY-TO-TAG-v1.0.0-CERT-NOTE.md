@@ -42,7 +42,8 @@
 5. **Release.yml / Dockerfile default feature set** may still omit `sal` / `sal-postgres` — certification measured an **asserted** feature build; operators must not tag without verifying release artifact features via `ai-memory features` / assert script.
 
 ### Capacity / follow-on (not gate-blocking for this cert claim set)
-6. Open capacity PRs may remain: #2643, #2644, #2662, #2663, #2673 (security/data integrity capacity — land as capacity allows; not required to assert “ready-to-tag under residual list” if residual list is honest).
+6. **Landed capacity (tip `3bd01c32` and ancestors):** #2643 (`8aa83e6f`, closes #2538/#2633); #2689 signed re-land of #2644 bulk funnel (`9136b5a3`, closes #2550–#2552/#2588/#2594); #2662 delete-lane DLQ (`3bd01c32`, closes #2498).  
+   **Still open (optional before cut):** #2663 (`/sync/since` cursor), #2673 (erasure outbox). Not required to assert ready-to-tag if this residual list is honest.
 
 ### Scale claim residual
 7. **No 1M+ agent scale certification**; modular 500–1000 claim envelope only as previously published after claims corrections.
