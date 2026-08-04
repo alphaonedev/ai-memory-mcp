@@ -198,43 +198,104 @@ impl PeerAttestationConfig {
 
     /// Load the allowlist from the [`PEER_ATTESTATION_ENV`] env var.
     ///
-    /// - **Missing / empty env** → zero-config (`has_allowlist() == false`).
+    /// - **Unset env** ([`VarError::NotPresent`](std::env::VarError::NotPresent))
+    ///   → zero-config (`has_allowlist() == false`). This is the ONLY
+    ///   zero-config path.
+    /// - **Present but empty / whitespace-only** → documented-intentional
+    ///   zero-config (F-2), with a one-shot WARN distinguishing it from a
+    ///   genuine unset (the realistic producer is an unexpanded
+    ///   `AI_MEMORY_FED_PEER_ATTESTATION="${FED_PEERS}"` shell reference).
     /// - **Valid JSON** (including `{}`) → configured posture (`has_allowlist()
     ///   == true`); empty peer map fails closed for enrollment.
     /// - **Parse error / unknown fields** → configured-broken (#2504): peers
     ///   empty but `has_allowlist() == true` so destructive lanes do **not**
     ///   degrade to faith-based replication. WARN states the real per-lane
     ///   consequence (delete is NOT default-deny under the old fallback).
+    /// - **Present but not valid UTF-8**
+    ///   ([`VarError::NotUnicode`](std::env::VarError::NotUnicode)) →
+    ///   configured-broken (#2722), identical posture to a parse error. On
+    ///   Linux env values are arbitrary bytes, so a mis-encoded (e.g. Latin-1)
+    ///   `EnvironmentFile` reaches the daemon here; it MUST fail closed, not
+    ///   silently disable the allowlist by falling through to zero-config.
+    ///
+    /// The `Err` arms are matched EXHAUSTIVELY (not via a catch-all `_`) so a
+    /// future [`std::env::VarError`] variant is a compile error rather than a
+    /// silent fall-through to zero-config (rust-skills `pat-exhaustive-enum`).
     #[must_use]
     pub fn from_env() -> Self {
         match std::env::var(PEER_ATTESTATION_ENV) {
-            Ok(s) if !s.trim().is_empty() => {
-                match serde_json::from_str::<HashMap<String, PeerScope>>(&s) {
-                    Ok(peers) => Self {
-                        peers,
-                        env_present: true,
-                    },
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "federation::peer_attestation",
-                            env = PEER_ATTESTATION_ENV,
-                            error = %e,
-                            "failed to parse peer-attestation env var as JSON — \
-                             treating as CONFIGURED-BROKEN (#2504): confinement \
-                             gates stay ON with an empty peer map (unenrolled \
-                             peers refused; federated DELETE is NOT wide-open). \
-                             Fix the JSON (or remove the env var for genuine \
-                             zero-config faith replication). deny_unknown_fields \
-                             is enabled on PeerScope — typo'd keys fail here too."
-                        );
-                        Self {
-                            peers: HashMap::new(),
-                            env_present: true,
-                        }
-                    }
-                }
+            // Present, non-empty value — valid JSON, `{}`, or a parse error
+            // routed to the CONFIGURED-BROKEN posture (#2504).
+            Ok(s) if !s.trim().is_empty() => Self::from_present_value(&s),
+            // Present but empty / whitespace-only — documented-intentional
+            // zero-config (F-2). Emit ONE informational WARN (deduped so a
+            // per-request `from_env` — `federation_receive.rs` — does not
+            // spam it) then fall through to zero-config.
+            Ok(_) => {
+                warn_present_but_empty_once();
+                Self::default()
             }
-            _ => Self::default(),
+            // #2722 — `std::env::var` returns `NotUnicode` when the variable
+            // IS PRESENT but not valid UTF-8 (Linux env values are arbitrary
+            // bytes). Route it into the SAME CONFIGURED-BROKEN branch as a
+            // JSON parse error so a mis-encoded `EnvironmentFile` fails closed
+            // (unenrolled peers refused; federated DELETE not wide-open)
+            // instead of silently disabling the allowlist.
+            Err(std::env::VarError::NotUnicode(_)) => {
+                tracing::warn!(
+                    target: "federation::peer_attestation",
+                    env = PEER_ATTESTATION_ENV,
+                    "peer-attestation env var is present but NOT valid UTF-8 \
+                     — treating as CONFIGURED-BROKEN (#2722): confinement \
+                     gates stay ON with an empty peer map (unenrolled peers \
+                     refused; federated DELETE is NOT wide-open). Linux env \
+                     values are arbitrary bytes — a mis-encoded (e.g. Latin-1) \
+                     EnvironmentFile lands here. Fix the value's encoding (or \
+                     remove the env var for genuine zero-config faith \
+                     replication)."
+                );
+                Self::configured_broken()
+            }
+            // The ONLY zero-config path: the variable is genuinely unset.
+            Err(std::env::VarError::NotPresent) => Self::default(),
+        }
+    }
+
+    /// Parse a present, non-empty env value into a config. Valid JSON
+    /// (including `{}`) yields the configured posture; a parse error / unknown
+    /// field yields the CONFIGURED-BROKEN posture (#2504).
+    fn from_present_value(s: &str) -> Self {
+        match serde_json::from_str::<HashMap<String, PeerScope>>(s) {
+            Ok(peers) => Self {
+                peers,
+                env_present: true,
+            },
+            Err(e) => {
+                tracing::warn!(
+                    target: "federation::peer_attestation",
+                    env = PEER_ATTESTATION_ENV,
+                    error = %e,
+                    "failed to parse peer-attestation env var as JSON — \
+                     treating as CONFIGURED-BROKEN (#2504): confinement \
+                     gates stay ON with an empty peer map (unenrolled \
+                     peers refused; federated DELETE is NOT wide-open). \
+                     Fix the JSON (or remove the env var for genuine \
+                     zero-config faith replication). deny_unknown_fields \
+                     is enabled on PeerScope — typo'd keys fail here too."
+                );
+                Self::configured_broken()
+            }
+        }
+    }
+
+    /// #2504 / #2722 — env was present but yielded no usable peer map (parse
+    /// error, unknown field, or non-UTF-8 bytes). `has_allowlist()` stays
+    /// true with an empty peer map so destructive inbound lanes fail closed
+    /// rather than degrading to "trust everyone".
+    fn configured_broken() -> Self {
+        Self {
+            peers: HashMap::new(),
+            env_present: true,
         }
     }
 
@@ -264,6 +325,31 @@ impl PeerAttestationConfig {
     pub fn is_configured_empty(&self) -> bool {
         self.env_present && self.peers.is_empty()
     }
+}
+
+/// Emit the "present but empty" zero-config WARN at most once per process.
+///
+/// F-2 — `from_env` is called per inbound push (`federation_receive.rs`), so a
+/// naive `tracing::warn!` would fire on every request; the [`std::sync::Once`]
+/// guard collapses it to a single informational line. The present-but-empty
+/// case is documented-intentional zero-config, so — unlike the CONFIGURED-BROKEN
+/// security WARNs (parse error / #2722 non-UTF-8), which stay per-call to keep
+/// the misconfiguration loud — this benign notice is deduped.
+fn warn_present_but_empty_once() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            target: "federation::peer_attestation",
+            env = PEER_ATTESTATION_ENV,
+            "peer-attestation env var is present but empty / whitespace-only \
+             — treating as ZERO-CONFIG faith-based replication \
+             (has_allowlist() == false). If you meant to enrol peers, the \
+             value is likely an unexpanded shell reference (e.g. \
+             AI_MEMORY_FED_PEER_ATTESTATION=\"${{FED_PEERS}}\" with FED_PEERS \
+             unset): set it to the JSON allowlist, or remove it entirely to \
+             silence this notice."
+        );
+    });
 }
 
 /// Whether the operator has explicitly opted out of #238 attestation
@@ -715,6 +801,90 @@ mod tests {
         assert!(
             !namespace_allowed(Some("stranger"), "secure/ops", &cfg),
             "#2504: under parse-error posture no peer may pull/delete out-of-map"
+        );
+    }
+
+    #[test]
+    fn from_env_present_but_empty_is_zero_config_f2() {
+        // F-2 — a present-but-empty value (the realistic
+        // `AI_MEMORY_FED_PEER_ATTESTATION="${FED_PEERS}"`-with-FED_PEERS-unset
+        // producer) is documented-intentional zero-config: it must NOT flip
+        // into the configured-broken posture, so `has_allowlist()` stays false
+        // and the handlers keep faith-based replication.
+        let _g = lock_env();
+        unsafe { std::env::set_var(PEER_ATTESTATION_ENV, "   ") };
+        let cfg = PeerAttestationConfig::from_env();
+        unsafe { std::env::remove_var(PEER_ATTESTATION_ENV) };
+        assert!(cfg.peers.is_empty());
+        assert!(
+            !cfg.has_allowlist(),
+            "F-2: present-but-empty env is zero-config, has_allowlist()=false"
+        );
+        assert!(!cfg.is_configured_empty());
+    }
+
+    // #2722 — `std::env::var` returns `Err(VarError::NotUnicode(_))` when the
+    // variable IS PRESENT but not valid UTF-8. On Linux env values are
+    // arbitrary bytes, so a mis-encoded (e.g. Latin-1) EnvironmentFile with a
+    // single non-ASCII byte reaches the daemon here. Before the fix that
+    // landed in the `_` arm alongside `NotPresent` and silently disabled the
+    // allowlist (env_present=false → federated-delete confinement OFF, TOFU
+    // OFF, faith-based attribution ON) — quieter than the parse-error case
+    // #2504 was written to fix. The fix routes it to CONFIGURED-BROKEN.
+    #[cfg(unix)]
+    #[test]
+    fn from_env_non_utf8_is_configured_broken_2722() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let _g = lock_env();
+        // 0xFF is never a valid UTF-8 byte on its own, so this OsStr is a
+        // present-but-non-UTF-8 value → VarError::NotUnicode from `env::var`.
+        let non_utf8 = OsStr::from_bytes(&[b'{', 0xFF, b'}']);
+        unsafe { std::env::set_var(PEER_ATTESTATION_ENV, non_utf8) };
+        // Guard the invariant this test relies on: the value really is
+        // non-UTF-8 (so `env::var` yields NotUnicode, not Ok).
+        assert!(
+            matches!(
+                std::env::var(PEER_ATTESTATION_ENV),
+                Err(std::env::VarError::NotUnicode(_))
+            ),
+            "#2722 fixture must be present-but-non-UTF-8 (VarError::NotUnicode)"
+        );
+        let cfg = PeerAttestationConfig::from_env();
+        unsafe { std::env::remove_var(PEER_ATTESTATION_ENV) };
+        assert!(cfg.peers.is_empty(), "#2722: non-UTF-8 yields no peer rows");
+        assert!(
+            cfg.has_allowlist(),
+            "#2722: non-UTF-8 env MUST fail closed (has_allowlist()=true), \
+             NOT silently degrade to zero-config"
+        );
+        assert!(
+            cfg.is_configured_empty(),
+            "#2722: non-UTF-8 env is the configured-broken (env_present) posture"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_env_refuses_out_of_map_peer_2722() {
+        // The security-relevant consequence: under the non-UTF-8
+        // configured-broken posture, the delete/pull lanes must refuse a
+        // peer that is not in the (empty) map — NOT fall through to the
+        // pre-#2504 faith-based allow.
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let _g = lock_env();
+        unsafe { std::env::remove_var(SYNC_TRUST_PEER_ENV) };
+        let non_utf8 = OsStr::from_bytes(&[0xFE, 0xFF]);
+        unsafe { std::env::set_var(PEER_ATTESTATION_ENV, non_utf8) };
+        let cfg = PeerAttestationConfig::from_env();
+        unsafe { std::env::remove_var(PEER_ATTESTATION_ENV) };
+        assert!(
+            !namespace_allowed(Some("stranger"), "secure/ops", &cfg),
+            "#2722: under non-UTF-8 configured-broken posture no peer may \
+             pull/delete out-of-map"
         );
     }
 }
