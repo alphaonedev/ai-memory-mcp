@@ -726,6 +726,94 @@ pub(super) async fn sync_push_via_store(
             noop += 1;
             continue;
         }
+        // #2711 (CWE-284, CB-7) — namespace confinement for links[] on the
+        // POSTGRES funnel (sqlite-twin parity; the sqlite lane is #2489). A link
+        // binds two endpoints, so BOTH endpoints' STORED namespaces are the
+        // subject — a claimed-only gate would let a `public/*`-scoped peer relate
+        // (and thereby relocate-by-reference) a `secure/ops` row by id. Gate only
+        // under the ENROLLED posture (`has_allowlist()`); zero-config stays
+        // byte-identical faith replication. A failed probe fails CLOSED (skip);
+        // a missing endpoint under Layer 1 cannot prove scope, so it fails CLOSED
+        // too. The probe is the SCALAR `MemoryStore::namespace_by_id` (never a
+        // full-row `get` — the #2488 decrypt-fail-closed / over-read lesson).
+        if attest_cfg.has_allowlist() {
+            let needs_stored = crate::federation::receive_auth::peer_declares_namespace_scope(
+                peer_header_owned.as_deref(),
+                &attest_cfg,
+            );
+            let src_ns = if needs_stored {
+                match resolve_stored_namespace(&app, body.sender_agent_id.clone(), &link.source_id)
+                    .await
+                {
+                    Ok(ns) => ns,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: ATTESTATION_TRACE_TARGET,
+                            memory_id = %link.source_id,
+                            error = %e,
+                            "sync_push (postgres): refusing federated link — source namespace \
+                             unresolvable (#2711 fail-closed)"
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let dst_ns = if needs_stored {
+                match resolve_stored_namespace(&app, body.sender_agent_id.clone(), &link.target_id)
+                    .await
+                {
+                    Ok(ns) => ns,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: ATTESTATION_TRACE_TARGET,
+                            memory_id = %link.target_id,
+                            error = %e,
+                            "sync_push (postgres): refusing federated link — target namespace \
+                             unresolvable (#2711 fail-closed)"
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            // Missing endpoint under Layer 1: fail closed (cannot prove scope).
+            if needs_stored && (src_ns.is_none() || dst_ns.is_none()) {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    source_id = %link.source_id,
+                    target_id = %link.target_id,
+                    "sync_push (postgres): refusing federated link — endpoint missing so scope \
+                     cannot decide (#2711)"
+                );
+                skipped += 1;
+                continue;
+            }
+            let src_ok = crate::federation::receive_auth::inbound_by_id_namespace_authorized(
+                crate::federation::receive_auth::LANE_LINKS,
+                &link.source_id,
+                src_ns.as_deref(),
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+                require_push_ns_scope,
+            );
+            let dst_ok = crate::federation::receive_auth::inbound_by_id_namespace_authorized(
+                crate::federation::receive_auth::LANE_LINKS,
+                &link.target_id,
+                dst_ns.as_deref(),
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+                require_push_ns_scope,
+            );
+            if !src_ok || !dst_ok {
+                skipped += 1;
+                continue;
+            }
+        }
         let attest_level = match (link.signature.as_deref(), link.observed_by.as_deref()) {
             (Some(sig_bytes), Some(observed_by)) => {
                 match crate::identity::verify::lookup_peer_public_key(observed_by) {
@@ -866,6 +954,24 @@ pub(super) async fn sync_push_via_store(
             skipped += 1;
             continue;
         }
+        // #2711 (CWE-284, CB-7) — namespace confinement for signals[] on the
+        // POSTGRES funnel (sqlite-twin parity; the sqlite lane is #2489).
+        // Authorship (`signal_author_authorized` above) answers "who authored";
+        // this choke answers "may this peer write in the signal's namespace". The
+        // subject is the signal's own claimed namespace. Zero-config short-circuits
+        // inside `inbound_write_namespace_authorized` (`!has_allowlist()`).
+        if !crate::federation::receive_auth::inbound_write_namespace_authorized(
+            crate::federation::receive_auth::LANE_SIGNALS,
+            &sig.id,
+            &sig.namespace,
+            None,
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+            require_push_ns_scope,
+        ) {
+            skipped += 1;
+            continue;
+        }
         if body.dry_run {
             noop += 1;
             continue;
@@ -930,6 +1036,24 @@ pub(super) async fn sync_push_via_store(
                 continue;
             }
         };
+        // #2711 (CWE-284, CB-7) — namespace confinement for action_transitions[]
+        // on the POSTGRES funnel (sqlite-twin parity; the sqlite lane is #2649).
+        // Authentication is not authorization: the crypto authz below answers
+        // "who signed"; this choke answers "may this peer touch the STORED action
+        // namespace". Subject is the **stored** namespace already loaded for the
+        // signable — no extra read. Zero-config short-circuits inside the helper.
+        if !crate::federation::receive_auth::inbound_write_namespace_authorized(
+            crate::federation::receive_auth::LANE_ACTION_TRANSITIONS,
+            &op.action_id,
+            &local.namespace,
+            Some(local.namespace.as_str()),
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+            require_push_ns_scope,
+        ) {
+            skipped += 1;
+            continue;
+        }
         if body.dry_run {
             noop += 1;
             continue;
