@@ -1125,7 +1125,22 @@ async fn clear_namespace_standard_inner(
             Err(e) => store_err_to_response(e),
         };
     }
-    let params = json!({"namespace": ns});
+    // #2719 (CB-6 / 2704-F1, CWE-284) — thread the header-resolved caller into
+    // the clear params EXACTLY like `set_namespace_standard_inner` (the SET path
+    // above) does. Pre-fix this passed only `{namespace}`, so
+    // `handle_namespace_clear_standard`'s `identity_claimed` probe
+    // (`params.agent_id` present + non-empty) was FALSE and the entire #1777
+    // owner gate + #2545 unresolvable-refusal block was SKIPPED — letting any
+    // api-key/keyless network caller DELETE a namespace's governance standard on
+    // a sqlite daemon (dropping the #2503 severed floor, re-opening the #2545
+    // attack on the network surface). Threading `caller` runs the same gate the
+    // MCP + postgres surfaces already enforce; a keyless caller resolves to
+    // `anonymous:invalid` (mirroring SET), which is refused against a named
+    // owner but still passes for an unowned/`system` standard (unowned-pass).
+    let mut params = json!({"namespace": ns});
+    if let Some(obj) = params.as_object_mut() {
+        obj.insert("agent_id".to_string(), json!(caller));
+    }
     let lock = app.db.lock().await;
     let result = crate::mcp::handle_namespace_clear_standard(&lock.0, &params);
     drop(lock);
