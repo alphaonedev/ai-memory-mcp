@@ -742,3 +742,100 @@ async fn create_postgres_pipelines_broadcast_with_local_write() {
     shutdown.notify_one();
     let _ = handle.await;
 }
+
+// ===================================================================
+// #2724 (CB-22): bulk_create fans out to peers on postgres
+// ===================================================================
+
+/// PARENT: `bulk_create_postgres` ended at the batched `store_batch` with NO
+/// `broadcast_store_quorum` / `bulk_catchup_push`, so a postgres daemon
+/// configured with `--quorum-peers` silently did NOT replicate rows written
+/// through `POST /api/v1/memories/bulk` — while the single-create postgres path
+/// (`create_postgres_pipelines_broadcast_with_local_write` above) and the
+/// sqlite bulk branch both fanned out. #2724 shares ONE fanout helper across
+/// both backends, so a bulk load now reaches every peer.
+#[tokio::test(flavor = "multi_thread")]
+async fn bulk_create_postgres_fans_out_to_peers_2724() {
+    let Some(url) = postgres_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    common::permissive_attestation_for_tests();
+
+    let peer1 = spawn_inproc_mock_peer().await;
+    let peer2 = spawn_inproc_mock_peer().await;
+    let peer3 = spawn_inproc_mock_peer().await;
+    let peer_urls = vec![peer1.url.clone(), peer2.url.clone(), peer3.url.clone()];
+    let cfg = federation_cfg_for_test(&peer_urls, 2);
+
+    let (base, shutdown, handle) = spawn_daemon_with_federation(&url, Some(cfg)).await;
+    let client = reqwest::Client::new();
+
+    let agent = "ai:alice-bulk-fanout";
+    let ns = format!("bulk-2724-{}", uuid::Uuid::new_v4());
+    let titles: Vec<String> = (0..3)
+        .map(|i| format!("bulk-row-{i}-{}", uuid::Uuid::new_v4()))
+        .collect();
+    let batch: Vec<Value> = titles
+        .iter()
+        .map(|t| {
+            json!({
+                "title": t,
+                "content": "bulk row that must fan out post-#2724",
+                "namespace": ns,
+                "tier": "mid",
+                "priority": 5,
+            })
+        })
+        .collect();
+
+    let resp = client
+        .post(format!("{base}/api/v1/memories/bulk"))
+        .header("x-agent-id", agent)
+        .json(&Value::Array(batch))
+        .send()
+        .await
+        .expect("bulk post");
+    // A clean batch of 3 distinct rows is a 200 with created == 3.
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "bulk must 200: {resp:?}"
+    );
+    let body: Value = resp.json().await.expect("bulk body");
+    assert_eq!(body["created"], 3, "3 distinct rows created: {body}");
+
+    // Every peer must observe the bulk fanout (per-row broadcast + terminal
+    // catchup). Straggler detach (W=2 of N=4) completes every peer.
+    let timeout = FANOUT_OBSERVED_TIMEOUT;
+    assert!(
+        wait_for_counter(&peer1.count, 1, timeout).await
+            && wait_for_counter(&peer2.count, 1, timeout).await
+            && wait_for_counter(&peer3.count, 1, timeout).await,
+        "every peer must observe the bulk fanout: p1={} p2={} p3={}",
+        peer1.count.load(Ordering::Relaxed),
+        peer2.count.load(Ordering::Relaxed),
+        peer3.count.load(Ordering::Relaxed),
+    );
+
+    // Wire-shape: every one of the three bulk rows reached peer-1 (across the
+    // per-row broadcasts and/or the terminal catchup batch).
+    let recorded = peer1.recorded.lock().await;
+    for t in &titles {
+        let seen = recorded.iter().any(|p| {
+            p.get("memories")
+                .and_then(|m| m.as_array())
+                .is_some_and(|arr| {
+                    arr.iter()
+                        .any(|m| m.get("title").and_then(|x| x.as_str()) == Some(t.as_str()))
+                })
+        });
+        assert!(
+            seen,
+            "peer-1 must have received bulk row `{t}` in a sync_push body"
+        );
+    }
+
+    shutdown.notify_one();
+    let _ = handle.await;
+}
