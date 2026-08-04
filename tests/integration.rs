@@ -6311,6 +6311,7 @@ fn set_governance(
             "params":{"name":"memory_namespace_set_standard","arguments":{
                 "namespace": namespace,
                 "id": sid,
+                "agent_id": owner_agent_id,
                 "governance": governance,
             }}
         })

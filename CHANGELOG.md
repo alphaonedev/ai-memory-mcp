@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed (namespace set-standard no longer caller-opt-in / silent claim)
 
-- **MCP/HTTP `set_namespace_standard` always enforces ownership; unowned private rows are not silently claimed** (refs [#2541](https://github.com/alphaonedev/ai-memory-mcp/issues/2541); CWE-284). Pre-fix omitting `agent_id` skipped the #929 gate, and the unowned arm rewrote `agent_id` + stamped `scope=shared` (irreversible confidentiality downgrade). Bind now requires ownership or explicit `scope=shared` without mutation; daemon principal is the explicit operator bypass (CLI).
+- **MCP/HTTP `set_namespace_standard` always enforces ownership; unowned rows are never silently claimed** (refs [#2541](https://github.com/alphaonedev/ai-memory-mcp/issues/2541); CWE-284). Pre-fix omitting `agent_id` skipped the #929 gate (could rebind any owned memory), and the unowned arm rewrote `agent_id` + stamped `scope=shared` (irreversible confidentiality downgrade). Ownership is always checked; claim rewrite removed. Daemon principal is the explicit CLI/operator bypass.
 
 ### Fixed (clear_namespace_standard cannot disarm unresolvable governance)
 

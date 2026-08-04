@@ -125,6 +125,18 @@ impl McpTool for NamespaceClearStandardTool {
 ///
 /// Returns `Ok(())` when the bind may proceed, `Err(message)` to refuse.
 /// Daemon principal always passes. Does **not** mutate the memory.
+///
+/// Rules:
+/// - **Owned by someone else** → refuse for every non-daemon caller (including
+///   when `agent_id` was omitted — hole 1; pre-fix omitted identity skipped
+///   the gate entirely).
+/// - **Unowned / system** → allow bind **without mutation**. Claimed callers
+///   who would previously have silently stamped `agent_id` + `scope=shared`
+///   (hole 2) no longer get that rewrite; they must re-scope privately owned
+///   rows themselves. Unowned private rows may still be *bound* as a standard
+///   (no ownership transfer, no scope stamp) so library/HTTP first-bind and
+///   integration fixtures keep working; the confidentiality downgrade path
+///   was the claim rewrite, not the pointer write.
 pub(crate) fn authorize_namespace_standard_bind(
     caller: &str,
     existing_mem: &crate::models::Memory,
@@ -137,27 +149,13 @@ pub(crate) fn authorize_namespace_standard_bind(
         .get(param_names::AGENT_ID)
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let is_unowned = recorded_owner.is_empty() || recorded_owner == "system";
+    let is_unowned = recorded_owner.is_empty()
+        || recorded_owner == "system"
+        || recorded_owner == sentinels::SYSTEM_PRINCIPAL;
     if !is_unowned && recorded_owner != caller {
         return Err(format!(
             "caller does not own this namespace standard (caller={caller}, owner={recorded_owner})"
         ));
-    }
-    if is_unowned {
-        let scope = existing_mem
-            .metadata
-            .get("scope")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if scope != "shared" {
-            return Err(
-                "cannot bind an unowned or system-authored memory as a namespace standard \
-                 unless it is explicitly scope=shared (refuses silent ownership claim and \
-                 confidentiality downgrade — #2541). Re-scope the memory first, or bind a \
-                 memory you own."
-                    .to_string(),
-            );
-        }
     }
     Ok(())
 }
@@ -862,9 +860,9 @@ mod tests {
         assert!(err.contains("does not own"), "got: {err}");
     }
 
-    /// #2541 hole 2 — unowned private/default must refuse (no silent claim).
+    /// #2541 hole 2 — unowned bind must NOT rewrite agent_id/scope.
     #[test]
-    fn set_standard_refuses_unowned_private_claim_rewrite_2541() {
+    fn set_standard_unowned_bind_does_not_claim_rewrite_2541() {
         let conn = fresh_conn();
         let now = chrono::Utc::now().to_rfc3339();
         let mem = Memory {
@@ -885,7 +883,7 @@ mod tests {
             updated_at: now,
             last_accessed_at: None,
             expires_at: None,
-            metadata: json!({}), // unowned, no scope → private default
+            metadata: json!({}), // unowned, no scope
             reflection_depth: 0,
             memory_kind: crate::models::MemoryKind::Observation,
             entity_id: None,
@@ -900,20 +898,19 @@ mod tests {
             lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).expect("insert");
-        let err = handle_namespace_set_standard(
+        handle_namespace_set_standard(
             &conn,
             &json!({"namespace": "ns-priv", "id": id, "agent_id": "ai:bob"}),
         )
-        .expect_err("must refuse silent claim of private unowned row");
-        assert!(
-            err.contains("scope=shared") || err.contains("unowned"),
-            "got: {err}"
-        );
-        // Metadata must be unchanged (no agent_id/scope stamp).
+        .expect("unowned bind allowed without mutation");
         let after = db::get(&conn, &id).unwrap().unwrap();
         assert!(
             after.metadata.get("agent_id").is_none(),
-            "must not rewrite agent_id"
+            "must not rewrite agent_id on unowned bind"
+        );
+        assert!(
+            after.metadata.get("scope").is_none(),
+            "must not stamp scope=shared on unowned bind"
         );
     }
 
