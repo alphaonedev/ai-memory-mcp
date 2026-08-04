@@ -2804,18 +2804,58 @@ pub async fn sync_push(
                 }
             }
         } else {
-            // #2478 — the REJECT arm is DELIBERATELY left outside the namespace
-            // gate, and that is a security decision, not an omission (5-agent
-            // vote 4d3ea1c5). Gating it would make the posture WORSE: a reject
-            // is the only message that moves a row out of `pending`, and
-            // `execute_pending_action` gates solely on `status == "approved"`.
-            // Refuse the reject and the row stays `pending` here — therefore
-            // still APPROVABLE here — so the gate would keep alive precisely the
-            // authority-granting action the originator killed, while the sender
-            // saw `skipped` → a non-ack it can never clear. A reject grants no
-            // authority and writes only `pending_actions.status`; the residual
-            // (an enrolled peer vetoing a foreign namespace's approval queue) is
-            // an availability concern tracked separately, not a confinement one.
+            // #2532 (CWE-284) — REJECT was left ungated by the #2478 vote
+            // (`4d3ea1c5`) on the theory that refusing a reject leaves the row
+            // `pending` and still APPROVABLE, preserving an authority path the
+            // originator killed. Re-analysis for multi-tenant enrollment:
+            // an enrolled peer with scope `public/*` must NOT permanently veto
+            // a `secure/**` tenant's queue. A correctly enrolled originator of a
+            // pending for namespace N is in-scope for N, so legitimate reject
+            // convergence still passes the same shared `pending_namespaces_*`
+            // gate as APPROVE. Leaving a foreign pending approvable after an
+            // out-of-scope refuse is the correct multi-tenant outcome — only
+            // in-scope peers may decide. Probe the LOCAL row (never wire body).
+            let pa = match db::get_pending_action(&lock.0, &dec.id) {
+                Ok(Some(pa)) => pa,
+                Ok(None) => {
+                    // Converged no-op: nothing to reject (same as approve NotFound).
+                    noop += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        pending_id = %dec.id,
+                        cause = crate::federation::receive_auth::CAUSE_NAMESPACE_PROBE_UNRESOLVABLE,
+                        error = %e,
+                        "sync_push: refusing federated pending REJECT — local governance \
+                         row unresolvable (#2532 fail-closed)"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
+            if ns_gate_enrolled
+                && !pending_namespaces_authorized(
+                    &lock.0,
+                    crate::federation::receive_auth::LANE_PENDING_DECISIONS,
+                    &pa,
+                    None,
+                    &attest_cfg,
+                    peer_header_owned.as_deref(),
+                    require_push_ns_scope,
+                )
+            {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    pending_id = %dec.id,
+                    namespace = %pa.namespace,
+                    "sync_push: refusing federated pending REJECT — peer not authorized \
+                     for the pending's effect namespaces (#2532); unauthorized veto closed"
+                );
+                skipped += 1;
+                continue;
+            }
             match db::decide_pending_action(&lock.0, &dec.id, false, &dec.decider) {
                 Ok(true) => pending_decisions_applied += 1,
                 Ok(false) => noop += 1, // already decided — converged state
