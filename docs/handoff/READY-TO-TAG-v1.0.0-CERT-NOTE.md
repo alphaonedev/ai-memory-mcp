@@ -36,14 +36,14 @@
 1. **#2504** — malformed `AI_MEMORY_FED_PEER_ATTESTATION` character can disable federated-delete ns gate; WARN misstates default-deny for that lane  
 2. **#2529** — federated `pendings[]` upsert can resurrect decided pending / overwrite decided_by  
 3. **#2536** — federated `namespace_meta` at in-scope ancestor can set governance default of out-of-scope descendants  
-4. **#2532** — federated REJECT of foreign-namespace pending is unauthorized veto (deliberately ungated by #2478)
+4. **#2532** — federated REJECT of foreign-namespace pending is unauthorized veto (deliberately ungated by #2478)  
 
 ### Packaging / release-channel residual
 5. **Release.yml / Dockerfile default feature set** may still omit `sal` / `sal-postgres` — certification measured an **asserted** feature build; operators must not tag without verifying release artifact features via `ai-memory features` / assert script.
 
 ### Capacity / follow-on (not gate-blocking for this cert claim set)
-6. **Landed capacity (tip `3bd01c32` and ancestors):** #2643 (`8aa83e6f`, closes #2538/#2633); #2689 signed re-land of #2644 bulk funnel (`9136b5a3`, closes #2550–#2552/#2588/#2594); #2662 delete-lane DLQ (`3bd01c32`, closes #2498).  
-   **Still open (optional before cut):** #2663 (`/sync/since` cursor), #2673 (erasure outbox). Not required to assert ready-to-tag if this residual list is honest.
+6. **Landed capacity (inventory at tip; see `{SCRATCH}/residual-inventory.txt`):** #2643 (`8aa83e6fe989`, authz #2538/#2633); #2689 (`9136b5a33259`, signed re-land of #2644 bulk funnel); #2662 (`3bd01c329e65`, delete-lane DLQ #2498); #2663 (`b3096c156373`, /sync/since cursor #2441).
+   **Still open (optional before cut):** #2673 (erasure outbox). Not required to assert ready-to-tag if this residual list is honest. Derived only from mechanical inventory — do not hand-edit PR numbers.
 
 ### Scale claim residual
 7. **No 1M+ agent scale certification**; modular 500–1000 claim envelope only as previously published after claims corrections.
