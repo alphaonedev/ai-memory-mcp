@@ -319,42 +319,65 @@ pub fn handle_load_family(
     let k = usize::try_from(k_raw).unwrap_or(usize::MAX).clamp(1, 100);
 
     let now = chrono::Utc::now().to_rfc3339();
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, tier, namespace, title, content, tags, priority, confidence, source, \
-                    access_count, created_at, updated_at, last_accessed_at, expires_at, metadata \
-             FROM memories \
-             WHERE (?1 IS NULL OR namespace = ?1) \
-               AND json_extract(metadata, '$.family') = ?2 \
-               AND (expires_at IS NULL OR expires_at > ?3) \
-             ORDER BY priority DESC, updated_at DESC \
-             LIMIT ?4",
-        )
-        .map_err(|e| format!("prepare memory_load_family failed: {e}"))?;
 
-    let rows = stmt
-        .query_map(
-            rusqlite::params![namespace, family_name, now, k],
-            db::row_to_memory,
-        )
-        .map_err(|e| format!("query memory_load_family failed: {e}"))?;
-    let memories: Vec<Memory> = rows
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| format!("collect memory_load_family rows failed: {e}"))?;
+    // #2600 — fail-closed lifecycle allow-list, IDENTICAL to the postgres twin
+    // (`PostgresStore::list` threads `lifecycle_visible_clause` into the SAME
+    // SQL shape). Pre-fix the always-on core-profile loader had NO lifecycle
+    // predicate on sqlite, so it served quarantined + tombstoned rows through
+    // the #1948 gate while postgres filtered them — a cross-backend
+    // data-integrity divergence on an always-on read path. Unqualified column
+    // form (`""`) because the query has no table alias.
+    let lifecycle_vis = crate::models::lifecycle_visible_clause("");
+    let sql = format!(
+        "SELECT id, tier, namespace, title, content, tags, priority, confidence, source, \
+                access_count, created_at, updated_at, last_accessed_at, expires_at, metadata \
+         FROM memories \
+         WHERE (?1 IS NULL OR namespace = ?1) \
+           AND json_extract(metadata, '$.family') = ?2 \
+           AND (expires_at IS NULL OR expires_at > ?3) \
+           {lifecycle_vis} \
+         ORDER BY priority DESC, updated_at DESC \
+         LIMIT ?4"
+    );
 
-    // #1555 — scope=private visibility post-filter, parity with the sibling
-    // read tools (list/search/recall) and applied through the canonical
-    // `is_visible_to_caller` predicate so the inbox / target_agent_id carve-out
-    // is honored (a naive `metadata.scope != 'private'` SQL clause would miss
-    // it). `caller == None` is the single-tenant trust-all posture (unchanged).
-    // `count` is recomputed from the filtered set so the wire count stays honest.
-    let memories: Vec<Memory> = match caller {
-        Some(c) => memories
-            .into_iter()
-            .filter(|m| crate::visibility::is_visible_to_caller(m, c))
-            .collect(),
-        None => memories,
+    // #1555/#2601 — the scope=private visibility filter runs in Rust through
+    // the canonical `is_visible_to_caller` predicate (which carries the #1921
+    // team/unit/org subtree carve-out that has NO SQL twin, so it cannot be a
+    // bare `metadata.scope` clause). Applying it AFTER a bare `LIMIT k`
+    // silently UNDER-returned when hidden rows sat before the boundary. Mirror
+    // the postgres `load_family_handler` escalation: filter, and when the
+    // visible set is short of `k`, re-ask at the historical `LIST_MAX_LIMIT`
+    // window and re-filter so both backends return the same rows up to `k`.
+    // `caller == None` is the single-tenant trust-all posture where the SQL
+    // `LIMIT k` is already exact. `count` tracks the filtered set so the wire
+    // count stays honest.
+    let run = |limit: usize| -> Result<Vec<Memory>, String> {
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("prepare memory_load_family failed: {e}"))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![namespace, family_name, now, limit],
+                db::row_to_memory,
+            )
+            .map_err(|e| format!("query memory_load_family failed: {e}"))?;
+        let memories: Vec<Memory> = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| format!("collect memory_load_family rows failed: {e}"))?;
+        Ok(match caller {
+            Some(c) => memories
+                .into_iter()
+                .filter(|m| crate::visibility::is_visible_to_caller(m, c))
+                .collect(),
+            None => memories,
+        })
     };
+
+    let mut memories = run(k)?;
+    if caller.is_some() && memories.len() < k {
+        memories = run(crate::db::LIST_MAX_LIMIT)?;
+        memories.truncate(k);
+    }
 
     Ok(json!({
         "family": family_name,

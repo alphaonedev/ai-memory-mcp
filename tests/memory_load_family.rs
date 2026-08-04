@@ -199,3 +199,140 @@ fn load_family_missing_family_arg_errors() {
         "error must mention missing arg; got: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #2600 (CB-15) — lifecycle allow-list on the sqlite path.
+//
+// Pre-fix the sqlite `handle_load_family` query had NO
+// `lifecycle_visible_clause`, so quarantined + tombstoned rows were
+// readable through this always-on core-profile tool, bypassing the #1948
+// fail-closed lifecycle allow-list — while postgres filtered them (a
+// cross-backend divergence). A quarantined AND a tombstoned family-tagged
+// row must NOT come back; the open row must.
+// ---------------------------------------------------------------------------
+fn seed_family_memory_lifecycle(
+    conn: &rusqlite::Connection,
+    title: &str,
+    namespace: &str,
+    family: &str,
+    lifecycle_state: &str,
+) -> String {
+    let id = seed_family_memory(conn, title, namespace, family, 5);
+    conn.execute(
+        "UPDATE memories SET lifecycle_state = ?1 WHERE id = ?2",
+        rusqlite::params![lifecycle_state, id],
+    )
+    .expect("set lifecycle_state");
+    id
+}
+
+#[test]
+fn load_family_excludes_quarantined_and_tombstoned_rows_2600() {
+    let conn = open_db();
+
+    let open_id = seed_family_memory_lifecycle(&conn, "open-mem", "ns", "core", "open");
+    let _quar = seed_family_memory_lifecycle(&conn, "quar-mem", "ns", "core", "quarantined");
+    let _tomb = seed_family_memory_lifecycle(&conn, "tomb-mem", "ns", "core", "tombstoned");
+
+    let resp: Value =
+        handle_load_family(&conn, &json!({"family": "core", "namespace": "ns"}), None).unwrap();
+
+    assert_eq!(
+        resp["count"], 1,
+        "only the lifecycle-visible row must return; got: {resp}"
+    );
+    let memories = resp["memories"].as_array().unwrap();
+    assert_eq!(memories.len(), 1);
+    assert_eq!(memories[0]["id"], open_id);
+}
+
+// ---------------------------------------------------------------------------
+// #2601 (CB-15) — the scope=private visibility filter runs BEFORE the LIMIT
+// (via the postgres-style escalation), so hidden rows sitting above the
+// `k` boundary no longer under-return the visible set.
+//
+// Seed (all family=core, one namespace):
+//   - two HIGH-priority rows owned by "other" + scope=private (hidden from
+//     caller "me") — these sort FIRST and would fill a bare `LIMIT 2`;
+//   - two lower-priority rows owned by "me" (visible).
+// Pre-fix: SQL `LIMIT 2` returns the two hidden rows, the Rust filter drops
+// both → count 0 (silent under-return). Post-fix: escalate + re-filter →
+// the two visible rows come back.
+// ---------------------------------------------------------------------------
+fn seed_family_memory_owned(
+    conn: &rusqlite::Connection,
+    title: &str,
+    namespace: &str,
+    family: &str,
+    priority: i32,
+    owner: &str,
+) -> String {
+    let now = Utc::now().to_rfc3339();
+    let mem = Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier: Tier::Mid,
+        namespace: namespace.to_string(),
+        title: title.to_string(),
+        content: format!("seeded for {family}"),
+        tags: vec![],
+        priority,
+        confidence: 1.0,
+        source: "import".to_string(),
+        access_count: 0,
+        created_at: now.clone(),
+        updated_at: now,
+        last_accessed_at: None,
+        expires_at: None,
+        metadata: json!({"family": family, "scope": "private", "agent_id": owner}),
+        reflection_depth: 0,
+        memory_kind: ai_memory::models::MemoryKind::Observation,
+        entity_id: None,
+        persona_version: None,
+        citations: Vec::new(),
+        source_uri: None,
+        source_span: None,
+        confidence_source: ConfidenceSource::CallerProvided,
+        confidence_signals: None,
+        confidence_decayed_at: None,
+        version: 1,
+        ..Memory::default()
+    };
+    db::insert(conn, &mem).expect("db::insert")
+}
+
+#[test]
+fn load_family_visibility_applies_before_limit_no_under_return_2601() {
+    let conn = open_db();
+
+    // Two hidden (other-owned, private) high-priority rows sort first.
+    seed_family_memory_owned(&conn, "hidden-1", "ns", "core", 9, "other");
+    seed_family_memory_owned(&conn, "hidden-2", "ns", "core", 8, "other");
+    // Two visible (me-owned) lower-priority rows sit past the k=2 boundary.
+    let mine_hi = seed_family_memory_owned(&conn, "mine-hi", "ns", "core", 5, "me");
+    let mine_lo = seed_family_memory_owned(&conn, "mine-lo", "ns", "core", 4, "me");
+
+    let resp: Value = handle_load_family(
+        &conn,
+        &json!({"family": "core", "namespace": "ns", "k": 2}),
+        Some("me"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        resp["count"], 2,
+        "visibility must be applied before the LIMIT so both visible rows \
+         come back even though hidden rows sort above them; got: {resp}"
+    );
+    let rows = resp["memories"].as_array().unwrap();
+    let ids: Vec<&str> = rows.iter().map(|m| m["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&mine_hi.as_str()), "mine-hi must be returned");
+    assert!(ids.contains(&mine_lo.as_str()), "mine-lo must be returned");
+    // No other-owned private row leaked through.
+    for m in rows {
+        let title = m["title"].as_str().unwrap();
+        assert!(
+            !title.starts_with("hidden"),
+            "other-owned private row leaked: {title}"
+        );
+    }
+}

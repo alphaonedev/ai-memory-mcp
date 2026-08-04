@@ -1226,6 +1226,26 @@ fn lookup_namespace_standard(
     let Ok(Some(mem)) = db::get(conn, &standard_id) else {
         return StandardLookup::Absent;
     };
+    // #2544 — a bound standard must be LIVE to govern. `db::get` carries NO
+    // lifecycle/expiry predicate, so an expired / tombstoned / quarantined
+    // memory would otherwise be served as the governing namespace standard
+    // into every recall / session_start (with its tokens uncounted). Gate it
+    // with the SAME fail-closed lifecycle allow-list (`is_recall_visible`, the
+    // Rust twin of the SQL `lifecycle_visible_clause`) + the expiry guard the
+    // read lanes apply, so a non-live standard is treated as if none is bound.
+    if !mem.lifecycle_state.is_recall_visible()
+        || crate::storage::lifecycle::is_expired(
+            mem.expires_at.as_deref(),
+            &chrono::Utc::now().to_rfc3339(),
+        )
+    {
+        tracing::debug!(
+            target: "namespace.standard.not_live",
+            namespace = %namespace,
+            "#2544: namespace standard not served — expired or non-visible lifecycle state"
+        );
+        return StandardLookup::Absent;
+    }
     // #2537 — run the predicate on the typed `Memory` BEFORE serialization,
     // so a withheld standard's bytes are never materialised at all.
     if caller.is_some_and(|c| !crate::visibility::is_visible_to_caller(&mem, c)) {
@@ -8198,6 +8218,53 @@ mod tests {
         super::inject_namespace_standard(&conn, Some("m9-inject-attach"), None, &mut resp);
         assert!(resp["standard"].is_object(), "expected attached standard");
         assert_eq!(resp["standard"]["id"].as_str().unwrap(), std_id);
+    }
+
+    #[test]
+    fn inject_namespace_standard_skips_non_live_standard_2544() {
+        // #2544 (CB-15) — a bound standard must be LIVE to govern. Pre-fix
+        // `lookup_namespace_standard` resolved the bound memory via a bare
+        // `db::get` with NO lifecycle/expiry predicate, so a tombstoned /
+        // quarantined / expired standard was served as the governing
+        // namespace standard into every recall / session_start. Assert the
+        // fail-closed lifecycle allow-list + expiry guard now suppress it.
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+
+        // Control — a live (Open, unexpired) standard IS served.
+        seed_namespace_standard(&conn, "ns2544-live", "S-live");
+        let mut live = make_recall_response(vec![]);
+        super::inject_namespace_standard(&conn, Some("ns2544-live"), None, &mut live);
+        assert!(live["standard"].is_object(), "live standard must be served");
+
+        // Tombstoned standard — bound, but excluded by the lifecycle
+        // allow-list (would have matched a bare `db::get` pre-fix).
+        let tomb_id = seed_namespace_standard(&conn, "ns2544-tomb", "S-tomb");
+        conn.execute(
+            "UPDATE memories SET lifecycle_state = 'tombstoned' WHERE id = ?1",
+            [&tomb_id],
+        )
+        .unwrap();
+        let mut tomb = make_recall_response(vec![]);
+        super::inject_namespace_standard(&conn, Some("ns2544-tomb"), None, &mut tomb);
+        assert!(
+            tomb.get("standard").is_none() && tomb.get("standards").is_none(),
+            "#2544: a tombstoned standard must not be served; got {tomb}"
+        );
+
+        // Expired standard — bound, but past its `expires_at`.
+        let exp_id = seed_namespace_standard(&conn, "ns2544-exp", "S-exp");
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
+        conn.execute(
+            "UPDATE memories SET expires_at = ?1 WHERE id = ?2",
+            rusqlite::params![past, exp_id],
+        )
+        .unwrap();
+        let mut exp = make_recall_response(vec![]);
+        super::inject_namespace_standard(&conn, Some("ns2544-exp"), None, &mut exp);
+        assert!(
+            exp.get("standard").is_none() && exp.get("standards").is_none(),
+            "#2544: an expired standard must not be served; got {exp}"
+        );
     }
 
     #[test]
