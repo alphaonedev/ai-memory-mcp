@@ -33,10 +33,9 @@
 ## Explicit residual list (must appear on any tag checklist)
 
 ### Gate1 confinement residuals (open issues)
-1. **#2504** — malformed `AI_MEMORY_FED_PEER_ATTESTATION` character can disable federated-delete ns gate; WARN misstates default-deny for that lane  
-2. **#2529** — federated `pendings[]` upsert can resurrect decided pending / overwrite decided_by  
-3. **#2536** — federated `namespace_meta` at in-scope ancestor can set governance default of out-of-scope descendants  
-4. **#2532** — federated REJECT of foreign-namespace pending is unauthorized veto (deliberately ungated by #2478)  
+1. **#2529** — federated `pendings[]` upsert can resurrect decided pending / overwrite decided_by  
+2. **#2536** — federated `namespace_meta` at in-scope ancestor can set governance default of out-of-scope descendants  
+3. **#2532** — federated REJECT of foreign-namespace pending is unauthorized veto (deliberately ungated by #2478)  
 
 ### Packaging / release-channel residual
 5. **Release.yml / Dockerfile default feature set** may still omit `sal` / `sal-postgres` — certification measured an **asserted** feature build; operators must not tag without verifying release artifact features via `ai-memory features` / assert script.
