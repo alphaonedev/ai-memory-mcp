@@ -548,7 +548,28 @@ async fn http_bulk_store_rejects_malformed_valid_from() {
     .await;
     // Per-row validate_create failure skips the row into `errors[]` (never a
     // silent store), so `created` is 0 and the row does not persist.
-    assert_eq!(status, StatusCode::OK, "bulk envelope is 200; body={body}");
+    //
+    // #2588 — this assertion read `StatusCode::OK` until v1.0.0. That was the
+    // pre-#2588 bulk envelope contract, in which a batch that persisted NOTHING
+    // still answered 200; #2588 was filed because 31,000 rows were lost behind
+    // exactly that shape with no signal to retry. The status is now the
+    // dominant cause's, and for a batch rejected solely by `validate_create`
+    // that is 400 — the SAME status the identical body gets from single-create
+    // `POST /api/v1/memories`, which is the surface-parity this PR exists to
+    // establish.
+    //
+    // The change is to the ENVELOPE assertion only. This test's SUBJECT — that
+    // a malformed `valid_from` is rejected and the row does not persist — is
+    // unchanged and still asserted below, which is why the 200 here was
+    // incidental scaffolding rather than a contract this file chose: the
+    // sibling happy-path cell above asserts `OK` with the same boilerplate and
+    // is UNTOUCHED, because a clean batch still returns 200.
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "#2588: a bulk batch that persisted nothing reports its dominant \
+         cause, not 200; body={body}"
+    );
     assert_eq!(
         body.get("created").and_then(serde_json::Value::as_u64),
         Some(0),

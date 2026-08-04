@@ -50,7 +50,65 @@ use serde_json::json;
 /// classifier's allowlist directly without going through the router.
 #[must_use]
 pub fn sanitize_bulk_row_error(raw: &str) -> &'static str {
+    classify_bulk_row_error(raw).label
+}
+
+/// #2552 / #2588 — the typed classification of a per-row bulk failure.
+///
+/// `label` is the #851 sanitized, allowlisted string echoed to the caller;
+/// `code` is the machine-readable [`crate::errors::error_codes`] slug a fleet
+/// loader switches on to decide retry-vs-backoff-vs-quarantine; `retryable`
+/// drives the whole-request status precedence when NOTHING was persisted (a
+/// retryable cause must win over a permanent one, so a batch that was half
+/// quota-rejected and half invalid reports the retryable 429 rather than
+/// telling the fleet "never retry" and permanently dropping the writable
+/// rows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BulkRowErrorClass {
+    /// Machine-readable slug from [`crate::errors::error_codes`].
+    pub code: &'static str,
+    /// #851 sanitized human label — the historical `errors[]` string.
+    pub label: &'static str,
+    /// HTTP status this cause maps to on the single-row surface.
+    pub status: StatusCode,
+    /// Whether re-submitting the same row could succeed later.
+    pub retryable: bool,
+}
+
+/// #2552 / #2588 — classify a raw per-row bulk failure into its typed class.
+///
+/// The classifier matches on stable substrings produced by `validate::*`,
+/// `crate::quotas::*`, `db::*`, and `crate::federation::*`. Anything that
+/// doesn't match falls back to the safe `"internal error"` default.
+///
+/// **#2588 — the quota arm is FIRST and load-bearing.** Pre-#2588 there was no
+/// quota arm at all, so `"QUOTA_EXCEEDED: agent qtest namespace q hit
+/// memories_per_day (current=5, max=5)"` matched nothing and fell through to
+/// `"internal error"`. A corpus load that lost 31,000 rows to the per-agent
+/// write quota was reported as `200 {"created":0,"errors":["internal error",
+/// …]}` with no server-side log line — a silent, unintentional loss of durable
+/// writes and the single most severe defect in this cluster. Classifying it
+/// costs no confidentiality: the IDENTICAL text is already returned verbatim
+/// to the same caller by the single-row `429 QUOTA_EXCEEDED` envelope
+/// (`handlers::create`). The match is on the `quota_exceeded` slug rather than
+/// a bare `"quota"` so the SUBSTRATE-failure message
+/// (`crate::errors::msg::QUOTA_CHECK_FAILED` = `"quota check failed"`) keeps
+/// classifying as an internal error — a failed quota READ is not a quota
+/// BREACH, and telling a loader to back off when the substrate is broken would
+/// be the wrong instruction.
+#[must_use]
+pub fn classify_bulk_row_error(raw: &str) -> BulkRowErrorClass {
     let lower = raw.to_ascii_lowercase();
+    // #2588 — quota FIRST: retryable, typed, and already caller-visible on
+    // the single-row surface.
+    if lower.contains("quota_exceeded") {
+        return BulkRowErrorClass {
+            code: crate::errors::error_codes::QUOTA_EXCEEDED,
+            label: "quota exceeded",
+            status: StatusCode::TOO_MANY_REQUESTS,
+            retryable: true,
+        };
+    }
     // Validation errors are template strings the caller's input can
     // synthesise on the client side; they don't carry DB/path/peer
     // state. Keep them informative.
@@ -61,21 +119,51 @@ pub fn sanitize_bulk_row_error(raw: &str) -> &'static str {
         || lower.contains("must be")
         || lower.contains("required")
     {
-        return "validation failed";
+        return BulkRowErrorClass {
+            code: crate::errors::error_codes::VALIDATION_FAILED,
+            label: "validation failed",
+            status: StatusCode::BAD_REQUEST,
+            retryable: false,
+        };
     }
     if lower.contains("already exists in namespace") || lower.contains("unique constraint") {
-        return "conflict: already exists";
+        return BulkRowErrorClass {
+            code: crate::errors::error_codes::CONFLICT,
+            label: "conflict: already exists",
+            status: StatusCode::CONFLICT,
+            retryable: false,
+        };
     }
     if lower.contains("not found") {
-        return "not found";
+        return BulkRowErrorClass {
+            code: crate::errors::error_codes::NOT_FOUND,
+            label: "not found",
+            status: StatusCode::NOT_FOUND,
+            retryable: false,
+        };
     }
     if lower.contains("denied by governance") || lower.contains("permission") {
-        return "forbidden";
+        return BulkRowErrorClass {
+            code: crate::errors::error_codes::GOVERNANCE_REFUSED,
+            label: "forbidden",
+            status: StatusCode::FORBIDDEN,
+            retryable: false,
+        };
     }
     if lower.contains("quorum") || lower.contains("fanout") || lower.contains("peer") {
-        return "replication unavailable";
+        return BulkRowErrorClass {
+            code: crate::errors::error_codes::REPLICATION_UNAVAILABLE,
+            label: "replication unavailable",
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            retryable: true,
+        };
     }
-    "internal error"
+    BulkRowErrorClass {
+        code: crate::errors::error_codes::INTERNAL_ERROR,
+        label: "internal error",
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        retryable: true,
+    }
 }
 
 /// Standard 500 response used at sites where the prior code leaked the
@@ -311,5 +399,56 @@ mod tests {
         let (status, body) = body_string(err).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(body.contains("serialisation failed"));
+    }
+}
+
+/// #2588 — classify a TYPED SAL error into its bulk row class by its
+/// canonical `code()` slug rather than by its prose.
+///
+/// The postgres bulk branch rejects rows with `StoreError`, which already
+/// carries the same `crate::errors::error_codes` slug the single-row surface
+/// maps to a status. Round-tripping it through
+/// [`classify_bulk_row_error`]'s substring matcher was a lossy inference over
+/// a value we hold — and it FAILED concretely: `StoreError::QuotaExceeded`
+/// renders as `"quota exceeded for <a> in <ns>: memories_per_day 5/5"`, which
+/// matches no allowlisted arm and so classified as a retryable
+/// `500 internal error`. That is the #2588 defect on the postgres branch
+/// specifically: a quota rollback that dropped the whole batch reported an
+/// opaque internal failure, so the sqlite and postgres backends disagreed
+/// about the SAME condition on the SAME request.
+#[cfg(feature = "sal")]
+#[must_use]
+pub fn classify_store_err(e: &crate::store::StoreError) -> BulkRowErrorClass {
+    use crate::errors::error_codes as codes;
+    let code = e.code();
+    let (label, status, retryable) = if code == codes::QUOTA_EXCEEDED {
+        ("quota exceeded", StatusCode::TOO_MANY_REQUESTS, true)
+    } else if code == codes::CONFLICT {
+        ("conflict: already exists", StatusCode::CONFLICT, false)
+    } else if code == codes::NOT_FOUND {
+        ("not found", StatusCode::NOT_FOUND, false)
+    } else if code == codes::GOVERNANCE_REFUSED {
+        ("forbidden", StatusCode::FORBIDDEN, false)
+    } else if code == codes::VALIDATION_FAILED {
+        ("validation failed", StatusCode::BAD_REQUEST, false)
+    } else if code == codes::STORE_BACKEND_UNAVAILABLE
+        || code == codes::RECORD_STOPPED
+        || code == codes::SCHEMA_AHEAD_OF_BINARY
+    {
+        // Reachable again once the operator resolves the posture, so a fleet
+        // loader SHOULD back off and retry rather than quarantine the rows.
+        (
+            "replication unavailable",
+            StatusCode::SERVICE_UNAVAILABLE,
+            true,
+        )
+    } else {
+        ("internal error", StatusCode::INTERNAL_SERVER_ERROR, true)
+    };
+    BulkRowErrorClass {
+        code,
+        label,
+        status,
+        retryable,
     }
 }

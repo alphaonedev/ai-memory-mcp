@@ -874,6 +874,30 @@ pub trait MemoryStore: Send + Sync {
     /// round-trip to amortise). `PostgresStore` overrides this with one
     /// multi-row `INSERT ... ON CONFLICT` so an N-row bulk ingest costs a
     /// single round-trip instead of N.
+    ///
+    /// # Returned-id contract (#2551 — LOAD-BEARING, do not weaken)
+    ///
+    /// The returned vector is 1:1 with `memories` in input order, and the
+    /// `handlers::bulk` per-row outcome ledger derives its `created` /
+    /// `updated` / `deduped` accounting from it — so two properties are part
+    /// of the trait contract, not adapter trivia:
+    ///
+    /// 1. **`id` is never rewritten by the conflict arm.** Neither adapter
+    ///    lists `id` in its `ON CONFLICT DO UPDATE SET`, so the returned id is
+    ///    the caller-minted one on a true INSERT and the PRE-EXISTING row's id
+    ///    on an upsert. `returned == memories[i].id` is therefore an exact,
+    ///    zero-round-trip insert-vs-update discriminator. An adapter that
+    ///    overwrote `id` on conflict would silently make every upsert report
+    ///    as a creation.
+    /// 2. **In-batch `(title, namespace)` duplicates collapse LAST-WINS.** When
+    ///    several input rows share a conflict key they all map to ONE returned
+    ///    id, and the content that survives is the LAST such input row's. The
+    ///    ledger reports the earlier positions as `deduped`, so an adapter that
+    ///    collapsed FIRST-wins would make the handler name the wrong row's
+    ///    content as durable — a data-integrity MISREPORT, not a cosmetic one.
+    ///
+    /// Both properties are pinned cross-backend by
+    /// `tests/bulk_write_truthfulness_2551.rs`.
     async fn store_batch(
         &self,
         ctx: &CallerContext,
