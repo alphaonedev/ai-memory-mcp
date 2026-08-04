@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (plaintext peer gate: loopback exactness is now suite-enforced)
+
+- **Regression pins for `host_is_loopback` exactness** (refs [#2677](https://github.com/alphaonedev/ai-memory-mcp/issues/2677); CWE-319 class). Behaviour was already correct after #2477; the suite only covered happy-path loopback. Spoof hosts (`127.0.0.1.evil.com`, `localhost.evil.com`, query-embedded loopback strings, `127.0.0.2`) are refused by unit + `FederationConfig::build` tests so a future `starts_with`/`contains` "tidy" cannot silently re-open cleartext federation. Decimal/hex IPv4 forms normalise to `127.0.0.1` in the URL parser and remain correctly exempt (pinned).
+
 ### Fixed (release/Docker binaries ship federation `sal` feature)
 
 - **Dockerfile and `release.yml` build with `--features sal` and assert the compiled feature set** (refs [#2676](https://github.com/alphaonedev/ai-memory-mcp/issues/2676) packaging residual). Pre-fix default cargo features were only `sqlite-bundled`, so GHCR/deb/tarball artifacts could omit the SAL/federation surface Gate3 measured with an asserted build. `scripts/assert-compiled-features.sh` now runs in the image build and on each release matrix binary (`sqlite-bundled` + `sal`). `sal-postgres` remains opt-in for PG-native deployments (plan-c / explicit build), not forced onto every multi-OS release target.
