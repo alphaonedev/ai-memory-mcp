@@ -723,7 +723,8 @@ pub async fn broadcast_delete_quorum(
     // `tracing::warn`-only and then vanished: nothing retried it, so the
     // replica kept a row the origin erased, permanently and silently,
     // and could later LWW-resurrect it.
-    #[cfg(feature = "sal")]
+    // #2717 — always collect; the delete-lane DLQ landing pass below is no
+    // longer sal-gated (mirrors the #2678/#2681 store-lane un-gating).
     let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
     for peer in &config.peers {
         let client = config.client.clone();
@@ -753,7 +754,6 @@ pub async fn broadcast_delete_quorum(
     // explicit-fail peers (DLQ with the peer's own failure reason), and
     // (c) deadline-evicted peers whose task never reported (DLQ with
     // `deadline_exceeded`). Byte-identical bookkeeping to the store lane.
-    #[cfg(feature = "sal")]
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let deadline = now + config.policy.ack_timeout;
@@ -771,7 +771,6 @@ pub async fn broadcast_delete_quorum(
             }
             Ok(Some(Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))))) => {
                 tracing::warn!("federation: delete peer {peer_id} failed for {id}: {reason}");
-                #[cfg(feature = "sal")]
                 explicit_failures.push((peer_id, reason));
             }
             Ok(Some(Err(e))) => {
@@ -820,8 +819,19 @@ pub async fn broadcast_delete_quorum(
     //
     // Best-effort: a sink error NEVER propagates — the local erasure
     // already committed and the quorum verdict is already computed.
-    // Feature-gated to `--features sal` because the sink trait is a
-    // sal-only surface; the default build keeps pre-#2498 behaviour.
+    //
+    // #2717 — UN-GATED on the default build. This pass was previously
+    // `#[cfg(feature = "sal")]` on the stated rationale that the sink trait
+    // was a sal-only surface, so the default `cargo install` / Homebrew-from
+    // -source / iOS+Android static-lib binaries kept the pre-#2498 behaviour
+    // where a federated DELETE miss was a `tracing::warn!`-only event and was
+    // then silently dropped — the higher-integrity erasure lane leaking the
+    // very GDPR-erased content a down peer could later LWW-resurrect. That
+    // rationale was invalidated when #2681 made async-trait non-optional and
+    // #2678/#2681 un-gated the STORE-lane equivalent, leaving the DELETE lane
+    // the lone still-gated survivor of the same class. `dlq_sink`, the sink
+    // trait, and the `push_dlq` types are all available on the default build,
+    // so this pass now compiles and runs on every shipped artifact.
     //
     // ## Data-integrity note — the (memory_id, peer_id) upsert key
     //
@@ -864,7 +874,6 @@ pub async fn broadcast_delete_quorum(
     // the peer never applied the delete, so it holds no tombstone for that
     // id, and an operator-initiated `restore_archived` deliberately
     // bypasses the tombstone gate as an authorized un-forget.
-    #[cfg(feature = "sal")]
     if let Some(sink) = config.dlq_sink.as_ref() {
         let acked = tracker.acked_peer_ids();
         let explicit_map: std::collections::HashMap<String, String> =
