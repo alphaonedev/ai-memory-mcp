@@ -328,6 +328,12 @@ pub(super) fn handle_update(
     let metadata = if params["metadata"].is_object() {
         let m = params["metadata"].clone();
         validate::validate_metadata(&m).map_err(|e| e.to_string())?;
+        // #2633 — the MCP update path validates inline (it does not route
+        // through `validate::validate_update`), so call the shared
+        // caller-origin `metadata.scope` gate here directly. Without it a
+        // typo'd scope token rode through to the read path, where pre-#2633
+        // "unknown ⇒ widest posture" made the row world-readable.
+        validate::validate_metadata_scope(&m).map_err(|e| e.to_string())?;
         // Preserve existing metadata.agent_id — provenance is immutable.
         // Without this, any MCP caller could rewrite the author of any memory.
         let existing = db::get(conn, &resolved_id)

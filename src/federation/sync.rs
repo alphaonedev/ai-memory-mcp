@@ -463,7 +463,7 @@ pub async fn broadcast_store_quorum_with_embedding(
     // independent of whether each task reported a Fail outcome
     // (deadline-evicted tasks never report; pre-#933 they were
     // silently lost).
-    #[cfg(feature = "sal")]
+    // #2678 — always collect; the DLQ landing pass below is no longer sal-gated.
     let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
     for peer in &config.peers {
         let client = config.client.clone();
@@ -494,7 +494,6 @@ pub async fn broadcast_store_quorum_with_embedding(
     // failure reason), and (c) deadline-evicted peers (no outcome
     // observed; DLQ with "deadline" as the failure reason). Pre-#933
     // the (c) bucket was silently lost.
-    #[cfg(feature = "sal")]
     let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     // Deadline is computed ONCE here and never re-derived inside the
@@ -517,12 +516,7 @@ pub async fn broadcast_store_quorum_with_embedding(
             }
             Ok(Some(Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))))) => {
                 tracing::warn!("federation: peer {peer_id} failed for {}: {reason}", mem.id);
-                #[cfg(feature = "sal")]
                 explicit_failures.push((peer_id.clone(), reason.clone()));
-                #[cfg(not(feature = "sal"))]
-                {
-                    let _ = (peer_id, reason);
-                }
             }
             Ok(Some(Err(e))) => {
                 tracing::warn!("federation: peer join error: {e}");
@@ -643,10 +637,9 @@ pub async fn broadcast_store_quorum_with_embedding(
     // computed. Operators observe sink-side errors via the
     // tracing::warn line below + the gauge.
     //
-    // Feature-gated to `--features sal` because the trait surface
-    // requires `async-trait`. The default (sqlite-only) build path
-    // never reaches this branch and pre-#933 behaviour is preserved.
-    #[cfg(feature = "sal")]
+    // #2678 — ungated. Pre-#2678 this branch was sal-only, so the default
+    // shipped binary preserved pre-#933 "silently lost" behaviour while
+    // migrations created the table and metrics advertised depth=0 healthy.
     if let Some(sink) = config.dlq_sink.as_ref() {
         let acked = tracker.acked_peer_ids();
         let explicit_map: std::collections::HashMap<String, String> =

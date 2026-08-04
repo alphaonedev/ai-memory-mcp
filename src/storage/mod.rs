@@ -18362,6 +18362,27 @@ pub enum ApproveSurface {
     LocalOperator,
 }
 
+/// #2538 — the shared approver-identity gate predicate for BOTH the
+/// `ApproverType::Human` arm (#1787 / #1796) and the
+/// `ApproverType::Agent(required)` named-approver arm.
+///
+/// One predicate, two arms: the disposition is a property of the calling
+/// SURFACE, not of the approver TYPE, so the Agent arm must not invent a
+/// third shape. `Http` (multi-tenant, per-request `X-Agent-Id`) enforces
+/// unconditionally; `LocalOperator` (single-operator MCP/CLI) enforces
+/// only under the multi-agent opt-in, because in the trust-all default the
+/// requester and the approver both resolve to the SAME durable
+/// `host:<hostname>` id (#1720 B1) and an unconditional reject-self would
+/// self-lock the lone operator out of their own queued actions.
+fn enforce_approver_identity_gate(surface: ApproveSurface) -> bool {
+    match surface {
+        ApproveSurface::Http => true,
+        ApproveSurface::LocalOperator => {
+            crate::identity::resolve_read_visibility_caller().is_some()
+        }
+    }
+}
+
 /// Task 1.10 — approver-type aware approve. Enforces the
 /// `metadata.governance.approver` of the pending action's namespace.
 ///
@@ -18369,6 +18390,9 @@ pub enum ApproveSurface {
 /// [`ApproveSurface`]. The multi-tenant HTTP surface enforces
 /// unconditionally; the single-operator MCP/CLI surfaces keep the
 /// `AI_MEMORY_AGENT_ID` opt-in.
+///
+/// #2538 — the SAME posture now also gates the `Agent(required)`
+/// named-approver arm (see [`enforce_approver_identity_gate`]).
 pub fn approve_with_approver_type(
     conn: &Connection,
     pending_id: &str,
@@ -18421,13 +18445,7 @@ pub fn approve_with_approver_type(
             // Human-gated action. The `surface` arg now selects the posture:
             // HTTP enforces UNCONDITIONALLY (matching the #1793 postgres fix);
             // the local single-operator surfaces keep the env opt-in.
-            let enforce_human_gate = match surface {
-                ApproveSurface::Http => true,
-                ApproveSurface::LocalOperator => {
-                    crate::identity::resolve_read_visibility_caller().is_some()
-                }
-            };
-            if enforce_human_gate {
+            if enforce_approver_identity_gate(surface) {
                 if approver_agent_id == pa.requested_by {
                     return Ok(ApproveOutcome::Rejected(
                         crate::errors::msg::SELF_APPROVAL_REFUSED.into(),
@@ -18453,6 +18471,39 @@ pub fn approve_with_approver_type(
                 return Ok(ApproveOutcome::Rejected(format!(
                     "designated approver is '{required}'; got '{approver_agent_id}'"
                 )));
+            }
+            // #2538 (CWE-863) — pre-fix this arm was a BARE STRING COMPARE:
+            // no self-approval refusal and no registered-agent check, while
+            // the Human arm above has BOTH and the Consensus arm below has
+            // the registered check. `approver_agent_id` on the HTTP surface
+            // derives from `X-Agent-Id`, a CLAIMED (not attested) principal,
+            // so a requester who is also the namespace's designated approver
+            // could self-approve their own governance-gated action — and a
+            // policy naming an agent the operator never registered was
+            // satisfiable by anyone who could claim that string.
+            //
+            // The named-approver arm is precisely the one an operator selects
+            // to impose SEPARATION OF DUTIES on a namespace, so it must be at
+            // least as strict as the permissive Human default. Mirror the
+            // Human arm EXACTLY (same predicate, same order, same messages'
+            // shape) rather than invent a third disposition.
+            //
+            // Residual by design: under the opt-in, a policy whose designated
+            // approver IS the requester makes that action unapprovable (the
+            // arm names exactly one permitted approver). That is the intended
+            // reading of a separation-of-duties control — the action stays
+            // `pending` (rejectable / re-policyable), never wrongly approved.
+            if enforce_approver_identity_gate(surface) {
+                if approver_agent_id == pa.requested_by {
+                    return Ok(ApproveOutcome::Rejected(
+                        crate::errors::msg::SELF_APPROVAL_REFUSED.into(),
+                    ));
+                }
+                if !is_registered_agent(conn, approver_agent_id) {
+                    return Ok(ApproveOutcome::Rejected(format!(
+                        "designated approver '{approver_agent_id}' is not a registered agent"
+                    )));
+                }
             }
             let ok = decide_pending_action(conn, pending_id, true, approver_agent_id)?;
             if ok {
@@ -26336,6 +26387,175 @@ mod tests {
         );
         // No approve audit emitted on refused path.
         assert_eq!(count_signed_events(&conn, "pending_action.approved"), 0);
+    }
+
+    /// #2633 — seed `ns` with a namespace standard whose governance policy
+    /// names `approver` as the DESIGNATED single approver
+    /// (`ApproverType::Agent`), with `write: Approve` so the arm is live.
+    fn seed_agent_approver_ns(conn: &Connection, ns: &str, approver: &str) {
+        use crate::models::{ApproverType, CorePolicy, GovernanceLevel, GovernancePolicy};
+        let policy = GovernancePolicy {
+            core: CorePolicy {
+                write: GovernanceLevel::Approve,
+                promote: GovernanceLevel::Any,
+                delete: GovernanceLevel::Owner,
+                approver: ApproverType::Agent(approver.to_string()),
+                inherit: true,
+                max_reflection_depth: None,
+                required_scope: None,
+            },
+            ..Default::default()
+        };
+        let mut standard = make_memory(
+            &format!("std-2538-{ns}"),
+            &format!("_standards-{ns}"),
+            Tier::Long,
+            9,
+        );
+        standard.metadata = serde_json::json!({"governance": policy});
+        let sid = insert(conn, &standard).unwrap();
+        set_namespace_standard(conn, ns, &sid, None).unwrap();
+    }
+
+    /// #2538 (CWE-863) — the `ApproverType::Agent(required)` NAMED-APPROVER
+    /// arm was a BARE STRING COMPARE: no self-approval refusal and no
+    /// registered-agent verification, while the `Human` arm three lines above
+    /// carried BOTH and the `Consensus` arm below carried the registered
+    /// check. `approver_agent_id` on the HTTP surface derives from the
+    /// CLAIMED (unattested) `X-Agent-Id`, so a requester who was also the
+    /// namespace's designated approver could self-approve their OWN
+    /// governance-gated action — defeating the separation-of-duties control
+    /// an operator selects the named-approver arm precisely to impose.
+    ///
+    /// **R-203 pre-fix behaviour at parent 5449b6da:** leg (A) below returned
+    /// `ApproveOutcome::Approved` (the bare `approver_agent_id != required`
+    /// compare passed, since approver == required), so the assertion for
+    /// `Rejected(SELF_APPROVAL_REFUSED)` FAILED with
+    /// `expected self-approval rejection, got Approved`. Leg (B) likewise
+    /// returned `Approved` for a designated approver that was never
+    /// registered.
+    #[test]
+    fn agent_arm_refuses_self_approval_and_unregistered_2538() {
+        let conn = test_db();
+        let ns = "ns/a2538";
+        // The designated approver IS the requester — the exact shape the
+        // named-approver arm exists to forbid.
+        seed_agent_approver_ns(&conn, ns, "ai:alice");
+        let payload = serde_json::json!({"title": "x", "namespace": ns});
+
+        // (A) HTTP surface, approver == required == requester → REFUSED.
+        let pid_self = queue_pending_action(
+            &conn,
+            crate::models::GovernedAction::Store,
+            ns,
+            None,
+            "ai:alice",
+            &payload,
+        )
+        .unwrap();
+        match approve_with_approver_type(&conn, &pid_self, "ai:alice", ApproveSurface::Http)
+            .unwrap()
+        {
+            ApproveOutcome::Rejected(m) => assert!(
+                m.contains("self-approval"),
+                "named approver must not self-approve, got: {m}"
+            ),
+            other => panic!("expected self-approval rejection, got {other:?}"),
+        }
+
+        // (B) A DIFFERENT designated approver that was never registered is
+        //     refused too (mirrors the Human arm / #216 Consensus ladder:
+        //     "claim any string" -> "operator pre-registered this id").
+        let ns_b = "ns/a2538b";
+        seed_agent_approver_ns(&conn, ns_b, "ai:bob");
+        let payload_b = serde_json::json!({"title": "x", "namespace": ns_b});
+        let pid_b = queue_pending_action(
+            &conn,
+            crate::models::GovernedAction::Store,
+            ns_b,
+            None,
+            "ai:alice",
+            &payload_b,
+        )
+        .unwrap();
+        match approve_with_approver_type(&conn, &pid_b, "ai:bob", ApproveSurface::Http).unwrap() {
+            ApproveOutcome::Rejected(m) => assert!(
+                m.contains("not a registered agent"),
+                "unregistered designated approver must be refused, got: {m}"
+            ),
+            other => panic!("expected unregistered rejection, got {other:?}"),
+        }
+
+        // (C) Liveness — a REGISTERED designated approver who is NOT the
+        //     requester still approves. The gate narrows the arm; it does
+        //     not brick it.
+        register_agent(&conn, "ai:bob", "ai:generic", &[]).expect("register");
+        assert!(
+            matches!(
+                approve_with_approver_type(&conn, &pid_b, "ai:bob", ApproveSurface::Http).unwrap(),
+                ApproveOutcome::Approved
+            ),
+            "a registered, non-requester designated approver must approve"
+        );
+
+        // (D) Wrong-approver refusal is UNCHANGED and still fires FIRST, so
+        //     the new gate never leaks whether a non-designated id happens to
+        //     be registered.
+        let pid_d = queue_pending_action(
+            &conn,
+            crate::models::GovernedAction::Store,
+            ns_b,
+            None,
+            "ai:carol",
+            &payload_b,
+        )
+        .unwrap();
+        match approve_with_approver_type(&conn, &pid_d, "ai:mallory", ApproveSurface::Http).unwrap()
+        {
+            ApproveOutcome::Rejected(m) => assert!(
+                m.contains("designated approver is"),
+                "wrong-approver message must be unchanged, got: {m}"
+            ),
+            other => panic!("expected wrong-approver rejection, got {other:?}"),
+        }
+    }
+
+    /// #2538 — the LocalOperator (single-operator MCP/CLI) surface keeps the
+    /// `AI_MEMORY_AGENT_ID` opt-in, byte-identically to the Human arm's
+    /// #1787/#1796 posture. In the trust-all default the requester and the
+    /// approver both resolve to the SAME durable `host:<hostname>` id
+    /// (#1720 B1), and the named-approver arm admits exactly ONE approver, so
+    /// an unconditional reject-self would leave the lone operator's own queued
+    /// actions permanently unapprovable with no adversary present.
+    ///
+    /// 3x3 adversarial vote (9 lenses, `4d3ea1c5` protocol): S1
+    /// (surface-keyed, mirroring Human) beat S2 (unconditional) 7-2.
+    #[test]
+    fn agent_arm_local_operator_keeps_opt_in_2538() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+        let conn = test_db();
+        let ns = "ns/a2538local";
+        seed_agent_approver_ns(&conn, ns, "ai:solo");
+        let payload = serde_json::json!({"title": "x", "namespace": ns});
+        let pid = queue_pending_action(
+            &conn,
+            crate::models::GovernedAction::Store,
+            ns,
+            None,
+            "ai:solo",
+            &payload,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                approve_with_approver_type(&conn, &pid, "ai:solo", ApproveSurface::LocalOperator)
+                    .unwrap(),
+                ApproveOutcome::Approved
+            ),
+            "LocalOperator with the opt-in OFF must stay byte-unchanged \
+             (no single-operator self-lock)"
+        );
     }
 
     /// #1787 (5-agent vote 4d3ea1c5 → C) — under the multi-tenant opt-in

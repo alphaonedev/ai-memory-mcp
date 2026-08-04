@@ -191,6 +191,9 @@ Coverage classify (docs-only short-circuit)
 #
 # Job-level `if:`; ratcheted like the ci.yml seven above.
 Per-Module Coverage Thresholds
+Doc symbol/path anchor gate (#2629)
+SDK-path vs routes.rs membership gate (#2629)
+Named-CI-job existence + enforcement-truthfulness gate (#2629)
 #
 # ---------------------------------------------------------------------------
 # KNOWN GAPS — declared here so they are not mistaken for oversights.

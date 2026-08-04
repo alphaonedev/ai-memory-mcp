@@ -313,10 +313,258 @@ check_env_var_census_rule() {
     done
 }
 
+# --------------------------------------------------------------------
+# #2492 — GENERALISED NUMERIC-CLAIM SCANNER + CURRENT-RELEASE ATTRIBUTION
+# --------------------------------------------------------------------
+#
+# THE DEFECT THIS CLOSES. The 3x7 claims audit
+# (docs/audit/3x7-claims-register-2026-08-01.md 3.3.1) found README.md
+# carrying FIVE stale SSOT values — 94→92/93 routes, 88→78 schema,
+# 30→28 Memory fields, 103→101 tools, 91/89→89/87 CLI subcommands —
+# WITH THIS GATE GREEN. README is, and was, in DOC_FILES, so the gap
+# was never the file walk: it was the PATTERN SET. Every rule above is
+# a hand-written regex pinned to one exact phrasing
+# (`\*\*N production \`\.route\(\.\.\.\)\` registrations\*\*`), and a
+# document that says the same thing in the seventh way nobody enumerated
+# is invisible. A gate that greens a page carrying five stale SSOT
+# values is the #2444 "reports success while doing nothing" shape.
+#
+# THE METHOD, chosen so it does not rot the way the hand-written set
+# did: for each SSOT const, match a small set of NOUN-PHRASE ANCHORS
+# (`HTTP route registrations`, `unique URL paths`, `unique paths`,
+# `MCP tools`, `-entry surface`, `CLI subcommands`, `-field \`Memory\``,
+# `schema **v`) and extract ANY adjacent integer in bold / code / plain
+# form. A new phrasing of an EXISTING claim is caught by the anchor;
+# only a genuinely new NOUN gets past, and that is a much rarer event
+# than a re-worded sentence.
+#
+# THE HISTORICAL GUARD IS LOAD-BEARING and must not be weakened. The
+# register notes the drift direction is "consistently toward MORE
+# CLAIMED ENFORCEMENT THAN EXISTS" — but README ALSO carries legitimate
+# release-narrative paragraphs (`**v0.8.0 (…) — prior release.** … At
+# the v0.8.0 release, surface was: schema **v70**, **100** MCP tools …,
+# **91** HTTP route registrations …, a **27-field** `Memory`.`) whose
+# numbers are TRUE STATEMENTS ABOUT A PAST RELEASE. Re-pointing them at
+# the live canonical would FALSIFY the release history — the same
+# reasoning that keeps CHANGELOG.md, the RFC files, and the three
+# frozen v0.7 migration guides out of DOC_FILES entirely. So a line
+# that OPENS a release-narrative paragraph (`^**v<semver>`) attributed
+# to a NON-current release, or that says `At the v<x> release` /
+# `release, surface was`, is skipped by the numeric rules.
+#
+# That guard would be a hole on its own — a stale paragraph could keep
+# calling itself "current release" forever and buy silence for every
+# number in it. RULE N1 closes it: a paragraph labelled `— current
+# release` MUST attribute the Cargo.toml version. That is the mechanism
+# that catches README's `**v0.9.0 — current release.** … schema **v78**,
+# **101** MCP tools …, **92** HTTP route registrations …, **89** CLI
+# subcommands … (**87** in the default build), a **28-field** `Memory`` —
+# the exact paragraph carrying four of the register's five shapes. Once
+# it is honestly relabelled `prior release` (or replaced by a v1.0.0
+# paragraph) the numbers are either history (skipped) or current
+# (checked). It is the same discipline as the #12 doc-drift
+# release-version-attribution rule above, applied to the paragraph lead
+# instead of the tool-count sentence.
+check_generalised_numeric_claims() {
+    local out
+    out="$(
+        GATE_DOC_FILES="${DOC_FILES[*]}" \
+        C_ROUTES="$CANONICAL_ROUTES_COUNT" \
+        C_PATHS="$CANONICAL_UNIQUE_PATHS_COUNT" \
+        C_SCHEMA="$CANONICAL_SCHEMA_VERSION" \
+        C_FIELDS="$CANONICAL_MEMORY_FIELDS" \
+        C_FULL_TOOLS="$CANONICAL_FULL_TOOL_COUNT" \
+        C_CLI_SAL="$CANONICAL_CLI_SAL" \
+        C_CLI_DEFAULT="$CANONICAL_CLI_DEFAULT" \
+        C_RELEASE="$CANONICAL_RELEASE_VERSION" \
+        python3 - <<'PY'
+import os
+import re
+
+docs = os.environ["GATE_DOC_FILES"].split()
+release = os.environ["C_RELEASE"]
+
+canon = {
+    "EXPECTED_PRODUCTION_ROUTES_COUNT": os.environ["C_ROUTES"],
+    "EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT": os.environ["C_PATHS"],
+    "CURRENT_SCHEMA_VERSION": os.environ["C_SCHEMA"],
+    "Memory::FIELD_COUNT": os.environ["C_FIELDS"],
+    "Profile::full().expected_tool_count()": os.environ["C_FULL_TOOLS"],
+    "EXPECTED_CLI_SUBCOMMANDS_SAL": os.environ["C_CLI_SAL"],
+    "EXPECTED_CLI_SUBCOMMANDS_DEFAULT": os.environ["C_CLI_DEFAULT"],
+}
+
+# `**92**` / `92` / `` `92` `` -- bold, code-span, or bare.
+NUM = r"(?:\*\*|`)?([0-9]+)(?:\*\*|`)?"
+
+RULES = [
+    ("EXPECTED_PRODUCTION_ROUTES_COUNT", [
+        NUM + r"[ ]*(?:\*\*)?[ ]*(?:production[ ]+)?(?:HTTP|REST)[ ]+routes?[ ]+registrations",
+        NUM + r"[ ]*(?:\*\*)?[ ]*(?:production[ ]+)?HTTP[ ]+routes\b",
+        NUM + r"[ ]*production[ ]+`\.route\(\.\.\.\)`[ ]+registrations",
+        NUM + r"[ ]*(?:\*\*)?[ ]*route[ ]+registrations",
+    ]),
+    ("EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT", [
+        NUM + r"[ ]*(?:\*\*)?[ ]*unique[ ]+(?:URL[ ]+)?paths",
+    ]),
+    # BOLD-ONLY, deliberately. A bare `schema v52` is the ladder-history
+    # phrasing the pre-existing CURRENT_SCHEMA_VERSION rule above already
+    # refuses to touch ("v52 added X", RFC back-references, the three
+    # frozen v0.7 migration guides); a bare-word anchor here would
+    # red-line ~30 lines of legitimate history across ROADMAP, the
+    # PORTABILITY spec, and the compliance inventory. `schema **vNN**`
+    # is the SURFACE-SUMMARY phrasing — the register's own stale shape.
+    ("CURRENT_SCHEMA_VERSION", [
+        r"schema[ ]+\*\*v([0-9]+)\*\*",
+    ]),
+    ("Memory::FIELD_COUNT", [
+        NUM + r"-field(?:\*\*)?[ ]*(?:`Memory`|struct)",
+    ]),
+    # `--profile full`-anchored, deliberately. A bare `N MCP tools`
+    # matches the per-release capability ladder ("5 MCP tools", "4 MCP
+    # tools") and per-family subset counts, none of which are claims
+    # about the full-profile total.
+    ("Profile::full().expected_tool_count()", [
+        NUM + r"[ ]*(?:\*\*)?[ ]*MCP[ ]+tools[ ]+at[ ]+`--profile[ ]+full`",
+        NUM + r"-entry(?:\*\*)?[ ]+surface",
+        NUM + r"[ ]*(?:\*\*)?[ ]*advertised[ ]+entries[ ]+at[ ]+`--profile[ ]+full`",
+    ]),
+    ("EXPECTED_CLI_SUBCOMMANDS_SAL", [
+        NUM + r"[ ]*(?:\*\*)?[ ]*(?:CLI[ ]+|top-level[ ]+)?subcommands[ ]+under[ ]+`--features[ ]+sal",
+        r"yields[ ]+\*\*([0-9]+)\*\*[ ]+by[ ]+unlocking",
+    ]),
+    ("EXPECTED_CLI_SUBCOMMANDS_DEFAULT", [
+        NUM + r"[ ]*(?:\*\*)?[ ]*(?:CLI[ ]+|top-level[ ]+)?subcommands[ ]+in[ ]+the[ ]+default[ ]+build",
+        NUM + r"[ ]*(?:\*\*)?[ ]*in[ ]+the[ ]+default[ ]+build",
+    ]),
+]
+RULES = [(k, [re.compile(p) for p in ps]) for k, ps in RULES]
+
+# `— current release` paragraph lead. RULE N1.
+CURRENT_RELEASE = re.compile(
+    r"\*\*v([0-9]+\.[0-9]+\.[0-9]+)[^*\n]{0,120}?[-—]{1,2}[ ]*current release"
+)
+# Release-narrative paragraph lead: `**v0.8.0 (`x`) — prior release.**`
+PARA_LEAD = re.compile(r"^\s*\*\*v([0-9]+\.[0-9]+\.[0-9]+)")
+# Unconditionally past-tense phrasings.
+PAST_TENSE = [
+    re.compile(r"\bAt the v[0-9]+\.[0-9]+\.[0-9]+ release\b"),
+    re.compile(r"\brelease, surface was\b"),
+    re.compile(r"\bat the v[0-9]+\.[0-9]+\.[0-9]+ release\b"),
+]
+# Pre-existing historical-claim exclusions, preserved verbatim in intent
+# from the CURRENT_SCHEMA_VERSION rule above: `v52 added X`,
+# changelog-style headers, RFC back-references.
+HISTORICAL = [
+    re.compile(r"^\s*#{1,6}\s"),
+    re.compile(r"\bv[0-9]+ added\b"),
+    re.compile(r"\bwas [0-9]+ at v[0-9]"),
+    re.compile(r"\bwas (?:four|five|six|seven|eight|nine|ten) at v[0-9]"),
+    # ROADMAP 11.3.1 self-declares its frozen baselines and even
+    # self-corrects inline ("the current substrate has advanced to
+    # schema 88, 103 MCP tools"). Re-pointing those numbers at the
+    # canonical would DESTROY the historical record they exist to keep.
+    re.compile(r"\bShip state at v[0-9]+\.[0-9]+"),
+    re.compile(r"\bFrozen v[0-9]+\.[0-9]+[^ ]* baseline\b"),
+]
+
+
+def is_historical(line):
+    m = PARA_LEAD.match(line)
+    if m and m.group(1) != release:
+        return True
+    if any(p.search(line) for p in PAST_TENSE):
+        return True
+    return any(p.search(line) for p in HISTORICAL)
+
+
+for f in docs:
+    try:
+        text = open(f, encoding="utf-8").read()
+    except OSError:
+        continue
+    for ln, line in enumerate(text.splitlines(), 1):
+        ctx = line.strip()[:160].replace("\t", " ")
+        m = CURRENT_RELEASE.search(line)
+        if m and m.group(1) != release:
+            print(
+                "CURRENT_RELEASE_ATTRIBUTION\t"
+                f"{f}\t{ln}\tv{m.group(1)}\tv{release}\t{ctx}"
+            )
+        if is_historical(line):
+            continue
+        for key, pats in RULES:
+            for pat in pats:
+                for hit in pat.finditer(line):
+                    val = hit.group(1)
+                    if val != canon[key]:
+                        print(f"{key}\t{f}\t{ln}\t{val}\t{canon[key]}\t{ctx}")
+PY
+    )" || true
+
+    # ---- PENDING-FIX ledger -------------------------------------------
+    # Format, one per line: `<doc-file> <RULE_KEY> <claimed-value> #<issue>`
+    # A MALFORMED entry HARD-FAILS (the ledger cannot rot into prose).
+    # A STALE entry — one that suppresses nothing — is a loud NOTICE and
+    # NOT a failure, exactly as `dual-trigger-cancel-allow.txt` handles
+    # `token-budget.yml`: a stale entry can only suppress a failure that
+    # no longer happens, and failing on it would red whichever PR lost
+    # the race to the document-correction lane that removed the claim.
+    # Five sibling lanes are correcting these documents concurrently; a
+    # stale-fails ledger would guarantee exactly that collision.
+    # The key is `<file> <rule> <value>` and NOT a line number precisely
+    # so a lane's reflow does not silently re-open a suppression.
+    local ledger="$REPO_ROOT/scripts/qc-allowlists/doc-numeric-claims-pending.txt"
+    local ledger_keys="" ledger_used="" bad_entry=0
+    if [[ -f "$ledger" ]]; then
+        while IFS= read -r raw; do
+            local entry="${raw%%#*}"
+            entry="$(printf '%s' "$entry" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [[ -z "$entry" ]] && continue
+            # shellcheck disable=SC2086
+            set -- $entry
+            if [[ $# -ne 3 ]] || ! [[ "$3" =~ ^v?[0-9][0-9.]*$ ]] || ! grep -qE '#[0-9]+' <<<"$raw"; then
+                printf 'FAIL: doc-numeric-claims ledger: malformed entry "%s"\n' "$raw" >&2
+                printf '       expected: <doc-file> <RULE_KEY> <claimed-value> #<issue>\n' >&2
+                bad_entry=1
+                continue
+            fi
+            ledger_keys="${ledger_keys}${1}|${2}|${3}"$'\n'
+        done < "$ledger"
+    fi
+    if [[ "$bad_entry" -ne 0 ]]; then
+        fail_count=$((fail_count + 1))
+    fi
+
+    if [[ -n "$out" ]]; then
+        while IFS=$'\t' read -r rule f ln val expect ctx; do
+            [[ -z "${rule:-}" ]] && continue
+            local key="${f}|${rule}|${val}"
+            if [[ -n "$ledger_keys" ]] && grep -Fxq "$key" <<<"$ledger_keys"; then
+                ledger_used="${ledger_used}${key}"$'\n'
+                continue
+            fi
+            emit_fail "$rule" "$f" "$ln" "$val" "$expect" "$ctx"
+        done <<<"$out"
+    fi
+
+    if [[ -n "$ledger_keys" ]]; then
+        local k
+        while IFS= read -r k; do
+            [[ -z "$k" ]] && continue
+            if ! grep -Fxq "$k" <<<"$ledger_used"; then
+                printf 'NOTICE: doc-numeric-claims ledger entry is STALE (suppresses nothing) — delete it: %s\n' \
+                    "$(tr '|' ' ' <<<"$k")" >&2
+            fi
+        done < <(sort -u <<<"$ledger_keys")
+    fi
+}
+
 run_all_rules() {
     fail_count=0
     check_schema_version_rule
     check_env_var_census_rule
+    check_generalised_numeric_claims
     # MCP tool count at --profile full
     check_narrative_count_rule \
         "Profile::full().expected_tool_count() (registry tools)" \
@@ -420,8 +668,12 @@ run_all_rules() {
 # scripts/check-vendor-literals.sh self-test convention.
 
 run_self_test() {
-    local tmpdir
-    tmpdir="$(mktemp -d)"
+    # Scratch lives UNDER the repo, never system /tmp and never
+    # `mktemp -d` (CLAUDE.md project hard rule; the #2494 /
+    # migration-ladder gates set the precedent).
+    local tmpdir="$REPO_ROOT/.local-runs/docs-ssot-selftest-$$"
+    rm -rf "$tmpdir"
+    mkdir -p "$tmpdir"
     trap 'rm -rf "$tmpdir"' RETURN
 
     cd "$tmpdir"
@@ -532,6 +784,176 @@ EOF
     else
         echo "PASS: self-test — gate correctly caught the contrived drift"
     fi
+
+    # ================================================================
+    # #2492 R-203 — the five README shapes that SLIPPED PAST THIS GATE
+    # ================================================================
+    #
+    # This leg is the whole point. It plants the EXACT pre-fix README
+    # phrasings the 3x7 claims audit found
+    # (docs/audit/3x7-claims-register-2026-08-01.md 3.3.1) and asserts
+    # BOTH directions:
+    #
+    #   * the FROZEN pre-fix gate (scripts/test/fixtures/
+    #     docs-vs-ssot-prefix-2492.sh, verbatim at 03bbd556) ACCEPTS
+    #     them — reproducing the defect, so the leg is not tautological
+    #   * the LIVE gate REJECTS them
+    #
+    # Every number that the PRE-FIX pattern set CAN see is set to the
+    # fixture canonical on purpose (e.g. `73 unique URL paths`), so the
+    # old gate's pass is a real pass on the planted text and not an
+    # accident of some unrelated rule staying quiet.
+    local prefix_gate="$REPO_ROOT/scripts/test/fixtures/docs-vs-ssot-prefix-2492.sh"
+    if [[ ! -x "$prefix_gate" ]]; then
+        echo "FAIL: self-test — frozen pre-fix gate missing at $prefix_gate" >&2
+        cd "$REPO_ROOT"
+        exit 1
+    fi
+
+    # A CLAUDE.md that BOTH gates consider clean, so each leg below
+    # isolates exactly the README text it plants.
+    cat > CLAUDE.md <<'CLEANEOF'
+Fixture CLAUDE.md — deliberately carries no narrative counts.
+CLEANEOF
+
+    # Fixture canonicals: routes 87 · paths 73 · schema 53 · fields 26
+    #                     tools 12 · cli 78 default / 80 sal · release 9.9.9
+    cat > README.md <<'STALEEOF'
+Surface: **92** HTTP route registrations (73 unique URL paths).
+2. **HTTP / mTLS daemon** -- 93 REST route registrations (73 unique URL paths) on `127.0.0.1:9077`.
+- **92 HTTP routes (78 unique paths)** -- full REST API.
+Surface: schema **v78**, **101** MCP tools at `--profile full`.
+| **keyword** | FTS5 only | Baseline 101-entry surface | 0 MB |
+| **smart** | Hybrid | full **101-entry** surface | ~1 GB |
+The **CLI** (**89** CLI subcommands under `--features sal`/`sal-postgres` (**87** in the default build)).
+a **28-field** `Memory`.
+STALEEOF
+
+    local prefix_out new_out
+    if ! prefix_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$prefix_gate" 2>&1); then
+        echo "FAIL: self-test R-203 — the FROZEN pre-fix gate REJECTED the planted shapes." >&2
+        echo "       The whole finding was that it accepted them; this leg is broken, not the gate." >&2
+        printf '%s\n' "$prefix_out" >&2
+        cd "$REPO_ROOT"
+        exit 1
+    fi
+    echo "PASS: self-test R-203 — frozen pre-fix gate ACCEPTS all five stale README shapes (the #2492 defect, reproduced)"
+
+    if new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+        echo "FAIL: self-test — the WIDENED gate accepted the stale README shapes" >&2
+        cd "$REPO_ROOT"
+        exit 1
+    fi
+    local shape rules_missing=0
+    for shape in \
+        "EXPECTED_PRODUCTION_ROUTES_COUNT: README.md:1 claims \"92\"" \
+        "EXPECTED_PRODUCTION_ROUTES_COUNT: README.md:2 claims \"93\"" \
+        "EXPECTED_PRODUCTION_ROUTES_COUNT: README.md:3 claims \"92\"" \
+        "EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: README.md:3 claims \"78\"" \
+        "CURRENT_SCHEMA_VERSION: README.md:4 claims \"78\"" \
+        "Profile::full().expected_tool_count(): README.md:4 claims \"101\"" \
+        "Profile::full().expected_tool_count(): README.md:5 claims \"101\"" \
+        "Profile::full().expected_tool_count(): README.md:6 claims \"101\"" \
+        "EXPECTED_CLI_SUBCOMMANDS_SAL: README.md:7 claims \"89\"" \
+        "EXPECTED_CLI_SUBCOMMANDS_DEFAULT: README.md:7 claims \"87\"" \
+        "Memory::FIELD_COUNT: README.md:8 claims \"28\"" \
+    ; do
+        if ! grep -qF "$shape" <<<"$new_out"; then
+            echo "FAIL: self-test — widened gate did not flag: $shape" >&2
+            rules_missing=1
+        fi
+    done
+    if [[ "$rules_missing" -ne 0 ]]; then
+        printf '%s\n' "$new_out" >&2
+        cd "$REPO_ROOT"
+        exit 1
+    fi
+    echo "PASS: self-test — widened gate REJECTS all 11 planted claims across the five register shapes"
+
+    # ---- HISTORICAL CONTROL: a legitimate past-release mention PASSES.
+    # The register's own guidance and this gate's original design both
+    # depend on it: README carries `**v0.8.0 (…) — prior release.** …
+    # surface was: schema **v70**, **100** MCP tools …` and ROADMAP
+    # 11.3.1 carries a self-correcting frozen v0.7.1 baseline. Firing on
+    # those would falsify the release history, so a regression HERE is a
+    # data-integrity defect in its own right.
+    cat > README.md <<'HISTEOF'
+**v9.8.6 (`legacy`) — prior release.** At the v9.8.6 release, surface was: schema **v41**, **99** MCP tools at `--profile full`, **77** HTTP route registrations (70 unique paths), **60** CLI subcommands under `--features sal` (**58** in the default build), a **21-field** `Memory`.
+**Ship state at v9.8.5 (frozen).** _(Frozen v9.8.5 baseline.)_ **55** HTTP route registrations / 44 unique paths, **90** MCP tools at `--profile full`.
+schema v41 added the widget table; v40 added the gadget table.
+### schema v39 — historical heading
+HISTEOF
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+        echo "FAIL: self-test — the widened gate fired on LEGITIMATE HISTORICAL mentions." >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        cd "$REPO_ROOT"
+        exit 1
+    fi
+    echo "PASS: self-test — historical release-narrative / frozen-baseline / ladder mentions still PASS"
+
+    # ---- CURRENT-RELEASE ATTRIBUTION (rule N1): a paragraph that calls
+    # itself the current release must name the Cargo.toml version. This
+    # is what stops the historical guard above from becoming a hole a
+    # stale "current release" paragraph could hide behind forever.
+    cat > README.md <<'ATTREOF'
+**v9.8.7 — current release.** A perfectly ordinary paragraph.
+ATTREOF
+    if new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+        echo "FAIL: self-test — gate accepted a stale '— current release' attribution" >&2
+        cd "$REPO_ROOT"
+        exit 1
+    fi
+    grep -q 'CURRENT_RELEASE_ATTRIBUTION' <<<"$new_out" || {
+        echo "FAIL: self-test — stale current-release paragraph not flagged by its own rule" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    echo "PASS: self-test — a '— current release' paragraph naming a stale version is REJECTED"
+
+    # ---- PENDING-FIX LEDGER, all three directions.
+    mkdir -p "$tmpdir/scripts/qc-allowlists"
+    local led="$tmpdir/scripts/qc-allowlists/doc-numeric-claims-pending.txt"
+    cat > README.md <<'LEDEOF'
+Surface: **92** HTTP route registrations (73 unique URL paths).
+a **28-field** `Memory`.
+LEDEOF
+    printf 'README.md EXPECTED_PRODUCTION_ROUTES_COUNT 92 #1\n' > "$led"
+    new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) && {
+        echo "FAIL: self-test — ledger suppressed an UNLEDGERED claim (28-field Memory)" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    grep -q 'FAIL: EXPECTED_PRODUCTION_ROUTES_COUNT:' <<<"$new_out" && {
+        echo "FAIL: self-test — a LEDGERED claim was still reported as a failure" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    grep -q 'FAIL: Memory::FIELD_COUNT:' <<<"$new_out" || {
+        echo "FAIL: self-test — the unledgered claim was not reported" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    echo "PASS: self-test — ledger suppresses exactly its own key and nothing else"
+
+    # STALE entry => loud NOTICE, exit 0 (the dual-trigger-cancel-allow
+    # precedent: it can only suppress a failure that no longer happens,
+    # and failing on it would red whichever PR lost the race to the
+    # document-correction lane).
+    cat > README.md <<'CLEANDOC'
+Nothing to see here.
+CLEANDOC
+    printf 'README.md EXPECTED_PRODUCTION_ROUTES_COUNT 92 #1\n' > "$led"
+    if ! new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+        echo "FAIL: self-test — a STALE ledger entry FAILED the gate (must be a NOTICE)" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    grep -q 'NOTICE: doc-numeric-claims ledger entry is STALE' <<<"$new_out" || {
+        echo "FAIL: self-test — a STALE ledger entry produced no NOTICE (the ledger can rot)" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    echo "PASS: self-test — a STALE ledger entry is a loud NOTICE, not a failure"
+
+    # MALFORMED entry => HARD FAIL (the ledger cannot rot into prose).
+    printf 'README.md EXPECTED_PRODUCTION_ROUTES_COUNT\n' > "$led"
+    new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1) && {
+        echo "FAIL: self-test — a MALFORMED ledger entry did not fail the gate" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    grep -q 'malformed entry' <<<"$new_out" || {
+        echo "FAIL: self-test — malformed ledger entry not named in the failure" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    echo "PASS: self-test — a MALFORMED ledger entry HARD-FAILS"
+
     cd "$REPO_ROOT"
 }
 
