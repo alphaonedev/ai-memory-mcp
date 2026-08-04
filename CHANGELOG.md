@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (HTTP get-standard no longer serves private standard bodies)
+
+- **`GET /api/v1/namespaces?namespace=` and path-form `…/{ns}/standard` gate the standard body through `visibility::is_visible_to_caller`** (refs [#2543](https://github.com/alphaonedev/ai-memory-mcp/issues/2543); #959 residual; CWE-284). Pre-fix the sqlite arm passed `caller=None` into `handle_namespace_get_standard` and the postgres arm used `CallerContext::for_admin`, so any caller who could name a namespace received title + content + governance of a default-private standard (the last unfiltered read of that body after #2537 closed the injection path). Both arms now resolve `X-Agent-Id` and share the MCP honesty shape: count-only `standards_withheld`, no id/owner leak. Shared-scope and owner reads unchanged. CLI/MCP stdio `None` trust-all posture unchanged.
+
 ### Fixed (namespace set-standard no longer caller-opt-in / silent claim)
 
 - **MCP/HTTP `set_namespace_standard` always enforces ownership; unowned rows are never silently claimed** (refs [#2541](https://github.com/alphaonedev/ai-memory-mcp/issues/2541); CWE-284). Pre-fix omitting `agent_id` skipped the #929 gate (could rebind any owned memory), and the unowned arm rewrote `agent_id` + stamped `scope=shared` (irreversible confidentiality downgrade). Ownership is always checked; claim rewrite removed. Daemon principal is the explicit CLI/operator bypass.

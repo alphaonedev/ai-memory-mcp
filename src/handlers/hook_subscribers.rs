@@ -811,10 +811,22 @@ pub async fn get_namespace_standard_qs(
         // thread headers through so the gate sees the X-Agent-Id.
         return list_namespaces(State(app), headers).await.into_response();
     };
-    // #945-sibling — when ns IS supplied, this becomes a per-namespace
-    // standard fetch. Currently no caller-vs-owner gate on this read
-    // path (filed as a follow-up under #959).
-    let _ = &headers;
+
+    // v1.0.0 #2543 / #959 residual — explicit HTTP fetch of a namespace
+    // standard is gated through the SAME canonical
+    // `visibility::is_visible_to_caller` predicate as #2537 injection and
+    // MCP `memory_namespace_get_standard`. Pre-fix this route passed
+    // `None` (sqlite) / `CallerContext::for_admin` (postgres), so any
+    // caller who could name a namespace received title + content + the
+    // full governance blob of a default-private standard. Withholding
+    // matches the MCP honesty shape: count-only `standards_withheld`,
+    // never the withheld id / owner / namespace (existence-oracle pin).
+    let visibility_caller = match resolve_caller_agent_id(None, &headers, None) {
+        Ok(id) => id,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+        }
+    };
 
     // v0.7.0 Wave-3 Continuation 5 (Bucket C / S35) — postgres-backed
     // daemons resolve the namespace standard via the SAL trait. When
@@ -824,12 +836,10 @@ pub async fn get_namespace_standard_qs(
     // the exact namespace.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        // v0.7.0 ship-hardening (2026-05-19): namespace standards are
-        // governance POLICY — readable by any caller that can query
-        // the namespace itself. Use for_admin so the SAL #910
-        // scope=private visibility filter doesn't drop the standard
-        // memory when the requester is not the policy author.
-        let ctx = crate::store::CallerContext::for_admin(sentinels::AI_HTTP_INTERNAL);
+        // Binding lookup is namespace_meta (not a visibility-scoped memory
+        // row). Admin context keeps the binding probe stable; body bytes
+        // still go through `is_visible_to_caller` after a separate get.
+        let bind_ctx = crate::store::CallerContext::for_admin(sentinels::AI_HTTP_INTERNAL);
         let inherit = q.inherit.unwrap_or(false);
         // Build chain leaf → root (most-specific first) by trimming
         // `/segment` until empty. The chain matches the SQLite
@@ -854,61 +864,98 @@ pub async fn get_namespace_standard_qs(
             // `handle_namespace_get_standard` inherit branch which
             // returns `chain` + `standards` arrays.
             let mut standards: Vec<serde_json::Value> = Vec::new();
+            let mut withheld: usize = 0;
             for candidate in &chain {
                 if let Ok(Some((standard_id, parent))) =
-                    app.store.get_namespace_standard(&ctx, candidate).await
+                    app.store.get_namespace_standard(&bind_ctx, candidate).await
                 {
-                    // Pull the standard memory body so the caller can
-                    // see governance + content layered through.
-                    let mem_doc = match app.store.get(&ctx, &standard_id).await {
-                        Ok(m) => json!({
-                            "namespace": candidate,
-                            (field_names::STANDARD_ID): standard_id,
-                            "id": standard_id,
-                            "title": m.title,
-                            "content": m.content,
-                            "priority": m.priority,
-                            (field_names::PARENT_NAMESPACE): parent,
-                            (field_names::GOVERNANCE): m.metadata.get(crate::META_KEY_GOVERNANCE).cloned()
-                                .unwrap_or(serde_json::Value::Null),
-                        }),
-                        Err(_) => json!({
-                            "namespace": candidate,
-                            (field_names::STANDARD_ID): standard_id,
-                            "id": standard_id,
-                            (field_names::PARENT_NAMESPACE): parent,
-                        }),
-                    };
-                    standards.push(mem_doc);
+                    // #2543 — fetch the body under admin (so SAL private
+                    // filter does not collapse Withheld into Absent), then
+                    // apply the canonical predicate before any title /
+                    // content / governance bytes enter the response.
+                    match app.store.get(&bind_ctx, &standard_id).await {
+                        Ok(m)
+                            if crate::visibility::is_visible_to_caller(&m, &visibility_caller) =>
+                        {
+                            standards.push(json!({
+                                "namespace": candidate,
+                                (field_names::STANDARD_ID): standard_id,
+                                "id": standard_id,
+                                "title": m.title,
+                                "content": m.content,
+                                "priority": m.priority,
+                                (field_names::PARENT_NAMESPACE): parent,
+                                (field_names::GOVERNANCE): m.metadata
+                                    .get(crate::META_KEY_GOVERNANCE)
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null),
+                            }));
+                        }
+                        Ok(_) => {
+                            // Binding exists; body not visible — honesty
+                            // count only (never the namespace name of a
+                            // withheld chain link).
+                            withheld += 1;
+                        }
+                        Err(_) => {
+                            // Dangling binding: surface id without body
+                            // (matches pre-fix dangling shape).
+                            standards.push(json!({
+                                "namespace": candidate,
+                                (field_names::STANDARD_ID): standard_id,
+                                "id": standard_id,
+                                (field_names::PARENT_NAMESPACE): parent,
+                            }));
+                        }
+                    }
                 }
             }
-            // Pick the closest (leaf-most) entry as the resolved
+            // Pick the closest (leaf-most) *visible* entry as the resolved
             // standard for the response root level so existing
             // single-standard consumers still see the expected
-            // `standard_id`.
+            // `standard_id` when the caller may read it.
             let closest = standards.first().cloned().unwrap_or(json!({}));
-            return (
-                StatusCode::OK,
-                Json(json!({
-                    "namespace": ns,
-                    "chain": chain,
-                    "standards": standards,
-                    "resolved_namespace": closest.get("namespace").cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                    (field_names::STANDARD_ID): closest.get(field_names::STANDARD_ID).cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                    "id": closest.get("id").cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                    (field_names::PARENT_NAMESPACE): closest.get(field_names::PARENT_NAMESPACE).cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                    (field_names::STORAGE_BACKEND): "postgres",
-                })),
-            )
-                .into_response();
+            let mut body = json!({
+                "namespace": ns,
+                "chain": chain,
+                "standards": standards,
+                "count": standards.len(),
+                "resolved_namespace": closest.get("namespace").cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                (field_names::STANDARD_ID): closest.get(field_names::STANDARD_ID).cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "id": closest.get("id").cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                (field_names::PARENT_NAMESPACE): closest.get(field_names::PARENT_NAMESPACE).cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                (field_names::STORAGE_BACKEND): "postgres",
+            });
+            if withheld > 0 {
+                body[field_names::STANDARDS_WITHHELD] = json!(withheld);
+            }
+            return (StatusCode::OK, Json(body)).into_response();
         }
         // Non-inherit form — single exact-match lookup.
-        match app.store.get_namespace_standard(&ctx, &ns).await {
+        match app.store.get_namespace_standard(&bind_ctx, &ns).await {
             Ok(Some((standard_id, parent))) => {
+                // #2543 — if the bound memory exists and is not visible,
+                // do not leak its id (MCP honesty shape).
+                match app.store.get(&bind_ctx, &standard_id).await {
+                    Ok(m) if !crate::visibility::is_visible_to_caller(&m, &visibility_caller) => {
+                        return (
+                            StatusCode::OK,
+                            Json(json!({
+                                "namespace": ns,
+                                (field_names::STANDARD_ID): serde_json::Value::Null,
+                                "id": serde_json::Value::Null,
+                                (field_names::STANDARDS_WITHHELD): 1,
+                                (field_names::STORAGE_BACKEND): "postgres",
+                            })),
+                        )
+                            .into_response();
+                    }
+                    _ => {}
+                }
                 return (
                     StatusCode::OK,
                     Json(json!({
@@ -943,17 +990,10 @@ pub async fn get_namespace_standard_qs(
         params["inherit"] = json!(inh);
     }
     let lock = app.db.lock().await;
-    // v1.0.0 #2537 — `None` visibility caller, DELIBERATE and scope-bounded.
-    // #2537 closes the UNSOLICITED injection of a standard body into every
-    // recall / session_start response. This route is the EXPLICIT
-    // per-namespace standard fetch, whose no-caller-gate posture is a
-    // pre-existing, in-tree, documented product decision with its own filed
-    // follow-up: see the `#945-sibling` note above and the postgres arm's
-    // `CallerContext::for_admin` ("namespace standards are governance POLICY
-    // — readable by any caller that can query the namespace itself"). Gating
-    // only the sqlite arm here would ALSO fork sqlite/postgres behaviour on
-    // one route. Tracked as its own issue against #959.
-    let result = crate::mcp::handle_namespace_get_standard(&lock.0, &params, None);
+    // #2543 — pass the HTTP principal into the shared MCP choke so the
+    // sqlite arm cannot diverge from postgres / injection / tool surfaces.
+    let result =
+        crate::mcp::handle_namespace_get_standard(&lock.0, &params, Some(&visibility_caller));
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
