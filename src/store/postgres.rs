@@ -19945,26 +19945,56 @@ impl MemoryStore for PostgresStore {
         // protecting every memory in the namespace, so it must be owner-gated
         // like SET. The standard memory's owner is `metadata->>'agent_id'`;
         // refuse a clear by a different named agent (admin/bypass + unowned pass).
+        //
+        // #2545 — INNER JOIN through standard_id yielded no row for severed
+        // (NULL) or dangling standard_ids, which skipped the gate. When a
+        // namespace_meta row exists but the standard is unresolvable, refuse
+        // (non-bypass) so clear cannot disarm fail-closed governance.
         if !ctx.bypass_visibility {
-            let recorded_owner: Option<String> = sqlx::query_scalar(
-                "SELECT m.metadata->>'agent_id' FROM namespace_meta nm \
-                 JOIN memories m ON m.id = nm.standard_id WHERE nm.namespace = $1",
+            let meta_exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM namespace_meta WHERE namespace = $1)",
             )
             .bind(namespace)
-            .fetch_optional(&self.pool)
+            .fetch_one(&self.pool)
             .await
-            .map_err(|e| to_store_err("clear_namespace_standard owner pre-fetch", e))?
-            .flatten();
-            if let Some(owner) = recorded_owner
-                && !owner.is_empty()
-                && owner != "system"
-                && owner != ctx.effective_principal()
-            {
-                return Err(StoreError::PermissionDenied {
-                    action: crate::OP_CLEAR_NAMESPACE_STANDARD.to_string(),
-                    target: namespace.to_string(),
-                    reason: format!("caller does not own this namespace standard (owner: {owner})"),
-                });
+            .map_err(|e| to_store_err("clear_namespace_standard meta-exists", e))?;
+            if meta_exists {
+                let recorded_owner: Option<String> = sqlx::query_scalar(
+                    "SELECT m.metadata->>'agent_id' FROM namespace_meta nm \
+                     JOIN memories m ON m.id = nm.standard_id WHERE nm.namespace = $1",
+                )
+                .bind(namespace)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err("clear_namespace_standard owner pre-fetch", e))?
+                .flatten();
+                match recorded_owner {
+                    Some(owner)
+                        if !owner.is_empty()
+                            && owner != "system"
+                            && owner != ctx.effective_principal() =>
+                    {
+                        return Err(StoreError::PermissionDenied {
+                            action: crate::OP_CLEAR_NAMESPACE_STANDARD.to_string(),
+                            target: namespace.to_string(),
+                            reason: format!(
+                                "caller does not own this namespace standard (owner: {owner})"
+                            ),
+                        });
+                    }
+                    Some(_) => {}
+                    None => {
+                        return Err(StoreError::PermissionDenied {
+                            action: crate::OP_CLEAR_NAMESPACE_STANDARD.to_string(),
+                            target: namespace.to_string(),
+                            reason:
+                                "cannot clear namespace standard: the bound standard memory is \
+                                     unresolvable (severed or dangling). Re-point the standard \
+                                     first, then clear — or use an admin/bypass surface."
+                                    .to_string(),
+                        });
+                    }
+                }
             }
         }
         let rows_affected = sqlx::query("DELETE FROM namespace_meta WHERE namespace = $1")

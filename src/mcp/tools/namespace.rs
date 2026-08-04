@@ -539,26 +539,60 @@ pub(crate) fn handle_namespace_clear_standard(
     // non-owner could disarm protections others rely on, and a non-admin owner
     // could set-but-never-clear). Gate ONLY when identity is claimed
     // (params.agent_id present); daemon-internal + unclaimed callers pass, same
-    // as SET. The bare DELETE carries no owner, but the standard memory's
-    // metadata.agent_id is recoverable via get_namespace_standard → db::get.
+    // as SET.
+    //
+    // #2545 — when the standard is UNRESOLVABLE (severed `standard_id` NULL
+    // post-#2503, or dangling id after memory reap), the pre-fix `&&`-chain
+    // short-circuited and skipped the gate entirely — any claimed caller could
+    // DELETE the last evidence of governance and restore allow-on-silence.
+    // Unresolvable + claimed identity → refuse with a re-point remedy.
     let identity_claimed = params
         .get(param_names::AGENT_ID)
         .and_then(|v| v.as_str())
         .is_some_and(|s| !s.is_empty());
-    if identity_claimed
-        && let Ok(Some(standard_id)) = db::get_namespace_standard(conn, namespace)
-        && let Ok(Some(existing_mem)) = db::get(conn, &standard_id)
-    {
-        let recorded_owner = existing_mem
-            .metadata
-            .get(param_names::AGENT_ID)
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let is_unowned = recorded_owner.is_empty() || recorded_owner == "system";
-        if !is_unowned && recorded_owner != caller && caller != sentinels::DAEMON_PRINCIPAL {
-            return Err(format!(
-                "caller does not own this namespace standard (caller={caller}, owner={recorded_owner})"
-            ));
+    if identity_claimed {
+        let meta_row_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM namespace_meta WHERE namespace = ?1",
+                rusqlite::params![namespace],
+                |_| Ok(1i32),
+            )
+            .is_ok();
+        if meta_row_exists {
+            let resolved = match db::get_namespace_standard(conn, namespace) {
+                Ok(Some(standard_id)) => db::get(conn, &standard_id).map_err(|e| e.to_string())?,
+                Ok(None) => None,
+                Err(e) => return Err(e.to_string()),
+            };
+            match resolved {
+                Some(existing_mem) => {
+                    let recorded_owner = existing_mem
+                        .metadata
+                        .get(param_names::AGENT_ID)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let is_unowned = recorded_owner.is_empty() || recorded_owner == "system";
+                    if !is_unowned
+                        && recorded_owner != caller
+                        && caller != sentinels::DAEMON_PRINCIPAL
+                    {
+                        return Err(format!(
+                            "caller does not own this namespace standard (caller={caller}, owner={recorded_owner})"
+                        ));
+                    }
+                }
+                None => {
+                    if caller != sentinels::DAEMON_PRINCIPAL {
+                        return Err(
+                            "cannot clear namespace standard: the bound standard memory is \
+                             unresolvable (severed or dangling). Re-point the standard with \
+                             memory_namespace_set_standard first, then clear — or use a \
+                             daemon/admin surface."
+                                .to_string(),
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -787,6 +821,37 @@ mod tests {
                 .is_none(),
             "owner clear removes the standard"
         );
+    }
+
+    /// #2545 — claimed non-owner must not clear a SEVERED/dangling binding.
+    #[test]
+    fn clear_standard_refuses_unresolvable_binding_2545() {
+        let conn = fresh_conn();
+        let id = insert_owned(&conn, "ns-clear-2545", "standard", "ai:alice");
+        handle_namespace_set_standard(
+            &conn,
+            &json!({"namespace": "ns-clear-2545", "id": id, "agent_id": "ai:alice"}),
+        )
+        .expect("alice sets");
+        db::delete(&conn, &id).expect("delete standard memory");
+
+        let err = handle_namespace_clear_standard(
+            &conn,
+            &json!({"namespace": "ns-clear-2545", "agent_id": "ai:bob"}),
+        )
+        .expect_err("claimed non-owner clear of unresolvable binding must refuse");
+        assert!(
+            err.contains("unresolvable") || err.contains("does not own"),
+            "got: {err}"
+        );
+        let still: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM namespace_meta WHERE namespace = ?1",
+                ["ns-clear-2545"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still, 1, "namespace_meta row must survive refused clear");
     }
 
     // set_standard: happy path without governance.
