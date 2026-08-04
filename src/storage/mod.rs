@@ -18014,11 +18014,17 @@ pub fn queue_pending_action(
 
 /// v0.6.2 (S34): upsert a `pending_actions` row from a canonical `PendingAction`
 /// struct — used by `sync_push` to apply a peer-originated pending row so
-/// governance state is cluster-consistent. Preserves `approvals` and
-/// decision fields verbatim so re-plays converge. Uses `INSERT ... ON
-/// CONFLICT(id) DO UPDATE` because the originator's id is stable across
-/// peers (unlike `queue_pending_action` which mints a fresh UUID per
-/// queue call).
+/// governance state is cluster-consistent. Uses `INSERT ... ON CONFLICT(id)
+/// DO UPDATE` because the originator's id is stable across peers (unlike
+/// `queue_pending_action` which mints a fresh UUID per queue call).
+///
+/// #2529 — **decision columns are never wire-writable on conflict.**
+/// Pre-fix `ON CONFLICT DO UPDATE` rewrote `status` / `decided_by` /
+/// `decided_at` / `approvals` from the peer, so an enrolled peer could
+/// resurrect a locally-decided row back to `pending` and wipe quorum
+/// history. On conflict we only refresh the request body fields, and only
+/// while the local row is still `pending` (`WHERE` clause). Terminal
+/// decisions converge via `pending_decisions[]`, not `pendings[]`.
 pub fn upsert_pending_action(conn: &Connection, pa: &PendingAction) -> Result<()> {
     let payload_json = serde_json::to_string(&pa.payload)?;
     let approvals_json = serde_json::to_string(&pa.approvals)?;
@@ -18033,11 +18039,8 @@ pub fn upsert_pending_action(conn: &Connection, pa: &PendingAction) -> Result<()
             namespace    = excluded.namespace,
             payload      = excluded.payload,
             requested_by = excluded.requested_by,
-            requested_at = excluded.requested_at,
-            status       = excluded.status,
-            decided_by   = excluded.decided_by,
-            decided_at   = excluded.decided_at,
-            approvals    = excluded.approvals",
+            requested_at = excluded.requested_at
+         WHERE pending_actions.status = 'pending'",
         params![
             pa.id,
             pa.action_type,
