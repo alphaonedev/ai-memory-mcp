@@ -16,7 +16,7 @@
 |------|--------|----------|
 | **1 Structural confinement** | PASS | `push_lanes` exhaustiveness + shared `inbound_*`; links/signals/crypto lanes; pull path #2480 via #2685 `a9b77b24`; residuals #2529/#2536/#2532 closed (#2694/#2696/#2698) |
 | **2 Claims** | PASS | Merge order **#2655 → #2656 → #2668 → #2659 LAST** (… `f95d889e`) |
-| **Packaging #2676** | PASS with residual | #2686 `d742f331` — `ai-memory features` + `assert-compiled-features.sh` |
+| **Packaging #2676** | PASS | #2686 `d742f331` — `ai-memory features` + `assert-compiled-features.sh`; release/Dockerfile ship `--features sal` + assert |
 | **3 Measured evidence** | PASS | DO do-perf: asserted sal-postgres binary @ `d742f331`; PG18+AGE+pgvector; hostssl cleartext REFUSED; TLS1.3 verify-full; 20 stores; droplets torn down |
 | **4 Agreement vote** | PASS | 3/3 AGREE with residuals (package tip `b95ad978`) |
 
@@ -40,7 +40,7 @@
 - **#2532** via #2698 (`1c12c988`) — REJECT namespace-confined same as APPROVE (closes unauthorized foreign veto)
 
 ### Packaging / release-channel residual
-5. **Release.yml / Dockerfile default feature set** may still omit `sal` / `sal-postgres` — certification measured an **asserted** feature build; operators must not tag without verifying release artifact features via `ai-memory features` / assert script.
+5. **Release channel ships `--features sal`** (Dockerfile + `release.yml` matrix) and asserts via `scripts/assert-compiled-features.sh` (`sqlite-bundled` + `sal`). **`sal-postgres` is not** on every multi-OS release binary (native sqlx weight); PG deployments use an asserted `sal-postgres` build (Gate3 measure tip `d742f331` / plan-c image). Operators still verify cut artifacts with `ai-memory features` / assert script before publish.
 
 ### Capacity / follow-on (not gate-blocking for this cert claim set)
 6. **Landed capacity (inventory at tip):** #2643 (`8aa83e6fe989`, authz #2538/#2633); #2689 (`9136b5a33259`, signed re-land of #2644 bulk funnel); #2662 (`3bd01c329e65`, delete-lane DLQ #2498); #2663 (`b3096c156373`, /sync/since cursor #2441); #2673 (`0d50789b`, erasure outbox #2446).
