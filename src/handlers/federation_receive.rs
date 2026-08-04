@@ -3649,7 +3649,7 @@ mod tests {
                 ..PeerScope::default()
             },
         );
-        let cfg = PeerAttestationConfig { peers };
+        let cfg = PeerAttestationConfig::from_peers(peers);
         let zero = PeerAttestationConfig::default();
 
         // (1) Zero-config faith posture (no allowlist): the claim is trusted
@@ -3743,7 +3743,7 @@ mod tests {
                 ..PeerScope::default()
             },
         );
-        let cfg = PeerAttestationConfig { peers };
+        let cfg = PeerAttestationConfig::from_peers(peers);
         let zero = PeerAttestationConfig::default();
 
         // EXPLOIT (blocked): forge a pending requested_by="victim".

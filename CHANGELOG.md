@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (a typo in `AI_MEMORY_FED_PEER_ATTESTATION` no longer wide-opens federated DELETE)
+
+- **Malformed or empty-present peer-attestation config no longer degrades to zero-config faith replication** (refs [#2504](https://github.com/alphaonedev/ai-memory-mcp/issues/2504); CWE-284). Pre-fix `from_env` treated parse error like env-absent: `has_allowlist() == false`, which turns **off** the federated-delete namespace gate and the #1056 TOFU 401 while the WARN claimed "default-deny". Read `/sync/since` and destructive DELETE took opposite postures from the same broken value.
+  - **Unset vs present:** env absent/empty → genuine zero-config (`has_allowlist` false). Env set (valid JSON including `{}`, or unparseable) → configured posture (`has_allowlist` true); empty peer map fails closed (no peer enrolled).
+  - **WARN** names CONFIGURED-BROKEN: confinement stays ON; federated DELETE is not wide-open.
+  - **`PeerScope` is `deny_unknown_fields`** so a typo'd key (`allowed_namespace`) fails closed instead of silent enrolled-unscoped.
+  - Zero-config meshes (#2491) unchanged when the env var is truly unset.
+
 ### Fixed (GDPR Art. 17: MCP / CLI erasure did not replicate while writes did)
 
 - **MCP `memory_delete` / `memory_forget` and CLI `delete` / `forget` now queue the erasure into a durable outbox that the daemon's existing federation push-DLQ replay worker drains and fans out** (refs [#2446](https://github.com/alphaonedev/ai-memory-mcp/issues/2446); GDPR Article 17; 9-lens 3x3 adversarial vote citing `4d3ea1c5`, **option B, 8 of 9 lenses**). `sync::broadcast_delete_quorum` had exactly ONE production caller — the HTTP `DELETE /api/v1/memories/{id}` handler. Every other erasure funnel was purely local, so an agent calling `memory_forget` over MCP erased locally, got `success`, and every federated replica kept the row, re-served it, and could later LWW-resurrect it. The STORE path meanwhile fanned out. **Anti-entropy catch-up cannot cover this**: it propagates writes by PULLING rows, and an erased row is exactly the thing it can no longer see — only an explicit tombstone push can carry an erasure.
