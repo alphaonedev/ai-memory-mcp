@@ -121,7 +121,6 @@ fn build_cfg(peer_url: &str) -> FederationConfig {
         sender_agent_id: "ai:fed-receive-cov".to_string(),
         api_key: None,
         signing_key: None,
-        #[cfg(feature = "sal")]
         dlq_sink: None,
     }
 }
@@ -201,7 +200,6 @@ async fn catchup_visits_every_peer_despite_one_failing() {
         sender_agent_id: "ai:fed-receive-cov".to_string(),
         api_key: None,
         signing_key: None,
-        #[cfg(feature = "sal")]
         dlq_sink: None,
     };
     catchup_once_for_tests(&cfg).await;

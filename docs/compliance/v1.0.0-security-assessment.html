@@ -149,6 +149,25 @@ footer a{color:var(--text-muted)}
       <tr><td>L5</td><td>Info</td><td>A01/A05</td><td>Keyless bind = open data plane (mitigated by loopback default + opt-in REQUIRE_API_KEY)</td><td>transport.rs:773</td></tr>
       <tr><td>L6</td><td>Info</td><td>A04</td><td>mTLS <code>/sync/*</code> bypass degrades to verbatim <code>X-Peer-Id</code> when <code>FED_REQUIRE_SIG=0</code></td><td>transport.rs:823</td></tr>
     </table>
+    <p style="margin-top:1rem;font-size:.9rem">The table above is the <strong>assessment as taken</strong> — a dated snapshot, preserved as the historical record. It is not a statement of current remediation status; that is below. The <code>file:line</code> anchors are the assessment's own and have drifted since.</p>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="section-eyebrow">▸ Remediation status</span>
+    <h2>What has shipped since the assessment — and what the default posture still is.</h2>
+    <p class="lede">Re-verified against <code>release/v1.0.0</code> HEAD on 2026-08-01. This section exists because the assessment page and the <a href="nsa-csi-mcp-security-mapping.html">NSA CSI mapping</a> were stale in <em>opposite</em> directions: this page still listed H1 as unremediated while the mapping claimed NSA concern (a) flatly closed. Neither was right. Both now say the same thing.</p>
+    <div class="key-box">
+      <ul>
+        <li><strong style="color:var(--text)">H1 / M1 — control SHIPPED, default posture UNCHANGED.</strong> #2044 (with #2129 and #2154 closing the last two members of the class) binds the HTTP principal to an enrolled per-agent API key (schema v83 <code>agent_api_keys</code>, <code>sha256(token) → agent_id</code>, boot-loaded), and under <code>enforce</code> the IDOR-sensitive single-row read/mutate routes, the bulk read surfaces, the approvals SSE stream and <code>require_admin</code> refuse a merely-<em>claimed</em> named principal with <code>403 attested_identity_required</code>. <strong>The shipped default is <code>AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=advisory</code> with zero keys enrolled, and in that posture the CHANGELOG records the consequence verbatim: "H1/M1 behave EXACTLY as pre-#2044 — the gate is fully inert until an operator enrolls per-agent keys AND sets <code>enforce</code>."</strong> So H1 is <em>closable</em>, not closed-by-default. A multi-principal deployment on the default posture is still running H1. Closing it: <code>ai-memory agents bind-api-key --agent-id &lt;a&gt; --token &lt;t&gt;</code> per principal, then <code>AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce</code> and restart <code>serve</code>. The <code>advisory</code> default was chosen deliberately: <code>enforce</code>-by-default with zero keys would refuse every existing shared-key deployment.</li>
+        <li><strong style="color:var(--text)">M2 — shipped as a boot guard, not yet a refusal.</strong> <code>tls_bind_guard</code> is wired: a plaintext non-loopback bind emits a hard boot WARN naming the cleartext exposure, silenced by <code>AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK</code>; <code>AI_MEMORY_REQUIRE_TLS=1</code> refuses a plaintext bind outright on any host. Binding is not refused by default this release.</li>
+        <li><strong style="color:var(--text)">M3 — closed.</strong> HTTP admission control is ON by default: an unset knob resolves to the CPU-scaled <code>clamp(cores × 64, 256, 4096)</code>; only an explicit <code>0</code> disables it.</li>
+        <li><strong style="color:var(--text)">L1 — closed.</strong> The <code>?api_key=</code> query-string credential is <strong>no longer accepted</strong> (header-only). This is a breaking change for any integrator on the query form.</li>
+        <li><strong style="color:var(--text)">L6 — compensating control shipped.</strong> The mTLS client-cert ↔ <code>X-Peer-Id</code> cross-check (<code>AI_MEMORY_FED_CERT_PEER_BINDING</code>, default <code>warn</code>) is inert until the operator supplies a fingerprint→peer-id binding map.</li>
+        <li>Remaining findings (LM1–LM3, L2–L5) are tracked under <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/2032">#2032</a>; this page does not assert a status for them.</li>
+      </ul>
+    </div>
   </div>
 </section>
 
