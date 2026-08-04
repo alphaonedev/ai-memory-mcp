@@ -121,6 +121,47 @@ impl McpTool for NamespaceClearStandardTool {
     }
 }
 
+/// #2541 / #929 — authorize binding an existing memory as a namespace standard.
+///
+/// Returns `Ok(())` when the bind may proceed, `Err(message)` to refuse.
+/// Daemon principal always passes. Does **not** mutate the memory.
+pub(crate) fn authorize_namespace_standard_bind(
+    caller: &str,
+    existing_mem: &crate::models::Memory,
+) -> Result<(), String> {
+    if caller == sentinels::DAEMON_PRINCIPAL {
+        return Ok(());
+    }
+    let recorded_owner = existing_mem
+        .metadata
+        .get(param_names::AGENT_ID)
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let is_unowned = recorded_owner.is_empty() || recorded_owner == "system";
+    if !is_unowned && recorded_owner != caller {
+        return Err(format!(
+            "caller does not own this namespace standard (caller={caller}, owner={recorded_owner})"
+        ));
+    }
+    if is_unowned {
+        let scope = existing_mem
+            .metadata
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if scope != "shared" {
+            return Err(
+                "cannot bind an unowned or system-authored memory as a namespace standard \
+                 unless it is explicitly scope=shared (refuses silent ownership claim and \
+                 confidentiality downgrade — #2541). Re-scope the memory first, or bind a \
+                 memory you own."
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn handle_namespace_set_standard(
     conn: &rusqlite::Connection,
     params: &Value,
@@ -143,8 +184,17 @@ pub fn handle_namespace_set_standard(
     // the forensic-chain row MUST land before the storage write so the
     // audit trail captures intent even on validate/storage failure
     // downstream. MCP callers resolve via `identity::resolve_agent_id`.
-    let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-        .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
+    //
+    // #2541 — `daemon` is a RESERVED wire id, so `validate_agent_id` rejects
+    // it and a naive resolve falls to `anonymous:invalid`. Explicit
+    // daemon principal (CLI operator / allowlisted internal callers) is
+    // accepted as the ownership-gate bypass without going through the
+    // wire-strict validator.
+    let caller = match params.get(param_names::AGENT_ID).and_then(|v| v.as_str()) {
+        Some(s) if s == sentinels::DAEMON_PRINCIPAL => sentinels::DAEMON_PRINCIPAL.to_string(),
+        other => crate::identity::resolve_agent_id(other, None)
+            .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string()),
+    };
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -161,77 +211,22 @@ pub fn handle_namespace_set_standard(
     // #929 SECURITY-high (Track A P6, 2026-05-20) — ownership gate on
     // the MCP entry. Mirrors the HTTP handler gate at
     // `handlers/hook_subscribers.rs::set_namespace_standard_inner`.
-    // Without this gate any MCP caller could overwrite any namespace's
-    // governance policy by passing the existing standard's id —
-    // sibling vector to the HTTP path.
     //
-    // Gate scope: ONLY applies when the caller has explicitly claimed
-    // identity via `params["agent_id"]`. When agent_id is absent the
-    // caller is identifying as the daemon process itself (the
-    // historical "no claim, no gate" semantic — used by integration
-    // tests that invoke this MCP function as a library call without
-    // setting up a full identity chain, and by daemon-internal
-    // bootstrap paths). The HTTP entry is the load-bearing gate for
-    // external callers because it ALWAYS resolves caller via
-    // X-Agent-Id (anonymous fallback included) and threads the
-    // resolved caller into the MCP params before calling here (see
-    // `set_namespace_standard_inner` line 715-720). Direct MCP
-    // callers that DO claim identity (via stdio JSON-RPC params)
-    // remain gated by this check; daemon-internal callers and tests
-    // that don't claim identity get the legacy posture.
-    let identity_claimed = params
-        .get(param_names::AGENT_ID)
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.is_empty());
-    if identity_claimed && let Ok(Some(existing_mem)) = db::get(conn, id) {
-        let recorded_owner = existing_mem
-            .metadata
-            .get(param_names::AGENT_ID)
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let is_unowned = recorded_owner.is_empty() || recorded_owner == "system";
-        if !is_unowned && recorded_owner != caller && caller != sentinels::DAEMON_PRINCIPAL {
-            return Err(format!(
-                "caller does not own this namespace standard (caller={caller}, owner={recorded_owner})"
-            ));
-        }
-        // Unowned-legacy claim — rewrite metadata.agent_id to caller
-        // so subsequent calls are gated. No-op when caller is the
-        // anonymous fallback (don't anchor ownership to anonymous).
-        if is_unowned && !caller.is_empty() && caller != sentinels::ANONYMOUS_INVALID {
-            let mut new_meta = if existing_mem.metadata.is_object() {
-                existing_mem.metadata.clone()
-            } else {
-                serde_json::json!({})
-            };
-            if let Some(obj) = new_meta.as_object_mut() {
-                obj.insert(
-                    "agent_id".to_string(),
-                    serde_json::Value::String(caller.clone()),
-                );
-                obj.entry("scope".to_string())
-                    .or_insert_with(|| serde_json::Value::String("shared".to_string()));
-            }
-            // Best-effort: don't fail the set-standard call if the
-            // claim rewrite fails — the ownership gate will refire on
-            // the next call once metadata.agent_id is non-empty.
-            if let Err(e) = db::update(
-                conn,
-                id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(&new_meta),
-            ) {
-                tracing::warn!(
-                    "namespace_standard (MCP): ownership-claim metadata update failed: {e}"
-                );
-            }
+    // #2541 — the gate must NOT be caller-opt-in via `params.agent_id`.
+    // Pre-fix, omitting agent_id skipped the gate entirely (any MCP
+    // caller could bind any memory as any namespace's standard). Apply
+    // the check for every non-daemon principal. Daemon principal is the
+    // explicit bypass (tests / internal bootstrap), not the absence of
+    // a field.
+    //
+    // #2541 hole 2 — never silently claim unowned rows (rewrite agent_id
+    // + stamp scope=shared). That was an irreversible confidentiality
+    // downgrade + ownership transfer. Unowned / system rows may only be
+    // bound when already explicitly scope=shared; otherwise refuse and
+    // tell the operator to re-scope.
+    if let Ok(Some(existing_mem)) = db::get(conn, id) {
+        if let Err(msg) = authorize_namespace_standard_bind(&caller, &existing_mem) {
+            return Err(msg);
         }
     }
 
@@ -728,7 +723,9 @@ mod tests {
             updated_at: now,
             last_accessed_at: None,
             expires_at: None,
-            metadata: json!({}),
+            // #2541 — unowned fixtures used as namespace standards must be
+            // explicitly scope=shared (silent claim/downgrade is forbidden).
+            metadata: json!({ "scope": "shared" }),
             reflection_depth: 0,
             memory_kind: crate::models::MemoryKind::Observation,
             entity_id: None,
@@ -852,6 +849,72 @@ mod tests {
             )
             .unwrap();
         assert_eq!(still, 1, "namespace_meta row must survive refused clear");
+    }
+
+    /// #2541 hole 1 — omitting agent_id must NOT skip ownership gate.
+    #[test]
+    fn set_standard_omitted_agent_id_still_gates_owned_row_2541() {
+        let conn = fresh_conn();
+        let id = insert_owned(&conn, "ns-opt-in", "std", "ai:alice");
+        let err =
+            handle_namespace_set_standard(&conn, &json!({"namespace": "ns-opt-in", "id": id}))
+                .expect_err("no agent_id must still refuse binding alice-owned memory");
+        assert!(err.contains("does not own"), "got: {err}");
+    }
+
+    /// #2541 hole 2 — unowned private/default must refuse (no silent claim).
+    #[test]
+    fn set_standard_refuses_unowned_private_claim_rewrite_2541() {
+        let conn = fresh_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = Memory {
+            cid: None,
+            valid_from: None,
+            valid_until: None,
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "ns-priv".to_string(),
+            title: "priv-std".to_string(),
+            content: "body".to_string(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({}), // unowned, no scope → private default
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
+        };
+        let id = db::insert(&conn, &mem).expect("insert");
+        let err = handle_namespace_set_standard(
+            &conn,
+            &json!({"namespace": "ns-priv", "id": id, "agent_id": "ai:bob"}),
+        )
+        .expect_err("must refuse silent claim of private unowned row");
+        assert!(
+            err.contains("scope=shared") || err.contains("unowned"),
+            "got: {err}"
+        );
+        // Metadata must be unchanged (no agent_id/scope stamp).
+        let after = db::get(&conn, &id).unwrap().unwrap();
+        assert!(
+            after.metadata.get("agent_id").is_none(),
+            "must not rewrite agent_id"
+        );
     }
 
     // set_standard: happy path without governance.

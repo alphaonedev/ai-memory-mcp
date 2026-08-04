@@ -447,61 +447,24 @@ async fn set_namespace_standard_inner(
         // caller as owner and this gate is a no-op for first writes.
         // Subsequent writes by a different caller hit the !is_unowned
         // branch and 403.
+        // #2541 — same authorize helper as MCP; no silent ownership claim.
         if let Ok(resolved_mem) = app.store.get(&ctx, &standard_id).await {
-            let recorded_owner = resolved_mem
-                .metadata
-                .get("agent_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let is_unowned =
-                recorded_owner.is_empty() || recorded_owner == sentinels::SYSTEM_PRINCIPAL;
             let caller_principal = ctx.effective_principal();
-            if !is_unowned
-                && recorded_owner != caller_principal
-                && caller_principal != sentinels::DAEMON_PRINCIPAL
+            if let Err(msg) =
+                crate::mcp::authorize_namespace_standard_bind(caller_principal, &resolved_mem)
             {
                 tracing::warn!(
                     target: super::AUTHZ_TRACE_TARGET,
-                    "POST /namespaces/{{ns}}/standard 403 (postgres path): caller {caller_principal} != owner {recorded_owner} (ns={ns}, id={standard_id})"
+                    "POST /namespaces/{{ns}}/standard 403 (postgres path): {msg} (ns={ns}, id={standard_id})"
                 );
                 return (
                     StatusCode::FORBIDDEN,
                     Json(json!({
-                        "error": crate::errors::msg::CALLER_NOT_NAMESPACE_STANDARD_OWNER,
-                        "owner": recorded_owner,
+                        "error": msg,
                         "caller": caller_principal
                     })),
                 )
                     .into_response();
-            }
-            // Unowned-legacy claim: rewrite metadata.agent_id to caller
-            // so subsequent calls are properly gated.
-            if is_unowned
-                && !caller_principal.is_empty()
-                && caller_principal != sentinels::ANONYMOUS_INVALID
-            {
-                let mut new_meta = if resolved_mem.metadata.is_object() {
-                    resolved_mem.metadata.clone()
-                } else {
-                    json!({})
-                };
-                if let Some(obj) = new_meta.as_object_mut() {
-                    obj.insert(
-                        "agent_id".to_string(),
-                        serde_json::Value::String(caller_principal.to_string()),
-                    );
-                    obj.entry("scope".to_string())
-                        .or_insert_with(|| serde_json::Value::String("shared".to_string()));
-                }
-                let patch = crate::store::UpdatePatch {
-                    metadata: Some(new_meta),
-                    ..Default::default()
-                };
-                if let Err(e) = app.store.update(&ctx, &standard_id, patch).await {
-                    tracing::warn!(
-                        "namespace_standard (postgres): ownership-claim metadata update failed: {e}"
-                    );
-                }
             }
         }
 
@@ -613,76 +576,20 @@ async fn set_namespace_standard_inner(
         .ok()
         .and_then(|v| v.into_iter().next());
         if let Some(m) = existing {
-            // #929 SECURITY-high (Track A P6, 2026-05-20) — ownership
-            // gate on the namespace-standard surface. Pre-fix any
-            // authenticated caller could overwrite any namespace's
-            // governance policy because the placeholder was stamped
-            // metadata.agent_id="system" (an unowned sentinel) and no
-            // caller-vs-owner comparison was performed. Now: the
-            // recorded owner is the only principal who can mutate the
-            // standard. Legacy "system" / empty owners are treated as
-            // unowned (any caller may CLAIM via the
-            // metadata.agent_id rewrite below) for backward
-            // compatibility with rows written before this fix.
-            let recorded_owner = m
-                .metadata
-                .get("agent_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let is_unowned =
-                recorded_owner.is_empty() || recorded_owner == sentinels::SYSTEM_PRINCIPAL;
-            if !is_unowned && recorded_owner != caller && caller != sentinels::DAEMON_PRINCIPAL {
+            // #929 / #2541 — authorize bind; never silent claim rewrite.
+            if let Err(msg) = crate::mcp::authorize_namespace_standard_bind(&caller, &m) {
                 tracing::warn!(
                     target: super::AUTHZ_TRACE_TARGET,
-                    "POST /namespaces/{{ns}}/standard 403: caller {caller} != owner {recorded_owner} (ns={ns})"
+                    "POST /namespaces/{{ns}}/standard 403: {msg} (ns={ns})"
                 );
                 return (
                     StatusCode::FORBIDDEN,
                     Json(json!({
-                        "error": crate::errors::msg::CALLER_NOT_NAMESPACE_STANDARD_OWNER,
-                        "owner": recorded_owner,
+                        "error": msg,
                         "caller": caller
                     })),
                 )
                     .into_response();
-            }
-            // Unowned-legacy fast path: claim ownership by rewriting
-            // metadata.agent_id to the caller. Next request from a
-            // different caller will be 403'd.
-            if is_unowned && !caller.is_empty() && caller != sentinels::ANONYMOUS_INVALID {
-                let mut new_meta = if m.metadata.is_object() {
-                    m.metadata.clone()
-                } else {
-                    json!({})
-                };
-                if let Some(obj) = new_meta.as_object_mut() {
-                    obj.insert(
-                        "agent_id".to_string(),
-                        serde_json::Value::String(caller.clone()),
-                    );
-                    // Preserve scope=shared if not already set so the
-                    // SAL #910 filter still surfaces the standard to
-                    // every reader.
-                    obj.entry("scope".to_string())
-                        .or_insert_with(|| serde_json::Value::String("shared".to_string()));
-                }
-                if let Err(e) = db::update(
-                    &lock.0,
-                    &m.id,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(&new_meta),
-                ) {
-                    tracing::warn!(
-                        "namespace_standard: ownership-claim metadata update failed: {e}"
-                    );
-                }
             }
             m.id
         } else {
@@ -751,23 +658,17 @@ async fn set_namespace_standard_inner(
     // resolved standard memory by id, check ownership. The auto-seed
     // path already validated above and re-checking here is a no-op for
     // it; the body.id-supplied path goes through this gate once.
+    // #2541 — body.id path uses the same authorize helper (no claim rewrite).
     if let Ok(Some(resolved_mem)) = db::get(&lock.0, &resolved_id) {
-        let recorded_owner = resolved_mem
-            .metadata
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let is_unowned = recorded_owner.is_empty() || recorded_owner == sentinels::SYSTEM_PRINCIPAL;
-        if !is_unowned && recorded_owner != caller && caller != sentinels::DAEMON_PRINCIPAL {
+        if let Err(msg) = crate::mcp::authorize_namespace_standard_bind(&caller, &resolved_mem) {
             tracing::warn!(
                 target: super::AUTHZ_TRACE_TARGET,
-                "POST /namespaces/{{ns}}/standard 403 (body.id path): caller {caller} != owner {recorded_owner} (ns={ns}, id={resolved_id})"
+                "POST /namespaces/{{ns}}/standard 403 (body.id path): {msg} (ns={ns}, id={resolved_id})"
             );
             return (
                 StatusCode::FORBIDDEN,
                 Json(json!({
-                    "error": crate::errors::msg::CALLER_NOT_NAMESPACE_STANDARD_OWNER,
-                    "owner": recorded_owner,
+                    "error": msg,
                     "caller": caller
                 })),
             )
