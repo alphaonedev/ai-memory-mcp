@@ -364,6 +364,22 @@ impl FederationDlqSink for RecordingDlqSink {
     async fn reset_throttled_quarantine(&self) -> Result<u64, String> {
         Ok(0)
     }
+
+    /// #2446 — never exercised by this harness (it drives the store-lane
+    /// landing pass, which never queues an erasure sentinel). `Contended`
+    /// is the no-op-and-retry outcome, so a stub can never silently claim
+    /// a fan-out that did not happen.
+    async fn expand_erasure_sentinel(
+        &self,
+        _row_id: i64,
+        _expected_attempt_count: i32,
+        _memory_id: &str,
+        _peer_ids: &[String],
+        _per_peer_payload: &serde_json::Value,
+        _per_peer_last_error: &str,
+    ) -> Result<ai_memory::federation::SentinelExpansion, String> {
+        Ok(ai_memory::federation::SentinelExpansion::Contended)
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -241,11 +241,33 @@ pub(super) fn handle_forget(
     let (matched, truncated) =
         forget_preview(conn, namespace, pattern, tier.as_ref(), owner.as_deref())?;
     let deleted_ids: Vec<String> = matched.into_iter().map(|m| m.id).collect();
+    // v1.0.0 #2446 — the FULL matched id set for the federated erasure
+    // outbox, collected BEFORE the delete commits (same connection,
+    // synchronous dispatch, so the set cannot drift). Deliberately NOT
+    // `deleted_ids` above: that rides the #1602 preview, capped at
+    // `DRY_RUN_PREVIEW_CAP` (50), so reusing it would silently propagate
+    // only the first 50 erasures of a bulk forget. Resolved only when the
+    // deployment is actually drainable, so an unfederated MCP server pays
+    // nothing.
+    let outbox_ids = crate::federation::erasure_outbox::collect_forget_ids(
+        conn,
+        namespace,
+        pattern,
+        tier.as_ref(),
+        owner.as_deref(),
+    );
     let deleted = match owner {
         Some(ref c) => db::forget_for_caller(conn, namespace, pattern, tier.as_ref(), archive, c),
         None => db::forget(conn, namespace, pattern, tier.as_ref(), archive),
     }
     .map_err(|e| e.to_string())?;
+    // v1.0.0 #2446 — queue the erasures for federated fan-out (best-effort;
+    // never fails the forget, writes nothing when undrainable).
+    crate::federation::erasure_outbox::enqueue_erasures(
+        conn,
+        &outbox_ids,
+        crate::federation::erasure_outbox::surfaces::MCP_FORGET,
+    );
     // v0.8.1 W2.2 (#1821 / gap G30) — evict the forgotten vectors from the
     // in-memory HNSW graph so semantic recall returns zero hits immediately
     // (not only after the next rebuild). `VectorIndex::remove` is `&self`

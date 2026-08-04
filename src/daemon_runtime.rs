@@ -5575,6 +5575,32 @@ pub async fn bootstrap_serve(
         fed.dlq_sink = Some(sink);
     }
 
+    // v1.0.0 #2446 — erasure-outbox drainability marker. The MCP / CLI
+    // erasure funnels queue a federated erasure ONLY when this marker is
+    // present, so the marker is what BOUNDS the outbox: a deployment
+    // nothing will drain accumulates ZERO rows, forever.
+    //
+    // Stamped only when ALL THREE hold: federation is configured, the
+    // build carries `--features sal` (the whole push-DLQ surface is gated
+    // on it, so a default-features binary has no replay worker), and the
+    // resolved sink is the SQLITE one — i.e. the worker drains the SAME
+    // file the MCP / CLI processes write to. A postgres-backed `serve`
+    // drains the POSTGRES table and never this sqlite file, so promising
+    // propagation there would be a lie (and MCP stdio is sqlite-only by
+    // construction anyway, CLAUDE.md #1675/n24). Every other boot CLEARS
+    // it, so turning federation off self-heals on the next start.
+    {
+        #[cfg(feature = "sal")]
+        let drainable_peers: Option<usize> = federation.as_ref().and_then(|fed| {
+            matches!(storage_backend, crate::handlers::StorageBackend::Sqlite)
+                .then(|| fed.peer_count())
+        });
+        #[cfg(not(feature = "sal"))]
+        let drainable_peers: Option<usize> = None;
+        let guard = db_state.lock().await;
+        federation::erasure_outbox::apply_drainability(&guard.0, drainable_peers);
+    }
+
     // v0.7.0 M3 — spawn the federation catchup loop now that the SAL
     // store handle has resolved. The loop dispatches each peer-pulled
     // memory through `store.apply_remote_memory` (postgres-aware) on
