@@ -88,6 +88,7 @@ fn set_standard_rejects_unknown_governance_level_variant() {
     let params = json!({
         "namespace": namespace,
         "id": standard_id,
+        "agent_id": "ai:i1384-test",
         "governance": {
             "write": "approval",
             "delete": "owner",
@@ -120,6 +121,7 @@ fn set_standard_rejects_unknown_approver_type_variant() {
     let params = json!({
         "namespace": namespace,
         "id": standard_id,
+        "agent_id": "ai:i1384-test",
         "governance": {
             "write": "approve",
             "delete": "owner",
@@ -147,6 +149,7 @@ fn set_standard_accepts_known_variants_round_trips_typed_policy() {
     let params = json!({
         "namespace": namespace,
         "id": standard_id,
+        "agent_id": "ai:i1384-test",
         "governance": {
             "write": "approve",
             "delete": "owner",
@@ -192,6 +195,7 @@ fn set_standard_tolerates_unknown_off_struct_fields_for_forward_compat() {
     let params = json!({
         "namespace": namespace,
         "id": standard_id,
+        "agent_id": "ai:i1384-test",
         "governance": {
             "write": "approve",
             "delete": "owner",
