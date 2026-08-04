@@ -173,10 +173,13 @@ async fn bulk_create_enforces_daily_quota_partial_fill_1788() {
         ))
         .unwrap();
     let resp = router.clone().oneshot(req).await.unwrap();
+    // #2588 — a PARTIAL fill is not an unqualified success. Pre-#2588 this
+    // asserted 200, which is the #2444/#2490 false-success shape: 3 of 8 rows
+    // landed and a client checking only the status saw "OK".
     assert_eq!(
         resp.status(),
-        StatusCode::OK,
-        "bulk returns 200 with created/errors"
+        StatusCode::MULTI_STATUS,
+        "bulk partial fill returns 207, not 200"
     );
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
@@ -191,6 +194,23 @@ async fn bulk_create_enforces_daily_quota_partial_fill_1788() {
         v["errors"].as_array().map(Vec::len),
         Some(5),
         "#1788: the 5 over-cap rows are rejected into errors[]: {v}"
+    );
+    // #2588 — the quota rejection is now TYPED, not the opaque "internal
+    // error" that hid 31,000 dropped rows behind an HTTP 200.
+    assert_eq!(
+        v["errors"][0]["code"], "QUOTA_EXCEEDED",
+        "#2588: quota rejections classify as QUOTA_EXCEEDED: {v}"
+    );
+    // #2551 — the reconciliation identity a fleet loader asserts on.
+    assert_eq!(v["sent"], 8, "{v}");
+    assert_eq!(
+        v["created"].as_u64().unwrap()
+            + v["updated"].as_u64().unwrap()
+            + v["deduped"].as_u64().unwrap()
+            + v["rejected"].as_u64().unwrap()
+            + v["pending"].as_array().unwrap().len() as u64,
+        8,
+        "#2551: created+updated+deduped+rejected+pending == sent: {v}"
     );
     assert_eq!(
         quota_count(&db_path, agent_id),

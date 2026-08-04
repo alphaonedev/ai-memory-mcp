@@ -2,19 +2,25 @@
   Copyright 2026 AlphaOne LLC
   SPDX-License-Identifier: Apache-2.0
 
-  ai-memory v0.7.0 — NSA CSI MCP Security Compliance (dedicated procurement page)
+  ai-memory v1.0.0 — NSA CSI MCP Security Compliance (dedicated procurement page)
 
   Maps every National Security Agency Cybersecurity Information document concern
   and recommendation (MCP Security Design Considerations, U/OO/6030316-26, May
-  2026) to the ai-memory substrate primitive that addresses it. Every claim
-  traces to a capability_id in docs/compliance/_inventory/v0.7.0-capabilities.json,
-  which in turn traces to a file path + line number + (where applicable) GitHub
-  issue/PR reference.
+  2026) to the ai-memory substrate primitive that addresses it.
+
+  Every code reference on this page is a SYMBOL (module / type / function / test
+  name), never a file:line anchor. Line numbers drift with every commit, and a
+  reviewer who follows a stale anchor to unrelated code loses trust a later
+  correction cannot buy back. A symbol either resolves (rg '<symbol>' src/ tests/)
+  or is provably gone, and where a previously-cited symbol was renamed or removed
+  this page says so at the point of citation.
 
   This is a public-facing procurement-grade page. Federal procurement reviewers
   read it to evaluate ai-memory against the NSA CSI checklist. No marketing
-  language. No NSA endorsement implied. Every "structurally_addressed" claim
-  has a code anchor.
+  language. No NSA endorsement implied. This document's own prose, version stamp,
+  coverage postures and symbol citations were re-verified against release/v1.0.0
+  HEAD on 2026-08-01; the linked capability inventory JSON remains a v0.7.0-tree
+  artefact (see the currency note in the page body).
 -->
 <!DOCTYPE html>
 <html lang="en">
@@ -22,10 +28,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory — NSA CSI MCP Security Compliance</title>
-<meta name="description" content="ai-memory v0.7.0 substrate-level coverage of the National Security Agency Cybersecurity Information document on Model Context Protocol security (U/OO/6030316-26, May 2026). Every NSA concern and recommendation mapped to a codegraph-verified substrate primitive.">
+<meta name="description" content="ai-memory v1.0.0 (schema v88) substrate-level coverage of the National Security Agency Cybersecurity Information document on Model Context Protocol security (U/OO/6030316-26, May 2026). 9 of 10 NSA security concerns structurally addressed as shipped; concern (a) access control structurally addressed under the enforce identity-binding posture with per-agent keys enrolled. 7 of 7 NSA recommendations implemented. Every claim cites a named symbol, not a file:line anchor.">
 <meta name="theme-color" content="#0d1117">
 <meta property="og:title" content="ai-memory — NSA CSI MCP Security Compliance">
-<meta property="og:description" content="Procurement-grade mapping of NSA-issued MCP security guidance to ai-memory substrate primitives. Codegraph-verified, file-anchored, zero marketing language.">
+<meta property="og:description" content="Procurement-grade mapping of NSA-issued MCP security guidance to ai-memory v1.0.0 substrate primitives. 9 of 10 concerns structurally addressed as shipped, concern (a) under the enforce identity-binding posture; 7 of 7 recommendations implemented. Symbol-cited, zero marketing language.">
 <meta property="og:url" content="https://alphaonedev.github.io/ai-memory-mcp/compliance/nsa-csi-mcp.html">
 <meta property="og:type" content="website">
 <meta name="twitter:card" content="summary_large_image">
@@ -131,7 +137,7 @@ footer a{color:var(--text-muted)}
       <a class="active" href="index.html">Compliance</a>
     </div>
     <div class="right">
-      <a href="../whats-new-v07.html">v0.7.0</a>
+      <a href="../whats-new-v09.html">What's new</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
     </div>
   </div>
@@ -142,13 +148,14 @@ footer a{color:var(--text-muted)}
     <div>
       <span class="eyebrow">▸ Procurement-grade compliance · Public-facing</span>
       <h1>NSA CSI MCP Security Compliance</h1>
-      <p class="tagline">ai-memory v0.7.0 substrate-level coverage of the National Security Agency Cybersecurity Information document on Model Context Protocol security (<code>U/OO/6030316-26</code>, May 2026). Every concern, every recommendation, every real-world incident class — mapped to a codegraph-verified substrate primitive with file-anchored evidence.</p>
+      <p class="tagline">ai-memory v1.0.0 substrate-level coverage of the National Security Agency Cybersecurity Information document on Model Context Protocol security (<code>U/OO/6030316-26</code>, May 2026). Every concern, every recommendation, every real-world incident class — mapped to the substrate primitive that addresses it, cited by <strong>named symbol, not <code>file:line</code> anchor</strong>.</p>
       <div class="hero-pills">
-        <span class="hero-pill good">10/10 concerns structurally addressed</span>
+        <span class="hero-pill good">9 of 10 concerns structurally addressed as shipped</span>
+        <span class="hero-pill warn">concern (a) addressed under the <code>enforce</code> identity-binding posture</span>
         <span class="hero-pill good">7/7 recommendations implemented</span>
-        <span class="hero-pill good">27 substrate primitives catalogued</span>
         <span class="hero-pill good">47 dedicated tests pinning the #1154 contract</span>
-        <span class="hero-pill">Schema v78 · 101 MCP tools · 92 HTTP routes</span>
+        <span class="hero-pill">27 primitives catalogued (v0.7.0-era inventory)</span>
+        <span class="hero-pill">Schema v88 · 103 MCP entries · 94 route registrations / 80 paths</span>
       </div>
     </div>
   </div>
@@ -156,20 +163,25 @@ footer a{color:var(--text-muted)}
 
 <section>
   <div class="container">
-    <span class="section-eyebrow">▸ Executive summary · 100% NSA CSI MCP coverage achieved</span>
-    <h2>ai-memory v0.7.0 structurally addresses every NSA-enumerated MCP security concern at the substrate layer.</h2>
+    <span class="section-eyebrow">▸ Executive summary · NSA CSI MCP coverage at v1.0.0</span>
+    <h2>ai-memory v1.0.0 structurally addresses nine of the ten NSA-enumerated MCP security concerns as shipped; concern (a) is addressed under a documented posture.</h2>
 
     <div class="coverage-banner">
-      <div class="big">10 of 10</div>
-      <div class="label">NSA CSI MCP security concerns structurally addressed at the substrate layer · 7 of 7 recommendations implemented</div>
-      <p>All 10 NSA-enumerated concerns structurally addressed at the substrate layer. All 7 NSA-issued recommendations implemented. Structural coverage of every real-world incident class the NSA document cites: tool parameter injection (NSA concern i, addressed by the <code>RequestValidator</code> DTO-bundled input-validation surface at <code>src/validate.rs:1027</code>); tool invocation path confusion (NSA concern j, closed by daemon-Ed25519-signed <code>serverInfo</code> at MCP initialize handshake per <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1154">#1154</a>); CVE-2025-49596 MCP-Inspector RCE (substrate ships its own <code>verify-*</code> CLI family); output poisoning for downstream automation (verbose-provenance recall decoration at <code>src/mcp/tools/recall.rs:284</code> with MCP wire default <code>verbose_provenance=true</code> at v0.7.0). Every claim on this page traces to a <code>capability_id</code> in the codegraph-verified <a href="_inventory/v0.7.0-capabilities.json">capability inventory</a>.</p>
+      <div class="big">9 of 10</div>
+      <div class="label">NSA security concerns structurally addressed <strong>as shipped</strong>; concern (a) access control structurally addressed under the <code>enforce</code> identity-binding posture with per-agent keys enrolled · 7 of 7 NSA recommendations implemented</div>
+      <p><strong>9 of 10 NSA security concerns structurally addressed as shipped; concern (a) access control structurally addressed under the <code>enforce</code> identity-binding posture with per-agent keys enrolled. 7 of 7 NSA recommendations implemented.</strong> The shipped default for concern (a) — <code>AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=advisory</code> with zero per-agent keys enrolled — is finding <strong>H1 (High)</strong> of this project's own <a href="v1.0.0-security-assessment.html">v1.0.0 adversarial security assessment</a>; the concern (a) row below states which posture the claim describes and the two commands that close it. Structural coverage of every real-world incident class the NSA document cites: tool parameter injection (NSA concern i, addressed by the <code>RequestValidator</code> DTO-bundled input-validation surface, <code>validate::RequestValidator</code>); tool invocation path confusion (NSA concern j, closed by daemon-Ed25519-signed <code>serverInfo</code> at the MCP initialize handshake per <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1154">#1154</a>); CVE-2025-49596 MCP-Inspector RCE (substrate ships its own <code>verify-*</code> CLI family); output poisoning for downstream automation (verbose-provenance recall decoration, <code>mcp::tools::recall::decorate_memory_many</code>).</p>
     </div>
 
     <div class="coverage-grid">
       <div class="coverage-card">
-        <div class="stat-num">10/10</div>
-        <div class="stat-label">NSA concerns structurally addressed</div>
-        <div class="stat-sub">a-j all fully addressed (concern j closed via #1154 daemon serverInfo signing)</div>
+        <div class="stat-num">9/10</div>
+        <div class="stat-label">NSA concerns structurally addressed as shipped</div>
+        <div class="stat-sub">b-j addressed as shipped (concern j closed via #1154 daemon serverInfo signing); concern (a) is the tenth — see below</div>
+      </div>
+      <div class="coverage-card">
+        <div class="stat-num partial">(a)</div>
+        <div class="stat-label">Access control — posture-conditional</div>
+        <div class="stat-sub">Structurally addressed under <code>AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce</code> with per-agent keys enrolled; the shipped default is finding H1 of the v1.0.0 assessment</div>
       </div>
       <div class="coverage-card">
         <div class="stat-num">7/7</div>
@@ -177,15 +189,16 @@ footer a{color:var(--text-muted)}
         <div class="stat-sub">a-g, plus the two meta-recommendations</div>
       </div>
       <div class="coverage-card">
-        <div class="stat-num">27</div>
-        <div class="stat-label">Substrate primitives catalogued</div>
-        <div class="stat-sub">Every primitive codegraph-verified at v0.7.0 HEAD</div>
-      </div>
-      <div class="coverage-card">
         <div class="stat-num">47</div>
         <div class="stat-label">Net-new tests pinning #1154 contract</div>
-        <div class="stat-sub">20 module + 27 integration; 0 regressions on existing MCP handshake tests</div>
+        <div class="stat-sub">20 module-level tests in <code>src/mcp/server_identity.rs</code> + 27 integration tests in <code>tests/mcp_initialize_server_signing.rs</code>, counted at v1.0.0 HEAD; 0 regressions on existing MCP handshake tests</div>
       </div>
+    </div>
+
+    <div class="disclaimer-box">
+      <strong>Currency note — read this before citing anything below.</strong>
+      <p>This document's prose, version stamp, coverage postures and code citations were re-verified against <code>release/v1.0.0</code> HEAD on 2026-08-01. <strong>The linked capability inventory (<a href="_inventory/v0.7.0-capabilities.json"><code>_inventory/v0.7.0-capabilities.json</code></a>, 27 primitives, codegraph-verified at commit <code>4add7a8528d4c16d696b391ec6e2890269669a84</code>) is a v0.7.0-tree artefact.</strong> It has not been re-derived against the v0.8.x / v0.9.0 / v1.0.0 source tree, and there is no <code>_inventory/v1.0.0-capabilities.json</code> in this repository; the v1.0.0 refresh is tracked under <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1938">#1938</a>. The inventory's own <code>file:line</code> fields inherit that vintage and should be read as v0.7.0 coordinates, not v1.0.0 ones. No structural regression against any of the 27 catalogued primitives is known or claimed — the inventory is simply not yet re-derived.</p>
+      <p style="margin-top:.6rem"><strong style="color:var(--warn)">This page cites SYMBOLS, not <code>file:line</code> anchors.</strong> Line numbers drift with every commit — a 2026-05 anchor re-read at v1.0.0 lands on unrelated code, and an anchor that misses costs a reviewer trust that a later correction cannot buy back. Every code reference below is a module, type, function, or test name that either resolves in the tree or is noted as gone. Reproduce any of them with <code>rg '&lt;symbol&gt;' src/ tests/</code>.</p>
     </div>
 
     <div class="disclaimer-box">
@@ -220,7 +233,7 @@ footer a{color:var(--text-muted)}
         <li><a href="nsa-control-test-matrix.html">Control → Test matrix (companion page)</a></li>
         <li><a href="#boundaries">Honest boundaries</a></li>
         <li><a href="honest-limitations.html">Honest-limitations companion</a></li>
-        <li><a href="_inventory/v0.7.0-capabilities.json">Capability inventory JSON</a></li>
+        <li><a href="_inventory/v0.7.0-capabilities.json">Capability inventory JSON (v0.7.0-era artefact)</a></li>
       </ul>
     </div>
   </div>
@@ -230,88 +243,88 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="section-eyebrow">▸ One-page reference</span>
     <h2>NSA CSI MCP Security Control → ai-memory Feature mapping.</h2>
-    <p class="lede">Single-page procurement-grade table mapping every NSA CSI MCP control requirement to the ai-memory tool, primitive, or substrate feature that addresses it. Each row carries the capability identifier from the codegraph-verified <a href="_inventory/v0.7.0-capabilities.json">inventory</a> and the substrate file path operators or auditors can grep against to confirm the feature is wired and present.</p>
+    <p class="lede">Single-page procurement-grade table mapping every NSA CSI MCP control requirement to the ai-memory tool, primitive, or substrate feature that addresses it. Each row carries the capability identifier from the <a href="_inventory/v0.7.0-capabilities.json">v0.7.0-era inventory</a> and the <strong>named substrate symbol</strong> operators or auditors can grep against (<code>rg '&lt;symbol&gt;' src/ tests/</code>) to confirm the feature is wired and present.</p>
 
-    <h3 style="margin-top:1.5rem;color:var(--text)">Concerns (10/10 structurally addressed)</h3>
+    <h3 style="margin-top:1.5rem;color:var(--text)">Concerns (9 of 10 structurally addressed as shipped; (a) posture-conditional)</h3>
     <table>
       <thead>
         <tr>
           <th style="width:14ch">NSA Concern</th>
           <th>ai-memory tool / feature</th>
           <th style="width:24ch">Capability identifier</th>
-          <th style="width:26ch">Substrate anchor</th>
+          <th style="width:26ch">Substrate symbol</th>
           <th style="width:10ch">Status</th>
         </tr>
       </thead>
       <tbody>
         <tr>
           <td class="col-name">a · Access control</td>
-          <td>Namespace isolation + Form 7 agent-EXTERNAL governance + admin-role gate + per-tenant authorisation</td>
+          <td>Namespace isolation + Form 7 agent-EXTERNAL governance + admin-role gate + per-tenant authorisation + HTTP per-agent-key principal binding (#2044/#2129/#2154). <strong>Structurally addressed under <code>AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce</code> with per-agent keys enrolled.</strong> The shipped default (<code>advisory</code>, zero keys enrolled) is finding <strong>H1 (High)</strong> of the <a href="v1.0.0-security-assessment.html">v1.0.0 assessment</a> — cross-tenant IDOR/BOLA via a spoofable <code>X-Agent-Id</code>. Close it with <code>ai-memory agents bind-api-key --agent-id &lt;a&gt; --token &lt;t&gt;</code> per principal, then <code>AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce</code> and restart <code>serve</code>. See <a href="#concern-a">concern (a)</a>.</td>
           <td><code>namespace_isolation</code>, <code>form_7_agent_external_governance</code></td>
-          <td><code>src/governance/mod.rs::check_agent_action</code> · <code>src/handlers/admin_role.rs:97</code></td>
-          <td><span class="status ok">addressed</span></td>
+          <td><code>governance::agent_action::check_agent_action</code> · <code>handlers::admin_role::{is_admin_caller, require_admin}</code> · <code>handlers::identity_binding</code></td>
+          <td><span class="status partial"><code>enforce</code> posture</span></td>
         </tr>
         <tr>
           <td class="col-name">b · Insecure context or data serialization</td>
           <td>Form 4 fact-provenance (citations, source_uri, source_span) + canonical-bytes Ed25519 signing + capabilities v3 envelope + RequestValidator</td>
           <td><code>form_4_fact_provenance</code>, <code>form_7_canonical_bytes_signing</code>, <code>capabilities_v3_envelope</code>, <code>request_validator_input_validation</code></td>
-          <td><code>src/models/memory.rs:464</code> · <code>src/governance/rules_store.rs:541</code> · <code>src/validate.rs:1027</code></td>
+          <td><code>models::Memory</code> (<code>citations</code> / <code>source_uri</code> / <code>source_span</code>) · <code>governance::rules_store::canonical_bytes_for_signing</code> · <code>validate::RequestValidator</code></td>
           <td><span class="status ok">addressed</span></td>
         </tr>
         <tr>
           <td class="col-name">c · Poor approval workflows</td>
-          <td>Track G 25-event hook pipeline (Allow/Modify/Deny/AskUser) + K10 pending-actions SSE stream + HMAC-mandatory webhook dispatch</td>
+          <td>Track G 27-event hook pipeline (Allow/Modify/Deny/AskUser) + K10 pending-actions SSE stream + HMAC-mandatory webhook dispatch</td>
           <td><code>track_g_hook_pipeline</code></td>
-          <td><code>src/hooks/events.rs:73</code> · <code>src/subscriptions.rs:521-548</code></td>
+          <td><code>hooks::events::HookEvent</code> · <code>handlers::routes::APPROVALS_STREAM</code> · <code>subscriptions::dispatch_approval_requested</code></td>
           <td><span class="status ok">addressed</span></td>
         </tr>
         <tr>
           <td class="col-name">d · Token or session security</td>
           <td>mTLS A2A transport + per-agent Ed25519 attestation + federation nonce-replay defense + SQLCipher encryption-at-rest</td>
           <td><code>mtls_a2a_transport</code>, <code>ed25519_agent_attestation</code>, <code>encryption_at_rest_sqlcipher</code></td>
-          <td><code>src/tls.rs:1175</code> · <code>src/governance/audit.rs:558</code> · <code>src/federation/signing.rs:42</code></td>
+          <td><code>tls::FingerprintAllowlistVerifier</code> · <code>governance::audit::load_daemon_signing_key</code> · <code>federation::signing::REQUIRE_NONCE_ENV</code></td>
           <td><span class="status ok">addressed</span></td>
         </tr>
         <tr>
           <td class="col-name">e · Misconfigurations and poor implementation</td>
           <td>Capabilities v3 envelope + namespace isolation + 6 fail-CLOSED secure-default env vars (#1053/#1054/#1055/#791/#922/governance)</td>
           <td><code>capabilities_v3_envelope</code>, <code>namespace_isolation</code></td>
-          <td><code>src/config.rs</code> (env-var resolvers) · <code>CLAUDE.md §Environment Variables</code></td>
+          <td><code>config</code> (env-var resolvers) · <code>security_profile::KNOBS</code> (the <code>asi-hard</code> pinned set) · <code>CLAUDE.md §Environment Variables</code></td>
           <td><span class="status ok">addressed</span></td>
         </tr>
         <tr>
           <td class="col-name">f · Inconsistent behaviors</td>
           <td>Seven-Gap Gap 1 optimistic-concurrency versioned writes + capabilities v3 envelope + Form 6 MemoryKind discriminator</td>
           <td><code>seven_gap_versioned_writes</code>, <code>capabilities_v3_envelope</code>, <code>form_6_memory_kind</code></td>
-          <td><code>src/models/memory.rs:521</code> · <code>src/storage/mod.rs:1132/1185</code> · <code>tests/http_if_match_concurrency.rs</code></td>
+          <td><code>models::Memory::version</code> · <code>storage::update_with_expected_version</code> · <code>store::postgres::PostgresStore::update_with_expected_version</code> · <code>tests/http_if_match_concurrency.rs</code></td>
           <td><span class="status ok">addressed</span></td>
         </tr>
         <tr>
           <td class="col-name">g · Poor or missing audit logs</td>
           <td>V-4 signed-events cross-row hash chain + substrate-native verify-* CLI family + Form 4 fact-provenance + Seven-Gap Gap 3 causal recall observations</td>
           <td><code>v4_signed_events_chain</code>, <code>substrate_native_verify_family</code>, <code>seven_gap_causal_recall</code></td>
-          <td><code>src/signed_events.rs:100-119</code> · <code>src/cli/verify_signed_events.rs</code> · <code>src/observations/mod.rs:65</code></td>
+          <td><code>signed_events::{SignedEvent, verify_chain}</code> · <code>cli::verify_signed_events</code> · <code>observations::record_recall</code></td>
           <td><span class="status ok">addressed</span></td>
         </tr>
         <tr>
           <td class="col-name">h · Denial of service and fatigue-based techniques</td>
           <td>7-layer DoS defense: K8 quota + cl100k token budget + HMAC fail-CLOSED webhook + SSRF guard + DLQ MAX_REPLAY_ATTEMPTS + 2 MB HTTP body cap + federation nonce-replay</td>
           <td><code>dos_multi_layer_defense</code>, <code>token_budget_guards</code>, <code>federation_push_dlq</code></td>
-          <td><code>src/profile.rs:419</code> · <code>src/subscriptions.rs:791-803</code> · <code>src/federation/push_dlq.rs:195</code> · <code>src/lib.rs:512</code></td>
+          <td><code>memory_quota_status</code> (MCP tool; <code>profile::Profile</code>) · <code>subscriptions::dispatch_event_to_subs</code> (HMAC fail-CLOSED) · <code>federation::push_dlq::MAX_REPLAY_ATTEMPTS</code> · <code>ai_memory::HTTP_BODY_LIMIT_BYTES</code></td>
           <td><span class="status ok">addressed</span></td>
         </tr>
         <tr>
           <td class="col-name">i · Tool parameter injection (real-world)</td>
-          <td>RequestValidator DTO-bundled input-validation surface (92 HTTP routes + 101 MCP tools + 89 CLI subcommands)</td>
+          <td>RequestValidator DTO-bundled input-validation surface (94 production HTTP route registrations over 80 unique paths + 103 advertised MCP entries at <code>--profile full</code> + 89 CLI subcommands in the default build / 91 under <code>sal</code>)</td>
           <td><code>request_validator_input_validation</code>, <code>form_4_fact_provenance</code></td>
-          <td><code>src/validate.rs:1027</code> (RequestValidator) · <code>src/validate.rs:784/808/852</code> (free-fn primitives)</td>
+          <td><code>validate::RequestValidator</code> · <code>validate::{validate_id, validate_namespace, validate_agent_id, validate_source_uri, validate_citation, validate_source_span}</code> (free-fn primitives)</td>
           <td><span class="status ok">addressed</span></td>
         </tr>
         <tr>
           <td class="col-name">j · Tool invocation path confusion (real-world)</td>
           <td>Composite defense: (1) clientInfo capture at MCP initialize + (2) daemon-Ed25519-signed serverInfo at MCP initialize (TOFU pin)</td>
           <td><code>mcp_client_attestation</code></td>
-          <td><code>src/mcp/server_identity.rs</code> · <code>src/mcp/mod.rs:1607-1611</code> · <code>tests/mcp_initialize_server_signing.rs</code></td>
+          <td><code>mcp::server_identity::{build_signed_identity, verify_signed_identity}</code> · <code>mcp::handle_request</code> (the <code>initialize</code> arm captures <code>clientInfo.name</code>) · <code>tests/mcp_initialize_server_signing.rs</code></td>
           <td><span class="status ok">addressed</span></td>
         </tr>
       </tbody>
@@ -324,7 +337,7 @@ footer a{color:var(--text-muted)}
           <th style="width:18ch">NSA Recommendation</th>
           <th>ai-memory tool / feature</th>
           <th style="width:24ch">Capability identifier</th>
-          <th style="width:26ch">Substrate anchor</th>
+          <th style="width:26ch">Substrate symbol</th>
           <th style="width:10ch">Status</th>
         </tr>
       </thead>
@@ -340,42 +353,42 @@ footer a{color:var(--text-muted)}
           <td class="col-name">b · Design for boundaries</td>
           <td>Namespace isolation + Form 7 governance + SAL trait boundary + federation peer allowlist + K9 permissions + capabilities v3 envelope</td>
           <td><code>namespace_isolation</code>, <code>form_7_agent_external_governance</code>, <code>capabilities_v3_envelope</code></td>
-          <td><code>src/store/mod.rs</code> · <code>src/governance/mod.rs</code> · <code>src/handlers/admin_role.rs</code></td>
+          <td><code>store::MemoryStore</code> (SAL trait boundary) · <code>governance::agent_action::check_agent_action</code> · <code>handlers::admin_role</code></td>
           <td><span class="status ok">implemented</span></td>
         </tr>
         <tr>
           <td class="col-name">c · Validate parameters</td>
           <td>RequestValidator + per-field free functions (validate_id, validate_namespace, validate_agent_id, validate_source_uri, validate_citation, validate_source_span) + per-namespace K8 quota dimension (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1156">#1156</a>, schema v50: <code>agent_quotas</code> PK <code>(agent_id, namespace)</code>) as defense-in-depth blast-radius control</td>
           <td><code>request_validator_input_validation</code>, <code>per_namespace_quota_dimension</code></td>
-          <td><code>src/validate.rs:1027</code> · <code>src/validate.rs:784/808/852</code> · <code>migrations/sqlite/0042_v50_per_namespace_quota.sql</code> · <code>tests/per_namespace_quota.rs</code></td>
+          <td><code>validate::RequestValidator</code> · <code>validate::{validate_id, validate_namespace, validate_agent_id}</code> · <code>migrations/sqlite/0042_v50_per_namespace_quota.sql</code> · <code>tests/per_namespace_quota.rs</code></td>
           <td><span class="status ok">implemented</span></td>
         </tr>
         <tr>
           <td class="col-name">d · Constrain and sandbox tool execution</td>
           <td>Track G hook pipeline (Allow/Modify/Deny/AskUser) + per-namespace standard policy + K9 permissions engine + Form 7 governance</td>
           <td><code>track_g_hook_pipeline</code>, <code>namespace_isolation</code>, <code>form_7_agent_external_governance</code></td>
-          <td><code>src/hooks/events.rs:73</code> · <code>src/governance/agent_action.rs:99</code></td>
+          <td><code>hooks::events::HookEvent</code> · <code>governance::agent_action::check_agent_action</code></td>
           <td><span class="status ok">implemented</span></td>
         </tr>
         <tr>
           <td class="col-name">e · Sign and verify MCP messages</td>
           <td>Per-agent Ed25519 attestation + canonical-bytes signing discipline + V-4 signed-events hash chain + federation nonce-replay + daemon serverInfo Ed25519 signing at MCP initialize</td>
           <td><code>ed25519_agent_attestation</code>, <code>form_7_canonical_bytes_signing</code>, <code>v4_signed_events_chain</code>, <code>mcp_client_attestation</code></td>
-          <td><code>src/governance/rules_store.rs:541</code> · <code>src/signed_events.rs:100-119</code> · <code>src/mcp/server_identity.rs</code></td>
+          <td><code>governance::rules_store::canonical_bytes_for_signing</code> · <code>signed_events::{SignedEvent, verify_chain}</code> · <code>mcp::server_identity</code></td>
           <td><span class="status ok">implemented</span></td>
         </tr>
         <tr>
           <td class="col-name">f · Filter and monitor output pipelines and chained execution</td>
           <td>Seven-Gap Gap 7 verbose-provenance recall decoration + Track G post_recall / post_search hooks + Accept-Provenance HTTP header (v0.7.x #1155)</td>
           <td><code>seven_gap_verbose_decoration</code>, <code>track_g_hook_pipeline</code></td>
-          <td><code>src/mcp/tools/recall.rs:284</code> · <code>src/handlers/accept_provenance.rs</code></td>
+          <td><code>mcp::tools::recall::decorate_memory_many</code> · <code>handlers::accept_provenance</code></td>
           <td><span class="status ok">implemented</span></td>
         </tr>
         <tr>
           <td class="col-name">g · Instrument for logging and detection</td>
-          <td>V-4 signed-events chain + Prometheus DLQ depth gauge + capabilities v3 envelope + Track G 25-event hook pipeline + bare /metrics surface</td>
+          <td>V-4 signed-events chain + Prometheus DLQ depth gauge + capabilities v3 envelope + Track G 27-event hook pipeline + bare /metrics surface</td>
           <td><code>v4_signed_events_chain</code>, <code>dos_multi_layer_defense</code>, <code>capabilities_v3_envelope</code>, <code>track_g_hook_pipeline</code></td>
-          <td><code>src/signed_events.rs</code> · <code>src/federation/push_dlq.rs:334</code> · <code>src/lib.rs</code></td>
+          <td><code>signed_events</code> · <code>federation::push_dlq::refresh_depth_gauge</code> · <code>handlers::transport::prometheus_metrics</code></td>
           <td><span class="status ok">implemented</span></td>
         </tr>
         <tr>
@@ -389,37 +402,48 @@ footer a{color:var(--text-muted)}
           <td class="col-name">meta · Scan local network for open or vulnerable MCP servers</td>
           <td>Substrate-native verify-* CLI family (not vulnerable to CVE-2025-49596 MCP-Inspector); operator-side network scanning out of substrate scope</td>
           <td><code>substrate_native_verify_family</code></td>
-          <td><code>src/cli/verify_signed_events.rs</code> · <code>src/forensic/bundle.rs</code></td>
+          <td><code>cli::verify_signed_events</code> · <code>forensic::bundle</code></td>
           <td><span class="status consumer">operator-side</span></td>
         </tr>
       </tbody>
     </table>
 
-    <p style="margin-top:1.5rem;color:var(--text-dim);font-size:.85rem">Every <code>Capability identifier</code> in the tables above corresponds to a row in the codegraph-verified <a href="_inventory/v0.7.0-capabilities.json">capability inventory JSON</a>. Every <code>Substrate anchor</code> is a real file:line in the v0.7.x codebase. Procurement reviewers can run the verification commands in §<a href="#verify">For procurement reviewers</a> to reproduce the mapping from a fresh checkout.</p>
+    <p style="margin-top:1.5rem;color:var(--text-dim);font-size:.85rem">Every <code>Capability identifier</code> in the tables above corresponds to a row in the <a href="_inventory/v0.7.0-capabilities.json">v0.7.0-era capability inventory JSON</a> (see the currency note above — that artefact has not been re-derived at v1.0.0; <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1938">#1938</a>). Every <code>Substrate symbol</code> is a named module / type / function / test that resolves at <code>release/v1.0.0</code> HEAD — check any of them with <code>rg '&lt;symbol&gt;' src/ tests/</code>. Procurement reviewers can run the verification commands in §<a href="#verify">For procurement reviewers</a> to reproduce the mapping from a fresh checkout.</p>
     <p style="color:var(--text-dim);font-size:.85rem">This table maps each control to the <em>feature</em> that addresses it. The companion <a href="nsa-control-test-matrix.html">Control → Test Matrix</a> maps the same controls to the <em>automated checks</em> that exercise them — named tests (<code>file::test_name</code>), CI workflow jobs, and do-1461 live-fleet harness check ids — with evidence gaps stated honestly.</p>
   </div>
 </section>
 
 <section id="concerns">
   <div class="container">
-    <span class="section-eyebrow">▸ NSA Concerns · 10 of 10 structurally addressed</span>
+    <span class="section-eyebrow">▸ NSA Concerns · 9 of 10 structurally addressed as shipped</span>
     <h2>NSA-enumerated security concerns → ai-memory substrate primitives.</h2>
-    <p class="lede">Each concern below is mapped to the substrate primitive(s) that address it, with file-anchored verification references and a procurement-grade narrative. Status badges: <span class="status ok">addressed</span> means structurally addressed at the substrate layer; <span class="status partial">partial</span> means partial coverage with a documented v0.7.x landing; <span class="status consumer">consumer</span> means consumer-application responsibility with substrate-side exposure of provenance signals.</p>
+    <p class="lede">Each concern below is mapped to the substrate primitive(s) that address it, with named-symbol verification references and a procurement-grade narrative. Status badges: <span class="status ok">addressed</span> means structurally addressed at the substrate layer <em>as shipped</em>; <span class="status partial">enforce posture</span> means structurally addressed under a documented, operator-selected posture that is not the shipped default; <span class="status consumer">consumer</span> means consumer-application responsibility with substrate-side exposure of provenance signals.</p>
 
     <div class="concern" id="concern-a">
       <div class="header">
         <h3>a · Access control</h3>
-        <div class="meta"><span class="status ok">structurally addressed</span></div>
+        <div class="meta"><span class="status partial">structurally addressed under the <code>enforce</code> posture</span></div>
       </div>
       <p><strong>What the NSA warns:</strong> MCP servers can expose tools that operate outside the user's intended access boundary; unauthorised callers may invoke privileged operations if the server lacks robust authentication and authorisation.</p>
-      <p><strong>How ai-memory addresses it:</strong> Four-layer composite defense — per-namespace isolation (every memory carries a strictly-validated <code>namespace</code> foreign key enforced at the storage layer); Form 7 agent-EXTERNAL governance rules engine consulted on every write that proposes an external action; explicit admin-role gate honoured by <code>AI_MEMORY_ADMIN_AGENT_IDS</code> (post-#980 the <code>*</code> wildcard is rejected at startup); per-tenant authorisation gates on subscription enumeration and DLQ access (#870, #872 — both fixed in v0.7.0 cycle as security-high cross-tenant leaks).</p>
+      <p><strong>How ai-memory addresses it:</strong> A composite defense — per-namespace isolation (every memory carries a strictly-validated <code>namespace</code> enforced at the storage layer); the Form 7 agent-EXTERNAL governance rules engine consulted on every write that proposes an external action (<code>governance::agent_action::check_agent_action</code>); an explicit admin-role gate honoured by <code>AI_MEMORY_ADMIN_AGENT_IDS</code>, where post-#980 the <code>*</code> wildcard is rejected rather than admitted (<code>handlers::admin_role</code>); per-tenant authorisation gates on subscription enumeration and DLQ access (#870, #872 — both fixed in the v0.7.0 cycle as security-high cross-tenant leaks); and HTTP per-agent-key principal binding (<code>handlers::identity_binding</code>, #2044/#2129/#2154).</p>
+      <p><strong>The posture qualification, stated plainly.</strong> On the HTTP surface the caller's principal is the <code>X-Agent-Id</code> header — a <strong>self-asserted</strong> value, while the <code>api_key</code> is only a shared transport credential. #2044 (with #2129 and #2154 closing the last two members of the class) shipped the control that binds them: an enrolled per-agent API key (schema v83 <code>agent_api_keys</code>, <code>sha256(token) → agent_id</code>) binds the header, and the IDOR-sensitive single-row read/mutate routes, the bulk read surfaces, the approvals SSE stream, and <code>require_admin</code> refuse a merely-<em>claimed</em> named principal with <code>403 attested_identity_required</code>. That control is real, it is tested, and it closes the concern — <strong>under <code>AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce</code> with per-agent keys enrolled.</strong></p>
+      <p><strong>The shipped default is <code>advisory</code> with zero keys enrolled</strong>, and in that posture the project's own CHANGELOG records the consequence verbatim: <em>"Out of the box (<code>advisory</code> default + zero per-agent keys enrolled) H1/M1 behave EXACTLY as pre-#2044 — the gate is fully inert until an operator enrolls per-agent keys AND sets <code>enforce</code>."</em> That default was chosen deliberately — <code>enforce</code>-by-default with zero keys enrolled would refuse every existing shared-key deployment (the #1985 trap) — but a procurement reviewer must be told which posture the coverage claim describes. <strong>A multi-principal deployment that leaves the default in place is running the posture this project rates finding H1 (High, OWASP A01/A07)</strong> in its own <a href="v1.0.0-security-assessment.html">v1.0.0 adversarial security assessment</a>: cross-tenant IDOR/BOLA on read+mutate via a spoofable <code>X-Agent-Id</code>. Single-operator deployments that enrol no per-agent keys are unaffected either way.</p>
+      <p><strong>Closing it is two steps:</strong></p>
+<pre class="codeblock"><span class="com"># 1. Enrol a per-agent API key for every named principal</span>
+ai-memory agents bind-api-key --agent-id &lt;agent&gt; --token &lt;token&gt;
+
+<span class="com"># 2. Require the binding, then restart `serve` (the key map is boot-loaded)</span>
+export AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce
+ai-memory serve</pre>
       <div class="anchor-list">
-        <strong>Code anchors:</strong>
+        <strong>Code symbols:</strong>
         <ul>
-          <li>src/governance/mod.rs::check_agent_action</li>
-          <li>src/daemon_runtime.rs:1583+ (AI_MEMORY_ADMIN_AGENT_IDS resolver)</li>
-          <li>src/handlers/admin_role.rs:97 (admin gate)</li>
-          <li>src/subscriptions.rs:138-166 (cross-tenant authz, #870/#872)</li>
+          <li>governance::agent_action::check_agent_action</li>
+          <li>daemon_runtime::resolve_admin_agent_ids (AI_MEMORY_ADMIN_AGENT_IDS resolver; <code>*</code> wildcard rejected)</li>
+          <li>handlers::admin_role::{is_admin_caller, is_admin_caller_trusted, require_admin}</li>
+          <li>handlers::identity_binding (#2044 per-agent-key principal binding)</li>
+          <li>config::{ENV_HTTP_ATTESTED_IDENTITY, HttpIdentityMode, http_attested_identity_mode}</li>
+          <li>subscriptions::{list, delete} — caller-scoped cross-tenant authz (#870/#872)</li>
         </ul>
       </div>
     </div>
@@ -434,11 +458,12 @@ footer a{color:var(--text-muted)}
       <div class="anchor-list">
         <strong>Code anchors:</strong>
         <ul>
-          <li>src/models/memory.rs:464/473/482 (Memory.citations/source_uri/source_span)</li>
-          <li>src/governance/rules_store.rs:541 (canonical_bytes_for_signing)</li>
-          <li>src/governance/rules_store.rs:781/798 (canonical-bytes regression tests)</li>
-          <li>src/validate.rs:1027 (RequestValidator)</li>
-          <li>tests/capabilities_v3.rs:125 (capabilities v3 envelope test)</li>
+          <li>models::Memory — the Form 4 provenance fields citations / source_uri / source_span</li>
+          <li>governance::rules_store::canonical_bytes_for_signing</li>
+          <li>governance::rules_store::canonical_bytes_for_signing_includes_enabled (co-located regression test)</li>
+          <li>governance::rules_store::canonical_bytes_for_signing_excludes_signature_and_attest_level (co-located regression test)</li>
+          <li>validate::RequestValidator</li>
+          <li>tests/capabilities_v3.rs — the capabilities-v3 envelope negotiation suite</li>
         </ul>
       </div>
     </div>
@@ -449,14 +474,14 @@ footer a{color:var(--text-muted)}
         <div class="meta"><span class="status ok">structurally addressed</span></div>
       </div>
       <p><strong>What the NSA warns:</strong> Automated tool execution without human-in-the-loop checkpoints can amplify damage from prompt injection or context contamination.</p>
-      <p><strong>How ai-memory addresses it:</strong> Track G 25-event programmable hook pipeline (each hook returns <code>Allow</code>, <code>Modify(delta)</code>, <code>Deny{reason, code}</code>, or <code>AskUser{prompt, options, default}</code>; chain ordering is priority-desc; first-Deny short-circuits); K10 pending-actions SSE stream at <code>/api/v1/approvals/stream</code>; <code>pending_actions</code> table with <code>memory_pending_approve</code> / <code>memory_pending_reject</code> MCP tools; HMAC-mandatory webhook dispatch under R3-S1.HMAC.</p>
+      <p><strong>How ai-memory addresses it:</strong> Track G 27-event programmable hook pipeline (each hook returns <code>Allow</code>, <code>Modify(delta)</code>, <code>Deny{reason, code}</code>, or <code>AskUser{prompt, options, default}</code>; chain ordering is priority-desc; first-Deny short-circuits); K10 pending-actions SSE stream at <code>/api/v1/approvals/stream</code>; <code>pending_actions</code> table with <code>memory_pending_approve</code> / <code>memory_pending_reject</code> MCP tools; HMAC-mandatory webhook dispatch under R3-S1.HMAC.</p>
       <div class="anchor-list">
         <strong>Code anchors:</strong>
         <ul>
-          <li>src/hooks/events.rs:73 (HookEvent enum, 25 variants)</li>
-          <li>src/subscriptions.rs:521-548 (pending_actions surface)</li>
-          <li>src/subscriptions.rs:791-803 (HMAC fail-CLOSED)</li>
-          <li>Command::Pending in src/daemon_runtime.rs</li>
+          <li>hooks::events::HookEvent (27 variants at v1.0.0)</li>
+          <li>handlers::routes::APPROVALS_STREAM + subscriptions::dispatch_approval_requested (pending-actions surface)</li>
+          <li>subscriptions::dispatch_event_to_subs (HMAC fail-CLOSED dispatch refusal, R3-S1.HMAC)</li>
+          <li>daemon_runtime::Command::Pending</li>
         </ul>
       </div>
     </div>
@@ -467,15 +492,17 @@ footer a{color:var(--text-muted)}
         <div class="meta"><span class="status ok">structurally addressed</span></div>
       </div>
       <p><strong>What the NSA warns:</strong> MCP servers handling tokens (API keys, signed bearer tokens, mTLS client certs) must protect them from theft and replay.</p>
-      <p><strong>How ai-memory addresses it:</strong> mTLS transport on the federation surface (sync daemon refuses to start without mTLS unless explicit insecure flag is set; an empty peer allowlist refuses every peer); per-agent Ed25519 keypairs for substrate-level attestation; federation nonce-replay defense (#922 — <code>AI_MEMORY_FED_REQUIRE_NONCE</code> defaults to <code>1</code>; signature bound to nonce as <code>body || 0x00 || nonce</code> so captured (body, sig) pairs cannot be replayed under a fresh nonce); optional SQLCipher encryption at rest with mode-0400 strict-permission enforcement (#1055).</p>
+      <p><strong>How ai-memory addresses it:</strong> per-agent Ed25519 keypairs for substrate-level attestation; federation nonce-replay defense (#922 — <code>AI_MEMORY_FED_REQUIRE_NONCE</code> defaults to <code>1</code>; signature bound to nonce as <code>body || 0x00 || nonce</code> so captured (body, sig) pairs cannot be replayed under a fresh nonce); optional SQLCipher encryption at rest with mode-0400 strict-permission enforcement (#1055); and the federation TLS posture below.</p>
+      <p><strong>Federation TLS, stated as the code implements it.</strong> An earlier revision of this page asserted that "the sync daemon refuses to start without mTLS unless an explicit insecure flag is set". <strong>It does not</strong>, and that sentence is withdrawn. What ships: outbound peer server-certificate verification IS required by default — <code>tls::server_verify_required</code> resolves to <em>required</em> when unset, and the pure mode selector <code>tls::select_sync_tls_mode</code> <strong>refuses</strong> to resolve the accept-any disposition unless the operator supplies all of <code>--insecure-skip-server-verify</code>, <strong>both</strong> <code>--client-cert</code> and <code>--client-key</code> (a compensating mTLS control), and an explicit falsy <code>AI_MEMORY_FED_REQUIRE_SERVER_VERIFY</code> (#2448) — four conditions, not one, and <code>AI_MEMORY_SECURITY_PROFILE=asi-hard</code> pins that knob on so the escape hatch is itself no-disable. Client-side mTLS is <strong>opt-in on both ends</strong>: with no client-cert flags and no insecure flag, <code>ai-memory sync-daemon</code> starts normally on the CA-validated path with no client certificate, and server-side <code>--mtls-allowlist</code> is optional — absent means no client-certificate verification is installed at all. The empty-allowlist refusal is a guard on an <em>already-enabled</em> control, not a cause of mTLS being required. Once enabled, mTLS is exactly as advertised: <code>tls::FingerprintAllowlistVerifier</code> returns <code>client_auth_mandatory() -&gt; true</code>, compares SHA-256 over the presented client certificate's DER against the operator allowlist in constant time, and rejects inside the TLS handshake — before any Axum layer or handler executes.</p>
       <div class="anchor-list">
-        <strong>Code anchors:</strong>
+        <strong>Code symbols:</strong>
         <ul>
-          <li>src/tls.rs:1175 (mTLS happy-path test)</li>
-          <li>src/tls.rs:1197 (empty-allowlist refusal test)</li>
-          <li>src/cli/sync.rs:654 (sync_daemon insecure-without-mtls refusal)</li>
-          <li>src/federation/signing.rs:42 (REQUIRE_NONCE_ENV)</li>
-          <li>src/governance/audit.rs:558 (load_daemon_signing_key)</li>
+          <li>tls::{server_verify_required, select_sync_tls_mode, FED_REQUIRE_SERVER_VERIFY_ENV} (#2448)</li>
+          <li>tls::FingerprintAllowlistVerifier (inbound client-cert pinning)</li>
+          <li>tls::load_mtls_rustls_config + the co-located tests test_load_mtls_rustls_config_happy_path / test_load_mtls_rustls_config_empty_allowlist_refuses</li>
+          <li>cli::sync::build_sync_client (threads the mode selector)</li>
+          <li>federation::signing::REQUIRE_NONCE_ENV</li>
+          <li>governance::audit::load_daemon_signing_key</li>
         </ul>
       </div>
     </div>
@@ -486,12 +513,15 @@ footer a{color:var(--text-muted)}
         <div class="meta"><span class="status ok">structurally addressed</span></div>
       </div>
       <p><strong>What the NSA warns:</strong> Permissive defaults compound across deployments; secure posture must be the default, not an opt-in.</p>
-      <p><strong>How ai-memory addresses it:</strong> v0.7.0 ships secure defaults across the board: <code>permissions.mode = "enforce"</code> (was <code>"advisory"</code> in v0.6.4); governance fail-CLOSED on rule-consultation errors (<code>AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=false</code>, #1054); SSRF DNS-failure fail-CLOSED (<code>AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=false</code>, #1053); passphrase-file mode-0400 strict-permission enforcement (<code>AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=false</code>, #1055); federation signature enforcement (<code>AI_MEMORY_FED_REQUIRE_SIG=1</code>, #791); federation nonce defense (<code>AI_MEMORY_FED_REQUIRE_NONCE=1</code>, #922).</p>
+      <p><strong>How ai-memory addresses it:</strong> v1.0.0 ships secure defaults across the board, and more of them than v0.7.0 did. Six verified at v0.7.0 and still in force: <code>permissions.mode = "enforce"</code> (was <code>"advisory"</code> in v0.6.4); governance fail-CLOSED on rule-consultation errors (<code>AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=false</code>, #1054); SSRF DNS-failure fail-CLOSED (<code>AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=false</code>, #1053); passphrase-file mode-0400 strict-permission enforcement (<code>AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=false</code>, #1055); federation signature enforcement (<code>AI_MEMORY_FED_REQUIRE_SIG=1</code>, #791); federation nonce defense (<code>AI_MEMORY_FED_REQUIRE_NONCE=1</code>, #922). v1.0.0 adds, on the federation inbound surface, per-write content attestation and per-signal author attestation default-ON (<code>AI_MEMORY_FED_REQUIRE_WRITE_SIG</code> / <code>_SIGNAL_SIG</code>, #1801/#1954), authority-lane fail-closed gates for inbound action transitions and commit-checkpoint resolutions, inbound write namespace scoping for an enrolled peer (#2447), outbound peer server-certificate verification required by default (#2448), a schema-downgrade guard that refuses to open a database newer than the binary (#2445), and HTTP admission control on by default. The named <code>AI_MEMORY_SECURITY_PROFILE=asi-hard</code> posture pins a 16-entry knob table to its hard floor and <strong>refuses to boot</strong> if an operator has set any pinned knob below it.</p>
+      <p><strong>The one default this page does NOT describe as fail-closed</strong> is the HTTP identity-binding posture — <code>AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY</code> defaults to <code>advisory</code>, which is inert with zero per-agent keys enrolled. That is the concern-(a) qualification above, and it is stated there rather than buried here.</p>
       <div class="anchor-list">
-        <strong>Code anchors:</strong>
+        <strong>Code symbols:</strong>
         <ul>
-          <li>src/config.rs::PermissionsMode (default Enforce)</li>
-          <li>Six fail-CLOSED env-var resolvers documented in CLAUDE.md §Environment Variables</li>
+          <li>config::PermissionsMode (default Enforce)</li>
+          <li>security_profile::{SecurityPosture, KNOBS, enforce_at_boot} — the asi-hard pinned-knob SSOT</li>
+          <li>storage::schema_guard::{evaluate, SchemaAheadOfBinary} (#2445 schema-downgrade guard)</li>
+          <li>The fail-CLOSED env-var resolvers documented in CLAUDE.md §Environment Variables</li>
         </ul>
       </div>
     </div>
@@ -502,15 +532,15 @@ footer a{color:var(--text-muted)}
         <div class="meta"><span class="status ok">structurally addressed</span></div>
       </div>
       <p><strong>What the NSA warns:</strong> Race conditions and undefined-behavior corner cases in MCP implementations produce non-deterministic outcomes that defy auditing.</p>
-      <p><strong>How ai-memory addresses it:</strong> Seven-Gap Gap 1 optimistic-concurrency versioned writes (<code>Memory.version: i64</code> at schema v45; concurrent updates passing <code>expected_version</code> race exactly one winner; the loser receives a typed 409 CONFLICT envelope; HTTP If-Match parity pinned by 5 regression tests); capabilities v3 envelope publishing runtime configuration to callers; Form 6 <code>MemoryKind</code> discriminator disambiguating <code>Claim</code> from <code>Observation</code> from <code>Reflection</code> for epistemic-weight differentiation.</p>
+      <p><strong>How ai-memory addresses it:</strong> Seven-Gap Gap 1 optimistic-concurrency versioned writes (<code>Memory.version: i64</code> at schema v45; concurrent updates passing <code>expected_version</code> race exactly one winner; the loser receives a typed 409 CONFLICT envelope; HTTP If-Match parity pinned by 5 regression tests); capabilities v3 envelope publishing runtime configuration to callers; Form 6 <code>MemoryKind</code> discriminator (16 variants at v1.0.0) disambiguating <code>Claim</code> from <code>Observation</code> from <code>Reflection</code> for epistemic-weight differentiation.</p>
       <div class="anchor-list">
         <strong>Code anchors:</strong>
         <ul>
-          <li>src/models/memory.rs:521 (Memory.version: i64)</li>
-          <li>src/storage/mod.rs:1185 (update_with_expected_version)</li>
-          <li>src/store/postgres.rs:1987 (postgres adapter)</li>
+          <li>models::Memory::version (i64, schema v45)</li>
+          <li>storage::update_with_expected_version (sqlite)</li>
+          <li>store::postgres::PostgresStore::update_with_expected_version (postgres adapter)</li>
           <li>tests/http_if_match_concurrency.rs (5 parity tests)</li>
-          <li>src/models/memory.rs:38 (MemoryKind 10 variants)</li>
+          <li>models::MemoryKind (16 variants at v1.0.0; the Form-6 ten plus Goal/Plan/Step and Told/Instruction/Intervention)</li>
         </ul>
       </div>
     </div>
@@ -525,10 +555,11 @@ footer a{color:var(--text-muted)}
       <div class="anchor-list">
         <strong>Code anchors:</strong>
         <ul>
-          <li>src/signed_events.rs:100-119 (prev_hash + sequence columns at schema v34)</li>
-          <li>src/cli/verify_signed_events.rs (chain verifier)</li>
-          <li>src/observations/mod.rs:65 (record_recall, causal Gap 3)</li>
-          <li>src/mcp/tools/recall_observations.rs:16 (memory_recall_observations MCP tool)</li>
+          <li>signed_events::SignedEvent — the prev_hash + sequence chain columns</li>
+          <li>signed_events::verify_chain</li>
+          <li>cli::verify_signed_events (the `ai-memory verify-signed-events-chain` verifier)</li>
+          <li>observations::record_recall (causal Gap 3 ledger write)</li>
+          <li>mcp::tools::recall_observations::{handle_recall_observations, RecallObservationsTool}</li>
         </ul>
       </div>
     </div>
@@ -544,13 +575,13 @@ footer a{color:var(--text-muted)}
       <div class="anchor-list">
         <strong>Code anchors:</strong>
         <ul>
-          <li>src/profile.rs:419 (memory_quota_status K8)</li>
+          <li>memory_quota_status (K8 quota MCP tool; family membership in profile::Profile)</li>
           <li>tests/token_budget_guard.rs (cl100k wire ceilings)</li>
-          <li>src/subscriptions.rs:791-803 (HMAC fail-CLOSED)</li>
-          <li>src/subscriptions.rs:1070-1100 (SSRF guard, #1053)</li>
-          <li>src/federation/push_dlq.rs:195 (MAX_REPLAY_ATTEMPTS)</li>
-          <li>src/lib.rs:512 (DefaultBodyLimit::max(2 * 1024 * 1024))</li>
-          <li>src/federation/signing.rs:42 (REQUIRE_NONCE_ENV)</li>
+          <li>subscriptions::dispatch_event_to_subs (HMAC fail-CLOSED)</li>
+          <li>subscriptions::{validate_url, validate_url_dns} (SSRF guard, #1053)</li>
+          <li>federation::push_dlq::MAX_REPLAY_ATTEMPTS</li>
+          <li>ai_memory::HTTP_BODY_LIMIT_BYTES (2 MiB Axum DefaultBodyLimit)</li>
+          <li>federation::signing::REQUIRE_NONCE_ENV</li>
         </ul>
       </div>
     </div>
@@ -561,13 +592,13 @@ footer a{color:var(--text-muted)}
         <div class="meta"><span class="status ok">structurally addressed</span></div>
       </div>
       <p><strong>What the NSA warns:</strong> Attackers embed adversarial parameters in tool-invocation payloads that the MCP server does not adequately validate. The NSA document cites this as a recurring real-world failure class.</p>
-      <p><strong>How ai-memory addresses it:</strong> <code>RequestValidator</code> DTO-bundled validation surface (#966). Every wire-entry layer — 92 HTTP routes, 101 MCP tools, 89 CLI subcommands — routes DTO-bundling validation through <code>RequestValidator::validate_create</code>, <code>validate_update</code>, <code>validate_memory</code>, <code>validate_link_triple</code>, <code>validate_consolidate</code>, <code>validate_id_and_namespace</code>, <code>validate_owner_write</code>, <code>validate_confidence_and_priority</code>. The typed <code>ValidationError { field, reason }</code> carries explicit field attribution while preserving byte-equal wire-side error messages via a <code>Display</code> impl mirroring the legacy <code>bail!</code> shape. Adding a new cross-field invariant is one struct method addition.</p>
+      <p><strong>How ai-memory addresses it:</strong> <code>RequestValidator</code> DTO-bundled validation surface (#966). Every wire-entry layer — <strong>94 production HTTP route registrations over 80 unique paths, 103 advertised MCP entries at <code>--profile full</code>, 89 CLI subcommands in the default build / 91 under <code>sal</code></strong> (the mechanically-pinned SSOT counts at v1.0.0; this section previously published the stale v0.7.0 figures 92 / 101 / 89) — routes DTO-bundling validation through <code>RequestValidator::validate_create</code>, <code>validate_update</code>, <code>validate_memory</code>, <code>validate_link_triple</code>, <code>validate_consolidate</code>, <code>validate_id_and_namespace</code>, <code>validate_owner_write</code>, <code>validate_confidence_and_priority</code>. The typed <code>ValidationError { field, reason }</code> carries explicit field attribution while preserving byte-equal wire-side error messages via a <code>Display</code> impl mirroring the legacy <code>bail!</code> shape. Adding a new cross-field invariant is one struct method addition.</p>
       <div class="anchor-list">
         <strong>Code anchors:</strong>
         <ul>
-          <li>src/validate.rs:1027 (pub struct RequestValidator)</li>
-          <li>src/validate.rs:1038/1050 (validate_create / validate_update methods)</li>
-          <li>src/validate.rs:784/808/852 (free-function primitives)</li>
+          <li>validate::RequestValidator (pub struct)</li>
+          <li>validate::RequestValidator::{validate_create, validate_update} (and validate_memory / validate_link_triple / validate_consolidate / validate_id_and_namespace / validate_owner_write / validate_confidence_and_priority)</li>
+          <li>validate::{validate_id, validate_namespace, validate_agent_id, validate_source_uri, validate_citation, validate_source_span} (free-function primitives)</li>
         </ul>
       </div>
     </div>
@@ -579,16 +610,16 @@ footer a{color:var(--text-muted)}
       </div>
       <p><strong>What the NSA warns:</strong> MCP clients mounting multiple servers without a robust resolution policy can suffer tool-name collisions — a malicious or misconfigured second server advertising a tool named <code>memory_recall</code> can shadow the legitimate one.</p>
       <p><strong>How ai-memory addresses it (composite — both halves shipped):</strong></p>
-      <p><strong>(1) Client-side identity capture (v0.7.0 baseline):</strong> the substrate captures <code>clientInfo.name</code> from the MCP initialize handshake (<code>src/mcp/mod.rs:1607-1611</code>) and threads it through every downstream operation for per-row provenance attribution. This proves WHICH client made a call and supports forensic reconstruction.</p>
-      <p><strong>(2) Server-side cryptographic identity attestation (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1154">#1154</a>, shipped in v0.7.0):</strong> the substrate publishes a daemon-Ed25519-signed <code>ai_memory_identity</code> block on every MCP initialize response (<code>src/mcp/server_identity.rs</code>). Clients implement Trust On First Use (TOFU): capture the signature on first connect; refuse subsequent connects that present a different signature. Canonical-bytes discipline mirrors the existing governance-rule signing pattern at <code>src/governance/rules_store.rs:541</code> — schema_version + daemon_id + public_key + signed_at signed via Ed25519. The implementation is purely additive on the wire (per MCP spec, clients ignore unknown response fields); v0.6.4 / v0.7.0 callers continue to function identically; the block is OMITTED when the daemon has no keypair on disk (preserving the existing "continuing unsigned" posture from <code>src/main.rs:116-118</code>).</p>
-      <p><strong>Coverage pinned by 47 dedicated tests:</strong> 20 module-level tests in <code>src/mcp/server_identity.rs</code> + 27 integration tests in <code>tests/mcp_initialize_server_signing.rs</code>. Zero regression on existing MCP handshake tests (<code>mcp_initialize_handshake_succeeds</code>, the eight <code>d4_*_initialize_round_trip</code> harness coverage tests).</p>
+      <p><strong>(1) Client-side identity capture (v0.7.0 baseline):</strong> the substrate captures <code>clientInfo.name</code> from the MCP initialize handshake (the <code>initialize</code> arm of <code>mcp::handle_request</code>) and threads it through every downstream operation for per-row provenance attribution. This proves WHICH client made a call and supports forensic reconstruction.</p>
+      <p><strong>(2) Server-side cryptographic identity attestation (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1154">#1154</a>, shipped in v0.7.0):</strong> the substrate publishes a daemon-Ed25519-signed <code>ai_memory_identity</code> block on every MCP initialize response (<code>mcp::server_identity::build_signed_identity</code>). Clients implement Trust On First Use (TOFU): capture the signature on first connect; refuse subsequent connects that present a different signature. Canonical-bytes discipline mirrors the existing governance-rule signing pattern (<code>governance::rules_store::canonical_bytes_for_signing</code>) — schema_version + daemon_id + public_key + signed_at signed via Ed25519. The implementation is purely additive on the wire (per MCP spec, clients ignore unknown response fields); v0.6.4 / v0.7.0 callers continue to function identically; the block is OMITTED when the daemon has no keypair on disk (preserving the existing "continuing unsigned" posture — <code>governance::audit::load_daemon_signing_key</code> returns <code>None</code>).</p>
+      <p><strong>Coverage pinned by 47 dedicated tests:</strong> 20 module-level tests in <code>src/mcp/server_identity.rs</code> + 27 integration tests in <code>tests/mcp_initialize_server_signing.rs</code>, counted at v1.0.0 HEAD. Zero regression on existing MCP handshake tests (<code>mcp_initialize_handshake_succeeds</code>, the eight <code>d4_*_initialize_round_trip</code> harness coverage tests).</p>
       <div class="anchor-list">
         <strong>Code anchors:</strong>
         <ul>
-          <li>src/mcp/server_identity.rs — DaemonIdentityToSign struct, canonical_bytes_for_identity, build_signed_identity, verify_signed_identity (net-new module, #1154)</li>
-          <li>src/mcp/mod.rs initialize handler — constructs + signs ai_memory_identity block; omits when no keypair</li>
-          <li>src/mcp/mod.rs:1607-1611 (clientInfo capture at initialize, v0.7.0 baseline)</li>
-          <li>src/governance/audit.rs:558 (load_daemon_signing_key — threaded as active_keypair into handle_request)</li>
+          <li>mcp::server_identity::{DaemonIdentityToSign, canonical_bytes_for_identity, build_signed_identity, verify_signed_identity} (net-new module, #1154)</li>
+          <li>mcp::handle_request — the initialize arm constructs + signs the ai_memory_identity block, and omits it when no keypair is present</li>
+          <li>mcp::handle_request — the same initialize arm captures clientInfo.name (v0.7.0 baseline)</li>
+          <li>governance::audit::load_daemon_signing_key (threaded as active_keypair into handle_request)</li>
           <li>tests/mcp_initialize_server_signing.rs — 27 integration tests covering happy path, no-keypair fallback, backwards compat, tampering rejection, malformed-input rejection, cross-rotation TOFU detection, determinism, performance, schema-version drift</li>
         </ul>
       </div>
@@ -607,7 +638,7 @@ footer a{color:var(--text-muted)}
         <h3>a · Choose supported MCP projects when possible</h3>
         <div class="meta"><span class="status ok">implemented</span></div>
       </div>
-      <p>ai-memory v0.7.0 is maintained by AlphaOne LLC under Apache 2.0. Public release cadence visible in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/release/v0.7.0/CHANGELOG.md">CHANGELOG.md</a>, <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/release/v0.7.0/RELEASE_NOTES_v0.7.0.md">release notes</a>, and the GitHub repository. Security-advisory channel via GitHub Security Advisory + email <code>security@alpha-one.mobi</code> per <a href="../SECURITY.html">SECURITY.md</a>. MCP Registry submission tracked under Task H of audit issue #1153.</p>
+      <p>ai-memory v1.0.0 is maintained by AlphaOne LLC under Apache 2.0. Public release cadence visible in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/release/v1.0.0/CHANGELOG.md">CHANGELOG.md</a>, the per-release notes under <a href="https://github.com/alphaonedev/ai-memory-mcp/tree/release/v1.0.0/docs">docs/</a>, and the GitHub repository. Security-advisory channel via GitHub Security Advisory + email <code>security@alpha-one.mobi</code> per <a href="../SECURITY.html">SECURITY.md</a>. MCP Registry submission tracked under Task H of audit issue #1153.</p>
     </div>
 
     <div class="recommendation" id="rec-b">
@@ -615,7 +646,7 @@ footer a{color:var(--text-muted)}
         <h3>b · Design for boundaries</h3>
         <div class="meta"><span class="status ok">implemented</span></div>
       </div>
-      <p>Every boundary is declared, validated, and has a fail-CLOSED secure default: namespace isolation (storage-layer foreign-key invariant); Form 7 agent-EXTERNAL governance (agent-action policy boundary); SAL trait at <code>src/store/mod.rs</code> (storage-adapter boundary, sqlite vs postgres+AGE); federation peer allowlist (network boundary); K3/K9 permissions model (operator-policy boundary); capabilities v3 envelope (wire-shape boundary published to consumers).</p>
+      <p>Every boundary is declared, validated, and has a fail-CLOSED secure default: namespace isolation (storage-layer foreign-key invariant); Form 7 agent-EXTERNAL governance (agent-action policy boundary); the SAL <code>store::MemoryStore</code> trait (storage-adapter boundary, sqlite vs postgres+AGE); federation peer allowlist (network boundary); K3/K9 permissions model (operator-policy boundary); capabilities v3 envelope (wire-shape boundary published to consumers).</p>
     </div>
 
     <div class="recommendation" id="rec-c">
@@ -623,7 +654,7 @@ footer a{color:var(--text-muted)}
         <h3>c · Validate parameters</h3>
         <div class="meta"><span class="status ok">implemented</span></div>
       </div>
-      <p><code>RequestValidator</code> at <code>src/validate.rs:1027</code> (#966) covers all three protocol surfaces (HTTP, MCP, CLI) via one struct method. Single-field primitives (<code>validate_id</code>, <code>validate_namespace</code>, <code>validate_agent_id</code>, <code>validate_source_uri</code>, <code>validate_citation</code>, <code>validate_source_span</code>) remain the lowest level. Pinned by regression tests in <code>tests/validate.rs</code>.</p>
+      <p><code>validate::RequestValidator</code> (#966) covers all three protocol surfaces (HTTP, MCP, CLI) via one struct method. Single-field primitives (<code>validate_id</code>, <code>validate_namespace</code>, <code>validate_agent_id</code>, <code>validate_source_uri</code>, <code>validate_citation</code>, <code>validate_source_span</code>) remain the lowest level. Pinned by the co-located test module in <code>src/validate.rs</code> plus the property-based suite <code>tests/proptest_validate.rs</code> — there is no <code>tests/validate.rs</code>; an earlier revision of this page cited one.</p>
     </div>
 
     <div class="recommendation" id="rec-d">
@@ -631,7 +662,7 @@ footer a{color:var(--text-muted)}
         <h3>d · Constrain and sandbox tool execution</h3>
         <div class="meta"><span class="status ok">implemented</span></div>
       </div>
-      <p>Track G hook pipeline with <code>Allow / Modify / Deny / AskUser</code> decision contract (default-off; <code>~/.config/ai-memory/hooks.toml</code> is the operator-controlled allowlist); per-namespace <code>standard_policy</code> memory pointers (#800 Batman Mode Crack 1); K9 permissions engine consulted on every write that proposes an agent-EXTERNAL action. Process-level sandboxing (containers, seccomp) is operator-deployment territory; substrate publishes reference configurations under <a href="https://github.com/alphaonedev/ai-memory-mcp/tree/release/v0.7.0/infra">infra/</a>.</p>
+      <p>Track G hook pipeline with <code>Allow / Modify / Deny / AskUser</code> decision contract (default-off; <code>~/.config/ai-memory/hooks.toml</code> is the operator-controlled allowlist); per-namespace <code>standard_policy</code> memory pointers (#800 Batman Mode Crack 1); K9 permissions engine consulted on every write that proposes an agent-EXTERNAL action. Process-level sandboxing (containers, seccomp) is operator-deployment territory; substrate publishes reference configurations under <a href="https://github.com/alphaonedev/ai-memory-mcp/tree/release/v1.0.0/infra">infra/</a>.</p>
     </div>
 
     <div class="recommendation" id="rec-e">
@@ -639,7 +670,7 @@ footer a{color:var(--text-muted)}
         <h3>e · Sign and verify MCP messages</h3>
         <div class="meta"><span class="status ok">implemented</span></div>
       </div>
-      <p>Per-agent Ed25519 keypairs for outbound link signing and inbound verification; canonical-bytes signing discipline at <code>src/governance/rules_store.rs:541</code> (excludes signature + attest_level; includes <code>enabled</code>; both invariants regression-pinned); V-4 signed-events cross-row hash chain; federation nonce-replay defense (#922); daemon-Ed25519-signed <code>serverInfo</code> at MCP initialize (#1154, shipped in v0.7.0).</p>
+      <p>Per-agent Ed25519 keypairs for outbound link signing and inbound verification; canonical-bytes signing discipline (<code>governance::rules_store::canonical_bytes_for_signing</code> — excludes signature + attest_level; includes <code>enabled</code>; both invariants regression-pinned); V-4 signed-events cross-row hash chain; federation nonce-replay defense (#922); daemon-Ed25519-signed <code>serverInfo</code> at MCP initialize (#1154, shipped at v0.7.0 and unchanged at v1.0.0).</p>
     </div>
 
     <div class="recommendation" id="rec-f">
@@ -647,7 +678,7 @@ footer a{color:var(--text-muted)}
         <h3>f · Filter and monitor output pipelines and chained execution</h3>
         <div class="meta"><span class="status ok">implemented</span></div>
       </div>
-      <p>Seven-Gap Gap 7 verbose-provenance recall decoration at <code>src/mcp/tools/recall.rs:284</code>; Track G <code>post_recall</code> + <code>post_search</code> hooks for operator-installed output filters; <code>Accept-Provenance: verbose</code> HTTP header + MCP capability negotiation flag (#1155, shipped in v0.7.0) so consumers can opt into verbose-default per-session without flipping the wire default (which would be a backwards-compat break).</p>
+      <p>Seven-Gap Gap 7 verbose-provenance recall decoration (<code>mcp::tools::recall::decorate_memory_many</code> — earlier revisions of this page cited a <code>decorate_memory</code> symbol that no longer exists); Track G <code>post_recall</code> + <code>post_search</code> hooks for operator-installed output filters; <code>Accept-Provenance: verbose</code> HTTP header + MCP capability negotiation flag (#1155, shipped in v0.7.0) so consumers can opt into verbose-default per-session without flipping the wire default (which would be a backwards-compat break).</p>
     </div>
 
     <div class="recommendation" id="rec-g">
@@ -655,7 +686,7 @@ footer a{color:var(--text-muted)}
         <h3>g · Instrument for logging and detection</h3>
         <div class="meta"><span class="status ok">implemented</span></div>
       </div>
-      <p>V-4 signed-events chain; Prometheus depth gauge on federation push DLQ (<code>refresh_depth_gauge</code> at <code>src/federation/push_dlq.rs:334</code>); capabilities v3 envelope publishing runtime configuration; Track G 25-event hook pipeline at every memory lifecycle transition; bare <code>/metrics</code> Prometheus surface.</p>
+      <p>V-4 signed-events chain; Prometheus depth gauge on federation push DLQ (<code>federation::push_dlq::refresh_depth_gauge</code>); capabilities v3 envelope publishing runtime configuration; Track G 27-event hook pipeline at every memory lifecycle transition; bare <code>/metrics</code> Prometheus surface.</p>
     </div>
 
     <div class="recommendation">
@@ -663,7 +694,7 @@ footer a{color:var(--text-muted)}
         <h3>meta · Track and patch MCP-related vulnerabilities</h3>
         <div class="meta"><span class="status ok">implemented</span></div>
       </div>
-      <p>Apache 2.0 release process with CHANGELOG.md surface; GitHub security-advisory channel; <code>Cargo.lock</code> dependency tracking (~5,479 lines); <code>cargo audit</code> CI gate against the RustSec advisory database.</p>
+      <p>Apache 2.0 release process with CHANGELOG.md surface; GitHub security-advisory channel; <code>Cargo.lock</code> dependency tracking (5,747 lines at v1.0.0); <code>cargo audit</code> CI gate against the RustSec advisory database.</p>
     </div>
 
     <div class="recommendation">
@@ -690,12 +721,12 @@ footer a{color:var(--text-muted)}
         <tr>
           <td class="col-name">Tool parameter injection in open MCP agents</td>
           <td><span class="status ok">structurally addressed</span></td>
-          <td><code>RequestValidator</code> at src/validate.rs:1027 — every wire boundary validates DTO-bundled parameters; typed <code>ValidationError</code> preserves field attribution</td>
+          <td><code>validate::RequestValidator</code> — every wire boundary validates DTO-bundled parameters; typed <code>ValidationError</code> preserves field attribution</td>
         </tr>
         <tr>
           <td class="col-name">Tool invocation path confusion</td>
           <td><span class="status ok">structurally addressed (post #1154)</span></td>
-          <td>v0.7.0 captures clientInfo at initialize; #1154 (shipped in v0.7.0) adds daemon-Ed25519-signed serverInfo so clients can pin-on-first-connect</td>
+          <td>The <code>initialize</code> arm of <code>mcp::handle_request</code> captures <code>clientInfo.name</code> (v0.7.0 baseline); #1154 adds daemon-Ed25519-signed <code>serverInfo</code> (<code>mcp::server_identity::build_signed_identity</code>) so clients can pin-on-first-connect</td>
         </tr>
         <tr>
           <td class="col-name">Unrestricted private/public repository access (GitHub-based MCP tools)</td>
@@ -710,7 +741,7 @@ footer a{color:var(--text-muted)}
         <tr>
           <td class="col-name">Poisoning output for downstream automation</td>
           <td><span class="status ok">structurally addressed (post #1155)</span></td>
-          <td>Verbose-provenance recall decoration at src/mcp/tools/recall.rs:284 surfaces Form 4 citations, Form 5 ConfidenceTier, Form 6 MemoryKind; #1155 (shipped in v0.7.0) adds Accept-Provenance capability negotiation so consumers opt-in per-session</td>
+          <td>Verbose-provenance recall decoration (<code>mcp::tools::recall::decorate_memory_many</code>) surfaces Form 4 citations, Form 5 ConfidenceTier, Form 6 MemoryKind; #1155 adds Accept-Provenance capability negotiation so consumers opt-in per-session</td>
         </tr>
         <tr>
           <td class="col-name">CVE-2025-49596 RCE in MCP-Inspector</td>
@@ -726,19 +757,27 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="section-eyebrow">▸ For procurement reviewers</span>
     <h2>How to independently verify every claim on this page.</h2>
-    <p class="lede">Procurement-grade evidence is reproducible. Every claim on this page traces to a <code>capability_id</code> in the codegraph-verified inventory; every capability traces to a file path + line number; every file path + line number can be checked out at the verification commit. Procurement reviewers may run the following commands to verify the substrate's posture from a fresh checkout.</p>
+    <p class="lede">Procurement-grade evidence is reproducible. Every claim on this page cites a <strong>named symbol</strong> — a module, type, function, or test name — that either resolves in the tree or is noted as gone. Symbols are used instead of <code>file:line</code> anchors on purpose: line numbers drift with every commit, so a stale anchor lands a reviewer on unrelated code, whereas <code>rg '&lt;symbol&gt;' src/ tests/</code> either finds it or proves it absent. Procurement reviewers may run the following commands to verify the substrate's posture from a fresh checkout.</p>
 
-    <h3>1. Checkout the verification commit</h3>
+    <h3>1. Checkout the release this page describes</h3>
 <pre class="codeblock"><span class="com"># Clone the public repository</span>
 git clone https://github.com/alphaonedev/ai-memory-mcp.git
 cd ai-memory-mcp
 
-<span class="com"># Check out the verification commit cited by this page</span>
-git checkout 4add7a8528d4c16d696b391ec6e2890269669a84</pre>
+<span class="com"># This page describes release/v1.0.0 and was re-verified against its HEAD</span>
+git checkout release/v1.0.0
 
-    <h3>2. Verify the schema version anchor</h3>
-<pre class="codeblock">grep -n 'CURRENT_SCHEMA_VERSION' src/storage/migrations.rs
-<span class="com"># Expected: line 554: const CURRENT_SCHEMA_VERSION: i64 = 53;</span></pre>
+<span class="com"># The linked capability inventory JSON is a v0.7.0-tree artefact, codegraph-</span>
+<span class="com"># verified at the commit below. Check it out ONLY to audit that artefact —</span>
+<span class="com"># its file:line fields are v0.7.0 coordinates, not v1.0.0 ones (see #1938).</span>
+<span class="com"># git checkout 4add7a8528d4c16d696b391ec6e2890269669a84</span></pre>
+
+    <h3>2. Verify the schema version (both adapters, lockstep)</h3>
+<pre class="codeblock">grep -n 'CURRENT_SCHEMA_VERSION: i64' src/storage/migrations.rs
+<span class="com"># Expected: const CURRENT_SCHEMA_VERSION: i64 = 88;   (sqlite)</span>
+
+grep -n 'CURRENT_SCHEMA_VERSION: i32' src/store/postgres.rs
+<span class="com"># Expected: const CURRENT_SCHEMA_VERSION: i32 = 88;   (postgres, lockstep)</span></pre>
 
     <h3>3. Verify the MCP tool count anchors</h3>
 <pre class="codeblock">cargo test --lib profile::tests::profile_full_matches_registry_all
@@ -747,16 +786,27 @@ cargo test --lib profile::tests::profile_graph_loads_core_plus_graph
 cargo test --lib profile::tests::profile_admin_loads_core_lifecycle_governance
 cargo test --lib profile::tests::profile_power_loads_core_plus_power</pre>
 
-    <h3>4. Verify the HookEvent variant count (25)</h3>
-<pre class="codeblock"><span class="com"># Codegraph approach (preferred)</span>
-mcp__codegraph__codegraph_node HookEvent
+    <h3>4. Verify the HookEvent variant count (27 at v1.0.0)</h3>
+<pre class="codeblock">awk '/^pub enum HookEvent/,/^\}/' src/hooks/events.rs | grep -cE '^\s+[A-Z][a-zA-Z]+,'
+<span class="com"># Expected: 27   (was 25 at v0.7.0; PreCompaction / OnCompactionRollback /</span>
+<span class="com">#           PreSignalSend / PostSignalAck and siblings landed since)</span></pre>
 
-<span class="com"># Or count via grep on the enum block</span>
-awk '/^pub enum HookEvent/,/^\}/' src/hooks/events.rs | grep -cE '^\s+[A-Z][a-zA-Z]+,'</pre>
+    <h3>5. Verify the Memory struct field count (30 at v1.0.0)</h3>
+<pre class="codeblock">grep -n 'FIELD_COUNT' src/models/memory.rs
+<span class="com"># Expected: pub const FIELD_COUNT: usize = 30;   (was 26 at v0.7.0)</span></pre>
 
-    <h3>5. Verify the Memory struct field count (26)</h3>
-<pre class="codeblock"><span class="com"># Codegraph approach (preferred)</span>
-mcp__codegraph__codegraph_node Memory</pre>
+    <h3>5b. Verify the wire-surface counts this page cites</h3>
+<pre class="codeblock">grep -nE 'EXPECTED_PRODUCTION_ROUTES_COUNT|EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT' src/lib.rs
+<span class="com"># Expected: 94 production route registrations over 80 unique paths</span>
+
+grep -nE 'EXPECTED_CLI_SUBCOMMANDS_(DEFAULT|SAL)' src/lib.rs
+<span class="com"># Expected: 89 CLI subcommands in the default build / 91 under `sal`</span>
+
+AI_MEMORY_NO_CONFIG=1 cargo test --lib profile::tests::profile_full_matches_registry_all
+<span class="com"># Pins Profile::full().expected_tool_count() = 103 advertised MCP entries</span>
+
+AI_MEMORY_NO_CONFIG=1 cargo test --test route_count_invariant
+AI_MEMORY_NO_CONFIG=1 cargo test --test cli_subcommand_count_invariant</pre>
 
     <h3>6. Run the test suite and observe pin invariants</h3>
 <pre class="codeblock"><span class="com"># Schema parity (sqlite + postgres lockstep)</span>
@@ -772,24 +822,46 @@ AI_MEMORY_NO_CONFIG=1 cargo test --test capabilities_v3
 AI_MEMORY_NO_CONFIG=1 cargo test --test token_budget_guard
 AI_MEMORY_NO_CONFIG=1 cargo test --test budget_tokens</pre>
 
-    <h3>7. Inspect the capability inventory JSON</h3>
-<pre class="codeblock">cat docs/compliance/_inventory/v0.7.0-capabilities.json | jq '.capabilities[] | {id, verified_in_v0_7_0, verified_at_paths}'</pre>
+    <h3>7. Inspect the capability inventory JSON (v0.7.0-era artefact)</h3>
+<pre class="codeblock">cat docs/compliance/_inventory/v0.7.0-capabilities.json | jq '.capabilities[] | {id, verified_in_v0_7_0, verified_at_paths}'
 
-    <h3>8. Spot-check any concern → primitive trace</h3>
+<span class="com"># NOTE: this artefact was codegraph-verified against the v0.7.0 tree and has</span>
+<span class="com"># NOT been re-derived at v1.0.0. There is no _inventory/v1.0.0-capabilities.json</span>
+<span class="com"># in this repository; the refresh is tracked under issue #1938. Read its</span>
+<span class="com"># file:line fields as v0.7.0 coordinates. This page's own prose was re-verified</span>
+<span class="com"># at release/v1.0.0 HEAD and cites symbols, which do not carry that vintage.</span></pre>
+
+    <h3>8. Spot-check any concern → primitive trace (by symbol)</h3>
 <pre class="codeblock"><span class="com"># For example, concern (h) DoS → 7-layer defense:</span>
 <span class="com"># Layer 1: K8 quota</span>
-grep -n 'memory_quota_status' src/profile.rs
+rg -n 'MEMORY_QUOTA_STATUS' src/profile.rs
 
-<span class="com"># Layer 3: HMAC-mandatory webhook</span>
-grep -n 'hmac_secret configured' src/subscriptions.rs
+<span class="com"># Layer 3: HMAC-mandatory webhook dispatch (fail-CLOSED, R3-S1.HMAC)</span>
+rg -n 'fn dispatch_event_to_subs' src/subscriptions.rs
+
+<span class="com"># Layer 4: SSRF guard (#1053)</span>
+rg -n 'fn validate_url_dns|fn validate_url' src/subscriptions.rs
+
+<span class="com"># Layer 5: DLQ replay bound</span>
+rg -n 'MAX_REPLAY_ATTEMPTS' src/federation/push_dlq.rs
 
 <span class="com"># Layer 6: HTTP body cap</span>
-grep -n 'DefaultBodyLimit' src/lib.rs
+rg -n 'HTTP_BODY_LIMIT_BYTES' src/lib.rs
 
-<span class="com"># Each grep returns the line number cited on this page.</span></pre>
+<span class="com"># Each symbol resolves at release/v1.0.0 HEAD, or it is gone and this page says so.</span></pre>
 
-    <h3>9. Re-derive the inventory at any future commit</h3>
-    <p>The inventory artefact carries a <code>verification_commit_sha</code> field. To re-derive at a future commit, follow the codegraph methodology documented in <a href="_inventory/v0.7.0-summary.html">_inventory/v0.7.0-summary.md §5 Reproducibility</a>.</p>
+    <h3>9. Verify the concern (a) posture on YOUR deployment</h3>
+<pre class="codeblock"><span class="com"># Which identity-binding posture is this daemon running?</span>
+echo "${AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY:-advisory (compiled default)}"
+
+<span class="com"># The coverage claim for NSA concern (a) describes `enforce` WITH per-agent</span>
+<span class="com"># keys enrolled. The shipped default (`advisory`, zero keys) is finding H1</span>
+<span class="com"># (High) of the v1.0.0 adversarial assessment on this same landing page.</span>
+rg -n 'ENV_HTTP_ATTESTED_IDENTITY|HttpIdentityMode' src/config.rs
+rg -n 'attested_identity_required' src/handlers/</pre>
+
+    <h3>10. Re-derive the inventory at any future commit</h3>
+    <p>The inventory artefact carries a <code>verification_commit_sha</code> field. To re-derive at a future commit, follow the codegraph methodology documented in <a href="_inventory/v0.7.0-summary.html">_inventory/v0.7.0-summary.md §5 Reproducibility</a>. The v1.0.0 re-derivation is tracked under <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1938">#1938</a>.</p>
   </div>
 </section>
 
@@ -797,7 +869,7 @@ grep -n 'DefaultBodyLimit' src/lib.rs
   <div class="container">
     <span class="section-eyebrow">▸ Honest boundaries</span>
     <h2>What ai-memory does NOT defend against.</h2>
-    <p class="lede">Substrate honesty is the procurement asset, not aspirational coverage. The companion document <a href="honest-limitations.html">honest-limitations.md</a> documents the genuine boundaries the substrate cannot reach — operating-system layer vulnerabilities, hardware attestation (an AgenticMem commercial-layer concern), LLM hallucination above the substrate, operator policy authoring errors, prompt injection at the LLM input layer, and more. These are NOT NSA CSI gaps (we address every NSA CSI concern). They are substrate boundaries that exist regardless of any compliance framework.</p>
+    <p class="lede">Substrate honesty is the procurement asset, not aspirational coverage. The companion document <a href="honest-limitations.html">honest-limitations.md</a> documents the genuine boundaries the substrate cannot reach — operating-system layer vulnerabilities, hardware attestation (an AgenticMem commercial-layer concern), LLM hallucination above the substrate, operator policy authoring errors, prompt injection at the LLM input layer, and more. These are NOT NSA CSI gaps — the substrate addresses nine of the ten NSA-enumerated concerns structurally as shipped, and the tenth (concern (a) access control) under the documented <code>enforce</code> identity-binding posture stated above. They are substrate boundaries that exist regardless of any compliance framework.</p>
 
     <p>The pair of documents (this NSA CSI mapping + the honest-limitations companion) is the procurement-grade evidence pair. Read in sequence to form a complete picture of substrate coverage.</p>
 
@@ -807,8 +879,10 @@ grep -n 'DefaultBodyLimit' src/lib.rs
 
 <footer>
   <div class="container">
-    <p style="margin-bottom:.5rem"><strong>ai-memory v0.7.0</strong> · NSA CSI MCP Security Compliance · public-facing procurement-grade evidence · maintained by AlphaOne LLC under Apache 2.0.</p>
-    <p style="margin-bottom:.5rem">Verification commit: <code>4add7a8528d4c16d696b391ec6e2890269669a84</code> on <code>release/v0.7.0</code> · Inventory: <a href="_inventory/v0.7.0-capabilities.json">v0.7.0-capabilities.json</a> · Summary: <a href="_inventory/v0.7.0-summary.html">v0.7.0-summary.md</a> · Companion: <a href="honest-limitations.html">honest-limitations.md</a></p>
+    <p style="margin-bottom:.5rem"><strong>ai-memory v1.0.0</strong> (sqlite + postgres schema <strong>v88</strong>, lockstep) · NSA CSI MCP Security Compliance · public-facing procurement-grade evidence · maintained by AlphaOne LLC under Apache 2.0.</p>
+    <p style="margin-bottom:.5rem">This page's prose, version stamp, coverage postures and symbol citations re-verified against <code>release/v1.0.0</code> HEAD on 2026-08-01. Inventory: <a href="_inventory/v0.7.0-capabilities.json">v0.7.0-capabilities.json</a> — a <strong>v0.7.0-tree artefact</strong>, codegraph-verified at commit <code>4add7a8528d4c16d696b391ec6e2890269669a84</code>, not re-derived at v1.0.0 (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1938">#1938</a>; there is no <code>_inventory/v1.0.0-capabilities.json</code>) · Summary: <a href="_inventory/v0.7.0-summary.html">v0.7.0-summary.md</a> · Companion: <a href="honest-limitations.html">honest-limitations.md</a></p>
+
+    <p style="margin-bottom:.5rem"><strong>Mapping authority.</strong> Every claim on this page traces to a <strong>named symbol</strong> in the source tree (module / type / function / test name), plus — where applicable — an issue or PR reference. It deliberately publishes <strong>no <code>file:line</code> anchors</strong>: line numbers drift with every commit, and a reviewer who follows a stale anchor to unrelated code loses trust that a later correction cannot restore, whereas a symbol either resolves (<code>rg '&lt;symbol&gt;' src/ tests/</code>) or is provably gone. Where a previously-cited symbol has been renamed or removed, this page now says so at the point of citation. The v0.7.0-era claims additionally carry a <code>capability_id</code> in the inventory above, whose own <code>file:line</code> fields inherit that artefact's vintage.</p>
     <p style="margin-bottom:.5rem">Reference: National Security Agency, <em>Model Context Protocol (MCP): Security Design Considerations for AI-Driven Automation</em>, Cybersecurity Information, U/OO/6030316-26 | PP-26-1834, Version 1.0, May 2026. The mapping above is one-directional: ai-memory's posture relative to NSA-issued guidance. NSA, DoD, and the United States Government do not endorse, certify, or recommend ai-memory, AgenticMem, AlphaOne LLC, or any commercial product.</p>
     <p>Audit issue: <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1153">#1153</a> · Follow-up issues: #1154 (daemon serverInfo signing), #1155 (Accept-Provenance), #1156 (per-namespace K8 quota dimension, shipped at schema v50 — defense-in-depth blast-radius control under recommendation c).</p>
   </div>

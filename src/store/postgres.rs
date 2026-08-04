@@ -24268,6 +24268,37 @@ impl MemoryStore for PostgresStore {
                         "designated approver is '{required}'; got '{approver_agent_id}'"
                     )));
                 }
+                // #2538 (CWE-863) — pre-fix this arm was a BARE STRING COMPARE
+                // on BOTH backends: no self-approval refusal, no
+                // registered-agent check, while the Human arm above carries
+                // both and the Consensus arm below carries the registered
+                // check. `approver_agent_id` arrives from the per-request
+                // `X-Agent-Id`, a CLAIMED (not attested) principal, so a
+                // requester who is also the namespace's designated approver
+                // could self-approve their own governance-gated action.
+                //
+                // UNCONDITIONAL here, exactly like the #1793 Human arm above:
+                // the postgres SAL is reachable only via the inherently
+                // multi-tenant HTTP daemon, so there is no single-operator
+                // self-lock to avoid and the sqlite `ApproveSurface`
+                // opt-in has no analogue.
+                //
+                // TRAP NOTE: `approve_with_approver_type` is overridden by
+                // SqliteStore ONLY — postgres reaches this arm through the
+                // trait default in `src/store/mod.rs` which delegates to THIS
+                // method, so a fix landed in the sqlite override alone would
+                // never execute here. Both paths are pinned by
+                // `tests/authz_named_approver_2538_pg.rs`.
+                if approver_agent_id == pa.requested_by {
+                    return Ok(super::ApproveOutcome::Rejected(
+                        crate::errors::msg::SELF_APPROVAL_REFUSED.to_string(),
+                    ));
+                }
+                if !self.is_registered_agent(approver_agent_id).await? {
+                    return Ok(super::ApproveOutcome::Rejected(format!(
+                        "designated approver '{approver_agent_id}' is not a registered agent"
+                    )));
+                }
                 let ok = self
                     .pending_decide(ctx, pending_id, true, approver_agent_id)
                     .await?;
@@ -25223,41 +25254,47 @@ impl MemoryStore for PostgresStore {
                 let visible = if let Some(v) = visible_cache.get(node) {
                     *v
                 } else {
-                    let row = sqlx::query("SELECT metadata FROM memories WHERE id = $1")
-                        .bind(node)
-                        .fetch_optional(&self.pool)
-                        .await
-                        .map_err(|e| to_store_err("find_paths visibility fetch", e))?;
-                    // v0.7.0 F-E3 fix (#1436): route through the
-                    // canonical predicate via META_KEY_* + MemoryScope
-                    // SSOTs. The string compare against
-                    // `MemoryScope::Private.as_str()` preserves the
-                    // pre-refactor permissive semantics (any non-private
-                    // scope is visible, matching
-                    // `is_visible_to_caller`). We can't call
-                    // `crate::visibility::is_visible_to_caller` directly
-                    // here because we only have the metadata blob (not
-                    // a full Memory struct), but we route through the
-                    // SAME META_KEY_* / MemoryScope::Private.as_str()
-                    // SSOTs so a future rename touches one place.
+                    let row =
+                        sqlx::query("SELECT id, namespace, metadata FROM memories WHERE id = $1")
+                            .bind(node)
+                            .fetch_optional(&self.pool)
+                            .await
+                            .map_err(|e| to_store_err("find_paths visibility fetch", e))?;
+                    // #2633 — this arm USED to re-implement the visibility
+                    // predicate inline (`if scope != "private" { true } else
+                    // { owner == caller }`) with a comment asserting parity
+                    // with `crate::visibility::is_visible_to_caller`. It had
+                    // drifted TWICE and the comment concealed both:
+                    //
+                    //   * it never received the #1921 subtree restriction, so
+                    //     `team` / `unit` / `org` rows stayed WORLD-READABLE on
+                    //     this postgres kg path long after every other read
+                    //     path was narrowed; and
+                    //   * it carried the #2633 "unknown scope ⇒ widest posture"
+                    //     widening, so a TYPO'd `metadata.scope` published a
+                    //     node here exactly as it did in the canonical
+                    //     predicate.
+                    //
+                    // The stated reason for the copy — "we only have the
+                    // metadata blob, not a full Memory struct" — is answered by
+                    // selecting the two extra scalar columns the predicate
+                    // actually needs and calling `is_visible_by_fields`. Per
+                    // the #951 rule this module opens with, drift between
+                    // copies of this predicate is a real defect; a copy that
+                    // only LOOKS canonical is the worst kind.
                     let v = match row {
                         Some(r) => {
+                            let node_id: String =
+                                r.try_get("id").map_err(|e| to_store_err("read id", e))?;
+                            let node_ns: String = r
+                                .try_get("namespace")
+                                .map_err(|e| to_store_err("read namespace", e))?;
                             let meta: serde_json::Value = r
                                 .try_get("metadata")
                                 .map_err(|e| to_store_err("read metadata", e))?;
-                            let scope = meta
-                                .get(crate::META_KEY_SCOPE)
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or(crate::models::namespace::MemoryScope::Private.as_str());
-                            if scope != crate::models::namespace::MemoryScope::Private.as_str() {
-                                true
-                            } else {
-                                let owner = meta
-                                    .get(crate::META_KEY_AGENT_ID)
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or("");
-                                owner == caller
-                            }
+                            crate::visibility::is_visible_by_fields(
+                                &node_id, &node_ns, &meta, caller,
+                            )
                         }
                         // Fail-closed: missing node ⇒ drop the path.
                         None => false,
