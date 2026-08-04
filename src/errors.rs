@@ -51,6 +51,20 @@ pub mod error_codes {
     /// and the write is unsigned / the agent has no bound key. The MCP
     /// store path surfaces the same condition as a plain error string.
     pub const ATTESTATION_FAILED: &str = "ATTESTATION_FAILED";
+    /// #2550 — a create-family write whose caller-supplied `agent_id` /
+    /// `metadata.agent_id` disagrees with the authenticated principal (403).
+    /// Pre-#2550 the single-create surface returned this refusal untyped and
+    /// the bulk surface OVERWROTE the disagreeing claim silently.
+    pub const AGENT_ID_MISMATCH: &str = "AGENT_ID_MISMATCH";
+    /// #2552 / #2588 — a bulk row whose write could not be replicated to the
+    /// configured quorum. The LOCAL commit already landed (ADR-0001 never
+    /// rolls back on a quorum miss), so this rides the bulk envelope's
+    /// `warnings[]` channel rather than `errors[]`.
+    pub const REPLICATION_UNAVAILABLE: &str = "REPLICATION_UNAVAILABLE";
+    /// #2552 — the safe fallback class for a bulk row failure whose raw text
+    /// matched no allowlisted classifier arm. Paired with the #851 sanitized
+    /// `"internal error"` label so no raw substrate text reaches the wire.
+    pub const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
 
     // ---- StorageError-side (substrate-facing) -------------------------------
     pub const PENDING_ACTION_NOT_FOUND: &str = "PENDING_ACTION_NOT_FOUND";

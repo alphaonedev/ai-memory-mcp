@@ -4016,13 +4016,20 @@ async fn http_bulk_create_partial_success_collects_errors() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    // #2588 — a PARTIAL application is 207, never 200. This assertion read
+    // `OK` before: one of two rows landed and the caller was told the request
+    // succeeded, which is the #2444/#2490 false-success shape.
+    assert_eq!(resp.status(), StatusCode::MULTI_STATUS);
     let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["created"], 1);
     assert_eq!(v["errors"].as_array().unwrap().len(), 1);
+    // #2551 — the reconciliation identity.
+    assert_eq!(v["sent"], 2);
+    assert_eq!(v["rejected"], 1);
+    assert_eq!(v["deduped"], 0);
 
     // The good row must be visible in the DB.
     let lock = state.lock().await;
