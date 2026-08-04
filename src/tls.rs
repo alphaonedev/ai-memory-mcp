@@ -2415,4 +2415,70 @@ mod tests {
                 .contains("exactly two")
         );
     }
+
+    /// #2677 — `host_is_loopback` exactness is load-bearing for the #2477
+    /// plaintext exemption. A future refactor to `starts_with("127.")` or
+    /// `contains("localhost")` would accept spoof hosts while every happy-
+    /// path test still passed (false-success class).
+    #[test]
+    fn host_is_loopback_exact_only_refuses_spoof_shapes_2677() {
+        for good in ["127.0.0.1", "::1", "localhost", "0:0:0:0:0:0:0:1", "[::1]"] {
+            assert!(
+                host_is_loopback(good),
+                "literal loopback must match: {good}"
+            );
+        }
+        for bad in [
+            "127.0.0.1.evil.com",
+            "localhost.evil.com",
+            "127.0.0.2",
+            "127.1",
+            "0.0.0.0",
+            "evil-localhost",
+            "localhostx",
+            "2130706433",
+            "0x7f000001",
+            "",
+            "example.com",
+        ] {
+            assert!(
+                !host_is_loopback(bad),
+                "spoof/encoded host must NOT be loopback: {bad}"
+            );
+        }
+    }
+
+    /// #2677 — scheme guard refuses spoofed "loopback" HTTP peers (hatch off).
+    #[test]
+    fn validate_peer_url_refuses_loopback_spoof_http_2677() {
+        let _g = fed_pin_env_lock();
+        // Ensure hatch is off for this process while we hold the pin lock.
+        // SAFETY: single-threaded unit test under process-wide pin lock.
+        unsafe {
+            std::env::remove_var(FED_ALLOW_PLAINTEXT_PEERS_ENV);
+        }
+        for peer in [
+            "http://127.0.0.1.evil.com:9077",
+            "http://localhost.evil.com:9077",
+            "http://evil.com/?x=127.0.0.1",
+            "http://127.0.0.2:9077",
+        ] {
+            assert!(
+                validate_peer_url_scheme(peer).is_err(),
+                "#2677: spoof loopback HTTP peer must be REFUSED: {peer}"
+            );
+        }
+        // Positive control: literal loopback still exempt.
+        assert!(validate_peer_url_scheme("http://127.0.0.1:9077").is_ok());
+        // url/reqwest normalises decimal/hex IPv4 forms to 127.0.0.1 before
+        // host_str(); they ARE loopback. Pin accept so a silent behaviour
+        // flip is reviewed (not a silent widen of a non-loopback host).
+        for peer in ["http://2130706433/", "http://0x7f000001/"] {
+            assert!(
+                validate_peer_url_scheme(peer).is_ok(),
+                "#2677: decimal/hex IPv4 loopback forms normalise to 127.0.0.1 \
+                 and must stay exempt: {peer}"
+            );
+        }
+    }
 }

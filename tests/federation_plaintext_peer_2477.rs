@@ -204,6 +204,36 @@ async fn container_hostname_is_not_treated_as_loopback_2477() {
     );
 }
 
+/// #2677 — pin EXACTNESS of the loopback exemption. Happy-path loopback tests
+/// would still pass if `host_is_loopback` were weakened to `starts_with("127.")`
+/// or `contains("localhost")`, which would accept plaintext peers on attacker
+/// hosts. Spoof shapes must stay refused without the hatch.
+#[tokio::test]
+async fn loopback_spoof_shapes_are_refused_not_exempt_2677() {
+    let _g = ENV_LOCK.lock().await;
+    clear_hatch();
+    for peer in [
+        "http://127.0.0.1.evil.com:9077",
+        "http://localhost.evil.com:9077",
+        "http://evil.com/?x=127.0.0.1",
+        "http://127.0.0.2:9077",
+    ] {
+        assert!(
+            build_one(peer).is_err(),
+            "#2677: spoof loopback peer must be REFUSED (exact host match only): {peer}"
+        );
+    }
+    // url crate normalises decimal/hex IPv4 to 127.0.0.1 — true loopback;
+    // pin acceptance so a behaviour flip is deliberate.
+    for peer in ["http://2130706433:9077", "http://0x7f000001:9077"] {
+        assert!(
+            build_one(peer).is_ok(),
+            "#2677: decimal/hex IPv4 loopback forms must stay exempt after URL \
+             normalisation: {peer}"
+        );
+    }
+}
+
 /// GUARD. The staged-rollout hatch works, and only on an explicit truthy
 /// token: an unrecognised value must never silently widen the control
 /// (the FBL-14 rule).
