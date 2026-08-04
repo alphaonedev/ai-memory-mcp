@@ -171,6 +171,21 @@ pub async fn list_pending(
     }
 }
 
+/// #2634 / CB-24 — record the TRUE governance verdict of a
+/// `pending_approve` decision at the point the authorization gate has
+/// produced it. `decision` is `"allow"` (approved / vote accepted) or
+/// `"refuse"` (self-approval / unregistered-approver rejection). Kept in
+/// one place so the postgres + sqlite branches emit identical rows.
+fn audit_pending_verdict(agent_id: &str, id: &str, decision: &str) {
+    crate::governance::audit::record_decision(
+        agent_id,
+        decision,
+        "pending_approve",
+        "",
+        json!({ (field_names::PENDING_ID): id }),
+    );
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn approve_pending(
     State(app): State<AppState>,
@@ -224,18 +239,17 @@ pub async fn approve_pending(
         }
     };
 
-    // #913 (security-medium / SOC2, 2026-05-19) — admin governance audit.
-    // Approve is the canonical privileged gate operation; the forensic-
-    // chain row MUST land before the storage write so the audit trail
-    // captures the approver's identity + pending_id even when the
-    // downstream consensus / execution path errors.
-    crate::governance::audit::record_decision(
-        &agent_id,
-        "allow",
-        "pending_approve",
-        "",
-        json!({ (field_names::PENDING_ID): &id }),
-    );
+    // #913 + #2634 / CB-24 — admin governance audit. Pre-fix a
+    // `record_decision("allow")` fired UNCONDITIONALLY here, BEFORE the
+    // `approve_with_approver_type` / consensus gate ran — so a REFUSED
+    // approval (self-approval / unregistered approver, #2643) was chained
+    // as "allow", a tamper-evident audit lying about the outcome. The
+    // verdict is now recorded at the outcome points below via
+    // `audit_pending_verdict`: an allowed approval → "allow" (emitted
+    // BEFORE the downstream execution write, so #913's approver-identity
+    // capture survives an execution error), a refused approval → "refuse".
+    // An operational error (NotFound 404 / consensus 500) reaches no
+    // governance verdict and so records no verdict row.
 
     // v0.7.0 Wave-3 Continuation 3 (Phase 20) — postgres-backed approve
     // routes through the FULL governance pipeline:
@@ -261,6 +275,8 @@ pub async fn approve_pending(
             .await
         {
             Ok(SalOutcome::Approved) => {
+                // #2634 — record "allow" BEFORE the execute write below.
+                audit_pending_verdict(&agent_id, &id, "allow");
                 if crate::audit::is_enabled() {
                     crate::audit::emit(crate::audit::EventBuilder::new(
                         crate::audit::AuditAction::Approve,
@@ -297,24 +313,32 @@ pub async fn approve_pending(
                 }))
                 .into_response()
             }
-            Ok(SalOutcome::Pending { votes, quorum }) => (
-                StatusCode::ACCEPTED,
-                Json(json!({
-                    "approved": false,
-                    "status": "pending",
-                    "id": id,
-                    "votes": votes,
-                    "quorum": quorum,
-                    "reason": crate::errors::msg::CONSENSUS_NOT_REACHED,
-                    (field_names::STORAGE_BACKEND): "postgres",
-                })),
-            )
-                .into_response(),
-            Ok(SalOutcome::Rejected(reason)) => (
-                StatusCode::FORBIDDEN,
-                Json(json!({"error": crate::errors::msg::approve_rejected(reason)})),
-            )
-                .into_response(),
+            Ok(SalOutcome::Pending { votes, quorum }) => {
+                // #2634 — the approval vote was accepted (awaiting quorum).
+                audit_pending_verdict(&agent_id, &id, "allow");
+                (
+                    StatusCode::ACCEPTED,
+                    Json(json!({
+                        "approved": false,
+                        "status": "pending",
+                        "id": id,
+                        "votes": votes,
+                        "quorum": quorum,
+                        "reason": crate::errors::msg::CONSENSUS_NOT_REACHED,
+                        (field_names::STORAGE_BACKEND): "postgres",
+                    })),
+                )
+                    .into_response()
+            }
+            Ok(SalOutcome::Rejected(reason)) => {
+                // #2634 / #2643 — governed refusal chains "refuse", not "allow".
+                audit_pending_verdict(&agent_id, &id, "refuse");
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": crate::errors::msg::approve_rejected(reason)})),
+                )
+                    .into_response()
+            }
             Err(e) => store_err_to_response(e),
         };
     }
@@ -325,77 +349,87 @@ pub async fn approve_pending(
     // (it is multi-tenant via per-request X-Agent-Id and sets no process
     // AI_MEMORY_AGENT_ID, so the storage-layer env opt-in would never fire).
     match db::approve_with_approver_type(&lock.0, &id, &agent_id, db::ApproveSurface::Http) {
-        Ok(ApproveOutcome::Approved) => match db::execute_pending_action(&lock.0, &id) {
-            Ok(memory_id) => {
-                // v0.6.2 (S34): fan out the decision AND the resulting
-                // memory so approve on one node makes the governed write
-                // visible on every peer. Drop the DB lock before any
-                // outbound HTTP.
-                let produced_mem = memory_id
-                    .as_deref()
-                    .and_then(|mid| db::get(&lock.0, mid).ok().flatten());
-                drop(lock);
-                if let Some(fed) = app.federation.as_ref() {
-                    let decision = PendingDecision {
-                        id: id.clone(),
-                        approved: true,
-                        decider: agent_id.clone(),
-                    };
-                    match crate::federation::broadcast_pending_decision_quorum(fed, &decision).await
-                    {
-                        Ok(tracker) => {
-                            if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                                // #869 — typed 503 envelope via the shared helper.
+        Ok(ApproveOutcome::Approved) => {
+            // #2634 — record "allow" BEFORE the execute write below.
+            audit_pending_verdict(&agent_id, &id, "allow");
+            match db::execute_pending_action(&lock.0, &id) {
+                Ok(memory_id) => {
+                    // v0.6.2 (S34): fan out the decision AND the resulting
+                    // memory so approve on one node makes the governed write
+                    // visible on every peer. Drop the DB lock before any
+                    // outbound HTTP.
+                    let produced_mem = memory_id
+                        .as_deref()
+                        .and_then(|mid| db::get(&lock.0, mid).ok().flatten());
+                    drop(lock);
+                    if let Some(fed) = app.federation.as_ref() {
+                        let decision = PendingDecision {
+                            id: id.clone(),
+                            approved: true,
+                            decider: agent_id.clone(),
+                        };
+                        match crate::federation::broadcast_pending_decision_quorum(fed, &decision)
+                            .await
+                        {
+                            Ok(tracker) => {
+                                if let Err(err) = crate::federation::finalise_quorum(&tracker) {
+                                    // #869 — typed 503 envelope via the shared helper.
+                                    let payload =
+                                        crate::federation::QuorumNotMetPayload::from_err(&err);
+                                    return super::under_replicated_response(&payload);
+                                }
+                            }
+                            Err(err) => {
                                 let payload =
                                     crate::federation::QuorumNotMetPayload::from_err(&err);
                                 return super::under_replicated_response(&payload);
                             }
                         }
-                        Err(err) => {
-                            let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return super::under_replicated_response(&payload);
+                        // If approval produced a brand-new memory (store
+                        // path), also broadcast it so peers have the row.
+                        // delete / promote paths produce no new memory
+                        // (the pending payload carries memory_id).
+                        if let Some(ref mem) = produced_mem
+                            && let Some(resp) = fanout_or_pending(&app, mem).await
+                        {
+                            return resp;
                         }
                     }
-                    // If approval produced a brand-new memory (store
-                    // path), also broadcast it so peers have the row.
-                    // delete / promote paths produce no new memory
-                    // (the pending payload carries memory_id).
-                    if let Some(ref mem) = produced_mem
-                        && let Some(resp) = fanout_or_pending(&app, mem).await
-                    {
-                        return resp;
-                    }
-                }
-                Json(json!({
-                    "approved": true,
-                    "id": id,
-                    (field_names::DECIDED_BY): agent_id,
-                    "executed": true,
-                    "memory_id": memory_id,
-                }))
-                .into_response()
-            }
-            Err(e) => {
-                tracing::error!("execute pending error: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": super::approvals::APPROVED_BUT_EXECUTION_FAILED})),
-                )
+                    Json(json!({
+                        "approved": true,
+                        "id": id,
+                        (field_names::DECIDED_BY): agent_id,
+                        "executed": true,
+                        "memory_id": memory_id,
+                    }))
                     .into_response()
+                }
+                Err(e) => {
+                    tracing::error!("execute pending error: {e}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": super::approvals::APPROVED_BUT_EXECUTION_FAILED})),
+                    )
+                        .into_response()
+                }
             }
-        },
-        Ok(ApproveOutcome::Pending { votes, quorum }) => (
-            StatusCode::ACCEPTED,
-            Json(json!({
-                "approved": false,
-                "status": "pending",
-                "id": id,
-                "votes": votes,
-                "quorum": quorum,
-                "reason": crate::errors::msg::CONSENSUS_NOT_REACHED,
-            })),
-        )
-            .into_response(),
+        }
+        Ok(ApproveOutcome::Pending { votes, quorum }) => {
+            // #2634 — the approval vote was accepted (awaiting quorum).
+            audit_pending_verdict(&agent_id, &id, "allow");
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "approved": false,
+                    "status": "pending",
+                    "id": id,
+                    "votes": votes,
+                    "quorum": quorum,
+                    "reason": crate::errors::msg::CONSENSUS_NOT_REACHED,
+                })),
+            )
+                .into_response()
+        }
         // #1620 — missing pending id is 404, matching the postgres
         // branch's StoreError::NotFound mapping (was 403 Rejected).
         Ok(ApproveOutcome::NotFound) => (
@@ -405,11 +439,15 @@ pub async fn approve_pending(
             })),
         )
             .into_response(),
-        Ok(ApproveOutcome::Rejected(reason)) => (
-            StatusCode::FORBIDDEN,
-            Json(json!({"error": crate::errors::msg::approve_rejected(reason)})),
-        )
-            .into_response(),
+        Ok(ApproveOutcome::Rejected(reason)) => {
+            // #2634 / #2643 — governed refusal chains "refuse", not "allow".
+            audit_pending_verdict(&agent_id, &id, "refuse");
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": crate::errors::msg::approve_rejected(reason)})),
+            )
+                .into_response()
+        }
         Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }

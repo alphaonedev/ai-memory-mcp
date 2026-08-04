@@ -1091,7 +1091,7 @@ async fn clear_namespace_standard_inner(
     crate::governance::audit::record_decision(
         &caller,
         "allow",
-        "namespace_clear_standard",
+        crate::mcp::AUDIT_KIND_NAMESPACE_CLEAR_STANDARD,
         "",
         json!({
             "namespace": ns,
