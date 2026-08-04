@@ -1,0 +1,63 @@
+# PENDING-FIX ledger for scripts/check-sdk-route-paths.sh
+# (3x7 claims register 3.3.2 — C-19 and C-20).
+#
+# FORMAT, one entry per line, whitespace-separated, everything from the
+# first `#` is commentary:
+#
+#     <sdk-file> <normalised-path> #<issue> <note>
+#
+# `<normalised-path>` is the gate's own normalised form, with every
+# path-parameter segment collapsed to `{}` — so ONE entry covers the
+# method, its docstring, and its README row without pinning line
+# numbers that the correcting lane will move.
+#
+# A MALFORMED entry HARD-FAILS. A STALE entry (one that suppresses
+# nothing) is a loud NOTICE and NOT a failure — the
+# `dual-trigger-cancel-allow.txt` rationale: it can only suppress a
+# violation that no longer happens, and failing on it would red
+# whichever PR lost the race to the lane that deleted the method.
+#
+# ---------------------------------------------------------------------
+# WHY THIS LEDGER EXISTS (2026-08-01).
+#
+# Every entry below is a SHIPPED SDK method or README row that calls a
+# route the server does not register — the exact defect the gate was
+# built to catch, present at `03bbd556`. They are held open only until
+# the SDK-correction lane merges:
+#
+#   C-19  grant / revoke / cluster — the register's disposition is
+#         DELETE FROM BOTH SDKS AND BOTH READMEs ("there is no
+#         server-side plan for these routes", register 3.2 group E).
+#   C-20  unsubscribe — the RESOURCE exists; only the SHAPE is wrong.
+#         `src/lib.rs` registers `delete` on `/api/v1/subscriptions`
+#         and the id rides the QUERY STRING
+#         (`src/handlers/subscriptions.rs`). The fix is to repoint the
+#         SDK at `DELETE /api/v1/subscriptions?id=<id>`, not to add a
+#         route.
+#
+# When the correcting lane merges, each line below turns into a NOTICE.
+# The NOTICE is the instruction to delete the line. When this file is
+# empty except the header, the gate is unconditional.
+# ---------------------------------------------------------------------
+
+# --- C-19: three methods that 404 at runtime, in both SDKs ------------
+sdk/python/ai_memory/client.py        /api/v1/memories/{}/grant   #2629 C-19 delete grant()
+sdk/python/ai_memory/client.py        /api/v1/memories/{}/revoke  #2629 C-19 delete revoke()
+sdk/python/ai_memory/client.py        /api/v1/cluster             #2629 C-19 delete cluster()
+sdk/python/ai_memory/async_client.py  /api/v1/memories/{}/grant   #2629 C-19
+sdk/python/ai_memory/async_client.py  /api/v1/memories/{}/revoke  #2629 C-19
+sdk/python/ai_memory/async_client.py  /api/v1/cluster             #2629 C-19
+sdk/python/README.md                  /api/v1/memories/{}/grant   #2629 C-19 the grant|revoke table row
+sdk/python/README.md                  /api/v1/cluster             #2629 C-19
+sdk/typescript/src/client.ts          /api/v1/memories/{}/grant   #2629 C-19
+sdk/typescript/src/client.ts          /api/v1/memories/{}/revoke  #2629 C-19
+sdk/typescript/src/client.ts          /api/v1/cluster             #2629 C-19
+sdk/typescript/README.md              /api/v1/memories/{}/grant   #2629 C-19
+sdk/typescript/README.md              /api/v1/memories/{}/revoke  #2629 C-19
+sdk/typescript/README.md              /api/v1/cluster             #2629 C-19
+
+# --- C-20: unsubscribe targets a path parameter that is not registered
+sdk/typescript/src/client.ts          /api/v1/subscriptions/{}    #2629 C-20 id rides the query string
+sdk/typescript/README.md              /api/v1/subscriptions/{}    #2629 C-20
+sdk/python/ai_memory/client.py        /api/v1/subscriptions/{}    #2629 C-20
+sdk/python/ai_memory/async_client.py  /api/v1/subscriptions/{}    #2629 C-20
