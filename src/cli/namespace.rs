@@ -167,9 +167,13 @@ fn set_standard(
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     let conn = db::open(db_path)?;
+    // #2541 — local CLI is an operator/admin surface: use the explicit
+    // daemon principal so ownership gate has a real bypass, not the
+    // "omit agent_id" hole.
     let mut params = json!({
         "namespace": namespace,
         "id": id,
+        "agent_id": crate::identity::sentinels::DAEMON_PRINCIPAL,
     });
     if let Some(p) = parent {
         params["parent"] = json!(p);

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (namespace set-standard no longer caller-opt-in / silent claim)
+
+- **MCP/HTTP `set_namespace_standard` always enforces ownership; unowned rows are never silently claimed** (refs [#2541](https://github.com/alphaonedev/ai-memory-mcp/issues/2541); CWE-284). Pre-fix omitting `agent_id` skipped the #929 gate (could rebind any owned memory), and the unowned arm rewrote `agent_id` + stamped `scope=shared` (irreversible confidentiality downgrade). Ownership is always checked; claim rewrite removed. Daemon principal is the explicit CLI/operator bypass.
+
 ### Fixed (clear_namespace_standard cannot disarm unresolvable governance)
 
 - **Claimed callers can no longer clear a namespace standard when the bound memory is severed or dangling** (refs [#2545](https://github.com/alphaonedev/ai-memory-mcp/issues/2545); CWE-284). Pre-fix the #1777 owner gate short-circuited when the standard was unresolvable, so any claimed agent could `DELETE` the last governance evidence and restore allow-on-silence. MCP/sqlite and PostgresStore refuse unresolvable clears with a re-point remedy; healthy #1777 contracts unchanged.

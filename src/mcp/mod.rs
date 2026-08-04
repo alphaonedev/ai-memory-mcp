@@ -597,6 +597,7 @@ pub use check_duplicate::handle_check_duplicate;
 pub use expand_query::handle_expand_query;
 pub use kg_query::handle_kg_query;
 pub use load_family::{handle_load_family, handle_smart_load};
+pub(crate) use namespace::authorize_namespace_standard_bind;
 pub(crate) use namespace::handle_namespace_clear_standard;
 // v0.7.0 G-PHASE-E-2 (#707) — promoted to `pub` so the integration
 // regression at `tests/g_phase_e_2_namespace_set_standard_governance_passthrough.rs`
@@ -8960,7 +8961,7 @@ mod tests {
             updated_at: chrono::Utc::now().to_rfc3339(),
             last_accessed_at: None,
             expires_at: None,
-            metadata: json!({}),
+            metadata: json!({ "scope": "shared" }),
             reflection_depth: 0,
             memory_kind: crate::models::MemoryKind::Observation,
             entity_id: None,
@@ -10105,7 +10106,7 @@ mod tests {
             updated_at: chrono::Utc::now().to_rfc3339(),
             last_accessed_at: None,
             expires_at: None,
-            metadata: json!({}),
+            metadata: json!({ "scope": "shared" }),
             reflection_depth: 0,
             memory_kind: crate::models::MemoryKind::Observation,
             entity_id: None,
@@ -10165,7 +10166,7 @@ mod tests {
             updated_at: chrono::Utc::now().to_rfc3339(),
             last_accessed_at: None,
             expires_at: None,
-            metadata: json!({}),
+            metadata: json!({ "scope": "shared" }),
             reflection_depth: 0,
             memory_kind: crate::models::MemoryKind::Observation,
             entity_id: None,
@@ -13900,7 +13901,7 @@ mod tests {
         // Insert a memory then mutate its metadata to null via raw SQL.
         let id = chunkc_seed_memory(&conn, "chunkc-ns-nullmeta", "p", Tier::Long);
         conn.execute(
-            "UPDATE memories SET metadata = 'null' WHERE id = ?1",
+            "UPDATE memories SET metadata = '{\"scope\":\"shared\"}' WHERE id = ?1",
             rusqlite::params![id],
         )
         .unwrap();
