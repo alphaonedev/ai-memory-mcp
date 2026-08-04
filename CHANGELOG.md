@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (clear_namespace_standard cannot disarm unresolvable governance)
+
+- **Claimed callers can no longer clear a namespace standard when the bound memory is severed or dangling** (refs [#2545](https://github.com/alphaonedev/ai-memory-mcp/issues/2545); CWE-284). Pre-fix the #1777 owner gate short-circuited when the standard was unresolvable, so any claimed agent could `DELETE` the last governance evidence and restore allow-on-silence. MCP/sqlite and PostgresStore refuse unresolvable clears with a re-point remedy; healthy #1777 contracts unchanged.
+
 ### Fixed (plaintext peer gate: loopback exactness is now suite-enforced)
 
 - **Regression pins for `host_is_loopback` exactness** (refs [#2677](https://github.com/alphaonedev/ai-memory-mcp/issues/2677); CWE-319 class). Behaviour was already correct after #2477; the suite only covered happy-path loopback. Spoof hosts (`127.0.0.1.evil.com`, `localhost.evil.com`, query-embedded loopback strings, `127.0.0.2`) are refused by unit + `FederationConfig::build` tests so a future `starts_with`/`contains` "tidy" cannot silently re-open cleartext federation. Decimal/hex IPv4 forms normalise to `127.0.0.1` in the URL parser and remain correctly exempt (pinned).
