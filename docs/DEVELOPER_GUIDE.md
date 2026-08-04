@@ -607,7 +607,13 @@ Content-Type: application/json
 ]
 ```
 
-Response: `{"created": 2, "errors": []}`
+Response: `{"sent": 2, "created": 2, "updated": 0, "deduped": 0, "rejected": 0, "errors": [], "pending": []}`
+
+`created + updated + deduped + rejected + pending.length == sent`. A partial
+application returns **207 Multi-Status**; a batch that persisted nothing
+returns the dominant cause's status (e.g. **429** for a quota breach), never
+200. Per-row failures carry `{index, code, field?, error}`. See
+[API_REFERENCE.md](API_REFERENCE.md) for the full envelope.
 
 Limited to **1,000 items per request**.
 
