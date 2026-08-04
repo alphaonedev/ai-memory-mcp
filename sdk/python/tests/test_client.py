@@ -107,6 +107,62 @@ def test_raise_for_status_passes_on_2xx() -> None:
     raise_for_status(200, {"ok": True})  # does not raise
 
 
+# ---------------------------------------------------------------------------
+# C-20 (3x7 claims register, 2026-08-01) — the daemon registers ``delete`` on
+# the COLLECTION path ``/api/v1/subscriptions`` only; the id rides the query
+# string (``UnsubscribeQuery`` in ``src/handlers/subscriptions.rs``). Both the
+# sync and async SDK clients used to send ``DELETE /api/v1/subscriptions/{id}``,
+# which matches no route — so webhook teardown appeared to fail safe while the
+# decommissioned endpoint kept receiving signed deliveries indefinitely.
+#
+# Offline: an ``httpx.MockTransport`` captures the URL the SDK builds, so no
+# daemon is required.
+# ---------------------------------------------------------------------------
+
+
+def _capture_transport(seen: list[httpx.Request]) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"deleted": True})
+
+    return httpx.MockTransport(handler)
+
+
+def test_unsubscribe_targets_collection_path_with_id_query() -> None:
+    seen: list[httpx.Request] = []
+    client = AiMemoryClient(base_url=TEST_BASE_URL)
+    client._client = httpx.Client(  # noqa: SLF001 - offline URL-shape probe
+        base_url=TEST_BASE_URL, transport=_capture_transport(seen)
+    )
+
+    assert client.unsubscribe("sub-abc-123") == {"deleted": True}
+
+    assert len(seen) == 1
+    request = seen[0]
+    assert request.method == "DELETE"
+    # The registered route is the bare collection path.
+    assert request.url.path == "/api/v1/subscriptions"
+    # The id is a query parameter, not a path segment.
+    assert request.url.params.get("id") == "sub-abc-123"
+    # Guard the exact regression: no `/api/v1/subscriptions/<id>` form.
+    assert "/api/v1/subscriptions/" not in str(request.url)
+
+
+def test_removed_v1_methods_are_gone() -> None:
+    """``grant`` / ``revoke`` / ``cluster`` hit routes the daemon never had.
+
+    ``rg '"/api/v1/cluster"|/grant"|/revoke"' src/handlers/routes.rs`` returns
+    nothing, so every call 404'd. They were deleted at v1.0.0 rather than
+    documented — a shipped method against a nonexistent route is a claim, not
+    a feature.
+    """
+    from ai_memory import AsyncAiMemoryClient
+
+    for cls in (AiMemoryClient, AsyncAiMemoryClient):
+        for name in ("grant", "revoke", "cluster"):
+            assert not hasattr(cls, name), f"{cls.__name__}.{name} must not exist"
+
+
 # The webhook-HMAC tests moved to tests/test_webhooks.py (#2455). The version
 # that lived here computed its "expected" signature with the SAME construction
 # the implementation used, then asserted the implementation agreed with itself

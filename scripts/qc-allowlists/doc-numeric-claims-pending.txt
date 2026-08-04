@@ -1,0 +1,67 @@
+# PENDING-FIX ledger for scripts/check-docs-vs-ssot.sh
+# (the #2492 generalised numeric-claim scanner).
+#
+# FORMAT, one entry per line, whitespace-separated, everything from the
+# first `#` is commentary:
+#
+#     <doc-file> <RULE_KEY> <claimed-value> #<issue> <note>
+#
+# The key is deliberately (file, rule, claimed-value) and NOT a line
+# number: the document-correction lanes reflow these files, and a
+# line-keyed suppression would silently re-open itself on a reflow.
+#
+# A MALFORMED entry HARD-FAILS the gate — the ledger cannot rot into
+# prose. A STALE entry (one that suppresses nothing, i.e. the claim has
+# been corrected) is a loud NOTICE and NOT a failure, exactly as
+# `dual-trigger-cancel-allow.txt` handles `token-budget.yml`: a stale
+# entry can only suppress a failure that no longer happens, and failing
+# on it would red whichever PR lost the race to the lane that removed
+# the claim. Delete a NOTICE'd line; that is the burn-down.
+#
+# ---------------------------------------------------------------------
+# WHY THIS LEDGER EXISTS AT ALL (2026-08-01, #2492).
+#
+# The 3x7 claims audit (docs/audit/3x7-claims-register-2026-08-01.md)
+# found 71 FALSE/OVERCLAIMED published claims, five of them stale SSOT
+# values on README.md that this gate greened. Widening the pattern set
+# (the fix) makes the gate reject them — correctly — but the DOCUMENTS
+# are being corrected by five sibling lanes IN PARALLEL with this gate.
+# Landing the widened pattern set with an empty ledger would red every
+# one of those PRs on a claim they are already fixing.
+#
+# So every entry below is a claim the widened scanner NOW REJECTS at
+# `03bbd556`, held open only until its correcting lane merges. This
+# gate must merge AFTER them; each merge should turn one or more of
+# these lines into a NOTICE, and the NOTICE is the instruction to
+# delete the line. When the file is empty except this header, the
+# burn-down is complete and the gate is unconditional.
+#
+# The values below are the CANONICAL ones the corrected documents must
+# carry (src/lib.rs:345/:375/:415/:434, src/storage/migrations.rs:867,
+# src/models/memory.rs:1097, src/mcp/registry.rs:295):
+#   routes 94 · unique paths 80 · schema 88 · Memory fields 30
+#   tools at `--profile full` 103 · CLI 89 default / 91 sal
+#   current release 1.0.0 (Cargo.toml)
+# ---------------------------------------------------------------------
+
+# --- README.md — BURNED DOWN 2026-08-01 -------------------------------
+# All five README entries were deleted when the README-correction lane
+# merged (#2654). Their NOTICEs were the instruction to delete them, and
+# this is the first live exercise of that loop: the lane landed, the
+# gate went from "5 suppressed" to "5 stale NOTICEs, still green", and
+# the lines came out. The five claims are now HARD-ENFORCED with no
+# suppression: 94 routes / 80 unique paths / 103 tools at
+# `--profile full` / 30-field Memory / schema 88 / 89 CLI default + 91
+# sal, and any paragraph calling itself the current release must name
+# the Cargo.toml version.
+
+# --- ROADMAP.md -------------------------------------------------------
+ROADMAP.md Profile::full().expected_tool_count() 101    #2492 ":13 Production version: v0.9.0 (schema v78, 101 MCP tools at `--profile full`)"
+
+# --- Other DOC_FILES the widened anchors newly reach ------------------
+docs/DEVELOPER_GUIDE.md EXPECTED_PRODUCTION_ROUTES_COUNT 93                  #2492 register 6.4 records this file as already internally inconsistent
+docs/a2a-harness-integration.md EXPECTED_PRODUCTION_ROUTES_COUNT 93         #2492
+docs/a2a-harness-integration.md Memory::FIELD_COUNT 28                      #2492
+docs/MIGRATION_QUICKSTART.md EXPECTED_CLI_SUBCOMMANDS_DEFAULT 79            #2492 v0.6->v0.7 comparison table; likely belongs with the three frozen v0.7 guides
+docs/compliance/nsa-csi-mcp-security-mapping.md CURRENT_SCHEMA_VERSION 57   #2492 dated v0.7.0 compliance artefact header
+docs/compliance/nsa-csi-mcp-security-mapping.md EXPECTED_PRODUCTION_ROUTES_COUNT 89  #2492 same artefact, "89 HTTP routes, 74 MCP tools"

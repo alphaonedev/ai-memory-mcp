@@ -270,7 +270,7 @@ footer a{color:var(--text-muted)}
         <div class="lbl">surface 2</div>
         <h3>In transit (federation)</h3>
         <div class="algo">rustls · TLS 1.3 · mTLS · SHA-256 fingerprint allowlist</div>
-        <p>Peer-to-peer federation traffic travels over mutual TLS. Each peer's client cert is pinned by SHA-256 fingerprint in the allowlist file — only allowlisted peers can push or pull, even if they have a valid cert.</p>
+        <p>Peer-to-peer federation traffic travels over mutual TLS. Each peer's client cert is pinned by SHA-256 fingerprint in the allowlist file — only allowlisted peers can push or pull, even if they have a valid cert. Since v1.0.0 (#2477) a peer URL that is not <code>https://</code> is <strong>refused at boot</strong>, so this is enforced rather than merely expected; plaintext <code>http://</code> remains available to <em>loopback</em> peers (single-host dev meshes), and to a non-loopback peer only when the operator explicitly acknowledges it with <code>AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS=1</code> — which the <code>asi-hard</code> posture pins off.</p>
       </div>
       <div class="layer integrity">
         <div class="lbl">surface 3</div>

@@ -252,6 +252,31 @@ impl FederationConfig {
         // it calls distinct MUST mint two. One function, no drift.
         let mut seen_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
         for raw in peer_urls {
+            // #2477 — refuse a peer that would carry PLAINTEXT memory
+            // content off-host BEFORE anything else uses the URL. Pre-fix
+            // this loop validated only for duplicates and the raw string
+            // went straight into `sync_push_url`, so `http://peer:9077`
+            // replicated content in the clear — trivially bypassing the
+            // four-condition ceremony #2448 built for the strictly weaker
+            // accept-any-server-cert case.
+            //
+            // Refusal is WHOLE-BOOT, never per-peer skip-and-continue:
+            // `n = 1 + peer_urls.len()` below feeds `QuorumPolicy::new`, so
+            // silently dropping a peer would change the quorum guarantee
+            // without saying so — a caller that asked for W-of-N would
+            // silently get W-of-(N-1).
+            //
+            // (Pre-#2442 there was a second reason: `PeerEndpoint.id` was
+            // the positional `peer-{i}`, so a shrunken list ALSO re-keyed
+            // every queued DLQ row above the gap. #2442 made the id a pure
+            // function of peer identity, so that half no longer applies —
+            // the quorum-denominator argument is now the whole of it.)
+            //
+            // The guard runs BEFORE `normalize_peer_url` is used for the
+            // duplicate check, so a plaintext duplicate reports the scheme
+            // refusal rather than the duplicate one. That ordering is
+            // deliberate: refuse the insecure thing first.
+            crate::tls::validate_peer_url_scheme(raw).map_err(|e| anyhow::anyhow!("{e}"))?;
             let normalized = normalize_peer_url(raw);
             if !seen_urls.insert(normalized.clone()) {
                 return Err(anyhow::anyhow!(
@@ -477,13 +502,10 @@ impl FederationConfig {
             sender_agent_id,
             api_key,
             signing_key,
-            // v0.7.0 Track D #933 — federation push DLQ sink is
-            // populated by the daemon bootstrap AFTER the SAL store
-            // handle resolves (see `daemon_runtime.rs`). The build()
-            // path here returns `None` so an `ai-memory serve`
-            // invocation that never bootstraps a store (none today;
-            // belt-and-braces) doesn't trip a half-wired DLQ.
-            #[cfg(feature = "sal")]
+            // v0.7.0 Track D #933 / #2678 — federation push DLQ sink is
+            // populated by the daemon bootstrap AFTER the store opens
+            // (see `daemon_runtime.rs`). build() returns `None` so a
+            // half-wired serve never enqueues into a missing sink.
             dlq_sink: None,
         }))
     }
