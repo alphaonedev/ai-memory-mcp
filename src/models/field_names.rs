@@ -299,6 +299,17 @@ pub const MEMORY_KIND: &str = "memory_kind";
 pub const NAMESPACES: &str = "namespaces";
 /// `namespace_filter` — wire/row field name.
 pub const NAMESPACE_FILTER: &str = "namespace_filter";
+/// `next_since` — wire/row field name.
+///
+/// #2441 — the `/sync/since` PULL CURSOR. Distinct from
+/// [`LATEST_UPDATED_AT`], which describes only the rows actually
+/// PROJECTED into `memories[]` (post namespace-allowlist +
+/// post-visibility). `next_since` is derived from the rows the server
+/// EXAMINED, so a page whose every row was filtered out still advances
+/// the puller's cursor instead of stalling it forever on the identical
+/// window. `null` means "do not move your cursor" (nothing was
+/// examined, or advancing could not be proven safe).
+pub const NEXT_SINCE: &str = "next_since";
 /// `observations` — wire/row field name.
 pub const OBSERVATIONS: &str = "observations";
 /// `observed_by` — wire/row field name.
