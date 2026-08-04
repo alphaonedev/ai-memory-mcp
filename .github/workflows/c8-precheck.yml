@@ -165,6 +165,105 @@ jobs:
         # = tmpdir; the gate must catch the drift.
         run: bash scripts/check-docs-vs-ssot.sh --self-test
 
+  doc-symbol-anchor-gate:
+    # Issue #2629 / 3x7 claims register. `check-docs-vs-ssot.sh` pins
+    # VALUES and nothing pinned SYMBOLS, so `file:line` anchors,
+    # `path.rs::symbol` qualifications and `[`sym`](../src/path.rs)`
+    # links rotted silently on every rename and module split. The audit
+    # sampled SIX anchors and found 6/6 MISS at HEAD — including
+    # `decorate_memory`, which has been `decorate_memory_many` since the
+    # recall decorator was batched. The register's ruling: "Anchors that
+    # miss 6/6 are worse than no anchors — they cost the reviewer trust
+    # they cannot get back." Dependency-free (grep/python3 over src/)
+    # because CI has no codegraph; the migration-ladder tip is REUSED
+    # from scripts/check-migration-ladder.sh rather than re-derived.
+    # Burn-down allowlist, where a STALE entry ALSO FAILS (#2494 style).
+    name: Doc symbol/path anchor gate (#2629)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run doc symbol-anchor gate
+        run: bash scripts/check-doc-symbol-anchors.sh
+      - name: Self-test the gate (regression evidence)
+        # Plants the audit's OWN finding (the decorate_memory rename), a
+        # pre-modularisation path, a past-EOF file:line anchor, a stale
+        # `migrate_vNN` tip claim, and a dead markdown symbol link in a
+        # throwaway copy under .local-runs/ — with near-miss controls
+        # (the correct symbol, a `Type::method` brace list, an in-range
+        # anchor, a module link, and CLAUDE.md's deliberate `test ! -f
+        # src/handlers.rs` absent-path assertion) that must each PASS,
+        # so the rule is proven to fire on the defect and not on its
+        # neighbourhood. Both allowlist directions are exercised, and an
+        # empty src/ tree must fail CLOSED rather than green a no-op.
+        run: bash scripts/check-doc-symbol-anchors.sh --self-test
+
+  sdk-route-path-gate:
+    # 3x7 claims register 3.3.2 — C-19 and C-20. NOTHING pinned the SDK
+    # READMEs or SDK client sources against `src/handlers/routes.rs`, so
+    # `grant()` / `revoke()` / `cluster()` shipped in BOTH SDKs against
+    # three paths with ZERO hits in routes.rs (they 404 at runtime), and
+    # TS `unsubscribe(id)` targeted `DELETE /api/v1/subscriptions/:id`
+    # when `src/lib.rs` registers delete on the COLLECTION path only and
+    # the id rides the query string. The gate normalises path PARAMETERS
+    # on both sides, which is what makes it catch C-20: a raw-string
+    # membership test passes it (the collection path IS registered) and
+    # a parameter-blind test passes it too.
+    name: SDK-path vs routes.rs membership gate (#2629)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run SDK-route-path gate
+        run: bash scripts/check-sdk-route-paths.sh
+      - name: Self-test the gate (regression evidence)
+        # Plants C-19 in the TS client, the python client and BOTH
+        # READMEs, and C-20 in the TS client and its README, against a
+        # fixture routes.rs carrying the same collection-vs-member
+        # asymmetry as the real one. Near-miss controls that must PASS:
+        # a correctly-templated member path in each SDK dialect, a
+        # collection call with a QUERY STRING (the shape C-20's fix must
+        # adopt), and the bare `/api/v1/` base-URL prefix. An empty sdk
+        # scan set fails CLOSED so the gate cannot no-op to green.
+        run: bash scripts/check-sdk-route-paths.sh --self-test
+
+  ci-job-claims-gate:
+    # 3x7 claims register 3.3.3 — C-21 / C-23 / C-24 / C-31, all one
+    # shape: "a control was removed and the prose was not". `ci.yml`'s
+    # "Code Coverage" job was removed in #1993 and is still cited as the
+    # live coverage gate in README + ROADMAP; the `postgres-age` nightly
+    # was deleted in da3fb9cc and the release notes still say the stack
+    # is "gated nightly" by it; PERFORMANCE.md cites an AGE job in
+    # bench.yml that has zero `age` hits; and bench.yml — which says of
+    # ITSELF "Bench is advisory (not in required-status-checks)" — is
+    # described as gating every PR.
+    #
+    # EXISTENCE alone would green that last one, which is why the gate
+    # also carries ENFORCEMENT-TRUTHFULNESS: a doc that says a named job
+    # gates / blocks merge / fails the PR must resolve to a context
+    # actually declared in required-contexts-release.txt. That is the
+    # rule that counters the bias the register identified — "the drift
+    # direction is consistently toward MORE CLAIMED ENFORCEMENT THAN
+    # EXISTS." Shipped as a ratchet with a pending-fix ledger because
+    # five document-correction lanes are in flight concurrently.
+    name: Named-CI-job existence + enforcement-truthfulness gate (#2629)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run CI-job-claims gate
+        run: bash scripts/check-ci-job-claims.sh
+      - name: Self-test the gate (regression evidence)
+        # Plants all four historical claims. The C-31 leg is the
+        # load-bearing one: the workflow EXISTS and its job EXISTS, so
+        # it asserts the rejection comes from the ENFORCEMENT rule
+        # specifically, not merely that the exit code was non-zero. Its
+        # paired near-miss — the same workflow described WITHOUT an
+        # enforcement verb — must PASS, so the rule does not ban
+        # mentioning an advisory workflow at all. An empty workflow set
+        # fails CLOSED.
+        run: bash scripts/check-ci-job-claims.sh --self-test
+
   cloud-init-ascii-gate:
     # v0.9.0 (issue #1880): a stray non-ASCII byte (U+2014 em-dash) in a
     # DO cloud-init template made cloud-init reject the config

@@ -554,7 +554,7 @@ script (Docker / Plan C deployments).
 | 151 | `AI_MEMORY_METRICS_GAUGE_REFRESH_SECS` | u64 (secs) | `60`; `0` disables the loop | daemon (`serve`, sqlite) | config | **[#2583, v1.0.0]** Cadence of the paced refresh of the `ai_memory_memories` corpus-size gauge. `GET /metrics` used to call `db::stats` on EVERY scrape and use exactly ONE of the ten fields it computes; `db::stats` issues eight statements including two full `GROUP BY` aggregations and `dim_violations` (which walks every row's `embedding` BLOB), measured ~15 ms at 8k rows and ~130 ms at 130k, all discarded except the first count — while holding the DB mutex, on an endpoint that is EXEMPT from admission control, at a scrape rate the daemon does not control. The count is now computed here with ONE `SELECT COUNT(*) FROM memories` (`crate::SQL_COUNT_MEMORIES`) and the scrape path renders pre-computed values with ZERO database work, so its cost is independent of corpus size AND of scrape rate. The companion gauge `ai_memory_memories_refreshed_at_seconds` (UNIX seconds; `0` = never) is published in lockstep and is NOT optional: without it a dead refresher would freeze a plausible-looking count forever — including through a mass deletion — while Prometheus `up` stayed 1, which is the #2444 "reports success while doing nothing" shape. Alert on `time() - ai_memory_memories_refreshed_at_seconds`. A process whose refresher never ran (a router built without the daemon loop, or `0`) pays ONE count on its FIRST scrape rather than serving a `0` indistinguishable from an empty corpus. An incrementally-maintained in-process counter was REJECTED: other OS processes write the same SQLite file (MCP stdio, `curator`, every CLI invocation), so an in-process delta would DRIFT and publish a confidently wrong number; SQLite has no `pg_class.reltuples` equivalent, so no cheap exact count exists and a cheap estimate would be a wrong number sold as truth. An unparseable value falls through to the default. Direct-read knob, no `config_precedence` entry; resolver test co-located in `src/background/memories_gauge.rs`. 5-agent adversarial vote (`4d3ea1c5`), 4-1. Source: `src/background/memories_gauge.rs::{ENV_INTERVAL_SECS,DEFAULT_INTERVAL,resolve_interval,publish,refresh_once}` + `src/handlers/transport.rs::prometheus_metrics`. |
 | 152 | `AI_MEMORY_RECALL_EMBED_BUDGET_MS` | u64 ms (tri-state: unset = default; explicit `0` = DISABLED) | `2000` (`RECALL_EMBED_BUDGET_MS_DEFAULT`) | CLI/daemon/MCP (every recall-path query embedding) | config | **[#2577, v1.0.0; 5-agent vote `4d3ea1c5`]** Wall-clock budget for the query-embedding call on the RECALL (read) path. **The defect it closes:** the remote embed client is built with `GENERATE_TIMEOUT` (30 s) — a *generation* budget sized for chat completions — so a provider that is UP but SLOW converted `memory_recall` into a multi-second hang (39,268 ms sampled). That is an AVAILABILITY defect, not merely latency: on **MCP stdio** the loop is single-threaded by JSON-RPC protocol design (the #965 audit), so the stall blocks EVERY subsequent tool call including `memory_store` — a plausible mechanism for an MCP client dropping its connection; on the **HTTP daemon** each stalled recall holds an admission permit for its whole duration (#2032 M3 default-on), so sustained provider latency saturates the in-flight cap and sheds HEALTHY traffic — including durable-truth WRITES — with 503s. On expiry the recall **degrades to keyword** and reports `mode:keyword` honestly: this is the #1593 posture applied to SLOWNESS rather than only to embedder-CONSTRUCTION failure, and it is a DEGRADE (fewer, FTS-ranked results), never a wrong result — the durable text is untouched and recall is pure (#1869/#1953). The expiry is reported to the existing circuit breaker (`note_failure`), so repeated stalls fast-fail rather than each paying the full budget. **Value rationale:** 2000 ms is ~4x the observed p99 (492 ms) and ~13x the p50 (156 ms) for a healthy `openrouter` round trip on the reference corpus, so under the measured distribution it fires on approximately nothing — a TAIL cutter, not a throughput governor — and it equals the substrate's own declared read-class ceiling (`hooks::timeouts::READ_CLASS_DEADLINE_MS`). Tri-state, mirroring `AI_MEMORY_MAX_INFLIGHT_REQUESTS` (#79): unset ⇒ 2000; explicit `0` ⇒ DISABLED (restores the pre-#2577 unbounded-until-30 s behaviour); unparseable ⇒ the default + WARN (an unrecognised token must never silently WIDEN the failure window — the #131/FBL-14 rule). Every read-path embed crosses ONE funnel (`embeddings::recall_query_embedding`), pinned mechanically by `tests/embed_budget_funnel_ceiling_2577.rs` (the #2445 `db_open_funnel_ceiling` precedent: the funnel every BOOT crosses is not the funnel every CALL crosses). Observability: the `ai_memory_recall_embed_degraded_total` counter + the `recall.embed.degraded` WARN — and note MCP stdio serves NO `/metrics`, so on that surface the WARN is the only channel. Direct-read cached knob (the `strict_dim_enabled` shape, `src/hnsw.rs`), deliberately NOT a boot-seeded `OnceLock` so it cannot be inert in a process that misses the seeding funnel (the #2233 defaults-lie class); no `config_precedence` `[limits]`-style entry — the resolver tests are co-located (mirrors #92/#132/#137/#146/#148/#149). Source: `src/embeddings.rs::{ENV_RECALL_EMBED_BUDGET_MS,RECALL_EMBED_BUDGET_MS_DEFAULT,recall_embed_budget,recall_query_embedding}` + `src/llm.rs::{embed_text_with_budget,embed_text_async_with_budget}`. |
 | 153 | `AI_MEMORY_QUERY_EMBED_CACHE_ENTRIES` | usize (`0` disables) | `512` (`QUERY_EMBED_CACHE_ENTRIES_DEFAULT`) | CLI/daemon/MCP (every recall-path query embedding) | config | **[#2577, v1.0.0; 5-agent vote `4d3ea1c5`]** Capacity of the process-local bounded query-embedding cache — the only lever that removes the ~156 ms remote-round-trip FLOOR every recall paid, rather than merely bounding its tail (#152). Agent fleets repeat queries heavily (this repo's own global instruction is "recall with the user's apparent topic or current working directory name"), so the hit rate is the point. **Key = `(SHA-256(exact query bytes), embedding_space fingerprint)`.** Three properties are load-bearing: (a) the query text is DIGESTED, never held in cleartext, because recall context is caller-supplied free text and this is a long-lived process-global — hashing keeps raw queries out of a heap dump; (b) the digest is over the EXACT bytes handed to the embedder — no case folding, no whitespace collapsing, no unicode normalisation — because a lossy fold is the ONLY way this cache could return a WRONG vector (two different queries colliding onto one entry); (c) the #2167 `embedding_space` fingerprint (`<canonical_model_id>#<prefix_scheme>`) is read at LOOKUP time and carried in the key, so a model swap is a KEY CHANGE (a miss) rather than an invalidation event some funnel could forget to fire — a foreign-space vector can never be served, and the query/document prefix asymmetry (#1520 nomic) cannot cross over either. Bounded LRU: at capacity the least-recently-used entry is evicted, so the footprint is a FIXED ceiling (~1.5 MB at 768-dim, ~6 MB at 3072-dim) that does not grow with corpus, namespace, or tenant count. A 900 s TTL caps the one hazard the key cannot express — a REMOTE provider silently re-pointing a model behind a stable id, which would leave cached query vectors in the old space while newly-written ROW vectors land in the new one. `0` disables caching entirely. **Residual (documented, not closed):** a cache HIT is measurably faster, so a co-tenant can probe whether a given exact query string was issued recently — a query-EXISTENCE timing oracle, not content disclosure; the cache holds no rows, no ids, and no namespaces, and row visibility (`is_visible_to_caller`) is applied downstream and unchanged. Observability: `ai_memory_query_embed_cache_hits_total`. Direct-read cached knob; no `config_precedence` entry (mirrors #150). Source: `src/embeddings.rs::{ENV_QUERY_EMBED_CACHE_ENTRIES,QUERY_EMBED_CACHE_ENTRIES_DEFAULT,query_embed_cache_capacity,recall_query_embedding}`. |
-| 154 | `AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS` | bool (`1`/`true`/`yes`/`on`, case-insensitive) | unset (= the plaintext-peer refusal is in force) | federation (`serve --quorum-peers` + `sync-daemon --peers`) | **operator-advisory** (config) | **[#2477, v1.0.0; 3x3 adversarial vote, option D 6/9, citing `4d3ea1c5`]** Staged-rollout escape hatch for the plaintext-federation-peer refusal. **The defect it closes:** `FederationConfig::build` formatted the raw operator `--quorum-peers` string straight into `PeerEndpoint::sync_push_url` with NO scheme validation, and `cli::sync::build_sync_client` (`sync-daemon --peers`) — a SECOND, fully independent peer-URL door — did the same. Federation replicates memory content that is NOT end-to-end encrypted (`src/encryption/mod.rs`, #1968 open), so `http://peer:9077` shipped tenant memory in the clear to anyone on the path. That bypassed with ZERO ceremony the four-condition opt-in #2448 built for the strictly WEAKER accept-any-server-cert case, and `docs/encryption.html` asserted unqualified that peer traffic "travels over mutual TLS ... TLS 1.3 only (no fallback)". **The guard** (`tls::validate_peer_url_scheme`, ONE validator called from BOTH doors — a fix scoped to `federation/peer.rs` alone would have been theatre): `https://` always accepted; `http://` to a LITERAL loopback host (`127.0.0.1`/`::1`/`localhost`/`[::1]`/`0:0:0:0:0:0:0:1`, the SSOT `tls::host_is_loopback` the inbound `tls_bind_guard` now shares) always accepted with no hatch, because the bytes never leave the kernel and forcing a hatch-flip on every dev mesh and CI fixture would train reflexive hatch use; `http://` to anything else REFUSED unless this knob is truthy; any other scheme, and a scheme-LESS `peer.example:9077` (previously accepted, then failing opaquely at request time), REFUSED. A container-bridge hostname such as `http://alice:9077` is NOT loopback — it crosses an interceptable virtual NIC, and treating "feels local" as "is local" is the category error the control exists to prevent (this repo's own `infra/plan-c` + `infra/lan-parity-test` fleets use that shape and therefore carry an explicit hatch line). **Refusal is WHOLE-BOOT, never per-peer skip-and-continue:** `n = 1 + peer_urls.len()` feeds `QuorumPolicy::new`, so dropping a peer would change the quorum guarantee without saying so, and `PeerEndpoint.id` is a positional index (#2442) so a shrunken list also re-keys every DLQ row above the gap. PERMISSIVE-knob grammar (default OFF): opened ONLY by an explicit truthy token — unset, empty, `0`, or an unrecognised word all KEEP the refusal (the #131/FBL-14 rule: an unrecognised token must never silently widen a security control). The refusal message names the SECURE remedies (`https://`, `--quorum-ca-cert`, `AI_MEMORY_FED_PEER_FINGERPRINTS`) BEFORE the hatch, pinned by an ordering assertion, so an operator is steered to fix the posture rather than disable the control. **PINNED by `asi-hard`** (#130) as the SECOND permissive knob in that SSOT (after `AI_MEMORY_ALLOW_SCHEMA_AHEAD`) and the SECOND network access-control pin (after `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY`, #148): its hard floor is "not truthy", so a hardened deployment refuses to boot with the hatch on. Direct-read knob (not clap-bound / not a `[section]` field), so no `config_precedence` entry (mirrors #85/#148/#149) — the resolver tests are co-located in `src/tls.rs`. Source: `src/tls.rs::{FED_ALLOW_PLAINTEXT_PEERS_ENV,plaintext_peers_allowed,host_is_loopback,validate_peer_url_scheme}` + `src/federation/peer.rs::FederationConfig::build` + `src/cli/sync.rs::build_sync_client` + `src/security_profile.rs::KNOBS`. |
+| 154 | `AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS` | bool (`1`/`true`/`yes`/`on`, case-insensitive) | unset (= the plaintext-peer refusal is in force) | federation (`serve --quorum-peers` + `sync-daemon --peers`) | **operator-advisory** (config) | **[#2477, v1.0.0; 3x3 adversarial vote, option D 6/9, citing `4d3ea1c5`]** Staged-rollout escape hatch for the plaintext-federation-peer refusal. **The defect it closes:** `FederationConfig::build` formatted the raw operator `--quorum-peers` string straight into `PeerEndpoint::sync_push_url` with NO scheme validation, and `cli::sync::build_sync_client` (`sync-daemon --peers`) — a SECOND, fully independent peer-URL door — did the same. Federation replicates memory content that is NOT end-to-end encrypted (`src/encryption/mod.rs`, #1968 open), so `http://peer:9077` shipped tenant memory in the clear to anyone on the path. That bypassed with ZERO ceremony the four-condition opt-in #2448 built for the strictly WEAKER accept-any-server-cert case, and `docs/encryption.html` asserted unqualified that peer traffic "travels over mutual TLS ... TLS 1.3 only (no fallback)". **The guard** (`tls::validate_peer_url_scheme`, ONE validator called from BOTH doors — a fix scoped to `federation/peer.rs` alone would have been theatre): `https://` always accepted; `http://` to a LITERAL loopback host (`127.0.0.1`/`::1`/`localhost`/`[::1]`/`0:0:0:0:0:0:0:1`, the SSOT `tls::host_is_loopback` the inbound `tls_bind_guard` now shares) always accepted with no hatch, because the bytes never leave the kernel and forcing a hatch-flip on every dev mesh and CI fixture would train reflexive hatch use; `http://` to anything else REFUSED unless this knob is truthy; any other scheme, and a scheme-LESS `peer.example:9077` (previously accepted, then failing opaquely at request time), REFUSED. A container-bridge hostname such as `http://alice:9077` is NOT loopback — it crosses an interceptable virtual NIC, and treating "feels local" as "is local" is the category error the control exists to prevent (this repo's own `infra/plan-c` + `infra/lan-parity-test` fleets use that shape and therefore carry an explicit hatch line). **Refusal is WHOLE-BOOT, never per-peer skip-and-continue:** `n = 1 + peer_urls.len()` feeds `QuorumPolicy::new`, so dropping a peer would change the quorum guarantee without saying so, and `PeerEndpoint.id` is a positional index (#2442) so a shrunken list also re-keys every DLQ row above the gap. PERMISSIVE-knob grammar (default OFF): opened ONLY by an explicit truthy token — unset, empty, `0`, or an unrecognised word all KEEP the refusal (the #131/FBL-14 rule: an unrecognised token must never silently widen a security control). The refusal message names the SECURE remedies (`https://`, `--quorum-ca-cert`, `AI_MEMORY_FED_PEER_FINGERPRINTS`) BEFORE the hatch, pinned by an ordering assertion, so an operator is steered to fix the posture rather than disable the control. **PINNED by `asi-hard`** (#130) as the SECOND permissive knob in that SSOT (after `AI_MEMORY_ALLOW_SCHEMA_AHEAD`) and the SECOND network access-control pin (after `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY`, #148): its hard floor is "not truthy", so a hardened deployment refuses to boot with the hatch on. Direct-read knob (not clap-bound / not a `[section]` field), so no `config_precedence` entry (mirrors #85/#148/#149) — the resolver tests are co-located in `src/tls.rs`. Source: `src/tls.rs::{FED_ALLOW_PLAINTEXT_PEERS_ENV,plaintext_peers_allowed,host_is_loopback,validate_peer_url_scheme}` + `src/federation/mod.rs::FederationConfig` (`impl` in `src/federation/peer.rs`)` + `src/cli/sync.rs::build_sync_client` + `src/security_profile.rs::KNOBS`. |
 | — | `RUST_LOG` | tracing filter | unset (= `info`) | all | config | Standard `tracing-subscriber` filter (e.g. `RUST_LOG=ai_memory=debug`). Not an `AI_MEMORY_*` var — listed for completeness. **Post-#1562 (2026-06-09):** the postgres SAL adapter emits under the literal targets `store::postgres` / `store::postgres::kg` (and `schema-init` under `schema_init`), so an `ai_memory=debug` filter does NOT match those events — add `store::postgres=debug` explicitly. |
 
 **Regression tests.** Precedence + secret-classification invariants
@@ -966,18 +966,19 @@ but new public operations live on the trait.
 
 ### Lint gates (issue #1174 PR10 — pm-v3.1 vendor-monoculture + SECS_PER_*)
 
-Nine numbered script-based lint gates run in CI alongside the four
+Twelve numbered script-based lint gates run in CI alongside the four
 cargo gates (fmt / clippy / test / audit) and the two test-guard jobs
 (`test-stdin-gate` #1989, `test-env-lock-gate` #2146). All are
-HARD-BLOCK. Eight are wired into `.github/workflows/c8-precheck.yml`,
-whose THIRTEEN jobs are `c8-precheck`, `vendor-literal-gate`,
+HARD-BLOCK. Eleven are wired into `.github/workflows/c8-precheck.yml`,
+whose SIXTEEN jobs are `c8-precheck`, `vendor-literal-gate`,
 `l3-boundary-gate`, `hardcoded-literal-gate`, `docs-vs-ssot-drift`,
 `cloud-init-ascii-gate`, `migration-ladder-gate`,
 `required-contexts-gate`, `install-checksum-gate`,
-`conformance-readers-gate`, `git-dependency-source-gate`, plus the two
-test-guard jobs above. (That job list was stale by three until #2636 —
-which is the same class of rot rule (f) now blocks mechanically, one
-layer down.) The ninth, gate **8** below, lives in
+`conformance-readers-gate`, `git-dependency-source-gate`,
+`doc-symbol-anchor-gate`, `sdk-route-path-gate`, `ci-job-claims-gate`,
+plus the two test-guard jobs above. (That job list was stale by three
+until #2636 — which is the same class of rot rule (f) now blocks
+mechanically, one layer down.) The twelfth, gate **8** below, lives in
 `.github/workflows/ci.yml` because it needs a Rust toolchain that
 `c8-precheck.yml`'s deliberately toolchain-free jobs do not carry.
 
@@ -986,7 +987,29 @@ As of #2636, every job in the three GATING workflows (`ci.yml`,
 `scripts/qc-allowlists/required-contexts-release.txt` or in the dated
 `scripts/qc-allowlists/required-contexts-not-required.txt` — see rule
 (f) of gate 7. A newly-added integrity gate can no longer default to
-unenforced.
+unenforced, which is why the three CERT-GATE-2 jobs below are declared
+REQUIRED in the mirror rather than left to default.
+
+**Gates 9, 10 and 11 are the CERT-GATE-2 published-claims set** (#2629 /
+#2492, 2026-08-01). They exist because a 265-claim audit
+(`docs/audit/3x7-claims-register-2026-08-01.md`) found **71
+FALSE/OVERCLAIMED published claims** while gate 4 was GREEN — and the
+register's diagnosis is the one that governs all three: *"the drift
+direction is consistently toward MORE CLAIMED ENFORCEMENT THAN EXISTS.
+That is not random staleness; it is a systematic bias that a gate must
+be built to counter."*
+
+**Two ledger dispositions, and the difference is deliberate.** Gates 4,
+10 and 11 carry PENDING-FIX ledgers where a **stale entry is a loud
+NOTICE, not a failure** — the `dual-trigger-cancel-allow.txt` precedent
+(rule (d) of gate 7): a stale entry can only suppress a failure that no
+longer happens, and failing on it would red whichever PR lost the race
+to the correction lane that removed the claim. Gate 9 carries a
+BURN-DOWN allowlist where a **stale entry FAILS** — the
+`required-contexts-joblevel-if-allow.txt` discipline (rule (b2)) —
+because nothing is concurrently correcting those anchors, so a stale
+entry there is pure rot. In every ledger a MALFORMED entry HARD-FAILS,
+so none of them can rot into prose.
 
 **0. Hardcoded-literal duplication ratchet (pm-v3.1)** —
 `scripts/check-hardcoded-literals.sh`. The mechanical enforcement of the
@@ -1098,15 +1121,65 @@ are gate-clean by construction. `--self-test` plants a violation
 in a tmpdir and confirms the gate rejects it.
 
 **4. Docs vs SSOT drift gate** (v0.7.0 operator directive
-2026-05-31) — `scripts/check-docs-vs-ssot.sh`. Markdown has no
+2026-05-31; **widened by #2492**, 2026-08-01) —
+`scripts/check-docs-vs-ssot.sh`. Markdown has no
 native variables, so this gate is the minimal-infra answer:
 parses the canonical Rust SSOT consts (`CURRENT_SCHEMA_VERSION`,
 `EXPECTED_PRODUCTION_ROUTES_COUNT`, `EXPECTED_CLI_SUBCOMMANDS_*`,
 `Profile::full().expected_tool_count()`, `Memory::FIELD_COUNT`,
 etc.), walks the operator-facing `.md` files for known
 narrative-count patterns, and HARD-BLOCKS when any cited value
-drifts from the canonical. `--self-test` stages a contrived
-stale-claim doc in a tmpdir and confirms the gate catches it.
+drifts from the canonical.
+
+**#2492 — the gate greened a page carrying FIVE stale SSOT values.**
+README.md is, and always was, in `DOC_FILES`, so the gap was never the
+file walk: it was the PATTERN SET. Every original rule is a
+hand-written regex pinned to one exact phrasing
+(`\*\*N production \`\.route\(\.\.\.\)\` registrations\*\*`), and a
+document that says the same thing in the seventh way nobody enumerated
+is invisible. README carried 94→92/93 routes, 88→78 schema, 30→28
+`Memory` fields, 103→101 tools and 91/89→89/87 CLI subcommands with
+this gate green — the #2444 "reports success while doing nothing"
+shape. The fix is a **generalised numeric-claim scanner**: for each
+SSOT const, a small set of NOUN-PHRASE ANCHORS (`HTTP route
+registrations`, `unique URL paths`, `unique paths`, `MCP tools at
+--profile full`, `-entry surface`, `CLI subcommands`,
+``-field `Memory` ``, `schema **v`) and ANY adjacent integer in bold /
+code / plain form. A re-worded sentence is caught by the anchor; only a
+genuinely new NOUN gets past, which is far rarer.
+
+**The historical guard is load-bearing and must not be weakened.**
+README legitimately carries release-narrative paragraphs
+(``**v0.8.0 (…) — prior release.** … At the v0.8.0 release, surface
+was: schema **v<then>**, **<N>** MCP tools …, a **<M>-field** `Memory`.``
+— with real numbers in place of the placeholders) and ROADMAP §11.3.1
+carries a self-correcting frozen v0.7.1 baseline. Those
+numbers are TRUE statements about a PAST release; re-pointing them at
+the canonical would falsify the record — the same reasoning that keeps
+CHANGELOG.md, the RFC files and the three frozen v0.7 migration guides
+out of `DOC_FILES` entirely. So a line that opens a release-narrative
+paragraph (`^**v<semver>`) attributed to a NON-current release, or that
+says `At the v<x> release` / `release, surface was` / `Ship state at
+v<x>` / `Frozen v<x> baseline`, is skipped by the numeric rules.
+
+That guard would be a hole on its own, so **rule N1** closes it: a
+paragraph labelled `— current release` MUST attribute the Cargo.toml
+version. That is what catches a README paragraph whose lead names a
+PRIOR version and still calls itself the current release — the single
+paragraph carrying four of the register's five shapes. Once it is honestly relabelled, its numbers are either history
+(skipped) or current (checked).
+
+**R-203 is mechanical here.** The pre-fix script is frozen VERBATIM at
+`scripts/test/fixtures/docs-vs-ssot-prefix-2492.sh` (the
+`ci-classify-prefix-2496.sh` / `required-contexts-prefix-2494.txt`
+precedent). `--self-test` plants the exact pre-fix README phrasings and
+asserts BOTH directions — the FROZEN gate ACCEPTS them (reproducing the
+defect) and the LIVE gate REJECTS all 11 planted claims. A self-test
+that only proved the new gate works would be tautological, since the
+whole finding was that the old gate greened them. Further legs pin the
+historical control (a prior-release paragraph, a frozen baseline and
+ladder mentions must still PASS), rule N1, and all three ledger
+directions. Scratch lives under `.local-runs/`, never `mktemp -d`.
 
 **5. Cloud-init ASCII gate** (#1880) — `scripts/check-cloud-init-ascii.sh`.
 A stray non-ASCII byte (a U+2014 em-dash) in a DigitalOcean
@@ -1391,6 +1464,178 @@ incapable of admitting a new build script. The job carries NO job-level
 reports `skipped` on a docs-only diff — counted as SATISFIED — so a
 supply-chain gate was switchable off by a classifier verdict about
 markdown.
+
+**9. Doc symbol/path anchor gate** (#2629, CERT GATE 2) —
+`scripts/check-doc-symbol-anchors.sh`. Gate 4 pins VALUES; **nothing
+pinned SYMBOLS**. Documents cite `file:line` anchors, `path.rs::symbol`
+qualifications and ``[`sym`](../src/path.rs)`` links that rot silently
+on every rename and module split. The 3x7 audit sampled SIX anchors and
+found **6/6 MISS at HEAD**, including `decorate_memory` — a symbol that
+has not existed since the recall decorator was batched into
+`decorate_memory_many` (`src/mcp/tools/recall.rs:610`). The register's
+ruling: *"Anchors that miss 6/6 are worse than no anchors — they cost
+the reviewer trust they cannot get back."* The class is worse than
+value drift because a wrong VALUE is falsifiable in one grep, while a
+wrong ANCHOR sends the reader to the wrong place and then makes them
+doubt everything else. FOUR rules, all keyed on PATH-QUALIFIED grammar:
+**PATH** (a cited `src/<p>.rs` must exist — this is what caught the
+pre-modularisation `src/handlers.rs` / `src/mcp.rs` / `src/db.rs`
+anchors still live in the operator guides), **LINE** (a `src/<p>.rs:<N>`
+anchor must name a line the file has), **QUAL** (every identifier in
+`src/<p>.rs::<sym>` and `src/<p>.rs::{a, B::c, d}` must be defined IN
+THAT FILE — each `::` component is checked, so
+`VectorIndex::build_with_capacity` resolves only if both do), and
+**MDLINK** (a ``[`sym`](../src/<p>.rs)`` link must resolve, or `sym`
+must BE the module's file stem, which is a legitimate module citation).
+
+**What is deliberately NOT a rule:** a bare backticked identifier
+sharing a line with a `src/` path. Measured against the tree that
+grammar yields **1,827 hits over 879 distinct tokens** — MCP tool
+names, DB columns, wire strings, env vars — almost none of them Rust
+definitions. A rule with that false-positive rate gets switched off
+within a week, and a gate nobody can leave on is worse than no gate.
+Two further carve-outs are load-bearing: a line that DELIBERATELY names
+a path as absent (CLAUDE.md's own worktree pre-flight asserts
+`test ! -f src/handlers.rs`) is exempt, evaluated over a THREE-LINE
+window because this repo hard-wraps prose and the disclaimer routinely
+lands on the line above the path it disclaims; and frozen doc trees
+(`docs/v0.*/`, `docs/internal/`, `docs/audit/`, `docs/rfc/`, `docs/adr*`,
+`docs/BASELINE-*.md`, the `perfect-endpoint-assessment` wave artefacts)
+are out of scope for the CHANGELOG reason — they describe a tree AS IT
+WAS. **NO NEW SSOT** (operator direction): where the migration-ladder
+tip is needed the gate EXTRACTS and reuses `read_current_schema_version`
+from `scripts/check-migration-ladder.sh` rather than deriving the tip a
+third time, and fails loudly if that function is renamed. That rule
+immediately caught `docs/postgres-age-guide.md` naming a ten-versions-
+stale `migrate_vNN()` as the end of the postgres ladder — the #2629
+issue title's own example. Burn-down allowlist
+`scripts/qc-allowlists/doc-symbol-anchors-allow.txt`, where a **STALE
+entry FAILS**. `--self-test` plants the audit's own `decorate_memory`
+rename, a pre-modularisation path, a past-EOF line anchor, a stale
+`migrate_vNN` tip claim and a dead markdown symbol link, with
+near-miss controls (the correct symbol, a `Type::method` brace list, an
+in-range anchor, a module link, the absent-path assertion) that must
+each PASS.
+
+**10. SDK-path vs `routes.rs` membership gate** (#2629, CERT GATE 2;
+register 3.3.2) — `scripts/check-sdk-route-paths.sh`. **Nothing pinned
+the SDK READMEs or SDK client sources against
+`src/handlers/routes.rs`**, so two defect classes shipped: **C-19** —
+`grant()` / `revoke()` / `cluster()` in BOTH SDKs calling
+`/api/v1/memories/{id}/grant`, `…/revoke` and `/api/v1/cluster`, three
+paths with ZERO hits in `routes.rs`, i.e. three shipped, typed,
+documented methods that **404 at runtime** (the TS source even carries a
+comment saying "Some may not be merged server-side yet" — the knowledge
+was in the tree and no control acted on it); and **C-20** — TS
+`unsubscribe(id)` targeting `DELETE /api/v1/subscriptions/:id` when
+`src/lib.rs` registers delete on the COLLECTION path only and the id
+rides the query string (`src/handlers/subscriptions.rs`). The register
+calls the check "mechanically trivial", and it is; the value is
+catching both AT AUTHORING TIME rather than at a customer's first call.
+The gate builds the registered set from the `routes.rs` const SSOT,
+extracts every `/api/v1/…` literal from `sdk/*/README.md` + the client
+sources, and **NORMALISES path PARAMETERS on both sides** — `{id}`,
+`:id`, `${encodeURIComponent(id)}`, `{memory_id}`, `<id>` all collapse
+to `{}`. That step is what makes it catch C-20: a raw-string membership
+test PASSES it (the collection path IS registered) and a
+parameter-blind test passes it too; only normalisation makes
+`/api/v1/subscriptions/{}` a non-member while
+`/api/v1/memories/{}` stays a member.
+
+**A path is a CLAIM only where it is a CALL.** This is the property
+that decides whether the gate is usable at all: a rule that greps RAW
+FILE TEXT fails on the CORRECTED tree, not the broken one. The
+C-19/C-20 fix deletes the three dead methods and repoints
+`unsubscribe`, but its BREAKING-CHANGE notes NAME the dead paths in
+order to explain them — ``// `cluster()` was REMOVED at v1.0.0. It
+posted to `/api/v1/cluster` …`` in the clients, a docstring narrating
+the old `unsubscribe` shape, a migration paragraph in each README.
+Failing those would force the removal notes to be deleted, and the
+migration note is precisely the thing that stops an integrator
+re-adding the method. So extraction is scoped by construction, not by
+allowlist: `.ts`/`.js` with comments stripped (`//`, `/* */`, JSDoc
+`*` continuations), `.py` with `#` comments AND triple-quoted
+docstrings stripped, and READMEs restricted to TABLE ROWS and FENCED
+CODE (a method-signature cell documents a live call; a prose paragraph
+explaining a removal does not). **The acceptance criterion is the
+PAIR** — RED on the pre-fix tree, GREEN on the corrected one — and the
+self-test's clean-control leg carries the verbatim removal-note shapes
+so a regression to raw-text matching fails there immediately. The scan
+set is `sdk/**` BY PATTERN, never an enumerated file list:
+`sdk/python/ai_memory/async_client.py` carried all four defects and
+appears nowhere in the 429-line claims register, so a gate scoped to
+the files the register named would have missed it entirely. PENDING-FIX
+ledger `scripts/qc-allowlists/sdk-route-paths-pending.txt`. `--self-test`
+plants C-19 in the TS client, the python client and BOTH READMEs and
+C-20 in the TS client and its README, with near-miss controls that must
+PASS: a correctly-templated member path in each SDK dialect, a
+collection call with a QUERY STRING (the shape C-20's fix must adopt),
+and the bare `/api/v1/` base-URL prefix. An empty sdk scan set fails
+CLOSED so the gate cannot no-op to green.
+
+**11. Named-CI-job existence + enforcement-truthfulness gate** (#2629,
+CERT GATE 2; register 3.3.3) — `scripts/check-ci-job-claims.sh`. Four
+published claims, all the same shape — *"a control was removed and the
+prose was not"*: **C-24**, `ci.yml`'s "Code Coverage" job cited as the
+live coverage gate in BOTH README and ROADMAP after being REMOVED in
+#1993 (README even documents the removal two clauses after asserting
+the job enforces a ratchet); **C-23**, `docs/v1.0.0/release-notes.md`
+saying the postgres/AGE stack is "gated **nightly** by the
+`postgres-age` CI job" when that job was deleted in `da3fb9cc` and
+`postgres-parity-nightly.yml` says in its own header the coverage is
+"gone rather than repaired"; **C-21**, PERFORMANCE.md citing an AGE
+bench gate in `.github/workflows/bench.yml`, which has zero `age` hits;
+**C-31**, PERFORMANCE.md saying `bench.yml` "gates every PR and trunk
+push" when `bench.yml:18` says of ITSELF "Bench is advisory (not in
+required-status-checks)" and `grep -ic bench
+scripts/qc-allowlists/required-contexts-release.txt` is 0.
+
+TWO rules, in strength order. **EXISTENCE** (unambiguous): every
+workflow file and named CI job cited in `README.md`, `ROADMAP.md`,
+`PERFORMANCE.md` or `docs/v1.0.0/*.md` must resolve to a file under
+`.github/workflows/` or to a parsed job `name:` / job key / matrix
+expansion within one; the parse follows the SAME YAML scalar rule gate 7
+established (a `#` preceded by whitespace opens a comment, `(#1174
+PR10)` does not), because a job whose DECLARED name differs from the
+reported one is exactly how the #2473 truncated context entered the live
+required set. Catches C-24 and C-23 outright. **ENFORCEMENT-TRUTHFULNESS**
+is the rule that counters the register's stated systematic bias: a doc
+that says a named job or workflow *gates* / *blocks merge* / *fails the
+PR* / *is required* must resolve to a context actually declared in
+`scripts/qc-allowlists/required-contexts-release.txt`. Existence alone
+GREENS C-31 — `bench.yml` exists and its job exists, and the claim that
+it gates anything is still false. Two calibrations keep it aimed at the
+defect rather than its neighbourhood: the enforcement verb must sit
+within **90 characters** of the citation (a ROADMAP "Code anchors" line
+names five workflows and one gate, and only one of the five is the
+gate's subject), and `operator-gated` is excluded because that is a
+claim about HUMAN release authority, not a required status check —
+demanding that a `workflow_dispatch`-only `release.yml` be a required PR
+context would be incoherent, so `workflow_dispatch`-ONLY workflows are
+exempt from ENFORCEMENT (never from EXISTENCE; a `schedule:`-only
+nightly is NOT exempt, since claiming a nightly gates a PR is exactly
+the false-enforcement shape). Shipped as a ratchet with the PENDING-FIX
+ledger `scripts/qc-allowlists/ci-job-claims-pending.txt` because five
+document-correction lanes are in flight concurrently. `--self-test`
+plants all four claims; the C-31 leg asserts the rejection comes from
+the ENFORCEMENT rule specifically, and its paired near-miss — the same
+workflow described WITHOUT an enforcement verb — must PASS so the rule
+does not ban mentioning an advisory workflow at all.
+
+**`cargo test` twin for gates 4 / 9 / 10 / 11:**
+`tests/doc_claims_integrity.rs` (the
+`tests/migration_ladder_integrity.rs` precedent). All four shell gates
+live in ONE workflow, so a deleted job, a renamed script or a `paths:`
+filter would make every one of them silently stop running while the
+branch stayed green. The twin re-asserts the two invariants with a
+concrete RUNTIME consequence (SDK path membership; named-CI-job
+existence) plus two STRUCTURAL properties — every ledger parses, and
+every gate is wired into `c8-precheck.yml` **with its `--self-test`
+step**, with no `needs: classify`, no `paths:` filter and no job-level
+`if:`. It deliberately does NOT duplicate the full pattern sets: two
+definitions that can disagree teach reviewers to ignore both. Run it as
+`( umask 022; cargo test --test doc_claims_integrity )` — the bare
+`cargo test` umask trap is #2628.
 
 ## Prime directive (operator-set, 2026-05-17)
 
@@ -1959,7 +2204,7 @@ recommending:
 - A "OWASP Agent Memory Guard" project (real, but
   vgudur-dev is the dominant author with 105 of ~125
   commits; OWASP Incubator tier, self-applied)
-- A code snippet to drop into `src/mcp/tools/store.rs` (the
+- A code snippet to drop into `src/mcp/tools/store/` (the
   substrate's primary write path)
 
 Account profile: GitHub user ID 194662684 (high = recent
