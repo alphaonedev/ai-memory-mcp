@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (federated `pendings[]` can no longer resurrect a decided governance row)
+
+- **`/sync/push` `pendings[]` refuses to resurrect or clobber a locally-decided pending action** (refs [#2529](https://github.com/alphaonedev/ai-memory-mcp/issues/2529); CWE-284). Pre-fix `upsert_pending_action` was `ON CONFLICT DO UPDATE` over **every** column including `status` / `decided_by` / `approvals`, so an enrolled peer could push `status: "pending"` for an id this node had already rejected and re-arm `execute_pending_action` (which only checks `status == "approved"`), defeating consensus quorum history.
+  - Receive loop: refuse wire rows with `status != "pending"` (decisions converge via `pending_decisions[]`); refuse when the **local** row is already terminal.
+  - Storage: on conflict, only refresh request body fields, and only while local `status = 'pending'`; decision columns are never wire-writable on conflict.
+  - Fresh undecided pendings still apply (zero-config + enrolled).
+
 ### Fixed (a typo in `AI_MEMORY_FED_PEER_ATTESTATION` no longer wide-opens federated DELETE)
 
 - **Malformed or empty-present peer-attestation config no longer degrades to zero-config faith replication** (refs [#2504](https://github.com/alphaonedev/ai-memory-mcp/issues/2504); CWE-284). Pre-fix `from_env` treated parse error like env-absent: `has_allowlist() == false`, which turns **off** the federated-delete namespace gate and the #1056 TOFU 401 while the WARN claimed "default-deny". Read `/sync/since` and destructive DELETE took opposite postures from the same broken value.

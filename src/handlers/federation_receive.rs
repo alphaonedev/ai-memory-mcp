@@ -2527,6 +2527,21 @@ pub async fn sync_push(
             noop += 1;
             continue;
         }
+        // #2529 (CWE-284) — `pendings[]` is the injection lane for UNDECIDED
+        // governance rows. Decisions converge through `pending_decisions[]`.
+        // Refuse wire rows that already claim a terminal status, so a peer
+        // cannot inject a pre-approved/rejected row and skip the decision path.
+        if pa.status != "pending" {
+            tracing::warn!(
+                target: ATTESTATION_TRACE_TARGET,
+                pending_id = %pa.id,
+                status = %pa.status,
+                "sync_push: refusing federated pendings entry with non-pending status \
+                 (#2529) — use pending_decisions[] to converge decisions"
+            );
+            skipped += 1;
+            continue;
+        }
         // #1920 (CWE-862) — gate the pending upsert behind the per-peer
         // authorship allowlist so a hostile peer cannot inject a pending
         // action attributed to an arbitrary `requested_by` (or a forged
@@ -2549,6 +2564,37 @@ pub async fn sync_push(
             skipped += 1;
             continue;
         }
+        // Probe local row once for #2529 terminal-status refuse + #2478 ns.
+        let local_pending = match db::get_pending_action(&lock.0, &pa.id) {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    pending_id = %pa.id,
+                    cause = crate::federation::receive_auth::CAUSE_NAMESPACE_PROBE_UNRESOLVABLE,
+                    error = %e,
+                    "sync_push: refusing federated pendings entry — local governance row \
+                     unresolvable (#2478/#2529 fail-closed)"
+                );
+                skipped += 1;
+                continue;
+            }
+        };
+        // #2529 — a locally DECIDED pending is terminal from the wire's view.
+        // Refuse resurrection / clobber of decided_by / approvals / status.
+        if let Some(ref existing) = local_pending {
+            if existing.status != "pending" {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    pending_id = %pa.id,
+                    local_status = %existing.status,
+                    "sync_push: refusing federated pendings upsert — local row is already \
+                     decided (#2529); decisions converge via pending_decisions[]"
+                );
+                skipped += 1;
+                continue;
+            }
+        }
         // #2478 (CWE-284) — #1920 gates WHO a pending may be attributed to; it
         // never consults a namespace. Confine the injection to the peer's scope
         // through the SAME shared verdict the memories/deletions lanes use, so
@@ -2563,22 +2609,7 @@ pub async fn sync_push(
         // oversight — but this lane's sink is strictly more destructive than
         // `memories[]`, so it is named here and in the PR body.
         if ns_gate_enrolled {
-            let stored_pending_ns = match db::get_pending_action(&lock.0, &pa.id) {
-                Ok(existing) => existing.map(|row| row.namespace),
-                Err(e) => {
-                    tracing::warn!(
-                        target: ATTESTATION_TRACE_TARGET,
-                        pending_id = %pa.id,
-                        cause = crate::federation::receive_auth::CAUSE_NAMESPACE_PROBE_UNRESOLVABLE,
-                        error = %e,
-                        "sync_push: refusing federated pendings entry — the governance row \
-                         this upsert would overwrite is UNRESOLVABLE on this node, so the \
-                         scope gate cannot decide (#2478 fail-closed)."
-                    );
-                    skipped += 1;
-                    continue;
-                }
-            };
+            let stored_pending_ns = local_pending.as_ref().map(|row| row.namespace.clone());
             if !pending_namespaces_authorized(
                 &lock.0,
                 crate::federation::receive_auth::LANE_PENDINGS,
