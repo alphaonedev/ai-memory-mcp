@@ -1266,20 +1266,22 @@ pub fn inbound_by_id_namespace_authorized(
 ///   here for uniformity — an operator hitting that refusal should drop the
 ///   redundant field, since the global standard is already in every chain.
 ///
-/// It does NOT and cannot gate:
+/// It also gates (Amendment #2536):
 ///
-/// - **the DESCENDANTS of `namespace`.** `resolve_governance_policy` walks
-///   leaf-first and returns the first level carrying a policy, so a peer scoped
-///   to an ANCESTOR (e.g. exactly `["secure"]`) sets the DEFAULT policy of every
-///   `secure/**` namespace that carries none of its own. Closing that needs
-///   pattern-vs-pattern subsumption, which the shared `glob_match` primitive
-///   structurally cannot express (it matches a pattern against a CONCRETE
-///   target), so a subtree variant was ranked LAST by the #2479 vote and is
-///   tracked separately rather than forked off the one #239 glob SSOT.
-/// - **the namespace the `standard_id` memory LIVES IN.** `set_namespace_standard`
-///   deliberately permits cross-namespace binding ("shared policy"), so gating it
-///   would break a documented feature; the read-amplification that binding a
-///   foreign memory enables is tracked separately.
+/// - **the DESCENDANTS of `namespace` by inheritance.** `resolve_governance_policy`
+///   walks leaf-first and returns the first level carrying a policy, so a peer
+///   scoped to an ANCESTOR (e.g. exactly `["secure"]`) would otherwise set the
+///   DEFAULT policy of every `secure/**` namespace that carries none of its own.
+///   Full pattern-vs-pattern subsumption is not in the #239 `glob_match` SSOT;
+///   instead we require the peer to also be authorized for a **concrete deep
+///   descendant probe** of `namespace` (same `inbound_write_namespace_authorized`
+///   path). Exact-scope and single-level `prefix/*` peers fail that probe;
+///   `prefix/**` and `**` succeed. See #2536.
+/// - **Not gated: the namespace the `standard_id` memory LIVES IN.**
+///   `set_namespace_standard` deliberately permits cross-namespace binding
+///   ("shared policy"), so gating it would break a documented feature; the
+///   read-amplification that binding a foreign memory enables is tracked
+///   separately.
 ///
 /// ## Amendment E — the global standard is not just another namespace
 ///
@@ -1358,8 +1360,45 @@ pub fn inbound_namespace_meta_authorized(
         }
     }
 
+    // #2536 — inheritance reaches descendants. After authorizing `namespace`
+    // itself, require authorization for a concrete deep descendant so an
+    // exact-scope peer cannot set (or clear) a standard that becomes the
+    // default policy of out-of-scope children. Amendment E already gates the
+    // global `*` row; skip the probe there (and there is no meaningful child
+    // of `*`).
+    if namespace != GLOBAL_STANDARD_NAMESPACE {
+        let descendant_probe = format!("{namespace}{NAMESPACE_META_DESCENDANT_PROBE_SUFFIX}");
+        if !inbound_write_namespace_authorized(
+            lane,
+            namespace,
+            &descendant_probe,
+            None,
+            attest_cfg,
+            peer_id,
+            require_push_namespace_scope,
+        ) {
+            tracing::warn!(
+                target: ATTESTATION_TRACE_TARGET,
+                namespace = %namespace,
+                descendant_probe = %descendant_probe,
+                peer_id = %peer_id.unwrap_or(""),
+                "sync_push: refusing federated {lane} entry — peer scope covers \
+                 this namespace but not its descendants (#2536); a governance standard \
+                 (or clear) on an ancestor is the default policy of every child \
+                 without its own. Declare a tree pattern (namespace/** or **) for \
+                 this peer if it is trusted to set hierarchical governance."
+            );
+            return false;
+        }
+    }
+
     true
 }
+
+/// #2536 — suffix appended to `namespace` to form the concrete deep-descendant
+/// probe. Two extra segments so single-level `prefix/*` patterns (which match
+/// exactly one child segment) fail, while `prefix/**` and `**` succeed.
+pub const NAMESPACE_META_DESCENDANT_PROBE_SUFFIX: &str = "/__ai_memory_2536_desc/deep";
 
 #[cfg(test)]
 mod tests {
