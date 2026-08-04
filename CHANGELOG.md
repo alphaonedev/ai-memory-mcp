@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (release/Docker binaries ship federation `sal` feature)
+
+- **Dockerfile and `release.yml` build with `--features sal` and assert the compiled feature set** (refs [#2676](https://github.com/alphaonedev/ai-memory-mcp/issues/2676) packaging residual). Pre-fix default cargo features were only `sqlite-bundled`, so GHCR/deb/tarball artifacts could omit the SAL/federation surface Gate3 measured with an asserted build. `scripts/assert-compiled-features.sh` now runs in the image build and on each release matrix binary (`sqlite-bundled` + `sal`). `sal-postgres` remains opt-in for PG-native deployments (plan-c / explicit build), not forced onto every multi-OS release target.
+
 ### Fixed (federated REJECT cannot veto foreign-namespace pendings)
 
 - **`/sync/push` `pending_decisions[]` REJECT is namespace-confined** (refs [#2532](https://github.com/alphaonedev/ai-memory-mcp/issues/2532); CWE-284). #2478 gated APPROVE but deliberately left REJECT ungated; an enrolled peer scoped to `public/*` could permanently set `status=rejected` on another tenant's queue. REJECT now uses the same local-row probe + shared `pending_namespaces_authorized` gate as APPROVE. Out-of-scope refuse leaves the row pending (still approvable by legitimate in-scope actors — the correct multi-tenant outcome). In-scope reject still converges. Zero-config unchanged.
