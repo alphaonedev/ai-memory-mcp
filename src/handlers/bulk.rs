@@ -15,6 +15,7 @@
 //! | #2594 | embedding — zero references to `app.embedder` on either backend |
 //! | #2551 | accounting — `created` counted rows SENT, not rows PERSISTED |
 //! | #2588 | exit discipline — a total quota rollback returned HTTP 200 |
+//! | #2724 | post-commit stages — no audit emit, no subscription dispatch, no postgres federation fanout |
 //!
 //! The fix is structural, not five patches: the per-row projection now routes
 //! through [`crate::handlers::create::resolve_create_metadata`] +
@@ -53,6 +54,31 @@
 //! into `errors[]` — as the pre-#2551 code did — made `rejected` unreconcilable
 //! and would have made the response status a function of peer reachability on a
 //! fully-persisted batch.
+//!
+//! # Post-commit stages (#2724, CB-22)
+//!
+//! Once the durable write has landed, single-create runs three post-commit
+//! stages that bulk had omitted on one or both backends (a fourth
+//! re-implementation-omits-a-stage symptom of the same root cause):
+//!
+//! 1. **Audit** — one `AuditAction::Store` row per persisted memory
+//!    ([`crate::audit::emit`]), so a fleet corpus load is not an invisible gap
+//!    in the tamper-evident chain. Bulk emitted ZERO on both backends.
+//! 2. **Subscription dispatch** — the `memory_store` lifecycle event
+//!    ([`crate::subscriptions::dispatch_event`] on sqlite,
+//!    `dispatch_event_postgres` on postgres) so a registered `memory_store`
+//!    subscriber sees bulk-ingested rows. Bulk fired ZERO on both backends.
+//! 3. **Federation fanout** — the postgres bulk branch ended at the batched
+//!    insert with no `broadcast_store_quorum` / `bulk_catchup_push`, so a
+//!    postgres daemon with `--quorum-peers` silently did not replicate bulk
+//!    rows. The sqlite branch already fanned out; this closes the postgres gap.
+//!
+//! All three fire ONCE per DISTINCT persisted row (`created + updated`) — an
+//! in-batch `(title, namespace)` collapse is one durable row, so it draws one
+//! audit line, one dispatch, and one broadcast, never one per input index —
+//! and NEVER for a rejected / skipped / pending row. This does not touch the
+//! reconciliation identity: the ledger counters are unchanged; a post-commit
+//! federation failure still lands only in `warnings[]`.
 
 #![allow(clippy::too_many_lines)]
 
@@ -500,6 +526,188 @@ fn embed_bulk_rows(
 }
 
 // ---------------------------------------------------------------------------
+// #2724 (CB-22) — post-commit stages: audit, subscription dispatch, fanout.
+// ---------------------------------------------------------------------------
+
+/// Collapse committed rows to ONE entry per persisted id (last-wins),
+/// mirroring the upsert's surviving-content rule.
+///
+/// Several input rows can share a persisted id after an in-batch
+/// `(title, namespace)` collapse (sqlite sequential upsert / postgres
+/// pre-INSERT dedup). The post-commit stages must fire ONCE per distinct
+/// durable row — `created + updated` of them — not once per input index, so a
+/// collapsed pair draws one audit line, one dispatch, and one broadcast. The
+/// LAST occurrence wins so the surviving CONTENT (the same row the upsert kept)
+/// is the one that is audited / dispatched / fanned out.
+fn distinct_committed_rows(mems: Vec<Memory>) -> Vec<Memory> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_id: std::collections::HashMap<String, Memory> = std::collections::HashMap::new();
+    for mem in mems {
+        if !by_id.contains_key(&mem.id) {
+            order.push(mem.id.clone());
+        }
+        by_id.insert(mem.id.clone(), mem);
+    }
+    order
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect()
+}
+
+/// #2724 (F1) — one `AuditAction::Store` audit row per persisted memory,
+/// matching single-create (`create::fanout_and_assemble_create_response` on
+/// sqlite, `create_memory_postgres` on postgres). Pre-#2724 a bulk load left
+/// ZERO Store rows in the tamper-evident chain on both backends. Gated ONCE on
+/// [`crate::audit::is_enabled`] so a disabled subsystem costs nothing.
+fn emit_bulk_store_audit(committed: &[Memory]) {
+    if !crate::audit::is_enabled() {
+        return;
+    }
+    for mem in committed {
+        let scope = mem
+            .metadata
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        // #869 — an absent agent_id records the documented `""` anonymous-actor
+        // sentinel, matching both single-create paths.
+        let agent = mem
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        crate::audit::emit(crate::audit::EventBuilder::new(
+            crate::audit::AuditAction::Store,
+            crate::audit::actor(agent, "http_body", scope.clone()),
+            crate::audit::target_memory(
+                mem.id.clone(),
+                mem.namespace.clone(),
+                Some(mem.title.clone()),
+                Some(mem.tier.to_string()),
+                scope,
+            ),
+        ));
+    }
+}
+
+/// #2724 (F2) — fire the `memory_store` subscription lifecycle event for every
+/// persisted row, matching single-create. Fire-and-forget (worker threads
+/// handle delivery); never rolls back the local commit. Respects the same
+/// backend split single-create uses: the sqlite path reads the `subscriptions`
+/// table under the shared writer lock, the postgres path walks the
+/// `_subscriptions/<*>` mirror rows via the SAL. Pre-#2724 a `memory_store`
+/// subscriber received NOTHING from a bulk write on either backend.
+async fn dispatch_bulk_store_events(app: &AppState, committed: &[Memory]) {
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        for mem in committed {
+            let agent = mem.metadata.get("agent_id").and_then(|v| v.as_str());
+            super::dispatch_event_postgres(
+                app,
+                crate::mcp::registry::tool_names::MEMORY_STORE,
+                &mem.id,
+                &mem.namespace,
+                agent,
+                None,
+            )
+            .await;
+        }
+        return;
+    }
+
+    // Sqlite: one lock for the whole batch (each dispatch is a fast table read
+    // + fire-and-forget spawn), mirroring single-create's single-lock dispatch.
+    let lock = app.db.lock().await;
+    for mem in committed {
+        let agent = mem.metadata.get("agent_id").and_then(|v| v.as_str());
+        crate::subscriptions::dispatch_event(
+            &lock.0,
+            crate::mcp::registry::tool_names::MEMORY_STORE,
+            &mem.id,
+            &mem.namespace,
+            agent,
+            &lock.1,
+        );
+    }
+}
+
+/// #2724 (F3) — federation fanout for a committed bulk batch. Shared by BOTH
+/// backends so the postgres branch (which had NONE) replicates bulk rows
+/// exactly as the sqlite branch always has.
+///
+/// One `broadcast_store_quorum` per persisted row, bounded by
+/// [`BULK_FANOUT_CONCURRENCY`] so 500 rows × 3 peers cannot exhaust the reqwest
+/// pool; then one batched `bulk_catchup_push` per peer to close the
+/// eventual-consistency gap the per-row retry can leave. A quorum miss does NOT
+/// abort the other rows (bulk semantics, deliberately weaker than
+/// `create_memory`'s 503 short-circuit) and lands in `warnings[]`, never
+/// `errors[]` — the local commit is durable (ADR-0001).
+async fn bulk_federation_fanout(
+    app: &AppState,
+    committed_mems: &[Memory],
+    ledger: &mut BulkLedger,
+) {
+    let Some(fed) = app.federation.as_ref() else {
+        return;
+    };
+    if committed_mems.is_empty() {
+        return;
+    }
+    let sem = Arc::new(tokio::sync::Semaphore::new(BULK_FANOUT_CONCURRENCY));
+    let mut joins: tokio::task::JoinSet<(String, Result<(), String>)> = tokio::task::JoinSet::new();
+    for mem in committed_mems {
+        let fed = fed.clone();
+        let mem = mem.clone();
+        let sem = sem.clone();
+        joins.spawn(async move {
+            let Ok(_permit) = sem.acquire_owned().await else {
+                return (mem.id.clone(), Err("fanout semaphore closed".to_string()));
+            };
+            let id = mem.id.clone();
+            let outcome = match crate::federation::broadcast_store_quorum(&fed, &mem).await {
+                Ok(tracker) => match crate::federation::finalise_quorum(&tracker) {
+                    Ok(_) => Ok(()),
+                    Err(err) => Err(err.to_string()),
+                },
+                Err(e) => {
+                    tracing::warn!("bulk_create: fanout for {id} failed (local committed): {e:?}");
+                    Ok(())
+                }
+            };
+            (id, outcome)
+        });
+    }
+    while let Some(res) = joins.join_next().await {
+        match res {
+            Ok((id, Err(err))) => ledger.warn(&format!("fanout for {id}: {err}")),
+            Ok((_, Ok(()))) => {}
+            Err(e) => tracing::warn!("bulk_create: fanout task join error: {e:?}"),
+        }
+    }
+
+    // v0.6.2 Patch 2 (S40): terminal catchup batch — one batched `sync_push`
+    // per peer with every committed row closes the eventual-consistency gap the
+    // per-row retry can leave.
+    let catchup_errors = crate::federation::bulk_catchup_push(fed, committed_mems).await;
+    for (peer_id, err) in catchup_errors {
+        ledger.warn(&format!("catchup to peer {peer_id}: {err}"));
+    }
+}
+
+/// #2724 (CB-22) — run every post-commit stage single-create runs, once per
+/// DISTINCT persisted row, for rows that actually committed. Audit → dispatch →
+/// fanout, the same order single-create uses.
+async fn run_bulk_post_commit(app: &AppState, committed_mems: &[Memory], ledger: &mut BulkLedger) {
+    if committed_mems.is_empty() {
+        return;
+    }
+    emit_bulk_store_audit(committed_mems);
+    dispatch_bulk_store_events(app, committed_mems).await;
+    bulk_federation_fanout(app, committed_mems, ledger).await;
+}
+
+// ---------------------------------------------------------------------------
 // The handler.
 // ---------------------------------------------------------------------------
 
@@ -875,59 +1083,13 @@ async fn bulk_create_sqlite(
         }
     }
 
-    // Stage 3 — federation fanout, once per successfully-inserted row, bounded
-    // by `BULK_FANOUT_CONCURRENCY` so 500 rows x 3 peers cannot exhaust the
-    // reqwest connection pool. A quorum miss does NOT abort the other rows
-    // (bulk semantics, deliberately weaker than `create_memory`'s 503
-    // short-circuit) and lands in `warnings[]`, never `errors[]` — the local
-    // commit is durable (ADR-0001).
-    let committed_mems: Vec<Memory> = committed.into_iter().map(|(mem, _)| mem).collect();
-    if let Some(fed) = app.federation.as_ref() {
-        let sem = Arc::new(tokio::sync::Semaphore::new(BULK_FANOUT_CONCURRENCY));
-        let mut joins: tokio::task::JoinSet<(String, Result<(), String>)> =
-            tokio::task::JoinSet::new();
-        for mem in &committed_mems {
-            let fed = fed.clone();
-            let mem = mem.clone();
-            let sem = sem.clone();
-            joins.spawn(async move {
-                let Ok(_permit) = sem.acquire_owned().await else {
-                    return (mem.id.clone(), Err("fanout semaphore closed".to_string()));
-                };
-                let id = mem.id.clone();
-                let outcome = match crate::federation::broadcast_store_quorum(&fed, &mem).await {
-                    Ok(tracker) => match crate::federation::finalise_quorum(&tracker) {
-                        Ok(_) => Ok(()),
-                        Err(err) => Err(err.to_string()),
-                    },
-                    Err(e) => {
-                        tracing::warn!(
-                            "bulk_create: fanout for {id} failed (local committed): {e:?}"
-                        );
-                        Ok(())
-                    }
-                };
-                (id, outcome)
-            });
-        }
-        while let Some(res) = joins.join_next().await {
-            match res {
-                Ok((id, Err(err))) => ledger.warn(&format!("fanout for {id}: {err}")),
-                Ok((_, Ok(()))) => {}
-                Err(e) => tracing::warn!("bulk_create: fanout task join error: {e:?}"),
-            }
-        }
-
-        // v0.6.2 Patch 2 (S40): terminal catchup batch — one batched
-        // `sync_push` per peer with every committed row closes the
-        // eventual-consistency gap the per-row retry can leave.
-        if !committed_mems.is_empty() {
-            let catchup_errors = crate::federation::bulk_catchup_push(fed, &committed_mems).await;
-            for (peer_id, err) in catchup_errors {
-                ledger.warn(&format!("catchup to peer {peer_id}: {err}"));
-            }
-        }
-    }
+    // #2724 (CB-22) — post-commit stages, once per distinct persisted row:
+    // audit emit + subscription dispatch + federation fanout, matching
+    // single-create. The sqlite branch already fanned out; #2724 folds in the
+    // audit + dispatch stages it omitted and shares the fanout with postgres.
+    let committed_mems =
+        distinct_committed_rows(committed.into_iter().map(|(mem, _)| mem).collect());
+    run_bulk_post_commit(app, &committed_mems, &mut ledger).await;
     ledger.into_response()
 }
 
@@ -1080,12 +1242,20 @@ async fn bulk_create_postgres(
     }
 
     let mut outcomes: Vec<(usize, String, String)> = Vec::new();
+    // #2724 (F3) — the memories that durably committed, each carrying the
+    // PERSISTED id `store_batch` returned, so the post-commit stages below
+    // (audit / dispatch / federation fanout) key on the same id every other
+    // consumer keys on. Populated only on the atomic-success arm.
+    let mut committed_mems: Vec<Memory> = Vec::new();
     if !allowed.is_empty() {
         let memories: Vec<Memory> = allowed.iter().map(|r| r.mem.clone()).collect();
         match app.store.store_batch(&ctx, &memories).await {
             Ok(ids) if ids.len() == allowed.len() => {
                 for (row, returned) in allowed.iter().zip(ids.iter()) {
                     outcomes.push((row.index, row.mem.id.clone(), returned.clone()));
+                    let mut mem = row.mem.clone();
+                    mem.id = returned.clone();
+                    committed_mems.push(mem);
                 }
                 // #2594 — stamp the vectors for the rows that actually landed.
                 // The batch is atomic, so this runs only on a committed batch.
@@ -1153,6 +1323,14 @@ async fn bulk_create_postgres(
         }
     }
     classify_persisted(&outcomes, &mut ledger);
+
+    // #2724 (CB-22) — post-commit stages the postgres bulk branch had omitted
+    // ENTIRELY: audit emit + subscription dispatch + federation fanout, once
+    // per distinct persisted row, matching `create_memory_postgres`. Pre-#2724
+    // a postgres daemon with `--quorum-peers` did not replicate bulk rows and a
+    // `memory_store` subscriber saw nothing from a bulk load.
+    let committed_mems = distinct_committed_rows(committed_mems);
+    run_bulk_post_commit(app, &committed_mems, &mut ledger).await;
     ledger.into_response()
 }
 
