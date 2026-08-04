@@ -328,8 +328,31 @@ class InboxMessage(_Base):
 
 
 class BulkCreateResponse(_Base):
-    """Response envelope for ``POST /api/v1/memories/bulk``."""
+    """Response envelope for ``POST /api/v1/memories/bulk``.
 
+    ``created + updated + deduped + rejected + len(pending) == sent`` is the
+    reconciliation identity a bulk loader should assert on every batch
+    (ai-memory#2551).
+
+    ``created`` counts rows the call INSERTED and ``updated`` counts rows it
+    upserted onto an existing ``(title, namespace)``; both are persisted.
+    ``deduped`` counts rows whose content was superseded by a LATER row in the
+    SAME batch — that row is NOT what you sent, and ``deduped_rows`` carries
+    the affected input indices.
+
+    ``warnings`` reports post-commit REPLICATION problems only: those rows are
+    durable locally, which is why they are not in ``errors``.
+
+    The daemon-declared ``ids`` field was removed: the handler has never
+    emitted it, so it was permanently empty and misdescribed the wire.
+    """
+
+    sent: int = 0
     created: int = 0
-    ids: list[str] = Field(default_factory=list)
+    updated: int = 0
+    deduped: int = 0
+    rejected: int = 0
     errors: list[dict[str, Any]] = Field(default_factory=list)
+    deduped_rows: list[dict[str, Any]] = Field(default_factory=list)
+    pending: list[dict[str, Any]] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)

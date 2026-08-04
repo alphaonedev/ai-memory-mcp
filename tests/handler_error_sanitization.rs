@@ -255,10 +255,15 @@ async fn bulk_create_with_invalid_row_returns_sanitized_errors() {
         .body(Body::from(body.to_string()))
         .unwrap();
     let (status, body) = run_request(router, req).await;
+    // #2588 — a bulk call in which NOTHING was persisted is not a success.
+    // Pre-#2588 this asserted 200; a batch whose every row was rejected (here
+    // by validation, at corpus scale by the per-agent write quota) returned
+    // `200 {"created":0,...}` and a fleet loader had no signal to retry or
+    // back off. The status is now the dominant cause's typed status.
     assert_eq!(
         status,
-        StatusCode::OK,
-        "bulk_create returns 200 with partial errors: body={body}"
+        StatusCode::BAD_REQUEST,
+        "bulk_create with zero persisted rows returns the dominant cause: body={body}"
     );
     assert_no_leaks("bulk_create_with_invalid_row", &body);
     // Specifically: the prior shape was `format!("{}: {}", body.title, e)`,
@@ -269,9 +274,11 @@ async fn bulk_create_with_invalid_row_returns_sanitized_errors() {
     let errors = parsed["errors"].as_array().expect("errors[] present");
     assert!(!errors.is_empty(), "expected at least one error row");
     for e in errors {
-        let s = e.as_str().expect("error entries are strings");
-        // The sanitizer collapses every validate / db / fanout error
-        // into one of these five fixed labels.
+        // #2552 — entries are objects `{index, code, field?, error}`. The
+        // `error` value keeps the #851 allowlist verbatim; `index` + `code`
+        // are the NEW axes (the caller could not previously tell WHICH row
+        // failed or WHY, so a 1000-row batch yielded 1000 identical strings).
+        let s = e["error"].as_str().expect("error entries carry `error`");
         assert!(
             matches!(
                 s,
@@ -280,9 +287,18 @@ async fn bulk_create_with_invalid_row_returns_sanitized_errors() {
                     | "not found"
                     | "forbidden"
                     | "replication unavailable"
+                    | "quota exceeded"
                     | "internal error"
             ),
             "bulk_create error entry not in allowlist: {s:?}"
+        );
+        assert!(
+            e["index"].is_number(),
+            "per-row error carries its input index"
+        );
+        assert!(
+            e["code"].is_string(),
+            "per-row error carries a machine code"
         );
     }
 }
