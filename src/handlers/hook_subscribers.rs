@@ -448,24 +448,57 @@ async fn set_namespace_standard_inner(
         // Subsequent writes by a different caller hit the !is_unowned
         // branch and 403.
         // #2541 — same authorize helper as MCP; no silent ownership claim.
-        if let Ok(resolved_mem) = app.store.get(&ctx, &standard_id).await {
-            let caller_principal = ctx.effective_principal();
-            if let Err(msg) =
-                crate::mcp::authorize_namespace_standard_bind(caller_principal, &resolved_mem)
-            {
-                tracing::warn!(
-                    target: super::AUTHZ_TRACE_TARGET,
-                    "POST /namespaces/{{ns}}/standard 403 (postgres path): {msg} (ns={ns}, id={standard_id})"
-                );
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({
-                        "error": msg,
-                        "caller": caller_principal
-                    })),
-                )
-                    .into_response();
+        //
+        // #2709 SECURITY-high (CB-4 / CWE-284, 2026-08-04) — the ownership
+        // probe MUST NOT fold a #910 visibility denial into "skip authz".
+        // `PostgresStore::get` under the tenant-scoped request `ctx`
+        // (`bypass_visibility=false`) returns `Err(NotFound)` for BOTH a
+        // genuinely-absent row AND a foreign-owned `scope=private` row the
+        // caller cannot see. The pre-fix `if let Ok(resolved_mem)` arm
+        // therefore SKIPPED the ownership check whenever `body.id` named
+        // another agent's non-shared memory — so `POST /namespaces/{ns}/
+        // standard {"id": <alice's private id>}` with `X-Agent-Id: bob`
+        // bound Alice's private memory as the namespace governance standard
+        // (a silent authz bypass; the sqlite twin at the `db::get` branch
+        // below never had this hole because storage-level `db::get` does
+        // NOT fold visibility). Fetch the row for the ownership check under
+        // a bypass-visibility probe ctx (the same `AI_HTTP_INTERNAL`
+        // admin-bind principal the get-standard binding probe uses, and the
+        // #2447 fold-avoiding precedent) so a hidden foreign row is
+        // RESOLVED and `authorize_namespace_standard_bind` runs the real
+        // ownership check against the REQUEST principal
+        // (`ctx.effective_principal()`), never the probe principal. The row
+        // is used ONLY for the ownership gate — it is never returned to the
+        // caller, so this does NOT weaken the #2537/#2707 read-path
+        // withholding. A `NotFound` from the probe means the row genuinely
+        // does not exist → skip authz + proceed, exactly as the sqlite
+        // `Ok(None)` branch does (first-write / non-existent id).
+        let ownership_probe_ctx =
+            crate::store::CallerContext::for_admin(sentinels::AI_HTTP_INTERNAL);
+        let caller_principal = ctx.effective_principal();
+        match app.store.get(&ownership_probe_ctx, &standard_id).await {
+            Ok(resolved_mem) => {
+                if let Err(msg) =
+                    crate::mcp::authorize_namespace_standard_bind(caller_principal, &resolved_mem)
+                {
+                    tracing::warn!(
+                        target: super::AUTHZ_TRACE_TARGET,
+                        "POST /namespaces/{{ns}}/standard 403 (postgres path): {msg} (ns={ns}, id={standard_id})"
+                    );
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "error": msg,
+                            "caller": caller_principal
+                        })),
+                    )
+                        .into_response();
+                }
             }
+            // Genuinely-absent id — parity with the sqlite `Ok(None)` arm
+            // (skip authz; first-write / non-existent id proceeds).
+            Err(crate::store::StoreError::NotFound { .. }) => {}
+            Err(e) => return store_err_to_response(e),
         }
 
         // v0.7.0 Wave-3 Continuation 5 (Bucket C / S35+S53+S60+S80) —
