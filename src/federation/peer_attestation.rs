@@ -72,8 +72,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Env var carrying the operator's per-peer attestation allowlist
-/// (JSON). Absent / parse-error = empty allowlist (default-deny on
-/// `/sync/since` unless [`SYNC_TRUST_PEER_ENV`] is set).
+/// (JSON). **Absent / empty** = genuine zero-config (faith-based
+/// replication; [`PeerAttestationConfig::has_allowlist`] is false).
+/// **Present but unparseable** = configured-broken posture (#2504):
+/// `has_allowlist` is true with an empty peer map so destructive
+/// inbound lanes fail closed rather than degrading to "trust everyone".
 pub const PEER_ATTESTATION_ENV: &str = "AI_MEMORY_FED_PEER_ATTESTATION";
 
 /// Env var that, when set to `"1"`, disables the #238 attestation
@@ -107,6 +110,7 @@ pub const PEER_ID_HEADER: &str = "x-peer-id";
 /// in the codebase: `*` matches a single segment, `**` matches any
 /// suffix. Empty = peer may not pull any namespace (default-deny).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerScope {
     /// Exact `body.sender_agent_id` values this peer may claim on
     /// `/sync/push`. Empty = only the peer-id itself.
@@ -134,12 +138,22 @@ pub struct PeerScope {
 /// }
 /// ```
 ///
-/// The empty map (`{}` or no env var at all) is a valid state. It
-/// triggers the default-deny posture on `/sync/since` and the
-/// "header must equal body" posture on `/sync/push`.
+/// ## Zero-config vs present-but-broken (#2504)
+///
+/// - **Env unset / empty string** — genuine zero-config: `has_allowlist()` is
+///   false; inbound write/delete lanes keep faith-based replication (#2491).
+/// - **Env set to valid JSON (including `{}`)** — configured posture:
+///   `has_allowlist()` is true. An empty peer map means no peer is enrolled
+///   (fail closed for namespace + TOFU), **not** zero-config.
+/// - **Env set but unparseable** — same as configured-with-empty-map for the
+///   gate switch, so a typo cannot disable the federated-delete namespace
+///   gate by falling through to zero-config (#2504).
 #[derive(Clone, Debug, Default)]
 pub struct PeerAttestationConfig {
     pub peers: HashMap<String, PeerScope>,
+    /// #2504 — true when `AI_MEMORY_FED_PEER_ATTESTATION` was present
+    /// (non-empty). Distinguishes Unset from `{}` / parse-error.
+    env_present: bool,
 }
 
 /// Reason a body-claimed `sender_agent_id` failed attestation against
@@ -171,27 +185,52 @@ impl AttestError {
 }
 
 impl PeerAttestationConfig {
+    /// Construct a configured allowlist (tests + programmatic loaders).
+    /// Marks the config as **present** so `has_allowlist()` is true even
+    /// when `peers` is empty (`{}` posture).
+    #[must_use]
+    pub fn from_peers(peers: HashMap<String, PeerScope>) -> Self {
+        Self {
+            peers,
+            env_present: true,
+        }
+    }
+
     /// Load the allowlist from the [`PEER_ATTESTATION_ENV`] env var.
-    /// Missing env var = empty config (default-deny). Parse error =
-    /// empty config + a `tracing::warn!` so the operator sees the
-    /// typo immediately. Refusing to start on a malformed allowlist
-    /// would be a self-DOS hazard during config rollouts.
+    ///
+    /// - **Missing / empty env** → zero-config (`has_allowlist() == false`).
+    /// - **Valid JSON** (including `{}`) → configured posture (`has_allowlist()
+    ///   == true`); empty peer map fails closed for enrollment.
+    /// - **Parse error / unknown fields** → configured-broken (#2504): peers
+    ///   empty but `has_allowlist() == true` so destructive lanes do **not**
+    ///   degrade to faith-based replication. WARN states the real per-lane
+    ///   consequence (delete is NOT default-deny under the old fallback).
     #[must_use]
     pub fn from_env() -> Self {
         match std::env::var(PEER_ATTESTATION_ENV) {
             Ok(s) if !s.trim().is_empty() => {
                 match serde_json::from_str::<HashMap<String, PeerScope>>(&s) {
-                    Ok(peers) => Self { peers },
+                    Ok(peers) => Self {
+                        peers,
+                        env_present: true,
+                    },
                     Err(e) => {
                         tracing::warn!(
                             target: "federation::peer_attestation",
                             env = PEER_ATTESTATION_ENV,
                             error = %e,
                             "failed to parse peer-attestation env var as JSON — \
-                             falling back to empty allowlist (default-deny on \
-                             /sync/since, header-must-equal-body on /sync/push)"
+                             treating as CONFIGURED-BROKEN (#2504): confinement \
+                             gates stay ON with an empty peer map (unenrolled \
+                             peers refused; federated DELETE is NOT wide-open). \
+                             Fix the JSON (or remove the env var for genuine \
+                             zero-config faith replication). deny_unknown_fields \
+                             is enabled on PeerScope — typo'd keys fail here too."
                         );
-                        Self::default()
+                        Self {
+                            peers: HashMap::new(),
+                            env_present: true,
+                        }
                     }
                 }
             }
@@ -206,14 +245,24 @@ impl PeerAttestationConfig {
         self.peers.get(peer_id)
     }
 
-    /// v0.7.0 #1056 — whether the operator has enrolled at least
-    /// one peer in the allowlist. Used by the federation handlers
-    /// to distinguish the zero-config posture (no allowlist set =
-    /// trust signed peer-ids on faith) from the configured posture
-    /// (allowlist set = refuse any peer-id not in the map).
+    /// Whether the operator has an **active** peer-attestation config.
+    ///
+    /// - **false** only for genuine zero-config (env unset/empty AND no
+    ///   programmatic peers) — handlers use faith-based replication.
+    /// - **true** when the env var was present (even if JSON was `{}` or
+    ///   unparseable — #2504) OR when peers were supplied programmatically.
+    ///
+    /// #1056 TOFU and #2447/#2488 namespace confinement both key off this
+    /// switch; #2504 ensures a typo cannot flip it to false.
     #[must_use]
     pub fn has_allowlist(&self) -> bool {
-        !self.peers.is_empty()
+        self.env_present || !self.peers.is_empty()
+    }
+
+    /// #2504 — env was present but peers are empty (parse error or `{}`).
+    #[must_use]
+    pub fn is_configured_empty(&self) -> bool {
+        self.env_present && self.peers.is_empty()
     }
 }
 
@@ -380,7 +429,7 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), v.clone()))
             .collect();
-        PeerAttestationConfig { peers }
+        PeerAttestationConfig::from_peers(peers)
     }
 
     // ---- attest_sender ---------------------------------------------------
@@ -616,11 +665,56 @@ mod tests {
     }
 
     #[test]
-    fn from_env_parse_error_is_empty() {
+    fn from_env_parse_error_is_empty_but_has_allowlist_2504() {
         let _g = lock_env();
         unsafe { std::env::set_var(PEER_ATTESTATION_ENV, "not json{{") };
         let cfg = PeerAttestationConfig::from_env();
         unsafe { std::env::remove_var(PEER_ATTESTATION_ENV) };
+        assert!(cfg.peers.is_empty(), "parse error yields no peer rows");
+        assert!(
+            cfg.has_allowlist(),
+            "#2504: parse error MUST NOT degrade to zero-config has_allowlist=false"
+        );
+        assert!(cfg.is_configured_empty());
+    }
+
+    #[test]
+    fn from_env_empty_object_is_configured_not_zero_config_2504() {
+        let _g = lock_env();
+        unsafe { std::env::set_var(PEER_ATTESTATION_ENV, "{}") };
+        let cfg = PeerAttestationConfig::from_env();
+        unsafe { std::env::remove_var(PEER_ATTESTATION_ENV) };
         assert!(cfg.peers.is_empty());
+        assert!(
+            cfg.has_allowlist(),
+            "#2504 X9d: `{{}}` is present config — fail closed, not faith replication"
+        );
+    }
+
+    #[test]
+    fn from_env_typo_scope_key_is_parse_error_2504() {
+        // X9e — misspelled `allowed_namespace` (singular) used to serde-default
+        // into enrolled-unscoped with no warning. deny_unknown_fields refuses it.
+        let _g = lock_env();
+        let body = r#"{"peer-1": {"allowed_namespace": ["public/*"]}}"#;
+        unsafe { std::env::set_var(PEER_ATTESTATION_ENV, body) };
+        let cfg = PeerAttestationConfig::from_env();
+        unsafe { std::env::remove_var(PEER_ATTESTATION_ENV) };
+        assert!(
+            cfg.peers.is_empty() && cfg.has_allowlist(),
+            "#2504 X9e: typo'd PeerScope key must fail closed, not silent unscoped enroll"
+        );
+    }
+
+    #[test]
+    fn parse_error_does_not_namespace_allow_any_peer_2504() {
+        let _g = lock_env();
+        unsafe { std::env::set_var(PEER_ATTESTATION_ENV, "{not-json") };
+        let cfg = PeerAttestationConfig::from_env();
+        unsafe { std::env::remove_var(PEER_ATTESTATION_ENV) };
+        assert!(
+            !namespace_allowed(Some("stranger"), "secure/ops", &cfg),
+            "#2504: under parse-error posture no peer may pull/delete out-of-map"
+        );
     }
 }
