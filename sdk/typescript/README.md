@@ -58,7 +58,9 @@ const m = await memory.store(
   { signingKey: key },
 );
 
-// Recall — fuzzy, scored, mutates access_count + TTL
+// Recall — fuzzy, scored, and PURE: it writes nothing to `memories` (#1953).
+// The access ladders (access_count, TTL extension, tier promotion) are applied
+// out of band by the daemon's fold job from the append-only recall ledger.
 const hits = await memory.recall({
   context: "how do I refresh a dns zone",
   namespace: "ops/dns",
@@ -97,13 +99,31 @@ you override `agentId`, pass an `AbortSignal`, or add custom headers.
 | `registerAgent(body, opts?)` | `POST /api/v1/agents` | Register an NHI. |
 | `metrics(opts?)` | `GET /api/v1/metrics` | Prometheus text-format. |
 | `subscribe(body, opts?)` | `POST /api/v1/subscriptions` | Register a webhook. |
-| `unsubscribe(id, opts?)` | `DELETE /api/v1/subscriptions/:id` | Remove a webhook. |
+| `unsubscribe(id, opts?)` | `DELETE /api/v1/subscriptions?id=<id>` | Remove a webhook. The id rides the QUERY STRING — the daemon registers `delete` on the collection path only. |
 | `listSubscriptions(opts?)` | `GET /api/v1/subscriptions` | List current webhooks. |
-| `grant(memoryId, body, opts?)` | `POST /api/v1/memories/:id/grant` | Grant access. |
-| `revoke(memoryId, body, opts?)` | `POST /api/v1/memories/:id/revoke` | Revoke access. |
 | `notify(body, opts?)` | `POST /api/v1/notify` | Send inbox message. |
 | `inbox(query?, opts?)` | `GET /api/v1/inbox` | Read inbox. |
-| `cluster(body, opts?)` | `POST /api/v1/cluster` | Peer management. |
+
+### Removed at v1.0.0 — BREAKING
+
+`grant()`, `revoke()` and `cluster()` are gone. They posted to
+`/api/v1/memories/:id/grant`, `/api/v1/memories/:id/revoke` and
+`/api/v1/cluster`, none of which the daemon registers — every call 404'd, in
+every release that shipped them. Replacements:
+
+- **Per-memory access control** — set `metadata.scope` (`"private"` |
+  `"collective"`) on the write, and attach a namespace governance standard for
+  policy. See `docs/governance.md`.
+- **Peer management** — federation peers are configured out of band
+  (`--quorum-peers`, the peer-attestation allowlist,
+  `AI_MEMORY_FED_INVENTORY_PATH`). The HTTP federation surface is
+  `POST /api/v1/sync/push` and `GET /api/v1/sync/since`. See
+  `docs/federation.md`.
+
+`unsubscribe(id)` now issues `DELETE /api/v1/subscriptions?id=<id>` instead of
+`DELETE /api/v1/subscriptions/:id`. The old form matched no route, so webhook
+teardown appeared to fail safe while leaving the decommissioned endpoint
+receiving signed deliveries indefinitely. The method signature is unchanged.
 
 ### Examples
 
@@ -247,8 +267,13 @@ app.post(
 
 #### `.unsubscribe()`
 
+Issues `DELETE /api/v1/subscriptions?id=<id>`. Check the returned flag —
+teardown is not silent-safe, so treat a falsy `deleted` as "the endpoint is
+still receiving signed deliveries".
+
 ```ts
-await memory.unsubscribe(sub.id);
+const { deleted } = await memory.unsubscribe(sub.id);
+if (!deleted) throw new Error(`subscription ${sub.id} was not removed`);
 ```
 
 #### `.notify()` / `.inbox()`
@@ -262,19 +287,6 @@ await memory.notify({
 });
 
 const { messages, unread } = await memory.inbox({ unread: true, limit: 20 });
-```
-
-#### `.grant()` / `.revoke()`
-
-```ts
-await memory.grant("b4e3…", { agent_id: "alice", permission: "read" });
-await memory.revoke("b4e3…", { agent_id: "alice" });
-```
-
-#### `.cluster()`
-
-```ts
-const { peers } = await memory.cluster({ action: "list" });
 ```
 
 #### `.agents()` / `.registerAgent()`

@@ -61,7 +61,8 @@ use super::FederationConfig;
 use super::sync::{AckOutcome, post_once};
 
 /// Tracing target for the push-DLQ enqueue + replay surface (this
-/// module plus the enqueue branch in `sync::broadcast_store_quorum`).
+/// module plus the enqueue branches in `sync::broadcast_store_quorum`
+/// (#933) and `sync::broadcast_delete_quorum` (#2498)).
 /// #1558 tracing-target SSOT.
 pub(crate) const PUSH_DLQ_TRACE_TARGET: &str = "ai_memory::federation::push_dlq";
 
@@ -437,10 +438,23 @@ fn classify_quarantine_cause(last_error: &str) -> &'static str {
         // the federated-delete scope gate failed closed. Distinct from a scope
         // refusal: the peer's config is fine and the row is un-erasable until
         // the read succeeds. Operator-actionable at the RECEIVER's storage, not
-        // at the sender's allowlist. Dormant until the delete lane gains a DLQ
-        // enqueue (#2498); classified here so the closed label set is already
-        // correct when it does, and so the token has exactly one meaning across
-        // the substrate.
+        // at the sender's allowlist.
+        //
+        // STILL DORMANT after #2498. The delete lane now DOES enqueue, so the
+        // refused deletion reaches the DLQ and is retried — but this specific
+        // LABEL remains unreachable, and #2498 did not change that. The
+        // receiver emits the `namespace_probe_unresolvable` token ONLY as a
+        // `tracing` field (`src/handlers/federation_receive.rs:892,2168,2494,
+        // 2600`; `src/handlers/federation_signing_check.rs:671`) and never in
+        // the HTTP 200 response body — the body carries only the `skipped`
+        // counter — so the sender's `last_error` is #2341's
+        // `success_report_non_ack_reason` text ("peer 2xx but N item(s)
+        // skipped …") and can never contain the token. The remaining
+        // precondition is a RECEIVER-side wire change that echoes the cause in
+        // the 200 body (a wire-shape change needing its own vote, #2498 §3 of
+        // the issue). Classified here so the closed label set is already
+        // correct when that lands, and so the token has exactly one meaning
+        // across the substrate.
         CAUSE_NAMESPACE_PROBE_UNRESOLVABLE
     } else if last_error.contains("401") || last_error.contains("403") {
         // The replay last_error is the `http {status}` shape, so 401/403
