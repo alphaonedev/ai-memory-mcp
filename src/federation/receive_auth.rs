@@ -833,6 +833,30 @@ pub const LANE_NAMESPACE_META: &str = "namespace_meta";
 /// [`lane_is_destructive`] must give it the destructive refusal prose.
 pub const LANE_NAMESPACE_META_CLEARS: &str = "namespace_meta_clears";
 
+/// Gate 1 — `/sync/push` `memories[]` subcollection.
+pub const LANE_MEMORIES: &str = "memories";
+
+/// Gate 1 — embeddings ride memories; no standalone apply.
+pub const LANE_EMBEDDINGS: &str = "embeddings";
+
+/// Gate 1 / #2489 — `/sync/push` `links[]` subcollection (endpoint-namespace confined).
+pub const LANE_LINKS: &str = "links";
+
+/// Gate 1 / #2489 — `/sync/push` `signals[]` subcollection (claimed-namespace confined).
+pub const LANE_SIGNALS: &str = "signals";
+
+/// Gate 1 / #2649 — `/sync/push` `action_transitions[]` (crypto + namespace).
+pub const LANE_ACTION_TRANSITIONS: &str = "action_transitions";
+
+/// Gate 1 / #2650 — `/sync/push` `checkpoints[]` (crypto + namespace).
+pub const LANE_CHECKPOINTS: &str = "checkpoints";
+
+/// Gate 1 — `/sync/push` `archives[]`.
+pub const LANE_ARCHIVES: &str = "archives";
+
+/// Gate 1 — `/sync/push` `restores[]`.
+pub const LANE_RESTORES: &str = "restores";
+
 /// Whether `lane` names a funnel whose refusal prose must describe a
 /// DESTRUCTIVE effect rather than a write.
 ///
@@ -1641,6 +1665,75 @@ mod tests {
                 false,
             ),
             "Layer 2 OFF: the staged-rollout opt-out restores the legacy posture"
+        );
+    }
+
+    /// #2649 / #2650 — crypto lanes must share the same Layer-1 namespace choke
+    /// as memories (authentication is not authorization). Pins the lane tokens
+    /// the receive loop passes so a rename cannot silently drop confinement.
+    #[test]
+    fn inbound_write_namespace_refuses_crypto_lanes_out_of_scope_2649_2650() {
+        use crate::federation::peer_attestation::{PeerAttestationConfig, PeerScope};
+
+        let mut scoped = PeerAttestationConfig::default();
+        scoped.peers.insert(
+            "peer-1".to_string(),
+            PeerScope {
+                allowed_sender_agent_ids: vec![],
+                allowed_namespaces: vec!["public/*".to_string()],
+            },
+        );
+
+        // #2649 — action_transitions subject is the **stored** action namespace.
+        assert!(
+            inbound_write_namespace_authorized(
+                LANE_ACTION_TRANSITIONS,
+                "act-1",
+                "public/ok",
+                Some("public/ok"),
+                &scoped,
+                Some("peer-1"),
+                true,
+            ),
+            "in-scope stored action namespace accepted"
+        );
+        assert!(
+            !inbound_write_namespace_authorized(
+                LANE_ACTION_TRANSITIONS,
+                "act-1",
+                "secure/ops",
+                Some("secure/ops"),
+                &scoped,
+                Some("peer-1"),
+                true,
+            ),
+            "#2649: out-of-scope stored action namespace refused"
+        );
+
+        // #2650 — checkpoints subject is the wire-claimed freeze-anchor ns.
+        assert!(
+            inbound_write_namespace_authorized(
+                LANE_CHECKPOINTS,
+                "cp-1",
+                "public/ok",
+                None,
+                &scoped,
+                Some("peer-1"),
+                true,
+            ),
+            "in-scope checkpoint namespace accepted"
+        );
+        assert!(
+            !inbound_write_namespace_authorized(
+                LANE_CHECKPOINTS,
+                "cp-1",
+                "secure/ops",
+                None,
+                &scoped,
+                Some("peer-1"),
+                true,
+            ),
+            "#2650: out-of-scope checkpoint namespace refused"
         );
     }
 

@@ -238,7 +238,12 @@ async fn pg_bulk_create_partial_fills_at_quota_1795() {
         .send()
         .await
         .expect("bulk POST");
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    // #2588 — a PARTIAL fill is 207, never 200 (this pin asserted 200 before,
+    // which is the #2444/#2490 false-success shape). This is ALSO the live
+    // cross-backend proof: the sqlite branch loops `db::insert` while this one
+    // batches through `store_batch`, and both now report the same status and
+    // the same counters for the same request.
+    assert_eq!(resp.status(), reqwest::StatusCode::MULTI_STATUS);
     let v: Value = resp.json().await.expect("bulk body");
     assert_eq!(
         v["created"], 3,
@@ -249,6 +254,17 @@ async fn pg_bulk_create_partial_fills_at_quota_1795() {
         Some(5),
         "#1795: the 5 over-cap rows are rejected into errors[]: {v}"
     );
+    // #2551 — the reconciliation identity holds on the postgres branch too.
+    assert_eq!(v["sent"], 8, "{v}");
+    assert_eq!(v["updated"], 0, "#2551: all three were fresh inserts: {v}");
+    assert_eq!(v["deduped"], 0, "#2551: no in-batch collapse here: {v}");
+    assert_eq!(v["rejected"], 5, "{v}");
+    // #2552 / #2588 — the quota rejections are indexed and typed rather than
+    // five copies of the opaque "internal error" that hid 31,000 lost rows.
+    for e in v["errors"].as_array().expect("errors[]") {
+        assert_eq!(e["code"], "QUOTA_EXCEEDED", "{v}");
+        assert!(e["index"].is_number(), "{v}");
+    }
 
     shutdown.notify_one();
     let _ = handle.await;

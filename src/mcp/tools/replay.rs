@@ -363,7 +363,12 @@ mod tests {
             updated_at: now,
             last_accessed_at: None,
             expires_at: None,
-            metadata: json!({"agent_id": "ai:test", "scope": "public"}),
+            // #2633 — was `scope: "public"`, a token that is NOT a
+            // `MemoryScope`. It only survived the visibility gate because the
+            // pre-#2633 read path treated ANY unrecognised token as
+            // world-readable. `collective` is the real world-readable scope
+            // and is what this fixture always meant.
+            metadata: json!({"agent_id": "ai:test", "scope": "collective"}),
             reflection_depth: 0,
             memory_kind: MemoryKind::Observation,
             entity_id: None,

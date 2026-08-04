@@ -282,7 +282,7 @@ This is the floor every plan below builds on. Numbers are sourced from the publi
 | Metric | Result | Source |
 |---|---|---|
 | Library tests passing (v0.7.0) | 6,961+ | release notes |
-| Line coverage gate (current, corrects a stale ≥93%/`--fail-under-lines 92`/"locked at 93.84%" claim per [#1970](https://github.com/alphaonedev/ai-memory-mcp/issues/1970)) | **Not a single flat percentage.** Two independent CI jobs enforce it: (1) `ci.yml`'s "Code Coverage" job — an absolute floor `MIN_COVERAGE_PCT=90` on TOTAL line coverage (`--features sal` build), plus a ratchet requiring `>= .coverage-baseline − 0.5%` slack (`.coverage-baseline` currently `92.59`, bumped forward-only as coverage rises, never lowered); (2) `coverage.yml`'s "Per-Module Coverage Thresholds" job — a **uniform 90% per-module floor** (`coverage/thresholds.toml`, operator standard 2026-06-11: "every module must reach 90%; a module may sit below 90 ONLY when structurally impossible to cover, proven in `coverage/policy.md`") plus its own `min_line_coverage = 90.0` workspace-global floor (`--features sal,sal-postgres`, live-PG+AGE+pgvector). A documented set of per-module floors sits below 90% as recorded structural exceptions (e.g. `handlers/power.rs` 53%, `handlers/governance.rs` 57%, `store/postgres.rs` 79%) — these are NOT gate weakenings; thresholds rise across releases and never fall without explicit operator approval (`coverage/check-thresholds.sh`). | `coverage/check-thresholds.sh`, `coverage/thresholds.toml`, `.coverage-baseline`, `.github/workflows/ci.yml`, `.github/workflows/coverage.yml` |
+| Line coverage gate (current; corrects BOTH a stale ≥93%/`--fail-under-lines 92`/"locked at 93.84%" claim per [#1970](https://github.com/alphaonedev/ai-memory-mcp/issues/1970) **and** this row's own "two independent CI jobs + `.coverage-baseline` ratchet" claim, corrected 2026-08-01) | **ONE CI job, one global floor, per-module floors, NO ratchet.** The sole live control is `coverage.yml`'s **"Per-Module Coverage Thresholds"** job, which since #1993 owns coverage end-to-end and enforces two things via `coverage/check-thresholds.sh` over a `--features sal,sal-postgres` (live-PG+AGE+pgvector) sweep: (1) the workspace-global absolute floor **`min_line_coverage = 90.0`** (`coverage/thresholds.toml`), and (2) every per-module floor in that file's `[modules]` table (operator standard 2026-06-11: "every module must reach 90%; a module may sit below 90 ONLY when structurally impossible to cover, proven in `coverage/policy.md`"). Documented per-module floors below 90% are recorded structural exceptions (e.g. `handlers/power.rs` 53%, `handlers/governance.rs` 57%, `store/postgres.rs` 79%), not gate weakenings; thresholds rise across releases and never fall without explicit operator approval. **What does NOT exist:** `ci.yml`'s "Code Coverage" job was **REMOVED** (`.github/workflows/ci.yml`, NOTE #1993 — it duplicated this gate and died mid-report under disk/wall pressure), and with it went its `MIN_COVERAGE_PCT=90` floor **and the `.coverage-baseline` ratchet with 0.5% slack**. Nothing in any workflow or script reads `.coverage-baseline` today — `rg 'coverage-baseline'` hits prose only. The file survives on disk carrying `92.59`; **it is dead config**, and the practical consequence is that the live floor is 90.0, i.e. roughly **2.6pp of coverage regression is undetectable** relative to the ratchet this row used to advertise. Re-wiring a ratchet into `check-thresholds.sh` or deleting the dead file is an open decision. | `coverage/check-thresholds.sh`, `coverage/thresholds.toml`, `.github/workflows/coverage.yml` |
 | Region coverage | 93.11% (v0.6.3 baseline; trending up) | evidence.html |
 | Function coverage | 92.55% (v0.6.3 baseline; trending up) | evidence.html |
 | Platform CI matrix | ubuntu-latest, macos-latest, windows-latest, iOS sim, Android emulator | evidence.html, mobile-runtime.yml |
@@ -331,27 +331,95 @@ This is the floor every plan below builds on. Numbers are sourced from the publi
 
 ICLR 2025 benchmark, pure SQLite FTS5+BM25. Keyword tier is fully local / zero cloud. Reranker-on / reranker-off / curator-on variants disclosed at v0.6.3.1. §11.4.A Gemma-4 refresh DISCHARGED by the #1975 ruling (2×5 vote wf_8ac90aca, 2026-07-10): historical gemma3:4b 97.8% headline retired; the measured OpenRouter Gemma-4 leg (2026-05-31) promoted as the expansion anchor; no local-Ollama Gemma-4 number exists (CPU-only reference host, #1983); local GPU re-run reopenable post-v1.0.
 
-### 9.6 Performance budgets (Apple M2, 16 GB, SQLite reference)
+### 9.6 Performance budgets (Apple M4, 32 GB, NVMe SSD — SQLite reference)
 
-| Operation | Tier | p95 budget |
+> **Reference machine (corrected 2026-08-01).** This section previously
+> headed the budget table with "Apple M2, 16 GB". The latency-budget family
+> is calibrated on **Apple M4 / 32 GB / NVMe SSD** — the machine
+> `PERFORMANCE.md §Hardware Baseline` has named since the budgets were first
+> published (commit `3ba1b8b0`, #383) and that `CHANGELOG.md` records for the
+> same change. The M2 / 16 GB machine (Apple Mac mini 2023, macOS 14.5) is
+> real and fully documented, but it is the **LongMemEval retrieval-quality**
+> reference (`benchmarks/longmemeval/methodology.md §1`), a different
+> measurement family. One machine per family; do not mix them.
+
+#### Budgets that are actually pinned and exercised
+
+These are the budgets `ai-memory bench` measures against, single-sourced in
+`src/bench.rs::Operation::target_p95_ms` and mechanically pinned to
+`PERFORMANCE.md` by `operation_targets_match_performance_md`. Every row here
+has a real `Operation` variant behind it.
+
+| Operation (`src/bench.rs`) | p95 budget (default workload) | p95 budget at `--scale 10000` |
 |---|---|---|
-| memory_store | keyword | ≤ 5 ms |
-| memory_store | semantic | ≤ 25 ms (MiniLM 384d) |
-| memory_store | autonomous | ≤ 60 ms (nomic 768d) |
-| memory_get | any | ≤ 2 ms |
-| memory_search | keyword | ≤ 8 ms |
-| memory_recall | semantic | ≤ 35 ms (FTS5 70% / HNSW 30%) |
-| memory_recall | autonomous | ≤ 90 ms (cross-encoder 100→10) |
-| memory_link | any | ≤ 4 ms |
-| memory_promote | any | ≤ 8 ms |
-| memory_consolidate | smart | ≤ 1500 ms (LLM-bound) |
-| memory_kg_query | any | ≤ 50 ms (depth 3, <1k edges) |
-| memory_get_taxonomy | any | ≤ 30 ms (depth 8) |
-| memory_archive_purge | any | ≤ 200 ms / 1000 rows |
-| sync_push | any | ≤ 15 ms (TLS 1.3) |
-| bulk_create | any | ≤ 2000 ms (100 rows + fanout) |
+| `memory_store` (no embedding) | ≤ 20 ms | ≤ 120 ms |
+| `memory_search` (FTS5) | ≤ 100 ms | ≤ 60 ms |
+| `memory_recall` (hot, depth=1) | ≤ 50 ms | ≤ 80 ms |
+| `memory_recall` (rerank stage, depth=1) | ≤ 60 ms | ≤ 100 ms |
+| `memory_kg_query` (depth=1) | ≤ 100 ms | unchanged (fixture is scale-independent) |
+| `memory_kg_query` (depth=3) | ≤ 100 ms | unchanged |
+| `memory_kg_query` (depth=5) | ≤ 250 ms | unchanged |
+| `memory_kg_timeline` | ≤ 100 ms | unchanged |
 
-CI guard (corrected 2026-07-11 per #1938 ruling wf_26d176ac): the Bench workflow gates every PR/push against the ABSOLUTE p95 budgets above (>10% over budget fails) plus the 10k-scale corpus gate; the baseline-COMPARE guard (`ai-memory bench --baseline <prior-run.json> --regression-threshold <pct>`, non-zero exit on regression) is a fully-shipped OPERATOR CLI tool, not yet a CI job — no committed `performance/baseline.json` exists; CI wiring (runner-class-pinned baseline + advisory soak) is carried by [#1987](https://github.com/alphaonedev/ai-memory-mcp/issues/1987). **These budgets are the latency contract of being at the endpoint (§2.1) — they are not arbitrary engineering targets.**
+Under `--verified` two more operations append, at the plain budget plus a
+fixed, corpus-scale-invariant crypto headroom: `memory_store`
+(verified/attested) = store + `VERIFIED_SIGN_HEADROOM_MS` (10 ms), and
+`memory_recall` (verified/attested) = recall + `VERIFIED_VERIFY_HEADROOM_MS`
+(20 ms). `MAX_SCALE = 1_000_000`; beyond the largest pinned `SCALE_BUDGETS`
+row (10k) the resolver reuses that row best-effort and `PERFORMANCE.md`
+deliberately declines to pin invented 1M budgets.
+
+#### Unmeasured design targets — no bench producer, gated by nothing
+
+The operations below have **no `Operation` variant** in `src/bench.rs`, so no
+harness measures them and nothing — CI or otherwise — checks them. They are
+recorded as design intent only. Do not cite them as measured or as enforced.
+
+`memory_store` (semantic / autonomous tiers) · `memory_get` ·
+`memory_recall` (semantic hybrid, and the neural cross-encoder autonomous
+path — the bench's rerank row uses a **lexical stand-in**, not the neural
+model) · `memory_link` · `memory_promote` · `memory_consolidate` ·
+`memory_get_taxonomy` · `memory_archive_purge` · `sync_push` ·
+`bulk_create`. The advisory-target subset that is still published with
+numbers lives in `PERFORMANCE.md`'s budget table, explicitly marked
+`*[advisory]*`; the per-tier variants that duplicated it are dropped here
+rather than restated, because a number no harness produces is not data.
+
+#### What CI actually does (corrected 2026-08-01)
+
+- The **Bench workflow is ADVISORY.** `.github/workflows/bench.yml:18` says
+  so verbatim — "Bench is advisory (not in required-status-checks)" — and
+  the workflow contributes **zero** entries to
+  `scripts/qc-allowlists/required-contexts-release.txt`. Its bench step and
+  its 10k-scale step both exit non-zero on a >10% budget breach and redden
+  the run, but a red Bench run **does not block a merge**. Both triggers
+  also carry `paths-ignore: ['docs/**', '**/*.md']`, so a docs-only PR never
+  runs it at all. (This corrects the prior "the Bench workflow gates every
+  PR/push" wording, which the workflow's own header contradicted.)
+- The **baseline-COMPARE guard IS a CI step, and `performance/baseline.json`
+  DOES exist.** The prior text — "not yet a CI job — no committed
+  `performance/baseline.json` exists" — was false in both halves. The step
+  is `bench.yml`'s "Baseline regression (advisory, #1987)"; it prints
+  "ADVISORY — never fails the build" and swallows the CLI's regression exit
+  code. The committed `performance/baseline.json` carries `"bootstrap":
+  true` (a dev-machine capture, 10 rows), and the step **self-skips the
+  comparison entirely** while that flag is set, because a
+  dev-vs-`ubuntu-latest` compare is pure hardware noise. Activating it
+  requires running the `regenerate-baseline` `workflow_dispatch` job on
+  `ubuntu-latest` (median-of-3) and committing the result with
+  `bootstrap: false`. Promotion to blocking is gated on a soak proving a
+  <1% false-positive rate over ≥20 runs (ruling `d6a366ea`); tracked by
+  [#1987](https://github.com/alphaonedev/ai-memory-mcp/issues/1987).
+- **macOS runs are held to a 3× looser bar.** `MACOS_BUDGET_MULT = 3.0`
+  (`src/bench.rs`) multiplies the budget before the 10% tolerance is
+  applied, so a macOS pass bar is 3.3× the published number (recall PASSes
+  at 165 ms against a published <50 ms). The advisory CI run is on
+  `ubuntu-latest`, where the multiplier is 1.0. Full disclosure in
+  `PERFORMANCE.md §Hardware Baseline`.
+
+**The pinned budgets above are the latency contract of being at the endpoint
+(§2.1) — they are not arbitrary engineering targets.** They are enforced by
+review and by a loud advisory signal, not yet by branch protection.
 
 ### 9.7 Surface area shipped (v0.7.0 grand-slam baseline, advanced through v1.0.0 GA)
 
@@ -359,7 +427,7 @@ CI guard (corrected 2026-07-11 per #1938 ruling wf_26d176ac): the Bench workflow
 
 - **103 MCP tools at `--profile full`** — the **v1.0.0** count, pinned by `Profile::full().expected_tool_count()` in `src/profile.rs` (derived from the per-family `tool_names()` slices; no hand-maintained literal). The callable/bootstrap split is whatever that constant declares, plus the always-on `memory_capabilities`. Per-release history: **74** at v0.7.0 → **100** advertised / 99 callable at v0.8.0 GA (the #1709 coordination tooling — `docs/v0.8.0/release-notes.md:74`) → **101** advertised / 100 callable at v0.9.0 (`docs/v0.9.0/release-notes.md:80`) → **103** advertised / 102 callable at v1.0.0 (`docs/v1.0.0/release-notes.md:84`). The prior wording attributed the 103 count to the v0.8.0 baseline, which shipped 100. 7 at `--profile core`.
 - **94 production HTTP route registrations** / 80 unique URL paths.
-- **91 CLI subcommands** under `--features sal`/`sal-postgres`; 89 in default build (the 2-variant gap is `Migrate` + `SchemaInit`, both `#[cfg(feature = "sal")]`; grown via #1720 B2 `Reown` + PE-8 `VerifyAuditTrail` + #1727 `UndoEdit` + v0.9.0 #1859 `Lineage` + v0.9.0 #1827 `Capability` (macaroon capability-token lifecycle) + v1.0.0 #1978 `Watch` (L3 substrate poll-based filesystem-watcher capture daemon); pinned by `ai_memory::EXPECTED_CLI_SUBCOMMANDS_DEFAULT=89` / `EXPECTED_CLI_SUBCOMMANDS_SAL=91` + `tests/cli_subcommand_count_invariant.rs`).
+- **92 CLI subcommands** under `--features sal`/`sal-postgres`; 90 in default build (the 2-variant gap is `Migrate` + `SchemaInit`, both `#[cfg(feature = "sal")]`; grown via #1720 B2 `Reown` + PE-8 `VerifyAuditTrail` + #1727 `UndoEdit` + v0.9.0 #1859 `Lineage` + v0.9.0 #1827 `Capability` (macaroon capability-token lifecycle) + v1.0.0 #1978 `Watch` (L3 substrate poll-based filesystem-watcher capture daemon); pinned by `ai_memory::EXPECTED_CLI_SUBCOMMANDS_DEFAULT=90` / `EXPECTED_CLI_SUBCOMMANDS_SAL=92` + `tests/cli_subcommand_count_invariant.rs`).
 - **27 hook lifecycle events** (17 baseline + 3 transcript-capture additions `PreArchive`/`PreTranscriptStore`/`PostTranscriptStore` + 5 reflection/compaction additions `PreRecallExpand`/`PreReflect`/`PostReflect`/`PreCompaction`/`OnCompactionRollback` + 2 v0.8.0 #1709 signal events `pre_signal_send`/`post_signal_ack` — per `src/hooks/events.rs::HookEvent`; 17+3+5+2=27).
 - **7 Agent Skills tools** (L1-5 register/list/get/resource/export + L2-6 `promote_from_reflection` + L2-7 `compositional_context`) — **load-bearing for §2.4 (improvable across model generations)**.
 - **4 feature tiers:** keyword · semantic · smart · autonomous.
@@ -993,12 +1061,17 @@ cargo fmt --check
 cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic
 AI_MEMORY_NO_CONFIG=1 cargo test
 cargo audit
-scripts/coverage.sh   # per #1970: NOT a flat "--fail-under-lines 92"/93.84% claim — mirrors
-                       # ci.yml's 90% absolute floor + ratchet vs .coverage-baseline (0.5% slack)
-                       # AND coverage.yml's uniform-90% per-module floor via check-thresholds.sh
-                       # (full gate mechanics in §9.1)
-ai-memory bench          # absolute p95 budget gate (baseline-compare vs a prior
-                         # --json run is operator tooling; CI wiring = #1987)
+scripts/coverage.sh   # NOT a flat "--fail-under-lines 92"/93.84% claim (#1970), and NOT a
+                       # ratchet (corrected 2026-08-01): it invokes coverage/check-thresholds.sh
+                       # only, which enforces the 90.0 workspace-global floor + every per-module
+                       # floor from coverage/thresholds.toml. The ci.yml "Code Coverage" job and
+                       # its .coverage-baseline ratchet were REMOVED (#1993); .coverage-baseline
+                       # is dead config that nothing reads. (Full mechanics in §9.1)
+ai-memory bench          # absolute p95 budget check. The Bench workflow that runs it is
+                         # ADVISORY (bench.yml:18; absent from required-contexts-release.txt)
+                         # and skips docs-only PRs. The baseline-compare step IS wired in CI
+                         # but never fails the build and currently self-skips on
+                         # performance/baseline.json's bootstrap:true. (#1987)
 ```
 
 Plus per-release:

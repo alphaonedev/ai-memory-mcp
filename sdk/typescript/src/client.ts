@@ -27,12 +27,9 @@ import { attestationFields, type AgentSigningKey } from "./attestation.js";
 import type {
   AgentRegistration,
   ClientOptions,
-  ClusterRequest,
-  ClusterResponse,
   CreateMemoryRequest,
   CreateSubscriptionRequest,
   ForgetRequest,
-  GrantRequest,
   HealthResponse,
   InboxQuery,
   InboxResponse,
@@ -47,7 +44,6 @@ import type {
   RecallResponse,
   RegisterAgentRequest,
   RequestOptions,
-  RevokeRequest,
   SearchQuery,
   SearchResponse,
   Stats,
@@ -577,14 +573,25 @@ export class AiMemoryClient {
     });
   }
 
-  /** `DELETE /api/v1/subscriptions/:id` — remove a webhook. */
+  /**
+   * `DELETE /api/v1/subscriptions?id=<id>` — remove a webhook.
+   *
+   * The subscription id rides the QUERY STRING, not the path. The daemon
+   * registers `delete` on the collection path `/api/v1/subscriptions` only
+   * (`src/lib.rs`, `handlers::routes::SUBSCRIPTIONS`) and reads the id from
+   * `UnsubscribeQuery` (`src/handlers/subscriptions.rs`). The pre-v1.0.0 SDK
+   * sent `DELETE /api/v1/subscriptions/:id`, which no route matches: the
+   * teardown answered 405/404 and the decommissioned endpoint kept receiving
+   * signed deliveries indefinitely. Verify the returned `deleted` flag.
+   */
   async unsubscribe(
     id: string,
     opts?: RequestOptions,
   ): Promise<{ deleted: boolean }> {
     return this.call<{ deleted: boolean }>({
       method: "DELETE",
-      path: `/api/v1/subscriptions/${encodeURIComponent(id)}`,
+      path: "/api/v1/subscriptions",
+      query: { id },
       requestOpts: opts,
     });
   }
@@ -600,34 +607,12 @@ export class AiMemoryClient {
     });
   }
 
-  /** `POST /api/v1/memories/:id/grant` — grant another agent access. */
-  async grant(
-    memoryId: string,
-    body: GrantRequest,
-    opts?: RequestOptions,
-  ): Promise<{ granted: boolean }> {
-    return this.call<{ granted: boolean }, GrantRequest>({
-      method: "POST",
-      path: `/api/v1/memories/${encodeURIComponent(memoryId)}/grant`,
-      body,
-      requestOpts: opts,
-    });
-  }
-
-  /** `POST /api/v1/memories/:id/revoke` — revoke access. */
-  async revoke(
-    memoryId: string,
-    body: RevokeRequest,
-    opts?: RequestOptions,
-  ): Promise<{ revoked: boolean }> {
-    return this.call<{ revoked: boolean }, RevokeRequest>({
-      method: "POST",
-      path: `/api/v1/memories/${encodeURIComponent(memoryId)}/revoke`,
-      body,
-      requestOpts: opts,
-    });
-  }
-
+  // `grant()` / `revoke()` were REMOVED at v1.0.0. They posted to
+  // `/api/v1/memories/:id/grant` and `/api/v1/memories/:id/revoke`, which are
+  // not registered by the daemon and never were — every call 404'd. Per-memory
+  // access control is expressed through `metadata.scope` (`private` /
+  // `collective`) on the write, plus namespace governance standards; see
+  // `docs/governance.md`.
   /** `POST /api/v1/notify` — send a message to another agent's inbox. */
   async notify(
     body: NotifyRequest,
@@ -654,18 +639,11 @@ export class AiMemoryClient {
     });
   }
 
-  /** `POST /api/v1/cluster` — peer management (join/leave/list/status). */
-  async cluster(
-    body: ClusterRequest,
-    opts?: RequestOptions,
-  ): Promise<ClusterResponse> {
-    return this.call<ClusterResponse, ClusterRequest>({
-      method: "POST",
-      path: "/api/v1/cluster",
-      body,
-      requestOpts: opts,
-    });
-  }
+  // `cluster()` was REMOVED at v1.0.0. It posted to `/api/v1/cluster`, which
+  // the daemon does not register and never did — every call 404'd. Federation
+  // peers are configured out of band (`--quorum-peers`, the peer-attestation
+  // allowlist, `AI_MEMORY_FED_INVENTORY_PATH`); the HTTP federation surface is
+  // `/api/v1/sync/push` + `/api/v1/sync/since`. See `docs/federation.md`.
 
   // ========================================================================
   // Low-level escape hatch

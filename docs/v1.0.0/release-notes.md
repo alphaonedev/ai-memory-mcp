@@ -67,7 +67,9 @@ The "defaults stop lying" lane (Gate 1′) is the centerpiece: six knobs
 that shipped OFF (or non-functional) through v0.10.0 now resolve to their
 secure posture by default, each riding the one-cycle deprecation-WARN
 discipline the v0.10.0 `warn-carrier` release delivered. The release also
-advances the schema **v78 → v86** (all additive), adds an M-of-N
+advances the schema **v78 → v88** — additive `ADD COLUMN` through v85,
+then **two DATA-MUTATING rungs (v86, v87) that rewrite stored rows** and
+one index-only rung (v88); see §"Schema ladder v78 → v88" — adds an M-of-N
 threshold key-recovery lane, human-key-signed m-of-n approvals, an
 open-time rollback-evidence check, an inference-plane egress gate, and a
 named `asi-hard` no-disable security posture.
@@ -86,7 +88,7 @@ CLI subcommands):
 | HTTP routes | **94 production `.route(...)` registrations** / 80 unique URL paths |
 | CLI subcommands | **89 default build** / **91 under `--features sal`** (the `capability init` sub-verb rides the existing `Capability` command, so the top-level count is unchanged) |
 | `MemoryKind` variants | **16** (adds v1.0.0 epistemic typing `Told` / `Instruction` / `Intervention`, [#1945](https://github.com/alphaonedev/ai-memory-mcp/issues/1945)) |
-| Schema | **v88** (`CURRENT_SCHEMA_VERSION`, both adapters; v88 = #2578 the v56 composite list/archive ordering indexes finally on postgres — `migrate_v56()` had been recorded as a postgres version-stamp no-op, so a namespace-scoped `list` read the whole namespace and sorted it; SQLite has carried them since v56, so its v88 is a no-op. Built `CONCURRENTLY`, fail-open, self-healing per connect. v87 = #2333 archived `kind_provenance` parity + #2332 expiry-rendering heal, post-GA on release/v1.0.0) |
+| Schema | **v88** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only. Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v88" |
 
 ## Secure-default flips (breaking)
 
@@ -195,20 +197,69 @@ The single source of truth for the pinned versions is
 `deploy/docker-1461/provision/lib.sh` (`EXPECTED_PG_VERSION=18.4`,
 `EXPECTED_AGE_VERSION=1.7.0`, `PGVECTOR_APT_VERSION=0.8.5-1.pgdg13+1`,
 `AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0`). The certified stack was
-tested live: the AGE-gated Cypher/KG suites (`age_cte_equivalence`,
-`g2_postgres_find_paths_age_param_binding`,
+exercised live on the validation host: the AGE-gated Cypher/KG suites
+(`age_cte_equivalence`, `g2_postgres_find_paths_age_param_binding`,
 `g4_postgres_link_projects_into_age_graph`, `cov_postgres_kg`,
 `issue_1482_age_cypher_persistent`, `kg_age_fallback`) and the
-pgvector-backed recall-purity suite (`recall_purity_p01_postgres`) all
-pass on it under `--features sal,sal-postgres --include-ignored`.
+pgvector-backed recall-purity suite (`recall_purity_p01_postgres`) ran
+green against it under `--features sal,sal-postgres --include-ignored`.
 
-The stack is now gated **nightly** by the `postgres-age` CI job
-(`.github/workflows/postgres-parity-nightly.yml`, [#2012](https://github.com/alphaonedev/ai-memory-mcp/issues/2012)),
-which builds the SSOT-pinned image, **fail-closed asserts** the live
-`server_version` / `age` extversion / `vector` extversion equal the pins
-before any test runs, then runs the AGE + pgvector suites against the
-live certified stack. This closes the gap that AGE-gated Cypher and the
-vector path could only be exercised on an operator's own machine.
+### What those AGE greens attest — read this before relying on them
+
+Until [#2511](https://github.com/alphaonedev/ai-memory-mcp/issues/2511)
+(HIGH / data-honesty) landed, **every AGE-routed graph READ was rejected
+by AGE at parse time and silently re-served from the relational
+recursive CTE**, while `Capabilities.kg_backend` kept reporting `Age`.
+There were **five independent causes, each sufficient on its own.** The
+suites named above were green through that window, so **those greens
+attest the relational CTE path, not the AGE engine** — they predate the
+parse-time-fallback fix and were never evidence that AGE served a single
+one of those reads.
+
+#2511's own regression tests had to assert through DIRECT Cypher rather
+than through `kg_query`, precisely because `kg_query` falls back — so a
+`kg_query`-only assertion cannot tell the two engines apart
+(`tests/age_cypher_param_binding_2511.rs`; both live tests FAIL at the
+parent commit, and a DB-free source-inspection pin structurally rejects
+the bad statement shape on hosts that never see AGE). #2511 is fixed and
+closed.
+
+**Residual, OPEN:** [#2613](https://github.com/alphaonedev/ai-memory-mcp/issues/2613).
+`build_find_paths_current_view_cypher` still carries
+`ALL(e IN relationships(p) …)`, so every AGE-routed `find_paths` reaches
+the same defect through the 2-arg `cypher()` form that the
+third-argument fix did not touch — still parse-rejected, still
+CTE-served. The `kg_backend = Age` reporting honesty gap is tracked on
+that same issue. Results stay correct (the relational CTE is the
+always-current mirror); what is not yet true is that AGE is the engine
+answering. Track #2613 before depending on AGE-engine traversal.
+
+### CI posture for the certified stack — the pins are not CI-asserted
+
+**No CI job builds or version-asserts PG 18.4 + AGE 1.7.0 + pgvector
+0.8.5.** The `postgres-age` job
+([#2012](https://github.com/alphaonedev/ai-memory-mcp/issues/2012)) that
+did was **deleted on 2026-07-31 by operator directive** (`da3fb9cc`),
+not repaired: it rebuilt the certified stack from source on the runner
+every night purely to reproduce a stack that already exists
+continuously as the `ai-memory-pg:18.4-age1.7.0-vec0.8.5` container on
+the validation host. What survives in
+`.github/workflows/postgres-parity-nightly.yml` is the
+`postgres-parity` job, which runs four `#[ignore]`-gated cross-backend
+parity binaries against a `pgvector/pgvector:pg16` service container —
+**PG 16, no AGE, not the certified stack.**
+
+The AGE-gated Cypher/KG suites listed above are not `#[ignore]`-gated
+and DO run on every PR and push in `coverage.yml` — but against an
+`apache/age:release_PG16_1.6.0` service container, i.e. **PG 16 + AGE
+1.6.0, not the certified pins.** That CI-vs-SSOT version drift is
+[#2512](https://github.com/alphaonedev/ai-memory-mcp/issues/2512)
+defect 2, held behind
+[#2548](https://github.com/alphaonedev/ai-memory-mcp/issues/2548)
+(whether any in-PR AGE coverage is wanted at all, to be justified on
+its own merits and with a container image if it ever is). The certified
+18.4 / 1.7.0 / 0.8.5 combination itself is exercised on the operator's
+validation host and nowhere else.
 
 ## Additive surfaces
 
@@ -365,7 +416,8 @@ vector path could only be exercised on an operator's own machine.
 Gate 3 is the endgame — ALL AI-NHI-conducted (operator correction
 2026-07-09, memory `9a62049d`; there is NO third-party auditor, which
 supersedes ROADMAP §11.6's "public security audit by named third-party
-firm" line for this epic). It ran as a five-step program:
+firm" line for this epic). ROADMAP §27 sequences it as a five-step
+program:
 
 1. **DigitalOcean full-spectrum testing + attestation.** The certified
    PG 18.4 + AGE 1.7.0 + pgvector 0.8.5 stack was exercised full-spectrum
@@ -378,18 +430,56 @@ firm" line for this epic). It ran as a five-step program:
    lenses) ran on the release branch under the 1:1-issue-per-finding
    discipline (every finding gets its own GitHub issue, never bundled;
    adversarially verified with retest + independent re-check, repeated
-   until a round is clean). The reviews surfaced **0 GA-blockers**; the
-   findings raised ([#2014](https://github.com/alphaonedev/ai-memory-mcp/issues/2014)–[#2017](https://github.com/alphaonedev/ai-memory-mcp/issues/2017))
-   were all fixed in-release per the prime directive (no deferrals).
+   until a round is clean). The round raised
+   [#2014](https://github.com/alphaonedev/ai-memory-mcp/issues/2014)–[#2017](https://github.com/alphaonedev/ai-memory-mcp/issues/2017)
+   and graded **none of them a GA-blocker**. Read the scope note below
+   before treating that as a statement about the repository.
+4. **100% fix + 100% track** (the ROADMAP §27 step this document
+   previously skipped in its numbering). Every finding the two review
+   lanes raised carried its own GitHub issue, was fixed, retested, and
+   independently re-checked, with rounds repeated until one came back
+   clean. **#2014–#2017 are all CLOSED** at the commit named below.
 5. **Final AI-NHI dogfood — PASS.** The dogfood on the GA binary confirmed
    a **lossless v78 → v86 migration on a real corpus** (the additive
    crypto-core / lineage-custody / M-of-N-recovery ladder round-trips on
    live data), functional green, and a sound `verify-audit-trail` (the
    witness / cause-binding / role-separation / identity-lineage /
-   rollback-evidence readouts resolve cleanly on both backends).
+   rollback-evidence readouts resolve cleanly on both backends). **That
+   dogfood covers v78 → v86 and nothing above it** — v87 and v88 landed
+   afterwards on `release/v1.0.0` and are NOT covered by it. See
+   §"Schema ladder v78 → v88".
 
-The tag cannot cut with any Gate-3 finding open; the loop closed green
-before the (operator-gated) tag cut.
+### Scope of this attestation
+
+As of commit **`03bbd556`** on `release/v1.0.0`, the Gate-3 review round
+described above closed with **0 GA-blockers in scope**, where *in scope*
+means the findings raised by the two Gate-3 review lanes — the
+multi-agent code review and the multi-agent security review — which are
+enumerated as #2014–#2017 and are all closed.
+
+**That is not a statement that the tracker is empty, and it must not be
+read as one.** Counted on 2026-08-01 via
+`gh api 'repos/alphaonedev/ai-memory-mcp/issues?state=open' --paginate`
+with pull requests excluded: **175 open non-PR issues.** Open items
+that touch claims in this document include
+[#2613](https://github.com/alphaonedev/ai-memory-mcp/issues/2613) (the
+AGE `find_paths` residual disclosed under §"Certified backend
+versions"), plus
+[#2400](https://github.com/alphaonedev/ai-memory-mcp/issues/2400),
+[#2438](https://github.com/alphaonedev/ai-memory-mcp/issues/2438),
+[#2450](https://github.com/alphaonedev/ai-memory-mcp/issues/2450),
+[#2492](https://github.com/alphaonedev/ai-memory-mcp/issues/2492) and
+[#2629](https://github.com/alphaonedev/ai-memory-mcp/issues/2629). A
+separate audit of this release's published claim surface is on the
+branch at `docs/audit/3x7-claims-register-2026-08-01.md`; its
+corrections are landing on the documents themselves, this one included.
+
+**No tag has been cut.** `git tag -l 'v1.0.0*'` is empty at this commit
+and the newest tag on the repository is `v0.10.0`. Nothing here
+describes a completed release event; the tag cut remains
+operator-gated, and the standing rule that it cannot cut with an open
+Gate-3 finding is a rule about a future action, not a record of a past
+one.
 
 ## Security review + code review
 
@@ -398,29 +488,58 @@ the Gate-3 endgame on the v1.0.0 release branch:
 
 1. **Multi-agent codegraph-anchored code review (AI NHI)** — findings
    filed 1:1, no bundling.
-2. **Fixed 100%** — every code-review finding closed in-release.
+2. **Every finding that round raised was closed in-release** — no
+   deferrals, per the prime directive.
 3. **Multi-agent security review (AI NHI, security lenses)** — findings
    filed 1:1, no bundling.
-4. **Fixed 100%** — every security finding closed in-release; the
-   combined code + security findings ([#2014](https://github.com/alphaonedev/ai-memory-mcp/issues/2014)–[#2017](https://github.com/alphaonedev/ai-memory-mcp/issues/2017))
-   produced **0 GA-blockers**, all triaged legit and fixed.
+4. **Every finding that round raised was closed in-release.** The
+   combined code + security findings are
+   [#2014](https://github.com/alphaonedev/ai-memory-mcp/issues/2014)–[#2017](https://github.com/alphaonedev/ai-memory-mcp/issues/2017);
+   all four are **CLOSED** at commit `03bbd556`, and **none was graded a
+   GA-blocker.**
 5. **Final DO + AI-NHI dogfood 3-green**, then a **3×7 documentation
    drive** and a **docs-drift** sweep.
 
-Each finding was fixed, retested, independently re-checked, and closed
-in-release per the prime directive. The review/validation loop closed
-green before the (operator-gated) tag cut.
+Each of those findings was fixed, retested, independently re-checked,
+and closed in-release. The scope of that claim — and the count of what
+is open on the tracker at this commit — is stated in §"Gate-3
+evidence" → *Scope of this attestation*; it is bounded to the findings
+those two review lanes raised, and no tag has been cut.
 
 > The detailed per-issue write-ups for #2014–#2017 are tracked in the
 > GitHub issues + the campaign memory rather than this document; they are
 > summarized here for completeness and to record that both review lanes
-> closed green with zero GA-blockers.
+> closed with zero GA-blockers among the findings they raised.
 
-## Schema ladder v78 → v86
+## Schema ladder v78 → v88
 
-All additive (CLAUDE.md §Database is the SSOT). Both adapters mirror via
-`src/store/postgres.rs::{migrate_v79 … migrate_v86}`; the v78→v86 ladder
-round-trips losslessly on a real corpus (Gate-3 dogfood).
+`CURRENT_SCHEMA_VERSION = 88` on both adapters
+(`src/storage/migrations.rs:867`, `src/store/postgres.rs`); CLAUDE.md
+§Database is the SSOT. Both adapters mirror via
+`src/store/postgres.rs::{migrate_v79 … migrate_v88}`.
+
+**The ladder is not uniformly additive, and this document previously
+said it was.** v79–v85 are pure additive `ADD COLUMN` / `CREATE TABLE`
+rungs. **v86 and v87 are DATA-MUTATING** — they issue `UPDATE`
+statements against `memories` and `archived_memories`, rewriting the
+stored rendering of existing rows. v88 is index-only (postgres-side
+DDL; no row is touched). Both mutating rungs are
+instant/value-preserving, idempotent, and fail-safe on an unparseable
+value (left byte-untouched rather than destroyed), but they are row
+rewrites and are labelled as such below.
+
+**Migration evidence, at its true bound.** The Gate-3 dogfood
+(§"Gate-3 evidence" step 5) attested a lossless **v78 → v86**
+round-trip on a real corpus. **v87 and v88 are outside that
+attestation** — both landed on `release/v1.0.0` after the dogfood ran.
+They are covered by their own regression tests, not by a
+real-corpus dogfood. Per the North Star, data-integrity evidence is
+under-claimed rather than stretched: if you are upgrading a populated
+database across v86 → v88, take a backup first (`ai-memory backup`).
+The sqlite ladder additionally writes its own pre-migration
+`VACUUM INTO` snapshot beside the database file on any `version > 0`
+upgrade, before any schema mutation
+(`src/storage/migrations.rs:1562`).
 
 | Schema | Change |
 |---|---|
@@ -432,6 +551,8 @@ round-trips losslessly on a real corpus (Gate-3 dogfood).
 | v84 | per-row embedding-space provenance — additive `embedding_space` column on `memories` + `archived_memories` (both backends) so recall never scores a vector from a different embedding space after a same-dim model swap ([#2167](https://github.com/alphaonedev/ai-memory-mcp/issues/2167)) |
 | v85 | archive claim-validity parity — additive `valid_from` / `valid_until` on `archived_memories` (both backends), closing the archive→restore data-loss where the #1834 claim-validity interval was dropped on the round-trip ([#2035](https://github.com/alphaonedev/ai-memory-mcp/issues/2035)) |
 | v86 | claim-bitemporal valid-time canonicalization — **DATA-MUTATING** (unlike every other v79-v85 rung, which is a pure additive `ADD COLUMN`): every stored `valid_from`/`valid_until` TEXT rendering on `memories` + `archived_memories` is REWRITTEN to the ONE fixed-UTC form `YYYY-MM-DDTHH:MM:SS.ffffffZ` (`validate::canonicalize_valid_time`), so the #1834 predicates' lexicographic TEXT comparison is exactly instant comparison — RFC3339's many equal-instant renderings (`Z` vs `+00:00`, variable fractional digits, non-UTC offsets) previously ordered WRONGLY as bytes, silently violating the start-inclusive/end-exclusive contract. The rewrite is INSTANT-PRESERVING (only the byte rendering changes, never the represented moment), idempotent (safe to re-run), and fail-safe (an unparseable value is left byte-untouched rather than destroyed) on both backends ([#1834](https://github.com/alphaonedev/ai-memory-mcp/issues/1834) pre-ship 3x7) |
+| v87 | archived `kind_provenance` parity + expiry-rendering heal — **DATA-MUTATING** (the second such rung; the first is v86). Additive half: `archived_memories.kind_provenance` on BOTH backends, the third v79/#1945 column finally mirrored onto the archive (its two siblings landed at v85), carried through every sqlite archive `INSERT…SELECT` + both `restore_archived*` lists, with legacy pre-v87 archive rows re-deriving it vocab-guarded from the metadata carrier ([#2333](https://github.com/alphaonedev/ai-memory-mcp/issues/2333), FBL-03). **Row-rewriting half (sqlite only):** `normalize_expiry_rows` applies the v86 canonicalization recipe to the expiry columns, whose predicates also compare lexicographically — `UPDATE memories SET expires_at = ?1 WHERE rowid = ?2` over every non-NULL `memories.expires_at`, plus the same over `archived_memories.expires_at` and, when the column is present, `archived_memories.original_expires_at` ([#2332](https://github.com/alphaonedev/ai-memory-mcp/issues/2332), FBL-02; `src/storage/migrations.rs`, the `if version < 87` arm). Postgres needs no heal — its `expires_at` is `TIMESTAMPTZ`, not TEXT — so `migrate_v87` is the additive half only. Same guarantees as v86: instant-preserving, idempotent, fail-safe on an unparseable value |
+| v88 | postgres composite list/archive ordering indexes — **index-only, no row is read or rewritten** ([#2578](https://github.com/alphaonedev/ai-memory-mcp/issues/2578)). `migrate_v56()` had been recorded as a postgres version-stamp no-op, so the three composite ordering indexes SQLite has carried since v56 were never built on postgres and a namespace-scoped `list` read the whole namespace and sorted it. v88 is postgres catching up; the SQLite v88 arm is a version-stamp no-op so both adapters keep ONE logical schema number. The DDL runs `CREATE INDEX CONCURRENTLY` on a dedicated connection outside any transaction with `lock_timeout` cleared and a bounded `statement_timeout` — a plain in-transaction `CREATE INDEX` is a fleet-wide boot brick (reproduced live: `canceling statement due to lock timeout` at 5.002 s against a table with one ordinary uncommitted writer, on a small table as readily as a large one). It is **FAIL-OPEN**: these indexes are derived, disposable, non-UNIQUE artifacts regenerable from the durable text, so a build failure DEGRADES to today's query plan and the version stamps regardless — refusing to boot a fleet over a missing performance index would trade total availability for zero integrity. Because the stamp means the arm never re-runs, `connect_*` re-probes `indisvalid` on EVERY connect and rebuilds anything missing or left INVALID, so a node that lost one build self-heals instead of staying silently un-indexed |
 
 ## Honest limits
 

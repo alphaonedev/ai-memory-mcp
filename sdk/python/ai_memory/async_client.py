@@ -356,7 +356,14 @@ class AsyncAiMemoryClient:
         return Subscription.model_validate(raw)
 
     async def unsubscribe(self, subscription_id: str) -> dict[str, Any]:
-        return await self._request("DELETE", f"/api/v1/subscriptions/{subscription_id}")
+        """``DELETE /api/v1/subscriptions?id=<id>``.
+
+        The subscription id rides the QUERY STRING, not the path — see
+        :meth:`ai_memory.AiMemoryClient.unsubscribe` for the full rationale.
+        """
+        return await self._request(
+            "DELETE", "/api/v1/subscriptions", params={"id": subscription_id}
+        )
 
     async def subscriptions(self) -> list[Subscription]:
         raw = await self._request("GET", "/api/v1/subscriptions")
@@ -381,26 +388,10 @@ class AsyncAiMemoryClient:
         )
         return raw.get("messages", raw) if isinstance(raw, dict) else raw
 
-    # -- grant / revoke ----------------------------------------------------
-    async def grant(
-        self, memory_id: str, agent_id: str, permission: str = "read"
-    ) -> dict[str, Any]:
-        return await self._request(
-            "POST",
-            f"/api/v1/memories/{memory_id}/grant",
-            json_body={"agent_id": agent_id, "permission": permission},
-        )
-
-    async def revoke(self, memory_id: str, agent_id: str) -> dict[str, Any]:
-        return await self._request(
-            "POST",
-            f"/api/v1/memories/{memory_id}/revoke",
-            json_body={"agent_id": agent_id},
-        )
-
-    # -- cluster ------------------------------------------------------------
-    async def cluster(self, request: dict[str, Any] | None = None) -> dict[str, Any]:
-        return await self._request("POST", "/api/v1/cluster", json_body=request or {})
+    # ``grant()`` / ``revoke()`` / ``cluster()`` were REMOVED at v1.0.0 — the
+    # daemon registers none of ``/api/v1/memories/{id}/grant``,
+    # ``/api/v1/memories/{id}/revoke``, ``/api/v1/cluster``, so every call
+    # 404'd. See :class:`ai_memory.AiMemoryClient` for the replacements.
 
     # -- agents -------------------------------------------------------------
     async def agents(self) -> list[AgentRegistration]:

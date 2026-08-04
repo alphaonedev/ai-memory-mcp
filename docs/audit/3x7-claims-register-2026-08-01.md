@@ -426,3 +426,60 @@ Stated bluntly so nobody mistakes this register for a clean bill of health.
 6. **Retrieval quality on anything other than LongMemEval is unmeasured**, and even there this register only adjudicates *which harness produced the published numbers* — it does not independently reproduce **96.4% / 96.8%**.
 7. **Seven independent passes wrote the source findings; this register adjudicates and ranks them.** Cross-surface spot-checks re-verified at `e31dea74`: `HTTP_BODY_LIMIT_BYTES = 2 * MIB`, `EXPECTED_PRODUCTION_ROUTES_COUNT = 94`, `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = 80`, `CURRENT_SCHEMA_VERSION = 88`, `min_line_coverage = 90.0`, `bench.yml` self-declared advisory + 0 bench entries in `required-contexts-release.txt`, `src/audit.rs` CHECKPOINT.sig comment-only, `kg_backend =` assignments `#[cfg(test)]`-only, zero `caps.compaction` writers, `transport.rs:852` sync bypass, no `grant`/`revoke`/`cluster` in `routes.rs`, `git tag -l 'v1.0.0*'` empty. **Findings not on that list are carried at their source pass's stated evidence and were not independently re-derived.**
 8. **HEAD moves.** This register is pinned to `e31dea74`. Every file:line will drift — which is, precisely, the #2629 failure class this register documents. **Re-derive before citing.**
+
+---
+
+## 7. ERRATA — errors found IN THIS REGISTER during remediation
+
+*Added 2026-08-01 by the CERT GATE 2 remediation lanes (PRs #2651–#2661). Every item below was found by a lane implementing this register's own §3 remedy list, and each was verified against code at `03bbd556`/`cb09bb07` before being recorded here.*
+
+**Why this section exists.** This register's standard is that a correct system which overclaims fails the bet-the-farm bar. **An audit that overclaims about claims fails its own standard.** The seven remediation lanes were instructed to verify every correction against the code rather than trust the register, and doing so surfaced ~20 defects in the register itself. They are recorded here rather than silently fixed, because §6.8 already warns that this document drifts — this is that warning coming true, measured.
+
+**Materiality note.** None of these overturns a Tier-1 verdict. C-01 through C-09 stand. The errors are of three kinds: **stale anchors** (the #2629 class, self-predicted), **undercounts** (the register was conservative, so the real defect was larger), and **four substantive misreadings** (E-01, E-02, E-11, E-16) where the register asserted something the code contradicts.
+
+### 7.1 — Substantive: the register was WRONG about the code
+
+| # | Register claim | Verified reality | Found by |
+|---|---|---|---|
+| **E-01** | **C-35**: "`postgres_endpoint_supported()` is an explicit allowlist — **56** `=> true` arms out of 94 route registrations" | **56 is an ARM COUNT, not a ROUTE count.** One match arm can cover several routes and several arms cover none. The real supported-route figure is **73 of 94**. The register's own framing conflates two different units, understating Postgres coverage by 17 routes | README lane (#2654) |
+| **E-02** | **C-23**: AGE-gated Cypher "could only be exercised on an operator's own machine" is "the current state **by design**" | **False at HEAD.** None of the six named AGE suites is `#[ignore]`-gated, and `.github/workflows/coverage.yml` sets `AI_MEMORY_TEST_AGE_URL` against an `apache/age:release_PG16_1.6.0` service container, running them on every PR and push to `release/**`. The true and narrower claim is: **no CI job builds or version-asserts the certified PG 18.4 + AGE 1.7.0 + pgvector 0.8.5 pins** (drift tracked as #2512 defect 2, behind #2548) | release-notes lane (#2651) |
+| **E-11** | **C-24**: "`rg 'coverage-baseline' .` hits **prose only**" | Nothing *reads* it — correct. But **the file exists on disk** carrying `92.59`. It is dead config, not an absent file; the distinction matters because a reviewer greping for it finds it and assumes a live ratchet | performance lane (#2653) |
+| **E-16** | **C-61**: the 2k HNSW fixture is "reachable only via an **undocumented** env var" | The var **is** documented — in `benches/hnsw_rebuild_async.rs` itself, just not in `PERFORMANCE.md`. Separately, the 43 µs / 56 µs figures **do** have a recorded producing run (`CHANGELOG.md`, `docs/v0.7.0/release-notes.md`), so they were kept at their true fixture size rather than deleted under rule 2 | performance lane (#2653) |
+
+### 7.2 — Undercounts: the real defect was LARGER than recorded
+
+| # | Register said | Actual | Found by |
+|---|---|---|---|
+| **E-03** | **C-20** is a TypeScript defect (`sdk/typescript/src/client.ts`) | **Three clients.** `sdk/python/ai_memory/client.py` and `sdk/python/ai_memory/async_client.py` carried the identical `/api/v1/subscriptions/{id}` bug. **`async_client.py` appears NOWHERE in this 429-line register** — the entire file was outside the audit's field of view, and it also carried all three C-19 dead methods | API lane (#2655) |
+| **E-04** | **C-55**: 6 anchors sampled, 6 miss | **13 checked, 13 miss** — including `tests/validate.rs`, a cited test file that **has never existed**, and `src/mcp/mod.rs:1607-1611`, which the register called "pointing at nothing" but actually points at `build_mcp_signal_hooks` — **unrelated code that reads plausibly to a skimming reviewer**, which is worse than nothing | security lane (#2656) |
+| **E-05** | **C-55** on the HTML procurement page: 5 tally sites | **8 sites** — the extras being `<meta name="description">` and `<meta property="og:description">`, which carry the retired "10 of 10" claim into **every shared link preview**. Also **34** `file:line` anchors on that page, all converted; and concern (d) carried an **independent instance of the C-04 false mTLS claim** that the register never located | NSA-HTML lane (#2660) |
+| **E-06** | **C-42**: "9 of the 15 rows have no `Operation` variant" | **11 of 15.** Only `memory_store`, `memory_search`, `memory_recall` and `memory_kg_query` map by operation name | performance lane (#2653) |
+| **E-07** | **C-47**: flags the missing `CaptureLag` and the phantom `Search`/`List`/`Get` | Also missed that **`Export` and `Import` have ZERO production emitters** — both variants appear only under `mod tests`. A documented "one summary event per bulk operation" that no bulk operation produces: a rule-2 no-producer claim sitting *inside* the enum the register was auditing. Separately, read-access audit events are **MCP-stdio-only** | security lane (#2656) |
+| **E-08** | **C-70**: test-count figures | The register's counting regex drops `#[tokio::test(flavor = …)]` attributes. Direction is conservative, but every sub-figure is wrong | README lane (#2654) |
+| **E-09** | **C-39**: bulk response is `{created, errors}` | The **Postgres** branch also returns `"pending": [...]`; the SQLite branch does not. The two backends return different response shapes | API lane (#2655) |
+| **E-10** | **C-44**: the `kg_bench` / `--features=age` command is dead | Understated — the "CTE (default, no extra services)" half was **also** wrong: `age_vs_cte` needs `--features sal-postgres` and a Postgres URL for **either** half, and the doc's `PG_DSN` env var is never read by the bench | performance lane (#2653) |
+| **E-17** | Two API-contract coverage rows the register did not examine | `memory_recall`/`context_tokens` published as MCP-only — it is on **both** transports; and the `memory_store`/`ttl_secs` note claimed "the MCP tool exposes `expires_at`" when MCP `StoreRequest` exposes **neither** | API lane (#2655) |
+
+### 7.3 — Stale anchors and counts (the #2629 class this register predicted)
+
+| # | Register anchor | Reality at HEAD | Found by |
+|---|---|---|---|
+| **E-12** | **C-17**: `src/config.rs:8712-8717` | Real resolver is `src/config.rs:4314-4321` — **stale by ~4,400 lines** | API lane (#2655) |
+| **E-13** | **C-29**: `CHANGELOG.md:460` | Now `:475`. Quote verbatim and unchanged | security lane (#2656) |
+| **E-14** | **C-09**: `CHANGELOG.md:171` / `:179`; **C-46**: `:336` | Now `:186` / `:194` / `:351`. Content matched in every case | release-notes lane (#2651) |
+| **E-15** | **C-08**: "**169** open non-PR issues" | **175** on 2026-08-01. The `[Unreleased]` block is ~343 lines, not ~328 | release-notes lane (#2651) |
+| **E-18** | **C-08**: the five-step program's step 4 "is absent from the text" | Correct, and now identified: step 4 is **"100% fix + 100% track"** (`ROADMAP.md` §27's canonical Gate-3 sequence). Never present in the file — absent from its first appearance onward | release-notes lane (#2651) |
+
+### 7.4 — Errors in a SOURCE the register relied on
+
+| # | Finding |
+|---|---|
+| **E-19** | **`benchmarks/longmemeval/README.md` shifted every harness throughput figure UP ONE ROW**, crediting `harness.py` with 57 q/s (which is `harness_fast.py`'s number) and `harness_fast.py` with 232 q/s (which is `harness_99.py --no-expand`'s). Settled by internal consistency — every `docs/DEVELOPER_GUIDE.md` row satisfies `published q/s == 500 questions / published elapsed`, and `benchmarks/README` carries no elapsed times so nothing cross-checked it. **Shipped-binary throughput is 1.2 q/s, not ~57.** C-36 cites DEVELOPER_GUIDE and is correct; the benchmark README was the drifted surface. Fixed at root, with elapsed times added so each figure is auditable |
+| **E-20** | **`docs/benchmark.svg` rendered the retired headline as PIXELS** — `97.0%`, `R@5 (485/500)`, `232 q/s` — on the image `README.md` embeds. Not a `.md` file, so no prose correction and no text-matching gate would ever have touched it. Corrected to `96.4%` / `482/500` (the fraction resolves exactly) / `1.2 q/s`. **Generalisable lesson: a claims gate that scans only text cannot see a claim that has been rendered** |
+
+### 7.5 — Process findings from remediation
+
+| # | Finding |
+|---|---|
+| **E-21** | **A `CONFLICTING` pull request silently suppresses ALL CI dispatch in this repo.** GitHub cannot compute a merge ref for a conflicting PR, so `pull_request`-triggered workflows create **no check suite at all** — and `gh pr checks` then reports *"no checks reported on the branch"*, which reads almost identically to a pass. Four remediation lanes were in this state simultaneously; five successive pushes on one produced zero Actions runs while the last *green* run sat four commits back. Close/reopen does **not** clear it; merging the base does. Verify with `gh api ".../actions/runs?head_sha=<sha>" -q .total_count`, never `gh pr checks`. Filed as **#2665** together with its sibling trap (a PR displaying green checks belonging to a superseded head) |
+| **E-22** | **The queue bottleneck across parallel doc lanes is `CHANGELOG.md` `[Unreleased]` contention**, producing genuine textual conflicts — not branch-protection strictness. Relaxing `strict` does not resolve a text conflict. **#2483 is the real fix and remains unowned.** Every conflict observed was both-added and resolvable by keeping both blocks |
