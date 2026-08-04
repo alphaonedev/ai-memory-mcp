@@ -6944,7 +6944,22 @@ pub async fn sync_cycle_once(
     }
     let pulled: SyncSinceResponse = resp.json().await?;
     let pull_count = pulled.memories.len();
-    let latest_pulled = pulled.memories.last().map(|m| m.updated_at.clone());
+    // #2441 — advance the cursor on rows the peer EXAMINED, not on the
+    // rows it projected. The peer applies its per-peer namespace
+    // allowlist and the `scope=private` visibility filter IN MEMORY,
+    // AFTER the SQL `LIMIT`, so a window composed entirely of
+    // out-of-scope rows comes back `count: 0` behind an HTTP 200.
+    // Deriving the cursor from `memories.last()` therefore pinned it
+    // forever: the identical window was re-requested every cycle and
+    // the replica never converged, while every observable signal said
+    // "in sync". `next_since` is the peer's honest examined-watermark
+    // (and is tie-group-safe, which `memories.last()` never was);
+    // the legacy expression remains the fallback for a peer that does
+    // not yet publish the field.
+    let latest_pulled = pulled
+        .next_since
+        .clone()
+        .or_else(|| pulled.memories.last().map(|m| m.updated_at.clone()));
 
     {
         let conn = db::open(db_path)?;
@@ -7248,6 +7263,14 @@ struct SyncSinceResponse {
     #[allow(dead_code)]
     limit: usize,
     memories: Vec<crate::models::Memory>,
+    /// #2441 — the peer's PULL CURSOR, derived from the rows it
+    /// EXAMINED rather than the rows it projected. Absent on a
+    /// pre-#2441 peer (`#[serde(default)]` → `None`), in which case
+    /// [`sync_cycle_once`] falls back to the legacy
+    /// `memories.last().updated_at` so a mixed-version mesh keeps
+    /// working exactly as before.
+    #[serde(default)]
+    next_since: Option<String>,
 }
 
 /// Re-export the `Instant`/`Duration` types so test crate use sites stay
