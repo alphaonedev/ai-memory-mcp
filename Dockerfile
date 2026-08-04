@@ -30,8 +30,15 @@ COPY migrations/ migrations/
 # alphaonedev/paste fork was deleted. The build context MUST include it
 # or `cargo build` fails: "failed to read /build/vendor/paste/Cargo.toml".
 COPY vendor/ vendor/
-
-RUN cargo build --release && strip target/release/ai-memory
+# #2676 packaging residual — ship the federation surface operators expect.
+# Default cargo features are only `sqlite-bundled`; without `sal`, SAL store
+# paths and several daemon federation workers stay compiled out. Gate3 cert
+# measured an asserted feature build; GHCR/deb must not silently ship less.
+COPY scripts/assert-compiled-features.sh scripts/assert-compiled-features.sh
+RUN cargo build --release --features sal \
+    && strip target/release/ai-memory \
+    && bash scripts/assert-compiled-features.sh target/release/ai-memory \
+         --require sqlite-bundled --require sal
 
 # ---- Runtime stage ----
 FROM debian:bookworm-slim
