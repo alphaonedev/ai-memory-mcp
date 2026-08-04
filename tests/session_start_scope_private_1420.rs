@@ -57,7 +57,29 @@ fn seed_memory(
     let id = uuid::Uuid::new_v4().to_string();
     let mut metadata = json!({ "agent_id": owner });
     if scope_public && let Some(obj) = metadata.as_object_mut() {
-        obj.insert("scope".to_string(), json!("public"));
+        // #2633 — this fixture used to seed the literal `"public"`, which is
+        // NOT a `MemoryScope` and which `validate::validate_scope` REFUSES on
+        // every write surface (asserted by `validate::tests::test_invalid_scope`,
+        // `assert!(validate_scope("public").is_err())`). It reached the DB only
+        // because `seed_memory` calls `db::insert` directly, bypassing that
+        // validator, and it read as world-visible only because the pre-#2633
+        // read path treated ANY unrecognised token as world-readable.
+        //
+        // Enumerating `"public"` as a broadly-visible legacy alias was
+        // considered and rejected: it would leave the substrate REFUSING to let
+        // an operator write `public` while treating any row that carries it as
+        // world-readable — the precise write/read incoherence #2633 removes.
+        // `shared` is genuinely grandfathered because five PRODUCTION sites
+        // still write it (the `_standard:<ns>` governance placeholders) and it
+        // is the documented #948/#978 federation shape; `public` is written by
+        // no production code and appears zero times in the live corpus.
+        //
+        // `collective` is the real world-readable scope this fixture always
+        // meant, and it is accepted by `validate_scope`.
+        obj.insert(
+            "scope".to_string(),
+            json!(ai_memory::models::namespace::MemoryScope::Collective.as_str()),
+        );
     }
     let mem = Memory {
         id: id.clone(),

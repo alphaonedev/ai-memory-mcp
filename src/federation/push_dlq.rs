@@ -61,7 +61,8 @@ use super::FederationConfig;
 use super::sync::{AckOutcome, post_once};
 
 /// Tracing target for the push-DLQ enqueue + replay surface (this
-/// module plus the enqueue branch in `sync::broadcast_store_quorum`).
+/// module plus the enqueue branches in `sync::broadcast_store_quorum`
+/// (#933) and `sync::broadcast_delete_quorum` (#2498)).
 /// #1558 tracing-target SSOT.
 pub(crate) const PUSH_DLQ_TRACE_TARGET: &str = "ai_memory::federation::push_dlq";
 
@@ -308,9 +309,51 @@ fn dlq_depth_warn_threshold() -> i64 {
 /// drown the very signal it is meant to be. `0` = below, `1` = at/over.
 static DLQ_DEPTH_OVER_THRESHOLD: AtomicI64 = AtomicI64::new(0);
 
+use crate::federation::peer::is_legacy_positional_peer_id;
 use crate::federation::receive_auth::{
     CAUSE_NAMESPACE_PROBE_UNRESOLVABLE, CAUSE_UNENROLLED_AUTHOR_STRICT,
 };
+
+/// #2442 — marker prefixed onto `last_error` when a DLQ row is found to carry
+/// a pre-#2442 POSITIONAL routing key.
+///
+/// Deliberately NOT fed to [`classify_quarantine_cause`]. That classifier is
+/// an ORDERED SUBSTRING matcher over `last_error`, and while no peer-supplied
+/// TEXT reaches that string (every producer formats only counts, a status
+/// code, or a local error), a peer-supplied INTEGER does:
+/// `sync::success_report_non_ack_reason` interpolates the receiver's own
+/// `skipped` count via `as_u64`. A peer answering 200 with `{"skipped": 429}`
+/// therefore mints a `last_error` containing `429` — which already matches
+/// this classifier's FIRST arm (`quota`) and `reset_throttled_quarantine`'s
+/// `LIKE '%429%'` on both backends, resetting `attempt_count = 0` forever and
+/// defeating the quarantine ceiling (#2672). Adding an arm keyed on a token in
+/// this string would widen that same laundering surface. It would ALSO
+/// override the row's real quarantine cause: a legacy-keyed row that was
+/// already failing `http 400` is still a `permanent` row, and the routing key
+/// is the secondary fact. The legacy condition is decided from the SHAPE of
+/// `row.peer_id` — structured input a peer cannot influence — and surfaced on
+/// its own counter (`ai_memory_federation_push_dlq_legacy_positional_total`),
+/// never by string-matching an error message.
+const LEGACY_PEER_ID_MARKER: &str = "[#2442 legacy positional peer_id]";
+
+/// #2442 — has this row's `last_error` already been annotated with
+/// [`LEGACY_PEER_ID_MARKER`]?
+///
+/// Re-annotating on every tick would append the marker ~100 times before the
+/// row quarantines and grow `last_error` without bound. Annotating exactly
+/// once keeps the ORIGINAL enqueue reason — the forensic record of why the
+/// write was undelivered in the first place — verbatim and permanent inside
+/// the string.
+fn already_marked_legacy(last_error: &str) -> bool {
+    last_error.starts_with(LEGACY_PEER_ID_MARKER)
+}
+
+/// #2442 — fires the operator-facing WARN once per process rather than once
+/// per row per tick. A large legacy backlog would otherwise emit the same
+/// paragraph thousands of times a minute and drown the signal it exists to
+/// raise — the same reasoning as the edge-triggered depth alarm above.
+static LEGACY_PEER_ID_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// #1544 — map a free-text DLQ `last_error` to a CLOSED-set quarantine
 /// cause label so the Prometheus label cardinality is bounded by
@@ -333,10 +376,23 @@ fn classify_quarantine_cause(last_error: &str) -> &'static str {
         // the federated-delete scope gate failed closed. Distinct from a scope
         // refusal: the peer's config is fine and the row is un-erasable until
         // the read succeeds. Operator-actionable at the RECEIVER's storage, not
-        // at the sender's allowlist. Dormant until the delete lane gains a DLQ
-        // enqueue (#2498); classified here so the closed label set is already
-        // correct when it does, and so the token has exactly one meaning across
-        // the substrate.
+        // at the sender's allowlist.
+        //
+        // STILL DORMANT after #2498. The delete lane now DOES enqueue, so the
+        // refused deletion reaches the DLQ and is retried — but this specific
+        // LABEL remains unreachable, and #2498 did not change that. The
+        // receiver emits the `namespace_probe_unresolvable` token ONLY as a
+        // `tracing` field (`src/handlers/federation_receive.rs:892,2168,2494,
+        // 2600`; `src/handlers/federation_signing_check.rs:671`) and never in
+        // the HTTP 200 response body — the body carries only the `skipped`
+        // counter — so the sender's `last_error` is #2341's
+        // `success_report_non_ack_reason` text ("peer 2xx but N item(s)
+        // skipped …") and can never contain the token. The remaining
+        // precondition is a RECEIVER-side wire change that echoes the cause in
+        // the 200 body (a wire-shape change needing its own vote, #2498 §3 of
+        // the issue). Classified here so the closed label set is already
+        // correct when that lands, and so the token has exactly one meaning
+        // across the substrate.
         CAUSE_NAMESPACE_PROBE_UNRESOLVABLE
     } else if last_error.contains("401") || last_error.contains("403") {
         // The replay last_error is the `http {status}` shape, so 401/403
@@ -485,17 +541,101 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
         // peer has been removed from the config since the DLQ row was
         // written, log + bump attempt_count + leave the row for the
         // operator to drain manually.
+        //
+        // #2442 — this `find` is EXACTLY where the positional-id defect
+        // detonated: with `id = peer-{i}`, decommissioning one peer shifted
+        // every higher index down, so this lookup SUCCEEDED against the wrong
+        // host, POSTed another tenant's content there, and stamped the row
+        // `replayed_at`. Peer ids are now derived from peer identity, so a
+        // surviving peer is never re-keyed and this lookup can only fail —
+        // never succeed against the wrong endpoint. What remains is
+        // classifying WHY it failed.
         let Some(peer) = config.peers.iter().find(|p| p.id == row.peer_id) else {
-            let _ = sink
-                .bump_dlq_attempt(row.id, "peer no longer in FederationConfig")
-                .await;
-            tracing::warn!(
-                target: PUSH_DLQ_TRACE_TARGET,
-                row_id = row.id,
-                peer_id = %row.peer_id,
-                "replay: peer {} not in FederationConfig — leaving row pending",
-                row.peer_id,
-            );
+            // #2442 — a row written by a PRE-fix binary carries a positional
+            // routing key that this binary can no longer resolve. We refuse
+            // to remap `peer-N` -> `config.peers[N]`: that mapping is only
+            // correct if the peer list has not changed since the row was
+            // written, and a binary upgrade is precisely when operators DO
+            // change it. Guessing would reintroduce the misdelivery this
+            // issue exists to close. DEGRADE (loud, actionable quarantine)
+            // beats CORRUPT (content to the wrong host). The cost is stated
+            // in the message: these rows stop retrying and need an
+            // operator-supplied re-key.
+            if is_legacy_positional_peer_id(&row.peer_id) {
+                crate::metrics::registry()
+                    .federation_push_dlq_legacy_positional
+                    .inc();
+                // Annotate `last_error` EXACTLY ONCE, preserving the original
+                // enqueue reason verbatim after the marker. `bump_dlq_attempt`
+                // overwrites `last_error`, so a naive constant reason would
+                // permanently destroy the forensic record of why this write
+                // was undelivered — the row IS that record.
+                //
+                // The attempt bump itself is not optional, and this is the
+                // one place the cost is genuinely unavoidable: pending rows
+                // are drained `ORDER BY failed_at ASC` and legacy rows are by
+                // construction the OLDEST, so a row that never burns its
+                // budget sits at the head of every batch forever and STARVES
+                // live rows out of the replay window. Bumping lets these
+                // converge to take-exclusion and hands the queue back.
+                let reason = if already_marked_legacy(&row.last_error) {
+                    row.last_error.clone()
+                } else {
+                    format!(
+                        "{LEGACY_PEER_ID_MARKER} original enqueue reason: {}",
+                        row.last_error
+                    )
+                };
+                let _ = sink.bump_dlq_attempt(row.id, &reason).await;
+                if !LEGACY_PEER_ID_WARNED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        target: PUSH_DLQ_TRACE_TARGET,
+                        row_id = row.id,
+                        peer_id = %row.peer_id,
+                        memory_id = %row.memory_id,
+                        "replay: DLQ row {} is keyed by a PRE-#2442 POSITIONAL peer id ({}) — \
+                         the --quorum-peers flag INDEX, written by an older binary. This binary \
+                         keys by stable peer identity, so the row has no live endpoint. It will \
+                         NOT be auto-remapped: `peer-N` -> peers[N] is only correct if your peer \
+                         list never changed, and an upgrade is exactly when it does, so guessing \
+                         would deliver this write to the WRONG HOST (that is #2442 itself). \
+                         WHAT IS LOST IF YOU DO NOTHING: after {MAX_REPLAY_ATTEMPTS} attempts \
+                         these rows stop being retried; the payloads are RETAINED, never \
+                         deleted, but the writes stay undelivered until the peer's own \
+                         /sync/since catch-up carries them. REMEDIATION: see \
+                         docs/TROUBLESHOOTING.md §federation-push-DLQ — it gives the \
+                         operator-gated re-key (which MUST also reset attempt_count) and the \
+                         one-liner that computes a peer's stable id from its URL. This warning \
+                         fires ONCE per process; the per-row detail is at debug level and the \
+                         ai_memory_federation_push_dlq_legacy_positional_total counter tracks \
+                         the volume.",
+                        row.id,
+                        row.peer_id,
+                    );
+                } else {
+                    tracing::debug!(
+                        target: PUSH_DLQ_TRACE_TARGET,
+                        row_id = row.id,
+                        peer_id = %row.peer_id,
+                        memory_id = %row.memory_id,
+                        "replay: skipping DLQ row {} — pre-#2442 positional peer id {} \
+                         (see the once-per-process WARN above)",
+                        row.id,
+                        row.peer_id,
+                    );
+                }
+            } else {
+                let _ = sink
+                    .bump_dlq_attempt(row.id, "peer no longer in FederationConfig")
+                    .await;
+                tracing::warn!(
+                    target: PUSH_DLQ_TRACE_TARGET,
+                    row_id = row.id,
+                    peer_id = %row.peer_id,
+                    "replay: peer {} not in FederationConfig — leaving row pending",
+                    row.peer_id,
+                );
+            }
             continue;
         };
 

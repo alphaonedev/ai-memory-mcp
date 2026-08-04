@@ -1606,14 +1606,21 @@ async fn http_bulk_create_happy() {
         {
             "tier": "long", "namespace": "chunk-d/bulk", "title": "b1",
             "content": "x", "tags": [], "priority": 5, "confidence": 1.0,
-            "source": "api", "metadata": {}, "agent_id": "ai:bulker",
+            "source": "api", "metadata": {},
         },
         {
             "tier": "long", "namespace": "chunk-d/bulk", "title": "b2",
             "content": "y", "tags": [], "priority": 5, "confidence": 1.0,
-            "source": "api", "metadata": {}, "agent_id": "ai:bulker",
+            "source": "api", "metadata": {},
         },
     ]);
+    // #2550 — the rows no longer carry a body `agent_id` claim. `post_json`
+    // sends no `X-Agent-Id`, so the caller resolves to `anonymous:req-<uuid>`
+    // and a claimed `"ai:bulker"` is now a 403 identity mismatch on BOTH
+    // create surfaces. Pre-#2550 the bulk branch silently OVERWROTE the
+    // disagreeing claim (single-create has refused it since #907), which is
+    // the same silent-field-drop class as the dropped `scope`. This fixture
+    // is the HAPPY path, so it makes no claim to mismatch.
     let (status, _payload) = post_json(&router, "/api/v1/memories/bulk", body).await;
     assert!(
         status == StatusCode::CREATED

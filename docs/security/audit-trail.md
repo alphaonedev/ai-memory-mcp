@@ -45,15 +45,29 @@ enabled = true
 path = "~/.local/state/ai-memory/audit/"
 schema_version = 1
 redact_content = true
-hash_chain = true
-attestation_cadence_minutes = 60
+hash_chain = true                 # mandatory; an explicit `false` REFUSES boot
+attestation_cadence_minutes = 60  # RESERVED — parsed, resolved, drives nothing
 append_only = true
 
 [audit.compliance.soc2]
 applied = true
 retention_days = 730
-attestation_cadence_minutes = 60
+attestation_cadence_minutes = 60  # RESERVED — see below
 ```
+
+> **`attestation_cadence_minutes` is RESERVED, not implemented.** The knob
+> parses and resolves (including the compliance-preset overrides), but the
+> periodic `CHECKPOINT.sig` attestation marker it would drive **does not
+> exist**: `src/audit.rs` states it "is **NOT** yet implemented: no emission
+> code exists and `effective_attestation_cadence_minutes` … has no production
+> consumer." An audit-enabled daemon emits a one-shot operator WARN
+> (`target: audit.attestation`) saying exactly that. Do not cite this knob as
+> an anti-truncation or continuous-monitoring control. `retention_days` **is**
+> live (`AuditConfig::effective_retention_days`, consumed by
+> `ai-memory logs purge`).
+>
+> `hash_chain = false` is refused outright at init rather than silently
+> ignored — the cross-row chain is mandatory and cannot be disabled.
 
 Restart the daemon (or any new CLI invocation picks up the new
 config). Verify:
@@ -69,16 +83,47 @@ ai-memory audit verify                  # exits 0 on intact chain
 
 ## What gets audited
 
-Every memory mutation. The full action vocabulary:
+The wire `action` vocabulary is the `AuditAction` enum in `src/audit.rs` —
+**14 values**, exactly these strings and no others. A SIEM parser should be
+built against this set:
 
-- `store` — new memory written
-- `update` — existing memory modified
-- `delete` — memory tombstoned
-- `recall` / `search` / `list` / `get` / `session_boot` — read access (one event per query, capturing namespace + actor; targets are aggregate `"*"` for list-style ops)
-- `link` / `promote` / `forget` / `consolidate` — derived mutations
-- `export` / `import` — bulk operations (one summary event)
-- `approve` / `reject` — governance state transitions
-- `session_boot` — `ai-memory boot` invocations (every AI agent's first turn)
+| Wire value | Meaning | Emitted today? |
+|---|---|---|
+| `store` | new memory written | yes |
+| `update` | existing memory modified | yes |
+| `delete` | memory deleted / tombstoned | yes |
+| `recall` | read access — **one event per query**, target `"*"` for list-style ops | yes |
+| `link` | typed link written | yes |
+| `promote` | tier promotion | yes |
+| `forget` | explicit forget | yes |
+| `consolidate` | consolidation | yes |
+| `export` | bulk export | **no producer at v1.0.0 — reserved** |
+| `import` | bulk import | **no producer at v1.0.0 — reserved** |
+| `approve` | governance approval | yes |
+| `reject` | governance rejection | yes |
+| `session_boot` | `ai-memory boot` invocation (an agent's first turn) | yes |
+| `capture_lag` | L1 capture-nag: an agent crossed the consecutive-non-capture-tool-call threshold without a write (#1389 / #1398). Informational, `outcome = allow` | yes |
+
+Three corrections a SIEM integrator needs, stated plainly:
+
+- **There is no `search`, `list`, or `get` action.** The `memory_search`,
+  `memory_list`, `memory_get`, `memory_recall` and `memory_session_start` MCP
+  tools all emit `recall`. A parser keyed on `search` / `list` / `get` will
+  match nothing.
+- **`capture_lag` is on the wire and was previously undocumented.** A parser
+  built against the older 13-value list meets it and fails to classify it.
+- **`export` and `import` are enum variants with no production emission site
+  at v1.0.0.** They are reserved; a bulk export or import produces no audit
+  line today.
+
+**Emission surfaces, honestly.** Read-access (`recall`) events come from the
+**MCP stdio dispatch layer only** (`src/mcp/mod.rs`) — the HTTP read routes
+(`GET /api/v1/memories`, `/memories/search`, `/recall`, `GET /memories/{id}`)
+emit **no** line to this file. HTTP emits `store`, `delete`, `link`,
+`approve`, `reject` (and the federation receive path emits `store`); the CLI
+emits `store`, `update`, `delete`, and `session_boot`. The in-DB `signed_events`
+chain has its own, differently-scoped read coverage and its own honest gap
+statement — see [`audit-trail-coverage.md`](./audit-trail-coverage.html).
 
 Each event captures:
 
@@ -105,8 +150,10 @@ Each event captures:
 | Local attacker edits one line | `self_hash` recomputation fails on `audit verify`; precise line number surfaces |
 | Local attacker inserts a forged line | The next line's `prev_hash` no longer matches the inserted line's `self_hash` |
 | Local attacker deletes one line | The line after the deletion has a `prev_hash` from a now-gone source line |
-| Local attacker truncates the tail | The chain is consistent up to truncation, but periodic `CHECKPOINT.sig` markers (every `attestation_cadence_minutes`) bound rollback when paired with off-host attestation |
+| Local attacker truncates the tail of `audit.log` | **Not detected by this file's chain.** Truncation leaves the surviving prefix internally consistent, so `audit verify` reports OK. There is no `CHECKPOINT.sig` marker: it is **RESERVED and not implemented** (`src/audit.rs` — "no emission code exists"), and the daemon says so in a one-shot WARN. The control for this threat is **real-time off-host shipping** to an immutable SIEM (row below); the SIEM's copy is what bounds how much tail can be silently discarded. The substrate's separate in-DB `signed_events` chain has its own, implemented anti-truncation anchor — next two rows. |
 | Root attacker rewrites the entire file | **Not defended.** Ship the lines off-host to an immutable SIEM in real time. The on-host chain still cross-checks the SIEM record. |
+| Attacker truncates the tail of the in-DB `signed_events` chain | **Detected** (#1850). `ai-memory verify-audit-trail` compares the surviving `MAX(sequence)` against the head sequence recorded in the off-table forensic watermark; an in-DB head below the anchored head is `TruncationCheck::Detected` (dirty, non-zero exit). With no anchor enrolled the verdict **withholds** (`Unknown`) rather than emitting a false all-clear. |
+| Attacker rewrites the whole `signed_events` suffix at the **same length** (recomputed `prev_hash`, equal row count — the chain walk and the sequence-only checks read clean) | **Detected** (#1873 / #2202). The verifier recomputes `SHA-256(canonical_chain_bytes(row))` of the surviving row **at the anchored sequence** and compares it against the watermark's `head_canonical_hash` / the K1-pinned, signature-verified witness dual-head hash whenever `anchored_seq <= db_head` → `HeadHashCheck::Mismatch` (dirty). **Residual, by design:** `canonical_chain_bytes` deliberately excludes `prev_hash`, so the anchor binds only the **anchored row** — an interior / mid-suffix rewrite **below** it that leaves that row's own columns intact, and a rewrite of the up-to-63 (`WATERMARK_INTERVAL` − 1) un-anchored rows **above** the last watermark, are **NOT** caught by the in-DB verdicts. `AI_MEMORY_LOG_SINK=syslog` off-host shipping (or a future rolling/accumulator hash committing the whole prefix) is the residual-closing control. |
 | Process crashes mid-write | A short or interrupted write can leave a malformed final JSONL record; `audit verify` reports the malformed/broken chain. `O_APPEND` prevents file-offset races but does not make an arbitrarily sized JSON line atomic. Use one writer process per audit file; separate processes are not chain-serialized. |
 | Attacker rolls back the whole DB **file** to an earlier snapshot | **[#1946 A1, v1.0.0]** Detected at the next `db::open` by the OPEN-TIME rollback-evidence head check: the surviving `signed_events` head is compared against the witness-signed OFF-TABLE `head-anchor.log` high-water on the `AI_MEMORY_WITNESS_KEY_DIR` mount (an on-host sibling the DB rollback does not touch). A head below the K1-pinned anchor high-water, with no operator sanction, is a `RollbackCheck::Evidence` verdict (loud WARN + signed `audit.rollback_evidence` row; refuses the open under `AI_MEMORY_REQUIRE_ROLLBACK_CHECK`). A legitimate DR restore is distinguished from an attack ONLY by an operator-signed `audit restore-attest --sign` sanction. ⚠️ **tamper-EVIDENCE, not tamper-PROOF** — see the honest-limit note below. |
 
@@ -514,17 +561,29 @@ scrape_configs:
 
 ## Regulatory mapping
 
-The compliance presets propagate well-known retention and cadence
-controls into the effective config. Set `applied = true` for the
-relevant preset; ai-memory picks the most-conservative value when
-multiple presets are active.
+The compliance presets propagate a well-known **retention** value into the
+effective config. Set `applied = true` for the relevant preset; ai-memory
+picks the longest retention when multiple presets are active.
 
-| Preset | Citation | Retention | Cadence | Notes |
-|---|---|---|---|---|
-| `soc2` | TSC CC7.2 | 2 years | 60 min | Continuous monitoring of audit logs. |
-| `hipaa` | 45 CFR §164.316(b)(2) | 6 years | — | Pair with `--features sqlcipher` for required at-rest crypto. |
-| `gdpr` | Art. 30 + Art. 5(1)(e) | 3 years | — | `pseudonymize_actors` reserved for v0.7+. |
-| `fedramp` | NIST SP 800-53 AU-11 / AU-12 | 3 years | 30 min | High-water mark for federal civilian / DoD IL2-IL5. |
+| Preset | Citation (retention) | Retention | Notes |
+|---|---|---|---|
+| `soc2` | TSC CC7.2 | 2 years | Retention only — see the attestation-cadence note below. |
+| `hipaa` | 45 CFR §164.316(b)(2) | 6 years | Pair with `--features sqlcipher` for required at-rest crypto. |
+| `gdpr` | Art. 30 + Art. 5(1)(e) | 3 years | `pseudonymize_actors` is reserved — no implementation. |
+| `fedramp` | NIST SP 800-53 AU-11 | 3 years | Retention high-water mark for federal civilian / DoD IL2-IL5. |
+
+**Attestation cadence is not mapped, deliberately.** Earlier revisions of this
+table published a per-preset attestation cadence (SOC2 60 min, FedRAMP 30 min)
+against TSC CC7.2 and NIST SP 800-53 AU-12. That mapping is withdrawn: the
+cadence resolver exists, but nothing consumes its value — the
+`CHECKPOINT.sig` marker it would drive is RESERVED and unimplemented (see the
+Quickstart note). A named control citation that resolves to a value no code
+acts on is worse than no mapping, so there is no cadence column. It returns
+when the emission does.
+
+What the presets do map is **retention** (`AuditConfig::effective_retention_days`,
+enforced by `ai-memory logs purge`, which warns when a purge cutoff overlaps
+the configured audit-retention horizon).
 
 The presets are configuration only. Compliance certification still
 requires the broader control environment (access reviews, change

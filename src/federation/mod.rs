@@ -40,15 +40,18 @@
 pub mod identity;
 pub mod peer;
 pub mod peer_attestation;
-// v0.7.0 Track D #933 — federation push DLQ + replay worker. The
-// concrete module requires `async-trait` for the object-safe sink
-// trait + sqlx for the postgres sink; both are SAL-feature deps so
-// the entire DLQ surface is feature-gated to `--features sal`. The
-// sqlite-only (default-features) build keeps `FederationConfig.dlq_sink`
-// typed as `Option<()>` via the stub below so call sites stay uniform
-// across builds.
-#[cfg(feature = "sal")]
+// v0.7.0 Track D #933 — federation push DLQ + replay worker.
+// #2678: the module is ungated on the default (sqlite-only) build so
+// failed fanouts land in `federation_push_dlq` rather than being
+// silently dropped. `async-trait` is a non-optional dep because the
+// sink is stored as `Arc<dyn FederationDlqSink>` (dyn dispatch for
+// sqlite vs postgres backends). Native AFIT is not object-safe yet
+// (rust-skills: async-fn-in-trait caveat 1) — keep `#[async_trait]`
+// until a dyn-compatible AFIT path lands. Postgres sink remains
+// `#[cfg(feature = "sal-postgres")]` inside the module.
+// proj-feature-additive: un-gating is additive; do NOT flip `default`.
 pub mod push_dlq;
+pub mod push_lanes;
 pub mod quorum;
 pub mod receive;
 pub mod receive_auth;
@@ -74,7 +77,6 @@ pub use receive::catchup_once_for_tests;
 pub use sync::*;
 // v0.7.0 Track D #933 — re-export push DLQ surface for daemon bootstrap +
 // integration tests.
-#[cfg(feature = "sal")]
 pub use push_dlq::{
     FederationDlqSink, FederationPushDlqRow, REPLAY_BATCH_SIZE, replay_once,
     spawn_replay_federation_push_dlq,
@@ -126,9 +128,11 @@ pub struct FederationConfig {
     /// — typically test harnesses that exercise `broadcast_*_quorum`
     /// in isolation.
     ///
-    /// Feature-gated to `--features sal` because the trait surface
-    /// (`async-trait`) is a SAL-only dep.
-    #[cfg(feature = "sal")]
+    /// #2678 — always present. Default-build daemons wire
+    /// [`push_dlq::SqliteDlqSink`]; postgres daemons wire
+    /// [`push_dlq::PostgresDlqSink`] under `sal-postgres`. `None` only
+    /// in isolated unit tests that exercise `broadcast_*_quorum`
+    /// without a durable sink.
     pub dlq_sink: Option<std::sync::Arc<dyn push_dlq::FederationDlqSink>>,
 }
 
@@ -482,7 +486,6 @@ mod tests {
             sender_agent_id: "ai:fed-test".to_string(),
             api_key: None,
             signing_key: None,
-            #[cfg(feature = "sal")]
             dlq_sink: None,
         }
     }
@@ -1428,8 +1431,8 @@ mod tests {
         let cfg = FederationConfig::build(
             2,
             &[
-                "http://peer-a.example/".to_string(),
-                "http://peer-b.example".to_string(),
+                "https://peer-a.example/".to_string(),
+                "https://peer-b.example".to_string(),
             ],
             Duration::from_millis(500),
             None,
@@ -1441,16 +1444,37 @@ mod tests {
         .unwrap()
         .expect("config should be Some when w>0 and peers nonempty");
         assert_eq!(cfg.peer_count(), 2);
-        assert_eq!(cfg.peers[0].id, "peer-0");
-        assert_eq!(cfg.peers[1].id, "peer-1");
+        // #2442 — ids are derived from peer IDENTITY (the normalised URL),
+        // never from the flag position. Assert the SHAPE and the distinctness,
+        // not a hard-coded digest: pinning the literal here would turn a
+        // silent change to the derivation (which re-keys every persisted
+        // federation_push_dlq row) into a one-line test edit instead of the
+        // migration it actually is. The frozen-wire-format contract is pinned
+        // deliberately, once, in tests/federation_stable_peer_id_2442.rs.
+        for peer in &cfg.peers {
+            assert!(
+                peer.id.starts_with("peer-h"),
+                "peer id must carry the #2442 stable-identity prefix, got {}",
+                peer.id
+            );
+            assert!(
+                !crate::federation::peer::is_legacy_positional_peer_id(&peer.id),
+                "a minted peer id must never impersonate the legacy positional shape, got {}",
+                peer.id
+            );
+        }
+        assert_ne!(
+            cfg.peers[0].id, cfg.peers[1].id,
+            "distinct peers must mint distinct routing keys"
+        );
         // Trailing slash is stripped during URL normalization.
         assert_eq!(
             cfg.peers[0].sync_push_url,
-            "http://peer-a.example/api/v1/sync/push"
+            "https://peer-a.example/api/v1/sync/push"
         );
         assert_eq!(
             cfg.peers[1].sync_push_url,
-            "http://peer-b.example/api/v1/sync/push"
+            "https://peer-b.example/api/v1/sync/push"
         );
         assert_eq!(cfg.sender_agent_id, "ai:builder");
     }
@@ -1460,8 +1484,8 @@ mod tests {
         let result = FederationConfig::build(
             2,
             &[
-                "http://peer.example".to_string(),
-                "http://peer.example/".to_string(),
+                "https://peer.example".to_string(),
+                "https://peer.example/".to_string(),
             ],
             Duration::from_millis(500),
             None,
@@ -1487,7 +1511,7 @@ mod tests {
         let bogus = std::path::PathBuf::from("/definitely/does/not/exist/ca.pem");
         let result = FederationConfig::build(
             2,
-            &["http://peer.example".to_string()],
+            &["https://peer.example".to_string()],
             Duration::from_millis(500),
             None,
             None,
@@ -1514,7 +1538,7 @@ mod tests {
         std::fs::write(&bad, b"this is not a valid pem certificate").unwrap();
         let result = FederationConfig::build(
             2,
-            &["http://peer.example".to_string()],
+            &["https://peer.example".to_string()],
             Duration::from_millis(500),
             None,
             None,
@@ -1539,7 +1563,7 @@ mod tests {
         let bogus_key = std::path::PathBuf::from("/definitely/missing/key.pem");
         let result = FederationConfig::build(
             2,
-            &["http://peer.example".to_string()],
+            &["https://peer.example".to_string()],
             Duration::from_millis(500),
             Some(&bogus_cert),
             Some(&bogus_key),
@@ -1833,7 +1857,6 @@ mod tests {
             sender_agent_id: "ai:catchup-test".to_string(),
             api_key: None,
             signing_key: None,
-            #[cfg(feature = "sal")]
             dlq_sink: None,
         }
     }
@@ -2181,7 +2204,7 @@ mod tests {
 
         let result = FederationConfig::build(
             2,
-            &["http://peer.example".to_string()],
+            &["https://peer.example".to_string()],
             Duration::from_millis(500),
             Some(&cert),
             Some(&key),
@@ -2213,7 +2236,7 @@ mod tests {
 
         let result = FederationConfig::build(
             2,
-            &["http://peer.example".to_string()],
+            &["https://peer.example".to_string()],
             Duration::from_millis(500),
             Some(&cert),
             Some(&bogus_key),
@@ -2472,7 +2495,6 @@ mod tests {
             sender_agent_id: "ai:no-peers".to_string(),
             api_key: None,
             signing_key: None,
-            #[cfg(feature = "sal")]
             dlq_sink: None,
         };
         // Non-empty memories list — the shortcut should still fire because
@@ -2599,8 +2621,8 @@ mod tests {
         let result = FederationConfig::build(
             2,
             &[
-                "http://peer.example".to_string(),
-                "http://peer.example/".to_string(),
+                "https://peer.example".to_string(),
+                "https://peer.example/".to_string(),
             ],
             Duration::from_millis(500),
             None,
@@ -2628,8 +2650,12 @@ mod tests {
         let result = FederationConfig::build(
             2,
             &[
-                "http://Peer.Example".to_string(),
-                "http://peer.example".to_string(),
+                // #2477 — both peers are https:// so the subject under test
+                // stays the CASE-INSENSITIVE duplicate check. The scheme
+                // guard runs first in the same loop, so a plaintext peer
+                // here would report the scheme refusal instead.
+                "https://Peer.Example".to_string(),
+                "https://peer.example".to_string(),
             ],
             Duration::from_millis(500),
             None,
@@ -2739,7 +2765,6 @@ mod tests {
             sender_agent_id: "ai:no-suffix".to_string(),
             api_key: None,
             signing_key: None,
-            #[cfg(feature = "sal")]
             dlq_sink: None,
         };
         let db = build_test_db();
