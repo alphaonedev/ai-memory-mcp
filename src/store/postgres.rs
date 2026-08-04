@@ -6269,7 +6269,16 @@ impl PostgresStore {
                     -- multiplicatively penalized so it cannot outrank its
                     -- winner at full score (reversible — clearing the
                     -- marker restores rank; sqlite twin in db::recall).
-                    * (CASE WHEN (m.metadata->>'contradiction_soft_loser') = '1'
+                    -- #2436 (CB-16) — `conserve_contradiction` stamps the
+                    -- marker as JSON boolean `true` (serde `Value::Bool`),
+                    -- so `->>` yields the TEXT 'true', NOT '1'. The prior
+                    -- `= '1'` never matched on postgres (dead penalty); the
+                    -- sqlite twins compare `json_extract(...) = 1` because
+                    -- SQLite's json_extract of a JSON true yields integer 1.
+                    -- An absent marker makes `->>` NULL, so `NULL = 'true'`
+                    -- is NULL → the CASE ELSE arm applies factor 1.0 (no
+                    -- penalty, no error).
+                    * (CASE WHEN (m.metadata->>'contradiction_soft_loser') = 'true'
                             THEN {soft_loser_factor} ELSE 1.0 END) AS rank
              FROM memories m
              WHERE m.tsv @@ plainto_tsquery('english', $1)

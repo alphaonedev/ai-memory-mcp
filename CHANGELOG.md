@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed (HTTP get-standard no longer serves private standard bodies)
+### Fixed (postgres soft-loser recall penalty was dead code)
+
+- **`PostgresStore::search_with_source_uri` now matches the G7 soft-loser marker's real JSON shape** (refs [#2436](https://github.com/alphaonedev/ai-memory-mcp/issues/2436), CB-16). `conserve_contradiction` stamps `metadata.contradiction_soft_loser` as a JSON boolean `true` (`serde_json::Value::Bool`), so postgres' `->>` operator renders it as the TEXT `'true'`. The predicate compared `(m.metadata->>'contradiction_soft_loser') = '1'`, which is ALWAYS false — the multiplicative recall down-weight never applied on postgres, so an LLM-confirmed-contradicted loser kept outranking its fresh winner at full score (a cross-backend divergence: the sqlite twins `json_extract(...) = 1` worked, the postgres mirror did not). Predicate corrected to `= 'true'`; an absent marker still yields `NULL` → factor 1.0 (no penalty, no error). The false in-code comment claiming the penalty applied is corrected. Regression: `tests/pg_soft_loser_penalty_2436.rs` (always-run sqlite value-shape + penalty pins; `#[ignore]`+`sal-postgres` live-PG parity proof).
 
 - **`GET /api/v1/namespaces?namespace=` and path-form `…/{ns}/standard` gate the standard body through `visibility::is_visible_to_caller`** (refs [#2543](https://github.com/alphaonedev/ai-memory-mcp/issues/2543); #959 residual; CWE-284). Pre-fix the sqlite arm passed `caller=None` into `handle_namespace_get_standard` and the postgres arm used `CallerContext::for_admin`, so any caller who could name a namespace received title + content + governance of a default-private standard (the last unfiltered read of that body after #2537 closed the injection path). Both arms now resolve `X-Agent-Id` and share the MCP honesty shape: count-only `standards_withheld`, no id/owner leak. Shared-scope and owner reads unchanged. CLI/MCP stdio `None` trust-all posture unchanged.
 
