@@ -686,6 +686,12 @@ pub async fn broadcast_store_quorum_with_embedding(
 /// counted against `policy.write_quorum`, deadline enforced, stragglers
 /// detached.
 ///
+/// #2498 — every dispatched peer that does not ack inside the deadline also
+/// lands a `federation_push_dlq` row (the #933 landing pass, mirrored onto
+/// this lane) so a failed erasure is durably recorded and retried instead of
+/// vanishing after one `tracing::warn`. See the landing pass at the bottom of
+/// this function for the (memory_id, peer_id) upsert-collision analysis.
+///
 /// # Errors
 ///
 /// Returns `QuorumError::LocalWriteFailed` if the internal tracker Arc cannot
@@ -706,6 +712,19 @@ pub async fn broadcast_delete_quorum(
     });
 
     let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
+    // #2498 — mirror of the #933 store-lane bookkeeping. Snapshot the
+    // dispatched peer ids BEFORE the fanout so the DLQ landing pass at
+    // the bottom can compute "dispatched ∖ acked = did-not-converge"
+    // independent of whether each task reported an outcome inside the
+    // deadline (a deadline-evicted task never reports). Pre-#2498 EVERY
+    // delete-lane failure — peer down, deadline elapsed, or a receiver
+    // refusal surfaced as `skipped > 0` inside an HTTP 200 and converted
+    // to a non-ack by #2341's `success_report_non_ack_reason` — was
+    // `tracing::warn`-only and then vanished: nothing retried it, so the
+    // replica kept a row the origin erased, permanently and silently,
+    // and could later LWW-resurrect it.
+    #[cfg(feature = "sal")]
+    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
     for peer in &config.peers {
         let client = config.client.clone();
         let url = peer.sync_push_url.clone();
@@ -729,6 +748,14 @@ pub async fn broadcast_delete_quorum(
         });
     }
 
+    // #2498 — per-peer outcomes observed INSIDE the deadline, so the
+    // landing pass below can distinguish (a) acked peers (skip), (b)
+    // explicit-fail peers (DLQ with the peer's own failure reason), and
+    // (c) deadline-evicted peers whose task never reported (DLQ with
+    // `deadline_exceeded`). Byte-identical bookkeeping to the store lane.
+    #[cfg(feature = "sal")]
+    let mut explicit_failures: Vec<(String, String)> = Vec::new();
+
     let deadline = now + config.policy.ack_timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -744,6 +771,8 @@ pub async fn broadcast_delete_quorum(
             }
             Ok(Some(Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))))) => {
                 tracing::warn!("federation: delete peer {peer_id} failed for {id}: {reason}");
+                #[cfg(feature = "sal")]
+                explicit_failures.push((peer_id, reason));
             }
             Ok(Some(Err(e))) => {
                 tracing::warn!("federation: delete peer join error: {e}");
@@ -773,6 +802,101 @@ pub async fn broadcast_delete_quorum(
             detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
+
+    // #2498 — federation push DLQ landing for the DELETE lane, mirroring
+    // the #933 store-lane pass. For every dispatched peer that did NOT
+    // ack inside the deadline (explicit `Fail`/`Throttled` outcomes AND
+    // deadline-evicted tasks whose outcome was never observed), insert a
+    // `federation_push_dlq` row so `replay_federation_push_dlq` re-POSTs
+    // the erasure when the peer recovers or its config is fixed.
+    //
+    // The enqueued `payload_json` is the delete body built above
+    // (`{sender_agent_id, memories: [], deletions: [id], dry_run: false}`),
+    // so the existing replay worker re-POSTs a correct deletion with NO
+    // replay-side change: `replay_once` passes `row.memory_id` as both
+    // `expected_id` and the idempotency key, and `expected_id` only ever
+    // matters for the `ids` echo in `post_once`, which a delete response
+    // does not carry.
+    //
+    // Best-effort: a sink error NEVER propagates — the local erasure
+    // already committed and the quorum verdict is already computed.
+    // Feature-gated to `--features sal` because the sink trait is a
+    // sal-only surface; the default build keeps pre-#2498 behaviour.
+    //
+    // ## Data-integrity note — the (memory_id, peer_id) upsert key
+    //
+    // `enqueue_push_failure` upserts on `(memory_id, peer_id)` with
+    // `DO UPDATE SET payload_json = excluded.payload_json`, so store-lane
+    // and delete-lane rows for the same memory+peer COLLIDE, last-failure
+    // -wins. Two orderings matter:
+    //
+    // 1. **store-then-delete** — a pending STORE row is overwritten by the
+    //    DELETE payload. This is CORRECT and deliberate: the delete is the
+    //    newer intent for the same key, replaying the superseded store
+    //    body would resurrect a row the origin erased, and the peer
+    //    converges to "absent", which is exactly the origin's state.
+    //
+    // 2. **delete-then-restore (KNOWN BOUNDED RESIDUAL, #2498)** — a
+    //    pending DELETE row that replays AFTER the same id was legitimately
+    //    restored locally (`db::restore_archived` reuses the archived id
+    //    verbatim) and re-replicated to that peer would DESTROY the
+    //    restored replica row. It is reachable because nothing supersedes
+    //    a pending row on a SUCCESSFUL push: the store/restore lanes
+    //    enqueue only on FAILURE, and there is no "clear pending row for
+    //    (memory_id, peer_id)" sink verb. The exposure is bounded — the
+    //    replay tick drains a pending row on the first healthy peer tick
+    //    (default 30s cadence), the origin's durable TEXT is untouched, and
+    //    the replica re-converges on the next anti-entropy catchup — but it
+    //    is NOT closed here: closing it needs a new `FederationDlqSink`
+    //    verb (a public-trait change, so a 5-agent vote per CLAUDE.md T1),
+    //    which is deliberately out of scope for this fix. Do NOT "fix" it
+    //    by giving the delete lane a distinct upsert key: that leaves case
+    //    2 exactly as reachable AND regresses case 1 into a transient
+    //    resurrection. The counterfactual — no delete DLQ at all — is the
+    //    graver integrity failure it replaces: a permanent, silent replica
+    //    divergence where the peer keeps GDPR-erased content forever and
+    //    can LWW-resurrect it into the mesh.
+    //
+    // The #1821/G30 `forget_tombstones` guard does NOT cover case 2: it is
+    // consulted on inbound WRITES (`db::insert_if_newer`) and the
+    // `restores[]` receive chokepoint against the RECEIVER's own
+    // tombstones, and it never gates the inbound DELETE lane. In case 2
+    // the peer never applied the delete, so it holds no tombstone for that
+    // id, and an operator-initiated `restore_archived` deliberately
+    // bypasses the tombstone gate as an authorized un-forget.
+    #[cfg(feature = "sal")]
+    if let Some(sink) = config.dlq_sink.as_ref() {
+        let acked = tracker.acked_peer_ids();
+        let explicit_map: std::collections::HashMap<String, String> =
+            explicit_failures.into_iter().collect();
+        for peer_id in &dispatched_peer_ids {
+            if acked.contains(peer_id) {
+                continue;
+            }
+            let reason = explicit_map
+                .get(peer_id)
+                .cloned()
+                .unwrap_or_else(|| "deadline_exceeded".to_string());
+            if let Err(e) = sink.enqueue_push_failure(id, peer_id, &body, &reason).await {
+                tracing::warn!(
+                    target: super::push_dlq::PUSH_DLQ_TRACE_TARGET,
+                    memory_id = %id,
+                    peer_id = %peer_id,
+                    "federation: failed to enqueue delete push-failure DLQ row \
+                     for peer {peer_id} on memory {id}: {e}",
+                );
+            } else {
+                tracing::info!(
+                    target: super::push_dlq::PUSH_DLQ_TRACE_TARGET,
+                    memory_id = %id,
+                    peer_id = %peer_id,
+                    reason = %reason,
+                    "federation: enqueued delete push-failure DLQ row for peer \
+                     {peer_id} on memory {id} (reason: {reason})",
+                );
+            }
+        }
+    }
     Ok(tracker)
 }
 
