@@ -640,6 +640,13 @@ pub enum Command {
     /// v0.7.0 ARCH-3 / FX-C3 (batch2) — `ai-memory quota-status`. CLI
     /// parity for `memory_quota_status`.
     QuotaStatus(crate::cli::commands::quota_status::QuotaStatusArgs),
+    /// #2676 / Gate 3 — report cargo features compiled into this binary.
+    ///
+    /// Prints `version:` + `features:` (comma-separated, sorted). Use
+    /// `--json` for `{"version","features"}`. Provision / measure harnesses
+    /// MUST assert the feature set (e.g. `sal-postgres` when certifying
+    /// Postgres), not merely `--version` success.
+    Features,
 }
 
 /// `ai-memory governance` parent argument struct.
@@ -1401,6 +1408,12 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::gc::run_stats(&db_path, j, &mut out)
+        }
+        Command::Features => {
+            // #2676 — no DB, no network: pure compile-time report.
+            let report = crate::build_features::features_report(j);
+            print!("{report}");
+            Ok(())
         }
         Command::Namespaces => {
             let stdout = std::io::stdout();
@@ -7888,6 +7901,7 @@ mod tests {
             &["ai-memory", "get", "id"],
             &["ai-memory", "list"],
             &["ai-memory", "stats"],
+            &["ai-memory", "features"],
             &["ai-memory", "namespaces"],
             &["ai-memory", "export"],
             &["ai-memory", "shell"],
@@ -7919,6 +7933,7 @@ mod tests {
         // here too for explicitness):
         assert!(is_write_command(&Command::Gc));
         assert!(!is_write_command(&Command::Stats));
+        assert!(!is_write_command(&Command::Features));
         assert!(!is_write_command(&Command::Namespaces));
         assert!(!is_write_command(&Command::Export(
             cli::io::ExportArgs::default()

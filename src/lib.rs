@@ -412,7 +412,7 @@ pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 80;
 /// actuator, bumping 87 → 88; v1.0.0 #1978 added `Watch` for the
 /// `ai-memory watch [--once|--daemon]` L3 substrate poll-based
 /// filesystem-watcher capture daemon, bumping 88 → 89.)
-pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 89;
+pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 90;
 
 /// Variants in `pub enum Command` that COMPILE under `--features sal`
 /// (or `sal-postgres`, which implies sal in `Cargo.toml`). Equals the
@@ -431,7 +431,7 @@ pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 89;
 /// (substrate record-stop actuator), bumping 89 → 90; v1.0.0 #1978
 /// added `Watch` (L3 substrate poll-based filesystem-watcher capture
 /// daemon), bumping 90 → 91.
-pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 91;
+pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 92;
 
 // ---------------------------------------------------------------------------
 // ARCH-10 (FX-C4-batch2, 2026-05-26) — minimal FFI self-identification
@@ -569,6 +569,7 @@ pub mod bench;
 // loop for `offloaded_blobs`; future v0.8.0 substrate tasks land
 // here without churning `daemon_runtime`.
 pub mod background;
+pub mod build_features;
 // v0.8.0 Pillar 1 (#1709) — attested-checkpoint sqlite free-functions
 // (mirrors `crate::signals`); backs the SAL `checkpoint_*` surface + the
 // future MCP `memory_checkpoint_*` handlers over a bare rusqlite Connection.
