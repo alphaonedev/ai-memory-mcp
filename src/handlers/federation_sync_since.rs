@@ -50,15 +50,28 @@ use super::{StorageBackend, store_err_to_response};
 /// Tie-group safety (the reason this is not simply `examined.last()`):
 /// the cursor predicate is strict `>`, so advancing to a timestamp that
 /// several rows share SKIPS every sharer that fell beyond the `LIMIT`.
-/// When the page came back FULL (`len >= limit`) it may have been cut
-/// mid-tie-group, so the trailing tie group is dropped and the cursor
-/// lands on the largest strictly-smaller timestamp examined; those rows
-/// are simply re-examined on the next pull (idempotent — the receiver
-/// applies `insert_if_newer`). A short page cannot have been cut, so it
-/// advances to the last row. A FULL page whose rows ALL share one
-/// timestamp yields `None`: refusing to advance stalls (loudly, at the
-/// call site), whereas advancing would silently drop rows — DEGRADE,
+/// When the page came back FULL (`raw_count >= limit`) it may have been
+/// cut mid-tie-group, so the trailing tie group is dropped and the
+/// cursor lands on the largest strictly-smaller timestamp examined;
+/// those rows are simply re-examined on the next pull (idempotent — the
+/// receiver applies `insert_if_newer`). A short page cannot have been
+/// cut, so it advances to the last row. A FULL page whose rows ALL share
+/// one timestamp yields `None`: refusing to advance stalls (loudly, at
+/// the call site), whereas advancing would silently drop rows — DEGRADE,
 /// never lose data.
+///
+/// #2718 / CB-14 / F7 — truncation is tested against `raw_count`, the
+/// number of rows the SQL `LIMIT` returned BEFORE the mapper dropped any
+/// undecryptable row (#2383), NOT the post-drop `examined.len()`. Both
+/// backends drop undecryptable rows, so a full page containing even one
+/// such row has `examined.len() < raw_count == limit`; keying truncation
+/// off `examined.len()` made that full page look short and advanced the
+/// watermark over a straddling tie group, silently dropping the boundary
+/// timestamp's other members that fell beyond the `LIMIT`. The walk-back
+/// still operates over `examined` (the delivered rows): every row with a
+/// timestamp strictly below `examined.last()` is fully contained in the
+/// page (they precede the boundary row in `updated_at ASC` order), so
+/// landing on the newest such timestamp is safe regardless of drops.
 ///
 /// Residual, documented rather than hidden: the postgres SAL adapter
 /// additionally clamps its own `LIMIT` internally, so an operator who
@@ -66,10 +79,11 @@ use super::{StorageBackend, store_err_to_response};
 /// genuinely-cut page look short here and re-open the tie hazard on
 /// that backend. That is the pre-#2441 behaviour of every puller, so it
 /// is not a regression; the guard simply does not extend to it.
-fn next_since_watermark(examined: &[Memory], limit: usize) -> Option<String> {
+fn next_since_watermark(examined: &[Memory], raw_count: usize, limit: usize) -> Option<String> {
     let last = examined.last()?;
-    if examined.len() < limit {
-        // Page was not truncated: no row beyond it can share `last`.
+    if raw_count < limit {
+        // Page was not truncated: the SQL `LIMIT` returned fewer rows than
+        // `limit`, so no row beyond the page can share `last`.
         return Some(last.updated_at.clone());
     }
     // Page may have been cut mid-tie-group. Walk back to the newest
@@ -87,11 +101,15 @@ fn next_since_watermark(examined: &[Memory], limit: usize) -> Option<String> {
 /// stall is real and must be loud rather than silent — raise
 /// `?limit=` (or `AI_MEMORY_MAX_PAGE_SIZE`) past the size of that
 /// timestamp's tie group and the pull converges on the next cycle.
-fn warn_if_cursor_pinned(next_since: Option<&str>, examined: usize, limit: usize) {
-    if next_since.is_none() && examined > 0 && examined >= limit {
+fn warn_if_cursor_pinned(next_since: Option<&str>, raw_count: usize, limit: usize) {
+    // #2718 / F7 — "full page" is measured by `raw_count` (pre-drop SQL
+    // rows), matching `next_since_watermark`, so a full page held by a
+    // single-timestamp tie group still WARNs even when undecryptable rows
+    // shrank the delivered set below `limit`.
+    if next_since.is_none() && raw_count > 0 && raw_count >= limit {
         tracing::warn!(
             target: "federation::scope",
-            examined,
+            examined = raw_count,
             limit,
             "sync_since: every row in a FULL page shares one updated_at; the pull \
              cursor cannot advance without skipping rows, so it is held. The peer \
@@ -317,9 +335,9 @@ pub async fn sync_since(
     // to the underlying store.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let mems = match app
+        let (mems, raw_count) = match app
             .store
-            .list_memories_updated_since(q.since.as_deref(), limit)
+            .list_memories_updated_since_counted(q.since.as_deref(), limit)
             .await
         {
             Ok(v) => v,
@@ -328,8 +346,11 @@ pub async fn sync_since(
         let total = mems.len();
         // #2441 — derive the pull cursor from rows EXAMINED, before the
         // two in-memory filters below shrink the page (possibly to zero).
-        let next_since = next_since_watermark(&mems, limit);
-        warn_if_cursor_pinned(next_since.as_deref(), total, limit);
+        // #2718 / F7 — truncation is measured by the RAW pre-drop count,
+        // not `total` (post-drop), so an undecryptable row cannot advance
+        // the watermark over a straddling tie group.
+        let next_since = next_since_watermark(&mems, raw_count, limit);
+        warn_if_cursor_pinned(next_since.as_deref(), raw_count, limit);
         let ns_filtered: Vec<Memory> = mems.into_iter().filter(|m| allowed(&m.namespace)).collect();
         let after_ns = ns_filtered.len();
         let excluded = total.saturating_sub(after_ns);
@@ -362,17 +383,20 @@ pub async fn sync_since(
     }
 
     let lock = state.lock().await;
-    let mems = match db::memories_updated_since(&lock.0, q.since.as_deref(), limit) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("sync_since: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
-            )
-                .into_response();
-        }
-    };
+    // #2718 / F7 — counted read: `raw_count` is the pre-drop SQL row count
+    // used for the tie-group truncation guard below.
+    let (mems, raw_count) =
+        match db::memories_updated_since_counted(&lock.0, q.since.as_deref(), limit) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("sync_since: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
+                )
+                    .into_response();
+            }
+        };
 
     // v0.7.0 #239 — apply per-peer namespace scope filter. Rows
     // outside the operator-configured allowlist are EXCLUDED from
@@ -383,8 +407,11 @@ pub async fn sync_since(
     // in-memory filters below shrink the page (possibly to zero). This
     // value is ALSO what the server records as the peer's observed
     // watermark below, so a fully-filtered window advances both sides.
-    let next_since = next_since_watermark(&mems, limit);
-    warn_if_cursor_pinned(next_since.as_deref(), total, limit);
+    // #2718 / F7 — truncation is measured by the RAW pre-drop count, not
+    // `total` (post-drop), so an undecryptable row cannot advance the
+    // watermark over a straddling tie group.
+    let next_since = next_since_watermark(&mems, raw_count, limit);
+    warn_if_cursor_pinned(next_since.as_deref(), raw_count, limit);
     let mems: Vec<Memory> = mems.into_iter().filter(|m| allowed(&m.namespace)).collect();
     let excluded = total.saturating_sub(mems.len());
 
@@ -452,4 +479,96 @@ pub async fn sync_since(
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod next_since_watermark_tests {
+    use super::next_since_watermark;
+    use crate::models::Memory;
+
+    fn mem_at(ts: &str) -> Memory {
+        Memory {
+            updated_at: ts.to_string(),
+            ..Memory::default()
+        }
+    }
+
+    /// A short page (raw_count < limit) advances to the last row: it
+    /// cannot have been cut, so no tie-group hazard.
+    #[test]
+    fn short_page_advances_to_last() {
+        let examined = vec![
+            mem_at("2026-06-01T00:00:00Z"),
+            mem_at("2026-06-02T00:00:00Z"),
+        ];
+        // raw_count == examined.len() == 2 < limit 10.
+        assert_eq!(
+            next_since_watermark(&examined, 2, 10).as_deref(),
+            Some("2026-06-02T00:00:00Z")
+        );
+    }
+
+    /// A FULL page cut mid-tie-group walks back to the newest strictly-
+    /// older timestamp (never advances over the straddling group).
+    #[test]
+    fn full_page_walks_back_over_tie_group() {
+        let examined = vec![
+            mem_at("2026-06-01T00:00:00Z"),
+            mem_at("2026-06-02T00:00:00Z"),
+            mem_at("2026-06-02T00:00:00Z"),
+        ];
+        // Full page (raw_count == limit == 3), trailing tie group at
+        // 06-02 may have members beyond LIMIT → walk back to 06-01.
+        assert_eq!(
+            next_since_watermark(&examined, 3, 3).as_deref(),
+            Some("2026-06-01T00:00:00Z")
+        );
+    }
+
+    /// #2718 / F7 — THE bug: a FULL page whose LAST row was dropped as
+    /// undecryptable. `examined.len()` is post-drop (2) and would falsely
+    /// read as short vs limit 3, advancing the watermark to the delivered
+    /// last row (06-02) and SKIPPING the straddling tie group that shares
+    /// 06-03 beyond the LIMIT. Keying off `raw_count` (3, the pre-drop SQL
+    /// count) correctly treats the page as FULL and walks back to 06-01.
+    #[test]
+    fn full_page_with_dropped_undecryptable_last_row_does_not_skip_tie_group() {
+        // Raw SQL returned 3 rows [06-01, 06-02, 06-03]; the 06-03 row was
+        // undecryptable and dropped, so `examined` holds only 2 rows and
+        // its last is 06-02 (a possibly-straddling tie boundary too).
+        let examined = vec![
+            mem_at("2026-06-01T00:00:00Z"),
+            mem_at("2026-06-02T00:00:00Z"),
+        ];
+        let raw_count = 3; // pre-drop SQL row count == limit
+        let limit = 3;
+        // Correct behavior: treat as FULL, walk back below the delivered
+        // last row (06-02) to the newest strictly-older ts (06-01).
+        assert_eq!(
+            next_since_watermark(&examined, raw_count, limit).as_deref(),
+            Some("2026-06-01T00:00:00Z"),
+            "raw-count guard must treat a drop-shortened full page as truncated"
+        );
+        // Contrast: the OLD post-drop-length logic (examined.len()==2 < 3)
+        // would have advanced to 06-02, skipping the 06-03 tie group.
+    }
+
+    /// A FULL page whose every delivered row shares one timestamp yields
+    /// `None` — refuse to advance (DEGRADE, never drop rows).
+    #[test]
+    fn full_single_timestamp_page_holds_cursor() {
+        let examined = vec![
+            mem_at("2026-06-02T00:00:00Z"),
+            mem_at("2026-06-02T00:00:00Z"),
+        ];
+        assert_eq!(next_since_watermark(&examined, 2, 2), None);
+    }
+
+    /// A full page where ALL rows were dropped (empty delivered set) holds
+    /// the cursor — never advances past undelivered rows.
+    #[test]
+    fn full_page_all_dropped_holds_cursor() {
+        let examined: Vec<Memory> = Vec::new();
+        assert_eq!(next_since_watermark(&examined, 5, 5), None);
+    }
 }

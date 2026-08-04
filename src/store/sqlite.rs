@@ -761,6 +761,21 @@ impl MemoryStore for SqliteStore {
         db::memories_updated_since(&conn, since, capped).map_err(box_err)
     }
 
+    // #2718 / CB-14 / F7 — same federation catch-up read as above but ALSO
+    // returns the RAW pre-drop SQL row count so the `/sync/since`
+    // tie-group watermark guard is correct. The sqlite path drops
+    // undecryptable rows (#2383), so the post-drop `Vec` length is NOT a
+    // safe truncation signal.
+    async fn list_memories_updated_since_counted(
+        &self,
+        since: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<(Vec<Memory>, usize)> {
+        let conn = self.state.lock().await;
+        let capped = limit.clamp(1, 10_000);
+        db::memories_updated_since_counted(&conn, since, capped).map_err(box_err)
+    }
+
     async fn apply_remote_memory(
         &self,
         _ctx: &CallerContext,

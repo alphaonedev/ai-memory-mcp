@@ -1715,6 +1715,37 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// v1.0.0 #2718 / CB-14 / F7 — the tie-group-safe sibling of
+    /// [`Self::list_memories_updated_since`]. Returns the projected rows
+    /// PLUS the RAW pre-drop SQL row count (rows the `LIMIT` returned
+    /// before any undecryptable row was dropped during mapping).
+    ///
+    /// The `/sync/since` `next_since_watermark` truncation guard MUST key
+    /// off this raw count, not the post-drop `Vec` length — otherwise one
+    /// undecryptable row in a full page reads as a short (untruncated)
+    /// page and the pull watermark advances over a straddling tie group,
+    /// silently dropping the rows that share the boundary timestamp
+    /// beyond the `LIMIT`.
+    ///
+    /// Default implementation delegates to
+    /// [`Self::list_memories_updated_since`] and reports `rows.len()` as
+    /// the count. Any adapter that DROPS rows during mapping (both the
+    /// sqlite and postgres adapters skip undecryptable rows, #2383) MUST
+    /// override this to report the true pre-drop count.
+    ///
+    /// # Errors
+    ///
+    /// Mirrors [`Self::list_memories_updated_since`].
+    async fn list_memories_updated_since_counted(
+        &self,
+        since: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<(Vec<Memory>, usize)> {
+        let rows = self.list_memories_updated_since(since, limit).await?;
+        let n = rows.len();
+        Ok((rows, n))
+    }
+
     /// Apply a remote-origin memory through an idempotent
     /// "insert-if-newer" path. Returns the resolved memory id (the
     /// adapter's row id, which may differ from the supplied `memory.id`

@@ -3330,16 +3330,26 @@ pub async fn sync_push(
     }
 
     // v0.8.0 Pillar-3 (#1709) / #224 Task 3a.1 — CRDT-lite merge: fold
-    // the sender's full vector clock into the receiver's persisted
-    // sync-state (pointwise max). Additive over the per-peer `observe`
-    // above — `observe` advances only what THIS push told us about the
-    // sender, whereas the merge enriches the receiver clock with every
-    // peer the sender has transitively observed, so the receiver's clock
-    // reflects all known peer timestamps (the reconciliation foundation
-    // for redundant-push short-circuiting). Monotonic: an older incoming
-    // timestamp never regresses a newer stored entry. Skipped in dry-run.
+    // the sender's vector clock into the receiver's persisted sync-state
+    // (pointwise max), monotonic (an older incoming timestamp never
+    // regresses a newer stored entry). Skipped in dry-run.
+    //
+    // v1.0.0 #2718 / CB-14 (relates #2670) — this fold is now PER-KEY
+    // AUTHORIZED. Pre-fix it called the un-gated `db::sync_state_merge`,
+    // which folded EVERY entry in `body.sender_clock`, so a hostile /
+    // buggy peer A could inject an arbitrarily-high timestamp for peer
+    // B's key and permanently PIN B's cursor (every later pull from B
+    // then returns zero rows). A peer is only authorized to advance its
+    // OWN clock entry, so the fold now accepts ONLY the entry keyed by
+    // `body.sender_agent_id` — the sender can move its own clock forward
+    // and NOTHING ELSE. Peer A's push can never touch peer B's entry.
     if !body.dry_run
-        && let Err(e) = db::sync_state_merge(&lock.0, &local_agent_id, &body.sender_clock)
+        && let Err(e) = db::sync_state_merge_authorized(
+            &lock.0,
+            &local_agent_id,
+            &body.sender_agent_id,
+            &body.sender_clock,
+        )
     {
         tracing::warn!("sync_push: sync_state_merge failed: {e}");
     }
