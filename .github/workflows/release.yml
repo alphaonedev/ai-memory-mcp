@@ -128,8 +128,22 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # #2676 packaging residual — release channel must not ship default-only
+      # binaries that omit `sal` (federation/SAL surface). Assert via the same
+      # pin Gate3 provision uses (`scripts/assert-compiled-features.sh`).
+      # Note: `sal-postgres` is NOT enabled here (sqlx/pgvector weight + native
+      # deps on every matrix OS); operators needing PG use an asserted
+      # sal-postgres build or the plan-c image. Agents never workflow_dispatch.
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} --features sal
+
+      - name: Assert compiled features (#2676)
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
+          # Windows artifact is .exe; run via path. Script uses `features` subcommand.
+          bash scripts/assert-compiled-features.sh "$bin" \
+            --require sqlite-bundled --require sal
 
       - name: Package binary (unix)
         if: ${{ !contains(matrix.target, 'windows') }}
