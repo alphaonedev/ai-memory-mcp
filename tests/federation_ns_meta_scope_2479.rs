@@ -84,20 +84,26 @@ const PEER_ID: &str = "ai:evil";
 const VICTIM_NS: &str = "secure/ops";
 const IN_SCOPE_NS: &str = "public/ok";
 
-/// `ai:evil` may act inside `public/*` only.
+/// `ai:evil` may act inside the `public/**` tree only.
+/// Tree pattern (not `public/*`) so in-scope `namespace_meta` controls still
+/// pass the #2536 descendant-coverage probe on `public/ok`.
 const SCOPED_ALLOWLIST: &str =
-    r#"{"ai:evil":{"allowed_namespaces":["public/*"],"allowed_sender_agent_ids":["ai:evil"]}}"#;
+    r#"{"ai:evil":{"allowed_namespaces":["public/**"],"allowed_sender_agent_ids":["ai:evil"]}}"#;
 
-/// The CONTROL posture: the same peer, scoped to reach the victim namespace too.
-const SCOPED_ALLOWLIST_WITH_VICTIM: &str = r#"{"ai:evil":{"allowed_namespaces":["public/*","secure/*"],"allowed_sender_agent_ids":["ai:evil"]}}"#;
+/// The CONTROL posture: the same peer, scoped to reach the victim namespace tree.
+/// #2536 requires tree coverage (`/**`) — a single-level `secure/*` matches
+/// `secure/ops` but not its descendants, so it may not set/clear hierarchical
+/// governance on that node.
+const SCOPED_ALLOWLIST_WITH_VICTIM: &str = r#"{"ai:evil":{"allowed_namespaces":["public/*","secure/**"],"allowed_sender_agent_ids":["ai:evil"]}}"#;
 
 /// Root-namespace posture for the parent cell: the peer owns `alpha` but NOT the
 /// namespace it tries to attach as `alpha`'s inheritance parent.
 const SCOPED_ALLOWLIST_ROOT: &str =
     r#"{"ai:evil":{"allowed_namespaces":["alpha"],"allowed_sender_agent_ids":["ai:evil"]}}"#;
 
-/// The control for the parent cell: both ends of the link are in scope.
-const SCOPED_ALLOWLIST_ROOT_AND_PARENT: &str = r#"{"ai:evil":{"allowed_namespaces":["alpha","victim"],"allowed_sender_agent_ids":["ai:evil"]}}"#;
+/// The control for the parent cell: both ends of the link are in scope with
+/// tree coverage (#2536 descendant probe on `alpha`).
+const SCOPED_ALLOWLIST_ROOT_AND_PARENT: &str = r#"{"ai:evil":{"allowed_namespaces":["alpha/**","victim/**"],"allowed_sender_agent_ids":["ai:evil"]}}"#;
 
 /// Amendment E: `["*"]` reads as "any top-level namespace" but glob-matches the
 /// literal global-standard key `*`.
