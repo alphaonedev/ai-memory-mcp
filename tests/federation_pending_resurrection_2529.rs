@@ -131,7 +131,7 @@ async fn push_pendings(router: &axum::Router, pendings: Vec<Value>) -> (StatusCo
     (status, report)
 }
 
-fn pending_wire(id: &str, status: &str, approvals: Value) -> Value {
+fn pending_wire(id: &str, status: &str, approvals: &Value) -> Value {
     json!({
         "id": id,
         "action_type": "store",
@@ -199,7 +199,7 @@ async fn federated_pending_cannot_resurrect_rejected_row_2529() {
         vec![pending_wire(
             "pa-2529-rej",
             "pending",
-            json!([{"agent_id": "ai:attacker", "approved_at": chrono::Utc::now().to_rfc3339()}]),
+            &json!([{"agent_id": "ai:attacker", "approved_at": chrono::Utc::now().to_rfc3339()}]),
         )],
     )
     .await;
@@ -239,7 +239,7 @@ async fn federated_pending_rejects_wire_non_pending_status_2529() {
 
     let (st, report) = push_pendings(
         &router,
-        vec![pending_wire("pa-2529-pre", "approved", json!([]))],
+        vec![pending_wire("pa-2529-pre", "approved", &json!([]))],
     )
     .await;
     assert_eq!(st, StatusCode::OK);
@@ -259,7 +259,7 @@ async fn control_fresh_pending_still_applies_2529() {
 
     let (st, report) = push_pendings(
         &router,
-        vec![pending_wire("pa-2529-ok", "pending", json!([]))],
+        vec![pending_wire("pa-2529-ok", "pending", &json!([]))],
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{report}");
