@@ -55,7 +55,7 @@ fn set_posture(allowlist: Option<&str>) {
                 body,
             ),
             None => {
-                std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV)
+                std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
             }
         }
     }
