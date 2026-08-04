@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (federated `namespace_meta` exact-scope no longer sets descendant defaults)
+
+- **`/sync/push` `namespace_meta[]` / `namespace_meta_clears[]` require tree-scope coverage of descendants** (refs [#2536](https://github.com/alphaonedev/ai-memory-mcp/issues/2536); CWE-284). #2479 confines the row's own namespace (and parent), but `resolve_governance_policy` walks leaf-first and returns the first ancestor with a policy — so a peer enrolled for exact `["secure"]` could set the DEFAULT policy of every `secure/**` child outside its allowlist. Full pattern-vs-pattern subsumption is not in the #239 `glob_match` SSOT; the control requires the same shared `inbound_write_namespace_authorized` verdict against a **concrete deep descendant probe** (`namespace/__ai_memory_2536_desc/deep`). Exact-scope and single-level `prefix/*` fail; `prefix/**` and `**` succeed. Amendment E (`*` global) unchanged. Zero-config meshes unchanged.
+
 ### Fixed (federated `pendings[]` can no longer resurrect a decided governance row)
 
 - **`/sync/push` `pendings[]` refuses to resurrect or clobber a locally-decided pending action** (refs [#2529](https://github.com/alphaonedev/ai-memory-mcp/issues/2529); CWE-284). Pre-fix `upsert_pending_action` was `ON CONFLICT DO UPDATE` over **every** column including `status` / `decided_by` / `approvals`, so an enrolled peer could push `status: "pending"` for an id this node had already rejected and re-arm `execute_pending_action` (which only checks `status == "approved"`), defeating consensus quorum history.
