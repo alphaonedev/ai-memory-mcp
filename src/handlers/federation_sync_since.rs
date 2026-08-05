@@ -108,7 +108,7 @@ fn warn_if_cursor_pinned(next_since: Option<&str>, raw_count: usize, limit: usiz
     // shrank the delivered set below `limit`.
     if next_since.is_none() && raw_count > 0 && raw_count >= limit {
         tracing::warn!(
-            target: "federation::scope",
+            target: crate::federation::SCOPE_TRACE_TARGET,
             examined = raw_count,
             limit,
             "sync_since: every row in a FULL page shares one updated_at; the pull \
@@ -287,7 +287,7 @@ pub async fn sync_since(
         // so an unauthorised peer cannot exfiltrate the DB. The
         // `excluded_for_scope` field is honest about the partial view.
         tracing::warn!(
-            target: "federation::scope",
+            target: crate::federation::SCOPE_TRACE_TARGET,
             peer = %peer_header.as_deref().unwrap_or(""),
             "sync_since: no scope allowlist for peer; refusing to return rows. \
              Set AI_MEMORY_FED_SYNC_TRUST_PEER=1 to opt out (legacy peers)."

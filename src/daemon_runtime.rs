@@ -7042,7 +7042,7 @@ pub async fn sync_cycle_once(
             Ok(()) => Some(candidate.to_string()),
             Err(reason) => {
                 tracing::warn!(
-                    target: "federation::scope",
+                    target: crate::federation::SCOPE_TRACE_TARGET,
                     peer = %peer_url,
                     candidate = %candidate,
                     reason,
@@ -7060,7 +7060,7 @@ pub async fn sync_cycle_once(
                 Ok(()) => Some(fallback.to_string()),
                 Err(reason) => {
                     tracing::warn!(
-                        target: "federation::scope",
+                        target: crate::federation::SCOPE_TRACE_TARGET,
                         peer = %peer_url,
                         candidate = %fallback,
                         reason,

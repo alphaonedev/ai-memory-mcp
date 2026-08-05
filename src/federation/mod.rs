@@ -112,6 +112,11 @@ pub(crate) const SYNC_TRACE_TARGET: &str = "ai_memory::federation::sync";
 /// #1558 tracing-target SSOT.
 pub(crate) const SIGNING_TRACE_TARGET: &str = "federation::signing";
 
+/// Tracing target for federation NAMESPACE-SCOPE + cursor-guard WARNs
+/// (the `/sync/since` projection scope filter and the #2718 pull-cursor
+/// poisoning guards). #1558 tracing-target SSOT.
+pub(crate) const SCOPE_TRACE_TARGET: &str = "federation::scope";
+
 /// Configured-at-serve federation state. Parsed from
 /// `--quorum-writes` + `--quorum-peers` + `--quorum-timeout-ms`.
 #[derive(Clone)]
