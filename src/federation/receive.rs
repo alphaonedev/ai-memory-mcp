@@ -157,6 +157,62 @@ fn advance_catchup_watermark(latest_ts: &mut Option<String>, halted: bool, row_t
     }
 }
 
+/// #2714 (CB-10) + #2441/#2715 (CB-11) — resolve the per-peer catch-up cursor to
+/// advance `sync_state` to after applying one `/sync/since` window on the `serve`
+/// catch-up puller, unifying two data-integrity invariants that MUST hold
+/// together (consuming `next_since` to fix the stall is exactly what would
+/// otherwise open the row-loss surface, so the two fixes are one decision):
+///
+///  - **Never advance past an un-applied row (#1687/#2714).** When a
+///    transient/non-durable apply halted this window (`halted == true`), advance
+///    ONLY to `latest_ts` — the last DURABLE success (`advance_catchup_watermark`
+///    froze it at the pre-failure high-water). A `SQLITE_BUSY` (and siblings) on
+///    one row therefore leaves the cursor behind that row so it is re-pulled next
+///    cycle; the cursor is NEVER leapt forward to the peer's examined-watermark
+///    past a row this replica has not persisted.
+///
+///  - **Converge an all-out-of-scope window (#2441).** When the window applied
+///    cleanly (`halted == false`), consume the peer's honest examined-watermark
+///    `next_since` so a window the peer filtered to `count:0` (its per-peer
+///    allowlist + `scope=private` filter run IN MEMORY, AFTER the SQL `LIMIT`)
+///    still advances instead of re-requesting the identical window forever. The
+///    peer-controlled candidate is VALIDATED first — the same #2718
+///    cursor-poisoning guard `sync_cycle_once` uses (RFC3339, not far-future,
+///    strictly ahead of the current cursor) — because it is written into the
+///    monotonic (refuse-to-regress) `sync_state` upsert; on rejection, or for a
+///    legacy peer that publishes no `next_since`, fall back to `latest_ts`.
+fn resolve_catchup_advance(
+    halted: bool,
+    latest_ts: Option<&str>,
+    next_since: Option<&str>,
+    current_since: Option<&str>,
+    peer_id: &str,
+) -> Option<String> {
+    if halted {
+        // #2714 — hold at the last durable success; do NOT honour next_since.
+        return latest_ts.map(str::to_string);
+    }
+    match next_since {
+        Some(candidate) => {
+            match crate::daemon_runtime::validate_pull_cursor(candidate, current_since) {
+                Ok(()) => Some(candidate.to_string()),
+                Err(reason) => {
+                    tracing::warn!(
+                        target: crate::federation::SCOPE_TRACE_TARGET,
+                        peer = %peer_id,
+                        candidate = %candidate,
+                        reason,
+                        "catchup: refusing peer-advertised next_since cursor; leaving \
+                         sync_state watermark at the last durable success (#2718 cursor-poisoning guard)"
+                    );
+                    latest_ts.map(str::to_string)
+                }
+            }
+        }
+        None => latest_ts.map(str::to_string),
+    }
+}
+
 /// v0.6.0.1 (#320) — post-partition catchup poller.
 ///
 /// Previously a node rejoining the mesh after SIGSTOP / network blip / restart
@@ -338,6 +394,19 @@ pub(super) async fn catchup_once_with_store(
             Some(arr) => arr.clone(),
             None => continue,
         };
+        // #2441 (CB-11) — the peer applies its per-peer namespace allowlist +
+        // `scope=private` visibility filter IN MEMORY, AFTER the SQL `LIMIT`, so a
+        // window composed entirely of out-of-scope rows returns `count:0` behind
+        // an HTTP 200. `next_since` is the peer's honest examined-watermark;
+        // consuming it lets an all-filtered (or empty) window still advance the
+        // cursor instead of re-requesting the identical window forever — the
+        // #2441 stall, which #2663 fixed on `sync_cycle_once` but never on this
+        // `serve` puller. See `resolve_catchup_advance` for the halt-gated,
+        // validated advance (the legacy `latest_ts` remains the fallback).
+        let next_since: Option<String> = body
+            .get("next_since")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
 
         // #935 (v0.7.0 Track D, 2026-05-20): emit an info-level
         // success line on every accepted pull so operators tailing
@@ -347,10 +416,9 @@ pub(super) async fn catchup_once_with_store(
         // pinned by the regression test in
         // `tests/federation_catchup_api_key.rs`.
         log_catchup_pull_ok(&peer.id, memories.len());
-
-        if memories.is_empty() {
-            continue;
-        }
+        // #2441 — NO `if memories.is_empty() { continue }` early-out: an empty
+        // window must still fall through to consume `next_since` below so an
+        // all-out-of-scope window converges. The apply loops no-op on empty.
 
         let mut applied = 0usize;
         let mut latest_ts: Option<String> = None;
@@ -378,7 +446,7 @@ pub(super) async fn catchup_once_with_store(
                 crate::identity::sentinels::FEDERATION_CATCHUP,
             );
             for raw in &memories {
-                let mem: crate::models::Memory = match serde_json::from_value(raw.clone()) {
+                let mut mem: crate::models::Memory = match serde_json::from_value(raw.clone()) {
                     Ok(m) => m,
                     Err(e) => {
                         log_catchup_unparseable_memory(&peer.id, e);
@@ -396,7 +464,18 @@ pub(super) async fn catchup_once_with_store(
                 ) {
                     continue;
                 }
-                // #1687 — advance the catchup watermark ONLY for rows that
+                // #2715 (CB-11 / B-4) — per-write CONTENT attestation, the pull
+                // sibling of the `/sync/push` gate. Verify a presented
+                // `metadata.write_signature` against the author's enrolled key:
+                // forged → refuse (skip), valid → agent_attested, absent →
+                // claimed. A refused row is a deliberate, permanent refusal (not
+                // transient), so `continue` WITHOUT halting the watermark — the
+                // `next_since` advance may pass it, as re-pull cannot fix a forged
+                // signature (same disposition as a namespace-scope refusal).
+                if !crate::handlers::federation_receive::attest_inbound_pull_memory(&mut mem) {
+                    continue;
+                }
+                // #1687/#2714 — advance the catchup watermark ONLY for rows that
                 // durably applied, halting at the first failure, so sync_state
                 // never moves past an un-persisted row (which would silently
                 // drop it from every future delta). Idempotent upserts make
@@ -415,16 +494,24 @@ pub(super) async fn catchup_once_with_store(
                     }
                 }
             }
-            if let Some(ts) = latest_ts.as_deref() {
+            // #2714 + #2441 — advance to the peer's examined-watermark on a clean
+            // window; hold at the last durable success when an apply halted.
+            if let Some(ts) = resolve_catchup_advance(
+                catchup_halted,
+                latest_ts.as_deref(),
+                next_since.as_deref(),
+                since_opt.as_deref(),
+                &peer.id,
+            ) {
                 let lock = db.lock().await;
-                if let Err(e) = crate::db::sync_state_observe(&lock.0, &local_id, &peer.id, ts) {
+                if let Err(e) = crate::db::sync_state_observe(&lock.0, &local_id, &peer.id, &ts) {
                     log_catchup_sync_state_observe_failed(&peer.id, e);
                 }
             }
         } else {
             let lock = db.lock().await;
             for raw in &memories {
-                let mem: crate::models::Memory = match serde_json::from_value(raw.clone()) {
+                let mut mem: crate::models::Memory = match serde_json::from_value(raw.clone()) {
                     Ok(m) => m,
                     Err(e) => {
                         log_catchup_unparseable_memory(&peer.id, e);
@@ -442,7 +529,13 @@ pub(super) async fn catchup_once_with_store(
                 ) {
                     continue;
                 }
-                // #1687 — advance the catchup watermark only on a successful
+                // #2715 (CB-11 / B-4) — per-write content attestation (see the
+                // SAL branch). Forged → refuse (skip, no halt); valid →
+                // agent_attested; absent → claimed.
+                if !crate::handlers::federation_receive::attest_inbound_pull_memory(&mut mem) {
+                    continue;
+                }
+                // #1687/#2714 — advance the catchup watermark only on a successful
                 // insert and halt at the first failure (see the SAL branch).
                 match crate::db::insert_if_newer(&lock.0, &mem) {
                     Ok(_) => {
@@ -452,8 +545,14 @@ pub(super) async fn catchup_once_with_store(
                     Err(_) => catchup_halted = true,
                 }
             }
-            if let Some(ts) = latest_ts.as_deref()
-                && let Err(e) = crate::db::sync_state_observe(&lock.0, &local_id, &peer.id, ts)
+            // #2714 + #2441 — halt-gated, validated cursor advance.
+            if let Some(ts) = resolve_catchup_advance(
+                catchup_halted,
+                latest_ts.as_deref(),
+                next_since.as_deref(),
+                since_opt.as_deref(),
+                &peer.id,
+            ) && let Err(e) = crate::db::sync_state_observe(&lock.0, &local_id, &peer.id, &ts)
             {
                 log_catchup_sync_state_observe_failed(&peer.id, e);
             }
@@ -540,13 +639,18 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
             None => continue,
         };
 
+        // #2441 (CB-11) — consume the peer's examined-watermark so an
+        // all-out-of-scope (count:0) window still advances (see the SAL branch).
+        let next_since: Option<String> = body
+            .get("next_since")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
         // #935 — emit the canonical "pull: <peer> ok" success line
         // pinned by `tests/federation_catchup_api_key.rs`.
         log_catchup_pull_ok(&peer.id, memories.len());
-
-        if memories.is_empty() {
-            continue;
-        }
+        // #2441 — no `if memories.is_empty() { continue }`: an empty window still
+        // consumes `next_since`. The apply loop no-ops on empty.
 
         let mut applied = 0usize;
         let mut latest_ts: Option<String> = None;
@@ -560,7 +664,7 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
         {
             let lock = db.lock().await;
             for raw in &memories {
-                let mem: crate::models::Memory = match serde_json::from_value(raw.clone()) {
+                let mut mem: crate::models::Memory = match serde_json::from_value(raw.clone()) {
                     Ok(m) => m,
                     Err(e) => {
                         log_catchup_unparseable_memory(&peer.id, e);
@@ -578,7 +682,12 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
                 ) {
                     continue;
                 }
-                // #1687 — advance the catchup watermark only on a successful
+                // #2715 (CB-11 / B-4) — per-write content attestation (see the
+                // SAL branch). Forged → refuse (skip); valid → agent_attested.
+                if !crate::handlers::federation_receive::attest_inbound_pull_memory(&mut mem) {
+                    continue;
+                }
+                // #1687/#2714 — advance the catchup watermark only on a successful
                 // insert and halt at the first failure (see the SAL branch).
                 match crate::db::insert_if_newer(&lock.0, &mem) {
                     Ok(_) => {
@@ -588,8 +697,14 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
                     Err(_) => catchup_halted = true,
                 }
             }
-            if let Some(ts) = latest_ts.as_deref()
-                && let Err(e) = crate::db::sync_state_observe(&lock.0, &local_id, &peer.id, ts)
+            // #2714 + #2441 — halt-gated, validated cursor advance.
+            if let Some(ts) = resolve_catchup_advance(
+                catchup_halted,
+                latest_ts.as_deref(),
+                next_since.as_deref(),
+                since_opt.as_deref(),
+                &peer.id,
+            ) && let Err(e) = crate::db::sync_state_observe(&lock.0, &local_id, &peer.id, &ts)
             {
                 log_catchup_sync_state_observe_failed(&peer.id, e);
             }
@@ -789,6 +904,96 @@ mod issue_1687_tests {
             Some("t1"),
             "watermark must stop at the last pre-failure success"
         );
+    }
+}
+
+#[cfg(test)]
+mod issue_2714_2441_tests {
+    //! #2714 (CB-10) row-loss guard + #2441/#2715 (CB-11) stall fix for the
+    //! `serve` catch-up puller's cursor-advance resolution. Uses fixed-instant
+    //! RFC3339 timestamps so `validate_pull_cursor` (RFC3339 + not-far-future +
+    //! strictly-ahead) accepts them deterministically.
+    use super::resolve_catchup_advance;
+
+    const T1: &str = "2026-06-15T00:00:01Z";
+    const T2: &str = "2026-06-15T00:00:02Z";
+    const T3: &str = "2026-06-15T00:00:03Z";
+
+    #[test]
+    fn halted_never_advances_to_next_since_2714() {
+        // A transient apply FAILED this window (halted). The peer's
+        // examined-watermark `next_since` (T3) is FAR past the last durable
+        // success (T1). The cursor MUST hold at T1 so the un-applied row is
+        // re-pulled — never leap to T3 (which would drop it forever, #2714).
+        let advance = resolve_catchup_advance(true, Some(T1), Some(T3), Some(T1), "peer-x");
+        assert_eq!(
+            advance.as_deref(),
+            Some(T1),
+            "row-loss guard: a halted window must advance only to the last durable success"
+        );
+    }
+
+    #[test]
+    fn halted_with_no_success_holds_cursor_2714() {
+        // The very first row failed transiently: no durable success this window.
+        // The cursor MUST NOT advance at all (None) so the window is re-pulled.
+        let advance = resolve_catchup_advance(true, None, Some(T3), Some(T1), "peer-x");
+        assert_eq!(
+            advance, None,
+            "row-loss guard: no durable success => no advance, whole window re-pulled"
+        );
+    }
+
+    #[test]
+    fn clean_window_consumes_next_since_2441() {
+        // A clean window (not halted) advances to the peer's honest
+        // examined-watermark so an all-filtered (count:0) window converges.
+        let advance = resolve_catchup_advance(false, Some(T2), Some(T3), Some(T1), "peer-x");
+        assert_eq!(
+            advance.as_deref(),
+            Some(T3),
+            "stall fix: a clean window advances to the validated next_since"
+        );
+    }
+
+    #[test]
+    fn empty_filtered_window_still_advances_via_next_since_2441() {
+        // The #2441 stall: an ALL-out-of-scope window returns count:0, so no row
+        // applied (latest_ts None) and NOT halted. Pre-fix the cursor never
+        // advanced and the identical window re-pulled forever. `next_since` now
+        // advances it past the filtered rows.
+        let advance = resolve_catchup_advance(false, None, Some(T3), Some(T1), "peer-x");
+        assert_eq!(
+            advance.as_deref(),
+            Some(T3),
+            "stall fix: an empty/all-filtered window must still advance via next_since"
+        );
+    }
+
+    #[test]
+    fn poisoned_far_future_next_since_falls_back_to_latest_ts_2718() {
+        // A peer-advertised far-future cursor must be REFUSED (cursor-poisoning
+        // guard); advance only to the honest last durable success instead.
+        let poison = "2999-01-01T00:00:00Z";
+        let advance = resolve_catchup_advance(false, Some(T2), Some(poison), Some(T1), "peer-x");
+        assert_eq!(
+            advance.as_deref(),
+            Some(T2),
+            "cursor-poisoning guard: a far-future next_since falls back to latest_ts"
+        );
+    }
+
+    #[test]
+    fn legacy_peer_without_next_since_uses_latest_ts_2441() {
+        // A legacy peer that does not publish `next_since` falls back to the
+        // applied-rows high-water (byte-identical to the pre-#2441 behaviour for
+        // a non-empty window).
+        let advance = resolve_catchup_advance(false, Some(T2), None, Some(T1), "peer-x");
+        assert_eq!(advance.as_deref(), Some(T2));
+        // ...and a legacy peer with an EMPTY window still stalls (unavoidable
+        // without the field) — no advance.
+        let advance_empty = resolve_catchup_advance(false, None, None, Some(T1), "peer-x");
+        assert_eq!(advance_empty, None);
     }
 }
 
