@@ -16848,6 +16848,33 @@ pub fn sync_state_merge(
     Ok(())
 }
 
+/// v1.0.0 #2718 / CB-14 (relates #2670) — per-key-AUTHORIZED CRDT-lite
+/// fold. The un-gated [`sync_state_merge`] folds EVERY entry a sender
+/// puts in its `sender_clock`, which lets a hostile / buggy peer A
+/// inject an arbitrarily-high timestamp for peer B's key and permanently
+/// PIN B's cursor (every later pull from B then returns zero rows and
+/// nothing can lower it without a manual DB edit — the #2670 class of
+/// cursor poisoning).
+///
+/// This variant gates each entry: it folds ONLY the entry keyed by
+/// `authorized_peer` — the OWN key of the peer that sent the push — so a
+/// peer can advance its own clock entry and NOTHING ELSE. Peer A's push
+/// can never move peer B's clock entry. Entries for any other key are
+/// dropped (a peer is not authorized to advance a key that is not its
+/// own). Monotonic via [`sync_state_observe`]: an older incoming
+/// timestamp still never regresses the stored entry.
+pub fn sync_state_merge_authorized(
+    conn: &Connection,
+    agent_id: &str,
+    authorized_peer: &str,
+    incoming: &crate::models::VectorClock,
+) -> Result<()> {
+    if let Some(seen_at) = incoming.entries.get(authorized_peer) {
+        sync_state_observe(conn, agent_id, authorized_peer, seen_at)?;
+    }
+    Ok(())
+}
+
 /// Load the full vector clock for `agent_id` — the set of
 /// (`peer_id` -> `last_seen_at`) this local agent tracks.
 pub fn sync_state_load(conn: &Connection, agent_id: &str) -> Result<crate::models::VectorClock> {
@@ -16911,6 +16938,27 @@ pub fn memories_updated_since(
     since: Option<&str>,
     limit: usize,
 ) -> Result<Vec<Memory>> {
+    Ok(memories_updated_since_counted(conn, since, limit)?.0)
+}
+
+/// v1.0.0 #2718 / CB-14 / F7 — the tie-group-safe sibling of
+/// [`memories_updated_since`]: returns the projected `Vec<Memory>` PLUS
+/// the RAW pre-drop SQL row count — the number of rows the `LIMIT`
+/// returned BEFORE undecryptable rows were dropped by the #2383
+/// `flatten` below.
+///
+/// `GET /api/v1/sync/since`'s `next_since_watermark` truncation
+/// detection MUST compare THIS raw count against `limit`, never the
+/// post-drop `Vec` length: one undecryptable row in an otherwise-full
+/// page makes the post-drop length look short, which advances the pull
+/// watermark over a straddling tie group and silently drops the rows
+/// that share the boundary timestamp beyond the `LIMIT` — a data-loss
+/// bug. The raw count is the honest "was this page truncated?" signal.
+pub fn memories_updated_since_counted(
+    conn: &Connection,
+    since: Option<&str>,
+    limit: usize,
+) -> Result<(Vec<Memory>, usize)> {
     // #1028 (HIGH, 2026-05-21) — REVERTED 2026-05-21 via QC pass-2.
     // The first-pass fix added a SAL-level
     // `COALESCE(scope, 'private') <> 'private'` filter here on the
@@ -17026,8 +17074,16 @@ pub fn memories_updated_since(
     // (the send path MUST ship plaintext, see the COLS note above), so it is
     // SKIPPED with a WARN instead of failing the entire catch-up batch. It
     // stays on disk and replicates as soon as its keypair is restored.
-    rows.map(|rows| rows.into_iter().flatten().collect())
-        .map_err(Into::into)
+    //
+    // #2718 / F7 — `raw_count` is the number of SQL rows the `LIMIT`
+    // returned BEFORE the drop below. The tie-group truncation guard in
+    // `next_since_watermark` keys off THIS value, never the post-`flatten`
+    // length, so one undecryptable row can no longer make a full page look
+    // short and advance the watermark over a straddling tie group.
+    let rows = rows?;
+    let raw_count = rows.len();
+    let mems: Vec<Memory> = rows.into_iter().flatten().collect();
+    Ok((mems, raw_count))
 }
 
 /// v1.0.0 #2579 — the FTS5 external-content integrity-check command.
@@ -27756,6 +27812,59 @@ mod tests {
         );
         assert_eq!(merged.latest_from("p-stable"), Some("2026-05-01T00:00:00Z"));
         assert_eq!(merged.latest_from("p-new"), Some("2026-02-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn sync_state_merge_authorized_folds_only_the_sender_own_key_2718() {
+        // v1.0.0 #2718 / CB-14 (relates #2670) — the per-key-authorized
+        // fold: only the entry keyed by `authorized_peer` is folded; every
+        // other key in the incoming clock is DROPPED so a peer cannot
+        // advance (poison) a key that is not its own.
+        let conn = test_db();
+        let local = "ai:receiver";
+        // Peer B has an established, legitimate clock entry.
+        sync_state_observe(&conn, local, "ai:peer-b", "2026-04-01T00:00:00Z").expect("seed B");
+
+        // Peer A pushes a clock advancing its OWN key AND poisoning B's.
+        let mut incoming = crate::models::VectorClock::default();
+        incoming.observe("ai:peer-a", "2026-04-05T00:00:00Z"); // own → folded
+        incoming.observe("ai:peer-b", "9999-12-31T23:59:59Z"); // foreign → DROPPED
+
+        sync_state_merge_authorized(&conn, local, "ai:peer-a", &incoming).expect("gated merge");
+
+        let merged = sync_state_load(&conn, local).expect("reload");
+        // A advanced its own key.
+        assert_eq!(
+            merged.latest_from("ai:peer-a"),
+            Some("2026-04-05T00:00:00Z")
+        );
+        // B is UNCHANGED — A could not poison it.
+        assert_eq!(
+            merged.latest_from("ai:peer-b"),
+            Some("2026-04-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn memories_updated_since_counted_reports_raw_pre_drop_row_count_2718() {
+        // v1.0.0 #2718 / CB-14 / F7 — the counted variant reports the RAW
+        // pre-drop SQL row count so the tie-group watermark guard is
+        // correct. On a clean (no-drop) corpus the raw count equals the
+        // delivered length; the drop path is exercised end-to-end by the
+        // handler + `next_since_watermark` unit tests.
+        let conn = test_db();
+        for i in 0..3 {
+            insert(
+                &conn,
+                &make_memory(&format!("row-{i}"), "ns-2718", Tier::Long, 5),
+            )
+            .unwrap();
+        }
+        let (mems, raw_count) = memories_updated_since_counted(&conn, None, 10).expect("counted");
+        assert_eq!(mems.len(), 3);
+        assert_eq!(raw_count, 3, "raw count matches SQL rows on a clean corpus");
+        // Delegating wrapper returns the same rows without the count.
+        assert_eq!(memories_updated_since(&conn, None, 10).unwrap().len(), 3);
     }
 
     // -----------------------------------------------------------------------

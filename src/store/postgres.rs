@@ -18643,6 +18643,27 @@ impl MemoryStore for PostgresStore {
         since: Option<&str>,
         limit: usize,
     ) -> StoreResult<Vec<Memory>> {
+        // #2718 / CB-14 / F7 — delegate to the counted variant (single
+        // source of the SQL + the #2303 decrypt-on-send + #2585 explicit
+        // projection) and drop the raw count.
+        Ok(self
+            .list_memories_updated_since_counted(since, limit)
+            .await?
+            .0)
+    }
+
+    /// #2718 / CB-14 / F7 — the tie-group-safe sibling of
+    /// [`Self::list_memories_updated_since`]: same catch-up read, but ALSO
+    /// returns the RAW pre-`flatten` SQL row count so the `/sync/since`
+    /// `next_since_watermark` truncation guard is correct on postgres too
+    /// (this path ALSO drops undecryptable rows via the #2383 flatten
+    /// below, so the post-drop `Vec` length is NOT a safe page-was-full
+    /// signal).
+    async fn list_memories_updated_since_counted(
+        &self,
+        since: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<(Vec<Memory>, usize)> {
         let limit_i: i64 = (limit as i64).clamp(1, STORE_LIST_MAX_LIMIT_SAL);
         let since_dt = match since {
             None => None,
@@ -18705,13 +18726,19 @@ impl MemoryStore for PostgresStore {
         // send path MUST ship plaintext, see the #2303 note on the mapper), so
         // it is SKIPPED with a WARN instead of failing the whole catch-up
         // batch. It stays on disk and replicates once its keypair is restored.
-        Ok(rows
+        //
+        // #2718 / F7 — `raw_count` is the SQL row count BEFORE the drop below,
+        // the honest "was this page truncated?" signal for the tie-group
+        // watermark guard.
+        let raw_count = rows.len();
+        let mems: Vec<Memory> = rows
             .iter()
             .map(Self::row_to_memory_scan)
             .collect::<StoreResult<Vec<_>>>()?
             .into_iter()
             .flatten()
-            .collect())
+            .collect();
+        Ok((mems, raw_count))
     }
 
     async fn apply_remote_memory(

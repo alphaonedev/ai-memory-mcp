@@ -4,14 +4,17 @@
 //! v0.8.0 Pillar-3 (#1709) / #224 Task 3a.1 — CRDT-lite sync-state merge
 //! receive-path regression.
 //!
-//! The federation `/sync/push` receiver now folds the sender's full
-//! vector clock (`sender_clock.entries`) into its own persisted
-//! `sync_state` via pointwise max (`db::sync_state_merge`), so the
-//! receiver's returned `receiver_clock` reflects EVERY peer the sender
-//! has transitively observed — not just this push's per-peer
-//! observation. The merge is monotonic: an older incoming timestamp for
-//! a peer the receiver already tracks at a newer value must NOT regress
-//! the stored entry.
+//! v1.0.0 #2718 / CB-14 (relates #2670) — the fold is now PER-KEY
+//! AUTHORIZED. The federation `/sync/push` receiver folds ONLY the
+//! entry keyed by the sending peer's OWN id (`body.sender_agent_id`)
+//! into its persisted `sync_state` via pointwise max
+//! (`db::sync_state_merge_authorized`), so a peer can advance its own
+//! clock entry and NOTHING ELSE. Pre-#2718 it folded the sender's FULL
+//! vector clock (`db::sync_state_merge`), which let a hostile / buggy
+//! peer A inject an arbitrarily-high timestamp for peer B's key and
+//! permanently PIN B's cursor (every later pull from B then returned
+//! zero rows). The merge is still monotonic on the authorized key: an
+//! older incoming timestamp must NOT regress the stored entry.
 //!
 //! These tests drive the real Axum `sync_push` handler end-to-end
 //! (zero-config TOFU + `REQUIRE_SIG=0` + `TRUST_BODY_AGENT_ID=1` so the
@@ -170,14 +173,18 @@ fn clear_fed_gates() {
     }
 }
 
+/// v1.0.0 #2718 / CB-14 — the fold accepts ONLY the sender's OWN clock
+/// key. A sender that carries a foreign (transitive) peer's key in its
+/// `sender_clock` cannot make the receiver adopt it — that key never
+/// lands, closing the cross-peer cursor-poisoning vector (#2670 class).
 #[tokio::test(flavor = "current_thread")]
-async fn sync_push_merges_sender_clock_into_receiver_clock_1709() {
+async fn sync_push_folds_only_sender_own_clock_key_2718() {
     let _g = env_lock();
     relax_fed_gates();
     let router = setup_router();
 
     // The sender carries a clock describing peers it has observed —
-    // including a transitive peer the receiver has never talked to.
+    // including a foreign peer the receiver has never talked to.
     let body = json!({
         "sender_agent_id": "ai:sender",
         "sender_clock": {"entries": {
@@ -192,17 +199,71 @@ async fn sync_push_merges_sender_clock_into_receiver_clock_1709() {
 
     assert_eq!(status, StatusCode::OK, "push must succeed; resp={resp}");
     let clock = &resp["receiver_clock"]["entries"];
-    // Every peer the sender's clock carried is now persisted on the
-    // receiver — including the transitive peer it had never seen.
+    // The sender's OWN entry lands.
     assert_eq!(
         clock["ai:sender"].as_str(),
         Some("2026-03-01T00:00:00Z"),
         "sender's own entry must land in receiver clock; resp={resp}"
     );
+    // #2718 — the foreign peer's entry MUST NOT be folded: a peer is only
+    // authorized to advance its own key. Pre-fix this landed the foreign
+    // key and was the cursor-poisoning vector.
+    assert!(
+        clock.get("ai:transitive-peer").is_none() || clock["ai:transitive-peer"].is_null(),
+        "a sender may NOT advance a foreign peer's clock key; resp={resp}"
+    );
+}
+
+/// v1.0.0 #2718 / CB-14 (relates #2670) — the poisoning regression: peer
+/// A's push carrying peer B's key must leave B's ESTABLISHED clock entry
+/// UNCHANGED, even when A asserts a far-higher timestamp for B.
+#[tokio::test(flavor = "current_thread")]
+async fn sync_push_peer_a_cannot_advance_peer_b_clock_key_2718() {
+    let _g = env_lock();
+    relax_fed_gates();
+    let router = setup_router();
+
+    // Peer B legitimately establishes its own clock entry (its OWN key).
+    let b_push = json!({
+        "sender_agent_id": "ai:peer-b",
+        "sender_clock": {"entries": {"ai:peer-b": "2026-04-01T00:00:00Z"}},
+        "memories": [],
+        "dry_run": false,
+    });
+    let (sb, rb) = post_sync_push(&router, b_push, "ai:peer-b").await;
+    assert_eq!(sb, StatusCode::OK, "peer-b push must succeed; rb={rb}");
     assert_eq!(
-        clock["ai:transitive-peer"].as_str(),
-        Some("2026-02-01T00:00:00Z"),
-        "transitive peer must be merged into receiver clock; resp={resp}"
+        rb["receiver_clock"]["entries"]["ai:peer-b"].as_str(),
+        Some("2026-04-01T00:00:00Z"),
+        "peer-b established its own clock entry; rb={rb}"
+    );
+
+    // Peer A pushes a poison entry for B's key with a far-future value.
+    let a_poison = json!({
+        "sender_agent_id": "ai:peer-a",
+        "sender_clock": {"entries": {
+            "ai:peer-a": "2026-04-05T00:00:00Z",
+            "ai:peer-b": "9999-12-31T23:59:59Z",
+        }},
+        "memories": [],
+        "dry_run": false,
+    });
+    let (sa, ra) = post_sync_push(&router, a_poison, "ai:peer-a").await;
+    clear_fed_gates();
+    assert_eq!(sa, StatusCode::OK, "peer-a push must succeed; ra={ra}");
+
+    let clock = &ra["receiver_clock"]["entries"];
+    // A advanced its OWN key.
+    assert_eq!(
+        clock["ai:peer-a"].as_str(),
+        Some("2026-04-05T00:00:00Z"),
+        "peer-a advanced its own key; ra={ra}"
+    );
+    // B's key is UNCHANGED — A cannot poison it.
+    assert_eq!(
+        clock["ai:peer-b"].as_str(),
+        Some("2026-04-01T00:00:00Z"),
+        "peer-a's push must NOT advance peer-b's clock key (#2718 poisoning guard); ra={ra}"
     );
 }
 
@@ -212,25 +273,28 @@ async fn sync_push_older_sender_timestamp_does_not_regress_receiver_clock_1709()
     relax_fed_gates();
     let router = setup_router();
 
-    // First push advances "ai:peer" to a NEWER timestamp.
+    // #2718 — the fold accepts only the sender's OWN key, so this
+    // monotonic-non-regress regression uses `ai:sender` (the authorized
+    // key) rather than a foreign `ai:peer` (which would never fold).
+    // First push advances "ai:sender" to a NEWER timestamp.
     let first = json!({
         "sender_agent_id": "ai:sender",
-        "sender_clock": {"entries": {"ai:peer": "2026-05-01T00:00:00Z"}},
+        "sender_clock": {"entries": {"ai:sender": "2026-05-01T00:00:00Z"}},
         "memories": [],
         "dry_run": false,
     });
     let (s1, r1) = post_sync_push(&router, first, "ai:sender").await;
     assert_eq!(s1, StatusCode::OK, "first push must succeed; r1={r1}");
     assert_eq!(
-        r1["receiver_clock"]["entries"]["ai:peer"].as_str(),
+        r1["receiver_clock"]["entries"]["ai:sender"].as_str(),
         Some("2026-05-01T00:00:00Z")
     );
 
-    // Second push carries an OLDER timestamp for the same peer — the
+    // Second push carries an OLDER timestamp for the same key — the
     // monotonic pointwise-max merge must NOT regress the stored value.
     let second = json!({
         "sender_agent_id": "ai:sender",
-        "sender_clock": {"entries": {"ai:peer": "2026-01-01T00:00:00Z"}},
+        "sender_clock": {"entries": {"ai:sender": "2026-01-01T00:00:00Z"}},
         "memories": [],
         "dry_run": false,
     });
@@ -239,7 +303,7 @@ async fn sync_push_older_sender_timestamp_does_not_regress_receiver_clock_1709()
 
     assert_eq!(s2, StatusCode::OK, "second push must succeed; r2={r2}");
     assert_eq!(
-        r2["receiver_clock"]["entries"]["ai:peer"].as_str(),
+        r2["receiver_clock"]["entries"]["ai:sender"].as_str(),
         Some("2026-05-01T00:00:00Z"),
         "older incoming timestamp must NOT regress the receiver clock; r2={r2}"
     );

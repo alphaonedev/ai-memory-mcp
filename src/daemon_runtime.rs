@@ -6901,6 +6901,53 @@ where
     Ok(())
 }
 
+/// v1.0.0 #2718 / CB-14 (B-5) — the maximum a peer-advertised pull
+/// cursor may LEAD the local wall-clock before it is rejected as
+/// poisoned. The `/sync/since` `next_since` field is peer-controlled and
+/// is written straight into `sync_state` through a monotonic (refuse-to-
+/// REGRESS) upsert, so a peer answering `next_since:"9999-12-31T…"` would
+/// otherwise permanently PIN this node's cursor (every later pull returns
+/// zero rows and nothing can lower it without a manual DB edit). The
+/// bound is generous enough to absorb real NTP drift yet defeats any
+/// far-future poison.
+const PULL_CURSOR_FUTURE_SKEW_SECS: i64 = 300;
+
+/// v1.0.0 #2718 / CB-14 — validate a peer-advertised pull-cursor
+/// candidate BEFORE honoring it as this node's new `sync_state`
+/// watermark. `Ok(())` only when the candidate is a well-formed,
+/// non-poisoned, forward step; `Err(reason)` (a short WARN string) when
+/// the candidate:
+///   * does not parse as RFC 3339,
+///   * LEADS the local wall-clock by more than
+///     [`PULL_CURSOR_FUTURE_SKEW_SECS`] (far-future poison), or
+///   * is NOT STRICTLY greater than the current cursor (`since`).
+///
+/// The monotonic check is LEXICAL to match the downstream pipeline
+/// exactly: `sync_state_observe`'s upsert (`excluded > stored`) and the
+/// server's `updated_at > since` SQL are both lexical string compares,
+/// so a value the server considers "greater" is accepted here on the
+/// same terms — no false rejection at the tie-group boundary. The
+/// far-future bound is the one check that must parse, to compare against
+/// `now`. On rejection the caller MUST NOT advance the cursor (leave
+/// `sync_state` unchanged) — DEGRADE (re-pull the same window next
+/// cycle), never silently skip forward over undelivered rows.
+fn validate_pull_cursor(candidate: &str, current_since: Option<&str>) -> Result<(), &'static str> {
+    let candidate_dt = match chrono::DateTime::parse_from_rfc3339(candidate) {
+        Ok(dt) => dt.with_timezone(&chrono::Utc),
+        Err(_) => return Err("not RFC3339"),
+    };
+    let ceiling = chrono::Utc::now() + chrono::Duration::seconds(PULL_CURSOR_FUTURE_SKEW_SECS);
+    if candidate_dt > ceiling {
+        return Err("exceeds now + skew (far-future cursor poison)");
+    }
+    if let Some(cur) = current_since
+        && candidate <= cur
+    {
+        return Err("not strictly greater than current cursor");
+    }
+    Ok(())
+}
+
 /// Run a single sync cycle against one peer — pull then push.
 ///
 /// Lifted verbatim (modulo path-of-Path-vs-PathBuf) from the pre-W6
@@ -6982,10 +7029,50 @@ pub async fn sync_cycle_once(
     // (and is tie-group-safe, which `memories.last()` never was);
     // the legacy expression remains the fallback for a peer that does
     // not yet publish the field.
-    let latest_pulled = pulled
-        .next_since
-        .clone()
-        .or_else(|| pulled.memories.last().map(|m| m.updated_at.clone()));
+    // #2718 / CB-14 (B-5) — resolve the watermark to advance to, VALIDATING
+    // the peer-controlled candidate first. `next_since` is peer-controlled
+    // and is written straight into `sync_state` through a monotonic
+    // (refuse-to-regress) upsert, so a peer answering a far-future value
+    // would permanently PIN this node's cursor. Validate before honoring;
+    // on rejection do NOT advance (leave `sync_state` unchanged) and WARN.
+    // The pulled rows still apply below — we simply re-pull the same window
+    // next cycle rather than skipping forward over undelivered rows.
+    let advance_to: Option<String> = match pulled.next_since.as_deref() {
+        Some(candidate) => match validate_pull_cursor(candidate, since.as_deref()) {
+            Ok(()) => Some(candidate.to_string()),
+            Err(reason) => {
+                tracing::warn!(
+                    target: crate::federation::SCOPE_TRACE_TARGET,
+                    peer = %peer_url,
+                    candidate = %candidate,
+                    reason,
+                    "sync-daemon: refusing peer-advertised next_since cursor; leaving \
+                     sync_state watermark unchanged (#2718 cursor-poisoning guard)"
+                );
+                None
+            }
+        },
+        // Legacy peer that does not publish `next_since`: fall back to the
+        // examined-rows watermark, held to the SAME validation so a poisoned
+        // `memories.last().updated_at` cannot pin the cursor either.
+        None => match pulled.memories.last().map(|m| m.updated_at.as_str()) {
+            Some(fallback) => match validate_pull_cursor(fallback, since.as_deref()) {
+                Ok(()) => Some(fallback.to_string()),
+                Err(reason) => {
+                    tracing::warn!(
+                        target: crate::federation::SCOPE_TRACE_TARGET,
+                        peer = %peer_url,
+                        candidate = %fallback,
+                        reason,
+                        "sync-daemon: refusing peer memories.last() watermark; leaving \
+                         sync_state watermark unchanged (#2718 cursor-poisoning guard)"
+                    );
+                    None
+                }
+            },
+            None => None,
+        },
+    };
 
     {
         let conn = db::open(db_path)?;
@@ -6994,7 +7081,7 @@ pub async fn sync_cycle_once(
                 let _ = db::insert_if_newer(&conn, mem);
             }
         }
-        if let Some(ref at) = latest_pulled {
+        if let Some(ref at) = advance_to {
             db::sync_state_observe(&conn, local_agent_id, peer_url, at)?;
         }
     }
@@ -7321,6 +7408,65 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt as _;
+
+    // ---- #2718 / CB-14 (B-5) — pull-cursor validation --------------------
+
+    /// A far-future peer-advertised cursor (the "9999" poison) is REFUSED,
+    /// so the monotonic sync_state upsert can never be pinned by it.
+    #[test]
+    fn pull_cursor_rejects_far_future_poison_2718() {
+        let err = validate_pull_cursor("9999-12-31T23:59:59+00:00", Some("2026-06-01T00:00:00Z"))
+            .expect_err("far-future cursor must be refused");
+        assert!(
+            err.contains("skew"),
+            "reason should name the skew bound: {err}"
+        );
+    }
+
+    /// An unparseable cursor is REFUSED (never honored on peer data).
+    #[test]
+    fn pull_cursor_rejects_unparseable_2718() {
+        assert!(validate_pull_cursor("not-a-timestamp", None).is_err());
+        assert!(validate_pull_cursor("", Some("2026-06-01T00:00:00Z")).is_err());
+    }
+
+    /// A cursor that does not STRICTLY advance the current one is REFUSED
+    /// (equal or older never advances the watermark).
+    #[test]
+    fn pull_cursor_rejects_non_advancing_2718() {
+        let cur = "2026-06-01T00:00:00Z";
+        assert!(
+            validate_pull_cursor(cur, Some(cur)).is_err(),
+            "equal cursor must not advance"
+        );
+        assert!(
+            validate_pull_cursor("2026-05-01T00:00:00Z", Some(cur)).is_err(),
+            "older cursor must not advance"
+        );
+    }
+
+    /// A well-formed, near-now, strictly-greater cursor is ACCEPTED — the
+    /// normal advance path must not regress.
+    #[test]
+    fn pull_cursor_accepts_valid_forward_step_2718() {
+        // A value comfortably in the past but strictly after the current
+        // cursor is a legitimate advance.
+        assert!(validate_pull_cursor("2026-06-02T00:00:00Z", Some("2026-06-01T00:00:00Z")).is_ok());
+        // First-ever pull (no current cursor) accepts any well-formed,
+        // non-far-future value.
+        let now = chrono::Utc::now().to_rfc3339();
+        assert!(validate_pull_cursor(&now, None).is_ok());
+    }
+
+    /// A value within the bounded skew window (slightly ahead of now) is
+    /// ACCEPTED — real NTP drift must not stall the cursor.
+    #[test]
+    fn pull_cursor_accepts_within_skew_window_2718() {
+        let slightly_ahead = (chrono::Utc::now()
+            + chrono::Duration::seconds(PULL_CURSOR_FUTURE_SKEW_SECS - 30))
+        .to_rfc3339();
+        assert!(validate_pull_cursor(&slightly_ahead, None).is_ok());
+    }
 
     /// #1579 A3 (SECURITY) — regression pin: the Postgres SAL boot
     /// path must log the REDACTED store URL. Pre-fix,
