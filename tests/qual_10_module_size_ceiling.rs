@@ -1081,7 +1081,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // (`resolve_governance_policy` + the in-tx walk inside
     // `enforce_governance_action`). MEASURED post-change: 32_196.
     // Ceiling 32_200 -> 32_300 (+104 headroom).
-    ("src/store/postgres.rs", 33_050), /* 2026-07-31 #2578/#2581/#2582/#2585 postgres read-path perf: the v88 composite-index arm + its CONCURRENTLY/indisvalid self-heal helper, the MEMORY_READ_COLUMNS read projection replacing eight `SELECT *` shapes, the UNNEST-batched recall ledger, the find_paths CTE routing, and the list_archived sargable split; measured 32_841 pre-merge. RE-MEASURED 32_937 after merging #2603 (#2580 pushed load_family's family predicate into SQL in this same file), so the number is the MERGED tree's, not either side's. #2627: a ceiling that arrives through a clean auto-merge is UNVERIFIED, not agreed — two branches can bump to an identical token from different pre-merge measurements and git raises no conflict. Always re-measure the merged file. */
+    // 2026-08-05 #2718 (CB-14) — bumped 33_050 → 33_150 (+94): the
+    // `list_memories_updated_since_counted` SAL override + its raw-count
+    // read land ~31 lines here on top of the merged tip's CB-18 additions.
+    // RE-MEASURED on the rebased tree at 33_056 (the #2627 lesson: a ceiling
+    // that arrives through a clean auto-merge is UNVERIFIED — always
+    // re-measure the merged file), so 33_150 carries the same modest headroom
+    // as the neighbouring bumps.
+    ("src/store/postgres.rs", 33_150), /* 2026-07-31 #2578/#2581/#2582/#2585 postgres read-path perf: the v88 composite-index arm + its CONCURRENTLY/indisvalid self-heal helper, the MEMORY_READ_COLUMNS read projection replacing eight `SELECT *` shapes, the UNNEST-batched recall ledger, the find_paths CTE routing, and the list_archived sargable split; measured 32_841 pre-merge. RE-MEASURED 32_937 after merging #2603 (#2580 pushed load_family's family predicate into SQL in this same file), so the number is the MERGED tree's, not either side's. #2627: a ceiling that arrives through a clean auto-merge is UNVERIFIED, not agreed — two branches can bump to an identical token from different pre-merge measurements and git raises no conflict. Always re-measure the merged file. */
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
