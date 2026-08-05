@@ -214,6 +214,30 @@ fn record_hmac_nonce(sig_hex: &str, ts_secs: i64) -> bool {
     true
 }
 
+/// #2634 / CB-24 — record the TRUE governance verdict of a K10 approval
+/// decision at the point the authorization gate produced it. The forensic
+/// `kind` reflects the REQUESTED decision (approve / deny) while the
+/// `verdict` token is the real outcome (`"allow"` / `"refuse"`). Kept in
+/// one place so the sqlite + postgres branches emit identical rows.
+fn audit_decide_verdict(
+    agent_id: &str,
+    id: &str,
+    requested: crate::approvals::Decision,
+    verdict: &str,
+) {
+    let kind = match requested {
+        crate::approvals::Decision::Approve => "approval_decide_approve",
+        crate::approvals::Decision::Deny => "approval_decide_deny",
+    };
+    crate::governance::audit::record_decision(
+        agent_id,
+        verdict,
+        kind,
+        "",
+        json!({ (field_names::PENDING_ID): id }),
+    );
+}
+
 /// `POST /api/v1/approvals/{pending_id}` — K10's HMAC-gated approval
 /// endpoint. See module-level comment above for the full contract.
 #[allow(clippy::too_many_lines)]
@@ -261,27 +285,18 @@ pub async fn approval_decide(
         }
     };
 
-    // #913 (security-medium / SOC2, 2026-05-19) — admin governance audit.
-    // K10's HMAC-gated approval endpoint is the primary privileged
-    // decision surface; emit the forensic-chain entry BEFORE the storage
-    // write so the audit trail records the decider's identity, the
-    // outcome (approve / deny), and the pending id regardless of
-    // downstream consensus / execution behaviour.
-    let decision_kind = match body.decision {
-        crate::approvals::Decision::Approve => "approval_decide_approve",
-        crate::approvals::Decision::Deny => "approval_decide_deny",
-    };
-    let decision_outcome = match body.decision {
-        crate::approvals::Decision::Approve => "allow",
-        crate::approvals::Decision::Deny => "refuse",
-    };
-    crate::governance::audit::record_decision(
-        &agent_id,
-        decision_outcome,
-        decision_kind,
-        "",
-        json!({ (field_names::PENDING_ID): &id }),
-    );
+    // #913 + #2634 / CB-24 — admin governance audit. Pre-fix, this
+    // surface recorded the CALLER'S REQUESTED decision UNCONDITIONALLY
+    // here, BEFORE the `approve_with_approver_type` / consensus gate ran —
+    // so an approval that the gate then REFUSED (self-approval /
+    // unregistered approver, #2643) was chained as "allow", a
+    // tamper-evident audit lying about the outcome. The verdict is now
+    // recorded at the outcome points below via `audit_decide_verdict`:
+    // approved / vote-accepted → "allow" (emitted BEFORE the downstream
+    // execution write so #913's decider-identity capture survives an
+    // execution error), a refused approval OR an explicit deny → "refuse".
+    // An operational error (NotFound 404 / consensus 500) reaches no
+    // verdict and records no verdict row.
 
     // #1618 — postgres-backed daemons dispatch through the SAL trait.
     // Pre-#1618 this handler unconditionally locked `app.db`, which on
@@ -311,6 +326,8 @@ pub async fn approval_decide(
             match db::approve_with_approver_type(&lock.0, &id, &agent_id, db::ApproveSurface::Http)
             {
                 Ok(crate::db::ApproveOutcome::Approved) => {
+                    // #2634 — record "allow" BEFORE the execute write below.
+                    audit_decide_verdict(&agent_id, &id, body.decision, "allow");
                     let executed = db::execute_pending_action(&lock.0, &id);
                     match executed {
                         Ok(memory_id) => json!({
@@ -331,14 +348,18 @@ pub async fn approval_decide(
                         }
                     }
                 }
-                Ok(crate::db::ApproveOutcome::Pending { votes, quorum }) => json!({
-                    "approved": false,
-                    "status": "pending",
-                    "id": id,
-                    "votes": votes,
-                    "quorum": quorum,
-                    "remember": format!("{:?}", body.remember).to_lowercase(),
-                }),
+                Ok(crate::db::ApproveOutcome::Pending { votes, quorum }) => {
+                    // #2634 — the approval vote was accepted (awaiting quorum).
+                    audit_decide_verdict(&agent_id, &id, body.decision, "allow");
+                    json!({
+                        "approved": false,
+                        "status": "pending",
+                        "id": id,
+                        "votes": votes,
+                        "quorum": quorum,
+                        "remember": format!("{:?}", body.remember).to_lowercase(),
+                    })
+                }
                 // #1620 — missing pending id is 404 (was 403 via the
                 // collapsed Rejected arm; postgres already 404'd).
                 Ok(crate::db::ApproveOutcome::NotFound) => {
@@ -351,6 +372,8 @@ pub async fn approval_decide(
                         .into_response();
                 }
                 Ok(crate::db::ApproveOutcome::Rejected(reason)) => {
+                    // #2634 / #2643 — governed refusal chains "refuse", not "allow".
+                    audit_decide_verdict(&agent_id, &id, body.decision, "refuse");
                     return (
                         StatusCode::FORBIDDEN,
                         Json(json!({"error": crate::errors::msg::approve_rejected(reason)})),
@@ -364,12 +387,16 @@ pub async fn approval_decide(
         }
         crate::approvals::Decision::Deny => {
             match db::decide_pending_action(&lock.0, &id, false, &agent_id) {
-                Ok(true) => json!({
-                    "rejected": true,
-                    "id": id,
-                    (field_names::DECIDED_BY): agent_id,
-                    "remember": format!("{:?}", body.remember).to_lowercase(),
-                }),
+                Ok(true) => {
+                    // #2634 — explicit deny chains "refuse".
+                    audit_decide_verdict(&agent_id, &id, body.decision, "refuse");
+                    json!({
+                        "rejected": true,
+                        "id": id,
+                        (field_names::DECIDED_BY): agent_id,
+                        "remember": format!("{:?}", body.remember).to_lowercase(),
+                    })
+                }
                 Ok(false) => {
                     return (
                         StatusCode::NOT_FOUND,
@@ -426,6 +453,8 @@ async fn approval_decide_postgres(
                 .await
             {
                 Ok(crate::store::ApproveOutcome::Approved) => {
+                    // #2634 — record "allow" BEFORE the execute write below.
+                    audit_decide_verdict(agent_id, id, body.decision, "allow");
                     match app.store.execute_pending_action(&ctx, id).await {
                         Ok(memory_id) => json!({
                             "approved": true,
@@ -445,15 +474,21 @@ async fn approval_decide_postgres(
                         }
                     }
                 }
-                Ok(crate::store::ApproveOutcome::Pending { votes, quorum }) => json!({
-                    "approved": false,
-                    "status": "pending",
-                    "id": id,
-                    "votes": votes,
-                    "quorum": quorum,
-                    "remember": remember_label,
-                }),
+                Ok(crate::store::ApproveOutcome::Pending { votes, quorum }) => {
+                    // #2634 — the approval vote was accepted (awaiting quorum).
+                    audit_decide_verdict(agent_id, id, body.decision, "allow");
+                    json!({
+                        "approved": false,
+                        "status": "pending",
+                        "id": id,
+                        "votes": votes,
+                        "quorum": quorum,
+                        "remember": remember_label,
+                    })
+                }
                 Ok(crate::store::ApproveOutcome::Rejected(reason)) => {
+                    // #2634 / #2643 — governed refusal chains "refuse", not "allow".
+                    audit_decide_verdict(agent_id, id, body.decision, "refuse");
                     return (
                         StatusCode::FORBIDDEN,
                         Json(json!({"error": crate::errors::msg::approve_rejected(reason)})),
@@ -465,12 +500,16 @@ async fn approval_decide_postgres(
         }
         crate::approvals::Decision::Deny => {
             match app.store.pending_decide(&ctx, id, false, agent_id).await {
-                Ok(true) => json!({
-                    "rejected": true,
-                    "id": id,
-                    (field_names::DECIDED_BY): agent_id,
-                    "remember": remember_label,
-                }),
+                Ok(true) => {
+                    // #2634 — explicit deny chains "refuse".
+                    audit_decide_verdict(agent_id, id, body.decision, "refuse");
+                    json!({
+                        "rejected": true,
+                        "id": id,
+                        (field_names::DECIDED_BY): agent_id,
+                        "remember": remember_label,
+                    })
+                }
                 Ok(false) => {
                     return (
                         StatusCode::NOT_FOUND,

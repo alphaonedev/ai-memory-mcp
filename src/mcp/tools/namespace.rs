@@ -193,19 +193,6 @@ pub fn handle_namespace_set_standard(
         other => crate::identity::resolve_agent_id(other, None)
             .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string()),
     };
-    crate::governance::audit::record_decision(
-        &caller,
-        "allow",
-        "namespace_set_standard",
-        "",
-        serde_json::json!({
-            "namespace": namespace,
-            (field_names::STANDARD_ID): id,
-            "parent": parent,
-            "has_governance": params.get(param_names::GOVERNANCE).is_some_and(|v| !v.is_null()),
-        }),
-    );
-
     // #929 SECURITY-high (Track A P6, 2026-05-20) — ownership gate on
     // the MCP entry. Mirrors the HTTP handler gate at
     // `handlers/hook_subscribers.rs::set_namespace_standard_inner`.
@@ -222,10 +209,36 @@ pub fn handle_namespace_set_standard(
     // downgrade + ownership transfer. Unowned / system rows may only be
     // bound when already explicitly scope=shared; otherwise refuse and
     // tell the operator to re-scope.
-    if let Ok(Some(existing_mem)) = db::get(conn, id) {
-        if let Err(msg) = authorize_namespace_standard_bind(&caller, &existing_mem) {
-            return Err(msg);
-        }
+    //
+    // #2634 / CB-24 — run the ownership gate FIRST so the forensic-chain
+    // row records the TRUE verdict. Pre-fix the `record_decision("allow")`
+    // fired UNCONDITIONALLY before this gate, so a refused bind was chained
+    // as "allow" (a tamper-evident audit lying about the outcome). The row
+    // is still emitted BELOW BEFORE the `db::update` storage write, so the
+    // #913 intent-capture guarantee (evidence survives a failed write on
+    // the allowed path) holds; a refused bind now chains "refuse".
+    let bind_refusal: Option<String> = match db::get(conn, id) {
+        Ok(Some(existing_mem)) => authorize_namespace_standard_bind(&caller, &existing_mem).err(),
+        _ => None,
+    };
+    crate::governance::audit::record_decision(
+        &caller,
+        if bind_refusal.is_some() {
+            "refuse"
+        } else {
+            "allow"
+        },
+        "namespace_set_standard",
+        "",
+        serde_json::json!({
+            "namespace": namespace,
+            (field_names::STANDARD_ID): id,
+            "parent": parent,
+            "has_governance": params.get(param_names::GOVERNANCE).is_some_and(|v| !v.is_null()),
+        }),
+    );
+    if let Some(msg) = bind_refusal {
+        return Err(msg);
     }
 
     // Task 1.8: optional governance policy merged into the standard memory's
@@ -512,7 +525,26 @@ pub(super) fn extract_governance(mem_val: &Value) -> Value {
     merge_governance_for_response(meta)
 }
 
-pub(crate) fn handle_namespace_clear_standard(
+/// #2634 / CB-24 — emit the forensic-chain "refuse" row for a REFUSED
+/// `namespace_clear_standard` at the ownership gate. Mirrors the allowed
+/// path's `record_decision(..., "allow", ...)` payload shape so the two
+/// verdicts are indistinguishable except for the decision token.
+/// #2634 (CB-24) — audit `kind` for the `clear_namespace_standard` governance
+/// decision, shared by the refuse gate + the allow path + the HTTP handler
+/// so the pm-v3.1 no-scattered-literal rule holds.
+pub(crate) const AUDIT_KIND_NAMESPACE_CLEAR_STANDARD: &str = "namespace_clear_standard";
+
+fn record_clear_refusal(caller: &str, namespace: &str) {
+    crate::governance::audit::record_decision(
+        caller,
+        "refuse",
+        AUDIT_KIND_NAMESPACE_CLEAR_STANDARD,
+        "",
+        serde_json::json!({ "namespace": namespace }),
+    );
+}
+
+pub fn handle_namespace_clear_standard(
     conn: &rusqlite::Connection,
     params: &Value,
 ) -> Result<Value, String> {
@@ -569,6 +601,13 @@ pub(crate) fn handle_namespace_clear_standard(
                         && recorded_owner != caller
                         && caller != sentinels::DAEMON_PRINCIPAL
                     {
+                        // #2634 / CB-24 — record the TRUE verdict of a
+                        // REFUSED clear. Pre-fix the ownership gate returned
+                        // BEFORE the `record_decision` below, so a refused
+                        // clear left NO forensic-chain row at all (the
+                        // opposite-ordering half of the #2634 class). Chain
+                        // "refuse" here so the refusal is audited.
+                        record_clear_refusal(&caller, namespace);
                         return Err(format!(
                             "caller does not own this namespace standard (caller={caller}, owner={recorded_owner})"
                         ));
@@ -576,6 +615,8 @@ pub(crate) fn handle_namespace_clear_standard(
                 }
                 None => {
                     if caller != sentinels::DAEMON_PRINCIPAL {
+                        // #2634 / CB-24 — audit the refused clear (see above).
+                        record_clear_refusal(&caller, namespace);
                         return Err(
                             "cannot clear namespace standard: the bound standard memory is \
                              unresolvable (severed or dangling). Re-point the standard with \
@@ -589,10 +630,15 @@ pub(crate) fn handle_namespace_clear_standard(
         }
     }
 
+    // #913 + #2634 / CB-24 — the ownership gate above has PASSED (or was
+    // skipped for daemon/unclaimed callers): this clear is ALLOWED. Record
+    // "allow" here, still BEFORE the `db::clear_namespace_standard` write so
+    // the #913 intent capture holds. Refused clears chain "refuse" at the
+    // gate above via `record_clear_refusal`.
     crate::governance::audit::record_decision(
         &caller,
         "allow",
-        "namespace_clear_standard",
+        AUDIT_KIND_NAMESPACE_CLEAR_STANDARD,
         "",
         serde_json::json!({ "namespace": namespace }),
     );

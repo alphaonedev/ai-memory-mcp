@@ -337,6 +337,21 @@ fn record_mcp_decision(
     }
 }
 
+/// #2634 / CB-24 — record the TRUE governance verdict of an MCP
+/// `pending_approve` decision at the point its authorization gate
+/// produced it. `decision` is `"allow"` (approved / vote accepted) or
+/// `"refuse"` (self-approval / unregistered-approver / rejected-signature
+/// refusal). Mirrors the HTTP `audit_pending_verdict` row shape.
+fn audit_pending_verdict(agent_id: &str, id: &str, decision: &str) {
+    crate::governance::audit::record_decision(
+        agent_id,
+        decision,
+        "pending_approve",
+        "",
+        json!({ (field_names::PENDING_ID): id }),
+    );
+}
+
 pub fn handle_pending_approve(
     conn: &rusqlite::Connection,
     params: &Value,
@@ -351,18 +366,18 @@ pub fn handle_pending_approve(
         .map_err(|e| e.to_string())?;
     let remember = parse_remember_param(params);
 
-    // #913 (security-medium / SOC2, 2026-05-19) — admin governance audit.
-    // Approve is the privileged gate operation; emit the forensic-chain
-    // row BEFORE the storage write so the audit trail captures the
-    // approver's identity + pending_id even when the downstream
-    // consensus / execution path errors.
-    crate::governance::audit::record_decision(
-        &agent_id,
-        "allow",
-        "pending_approve",
-        "",
-        json!({ (field_names::PENDING_ID): id }),
-    );
+    // #913 + #2634 / CB-24 — admin governance audit. Pre-fix a
+    // `record_decision("allow")` fired UNCONDITIONALLY here, BEFORE the
+    // R40 signed-approval gate + the `approve_with_approver_type` /
+    // consensus gate below — so a REFUSED approval (self-approval /
+    // unregistered approver #2643, or a rejected signature quorum) was
+    // chained as "allow", a tamper-evident audit lying about the outcome.
+    // The verdict is recorded at the outcome points below via
+    // `audit_pending_verdict`: approved / vote-accepted → "allow"
+    // (emitted BEFORE the downstream execution write so #913's
+    // approver-identity capture survives an execution error), a refused
+    // approval → "refuse". Operational errors (NotFound / storage) reach
+    // no verdict and record no verdict row.
 
     // R40 (#1957) — human-key-signed approval gate. When the pending action was
     // routed from a typed escalation (`requires_signed_approval`) OR the caller
@@ -393,6 +408,8 @@ pub fn handle_pending_approve(
                 distinct,
                 threshold,
             }) => {
+                // #2634 — signatures accepted so far, awaiting quorum.
+                audit_pending_verdict(&agent_id, id, "allow");
                 return Ok(json!({
                     "approved": false,
                     "status": "pending",
@@ -402,7 +419,11 @@ pub fn handle_pending_approve(
                     "reason": "signed approval quorum not yet met",
                 }));
             }
-            Err(e) => return Err(format!("signed approval rejected: {e}")),
+            Err(e) => {
+                // #2634 / #2643 — a rejected signature quorum is a refusal.
+                audit_pending_verdict(&agent_id, id, "refuse");
+                return Err(format!("signed approval rejected: {e}"));
+            }
         }
     }
 
@@ -413,6 +434,8 @@ pub fn handle_pending_approve(
         .map_err(|e| e.to_string())?
     {
         ApproveOutcome::Approved => {
+            // #2634 — record "allow" BEFORE the execute write below.
+            audit_pending_verdict(&agent_id, id, "allow");
             // Task 1.10: auto-execute the queued action on final approval.
             let executed = db::execute_pending_action(conn, id).map_err(|e| e.to_string())?;
             record_mcp_decision(conn, id, &agent_id, "approve", remember);
@@ -429,17 +452,26 @@ pub fn handle_pending_approve(
                 },
             }))
         }
-        ApproveOutcome::Pending { votes, quorum } => Ok(json!({
-            "approved": false,
-            "status": "pending",
-            "id": id,
-            "votes": votes,
-            "quorum": quorum,
-            "reason": crate::errors::msg::CONSENSUS_NOT_REACHED,
-        })),
-        // #1620 — typed not-found (was a Rejected string).
+        ApproveOutcome::Pending { votes, quorum } => {
+            // #2634 — the approval vote was accepted (awaiting quorum).
+            audit_pending_verdict(&agent_id, id, "allow");
+            Ok(json!({
+                "approved": false,
+                "status": "pending",
+                "id": id,
+                "votes": votes,
+                "quorum": quorum,
+                "reason": crate::errors::msg::CONSENSUS_NOT_REACHED,
+            }))
+        }
+        // #1620 — typed not-found (was a Rejected string). Operational
+        // not-found reaches no governance verdict → no verdict row.
         ApproveOutcome::NotFound => Err(crate::errors::msg::pending_action_not_found(id)),
-        ApproveOutcome::Rejected(reason) => Err(crate::errors::msg::approve_rejected(reason)),
+        ApproveOutcome::Rejected(reason) => {
+            // #2634 / #2643 — governed refusal chains "refuse", not "allow".
+            audit_pending_verdict(&agent_id, id, "refuse");
+            Err(crate::errors::msg::approve_rejected(reason))
+        }
     }
 }
 

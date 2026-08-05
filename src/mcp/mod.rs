@@ -597,8 +597,8 @@ pub use check_duplicate::handle_check_duplicate;
 pub use expand_query::handle_expand_query;
 pub use kg_query::handle_kg_query;
 pub use load_family::{handle_load_family, handle_smart_load};
+pub(crate) use namespace::AUDIT_KIND_NAMESPACE_CLEAR_STANDARD;
 pub(crate) use namespace::authorize_namespace_standard_bind;
-pub(crate) use namespace::handle_namespace_clear_standard;
 // v0.7.0 G-PHASE-E-2 (#707) — promoted to `pub` so the integration
 // regression at `tests/g_phase_e_2_namespace_set_standard_governance_passthrough.rs`
 // can exercise the merge path directly. The handler is still routed
@@ -610,7 +610,9 @@ pub(crate) use namespace::handle_namespace_clear_standard;
 // on the same rationale so the get-side governance pass-through
 // regression at `tests/issue_1326_*.rs` can pin the surface without
 // stdio JSON-RPC scaffolding.
-pub use namespace::{handle_namespace_get_standard, handle_namespace_set_standard};
+pub use namespace::{
+    handle_namespace_clear_standard, handle_namespace_get_standard, handle_namespace_set_standard,
+};
 pub use notify::{handle_inbox, handle_notify};
 pub use pending::{handle_pending_approve, handle_pending_reject};
 // v0.7.0 #1389 L4 — host-volunteered turn capture per RFC-0001.
