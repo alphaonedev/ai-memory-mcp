@@ -19968,17 +19968,29 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("clear_namespace_standard meta-exists", e))?;
             if meta_exists {
-                let recorded_owner: Option<String> = sqlx::query_scalar(
+                // #2704-F2 (CB-18, CWE-284) — the INNER JOIN through `standard_id`
+                // yields NO row for a severed (NULL) or dangling `standard_id`, and
+                // a row with a SQL-NULL `agent_id` when the standard memory exists
+                // but is UNOWNED. `.flatten()` collapsed BOTH into `None`, so an
+                // unowned standard (case b) was misclassified as unresolvable
+                // (case a) and REFUSED with a wrong "severed or dangling" error —
+                // making a legacy pre-#929 / federated / non-object-metadata pg
+                // standard un-clearable by a non-bypass caller. Keep the two states
+                // separable: `Option<Option<String>>` (outer = row-presence, inner
+                // = agent_id NULL-ness). `Some(None)` is the documented unowned-pass
+                // (ALLOW, matching the sqlite twin where `recorded_owner == ""` is
+                // `is_unowned`); `None` is the genuinely unresolvable refusal (#2545).
+                let owner_row: Option<Option<String>> = sqlx::query_scalar(
                     "SELECT m.metadata->>'agent_id' FROM namespace_meta nm \
                      JOIN memories m ON m.id = nm.standard_id WHERE nm.namespace = $1",
                 )
                 .bind(namespace)
                 .fetch_optional(&self.pool)
                 .await
-                .map_err(|e| to_store_err("clear_namespace_standard owner pre-fetch", e))?
-                .flatten();
-                match recorded_owner {
-                    Some(owner)
+                .map_err(|e| to_store_err("clear_namespace_standard owner pre-fetch", e))?;
+                match owner_row {
+                    // Row exists with a named owner different from the caller → refuse.
+                    Some(Some(owner))
                         if !owner.is_empty()
                             && owner != "system"
                             && owner != ctx.effective_principal() =>
@@ -19991,7 +20003,11 @@ impl MemoryStore for PostgresStore {
                             ),
                         });
                     }
+                    // Row exists, caller owns it OR it is unowned (agent_id
+                    // present-empty/"system", or SQL NULL) → the unowned-pass. ALLOW.
                     Some(_) => {}
+                    // No joined row → severed (NULL standard_id) or dangling id →
+                    // truly unresolvable. Refuse a non-bypass clear (#2545).
                     None => {
                         return Err(StoreError::PermissionDenied {
                             action: crate::OP_CLEAR_NAMESPACE_STANDARD.to_string(),

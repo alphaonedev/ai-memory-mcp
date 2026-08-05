@@ -10966,6 +10966,13 @@ async fn http_clear_namespace_standard_qs_happy_path_after_set() {
                 .uri("/api/v1/namespaces")
                 .method("POST")
                 .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                // #2719 (CB-6) — the clear path now runs the #1777 owner gate,
+                // so the standard must be OWNED by a resolvable identity that
+                // the clear then presents. Keyless (no X-Agent-Id) stamps an
+                // unresolvable owner the keyless clear can never match. Present
+                // a stable owner on BOTH set + clear so this happy-path test
+                // exercises an OWNER clearing its OWN standard.
+                .header(crate::HEADER_AGENT_ID, "ai:qs-clear-owner")
                 .body(Body::from(
                     serde_json::to_vec(&json!({"namespace": "qs-clear-happy"})).unwrap(),
                 ))
@@ -10985,6 +10992,8 @@ async fn http_clear_namespace_standard_qs_happy_path_after_set() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces?namespace=qs-clear-happy")
                 .method("DELETE")
+                // #2719 (CB-6) — same owner as the set above → owner gate passes.
+                .header(crate::HEADER_AGENT_ID, "ai:qs-clear-owner")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -11427,6 +11436,9 @@ async fn http_clear_qs_fanout_202_when_peer_down() {
                 .uri("/api/v1/namespaces")
                 .method("POST")
                 .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                // #2719 (CB-6) — owner-gated clear needs an owned standard; see
+                // http_clear_namespace_standard_qs_happy_path_after_set.
+                .header(crate::HEADER_AGENT_ID, "ai:qs-clear-owner")
                 .body(Body::from(
                     serde_json::to_vec(&json!({"namespace": "qs-clear-fed"})).unwrap(),
                 ))
@@ -11448,6 +11460,8 @@ async fn http_clear_qs_fanout_202_when_peer_down() {
             axum::http::Request::builder()
                 .uri("/api/v1/namespaces?namespace=qs-clear-fed")
                 .method("DELETE")
+                // #2719 (CB-6) — same owner as the set above → owner gate passes.
+                .header(crate::HEADER_AGENT_ID, "ai:qs-clear-owner")
                 .body(Body::empty())
                 .unwrap(),
         )
