@@ -197,6 +197,9 @@ pub const EVENT_TYPES: &str = "event_types";
 pub const EXCLUDED_FOR_SCOPE: &str = "excluded_for_scope";
 /// `excluded_for_scope_private` — wire/row field name.
 pub const EXCLUDED_FOR_SCOPE_PRIVATE: &str = "excluded_for_scope_private";
+/// `existing_id` — wire field: the stored id a conflict/dedup collided with
+/// (single-create 409 + bulk `errors[]` CONFLICT rows, #2725).
+pub const EXISTING_ID: &str = "existing_id";
 /// `expanded_terms` — wire/row field name.
 pub const EXPANDED_TERMS: &str = "expanded_terms";
 /// `expired_at` — wire/row field name.
@@ -410,6 +413,10 @@ pub const SUBSCRIPTION_ID: &str = "subscription_id";
 pub const SUBSCRIPTIONS: &str = "subscriptions";
 /// `suggested_merge` — wire/row field name.
 pub const SUGGESTED_MERGE: &str = "suggested_merge";
+/// `superseded_by` — wire field: the id whose content was superseded, in the
+/// bulk `deduped_rows[]`/`updated_rows[]` disclosure arrays (#2551, #2725) and
+/// the skill supersession response.
+pub const SUPERSEDED_BY: &str = "superseded_by";
 /// `superseded_id` — wire/row field name.
 pub const SUPERSEDED_ID: &str = "superseded_id";
 /// `synthesized` — wire/row field name.

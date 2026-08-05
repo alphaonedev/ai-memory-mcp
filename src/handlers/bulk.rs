@@ -125,6 +125,7 @@ use std::sync::Arc;
 
 use crate::db;
 use crate::embeddings::EmbedStatus;
+use crate::mcp::param_names::ON_CONFLICT;
 use crate::mcp::tools::OnConflictMode;
 use crate::models::field_names;
 use crate::models::{CreateMemory, Memory};
@@ -274,7 +275,7 @@ impl BulkLedger {
     /// same request, by a LATER row sharing its `(title, namespace)`.
     fn dedupe(&mut self, index: usize, superseded_by: usize) {
         self.deduped_rows
-            .push(json!({ "index": index, "superseded_by": superseded_by }));
+            .push(json!({ "index": index, (field_names::SUPERSEDED_BY): superseded_by }));
     }
 
     /// #2725 (CB-23) — record an input row that REPLACED a pre-existing stored
@@ -284,7 +285,7 @@ impl BulkLedger {
     /// `deduped_rows[]` disclosure shape; a disclosure only, not a counter.
     fn updated_row(&mut self, index: usize, superseded_by: &str) {
         self.updated_rows
-            .push(json!({ "index": index, "superseded_by": superseded_by }));
+            .push(json!({ "index": index, (field_names::SUPERSEDED_BY): superseded_by }));
     }
 
     /// #2725 (CB-23) — record a row REJECTED because its `(title, namespace)`
@@ -308,7 +309,7 @@ impl BulkLedger {
             ),
         );
         if let Some(entry) = self.errors.last_mut().and_then(|e| e.as_object_mut()) {
-            entry.insert("existing_id".to_string(), json!(existing_id));
+            entry.insert(field_names::EXISTING_ID.to_string(), json!(existing_id));
         }
     }
 
@@ -908,7 +909,7 @@ pub async fn bulk_create(
             match OnConflictMode::parse(body.on_conflict.as_deref().unwrap_or("error")) {
                 Ok(m) => m,
                 Err(msg) => {
-                    ledger.reject(index, "on_conflict", &msg);
+                    ledger.reject(index, ON_CONFLICT, &msg);
                     continue;
                 }
             };
@@ -1091,7 +1092,7 @@ async fn bulk_create_sqlite(
                     match db::next_versioned_title(&lock.0, &row.mem.title, &row.mem.namespace) {
                         Ok(title) => row.mem.title = title,
                         Err(e) => {
-                            ledger.reject(row.index, "on_conflict", &e.to_string());
+                            ledger.reject(row.index, ON_CONFLICT, &e.to_string());
                             continue;
                         }
                     }
@@ -1336,7 +1337,7 @@ async fn bulk_create_postgres(
                     Err(e) => {
                         ledger.reject_class(
                             row.index,
-                            "on_conflict",
+                            ON_CONFLICT,
                             classify_store_err(&e),
                             &e.to_string(),
                         );
@@ -1354,7 +1355,7 @@ async fn bulk_create_postgres(
                     Err(e) => {
                         ledger.reject_class(
                             row.index,
-                            "on_conflict",
+                            ON_CONFLICT,
                             classify_store_err(&e),
                             &e.to_string(),
                         );
