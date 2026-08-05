@@ -202,7 +202,7 @@ pub fn handle_skill_get(conn: &Connection, params: &Value) -> Result<Value, Stri
         response[field_names::SIGNING_AGENT] = json!(agent);
     }
     if let Some(sup_id) = superseded_by {
-        response["superseded_by"] = json!(sup_id);
+        response[field_names::SUPERSEDED_BY] = json!(sup_id);
     }
     if let Ok(meta_val) = serde_json::from_str::<Value>(&metadata) {
         response["metadata"] = meta_val;

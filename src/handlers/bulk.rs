@@ -28,10 +28,12 @@
 //!
 //! ```json
 //! {
-//!   "sent": 3, "created": 1, "updated": 0, "deduped": 1, "rejected": 1,
-//!   "errors":       [{"index": 2, "code": "VALIDATION_FAILED",
-//!                     "field": "create", "error": "validation failed"}],
+//!   "sent": 4, "created": 1, "updated": 1, "deduped": 1, "rejected": 1,
+//!   "errors":       [{"index": 2, "code": "CONFLICT",
+//!                     "error": "conflict: already exists",
+//!                     "existing_id": "…"}],
 //!   "deduped_rows": [{"index": 0, "superseded_by": 1}],
+//!   "updated_rows": [{"index": 3, "superseded_by": "…"}],
 //!   "pending":      [],
 //!   "warnings":     []
 //! }
@@ -47,6 +49,35 @@
 //! collapse is a **result the caller must be told about**, not a silent
 //! success, so each one is additionally addressable by input index in
 //! `deduped_rows[]`.
+//!
+//! # `on_conflict` — pre-existing-row disposition (#2725, CB-23)
+//!
+//! Each input row carries the SAME `on_conflict` vocabulary as single-create
+//! (`error` | `merge` | `version`, parsed by
+//! [`crate::mcp::tools::OnConflictMode`]) and defaults to **`error`**, matching
+//! the sqlite single-create default. The disposition applies ONLY to a
+//! collision with a **pre-existing stored** `(title, namespace)` row — NOT to an
+//! in-batch sibling, which is the `deduped_rows[]` collapse above:
+//!
+//! * **`error`** (default) — a row colliding with a pre-existing row is
+//!   REJECTED into `errors[]` as a `CONFLICT` carrying the `existing_id`, and
+//!   the stored content is left UNTOUCHED. Pre-#2725 bulk had no default, so
+//!   every such row silently and unrecoverably OVERWROTE the pre-existing
+//!   content via `db::insert`'s upsert arm — a data-integrity defect, because
+//!   `insert_inner` takes no pre-overwrite snapshot (unlike `db::update`), so
+//!   the prior content was gone and `ai-memory undo-edit` had nothing to
+//!   restore.
+//! * **`merge`** — the caller's explicit opt-in to the content-replacing
+//!   upsert. Each row that replaced a pre-existing row is disclosed by input
+//!   index in `updated_rows[]` (`{index, superseded_by: <stored id>}`),
+//!   mirroring the `deduped_rows[]` shape, so a loader can tell which of its
+//!   records overwrote existing content.
+//! * **`version`** — the row's title is rewritten to the next free suffix so it
+//!   lands as a NEW row and never overwrites.
+//!
+//! A conflict-rejected row counts in `rejected`, never in `updated`, so the
+//! reconciliation identity holds. `updated_rows[]` is a disclosure array (like
+//! `deduped_rows[]`), never a counter, so it does not enter the identity.
 //!
 //! `warnings[]` is deliberately SEPARATE from `errors[]`: a post-commit
 //! federation quorum/catchup failure means the row IS durable locally
@@ -94,6 +125,8 @@ use std::sync::Arc;
 
 use crate::db;
 use crate::embeddings::EmbedStatus;
+use crate::mcp::param_names::ON_CONFLICT;
+use crate::mcp::tools::OnConflictMode;
 use crate::models::field_names;
 use crate::models::{CreateMemory, Memory};
 use crate::validate;
@@ -155,6 +188,10 @@ struct BulkLedger {
     updated: usize,
     errors: Vec<serde_json::Value>,
     deduped_rows: Vec<serde_json::Value>,
+    /// #2725 (CB-23) — input index → superseded (pre-existing) row id for
+    /// rows that were UPDATED under an explicit overwrite `on_conflict`.
+    /// A disclosure array mirroring `deduped_rows`, never a counter.
+    updated_rows: Vec<serde_json::Value>,
     pending: Vec<serde_json::Value>,
     warnings: Vec<&'static str>,
     /// Highest-precedence rejection class seen, for the whole-request status.
@@ -172,6 +209,7 @@ impl BulkLedger {
             updated: 0,
             errors: Vec::new(),
             deduped_rows: Vec::new(),
+            updated_rows: Vec::new(),
             pending: Vec::new(),
             warnings: Vec::new(),
             worst: None,
@@ -237,7 +275,42 @@ impl BulkLedger {
     /// same request, by a LATER row sharing its `(title, namespace)`.
     fn dedupe(&mut self, index: usize, superseded_by: usize) {
         self.deduped_rows
-            .push(json!({ "index": index, "superseded_by": superseded_by }));
+            .push(json!({ "index": index, (field_names::SUPERSEDED_BY): superseded_by }));
+    }
+
+    /// #2725 (CB-23) — record an input row that REPLACED a pre-existing stored
+    /// row under an explicit overwrite `on_conflict` (`merge`). `superseded_by`
+    /// is the stored id whose content was overwritten (never rewritten by the
+    /// conflict arm, so it is the pre-existing row's id). Mirrors the
+    /// `deduped_rows[]` disclosure shape; a disclosure only, not a counter.
+    fn updated_row(&mut self, index: usize, superseded_by: &str) {
+        self.updated_rows
+            .push(json!({ "index": index, (field_names::SUPERSEDED_BY): superseded_by }));
+    }
+
+    /// #2725 (CB-23) — record a row REJECTED because its `(title, namespace)`
+    /// collides with a PRE-EXISTING stored row under the default
+    /// `on_conflict=error`. Echoes the `existing_id` (as single-create's 409
+    /// does) so a loader can reconcile without a second lookup. Classified as
+    /// `CONFLICT` so it participates in the dominant-cause status precedence.
+    fn reject_conflict(&mut self, index: usize, existing_id: &str) {
+        let class = crate::handlers::errors::BulkRowErrorClass {
+            code: crate::errors::error_codes::CONFLICT,
+            label: "conflict: already exists",
+            status: StatusCode::CONFLICT,
+            retryable: false,
+        };
+        self.reject_class(
+            index,
+            "",
+            class,
+            &format!(
+                "on_conflict=error: (title, namespace) collides with existing row {existing_id}"
+            ),
+        );
+        if let Some(entry) = self.errors.last_mut().and_then(|e| e.as_object_mut()) {
+            entry.insert(field_names::EXISTING_ID.to_string(), json!(existing_id));
+        }
     }
 
     /// Record a post-commit replication failure. The row IS durable locally,
@@ -333,6 +406,11 @@ impl BulkLedger {
             if !self.deduped_rows.is_empty() {
                 obj.insert("deduped_rows".to_string(), json!(self.deduped_rows));
             }
+            // #2725 (CB-23) — input index → superseded id for rows updated
+            // under an explicit overwrite `on_conflict`.
+            if !self.updated_rows.is_empty() {
+                obj.insert("updated_rows".to_string(), json!(self.updated_rows));
+            }
             if !self.warnings.is_empty() {
                 obj.insert("warnings".to_string(), json!(self.warnings));
             }
@@ -400,6 +478,10 @@ struct PreparedRow {
     signed_created_at: Option<String>,
     /// #2594 — the vector computed for this row before any DB lock was taken.
     embedding: Option<Vec<f32>>,
+    /// #2725 (CB-23) — the per-row pre-existing-collision disposition, parsed
+    /// once in stage 1 from `body.on_conflict` (default `error`), resolved
+    /// against the live DB in the persist stage.
+    on_conflict: OnConflictMode,
 }
 
 /// #2551 — classify persisted rows into created / updated / deduped.
@@ -443,7 +525,8 @@ fn classify_persisted(outcomes: &[(usize, String, String)], ledger: &mut BulkLed
     }
     for returned in order {
         let members = &groups[returned];
-        if minted_here.contains(returned) {
+        let created = minted_here.contains(returned);
+        if created {
             ledger.created += 1;
         } else {
             ledger.updated += 1;
@@ -451,6 +534,16 @@ fn classify_persisted(outcomes: &[(usize, String, String)], ledger: &mut BulkLed
         if let Some((&survivor, superseded)) = members.split_last() {
             for &idx in superseded {
                 ledger.dedupe(idx, survivor);
+            }
+            // #2725 (CB-23) — a group whose returned id was NOT minted by any
+            // of its members upserted onto a PRE-EXISTING stored row, so the
+            // survivor's content REPLACED it. `returned` is that pre-existing
+            // row's id (the conflict arm never rewrites `id`). Reachable only
+            // under an explicit overwrite `on_conflict` (`merge`); the default
+            // `error` rejects a pre-existing collision BEFORE it reaches the
+            // persist stage, so an updated group never carries a default row.
+            if !created {
+                ledger.updated_row(survivor, returned);
             }
         }
     }
@@ -808,6 +901,18 @@ pub async fn bulk_create(
             ledger.reject(index, &e.field, &e.to_string());
             continue;
         }
+        // #2725 (CB-23) — parse the per-row `on_conflict` disposition up front,
+        // sharing the single-create SSOT (`error` | `merge` | `version`,
+        // default `error`). An unknown token rejects the row (single-create
+        // returns 400 for the same input) rather than silently defaulting.
+        let on_conflict =
+            match OnConflictMode::parse(body.on_conflict.as_deref().unwrap_or("error")) {
+                Ok(m) => m,
+                Err(msg) => {
+                    ledger.reject(index, ON_CONFLICT, &msg);
+                    continue;
+                }
+            };
         let metadata = match resolve_create_metadata(&caller, body) {
             Ok(m) => m,
             Err(e) => {
@@ -835,6 +940,7 @@ pub async fn bulk_create(
             signature: body.signature.clone(),
             signed_created_at: body.created_at.clone(),
             embedding: None,
+            on_conflict,
         });
     }
 
@@ -892,6 +998,28 @@ async fn bulk_create_sqlite(
     let mut committed: Vec<(Memory, Option<Vec<f32>>)> = Vec::new();
     {
         let lock = app.db.lock().await;
+        // #2725 (CB-23) — snapshot each `error`-mode row's PRE-EXISTING
+        // `(title, namespace)` → id BEFORE the sequential upsert loop inserts
+        // anything, so a row colliding with an in-batch sibling (which this
+        // loop is about to create) is NOT mistaken for a pre-existing
+        // collision — that stays the `deduped_rows[]` collapse. `None` caches a
+        // confirmed miss so a repeated key is probed once. Only `error` rows
+        // consult it (`version` renames, `merge` upserts unconditionally).
+        let mut pre_existing: std::collections::HashMap<(String, String), Option<String>> =
+            std::collections::HashMap::new();
+        for row in &prepared {
+            if row.on_conflict != OnConflictMode::Error {
+                continue;
+            }
+            let key = (row.mem.title.clone(), row.mem.namespace.clone());
+            if let std::collections::hash_map::Entry::Vacant(slot) = pre_existing.entry(key) {
+                let existing =
+                    db::find_by_title_namespace(&lock.0, &row.mem.title, &row.mem.namespace)
+                        .ok()
+                        .flatten();
+                slot.insert(existing);
+            }
+        }
         for mut row in prepared {
             // #1919 (CWE-288) — per-row agent attestation, mirroring the
             // single-create sqlite gate. A forged / unverifiable signature (or,
@@ -944,6 +1072,32 @@ async fn bulk_create_sqlite(
             {
                 ledger.reject(row.index, "signature", &e.to_string());
                 continue;
+            }
+
+            // #2725 (CB-23) — resolve the pre-existing-collision disposition
+            // BEFORE any content-replacing write (and before the quota charge,
+            // so a rejected row needs no refund). Default `error` REFUSES a
+            // pre-existing collision (carrying its id) rather than silently
+            // overwriting the stored content via `db::insert`'s upsert arm;
+            // `version` renames to a fresh title; `merge` opts into the upsert.
+            match row.on_conflict {
+                OnConflictMode::Error => {
+                    let key = (row.mem.title.clone(), row.mem.namespace.clone());
+                    if let Some(existing_id) = pre_existing.get(&key).and_then(|o| o.as_deref()) {
+                        ledger.reject_conflict(row.index, existing_id);
+                        continue;
+                    }
+                }
+                OnConflictMode::Version => {
+                    match db::next_versioned_title(&lock.0, &row.mem.title, &row.mem.namespace) {
+                        Ok(title) => row.mem.title = title,
+                        Err(e) => {
+                            ledger.reject(row.index, ON_CONFLICT, &e.to_string());
+                            continue;
+                        }
+                    }
+                }
+                OnConflictMode::Merge => {}
             }
 
             // Namespace governance — sqlite parity with the postgres bulk
@@ -1159,6 +1313,57 @@ async fn bulk_create_postgres(
         {
             ledger.reject(row.index, "signature", &e.to_string());
             continue;
+        }
+
+        // #2725 (CB-23) — pre-existing-collision disposition (postgres twin).
+        // The batched INSERT runs only AFTER this loop, so a
+        // `find_by_title_namespace` hit here is necessarily a PRE-EXISTING row,
+        // never an in-batch sibling (in-batch collapse stays the
+        // `deduped_rows[]` path via `store_batch`'s last-wins upsert). Default
+        // `error` refuses the overwrite (carrying the id); `version` renames;
+        // `merge` opts into the content-replacing upsert.
+        match row.on_conflict {
+            OnConflictMode::Error => {
+                match app
+                    .store
+                    .find_by_title_namespace(&row.mem.title, &row.mem.namespace)
+                    .await
+                {
+                    Ok(Some(existing_id)) => {
+                        ledger.reject_conflict(row.index, &existing_id);
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        ledger.reject_class(
+                            row.index,
+                            ON_CONFLICT,
+                            classify_store_err(&e),
+                            &e.to_string(),
+                        );
+                        continue;
+                    }
+                }
+            }
+            OnConflictMode::Version => {
+                match app
+                    .store
+                    .next_versioned_title(&row.mem.title, &row.mem.namespace)
+                    .await
+                {
+                    Ok(title) => row.mem.title = title,
+                    Err(e) => {
+                        ledger.reject_class(
+                            row.index,
+                            ON_CONFLICT,
+                            classify_store_err(&e),
+                            &e.to_string(),
+                        );
+                        continue;
+                    }
+                }
+            }
+            OnConflictMode::Merge => {}
         }
 
         // F-A2A1.5 (#705) — namespace governance, per row.
@@ -1377,6 +1582,39 @@ mod tests {
         let mut l = BulkLedger::new(1);
         classify_persisted(&outcomes(&[("minted", "preexisting")]), &mut l);
         assert_eq!((l.created, l.updated, l.deduped()), (0, 1, 0));
+        // #2725 (CB-23) — the updated row discloses its superseded (pre-existing)
+        // id by input index, mirroring `deduped_rows[]`.
+        assert_eq!(l.updated_rows.len(), 1);
+        assert_eq!(l.updated_rows[0]["index"], 0);
+        assert_eq!(l.updated_rows[0]["superseded_by"], "preexisting");
+    }
+
+    /// #2725 (CB-23) — a fresh/created group emits NO `updated_rows` entry, and
+    /// an in-batch collapse (created + deduped) is likewise never an update.
+    #[test]
+    fn classify_created_and_dedup_emit_no_updated_rows() {
+        let mut l = BulkLedger::new(3);
+        classify_persisted(
+            &outcomes(&[("r0", "r0"), ("r1", "r1"), ("r2", "r0")]),
+            &mut l,
+        );
+        assert_eq!((l.created, l.updated, l.deduped()), (2, 0, 1));
+        assert!(l.updated_rows.is_empty());
+    }
+
+    /// #2725 (CB-23) — a conflict rejection is a `CONFLICT`-class error that
+    /// carries the `existing_id` and drives the dominant-cause status.
+    #[test]
+    fn reject_conflict_is_a_conflict_with_existing_id() {
+        use crate::errors::error_codes;
+        let mut l = BulkLedger::new(1);
+        l.reject_conflict(0, "row-abc");
+        assert_eq!(l.rejected(), 1);
+        assert_eq!(l.updated, 0);
+        assert_eq!(l.errors[0]["code"], error_codes::CONFLICT);
+        assert_eq!(l.errors[0]["index"], 0);
+        assert_eq!(l.errors[0]["existing_id"], "row-abc");
+        assert_eq!(l.status(), StatusCode::CONFLICT);
     }
 
     /// #2551 — the in-batch collapse, in the shape the POSTGRES branch

@@ -327,6 +327,12 @@ async fn bulk_created_counts_persisted_not_sent_2551() {
 /// PARENT: a second bulk call that UPSERTS an already-existing row reports
 /// `created: 1`. Summing `created` across batches then over-counts the table,
 /// which is the cross-batch half of the 7,912/7,855 discrepancy.
+///
+/// #2725 (CB-23) — the cross-call upsert is now an EXPLICIT `on_conflict=merge`;
+/// the default (`error`) rejects a pre-existing collision rather than silently
+/// overwriting (that data-integrity change is pinned by
+/// `tests/bulk_on_conflict_2725.rs`). This cell keeps pinning the surviving
+/// #2551 concern: an upsert reports `updated`, never `created`.
 #[tokio::test]
 async fn bulk_updated_is_distinct_from_created_2551() {
     let (router, db_path, _keep) = build_test_router();
@@ -340,12 +346,9 @@ async fn bulk_updated_is_distinct_from_created_2551() {
     assert_eq!(first["created"], 1, "{first}");
     assert_eq!(first["updated"], 0, "{first}");
 
-    let (status, second) = post(
-        &router,
-        "/api/v1/memories/bulk",
-        &json!([row(ns, "t", "v2")]),
-    )
-    .await;
+    let mut merge_row = row(ns, "t", "v2");
+    merge_row["on_conflict"] = json!("merge");
+    let (status, second) = post(&router, "/api/v1/memories/bulk", &json!([merge_row])).await;
     assert_eq!(db_row_count(&db_path, ns), 1, "still one row: {second}");
     assert_eq!(
         second["created"], 0,

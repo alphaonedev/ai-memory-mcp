@@ -515,7 +515,7 @@ fn resolve_create_conflict_title(
                             "memory with title '{}' already exists in namespace '{}'",
                             body.title, body.namespace
                         ),
-                        "existing_id": existing_id,
+                        (field_names::EXISTING_ID): existing_id,
                     })),
                 )
                     .into_response()),
@@ -1678,7 +1678,7 @@ pub async fn create_memory(
                             mem.namespace,
                         ),
                         "code": crate::errors::error_codes::CONFLICT,
-                        "existing_id": conflict.existing_id,
+                        (field_names::EXISTING_ID): conflict.existing_id,
                         "existing_title": conflict.existing_title,
                         (field_names::SIMILARITY): conflict.similarity,
                         "reason": conflict.reason,
