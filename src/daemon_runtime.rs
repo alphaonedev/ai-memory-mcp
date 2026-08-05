@@ -6910,7 +6910,7 @@ where
 /// zero rows and nothing can lower it without a manual DB edit). The
 /// bound is generous enough to absorb real NTP drift yet defeats any
 /// far-future poison.
-const PULL_CURSOR_FUTURE_SKEW_SECS: i64 = 300;
+pub(crate) const PULL_CURSOR_FUTURE_SKEW_SECS: i64 = 300;
 
 /// v1.0.0 #2718 / CB-14 — validate a peer-advertised pull-cursor
 /// candidate BEFORE honoring it as this node's new `sync_state`
@@ -6931,7 +6931,10 @@ const PULL_CURSOR_FUTURE_SKEW_SECS: i64 = 300;
 /// `now`. On rejection the caller MUST NOT advance the cursor (leave
 /// `sync_state` unchanged) — DEGRADE (re-pull the same window next
 /// cycle), never silently skip forward over undelivered rows.
-fn validate_pull_cursor(candidate: &str, current_since: Option<&str>) -> Result<(), &'static str> {
+pub(crate) fn validate_pull_cursor(
+    candidate: &str,
+    current_since: Option<&str>,
+) -> Result<(), &'static str> {
     let candidate_dt = match chrono::DateTime::parse_from_rfc3339(candidate) {
         Ok(dt) => dt.with_timezone(&chrono::Utc),
         Err(_) => return Err("not RFC3339"),
@@ -7076,12 +7079,67 @@ pub async fn sync_cycle_once(
 
     {
         let conn = db::open(db_path)?;
+        // #2714 (CB-10, data-loss) — a transient/non-durable apply (SQLITE_BUSY
+        // and siblings) MUST NOT let the cursor advance past the un-applied row.
+        // Pre-fix this loop discarded the insert result (`let _ =`) and then
+        // advanced `sync_state` to `advance_to` UNCONDITIONALLY — and #2663's
+        // `next_since` fix made it WORSE, leaping the cursor to the peer's
+        // examined-watermark far past any individually-failed row, so one
+        // `SQLITE_BUSY` permanently dropped that row (the strict `updated_at >
+        // since` delta never re-offers it). Adopt the `catchup_halted` discipline
+        // the `serve` puller got right in #1687: halt at the first non-durable
+        // apply and advance only to the last DURABLE success, so the failed row
+        // (and everything after it) is re-pulled next cycle. `/sync/since` orders
+        // rows by `updated_at` ASC, so the pre-failure high-water is <= the
+        // failed row's timestamp — the failed row is never skipped.
+        let mut apply_halted = false;
+        let mut last_durable: Option<String> = None;
         for mem in &pulled.memories {
-            if crate::validate::RequestValidator::validate_memory(mem).is_ok() {
-                let _ = db::insert_if_newer(&conn, mem);
+            if crate::validate::RequestValidator::validate_memory(mem).is_err() {
+                continue;
+            }
+            // #2715 (CB-11 / B-4) — per-write content attestation, the pull
+            // sibling of the `/sync/push` gate: a forged `metadata.write_signature`
+            // is refused, a valid one lands `agent_attested`, absent → `claimed`.
+            // A refused row is a permanent (not transient) refusal, so `continue`
+            // WITHOUT halting — re-pull cannot fix a forged signature.
+            let mut to_insert = mem.clone();
+            if !crate::handlers::federation_receive::attest_inbound_pull_memory(&mut to_insert) {
+                continue;
+            }
+            match db::insert_if_newer(&conn, &to_insert) {
+                Ok(_) => {
+                    if !apply_halted
+                        && last_durable
+                            .as_deref()
+                            .is_none_or(|cur| to_insert.updated_at.as_str() > cur)
+                    {
+                        last_durable = Some(to_insert.updated_at.clone());
+                    }
+                }
+                Err(e) => {
+                    apply_halted = true;
+                    tracing::warn!(
+                        target: crate::federation::SCOPE_TRACE_TARGET,
+                        peer = %peer_url,
+                        memory_id = %to_insert.id,
+                        error = %e,
+                        "sync-daemon: non-durable apply — halting cursor advance so \
+                         the un-applied row is re-pulled next cycle (#2714 row-loss guard)"
+                    );
+                }
             }
         }
-        if let Some(ref at) = advance_to {
+        // #2714 — when an apply failed this window, NEVER advance to the peer's
+        // examined-watermark (`advance_to`) past the un-applied row; advance only
+        // to the last durable success. On a clean window keep the #2441/#2663
+        // `next_since` behaviour (advance to the validated peer watermark).
+        let observe_to: Option<&str> = if apply_halted {
+            last_durable.as_deref()
+        } else {
+            advance_to.as_deref()
+        };
+        if let Some(at) = observe_to {
             db::sync_state_observe(&conn, local_agent_id, peer_url, at)?;
         }
     }

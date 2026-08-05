@@ -567,6 +567,93 @@ pub(super) fn apply_inbound_write_attestation(
     .map(|_| ())
 }
 
+/// #2715 (CB-11 / B-4, data-integrity/federation) — attested apply-gate for the
+/// federation PULL paths (the `serve` catch-up puller
+/// [`crate::federation::receive::catchup_once_with_store`] + the `sync-daemon`
+/// [`crate::daemon_runtime::sync_cycle_once`]), the read-direction sibling of the
+/// `/sync/push` per-write content-attestation gate ([`apply_inbound_write_attestation`]).
+///
+/// Both pullers previously applied pulled rows with only a namespace check and
+/// NO content attestation — a forged `metadata.write_signature` that the push
+/// receive path would REJECT was silently accepted through the pull door, and
+/// every row landed with whatever `attest_level` the wire asserted. This closes
+/// that bypass with the SAME cryptographic core the push path uses.
+///
+/// A pulled row is applied by the AUTHOR's own claim: unlike push there is no
+/// distinct #238-attested relayer (`sender_agent_id`) on the `/sync/since` GET
+/// response, so we verify the presented signature against the CLAIMED author and
+/// pass `sender == author`, which makes the strict-flip's honored-third-party
+/// REFUSAL inert here (it only fires for a relayer honoring someone else's
+/// claim). This gate's job is therefore FORGERY REJECTION + honest
+/// `attest_level`, never a self-authored-relay brick:
+///   - a presented signature that does NOT verify against the author's enrolled
+///     key → `Err` → refuse (skip the row, fail-closed — the durable text on the
+///     peer is unchanged and re-pull is harmless);
+///   - a signature that verifies → `agent_attested`;
+///   - no signature, or an author with no locally-enrolled key → `claimed`
+///     (DEGRADE, never corrupt — the pull direction has no attested relayer to
+///     hold accountable, so an unsigned row is accepted-and-flagged).
+///
+/// The author key is resolved from the on-disk ENROLLED key store
+/// ([`crate::identity::verify::lookup_peer_public_key`]) — the SAME source the
+/// federation signal-author and transition-author lanes use — so the gate is
+/// backend-UNIFORM (sqlite + postgres pulls behave identically; the sqlite-only
+/// `db::agent_pubkey` registration source the push path uses is deliberately NOT
+/// used here). No `.is_ok()` / `if let Ok` is used as a security predicate — a
+/// forged signature is an explicit `Err` that returns `false`.
+///
+/// #2340 (FBL-32) — redacts to the TO-BE-PERSISTED form FIRST so the attestation
+/// verifies + stamps over exactly the bytes the storage funnel
+/// (`insert_if_newer` / `apply_remote_memory`, which both secret-screen-degrade
+/// on the receive path) will persist; a stale cross-mode `write_signature` is
+/// dropped inside the redactor and the row lands honestly `claimed` instead of a
+/// false `agent_attested`.
+///
+/// Returns `true` when the (now-attested) row may be applied, `false` when it
+/// must be skipped.
+#[must_use]
+pub(crate) fn attest_inbound_pull_memory(mem: &mut Memory) -> bool {
+    use base64::Engine;
+    let Some(author) = mem
+        .metadata
+        .get(crate::META_KEY_AGENT_ID)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+    else {
+        // No claimed author → no owner claim to verify a signature against.
+        // Apply unchanged (byte-identical to the pre-#2715 pull behaviour for
+        // an author-less row).
+        return true;
+    };
+    // #2340 — redact BEFORE verify/stamp so the attestation commits over the
+    // persisted bytes (see fn docs).
+    crate::federation::receive_auth::redact_inbound_before_attestation(mem);
+    let author_bound_key = crate::identity::verify::lookup_peer_public_key(&author)
+        .map(|vk| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vk.to_bytes()));
+    match apply_inbound_write_attestation(
+        mem,
+        &author,
+        &author,
+        None,
+        author_bound_key.as_deref(),
+        crate::federation::receive_auth::require_write_sig_enabled(),
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                target: ATTESTATION_TRACE_TARGET,
+                memory_id = %mem.id,
+                author = %author,
+                error = %e,
+                "federation pull: per-write content attestation failed — refusing \
+                 forged/unverifiable inbound memory (#2715 B-4); skipping this row, \
+                 the batch survives and re-pull is harmless"
+            );
+            false
+        }
+    }
+}
+
 /// v1.0.0 R19/A3 (#1948, decision `560c8007`) — route-IN quarantine of a
 /// provenance-less inbound relayed memory (write boundary only).
 ///
@@ -3535,6 +3622,138 @@ mod tests {
         )
         .expect("unsigned permissive must pass");
         assert_eq!(mem.metadata["attest_level"], "claimed");
+    }
+
+    // ---- #2715 (CB-11 / B-4) per-write attestation on the federation PULL
+    //      paths (serve catch-up puller + sync-daemon), via
+    //      `attest_inbound_pull_memory` — the read-direction sibling gate ----
+
+    /// Serialize the `AI_MEMORY_KEY_DIR` mutation these tests need (the pull
+    /// gate resolves the author key from the on-disk enrolled key store) with
+    /// every other key-dir test in the process.
+    struct KeyDirEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl KeyDirEnvGuard {
+        fn set(dir: &std::path::Path) -> Self {
+            let lock = keypair::key_dir_env_lock()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prev = std::env::var_os(keypair::KEY_DIR_ENV);
+            // SAFETY: single-threaded test mutation, serialized by the lock held
+            // for this guard's lifetime.
+            unsafe { std::env::set_var(keypair::KEY_DIR_ENV, dir) };
+            Self { _lock: lock, prev }
+        }
+    }
+    impl Drop for KeyDirEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var(keypair::KEY_DIR_ENV, v),
+                    None => std::env::remove_var(keypair::KEY_DIR_ENV),
+                }
+            }
+        }
+    }
+
+    /// A VALID presented `write_signature`, verified against the author's
+    /// locally-enrolled key, upgrades a pulled row to `agent_attested` and is
+    /// applied. (The key source is the on-disk store, resolved by the gate
+    /// itself — not passed in, unlike the push-side tests above.)
+    #[test]
+    fn pull_attestation_valid_sig_upgrades_and_applies_2715() {
+        let dir = tempfile::tempdir().expect("key dir");
+        let author = "alice";
+        let kp = keypair::generate(author).expect("gen");
+        keypair::save(&kp, dir.path()).expect("enroll alice");
+        let _g = KeyDirEnvGuard::set(dir.path());
+
+        let mut mem = wsig_mem(author);
+        let sig = attest::sign_memory_write(&kp, &mem, author).expect("sign");
+        put_write_sig(&mut mem, &sig);
+
+        assert!(
+            attest_inbound_pull_memory(&mut mem),
+            "a validly-signed pulled row must be applied"
+        );
+        assert_eq!(
+            mem.metadata["attest_level"], "agent_attested",
+            "a verified write_signature upgrades the pulled row to agent_attested"
+        );
+    }
+
+    /// THE SECURITY CORE: a FORGED presented signature (present but not
+    /// verifiable against the author's enrolled key) is REFUSED on the pull
+    /// path — the forgery a peer could previously smuggle through the catch-up
+    /// door that `/sync/push` would have rejected (#2715 B-4). No `.is_ok()`
+    /// masking — the gate returns `false` on the explicit `Err`.
+    #[test]
+    fn pull_attestation_forged_sig_refused_2715() {
+        let dir = tempfile::tempdir().expect("key dir");
+        let author = "alice";
+        let kp = keypair::generate(author).expect("gen");
+        keypair::save(&kp, dir.path()).expect("enroll alice");
+        let _g = KeyDirEnvGuard::set(dir.path());
+
+        let mut mem = wsig_mem(author);
+        let mut sig = attest::sign_memory_write(&kp, &mem, author).expect("sign");
+        sig[0] ^= 0xFF; // forge
+        put_write_sig(&mut mem, &sig);
+
+        assert!(
+            !attest_inbound_pull_memory(&mut mem),
+            "a forged write_signature on the pull path must be REFUSED (skip the row)"
+        );
+    }
+
+    /// An UNSIGNED pulled row is accept-and-FLAGGED: it lands `claimed`
+    /// (DEGRADE, never corrupt — the pull direction has no attested relayer to
+    /// hold accountable), and is applied. A peer-asserted `agent_attested` is
+    /// overridden to `claimed` (a peer cannot self-assert attestation).
+    #[test]
+    fn pull_attestation_unsigned_lands_claimed_2715() {
+        let dir = tempfile::tempdir().expect("key dir");
+        let author = "alice";
+        let kp = keypair::generate(author).expect("gen");
+        keypair::save(&kp, dir.path()).expect("enroll alice");
+        let _g = KeyDirEnvGuard::set(dir.path());
+
+        let mut mem = wsig_mem(author);
+        // Peer lies: claims agent_attested with no signature.
+        mem.metadata.as_object_mut().unwrap().insert(
+            "attest_level".to_string(),
+            serde_json::json!("agent_attested"),
+        );
+
+        assert!(
+            attest_inbound_pull_memory(&mut mem),
+            "an unsigned pulled row is accepted (flagged claimed), never dropped"
+        );
+        assert_eq!(
+            mem.metadata["attest_level"], "claimed",
+            "unsigned pulled row must be flagged claimed, overriding the peer's self-assertion"
+        );
+    }
+
+    /// A pulled row with NO claimed author (`metadata.agent_id` absent) has no
+    /// owner claim to attest against — applied unchanged (no env / key needed).
+    #[test]
+    fn pull_attestation_no_author_applies_unchanged_2715() {
+        let mut mem = Memory {
+            id: "m-2715-no-author".to_string(),
+            namespace: "team/alpha".to_string(),
+            title: "t".to_string(),
+            content: "c".to_string(),
+            created_at: "2026-06-01T12:00:00+00:00".to_string(),
+            metadata: serde_json::json!({}),
+            ..Memory::default()
+        };
+        assert!(
+            attest_inbound_pull_memory(&mut mem),
+            "an author-less pulled row carries no claim to verify; applied unchanged"
+        );
     }
 
     /// Strict mode (`AI_MEMORY_FED_REQUIRE_WRITE_SIG`) refuses an unsigned
