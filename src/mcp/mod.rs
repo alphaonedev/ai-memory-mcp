@@ -612,6 +612,7 @@ pub(crate) use namespace::authorize_namespace_standard_bind;
 // stdio JSON-RPC scaffolding.
 pub use namespace::{
     handle_namespace_clear_standard, handle_namespace_get_standard, handle_namespace_set_standard,
+    handle_namespace_set_standard_trusted,
 };
 pub use notify::{handle_inbox, handle_notify};
 pub use pending::{handle_pending_approve, handle_pending_reject};
