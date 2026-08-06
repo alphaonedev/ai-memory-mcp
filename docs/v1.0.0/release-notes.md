@@ -224,15 +224,20 @@ parent commit, and a DB-free source-inspection pin structurally rejects
 the bad statement shape on hosts that never see AGE). #2511 is fixed and
 closed.
 
-**Residual, OPEN:** [#2613](https://github.com/alphaonedev/ai-memory-mcp/issues/2613).
-`build_find_paths_current_view_cypher` still carries
-`ALL(e IN relationships(p) …)`, so every AGE-routed `find_paths` reaches
-the same defect through the 2-arg `cypher()` form that the
-third-argument fix did not touch — still parse-rejected, still
-CTE-served. The `kg_backend = Age` reporting honesty gap is tracked on
-that same issue. Results stay correct (the relational CTE is the
-always-current mirror); what is not yet true is that AGE is the engine
-answering. Track #2613 before depending on AGE-engine traversal.
+**Residual, RESOLVED by [#2613](https://github.com/alphaonedev/ai-memory-mcp/issues/2613).**
+The AGE `find_paths` reader (`find_paths_cypher`) and its
+`build_find_paths_current_view_cypher` builder — which emitted an
+`ALL(e IN relationships(p) …)` guard that the pinned AGE version rejects
+at parse time — were unreachable from production ever since #2582 routed
+`find_paths` to the relational recursive-CTE UNCONDITIONALLY on both
+backends. #2613 DELETES that dead reader + builder rather than porting a
+path the measurements prove can never win (5-agent vote `4d3ea1c5`,
+unanimous), closing the "advertise a capability it cannot deliver" gap.
+The reporting honesty gap is closed too: an AGE deployment now emits a
+one-shot connect-time WARN stating `find_paths` is CTE-served (the
+per-call fallback WARN that removal left silent). `find_paths` results
+were and remain correct (the CTE reads the durable `memory_links`);
+`kg_query` / `kg_timeline` / `lineage` still use AGE Cypher.
 
 ### CI posture for the certified stack — the pins are not CI-asserted
 

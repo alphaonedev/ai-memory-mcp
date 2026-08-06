@@ -394,10 +394,12 @@ async fn kg_query_equivalence() {
 //
 // Semantic regression for the #1689 fix: kg_invalidate SETs valid_until
 // on the edge (it does NOT delete it), so a current-view kg_query /
-// find_paths MUST filter it out. The builder-string unit tests in
-// src/store/postgres.rs pin that the filter TEXT is present; THIS test
-// proves the filter actually WORKS against a live AGE instance — and
-// that the AGE result matches the CTE result (which already filters).
+// find_paths MUST filter it out. For kg_query the AGE Cypher reader's
+// Rust-side guard (`age_path_edges_all_current`) enforces it; for
+// find_paths the relational CTE's `valid_until` predicate does (the AGE
+// find_paths reader was deleted in #2613). THIS test proves the filter
+// actually WORKS against a live AGE instance — and that kg_query's AGE
+// result matches the CTE result (which already filters).
 // Pre-fix, the unfiltered AGE branch would still return the invalidated
 // edge's target and diverge from the CTE, failing this test.
 // ---------------------------------------------------------------------------
@@ -484,15 +486,18 @@ async fn issue_1689_age_excludes_invalidated_edges() {
     // find_paths current view must likewise not route through the
     // retracted edge: the shortest 0->1 path was the direct edge; after
     // invalidation any surviving 0->1 path must be strictly longer than 1
-    // hop (or absent). Pre-fix the AGE find_paths would still return the
-    // 1-hop path.
+    // hop (or absent). #2613 — call the `find_paths` DISPATCHER, which is
+    // what production serves (the relational recursive-CTE on both backends
+    // since #2582; the AGE `find_paths_cypher` reader was deleted). The
+    // CTE's `valid_until IS NULL OR valid_until > NOW()` filter enforces the
+    // #1689 current-view exclusion this test pins.
     let paths = store
-        .find_paths_cypher(&ids[0], &ids[1], Some(4), Some(10))
+        .find_paths(&ids[0], &ids[1], Some(4), Some(10))
         .await
-        .expect("find_paths_cypher after invalidate");
+        .expect("find_paths after invalidate");
     assert!(
         paths.iter().all(|p| p.len() != 2),
-        "#1689: AGE find_paths must not return the invalidated direct 0->1 edge (a 2-node path)"
+        "#1689: find_paths must not return the invalidated direct 0->1 edge (a 2-node path)"
     );
 }
 

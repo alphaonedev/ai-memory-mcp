@@ -3,49 +3,39 @@
 
 // clippy allows (test scaffolding): pedantic lints with no behavioral impact.
 #![allow(clippy::doc_lazy_continuation, clippy::too_many_lines)]
-//! v0.7.0.1 G5 — postgres `find_paths_cypher` must compile cleanly
-//! against AGE 1.5.0's `convert_cypher_to_subquery` analyzer.
+//! #2613 — `find_paths` on a postgres-AGE daemon is served by the
+//! relational recursive-CTE, NOT an AGE Cypher traversal.
 //!
-//! Reproducer for the G5 finding surfaced by R1b against the live cert
-//! droplets:
+//! ## History (why this file used to assert something false)
 //!
-//! ```text
-//! ERROR ai_memory::handlers: store backend error: backend unavailable:
-//!   postgres: cypher find_paths: error returned from database:
-//!   syntax error at or near "|"
-//! ```
-//!
-//! The pre-fix Cypher was:
-//!
-//! ```cypher
-//! MATCH p = (a)-[*..N]-(b)
-//! WHERE a.id = $start_id AND b.id = $target_id
-//! RETURN [n IN nodes(p) | properties(n).id] AS path
-//! ORDER BY length(p) ASC
-//! LIMIT N
-//! ```
-//!
-//! AGE 1.5.0's parser supports list comprehensions (`[var IN list | expr]`)
-//! in isolation, but `convert_cypher_to_subquery` mishandles the shape when
-//! the iteration variable is bound from a function call (`nodes(p)`) and
-//! the projection touches a property — the analyzer's recovery point at
-//! `|` bubbles up as a Postgres-grammar `syntax error at or near "|"`
-//! before the planner ever sees the Cypher body. The handler converts
-//! that error to a 503 `storage backend unavailable`.
+//! This file was `g5_find_paths_cypher_no_syntax_error.rs`, a v0.7.0.1
+//! reproducer that a live-AGE `find_paths` must not surface the Cypher
+//! `syntax error at or near "|"` / `"("` that AGE's parser raised on the
+//! list-comprehension / `ALL(...)` shapes. Those shapes were never
+//! parseable on the SSOT-pinned AGE 1.7 at all, so #2582 routed
+//! `find_paths` to the relational recursive-CTE UNCONDITIONALLY on both
+//! `KgBackend` values, and #2613 DELETED the unreachable AGE
+//! `find_paths_cypher` reader + its builder. The old filename now asserts
+//! a falsehood (there is no Cypher `find_paths` to keep syntactically
+//! clean), so it is renamed and repurposed into the regression that
+//! belongs here: proving `find_paths` on an AGE deployment resolves via
+//! the CTE and returns correct paths, with no AGE traversal invoked.
 //!
 //! ## What this test asserts
 //!
 //! 1. Boot an in-process HTTP daemon backed by [`PostgresStore`] against
-//!    a database with Apache AGE 1.5.0 enabled (so the SAL dispatcher's
-//!    `kg_backend = Age` branch lights up).
-//! 2. Seed a 5-node chain A→B→C→D→E through `POST /api/v1/memories`
-//!    + `POST /api/v1/links` — same wire shape S65 uses; the G4 fix
-//!    self-projects each link into the `memory_graph` AGE projection so
-//!    the corpus is in place by the time `find_paths` runs.
-//! 3. POST `{source_id: A, target_id: E, max_depth: 3}` to
+//!    a database with Apache AGE enabled (so the SAL dispatcher's
+//!    `kg_backend = Age` branch resolves — even though `find_paths` no
+//!    longer dispatches to it).
+//! 2. Seed a chain A→B→C→D→E through `POST /api/v1/memories`
+//!    + `POST /api/v1/links` — same wire shape S65 uses; the relational
+//!    `memory_links` rows the CTE walks are in place by the time
+//!    `find_paths` runs.
+//! 3. POST `{source_id, target_id, max_depth}` to
 //!    `/api/v1/kg/find_paths` and assert a 200 with a non-empty `paths`
-//!    array. Pre-G5 the daemon returned 503 with the syntax-error wire
-//!    shape above.
+//!    array whose shortest path spans the chain. On an AGE deployment
+//!    this proves the CTE serves `find_paths` correctly (pre-#2582 the
+//!    AGE branch surfaced a 503 with the `"|"` syntax-error wire shape).
 //!
 //! ## Gating
 //!
@@ -70,8 +60,8 @@ mod common;
 use common::{DAEMON_READY_TIMEOUT, free_port, wait_for_http_ready};
 
 /// AGE-or-Postgres URL fallback — sibling of g2/g4; differs from
-/// `common::age_url` because the find-paths cypher path is tested
-/// against whatever Postgres is available.
+/// `common::age_url` because `find_paths` is tested against whatever
+/// Postgres (AGE-enabled) is available.
 fn age_url() -> Option<String> {
     std::env::var("AI_MEMORY_TEST_AGE_URL")
         .ok()
@@ -199,28 +189,32 @@ async fn store_memory(
     v["id"].as_str().expect("id").to_string()
 }
 
-/// G5 reproducer — `POST /api/v1/kg/find_paths` over a 5-node chain
-/// must return a 200 with a non-empty `paths` array on a postgres-AGE
-/// daemon. Pre-fix this surfaces as a 503 `syntax error at or near "|"`
-/// because the Cypher list-comprehension form fails AGE 1.5.0's analyzer.
+/// #2613 — `POST /api/v1/kg/find_paths` over a 5-node chain must return a
+/// 200 with a non-empty `paths` array on a postgres-AGE daemon, proving
+/// `find_paths` is served by the relational recursive-CTE (no AGE Cypher
+/// traversal is invoked). This deliberately runs against an AGE-installed
+/// fixture (`kg_backend = Age`) so the assertion covers the AGE deployment
+/// specifically — the honesty guarantee that a `KgBackend::Age` node still
+/// gets correct, CTE-served path-finding.
 #[tokio::test(flavor = "multi_thread")]
-async fn g5_find_paths_cypher_compiles_against_age_1_5() {
+async fn g5_find_paths_cte_served_on_age() {
     let Some(url) = age_url() else {
         eprintln!(
-            "skipping g5_find_paths_cypher_compiles_against_age_1_5: \
+            "skipping g5_find_paths_cte_served_on_age: \
              AI_MEMORY_TEST_AGE_URL / AI_MEMORY_TEST_POSTGRES_URL not set"
         );
         return;
     };
 
-    // Probe the connection's `kg_backend`; the CTE fallback doesn't
-    // exhibit G5 because there's no Cypher to compile against.
+    // Probe the connection's `kg_backend`; this test only asserts the
+    // AGE-installed shape (a CTE-only fixture has no `KgBackend::Age`
+    // branch to prove find_paths is nonetheless CTE-served).
     let store = PostgresStore::connect(&url)
         .await
         .expect("connect postgres adapter");
     if !matches!(store.kg_backend(), ai_memory::store::KgBackend::Age) {
         eprintln!(
-            "skipping g5_find_paths_cypher_compiles_against_age_1_5: \
+            "skipping g5_find_paths_cte_served_on_age: \
              kg_backend != Age (no AGE extension on this fixture)"
         );
         return;
@@ -267,7 +261,7 @@ async fn g5_find_paths_cypher_compiles_against_age_1_5() {
     // depth=3 only covers an A→B→C→D path which is intentional — the
     // assertion is "no 503", not "every path is enumerated"; the longer
     // 4-hop A→…→E path stays out so we can prove the depth knob round-
-    // trips the handler boundary as well as the cypher analyzer.
+    // trips the handler boundary as well as the CTE traversal.
     let resp = client
         .post(format!("{base}/api/v1/kg/find_paths"))
         .header("X-Agent-Id", G5_TEST_AGENT_ID)
@@ -287,19 +281,17 @@ async fn g5_find_paths_cypher_compiles_against_age_1_5() {
     assert_eq!(
         status,
         reqwest::StatusCode::OK,
-        "G5: find_paths must return 200 from a postgres-AGE daemon — \
-         pre-fix this surfaces as 503 with `cypher find_paths: \
-         syntax error at or near \"|\"` because the list-comprehension \
-         RETURN form fails AGE 1.5.0's `convert_cypher_to_subquery` \
-         analyzer; got status={status} body={body}."
+        "#2613: find_paths must return 200 from a postgres-AGE daemon \
+         (served by the relational CTE, no AGE Cypher traversal) — \
+         pre-#2582 the AGE branch surfaced 503 with `cypher find_paths: \
+         syntax error at or near \"|\"`; got status={status} body={body}."
     );
 
     let paths = body["paths"].as_array().expect("paths must be an array");
     assert!(
         !paths.is_empty(),
-        "G5: find_paths must surface at least one path through the \
-         A→B→C→D chain at max_depth=3 once the cypher compiles; got \
-         empty: {body}"
+        "#2613: find_paths must surface at least one path through the \
+         A→B→C→D chain at max_depth=3 via the CTE; got empty: {body}"
     );
 
     // First (shortest) path should be the 4-node A→B→C→D chain.
