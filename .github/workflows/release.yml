@@ -137,13 +137,60 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }} --features sal
 
-      - name: Assert compiled features (#2676)
+      - name: Assert compiled features (#2676, #2728)
         shell: bash
         run: |
           bin="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
-          # Windows artifact is .exe; run via path. Script uses `features` subcommand.
-          bash scripts/assert-compiled-features.sh "$bin" \
-            --require sqlite-bundled --require sal
+          target="${{ matrix.target }}"
+          # #2728 — the release matrix cross-builds x86_64-apple-darwin on an
+          # arm64 `macos-latest` runner. `ai-memory features` self-report is an
+          # EXECUTING assertion; running the x86_64 binary on arm64 needs
+          # Rosetta 2 (NOT guaranteed on GitHub arm64 macOS images), and a
+          # Rosetta miss would fail this job only during a real tag cut. So:
+          # execute the feature self-report ONLY when the target is natively
+          # runnable on this host; for a non-native target, verify the built
+          # artifact's ARCHITECTURE WITHOUT running it. The compiled feature
+          # set is identical across both darwin targets (same
+          # `cargo build --release --features sal` invocation above), so the
+          # native aarch64-apple-darwin job's feature assertion already covers
+          # the feature contract; the x86_64 job additionally confirms the
+          # cross-build actually emitted an x86_64 Mach-O, not a silent
+          # host-arch binary.
+          target_arch="${target%%-*}"
+          case "$target_arch" in
+            arm64) target_arch="aarch64" ;;
+          esac
+          host_arch="$(uname -m)"
+          case "$host_arch" in
+            arm64) host_arch="aarch64" ;;
+            amd64) host_arch="x86_64" ;;
+          esac
+          if [[ "$target_arch" == "$host_arch" ]]; then
+            # Native target — safe to execute (Windows artifact is .exe; the
+            # script invokes the `features` subcommand via the path).
+            echo "native target ($target on $host_arch): executing feature self-report assertion"
+            bash scripts/assert-compiled-features.sh "$bin" \
+              --require sqlite-bundled --require sal
+          else
+            echo "non-native target ($target on $host_arch): verifying arch WITHOUT executing (#2728)"
+            # Expected Mach-O / `file` architecture token for the target CPU.
+            case "$target_arch" in
+              x86_64)  want="x86_64" ;;
+              aarch64) want="arm64" ;;   # lipo / Mach-O name aarch64 as arm64
+              *)       want="$target_arch" ;;
+            esac
+            if command -v lipo >/dev/null 2>&1; then
+              info="$(lipo -info "$bin")"
+            else
+              info="$(file "$bin")"
+            fi
+            echo "  artifact: $info"
+            if ! printf '%s' "$info" | grep -qiw "$want"; then
+              echo "assert: arch verification FAILED — expected '$want' in: $info" >&2
+              exit 1
+            fi
+            echo "assert: arch verification OK ($bin is $want; non-exec #2728)"
+          fi
 
       - name: Package binary (unix)
         if: ${{ !contains(matrix.target, 'windows') }}

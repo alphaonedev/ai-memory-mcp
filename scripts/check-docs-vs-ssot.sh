@@ -152,6 +152,21 @@ DOC_FILES=(
     docs/v1.0.0/release-notes.md
 )
 
+# Operator-facing HTML surfaces (rendered compliance pages). Markdown is
+# the primary narrative form, but procurement-facing .html pages restate
+# the same mechanically-pinned SSOT counts and drift INDEPENDENTLY of
+# their .md siblings when an SSOT moves — #2729 / CB-32: nsa-csi-mcp.html
+# shipped stale 89/91 CLI counts vs SSOT 90/92 while
+# nsa-csi-mcp-security-mapping.md was already correct at 90/92. The gate
+# had ZERO html references (same class as #2668 E-20 for benchmark.svg),
+# so the rendered surface was invisible. These files are walked by the
+# html-aware CLI-count rules in run_all_rules below. Kept as an explicit
+# allowlist (not a `**/*.html` glob) so a historical/archived HTML page
+# cannot silently enroll a legitimate past-release count into the gate.
+HTML_DOC_FILES=(
+    docs/compliance/nsa-csi-mcp.html
+)
+
 # CHANGELOG.md is intentionally excluded — every entry is a historical
 # snapshot at landing time, so claims like "Both adapters now at
 # CURRENT_SCHEMA_VERSION = 50" are CORRECT historical state, not drift.
@@ -662,6 +677,26 @@ run_all_rules() {
         "EXPECTED_CLI_SUBCOMMANDS_SAL" \
         "$CANONICAL_CLI_SAL" \
         'yields \*\*([0-9]+)\*\* by unlocking|([0-9]+) CLI subcommands\*\* under `--features sal`'
+    # CLI subcommand counts on operator-facing HTML surfaces (#2729 /
+    # CB-32). The markdown rules above never see rendered .html pages;
+    # these sibling rules police the same two anchors on the HTML
+    # compliance docs (HTML_DOC_FILES). The default-build anchor is
+    # "<N> CLI subcommands in the default build"; the sal anchor is the
+    # "<N> under `sal`" figure that immediately follows it
+    # ("... default build / <N> under <code>sal</code>"). Both survive
+    # the code-span markup and match all three procurement-page uses
+    # (the surface-table cell, the addresses-it paragraph, and the
+    # operator-runbook `# Expected:` comment).
+    check_narrative_count_rule \
+        "EXPECTED_CLI_SUBCOMMANDS_DEFAULT (html)" \
+        "$CANONICAL_CLI_DEFAULT" \
+        '([0-9]+) CLI subcommands in the default build' \
+        "${HTML_DOC_FILES[@]}"
+    check_narrative_count_rule \
+        "EXPECTED_CLI_SUBCOMMANDS_SAL (html)" \
+        "$CANONICAL_CLI_SAL" \
+        'default build / ([0-9]+) under' \
+        "${HTML_DOC_FILES[@]}"
 
     if [[ "$fail_count" -gt 0 ]]; then
         printf '\n❌ docs-vs-SSOT drift gate: %d violation(s)\n' "$fail_count" >&2
@@ -1016,6 +1051,53 @@ CLEANDOC
         echo "FAIL: self-test #2713 — engine fault did not produce the distinct fail-closed message" >&2
         cd "$REPO_ROOT"; exit 1; }
     echo "PASS: self-test #2713 — an analysis-engine error FAILS CLOSED (exit $fault_rc, distinct message, no PASS banner)"
+    # ---- HTML SURFACE COVERAGE (#2729 / CB-32, R-203). Before this
+    # extension the gate had ZERO html coverage, so nsa-csi-mcp.html
+    # shipped stale 89/91 CLI counts while its .md sibling was correct.
+    # Plant a stale HTML count under the fixture and assert BOTH
+    # html-aware CLI rules REJECT it. Clean the md docs + remove the
+    # ledger first so this leg isolates exactly the planted HTML.
+    rm -f "$led"
+    cat > CLAUDE.md <<'HTMLCLEANCLAUDE'
+Fixture CLAUDE.md — deliberately carries no narrative counts.
+HTMLCLEANCLAUDE
+    cat > README.md <<'HTMLCLEANREADME'
+Fixture README — deliberately carries no narrative counts.
+HTMLCLEANREADME
+    mkdir -p "$tmpdir/docs/compliance"
+    # Fixture canonicals: cli 78 default / 80 sal. Plant 89/91 — the exact
+    # pre-fix nsa-csi-mcp.html shape — so the assertion reproduces CB-32.
+    cat > "$tmpdir/docs/compliance/nsa-csi-mcp.html" <<'HTMLSTALEEOF'
+<td>RequestValidator surface (94 production HTTP route registrations over 80 unique paths + 103 advertised MCP entries at <code>--profile full</code> + 89 CLI subcommands in the default build / 91 under <code>sal</code>)</td>
+<span class="com"># Expected: 89 CLI subcommands in the default build / 91 under `sal`</span>
+HTMLSTALEEOF
+    if new_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+        echo "FAIL: self-test — gate did NOT catch the stale HTML CLI counts (89/91 vs fixture 78/80)" >&2
+        printf '%s\n' "$new_out" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    grep -q 'EXPECTED_CLI_SUBCOMMANDS_DEFAULT (html): docs/compliance/nsa-csi-mcp.html' <<<"$new_out" || {
+        echo "FAIL: self-test — stale HTML default-build CLI count not flagged by the html rule" >&2
+        printf '%s\n' "$new_out" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    grep -q 'EXPECTED_CLI_SUBCOMMANDS_SAL (html): docs/compliance/nsa-csi-mcp.html' <<<"$new_out" || {
+        echo "FAIL: self-test — stale HTML sal CLI count not flagged by the html rule" >&2
+        printf '%s\n' "$new_out" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    echo "PASS: self-test — html-aware gate REJECTS stale HTML CLI counts (#2729 / CB-32)"
+
+    # ---- HTML CONTROL: correct HTML counts (matching the fixture
+    # canonical 78/80) must PASS, proving the html rule is not a
+    # blanket-fail on any html file it touches.
+    cat > "$tmpdir/docs/compliance/nsa-csi-mcp.html" <<'HTMLGOODEOF'
+<td>RequestValidator surface (78 CLI subcommands in the default build / 80 under <code>sal</code>)</td>
+HTMLGOODEOF
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+        echo "FAIL: self-test — html rule fired on CORRECT HTML CLI counts (78/80)" >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    echo "PASS: self-test — correct HTML CLI counts (78/80) still PASS"
 
     cd "$REPO_ROOT"
 }
