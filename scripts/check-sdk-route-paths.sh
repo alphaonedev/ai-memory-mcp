@@ -250,6 +250,27 @@ MDEOF
         echo "FAIL: self-test ledger — malformed entry not named" >&2; exit 1; }
     echo "PASS: self-test ledger — a MALFORMED entry HARD-FAILS"
 
+    # ---- fail CLOSED on an analysis-engine error (CB-2 / #2713) -------
+    # An internal engine error (a UnicodeDecodeError on one non-UTF-8 byte
+    # in a scanned SDK file; a logic bug) must NEVER print PASS. R-203:
+    # first reproduce the pre-fix SHAPE — `x="$(crashing-python)" || true`
+    # — which swallows a crash into an empty value and would print a false
+    # PASS; then prove the FIXED gate fails closed under an injected fault.
+    write_clean
+    prefix_shape="$(v="$(python3 -c 'import sys; sys.exit(3)')" || true; [[ -z "$v" ]] && echo "WOULD-PRINT-PASS")"
+    [[ "$prefix_shape" == "WOULD-PRINT-PASS" ]] || {
+        echo "FAIL: self-test R-203 — the pre-fix \`|| true\` shape did not reproduce the false-PASS fail-open" >&2; exit 1; }
+    fault_rc=0
+    fault_out="$(AI_MEMORY_SDK_GATE_ROOT="$FIX" AI_MEMORY_SDK_GATE_SELFTEST_FAULT=1 "$SELF" 2>&1)" || fault_rc=$?
+    [[ "$fault_rc" -ne 0 ]] || {
+        echo "FAIL: self-test #2713 — the gate exited 0 on an injected analysis-engine fault (fail-OPEN)" >&2
+        printf '%s\n' "$fault_out" | sed 's/^/       /' >&2; exit 1; }
+    grep -q 'gate: PASS' <<<"$fault_out" && {
+        echo "FAIL: self-test #2713 — the gate printed a PASS banner despite an engine fault" >&2; exit 1; }
+    grep -q 'analysis engine errored' <<<"$fault_out" || {
+        echo "FAIL: self-test #2713 — engine fault did not produce the distinct fail-closed message" >&2; exit 1; }
+    echo "PASS: self-test #2713 — an analysis-engine error FAILS CLOSED (exit $fault_rc, distinct message, no PASS banner)"
+
     # ---- The gate must never be a silent no-op ------------------------
     rm -rf "$FIX/sdk"
     mkdir -p "$FIX/sdk"
@@ -296,7 +317,7 @@ if [[ "${#SDK_FILES[@]}" -eq 0 ]]; then
     exit 1
 fi
 
-violations="$(
+if ! violations="$(
     ROUTES_RS="$ROUTES_RS" \
     SDK_FILE_LIST="$(printf '%s\n' "${SDK_FILES[@]}")" \
     REPO_ROOT="$REPO_ROOT" \
@@ -307,6 +328,13 @@ import re
 root = os.environ["REPO_ROOT"].rstrip("/")
 routes_rs = os.environ["ROUTES_RS"]
 sdk_files = [f for f in os.environ["SDK_FILE_LIST"].splitlines() if f.strip()]
+
+# Self-test fault-injection (#2713): when this env var is set the analysis
+# engine raises, so the gate's own --self-test can prove the gate FAILS
+# CLOSED (exits non-zero, prints no PASS) on an engine error instead of
+# swallowing it into an empty violation set. Never set in production / CI.
+if os.environ.get("AI_MEMORY_SDK_GATE_SELFTEST_FAULT"):
+    raise RuntimeError("check-sdk-route-paths self-test: injected analysis-engine fault (#2713)")
 
 PARAM = re.compile(r"^(?:\{[^}]*\}|:[A-Za-z_][A-Za-z0-9_]*|\$\{.*\}|<[^>]*>)$")
 
@@ -510,7 +538,15 @@ for f in sdk_files:
                 continue
             print(f"{rel}\t{ln}\t{raw}\t{norm}\t{line.strip()[:140]}")
 PY
-)" || true
+)"; then
+    # FAIL CLOSED (#2713): the analysis engine exited non-zero (an uncaught
+    # exception — e.g. a UnicodeDecodeError on one non-UTF-8 byte in a
+    # scanned SDK file, or the injected self-test fault). The pre-fix
+    # `|| true` swallowed that into an empty violation set and printed a
+    # FALSE "PASS". Refuse loudly instead of attesting to work never done.
+    printf 'FAIL: check-sdk-route-paths: analysis engine errored (python exited non-zero) — refusing to report PASS (#2713 fail-closed)\n' >&2
+    exit 2
+fi
 
 # ---- PENDING-FIX ledger ---------------------------------------------
 # Format: `<sdk-file> <normalised-path> #<issue> <note>`. Same three
