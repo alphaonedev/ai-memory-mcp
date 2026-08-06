@@ -169,6 +169,37 @@ pub fn get(conn: &Connection, id: &str) -> rusqlite::Result<Option<Checkpoint>> 
     .optional()
 }
 
+/// `WHERE id = ?1` scalar SELECT of a checkpoint's `namespace` only — the
+/// checkpoints-table twin of [`crate::storage::namespace_by_id`].
+const SQL_SELECT_CHECKPOINT_NAMESPACE_BY_ID: &str =
+    "SELECT namespace FROM checkpoints WHERE id = ?1";
+
+/// Resolve the STORED `namespace` of the checkpoint row with `id`, or `None`
+/// when no such row exists locally.
+///
+/// #2708 (CB-3, CWE-284/#2447-class) — the federation checkpoint-resolution
+/// receive lane authorizes a peer's per-peer `allowed_namespaces` scope, but
+/// the [`apply_inbound_resolution`] CAS keys on `(id, state)` ONLY: on the
+/// pending→resolved arm it resolves the LOCAL row by id and writes NOTHING to
+/// its `namespace`. So the confinement subject on that arm is the STORED
+/// namespace, NOT the attacker-chosen wire `namespace` — a peer scoped to
+/// `public/*` must not resolve a `secure/ops` freeze anchor by presenting a
+/// `public/ok` wire namespace. This scalar is the by-id namespace probe the
+/// receive funnel feeds as `existing_namespace`, mirroring how the memories
+/// lane consumes [`crate::storage::namespace_by_id`] (#2447) — a SCALAR
+/// projection, never a full-row [`get`], so a probe never depends on mapping
+/// the checkpoint's condition JSON / attestation bytes.
+///
+/// # Errors
+/// Propagates the `rusqlite` query error (the caller MUST fail closed — an
+/// unresolvable probe cannot be reported as "provably no local row").
+pub fn namespace_by_id(conn: &Connection, id: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(SQL_SELECT_CHECKPOINT_NAMESPACE_BY_ID, params![id], |row| {
+        row.get::<_, String>(0)
+    })
+    .optional()
+}
+
 /// List a namespace's checkpoints, newest-first, capped at `limit`. When
 /// `state` is `Some`, narrows to that lifecycle state; when `None`, returns
 /// every checkpoint in the namespace.
