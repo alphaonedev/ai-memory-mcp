@@ -216,6 +216,21 @@ pub struct Metrics {
     /// §federation-push-DLQ. It should fall to zero and stay there.
     pub federation_push_dlq_legacy_positional: IntCounter,
 
+    /// #2716 (CB-12) — cumulative count of pending federated ERASURES /
+    /// DELETES that the replay worker SUPERSEDED instead of propagating,
+    /// because the target id is LIVE again locally with an `updated_at`
+    /// that POST-DATES the queued erasure (an authorized archive restore /
+    /// re-store). Incremented at BOTH supersede sites: the erasure-sentinel
+    /// expansion guard (F10) and the replay-POST-path restore-race guard
+    /// (F9). A supersede CANCELS an operator-requested erasure, so it is
+    /// never silent — this counter is the observable companion to the loud
+    /// WARN. A non-zero rate is expected on any mesh that restores archived
+    /// rows; a SUSTAINED rate may mean an erasure keeps being undone by a
+    /// resurrection whose clock leads the eraser and warrants an operator
+    /// re-issue. Increments once per superseded row per pass (a rate, not a
+    /// population).
+    pub federation_erasure_superseded: IntCounter,
+
     /// pm-v3.1 PR8 (issue #1174) — cumulative HNSW oldest-eviction
     /// count since process start. Replaces the prior process-global
     /// `AtomicU64` `INDEX_EVICTIONS_TOTAL` in `src/hnsw.rs`.
@@ -624,6 +639,19 @@ impl Metrics {
         )?;
         registry.register(Box::new(federation_push_dlq_legacy_positional.clone()))?;
 
+        // #2716 (CB-12) — federated erasure/delete supersede observability.
+        let federation_erasure_superseded = IntCounter::new(
+            "ai_memory_federation_erasure_superseded_total",
+            "Federation pending erasures/deletes SUPERSEDED (not propagated) \
+             because the target id is LIVE again locally with an updated_at \
+             that post-dates the queued erasure (an authorized restore / \
+             re-store). Counts both the erasure-sentinel expansion guard and \
+             the replay-POST-path restore-race guard. A supersede cancels an \
+             operator-requested erasure; a sustained rate may mean an erasure \
+             is being undone by a resurrection and warrants a re-issue. #2716.",
+        )?;
+        registry.register(Box::new(federation_erasure_superseded.clone()))?;
+
         // pm-v3.1 PR8 (issue #1174) — HNSW eviction observability moved
         // from process-global atomics in `src/hnsw.rs` into the metrics
         // registry. The counter mirrors `INDEX_EVICTIONS_TOTAL`; the
@@ -799,6 +827,7 @@ impl Metrics {
             federation_push_dlq_quarantined,
             federation_push_dlq_quarantined_by_cause,
             federation_push_dlq_legacy_positional,
+            federation_erasure_superseded,
             hnsw_evictions_total,
             hnsw_last_eviction_at_nanos,
             subscription_dlq_overflow_total,

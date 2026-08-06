@@ -749,6 +749,7 @@ async fn replay_ack_leaves_row_pending_when_snapshot_is_stale_2360() {
                     payload_json: serde_json::json!({"memories": [], "gen": 1}),
                     attempt_count: 1,
                     last_error: "prior".to_string(),
+                    failed_at: "1970-01-01T00:00:00+00:00".to_string(),
                 },
             ])
         }
@@ -793,6 +794,16 @@ async fn replay_ack_leaves_row_pending_when_snapshot_is_stale_2360() {
             _last_error: &str,
         ) -> Result<ai_memory::federation::SentinelExpansion, String> {
             Ok(ai_memory::federation::SentinelExpansion::Contended)
+        }
+        // #2716 — this sink models the store-lane mark-vs-refresh race; its
+        // row is a store payload (never a delete), so the restore-race
+        // guard is never consulted. `false` = "not superseded" (proceed).
+        async fn erasure_delete_superseded_by_restore(
+            &self,
+            _memory_id: &str,
+            _erasure_failed_at: &str,
+        ) -> Result<bool, String> {
+            Ok(false)
         }
     }
 

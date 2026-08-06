@@ -380,6 +380,16 @@ impl FederationDlqSink for RecordingDlqSink {
     ) -> Result<ai_memory::federation::SentinelExpansion, String> {
         Ok(ai_memory::federation::SentinelExpansion::Contended)
     }
+
+    // #2716 — this harness drives the store-lane landing pass and never a
+    // delete/erasure, so the restore-race guard is never consulted.
+    async fn erasure_delete_superseded_by_restore(
+        &self,
+        _memory_id: &str,
+        _erasure_failed_at: &str,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 // ---------------------------------------------------------------------------
