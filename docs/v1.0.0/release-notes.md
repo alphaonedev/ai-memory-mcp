@@ -239,7 +239,7 @@ answering. Track #2613 before depending on AGE-engine traversal.
 **No CI job builds or version-asserts PG 18.4 + AGE 1.7.0 + pgvector
 0.8.5.** The `postgres-age` job
 ([#2012](https://github.com/alphaonedev/ai-memory-mcp/issues/2012)) that
-did was **deleted on 2026-07-31 by operator directive** (`da3fb9cc`),
+did was **deleted on 2026-07-31 by operator directive** (`2b85ba38`),
 not repaired: it rebuilt the certified stack from source on the runner
 every night purely to reproduce a stack that already exists
 continuously as the `ai-memory-pg:18.4-age1.7.0-vec0.8.5` container on
@@ -451,7 +451,7 @@ program:
 
 ### Scope of this attestation
 
-As of commit **`03bbd556`** on `release/v1.0.0`, the Gate-3 review round
+As of commit **`0b5662ba`** on `release/v1.0.0`, the Gate-3 review round
 described above closed with **0 GA-blockers in scope**, where *in scope*
 means the findings raised by the two Gate-3 review lanes — the
 multi-agent code review and the multi-agent security review — which are
@@ -495,7 +495,7 @@ the Gate-3 endgame on the v1.0.0 release branch:
 4. **Every finding that round raised was closed in-release.** The
    combined code + security findings are
    [#2014](https://github.com/alphaonedev/ai-memory-mcp/issues/2014)–[#2017](https://github.com/alphaonedev/ai-memory-mcp/issues/2017);
-   all four are **CLOSED** at commit `03bbd556`, and **none was graded a
+   all four are **CLOSED** at commit `0b5662ba`, and **none was graded a
    GA-blocker.**
 5. **Final DO + AI-NHI dogfood 3-green**, then a **3×7 documentation
    drive** and a **docs-drift** sweep.

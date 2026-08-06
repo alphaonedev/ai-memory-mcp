@@ -5,7 +5,7 @@
 
 **Status:** BINDING. Supersedes all prior scope discussion for v1.0.0.
 **Decided by:** AI NHI synthesis over 13 adversarial lens verdicts.
-**Code baseline:** brief was verified at `release/v1.0.0 @ 5449b6da`; **HEAD is now `e31dea74`**. Every blocking item below must be re-verified at the cut commit before the certification is signed (see §6).
+**Code baseline:** brief was verified at `release/v1.0.0 @ cc61a899`; **HEAD is now `2f32dde1`**. Every blocking item below must be re-verified at the cut commit before the certification is signed (see §6).
 
 ---
 
@@ -163,7 +163,7 @@ Reopen the cut line if **any** of the following becomes true:
 4. **The running claims audit adds findings** — assume it adds, never subtracts. Any new overclaim that cannot be withdrawn is a blocker.
 5. **Any additional control is found emitting PASS without checking** — it joins the blocking set automatically under §0, no re-vote required. (#2635 is proof this class already ships here.)
 6. **Further tag-pipeline findings** (§3C). That surface was never audited; treat current knowledge as a floor.
-7. **Re-verification at the cut commit fails.** The backlog was verified at `5449b6da`; HEAD is `e31dea74`. #2630 proves this audit's own merges introduce regressions. Every blocking item is re-verified at the cut, or the certification is unsupported.
+7. **Re-verification at the cut commit fails.** The backlog was verified at `cc61a899`; HEAD is `2f32dde1`. #2630 proves this audit's own merges introduce regressions. Every blocking item is re-verified at the cut, or the certification is unsupported.
 8. **The evidence in §5.4(3) cannot be produced truthfully** — today it cannot, because #2548 and #2512 mean the certified pg+AGE tier has never been executed in CI. If it still cannot be produced at cut time, do not sign; ship v1.0.0 **without** the enterprise-federation certification and say so plainly.
 
 **Bottom line: v1.0.0 is reachable and is NOT a v2.0.0 — but it is 2–3 weeks out, not 3 days, and it is not shippable with the claim surface in its current state.**

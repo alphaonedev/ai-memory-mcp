@@ -3,7 +3,7 @@
 
 # CLAIMS REGISTER — ai-memory v1.0.0 GA
 
-**Repo:** `/home/fate_two/v07/v09-dev` · **Branch:** `release/v1.0.0` · **HEAD:** `e31dea74` (was `5449b6da` when the seven surface passes began; re-verified at `e31dea74`)
+**Repo:** `/home/fate_two/v07/v09-dev` · **Branch:** `release/v1.0.0` · **HEAD:** `2f32dde1` (was `cc61a899` when the seven surface passes began; re-verified at `2f32dde1`)
 **Standard applied (operator, verbatim):** *"enterprise ready means a fortune 500 company would bet their entire business in integrating all their AI Agents with ai-memory v1.0.0 GA release — they would bet the entire farm analogy on ai-memory doing everything it CLAIMS it can reliably, consistently, without error"*
 **Binding surface:** the published claims, not the code.
 **Scope:** 7 published surfaces — README, capabilities API, security/compliance docs, federation docs, performance claims, API contract + SDK READMEs, roadmap/release-notes/changelog.
@@ -179,7 +179,7 @@ This is the release's own readiness attestation — the single claim an enterpri
 
 **C-23 · FALSE · `postgres-age` nightly CI job gates the certified stack**
 📍 `docs/v1.0.0/release-notes.md:205-212` — "gated **nightly** ... **fail-closed asserts** the live server_version / age extversion / vector extversion equal the pins before any test runs ... This closes the gap that AGE-gated Cypher ... could only be exercised on an operator's own machine."
-> `.github/workflows/postgres-parity-nightly.yml:16-29` — "**REMOVED 2026-07-31 (operator directive)**: the `postgres-age` job (#2012) ... is **gone rather than repaired**"; deleted in `da3fb9cc`. The surviving job uses `pgvector/pgvector:pg16` — **not** the certified PG 18.4 — and runs 4 non-AGE binaries. The exact disclaimer the sentence claims to retire is the current state **by design**.
+> `.github/workflows/postgres-parity-nightly.yml:16-29` — "**REMOVED 2026-07-31 (operator directive)**: the `postgres-age` job (#2012) ... is **gone rather than repaired**"; deleted in `2b85ba38`. The surviving job uses `pgvector/pgvector:pg16` — **not** the certified PG 18.4 — and runs 4 non-AGE binaries. The exact disclaimer the sentence claims to retire is the current state **by design**.
 
 **C-24 · FALSE · "Two independent CI jobs" enforce coverage + a `.coverage-baseline` ratchet**
 📍 `ROADMAP.md:284`, `:993-996`
@@ -424,14 +424,14 @@ Stated bluntly so nobody mistakes this register for a clean bill of health.
 4. **Surfaces not in scope:** `docs/INSTALL.md`, `docs/DEVELOPER_GUIDE.md` (beyond incidental cross-checks — note it is already known internally inconsistent on tool count at lines 7/88 vs 423 vs 845), `docs/ARCHITECTURAL_LIMITS.md`, `docs/production-deployment.md` (beyond §7), MCP per-tool descriptions and JSON schemas as advertised on the wire, iOS/Android clients, SDK source beyond the READMEs and the specific methods named, the public website, GitHub Pages content outside `docs/compliance/`, marketing copy, licensing, and dependency CVE posture.
 5. **Postgres + AGE behaviour is entirely unverified by execution here** — and per C-09 the project's own most recent live evidence (#2511) shows a five-cause silent fallback to the relational CTE that made prior AGE greens meaningless. **Treat every Postgres/AGE claim in this register as adjudicated-on-paper only.**
 6. **Retrieval quality on anything other than LongMemEval is unmeasured**, and even there this register only adjudicates *which harness produced the published numbers* — it does not independently reproduce **96.4% / 96.8%**.
-7. **Seven independent passes wrote the source findings; this register adjudicates and ranks them.** Cross-surface spot-checks re-verified at `e31dea74`: `HTTP_BODY_LIMIT_BYTES = 2 * MIB`, `EXPECTED_PRODUCTION_ROUTES_COUNT = 94`, `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = 80`, `CURRENT_SCHEMA_VERSION = 88`, `min_line_coverage = 90.0`, `bench.yml` self-declared advisory + 0 bench entries in `required-contexts-release.txt`, `src/audit.rs` CHECKPOINT.sig comment-only, `kg_backend =` assignments `#[cfg(test)]`-only, zero `caps.compaction` writers, `transport.rs:852` sync bypass, no `grant`/`revoke`/`cluster` in `routes.rs`, `git tag -l 'v1.0.0*'` empty. **Findings not on that list are carried at their source pass's stated evidence and were not independently re-derived.**
-8. **HEAD moves.** This register is pinned to `e31dea74`. Every file:line will drift — which is, precisely, the #2629 failure class this register documents. **Re-derive before citing.**
+7. **Seven independent passes wrote the source findings; this register adjudicates and ranks them.** Cross-surface spot-checks re-verified at `2f32dde1`: `HTTP_BODY_LIMIT_BYTES = 2 * MIB`, `EXPECTED_PRODUCTION_ROUTES_COUNT = 94`, `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = 80`, `CURRENT_SCHEMA_VERSION = 88`, `min_line_coverage = 90.0`, `bench.yml` self-declared advisory + 0 bench entries in `required-contexts-release.txt`, `src/audit.rs` CHECKPOINT.sig comment-only, `kg_backend =` assignments `#[cfg(test)]`-only, zero `caps.compaction` writers, `transport.rs:852` sync bypass, no `grant`/`revoke`/`cluster` in `routes.rs`, `git tag -l 'v1.0.0*'` empty. **Findings not on that list are carried at their source pass's stated evidence and were not independently re-derived.**
+8. **HEAD moves.** This register is pinned to `2f32dde1`. Every file:line will drift — which is, precisely, the #2629 failure class this register documents. **Re-derive before citing.**
 
 ---
 
 ## 7. ERRATA — errors found IN THIS REGISTER during remediation
 
-*Added 2026-08-01 by the CERT GATE 2 remediation lanes (PRs #2651–#2661). Every item below was found by a lane implementing this register's own §3 remedy list, and each was verified against code at `03bbd556`/`cb09bb07` before being recorded here.*
+*Added 2026-08-01 by the CERT GATE 2 remediation lanes (PRs #2651–#2661). Every item below was found by a lane implementing this register's own §3 remedy list, and each was verified against code at `0b5662ba`/`67e6d940` before being recorded here.*
 
 **Why this section exists.** This register's standard is that a correct system which overclaims fails the bet-the-farm bar. **An audit that overclaims about claims fails its own standard.** The seven remediation lanes were instructed to verify every correction against the code rather than trust the register, and doing so surfaced ~20 defects in the register itself. They are recorded here rather than silently fixed, because §6.8 already warns that this document drifts — this is that warning coming true, measured.
 

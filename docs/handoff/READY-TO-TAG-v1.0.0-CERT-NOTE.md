@@ -1,9 +1,9 @@
 # Ready-to-tag certification note — ai-memory v1.0.0
 
 **Status:** READY-TO-TAG (operator-gated)  
-**Recommended cut tip (current):** `b1bd4c59a84cc864095ab459ee84134e0a621a85` — includes Gate1 residual closes (#2529/#2536/#2532) + release/Docker `--features sal` assert (#2700).  
-**First cert-note tip:** `0130b2f191120b1eed49df7ab53403551cfa275c` — first tip that **includes this cert note**.  
-**Also valid to cut:** any `release/v1.0.0` tip that is a **descendant of `0130b2f1`** and still contains this file.  
+**Authorized cut SHA (exact — the ONLY tip this note certifies):** `b1bd4c59a84cc864095ab459ee84134e0a621a85` — the measured/reviewed tip; includes Gate1 residual closes (#2529/#2536/#2532) + release/Docker `--features sal` assert (#2700).  
+**First cert-note tip:** `0130b2f191120b1eed49df7ab53403551cfa275c` — first tip that **includes this cert note** (minimum ancestor of the authorized SHA).  
+**Re-certification required on drift:** this note certifies **only** `b1bd4c59a84cc864095ab459ee84134e0a621a85`. **No descendant is auto-authorized.** Any later `release/v1.0.0` tip carries un-recertified commits — including `security`-labelled changes the Gate-3 measure binary `c1c6055d` never covered — and MUST be re-run through the gates and re-pinned in this note before it may be cut.  
 **Do not cut:** `c1c6055d` — measure-binary parent; **omits** this cert note.  
 **Measure binary (Gate3):** `c1c6055d` (asserted `sal-postgres` build).  
 **Branch:** `release/v1.0.0`  
@@ -56,7 +56,7 @@
 
 1. Review this note + residual list  
 2. Optionally land residual security issues or accept as post-tag  
-3. **Cut** `v1.0.0` on recommended tip **`b1bd4c59`** (or any later descendant that still contains this document; minimum ancestor `0130b2f1`) — **never** on `c1c6055d`  
+3. **Cut** `v1.0.0` on the exact authorized SHA **`b1bd4c59a84cc864095ab459ee84134e0a621a85`** — **only** this SHA. No descendant is auto-authorized; if the tip has drifted past it, re-certify per the header before cutting. **Never** cut `c1c6055d`  
 4. **Dispatch** publish workflows  
 5. Agents **must not** create tags or dispatch release/publish
 
@@ -64,9 +64,11 @@
 
 ```bash
 git fetch origin && git log -1 --oneline origin/release/v1.0.0
-# recommended: b1bd4c59 or descendant; must include this file (never cut c1c6055d)
-git merge-base --is-ancestor 0130b2f1 origin/release/v1.0.0 && echo "cert-note tip is ancestor of HEAD: OK"
-git merge-base --is-ancestor b1bd4c59 origin/release/v1.0.0 && echo "recommended cut tip is ancestor of HEAD: OK"
+# The tag MUST be cut on EXACTLY b1bd4c59a84cc864095ab459ee84134e0a621a85 (never c1c6055d).
+git merge-base --is-ancestor 0130b2f1 origin/release/v1.0.0 && echo "cert-note min ancestor present: OK"
+git merge-base --is-ancestor b1bd4c59 origin/release/v1.0.0 && echo "authorized cut SHA present: OK"
+# If the tip has advanced past the authorized SHA, STOP and re-certify — do not cut the drifted tip:
+git rev-parse origin/release/v1.0.0   # must equal b1bd4c59a84cc864095ab459ee84134e0a621a85, else DRIFTED
 git tag -l 'v1.0.0*'   # expect empty until operator cuts
 # release channel (GHCR/deb/tarball):
 cargo build --release --features sal
