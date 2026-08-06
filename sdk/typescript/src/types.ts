@@ -149,6 +149,72 @@ export interface UpdateMemoryRequest {
   metadata?: Record<string, unknown>;
 }
 
+/**
+ * A per-row rejection in a {@link BulkCreateResponse} `errors[]` entry.
+ *
+ * `field` is echoed only when the server has a slug-shaped attribution;
+ * `existing_id` is present for a `CONFLICT` row that collided with a
+ * pre-existing stored `(title, namespace)` under `on_conflict=error`
+ * (`src/handlers/bulk.rs::BulkLedger::{reject_class,reject_conflict}`).
+ */
+export interface BulkCreateError {
+  index: number;
+  code: string;
+  error: string;
+  field?: string;
+  existing_id?: string;
+}
+
+/**
+ * A `deduped_rows[]` disclosure: input row `index` was superseded, within
+ * the SAME batch, by a LATER row (`superseded_by`, an input index) sharing
+ * its `(title, namespace)`. `superseded_by` is a NUMBER here.
+ */
+export interface BulkDedupedRow {
+  index: number;
+  superseded_by: number;
+}
+
+/**
+ * An `updated_rows[]` disclosure (#2725): input row `index` REPLACED a
+ * pre-existing stored row under an explicit overwrite `on_conflict`;
+ * `superseded_by` is the overwritten STORED id (a string).
+ */
+export interface BulkUpdatedRow {
+  index: number;
+  superseded_by: string;
+}
+
+/**
+ * Response envelope for `POST /api/v1/memories/bulk`
+ * (`src/handlers/bulk.rs::BulkLedger::into_response`).
+ *
+ * The reconciliation identity a fleet loader asserts is
+ * `created + updated + deduped + rejected + pending.length === sent`.
+ * `created` counts rows this call INSERTED and `updated` counts rows it
+ * upserted onto an already-existing `(title, namespace)`.
+ *
+ * The daemon answers **207 Multi-Status** for a partially-applied batch and
+ * **202** for a fully-queued (all-pending) batch — both 2xx, so `res.ok`
+ * gating (client.ts) accepts them. `deduped_rows`, `updated_rows`,
+ * `warnings`, `embed_status`, and `embed_status_reason` are emitted only
+ * when non-empty / degraded, so they are optional.
+ */
+export interface BulkCreateResponse {
+  sent: number;
+  created: number;
+  updated: number;
+  deduped: number;
+  rejected: number;
+  errors: BulkCreateError[];
+  pending: Array<Record<string, unknown>>;
+  deduped_rows?: BulkDedupedRow[];
+  updated_rows?: BulkUpdatedRow[];
+  warnings?: string[];
+  embed_status?: string;
+  embed_status_reason?: string;
+}
+
 /** Body for `POST /api/v1/recall`. */
 export interface RecallRequest {
   context: string;
