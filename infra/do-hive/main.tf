@@ -97,6 +97,17 @@ variable "agent_droplet_size" {
   default     = "s-1vcpu-1gb"
 }
 
+variable "agent_workload" {
+  description = "Which workload the agent droplets run: 'ironclaw' (default; the E1 emergent-behavior hive) or 'loadgen' (#2438 capacity-measurement load generators -- curl+python3 op mix, no IronClaw, no LLM inference). The default keeps the IronClaw hive path byte-identical; measurement.tfvars selects 'loadgen'."
+  type        = string
+  default     = "ironclaw"
+
+  validation {
+    condition     = contains(["ironclaw", "loadgen"], var.agent_workload)
+    error_message = "agent_workload must be 'ironclaw' or 'loadgen'."
+  }
+}
+
 variable "ssh_pubkey_fingerprint" {
   description = "SSH key fingerprint to authorise on every droplet. Operator's key."
   type        = string
@@ -183,11 +194,21 @@ resource "digitalocean_droplet" "agent" {
   vpc_uuid = digitalocean_vpc.hive.id
   ssh_keys = [var.ssh_pubkey_fingerprint]
 
-  user_data = templatefile("${path.module}/cloud-init-agent.yaml.tpl", {
-    ironclaw_image_url = var.ironclaw_image_url
-    memory_private_ip  = digitalocean_droplet.memory.ipv4_address_private
-    agent_index        = count.index + 1
-  })
+  // #2438: select the load-generator bootstrap when agent_workload=="loadgen"
+  // (measurement.tfvars). Default keeps the IronClaw path unchanged. The var
+  // map is shared and unchanged; the loadgen template ignores ironclaw_image_url
+  // (templatefile tolerates unreferenced vars) and reads only memory_private_ip
+  // + agent_index, so the default hive path is byte-identical.
+  user_data = templatefile(
+    var.agent_workload == "loadgen"
+    ? "${path.module}/cloud-init-loadgen.yaml.tpl"
+    : "${path.module}/cloud-init-agent.yaml.tpl",
+    {
+      ironclaw_image_url = var.ironclaw_image_url
+      memory_private_ip  = digitalocean_droplet.memory.ipv4_address_private
+      agent_index        = count.index + 1
+    }
+  )
 
   tags = ["ai-memory-hive", "ai-memory-agent"]
 }
