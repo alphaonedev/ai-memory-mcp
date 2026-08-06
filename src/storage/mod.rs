@@ -18081,14 +18081,43 @@ pub fn queue_pending_action(
 /// history. On conflict we only refresh the request body fields, and only
 /// while the local row is still `pending` (`WHERE` clause). Terminal
 /// decisions converge via `pending_decisions[]`, not `pendings[]`.
+///
+/// #2710 CB-5 / CB-9 F-6 (CWE-284) — **decision columns are never wire-writable
+/// on the FRESH INSERT either.** #2529 closed the CONFLICT branch but left the
+/// INSERT branch binding the wire `approvals` / `decided_by` / `decided_at`
+/// verbatim, so a peer could pre-stuff a FRESH pending row with a full
+/// approval quorum (or a `decided_by` stamp) and then land a single
+/// `pending_decisions[]` vote to cross a Consensus(N) threshold — a human
+/// quorum satisfied by one relayed vote. The INSERT now hard-pins
+/// `status='pending'`, `decided_by=NULL`, `decided_at=NULL`, `approvals='[]'`:
+/// a wire-originated pending ALWAYS starts with zero local quorum, and
+/// approvals are gathered locally via the signed-approval gate
+/// (`src/approvals.rs`) as `pending_decisions[]` votes converge — never
+/// trusted from the `pendings[]` wire row. This is the #2529 precedent
+/// ("decisions converge only via `pending_decisions[]`") extended to the
+/// insert branch.
+///
+/// #2720 F-7 (CWE-284) — **the conflict UPDATE is bound to the row's original
+/// author.** The `ON CONFLICT DO UPDATE` refreshed `action_type` / `memory_id`
+/// / `payload` on a still-`pending` local row regardless of WHO authored it, so
+/// an in-scope peer that satisfies `pending_author_authorized` (which sets
+/// `requested_by` to itself) could take over a pending row queued by a LOCAL
+/// operator and swap its `action_type`/`payload` (e.g. `store` -> `delete`)
+/// before a human approves what they believed they queued. The `WHERE` now also
+/// requires `pending_actions.requested_by = excluded.requested_by`, mirroring
+/// the [`crate::handlers::federation_receive::resolve_inbound_attribution`]
+/// identity-binding discipline: a convergence update lands only on a row the
+/// inbound author already owns. A peer authorized to author only as itself
+/// therefore cannot rewrite a differently-authored row (its `requested_by`
+/// never matches), while the legitimate re-push of an originator's own row
+/// (identical `requested_by`) still converges.
 pub fn upsert_pending_action(conn: &Connection, pa: &PendingAction) -> Result<()> {
     let payload_json = serde_json::to_string(&pa.payload)?;
-    let approvals_json = serde_json::to_string(&pa.approvals)?;
     conn.execute(
         "INSERT INTO pending_actions
          (id, action_type, memory_id, namespace, payload, requested_by,
           requested_at, status, decided_by, decided_at, approvals)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', NULL, NULL, '[]')
          ON CONFLICT(id) DO UPDATE SET
             action_type  = excluded.action_type,
             memory_id    = excluded.memory_id,
@@ -18096,7 +18125,8 @@ pub fn upsert_pending_action(conn: &Connection, pa: &PendingAction) -> Result<()
             payload      = excluded.payload,
             requested_by = excluded.requested_by,
             requested_at = excluded.requested_at
-         WHERE pending_actions.status = 'pending'",
+         WHERE pending_actions.status = 'pending'
+           AND pending_actions.requested_by = excluded.requested_by",
         params![
             pa.id,
             pa.action_type,
@@ -18105,10 +18135,6 @@ pub fn upsert_pending_action(conn: &Connection, pa: &PendingAction) -> Result<()
             payload_json,
             pa.requested_by,
             pa.requested_at,
-            pa.status,
-            pa.decided_by,
-            pa.decided_at,
-            approvals_json,
         ],
     )?;
     Ok(())
