@@ -2877,10 +2877,32 @@ mod postgres_side {
         let has = |rows: &[Memory], id: &str| rows.iter().any(|m| m.id == id);
         let has_scored = |rows: &[(Memory, f64)], id: &str| rows.iter().any(|(m, _)| m.id == id);
 
-        // --- bob (non-admin, no bypass) impersonating the namespace ---
+        // --- bob (non-admin, no bypass), keyed on his OWN identity ---
+        // #2645 HERMETICITY (single-correct-answer, no vote): the postgres
+        // visibility SQL keys the owner/target carve-outs on
+        // `ctx.effective_principal()`, which returns `as_agent` when set
+        // (src/store/mod.rs:595). The prior fixture set
+        // `bob_ctx.as_agent = Some(NS)`, so bob's principal was the
+        // NAMESPACE "fortitude/X" — which never equals the seeded
+        // `target_agent_id = "ai:bob"`, so the inbox carve-out could not
+        // fire from THIS cell's own rows. The cell therefore only passed
+        // on the long-lived certified tier, where a pre-existing row
+        // happened to satisfy the query — an undeclared dependency on
+        // accumulated state (it FAILED on a freshly created pg database).
+        // Binding bob's principal to his agent id ("ai:bob") makes the
+        // carve-out fire from the seeded inbox row alone, so the cell is
+        // honest on a greenfield database AND the accumulated tier, while
+        // still proving the real property (recipient reads the inbox row;
+        // a non-owner/non-recipient does not leak alice's private row).
         let mut bob_ctx = ai_memory::store::CallerContext::for_agent(BOB);
-        bob_ctx.as_agent = Some(NS.to_string());
+        bob_ctx.as_agent = Some(BOB.to_string());
         assert!(!bob_ctx.bypass_visibility, "non-admin ctx never bypasses");
+        assert_eq!(
+            bob_ctx.effective_principal(),
+            BOB,
+            "#2645: bob's principal MUST be his agent id so the \
+             target_agent_id carve-out keys on the seeded inbox recipient"
+        );
 
         let bob_search = ai_memory::store::MemoryStore::search(&pg, &bob_ctx, NEEDLE, &filter)
             .await
@@ -2911,8 +2933,12 @@ mod postgres_side {
         );
 
         // --- alice (owner) sees her own private row ---
+        // #2645: same hermeticity fix — the owner carve-out
+        // (`metadata->>'agent_id' = $caller`) keys on effective_principal,
+        // so alice's principal must be her agent id ("ai:alice"), the
+        // value stamped on her seeded private row, not the namespace.
         let mut alice_ctx = ai_memory::store::CallerContext::for_agent(ALICE);
-        alice_ctx.as_agent = Some(NS.to_string());
+        alice_ctx.as_agent = Some(ALICE.to_string());
         let alice_search = ai_memory::store::MemoryStore::search(&pg, &alice_ctx, NEEDLE, &filter)
             .await
             .expect("alice search");
