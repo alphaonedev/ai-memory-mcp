@@ -11749,7 +11749,10 @@ async fn http_prometheus_metrics_returns_text_body() {
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/metrics", axum_get(prometheus_metrics))
-        .with_state(state);
+        // v1.0.0 #2621 — prometheus_metrics now takes `State<AppState>` so the
+        // cold prime can dispatch on the active backend; wrap the `Db` in a
+        // test AppState (the list_namespaces test pattern).
+        .with_state(test_app_state(state));
     let resp = app
         .oneshot(
             axum::http::Request::builder()

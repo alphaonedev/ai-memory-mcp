@@ -1136,13 +1136,15 @@ async fn sqlite_liveness(app: &AppState) -> (bool, &'static str) {
 /// cadence) would otherwise serve a gauge of `0` that is indistinguishable
 /// from an empty corpus. The first scrape in such a process pays ONE
 /// `COUNT`; every subsequent scrape is free.
-pub async fn prometheus_metrics(State(state): State<Db>) -> impl IntoResponse {
+///
+/// v1.0.0 #2621 — the handler takes `State<AppState>` (not `State<Db>`) so
+/// the cold prime dispatches on the ACTIVE backend: a postgres-backed daemon
+/// counts its served pg corpus through the SAL trait, NOT the local sqlite
+/// sidecar that `State<Db>` always resolves to regardless of backend (which
+/// published `0` for a populated postgres corpus).
+pub async fn prometheus_metrics(State(app): State<AppState>) -> impl IntoResponse {
     if crate::metrics::registry().memories_gauge_refreshed_at.get() == 0 {
-        let now = chrono::Utc::now().timestamp();
-        db_op(state, move |guard| {
-            crate::background::memories_gauge::refresh_once(&guard.0, now);
-        })
-        .await;
+        cold_prime_memories_gauge(&app).await;
     }
     let body = crate::metrics::render();
     (
@@ -1155,6 +1157,28 @@ pub async fn prometheus_metrics(State(state): State<Db>) -> impl IntoResponse {
     )
         .into_response()
 }
+
+/// v1.0.0 #2621 — cold-prime the corpus-size gauge from the ACTIVE backend.
+///
+/// On a postgres-backed daemon the count comes from the served corpus via
+/// the SAL trait (`app.store`, the same store every other stat routes
+/// through), NOT the local sqlite `Db` sidecar. On sqlite it takes the cheap
+/// single-`COUNT` path against the shared connection. Backends other than
+/// postgres (and every non-`sal` build) fall through to the sqlite path.
+async fn cold_prime_memories_gauge(app: &AppState) {
+    let now = chrono::Utc::now().timestamp();
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        crate::background::memories_gauge::refresh_once_sal(app.store.as_ref(), now).await;
+        return;
+    }
+    let db = app.db.clone();
+    db_op(db, move |guard| {
+        crate::background::memories_gauge::refresh_once(&guard.0, now);
+    })
+    .await;
+}
+
 #[cfg(test)]
 mod transport_helpers_tests {
     use super::*;
