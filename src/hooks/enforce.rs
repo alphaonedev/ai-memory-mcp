@@ -89,6 +89,14 @@ pub const ELIGIBLE_REQUIRED_EVENTS: &[HookEvent] = &[
     // hook runs FailMode::Closed so a hook error/timeout → Deny rather than a
     // silently-allowed send).
     HookEvent::PreSignalSend,
+    // #2637 — PreCompaction is a deny-capable pre-event now consulted
+    // synchronously in `ConsolidationPass::run` (the curator's autonomous
+    // hard-DELETE merge) before any destructive op. Declaring it required makes
+    // the curator boot install the process-global gate and DENY the merge when
+    // no enabled `pre_compaction` hook is present (fail-closed), closing the
+    // #2637 configurable-but-inert gate. Eligible on the curator surface; on
+    // serve/mcp (which never consult PreCompaction) it is simply never checked.
+    HookEvent::PreCompaction,
 ];
 
 /// `true` when `event` may legally be declared a required event.

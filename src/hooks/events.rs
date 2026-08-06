@@ -167,10 +167,18 @@ pub enum HookEvent {
     ///
     /// TODO(G3-G11): wire here at `crate::hnsw` (`hnsw.eviction` log site).
     OnIndexEviction,
-    /// Fires before a memory is archived. Payload: [`MemoryRef`] (writable target id).
-    ///
-    /// TODO(G3-G11): wire here at `crate::storage::archive_memory`.
-    PreArchive,
+    // #2637 — `PreArchive` REMOVED (v1.0.0). It advertised a fail-closable
+    // gate over archiving (a REVERSIBLE op: rows move to `archived_memories`
+    // and restore via `restore_archived`), but never fired in production — its
+    // only reachable "fire site" (`db::archive_memory_no_tx`) is a SYNC helper
+    // inside an open rusqlite write transaction / bulk-gc sweep, where a
+    // blocking async hook consult would hold the single sqlite write lock
+    // per-row across an unbounded hook round-trip (self-deadlock hazard). A
+    // configurable-but-inert destructive-op gate is worse than none (#2444
+    // false-success class), so the variant + advertisement were removed rather
+    // than left lying. 5-agent vote (4d3ea1c5). PreCompaction — the one
+    // genuinely-ungated destructive path (curator autonomous hard-DELETE merge)
+    // — was WIRED instead (see `src/curator/compaction.rs`).
     /// Fires before a transcript is stored. Payload: [`TranscriptDelta`] (writable).
     ///
     /// TODO(G3-G11): wire here at `crate::transcripts::store`.
@@ -397,12 +405,12 @@ pub struct SearchResult {
 }
 
 // ---------------------------------------------------------------------------
-// Pre/Post-delete + pre-archive payloads
+// Pre/Post-delete payloads
 // ---------------------------------------------------------------------------
 
-/// Pointer at a single memory by id. Used by `pre_delete`,
-/// `post_delete`, and `pre_archive` — operations that take an id
-/// and don't need the full row to make a decision.
+/// Pointer at a single memory by id. Used by `pre_delete` and
+/// `post_delete` — operations that take an id and don't need the
+/// full row to make a decision.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryRef {
     pub id: String,
@@ -826,7 +834,6 @@ mod tests {
                 "\"post_governance_decision\"",
             ),
             (HookEvent::OnIndexEviction, "\"on_index_eviction\""),
-            (HookEvent::PreArchive, "\"pre_archive\""),
             (HookEvent::PreTranscriptStore, "\"pre_transcript_store\""),
             (HookEvent::PostTranscriptStore, "\"post_transcript_store\""),
             (HookEvent::PreRecallExpand, "\"pre_recall_expand\""),
@@ -843,18 +850,19 @@ mod tests {
             (HookEvent::PostSignalAck, "\"post_signal_ack\""),
         ];
 
-        // Pin the count at the type boundary so adding a 28th
+        // Pin the count at the type boundary so adding a 27th
         // variant without updating the table fails this test. G2
         // shipped 20; G10 added the 21st (`pre_recall_expand`);
         // v0.7.0 recursive-learning Task 6/8 added the 22nd +
         // 23rd (`pre_reflect`, `post_reflect`); L1-7 added the
         // 24th + 25th (`pre_compaction`, `on_compaction_rollback`);
-        // v0.8.0 #1709 adds the 26th + 27th (`pre_signal_send`,
-        // `post_signal_ack`).
+        // v0.8.0 #1709 added `pre_signal_send` + `post_signal_ack`;
+        // v1.0.0 #2637 REMOVED the never-fired `pre_archive`, so the
+        // count is 26.
         assert_eq!(
             table.len(),
-            27,
-            "v0.8.0 #1709 raises the count from 25 to 27 (adds pre_signal_send + post_signal_ack)"
+            26,
+            "v1.0.0 #2637 removed pre_archive, dropping the HookEvent count 27 -> 26"
         );
 
         for (variant, expected_json) in table {
@@ -962,11 +970,11 @@ mod tests {
         let back: MemoryRef = serde_json::from_str(&json).expect("decode");
         assert_eq!(back.id, r.id);
 
-        // Same payload backs PreDelete / PostDelete / PreArchive.
+        // Same payload backs PreDelete / PostDelete.
         // The variant tag is independent so it's fine to reuse.
         assert_eq!(
-            serde_json::to_string(&HookEvent::PreArchive).unwrap(),
-            "\"pre_archive\""
+            serde_json::to_string(&HookEvent::PostDelete).unwrap(),
+            "\"post_delete\""
         );
     }
 

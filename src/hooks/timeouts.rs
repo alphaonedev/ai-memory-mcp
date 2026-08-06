@@ -26,7 +26,7 @@
 //
 //   * Write       — pre/post_store, pre/post_delete, pre/post_promote,
 //                   pre/post_link, pre/post_consolidate,
-//                   pre/post_governance_decision, pre_archive.
+//                   pre/post_governance_decision.
 //                   5000ms class deadline. Writes are user-initiated
 //                   and rarer than reads, so we tolerate a longer
 //                   chain (PII redaction → policy gate → audit emit
@@ -130,9 +130,9 @@ pub const HOT_PATH_CLASS_DEADLINE_MS: u64 = 50;
 // event_class — the canonical mapping
 // ---------------------------------------------------------------------------
 
-/// Map a [`HookEvent`] to its [`EventClass`]. Total over the 27
+/// Map a [`HookEvent`] to its [`EventClass`]. Total over the 26
 /// variants — the compiler's exhaustiveness check enforces the table
-/// stays in sync if a 28th event ever lands.
+/// stays in sync if a 27th event ever lands.
 #[must_use]
 pub fn event_class(event: HookEvent) -> EventClass {
     match event {
@@ -149,7 +149,6 @@ pub fn event_class(event: HookEvent) -> EventClass {
         | HookEvent::PostConsolidate
         | HookEvent::PreGovernanceDecision
         | HookEvent::PostGovernanceDecision
-        | HookEvent::PreArchive
         // v0.7.0 Task 6/8: reflect lifecycle fires on the write
         // path (the substrate inserts the new reflection memory +
         // N reflects_on links inside a single transaction).
@@ -338,16 +337,17 @@ mod tests {
     use super::*;
 
     /// Every `HookEvent` variant must classify into exactly one
-    /// `EventClass`. Table-driven so adding a 28th variant without
+    /// `EventClass`. Table-driven so adding a 27th variant without
     /// updating the mapping fails this test (the compiler also
     /// flags the missing arm in `event_class`, but the assertion
     /// surface here is what an operator reading the test reads).
     #[test]
-    fn event_class_table_covers_all_27_variants() {
+    fn event_class_table_covers_all_26_variants() {
         let table = [
-            // Write — 19 variants (Task 6/8 added pre_reflect + post_reflect;
+            // Write — 18 variants (Task 6/8 added pre_reflect + post_reflect;
             // L1-7 added pre_compaction + on_compaction_rollback;
-            // v0.8.0 #1709 added pre_signal_send + post_signal_ack).
+            // v0.8.0 #1709 added pre_signal_send + post_signal_ack;
+            // #2637 removed the never-fired pre_archive).
             (HookEvent::PreStore, EventClass::Write),
             (HookEvent::PostStore, EventClass::Write),
             (HookEvent::PreDelete, EventClass::Write),
@@ -360,7 +360,6 @@ mod tests {
             (HookEvent::PostConsolidate, EventClass::Write),
             (HookEvent::PreGovernanceDecision, EventClass::Write),
             (HookEvent::PostGovernanceDecision, EventClass::Write),
-            (HookEvent::PreArchive, EventClass::Write),
             (HookEvent::PreReflect, EventClass::Write),
             (HookEvent::PostReflect, EventClass::Write),
             (HookEvent::PreCompaction, EventClass::Write),
@@ -383,8 +382,8 @@ mod tests {
 
         assert_eq!(
             table.len(),
-            27,
-            "v0.8.0 #1709 mapping must cover exactly the 27 HookEvent variants"
+            26,
+            "the mapping must cover exactly the 26 HookEvent variants (#2637 removed pre_archive)"
         );
         for (event, expected) in table {
             assert_eq!(

@@ -64,9 +64,6 @@ use crate::models::{Memory, Tier};
 #[cfg(feature = "sal")]
 use crate::store::{CallerContext, MemoryStore, StoreError};
 
-#[cfg(test)]
-use crate::hooks::events::HookEvent;
-
 #[cfg(feature = "sal")]
 use super::cluster::ConsolidationClustering;
 #[cfg(feature = "sal")]
@@ -84,6 +81,37 @@ const CONSOLIDATOR_AGENT_ID: &str = crate::identity::sentinels::AI_CURATOR;
 /// curator sweep (pm-v3.1 lint-gate).
 #[cfg(feature = "sal")]
 pub(crate) const COMPACTION_TRACE_TARGET: &str = "curator::compaction";
+
+/// #2637 — injection seam for the `PreCompaction` decision gate.
+///
+/// A `pre_compaction` hook gates the curator's autonomous, hard-DELETE
+/// consolidation merge — the one destructive path NOT covered by the
+/// caller-facing `PreConsolidate` consult (the MCP/HTTP `memory_consolidate`
+/// handlers), which the background `ConsolidationPass` never routes through.
+/// Production wires this to the process-global pre-event enforcement gate
+/// (`crate::mcp::consult_pre_event_gate(HookEvent::PreCompaction, ..)`,
+/// installed by the curator boot when `[hooks].enforce_mode != off` +
+/// `pre_compaction` is a declared `required_event`). Tests inject a stub so a
+/// `run()` abort-on-Deny assertion never touches the process-global `OnceLock`
+/// (which cannot be reset and would contaminate sibling lib tests).
+#[cfg(feature = "sal")]
+pub(crate) type PreCompactionGate =
+    std::sync::Arc<dyn Fn(&[String], &serde_json::Value) -> Result<(), String> + Send + Sync>;
+
+/// The production `PreCompactionGate` — consult the process-global pre-event
+/// enforcement gate. INERT (`Ok`) when no gate is installed (the default
+/// enforce-off deployment), so the consult adds zero cost beyond one
+/// `OnceLock` load and the merge proceeds byte-identically to pre-#2637.
+#[cfg(feature = "sal")]
+fn production_pre_compaction_gate() -> PreCompactionGate {
+    std::sync::Arc::new(|namespaces: &[String], payload: &serde_json::Value| {
+        crate::mcp::consult_pre_event_gate(
+            crate::hooks::events::HookEvent::PreCompaction,
+            namespaces.to_vec(),
+            payload.clone(),
+        )
+    })
+}
 
 // ---------------------------------------------------------------------------
 // ConsolidationPass
@@ -120,6 +148,11 @@ pub(crate) struct ConsolidationPass<'a> {
     /// default, making the config field dead (#1691-class) — this is the live
     /// consumer.
     pub(crate) cosine_threshold: f32,
+    /// #2637 — the `PreCompaction` decision gate consulted per eligible cluster
+    /// BEFORE the destructive merge. Defaults to [`production_pre_compaction_gate`]
+    /// (the process-global enforce gate); tests override it via
+    /// [`Self::with_pre_compaction_gate`].
+    pub(crate) pre_compaction_gate: PreCompactionGate,
 }
 
 /// Structured outcome of one [`ConsolidationPass::run`] sweep.
@@ -148,6 +181,12 @@ pub(crate) struct ConsolidationRunReport {
     /// Clusters rolled back after a failed `verify` (Stage-6, #664): the
     /// pre-merge sources were restored and the unverifiable summary removed.
     pub(crate) rolled_back: usize,
+    /// #2637 — eligible clusters the `PreCompaction` decision gate DENIED
+    /// before any destructive op (no summarise, no persist; sources untouched).
+    /// Non-zero only when an operator has enrolled a fail-closed `pre_compaction`
+    /// hook (or declared it a `required_event` with none configured) and the
+    /// curator boot installed the process-global enforce gate.
+    pub(crate) clusters_denied_by_hook: usize,
     /// Per-cluster errors (summarise / persist / verify). Best-effort: one
     /// cluster failing does not abort the sweep.
     pub(crate) errors: Vec<String>,
@@ -168,7 +207,19 @@ impl<'a> ConsolidationPass<'a> {
             llm,
             dry_run,
             cosine_threshold: super::cluster::DEFAULT_COSINE_THRESHOLD,
+            pre_compaction_gate: production_pre_compaction_gate(),
         }
+    }
+
+    /// #2637 — override the `PreCompaction` gate (test-only). Lets a unit test
+    /// prove `run()` aborts the destructive merge on a Deny without installing
+    /// the process-global `OnceLock` enforce gate (which cannot be reset and
+    /// would leak into sibling lib tests).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_pre_compaction_gate(mut self, gate: PreCompactionGate) -> Self {
+        self.pre_compaction_gate = gate;
+        self
     }
 
     /// #1750 — thread the operator-resolved cosine gate threshold
@@ -434,6 +485,32 @@ impl<'a> ConsolidationPass<'a> {
                 continue;
             }
 
+            // #2637 — the `PreCompaction` decision gate fires HERE, before the
+            // destructive hard-DELETE merge (summarise → persist → verify). A
+            // Deny — or a fail-closed required-hook error/timeout surfaced as a
+            // stringified 503 — ABORTS this cluster: no summarise, no persist,
+            // sources untouched. `eligible()` guarantees every member shares one
+            // non-reserved namespace, so `members[0].namespace` scopes the gate.
+            // INERT (Allow) unless the operator enrolled a `pre_compaction` hook
+            // and the curator boot installed the process-global enforce gate.
+            let ns_scope = vec![members[0].namespace.clone()];
+            let gate_payload = serde_json::json!({
+                "pass": self.name(),
+                "candidate_ids": cluster_ids,
+                "namespaces": ns_scope,
+            });
+            if let Err(reason) = (self.pre_compaction_gate)(&ns_scope, &gate_payload) {
+                report.clusters_denied_by_hook += 1;
+                tracing::warn!(
+                    target: COMPACTION_TRACE_TARGET,
+                    pass = self.name(),
+                    cluster_size = members.len(),
+                    reason = %reason,
+                    "pre_compaction hook DENIED the cluster — destructive merge aborted (#2637)"
+                );
+                continue;
+            }
+
             let summary = match self.summarize(&members) {
                 Ok(s) => s,
                 Err(e) => {
@@ -565,27 +642,6 @@ fn tier_rank(t: &Tier) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
-// Pre-compaction hook event dispatch (fire-site stubs — test-only)
-// ---------------------------------------------------------------------------
-
-/// Fire-site stub for the `pre_compaction` hook event.  Returns `true`
-/// (always-allow) until the G-track executor wires the new events in.
-/// Tests assert that the right `HookEvent` constant is referenced here.
-#[cfg(test)]
-pub(super) fn fire_pre_compaction_hook(_event: HookEvent) -> bool {
-    // TODO(L1-7 → executor wiring): call the hook chain once
-    // the G-track executor is extended to handle PreCompaction.
-    true
-}
-
-/// Returns `true` iff `event` is the pre-compaction event.
-/// Used by tests to verify correct event constant usage.
-#[cfg(test)]
-pub(super) fn is_pre_compaction(event: HookEvent) -> bool {
-    matches!(event, HookEvent::PreCompaction)
-}
-
-// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -677,20 +733,13 @@ mod tests {
     }
 
     // ---- hook event constants -----------------------------------------------
-
-    #[test]
-    fn pre_compaction_event_constant_is_correct() {
-        assert!(is_pre_compaction(HookEvent::PreCompaction));
-        assert!(!is_pre_compaction(HookEvent::OnCompactionRollback));
-        assert!(!is_pre_compaction(HookEvent::PreStore));
-    }
-
-    #[test]
-    fn fire_pre_compaction_hook_passes_through_allow() {
-        // The stub always allows — fire_pre_compaction_hook must return true
-        // until the executor wiring lands.
-        assert!(fire_pre_compaction_hook(HookEvent::PreCompaction));
-    }
+    //
+    // #2637 — the pre-#2637 `#[cfg(test)]` stubs `fire_pre_compaction_hook`
+    // (returned a hardcoded `true`) + `is_pre_compaction` are GONE: they
+    // advertised a gate that never fired in production. The `PreCompaction`
+    // classification is pinned by `tests/hook_pipeline_exhaustiveness.rs` and
+    // `tests/curator/compaction_test.rs`; the LIVE gate is exercised by
+    // `run_pre_compaction_deny_aborts_the_merge_2637` below.
 
     #[test]
     fn on_compaction_rollback_is_not_pre_event() {
@@ -1264,6 +1313,96 @@ mod tests {
             assert!(
                 rows.iter().any(|m| m.title.starts_with("[consolidated]")),
                 "a consolidated row must exist"
+            );
+        }
+
+        #[tokio::test]
+        async fn run_pre_compaction_deny_aborts_the_merge_2637() {
+            // #2637 (R-203) — the `PreCompaction` decision gate must fire BEFORE
+            // the curator's autonomous hard-DELETE merge, and a Deny must ABORT
+            // the cluster: no summarise (llm untouched), no persist (both source
+            // rows survive), no `[consolidated]` row. Injecting the gate stub —
+            // rather than the process-global `OnceLock` — keeps this test from
+            // contaminating sibling lib tests (the gate cannot be reset).
+            //
+            // At the parent commit (no consult wired into `run()`) this FAILS:
+            // the merge proceeds, `memories_consolidated == 2`, a `[consolidated]`
+            // row lands, and the llm summariser IS called.
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let candidates = seed_two_dupes(&conn);
+            let llm = StubLlm::new("must-not-be-summarised");
+
+            // A fail-closed `pre_compaction` gate: it records that it fired and
+            // refuses (mirrors a required-but-absent hook → stringified 503 Deny).
+            let fired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let fired_probe = std::sync::Arc::clone(&fired);
+            let deny_gate: PreCompactionGate =
+                std::sync::Arc::new(move |namespaces: &[String], _payload: &serde_json::Value| {
+                    fired_probe.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // The gate is scoped to the cluster's substrate-resolved
+                    // namespace, never a caller-supplied key.
+                    assert_eq!(namespaces, ["ns"], "gate scoped to the cluster ns");
+                    Err("refused by hooks.enforce gate (code 503): \
+                         pre_compaction REQUIRED but NO enabled hook"
+                        .to_string())
+                });
+
+            let pass = ConsolidationPass::new(&store, &llm, false /* real */)
+                .with_pre_compaction_gate(deny_gate);
+
+            let out = pass.run(&candidates).await.unwrap();
+
+            // The gate fired for the one eligible cluster and denied it.
+            assert_eq!(
+                fired.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "PreCompaction gate must be consulted once for the eligible cluster"
+            );
+            assert_eq!(out.eligible_clusters, 1, "the dup pair is eligible");
+            assert_eq!(
+                out.clusters_denied_by_hook, 1,
+                "the denied cluster is counted"
+            );
+            assert_eq!(
+                out.memories_consolidated, 0,
+                "a Deny must abort the destructive merge"
+            );
+            assert_eq!(
+                out.rollback_entries_written, 0,
+                "no rollback entry for an aborted merge"
+            );
+            assert!(
+                out.errors.is_empty(),
+                "a clean Deny is not a per-cluster error: {:?}",
+                out.errors
+            );
+
+            // The summariser was never reached — the gate short-circuited first.
+            assert!(
+                llm.calls.lock().unwrap().is_empty(),
+                "Deny must short-circuit BEFORE summarize"
+            );
+
+            // Both source rows survive; no `[consolidated]` row was written.
+            let rows = crate::db::list(
+                &conn,
+                Some("ns"),
+                None,
+                16,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(rows.len(), 2, "both sources survive the aborted merge");
+            assert!(
+                !rows.iter().any(|m| m.title.starts_with("[consolidated]")),
+                "no consolidated row on a denied cluster"
             );
         }
 

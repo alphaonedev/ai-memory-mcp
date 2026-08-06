@@ -654,7 +654,7 @@ The `--profile` flag **must** be passed in the MCP args — `config.toml` has no
 
 ## Hooks (v0.7+)
 
-The hook pipeline (Track G of `attested-cortex`) adds **27 lifecycle events** at every memory operation point, turning the substrate into a programmable extension surface. 20 baseline events (PreStore/PostStore/PreRecall/PostRecall/PreSearch/PostSearch/PreDelete/PostDelete/PrePromote/PostPromote/PreLink/PostLink/PreConsolidate/PostConsolidate/PreGovernanceDecision/PostGovernanceDecision/OnIndexEviction/PreArchive/PreTranscriptStore/PostTranscriptStore) plus 5 v0.7.0 additions (PreRecallExpand, PreReflect, PostReflect, PreCompaction, OnCompactionRollback) plus 2 v0.8.0 Pillar-1 #1709 additions (PreSignalSend, PostSignalAck). Authoritative enum: `src/hooks/events.rs::HookEvent`. Hooks are **default off** — a v0.7 install with no `~/.config/ai-memory/hooks.toml` behaves identically to v0.6.4.
+The hook pipeline (Track G of `attested-cortex`) adds **26 lifecycle events** at every memory operation point, turning the substrate into a programmable extension surface. 19 baseline events (PreStore/PostStore/PreRecall/PostRecall/PreSearch/PostSearch/PreDelete/PostDelete/PrePromote/PostPromote/PreLink/PostLink/PreConsolidate/PostConsolidate/PreGovernanceDecision/PostGovernanceDecision/OnIndexEviction/PreTranscriptStore/PostTranscriptStore) plus 5 v0.7.0 additions (PreRecallExpand, PreReflect, PostReflect, PreCompaction, OnCompactionRollback) plus 2 v0.8.0 Pillar-1 #1709 additions (PreSignalSend, PostSignalAck). Authoritative enum: `src/hooks/events.rs::HookEvent`. (v1.0.0 #2637 removed the never-fired `PreArchive` gate, 27 → 26.) Hooks are **default off** — a v0.7 install with no `~/.config/ai-memory/hooks.toml` behaves identically to v0.6.4.
 
 ```toml
 # ~/.config/ai-memory/hooks.toml
@@ -668,7 +668,7 @@ enabled = true
 namespace = "team/*"
 ```
 
-**Event matrix:** `pre_store`, `post_store`, `pre_recall`, `post_recall`, `pre_search`, `post_search`, `pre_delete`, `post_delete`, `pre_promote`, `post_promote`, `pre_link`, `post_link`, `pre_consolidate`, `post_consolidate`, `pre_governance_decision`, `post_governance_decision`, `on_index_eviction`, `pre_archive`, `pre_transcript_store`, `post_transcript_store`. Hooks return `Allow`, `Modify(delta)` (pre- events only), `Deny{reason, code}`, or `AskUser{prompt, options, default}`. Chain order is priority-desc; the first `Deny` short-circuits the chain.
+**Event matrix:** `pre_store`, `post_store`, `pre_recall`, `post_recall`, `pre_search`, `post_search`, `pre_delete`, `post_delete`, `pre_promote`, `post_promote`, `pre_link`, `post_link`, `pre_consolidate`, `post_consolidate`, `pre_governance_decision`, `post_governance_decision`, `on_index_eviction`, `pre_transcript_store`, `post_transcript_store`. Hooks return `Allow`, `Modify(delta)` (pre- events only), `Deny{reason, code}`, or `AskUser{prompt, options, default}`. Chain order is priority-desc; the first `Deny` short-circuits the chain.
 
 **Performance contract:** `post_recall` and `post_search` default to `mode = "daemon"` (long-running IPC client) so they do not blow the v0.6.3 50ms recall p95 budget. `mode = "exec"` (subprocess-per-call) is permitted but requires explicit override and budget recalibration. Audit every hook for time and resource cost before promoting it past staging — a 200ms `post_recall` exec hook silently degrades every recall on the box.
 
