@@ -1087,6 +1087,47 @@ mod tests {
         );
     }
 
+    /// #2763 / CB-19 — focused branch coverage for the trusted-handler split
+    /// helper `resolve_namespace_standard_caller`. The end-to-end 2721 test
+    /// above exercises the handlers, but the Per-Module Coverage gate dips on
+    /// the two branches of this pure resolver, so pin them directly:
+    ///   (a) a `trusted_caller` is returned VERBATIM (the out-of-band operator
+    ///       surface — the daemon/reserved principal it carries is honored);
+    ///   (b) a wire `agent_id` equal to a reserved sentinel (`daemon`) falls to
+    ///       `ANONYMOUS_INVALID` — the security-critical CB-19 branch a wire
+    ///       spoofer downgrades to;
+    ///   (c) a legitimate wire `agent_id` resolves to itself (the `Ok` arm of
+    ///       the `unwrap_or_else`).
+    #[test]
+    fn resolve_namespace_standard_caller_branches_2763() {
+        // (a) Trusted caller wins verbatim, regardless of any wire agent_id —
+        // even a reserved sentinel present on the wire cannot displace the
+        // out-of-band trusted principal.
+        let params_with_wire = json!({ "agent_id": sentinels::SYSTEM_PRINCIPAL });
+        assert_eq!(
+            resolve_namespace_standard_caller(&params_with_wire, Some(sentinels::DAEMON_PRINCIPAL),),
+            sentinels::DAEMON_PRINCIPAL,
+            "a trusted_caller must be returned verbatim (out-of-band operator surface)"
+        );
+
+        // (b) Wire agent_id spoofing the reserved daemon sentinel, with NO
+        // trusted caller, downgrades to anonymous:invalid (CB-19 security branch).
+        let params_daemon = json!({ "agent_id": sentinels::DAEMON_PRINCIPAL });
+        assert_eq!(
+            resolve_namespace_standard_caller(&params_daemon, None),
+            sentinels::ANONYMOUS_INVALID,
+            "a wire daemon claim must never be honored — it falls to anonymous:invalid"
+        );
+
+        // (c) A legitimate wire agent_id (non-reserved) resolves to itself.
+        let params_alice = json!({ "agent_id": "ai:alice" });
+        assert_eq!(
+            resolve_namespace_standard_caller(&params_alice, None),
+            "ai:alice",
+            "a non-reserved wire agent_id must resolve to itself"
+        );
+    }
+
     // set_standard: happy path without governance.
     #[test]
     fn set_standard_happy_path() {
