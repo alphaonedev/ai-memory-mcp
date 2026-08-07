@@ -203,6 +203,27 @@ MDEOF
         echo "FAIL: self-test allowlist — a MALFORMED entry did not fail" >&2; exit 1; }
     echo "PASS: self-test allowlist — a MALFORMED entry HARD-FAILS"
 
+    # ---- fail CLOSED on an analysis-engine error (CB-2 / #2713) -------
+    # An internal engine error must NEVER print PASS — the exact fail-open
+    # this gate hits once its burn-down allowlist empties. R-203: first
+    # reproduce the pre-fix SHAPE — `x="$(crashing-python)" || true` —
+    # which swallows a crash into an empty value and would print a false
+    # PASS; then prove the FIXED gate fails closed under an injected fault.
+    write_clean
+    prefix_shape="$(v="$(python3 -c 'import sys; sys.exit(3)')" || true; [[ -z "$v" ]] && echo "WOULD-PRINT-PASS")"
+    [[ "$prefix_shape" == "WOULD-PRINT-PASS" ]] || {
+        echo "FAIL: self-test R-203 — the pre-fix \`|| true\` shape did not reproduce the false-PASS fail-open" >&2; exit 1; }
+    fault_rc=0
+    fault_out="$(AI_MEMORY_SYMBOL_GATE_ROOT="$FIX" AI_MEMORY_SYMBOL_GATE_SELFTEST_FAULT=1 "$SELF" 2>&1)" || fault_rc=$?
+    [[ "$fault_rc" -ne 0 ]] || {
+        echo "FAIL: self-test #2713 — the gate exited 0 on an injected analysis-engine fault (fail-OPEN)" >&2
+        printf '%s\n' "$fault_out" | sed 's/^/       /' >&2; exit 1; }
+    grep -q 'gate: PASS' <<<"$fault_out" && {
+        echo "FAIL: self-test #2713 — the gate printed a PASS banner despite an engine fault" >&2; exit 1; }
+    grep -q 'analysis engine errored' <<<"$fault_out" || {
+        echo "FAIL: self-test #2713 — engine fault did not produce the distinct fail-closed message" >&2; exit 1; }
+    echo "PASS: self-test #2713 — an analysis-engine error FAILS CLOSED (exit $fault_rc, distinct message, no PASS banner)"
+
     # ---- never a silent no-op ----------------------------------------
     write_clean
     rm -rf "$FIX/src"
@@ -244,7 +265,7 @@ if [[ -f "$LADDER_GATE" ]]; then
     LADDER_TIP="$(read_current_schema_version "$REPO_ROOT/src/store/postgres.rs")"
 fi
 
-violations="$(
+if ! violations="$(
     REPO_ROOT="$REPO_ROOT" LADDER_TIP="$LADDER_TIP" python3 - <<'PY'
 import glob
 import os
@@ -252,6 +273,13 @@ import re
 
 root = os.environ["REPO_ROOT"].rstrip("/")
 ladder_tip = os.environ.get("LADDER_TIP", "").strip()
+
+# Self-test fault-injection (#2713): when this env var is set the analysis
+# engine raises, so the gate's own --self-test can prove the gate FAILS
+# CLOSED (exits non-zero, prints no PASS) on an engine error instead of
+# swallowing it into an empty violation set. Never set in production / CI.
+if os.environ.get("AI_MEMORY_SYMBOL_GATE_SELFTEST_FAULT"):
+    raise RuntimeError("check-doc-symbol-anchors self-test: injected analysis-engine fault (#2713)")
 
 # ---- symbol index over src/ ------------------------------------------
 DEF = re.compile(
@@ -405,7 +433,14 @@ for doc in seen_docs:
                     emit("LADDER_TIP", doc, ln,
                          f"migrate_v{m.group(1)}!=migrate_v{ladder_tip}", ctx)
 PY
-)" || true
+)"; then
+    # FAIL CLOSED (#2713): the analysis engine exited non-zero (an uncaught
+    # exception — e.g. the injected self-test fault, or a logic error). The
+    # pre-fix `|| true` swallowed that into an empty violation set and
+    # printed a FALSE "PASS" the moment the burn-down allowlist emptied.
+    printf 'FAIL: check-doc-symbol-anchors: analysis engine errored (python exited non-zero) — refusing to report PASS (#2713 fail-closed)\n' >&2
+    exit 2
+fi
 
 # ---- BURN-DOWN allowlist (STALE ENTRY FAILS) -------------------------
 allow_keys=""

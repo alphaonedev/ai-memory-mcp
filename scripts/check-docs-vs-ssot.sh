@@ -200,12 +200,13 @@ check_schema_version_rule() {
     local rule_name="CURRENT_SCHEMA_VERSION"
     for f in "${DOC_FILES[@]}"; do
         [[ -f "$f" ]] || continue
-        while IFS=$'\t' read -r ln val context; do
-            [[ -z "$val" ]] && continue
-            if [[ "$val" != "$CANONICAL_SCHEMA_VERSION" ]]; then
-                emit_fail "$rule_name" "$f" "$ln" "$val" "$CANONICAL_SCHEMA_VERSION" "$context"
-            fi
-        done < <(
+        # Capture-then-check rather than `done < <(python3 …)`: under
+        # `set -euo pipefail` a process-substitution's exit status is NOT
+        # observed, so a crashing engine (a non-UTF-8 byte → the unguarded
+        # `open('$f')` raises UnicodeDecodeError) yielded an EMPTY row set
+        # and the rule silently passed — the #2713 swallowed-error shape.
+        local schema_rows
+        schema_rows="$(
             python3 -c "
 import re
 patterns = [
@@ -239,7 +240,16 @@ for ln, line in enumerate(open('$f').read().splitlines(), 1):
             print(f'{ln}\t{m.group(1)}\t{ctx}')
             break
 "
-        )
+        )" || {
+            printf 'FAIL: check-docs-vs-ssot: CURRENT_SCHEMA_VERSION analysis engine errored on %s (python exited non-zero) — refusing to report PASS (#2713 fail-closed)\n' "$f" >&2
+            exit 2
+        }
+        while IFS=$'\t' read -r ln val context; do
+            [[ -z "$val" ]] && continue
+            if [[ "$val" != "$CANONICAL_SCHEMA_VERSION" ]]; then
+                emit_fail "$rule_name" "$f" "$ln" "$val" "$CANONICAL_SCHEMA_VERSION" "$context"
+            fi
+        done <<< "$schema_rows"
     done
 }
 
@@ -255,13 +265,13 @@ check_narrative_count_rule() {
     fi
     for f in "${files[@]}"; do
         [[ -f "$f" ]] || continue
-        # Use python for robust regex with capture groups
-        while IFS=$'\t' read -r ln val context; do
-            [[ -z "$val" ]] && continue
-            if [[ "$val" != "$canonical" ]]; then
-                emit_fail "$rule_name" "$f" "$ln" "$val" "$canonical" "$context"
-            fi
-        done < <(
+        # Use python for robust regex with capture groups. Capture-then-
+        # check, not `done < <(python3 …)`: a process-substitution's exit
+        # status is unobserved under `set -euo pipefail`, so a crashing
+        # engine (a non-UTF-8 byte → the unguarded `open('$f')`) silently
+        # yielded no rows and the rule passed — the #2713 fail-open shape.
+        local narrative_rows
+        narrative_rows="$(
             python3 -c "
 import re, sys
 pat = re.compile(r'''$pattern''')
@@ -274,7 +284,16 @@ for ln, line in enumerate(open('$f').read().splitlines(), 1):
         ctx = line.strip()[:160]
         print(f'{ln}\t{val}\t{ctx}')
 "
-        )
+        )" || {
+            printf 'FAIL: check-docs-vs-ssot: %s analysis engine errored on %s (python exited non-zero) — refusing to report PASS (#2713 fail-closed)\n' "$rule_name" "$f" >&2
+            exit 2
+        }
+        while IFS=$'\t' read -r ln val context; do
+            [[ -z "$val" ]] && continue
+            if [[ "$val" != "$canonical" ]]; then
+                emit_fail "$rule_name" "$f" "$ln" "$val" "$canonical" "$context"
+            fi
+        done <<< "$narrative_rows"
     done
 }
 
@@ -367,7 +386,7 @@ check_env_var_census_rule() {
 # instead of the tool-count sentence.
 check_generalised_numeric_claims() {
     local out
-    out="$(
+    if ! out="$(
         GATE_DOC_FILES="${DOC_FILES[*]}" \
         C_ROUTES="$CANONICAL_ROUTES_COUNT" \
         C_PATHS="$CANONICAL_UNIQUE_PATHS_COUNT" \
@@ -383,6 +402,13 @@ import re
 
 docs = os.environ["GATE_DOC_FILES"].split()
 release = os.environ["C_RELEASE"]
+
+# Self-test fault-injection (#2713): when this env var is set the analysis
+# engine raises, so the gate's own --self-test can prove the gate FAILS
+# CLOSED (exits non-zero, prints no PASS) on an engine error instead of
+# swallowing it into an empty violation set. Never set in production / CI.
+if os.environ.get("AI_MEMORY_DOCS_GATE_SELFTEST_FAULT"):
+    raise RuntimeError("check-docs-vs-ssot self-test: injected analysis-engine fault (#2713)")
 
 canon = {
     "EXPECTED_PRODUCTION_ROUTES_COUNT": os.environ["C_ROUTES"],
@@ -500,7 +526,16 @@ for f in docs:
                     if val != canon[key]:
                         print(f"{key}\t{f}\t{ln}\t{val}\t{canon[key]}\t{ctx}")
 PY
-    )" || true
+    )"; then
+        # FAIL CLOSED (#2713): the numeric-claim analysis engine exited
+        # non-zero (an uncaught exception — a UnicodeDecodeError on one
+        # non-UTF-8 byte in a scanned doc, or the injected self-test
+        # fault). The pre-fix `|| true` swallowed that into an empty
+        # violation set and printed a FALSE "PASS" (the count in the pass
+        # banner comes from a bash-side scan, attesting to work never run).
+        printf 'FAIL: check-docs-vs-ssot: numeric-claim analysis engine errored (python exited non-zero) — refusing to report PASS (#2713 fail-closed)\n' >&2
+        exit 2
+    fi
 
     # ---- PENDING-FIX ledger -------------------------------------------
     # Format, one per line: `<doc-file> <RULE_KEY> <claimed-value> #<issue>`
@@ -953,6 +988,34 @@ CLEANDOC
         echo "FAIL: self-test — malformed ledger entry not named in the failure" >&2
         cd "$REPO_ROOT"; exit 1; }
     echo "PASS: self-test — a MALFORMED ledger entry HARD-FAILS"
+
+    # ---- fail CLOSED on an analysis-engine error (CB-2 / #2713) -------
+    # An internal engine error (a UnicodeDecodeError on one non-UTF-8 byte
+    # in a scanned doc; a logic bug) must NEVER print PASS — the pre-fix
+    # `|| true` on the numeric-claim heredoc did exactly that, and the
+    # pass banner's count comes from a bash-side `find`, attesting to work
+    # never run. R-203: first reproduce the pre-fix SHAPE, then prove the
+    # FIXED gate fails closed under an injected engine fault.
+    cat > README.md <<'CLEANDOC'
+Nothing to see here.
+CLEANDOC
+    rm -f "$led"
+    prefix_shape="$(v="$(python3 -c 'import sys; sys.exit(3)')" || true; [[ -z "$v" ]] && echo "WOULD-PRINT-PASS")"
+    [[ "$prefix_shape" == "WOULD-PRINT-PASS" ]] || {
+        echo "FAIL: self-test R-203 — the pre-fix \`|| true\` shape did not reproduce the false-PASS fail-open" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    fault_rc=0
+    fault_out="$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" AI_MEMORY_DOCS_GATE_SELFTEST_FAULT=1 "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1)" || fault_rc=$?
+    [[ "$fault_rc" -ne 0 ]] || {
+        echo "FAIL: self-test #2713 — the gate exited 0 on an injected analysis-engine fault (fail-OPEN)" >&2
+        printf '%s\n' "$fault_out" | sed 's/^/       /' >&2; cd "$REPO_ROOT"; exit 1; }
+    grep -q 'gate: PASS' <<<"$fault_out" && {
+        echo "FAIL: self-test #2713 — the gate printed a PASS banner despite an engine fault" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    grep -q 'analysis engine errored' <<<"$fault_out" || {
+        echo "FAIL: self-test #2713 — engine fault did not produce the distinct fail-closed message" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    echo "PASS: self-test #2713 — an analysis-engine error FAILS CLOSED (exit $fault_rc, distinct message, no PASS banner)"
 
     cd "$REPO_ROOT"
 }
