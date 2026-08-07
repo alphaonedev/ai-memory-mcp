@@ -273,6 +273,18 @@ fn test_memory_export_reflection_mcp_tool() {
     let conn = open(&db_path);
     let src = seed_observation(&conn, "mcp-ns", "obs");
     let rfl_id = drive_reflect(&conn, &db_path, "mcp-ns", &src, "lesson");
+    // This is the only test in the module that reads the seeded DB from a
+    // SEPARATE process (the spawned `ai-memory mcp` subprocess below) rather
+    // than an in-process `db::open`. `db::open` opens WAL with
+    // `synchronous=NORMAL`, and rusqlite's `Drop`->`sqlite3_close`
+    // checkpoint-on-close is best-effort — so on macOS (APFS + WAL) the
+    // reflection row can still be sitting in the `-wal` sidecar when the
+    // subprocess opens the DB, surfacing as an intermittent
+    // `memory not found` (issue #2764). Force a full checkpoint into the
+    // main DB file BEFORE dropping the writer so the reader process is
+    // guaranteed to see the committed row. This is a durability barrier,
+    // not a timing hack.
+    db::checkpoint(&conn).expect("wal checkpoint before subprocess read");
     drop(conn);
 
     let request = format!(

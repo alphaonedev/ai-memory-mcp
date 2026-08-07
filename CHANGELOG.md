@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+<!-- #2764 (test/2764-flaky-export-isolation) -->
+### Fixed (`export_reflections::test_memory_export_reflection_mcp_tool` no longer intermittently fails with `memory not found` on macOS)
+
+- **The reflection-export MCP integration test is now deterministic across a process boundary** (refs [#2764](https://github.com/alphaonedev/ai-memory-mcp/issues/2764); epic [#2705](https://github.com/alphaonedev/ai-memory-mcp/issues/2705)). `tests/cli/export_reflections.rs::test_memory_export_reflection_mcp_tool` is the ONLY test in the module that reads the seeded database from a SEPARATE process — it seeds the reflection with an in-process `rusqlite::Connection`, drops it, then spawns an `ai-memory mcp` subprocess that reads the row back by id. `db::open` opens the DB in WAL mode with `synchronous=NORMAL`, and rusqlite's `Drop` -> `sqlite3_close` checkpoint-on-close is best-effort, so on macOS (APFS + WAL) the just-committed reflection row could still be sitting in the `-wal` sidecar when the subprocess opened the DB — surfacing as an intermittent `memory not found` (a test-isolation/durability defect in the harness, NOT a substrate defect; the on-disk row was always correct). **Fix:** the test now forces `PRAGMA wal_checkpoint(TRUNCATE)` via the existing `db::checkpoint` on the writer connection BEFORE dropping it, guaranteeing the committed row is durably in the main DB file the reader process opens. This is a durability barrier, not a timing hack — no `sleep` was added and no assertion was weakened. Each test already runs against its own `tempfile::TempDir` DB with a per-test namespace, so no cross-test state is shared.
+
 <!-- v1.0.0 GA cert drain (#2705): entries restored after the conflict-free batch-merge strip -->
 <!-- #2747 (cb19-2721-reserved-sentinel-wire) -->
 ### Fixed (reserved `daemon` principal can no longer be self-asserted from the MCP wire in `namespace_set_standard`)
