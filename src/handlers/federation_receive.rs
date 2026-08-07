@@ -3209,15 +3209,52 @@ pub async fn sync_push(
         }
         // Gate 1 / #2650 — format validation is not scope. Resolver-key crypto
         // answers "who resolved"; this choke answers "may this peer write a
-        // freeze-anchor resolution in `cp.namespace`". Wire namespace is the
-        // write subject (first-resolution-wins may create/update under that ns).
-        // Postgres still skips apply entirely (#2464) — confinement still runs
-        // so both backends refuse out-of-scope rows the same way.
+        // freeze-anchor resolution touching this checkpoint".
+        //
+        // #2708 (CB-3, CWE-284, security-high) — the write subject is NOT the
+        // attacker-chosen wire `cp.namespace` on the pending→resolved arm. The
+        // `apply_inbound_resolution` CAS keys on `(id, state)` only: when a
+        // local row exists it resolves THAT row and never writes its namespace,
+        // so a peer scoped to `public/*` could otherwise present a `public/ok`
+        // wire namespace and resolve a `secure/ops` freeze anchor by id (the
+        // #2447 stored-vs-claimed split, applied to checkpoints). Mirror the
+        // memories lane exactly (`inbound_write_namespace_authorized` with BOTH
+        // the claimed AND the STORED namespace): resolve the local row's stored
+        // namespace by id and refuse when EITHER is out of scope. This keeps
+        // the two legitimate arms intact — a first-landing resolution (no local
+        // row) creates under the claimed namespace (checked; stored is None),
+        // while a resolution of a locally-pending anchor is confined to that
+        // anchor's STORED namespace. The probe is elided when Layer 1 is not
+        // armed for this peer (`ns_scope_needs_existing`), so zero-config
+        // deployments pay ZERO extra reads. Postgres still skips apply entirely
+        // (#2464/#1936) — confinement still runs so both backends refuse
+        // out-of-scope rows the same way.
+        let existing_cp_ns = if ns_scope_needs_existing {
+            match crate::checkpoints::namespace_by_id(&lock.0, &cp.id) {
+                Ok(ns) => ns,
+                Err(e) => {
+                    // Fail CLOSED: an unresolvable existence probe cannot be
+                    // reported as "provably no local row" — that is exactly the
+                    // input the stored-vs-claimed relocate bypass needs.
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        checkpoint_id = %cp.id,
+                        "sync_push: checkpoint namespace-scope pre-resolve failed for {}: {e}; \
+                         refusing the resolution (#2708 fail-closed)",
+                        cp.id
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         if !crate::federation::receive_auth::inbound_write_namespace_authorized(
             crate::federation::receive_auth::LANE_CHECKPOINTS,
             &cp.id,
             &cp.namespace,
-            None,
+            existing_cp_ns.as_deref(),
             &attest_cfg,
             peer_header_owned.as_deref(),
             require_push_ns_scope,
