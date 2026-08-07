@@ -120,7 +120,15 @@ fn count_matches(root: &Path, needle: &str) -> usize {
 /// contract (`handle_skill_get`/`_list`/`_resource`/`_register`/`_export`/
 /// `_compositional_context` all return `Result<Value, String>` — extending a
 /// uniformly-String family, not seeding a new one). Net acknowledged: +2.
-const QUAL_6_CEILING: usize = 116;
+// 2026-08-07 (#2721 / CB-19) — raised 116 -> 119 for the reserved-principal
+// wire-hardening split of `handle_namespace_set_standard` in
+// `src/mcp/tools/namespace.rs` into the wire handler + the trusted in-process
+// entry `handle_namespace_set_standard_trusted` + the shared
+// `handle_namespace_set_standard_inner`, each returning `Result<Value, String>`
+// for signature parity with the surrounding namespace-standard handler family
+// (get/clear also `Result<Value, String>`). No new error contract; measured
+// count is 119. Net acknowledged: +3.
+const QUAL_6_CEILING: usize = 119;
 
 /// QUAL-7 ceiling: 6+ sites at v2-review time + slack. Raised
 /// 25 → 26 for the #1455 fail-CLOSED governance pair in
