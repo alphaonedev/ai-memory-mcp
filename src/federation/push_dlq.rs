@@ -87,6 +87,17 @@ pub struct FederationPushDlqRow {
     pub payload_json: serde_json::Value,
     pub attempt_count: i32,
     pub last_error: String,
+    /// #2716 (CB-12) — the RFC3339 UTC instant this row's erasure /
+    /// failed push was recorded (`federation_push_dlq.failed_at`). Read
+    /// into the struct so the DB-less [`replay_once`] orchestrator can run
+    /// the F9 restore-race guard on the POST path: a pending DELETE whose
+    /// id is LIVE again locally with an `updated_at` at/after this instant
+    /// is an AUTHORIZED restore that must SUPERSEDE the delete (never
+    /// destroy the just-restored replica, #2666). Both backends normalise
+    /// to RFC3339 (sqlite stores TEXT; postgres decodes `TIMESTAMPTZ` and
+    /// `to_rfc3339()`s it here) so [`restore_supersedes`] compares
+    /// backend-identically.
+    pub failed_at: String,
 }
 
 /// Abstract dead-letter-queue interface backing the
@@ -216,6 +227,73 @@ pub trait FederationDlqSink: Send + Sync {
         per_peer_payload: &serde_json::Value,
         per_peer_last_error: &str,
     ) -> Result<SentinelExpansion, String>;
+
+    /// #2716 (CB-12) F9 — the replay-POST-path restore-race guard.
+    ///
+    /// Returns `true` when the local `memories` row for `memory_id` is
+    /// LIVE **and** its `updated_at` is at or after `erasure_failed_at` —
+    /// i.e. an AUTHORIZED restore / re-store (which stamps `updated_at =
+    /// now`) POST-DATES the queued erasure. In that case the pending
+    /// DELETE (an erasure-outbox per-peer row OR a #2498 delete-lane DLQ
+    /// landing) MUST be SUPERSEDED — never POSTed — or it would destroy
+    /// the just-restored copy on the peer (the #2666 hazard, narrowed but
+    /// not closed by the one-shot liveness probe inside
+    /// [`Self::expand_erasure_sentinel`]).
+    ///
+    /// Returns `false` when the id is not live locally, or when the live
+    /// row's `updated_at` PRE-dates the erasure (an LWW resurrection
+    /// carries the peer's original pre-delete `updated_at`) — so a
+    /// legitimate erasure still propagates.
+    ///
+    /// The comparison is [`restore_supersedes`] (parsed RFC3339 instants,
+    /// fail-safe toward supersede). `erasure_failed_at` is the pending
+    /// row's own [`FederationPushDlqRow::failed_at`]; because the
+    /// authorized-restore branch (the only one that can classify a LIVE
+    /// row as superseded) stamps `updated_at` from the SAME node that
+    /// queued `failed_at`, the dangerous "silent-delete a restored row"
+    /// direction cannot arise from clock skew.
+    ///
+    /// # Errors
+    ///
+    /// Returns the formatted backend error on a read failure. The caller
+    /// FAILS SAFE: it leaves the pending delete UNSENT for the tick rather
+    /// than risk destroying a possibly-restored replica.
+    async fn erasure_delete_superseded_by_restore(
+        &self,
+        memory_id: &str,
+        erasure_failed_at: &str,
+    ) -> Result<bool, String>;
+}
+
+/// #2716 (CB-12) — decide whether a LIVE row's `updated_at` supersedes a
+/// queued erasure's `failed_at`, comparing them as PARSED RFC3339 instants
+/// (never lexically — a lexical compare misorders the many RFC3339
+/// renderings of one instant).
+///
+/// Fail-safe: an unparseable timestamp on EITHER side returns `true`
+/// (treat as SUPERSEDED → do NOT delete → preserve the live row), because
+/// the North Star ranks "never cause unintentional data loss" ABOVE
+/// "purged content must not resurrect". A false-supersede leaves a loud,
+/// operator-re-issuable erasure pending; a false-delete destroys data.
+#[must_use]
+pub(crate) fn restore_supersedes(live_updated_at: &str, erasure_failed_at: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(live_updated_at),
+        chrono::DateTime::parse_from_rfc3339(erasure_failed_at),
+    ) {
+        (Ok(live), Ok(failed)) => live >= failed,
+        _ => true,
+    }
+}
+
+/// #2716 — is this pending DLQ payload a DELETE (a `deletions:[...]`
+/// body)? Only delete-shaped rows pay the F9 restore-race re-check on the
+/// replay POST path; store / link / catch-up rows fall straight through.
+fn payload_is_delete(payload: &serde_json::Value) -> bool {
+    payload
+        .get("deletions")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|d| !d.is_empty())
 }
 
 /// #2446 — outcome of one erasure-outbox sentinel expansion.
@@ -716,6 +794,76 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
             continue;
         };
 
+        // #2716 (CB-12) F9 — restore-race guard on the replay POST path.
+        // A pending DELETE (an erasure-outbox per-peer row OR a #2498
+        // delete-lane DLQ landing) that would replay AFTER the id was
+        // legitimately restored / re-stored locally must be SUPERSEDED,
+        // never POSTed — else it destroys the peer's just-restored copy
+        // (the #2666 hazard the one-shot expand-time probe cannot see,
+        // since the restore happens AFTER expansion). Delete-shaped
+        // payloads only; every other lane falls straight through.
+        if payload_is_delete(&row.payload_json) {
+            match sink
+                .erasure_delete_superseded_by_restore(&row.memory_id, &row.failed_at)
+                .await
+            {
+                Ok(true) => {
+                    crate::metrics::registry()
+                        .federation_erasure_superseded
+                        .inc();
+                    // Clear the superseded row (guarded by the take-time
+                    // attempt snapshot, same contract as the Ack path). A
+                    // 0-row no-op (a concurrent bump) just leaves it
+                    // pending — the next tick re-checks and still will not
+                    // POST while the restore stands.
+                    if let Err(e) = sink.mark_dlq_row_replayed(row.id, row.attempt_count).await {
+                        tracing::warn!(
+                            target: PUSH_DLQ_TRACE_TARGET,
+                            row_id = row.id,
+                            "replay: superseded erasure row {} could not be cleared \
+                             (non-fatal; stays pending, re-checked next tick): {e}",
+                            row.id,
+                        );
+                    }
+                    tracing::warn!(
+                        target: PUSH_DLQ_TRACE_TARGET,
+                        row_id = row.id,
+                        memory_id = %row.memory_id,
+                        peer_id = %row.peer_id,
+                        failed_at = %row.failed_at,
+                        "replay: pending DELETE for {} SUPERSEDED — the id is LIVE again \
+                         locally with a restore/re-store that POST-DATES the queued erasure \
+                         ({}), so the delete was NOT sent to peer {} (it would have destroyed \
+                         a just-restored replica — #2666/#2716). Re-issue the erasure if it \
+                         is still intended",
+                        row.memory_id,
+                        row.failed_at,
+                        row.peer_id,
+                    );
+                    continue;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    // FAIL SAFE — an undeterminable liveness must NOT let
+                    // the delete fly (it could destroy a restored replica).
+                    // Leave the row pending for the next tick WITHOUT
+                    // burning the attempt budget (this is not a delivery
+                    // failure): "never cause unintentional data loss"
+                    // OUTRANKS "purged content must not resurrect".
+                    tracing::warn!(
+                        target: PUSH_DLQ_TRACE_TARGET,
+                        row_id = row.id,
+                        memory_id = %row.memory_id,
+                        "replay: could not evaluate the restore-race guard for {} ({e}); \
+                         leaving the pending delete UNSENT this tick (fail-safe: never \
+                         destroy a possibly-restored replica) — retrying next tick (#2716)",
+                        row.memory_id,
+                    );
+                    continue;
+                }
+            }
+        }
+
         let outcome = post_once(
             &config.client,
             &peer.sync_push_url,
@@ -900,15 +1048,27 @@ async fn expand_erasure_sentinel_row(
             "replay: expanded queued erasure for {} into {n} per-peer delete row(s) (#2446)",
             row.memory_id,
         ),
-        Ok(SentinelExpansion::SupersededByLiveRow) => tracing::warn!(
-            target: PUSH_DLQ_TRACE_TARGET,
-            row_id = row.id,
-            memory_id = %row.memory_id,
-            "replay: queued erasure for {} SUPERSEDED — the id is LIVE again locally (an \
-             archive restore or an authorized re-store), so the delete was NOT fanned out. \
-             Re-issue the erasure if it is still intended (#2446)",
-            row.memory_id,
-        ),
+        Ok(SentinelExpansion::SupersededByLiveRow) => {
+            // #2716 (CB-12) — a supersede is a data-integrity event, never
+            // silent: it CANCELS an erasure the caller requested. LOUD
+            // (WARN) + OBSERVABLE (metric) so an operator can tell an
+            // authorized restore (correct cancel) from a case that needs
+            // the erasure re-issued.
+            crate::metrics::registry()
+                .federation_erasure_superseded
+                .inc();
+            tracing::warn!(
+                target: PUSH_DLQ_TRACE_TARGET,
+                row_id = row.id,
+                memory_id = %row.memory_id,
+                "replay: queued erasure for {} SUPERSEDED — the id is LIVE again locally with \
+                 an `updated_at` that POST-DATES the erasure (an archive restore or an \
+                 authorized re-store), so the delete was NOT fanned out. An LWW resurrection \
+                 (older `updated_at`) would instead PROCEED. Re-issue the erasure if it is \
+                 still intended (#2446/#2716)",
+                row.memory_id,
+            );
+        }
         Ok(SentinelExpansion::Contended) => tracing::debug!(
             target: PUSH_DLQ_TRACE_TARGET,
             row_id = row.id,
@@ -1062,7 +1222,8 @@ impl FederationDlqSink for SqliteDlqSink {
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare(
-                "SELECT id, memory_id, peer_id, payload_json, attempt_count, last_error \
+                "SELECT id, memory_id, peer_id, payload_json, attempt_count, last_error, \
+                        failed_at \
                  FROM federation_push_dlq \
                  WHERE replayed_at IS NULL AND attempt_count < ?2 \
                  ORDER BY failed_at ASC \
@@ -1083,6 +1244,9 @@ impl FederationDlqSink for SqliteDlqSink {
                         payload_json,
                         attempt_count: row.get(4)?,
                         last_error: row.get(5)?,
+                        // #2716 — RFC3339 TEXT column, used verbatim by the
+                        // F9 restore-race guard.
+                        failed_at: row.get(6)?,
                     })
                 },
             )
@@ -1184,22 +1348,37 @@ impl FederationDlqSink for SqliteDlqSink {
         let outcome = (|| -> rusqlite::Result<SentinelExpansion> {
             // Optimistic-concurrency guard, same token as
             // `mark_dlq_row_replayed`.
-            let still_ours: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM federation_push_dlq \
-                 WHERE id = ?1 AND attempt_count = ?2 AND replayed_at IS NULL",
-                rusqlite::params![row_id, expected_attempt_count],
-                |r| r.get(0),
-            )?;
-            if still_ours == 0 {
+            use rusqlite::OptionalExtension as _;
+            // Optimistic-concurrency guard + the sentinel's own `failed_at`
+            // in ONE read: absent row => contended.
+            let failed_at: Option<String> = conn
+                .query_row(
+                    "SELECT failed_at FROM federation_push_dlq \
+                     WHERE id = ?1 AND attempt_count = ?2 AND replayed_at IS NULL",
+                    rusqlite::params![row_id, expected_attempt_count],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(failed_at) = failed_at else {
                 return Ok(SentinelExpansion::Contended);
-            }
-            // #2446 restore-after-delete guard — see the trait doc.
-            let live: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM memories WHERE id = ?1",
-                rusqlite::params![memory_id],
-                |r| r.get(0),
-            )?;
-            let expansion = if live > 0 {
+            };
+            // #2446/#2716 restore-after-delete guard — see the trait doc.
+            // SUPERSEDE only when the id is LIVE **and** its `updated_at`
+            // POST-DATES the erasure (an authorized restore/re-store). An
+            // LWW resurrection carries the peer's older pre-delete
+            // `updated_at`, so the legitimate erasure PROCEEDS (fans out) —
+            // closing the F10 silent-cancel.
+            let live_updated_at: Option<String> = conn
+                .query_row(
+                    "SELECT updated_at FROM memories WHERE id = ?1",
+                    rusqlite::params![memory_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let superseded = live_updated_at
+                .as_deref()
+                .is_some_and(|u| restore_supersedes(u, &failed_at));
+            let expansion = if superseded {
                 SentinelExpansion::SupersededByLiveRow
             } else {
                 let mut written = 0u64;
@@ -1255,6 +1434,26 @@ impl FederationDlqSink for SqliteDlqSink {
                 Err(format!("sqlite expand_erasure_sentinel: {e}"))
             }
         }
+    }
+
+    async fn erasure_delete_superseded_by_restore(
+        &self,
+        memory_id: &str,
+        erasure_failed_at: &str,
+    ) -> Result<bool, String> {
+        use rusqlite::OptionalExtension as _;
+        let conn = self.conn.lock().await;
+        let live_updated_at: Option<String> = conn
+            .query_row(
+                "SELECT updated_at FROM memories WHERE id = ?1",
+                rusqlite::params![memory_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("sqlite erasure_delete_superseded_by_restore: {e}"))?;
+        Ok(live_updated_at
+            .as_deref()
+            .is_some_and(|u| restore_supersedes(u, erasure_failed_at)))
     }
 }
 
@@ -1320,8 +1519,16 @@ impl FederationDlqSink for PostgresDlqSink {
     ) -> Result<Vec<FederationPushDlqRow>, String> {
         let pool = self.store.pool();
         let limit_i64: i64 = limit.try_into().unwrap_or(i64::MAX);
-        let rows: Vec<(i64, String, String, serde_json::Value, i32, String)> = sqlx::query_as(
-            "SELECT id, memory_id, peer_id, payload_json, attempt_count, last_error \
+        let rows: Vec<(
+            i64,
+            String,
+            String,
+            serde_json::Value,
+            i32,
+            String,
+            chrono::DateTime<chrono::Utc>,
+        )> = sqlx::query_as(
+            "SELECT id, memory_id, peer_id, payload_json, attempt_count, last_error, failed_at \
              FROM federation_push_dlq \
              WHERE replayed_at IS NULL AND attempt_count < $2 \
              ORDER BY failed_at ASC \
@@ -1335,7 +1542,7 @@ impl FederationDlqSink for PostgresDlqSink {
         Ok(rows
             .into_iter()
             .map(
-                |(id, memory_id, peer_id, payload_json, attempt_count, last_error)| {
+                |(id, memory_id, peer_id, payload_json, attempt_count, last_error, failed_at)| {
                     FederationPushDlqRow {
                         id,
                         memory_id,
@@ -1343,6 +1550,9 @@ impl FederationDlqSink for PostgresDlqSink {
                         payload_json,
                         attempt_count,
                         last_error,
+                        // #2716 — normalise the `TIMESTAMPTZ` to RFC3339 so
+                        // the backend-blind F9 guard compares identically.
+                        failed_at: failed_at.to_rfc3339(),
                     }
                 },
             )
@@ -1450,25 +1660,35 @@ impl FederationDlqSink for PostgresDlqSink {
             .begin()
             .await
             .map_err(|e| format!("postgres expand_erasure_sentinel begin: {e}"))?;
-        let still_ours: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM federation_push_dlq \
+        // Optimistic-concurrency guard + the sentinel's own `failed_at` in
+        // ONE read: absent row => contended.
+        let sentinel: Option<(chrono::DateTime<chrono::Utc>,)> = sqlx::query_as(
+            "SELECT failed_at FROM federation_push_dlq \
              WHERE id = $1 AND attempt_count = $2 AND replayed_at IS NULL",
         )
         .bind(row_id)
         .bind(expected_attempt_count)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| format!("postgres expand_erasure_sentinel guard: {e}"))?;
-        if still_ours.0 == 0 {
+        let Some((failed_at,)) = sentinel else {
             return Ok(SentinelExpansion::Contended);
-        }
-        // #2446 restore-after-delete guard — see the trait doc.
-        let live: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM memories WHERE id = $1")
-            .bind(memory_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| format!("postgres expand_erasure_sentinel liveness probe: {e}"))?;
-        let expansion = if live.0 > 0 {
+        };
+        // #2446/#2716 restore-after-delete guard — see the trait doc.
+        // SUPERSEDE only when the id is LIVE **and** its `updated_at`
+        // POST-DATES the erasure (an authorized restore). An LWW
+        // resurrection carries an older `updated_at`, so the legitimate
+        // erasure PROCEEDS — closing the F10 silent-cancel. Both columns
+        // are `TIMESTAMPTZ`, so the comparison is a typed instant compare
+        // (no parse, no fail-safe branch needed here).
+        let live: Option<(chrono::DateTime<chrono::Utc>,)> =
+            sqlx::query_as("SELECT updated_at FROM memories WHERE id = $1")
+                .bind(memory_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| format!("postgres expand_erasure_sentinel liveness probe: {e}"))?;
+        let superseded = live.is_some_and(|(u,)| u >= failed_at);
+        let expansion = if superseded {
             SentinelExpansion::SupersededByLiveRow
         } else {
             let mut written = 0u64;
@@ -1506,6 +1726,23 @@ impl FederationDlqSink for PostgresDlqSink {
             .await
             .map_err(|e| format!("postgres expand_erasure_sentinel commit: {e}"))?;
         Ok(expansion)
+    }
+
+    async fn erasure_delete_superseded_by_restore(
+        &self,
+        memory_id: &str,
+        erasure_failed_at: &str,
+    ) -> Result<bool, String> {
+        let pool = self.store.pool();
+        let live: Option<(chrono::DateTime<chrono::Utc>,)> =
+            sqlx::query_as("SELECT updated_at FROM memories WHERE id = $1")
+                .bind(memory_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| format!("postgres erasure_delete_superseded_by_restore: {e}"))?;
+        // Normalise the typed `TIMESTAMPTZ` to RFC3339 and run the shared
+        // fail-safe comparator so both backends agree byte-for-byte.
+        Ok(live.is_some_and(|(u,)| restore_supersedes(&u.to_rfc3339(), erasure_failed_at)))
     }
 }
 
@@ -1552,9 +1789,11 @@ mod replay_arm_tests {
         count_should_err: bool,
         take_should_err: bool,
         take_calls: AtomicUsize,
-        // #2446 — memory ids the mock treats as LIVE locally, so a test can
-        // drive the restore-after-delete supersede arm.
-        live_ids: Mutex<Vec<String>>,
+        // #2446/#2716 — (memory_id, updated_at) the mock treats as LIVE
+        // locally, so a test can drive the restore-after-delete supersede
+        // arm AND the F10/F9 updated_at-vs-failed_at discriminator (a
+        // resurrection with an OLDER updated_at must NOT supersede).
+        live_rows: Mutex<Vec<(String, String)>>,
         // #2446 — records `expand_erasure_sentinel` calls: (row_id, peers).
         expanded: Mutex<Vec<(i64, Vec<String>)>>,
     }
@@ -1575,6 +1814,7 @@ mod replay_arm_tests {
                 payload_json: payload_json.clone(),
                 attempt_count: 1,
                 last_error: last_error.to_string(),
+                failed_at: chrono::Utc::now().to_rfc3339(),
             });
             Ok(())
         }
@@ -1667,7 +1907,17 @@ mod replay_arm_tests {
             else {
                 return Ok(SentinelExpansion::Contended);
             };
-            if self.live_ids.lock().unwrap().iter().any(|i| i == memory_id) {
+            let failed_at = rows[pos].failed_at.clone();
+            // #2716 — SUPERSEDE only when the id is live AND its updated_at
+            // post-dates the erasure (mirrors the real backend guard).
+            let superseded = self
+                .live_rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(id, _)| id == memory_id)
+                .is_some_and(|(_, u)| super::restore_supersedes(u, &failed_at));
+            if superseded {
                 rows.remove(pos);
                 return Ok(SentinelExpansion::SupersededByLiveRow);
             }
@@ -1681,6 +1931,10 @@ mod replay_arm_tests {
                     payload_json: per_peer_payload.clone(),
                     attempt_count: 0,
                     last_error: per_peer_last_error.to_string(),
+                    // The per-peer row inherits the sentinel's erasure
+                    // instant so the F9 replay re-check compares against the
+                    // original delete-intent time.
+                    failed_at: failed_at.clone(),
                 });
                 next_id += 1;
             }
@@ -1689,6 +1943,20 @@ mod replay_arm_tests {
                 .unwrap()
                 .push((row_id, peer_ids.to_vec()));
             Ok(SentinelExpansion::Expanded(peer_ids.len() as u64))
+        }
+
+        async fn erasure_delete_superseded_by_restore(
+            &self,
+            memory_id: &str,
+            erasure_failed_at: &str,
+        ) -> Result<bool, String> {
+            Ok(self
+                .live_rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(id, _)| id == memory_id)
+                .is_some_and(|(_, u)| super::restore_supersedes(u, erasure_failed_at)))
         }
     }
 
@@ -1716,6 +1984,7 @@ mod replay_arm_tests {
             id,
             memory_id: format!("mem-{id}"),
             peer_id: peer_id.to_string(),
+            failed_at: "1970-01-01T00:00:00+00:00".to_string(),
             payload_json: serde_json::json!({"id": format!("mem-{id}")}),
             attempt_count,
             last_error: String::new(),
@@ -1854,6 +2123,7 @@ mod replay_arm_tests {
             payload_json: serde_json::json!({}),
             attempt_count,
             last_error: last_error.to_string(),
+            failed_at: "1970-01-01T00:00:00+00:00".to_string(),
         }
     }
 
@@ -1995,5 +2265,173 @@ mod replay_arm_tests {
             "matching-snapshot mark clears"
         );
         assert_eq!(sink.marked_replayed.lock().unwrap().as_slice(), &[9]);
+    }
+
+    // ----- #2716 (CB-12) erasure restore-race + silent-cancel guards -----
+
+    const TS_OLD: &str = "2026-01-01T00:00:00+00:00";
+    const TS_MID: &str = "2026-06-01T00:00:00+00:00";
+    const TS_NEW: &str = "2026-12-01T00:00:00+00:00";
+
+    fn erasure_payload(mem: &str) -> serde_json::Value {
+        serde_json::json!({"memories": [], "deletions": [mem], "dry_run": false})
+    }
+
+    fn sentinel_row(id: i64, mem: &str, failed_at: &str) -> FederationPushDlqRow {
+        FederationPushDlqRow {
+            id,
+            memory_id: mem.to_string(),
+            peer_id: crate::federation::erasure_outbox::ALL_PEERS_SENTINEL_PEER_ID.to_string(),
+            payload_json: erasure_payload(mem),
+            attempt_count: 1,
+            last_error: "queued".to_string(),
+            failed_at: failed_at.to_string(),
+        }
+    }
+
+    fn delete_row(id: i64, mem: &str, peer_id: &str, failed_at: &str) -> FederationPushDlqRow {
+        FederationPushDlqRow {
+            id,
+            memory_id: mem.to_string(),
+            peer_id: peer_id.to_string(),
+            payload_json: erasure_payload(mem),
+            attempt_count: 0,
+            last_error: String::new(),
+            failed_at: failed_at.to_string(),
+        }
+    }
+
+    /// #2716 F10 — an LWW RESURRECTION (a live row whose `updated_at`
+    /// PRE-dates the erasure) must NOT silently cancel the erasure: the
+    /// sentinel EXPANDS and the delete fans out. This is the defect —
+    /// pre-#2716 any live row cancelled the erasure mesh-wide.
+    #[tokio::test]
+    async fn erasure_sentinel_over_lww_resurrection_proceeds_2716() {
+        let sink = MockSink::default();
+        sink.rows
+            .lock()
+            .unwrap()
+            .push(sentinel_row(1, "mem-x", TS_MID));
+        // Resurrection: live, but with an OLDER updated_at (the peer's
+        // pre-delete value re-delivered via catch-up).
+        sink.live_rows
+            .lock()
+            .unwrap()
+            .push(("mem-x".to_string(), TS_OLD.to_string()));
+        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        replay_once(&cfg, &sink).await;
+        assert_eq!(
+            sink.expanded.lock().unwrap().len(),
+            1,
+            "#2716 F10: a resurrection OLDER than the erasure must NOT cancel it — the \
+             sentinel must EXPAND (fan the delete out to peers)"
+        );
+    }
+
+    /// #2716 — an AUTHORIZED restore (a live row whose `updated_at`
+    /// POST-dates the erasure) correctly SUPERSEDES the erasure (no
+    /// fan-out) — the F9/#2666 fail-safe direction, preserved.
+    #[tokio::test]
+    async fn erasure_sentinel_over_authorized_restore_supersedes_2716() {
+        let sink = MockSink::default();
+        sink.rows
+            .lock()
+            .unwrap()
+            .push(sentinel_row(1, "mem-x", TS_MID));
+        sink.live_rows
+            .lock()
+            .unwrap()
+            .push(("mem-x".to_string(), TS_NEW.to_string()));
+        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        replay_once(&cfg, &sink).await;
+        assert!(
+            sink.expanded.lock().unwrap().is_empty(),
+            "#2716: an authorized restore NEWER than the erasure must SUPERSEDE — no fan-out"
+        );
+        assert!(
+            sink.rows.lock().unwrap().is_empty(),
+            "#2716: the superseded sentinel is cleared, not retried forever"
+        );
+    }
+
+    /// #2716 F9 — a pending per-peer DELETE that replays AFTER an
+    /// authorized restore (live row newer than the erasure) must be
+    /// SUPERSEDED on the POST path — NEVER sent to the peer (it would
+    /// destroy the just-restored replica, #2666). This is the race the
+    /// pre-#2716 replay path (no re-check) left open.
+    #[tokio::test]
+    async fn pending_delete_superseded_by_restore_is_not_posted_2716() {
+        let sink = MockSink::default();
+        sink.rows
+            .lock()
+            .unwrap()
+            .push(delete_row(7, "mem-x", "peer-0", TS_MID));
+        sink.live_rows
+            .lock()
+            .unwrap()
+            .push(("mem-x".to_string(), TS_NEW.to_string()));
+        // Dead peer URL: if the guard failed to fire, post_once would run
+        // and the row would be BUMPED (a delivery failure) — the asserts
+        // catch that regression directly.
+        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        replay_once(&cfg, &sink).await;
+        assert_eq!(
+            sink.marked_replayed.lock().unwrap().as_slice(),
+            &[7],
+            "#2716 F9: a delete superseded by a restore must be CLEARED, not POSTed"
+        );
+        assert!(
+            sink.bumped.lock().unwrap().is_empty(),
+            "#2716 F9: the superseded delete must NOT reach post_once (no attempt bump)"
+        );
+    }
+
+    /// #2716 F9 — the guard does NOT over-supersede: a pending delete for
+    /// an id that is NOT live locally still POSTs (and bumps on failure),
+    /// so a legitimate erasure keeps propagating.
+    #[tokio::test]
+    async fn pending_delete_for_absent_row_still_posts_2716() {
+        let sink = MockSink::default();
+        sink.rows
+            .lock()
+            .unwrap()
+            .push(delete_row(7, "mem-gone", "peer-0", TS_MID));
+        // live_rows empty → the id is not live → not superseded.
+        let cfg = cfg_with_peer("peer-0", "http://127.0.0.1:1/api/v1/sync/push");
+        replay_once(&cfg, &sink).await;
+        assert!(
+            sink.marked_replayed.lock().unwrap().is_empty(),
+            "#2716: an absent (truly-erased) row is never superseded"
+        );
+        assert!(
+            !sink.bumped.lock().unwrap().is_empty(),
+            "#2716: the delete reached post_once and bumped on the failed POST"
+        );
+    }
+
+    /// #2716 — the pure comparator: instant (not lexical) `>=` ordering,
+    /// and FAIL-SAFE (supersede → preserve data) on any unparseable input.
+    #[test]
+    fn restore_supersedes_is_fail_safe_and_instant_ordered_2716() {
+        assert!(
+            super::restore_supersedes(TS_NEW, TS_MID),
+            "newer supersedes"
+        );
+        assert!(
+            super::restore_supersedes(TS_MID, TS_MID),
+            ">=: an equal instant supersedes"
+        );
+        assert!(
+            !super::restore_supersedes(TS_OLD, TS_MID),
+            "an older live row does NOT supersede (erasure proceeds)"
+        );
+        assert!(
+            super::restore_supersedes("not-a-timestamp", TS_MID),
+            "unparseable live updated_at → fail-safe SUPERSEDE (preserve data)"
+        );
+        assert!(
+            super::restore_supersedes(TS_OLD, "garbage"),
+            "unparseable failed_at → fail-safe SUPERSEDE (preserve data)"
+        );
     }
 }
