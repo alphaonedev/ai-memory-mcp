@@ -350,6 +350,16 @@ pub fn handle_action_next(conn: &rusqlite::Connection, params: &Value) -> Result
 /// timestamp is computed internally from `ttl_secs` (default 60) so callers
 /// never marshal wall-clock time.
 ///
+/// This is the SQLITE-LOCAL MCP-stdio lease surface: it holds a bare
+/// `rusqlite::Connection` and calls the `crate::actions::*` free-function
+/// directly (MCP stdio is structurally sqlite-only, #1675). It is the ONLY
+/// production caller of the lease acquire operation at v1.0.0 — a
+/// postgres-backed daemon has no lease-acquire surface (leases are node-local
+/// and do not federate). See the #2513 reachability note on
+/// [`crate::store::MemoryStore::lease_acquire`]: a future pg-reachable lease
+/// wire surface MUST dispatch through the SAL trait (`app.store.lease_acquire`),
+/// not this handler.
+///
 /// # Errors
 /// - `lease conflict: <id> held by another holder` when a non-expired lease
 ///   is held by a different holder.
