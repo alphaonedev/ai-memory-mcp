@@ -549,3 +549,33 @@ jobs:
         # plus a clean control carrying `repository`/`homepage` URLs and the
         # post-#2051 `path = "vendor/paste"` shape, which must NOT trip.
         run: bash scripts/check-git-dependency-sources.sh --self-test
+
+  create-extension-allowlist-gate:
+    # Issue #2648 — SUPPLY-CHAIN. A PostgreSQL extension installs AS
+    # SUPERUSER inside the process that owns the substrate — below the SAL,
+    # below governance, below the signed audit chain — and persists into
+    # `pg_dump`. It is not a dependency in the ordinary sense; it is code
+    # executing beneath every control this release has spent its audit
+    # verifying. This gate HARD-BLOCKS any `CREATE EXTENSION <name>` in the
+    # repo whose <name> is not on the closed `{vector, age}` allowlist —
+    # the same closed-allowlist + self-test + no-`if:` shape the sibling
+    # `vendor-literal-gate` / `git-dependency-source-gate` established, and
+    # it keeps a currently-clean property (zero unallowlisted extension
+    # references at HEAD) clean at tag-cut, which is the cheapest moment.
+    name: "CREATE EXTENSION allowlist gate (#2648)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run CREATE EXTENSION allowlist gate
+        run: bash scripts/check-create-extension-allowlist.sh
+      - name: Self-test the gate (regression evidence)
+        # Per #2635 a supply-chain gate without a self-test has never been
+        # shown to be load-bearing, and per #2641 a gate can print a block
+        # and still exit 0. --self-test plants an off-allowlist extension
+        # named `foo`, asserts the gate exits non-zero + names the `foo`
+        # offender, then plants an allowlisted extension named `vector` and
+        # asserts it PASSES (R-203 near-miss: proves the gate blocks the
+        # off-allowlist NAME, not the mere presence of a create-extension
+        # DDL statement).
+        run: bash scripts/check-create-extension-allowlist.sh --self-test
