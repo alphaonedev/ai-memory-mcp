@@ -1057,18 +1057,76 @@ async fn create_memory_postgres(
             tier_default,
         )
     };
+    // #2743 — honour the request `on_conflict` disposition on the postgres
+    // SINGLE-create path, closing the backend-parity asymmetry: this arm
+    // ALWAYS upserted via `store_with_embedding`, while the sqlite
+    // single-create arm (`resolve_create_conflict_title`) AND both #2725
+    // (CB-23) bulk arms refuse a pre-existing `(title, namespace)` collision
+    // under the default `error`. On postgres a bare `POST /memories` whose key
+    // collided therefore silently REPLACED the stored row's content with no
+    // pre-overwrite snapshot — the exact silent-overwrite class CB-23 closed
+    // for bulk, with bulk-pg left STRICTER than single-create-pg (the tell).
+    //
+    // Resolution runs BEFORE `build_create_memory` (so `version` renames the
+    // title the attestation gate below signs, mirroring the sqlite ordering)
+    // and BEFORE the content-replacing `store_with_embedding` + the daily
+    // quota charge, so a refused collision neither overwrites the durable row
+    // nor charges the caller's quota (the CB-23 ordering). The three-way
+    // disposition mirrors the sqlite `resolve_create_conflict_title` +
+    // `bulk_create_postgres` precedent verbatim: `error` (default) → 409
+    // CONFLICT carrying `existing_id`, never overwrite; `version` →
+    // `next_versioned_title` rename; `merge` → fall through to the
+    // upsert-via-`store_with_embedding` path. The probe goes through the
+    // async SAL trait methods (`PostgresStore` implements both, per the CB-23
+    // bulk-pg arm) rather than a rusqlite `db::` call.
+    use crate::mcp::tools::OnConflictMode;
+    let on_conflict_str = body.on_conflict.as_deref().unwrap_or("error");
+    let on_conflict_mode = match OnConflictMode::parse(on_conflict_str) {
+        Ok(m) => m,
+        Err(msg) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
+        }
+    };
+    let resolved_title = match on_conflict_mode {
+        OnConflictMode::Error => {
+            match app
+                .store
+                .find_by_title_namespace(&body.title, &body.namespace)
+                .await
+            {
+                Ok(Some(existing_id)) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "code": crate::errors::error_codes::CONFLICT,
+                            "error": format!(
+                                "memory with title '{}' already exists in namespace '{}'",
+                                body.title, body.namespace
+                            ),
+                            (field_names::EXISTING_ID): existing_id,
+                        })),
+                    )
+                        .into_response();
+                }
+                Ok(None) => body.title.clone(),
+                Err(e) => return store_err_to_response(e),
+            }
+        }
+        OnConflictMode::Version => match app
+            .store
+            .next_versioned_title(&body.title, &body.namespace)
+            .await
+        {
+            Ok(title) => title,
+            Err(e) => return store_err_to_response(e),
+        },
+        OnConflictMode::Merge => body.title.clone(),
+    };
     // #2550 — THE shared create-funnel projection. Pre-#2550 this was a
     // hand-maintained struct literal duplicated across four write funnels;
     // the two `bulk_create` copies had already drifted (no `kind_provenance`
     // stamp, no `scope` merge).
-    let mut mem = build_create_memory(
-        body,
-        metadata,
-        body.title.clone(),
-        final_tags,
-        expires_at,
-        &now,
-    );
+    let mut mem = build_create_memory(body, metadata, resolved_title, final_tags, expires_at, &now);
     // #626 Layer-3 (C7) — agent-attestation gate (postgres SAL branch).
     // Same contract as the sqlite path, but the bound-key lookup goes
     // through the async `MemoryStore::agent_pubkey`. 400 for a malformed
