@@ -107,6 +107,32 @@ Backup cadence target: hourly snapshots, 48-hour rotation, weekly off-host trans
 
 ---
 
+## 4b. Verifying release-artifact provenance
+
+Every artifact the release workflow publishes — the pre-built Rust binaries + deb/rpm packages, the iOS xcframework tarball, the Android JNI tarball, the CycloneDX SBOM, and the GHCR Docker image — carries an OIDC-bound [Sigstore](https://www.sigstore.dev/) build-provenance attestation ([#2487](https://github.com/alphaonedev/ai-memory-mcp/issues/2487)), **in addition to** the sha256 checksum published alongside it. The attestation is a Rekor-logged statement, signed against GitHub's OIDC identity (not a developer key), that binds each artifact to the exact workflow, repository, and commit SHA that produced it. A checksum proves the bytes you downloaded match the bytes that were published; the attestation proves *who* published them and *from what source* — a control a checksum cannot provide.
+
+Verify a downloaded binary before trusting it:
+
+```bash
+# 1. checksum (unchanged) — bytes match what was published
+sha256sum -c ai-memory-x86_64-unknown-linux-gnu.tar.gz.sha256
+
+# 2. provenance (new) — bound to this repo's release workflow + a specific commit
+gh attestation verify ai-memory-x86_64-unknown-linux-gnu.tar.gz \
+    --repo alphaonedev/ai-memory-mcp
+```
+
+Verify the Docker image (the attestation is attached to the registry, so no local pull is required):
+
+```bash
+gh attestation verify oci://ghcr.io/alphaonedev/ai-memory:<version> \
+    --repo alphaonedev/ai-memory-mcp
+```
+
+`gh attestation verify` exits non-zero if no matching attestation exists in the Rekor transparency log or if the artifact's digest does not match the signed statement. Run it in your ingestion pipeline, not just by hand — an attestation nobody checks is decorative.
+
+---
+
 ## 5. Schema migrations
 
 Migrations are forward-only and run automatically on the first daemon start after an upgrade. There is no offline migration step. The substrate refuses to start against a database newer than the binary expects (**downgrade refusal**, [#2445](https://github.com/alphaonedev/ai-memory-mcp/issues/2445)) and progresses through every intermediate version on upgrade — never skips.

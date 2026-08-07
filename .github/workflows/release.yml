@@ -89,6 +89,19 @@ jobs:
     name: Release (${{ matrix.target }})
     needs: preflight
     runs-on: ${{ matrix.os }}
+    # #2487 supply-chain: OIDC-bound Sigstore build provenance for the
+    # release binaries + deb/rpm, mirroring the OIDC pattern the SDK
+    # publish jobs already use (publish-sdks.yml `id-token: write` →
+    # PyPI Trusted Publishing / npm `--provenance`). `attest-build-provenance`
+    # is the GitHub-native application of that SAME OIDC → Sigstore/Rekor
+    # mechanism to raw binary artifacts (which have no package-registry
+    # trusted publisher). `contents: write` is retained for the GitHub
+    # Release upload; the top-level `packages: write` is dropped for this
+    # job because it publishes no package.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -307,6 +320,16 @@ jobs:
           name: ai-memory-${{ matrix.target }}
           path: dist/ai-memory*
 
+      - name: Attest build provenance (release binaries + packages)
+        # #2487 — additive to the existing sha256 checksums (never a
+        # replacement): a Rekor-logged, OIDC-bound attestation naming
+        # workflow + repo + commit SHA over every released artifact in
+        # dist/ (tarball/zip + deb + rpm). Consumers verify with
+        # `gh attestation verify <file> --repo alphaonedev/ai-memory-mcp`.
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'dist/ai-memory*'
+
       - name: Resolve release-body file (per-tag override, optional)
         id: release_body
         shell: bash
@@ -366,6 +389,12 @@ jobs:
     name: SBOM (CycloneDX)
     needs: [preflight]
     runs-on: ubuntu-latest
+    # #2487 — OIDC-bound Sigstore provenance for the CycloneDX SBOM
+    # artifact (same mechanism as the release-binary job above).
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -403,6 +432,12 @@ jobs:
           cd dist
           sha256sum ai-memory.cdx.json > ai-memory.cdx.json.sha256
           ls -la ai-memory.cdx.json*
+
+      - name: Attest build provenance (CycloneDX SBOM)
+        # #2487 — additive to the sha256 above.
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'dist/ai-memory.cdx.json'
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
@@ -452,6 +487,12 @@ jobs:
     needs: [preflight]
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: macos-latest
+    # #2487 — OIDC-bound Sigstore provenance for the iOS xcframework
+    # tarball (same mechanism as the release-binary job above).
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -536,6 +577,12 @@ jobs:
           shasum -a 256 ai-memory-ios.xcframework.tar.gz > ai-memory-ios.xcframework.tar.gz.sha256
           ls -la ai-memory-ios.xcframework.tar.gz*
 
+      - name: Attest build provenance (iOS xcframework)
+        # #2487 — additive to the sha256 above.
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'dist/ai-memory-ios.xcframework.tar.gz'
+
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -579,6 +626,12 @@ jobs:
     needs: [preflight]
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
+    # #2487 — OIDC-bound Sigstore provenance for the Android JNI tarball
+    # (same mechanism as the release-binary job above).
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -686,6 +739,12 @@ jobs:
           tar czf ai-memory-android.tar.gz aar/
           shasum -a 256 ai-memory-android.tar.gz > ai-memory-android.tar.gz.sha256
           ls -la ai-memory-android.tar.gz*
+
+      - name: Attest build provenance (Android JNI bundle)
+        # #2487 — additive to the sha256 above.
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'dist/ai-memory-android.tar.gz'
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
@@ -892,6 +951,10 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # #2487 — OIDC-bound Sigstore provenance for the GHCR image, the
+      # container-registry form of the same mechanism the SDK OIDC jobs use.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -914,6 +977,7 @@ jobs:
           TAG: ${{ needs.preflight.outputs.tag }}
 
       - name: Build and push Docker image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -926,6 +990,17 @@ jobs:
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Attest build provenance (Docker image)
+        # #2487 — pins the attestation to the pushed image digest and
+        # attaches it to GHCR. Consumers verify with
+        # `gh attestation verify oci://ghcr.io/alphaonedev/ai-memory:<ver> \
+        #    --repo alphaonedev/ai-memory-mcp`.
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/ai-memory
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
   # --------------------------------------------------------------------
   # Fedora COPR source-RPM upload (stable releases only).
