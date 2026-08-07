@@ -98,18 +98,24 @@ pub enum HookEvent {
     ///
     /// TODO(G3-G11): wire here at `crate::storage::insert` (post-INSERT).
     PostStore,
-    /// Fires before a recall query executes. Payload: [`RecallQuery`] (writable).
-    ///
-    /// TODO(G3-G11): wire here at `crate::storage::recall`.
-    PreRecall,
+    // #2758 — `PreRecall` REMOVED (v1.0.0). It advertised a fail-closable
+    // gate over recall, but never fired in production and — since #1869/#1953
+    // made recall PURE (it mutates zero rows in `memories`) — a pre-READ
+    // governance gate is the wrong abstraction: there is no destructive op to
+    // gate. A configurable-but-inert gate is worse than none (#2444
+    // false-success class), so the variant + advertisement were removed rather
+    // than wired onto a read for symmetry. Same disposition as #2637's
+    // `PreArchive`. The `post_recall` NOTIFY event is retained. (Row visibility
+    // + governance are already enforced on the read path — see
+    // `is_visible_to_caller` / the SAL scope=private gates.)
     /// Fires after a recall query returns. Payload: [`RecallResult`] (read-only).
     ///
     /// TODO(G3-G11): wire here at `crate::storage::recall` (post-return).
     PostRecall,
-    /// Fires before a full-text search executes. Payload: [`SearchQuery`] (writable).
-    ///
-    /// TODO(G3-G11): wire here at `crate::storage::search`.
-    PreSearch,
+    // #2758 — `PreSearch` REMOVED (v1.0.0). Same disposition as `PreRecall`
+    // above: full-text search is a read path with no destructive op to gate,
+    // and the variant never fired in production. Removed rather than wired onto
+    // a read for symmetry. The `post_search` NOTIFY event is retained.
     /// Fires after a full-text search returns. Payload: [`SearchResult`] (read-only).
     ///
     /// TODO(G3-G11): wire here at `crate::storage::search` (post-return).
@@ -179,10 +185,13 @@ pub enum HookEvent {
     // than left lying. 5-agent vote (4d3ea1c5). PreCompaction — the one
     // genuinely-ungated destructive path (curator autonomous hard-DELETE merge)
     // — was WIRED instead (see `src/curator/compaction.rs`).
-    /// Fires before a transcript is stored. Payload: [`TranscriptDelta`] (writable).
-    ///
-    /// TODO(G3-G11): wire here at `crate::transcripts::store`.
-    PreTranscriptStore,
+    // #2758 — `PreTranscriptStore` REMOVED (v1.0.0). It advertised a gate over
+    // transcript writes, but never fired in production: `crate::transcripts::store`
+    // has ZERO production callers (every caller is inside a `#[cfg(test)]` module),
+    // so there is no reachable write path to gate. A configurable-but-inert
+    // destructive-op gate is worse than none (#2444 false-success class; #2637's
+    // `PreArchive` disposition), so the variant + advertisement were removed. The
+    // `post_transcript_store` NOTIFY event is retained.
     /// Fires after a transcript has been stored. Payload: [`Transcript`] (read-only).
     ///
     /// TODO(G3-G11): wire here at `crate::transcripts::store` (post-INSERT).
@@ -322,26 +331,9 @@ pub struct MemoryDelta {
 // Pre/Post-recall payloads
 // ---------------------------------------------------------------------------
 
-/// Writable recall query a `pre_recall` hook may rewrite before
-/// the recall executes. Mirrors the public `memory_recall` MCP /
-/// HTTP request shape; fields are optional so a hook may rewrite
-/// only the parts it cares about (e.g. injecting a `namespace`
-/// filter for tenant isolation).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RecallQuery {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub query: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub namespace: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tier: Option<Tier>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tags: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub budget_tokens: Option<usize>,
-}
+// #2758 — the `RecallQuery` hook-payload struct was REMOVED with the
+// `PreRecall` variant it backed (its sole consumer). It is not shared with
+// the retained `post_recall` event (which carries `RecallResult`).
 
 /// G10 hot-path payload for [`HookEvent::PreRecallExpand`]. Carries
 /// only the three fields a query-expansion hook needs to make a
@@ -382,20 +374,9 @@ pub struct RecallResult {
 // Pre/Post-search payloads
 // ---------------------------------------------------------------------------
 
-/// Writable FTS search query for `pre_search` hooks. Same shape
-/// as [`RecallQuery`] minus the budget knob — search is the
-/// uncapped FTS surface; the budget machinery is recall-only.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SearchQuery {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub query: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub namespace: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tags: Option<Vec<String>>,
-}
+// #2758 — the `SearchQuery` hook-payload struct was REMOVED with the
+// `PreSearch` variant it backed (its sole consumer). It is not shared with
+// the retained `post_search` event (which carries `SearchResult`).
 
 /// Read-only result returned to `post_search` hooks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -698,20 +679,9 @@ pub struct CompactionRollbackEvent {
 // Transcript payloads (I-track interop)
 // ---------------------------------------------------------------------------
 
-/// Writable delta for `pre_transcript_store`. Hooks may rewrite
-/// the namespace, the raw content, or the TTL before the
-/// transcript blob is compressed and persisted. Content is
-/// passed in clear text — compression happens server-side.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TranscriptDelta {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub namespace: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-    /// TTL in seconds from "now"; `None` means no expiry.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ttl_secs: Option<i64>,
-}
+// #2758 — the `TranscriptDelta` hook-payload struct was REMOVED with the
+// `PreTranscriptStore` variant it backed (its sole consumer). It is not shared
+// with the retained `post_transcript_store` event (which carries `Transcript`).
 
 /// Read-only handle returned to `post_transcript_store` hooks.
 ///
@@ -813,9 +783,7 @@ mod tests {
         let table = [
             (HookEvent::PreStore, "\"pre_store\""),
             (HookEvent::PostStore, "\"post_store\""),
-            (HookEvent::PreRecall, "\"pre_recall\""),
             (HookEvent::PostRecall, "\"post_recall\""),
-            (HookEvent::PreSearch, "\"pre_search\""),
             (HookEvent::PostSearch, "\"post_search\""),
             (HookEvent::PreDelete, "\"pre_delete\""),
             (HookEvent::PostDelete, "\"post_delete\""),
@@ -834,7 +802,6 @@ mod tests {
                 "\"post_governance_decision\"",
             ),
             (HookEvent::OnIndexEviction, "\"on_index_eviction\""),
-            (HookEvent::PreTranscriptStore, "\"pre_transcript_store\""),
             (HookEvent::PostTranscriptStore, "\"post_transcript_store\""),
             (HookEvent::PreRecallExpand, "\"pre_recall_expand\""),
             (HookEvent::PreReflect, "\"pre_reflect\""),
@@ -850,19 +817,22 @@ mod tests {
             (HookEvent::PostSignalAck, "\"post_signal_ack\""),
         ];
 
-        // Pin the count at the type boundary so adding a 27th
+        // Pin the count at the type boundary so adding a 24th
         // variant without updating the table fails this test. G2
         // shipped 20; G10 added the 21st (`pre_recall_expand`);
         // v0.7.0 recursive-learning Task 6/8 added the 22nd +
         // 23rd (`pre_reflect`, `post_reflect`); L1-7 added the
         // 24th + 25th (`pre_compaction`, `on_compaction_rollback`);
         // v0.8.0 #1709 added `pre_signal_send` + `post_signal_ack`;
-        // v1.0.0 #2637 REMOVED the never-fired `pre_archive`, so the
-        // count is 26.
+        // v1.0.0 #2637 REMOVED the never-fired `pre_archive` (27 -> 26);
+        // v1.0.0 #2758 REMOVED the never-fired `pre_recall` + `pre_search`
+        // (read-path, no op to gate) + `pre_transcript_store` (no production
+        // write path), so the count is 23.
         assert_eq!(
             table.len(),
-            26,
-            "v1.0.0 #2637 removed pre_archive, dropping the HookEvent count 27 -> 26"
+            23,
+            "v1.0.0 #2758 removed pre_recall + pre_search + pre_transcript_store, \
+             dropping the HookEvent count 26 -> 23"
         );
 
         for (variant, expected_json) in table {
@@ -898,24 +868,8 @@ mod tests {
         assert!(back.title.is_none());
     }
 
-    #[test]
-    fn recall_query_round_trips() {
-        let q = RecallQuery {
-            query: Some("auth tokens".into()),
-            namespace: Some("team/security".into()),
-            limit: Some(10),
-            tier: Some(Tier::Long),
-            tags: Some(vec!["secrets".into()]),
-            budget_tokens: Some(2_048),
-        };
-        let json = serde_json::to_string(&q).expect("encode");
-        let back: RecallQuery = serde_json::from_str(&json).expect("decode");
-        assert_eq!(back.query.as_deref(), Some("auth tokens"));
-        assert_eq!(back.namespace.as_deref(), Some("team/security"));
-        assert_eq!(back.limit, Some(10));
-        assert_eq!(back.tier, Some(Tier::Long));
-        assert_eq!(back.budget_tokens, Some(2_048));
-    }
+    // #2758 — `recall_query_round_trips` was REMOVED with the `RecallQuery`
+    // payload struct + the `PreRecall` variant it backed.
 
     #[test]
     fn recall_expand_query_round_trips() {
@@ -939,18 +893,9 @@ mod tests {
     }
 
     #[test]
-    fn search_query_and_result_round_trip() {
-        let sq = SearchQuery {
-            query: Some("postgres".into()),
-            namespace: Some("eng".into()),
-            limit: Some(5),
-            tags: None,
-        };
-        let json = serde_json::to_string(&sq).expect("encode SearchQuery");
-        let back: SearchQuery = serde_json::from_str(&json).expect("decode SearchQuery");
-        assert_eq!(back.query.as_deref(), Some("postgres"));
-        assert!(back.tags.is_none());
-
+    fn search_result_round_trips() {
+        // #2758 — the `SearchQuery` half was REMOVED with the `PreSearch`
+        // variant; only the retained `post_search` payload is exercised here.
         let sr = SearchResult {
             query: "postgres".into(),
             memories: vec![],
@@ -1186,17 +1131,10 @@ mod tests {
     }
 
     #[test]
-    fn transcript_payloads_round_trip_and_project_from_internal() {
-        let delta = TranscriptDelta {
-            namespace: Some("agent/claude".into()),
-            content: Some("hello world".into()),
-            ttl_secs: Some(crate::SECS_PER_HOUR),
-        };
-        let json = serde_json::to_string(&delta).expect("encode");
-        let back: TranscriptDelta = serde_json::from_str(&json).expect("decode");
-        assert_eq!(back.namespace.as_deref(), Some("agent/claude"));
-        assert_eq!(back.ttl_secs, Some(crate::SECS_PER_HOUR));
-
+    fn transcript_payload_projects_from_internal() {
+        // #2758 — the `TranscriptDelta` half was REMOVED with the
+        // `PreTranscriptStore` variant; only the retained `post_transcript_store`
+        // projection is exercised here.
         // Project from the internal storage handle to the wire shape.
         let internal = crate::transcripts::Transcript {
             id: "tr-1".into(),

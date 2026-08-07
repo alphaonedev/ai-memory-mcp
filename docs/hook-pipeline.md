@@ -113,20 +113,29 @@ rest. Namespace-qualified `required_events` is tracked as a follow-up.
 
 ## 26-event matrix
 
-The 20 baseline events:
+The 17 baseline events (#2758 removed `pre_recall` / `pre_search` /
+`pre_transcript_store`; the `post_*` notify events are retained):
 
 | Event | Phase | Class | Fires on |
 |---|---|---|---|
 | `pre_store` / `post_store` | write | Write | `memory_store`, `memory_update` (when content changes) |
-| `pre_recall` / `post_recall` | read | Read | `memory_recall`, family-loader recall |
-| `pre_search` / `post_search` | read | Read | `memory_search` |
+| `post_recall` | read | Read | `memory_recall`, family-loader recall |
+| `post_search` | read | Read | `memory_search` |
 | `pre_delete` / `post_delete` | write | Write | `memory_delete` |
 | `pre_promote` / `post_promote` | write | Write | tier promotion (manual + auto) |
 | `pre_link` / `post_link` | write | Write | `memory_link` |
 | `pre_consolidate` / `post_consolidate` | write | Write | `memory_consolidate` |
 | `pre_governance_decision` / `post_governance_decision` | gate | Write | governance pipeline |
 | `on_index_eviction` | maintenance | Index | HNSW eviction |
-| `pre_transcript_store` / `post_transcript_store` | write | Transcript | transcript sidechain writes |
+| `post_transcript_store` | write | Transcript | transcript sidechain writes |
+
+> **#2758 (v1.0.0):** `pre_recall`, `pre_search`, and `pre_transcript_store`
+> were REMOVED. Recall and search are pure read paths (recall mutates zero
+> rows since #1869/#1953), so a pre-READ governance gate has no destructive
+> op to gate; and `crate::transcripts::store` has no production write path.
+> Rather than advertise an enforcement point that never fires (the #2637
+> `pre_archive` disposition), the three pre-events were removed. The
+> corresponding `post_*` notify events are retained.
 
 The 5 grand-slam additions:
 
@@ -190,7 +199,7 @@ monotonically as earlier hooks consume time:
 | `Write` | **5,000 ms** | store/delete/promote/link/consolidate/governance/archive/reflect/compaction |
 | `Read` | **2,000 ms** | recall/search |
 | `Index` | **1,000 ms** | `on_index_eviction` |
-| `Transcript` | **5,000 ms** | `pre_transcript_store`, `post_transcript_store` |
+| `Transcript` | **5,000 ms** | `post_transcript_store` |
 | `HotPath` | **50 ms** | `pre_recall_expand` (only inhabitant today) |
 
 The HotPath ceiling is the v0.6.3 recall p95 budget — a hook that

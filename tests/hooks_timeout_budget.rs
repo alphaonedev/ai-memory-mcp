@@ -178,8 +178,10 @@ fn index_class_deadline_is_1_second_via_public_api() {
 
 #[test]
 fn transcript_class_deadline_is_5_seconds_via_public_api() {
+    // #2758 removed the never-fired PreTranscriptStore; the retained
+    // PostTranscriptStore notify event carries the Transcript class.
     assert_eq!(
-        event_class(HookEvent::PreTranscriptStore),
+        event_class(HookEvent::PostTranscriptStore),
         EventClass::Transcript
     );
     assert_eq!(

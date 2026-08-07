@@ -345,14 +345,14 @@ pub fn is_pre_event(event: HookEvent) -> bool {
     match event {
         // ---- pre-events: `Modify` decisions ARE honoured -----------------
         HookEvent::PreStore
-        | HookEvent::PreRecall
-        | HookEvent::PreSearch
         | HookEvent::PreDelete
         | HookEvent::PrePromote
         | HookEvent::PreLink
         | HookEvent::PreConsolidate
         | HookEvent::PreGovernanceDecision
-        | HookEvent::PreTranscriptStore
+        // #2758 REMOVED PreRecall + PreSearch (read-path, no op to gate) +
+        // PreTranscriptStore (no production write path) — mirroring #2637's
+        // PreArchive removal.
         // G10: hot-path query expansion fires before the recall
         // call — Modify decisions rewrite the in-flight query.
         | HookEvent::PreRecallExpand
@@ -659,14 +659,11 @@ mod tests {
         // added PreReflect; L1-7 added PreCompaction).
         for ev in [
             HookEvent::PreStore,
-            HookEvent::PreRecall,
-            HookEvent::PreSearch,
             HookEvent::PreDelete,
             HookEvent::PrePromote,
             HookEvent::PreLink,
             HookEvent::PreConsolidate,
             HookEvent::PreGovernanceDecision,
-            HookEvent::PreTranscriptStore,
             HookEvent::PreRecallExpand,
             HookEvent::PreReflect,
             HookEvent::PreCompaction,

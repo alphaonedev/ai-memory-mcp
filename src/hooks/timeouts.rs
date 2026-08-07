@@ -130,9 +130,9 @@ pub const HOT_PATH_CLASS_DEADLINE_MS: u64 = 50;
 // event_class — the canonical mapping
 // ---------------------------------------------------------------------------
 
-/// Map a [`HookEvent`] to its [`EventClass`]. Total over the 26
+/// Map a [`HookEvent`] to its [`EventClass`]. Total over the 23
 /// variants — the compiler's exhaustiveness check enforces the table
-/// stays in sync if a 27th event ever lands.
+/// stays in sync if a 24th event ever lands.
 #[must_use]
 pub fn event_class(event: HookEvent) -> EventClass {
     match event {
@@ -165,15 +165,16 @@ pub fn event_class(event: HookEvent) -> EventClass {
         // dedicated notify class (same posture as PostReflect).
         | HookEvent::PreSignalSend
         | HookEvent::PostSignalAck => EventClass::Write,
-        // Reads: query path. Hot.
-        HookEvent::PreRecall
-        | HookEvent::PostRecall
-        | HookEvent::PreSearch
-        | HookEvent::PostSearch => EventClass::Read,
+        // Reads: query path. Hot. (#2758 removed the never-fired PreRecall +
+        // PreSearch — recall/search are pure read paths; the post-* notify
+        // events remain read-class.)
+        HookEvent::PostRecall | HookEvent::PostSearch => EventClass::Read,
         // Index: HNSW lifecycle.
         HookEvent::OnIndexEviction => EventClass::Index,
-        // Transcripts: I-track interop.
-        HookEvent::PreTranscriptStore | HookEvent::PostTranscriptStore => EventClass::Transcript,
+        // Transcripts: I-track interop. (#2758 removed the never-fired
+        // PreTranscriptStore — no production transcript-write path — leaving
+        // the post-* notify event.)
+        HookEvent::PostTranscriptStore => EventClass::Transcript,
         // G10: synchronous hot-path query expansion (50ms budget).
         HookEvent::PreRecallExpand => EventClass::HotPath,
     }
@@ -337,12 +338,12 @@ mod tests {
     use super::*;
 
     /// Every `HookEvent` variant must classify into exactly one
-    /// `EventClass`. Table-driven so adding a 27th variant without
+    /// `EventClass`. Table-driven so adding a 24th variant without
     /// updating the mapping fails this test (the compiler also
     /// flags the missing arm in `event_class`, but the assertion
     /// surface here is what an operator reading the test reads).
     #[test]
-    fn event_class_table_covers_all_26_variants() {
+    fn event_class_table_covers_all_23_variants() {
         let table = [
             // Write — 18 variants (Task 6/8 added pre_reflect + post_reflect;
             // L1-7 added pre_compaction + on_compaction_rollback;
@@ -366,15 +367,14 @@ mod tests {
             (HookEvent::OnCompactionRollback, EventClass::Write),
             (HookEvent::PreSignalSend, EventClass::Write),
             (HookEvent::PostSignalAck, EventClass::Write),
-            // Read — 4 variants.
-            (HookEvent::PreRecall, EventClass::Read),
+            // Read — 2 variants (#2758 removed the never-fired pre_recall +
+            // pre_search; recall/search are pure read paths).
             (HookEvent::PostRecall, EventClass::Read),
-            (HookEvent::PreSearch, EventClass::Read),
             (HookEvent::PostSearch, EventClass::Read),
             // Index — 1 variant.
             (HookEvent::OnIndexEviction, EventClass::Index),
-            // Transcript — 2 variants.
-            (HookEvent::PreTranscriptStore, EventClass::Transcript),
+            // Transcript — 1 variant (#2758 removed the never-fired
+            // pre_transcript_store; no production transcript-write path).
             (HookEvent::PostTranscriptStore, EventClass::Transcript),
             // HotPath — 1 variant (G10).
             (HookEvent::PreRecallExpand, EventClass::HotPath),
@@ -382,8 +382,9 @@ mod tests {
 
         assert_eq!(
             table.len(),
-            26,
-            "the mapping must cover exactly the 26 HookEvent variants (#2637 removed pre_archive)"
+            23,
+            "the mapping must cover exactly the 23 HookEvent variants (#2758 removed \
+             pre_recall + pre_search + pre_transcript_store)"
         );
         for (event, expected) in table {
             assert_eq!(
