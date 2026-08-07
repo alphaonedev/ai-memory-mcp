@@ -2518,6 +2518,36 @@ pub trait MemoryStore: Send + Sync {
     /// the caller's own) is reclaimed. Sets `acquired_at` + `heartbeat_at` to
     /// `now`; `expires_at` is the caller-computed deadline. Default
     /// `UnsupportedCapability`.
+    ///
+    /// # Reachability at v1.0.0 (#2513) — MCP-stdio/sqlite-local, no HTTP surface
+    ///
+    /// This method and its siblings [`lease_renew`](Self::lease_renew) /
+    /// [`lease_release`](Self::lease_release) / [`lease_get`](Self::lease_get) are
+    /// a NODE-LOCAL, single-holder coordination primitive. At v1.0.0 the lease
+    /// acquire/renew/release/get operations are surfaced on exactly ONE
+    /// production path: the MCP stdio handlers
+    /// ([`crate::mcp::tools::action::handle_lease_acquire`] et al.), which hold a
+    /// bare `rusqlite::Connection` and call the `crate::actions::lease_*`
+    /// free-functions directly — MCP stdio is structurally sqlite-only (#1675).
+    /// There is deliberately NO HTTP lease route (unlike the FEDERATED
+    /// coordination primitives — action-transition / signals / checkpoints —
+    /// which got HTTP send surfaces under #1718/#2391 precisely because they
+    /// fan out W-of-N; a single-holder lease does NOT federate — fanning an
+    /// acquire to peers would split-brain the mutex).
+    ///
+    /// The consequence, and the whole of #2513: on a POSTGRES-backed daemon
+    /// these four `PostgresStore` methods have **no production caller** — they
+    /// are correct + live-PG-tested (#2310) forward-scaffolding, dormant until a
+    /// pg-reachable lease wire surface is added. When one IS added, it MUST
+    /// dispatch through THIS trait (`app.store.lease_acquire(...)`), never a
+    /// direct `crate::actions::*` call, so BOTH backends are served — the exact
+    /// SAL-routing discipline the L4/L2
+    /// [`capture_turn_idempotent`](Self::capture_turn_idempotent) /
+    /// [`recover_turn_idempotent`](Self::recover_turn_idempotent) methods
+    /// already document. Contrast [`lease_sweep_expired`](Self::lease_sweep_expired),
+    /// the one lease method that DOES have a pg production caller (the pg
+    /// maintenance loop in `daemon_runtime`); it reclaims expired rows, so the
+    /// pg `leases` table is maintained even while it is never written.
     async fn lease_acquire(
         &self,
         _ctx: &CallerContext,
@@ -2533,7 +2563,9 @@ pub trait MemoryStore: Send + Sync {
 
     /// #1709 Pillar 1 — renew a lease the caller holds (extend `expires_at`,
     /// bump `heartbeat_at` to `now`). `NotFound` when no lease held by
-    /// `holder` exists. Default `UnsupportedCapability`.
+    /// `holder` exists. Default `UnsupportedCapability`. See
+    /// [`lease_acquire`](Self::lease_acquire) for the #2513 reachability note
+    /// (MCP-stdio/sqlite-local; dormant on pg until an HTTP surface routes here).
     async fn lease_renew(
         &self,
         _ctx: &CallerContext,
@@ -2548,7 +2580,9 @@ pub trait MemoryStore: Send + Sync {
     }
 
     /// #1709 Pillar 1 — release a lease held by `holder`. Returns `true` when
-    /// a row was removed. Default `UnsupportedCapability`.
+    /// a row was removed. Default `UnsupportedCapability`. See
+    /// [`lease_acquire`](Self::lease_acquire) for the #2513 reachability note
+    /// (MCP-stdio/sqlite-local; dormant on pg until an HTTP surface routes here).
     async fn lease_release(
         &self,
         _ctx: &CallerContext,
@@ -2561,7 +2595,9 @@ pub trait MemoryStore: Send + Sync {
     }
 
     /// #1709 Pillar 1 — the current lease on an action, if any. Default
-    /// `UnsupportedCapability`.
+    /// `UnsupportedCapability`. See [`lease_acquire`](Self::lease_acquire) for
+    /// the #2513 reachability note (MCP-stdio/sqlite-local; dormant on pg until
+    /// an HTTP surface routes here).
     async fn lease_get(
         &self,
         _ctx: &CallerContext,
