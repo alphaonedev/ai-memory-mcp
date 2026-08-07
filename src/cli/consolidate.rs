@@ -58,6 +58,9 @@ pub fn run(
     // > git remote > cwd basename > "global" (see `cli::helpers`).
     let namespace = crate::cli::helpers::resolve_namespace(args.namespace);
     validate::validate_consolidate(&ids, &args.title, &args.summary, &namespace)?;
+    // v1.0.0 #2572 — REFUSE this write on a Postgres store (see `refuse_pg_store`).
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "consolidate", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     let consolidator_agent_id = identity::resolve_agent_id(cli_agent_id, None)?;
     // #2121 — the CLI is a CALLER-origin authoring surface for the covenant
@@ -102,6 +105,9 @@ pub fn run_auto(
     cli_agent_id: Option<&str>,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
+    // v1.0.0 #2572 — REFUSE this write on a Postgres store (see `refuse_pg_store`).
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "auto-consolidate", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     let consolidator_agent_id = identity::resolve_agent_id(cli_agent_id, None)?;
     let tier_filter = if args.short_only {

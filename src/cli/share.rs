@@ -94,6 +94,9 @@ pub fn cmd_share(
     args: &ShareArgs,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
+    // v1.0.0 #2572 — REFUSE this write on a Postgres store (see `refuse_pg_store`).
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "share", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
 
     // Build the JSON params bag the substrate primitive consumes. The

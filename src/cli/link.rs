@@ -34,6 +34,9 @@ pub fn cmd_link(
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     validate::validate_link(&args.source_id, &args.target_id, &args.relation)?;
+    // v1.0.0 #2572 — REFUSE this write on a Postgres store (see `refuse_pg_store`).
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "link", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     db::create_link(&conn, &args.source_id, &args.target_id, &args.relation)?;
     if json_out {
@@ -56,6 +59,9 @@ pub fn cmd_resolve(
     json_out: bool,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
+    // v1.0.0 #2572 — REFUSE this write on a Postgres store (see `refuse_pg_store`).
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "resolve", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     validate::validate_link(
         &args.winner_id,

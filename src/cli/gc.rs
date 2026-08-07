@@ -16,6 +16,9 @@ pub fn run_gc(
     app_config: &config::AppConfig,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
+    // v1.0.0 #2572 — REFUSE this eviction write on a Postgres store (see `refuse_pg_store`).
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "gc", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     // v0.9.0 P0-1 (#1869) — fold-before-gc: apply pending recall-access
     // TTL extensions from the `recall_observations` ledger BEFORE
@@ -66,6 +69,9 @@ pub fn run_gc(
 
 /// `stats` handler.
 pub fn run_stats(db_path: &Path, json_out: bool, out: &mut CliOutput<'_>) -> Result<()> {
+    // v1.0.0 #2572 — REFUSE on a Postgres store (phantom SQLite stats are empty; see `refuse_pg_store`).
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "stats", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     let stats = db::stats(&conn, db_path)?;
     if json_out {
@@ -89,6 +95,9 @@ pub fn run_stats(db_path: &Path, json_out: bool, out: &mut CliOutput<'_>) -> Res
 
 /// `namespaces` handler.
 pub fn run_namespaces(db_path: &Path, json_out: bool, out: &mut CliOutput<'_>) -> Result<()> {
+    // v1.0.0 #2572 — REFUSE on a Postgres store (phantom SQLite listing is empty; see `refuse_pg_store`).
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "namespaces", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     let ns = db::list_namespaces(&conn)?;
     if json_out {

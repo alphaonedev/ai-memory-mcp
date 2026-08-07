@@ -158,6 +158,12 @@ pub fn run(
     cli_agent_id: Option<&str>,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
+    // v1.0.0 #2572 — REFUSE the LOCAL-store leg on a Postgres deployment BEFORE
+    // opening the local sqlite (see `refuse_pg_store`). The `--remote-db` leg is
+    // an explicit second sqlite FILE argument, not the configured store, so it
+    // is unaffected.
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "sync", out)?;
+    let db_path = db_path.as_path();
     let local_conn = db::open(db_path)?;
     let remote_conn = db::open(&args.remote_db)?;
     let caller_id = identity::resolve_agent_id(cli_agent_id, None)?;

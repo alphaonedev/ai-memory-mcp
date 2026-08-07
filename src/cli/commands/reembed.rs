@@ -292,6 +292,13 @@ pub async fn cmd_reembed(
     app_config: &AppConfig,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
+    // v1.0.0 #2572 — REFUSE on a Postgres store BEFORE building the embedder, so
+    // a pg deployment fails fast rather than paying HF-Hub/candle construction
+    // for a re-embed write that cannot land in the served store. This is the
+    // FIRST side-effecting step (the read-then-write `build_plan`/`set_embeddings`
+    // sequence follows the open at line ~353). See `refuse_pg_store`.
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "reembed", out)?;
+    let db_path = db_path.as_path();
     let feature_tier = app_config.effective_tier(None);
     let tier_config = feature_tier.config();
     let resolved = app_config.resolve_embeddings();

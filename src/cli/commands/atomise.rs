@@ -285,6 +285,12 @@ pub fn run_with_curator(
         }
     };
 
+    // v1.0.0 #2572 — REFUSE this write on a Postgres store BEFORE the local
+    // sqlite open (see `refuse_pg_store`). A pg-refusal propagates as an `Err`
+    // rather than through the atomise exit-code map, which is correct: it is a
+    // hard deployment misconfiguration, not an atomisation outcome.
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "atomise", out)?;
+    let db_path = db_path.as_path();
     // Open the DB. Failure here lands on the db_error track.
     let conn = match db::open(db_path) {
         Ok(c) => c,

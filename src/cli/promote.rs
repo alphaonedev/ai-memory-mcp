@@ -57,6 +57,9 @@ pub fn cmd_promote(
         // the R22 reserved-namespace refusal.
         validate::reject_reserved_write_namespace(to_ns)?;
     }
+    // v1.0.0 #2572 — REFUSE this write on a Postgres store (see `refuse_pg_store`).
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "promote", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     let target = if let Some(m) = db::get(&conn, &args.id)? {
         m

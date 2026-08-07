@@ -167,6 +167,10 @@ fn set_standard(
     json_out: bool,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
+    // v1.0.0 #2572 — REFUSE this governance-standard write on a Postgres store
+    // (see `refuse_pg_store`).
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "namespace set-standard", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     // #2541 / #2721 — the local CLI is an operator/admin surface that acts as
     // the daemon principal. Pass `DAEMON_PRINCIPAL` OUT OF BAND via the trusted
@@ -220,6 +224,10 @@ fn get_standard(
     json_out: bool,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
+    // v1.0.0 #2572 — REFUSE on a Postgres store (a phantom SQLite read returns
+    // an empty conjured database; see `refuse_pg_store`).
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "namespace get-standard", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     let params = json!({
         "namespace": namespace,
@@ -287,6 +295,10 @@ fn clear_standard(
     json_out: bool,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
+    // v1.0.0 #2572 — REFUSE this governance-standard write on a Postgres store
+    // (see `refuse_pg_store`).
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "namespace clear-standard", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     let params = json!({ "namespace": namespace });
     let resp = handle_namespace_clear_standard(&conn, &params).map_err(|e| anyhow::anyhow!(e))?;

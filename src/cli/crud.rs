@@ -69,6 +69,10 @@ pub fn cmd_get(
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     validate::validate_id(&args.id)?;
+    // v1.0.0 #2572 — REFUSE on a Postgres store (a phantom SQLite read returns
+    // an empty conjured database; see `refuse_pg_store`).
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "get", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     if let Some(mem) = db::resolve_id(&conn, &args.id)? {
         let links = db::get_links(&conn, &mem.id).unwrap_or_default();
@@ -114,6 +118,10 @@ pub fn cmd_list(
     if let Some(ref v) = args.valid_at {
         validate::validate_valid_at(v)?;
     }
+    // v1.0.0 #2572 — REFUSE on a Postgres store (a phantom SQLite read returns
+    // an empty conjured database; see `refuse_pg_store`).
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "list", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
     let tier = args.tier.as_deref().and_then(Tier::from_str);
@@ -171,6 +179,9 @@ pub fn cmd_delete(
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     validate::validate_id(&args.id)?;
+    // v1.0.0 #2572 — REFUSE this delete on a Postgres store (see `refuse_pg_store`).
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "delete", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     let target = db::resolve_id(&conn, &args.id)?;
     let Some(target) = target else {

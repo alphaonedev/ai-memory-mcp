@@ -96,6 +96,13 @@ pub fn run(db_path: &Path, args: &CalibrateConfidenceArgs, out: &mut CliOutput<'
         return Ok(2);
     }
 
+    // v1.0.0 #2572 — REFUSE on a Postgres store BEFORE the raw sqlite open.
+    // `calibrate confidence` UPDATEs `confidence_shadow_observations`, so it is a
+    // class-(a) WRITE despite its "read-only" docstring — on a pg deployment the
+    // UPDATE would phantom-land in a throwaway SQLite file. This bypasses
+    // `db::open`, so the guard is applied at the raw-open site. See `refuse_pg_store`.
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "calibrate confidence", out)?;
+    let db_path = db_path.as_path();
     let conn = Connection::open(db_path)?;
     // v1.0.0 #2445 — raw-open WRITE funnel (`calibrate_from_shadow` UPDATEs
     // `confidence_shadow_observations`).
