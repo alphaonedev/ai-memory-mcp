@@ -377,7 +377,8 @@ pub fn is_pre_event(event: HookEvent) -> bool {
         | HookEvent::PostConsolidate
         | HookEvent::PostGovernanceDecision
         | HookEvent::OnIndexEviction
-        | HookEvent::PostTranscriptStore
+        // #2758 REMOVED PostTranscriptStore with the rest of the transcript
+        // hook family (no production transcript-write path).
         | HookEvent::PostReflect
         | HookEvent::OnCompactionRollback
         // v0.8.0 #1709: post_signal_ack is notify-only.
@@ -683,7 +684,6 @@ mod tests {
             HookEvent::PostConsolidate,
             HookEvent::PostGovernanceDecision,
             HookEvent::OnIndexEviction,
-            HookEvent::PostTranscriptStore,
             HookEvent::PostReflect,
             HookEvent::OnCompactionRollback,
             HookEvent::PostSignalAck,

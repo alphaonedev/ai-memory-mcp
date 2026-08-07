@@ -93,10 +93,9 @@ pub enum EventClass {
     Read,
     /// HNSW index lifecycle events. Background maintenance loop.
     Index,
-    /// Transcript I-track events. Same 5s budget as writes; called
-    /// out separately because the payload shape and call-site
-    /// pressure profile differ.
-    Transcript,
+    // #2758 — the `Transcript` class was REMOVED: its only inhabitants were
+    // the never-fired `Pre`/`PostTranscriptStore` events, which had no
+    // production transcript-write path.
     /// G10: synchronous hot-path hooks that fire *inside* the recall
     /// p95 budget (50ms). Today's only inhabitant is
     /// [`HookEvent::PreRecallExpand`]; future synchronous hot-path
@@ -117,8 +116,8 @@ pub const WRITE_CLASS_DEADLINE_MS: u64 = 5_000;
 pub const READ_CLASS_DEADLINE_MS: u64 = 2_000;
 /// Class deadline for [`EventClass::Index`].
 pub const INDEX_CLASS_DEADLINE_MS: u64 = 1_000;
-/// Class deadline for [`EventClass::Transcript`].
-pub const TRANSCRIPT_CLASS_DEADLINE_MS: u64 = 5_000;
+// #2758 — `TRANSCRIPT_CLASS_DEADLINE_MS` was REMOVED with the `Transcript`
+// EventClass (its never-fired transcript events had no production path).
 /// G10 — class deadline for [`EventClass::HotPath`] (synchronous
 /// recall-budget hooks). 50ms = the v0.6.3 recall p95 budget; a
 /// hook that runs longer would blow the SLO. The class deadline is
@@ -130,9 +129,9 @@ pub const HOT_PATH_CLASS_DEADLINE_MS: u64 = 50;
 // event_class — the canonical mapping
 // ---------------------------------------------------------------------------
 
-/// Map a [`HookEvent`] to its [`EventClass`]. Total over the 23
+/// Map a [`HookEvent`] to its [`EventClass`]. Total over the 22
 /// variants — the compiler's exhaustiveness check enforces the table
-/// stays in sync if a 24th event ever lands.
+/// stays in sync if a 23rd event ever lands.
 #[must_use]
 pub fn event_class(event: HookEvent) -> EventClass {
     match event {
@@ -171,10 +170,9 @@ pub fn event_class(event: HookEvent) -> EventClass {
         HookEvent::PostRecall | HookEvent::PostSearch => EventClass::Read,
         // Index: HNSW lifecycle.
         HookEvent::OnIndexEviction => EventClass::Index,
-        // Transcripts: I-track interop. (#2758 removed the never-fired
-        // PreTranscriptStore — no production transcript-write path — leaving
-        // the post-* notify event.)
-        HookEvent::PostTranscriptStore => EventClass::Transcript,
+        // #2758 removed the whole transcript hook family (PreTranscriptStore +
+        // PostTranscriptStore) — no production transcript-write path — so the
+        // Transcript EventClass has no remaining inhabitant and was removed too.
         // G10: synchronous hot-path query expansion (50ms budget).
         HookEvent::PreRecallExpand => EventClass::HotPath,
     }
@@ -207,7 +205,6 @@ pub fn class_deadline(class: EventClass) -> Duration {
         EventClass::Write => WRITE_CLASS_DEADLINE_MS,
         EventClass::Read => READ_CLASS_DEADLINE_MS,
         EventClass::Index => INDEX_CLASS_DEADLINE_MS,
-        EventClass::Transcript => TRANSCRIPT_CLASS_DEADLINE_MS,
         EventClass::HotPath => HOT_PATH_CLASS_DEADLINE_MS,
     };
     Duration::from_millis(base_ms.saturating_mul(test_timing_budget_mult()))
@@ -338,12 +335,12 @@ mod tests {
     use super::*;
 
     /// Every `HookEvent` variant must classify into exactly one
-    /// `EventClass`. Table-driven so adding a 24th variant without
+    /// `EventClass`. Table-driven so adding a 23rd variant without
     /// updating the mapping fails this test (the compiler also
     /// flags the missing arm in `event_class`, but the assertion
     /// surface here is what an operator reading the test reads).
     #[test]
-    fn event_class_table_covers_all_23_variants() {
+    fn event_class_table_covers_all_22_variants() {
         let table = [
             // Write — 18 variants (Task 6/8 added pre_reflect + post_reflect;
             // L1-7 added pre_compaction + on_compaction_rollback;
@@ -373,18 +370,18 @@ mod tests {
             (HookEvent::PostSearch, EventClass::Read),
             // Index — 1 variant.
             (HookEvent::OnIndexEviction, EventClass::Index),
-            // Transcript — 1 variant (#2758 removed the never-fired
-            // pre_transcript_store; no production transcript-write path).
-            (HookEvent::PostTranscriptStore, EventClass::Transcript),
+            // #2758 removed the Transcript class entirely — its only
+            // inhabitants were the never-fired pre_/post_transcript_store
+            // events (no production transcript-write path).
             // HotPath — 1 variant (G10).
             (HookEvent::PreRecallExpand, EventClass::HotPath),
         ];
 
         assert_eq!(
             table.len(),
-            23,
-            "the mapping must cover exactly the 23 HookEvent variants (#2758 removed \
-             pre_recall + pre_search + pre_transcript_store)"
+            22,
+            "the mapping must cover exactly the 22 HookEvent variants (#2758 removed \
+             pre_recall + pre_search + the transcript hook family)"
         );
         for (event, expected) in table {
             assert_eq!(
@@ -409,10 +406,7 @@ mod tests {
             class_deadline(EventClass::Index),
             Duration::from_millis(1_000)
         );
-        assert_eq!(
-            class_deadline(EventClass::Transcript),
-            Duration::from_millis(5_000)
-        );
+        // #2758 removed EventClass::Transcript (never-fired transcript events).
         // G10: hot-path budget is the v0.6.3 recall p95 (50ms).
         assert_eq!(
             class_deadline(EventClass::HotPath),
@@ -435,10 +429,7 @@ mod tests {
             class_deadline_for_event(HookEvent::OnIndexEviction),
             Duration::from_millis(INDEX_CLASS_DEADLINE_MS)
         );
-        assert_eq!(
-            class_deadline_for_event(HookEvent::PostTranscriptStore),
-            Duration::from_millis(TRANSCRIPT_CLASS_DEADLINE_MS)
-        );
+        // #2758 removed the Transcript class (never-fired transcript events).
         // G10: PreRecallExpand is the inhabitant of HotPath.
         assert_eq!(
             class_deadline_for_event(HookEvent::PreRecallExpand),

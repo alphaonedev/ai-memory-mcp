@@ -176,19 +176,10 @@ fn index_class_deadline_is_1_second_via_public_api() {
     assert_eq!(class_deadline(EventClass::Index), Duration::from_secs(1));
 }
 
-#[test]
-fn transcript_class_deadline_is_5_seconds_via_public_api() {
-    // #2758 removed the never-fired PreTranscriptStore; the retained
-    // PostTranscriptStore notify event carries the Transcript class.
-    assert_eq!(
-        event_class(HookEvent::PostTranscriptStore),
-        EventClass::Transcript
-    );
-    assert_eq!(
-        class_deadline(EventClass::Transcript),
-        Duration::from_secs(5)
-    );
-}
+// #2758 — `transcript_class_deadline_is_5_seconds_via_public_api` was
+// REMOVED with the `EventClass::Transcript` class: its only inhabitants were
+// the never-fired pre_/post_transcript_store events (no production
+// transcript-write path).
 
 // ---------------------------------------------------------------------------
 // L0.7-4 Tier C — chain.fire real-executor coverage

@@ -22,53 +22,55 @@
 use ai_memory::config::HOOK_EVENTS_COUNT;
 use ai_memory::hooks::events::HookEvent;
 
-/// The three removed tokens must NOT deserialize into any live
-/// `HookEvent` variant. This is the mechanism by which a
-/// `[hooks].required_events` entry naming one now fails to parse loudly
-/// (the field is `Option<Vec<HookEvent>>`), and by which the advertised
-/// hook surface stops CLAIMING an enforcement it does not have.
+/// The removed tokens must NOT deserialize into any live `HookEvent`
+/// variant: `pre_recall` / `pre_search` (read-path gates with no
+/// destructive op) + the WHOLE transcript hook family `pre_transcript_store`
+/// / `post_transcript_store` (no production transcript-write path, so even
+/// the `post_*` notify event never fired — the same false-success shape).
+/// This is the mechanism by which a `[hooks].required_events` entry naming
+/// one now fails to parse loudly (the field is `Option<Vec<HookEvent>>`),
+/// and by which the advertised hook surface stops CLAIMING an enforcement /
+/// notify point it does not have.
 #[test]
-fn removed_pre_event_tokens_no_longer_deserialize_2758() {
+fn removed_event_tokens_no_longer_deserialize_2758() {
     for token in [
         "\"pre_recall\"",
         "\"pre_search\"",
         "\"pre_transcript_store\"",
+        "\"post_transcript_store\"",
     ] {
         let parsed: Result<HookEvent, _> = serde_json::from_str(token);
         assert!(
             parsed.is_err(),
             "{token} must NOT deserialize into a live HookEvent variant after #2758 \
-             (a present-but-unfired governance hook is a false enforcement claim)"
+             (a present-but-unfired hook is a false enforcement/notify claim)"
         );
     }
 }
 
-/// The retained `post_*` NOTIFY siblings must still deserialize — #2758
-/// removed only the three never-fired `pre_*` events, not the read/notify
-/// events that legitimately fire.
+/// The retained `post_recall` / `post_search` NOTIFY siblings must still
+/// deserialize — their READ paths are real production paths, so unlike the
+/// transcript pair they were kept. (The transcript `post_*` event is in the
+/// removed set above precisely because its path is not real.)
 #[test]
-fn retained_post_event_tokens_still_deserialize_2758() {
-    for token in [
-        "\"post_recall\"",
-        "\"post_search\"",
-        "\"post_transcript_store\"",
-    ] {
+fn retained_read_post_event_tokens_still_deserialize_2758() {
+    for token in ["\"post_recall\"", "\"post_search\""] {
         let parsed: Result<HookEvent, _> = serde_json::from_str(token);
         assert!(
             parsed.is_ok(),
-            "{token} is a retained notify event and must still deserialize"
+            "{token} fires on a real production read path and must still deserialize"
         );
     }
 }
 
-/// The compile-time variant count SSOT drops 26 -> 23 (#2637 had taken it
-/// 27 -> 26 by removing `pre_archive`).
+/// The compile-time variant count SSOT drops 26 -> 22 (#2637 had taken it
+/// 27 -> 26 by removing `pre_archive`; #2758 removes 4 more).
 #[test]
-fn hook_events_count_is_23_after_2758() {
+fn hook_events_count_is_22_after_2758() {
     assert_eq!(
-        HOOK_EVENTS_COUNT, 23,
-        "HOOK_EVENTS_COUNT must be 23 after #2758 removed pre_recall + pre_search \
-         + pre_transcript_store (was 26 after #2637 removed pre_archive)"
+        HOOK_EVENTS_COUNT, 22,
+        "HOOK_EVENTS_COUNT must be 22 after #2758 removed pre_recall + pre_search \
+         + the transcript hook family (was 26 after #2637 removed pre_archive)"
     );
 }
 

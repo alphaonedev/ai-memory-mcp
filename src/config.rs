@@ -1039,8 +1039,10 @@ pub struct CapabilityHooks {
 /// variants land; the corresponding enum exhaustiveness check in
 /// `src/hooks/timeouts.rs` enforces the count at test time. (#2637
 /// removed the never-fired `PreArchive`, 27 → 26; #2758 removed the
-/// never-fired `PreRecall` + `PreSearch` + `PreTranscriptStore`, 26 → 23.)
-pub const HOOK_EVENTS_COUNT: usize = 23;
+/// never-fired `PreRecall` + `PreSearch` (read paths) + the whole
+/// transcript hook family `PreTranscriptStore` + `PostTranscriptStore`
+/// (no production transcript-write path), 26 → 22.)
+pub const HOOK_EVENTS_COUNT: usize = 22;
 
 fn default_hook_events_count() -> usize {
     HOOK_EVENTS_COUNT

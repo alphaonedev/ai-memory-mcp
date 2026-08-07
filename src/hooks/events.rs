@@ -185,17 +185,18 @@ pub enum HookEvent {
     // than left lying. 5-agent vote (4d3ea1c5). PreCompaction — the one
     // genuinely-ungated destructive path (curator autonomous hard-DELETE merge)
     // — was WIRED instead (see `src/curator/compaction.rs`).
-    // #2758 — `PreTranscriptStore` REMOVED (v1.0.0). It advertised a gate over
-    // transcript writes, but never fired in production: `crate::transcripts::store`
-    // has ZERO production callers (every caller is inside a `#[cfg(test)]` module),
-    // so there is no reachable write path to gate. A configurable-but-inert
-    // destructive-op gate is worse than none (#2444 false-success class; #2637's
-    // `PreArchive` disposition), so the variant + advertisement were removed. The
-    // `post_transcript_store` NOTIFY event is retained.
-    /// Fires after a transcript has been stored. Payload: [`Transcript`] (read-only).
-    ///
-    /// TODO(G3-G11): wire here at `crate::transcripts::store` (post-INSERT).
-    PostTranscriptStore,
+    // #2758 — BOTH transcript events REMOVED (v1.0.0). `crate::transcripts::store`
+    // has ZERO production callers (every caller is inside a `#[cfg(test)]` module;
+    // the L4 `memory_capture_turn` path writes `memories` + `transcript_line_dedup`,
+    // not `memory_transcripts`), so NEITHER `pre_transcript_store` (a gate with no
+    // reachable write path) NOR `post_transcript_store` (a notify event that never
+    // fires — the same #2444 false-success shape, inert for the identical reason)
+    // ever fired in production. Advertising an enforcement/notify point that never
+    // fires is a false claim (the #2637 `PreArchive` disposition), so the whole
+    // transcript hook family — both variants, the `TranscriptDelta`/`Transcript`
+    // payload structs, and the now-uninhabited `EventClass::Transcript` — was
+    // removed. Unlike recall/search (whose retained `post_*` events fire on real
+    // production read paths), the transcript pair had no live path at all.
     /// G10: fires *synchronously* on the recall hot path before the
     /// embedder / DB call to allow query expansion (synonyms,
     /// spelling correction, harness-specific normalization). Payload:
@@ -679,40 +680,11 @@ pub struct CompactionRollbackEvent {
 // Transcript payloads (I-track interop)
 // ---------------------------------------------------------------------------
 
-// #2758 — the `TranscriptDelta` hook-payload struct was REMOVED with the
-// `PreTranscriptStore` variant it backed (its sole consumer). It is not shared
-// with the retained `post_transcript_store` event (which carries `Transcript`).
-
-/// Read-only handle returned to `post_transcript_store` hooks.
-///
-/// Mirrors `crate::transcripts::Transcript` field-for-field
-/// (which is *not* `Serialize` itself — it's an internal storage
-/// handle). The executor (G3) will project from the internal
-/// type into this wire-shaped struct before fanning out to hook
-/// subscribers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Transcript {
-    pub id: String,
-    pub namespace: String,
-    pub created_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<String>,
-    pub compressed_size: i64,
-    pub original_size: i64,
-}
-
-impl From<&crate::transcripts::Transcript> for Transcript {
-    fn from(t: &crate::transcripts::Transcript) -> Self {
-        Self {
-            id: t.id.clone(),
-            namespace: t.namespace.clone(),
-            created_at: t.created_at.clone(),
-            expires_at: t.expires_at.clone(),
-            compressed_size: t.compressed_size,
-            original_size: t.original_size,
-        }
-    }
-}
+// #2758 — the `TranscriptDelta` + `Transcript` hook-payload structs were
+// REMOVED with the transcript hook family (`PreTranscriptStore` +
+// `PostTranscriptStore`) they backed. `crate::transcripts::store` has no
+// production caller, so neither event ever fired; nothing else consumes
+// these wire shapes.
 
 // ---------------------------------------------------------------------------
 // Signal payloads (v0.8.0 Pillar-1 #1709 / #1729)
@@ -802,7 +774,6 @@ mod tests {
                 "\"post_governance_decision\"",
             ),
             (HookEvent::OnIndexEviction, "\"on_index_eviction\""),
-            (HookEvent::PostTranscriptStore, "\"post_transcript_store\""),
             (HookEvent::PreRecallExpand, "\"pre_recall_expand\""),
             (HookEvent::PreReflect, "\"pre_reflect\""),
             (HookEvent::PostReflect, "\"post_reflect\""),
@@ -826,13 +797,15 @@ mod tests {
         // v0.8.0 #1709 added `pre_signal_send` + `post_signal_ack`;
         // v1.0.0 #2637 REMOVED the never-fired `pre_archive` (27 -> 26);
         // v1.0.0 #2758 REMOVED the never-fired `pre_recall` + `pre_search`
-        // (read-path, no op to gate) + `pre_transcript_store` (no production
-        // write path), so the count is 23.
+        // (read-path, no op to gate) + the whole transcript hook family
+        // `pre_transcript_store` + `post_transcript_store` (no production
+        // transcript-write path at all), so the count is 22.
         assert_eq!(
             table.len(),
-            23,
-            "v1.0.0 #2758 removed pre_recall + pre_search + pre_transcript_store, \
-             dropping the HookEvent count 26 -> 23"
+            22,
+            "v1.0.0 #2758 removed pre_recall + pre_search + the transcript hook \
+             family (pre_transcript_store + post_transcript_store), \
+             dropping the HookEvent count 26 -> 22"
         );
 
         for (variant, expected_json) in table {
@@ -1130,28 +1103,9 @@ mod tests {
         assert_eq!(back.namespace, "team/ops");
     }
 
-    #[test]
-    fn transcript_payload_projects_from_internal() {
-        // #2758 — the `TranscriptDelta` half was REMOVED with the
-        // `PreTranscriptStore` variant; only the retained `post_transcript_store`
-        // projection is exercised here.
-        // Project from the internal storage handle to the wire shape.
-        let internal = crate::transcripts::Transcript {
-            id: "tr-1".into(),
-            namespace: "agent/claude".into(),
-            created_at: "2026-05-05T00:00:00Z".into(),
-            expires_at: None,
-            compressed_size: 42,
-            original_size: 256,
-        };
-        let wire: Transcript = (&internal).into();
-        let json = serde_json::to_string(&wire).expect("encode wire");
-        let back: Transcript = serde_json::from_str(&json).expect("decode wire");
-        assert_eq!(back.id, "tr-1");
-        assert_eq!(back.compressed_size, 42);
-        assert_eq!(back.original_size, 256);
-        assert!(back.expires_at.is_none());
-    }
+    // #2758 — `transcript_payloads_round_trip_and_project_from_internal` was
+    // REMOVED with the whole transcript hook family (both variants + the
+    // `TranscriptDelta`/`Transcript` payload structs it exercised).
 
     #[test]
     fn signal_payloads_round_trip() {
