@@ -26,6 +26,7 @@ import { apiErrorFromResponse, NetworkError } from "./errors.js";
 import { attestationFields, type AgentSigningKey } from "./attestation.js";
 import type {
   AgentRegistration,
+  BulkCreateResponse,
   ClientOptions,
   CreateMemoryRequest,
   CreateSubscriptionRequest,
@@ -315,15 +316,24 @@ export class AiMemoryClient {
     });
   }
 
-  /** `POST /api/v1/memories/bulk` — batch insert (<=1000). */
+  /**
+   * `POST /api/v1/memories/bulk` — batch insert (<=1000).
+   *
+   * The handler is `Json(bodies): Json<Vec<CreateMemory>>`
+   * (`src/handlers/bulk.rs`), so the body is a BARE JSON ARRAY — an object
+   * wrapper fails axum's `Json` extractor outright. The response is the
+   * per-row ledger envelope ({@link BulkCreateResponse}), NOT a list of
+   * created rows; a partial batch answers 207 and an all-pending batch 202,
+   * both of which `res.ok` accepts (ai-memory#2646).
+   */
   async storeBulk(
     memories: CreateMemoryRequest[],
     opts?: RequestOptions,
-  ): Promise<{ created: Memory[]; count: number }> {
-    return this.call({
+  ): Promise<BulkCreateResponse> {
+    return this.call<BulkCreateResponse, CreateMemoryRequest[]>({
       method: "POST",
       path: "/api/v1/memories/bulk",
-      body: { memories },
+      body: memories,
       requestOpts: opts,
     });
   }

@@ -101,6 +101,111 @@ describe("AiMemoryClient.unsubscribe URL shape (C-20)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// #2646 — `storeBulk` posted `{ memories }` (an OBJECT wrapper) at a handler
+// that is `Json<Vec<CreateMemory>>` (a BARE ARRAY), so every call was dead on
+// arrival; and it typed a `{ created: Memory[]; count }` response the daemon
+// has never emitted. This offline test pins BOTH: the request body is an
+// array, and a representative `BulkCreateResponse` envelope (including a
+// rejected row) parses through.
+// ---------------------------------------------------------------------------
+
+describe("AiMemoryClient.storeBulk wire shape (#2646)", () => {
+  function capture(responseBody: unknown, status = 207): {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    fetchImpl: any;
+    seenBody: () => string;
+  } {
+    let body = "";
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const fetchImpl = async (_url: any, init: any) => {
+      body = String(init?.body ?? "");
+      return {
+        ok: status >= 200 && status < 300,
+        status,
+        headers: { get: () => "application/json" },
+        json: async () => responseBody,
+        text: async () => JSON.stringify(responseBody),
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any;
+    };
+    return { fetchImpl, seenBody: () => body };
+  }
+
+  test("sends a BARE ARRAY body, never an object wrapper", async () => {
+    const envelope = {
+      sent: 2,
+      created: 2,
+      updated: 0,
+      deduped: 0,
+      rejected: 0,
+      errors: [],
+      pending: [],
+    };
+    const { fetchImpl, seenBody } = capture(envelope, 200);
+    const client = new AiMemoryClient(
+      { baseUrl: "http://localhost:9077" },
+      fetchImpl,
+    );
+
+    await client.storeBulk([
+      { title: "a", content: "one" },
+      { title: "b", content: "two" },
+    ]);
+
+    const parsed = JSON.parse(seenBody());
+    // The daemon's `Json<Vec<CreateMemory>>` extractor requires a top-level
+    // array; the pre-#2646 `{ memories: [...] }` wrapper 400s outright.
+    expect(Array.isArray(parsed)).toBe(true);
+    expect(parsed).toHaveLength(2);
+    expect(parsed[0]).toMatchObject({ title: "a", content: "one" });
+  });
+
+  test("parses the ledger envelope including a rejected row (207)", async () => {
+    const envelope = {
+      sent: 4,
+      created: 1,
+      updated: 1,
+      deduped: 1,
+      rejected: 1,
+      errors: [
+        {
+          index: 2,
+          code: "CONFLICT",
+          error: "conflict: already exists",
+          existing_id: "row-abc",
+        },
+      ],
+      deduped_rows: [{ index: 0, superseded_by: 1 }],
+      updated_rows: [{ index: 3, superseded_by: "row-xyz" }],
+      pending: [],
+      warnings: ["quorum replication deferred"],
+    };
+    const { fetchImpl } = capture(envelope, 207);
+    const client = new AiMemoryClient(
+      { baseUrl: "http://localhost:9077" },
+      fetchImpl,
+    );
+
+    const res = await client.storeBulk([
+      { title: "a", content: "one" },
+      { title: "b", content: "two" },
+      { title: "c", content: "three" },
+      { title: "d", content: "four" },
+    ]);
+
+    // Reconciliation identity the module docs promise.
+    expect(res.created + res.updated + res.deduped + res.rejected + res.pending.length).toBe(
+      res.sent,
+    );
+    expect(res.rejected).toBe(1);
+    expect(res.errors[0]).toMatchObject({ index: 2, code: "CONFLICT", existing_id: "row-abc" });
+    expect(res.deduped_rows).toEqual([{ index: 0, superseded_by: 1 }]);
+    expect(res.updated_rows).toEqual([{ index: 3, superseded_by: "row-xyz" }]);
+    expect(res.warnings).toEqual(["quorum replication deferred"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Live integration tests — opt-in via AI_MEMORY_TEST_DAEMON=1.
 // ---------------------------------------------------------------------------
 
