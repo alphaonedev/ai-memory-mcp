@@ -400,6 +400,75 @@ pub(super) fn resolve_inbound_attribution(
     sender_agent_id.to_string()
 }
 
+/// #2720 F-12 (CWE-346) — bind the DECIDER of an inbound federated pending
+/// REJECT to the attested peer, never the self-asserted wire `decider`.
+///
+/// ## The hole this closes
+///
+/// The APPROVE arm routes through [`crate::db::approve_with_approver_type`]
+/// (self-approval refusal + `is_registered_agent` + approver-type policy), but
+/// the REJECT arm called [`crate::db::decide_pending_action`] with the wire
+/// `PendingDecision::decider` VERBATIM. So an in-scope peer could stamp
+/// `pending_actions.decided_by` — AND the signed `pending_action.denied` audit
+/// row it emits — with ANY identity string, including a real operator's:
+/// forging the governance audit trail. #2532 made REJECT symmetric on WHERE
+/// (namespace scope) but it stayed asymmetric on WHO.
+///
+/// This is a faithful mirror of the memory lane's
+/// [`resolve_inbound_attribution`] identity discipline (and the signal lane's
+/// [`signal_author_authorized`]): a relayed third-party claim is trusted ONLY
+/// when the operator authorized this peer to author as that agent (the
+/// per-peer [`crate::federation::peer_attestation::PeerScope::allowed_sender_agent_ids`]
+/// allowlist), or when it self-relays (`decider == sender_agent_id`).
+/// Zero-config (no allowlist) preserves the faith-based posture, byte-identical
+/// to pre-fix. Unlike a signal, a `PendingDecision` carries no signed canonical
+/// bytes over `decider`, so — exactly like a memory — an unauthorized claim is
+/// REBOUND to the attested sender rather than skipped, keeping the reject
+/// converging (the originator killed the action) while the audit records the
+/// real attested actor.
+///
+/// Returns the decider string to record on the deny transition.
+#[must_use]
+pub(super) fn resolve_inbound_decider(
+    claimed_decider: &str,
+    sender_agent_id: &str,
+    attest_cfg: &PeerAttestationConfig,
+    peer_id: Option<&str>,
+) -> String {
+    // The #238-attested sender is always trusted to decide as itself.
+    if claimed_decider == sender_agent_id {
+        return claimed_decider.to_string();
+    }
+    // Enrolled posture: a relayed third-party decider is trusted ONLY if the
+    // operator authorized this peer to author as that agent. Zero-config
+    // (no allowlist) preserves the faith-based posture.
+    let authorized = if attest_cfg.has_allowlist() {
+        peer_id
+            .and_then(|p| attest_cfg.scope_for(p))
+            .is_some_and(|scope| {
+                scope
+                    .allowed_sender_agent_ids
+                    .iter()
+                    .any(|a| a == claimed_decider)
+            })
+    } else {
+        true
+    };
+    if authorized {
+        return claimed_decider.to_string();
+    }
+    tracing::warn!(
+        target: ATTESTATION_TRACE_TARGET,
+        claimed_decider = %claimed_decider,
+        sender = %sender_agent_id,
+        peer_id = %peer_id.unwrap_or(""),
+        "sync_push: peer not authorized to reject-as the claimed decider (#2720 F-12); \
+         rebinding the decision actor to the attested sender so the signed audit \
+         trail records the real actor"
+    );
+    sender_agent_id.to_string()
+}
+
 /// #1843 (v0.8.1, security-high) — author-binding authorization for an inbound
 /// relayed signal, shared verbatim by the sqlite (`sync_push`) and postgres
 /// (`sync_push_via_store`) receive loops so both backends behave identically.
@@ -2943,7 +3012,18 @@ pub async fn sync_push(
                 skipped += 1;
                 continue;
             }
-            match db::decide_pending_action(&lock.0, &dec.id, false, &dec.decider) {
+            // #2720 F-12 (CWE-346) — bind the decider to the attested peer, never
+            // the self-asserted wire `dec.decider`. Mirrors the memory lane's
+            // `resolve_inbound_attribution`: an unauthorized third-party claim is
+            // rebound to the sender so the signed `pending_action.denied` audit
+            // row records the real attested actor, not a forged operator id.
+            let bound_decider = resolve_inbound_decider(
+                &dec.decider,
+                &body.sender_agent_id,
+                &attest_cfg,
+                peer_header_owned.as_deref(),
+            );
+            match db::decide_pending_action(&lock.0, &dec.id, false, &bound_decider) {
                 Ok(true) => pending_decisions_applied += 1,
                 Ok(false) => noop += 1, // already decided — converged state
                 Err(e) => {
@@ -4122,6 +4202,58 @@ mod tests {
             &zero,
             Some("ai:relay")
         ));
+    }
+
+    /// #2720 F-12 (CWE-346) ADVERSARIAL — a federated pending REJECT must not
+    /// stamp the signed audit trail with an arbitrary wire-supplied decider.
+    /// [`resolve_inbound_decider`] binds the recorded actor to the attested peer
+    /// (mirroring `resolve_inbound_attribution`): an unauthorized third-party
+    /// claim is rebound to the sender, an authorized one is kept, self-relay is
+    /// kept, and zero-config stays faith-based.
+    #[test]
+    fn resolve_inbound_decider_rebinds_forged_decider_2720() {
+        use crate::federation::peer_attestation::PeerScope;
+        use std::collections::HashMap;
+
+        // Enrolled: peer "ai:relay" may decide only as "bob".
+        let mut peers = HashMap::new();
+        peers.insert(
+            "ai:relay".to_string(),
+            PeerScope {
+                allowed_sender_agent_ids: vec!["bob".to_string()],
+                ..PeerScope::default()
+            },
+        );
+        let cfg = PeerAttestationConfig::from_peers(peers);
+        let zero = PeerAttestationConfig::default();
+
+        // EXPLOIT (rebound): forge a reject decided_by a real operator id.
+        assert_eq!(
+            resolve_inbound_decider("ai:victim-operator", "ai:relay", &cfg, Some("ai:relay")),
+            "ai:relay",
+            "#2720 F-12: an unauthorized decider must be rebound to the attested sender"
+        );
+
+        // Legit: an authorized third-party decider ("bob") is preserved.
+        assert_eq!(
+            resolve_inbound_decider("bob", "ai:relay", &cfg, Some("ai:relay")),
+            "bob",
+            "#2720 F-12: an operator-authorized relayed decider is kept"
+        );
+
+        // Legit: self-relay (decider == sender) is preserved.
+        assert_eq!(
+            resolve_inbound_decider("ai:relay", "ai:relay", &cfg, Some("ai:relay")),
+            "ai:relay",
+            "#2720 F-12: the attested sender may decide as itself"
+        );
+
+        // Zero-config (unenrolled mesh): faith-based — the claim is kept.
+        assert_eq!(
+            resolve_inbound_decider("ai:victim-operator", "ai:relay", &zero, Some("ai:relay")),
+            "ai:victim-operator",
+            "#2720 F-12: zero-config preserves the faith-based (byte-identical) posture"
+        );
     }
 
     /// v0.7.0 #1049 (Agent-5 #9) — `extract_peer_id` validates the
