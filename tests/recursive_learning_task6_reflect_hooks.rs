@@ -595,7 +595,10 @@ fn reflect_result_wire_shape_is_serde_clean() {
 // ─────────────────────────────────────────────────────────────────────
 
 #[test]
-fn hook_event_count_grows_to_23_with_pre_and_post_reflect() {
+fn reflect_hook_subset_encodes_to_unique_snake_case() {
+    // The v0.7.0 Task 6/8 subset (through PostReflect; excludes the
+    // v0.8.0 signal events + the L1-7 compaction events). #2637 removed
+    // the never-fired PreArchive, so this subset is now 22, not 23.
     let all = [
         HookEvent::PreStore,
         HookEvent::PostStore,
@@ -614,7 +617,6 @@ fn hook_event_count_grows_to_23_with_pre_and_post_reflect() {
         HookEvent::PreGovernanceDecision,
         HookEvent::PostGovernanceDecision,
         HookEvent::OnIndexEviction,
-        HookEvent::PreArchive,
         HookEvent::PreTranscriptStore,
         HookEvent::PostTranscriptStore,
         HookEvent::PreRecallExpand,
@@ -623,8 +625,8 @@ fn hook_event_count_grows_to_23_with_pre_and_post_reflect() {
     ];
     assert_eq!(
         all.len(),
-        23,
-        "v0.7.0 Task 6/8 raises the count from 21 to 23"
+        22,
+        "v0.7.0 Task 6/8 subset is 22 after #2637 removed pre_archive"
     );
     // Every variant encodes to a unique snake_case string.
     let mut tags: Vec<String> = all
@@ -633,7 +635,7 @@ fn hook_event_count_grows_to_23_with_pre_and_post_reflect() {
         .collect();
     tags.sort();
     tags.dedup();
-    assert_eq!(tags.len(), 23, "every HookEvent serialises uniquely");
+    assert_eq!(tags.len(), 22, "every HookEvent serialises uniquely");
 }
 
 // ---------------------------------------------------------------------------

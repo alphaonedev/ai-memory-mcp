@@ -1694,6 +1694,41 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             // inside `init_tracing` makes this safe to call even when
             // another subscriber is already installed.
             init_tracing();
+
+            // #2637 (CWE-284 gate-integrity) — INSTALL the process pre-event
+            // enforcement gate on the CURATOR, mirroring `run_mcp_server` (#1885)
+            // and `bootstrap_serve` (#1924). The curator's autonomous
+            // `ConsolidationPass::run` (the hard-DELETE consolidation merge) is
+            // the one destructive path NOT reached by the caller-facing
+            // `PreConsolidate` consult, so pre-#2637 a `pre_compaction` hook —
+            // even with `fail_mode = "closed"` and declared a `required_event` —
+            // NEVER fired: the curator process never installed the gate that
+            // `ConsolidationPass::run` consults. Installed ONLY when enforce is
+            // active AND a required event is declared → default (off) curators
+            // never install it (byte-identical to pre-#2637). Idempotent
+            // OnceLock: harmless if another surface on the same process already
+            // installed it.
+            {
+                use crate::hooks::{HookEnforceMode, config::HookConfig};
+                let mode = app_config.resolve_hooks_enforce_mode();
+                let required = app_config.resolve_required_events();
+                if mode != HookEnforceMode::Off && !required.is_empty() {
+                    let all_hooks = HookConfig::default_path()
+                        .filter(|p| p.exists())
+                        .and_then(|p| HookConfig::load_from_file(&p).ok())
+                        .unwrap_or_default();
+                    // `install_pre_event_enforce_gate_for_tests` is the ONLY
+                    // public installer for the process-global gate (the `_for_tests`
+                    // suffix names its introduction, not a `#[cfg(test)]` guard);
+                    // reused here so the curator shares the identical install path.
+                    crate::mcp::install_pre_event_enforce_gate_for_tests(all_hooks, mode, required);
+                    tracing::info!(
+                        "#2637 — curator pre-event enforcement gate installed \
+                         (pre_compaction gates the autonomous hard-DELETE merge)"
+                    );
+                }
+            }
+
             // Daemon mode runs indefinitely on a `spawn_blocking` worker
             // that itself calls `tracing::info!`. If the dispatch held
             // the process-wide `Stdout::lock()` while the daemon ran,

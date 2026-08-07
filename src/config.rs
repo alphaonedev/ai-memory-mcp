@@ -1037,8 +1037,9 @@ pub struct CapabilityHooks {
 
 /// Compile-time count of `HookEvent` variants.  Updated here when new
 /// variants land; the corresponding enum exhaustiveness check in
-/// `src/hooks/timeouts.rs` enforces the count at test time.
-pub const HOOK_EVENTS_COUNT: usize = 27;
+/// `src/hooks/timeouts.rs` enforces the count at test time. (#2637
+/// removed the never-fired `PreArchive`, dropping the count 27 → 26.)
+pub const HOOK_EVENTS_COUNT: usize = 26;
 
 fn default_hook_events_count() -> usize {
     HOOK_EVENTS_COUNT

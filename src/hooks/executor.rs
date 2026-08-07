@@ -15,7 +15,7 @@
 //   payload is written to stdin; stdin is then closed; the child's
 //   stdout is read to EOF and parsed as a single JSON object.
 //   Cheapest model to reason about; ideal for cold or low-rate
-//   events (`pre_governance_decision`, `pre_archive`).
+//   events (`pre_governance_decision`, `pre_consolidate`).
 //
 // * [`DaemonExecutor`] — one long-lived child per `HookConfig`.
 //   Frames newline-delimited JSON over stdin/stdout (NDJSON, see

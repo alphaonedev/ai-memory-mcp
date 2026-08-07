@@ -352,7 +352,6 @@ pub fn is_pre_event(event: HookEvent) -> bool {
         | HookEvent::PreLink
         | HookEvent::PreConsolidate
         | HookEvent::PreGovernanceDecision
-        | HookEvent::PreArchive
         | HookEvent::PreTranscriptStore
         // G10: hot-path query expansion fires before the recall
         // call — Modify decisions rewrite the in-flight query.
@@ -667,7 +666,6 @@ mod tests {
             HookEvent::PreLink,
             HookEvent::PreConsolidate,
             HookEvent::PreGovernanceDecision,
-            HookEvent::PreArchive,
             HookEvent::PreTranscriptStore,
             HookEvent::PreRecallExpand,
             HookEvent::PreReflect,

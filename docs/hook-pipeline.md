@@ -1,7 +1,7 @@
 ---
 layout: doc
 ---
-# Hook pipeline (Track G — 27 lifecycle events)
+# Hook pipeline (Track G — 26 lifecycle events)
 
 v0.7.0 ships a programmable extension surface that fires on every
 substrate lifecycle point. Hooks return one of `Allow`,
@@ -42,7 +42,7 @@ fail_mode = "open"       # open (default) | closed
 
 Fields ([`src/hooks/config.rs:174-190`](../src/hooks/config.rs)):
 
-- **`event`** — one of the 27 events below.
+- **`event`** — one of the 26 events below.
 - **`command`** — absolute path to the helper binary.
 - **`priority`** — higher fires first; first `Deny` short-circuits the chain.
 - **`timeout_ms`** — wall-clock budget per call; capped at
@@ -111,7 +111,7 @@ run UNGOVERNED while the presence gate reads as satisfied. `ai-memory doctor
 --hooks` flags exactly this config; add a `namespace = "*"` hook to cover the
 rest. Namespace-qualified `required_events` is tracked as a follow-up.
 
-## 27-event matrix
+## 26-event matrix
 
 The 20 baseline events:
 
@@ -126,7 +126,6 @@ The 20 baseline events:
 | `pre_consolidate` / `post_consolidate` | write | Write | `memory_consolidate` |
 | `pre_governance_decision` / `post_governance_decision` | gate | Write | governance pipeline |
 | `on_index_eviction` | maintenance | Index | HNSW eviction |
-| `pre_archive` | write | Write | archive-on-GC + manual archive |
 | `pre_transcript_store` / `post_transcript_store` | write | Transcript | transcript sidechain writes |
 
 The 5 grand-slam additions:
@@ -296,7 +295,7 @@ Pinned by [`tests/hooks_executor_test.rs`](../tests/hooks_executor_test.rs),
    hook count). The capabilities `hooks` block
    (`memory_capabilities` over MCP, e.g.
    `printf '<JSON-RPC tools/call>' | ai-memory mcp --profile full`)
-   reports `hook_events_count` (27) and `registered_count` — it does
+   reports `hook_events_count` (26) and `registered_count` — it does
    not enumerate per-event hook rows.
 
 ## Tuning guidance

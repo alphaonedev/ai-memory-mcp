@@ -41,7 +41,6 @@ const ALL_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent::PreGovernanceDecision,
     HookEvent::PostGovernanceDecision,
     HookEvent::OnIndexEviction,
-    HookEvent::PreArchive,
     HookEvent::PreTranscriptStore,
     HookEvent::PostTranscriptStore,
     HookEvent::PreRecallExpand,
@@ -67,37 +66,38 @@ fn arch_7_all_hook_events_classified_by_is_pre_event() {
 }
 
 #[test]
-fn arch_7_hook_event_count_matches_documented_27() {
-    // CLAUDE.md narrative documents the HookEvent variant count
-    // (25 at v0.7.0; 27 at v0.8.0 after #1709 adds pre_signal_send +
-    // post_signal_ack). Mechanically pin the count so doc + code stay
-    // in lockstep. A future addition to `ALL_HOOK_EVENTS` should
-    // come with a CLAUDE.md narrative bump and a count update here.
+fn arch_7_hook_event_count_matches_documented_26() {
+    // Narrative documents the HookEvent variant count (25 at v0.7.0;
+    // 27 at v0.8.0 after #1709 adds pre_signal_send + post_signal_ack;
+    // 26 at v1.0.0 after #2637 removes the never-fired pre_archive).
+    // Mechanically pin the count so doc + code stay in lockstep. A
+    // future addition to `ALL_HOOK_EVENTS` should come with a narrative
+    // bump and a count update here.
     assert_eq!(
         ALL_HOOK_EVENTS.len(),
-        27,
+        26,
         "ARCH-7 hook event count drift: ALL_HOOK_EVENTS has {} entries; \
-         expected 27 per the v0.8.0 CLAUDE.md / src/hooks/events.rs SSOT. \
-         Update the test AND CLAUDE.md when adding a variant.",
+         expected 26 per the v1.0.0 src/hooks/events.rs SSOT (#2637 removed pre_archive). \
+         Update the test when adding or removing a variant.",
         ALL_HOOK_EVENTS.len(),
     );
 }
 
 #[test]
-fn arch_7_pre_event_count_is_fourteen() {
-    // 14 pre-events: PreStore, PreRecall, PreSearch, PreDelete,
+fn arch_7_pre_event_count_is_thirteen() {
+    // 13 pre-events: PreStore, PreRecall, PreSearch, PreDelete,
     // PrePromote, PreLink, PreConsolidate, PreGovernanceDecision,
-    // PreArchive, PreTranscriptStore, PreRecallExpand, PreReflect,
-    // PreCompaction, PreSignalSend (v0.8.0 #1709). The remaining 13
-    // are post-/on-class.
+    // PreTranscriptStore, PreRecallExpand, PreReflect, PreCompaction,
+    // PreSignalSend (v0.8.0 #1709). #2637 removed the never-fired
+    // PreArchive (14 → 13). The remaining 13 are post-/on-class.
     let pre_count = ALL_HOOK_EVENTS
         .iter()
         .copied()
         .filter(|&ev| is_pre_event(ev))
         .count();
     assert_eq!(
-        pre_count, 14,
+        pre_count, 13,
         "ARCH-7 pre-event count drift: {pre_count} variants classify as pre-events; \
-         expected 14. If a new pre-event was added, bump this expectation in lockstep.",
+         expected 13. If a pre-event was added/removed, bump this expectation in lockstep.",
     );
 }
