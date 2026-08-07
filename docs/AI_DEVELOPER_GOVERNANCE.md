@@ -623,13 +623,69 @@ source is reserved for content the user dictated or corrected.
 
 ## 5. Review Requirements
 
-### 5.1 Mandatory human review
+### 5.0 Review model (single-authority)
 
-- **All AI-authored PRs require human review before merge.** No exceptions.
-- PRs to `main` require approval from `@alphaonedev` (CODEOWNERS), per
-  [`ENGINEERING_STANDARDS.md` §1.3](ENGINEERING_STANDARDS.html).
-- PRs to `develop` require at least one human review for AI-authored changes, even
-  though `develop` does not currently enforce this in branch protection.
+This project runs under the operator's **single-authority** model: only the
+`@alphaonedev` account — and the AI-NHI agents acting under it — authors,
+reviews, and merges work (see §"Sole-authority operator" in the repo
+guidance). One consequence is mechanical and is easily mistaken for
+negligence, so it is stated plainly here: **GitHub's
+`required_approving_review_count` is `0`, and it cannot be anything else.**
+The same authority authors and merges every PR, and GitHub forbids a PR
+author from approving their own PR, so no second account can ever supply a
+required approving review. A `required_pull_request_reviews` block or a
+`CODEOWNERS`-enforced "require review from Code Owners" setting would
+therefore gate nothing — it would either be unsatisfiable (blocking every PR
+forever) or bypassed by admin merge. `.github/CODEOWNERS` (`* @alphaonedev`)
+is retained as a routing / notification marker, **not** an enforced merge
+gate.
+
+Review is real, but it is delivered in **three layers**, and none of them is
+an independent per-PR human approval — that is structurally impossible under
+single authority:
+
+1. **AI layer (per-PR) — substantive, but NOT independent of the merger.**
+   Fable 5 code-reviews AND security-audits every PR before merge; a green CI
+   run is explicitly **not** sufficient (operator directive). Because Fable 5
+   acts under the same single authority that merges, this review is
+   substantive but not independent of the merger. Evidence lands in the
+   per-merge close comments ("Fable 5 review-verified") and the
+   `.local-runs/fable-audit-*` audit artifacts.
+
+2. **Independent human layer (per-release) — the operator-gated tag-cut.**
+   The GA tag-cut is operator-gated: the human sole-authority reviews the
+   full release before cutting the tag (see the release gate in the repo
+   guidance). This is the genuinely independent review, at **release**
+   granularity rather than per-PR.
+
+3. **Mechanical layer (per-PR) — CI + admin enforcement.** Every PR to a
+   protected release branch must pass the required CI status checks with
+   `enforce_admins: true` (no admin bypass of CI) and `strict: true` (branch
+   must be up to date before merge). The required-context set is the CB-1
+   SSOT — the **32** contexts declared in
+   `scripts/qc-allowlists/required-contexts-release.txt`, mechanically
+   verified against the workflows on every PR.
+
+So "review before merge" in the sections below means the AI + mechanical
+layers per-PR **plus** the independent human layer per-release — not an
+independent per-PR human approving review, which the single-authority model
+makes impossible. `.github/branch-protection.yml` is documentation only:
+nothing reads or applies it, and it declares no check set (#2443 / #2475).
+
+### 5.1 Review before merge
+
+- **Every AI-authored PR is reviewed before merge** — by the per-PR AI layer
+  (Fable 5 code-review + security-audit) and the per-PR mechanical layer
+  (required CI + `enforce_admins`), plus the independent per-release operator
+  review at the GA tag-cut (§5.0). This is **not** an independent per-PR
+  human approving review: under the single-authority model no second account
+  exists to supply one, so GitHub's `required_approving_review_count` is `0`
+  (§5.0) — a mechanical consequence of the model, not a missing control.
+- The `@alphaonedev` `CODEOWNERS` entry and any "N required approving reviews"
+  branch-protection setting are **not** operative per-PR gates here (§5.0);
+  `CODEOWNERS` serves as a routing / notification marker only.
+- On `develop`, likewise, no independent approving review is required or
+  enforceable — the same three-layer model (§5.0) applies.
 
 ### 5.2 Quality gates (CI + local)
 
@@ -655,6 +711,14 @@ come from humans, and — for AI-authored PRs — must come specifically from th
 single approver designated in §5.4.
 
 ### 5.4 Sole approver for AI-authored PRs
+
+> **Single-authority note (§5.0).** This section states *who could ever* be a
+> valid approver — it is a policy ceiling, not a description of an enforced
+> per-PR gate. Under the single-authority model `@alphaonedev` cannot
+> self-approve, so `required_approving_review_count` is `0` and no approving
+> review is collected in the normal flow; the operative controls are the
+> three-layer model in §5.0. `CODEOWNERS` remains `* @alphaonedev` as a
+> routing / notification marker, not an enforced approval gate.
 
 **Only `@alphaonedev` may approve PRs whose commits carry the AI agent
 `Co-Authored-By:` trailer (per §4.1), regardless of which approved agent class

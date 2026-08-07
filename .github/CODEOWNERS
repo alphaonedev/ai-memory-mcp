@@ -1,2 +1,8 @@
-# All files require review from the project owner
+# Routing / notification marker only — NOT an enforced merge gate.
+# Under the operator's single-authority model, @alphaonedev (and the AI-NHI
+# agents acting under it) authors and merges every PR, so GitHub's
+# required_approving_review_count is 0: no second account can supply an
+# approving review, and self-approval is forbidden. "Require review from Code
+# Owners" is therefore NOT enabled — it would gate nothing. See the
+# single-authority review model in docs/AI_DEVELOPER_GOVERNANCE.md §5.0.
 * @alphaonedev
