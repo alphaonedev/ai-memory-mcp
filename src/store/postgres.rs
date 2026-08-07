@@ -1486,6 +1486,27 @@ impl PostgresStore {
             }
         );
 
+        // v1.0.0 #2613 — capability-honesty signal. `Capabilities.kg_backend`
+        // reports `Age` when the extension is installed, but `find_paths`
+        // resolution is served by the relational recursive-CTE over the
+        // durable `memory_links` on BOTH backends (since #2582 — the AGE
+        // Cypher traversal is unreachable on the pinned AGE version and never
+        // wins the measured crossover). The per-CALL `warn_age_fallback_pair`
+        // was removed (it fired on 100% of AGE `find_paths` calls carrying
+        // zero information); this one-shot per-boot WARN is its honest
+        // replacement, so an AGE deployment can still tell that `find_paths`
+        // is CTE-served rather than assuming an AGE graph traversal it does
+        // not get. `kg_query` / `kg_timeline` / `lineage` DO use AGE Cypher.
+        if matches!(kg_backend, KgBackend::Age) {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                kg_backend = %kg_backend,
+                "find_paths on this AGE deployment is served by the relational \
+                 recursive-CTE, not an AGE Cypher traversal (#2582/#2613); \
+                 kg_query/kg_timeline/lineage still use AGE Cypher"
+            );
+        }
+
         // v0.7.0.1 G4 — when AGE is the resolved KG backend, ensure
         // the `memory_graph` projection exists at connect time so
         // every subsequent link write can `MERGE` nodes/edges into it
@@ -9475,12 +9496,19 @@ impl PostgresStore {
         // here for exactly that read-your-own-write reason; `sync` mode now
         // gets the same guarantee.
         //
-        // `find_paths_cypher` + its builder are RETAINED (not deleted):
-        // they still back the #2032 L4 Cypher-injection guard unit tests and
-        // the live-AGE equivalence suites. Follow-up work — port it to the
-        // #2511 Rust-side-filter shape or delete it, plus the capability
-        // honesty item so an AGE deployment can still tell that `find_paths`
-        // is CTE-served — is tracked separately.
+        // v1.0.0 #2613 — `find_paths_cypher` + its
+        // `build_find_paths_current_view_cypher` builder are DELETED (not
+        // retained). Since #2582 the dispatcher hardcodes the CTE on BOTH
+        // backends and the measurements above prove the AGE traversal can
+        // never win at any depth, so a ported Cypher path would only ever be
+        // parseable dead code advertising a `KgBackend::Age` capability the
+        // runtime never reaches. Deleting it — and letting the surface
+        // honestly report path resolution as CTE-served on AGE (the connect-
+        // time WARN below) — closes the honesty gap rather than papering over
+        // it. 5-agent vote (4d3ea1c5), unanimous DELETE. The #2032 L4 Cypher-
+        // injection surface it guarded is gone WITH it (no inlined-id Cypher
+        // `find_paths` statement remains to guard), and the equivalence suites
+        // now exercise the `find_paths` dispatcher — what production serves.
         self.find_paths_cte(source_id, target_id, max_depth, max_results)
             .await
     }
@@ -9565,229 +9593,6 @@ impl PostgresStore {
                     .try_get::<Vec<String>, _>("path")
                     .map_err(|e| to_store_err("read path", e))?;
                 Ok(path)
-            })
-            .collect()
-    }
-
-    /// Cypher (Apache AGE) implementation of `find_paths`.
-    ///
-    /// Wraps a `MATCH p = (s)-[*..N]-(t) RETURN [n IN nodes(p) | n.id]`
-    /// traversal in the `cypher('memory_graph', ...)` set-returning
-    /// function, ordered by `length(p)` so shorter paths land first.
-    /// Source / target ids are bound through AGE's `$vars` JSON so
-    /// user input is never interpolated into the Cypher body. The
-    /// variable-length pattern's upper bound IS interpolated — Cypher
-    /// does not accept a parameter there — but `validate_find_paths_depth`
-    /// already clamps it to a small bounded integer with no injection
-    /// surface.
-    ///
-    /// # Errors
-    ///
-    /// Returns `StoreError::InvalidInput` for an out-of-range
-    /// `max_depth`; `StoreError::BackendUnavailable` for any sqlx or
-    /// AGE error.
-    pub async fn find_paths_cypher(
-        &self,
-        source_id: &str,
-        target_id: &str,
-        max_depth: Option<usize>,
-        max_results: Option<usize>,
-    ) -> StoreResult<Vec<Vec<String>>> {
-        let depth = max_depth.unwrap_or(FIND_PATHS_DEFAULT_DEPTH_SAL);
-        validate_find_paths_depth(depth)?;
-        let cap = max_results
-            .unwrap_or(FIND_PATHS_DEFAULT_LIMIT_SAL)
-            .clamp(1, FIND_PATHS_MAX_LIMIT_SAL);
-
-        if source_id == target_id {
-            return Ok(vec![vec![source_id.to_string()]]);
-        }
-
-        // AGE requires `ag_catalog` on the search path and the extension
-        // loaded into the session. Same shape as `kg_query_cypher`.
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err(CTX_BEGIN_AGE_TX, e))?;
-
-        // #1640 — tolerated LOAD (see load_age_tolerated): a role-level
-        // LOAD refusal must not fail the query on fleets where
-        // shared_preload_libraries provides the library.
-        load_age_tolerated(&mut tx).await?;
-        sqlx::query(SQL_SET_AGE_SEARCH_PATH)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| to_store_err(CTX_SET_SEARCH_PATH, e))?;
-
-        // v0.7.0 ship-hardening (2026-05-19): the prior shape
-        // `RETURN reduce(s = a.id, n IN nodes(p)[1..] | s + '->' +
-        // n.id) AS path` is REJECTED at parse time by AGE 1.6.0 with
-        // `syntax error at or near "|"`. AGE 1.5.0 accepted reduce
-        // bodies containing `|`; AGE 1.6.0's grammar narrowed the
-        // `|` recovery point and now treats it as the list-comprehension
-        // pipe separator only — making `reduce(... | ...)` ambiguous
-        // with `[var IN list | expr]` and rejected entirely. Direct
-        // psql PREPARE/EXECUTE confirms: the reduce form errors, the
-        // list-comp form errors with "could not find properties for n"
-        // (same grammar narrowing), and the alternative `UNWIND + collect`
-        // form silently returns an empty path. The ONLY portable shape
-        // that survives both AGE 1.5 and 1.6 is `RETURN nodes(p)` which
-        // returns the vertex list directly; the Rust-side decode then
-        // strips AGE's text-format `::vertex` type tags and pulls each
-        // `properties.id` to reconstruct the path.
-        //
-        // The variable-length pattern stays `-[*1..N]-` (un-arrowed,
-        // explicit lower bound) per the symmetric-closure contract
-        // from the CTE branch — matching either declared edge
-        // direction. AGE 1.6.0 accepts this shape; the `convert_cypher_to_subquery`
-        // pattern walker round-trips it correctly.
-        // v0.7.0 ship-hardening (2026-05-19): use 2-arg `cypher()` with
-        // IDs inlined into the cypher body instead of a 3-arg form with
-        // a params dict. Empirical findings via PREPARE/EXECUTE + raw
-        // SQL in psql + sqlx round-trips:
-        //
-        //   * 3-arg `cypher(graph, body, params)` with `params` bound
-        //     via sqlx's `Agtype` binary wrapper → cypher executes
-        //     without error but matches 0 rows (the `$start_id` /
-        //     `$target_id` variable substitution doesn't happen — the
-        //     binary protocol's agtype encoding does not surface the
-        //     params dict's keys to AGE's cypher analyzer).
-        //   * 3-arg `cypher(graph, body, '{"…"}'::agtype)` with an
-        //     INLINE agtype literal → AGE 1.5/1.6 rejects: "third
-        //     argument of cypher function must be a parameter" (the
-        //     `Const` node it sees isn't accepted).
-        //   * 2-arg `cypher(graph, body)` with the IDs inlined into
-        //     the cypher TEXT (WHERE a.id = 'literal') → works on
-        //     both AGE 1.5 and 1.6, returns matched paths correctly.
-        //
-        // We take the 2-arg path. Source and target IDs are
-        // UUID-validated upstream (`validate_memory_id`) so the
-        // inlined values are safe from SQL injection; the
-        // defense-in-depth `assert_age_id_safe()` check below rejects
-        // any residual id that doesn't match `[A-Za-z0-9_-]+` before
-        // it reaches the format string. The `reduce(... | ...)`
-        // string-join shape from earlier was ALSO broken on AGE
-        // 1.6 (the `|` separator became unparseable in reduce
-        // bodies); the new cypher uses `RETURN nodes(p)` and the
-        // Rust-side decode pulls each vertex's `properties.id` to
-        // reconstruct the chain.
-        assert_age_id_safe(source_id).map_err(|detail| StoreError::InvalidInput { detail })?;
-        assert_age_id_safe(target_id).map_err(|detail| StoreError::InvalidInput { detail })?;
-
-        // #1689 — current-view path-finding MUST exclude invalidated edges,
-        // matching sqlite `db::find_paths`, `find_paths_cte` (both UNION arms),
-        // and `kg_query_cypher`. `kg_invalidate_cypher` SETs `r.valid_until`
-        // on the edge (it does NOT delete it), so the
-        // `ALL(e IN relationships(p) ...)` guard drops any path that traverses
-        // an invalidated edge. The `IS NULL OR` arm is load-bearing: this
-        // traversal matches UNTYPED edges, and relations that never carry an
-        // invalidation (e.g. `supersedes`, or a never-retracted `related_to`)
-        // have NO `valid_until` property — `IS NULL` keeps them, so the filter
-        // can never silently drop uninvalidated paths. The cut-off is inlined
-        // as an RFC3339 `+00:00` literal (find_paths uses the 2-arg `cypher()`
-        // form — see the param-binding note above — so it cannot bind `$now`);
-        // `to_rfc3339()` output contains no single quote, so no injection
-        // surface. Defense in depth: if an AGE build rejects the
-        // `relationships()`/`ALL()` predicate, the `find_paths` dispatcher's
-        // `is_age_runtime_failure` arm falls back to the correct
-        // `find_paths_cte`.
-        let now_stamp = Utc::now().to_rfc3339();
-        // #2032 L4 — builder is now self-guarding; propagate its id-safety
-        // error the same way the upstream checks map to InvalidInput.
-        let find_paths_cypher =
-            build_find_paths_current_view_cypher(source_id, target_id, depth, cap, &now_stamp)
-                .map_err(|detail| StoreError::InvalidInput { detail })?;
-        let sql = format!(
-            "SELECT path FROM cypher('memory_graph', $$ {find_paths_cypher} $$) AS (path agtype)"
-        );
-        // #1482 — per-call-unique cypher text (inlined source/target
-        // ids + depth + cap); run unnamed so it never enters the
-        // prepared-statement cache and evicts reusable hot statements.
-        let rows = sqlx::query(&sql)
-            .persistent(false)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("cypher find_paths", e))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| to_store_err(CTX_COMMIT_AGE_TX, e))?;
-
-        // AGE returns each `path` cell as a JSON-encoded string
-        // (agtype string) of the shape `"id1->id2->…"` — `reduce`
-        // walks a `nodes(p)[1..]` slice and appends `'->' + n.id` per
-        // step starting from `a.id`. Decode through the [`Agtype`]
-        // wrapper so sqlx's binary-protocol path strips the version
-        // byte; the resulting payload is a JSON string literal that
-        // we parse and then split on `->` to recover the path.
-        rows.iter()
-            .map(|r| {
-                let raw: Agtype = r
-                    .try_get::<Agtype, _>("path")
-                    .map_err(|e| to_store_err("read path", e))?;
-                // AGE serialises strings as JSON-quoted strings (e.g.
-                // `"abc"`); parse as JSON to strip the
-                // quotes and decode any escapes the encoder applied.
-                // `raw.0` is AGE's text format for a vertex list:
-                //   `[{"id":..., "label":"Memory",
-                //      "properties":{"id":"uuid1"}}::vertex,
-                //     {"id":..., "properties":{"id":"uuid2"}}::vertex, ...]`
-                // The `::vertex` (and `::edge`, `::path`) suffixes are
-                // AGE's text-format type tags and are NOT valid JSON.
-                // Strip them, parse as JSON, then pull each
-                // `properties.id` to reconstruct the chain.
-                let json_payload = raw
-                    .0
-                    .replace("::vertex", "")
-                    .replace("::edge", "")
-                    .replace("::path", "");
-                // QC Obs #8 (2026-05-20): cap echoed payload at 200
-                // chars in error messages so an unbounded malformed
-                // response doesn't blow up the log / response body.
-                let payload_preview = |s: &str| -> String {
-                    if s.len() <= 200 {
-                        s.to_string()
-                    } else {
-                        // #1895 — truncate on a CHAR boundary, never a raw
-                        // byte index: `&s[..200]` panics with "byte index 200
-                        // is not a char boundary" when offset 200 falls inside
-                        // a multi-byte UTF-8 sequence. This helper runs on the
-                        // JSON-parse-FAILURE path over `raw.0` (arbitrary /
-                        // adversarial AGE bytes), so ASCII cannot be assumed.
-                        let end = s.char_indices().nth(200).map_or(s.len(), |(i, _)| i);
-                        format!("{}…<{}b truncated>", &s[..end], s.len() - end)
-                    }
-                };
-                let arr: serde_json::Value = serde_json::from_str(&json_payload).map_err(|e| {
-                    StoreError::IntegrityFailed {
-                        detail: format!(
-                            "non-JSON AGE path payload: {}: {e}",
-                            payload_preview(&raw.0)
-                        ),
-                    }
-                })?;
-                let nodes = arr.as_array().ok_or_else(|| StoreError::IntegrityFailed {
-                    detail: format!("AGE path is not an array: {}", payload_preview(&raw.0)),
-                })?;
-                let ids: Vec<String> = nodes
-                    .iter()
-                    .filter_map(|v| {
-                        v.get(field_names::PROPERTIES)
-                            .and_then(|p| p.get("id"))
-                            .and_then(|i| i.as_str())
-                            .map(String::from)
-                    })
-                    .collect();
-                if ids.is_empty() {
-                    return Err(StoreError::IntegrityFailed {
-                        detail: format!(
-                            "AGE path has no extractable ids: {}",
-                            payload_preview(&raw.0)
-                        ),
-                    });
-                }
-                Ok(ids)
             })
             .collect()
     }
@@ -10111,8 +9916,10 @@ impl PostgresStore {
         // v0.7.0.1 G4 — wrap the SQL `INSERT INTO memory_links` write
         // and the AGE `memory_graph` projection MERGE in a single
         // transaction so a successful link write never leaves a
-        // stale AGE projection that would surface as `paths_found=0`
-        // on `find_paths_cypher` (HALT v0.7.0 R1 S65). When the
+        // stale AGE projection that would surface as an empty result
+        // on the AGE Cypher readers `kg_query`/`kg_timeline` (HALT
+        // v0.7.0 R1 S65; `find_paths` reads `memory_links` via the CTE
+        // and is unaffected). When the
         // adapter resolved the CTE backend at connect time the AGE
         // branch is a no-op — the recursive-CTE path reads from
         // `memory_links` directly.
@@ -10181,10 +9988,12 @@ impl PostgresStore {
                 // best-effort. The relational `memory_links` insert
                 // above is the canonical source of truth — the AGE
                 // graph projection is a query-acceleration mirror used
-                // by the cypher-backed `find_paths_cypher` path, which
-                // already falls back to the recursive CTE
+                // by the cypher-backed `kg_query`/`kg_timeline`/`lineage`
+                // readers, which already fall back to the recursive CTE
                 // (`is_age_runtime_failure` → `warn_age_fallback`) when
-                // AGE is unavailable at query time.
+                // AGE is unavailable at query time. (`find_paths` reads
+                // `memory_links` via the CTE directly and never touches
+                // this projection — #2613.)
                 //
                 // Pre-fix: any AGE runtime failure here (e.g. the test
                 // postgres user lacking permission to `LOAD 'age'`)
@@ -10249,8 +10058,10 @@ impl PostgresStore {
                             err = %e,
                             "AGE projection skipped on link insert — \
                              relational memory_links row still committed. \
-                             find_paths_cypher will degrade to CTE fallback for \
-                             queries that traverse this edge."
+                             kg_query/kg_timeline over this edge may see a \
+                             stale AGE projection until it is rebuilt; \
+                             find_paths reads memory_links via the CTE and \
+                             stays correct."
                         );
                     }
                     Err(e) => return Err(e),
@@ -14211,9 +14022,8 @@ fn assert_age_id_safe(id: &str) -> Result<(), String> {
 /// # #2511 — only AGE-PARSEABLE constructs may appear here
 ///
 /// The pre-#2511 body used two constructs Apache AGE's Cypher parser
-/// does NOT implement, verified live against AGE 1.7.0 (and matching the
-/// v0.7.0 ship-hardening note on `find_paths_cypher`, which hit the same
-/// wall for `reduce`):
+/// does NOT implement, verified live against AGE 1.7.0 (the same grammar
+/// wall the deleted `find_paths` AGE reader hit for `reduce`, #2613):
 ///
 /// * `ALL(e IN relationships(p) WHERE …)` — the list predicate for the
 ///   #1689 temporal-validity guard. `ERROR: syntax error at or near "("`.
@@ -14307,9 +14117,10 @@ fn age_last_edge_relation(edges: &[serde_json::Value]) -> String {
 /// which is JSON plus a `::vertex` / `::edge` / `::path` type tag after
 /// each element. Strip the tags, parse, and return the elements.
 ///
-/// Shared by [`PostgresStore::kg_query_cypher`] and
-/// [`PostgresStore::find_paths_cypher`] so the two AGE readers cannot
-/// drift on the payload contract.
+/// Used by [`PostgresStore::kg_query_cypher`] (and the sibling AGE
+/// timeline/lineage readers) so every AGE-payload decode shares one
+/// contract. (`find_paths` no longer has an AGE reader — #2613 deleted
+/// `find_paths_cypher`; it is served by the relational CTE.)
 fn age_decode_entity_list(what: &str, raw: &str) -> StoreResult<Vec<serde_json::Value>> {
     // QC Obs #8 (2026-05-20) / #1895 — cap the echoed payload at 200
     // CHARS (never a raw byte index: `&s[..200]` panics mid-UTF-8) so an
@@ -14384,70 +14195,6 @@ fn age_path_edges_all_current(edges: &[serde_json::Value], now_stamp: &str) -> b
             Some(_) => false,
         }
     })
-}
-
-/// #1689 — builds the current-view `find_paths` Cypher body for the AGE
-/// backend, including the per-edge temporal-validity filter that excludes
-/// invalidated edges.
-///
-/// `find_paths` uses the 2-arg `cypher()` form (AGE rejects the params dict
-/// in the 3-arg form for this shape — see the call-site note), so the
-/// source/target ids and the `now` cut-off are INLINED into the Cypher text.
-/// The ids are `assert_age_id_safe`-validated at the call site and `now` is
-/// an `Utc::now().to_rfc3339()` stamp (no single quote), so the inlined
-/// literals carry no injection surface.
-///
-/// The traversal matches UNTYPED edges (`-[*1..depth]-`); the
-/// `e.valid_until IS NULL` arm keeps every edge that was never invalidated
-/// (relations like `supersedes`, or never-retracted `related_to`, have no
-/// `valid_until` property), so the filter only drops genuinely-invalidated
-/// edges — it can never silently drop uninvalidated paths.
-///
-/// # KNOWN DEFECT — same class as #2511, deliberately NOT fixed here
-///
-/// `ALL(e IN relationships(p) WHERE …)` is **unparseable on Apache AGE**
-/// (`ERROR: syntax error at or near "("`, verified live on AGE 1.7.0 —
-/// `ANY` / `NONE` / `filter(…)` / list comprehensions fail identically).
-/// So this whole statement is rejected at parse time and
-/// [`PostgresStore::find_paths`]'s `is_age_runtime_failure` arm has been
-/// silently serving EVERY AGE-routed `find_paths` from
-/// `find_paths_cte` — the #2511 defect class, reached through a different
-/// door (this builder uses the 2-arg `cypher()` form, so the #2511
-/// third-argument fix does not touch it).
-///
-/// The `kg_query` twin was fixed by moving the guard Rust-side (see
-/// [`build_kg_query_current_view_cypher`] +
-/// [`age_path_edges_all_current`]). Porting that here needs two decisions
-/// that warrant their own review and are NOT taken in #2511's scope:
-/// (a) `LIMIT {cap}` currently applies BEFORE the guard, so a Rust-side
-/// filter can return fewer than `cap` paths unless the fetch over-fetches;
-/// (b) whether `find_paths_cte`'s visibility/lifecycle semantics need the
-/// same explicit re-derivation `kg_query_cypher` now performs. Tracked as
-/// a residual on #2511.
-fn build_find_paths_current_view_cypher(
-    source_id: &str,
-    target_id: &str,
-    depth: usize,
-    cap: usize,
-    now_stamp: &str,
-) -> Result<String, String> {
-    // #2032 L4 — defense-in-depth co-location. This builder INLINES
-    // `source_id`/`target_id` into the Cypher text (the 2-arg `cypher()`
-    // form cannot bind them), so the id-safety invariant MUST hold HERE,
-    // not only at the current call site. A future caller that inlines
-    // these ids without the upstream check cannot silently reintroduce
-    // AGE Cypher injection. Release-active (returns `Err`), NOT a
-    // `debug_assert!` (which compiles out of release builds).
-    assert_age_id_safe(source_id)?;
-    assert_age_id_safe(target_id)?;
-    Ok(format!(
-        "MATCH p = (a)-[*1..{depth}]-(b) \
-         WHERE a.id = '{source_id}' AND b.id = '{target_id}' \
-           AND ALL(e IN relationships(p) WHERE e.valid_until IS NULL OR e.valid_until > '{now_stamp}') \
-         RETURN nodes(p) AS path \
-         ORDER BY length(p) ASC \
-         LIMIT {cap}"
-    ))
 }
 
 /// v0.7.0.1 G2 — sqlx-bindable wrapper for AGE's `agtype` parameter
@@ -14853,8 +14600,8 @@ async fn project_link_into_age(
     // MERGE the directional edge typed by the SAL relation value so
     // `kg_query_cypher`'s `[r:related_to*1..N]` matcher resolves
     // directly. The relation property is also stored on the edge so
-    // typeless traversals (`find_paths_cypher`) can read it back
-    // through `last(r).relation` without a second lookup.
+    // the Rust-side readers (`age_last_edge_relation`) can pull it back
+    // without a second lookup.
     //
     // #2377 (FIX #9) — thread the row's temporal-validity onto the edge.
     // Pre-fix the MERGE carried only `{relation}`, so a link BORN with
@@ -18607,8 +18354,9 @@ impl MemoryStore for PostgresStore {
                         err = %e,
                         "AGE edge unprojection skipped on link delete — \
                          relational memory_links row(s) still removed. \
-                         find_paths_cypher may traverse a phantom edge until \
-                         the projection is rebuilt; the relational CTE is correct."
+                         kg_query/kg_timeline may traverse a phantom edge until \
+                         the projection is rebuilt; the relational CTE (and \
+                         find_paths, which uses it) is correct."
                     );
                 }
                 Err(e) => return Err(e),
@@ -23797,8 +23545,10 @@ impl MemoryStore for PostgresStore {
                                 err = %e,
                                 "AGE projection skipped on archive_restore — \
                                  relational memory_links row still committed. \
-                                 find_paths_cypher will degrade to CTE fallback \
-                                 for queries that traverse this edge."
+                                 kg_query/kg_timeline over this edge may see a \
+                                 stale AGE projection until it is rebuilt; \
+                                 find_paths reads memory_links via the CTE and \
+                                 stays correct."
                             );
                         }
                         Err(e) => return Err(e),
@@ -27456,26 +27206,6 @@ mod tests {
     }
 
     #[test]
-    fn build_find_paths_cypher_self_guards_unsafe_ids_2032() {
-        // #2032 L4 — the builder must reject an unsafe id ITSELF (defense in
-        // depth), not only rely on the upstream call-site check. A future
-        // caller that inlines ids without the upstream guard cannot silently
-        // re-open AGE Cypher injection.
-        let ts = "2026-07-15T00:00:00Z";
-        assert!(build_find_paths_current_view_cypher("a'b", "ok", 3, 10, ts).is_err());
-        assert!(build_find_paths_current_view_cypher("ok", "b'; MATCH", 3, 10, ts).is_err());
-        // A pair of safe ids still builds.
-        let good = build_find_paths_current_view_cypher(
-            "0f8fad5b-d9cb-469f-a165-70867728950e",
-            "9c858901-8a57-4791-81fe-4c455b099bc9",
-            3,
-            10,
-            ts,
-        );
-        assert!(good.is_ok());
-    }
-
-    #[test]
     fn assert_age_id_safe_rejects_double_quote_and_backtick() {
         assert!(assert_age_id_safe("a\"b").is_err());
         assert!(assert_age_id_safe("a`b").is_err());
@@ -28371,55 +28101,6 @@ mod tests {
         assert!(!age_edge_is_lineage_relation(&serde_json::json!({
             "properties": { "relation": 7 }
         })));
-    }
-
-    #[test]
-    fn issue_1689_find_paths_cypher_excludes_invalidated_edges() {
-        // #1689 — the AGE current-view find_paths body MUST carry the same
-        // per-edge temporal-validity guard as kg_query / the CTE path, so a
-        // retracted link no longer influences path-finding. find_paths inlines
-        // its ids + cut-off (2-arg cypher form), so the guard compares against
-        // an inlined RFC3339 literal rather than a `$now` param.
-        //
-        // These are arbitrary INPUT fixtures fed to the builder; the
-        // assertions below prove the builder round-trips each input verbatim
-        // into the emitted Cypher (the format text — `a.id =`, `[*1..N]`,
-        // `LIMIT` — is the generic openCypher the builder produces).
-        let (src, dst, depth, cap, now) = (
-            "11111111-1111-1111-1111-111111111111",
-            "22222222-2222-2222-2222-222222222222",
-            4usize,
-            10usize,
-            "2026-06-15T00:00:00+00:00",
-        );
-        // #2032 L4 — builder now returns Result (self-guards ids); these are
-        // safe UUIDs so it builds.
-        let cypher = build_find_paths_current_view_cypher(src, dst, depth, cap, now)
-            .expect("safe ids build");
-        assert!(
-            cypher.contains(&format!(
-                "ALL(e IN relationships(p) WHERE e.valid_until IS NULL OR e.valid_until > '{now}')"
-            )),
-            "find_paths Cypher missing the valid_until guard: {cypher}"
-        );
-        // Bounded depth interpolated into the untyped variable-length pattern.
-        assert!(
-            cypher.contains(&format!("[*1..{depth}]")),
-            "depth not interpolated: {cypher}"
-        );
-        // Source/target ids inlined (2-arg cypher form) and the cap applied.
-        assert!(
-            cypher.contains(&format!("a.id = '{src}'")),
-            "source id not inlined: {cypher}"
-        );
-        assert!(
-            cypher.contains(&format!("b.id = '{dst}'")),
-            "target id not inlined: {cypher}"
-        );
-        assert!(
-            cypher.contains(&format!("LIMIT {cap}")),
-            "cap not applied: {cypher}"
-        );
     }
 
     #[test]
@@ -32805,9 +32486,14 @@ mod tests {
             .await
             .expect("drain kg projection outbox");
         assert!(drained <= 100, "drain honours the batch ceiling");
+        // #2613 — exercise the `find_paths` DISPATCHER (what production
+        // serves), not the deleted `find_paths_cypher`. Since #2582 the
+        // dispatcher routes to the relational recursive-CTE over the durable
+        // `memory_links` on BOTH `KgBackend` values, so this is the true
+        // AGE-fixture path-finding path even though no Cypher is invoked.
         // The source==target shortcut is a trivial one-node path...
         let trivial = store
-            .find_paths_cypher(&a_id, &a_id, Some(2), Some(5))
+            .find_paths(&a_id, &a_id, Some(2), Some(5))
             .await
             .expect("find_paths self");
         assert_eq!(
@@ -32815,18 +32501,11 @@ mod tests {
             vec![vec![a_id.clone()]],
             "self path is the single node"
         );
-        // ...and a real two-node query executes the AGE traversal body
-        // (depth-bounded cypher build + bind + execute). The result is
-        // backend-dependent — an AGE build that lags the link projection
-        // yields an empty set, and older AGE point-releases reject the
-        // variable-length pattern outright — so we accept either a
-        // coherent path set or a surfaced backend error, asserting only
-        // that the traversal path does not panic and any returned path
-        // spans both endpoints.
-        match store
-            .find_paths_cypher(&a_id, &b_id, Some(3), Some(10))
-            .await
-        {
+        // ...and a real two-node query walks the A->B edge via the CTE.
+        // The link was written to `memory_links` above, so the CTE returns
+        // it deterministically regardless of AGE projection state; assert
+        // any returned path spans both endpoints.
+        match store.find_paths(&a_id, &b_id, Some(3), Some(10)).await {
             Ok(paths) => assert!(
                 paths.iter().all(|p| p.len() >= 2),
                 "any returned path spans at least the two endpoints"

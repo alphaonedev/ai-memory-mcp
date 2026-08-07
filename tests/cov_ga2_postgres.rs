@@ -12,8 +12,8 @@
 //!
 //! - The **inherent** (non-trait) public methods reachable only via the
 //!   concrete `PostgresStore`: `search_with_source_uri`,
-//!   `list_by_source_uri`, `find_paths` / `find_paths_cte` /
-//!   `find_paths_cypher` (both KG backends), `kg_query_with_history` with
+//!   `list_by_source_uri`, `find_paths` / `find_paths_cte`
+//!   (CTE-served on both KG backends, #2613), `kg_query_with_history` with
 //!   `include_invalidated`, `get_links`, `recall_observation_insert` +
 //!   `recall_observation_gc`, `taxonomy_namespaces`, `list_archived_pg`,
 //!   `list_pending_actions`, `current_embedding_dim`.
@@ -291,7 +291,7 @@ async fn find_paths_inherent_connected_and_cte_branch() {
 }
 
 #[tokio::test]
-async fn find_paths_cypher_branch_when_age_present() {
+async fn find_paths_dispatch_branch_when_age_present() {
     let Some(store) = connect().await else {
         return;
     };
@@ -309,19 +309,21 @@ async fn find_paths_cypher_branch_when_age_present() {
         .unwrap();
     store.link(&ctx, &link(&a, &b)).await.unwrap();
 
-    // find_paths_cypher is public; on an AGE-backed fixture it exercises
-    // the Cypher enumeration + agtype-string peeling. On a CTE-only DB the
-    // call may surface a backend error — tolerate it (the goal is to drive
-    // the entry path; the parity test pins identical output elsewhere).
-    match store.find_paths_cypher(&a, &b, Some(4), Some(5)).await {
+    // #2613 — drive the `find_paths` DISPATCHER (what production serves).
+    // Since #2582 it routes to the relational recursive-CTE over the durable
+    // `memory_links` on BOTH KG backends (the AGE `find_paths_cypher` reader
+    // was deleted), so on an AGE fixture the linked a->b edge yields at least
+    // one path with no Cypher invoked. Tolerate a surfaced backend error to
+    // keep the coverage driver robust across fixtures.
+    match store.find_paths(&a, &b, Some(4), Some(5)).await {
         Ok(paths) => {
-            // When AGE answers, the a→b edge yields at least one path.
+            // The a->b edge yields at least one path via the CTE.
             let _ = paths;
         }
         Err(StoreError::BackendUnavailable { .. } | StoreError::InvalidInput { .. }) => {
-            // CTE-only fixture: the cypher path is legitimately unavailable.
+            // Fixture-dependent backend error — tolerated.
         }
-        Err(other) => panic!("unexpected find_paths_cypher error: {other:?}"),
+        Err(other) => panic!("unexpected find_paths error: {other:?}"),
     }
 }
 

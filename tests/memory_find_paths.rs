@@ -9,11 +9,10 @@
 //! max_depth?, max_results?)` that returns up to N paths through the
 //! KG between two memories using BFS with cycle detection. The
 //! implementation dispatches on the resolved `KgBackend`: `SQLite` uses
-//! a recursive CTE through `db::find_paths`; Postgres deployments
-//! either fall back to the same recursive-CTE shape via
-//! `PostgresStore::find_paths_cte` or use Cypher
-//! `MATCH p = (s)-[*..N]-(t) RETURN p` via
-//! `PostgresStore::find_paths_cypher` when AGE is installed.
+//! a recursive CTE through `db::find_paths`; Postgres deployments use
+//! the same recursive-CTE shape via `PostgresStore::find_paths_cte` on
+//! BOTH KG backends (since #2582/#2613 — the AGE Cypher `find_paths`
+//! reader was deleted as unreachable on the pinned AGE version).
 //!
 //! Scenarios pinned here:
 //! 1. Linear 3-hop chain (A→B→C→D) — `find_paths(A, D)` returns the

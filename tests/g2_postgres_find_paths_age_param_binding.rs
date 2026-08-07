@@ -3,42 +3,36 @@
 
 // clippy allows (test scaffolding): pedantic lints with no behavioral impact.
 #![allow(clippy::doc_markdown, clippy::elidable_lifetime_names)]
-//! v0.7.0.1 G2 — postgres `find_paths_cypher` must use a SQL parameter
-//! binding for AGE's `cypher()` third argument (the params jsonb), not
-//! an inlined literal.
+//! v0.7.0.1 G2 (repurposed #2613) — `POST /api/v1/kg/find_paths` on a
+//! postgres-AGE daemon must return a 200 with an enumerated path.
 //!
-//! Reproducer for HALT finding G2 from
-//! `runs/v0.7.0-a2a-cont6-cert-r1b-20260509-2148/findings/HALT.md`.
+//! ## History
+//!
+//! This began as the HALT-G2 reproducer for a postgres `find_paths_cypher`
+//! that inlined AGE's `cypher()` params dict as a literal rather than
+//! binding it (`third argument of cypher function must be a parameter`).
+//! That AGE `find_paths` reader was unreachable on the pinned AGE version
+//! and #2582 routed `find_paths` to the relational recursive-CTE
+//! UNCONDITIONALLY on both backends; #2613 DELETED the reader. The
+//! `cypher()` param-binding contract now lives with `kg_query` (#2511,
+//! `Agtype`). The Agtype wire-encoder mirror below still guards that
+//! shared binding. This test keeps its value as a live-AGE `find_paths`
+//! regression: it proves an AGE-installed daemon serves `find_paths` (via
+//! the CTE) with a 200 + at least one path, no AGE traversal invoked.
 //!
 //! ## What this test asserts
 //!
 //! 1. Boot an in-process HTTP daemon backed by [`PostgresStore`] against
-//!    a database with Apache AGE 1.5.0 enabled (so the SAL dispatcher's
-//!    `kg_backend = Age` branch lights up rather than falling back to
-//!    the recursive-CTE path).
-//! 2. Bootstrap the `memory_graph` AGE projection.
+//!    a database with Apache AGE enabled (so the SAL dispatcher resolves
+//!    `kg_backend = Age`, even though `find_paths` no longer dispatches
+//!    to it).
+//! 2. Bootstrap the `memory_graph` AGE projection (kept so the fixture is
+//!    a faithful AGE deployment; the CTE reads `memory_links`, not it).
 //! 3. Seed a 5-node chain A→B→C→D→E by POSTing memories then projecting
-//!    nodes + edges directly into the AGE graph (the `link_internal`
-//!    path doesn't mirror into AGE; the projection is normally seeded
-//!    by the J1 graph-prep scripts — this test owns its corpus).
+//!    nodes + edges directly into the AGE graph.
 //! 4. POST `{source_id: A, target_id: E, max_depth: 7}` to
 //!    `/api/v1/kg/find_paths` and assert a 200 with at least one
 //!    enumerated path.
-//!
-//! ## Pre-fix behaviour (the failure shape from S65)
-//!
-//! AGE 1.5.0 raises:
-//!
-//! ```text
-//! error returned from database: third argument of cypher function must
-//! be a parameter
-//! ```
-//!
-//! …because the postgres adapter inlines the params dict as a literal
-//! `'{"start_id":"…"}'::agtype` rather than binding it through sqlx as
-//! a `$N` placeholder. The handler converts that error to a 503
-//! "storage backend unavailable" so the cert harness sees the wire
-//! shape `503` + JSON error.
 //!
 //! ## Gating
 //!
@@ -216,7 +210,8 @@ impl<'q> sqlx::Encode<'q, sqlx::Postgres> for Agtype {
         // AGE binary format: 1-byte version (0x01) prefix, then the
         // JSON text payload. Mirrors the production-side encoder in
         // `src/store/postgres.rs::Agtype` so the test fixture
-        // exercises the same wire shape `find_paths_cypher` does.
+        // exercises the same wire shape `kg_query_cypher`'s params
+        // binding does (#2511).
         buf.push(1);
         buf.extend_from_slice(self.0.as_bytes());
         Ok(sqlx::encode::IsNull::No)
@@ -382,9 +377,10 @@ async fn g2_postgres_find_paths_age_returns_200_with_paths() {
     assert_eq!(
         status,
         reqwest::StatusCode::OK,
-        "G2: find_paths must return 200 from a postgres-AGE daemon for a \
-         valid 4-hop chain; got status={status} body={body}. Pre-fix this \
-         was a 503 with `cypher find_paths: third argument of cypher \
+        "G2/#2613: find_paths must return 200 from a postgres-AGE daemon \
+         for a valid 4-hop chain (served by the relational CTE, no AGE \
+         traversal); got status={status} body={body}. The historical AGE \
+         `find_paths_cypher` failure was a 503 `third argument of cypher \
          function must be a parameter`."
     );
 

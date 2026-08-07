@@ -39,8 +39,10 @@
 //!
 //! `link_internal` only writes to the `memory_links` SQL table — it
 //! does not run the Cypher MERGE that registers the node/edge in the
-//! AGE graph. With an empty projection, `find_paths_cypher` returns
-//! zero rows even when the SQL link table holds the chain.
+//! AGE graph. With an empty projection, the AGE Cypher readers
+//! (`kg_query`/`kg_timeline`) return zero rows even when the SQL link
+//! table holds the chain. (`find_paths` reads `memory_links` via the
+//! CTE and is unaffected — its AGE reader was deleted in #2613.)
 //!
 //! ## Gating
 //!

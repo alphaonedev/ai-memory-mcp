@@ -1,11 +1,13 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! #1482 regression — the three AGE Cypher dispatch sites
-//! (`kg_query_cypher`, `kg_timeline_cypher`, `find_paths_cypher`) build
-//! per-call-unique SQL text (inlined ids + depth + window/cap) and must
-//! run via the postgres *unnamed* statement (`.persistent(false)`), NOT
-//! the default persistent/named prepared statement.
+//! #1482 regression — the AGE Cypher dispatch sites
+//! (`kg_query_cypher`, `kg_timeline_cypher`) build per-call-unique SQL
+//! text (inlined ids + depth + window/cap) and must run via the postgres
+//! *unnamed* statement (`.persistent(false)`), NOT the default
+//! persistent/named prepared statement. (`find_paths` was a third such
+//! site until #2613 deleted its AGE reader; it is now CTE-served with
+//! stable text and correctly contributes no `cypher(` statement here.)
 //!
 //! Spun out of #1472's EXPLAIN hot-path audit. sqlx 0.8.6 defaults
 //! `Query::persistent = true` and bounds the per-connection prepared
@@ -128,11 +130,12 @@ async fn age_cypher_dispatch_never_persists_named_statements() {
             .await
             .expect("kg_timeline cypher dispatch");
         // source != target so `find_paths` doesn't take the trivial
-        // same-node early return and actually runs the cypher.
+        // same-node early return and actually runs the CTE query (#2613 —
+        // find_paths is CTE-served; it must not add a `cypher(` statement).
         store
             .find_paths(&source, &target, Some(4), Some(16))
             .await
-            .expect("find_paths cypher dispatch");
+            .expect("find_paths dispatch");
     }
 
     // Positive control: an explicitly-persistent marker statement. On the
