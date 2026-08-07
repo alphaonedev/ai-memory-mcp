@@ -213,6 +213,42 @@ async fn seed_memory(router: &axum::Router, ns: &str, title: &str, content: &str
         .to_string()
 }
 
+/// #2743 — seed a memory carrying `metadata.topic` so the topic-filtered
+/// contradiction sweep selects it. Distinct titles are now REQUIRED between
+/// co-namespace seeds: the postgres single-create honours `on_conflict`
+/// (default `error`), so two writes sharing a `(title, namespace)` no longer
+/// silently upsert to one row — they 409. The topic filter matches on
+/// `metadata.topic` (or `title`), so distinct titles plus a shared topic give
+/// two genuinely distinct contradiction candidates.
+async fn seed_memory_topic(
+    router: &axum::Router,
+    ns: &str,
+    title: &str,
+    content: &str,
+    topic: &str,
+) -> String {
+    let (status, body) = post_json(
+        router,
+        "/api/v1/memories",
+        json!({
+            "title": title,
+            "content": content,
+            "namespace": ns,
+            "agent_id": CALLER,
+            "metadata": { "topic": topic },
+        }),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "seed memory status={status} body={body}"
+    );
+    body["id"]
+        .as_str()
+        .expect("seed memory returns id")
+        .to_string()
+}
+
 macro_rules! pg_test {
     ($name:ident, $url:ident, $body:block) => {
         #[tokio::test]
@@ -488,22 +524,47 @@ pg_test!(pg_get_taxonomy_non_admin_is_403, url, {
 pg_test!(pg_detect_contradictions_pg_arm, url, {
     let r = pg_router(&url).await;
     let ns = uniq_ns();
-    // Two rows sharing a title but differing content synthesize a
-    // heuristic `contradicts` link in the pg branch.
-    seed_memory(&r, &ns, "shared topic", "the sky is blue").await;
-    seed_memory(&r, &ns, "shared topic", "the sky is green").await;
+    // #2743 — DISTINCT titles. The postgres single-create now honours
+    // `on_conflict` (default `error`), so two writes sharing a
+    // `(title, namespace)` no longer silently upsert to one row (pre-#2743 this
+    // seeded ONE row via the `ON CONFLICT (title, namespace) DO UPDATE` arm, and
+    // the array-ness assertions below passed vacuously). Two distinct rows
+    // exercise the pg candidate list + pairwise loop; the NO-topic synth arm
+    // keys on identical titles (which the single-create dedup structurally
+    // prevents), so this asserts the arm returns OK with `memories`/`links`
+    // arrays over a real two-row candidate set.
+    seed_memory(&r, &ns, "shared topic blue", "the sky is blue").await;
+    seed_memory(&r, &ns, "shared topic green", "the sky is green").await;
     let (status, body) = get(&r, &format!("/api/v1/contradictions?namespace={ns}")).await;
     assert_eq!(status, StatusCode::OK, "body={body}");
     assert_eq!(body["storage_backend"], "postgres");
-    assert!(body["memories"].is_array());
+    // Both distinct-title writes persisted (no 409, no dedup): two candidates.
+    assert_eq!(
+        body["memories"].as_array().map(Vec::len),
+        Some(2),
+        "#2743: both distinct-title single-creates persist as separate rows: {body}"
+    );
     assert!(body["links"].is_array());
 });
 
 pg_test!(pg_detect_contradictions_topic_filter_pg_arm, url, {
     let r = pg_router(&url).await;
     let ns = uniq_ns();
-    seed_memory(&r, &ns, "alpha-topic", "claim one").await;
-    seed_memory(&r, &ns, "alpha-topic", "claim two differs").await;
+    // #2743 — DISTINCT titles + a shared `metadata.topic`. Two genuinely
+    // distinct rows (single-create no longer upserts same-title writes to one)
+    // selected by the `&topic=` filter via `metadata.topic`, with differing
+    // content, so the pg heuristic synthesizes a `contradicts` link — the
+    // scenario the pre-#2743 same-title seeds only PRETENDED to exercise (they
+    // upserted to one row and synthesized nothing; the test passed vacuously).
+    seed_memory_topic(&r, &ns, "alpha-topic one", "claim one", "alpha-topic").await;
+    seed_memory_topic(
+        &r,
+        &ns,
+        "alpha-topic two",
+        "claim two differs",
+        "alpha-topic",
+    )
+    .await;
     let (status, body) = get(
         &r,
         &format!("/api/v1/contradictions?namespace={ns}&topic=alpha-topic"),
@@ -511,6 +572,14 @@ pg_test!(pg_detect_contradictions_topic_filter_pg_arm, url, {
     .await;
     assert_eq!(status, StatusCode::OK, "body={body}");
     assert_eq!(body["storage_backend"], "postgres");
+    // Both distinct rows match the topic and differ in content → the pg arm
+    // synthesizes exactly one `contradicts` link (only `contradicts` links are
+    // synthesized on this arm).
+    let links = body["links"].as_array().expect("links[]");
+    assert!(
+        links.iter().any(|l| l["synthesized"] == true),
+        "#2743: two distinct topic-matched rows must synthesize a contradicts link: {body}"
+    );
 });
 
 pg_test!(pg_detect_contradictions_missing_args_is_400, url, {
