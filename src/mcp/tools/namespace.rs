@@ -160,9 +160,62 @@ pub(crate) fn authorize_namespace_standard_bind(
     Ok(())
 }
 
+/// #2721 / CB-19 — resolve the caller for a namespace-standard mutation,
+/// distinguishing an INTERNALLY-SYNTHESIZED trusted principal from a
+/// SELF-ASSERTED wire `agent_id`.
+///
+/// `trusted_caller` is supplied OUT OF BAND by an in-process operator
+/// surface (the CLI) that legitimately acts as the reserved
+/// [`sentinels::DAEMON_PRINCIPAL`]; it is used verbatim.
+///
+/// Otherwise the caller is resolved from the (untrusted) WIRE
+/// `params.agent_id` via the wire-strict [`crate::identity::resolve_agent_id`],
+/// which runs `validate_agent_id` and therefore REJECTS every
+/// [`crate::validate::RESERVED_AGENT_IDS`] sentinel (#977). A wire caller
+/// presenting a reserved id (e.g. `agent_id="daemon"`) fails resolution and
+/// falls to [`sentinels::ANONYMOUS_INVALID`] — a non-owning principal the
+/// ownership gate refuses on any owned row — so a self-asserted wire field can
+/// never obtain the daemon/reserved authority the internal producers carve out
+/// of the cross-tenant gates. Closes the #2706/#2541 hole where `daemon` was
+/// special-cased BEFORE the strict validator.
+fn resolve_namespace_standard_caller(params: &Value, trusted_caller: Option<&str>) -> String {
+    if let Some(trusted) = trusted_caller {
+        return trusted.to_string();
+    }
+    crate::identity::resolve_agent_id(
+        params.get(param_names::AGENT_ID).and_then(|v| v.as_str()),
+        None,
+    )
+    .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string())
+}
+
+/// MCP wire entry for `memory_namespace_set_standard`. Caller identity is
+/// resolved ONLY from the untrusted wire `params.agent_id`; a reserved
+/// sentinel is never honored (#2721 / CB-19). Trusted in-process operators
+/// call [`handle_namespace_set_standard_trusted`] instead.
 pub fn handle_namespace_set_standard(
     conn: &rusqlite::Connection,
     params: &Value,
+) -> Result<Value, String> {
+    handle_namespace_set_standard_inner(conn, params, None)
+}
+
+/// Trusted in-process entry — the CLI operator surface supplies the daemon
+/// principal OUT OF BAND via `trusted_caller`, never through the wire
+/// `params.agent_id` (#2721 / CB-19). Not reachable from any wire surface, so
+/// the reserved principal it carries cannot be self-asserted by a wire caller.
+pub fn handle_namespace_set_standard_trusted(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    trusted_caller: &str,
+) -> Result<Value, String> {
+    handle_namespace_set_standard_inner(conn, params, Some(trusted_caller))
+}
+
+fn handle_namespace_set_standard_inner(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    trusted_caller: Option<&str>,
 ) -> Result<Value, String> {
     let namespace = params["namespace"]
         .as_str()
@@ -181,18 +234,16 @@ pub fn handle_namespace_set_standard(
     // audit. Namespace-standard mutations gate every downstream write;
     // the forensic-chain row MUST land before the storage write so the
     // audit trail captures intent even on validate/storage failure
-    // downstream. MCP callers resolve via `identity::resolve_agent_id`.
+    // downstream.
     //
-    // #2541 — `daemon` is a RESERVED wire id, so `validate_agent_id` rejects
-    // it and a naive resolve falls to `anonymous:invalid`. Explicit
-    // daemon principal (CLI operator / allowlisted internal callers) is
-    // accepted as the ownership-gate bypass without going through the
-    // wire-strict validator.
-    let caller = match params.get(param_names::AGENT_ID).and_then(|v| v.as_str()) {
-        Some(s) if s == sentinels::DAEMON_PRINCIPAL => sentinels::DAEMON_PRINCIPAL.to_string(),
-        other => crate::identity::resolve_agent_id(other, None)
-            .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string()),
-    };
+    // #2721 / CB-19 — the caller is resolved via
+    // `resolve_namespace_standard_caller`: a reserved sentinel (e.g.
+    // `daemon`) is honored ONLY when supplied OUT OF BAND by a trusted
+    // in-process surface (`trusted_caller`), never from the self-asserted wire
+    // `params.agent_id`, which the wire-strict `validate_agent_id` rejects
+    // (#977). A wire caller spoofing a reserved id downgrades to
+    // `anonymous:invalid` and is refused by the ownership gate below.
+    let caller = resolve_namespace_standard_caller(params, trusted_caller);
     // #929 SECURITY-high (Track A P6, 2026-05-20) — ownership gate on
     // the MCP entry. Mirrors the HTTP handler gate at
     // `handlers/hook_subscribers.rs::set_namespace_standard_inner`.
@@ -957,6 +1008,82 @@ mod tests {
         assert!(
             after.metadata.get("scope").is_none(),
             "must not stamp scope=shared on unowned bind"
+        );
+    }
+
+    /// #2721 / CB-19 — a WIRE-asserted `agent_id` equal to a reserved sentinel
+    /// (`DAEMON_PRINCIPAL`, or any other `RESERVED_AGENT_IDS` member) MUST NOT
+    /// be honored as that reserved principal: it downgrades to
+    /// `anonymous:invalid` and is refused by the #929 ownership gate on an
+    /// owned row. The daemon principal is producible ONLY out-of-band via the
+    /// trusted entry, which the internal producers (CLI operator surface) use.
+    #[test]
+    fn set_standard_wire_reserved_sentinel_is_not_honored_2721() {
+        let conn = fresh_conn();
+        let id = insert_owned(&conn, "ns-2721", "std", "ai:alice");
+
+        // (1) Wire caller spoofing DAEMON_PRINCIPAL is refused on alice's row,
+        // and is attributed to `anonymous:invalid` — NOT honored as `daemon`.
+        let err = handle_namespace_set_standard(
+            &conn,
+            &json!({
+                "namespace": "ns-2721",
+                "id": id,
+                "agent_id": sentinels::DAEMON_PRINCIPAL,
+            }),
+        )
+        .expect_err("wire agent_id=daemon must not bypass the ownership gate");
+        assert!(err.contains("does not own"), "got: {err}");
+        assert!(
+            err.contains(sentinels::ANONYMOUS_INVALID),
+            "wire daemon must downgrade to anonymous:invalid, got: {err}"
+        );
+        assert!(
+            !err.contains(&format!("caller={}", sentinels::DAEMON_PRINCIPAL)),
+            "wire daemon must never be honored as the daemon principal, got: {err}"
+        );
+        assert!(
+            db::get_namespace_standard(&conn, "ns-2721")
+                .unwrap()
+                .is_none(),
+            "a refused spoof must not have bound the standard"
+        );
+
+        // (2) A second reserved sentinel on the wire is likewise refused.
+        let err_sys = handle_namespace_set_standard(
+            &conn,
+            &json!({
+                "namespace": "ns-2721",
+                "id": id,
+                "agent_id": sentinels::SYSTEM_PRINCIPAL,
+            }),
+        )
+        .expect_err("wire agent_id=system must not bypass the ownership gate");
+        assert!(err_sys.contains("does not own"), "got: {err_sys}");
+
+        // (3) HTTP ingest boundary: the strict header resolver rejects a wire
+        // `X-Agent-Id: daemon` before it can ever reach `params.agent_id`.
+        assert!(
+            crate::identity::resolve_http_agent_id(None, Some(sentinels::DAEMON_PRINCIPAL))
+                .is_err(),
+            "HTTP header resolver must reject a wire daemon claim"
+        );
+
+        // (4) CONTROL — a legitimate internal daemon self-write via the trusted
+        // OUT-OF-BAND entry STILL succeeds (the daemon principal bypasses the
+        // ownership gate; the internal producers are not tightened by CB-19).
+        handle_namespace_set_standard_trusted(
+            &conn,
+            &json!({"namespace": "ns-2721", "id": id}),
+            sentinels::DAEMON_PRINCIPAL,
+        )
+        .expect("trusted daemon self-write must still succeed");
+        assert_eq!(
+            db::get_namespace_standard(&conn, "ns-2721")
+                .unwrap()
+                .as_deref(),
+            Some(id.as_str()),
+            "trusted daemon self-write binds the standard"
         );
     }
 

@@ -28,7 +28,8 @@
 use crate::cli::CliOutput;
 use crate::db;
 use crate::mcp::{
-    handle_namespace_clear_standard, handle_namespace_get_standard, handle_namespace_set_standard,
+    handle_namespace_clear_standard, handle_namespace_get_standard,
+    handle_namespace_set_standard_trusted,
 };
 use crate::models::field_names;
 use anyhow::{Context, Result};
@@ -167,13 +168,14 @@ fn set_standard(
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     let conn = db::open(db_path)?;
-    // #2541 — local CLI is an operator/admin surface: use the explicit
-    // daemon principal so ownership gate has a real bypass, not the
-    // "omit agent_id" hole.
+    // #2541 / #2721 — the local CLI is an operator/admin surface that acts as
+    // the daemon principal. Pass `DAEMON_PRINCIPAL` OUT OF BAND via the trusted
+    // entry, NOT via the wire `params.agent_id` field: a self-asserted wire
+    // `agent_id="daemon"` is rejected at the resolution boundary (#977, CB-19),
+    // so the reserved principal is producible only by this in-process surface.
     let mut params = json!({
         "namespace": namespace,
         "id": id,
-        "agent_id": crate::identity::sentinels::DAEMON_PRINCIPAL,
     });
     if let Some(p) = parent {
         params["parent"] = json!(p);
@@ -183,7 +185,12 @@ fn set_standard(
             serde_json::from_str(g).context("--governance must be a valid JSON object")?;
         params[field_names::GOVERNANCE] = gov_val;
     }
-    let resp = handle_namespace_set_standard(&conn, &params).map_err(|e| anyhow::anyhow!(e))?;
+    let resp = handle_namespace_set_standard_trusted(
+        &conn,
+        &params,
+        crate::identity::sentinels::DAEMON_PRINCIPAL,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
     emit(out, json_out, &resp, |o, r| {
         writeln!(
             o.stdout,
