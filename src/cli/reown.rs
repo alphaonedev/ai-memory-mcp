@@ -84,6 +84,11 @@ pub struct ReownArgs {
 /// formatter error if the DB open, the re-own sweep, or the report
 /// render fails.
 pub fn run(db_path: &Path, args: &ReownArgs, out: &mut CliOutput<'_>) -> Result<i32> {
+    // v1.0.0 #2572 — REFUSE this re-ownership write on a Postgres store (see
+    // `refuse_pg_store`). Corrects the CLI_REFERENCE overclaim that `reown`
+    // works on "Both sqlite + postgres".
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "reown", out)?;
+    let db_path = db_path.as_path();
     let conn =
         crate::db::open(db_path).with_context(|| crate::errors::msg::opening(db_path.display()))?;
     let report = crate::storage::reown(

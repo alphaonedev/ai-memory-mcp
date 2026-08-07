@@ -47,6 +47,10 @@ pub fn run(
     json_out: bool,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
+    // v1.0.0 #2572 — REFUSE on a Postgres store BEFORE opening the local sqlite
+    // (restore/purge write; list/stats phantom-read empty). See `refuse_pg_store`.
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "archive", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     match args.action {
         ArchiveAction::List {

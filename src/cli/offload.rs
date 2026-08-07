@@ -77,6 +77,12 @@ pub fn run_offload(db_path: &Path, args: &OffloadArgs, out: &mut CliOutput<'_>) 
     let content = read_input(&args.file)?;
     let namespace = args.namespace.clone().unwrap_or_else(|| "auto".to_string());
     let agent_id = resolve_agent_id(args.agent_id.as_deref())?;
+    // v1.0.0 #2572 — REFUSE this offload write on a Postgres store. `offload`
+    // persists the blob into the DB-backed memory substrate via this connection
+    // (NOT a filesystem-local cold store), so on a pg deployment the write would
+    // phantom-land in a throwaway SQLite file. See `refuse_pg_store`.
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "offload", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path).context("open db")?;
     let off = ContextOffloader::new(&conn, None, OffloadConfig::default());
     let result = off
@@ -108,6 +114,10 @@ pub fn run_offload(db_path: &Path, args: &OffloadArgs, out: &mut CliOutput<'_>) 
 
 /// `ai-memory deref <ref_id>` entry point.
 pub fn run_deref(db_path: &Path, args: &DerefArgs, out: &mut CliOutput<'_>) -> Result<()> {
+    // v1.0.0 #2572 — REFUSE on a Postgres store (a phantom SQLite deref reads an
+    // empty conjured database; see `refuse_pg_store`).
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "deref", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path).context("open db")?;
     let off = ContextOffloader::new(&conn, None, OffloadConfig::default());
     // SEC-4 (Cluster D) — operator CLI is the trusted-direct-ops path

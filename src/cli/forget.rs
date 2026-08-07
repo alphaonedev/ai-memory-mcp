@@ -100,6 +100,11 @@ pub fn cmd_forget(
     }
 
     let tier = args.tier.as_deref().and_then(Tier::from_str);
+    // v1.0.0 #2572 — REFUSE this erasure on a Postgres store (see `refuse_pg_store`).
+    // The query-only receipt sub-modes above short-circuit before this and carry
+    // their own guard.
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "forget", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     // v1.0.0 #2446 — resolve the FULL matched id set BEFORE the delete
     // commits (same connection, synchronous), so the federated erasure
@@ -155,6 +160,10 @@ fn cmd_show_receipt(
     json_out: bool,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
+    // v1.0.0 #2572 — REFUSE on a Postgres store (a phantom SQLite read returns
+    // an empty conjured database; see `refuse_pg_store`).
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "forget --show-receipt", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     let Some(receipt) = db::get_forget_tombstone(&conn, memory_id)? else {
         if json_out {
@@ -210,6 +219,10 @@ fn cmd_verify_receipt(
     json_out: bool,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
+    // v1.0.0 #2572 — REFUSE on a Postgres store (a phantom SQLite read returns
+    // an empty conjured database; see `refuse_pg_store`).
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "forget --verify-receipt", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     let Some(receipt) = db::get_forget_tombstone(&conn, memory_id)? else {
         if json_out {

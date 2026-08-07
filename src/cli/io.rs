@@ -174,6 +174,7 @@ pub fn export(db_path: &Path, args: &ExportArgs, out: &mut CliOutput<'_>) -> Res
         args.store_url.as_deref(),
         VERB_EXPORT,
         crate::cli::backup::StoreDisagreement::RedirectWithNote,
+        None,
         out,
     )?;
     // #2444 shape — `db::open` CREATES the file when absent and then runs the
@@ -374,6 +375,7 @@ pub(crate) fn import_from_str(
         args.store_url.as_deref(),
         VERB_IMPORT,
         crate::cli::backup::StoreDisagreement::Refuse,
+        None,
         out,
     )?;
     // Deliberately NO `!exists` refusal here (unlike `export`): importing
@@ -943,6 +945,11 @@ pub fn mine(
         return Ok(());
     }
 
+    // v1.0.0 #2572 — REFUSE on a Postgres store BEFORE the local sqlite write
+    // path (the dry-run above only reads the on-disk export and never opens the
+    // DB, so it is intentionally not guarded).
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "mine", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
     let now = Utc::now();

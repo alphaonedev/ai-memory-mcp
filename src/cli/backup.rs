@@ -162,6 +162,56 @@ fn resolve_sqlite_source(
         store_url_arg,
         verb,
         StoreDisagreement::RedirectWithNote,
+        None,
+        out,
+    )
+}
+
+/// v1.0.0 #2572 — HTTP-daemon remedy hint threaded into the Postgres refusal
+/// for the class-(a) CLI write/read verbs (see [`refuse_pg_store`]).
+pub(crate) const PG_CLI_ALTERNATIVE: &str = "the local SQLite CLI cannot reach a \
+    Postgres store — a write would land in a throwaway SQLite file the Postgres \
+    deployment never reads (reported as success while the data is silently LOST), \
+    and a read would return an empty conjured database. Route this operation \
+    through the HTTP daemon (`ai-memory serve`) or MCP-over-HTTP instead; see \
+    docs/production-deployment.md";
+
+/// v1.0.0 #2572 — the shared Postgres-refusal funnel for the class-(a) CLI
+/// verbs (`store` / `link` / `update` / `promote` / `forget` / `delete` / `gc`
+/// / `archive` / `consolidate` / `namespace` / `reown` / `share` / `offload` /
+/// `reflect` / `atomise` / `reembed` / `mine` / `sync` / `calibrate confidence`).
+///
+/// Each of those verbs opens the local SQLite `--db` directly; on a
+/// Postgres-served deployment (`AI_MEMORY_STORE_URL=postgres://…`, the #1927
+/// non-argv channel, or `--store-url`) that write phantom-lands in a throwaway
+/// SQLite file the served store never reads — reporting success while the data
+/// is LOST (the exact #2490 class PR #2568 closed for the durability verbs).
+/// This gate resolves the configured store BEFORE `db::open` and REFUSES a
+/// Postgres URL (5-agent vote `4d3ea1c5`, UNANIMOUS REFUSE). The Route-through-
+/// SAL capability is deferred to #2772.
+///
+/// Returns the resolved local SQLite path (byte-identical to `db_path` in every
+/// `Ok` case) so the caller opens exactly what it would have, or the typed
+/// Postgres / ambiguous-store refusal. `store_url_arg` is `None` because no
+/// class-(a) verb carries a `--store-url` flag; the env channels
+/// (`AI_MEMORY_STORE_URL_FILE` > `AI_MEMORY_STORE_URL`) are still consulted.
+///
+/// # Errors
+///
+/// Refuses on a Postgres store URL, an unrecognised scheme, an argv/env
+/// store-URL disagreement, an empty `sqlite://` path, or a `sqlite://` path that
+/// disagrees with `--db` (WRITE disposition — never a silent redirect).
+pub(crate) fn refuse_pg_store(
+    db_path: &Path,
+    verb: &str,
+    out: &mut CliOutput<'_>,
+) -> Result<PathBuf> {
+    resolve_sqlite_store(
+        db_path,
+        None,
+        verb,
+        StoreDisagreement::Refuse,
+        Some(PG_CLI_ALTERNATIVE),
         out,
     )
 }
@@ -176,11 +226,18 @@ fn resolve_sqlite_source(
 /// unrecognised scheme, an argv/env store-URL disagreement, an empty
 /// `sqlite://` path, and — under [`StoreDisagreement::Refuse`] — a
 /// `sqlite://` path that disagrees with `--db`.
+///
+/// v1.0.0 #2572 — `pg_alternative` names the store-appropriate remedy in the
+/// Postgres-refusal message. `None` (backup / restore / export / import) keeps
+/// the #2444/#2490 pg-native-dump guidance verbatim; `Some(hint)` (the class-(a)
+/// CLI write/read verbs) points the operator at the HTTP daemon instead, since a
+/// local-SQLite write cannot reach a Postgres store.
 pub(crate) fn resolve_sqlite_store(
     db_path: &Path,
     store_url_arg: Option<&str>,
     verb: &str,
     disagreement: StoreDisagreement,
+    pg_alternative: Option<&str>,
     out: &mut CliOutput<'_>,
 ) -> Result<PathBuf> {
     use crate::daemon_runtime::{SQLITE_URL_SCHEME, is_postgres_url, resolve_store_url};
@@ -213,6 +270,13 @@ pub(crate) fn resolve_sqlite_store(
     };
 
     if is_postgres_url(&url) {
+        if let Some(alt) = pg_alternative {
+            anyhow::bail!(
+                "`ai-memory {verb}` operates on a local SQLite database only, but this \
+                 deployment's configured store is Postgres ({}). Refusing — {alt} (#2572).",
+                redact_url_password(&url)
+            );
+        }
         anyhow::bail!(
             "`ai-memory {verb}` acts on a local SQLite database only, but this \
              deployment's configured store is Postgres ({}). Refusing — a SQLite \
@@ -692,6 +756,73 @@ pub fn run_restore(
 mod tests {
     use super::*;
     use crate::cli::test_utils::{TestEnv, seed_memory};
+
+    /// v1.0.0 #2572 — the class-(a) guard returns the typed Postgres refusal
+    /// (naming the HTTP-daemon remedy, DSN-redacted) on a `postgres://` store
+    /// URL, and is byte-transparent (returns the `--db` path unchanged) when no
+    /// store URL is configured.
+    ///
+    /// The Postgres URL is supplied through the ARG channel, exercising the
+    /// exact `Refuse` disposition + `PG_CLI_ALTERNATIVE` hint that
+    /// [`refuse_pg_store`] threads — WITHOUT ever setting a process-global
+    /// `AI_MEMORY_STORE_URL`. Lib tests run in parallel in one process, and a
+    /// transiently-set `postgres://` env could make a concurrent `sal` test
+    /// attempt a real pg connection; the env channel is instead covered by the
+    /// isolated-subprocess behavioral legs in
+    /// `tests/cli_write_verb_pg_refuse_ceiling_2572.rs`. The ambient env is
+    /// cleared under the shared `store_url_env_lock` (#2146) so the arg is
+    /// authoritative; nothing is ever SET.
+    #[test]
+    fn refuse_pg_store_typed_refusal_on_postgres_url_2572() {
+        let _g = crate::store_url::store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: env mutation is serialized by `store_url_env_lock`; we only
+        // CLEAR (never set) so a concurrent test can never observe a pg URL.
+        unsafe {
+            std::env::remove_var(crate::store_url::STORE_URL_ENV);
+            std::env::remove_var(crate::store_url::STORE_URL_FILE_ENV);
+        }
+
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+
+        // 1) No store URL (arg None, env cleared) → transparent --db pass-through.
+        {
+            let mut out = env.output();
+            let resolved =
+                refuse_pg_store(&db, "store", &mut out).expect("no store URL → pass-through");
+            assert_eq!(
+                resolved, db,
+                "with no store URL the guard must return the --db path unchanged (#2572)"
+            );
+        }
+
+        // 2) postgres:// via the ARG channel → typed refusal, HTTP-daemon remedy,
+        //    DSN password redacted.
+        {
+            let mut out = env.output();
+            let err = resolve_sqlite_store(
+                &db,
+                Some("postgres://ai_memory:hunter2@127.0.0.1:5432/ai_memory"),
+                "store",
+                StoreDisagreement::Refuse,
+                Some(PG_CLI_ALTERNATIVE),
+                &mut out,
+            )
+            .expect_err("postgres:// must refuse (#2572)");
+            let msg = err.to_string();
+            assert!(msg.contains("#2572"), "refusal must cite #2572: {msg}");
+            assert!(
+                msg.contains("HTTP daemon"),
+                "refusal must name the HTTP-daemon remedy, not pg_dump: {msg}"
+            );
+            assert!(
+                !msg.contains("hunter2"),
+                "refusal must redact the DSN password: {msg}"
+            );
+        }
+    }
 
     #[test]
     fn test_backup_happy_path_creates_snapshot_and_manifest() {

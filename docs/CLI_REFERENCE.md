@@ -854,11 +854,16 @@ ai-memory reown --namespace prod --to alice --claim-unowned --json
 | `--claim-unowned` | ALSO re-own rows with an absent / empty `metadata.agent_id` (the legacy "owned by nobody" class). Without it, only rows with an existing owner are rewritten. |
 | `--json` | Emit the machine-readable `{matched, rewritten, dry_run}` report instead of the human summary. |
 
-Only `metadata.agent_id` is touched (a single-key `json_set` on sqlite
-/ `jsonb_set` on postgres); every other metadata key is preserved and
-the `agent_id_idx` generated column auto-reprojects the new owner.
-Both sqlite + postgres. See the §"Agent Identity" durable-stamp
-posture in `CLAUDE.md` for why this precedes enabling enforced reads.
+Only `metadata.agent_id` is touched (a single-key `json_set`); every
+other metadata key is preserved and the `agent_id_idx` generated column
+auto-reprojects the new owner. **The `ai-memory reown` CLI verb operates
+on the local SQLite `--db` only. On a Postgres-served deployment
+(`AI_MEMORY_STORE_URL=postgres://…`, the `AI_MEMORY_STORE_URL_FILE`
+channel, or `--store-url`) it REFUSES rather than phantom-write to a
+throwaway SQLite file the served store never reads — re-own via the HTTP
+daemon (`ai-memory serve`) instead ([#2572](https://github.com/alphaonedev/ai-memory-mcp/issues/2572)).**
+See the §"Agent Identity" durable-stamp posture in `CLAUDE.md` for why
+this precedes enabling enforced reads.
 
 ### `identity` — Ed25519 keypair management (H-track)
 

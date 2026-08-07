@@ -76,6 +76,9 @@ pub fn run(
 ) -> Result<()> {
     use crate::models::Tier;
     validate::validate_id(&args.id)?;
+    // v1.0.0 #2572 — REFUSE this write on a Postgres store (see `refuse_pg_store`).
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "update", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     let resolved_id = if db::get(&conn, &args.id)?.is_some() {
         args.id.clone()

@@ -102,6 +102,9 @@ pub fn cmd_reflect(
     if args.source_ids.is_empty() {
         anyhow::bail!("reflect: --source-ids is required (comma-separated list)");
     }
+    // v1.0.0 #2572 — REFUSE this write on a Postgres store (see `refuse_pg_store`).
+    let db_path = crate::cli::backup::refuse_pg_store(db_path, "reflect", out)?;
+    let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
 
     let mut params = json!({
