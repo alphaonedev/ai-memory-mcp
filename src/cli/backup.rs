@@ -757,28 +757,18 @@ mod tests {
     use super::*;
     use crate::cli::test_utils::{TestEnv, seed_memory};
 
-    /// v1.0.0 #2572 — the class-(a) guard returns the typed Postgres refusal
-    /// (naming the HTTP-daemon remedy, DSN-redacted) on a `postgres://` store
-    /// URL, and is byte-transparent (returns the `--db` path unchanged) when no
-    /// store URL is configured.
-    ///
-    /// The Postgres URL is supplied through the ARG channel, exercising the
-    /// exact `Refuse` disposition + `PG_CLI_ALTERNATIVE` hint that
-    /// [`refuse_pg_store`] threads — WITHOUT ever setting a process-global
-    /// `AI_MEMORY_STORE_URL`. Lib tests run in parallel in one process, and a
-    /// transiently-set `postgres://` env could make a concurrent `sal` test
-    /// attempt a real pg connection; the env channel is instead covered by the
-    /// isolated-subprocess behavioral legs in
-    /// `tests/cli_write_verb_pg_refuse_ceiling_2572.rs`. The ambient env is
-    /// cleared under the shared `store_url_env_lock` (#2146) so the arg is
-    /// authoritative; nothing is ever SET.
+    /// v1.0.0 #2572 — the shared class-(a) funnel returns the typed Postgres
+    /// refusal (naming the HTTP-daemon remedy, DSN-redacted) on a `postgres://`
+    /// store URL, and is byte-transparent (returns the `--db` path unchanged)
+    /// when no store URL is configured. In-process env mutation is serialised
+    /// through the shared `store_url_env_lock` (#2146).
     #[test]
     fn refuse_pg_store_typed_refusal_on_postgres_url_2572() {
         let _g = crate::store_url::store_url_env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // SAFETY: env mutation is serialized by `store_url_env_lock`; we only
-        // CLEAR (never set) so a concurrent test can never observe a pg URL.
+        // SAFETY: env mutation is serialized by `store_url_env_lock`; these keys
+        // are read only by `resolve_store_url`, held for this whole test.
         unsafe {
             std::env::remove_var(crate::store_url::STORE_URL_ENV);
             std::env::remove_var(crate::store_url::STORE_URL_FILE_ENV);
@@ -787,7 +777,7 @@ mod tests {
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();
 
-        // 1) No store URL (arg None, env cleared) → transparent --db pass-through.
+        // 1) No store URL → transparent pass-through of the --db path.
         {
             let mut out = env.output();
             let resolved =
@@ -798,19 +788,18 @@ mod tests {
             );
         }
 
-        // 2) postgres:// via the ARG channel → typed refusal, HTTP-daemon remedy,
-        //    DSN password redacted.
+        // 2) postgres:// → typed refusal, HTTP-daemon remedy, password redacted.
+        // SAFETY: see above.
+        unsafe {
+            std::env::set_var(
+                crate::store_url::STORE_URL_ENV,
+                "postgres://ai_memory:hunter2@127.0.0.1:5432/ai_memory",
+            );
+        }
         {
             let mut out = env.output();
-            let err = resolve_sqlite_store(
-                &db,
-                Some("postgres://ai_memory:hunter2@127.0.0.1:5432/ai_memory"),
-                "store",
-                StoreDisagreement::Refuse,
-                Some(PG_CLI_ALTERNATIVE),
-                &mut out,
-            )
-            .expect_err("postgres:// must refuse (#2572)");
+            let err = refuse_pg_store(&db, "store", &mut out)
+                .expect_err("postgres:// must refuse (#2572)");
             let msg = err.to_string();
             assert!(msg.contains("#2572"), "refusal must cite #2572: {msg}");
             assert!(
@@ -821,6 +810,10 @@ mod tests {
                 !msg.contains("hunter2"),
                 "refusal must redact the DSN password: {msg}"
             );
+        }
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var(crate::store_url::STORE_URL_ENV);
         }
     }
 
