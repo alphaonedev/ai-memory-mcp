@@ -26,9 +26,8 @@ use ai_memory::hooks::events::HookEvent;
 const ALL_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent::PreStore,
     HookEvent::PostStore,
-    HookEvent::PreRecall,
+    // #2758 removed the never-fired PreRecall + PreSearch (pure read paths).
     HookEvent::PostRecall,
-    HookEvent::PreSearch,
     HookEvent::PostSearch,
     HookEvent::PreDelete,
     HookEvent::PostDelete,
@@ -41,8 +40,8 @@ const ALL_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent::PreGovernanceDecision,
     HookEvent::PostGovernanceDecision,
     HookEvent::OnIndexEviction,
-    HookEvent::PreTranscriptStore,
-    HookEvent::PostTranscriptStore,
+    // #2758 removed the whole transcript hook family (PreTranscriptStore +
+    // PostTranscriptStore) — no production transcript-write path.
     HookEvent::PreRecallExpand,
     HookEvent::PreReflect,
     HookEvent::PostReflect,
@@ -66,38 +65,43 @@ fn arch_7_all_hook_events_classified_by_is_pre_event() {
 }
 
 #[test]
-fn arch_7_hook_event_count_matches_documented_26() {
+fn arch_7_hook_event_count_matches_documented_22() {
     // Narrative documents the HookEvent variant count (25 at v0.7.0;
     // 27 at v0.8.0 after #1709 adds pre_signal_send + post_signal_ack;
-    // 26 at v1.0.0 after #2637 removes the never-fired pre_archive).
+    // 26 at v1.0.0 after #2637 removes the never-fired pre_archive;
+    // 22 at v1.0.0 after #2758 removes the never-fired pre_recall +
+    // pre_search + the whole transcript hook family (pre_transcript_store
+    // + post_transcript_store)).
     // Mechanically pin the count so doc + code stay in lockstep. A
     // future addition to `ALL_HOOK_EVENTS` should come with a narrative
     // bump and a count update here.
     assert_eq!(
         ALL_HOOK_EVENTS.len(),
-        26,
+        22,
         "ARCH-7 hook event count drift: ALL_HOOK_EVENTS has {} entries; \
-         expected 26 per the v1.0.0 src/hooks/events.rs SSOT (#2637 removed pre_archive). \
+         expected 22 per the v1.0.0 src/hooks/events.rs SSOT (#2758 removed \
+         pre_recall + pre_search + the transcript hook family). \
          Update the test when adding or removing a variant.",
         ALL_HOOK_EVENTS.len(),
     );
 }
 
 #[test]
-fn arch_7_pre_event_count_is_thirteen() {
-    // 13 pre-events: PreStore, PreRecall, PreSearch, PreDelete,
-    // PrePromote, PreLink, PreConsolidate, PreGovernanceDecision,
-    // PreTranscriptStore, PreRecallExpand, PreReflect, PreCompaction,
-    // PreSignalSend (v0.8.0 #1709). #2637 removed the never-fired
-    // PreArchive (14 → 13). The remaining 13 are post-/on-class.
+fn arch_7_pre_event_count_is_ten() {
+    // 10 pre-events: PreStore, PreDelete, PrePromote, PreLink,
+    // PreConsolidate, PreGovernanceDecision, PreRecallExpand, PreReflect,
+    // PreCompaction, PreSignalSend (v0.8.0 #1709). #2637 removed the
+    // never-fired PreArchive (14 → 13); #2758 removed the never-fired
+    // PreRecall + PreSearch + PreTranscriptStore (13 → 10). The
+    // remaining 13 variants are post-/on-class.
     let pre_count = ALL_HOOK_EVENTS
         .iter()
         .copied()
         .filter(|&ev| is_pre_event(ev))
         .count();
     assert_eq!(
-        pre_count, 13,
+        pre_count, 10,
         "ARCH-7 pre-event count drift: {pre_count} variants classify as pre-events; \
-         expected 13. If a pre-event was added/removed, bump this expectation in lockstep.",
+         expected 10. If a pre-event was added/removed, bump this expectation in lockstep.",
     );
 }

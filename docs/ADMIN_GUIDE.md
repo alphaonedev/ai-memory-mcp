@@ -668,7 +668,7 @@ enabled = true
 namespace = "team/*"
 ```
 
-**Event matrix:** `pre_store`, `post_store`, `pre_recall`, `post_recall`, `pre_search`, `post_search`, `pre_delete`, `post_delete`, `pre_promote`, `post_promote`, `pre_link`, `post_link`, `pre_consolidate`, `post_consolidate`, `pre_governance_decision`, `post_governance_decision`, `on_index_eviction`, `pre_transcript_store`, `post_transcript_store`. Hooks return `Allow`, `Modify(delta)` (pre- events only), `Deny{reason, code}`, or `AskUser{prompt, options, default}`. Chain order is priority-desc; the first `Deny` short-circuits the chain.
+**Event matrix:** `pre_store`, `post_store`, `post_recall`, `post_search`, `pre_delete`, `post_delete`, `pre_promote`, `post_promote`, `pre_link`, `post_link`, `pre_consolidate`, `post_consolidate`, `pre_governance_decision`, `post_governance_decision`, `on_index_eviction` (#2758 removed the never-fired `pre_recall` / `pre_search` + the whole transcript hook family `pre_transcript_store` / `post_transcript_store`). Hooks return `Allow`, `Modify(delta)` (pre- events only), `Deny{reason, code}`, or `AskUser{prompt, options, default}`. Chain order is priority-desc; the first `Deny` short-circuits the chain.
 
 **Performance contract:** `post_recall` and `post_search` default to `mode = "daemon"` (long-running IPC client) so they do not blow the v0.6.3 50ms recall p95 budget. `mode = "exec"` (subprocess-per-call) is permitted but requires explicit override and budget recalibration. Audit every hook for time and resource cost before promoting it past staging — a 200ms `post_recall` exec hook silently degrades every recall on the box.
 

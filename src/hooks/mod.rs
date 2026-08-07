@@ -80,9 +80,8 @@ pub use executor::{
 // can both reach for the canonical type without a deeper import.
 pub use timeouts::{
     EventClass, HOT_PATH_CLASS_DEADLINE_MS, INDEX_CLASS_DEADLINE_MS, READ_CLASS_DEADLINE_MS,
-    TRANSCRIPT_CLASS_DEADLINE_MS, WRITE_CLASS_DEADLINE_MS, class_deadline,
-    class_deadline_for_event, event_class, per_hook_budget_ms, record_timeout_violation,
-    timeout_violations_total,
+    WRITE_CLASS_DEADLINE_MS, class_deadline, class_deadline_for_event, event_class,
+    per_hook_budget_ms, record_timeout_violation, timeout_violations_total,
 };
 // G10 — pre_recall_expand hot-path helper.
 pub use recall::{PreRecallOutcome, apply_pre_recall_expand};

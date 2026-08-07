@@ -113,20 +113,34 @@ rest. Namespace-qualified `required_events` is tracked as a follow-up.
 
 ## 26-event matrix
 
-The 20 baseline events:
+The 16 baseline events (#2758 removed `pre_recall` / `pre_search` and the
+whole transcript hook family `pre_transcript_store` / `post_transcript_store`;
+the `post_recall` / `post_search` notify events are retained):
 
 | Event | Phase | Class | Fires on |
 |---|---|---|---|
 | `pre_store` / `post_store` | write | Write | `memory_store`, `memory_update` (when content changes) |
-| `pre_recall` / `post_recall` | read | Read | `memory_recall`, family-loader recall |
-| `pre_search` / `post_search` | read | Read | `memory_search` |
+| `post_recall` | read | Read | `memory_recall`, family-loader recall |
+| `post_search` | read | Read | `memory_search` |
 | `pre_delete` / `post_delete` | write | Write | `memory_delete` |
 | `pre_promote` / `post_promote` | write | Write | tier promotion (manual + auto) |
 | `pre_link` / `post_link` | write | Write | `memory_link` |
 | `pre_consolidate` / `post_consolidate` | write | Write | `memory_consolidate` |
 | `pre_governance_decision` / `post_governance_decision` | gate | Write | governance pipeline |
 | `on_index_eviction` | maintenance | Index | HNSW eviction |
-| `pre_transcript_store` / `post_transcript_store` | write | Transcript | transcript sidechain writes |
+
+> **#2758 (v1.0.0):** `pre_recall`, `pre_search`, and the whole transcript
+> hook family (`pre_transcript_store` + `post_transcript_store`) were REMOVED.
+> Recall and search are pure read paths (recall mutates zero rows since
+> #1869/#1953), so a pre-READ governance gate has no destructive op to gate —
+> the `post_recall` / `post_search` notify events, which fire on real
+> production read paths, are retained. `crate::transcripts::store` has NO
+> production caller (every caller is test-only), so NEITHER transcript event
+> ever fired — the `post_transcript_store` notify was inert for the same
+> reason as its `pre_*` sibling, so the whole family (both events + the
+> now-uninhabited `Transcript` `EventClass`) was removed. Advertising an
+> enforcement/notify point that never fires is a false claim (the #2637
+> `pre_archive` disposition).
 
 The 5 grand-slam additions:
 
@@ -190,7 +204,6 @@ monotonically as earlier hooks consume time:
 | `Write` | **5,000 ms** | store/delete/promote/link/consolidate/governance/archive/reflect/compaction |
 | `Read` | **2,000 ms** | recall/search |
 | `Index` | **1,000 ms** | `on_index_eviction` |
-| `Transcript` | **5,000 ms** | `pre_transcript_store`, `post_transcript_store` |
 | `HotPath` | **50 ms** | `pre_recall_expand` (only inhabitant today) |
 
 The HotPath ceiling is the v0.6.3 recall p95 budget — a hook that

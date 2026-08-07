@@ -345,14 +345,14 @@ pub fn is_pre_event(event: HookEvent) -> bool {
     match event {
         // ---- pre-events: `Modify` decisions ARE honoured -----------------
         HookEvent::PreStore
-        | HookEvent::PreRecall
-        | HookEvent::PreSearch
         | HookEvent::PreDelete
         | HookEvent::PrePromote
         | HookEvent::PreLink
         | HookEvent::PreConsolidate
         | HookEvent::PreGovernanceDecision
-        | HookEvent::PreTranscriptStore
+        // #2758 REMOVED PreRecall + PreSearch (read-path, no op to gate) +
+        // PreTranscriptStore (no production write path) — mirroring #2637's
+        // PreArchive removal.
         // G10: hot-path query expansion fires before the recall
         // call — Modify decisions rewrite the in-flight query.
         | HookEvent::PreRecallExpand
@@ -377,7 +377,8 @@ pub fn is_pre_event(event: HookEvent) -> bool {
         | HookEvent::PostConsolidate
         | HookEvent::PostGovernanceDecision
         | HookEvent::OnIndexEviction
-        | HookEvent::PostTranscriptStore
+        // #2758 REMOVED PostTranscriptStore with the rest of the transcript
+        // hook family (no production transcript-write path).
         | HookEvent::PostReflect
         | HookEvent::OnCompactionRollback
         // v0.8.0 #1709: post_signal_ack is notify-only.
@@ -659,14 +660,11 @@ mod tests {
         // added PreReflect; L1-7 added PreCompaction).
         for ev in [
             HookEvent::PreStore,
-            HookEvent::PreRecall,
-            HookEvent::PreSearch,
             HookEvent::PreDelete,
             HookEvent::PrePromote,
             HookEvent::PreLink,
             HookEvent::PreConsolidate,
             HookEvent::PreGovernanceDecision,
-            HookEvent::PreTranscriptStore,
             HookEvent::PreRecallExpand,
             HookEvent::PreReflect,
             HookEvent::PreCompaction,
@@ -686,7 +684,6 @@ mod tests {
             HookEvent::PostConsolidate,
             HookEvent::PostGovernanceDecision,
             HookEvent::OnIndexEviction,
-            HookEvent::PostTranscriptStore,
             HookEvent::PostReflect,
             HookEvent::OnCompactionRollback,
             HookEvent::PostSignalAck,
