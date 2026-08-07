@@ -449,6 +449,291 @@ fn rerank_max_seq() -> usize {
     *RERANK_MAX_SEQ.get().unwrap_or(&RERANK_MAX_SEQ_DEFAULT)
 }
 
+// ---------------------------------------------------------------------------
+// v1.0.0 #2608 — wall-clock budget for the autonomous-tier neural rerank
+// ---------------------------------------------------------------------------
+
+/// #2608 — wall-clock budget for the cross-encoder rerank stage, in
+/// milliseconds. The DATA-lane sibling of the #2577 recall-embed budget
+/// (`AI_MEMORY_RECALL_EMBED_BUDGET_MS`).
+///
+/// **Why the rerank needs its own budget.** On the reference corpus the
+/// cross-encoder forward is the LARGER read-path term (~1,063 ms of a
+/// ~1,290 ms autonomous p50); a long-content corpus pushed warm autonomous
+/// recall to ~4 s (#1588). Left unbounded that is an AVAILABILITY defect,
+/// not merely a latency one, exactly as #2577 documents for the query
+/// embed: on MCP stdio the single-threaded JSON-RPC loop (the #965 audit)
+/// stalls EVERY subsequent tool call, and on the HTTP daemon each recall
+/// holds an admission permit (#2032 M3), so sustained rerank latency sheds
+/// HEALTHY traffic — including durable-truth writes — with 503s.
+///
+/// **Why PRE-FLIGHT admission, not a mid-flight abort.** A candle BERT
+/// forward is a synchronous CPU call with NO yield/cancellation point, and
+/// the pool cap ([`RERANK_POOL_MAX`]) makes each rerank ONE forward over
+/// ≤ 20 candidates (no mid-flight checkpoint). A wall-clock timeout could
+/// only abandon the waiting thread while the forward keeps burning a core —
+/// strictly worse at fleet scale (it converts a latency problem into
+/// CPU-exhaustion, firing hardest when the fleet is busiest). So the budget
+/// is enforced as a PRE-FLIGHT decision: estimate the forward's cost BEFORE
+/// it starts (from candidate count × padded token length, both known up
+/// front) and, when the estimate exceeds the budget, SKIP the neural stage
+/// and ship the pre-rerank hybrid ordering. This is deterministic given the
+/// same inputs (no load-dependent ordering) and never starts an over-budget
+/// forward. The budget GRAMMAR is copied verbatim from #2577; the
+/// ENFORCEMENT differs by necessity — resolved by the 5-agent vote
+/// (`4d3ea1c5`), 4-1 for pre-flight admission over a measured
+/// `recv_timeout` degrade.
+///
+/// On a degrade the recall **stays hybrid** (fewer, FTS/semantic-ranked
+/// results, NOT cross-encoded) and the operator's configured
+/// [`RerankerScoreFloor`] is still applied (the floor lives in the outer
+/// [`BatchedReranker::rerank`], so a skip cannot silently return rows the
+/// operator configured to be dropped). That is a DEGRADE, never a wrong
+/// result — the durable memory text is untouched and recall is pure.
+///
+/// Tri-state, mirroring [`crate::embeddings::ENV_RECALL_EMBED_BUDGET_MS`]:
+/// unset ⇒ [`RERANK_BUDGET_MS_DEFAULT`]; an explicit `0` ⇒ DISABLED (the
+/// pre-#2608 unbounded behaviour); unparseable ⇒ the default + a WARN (an
+/// unrecognised token must never silently WIDEN the failure window — the
+/// #131/FBL-14 rule).
+pub const ENV_RERANK_BUDGET_MS: &str = "AI_MEMORY_RERANK_BUDGET_MS";
+
+/// #2608 — compiled default for [`ENV_RERANK_BUDGET_MS`].
+///
+/// 2000 ms is the substrate's declared read-class ceiling
+/// (`crate::hooks::timeouts::READ_CLASS_DEADLINE_MS`), the same value
+/// #2577 uses for the query-embed budget, so the codebase holds ONE answer
+/// to "how long may a read spend on an out-of-process side quest". On the
+/// #2576 reference corpus (≤ 20 pairs × ~135 padded tokens) the estimate is
+/// ~1,080 ms — comfortably under 2,000 ms — so under the measured
+/// distribution the gate fires on approximately nothing. It is a TAIL
+/// cutter aimed at pathological long-content batches (the #1588 ~4 s case),
+/// not a throughput governor.
+pub const RERANK_BUDGET_MS_DEFAULT: u64 = 2_000;
+
+/// Cached resolution of [`ENV_RERANK_BUDGET_MS`]. Read on the rerank hot
+/// path, so resolved once and cached — the `recall_embed_budget` /
+/// `strict_dim_enabled` direct-read pattern.
+///
+/// Deliberately NOT a boot-seeded `OnceLock`: a seed-based knob is inert in
+/// any process that does not cross the seeding funnel (the #2233
+/// "defaults lie" class). A direct cached read is correct in every process,
+/// including CLI one-shots and library callers.
+///
+/// `u64::MAX` is the uninitialised sentinel (an unreachable budget value).
+static RERANK_BUDGET_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Pure tri-state resolution of the rerank budget (`0` = disabled) from an
+/// already-read env value, so the grammar is testable without touching the
+/// process env (the #2115/#2146 env-lock hazard). Mirrors #2577: `None`
+/// (unset) ⇒ default; explicit `0` ⇒ disabled; a parseable value wins;
+/// unparseable ⇒ default + a WARN (never silently WIDEN the failure window,
+/// the #131/FBL-14 rule).
+fn resolve_rerank_budget_ms(var: Option<&str>) -> u64 {
+    match var {
+        None => RERANK_BUDGET_MS_DEFAULT,
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::warn!(
+                    target: "rerank.budget",
+                    value = %raw,
+                    default_ms = RERANK_BUDGET_MS_DEFAULT,
+                    "unparseable {ENV_RERANK_BUDGET_MS}; falling back to the \
+                     compiled default (an unrecognised token must never widen the \
+                     failure window)"
+                );
+                RERANK_BUDGET_MS_DEFAULT
+            }
+        },
+    }
+}
+
+/// Resolve the raw configured rerank budget in ms (`0` = disabled),
+/// caching the first read. Tri-state per [`ENV_RERANK_BUDGET_MS`].
+fn rerank_budget_ms_resolved() -> u64 {
+    let cached = RERANK_BUDGET_MS.load(Ordering::Relaxed);
+    if cached != u64::MAX {
+        return cached;
+    }
+    let resolved = resolve_rerank_budget_ms(std::env::var(ENV_RERANK_BUDGET_MS).ok().as_deref());
+    RERANK_BUDGET_MS.store(resolved, Ordering::Relaxed);
+    resolved
+}
+
+/// The effective rerank budget for this process, in ms. `None` when the
+/// operator explicitly disabled it with `0`.
+fn rerank_budget_ms() -> Option<u64> {
+    match rerank_budget_ms_resolved() {
+        0 => None,
+        ms => Some(ms),
+    }
+}
+
+/// The effective rerank budget for this process. `None` when disabled.
+/// Public companion of [`rerank_budget_ms`] for operator diagnostics /
+/// capability reporting, mirroring [`crate::embeddings::recall_embed_budget`].
+#[must_use]
+pub fn rerank_budget() -> Option<std::time::Duration> {
+    rerank_budget_ms().map(std::time::Duration::from_millis)
+}
+
+/// Test-only override for the #2608 budget cache (the
+/// [`crate::embeddings::set_recall_embed_budget_for_test`] twin — avoids
+/// the #2115/#2146 env-lock hazard). `None` re-reads the env on the next
+/// call. Process-global: restore `None` before returning.
+#[doc(hidden)]
+pub fn set_rerank_budget_for_test(forced: Option<u64>) {
+    RERANK_BUDGET_MS.store(forced.unwrap_or(u64::MAX), Ordering::Relaxed);
+}
+
+/// #2608 — WordPiece byte→token proxy divisor. English WordPiece averages
+/// ~4 bytes per token; used to estimate a tokenized length WITHOUT running
+/// a real tokenizer, so the pre-flight cost estimate is a pure, model-free
+/// function (the property the pre-flight budget requires over an
+/// un-cancellable forward).
+const RERANK_EST_BYTES_PER_TOKEN: usize = 4;
+
+/// #2608 — BERT structural tokens per (query, document) pair
+/// (`[CLS] query [SEP] document [SEP]`).
+const RERANK_EST_STRUCTURAL_TOKENS: usize = 3;
+
+/// #2608 — estimated wall-clock cost of the batched cross-encoder forward,
+/// in nanoseconds per (pair × padded-token). Grounded in the #2608
+/// reference measurement — a ~20-pair × ~135-padded-token rerank measured
+/// ~1,063 ms ⇒ ~0.39 ms per pair-token, rounded UP to 0.4 ms so the
+/// admission gate errs toward protecting availability. This is an ESTIMATE,
+/// not a measured guarantee: CI cannot run the candle forward (no weights),
+/// so the wall-clock budget is a ceiling and this coefficient is the
+/// admission proxy the un-cancellable synchronous forward forces. A named
+/// `const` (not a scattered literal) so it is a single audited, calibratable
+/// knob.
+const RERANK_FORWARD_NANOS_PER_PAIR_TOKEN: u64 = 400_000;
+
+/// #2608 — cheap, deterministic, tokenizer-free proxy for the WordPiece
+/// token length of a string (byte length / [`RERANK_EST_BYTES_PER_TOKEN`],
+/// rounded up).
+fn est_token_len(s: &str) -> usize {
+    s.len().div_ceil(RERANK_EST_BYTES_PER_TOKEN)
+}
+
+/// #2608 — estimate the wall-clock cost (ms) of the batched neural
+/// cross-encoder forward for `candidates`, BEFORE the (synchronous,
+/// un-cancellable) forward runs.
+///
+/// The batched forward pads every row to the LONGEST tokenized length
+/// present in the pooled head (`BatchLongest`, #2576) and truncates at
+/// [`rerank_max_seq`], so cost ≈ pooled_count × padded_seq_len. The padded
+/// length is proxied from byte length via [`est_token_len`] (no real
+/// tokenizer needed). The longest length is taken over ALL candidates
+/// rather than only the top-[`RERANK_POOL_MAX`] scored head: the head is
+/// selected by SCORE and token length is uncorrelated with score, so the
+/// longest doc may sit in the tail — using the corpus-max UPPER-BOUNDS the
+/// true batch-longest of the scored head, which is deliberately CONSERVATIVE
+/// (biases toward degrading, i.e. toward protecting availability; a degrade
+/// is fewer/hybrid results, never a wrong result).
+fn estimate_rerank_forward_ms(query: &str, candidates: &[(Memory, f64)]) -> u64 {
+    if candidates.is_empty() {
+        return 0;
+    }
+    let max_seq = rerank_max_seq();
+    let query_tokens = est_token_len(query);
+    let longest_padded = candidates
+        .iter()
+        .map(|(mem, _)| {
+            // document = "{title} {content}" (embedding_document).
+            let doc_tokens = est_token_len(&mem.title) + est_token_len(&mem.content);
+            (query_tokens + doc_tokens + RERANK_EST_STRUCTURAL_TOKENS).min(max_seq)
+        })
+        .max()
+        .unwrap_or(0);
+    let pooled = candidates.len().min(RERANK_POOL_MAX);
+    let pooled_u64 = u64::try_from(pooled).unwrap_or(u64::MAX);
+    let longest_u64 = u64::try_from(longest_padded).unwrap_or(u64::MAX);
+    let work = pooled_u64.saturating_mul(longest_u64);
+    work.saturating_mul(RERANK_FORWARD_NANOS_PER_PAIR_TOKEN) / 1_000_000
+}
+
+/// #2608 — the pluggable (query, document) relevance scorer seam.
+///
+/// The production neural cross-encoder ([`CrossEncoder`]) implements it, so
+/// its behaviour is byte-identical. A test double implements it to drive the
+/// neural-rerank blend + the budget-degrade branch in CI WITHOUT downloading
+/// the BERT model — on a CI host [`CrossEncoder::new_neural`] always returns
+/// the lexical fallback, so [`CrossEncoder::neural_score_pairs`] would
+/// otherwise have zero coverage. Mirrors the shipped
+/// [`crate::embeddings::Embed`] trait / [`crate::embeddings::Embedder`] enum
+/// swappable-for-tests pattern.
+pub trait PairScorer: Send + Sync {
+    /// Cross-encoder relevance scores for a (already pool-capped) candidate
+    /// slice, one score in `[0, 1]` per candidate in input order.
+    fn score_pairs(&self, query: &str, candidates: &[(Memory, f64)]) -> Vec<f32>;
+
+    /// Whether this scorer runs the (costly, budget-gated) neural forward.
+    /// The pre-flight rerank budget only gates neural scorers — lexical
+    /// scoring is CPU-trivial and never budgeted.
+    fn scorer_is_neural(&self) -> bool;
+}
+
+impl PairScorer for CrossEncoder {
+    fn score_pairs(&self, query: &str, candidates: &[(Memory, f64)]) -> Vec<f32> {
+        self.pair_scores(query, candidates)
+    }
+
+    fn scorer_is_neural(&self) -> bool {
+        self.is_neural()
+    }
+}
+
+/// #2608 — the single-query rerank blend, parameterised over a
+/// [`PairScorer`] so a test double can drive it without a BERT model.
+///
+/// Byte-identical to the pre-#2608 body of
+/// [`CrossEncoder::rerank_with_reflection_boost`] (which now delegates
+/// here) — the L2-8 boost-free equivalence pin
+/// (`rerank == rerank_with_reflection_boost(.., disabled())`) still holds.
+/// The pre-flight budget gate lives in [`BatchedReranker::rerank_unfloored`]
+/// (the production dispatch chokepoint), NOT here, so this core stays a pure
+/// blend usable by both the direct path and the coalesced worker.
+fn rerank_pairs_core(
+    scorer: &dyn PairScorer,
+    query: &str,
+    candidates: Vec<(Memory, f64)>,
+    boost_config: &ReflectionBoostConfig,
+) -> Vec<(Memory, f64)> {
+    let (head, tail) = split_rerank_pool(candidates);
+    let ce_scores = scorer.score_pairs(query, &head);
+    let mut scored: Vec<(Memory, f64)> = head
+        .into_iter()
+        .zip(ce_scores)
+        .map(|((mem, original_score), ce_score)| {
+            let blended =
+                ORIGINAL_WEIGHT * original_score + CROSS_ENCODER_WEIGHT * f64::from(ce_score);
+            let factor = boost_config.factor_for(&mem);
+            (mem, finite_or_floor(blended * factor))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.extend(tail);
+    scored
+}
+
+/// #2608 — the pre-flight budget DEGRADE result: the pre-rerank hybrid
+/// ordering (candidates sorted by their incoming hybrid score descending),
+/// with NO neural forward. The caller ([`BatchedReranker::rerank`]) applies
+/// the operator's [`RerankerScoreFloor`] to this, so the degrade honours
+/// `AI_MEMORY_RERANK_SCORE_FLOOR` exactly as the cross-encoded path does.
+///
+/// Note the floor was calibrated against the BLENDED post-rerank score
+/// (`0.6·original + 0.4·ce`); on the hybrid degrade scale it compares
+/// against the raw incoming score. [`RerankerScoreFloor::RelativeToTop`] is
+/// scale-invariant (safe); [`RerankerScoreFloor::Absolute`] is
+/// scale-sensitive — documented so an operator can reason about the degrade.
+fn degrade_to_hybrid_ordering(mut candidates: Vec<(Memory, f64)>) -> Vec<(Memory, f64)> {
+    candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+    candidates
+}
+
 /// v1.0.0 #2576 — should this process construct the neural cross-encoder?
 ///
 /// The rerank stage only runs when recall reached `mode == "hybrid"`, and
@@ -1113,26 +1398,13 @@ impl CrossEncoder {
         candidates: Vec<(Memory, f64)>,
         boost_config: &ReflectionBoostConfig,
     ) -> Vec<(Memory, f64)> {
-        let (head, tail) = split_rerank_pool(candidates);
-
-        let ce_scores = self.pair_scores(query, &head);
-        let mut scored: Vec<(Memory, f64)> = head
-            .into_iter()
-            .zip(ce_scores)
-            .map(|((mem, original_score), ce_score)| {
-                let blended =
-                    ORIGINAL_WEIGHT * original_score + CROSS_ENCODER_WEIGHT * f64::from(ce_score);
-                let factor = boost_config.factor_for(&mem);
-                (mem, finite_or_floor(blended * factor))
-            })
-            .collect();
-
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        // #1597 — uncapped remainder: blended scores untouched, already
-        // sorted descending by `split_rerank_pool`, ranked below the
-        // cross-encoded head.
-        scored.extend(tail);
-        scored
+        // #2608 — the blend lives in ONE place ([`rerank_pairs_core`]),
+        // parameterised over the [`PairScorer`] seam so a test double can
+        // exercise it without a BERT model. Byte-identical to the pre-#2608
+        // inline body (the L2-8 boost-free equivalence pin still holds). The
+        // pre-flight budget gate is applied by [`BatchedReranker`], not here,
+        // so this stays a pure blend shared by the direct + coalesced paths.
+        rerank_pairs_core(self, query, candidates, boost_config)
     }
 
     /// #1597 — cross-encoder scores for an (already capped) candidate
@@ -1662,6 +1934,13 @@ pub struct BatchedReranker {
     /// short-circuit and for callers that explicitly want non-batched
     /// behavior (tests, benchmarks).
     encoder: Arc<CrossEncoder>,
+    /// #2608 — test-only [`PairScorer`] override. `None` in EVERY production
+    /// constructor (production always scores through `encoder`), so the
+    /// resolved scorer is byte-identical to pre-#2608. When `Some` (built via
+    /// [`Self::with_scorer`]) the direct rerank path scores through this stub
+    /// instead of the real cross-encoder, so CI can drive the neural-rerank
+    /// blend + the pre-flight budget-degrade branch without a BERT model.
+    scorer_override: Option<Arc<dyn PairScorer>>,
     /// v0.7.0 L2-8 — reflection-aware boost config the worker hands
     /// down to every batched `rerank` call.  Defaults to
     /// [`ReflectionBoostConfig::default`] (boost = 1.2) so the daemon
@@ -1944,6 +2223,7 @@ impl BatchedReranker {
                 stop,
                 workers,
                 encoder,
+                scorer_override: None,
                 reflection_boost,
                 score_floor,
                 inflight: AtomicUsize::new(0),
@@ -1956,7 +2236,33 @@ impl BatchedReranker {
             stop,
             workers,
             encoder,
+            scorer_override: None,
             reflection_boost,
+            score_floor,
+            inflight: AtomicUsize::new(0),
+            worker_submissions: AtomicUsize::new(0),
+        }
+    }
+
+    /// #2608 — build a worker-less [`BatchedReranker`] that scores through
+    /// an arbitrary [`PairScorer`], for CI coverage of the neural-rerank
+    /// blend + the pre-flight budget-degrade branch WITHOUT a BERT model
+    /// (on a CI host [`CrossEncoder::new_neural`] always degrades to lexical,
+    /// so the real neural path is unreachable). Not a production constructor:
+    /// no coalescing pool, no worker threads — the direct path scores through
+    /// the injected scorer. `rerank` still applies the configured
+    /// [`RerankerScoreFloor`], so the degrade-honours-the-floor invariant is
+    /// exercised end-to-end.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_scorer(scorer: Arc<dyn PairScorer>, score_floor: RerankerScoreFloor) -> Self {
+        Self {
+            sender: None,
+            stop: Arc::new(AtomicBool::new(false)),
+            workers: Vec::new(),
+            encoder: Arc::new(CrossEncoder::new()),
+            scorer_override: Some(scorer),
+            reflection_boost: ReflectionBoostConfig::disabled(),
             score_floor,
             inflight: AtomicUsize::new(0),
             worker_submissions: AtomicUsize::new(0),
@@ -2023,6 +2329,52 @@ impl BatchedReranker {
     /// pin in `g9_batched_reranker_serial_calls_match_rerank`) call
     /// this directly.
     fn rerank_unfloored(&self, query: &str, candidates: Vec<(Memory, f64)>) -> Vec<(Memory, f64)> {
+        // #2608 — resolve the scorer (production `encoder`, or a test-only
+        // override). This is the ONE production dispatch chokepoint the recall
+        // path crosses (`rerank` → `rerank_unfloored`), so the pre-flight
+        // budget gate here covers BOTH the direct and coalesced paths
+        // uniformly (5-agent vote `4d3ea1c5`) — a `recv_timeout` on the worker
+        // reply could only budget the coalesced path, leaving the synchronous
+        // direct path uncontrolled.
+        let default_scorer: &dyn PairScorer = self.encoder.as_ref();
+        let scorer: &dyn PairScorer = self.scorer_override.as_deref().unwrap_or(default_scorer);
+
+        // #2608 — PRE-FLIGHT budget admission. Only the neural forward is
+        // costly enough to budget; lexical scoring is CPU-trivial and never
+        // gated. When the estimated forward would exceed the wall-clock
+        // budget, SKIP it and ship the pre-rerank hybrid ordering (the outer
+        // `rerank` / `rerank_coalesced` still applies the score floor, so the
+        // degrade honours `AI_MEMORY_RERANK_SCORE_FLOOR`). A candle BERT
+        // forward has no cancellation point, so admission is decided BEFORE
+        // the forward starts — deterministic, and it never burns a core on
+        // work it will discard.
+        if scorer.scorer_is_neural()
+            && let Some(budget_ms) = rerank_budget_ms()
+        {
+            let estimate_ms = estimate_rerank_forward_ms(query, &candidates);
+            if estimate_ms > budget_ms {
+                tracing::warn!(
+                    target: "rerank.budget.degraded",
+                    estimate_ms,
+                    budget_ms,
+                    candidates = candidates.len(),
+                    "cross-encoder rerank estimated over budget; degrading to the \
+                     pre-rerank hybrid ordering (#2608). Results are FEWER (no neural \
+                     re-ranking) and stay hybrid-ranked, never wrong — the score floor \
+                     still applies."
+                );
+                crate::metrics::inc_rerank_budget_degraded();
+                return degrade_to_hybrid_ordering(candidates);
+            }
+        }
+
+        // #2608 — test-injected stub scorer: score through the pure core
+        // (no coalescing pool exists on a `with_scorer` reranker), so CI can
+        // exercise the neural blend deterministically.
+        if let Some(stub) = self.scorer_override.as_deref() {
+            return rerank_pairs_core(stub, query, candidates, &self.reflection_boost);
+        }
+
         // #1579 B10 — RAII in-flight guard so a panicking encoder call
         // can't leak the counter and wedge the auto-select high.
         struct InflightGuard<'a>(&'a AtomicUsize);
@@ -4175,5 +4527,296 @@ mod issue_1597_tests {
             "#1597 timing (50-candidate pool, CPU): BEFORE sequential-full = {before:?}; \
              AFTER capped+batched = {after:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod reranker_budget_seam_2608_tests {
+    //! #2608 — CI coverage of the pluggable [`PairScorer`] seam + the
+    //! pre-flight wall-clock rerank budget. These run WITHOUT a BERT model:
+    //! a CI host always degrades `CrossEncoder::new_neural()` to lexical, so
+    //! the seam is the only way to exercise the neural-rerank decision path
+    //! (`neural_score_pairs` and its blend) and the budget-degrade branch.
+    use super::{
+        BatchedReranker, PairScorer, RERANK_FORWARD_NANOS_PER_PAIR_TOKEN, RERANK_POOL_MAX,
+        RerankerScoreFloor, degrade_to_hybrid_ordering, est_token_len, estimate_rerank_forward_ms,
+        rerank_budget, resolve_rerank_budget_ms, set_rerank_budget_for_test,
+    };
+    use crate::models::Memory;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // The budget lives in a process-global atomic (`set_rerank_budget_for_test`);
+    // serialise every test that mutates it so parallel runners never race.
+    static BUDGET_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn mem(title: &str, content: &str) -> Memory {
+        Memory {
+            title: title.to_string(),
+            content: content.to_string(),
+            ..Memory::default()
+        }
+    }
+
+    /// Deterministic stand-in for the neural cross-encoder. Records call
+    /// count so a test can assert the budget-degrade path SKIPPED scoring.
+    struct StubScorer {
+        neural: bool,
+        calls: AtomicUsize,
+        /// Fixed score returned per candidate, in input order.
+        scores: Vec<f32>,
+    }
+
+    impl PairScorer for StubScorer {
+        fn score_pairs(&self, _query: &str, candidates: &[(Memory, f64)]) -> Vec<f32> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            candidates
+                .iter()
+                .enumerate()
+                .map(|(i, _)| self.scores.get(i).copied().unwrap_or(0.0))
+                .collect()
+        }
+        fn scorer_is_neural(&self) -> bool {
+            self.neural
+        }
+    }
+
+    // ---- tri-state budget grammar (mirrors #2577) -------------------------
+
+    #[test]
+    fn rerank_budget_tri_state_resolution() {
+        // unset ⇒ compiled default.
+        assert_eq!(
+            resolve_rerank_budget_ms(None),
+            super::RERANK_BUDGET_MS_DEFAULT
+        );
+        // explicit 0 ⇒ disabled sentinel (0), distinct from unset.
+        assert_eq!(resolve_rerank_budget_ms(Some("0")), 0);
+        // a parseable value wins, whitespace-trimmed.
+        assert_eq!(resolve_rerank_budget_ms(Some("1500")), 1500);
+        assert_eq!(resolve_rerank_budget_ms(Some("  3000 ")), 3000);
+        // unparseable (and a negative, which u64 rejects) ⇒ default + WARN,
+        // never a silently-widened (0/disabled) window.
+        assert_eq!(
+            resolve_rerank_budget_ms(Some("nonsense")),
+            super::RERANK_BUDGET_MS_DEFAULT
+        );
+        assert_eq!(
+            resolve_rerank_budget_ms(Some("-5")),
+            super::RERANK_BUDGET_MS_DEFAULT
+        );
+    }
+
+    #[test]
+    fn rerank_budget_explicit_zero_disables() {
+        let _guard = BUDGET_LOCK.lock().unwrap();
+        set_rerank_budget_for_test(Some(0));
+        assert!(rerank_budget().is_none(), "explicit 0 disables the budget");
+        set_rerank_budget_for_test(Some(2_000));
+        assert_eq!(rerank_budget().map(|d| d.as_millis()), Some(2_000));
+        set_rerank_budget_for_test(None);
+    }
+
+    // ---- estimate ---------------------------------------------------------
+
+    #[test]
+    fn rerank_estimate_is_zero_for_empty_and_grows_with_work() {
+        assert_eq!(estimate_rerank_forward_ms("q", &[]), 0);
+        // WordPiece byte→token proxy: 4 bytes ≈ 1 token, rounded up.
+        assert_eq!(est_token_len(""), 0);
+        assert_eq!(est_token_len("abcd"), 1);
+        assert_eq!(est_token_len("abcde"), 2);
+
+        // A small, short batch estimates well under the 2000 ms default.
+        let small: Vec<(Memory, f64)> = (0..5)
+            .map(|i| (mem(&format!("t{i}"), "short body"), 0.5))
+            .collect();
+        assert!(
+            estimate_rerank_forward_ms("query", &small) < 2_000,
+            "a small short-content batch must not trip the default budget"
+        );
+
+        // A full pool of long content estimates far higher (the tail-cutter
+        // target): 20 pairs × a document that truncates at max_seq.
+        let long_doc = "x".repeat(4_000);
+        let big: Vec<(Memory, f64)> = (0..RERANK_POOL_MAX + 10)
+            .map(|i| (mem(&format!("t{i}"), &long_doc), 0.5))
+            .collect();
+        let est = estimate_rerank_forward_ms("query", &big);
+        assert!(
+            est > estimate_rerank_forward_ms("query", &small),
+            "more/longer candidates estimate a higher forward cost"
+        );
+        assert!(est > 0);
+        // Coefficient is a real, non-zero named const (calibratable knob).
+        assert!(RERANK_FORWARD_NANOS_PER_PAIR_TOKEN > 0);
+    }
+
+    #[test]
+    fn rerank_degrade_orders_by_hybrid_score_descending() {
+        let out = degrade_to_hybrid_ordering(vec![
+            (mem("a", "aa"), 0.1),
+            (mem("b", "bb"), 0.9),
+            (mem("c", "cc"), 0.5),
+        ]);
+        let scores: Vec<f64> = out.iter().map(|(_, s)| *s).collect();
+        assert_eq!(scores, vec![0.9, 0.5, 0.1], "pre-rerank hybrid order desc");
+    }
+
+    // ---- end-to-end via the seam -----------------------------------------
+
+    #[test]
+    fn rerank_neural_stub_over_budget_degrades_to_hybrid_and_skips_forward() {
+        let _guard = BUDGET_LOCK.lock().unwrap();
+        let stub = Arc::new(StubScorer {
+            neural: true,
+            calls: AtomicUsize::new(0),
+            // ce scores that WOULD reorder if applied (a beats b).
+            scores: vec![1.0, 0.0],
+        });
+        let br = BatchedReranker::with_scorer(
+            stub.clone() as Arc<dyn PairScorer>,
+            RerankerScoreFloor::Off,
+        );
+
+        let before = crate::metrics::registry()
+            .rerank_budget_degraded_total
+            .get();
+        set_rerank_budget_for_test(Some(1)); // 1 ms ⇒ any real batch is over budget
+        let out = br.rerank(
+            "query",
+            vec![(mem("a", "aaaa"), 0.1), (mem("b", "bbbb"), 0.9)],
+        );
+        set_rerank_budget_for_test(None);
+
+        // DEGRADE: pre-rerank hybrid ordering by ORIGINAL score, no ce blend.
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out[0].0.title, "b",
+            "highest original score leads on degrade"
+        );
+        assert!(
+            (out[0].1 - 0.9).abs() < 1e-9,
+            "original score preserved, not blended"
+        );
+        assert!((out[1].1 - 0.1).abs() < 1e-9);
+        assert_eq!(
+            stub.calls.load(Ordering::Relaxed),
+            0,
+            "the neural forward MUST NOT run when pre-flight admission degrades"
+        );
+        assert!(
+            crate::metrics::registry()
+                .rerank_budget_degraded_total
+                .get()
+                > before,
+            "a degrade increments the observability counter"
+        );
+    }
+
+    #[test]
+    fn rerank_neural_stub_within_budget_applies_forward_blend() {
+        let _guard = BUDGET_LOCK.lock().unwrap();
+        let stub = Arc::new(StubScorer {
+            neural: true,
+            calls: AtomicUsize::new(0),
+            scores: vec![1.0, 0.0],
+        });
+        let br = BatchedReranker::with_scorer(
+            stub.clone() as Arc<dyn PairScorer>,
+            RerankerScoreFloor::Off,
+        );
+
+        set_rerank_budget_for_test(Some(10_000_000)); // huge ⇒ always admitted
+        let out = br.rerank(
+            "query",
+            vec![(mem("a", "aaaa"), 0.1), (mem("b", "bbbb"), 0.9)],
+        );
+        set_rerank_budget_for_test(None);
+
+        assert_eq!(stub.calls.load(Ordering::Relaxed), 1, "neural forward ran");
+        // Blend applied: a = 0.6*0.1 + 0.4*1.0 = 0.46; b = 0.6*0.9 + 0.4*0.0 = 0.54.
+        // Output is the blended score, not the original — proving the ce path ran.
+        let by_title = |t: &str| {
+            out.iter()
+                .find(|(m, _)| m.title == t)
+                .map(|(_, s)| *s)
+                .unwrap()
+        };
+        assert!(
+            (by_title("a") - 0.46).abs() < 1e-9,
+            "a carries the blended ce score"
+        );
+        assert!(
+            (by_title("b") - 0.54).abs() < 1e-9,
+            "b carries the blended ce score"
+        );
+    }
+
+    #[test]
+    fn rerank_lexical_scorer_is_never_budget_gated() {
+        let _guard = BUDGET_LOCK.lock().unwrap();
+        let stub = Arc::new(StubScorer {
+            neural: false, // lexical — CPU-trivial, never gated
+            calls: AtomicUsize::new(0),
+            scores: vec![0.0, 0.0],
+        });
+        let br = BatchedReranker::with_scorer(
+            stub.clone() as Arc<dyn PairScorer>,
+            RerankerScoreFloor::Off,
+        );
+
+        set_rerank_budget_for_test(Some(1)); // would degrade a neural scorer
+        let out = br.rerank(
+            "query",
+            vec![(mem("a", "aaaa"), 0.1), (mem("b", "bbbb"), 0.9)],
+        );
+        set_rerank_budget_for_test(None);
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            stub.calls.load(Ordering::Relaxed),
+            1,
+            "a non-neural scorer is never gated, so scoring still runs under a 1 ms budget"
+        );
+    }
+
+    #[test]
+    fn rerank_budget_degrade_still_applies_score_floor() {
+        // Data-integrity invariant (#2608): a degrade must NOT silently return
+        // rows the operator configured AI_MEMORY_RERANK_SCORE_FLOOR to drop.
+        let _guard = BUDGET_LOCK.lock().unwrap();
+        let stub = Arc::new(StubScorer {
+            neural: true,
+            calls: AtomicUsize::new(0),
+            scores: vec![0.0, 0.0, 0.0],
+        });
+        // Absolute floor at 0.4: on the pre-rerank hybrid scale the two
+        // sub-0.4 rows are dropped (the top row is always preserved).
+        let br = BatchedReranker::with_scorer(
+            stub.clone() as Arc<dyn PairScorer>,
+            RerankerScoreFloor::Absolute(0.4),
+        );
+
+        set_rerank_budget_for_test(Some(1));
+        let out = br.rerank(
+            "query",
+            vec![
+                (mem("top", "aaaa"), 0.9),
+                (mem("mid", "bbbb"), 0.3),
+                (mem("low", "cccc"), 0.1),
+            ],
+        );
+        set_rerank_budget_for_test(None);
+
+        assert_eq!(
+            stub.calls.load(Ordering::Relaxed),
+            0,
+            "forward skipped on degrade"
+        );
+        // The floor still fired on the degraded (pre-rerank) scores: the two
+        // rows below 0.4 are dropped, the top row survives.
+        assert_eq!(out.len(), 1, "score floor applies on the degrade path");
+        assert_eq!(out[0].0.title, "top");
     }
 }

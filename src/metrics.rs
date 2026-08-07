@@ -316,6 +316,13 @@ pub struct Metrics {
     /// channel.
     pub recall_embed_degraded_total: IntCounter,
 
+    /// #2608 — monotonic count of autonomous-tier recalls whose cross-encoder
+    /// rerank was skipped by the pre-flight `AI_MEMORY_RERANK_BUDGET_MS`
+    /// admission gate (degraded to the pre-rerank hybrid ordering). MCP stdio
+    /// serves no `/metrics`, so on that surface the `rerank.budget.degraded`
+    /// WARN is the only channel.
+    pub rerank_budget_degraded_total: IntCounter,
+
     /// #2577 — monotonic count of recall query embeddings served from the
     /// process-local cache instead of a remote round trip. Rising with
     /// traffic is the healthy shape (agent fleets repeat queries heavily);
@@ -739,6 +746,20 @@ impl Metrics {
         )?;
         registry.register(Box::new(recall_embed_degraded_total.clone()))?;
 
+        let rerank_budget_degraded_total = IntCounter::new(
+            "ai_memory_rerank_budget_degraded_total",
+            "Monotonic counter of autonomous-tier recalls whose cross-encoder \
+             rerank was SKIPPED because its estimated forward cost exceeded \
+             AI_MEMORY_RERANK_BUDGET_MS (#2608). The recall stays HYBRID \
+             (FTS/semantic-ranked, no neural re-ranking) and the configured \
+             score floor still applies — a DEGRADE, never a wrong result. \
+             Alert on a sustained increment rate: a few trips is a \
+             long-content tail, a sustained rate means the budget is \
+             mis-sized for this corpus. Always zero when the budget is \
+             disabled (=0) or on non-neural reranker deployments.",
+        )?;
+        registry.register(Box::new(rerank_budget_degraded_total.clone()))?;
+
         let query_embed_cache_hits_total = IntCounter::new(
             "ai_memory_query_embed_cache_hits_total",
             "Monotonic counter of recall query embeddings served from the \
@@ -808,6 +829,7 @@ impl Metrics {
             federation_renewal_lag_seconds,
             admission_shed_total,
             recall_embed_degraded_total,
+            rerank_budget_degraded_total,
             query_embed_cache_hits_total,
             age_projection_pending_depth,
             age_projection_failed_total,
@@ -924,6 +946,15 @@ pub fn record_auto_export_spawn_failed() {
 /// channel on MCP stdio (no `/metrics` endpoint there).
 pub fn inc_recall_embed_degraded() {
     registry().recall_embed_degraded_total.inc();
+}
+
+/// v1.0.0 #2608 — record one autonomous-tier recall whose cross-encoder
+/// rerank was skipped by the pre-flight `AI_MEMORY_RERANK_BUDGET_MS`
+/// admission gate (degraded to the pre-rerank hybrid ordering). Pairs with
+/// the `rerank.budget.degraded` WARN at the call site, which is the only
+/// channel on MCP stdio (no `/metrics` endpoint there).
+pub fn inc_rerank_budget_degraded() {
+    registry().rerank_budget_degraded_total.inc();
 }
 
 /// v1.0.0 #2577 — record one recall query embedding served from the
