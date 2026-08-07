@@ -6000,18 +6000,30 @@ pub async fn bootstrap_serve(
     // (eight statements, of which the scrape used one) per request while
     // holding the DB mutex.
     //
-    // SQLITE ONLY, for the same reason as the checker above: `db_state` is
-    // the local sqlite handle, so on a postgres-backed daemon a count taken
-    // here would describe the sidecar rather than the served corpus. That
-    // is a PRE-EXISTING defect of this gauge — `prometheus_metrics` has
-    // always read the sqlite `Db` regardless of backend — and it is filed
-    // separately rather than entrenched here by pacing a wrong number.
-    if !matches!(storage_backend, crate::handlers::StorageBackend::Postgres) {
+    // v1.0.0 #2621 — the refresher DISPATCHES ON THE ACTIVE BACKEND. `db_state`
+    // is the local sqlite handle, which on a postgres-backed daemon is the
+    // SIDECAR, not the served corpus — pacing a count off it published `0`
+    // for a populated pg corpus (#2621). Postgres routes through the SAL trait
+    // (`app_state.store`, the same store the scrape-path cold prime now uses),
+    // mirroring the `access_fold::spawn_sal` postgres-loop precedent; sqlite
+    // keeps the cheap single-`COUNT` `read_total` loop.
+    #[cfg(feature = "sal")]
+    if matches!(storage_backend, crate::handlers::StorageBackend::Postgres) {
+        task_handles.push(crate::background::memories_gauge::spawn_sal(
+            app_state.store.clone(),
+            crate::background::memories_gauge::resolve_interval(),
+        ));
+    } else {
         task_handles.push(crate::background::memories_gauge::spawn(
             db_state.clone(),
             crate::background::memories_gauge::resolve_interval(),
         ));
     }
+    #[cfg(not(feature = "sal"))]
+    task_handles.push(crate::background::memories_gauge::spawn(
+        db_state.clone(),
+        crate::background::memories_gauge::resolve_interval(),
+    ));
 
     // v0.9.0 P0-1 (#1869) — recall-access FOLD loops. The dedicated
     // sqlite-ledger loop (default 60 s) + the postgres SAL loop each live

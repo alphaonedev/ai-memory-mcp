@@ -189,6 +189,118 @@ pub fn spawn(state: Arc<Mutex<DbTuple>>, interval: Duration) -> JoinHandle<()> {
     })
 }
 
+// ---------------------------------------------------------------------
+// v1.0.0 #2621 — postgres/SAL corpus-size gauge refresher.
+//
+// The sqlite `spawn` above counts the local sqlite `Db` handle. On a
+// `--store-url postgres://…` daemon that handle is the local SIDECAR the
+// federation nonce cache + other host-local state live in — NOT the served
+// corpus — so counting it publishes 0 (or the sidecar's count) for a
+// populated postgres corpus (#2621). The refresher must count via the
+// ACTIVE store the daemon serves from (`app.store`), so it routes through
+// the SAL trait's existing `stats()` method — `stats.total` is the SAME
+// physical `COUNT(*)` the sqlite `read_total` publishes. This mirrors the
+// `crate::background::access_fold::{SalFoldStore,spawn_sal}` shape so both
+// backends' loops are unit-testable with a mock rather than only through a
+// live daemon boot.
+// ---------------------------------------------------------------------
+
+/// The one substrate verb the SAL gauge loop drives, narrowed from the
+/// full [`crate::store::MemoryStore`] so the loop is testable with a mock
+/// (the [`crate::background::access_fold::SalFoldStore`] precedent — a
+/// minimal trait, not the whole store surface).
+#[cfg(feature = "sal")]
+#[async_trait::async_trait]
+pub trait SalCountStore: Send + Sync {
+    /// The physical corpus row count (`stats.total`) of the ACTIVE store.
+    ///
+    /// # Errors
+    /// Propagates the substrate stats error; the caller logs and retains
+    /// the previous gauge value (a stale-but-true number beats a zeroed one).
+    async fn count_total(&self) -> anyhow::Result<i64>;
+}
+
+/// Bridge the daemon's `Arc<dyn MemoryStore>` to the narrowed
+/// [`SalCountStore`] verb (the trait-object blanket impl lets [`spawn_sal`]
+/// take `app_state.store` directly). Reads `stats().total`, the SAME
+/// physical `COUNT(*)` the sqlite [`read_total`] path publishes.
+#[cfg(feature = "sal")]
+#[async_trait::async_trait]
+impl SalCountStore for dyn crate::store::MemoryStore {
+    async fn count_total(&self) -> anyhow::Result<i64> {
+        let total = self.stats().await.map_err(anyhow::Error::from)?.total;
+        // `Stats::total` is a `usize` row count; a corpus that overflows
+        // `i64` is not physically representable, so the saturating cast is
+        // order-preserving and never wraps to a negative gauge.
+        Ok(i64::try_from(total).unwrap_or(i64::MAX))
+    }
+}
+
+/// Run one SAL refresh, publishing onto an EXPLICIT metrics handle (the
+/// async sibling of [`refresh_once_into`]). Returns the count it published,
+/// or `None` when the store read failed — in which case NOTHING is
+/// published, so the previous value and its freshness stamp are retained.
+#[cfg(feature = "sal")]
+pub async fn refresh_once_sal_into<S: SalCountStore + ?Sized>(
+    metrics: &crate::metrics::Metrics,
+    store: &S,
+    now_unix: i64,
+) -> Option<i64> {
+    match store.count_total().await {
+        Ok(total) => {
+            publish_into(metrics, total, now_unix);
+            Some(total)
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                error = %e,
+                "corpus-size gauge refresh (postgres) failed; the previous value is \
+                 retained and ai_memory_memories_refreshed_at_seconds will age"
+            );
+            None
+        }
+    }
+}
+
+/// Run one SAL refresh against the process metrics registry — the
+/// production entry point (the paced loop and the scrape-path cold prime).
+#[cfg(feature = "sal")]
+pub async fn refresh_once_sal<S: SalCountStore + ?Sized>(store: &S, now_unix: i64) -> Option<i64> {
+    refresh_once_sal_into(crate::metrics::registry(), store, now_unix).await
+}
+
+/// Spawn the postgres/SAL corpus-size gauge refresher at `interval`. Each
+/// tick sleeps then counts the ACTIVE store and publishes it (the
+/// [`crate::background::access_fold::spawn_sal`] cadence — the first publish
+/// lands after one `interval`; the scrape-path cold prime in
+/// [`crate::handlers::prometheus_metrics`] covers the value before then).
+/// Returns a [`JoinHandle`] the caller aborts on shutdown; the loop tolerates
+/// transient substrate errors (logs + retains the previous value), and a zero
+/// interval disables it (the [`spawn`] precedent).
+#[cfg(feature = "sal")]
+#[must_use]
+pub fn spawn_sal<S>(store: Arc<S>, interval: Duration) -> JoinHandle<()>
+where
+    S: SalCountStore + ?Sized + 'static,
+{
+    tokio::spawn(async move {
+        if interval.as_secs() == 0 {
+            tracing::info!(
+                target: TRACE_TARGET,
+                env = ENV_INTERVAL_SECS,
+                "corpus-size gauge refresher (postgres) DISABLED by configuration"
+            );
+            return;
+        }
+        loop {
+            tokio::time::sleep(interval).await;
+            let now = chrono::Utc::now().timestamp();
+            refresh_once_sal(store.as_ref(), now).await;
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +355,136 @@ mod tests {
             5_000,
             "an empty corpus is distinguishable from `never computed` ONLY by this stamp"
         );
+    }
+
+    // ---- v1.0.0 #2621 — SAL / postgres gauge refresher -------------
+
+    /// The load-bearing #2621 regression: on a postgres-backed daemon the
+    /// gauge must count the ACTIVE store's corpus, NOT the local sqlite
+    /// sidecar. Uses a real `SqliteStore` standing in for ANY `MemoryStore`
+    /// (so the deterministic gate needs no live postgres) and proves the SAL
+    /// path publishes the STORE's count (3) while the sidecar the pre-#2621
+    /// gauge read is empty (0) — the exact divergence the defect reported.
+    /// The live-postgres twin is `tests/pg_memories_gauge_2621.rs`
+    /// (`#[ignore]` + `sal-postgres`, run via `--include-ignored`).
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn sal_refresh_counts_the_active_store_not_the_sqlite_sidecar() {
+        use crate::store::MemoryStore;
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The ACTIVE store the daemon serves from holds a real corpus.
+        let store = crate::store::sqlite::SqliteStore::open(&dir.path().join("active.db"))
+            .expect("open active store");
+        let ctx = crate::store::CallerContext::for_agent("gauge-2621");
+        for i in 0..3 {
+            let now = chrono::Utc::now().to_rfc3339();
+            let mem = crate::models::Memory {
+                id: uuid::Uuid::new_v4().to_string(),
+                title: format!("gauge-row-{i}"),
+                content: "corpus body".to_string(),
+                namespace: "gauge".to_string(),
+                created_at: now.clone(),
+                updated_at: now,
+                ..Default::default()
+            };
+            store.store(&ctx, &mem).await.expect("store row");
+        }
+        let store: Arc<dyn crate::store::MemoryStore> = Arc::new(store);
+
+        // The local sqlite sidecar the pre-#2621 gauge read is EMPTY — on a
+        // postgres daemon its 0 is the WRONG number for a populated corpus.
+        let sidecar = crate::storage::open(&dir.path().join("sidecar.db")).expect("open sidecar");
+        let sidecar_metrics = isolated();
+        assert_eq!(
+            refresh_once_into(&sidecar_metrics, &sidecar, 1_000),
+            Some(0),
+            "the sqlite sidecar the pre-#2621 gauge read is empty — its 0 is the wrong number"
+        );
+
+        // The backend-correct SAL path counts the ACTIVE store's real corpus.
+        let m = isolated();
+        let published = refresh_once_sal_into(&m, store.as_ref(), 7_000).await;
+        assert_eq!(
+            published,
+            Some(3),
+            "the SAL gauge counts the active store's corpus (#2621), not the sidecar"
+        );
+        assert_eq!(m.memories_gauge.get(), 3);
+        assert_eq!(m.memories_gauge_refreshed_at.get(), 7_000);
+    }
+
+    /// A failed SAL store read retains the previous value + freshness stamp
+    /// (the async twin of `a_failed_read_retains_the_previous_value`).
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn sal_a_failed_count_retains_the_previous_value() {
+        struct ErrStore;
+        #[async_trait::async_trait]
+        impl SalCountStore for ErrStore {
+            async fn count_total(&self) -> anyhow::Result<i64> {
+                anyhow::bail!("synthetic sal stats failure")
+            }
+        }
+        let m = isolated();
+        publish_into(&m, 42, 1_000);
+        assert_eq!(refresh_once_sal_into(&m, &ErrStore, 2_000).await, None);
+        assert_eq!(m.memories_gauge.get(), 42, "stale-but-true beats zeroed");
+        assert_eq!(
+            m.memories_gauge_refreshed_at.get(),
+            1_000,
+            "the freshness stamp must NOT advance on a failed read"
+        );
+    }
+
+    /// Drive the real [`spawn_sal`] tokio loop with a sub-millisecond
+    /// interval so its body (count → publish → sleep) executes several
+    /// times, then abort the handle (the `access_fold::spawn_sal` pattern).
+    #[cfg(feature = "sal")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn spawn_sal_loop_counts_across_ticks() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        struct CountingStore {
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl SalCountStore for CountingStore {
+            async fn count_total(&self) -> anyhow::Result<i64> {
+                let n = self.calls.fetch_add(1, SeqCst);
+                Ok(i64::try_from(n).unwrap_or(0))
+            }
+        }
+        let store = Arc::new(CountingStore {
+            calls: AtomicUsize::new(0),
+        });
+        // A whole-second interval: the disable guard is `as_secs() == 0`, so
+        // a sub-second `Duration` would be read as "disabled" and never tick.
+        let handle = spawn_sal(Arc::clone(&store), Duration::from_secs(1));
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        handle.abort();
+        let _ = handle.await;
+        assert!(
+            store.calls.load(SeqCst) >= 2,
+            "spawn_sal loop should have counted the corpus at least twice"
+        );
+    }
+
+    /// A zero interval disables the SAL loop (never counts) — the postgres
+    /// twin of `default_interval_is_a_minute_and_nonzero`'s disable arm.
+    #[cfg(feature = "sal")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn spawn_sal_zero_interval_disables_the_loop() {
+        struct NeverStore;
+        #[async_trait::async_trait]
+        impl SalCountStore for NeverStore {
+            async fn count_total(&self) -> anyhow::Result<i64> {
+                panic!("a disabled loop must never count the corpus");
+            }
+        }
+        // A zero interval makes the spawned task return immediately.
+        let handle = spawn_sal(Arc::new(NeverStore), Duration::from_secs(0));
+        handle.await.expect("disabled loop returns cleanly");
     }
 }
