@@ -37,14 +37,14 @@ There is no separate development repo. `ai-memory-mcp-dev` is archived.
 | Rule | Enforcement |
 |------|-------------|
 | Direct pushes | Blocked — PRs required |
-| Approving reviews | 1 required from `@alphaonedev` (CODEOWNERS) |
-| Stale review dismissal | Enabled — new pushes invalidate approvals |
+| Approving reviews | **0 required** — single-authority model: no second account can supply one and self-approval is forbidden. `CODEOWNERS` (`* @alphaonedev`) is a routing marker, not a gate. See `AI_DEVELOPER_GOVERNANCE.md` §5.0. |
+| Stale review dismissal | Inert — no approving review is required, so none can become stale (§5.0). Freshness is enforced via branch-up-to-date (`strict`). |
 | CI status checks | `Check (ubuntu-latest)` + `Check (macos-latest)` must pass |
 | Branch up-to-date | Required before merge |
 | Force pushes | Blocked |
 | Branch deletion | Blocked |
 
-No code reaches `main` without the project owner's explicit approval.
+No code reaches `main` outside the single authority: `@alphaonedev` (and the AI-NHI agents acting under it) merges every change, gated by the three-layer review model — per-PR AI review + security audit, per-PR CI/`enforce_admins`, and the independent per-release operator review at tag-cut — **not** by an independent per-PR approving review (`AI_DEVELOPER_GOVERNANCE.md` §5.0).
 
 PRs to `develop` do not require owner approval but must pass all CI checks (fmt, clippy pedantic, tests).
 
@@ -309,7 +309,7 @@ Before tagging a release:
 | Reference | Location |
 |-----------|----------|
 | CI/CD workflow | `.github/workflows/ci.yml` |
-| Branch protection | GitHub repo settings + `.github/CODEOWNERS` |
+| Branch protection | GitHub repo settings + required-context SSOT (`scripts/qc-allowlists/required-contexts-release.txt`). `.github/CODEOWNERS` is a routing marker, not an enforced gate (§5.0). |
 | Contributing guide | `CONTRIBUTING.md` |
 | AI Developer Workflow | `docs/AI_DEVELOPER_WORKFLOW.md` |
 | AI Developer Governance Standard | `docs/AI_DEVELOPER_GOVERNANCE.md` |
