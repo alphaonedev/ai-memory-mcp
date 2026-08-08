@@ -89,9 +89,9 @@ variable "ai_memory_image_url" {
 }
 
 variable "ironclaw_image_url" {
-  description = "URL to the IronClaw v0.28.1 runner tarball."
+  description = "URL to the IronClaw v1.1.0 runner tarball."
   type        = string
-  default     = "https://github.com/alphaonedev/ironclaw/releases/download/v0.28.1/ironclaw-x86_64-unknown-linux-gnu.tar.gz"
+  default     = "https://github.com/nearai/ironclaw/releases/download/ironclaw-v1.1.0/ironclaw-x86_64-unknown-linux-gnu.tar.gz"
 }
 
 // ---------------------------------------------------------------------------

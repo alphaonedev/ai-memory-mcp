@@ -138,27 +138,27 @@ services:
       # single-host Docker network used for parity/chaos testing only. Do NOT
       # copy this line into a deployment whose peers cross a real network.
       AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS: "1"
-      # Operator directive 2026-05-31 (supersedes 2026-05-21 #1067 xAI
-      # Grok 4.3 wiring): IronClaw containers run with OpenRouter
-      # google/gemma-4-26b-a4b-it as the AI NHI brain. Cost+context
-      # rationale: $0.06/M-in + $0.33/M-out (vs $3 + $15 on xAI Grok 4.3,
-      # a 50-95× cost reduction); 262144-token context; 26B sparse-MoE
-      # quality is materially stronger than local 8B gemma4:e4b for
-      # long-context atomise/reflect/calibrate paths. Connectivity
-      # verified 2026-05-31 ~11:23 ET (HTTP 200, 2.2s latency).
+      # Enterprise-cert campaign 2026-08-08 (supersedes the 2026-05-31
+      # OpenRouter Gemma 4 26B cost-optimization for THIS certified
+      # enterprise-federated round): IronClaw containers run Grok 4.5 via
+      # OpenRouter (`x-ai/grok-4.5`) as the AI NHI brain, matching the DO
+      # substrate (infra/do-hive/cloud-init-agent.yaml.tpl runs the xAI-direct
+      # `grok-4.5` model) so the free local lan-parity run and the paid DO run
+      # exercise the SAME model family. Only the model id changes here; the
+      # OpenRouter backend selection is unchanged. Operators who want the prior
+      # cost-optimized Gemma brain override via env
+      # (`AI_MEMORY_LLM_MODEL=google/gemma-4-26b-a4b-it`).
       # `OPENROUTER_API_KEY` comes from `~/.env` on this node;
       # `:?` syntax fails compose with a clear error if the shell env
       # hasn't sourced ~/.env first. Production operators run:
       #   set -a; source ~/.env; set +a
       #   docker compose -f infra/lan-parity-test/docker-compose.yml up -d
       AI_MEMORY_LLM_BACKEND: "openrouter"
-      AI_MEMORY_LLM_MODEL: "${AI_MEMORY_LLM_MODEL:-google/gemma-4-26b-a4b-it}"
-      # auto_tag historically used a separate fast/cheap model
-      # (gemma3:4b on Ollama, then grok-4.3 mini on xAI). On OpenRouter
-      # the same paid Gemma 4 26B model is cheap enough to use uniformly;
-      # operators with extreme cost concerns can override via env to
-      # google/gemma-4-26b-a4b-it:free (rate-limited) or any other model.
-      AI_MEMORY_AUTO_TAG_MODEL: "${AI_MEMORY_AUTO_TAG_MODEL:-google/gemma-4-26b-a4b-it}"
+      AI_MEMORY_LLM_MODEL: "${AI_MEMORY_LLM_MODEL:-x-ai/grok-4.5}"
+      # auto_tag reuses the same paid Grok 4.5 model uniformly; operators with
+      # extreme cost concerns can override via env to a cheaper OpenRouter model
+      # (e.g. google/gemma-4-26b-a4b-it) or any other model.
+      AI_MEMORY_AUTO_TAG_MODEL: "${AI_MEMORY_AUTO_TAG_MODEL:-x-ai/grok-4.5}"
       # Kept for backward compat with anything that still reads OLLAMA_BASE_URL
       # directly (e.g., tier-default fallback when AI_MEMORY_LLM_BACKEND unset
       # in some future config path). Harmless when AI_MEMORY_LLM_BACKEND=openrouter.
@@ -224,11 +224,12 @@ services:
       # single-host Docker network used for parity/chaos testing only. Do NOT
       # copy this line into a deployment whose peers cross a real network.
       AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS: "1"
-      # See alice's block for the 2026-05-31 OpenRouter Gemma 4 26B
-      # rationale (supersedes the #1067 xAI Grok 4.3 wiring).
+      # See alice's block for the 2026-08-08 enterprise-cert Grok 4.5
+      # rationale (`x-ai/grok-4.5` via OpenRouter; supersedes the
+      # 2026-05-31 Gemma 4 26B cost-optimization for this cert round).
       AI_MEMORY_LLM_BACKEND: "openrouter"
-      AI_MEMORY_LLM_MODEL: "${AI_MEMORY_LLM_MODEL:-google/gemma-4-26b-a4b-it}"
-      AI_MEMORY_AUTO_TAG_MODEL: "${AI_MEMORY_AUTO_TAG_MODEL:-google/gemma-4-26b-a4b-it}"
+      AI_MEMORY_LLM_MODEL: "${AI_MEMORY_LLM_MODEL:-x-ai/grok-4.5}"
+      AI_MEMORY_AUTO_TAG_MODEL: "${AI_MEMORY_AUTO_TAG_MODEL:-x-ai/grok-4.5}"
       OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434}"
       OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY must be set in shell env — source ~/.env before running docker compose up}"
       AI_MEMORY_API_KEY: "${AI_MEMORY_API_KEY:-${OPENROUTER_API_KEY}}"
