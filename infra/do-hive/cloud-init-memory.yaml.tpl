@@ -75,12 +75,16 @@ write_files:
       fi
 
       # --- build + install Apache AGE from source against pg16 ---
-      # AGE is source-only. master supports PG16; pin the PG16 release branch.
+      # AGE is source-only. Pin the EXACT release tag release_PG16_1.6.0 so the
+      # DO substrate is version-identical to infra/lan-parity-test/Dockerfile.pg-age-vector
+      # (FROM apache/age:release_PG16_1.6.0). An unpinned branch (PG16/master) can
+      # drift the AGE version between the free local parity run and the paid DO
+      # run, so a cert result proven locally would not be proven on DO.
       if [ ! -f "$(/usr/bin/pg_config --pkglibdir)/age.so" ]; then
         rm -rf /opt/age-src
         git clone https://github.com/apache/age.git /opt/age-src
         cd /opt/age-src
-        git checkout PG16 || git checkout master
+        git checkout release_PG16_1.6.0
         make PG_CONFIG=/usr/bin/pg_config
         make install PG_CONFIG=/usr/bin/pg_config
       fi

@@ -11,7 +11,7 @@ write_files:
     permissions: '0644'
     content: |
       [Unit]
-      Description=IronClaw v0.29.1 agent #${agent_index} (Track E1 hive)
+      Description=IronClaw v1.1.0 agent #${agent_index} (Track E1 hive)
       After=network-online.target
       Wants=network-online.target
 
