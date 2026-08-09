@@ -273,7 +273,7 @@ footer a{color:var(--text-muted)}
         </tr>
         <tr>
           <td class="col-name">c · Poor approval workflows</td>
-          <td>Track G 27-event hook pipeline (Allow/Modify/Deny/AskUser) + K10 pending-actions SSE stream + HMAC-mandatory webhook dispatch</td>
+          <td>Track G 22-event hook pipeline (Allow/Modify/Deny/AskUser) + K10 pending-actions SSE stream + HMAC-mandatory webhook dispatch</td>
           <td><code>track_g_hook_pipeline</code></td>
           <td><code>hooks::events::HookEvent</code> · <code>handlers::routes::APPROVALS_STREAM</code> · <code>subscriptions::dispatch_approval_requested</code></td>
           <td><span class="status ok">addressed</span></td>
@@ -386,7 +386,7 @@ footer a{color:var(--text-muted)}
         </tr>
         <tr>
           <td class="col-name">g · Instrument for logging and detection</td>
-          <td>V-4 signed-events chain + Prometheus DLQ depth gauge + capabilities v3 envelope + Track G 27-event hook pipeline + bare /metrics surface</td>
+          <td>V-4 signed-events chain + Prometheus DLQ depth gauge + capabilities v3 envelope + Track G 22-event hook pipeline + bare /metrics surface</td>
           <td><code>v4_signed_events_chain</code>, <code>dos_multi_layer_defense</code>, <code>capabilities_v3_envelope</code>, <code>track_g_hook_pipeline</code></td>
           <td><code>signed_events</code> · <code>federation::push_dlq::refresh_depth_gauge</code> · <code>handlers::transport::prometheus_metrics</code></td>
           <td><span class="status ok">implemented</span></td>
@@ -686,7 +686,7 @@ ai-memory serve</pre>
         <h3>g · Instrument for logging and detection</h3>
         <div class="meta"><span class="status ok">implemented</span></div>
       </div>
-      <p>V-4 signed-events chain; Prometheus depth gauge on federation push DLQ (<code>federation::push_dlq::refresh_depth_gauge</code>); capabilities v3 envelope publishing runtime configuration; Track G 27-event hook pipeline at every memory lifecycle transition; bare <code>/metrics</code> Prometheus surface.</p>
+      <p>V-4 signed-events chain; Prometheus depth gauge on federation push DLQ (<code>federation::push_dlq::refresh_depth_gauge</code>); capabilities v3 envelope publishing runtime configuration; Track G 22-event hook pipeline at every memory lifecycle transition; bare <code>/metrics</code> Prometheus surface.</p>
     </div>
 
     <div class="recommendation">

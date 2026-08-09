@@ -1034,7 +1034,7 @@ HTTP API can set any well-formed `agent_id`; what a signature attests is the
 `attest_level`, not that the id itself is trustworthy for authorization. Use such
 an id for provenance, audit, and filter scoping — **never as an authorization gate
 on its own.** (Whether an *unsigned* write is accepted at all is governed by the
-store-path attestation gate below — **required by default since v0.9.0**.)
+store-path attestation gate below — **required by default on the HTTP direct-write surface only** since v1.0.0 (#1985, correcting #1751); MCP/CLI stay permissive.)
 
 **Store-path attestation (#626 Layer-3, v0.7.0).** A caller holding the agent's
 keypair can upgrade a write from claimed to attested by presenting a detached

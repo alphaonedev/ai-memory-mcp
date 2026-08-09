@@ -6,28 +6,25 @@ layout: doc
 **Category 1 (hook-capable). 100% reliable.** This is the load-bearing
 remediation for issue [#487](https://github.com/alphaonedev/ai-memory-mcp/issues/487).
 
-> ### ⚠️ v0.9.0 — attestation is required by default; Claude Code's MCP client doesn't sign
-> As of **v0.9.0**, ai-memory **rejects unsigned writes** with `403 ATTESTATION_FAILED`.
-> Claude Code's MCP client sends `memory_store` **without a signature**, and ai-memory
-> does **not** self-sign memory writes server-side — so on a v0.9.0 MCP server your
-> Claude Code memory captures would fail.
+> ### ℹ️ v1.0.0 — attestation is surface-scoped; MCP needs no opt-out
+> **This note previously told you to set `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`. Do not do
+> that.** It described the v0.9.0 posture (#1751), which required attestation on *every*
+> surface. Claude Code's MCP client sends `memory_store` **without a signature** and no MCP
+> host can construct the canonical `SignableWrite` envelope, which made that default
+> unsatisfiable on MCP ([#1981](https://github.com/alphaonedev/ai-memory-mcp/issues/1981)).
 >
-> **For a normal single-operator Claude Code setup, opt out** — add this to the
-> ai-memory MCP server's `env` block in `~/.claude.json`:
+> **v1.0.0 ([#1985](https://github.com/alphaonedev/ai-memory-mcp/issues/1985)) fixed it in the
+> substrate, not in your config:** with `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` **unset**, the
+> fail-closed `403 ATTESTATION_FAILED` applies to the **HTTP direct-write surface only**
+> (`POST /api/v1/memories` + `/bulk`). The MCP `memory_store` and CLI `store` surfaces are the
+> operator-as-actor path: an unsigned write is accepted and lands `attest_level="claimed"`.
+> **A stock Claude Code setup works out of the box with no `env` override.**
 >
-> ```jsonc
-> "mcpServers": {
->   "ai-memory": {
->     "command": "ai-memory",
->     "args": ["mcp", "--profile", "full"],
->     "env": { "AI_MEMORY_REQUIRE_AGENT_ATTESTATION": "0" }
->   }
-> }
-> ```
->
-> Keep attestation **required** only for multi-agent / shared / federated deployments
-> (where the client signs) — attested writes are still available on the CLI
-> (`ai-memory store --sign`). Full guide: **[Attestation setup](../attestation.html)**.
+> Setting `=0` is a **global** override — it also disables the one surface where the gate is
+> genuinely load-bearing (HTTP direct-write, the network surface). Leave it unset. Use `=1`
+> only if you want strict on every surface and your clients can sign; attested writes remain
+> available on the CLI via `ai-memory store --sign`.
+> Full guide: **[Attestation setup](../attestation.html)**.
 
 ## Quick install
 

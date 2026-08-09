@@ -584,7 +584,8 @@ pub(super) fn signal_author_authorized(
 ///   against the re-attributed sender (it would spuriously read as forged).
 ///   The row already correctly landed `claimed`; leave it.
 /// - **Strict mode is third-party-only.** `require_write_sig_env`
-///   (`AI_MEMORY_FED_REQUIRE_WRITE_SIG`, default off) is honored only for a
+///   (`AI_MEMORY_FED_REQUIRE_WRITE_SIG`, default ON at v1.0.0 per
+///   `FED_REQUIRE_WRITE_SIG_DEFAULT` — #1801->#1954; `=0` reverts) is honored only for a
 ///   HONORED third-party relayed claim (`attribute_agent != sender_agent_id`);
 ///   self-authored relays stay faith-based (already gated by the #238
 ///   envelope attestation + #29 signature + #30 nonce + #43 enrollment), so a

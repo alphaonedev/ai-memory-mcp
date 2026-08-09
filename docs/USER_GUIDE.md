@@ -1419,7 +1419,7 @@ the signature against the agent's **bound public key** (registered via
 verbatim (±300 s freshness window). A forged signature is rejected with
 `403 ATTESTATION_FAILED`.
 
-As of v0.9.0 ([#1751](https://github.com/alphaonedev/ai-memory-mcp/issues/1751)), attestation is **required by default**: an unsigned
+As of v1.0.0 ([#1985](https://github.com/alphaonedev/ai-memory-mcp/issues/1985), correcting [#1751](https://github.com/alphaonedev/ai-memory-mcp/issues/1751)), attestation is **required by default on the HTTP direct-write surface only** (`POST /api/v1/memories` + `/bulk`); MCP `memory_store` and CLI `store` are the operator-as-actor path and stay permissive, landing `claimed`. On the HTTP direct-write surface an unsigned
 write is **rejected** (`403 ATTESTATION_FAILED`) rather than landing claimed.
 Operators who need the pre-v0.9 permissive posture (unsigned → claimed) must
 set the explicit opt-out `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` (or
