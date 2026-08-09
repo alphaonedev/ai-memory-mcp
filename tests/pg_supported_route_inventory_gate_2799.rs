@@ -49,16 +49,20 @@
 //! the inventory reviewable; those tests make each entry behaviourally
 //! true.
 
-#![cfg(feature = "sal")]
 // This gate's value is the prose: the doc comments ARE the reviewable,
 // authoritative pg-supported inventory + the binding-safety rationale.
 // Relax the doc-STYLE pedantic lints (identifier backticks / list
-// indentation) here — the prose is intentional and human-facing.
+// indentation) here — the prose is intentional and human-facing. These
+// allows sit BEFORE the `#![cfg]` so they still apply to the crate-level
+// `//!` module docs on a non-sal build (e.g. the vectorlite CI leg),
+// where `#![cfg(feature = "sal")]` empties the crate but the module docs
+// are still linted.
 #![allow(
     clippy::doc_markdown,
     clippy::doc_overindented_list_items,
     clippy::doc_lazy_continuation
 )]
+#![cfg(feature = "sal")]
 
 use axum::http::Method;
 use std::collections::BTreeSet;
