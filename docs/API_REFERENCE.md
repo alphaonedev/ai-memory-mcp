@@ -104,7 +104,7 @@ public key: body `{"pubkey_b64": "<base64 32-byte key>"}`, response
 `{"bound": true, "agent_id": "..."}`; the pubkey is validated as a real
 curve point and the agent must already be registered. Gives attesting
 clients a first-party enrollment surface instead of an out-of-band DB
-write — store-path attestation is required by default since v0.9.0
+write — store-path attestation is required by default on the HTTP direct-write surface only since v1.0.0 (#1985, correcting #1751; MCP/CLI stay permissive)
 (#1751; opt out with `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`)).
 The admin allowlist is `[admin] agent_ids = [...]` in `config.toml`
 (plus `AI_MEMORY_ADMIN_AGENT_IDS`); when empty (the default) these

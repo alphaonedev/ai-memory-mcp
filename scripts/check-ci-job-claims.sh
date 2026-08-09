@@ -178,6 +178,32 @@ MDEOF
         echo "FAIL: self-test C-31 near-miss — a NON-enforcement mention of the same workflow was rejected" >&2; exit 1; }
     echo "PASS: self-test C-31 near-miss — the same workflow described WITHOUT an enforcement claim PASSES"
 
+    # ---- WF_WORD: the bare-stem citation shape (3x7 lane-3, 2026-08-09).
+    # README carried "The `token-budget` workflow is a **required status
+    # check**" while token-budget appears NOWHERE in the required-context
+    # mirror. WF_TICK needs a .yml suffix and JOB_CITE needs the literal
+    # word "job", so the ENFORCEMENT rule -- built for exactly this false
+    # claim -- could not see the most-quoted enforcement sentence in the
+    # tier-1 doc. R-203: the leg asserts the pre-fix shape is REJECTED,
+    # and that the rejection comes from the ENFORCEMENT rule.
+    write_clean
+    printf 'The `bench` workflow is a **required status check**.\n' > "$FIX/README.md"
+    [[ "$(run_fixture)" != "0" ]] || {
+        echo "FAIL: self-test WF_WORD — a bare-stem workflow citation claiming required-status was ACCEPTED." >&2
+        echo "       This is the README:795 token-budget shape; without WF_WORD the gate is blind to it." >&2
+        exit 1; }
+    run_fixture_out | grep -q 'WORKFLOW_ENFORCEMENT' || {
+        echo "FAIL: self-test WF_WORD — rejected, but NOT by the enforcement rule (wrong reason)" >&2; exit 1; }
+    echo "PASS: self-test WF_WORD — a bare-stem workflow-stem citation + required-status claim is REJECTED"
+
+    # Near-miss: the same bare-stem citation with NO enforcement verb must
+    # PASS, so the shape does not ban naming an advisory workflow.
+    write_clean
+    printf 'The `bench` workflow runs on every PR and uploads a baseline JSON artifact.\n' > "$FIX/README.md"
+    [[ "$(run_fixture)" = "0" ]] || {
+        echo "FAIL: self-test WF_WORD near-miss — a non-enforcement bare-stem mention was rejected" >&2; exit 1; }
+    echo "PASS: self-test WF_WORD near-miss — bare-stem mention without an enforcement verb PASSES"
+
     # ---- C-21: a job cited inside a workflow that has no such job ----
     write_clean
     printf 'The **J8 CI gate** (see `.github/workflows/bench.yml`, AGE job) blocks merge.\n' > "$FIX/PERFORMANCE.md"
@@ -387,7 +413,11 @@ def job_is_required(token):
     return any(r.startswith(token + " (") for r in required)
 
 
-DOCS = ["README.md", "ROADMAP.md", "PERFORMANCE.md"] + sorted(glob.glob(
+DOCS = ["README.md", "ROADMAP.md", "PERFORMANCE.md",
+        "docs/DEVELOPER_GUIDE.md", "docs/ENGINEERING_STANDARDS.md",
+        "docs/CLI_REFERENCE.md", "docs/CONFIG_SCHEMA.md",
+        "docs/reproducible-baselines.html", "docs/for-everyone.html",
+        "docs/audience/developer.html"] + sorted(glob.glob(
     os.path.join(root, "docs/v1.0.0/*.md")))
 
 # YAML trigger / structural keywords are not job names.
@@ -443,6 +473,15 @@ WF_PATH = re.compile(r"\.github/workflows/([A-Za-z0-9_.-]+\.ya?ml)")
 WF_TICK = re.compile(r"`([A-Za-z0-9_.-]+\.ya?ml)`")
 POSSESSIVE = re.compile(
     r"`([A-Za-z0-9_.-]+\.ya?ml)`'s\s+(?:\"([^\"]+)\"|`([^`]+)`)\s+job")
+# `<stem>` workflow -- the bare-stem citation shape (3x7 lane-3,
+# 2026-08-09). README said "The `token-budget` workflow is a **required
+# status check**" while `token-budget` appears NOWHERE in
+# required-contexts-release.txt. Neither WF_TICK (needs a .yml suffix)
+# nor JOB_CITE (needs the literal word "job") could see it, so the
+# ENFORCEMENT rule -- the rule built for exactly that false claim --
+# was structurally blind to the single most-quoted enforcement
+# sentence in the tier-1 doc. Resolves the stem to <stem>.yml.
+WF_WORD = re.compile(r"`([A-Za-z0-9_.-]{2,40})`\s+workflow\b")
 JOB_CITE = re.compile(
     r"(?:`([^`\n]{2,60})`|\"([^\"\n]{2,60})\")\s+(?:CI\s+|nightly\s+)?job\b")
 JOB_IN_WF = re.compile(
@@ -480,6 +519,14 @@ for d in DOCS:
             # exists SOMEWHERE in the tree (compose files, fixtures).
             if not glob.glob(os.path.join(root, "**", name), recursive=True):
                 emit("YAML_FILE", rel, ln, name, ctx, "cited .yml exists nowhere in the tree")
+        for m in WF_WORD.finditer(line):
+            stem = m.group(1)
+            if stem.endswith((".yml", ".yaml")):
+                continue
+            for cand in (stem + ".yml", stem + ".yaml"):
+                if os.path.exists(os.path.join(root, ".github/workflows", cand)):
+                    cited_wfs.setdefault(cand, (m.start(), m.end()))
+                    break
 
         # ---- named JOB existence -------------------------------------
         cited_jobs = []

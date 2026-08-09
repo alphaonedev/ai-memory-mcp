@@ -167,6 +167,29 @@ HTML_DOC_FILES=(
     docs/compliance/nsa-csi-mcp.html
 )
 
+# Additional surfaces walked ONLY by the HookEvent rule (3x7 lane-3,
+# 2026-08-09). The HookEvent rule was the last legacy hand-regex left
+# behind when #2492 generalised the other SSOT rules, and it was ALSO
+# scoped to DOC_FILES/HTML_DOC_FILES -- so it missed the class twice.
+# At f7399cfb the gate reported hooks=22 and PASSED while five live
+# surfaces published 25 or 27, two of them naming pre_recall, an event
+# #2758 REMOVED precisely because advertising a hook that never fires
+# is a false enforcement claim.
+#
+# Deliberately a SEPARATE list, not an extension of DOC_FILES /
+# HTML_DOC_FILES: those are shared by the route / tool / CLI-count
+# rules, and widening them here would enroll pages whose OTHER counts
+# belong to a different correction lane, redding this gate on drift it
+# is not the subject of. One rule, one scan set.
+HOOK_DOC_FILES=(
+    "${DOC_FILES[@]}"
+    "${HTML_DOC_FILES[@]}"
+    docs/production-deployment.md
+    docs/strategy/coala-mapping.md
+    docs/audience/developer.html
+    docs/essays/brass-tacks-3-why.html
+)
+
 # CHANGELOG.md is intentionally excluded — every entry is a historical
 # snapshot at landing time, so claims like "Both adapters now at
 # CURRENT_SCHEMA_VERSION = 50" are CORRECT historical state, not drift.
@@ -290,7 +313,35 @@ check_narrative_count_rule() {
             python3 -c "
 import re, sys
 pat = re.compile(r'''$pattern''')
+# HISTORICAL GUARD -- 3x7 lane-3, 2026-08-09. Mirrors is_historical in
+# the #2492 generalised scanner below. Principle: a TRUE statement about
+# a PAST release must never be re-pointed at the canonical, or the gate
+# destroys the record it exists to protect. This legacy per-rule function
+# never had the guard -- harmless only while every rule regex was narrow
+# enough to miss history by accident. Generalising the HookEvent anchors
+# made that accident stop holding: the README prior-release paragraph and
+# the ROADMAP frozen v0.7.1 baseline both legitimately say 25.
+# NOTE: single-quoted regexes only -- this python is embedded in a
+# double-quoted shell string, so a double quote here closes it.
+_PARA_LEAD = re.compile(r'^\s*\*\*v([0-9]+\.[0-9]+\.[0-9]+)')
+_HIST = [
+    re.compile(r'^\s*#{1,6}\s'),
+    re.compile(r'\b[Aa]t the v[0-9]+\.[0-9]+\.[0-9]+ release\b'),
+    re.compile(r'\brelease, surface was\b'),
+    re.compile(r'\bv[0-9]+ added\b'),
+    re.compile(r'\bwas [0-9]+ at v[0-9]'),
+    re.compile(r'\bShip state at v[0-9]+\.[0-9]+'),
+    re.compile(r'\bFrozen v[0-9]+\.[0-9]+[^ ]* baseline\b'),
+]
+_release = '''$CANONICAL_RELEASE_VERSION'''
+def _is_historical(line):
+    m = _PARA_LEAD.match(line)
+    if m and m.group(1) != _release:
+        return True
+    return any(p.search(line) for p in _HIST)
 for ln, line in enumerate(open('$f').read().splitlines(), 1):
+    if _is_historical(line):
+        continue
     for m in pat.finditer(line):
         # Alternation groups: take the FIRST non-None capture
         val = next((g for g in m.groups() if g is not None), '')
@@ -653,11 +704,25 @@ run_all_rules() {
         "MemoryLinkRelation::COUNT" \
         "$CANONICAL_LINK_COUNT" \
         '\*\*([0-9]+) variants at v0\.7\.0\*\* \(was four at v0\.6\.x\)'
-    # HookEvent count
+    # HookEvent count -- GENERALISED noun-phrase anchors (3x7 lane-3,
+    # 2026-08-09), replacing the two hand-written phrasings this rule
+    # shipped with. Per the #2492 diagnosis: a document that says the
+    # same thing in the seventh way nobody enumerated is invisible.
+    # Anchors are NOUNS + any adjacent integer, so a re-worded sentence
+    # is still caught.
+    #
+    # The (?<![0-9])(?<!ships ) guard on the bare "lifecycle events"
+    # anchor is load-bearing: ROADMAP opens its v0.8.0 planning row with
+    # "v0.7.0 grand-slam ships 25 lifecycle events." -- a TRUE past-release
+    # statement. The digit lookbehind is required too: without it the
+    # engine simply re-anchors one character right and matches "5".
+    # "variants total" is deliberately NOT an anchor for the same reason:
+    # that same line legitimately carries "27 variants total AT v0.8.0".
     check_narrative_count_rule \
         "HookEvent variants" \
         "$CANONICAL_HOOK_EVENTS" \
-        '\*\*([0-9]+) hook lifecycle events\*\*|([0-9]+) lifecycle events\) — A programmable'
+        '([0-9]+)[- ]event hook pipeline|([0-9]+) named substrate events|([0-9]+) hook lifecycle events|(?<![0-9])(?<!ships )([0-9]+) lifecycle events' \
+        "${HOOK_DOC_FILES[@]}"
     # Routes count
     check_narrative_count_rule \
         "EXPECTED_PRODUCTION_ROUTES_COUNT" \
@@ -1098,6 +1163,70 @@ HTMLGOODEOF
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test — correct HTML CLI counts (78/80) still PASS"
+
+    # ---- HOOKEVENT WIDENING (3x7 lane-3, 2026-08-09). Before this
+    # widening the HookEvent rule matched exactly TWO hand-written
+    # phrasings and scanned only DOC_FILES/HTML_DOC_FILES, so at
+    # f7399cfb it reported hooks=22 and PASSED while five live surfaces
+    # published 25 or 27 -- including docs/audience/developer.html
+    # naming pre_recall, an event #2758 REMOVED. Plant all five VERBATIM
+    # pre-fix phrasings (fixture canonical is 25, so 27 is drift) and
+    # assert the widened rule REJECTS every one, naming its file.
+    rm -f "$led"
+    mkdir -p "$tmpdir/docs/audience" "$tmpdir/docs/essays" "$tmpdir/docs/strategy"
+    cat > README.md <<'HOOKSTALEREADME'
+- **Hook pipeline (27 lifecycle events).** A programmable extension surface.
+HOOKSTALEREADME
+    cat > "$tmpdir/docs/production-deployment.md" <<'HOOKSTALEPD'
+Hooks (`pre_store`, `post_store`, etc. — 27 lifecycle events, see hook-pipeline.md) are the supported extension surface.
+HOOKSTALEPD
+    cat > "$tmpdir/docs/strategy/coala-mapping.md" <<'HOOKSTALECOALA'
+| Working memory | ... | `src/hooks/events.rs` (27 lifecycle events with typed payloads) |
+HOOKSTALECOALA
+    cat > "$tmpdir/docs/audience/developer.html" <<'HOOKSTALEDEV'
+  <h2>27-event hook pipeline + HMAC subscriptions.</h2>
+  <p>The hook pipeline fires on 27 named substrate events.</p>
+HOOKSTALEDEV
+    cat > "$tmpdir/docs/essays/brass-tacks-3-why.html" <<'HOOKSTALEBT'
+  <p>The hook pipeline fires on 27 named substrate events.</p>
+HOOKSTALEBT
+    if hook_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+        echo "FAIL: self-test — widened HookEvent rule did NOT catch the five planted 27-vs-25 claims" >&2
+        printf '%s\n' "$hook_out" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    for hf in README.md docs/production-deployment.md docs/strategy/coala-mapping.md \
+              docs/audience/developer.html docs/essays/brass-tacks-3-why.html; do
+        grep -q "HookEvent variants: $hf" <<<"$hook_out" || {
+            echo "FAIL: self-test — widened HookEvent rule missed the planted claim in $hf" >&2
+            printf '%s\n' "$hook_out" >&2
+            cd "$REPO_ROOT"; exit 1; }
+    done
+    echo "PASS: self-test — widened HookEvent rule REJECTS all five pre-fix phrasings across md + html"
+
+    # ---- HOOKEVENT HISTORICAL CONTROL. The generalised anchors would be
+    # unusable without the guard: ROADMAP legitimately opens a planning
+    # row "v0.7.0 grand-slam ships 25 lifecycle events." and carries a
+    # frozen v0.7.1 baseline, and README carries prior-release paragraph
+    # leads. All must PASS even though their numbers differ from the
+    # canonical. The bare digit lookbehind matters here too -- without
+    # (?<![0-9]) the engine re-anchors one char right and matches "7".
+    cat > README.md <<'HOOKHISTREADME'
+**v9.8.6 (`legacy`) — prior release.** Shipped a programmable 27-event hook pipeline.
+HOOKHISTREADME
+    cat > "$tmpdir/docs/production-deployment.md" <<'HOOKHISTPD'
+v0.7.0 grand-slam ships 27 lifecycle events.
+**Ship state at v9.8.5 (frozen).** _(Frozen v9.8.5 baseline.)_ 27 hook lifecycle events at v9.8.5.
+HOOKHISTPD
+    rm -f "$tmpdir/docs/strategy/coala-mapping.md" \
+          "$tmpdir/docs/audience/developer.html" \
+          "$tmpdir/docs/essays/brass-tacks-3-why.html"
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+        echo "FAIL: self-test — widened HookEvent rule fired on LEGITIMATE HISTORICAL hook mentions" >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    echo "PASS: self-test — historical hook mentions (prior-release lead, 'ships N', frozen baseline) still PASS"
 
     cd "$REPO_ROOT"
 }

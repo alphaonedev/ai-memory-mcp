@@ -185,7 +185,7 @@ ai-memory serve</code></pre>
 <section class="wrap-mid">
   <div class="eyebrow-h2">NHI agent_id semantics</div>
   <h2>Every memory carries a claimed identity.</h2>
-  <p><code>metadata.agent_id</code> is the AI Non-Human Identity marker. On an unsigned write the id is <strong>claimed</strong>, not attested &mdash; don't make security decisions on it alone. As of v0.7.0 (#626 Layer-3) a caller holding the agent's keypair can present a detached Ed25519 <code>signature</code> on the CLI (<code>store --sign</code>), MCP (<code>memory_store</code>), or HTTP (<code>POST /api/v1/memories</code>) store path; the daemon verifies it against the agent's bound public key and stamps <code>metadata.attest_level = "agent_attested"</code>. As of v0.9.0 (#1751) store-path attestation is <strong>required by default</strong>: an unsigned direct write is rejected (<code>403 ATTESTATION_FAILED</code>), and operators opt <em>out</em> with <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0</code> to restore the permissive <code>claimed</code> posture.</p>
+  <p><code>metadata.agent_id</code> is the AI Non-Human Identity marker. On an unsigned write the id is <strong>claimed</strong>, not attested &mdash; don't make security decisions on it alone. As of v0.7.0 (#626 Layer-3) a caller holding the agent's keypair can present a detached Ed25519 <code>signature</code> on the CLI (<code>store --sign</code>), MCP (<code>memory_store</code>), or HTTP (<code>POST /api/v1/memories</code>) store path; the daemon verifies it against the agent's bound public key and stamps <code>metadata.attest_level = "agent_attested"</code>. As of v1.0.0 (#1985, correcting #1751) store-path attestation is <strong>required by default on the HTTP direct-write surface only</strong>: an unsigned <code>POST /api/v1/memories</code>(+<code>/bulk</code>) is rejected (<code>403 ATTESTATION_FAILED</code>), while MCP <code>memory_store</code> and CLI <code>store</code> stay permissive and land <code>claimed</code>, and operators opt <em>out</em> with <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0</code> to restore the permissive <code>claimed</code> posture.</p>
 
   <h3>Resolution ladder (CLI + MCP)</h3>
   <ol>
@@ -208,8 +208,8 @@ ai-memory serve</code></pre>
 
 <section class="wrap-mid">
   <div class="eyebrow-h2">Hooks and subscriptions</div>
-  <h2>27-event hook pipeline + HMAC subscriptions.</h2>
-  <p>The hook pipeline fires on 27 named substrate events (snake_case wire names from the <code>HookEvent</code> enum in <code>src/hooks/events.rs</code>): <code>pre_store</code>, <code>post_store</code>, <code>pre_recall</code>, <code>post_recall</code>, <code>pre_link</code>, <code>post_reflect</code>, etc. Hooks run synchronously (default) or async-fan-out (subscriptions).</p>
+  <h2>22-event hook pipeline + HMAC subscriptions.</h2>
+  <p>The hook pipeline fires on 22 named substrate events (snake_case wire names from the <code>HookEvent</code> enum in <code>src/hooks/events.rs</code>; the count SSOT is <code>HOOK_EVENTS_COUNT</code> in <code>src/config.rs</code>): <code>pre_store</code>, <code>post_store</code>, <code>pre_delete</code>, <code>post_recall</code>, <code>pre_link</code>, <code>post_reflect</code>, etc. Five never-fired events were REMOVED at v1.0.0 &mdash; <code>pre_archive</code> (#2637) and <code>pre_recall</code> / <code>pre_search</code> / <code>pre_transcript_store</code> / <code>post_transcript_store</code> (#2758): a hook the substrate advertises must actually fire, or it must not be advertised. A <code>[hooks].required_events</code> entry naming one of the five now fails to parse. Hooks run synchronously (default) or async-fan-out (subscriptions).</p>
 
   <h3>Register a webhook subscription</h3>
   <pre><code>ai-memory subscribe \

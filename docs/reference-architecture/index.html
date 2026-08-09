@@ -538,8 +538,8 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
       </thead>
       <tbody>
         <tr>
-          <td class="id">AI_MEMORY_REQUIRE_AGENT_ATTESTATION (required by default; =0 opts out)</td>
-          <td>Every store write must be agent-attested; an unsigned write is refused. Required by default since v0.9.0 (#1751) — set <code>=0</code> to restore the permissive <code>claimed</code> posture.</td>
+          <td class="id">AI_MEMORY_REQUIRE_AGENT_ATTESTATION (required by default on HTTP direct-write only; =0 opts out everywhere)</td>
+          <td>Surface-scoped since v1.0.0 (#1985, correcting #1751): an unsigned <strong>HTTP direct write</strong> (<code>POST /api/v1/memories</code>(+<code>/bulk</code>)) is refused <code>403 ATTESTATION_FAILED</code>; MCP <code>memory_store</code> and CLI <code>store</code> are operator-as-actor and stay permissive, landing <code>claimed</code>. <code>=1</code> forces strict on every surface; <code>=0</code> restores the permissive posture everywhere.</td>
           <td>unsigned write → <code>403 ATTESTATION_FAILED</code></td>
           <td class="res">PASS — unsigned write → 403 ATTESTATION_FAILED</td>
         </tr>

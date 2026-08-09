@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs (3x7 lane-3 — behavioral/enforcement claims, GitHub Pages, compliance, CI-job truthfulness)
+
+- **`docs/integrations/claude-code.md` instructed operators to DISABLE the one
+  load-bearing attestation gate, on a premise false since #1985** (refs
+  [#2827](https://github.com/alphaonedev/ai-memory-mcp/issues/2827)). The guide asserted
+  "as of v0.9.0 ai-memory rejects unsigned writes" and prescribed a copy-pasteable
+  `"AI_MEMORY_REQUIRE_AGENT_ATTESTATION": "0"` block. `resolve_require_agent_attestation`
+  (`src/identity/attest.rs`) resolves an unset knob to `matches!(surface,
+  WriteSurface::HttpDirect)` — MCP `memory_store` is **permissive**, so a stock Claude Code
+  setup needs no override. Because `=0` is GLOBAL, following the guide turned OFF the
+  fail-closed `403 ATTESTATION_FAILED` on the HTTP direct-write surface — the network
+  surface. The call-out now explicitly RETRACTS the prior instruction rather than silently
+  dropping it, so an operator who already applied `=0` learns to remove it. The same
+  unscoped-attestation claim was corrected on **13 further live surfaces**; the ten
+  `docs/whats-new-v09.html` sites were CORRECT for v0.9.0 and are preserved.
+- **~60 HTML surfaces implied SQLite and Postgres are one identical API** (refs
+  [#2828](https://github.com/alphaonedev/ai-memory-mcp/issues/2828)). The #2811 Phase-2
+  remediation corrected the markdown and never reached the rendered pages: pre-fix the
+  strings `59`, `21` and "59 of 80" appeared in **zero** HTML files, and only four sentences
+  across two past-release pages disclosed the subset at all. Corrected the load-bearing six —
+  `performance.html` ("behaviorally identical", in the same paragraph that recommends
+  Postgres for >1M scale), `architectures-t5.html` ("identical surface area"),
+  `whats-new-v09.html:248` ("one API", contradicting `:446` on the same page),
+  `index.html` ("Identical semantics"), `evidence.html` ("full SAL-parity suite"), and
+  `feature-matrix.html`, the canonical route table, which had **no per-route backend column
+  at all**. `essays/brass-tacks-3-why.html:86` ("the same Cypher-shaped query surface in
+  both") was checked and is **accurate** — the whole `kg_*` family is pg-supported.
+- **`docs/encryption.html` claimed a CA-chain validation that does not exist** (refs
+  [#2829](https://github.com/alphaonedev/ai-memory-mcp/issues/2829)). The page said the
+  receiving daemon "validates the peer's cert chain (using the configured CA bundle) AND
+  checks its SHA-256 fingerprint"; `FingerprintAllowlistVerifier::verify_client_cert`
+  (`src/tls.rs`) takes `_intermediates` and `_now` as IGNORED parameters and its whole body is
+  a fingerprint comparison — PIN-ONLY, the SSH `known_hosts` model. Same page: added the
+  missing honest-limitation that **federation is NOT end-to-end encrypted** (plaintext memory
+  content on the wire; [#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968) OPEN,
+  and the stated rationale for both #2448 and #2477), corrected
+  `AI_MEMORY_FED_REQUIRE_WRITE_SIG` from "opt-in strict mode" to the v1.0.0 default-ON posture
+  (`FED_REQUIRE_WRITE_SIG_DEFAULT = true`, #1801→#1954), and restamped the page from v0.9.0.
+- **Six surfaces published 25 or 27 hook lifecycle events against `HOOK_EVENTS_COUNT = 22`,
+  two of them advertising REMOVED events** (refs
+  [#2832](https://github.com/alphaonedev/ai-memory-mcp/issues/2832)). `docs/audience/developer.html`
+  named `pre_recall` — removed by #2758 precisely because advertising a hook that never fires
+  is a false enforcement claim — and `README.md:138` enumerated four removed events. #2780
+  corrected the compliance count in one place and missed three cells on the same page;
+  `ROADMAP.md` contradicted itself (22 at `:431`, 27 at `:799` and `:1263`).
+- **`README.md` published `token-budget` as a "required status check" and a "hard CI gate"
+  with the wrong ceiling** (refs
+  [#2835](https://github.com/alphaonedev/ai-memory-mcp/issues/2835)). It carries no required
+  context; the workflow enforces **6750** while the cited 11,000 is the deliberately-looser
+  `cargo test` backstop. Also corrected `docs/reproducible-baselines.html` ("regression gate
+  on every PR" for an advisory bench).
+- **Stale source doc-comment**: `src/handlers/federation_receive.rs` described
+  `AI_MEMORY_FED_REQUIRE_WRITE_SIG` as "default off" 200 lines from
+  `FED_REQUIRE_WRITE_SIG_DEFAULT = true` — the comment a future doc gets written from.
+- **`docs/v1.0.0/perfect-endpoint-assessment/**` carries a FROZEN-ARTEFACT banner.** The
+  49-ballot tree asserts ~20 pre-v1.0.0 defaults as fact, several flipped by the very work
+  those ballots recommended (`w7-a3-claims-discipline.md` — the claims register itself —
+  prescribes replacement wordings now wrong in both directions). Disclosed with a reversal
+  table rather than rewritten: re-pointing the ballots would falsify the record.
+
+### CI (3x7 lane-3 — two gates widened, both proven load-bearing)
+
+- **`scripts/check-docs-vs-ssot.sh` — the HookEvent rule was the last legacy hand-regex.**
+  It matched exactly two phrasings and scanned only `DOC_FILES`/`HTML_DOC_FILES`, so it
+  reported `hooks=22` and PASSED while six live surfaces published 25 or 27 — the #2492
+  defect ("a document that says the same thing in the seventh way nobody enumerated is
+  invisible") left un-generalised on this one rule. Replaced with noun-phrase anchors over a
+  dedicated `HOOK_DOC_FILES` set (separate from the shared arrays on purpose, so it cannot red
+  on count drift owned by a concurrent lane). Two subtleties are load-bearing: this legacy
+  per-rule function had **no historical guard** (only the #2492 scanner did), which the
+  generalised anchors made matter immediately — a mirrored `is_historical` now protects
+  README's prior-release paragraph and ROADMAP's frozen v0.7.1 baseline; and the bare
+  `lifecycle events` anchor needs `(?<![0-9])` as well as `(?<!ships )`, because without it the
+  engine re-anchors one character right and matches `5` out of `25`. On its first run the
+  widened rule caught 7 sites, including three `nsa-csi-mcp.html` cells #2780 missed.
+  `--self-test`: all five verbatim pre-fix phrasings REJECTED across md + html (each named by
+  file); historical mentions still PASS.
+- **`scripts/check-ci-job-claims.sh` was structurally blind to the bare-stem citation.**
+  `WF_TICK` requires a `.yml` suffix and `JOB_CITE` requires the literal word "job", so
+  ``The `token-budget` workflow is a required status check`` registered no citation and the
+  ENFORCEMENT rule — the rule built for exactly that false claim — never evaluated it. Added
+  the `WF_WORD` shape (`` `<stem>` workflow `` → `<stem>.yml`) and widened the scan set beyond
+  the four original files. `--self-test`: the pre-fix shape is REJECTED **by the ENFORCEMENT
+  rule specifically**, and the near-miss (same citation, no enforcement verb) still PASSES so
+  the rule does not ban naming an advisory workflow.
+
 ### Docs (Phase-2 pg-parity remediation — the TRUTHFULNESS FLOOR; vote `4d3ea1c5`, Option B+)
 
 - **Corrected every overclaiming doc to the authoritative Postgres
