@@ -265,6 +265,19 @@ durable memory text.
   `node_count`, `fed_identity` and `quorum_writes`. CA + leaf private keys move
   operator-host -> droplet over SSH; the nodes' Ed25519 signing keys never move
   at all.
+- **Residual risk this lane ACCEPTS (disclosed, not closed): the SSH push is
+  trust-on-first-use.** The channel that carries the CA private key and each
+  node's leaf `node.key` is `federate.sh`'s SSH, which defaults to
+  `StrictHostKeyChecking=accept-new`. A first-contact MITM on the
+  operator -> droplet path would obtain that material. The residual is accepted
+  because the hive is ephemeral, money-gated, and operator -> own-droplet. An
+  operator who does not want to accept it can pre-seed `known_hosts` from the
+  DO console host keys, or export
+  `SSH_OPTS='-o StrictHostKeyChecking=yes -o ConnectTimeout=15'` with the host
+  key pinned. Stated here because disclosing only the exposure this design
+  CLOSES (terraform state / droplet metadata) while omitting the one it DEPENDS
+  ON would be exactly the asymmetry the campaign's truthfulness discipline
+  exists to prevent.
 - **Fail-closed, not silently-degraded.** A node with no peer list refuses to
   start rather than running as a one-node "mesh" that satisfies nothing while
   reporting healthy. `fed-bootstrap.sh` additionally refuses a non-`https` peer

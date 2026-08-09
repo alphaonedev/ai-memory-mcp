@@ -112,6 +112,17 @@ write_files:
   # a real extra step, and it is the step the existing DO staging notes
   # already prescribe ("scp/rsync the whole crypto/ dir onto each
   # droplet" -- infra/do-hive/crypto/KNOWN-DO-STAGING.md section 1).
+  #
+  # RESIDUAL RISK this approach ACCEPTS (disclosed, not closed): the SSH
+  # push is trust-on-first-use. federate.sh defaults to
+  # StrictHostKeyChecking=accept-new on the very channel that carries the
+  # CA private key and each node's leaf node.key, so a first-contact MITM
+  # on the operator->droplet path would obtain them. Accepted because the
+  # hive is ephemeral, money-gated, and operator->own-droplet; closable by
+  # pre-seeding known_hosts or exporting SSH_OPTS with
+  # StrictHostKeyChecking=yes and a pinned host key. Named here because
+  # disclosing only the exposure this design CLOSES while omitting the one
+  # it DEPENDS ON would be a one-sided ledger.
   # =====================================================================
   - path: /etc/systemd/system/ai-memory.service.d/10-federation.conf
     permissions: '0644'

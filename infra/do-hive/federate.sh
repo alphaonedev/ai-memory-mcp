@@ -55,6 +55,14 @@ SIGNER="${SIGNER:-${REPO_ROOT}/target/release/examples/attest_sign}"
 AUTHOR_ID="${AUTHOR_ID:-ai:hive-author}"
 AUTHOR_KEY_DIR="${AUTHOR_KEY_DIR:-${HERE}/crypto/author-keys}"
 SSH_USER="${SSH_USER:-root}"
+# RESIDUAL RISK, disclosed: this SSH channel carries the CA private key and each
+# node's leaf node.key, and it defaults to StrictHostKeyChecking=accept-new --
+# trust-on-first-use. A first-contact MITM on the operator->droplet path would
+# obtain that material. Accepted here because the hive is ephemeral,
+# money-gated, and operator->own-droplet. To close it: pre-seed known_hosts
+# from the DO console host keys, or export
+# SSH_OPTS='-o StrictHostKeyChecking=yes -o ConnectTimeout=15' with the host
+# key pinned.
 SSH_OPTS="${SSH_OPTS:--o StrictHostKeyChecking=accept-new -o ConnectTimeout=15}"
 FED_DIR=/etc/ai-memory/fed
 NS="${NS:-fed-cert}"
