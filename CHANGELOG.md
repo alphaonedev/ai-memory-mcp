@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Phase-1 pg-parity remediation — claims-parity anti-regression gate; vote `4d3ea1c5`)
+
+- **`tests/pg_supported_route_inventory_gate_2799.rs`** — the durable
+  control the v1.0 pg-parity remediation (Option B+) mandated. The
+  postgres surface allow-list (`postgres_endpoint_supported`) is
+  hand-maintained; when it silently lags the router, an un-migrated
+  handler can 501-vs-corrupt (a route opened onto the empty scratch
+  sqlite reads/writes the WRONG DB on a pg daemon). The gate (a)
+  freezes the allow-list membership at SOURCE level (the exact
+  route-const + path-matcher set), (b) pins the AUTHORITATIVE
+  pg-supported inventory — **59 of 80 unique production paths are
+  pg-supported; 21 are fully fail-closed 501** (the register's "56" and
+  the audit's "73" were both wrong) — and the exact fully-501 list, and
+  (c) asserts every pg-supported path is a registered route. Any future
+  allow-list/router edit now forces a reviewed inventory update +
+  proof-of-dispatch, closing the omission class that produced these 501s.
+
+### Fixed (router-mirror completeness — `path_is_registered_route`)
+
+- `path_is_registered_route` was missing three registered + pg-supported
+  routes (`POST /api/v1/signals` #1718, `POST /api/v1/actions/{id}/transition`
+  #1718, `POST /api/v1/checkpoints/{id}/resolve` #2391) and the
+  `POST /api/v1/skill/{id}/retire` arm — a latent 404-vs-501
+  wire-truthfulness drift (masked because a pg-supported route never
+  reaches that branch). Surfaced by the anti-regression gate above and
+  reconciled so the router mirror is complete.
+
 <!-- wave-2 GA cert (#2705): entries restored after conflict-free batch merge (#2768/#2770/#2774) -->
 <!-- PR #2768 (fix/2758-unfired-governance-hooks) -->
 <!-- #2758 (fix/2758-unfired-governance-hooks) -->
