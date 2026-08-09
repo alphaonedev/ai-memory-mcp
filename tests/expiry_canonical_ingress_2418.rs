@@ -390,6 +390,13 @@ async fn postgres_expiry_parity_2418() {
         "2027-03-01T21:00:00+09:00",
     ];
     let canonical = canonicalize_valid_time(spellings[0]).expect("canonical");
+    // The pg store fail-CLOSES on a malformed transaction-time stamp
+    // (`parse_rfc3339_required(&memory.created_at)` — the North-Star
+    // "never store corrupt data" posture); `Memory::default()` leaves
+    // created_at / updated_at EMPTY, which is not valid RFC3339. Stamp
+    // them so the fixture exercises the `expires_at` canonicalization it
+    // means to test, not the empty-timestamp reject path.
+    let now = chrono::Utc::now().to_rfc3339();
     for (i, spelling) in spellings.iter().enumerate() {
         let id = format!("canon-parity-pg-{i}");
         let mem = Memory {
@@ -398,6 +405,8 @@ async fn postgres_expiry_parity_2418() {
             title: format!("parity-{i}"),
             content: "parity body".to_string(),
             tier: Tier::Mid,
+            created_at: now.clone(),
+            updated_at: now.clone(),
             expires_at: Some((*spelling).to_string()),
             ..Memory::default()
         };

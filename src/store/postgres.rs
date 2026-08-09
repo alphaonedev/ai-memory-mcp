@@ -19421,7 +19421,17 @@ impl MemoryStore for PostgresStore {
         .bind(filter.namespace.as_ref())
         .bind(filter.tier.as_ref().map(Tier::as_str))
         .bind(tags_first)
-        .bind(filter.agent_id.as_ref().or(ctx.as_agent.as_ref()))
+        // #1720 A7 PARITY: the `$5` author filter binds ONLY the explicit
+        // `filter.agent_id` — never `ctx.as_agent`. `as_agent` is the
+        // impersonation / visibility principal (it feeds `$9` = `caller_opt`
+        // for the scope=private + target_agent_id carve-out), NOT an author
+        // restriction. Folding it into the author filter here diverged from
+        // both `PostgresStore::search` (which binds `filter.agent_id` only)
+        // and every sqlite recall path (which passes the author filter as
+        // `None` and threads `as_agent` only into the visibility clause) —
+        // silently dropping rows the caller may legitimately see (e.g. an
+        // inbox row authored by another agent but `target_agent_id`=caller).
+        .bind(filter.agent_id.as_ref())
         .bind(filter.since)
         .bind(filter.until)
         .bind(fts_pool)
@@ -19512,7 +19522,10 @@ impl MemoryStore for PostgresStore {
             .bind(filter.namespace.as_ref())
             .bind(filter.tier.as_ref().map(Tier::as_str))
             .bind(tags_first)
-            .bind(filter.agent_id.as_ref().or(ctx.as_agent.as_ref()))
+            // #1720 A7 PARITY (semantic pool): bind ONLY the explicit author
+            // filter here; `ctx.as_agent` drives visibility via `$9`, never
+            // authorship. See the matching comment on the FTS pool bind above.
+            .bind(filter.agent_id.as_ref())
             .bind(filter.since)
             .bind(filter.until)
             .bind(ann_pool)
