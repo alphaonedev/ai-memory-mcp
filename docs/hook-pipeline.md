@@ -1,7 +1,7 @@
 ---
 layout: doc
 ---
-# Hook pipeline (Track G — 26 lifecycle events)
+# Hook pipeline (Track G — 22 lifecycle events)
 
 v0.7.0 ships a programmable extension surface that fires on every
 substrate lifecycle point. Hooks return one of `Allow`,
@@ -42,7 +42,7 @@ fail_mode = "open"       # open (default) | closed
 
 Fields ([`src/hooks/config.rs:174-190`](../src/hooks/config.rs)):
 
-- **`event`** — one of the 26 events below.
+- **`event`** — one of the 22 events below.
 - **`command`** — absolute path to the helper binary.
 - **`priority`** — higher fires first; first `Deny` short-circuits the chain.
 - **`timeout_ms`** — wall-clock budget per call; capped at
@@ -111,9 +111,9 @@ run UNGOVERNED while the presence gate reads as satisfied. `ai-memory doctor
 --hooks` flags exactly this config; add a `namespace = "*"` hook to cover the
 rest. Namespace-qualified `required_events` is tracked as a follow-up.
 
-## 26-event matrix
+## 22-event matrix
 
-The 16 baseline events (#2758 removed `pre_recall` / `pre_search` and the
+The 15 baseline events (#2758 removed `pre_recall` / `pre_search` and the
 whole transcript hook family `pre_transcript_store` / `post_transcript_store`;
 the `post_recall` / `post_search` notify events are retained):
 

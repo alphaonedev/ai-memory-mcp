@@ -1120,7 +1120,7 @@ Both statements are mechanically checkable and pinned against regression: `postg
 
 ## CLI Commands
 
-91 top-level subcommands under `--features sal` OR `--features sal-postgres` (90 in the default build; the 2-variant gap is `Migrate` + `SchemaInit`, both gated `#[cfg(feature = "sal")]` per `src/daemon_runtime.rs::Command::{Migrate,SchemaInit}`; was 40 at v0.6.4). Run `ai-memory <command> --help` for details on any command, or `ai-memory --help` for the full list.
+92 top-level subcommands under `--features sal` OR `--features sal-postgres` (90 in the default build; the 2-variant gap is `Migrate` + `SchemaInit`, both gated `#[cfg(feature = "sal")]` per `src/daemon_runtime.rs::Command::{Migrate,SchemaInit}`; was 40 at v0.6.4). Run `ai-memory <command> --help` for details on any command, or `ai-memory --help` for the full list.
 
 | Command | Description |
 |---------|-------------|

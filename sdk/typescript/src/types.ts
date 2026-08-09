@@ -33,7 +33,15 @@ export type Source =
   | "chaos";
 
 /**
- * A Memory row. Corresponds to `ai_memory::models::Memory` (15 fields).
+ * A Memory row. Corresponds to `ai_memory::models::Memory`, which carries
+ * **30 fields** at v1.0.0 (`Memory::FIELD_COUNT`). The 15 declared below are
+ * the v0.6.x core; the other 15 (`cid`, `version`, `lifecycle_state`,
+ * `memory_kind`, `kind_provenance`, `reflection_depth`, `entity_id`,
+ * `persona_version`, `citations`, `source_uri`, `source_span`,
+ * `confidence_source`, `confidence_signals`, `confidence_decayed_at`,
+ * `valid_from` / `valid_until`) are NOT declared here. TypeScript interfaces
+ * are structural and do not strip at runtime, so they survive a round trip —
+ * they are simply untyped. Declaring them is tracked separately.
  *
  * NOTE: `metadata` is `serde_json::Value` server-side — we expose it as
  * `Record<string, unknown>` on the SDK side (server validates it must be

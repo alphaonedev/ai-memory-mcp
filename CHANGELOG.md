@@ -60,6 +60,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **`infra/do-hive/crypto/gen-certs.sh`** — additive `HIVE_NODE_IPS="ip1 ip2 ..."` mode minting `hive-node-1..N` leaves (SAN = localhost + 127.0.0.1 + that droplet's private VPC ip) and a per-node allowlist pinning every OTHER node plus the node ITSELF (its own client cert is the only one it holds, and both the on-droplet bootstrap and `federate.sh`'s assertions probe `:9077` with it) — and NOTHING else: no operator/bastion cert is minted, because nothing needs one and an unused trust anchor is a liability. Unset leaves the legacy localhost/peerA/peerB material byte-identical.
   - **`infra/do-hive/federate.sh`** — the post-apply wiring + the Track D assertions. It NEVER calls terraform, NEVER spawns a droplet and refuses with no side effects unless the outputs describe >= 2 nodes (the safety property `measure-capacity-ramp.sh` already declares). Every assertion runs ON a droplet over SSH, never from the orchestrator host: the peer URLs are PRIVATE VPC addresses and the `:9077` rule admits only hive droplet ids, so an orchestrator-host curl could not reach them even if the address routed. `verify` asserts: each node answers `/health` over mTLS AND refuses a no-cert client; **cross-host**, node 1 reaches node 2 at its private `https://<ip>:9077/api/v1/health` with node 1's peer cert (the assertion the local 2-daemon legs structurally cannot make); a `W=2` quorum write admitted at node 1 returns `201 quorum_met` (or `202` locally-durable on a late ack) and the row is readable at node 2; and a SIGNED write authored on node 1 reaches `metadata.attest_level = "agent_attested"` at node 2 — the cross-peer content write-sig lane, which needs the author key enrolled at BOTH nodes plus the v1.0.0 default-on `AI_MEMORY_FED_REQUIRE_WRITE_SIG`. The signature is computed on the orchestrator host; the author private key never leaves it.
   - **`infra/do-hive/README-measurement.md`** — the `-var memory_count=2` run recipe, the post-boot verification table, the triage commands, and an honest statement of the **secrets-in-terraform-state tradeoff**: private crypto material never touches terraform (it would land both in `terraform.tfstate`, which `spawn.sh` copies into `.local-runs/do-hive-runs/<ts>/`, and in the droplet metadata service), the rejected droplet-1-generates-and-distributes alternative would be trust-on-first-use over plaintext (a federation-encryption certification cannot rest on that), and the resulting honest cost is that `terraform apply` yields two nodes parked in a fail-closed wait plus one operator command.
+### Docs (3x7 documentation-drift sweep, lane 2 — API-surface counts + net-new completeness)
+
+- **Corrected 39 stale API-surface count claims across 25 live markdown
+  docs, both SDKs and one `src/` doc comment.** `scripts/check-docs-vs-ssot.sh`
+  was GREEN throughout: its `DOC_FILES` set is narrower than the doc corpus,
+  so the whole class was invisible to it (#2830, gate widening tracked in
+  #2839). Canonical values re-derived from source, not from prose: tools
+  **103** advertised / 102 callable, core **8** advertised, graph 19, admin
+  21, power 56; HTTP **94** registrations / **80** unique paths; CLI **90**
+  default / **92** `sal`; schema **v88**; `Memory` **30** fields;
+  `HookEvent` **22**. Highest-blast-radius corrections:
+  - `ROADMAP.md:799` claimed `HookEvent` has 27 variants **and quoted the
+    awk command that returns 22**; `docs/compliance/nsa-csi-mcp.html` has
+    the same self-invalidating shape and is handed to lane 3 (#2837).
+  - `docs/v1.0.0/release-notes.md` — the v1.0.0 surface table's own CLI
+    row said `89 / 91`; corrected to `90 / 92`.
+  - `docs/DEVELOPER_GUIDE.md:851` said "advertises 101 entries (102
+    callable …)" — contradictory inside one sentence.
+  - `docs/postgres-age-guide.md:483` documented a **phantom endpoint**,
+    `GET /api/v1/memories/:id/links`, which is registered nowhere.
+  - `docs/ADMIN_GUIDE.md` + `docs/hook-pipeline.md` still enumerated the
+    `PreRecall` / `PreSearch` / `PreTranscriptStore` / `PostTranscriptStore`
+    events removed by #2758; rewritten to the real 15 + 5 + 2 = 22.
+  - `ROADMAP.md:13` and `docs/README.md` still called v0.9.0 the current
+    release. Both now say v1.0.0 is the current release and the
+    `Cargo.toml` stamp **while stating that no `v1.0.0*` tag is cut**, so
+    v0.9.0 remains the newest published tag — the release badge and link
+    deliberately still point at v0.9.0 rather than a URL that would 404.
+  - True historical snapshots were preserved throughout (the per-release
+    `README.md` surface paragraphs, the frozen v0.7.1 ROADMAP baseline,
+    `docs/MIGRATION_*.md`, `docs/v0.*/`, and `src/validate.rs:1386-1388`,
+    which is explicitly scoped "at v0.7.0").
+- **Closed three reference-doc completeness gaps where the doc asserted a
+  completeness it did not have** (#2831). `docs/CLI_REFERENCE.md` claims to
+  track all 90/92 subcommands but omitted `capability`, `model-attest`,
+  `epoch-apply` and `lineage` — `model-attest` had no user-facing
+  documentation anywhere. `docs/API_REFERENCE.md` claims "80 unique URL
+  paths" but documented 76, omitting `PUT /api/v1/agents/{id}/pubkey`,
+  `GET /api/v1/memories/{id}/lineage`, `POST /api/v1/checkpoints/{id}/resolve`
+  and `POST /api/v1/skill/{id}/retire`. `docs/agent-skills.md` said the
+  `memory_skill_*` family is 7 tools; it is **9** — and the two
+  undocumented verbs were the #2024 destructive pair, including the
+  irreversible `memory_skill_delete` hard purge, whose retire-first intent
+  gate and surviving signed `skill.purged` audit row were reachable only
+  from this changelog. All three sets re-verified empty after the fix.
+- **Documented five net-new v1.0.0 surfaces that had reached CHANGELOG and
+  nothing else** (#2833). New `PERFORMANCE.md` §"Read-path degrade budgets"
+  covers `AI_MEMORY_RECALL_EMBED_BUDGET_MS` (#2577) and
+  `AI_MEMORY_RERANK_BUDGET_MS` (#2608) — including why rerank is enforced
+  pre-flight rather than mid-flight, that its cost coefficient is an
+  ESTIMATE and not a measured guarantee, and the query-embed cache's
+  documented timing-oracle residual stated precisely as query-EXISTENCE
+  rather than content disclosure. `docs/API_REFERENCE.md` §`GET /metrics`
+  previously documented **no series at all**; it now carries the
+  operationally load-bearing subset, with
+  `ai_memory_memories_refreshed_at_seconds` (#2583) marked not-optional
+  because without an alert on it a dead refresher freezes a plausible
+  corpus count through a mass deletion while `up` stays 1 — plus the
+  `fts_integrity` health verdict (#2579) and its 3-interval self-staling
+  rule. Every value was verified against source before being written.
+- **Corrected the SDK `Memory` model docstrings** (#2834). Both
+  `sdk/python/ai_memory/models.py` and `sdk/typescript/src/types.ts` said
+  "15 fields", and the Python docstring asserted "Every field present on
+  the Rust side is mapped here"; `Memory::FIELD_COUNT` is **30**. Stated
+  precisely: the 15 untyped fields are named, and they **survive** a round
+  trip (Python `_Base` sets `extra="allow"`; TypeScript interfaces do not
+  strip at runtime) — they arrive untyped, they are not lost. Actually
+  typing them is a public-contract change in two published SDKs and is
+  tracked separately in #2834.
+- Removed two `scripts/qc-allowlists/doc-numeric-claims-pending.txt`
+  entries the fixes above made stale, as the gate's NOTICE instructs.
+
 
 ### Docs (Phase-2 pg-parity remediation — the TRUTHFULNESS FLOOR; vote `4d3ea1c5`, Option B+)
 

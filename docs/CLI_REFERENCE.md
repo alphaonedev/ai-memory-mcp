@@ -248,7 +248,7 @@ records the original claim.
 ### `mcp`
 
 Run as an MCP tool server over stdio (JSON-RPC 2.0).
-`--profile full` advertises 101 entries (100 callable memory tools + the
+`--profile full` advertises 103 entries (102 callable memory tools + the
 always-on `memory_capabilities` bootstrap; see issue
 [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862) for the
 disambiguation). Default `--profile core` ships 7 tools + the bootstrap.
@@ -1008,6 +1008,82 @@ ai-memory watch --daemon --host claude-code --host codex
 | `--limit <N>` | Max lines atomised per host, per tick (default 100). |
 | `--dry-run` | Parse + report only, no writes. |
 | `--json` | Emit the `WatchReport` wire shape instead of a human summary. |
+
+## v0.9.0 + v1.0.0 net-new CLI subcommands
+
+The four subcommands below complete the 90-default / 92-`sal` inventory
+this document claims to track. Each maps 1:1 to a `Command` variant in
+`src/daemon_runtime.rs`.
+
+### `ai-memory capability` — macaroon capability tokens (v0.9.0 G10.1, #1827)
+
+Stateless bearer grants consumed by the governance gates. A valid token
+whose caveat chain and issuer ceiling cover the in-flight
+`(action, namespace)` flips an otherwise-`Deny`/`Ask` coarse-gate
+decision to `Allow` — **attenuation-only widening**, never escalation.
+Tokens are presented via the MCP `capability` param, the
+`X-AI-Memory-Capability` HTTP header, or `--capability` on governed CLI
+verbs. A caller that presents no token is unaffected.
+
+```bash
+ai-memory capability init                              # v1.0.0 R9 (#1960) — idempotent zero-config
+                                                       # `owner` mint (custody + .caproot). No-op if present.
+ai-memory capability keygen <issuer>                   # issuer .caproot mint secret (mode 0600)
+ai-memory capability mint <issuer> \
+    --namespace-prefix team/ --op-ceiling read \
+    --expires-in-secs 3600                             # root token; expiry is lint-enforced
+ai-memory capability attenuate --token cap1:... \
+    --action Store --agent alice                       # keyless; strictly NARROWS
+ai-memory capability inspect --token cap1:...          # decode + print structure (no verification)
+ai-memory capability verify  --token cap1:... \
+    --action Store --namespace team/eng --agent alice  # verify against [capabilities] + request tuple
+```
+
+`--key-dir <PATH>` is global to the subcommand (`AI_MEMORY_KEY_DIR`
+otherwise). Revocation is short `expires_at` + `root_secret` rotation —
+there is no online revocation store. Enabled by default at v1.0.0
+(`[capabilities].enabled`); set `AI_MEMORY_CAPABILITIES=off` for the
+fully-inert posture.
+
+### `ai-memory model-attest` — model-family attestations (v0.9.0 §25.3 S1, #1870)
+
+Inspect or enroll rows in the append-only, write-once (TOFU)
+`model_attestations` substrate that records WHICH model family produced
+a generation.
+
+```bash
+ai-memory model-attest list       # every row (loader-observed + operator-signed); read-only, no key
+ai-memory model-attest enroll ... # operator-signed attestation; REQUIRES the operator key
+```
+
+**Honest bound:** loader coverage hard-caps at roughly 40% — only
+substrate-invoked generation is attestable. Distinctness computed from
+rows that are merely CLAIMED is not attested; see the decorrelation
+probe in [`ADMIN_GUIDE.md`](ADMIN_GUIDE.html).
+
+### `ai-memory epoch-apply` — verify-only epoch freeze (v0.9.0 §25.3 S5 / RQ-10, #1878)
+
+```bash
+ai-memory epoch-apply <manifest.json> [--key-dir <PATH>]
+```
+
+Verifies an operator-signed epoch manifest and, on success, writes the
+triple anchor: the resolved `EpochAdvance` checkpoint plus the
+`epoch.manifest_applied` audit row. Verify-only — it never mints a
+manifest. Requires the operator key.
+
+### `ai-memory lineage` — derivation lineage-DAG walk (v0.9.0 G13-mem, #1859)
+
+```bash
+ai-memory lineage <id> [--descendants] [--max-depth N] [--json]
+```
+
+Walks a memory's derivation DAG over the provenance relation subset
+`derived_from` / `reflects_on` / `derives_from`. Ancestors by default;
+`--descendants` reverses the direction. `--max-depth` is capped at 5.
+Three-surface parity with the `memory_lineage` MCP tool and
+`GET /api/v1/memories/{id}/lineage`. Requires the lineage DAG enabled
+(`AI_MEMORY_LINEAGE_DAG`, default on).
 
 ## Shell, completions, man
 

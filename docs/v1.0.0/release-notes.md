@@ -86,7 +86,7 @@ CLI subcommands):
 | MCP tools (`--profile full`) | **103 advertised** (102 callable + the always-on `memory_capabilities` bootstrap) |
 | MCP tools (`--profile core`) | **7** (original 5 + `memory_load_family` + `memory_smart_load`) + the `memory_capabilities` bootstrap |
 | HTTP routes | **94 production `.route(...)` registrations** / 80 unique URL paths |
-| CLI subcommands | **89 default build** / **91 under `--features sal`** (the `capability init` sub-verb rides the existing `Capability` command, so the top-level count is unchanged) |
+| CLI subcommands | **90 default build** / **92 under `--features sal`** (the `capability init` sub-verb rides the existing `Capability` command, so the top-level count is unchanged) |
 | `MemoryKind` variants | **16** (adds v1.0.0 epistemic typing `Told` / `Instruction` / `Intervention`, [#1945](https://github.com/alphaonedev/ai-memory-mcp/issues/1945)) |
 | Schema | **v88** (`CURRENT_SCHEMA_VERSION`, both adapters). Not uniformly additive: v79–v85 are additive, **v86 and v87 rewrite stored rows**, v88 is index-only. Per-rung detail + the true bound of the migration evidence: §"Schema ladder v78 → v88" |
 

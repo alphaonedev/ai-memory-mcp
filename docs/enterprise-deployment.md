@@ -426,7 +426,7 @@ ai-memory schema-init --store-url postgres://aimemory:PWD@hub.dc1.internal:5432/
 ```
 
 Opening the store runs the idempotent `postgres_schema.sql` bootstrap
-plus the in-process upgrade ladder to schema v78 as a side effect. The
+plus the in-process upgrade ladder to schema v88 as a side effect. The
 `vector` (pgvector) extension is required (its absence aborts the
 bootstrap); `age` is opt-in — when installed, the verb additionally
 creates the AGE graph `memory_graph` via the idempotent

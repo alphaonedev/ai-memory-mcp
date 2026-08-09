@@ -405,6 +405,45 @@ or Grafana Agent.
 curl http://127.0.0.1:9077/metrics
 ```
 
+Both paths are **exempt from admission control** (#1733 / #2032 M3) so
+Prometheus keeps scraping under overload. Since #2583 the steady-state
+scrape does **no database work** — every value is pre-computed by
+background refreshers — so its cost is independent of corpus size and of
+scrape rate. The one exception is a cold prime: a process whose gauge
+refresher has never run (a router built without the daemon loop, or
+`AI_MEMORY_METRICS_GAUGE_REFRESH_SECS=0`) pays a single `COUNT` on its
+FIRST scrape, rather than serving a `0` that is indistinguishable from an
+empty corpus.
+
+Series an operator should wire alerts to (canonical registration:
+`src/metrics.rs`):
+
+| Series | Type | Meaning |
+|---|---|---|
+| `ai_memory_memories` | gauge | Corpus size. Refreshed on a paced loop (`AI_MEMORY_METRICS_GAUGE_REFRESH_SECS`, default `60`; `0` disables the loop), not per scrape. |
+| `ai_memory_memories_refreshed_at_seconds` | gauge | UNIX seconds at which the gauge above was last recomputed; `0` = never. **Not optional — alert on `time() - ai_memory_memories_refreshed_at_seconds`.** Without it a dead refresher would freeze a plausible-looking count forever, including through a mass deletion, while Prometheus `up` stayed `1`. |
+| `ai_memory_admission_shed_total` | counter | Requests shed by admission control with a typed `503`. |
+| `ai_memory_recall_embed_degraded_total` | counter | Recalls that exceeded `AI_MEMORY_RECALL_EMBED_BUDGET_MS` and degraded to keyword (#2577). |
+| `ai_memory_rerank_budget_degraded_total` | counter | Recalls whose cross-encoder stage was skipped pre-flight under `AI_MEMORY_RERANK_BUDGET_MS`, shipping the hybrid ordering (#2608). |
+| `ai_memory_query_embed_cache_hits_total` | counter | Query-embedding cache hits (#2577). |
+| `ai_memory_corrupt_provenance_rows_total{column}` | counter | Rows skipped by a discovery scan because a provenance column would not open (e.g. `encrypted_envelope`, #2383). |
+| `ai_memory_hnsw_evictions_total`, `ai_memory_hnsw_size` | counter, gauge | Vector-index pressure; see `AI_MEMORY_VECTOR_INDEX_CAPACITY`. |
+| `ai_memory_federation_push_dlq_depth`, `..._quarantined_by_cause_total{cause}` | gauge, counter | Federation push-DLQ backlog and its cause breakdown. |
+
+This table is the operationally load-bearing subset, not the full
+registry — scrape the endpoint for the complete list.
+
+`GET /api/v1/health` additionally reports a cached
+`fts_integrity: {status, checked_at, interval_secs}` verdict. The FTS5
+integrity check re-tokenizes the whole corpus and is prepared by SQLite
+as a WRITER, so since #2579 it runs on its own paced background
+connection (`AI_MEMORY_FTS_INTEGRITY_INTERVAL_SECS`, default 6 h, `0` =
+`disabled`) rather than on every probe. A cached `failed` still answers
+**503**; an `ok` verdict older than three intervals degrades itself to
+`stale` so a dead checker cannot re-present its last pass; `pending`
+means no check has completed yet. `ai-memory doctor` runs the same deep
+check on demand.
+
 ### `GET /api/v1/stats`
 
 Structured database stats (counts by tier/namespace, links, size,
@@ -1286,6 +1325,20 @@ MCP-only.
 |---|---|---|
 | `POST` | `/api/v1/actions/{id}/transition` | Coordination action-state transition (`handlers::transition_action`) — local CAS write + W-of-N federation fanout. MCP: `memory_action_transition`. |
 | `POST` | `/api/v1/signals` | Signed inter-agent signal send (`handlers::send_signal`) — local write + W-of-N fanout. MCP: `memory_signal_send`. |
+
+### v0.9.0 + v1.0.0 net-new endpoints
+
+The four paths below complete the 80-unique-path inventory. Each is
+registered in `src/lib.rs` against the corresponding
+`src/handlers/routes.rs` const, so the path string here is the SSOT
+value, not a transcription.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `PUT` | `/api/v1/agents/{id}/pubkey` | Bind an Ed25519 attestation public key to a registered agent (`handlers::bind_agent_pubkey`, [#1539](https://github.com/alphaonedev/ai-memory-mcp/issues/1539)). **Admin-gated.** The bound key is what the write-attestation and federation author-verification paths check a presented signature against — see §"Admin-gated endpoints". CLI twin: `ai-memory agents bind-key`. |
+| `GET` | `/api/v1/memories/{id}/lineage` | Walk a memory's derivation lineage-DAG — ancestors/descendants over the provenance relation subset `derived_from` / `reflects_on` / `derives_from` (`handlers::get_lineage`, v0.9.0 G13-mem [#1859](https://github.com/alphaonedev/ai-memory-mcp/issues/1859)). Three-surface parity with the `memory_lineage` MCP tool and `ai-memory lineage`. Requires the lineage DAG to be enabled (`AI_MEMORY_LINEAGE_DAG`, default on). |
+| `POST` | `/api/v1/checkpoints/{id}/resolve` | Resolve a commit-checkpoint (`handlers::resolve_checkpoint`, [#2391](https://github.com/alphaonedev/ai-memory-mcp/issues/2391)) — local resolve plus W-of-N federation fanout via `federation::broadcast_checkpoint_resolution_quorum`. This is the SEND leg of the FED-RQ-01 ([#1936](https://github.com/alphaonedev/ai-memory-mcp/issues/1936)) checkpoint-federation transport; the receive leg is gated by `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` (fail-closed by default). MCP: `memory_checkpoint_resolve`. |
+| `POST` | `/api/v1/skill/{id}/retire` | Retire or unretire a skill lineage (`handlers::skill_retire_route`, [#2024](https://github.com/alphaonedev/ai-memory-mcp/issues/2024)). **Admin-gated and reversible** — it sets the schema-v82 `retired_at` / `retired_by` / `retire_reason` columns and deletes nothing. Pass `unretire=true` to reverse. The irreversible sibling `memory_skill_delete` is deliberately MCP-only with no HTTP route; see [`agent-skills.md`](agent-skills.html). |
 
 ### v0.7.0 net-new MCP tools
 
