@@ -139,6 +139,19 @@ pub async fn get_capabilities(
             .unwrap_or(0)
     };
 
+    // PR-C pg-parity (5-agent vote 4d3ea1c5) — resolve the live KG backend
+    // tag once, cfg-split like `db_schema_version` above because `app.store`
+    // (the SAL trait handle) exists only under the `sal` feature. In the
+    // non-sal default build the daemon is sqlite-only and traverses
+    // `memory_links` via recursive CTE, so the tag is compile-time `cte`.
+    #[cfg(feature = "sal")]
+    let kg_backend_tag: &str = app.store.kg_backend().as_str();
+    // `crate::store` (home of `KgBackend`) is itself `sal`-gated, so the
+    // non-sal arm uses the literal recursive-CTE tag directly — the default
+    // sqlite-only build has no AGE and no alternate KG path.
+    #[cfg(not(feature = "sal"))]
+    let kg_backend_tag: &str = "cte";
+
     match result {
         Ok(mut v) => {
             // v0.7.0 Wave-3 — surface the resolved storage backend so
@@ -150,6 +163,22 @@ pub async fn get_capabilities(
                 obj.insert(
                     field_names::STORAGE_BACKEND.to_string(),
                     serde_json::Value::String(app.storage_backend.as_str().to_string()),
+                );
+                // PR-C pg-parity (5-agent vote 4d3ea1c5) — surface the live
+                // knowledge-graph traversal backend (`age` on an AGE-enabled
+                // postgres daemon, else `cte`) resolved from the SAL store,
+                // NOT the config-construction default `kg_backend: None`. The
+                // MCP `memory_capabilities` path is structurally sqlite-only
+                // (#1675/n24 — `ai-memory mcp` always opens a local rusqlite
+                // Connection), so its overlay correctly reports the recursive
+                // CTE posture; the postgres KG lives only behind the HTTP
+                // daemon, which is exactly this handler. Always emitted here
+                // (cte | age) so a polling client can rely on the field shape
+                // — closing the pre-PR-C gap where the field was omitted on a
+                // postgres daemon (the `skip_serializing_if = None` default).
+                obj.insert(
+                    "kg_backend".to_string(),
+                    serde_json::Value::String(kg_backend_tag.to_string()),
                 );
                 // v0.7.0.1 S75 — surface the live DB schema-migration
                 // version (`MAX(version)` from the `schema_version`

@@ -827,6 +827,22 @@ pub trait MemoryStore: Send + Sync {
         Ok(0)
     }
 
+    /// PR-C pg-parity (5-agent vote `4d3ea1c5`) — the knowledge-graph
+    /// traversal backend this adapter resolves at connect time, surfaced
+    /// through `/api/v1/capabilities.kg_backend` so operators can confirm
+    /// whether a live daemon runs AGE Cypher or the recursive-CTE fallback
+    /// without reading the boot log.
+    ///
+    /// Default is [`KgBackend::Cte`] — every SQLite deployment traverses
+    /// `memory_links` via recursive CTE and has no AGE, so the default is
+    /// the truth for the sqlite adapter (and any future non-AGE adapter).
+    /// `PostgresStore` overrides this to return the value it detected at
+    /// connect time (`age` when the `age` extension is installed, else
+    /// `cte`). Sticky for the process lifetime — no per-call re-probe.
+    fn kg_backend(&self) -> KgBackend {
+        KgBackend::Cte
+    }
+
     /// Store a memory. The `ctx` supplies the calling agent; the
     /// `Memory.metadata.agent_id` field is authoritative over any
     /// client-supplied value.
@@ -1337,6 +1353,37 @@ pub trait MemoryStore: Send + Sync {
     /// `(source_id, target_id, relation)` so a paginated migrate can
     /// resume mid-stream without losing rows.
     async fn list_links(&self, namespace: Option<&str>) -> StoreResult<Vec<MemoryLink>>;
+
+    /// PR-C pg-parity (5-agent vote `4d3ea1c5`) — batch-resolve the
+    /// STRONGEST incident-edge attestation level per memory id, over
+    /// `memory_links` where the id appears as either `source_id` OR
+    /// `target_id`. The SAL twin of the sqlite-only decorator
+    /// [`crate::mcp::recall::latest_link_attest_level_many`], so
+    /// the `Accept-Provenance: verbose` recall envelope can carry
+    /// `latest_link_attest_level` on the postgres path too (the sqlite
+    /// path decorates it via `decorate_memory_many`; before this method
+    /// the postgres verbose branch silently dropped the field — a wire
+    /// parity gap between backends).
+    ///
+    /// Returns a map from memory id → the best `attest_level` wire string
+    /// (`"unsigned"` | `"self_signed"` | `"peer_attested"` | …) found on
+    /// any incident edge; ids with no attested incident edge are ABSENT
+    /// from the map (mirroring the sqlite free-fn contract). Best-effort:
+    /// the default implementation returns an empty map, so a decoration
+    /// lookup never blocks a recall — a backend with no link-attestation
+    /// surface degrades to "no decoration" (fewer fields, never wrong
+    /// fields). `SqliteStore` and `PostgresStore` override it with the
+    /// live `memory_links` scan + best-of ranking.
+    ///
+    /// # Errors
+    /// Propagates a genuine backend read failure from an overriding
+    /// adapter; the default is infallible.
+    async fn latest_link_attest_levels(
+        &self,
+        _ids: &[&str],
+    ) -> StoreResult<std::collections::HashMap<String, String>> {
+        Ok(std::collections::HashMap::new())
+    }
 
     /// v0.7.0 ARCH-2 followup (FX-C2) — per-anchor edge probe. Returns
     /// every link where `anchor_id` is either the source or the target

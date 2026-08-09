@@ -636,6 +636,21 @@ impl MemoryStore for SqliteStore {
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(box_err)
     }
 
+    /// PR-C pg-parity (5-agent vote `4d3ea1c5`) — delegate to the sqlite
+    /// SSOT decorator free-fn, which already resolves the strongest
+    /// incident-edge attestation per id in one batched query. Wrapping it
+    /// on the trait gives the postgres verbose-recall branch a
+    /// backend-blind method to call for the same wire field.
+    async fn latest_link_attest_levels(
+        &self,
+        ids: &[&str],
+    ) -> StoreResult<std::collections::HashMap<String, String>> {
+        let conn = self.state.lock().await;
+        Ok(crate::mcp::recall::latest_link_attest_level_many(
+            &conn, ids,
+        ))
+    }
+
     async fn register_agent(
         &self,
         _ctx: &CallerContext,
