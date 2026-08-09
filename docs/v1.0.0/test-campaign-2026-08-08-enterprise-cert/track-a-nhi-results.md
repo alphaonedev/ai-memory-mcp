@@ -352,8 +352,23 @@ in #2810's stated remediation, so it does not move the verdict to HOLD.
 ## Claims-parity spot check
 
 `tests/pg_supported_route_inventory_gate_2799.rs` — the Phase-1 anti-regression
-gate that freezes the 59-supported / 21-fully-501 partition — run against this
-fresh database. Result recorded in
+gate that freezes the 59-supported / 21-fully-501 partition — run in release
+against this fresh database:
+
+```
+AI_MEMORY_TEST_POSTGRES_URL=postgres://…/tracka_remint \
+  cargo test --features sal,sal-postgres --release \
+             --test pg_supported_route_inventory_gate_2799
+
+test already_open_sal_route_1111_routes_stay_supported ... ok
+test pg_supported_inventory_and_counts_are_pinned ... ok
+test allowlist_membership_is_frozen_at_source ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored
+```
+
+**PASS (3/3)** — the pg-supported inventory and the source-level allow-list
+membership are unchanged, so the 59/21 partition this re-mint certifies against
+is the one the gate pins. Log:
 `.local-runs/cert-campaign/tracka/remint-2026-08-09/gate2799.log`.
 
 ## Harness corrections made during this re-mint (disclosed)
