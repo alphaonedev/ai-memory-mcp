@@ -791,7 +791,13 @@ mod postgres_twins {
             return;
         };
         ai_memory::config::set_append_only(true);
-        let ctx = CallerContext::for_agent("g6-flagon");
+        // The pg trait `update` enforces the #1412/#1628 caller-owns gate:
+        // `metadata->>'agent_id'` (the owner stamped at store time from
+        // `sample()`, i.e. "ai:g6-flagon") must equal `ctx.effective_principal()`.
+        // The caller principal MUST therefore match the stamped owner, or the
+        // update is correctly refused with `PermissionDenied` (a real security
+        // control, NOT a bug). `sample()` stamps `metadata.agent_id="ai:g6-flagon"`.
+        let ctx = CallerContext::for_agent("ai:g6-flagon");
         let id = uuid::Uuid::new_v4().to_string();
         let mem = sample(&id, "ns-pg-put", "pg-v1");
         MemoryStore::store(&pg, &ctx, &mem)

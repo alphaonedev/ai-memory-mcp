@@ -636,6 +636,14 @@ mod postgres_parity {
         let agent = format!("ai:1826-{}", uuid::Uuid::new_v4());
         let ph = payload_hash(b"pg-forged");
         let ts = chrono::Utc::now();
+        // ISOLATION-SAFETY: `sequence` is UNIQUE and the shared postgres DB
+        // accumulates audit rows across the whole suite, so a hardcoded
+        // `sequence = 1` collides. Compute the next free sequence from the head.
+        let base_seq: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) FROM signed_events")
+                .fetch_one(pg.pool())
+                .await
+                .expect("read signed_events head");
         sqlx::query(
             "INSERT INTO signed_events \
                 (id, agent_id, event_type, payload_hash, signature, attest_level, timestamp, \
@@ -650,7 +658,7 @@ mod postgres_parity {
         .bind("recorder_signed")
         .bind(ts)
         .bind(ai_memory::signed_events::ZERO_HASH.to_vec())
-        .bind(1_i64)
+        .bind(base_seq + 1)
         .bind(Option::<Vec<u8>>::None)
         .execute(pg.pool())
         .await

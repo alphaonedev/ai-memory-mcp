@@ -328,6 +328,17 @@ mod postgres_parity {
         let ts = chrono::Utc::now();
         let cause = compute_cause_hash(&agent, "memory.reclassified", &id, "pg|obs|decision");
 
+        // ISOLATION-SAFETY: `signed_events.sequence` carries a UNIQUE index and
+        // the shared postgres DB accumulates real audit rows from every other
+        // test in the suite (the nightly runs the whole `sal-postgres` suite
+        // serially against ONE DB), so a hardcoded `sequence = 1` collides.
+        // Compute the next free sequence from the live head instead.
+        let base_seq: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) FROM signed_events")
+                .fetch_one(pg.pool())
+                .await
+                .expect("read signed_events head");
+
         // INSERT a cause-bearing row directly (no pg writer binds a cause
         // in G5a — this exercises the COLUMN round-trip + shared fold).
         sqlx::query(
@@ -344,7 +355,7 @@ mod postgres_parity {
         .bind("unsigned")
         .bind(ts)
         .bind(ZERO_HASH.to_vec())
-        .bind(1_i64)
+        .bind(base_seq + 1)
         .bind(&cause)
         .execute(pg.pool())
         .await
