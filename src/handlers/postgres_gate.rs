@@ -479,6 +479,12 @@ pub fn path_is_registered_route(method: &axum::http::Method, path: &str) -> bool
         ("DELETE", super::routes::SUBSCRIPTIONS) => true,
         ("GET", super::routes::SUBSCRIPTIONS) => true,
         ("POST", super::routes::SESSION_START) => true,
+        // #1718 — Commit-C2 signal send-path (was missing from this
+        // router mirror even though the route is registered + pg-supported;
+        // the omission was masked because a pg-supported route never
+        // reaches the 404-vs-501 branch this table feeds — caught by the
+        // Phase-1 anti-regression gate `pg_supported_route_inventory_gate`).
+        ("POST", super::routes::SIGNALS) => true,
         // Cluster E API-2 — Agent Skills (parameterless variants).
         ("POST", super::routes::SKILL_REGISTER) => true,
         ("GET", super::routes::SKILL_LIST) => true,
@@ -524,17 +530,23 @@ pub fn path_is_registered_route(method: &axum::http::Method, path: &str) -> bool
         ("POST", p) if archive_restore_path(p) => true,
         // /api/v1/pending/{id}/approve|reject
         ("POST", p) if pending_decide_path(p) => true,
+        // /api/v1/actions/{id}/transition (#1718) + /api/v1/checkpoints/{id}/resolve
+        // (#2391) — registered + pg-supported, previously absent from this
+        // router mirror (Phase-1 anti-regression-gate finding).
+        ("POST", p) if actions_transition_path(p) => true,
+        ("POST", p) if checkpoints_resolve_path(p) => true,
         // /api/v1/approvals/{pending_id}
         ("POST", p) if approvals_decide_path(p) => true,
         // /api/v1/skill/{id} (GET)
         ("GET", p) if skill_id_path(p) => true,
         // /api/v1/skill/{id}/resource (GET)
         ("GET", p) if skill_id_sub_path(p, "resource") => true,
-        // /api/v1/skill/{id}/export | /promote | /compose (POST)
+        // /api/v1/skill/{id}/export | /promote | /compose | /retire (POST)
         ("POST", p)
             if skill_id_sub_path(p, "export")
                 || skill_id_sub_path(p, "promote")
-                || skill_id_sub_path(p, "compose") =>
+                || skill_id_sub_path(p, "compose")
+                || skill_id_sub_path(p, "retire") =>
         {
             true
         }
