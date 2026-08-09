@@ -218,9 +218,17 @@ write_files:
 
       fail() { echo "[fed-bootstrap] FAIL: $*" >&2; exit 1; }
 
-      install -d -m 0750 -o aimemory -g aimemory \
-        /etc/ai-memory "$FED_DIR" "$FED_DIR/peers" "$KEY_DIR" \
-        "$XDG_DIR" "$XDG_DIR/ai-memory"
+      # CUSTODY SPLIT. Everything the daemon only needs to READ stays
+      # root-owned, group aimemory, non-writable by the service user: a
+      # compromised daemon can use its trust anchors but cannot rewrite them.
+      # Same separable-custody principle the substrate already applies to
+      # AI_MEMORY_WITNESS_KEY_DIR ("a mount the daemon can READ but a
+      # compromised daemon process cannot overwrite"). Only $KEY_DIR is
+      # daemon-writable, because `identity generate` runs as aimemory and the
+      # daemon owns its own signing keys by design.
+      install -d -m 0750 -o root -g aimemory \
+        /etc/ai-memory "$FED_DIR" "$FED_DIR/peers" "$XDG_DIR" "$XDG_DIR/ai-memory"
+      install -d -m 0700 -o aimemory -g aimemory "$KEY_DIR"
 
       # --- A. mint this node's federation identity ---------------------
       [ -x "$BIN" ] || fail "no ai-memory binary at $BIN; scp a --features sal-postgres build over it, then: systemctl restart ai-memory-fed-bootstrap"
@@ -241,18 +249,22 @@ write_files:
         ( umask 077; openssl rand -hex 32 > /etc/ai-memory/api-key ) \
           || fail "could not mint the local api key"
       fi
-      chown aimemory:aimemory /etc/ai-memory/api-key
-      chmod 0600 /etc/ai-memory/api-key
+      chown root:aimemory /etc/ai-memory/api-key
+      chmod 0640 /etc/ai-memory/api-key
       API_KEY="$(cat /etc/ai-memory/api-key)"
-      cat > "$XDG_DIR/ai-memory/config.toml" <<CFG
+      # The umask subshell matters: config.toml carries the api_key, so it must
+      # never exist even momentarily at the inherited 0644.
+      ( umask 077
+        cat > "$XDG_DIR/ai-memory/config.toml" <<CFG
       schema_version = 2
       api_key = "$API_KEY"
 
       [admin]
       agent_ids = ["$ADMIN_ID"]
       CFG
-      chown -R aimemory:aimemory "$XDG_DIR"
-      chmod 0600 "$XDG_DIR/ai-memory/config.toml"
+      ) || fail "could not write the daemon config"
+      chown root:aimemory "$XDG_DIR/ai-memory/config.toml"
+      chmod 0640 "$XDG_DIR/ai-memory/config.toml"
       # NOTE: tier is left unset, so the daemon keeps its compiled default
       # (semantic). A Track-D-only run that does not need the embedder can
       # add `tier = "keyword"` to that file and restart -- the same
@@ -278,8 +290,11 @@ write_files:
       # The daemon refuses a plaintext non-loopback peer at boot (#2477).
       # Repeating the check here turns that into a named, logged refusal
       # instead of an opaque unit start failure.
-      . "$FED_DIR/peers.conf"
-      PEERS="$${AI_MEMORY_QUORUM_PEERS:-}"
+      # PARSED, never sourced. systemd reads this file as a plain KEY=value
+      # EnvironmentFile, so `.` would give it shell-execution semantics this
+      # script does not need and systemd does not grant -- a needless
+      # arbitrary-code surface on an over-the-wire-delivered file.
+      PEERS="$(sed -n 's/^AI_MEMORY_QUORUM_PEERS=//p' "$FED_DIR/peers.conf" | tail -1 | tr -d '"\r')"
       [ -n "$PEERS" ] || fail "peers.conf carries no AI_MEMORY_QUORUM_PEERS; refusing to start a federated node with an empty peer list"
       BAD_PEER=0
       OLD_IFS=$IFS
@@ -297,8 +312,12 @@ write_files:
       PEER_PUBS=$(ls -1 "$FED_DIR"/peers/*.pub 2>/dev/null | wc -l)
       [ "$PEER_PUBS" -ge 1 ] || fail "no peer public keys under $FED_DIR/peers"
       cp "$FED_DIR"/peers/*.pub "$KEY_DIR"/ || fail "could not install peer public keys"
-      chown -R aimemory:aimemory "$KEY_DIR" "$FED_DIR"
-      chmod 0600 "$FED_DIR/node.key"
+      chown -R aimemory:aimemory "$KEY_DIR"
+      # $FED_DIR stays root-owned (custody split above); the daemon reads it as
+      # group aimemory and cannot rewrite its own trust anchors.
+      chown -R root:aimemory "$FED_DIR"
+      chmod 0750 "$FED_DIR" "$FED_DIR/peers"
+      chmod 0640 "$FED_DIR/node.key"
       chmod 0644 "$FED_DIR/ca.crt" "$FED_DIR/node.crt" "$FED_DIR/peers.allowlist" "$FED_DIR/peers.conf"
       echo "[fed-bootstrap] enrolled $PEER_PUBS peer public key(s) into $KEY_DIR"
 
