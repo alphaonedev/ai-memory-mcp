@@ -27,15 +27,25 @@
 //! - `core` — 7 tools, the new v0.6.4 default (v0.7 B1 added
 //!   `memory_load_family`; v0.7 B2 added `memory_smart_load`).
 //!   Always loaded.
-//! - `graph` — adds the 11 KG/entity/replay/verify/find_paths tools. ~18 tools.
-//! - `admin` — adds lifecycle (6) + governance (8). ~21 tools.
-//! - `power` — adds the 8 LLM-augmented + operator tools (consolidate,
-//!   auto_tag, …, plus the v0.7 K7 subscription-reliability pair).
-//!   ~15 tools.
-//! - `full` — every family. **74 advertised entries at v0.7.0**
-//!   (73 callable "memory tools" + the always-on `memory_capabilities`
-//!   bootstrap; `Profile::full().expected_tool_count()` is the
-//!   canonical assertion).
+//! - `graph` — adds the `Family::Graph` KG / entity / replay / verify /
+//!   find_paths / lineage tools.
+//! - `admin` — adds `Family::Lifecycle` + `Family::Governance`.
+//! - `power` — adds the `Family::Power` LLM-augmented + operator +
+//!   coordination tools (consolidate, auto_tag, the v0.7 K7
+//!   subscription-reliability pair, the v0.8.0 #1709 action / lease /
+//!   signal / checkpoint / routine surfaces, …).
+//! - `full` — every family. Its advertised-entry count (callable
+//!   "memory tools" + the always-on `memory_capabilities` bootstrap)
+//!   is whatever `Profile::full().expected_tool_count()` returns —
+//!   that accessor, derived from the per-family `tool_names` slices,
+//!   is the canonical SSOT.
+//!
+//! Per-profile totals are deliberately NOT restated as literals here:
+//! `Profile::<name>().expected_tool_count()` is the only count that
+//! cannot drift. (The pre-#2782 form hardcoded `~18` / `~21` / `~15`
+//! and `74 advertised entries at v0.7.0`; by v1.0.0 the live values
+//! were 19 / 21 / 56 and 103 — the literals rotted, the accessor did
+//! not.)
 //! - `custom` — comma-separated family list (`core,graph,archive` …).
 //!   `core` is implicitly added if missing — there's no profile that
 //!   ships *less than* the 7 core tools at v0.7.0 (the original 5 +
@@ -657,10 +667,11 @@ impl Profile {
         }
     }
 
-    /// `graph` — core + graph. 18 tools (v0.7.0 I4 added `memory_replay`;
-    /// v0.7 H4 added `memory_verify`; v0.7 B1 added `memory_load_family`
-    /// to core; v0.7 B2 added `memory_smart_load` to core; v0.7 J7
-    /// added `memory_find_paths`).
+    /// `graph` — core + graph. The loaded-tool count is
+    /// `Profile::graph().expected_tool_count()` (core 7 + the
+    /// `Family::Graph` slice); **19** at v1.0.0 — the pre-#2782
+    /// docstring still said 18, having missed the v0.9.0 G13-mem
+    /// (#1859) `memory_lineage` addition.
     #[must_use]
     pub fn graph() -> Self {
         Self {
@@ -668,7 +679,8 @@ impl Profile {
         }
     }
 
-    /// `admin` — core + lifecycle + governance. 21 tools
+    /// `admin` — core + lifecycle + governance. The loaded-tool count is
+    /// `Profile::admin().expected_tool_count()`; **21** at v1.0.0
     /// (core 7 + lifecycle 6 + governance 8; v0.7 B1 added
     /// `memory_load_family` to core; v0.7 B2 added
     /// `memory_smart_load` to core; #1389 L4 added
@@ -680,10 +692,15 @@ impl Profile {
         }
     }
 
-    /// `power` — core + power. 30 tools (core 7 + power 23; v0.7 B1
-    /// added `memory_load_family` to core; v0.7 B2 added `memory_smart_load`
-    /// to core; v0.7 K7 added the two subscription-reliability tools
-    /// to `Family::Power`).
+    /// `power` — core + power. The loaded-tool count is
+    /// `Profile::power().expected_tool_count()` — the SSOT, derived from
+    /// `Family::Core.tool_names()` + `Family::Power.tool_names()` and
+    /// pinned by `profile_power_loads_core_plus_power`. At v1.0.0 that
+    /// is **56** (core 7 + the 49-entry `Family::Power` slice); the
+    /// figure is stated with its release anchor because the slice keeps
+    /// growing (v0.7 K7 added the two subscription-reliability tools,
+    /// v0.8.0 #1709 added the action / lease / signal / checkpoint /
+    /// routine coordination surfaces). Do not re-derive it by hand.
     #[must_use]
     pub fn power() -> Self {
         Self {

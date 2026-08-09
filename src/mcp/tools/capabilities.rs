@@ -506,10 +506,25 @@ pub fn format_rule_summary(namespace: &str, policy: &crate::models::GovernancePo
 /// `Profile` state.
 ///
 /// The summary names: how many tools are advertised in `tools/list`
-/// under the active profile vs how many exist in total, and the three
-/// recovery paths an LLM can take to reach unloaded tools (`--profile`
-/// CLI flag, [`memory_load_family`](#) — landing in B1, and
-/// [`memory_smart_load`](#) — landing in B2).
+/// under the active profile vs how many exist in total, what an
+/// unloaded tool actually does when called, and the ONE path that
+/// makes an unloaded tool callable — restarting the server under a
+/// wider `--profile`.
+///
+/// **#2781 — `memory_load_family` / `memory_smart_load` are NOT
+/// tool-recovery paths.** Both load MEMORIES: `LoadFamilyTool` is
+/// described as "Load top-k recent + high-priority memories from a
+/// Family" and its handler returns memory rows; `memory_smart_load`
+/// picks a family from a free-text intent and forwards to the same
+/// handler. Neither mutates the registry or the resolved
+/// [`crate::profile::Profile`], so neither can make an unloaded tool
+/// callable — `tools/call` on a tool the profile did not load returns
+/// JSON-RPC `-32601 unknown tool: <name>` regardless (see the #1254
+/// uniform-message tests in `src/mcp/mod.rs`). Listing them as
+/// recovery paths (b) and (c) sent an NHI down a dead end: it called
+/// `memory_load_family` expecting a tool and got memory rows. The
+/// manifest now says what is true, and still names both tools so the
+/// LLM learns they exist — as the memory loaders they are.
 ///
 /// The result is a single plain-language string, intentionally written
 /// for an LLM to repeat verbatim when an end-user asks "what tools do
@@ -523,14 +538,15 @@ pub fn build_capabilities_summary(profile: &crate::profile::Profile) -> String {
     // always-on bootstrap (`memory_capabilities`). Reconciles with
     // `build_capabilities_describe_to_user`'s "{n_loaded} memory
     // tool{s}" phrasing so the summary number agrees with the
-    // user-facing sentence — at v0.7.0 both report 73 for
-    // `--profile full` (73 callable memory tools + the always-on
-    // `memory_capabilities` bootstrap = 74 advertised entries, which
-    // matches `Profile::full().expected_tool_count()` and
-    // `crate::mcp::registry::tool_names::ALL.len()`). The F13 pin
+    // user-facing sentence: for `--profile full` both report
+    // `Profile::full().expected_tool_count() - ALWAYS_ON_TOOLS.len()`
+    // callable memory tools, one fewer than the advertised-entry count
+    // `crate::mcp::registry::tool_names::ALL.len()`. At v1.0.0 that is
+    // 102 callable / 103 advertised (#2782 corrected the stale "73 /
+    // 74 at v0.7.0" literals this comment used to carry). The F13 pin
     // guards against the off-by-one where the summary count would
     // collide with the advertised-entries count; see issue #862 for
-    // the canonical 73/74 disambiguation.
+    // the canonical callable-vs-advertised disambiguation.
     let total: usize = Family::all()
         .iter()
         .map(|f| f.expected_tool_count())
@@ -554,12 +570,13 @@ pub fn build_capabilities_summary(profile: &crate::profile::Profile) -> String {
 
     format!(
         "{visible} of {total} memory tools are advertised in tools/list under the current \
-         profile ({label}). The other {unloaded} are listed in this manifest but NOT directly \
-         callable. To use any unloaded tool, choose one of: \
-         (a) restart the server with --profile <family> or --profile full, \
-         (b) call memory_load_family(family=<name>) — preferred, \
-         (c) call memory_smart_load(intent='<plain language>') — easiest, \
-         (d) call the tool by name and recover from JSON-RPC -32601."
+         profile ({label}). The other {unloaded} are listed in this manifest but NOT \
+         callable in this session: calling one returns JSON-RPC -32601 unknown tool. \
+         (a) The only way to make an unloaded tool callable is to restart the server with \
+         --profile <family> or --profile full — no runtime call loads tools. \
+         (b) memory_load_family(family=<name>) and \
+         memory_smart_load(intent='<plain language>') load MEMORIES tagged with a family; \
+         they do NOT register tools, so they cannot reach an unloaded tool."
     )
 }
 

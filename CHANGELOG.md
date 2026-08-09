@@ -136,6 +136,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the four original files. `--self-test`: the pre-fix shape is REJECTED **by the ENFORCEMENT
   rule specifically**, and the near-miss (same citation, no enforcement verb) still PASSES so
   the rule does not ban naming an advisory workflow.
+### Fixed — runtime manifest truthfulness
+
+- **The `memory_capabilities` manifest no longer tells an agent that
+  `memory_load_family` / `memory_smart_load` can reach an unloaded TOOL**
+  (refs [#2781](https://github.com/alphaonedev/ai-memory-mcp/issues/2781);
+  distinct from #864, which was the naming question). The v0.7.0 `summary`
+  string listed four "recovery paths" — `(b) call
+  memory_load_family(family=<name>) — preferred` and `(c) call
+  memory_smart_load(intent='<plain language>') — easiest` among them. Both
+  are FALSE: `LoadFamilyTool`'s own description is "Load top-k recent +
+  high-priority memories from a Family", its handler returns memory rows,
+  and `handle_smart_load` picks a family from a free-text intent and
+  forwards to that same handler. Neither mutates the tool registry or the
+  resolved `Profile`, so `tools/call` on a tool the active profile did not
+  load still returns `-32601 unknown tool: <name>` (the #1254 uniform
+  message). An NHI following the manifest took a dead end. The old `(d)
+  call the tool by name and recover from JSON-RPC -32601` was not a path
+  either — that is the OUTCOME, not a way to reach the tool. **Effect:**
+  the summary now states the `-32601` outcome up front, names profile
+  selection at MCP boot as the ONLY way to make an unloaded tool callable,
+  and still names both family loaders — as the MEMORY loaders they are.
+  Docs reconciled (`docs/v0.7/canonical-phrasings.md`, `docs/ADMIN_GUIDE.md`,
+  `docs/MIGRATION_v0.7.md` — the last two claimed the loaders "register
+  additional families at runtime without restarting the MCP server").
+  **Regression (R-203):** `tests/calibration_t0.rs::t0_summary_core_profile_names_the_one_real_recovery_path`
+  and `tests/discovery_gate_t1_t3.rs::t2_recognition_summary_disclaims_loaders_as_tool_recovery_paths`
+  both assert the corrected wording AND ban the four retired strings, so
+  the false framing cannot come back; `tests/capabilities_v3.rs` pins the
+  disclaimer under `core` and `full`.
+
+### Docs (drift remediation — playbook / profile docstrings / nsa-csi hook count)
+
+- **`docs/v1.0.0/nhi-playbook-P0-P11.md` — four assertions reconciled to
+  v1.0.0 behavior** (refs [#2796](https://github.com/alphaonedev/ai-memory-mcp/issues/2796)).
+  The binary was correct in each case; the playbook drifted, so a tester
+  taking it literally would mis-flag a PASS as a FAIL. **P0** — `tools/list`
+  under `--profile core` renders **8** entries (the 7 `Family::Core` tools
+  that `Profile::core().expected_tool_count()` reports, plus the always-on
+  `memory_capabilities` bootstrap `ALWAYS_ON_TOOLS` registers outside the
+  profile filter), the same framing the doc already used for full.
+  **P2** — the "every explicit delete/forget writes an `archived_memories`
+  row" claim is scoped to its true subject: `memory_forget` archives
+  (`archive_reason='forget'`, same transaction as the delete per #1776)
+  when `[storage].archive_on_gc` is on (the default), and `memory_delete`
+  by id is a HARD delete with NO archive copy — a caveat an operator must
+  have, since under the default `append_only=off` it destroys durable text
+  irrecoverably. **P9** — an MCP-stored memory stamps `source = "nhi"`
+  (`validate::DEFAULT_NHI_SOURCE`, vendor-neutral since #1175), not
+  `claude`; the client identity lives in `metadata.agent_id`. **P10** — the
+  MCP `memory_stats` field is `total` (the serialized `models::memory::Stats`,
+  plus the #2334 `live` / `expired_pending_gc` siblings); `total_memories`
+  is the HTTP admin / doctor / boot spelling of the same value, and the two
+  surfaces are now distinguished rather than conflated.
+- **`docs/compliance/nsa-csi-mcp-security-mapping.md` no longer claims 27
+  `HookEvent` variants** (refs [#2780](https://github.com/alphaonedev/ai-memory-mcp/issues/2780)).
+  `HOOK_EVENTS_COUNT` is **22** (`src/config.rs`) — #2637 removed the
+  never-fired `pre_archive` gate (27 → 26) and #2758 removed `pre_recall` /
+  `pre_search` / `pre_transcript_store` / `post_transcript_store` (26 → 22).
+  The doc named the exact SSOT test it contradicted. Both citations (§2.7
+  concern-c table row + §3.3) corrected; `ROADMAP.md`'s current-state
+  parenthetical inside the frozen v0.7.1 baseline corrected 27 → 22. The
+  dated `docs/audit/3x7-claims-register-2026-08-01.md` keeps its 27 — that
+  figure was TRUE at the register's HEAD `2f32dde1` (2026-08-01, before
+  both removals landed 2026-08-07) — and carries an Erratum instead, per
+  the frozen-snapshot policy that keeps CHANGELOG and the v0.7 migration
+  guides out of the drift gate.
+- **`scripts/check-docs-vs-ssot.sh` now sees the phrasings that drifted.**
+  The HookEvent rule only knew "hook lifecycle events", so the nsa-csi
+  ``**27** `HookEvent` variants`` claim was invisible for the two releases
+  it was wrong across; two bold-anchored alternatives were added (the
+  bold anchor keeps ROADMAP §11.3.1's legitimate historical "25 hook
+  lifecycle events at v0.7.1" untouched, same reasoning as the
+  bold-only `CURRENT_SCHEMA_VERSION` rule). `docs/v1.0.0/nhi-playbook-P0-P11.md`
+  joins `DOC_FILES` — it opens with an explicit "v1.0.0 SSOT values used
+  below" block that a tester reads as the pass/fail bar, and was not
+  walked. Both additions verified load-bearing by re-planting the pre-fix
+  claims and confirming the gate REJECTS them.
+- **`src/profile.rs` profile docstrings stopped citing rotted literals**
+  (refs [#2782](https://github.com/alphaonedev/ai-memory-mcp/issues/2782)).
+  `Profile::power()` said "30 tools (core 7 + power 23)" against a live 56
+  (core 7 + a 49-entry `Family::Power` slice), and the module doc said
+  "**74 advertised entries at v0.7.0** (73 callable …)" against a live
+  103/102. `graph()` said 18 against a live 19, having missed the v0.9.0
+  #1859 `memory_lineage` addition. Every per-profile count now leads with
+  the `Profile::<name>().expected_tool_count()` accessor (the SSOT that
+  cannot drift); where a figure is still stated it carries its release
+  anchor. Same class fixed in `src/mcp/tools/capabilities.rs` (the F13
+  comment's "73 / 74 at v0.7.0"), `src/validate.rs` (a present-tense
+  docstring citing 89 routes / 74 tools / 83/85 CLI subcommands, now
+  naming the consts), and `docs/ADMIN_GUIDE.md` (a "101 advertised
+  entries / 100 callable" profile table cell, now 103/102).
 <!-- #2812 (feat/do-hive-multinode-federation) -->
 ### Added (Track D federated multi-node DO substrate for the v1.0.0 enterprise-cert round)
 

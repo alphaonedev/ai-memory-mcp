@@ -193,36 +193,63 @@ fn t0_describe_to_user_omits_mcp_jargon_across_profiles() {
 
 // ---------------------------------------------------------------------------
 // T0-A1-CORE — the `summary` (operator-facing) string on `--profile core`
-// names the four recovery paths verbatim (a, b, c, d). This is the
-// counterpart calibration cell for the A1 phrasing — operators get the
-// recovery vocabulary even when LLMs mute it from the user-facing
-// describe sentence.
+// names the ONE real recovery path verbatim, states the -32601 outcome of
+// calling an unloaded tool, and explicitly disclaims the two memory
+// loaders as tool-recovery paths.
+//
+// #2781 rewrote this cell. It used to assert four "recovery paths"
+// (a/b/c/d) because the manifest advertised four; two of them were
+// FALSE. `memory_load_family` / `memory_smart_load` load MEMORIES
+// tagged with a family — their handlers return memory rows and never
+// mutate the registry or the resolved `Profile` — so an NHI that
+// followed path (b) or (c) to "reach an unloaded tool" took a dead end.
+// The old (d) was not a recovery path either: calling an unloaded tool
+// by name yields `-32601 unknown tool`, which is the OUTCOME, not a way
+// to reach it. Asserting the old strings would now pin a false claim
+// into the substrate's own calibration suite.
 // ---------------------------------------------------------------------------
 #[test]
-fn t0_summary_core_profile_lists_four_recovery_paths() {
+fn t0_summary_core_profile_names_the_one_real_recovery_path() {
     let val = v3_response(&Profile::core());
     let summary = val["summary"].as_str().expect("summary present");
 
-    // Path (a) — CLI escape hatch
+    // The only path that makes an unloaded tool callable.
     assert!(
-        summary.contains("(a) restart the server with --profile <family>"),
-        "T0-A1-CORE: summary missing recovery path (a); got: {summary}"
+        summary.contains(
+            "(a) The only way to make an unloaded tool callable is to restart \
+                          the server with --profile <family> or --profile full"
+        ),
+        "T0-A1-CORE: summary missing the real recovery path (a); got: {summary}"
     );
-    // Path (b) — preferred runtime loader (B1, lands later in v0.7.0)
+    // The honest outcome of calling an unloaded tool.
     assert!(
-        summary.contains("(b) call memory_load_family(family=<name>) — preferred"),
-        "T0-A1-CORE: summary missing recovery path (b); got: {summary}"
+        summary.contains("calling one returns JSON-RPC -32601 unknown tool"),
+        "T0-A1-CORE: summary must state the -32601 outcome; got: {summary}"
     );
-    // Path (c) — easiest runtime loader (B2, lands later in v0.7.0)
+    // The two memory loaders are still NAMED (the LLM should know they
+    // exist) but explicitly disclaimed as tool-recovery paths (#2781).
     assert!(
-        summary.contains("(c) call memory_smart_load(intent='<plain language>') — easiest"),
-        "T0-A1-CORE: summary missing recovery path (c); got: {summary}"
+        summary.contains("memory_load_family(family=<name>)")
+            && summary.contains("memory_smart_load(intent='<plain language>')"),
+        "T0-A1-CORE: summary must still name both memory loaders; got: {summary}"
     );
-    // Path (d) — call-by-name fallback for harnesses without runtime loaders
     assert!(
-        summary.contains("(d) call the tool by name and recover from JSON-RPC -32601"),
-        "T0-A1-CORE: summary missing recovery path (d); got: {summary}"
+        summary.contains("load MEMORIES tagged with a family; they do NOT register tools"),
+        "T0-A1-CORE: summary must disclaim the loaders as tool-recovery paths (#2781); \
+         got: {summary}"
     );
+    // The retired false framing must not come back.
+    for banned in [
+        "(b) call memory_load_family(family=<name>) — preferred",
+        "(c) call memory_smart_load(intent='<plain language>') — easiest",
+        "(d) call the tool by name and recover from JSON-RPC -32601",
+        "To use any unloaded tool, choose one of:",
+    ] {
+        assert!(
+            !summary.contains(banned),
+            "T0-A1-CORE: #2781 retired phrasing is back: {banned:?}; got: {summary}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -153,6 +153,13 @@ DOC_FILES=(
     docs/CONFIG_SCHEMA.md
     docs/production-deployment.md
     docs/enterprise-deployment.md
+    # #2796 — the committed NHI dogfood playbook opens with an explicit
+    # "v1.0.0 SSOT values used below" block (schema, tool counts, Memory
+    # fields, link relations, route/CLI counts, HookEvent variants) that a
+    # tester reads as the pass/fail bar. It was not walked, so its
+    # `--profile core` count drifted unnoticed. It is a CURRENT-release
+    # doc, not a frozen snapshot, so it belongs in the gate.
+    docs/v1.0.0/nhi-playbook-P0-P11.md
 )
 
 # Operator-facing HTML surfaces (rendered compliance pages). Markdown is
@@ -763,10 +770,19 @@ run_all_rules() {
     # engine simply re-anchors one character right and matches "5".
     # "variants total" is deliberately NOT an anchor for the same reason:
     # that same line legitimately carries "27 variants total AT v0.8.0".
+    #
+    # 3x7 lane-1 (#2780) UNION: the two `HookEvent`-SYMBOL phrasings below
+    # are ADDITIVE to the lane-3 noun-phrase anchors — the generalised set
+    # above does NOT cover the compliance-doc phrasing "**N** `HookEvent`
+    # variants" (docs/compliance/nsa-csi-mcp-security-mapping.md:115, which
+    # named the exact SSOT test it contradicted while shipping 27). They
+    # stay BOLD-anchored + symbol-specific so the ROADMAP §11.3.1 frozen
+    # v0.7.1 baseline's legitimate historical prose and the "27 variants
+    # total AT v0.8.0" line are untouched.
     check_narrative_count_rule \
         "HookEvent variants" \
         "$CANONICAL_HOOK_EVENTS" \
-        '([0-9]+)[- ]event hook pipeline|([0-9]+) named substrate events|([0-9]+) hook lifecycle events|(?<![0-9])(?<!ships )([0-9]+) lifecycle events' \
+        '([0-9]+)[- ]event hook pipeline|([0-9]+) named substrate events|([0-9]+) hook lifecycle events|(?<![0-9])(?<!ships )([0-9]+) lifecycle events|\*\*([0-9]+)\*\* `HookEvent` variants|`HookEvent` SSOT \(\*\*([0-9]+)\*\* variants' \
         "${HOOK_DOC_FILES[@]}"
     # Routes count
     check_narrative_count_rule \
