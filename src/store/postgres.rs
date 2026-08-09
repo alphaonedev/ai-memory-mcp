@@ -8024,7 +8024,8 @@ impl PostgresStore {
     ///
     /// Routes on the [`KgBackend`] resolved at [`Self::connect`] time
     /// (J1 substrate). When AGE is installed the traversal runs as a
-    /// Cypher `MATCH ... -[:related_to*1..N]-> ...` query through the
+    /// Cypher `MATCH ... -[r*1..N]-> ...` query (untyped so it walks all
+    /// [`crate::models::MemoryLinkRelation`] variants, #2792) through the
     /// `memory_graph` projection; otherwise we fall back to a recursive
     /// CTE over the `memory_links` table that mirrors the SQLite shape.
     ///
@@ -8116,14 +8117,18 @@ impl PostgresStore {
 
     /// Cypher (Apache AGE) implementation of `kg_query`.
     ///
-    /// Wraps a `MATCH (a)-[:related_to*1..N]->(b)` traversal in the
-    /// `cypher('memory_graph', ...)` set-returning function. Parameter
+    /// Wraps a `MATCH (a)-[r*1..N]->(b)` traversal in the
+    /// `cypher('memory_graph', ...)` set-returning function. The pattern is
+    /// UNTYPED (#2792) so it walks every [`crate::models::MemoryLinkRelation`]
+    /// edge the SQLite CTE would (AGE's parser rejects a type ALTERNATION);
+    /// the per-edge membership guard `age_edge_is_memory_link_relation` keeps
+    /// the result set CHECK-constraint-equivalent to `memory_links`. Parameter
     /// passing uses AGE's `$vars` syntax through a JSON-encoded second
     /// argument so the start id is bound — never interpolated — to
     /// keep the surface free of injection hazards.
     ///
-    /// The graph projection (`memory_graph`) and the `:related_to`
-    /// edge label are conventions established by the J1 schema-prep
+    /// The graph projection (`memory_graph`) and the per-relation
+    /// edge labels are conventions established by the J1 schema-prep
     /// scripts. When the projection is absent the underlying call
     /// surfaces as `BackendUnavailable` so the test harness can
     /// distinguish "AGE present, graph missing" from a real bug.
@@ -8254,6 +8259,16 @@ impl PostgresStore {
 
             let edges_raw = age_cell_text_required(r, AGE_COL_PATH_EDGES, READ_PATH_EDGES)?;
             let edges = age_decode_entity_list(AGE_COL_PATH_EDGES, &edges_raw)?;
+            // #2792 — the untyped `-[r*1..N]->` pattern
+            // (`build_kg_query_current_view_cypher`) matches EVERY edge type in
+            // `memory_graph`; keep the AGE branch row-for-row equivalent to the
+            // SQLite CTE's CHECK-constrained `memory_links` relation set by
+            // dropping any path that hops through a non-`MemoryLinkRelation`
+            // edge (fail-closed — a stray projection edge must never surface a
+            // target the CTE could never return).
+            if !edges.iter().all(age_edge_is_memory_link_relation) {
+                continue;
+            }
             if !age_path_edges_all_current(&edges, &now_stamp) {
                 continue;
             }
@@ -14056,13 +14071,61 @@ fn assert_age_id_safe(id: &str) -> Result<(), String> {
 /// first: an unsupported construct does not fail loudly, it degrades the
 /// whole backend to the CTE.
 fn build_kg_query_current_view_cypher(max_depth: usize) -> String {
+    // #2792 — the pattern is UNTYPED (`-[r*1..N]->`), NOT the pre-fix
+    // single-type `-[r:related_to*1..N]->`. The SQLite recursive CTE
+    // (`db::kg_query`) traverses `memory_links` with NO relation filter, so
+    // it walks ALL 9 `MemoryLinkRelation` variants; the pre-fix Cypher matched
+    // ONLY `related_to`, silently under-reporting every `supersedes` /
+    // `contradicts` / `derived_from` / `reflects_on` / `derives_from` /
+    // `decomposes_into` / `depends_on` / `advances` edge (kg_query count:0 on
+    // pg vs count:1 on sqlite for an identical `supersedes` edge).
+    //
+    // A relationship-type ALTERNATION (`-[r:a|b|c*1..N]->`) is NOT an option:
+    // Apache AGE's cypher parser does not implement it — `ERROR: syntax error
+    // at or near "|"`, verified live on AGE 1.6.0 AND 1.7.0 (the same wall the
+    // #2511 lineage path hit; see `build_kg_query_lineage_cypher`'s notes). The
+    // untyped traversal is instead kept row-for-row equivalent to the CTE's
+    // CHECK-constrained relation set by the Rust-side membership guard
+    // `age_edge_is_memory_link_relation`, applied per edge in
+    // [`PostgresStore::kg_query_cypher`].
     format!(
-        "MATCH p = (a)-[r:related_to*1..{max_depth}]->(b) \
+        "MATCH p = (a)-[r*1..{max_depth}]->(b) \
          WHERE a.id = $start_id \
          RETURN b.id AS target_id, \
                 nodes(p) AS path_nodes, \
                 relationships(p) AS path_edges"
     )
+}
+
+/// #2792 — is this decoded AGE edge one of the 9 canonical
+/// [`crate::models::MemoryLinkRelation`] variants?
+///
+/// The kg_query current-view traversal mirrors the SQLite recursive CTE
+/// (`db::kg_query`), which reads `memory_links` — a column CHECK-constrained
+/// to exactly `MemoryLinkRelation::all()`. The AGE `memory_graph` projection
+/// is populated ONLY by [`project_link_into_age`] (those same 9 labels), but
+/// an untyped `-[r*1..N]->` pattern (the #2792 fix for AGE's missing
+/// type-alternation support) would surface ANY edge in the graph. This
+/// fail-CLOSED membership guard keeps the AGE branch row-for-row equivalent
+/// to the CTE even if a stray non-link edge ever lands in the projection — the
+/// North-Star "DEGRADE (fewer results), never WRONG results" reading, and the
+/// exact structural twin of [`age_edge_is_lineage_relation`] (which filters to
+/// the stricter provenance subset P).
+///
+/// Prefers the `relation` PROPERTY and falls back to the edge LABEL —
+/// [`project_link_into_age`] writes the identical SAL relation value to both.
+fn age_edge_is_memory_link_relation(edge: &serde_json::Value) -> bool {
+    let name = edge
+        .get(field_names::PROPERTIES)
+        .and_then(|p| p.get("relation"))
+        .and_then(|r| r.as_str())
+        .or_else(|| edge.get("label").and_then(|l| l.as_str()));
+    let Some(name) = name else {
+        // Fail CLOSED: an edge whose relation cannot be read is NOT provably a
+        // memory-link edge, so it must not widen the traversal.
+        return false;
+    };
+    crate::models::MemoryLinkRelation::from_str(name).is_some()
 }
 
 /// #2511 — the relation of the LAST edge on a decoded `relationships(p)`
