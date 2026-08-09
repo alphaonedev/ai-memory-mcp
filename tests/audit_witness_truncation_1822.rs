@@ -186,6 +186,7 @@ fn row_only_delete_is_caught_by_witness_but_not_the_old_oracle() {
     let args = ai_memory::cli::verify_audit_trail::VerifyAuditTrailArgs {
         since: None,
         json: false,
+        store_url: None,
     };
     let mut so = Vec::<u8>::new();
     let mut se = Vec::<u8>::new();
