@@ -13,6 +13,10 @@ an ADDITIVE extension of the existing `infra/do-hive` provisioning + the
 `infra/pillar4-envelope/measure-envelope.sh` op-mix instrument. The default
 IronClaw-hive path is byte-identical; the measurement path is a toggle.
 
+> **Also in this file:** the [Track D federated multi-node round](#track-d----federated-multi-node-cert-round-memory_count2)
+> for the v1.0.0 enterprise-certification campaign. Same money gate, same
+> teardown, different toggle (`-var memory_count=2`).
+
 ## What this is NOT (honest scope)
 
 Read this first. It bounds every number the campaign can honestly publish.
@@ -119,3 +123,156 @@ Budget the campaign at ~$2, inside the do-hive header's own smoke-test budget.
 - The load-gen cloud-init is ASCII-only (the #1880 `check-cloud-init-ascii.sh`
   gate) and its embedded bash uses only unbraced shell vars so Terraform's
   `${...}` / `%{...}` interpolation never collides with it.
+
+---
+
+# Track D -- federated multi-node cert round (`memory_count=2`)
+
+Track D of the v1.0.0 enterprise-certification campaign
+(`docs/v1.0.0/test-campaign-2026-08-08-enterprise-cert/PLAN.md` Track D + §3)
+requires **REAL federated multi-node ai-memory across droplets**: an enrolled
+quorum, mutual TLS on the peer channel, per-write content signatures, and a
+W-of-N write. The local harnesses
+(`crypto/test-federation-mtls.sh`, `crypto/test-fed-write-sig-attestation.sh`)
+prove the *config*, but both their peers share one loopback interface and one
+process table, so they cannot prove cross-host reachability. This is the
+re-host.
+
+`main.tf` grows one variable, `memory_count` (default `1`). At the default the
+rendered `cloud-init-memory.yaml.tpl` user_data is **byte-identical** to the
+pre-Track-D template (verified by rendering both and `cmp`), so the existing
+IronClaw hive and the #2438 measurement cluster are untouched.
+
+## What gets provisioned at `memory_count=2`
+
+| piece | detail |
+|---|---|
+| droplets | `ai-memory-hive-memory-1` + `-2` on the existing VPC, same size/image as before |
+| firewall | `:9077` east-west additionally opened **between memory nodes** (only when `memory_count > 1`); SSH + outbound rules unchanged |
+| serve | a systemd **drop-in** (`ai-memory.service.d/10-federation.conf`) overrides only `ExecStart`; the base unit stays byte-identical, so the postgres/AGE/pgvector half cannot drift between the two topologies |
+| mTLS | each node presents its own leaf as BOTH server and outbound quorum client cert; `--mtls-allowlist` pins the peer + itself + the operator client (`crypto/gen-certs.sh` `HIVE_NODE_IPS` mode) |
+| quorum | `--quorum-writes 2 --quorum-peers https://<peer-private-ip>:9077 --quorum-ca-cert ... --quorum-timeout-ms 8000` |
+| federation identity | `ai:hive-memory-N`, Ed25519 keypair **generated on the droplet**; only the `.pub` ever leaves |
+| `AI_MEMORY_FED_*` | **all left UNSET on purpose.** At v1.0.0 write-sig / signal-sig / transition-sig / checkpoint-sig / nonce / peer-enrollment / policy-current are fail-closed by compiled default. Setting them to `1` would prove "the flag works", not "the shipped default is secure" |
+| api key | minted **on** each droplet (`openssl rand -hex 32` -> `/etc/ai-memory/api-key`, mode 0600). The daemon correctly refuses a non-loopback bind without one (`crypto/KNOWN-DO-STAGING.md` §3) |
+
+## Why there is a second command (`federate.sh`)
+
+Two constraints make peer wiring necessarily post-apply, and both are
+load-bearing rather than convenience:
+
+1. **Terraform cannot express it.** A DO droplet's private IPv4 is allocated at
+   create time and `digitalocean_droplet` has no input for it, so node 1's
+   `user_data` cannot reference node 2's address. With `count`, terraform models
+   the whole resource as ONE graph node, so even `memory[1 - count.index]` is a
+   hard `Cycle: digitalocean_droplet.memory` at plan time -- a resource cannot
+   reference itself.
+2. **Secrets must stay out of terraform state.** Anything rendered into
+   `user_data` lives verbatim in `terraform.tfstate` -- which `spawn.sh` COPIES
+   into `.local-runs/do-hive-runs/<ts>/` on every apply -- and is readable from
+   the droplet's own metadata service. So the CA + leaf private keys are minted
+   on the operator host and pushed over SSH instead.
+
+**Rejected alternative:** generate on droplet 1 and distribute to the others.
+There is no authenticated channel between two fresh droplets *before* the mTLS
+material exists (that material *is* the channel), so the bootstrap would be
+trust-on-first-use over plaintext -- and a federation-encryption certification
+cannot rest on a plaintext, unauthenticated key exchange.
+
+**Honest cost:** `terraform apply` alone does not yield a running mesh. It
+yields two nodes parked in a **fail-closed wait** (the drop-in's
+`EnvironmentFile` has no leading `-`, so systemd refuses to start `serve`
+until the peer list lands), and one operator command completes them. That step
+is the one `crypto/KNOWN-DO-STAGING.md` §1 already prescribes.
+
+## Run recipe
+
+```bash
+# 0. Operator vault + spend approval (operator only; AI agents MUST NOT set this).
+source <operator DO token vault>                  # exports DIGITALOCEAN_TOKEN
+export AI_MEMORY_OPERATOR_DO_SPEND_APPROVED=1
+export TF_VAR_ssh_pubkey_fingerprint=<operator key fingerprint>
+
+# 1. Build the artifacts federate.sh needs on THIS host.
+cargo build --release --features sal,sal-postgres
+cargo build --release --example attest_sign
+
+# 2. Provision 2 substrate nodes. MONEY-GATED; ~$0.048/hr for the pair.
+cd infra/do-hive
+./spawn.sh apply -var memory_count=2 -var agent_count=0
+
+# 3. Put a #1882-fixed sal-postgres binary on each node (the cloud-init NOTE:
+#    serve only starts once such a binary is present).
+terraform output -json memory_nodes | jq -r '.[].public_ip' | while read -r ip; do
+  scp target/release/ai-memory "root@$ip:/opt/ai-memory/bin/ai-memory"
+done
+
+# 4. Wire the mesh + run the Track D assertions. NEVER calls terraform-apply,
+#    never spawns a droplet; refuses if the outputs do not describe >= 2 nodes.
+./federate.sh                # == ./federate.sh wire && ./federate.sh verify
+
+# 5. Stop the meter. UNCHANGED - idempotent, per-second billing stops on destroy.
+./teardown.sh
+```
+
+`spawn.sh` and `teardown.sh` are untouched: the money gate
+(`AI_MEMORY_OPERATOR_DO_SPEND_APPROVED=1`), the audit dump, and the idempotent
+destroy behave exactly as before.
+
+## What to verify post-boot
+
+`./federate.sh verify` asserts each of these and exits non-zero if any FAILs
+(same PASS/FAIL shape as the `crypto/test-*.sh` legs):
+
+| assertion | expected |
+|---|---|
+| each node `/api/v1/health` over mTLS with the operator client cert | `200` |
+| each node with **no** client cert | connection refused at the rustls allowlist (mTLS is mandatory) |
+| a `W=2` quorum write to node 1 | `201 quorum_met` (or `202` locally-durable if the ack lands late -- both prove the mutually authenticated channel carried it) |
+| that row read back from **node 2** | present -- the write actually replicated |
+| a **signed** write authored `ai:hive-author` on node 1, read at node 2 | `metadata.attest_level == "agent_attested"` -- proves EMIT + cross-peer author enrollment + the v1.0.0 default-on write-sig flip together |
+
+Manual spot checks if a leg goes red:
+
+```bash
+IP1=$(terraform output -json memory_nodes | jq -r '.[0].public_ip')
+ssh root@$IP1 'systemctl status ai-memory-fed-bootstrap --no-pager'
+ssh root@$IP1 'tail -40 /var/log/ai-memory-federation.log'   # per-stage trace
+ssh root@$IP1 'journalctl -u ai-memory -n 60 --no-pager'
+ssh root@$IP1 'cat /etc/ai-memory/api-key'                   # per-node shared key
+ssh root@$IP1 'ls /etc/ai-memory/keys'                       # own .priv/.pub + peer .pub
+```
+
+The bootstrap is a resumable state machine; after fixing a cause, re-run it
+with `systemctl restart ai-memory-fed-bootstrap`. It never deletes or rewrites
+durable memory text.
+
+## Safety properties of the Track D lane
+
+- **`memory_count=1` is byte-identical.** Every federation stanza sits behind a
+  `%{ if federation_enabled }` template directive; rendering the new template at
+  `memory_count=1` and `cmp`-ing it against the pre-Track-D render is clean.
+  `crypto/gen-certs.sh` is likewise additive -- with `HIVE_NODE_IPS` unset it
+  emits exactly the legacy localhost/peerA/peerB material.
+- **No secrets in terraform state.** Terraform carries only `node_index`,
+  `node_count`, `fed_identity` and `quorum_writes`. CA + leaf private keys move
+  operator-host -> droplet over SSH; the nodes' Ed25519 signing keys never move
+  at all.
+- **Fail-closed, not silently-degraded.** A node with no peer list refuses to
+  start rather than running as a one-node "mesh" that satisfies nothing while
+  reporting healthy. `fed-bootstrap.sh` additionally refuses a non-`https` peer
+  URL locally, mirroring the daemon's own #2477 boot refusal, so the cause is
+  named in the log instead of surfacing as an opaque unit failure.
+- **Cross-enrollment moves public material only.** Peer `.pub` files and the
+  author `.pub` -- never a `.priv` -- exactly the discipline
+  `infra/lan-parity-test/provision-peer-keys.sh` follows for the docker mesh
+  (#1803).
+- **ASCII-clean cloud-init.** The template stays pure ASCII (#1880 gate) and all
+  braced shell expansions are `$$`-escaped so terraform interpolation never
+  collides with bash or with curl's `%{http_code}`.
+- **`federate.sh` spends nothing.** It reads `terraform output` and SSHes into
+  an already-provisioned cluster; it never invokes `terraform apply` and refuses
+  with no side effects when fewer than 2 memory nodes exist.
+- **`memory_count` is capped at 8** so a mistyped value cannot mint a
+  50-droplet bill; `docs/enterprise-deployment.md` §8.8's ~50-peer federation
+  ceiling is far above anything this money-gated test hive should provision.

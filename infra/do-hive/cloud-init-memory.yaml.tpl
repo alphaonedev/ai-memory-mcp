@@ -50,6 +50,324 @@ write_files:
 
       [Install]
       WantedBy=multi-user.target
+%{~ if federation_enabled }
+  # =====================================================================
+  # Track D -- REAL federated multi-node ai-memory (v1.0.0 enterprise-cert
+  # campaign, docs/v1.0.0/test-campaign-2026-08-08-enterprise-cert/PLAN.md
+  # Track D + section 3). Rendered ONLY when main.tf's memory_count >= 2;
+  # at memory_count == 1 every byte below is absent and this template is
+  # byte-identical to the pre-Track-D single-substrate bootstrap.
+  #
+  # Topology mirrors the certified LOCAL 2-node config
+  # (infra/do-hive/crypto/test-federation-mtls.sh +
+  # infra/do-hive/crypto/test-fed-write-sig-attestation.sh), re-hosted onto
+  # droplets: each node presents its own leaf cert as BOTH its server cert
+  # and its outbound quorum client cert, pins every other node's cert
+  # fingerprint in peers.allowlist, dials peers as
+  # https://<peer-private-ip>:9077, and runs --quorum-writes W.
+  #
+  # AI_MEMORY_FED_* knobs are DELIBERATELY LEFT UNSET. At v1.0.0 the
+  # secure posture IS the compiled default -- write-sig (#94), signal-sig
+  # (#96), transition-sig (#87), checkpoint-sig (#125), nonce (#30),
+  # peer-enrollment (#43) and policy-current (#132) are all fail-closed
+  # with the env absent. Setting them to 1 would be redundant AND would
+  # make the cert evidence weaker: it would prove "the flag works", not
+  # "the shipped default is secure". The same reasoning the local leg
+  # applies at test-fed-write-sig-attestation.sh ("env left unset on
+  # purpose to prove the DEFAULT-ON posture").
+  #
+  # ---------------------------------------------------------------------
+  # SECRETS-IN-TERRAFORM-STATE TRADEOFF (chosen approach + rejected ones)
+  # ---------------------------------------------------------------------
+  # CHOSEN: private crypto material NEVER touches terraform. Terraform
+  # passes only plan-time, non-secret facts (node_index, node_count,
+  # fed_identity, quorum_writes). The mTLS bundle is minted on the
+  # OPERATOR host by infra/do-hive/federate.sh (which reuses
+  # crypto/gen-certs.sh) and scp'd to /etc/ai-memory/fed/ over SSH; the
+  # node's Ed25519 federation signing key is generated ON the droplet and
+  # its PRIVATE half never leaves. Only public material (peer .pub files,
+  # the author .pub) is ever moved between nodes. Consequence: zero
+  # secrets in terraform.tfstate -- which matters concretely here because
+  # spawn.sh COPIES terraform.tfstate into .local-runs/do-hive-runs/<ts>/
+  # on every apply, so anything in state is also in a plaintext audit
+  # dump on the orchestrator disk.
+  #
+  # REJECTED (a) pre-generate locally, inject via templatefile vars: a
+  # droplet's user_data is stored verbatim in terraform state AND is
+  # readable from the droplet's own metadata service, so every peer
+  # private key + CA key would land in both. Directly contradicts the
+  # brief's own "keep secrets out of terraform state where feasible".
+  #
+  # REJECTED (b) generate on droplet 1, distribute to the others: there
+  # is no authenticated channel between two fresh droplets before the
+  # mTLS material exists (that is the material). Any bootstrap over the
+  # VPC would be trust-on-first-use over plaintext -- which would make
+  # the cert round's Leg-2 "unauthorised + plaintext peers are refused"
+  # assertion rest on a plaintext, unauthenticated key exchange. A
+  # federation-encryption certification cannot be built on that.
+  #
+  # HONEST COST of the chosen approach: `terraform apply` alone does not
+  # yield a running mesh. It yields two nodes parked in a fail-closed
+  # wait, and one operator command (federate.sh) completes them. That is
+  # a real extra step, and it is the step the existing DO staging notes
+  # already prescribe ("scp/rsync the whole crypto/ dir onto each
+  # droplet" -- infra/do-hive/crypto/KNOWN-DO-STAGING.md section 1).
+  # =====================================================================
+  - path: /etc/systemd/system/ai-memory.service.d/10-federation.conf
+    permissions: '0644'
+    content: |
+      # Track D federated overlay for node ${node_index} of ${node_count}.
+      #
+      # A systemd DROP-IN, deliberately NOT a fork of ai-memory.service: the
+      # base unit stays byte-identical at every memory_count, so the
+      # single-substrate hive and the federated mesh can never drift apart
+      # in the postgres/AGE/pgvector half. Only the serve invocation and the
+      # federation environment are overridden. Environment= is a list
+      # directive, so the base unit's PERMISSIONS_MODE / AUTONOMOUS_HOOKS /
+      # RUST_LOG settings are preserved, not replaced.
+      #
+      # WHY THIS UNIT REFUSES TO START BEFORE federate.sh HAS RUN:
+      # EnvironmentFile has NO leading '-', so systemd refuses to start the
+      # service until /etc/ai-memory/fed/peers.conf exists. That is
+      # deliberate fail-closed wiring. A "federated" node that booted with
+      # an empty peer list would accept writes, satisfy W=1 locally, and
+      # report healthy while replicating to nobody -- a substrate that
+      # reports success while doing nothing. Refusing to start is the
+      # honest degrade.
+      [Service]
+      Environment=AI_MEMORY_FED_IDENTITY=${fed_identity}
+      Environment=AI_MEMORY_KEY_DIR=/etc/ai-memory/keys
+      Environment=XDG_CONFIG_HOME=/etc/ai-memory/xdg
+      Environment=HOME=/opt/ai-memory
+      EnvironmentFile=/etc/ai-memory/fed/peers.conf
+      ExecStart=
+      ExecStart=/opt/ai-memory/bin/ai-memory serve --host 0.0.0.0 --port 9077 --store-url "postgres://aimemory:${db_password}@localhost/aimemory" --tls-cert /etc/ai-memory/fed/node.crt --tls-key /etc/ai-memory/fed/node.key --mtls-allowlist /etc/ai-memory/fed/peers.allowlist --quorum-writes ${quorum_writes} --quorum-peers $${AI_MEMORY_QUORUM_PEERS} --quorum-client-cert /etc/ai-memory/fed/node.crt --quorum-client-key /etc/ai-memory/fed/node.key --quorum-ca-cert /etc/ai-memory/fed/ca.crt --quorum-timeout-ms 8000
+  - path: /etc/systemd/system/ai-memory-fed-bootstrap.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=ai-memory Track D federation bootstrap (identity mint, peer enrollment, mesh verify)
+      After=network-online.target postgresql.service
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      # The script owns its own bounded retry loops (wait for the operator
+      # bundle, then wait for each peer to answer over the mutually
+      # authenticated channel), so systemd must neither time it out nor
+      # race it with a Restart= of its own. Re-run after fixing a problem
+      # with: systemctl restart ai-memory-fed-bootstrap
+      TimeoutStartSec=0
+      ExecStart=/opt/ai-memory/fed-bootstrap.sh
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /opt/ai-memory/fed-bootstrap.sh
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      # =================================================================
+      # Track D federation bootstrap -- node ${node_index} of ${node_count}.
+      #
+      # Cloud-init cannot know a peer's private IP (DO allocates it at
+      # create time and a terraform resource cannot reference itself), so
+      # this one-shot completes the wiring AFTER both droplets exist. It
+      # is a resumable state machine, idempotent at every stage:
+      #
+      #   A  mint this node's Ed25519 federation identity; publish only
+      #      the .pub for cross-enrollment (private half never leaves)
+      #   B  mint a local api_key + write config.toml (the daemon REFUSES
+      #      a non-loopback bind without one -- see KNOWN-DO-STAGING.md
+      #      section 3; that refusal is the product working as designed)
+      #   C  wait for the operator-delivered mTLS bundle + peer list
+      #   D  local #2477 pre-check: refuse a non-https peer URL here too
+      #   E  install peer public keys into the key dir (the transport
+      #      lane's enrollment -- exactly the cross-copy that
+      #      infra/lan-parity-test/provision-peer-keys.sh does for the
+      #      docker mesh, #1803, and only ever public material)
+      #   F  start the daemon; wait for local /health over mTLS
+      #   G  wait until EVERY peer answers /health over the mutually
+      #      authenticated channel (the retry loop the mesh needs)
+      #   H  register + bind the cert-round author pubkey so the CONTENT
+      #      write-sig lane can reach attest_level=agent_attested at this
+      #      receiver (test-fed-write-sig-attestation.sh binds the author
+      #      on BOTH dbs; the CLI `agents bind-key` speaks sqlite only, so
+      #      on this postgres substrate it must go over the admin-gated
+      #      PUT /api/v1/agents/{id}/pubkey route, #1539)
+      #
+      # Every failure exits non-zero and leaves a diagnosis in
+      # /var/log/ai-memory-federation.log + journalctl. Nothing here ever
+      # deletes or rewrites durable memory text.
+      # =================================================================
+      set -uo pipefail
+      exec > >(tee -a /var/log/ai-memory-federation.log) 2>&1
+      echo "=== ai-memory federation bootstrap node ${node_index}/${node_count} $(date -u) ==="
+
+      FED_DIR=/etc/ai-memory/fed
+      KEY_DIR=/etc/ai-memory/keys
+      XDG_DIR=/etc/ai-memory/xdg
+      FED_ID='${fed_identity}'
+      BIN=/opt/ai-memory/bin/ai-memory
+      ADMIN_ID=ai:hive-admin
+      LOCAL=https://127.0.0.1:9077
+      MATERIAL_TRIES=720
+      MATERIAL_SLEEP=10
+      PEER_TRIES=240
+      PEER_SLEEP=5
+
+      fail() { echo "[fed-bootstrap] FAIL: $*" >&2; exit 1; }
+
+      install -d -m 0750 -o aimemory -g aimemory \
+        /etc/ai-memory "$FED_DIR" "$FED_DIR/peers" "$KEY_DIR" \
+        "$XDG_DIR" "$XDG_DIR/ai-memory"
+
+      # --- A. mint this node's federation identity ---------------------
+      [ -x "$BIN" ] || fail "no ai-memory binary at $BIN; scp a --features sal-postgres build over it, then: systemctl restart ai-memory-fed-bootstrap"
+      if [ ! -f "$KEY_DIR/$FED_ID.priv" ]; then
+        sudo -u aimemory env AI_MEMORY_NO_CONFIG=1 AI_MEMORY_DB=/opt/ai-memory/identity.db \
+          "$BIN" identity generate --agent-id "$FED_ID" --key-dir "$KEY_DIR" \
+          || fail "identity generate failed for $FED_ID"
+      fi
+      cp "$KEY_DIR/$FED_ID.pub" "$FED_DIR/$FED_ID.pub"
+      chmod 0644 "$FED_DIR/$FED_ID.pub"
+      echo "[fed-bootstrap] published $FED_DIR/$FED_ID.pub (public half only) for cross-enrollment"
+
+      # --- B. local api_key + admin allowlist --------------------------
+      # Minted HERE, not passed through terraform, so the shared secret
+      # never enters terraform.tfstate or the spawn.sh audit dump. The
+      # operator reads it with: ssh root@<node> cat /etc/ai-memory/api-key
+      if [ ! -s /etc/ai-memory/api-key ]; then
+        ( umask 077; openssl rand -hex 32 > /etc/ai-memory/api-key ) \
+          || fail "could not mint the local api key"
+      fi
+      chown aimemory:aimemory /etc/ai-memory/api-key
+      chmod 0600 /etc/ai-memory/api-key
+      API_KEY="$(cat /etc/ai-memory/api-key)"
+      cat > "$XDG_DIR/ai-memory/config.toml" <<CFG
+      schema_version = 2
+      api_key = "$API_KEY"
+
+      [admin]
+      agent_ids = ["$ADMIN_ID"]
+      CFG
+      chown -R aimemory:aimemory "$XDG_DIR"
+      chmod 0600 "$XDG_DIR/ai-memory/config.toml"
+      # NOTE: tier is left unset, so the daemon keeps its compiled default
+      # (semantic). A Track-D-only run that does not need the embedder can
+      # add `tier = "keyword"` to that file and restart -- the same
+      # embedder-free posture KNOWN-DO-STAGING.md section 2 documents.
+
+      # --- C. wait for the operator-delivered mTLS bundle --------------
+      i=0
+      while [ ! -f "$FED_DIR/ENROLLED" ]; do
+        i=$((i + 1))
+        if [ "$i" -gt "$MATERIAL_TRIES" ]; then
+          fail "timed out after $((MATERIAL_TRIES * MATERIAL_SLEEP))s waiting for $FED_DIR/ENROLLED; run infra/do-hive/federate.sh on the orchestrator host, then: systemctl restart ai-memory-fed-bootstrap"
+        fi
+        if [ $((i % 30)) -eq 1 ]; then
+          echo "[fed-bootstrap] waiting for $FED_DIR/ENROLLED (federate.sh) ... try $i/$MATERIAL_TRIES"
+        fi
+        sleep "$MATERIAL_SLEEP"
+      done
+      for f in ca.crt node.crt node.key peers.allowlist peers.conf author.id author.pub; do
+        [ -s "$FED_DIR/$f" ] || fail "federation material incomplete: $FED_DIR/$f missing or empty"
+      done
+
+      # --- D. local #2477 pre-check on the delivered peer list ---------
+      # The daemon refuses a plaintext non-loopback peer at boot (#2477).
+      # Repeating the check here turns that into a named, logged refusal
+      # instead of an opaque unit start failure.
+      . "$FED_DIR/peers.conf"
+      PEERS="$${AI_MEMORY_QUORUM_PEERS:-}"
+      [ -n "$PEERS" ] || fail "peers.conf carries no AI_MEMORY_QUORUM_PEERS; refusing to start a federated node with an empty peer list"
+      BAD_PEER=0
+      OLD_IFS=$IFS
+      IFS=,
+      for u in $PEERS; do
+        case "$u" in
+          https://*) ;;
+          *) echo "[fed-bootstrap] non-https peer URL in peers.conf: $u"; BAD_PEER=1 ;;
+        esac
+      done
+      IFS=$OLD_IFS
+      [ "$BAD_PEER" -eq 0 ] || fail "peers.conf contains a non-https peer URL; refused locally (the daemon refuses the same shape at boot, #2477)"
+
+      # --- E. install peer public keys (transport-lane enrollment) -----
+      PEER_PUBS=$(ls -1 "$FED_DIR"/peers/*.pub 2>/dev/null | wc -l)
+      [ "$PEER_PUBS" -ge 1 ] || fail "no peer public keys under $FED_DIR/peers"
+      cp "$FED_DIR"/peers/*.pub "$KEY_DIR"/ || fail "could not install peer public keys"
+      chown -R aimemory:aimemory "$KEY_DIR" "$FED_DIR"
+      chmod 0600 "$FED_DIR/node.key"
+      chmod 0644 "$FED_DIR/ca.crt" "$FED_DIR/node.crt" "$FED_DIR/peers.allowlist" "$FED_DIR/peers.conf"
+      echo "[fed-bootstrap] enrolled $PEER_PUBS peer public key(s) into $KEY_DIR"
+
+      # --- F. start the daemon; wait for local health over mTLS --------
+      systemctl daemon-reload
+      systemctl enable ai-memory >/dev/null 2>&1 || true
+      systemctl restart ai-memory || fail "ai-memory failed to start (journalctl -u ai-memory)"
+
+      mtls_code() {
+        curl -sS --max-time 10 \
+          --cacert "$FED_DIR/ca.crt" --cert "$FED_DIR/node.crt" --key "$FED_DIR/node.key" \
+          -o /dev/null -w '%%{http_code}' "$1" 2>/dev/null
+      }
+
+      i=0
+      until [ "$(mtls_code "$LOCAL/api/v1/health")" = "200" ]; do
+        i=$((i + 1))
+        [ "$i" -gt 60 ] && fail "local daemon never answered /api/v1/health over mTLS (journalctl -u ai-memory)"
+        sleep 5
+      done
+      echo "[fed-bootstrap] local daemon healthy over mTLS"
+
+      # --- G. wait for every peer over the mutually authenticated channel
+      IFS=,
+      for u in $PEERS; do
+        i=0
+        until [ "$(mtls_code "$u/api/v1/health")" = "200" ]; do
+          i=$((i + 1))
+          if [ "$i" -gt "$PEER_TRIES" ]; then
+            IFS=$OLD_IFS
+            fail "peer $u never answered /api/v1/health over the mutually authenticated channel after $((PEER_TRIES * PEER_SLEEP))s"
+          fi
+          [ $((i % 12)) -eq 1 ] && echo "[fed-bootstrap] waiting for peer $u ... try $i/$PEER_TRIES"
+          sleep "$PEER_SLEEP"
+        done
+        echo "[fed-bootstrap] peer $u reachable over mTLS"
+      done
+      IFS=$OLD_IFS
+
+      # --- H. bind the cert-round author pubkey (content write-sig lane)
+      AUTHOR_ID="$(cat "$FED_DIR/author.id")"
+      AUTHOR_PUB="$(cat "$FED_DIR/author.pub")"
+      admin_call() {
+        curl -sS --max-time 15 \
+          --cacert "$FED_DIR/ca.crt" --cert "$FED_DIR/node.crt" --key "$FED_DIR/node.key" \
+          -H "content-type: application/json" -H "x-api-key: $API_KEY" -H "x-agent-id: $ADMIN_ID" \
+          -o /dev/null -w '%%{http_code}' "$@" 2>/dev/null
+      }
+      i=0
+      while :; do
+        RC=$(admin_call -X POST "$LOCAL/api/v1/agents" -d "{\"agent_id\":\"$AUTHOR_ID\",\"agent_type\":\"system\"}")
+        case "$RC" in 200|201|409) break ;; esac
+        i=$((i + 1))
+        [ "$i" -gt 12 ] && fail "could not register author $AUTHOR_ID (last HTTP $RC)"
+        sleep 5
+      done
+      i=0
+      while :; do
+        RC=$(admin_call -X PUT "$LOCAL/api/v1/agents/$AUTHOR_ID/pubkey" -d "{\"pubkey_b64\":\"$AUTHOR_PUB\"}")
+        [ "$RC" = "200" ] && break
+        i=$((i + 1))
+        [ "$i" -gt 12 ] && fail "could not bind author pubkey for $AUTHOR_ID (last HTTP $RC)"
+        sleep 5
+      done
+      echo "[fed-bootstrap] author $AUTHOR_ID pubkey bound on this node"
+
+      : > "$FED_DIR/MESH-READY"
+      echo "[fed-bootstrap] MESH READY node ${node_index}/${node_count} identity=$FED_ID peers=$PEERS author=$AUTHOR_ID"
+%{~ endif }
   - path: /opt/ai-memory/provision.sh
     permissions: '0755'
     content: |
@@ -120,10 +438,23 @@ write_files:
       chown -R aimemory:aimemory /opt/ai-memory
 
       systemctl daemon-reload
+%{~ if federation_enabled }
+      # Track D: do NOT start serve here. The federated overlay drop-in binds
+      # an EnvironmentFile that only exists once federate.sh has delivered the
+      # peer list, so an early start would just crash-loop. The one-shot
+      # bootstrap unit owns the ordering; --no-block keeps cloud-init's runcmd
+      # from hanging on a unit that legitimately waits for the operator.
+      if [ -x /opt/ai-memory/bin/ai-memory ]; then
+        systemctl enable ai-memory || true
+      fi
+      systemctl enable ai-memory-fed-bootstrap || true
+      systemctl start --no-block ai-memory-fed-bootstrap || true
+%{~ else }
       # serve only starts once a sal-postgres binary is present.
       if [ -x /opt/ai-memory/bin/ai-memory ]; then
         systemctl enable --now ai-memory || true
       fi
+%{~ endif }
       echo "=== provision complete $(date -u) ==="
 runcmd:
   - bash /opt/ai-memory/provision.sh
