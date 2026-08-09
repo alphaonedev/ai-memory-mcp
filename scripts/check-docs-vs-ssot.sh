@@ -150,6 +150,9 @@ DOC_FILES=(
     docs/integrations/README.md
     docs/integrations/claude-code.md
     docs/v1.0.0/release-notes.md
+    docs/CONFIG_SCHEMA.md
+    docs/production-deployment.md
+    docs/enterprise-deployment.md
 )
 
 # Operator-facing HTML surfaces (rendered compliance pages). Markdown is
@@ -316,30 +319,72 @@ for ln, line in enumerate(open('$f').read().splitlines(), 1):
 # AI_MEMORY_* env var READ by production code must appear somewhere in
 # CLAUDE.md (the env-var table is the operator-facing contract; 13
 # missing rows were found by hand on 2026-06-09 — this makes the class
-# mechanical). Production boundary: skip *test* files and lines below
-# the first `mod tests {`. Intentionally one-directional — extra rows
-# in CLAUDE.md for removed vars are caught by the symbol census, and
-# vars only set (not read) by code are not operator knobs.
+# mechanical). Intentionally one-directional — extra rows in CLAUDE.md
+# for removed vars are caught by the symbol census, and vars only set
+# (not read) by code are not operator knobs.
+#
+# WIDENED (#2830, 2026-08-09 lane-1 config sweep). The rule censused
+# 102 of the 155 env vars production code actually reads, in three
+# independent ways, and the seven knobs that were missing from the table
+# had ALL slipped through one of them:
+#
+#   1. The const shape required the name to START with `ENV_`. The tree
+#      uses TWO conventions — `ENV_FOO` and the `FOO_ENV` suffix — and
+#      the suffix style is the majority style for the security /
+#      federation knobs (`REQUIRE_WRITE_SIG_ENV`, `STORE_URL_ENV`,
+#      `WITNESS_KEY_DIR_ENV`, …). 68 declarations were invisible.
+#   2. Clap-bound flags (`#[arg(long, env = "AI_MEMORY_PROFILE")]`) were
+#      not a recognised read shape at all.
+#   3. The production boundary the comment CLAIMED ("skip *test* files
+#      and lines below the first `mod tests {`") was never implemented —
+#      the greps walked whole files. It is implemented for real below,
+#      because widening 1+2 without it would newly red the gate on the
+#      `#[cfg(test)]`-gated `AI_MEMORY_TEST_*` fixtures.
+#
+# The boundary skips a `#[cfg(test)]`-gated item by BRACE DEPTH (so a
+# gated `fn` mid-file resumes production scanning after its body) rather
+# than skipping to EOF, which would have dropped 40+ real production
+# declarations. The filename filter matches `tests.rs` / `*_test.rs` /
+# `*_tests.rs` / `test_*.rs` and deliberately NOT the looser `*test*.rs`
+# the sibling gates use: that glob excludes `peer_attestation.rs` and
+# `attest.rs` ("at-TEST-ation"), which declare live security knobs.
+# Known residual: a const whose `= "AI_MEMORY_…"` wraps to a second line
+# is still unseen (one var today, itself already documented).
 check_env_var_census_rule() {
     local rule_name="ENV_VAR_CENSUS" var
     local code_vars
-    # Two read shapes: direct env::var("AI_MEMORY_X") literals, and
-    # const-indirected reads where the spelling lives on an `ENV_*`
-    # const definition (e.g. `pub const ENV_ADMIN_HEADER_TRUST: &str =
-    # "AI_MEMORY_ADMIN_HEADER_TRUST";`) — the post-#1558 house style.
     # `|| true` guards against `set -e`/`pipefail`: when the scanned tree
     # has ZERO matches (e.g. the --self-test fixture's tiny src/ tree),
     # every grep stage in the pipe exits 1 (no-match), which under
     # pipefail propagates as the assignment's exit status and silently
     # aborts the whole gate before any later rule runs. Zero matches is a
     # legitimate (if rare) state, not a script error.
-    code_vars=$( { grep -rhoE 'env::var(_os)?\("(AI_MEMORY_[A-Z0-9_]+)"' "$REPO_ROOT/src" \
-        --include='*.rs' 2>/dev/null; \
-        grep -rhoE 'const ENV_[A-Z0-9_]+: *&str *= *"AI_MEMORY_[A-Z0-9_]+"' "$REPO_ROOT/src" \
-        --include='*.rs' 2>/dev/null; } \
+    _census_production_lines() {
+        find "$REPO_ROOT/src" -name '*.rs' \
+            ! -name 'tests.rs' ! -name '*_test.rs' ! -name '*_tests.rs' \
+            ! -name 'test_*.rs' -print0 2>/dev/null \
+        | xargs -0 -r awk '
+            FNR==1 { skip=0; depth=0; armed=0 }
+            !skip && /^[[:space:]]*#\[cfg\(test\)\]/ { skip=1; armed=0; depth=0; next }
+            skip {
+                n=gsub(/\{/,"{"); m=gsub(/\}/,"}")
+                depth += n - m
+                if (n > 0) armed=1
+                if (armed && depth <= 0) { skip=0; next }
+                if (!armed && /;[[:space:]]*$/) { skip=0 }
+                next
+            }
+            { print }' 2>/dev/null
+    }
+    code_vars=$( { _census_production_lines | grep -oE 'env::var(_os)?\("AI_MEMORY_[A-Z0-9_]+"'; \
+        _census_production_lines | grep -oE 'const [A-Z][A-Z0-9_]*: *&str *= *"AI_MEMORY_[A-Z0-9_]+"'; \
+        _census_production_lines | grep -oE 'env *= *"AI_MEMORY_[A-Z0-9_]+"'; } \
         | grep -oE 'AI_MEMORY_[A-Z0-9_]+' | sort -u) || true
     for var in $code_vars; do
-        if ! grep -q "$var" "$REPO_ROOT/CLAUDE.md"; then
+        # Word-boundaried: a bare `grep -q` lets a LONGER var's mention
+        # satisfy a shorter one (`AI_MEMORY_STORE_URL` would be answered
+        # by `AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS`).
+        if ! grep -qE "${var}([^A-Z0-9_]|\$)" "$REPO_ROOT/CLAUDE.md"; then
             printf 'FAIL: %s: src reads %s but CLAUDE.md never mentions it (env-var table drift)\n' \
                 "$rule_name" "$var" >&2
             fail_count=$((fail_count + 1))

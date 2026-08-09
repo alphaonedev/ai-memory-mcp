@@ -1165,7 +1165,7 @@ Concurrent writes from different agents are merged via the substrate's
 CRDT-lite vector-clock merge (`src/federation/vector_clock.rs`). The
 v0.7.0 schema also carries a `version` column on the Memory struct
 (schema v45, Gap-1 optimistic concurrency for `memory_update`; field
-26 of the current 28-field struct, `CLAUDE.md §"Data Model"`).
+26 of the current 30-field struct, `CLAUDE.md §"Data Model"`).
 
 For the swarm topology:
 

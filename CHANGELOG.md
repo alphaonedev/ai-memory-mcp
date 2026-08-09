@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs (3x7 sweep lane 1 — configuration surfaces; #2820-#2826)
+
+- **`ENV_VAR_CENSUS` in `scripts/check-docs-vs-ssot.sh` censused 102 of the
+  155 env vars production code reads; widened to 155** (#2820). The const
+  shape required the name to START with `ENV_`, so the `FOO_ENV` suffix
+  convention — the majority style for the security/federation knobs — was
+  invisible (68 declarations); clap-bound `#[arg(env = "…")]` flags were
+  not a recognised read shape at all; and the production boundary the
+  rule's comment had claimed since 2026-06-09 was never implemented. All
+  three fixed, plus a word-boundaried mention check. Seven production
+  knobs that had slipped through are now documented —
+  `AI_MEMORY_STORE_URL` + `AI_MEMORY_STORE_URL_FILE` (both **secret**: a
+  Postgres DSN password, whose own escape hatch was already documented),
+  `AI_MEMORY_REQUIRE_WHY_TRACE`, `AI_MEMORY_REQUIRE_IMMUTABLE_AUTHORSHIP`,
+  `AI_MEMORY_SKILLS_IMPORT_ROOT`, `AI_MEMORY_RECOVERY_GUARDIAN_PUBKEYS`,
+  `AI_MEMORY_RECOVERY_THRESHOLD`.
+- **`docs/CONFIG_SCHEMA.md`, `docs/production-deployment.md` and
+  `docs/enterprise-deployment.md` added to `DOC_FILES`** (#2823) — the
+  canonical configuration reference had never been checked by any
+  SSOT-drift rule. Surfaced and fixed: schema `v78` → `v88`, and a
+  `28-field Memory` → `30-field` claim.
+- **`max_inflight_requests` was documented with pre-#2032 semantics in
+  four places** (#2821), including the copy-pasteable `[limits]` block in
+  both CLAUDE.md and `docs/CONFIG_SCHEMA.md` — pasting the canonical
+  example verbatim DISABLED the v1.0.0 DoS admission guard. Root artefact
+  was the `LimitsSection.max_inflight_requests` doc-comment in
+  `src/config.rs`, now corrected along with both precedence paragraphs.
+- **The `asi-hard` pinned set was documented as 15 knobs; `KNOBS` has 17**
+  (#2822) — CLAUDE.md row #130 and `docs/deploy/README.md` both omitted
+  the two permissive-shaped pins whose violation REFUSES BOOT.
+- **Five surfaces still described the v0.10.0 permissive federation
+  defaults** (#2824); `docs/SECURITY.md` un-claimed a shipped fail-closed
+  control, steering operators away from the origin-author key enrollment
+  the default now requires.
+- **CLAUDE.md env-table row accuracy** (#2825): inverted default on
+  `AI_MEMORY_CONFIDENCE_SHADOW_SAMPLE_RATE` (`0.0` documented, `1.0`
+  actual — 100% of touches, not 0%); two false behavioural claims
+  (`AI_MEMORY_FED_PEER_FINGERPRINTS` "mixed-mode rollout";
+  `AI_MEMORY_REFLECT_DECORRELATION_MODE` `enforce` "INERT" when it can
+  refuse a reflection write); two credential-bearing rows re-classed
+  `secret`; four dead `Source:` anchors; duplicate row number `110`.
+- Frozen history preserved: `README.md`'s `## What's new in v0.8`
+  "opt-in" admission-control sentence and the `EXPECTED_SCHEMA=57`
+  pinned-release anchor were deliberately NOT changed.
+
 ### Docs (Phase-2 pg-parity remediation — the TRUTHFULNESS FLOOR; vote `4d3ea1c5`, Option B+)
 
 - **Corrected every overclaiming doc to the authoritative Postgres

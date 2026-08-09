@@ -191,7 +191,9 @@ daemon so Postgres-backed / MCP-over-HTTP deployments can drive them
   the signed surface (`src/handlers/coordination.rs`).
 
 (The DATA-lane sibling for relayed memory writes is
-`AI_MEMORY_FED_REQUIRE_WRITE_SIG` (#1464), default permissive — see
+`AI_MEMORY_FED_REQUIRE_WRITE_SIG` (#1464), which defaults **fail-closed
+(required)** at v1.0.0 (`FED_REQUIRE_WRITE_SIG_DEFAULT = true`, #1801 →
+#1954; it was permissive through v0.10.0) — see
 [`docs/federation.md`](federation.html).)
 
 ## Pillar-2 — typed cognition

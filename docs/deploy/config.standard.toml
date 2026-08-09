@@ -1,8 +1,11 @@
 # ai-memory — STANDARD deployment config template (v1.0.0, PE-1 / #1962)
 #
 # This is the baseline reference config. It keeps every security knob at
-# its own compiled default (byte-identical legacy). Copy it to
-# ~/.config/ai-memory/config.toml (or the path named by --config) and edit.
+# its own compiled default. That is NOT byte-identical to legacy at
+# v1.0.0: FED_REQUIRE_WRITE_SIG, FED_REQUIRE_SIGNAL_SIG and
+# [capabilities].enabled now default true, and HTTP admission control is
+# CPU-scaled ON when unset. Copy it to ~/.config/ai-memory/config.toml
+# (there is no global --config flag) and edit.
 #
 # For a maximally-hardened, fail-closed-everything deployment use
 # config.asi-hard.toml + asi-hard.env instead (see README.md).

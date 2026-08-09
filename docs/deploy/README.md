@@ -3,13 +3,20 @@
 # Production-hardening deployment TEMPLATES (PE-1, #1962)
 
 Named, operator-selectable deployment templates for ai-memory. These are
-**config + env files you copy and edit** — never compiled default flips.
-The compiled defaults stay backward-compatible; a hardened posture is an
-explicit operator choice made by selecting a template.
+**config + env files you copy and edit**. Selecting a template is an
+explicit operator choice and is the only way to get the FULL hardened
+posture. Note, though, that v1.0.0 DID move several compiled defaults to
+their secure setting independently of any template —
+`AI_MEMORY_FED_REQUIRE_WRITE_SIG` and `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG`
+(both now `true`), `[capabilities].enabled` (now `true`), and HTTP
+admission control (now CPU-scaled ON when unset). This page said "never
+compiled default flips … the compiled defaults stay backward-compatible"
+through v1.0.0; that is no longer accurate, and an operator planning a
+legacy-parity rollout needs to know it.
 
 | Template | Files | Posture |
 |---|---|---|
-| **standard** | [`config.standard.toml`](config.standard.toml) | Baseline. Every security knob at its own compiled default (byte-identical legacy). |
+| **standard** | [`config.standard.toml`](config.standard.toml) | Baseline: every security knob at its own compiled default. NOT byte-identical to legacy at v1.0.0 — see the four default flips noted above. |
 | **asi-hard** | [`config.asi-hard.toml`](config.asi-hard.toml) + [`asi-hard.env`](asi-hard.env) | Maximally-hardened, fail-closed-everything procurement posture. |
 
 ## asi-hard — the maximally-hardened procurement profile
@@ -43,8 +50,21 @@ floor (the "no-disable" contract). SSOT: `src/security_profile.rs::KNOBS`.
   must verify the peer's SERVER cert; `ai-memory sync-daemon
   --insecure-skip-server-verify` is refused under this posture)
 - `AI_MEMORY_DB_SYNCHRONOUS=FULL` (power-loss durability)
+- `AI_MEMORY_ALLOW_SCHEMA_AHEAD` **must be UNSET** (#2445) — the first
+  PERMISSIVE-shaped pin, so its hard floor is the inverse: under
+  `asi-hard` the schema-downgrade hatch may not be set at all, and
+  setting it REFUSES boot rather than being honoured. Reaching for it
+  mid-incident on a hardened node yields a boot refusal.
+- `AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS` **must be non-truthy** (#2477) —
+  the second permissive-shaped pin and the second network access-control
+  pin; a `http://` non-loopback federation peer is refused.
 - plus `[governance].require_operator_pubkey=true` (bridged at the
   governance boot check).
+
+(That list is all **17** `KNOBS` entries. It enumerated only 15 through
+v1.0.0, silently omitting the two permissive-shaped pins above — the ones
+whose violation REFUSES BOOT — while claiming `src/security_profile.rs::KNOBS`
+as its SSOT. `docs/deploy/asi-hard.env` had them right.)
 
 ### What the config template pins (config-backed PE-1, #1962)
 
