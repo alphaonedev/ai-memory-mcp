@@ -150,7 +150,7 @@ IronClaw hive and the #2438 measurement cluster are untouched.
 | droplets | `ai-memory-hive-memory-1` + `-2` on the existing VPC, same size/image as before |
 | firewall | `:9077` east-west additionally opened **between memory nodes** (only when `memory_count > 1`); SSH + outbound rules unchanged |
 | serve | a systemd **drop-in** (`ai-memory.service.d/10-federation.conf`) overrides only `ExecStart`; the base unit stays byte-identical, so the postgres/AGE/pgvector half cannot drift between the two topologies |
-| mTLS | each node presents its own leaf as BOTH server and outbound quorum client cert; `--mtls-allowlist` pins the peer + itself + the operator client (`crypto/gen-certs.sh` `HIVE_NODE_IPS` mode) |
+| mTLS | each node presents its own leaf as BOTH server and outbound quorum client cert; `--mtls-allowlist` pins every other node + itself and nothing else (`crypto/gen-certs.sh` `HIVE_NODE_IPS` mode). No operator/bastion cert is minted -- an unused trust anchor is a liability, and the assertions run on-node with material the mesh already trusts |
 | quorum | `--quorum-writes 2 --quorum-peers https://<peer-private-ip>:9077 --quorum-ca-cert ... --quorum-timeout-ms 8000` |
 | federation identity | `ai:hive-memory-N`, Ed25519 keypair **generated on the droplet**; only the `.pub` ever leaves |
 | `AI_MEMORY_FED_*` | **all left UNSET on purpose.** At v1.0.0 write-sig / signal-sig / transition-sig / checkpoint-sig / nonce / peer-enrollment / policy-current are fail-closed by compiled default. Setting them to `1` would prove "the flag works", not "the shipped default is secure" |
@@ -222,13 +222,20 @@ destroy behave exactly as before.
 ## What to verify post-boot
 
 `./federate.sh verify` asserts each of these and exits non-zero if any FAILs
-(same PASS/FAIL shape as the `crypto/test-*.sh` legs):
+(same PASS/FAIL shape as the `crypto/test-*.sh` legs).
+
+**Every assertion runs ON a droplet over SSH, never from the orchestrator
+host.** The peer URLs are PRIVATE VPC addresses and the `:9077` rule admits
+only hive droplet ids, so a curl from outside could not reach them even if the
+address routed; running on-node also keeps the client-cert set to material the
+mesh already trusts.
 
 | assertion | expected |
 |---|---|
-| each node `/api/v1/health` over mTLS with the operator client cert | `200` |
+| each node `/api/v1/health` over mTLS (its own peer cert, via loopback) | `200` |
 | each node with **no** client cert | connection refused at the rustls allowlist (mTLS is mandatory) |
-| a `W=2` quorum write to node 1 | `201 quorum_met` (or `202` locally-durable if the ack lands late -- both prove the mutually authenticated channel carried it) |
+| **cross-host**: node 1 -> node 2 at `https://<node-2 private ip>:9077/api/v1/health` with node 1's peer cert | `200` -- the assertion the local 2-daemon legs structurally cannot make |
+| a `W=2` quorum write admitted at node 1 | `201 quorum_met` (or `202` locally-durable if the ack lands late -- both prove the mutually authenticated channel carried it) |
 | that row read back from **node 2** | present -- the write actually replicated |
 | a **signed** write authored `ai:hive-author` on node 1, read at node 2 | `metadata.attest_level == "agent_attested"` -- proves EMIT + cross-peer author enrollment + the v1.0.0 default-on write-sig flip together |
 

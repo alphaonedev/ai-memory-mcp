@@ -204,61 +204,107 @@ wire() {
 }
 
 # --- verify ------------------------------------------------------------------
+#
+# EVERY assertion runs ON a droplet over ssh, never from this host. The peer
+# URLs are PRIVATE VPC addresses (`https://10.20.x.y:9077`) and the `:9077`
+# firewall rule admits only hive droplet ids, so an orchestrator-host curl
+# could not reach them even if the address routed. Running on-node also means
+# the only client certs in play are ones the mesh already trusts, so the
+# verification introduces no new trust anchor -- which is why there is no
+# separate operator/bastion cert in `gen-certs.sh`'s HIVE_NODE_IPS mode.
 
-op_curl() {
-  curl -sS --max-time 20 \
-    --cacert "$OUT_DIR/ca.crt" \
-    --cert "$OUT_DIR/hive-operator.crt" --key "$OUT_DIR/hive-operator.key" "$@"
+# node_sh <idx0> -- run the script on stdin as root on that node.
+node_sh() { ssh $SSH_OPTS "${SSH_USER}@${PUBLIC_IPS[$1]}" "bash -s"; }
+
+# node_get <idx0> <memory-id> -- read one memory from that node over its own
+# loopback mTLS listener, using the node's own cert + its own api key.
+node_get() {
+  node_sh "$1" <<EOS 2>/dev/null
+curl -sS --max-time 15 --cacert /etc/ai-memory/fed/ca.crt \\
+  --cert /etc/ai-memory/fed/node.crt --key /etc/ai-memory/fed/node.key \\
+  -H "x-api-key: \$(cat /etc/ai-memory/api-key)" -H 'x-agent-id: $AUTHOR_ID' \\
+  https://127.0.0.1:9077/api/v1/memories/$2 2>/dev/null
+EOS
 }
 
-verify() {
-  [ -s "$OUT_DIR/hive-operator.crt" ] || die "no operator client cert at $OUT_DIR; run: $0 wire"
+# node_post <idx0> <base64-json-body> -- POST /api/v1/memories on that node.
+# The body rides base64 so no JSON quoting has to survive the ssh command line.
+node_post() {
+  node_sh "$1" <<EOS 2>/dev/null
+BODY=\$(printf '%s' '$2' | base64 -d)
+curl -sS --max-time 30 --cacert /etc/ai-memory/fed/ca.crt \\
+  --cert /etc/ai-memory/fed/node.crt --key /etc/ai-memory/fed/node.key \\
+  -H 'content-type: application/json' \\
+  -H "x-api-key: \$(cat /etc/ai-memory/api-key)" -H 'x-agent-id: $AUTHOR_ID' \\
+  -X POST https://127.0.0.1:9077/api/v1/memories -d "\$BODY" -w '\\n%{http_code}' 2>/dev/null
+EOS
+}
 
-  # A1 -- each node answers /health over mTLS, and ONLY over mTLS.
+b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
+
+verify() {
+  # A1 -- each node answers /health over mTLS with an authorised cert, and
+  #       REFUSES a caller presenting no cert (mTLS mandatory, not optional).
   for i in $(seq 0 $((NODE_COUNT - 1))); do
     n=$((i + 1))
-    url="${PEER_URLS[$i]}/api/v1/health"
-    code="$(op_curl -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)"
+    code=$(node_sh "$i" <<'EOS' 2>/dev/null
+curl -sS --max-time 15 --cacert /etc/ai-memory/fed/ca.crt \
+  --cert /etc/ai-memory/fed/node.crt --key /etc/ai-memory/fed/node.key \
+  -o /dev/null -w '%{http_code}' https://127.0.0.1:9077/api/v1/health 2>/dev/null
+EOS
+)
     if [ "$code" = "200" ]; then
       ok "node $n /health over mTLS (200)"
     else
       no "node $n /health over mTLS got '$code' (expected 200)"
     fi
-    if curl -sS --max-time 10 --cacert "$OUT_DIR/ca.crt" -o /dev/null "$url" 2>/dev/null; then
-      no "node $n accepted a client with NO cert (mTLS not enforced)"
+
+    if node_sh "$i" <<'EOS' >/dev/null 2>&1
+curl -sS --max-time 10 --cacert /etc/ai-memory/fed/ca.crt \
+  -o /dev/null https://127.0.0.1:9077/api/v1/health 2>/dev/null
+EOS
+    then
+      no "node $n accepted a client presenting NO cert (mTLS not enforced)"
     else
       ok "node $n refuses a client presenting no cert"
     fi
   done
 
-  API1="$(on_node "${PUBLIC_IPS[0]}" 'cat /etc/ai-memory/api-key')" \
-    || die "could not read node 1 api key"
-  API2="$(on_node "${PUBLIC_IPS[1]}" 'cat /etc/ai-memory/api-key')" \
-    || die "could not read node 2 api key"
+  # A2 -- CROSS-HOST mTLS: node 1 reaches node 2 on its PRIVATE VPC address
+  #       with its own peer cert. This is precisely the assertion the local
+  #       2-daemon legs structurally cannot make.
+  peerurl="${PEER_URLS[1]}"
+  code=$(node_sh 0 <<EOS 2>/dev/null
+curl -sS --max-time 15 --cacert /etc/ai-memory/fed/ca.crt \\
+  --cert /etc/ai-memory/fed/node.crt --key /etc/ai-memory/fed/node.key \\
+  -o /dev/null -w '%{http_code}' $peerurl/api/v1/health 2>/dev/null
+EOS
+)
+  if [ "$code" = "200" ]; then
+    ok "CROSS-HOST: node 1 reaches node 2 at $peerurl over mutual TLS (200)"
+  else
+    no "CROSS-HOST: node 1 -> node 2 ($peerurl) got '$code' (expected 200)"
+  fi
 
-  # A2 -- a W-of-N quorum write to node 1 commits AND replicates to node 2.
+  # A3 -- a W-of-N quorum write admitted at node 1 commits AND replicates.
   #       201 = quorum_met; 202 = locally durable with a late ack. Both prove
-  #       the mutually authenticated peer channel carried the write; the
-  #       replication itself is asserted separately by reading node 2.
-  TITLE="hive-quorum-probe-$$"
-  body=$(jq -nc --arg t "$TITLE" --arg ns "$NS" \
+  #       the mutually authenticated peer channel carried it; the replication
+  #       itself is asserted separately by READING node 2.
+  body=$(jq -nc --arg t "hive-quorum-probe-$$" --arg ns "$NS" \
     '{title:$t,content:"a federated write that must replicate across the DO mTLS quorum mesh",namespace:$ns,tier:"mid"}')
-  resp=$(op_curl -H "content-type: application/json" -H "x-api-key: $API1" \
-    -H "x-agent-id: $AUTHOR_ID" -X POST "${PEER_URLS[0]}/api/v1/memories" -d "$body" \
-    -w $'\n%{http_code}')
+  resp=$(node_post 0 "$(b64 "$body")")
   qcode=$(echo "$resp" | tail -1)
   qjson=$(echo "$resp" | sed '$d')
-  QID=$(echo "$qjson" | jq -r '.id // empty')
+  QID=$(echo "$qjson" | jq -r '.id // empty' 2>/dev/null)
   case "$qcode" in
-    201) ok "W-of-N quorum write to node 1 committed + replicated (201 quorum_met)" ;;
-    202) ok "quorum write to node 1 locally durable (202; peer ack timing) -- mesh channel carried it" ;;
-    *)   no "quorum write to node 1 got '$qcode' ($qjson)" ;;
+    201) ok "W-of-N quorum write at node 1 committed + replicated (201 quorum_met)" ;;
+    202) ok "quorum write at node 1 locally durable (202; peer ack timing) -- the mesh channel carried it" ;;
+    *)   no "quorum write at node 1 got '$qcode' ($qjson)" ;;
   esac
   if [ -n "$QID" ]; then
     landed=""
     for _ in $(seq 1 20); do
-      landed=$(op_curl -H "x-api-key: $API2" -H "x-agent-id: $AUTHOR_ID" \
-        "${PEER_URLS[1]}/api/v1/memories/$QID" 2>/dev/null | jq -r '.id // empty')
+      landed=$(node_get 1 "$QID" | jq -r '.id // empty' 2>/dev/null)
       [ -n "$landed" ] && break
       sleep 2
     done
@@ -269,10 +315,12 @@ verify() {
     fi
   fi
 
-  # A3 -- a SIGNED write authored on node 1 reaches attest_level=agent_attested
-  #       at node 2. This is the cross-peer CONTENT write-sig lane: it needs
-  #       the author key enrolled at BOTH nodes (fed-bootstrap stage H) and the
-  #       v1.0.0 default-on AI_MEMORY_FED_REQUIRE_WRITE_SIG at the receiver.
+  # A4 -- a SIGNED write authored on node 1 reaches attest_level=agent_attested
+  #       at node 2. The cross-peer CONTENT write-sig lane: it needs the author
+  #       key enrolled at BOTH nodes (fed-bootstrap stage H) and the v1.0.0
+  #       default-on AI_MEMORY_FED_REQUIRE_WRITE_SIG at the receiver. The
+  #       signature is computed HERE; the author private key never leaves this
+  #       host.
   if [ ! -x "$SIGNER" ]; then
     no "no attest_sign signer at $SIGNER -- build it (cargo build --release --example attest_sign) and re-run verify; the cross-peer attestation leg is NOT proven without it"
   else
@@ -288,29 +336,25 @@ verify() {
       sbody=$(jq -nc --arg t "$STITLE" --arg c "$SCONTENT" --arg ns "$NS" \
         --arg sig "$SIG" --arg ca "$CREATED" \
         '{title:$t,content:$c,namespace:$ns,tier:"mid",signature:$sig,created_at:$ca}')
-      sresp=$(op_curl -H "content-type: application/json" -H "x-api-key: $API1" \
-        -H "x-agent-id: $AUTHOR_ID" -X POST "${PEER_URLS[0]}/api/v1/memories" -d "$sbody" \
-        -w $'\n%{http_code}')
+      sresp=$(node_post 0 "$(b64 "$sbody")")
       scode=$(echo "$sresp" | tail -1)
       sjson=$(echo "$sresp" | sed '$d')
-      SID=$(echo "$sjson" | jq -r '.id // empty')
+      SID=$(echo "$sjson" | jq -r '.id // empty' 2>/dev/null)
       if [ "$scode" = "201" ] && [ -n "$SID" ]; then
         ok "signed write accepted at node 1 (201 id=$SID)"
       else
-        no "signed write to node 1 got '$scode' ($sjson)"
+        no "signed write at node 1 got '$scode' ($sjson)"
       fi
       if [ -n "$SID" ]; then
         lvl=""
         for _ in $(seq 1 20); do
-          lvl=$(op_curl -H "x-api-key: $API2" -H "x-agent-id: $AUTHOR_ID" \
-            "${PEER_URLS[1]}/api/v1/memories/$SID" 2>/dev/null \
-            | jq -r '.metadata.attest_level // empty')
+          lvl=$(node_get 1 "$SID" | jq -r '.metadata.attest_level // empty' 2>/dev/null)
           [ -n "$lvl" ] && break
           sleep 2
         done
         case "$lvl" in
           agent_attested) ok "signed cross-peer write lands attest_level=agent_attested at node 2" ;;
-          "")             no "signed write never reached node 2 (replication or enrollment failure)" ;;
+          "")             no "signed write never reached node 2 (replication or author-enrollment failure)" ;;
           *)              no "signed write reached node 2 at attest_level='$lvl' (expected agent_attested)" ;;
         esac
       fi
