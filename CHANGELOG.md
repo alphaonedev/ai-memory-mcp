@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs (Phase-2 pg-parity remediation — the TRUTHFULNESS FLOOR; vote `4d3ea1c5`, Option B+)
+
+- **Corrected every overclaiming doc to the authoritative Postgres
+  inventory: 59 of the 80 unique production HTTP paths are pg-supported;
+  21 are fully fail-closed 501; MCP-stdio is structurally SQLite-only
+  (#1675).** The number was wrong in three different places and every
+  correction now agrees with the Phase-1 anti-regression gate
+  (`tests/pg_supported_route_inventory_gate_2799.rs`) and the SSOT
+  (`EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = 80`):
+  - `README.md` — the §"Backend parity" and feature-list claims cited
+    "73 of the 94 registrations"; corrected to "59 of the 80 unique
+    paths … 21 fully fail-closed 501", with the fail-closed-never-corrupt
+    property and the Phase-1-fixed surfaces (kg family, `kg_backend`
+    capabilities, verbose-recall `latest_link_attest_level`,
+    `verify-audit-trail --store-url`) stated.
+  - `docs/postgres-age-guide.md` — replaced the FALSE "after Wave-3 …
+    no standard HTTP endpoint returns 501 … every endpoint (92
+    registrations / 78 unique paths) dispatches through the SAL"
+    statement with the truthful 59/80 inventory, the enumerated 21
+    fully-501 paths, and the corrected 94/80 SSOT counts.
+  - `docs/whats-new-v08.html` + `docs/whats-new-v09.html` — removed the
+    false "SQLite and PostgreSQL+AGE, identical API" / "behind one
+    identical API" marketing claim; both now state the pg HTTP subset +
+    SQLite-only MCP-stdio honestly.
+  - `docs/audit/3x7-claims-register-2026-08-01.md` — dated TRUTH-FIX
+    annotations on C-35 and E-01: the register's "56 of 94" (arm count)
+    and the audit's "73 of 94" (registration count) were both wrong
+    units; the authoritative figure is 59 of 80 unique paths.
+- **Bound the enterprise-cert artifact to the real pg-supported surface.**
+  `docs/v1.0.0/test-campaign-2026-08-08-enterprise-cert/PLAN.md` gains a
+  §2.0 "Certification boundary" that scopes the PG16+AGE cert to the 59
+  pg-supported paths + the Phase-1-fixed surfaces, and explicitly lists
+  the 21 SQLite-only / v1.x-deferred paths + MCP-stdio as OUTSIDE the
+  cert boundary — the certified surface is the pg-supported set, not the
+  SQLite superset.
+- **Filed the v1.x tracking EPIC + sub-items** for the 21 genuine
+  fail-closed gaps (postgres surface-parity):
+  [#2803](https://github.com/alphaonedev/ai-memory-mcp/issues/2803)
+  (EPIC) with sub-items #2804-#2810, referencing this vote and the
+  pg-parity audit. Goal: a claims auditor reading these docs finds ZERO
+  statement that overclaims the Postgres configuration.
+
 ### Added (Phase-1 pg-parity remediation — claims-parity anti-regression gate; vote `4d3ea1c5`)
 
 - **`tests/pg_supported_route_inventory_gate_2799.rs`** — the durable
