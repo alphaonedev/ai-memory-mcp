@@ -101,5 +101,57 @@ fp peerA.crt > peerB.allowlist          # peerB trusts peerA's client cert
   done
 } > fingerprints.txt
 
+# --- Track D hive nodes (ADDITIVE; skipped unless HIVE_NODE_IPS is set) ------
+# HIVE_NODE_IPS="10.20.0.5 10.20.0.6" mints one leaf per DO memory droplet
+# (hive-node-1..N, CN = the droplet name, SAN = localhost + 127.0.0.1 + that
+# node's PRIVATE VPC ip) and writes a per-node allowlist. Unset => this block
+# does nothing and the output is byte-identical to the legacy
+# localhost/peerA/peerB set, so every existing crypto leg keeps its exact
+# material.
+#
+# Each hive-node-N.allowlist pins exactly TWO classes of fingerprint, and no
+# more -- every additional entry is one more key whose loss opens the mesh:
+#   * every OTHER node  -- the mutually authenticated quorum channel
+#   * the node ITSELF   -- its own client cert is the ONLY one it holds, and
+#                          both the on-droplet fed-bootstrap and federate.sh's
+#                          post-boot assertions probe :9077 with it (the
+#                          assertions run ON a node over ssh, because the
+#                          peer URLs are PRIVATE VPC addresses that are not
+#                          routable from the orchestrator host). Trusting your
+#                          own client cert grants an attacker nothing new:
+#                          holding it means already holding the server key
+#                          sitting beside it.
+# There is deliberately NO separate operator/bastion client cert: nothing needs
+# one, and an unused trust anchor is a liability, not a convenience.
+if [ -n "${HIVE_NODE_IPS:-}" ]; then
+  hive_idx=0
+  for hive_ip in $HIVE_NODE_IPS; do
+    hive_idx=$((hive_idx + 1))
+    mint "hive-node-$hive_idx" "ai-memory-hive-memory-$hive_idx" \
+      "DNS:localhost,IP:127.0.0.1,IP:$hive_ip"
+  done
+
+  hive_total=$hive_idx
+  hive_idx=0
+  for _hive_ip in $HIVE_NODE_IPS; do
+    hive_idx=$((hive_idx + 1))
+    : > "hive-node-$hive_idx.allowlist"
+    hive_j=0
+    while [ "$hive_j" -lt "$hive_total" ]; do
+      hive_j=$((hive_j + 1))
+      fp "hive-node-$hive_j.crt" >> "hive-node-$hive_idx.allowlist"
+    done
+  done
+
+  {
+    echo "# Track D hive-node fingerprints generated $(date -u)"
+    hive_idx=0
+    for _hive_ip in $HIVE_NODE_IPS; do
+      hive_idx=$((hive_idx + 1))
+      printf '%-14s %s\n' "hive-node-$hive_idx" "$(fp "hive-node-$hive_idx.crt")"
+    done
+  } >> fingerprints.txt
+fi
+
 echo "OK — crypto material in $OUT_DIR"
 cat fingerprints.txt
