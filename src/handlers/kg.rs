@@ -883,32 +883,77 @@ pub async fn kg_invalidate(
     // inbox target, or the row is unowned-legacy, or caller is
     // "daemon" sentinel). Mirrors the gate shape in #930 update_memory
     // and #936 archive_purge.
+    //
+    // #2793: branch on `storage_backend` so postgres-backed daemons read the
+    // source memory from postgres via the SAL trait instead of the empty
+    // SQLite scratch connection. Pre-fix EVERY postgres-backed kg_invalidate
+    // returned 404 here (the scratch `db::get` found nothing), 404ing before
+    // the `app.store.invalidate_link` postgres branch below could run — the
+    // exact class #1134 fixed for the sibling `kg_timeline` handler.
+    let extract_owner_target = |mem: &Memory| -> (String, String) {
+        let owner = mem
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let target = mem
+            .metadata
+            .get(field_names::TARGET_AGENT_ID)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        (owner, target)
+    };
     let source_owner: Option<(String, String)> = {
-        let lock = app.db.lock().await;
-        match db::get(&lock.0, &body.source_id) {
-            Ok(Some(mem)) => {
-                let owner = mem
-                    .metadata
-                    .get("agent_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let target = mem
-                    .metadata
-                    .get(field_names::TARGET_AGENT_ID)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                Some((owner, target))
+        #[cfg(feature = "sal")]
+        if matches!(app.storage_backend, StorageBackend::Postgres) {
+            let ctx = crate::store::CallerContext::for_agent(caller.clone());
+            match app.store.get(&ctx, &body.source_id).await {
+                Ok(mem) => Some(extract_owner_target(&mem)),
+                Err(e) => {
+                    let msg = format!("{e:?}");
+                    if msg.contains("NotFound") || msg.contains("not found") {
+                        None
+                    } else {
+                        tracing::error!("kg_invalidate: source lookup failed (postgres): {e:?}");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
+                        )
+                            .into_response();
+                    }
+                }
             }
-            Ok(None) => None,
-            Err(e) => {
-                tracing::error!("kg_invalidate: source lookup failed: {e}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
-                )
-                    .into_response();
+        } else {
+            let lock = app.db.lock().await;
+            match db::get(&lock.0, &body.source_id) {
+                Ok(Some(mem)) => Some(extract_owner_target(&mem)),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::error!("kg_invalidate: source lookup failed: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        #[cfg(not(feature = "sal"))]
+        {
+            let lock = app.db.lock().await;
+            match db::get(&lock.0, &body.source_id) {
+                Ok(Some(mem)) => Some(extract_owner_target(&mem)),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::error!("kg_invalidate: source lookup failed: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
+                    )
+                        .into_response();
+                }
             }
         }
     };
