@@ -56,6 +56,21 @@ pub struct VerifyAuditTrailArgs {
     /// human-readable summary.
     #[arg(long)]
     pub json: bool,
+
+    /// v1.0.0 pg-parity PR-B — verify the audit chain against a
+    /// POSTGRES store instead of the local sqlite `--db`. Accepts a
+    /// `postgres://…` DSN (a `sqlite:///path` is also honored, opening
+    /// that file rather than `--db`). When present, the exact `serve` /
+    /// `curator` `--store-url` precedent applies: the non-argv
+    /// `AI_MEMORY_STORE_URL_FILE` (a `0600` file, #1927) and
+    /// `AI_MEMORY_STORE_URL` channels take precedence over this
+    /// world-readable argv value. The exit-code + verdict contract is
+    /// identical to the sqlite path (dirty → exit 1; the `K1`/`K2`
+    /// require-mode flags such as `AI_MEMORY_REQUIRE_WITNESS` are still
+    /// honored). Postgres requires a binary built with
+    /// `--features sal-postgres`.
+    #[arg(long, value_name = "URL")]
+    pub store_url: Option<String>,
 }
 
 /// Run the audit-trail verifier. Returns the desired process exit
@@ -70,9 +85,29 @@ pub fn run(db_path: &Path, args: &VerifyAuditTrailArgs, out: &mut CliOutput<'_>)
         crate::db::open(db_path).with_context(|| format!("open db at {}", db_path.display()))?;
     let report = crate::signed_events::verify_audit_trail(&conn, args.since.as_deref())
         .context("verify_audit_trail over signed_events")?;
+    render(&report, args.json, out)
+}
+
+/// Render an already-computed [`crate::signed_events::AuditTrailReport`]
+/// to `out` and return the process exit code (0 clean, 1 dirty). Split
+/// out of [`run`] (v1.0.0 pg-parity PR-B) so the postgres `--store-url`
+/// path ([`crate::store::postgres::PostgresStore::verify_audit_trail`]),
+/// which produces the SAME report shape via the SAME shared verdict fns
+/// (GATE K3 parity), renders BYTE-FOR-BYTE identically to the sqlite
+/// path — the exit-code + output contract is defined once, here.
+///
+/// # Errors
+///
+/// Returns the serializer or formatter error if the JSON serialization
+/// or report write fails.
+pub fn render(
+    report: &crate::signed_events::AuditTrailReport,
+    json: bool,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
     let clean = report.is_clean();
 
-    if args.json {
+    if json {
         let json = serde_json::to_string_pretty(&report).context("serialize audit-trail report")?;
         writeln!(out.stdout, "{json}").context(CTX_WRITE_AUDIT_REPORT)?;
     } else if clean {
@@ -280,6 +315,7 @@ mod tests {
         let args = VerifyAuditTrailArgs {
             since: None,
             json: true,
+            store_url: None,
         };
         let mut buf_out = Vec::<u8>::new();
         let mut buf_err = Vec::<u8>::new();
@@ -304,6 +340,7 @@ mod tests {
         let args = VerifyAuditTrailArgs {
             since: None,
             json: false,
+            store_url: None,
         };
         let mut buf_out = Vec::<u8>::new();
         let mut buf_err = Vec::<u8>::new();

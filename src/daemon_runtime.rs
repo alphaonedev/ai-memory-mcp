@@ -1962,12 +1962,11 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             }
         }
         Command::VerifyAuditTrail(a) => {
-            let stdout = std::io::stdout();
-            let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
-            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            match cli::verify_audit_trail::run(&db_path, &a, &mut out)? {
+            // v1.0.0 pg-parity PR-B — routes to the postgres twin when
+            // `--store-url` (or the #1927 non-argv channel) resolves to a
+            // `postgres://` DSN, else the sqlite path. Exit-code contract
+            // is identical on both backends.
+            match run_verify_audit_trail(&db_path, &a, app_config).await? {
                 0 => Ok(()),
                 code => std::process::exit(code),
             }
@@ -4154,6 +4153,121 @@ async fn build_store_handle(
             Ok((StorageBackend::Sqlite, Arc::new(store)))
         }
     }
+}
+
+/// v1.0.0 pg-parity PR-B — dispatch `verify-audit-trail`, routing the
+/// audit-chain verification to the POSTGRES twin
+/// ([`crate::store::postgres::PostgresStore::verify_audit_trail`]) when
+/// `--store-url` (or the #1927 non-argv `AI_MEMORY_STORE_URL_FILE` /
+/// `AI_MEMORY_STORE_URL` channel) resolves to a `postgres://` DSN, else
+/// to the local sqlite path ([`crate::cli::verify_audit_trail::run`]).
+/// A `sqlite:///path` store-url opens THAT file rather than `--db`; any
+/// other scheme is refused — the same URL-scheme dispatch
+/// [`build_store_handle`] performs. The exit-code + verdict contract is
+/// rendered once via [`crate::cli::verify_audit_trail::render`], so both
+/// backends behave identically (GATE K3 parity).
+///
+/// # Errors
+///
+/// Propagates a store-url resolution error, a postgres connect / verify
+/// error, an unrecognised scheme, or the sqlite open / verify error.
+async fn run_verify_audit_trail(
+    db_path: &Path,
+    a: &crate::cli::verify_audit_trail::VerifyAuditTrailArgs,
+    app_config: &AppConfig,
+) -> Result<i32> {
+    let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
+    let mut so = stdout.lock();
+    let mut se = stderr.lock();
+    let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+
+    // #1927 — prefer the non-argv credential channel over the
+    // world-readable `--store-url` argv, exactly as `build_store_handle`
+    // does for `serve` / `curator`.
+    let resolved = resolve_store_url(a.store_url.as_deref())?;
+
+    match resolved.as_deref() {
+        Some(url) if is_postgres_url(url) => {
+            verify_audit_trail_postgres(url, a, app_config, &mut out).await
+        }
+        Some(url) => {
+            let path = sqlite_store_url_to_path(url).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unrecognised --store-url: {} (expected postgres://... or sqlite:///path)",
+                    crate::logging::redact_url_password(url)
+                )
+            })?;
+            crate::cli::verify_audit_trail::run(Path::new(path), a, &mut out)
+        }
+        None => crate::cli::verify_audit_trail::run(db_path, a, &mut out),
+    }
+}
+
+/// Mirror [`build_store_handle`]'s `sqlite://` scheme handling so a
+/// `--store-url sqlite:///path` on `verify-audit-trail` opens the SAME
+/// file the daemon would. Returns `None` for a non-sqlite scheme.
+fn sqlite_store_url_to_path(url: &str) -> Option<&str> {
+    let path = url
+        .strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("SQLITE://"))?;
+    Some(
+        path.strip_prefix('/')
+            .map_or(path, |p| if p.starts_with('/') { p } else { path }),
+    )
+}
+
+/// Postgres arm of [`run_verify_audit_trail`] — reuses the SAME
+/// no-embedder connect precedent [`build_store_handle`] uses (a verify
+/// touches only the append-only audit chain, never a vector, so the
+/// legacy `DEFAULT_EMBEDDING_DIM` path applies and no auto-migrate is
+/// needed), then dispatches to the postgres `verify_audit_trail` twin
+/// and renders identically to the sqlite path.
+#[cfg(feature = "sal-postgres")]
+async fn verify_audit_trail_postgres(
+    url: &str,
+    a: &crate::cli::verify_audit_trail::VerifyAuditTrailArgs,
+    app_config: &AppConfig,
+    out: &mut cli::CliOutput<'_>,
+) -> Result<i32> {
+    let timeout = app_config
+        .postgres_statement_timeout_secs
+        .unwrap_or(crate::store::postgres::DEFAULT_STATEMENT_TIMEOUT_SECS);
+    // #1579 A3 (SECURITY) — never echo the credential.
+    let display_url = crate::logging::redact_url_password(url);
+    tracing::info!("verify-audit-trail: opening Postgres SAL store at {display_url}");
+    let store = crate::store::postgres::PostgresStore::connect_with_dim_and_timeout(
+        url,
+        crate::store::postgres::DEFAULT_EMBEDDING_DIM,
+        timeout,
+        app_config.resolve_pg_pool(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("connect postgres adapter for verify-audit-trail: {e}"))?;
+    let report = store
+        .verify_audit_trail(a.since.as_deref())
+        .await
+        .map_err(|e| anyhow::anyhow!("verify_audit_trail over postgres signed_events: {e}"))?;
+    crate::cli::verify_audit_trail::render(&report, a.json, out)
+}
+
+/// Fail-closed stub for a binary built WITHOUT `--features sal-postgres`:
+/// the store-url resolved to postgres but this binary cannot open it, so
+/// refuse loudly rather than silently verifying the wrong (sqlite) store
+/// — mirrors [`crate::store_url::refuse_postgres_store_url_without_feature`].
+#[cfg(not(feature = "sal-postgres"))]
+#[allow(clippy::unused_async)]
+async fn verify_audit_trail_postgres(
+    url: &str,
+    _a: &crate::cli::verify_audit_trail::VerifyAuditTrailArgs,
+    _app_config: &AppConfig,
+    _out: &mut cli::CliOutput<'_>,
+) -> Result<i32> {
+    anyhow::bail!(
+        "--store-url postgres:// requires the binary to be built with \
+         --features sal-postgres; this binary was built without it (verifying {})",
+        crate::logging::redact_url_password(url)
+    )
 }
 
 /// v0.7.0 #1455 — `true` when the operator opted into the legacy
@@ -11912,5 +12026,136 @@ decision = "allow"
         tokio::time::sleep(Duration::from_millis(30)).await;
         h.abort();
         let _ = h.await;
+    }
+
+    // ── v1.0.0 pg-parity PR-B — verify-audit-trail --store-url dispatch ──
+
+    fn prb_args(store_url: Option<&str>) -> crate::cli::verify_audit_trail::VerifyAuditTrailArgs {
+        crate::cli::verify_audit_trail::VerifyAuditTrailArgs {
+            since: None,
+            json: true,
+            store_url: store_url.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn prb_sqlite_store_url_to_path_variants() {
+        // A postgres / non-sqlite scheme is not a sqlite path (routed to the
+        // pg arm / the unrecognised-scheme refusal instead).
+        assert!(sqlite_store_url_to_path("postgres://h/db").is_none());
+        assert!(sqlite_store_url_to_path("mysql://h/db").is_none());
+        // `sqlite:///abs` → the absolute path; upper-case scheme honored.
+        assert_eq!(
+            sqlite_store_url_to_path("sqlite:///var/x.db"),
+            Some("/var/x.db")
+        );
+        assert_eq!(
+            sqlite_store_url_to_path("SQLITE:///var/x.db"),
+            Some("/var/x.db")
+        );
+        // `sqlite://relative.db` → the relative path (no leading slash).
+        assert_eq!(
+            sqlite_store_url_to_path("sqlite://relative.db"),
+            Some("relative.db")
+        );
+    }
+
+    #[tokio::test]
+    async fn prb_run_verify_audit_trail_sqlite_paths() {
+        let _g = crate::store_url::store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: the store-url env lock serialises every store-url env test;
+        // clearing the channels here makes the argv store-url authoritative.
+        unsafe {
+            std::env::remove_var(STORE_URL_ENV);
+            std::env::remove_var(STORE_URL_FILE_ENV);
+        }
+        let env = TestEnv::fresh();
+        let cfg = crate::config::AppConfig::default();
+        // No `--store-url` → the local `--db` sqlite branch.
+        let code = run_verify_audit_trail(&env.db_path, &prb_args(None), &cfg)
+            .await
+            .expect("sqlite None branch verifies");
+        assert!(code == 0 || code == 1, "sqlite verify returns an exit code");
+        // A `sqlite://<path>` store-url strips to that path (same db here).
+        let url = format!("sqlite://{}", env.db_path.to_string_lossy());
+        run_verify_audit_trail(&env.db_path, &prb_args(Some(&url)), &cfg)
+            .await
+            .expect("sqlite:// branch verifies");
+    }
+
+    #[tokio::test]
+    async fn prb_run_verify_audit_trail_unrecognised_scheme_errs() {
+        let _g = crate::store_url::store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: serialised by the store-url env lock (see sibling test).
+        unsafe {
+            std::env::remove_var(STORE_URL_ENV);
+            std::env::remove_var(STORE_URL_FILE_ENV);
+        }
+        let env = TestEnv::fresh();
+        let cfg = crate::config::AppConfig::default();
+        let res = run_verify_audit_trail(&env.db_path, &prb_args(Some("mysql://h/db")), &cfg).await;
+        assert!(res.is_err(), "an unrecognised store-url scheme is refused");
+    }
+
+    #[cfg(feature = "sal-postgres")]
+    #[tokio::test]
+    async fn prb_verify_audit_trail_postgres_bad_url_errs() {
+        let cfg = crate::config::AppConfig::default();
+        let stdout = std::io::stdout();
+        let stderr = std::io::stderr();
+        let mut so = stdout.lock();
+        let mut se = stderr.lock();
+        let mut out = crate::cli::CliOutput::from_std(&mut so, &mut se);
+        // An unreachable postgres endpoint fails at connect → Err (covers the
+        // pg redact + connect + map_err arm without a live DB).
+        let res = verify_audit_trail_postgres(
+            "postgres://prb:prb@127.0.0.1:1/nodb",
+            &prb_args(Some("postgres://prb:prb@127.0.0.1:1/nodb")),
+            &cfg,
+            &mut out,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "an unreachable postgres endpoint is a connect error"
+        );
+    }
+
+    /// The postgres DISPATCH arm of `run_verify_audit_trail`
+    /// (`Some(url) if is_postgres_url(url)` → the pg twin) — driven through
+    /// the dispatcher (not `verify_audit_trail_postgres` directly) so the
+    /// `is_postgres_url` match-arm is exercised; an unreachable endpoint
+    /// surfaces the connect error. The sqlite / None / unrecognised arms
+    /// are pinned by the sibling tests above. (Per-Module Coverage: the
+    /// `assert_cmd` integration test spawns a subprocess llvm-cov does not
+    /// instrument, so these in-process unit tests are what cover the
+    /// dispatcher's arms.)
+    #[cfg(feature = "sal-postgres")]
+    #[tokio::test]
+    async fn prb_run_verify_audit_trail_postgres_dispatch_errs() {
+        let _g = crate::store_url::store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: serialised by the store-url env lock (see sibling tests).
+        unsafe {
+            std::env::remove_var(STORE_URL_ENV);
+            std::env::remove_var(STORE_URL_FILE_ENV);
+        }
+        let env = TestEnv::fresh();
+        let cfg = crate::config::AppConfig::default();
+        let res = run_verify_audit_trail(
+            &env.db_path,
+            &prb_args(Some("postgres://prb:prb@127.0.0.1:1/nodb")),
+            &cfg,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "a postgres --store-url to an unreachable endpoint is a connect error"
+        );
     }
 }
