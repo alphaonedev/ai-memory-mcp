@@ -12124,4 +12124,38 @@ decision = "allow"
             "an unreachable postgres endpoint is a connect error"
         );
     }
+
+    /// The postgres DISPATCH arm of `run_verify_audit_trail`
+    /// (`Some(url) if is_postgres_url(url)` → the pg twin) — driven through
+    /// the dispatcher (not `verify_audit_trail_postgres` directly) so the
+    /// `is_postgres_url` match-arm is exercised; an unreachable endpoint
+    /// surfaces the connect error. The sqlite / None / unrecognised arms
+    /// are pinned by the sibling tests above. (Per-Module Coverage: the
+    /// `assert_cmd` integration test spawns a subprocess llvm-cov does not
+    /// instrument, so these in-process unit tests are what cover the
+    /// dispatcher's arms.)
+    #[cfg(feature = "sal-postgres")]
+    #[tokio::test]
+    async fn prb_run_verify_audit_trail_postgres_dispatch_errs() {
+        let _g = crate::store_url::store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: serialised by the store-url env lock (see sibling tests).
+        unsafe {
+            std::env::remove_var(STORE_URL_ENV);
+            std::env::remove_var(STORE_URL_FILE_ENV);
+        }
+        let env = TestEnv::fresh();
+        let cfg = crate::config::AppConfig::default();
+        let res = run_verify_audit_trail(
+            &env.db_path,
+            &prb_args(Some("postgres://prb:prb@127.0.0.1:1/nodb")),
+            &cfg,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "a postgres --store-url to an unreachable endpoint is a connect error"
+        );
+    }
 }
