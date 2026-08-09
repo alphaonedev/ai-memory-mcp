@@ -124,18 +124,27 @@ db_mmap_size_bytes = 268435456  # sqlite PRAGMA mmap_size (#1579 B7).
 
 # ---------------------------------------------------------------------
 # [limits] — operator-tunable resource caps (#1156 follow-up; #1733
-# added max_inflight_requests at v0.8.0). All fall back to the compiled
-# default when absent, non-positive, or unparseable. Precedence per field:
+# added max_inflight_requests at v0.8.0, #2032 M3 made it default-ON).
+# Precedence per field:
 #   AI_MEMORY_MAX_* env > [limits] section > compiled default.
+# Absent / non-positive / unparseable values fall through to the compiled
+# default — EXCEPT max_inflight_requests, whose tri-state resolver has no
+# `> 0` filter and honours an explicit 0 as DISABLED.
 # ---------------------------------------------------------------------
 [limits]
 max_memories_per_day = 1000        # per-agent daily memory-write quota
 max_storage_bytes    = 104857600   # per-agent storage cap (bytes; 100 MiB)
 max_links_per_day    = 5000        # per-agent daily link-write quota
 max_page_size        = 1000        # list/bulk/sync page-size cap (OOM guard)
-max_inflight_requests = 0          # #1733 HTTP admission cap; 0 = disabled
-                                   # (opt-in). Positive n sheds >n concurrent
-                                   # in-flight requests with a typed 503.
+# max_inflight_requests            # #1733 HTTP admission cap, TRI-STATE since
+                                   # #2032 M3 — LEAVE UNSET for the secure
+                                   # default. UNSET = ON, CPU-scaled to
+                                   # clamp(cores*64, 256, 4096). Positive n =
+                                   # that exact cap (sheds >n concurrent
+                                   # in-flight requests with a typed 503).
+                                   # An EXPLICIT 0 = DISABLED. Do not paste
+                                   # `= 0` here: it turns the DoS admission
+                                   # guard OFF, it is not "the default".
                                    # Env: AI_MEMORY_MAX_INFLIGHT_REQUESTS.
 vector_index_capacity = 100000     # #1005 G2 in-memory vector-index residency
                                    # cap (entries); default = compiled 100k.
@@ -169,7 +178,7 @@ to certify a stack whose probed versions drift from the pins below).
 | Apache AGE | **1.7.0** | `AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0`, `EXPECTED_AGE_VERSION=1.7.0` |
 | pgvector (server extension) | **0.8.5** | `PGVECTOR_APT_VERSION=0.8.5-1.pgdg13+1` |
 | pgvector (Rust binding crate) | **0.4** | `Cargo.toml` → `pgvector = "0.4"` |
-| ai-memory postgres schema | **v78** | postgres ladder pinned in lockstep with SQLite `CURRENT_SCHEMA_VERSION = 78` (`src/storage/migrations.rs`). NOTE: the `deploy/docker-1461` / `deploy/do-1461` provisioning configs are reproducibility anchors **pinned to the v0.7.0 release** (`EXPECTED_VERSION=0.7.0`, `EXPECTED_SCHEMA=57`, golden SHA), so their `57` is correct *for that pinned release* — it is not a stale copy of the current tip (`CURRENT_SCHEMA_VERSION = 78`). A v0.8.1 deployment-validation anchor (schema 78) would be a separate config. |
+| ai-memory postgres schema | **v88** | postgres ladder pinned in lockstep with SQLite `CURRENT_SCHEMA_VERSION = 88` (`src/storage/migrations.rs`). NOTE: the `deploy/docker-1461` / `deploy/do-1461` provisioning configs are reproducibility anchors **pinned to the v0.7.0 release** (`EXPECTED_VERSION=0.7.0`, `EXPECTED_SCHEMA=57`, golden SHA), so their `57` is correct *for that pinned release* — it is not a stale copy of the current tip (`CURRENT_SCHEMA_VERSION = 88`). A deployment-validation anchor at the current schema would be a separate config. |
 
 The bundled stacked image at
 [`deploy/docker-1461/Dockerfile.pg-age-vector`](../deploy/docker-1461/Dockerfile.pg-age-vector)
@@ -191,8 +200,28 @@ Beyond the four #1146 sectioned blocks (`[llm]` / `[embeddings]` /
 `[reranker]` / `[storage]`) and `[limits]` shown in the Quick reference,
 `AppConfig` (`src/config.rs`) parses the following operator-facing
 sections. Each is **default-safe** — absent blocks select the compiled
-default and preserve the pre-existing behaviour. Fields are listed
-exactly as the SSOT struct declares them.
+default and preserve the pre-existing behaviour. Field names are given as
+the SSOT struct declares them.
+
+> **Coverage caveat (v1.0.0 lane-1 config sweep).** This page is not yet
+> an exhaustive enumeration, and until v1.0.0 it claimed to be ("Fields
+> are listed exactly as the SSOT struct declares them"). Sections that
+> `AppConfig` resolves but this page does not define below — while the
+> shipped `docs/deploy/config.asi-hard.toml` template sets several of
+> them — include at least: `[security].secret_screen_mode` (compiled
+> default `refuse`), `[capabilities].enabled` (compiled default **`true`**
+> since R9 #1960) + `[capabilities.issuers]`, `[hooks].enforce_mode` +
+> `[hooks].required_events` (#1734 PE-1; the `[hooks]` section below
+> documents only `hooks.subscription.hmac_secret`), the `[curator]`
+> fields (`transcript_classify_enabled`, `[curator.compaction]`
+> `enabled` / `cosine_threshold`), `[logging]` (incl. `sink`,
+> `syslog_address`, `syslog_transport`, `syslog_tls_ca_file`),
+> `[reranker].score_floor`, and the `[storage]` data-integrity switches
+> `append_only` / `lineage_dag` / `consolidate_tombstone_sources` /
+> `age_projection_mode`. Every one of them IS documented per-knob in the
+> CLAUDE.md environment-variable table (each names its `[section].field`
+> twin); treat that table as the exhaustive index until these sections
+> land here.
 
 ### Top-level operational fields
 
@@ -407,7 +436,11 @@ methods:
   handler via `State(app)`. Precedence ladder for this section is
   `AI_MEMORY_MAX_* env > [limits] > compiled default` (no CLI flag, no
   legacy flat field). Non-positive / unparseable values are filtered so
-  a stray `0` `max_page_size` cannot clamp every list response to empty.
+  a stray `0` `max_page_size` cannot clamp every list response to empty —
+  **except `max_inflight_requests`**, which is resolved by
+  `env_tristate_usize` (no `> 0` filter) precisely so an explicit `0` can
+  mean "operator disabled admission control", distinct from unset. Do not
+  read the filtering sentence as covering that knob.
 
 **Uniform precedence ladder** (CLI > env > config > legacy > compiled):
 

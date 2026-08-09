@@ -49,11 +49,23 @@ capabilities:
    envelope) and land `claimed`. Setting
    `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` forces strict enforcement on
    every surface (the old v0.9.0 posture); `=0` forces permissive
-   everywhere. The federation **receive** path remains claimed-by-default —
-   per-write *cryptographic* attestation of synced memories needs a
-   wire-protocol extension (sender signs each row, receiver verifies) and
-   is tracked under Pillar-3 #1719; mTLS + the per-memory authorship
-   allowlist stay the trust boundary for synced writes.)
+   everywhere. The federation **receive** path is
+   per-write cryptographically attested and **fail-closed BY DEFAULT** at
+   v1.0.0: `AI_MEMORY_FED_REQUIRE_WRITE_SIG` defaults to `1`
+   (`FED_REQUIRE_WRITE_SIG_DEFAULT = true`, #1801 → #1954), and both the
+   push (`/sync/push`) and pull (`/sync/since`) receive lanes call
+   `apply_inbound_write_attestation`, verifying the author's detached
+   Ed25519 signature over the #626 `SignableWrite` envelope against the
+   attributed author's locally-**enrolled** key and refusing an
+   unsigned/unverifiable HONORED third-party relay. (This paragraph
+   previously said the receive path "remains claimed-by-default" and that
+   the wire extension "is tracked under Pillar-3 #1719" — a stale un-claim
+   of a shipped fail-closed control, and a materially harmful one, because
+   it steered operators AWAY from enrolling origin-author keys, which is
+   the exact prerequisite the shipped default now requires.) mTLS + the
+   per-memory authorship allowlist remain in force underneath as
+   additional layers; `=0` is the staged-rollout bridge during peer key
+   enrollment.)
 4. **Compromised LLM** (Ollama returning malicious content). Autonomy
    hooks never `exec` or write to disk outside the database. Worst
    case: bad tags, spurious contradiction flags. Reversible via the
