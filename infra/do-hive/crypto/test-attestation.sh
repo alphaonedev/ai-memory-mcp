@@ -41,13 +41,29 @@ AI_MEMORY_NO_CONFIG=1 "$BIN" agents bind-key --agent-id "$AGENT" --pubkey "$PUB"
 echo "INFO: bound pubkey $PUB for $AGENT"
 
 # --- 2. launch daemon: HTTPS + mTLS + attestation REQUIRED --------------------
-AI_MEMORY_NO_CONFIG=1 AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 \
+# Attestation is tier-independent — it needs NO embedder. Boot the daemon at
+# tier=keyword via an ISOLATED XDG config so a fresh host with no MiniLM cache
+# neither logs EMBEDDER LOAD FAILED nor pays a semantic-tier boot delay that
+# RACES the health-poll window. Historically this leg booted the compiled-default
+# tier=semantic (AI_MEMORY_NO_CONFIG=1; serve has NO --tier flag — tier resolves
+# from config.toml only), whose MiniLM-at-boot load exceeded the poll window under
+# machine load, so every subsequent request returned HTTP 000 and the POS/NEG
+# assertions failed spuriously (KNOWN-DO-STAGING.md §2 boot-race — failed 0/2 with
+# got-000 under load, passed 2/2 isolated). Fix mirrors the sibling
+# test-fed-write-sig-attestation.sh: drop AI_MEMORY_NO_CONFIG on the serve line and
+# point XDG_CONFIG_HOME/HOME at an isolated tier=keyword config (same isolation
+# NO_CONFIG gives the offline CLI ops above, but WITH a tier override).
+CFG="$WORK/xdg"; mkdir -p "$CFG/ai-memory"
+printf 'schema_version = 2\ntier = "keyword"\n' > "$CFG/ai-memory/config.toml"
+XDG_CONFIG_HOME="$CFG" HOME="$WORK" AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 \
 "$BIN" serve --host 127.0.0.1 --port "$PORT" --db "$DB" \
   --tls-cert "$OUT/server.crt" --tls-key "$OUT/server.key" \
   --mtls-allowlist "$OUT/allowlist.txt" >"$LOG" 2>&1 &
 DPID=$!
 CC=(--cert "$OUT/client-good.crt" --key "$OUT/client-good.key")
-for i in $(seq 1 40); do
+# Belt-and-suspenders: a 60 s poll window (matching the sibling leg) on top of the
+# real fix, so a heavily-loaded host still clears the fast keyword-tier boot.
+for i in $(seq 1 120); do
   curl -sk "${CC[@]}" "https://127.0.0.1:$PORT/api/v1/health" -o /dev/null && break; sleep 0.5; done
 BASE="https://127.0.0.1:$PORT/api/v1"
 
