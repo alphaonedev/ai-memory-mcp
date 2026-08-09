@@ -547,13 +547,35 @@ async fn recall_response(
                 // tracked follow-up; the substrate's structural NSA
                 // CSI MCP coverage at v0.7.x stands at 10/10 with
                 // sqlite as the canonical default backend.
-                if provenance_shape.is_verbose() {
-                    tracing::info!(
-                        "recall (postgres): Accept-Provenance: verbose received; \
-                         postgres-side verbose decoration not yet implemented — \
-                         shipping bare Form 4/5/6 envelope. Sqlite path supports verbose."
-                    );
-                }
+                // PR-C pg-parity (5-agent vote 4d3ea1c5) — restore the
+                // `Accept-Provenance: verbose` `latest_link_attest_level`
+                // decoration on the postgres recall path. The sqlite branch
+                // adds it via `decorate_memory_many`; the pg branch used to
+                // drop it (the sqlite decorator needs a rusqlite::Connection
+                // the pg adapter does not hold) and only logged a
+                // not-yet-implemented notice. The SAL `latest_link_attest_levels`
+                // method closes that backend gap with one batched
+                // `memory_links` scan + the shared best-of ranking, so the pg
+                // verbose envelope now matches sqlite field-for-field.
+                // Best-effort: a lookup error degrades to no decoration
+                // (fewer fields, never wrong fields) and never blocks recall.
+                let attest_map: std::collections::HashMap<String, String> = if provenance_shape
+                    .is_verbose()
+                {
+                    let ids: Vec<&str> = scored_pairs.iter().map(|(m, _)| m.id.as_str()).collect();
+                    match app.store.latest_link_attest_levels(&ids).await {
+                        Ok(map) => map,
+                        Err(e) => {
+                            tracing::warn!(
+                                "recall (postgres): latest_link_attest_levels failed \
+                                     (verbose decoration skipped, non-fatal): {e}"
+                            );
+                            std::collections::HashMap::new()
+                        }
+                    }
+                } else {
+                    std::collections::HashMap::new()
+                };
                 let scored: Vec<serde_json::Value> = scored_pairs
                     .iter()
                     .filter_map(|(m, s)| match serde_json::to_value(m) {
@@ -566,6 +588,15 @@ async fn recall_response(
                                             / crate::SCORE_DISPLAY_ROUND_FACTOR
                                     ),
                                 );
+                                // PR-C — verbose provenance parity: attach the
+                                // strongest incident-edge attestation, matching
+                                // the sqlite `decorate_memory_many` wire field.
+                                if let Some(level) = attest_map.get(&m.id) {
+                                    obj.insert(
+                                        "latest_link_attest_level".to_string(),
+                                        json!(level),
+                                    );
+                                }
                             }
                             Some(v)
                         }

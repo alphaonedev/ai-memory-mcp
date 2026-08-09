@@ -489,8 +489,12 @@ mod quota_status;
 // v0.7.0 (issue #691) — substrate-level agent-action rules engine.
 #[path = "tools/check_agent_action.rs"]
 mod check_agent_action;
+// PR-C pg-parity (5-agent vote 4d3ea1c5) — `pub(crate)` so the SAL
+// adapters (`store::sqlite`, `store::postgres`) can reuse the recall
+// decorator's `latest_link_attest_level_many` free-fn + `attest_rank`
+// SSOT for the postgres verbose-recall parity method.
 #[path = "tools/recall.rs"]
-mod recall;
+pub(crate) mod recall;
 // v0.7.0 Provenance Gap 3 (#886) — recall-consumption observation tier.
 #[path = "tools/recall_observations.rs"]
 mod recall_observations;

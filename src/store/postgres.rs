@@ -15272,6 +15272,16 @@ impl MemoryStore for PostgresStore {
             | Capabilities::ATOMIC_MULTI_WRITE
     }
 
+    /// PR-C pg-parity (5-agent vote `4d3ea1c5`) — surface the AGE-vs-CTE
+    /// posture this pool resolved at connect time (the inherent
+    /// [`PostgresStore::kg_backend`] field accessor) through the SAL trait
+    /// so `/api/v1/capabilities.kg_backend` reports `age` on an
+    /// AGE-enabled postgres daemon and `cte` otherwise, instead of the
+    /// pre-PR-C `None` (field omitted).
+    fn kg_backend(&self) -> KgBackend {
+        self.kg_backend
+    }
+
     /// v1.0.0 R19/A3 (#1948) — route-OUT dequarantine (delegates to the
     /// inherent [`PostgresStore::dequarantine_raw`]).
     async fn dequarantine(&self, id: &str) -> StoreResult<bool> {
@@ -18209,6 +18219,81 @@ impl MemoryStore for PostgresStore {
                 })
             })
             .collect()
+    }
+
+    /// PR-C pg-parity (5-agent vote `4d3ea1c5`) — postgres twin of the
+    /// sqlite [`crate::mcp::recall::latest_link_attest_level_many`]
+    /// decorator. One `= ANY($1)` scan over `memory_links` resolves the
+    /// STRONGEST incident-edge attestation per requested id (source OR
+    /// target endpoint), ranked by the shared
+    /// [`crate::mcp::recall::attest_rank`] so the verbose-recall
+    /// `latest_link_attest_level` wire field is byte-identical across
+    /// backends. Ids with no attested incident edge are absent from the
+    /// map (the sqlite free-fn contract).
+    async fn latest_link_attest_levels(
+        &self,
+        ids: &[&str],
+    ) -> StoreResult<std::collections::HashMap<String, String>> {
+        use crate::mcp::recall::attest_rank;
+        use crate::models::AttestLevel;
+
+        let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        // Owned copy for the `= ANY($1)` text[] bind.
+        let id_vec: Vec<String> = ids.iter().map(|s| (*s).to_string()).collect();
+        // Membership set so an edge whose OTHER endpoint is out of the
+        // batch only contributes to the endpoint(s) actually requested —
+        // matches the sqlite free-fn's `in_batch` filter exactly.
+        let in_batch: std::collections::HashSet<&str> = ids.iter().copied().collect();
+
+        let rows = sqlx::query(
+            "SELECT source_id, target_id, attest_level \
+             FROM memory_links \
+             WHERE source_id = ANY($1) OR target_id = ANY($1)",
+        )
+        .bind(&id_vec)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("latest_link_attest_levels", e))?;
+
+        let mut best_by_id: std::collections::HashMap<String, AttestLevel> =
+            std::collections::HashMap::new();
+        for r in &rows {
+            let source_id: String = r
+                .try_get("source_id")
+                .map_err(|e| to_store_err("latest_link_attest_levels source_id", e))?;
+            let target_id: String = r
+                .try_get("target_id")
+                .map_err(|e| to_store_err("latest_link_attest_levels target_id", e))?;
+            let level_opt: Option<String> = r
+                .try_get(crate::models::field_names::ATTEST_LEVEL)
+                .map_err(|e| to_store_err("latest_link_attest_levels attest_level", e))?;
+            let Some(level_str) = level_opt else { continue };
+            let Some(level) = AttestLevel::from_str(&level_str) else {
+                continue;
+            };
+            let rank = attest_rank(level);
+            for endpoint in [&source_id, &target_id] {
+                if !in_batch.contains(endpoint.as_str()) {
+                    continue;
+                }
+                match best_by_id.get(endpoint) {
+                    None => {
+                        best_by_id.insert(endpoint.clone(), level);
+                    }
+                    Some(curr) if rank > attest_rank(*curr) => {
+                        best_by_id.insert(endpoint.clone(), level);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for (id, level) in best_by_id {
+            out.insert(id, level.as_str().to_string());
+        }
+        Ok(out)
     }
 
     /// v0.7.0 ARCH-2 followup (FX-C2) — per-anchor edge probe over

@@ -319,7 +319,7 @@ pub(crate) fn freshness_state(mem: &Memory) -> &'static str {
     }
 }
 
-const fn attest_rank(level: AttestLevel) -> u8 {
+pub(crate) const fn attest_rank(level: AttestLevel) -> u8 {
     // v0.7.0 #1430 fix: new SignedByPeer (L4 capture_turn) + DaemonSigned
     // (governance audit) variants ranked alongside the original 3.
     // Ranking semantics:
