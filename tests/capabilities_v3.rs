@@ -196,12 +196,18 @@ fn cap_v3_summary_core_profile_counts_and_names_recovery_paths() {
         "core profile must report {n_core_unloaded} unloaded ({n_full} - {n_core}); got: {summary}"
     );
 
-    // Three named recovery paths must all appear (verbatim names — these
-    // are the strings reasoning-class LLMs are expected to repeat back).
+    // The real recovery path + the honest -32601 outcome + the two
+    // memory loaders, named but DISCLAIMED as tool-recovery paths
+    // (#2781 — they load memories, not tools). Verbatim names, since
+    // these are the strings reasoning-class LLMs repeat back.
     assert!(summary.contains("--profile <family>"));
+    assert!(summary.contains("JSON-RPC -32601"));
     assert!(summary.contains("memory_load_family(family=<name>)"));
     assert!(summary.contains("memory_smart_load(intent="));
-    assert!(summary.contains("JSON-RPC -32601"));
+    assert!(
+        summary.contains("they do NOT register tools"),
+        "#2781: the loaders must be disclaimed, not advertised as tool recovery; got: {summary}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -241,11 +247,16 @@ fn cap_v3_summary_full_profile_reports_all_visible() {
         summary.contains("0 are listed in this manifest"),
         "full profile must report 0 unloaded; got: {summary}"
     );
-    // Even when nothing is unloaded, the recovery vocabulary stays present
-    // so an LLM exposed only to the full-profile summary still learns the
-    // names of the loader tools.
+    // Even when nothing is unloaded, the vocabulary stays present so an
+    // LLM exposed only to the full-profile summary still learns the names
+    // of the memory-loader tools — and, since #2781, learns that they are
+    // memory loaders rather than a way to reach an unloaded tool.
     assert!(summary.contains("memory_load_family"));
     assert!(summary.contains("memory_smart_load"));
+    assert!(
+        summary.contains("they do NOT register tools"),
+        "#2781: the loader disclaimer is part of the fixed vocabulary; got: {summary}"
+    );
 }
 
 // ---------------------------------------------------------------------------

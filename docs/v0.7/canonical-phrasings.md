@@ -28,8 +28,10 @@ The split exists because reasoning-class LLMs in 2026-04 NHI Discovery Gate obse
 ## A1 — `summary` canonical phrasing
 
 ```
-{visible} of {total} tools are advertised in tools/list under the current profile ({label}). The other {unloaded} are listed in this manifest but NOT directly callable. To use any unloaded tool, choose one of: (a) restart the server with --profile <family> or --profile full, (b) call memory_load_family(family=<name>) — preferred, (c) call memory_smart_load(intent='<plain language>') — easiest, (d) call the tool by name and recover from JSON-RPC -32601.
+{visible} of {total} memory tools are advertised in tools/list under the current profile ({label}). The other {unloaded} are listed in this manifest but NOT callable in this session: calling one returns JSON-RPC -32601 unknown tool. (a) The only way to make an unloaded tool callable is to restart the server with --profile <family> or --profile full — no runtime call loads tools. (b) memory_load_family(family=<name>) and memory_smart_load(intent='<plain language>') load MEMORIES tagged with a family; they do NOT register tools, so they cannot reach an unloaded tool.
 ```
+
+> **Corrected 2026-08-09 ([#2781](https://github.com/alphaonedev/ai-memory-mcp/issues/2781)).** The v0.7.0 phrasing listed four "recovery paths" (a–d) and called `memory_load_family` the *preferred* way "to use any unloaded tool". That was false: `LoadFamilyTool`'s own description is "Load top-k recent + high-priority memories from a Family", its handler returns memory rows, and neither it nor `memory_smart_load` (which forwards to it) mutates the tool registry or the resolved `Profile`. An NHI following (b) or (c) got memory rows instead of the tool it wanted. The old (d) was not a path either — `-32601` is the OUTCOME of calling an unloaded tool, not a way to reach it. Profile selection at MCP boot is the only real path, and the phrasing now says so while still naming both loaders for what they are.
 
 Substitution variables:
 
@@ -40,15 +42,21 @@ Substitution variables:
 | `{label}` | profile name (`core`/`graph`/`admin`/`power`/`full`) or comma-joined family list for custom profiles | `core` |
 | `{unloaded}` | `total − visible` | `43` |
 
-The four recovery paths (a–d) appear verbatim in the canonical phrasing **regardless of the active profile** — so an LLM exposed only to `--profile full` still learns the recovery vocabulary for environments where it isn't.
+Both clauses (a) and (b) appear verbatim in the canonical phrasing **regardless of the active profile** — so an LLM exposed only to `--profile full` still learns the vocabulary for environments where tools are unloaded, and still learns that the two family loaders are memory loaders.
 
 ### Worked examples
 
+The `{visible}` / `{total}` figures below are the v0.7.0-era numbers this
+page was written against; the live values are derived from
+`Family::tool_names()` (`{total}` = `Profile::full().expected_tool_count()`
+minus the always-on bootstrap) and are asserted SSOT-derived, never as
+literals, in `tests/capabilities_v3.rs`.
+
 | Profile | Opening |
 |---|---|
-| `core` | `8 of 51 tools are advertised in tools/list under the current profile (core). The other 43 …` |
-| `graph` | `19 of 51 tools are advertised in tools/list under the current profile (graph). The other 32 …` |
-| `full` | `51 of 51 tools are advertised in tools/list under the current profile (full). The other 0 …` |
+| `core` | `7 of 51 memory tools are advertised in tools/list under the current profile (core). The other 44 …` |
+| `graph` | `19 of 51 memory tools are advertised in tools/list under the current profile (graph). The other 32 …` |
+| `full` | `51 of 51 memory tools are advertised in tools/list under the current profile (full). The other 0 …` |
 
 ---
 
