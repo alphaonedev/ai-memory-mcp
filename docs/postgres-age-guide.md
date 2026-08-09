@@ -40,7 +40,7 @@ choice. Switch to postgres+AGE when one or more of these is true:
   sqlite-over-NFS is not.
 
 The two backends have **schema parity at v78**
-(`CURRENT_SCHEMA_VERSION = 78` on both ladders — the postgres upgrade
+(`CURRENT_SCHEMA_VERSION = 88` on both ladders — the postgres upgrade
 ladder ends at `migrate_v78()`) — every feature that works on sqlite
 works on postgres.
 
@@ -196,7 +196,7 @@ What it does (see `src/cli/schema_init.rs`):
    `migrate` verb uses — the open itself runs `INIT_SCHEMA` (the
    bundled `src/store/postgres_schema.sql`, idempotent `CREATE TABLE
    IF NOT EXISTS` throughout) plus the in-process upgrade ladder up to
-   schema v78 (the current `CURRENT_SCHEMA_VERSION`) as a side effect. The
+   schema v88 (the current `CURRENT_SCHEMA_VERSION`) as a side effect. The
    `vector` (pgvector) extension is
    **required** — `CREATE EXTENSION IF NOT EXISTS vector` failing
    aborts the bootstrap.
@@ -218,7 +218,7 @@ What it does (see `src/cli/schema_init.rs`):
    true` in the JSON report).
 4. Enumerates the resulting catalog and prints the human summary
    (tables / indices / views / functions / extensions /
-   `schema_version: 78`) or the `--json` report.
+   `schema_version: 88`) or the `--json` report.
 
 Idempotent on rerun — safe to invoke from a deploy script. Exit code
 0 on success, non-zero on connection / bootstrap failure.
@@ -480,7 +480,7 @@ identically on sqlite and postgres:
 | `GET` | `/api/v1/memories` | `MemoryStore::list` |
 | `GET` | `/api/v1/search` | `MemoryStore::search` |
 | `POST` | `/api/v1/links` | `MemoryStore::link_signed` |
-| `GET` | `/api/v1/memories/:id/links` | `MemoryStore::list_links` |
+| `GET` | `/api/v1/memories/{id}` (links are returned inline) | `MemoryStore::list_links` |
 | `GET` | `/api/v1/capabilities` | reports `storage_backend` |
 | `GET` | `/api/v1/health` | (no storage I/O) |
 

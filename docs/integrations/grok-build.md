@@ -309,7 +309,7 @@ flowchart TB
 | `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` (required by default since v0.9.0, #1751) | Unsigned writes are blocked (`403 ATTESTATION_FAILED`) by default — set `=0` to opt out and restore the permissive `claimed` posture | Already on by default; run `ai-memory identity generate` + agent registration so signed writes succeed instead of being rejected |
 | `AI_MEMORY_REQUIRE_OWNED_ROWS=1` | MCP boot refusal on owner lockout | Strict multi-agent hosts with `AI_MEMORY_AGENT_ID` set |
 | `[memory] enabled = true` in Grok | Second memory system | Only if you want Grok native memory **in addition** to ai-memory |
-| `--profile core` | Drops 92 power/graph tools | Low-token or read-mostly workflows |
+| `--profile core` | Drops 95 of the 103 advertised entries | Low-token or read-mostly workflows |
 
 ---
 
@@ -344,7 +344,7 @@ printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_n
 
 ```text
 ai-memory: loaded config from ~/.config/ai-memory/config.toml
-ai-memory: profile = 8 families ... expected tool count = 101
+ai-memory: profile = 8 families ... expected tool count = 103
 ai-memory MCP server started (stdio, tier=autonomous)
 ```
 

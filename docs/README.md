@@ -5,14 +5,14 @@ layout: doc
 
 <div align="center">
 
-## 🎯 Current release · **v0.9.0** (`secure-default hardening`) · ≥92% line coverage (ratchet pinned in [`.coverage-baseline`](../.coverage-baseline))
+## 🎯 Current release · **v1.0.0** (`defaults stop lying`; `Cargo.toml` version stamp — the tag is not cut yet, so the newest PUBLISHED tag is **v0.9.0** `secure-default hardening`) · ≥92% line coverage (ratchet pinned in [`.coverage-baseline`](../.coverage-baseline))
 
 [![Release](https://img.shields.io/badge/release-v0.9.0-brightgreen?logo=github)](https://github.com/alphaonedev/ai-memory-mcp/releases/tag/v0.9.0)
 [![crates.io](https://img.shields.io/crates/v/ai-memory)](https://crates.io/crates/ai-memory)
 
 **v0.6.3** cleared the a2a-gate certification bar (three consecutive full-testbook green runs across three agent frameworks and three transport modes — **324 passing scenarios**, zero partial greens); **v0.7.0** layers on the attested-cortex epic (Ed25519 attestation, 25-event hook pipeline, postgres+AGE first-class backend, schema v57). Full release notes: [`v0.7.0/release-notes.md`](v0.7.0/release-notes.html).
 
-**📦 [Release v0.9.0](https://github.com/alphaonedev/ai-memory-mcp/releases/tag/v0.9.0)** ·
+**📦 [Latest published release — v0.9.0](https://github.com/alphaonedev/ai-memory-mcp/releases/tag/v0.9.0)** ·
 **🧪 [Evidence Hub (campaigns)](evidence/)** ·
 **📊 [Frozen Claims](evidence.html)**
 
