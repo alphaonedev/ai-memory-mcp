@@ -8516,9 +8516,12 @@ impl PostgresStore {
 
     /// Cypher (Apache AGE) implementation of `kg_timeline`.
     ///
-    /// Wraps a `MATCH (a)-[r:related_to]->(b)` traversal in the
+    /// Wraps a `MATCH (a)-[r]->(b)` traversal in the
     /// `cypher('memory_graph', ...)` set-returning function, ordered
     /// by `r.valid_from ASC` and tie-broken by `r.created_at ASC` to
+    /// return link events for ALL `MemoryLinkRelation` variants at parity
+    /// with the CTE (untyped, #2792 sibling — the pre-fix `-[r:related_to]->`
+    /// silently omitted every non-`related_to` event); to
     /// match the SQLite implementation. The since/until filters are
     /// applied through Cypher's `WHERE` predicate; the start id is
     /// passed as an AGE `$vars` JSON parameter so the user-supplied
@@ -8575,8 +8578,19 @@ impl PostgresStore {
         }
         let where_sql = where_clauses.join(" AND ");
 
+        // #2792 sibling — UNTYPED pattern (`-[r]->`), NOT the pre-fix
+        // `-[r:related_to]->`. The SQLite CTE twin (`db::kg_timeline`) reads
+        // `memory_links` with NO relation filter, so it returns link events
+        // for ALL nine `MemoryLinkRelation` variants; the hardcoded
+        // `related_to` LABEL silently omitted every `supersedes` /
+        // `contradicts` / … event from the AGE timeline. AGE's parser rejects
+        // a relationship-type ALTERNATION, and each row already projects
+        // `r.relation`, so untyped + the fail-closed per-row membership guard
+        // in the decode loop below holds parity with the CTE. The existing
+        // `r.valid_from IS NOT NULL` predicate additionally scopes to
+        // memory-link edges (`project_link_into_age` always SETs it).
         let cypher = format!(
-            "MATCH (a)-[r:related_to]->(b) \
+            "MATCH (a)-[r]->(b) \
              WHERE {where_sql} \
              RETURN b.id AS target_id, \
                     r.relation AS relation, \
@@ -8645,9 +8659,20 @@ impl PostgresStore {
             let valid_until_raw = age_cell_text_opt(r, field_names::VALID_UNTIL, READ_VALID_UNTIL)?;
             let observed_by_raw = age_cell_text_opt(r, field_names::OBSERVED_BY, READ_OBSERVED_BY)?;
 
+            let relation = strip_agtype_quotes(&relation_raw).to_string();
+            // #2792 sibling — fail-CLOSED membership guard: the untyped
+            // `-[r]->` pattern above matches EVERY edge type in `memory_graph`,
+            // so drop any event whose relation is not one of the nine
+            // CHECK-constrained `MemoryLinkRelation` variants the CTE twin
+            // could return (a stray projection edge must never surface a
+            // timeline event the relational store would not).
+            if crate::models::MemoryLinkRelation::from_str(&relation).is_none() {
+                continue;
+            }
+
             decoded.push(KgTimelineRow {
                 target_id: strip_agtype_quotes(&target_id_raw).to_string(),
-                relation: strip_agtype_quotes(&relation_raw).to_string(),
+                relation,
                 valid_from: strip_agtype_quotes(&valid_from_raw).to_string(),
                 // SQL NULL (absent property) and the agtype scalar `null`
                 // both collapse to `None` — the wire shape the CTE twin
@@ -8816,9 +8841,11 @@ impl PostgresStore {
     ///
     /// Routes on the [`KgBackend`] resolved at [`Self::connect`] time
     /// (J1 substrate). When AGE is installed the supersession runs as
-    /// a Cypher `MATCH (a)-[r:related_to]->(b) ... SET r.valid_until`
-    /// over the `memory_graph` projection; otherwise we fall back to a
-    /// plain `UPDATE memory_links` that mirrors the SQLite shape in
+    /// a Cypher `MATCH (a)-[r]->(b) … WHERE r.relation = $rel … SET
+    /// r.valid_until` over the `memory_graph` projection (untyped +
+    /// bound-param relation filter so EVERY relation is invalidated, #2793);
+    /// otherwise we fall back to a plain `UPDATE memory_links` that mirrors
+    /// the SQLite shape in
     /// `db::invalidate_link`.
     ///
     /// Both branches return rows in the same [`KgInvalidateRow`] shape
@@ -8892,9 +8919,12 @@ impl PostgresStore {
 
     /// Cypher (Apache AGE) implementation of `kg_invalidate`.
     ///
-    /// Wraps a `MATCH (a)-[r:related_to]->(b) ... SET r.valid_until`
-    /// over the `memory_graph` projection in the
-    /// `cypher('memory_graph', ...)` set-returning function. Parameter
+    /// Wraps a `MATCH (a)-[r]->(b) … WHERE r.relation = $rel … SET
+    /// r.valid_until` over the `memory_graph` projection in the
+    /// `cypher('memory_graph', ...)` set-returning function. The pattern is
+    /// UNTYPED with the relation scoped by the bound `r.relation = $rel`
+    /// filter (#2793) so the AGE edge is stamped for every relation the #2792
+    /// `kg_query` traverses, not only `related_to`. Parameter
     /// passing uses AGE's `$vars` syntax through a JSON-encoded second
     /// argument so the source/target ids and the timestamp are bound
     /// — never interpolated — into the Cypher body.
@@ -8949,7 +8979,22 @@ impl PostgresStore {
         // Step 1: capture the prior `valid_until` so the wire-shape
         // can surface it. We bind the ids + relation through AGE's
         // `$vars` JSON so user input is never interpolated.
-        let read_cypher = "MATCH (a)-[r:related_to]->(b) \
+        //
+        // #2793 — the relationship pattern is UNTYPED (`-[r]->`), NOT the
+        // pre-fix `-[r:related_to]->`. The edge is scoped to the exact
+        // relation by the BOUND-param property filter `r.relation = $rel`
+        // (`project_link_into_age` writes `{relation: $rel}` on every edge),
+        // so no relation is interpolated into the Cypher. Pre-fix the
+        // hardcoded `related_to` LABEL missed EVERY non-`related_to` edge, so
+        // this read returned zero rows and the whole invalidation fell through
+        // to `kg_invalidate_cte` — which stamps the RELATIONAL row only,
+        // leaving the AGE edge's `valid_until` unset. Now that #2792 makes the
+        // current-view `kg_query` traverse all nine relations, that left an
+        // invalidated `supersedes` / `contradicts` / … edge STILL VISIBLE in
+        // the AGE current view (a WRONG result). Untyped + property-filter
+        // stamps the correct edge for every relation (verified live on AGE
+        // 1.6.0).
+        let read_cypher = "MATCH (a)-[r]->(b) \
              WHERE a.id = $src AND b.id = $dst AND r.relation = $rel \
              RETURN r.valid_until AS prior";
         // #2511 — bare `agtype`-typed `$1` Param, not an inlined
@@ -9010,7 +9055,11 @@ impl PostgresStore {
         // this is 1, but we don't assume — duplicate edges would show
         // up here and the dispatcher's contract is the same either
         // way (the prior value already came from row[0]).
-        let write_cypher = "MATCH (a)-[r:related_to]->(b) \
+        // #2793 — UNTYPED pattern (see the read_cypher note above): the
+        // relation is scoped by the bound `r.relation = $rel` filter, never
+        // interpolated, so this SET stamps the AGE edge for EVERY relation the
+        // #2792 `kg_query` now traverses, not only `related_to`.
+        let write_cypher = "MATCH (a)-[r]->(b) \
              WHERE a.id = $src AND b.id = $dst AND r.relation = $rel \
              SET r.valid_until = $now \
              RETURN count(r) AS affected";
@@ -28060,9 +28109,29 @@ mod tests {
              from relationships(p), not via last(): {cypher}"
         );
         // The bounded depth is interpolated, not parameterised.
+        //
+        // #2792 — the relationship pattern is now UNTYPED (`-[r*1..N]->`),
+        // NOT the pre-#2792 single-type `-[r:related_to*1..N]->`, so the AGE
+        // traversal walks ALL nine `MemoryLinkRelation` variants at parity
+        // with the SQLite CTE instead of only `related_to`. AGE's parser
+        // rejects a relationship-type ALTERNATION, so the CTE-equivalent
+        // relation set is held Rust-side by `age_edge_is_memory_link_relation`
+        // (a per-edge membership guard, applied in `kg_query_cypher` right
+        // beside the #1689 `age_path_edges_all_current` invalidation guard —
+        // which this change does NOT touch, so the invalidated-edge exclusion
+        // this test's name pins is unchanged and still runtime-verified by
+        // `age_cte_equivalence` + `kg_query_relation_parity_2792`).
         assert!(
-            cypher.contains(&format!("related_to*1..{depth}")),
-            "depth not interpolated: {cypher}"
+            cypher.contains(&format!("r*1..{depth}")),
+            "depth not interpolated into the untyped pattern: {cypher}"
+        );
+        // #2792 — the pattern must NOT re-introduce a single relationship
+        // type, or the AGE branch would silently under-report every
+        // non-`related_to` edge again.
+        assert!(
+            !cypher.contains(":related_to"),
+            "kg_query current-view Cypher must be UNTYPED so it walks every \
+             MemoryLinkRelation, not only related_to (#2792): {cypher}"
         );
         // The start id stays a bound `$vars` param, never interpolated.
         assert!(

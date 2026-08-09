@@ -241,4 +241,115 @@ mod pg {
             MemoryLinkRelation::COUNT
         );
     }
+
+    /// #2792 + #1689 — the untyped `-[r*1..N]->` pattern must STILL exclude
+    /// INVALIDATED edges from the current-view traversal, for the
+    /// newly-traversed non-`related_to` relations too. The invalidation guard
+    /// is the Rust-side `age_path_edges_all_current` (`kg_query_cypher`),
+    /// which the #2792 pattern change does NOT touch — this pins that the two
+    /// guards compose: a `supersedes` edge is traversed (the #2792 fix) yet
+    /// dropped once invalidated (the #1689 contract), and re-appears only
+    /// under `include_invalidated=true`.
+    #[tokio::test]
+    async fn pg_kg_query_excludes_invalidated_supersedes_edge_2792() {
+        let Some(url) = pg_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL/AGE_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect pg");
+        let ctx = admin_ctx();
+        let ns = uniq("kg2792inv");
+        let src = uniq("src");
+        let tgt = uniq("dst");
+        store
+            .store(&ctx, &pg_mem(&src, &ns))
+            .await
+            .expect("store src");
+        store
+            .store(&ctx, &pg_mem(&tgt, &ns))
+            .await
+            .expect("store tgt");
+        store
+            .link(&ctx, &pg_link(&src, &tgt, "supersedes"))
+            .await
+            .expect("link");
+
+        // Current-view BEFORE invalidation: the supersedes edge is traversed.
+        let before = MemoryStore::kg_query(&store, &src, 3, false)
+            .await
+            .expect("kg_query before");
+        assert!(
+            before.iter().any(|r| r.target_id == tgt),
+            "#2792: supersedes edge must be traversed before invalidation; got {before:?}"
+        );
+
+        // Invalidate the edge (SET valid_until = now on the AGE edge + row).
+        let res = store
+            .invalidate_link(&src, &tgt, "supersedes", None)
+            .await
+            .expect("invalidate_link");
+        assert!(res.found, "invalidate_link must find the supersedes edge");
+
+        // Current-view AFTER invalidation: the edge MUST be excluded (#1689).
+        let after = MemoryStore::kg_query(&store, &src, 3, false)
+            .await
+            .expect("kg_query after");
+        assert!(
+            after.iter().all(|r| r.target_id != tgt),
+            "#1689: invalidated supersedes edge must be EXCLUDED from the \
+             current-view AGE traversal (the untyped #2792 pattern must not \
+             walk invalidated edges); got {after:?}"
+        );
+
+        // include_invalidated=true lifts the filter — the edge is visible again.
+        let history = MemoryStore::kg_query(&store, &src, 3, true)
+            .await
+            .expect("kg_query history");
+        assert!(
+            history.iter().any(|r| r.target_id == tgt),
+            "include_invalidated=true must surface the invalidated edge; got {history:?}"
+        );
+    }
+
+    /// #2792 sibling — `kg_timeline` on the AGE backend must return link
+    /// events for ALL relations, not only `related_to`. `kg_timeline_cypher`
+    /// hardcoded the same `-[r:related_to]->` pattern the #2792 `kg_query`
+    /// carried, so an AGE-backed `memory_kg_timeline` silently omitted every
+    /// `supersedes` / `contradicts` / … event that the SQLite CTE returns.
+    #[tokio::test]
+    async fn pg_kg_timeline_returns_non_related_to_events_2792sibling() {
+        let Some(url) = pg_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL/AGE_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect pg");
+        let ctx = admin_ctx();
+        let ns = uniq("kg2792tl");
+        let src = uniq("src");
+        let tgt = uniq("dst");
+        store
+            .store(&ctx, &pg_mem(&src, &ns))
+            .await
+            .expect("store src");
+        store
+            .store(&ctx, &pg_mem(&tgt, &ns))
+            .await
+            .expect("store tgt");
+        store
+            .link(&ctx, &pg_link(&src, &tgt, "supersedes"))
+            .await
+            .expect("link");
+
+        let events = store
+            .kg_timeline(&src, None, None, None)
+            .await
+            .expect("kg_timeline");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.target_id == tgt && e.relation == "supersedes"),
+            "#2792 sibling: kg_timeline must surface the supersedes event on AGE \
+             (pre-fix the -[r:related_to]-> pattern omitted it); got {events:?}"
+        );
+    }
 }
