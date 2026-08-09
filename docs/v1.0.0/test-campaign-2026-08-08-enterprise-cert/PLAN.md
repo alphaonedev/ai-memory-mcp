@@ -188,11 +188,18 @@ stood between "CI is green" and "enterprise-certified":
   a complete re-architecture: the obsolete v0.28.1 `--provider` / `--base-url` /
   `--model` CLI flags do NOT exist in 1.1.0 (it is config-driven —
   `ironclaw onboard` + `models set-provider` + `config set` secrets). The
-  DO agent cloud-init `ExecStart` invocation line is therefore left AS-IS for now;
-  the correct 1.1.0 Reborn-runtime invocation replaces the obsolete flags and is
-  being validated separately, wired in a follow-up commit. This is an
-  operator-provided dependency (an authorized, public test-driver artifact), NOT a
-  shirked task.
+  correct 1.1.0 Reborn-runtime invocation is now WIRED into the DO agent
+  cloud-init (`infra/do-hive/cloud-init-agent.yaml.tpl`): the template writes a
+  reborn home (`config.toml` selection layer with `[llm.default]` pointing at
+  Grok 4.5, secrets referenced by ENV NAME only), runs a non-interactive
+  `ironclaw onboard --no-service` to provision the providers catalog + WebChat
+  bearer token, and the systemd unit's `ExecStart` is
+  `/opt/ironclaw/bin/ironclaw serve --host 127.0.0.1 --port 3000`. Validated
+  against the real 1.1.0 binary using the Track B rerun recipe
+  (`.local-runs/cert-campaign/trackb/`, 2026-08-09): same reborn-home layout,
+  same `IRONCLAW_REBORN_HOME` drive, same sibling-workspace working directory
+  the runtime requires. This is an operator-provided dependency (an authorized,
+  public test-driver artifact), NOT a shirked task.
 
 ---
 
