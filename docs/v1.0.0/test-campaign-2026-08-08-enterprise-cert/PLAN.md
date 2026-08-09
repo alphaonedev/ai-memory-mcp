@@ -54,6 +54,42 @@ against the LOCKED config above.
 | **F** | USL capacity, crypto-ON | DO N-node hive under the encrypted+attested config (`infra/do-hive/`) | Capacity measured on the certified config (encryption + attestation ON) — NOT the earlier invalidated plaintext/attestation-off run. Reported against the defined unit + measured cells (per the operator's 500-1000-agent-cluster / 500-agent-block certification scope). |
 | **E2E** | End-to-end | The full chain: IronClaw(Grok 4.5) → encrypted API → ai-memory daemon → PG16/AGE/pgvector, federated, attested | A store→recall→reflect→consolidate→federate round-trip completes with encryption + attestation ON at every hop and the durable memory TEXT intact on both nodes. |
 
+### 2.0 Certification boundary — the PostgreSQL-supported surface (NOT the SQLite superset)
+
+The PG16 + AGE + pgvector certification is scoped to the **real
+Postgres-supported HTTP surface, not the full SQLite surface.** Of the
+**80 unique production URL paths**, exactly **59 are pg-supported and 21
+are fully fail-closed 501** — the partition is frozen by
+`tests/pg_supported_route_inventory_gate_2799.rs` (Phase-1 anti-regression
+gate, 5-agent vote `4d3ea1c5`). Track C's "sqlite↔postgres SAL parity"
+assertion means parity **across the 59 pg-supported paths + the shared SAL
+trait**, and the cert claim MUST read that way:
+
+> **Certified: PG16 + AGE 1.6.0 + pgvector serves the 59 pg-supported HTTP
+> paths (core CRUD, recall, search, links, KG including all 9 relations,
+> archive, federation sync, coordination and governance ENFORCEMENT
+> writes), plus the Phase-1-fixed surfaces (`kg_query` / `kg_invalidate` /
+> `kg_timeline`, the `kg_backend` capabilities field, verbose-recall
+> `latest_link_attest_level`, and `verify-audit-trail --store-url`).**
+
+**Explicitly OUTSIDE the cert boundary (SQLite-only / v1.x-deferred — a
+certified pg deployment must NOT rely on these):**
+
+- **MCP-stdio** — structurally SQLite-only (#1675). A pg deployment serves
+  MCP clients through the HTTP daemon, not `ai-memory mcp`.
+- **The 21 fully-501 HTTP paths** — the 8 `/api/v1/skill/*` routes; the
+  bare `/api/v1/find_paths` alias; `/api/v1/share`; and the 11 `memory_*`
+  parity routes (`atomise`, `smart_load`, `export_reflection`, `replay`,
+  `subscription_replay`, `subscription_dlq_list`, `calibrate_confidence`,
+  `dependents_of_invalidated`, `verify`, and the governance-INSPECTION
+  `rule_list` + `check_agent_action` — enforcement works on pg, only the
+  read/list API 501s). Tracked for v1.x under the Postgres surface-parity
+  EPIC ([#2803](https://github.com/alphaonedev/ai-memory-mcp/issues/2803)).
+
+A track that exercises a path in the 21-fully-501 set and asserts it
+"works on Postgres" is a cert-scope violation, not a GREEN — the honest
+certified surface is the 59, and the 21 are disclosed, not hidden.
+
 ### 2.1 Track E — the 3 encryption legs (exact pos/neg assertions)
 
 Grounded in `infra/do-hive/crypto/` (read its `README.md` for the per-leg serve

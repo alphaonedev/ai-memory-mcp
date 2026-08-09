@@ -619,12 +619,48 @@ pass-through.
 
 ### What still returns 501 on postgres
 
-After Wave-3 Continuation 3, **no standard HTTP endpoint** returns
-501 on a postgres-backed daemon. Every endpoint listed in the
-router (**92 production `.route(...)` registrations in `src/lib.rs`
-— 78 unique URL paths**, surfaced through
-`/api/v1/capabilities`) dispatches through the SAL trait or is handled
-directly by the postgres adapter.
+Of the **80 unique production URL paths** (over **94 `.route(...)`
+registrations in `src/lib.rs`**, surfaced through
+`/api/v1/capabilities`), **59 are served on a postgres-backed daemon
+and 21 are fully fail-closed** — every HTTP method on those 21 paths
+returns a uniform `501 NOT IMPLEMENTED`. The gate FAILS CLOSED by
+design: an un-migrated handler can never fall through to the empty
+in-memory scratch SQLite database that `bootstrap_serve` opens against
+`--db`, so the worst case on Postgres is a loud 501, never a silent
+read/write against the wrong database (data-integrity North Star:
+degrade, never corrupt). This inventory is pinned against regression by
+`tests/pg_supported_route_inventory_gate_2799.rs`, which freezes the
+exact 59-supported / 21-fully-501 partition and fails CI if the router
+and the `postgres_endpoint_supported()` allow-list ever drift.
+
+**The 21 fully-501 paths (honest v1.0 gaps — do NOT expect these to
+work on Postgres; closing them is tracked under the v1.x Postgres
+surface-parity EPIC [#2803](https://github.com/alphaonedev/ai-memory-mcp/issues/2803)):**
+
+- **Agent Skills surface** — `/api/v1/skill/*` (8 paths): postgres ships
+  no skills table (`migrate_v82` is a version-stamp no-op). *(v1.x:
+  postgres skills storage.)*
+- **`/api/v1/find_paths`** — the bare legacy alias. Use the supported
+  `/api/v1/kg/find_paths` instead.
+- **`/api/v1/share`** — the pg source-read `CallerContext` is a T3
+  authorization posture choice deferred to a vote. *(v1.x.)*
+- **`memory_*` MCP-parity routes with no pg SAL method / app.db binding**
+  (11 paths): `memory_atomise`, `memory_smart_load`,
+  `memory_export_reflection`, `memory_replay`,
+  `memory_subscription_replay`, `memory_subscription_dlq_list`,
+  `memory_calibrate_confidence`, `memory_dependents_of_invalidated`,
+  and `memory_verify` (compact link-verify is `app.db`-bound;
+  `/api/v1/links/verify` **is** the pg-supported link-verify surface).
+  `memory_rule_list` + `memory_check_agent_action` 501 only the
+  governance **INSPECTION / read** API because postgres ships no
+  `governance_rules` table — governance **enforcement** itself works on
+  Postgres. *(v1.x: pg SAL methods + governance_rules table.)*
+
+Conversely, several surfaces that once 501'd on Postgres are now
+supported: `kg_query` / `kg_invalidate` / `kg_timeline` traverse all 9
+relations, `/api/v1/capabilities` reports the `kg_backend` field,
+verbose recall carries `latest_link_attest_level`, and
+`verify-audit-trail --store-url` verifies the postgres audit chain.
 
 The route gate retains its 501 envelope as a safety net for:
 
