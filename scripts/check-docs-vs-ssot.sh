@@ -150,6 +150,13 @@ DOC_FILES=(
     docs/integrations/README.md
     docs/integrations/claude-code.md
     docs/v1.0.0/release-notes.md
+    # #2796 — the committed NHI dogfood playbook opens with an explicit
+    # "v1.0.0 SSOT values used below" block (schema, tool counts, Memory
+    # fields, link relations, route/CLI counts, HookEvent variants) that a
+    # tester reads as the pass/fail bar. It was not walked, so its
+    # `--profile core` count drifted unnoticed. It is a CURRENT-release
+    # doc, not a frozen snapshot, so it belongs in the gate.
+    docs/v1.0.0/nhi-playbook-P0-P11.md
 )
 
 # Operator-facing HTML surfaces (rendered compliance pages). Markdown is
@@ -653,11 +660,23 @@ run_all_rules() {
         "MemoryLinkRelation::COUNT" \
         "$CANONICAL_LINK_COUNT" \
         '\*\*([0-9]+) variants at v0\.7\.0\*\* \(was four at v0\.6\.x\)'
-    # HookEvent count
+    # HookEvent count.
+    #
+    # #2780: the pre-existing two alternatives only knew the phrase "hook
+    # lifecycle events". docs/compliance/nsa-csi-mcp-security-mapping.md
+    # says "**27** `HookEvent` variants ... that tests/curator/
+    # compaction_test.rs pins" — a live compliance claim that named the
+    # exact SSOT test it contradicted, invisible to this gate for the two
+    # releases (#2637 27 → 26, #2758 26 → 22) it was wrong across. The two
+    # added alternatives are the `HookEvent`-symbol phrasings; they stay
+    # BOLD-anchored so the ROADMAP §11.3.1 frozen v0.7.1 baseline's
+    # legitimate historical "25 hook lifecycle events at v0.7.1" prose is
+    # untouched (same reasoning as the CURRENT_SCHEMA_VERSION bold-only
+    # rule in check_generalised_numeric_claims).
     check_narrative_count_rule \
         "HookEvent variants" \
         "$CANONICAL_HOOK_EVENTS" \
-        '\*\*([0-9]+) hook lifecycle events\*\*|([0-9]+) lifecycle events\) — A programmable'
+        '\*\*([0-9]+) hook lifecycle events\*\*|([0-9]+) lifecycle events\) — A programmable|\*\*([0-9]+)\*\* `HookEvent` variants|`HookEvent` SSOT \(\*\*([0-9]+)\*\* variants'
     # Routes count
     check_narrative_count_rule \
         "EXPECTED_PRODUCTION_ROUTES_COUNT" \
