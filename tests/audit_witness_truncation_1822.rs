@@ -742,6 +742,20 @@ mod postgres_parity {
         let Some(pg) = live_pg().await else {
             return;
         };
+        // #2843 test-isolation: the lan-parity Pass-2 suite serializes every
+        // live-pg test binary against the SHARED `ai_memory_test` DB. Sibling
+        // #1831 G17 M-of-N recovery tests seed `agent_lineage` rows for
+        // `ai:rec-*` agents with no matching signed_events witness, so a stale
+        // residue makes `verify_audit_trail` correctly return
+        // `lineage: Forged` — which is NOT what this head-hash test exercises.
+        // Clear the lineage table so the clean-chain precondition is
+        // order-independent (agent_lineage is NOT part of the signed_events
+        // hash chain, so this never perturbs the head-hash / truncation /
+        // chain-intact axes under test). Fresh-DB runs start empty → no-op.
+        sqlx::query("DELETE FROM agent_lineage")
+            .execute(pg.pool())
+            .await
+            .ok();
         let fdir = fresh_dir("pg-hh-forensic");
         // Live forensic sink so `maybe_record_audit_watermark` writes and
         // `last_audit_watermark` reads (process-global; torn down at the end).
@@ -785,7 +799,24 @@ mod postgres_parity {
             "a CLEAN pg chain must read NotDetected — the #2203 anchor/recompute precision \
              skew (nanos vs micros) is fixed; report={report:?}"
         );
-        assert!(report.is_clean(), "clean pg chain; report={report:?}");
+        // #2843: assert on the axes THIS test exercises (head-hash clean +
+        // no truncation + intact chain + no sequence gaps) rather than a
+        // blanket `is_clean()`. The lineage/role_separation/rollback axes are
+        // seeded by unrelated concerns on the shared parity DB and are not what
+        // `pg_head_hash_clean_chain` is testing (#1822/#2202/#2203).
+        assert_eq!(
+            report.truncation,
+            TruncationCheck::NotDetected,
+            "a CLEAN pg chain must read no truncation; report={report:?}"
+        );
+        assert!(
+            report.chain_intact,
+            "a CLEAN pg chain must stay intact; report={report:?}"
+        );
+        assert!(
+            report.sequence_gaps.is_empty(),
+            "a CLEAN pg chain must have no sequence gaps; report={report:?}"
+        );
 
         // SAME-LENGTH rewrite of the anchored (head) row → the at-anchored-seq
         // recompute differs from the anchor → Mismatch (#2202 on pg).
