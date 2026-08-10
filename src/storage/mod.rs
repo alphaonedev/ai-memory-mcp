@@ -8483,6 +8483,31 @@ pub fn consolidate(
     }
 }
 
+/// #2860 (federation data-integrity, 5-agent vote `4d3ea1c5`) — replace a
+/// single row's `metadata` JSON in place. Used ONLY by the federated-
+/// consolidate finalize (`handlers::consolidate_federation`) to additively
+/// stamp the substrate `write_signature` + `attest_level=agent_attested` +
+/// `consolidator_tenant`/`summary_source` provenance onto a freshly-minted
+/// consolidated row so the STORED origin row byte-matches the broadcast copy
+/// (a catch-up re-send of a row missing the signature would otherwise flip a
+/// peer's `agent_attested` row back to `claimed` — and re-quarantine it under
+/// `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`). Deliberately does NOT touch
+/// `updated_at` / `version`: the caller stamps the SAME metadata onto the
+/// broadcast object, so the federation LWW timestamp stays the mint instant on
+/// every replica. The `write_signature` commits to the 6-field `SignableWrite`
+/// envelope only (never `metadata`), so replacing `metadata` here cannot
+/// invalidate it.
+///
+/// # Errors
+/// Propagates the `rusqlite` UPDATE error.
+pub fn set_row_metadata(conn: &Connection, id: &str, metadata_json: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE memories SET metadata = ?1 WHERE id = ?2",
+        params![metadata_json, id],
+    )?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Reflection (v0.7.0 recursive-learning Task 4/8, issue #655).
 // ---------------------------------------------------------------------------

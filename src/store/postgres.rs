@@ -21785,6 +21785,29 @@ impl MemoryStore for PostgresStore {
         Ok(new_id)
     }
 
+    /// #2860 (federation data-integrity, 5-agent vote `4d3ea1c5`) — postgres
+    /// twin of `db::set_row_metadata` / `SqliteStore::set_row_metadata`.
+    /// Replace one row's `metadata` jsonb in place (no `updated_at`/`version`
+    /// bump) so the federated-consolidate finalize can stamp the substrate
+    /// `write_signature` + provenance onto the freshly-minted row identically
+    /// on both backends. `metadata` is `jsonb NOT NULL` with a
+    /// `jsonb_typeof = 'object'` CHECK, so the input is cast `$1::jsonb`.
+    async fn set_row_metadata(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        metadata_json: &str,
+    ) -> StoreResult<()> {
+        self.gate_record_stop()?;
+        sqlx::query("UPDATE memories SET metadata = $1::jsonb WHERE id = $2")
+            .bind(metadata_json)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("set_row_metadata", e))?;
+        Ok(())
+    }
+
     async fn reflect(
         &self,
         ctx: &CallerContext,

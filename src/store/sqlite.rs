@@ -1173,6 +1173,17 @@ impl MemoryStore for SqliteStore {
         .map_err(box_err)
     }
 
+    async fn set_row_metadata(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        metadata_json: &str,
+    ) -> StoreResult<()> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        db::set_row_metadata(&conn, id, metadata_json).map_err(box_err)
+    }
+
     async fn reflect(
         &self,
         ctx: &CallerContext,

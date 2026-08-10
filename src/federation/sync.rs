@@ -1203,10 +1203,24 @@ pub async fn broadcast_link_quorum(
     Ok(tracker)
 }
 
-/// v0.6.2 (#326): fan out a consolidation in a single `sync_push` — the new
-/// consolidated memory + the source ids being deleted. Mirrors the local
-/// semantics of `db::consolidate` (insert new + delete sources) so peers
-/// end up in the same terminal state as the originator.
+/// v0.6.2 (#326): fan out a consolidation in a single `sync_push` so peers
+/// reach the SAME terminal state as the originator. Mirrors the local
+/// disposition of `db::consolidate`:
+///
+/// - **`deletions`** — the legacy hard-DELETE disposition: source ids the peer
+///   must reap (populated only when `consolidate_tombstone_sources` is OFF).
+/// - **`tombstoned_sources`** — #2860: the RETAINED, `lifecycle_state`-flipped
+///   source rows under the v1.0.0-default TOMBSTONE disposition. Riding the
+///   normal `memories[]` lane, they converge via the receiver's LWW
+///   `insert_if_newer`/`merge_inbound` (the `SignableWrite` envelope excludes
+///   `lifecycle_state` + `content` is unchanged, so each source's original
+///   `write_signature` still verifies). Peers thus RETAIN + tombstone the
+///   sources instead of hard-deleting them — closing the divergence where the
+///   origin tombstoned while the `deletions[]` lane made peers hard-delete.
+/// - **`derived_edges`** — #2860: the navigable `C -> source` `derived_from`
+///   lineage edges, riding the existing `links[]` lane so the lineage DAG
+///   converges (the `deletions[]` legacy path emits none — cascade would reap
+///   them; `metadata.derived_from` carries provenance there instead).
 ///
 /// # Errors
 ///
@@ -1214,16 +1228,26 @@ pub async fn broadcast_link_quorum(
 pub async fn broadcast_consolidate_quorum(
     config: &FederationConfig,
     new_mem: &Memory,
-    source_ids: &[String],
+    deletions: &[String],
+    tombstoned_sources: &[Memory],
+    derived_edges: &[MemoryLink],
 ) -> Result<AckTracker, QuorumError> {
     let now = Instant::now();
     let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
     tracker.lock().await.record_local();
 
+    // #2860 — the consolidated row FIRST, then any tombstoned source rows, so a
+    // strict-write-sig peer applies the (self-relayed, agent-attested)
+    // consolidation and converges the sources' tombstone state in one push.
+    let mut memories: Vec<&Memory> = Vec::with_capacity(1 + tombstoned_sources.len());
+    memories.push(new_mem);
+    memories.extend(tombstoned_sources.iter());
+
     let body = serde_json::json!({
         (field_names::SENDER_AGENT_ID): config.sender_agent_id,
-        "memories": [new_mem],
-        "deletions": source_ids,
+        "memories": memories,
+        "deletions": deletions,
+        "links": derived_edges,
         "dry_run": false,
     });
 

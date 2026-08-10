@@ -225,11 +225,14 @@ async fn fetch_consolidate_source_pairs(
     Ok(out)
 }
 
-/// #1552 / #326 — shared federation fanout for the consolidate write path,
-/// called by both the postgres SAL branch and the sqlite branch of
-/// [`consolidate_memories`]. Broadcasts the merged memory + the source-id
-/// deletions to the W-quorum so peers converge `metadata.consolidated_from_agents`
-/// + the deleted sources synchronously instead of waiting on async catch-up.
+/// #1552 / #326 / #2860 — shared federation fanout for the consolidate write
+/// path, called by both the postgres SAL branch and the sqlite branch of
+/// [`consolidate_memories`]. Broadcasts the substrate-authored merged memory to
+/// the W-quorum plus its source disposition — either the legacy `deletions`
+/// (hard-DELETE) list OR the RETAINED `tombstoned_sources` rows + navigable
+/// `derived_edges` (`derived_from`) under the v1.0.0-default tombstone
+/// disposition (#2860) — so peers converge the consolidation, the source state,
+/// AND the lineage DAG synchronously instead of waiting on async catch-up.
 ///
 /// Returns `Some(response)` when the quorum is NOT met (a typed 503 the caller
 /// must return verbatim), or `None` on success / when federation is disabled
@@ -237,25 +240,41 @@ async fn fetch_consolidate_source_pairs(
 async fn consolidate_fanout(
     fed: Option<&crate::federation::FederationConfig>,
     mem: &crate::models::Memory,
-    source_ids: &[String],
+    deletions: &[String],
+    tombstoned_sources: &[crate::models::Memory],
+    derived_edges: &[crate::models::MemoryLink],
 ) -> Option<axum::response::Response> {
     let fed = fed?;
-    match crate::federation::broadcast_consolidate_quorum(fed, mem, source_ids).await {
+    match crate::federation::broadcast_consolidate_quorum(
+        fed,
+        mem,
+        deletions,
+        tombstoned_sources,
+        derived_edges,
+    )
+    .await
+    {
         Ok(tracker) => {
             if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                // #2856 (federation data-integrity, 5-agent vote `4d3ea1c5`,
-                // Option A) — a consolidation is a substrate-derived write the
-                // origin daemon cannot sign as the tenant consolidator, so a
-                // strict-write-sig peer refuses it and the quorum misses. Return
-                // the id-bearing under-replication 202 (was the bare
-                // `under_replicated_response`, which omitted the created `id`)
-                // so the caller can DISCOVER + reconcile the local-only row
-                // instead of seeing a success-shaped 2xx with nothing to act on.
+                // #2856/#2861 loud floor + #2860 convergence composed. #2860
+                // authors the consolidation as the daemon federation identity so
+                // the quorum normally SUCCEEDS (self-relay past strict write-sig)
+                // and this miss path is now the RESIDUAL peer-down / partition
+                // case. When it does miss, keep #2861's id-bearing under-
+                // replication 202 (`under_replicated_consolidate_response`, was
+                // the bare `under_replicated_response` that omitted the created
+                // `id`) so the caller can DISCOVER + reconcile the local-only row
+                // instead of seeing a success-shaped 2xx with nothing to act on
+                // (5-agent vote `4d3ea1c5`). Exactly one of `deletions` /
+                // `tombstoned_sources` is populated (legacy hard-delete vs the
+                // v1.0.0-default tombstone disposition), so their sum is the
+                // original consolidated-source count the 202 body reports.
                 let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
+                let source_count = deletions.len() + tombstoned_sources.len();
                 return Some(super::under_replicated_consolidate_response(
                     &payload,
                     mem,
-                    source_ids.len(),
+                    source_count,
                 ));
             }
         }
@@ -404,6 +423,15 @@ pub async fn consolidate_memories(
         {
             return store_err_to_response(e);
         }
+        // #2860 (5-agent vote `4d3ea1c5`) — federated path: author the
+        // substrate-DERIVED row as the daemon's federation identity so it
+        // self-relays past strict write-sig (postgres twin of the sqlite
+        // branch's `author_id`). The `for_agent` ctx (source-read visibility /
+        // IDOR) is UNCHANGED — only the recorded author moves.
+        let pg_author_id = match app.federation.as_ref().as_ref() {
+            Some(f) => f.sender_agent_id.clone(),
+            None => consolidator_agent_id.clone(),
+        };
         let new_id = match app
             .store
             .consolidate(
@@ -414,26 +442,52 @@ pub async fn consolidate_memories(
                 &body.namespace,
                 &tier,
                 crate::db::CONSOLIDATION_SOURCE,
-                &consolidator_agent_id,
+                &pg_author_id,
             )
             .await
         {
             Ok(new_id) => new_id,
             Err(e) => return store_err_to_response(e),
         };
-        // #1552 — federation fanout parity (shared `consolidate_fanout` helper,
-        // covered by the sqlite-branch fanout test). The SAL-ported postgres
-        // branch previously returned here WITHOUT broadcasting, so on a
-        // postgres-backed federated hive a consolidation only reached
-        // cross-region peers via async catch-up (`/sync/since`) rather than the
-        // synchronous W-quorum. Read the merged row back through the trait, then
-        // broadcast it + the source-id deletions; a quorum miss surfaces a typed
-        // 503 exactly like the regular create path. A read-back failure logs +
-        // falls through to the success envelope (catch-up reconciles peers).
+        // #1552 / #2860 — federation fanout parity (shared `consolidate_fanout`
+        // helper). The SAL-ported postgres branch previously returned here
+        // WITHOUT broadcasting; now it reads the substrate-authored row back
+        // through the trait, FINALIZES it (best-effort daemon `write_signature`
+        // + tenant/summary provenance, persisted via `set_row_metadata` so the
+        // stored row byte-matches the broadcast copy), and broadcasts it + its
+        // source disposition + `derived_from` lineage — the postgres twin of the
+        // sqlite branch below. A read-back failure logs + falls through to the
+        // success envelope (catch-up reconciles peers).
         if app.federation.is_some() {
-            if let Ok(mem) = app.store.get(&ctx, &new_id).await {
-                if let Some(resp) =
-                    consolidate_fanout(app.federation.as_ref().as_ref(), &mem, &source_ids).await
+            // #2860 — the consolidated row is now owned by `pg_author_id` (the
+            // substrate sender), so read it back AS the author: the `for_agent`
+            // tenant `ctx` would visibility-filter the sender-owned row to
+            // NotFound and silently skip the fanout. The source reads below stay
+            // on the tenant `ctx` (the tenant owns the sources).
+            let author_ctx = crate::store::CallerContext::for_agent(&pg_author_id);
+            if let Ok(mut mem) = app.store.get(&author_ctx, &new_id).await {
+                // Shared, unit-tested finalize+disposition (SAL twin of the sqlite
+                // branch's `sqlite_finalize_and_disposition`). Source reads stay on
+                // the tenant `ctx` (the tenant owns the sources); `set_row_metadata`
+                // is by-id and ctx-agnostic.
+                let disp = crate::handlers::consolidate_federation::store_finalize_and_disposition(
+                    app.store.as_ref(),
+                    &ctx,
+                    &mut mem,
+                    &source_ids,
+                    &pg_author_id,
+                    &consolidator_agent_id,
+                    body.summary.as_deref(),
+                )
+                .await;
+                if let Some(resp) = consolidate_fanout(
+                    app.federation.as_ref().as_ref(),
+                    &mem,
+                    &disp.deletions,
+                    &disp.tombstoned_sources,
+                    &disp.derived_edges,
+                )
+                .await
                 {
                     return resp;
                 }
@@ -509,9 +563,29 @@ pub async fn consolidate_memories(
             };
         }
     }
-    // #2121 — tenant HTTP surface: never substrate-authored (parity with the
-    // postgres branch above, whose `for_agent` ctx has
-    // `bypass_visibility = false`).
+    // #2121 / #2860 — a NON-federated tenant HTTP consolidate stays tenant-
+    // authored + never substrate-authored (byte-identical single-node
+    // behaviour). On the FEDERATED path (#2860, 5-agent vote `4d3ea1c5`,
+    // decision memory `8b428944`) the substrate-DERIVED row is authored as the
+    // daemon's federation identity (`fed.sender_agent_id`) — the substrate that
+    // ran the derivation and HOLDS the signing key — so it SELF-RELAYS past the
+    // strict per-write attestation gate (`require = strict && attribute !=
+    // sender` is false) and can land `agent_attested` where the daemon key is
+    // enrolled. Quota is still charged to the INVOKING tenant above; the tenant
+    // is retained as provenance by the federated finalize below. This mirrors
+    // the already-converging curator `ConsolidationPass` (author = `AI_CURATOR`
+    // substrate sentinel). `substrate_authored` stays `false` for cross-backend
+    // parity: the postgres SAL `consolidate` derives it from
+    // `ctx.bypass_visibility` (`false` for the `for_agent` tenant ctx we must
+    // NOT relax — it gates the source-read visibility / IDOR), so the sqlite
+    // path mirrors that, and the `AI_MEMORY_REQUIRE_WHY_TRACE=1` gate applies
+    // IDENTICALLY on both backends (a why_trace-less federated consolidation is
+    // refused on both, never stamped-and-passed on one).
+    let fed_enabled = app.federation.is_some();
+    let author_id = match app.federation.as_ref().as_ref() {
+        Some(f) => f.sender_agent_id.clone(),
+        None => consolidator_agent_id.clone(),
+    };
     let consolidate_result = db::consolidate(
         &lock.0,
         &body.ids,
@@ -520,7 +594,7 @@ pub async fn consolidate_memories(
         &body.namespace,
         &tier,
         crate::db::CONSOLIDATION_SOURCE,
-        &consolidator_agent_id,
+        &author_id,
         false,
     );
     // #1788 — refund the quota charge if the consolidate write failed (mirrors
@@ -536,9 +610,10 @@ pub async fn consolidate_memories(
         }
     }
     // Read the newly consolidated memory back so we can fanout — must do
-    // this inside the same lock window because db::consolidate deletes
-    // the source rows as part of its transaction.
-    let new_mem = match &consolidate_result {
+    // this inside the same lock window because db::consolidate deletes (or,
+    // under the tombstone disposition, retains) the source rows as part of
+    // its transaction.
+    let mut new_mem = match &consolidate_result {
         Ok(new_id) => db::get(&lock.0, new_id).ok().flatten(),
         Err(_) => None,
     };
@@ -561,17 +636,51 @@ pub async fn consolidate_memories(
             details,
         );
     }
+    // #2860 — on the FEDERATED path, finalize the substrate-authored row
+    // (best-effort daemon `write_signature` + tenant/summary provenance) and
+    // prepare the lineage disposition to broadcast, all while the lock is held
+    // so the tombstoned source rows + `derived_from` edges are read consistently.
+    // The finalize+disposition logic is the shared, unit-tested helper (its
+    // postgres twin `store_finalize_and_disposition` runs the identical body
+    // through the SAL trait, so the two backends cannot drift).
+    let disposition = if fed_enabled {
+        new_mem.as_mut().map(|mem| {
+            crate::handlers::consolidate_federation::sqlite_finalize_and_disposition(
+                &lock.0,
+                mem,
+                &source_ids,
+                &author_id,
+                &consolidator_agent_id,
+                body.summary.as_deref(),
+            )
+        })
+    } else {
+        None
+    };
     // Drop DB lock before fanning out — peers POST back to our sync_push
     // and we'd deadlock on the shared Mutex if we held it.
     drop(lock);
     match consolidate_result {
         Ok(new_id) => {
-            // v0.6.2 (#326) / #1552: propagate consolidation to peers so
-            // `metadata.consolidated_from_agents` and the deleted sources
-            // are in sync across the mesh (shared `consolidate_fanout` helper).
+            // v0.6.2 (#326) / #1552 / #2860: propagate the consolidation + its
+            // source disposition + `derived_from` lineage to peers so the mesh
+            // reaches the same terminal state (shared `consolidate_fanout`).
             if let Some(mem) = new_mem {
-                if let Some(resp) =
-                    consolidate_fanout(app.federation.as_ref().as_ref(), &mem, &source_ids).await
+                let disp = disposition.unwrap_or_else(|| {
+                    crate::handlers::consolidate_federation::FanoutDisposition {
+                        deletions: source_ids.clone(),
+                        tombstoned_sources: Vec::new(),
+                        derived_edges: Vec::new(),
+                    }
+                });
+                if let Some(resp) = consolidate_fanout(
+                    app.federation.as_ref().as_ref(),
+                    &mem,
+                    &disp.deletions,
+                    &disp.tombstoned_sources,
+                    &disp.derived_edges,
+                )
+                .await
                 {
                     return resp;
                 }
