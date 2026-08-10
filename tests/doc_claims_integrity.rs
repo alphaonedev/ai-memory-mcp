@@ -511,6 +511,11 @@ fn claims_gates_are_wired_into_ci_with_self_tests_2629() {
         "scripts/check-doc-symbol-anchors.sh",
         "scripts/check-sdk-route-paths.sh",
         "scripts/check-ci-job-claims.sh",
+        // #2839 — the COMPLETENESS gate (the accuracy gates above pin
+        // whether a cited value/symbol is RIGHT; this pins whether anything
+        // is MISSING). Same wiring contract: invoked + --self-test in
+        // c8-precheck.yml so it cannot silently stop detecting.
+        "scripts/check-doc-surface-completeness.sh",
     ] {
         let path = root.join(script);
         assert!(path.exists(), "claims gate missing from the tree: {script}");
