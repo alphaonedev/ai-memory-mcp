@@ -9928,6 +9928,121 @@ async fn http_consolidate_fans_out_to_peer_1552() {
 }
 
 #[tokio::test]
+async fn http_consolidate_under_replicated_returns_created_id_2856() {
+    // #2856 (federation data-integrity, 5-agent vote `4d3ea1c5`, Option A) —
+    // a consolidation is a substrate-derived write the origin daemon cannot
+    // sign as the tenant consolidator, so a strict-write-sig peer refuses it
+    // (returns 2xx but `skipped:1`) and the W=2 quorum MISSES. The origin must
+    // then fail LOUD, NOT return a success-shaped 2xx that hides what diverged:
+    // the `202` under-replication body MUST carry the created memory `id` (+
+    // `quorum_met:false` / `durability:"local"`) so the caller can DISCOVER +
+    // reconcile the local-only row. Pre-#2856 the bare under-replication body
+    // omitted the `id` — the North-Star "success-shaped while silently
+    // diverging" defect. The local write stays durable (202, not 5xx: W3/G12).
+    use std::sync::atomic::Ordering;
+    let state = test_state();
+    let now = Utc::now().to_rfc3339();
+    let (id_a, id_b) = {
+        let lock = state.lock().await;
+        let mk = |title: &str| Memory {
+            cid: None,
+            valid_from: None,
+            valid_until: None,
+            id: Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: "merge-fed-skip-ns".into(),
+            title: title.into(),
+            content: format!("body for {title}"),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".into(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: serde_json::json!({"agent_id": "consolidator"}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
+        };
+        let a = db::insert(&lock.0, &mk("fed-skip-draft-a")).unwrap();
+        let b = db::insert(&lock.0, &mk("fed-skip-draft-b")).unwrap();
+        (a, b)
+    };
+    // The peer returns 2xx but SKIPS the item (the strict-write-sig refusal) →
+    // NON-ack → W=2 quorum miss.
+    let (peer_url, count) = h8d_spawn_mock_peer(H8dPeerBehaviour::Skip).await;
+    let app_state = h8d_app_state_with_fed(state.clone(), vec![peer_url], 2, 1500);
+    let app = Router::new()
+        .route("/api/v1/consolidate", axum_post(consolidate_memories))
+        .with_state(app_state);
+    let body = serde_json::json!({
+        "ids": [id_a, id_b],
+        "title": "fed-skip-merged-result",
+        "summary": "a merge that a strict peer refuses to replicate",
+        "namespace": "merge-fed-skip-ns",
+        "tier": Tier::Long.as_str()
+    });
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/consolidate")
+                .method("POST")
+                .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+                .header("x-agent-id", "consolidator")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Durable-but-under-replicated: 202, never a 5xx (W3/G12), never a bare
+    // success that hides the divergence.
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "a refused-by-peer consolidation must surface as 202 under-replicated"
+    );
+    assert!(
+        count.load(Ordering::Relaxed) >= 1,
+        "consolidate must have attempted the fanout to the refusing peer"
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    // North-Star: the response is LOUD (quorum not met) AND RECONCILABLE (the
+    // created id is returned so the caller can find the local-only row).
+    assert_eq!(v["quorum_met"], serde_json::json!(false), "body={v}");
+    assert_eq!(v["durability"], serde_json::json!("local"), "body={v}");
+    let created_id = v["id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            panic!("consolidate 202 must return the created memory id (#2856); body={v}")
+        });
+    // The returned id must resolve to the durably-committed local row.
+    {
+        let lock = state.lock().await;
+        let got = db::get(&lock.0, created_id).unwrap();
+        assert!(
+            got.is_some(),
+            "the returned consolidate id must be a durable local row (#2856)"
+        );
+    }
+}
+
+#[tokio::test]
 async fn http_reflect_fans_out_to_peer_1552() {
     // #1552 — the reflect write path must broadcast the new reflection memory
     // (and its `reflects_on` edges) to the federation quorum (shared
@@ -10513,6 +10628,15 @@ async fn h8d_spawn_mock_peer(
                 StatusCode::OK,
                 Json(json!({"applied": 1, "noop": 0, "skipped": 0})),
             ),
+            // #2856 — a receiver that returns 2xx but reports the item
+            // SKIPPED (refused/not applied), exactly what a strict-write-sig
+            // peer does to an unsigned consolidated relay. `post_and_classify`
+            // classifies `skipped > 0` as a NON-ack, so the origin's quorum
+            // misses.
+            H8dPeerBehaviour::Skip => (
+                StatusCode::OK,
+                Json(json!({"applied": 0, "noop": 0, "skipped": 1})),
+            ),
             H8dPeerBehaviour::Fail500 => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "stub failure"})),
@@ -10549,6 +10673,10 @@ async fn h8d_spawn_mock_peer(
 enum H8dPeerBehaviour {
     /// Always returns 200 OK with the standard ack envelope.
     Ack,
+    /// #2856 — returns 200 OK but reports the item `skipped` (refused /
+    /// not applied), the exact strict-write-sig receiver disposition for
+    /// an unsigned consolidated relay. Counts as a NON-ack at the origin.
+    Skip,
     /// Always returns 500 Internal Server Error.
     Fail500,
     /// Always returns 503 Service Unavailable.
