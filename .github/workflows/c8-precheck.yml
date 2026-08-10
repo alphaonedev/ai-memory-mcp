@@ -264,6 +264,43 @@ jobs:
         # fails CLOSED.
         run: bash scripts/check-ci-job-claims.sh --self-test
 
+  doc-surface-completeness-gate:
+    # Issue #2839 / 3x7 lane-2 register §E. Gates 4 (docs-vs-SSOT) and 9
+    # (doc-symbol-anchors) both pin whether a CITED value/symbol is RIGHT
+    # — an ACCURACY axis. NEITHER answers "is anything MISSING?" — a
+    # COMPLETENESS axis. #2831 found, by three trivial diffs, that a
+    # reference doc can be a full release behind while every accuracy gate
+    # is GREEN: Command variants absent from CLI_REFERENCE.md (which
+    # asserts it "is kept in sync"), routes.rs consts absent from
+    # API_REFERENCE.md, and the DESTRUCTIVE #2024 memory_skill_* pair
+    # absent from agent-skills.md. Same #2492 overclaim bias, one axis
+    # over. Three set-differences against consts the repo already exports
+    # (no new SSOT): every Command variant is documented (kebab-cased),
+    # every routes.rs path is documented (param-normalised), every
+    # registry tool is named in a live non-frozen doc. Burn-down
+    # allowlist where a STALE entry ALSO FAILS; an EMPTY scan set fails
+    # CLOSED. Dependency-free (grep/python3 over src/), matching the
+    # toolchain-free posture of the other c8-precheck gates.
+    name: Doc surface completeness gate (#2839)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run doc-surface-completeness gate
+        run: bash scripts/check-doc-surface-completeness.sh
+      - name: Self-test the gate (regression evidence)
+        # Plants one real omission per rule (an undocumented subcommand,
+        # an undocumented route, an undocumented tool) in a throwaway copy
+        # under .local-runs/, with near-miss controls that must PASS (a
+        # subcommand documented ONLY inside a code fence; a route
+        # documented with `:id` not `{id}`; a #[command(hide)] variant that
+        # is exempt) and the frozen-exclusion control (a tool named ONLY in
+        # a frozen docs/v0.*/ file, which must NOT count as coverage). Both
+        # allowlist directions are exercised, an injected engine fault must
+        # fail CLOSED, and an empty scan set must fail CLOSED rather than
+        # green a no-op.
+        run: bash scripts/check-doc-surface-completeness.sh --self-test
+
   cloud-init-ascii-gate:
     # v0.9.0 (issue #1880): a stray non-ASCII byte (U+2014 em-dash) in a
     # DO cloud-init template made cloud-init reject the config

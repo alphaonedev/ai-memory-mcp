@@ -1,0 +1,7 @@
+# Burn-down allowlist for scripts/check-doc-surface-completeness.sh (#2839).
+# Format: <RULE> <token> #<issue>   where RULE = CLI | ROUTE | TOOL
+#   CLI   token = kebab subcommand   e.g.  CLI reown #1234
+#   ROUTE token = normalised path    e.g.  ROUTE /api/v1/foo/{} #1234
+#   TOOL  token = tool name          e.g.  TOOL memory_foo #1234
+# A STALE entry (suppresses nothing) FAILS — this is a burn-down ledger,
+# not a pending-fix hold. A MALFORMED entry HARD-FAILS. Passing state = EMPTY.

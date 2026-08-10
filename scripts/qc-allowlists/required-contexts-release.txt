@@ -195,6 +195,16 @@ Doc symbol/path anchor gate (#2629)
 SDK-path vs routes.rs membership gate (#2629)
 Named-CI-job existence + enforcement-truthfulness gate (#2629)
 #
+# #2839 — reference-doc COMPLETENESS gate (the accuracy gates above pin
+# whether a cited value/symbol is RIGHT; this one pins whether anything is
+# MISSING). Declared REQUIRED per gate 7 rule (f): a new c8-precheck
+# integrity gate must be declared here (or in the not-required ledger) or
+# rule (f) flags it as required-by-nothing — the #2636 class. Mirror-first:
+# this declaration lands before the companion branch-protection API call
+# (KNOWN GAP below), so the gate can prove the context sound before it is
+# enforced.
+Doc surface completeness gate (#2839)
+#
 # ---------------------------------------------------------------------------
 # KNOWN GAPS — declared here so they are not mistaken for oversights.
 # Closing any of them is a branch-protection edit, deliberately NOT done in
