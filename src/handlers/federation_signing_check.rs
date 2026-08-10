@@ -300,7 +300,14 @@ pub(super) async fn sync_push_via_store(
         // honored (attribute == claimed). The enrolled-key lookup resolves
         // through the SAL `agent_pubkey` trait method so both backends match.
         let claim_bound_key = match original_claim.as_deref() {
-            Some(c) => app.store.agent_pubkey(c).await.ok().flatten(),
+            // #2865 — DB registry FIRST, enrolled key-dir as a MISS-ONLY
+            // fallback (postgres twin of the sqlite path), so a third-party
+            // author whose FEDERATION identity key is cross-enrolled in the
+            // key-dir (not DB-bound) is HONORED rather than re-attributed.
+            Some(c) => crate::handlers::federation_receive::resolve_author_bound_key(
+                app.store.agent_pubkey(c).await.ok().flatten(),
+                c,
+            ),
             None => None,
         };
         let claim_write_attested = original_claim.as_deref().is_some_and(|c| {
@@ -327,11 +334,18 @@ pub(super) async fn sync_push_via_store(
         let bound_pubkey = if Some(attribute_agent.as_str()) == original_claim.as_deref() {
             claim_bound_key.clone()
         } else {
-            app.store
-                .agent_pubkey(&attribute_agent)
-                .await
-                .ok()
-                .flatten()
+            // #2865 — same DB-first, enrolled-key-dir MISS-ONLY fallback as the
+            // claim key above (postgres twin), so a peer's cross-enrolled
+            // FEDERATION identity key verifies a propagated write_signature and
+            // reaches agent_attested out-of-box, backend-uniform with sqlite.
+            crate::handlers::federation_receive::resolve_author_bound_key(
+                app.store
+                    .agent_pubkey(&attribute_agent)
+                    .await
+                    .ok()
+                    .flatten(),
+                &attribute_agent,
+            )
         };
         if let Err(e) = apply_inbound_write_attestation(
             &mut to_insert,

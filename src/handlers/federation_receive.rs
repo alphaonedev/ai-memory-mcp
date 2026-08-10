@@ -615,6 +615,72 @@ pub(super) fn signal_author_authorized(
     true
 }
 
+/// #2865 — resolve the attributed author's bound Ed25519 public key (base64)
+/// for the `/sync/push` per-write CONTENT-attestation lane
+/// ([`apply_inbound_write_attestation`]): the DB `agent_pubkey` registry FIRST,
+/// then the on-disk ENROLLED key store ([`crate::identity::verify::lookup_peer_public_key`],
+/// the key-dir) as a MISS-ONLY fallback.
+///
+/// **Why the fallback (the #2865 gap).** A daemon authors a federated
+/// consolidation as its FEDERATION identity (e.g. `ai:hive-memory-1`,
+/// #2860/#2862). A normally-enrolled mesh cross-enrolls a peer's federation
+/// public key into the key-dir — the SAME source the PULL author lane
+/// ([`attest_inbound_pull_memory`]), the signal-author lane
+/// ([`signal_author_authorized`]), and the transition-author lane already
+/// trust — but does NOT bind it into the per-node DB `agent_pubkey` registry.
+/// Pre-#2865 the push lane resolved the author key from the DB registry ONLY,
+/// so the propagated `metadata.write_signature` could not be verified and the
+/// row landed `attest_level=claimed` — quarantined at peers under
+/// `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` (asi-hard). Consulting the key-dir
+/// as a fallback brings the push lane to parity with the pull lane and makes
+/// daemon-authored derived content converge at `agent_attested` OUT-OF-BOX,
+/// with no manual DB-bind step. 5-agent vote (`4d3ea1c5`), unanimous.
+///
+/// **Trust (why this is not a new grant).** The key-dir is
+/// operator/enrollment-controlled and is NOT writable over the wire — no
+/// `/sync/*` receive handler writes it — so reading it grants no new trust; it
+/// is the identical source three inbound author lanes already use. The fallback
+/// is MISS-ONLY (`registry_key.or_else(...)`): a key bound into the DB registry
+/// (e.g. the cert-round author via the admin `PUT /api/v1/agents/{id}/pubkey`
+/// route, or `ai-memory agents bind-key`) ALWAYS wins, so a stale/rotated
+/// key-dir entry can never shadow the authoritative registry key. And
+/// [`apply_inbound_write_attestation`] VERIFIES the presented signature against
+/// whichever key resolves — a wrong/absent key can only DEGRADE the row to
+/// `claimed`, never mis-attest it (a forged signature is rejected
+/// unconditionally). The key-dir [`ed25519_dalek::VerifyingKey`] is encoded
+/// URL-safe-no-pad exactly as the pull lane encodes it;
+/// [`crate::identity::keypair::decode_public_base64`] accepts both that and the
+/// STANDARD form the DB registry stores.
+#[must_use]
+pub fn resolve_author_bound_key(
+    registry_key: Option<String>,
+    attribute_agent: &str,
+) -> Option<String> {
+    use base64::Engine as _;
+    registry_key.or_else(|| {
+        crate::identity::verify::lookup_peer_public_key(attribute_agent)
+            .map(|vk| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vk.to_bytes()))
+    })
+}
+
+/// Test seam for [`resolve_author_bound_key`] taking an explicit key
+/// directory (mirrors the [`crate::identity::verify::lookup_peer_public_key`]
+/// / `lookup_peer_public_key_in` pairing) so a regression test can populate a
+/// tempdir key-dir without touching the operator's real key store or mutating
+/// `AI_MEMORY_KEY_DIR`.
+#[must_use]
+pub fn resolve_author_bound_key_in(
+    registry_key: Option<String>,
+    attribute_agent: &str,
+    key_dir: &std::path::Path,
+) -> Option<String> {
+    use base64::Engine as _;
+    registry_key.or_else(|| {
+        crate::identity::verify::lookup_peer_public_key_in(attribute_agent, key_dir)
+            .map(|vk| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vk.to_bytes()))
+    })
+}
+
 /// #1464 (v0.8.0) — per-write CONTENT attestation on the federation receive
 /// path. The ATTRIBUTION lane ([`resolve_inbound_attribution`]) resolves
 /// WHO a relayed memory is attributed to; this resolves WHETHER the relayed
@@ -741,7 +807,6 @@ pub(super) fn apply_inbound_write_attestation(
 /// must be skipped.
 #[must_use]
 pub(crate) fn attest_inbound_pull_memory(mem: &mut Memory) -> bool {
-    use base64::Engine;
     let Some(author) = mem
         .metadata
         .get(crate::META_KEY_AGENT_ID)
@@ -756,8 +821,12 @@ pub(crate) fn attest_inbound_pull_memory(mem: &mut Memory) -> bool {
     // #2340 — redact BEFORE verify/stamp so the attestation commits over the
     // persisted bytes (see fn docs).
     crate::federation::receive_auth::redact_inbound_before_attestation(mem);
-    let author_bound_key = crate::identity::verify::lookup_peer_public_key(&author)
-        .map(|vk| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vk.to_bytes()));
+    // #2865 — single-source the author-key resolution through the shared
+    // helper. The pull lane has no DB-registry source (it is backend-uniform by
+    // design), so it passes `None` and the helper resolves the enrolled key-dir
+    // key exactly as before (byte-identical) — the same resolver the push lane
+    // now falls back to.
+    let author_bound_key = resolve_author_bound_key(None, &author);
     match apply_inbound_write_attestation(
         mem,
         &author,
@@ -1996,9 +2065,13 @@ pub async fn sync_push(
         // write_signature) is HONORED rather than re-attributed to the daemon
         // relay sender (the #2860 re-broadcast divergence). Reused below as the
         // attestation bound key when the claim is honored (attribute == claimed).
-        let claim_bound_key = original_claim
-            .as_deref()
-            .and_then(|c| db::agent_pubkey(&lock.0, c).ok().flatten());
+        let claim_bound_key = original_claim.as_deref().and_then(|c| {
+            // #2865 — DB registry FIRST, enrolled key-dir as a MISS-ONLY
+            // fallback, so a third-party author whose FEDERATION identity key
+            // is cross-enrolled in the key-dir (not DB-bound) is HONORED
+            // rather than re-attributed to the relay sender.
+            resolve_author_bound_key(db::agent_pubkey(&lock.0, c).ok().flatten(), c)
+        });
         let claim_write_attested = original_claim.as_deref().is_some_and(|c| {
             inbound_claim_is_write_attested(&to_insert, c, claim_bound_key.as_deref())
         });
@@ -2022,7 +2095,15 @@ pub async fn sync_push(
         let author_bound_key = if Some(attribute_agent.as_str()) == original_claim.as_deref() {
             claim_bound_key.clone()
         } else {
-            db::agent_pubkey(&lock.0, &attribute_agent).ok().flatten()
+            // #2865 — same DB-first, enrolled-key-dir MISS-ONLY fallback as the
+            // claim key above (the honored branch already carries it via
+            // `claim_bound_key`). Lets a peer's cross-enrolled FEDERATION
+            // identity key verify a propagated write_signature and reach
+            // agent_attested out-of-box, with no manual DB-bind step.
+            resolve_author_bound_key(
+                db::agent_pubkey(&lock.0, &attribute_agent).ok().flatten(),
+                &attribute_agent,
+            )
         };
         if let Err(e) = apply_inbound_write_attestation(
             &mut to_insert,

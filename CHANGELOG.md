@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed (federation data-integrity — CERT-BLOCKING)
 
+- **Daemon-authored federated consolidations converge at `agent_attested` at
+  peers OUT-OF-BOX for a normally-enrolled mesh — no manual DB-bind step**
+  ([#2865](https://github.com/alphaonedev/ai-memory-mcp/issues/2865); 5-agent
+  adversarial vote `4d3ea1c5`, UNANIMOUS). A consolidation authored as the
+  daemon's FEDERATION identity (e.g. `ai:hive-memory-1`, #2860/#2862) carries a
+  valid propagated `metadata.write_signature`, but the `/sync/push` receive lane
+  resolved the attributed author's verification key from the DB `agent_pubkey`
+  registry ONLY. `fed-bootstrap.sh` (and mesh enrollment generally) cross-enrolls
+  a peer's federation public key into the on-disk key store (the key-dir) — the
+  SAME source the PULL author lane (#2715), the signal-author lane, and the
+  transition-author lane already trust — but does NOT bind it into the per-node
+  DB registry, so the signature could not be verified and the row landed
+  `attest_level=claimed` (and was QUARANTINED at peers under
+  `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED=1` / `asi-hard`). The push lane's
+  author-key resolution now falls back to the enrolled key-dir
+  (`crate::identity::verify::lookup_peer_public_key`) as a MISS-ONLY layer after
+  the DB registry (`handlers::federation_receive::resolve_author_bound_key`),
+  bringing it to parity with the pull lane on BOTH backends and closing the gap
+  with no manual bind. **No weakening of attestation:** the key-dir is
+  operator/enrollment-controlled and not writable over the wire; the fallback is
+  miss-only so a DB-bound key always wins; and the presented signature is still
+  VERIFIED against whichever key resolves, so a forged/absent key can only
+  DEGRADE a row to `claimed`, never mis-attest it (a forged signature is rejected
+  unconditionally). Pinned by `tests/federation_writesig_keydir_fallback_2865.rs`.
 - **Re-broadcast tombstoned consolidation SOURCE rows no longer DIVERGE in
   `attest_level` across nodes** (#2863, residual of #2860 surfaced by the DO
   2-node re-verify; two 5-agent adversarial votes `4d3ea1c5`). A consolidation
