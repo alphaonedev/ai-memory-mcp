@@ -92,6 +92,88 @@ def test_memory_round_trips_metadata() -> None:
     assert m.tier is Tier.LONG
 
 
+def test_memory_back_compat_without_v070_fields() -> None:
+    """An OLDER daemon's response omits the v0.7.0+ columns entirely; the
+    model must still parse and default the missing typed fields to ``None``."""
+    payload = {
+        "id": "abc",
+        "tier": "mid",
+        "namespace": "global",
+        "title": "t",
+        "content": "c",
+        "created_at": "2026-04-19T00:00:00Z",
+        "updated_at": "2026-04-19T00:00:00Z",
+    }
+    m = Memory.model_validate(payload)
+    # #2834 — the added fields are optional-with-default so a legacy response
+    # round-trips cleanly.
+    assert m.version is None
+    assert m.lifecycle_state is None
+    assert m.memory_kind is None
+    assert m.cid is None
+    assert m.citations is None
+    assert m.valid_from is None
+    assert m.valid_until is None
+
+
+def test_memory_types_all_30_fields() -> None:
+    """#2834 — all 30 server-side ``Memory`` fields are typed and round-trip.
+
+    Typing completeness only: the v0.7.0+ fields already survived via
+    ``extra="allow"`` before they were declared; this asserts they now read
+    back through the typed attributes."""
+    payload = {
+        "id": "abc",
+        "tier": "long",
+        "namespace": "global",
+        "title": "t",
+        "content": "c",
+        "tags": ["x"],
+        "priority": 7,
+        "confidence": 0.8,
+        "source": "api",
+        "access_count": 3,
+        "created_at": "2026-04-19T00:00:00Z",
+        "updated_at": "2026-04-19T00:00:00Z",
+        "last_accessed_at": "2026-04-19T01:00:00Z",
+        "expires_at": "2026-04-26T00:00:00Z",
+        "metadata": {"agent_id": "alice"},
+        "reflection_depth": 2,
+        "memory_kind": "reflection",
+        "entity_id": "ent-1",
+        "persona_version": 4,
+        "citations": [{"uri": "doc:1", "accessed_at": "2026-04-19T00:00:00Z"}],
+        "source_uri": "doc:1",
+        "source_span": {"start": 0, "end": 10},
+        "confidence_source": "auto_derived",
+        "confidence_signals": {"source_age_days": 1.5},
+        "confidence_decayed_at": "2026-04-20T00:00:00Z",
+        "version": 3,
+        "lifecycle_state": "open",
+        "cid": "b3:deadbeef",
+        "valid_from": "2026-04-01T00:00:00Z",
+        "valid_until": "2026-05-01T00:00:00Z",
+    }
+    m = Memory.model_validate(payload)
+    assert m.reflection_depth == 2
+    assert m.memory_kind == "reflection"
+    assert m.entity_id == "ent-1"
+    assert m.persona_version == 4
+    assert m.citations == [{"uri": "doc:1", "accessed_at": "2026-04-19T00:00:00Z"}]
+    assert m.source_uri == "doc:1"
+    assert m.source_span == {"start": 0, "end": 10}
+    assert m.confidence_source == "auto_derived"
+    assert m.confidence_signals == {"source_age_days": 1.5}
+    assert m.confidence_decayed_at == "2026-04-20T00:00:00Z"
+    assert m.version == 3
+    assert m.lifecycle_state == "open"
+    assert m.cid == "b3:deadbeef"
+    assert m.valid_from == "2026-04-01T00:00:00Z"
+    assert m.valid_until == "2026-05-01T00:00:00Z"
+    # All 30 server-side fields are declared on the model.
+    assert len(Memory.model_fields) == 30
+
+
 def test_raise_for_status_maps_404() -> None:
     with pytest.raises(NotFoundError) as info:
         raise_for_status(404, {"error": "not found"})

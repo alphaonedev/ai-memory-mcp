@@ -598,6 +598,78 @@ operator does not override:
 The model defaults are intentionally aggressive — operators MUST
 verify the chosen model exists on their account before relying on it.
 
+## Optional vector-index backend — `vectorlite` (off-by-default)
+
+By default ai-memory serves approximate-nearest-neighbour recall from a
+**built-in pure-Rust HNSW index** (`src/hnsw.rs`) — no native dependency,
+no extra build step, works everywhere the binary works. For deployments
+that want a SQLite-native ANN backend, an **off-by-default cargo feature**
+`vectorlite` ([#1860](https://github.com/alphaonedev/ai-memory-mcp/issues/1860)
+/ [#2219](https://github.com/alphaonedev/ai-memory-mcp/issues/2219)) wires
+the [vectorlite](https://github.com/1yefuwang1/vectorlite) SQLite loadable
+extension in as an alternate index.
+
+It is opt-in in **three** independent steps — none of which a stock build
+performs — because the extension is a **native shared library** that ships
+outside the Rust dependency graph:
+
+1. **Compile the feature in.** `vectorlite = ["rusqlite/load_extension"]`
+   in `Cargo.toml` is OFF by default:
+
+   ```bash
+   cargo build --release --features vectorlite
+   ```
+
+   A stock (`--features`-less) build never reads the env var below and
+   never loads any extension. There is **no Rust `vectorlite` crate** — the
+   crates.io name of that spelling is unrelated to this project — so the
+   native library is acquired out-of-band, not via `cargo`.
+
+2. **Acquire the native library out-of-band.** The `.so` / `.dylib` /
+   `.dll` is fetched by the repo's helper script rather than a package
+   manager:
+
+   ```bash
+   scripts/fetch-vectorlite.sh /opt/ai-memory   # -> /opt/ai-memory/vectorlite.{so|dylib|dll}
+   ```
+
+   The helper downloads the correct per-platform artefact (from the
+   Apache-2.0 [vectorlite](https://github.com/1yefuwang1/vectorlite)
+   project — there is no Rust crate) and prints the
+   `export AI_MEMORY_VECTORLITE_EXTENSION=<path>` line to use. The filename
+   **MUST keep the `vectorlite` stem** — SQLite derives the
+   `sqlite3_vectorlite_init` entry-point name from the file stem, so a
+   renamed library will not load.
+
+3. **Point the runtime at it.** Set the path at daemon / MCP startup:
+
+   ```bash
+   export AI_MEMORY_VECTORLITE_EXTENSION=/opt/ai-memory/vectorlite.so
+   ```
+
+   (env-var row #145 in the CLAUDE.md environment-variable table.)
+
+**Fail-closed-to-pure-Rust-HNSW behaviour.** This is the data-integrity
+guarantee: when the feature is compiled AND the path is set, the
+vector-index funnel loads the extension as the ANN backend; but if the var
+is **unset / empty**, if the library **fails to load or fails its
+construction-time smoke test**, or if it **hard-fails mid-life**, the
+substrate silently **degrades to the built-in pure-Rust HNSW index**. The
+durable memory **text** is never at risk — an ANN index is derived,
+regenerable data (the North-Star "degrade, never corrupt; worst case is
+fewer results, never wrong results"). A misconfigured extension therefore
+never takes the substrate down; it only forgoes the acceleration.
+
+Sibling off-by-default cargo feature: `fs-notify`
+([#1978](https://github.com/alphaonedev/ai-memory-mcp/issues/1978) /
+[#2220](https://github.com/alphaonedev/ai-memory-mcp/issues/2220)) — the
+event-driven (`inotify` / FSEvents / ReadDirectoryChangesW) watch path for
+the L3 `ai-memory watch` capture daemon, which likewise degrades to the
+dependency-free std-only poll loop when absent or on init failure.
+
+Source: `src/vectorlite.rs::{VECTORLITE_EXTENSION_ENV,from_env}` +
+`src/hnsw.rs`.
+
 ## Related
 
 - [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) —

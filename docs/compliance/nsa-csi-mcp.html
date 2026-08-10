@@ -474,11 +474,11 @@ ai-memory serve</pre>
         <div class="meta"><span class="status ok">structurally addressed</span></div>
       </div>
       <p><strong>What the NSA warns:</strong> Automated tool execution without human-in-the-loop checkpoints can amplify damage from prompt injection or context contamination.</p>
-      <p><strong>How ai-memory addresses it:</strong> Track G 27-event programmable hook pipeline (each hook returns <code>Allow</code>, <code>Modify(delta)</code>, <code>Deny{reason, code}</code>, or <code>AskUser{prompt, options, default}</code>; chain ordering is priority-desc; first-Deny short-circuits); K10 pending-actions SSE stream at <code>/api/v1/approvals/stream</code>; <code>pending_actions</code> table with <code>memory_pending_approve</code> / <code>memory_pending_reject</code> MCP tools; HMAC-mandatory webhook dispatch under R3-S1.HMAC.</p>
+      <p><strong>How ai-memory addresses it:</strong> Track G 22-event programmable hook pipeline (each hook returns <code>Allow</code>, <code>Modify(delta)</code>, <code>Deny{reason, code}</code>, or <code>AskUser{prompt, options, default}</code>; chain ordering is priority-desc; first-Deny short-circuits); K10 pending-actions SSE stream at <code>/api/v1/approvals/stream</code>; <code>pending_actions</code> table with <code>memory_pending_approve</code> / <code>memory_pending_reject</code> MCP tools; HMAC-mandatory webhook dispatch under R3-S1.HMAC.</p>
       <div class="anchor-list">
         <strong>Code anchors:</strong>
         <ul>
-          <li>hooks::events::HookEvent (27 variants at v1.0.0)</li>
+          <li>hooks::events::HookEvent (22 variants at v1.0.0)</li>
           <li>handlers::routes::APPROVALS_STREAM + subscriptions::dispatch_approval_requested (pending-actions surface)</li>
           <li>subscriptions::dispatch_event_to_subs (HMAC fail-CLOSED dispatch refusal, R3-S1.HMAC)</li>
           <li>daemon_runtime::Command::Pending</li>
@@ -786,10 +786,10 @@ cargo test --lib profile::tests::profile_graph_loads_core_plus_graph
 cargo test --lib profile::tests::profile_admin_loads_core_lifecycle_governance
 cargo test --lib profile::tests::profile_power_loads_core_plus_power</pre>
 
-    <h3>4. Verify the HookEvent variant count (27 at v1.0.0)</h3>
+    <h3>4. Verify the HookEvent variant count (22 at v1.0.0)</h3>
 <pre class="codeblock">awk '/^pub enum HookEvent/,/^\}/' src/hooks/events.rs | grep -cE '^\s+[A-Z][a-zA-Z]+,'
-<span class="com"># Expected: 27   (was 25 at v0.7.0; PreCompaction / OnCompactionRollback /</span>
-<span class="com">#           PreSignalSend / PostSignalAck and siblings landed since)</span></pre>
+<span class="com"># Expected: 22   (was 25 at v0.7.0, peaked at 27; #2637 + #2758 removed 5 variants:</span>
+<span class="com">#           pre_archive / pre_recall / pre_search / pre_transcript_store / post_transcript_store)</span></pre>
 
     <h3>5. Verify the Memory struct field count (30 at v1.0.0)</h3>
 <pre class="codeblock">grep -n 'FIELD_COUNT' src/models/memory.rs

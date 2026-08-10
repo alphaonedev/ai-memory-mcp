@@ -226,11 +226,11 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
     <h1>Enterprise Reference Architecture: CPU + Memory + GPU Federated Nodes</h1>
     <p class="tagline">Local Ollama embeddings on GPU-equipped nodes for enterprise federated ai-memory deployments — with the when-to-choose-which guidance vs. the CPU-only API-embeddings shape.</p>
     <div class="pills" style="justify-content:flex-start">
-      <span class="pill">v0.9.0 GA</span>
+      <span class="pill">v1.0.0 GA</span>
       <span class="pill">local GPU embeddings</span>
       <span class="pill">nomic-embed-text · 768d</span>
       <span class="pill">W-of-N quorum · mTLS</span>
-      <span class="pill">schema v78</span>
+      <span class="pill">schema v88</span>
     </div>
   </div>
 </section>
@@ -324,7 +324,7 @@ capacity / cost / SLA planning is
         <text x="405" y="362" text-anchor="middle" class="svg-title" font-size="11" fill="#ffb86b" font-weight="700">SQLite (WAL + FTS5)</text>
         <text x="405" y="380" text-anchor="middle" class="svg-label" font-size="8.5">— or —</text>
         <text x="405" y="398" text-anchor="middle" class="svg-label" font-size="10" fill="#ffb86b">PostgreSQL + Apache AGE</text>
-        <text x="405" y="416" text-anchor="middle" class="svg-label" font-size="9">+ pgvector · schema v78</text>
+        <text x="405" y="416" text-anchor="middle" class="svg-label" font-size="9">+ pgvector · schema v88</text>
       </g>
 
       <!-- GPU embed loopback leg (green) -->
@@ -364,7 +364,7 @@ capacity / cost / SLA planning is
         <text x="965" y="362" text-anchor="middle" class="svg-title" font-size="11" fill="#ffb86b" font-weight="700">SQLite (WAL + FTS5)</text>
         <text x="965" y="380" text-anchor="middle" class="svg-label" font-size="8.5">— or —</text>
         <text x="965" y="398" text-anchor="middle" class="svg-label" font-size="10" fill="#ffb86b">PostgreSQL + Apache AGE</text>
-        <text x="965" y="416" text-anchor="middle" class="svg-label" font-size="9">+ pgvector · schema v78</text>
+        <text x="965" y="416" text-anchor="middle" class="svg-label" font-size="9">+ pgvector · schema v88</text>
       </g>
 
       <path class="flow gpu" d="M822 252 C844 240 846 216 860 210" aria-hidden="true"/>
@@ -397,12 +397,12 @@ capacity / cost / SLA planning is
   <span class="item"><span class="dot" style="background:#ffd700"></span>Batman maximum-secure</span>
 </div>
 <div class="stats" style="margin-top:1.5rem">
-  <div class="stat"><div class="n">v78</div><div class="l">DB schema</div></div>
-  <div class="stat"><div class="n">101 / 7</div><div class="l">MCP tools (full / core)</div></div>
-  <div class="stat"><div class="n">87 / 89</div><div class="l">CLI subcommands (default / sal)</div></div>
-  <div class="stat"><div class="n">92 / 78</div><div class="l">HTTP routes / paths</div></div>
+  <div class="stat"><div class="n">v88</div><div class="l">DB schema</div></div>
+  <div class="stat"><div class="n">103 / 7</div><div class="l">MCP tools (full / core)</div></div>
+  <div class="stat"><div class="n">90 / 92</div><div class="l">CLI subcommands (default / sal)</div></div>
+  <div class="stat"><div class="n">94 / 80</div><div class="l">HTTP routes / paths</div></div>
   <div class="stat"><div class="n">9</div><div class="l">Link relations</div></div>
-  <div class="stat"><div class="n">28</div><div class="l">Memory fields</div></div>
+  <div class="stat"><div class="n">30</div><div class="l">Memory fields</div></div>
 </div>
 <p><strong>When to choose this.</strong> Your fleet nodes have GPUs (or you are
 sizing new nodes and embedding volume justifies them). You want the
@@ -451,7 +451,7 @@ verified <code>AI_MEMORY_*</code> override battery follow.</p>
     <h3>SQLite or Postgres + AGE</h3>
     <p>Single-node: SQLite WAL + FTS5. Shared fleet: PostgreSQL + Apache AGE +
     pgvector via <code>ai-memory serve --store-url postgres://…</code> (the SAL trait path).
-    <strong>Schema v78</strong> in lockstep across all peers.</p>
+    <strong>Schema v88</strong> in lockstep across all peers.</p>
   </div>
   <div class="card leg2">
     <span class="leg-tag">Federation &amp; security</span>
@@ -615,7 +615,7 @@ the serving tier.</p>
 <li><a href="enterprise-cpu-memory.html">CPU + Memory sibling architecture</a> —
   cloud + airgapped API-embedding shapes, sizing and security posture.</li>
 <li><a href="../whats-new-v08.html">What's New in v0.8.0</a> — distributed-coordination
-  GA (schema v78, 101/7 MCP tools, 9 link relations, 28 memory fields).</li>
+  GA (schema v88, 103/7 MCP tools, 9 link relations, 30 memory fields).</li>
 <li><a href="../v0.8.0/release-notes.html"><code>docs/v0.8.0/release-notes.md</code></a>
   — the v0.8.0 GA change inventory.</li>
 <li><a href="../RUNBOOK-ollama-kv-tuning.html"><code>docs/RUNBOOK-ollama-kv-tuning.md</code></a>

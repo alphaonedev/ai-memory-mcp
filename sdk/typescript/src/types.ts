@@ -34,14 +34,23 @@ export type Source =
 
 /**
  * A Memory row. Corresponds to `ai_memory::models::Memory`, which carries
- * **30 fields** at v1.0.0 (`Memory::FIELD_COUNT`). The 15 declared below are
- * the v0.6.x core; the other 15 (`cid`, `version`, `lifecycle_state`,
- * `memory_kind`, `kind_provenance`, `reflection_depth`, `entity_id`,
+ * **30 fields** at v1.0.0 (`Memory::FIELD_COUNT`, SSOT
+ * `src/models/memory.rs`) — and all 30 are now declared here (#2834). The
+ * first 15 are the v0.6.x core; the 15 declared after `metadata` are the
+ * v0.7.0+ additions (`reflection_depth`, `memory_kind`, `entity_id`,
  * `persona_version`, `citations`, `source_uri`, `source_span`,
  * `confidence_source`, `confidence_signals`, `confidence_decayed_at`,
- * `valid_from` / `valid_until`) are NOT declared here. TypeScript interfaces
- * are structural and do not strip at runtime, so they survive a round trip —
- * they are simply untyped. Declaring them is tracked separately.
+ * `version`, `lifecycle_state`, `cid`, `valid_from`, `valid_until`).
+ *
+ * This is a **typing-completeness** change, not a data-loss fix: TypeScript
+ * interfaces are structural and do not strip at runtime, so those 15 already
+ * survived a round trip — they were untyped, never lost. Declaring them gives
+ * callers static types for the full row. (`kind_provenance` is a schema-v79 DB
+ * column but is NOT a field on the Rust `struct Memory`, so it is deliberately
+ * not declared here.)
+ *
+ * Every added field is `?: T | null` so a response from an OLDER daemon that
+ * omits it still type-checks.
  *
  * NOTE: `metadata` is `serde_json::Value` server-side — we expose it as
  * `Record<string, unknown>` on the SDK side (server validates it must be
@@ -67,6 +76,39 @@ export interface Memory {
   last_accessed_at?: string | null;
   expires_at?: string | null;
   metadata: Record<string, unknown>;
+  // v0.7.0+ typed columns (#2834 typing completeness). Wire keys match the
+  // Rust serde field names verbatim (snake_case). All optional so an older
+  // daemon's response that omits any of them still type-checks.
+  /** Recursion depth in the reflection tree (0 for caller-minted rows). */
+  reflection_depth?: number | null;
+  /**
+   * snake_case memory-kind discriminator on the wire (e.g. `"observation"`,
+   * `"reflection"`, `"persona"`). Kept as `string` so a future variant the
+   * SDK predates still type-checks.
+   */
+  memory_kind?: string | null;
+  entity_id?: string | null;
+  persona_version?: number | null;
+  /** Fact-provenance Citation envelopes ({uri, accessed_at, hash?, span?}). */
+  citations?: unknown[] | null;
+  source_uri?: string | null;
+  /** Byte-range into the cited source body: `{ start, end }`. */
+  source_span?: { start: number; end: number } | null;
+  /** snake_case confidence-provenance discriminator (e.g. `"caller_provided"`). */
+  confidence_source?: string | null;
+  confidence_signals?: Record<string, unknown> | null;
+  /** RFC3339 */
+  confidence_decayed_at?: string | null;
+  /** Optimistic-concurrency version counter. */
+  version?: number | null;
+  /** snake_case lifecycle state (e.g. `"open"`). */
+  lifecycle_state?: string | null;
+  /** BLAKE3 content-id (`b3:<hex>`). */
+  cid?: string | null;
+  /** RFC3339 claim-validity lower bound (inclusive). */
+  valid_from?: string | null;
+  /** RFC3339 claim-validity upper bound (exclusive). */
+  valid_until?: string | null;
 }
 
 /** A scored Memory returned by `/recall` (Memory + `score` field). */

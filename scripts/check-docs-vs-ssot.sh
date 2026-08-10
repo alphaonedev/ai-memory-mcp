@@ -162,6 +162,49 @@ DOC_FILES=(
     docs/v1.0.0/nhi-playbook-P0-P11.md
 )
 
+# #2839 (3x7 lane-2 register §E) — WIDEN the scan set. #2492 correctly
+# generalised the PATTERN set from hand-written regexes to noun-phrase
+# anchors but did NOT widen DOC_FILES, so ~130 wrong live counts shipped in
+# CURRENT operator-facing reference docs this gate never opened. The split
+# was the file set, not authorship: files at/near canon were IN the curated
+# list, files a full release behind were not. This widening is an EXPLICIT
+# additive list of the CURRENT reference docs #2839 enumerated (plus the
+# already-canon CLI_REFERENCE.md, whose tool/route/CLI counts belong under
+# this gate) — NOT a blanket `docs/**/*.md` glob. A blanket glob drags in the
+# historical "when-added schema vN" ladder references (docs/coordination.md's
+# "lifecycle_state column (schema v64)"), v0.7.0-scoped verification
+# statements (docs/cli-design-rationale.md "at release/v0.7.0 HEAD ... 79
+# subcommands"), frozen per-release summaries (docs/compliance/_inventory/
+# v0.7.0-summary.md), analysis/adjudication artifacts (docs/reviews/,
+# docs/design/ — 3x7 / TRACT / RED-QUEEN), and the v0.7-scoped ADMIN_GUIDE /
+# migration guides — all of which carry TRUE HISTORICAL numbers whose
+# phrasings the gate's current-state historical guards do not all recognise,
+# so a blanket walk would false-positive on legitimate history. Closing the
+# blanket-glob path cleanly needs the CURRENT_SCHEMA_VERSION rule's
+# "vN added X" historical guard broadened to the "(schema **vN**; Feature)"
+# phrasing first (a follow-up on the gate's core rule logic, deliberately not
+# bundled into this doc-perfection wave). The list below is de-duped against
+# the curated entries above so their inline rationale survives.
+for _wf in \
+    docs/USER_GUIDE.md \
+    docs/CLI_REFERENCE.md \
+    docs/GLOSSARY.md \
+    docs/SECURITY.md \
+    docs/INSTALL.md \
+    docs/install-quickstart.md \
+    docs/integration-guide.md \
+    docs/postgres-age-guide.md \
+    docs/hook-pipeline.md \
+    docs/agent-skills.md \
+    docs/batman-active-mode.md \
+    docs/governance.md
+do
+    [[ -f "$_wf" ]] || continue
+    _dup=0
+    for _e in "${DOC_FILES[@]}"; do [[ "$_e" == "$_wf" ]] && { _dup=1; break; }; done
+    [[ "$_dup" == 0 ]] && DOC_FILES+=("$_wf")
+done
+
 # Operator-facing HTML surfaces (rendered compliance pages). Markdown is
 # the primary narrative form, but procurement-facing .html pages restate
 # the same mechanically-pinned SSOT counts and drift INDEPENDENTLY of

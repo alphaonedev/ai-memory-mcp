@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs / gates (perfection wave 2 — post-#2844 remainder; #2837 #2838 #2839 #2834)
+
+- **New reference-doc COMPLETENESS gate** `scripts/check-doc-surface-completeness.sh`
+  (#2839) — the axis the accuracy gates never covered. Three set-differences
+  against consts the repo already exports (no new SSOT): every `Command`
+  variant is documented in `docs/CLI_REFERENCE.md` (kebab-cased,
+  `#[command(hide)]` exempt), every `routes.rs` path const is documented in
+  `docs/API_REFERENCE.md` (param-normalised), every `registry::tool_names`
+  const is named in a live non-frozen doc. Burn-down allowlist (STALE entry
+  FAILS), empty scan set + engine error fail CLOSED, `--self-test` with one
+  real omission per rule + near-miss controls. Wired into `c8-precheck.yml`
+  with its self-test, declared required in `required-contexts-release.txt`,
+  covered by the `tests/doc_claims_integrity.rs` twin. On first run it caught
+  two genuine current omissions — `ai-memory stop` (#1955) and `ai-memory
+  features` (#2676) were live subcommands absent from `CLI_REFERENCE.md` —
+  now documented.
+- **Widened `check-docs-vs-ssot.sh` DOC_FILES** (#2839) to the current
+  operator-facing reference docs it never opened (USER_GUIDE, CLI_REFERENCE,
+  GLOSSARY, SECURITY, INSTALL, install-quickstart, integration-guide,
+  postgres-age-guide, hook-pipeline, agent-skills, batman-active-mode,
+  governance). Surfaced one live overclaim: `docs/INSTALL.md` cited 101/100
+  tools → 103/102.
+- **~90 stale API-surface counts reconciled across the rendered Pages HTML +
+  compliance HTML** (#2837) — the markdown was fixed in #2844 but the HTML
+  was not. tools 100/101→103/102, routes 92→94 / 78→80, CLI 87→90, schema
+  v78→v88, `Memory` 28→30, `HookEvent` 25/27→22, graph family 11→12, the
+  `feature-matrix` arithmetic 101+92+87=280 → 103+94+90=287, and the two
+  self-invalidating repros (nsa-csi-mcp.html heading 27→22 above its own
+  awk-returns-22 command; evidence.html `EXPECTED_PRODUCTION_ROUTES_COUNT`
+  92→94). True historical snapshots + measured test-record data preserved.
+- **vectorlite user-facing guide** (#2838 / #2219) — the env-table rows for
+  the v1.0.0 knobs already landed in #2844; added the missing FEATURE guide:
+  a "Optional vector-index backend — `vectorlite`" section in
+  `docs/CONFIG_SCHEMA.md` (off-by-default cargo feature, out-of-band native
+  lib via `scripts/fetch-vectorlite.sh`, fail-closed-to-pure-Rust-HNSW) + an
+  off-by-default-cargo-features note in `docs/feature-matrix.html`.
+- **SDK `Memory` model now types all 30 server fields** (#2834) — the Python
+  (`sdk/python/ai_memory/models.py`) and TypeScript
+  (`sdk/typescript/src/types.ts`) `Memory` models declared 15 of 30 fields;
+  the remaining 15 are now typed (optional-with-default so an older daemon's
+  response still parses). A typing-completeness fix, not a data-loss fix —
+  the untyped fields already survived round-trip via `extra="allow"` /
+  structural typing. (`kind_provenance`, listed in the issue, is a schema-v79
+  DB column, not one of the 30 `Memory` struct fields — verified against
+  `src/models/memory.rs`.)
+
 ### Docs (3x7 sweep lane 1 — configuration surfaces; #2820-#2826)
 
 - **`ENV_VAR_CENSUS` in `scripts/check-docs-vs-ssot.sh` censused 102 of the

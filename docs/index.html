@@ -372,9 +372,9 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
     <div class="meta">
       <span>Local-first &middot; air-gappable</span>
       <span>Model-neutral (MCP)</span>
-      <span>101 MCP tools</span>
-      <span>92 HTTP routes (78 unique paths)</span>
-      <span>87 CLI subcommands</span>
+      <span>103 MCP tools</span>
+      <span>94 HTTP routes (80 unique paths)</span>
+      <span>90 CLI subcommands</span>
       <span>Ed25519 attested audit chain</span>
       <span>SQLite&nbsp;+&nbsp;Postgres&#x202F;/&#x202F;AGE</span>
       <span><a href="compliance/nsa-csi-mcp.html" style="color:#6ee7ff">NSA CSI MCP 10/10 · 7/7</a></span>
@@ -502,7 +502,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
       </div>
       <div class="feat violet">
         <span class="tag violet">Hooks</span>
-        <h3>Programmable 25-event pipeline</h3>
+        <h3>Programmable 22-event pipeline</h3>
         <p>Subprocess JSON-stdio handlers fire on store, recall, reflect, link, GC, federation push. HMAC-signed webhooks with DLQ + replay.</p>
       </div>
       <div class="feat violet">
@@ -666,12 +666,12 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
 <!-- ============ MIGRATION → v0.9.0 ============ -->
 <section id="migrate">
   <div class="container-narrow">
-    <span class="eyebrow">Migrating to v0.9.0</span>
+    <span class="eyebrow">Migrating to v1.0.0</span>
     <h2>Already running v0.6.4, v0.7.x, or v0.8.x? The upgrade is one boot.</h2>
     <p class="lede">
-      v0.9.0 migrates your existing database in place. The sqlite schema steps up to
-      <strong>v78</strong> on the first <code>ai-memory serve</code> after the upgrade (a v0.8.x DB steps
-      <strong>v70&nbsp;&rarr;&nbsp;v78</strong>; a v0.7.x DB steps v57&nbsp;&rarr;&nbsp;v78; a v0.6.4 DB walks the full ladder).
+      v1.0.0 migrates your existing database in place. The sqlite schema steps up to
+      <strong>v88</strong> on the first <code>ai-memory serve</code> after the upgrade (a v0.8.x DB steps
+      <strong>v70&nbsp;&rarr;&nbsp;v88</strong>; a v0.7.x DB steps v57&nbsp;&rarr;&nbsp;v88; a v0.6.4 DB walks the full ladder).
       It is <strong>non-destructive</strong> &mdash; every existing memory carries forward unchanged, archive&nbsp;&rarr;&nbsp;restore is lossless, and new
       columns default to safe values for legacy rows. Typical downtime is
       <strong>30&nbsp;seconds to 2&nbsp;minutes</strong> on a laptop-sized database.
@@ -740,13 +740,13 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
       <a class="int-card" href="API_REFERENCE.html">
         <div class="label">HTTP</div>
         <h4>REST API</h4>
-        <p>92 routes (78 unique paths) at <code>/api/v1/</code>. Axum daemon on port 9077. mTLS optional.</p>
+        <p>94 routes (80 unique paths) at <code>/api/v1/</code>. Axum daemon on port 9077. mTLS optional.</p>
         <span class="arrow">API reference &rarr;</span>
       </a>
       <a class="int-card" href="CLI_REFERENCE.html">
         <div class="label">CLI</div>
         <h4>Command line</h4>
-        <p>87 subcommands (89 with <code>--features sal</code>), optional <code>--json</code>. For shell scripts, cron, and humans.</p>
+        <p>90 subcommands (92 with <code>--features sal</code>), optional <code>--json</code>. For shell scripts, cron, and humans.</p>
         <span class="arrow">CLI reference &rarr;</span>
       </a>
     </div>
@@ -945,12 +945,12 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
       <a class="lk" href="evidence.html"><strong>Evidence &mdash; frozen claims</strong><span class="desc">Every public number, pinned to a commit + test artifact. 15,951/0 final baseline.</span></a>
       <a class="lk" href="USER_GUIDE.html"><strong>User guide</strong><span class="desc">End-to-end MCP tool reference</span></a>
       <a class="lk" href="DEVELOPER_GUIDE.html"><strong>Developer guide</strong><span class="desc">Build from source, extend, add tools</span></a>
-      <a class="lk" href="API_REFERENCE.html"><strong>HTTP API</strong><span class="desc">92 routes (78 unique paths)</span></a>
-      <a class="lk" href="CLI_REFERENCE.html"><strong>CLI reference</strong><span class="desc">87 subcommands</span></a>
+      <a class="lk" href="API_REFERENCE.html"><strong>HTTP API</strong><span class="desc">94 routes (80 unique paths)</span></a>
+      <a class="lk" href="CLI_REFERENCE.html"><strong>CLI reference</strong><span class="desc">90 subcommands</span></a>
       <a class="lk" href="GLOSSARY.html"><strong>Glossary</strong><span class="desc">Every concept, one place</span></a>
       <a class="lk" href="knowledge-graph.html"><strong>Knowledge graph</strong><span class="desc">Typed links, temporal validity</span></a>
       <a class="lk" href="agent-identity.html"><strong>Agent identity (NHI)</strong><span class="desc">agent_id semantics</span></a>
-      <a class="lk" href="hook-pipeline.html"><strong>Hook pipeline</strong><span class="desc">27 events, JSON-stdio handlers</span></a>
+      <a class="lk" href="hook-pipeline.html"><strong>Hook pipeline</strong><span class="desc">22 events, JSON-stdio handlers</span></a>
       <a class="lk" href="confidence-calibration.html"><strong>Confidence calibration</strong><span class="desc">Auto-confidence, shadow, decay</span></a>
       <a class="lk" href="atomisation.html"><strong>Atomisation (WT-1)</strong><span class="desc">Atom rows, parent links</span></a>
       <a class="lk" href="ENGINEERING_STANDARDS.html"><strong>Engineering standards</strong><span class="desc">Code, test, security, release</span></a>

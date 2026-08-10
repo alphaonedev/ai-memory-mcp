@@ -1085,6 +1085,37 @@ Three-surface parity with the `memory_lineage` MCP tool and
 `GET /api/v1/memories/{id}/lineage`. Requires the lineage DAG enabled
 (`AI_MEMORY_LINEAGE_DAG`, default on).
 
+### `stop` — substrate record-stop actuator (v1.0.0, #1955)
+
+```bash
+ai-memory stop                # freeze THIS substrate's own record plane
+ai-memory stop --status       # report the current record-stop state
+ai-memory stop --resume       # lift a prior record-stop (resume recording)
+ai-memory stop --json         # machine-readable status/verdict
+```
+
+Freezes THIS substrate's own record plane — subsequent writes are
+refused until `--resume` (or a daemon restart) — and emits a signed
+`substrate.record_stop` / `substrate.record_resume` attestation into the
+audit chain. Vocabulary is deliberate: this is a **record-stop**, NOT a
+kill-switch (§2.3) — it stops the substrate's record plane, not any
+external cognition. Routes through the backend-blind
+`MemoryStore::record_stop` so SQLite and Postgres behave identically.
+
+### `features` — report compiled cargo features (v1.0.0, #2676 / Gate 3)
+
+```bash
+ai-memory features            # version: + features: (comma-separated, sorted)
+ai-memory features --json     # {"version": "...", "features": ["sal", ...]}
+```
+
+Prints the crate `version:` plus the `features:` compiled into this
+binary. Provision / certification / measurement harnesses MUST assert
+the feature set (e.g. `sal-postgres` when certifying the Postgres
+backend), not merely `--version` success — a binary that built without
+`sal-postgres` will silently lack the Postgres surface. Always available
+(no feature gate).
+
 ## Shell, completions, man
 
 ```bash

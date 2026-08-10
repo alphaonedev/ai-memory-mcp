@@ -111,16 +111,25 @@ class GovernancePolicy(_Base):
 class Memory(_Base):
     """A Memory row. Mirrors ``ai_memory::models::Memory``, which carries
 
-    **30 fields** at v1.0.0 (``Memory::FIELD_COUNT``). The 15 declared below
-    are the v0.6.x core; the other 15 (``cid``, ``version``,
-    ``lifecycle_state``, ``memory_kind``, ``kind_provenance``,
-    ``reflection_depth``, ``entity_id``, ``persona_version``, ``citations``,
-    ``source_uri``, ``source_span``, ``confidence_source``,
-    ``confidence_signals``, ``confidence_decayed_at``, ``valid_from`` /
-    ``valid_until``) are NOT typed here — they survive a round trip because
-    ``_Base`` sets ``extra="allow"``, but they arrive untyped. Typing them is
-    tracked separately. ``metadata`` is
-    a free-form ``dict`` since the server stores ``serde_json::Value``.
+    **30 fields** at v1.0.0 (``Memory::FIELD_COUNT``, SSOT
+    ``src/models/memory.rs``) — and all 30 are now typed here (#2834). The
+    first 15 are the v0.6.x core; the 15 declared after ``metadata`` are the
+    v0.7.0+ additions (``reflection_depth``, ``memory_kind``, ``entity_id``,
+    ``persona_version``, ``citations``, ``source_uri``, ``source_span``,
+    ``confidence_source``, ``confidence_signals``, ``confidence_decayed_at``,
+    ``version``, ``lifecycle_state``, ``cid``, ``valid_from``,
+    ``valid_until``).
+
+    This is a **typing-completeness** change, not a data-loss fix: those 15
+    already survived a round trip because ``_Base`` sets ``extra="allow"``, so
+    an unknown key was kept on the object verbatim — it was untyped, never
+    lost. Declaring them gives callers typed, attribute-style access for the
+    full row. (``kind_provenance`` is a schema-v79 DB column but is NOT a field
+    on the Rust ``struct Memory``, so it is deliberately not declared here.)
+
+    Every added field is ``Optional[T] = None`` so a response from an OLDER
+    daemon that omits it still parses. ``metadata`` is a free-form ``dict``
+    since the server stores ``serde_json::Value``.
     """
 
     id: str
@@ -138,6 +147,31 @@ class Memory(_Base):
     last_accessed_at: str | None = None
     expires_at: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # v0.7.0+ typed columns (#2834 typing completeness). All optional-with-
+    # default so an older daemon's response that omits any of them still
+    # parses. Wire keys match the Rust serde field names verbatim (snake_case).
+    reflection_depth: int | None = None
+    # ``memory_kind`` / ``confidence_source`` / ``lifecycle_state`` are
+    # snake_case enum strings on the wire (e.g. "observation",
+    # "caller_provided", "open"); kept as ``str`` so a future variant the SDK
+    # predates still parses.
+    memory_kind: str | None = None
+    entity_id: str | None = None
+    persona_version: int | None = None
+    # ``citations`` is a JSON array of Citation envelopes
+    # ({uri, accessed_at, hash?, span?}); ``source_span`` is a JSON
+    # {start, end} object; ``confidence_signals`` is a JSON object.
+    citations: list[Any] | None = None
+    source_uri: str | None = None
+    source_span: dict[str, Any] | None = None
+    confidence_source: str | None = None
+    confidence_signals: dict[str, Any] | None = None
+    confidence_decayed_at: str | None = None
+    version: int | None = None
+    lifecycle_state: str | None = None
+    cid: str | None = None
+    valid_from: str | None = None
+    valid_until: str | None = None
 
 
 class MemoryLink(_Base):
