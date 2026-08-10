@@ -19109,7 +19109,12 @@ impl MemoryStore for PostgresStore {
         Ok(applied_id)
     }
 
-    async fn merge_inbound(&self, ctx: &CallerContext, inbound: &Memory) -> StoreResult<String> {
+    async fn merge_inbound(
+        &self,
+        ctx: &CallerContext,
+        inbound: &Memory,
+        receiver_verified: bool,
+    ) -> StoreResult<String> {
         self.gate_record_stop()?;
         // v0.8.1 W2.3 (#1821 / gap G30) — resurrection guard (postgres parity
         // with the sqlite insert_if_newer gate). DROP an inbound write for a
@@ -19185,6 +19190,17 @@ impl MemoryStore for PostgresStore {
             crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS,
         );
         let merged = crate::models::merge_memory(&existing, &prepared);
+        // #2863 — atomic `agent_attested` re-assert (postgres twin of the sqlite
+        // `db::merge_inbound` path): `sanitize` above demoted the inbound level
+        // to `claimed` for the LWW tiebreak, but that must not DEMOTE a level
+        // THIS node verified over the persisted bytes. When the merged row's full
+        // SignableWrite surface + `write_signature` is byte-identical to the
+        // (post-redaction) verified `inbound`, restore `agent_attested`. The
+        // restored level flows into the `metadata` column encoded below, so it is
+        // written in the SAME UPDATE (atomic, no crash window). No-op when
+        // `receiver_verified` is false.
+        let merged =
+            crate::models::reassert_verified_attestation(merged, inbound, receiver_verified);
 
         // Encode the JSON-shaped columns the same way the
         // `apply_remote_memory` insert path does.
@@ -32145,7 +32161,7 @@ mod tests {
             .expect("apply_remote_memory is an idempotent no-op on a tombstoned id");
         assert_eq!(id, vid);
         let id2 = store
-            .merge_inbound(&ctx, &replay)
+            .merge_inbound(&ctx, &replay, false)
             .await
             .expect("merge_inbound is an idempotent no-op on a tombstoned id");
         assert_eq!(id2, vid);
@@ -32407,7 +32423,7 @@ mod tests {
         m2.content = "content-v2".to_string();
         m2.updated_at = (chrono::Utc::now() + chrono::Duration::seconds(5)).to_rfc3339();
         store
-            .merge_inbound(&ctx, &m2)
+            .merge_inbound(&ctx, &m2, false)
             .await
             .expect("merge_inbound v2");
 
@@ -32906,11 +32922,11 @@ mod tests {
         );
         // merge_inbound persists an inbound peer memory and returns its id.
         let a_id = store
-            .merge_inbound(&ctx, &a)
+            .merge_inbound(&ctx, &a, false)
             .await
             .expect("merge_inbound a");
         let b_id = store
-            .merge_inbound(&ctx, &b)
+            .merge_inbound(&ctx, &b, false)
             .await
             .expect("merge_inbound b");
         assert!(!a_id.is_empty() && !b_id.is_empty());

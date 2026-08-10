@@ -149,3 +149,78 @@ async fn pg_federated_consolidation_authors_as_sender_and_finalize_persists_2860
         "finalize persists the substrate write_signature in place (jsonb replace)"
     );
 }
+
+/// #2863 — live-postgres parity for the merge-path `agent_attested` re-assert.
+/// A re-broadcast of a source that landed `agent_attested` merges OVER the
+/// existing row; `PostgresStore::merge_inbound` runs the shared `sanitize` +
+/// LWW-newer (which would demote the receiver-verified level to `claimed`), then
+/// atomically re-asserts `agent_attested` when the merged row's SignableWrite
+/// surface + `write_signature` matches the verified inbound. Pins that the pg
+/// twin behaves IDENTICALLY to the sqlite `db::merge_inbound` unit test
+/// (`storage::tests::merge_inbound_reasserts_receiver_verified_agent_attested_2863`)
+/// — including the `created_at` TIMESTAMPTZ round-trip (matched by instant, not
+/// bytes). `receiver_verified=false` reproduces the legacy demotion.
+#[tokio::test]
+async fn pg_merge_inbound_reasserts_receiver_verified_agent_attested_2863() {
+    // Fresh existing agent_attested signed source; merge a NEWER re-broadcast of
+    // the same signed unit; return the persisted attest_level. (Declared before
+    // any statement to satisfy `clippy::items_after_statements`.)
+    async fn scenario(store: &PostgresStore, receiver_verified: bool) -> String {
+        let ns = format!("fed-2863-{}", uuid::Uuid::new_v4());
+        let id = uuid::Uuid::new_v4().to_string();
+        let author = "ai:hive-author";
+        let ctx = CallerContext::for_agent(author);
+
+        store
+            .store(
+                &ctx,
+                &mem(&id, &ns, "k8s guide", "scale to three replicas", author),
+            )
+            .await
+            .expect("store existing source");
+        // Force the persisted row to the finalized agent_attested + signature
+        // shape (mirrors the origin's finalize), bypassing store()'s own gate.
+        let meta = serde_json::json!({
+            "agent_id": author,
+            "write_signature": "JjiHIu-2863-roundtrip-b64",
+            "attest_level": "agent_attested",
+        });
+        store
+            .set_row_metadata(&ctx, &id, &serde_json::to_string(&meta).unwrap())
+            .await
+            .expect("finalize existing to agent_attested");
+
+        // Inbound = the PERSISTED row (so its signed surface — incl. the pg
+        // TIMESTAMPTZ-rendered created_at — matches byte-for-byte / by-instant),
+        // NEWER updated_at, carrying the same write_signature + wire level.
+        let stored = store.get(&ctx, &id).await.expect("get finalized");
+        let mut inbound = stored.clone();
+        inbound.updated_at = "2026-08-11T00:00:00+00:00".to_string();
+        inbound.metadata = meta.clone();
+
+        store
+            .merge_inbound(&ctx, &inbound, receiver_verified)
+            .await
+            .expect("pg merge_inbound");
+        let got = store.get(&ctx, &id).await.expect("get after merge");
+        got.metadata
+            .get("attest_level")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<absent>")
+            .to_string()
+    }
+
+    let Some(store) = connect().await else {
+        return;
+    };
+    assert_eq!(
+        scenario(&store, true).await,
+        "agent_attested",
+        "#2863 pg: a receiver-verified level survives the merge (parity with sqlite)"
+    );
+    assert_eq!(
+        scenario(&store, false).await,
+        "claimed",
+        "#2863 pg: receiver_verified=false → legacy sanitize+LWW demotion"
+    );
+}

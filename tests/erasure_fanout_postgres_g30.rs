@@ -110,7 +110,7 @@ async fn postgres_forget_tombstone_blocks_resurrection_g30() {
         ..mem(&ns, "rnote", "original secret content")
     };
     let returned = pg
-        .merge_inbound(&admin, &revived)
+        .merge_inbound(&admin, &revived, false)
         .await
         .expect("merge_inbound");
     assert_eq!(

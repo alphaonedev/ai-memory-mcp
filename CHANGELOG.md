@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed (federation data-integrity — CERT-BLOCKING)
 
+- **Re-broadcast tombstoned consolidation SOURCE rows no longer DIVERGE in
+  `attest_level` across nodes** (#2863, residual of #2860 surfaced by the DO
+  2-node re-verify; two 5-agent adversarial votes `4d3ea1c5`). A consolidation
+  SOURCE that landed `agent_attested` at a peer (fresh push, self-relayed by its
+  author) was DOWNGRADED to `claimed` at that peer when the #2860 lineage path
+  RE-BROADCAST it under the daemon federation identity — same byte-identical
+  valid `write_signature`, same content, divergent `attest_level` (origin
+  `agent_attested` vs peer `claimed`; under `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED=1`
+  a visibility divergence). Two independent mechanisms, both closed **without
+  weakening attestation** (an unsigned/forged/unenrolled-author row still lands
+  `claimed`): **(1)** `resolve_inbound_attribution` now HONORS a third-party
+  claim whose `write_signature` VERIFIES against the CLAIMED author's
+  locally-enrolled key (a valid Ed25519 signature over the 6-field
+  `SignableWrite` is unforgeable proof of authorship independent of the relaying
+  peer — strictly stronger than the operational `allowed_sender_agent_ids`
+  allowlist, which governs UNSIGNED bare claims), rather than re-attributing it
+  to the daemon relay; **(2)** the re-broadcast MERGES over the peer's existing
+  row, where `db::merge_inbound`'s `sanitize_inbound_attestation` (which
+  correctly neutralizes an UNTRUSTED wire-asserted level for the LWW tiebreak)
+  also wiped the receiver's OWN just-verified level and LWW-newer persisted
+  `claimed` — so `merge_inbound` now re-asserts `agent_attested` ATOMICALLY (in
+  the merge transaction, before the content-sealing write, so it holds under
+  at-rest encryption and leaves no crash window that could strand a terminal
+  tombstone) when, and only when, the merged row's full `SignableWrite` surface
+  + `write_signature` is byte-identical to the row THIS node just verified
+  (`receiver_verified` — never a peer self-assertion). Convergence is
+  enrollment-bounded: a peer without the origin author's key legitimately
+  stays `claimed` (fail-closed degrade; TOFU key distribution deferred to v1.x).
+  Both backends (sqlite + postgres) edited identically; the receive-loop wiring
+  is pinned end-to-end by `tests/fed_consolidate_source_attest_parity_2863.rs`
+  (sqlite `/sync/push`) and `tests/fed_consolidate_converges_2860_pg.rs` (live
+  postgres), plus unit arms for the attribution honor path
+  (`handlers::federation_receive`), the pure re-assert
+  (`models::crdt_merge::reassert_verified_attestation`), and the real merge path
+  (`storage::merge_inbound`). New pure fn
+  `identity::attest::resolve_write_attest_level` factored out of
+  `stamp_attestation` so the honor decision and the stamped level share ONE
+  verification.
 - **Tenant-attributed federated consolidation now CONVERGES under strict
   write-sig** (#2860, follow-up to #2856/#2861; 5-agent adversarial vote
   `4d3ea1c5`, Option A). `POST /api/v1/consolidate` minted a NEW

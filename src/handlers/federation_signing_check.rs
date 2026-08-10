@@ -286,32 +286,53 @@ pub(super) async fn sync_push_via_store(
             .get(crate::META_KEY_AGENT_ID)
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        // #2340 (FBL-32) — redact to the TO-BE-PERSISTED form FIRST (postgres
+        // twin of the sqlite receive path). Moved AHEAD of attribution for #2863
+        // so BOTH the crypto-attest HONOR check and the attestation stamp verify
+        // over exactly the bytes `PostgresStore::merge_inbound` persists. Redact
+        // touches only content/title/write_signature; attribution reads/writes
+        // only agent_id/attest_level, so the reorder is behavior-preserving.
+        crate::federation::receive_auth::redact_inbound_before_attestation(&mut to_insert);
+        // #2863 — resolve the CLAIMED author's enrolled key up front so a
+        // cryptographically-attested third-party claim (a valid propagated
+        // write_signature) is HONORED rather than re-attributed to the daemon
+        // relay sender. Reused as the attestation bound key when the claim is
+        // honored (attribute == claimed). The enrolled-key lookup resolves
+        // through the SAL `agent_pubkey` trait method so both backends match.
+        let claim_bound_key = match original_claim.as_deref() {
+            Some(c) => app.store.agent_pubkey(c).await.ok().flatten(),
+            None => None,
+        };
+        let claim_write_attested = original_claim.as_deref().is_some_and(|c| {
+            crate::handlers::federation_receive::inbound_claim_is_write_attested(
+                &to_insert,
+                c,
+                claim_bound_key.as_deref(),
+            )
+        });
         let attribute_agent = resolve_inbound_attribution(
             &mut to_insert,
             &body.sender_agent_id,
             &attest_cfg,
             peer_header_owned.as_deref(),
+            claim_write_attested,
         );
         // #1464 (v0.8.0) — per-write CONTENT attestation (postgres twin of
         // the sqlite receive path). Verify any presented
         // `metadata.write_signature` against the attributed author's enrolled
         // key → `agent_attested` vs `claimed`; reject forged, or (strict,
-        // opt-in) an unsigned honored third-party claim. The enrolled-key
-        // lookup resolves through the SAL `agent_pubkey` trait method so both
-        // backends behave identically.
-        // #2340 (FBL-32) — redact to the TO-BE-PERSISTED form FIRST (postgres
-        // twin of the sqlite receive path): the attestation below verifies +
-        // stamps over exactly the bytes `PostgresStore::merge_inbound`'s
-        // screen will persist. A cross-mode raw-signed row has its stale
-        // write_signature dropped inside the helper and lands honestly
-        // `claimed` instead of a false `agent_attested`.
-        crate::federation::receive_auth::redact_inbound_before_attestation(&mut to_insert);
-        let bound_pubkey = app
-            .store
-            .agent_pubkey(&attribute_agent)
-            .await
-            .ok()
-            .flatten();
+        // opt-in) an unsigned honored third-party claim. When the claim was
+        // honored, `attribute_agent == original_claim`, so reuse the key already
+        // looked up above (avoids a second lookup, #2863).
+        let bound_pubkey = if Some(attribute_agent.as_str()) == original_claim.as_deref() {
+            claim_bound_key.clone()
+        } else {
+            app.store
+                .agent_pubkey(&attribute_agent)
+                .await
+                .ok()
+                .flatten()
+        };
         if let Err(e) = apply_inbound_write_attestation(
             &mut to_insert,
             &attribute_agent,
@@ -459,7 +480,19 @@ pub(super) async fn sync_push_via_store(
         // Pre-fix this called `apply_remote_memory`, which had NONE of the
         // receive-lane guards (a stale peer could resurrect a forgotten
         // row; a same-id/different-title push error-skipped forever).
-        match app.store.merge_inbound(&ctx, &to_insert).await {
+        // #2863 — pass the receiver's VERIFIED verdict (postgres twin) so the
+        // merge-over-existing path re-asserts `agent_attested` atomically when the
+        // persisted row is byte-identical to the signed unit this node verified;
+        // `row_is_agent_attested` reads the post-`apply` `to_insert`.
+        match app
+            .store
+            .merge_inbound(
+                &ctx,
+                &to_insert,
+                crate::handlers::federation_receive::row_is_agent_attested(&to_insert),
+            )
+            .await
+        {
             Ok(applied_id) => {
                 applied += 1;
                 // v1.0.0 R19/A3 (#1948) — route-OUT dequarantine-on-attest

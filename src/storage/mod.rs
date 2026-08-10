@@ -13976,7 +13976,11 @@ pub fn archived_namespace_by_id(conn: &Connection, id: &str) -> Result<Option<St
 /// Bubbles up rusqlite / serde errors from the read, the merge-write, or
 /// the `insert_if_newer` fall-through. On any error inside the merge
 /// transaction the partial write is rolled back.
-pub fn merge_inbound(conn: &Connection, inbound: &Memory) -> Result<String> {
+pub fn merge_inbound(
+    conn: &Connection,
+    inbound: &Memory,
+    receiver_verified: bool,
+) -> Result<String> {
     // Take the write lock up front so the read-merge-write is atomic
     // against a concurrent peer push (BEGIN IMMEDIATE — same idiom as
     // `consolidate` / `size_gc`).
@@ -14020,6 +14024,21 @@ pub fn merge_inbound(conn: &Connection, inbound: &Memory) -> Result<String> {
                 // #224 field-wise merge — the SAME pure reconciler the
                 // postgres adapter calls in Rust (no per-backend drift).
                 let merged = crate::models::merge_memory(&existing, &prepared);
+                // #2863 — re-assert the receiver-VERIFIED `agent_attested` level
+                // ATOMICALLY (inside this BEGIN IMMEDIATE tx, before the
+                // content-sealing `overwrite_full_row_by_id`). `sanitize` above
+                // demoted the inbound level to `claimed` for the LWW tiebreak
+                // (correct — a peer must not self-assert), but that must not
+                // DEMOTE a level THIS node verified over the persisted bytes:
+                // when the merged row's full SignableWrite surface + signature is
+                // byte-identical to the verified inbound, restore `agent_attested`.
+                // No-op when `receiver_verified` is false (every non-receive
+                // caller) — byte-identical legacy merge.
+                let merged = crate::models::reassert_verified_attestation(
+                    merged,
+                    inbound,
+                    receiver_verified,
+                );
                 overwrite_full_row_by_id(conn, &merged)?;
                 Ok(Some(merged.id))
             }
@@ -22362,7 +22381,7 @@ mod tests {
         });
         inbound.updated_at = "2026-06-16T09:00:00+00:00".to_string();
 
-        let result_id = merge_inbound(&conn, &inbound).unwrap();
+        let result_id = merge_inbound(&conn, &inbound, false).unwrap();
         assert_eq!(result_id, id, "merge returns the existing row id");
 
         let got = get(&conn, &id).unwrap().unwrap();
@@ -22388,6 +22407,64 @@ mod tests {
         );
     }
 
+    /// #2863 — the REAL merge-over-existing path re-asserts a RECEIVER-VERIFIED
+    /// `agent_attested` atomically (the `sanitize` + LWW-newer demotion of a
+    /// re-broadcast tombstoned SOURCE that the receiver just verified is the
+    /// bug). Pins: (1) `receiver_verified=true` + matching signed surface →
+    /// persisted `agent_attested` (RED before the fix — sanitize+LWW → claimed);
+    /// (2) `receiver_verified=false` → legacy `claimed`. The forge-negative (a
+    /// merged row whose signed surface DIFFERS from the verified inbound stays
+    /// `claimed`) is pinned backend-agnostically by
+    /// `crate::models::crdt_merge::tests::reassert_noop_on_{content,signature}_*_2863`.
+    #[test]
+    fn merge_inbound_reasserts_receiver_verified_agent_attested_2863() {
+        // Persist an existing agent_attested signed source, then merge a NEWER
+        // re-broadcast of the same signed unit; return the persisted attest_level.
+        let run = |receiver_verified: bool| -> String {
+            let conn = test_db();
+            let mut existing = make_memory("src-2863", "team/alpha", Tier::Long, 5);
+            existing.content = "scale the deployment to three replicas".to_string();
+            existing.title = "kubernetes deployment guide".to_string();
+            existing.created_at = "2026-08-10T12:00:00+00:00".to_string();
+            existing.updated_at = "2026-08-10T12:00:00+00:00".to_string();
+            existing.metadata = serde_json::json!({
+                "agent_id": "ai:hive-author",
+                "write_signature": "JjiHIu1K887waRYKYvSO-roundtrip-b64",
+                "attest_level": "agent_attested",
+            });
+            let id = insert(&conn, &existing).unwrap();
+
+            // Re-broadcast tombstoned SOURCE: SAME signed surface + signature,
+            // NEWER updated_at (wins LWW), wire attest_level `agent_attested`
+            // (sanitize demotes it inside merge_inbound).
+            let mut inbound = existing.clone();
+            inbound.id = id.clone();
+            inbound.updated_at = "2026-08-10T19:14:31+00:00".to_string();
+
+            let rid = merge_inbound(&conn, &inbound, receiver_verified).unwrap();
+            assert_eq!(rid, id, "merge returns the existing row id");
+            get(&conn, &id)
+                .unwrap()
+                .unwrap()
+                .metadata
+                .get("attest_level")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<absent>")
+                .to_string()
+        };
+
+        assert_eq!(
+            run(true),
+            "agent_attested",
+            "#2863: a receiver-verified level survives the merge (not demoted to claimed)"
+        );
+        assert_eq!(
+            run(false),
+            "claimed",
+            "non-receive callers pass false → byte-identical legacy sanitize+LWW demotion"
+        );
+    }
+
     /// A brand-new id (no existing row) falls through to `insert_if_newer`
     /// and creates the row fresh (OLD behaviour preserved).
     #[test]
@@ -22395,7 +22472,7 @@ mod tests {
         let conn = test_db();
         let mem = make_memory("merge-fresh", "test", Tier::Mid, 5);
         let inbound_id = mem.id.clone();
-        let result_id = merge_inbound(&conn, &mem).unwrap();
+        let result_id = merge_inbound(&conn, &mem, false).unwrap();
         assert_eq!(result_id, inbound_id, "fresh insert returns the row id");
         let got = get(&conn, &inbound_id).unwrap().unwrap();
         assert_eq!(got.title, "merge-fresh");
@@ -22428,7 +22505,7 @@ mod tests {
         inbound.tags = vec!["b".to_string()];
         inbound.updated_at = "2026-06-16T09:00:00+00:00".to_string();
 
-        let result_id = merge_inbound(&conn, &inbound).unwrap();
+        let result_id = merge_inbound(&conn, &inbound, false).unwrap();
 
         // Deduped onto the existing row (kept its id); the new id never
         // became a separate row.
@@ -22473,7 +22550,7 @@ mod tests {
         inbound.expires_at = None;
         inbound.updated_at = "2026-06-16T09:00:00+00:00".to_string();
 
-        merge_inbound(&conn, &inbound).unwrap();
+        merge_inbound(&conn, &inbound, false).unwrap();
         let got = get(&conn, &id).unwrap().unwrap();
         // LWW content (inbound newer) + max-durability tier + max depth —
         // all consistent in the single persisted row.
@@ -22515,7 +22592,7 @@ mod tests {
         inbound.version = 4;
         inbound.updated_at = "2026-06-16T00:00:00+00:00".to_string();
 
-        merge_inbound(&conn, &inbound).unwrap();
+        merge_inbound(&conn, &inbound, false).unwrap();
         let got = get(&conn, &id).unwrap().unwrap();
         assert_eq!(got.version, 12, "version is max(12, 4)");
     }

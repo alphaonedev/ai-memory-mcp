@@ -1851,7 +1851,20 @@ pub trait MemoryStore: Send + Sync {
     ///
     /// Returns `InvalidInput` when `inbound` fails validation. Returns
     /// `Backend` for storage errors.
-    async fn merge_inbound(&self, _ctx: &CallerContext, _inbound: &Memory) -> StoreResult<String> {
+    /// #2863 — `receiver_verified` is THIS node's own attestation verdict for
+    /// `inbound` (`row_is_agent_attested` of the row AFTER the receive path's
+    /// `apply_inbound_write_attestation`, never a peer self-assertion). When set,
+    /// the merge-over-existing path re-asserts `agent_attested` on the persisted
+    /// row iff its full `SignableWrite` surface + `write_signature` is
+    /// byte-identical to `inbound` — so the CRDT `sanitize` (which neutralizes an
+    /// UNTRUSTED level for the LWW tiebreak) cannot demote a level this node
+    /// independently verified. Non-receive callers pass `false` (legacy merge).
+    async fn merge_inbound(
+        &self,
+        _ctx: &CallerContext,
+        _inbound: &Memory,
+        _receiver_verified: bool,
+    ) -> StoreResult<String> {
         Err(StoreError::UnsupportedCapability {
             capability: "FEDERATION_MERGE_INBOUND".to_string(),
         })
