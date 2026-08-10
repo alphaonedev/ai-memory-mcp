@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`POST /api/v1/memory_reflect` false `400 "source memory not found"` on
+  postgres (#2857)** — the postgres SAL branch of `handle_reflect_http`
+  resolved the caller identity from the request BODY only (via
+  `parse_reflect_input`), ignoring the `X-Agent-Id` header. Source existence is
+  checked through the SAL `MemoryStore::get` scope=private visibility gate keyed
+  on the `CallerContext` principal, so a source memory written and GET-able
+  under `X-Agent-Id: <owner>` (no body `agent_id`) was invisible to reflect —
+  its lookup ran under the host/anonymous default principal — and reflect
+  refused an existing memory. Reflect now resolves the caller
+  header-authoritatively when `X-Agent-Id` is present (the
+  `resolve_caller_agent_id` parity helper, matching GET/recall/store), so the
+  source lookup AND the reflection authorship use the same principal the memory
+  was written under. The body `agent_id` remains a refinement that must match
+  the header (#2140 forge protection unchanged); with no header present the
+  shipped #1317 body-only zero-config contract stands. Reflect still correctly
+  refuses a source the caller genuinely cannot see. Regression:
+  `tests/reflect_pg_caller_identity_2857.rs` (pg-gated).
+
 ### Docs / gates (perfection wave 2 — post-#2844 remainder; #2837 #2838 #2839 #2834)
 
 - **New reference-doc COMPLETENESS gate** `scripts/check-doc-surface-completeness.sh`
