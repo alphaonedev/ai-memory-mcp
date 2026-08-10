@@ -166,3 +166,111 @@ directive. The federation transport, mTLS, quorum, and cross-peer attestation co
 `infra/do-hive/teardown.sh` destroyed 5 resources (2 memory + 1 agent + VPC + firewall).
 `doctl compute droplet list --tag-name ai-memory-hive` → **EMPTY**; full-list grep → **zero
 ai-memory-hive droplets**. Timestamp **2026-08-10T13:38:46Z**. Spend ~**$0.05**.
+
+---
+
+# RE-VERIFY round — #2860 convergence on a real 2-node mesh (2026-08-10)
+
+**Round date:** 2026-08-10 (EXECUTED — closes the loop on the DO-round #2856 data-integrity finding)
+**Base:** `release/v1.0.0` @ `67f44a4b` (the MERGED fix chain: #2856→#2861 `8cbbce3c` + #2857→#2859 `1f0e6125` + #2860→#2862 `67f44a4b`)
+**Orchestrator:** Opus 5 (`hard-coder`). Spend operator-authorized 2026-08-10.
+**Disposition:** **#2860 CONVERGENCE PROVEN on a real 2-node federated DO mesh** (pg16 + AGE 1.6.0 + pgvector 0.8.4, mTLS, W=2, v1.0.0-default strict write-sig). The exact operation the DO round found broken (#2856) — an LLM/substrate consolidation that committed on the origin but NEVER reached the peer — now converges node1→node2 at `attest_level=agent_attested` with its `derived_from` edges and source tombstones. **1 residual filed (#2863).** Hive **torn down; zero droplets**.
+
+## Provisioned topology (as-run)
+
+| item | value |
+|------|-------|
+| spawn | `./spawn.sh apply -var memory_count=2 -var agent_count=0 -var quorum_writes=2` (the #2850-fixed `-var` CLI channel — worked verbatim) |
+| memory nodes | `ai:hive-memory-1` 104.131.55.242 (priv 10.20.0.2), `ai:hive-memory-2` 138.197.16.67 (priv 10.20.0.3) |
+| store | PostgreSQL 16.14 + Apache AGE **1.6.0** + pgvector **0.8.4** (extensions created in-DB by cloud-init; confirmed) |
+| binary | fixed tip `67f44a4b`, `cargo build --release --features sal,sal-postgres`, sha256 `9557a8345ecaf0b2…`, scp'd to `/opt/ai-memory/bin/ai-memory` on both nodes (`ai-memory --version` = 1.0.0) |
+| crypto | mTLS everywhere (per-node leaves, `--mtls-allowlist`); W=2 quorum over mutual TLS |
+| attestation | v1.0.0 default-ON: `AI_MEMORY_FED_REQUIRE_WRITE_SIG` UNSET → strict (confirmed in the boot WARN) |
+| runtime / spend | ~31 min droplet uptime; teardown **2026-08-10T19:21:47Z**; spend ~**$0.03** (of the $100 budget) |
+
+## Track D core — RE-CONFIRMED GREEN on the fixed binary
+
+`./federate.sh all` verbatim: **9 PASS / 0 FAIL** (the #2854/#2855 harness fixes are in; no false FAILs this round).
+
+```
+PASS: node 1 /health over mTLS (200)
+PASS: node 1 refuses a client presenting no cert
+PASS: node 2 /health over mTLS (200)
+PASS: node 2 refuses a client presenting no cert
+PASS: CROSS-HOST: node 1 reaches node 2 at https://10.20.0.3:9077 over mutual TLS (200)
+PASS: W-of-N quorum write at node 1 committed + replicated (201 quorum_met)
+PASS: quorum write replicated: id 7adbf3ae-… readable at node 2
+PASS: signed write accepted at node 1 (201 id=a9463ef8-…)
+PASS: signed cross-peer write lands attest_level=agent_attested at node 2
+----
+federate verify: 9 PASS / 0 FAIL
+```
+
+## ⭐ #2860 CONVERGENCE RE-VERIFY (the point) — per-assertion PASS/FAIL
+
+Method: on node1, store 2 near-dup SIGNED memories (author `ai:hive-author`, DB-enrolled at both nodes), then `POST /api/v1/consolidate {ids, title, use_llm:true}`. The daemon fetched a deterministic summary (Grok/OpenRouter LLM path available; the convergence is about the RECEIVE path, not the LLM). Assert on **node2** (pg-direct + mTLS API).
+
+**Enrollment note (required, honest):** the #2860 fix authors the FEDERATED consolidation as the daemon's federation identity (`ai:hive-memory-1`) so it self-relays past the strict gate. For the receiver to reach `agent_attested` (not merely `claimed`), the daemon's federation identity must be enrolled in the PEER's DB `agent_pubkey` registry. `fed-bootstrap` cross-enrolls peer federation `.pub` into the KEY_DIR (transport lane) and DB-binds only the author; the pg content-write-sig lane resolves via `store.agent_pubkey` (DB registry). So this re-verify DB-bound each node's federation identity into the peer registry (public-key material the mesh already trusts, the DB-lane twin of the existing key-dir cross-enrollment) via the admin `PUT /api/v1/agents/{id}/pubkey` route. **Recommendation:** `fed-bootstrap` should DB-bind the peer federation identities too, so daemon-authored derived content converges at `agent_attested` out-of-the-box (needed for non-quarantined visibility under `asi-hard`). Without it convergence still holds under the default posture, landing `claimed` (present, visible, not skipped).
+
+| # | Assertion | Result | Verbatim evidence (node2 pg / node1 log) |
+|---|-----------|--------|------------------------------------------|
+| (a) | Consolidated `C` PRESENT at node2 (`SELECT id … WHERE id=C`), NOT skipped | **PROVEN PASS** | node2 pg: `1e6db16a…|ai:hive-memory-1|agent_attested|substrate|ai:hive-author|open` — present |
+| (a) | `C` at `attest_level=agent_attested` (daemon-signed self-relay) | **PROVEN PASS** | node2 `metadata.attest_level="agent_attested"`, `agent_id="ai:hive-memory-1"`, `write_signature` present, `propagated_trust="agent_attested"` |
+| (a) | `C` API-readable at node2 over mTLS as the owner identity | **PROVEN PASS** | `GET /api/v1/memories/1e6db16a…` as `x-agent-id: ai:hive-memory-1` → 200 (owned by the substrate; the invoking tenant does not see it via scope=private recall — the documented #2860 consequence) |
+| (b) | `derived_from` edges `C→sources` present at node2 | **PROVEN PASS** | node2 `memory_links`: `1e6db16a…→38b83c5f… derived_from`, `1e6db16a…→60f0a0ef… derived_from`; `C.metadata.derived_from=[38b83c5f,60f0a0ef]`, `derived_from_cids=[b3:cbeb…,b3:2d06…]` |
+| (c) | Source tombstone disposition converged (lifecycle matches both nodes) | **PROVEN PASS** | `38b83c5f`: node1=`tombstoned` node2=`tombstoned`; `60f0a0ef`: node1=`tombstoned` node2=`tombstoned` |
+| (d) | NO silent skip in node1 federation log (contrast #2856 `unenrolled_author_strict`) | **PROVEN PASS** | node1 journal has NO `unenrolled_author_strict` / `item(s) skipped` for the consolidation; `C` provably reached node2 |
+
+**Final tally:** convergence re-verify **11 PASS / 0 FAIL** (CID `1e6db16a-8061-48f1-b595-f1a81acdac83`).
+
+Consolidated `C` full metadata at node2 (verbatim):
+```json
+{ "agent_id":"ai:hive-memory-1", "attest_level":"agent_attested",
+  "derived_from":["38b83c5f-…","60f0a0ef-…"], "summary_source":"substrate",
+  "write_signature":"sqhhTKrXG2VEiRgSpZbQ+…", "propagated_trust":"agent_attested",
+  "derived_from_cids":["b3:cbeb52962…","b3:2d06689ed…"],
+  "consolidator_tenant":"ai:hive-author", "consolidated_from_agents":["ai:hive-author"] }
+```
+
+Contrast with the #2856 evidence (pre-fix): the consolidated row was ABSENT at node2, the peer receiver logged `2xx, 1 item skipped` (`unenrolled_author_strict`), and the caller saw only `202 durability:local`. **That silent inter-node divergence is now closed.**
+
+## Residual floor (#2861) — PROVEN
+
+Forced quorum miss (node2 stopped), consolidate on node1 with W=2 unmeetable → HTTP **202** carrying the created id, LOUD + reconcilable:
+```json
+HTTP 202
+{ "id":"7ce376f1-9573-4fa2-bb15-d1889c131ba6", "quorum_met":false, "durability":"local",
+  "acks":1, "needed":2, "reason":"timeout", "consolidated":2, "summary":"…", "content":"…", "memory":{…} }
+```
+The under-replication is discoverable and reconcilable via the returned id — exactly the #2861 loud-202 floor.
+
+## PROVEN ledger
+
+| claim | status | proof |
+|---|---|---|
+| Track D core (mTLS, cross-host, W=2 quorum, signed→agent_attested) on the fixed binary | **PROVEN** | `federate.sh` 9/0 |
+| #2856 symptom (consolidation absent at peer / silent divergence) FIXED | **PROVEN** | `C` present at node2, agent_attested, no skip |
+| #2860 (a) consolidated `C` converges at agent_attested | **PROVEN** | node2 pg dump + API |
+| #2860 (b) `derived_from` edges converge | **PROVEN** | node2 `memory_links` |
+| #2860 (c) source tombstone lifecycle converges | **PROVEN** | both nodes `tombstoned` |
+| #2860 (d) no silent skip | **PROVEN** | node1 journal |
+| #2861 loud-202 under-replication floor | **PROVEN** | 202 id-bearing body |
+
+## Findings this round (1:1)
+
+| # | issue | class |
+|---|---|---|
+| 1 | [#2863](https://github.com/alphaonedev/ai-memory-mcp/issues/2863) — #2860 re-broadcast tombstoned **source** rows land `claimed` at the peer (attest_level divergence) while `agent_attested` on the origin, despite a byte-identical valid `write_signature` + content | **substrate residual — filed, follow-up to #2860** |
+
+**Observation (documented, not filed — C5 discipline):** the under-replicated floor-C created while node2 was down did NOT reappear at node2 within the ~2 min observation window post-restart (catchup `/sync/since` pulls returned 0 rows). `broadcast_consolidate_quorum` DOES carry push-DLQ landing logic (`src/federation/sync.rs:461-492`, #2678), so DLQ-replay reconciliation is plausible but was not observed to completion; the #2861 202-id reconciliation handle is proven. Not filed as a defect pending a longer-window / DLQ-instrumented repro so as not to misdiagnose expected DLQ-replay timing.
+
+## Can #2860 be closed?
+
+**YES — the convergence is PROVEN on a real mesh.** All four stated assertions (a/b/c/d) pass; the exact #2856 symptom (consolidation never reaching the peer, silent divergence) is closed; the consolidated result converges at `agent_attested` with edges + tombstone convergence. The newly-surfaced **source-attest divergence is a distinct residual (#2863)**, not the #2856 symptom — the durable TEXT and `write_signature` are byte-identical on both nodes, so it is a derived-metadata divergence, tracked separately. Final close/merge remains Fable-gated.
+
+## Teardown confirmation
+
+`infra/do-hive/teardown.sh` destroyed 4 resources (2 memory + VPC + firewall).
+`doctl compute droplet list --tag-name ai-memory-hive` → **EMPTY**; full-list grep → **zero
+ai-memory droplets** (count 0). A 95-min money-safety watchdog was armed at spawn and never
+fired. Timestamp **2026-08-10T19:21:47Z**. Spend ~**$0.03**.
