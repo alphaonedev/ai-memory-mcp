@@ -18,6 +18,7 @@
 
 import { AiMemoryClient } from "../src/client.js";
 import { ValidationError, NotFoundError } from "../src/errors.js";
+import type { Memory } from "../src/types.js";
 
 const BASE_URL = process.env.AI_MEMORY_TEST_URL ?? "http://localhost:9077";
 const DAEMON_ENABLED = process.env.AI_MEMORY_TEST_DAEMON === "1";
@@ -33,6 +34,79 @@ const describeIntegration = DAEMON_ENABLED ? describe : describe.skip;
 // agreed with itself and stayed green while the SDK could not verify a single
 // genuine delivery. The replacement asserts against a fixture emitted by the
 // RUST signer.
+
+// ---------------------------------------------------------------------------
+// #2834 — the `Memory` interface types all 30 server-side fields. This is a
+// typing-completeness assertion, not a data-loss fix: the v0.7.0+ fields
+// already survived a round trip via structural typing before they were
+// declared. The `Memory`-typed object literals below only compile if every
+// field is declared with the expected type; the runtime asserts read-back.
+// ---------------------------------------------------------------------------
+describe("Memory typed fields (#2834)", () => {
+  test("all v0.7.0+ fields read back through the typed interface", () => {
+    const m: Memory = {
+      id: "abc",
+      tier: "long",
+      namespace: "global",
+      title: "t",
+      content: "c",
+      tags: ["x"],
+      priority: 7,
+      confidence: 0.8,
+      source: "api",
+      access_count: 3,
+      created_at: "2026-04-19T00:00:00Z",
+      updated_at: "2026-04-19T00:00:00Z",
+      last_accessed_at: "2026-04-19T01:00:00Z",
+      expires_at: "2026-04-26T00:00:00Z",
+      metadata: { agent_id: "alice" },
+      reflection_depth: 2,
+      memory_kind: "reflection",
+      entity_id: "ent-1",
+      persona_version: 4,
+      citations: [{ uri: "doc:1", accessed_at: "2026-04-19T00:00:00Z" }],
+      source_uri: "doc:1",
+      source_span: { start: 0, end: 10 },
+      confidence_source: "auto_derived",
+      confidence_signals: { source_age_days: 1.5 },
+      confidence_decayed_at: "2026-04-20T00:00:00Z",
+      version: 3,
+      lifecycle_state: "open",
+      cid: "b3:deadbeef",
+      valid_from: "2026-04-01T00:00:00Z",
+      valid_until: "2026-05-01T00:00:00Z",
+    };
+    expect(m.reflection_depth).toBe(2);
+    expect(m.memory_kind).toBe("reflection");
+    expect(m.version).toBe(3);
+    expect(m.lifecycle_state).toBe("open");
+    expect(m.cid).toBe("b3:deadbeef");
+    expect(m.source_span).toEqual({ start: 0, end: 10 });
+    expect(m.valid_until).toBe("2026-05-01T00:00:00Z");
+  });
+
+  test("a legacy row without the v0.7.0+ fields still type-checks", () => {
+    // An OLDER daemon omits the added columns; the interface's optional fields
+    // keep this assignable.
+    const legacy: Memory = {
+      id: "abc",
+      tier: "mid",
+      namespace: "global",
+      title: "t",
+      content: "c",
+      tags: [],
+      priority: 5,
+      confidence: 1.0,
+      source: "api",
+      access_count: 0,
+      created_at: "2026-04-19T00:00:00Z",
+      updated_at: "2026-04-19T00:00:00Z",
+      metadata: {},
+    };
+    expect(legacy.version).toBeUndefined();
+    expect(legacy.cid).toBeUndefined();
+  });
+});
 
 describe("AiMemoryClient constructor", () => {
   test("requires baseUrl", () => {
