@@ -253,10 +253,33 @@ pub async fn handle_reflect_http(
     // wire slugs + `{id, reflection_depth, reflects_on, namespace}` shape.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        let (input, caller_depth) = match crate::mcp::parse_reflect_input(&body, None) {
+        let (mut input, caller_depth) = match crate::mcp::parse_reflect_input(&body, None) {
             Ok(parsed) => parsed,
             Err(e) => return err_response(e),
         };
+        // #2857 — resolve the caller identity HEADER-AUTHORITATIVELY when an
+        // `X-Agent-Id` header is present, matching how GET /memories/{id},
+        // recall, and store resolve it (`resolve_http_agent_id` / the
+        // `resolve_caller_agent_id` parity helper). `parse_reflect_input`
+        // reads the caller id from the request BODY only, so on the postgres
+        // SAL branch — where source existence is checked through the SAL
+        // `MemoryStore::get` scope=private visibility gate keyed on the
+        // `CallerContext` principal — a source written and GET-able under
+        // `X-Agent-Id: <owner>` (no body `agent_id`) was invisible to reflect,
+        // producing a false `400 "source memory not found"` for a memory that
+        // demonstrably exists (the store-vs-lookup owner-scoping mismatch).
+        // The body `agent_id` stays a REFINEMENT that MUST match the header,
+        // so the #2140 forge protection is unchanged. When NO header is present
+        // the shipped #1317 body-only zero-config contract stands (the
+        // body-derived `input.agent_id` is kept verbatim) — resolving
+        // header-authoritatively there would 403 a legitimate body-only caller.
+        if headers.contains_key(crate::HEADER_AGENT_ID) {
+            let body_agent = body.get("agent_id").and_then(Value::as_str);
+            match crate::handlers::parity::resolve_caller_agent_id(body_agent, &headers, None) {
+                Ok(id) => input.agent_id = id,
+                Err(e) => return err_response(e),
+            }
+        }
         let caller = crate::store::CallerContext::for_agent(&input.agent_id);
         // #1325 caller-asserted depth pre-check (parity with the sqlite
         // MCP path): compare the asserted `depth` to the substrate-
