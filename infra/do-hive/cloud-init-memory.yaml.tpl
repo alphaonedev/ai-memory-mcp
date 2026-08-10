@@ -41,6 +41,12 @@ write_files:
       Type=simple
       User=aimemory
       Group=aimemory
+      # #2853: even in postgres-store mode the daemon opens a local sqlite
+      # ai-memory.db (deferred-audit journal + federation nonce cache). With no
+      # WorkingDirectory systemd's default CWD is /, which User=aimemory cannot
+      # write, so the open fails SQLITE_CANTOPEN (exit 75). Give it the aimemory
+      # home (writable) as CWD so the relative ai-memory.db lands there.
+      WorkingDirectory=/opt/ai-memory
       Environment=AI_MEMORY_PERMISSIONS_MODE=enforce
       Environment=AI_MEMORY_AUTONOMOUS_HOOKS=0
       Environment=RUST_LOG=ai_memory=info,store::postgres=info
@@ -265,8 +271,16 @@ write_files:
       API_KEY="$(cat /etc/ai-memory/api-key)"
       # The umask subshell matters: config.toml carries the api_key, so it must
       # never exist even momentarily at the inherited 0644.
+      # #2852: the daemon's config resolver (AppConfig::config_path,
+      # src/config.rs) reads $HOME/.config/ai-memory/config.toml and IGNORES
+      # XDG_CONFIG_HOME. In the serve drop-in $HOME=/opt/ai-memory, so the daemon
+      # loads /opt/ai-memory/.config/ai-memory/config.toml. Writing the api_key
+      # config to $XDG_DIR left it UNREAD and serve fail-closed on the 0.0.0.0
+      # bind ("api_key is unset", exit 75). Write to the path the daemon loads.
+      DAEMON_CFG_DIR=/opt/ai-memory/.config/ai-memory
+      install -d -o aimemory -g aimemory -m 0750 "$DAEMON_CFG_DIR"
       ( umask 077
-        cat > "$XDG_DIR/ai-memory/config.toml" <<CFG
+        cat > "$DAEMON_CFG_DIR/config.toml" <<CFG
       schema_version = 2
       api_key = "$API_KEY"
 
@@ -274,8 +288,8 @@ write_files:
       agent_ids = ["$ADMIN_ID"]
       CFG
       ) || fail "could not write the daemon config"
-      chown root:aimemory "$XDG_DIR/ai-memory/config.toml"
-      chmod 0640 "$XDG_DIR/ai-memory/config.toml"
+      chown root:aimemory "$DAEMON_CFG_DIR/config.toml"
+      chmod 0640 "$DAEMON_CFG_DIR/config.toml"
       # NOTE: tier is left unset, so the daemon keeps its compiled default
       # (semantic). A Track-D-only run that does not need the embedder can
       # add `tier = "keyword"` to that file and restart -- the same
@@ -423,16 +437,22 @@ write_files:
       fi
 
       # --- build + install Apache AGE from source against pg16 ---
-      # AGE is source-only. Pin the EXACT release tag release_PG16_1.6.0 so the
-      # DO substrate is version-identical to infra/lan-parity-test/Dockerfile.pg-age-vector
-      # (FROM apache/age:release_PG16_1.6.0). An unpinned branch (PG16/master) can
-      # drift the AGE version between the free local parity run and the paid DO
-      # run, so a cert result proven locally would not be proven on DO.
+      # AGE is source-only. Pin the EXACT 1.6.0/PG16 release so the DO substrate
+      # is version-identical to infra/lan-parity-test/Dockerfile.pg-age-vector
+      # (FROM apache/age:release_PG16_1.6.0). NOTE the git ref and the docker tag
+      # DIFFER: the apache/age GitHub repo has NO ref named `release_PG16_1.6.0`
+      # (that underscore form is the DOCKER tag). The git branch/tag are
+      # slash-delimited -- `release/PG16/1.6.0` (== tag `PG16/v1.6.0-rc0`,
+      # commit 2db2f060), the same 1.6.0 code the docker image ships. An
+      # unpinned branch (PG16/master) can drift the AGE version between the free
+      # local parity run and the paid DO run, so a cert result proven locally
+      # would not be proven on DO. (#2851 -- the underscore ref failed
+      # `git checkout` under `set -e` and aborted the whole provision.)
       if [ ! -f "$(/usr/bin/pg_config --pkglibdir)/age.so" ]; then
         rm -rf /opt/age-src
         git clone https://github.com/apache/age.git /opt/age-src
         cd /opt/age-src
-        git checkout release_PG16_1.6.0
+        git checkout release/PG16/1.6.0
         make PG_CONFIG=/usr/bin/pg_config
         make install PG_CONFIG=/usr/bin/pg_config
       fi

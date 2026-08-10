@@ -91,14 +91,19 @@ case "${cmd}" in
   plan)
     print_cost
     terraform init -input=false
-    terraform plan -input=false
+    # #2850: forward extra CLI args (e.g. -var memory_count=2) to terraform.
+    # Without this the documented recipe `spawn.sh apply -var memory_count=2`
+    # silently dropped every -var and provisioned the DEFAULT topology
+    # (memory_count=1 -> Track D impossible; agent_count=10 -> ~10x spend).
+    terraform plan -input=false "${@:2}"
     ;;
   apply)
     print_cost
     require_money_gate
     terraform init -input=false
     mkdir -p "${SCRATCH_ROOT}/${NOW}"
-    terraform apply -input=false -auto-approve
+    # #2850: forward extra CLI args (e.g. -var memory_count=2) — see plan case.
+    terraform apply -input=false -auto-approve "${@:2}"
     terraform output -json > "${SCRATCH_ROOT}/${NOW}/outputs.json"
     cp terraform.tfstate "${SCRATCH_ROOT}/${NOW}/terraform.tfstate"
     echo "[spawn.sh] Apply complete. Audit dump: ${SCRATCH_ROOT}/${NOW}/"
