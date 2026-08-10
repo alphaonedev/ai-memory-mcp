@@ -342,11 +342,28 @@ pub(super) fn check_sender_clock_skew(sender_agent_id: &str, body: &SyncPushBody
 /// This preserves legitimate multi-author relay provenance (a hub/curator
 /// relaying a fleet of agents the operator allowlisted) while closing the
 /// forge hole for unauthorized claims.
+///
+/// #2863 — `claim_write_attested` is an INDEPENDENT honor path: when the row
+/// carries a `metadata.write_signature` that VERIFIES against the CLAIMED
+/// author's locally-enrolled key (computed caller-side over the POST-redaction
+/// bytes via [`inbound_claim_is_write_attested`], because the enrolled-key
+/// lookup straddles the sync-sqlite / async-pg boundary), the claim is honored
+/// regardless of the allowlist. A valid Ed25519 signature over the 6-field
+/// `SignableWrite` is unforgeable proof of authorship independent of which peer
+/// relayed it — strictly stronger than the operational `allowed_sender_agent_ids`
+/// allowlist, which is the authorization for UNSIGNED bare claims. This closes
+/// the #2860 re-broadcast divergence where a tombstoned consolidation SOURCE
+/// authored by A but relayed under the daemon federation identity was
+/// re-attributed to the daemon and downgraded from `agent_attested` to
+/// `claimed` at the peer. An unsigned / forged / unenrolled-author claim still
+/// re-attributes exactly as before (the honor path requires a VERIFIED enrolled
+/// signature, never mere presence).
 pub(super) fn resolve_inbound_attribution(
     to_insert: &mut Memory,
     sender_agent_id: &str,
     attest_cfg: &PeerAttestationConfig,
     peer_id: Option<&str>,
+    claim_write_attested: bool,
 ) -> String {
     let Some(claimed) = to_insert
         .metadata
@@ -360,16 +377,19 @@ pub(super) fn resolve_inbound_attribution(
     if claimed == sender_agent_id {
         return claimed;
     }
-    // Enrolled posture: a relayed third-party claim is trusted ONLY if the
-    // operator authorized this peer to author as that agent. Zero-config
-    // (no allowlist) preserves the faith-based posture.
-    let authorized = if attest_cfg.has_allowlist() {
-        peer_id
-            .and_then(|p| attest_cfg.scope_for(p))
-            .is_some_and(|scope| scope.allowed_sender_agent_ids.iter().any(|a| a == &claimed))
-    } else {
-        true
-    };
+    // A relayed third-party claim is honored when EITHER (#2863) it carries a
+    // write_signature that cryptographically verifies against the claimed
+    // author's enrolled key, OR (enrolled posture) the operator authorized this
+    // peer to author as that agent. Zero-config (no allowlist) preserves the
+    // faith-based posture.
+    let authorized = claim_write_attested
+        || if attest_cfg.has_allowlist() {
+            peer_id
+                .and_then(|p| attest_cfg.scope_for(p))
+                .is_some_and(|scope| scope.allowed_sender_agent_ids.iter().any(|a| a == &claimed))
+        } else {
+            true
+        };
     if authorized {
         return claimed;
     }
@@ -398,6 +418,44 @@ pub(super) fn resolve_inbound_attribution(
         );
     }
     sender_agent_id.to_string()
+}
+
+/// #2863 — does this inbound row's presented `metadata.write_signature` VERIFY
+/// against `claimed_author`'s locally-enrolled key over the 6-field
+/// `SignableWrite`? Reuses the EXACT `attest_write` path the write-sig lane
+/// stamps with (over the POST-redaction persisted bytes — call this AFTER
+/// [`crate::federation::receive_auth::redact_inbound_before_attestation`]), so
+/// the honor decision [`resolve_inbound_attribution`] makes and the level
+/// [`apply_inbound_write_attestation`] stamps cannot disagree. A valid Ed25519
+/// signature is unforgeable proof of authorship independent of which peer
+/// relayed it; `claimed_bound_key` MUST come from the LOCAL enrolled keystore
+/// (`agent_pubkey`), never a wire-presented key. Returns `false` on any absent
+/// signature / unenrolled key / verification failure (fail-closed).
+pub(super) fn inbound_claim_is_write_attested(
+    mem: &Memory,
+    claimed_author: &str,
+    claimed_bound_key: Option<&str>,
+) -> bool {
+    let presented_sig = mem
+        .metadata
+        .get(crate::models::field_names::WRITE_SIGNATURE)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(s.trim())
+                .ok()
+        });
+    matches!(
+        crate::identity::attest::resolve_write_attest_level(
+            mem,
+            claimed_author,
+            claimed_bound_key,
+            presented_sig.as_deref(),
+            false,
+        ),
+        Ok(crate::identity::verify::AttestLevel::AgentAttested)
+    )
 }
 
 /// #2720 F-12 (CWE-346) — bind the DECIDER of an inbound federated pending
@@ -1924,11 +1982,32 @@ pub async fn sync_push(
             .get(crate::META_KEY_AGENT_ID)
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        // #2340 (FBL-32) — redact to the TO-BE-PERSISTED form FIRST. Moved
+        // AHEAD of attribution for #2863 so BOTH the crypto-attest HONOR check
+        // and the attestation stamp below verify over exactly the bytes
+        // `db::merge_inbound` will persist (the funnel's own redact is then an
+        // idempotent no-op). The reorder is behavior-preserving: redact touches
+        // only content/title/write_signature while attribution reads/writes only
+        // agent_id/attest_level. A cross-mode raw-signed row has its stale
+        // write_signature dropped inside the helper and lands honestly `claimed`.
+        crate::federation::receive_auth::redact_inbound_before_attestation(&mut to_insert);
+        // #2863 — resolve the CLAIMED author's enrolled key up front so a
+        // cryptographically-attested third-party claim (a valid propagated
+        // write_signature) is HONORED rather than re-attributed to the daemon
+        // relay sender (the #2860 re-broadcast divergence). Reused below as the
+        // attestation bound key when the claim is honored (attribute == claimed).
+        let claim_bound_key = original_claim
+            .as_deref()
+            .and_then(|c| db::agent_pubkey(&lock.0, c).ok().flatten());
+        let claim_write_attested = original_claim.as_deref().is_some_and(|c| {
+            inbound_claim_is_write_attested(&to_insert, c, claim_bound_key.as_deref())
+        });
         let attribute_agent = resolve_inbound_attribution(
             &mut to_insert,
             &body.sender_agent_id,
             &attest_cfg,
             peer_header_owned.as_deref(),
+            claim_write_attested,
         );
         // #1464 (v0.8.0) — per-write CONTENT attestation. Verify any
         // presented `metadata.write_signature` against the attributed
@@ -1937,16 +2016,14 @@ pub async fn sync_push(
         // third-party relayed claim. Skips re-attributed rows internally.
         // Hoist the author's bound key so the refusal WARN can distinguish
         // missing-author-key from missing-signature (item 7 observability —
-        // the manual substitute for the deferred TOFU key distribution).
-        //
-        // #2340 (FBL-32) — redact to the TO-BE-PERSISTED form FIRST, so the
-        // attestation below verifies + stamps over exactly the bytes
-        // `db::merge_inbound`'s storage funnel will persist (the funnel's own
-        // redact becomes an idempotent no-op). A cross-mode raw-signed row
-        // has its stale write_signature dropped inside the helper and lands
-        // honestly `claimed` instead of a false `agent_attested`.
-        crate::federation::receive_auth::redact_inbound_before_attestation(&mut to_insert);
-        let author_bound_key = db::agent_pubkey(&lock.0, &attribute_agent).ok().flatten();
+        // the manual substitute for the deferred TOFU key distribution). When
+        // the claim was honored, `attribute_agent == original_claim`, so reuse
+        // the key already looked up above (avoids a second lookup, #2863).
+        let author_bound_key = if Some(attribute_agent.as_str()) == original_claim.as_deref() {
+            claim_bound_key.clone()
+        } else {
+            db::agent_pubkey(&lock.0, &attribute_agent).ok().flatten()
+        };
         if let Err(e) = apply_inbound_write_attestation(
             &mut to_insert,
             &attribute_agent,
@@ -2098,7 +2175,13 @@ pub async fn sync_push(
         // operates on the exact row — with any re-attribution applied —
         // that is persisted here. `stamp_reflection_origin` carried the
         // `peer_origin` / `original_depth` / local-cap metadata.)
-        match db::merge_inbound(&lock.0, &to_insert) {
+        // #2863 — pass the receiver's VERIFIED verdict so the merge-over-existing
+        // path re-asserts `agent_attested` atomically when the persisted row is
+        // byte-identical to the signed unit this node just verified (the merge's
+        // `sanitize` otherwise demotes it to `claimed`). `row_is_agent_attested`
+        // reads the post-`apply` `to_insert` (THIS node's verdict, never a peer
+        // self-assertion).
+        match db::merge_inbound(&lock.0, &to_insert, row_is_agent_attested(&to_insert)) {
             Ok(actual_id) => {
                 applied += 1;
                 // v1.0.0 R19/A3 (#1948) — route-OUT dequarantine-on-attest.
@@ -4074,7 +4157,7 @@ mod tests {
         // verbatim and NOT rewritten (preserve #1056/#238 behaviour).
         let mut m = claiming("alice");
         assert_eq!(
-            resolve_inbound_attribution(&mut m, "ai:relay", &zero, Some("ai:relay")),
+            resolve_inbound_attribution(&mut m, "ai:relay", &zero, Some("ai:relay"), false),
             "alice"
         );
         assert_eq!(m.metadata["agent_id"], "alice");
@@ -4083,7 +4166,7 @@ mod tests {
         // to the sender AND rewrite ownership; stamp the bare-claim level.
         let mut m2 = claiming("alice");
         assert_eq!(
-            resolve_inbound_attribution(&mut m2, "ai:relay", &cfg, Some("ai:relay")),
+            resolve_inbound_attribution(&mut m2, "ai:relay", &cfg, Some("ai:relay"), false),
             "ai:relay"
         );
         assert_eq!(
@@ -4095,7 +4178,7 @@ mod tests {
         // (3) Enrolled, peer authorized to author as "bob" → trusted, preserved.
         let mut m3 = claiming("bob");
         assert_eq!(
-            resolve_inbound_attribution(&mut m3, "ai:relay", &cfg, Some("ai:relay")),
+            resolve_inbound_attribution(&mut m3, "ai:relay", &cfg, Some("ai:relay"), false),
             "bob"
         );
         assert_eq!(m3.metadata["agent_id"], "bob");
@@ -4104,7 +4187,7 @@ mod tests {
         // → trusted regardless of the allowlist.
         let mut m4 = claiming("ai:relay");
         assert_eq!(
-            resolve_inbound_attribution(&mut m4, "ai:relay", &cfg, Some("ai:relay")),
+            resolve_inbound_attribution(&mut m4, "ai:relay", &cfg, Some("ai:relay"), false),
             "ai:relay"
         );
 
@@ -4115,9 +4198,131 @@ mod tests {
             ..Memory::default()
         };
         assert_eq!(
-            resolve_inbound_attribution(&mut m5, "ai:relay", &cfg, Some("ai:relay")),
+            resolve_inbound_attribution(&mut m5, "ai:relay", &cfg, Some("ai:relay"), false),
             "ai:relay"
         );
+    }
+
+    /// #2863 — fed-consolidate-source-attest-parity (fix #1: attribution).
+    /// Drives the receive loop's attribution + apply sequence for a re-broadcast
+    /// tombstoned SOURCE relayed under the daemon federation identity (sender !=
+    /// the source's author). A third-party claim carrying a write_signature that
+    /// VERIFIES against the CLAIMED author's ENROLLED key is HONORED (lands
+    /// `agent_attested`); an unsigned / forged / unenrolled-author claim still
+    /// re-attributes to the sender and lands `claimed`.
+    #[test]
+    fn rebroadcast_source_honors_crypto_attested_claim_2863() {
+        use crate::federation::peer_attestation::PeerScope;
+        use std::collections::HashMap;
+
+        // Mirror of the receive-loop sequence (redact omitted — no secret in the
+        // fixture): compute the crypto-attest signal, resolve attribution,
+        // resolve the bound key exactly as the caller does, stamp.
+        fn drive(
+            mem: &mut Memory,
+            sender: &str,
+            cfg: &PeerAttestationConfig,
+            peer: Option<&str>,
+            claimed_key: Option<&str>,
+            require: bool,
+        ) -> String {
+            let original_claim = mem
+                .metadata
+                .get(crate::META_KEY_AGENT_ID)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let claim_write_attested = original_claim
+                .as_deref()
+                .is_some_and(|c| inbound_claim_is_write_attested(mem, c, claimed_key));
+            let attribute =
+                resolve_inbound_attribution(mem, sender, cfg, peer, claim_write_attested);
+            // Caller key-reuse: when the claim was honored (attribute == claim),
+            // the bound key is the claimed author's; otherwise the re-attributed
+            // sender's key (unenrolled in this fixture → None).
+            let bound = if Some(attribute.as_str()) == original_claim.as_deref() {
+                claimed_key
+            } else {
+                None
+            };
+            apply_inbound_write_attestation(
+                mem,
+                &attribute,
+                sender,
+                original_claim.as_deref(),
+                bound,
+                require,
+            )
+            .expect("apply must not reject (honored verifies; re-attributed skips)");
+            attribute
+        }
+
+        let author = "ai:hive-author";
+        let daemon = "ai:hive-memory-1"; // #2860 re-broadcast sender (fed identity)
+        let kp = keypair::generate(author).unwrap();
+        let author_pk = pk_b64(&kp);
+        // Enrolled peer authorized ONLY as itself — hive-author is a third party.
+        let mut peers = HashMap::new();
+        peers.insert(daemon.to_string(), PeerScope::default());
+        let cfg = PeerAttestationConfig::from_peers(peers);
+
+        let signed = |author_id: &str| -> Memory {
+            let mut m = wsig_mem(author_id);
+            let sig = attest::sign_memory_write(&kp, &m, author_id).unwrap();
+            put_write_sig(&mut m, &sig);
+            m
+        };
+
+        // (a) Self-relay signed (sender == author) → agent_attested [control].
+        let mut a = signed(author);
+        assert_eq!(
+            drive(&mut a, author, &cfg, Some(author), Some(&author_pk), true),
+            author
+        );
+        assert_eq!(a.metadata["attest_level"], "agent_attested");
+
+        // (b) THE FIX: third-party signed, enrolled peer NOT authorized as
+        // hive-author, author key enrolled → HONORED → agent_attested. (Pre-fix
+        // this re-attributed to `daemon` and landed `claimed`.)
+        let mut b = signed(author);
+        assert_eq!(
+            drive(&mut b, daemon, &cfg, Some(daemon), Some(&author_pk), true),
+            author,
+            "#2863: a crypto-attested third-party claim must be honored, not re-attributed"
+        );
+        assert_eq!(b.metadata["attest_level"], "agent_attested");
+        assert_eq!(
+            b.metadata["agent_id"], author,
+            "authorship preserved as the true author"
+        );
+
+        // (c) Third-party UNSIGNED → re-attributed → claimed.
+        let mut c = wsig_mem(author);
+        assert_eq!(
+            drive(&mut c, daemon, &cfg, Some(daemon), Some(&author_pk), false),
+            daemon
+        );
+        assert_eq!(c.metadata["attest_level"], "claimed");
+
+        // (d) Third-party FORGED sig (present but invalid) → NOT honored (verify,
+        // not presence) → re-attributed → claimed.
+        let mut d = wsig_mem(author);
+        let mut sig = attest::sign_memory_write(&kp, &d, author).unwrap();
+        sig[0] ^= 0xFF;
+        put_write_sig(&mut d, &sig);
+        assert_eq!(
+            drive(&mut d, daemon, &cfg, Some(daemon), Some(&author_pk), false),
+            daemon
+        );
+        assert_eq!(d.metadata["attest_level"], "claimed");
+
+        // (e) Third-party signed but author key NOT enrolled (bound_key=None) →
+        // cannot verify → not honored → re-attributed → claimed (fail-closed).
+        let mut e = signed(author);
+        assert_eq!(
+            drive(&mut e, daemon, &cfg, Some(daemon), None, false),
+            daemon
+        );
+        assert_eq!(e.metadata["attest_level"], "claimed");
     }
 
     /// #1920 ADVERSARIAL — a hostile-but-enrolled peer must not be able to

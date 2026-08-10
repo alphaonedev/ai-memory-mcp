@@ -619,7 +619,7 @@ fn federation_merge_seals_content_and_snapshots_1773() {
     let mut inbound = existing.clone();
     inbound.content = "merged via federation".to_string();
     inbound.updated_at = "2026-06-01T00:00:00+00:00".to_string();
-    db::merge_inbound(&conn, &inbound).expect("merge_inbound");
+    db::merge_inbound(&conn, &inbound, false).expect("merge_inbound");
 
     // HIGH: read must return the MERGED content (re-sealed), not stale.
     let fetched = db::get(&conn, &id).expect("get").expect("exists");

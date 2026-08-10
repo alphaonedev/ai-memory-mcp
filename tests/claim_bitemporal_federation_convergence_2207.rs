@@ -124,7 +124,7 @@ fn remote_newer_close_replicates_by_id_and_valid_at_excludes() {
 
     // A peer CLOSED the claim: same id, NEWER updated_at, valid_until set.
     let closed = claim(&id, T1_CLOSE_UPD, Some(CLOSE_AT));
-    let merged_id = storage::merge_inbound(&conn, &closed).expect("merge inbound close");
+    let merged_id = storage::merge_inbound(&conn, &closed, false).expect("merge inbound close");
     assert_eq!(merged_id, id, "merge_inbound reconciles the existing id");
 
     // The receiver ADOPTED the close (newer-wins LWW on valid_until).
@@ -168,7 +168,7 @@ fn both_merge_orders_converge_to_identical_rows() {
     // Node 1 holds A (open), receives B (closed).
     let (_tmp1, conn1) = fresh_db();
     let id1 = storage::insert(&conn1, &a_open).expect("node1 seed A");
-    storage::merge_inbound(&conn1, &b_closed).expect("node1 merge B");
+    storage::merge_inbound(&conn1, &b_closed, false).expect("node1 merge B");
     let row1 = db::get(&conn1, &id1)
         .expect("node1 get")
         .expect("node1 row");
@@ -176,7 +176,7 @@ fn both_merge_orders_converge_to_identical_rows() {
     // Node 2 holds B (closed), receives A (open) — the REVERSE order.
     let (_tmp2, conn2) = fresh_db();
     let id2 = storage::insert(&conn2, &b_closed).expect("node2 seed B");
-    storage::merge_inbound(&conn2, &a_open).expect("node2 merge A");
+    storage::merge_inbound(&conn2, &a_open, false).expect("node2 merge A");
     let row2 = db::get(&conn2, &id2)
         .expect("node2 get")
         .expect("node2 row");
@@ -222,7 +222,7 @@ fn stale_remote_reopen_does_not_clobber_local_close() {
 
     // A STALE peer row: same id, OLDER updated_at, still OPEN (valid_until=None).
     let stale_open = claim(&id, T0_OPEN, None);
-    storage::merge_inbound(&conn, &stale_open).expect("merge stale open");
+    storage::merge_inbound(&conn, &stale_open, false).expect("merge stale open");
 
     // The local close survives (prefer-non-null / LWW keeps the close).
     let got = db::get(&conn, &id).expect("get").expect("row present");

@@ -208,7 +208,7 @@ async fn federation_receive_is_stopped() {
     let merge = mk_memory("merge-inbound", "peer merge under stop");
     assert!(
         matches!(
-            store.merge_inbound(&c, &merge).await,
+            store.merge_inbound(&c, &merge, false).await,
             Err(StoreError::Stopped { .. })
         ),
         "merge_inbound must refuse under stop"

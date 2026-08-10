@@ -928,7 +928,7 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
     mi_local.priority = 3;
     mi_local.updated_at = "2026-06-16T00:00:00+00:00".to_string();
     let stored_id = store
-        .merge_inbound(&ctx, &mi_local)
+        .merge_inbound(&ctx, &mi_local, false)
         .await
         .expect("merge_inbound fresh-insert ok");
     assert_eq!(stored_id, mi_id, "fresh merge_inbound returns the row id");
@@ -938,7 +938,7 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
     mi_inbound.priority = 5;
     mi_inbound.updated_at = "2026-06-16T09:00:00+00:00".to_string();
     let merged_id = store
-        .merge_inbound(&ctx, &mi_inbound)
+        .merge_inbound(&ctx, &mi_inbound, false)
         .await
         .expect("merge_inbound divergent same-id ok");
     assert_eq!(merged_id, mi_id, "merge returns the existing row id");

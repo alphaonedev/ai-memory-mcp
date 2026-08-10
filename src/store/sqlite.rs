@@ -801,13 +801,19 @@ impl MemoryStore for SqliteStore {
         db::insert_if_newer(&conn, memory).map_err(box_err)
     }
 
-    async fn merge_inbound(&self, _ctx: &CallerContext, inbound: &Memory) -> StoreResult<String> {
+    async fn merge_inbound(
+        &self,
+        _ctx: &CallerContext,
+        inbound: &Memory,
+        receiver_verified: bool,
+    ) -> StoreResult<String> {
         self.gate_record_stop()?;
         // v0.8.0 Pillar-3 (#1709 / #224) — delegate to the sqlite
         // free-fn, which does the atomic read-by-id → `merge_memory` →
-        // full-row write (else `insert_if_newer` fall-through).
+        // full-row write (else `insert_if_newer` fall-through). #2863 — thread
+        // the receiver-verified verdict for the atomic agent_attested re-assert.
         let conn = self.state.lock().await;
-        db::merge_inbound(&conn, inbound).map_err(box_err)
+        db::merge_inbound(&conn, inbound, receiver_verified).map_err(box_err)
     }
 
     async fn apply_remote_link(
@@ -3767,7 +3773,7 @@ mod tests {
         m2.content = "content-v2".to_string();
         m2.updated_at = (chrono::Utc::now() + chrono::Duration::seconds(5)).to_rfc3339();
         store
-            .merge_inbound(&ctx, &m2)
+            .merge_inbound(&ctx, &m2, false)
             .await
             .expect("merge_inbound v2");
 

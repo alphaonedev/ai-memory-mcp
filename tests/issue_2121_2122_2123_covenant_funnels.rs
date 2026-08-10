@@ -513,7 +513,7 @@ fn merge_inbound_same_id_never_refuses_missing_why_trace_under_enforce_2123() {
     inbound.content = "remote merged content".to_string();
     inbound.updated_at = (chrono::Utc::now() + chrono::Duration::seconds(2)).to_rfc3339();
     inbound.version = 2;
-    let merged_id = db::merge_inbound(&conn, &inbound)
+    let merged_id = db::merge_inbound(&conn, &inbound, false)
         .expect("merge_inbound must accept a why_trace-less inbound write under enforce");
     assert_eq!(merged_id, id);
     let got = db::get(&conn, &id).unwrap().unwrap();

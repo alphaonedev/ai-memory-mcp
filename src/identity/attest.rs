@@ -315,22 +315,28 @@ pub fn redact_before_sign(mem: &mut Memory) {
 }
 
 /// I/O-free core: resolve the [`AttestLevel`] for `mem` written by
-/// `agent_id` (given the agent's bound key + an optional presented
-/// signature) and, on success, stamp `metadata.attest_level`.
+/// `agent_id`, given the agent's bound key + an optional presented signature.
+/// Does NOT mutate `mem` (the sibling [`stamp_attestation`] writes the level).
 ///
 /// The signed surface is built from the memory itself —
 /// `agent_id + namespace + title + kind + created_at + sha256(content)` —
-/// so the signature commits to the row's identity-bearing fields. The
-/// caller supplies `agent_id` explicitly (every write surface already
-/// resolved it) rather than re-deriving it from metadata.
+/// recomputing `sha256(content)` over the PERSISTED bytes (never a presented
+/// digest) so the signature commits to the row's identity-bearing fields. The
+/// caller supplies `agent_id` explicitly (every write surface already resolved
+/// it) rather than re-deriving it from metadata.
+///
+/// #2863 — factored out of [`stamp_attestation`] so the federation receive path
+/// can reuse the EXACT same verification to decide whether to HONOR a
+/// cryptographically-attested third-party claim; sharing this one function
+/// guarantees the honor decision and the stamped `attest_level` cannot disagree.
 ///
 /// # Errors
 ///
 /// Surfaces [`crate::identity::verify::AttestError`] (forged signature,
 /// attestation required but absent, malformed signature, corrupt bound
 /// key) as an `anyhow::Error` so the write path rejects the store.
-pub fn stamp_attestation(
-    mem: &mut Memory,
+pub fn resolve_write_attest_level(
+    mem: &Memory,
     agent_id: &str,
     bound_pubkey_b64: Option<&str>,
     signature: Option<&[u8]>,
@@ -345,8 +351,27 @@ pub fn stamp_attestation(
         created_at: &mem.created_at,
         content_sha256: &content_hash,
     };
-    let level = crate::identity::verify::attest_write(&write, bound_pubkey_b64, signature, require)
-        .map_err(|e| anyhow::anyhow!("agent attestation failed: {e}"))?;
+    crate::identity::verify::attest_write(&write, bound_pubkey_b64, signature, require)
+        .map_err(|e| anyhow::anyhow!("agent attestation failed: {e}"))
+}
+
+/// Resolve the [`AttestLevel`] for `mem` written by `agent_id` (via
+/// [`resolve_write_attest_level`]) and, on success, stamp
+/// `metadata.attest_level`.
+///
+/// # Errors
+///
+/// Surfaces [`crate::identity::verify::AttestError`] (forged signature,
+/// attestation required but absent, malformed signature, corrupt bound
+/// key) as an `anyhow::Error` so the write path rejects the store.
+pub fn stamp_attestation(
+    mem: &mut Memory,
+    agent_id: &str,
+    bound_pubkey_b64: Option<&str>,
+    signature: Option<&[u8]>,
+    require: bool,
+) -> Result<AttestLevel> {
+    let level = resolve_write_attest_level(mem, agent_id, bound_pubkey_b64, signature, require)?;
 
     if let Some(obj) = mem.metadata.as_object_mut() {
         obj.insert(

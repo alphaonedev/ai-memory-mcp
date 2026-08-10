@@ -2101,7 +2101,7 @@ mod postgres_side {
         inbound.id = id.clone();
         inbound.content = plaintext.to_string();
         inbound.updated_at = (chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
-        let merged_id = MemoryStore::merge_inbound(&pg, &admin_ctx, &inbound)
+        let merged_id = MemoryStore::merge_inbound(&pg, &admin_ctx, &inbound, false)
             .await
             .expect("merge_inbound under encryption");
         assert_eq!(merged_id, id, "merge resolves the same-id UPDATE path");

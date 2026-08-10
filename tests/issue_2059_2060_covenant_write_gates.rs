@@ -511,7 +511,7 @@ fn merge_inbound_same_id_consults_governance_pre_write_2123() {
     let mut refused = seed.clone();
     refused.title = format!("now {GOV_MARKER_2123} laundered");
     refused.updated_at = chrono::Utc::now().to_rfc3339();
-    let err = db::merge_inbound(&conn, &refused)
+    let err = db::merge_inbound(&conn, &refused, false)
         .expect_err("a same-id merge into a governance-refused shape must be refused");
     assert!(
         err.downcast_ref::<GovernanceRefusal>().is_some(),
@@ -547,7 +547,7 @@ fn merge_inbound_same_id_never_refuses_missing_why_trace_under_enforce_2123() {
     no_wt.title = "benign merged title".to_string();
     no_wt.metadata = serde_json::json!({"agent_id": "alice"});
     no_wt.updated_at = chrono::Utc::now().to_rfc3339();
-    let id = db::merge_inbound(&conn, &no_wt)
+    let id = db::merge_inbound(&conn, &no_wt, false)
         .expect("a why_trace-less same-id inbound merge must NEVER be refused");
     assert_eq!(id, seed.id, "the merge resolves to the existing id");
     unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };

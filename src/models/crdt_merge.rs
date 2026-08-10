@@ -170,6 +170,78 @@ pub fn sanitize_inbound_attestation(inbound: &Memory) -> Memory {
     sanitized
 }
 
+/// #2863 — re-assert the RECEIVER-VERIFIED `agent_attested` level onto a merged
+/// row when `receiver_verified` is set AND the merged row's `SignableWrite`
+/// surface + `write_signature` is byte-identical to `verified_inbound` (the row
+/// the federation receive path already verified against the origin author's
+/// LOCALLY-ENROLLED key). [`sanitize_inbound_attestation`] correctly neutralizes
+/// the inbound level for the LWW TIEBREAK — a peer must never win by
+/// self-asserting `agent_attested` — but that must not DEMOTE a level THIS node
+/// INDEPENDENTLY verified over the persisted bytes (env #94). Applied on the
+/// merged row INSIDE the merge transaction and BEFORE the content-sealing write,
+/// so the plaintext surface compare holds on at-rest-encrypted deployments too
+/// (the `content` column becomes ciphertext only AFTER the write) and there is
+/// no non-atomic crash window that could strand a TERMINAL tombstone at
+/// `claimed`. `receiver_verified` is the caller's trust signal
+/// (`row_is_agent_attested` of the row AFTER `apply_inbound_write_attestation`,
+/// which always overwrites `attest_level` with THIS node's verdict); every
+/// NON-receive caller passes `false` for a byte-identical legacy merge.
+#[must_use]
+pub fn reassert_verified_attestation(
+    mut merged: Memory,
+    verified_inbound: &Memory,
+    receiver_verified: bool,
+) -> Memory {
+    if receiver_verified && signed_surface_matches(&merged, verified_inbound) {
+        if let Some(obj) = merged.metadata.as_object_mut() {
+            obj.insert(
+                field_names::ATTEST_LEVEL.to_string(),
+                Value::String(AttestLevel::AgentAttested.as_str().to_string()),
+            );
+        }
+    }
+    merged
+}
+
+/// #2863 — do two rows carry a byte-identical 6-field `SignableWrite` surface
+/// (`agent_id` + `namespace` + `title` + `memory_kind` + `created_at` +
+/// `content`) AND the same non-empty `write_signature`? The signature commits to
+/// `sha256(content)` + the other five fields, so an identical signature over an
+/// identical surface proves the persisted merged row IS the exact coherent
+/// signed unit the receiver verified — never a field-wise CRDT accretion
+/// (a "Frankenstein" row) nor a distinct signed unit. A missing/empty signature
+/// or agent_id on either side is a non-match (fail-closed).
+fn signed_surface_matches(a: &Memory, b: &Memory) -> bool {
+    fn meta_str<'m>(m: &'m Memory, key: &str) -> Option<&'m str> {
+        m.metadata.get(key).and_then(Value::as_str)
+    }
+    // `created_at` compared by INSTANT, not bytes: a lossless RFC3339
+    // re-rendering (e.g. postgres round-tripping `TIMESTAMPTZ` back to the wire,
+    // or `Z` vs `+00:00`) represents the SAME signed instant and must still
+    // match, while a genuinely different `created_at` (a Frankenstein whose
+    // timestamp came from a distinct row) is rejected — so the two backends
+    // cannot drift on the rendering seam. Unparseable values fall back to byte
+    // equality (fail-closed on the pathological case).
+    let created_at_eq = match (
+        chrono::DateTime::parse_from_rfc3339(&a.created_at),
+        chrono::DateTime::parse_from_rfc3339(&b.created_at),
+    ) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a.created_at == b.created_at,
+    };
+    let sig_a = meta_str(a, field_names::WRITE_SIGNATURE);
+    let agent_a = meta_str(a, param_names::AGENT_ID);
+    a.content == b.content
+        && a.title == b.title
+        && a.namespace == b.namespace
+        && created_at_eq
+        && a.memory_kind == b.memory_kind
+        && agent_a == meta_str(b, param_names::AGENT_ID)
+        && agent_a.is_some_and(|s| !s.is_empty())
+        && sig_a == meta_str(b, field_names::WRITE_SIGNATURE)
+        && sig_a.is_some_and(|s| !s.is_empty())
+}
+
 /// #1755 item 3b — cap an UNTRUSTED inbound row's `updated_at` to a
 /// freshness ceiling (`now + skew_secs`) before it is merged, so a
 /// federated relay cannot post-date `updated_at` — the PRIMARY LWW
@@ -952,6 +1024,74 @@ mod tests {
         let sanitized = sanitize_inbound_attestation(&no_level);
         assert!(sanitized.metadata.get("attest_level").is_none());
         assert_eq!(attest_rank(&sanitized), 0);
+    }
+
+    // ---- #2863 reassert_verified_attestation --------------------------------
+
+    /// A `base`-shaped row carrying `agent_id` + `write_signature` + a given
+    /// `attest_level` (the six signed-surface fields come from `base`).
+    fn signed_row_2863(sig: &str, level: &str) -> Memory {
+        let mut m = base("a", "2026-06-16T00:00:00+00:00");
+        m.metadata = json!({
+            "agent_id": "ai:hive-author",
+            "write_signature": sig,
+            "attest_level": level,
+        });
+        m
+    }
+
+    fn level_of(m: &Memory) -> Option<&str> {
+        m.metadata.get("attest_level").and_then(Value::as_str)
+    }
+
+    #[test]
+    fn reassert_restores_agent_attested_on_matching_surface_2863() {
+        // sanitize demoted the merged row to `claimed`, but its full SignableWrite
+        // surface + write_signature equals the receiver-verified inbound → restore.
+        let verified = signed_row_2863("SIG", "agent_attested");
+        let merged = signed_row_2863("SIG", "claimed");
+        let out = reassert_verified_attestation(merged, &verified, true);
+        assert_eq!(level_of(&out), Some("agent_attested"));
+    }
+
+    #[test]
+    fn reassert_noop_when_not_receiver_verified_2863() {
+        // Non-receive callers pass false → byte-identical legacy merge (claimed).
+        let verified = signed_row_2863("SIG", "agent_attested");
+        let merged = signed_row_2863("SIG", "claimed");
+        let out = reassert_verified_attestation(merged, &verified, false);
+        assert_eq!(level_of(&out), Some("claimed"));
+    }
+
+    #[test]
+    fn reassert_noop_on_content_surface_mismatch_2863() {
+        // A Frankenstein / local-won row (different content) must stay claimed.
+        let verified = signed_row_2863("SIG", "agent_attested");
+        let mut merged = signed_row_2863("SIG", "claimed");
+        merged.content = "DIFFERENT-CONTENT".into();
+        let out = reassert_verified_attestation(merged, &verified, true);
+        assert_eq!(level_of(&out), Some("claimed"));
+    }
+
+    #[test]
+    fn reassert_noop_on_signature_mismatch_2863() {
+        // A DIFFERENT write_signature (a distinct signed unit) must not be laundered.
+        let verified = signed_row_2863("SIG-A", "agent_attested");
+        let merged = signed_row_2863("SIG-B", "claimed");
+        let out = reassert_verified_attestation(merged, &verified, true);
+        assert_eq!(level_of(&out), Some("claimed"));
+    }
+
+    #[test]
+    fn reassert_noop_when_signature_absent_2863() {
+        // No write_signature on either side → fail-closed (never re-assert).
+        let mut verified = base("a", "2026-06-16T00:00:00+00:00");
+        verified.metadata =
+            json!({ "agent_id": "ai:hive-author", "attest_level": "agent_attested" });
+        let mut merged = base("a", "2026-06-16T00:00:00+00:00");
+        merged.metadata = json!({ "agent_id": "ai:hive-author", "attest_level": "claimed" });
+        let out = reassert_verified_attestation(merged, &verified, true);
+        assert_eq!(level_of(&out), Some("claimed"));
     }
 
     /// Set `metadata.version_vector` from `(peer, ts)` pairs (test helper).
