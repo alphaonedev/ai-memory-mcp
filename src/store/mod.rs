@@ -2312,6 +2312,26 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #2860 (federation data-integrity, 5-agent vote `4d3ea1c5`) — replace a
+    /// single row's `metadata` JSON in place. Used ONLY by the federated
+    /// consolidate finalize on the postgres branch (the sqlite branch calls the
+    /// `db::set_row_metadata` free function directly on its open connection) to
+    /// stamp the substrate `write_signature` + `attest_level=agent_attested` +
+    /// `consolidator_tenant`/`summary_source` provenance onto a freshly-minted
+    /// consolidated row so the STORED origin row byte-matches the broadcast copy.
+    /// Deliberately does NOT touch `updated_at`/`version` — see the sqlite
+    /// twin's doc. Default returns `UnsupportedCapability`.
+    async fn set_row_metadata(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+        _metadata_json: &str,
+    ) -> StoreResult<()> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "SET_ROW_METADATA".to_string(),
+        })
+    }
+
     /// Recursive-learning primitive (#655 Task 4/8): mint a reflection
     /// memory over `input.source_ids`, computing
     /// `reflection_depth = max(source depths) + 1`, refusing with

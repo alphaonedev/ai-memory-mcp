@@ -1018,7 +1018,7 @@ mod tests {
         let cfg = build_config(vec![url1, url2], 2, 2000);
         let new_mem = sample_memory();
         let sources = vec!["src-a".to_string(), "src-b".to_string()];
-        let tracker = broadcast_consolidate_quorum(&cfg, &new_mem, &sources)
+        let tracker = broadcast_consolidate_quorum(&cfg, &new_mem, &sources, &[], &[])
             .await
             .unwrap();
         assert!(finalise_quorum(&tracker).is_ok());
@@ -1038,7 +1038,7 @@ mod tests {
         let (url2, _) = spawn_mock_peer(MockBehaviour::Fail).await;
         let cfg = build_config(vec![url1, url2], 3, 500);
         let new_mem = sample_memory();
-        let tracker = broadcast_consolidate_quorum(&cfg, &new_mem, &[])
+        let tracker = broadcast_consolidate_quorum(&cfg, &new_mem, &[], &[], &[])
             .await
             .unwrap();
         let err = finalise_quorum(&tracker).unwrap_err();
@@ -3083,7 +3083,7 @@ mod tests {
         let url1 = spawn_id_drift_peer().await;
         let cfg = build_config(vec![url1], 2, 1000);
         let new_mem = sample_memory();
-        let tracker = broadcast_consolidate_quorum(&cfg, &new_mem, &[])
+        let tracker = broadcast_consolidate_quorum(&cfg, &new_mem, &[], &[], &[])
             .await
             .unwrap();
         let err = finalise_quorum(&tracker).unwrap_err();
@@ -3299,7 +3299,7 @@ mod tests {
         let cfg = build_config(vec![url1, url2], 2, 2000);
         let mem = sample_memory();
         let sources = vec!["src-1".to_string(), "src-2".to_string()];
-        let _tracker = broadcast_consolidate_quorum(&cfg, &mem, &sources)
+        let _tracker = broadcast_consolidate_quorum(&cfg, &mem, &sources, &[], &[])
             .await
             .unwrap();
         for _ in 0..200 {

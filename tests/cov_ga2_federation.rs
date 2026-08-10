@@ -1189,7 +1189,7 @@ async fn broadcast_consolidate_quorum_no_peers_ok() {
     let cfg = quorum_config(Vec::new());
     let mem = ga2_memory("consol-new");
     let sources = vec!["src-a".to_string(), "src-b".to_string()];
-    let tracker = ai_memory::federation::sync::broadcast_consolidate_quorum(&cfg, &mem, &sources)
+    let tracker = ai_memory::federation::sync::broadcast_consolidate_quorum(&cfg, &mem, &sources, &[], &[])
         .await
         .expect("consolidate quorum returns tracker");
     assert!(tracker.finalise(std::time::Instant::now()).is_ok());

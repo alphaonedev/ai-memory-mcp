@@ -103,6 +103,7 @@ pub mod approvals;
 pub mod archive;
 pub mod bulk;
 pub mod capture_turn;
+pub mod consolidate_federation;
 pub mod coordination;
 pub mod create;
 pub mod errors;

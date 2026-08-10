@@ -453,7 +453,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // what it now refuses, why the disposition is surface-keyed rather than
     // unconditional (3x3 vote 7-2), and which residual is deliberate.
     // MEASURED post-change: 28_047. Ceiling 27_900 -> 28_120 (+73 headroom).
-    ("src/storage/mod.rs", 28_200), /* 2026-08-04 #2718/CB-14 QUAL-10: `memories_updated_since_counted` (raw pre-drop row count for the F7 tie-group guard) + `sync_state_merge_authorized` (per-key-authorized #2670-class fold) + 2 unit tests. Measured 28_160; ceiling 28_120 -> 28_200 (+40 headroom). */
+    ("src/storage/mod.rs", 28_300), /* 2026-08-04 #2718/CB-14 QUAL-10: `memories_updated_since_counted` (raw pre-drop row count for the F7 tie-group guard) + `sync_state_merge_authorized` (per-key-authorized #2670-class fold) + 2 unit tests. Measured 28_160; ceiling 28_120 -> 28_200 (+40 headroom). 2026-08-10 (#2860, 5-agent vote 4d3ea1c5): the `set_row_metadata` free fn (federated-consolidate finalize metadata persist). Measured 28_211; ceiling 28_200 -> 28_300 (+89 headroom). */
     // 2026-07-21 (#1802 R-05 S1) — NEW submodule extracted from
     // storage/mod.rs (doctor / observability probes). Measured 698;
     // ceiling 800 (+102).

@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (federation data-integrity — CERT-BLOCKING)
+
+- **Tenant-attributed federated consolidation now CONVERGES under strict
+  write-sig** (#2860, follow-up to #2856/#2861; 5-agent adversarial vote
+  `4d3ea1c5`, Option A). `POST /api/v1/consolidate` minted a NEW
+  substrate-DERIVED memory (LLM summary / deterministic concat produced by the
+  origin DAEMON) stamped `metadata.agent_id=<tenant>` with NO
+  `write_signature`; the daemon cannot sign as the tenant, so under the
+  v1.0.0-default `AI_MEMORY_FED_REQUIRE_WRITE_SIG=1` the receiver refused it as
+  an unsigned honored third-party relay (`unenrolled_author_strict`) — it
+  committed on the origin but never reached peers (silent inter-node
+  divergence, forbidden by the North Star). **The fix, send-path/mint-site
+  only (no receiver-twin, wire-schema, or `SignableWrite` change):** on the
+  FEDERATED path the consolidation is now authored as the daemon's federation
+  identity (`FederationConfig::sender_agent_id`) — the substrate that ACTUALLY
+  derived the bytes and HOLDS the signing key — so it SELF-RELAYS past the
+  strict gate (`require = strict && attribute != sender` is structurally
+  false) and converges at EVERY peer regardless of key enrollment, and a
+  best-effort daemon `write_signature` over the standard 6-field
+  `SignableWrite` upgrades it to `attest_level=agent_attested` where the daemon
+  key is enrolled (required for a VISIBLE, non-quarantined convergence under
+  the hardened `asi-hard` profile, which pins
+  `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED=1`). Crypto-honest (`agent_id ==
+  signer == sender`, no CWE-346 decoupling); matches the already-converging
+  curator `ConsolidationPass`. The invoking tenant + source authors are
+  retained as **UNTRUSTED provenance** (`metadata.consolidator_tenant` +
+  `consolidated_from_agents`; nothing authorizes off them), and the
+  content-authorship truth of a caller-SUPPLIED summary is recorded in
+  `metadata.summary_source` (`caller` | `substrate`).
+- **The consolidation's `derived_from` lineage edges + source disposition now
+  replicate too** (#2860) — previously `broadcast_consolidate_quorum` shipped
+  only `deletions:[source_ids]` (a hard-DELETE), so under the v1.0.0-default
+  `AI_MEMORY_CONSOLIDATE_TOMBSTONE_SOURCES` disposition the origin TOMBSTONED +
+  retained its sources while peers HARD-DELETED them and never received the
+  navigable edges — a second divergence. The broadcast now carries the
+  navigable `C -> source` `derived_from` edges on the existing `links[]` lane
+  and, under the tombstone disposition, re-broadcasts the RETAINED tombstoned
+  source rows on the `memories[]` lane (converging their `lifecycle_state` via
+  the receiver's normal LWW merge, their original `write_signature` still
+  valid) instead of hard-deleting them; the legacy hard-delete disposition
+  keeps the `deletions[]` list unchanged. Backend-parity pinned by a live-pg
+  test; cross-backend authorship/finalize logic covered by unit tests.
+- **New `MemoryStore::set_row_metadata`** SAL primitive (both adapters;
+  additive) — an in-place `metadata` replace (no `updated_at`/`version` bump)
+  used by the federated-consolidate finalize so the stored origin row
+  byte-matches the broadcast copy (a catch-up re-send of a signature-less row
+  would otherwise flip a peer's `agent_attested` row back to `claimed` and
+  re-quarantine it under `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`).
+
 ### Docs / gates (perfection wave 2 — post-#2844 remainder; #2837 #2838 #2839 #2834)
 
 - **New reference-doc COMPLETENESS gate** `scripts/check-doc-surface-completeness.sh`
