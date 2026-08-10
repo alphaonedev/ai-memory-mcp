@@ -367,6 +367,12 @@ footer a{color:var(--text-muted)}
         <div class="mode-desc">Auto-tag, contradiction detection, consolidation. Tier-gated: smart adds LLM tagging, autonomous adds rerank + auto-merge.</div>
       </div>
     </div>
+
+    <p class="lede" style="margin-top:1.5rem">Two <strong>off-by-default cargo features</strong> layer optional acceleration onto that same binary; a stock build never compiles either in, and both <strong>fail closed to the default path</strong>:</p>
+    <ul>
+      <li><strong><code>vectorlite</code></strong> — an optional ANN vector-index backend. The native loadable extension is acquired <em>out-of-band</em> (there is no Rust crate; the crates.io <code>vectorlite</code> name is unrelated) via <code>scripts/fetch-vectorlite.sh</code>, then pointed to at runtime with <code>AI_MEMORY_VECTORLITE_EXTENSION=/path/to/vectorlite.so</code>. On any load or smoke-test failure it <strong>degrades to the built-in pure-Rust HNSW index</strong> — the durable memory text is never at risk (the index is derived, regenerable data). See <a href="https://alphaonedev.github.io/ai-memory-mcp/CONFIG_SCHEMA.html#optional-vector-index-backend-vectorlite-off-by-default">CONFIG_SCHEMA § "Optional vector-index backend"</a>.</li>
+      <li><strong><code>fs-notify</code></strong> — an event-driven (<code>inotify</code>/FSEvents/ReadDirectoryChangesW) watch path for the L3 capture daemon (<code>ai-memory watch</code>). Off by default the daemon uses a dependency-free std-only mtime/size poll loop; the feature layers the event-driven path <em>alongside</em> the poll fallback, degrading to the poll loop on any init failure.</li>
+    </ul>
   </div>
 </section>
 
