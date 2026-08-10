@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Federated consolidation no longer returns a success-shaped response while
+  silently diverging (#2856, data-integrity, 5-agent vote `4d3ea1c5`).** A
+  `POST /api/v1/consolidate` mints a NEW substrate-derived memory attributed to
+  the tenant consolidator, but the origin daemon cannot produce that tenant's
+  Ed25519 signature — so under the v1.0.0-default strict
+  `AI_MEMORY_FED_REQUIRE_WRITE_SIG=1` a peer refuses the unsigned honored-
+  third-party relay (`unenrolled_author_strict`) and buckets it into `skipped`
+  inside its own 2xx, missing the W-of-N quorum. The origin then returned a
+  `202 durability:"local"` body that OMITTED the created memory's `id`, so a
+  caller saw a success-shaped 2xx with no way to discover the row that
+  committed locally but did not replicate. The consolidate under-replication
+  `202` now carries the created `id` (plus the `consolidated` / `summary` /
+  `content` / `memory` fields the `201` success body emits) alongside
+  `quorum_met:false` / `durability:"local"`, so the under-replication is LOUD
+  and RECONCILABLE (the North-Star "degrade, never diverge silently" floor).
+  The `202`-not-`5xx` status is preserved (the local row is durable — W3/gap
+  G12). Applies to both the sqlite and postgres consolidate branches via the
+  shared `consolidate_fanout` helper. Regression:
+  `handlers::tests::http_consolidate_under_replicated_returns_created_id_2856`.
+  Convergent replication of a tenant-attributed consolidation (which requires
+  resolving the tenant-vs-substrate authorship model) is tracked as a
+  follow-up (#2860).
 - **`POST /api/v1/memory_reflect` false `400 "source memory not found"` on
   postgres (#2857)** — the postgres SAL branch of `handle_reflect_http`
   resolved the caller identity from the request BODY only (via

@@ -243,9 +243,20 @@ async fn consolidate_fanout(
     match crate::federation::broadcast_consolidate_quorum(fed, mem, source_ids).await {
         Ok(tracker) => {
             if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                // #869 — typed 503 envelope via the shared helper.
+                // #2856 (federation data-integrity, 5-agent vote `4d3ea1c5`,
+                // Option A) — a consolidation is a substrate-derived write the
+                // origin daemon cannot sign as the tenant consolidator, so a
+                // strict-write-sig peer refuses it and the quorum misses. Return
+                // the id-bearing under-replication 202 (was the bare
+                // `under_replicated_response`, which omitted the created `id`)
+                // so the caller can DISCOVER + reconcile the local-only row
+                // instead of seeing a success-shaped 2xx with nothing to act on.
                 let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                return Some(super::under_replicated_response(&payload));
+                return Some(super::under_replicated_consolidate_response(
+                    &payload,
+                    mem,
+                    source_ids.len(),
+                ));
             }
         }
         Err(e) => {
