@@ -1473,10 +1473,10 @@ impl std::error::Error for ValidationError {}
 /// Validate parameters** per the NSA Cybersecurity Information document
 /// on MCP security (U/OO/6030316-26 \| PP-26-1834, May 2026, Version
 /// 1.0). Every wire-entry layer — HTTP routes
-/// (`EXPECTED_PRODUCTION_ROUTES_COUNT=89` in `src/lib.rs`), MCP
-/// tools (`Profile::full().expected_tool_count()=74` per
+/// (`EXPECTED_PRODUCTION_ROUTES_COUNT` in `src/lib.rs`), MCP
+/// tools (`Profile::full().expected_tool_count()` per
 /// `src/profile.rs`), CLI subcommands
-/// (`EXPECTED_CLI_SUBCOMMANDS_DEFAULT=83` / `_SAL=85` in `src/lib.rs`)
+/// (`EXPECTED_CLI_SUBCOMMANDS_DEFAULT` / `_SAL` in `src/lib.rs`)
 /// — routes DTO-bundling validation through
 /// `RequestValidator` so adding a new cross-field invariant is one
 /// struct-method edit rather than 3+ audited per-surface edits. The

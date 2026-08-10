@@ -306,10 +306,10 @@ flowchart TB
 
 | Knob | Risk | When to enable |
 |---|---|---|
-| `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` (required by default since v0.9.0, #1751) | Unsigned writes are blocked (`403 ATTESTATION_FAILED`) by default — set `=0` to opt out and restore the permissive `claimed` posture | Already on by default; run `ai-memory identity generate` + agent registration so signed writes succeed instead of being rejected |
+| `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` (required by default on the HTTP direct-write surface only since v1.0.0, #1985 correcting #1751) | Unsigned `POST /api/v1/memories`(+`/bulk`) writes are blocked (`403 ATTESTATION_FAILED`) by default; MCP `memory_store` / CLI `store` stay permissive and land `claimed`. `=1` forces strict everywhere, `=0` permissive everywhere | Already on by default; run `ai-memory identity generate` + agent registration so signed writes succeed instead of being rejected |
 | `AI_MEMORY_REQUIRE_OWNED_ROWS=1` | MCP boot refusal on owner lockout | Strict multi-agent hosts with `AI_MEMORY_AGENT_ID` set |
 | `[memory] enabled = true` in Grok | Second memory system | Only if you want Grok native memory **in addition** to ai-memory |
-| `--profile core` | Drops 92 power/graph tools | Low-token or read-mostly workflows |
+| `--profile core` | Drops 95 of the 103 advertised entries | Low-token or read-mostly workflows |
 
 ---
 
@@ -344,7 +344,7 @@ printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_n
 
 ```text
 ai-memory: loaded config from ~/.config/ai-memory/config.toml
-ai-memory: profile = 8 families ... expected tool count = 101
+ai-memory: profile = 8 families ... expected tool count = 103
 ai-memory MCP server started (stdio, tier=autonomous)
 ```
 
@@ -393,7 +393,7 @@ Prefer explicit `allow` on read tools instead of a catch-all.
 | `memory_store` always pending | Namespace `write: approve` | Expected — use `memory_pending_approve` |
 | Grok never prompts on store | `permission_mode = "always-approve"` | Set `permission_mode = "default"` + `ask` rules |
 | LLM tools fail, recall works | OpenRouter/key/embedder down | `ai-memory doctor` → LLM/Embeddings Reachability |
-| `403 ATTESTATION_FAILED` | Attestation is required by default (v0.9.0, #1751) and the write is unsigned / no keys bound | Generate identity + register agent + sign writes, or set `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` to opt out |
+| `403 ATTESTATION_FAILED` | Attestation is required by default on the HTTP direct-write surface (v1.0.0, #1985 correcting #1751) and the write is unsigned / no keys bound (MCP/CLI writes are not gated by this default) | Generate identity + register agent + sign writes, or set `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` to opt out |
 | Agent ignores recall directive | Category-2 best-effort | Strengthen user rules; boot hook still runs mechanically |
 
 ---

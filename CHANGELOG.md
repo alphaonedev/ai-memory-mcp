@@ -7,6 +7,226 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs (3x7 sweep lane 1 — configuration surfaces; #2820-#2826)
+
+- **`ENV_VAR_CENSUS` in `scripts/check-docs-vs-ssot.sh` censused 102 of the
+  155 env vars production code reads; widened to 155** (#2820). The const
+  shape required the name to START with `ENV_`, so the `FOO_ENV` suffix
+  convention — the majority style for the security/federation knobs — was
+  invisible (68 declarations); clap-bound `#[arg(env = "…")]` flags were
+  not a recognised read shape at all; and the production boundary the
+  rule's comment had claimed since 2026-06-09 was never implemented. All
+  three fixed, plus a word-boundaried mention check. Seven production
+  knobs that had slipped through are now documented —
+  `AI_MEMORY_STORE_URL` + `AI_MEMORY_STORE_URL_FILE` (both **secret**: a
+  Postgres DSN password, whose own escape hatch was already documented),
+  `AI_MEMORY_REQUIRE_WHY_TRACE`, `AI_MEMORY_REQUIRE_IMMUTABLE_AUTHORSHIP`,
+  `AI_MEMORY_SKILLS_IMPORT_ROOT`, `AI_MEMORY_RECOVERY_GUARDIAN_PUBKEYS`,
+  `AI_MEMORY_RECOVERY_THRESHOLD`.
+- **`docs/CONFIG_SCHEMA.md`, `docs/production-deployment.md` and
+  `docs/enterprise-deployment.md` added to `DOC_FILES`** (#2823) — the
+  canonical configuration reference had never been checked by any
+  SSOT-drift rule. Surfaced and fixed: schema `v78` → `v88`, and a
+  `28-field Memory` → `30-field` claim.
+- **`max_inflight_requests` was documented with pre-#2032 semantics in
+  four places** (#2821), including the copy-pasteable `[limits]` block in
+  both CLAUDE.md and `docs/CONFIG_SCHEMA.md` — pasting the canonical
+  example verbatim DISABLED the v1.0.0 DoS admission guard. Root artefact
+  was the `LimitsSection.max_inflight_requests` doc-comment in
+  `src/config.rs`, now corrected along with both precedence paragraphs.
+- **The `asi-hard` pinned set was documented as 15 knobs; `KNOBS` has 17**
+  (#2822) — CLAUDE.md row #130 and `docs/deploy/README.md` both omitted
+  the two permissive-shaped pins whose violation REFUSES BOOT.
+- **Five surfaces still described the v0.10.0 permissive federation
+  defaults** (#2824); `docs/SECURITY.md` un-claimed a shipped fail-closed
+  control, steering operators away from the origin-author key enrollment
+  the default now requires.
+- **CLAUDE.md env-table row accuracy** (#2825): inverted default on
+  `AI_MEMORY_CONFIDENCE_SHADOW_SAMPLE_RATE` (`0.0` documented, `1.0`
+  actual — 100% of touches, not 0%); two false behavioural claims
+  (`AI_MEMORY_FED_PEER_FINGERPRINTS` "mixed-mode rollout";
+  `AI_MEMORY_REFLECT_DECORRELATION_MODE` `enforce` "INERT" when it can
+  refuse a reflection write); two credential-bearing rows re-classed
+  `secret`; four dead `Source:` anchors; duplicate row number `110`.
+- Frozen history preserved: `README.md`'s `## What's new in v0.8`
+  "opt-in" admission-control sentence and the `EXPECTED_SCHEMA=57`
+  pinned-release anchor were deliberately NOT changed.
+### Docs (3x7 lane-3 — behavioral/enforcement claims, GitHub Pages, compliance, CI-job truthfulness)
+
+- **`docs/integrations/claude-code.md` instructed operators to DISABLE the one
+  load-bearing attestation gate, on a premise false since #1985** (refs
+  [#2827](https://github.com/alphaonedev/ai-memory-mcp/issues/2827)). The guide asserted
+  "as of v0.9.0 ai-memory rejects unsigned writes" and prescribed a copy-pasteable
+  `"AI_MEMORY_REQUIRE_AGENT_ATTESTATION": "0"` block. `resolve_require_agent_attestation`
+  (`src/identity/attest.rs`) resolves an unset knob to `matches!(surface,
+  WriteSurface::HttpDirect)` — MCP `memory_store` is **permissive**, so a stock Claude Code
+  setup needs no override. Because `=0` is GLOBAL, following the guide turned OFF the
+  fail-closed `403 ATTESTATION_FAILED` on the HTTP direct-write surface — the network
+  surface. The call-out now explicitly RETRACTS the prior instruction rather than silently
+  dropping it, so an operator who already applied `=0` learns to remove it. The same
+  unscoped-attestation claim was corrected on **13 further live surfaces**; the ten
+  `docs/whats-new-v09.html` sites were CORRECT for v0.9.0 and are preserved.
+- **~60 HTML surfaces implied SQLite and Postgres are one identical API** (refs
+  [#2828](https://github.com/alphaonedev/ai-memory-mcp/issues/2828)). The #2811 Phase-2
+  remediation corrected the markdown and never reached the rendered pages: pre-fix the
+  strings `59`, `21` and "59 of 80" appeared in **zero** HTML files, and only four sentences
+  across two past-release pages disclosed the subset at all. Corrected the load-bearing six —
+  `performance.html` ("behaviorally identical", in the same paragraph that recommends
+  Postgres for >1M scale), `architectures-t5.html` ("identical surface area"),
+  `whats-new-v09.html:248` ("one API", contradicting `:446` on the same page),
+  `index.html` ("Identical semantics"), `evidence.html` ("full SAL-parity suite"), and
+  `feature-matrix.html`, the canonical route table, which had **no per-route backend column
+  at all**. `essays/brass-tacks-3-why.html:86` ("the same Cypher-shaped query surface in
+  both") was checked and is **accurate** — the whole `kg_*` family is pg-supported.
+- **`docs/encryption.html` claimed a CA-chain validation that does not exist** (refs
+  [#2829](https://github.com/alphaonedev/ai-memory-mcp/issues/2829)). The page said the
+  receiving daemon "validates the peer's cert chain (using the configured CA bundle) AND
+  checks its SHA-256 fingerprint"; `FingerprintAllowlistVerifier::verify_client_cert`
+  (`src/tls.rs`) takes `_intermediates` and `_now` as IGNORED parameters and its whole body is
+  a fingerprint comparison — PIN-ONLY, the SSH `known_hosts` model. Same page: added the
+  missing honest-limitation that **federation is NOT end-to-end encrypted** (plaintext memory
+  content on the wire; [#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968) OPEN,
+  and the stated rationale for both #2448 and #2477), corrected
+  `AI_MEMORY_FED_REQUIRE_WRITE_SIG` from "opt-in strict mode" to the v1.0.0 default-ON posture
+  (`FED_REQUIRE_WRITE_SIG_DEFAULT = true`, #1801→#1954), and restamped the page from v0.9.0.
+- **Six surfaces published 25 or 27 hook lifecycle events against `HOOK_EVENTS_COUNT = 22`,
+  two of them advertising REMOVED events** (refs
+  [#2832](https://github.com/alphaonedev/ai-memory-mcp/issues/2832)). `docs/audience/developer.html`
+  named `pre_recall` — removed by #2758 precisely because advertising a hook that never fires
+  is a false enforcement claim — and `README.md:138` enumerated four removed events. #2780
+  corrected the compliance count in one place and missed three cells on the same page;
+  `ROADMAP.md` contradicted itself (22 at `:431`, 27 at `:799` and `:1263`).
+- **`README.md` published `token-budget` as a "required status check" and a "hard CI gate"
+  with the wrong ceiling** (refs
+  [#2835](https://github.com/alphaonedev/ai-memory-mcp/issues/2835)). It carries no required
+  context; the workflow enforces **6750** while the cited 11,000 is the deliberately-looser
+  `cargo test` backstop. Also corrected `docs/reproducible-baselines.html` ("regression gate
+  on every PR" for an advisory bench).
+- **Stale source doc-comment**: `src/handlers/federation_receive.rs` described
+  `AI_MEMORY_FED_REQUIRE_WRITE_SIG` as "default off" 200 lines from
+  `FED_REQUIRE_WRITE_SIG_DEFAULT = true` — the comment a future doc gets written from.
+- **`docs/v1.0.0/perfect-endpoint-assessment/**` carries a FROZEN-ARTEFACT banner.** The
+  49-ballot tree asserts ~20 pre-v1.0.0 defaults as fact, several flipped by the very work
+  those ballots recommended (`w7-a3-claims-discipline.md` — the claims register itself —
+  prescribes replacement wordings now wrong in both directions). Disclosed with a reversal
+  table rather than rewritten: re-pointing the ballots would falsify the record.
+
+### CI (3x7 lane-3 — two gates widened, both proven load-bearing)
+
+- **`scripts/check-docs-vs-ssot.sh` — the HookEvent rule was the last legacy hand-regex.**
+  It matched exactly two phrasings and scanned only `DOC_FILES`/`HTML_DOC_FILES`, so it
+  reported `hooks=22` and PASSED while six live surfaces published 25 or 27 — the #2492
+  defect ("a document that says the same thing in the seventh way nobody enumerated is
+  invisible") left un-generalised on this one rule. Replaced with noun-phrase anchors over a
+  dedicated `HOOK_DOC_FILES` set (separate from the shared arrays on purpose, so it cannot red
+  on count drift owned by a concurrent lane). Two subtleties are load-bearing: this legacy
+  per-rule function had **no historical guard** (only the #2492 scanner did), which the
+  generalised anchors made matter immediately — a mirrored `is_historical` now protects
+  README's prior-release paragraph and ROADMAP's frozen v0.7.1 baseline; and the bare
+  `lifecycle events` anchor needs `(?<![0-9])` as well as `(?<!ships )`, because without it the
+  engine re-anchors one character right and matches `5` out of `25`. On its first run the
+  widened rule caught 7 sites, including three `nsa-csi-mcp.html` cells #2780 missed.
+  `--self-test`: all five verbatim pre-fix phrasings REJECTED across md + html (each named by
+  file); historical mentions still PASS.
+- **`scripts/check-ci-job-claims.sh` was structurally blind to the bare-stem citation.**
+  `WF_TICK` requires a `.yml` suffix and `JOB_CITE` requires the literal word "job", so
+  ``The `token-budget` workflow is a required status check`` registered no citation and the
+  ENFORCEMENT rule — the rule built for exactly that false claim — never evaluated it. Added
+  the `WF_WORD` shape (`` `<stem>` workflow `` → `<stem>.yml`) and widened the scan set beyond
+  the four original files. `--self-test`: the pre-fix shape is REJECTED **by the ENFORCEMENT
+  rule specifically**, and the near-miss (same citation, no enforcement verb) still PASSES so
+  the rule does not ban naming an advisory workflow.
+### Fixed — runtime manifest truthfulness
+
+- **The `memory_capabilities` manifest no longer tells an agent that
+  `memory_load_family` / `memory_smart_load` can reach an unloaded TOOL**
+  (refs [#2781](https://github.com/alphaonedev/ai-memory-mcp/issues/2781);
+  distinct from #864, which was the naming question). The v0.7.0 `summary`
+  string listed four "recovery paths" — `(b) call
+  memory_load_family(family=<name>) — preferred` and `(c) call
+  memory_smart_load(intent='<plain language>') — easiest` among them. Both
+  are FALSE: `LoadFamilyTool`'s own description is "Load top-k recent +
+  high-priority memories from a Family", its handler returns memory rows,
+  and `handle_smart_load` picks a family from a free-text intent and
+  forwards to that same handler. Neither mutates the tool registry or the
+  resolved `Profile`, so `tools/call` on a tool the active profile did not
+  load still returns `-32601 unknown tool: <name>` (the #1254 uniform
+  message). An NHI following the manifest took a dead end. The old `(d)
+  call the tool by name and recover from JSON-RPC -32601` was not a path
+  either — that is the OUTCOME, not a way to reach the tool. **Effect:**
+  the summary now states the `-32601` outcome up front, names profile
+  selection at MCP boot as the ONLY way to make an unloaded tool callable,
+  and still names both family loaders — as the MEMORY loaders they are.
+  Docs reconciled (`docs/v0.7/canonical-phrasings.md`, `docs/ADMIN_GUIDE.md`,
+  `docs/MIGRATION_v0.7.md` — the last two claimed the loaders "register
+  additional families at runtime without restarting the MCP server").
+  **Regression (R-203):** `tests/calibration_t0.rs::t0_summary_core_profile_names_the_one_real_recovery_path`
+  and `tests/discovery_gate_t1_t3.rs::t2_recognition_summary_disclaims_loaders_as_tool_recovery_paths`
+  both assert the corrected wording AND ban the four retired strings, so
+  the false framing cannot come back; `tests/capabilities_v3.rs` pins the
+  disclaimer under `core` and `full`.
+
+### Docs (drift remediation — playbook / profile docstrings / nsa-csi hook count)
+
+- **`docs/v1.0.0/nhi-playbook-P0-P11.md` — four assertions reconciled to
+  v1.0.0 behavior** (refs [#2796](https://github.com/alphaonedev/ai-memory-mcp/issues/2796)).
+  The binary was correct in each case; the playbook drifted, so a tester
+  taking it literally would mis-flag a PASS as a FAIL. **P0** — `tools/list`
+  under `--profile core` renders **8** entries (the 7 `Family::Core` tools
+  that `Profile::core().expected_tool_count()` reports, plus the always-on
+  `memory_capabilities` bootstrap `ALWAYS_ON_TOOLS` registers outside the
+  profile filter), the same framing the doc already used for full.
+  **P2** — the "every explicit delete/forget writes an `archived_memories`
+  row" claim is scoped to its true subject: `memory_forget` archives
+  (`archive_reason='forget'`, same transaction as the delete per #1776)
+  when `[storage].archive_on_gc` is on (the default), and `memory_delete`
+  by id is a HARD delete with NO archive copy — a caveat an operator must
+  have, since under the default `append_only=off` it destroys durable text
+  irrecoverably. **P9** — an MCP-stored memory stamps `source = "nhi"`
+  (`validate::DEFAULT_NHI_SOURCE`, vendor-neutral since #1175), not
+  `claude`; the client identity lives in `metadata.agent_id`. **P10** — the
+  MCP `memory_stats` field is `total` (the serialized `models::memory::Stats`,
+  plus the #2334 `live` / `expired_pending_gc` siblings); `total_memories`
+  is the HTTP admin / doctor / boot spelling of the same value, and the two
+  surfaces are now distinguished rather than conflated.
+- **`docs/compliance/nsa-csi-mcp-security-mapping.md` no longer claims 27
+  `HookEvent` variants** (refs [#2780](https://github.com/alphaonedev/ai-memory-mcp/issues/2780)).
+  `HOOK_EVENTS_COUNT` is **22** (`src/config.rs`) — #2637 removed the
+  never-fired `pre_archive` gate (27 → 26) and #2758 removed `pre_recall` /
+  `pre_search` / `pre_transcript_store` / `post_transcript_store` (26 → 22).
+  The doc named the exact SSOT test it contradicted. Both citations (§2.7
+  concern-c table row + §3.3) corrected; `ROADMAP.md`'s current-state
+  parenthetical inside the frozen v0.7.1 baseline corrected 27 → 22. The
+  dated `docs/audit/3x7-claims-register-2026-08-01.md` keeps its 27 — that
+  figure was TRUE at the register's HEAD `2f32dde1` (2026-08-01, before
+  both removals landed 2026-08-07) — and carries an Erratum instead, per
+  the frozen-snapshot policy that keeps CHANGELOG and the v0.7 migration
+  guides out of the drift gate.
+- **`scripts/check-docs-vs-ssot.sh` now sees the phrasings that drifted.**
+  The HookEvent rule only knew "hook lifecycle events", so the nsa-csi
+  ``**27** `HookEvent` variants`` claim was invisible for the two releases
+  it was wrong across; two bold-anchored alternatives were added (the
+  bold anchor keeps ROADMAP §11.3.1's legitimate historical "25 hook
+  lifecycle events at v0.7.1" untouched, same reasoning as the
+  bold-only `CURRENT_SCHEMA_VERSION` rule). `docs/v1.0.0/nhi-playbook-P0-P11.md`
+  joins `DOC_FILES` — it opens with an explicit "v1.0.0 SSOT values used
+  below" block that a tester reads as the pass/fail bar, and was not
+  walked. Both additions verified load-bearing by re-planting the pre-fix
+  claims and confirming the gate REJECTS them.
+- **`src/profile.rs` profile docstrings stopped citing rotted literals**
+  (refs [#2782](https://github.com/alphaonedev/ai-memory-mcp/issues/2782)).
+  `Profile::power()` said "30 tools (core 7 + power 23)" against a live 56
+  (core 7 + a 49-entry `Family::Power` slice), and the module doc said
+  "**74 advertised entries at v0.7.0** (73 callable …)" against a live
+  103/102. `graph()` said 18 against a live 19, having missed the v0.9.0
+  #1859 `memory_lineage` addition. Every per-profile count now leads with
+  the `Profile::<name>().expected_tool_count()` accessor (the SSOT that
+  cannot drift); where a figure is still stated it carries its release
+  anchor. Same class fixed in `src/mcp/tools/capabilities.rs` (the F13
+  comment's "73 / 74 at v0.7.0"), `src/validate.rs` (a present-tense
+  docstring citing 89 routes / 74 tools / 83/85 CLI subcommands, now
+  naming the consts), and `docs/ADMIN_GUIDE.md` (a "101 advertised
+  entries / 100 callable" profile table cell, now 103/102).
 <!-- #2812 (feat/do-hive-multinode-federation) -->
 ### Added (Track D federated multi-node DO substrate for the v1.0.0 enterprise-cert round)
 
@@ -16,6 +236,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **`infra/do-hive/crypto/gen-certs.sh`** — additive `HIVE_NODE_IPS="ip1 ip2 ..."` mode minting `hive-node-1..N` leaves (SAN = localhost + 127.0.0.1 + that droplet's private VPC ip) and a per-node allowlist pinning every OTHER node plus the node ITSELF (its own client cert is the only one it holds, and both the on-droplet bootstrap and `federate.sh`'s assertions probe `:9077` with it) — and NOTHING else: no operator/bastion cert is minted, because nothing needs one and an unused trust anchor is a liability. Unset leaves the legacy localhost/peerA/peerB material byte-identical.
   - **`infra/do-hive/federate.sh`** — the post-apply wiring + the Track D assertions. It NEVER calls terraform, NEVER spawns a droplet and refuses with no side effects unless the outputs describe >= 2 nodes (the safety property `measure-capacity-ramp.sh` already declares). Every assertion runs ON a droplet over SSH, never from the orchestrator host: the peer URLs are PRIVATE VPC addresses and the `:9077` rule admits only hive droplet ids, so an orchestrator-host curl could not reach them even if the address routed. `verify` asserts: each node answers `/health` over mTLS AND refuses a no-cert client; **cross-host**, node 1 reaches node 2 at its private `https://<ip>:9077/api/v1/health` with node 1's peer cert (the assertion the local 2-daemon legs structurally cannot make); a `W=2` quorum write admitted at node 1 returns `201 quorum_met` (or `202` locally-durable on a late ack) and the row is readable at node 2; and a SIGNED write authored on node 1 reaches `metadata.attest_level = "agent_attested"` at node 2 — the cross-peer content write-sig lane, which needs the author key enrolled at BOTH nodes plus the v1.0.0 default-on `AI_MEMORY_FED_REQUIRE_WRITE_SIG`. The signature is computed on the orchestrator host; the author private key never leaves it.
   - **`infra/do-hive/README-measurement.md`** — the `-var memory_count=2` run recipe, the post-boot verification table, the triage commands, and an honest statement of the **secrets-in-terraform-state tradeoff**: private crypto material never touches terraform (it would land both in `terraform.tfstate`, which `spawn.sh` copies into `.local-runs/do-hive-runs/<ts>/`, and in the droplet metadata service), the rejected droplet-1-generates-and-distributes alternative would be trust-on-first-use over plaintext (a federation-encryption certification cannot rest on that), and the resulting honest cost is that `terraform apply` yields two nodes parked in a fail-closed wait plus one operator command.
+### Docs (3x7 documentation-drift sweep, lane 2 — API-surface counts + net-new completeness)
+
+- **Corrected 39 stale API-surface count claims across 25 live markdown
+  docs, both SDKs and one `src/` doc comment.** `scripts/check-docs-vs-ssot.sh`
+  was GREEN throughout: its `DOC_FILES` set is narrower than the doc corpus,
+  so the whole class was invisible to it (#2830, gate widening tracked in
+  #2839). Canonical values re-derived from source, not from prose: tools
+  **103** advertised / 102 callable, core **8** advertised, graph 19, admin
+  21, power 56; HTTP **94** registrations / **80** unique paths; CLI **90**
+  default / **92** `sal`; schema **v88**; `Memory` **30** fields;
+  `HookEvent` **22**. Highest-blast-radius corrections:
+  - `ROADMAP.md:799` claimed `HookEvent` has 27 variants **and quoted the
+    awk command that returns 22**; `docs/compliance/nsa-csi-mcp.html` has
+    the same self-invalidating shape and is handed to lane 3 (#2837).
+  - `docs/v1.0.0/release-notes.md` — the v1.0.0 surface table's own CLI
+    row said `89 / 91`; corrected to `90 / 92`.
+  - `docs/DEVELOPER_GUIDE.md:851` said "advertises 101 entries (102
+    callable …)" — contradictory inside one sentence.
+  - `docs/postgres-age-guide.md:483` documented a **phantom endpoint**,
+    `GET /api/v1/memories/:id/links`, which is registered nowhere.
+  - `docs/ADMIN_GUIDE.md` + `docs/hook-pipeline.md` still enumerated the
+    `PreRecall` / `PreSearch` / `PreTranscriptStore` / `PostTranscriptStore`
+    events removed by #2758; rewritten to the real 15 + 5 + 2 = 22.
+  - `ROADMAP.md:13` and `docs/README.md` still called v0.9.0 the current
+    release. Both now say v1.0.0 is the current release and the
+    `Cargo.toml` stamp **while stating that no `v1.0.0*` tag is cut**, so
+    v0.9.0 remains the newest published tag — the release badge and link
+    deliberately still point at v0.9.0 rather than a URL that would 404.
+  - True historical snapshots were preserved throughout (the per-release
+    `README.md` surface paragraphs, the frozen v0.7.1 ROADMAP baseline,
+    `docs/MIGRATION_*.md`, `docs/v0.*/`, and `src/validate.rs:1386-1388`,
+    which is explicitly scoped "at v0.7.0").
+- **Closed three reference-doc completeness gaps where the doc asserted a
+  completeness it did not have** (#2831). `docs/CLI_REFERENCE.md` claims to
+  track all 90/92 subcommands but omitted `capability`, `model-attest`,
+  `epoch-apply` and `lineage` — `model-attest` had no user-facing
+  documentation anywhere. `docs/API_REFERENCE.md` claims "80 unique URL
+  paths" but documented 76, omitting `PUT /api/v1/agents/{id}/pubkey`,
+  `GET /api/v1/memories/{id}/lineage`, `POST /api/v1/checkpoints/{id}/resolve`
+  and `POST /api/v1/skill/{id}/retire`. `docs/agent-skills.md` said the
+  `memory_skill_*` family is 7 tools; it is **9** — and the two
+  undocumented verbs were the #2024 destructive pair, including the
+  irreversible `memory_skill_delete` hard purge, whose retire-first intent
+  gate and surviving signed `skill.purged` audit row were reachable only
+  from this changelog. All three sets re-verified empty after the fix.
+- **Documented five net-new v1.0.0 surfaces that had reached CHANGELOG and
+  nothing else** (#2833). New `PERFORMANCE.md` §"Read-path degrade budgets"
+  covers `AI_MEMORY_RECALL_EMBED_BUDGET_MS` (#2577) and
+  `AI_MEMORY_RERANK_BUDGET_MS` (#2608) — including why rerank is enforced
+  pre-flight rather than mid-flight, that its cost coefficient is an
+  ESTIMATE and not a measured guarantee, and the query-embed cache's
+  documented timing-oracle residual stated precisely as query-EXISTENCE
+  rather than content disclosure. `docs/API_REFERENCE.md` §`GET /metrics`
+  previously documented **no series at all**; it now carries the
+  operationally load-bearing subset, with
+  `ai_memory_memories_refreshed_at_seconds` (#2583) marked not-optional
+  because without an alert on it a dead refresher freezes a plausible
+  corpus count through a mass deletion while `up` stays 1 — plus the
+  `fts_integrity` health verdict (#2579) and its 3-interval self-staling
+  rule. Every value was verified against source before being written.
+- **Corrected the SDK `Memory` model docstrings** (#2834). Both
+  `sdk/python/ai_memory/models.py` and `sdk/typescript/src/types.ts` said
+  "15 fields", and the Python docstring asserted "Every field present on
+  the Rust side is mapped here"; `Memory::FIELD_COUNT` is **30**. Stated
+  precisely: the 15 untyped fields are named, and they **survive** a round
+  trip (Python `_Base` sets `extra="allow"`; TypeScript interfaces do not
+  strip at runtime) — they arrive untyped, they are not lost. Actually
+  typing them is a public-contract change in two published SDKs and is
+  tracked separately in #2834.
+- Removed two `scripts/qc-allowlists/doc-numeric-claims-pending.txt`
+  entries the fixes above made stale, as the gate's NOTICE instructs.
+
 
 ### Docs (Phase-2 pg-parity remediation — the TRUTHFULNESS FLOOR; vote `4d3ea1c5`, Option B+)
 

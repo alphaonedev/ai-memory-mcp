@@ -27,7 +27,9 @@ its PASS/FAIL tally + evidence (row ids, SQL confirmations, error strings).
 
 **v1.0.0 SSOT values used below** (from `CLAUDE.md` / the canonical Rust consts):
 schema **v88**; MCP tools **103** at `--profile full` (102 callable + the
-always-on `memory_capabilities` bootstrap), **7** at `--profile core`;
+always-on `memory_capabilities` bootstrap), **7** at `--profile core`
+per `Profile::core().expected_tool_count()` — which `tools/list` renders as
+**8** entries, the same 7 callable tools plus that always-on bootstrap;
 capabilities envelope `schema_version` **"3"**; `Memory` **30 fields**;
 `MemoryLinkRelation::COUNT` **9**; HTTP **94** route registrations / **80**
 unique paths; CLI **90** default / **92** sal subcommands; `HookEvent`
@@ -48,7 +50,11 @@ protocol handshake succeeds, and the advertised surface matches the SSOT.
 - `memory_capabilities.schema_version` = `"3"`; `memory_capabilities.version` = `1.0.0`.
 - All tool families load (`loaded:true`).
 - `tools/list` count = **103** at `--profile full` (matches
-  `Profile::full().expected_tool_count()`); `--profile core` = 7.
+  `Profile::full().expected_tool_count()`); `--profile core` = **8** —
+  the 7 `Family::Core` tools (`Profile::core().expected_tool_count()`)
+  plus the always-on `memory_capabilities` bootstrap, which
+  `ALWAYS_ON_TOOLS` (`src/profile.rs`) registers outside the
+  profile filter per RFC S27. Same framing as the full count above.
 
 **Exercised by:** `src/profile.rs::Profile::full().expected_tool_count()`,
 `tests/mcp_tools_list_schema_discovery.rs`, the MCP `initialize` + `memory_capabilities` handshake.
@@ -75,10 +81,10 @@ Form-4 provenance wire-schema fields (`source_uri`, `expected_version`,
 
 ---
 
-## P2 — Lifecycle (tier transitions, archive-before-delete)
+## P2 — Lifecycle (tier transitions, archive-on-forget)
 
 **Verifies:** TTL tiers, auto-promotion, explicit promotion, scoped forget, and
-the archive-before-delete data-integrity contract. At v1.0.0 recall is PURE
+the archive-on-forget data-integrity contract. At v1.0.0 recall is PURE
 (#1869/#1953) — access ladders are applied by the FOLD job, not synchronously —
 so promotion is asserted after a fold, not inline.
 
@@ -87,12 +93,26 @@ so promotion is asserted after a fold, not inline.
   auto-promotes **mid→long** at `PROMOTION_THRESHOLD` after the fold; `expires_at` clears on long.
 - `memory_promote` explicitly jumps mid→long (single call by default; optional `target_tier` stops at mid).
 - `memory_forget` by namespace is EXACT-scoped (a sub-namespace survives a parent-namespace forget).
-- **Archive-before-delete:** every explicit delete/forget writes an
-  `archived_memories` row (`archive_reason='forget'`) BEFORE the row is reaped —
-  the durable text is never destroyed without a restorable archive copy.
+- **Archive-on-forget:** `memory_forget` writes an `archived_memories` row
+  (`archive_reason='forget'`) for every matched row in the SAME transaction as
+  the delete (#1776) whenever `[storage].archive_on_gc` is enabled — the
+  compiled default (`effective_archive_on_gc()` → `true`). The response's
+  `archived` field reports the disposition of that call. With
+  `archive_on_gc = false` the same verb is a permanent hard-delete with no
+  archive copy (boot emits `warn_if_archive_on_gc_disabled`). The GC TTL sweep
+  archives on the same switch under `archive_reason='ttl_expired'`.
+- **`memory_delete` by id is the hard, irreversible verb — it does NOT
+  archive.** `db::delete` removes the row (and its embedding / FTS / link
+  children) with NO `archived_memories` copy: it severs any `namespace_meta`
+  binding (#2503) and appends an identity-only tombstone revision leaf ONLY
+  when append-only is enabled (`AI_MEMORY_APPEND_ONLY`, off by default). Under
+  the default configuration a deleted memory's durable text is not recoverable
+  from the substrate — the tool's own `docs()` says "Hard-delete by id". An
+  operator wanting a restorable copy uses `memory_forget` (or archives first).
 
 **Exercised by:** `tests/recall_purity_p01.rs` (fold-before-gc, purity),
-the promotion-threshold + archive-on-delete storage paths, `memory_gc`.
+the promotion-threshold + archive-on-forget storage paths (`db::forget`),
+`db::delete`, `memory_gc`.
 
 ---
 
@@ -197,7 +217,7 @@ subscription dispatch gate.
 cross-interface behavior over the shared storage layer.
 
 **Pass assertion:**
-- An MCP-stored memory is retrievable via CLI `list --json` (source stamped `claude`); a CLI-stored memory shows source `cli` with a synthesized durable `agent_id`.
+- An MCP-stored memory is retrievable via CLI `list --json` with source stamped `nhi` — the vendor-neutral `validate::DEFAULT_NHI_SOURCE` that replaced the pre-#1175 `claude` hardcode; the client identity lives in `metadata.agent_id` (e.g. `ai:claude@<host>`), not in `source`. A CLI-stored memory shows source `cli` with a synthesized durable `agent_id`.
 - Validation parity: an invalid `agent_id` metachar (`$`) and a >128-byte `agent_id` are rejected identically at the CLI and MCP layers.
 - Cross-interface contradiction detection fires (a CLI store flags a `potential_contradictions` id against a prior MCP store).
 - (Postgres deployments serve MCP clients through the HTTP daemon — MCP stdio is structurally sqlite-only, #1675 — so HTTP↔CLI parity is the postgres-substrate assertion.)
@@ -214,7 +234,7 @@ health honestly under sustained load.
 
 **Pass assertion:**
 - `PERFORMANCE.md` budgets exist and the run stays within them (recall p95, rerank budget #2608, recall-embed budget #2577).
-- `memory_stats` returns `by_namespace`, `by_tier`, `db_size_bytes`, `links_count`, `total`.
+- MCP `memory_stats` returns the serialized `models::memory::Stats` shape: `total` (RAW physical row count), the #2334 expiry-axis siblings `live` + `expired_pending_gc`, `by_tier`, `by_namespace`, `expiring_soon`, `links_count`, `db_size_bytes`, `dim_violations`, `index_evictions_total`. The MCP field is `total`, NOT `total_memories` — `total_memories` is what the HTTP admin stats surface (`handlers::admin`, `field_names::TOTAL_MEMORIES`) and `ai-memory doctor` / boot name the same value; reconcile per surface, and prefer `live` over `total` when comparing against boot's LIVE count.
 - `ai-memory doctor` reports overall INFO with no corruption flagged; `/health` renders the cached FTS-integrity verdict (#2579) and `/metrics` renders the paced corpus gauge (#2583) with zero per-request DB scan cost.
 - Sustained sequential recalls return cleanly with consistent shape (no lock starvation).
 

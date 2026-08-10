@@ -109,9 +109,17 @@ class GovernancePolicy(_Base):
 
 
 class Memory(_Base):
-    """Full ``struct Memory`` — 15 fields.
+    """A Memory row. Mirrors ``ai_memory::models::Memory``, which carries
 
-    Every field present on the Rust side is mapped here. ``metadata`` is
+    **30 fields** at v1.0.0 (``Memory::FIELD_COUNT``). The 15 declared below
+    are the v0.6.x core; the other 15 (``cid``, ``version``,
+    ``lifecycle_state``, ``memory_kind``, ``kind_provenance``,
+    ``reflection_depth``, ``entity_id``, ``persona_version``, ``citations``,
+    ``source_uri``, ``source_span``, ``confidence_source``,
+    ``confidence_signals``, ``confidence_decayed_at``, ``valid_from`` /
+    ``valid_until``) are NOT typed here — they survive a round trip because
+    ``_Base`` sets ``extra="allow"``, but they arrive untyped. Typing them is
+    tracked separately. ``metadata`` is
     a free-form ``dict`` since the server stores ``serde_json::Value``.
     """
 

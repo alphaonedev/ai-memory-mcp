@@ -164,7 +164,7 @@ Out-of-the-box observability lands in three places:
 - **File logging.** Opt-in via `[logging]` in `config.toml` (path, rotation size, retention days, `structured = true` for JSON). Routes to a rotating appender; off by default.
 - **`ai-memory doctor`.** A 10-section health dashboard run locally at v0.7.x: Storage / Index / Recall / Governance / Sync / Webhook / Capabilities / Reflection Health / LLM Reachability (#1146) / Embeddings Reachability (#1598). Nothing leaves the host except the opt-in reachability probes against your configured LLM / embedding backends.
 
-Hooks (`pre_store`, `post_store`, `post_recall`, `pre_governance_decision`, etc. — 27 lifecycle events, see [`hook-pipeline.md`](hook-pipeline.html)) are the supported extension surface for routing events to a SIEM, paging an operator, or short-circuiting writes. See [`docs/integrations/`](integrations/) and [`telemetry.md`](telemetry.html).
+Hooks (`pre_store`, `post_store`, `post_recall`, `pre_governance_decision`, etc. — 22 lifecycle events, see [`hook-pipeline.md`](hook-pipeline.html)) are the supported extension surface for routing events to a SIEM, paging an operator, or short-circuiting writes. See [`docs/integrations/`](integrations/) and [`telemetry.md`](telemetry.html).
 
 ---
 

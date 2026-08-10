@@ -6,7 +6,7 @@
 
 1. **MCP tool server** -- stdio JSON-RPC server exposing 103 advertised entries at `--profile full` (102 callable memory tools + the always-on `memory_capabilities` bootstrap) + 2 MCP prompts for any MCP-compatible AI client (Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others)
 2. **CLI tool** -- direct SQLite operations for store, recall, search, list, etc. (completely AI-agnostic)
-3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API with 93 route registrations / 80 unique URL paths (completely AI-agnostic)
+3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API with 94 route registrations / 80 unique URL paths (completely AI-agnostic)
 
 **Key architectural features:** Zero token cost (no context loaded until recall), TOON compact default response format (79% smaller than JSON), MCP prompts capability (`recall-first` behavioral rules + `memory-workflow` reference card), 4 feature tiers with optional local LLMs via Ollama, true dedup on title+namespace, 6-factor recall scoring with score field in responses.
 
@@ -15,7 +15,7 @@ All three interfaces share the same storage layer (`src/storage/`, exposed as th
 ```
 main.rs            -- Thin CLI shim (W6 refactor); top-level Command enum now lives in daemon_runtime.rs (92 subcommands with --features sal, 90 in the default build)
 daemon_runtime.rs  -- HTTP daemon `serve` bootstrap, MCP `mcp` dispatch, top-level clap Command enum
-models/            -- Data structures: Memory (28 fields at v0.9.0), MemoryLink (9 relations at v0.8.0), MemoryKind (Batman Form-6 + Goal/Plan/Step), LifecycleState (v0.8.0 Pillar-2 state machine), Citation/SourceSpan (Form-4), query types, constants
+models/            -- Data structures: Memory (30 fields at v1.0.0), MemoryLink (9 relations at v0.8.0), MemoryKind (Batman Form-6 + Goal/Plan/Step), LifecycleState (v0.8.0 Pillar-2 state machine), Citation/SourceSpan (Form-4), query types, constants
 handlers/          -- HTTP request handlers split per domain (http.rs, federation_receive.rs, hook_subscribers.rs, transport.rs, plus per-surface modules: recall.rs, memories.rs, admin.rs, kg.rs, …); Axum extractors + JSON responses; error sanitization. Route-path SSOT in handlers/routes.rs (#1558 batch 4 — one const per production route path; lib.rs registers them, the postgres gate / federation receiver / doctor match on them)
 storage/           -- sqlite SQL primitives; CRUD, FTS5, recall scoring, GC, migration (CURRENT_SCHEMA_VERSION = 88)
 store/             -- SAL `MemoryStore` trait + adapter implementations (sqlite + postgres + AGE feature gates); new DB operations land here FIRST (post-#961)
@@ -75,7 +75,7 @@ When running at the `semantic` tier or higher, ai-memory loads a HuggingFace emb
 ### `src/models/`
 
 - `Tier` enum (`Short`, `Mid`, `Long`) with TTL defaults: 6h, 7d, none
-- `Memory` struct -- the core data type with **28 fields at v0.9.0** (27 at v0.8.0, 26 at v0.7.0, was 15 at v0.6.x): adds `reflection_depth` (Task 1/8), `memory_kind` (Batman Form-6 vocabulary), `entity_id` + `persona_version` (QW-2), `citations` + `source_uri` + `source_span` (Form-4 fact provenance), `confidence_source` + `confidence_signals` + `confidence_decayed_at` (Form-5 calibration), `version` (schema v45 — Gap-1 optimistic concurrency for `memory_update`), `lifecycle_state` (schema v64 — v0.8.0 Pillar-2 #1709 typed-cognition state machine: `open`→`active`→`blocked`/`done`/`abandoned`, transitions enforced on `memory_update`), and `cid` (schema v74 — v0.9.0 G8 #1825 additive BLAKE3 content-id, `Option<String>`). Extensible `metadata` JSON column still present. Canonical truth in `src/models/memory.rs`.
+- `Memory` struct -- the core data type with **30 fields at v1.0.0** (28 at v0.9.0, 27 at v0.8.0, 26 at v0.7.0, was 15 at v0.6.x): adds `reflection_depth` (Task 1/8), `memory_kind` (Batman Form-6 vocabulary), `entity_id` + `persona_version` (QW-2), `citations` + `source_uri` + `source_span` (Form-4 fact provenance), `confidence_source` + `confidence_signals` + `confidence_decayed_at` (Form-5 calibration), `version` (schema v45 — Gap-1 optimistic concurrency for `memory_update`), `lifecycle_state` (schema v64 — v0.8.0 Pillar-2 #1709 typed-cognition state machine: `open`→`active`→`blocked`/`done`/`abandoned`, transitions enforced on `memory_update`), and `cid` (schema v74 — v0.9.0 G8 #1825 additive BLAKE3 content-id, `Option<String>`). Extensible `metadata` JSON column still present. Canonical truth in `src/models/memory.rs`.
 - `MemoryLink` struct -- typed directional links between memories. **Nine relation variants at v0.8.0** (six at v0.7.0, four at v0.6.x): `related_to`, `supersedes`, `contradicts`, `derived_from`, `reflects_on`, `derives_from`, `decomposes_into`, `depends_on`, `advances`. Carries v0.7 temporal-validity (`valid_from`, `valid_until`, `observed_by`) and attestation (`signature`, `attest_level`, `signed_at`) columns.
 - Request types: `CreateMemory`, `UpdateMemory`, `SearchQuery`, `ListQuery`, `RecallQuery`, `RecallBody`, `LinkBody`, `ForgetQuery`, `ConsolidateBody`, `ImportBody`
 - Response types: `Stats`, `TierCount`, `NamespaceCount`
@@ -383,7 +383,7 @@ Added in schema migration v3 -> v4 (shown in its original 16-column shape). Stor
 
 ### `schema_version` table
 
-Tracks migration state. Current version: **78** (`CURRENT_SCHEMA_VERSION` in `src/storage/migrations.rs`).
+Tracks migration state. Current version: **88** (`CURRENT_SCHEMA_VERSION` in `src/storage/migrations.rs`).
 
 ## Recall Scoring Formula
 
@@ -420,7 +420,7 @@ The `config.rs` module defines 4 feature tiers that gate functionality:
 | `smart` | Yes | Yes | Adds LLM-backed expansion / auto-tag / contradiction detection |
 | `autonomous` | Yes | Yes | Adds cross-encoder reranking + autonomous behaviors |
 
-The tier gates **capabilities** (embedder / LLM / reranker), not the advertised tool count — the tool surface is selected separately by `--profile` (7 entries at `core`, 101 at `full`). Tier is set at startup via `ai-memory mcp --tier <tier>` and cannot be changed at runtime. Post-#1067 the LLM is provider-agnostic (`AI_MEMORY_LLM_BACKEND`), not Ollama-only. The `memory_capabilities` tool reports the active tier and which features are available, allowing AI clients to adapt their behavior.
+The tier gates **capabilities** (embedder / LLM / reranker), not the advertised tool count — the tool surface is selected separately by `--profile` (8 advertised at `core` — 7 callable + the bootstrap — and 103 at `full`). Tier is set at startup via `ai-memory mcp --tier <tier>` and cannot be changed at runtime. Post-#1067 the LLM is provider-agnostic (`AI_MEMORY_LLM_BACKEND`), not Ollama-only. The `memory_capabilities` tool reports the active tier and which features are available, allowing AI clients to adapt their behavior.
 
 > **Note:** Configuration is loaded once at process startup. Changes to `config.toml` require restarting the ai-memory process (MCP server, HTTP daemon, or CLI) to take effect.
 
@@ -840,7 +840,7 @@ Global flags:
 
 ### `serve`
 
-Start the HTTP daemon (93 route registrations / 80 unique URL paths).
+Start the HTTP daemon (94 route registrations / 80 unique URL paths).
 
 ```bash
 ai-memory serve --host 127.0.0.1 --port 9077
@@ -848,7 +848,7 @@ ai-memory serve --host 127.0.0.1 --port 9077
 
 ### `mcp`
 
-Run as an MCP tool server over stdio. This is the primary integration path for any MCP-compatible AI client. The `--profile full` surface advertises 101 entries (102 callable memory tools + the always-on `memory_capabilities` bootstrap); the default `--profile core` ships 7 + the bootstrap.
+Run as an MCP tool server over stdio. This is the primary integration path for any MCP-compatible AI client. The `--profile full` surface advertises 103 entries (102 callable memory tools + the always-on `memory_capabilities` bootstrap); the default `--profile core` ships 7 + the bootstrap (8 advertised).
 
 ```bash
 ai-memory mcp

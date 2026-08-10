@@ -474,7 +474,13 @@ impl std::fmt::Debug for IssuerConfig {
 /// from the broad agent registry.
 #[derive(Clone, Default)]
 pub struct CapabilityConfig {
-    /// Master enable (default false — the GA posture is inert).
+    /// Master enable. The compiled default is
+    /// [`DEFAULT_CAPABILITIES_ENABLED`], which is **`true`** since R9
+    /// #1960 (this line said "default false — the GA posture is inert"
+    /// through v1.0.0). Default-on is ADDITIVE-ONLY: the gate hook
+    /// short-circuits on `token.is_none() || base == Allow` BEFORE it
+    /// consults this field, so a capability-LESS caller is byte-identical
+    /// to the legacy inert posture and gains zero new denials.
     pub enabled: bool,
     /// The closed allowlist keyed by issuer id.
     pub issuers: BTreeMap<String, IssuerConfig>,

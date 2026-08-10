@@ -433,9 +433,9 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 <section id="why">
   <div class="container">
     <span class="eyebrow">Why ai-memory</span>
-    <h2>One substrate. Five deployment scales. Identical semantics.</h2>
+    <h2>One substrate. Five deployment scales. One contract.</h2>
     <p class="lede">
-      Most AI tooling forces a tier choice up front: a hobby SDK, a cloud SaaS, or a bespoke enterprise rollout. ai-memory is one substrate &mdash; <code>memory_store</code>, <code>memory_recall</code>, <code>memory_link</code>, <code>memory_reflect</code> &mdash; that scales from a single laptop with one AI assistant to a global hive of attesting NHI agents. Same tools. Same wire format. Same governance.
+      Most AI tooling forces a tier choice up front: a hobby SDK, a cloud SaaS, or a bespoke enterprise rollout. ai-memory is one substrate &mdash; <code>memory_store</code>, <code>memory_recall</code>, <code>memory_link</code>, <code>memory_reflect</code> &mdash; that scales from a single laptop with one AI assistant to a global hive of attesting NHI agents. Same tools. Same wire format. Same governance. One honest bound worth knowing up front: on a <strong>PostgreSQL</strong>-backed deployment 59 of the 80 unique HTTP paths are served and 21 fail closed with <code>501</code>, and MCP stdio is SQLite-only &mdash; see <a href="feature-matrix.html">the feature matrix</a>.
     </p>
     <div class="continuum">
       <a class="step" href="architectures-t1.html">
@@ -604,7 +604,7 @@ cd ai-memory-mcp &amp;&amp; cargo build --release</code></pre>
       <a class="cta ghost" href="QUICKSTART.html">3-minute engineer quickstart</a>
     </div>
     <div style="margin-top:1rem;padding:.9rem 1.1rem;border:1px solid var(--p2,#ffb86b);border-left:4px solid var(--p2,#ffb86b);border-radius:8px;background:rgba(255,184,107,.06);font-size:.92rem">
-      <strong>⚠️ Required after install:</strong> v0.9.0 requires agent attestation by default &mdash; set it up (or opt out) before your first write, or it returns <code>403 ATTESTATION_FAILED</code>. <a href="attestation.html"><strong>Attestation setup guide &rarr;</strong></a>
+      <strong>⚠️ Required after install:</strong> v1.0.0 requires agent attestation by default on the <strong>HTTP direct-write surface only</strong> (#1985, correcting #1751) &mdash; MCP <code>memory_store</code> and CLI <code>store</code> stay permissive. Set it up before your first HTTP write, or <code>POST /api/v1/memories</code> returns <code>403 ATTESTATION_FAILED</code>. <a href="attestation.html"><strong>Attestation setup guide &rarr;</strong></a>
     </div>
 
     <div style="margin-top:3rem; padding-top:1.5rem; border-top:1px solid var(--border)">

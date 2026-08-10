@@ -1647,7 +1647,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="roadmap-content">
           <div class="rmt-theme">Security Hardening + Agentic Substrate · <span style="color:var(--good)">SHIPPED</span></div>
           <div class="rmt-eta">Jul 2026 · GA</div>
-          <div class="rmt-desc">49 fixes from a 5-lane adversarial code review (#1885&ndash;#1935). Agent attestation is now REQUIRED by default on writes; MCP + HTTP mandatory-hook enforcement is live.</div>
+          <div class="rmt-desc">49 fixes from a 5-lane adversarial code review (#1885&ndash;#1935). Agent attestation is now REQUIRED by default on writes; MCP + HTTP mandatory-hook enforcement is live. <em>(v1.0.0 #1985 scoped that attestation default to the HTTP direct-write surface only.)</em></div>
           <ul class="rmt-bullets">
             <li>Attestation-by-default: unsigned store &rarr; 403 ATTESTATION_FAILED (#1751; opt out with <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0</code>)</li>
             <li>Mandatory hook enforcement wired onto MCP (#1885) + HTTP (#1924)</li>
@@ -1947,7 +1947,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p1" style="height:100%;display:flex;flex-direction:column;border:2px solid rgba(200,162,255,0.4)">
           <div class="card-eyebrow" style="color:var(--pillar-3)">▸ NEW · RELEASE SPOTLIGHT</div>
           <div class="card-title">What's New in v0.9.0 — security hardening</div>
-          <p class="card-body">The release that closes the attestation gap. 49 fixes from a 5-lane adversarial code review (#1885&ndash;#1935). Headline: agent attestation is now REQUIRED by default on writes — an unsigned store returns 403 ATTESTATION_FAILED (#1751; opt out with <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0</code>). MCP + HTTP mandatory-hook enforcement is now actually wired (#1885 / #1924). Additive: skill memories (#1865), recall_observations shadow-feedback (#1706), memory-derivation lineage-DAG (#1859), opt-in vector-search slice (#1005). Schema v70 → v78, 101 MCP tools at full / 7 core, 9 link relations.</p>
+          <p class="card-body">The release that closes the attestation gap. 49 fixes from a 5-lane adversarial code review (#1885&ndash;#1935). Headline: agent attestation is now REQUIRED by default on writes — an unsigned store returns 403 ATTESTATION_FAILED (#1751; opt out with <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0</code>). <em>Superseded at v1.0.0 by #1985, which scoped that default to the HTTP direct-write surface only — MCP <code>memory_store</code> and CLI <code>store</code> stay permissive.</em> MCP + HTTP mandatory-hook enforcement is now actually wired (#1885 / #1924). Additive: skill memories (#1865), recall_observations shadow-feedback (#1706), memory-derivation lineage-DAG (#1859), opt-in vector-search slice (#1005). Schema v70 → v78, 101 MCP tools at full / 7 core, 9 link relations.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-3)">whats-new-v09.html →</div>
         </div>
       </a>

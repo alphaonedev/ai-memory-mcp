@@ -49,7 +49,7 @@ Below is an example for **Claude Code** (user scope: merge `mcpServers` into `~/
 
 ### How It Works
 
-With MCP configured, your AI client gains 101 memory tools at `--profile full` (100 callable tools + the always-on `memory_capabilities` bootstrap) (highlights below; see [API_REFERENCE.md](API_REFERENCE.html) for the full reference):
+With MCP configured, your AI client gains 103 memory tools at `--profile full` (102 callable tools + the always-on `memory_capabilities` bootstrap) (highlights below; see [API_REFERENCE.md](API_REFERENCE.html) for the full reference):
 
 - **memory_store** -- Store new knowledge (auto-deduplicates by title+namespace, reports contradictions)
 - **memory_recall** -- Recall relevant memories for the current context (supports `until` date filter)
@@ -77,7 +77,7 @@ Your AI assistant uses these tools automatically during conversations. You can a
 
 ## MCP Tool Reference
 
-This section documents the MCP tools with their exact parameter schemas, example requests, and response formats. **The surface advertises 101 entries at `--profile full`** (100 callable "memory tools" + the always-on `memory_capabilities` bootstrap — both numbers are intentional; see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862) for the disambiguation). Default `--profile core` exposes 7 (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on `memory_capabilities`. Canonical counts on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html) and asserted by `Profile::full().expected_tool_count()` in `src/profile.rs`. All tools are invoked via JSON-RPC 2.0 using method `tools/call` with the tool name in `params.name` and tool parameters in `params.arguments`.
+This section documents the MCP tools with their exact parameter schemas, example requests, and response formats. **The surface advertises 103 entries at `--profile full`** (102 callable "memory tools" + the always-on `memory_capabilities` bootstrap — both numbers are intentional; see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862) for the disambiguation). Default `--profile core` exposes 7 (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on `memory_capabilities`. Canonical counts on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html) and asserted by `Profile::full().expected_tool_count()` in `src/profile.rs`. All tools are invoked via JSON-RPC 2.0 using method `tools/call` with the tool name in `params.name` and tool parameters in `params.arguments`.
 
 All responses are wrapped in the MCP content envelope:
 
@@ -1419,7 +1419,7 @@ the signature against the agent's **bound public key** (registered via
 verbatim (±300 s freshness window). A forged signature is rejected with
 `403 ATTESTATION_FAILED`.
 
-As of v0.9.0 ([#1751](https://github.com/alphaonedev/ai-memory-mcp/issues/1751)), attestation is **required by default**: an unsigned
+As of v1.0.0 ([#1985](https://github.com/alphaonedev/ai-memory-mcp/issues/1985), correcting [#1751](https://github.com/alphaonedev/ai-memory-mcp/issues/1751)), attestation is **required by default on the HTTP direct-write surface only** (`POST /api/v1/memories` + `/bulk`); MCP `memory_store` and CLI `store` are the operator-as-actor path and stay permissive, landing `claimed`. On the HTTP direct-write surface an unsigned
 write is **rejected** (`403 ATTESTATION_FAILED`) rather than landing claimed.
 Operators who need the pre-v0.9 permissive posture (unsigned → claimed) must
 set the explicit opt-out `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` (or

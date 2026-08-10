@@ -150,6 +150,16 @@ DOC_FILES=(
     docs/integrations/README.md
     docs/integrations/claude-code.md
     docs/v1.0.0/release-notes.md
+    docs/CONFIG_SCHEMA.md
+    docs/production-deployment.md
+    docs/enterprise-deployment.md
+    # #2796 — the committed NHI dogfood playbook opens with an explicit
+    # "v1.0.0 SSOT values used below" block (schema, tool counts, Memory
+    # fields, link relations, route/CLI counts, HookEvent variants) that a
+    # tester reads as the pass/fail bar. It was not walked, so its
+    # `--profile core` count drifted unnoticed. It is a CURRENT-release
+    # doc, not a frozen snapshot, so it belongs in the gate.
+    docs/v1.0.0/nhi-playbook-P0-P11.md
 )
 
 # Operator-facing HTML surfaces (rendered compliance pages). Markdown is
@@ -165,6 +175,29 @@ DOC_FILES=(
 # cannot silently enroll a legitimate past-release count into the gate.
 HTML_DOC_FILES=(
     docs/compliance/nsa-csi-mcp.html
+)
+
+# Additional surfaces walked ONLY by the HookEvent rule (3x7 lane-3,
+# 2026-08-09). The HookEvent rule was the last legacy hand-regex left
+# behind when #2492 generalised the other SSOT rules, and it was ALSO
+# scoped to DOC_FILES/HTML_DOC_FILES -- so it missed the class twice.
+# At f7399cfb the gate reported hooks=22 and PASSED while five live
+# surfaces published 25 or 27, two of them naming pre_recall, an event
+# #2758 REMOVED precisely because advertising a hook that never fires
+# is a false enforcement claim.
+#
+# Deliberately a SEPARATE list, not an extension of DOC_FILES /
+# HTML_DOC_FILES: those are shared by the route / tool / CLI-count
+# rules, and widening them here would enroll pages whose OTHER counts
+# belong to a different correction lane, redding this gate on drift it
+# is not the subject of. One rule, one scan set.
+HOOK_DOC_FILES=(
+    "${DOC_FILES[@]}"
+    "${HTML_DOC_FILES[@]}"
+    docs/production-deployment.md
+    docs/strategy/coala-mapping.md
+    docs/audience/developer.html
+    docs/essays/brass-tacks-3-why.html
 )
 
 # CHANGELOG.md is intentionally excluded — every entry is a historical
@@ -290,7 +323,35 @@ check_narrative_count_rule() {
             python3 -c "
 import re, sys
 pat = re.compile(r'''$pattern''')
+# HISTORICAL GUARD -- 3x7 lane-3, 2026-08-09. Mirrors is_historical in
+# the #2492 generalised scanner below. Principle: a TRUE statement about
+# a PAST release must never be re-pointed at the canonical, or the gate
+# destroys the record it exists to protect. This legacy per-rule function
+# never had the guard -- harmless only while every rule regex was narrow
+# enough to miss history by accident. Generalising the HookEvent anchors
+# made that accident stop holding: the README prior-release paragraph and
+# the ROADMAP frozen v0.7.1 baseline both legitimately say 25.
+# NOTE: single-quoted regexes only -- this python is embedded in a
+# double-quoted shell string, so a double quote here closes it.
+_PARA_LEAD = re.compile(r'^\s*\*\*v([0-9]+\.[0-9]+\.[0-9]+)')
+_HIST = [
+    re.compile(r'^\s*#{1,6}\s'),
+    re.compile(r'\b[Aa]t the v[0-9]+\.[0-9]+\.[0-9]+ release\b'),
+    re.compile(r'\brelease, surface was\b'),
+    re.compile(r'\bv[0-9]+ added\b'),
+    re.compile(r'\bwas [0-9]+ at v[0-9]'),
+    re.compile(r'\bShip state at v[0-9]+\.[0-9]+'),
+    re.compile(r'\bFrozen v[0-9]+\.[0-9]+[^ ]* baseline\b'),
+]
+_release = '''$CANONICAL_RELEASE_VERSION'''
+def _is_historical(line):
+    m = _PARA_LEAD.match(line)
+    if m and m.group(1) != _release:
+        return True
+    return any(p.search(line) for p in _HIST)
 for ln, line in enumerate(open('$f').read().splitlines(), 1):
+    if _is_historical(line):
+        continue
     for m in pat.finditer(line):
         # Alternation groups: take the FIRST non-None capture
         val = next((g for g in m.groups() if g is not None), '')
@@ -316,30 +377,72 @@ for ln, line in enumerate(open('$f').read().splitlines(), 1):
 # AI_MEMORY_* env var READ by production code must appear somewhere in
 # CLAUDE.md (the env-var table is the operator-facing contract; 13
 # missing rows were found by hand on 2026-06-09 — this makes the class
-# mechanical). Production boundary: skip *test* files and lines below
-# the first `mod tests {`. Intentionally one-directional — extra rows
-# in CLAUDE.md for removed vars are caught by the symbol census, and
-# vars only set (not read) by code are not operator knobs.
+# mechanical). Intentionally one-directional — extra rows in CLAUDE.md
+# for removed vars are caught by the symbol census, and vars only set
+# (not read) by code are not operator knobs.
+#
+# WIDENED (#2830, 2026-08-09 lane-1 config sweep). The rule censused
+# 102 of the 155 env vars production code actually reads, in three
+# independent ways, and the seven knobs that were missing from the table
+# had ALL slipped through one of them:
+#
+#   1. The const shape required the name to START with `ENV_`. The tree
+#      uses TWO conventions — `ENV_FOO` and the `FOO_ENV` suffix — and
+#      the suffix style is the majority style for the security /
+#      federation knobs (`REQUIRE_WRITE_SIG_ENV`, `STORE_URL_ENV`,
+#      `WITNESS_KEY_DIR_ENV`, …). 68 declarations were invisible.
+#   2. Clap-bound flags (`#[arg(long, env = "AI_MEMORY_PROFILE")]`) were
+#      not a recognised read shape at all.
+#   3. The production boundary the comment CLAIMED ("skip *test* files
+#      and lines below the first `mod tests {`") was never implemented —
+#      the greps walked whole files. It is implemented for real below,
+#      because widening 1+2 without it would newly red the gate on the
+#      `#[cfg(test)]`-gated `AI_MEMORY_TEST_*` fixtures.
+#
+# The boundary skips a `#[cfg(test)]`-gated item by BRACE DEPTH (so a
+# gated `fn` mid-file resumes production scanning after its body) rather
+# than skipping to EOF, which would have dropped 40+ real production
+# declarations. The filename filter matches `tests.rs` / `*_test.rs` /
+# `*_tests.rs` / `test_*.rs` and deliberately NOT the looser `*test*.rs`
+# the sibling gates use: that glob excludes `peer_attestation.rs` and
+# `attest.rs` ("at-TEST-ation"), which declare live security knobs.
+# Known residual: a const whose `= "AI_MEMORY_…"` wraps to a second line
+# is still unseen (one var today, itself already documented).
 check_env_var_census_rule() {
     local rule_name="ENV_VAR_CENSUS" var
     local code_vars
-    # Two read shapes: direct env::var("AI_MEMORY_X") literals, and
-    # const-indirected reads where the spelling lives on an `ENV_*`
-    # const definition (e.g. `pub const ENV_ADMIN_HEADER_TRUST: &str =
-    # "AI_MEMORY_ADMIN_HEADER_TRUST";`) — the post-#1558 house style.
     # `|| true` guards against `set -e`/`pipefail`: when the scanned tree
     # has ZERO matches (e.g. the --self-test fixture's tiny src/ tree),
     # every grep stage in the pipe exits 1 (no-match), which under
     # pipefail propagates as the assignment's exit status and silently
     # aborts the whole gate before any later rule runs. Zero matches is a
     # legitimate (if rare) state, not a script error.
-    code_vars=$( { grep -rhoE 'env::var(_os)?\("(AI_MEMORY_[A-Z0-9_]+)"' "$REPO_ROOT/src" \
-        --include='*.rs' 2>/dev/null; \
-        grep -rhoE 'const ENV_[A-Z0-9_]+: *&str *= *"AI_MEMORY_[A-Z0-9_]+"' "$REPO_ROOT/src" \
-        --include='*.rs' 2>/dev/null; } \
+    _census_production_lines() {
+        find "$REPO_ROOT/src" -name '*.rs' \
+            ! -name 'tests.rs' ! -name '*_test.rs' ! -name '*_tests.rs' \
+            ! -name 'test_*.rs' -print0 2>/dev/null \
+        | xargs -0 -r awk '
+            FNR==1 { skip=0; depth=0; armed=0 }
+            !skip && /^[[:space:]]*#\[cfg\(test\)\]/ { skip=1; armed=0; depth=0; next }
+            skip {
+                n=gsub(/\{/,"{"); m=gsub(/\}/,"}")
+                depth += n - m
+                if (n > 0) armed=1
+                if (armed && depth <= 0) { skip=0; next }
+                if (!armed && /;[[:space:]]*$/) { skip=0 }
+                next
+            }
+            { print }' 2>/dev/null
+    }
+    code_vars=$( { _census_production_lines | grep -oE 'env::var(_os)?\("AI_MEMORY_[A-Z0-9_]+"'; \
+        _census_production_lines | grep -oE 'const [A-Z][A-Z0-9_]*: *&str *= *"AI_MEMORY_[A-Z0-9_]+"'; \
+        _census_production_lines | grep -oE 'env *= *"AI_MEMORY_[A-Z0-9_]+"'; } \
         | grep -oE 'AI_MEMORY_[A-Z0-9_]+' | sort -u) || true
     for var in $code_vars; do
-        if ! grep -q "$var" "$REPO_ROOT/CLAUDE.md"; then
+        # Word-boundaried: a bare `grep -q` lets a LONGER var's mention
+        # satisfy a shorter one (`AI_MEMORY_STORE_URL` would be answered
+        # by `AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS`).
+        if ! grep -qE "${var}([^A-Z0-9_]|\$)" "$REPO_ROOT/CLAUDE.md"; then
             printf 'FAIL: %s: src reads %s but CLAUDE.md never mentions it (env-var table drift)\n' \
                 "$rule_name" "$var" >&2
             fail_count=$((fail_count + 1))
@@ -653,11 +756,34 @@ run_all_rules() {
         "MemoryLinkRelation::COUNT" \
         "$CANONICAL_LINK_COUNT" \
         '\*\*([0-9]+) variants at v0\.7\.0\*\* \(was four at v0\.6\.x\)'
-    # HookEvent count
+    # HookEvent count -- GENERALISED noun-phrase anchors (3x7 lane-3,
+    # 2026-08-09), replacing the two hand-written phrasings this rule
+    # shipped with. Per the #2492 diagnosis: a document that says the
+    # same thing in the seventh way nobody enumerated is invisible.
+    # Anchors are NOUNS + any adjacent integer, so a re-worded sentence
+    # is still caught.
+    #
+    # The (?<![0-9])(?<!ships ) guard on the bare "lifecycle events"
+    # anchor is load-bearing: ROADMAP opens its v0.8.0 planning row with
+    # "v0.7.0 grand-slam ships 25 lifecycle events." -- a TRUE past-release
+    # statement. The digit lookbehind is required too: without it the
+    # engine simply re-anchors one character right and matches "5".
+    # "variants total" is deliberately NOT an anchor for the same reason:
+    # that same line legitimately carries "27 variants total AT v0.8.0".
+    #
+    # 3x7 lane-1 (#2780) UNION: the two `HookEvent`-SYMBOL phrasings below
+    # are ADDITIVE to the lane-3 noun-phrase anchors — the generalised set
+    # above does NOT cover the compliance-doc phrasing "**N** `HookEvent`
+    # variants" (docs/compliance/nsa-csi-mcp-security-mapping.md:115, which
+    # named the exact SSOT test it contradicted while shipping 27). They
+    # stay BOLD-anchored + symbol-specific so the ROADMAP §11.3.1 frozen
+    # v0.7.1 baseline's legitimate historical prose and the "27 variants
+    # total AT v0.8.0" line are untouched.
     check_narrative_count_rule \
         "HookEvent variants" \
         "$CANONICAL_HOOK_EVENTS" \
-        '\*\*([0-9]+) hook lifecycle events\*\*|([0-9]+) lifecycle events\) — A programmable'
+        '([0-9]+)[- ]event hook pipeline|([0-9]+) named substrate events|([0-9]+) hook lifecycle events|(?<![0-9])(?<!ships )([0-9]+) lifecycle events|\*\*([0-9]+)\*\* `HookEvent` variants|`HookEvent` SSOT \(\*\*([0-9]+)\*\* variants' \
+        "${HOOK_DOC_FILES[@]}"
     # Routes count
     check_narrative_count_rule \
         "EXPECTED_PRODUCTION_ROUTES_COUNT" \
@@ -1098,6 +1224,70 @@ HTMLGOODEOF
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test — correct HTML CLI counts (78/80) still PASS"
+
+    # ---- HOOKEVENT WIDENING (3x7 lane-3, 2026-08-09). Before this
+    # widening the HookEvent rule matched exactly TWO hand-written
+    # phrasings and scanned only DOC_FILES/HTML_DOC_FILES, so at
+    # f7399cfb it reported hooks=22 and PASSED while five live surfaces
+    # published 25 or 27 -- including docs/audience/developer.html
+    # naming pre_recall, an event #2758 REMOVED. Plant all five VERBATIM
+    # pre-fix phrasings (fixture canonical is 25, so 27 is drift) and
+    # assert the widened rule REJECTS every one, naming its file.
+    rm -f "$led"
+    mkdir -p "$tmpdir/docs/audience" "$tmpdir/docs/essays" "$tmpdir/docs/strategy"
+    cat > README.md <<'HOOKSTALEREADME'
+- **Hook pipeline (27 lifecycle events).** A programmable extension surface.
+HOOKSTALEREADME
+    cat > "$tmpdir/docs/production-deployment.md" <<'HOOKSTALEPD'
+Hooks (`pre_store`, `post_store`, etc. — 27 lifecycle events, see hook-pipeline.md) are the supported extension surface.
+HOOKSTALEPD
+    cat > "$tmpdir/docs/strategy/coala-mapping.md" <<'HOOKSTALECOALA'
+| Working memory | ... | `src/hooks/events.rs` (27 lifecycle events with typed payloads) |
+HOOKSTALECOALA
+    cat > "$tmpdir/docs/audience/developer.html" <<'HOOKSTALEDEV'
+  <h2>27-event hook pipeline + HMAC subscriptions.</h2>
+  <p>The hook pipeline fires on 27 named substrate events.</p>
+HOOKSTALEDEV
+    cat > "$tmpdir/docs/essays/brass-tacks-3-why.html" <<'HOOKSTALEBT'
+  <p>The hook pipeline fires on 27 named substrate events.</p>
+HOOKSTALEBT
+    if hook_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+        echo "FAIL: self-test — widened HookEvent rule did NOT catch the five planted 27-vs-25 claims" >&2
+        printf '%s\n' "$hook_out" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    for hf in README.md docs/production-deployment.md docs/strategy/coala-mapping.md \
+              docs/audience/developer.html docs/essays/brass-tacks-3-why.html; do
+        grep -q "HookEvent variants: $hf" <<<"$hook_out" || {
+            echo "FAIL: self-test — widened HookEvent rule missed the planted claim in $hf" >&2
+            printf '%s\n' "$hook_out" >&2
+            cd "$REPO_ROOT"; exit 1; }
+    done
+    echo "PASS: self-test — widened HookEvent rule REJECTS all five pre-fix phrasings across md + html"
+
+    # ---- HOOKEVENT HISTORICAL CONTROL. The generalised anchors would be
+    # unusable without the guard: ROADMAP legitimately opens a planning
+    # row "v0.7.0 grand-slam ships 25 lifecycle events." and carries a
+    # frozen v0.7.1 baseline, and README carries prior-release paragraph
+    # leads. All must PASS even though their numbers differ from the
+    # canonical. The bare digit lookbehind matters here too -- without
+    # (?<![0-9]) the engine re-anchors one char right and matches "7".
+    cat > README.md <<'HOOKHISTREADME'
+**v9.8.6 (`legacy`) — prior release.** Shipped a programmable 27-event hook pipeline.
+HOOKHISTREADME
+    cat > "$tmpdir/docs/production-deployment.md" <<'HOOKHISTPD'
+v0.7.0 grand-slam ships 27 lifecycle events.
+**Ship state at v9.8.5 (frozen).** _(Frozen v9.8.5 baseline.)_ 27 hook lifecycle events at v9.8.5.
+HOOKHISTPD
+    rm -f "$tmpdir/docs/strategy/coala-mapping.md" \
+          "$tmpdir/docs/audience/developer.html" \
+          "$tmpdir/docs/essays/brass-tacks-3-why.html"
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+        echo "FAIL: self-test — widened HookEvent rule fired on LEGITIMATE HISTORICAL hook mentions" >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    echo "PASS: self-test — historical hook mentions (prior-release lead, 'ships N', frozen baseline) still PASS"
 
     cd "$REPO_ROOT"
 }

@@ -284,6 +284,59 @@ harness + a REAL CI-gated smaller scale + a DOCUMENTED, reproducible 1M
 methodology — with the 1M budgets left ESTIMABLE (operator-measured)
 rather than invented.
 
+## Read-path degrade budgets (#2577 recall embed, #2608 rerank)
+
+Two v1.0.0 wall-clock budgets bound the read path. Both are
+**availability** controls first and latency controls second: an
+unbounded stage on MCP stdio blocks every subsequent tool call (the
+JSON-RPC loop is single-threaded by protocol design, per the #965
+audit), and on the HTTP daemon each stalled recall holds an admission
+permit, so sustained upstream latency sheds healthy traffic — including
+durable-truth writes — with 503s.
+
+| Knob | Default | Stage | On expiry |
+|---|---|---|---|
+| `AI_MEMORY_RECALL_EMBED_BUDGET_MS` | `2000` (explicit `0` disables) | query embedding (`embeddings::recall_query_embedding`) | Recall **degrades to keyword** and reports `mode:keyword`. The expiry is fed to the embedder circuit breaker, so repeated stalls fast-fail instead of each paying the full budget. Counter: `ai_memory_recall_embed_degraded_total`; WARN target `recall.embed.degraded`. |
+| `AI_MEMORY_RERANK_BUDGET_MS` | `2000` (explicit `0` disables) | cross-encoder rerank (`reranker::BatchedReranker`) | Enforced **pre-flight, never mid-flight** — a candle BERT forward has no cancellation point, so a wall-clock abort would abandon the waiting thread while the forward kept burning a core. The cost is estimated from candidate count × padded token length before the forward starts; over budget, the neural stage is skipped and the recall ships the pre-rerank **hybrid** ordering. The operator's `AI_MEMORY_RERANK_SCORE_FLOOR` is still applied. Counter: `ai_memory_rerank_budget_degraded_total`; WARN target `rerank.budget.degraded`. |
+
+Both are DEGRADES, never wrong results: fewer / differently-ranked
+results, the durable memory text untouched, recall still pure
+(#1869/#1953). Grammar is tri-state in both cases — unset takes the
+default, an explicit `0` disables, and an **unparseable value takes the
+default plus a WARN** so a typo can never silently widen the failure
+window.
+
+The 2000 ms recall-embed default is roughly 4x the observed p99
+(492 ms) and 13x the p50 (156 ms) for a healthy remote round trip on the
+#2577 reference corpus, so under the measured distribution it is a TAIL
+cutter, not a throughput governor. It equals the substrate's own
+declared read-class ceiling (`hooks::timeouts::READ_CLASS_DEADLINE_MS`).
+The rerank coefficient (`RERANK_FORWARD_NANOS_PER_PAIR_TOKEN`) is
+grounded in the ~1,063 ms reference measurement and is documented as an
+**estimate, not a measured guarantee**.
+
+A companion process-local query-embedding cache
+(`AI_MEMORY_QUERY_EMBED_CACHE_ENTRIES`, default `512`, `0` disables) is
+the only lever that removes the ~156 ms round-trip FLOOR rather than
+bounding its tail. It is keyed on
+`(SHA-256(exact query bytes), embedding_space fingerprint)` — the query
+text is digested, never held in cleartext; the digest is over the exact
+bytes with no case folding or normalisation, because a lossy fold is the
+only way the cache could return a WRONG vector; and carrying the #2167
+embedding-space fingerprint makes a model swap a key change (a miss)
+rather than an invalidation event some funnel could forget to fire.
+Bounded LRU plus a 900 s TTL, so the footprint is a fixed ceiling
+(~1.5 MB at 768-dim, ~6 MB at 3072-dim) independent of corpus, namespace
+or tenant count. Counter: `ai_memory_query_embed_cache_hits_total`.
+Documented residual: a cache hit is measurably faster, so a co-tenant
+can probe whether a given exact query string was issued recently — a
+query-EXISTENCE timing oracle, not content disclosure. The cache holds
+no rows, ids or namespaces, and row visibility is applied downstream and
+unchanged.
+
+**On MCP stdio there is no `/metrics` endpoint**, so on that surface the
+WARN is the only channel for either degrade.
+
 ## Power-loss durability (#1961 / R23-R7)
 
 By default the SQLite substrate opens with `PRAGMA synchronous=NORMAL`

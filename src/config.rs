@@ -3780,9 +3780,24 @@ pub struct LimitsSection {
     pub max_page_size: Option<usize>,
 
     /// #1733 (Pillar-4 4.A) — global HTTP admission-control concurrency
-    /// cap. When `Some(n)` with `n > 0`, the daemon admits at most `n`
-    /// concurrent in-flight requests and sheds the rest with a typed
-    /// `503`. `None` / `Some(0)` leaves admission control disabled.
+    /// cap. TRI-STATE since #2032 M3, and the three states are NOT the
+    /// obvious ones:
+    ///
+    /// * `Some(n)`, `n > 0` — admit at most `n` concurrent in-flight
+    ///   requests, shedding the rest with a typed `503`.
+    /// * `Some(0)` — the operator EXPLICITLY DISABLED admission control.
+    /// * `None` (absent) — admission control is **ON**, CPU-scaled by
+    ///   [`resolve_default_max_inflight_requests`].
+    ///
+    /// This doc-comment said "`None` / `Some(0)` leaves admission control
+    /// disabled" through v1.0.0, which was the pre-#2032 contract and is
+    /// wrong for `None`. It is called out because this comment is what
+    /// doc writers copy: the same inverted claim reached the `[limits]`
+    /// blocks of both CLAUDE.md and `docs/CONFIG_SCHEMA.md`, where a
+    /// copy-pasted `max_inflight_requests = 0` silently turned the DoS
+    /// guard off. Unlike the sibling `[limits]` knobs there is
+    /// deliberately NO `> 0` filter on the resolver — that is what makes
+    /// explicit `0` distinguishable from unset.
     pub max_inflight_requests: Option<usize>,
 
     /// v0.9 #1005 (G2) — in-memory vector-index residency cap

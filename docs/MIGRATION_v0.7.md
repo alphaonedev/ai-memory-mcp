@@ -105,8 +105,8 @@ post-grand-slam inventory: [`docs/internal/v070-feature-inventory.md`](internal/
 
 | Tool | Family | Track / form | One-line description |
 |---|---|---|---|
-| `memory_load_family(family)` | Core | B1 | Always-on loader — registers the named family's tools without restarting the MCP server. |
-| `memory_smart_load(intent)` | Core | B2 | Embedding-matched loader — picks the family that best fits a natural-language intent string. |
+| `memory_load_family(family)` | Core | B1 | Always-on MEMORY loader — returns top-k recent + high-priority memories tagged with the named family. It does NOT register tools (corrected 2026-08-09, [#2781](https://github.com/alphaonedev/ai-memory-mcp/issues/2781); this row previously said it "registers the named family's tools without restarting the MCP server", which was never true). |
+| `memory_smart_load(intent)` | Core | B2 | Embedding-matched MEMORY loader — picks the family that best fits a natural-language intent string, then forwards to `memory_load_family`. |
 | `memory_find_paths(source, target, max_depth=5)` | Graph | J7 | Returns paths through the knowledge graph; Cypher on AGE, recursive CTE on SQLite. |
 | `memory_replay(memory_id, depth?)` | Graph | I4 / L2-4 | Reconstructs the transcript chain for a memory by traversing `memory_transcript_links`. |
 | `memory_verify(link_id)` | Graph | H4 | Returns `{signature_verified, attest_level, signed_by, signed_at}` for a link. |

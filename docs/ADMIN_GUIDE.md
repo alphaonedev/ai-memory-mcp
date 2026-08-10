@@ -48,7 +48,7 @@ Run the HTTP daemon directly in the foreground:
 ai-memory --db /path/to/ai-memory.db serve
 ```
 
-The daemon listens on `127.0.0.1:9077` by default and exposes 92 HTTP route registrations (78 unique URL paths) (canonical count on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
+The daemon listens on `127.0.0.1:9077` by default and exposes 94 HTTP route registrations (80 unique URL paths) (canonical count on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
 
 ### Systemd (Production HTTP Daemon)
 
@@ -143,7 +143,7 @@ The `--tier` flag controls which features are enabled. Each tier builds on the p
 | `keyword` | keyword subset | No | No | Minimal |
 | `semantic` (default) | semantic subset | Yes (HuggingFace) | No | ~256 MB |
 | `smart` | smart subset (LLM tools enabled) | Yes | Yes — any provider (#1067): Ollama, xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp | ~1 GB (local Ollama) / ~256 MB (remote endpoint) |
-| `autonomous` | full 101-entry surface (v0.9.0; 100 callable memory tools + the always-on `memory_capabilities` bootstrap) | Yes | Yes — same as smart (#1067) | ~4 GB (local Ollama) / ~3 GB (remote LLM, local cross-encoder) |
+| `autonomous` | full 103-entry surface (v1.0.0; 102 callable memory tools + the always-on `memory_capabilities` bootstrap) | Yes | Yes — same as smart (#1067) | ~4 GB (local Ollama) / ~3 GB (remote LLM, local cross-encoder) |
 
 Set the tier when starting the MCP server or running per-invocation
 subcommands (`mcp`, `store`, `recall`, etc.):
@@ -640,9 +640,9 @@ profile is active.
 | `graph` | core + Graph family | Agents that walk `memory_link` / `memory_get_links` / `memory_kg_query` / `memory_find_paths` / `memory_verify` / `memory_replay` / the entity + taxonomy tools. |
 | `admin` | core + Lifecycle + Governance families | Operator sessions doing `memory_pending_*`, `memory_check_agent_action`, `memory_rule_list`, agent registration, lifecycle ops. |
 | `power` | core + Power family | Smart/autonomous tier deployments that want `memory_consolidate`, `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, `memory_check_duplicate`, `memory_inbox`, the subscription-reliability tools, etc. always available. |
-| `full` | every family — **101 advertised entries** (100 callable memory tools + the always-on `memory_capabilities` bootstrap; both numbers are intentional, see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862)) | Pre-v0.6.4 behavior 1:1, plus v0.7/v0.8/v0.9 additions. Canonical count asserted by `Profile::full().expected_tool_count()` in `src/profile.rs`. |
+| `full` | every family — **103 advertised entries** (102 callable memory tools + the always-on `memory_capabilities` bootstrap; both numbers are intentional, see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862)) | Pre-v0.6.4 behavior 1:1, plus v0.7/v0.8/v0.9 additions. Canonical count asserted by `Profile::full().expected_tool_count()` in `src/profile.rs`. |
 
-**v0.7 core additions:** `memory_load_family(family)` and `memory_smart_load(intent)` live in the Core family, so every named profile (all of which include core) advertises them. They register additional families at runtime without restarting the MCP server — preferred over re-launching with a wider `--profile` for short-lived expansions. The pinned phrasings the agent sees for these recovery paths live in [`v0.7/canonical-phrasings.md`](v0.7/canonical-phrasings.html).
+**v0.7 core additions:** `memory_load_family(family)` and `memory_smart_load(intent)` live in the Core family, so every named profile (all of which include core) advertises them. **They load MEMORIES tagged with a family — they do NOT register tools.** `memory_load_family` returns the top-k recent + high-priority memories whose `metadata.family` matches, and `memory_smart_load` picks the best-matching family from a free-text intent and forwards to it; neither mutates the tool registry or the resolved `Profile`, so neither makes an unloaded tool callable ([#2781](https://github.com/alphaonedev/ai-memory-mcp/issues/2781); the pre-#2781 sentence here claimed they "register additional families at runtime"). Restarting under a wider `--profile` is the only way to widen the callable tool surface. The pinned phrasings the agent sees live in [`v0.7/canonical-phrasings.md`](v0.7/canonical-phrasings.html).
 
 ```bash
 ai-memory mcp                       # --profile core (default)
@@ -654,7 +654,7 @@ The `--profile` flag **must** be passed in the MCP args — `config.toml` has no
 
 ## Hooks (v0.7+)
 
-The hook pipeline (Track G of `attested-cortex`) adds **26 lifecycle events** at every memory operation point, turning the substrate into a programmable extension surface. 19 baseline events (PreStore/PostStore/PreRecall/PostRecall/PreSearch/PostSearch/PreDelete/PostDelete/PrePromote/PostPromote/PreLink/PostLink/PreConsolidate/PostConsolidate/PreGovernanceDecision/PostGovernanceDecision/OnIndexEviction/PreTranscriptStore/PostTranscriptStore) plus 5 v0.7.0 additions (PreRecallExpand, PreReflect, PostReflect, PreCompaction, OnCompactionRollback) plus 2 v0.8.0 Pillar-1 #1709 additions (PreSignalSend, PostSignalAck). Authoritative enum: `src/hooks/events.rs::HookEvent`. (v1.0.0 #2637 removed the never-fired `PreArchive` gate, 27 → 26.) Hooks are **default off** — a v0.7 install with no `~/.config/ai-memory/hooks.toml` behaves identically to v0.6.4.
+The hook pipeline (Track G of `attested-cortex`) adds **22 lifecycle events** at every memory operation point, turning the substrate into a programmable extension surface. 15 baseline events (PreStore/PostStore/PostRecall/PostSearch/PreDelete/PostDelete/PrePromote/PostPromote/PreLink/PostLink/PreConsolidate/PostConsolidate/PreGovernanceDecision/PostGovernanceDecision/OnIndexEviction) plus 5 v0.7.0 additions (PreRecallExpand, PreReflect, PostReflect, PreCompaction, OnCompactionRollback) plus 2 v0.8.0 Pillar-1 #1709 additions (PreSignalSend, PostSignalAck) — 15+5+2=22. Authoritative enum: `src/hooks/events.rs::HookEvent`. (v1.0.0 #2637 removed the never-fired `PreArchive` gate, 27 → 26; v1.0.0 #2758 removed the never-fired `PreRecall`/`PreSearch` read gates and the whole `PreTranscriptStore`/`PostTranscriptStore` family, 26 → 22.) Hooks are **default off** — a v0.7 install with no `~/.config/ai-memory/hooks.toml` behaves identically to v0.6.4.
 
 ```toml
 # ~/.config/ai-memory/hooks.toml
@@ -1034,7 +1034,7 @@ HTTP API can set any well-formed `agent_id`; what a signature attests is the
 `attest_level`, not that the id itself is trustworthy for authorization. Use such
 an id for provenance, audit, and filter scoping — **never as an authorization gate
 on its own.** (Whether an *unsigned* write is accepted at all is governed by the
-store-path attestation gate below — **required by default since v0.9.0**.)
+store-path attestation gate below — **required by default on the HTTP direct-write surface only** since v1.0.0 (#1985, correcting #1751); MCP/CLI stay permissive.)
 
 **Store-path attestation (#626 Layer-3, v0.7.0).** A caller holding the agent's
 keypair can upgrade a write from claimed to attested by presenting a detached
@@ -1407,7 +1407,7 @@ Both are cleaned up on graceful shutdown (the daemon runs `PRAGMA wal_checkpoint
 
 Maximum request body size: **2 MiB** (`HTTP_BODY_LIMIT_BYTES` in `src/lib.rs`).
 
-The HTTP daemon exposes **92 production `.route(...)` registrations / 78 unique URL paths** (canonical count via codegraph `codegraph_search kind=route limit=100` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated test-only routes; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`. The table below lists the high-traffic surfaces — see [`docs/API_REFERENCE.md`](API_REFERENCE.html) for the complete enumeration):
+The HTTP daemon exposes **94 production `.route(...)` registrations / 80 unique URL paths** (canonical count via codegraph `codegraph_search kind=route limit=100` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated test-only routes; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`. The table below lists the high-traffic surfaces — see [`docs/API_REFERENCE.md`](API_REFERENCE.html) for the complete enumeration):
 
 | Method | Path | Description |
 |--------|------|-------------|

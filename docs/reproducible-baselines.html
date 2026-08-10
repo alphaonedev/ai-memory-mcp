@@ -113,7 +113,7 @@ footer a{color:var(--text-muted)}
     <p class="tagline">A result you cannot reproduce is an anecdote. ai-memory v0.9.0 ships <strong>three reproducibility contracts</strong>, each with committed mechanism and citable evidence: the <a href="#fleet">two-round clean-room fleet reproduction</a> (do-1461), the <a href="#bench">performance-baseline + regression-gate mechanism</a> (<code>src/bench.rs</code>), and the <a href="#suite">release-gate full-suite contract</a> (the 2026-05-22 final campaign). This page documents what each contract pins, where the pins live, and how to re-run them.</p>
     <div class="hero-pills">
       <span class="hero-pill good">Fleet: 2 × independent 0→60 runs · 119/119 verify checks green both rounds</span>
-      <span class="hero-pill good">Bench: p95 budgets + baseline-JSON regression gate on every PR</span>
+      <span class="hero-pill good">Bench: p95 budgets + baseline-JSON regression check on every PR (advisory, not a required status check)</span>
       <span class="hero-pill good">Suite: pinned branch + binary + invocation + environment</span>
     </div>
   </div>

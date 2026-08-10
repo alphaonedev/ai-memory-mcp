@@ -279,7 +279,7 @@ sal          = ["dep:async-trait", "dep:bitflags", "dep:thiserror"]
 sal-postgres = ["sal", "dep:sqlx", "dep:pgvector"]
 ```
 
-**89 CLI subcommands in the default build; 91 under `sal`.** The gap is `Migrate` + `SchemaInit`. This asymmetry is the root of §9.
+**90 CLI subcommands in the default build; 92 under `sal`.** The gap is `Migrate` + `SchemaInit`. This asymmetry is the root of §9.
 
 ### The eight numbered lint gates (all HARD-BLOCK, wired into `c8-precheck.yml`)
 

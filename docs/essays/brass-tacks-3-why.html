@@ -96,7 +96,7 @@ footer a{color:var(--muted)}
   <div class="fact"><dt>Surface</dt><dd><code>ai-memory governance check-action</code> (CLI, #863), the governance HTTP endpoint, and the <code>memory_check_agent_action</code> MCP tool</dd></div>
 
   <h2><span class="num">05.</span> HMAC-required subscriptions + SSRF gate</h2>
-  <p>The hook pipeline fires on 25 named substrate events. External subscribers (webhooks) must register an HMAC secret at subscription time; events are POSTed with an <code>X-AI-Memory-Signature</code> header; unsigned subscriptions are refused at registration. Loopback URLs are refused unless <code>AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS=1</code> &mdash; an SSRF gate (issue #628, H11) so a compromised agent cannot pivot to localhost services.</p>
+  <p>The hook pipeline fires on 22 named substrate events. External subscribers (webhooks) must register an HMAC secret at subscription time; events are POSTed with an <code>X-AI-Memory-Signature</code> header; unsigned subscriptions are refused at registration. Loopback URLs are refused unless <code>AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS=1</code> &mdash; an SSRF gate (issue #628, H11) so a compromised agent cannot pivot to localhost services.</p>
 
   <h2><span class="num">06.</span> Autonomous tier (LLM consolidate / contradict / auto-tag)</h2>
   <p>When you wire in an LLM (local Ollama, OpenAI-compatible endpoint, whatever), the substrate runs:</p>

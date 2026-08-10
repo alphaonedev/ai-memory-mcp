@@ -14,8 +14,13 @@
 //!
 //! - **T1 RECALL** — given the v3 capabilities response, can a
 //!   reasoning-class LLM recall the **names** of the three runtime
-//!   recovery paths (`--profile`, `memory_load_family`,
+//!   surfaces the summary teaches (`--profile`, `memory_load_family`,
 //!   `memory_smart_load`)? Asserted as substring presence in `summary`.
+//!   **#2781:** only `--profile` reaches an unloaded TOOL; the two
+//!   family loaders load MEMORIES and the summary now says so. The
+//!   names must still be recallable — an LLM should know the memory
+//!   loaders exist — but "recovery path" language below refers to the
+//!   pre-#2781 framing and is retained only where it names history.
 //! - **T2 RECOGNITION** — given a user-style question ("how do I load
 //!   more tools?"), does the substrate's `to_describe_to_user` string
 //!   carry the recognition lexicon ("on demand", "load them",
@@ -275,23 +280,39 @@ fn t2_recognition_describe_uses_closing_form_under_full_profile() {
 
 // ---------------------------------------------------------------------------
 // T2-RECOGNITION-OPERATOR-VOCAB — the `summary` (operator-facing) string
-// carries the "preferred" / "easiest" recognition tags that let the LLM
-// rank the loader paths without re-deriving them. This is the lexicon
-// the t2-reactive-loaders cell expects the LLM to repeat when asked
-// "what's the best way to load a family?".
+// must NOT rank the two family loaders as ways to reach an unloaded
+// tool, and must say what they actually do.
+//
+// #2781 inverted this cell. It previously asserted the "— preferred"
+// (memory_load_family) and "— easiest" (memory_smart_load) ranking tags,
+// pinning a FALSE claim: both tools load MEMORIES tagged with a family
+// (`LoadFamilyTool::description()` = "Load top-k recent + high-priority
+// memories from a Family"; `handle_smart_load` forwards to the same
+// handler) and neither mutates the tool registry or the resolved
+// `Profile`, so ranking them as tool-recovery paths sent an LLM down a
+// dead end. The recognition lexicon an LLM should now converge on is
+// "these load memories; restart under a wider --profile to reach a
+// tool", which is what this cell pins.
 // ---------------------------------------------------------------------------
 #[test]
-fn t2_recognition_summary_ranks_loader_paths_with_preferred_and_easiest() {
+fn t2_recognition_summary_disclaims_loaders_as_tool_recovery_paths() {
     let summary = summary_for(&Profile::core());
+    for banned in ["— preferred", "— easiest"] {
+        assert!(
+            !summary.contains(banned),
+            "T2-RECOGNITION-OPERATOR-VOCAB: #2781 — the summary must not rank the \
+             family loaders as tool-recovery paths ({banned:?} is back).\nfull: {summary}"
+        );
+    }
     assert!(
-        summary.contains("— preferred"),
-        "T2-RECOGNITION-OPERATOR-VOCAB: summary missing the \"— preferred\" \
-         tag on memory_load_family (path (b)).\nfull: {summary}"
+        summary.contains("load MEMORIES tagged with a family; they do NOT register tools"),
+        "T2-RECOGNITION-OPERATOR-VOCAB: #2781 — summary must state what the two \
+         family loaders actually do.\nfull: {summary}"
     );
     assert!(
-        summary.contains("— easiest"),
-        "T2-RECOGNITION-OPERATOR-VOCAB: summary missing the \"— easiest\" \
-         tag on memory_smart_load (path (c)).\nfull: {summary}"
+        summary.contains("The only way to make an unloaded tool callable is to restart"),
+        "T2-RECOGNITION-OPERATOR-VOCAB: #2781 — summary must name profile selection \
+         as the one real path to an unloaded tool.\nfull: {summary}"
     );
 }
 

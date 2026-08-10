@@ -56,10 +56,8 @@
 # the Cargo.toml version.
 
 # --- ROADMAP.md -------------------------------------------------------
-ROADMAP.md Profile::full().expected_tool_count() 101    #2492 ":13 Production version: v0.9.0 (schema v78, 101 MCP tools at `--profile full`)"
 
 # --- Other DOC_FILES the widened anchors newly reach ------------------
-docs/DEVELOPER_GUIDE.md EXPECTED_PRODUCTION_ROUTES_COUNT 93                  #2492 register 6.4 records this file as already internally inconsistent
 docs/a2a-harness-integration.md EXPECTED_PRODUCTION_ROUTES_COUNT 93         #2492
 docs/a2a-harness-integration.md Memory::FIELD_COUNT 28                      #2492
 docs/MIGRATION_QUICKSTART.md EXPECTED_CLI_SUBCOMMANDS_DEFAULT 79            #2492 v0.6->v0.7 comparison table; likely belongs with the three frozen v0.7 guides
