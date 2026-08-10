@@ -298,8 +298,18 @@ EOS
   #       201 = quorum_met; 202 = locally durable with a late ack. Both prove
   #       the mutually authenticated peer channel carried it; the replication
   #       itself is asserted separately by READING node 2.
-  body=$(jq -nc --arg t "hive-quorum-probe-$$" --arg ns "$NS" \
-    '{title:$t,content:"a federated write that must replicate across the DO mTLS quorum mesh",namespace:$ns,tier:"mid"}')
+  # #2854: v1.0.0 fail-closes UNSIGNED HTTP-direct writes (POST /api/v1/memories)
+  # with 403 ATTESTATION_FAILED, so the quorum probe MUST be signed (like A4)
+  # or it never reaches the fanout it is meant to assert.
+  QTITLE="hive-quorum-probe-$$"
+  QCONTENT="a federated write that must replicate across the DO mTLS quorum mesh"
+  QCREATED="$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
+  QSIG=""
+  [ -x "$SIGNER" ] && QSIG="$("$SIGNER" --agent-id "$AUTHOR_ID" --namespace "$NS" \
+    --title "$QTITLE" --kind observation --created-at "$QCREATED" --content "$QCONTENT" \
+    --priv-file "$AUTHOR_KEY_DIR/$AUTHOR_ID.priv" 2>/dev/null)"
+  body=$(jq -nc --arg t "$QTITLE" --arg c "$QCONTENT" --arg ns "$NS" --arg s "$QSIG" --arg ca "$QCREATED" \
+    '{title:$t,content:$c,namespace:$ns,tier:"mid"} + (if $s != "" then {signature:$s,created_at:$ca} else {} end)')
   resp=$(node_post 0 "$(b64 "$body")")
   qcode=$(echo "$resp" | tail -1)
   qjson=$(echo "$resp" | sed '$d')
@@ -312,7 +322,7 @@ EOS
   if [ -n "$QID" ]; then
     landed=""
     for _ in $(seq 1 20); do
-      landed=$(node_get 1 "$QID" | jq -r '.id // empty' 2>/dev/null)
+      landed=$(node_get 1 "$QID" | jq -r '(.memory.id // .id) // empty' 2>/dev/null)
       [ -n "$landed" ] && break
       sleep 2
     done
@@ -356,7 +366,7 @@ EOS
       if [ -n "$SID" ]; then
         lvl=""
         for _ in $(seq 1 20); do
-          lvl=$(node_get 1 "$SID" | jq -r '.metadata.attest_level // empty' 2>/dev/null)
+          lvl=$(node_get 1 "$SID" | jq -r '(.memory.metadata.attest_level // .metadata.attest_level) // empty' 2>/dev/null)
           [ -n "$lvl" ] && break
           sleep 2
         done
