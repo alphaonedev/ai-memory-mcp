@@ -55,6 +55,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   byte-matches the broadcast copy (a catch-up re-send of a signature-less row
   would otherwise flip a peer's `agent_attested` row back to `claimed` and
   re-quarantine it under `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`).
+### Fixed
+
+- **Federated consolidation no longer returns a success-shaped response while
+  silently diverging (#2856, data-integrity, 5-agent vote `4d3ea1c5`).** A
+  `POST /api/v1/consolidate` mints a NEW substrate-derived memory attributed to
+  the tenant consolidator, but the origin daemon cannot produce that tenant's
+  Ed25519 signature — so under the v1.0.0-default strict
+  `AI_MEMORY_FED_REQUIRE_WRITE_SIG=1` a peer refuses the unsigned honored-
+  third-party relay (`unenrolled_author_strict`) and buckets it into `skipped`
+  inside its own 2xx, missing the W-of-N quorum. The origin then returned a
+  `202 durability:"local"` body that OMITTED the created memory's `id`, so a
+  caller saw a success-shaped 2xx with no way to discover the row that
+  committed locally but did not replicate. The consolidate under-replication
+  `202` now carries the created `id` (plus the `consolidated` / `summary` /
+  `content` / `memory` fields the `201` success body emits) alongside
+  `quorum_met:false` / `durability:"local"`, so the under-replication is LOUD
+  and RECONCILABLE (the North-Star "degrade, never diverge silently" floor).
+  The `202`-not-`5xx` status is preserved (the local row is durable — W3/gap
+  G12). Applies to both the sqlite and postgres consolidate branches via the
+  shared `consolidate_fanout` helper. Regression:
+  `handlers::tests::http_consolidate_under_replicated_returns_created_id_2856`.
+  Convergent replication of a tenant-attributed consolidation (which requires
+  resolving the tenant-vs-substrate authorship model) is tracked as a
+  follow-up (#2860).
+- **`POST /api/v1/memory_reflect` false `400 "source memory not found"` on
+  postgres (#2857)** — the postgres SAL branch of `handle_reflect_http`
+  resolved the caller identity from the request BODY only (via
+  `parse_reflect_input`), ignoring the `X-Agent-Id` header. Source existence is
+  checked through the SAL `MemoryStore::get` scope=private visibility gate keyed
+  on the `CallerContext` principal, so a source memory written and GET-able
+  under `X-Agent-Id: <owner>` (no body `agent_id`) was invisible to reflect —
+  its lookup ran under the host/anonymous default principal — and reflect
+  refused an existing memory. Reflect now resolves the caller
+  header-authoritatively when `X-Agent-Id` is present (the
+  `resolve_caller_agent_id` parity helper, matching GET/recall/store), so the
+  source lookup AND the reflection authorship use the same principal the memory
+  was written under. The body `agent_id` remains a refinement that must match
+  the header (#2140 forge protection unchanged); with no header present the
+  shipped #1317 body-only zero-config contract stands. Reflect still correctly
+  refuses a source the caller genuinely cannot see. Regression:
+  `tests/reflect_pg_caller_identity_2857.rs` (pg-gated).
 
 ### Docs / gates (perfection wave 2 — post-#2844 remainder; #2837 #2838 #2839 #2834)
 

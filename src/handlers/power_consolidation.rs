@@ -256,13 +256,26 @@ async fn consolidate_fanout(
     {
         Ok(tracker) => {
             if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                // #869 — typed 503 envelope via the shared helper. (#2861 in the
-                // merge queue enhances this to an id-bearing 202 via
-                // `under_replicated_consolidate_response`; overlap noted — this
-                // convergence fix makes the quorum SUCCEED, so the miss path is
-                // now the residual peer-down case, where the loud floor matters.)
+                // #2856/#2861 loud floor + #2860 convergence composed. #2860
+                // authors the consolidation as the daemon federation identity so
+                // the quorum normally SUCCEEDS (self-relay past strict write-sig)
+                // and this miss path is now the RESIDUAL peer-down / partition
+                // case. When it does miss, keep #2861's id-bearing under-
+                // replication 202 (`under_replicated_consolidate_response`, was
+                // the bare `under_replicated_response` that omitted the created
+                // `id`) so the caller can DISCOVER + reconcile the local-only row
+                // instead of seeing a success-shaped 2xx with nothing to act on
+                // (5-agent vote `4d3ea1c5`). Exactly one of `deletions` /
+                // `tombstoned_sources` is populated (legacy hard-delete vs the
+                // v1.0.0-default tombstone disposition), so their sum is the
+                // original consolidated-source count the 202 body reports.
                 let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                return Some(super::under_replicated_response(&payload));
+                let source_count = deletions.len() + tombstoned_sources.len();
+                return Some(super::under_replicated_consolidate_response(
+                    &payload,
+                    mem,
+                    source_count,
+                ));
             }
         }
         Err(e) => {
