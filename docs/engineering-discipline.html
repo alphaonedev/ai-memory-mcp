@@ -323,7 +323,7 @@ is a <span class="err">HARD-BLOCK</span> when its site-count exceeds the frozen 
       <div class="card amber">
         <div class="lbl">batch 4</div>
         <h3>handlers::routes</h3>
-        <p>One const per production HTTP route path — 78 consts. The router registers them, and the postgres surface gate (207 literals in <code>postgres_gate.rs</code>), the federation receiver, and the CLI doctor all match on them — so <strong>route gating structurally cannot drift from route registration</strong>.</p>
+        <p>One const per production HTTP route path — 80 consts. The router registers them, and the postgres surface gate (207 literals in <code>postgres_gate.rs</code>), the federation receiver, and the CLI doctor all match on them — so <strong>route gating structurally cannot drift from route registration</strong>.</p>
       </div>
       <div class="card cyan">
         <div class="lbl">batch 6</div>

@@ -61,5 +61,3 @@
 docs/a2a-harness-integration.md EXPECTED_PRODUCTION_ROUTES_COUNT 93         #2492
 docs/a2a-harness-integration.md Memory::FIELD_COUNT 28                      #2492
 docs/MIGRATION_QUICKSTART.md EXPECTED_CLI_SUBCOMMANDS_DEFAULT 79            #2492 v0.6->v0.7 comparison table; likely belongs with the three frozen v0.7 guides
-docs/compliance/nsa-csi-mcp-security-mapping.md CURRENT_SCHEMA_VERSION 57   #2492 dated v0.7.0 compliance artefact header
-docs/compliance/nsa-csi-mcp-security-mapping.md EXPECTED_PRODUCTION_ROUTES_COUNT 89  #2492 same artefact, "89 HTTP routes, 74 MCP tools"
