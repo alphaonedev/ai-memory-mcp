@@ -453,55 +453,26 @@ pub async fn consolidate_memories(
             // on the tenant `ctx` (the tenant owns the sources).
             let author_ctx = crate::store::CallerContext::for_agent(&pg_author_id);
             if let Ok(mut mem) = app.store.get(&author_ctx, &new_id).await {
-                let summary_source = crate::handlers::consolidate_federation::summary_source_of(
+                // Shared, unit-tested finalize+disposition (SAL twin of the sqlite
+                // branch's `sqlite_finalize_and_disposition`). Source reads stay on
+                // the tenant `ctx` (the tenant owns the sources); `set_row_metadata`
+                // is by-id and ctx-agnostic.
+                let disp = crate::handlers::consolidate_federation::store_finalize_and_disposition(
+                    app.store.as_ref(),
+                    &ctx,
+                    &mut mem,
+                    &source_ids,
+                    &pg_author_id,
+                    &consolidator_agent_id,
                     body.summary.as_deref(),
-                );
-                let author_kp =
-                    crate::handlers::consolidate_federation::load_author_signing_keypair(
-                        &pg_author_id,
-                    );
-                let (final_meta, _signed) =
-                    crate::handlers::consolidate_federation::finalize_consolidation_metadata(
-                        &mem,
-                        &pg_author_id,
-                        author_kp.as_ref(),
-                        &consolidator_agent_id,
-                        summary_source,
-                    );
-                if let Ok(js) = serde_json::to_string(&final_meta) {
-                    if let Err(e) = app.store.set_row_metadata(&ctx, &new_id, &js).await {
-                        tracing::warn!(
-                            "consolidate(pg): failed to persist federated attestation metadata for {new_id}: {e}"
-                        );
-                    }
-                }
-                mem.metadata = final_meta;
-                // Source disposition: TOMBSTONE (v1.0.0 default) re-broadcasts the
-                // retained tombstoned source rows via memories[] + ships the
-                // navigable derived_from edges; legacy hard-delete keeps the
-                // deletions[] list.
-                let (deletions, tombstoned_sources, derived_edges) =
-                    if crate::config::consolidate_tombstone_sources_enabled() {
-                        let mut sources: Vec<Memory> = Vec::with_capacity(source_ids.len());
-                        for id in &source_ids {
-                            if let Ok(src) = app.store.get(&ctx, id).await {
-                                sources.push(src);
-                            }
-                        }
-                        let edges = crate::handlers::consolidate_federation::derived_from_edges(
-                            &mem,
-                            &source_ids,
-                        );
-                        (Vec::new(), sources, edges)
-                    } else {
-                        (source_ids.clone(), Vec::new(), Vec::new())
-                    };
+                )
+                .await;
                 if let Some(resp) = consolidate_fanout(
                     app.federation.as_ref().as_ref(),
                     &mem,
-                    &deletions,
-                    &tombstoned_sources,
-                    &derived_edges,
+                    &disp.deletions,
+                    &disp.tombstoned_sources,
+                    &disp.derived_edges,
                 )
                 .await
                 {
@@ -655,51 +626,24 @@ pub async fn consolidate_memories(
     // #2860 — on the FEDERATED path, finalize the substrate-authored row
     // (best-effort daemon `write_signature` + tenant/summary provenance) and
     // prepare the lineage disposition to broadcast, all while the lock is held
-    // so the tombstoned source rows + `derived_from` edges are read
-    // consistently. `fanout_deletions` defaults to the legacy hard-DELETE list
-    // and is emptied only under the tombstone disposition (where the sources
-    // are re-broadcast as tombstoned rows instead).
-    let mut fanout_deletions: Vec<String> = source_ids.clone();
-    let mut tombstoned_sources: Vec<Memory> = Vec::new();
-    let mut derived_edges: Vec<crate::models::MemoryLink> = Vec::new();
-    if fed_enabled {
-        if let Some(mem) = new_mem.as_mut() {
-            let summary_source =
-                crate::handlers::consolidate_federation::summary_source_of(body.summary.as_deref());
-            let author_kp =
-                crate::handlers::consolidate_federation::load_author_signing_keypair(&author_id);
-            let (final_meta, _signed) =
-                crate::handlers::consolidate_federation::finalize_consolidation_metadata(
-                    mem,
-                    &author_id,
-                    author_kp.as_ref(),
-                    &consolidator_agent_id,
-                    summary_source,
-                );
-            if let Ok(js) = serde_json::to_string(&final_meta) {
-                if let Err(e) = db::set_row_metadata(&lock.0, &mem.id, &js) {
-                    tracing::warn!(
-                        "consolidate: failed to persist federated attestation metadata for {}: {e}",
-                        mem.id
-                    );
-                }
-            }
-            mem.metadata = final_meta;
-            if crate::config::consolidate_tombstone_sources_enabled() {
-                // TOMBSTONE disposition (v1.0.0 default): peers RETAIN + tombstone
-                // the sources (converged via the memories[] LWW lane) and receive
-                // the navigable `derived_from` edges — no hard-delete, so lineage
-                // + source-state converge instead of diverging.
-                fanout_deletions = Vec::new();
-                tombstoned_sources = source_ids
-                    .iter()
-                    .filter_map(|id| db::get(&lock.0, id).ok().flatten())
-                    .collect();
-                derived_edges =
-                    crate::handlers::consolidate_federation::derived_from_edges(mem, &source_ids);
-            }
-        }
-    }
+    // so the tombstoned source rows + `derived_from` edges are read consistently.
+    // The finalize+disposition logic is the shared, unit-tested helper (its
+    // postgres twin `store_finalize_and_disposition` runs the identical body
+    // through the SAL trait, so the two backends cannot drift).
+    let disposition = if fed_enabled {
+        new_mem.as_mut().map(|mem| {
+            crate::handlers::consolidate_federation::sqlite_finalize_and_disposition(
+                &lock.0,
+                mem,
+                &source_ids,
+                &author_id,
+                &consolidator_agent_id,
+                body.summary.as_deref(),
+            )
+        })
+    } else {
+        None
+    };
     // Drop DB lock before fanning out — peers POST back to our sync_push
     // and we'd deadlock on the shared Mutex if we held it.
     drop(lock);
@@ -709,12 +653,19 @@ pub async fn consolidate_memories(
             // source disposition + `derived_from` lineage to peers so the mesh
             // reaches the same terminal state (shared `consolidate_fanout`).
             if let Some(mem) = new_mem {
+                let disp = disposition.unwrap_or_else(|| {
+                    crate::handlers::consolidate_federation::FanoutDisposition {
+                        deletions: source_ids.clone(),
+                        tombstoned_sources: Vec::new(),
+                        derived_edges: Vec::new(),
+                    }
+                });
                 if let Some(resp) = consolidate_fanout(
                     app.federation.as_ref().as_ref(),
                     &mem,
-                    &fanout_deletions,
-                    &tombstoned_sources,
-                    &derived_edges,
+                    &disp.deletions,
+                    &disp.tombstoned_sources,
+                    &disp.derived_edges,
                 )
                 .await
                 {

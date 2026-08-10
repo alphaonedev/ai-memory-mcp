@@ -193,6 +193,126 @@ pub(crate) fn derived_from_edges(consolidated: &Memory, source_ids: &[String]) -
         .collect()
 }
 
+/// The broadcast disposition for a federated consolidation: the source ids to
+/// hard-DELETE at peers (legacy), the RETAINED tombstoned source rows to
+/// re-broadcast (tombstone disposition), and the `derived_from` edges to ship.
+pub(crate) struct FanoutDisposition {
+    pub deletions: Vec<String>,
+    pub tombstoned_sources: Vec<Memory>,
+    pub derived_edges: Vec<MemoryLink>,
+}
+
+/// SQLITE federated-consolidate finalize + disposition (shared, testable). On
+/// the read-back consolidated row `mem` (already authored as `author_id` == the
+/// federation sender): stamp the substrate `write_signature` + tenant/summary
+/// provenance (persisting it in place so the stored origin row byte-matches the
+/// broadcast copy), mutate `mem.metadata` to the finalized value, then compute
+/// the source disposition — under the v1.0.0-default tombstone posture the
+/// RETAINED tombstoned source rows are re-broadcast (no `deletions`) alongside
+/// the navigable `derived_from` edges; otherwise the legacy `deletions` list is
+/// returned. All reads/writes go through the caller's already-open connection.
+pub(crate) fn sqlite_finalize_and_disposition(
+    conn: &rusqlite::Connection,
+    mem: &mut Memory,
+    source_ids: &[String],
+    author_id: &str,
+    consolidator_tenant: &str,
+    raw_summary: Option<&str>,
+) -> FanoutDisposition {
+    let summary_source = summary_source_of(raw_summary);
+    let author_kp = load_author_signing_keypair(author_id);
+    let (final_meta, _signed) = finalize_consolidation_metadata(
+        mem,
+        author_id,
+        author_kp.as_ref(),
+        consolidator_tenant,
+        summary_source,
+    );
+    if let Ok(js) = serde_json::to_string(&final_meta) {
+        if let Err(e) = crate::db::set_row_metadata(conn, &mem.id, &js) {
+            tracing::warn!(
+                "consolidate: failed to persist federated attestation metadata for {}: {e}",
+                mem.id
+            );
+        }
+    }
+    mem.metadata = final_meta;
+    if crate::config::consolidate_tombstone_sources_enabled() {
+        let tombstoned_sources = source_ids
+            .iter()
+            .filter_map(|id| crate::db::get(conn, id).ok().flatten())
+            .collect();
+        let derived_edges = derived_from_edges(mem, source_ids);
+        FanoutDisposition {
+            deletions: Vec::new(),
+            tombstoned_sources,
+            derived_edges,
+        }
+    } else {
+        FanoutDisposition {
+            deletions: source_ids.to_vec(),
+            tombstoned_sources: Vec::new(),
+            derived_edges: Vec::new(),
+        }
+    }
+}
+
+/// SAL-store (postgres) twin of [`sqlite_finalize_and_disposition`] — identical
+/// finalize + disposition logic routed through the `MemoryStore` trait so the
+/// two backends cannot drift. `ctx` is the SOURCE-read context (the invoking
+/// tenant, who owns the sources); `set_row_metadata` ignores it (in-place
+/// by-id). `mem` is the read-back consolidated row (already authored as
+/// `author_id`).
+#[cfg(feature = "sal")]
+pub(crate) async fn store_finalize_and_disposition(
+    store: &dyn crate::store::MemoryStore,
+    ctx: &crate::store::CallerContext,
+    mem: &mut Memory,
+    source_ids: &[String],
+    author_id: &str,
+    consolidator_tenant: &str,
+    raw_summary: Option<&str>,
+) -> FanoutDisposition {
+    let summary_source = summary_source_of(raw_summary);
+    let author_kp = load_author_signing_keypair(author_id);
+    let (final_meta, _signed) = finalize_consolidation_metadata(
+        mem,
+        author_id,
+        author_kp.as_ref(),
+        consolidator_tenant,
+        summary_source,
+    );
+    if let Ok(js) = serde_json::to_string(&final_meta) {
+        if let Err(e) = store.set_row_metadata(ctx, &mem.id, &js).await {
+            tracing::warn!(
+                "consolidate(pg): failed to persist federated attestation metadata for {}: {e}",
+                mem.id
+            );
+        }
+    }
+    mem.metadata = final_meta;
+    if crate::config::consolidate_tombstone_sources_enabled() {
+        let mut tombstoned_sources = Vec::with_capacity(source_ids.len());
+        for id in source_ids {
+            if let Ok(src) = store.get(ctx, id).await {
+                tombstoned_sources.push(src);
+            }
+        }
+        let derived_edges = derived_from_edges(mem, source_ids);
+        FanoutDisposition {
+            deletions: Vec::new(),
+            tombstoned_sources,
+            derived_edges,
+        }
+    } else {
+        FanoutDisposition {
+            deletions: source_ids.to_vec(),
+            tombstoned_sources: Vec::new(),
+            derived_edges: Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! #2860 regression — pins that a substrate-authored (self-relayed)
@@ -349,5 +469,180 @@ mod tests {
             );
             assert_eq!(edge.created_at, mem.created_at);
         }
+    }
+
+    // ---- finalize+disposition helper coverage (both backend twins) ----
+
+    use std::sync::Mutex;
+    /// Serializes the tombstone/lineage process-global flag flips.
+    static FLAG_LOCK: Mutex<()> = Mutex::new(());
+
+    fn seed_mem(id: &str, ns: &str, title: &str, author: &str) -> Memory {
+        Memory {
+            id: id.to_string(),
+            namespace: ns.to_string(),
+            title: title.to_string(),
+            content: format!("content for {title} alpha beta gamma"),
+            created_at: "2026-08-10T12:00:00+00:00".to_string(),
+            updated_at: "2026-08-10T12:00:00+00:00".to_string(),
+            metadata: serde_json::json!({ "agent_id": author }),
+            ..Memory::default()
+        }
+    }
+
+    /// SQLITE twin: `sqlite_finalize_and_disposition` under the tombstone
+    /// disposition stamps the provenance, persists it in place, and returns the
+    /// retained tombstoned sources + navigable edges (no `deletions`).
+    #[test]
+    fn sqlite_finalize_and_disposition_tombstone_disposition() {
+        let _g = FLAG_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::config::set_lineage_dag(true);
+        crate::config::set_consolidate_tombstone_sources(true);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = crate::db::open(&dir.path().join("t.db")).expect("open");
+        let ns = "fed-consolidate-2860";
+        crate::db::insert(&conn, &seed_mem("src-a", ns, "A", "tenant:alice")).expect("a");
+        crate::db::insert(&conn, &seed_mem("src-b", ns, "B", "tenant:alice")).expect("b");
+        let mut consolidated = seed_mem("c-2860", ns, "merged", SENDER);
+        crate::db::insert(&conn, &consolidated).expect("c");
+
+        let disp = sqlite_finalize_and_disposition(
+            &conn,
+            &mut consolidated,
+            &["src-a".to_string(), "src-b".to_string()],
+            SENDER,
+            TENANT,
+            Some("a caller summary"),
+        );
+
+        crate::config::set_lineage_dag(false);
+        crate::config::set_consolidate_tombstone_sources(false);
+
+        assert!(
+            disp.deletions.is_empty(),
+            "tombstone mode ships no hard deletions"
+        );
+        assert_eq!(
+            disp.tombstoned_sources.len(),
+            2,
+            "both retained sources re-broadcast"
+        );
+        assert_eq!(
+            disp.derived_edges.len(),
+            2,
+            "one derived_from edge per source"
+        );
+        // Provenance stamped on the in-memory row AND persisted.
+        assert_eq!(
+            consolidated.metadata[META_CONSOLIDATOR_TENANT],
+            serde_json::json!(TENANT)
+        );
+        assert_eq!(
+            consolidated.metadata[META_SUMMARY_SOURCE],
+            serde_json::json!(SUMMARY_SOURCE_CALLER)
+        );
+        let persisted = crate::db::get(&conn, "c-2860")
+            .expect("get")
+            .expect("present");
+        assert_eq!(
+            persisted.metadata[META_CONSOLIDATOR_TENANT],
+            serde_json::json!(TENANT),
+            "finalize metadata persisted to the origin row (byte-matches broadcast)"
+        );
+    }
+
+    /// SQLITE twin, legacy hard-delete disposition: `deletions` carries the
+    /// source ids and no tombstoned rows / edges are shipped.
+    #[test]
+    fn sqlite_finalize_and_disposition_legacy_delete_disposition() {
+        let _g = FLAG_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::config::set_lineage_dag(false);
+        crate::config::set_consolidate_tombstone_sources(false);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = crate::db::open(&dir.path().join("t.db")).expect("open");
+        let mut consolidated = seed_mem("c-legacy", "ns", "merged", SENDER);
+        crate::db::insert(&conn, &consolidated).expect("c");
+        let disp = sqlite_finalize_and_disposition(
+            &conn,
+            &mut consolidated,
+            &["src-a".to_string(), "src-b".to_string()],
+            SENDER,
+            TENANT,
+            None,
+        );
+        assert_eq!(
+            disp.deletions.len(),
+            2,
+            "legacy disposition hard-deletes sources"
+        );
+        assert!(disp.tombstoned_sources.is_empty());
+        assert!(disp.derived_edges.is_empty());
+        assert_eq!(
+            consolidated.metadata[META_SUMMARY_SOURCE],
+            serde_json::json!(SUMMARY_SOURCE_SUBSTRATE)
+        );
+    }
+
+    /// SAL twin: `store_finalize_and_disposition` runs the IDENTICAL body
+    /// through the `MemoryStore` trait — exercised here with a `SqliteStore`
+    /// (so the postgres branch's finalize logic is covered without a live pg).
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn store_finalize_and_disposition_matches_sqlite_twin() {
+        use crate::store::{CallerContext, MemoryStore};
+        let _g = FLAG_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::config::set_lineage_dag(true);
+        crate::config::set_consolidate_tombstone_sources(true);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = crate::store::sqlite::SqliteStore::open(dir.path().join("s.db")).expect("open");
+        let tenant_ctx = CallerContext::for_agent(TENANT);
+        store
+            .store(&tenant_ctx, &seed_mem("s-a", "ns", "A", TENANT))
+            .await
+            .expect("a");
+        store
+            .store(&tenant_ctx, &seed_mem("s-b", "ns", "B", TENANT))
+            .await
+            .expect("b");
+        let mut consolidated = seed_mem("s-c", "ns", "merged", SENDER);
+        store
+            .store(&CallerContext::for_agent(SENDER), &consolidated)
+            .await
+            .expect("c");
+
+        let disp = store_finalize_and_disposition(
+            &store,
+            &tenant_ctx,
+            &mut consolidated,
+            &["s-a".to_string(), "s-b".to_string()],
+            SENDER,
+            TENANT,
+            Some("caller text"),
+        )
+        .await;
+
+        crate::config::set_lineage_dag(false);
+        crate::config::set_consolidate_tombstone_sources(false);
+
+        assert!(disp.deletions.is_empty());
+        assert_eq!(disp.tombstoned_sources.len(), 2);
+        assert_eq!(disp.derived_edges.len(), 2);
+        assert_eq!(
+            consolidated.metadata[META_CONSOLIDATOR_TENANT],
+            serde_json::json!(TENANT)
+        );
+        assert_eq!(
+            consolidated.metadata[META_SUMMARY_SOURCE],
+            serde_json::json!(SUMMARY_SOURCE_CALLER)
+        );
     }
 }

@@ -726,9 +726,10 @@ async fn broadcast_consolidate_quorum_peer_ack_meets_quorum() {
     let cfg = quorum_config_w2(vec![peer("peer-ack", url)]);
     let m = ga2_memory("consol-ack");
     let sources = vec!["src-x".to_string(), "src-y".to_string()];
-    let tracker = ai_memory::federation::sync::broadcast_consolidate_quorum(&cfg, &m, &sources, &[], &[])
-        .await
-        .expect("consolidate quorum returns tracker");
+    let tracker =
+        ai_memory::federation::sync::broadcast_consolidate_quorum(&cfg, &m, &sources, &[], &[])
+            .await
+            .expect("consolidate quorum returns tracker");
     assert!(tracker.finalise(std::time::Instant::now()).is_ok());
 }
 

@@ -734,7 +734,13 @@ async fn restore_quorum_ack_and_fail_arms() {
 async fn consolidate_quorum_ack_and_fail_arms() {
     let mem = fixture_memory("consol-var-1");
     let sources = vec!["src-1".to_string(), "src-2".to_string()];
-    assert_variant_quorum_arms!(|cfg| sync::broadcast_consolidate_quorum(&cfg, &mem, &sources, &[], &[]));
+    assert_variant_quorum_arms!(|cfg| sync::broadcast_consolidate_quorum(
+        &cfg,
+        &mem,
+        &sources,
+        &[],
+        &[]
+    ));
 }
 
 #[tokio::test]
