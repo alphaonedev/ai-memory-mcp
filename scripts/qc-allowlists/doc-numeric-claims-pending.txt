@@ -58,6 +58,4 @@
 # --- ROADMAP.md -------------------------------------------------------
 
 # --- Other DOC_FILES the widened anchors newly reach ------------------
-docs/a2a-harness-integration.md EXPECTED_PRODUCTION_ROUTES_COUNT 93         #2492
-docs/a2a-harness-integration.md Memory::FIELD_COUNT 28                      #2492
 docs/MIGRATION_QUICKSTART.md EXPECTED_CLI_SUBCOMMANDS_DEFAULT 79            #2492 v0.6->v0.7 comparison table; likely belongs with the three frozen v0.7 guides

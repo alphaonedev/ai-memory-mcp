@@ -45,4 +45,3 @@ docs/ADR-0003-kg-invalidation-eventual-consistency.md src/db.rs    #2629 src/db.
 docs/RECURSIVE_LEARNING.md src/db.rs                               #2629 same split
 docs/RUNBOOK-adapter-selection.md src/handlers.rs                  #2629 Wave-1 split into src/handlers/
 docs/security/build-script-vetting.md src/inner.rs                 #2629 no such file anywhere in src/
-docs/postgres-age-guide.md migrate_v78!=migrate_v88                #2629 the #2629 title's own example; tip is read from scripts/check-migration-ladder.sh

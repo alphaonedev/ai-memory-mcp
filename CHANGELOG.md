@@ -42,6 +42,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tests/embedding_dim_migration.rs::{auto_migrate_preserves_embeddings_without_embedder_2567,auto_migrate_nulls_embeddings_with_embedder_2567}`
   plus the CI-universal source guard
   `tests/embedding_dim_preserve_no_embedder_2567.rs`.
+### Fixed (cross-backend determinism — Postgres FTS tag parity)
+
+- **The Postgres FTS surface now indexes `tags`, matching SQLite — a
+  tag-only-hit search / recall / contradiction no longer returns DIFFERENT
+  rows per backend** ([#2392](https://github.com/alphaonedev/ai-memory-mcp/issues/2392);
+  5-agent vote `4d3ea1c5`; schema **v88 → v89**; determinism / cross-backend
+  consistency, "Postgres is the enterprise tier"). SQLite's `memories_fts`
+  FTS5 virtual table has always indexed `(title, content, tags)`, but the
+  Postgres stored generated `tsv` tsvector (schema v57, #1579 B2) folded ONLY
+  `title + content` — it OMITTED `tags`. So the SAME wire query whose only
+  matching token was a TAG word returned the row on SQLite but ZERO rows on
+  the enterprise (Postgres) tier: the enterprise tier silently under-returned
+  tag matches on every `tsv`-reading path (search / recall / contradiction /
+  list). **Fix:** schema v89 redefines the generated column to fold
+  `coalesce(tags::text, '')` — the generated-column-LEGAL fold (a Postgres
+  GENERATED column bars the set-returning `jsonb_array_elements_text`, so the
+  immutable `jsonb -> text` cast is used; the JSON brackets / quotes / commas
+  are text-search separators that tokenize away, leaving the array elements as
+  lexemes under the SAME `'english'` config already applied to title +
+  content). Because every Postgres read path already reads the `tsv` COLUMN
+  for both the `@@` match and `ts_rank(...)` (v57), redefining the column
+  fixes all four surfaces uniformly with no query-shape change. **Migration:**
+  PG16 has no `ALTER COLUMN ... SET EXPRESSION` (PG17+), so `migrate_v89`
+  (`migrations/postgres/0046_v89_tsv_include_tags.sql`) is `DROP COLUMN IF
+  EXISTS tsv` (which cascades away the dependent `memories_tsv_gin` GIN index)
+  + `ADD COLUMN tsv ... GENERATED ... STORED` + recreate the GIN index, in one
+  transaction on the pooled connection (retaining the pool `lock_timeout` so
+  the ACCESS EXCLUSIVE table rewrite fails CLOSED under contention — a
+  STORED-generated rewrite cannot be built `CONCURRENTLY`; worst case is the
+  pre-v89 behaviour = fewer tag results = DEGRADE, never a wrong result, and
+  the durable `title`/`content`/`tags` TEXT is untouched since `tsv` is
+  regenerated from it). The SQLite twin (`migrations/sqlite/0073_v89_tsv_tags_noop.sql`)
+  is a version-stamp no-op — FTS5 already indexes tags — so `CURRENT_SCHEMA_VERSION`
+  moves 88 → 89 on both adapters in lockstep (the v57 / v69 / v88
+  postgres-only-arm precedent, roles reversed vs v55). Runtime proof:
+  `tests/fts_tag_parity_2392.rs` asserts a tag-only-hit query returns the row
+  on BOTH backends; the populated-legacy ladder replay
+  (`tests/postgres_ladder_replay.rs`) covers the DROP+ADD via the
+  `memories.source_uri` (v37 + v44) re-assertion precedent, which is why
+  `migrate_v89` uses `DROP COLUMN IF EXISTS`. **Residual (documented, not a
+  regression):** a tag whose value is exactly a Postgres `'english'` stopword
+  is dropped from the Postgres tsvector but indexed by SQLite FTS5 (which does
+  no stopword removal) — a smaller, pre-existing tokenizer-asymmetry class
+  already true for title/content, and a DEGRADE (fewer Postgres results),
+  never a wrong result.
+
 ### Fixed (data integrity — import round-trip)
 
 - **An edited corpus can now re-import its own backup, and the default
