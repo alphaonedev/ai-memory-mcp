@@ -65,7 +65,7 @@ variable "pg_port" {
 # do-1461 GRAND SLAM topology (15 nodes) — the Secure Enterprise Federated
 # Reference Architecture: a 3-region AI Agent Hive. Each region is a
 # self-contained substrate cluster of 1 regional PostgreSQL 18.4 + Apache
-# AGE 1.7.0 + pgvector 0.8.2 node, 3 ai-memory daemon peers, and 1 agent (an
+# AGE 1.7.0 + pgvector 0.8.5 node, 3 ai-memory daemon peers, and 1 agent (an
 # NHI client driver). A region's peers reach THEIR regional pg over that
 # region's private VPC under sslmode=verify-full (daemon->PG leg); the 9 peers
 # federate into ONE mesh across all three regions over public IPs secured by
@@ -74,7 +74,7 @@ variable "pg_port" {
 #
 #   per region (x3: nyc3 US-East, fra1 EU-Central, sgp1 Asia-SE):
 #     - 3 peers (ai-memory daemon, sal,sal-postgres) -> federation mesh members
-#     - 1 pg    (regional PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.2)
+#     - 1 pg    (regional PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.5)
 #     - 1 agent (NHI client: xAI grok-4.3 driver; pure mTLS client, NOT a mesh
 #                member) -> exercises the a2a + ai_nhi full-spectrum groups
 #   => 9 peers + 3 regional pg + 3 agents = 15 nodes. Federation is EVENTUAL

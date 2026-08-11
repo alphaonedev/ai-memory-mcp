@@ -125,6 +125,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   apply to them. The classifier decision table is CI-provable via
   `pg-hostssl-healthcheck.sh --self-test` (no live PostgreSQL required). The
   Ed25519-CA channel-binding half of #2658 remains tracked as residual.
+- **The two certified provisioning SSOTs now pin the SAME pgvector patch
+  (0.8.5), and a cross-lane parity test keeps them from silently diverging**
+  ([#2872](https://github.com/alphaonedev/ai-memory-mcp/issues/2872)). The
+  container lane `deploy/docker-1461/provision/lib.sh` pinned pgvector 0.8.5
+  (`PGVECTOR_APT_VERSION=0.8.5-1.pgdg13+1`) while the sibling NATIVE lane
+  `deploy/do-1461/provision/lib.sh` pinned 0.8.2
+  (`EXPECTED_PGVECTOR_VERSION=0.8.2`) — a bet-the-farm consistency defect
+  disclosed but not reconciled at v1.0.0. Investigation against the live pgdg
+  apt repo found the divergence was accidental drift, not a distro constraint:
+  `0.8.5` is published for BOTH lanes' distros (`0.8.5-1.pgdg24.04+1` for
+  Ubuntu 24.04 / noble, `0.8.5-1.pgdg13+1` for Debian 13 / trixie), AND the
+  do-1461 `0.8.2-1.pgdg24.04+1` pin was no longer resolvable at all (pgdg keeps
+  only a rolling window — 0.8.4/0.8.5/0.8.6 for postgresql-18 — so an apt
+  install of 0.8.2 would fail, the #2658 nonexistent-pin class). Fix: unify
+  do-1461 to `PGVECTOR_APT_VERSION=0.8.5-1.pgdg24.04+1` /
+  `EXPECTED_PGVECTOR_VERSION=0.8.5` (matching docker-1461 and the canonical
+  v1.0.0 GA stack), reconcile every dependent narrative literal across both
+  lanes' provisioning scripts / Dockerfiles / Terraform / README, replace the
+  release-notes "the two provisioning SSOTs do not agree" caveat with the
+  reconciled truth, and add `tests/provisioning_pgvector_pin_parity.rs` — a
+  mechanical cross-lane pin-parity gate (only the pgdg distro suffix may differ;
+  the upstream patch must match and equal the canonical 0.8.5) so a future
+  accidental re-divergence fails loud.
 
 ### Fixed (federation data-integrity — CERT-BLOCKING)
 

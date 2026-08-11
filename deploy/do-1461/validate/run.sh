@@ -140,7 +140,7 @@ inv_all | while IFS="$(printf '\t')" read -r host role region pub priv; do
                      || record "$host" "single_instance" 1 "${nproc:-0}" FAIL
 done
 
-# ---- pg nodes: pinned upstream stack (PG 18.4 + AGE 1.7.0 + pgvector 0.8.2) --
+# ---- pg nodes: pinned upstream stack (PG 18.4 + AGE 1.7.0 + pgvector 0.8.5) --
 # ONE regional PG droplet per region runs the pinned NATIVE stack (no container
 # anywhere on the DO fleet). Every published result must be peer-verifiable
 # against the EXACT upstream stack, so assert the LIVE server reports those
