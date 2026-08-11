@@ -8,6 +8,16 @@
 #
 #   POS  sslmode=verify-full + sslrootcert=ca.crt against host=localhost (matches
 #        the cert SAN) CONNECTS with full server-cert verification.
+#   POS2 the SAME connect under scram-sha-256 auth with channel_binding=require
+#        succeeds. This is the leg that guards the cert KEY ALGORITHM: libpq's
+#        tls-server-end-point channel binding hashes the server cert with the
+#        digest in its signatureAlgorithm, so an Ed25519 chain aborts here with
+#        "could not find digest for NID UNDEF" while the RSA/SHA-256 chain
+#        gen-certs.sh now mints binds cleanly (regression for #2658 / the
+#        misleading "Postgres accepts Ed25519" claim). The certified pg-TLS lane
+#        (deploy/do-1461) and 20_pg_age.sh's pg_hba are scram-sha-256; this
+#        mirrors that auth method so the local pre-flight exercises the real
+#        channel-binding path, not just trust auth.
 #   NEG1 sslmode=disable (plaintext) is REFUSED — pg_hba is hostssl-only.
 #   NEG2 sslmode=verify-full against host=127.0.0.1 (NOT in the cert SAN) is
 #        REFUSED on the hostname check ("server certificate for ... does not
@@ -49,12 +59,19 @@ unix_socket_directories = '$PGDATA'
 ssl = on
 ssl_cert_file = 'server.crt'
 ssl_key_file = 'server.key'
+password_encryption = 'scram-sha-256'
 EOF
-# hostssl-only for the app user => a plaintext connection is refused at the HBA.
+# hostssl-only => a plaintext connection is refused at the HBA. The APP user
+# ($PGUSER) authenticates with scram-sha-256 — mirroring the certified lane
+# (deploy/do-1461 20_pg_age.sh) — so the POS2 leg below exercises the real
+# scram channel-binding path (the one that trips over an Ed25519 server cert).
+# The postgres superuser stays trust so the bootstrap probes below stay simple.
 cat > "$PGDATA/pg_hba.conf" <<EOF
-local   all all                 trust
-hostssl all all 127.0.0.1/32    trust
-hostssl all all ::1/128         trust
+local   all all                       trust
+hostssl all postgres 127.0.0.1/32     trust
+hostssl all postgres ::1/128          trust
+hostssl all all      127.0.0.1/32     scram-sha-256
+hostssl all all      ::1/128          scram-sha-256
 EOF
 "$PGBIN/pg_ctl" -D "$PGDATA" -l "$PGDATA/pg.log" -w start >/dev/null 2>&1 || { echo "pg start failed"; tail -20 "$PGDATA/pg.log"; exit 1; }
 "$PGBIN/psql" -h localhost -p "$PGPORT" -U postgres -d postgres -v ON_ERROR_STOP=1 >/dev/null 2>&1 <<SQL
@@ -73,6 +90,17 @@ if "$PGBIN/psql" "host=localhost port=$PGPORT user=$PGUSER dbname=$PGDB sslmode=
      -tAc "SELECT 'tls-ok';" 2>"$OUT/../pg.pos.err" | grep -q tls-ok; then
   ok "leg3 POS: sslmode=verify-full + pinned CA + host=localhost connected"
 else no "leg3 POS: verify-full connect failed ($(cat "$OUT/../pg.pos.err"))"; fi
+
+# --- POSITIVE 2: scram-sha-256 auth + verify-full + channel_binding=require ---
+# tls-server-end-point channel binding hashes the server cert using the digest
+# named in its signatureAlgorithm. An Ed25519 chain has none => libpq aborts
+# with "could not find digest for NID UNDEF"; the RSA/SHA-256 chain binds. This
+# is the leg that would have caught the #2658 Ed25519 breakage — the older
+# trust-auth-only suite never negotiated scram, so it never reached this path.
+if "$PGBIN/psql" "host=localhost port=$PGPORT user=$PGUSER dbname=$PGDB sslmode=verify-full sslrootcert=$CA channel_binding=require" \
+     -tAc "SELECT 'cb-ok';" 2>"$OUT/../pg.pos2.err" | grep -q cb-ok; then
+  ok "leg3 POS2: scram-sha-256 + verify-full + channel_binding=require connected (RSA chain binds)"
+else no "leg3 POS2: scram channel-binding connect failed ($(cat "$OUT/../pg.pos2.err"))"; fi
 
 # --- NEGATIVE 1: plaintext (sslmode=disable) refused by hostssl-only HBA -----
 if "$PGBIN/psql" "host=localhost port=$PGPORT user=$PGUSER dbname=$PGDB sslmode=disable" \
