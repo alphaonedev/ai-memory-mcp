@@ -82,12 +82,62 @@ jobs:
           fi
 
   # --------------------------------------------------------------------
+  # #2895 (§3C release-pipeline supply-chain) — run the SAME supply-chain
+  # gates the PR-time CI runs, INSIDE the release pipeline, BEFORE any build
+  # or publish. A gate that only guards PRs does not guard the artifact a
+  # `workflow_dispatch` release mints: `release.yml` builds + publishes from a
+  # tag ref, and nothing forced that tag's tree through the gates. This job
+  # is a `needs:` of every build/publish job, so a git-sourced dependency
+  # (#2050 / #2512) or an un-ledgered custom build script (#2635) blocks the
+  # release rather than shipping to crates.io / GHCR / Homebrew / COPR.
+  # §6.6: treat current knowledge as a floor — extend this job as gates land.
+  # --------------------------------------------------------------------
+  supply-chain:
+    name: Supply-chain gates (before build + publish)
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+
+      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Git-dependency-source gate (#2050 / #2512)
+        # No cargo dependency may resolve from a git source (a deleted/rewritten
+        # git repo is an unfetchable, unpinnable supply-chain hole). Pure
+        # bash/grep over Cargo.toml + Cargo.lock; no toolchain needed.
+        run: bash scripts/check-git-dependency-sources.sh
+
+      - name: Git-dependency-source gate self-test (#2050 / #2512)
+        run: bash scripts/check-git-dependency-sources.sh --self-test
+
+      - name: Fetch the locked dependency graph (#2635)
+        # cargo metadata --offline resolves the complete cross-platform graph;
+        # fetch first so the verifier runs offline + content-pinned.
+        run: cargo fetch --locked
+
+      - name: Build-script custom-build ledger gate (#2635)
+        # Every custom-build package in the resolved graph must be ledgered in
+        # supply-chain/build-script-vetting.json — a build script executes with
+        # the builder's authority at compile time, and a release build runs
+        # every one of them.
+        run: python3 scripts/check-build-script-vetting.py
+
+      - name: Build-script ledger gate self-test (#2635)
+        run: python3 scripts/check-build-script-vetting.py --self-test
+
+  # --------------------------------------------------------------------
   # Cross-platform binary builds + GitHub Release page.
   # 5 targets: linux x86_64 + aarch64, macOS x86_64 + aarch64, windows x86_64.
   # --------------------------------------------------------------------
   release:
     name: Release (${{ matrix.target }})
-    needs: preflight
+    needs: [preflight, supply-chain]
     runs-on: ${{ matrix.os }}
     # #2487 supply-chain: OIDC-bound Sigstore build provenance for the
     # release binaries + deb/rpm, mirroring the OIDC pattern the SDK
@@ -148,7 +198,10 @@ jobs:
       # deps on every matrix OS); operators needing PG use an asserted
       # sal-postgres build or the plan-c image. Agents never workflow_dispatch.
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} --features sal
+        # --locked (#2895): build against the COMMITTED Cargo.lock exactly.
+        # A release must never silently resolve a newer transitive dependency
+        # than the one that was reviewed/audited on the branch.
+        run: cargo build --locked --release --target ${{ matrix.target }} --features sal
 
       - name: Assert compiled features (#2676, #2728)
         shell: bash
@@ -387,7 +440,7 @@ jobs:
   # --------------------------------------------------------------------
   sbom:
     name: SBOM (CycloneDX)
-    needs: [preflight]
+    needs: [preflight, supply-chain]
     runs-on: ubuntu-latest
     # #2487 — OIDC-bound Sigstore provenance for the CycloneDX SBOM
     # artifact (same mechanism as the release-binary job above).
@@ -484,7 +537,7 @@ jobs:
   # --------------------------------------------------------------------
   mobile-ios:
     name: Mobile artifact (iOS xcframework)
-    needs: [preflight]
+    needs: [preflight, supply-chain]
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: macos-latest
     # #2487 — OIDC-bound Sigstore provenance for the iOS xcframework
@@ -519,6 +572,7 @@ jobs:
           for TARGET in aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios; do
             echo "::group::cargo build --target $TARGET"
             cargo build \
+              --locked \
               --release \
               --target "$TARGET" \
               --no-default-features \
@@ -623,7 +677,7 @@ jobs:
   # --------------------------------------------------------------------
   mobile-android:
     name: Mobile artifact (Android AAR-compatible)
-    needs: [preflight]
+    needs: [preflight, supply-chain]
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
     # #2487 — OIDC-bound Sigstore provenance for the Android JNI tarball
@@ -697,6 +751,7 @@ jobs:
             ABI="${ABI_OF[$TARGET]}"
             echo "::group::cargo build --target $TARGET ($ABI)"
             cargo build \
+              --locked \
               --release \
               --target "$TARGET" \
               --no-default-features \
@@ -776,16 +831,24 @@ jobs:
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
+        # #2895 — pin the publish toolchain to the same 1.96.0 every other
+        # release + verification job uses (was bare `@stable`, an unpinned,
+        # moving compiler on the one job that mints the crates.io artifact).
+        uses: dtolnay/rust-toolchain@1.96.0
 
       - name: Publish to crates.io (with retry)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
+          # #2895 — `--locked` (build the crate against the COMMITTED Cargo.lock)
+          # and NO `--allow-dirty`. The checkout is at the release tag, so the
+          # tree is already clean; `--allow-dirty` only ever masked a tree that
+          # DIVERGED from the committed source, which is exactly what a
+          # supply-chain gate must not paper over on the publish path.
           for attempt in 1 2 3; do
-            if output=$(cargo publish --allow-dirty 2>&1); then
+            if output=$(cargo publish --locked 2>&1); then
               echo "::notice::crates.io publish succeeded on attempt $attempt"
               echo "$output" | tail -10
               exit 0
@@ -945,7 +1008,7 @@ jobs:
   # --------------------------------------------------------------------
   docker:
     name: Docker (GHCR)
-    needs: [preflight]
+    needs: [preflight, supply-chain]
     if: needs.preflight.outputs.is_prerelease == 'false'
     runs-on: ubuntu-latest
     permissions:
