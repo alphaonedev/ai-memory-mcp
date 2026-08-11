@@ -288,10 +288,16 @@ pub fn list_observations(
     // row a single recall appends shares `observed_at` (= the tx timestamp), so
     // `ORDER BY observed_at DESC` alone left an ARBITRARY permutation within each
     // recall_id — a wire-visible non-determinism on an audit surface. `rank`
-    // (the retriever's returned position) then `memory_id` (unique per recall_id)
-    // make the order strict and total, byte-identical to the postgres twin
-    // (`PostgresStore::list_recall_observations`).
-    sql.push_str(" ORDER BY observed_at DESC, rank ASC, memory_id ASC LIMIT ?");
+    // (the retriever's returned position) then `memory_id` narrow ties within a
+    // single recall_id, but this listing surface also accepts `recall_id =
+    // None` (unfiltered), and the table's actual PRIMARY KEY is
+    // `(recall_id, memory_id)` — `memory_id` is unique only WITHIN a
+    // recall_id partition, so TWO recalls that observe the same memory at the
+    // same rank in the same `observed_at` instant (ms-precision text on
+    // sqlite) leave a residual tie. `recall_id ASC` as the FINAL key gives the
+    // full PK and makes the order genuinely total, byte-identical to the
+    // postgres twin (`PostgresStore::list_recall_observations`).
+    sql.push_str(" ORDER BY observed_at DESC, rank ASC, memory_id ASC, recall_id ASC LIMIT ?");
     let lim_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
     binds.push(Box::new(lim_i64));
 

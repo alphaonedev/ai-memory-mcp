@@ -114,6 +114,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each `recall_id` on the append-only P0-1 AUDIT ledger. It now appends
   `, rank ASC, memory_id ASC` for a strict total order. Regression coverage:
   `tests/ordering_determinism_2602_2615.rs`.
+- **Collation-stable postgres tiebreaks (#1724 collation-byte-range class),
+  closing a residual where the new tiebreaks themselves ordered differently
+  across backends.** `memories.id` and `recall_observations.recall_id` /
+  `.memory_id` are `TEXT`, NOT `uuid`, on postgres, and the corpus is not
+  guaranteed canonical lowercase UUIDs — `portability::import` preserves
+  ids verbatim and federation receive applies a peer's `mem.id` verbatim
+  with no UUID-format validation — so a mixed-case id (`mem-a` vs `MEM-B`)
+  sorted under postgres' default (non-`C`) collation while sqlite always
+  sorts `id`/`recall_id`/`memory_id` BINARY, silently reintroducing
+  backend-dependent order on the very tiebreak meant to close #2602/#2615.
+  `PostgresStore::list`'s `id` tiebreak and `PostgresStore::list_recall_observations`'s
+  `memory_id`/`recall_id` tiebreaks are now `COLLATE "C"`, byte-ordering
+  identically to sqlite on both surfaces. `list_recall_observations` (both
+  backends) also gained a final `recall_id` key — the ledger's actual
+  PRIMARY KEY is `(recall_id, memory_id)`, so `memory_id` alone is unique
+  only WITHIN one `recall_id`, and this listing surface accepts
+  `recall_id = None` (unfiltered). Also gave the HTTP postgres
+  `load_family` path (`handlers::power_consolidation::load_family_handler`)
+  an explicit `id ASC` in-process tiebreak so its ordering is
+  self-contained rather than depending implicitly on the upstream
+  `store.list` invariant holding. Live-postgres regression coverage:
+  `tests/ordering_determinism_2602_2615_pg.rs` (`#[ignore]`,
+  `--features sal,sal-postgres`, `AI_MEMORY_TEST_POSTGRES_URL`).
 
 ### Fixed (data integrity — import round-trip)
 

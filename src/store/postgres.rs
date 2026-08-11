@@ -17839,8 +17839,16 @@ impl MemoryStore for PostgresStore {
         // to the sqlite twin (`storage::build_list_query`) + the
         // `memory_load_family` loader: `(priority, updated_at)` ties are common,
         // so without it which rows page vs fall off under LIMIT was
-        // plan-/backend-dependent. `id` is the UUID primary key (unique, NOT
-        // NULL) so the sort is a strict total order on both backends.
+        // plan-/backend-dependent. `id` is `TEXT PRIMARY KEY` on postgres (NOT
+        // `uuid`), and ids are NOT guaranteed to be canonical lowercase UUIDs —
+        // `portability::import` preserves corpus ids verbatim and federation
+        // receive applies a peer's `mem.id` verbatim with no UUID-format
+        // validation, so e.g. `mem-a` vs `MEM-B` can appear. Postgres' default
+        // (non-"C") collation orders such strings DIFFERENTLY from sqlite's
+        // BINARY comparison, which would silently reintroduce cross-backend
+        // ordering drift on the very tiebreak meant to close it (#1724
+        // collation-byte-range lesson). `COLLATE "C"` pins the postgres sort to
+        // byte order, identical to sqlite BINARY, on BOTH backends.
         let list_sql = format!(
             "SELECT {cols} FROM memories
              WHERE {ns_predicate}
@@ -17862,7 +17870,7 @@ impl MemoryStore for PostgresStore {
                )
                {metadata_eq_predicate}
                {lifecycle_vis}
-             ORDER BY priority DESC, updated_at DESC, id ASC
+             ORDER BY priority DESC, updated_at DESC, id COLLATE \"C\" ASC
              LIMIT $5",
             // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list. Also
             // covers the export egress: `export_memories` delegates to `list`.
@@ -21834,8 +21842,15 @@ impl MemoryStore for PostgresStore {
         // v1.0.0 #2615 — total order on the audit ledger, identical to the
         // sqlite twin (`crate::observations::list_observations`): all rows a
         // single recall appends share `observed_at`, so `rank` then `memory_id`
-        // make the within-recall order strict and deterministic.
-        qb.push(" ORDER BY observed_at DESC, rank ASC, memory_id ASC LIMIT ")
+        // narrow ties within one recall_id — but this surface also accepts
+        // `recall_id = None` (unfiltered) and the table's PRIMARY KEY is
+        // `(recall_id, memory_id)`, so `recall_id ASC` is the FINAL key needed
+        // for a genuinely total order across recall_ids. `memory_id` and
+        // `recall_id` are TEXT on postgres and not guaranteed canonical UUIDs
+        // (same #1724-class risk as the `memories.id` tiebreak in `list`), so
+        // both are pinned `COLLATE "C"` to byte-order identically to sqlite
+        // BINARY.
+        qb.push(" ORDER BY observed_at DESC, rank ASC, memory_id COLLATE \"C\" ASC, recall_id COLLATE \"C\" ASC LIMIT ")
             .push_bind(lim_i64);
         let rows = qb
             .build()
