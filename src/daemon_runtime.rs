@@ -4780,7 +4780,22 @@ fn governance_consultation_unavailable_inner(
 /// string the daemon sees does not reflect off-host reachability, so the
 /// string-match loopback guard alone cannot protect them.
 fn require_api_key_strict() -> bool {
-    std::env::var("AI_MEMORY_REQUIRE_API_KEY")
+    require_api_key_strict_value(std::env::var("AI_MEMORY_REQUIRE_API_KEY").ok().as_deref())
+}
+
+/// Pure parser for the [`require_api_key_strict`] env value — truthy on
+/// `"1"` / `"true"` (case-insensitive), false otherwise (including absent).
+///
+/// Factored out so the parse behaviour is unit-testable WITHOUT mutating the
+/// process-global `AI_MEMORY_REQUIRE_API_KEY`. The pre-#2567 test set/removed
+/// that var directly, which under the DEFAULT multi-threaded test harness (the
+/// SAL-only feature gate — the `--test-threads=1` coverage/postgres gates
+/// serialise and so never saw it) RACED any concurrently-running test that
+/// reads it through the boot path (`serve` → [`api_key_bind_guard`] →
+/// `require_api_key_strict`), causing a spurious #1458 API-key refusal in
+/// `serve_bootstrap_failure_returns_typed_fatal_shutdown`.
+fn require_api_key_strict_value(value: Option<&str>) -> bool {
+    value
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
@@ -8196,17 +8211,27 @@ mod tests {
     }
 
     /// The strict-mode env parser honours truthy forms and defaults off.
+    ///
+    /// \#2567 CI-fix — this test previously mutated the PROCESS-GLOBAL
+    /// `AI_MEMORY_REQUIRE_API_KEY` via `set_var` / `remove_var`, which under
+    /// the DEFAULT multi-threaded harness (the SAL-only feature gate; the
+    /// `--test-threads=1` coverage/postgres gates serialise and never saw it)
+    /// RACED `serve_bootstrap_failure_returns_typed_fatal_shutdown` — running
+    /// concurrently, that test read the transient `"1"` through the boot path
+    /// and hit the #1458 API-key refusal instead of its expected DB-path
+    /// failure. The parse logic now lives in the pure
+    /// `require_api_key_strict_value`, exercised here with literal values and
+    /// ZERO global-env mutation, so no concurrent reader can ever observe a
+    /// transient value (this was the SOLE writer of that var in the crate).
     #[test]
     fn require_api_key_strict_env_parse_1458() {
-        unsafe { std::env::remove_var("AI_MEMORY_REQUIRE_API_KEY") };
-        assert!(!require_api_key_strict());
-        unsafe { std::env::set_var("AI_MEMORY_REQUIRE_API_KEY", "1") };
-        assert!(require_api_key_strict());
-        unsafe { std::env::set_var("AI_MEMORY_REQUIRE_API_KEY", "TRUE") };
-        assert!(require_api_key_strict());
-        unsafe { std::env::set_var("AI_MEMORY_REQUIRE_API_KEY", "0") };
-        assert!(!require_api_key_strict());
-        unsafe { std::env::remove_var("AI_MEMORY_REQUIRE_API_KEY") };
+        assert!(!require_api_key_strict_value(None));
+        assert!(require_api_key_strict_value(Some("1")));
+        assert!(require_api_key_strict_value(Some("TRUE")));
+        assert!(require_api_key_strict_value(Some("true")));
+        assert!(!require_api_key_strict_value(Some("0")));
+        assert!(!require_api_key_strict_value(Some("yes")));
+        assert!(!require_api_key_strict_value(Some("")));
     }
 
     // ----- helpers -------------------------------------------------------
