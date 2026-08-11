@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (data integrity)
+
+- **The postgres daemon-bootstrap embedding-dim auto-migrate no longer
+  NULLs every stored embedding when no embedder can regenerate them**
+  ([#2567](https://github.com/alphaonedev/ai-memory-mcp/issues/2567);
+  data-integrity North Star; 5-agent adversarial vote `4d3ea1c5`).
+  `PostgresStore::connect_with_dim_and_timeout_auto_migrate`
+  (`src/store/postgres.rs`) drove the #877 destructive
+  `migrate_embedding_dim(dim, force=true)` — which runs `UPDATE memories
+  SET embedding = NULL, embedding_space = NULL` — UNCONDITIONALLY whenever
+  the stored column dim disagreed with the configured dim, gated only on
+  `configured_embedding_dim.is_some()`. That signal is derived from TIER
+  CONFIG, not from a constructible embedder, so a daemon whose embedder is
+  NOT buildable (keyword tier, `AI_MEMORY_INFERENCE_EGRESS=deny`, a missing
+  API key, or a model-download failure) but whose tier resolved a dim would
+  destroy every stored vector on boot with no embedder to re-derive them —
+  irreversible loss of regenerable derived state, with `updated_at`
+  untouched so it was invisible to staleness checks. The destructive
+  migrate is now gated on a truthful `embedder_available` signal
+  (`build_embedder(...).is_some()` in `serve`, threaded through
+  `build_store_handle`; fail-closed `false` at the `build_curator_store` /
+  agents-bind-api-key / test call sites that construct no embedder): when
+  the dims disagree AND no embedder is constructible, the stored embeddings
+  are PRESERVED, the connect still succeeds (DEGRADE, never error), and a
+  loud WARN names the real stored + target dim. Recall degrades safely —
+  the #2167 `embedding_space` predicate + the #114 dim-match gate already
+  exclude a cross-dim/cross-space vector from scoring, and no-embedder
+  writes bind `embedding = NULL`, so the stale column dim is never
+  exercised — and the schema self-heals on the next boot that DOES build an
+  embedder (the normal migrate-then-backfill path). The SQLite adapter has
+  no destructive dim-migrate path and is pinned so it can never grow one
+  without the same gate (cross-backend #2488 lesson). Verified live-PG by
+  `tests/embedding_dim_migration.rs::{auto_migrate_preserves_embeddings_without_embedder_2567,auto_migrate_nulls_embeddings_with_embedder_2567}`
+  plus the CI-universal source guard
+  `tests/embedding_dim_preserve_no_embedder_2567.rs`.
+
 ### Fixed (cert truthfulness — published-claims reconciliation)
 
 - **The published LongMemEval keyword headline figures are now MEASURED on

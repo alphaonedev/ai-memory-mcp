@@ -199,6 +199,10 @@ async fn auto_migrate_converts_384_schema_to_768_on_daemon_bootstrap() {
             768,
             30,
             PoolConfig::default(),
+            // #2567 — embedder available: this test exercises the destructive
+            // migrate/backfill path, which is reachable only when an embedder
+            // can regenerate the NULLed vectors.
+            true,
         )
         .await
         .expect("auto-migrate to dim=768");
@@ -217,6 +221,10 @@ async fn auto_migrate_converts_384_schema_to_768_on_daemon_bootstrap() {
             768,
             30,
             PoolConfig::default(),
+            // #2567 — embedder available: this test exercises the destructive
+            // migrate/backfill path, which is reachable only when an embedder
+            // can regenerate the NULLed vectors.
+            true,
         )
         .await
         .expect("idempotent auto-migrate");
@@ -249,6 +257,10 @@ async fn auto_migrate_no_op_when_fresh_schema_already_matches() {
             768,
             30,
             PoolConfig::default(),
+            // #2567 — embedder available: this test exercises the destructive
+            // migrate/backfill path, which is reachable only when an embedder
+            // can regenerate the NULLed vectors.
+            true,
         )
         .await
         .expect("fresh bootstrap at dim=768 via auto-migrate path");
@@ -292,6 +304,10 @@ async fn http_write_path_accepts_768_after_auto_migrate() {
         768,
         30,
         PoolConfig::default(),
+        // #2567 — embedder available: this test exercises the destructive
+        // migrate/backfill path, which is reachable only when an embedder
+        // can regenerate the NULLed vectors.
+        true,
     )
     .await
     .expect("auto-migrate at bootstrap");
@@ -537,6 +553,10 @@ async fn default_deploy_no_boot_alter_cross_process_1882() {
         daemon_default_dim,
         30,
         PoolConfig::default(),
+        // #2567 — embedder available: this test exercises the destructive
+        // migrate/backfill path, which is reachable only when an embedder
+        // can regenerate the NULLed vectors.
+        true,
     )
     .await
     .expect("serving pool boots at the daemon default dim");
@@ -708,5 +728,177 @@ async fn migrate_embedding_dim_refuses_when_embeddings_exist_without_force() {
         nulled,
         Some((true,)),
         "forced conversion must NULL the stored embedding (re-embed required)"
+    );
+}
+
+/// \#2567 (5-agent vote `4d3ea1c5`) — DEGRADE, never destroy. When the
+/// stored `memories.embedding` column dim disagrees with the incoming
+/// configured dim AND NO embedder is constructible
+/// (`embedder_available = false`: keyword tier / inference-egress denied /
+/// the embedder failed to build), the daemon-bootstrap auto-migrate MUST
+/// PRESERVE the stored embeddings rather than clear them. Clearing derived
+/// state that cannot be regenerated (no embedder ⇒ no backfill) is
+/// irreversible data loss, and `updated_at` is untouched so it would be
+/// invisible to staleness checks. The connect still SUCCEEDS (degrade, not
+/// error), the column dim stays untouched, and the vectors stay non-NULL;
+/// the schema self-heals the next boot that DOES build an embedder.
+#[tokio::test]
+async fn auto_migrate_preserves_embeddings_without_embedder_2567() {
+    use ai_memory::models::Memory;
+    use ai_memory::store::{CallerContext, MemoryStore};
+    use chrono::Utc;
+
+    let Some(url) = postgres_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _public_lock = PublicSchemaLock::acquire()
+        .expect("PublicSchemaLock requires AI_MEMORY_TEST_POSTGRES_URL (already checked above)");
+
+    let inspect = inspection_pool(&url).await;
+    reset_schema(&inspect).await;
+
+    // Bootstrap at 768 and seed a 768-dim embedding — a POPULATED corpus at
+    // a dim that will disagree with the incoming (keyword-only) config.
+    let store = PostgresStore::connect_with_dim(&url, 768)
+        .await
+        .expect("connect at dim=768");
+    assert_eq!(current_dim(&inspect).await, Some(768), "bootstrap at 768");
+
+    let now = Utc::now().to_rfc3339();
+    let mem = Memory {
+        id: "issue-2567-preserve".to_string(),
+        namespace: "ai-memory-mcp".to_string(),
+        title: "issue #2567 preserve".to_string(),
+        content: "this embedding must survive a no-embedder dim disagreement".to_string(),
+        tags: vec!["issue-2567".to_string()],
+        source: "test".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        metadata: serde_json::json!({"agent_id":"issue-2567-test"}),
+        ..Default::default()
+    };
+    let ctx = CallerContext::for_agent("issue-2567-test");
+    let embedding: Vec<f32> = vec![0.25_f32; 768];
+    store
+        .store_with_embedding(&ctx, &mem, Some(&embedding), Some("test-space#none"))
+        .await
+        .expect("seed 768-dim embedding");
+    drop(store);
+
+    // Boot the auto-migrate entry point at a DIFFERENT dim (384) with
+    // embedder_available = FALSE — the #2567 no-embedder case. The dims
+    // disagree (768 != 384) but there is no embedder to regenerate the
+    // vectors, so the destructive migrate MUST be skipped and the connect
+    // MUST still succeed.
+    {
+        let _serve = PostgresStore::connect_with_dim_and_timeout_auto_migrate(
+            &url,
+            384,
+            30,
+            PoolConfig::default(),
+            // #2567 — NO constructible embedder ⇒ preserve, do not NULL.
+            false,
+        )
+        .await
+        .expect("no-embedder auto-migrate connect must SUCCEED (degrade, never error)");
+    }
+
+    // Nothing destroyed: the column dim is UNCHANGED (still 768) and the
+    // stored embedding is still non-NULL.
+    assert_eq!(
+        current_dim(&inspect).await,
+        Some(768),
+        "#2567: no-embedder auto-migrate must leave the column dim untouched (no destructive ALTER)"
+    );
+    let still_present: Option<(bool,)> = sqlx::query_as(
+        "SELECT embedding IS NOT NULL FROM memories WHERE id = 'issue-2567-preserve'",
+    )
+    .fetch_optional(&inspect)
+    .await
+    .expect("inspect embedding nullability");
+    assert_eq!(
+        still_present,
+        Some((true,)),
+        "#2567: no-embedder auto-migrate must PRESERVE the stored embedding \
+         (never NULL derived state that cannot be regenerated)"
+    );
+}
+
+/// \#2567 — the CONTRAST case that keeps the #877 fix intact. With
+/// `embedder_available = true` the SAME dim disagreement over a populated
+/// corpus DOES take the destructive migrate (a live embedder will
+/// regenerate the vectors from the durable text), flipping the column and
+/// clearing the stored embedding. This pins that the #2567 gate degrades
+/// ONLY the no-embedder path and does not break the embedder-present path.
+#[tokio::test]
+async fn auto_migrate_nulls_embeddings_with_embedder_2567() {
+    use ai_memory::models::Memory;
+    use ai_memory::store::{CallerContext, MemoryStore};
+    use chrono::Utc;
+
+    let Some(url) = postgres_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _public_lock = PublicSchemaLock::acquire()
+        .expect("PublicSchemaLock requires AI_MEMORY_TEST_POSTGRES_URL (already checked above)");
+
+    let inspect = inspection_pool(&url).await;
+    reset_schema(&inspect).await;
+
+    let store = PostgresStore::connect_with_dim(&url, 768)
+        .await
+        .expect("connect at dim=768");
+    assert_eq!(current_dim(&inspect).await, Some(768), "bootstrap at 768");
+
+    let now = Utc::now().to_rfc3339();
+    let mem = Memory {
+        id: "issue-2567-migrate".to_string(),
+        namespace: "ai-memory-mcp".to_string(),
+        title: "issue #2567 migrate".to_string(),
+        content: "this embedding is NULLed because a live embedder will re-derive it".to_string(),
+        tags: vec!["issue-2567".to_string()],
+        source: "test".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        metadata: serde_json::json!({"agent_id":"issue-2567-test"}),
+        ..Default::default()
+    };
+    let ctx = CallerContext::for_agent("issue-2567-test");
+    let embedding: Vec<f32> = vec![0.25_f32; 768];
+    store
+        .store_with_embedding(&ctx, &mem, Some(&embedding), Some("test-space#none"))
+        .await
+        .expect("seed 768-dim embedding");
+    drop(store);
+
+    {
+        let _serve = PostgresStore::connect_with_dim_and_timeout_auto_migrate(
+            &url,
+            384,
+            30,
+            PoolConfig::default(),
+            // #2567 — a live embedder IS available ⇒ the #877 migrate runs.
+            true,
+        )
+        .await
+        .expect("with-embedder auto-migrate to dim=384");
+    }
+
+    assert_eq!(
+        current_dim(&inspect).await,
+        Some(384),
+        "#2567: with-embedder auto-migrate must flip the column to vector(384)"
+    );
+    let nulled: Option<(bool,)> =
+        sqlx::query_as("SELECT embedding IS NULL FROM memories WHERE id = 'issue-2567-migrate'")
+            .fetch_optional(&inspect)
+            .await
+            .expect("inspect post-conversion embedding nullability");
+    assert_eq!(
+        nulled,
+        Some((true,)),
+        "#2567: with-embedder auto-migrate NULLs the stored embedding (re-embed regenerates it)"
     );
 }
