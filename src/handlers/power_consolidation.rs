@@ -1118,11 +1118,17 @@ pub async fn load_family_handler(
         let ctx = crate::handlers::parity::http_caller_ctx(&headers, None);
         let narrow = |rows: Vec<Memory>| -> Vec<Memory> {
             let mut kept: Vec<Memory> = rows.into_iter().filter(|m| family_eq.matches(m)).collect();
-            // priority DESC, updated_at DESC (mirrors handle_load_family).
+            // priority DESC, updated_at DESC, id ASC (mirrors handle_load_family
+            // + the #2602/#2615 `store::list` tiebreak). `sort_by` is stable, so
+            // this in-process sort inherits determinism only IMPLICITLY from the
+            // already-ordered `store.list` result; an explicit `id` tiebreak
+            // makes this call site a self-contained total order rather than one
+            // that silently depends on an upstream invariant holding.
             kept.sort_by(|a, b| {
                 b.priority
                     .cmp(&a.priority)
                     .then_with(|| b.updated_at.cmp(&a.updated_at))
+                    .then_with(|| a.id.cmp(&b.id))
             });
             kept
         };
