@@ -319,17 +319,38 @@ This is the floor every plan below builds on. Numbers are sourced from the publi
 
 ### 9.5 LongMemEval — published
 
+Binary-faithful figures (keyword / semantic / autonomous) come from the shipped
+`ai-memory recall` pipeline via `harness.py`; the LLM-expanded anchor is a
+*shadow* harness (`harness_99.py`, scoring re-implemented outside the binary).
+Binary-faithful and shadow numbers are comparable **within** a harness, never
+across. Canonical per-tier / per-category source of truth:
+[`benchmarks/longmemeval/results.md`](benchmarks/longmemeval/results.md).
+
 | Metric | Result |
 |---|---|
-| Recall@5 (keyword, LLM-independent) | **97.0%** (485/500) |
-| Recall@5 (LLM-expanded, current-gen anchor) | **97.2%** (Gemma 4, API venue) |
-| Recall@10 / Recall@20 (keyword) | 98.2% (491/500) / 99.4% (497/500) |
-| Recall@10 / Recall@20 (LLM-expanded anchor) | 99.6% / 99.8% |
-| Throughput (keyword) | 232 q/s |
-| Throughput (LLM-expanded) | 142 q/s |
+| Recall@5 (keyword, binary-faithful, LLM-independent) | **96.4%** (482/500) |
+| Recall@5 (LLM-expanded anchor, shadow) | **97.2%** (Gemma 4, API venue) |
+| Recall@10 / Recall@20 (keyword, binary-faithful) | 98.4% (492/500) / 99.4% (497/500) |
+| Recall@10 / Recall@20 (LLM-expanded anchor, shadow) | 99.6% / 99.8% |
+| Throughput (keyword, binary-faithful `harness.py`) | 1.2 q/s |
+| Throughput (LLM-expanded, shadow `harness_99.py`) | 142 q/s |
 | Cloud cost (keyword tier) | $0 |
 
-ICLR 2025 benchmark, pure SQLite FTS5+BM25. Keyword tier is fully local / zero cloud. Reranker-on / reranker-off / curator-on variants disclosed at v0.6.3.1. §11.4.A Gemma-4 refresh DISCHARGED by the #1975 ruling (2×5 vote wf_8ac90aca, 2026-07-10): historical gemma3:4b 97.8% headline retired; the measured OpenRouter Gemma-4 leg (2026-05-31) promoted as the expansion anchor; no local-Ollama Gemma-4 number exists (CPU-only reference host, #1983); local GPU re-run reopenable post-v1.0.
+ICLR 2025 benchmark, pure SQLite FTS5+BM25. Keyword tier is fully local / zero
+cloud. **Retirement note (matches `README.md` §Benchmark):** the earlier keyword
+figures **97.0% R@5 (485/500)** and **232 q/s** were Python-shadow-harness
+numbers and are retired — the binary-faithful keyword R@5 is **96.4% (482/500)**
+at **1.2 q/s** (`harness.py`), and `232 q/s` (a 10-core parallel Python FTS5
+reimplementation that never loads the Rust ranker) is not a product number. The
+1.2 q/s is subprocess-spawn-dominated (one process fork per query), not
+recall-dominated; an integrator on a long-lived MCP stdio or HTTP daemon pays no
+per-query spawn — for real latency use the §9.6 Performance-budget hot-path
+p95s, not any throughput row here. Reranker-on / reranker-off / curator-on
+variants disclosed at v0.6.3.1. §11.4.A Gemma-4 refresh DISCHARGED by the #1975
+ruling (2×5 vote wf_8ac90aca, 2026-07-10): historical gemma3:4b 97.8% headline
+retired; the measured OpenRouter Gemma-4 leg (2026-05-31) promoted as the
+expansion anchor; no local-Ollama Gemma-4 number exists (CPU-only reference
+host, #1983); local GPU re-run reopenable post-v1.0.
 
 ### 9.6 Performance budgets (Apple M4, 32 GB, NVMe SSD — SQLite reference)
 

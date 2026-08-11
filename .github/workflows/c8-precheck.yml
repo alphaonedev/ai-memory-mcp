@@ -329,6 +329,39 @@ jobs:
         # the stale-entry hard-fail, and the empty-scan fail-closed.
         run: bash scripts/check-capacity-claims.sh --self-test
 
+  benchmark-claim-gate:
+    # CERT GATE (TRUTHFULNESS; #2879, following #2869 + CERT-GATE-2
+    # #2629/#2492). The final cert vote caught `ROADMAP.md` §9.5 still
+    # publishing the RETIRED Python-shadow-harness keyword figures (R@5
+    # 97.0% / 485-of-500 and 232 q/s) while `README.md` §Benchmark had
+    # already corrected them to the BINARY-FAITHFUL 96.4% (482/500) / 1.2
+    # q/s. Gate 4 pins Rust consts; gates 9/10/11 pin symbols / SDK paths /
+    # CI-job claims; #2869 pins agent-count capacity claims — but NOTHING
+    # policed a published BENCHMARK NUMBER, so a retired-shadow keyword
+    # cell shipped with every claims gate GREEN (the #2444 shape). This
+    # gate parses the canonical binary-faithful keyword-baseline row from
+    # `benchmarks/longmemeval/results.md` (the SSOT README cites) and fails
+    # when a top-level README.md / ROADMAP.md keyword table CELL (recall or
+    # q/s) contradicts it. Retirement/historical notes that quote the
+    # retired figure are exempt; non-keyword (LLM-expanded / semantic /
+    # autonomous) rows use a different canon and are not compared.
+    name: Benchmark-claim canon gate (#2879)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run benchmark-claim gate
+        run: bash scripts/check-benchmark-claims.sh
+      - name: Self-test the gate (regression evidence)
+        # --self-test plants the exact C-01 contradiction (retired keyword
+        # 97.0% R@5 + 98.2% R@10 + 232 q/s as LIVE cells → gate MUST fail)
+        # against the REAL canon results.md, plus near-miss controls that
+        # MUST pass (the corrected binary-faithful cells, the higher
+        # LLM-expanded anchor row, a retirement note quoting the retired
+        # figures, the semantic row, and a header-based keyword table row
+        # with no R@ token), then exercises the empty-scan fail-closed.
+        run: bash scripts/check-benchmark-claims.sh --self-test
+
   cloud-init-ascii-gate:
     # v0.9.0 (issue #1880): a stray non-ASCII byte (U+2014 em-dash) in a
     # DO cloud-init template made cloud-init reject the config

@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (cert truthfulness — published-claims reconciliation)
+
+- **`ROADMAP.md` §9.5 keyword LongMemEval cells reconciled to the
+  binary-faithful canon, and a new load-bearing gate now polices published
+  benchmark cells** ([#2879](https://github.com/alphaonedev/ai-memory-mcp/issues/2879);
+  cert finding C-01). §9.5 still shipped the RETIRED Python-shadow-harness
+  keyword figures — **Recall@5 97.0% (485/500)** and **232 q/s** — that
+  `README.md` §Benchmark had already corrected to the BINARY-FAITHFUL
+  **96.4% (482/500)** / **1.2 q/s** ("232 q/s is not a product number"). The
+  same-lineage keyword R@10 **98.2% (491/500)** is corrected to **98.4%
+  (492/500)** (R@20 99.4%/497 was already the binary-faithful value); the
+  throughput cells are relabelled with their harness provenance (keyword =
+  binary-faithful `harness.py`, LLM-expanded = shadow `harness_99.py`), and a
+  retirement note (matching README) records the retired shadow figures.
+  Canonical source: `benchmarks/longmemeval/results.md` keyword-baseline row.
+  New gate `scripts/check-benchmark-claims.sh` (c8-precheck job **Benchmark-claim
+  canon gate (#2879)** + `--self-test` + required-contexts mirror) HARD-BLOCKS a
+  top-level README.md/ROADMAP.md keyword table CELL (recall or q/s) that
+  contradicts the parsed canon; retirement notes and non-keyword (LLM-expanded /
+  semantic / autonomous) rows are exempt. Follows the #2869 pattern.
+- **The federation "certified for 500-1000-agent clusters" claim is reworded to
+  separate the DESIGN ENVELOPE from MEASURED capacity across every twin surface**
+  ([#2880](https://github.com/alphaonedev/ai-memory-mcp/issues/2880)). The
+  500-1000-agent envelope is a DERIVED TOPOLOGY CEILING (T6=1000+/~50-peer),
+  architecturally defensible but ASSERTED, not MEASURED — Track F ran only a
+  2-node bounded sample, the USL projection is deferred, and the largest proven
+  mesh is 2 nodes. `docs/zero-touch-trust.html` (`<meta description>` + tagline),
+  `docs/federation.md` (×2), and `docs/federation-identity.md` now say
+  "architected for / design scale envelope (derived topology ceiling) …
+  real-mesh-measured to 2 nodes, full-scale USL capacity projection deferred"
+  instead of "certified". The envelope itself is retained (it is defensible);
+  only the MEASURED/certified framing is dropped. Cites #2438.
+- **The cert PLAN §2.0 (`docs/v1.0.0/test-campaign-2026-08-08-enterprise-cert/PLAN.md`)
+  now scopes "federation" to the LOCAL enforcement surface and discloses the 7
+  sqlite-native federated-receive lanes a pg receiver does NOT apply**
+  ([#2881](https://github.com/alphaonedev/ai-memory-mcp/issues/2881); cross-links
+  [#2341](https://github.com/alphaonedev/ai-memory-mcp/issues/2341) /
+  [#2803](https://github.com/alphaonedev/ai-memory-mcp/issues/2803)). Of the 13
+  `/sync/push` federated-receive subcollection lanes, a pg RECEIVER applies only
+  5 (`memories` / `links` / `deletions` / `signals` / `action_transitions`, with
+  `embeddings` riding on `memories`); the other 7 — `archives`, `restores`,
+  `pendings`, `pending_decisions`, `namespace_meta`, `namespace_meta_clears`,
+  `checkpoints` — bucket `unsupported_on_postgres`
+  (`src/handlers/federation_signing_check.rs:969`) and do NOT converge to a pg
+  peer. §2.0 now scopes the "coordination and governance ENFORCEMENT writes"
+  claim to LOCAL enforcement + the 5 convergence lanes, and discloses the 7
+  sqlite-native lanes the way the 21 fully-501 paths are disclosed. Docs-only.
+
 ### Fixed (create data-integrity — CERT-BLOCKING)
 
 - **The default `on_conflict=error` create disposition is now ATOMICALLY

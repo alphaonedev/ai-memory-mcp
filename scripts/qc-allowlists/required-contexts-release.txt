@@ -216,6 +216,18 @@ Doc surface completeness gate (#2839)
 # below), so the gate can prove the context sound before it is enforced.
 Capacity-claim ceiling gate (#2869)
 #
+# #2879 — published-BENCHMARK-CELL truthfulness gate (CERT TRUTHFULNESS).
+# The accuracy gates above pin cited Rust-const VALUES / symbols / SDK-paths
+# / CI-jobs, and #2869 pins agent-count capacity claims; NONE policed a
+# published BENCHMARK NUMBER, so `ROADMAP.md` §9.5 shipped the retired
+# shadow keyword figures (97.0% R@5 / 232 q/s) while every claims gate was
+# green. Declared REQUIRED per gate 7 rule (f) — a new c8-precheck integrity
+# gate must be declared here (or in the not-required ledger) or it is
+# required-by-nothing (the #2636 class). Mirror-first: this declaration
+# lands before the companion branch-protection API call (KNOWN GAP below),
+# so the gate can prove the context sound before it is enforced.
+Benchmark-claim canon gate (#2879)
+#
 # ---------------------------------------------------------------------------
 # KNOWN GAPS — declared here so they are not mistaken for oversights.
 # Closing any of them is a branch-protection edit, deliberately NOT done in
