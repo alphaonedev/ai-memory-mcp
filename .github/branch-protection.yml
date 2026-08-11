@@ -114,6 +114,50 @@ branches:
     enforce_admins: true
     allow_force_push: false
 
+# KNOWN-INERT LIVE RULESET (#2486). `required_signatures` on the live
+# GitHub ruleset `signed-attested-branches` (id 17752665, targets
+# `refs/heads/{main,develop,release/*}`, confirmed live via
+# `gh api repos/alphaonedev/ai-memory-mcp/rulesets/17752665`) is NOT the
+# control it names itself. Under this repo's exclusively-API-squash-merge
+# flow, GitHub CREATES and SIGNS the merge commit with its own web-flow key
+# (`B5690EEEBB952194`), so the rule is SELF-SATISFYING — it verifies a
+# signature it produced itself and can structurally never reject anything.
+# This is the same class as #2444 / #2449 / #2452 / #2443: a control that
+# reports success while doing nothing.
+#
+# Per this file's own doctrine above (nobody reads this file; it enforces
+# nothing; GitHub's live ruleset state is the only authoritative artefact),
+# this note changes NOTHING live — it exists so a reviewer of this file
+# does not COUNT `required_signatures` in the release-gate control
+# inventory. The controls actually holding `release/**` are
+# `non_fast_forward`, `deletion`, and the required-status-check set
+# declared in `scripts/qc-allowlists/required-contexts-release.txt`
+# (verified by `scripts/check-required-contexts.sh`). Do NOT remove
+# `required_signatures` from the live ruleset as part of reconciling this
+# note — that is a live security-config mutation (Sensitive class,
+# operator-gated) #2486 did not ask for and this file cannot make (see
+# doctrine above: nobody reads this file, nothing enforces it).
+#
+# The ACTUAL commit-signing posture control is
+# `scripts/check-commit-signing-posture.sh`, wired as the
+# `Commit-signing posture gate (#2486)` job in
+# `.github/workflows/c8-precheck.yml` — it inspects the PR's OWN commits
+# (identity + signature verified against
+# `scripts/qc-allowlists/enrolled-commit-signers.txt`) rather than the
+# GitHub-produced merge artefact `required_signatures` inspects.
+signing_posture_note:
+  ruleset_id: 17752665
+  ruleset_name: signed-attested-branches
+  rule: required_signatures
+  status: self_satisfying_under_api_merge
+  not_a_control_because: |
+    GitHub signs its own web-flow squash-merge commits, so
+    required_signatures verifies a signature GitHub itself produced.
+    It cannot fail on the merge path it governs.
+  actual_control: scripts/check-commit-signing-posture.sh
+  actual_control_ci_job: "Commit-signing posture gate (#2486)"
+  issue: "#2486"
+
 # Auxiliary policy: nightly run-against-develop.
 # The Batman acceptance workflow runs on path-filtered PRs by default;
 # the nightly schedule below catches regressions whose triggering edit
