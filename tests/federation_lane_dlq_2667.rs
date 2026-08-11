@@ -612,3 +612,131 @@ async fn pg_namespace_meta_lane_dlq_parity_2667() {
         "the parity row must clear cleanly"
     );
 }
+
+/// #2882 — PERMANENT live-PG coverage of the `PostgresDlqSink` REPLAY path.
+///
+/// The #2875/#2667 federation DLQ fix's whole value is the
+/// failure -> land -> REPLAY -> converge -> clear round-trip, but before this
+/// test that round-trip was only ever exercised through `SqliteDlqSink`
+/// (`namespace_meta_lane_replays_and_clears_2667` above); the pg parity test
+/// (`pg_namespace_meta_lane_dlq_parity_2667`) is `#[ignore]` + LANDING-ONLY, so
+/// it neither ran in CI's live-PG coverage job (which does not pass
+/// `--include-ignored`) nor drove `replay_once` against `PostgresDlqSink`. This
+/// test closes that caveat: it mirrors the sqlite replay-and-clear assertion on
+/// the REAL `PostgresDlqSink` over a live instance, PERMANENTLY (every PR, no
+/// per-round DO spend).
+///
+/// It is DELIBERATELY NOT `#[ignore]`: the coverage job's live-PG leg does NOT
+/// pass `--include-ignored`, so an `#[ignore]` twin would show 0% coverage in
+/// CI. Instead it self-SKIPS (eprintln + early return) when
+/// `AI_MEMORY_TEST_POSTGRES_URL` is unset (plain `cargo test` stays green) or
+/// when `PostgresStore::connect` fails — the house pattern shared with
+/// `tests/embedding_space_provenance_2167_pg.rs` et al., which RUNS in the
+/// live-PG job.
+///
+/// ## Exactly what this covers (no overclaim)
+///
+/// Drives a GOVERNANCE lane (`broadcast_namespace_meta_quorum`, the
+/// authority-class `namespace_meta` subcollection the anti-entropy catch-up
+/// loop never reconciles) through `PostgresDlqSink`, on live postgres:
+///   1. peer DOWN (500) -> exactly one pg DLQ row lands, keyed
+///      `namespace_meta:{ns}`, `attempt_count == 1`;
+///   2. peer HEALS (mock now 200-acks with no `ids` echo);
+///   3. `replay_once(&cfg, &PostgresDlqSink)` re-POSTs the governance body and
+///      the `sync_push` 200 acks it -> `PostgresDlqSink::mark_dlq_row_replayed`
+///      stamps `replayed_at` (the Ack arm), so the pg DLQ row CLEARS. A cleared
+///      row is definitional proof of re-POST + converge, because the Ack arm is
+///      the ONLY path that clears a row (`src/federation/push_dlq.rs`).
+///
+/// The DB is SHARED (the coverage suite serialises, but rows persist across
+/// runs), so every assertion is SCOPED to this run's own row via a UNIQUE
+/// `namespace` (uuid) — NOT the global `pending_dlq_count()`. The `peer.hits()`
+/// corroboration is therefore a `>` (a lower bound: co-resident `peer-down`
+/// rows from other runs may also replay against this healthy mock), while the
+/// load-bearing per-row proof is "this run's row is CLEARED after replay". This
+/// test does NOT assert anything about the global DLQ depth or other lanes.
+/// Scoped lookup of THIS run's pending pg DLQ row by its unique key.
+/// `take_pending_dlq_rows` is a pure SELECT on both backends (never a delete),
+/// so it is safe to call for assertions before AND after replay.
+#[cfg(feature = "sal-postgres")]
+async fn find_pending_row_by_key(
+    sink: &Arc<dyn FederationDlqSink>,
+    key: &str,
+) -> Option<FederationPushDlqRow> {
+    sink.take_pending_dlq_rows(4096)
+        .await
+        .expect("pg take pending")
+        .into_iter()
+        .find(|r| r.memory_id == key)
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_namespace_meta_lane_replays_and_clears_2882() {
+    use ai_memory::federation::push_dlq::PostgresDlqSink;
+    use ai_memory::store::postgres::PostgresStore;
+
+    let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+        eprintln!("test skipped: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let store = match PostgresStore::connect(&url).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!("test skipped: PostgresStore::connect failed: {e}");
+            return;
+        }
+    };
+    let sink: Arc<dyn FederationDlqSink> = Arc::new(PostgresDlqSink::new(store));
+
+    // Unique namespace so this run's DLQ key cannot collide with any other
+    // run's rows on the shared instance — every assertion below is scoped to it.
+    let ns = format!("pg-2882/{}", uuid::Uuid::new_v4());
+    let expected_key = format!("namespace_meta:{ns}");
+    let entry = NamespaceMetaEntry {
+        namespace: ns.clone(),
+        standard_id: "mem-std-pg-2882".to_string(),
+        parent_namespace: None,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    // (1) peer DOWN -> the governance lane lands exactly one pg DLQ row.
+    let peer = PeerState::with_mode(MODE_FAIL);
+    let peer_url = spawn_mock_peer(peer.clone()).await;
+    let cfg = build_cfg(&peer_url, sink.clone());
+    broadcast_namespace_meta_quorum(&cfg, &entry).await.unwrap();
+
+    let landed = find_pending_row_by_key(&sink, &expected_key)
+        .await
+        .expect("#2882: the namespace_meta lane must land a pg DLQ row for the down peer");
+    assert_eq!(landed.peer_id, "peer-down");
+    assert_eq!(
+        landed.attempt_count, 1,
+        "a single fanout failure lands the row at attempt_count == 1"
+    );
+    assert_eq!(
+        landed.payload_json["namespace_meta"][0]["namespace"], ns,
+        "the pg DLQ row carries the verbatim governance subcollection body"
+    );
+    let hits_before = peer.hits();
+
+    // (2) peer HEALS, then (3) run the REAL replay worker against PostgresDlqSink.
+    peer.set_mode(MODE_OK);
+    replay_once(&cfg, sink.as_ref()).await;
+
+    // (3) proof: this run's pg DLQ row CLEARED (the Ack arm marked it replayed),
+    // which is definitional proof it re-POSTed and the peer converged.
+    assert!(
+        find_pending_row_by_key(&sink, &expected_key)
+            .await
+            .is_none(),
+        "#2882: PostgresDlqSink replay must CLEAR the governance row once the peer \
+         recovers — a cleared row is the Ack arm, the only path that re-POSTs and \
+         converges (a bare landing-only pg test never exercised this)"
+    );
+    assert!(
+        peer.hits() > hits_before,
+        "replay must re-POST the namespace_meta body to the now-healthy peer \
+         (>, not exact: co-resident peer-down rows on the shared DB may also replay)"
+    );
+}
