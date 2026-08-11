@@ -297,6 +297,28 @@ EOS
   echo "$exts" | grep -q vector || die "[$pg_host] vector (pgvector) extension missing"
   log "[$pg_host] extensions OK: $(echo $exts | tr '\n' ' ')"
 
+  # ------------------------------------------------------------------------
+  # #2658 fail-CLOSED hostssl proof. Everything above (pg_isready, extension
+  # verify) speaks over the LOCAL unix socket (`local ... trust`) and passes
+  # even if the hostssl arming silently did not take effect (ssl GUC not
+  # applied, a lost pg_hba, ...). A run that reports "ready" while the TCP
+  # listener accepts CLEARTEXT is a silent security disarm in the certified
+  # provisioning lane. PROVE hostssl is armed before declaring the substrate
+  # ready: a plaintext (sslmode=disable) TCP connection over the region VPC
+  # IP MUST be refused PRE-AUTH by the hostssl-only pg_hba ("no pg_hba.conf
+  # entry ... no encryption"). Any other outcome -- a query that runs
+  # (trust), or one that reaches authentication (transport admitted in
+  # cleartext) -- aborts provisioning LOUD.
+  log "[$pg_host] proving hostssl armed (plaintext sslmode=disable on $pg_priv:$PG_PORT must be REFUSED pre-auth)"
+  local plain_out
+  plain_out="$(ssh_node "$pg_pub" "psql 'host=$pg_priv port=$PG_PORT user=$PG_USER dbname=$PG_DB sslmode=disable connect_timeout=5' -w -tAc 'SELECT 1' 2>&1; true")"
+  case "$plain_out" in
+    *"no pg_hba.conf entry"*|*"no encryption"*)
+      log "[$pg_host] hostssl armed: plaintext refused pre-auth" ;;
+    *)
+      die "[$pg_host] FAIL-CLOSED (#2658): hostssl is NOT provably armed -- a plaintext (sslmode=disable) TCP connection to $pg_priv:$PG_PORT was NOT refused pre-auth. REFUSING to declare this pg substrate ready (a cleartext-accepting postgres reporting healthy is the silent disarm this gate exists to prevent). probe: ${plain_out}" ;;
+  esac
+
   log "region $region PG18.4/AGE1.7.0/pgvector substrate ready ($pg_host @ $pg_priv:$PG_PORT, $peer_n peer schemas, NATIVE/no-docker)"
 }
 
