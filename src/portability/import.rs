@@ -550,10 +550,24 @@ fn apply_all_classes(
         // path always took `storage::insert`'s silent upsert-merge, which
         // CLOBBERED an existing destination row's content whenever an
         // imported memory (different id) collided on `(title, namespace)`.
-        if let Some(existing_id) =
+        let collision =
             crate::storage::find_by_title_namespace(conn, &staged.title, &staged.namespace)
-                .with_context(|| format!("import: collision probe for memory {}", staged.id))?
-        {
+                .with_context(|| format!("import: collision probe for memory {}", staged.id))?;
+        // #2878 — whether the write below must be ATOMICALLY fail-closed
+        // (`insert_imported_no_overwrite`, `INSERT … ON CONFLICT DO NOTHING`).
+        // Every non-`Merge` disposition promises "never clobber the
+        // destination's durable text", so a concurrent writer that raced into
+        // `(title, namespace)` BETWEEN the probe above and the write must be
+        // REFUSED, not upsert-merged — the North-Star lost-update #2771 closed
+        // on the create funnel, here on the Portability-v2 importer. Only
+        // `Merge` (the operator's opt-in silent upsert-merge) keeps the upsert;
+        // the non-race path is byte-identical under both writes (`DO NOTHING`
+        // and `DO UPDATE` behave the same when there is no conflict), so
+        // `Version`'s suffix semantics and `Merge`'s upsert semantics are
+        // unchanged — only the raced-collision outcome flips from a silent
+        // clobber to a skip.
+        let fail_closed = opts.on_conflict != ConflictMode::Merge;
+        if let Some(existing_id) = collision {
             match opts.on_conflict {
                 // Legacy silent upsert-merge — the operator opted in.
                 ConflictMode::Merge => {}
@@ -583,10 +597,40 @@ fn apply_all_classes(
         // `storage::insert`, but WITHOUT advancing this node's vector-clock
         // component — remote-admission semantics mirroring `insert_if_newer`,
         // #2211: the destination did not author these rows). It opens no
-        // inner transaction.
-        crate::storage::insert_imported(conn, &staged)
-            .with_context(|| format!("import memory {}", staged.id))?;
-        report.memories += 1;
+        // inner transaction. #2878 — under the non-`Merge` dispositions the
+        // write is the fail-closed `insert_imported_no_overwrite`, so a racer
+        // that took the key AFTER the probe cannot be silently clobbered.
+        let write_result = if fail_closed {
+            crate::storage::insert_imported_no_overwrite(conn, &staged)
+        } else {
+            crate::storage::insert_imported(conn, &staged)
+        };
+        match write_result {
+            Ok(_) => {
+                report.memories += 1;
+            }
+            // #2878 — the fail-closed write refused a `(title, namespace)`
+            // collision that raced past the probe above. Skip the row with the
+            // SAME disposition as the probe-hit `Error` arm (count + WARN +
+            // continue), never a silent overwrite and never a bundle abort — a
+            // conflict has always been a per-row skip on this funnel, not an
+            // all-or-nothing failure.
+            Err(e) if e.downcast_ref::<crate::storage::ConflictError>().is_some() => {
+                let existing_id = e
+                    .downcast_ref::<crate::storage::ConflictError>()
+                    .map_or_else(String::new, |c| c.existing_id.clone());
+                report.conflicts_skipped += 1;
+                report.warnings.push(format!(
+                    "memory {} skipped: (title, namespace) collision with existing {existing_id} \
+                     (raced past the collision probe)",
+                    staged.id
+                ));
+                continue;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("import memory {}", staged.id));
+            }
+        }
     }
     for link in &env.links {
         // Pre-ship 3x7 HIGH-2 (link lane) — L1 parity with the `cli::io`

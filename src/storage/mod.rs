@@ -1475,6 +1475,27 @@ pub fn insert_imported(conn: &Connection, mem: &Memory) -> Result<String> {
     insert_inner(conn, mem, false, false)
 }
 
+/// v1.0.0 #2878 — FAIL-CLOSED remote-admission insert: the no-overwrite twin
+/// of [`insert_imported`] (same remote-admission funnel — vector-clock crosses
+/// verbatim, NOT stamped locally) EXCEPT a `(title, namespace)` collision is
+/// `DO NOTHING` instead of `DO UPDATE`: a row that already holds the key is NOT
+/// overwritten. Instead the write returns a typed [`ConflictError`] (the same
+/// shape the up-front existence probe raises). Closes the Portability-v2
+/// probe-then-upsert lost-update: on a PROBE MISS under the non-`Merge`
+/// dispositions the importer routes here so a concurrent writer that raced into
+/// the key BETWEEN the collision probe and the write can never be silently
+/// upsert-overwritten. `Merge` (the operator's opt-in silent upsert) keeps
+/// calling [`insert_imported`].
+///
+/// # Errors
+///
+/// * [`ConflictError`] (via `anyhow`) when `(mem.title, mem.namespace)`
+///   already exists — the existing row is left byte-identical.
+/// * Otherwise identical to [`insert_imported`].
+pub fn insert_imported_no_overwrite(conn: &Connection, mem: &Memory) -> Result<String> {
+    insert_inner(conn, mem, false, true)
+}
+
 /// Shared body of [`insert`] / [`insert_imported`] / [`insert_no_overwrite`].
 /// `stamp_local_clock` selects whether this node's vector-clock component is
 /// advanced (local authorship) or the metadata crosses verbatim (remote
