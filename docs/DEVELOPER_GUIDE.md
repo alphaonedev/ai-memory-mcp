@@ -383,7 +383,7 @@ Added in schema migration v3 -> v4 (shown in its original 16-column shape). Stor
 
 ### `schema_version` table
 
-Tracks migration state. Current version: **88** (`CURRENT_SCHEMA_VERSION` in `src/storage/migrations.rs`).
+Tracks migration state. Current version: **89** (`CURRENT_SCHEMA_VERSION` in `src/storage/migrations.rs`).
 
 ## Recall Scoring Formula
 

@@ -218,7 +218,7 @@ What it does (see `src/cli/schema_init.rs`):
    true` in the JSON report).
 4. Enumerates the resulting catalog and prints the human summary
    (tables / indices / views / functions / extensions /
-   `schema_version: 88`) or the `--json` report.
+   `schema_version: 89`) or the `--json` report.
 
 Idempotent on rerun — safe to invoke from a deploy script. Exit code
 0 on success, non-zero on connection / bootstrap failure.

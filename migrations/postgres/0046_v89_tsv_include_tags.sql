@@ -51,7 +51,12 @@
 -- EXCLUSIVE lock and rewrites the table to backfill the column (the same
 -- posture as the original v57 add). At the fleet's ~8k rows this is
 -- sub-second; plan a maintenance window before running it against
--- multi-million-row deployments. This DDL is executed by
+-- multi-million-row deployments. If the rewrite exceeds the pooled
+-- connection's default 30s `statement_timeout` on such a table, raise or
+-- disable the ceiling for the boot that runs the migration via
+-- `postgres_statement_timeout_secs` (`AI_MEMORY_PG_STATEMENT_TIMEOUT_SECS`;
+-- `0` lifts both the `statement_timeout` and `lock_timeout` bounds) so the
+-- arm can complete instead of rolling back every boot. This DDL is executed by
 -- `PostgresStore::migrate_v89()` (via `sqlx::raw_sql`) inside ONE
 -- transaction on the POOLED connection, which RETAINS the pool's
 -- `lock_timeout` / `statement_timeout` — deliberately, so under lock
