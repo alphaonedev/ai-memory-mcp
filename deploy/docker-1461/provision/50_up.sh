@@ -29,8 +29,17 @@ dc up -d --remove-orphans
 # Gate: PG first (peers depend_on it healthy, but assert explicitly).
 log "up: waiting for $PG_CONTAINER"
 wait_healthy "$PG_CONTAINER" "${DOCKER_1461_PG_WAIT_TICKS:-40}" \
-  || die "up: $PG_CONTAINER did not become healthy"
+  || die "up: $PG_CONTAINER did not become healthy (its healthcheck now PROVES hostssl is armed -- a plaintext sslmode=disable TCP connection must be refused pre-auth, #2658; check 'docker logs $PG_CONTAINER' + the healthcheck output for a cleartext-accepted disarm)"
 log "up: $PG_CONTAINER healthy"
+
+# #2658 explicit fail-CLOSED re-probe. The healthcheck already gates
+# `healthy` on hostssl being armed, but re-run it here so a disarm aborts
+# provisioning with a NAMED security cause (not a generic wait timeout),
+# and so the gate survives a future revert of the compose healthcheck.
+log "up: proving hostssl armed on $PG_CONTAINER (plaintext sslmode=disable must be REFUSED pre-auth)"
+node_exec "$PG_CONTAINER" /usr/local/bin/pg-hostssl-healthcheck.sh \
+  || die "up: REFUSING to declare the mesh ready -- $PG_CONTAINER is up but hostssl is NOT provably armed; a plaintext (sslmode=disable) TCP connection was not refused pre-auth (silent cleartext disarm, #2658)"
+log "up: hostssl armed on $PG_CONTAINER (cleartext refused pre-auth)"
 
 # Gate: each peer over the real mTLS HTTPS healthcheck.
 i=1
