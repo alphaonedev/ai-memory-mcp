@@ -326,11 +326,22 @@ Binary-faithful and shadow numbers are comparable **within** a harness, never
 across. Canonical per-tier / per-category source of truth:
 [`benchmarks/longmemeval/results.md`](benchmarks/longmemeval/results.md).
 
+> **Keyword figures measured on the v1.0.0 binary (2026-08-11, #2888).**
+> The binary-faithful **keyword** row (R@1 86.6% / R@5 96.4% / R@10 98.4% /
+> R@20 99.6%) was re-measured on the v1.0.0 release binary (commit
+> `811ce105`) over all 500 questions, so the published number is measured
+> on the product it is claimed for — not carried over from the v0.7.0 run.
+> It reproduces the 2026-05-31 v0.7.0 keyword figures EXACTLY at
+> R@1/R@5/R@10 and by one additional `temporal-reasoning` question at R@20
+> (99.4%→99.6%); the FTS5 keyword recall pipeline is materially unchanged.
+> The `semantic` / `autonomous` binary-faithful rows and the shadow
+> LLM-expanded anchor remain their 2026-05-31 v0.7.0 measurements.
+
 | Metric | Result |
 |---|---|
 | Recall@5 (keyword, binary-faithful, LLM-independent) | **96.4%** (482/500) |
 | Recall@5 (LLM-expanded anchor, shadow) | **97.2%** (Gemma 4, API venue) |
-| Recall@10 / Recall@20 (keyword, binary-faithful) | 98.4% (492/500) / 99.4% (497/500) |
+| Recall@10 / Recall@20 (keyword, binary-faithful) | 98.4% (492/500) / 99.6% (498/500) |
 | Recall@10 / Recall@20 (LLM-expanded anchor, shadow) | 99.6% / 99.8% |
 | Throughput (keyword, binary-faithful `harness.py`) | 1.2 q/s |
 | Throughput (LLM-expanded, shadow `harness_99.py`) | 142 q/s |

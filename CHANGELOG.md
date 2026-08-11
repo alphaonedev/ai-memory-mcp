@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed (cert truthfulness — published-claims reconciliation)
 
+- **The published LongMemEval keyword headline figures are now MEASURED on
+  the v1.0.0 binary, not carried over from the v0.7.0 run**
+  ([#2888](https://github.com/alphaonedev/ai-memory-mcp/issues/2888); cert
+  truthfulness). The README §Benchmark / ROADMAP §9.5 / `results.md` keyword
+  numbers (96.4% R@5 etc.) were measured on the v0.7.0 binary (2026-05-31)
+  yet presented as the v1.0.0 product's figures; under the bet-the-farm rule
+  a number claimed for v1.0.0 must be measured on v1.0.0. The keyword tier
+  (the LLM-independent, load-bearing floor) was RE-MEASURED on the v1.0.0
+  release binary (commit `811ce105`) via `harness.py` (binary-faithful, one
+  `ai-memory recall` subprocess per question, all 500 questions), using
+  `AI_MEMORY_SECRET_SCREEN_MODE=off` + `AI_MEMORY_NO_CONFIG=1` to reproduce
+  the v0.7.0 ingest baseline — secret-screening is a v0.8.1 WRITE-path
+  control (env #95), absent at v0.7.0 and orthogonal to keyword recall
+  quality; at its `refuse` default it drops LongMemEval-S sessions carrying
+  synthetic credential-like strings and measures the screen, not the FTS5
+  ranker. **Result:** R@1 86.6% (433/500), R@5 96.4% (482/500), R@10 98.4%
+  (492/500), R@20 99.6% (498/500) — byte-identical to the v0.7.0 keyword run
+  at R@1/R@5/R@10 and at every per-category cell except `temporal-reasoning`
+  R@20 (131/133 → 132/133), lifting Overall R@20 99.4% (497/500) → 99.6%
+  (498/500). `results.md` now records the v1.0.0 re-measurement as the
+  canonical keyword row (v0.7.0 semantic/autonomous rows unchanged, not
+  re-run); README/ROADMAP carry v1.0.0 provenance and the R@20 cell is
+  updated to 99.6% (498/500). Raw log + CSV under `.local-runs/2888-bench/`.
+  Docs-only; the #2879 benchmark-claim gate + `check-docs-vs-ssot` stay
+  green (canon and docs agree at 99.6% R@20).
 - **`ROADMAP.md` §9.5 keyword LongMemEval cells reconciled to the
   binary-faithful canon, and a new load-bearing gate now polices published
   benchmark cells** ([#2879](https://github.com/alphaonedev/ai-memory-mcp/issues/2879);
