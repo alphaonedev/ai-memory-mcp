@@ -58,7 +58,9 @@ ROADMAP.md Code Coverage          #2629 C-24
 ROADMAP.md ci.yml:Code Coverage   #2629 C-24 the possessive citation on the same line
 
 # --- C-23 -------------------------------------------------------------
-docs/v1.0.0/release-notes.md postgres-age  #2629 C-23 job deleted in da3fb9cc
+# (resolved #2512/#2548) release-notes.md §"CI posture" now describes the
+# postgres-age deletion + the new in-PR cert-postgres-age.yml coverage with
+# no false enforcement claim, so no suppression entry is needed here.
 
 # --- C-21 — BURNED DOWN 2026-08-01 ------------------------------------
 # The PERFORMANCE.md correction lane removed the AGE-job citation, so the

@@ -1,0 +1,279 @@
+# Certified Postgres + Apache AGE + pgvector tier — IN-PR cert evidence (#2548).
+#
+# WHY THIS WORKFLOW EXISTS. Before #2548 the certified pg+AGE tier was NEVER
+# exercised in-PR. The `#[ignore]`-gated postgres/AGE cells ran ONLY in
+# `postgres-parity-nightly.yml` (a `schedule:` workflow that fires from the
+# DEFAULT branch, not from a PR into `release/**`), and the AGE-backed cells
+# self-skip unless `AI_MEMORY_TEST_AGE_URL` is set — so on the certification
+# branch nothing proved the certified tier actually works. The 2026-08-01
+# cutline ruling §5.4(3) requires EXECUTED evidence on real Postgres + AGE +
+# pgvector, at the CERTIFIED versions, on the cert branch. "You cannot certify
+# a tier CI does not run", and the ruling forbids "CI-on-16-while-certifying-18".
+# This job is what makes §5.4(3) executable: it runs the ignored pg cells AND
+# the AGE-backed cells (with the AGE url set, so they stop self-skipping)
+# against a LIVE stack pinned to the ONE TRUE certified triple.
+#
+# ONE DECLARATION SOURCE (#B1 cert-review fix, 2026-08-11). Earlier revisions
+# of this job started the STOCK `apache/age:release_PG18_1.7.0` service image
+# unmodified (which ships PostgreSQL 18.1, not 18.4) and installed pgvector
+# UNPINNED (resolves to whatever the pgdg snapshot currently carries, e.g.
+# 0.8.6) — so the docs claiming "the exact triple 18.4/1.7.0/0.8.5 is
+# CI-asserted in-PR" OVERCLAIMED what this job actually proved. The fix is to
+# make CI run the ACTUAL certified minors rather than weaken the docs: this
+# job now BUILDS the real deploy artifact —
+# `deploy/docker-1461/Dockerfile.pg-age-vector`, the SAME recipe the
+# docker-1461 mesh ships — with build-args resolved from the ONE SSOT,
+# `deploy/docker-1461/provision/lib.sh` (`PG_APT_VERSION`,
+# `PGVECTOR_APT_VERSION`, `AGE_BASE_IMAGE`, `EXPECTED_PG_VERSION`,
+# `EXPECTED_AGE_VERSION`), and RUNS that built image as the postgres under
+# test — not a `services:` block pointed at the unmodified base image. No
+# operative version literal is re-typed in this file: every pin is read from the
+# deploy SSOT by the "Resolve certified stack pins" step below and threaded
+# through `$GITHUB_ENV` to the build + assert steps. This is the maximal
+# "extend prior art, do not fork it" path (CLAUDE.md): the CI evidence and
+# the shipped deploy image are now the SAME artifact, so a future SSOT pin
+# bump moves both in lockstep with zero drift by construction.
+#
+# THE ONE TRUE CERTIFIED TRIPLE (SSOT: deploy/docker-1461/provision/lib.sh —
+# see also docs/postgres-age-guide.md §"Certified versions"):
+#
+#   * PostgreSQL   18.4   (EXPECTED_PG_VERSION=18.4)
+#   * Apache AGE   1.7.0  (EXPECTED_AGE_VERSION=1.7.0; base image apache/age:release_PG18_1.7.0)
+#   * pgvector     0.8.5  (PGVECTOR_APT_VERSION=0.8.5-1.pgdg13+1)
+#
+# `deploy/docker-1461/Dockerfile.pg-age-vector` bumps the apache/age base
+# image's server to the exact pinned minor via a pgdg `apt --only-upgrade`
+# (ABI-safe within PG major 18 — AGE's compiled extension loads unchanged
+# across PG minors) and layers in the exact pinned pgvector .deb (the
+# upstream apache/age image does not ship pgvector). The
+# `Assert certified stack versions` step below hard-fails on ANY drift from
+# the exact pinned minors — so this job is EVIDENCE, not a claim: a base-image
+# or apt-snapshot drift that silently moved a version off the SSOT pin reds
+# here, and the printed `PostgreSQL=… Apache AGE=… pgvector=…` notice in the
+# executed run is the proof.
+#
+# Modelled on postgres-parity-nightly.yml (mold + trimmed dev debug to hold the
+# heavy sal-postgres build under the runner RSS/disk ceilings) and coverage.yml
+# (the pg-age service + AGE/pgvector extension provisioning). coverage.yml keeps
+# running the DOCUMENTED ALTERNATE matrix (PG16 + AGE 1.6.0); this job is the
+# CANONICAL certified-triple evidence. Both are honest and both are in the SSOT.
+name: "Certified Postgres + AGE + pgvector tier (#2548)"
+
+on:
+  pull_request:
+    branches: ["release/**"]
+  push:
+    branches: ["release/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Event-distinct key (includes github.event_name) so a same-sha push +
+  # pull_request pair never collide into one cancel-in-progress group — the
+  # rule-(d) CANCELLED-DUPLICATE class scripts/check-required-contexts.sh
+  # guards against. Fork-PR-safe: isolates fork PRs by number.
+  group: cert-pg-age-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Match postgres-feature / postgres-parity-nightly: mold linker + no dev debug
+  # info to keep the heavy sal-postgres build under the runner ceilings.
+  RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  AI_MEMORY_TEST_POSTGRES_URL: "postgres://ai_memory:ai_memory_ci@127.0.0.1:5432/ai_memory_ci"
+  AI_MEMORY_TEST_AGE_URL: "postgres://ai_memory:ai_memory_ci@127.0.0.1:5432/ai_memory_ci"
+
+jobs:
+  cert-postgres-age:
+    name: "Certified pg+AGE cells (live PG 18.4 + AGE 1.7.0 + pgvector 0.8.5)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # NOTE: deliberately NO `services:` block. A GitHub Actions `services:`
+    # entry can only start a bare image — it cannot pass `--build-arg`s — so
+    # it structurally cannot run the pinned-minor deploy image below. The
+    # postgres+AGE+pgvector container is built and run explicitly in the
+    # steps below instead, from the SAME Dockerfile the docker-1461 mesh
+    # ships (see the "ONE DECLARATION SOURCE" header note above).
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk (heavy sal-postgres build headroom)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup \
+                      /usr/local/share/powershell /usr/local/share/chromium \
+                      /usr/local/share/boost /usr/local/lib/node_modules \
+                      /opt/google /usr/lib/jvm /opt/microsoft \
+                      /usr/share/swift /usr/share/miniconda || true
+          sudo apt-get autoremove --purge -y || true
+          sudo apt-get clean || true
+          df -h /
+
+      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy
+
+      - name: Install mold linker + postgresql-client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold postgresql-client
+          mold --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve certified stack pins from deploy SSOT
+        run: |
+          set -euo pipefail
+          # ONE declaration source (#B1): every version literal this job
+          # exercises comes from deploy/docker-1461/provision/lib.sh — the
+          # SAME file the docker-1461 mesh + its validate harness consume.
+          # Nothing below is re-typed as a bare literal; a future SSOT pin
+          # bump (e.g. a PG 18.5 point release) moves this job automatically.
+          source deploy/docker-1461/provision/lib.sh
+          {
+            echo "CERT_AGE_BASE_IMAGE=${AGE_BASE_IMAGE}"
+            echo "CERT_PG_MAJOR=${PG_MAJOR}"
+            echo "CERT_PG_APT_VERSION=${PG_APT_VERSION}"
+            echo "CERT_PGVECTOR_APT_VERSION=${PGVECTOR_APT_VERSION}"
+            echo "CERT_EXPECTED_PG_VERSION=${EXPECTED_PG_VERSION}"
+            echo "CERT_EXPECTED_AGE_VERSION=${EXPECTED_AGE_VERSION}"
+            # pg_extension.extversion for pgvector reports the bare semver
+            # (e.g. "0.8.5"), never the pgdg package suffix — strip it here
+            # once so the assert step below has no literal of its own.
+            echo "CERT_EXPECTED_PGVECTOR_VERSION=${PGVECTOR_APT_VERSION%%-*}"
+          } >> "$GITHUB_ENV"
+          echo "::notice::certified pins resolved from deploy/docker-1461/provision/lib.sh — PG ${PG_APT_VERSION} (server ${EXPECTED_PG_VERSION}), AGE base ${AGE_BASE_IMAGE} (server ${EXPECTED_AGE_VERSION}), pgvector ${PGVECTOR_APT_VERSION}"
+
+      - name: Build certified pg+AGE+pgvector image (deploy/docker-1461/Dockerfile.pg-age-vector)
+        run: |
+          set -euo pipefail
+          # Builds the SAME artifact the docker-1461 mesh ships — extending
+          # prior art rather than forking a second recipe. Every ARG comes
+          # from the previous step's resolved SSOT env, never a literal here.
+          docker build \
+            --build-arg AGE_BASE_IMAGE="${CERT_AGE_BASE_IMAGE}" \
+            --build-arg PG_MAJOR="${CERT_PG_MAJOR}" \
+            --build-arg PG_APT_VERSION="${CERT_PG_APT_VERSION}" \
+            --build-arg PGVECTOR_APT_VERSION="${CERT_PGVECTOR_APT_VERSION}" \
+            -t cert-pg-age-vector:ci \
+            -f deploy/docker-1461/Dockerfile.pg-age-vector \
+            deploy/docker-1461
+
+      - name: Run certified pg+AGE+pgvector container
+        run: |
+          set -euo pipefail
+          docker run -d --name cert-pg-age \
+            -e POSTGRES_USER=ai_memory \
+            -e POSTGRES_PASSWORD=ai_memory_ci \
+            -e POSTGRES_DB=ai_memory_ci \
+            -p 5432:5432 \
+            cert-pg-age-vector:ci
+
+      - name: Wait for postgres readiness
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            if pg_isready -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_ci >/dev/null 2>&1; then
+              echo "::notice::postgres is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::postgres did not become ready within 120s"
+          docker logs cert-pg-age || true
+          exit 1
+
+      - name: Provision AGE + vector extensions (certified stack)
+        env:
+          PGPASSWORD: ai_memory_ci
+        run: |
+          set -euo pipefail
+          # pgvector is already baked into the image at the pinned version
+          # by Dockerfile.pg-age-vector (built above) — no apt-get here.
+          # Provision extensions + the memory_graph AGE graph the SAL postgres
+          # adapter expects. Mirrors coverage.yml + infra/lan-parity-test/init-age.sql.
+          psql -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_ci -c "CREATE EXTENSION IF NOT EXISTS vector;"
+          psql -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_ci -c "CREATE EXTENSION IF NOT EXISTS age;"
+          psql -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_ci -c "LOAD 'age'; SET search_path = ag_catalog, \"\$user\", public; SELECT ag_catalog.create_graph('memory_graph');" || echo "memory_graph already exists or AGE init handled by ladder"
+
+      - name: Assert certified stack versions (cert evidence, hard-fail on drift)
+        env:
+          PGPASSWORD: ai_memory_ci
+        run: |
+          set -euo pipefail
+          PSQL="psql -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_ci -tAX"
+          # split_part(...,' ',1) strips the "(Debian 18.4-1.pgdg13+1)" build
+          # metadata SHOW server_version / current_setting append after the
+          # bare version — without this, tr -d '[:space:]' collapses that
+          # into "18.4(Debian18.4-1.pgdg13+1)", which never equals the exact
+          # SSOT string and false-reds the assert below even when the
+          # server IS the certified 18.4.
+          pg_ver=$($PSQL -c "SELECT split_part(current_setting('server_version'), ' ', 1);" | tr -d '[:space:]')
+          age_ver=$($PSQL -c "SELECT extversion FROM pg_extension WHERE extname='age';" | tr -d '[:space:]')
+          vec_ver=$($PSQL -c "SELECT extversion FROM pg_extension WHERE extname='vector';" | tr -d '[:space:]')
+          echo "::notice::certified stack — PostgreSQL=$pg_ver  Apache AGE=$age_ver  pgvector=$vec_ver"
+          {
+            echo "### Certified Postgres + AGE + pgvector tier"
+            echo ""
+            echo "| component | running | certified (SSOT) |"
+            echo "| --- | --- | --- |"
+            echo "| PostgreSQL | $pg_ver | ${CERT_EXPECTED_PG_VERSION} |"
+            echo "| Apache AGE | $age_ver | ${CERT_EXPECTED_AGE_VERSION} |"
+            echo "| pgvector | $vec_ver | ${CERT_EXPECTED_PGVECTOR_VERSION} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # EXACT-minor assertion (#B1) — the SSOT-pinned minor, not merely
+          # the major. A base-image drift off the exact pinned minor (an apt
+          # snapshot moving, a base-image digest update) must RED, never
+          # silently certify a different version than the one the docs cite.
+          case "$pg_ver" in
+            "$CERT_EXPECTED_PG_VERSION") echo "PostgreSQL $pg_ver == certified $CERT_EXPECTED_PG_VERSION OK" ;;
+            *) echo "::error::expected PostgreSQL exactly $CERT_EXPECTED_PG_VERSION (certified, deploy/docker-1461/provision/lib.sh EXPECTED_PG_VERSION), got '$pg_ver' — CI must not certify a version it does not run (§5.4(3))"; exit 1 ;;
+          esac
+          # Certified AGE is exactly 1.7.0. Reject 1.6.x and anything else —
+          # the whole point of #2512 is that CI must run the certified 1.7.0,
+          # not merely a 1.7.* rendering of a different point release.
+          case "$age_ver" in
+            "$CERT_EXPECTED_AGE_VERSION") echo "Apache AGE $age_ver == certified $CERT_EXPECTED_AGE_VERSION OK" ;;
+            *) echo "::error::expected Apache AGE exactly $CERT_EXPECTED_AGE_VERSION (certified, deploy/docker-1461/provision/lib.sh EXPECTED_AGE_VERSION), got '$age_ver' — CI must not certify a version it does not run (§5.4(3))"; exit 1 ;;
+          esac
+          # pgvector must match the SSOT-pinned semver exactly (allowing only
+          # for a trailing suffix the extversion column itself might carry).
+          case "$vec_ver" in
+            "") echo "::error::pgvector extension not present"; exit 1 ;;
+            ${CERT_EXPECTED_PGVECTOR_VERSION}*) echo "pgvector $vec_ver == certified ${CERT_EXPECTED_PGVECTOR_VERSION} OK" ;;
+            *) echo "::error::expected pgvector exactly ${CERT_EXPECTED_PGVECTOR_VERSION} (certified, deploy/docker-1461/provision/lib.sh PGVECTOR_APT_VERSION), got '$vec_ver' — CI must not certify a version it does not run (§5.4(3))"; exit 1 ;;
+          esac
+
+      - name: Run #[ignore]-gated pg + AGE cells against the certified stack
+        run: |
+          set -euo pipefail
+          # The pg-parity binaries mirror postgres-parity-nightly.yml (they do
+          # not touch AGE). The AGE-backed binaries self-skip unless
+          # AI_MEMORY_TEST_AGE_URL is set (it is, in env: above), so they run
+          # here — this is the in-PR cert evidence that was missing (#2548).
+          # `--include-ignored` also runs the explicitly #[ignore]-gated cells
+          # (e.g. age_cypher_param_binding_2511). --test-threads=1 because the
+          # sal-postgres suite shares one database with no per-test isolation.
+          cargo test --features sal-postgres \
+            --test secret_screen_postgres_parity_g29 \
+            --test postgres_l2_rehydration_1693 \
+            --test erasure_fanout_postgres_g30 \
+            --test recall_purity_p01_postgres \
+            --test qual_pg_write_funnel_parity_2393_2397 \
+            --test store_parity_gaps \
+            --test age_cypher_param_binding_2511 \
+            --test kg_query_relation_parity_2792 \
+            --test g2_postgres_find_paths_age_param_binding \
+            --test g4_postgres_link_projects_into_age_graph \
+            --test g5_find_paths_cte_served_on_age \
+            --test kg_age_fallback \
+            --test age_cte_equivalence \
+            --test issue_1482_age_cypher_persistent \
+            --test pillar4_4c_deferred_age_cold_path_1735 \
+            --test pillar4_4d_age_unprojection_on_delete_1783 \
+            --test age_deferred_projection_cluster_2375_2376_2377 \
+            -- --include-ignored --test-threads=1

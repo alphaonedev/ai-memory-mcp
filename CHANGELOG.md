@@ -137,6 +137,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `store.list` invariant holding. Live-postgres regression coverage:
   `tests/ordering_determinism_2602_2615_pg.rs` (`#[ignore]`,
   `--features sal,sal-postgres`, `AI_MEMORY_TEST_POSTGRES_URL`).
+### CI / supply-chain (cert-evidence unblocker cluster — CERT-BLOCKING; #2548 #2512 #2534 #2895)
+
+- **#2548 — certified pg+AGE tier now runs IN-PR.** New workflow
+  `.github/workflows/cert-postgres-age.yml` triggers on `pull_request` +
+  `push` to `release/**` and runs the `#[ignore]`-gated postgres cells AND
+  the AGE-backed cells (`AI_MEMORY_TEST_AGE_URL` set, so they stop
+  self-skipping) against the certified image CI builds from
+  `deploy/docker-1461/Dockerfile.pg-age-vector` (the same recipe the
+  docker-1461 mesh ships, SSOT-pinned from `deploy/docker-1461/provision/lib.sh`),
+  `--include-ignored --test-threads=1`. Makes the
+  2026-08-01 cutline ruling §5.4(3) EXECUTABLE — the certified tier is proven
+  by execution on the cert branch, not merely claimed. A version-assert step
+  hard-fails if the running stack is not the EXACT certified minors —
+  PostgreSQL **18.4**, AGE **1.7.0**, pgvector **0.8.5** — so any drift reds
+  instead of silently certifying the wrong version.
+- **#2512 — AGE pin drift reconciled.** The **one true certified triple** is
+  standardized and documented: **PostgreSQL 18.4 + Apache AGE 1.7.0 +
+  pgvector 0.8.5** (SSOT: `deploy/docker-1461/provision/lib.sh` +
+  `docs/postgres-age-guide.md`). The new cert job exercises that canonical
+  triple; `coverage.yml` (which pins the PG16 + AGE 1.6.0 alternate) is now
+  explicitly labelled as the DOCUMENTED ALTERNATE matrix (a line-coverage
+  measurement, not cert evidence) with a cross-reference to the cert job, so
+  CI and the certified-version SSOT AGREE and neither is drift. The release
+  branch already vendors `paste` in-tree (`path = "vendor/paste"`, #2050), so
+  there is no dead git pin to fix here. `docs/v1.0.0/release-notes.md` is
+  reconciled in lockstep (§"Certified backend versions" + §"CI posture"): the
+  passages that said the 18.4/1.7.0/0.8.5 stack was "additionally validated
+  off-CI, not CI-asserted" now state it is exercised in-PR by the new cert
+  job, with PG 16/AGE 1.6.0 relabelled as the documented alternate — closing
+  the §0 cross-doc contradiction that would otherwise ship.
+- **#2534 — one declaration source for required checks.** New gate
+  `scripts/check-branch-protection.sh` (with `--self-test`) HARD-FAILS if
+  `.github/branch-protection.yml` re-declares a bare `required_checks` key
+  (the #2443 regression), while correctly NOT tripping on the intended
+  `required_checks_declaration` pointer. Wired as steps of the already-required
+  `required-contexts-gate` job in `.github/workflows/c8-precheck.yml`.
+- **#2895 — release pipeline supply-chain hardening.**
+  `.github/workflows/release.yml`: every `cargo build` and `cargo publish`
+  now passes `--locked`; `--allow-dirty` is dropped from `cargo publish`; the
+  crates.io publish toolchain is pinned to **1.96.0** (was bare `@stable`);
+  and a new `supply-chain` job runs the git-dependency-source (#2050/#2512)
+  and build-script-vetting (#2635) gates BEFORE any build or publish, wired
+  as a `needs:` of every build/publish job so a supply-chain finding blocks
+  the release rather than shipping to crates.io / GHCR / Homebrew / COPR.
 
 ### Fixed (data integrity — import round-trip)
 
