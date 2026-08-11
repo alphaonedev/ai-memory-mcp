@@ -156,6 +156,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fully-hardened-env PASS test in `src/enterprise_federation_posture.rs`,
   a `doctor --posture` dispatch-shape suite in `src/cli/doctor.rs`, and
   a boot-refusal test.
+  **Fable review fixes (2026-08-11):** (B1, false-green, CONFIRMED-LIVE)
+  the peer-enrollment check now evaluates the SAME combined predicate
+  the live `/sync/push` + `/sync/since` receive gate uses —
+  `require_peer_enrollment_enabled() && !allow_unenrolled_peers_enabled()`
+  — instead of only the first half, closing a hole where
+  `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1` on an otherwise fully-hardened
+  env let the daemon accept unenrolled-peer attribution while the
+  posture check reported PASS (regression test:
+  `allow_unenrolled_peers_hatch_open_fails_even_with_enrollment_required`).
+  (B2) added the missing boot banner — every `PostureCheck`
+  (control/required/actual) is logged under the
+  `security.posture.enterprise_federation` target in `daemon_runtime::run`
+  next to the existing asi-hard report, satisfying the ruling's "boot
+  banner echoing the effective posture" requirement; corrected the
+  `docs/deploy/enterprise-federation.env` comment that (pre-fix) claimed
+  a banner that did not exist. Also folded in: the peer-enrollment /
+  per-message-sig / per-message-nonce / sync-trust-peer /
+  trust-body-agent-id checks now call the REAL production reader
+  functions (`require_sig`/`require_nonce`/`sync_trust_peer_bypass`/
+  `trust_body_agent_id_bypass`) instead of re-deriving grammar locally,
+  closing a false-red/false-green class where a re-derived helper
+  disagreed with the live gate's case-sensitivity or exact-match
+  semantics; dropped a misleading `[encryption].at_rest = true`
+  remediation parenthetical that could never actually clear the
+  encrypt-at-rest FAIL; documented the `**`-vs-`prefix/**` glob
+  reconciliation in the module docs; hoisted the
+  `AI_MEMORY_PERMISSIONS_MODE` env-name literal to
+  `AppConfig::ENV_PERMISSIONS_MODE`; added a `qual_10` module-size
+  ceiling row for the new module.
 
 ### Fixed (data integrity)
 

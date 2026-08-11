@@ -1055,6 +1055,55 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             );
         }
     }
+    // v1.0.0 §5.3 cutline ruling B2 fix (Fable review, 2026-08-11) — the
+    // boot banner echoing the EFFECTIVE enterprise-federation posture,
+    // required by the ruling's own opening sentence ("with a boot banner
+    // echoing the effective posture") and its cited precedent ("verify
+    // the banner, never infer from env"). Pre-fix this posture shipped
+    // profile+validation+refusal but NO banner: the asi-hard block above
+    // covers only the 17 generic asi-hard knobs, none of the
+    // federation-specific additions (the four FED_REQUIRE_*, trust
+    // domain, fingerprints, attestation, permissions mode, fail-open,
+    // encrypt-at-rest). `evaluate` is pure/read-only (see its own doc
+    // comment), so calling it here in the async runtime — alongside the
+    // asi-hard report above, NOT in the synchronous pre-runtime phase —
+    // is safe; the pre-runtime `enforce_at_boot_pre_runtime` call in
+    // `main.rs` already ran the REFUSAL half of this same evaluation.
+    // Gated on the opt-in require-flag so a deployment that never opted
+    // into §5.3 certification gets a byte-identical boot log.
+    if crate::enterprise_federation_posture::enterprise_federation_posture_required() {
+        let checks = crate::enterprise_federation_posture::evaluate(app_config);
+        let mut fail_count = 0usize;
+        for c in &checks {
+            if c.pass {
+                tracing::info!(
+                    target: crate::enterprise_federation_posture::TRACING_TARGET,
+                    control = %c.control,
+                    required = %c.required,
+                    actual = %c.actual,
+                    "enterprise-federation posture: PASS"
+                );
+            } else {
+                fail_count += 1;
+                tracing::warn!(
+                    target: crate::enterprise_federation_posture::TRACING_TARGET,
+                    control = %c.control,
+                    required = %c.required,
+                    actual = %c.actual,
+                    remediation = %c.remediation,
+                    "enterprise-federation posture: FAIL"
+                );
+            }
+        }
+        tracing::warn!(
+            target: crate::enterprise_federation_posture::TRACING_TARGET,
+            checked = checks.len(),
+            failing = fail_count,
+            "enterprise-federation posture ENGAGED (AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE) \
+             — effective posture logged above; `ai-memory doctor --posture enterprise-federation` \
+             for the full report"
+        );
+    }
     // Seed the process-wide per-agent quota defaults from the resolved
     // `[limits]` config (env `AI_MEMORY_MAX_*` > `[limits]` > compiled
     // default). `ensure_row` / the Postgres quota-row auto-inserts read

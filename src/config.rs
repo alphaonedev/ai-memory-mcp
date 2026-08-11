@@ -7621,6 +7621,13 @@ impl AppConfig {
         }
     }
 
+    /// v1.0.0 §5.3 cutline ruling — hoisted to a named const (was a bare
+    /// literal at this single production `std::env::var` call site);
+    /// `crate::enterprise_federation_posture::evaluate` reuses this const
+    /// rather than re-declaring the env-var-name string (pm-v3.1
+    /// hardcoded-literal-duplication gate).
+    pub const ENV_PERMISSIONS_MODE: &str = "AI_MEMORY_PERMISSIONS_MODE";
+
     /// v0.7.0 K3 — resolve the effective [`PermissionsMode`] consulted
     /// by [`crate::db::enforce_governance`].
     ///
@@ -7643,7 +7650,7 @@ impl AppConfig {
     ///    set `[permissions].mode = "advisory"` explicitly.
     #[must_use]
     pub fn effective_permissions_mode(&self) -> PermissionsMode {
-        if let Ok(raw) = std::env::var("AI_MEMORY_PERMISSIONS_MODE") {
+        if let Ok(raw) = std::env::var(Self::ENV_PERMISSIONS_MODE) {
             match raw.to_ascii_lowercase().as_str() {
                 "enforce" => return PermissionsMode::Enforce,
                 "advisory" => return PermissionsMode::Advisory,

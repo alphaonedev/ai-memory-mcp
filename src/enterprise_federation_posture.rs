@@ -59,6 +59,18 @@
 //!   `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` (env-table row #39,
 //!   [`crate::daemon_runtime::governance_fail_open_on_error`]), checked
 //!   here directly.
+//!
+//! A third reconciliation, on the `**` allow-all-glob check (§5.3's "no
+//! peer scope's `allowed_namespaces` contains a bare `**` allow-all
+//! glob"): the check below matches ONLY the literal string `"**"`,
+//! mirroring `crate::federation::peer_attestation`'s own `glob_match`,
+//! for which a bare `"**"` is the SOLE unconditional match-any-namespace
+//! token (#1902 — a bare `*` matches exactly one top-level segment, NOT
+//! "everything", to avoid silently widening a `["*"]` allowlist to the
+//! whole tree). A scoped pattern like `"team-x/**"` PASSES this check —
+//! it is a deliberate, prefix-CONFINED allow-all under `team-x/`, not
+//! the substrate-wide allow-all `§5.3` forbids, so flagging it would be
+//! a false positive against a legitimate per-team wildcard scope.
 
 use crate::config::{AppConfig, PermissionsMode};
 use crate::federation::peer_attestation::{PEER_ATTESTATION_ENV, PeerScope};
@@ -78,6 +90,14 @@ pub const POSTURE_ENTERPRISE_FEDERATION: &str = "enterprise-federation";
 /// (`AI_MEMORY_REQUIRE_WITNESS`, `AI_MEMORY_REQUIRE_ROLLBACK_CHECK`, …).
 pub const ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE: &str =
     "AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE";
+
+/// `tracing` target for the §5.3 boot-banner rows
+/// (`daemon_runtime::run`, the B2 fix — see module docs). Hoisted to a
+/// named const (pm-v3.1 hardcoded-literal-duplication gate: the target
+/// string is used at 3 call sites — one per PASS row, FAIL row, and the
+/// closing ENGAGED summary) so the banner and any future consumer (e.g.
+/// a `RUST_LOG` filter target) share one spelling.
+pub const TRACING_TARGET: &str = "security.posture.enterprise_federation";
 
 /// One §5.3 requirement's evaluated outcome.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -130,38 +150,6 @@ fn is_truthy(v: &str) -> bool {
     )
 }
 
-/// The house falsy grammar (`0`/`false`/`no`/`off`) used by the
-/// default-ON `AI_MEMORY_FED_REQUIRE_*` knobs (env-table rows #29/#30):
-/// UNSET or any non-falsy value stays strict; only an EXPLICIT falsy
-/// token opts out.
-fn is_falsy(v: &str) -> bool {
-    matches!(
-        v.trim().to_ascii_lowercase().as_str(),
-        "0" | "false" | "no" | "off"
-    )
-}
-
-/// A default-ON `AI_MEMORY_FED_REQUIRE_*`-shaped env: compliant when
-/// unset OR set to anything that is not an explicit falsy token.
-fn default_on_env_compliant(env: &str) -> (bool, String) {
-    match std::env::var(env) {
-        Ok(v) if is_falsy(&v) => (false, v),
-        Ok(v) => (true, v),
-        Err(_) => (true, MSG_UNSET_DEFAULTS_STRICT.to_string()),
-    }
-}
-
-/// A "must be UNSET" env: compliant when absent OR set to a non-truthy
-/// value (mirrors `crate::tls::plaintext_peers_allowed`'s own
-/// disposition — an unrecognised token never silently opens the hatch).
-fn must_be_unset_env(env: &str) -> (bool, String) {
-    match std::env::var(env) {
-        Ok(v) if is_truthy(&v) => (false, v),
-        Ok(v) => (true, format!("{v:?} (not truthy)")),
-        Err(_) => (true, "(unset)".to_string()),
-    }
-}
-
 /// Evaluate the RESOLVED process configuration against the certified
 /// enterprise-federation posture. Pure / read-only: mutates no env var,
 /// touches no database. Safe to call from any live process (the
@@ -203,19 +191,55 @@ pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
          hard floor; see `src/security_profile.rs::KNOBS`",
     ));
 
-    // ---- 3. AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT ------------------
+    // ---- 3. AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT (COMBINED with the
+    // AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS escape hatch) -------------
+    // B1 fix (Fable review, 2026-08-11): the LIVE receive gate on both
+    // `/sync/push` and `/sync/since` is the combined predicate
+    // `require_peer_enrollment_enabled() && !allow_unenrolled_peers_enabled()`
+    // (`src/handlers/federation_signing_check.rs:1614,1935`), NOT
+    // `require_peer_enrollment_enabled()` alone. Checking only the first
+    // half was a false-green: a fully-hardened env with
+    // `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1` set made the daemon accept
+    // unenrolled-peer attribution on BOTH receive lanes while this check
+    // reported PASS. Reuses both real gate functions verbatim.
+    let peer_enrollment_required =
+        crate::handlers::federation_signing_check::require_peer_enrollment_enabled();
+    let unenrolled_peers_allowed =
+        crate::handlers::federation_signing_check::allow_unenrolled_peers_enabled();
     out.push(check(
         crate::handlers::federation_signing_check::REQUIRE_PEER_ENROLLMENT_ENV,
-        "not explicitly disabled (peer enrollment required)",
-        std::env::var(crate::handlers::federation_signing_check::REQUIRE_PEER_ENROLLMENT_ENV)
-            .unwrap_or_else(|_| MSG_UNSET_DEFAULTS_STRICT.to_string()),
-        crate::handlers::federation_signing_check::require_peer_enrollment_enabled(),
-        "unset AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT or set it to 1",
+        "not explicitly disabled (peer enrollment required) AND \
+         AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS not truthy (no rollout hatch open)",
+        format!(
+            "{}={:?}; {}={:?}",
+            crate::handlers::federation_signing_check::REQUIRE_PEER_ENROLLMENT_ENV,
+            std::env::var(crate::handlers::federation_signing_check::REQUIRE_PEER_ENROLLMENT_ENV)
+                .unwrap_or_else(|_| MSG_UNSET_DEFAULTS_STRICT.to_string()),
+            crate::handlers::federation_signing_check::ALLOW_UNENROLLED_PEERS_ENV,
+            std::env::var(crate::handlers::federation_signing_check::ALLOW_UNENROLLED_PEERS_ENV)
+                .unwrap_or_else(|_| "(unset)".to_string()),
+        ),
+        peer_enrollment_required && !unenrolled_peers_allowed,
+        "unset AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT (or set it to 1) AND unset \
+         AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS",
     ));
 
     // ---- 4. AI_MEMORY_FED_REQUIRE_SIG ------------------------------
-    let (sig_ok, sig_actual) =
-        default_on_env_compliant(crate::federation::signing::REQUIRE_SIG_ENV);
+    // NB1 fix (Fable review, 2026-08-11): call the REAL reader
+    // (`crate::federation::signing::require_sig`, which delegates to the
+    // case-SENSITIVE `receive_auth::env_flag_default_on`) instead of
+    // re-deriving falsy grammar with a lowercasing local helper. The
+    // local `is_falsy` helper lowercased before matching, so e.g.
+    // `AI_MEMORY_FED_REQUIRE_SIG=FALSE` read as non-compliant here while
+    // the live gate (exact-lowercase match only) stayed strict —
+    // fail-closed drift, but WRONG relative to the process's real
+    // behaviour, which is exactly the false-green/false-red class this
+    // module exists to prevent.
+    let (sig_ok, sig_actual) = (
+        crate::federation::signing::require_sig(),
+        std::env::var(crate::federation::signing::REQUIRE_SIG_ENV)
+            .unwrap_or_else(|_| MSG_UNSET_DEFAULTS_STRICT.to_string()),
+    );
     out.push(check(
         crate::federation::signing::REQUIRE_SIG_ENV,
         "not explicitly disabled (per-message Ed25519 signatures required)",
@@ -225,8 +249,12 @@ pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
     ));
 
     // ---- 5. AI_MEMORY_FED_REQUIRE_NONCE -----------------------------
-    let (nonce_ok, nonce_actual) =
-        default_on_env_compliant(crate::federation::signing::REQUIRE_NONCE_ENV);
+    // NB1 fix — same real-reader substitution as check #4.
+    let (nonce_ok, nonce_actual) = (
+        crate::federation::signing::require_nonce(),
+        std::env::var(crate::federation::signing::REQUIRE_NONCE_ENV)
+            .unwrap_or_else(|_| MSG_UNSET_DEFAULTS_STRICT.to_string()),
+    );
     out.push(check(
         crate::federation::signing::REQUIRE_NONCE_ENV,
         "not explicitly disabled (per-message nonce freshness required)",
@@ -248,13 +276,22 @@ pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
     // ---- 7. AI_MEMORY_PERMISSIONS_MODE=enforce ---------------------
     // Ruling §5.3 literal `AI_MEMORY_FED_PERMISSIONS_MODE=enforce`
     // reconciled to the real K3/K9 governance gate (see module docs).
+    // `AppConfig::ENV_PERMISSIONS_MODE` is the hoisted const both this
+    // label and `effective_permissions_mode()` read from (pm-v3.1
+    // hardcoded-literal-duplication gate) — no bare literal here.
     let mode = app_config.effective_permissions_mode();
     out.push(check(
-        "AI_MEMORY_PERMISSIONS_MODE (ruling: AI_MEMORY_FED_PERMISSIONS_MODE)",
+        &format!(
+            "{} (ruling: AI_MEMORY_FED_PERMISSIONS_MODE)",
+            AppConfig::ENV_PERMISSIONS_MODE
+        ),
         "enforce",
         mode.as_str().to_string(),
         mode == PermissionsMode::Enforce,
-        "set AI_MEMORY_PERMISSIONS_MODE=enforce (or [permissions].mode = \"enforce\")",
+        &format!(
+            "set {}=enforce (or [permissions].mode = \"enforce\")",
+            AppConfig::ENV_PERMISSIONS_MODE
+        ),
     ));
 
     // ---- 8. AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=0 --------------
@@ -353,24 +390,32 @@ pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
     ));
 
     // ---- 13. AI_MEMORY_FED_SYNC_TRUST_PEER — MUST BE UNSET ---------
-    let (sync_trust_ok, sync_trust_actual) =
-        must_be_unset_env(crate::federation::peer_attestation::SYNC_TRUST_PEER_ENV);
+    // NB1 fix — call the REAL reader (`peer_attestation::sync_trust_peer_bypass`,
+    // exact-literal `"1"` match, `src/federation/peer_attestation.rs:366`)
+    // instead of the broader local `is_truthy` grammar (`1`/`true`/`yes`/`on`).
+    // The real gate trips ONLY on the literal `1`, so e.g. `=true` never
+    // opens the bypass in production but `must_be_unset_env`'s truthy
+    // grammar would have false-FAILED this check against a compliant env.
+    let sync_trust_bypassed = crate::federation::peer_attestation::sync_trust_peer_bypass();
     out.push(check(
         crate::federation::peer_attestation::SYNC_TRUST_PEER_ENV,
-        "UNSET (or non-truthy)",
-        sync_trust_actual,
-        sync_trust_ok,
+        "UNSET (or not the literal `1` — the real gate's exact-match grammar)",
+        std::env::var(crate::federation::peer_attestation::SYNC_TRUST_PEER_ENV)
+            .map_or_else(|_| "(unset)".to_string(), |v| format!("{v:?}")),
+        !sync_trust_bypassed,
         "unset AI_MEMORY_FED_SYNC_TRUST_PEER",
     ));
 
     // ---- 14. AI_MEMORY_FED_TRUST_BODY_AGENT_ID — MUST BE UNSET -----
-    let (trust_body_ok, trust_body_actual) =
-        must_be_unset_env(crate::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV);
+    // NB1 fix — same real-reader substitution as check #13
+    // (`peer_attestation::trust_body_agent_id_bypass`, exact `"1"` match).
+    let trust_body_bypassed = crate::federation::peer_attestation::trust_body_agent_id_bypass();
     out.push(check(
         crate::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV,
-        "UNSET (or non-truthy)",
-        trust_body_actual,
-        trust_body_ok,
+        "UNSET (or not the literal `1` — the real gate's exact-match grammar)",
+        std::env::var(crate::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV)
+            .map_or_else(|_| "(unset)".to_string(), |v| format!("{v:?}")),
+        !trust_body_bypassed,
         "unset AI_MEMORY_FED_TRUST_BODY_AGENT_ID",
     ));
 
@@ -386,8 +431,13 @@ pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
                 .unwrap_or_else(|_| "(unset)".to_string())
         ),
         sqlcipher_build && encrypt_env_truthy,
-        "rebuild with --features sqlcipher AND set AI_MEMORY_ENCRYPT_AT_REST=1 \
-         (or [encryption].at_rest = true)",
+        // NB3 fix (Fable review, 2026-08-11): the parenthetical
+        // "(or [encryption].at_rest = true)" was dropped — `evaluate`
+        // (matching EVERY production call site of `encryption_enabled`,
+        // not merely this one) passes `config_flag: None`, so setting
+        // `[encryption].at_rest = true` in config.toml would NOT clear
+        // this FAIL; only the env var is a live remediation here.
+        "rebuild with --features sqlcipher AND set AI_MEMORY_ENCRYPT_AT_REST=1",
     ));
 
     // ---- 16. peer URLs https-only ------------------------------------
@@ -484,10 +534,11 @@ mod tests {
     /// source of truth even inside the test cleanup).
     const FED_ENV_VARS: &[&str] = &[
         crate::handlers::federation_signing_check::REQUIRE_PEER_ENROLLMENT_ENV,
+        crate::handlers::federation_signing_check::ALLOW_UNENROLLED_PEERS_ENV,
         crate::federation::signing::REQUIRE_SIG_ENV,
         crate::federation::signing::REQUIRE_NONCE_ENV,
         crate::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
-        "AI_MEMORY_PERMISSIONS_MODE",
+        AppConfig::ENV_PERMISSIONS_MODE,
         crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN,
         crate::federation::identity::trust_bundle::TRUST_DOMAIN_ENV,
         crate::tls::FED_PEER_FINGERPRINTS_ENV,
@@ -569,11 +620,12 @@ mod tests {
         // AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT / _SIG / _NONCE /
         // _PUSH_NAMESPACE_SCOPE / AI_MEMORY_PERMISSIONS_MODE /
         // AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR / _SYNC_TRUST_PEER /
-        // _TRUST_BODY_AGENT_ID / _ALLOW_PLAINTEXT_PEERS are all
-        // deliberately left UNSET — every one of them already defaults
-        // to the certified-compliant state (see each check's
-        // `default_on_env_compliant` / `must_be_unset_env` arm), which
-        // is itself part of what this test proves.
+        // _TRUST_BODY_AGENT_ID / _ALLOW_PLAINTEXT_PEERS /
+        // _ALLOW_UNENROLLED_PEERS are all deliberately left UNSET — every
+        // one of them already defaults to the certified-compliant state
+        // (each check now calls the real production reader function
+        // directly, per the B1/NB1 fixes), which is itself part of what
+        // this test proves.
         fp_file
     }
 
@@ -674,6 +726,62 @@ mod tests {
             crate::handlers::federation_signing_check::REQUIRE_PEER_ENROLLMENT_ENV,
         );
         assert!(!c.pass);
+        assert!(!all_pass(&checks));
+    }
+
+    #[test]
+    fn allow_unenrolled_peers_hatch_open_fails_even_with_enrollment_required() {
+        // B1 (Fable review, 2026-08-11): a fully-hardened env with
+        // AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT left at its strict
+        // default PLUS AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1 made the
+        // LIVE daemon accept unenrolled-peer attribution on BOTH
+        // `/sync/push` and `/sync/since` (the combined predicate in
+        // `federation_signing_check.rs:1614,1935`), while the
+        // pre-fix check #3 (which read only
+        // `require_peer_enrollment_enabled()`) reported PASS — a
+        // false-green. This is the regression test proving the fix:
+        // the same env now FAILS check #3.
+        let _g = env_lock();
+        unsafe {
+            clear_all();
+        }
+        let _cleanup = EnvGuard;
+        let _fp_file = set_fully_hardened_env();
+        unsafe {
+            // Deliberately confirm the strict knob is untouched (unset ->
+            // strict per its own default) so the FAIL is attributable
+            // ONLY to the escape hatch, not to a loosened enrollment knob.
+            std::env::remove_var(
+                crate::handlers::federation_signing_check::REQUIRE_PEER_ENROLLMENT_ENV,
+            );
+            std::env::set_var(
+                crate::handlers::federation_signing_check::ALLOW_UNENROLLED_PEERS_ENV,
+                "1",
+            );
+        }
+        assert!(
+            crate::handlers::federation_signing_check::require_peer_enrollment_enabled(),
+            "precondition: enrollment must still read as required"
+        );
+        assert!(
+            crate::handlers::federation_signing_check::allow_unenrolled_peers_enabled(),
+            "precondition: the escape hatch must be open"
+        );
+        let checks = evaluate(&AppConfig::default());
+        let c = find(
+            &checks,
+            crate::handlers::federation_signing_check::REQUIRE_PEER_ENROLLMENT_ENV,
+        );
+        assert!(
+            !c.pass,
+            "check #3 must FAIL when the unenrolled-peers rollout hatch is open, \
+             even though peer enrollment itself is still required — this is the exact \
+             false-green Fable proved live on the built binary"
+        );
+        assert!(
+            c.actual
+                .contains(crate::handlers::federation_signing_check::ALLOW_UNENROLLED_PEERS_ENV)
+        );
         assert!(!all_pass(&checks));
     }
 
