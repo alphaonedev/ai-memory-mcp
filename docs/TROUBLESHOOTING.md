@@ -323,9 +323,14 @@ disagree on `(title, namespace)` content.
 
 **Fix**: Decide which side is authoritative. On that side, run
 `ai-memory export > snapshot.json`. On the other side,
-`ai-memory import --trust-source < snapshot.json`. The upsert on
-`(title, namespace)` will overwrite the divergent copies with the
-authoritative ones.
+`ai-memory import --trust-source --on-conflict merge < snapshot.json`.
+`--on-conflict merge` is the disposition that OVERWRITES a divergent
+copy: the default `version` never clobbers — it keeps the existing row,
+and for a same-`id` row it is an idempotent no-op (so the default would
+leave the divergent copies untouched). `--trust-source` only preserves
+the embedded `agent_id`; it does not change the conflict disposition.
+The `merge` upsert on `(title, namespace)` overwrites the divergent
+copies with the authoritative ones.
 
 Per-namespace conflict resolution is an open work item (sync-phase
 Layer 2b).
