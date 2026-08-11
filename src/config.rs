@@ -464,7 +464,13 @@ impl TierConfig {
                 capability_issuers: Some(active_capability_config().issuer_count()),
             },
             hooks: CapabilityHooks::default(),
-            compaction: CapabilityCompaction::planned(),
+            // v1.0.0 #2400 — compaction SHIPPED at v0.8.0 (#1749 live
+            // `ConsolidationPass`); report `shipped` carrying the runtime
+            // enabled state (`AI_MEMORY_COMPACTION_ENABLED` #81, seeded at boot)
+            // instead of the pre-#2400 `planned()` under-claim. `enabled`
+            // defaults `false` in an unseeded raw-library / test process, which
+            // is also the compiled config default.
+            compaction: CapabilityCompaction::shipped(crate::config::compaction_enabled()),
             approval: CapabilityApproval {
                 pending_requests: 0,
                 deferred_audit_dlq_size: 0,
@@ -1116,6 +1122,30 @@ impl CapabilityCompaction {
     pub fn planned() -> Self {
         Self {
             status: PlannedFeature::planned("v0.8+"),
+            interval_minutes: None,
+            last_run_at: None,
+            last_run_stats: None,
+        }
+    }
+
+    /// v1.0.0 #2400 — the consolidation compaction subsystem SHIPPED at
+    /// v0.8.0 (#1749: the live `crate::curator::compaction::ConsolidationPass`
+    /// hard-DELETE-merge consolidator). The capabilities surface previously
+    /// reported [`Self::planned`] — a defaults-lie under-claim that told
+    /// operators reading `memory_capabilities` the feature was still on the
+    /// roadmap. This reports `planned = false` at the shipping version with
+    /// `enabled` carrying the runtime activation state (opt-in via
+    /// `AI_MEMORY_COMPACTION_ENABLED` / `[curator.compaction].enabled`, env
+    /// #81), mirroring the [`CapabilityTranscripts::shipped`] precedent
+    /// (#1324) exactly.
+    #[must_use]
+    pub fn shipped(enabled: bool) -> Self {
+        Self {
+            status: PlannedFeature {
+                planned: false,
+                version: crate::PKG_VERSION.to_string(),
+                enabled,
+            },
             interval_minutes: None,
             last_run_at: None,
             last_run_stats: None,
@@ -5811,6 +5841,35 @@ pub fn consolidate_tombstone_sources_enabled() -> bool {
         && CONSOLIDATE_TOMBSTONE_SOURCES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// v1.0.0 #2400 — process-wide REPORT-ONLY snapshot of the resolved curator
+/// compaction-enabled state (`AI_MEMORY_COMPACTION_ENABLED` env >
+/// `[curator.compaction].enabled` > compiled default `false`), seeded once at
+/// boot from [`AppConfig::resolve_compaction_enabled`]. Read ONLY by the
+/// `memory_capabilities` reporter ([`TierConfig::capabilities_with_resolved`])
+/// so the surface can carry the shipped-feature `enabled` bit without an
+/// `AppConfig` handle in scope. Unlike [`LINEAGE_DAG`] this flag drives NO
+/// storage / consolidate BEHAVIOR — the live consolidator reads
+/// `CuratorConfig.compaction.enabled`, threaded independently at the curator
+/// build sites — so seeding it unconditionally at boot is safe (no test
+/// isolation concern). Default `false` (byte-identical: "shipped, not enabled")
+/// until seeded, which is also the compiled config default.
+static COMPACTION_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Seed the process-wide compaction-enabled report flag (#2400). Called once at
+/// boot from [`AppConfig::resolve_compaction_enabled`].
+pub fn set_compaction_enabled(enabled: bool) {
+    COMPACTION_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether curator compaction is enabled process-wide, for the capabilities
+/// report (#2400). Defaults to `false` ("shipped, not enabled") until seeded by
+/// [`set_compaction_enabled`].
+#[must_use]
+pub fn compaction_enabled() -> bool {
+    COMPACTION_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `[permissions]` block in `config.toml`. Carries the gate's
 /// enforcement posture and (v0.7.0 K9) the declarative rule list
 /// the unified [`crate::permissions::Permissions::evaluate`]
@@ -6593,6 +6652,99 @@ impl AuditComplianceConfig {
         .flatten()
         .filter(|p| p.applied.unwrap_or(false))
     }
+
+    /// Iterate over every preset whose `applied = true`, paired with its
+    /// wire name (`soc2` / `hipaa` / `gdpr` / `fedramp`).
+    fn applied_presets_named(&self) -> impl Iterator<Item = (&'static str, &CompliancePreset)> {
+        [
+            ("soc2", self.soc2.as_ref()),
+            ("hipaa", self.hipaa.as_ref()),
+            ("gdpr", self.gdpr.as_ref()),
+            ("fedramp", self.fedramp.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(name, p)| p.map(|p| (name, p)))
+        .filter(|(_, p)| p.applied.unwrap_or(false))
+    }
+
+    /// v1.0.0 #2401 — enumerate the compliance-preset fields that are
+    /// ADVERTISED (an `applied` preset sets the flag `true`) but whose real
+    /// enforcement gate is NOT active in this process, so a boot WARN can name
+    /// each unenforced claim explicitly. This is the fix for the
+    /// compliance-defaults-lie where the HIPAA/GDPR preset templates print
+    /// `encrypt_at_rest = true` / `pseudonymize_actors = true` while the
+    /// substrate performs neither — a bet-the-farm overclaim on a compliance
+    /// surface.
+    ///
+    /// `at_rest_content_encryption_active` is the live at-rest content-encryption
+    /// gate (production passes [`crate::encryption::encryption_enabled`]`(None)`,
+    /// the exact signal the storage write path consults); it is threaded in so
+    /// this pure core is unit-testable without touching process env or the
+    /// build's `sqlcipher` feature.
+    ///
+    /// - `encrypt_at_rest = true` is unenforced when at-rest content encryption
+    ///   is NOT active (env #37 `AI_MEMORY_ENCRYPT_AT_REST` + `--features
+    ///   sqlcipher`).
+    /// - `pseudonymize_actors = true` is ALWAYS unenforced at v1.0.0: the knob
+    ///   has NO consumer anywhere in the substrate (reserved / unimplemented),
+    ///   so an `applied` preset asserting it can never be honored this release.
+    ///
+    /// The 5-agent vote (`4d3ea1c5`) resolved the disposition to a loud boot
+    /// WARN (not a hard boot refusal), matching the repo's
+    /// `tls_bind_guard` / first-ship-advisory precedent for a SET-but-
+    /// UNENFORCEABLE posture the operator never explicitly demanded.
+    #[must_use]
+    pub fn unenforced_claims(
+        &self,
+        at_rest_content_encryption_active: bool,
+    ) -> Vec<UnenforcedComplianceClaim> {
+        let mut claims = Vec::new();
+        for (preset, cfg) in self.applied_presets_named() {
+            if cfg.encrypt_at_rest == Some(true) && !at_rest_content_encryption_active {
+                claims.push(UnenforcedComplianceClaim {
+                    preset,
+                    field: "encrypt_at_rest",
+                    does_not:
+                        "the daemon does NOT encrypt memory content at rest — memory content is \
+                         persisted in PLAINTEXT",
+                    remediation:
+                        "build with `--features sqlcipher` AND set AI_MEMORY_ENCRYPT_AT_REST=1 \
+                         (env #37), or remove `encrypt_at_rest` from the preset",
+                });
+            }
+            if cfg.pseudonymize_actors == Some(true) {
+                claims.push(UnenforcedComplianceClaim {
+                    preset,
+                    field: "pseudonymize_actors",
+                    does_not:
+                        "the daemon does NOT pseudonymize actor ids — the knob is RESERVED and has \
+                         no consumer at v1.0.0, so audit actor ids are recorded verbatim",
+                    remediation:
+                        "remove `pseudonymize_actors` from the preset; do not rely on it for \
+                         compliance until a future release implements it",
+                });
+            }
+        }
+        claims
+    }
+}
+
+/// v1.0.0 #2401 — one ADVERTISED-but-UNENFORCED compliance-preset field,
+/// surfaced by [`AuditComplianceConfig::unenforced_claims`] so the boot path can
+/// emit a loud, unmissable WARN naming exactly what an `applied` preset claims
+/// that the running daemon does NOT actually perform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnenforcedComplianceClaim {
+    /// The preset wire name that carries the unenforced field
+    /// (`soc2` / `hipaa` / `gdpr` / `fedramp`).
+    pub preset: &'static str,
+    /// The `CompliancePreset` field that is advertised but unenforced.
+    pub field: &'static str,
+    /// A plain statement of what the daemon does NOT do, despite the claim.
+    pub does_not: &'static str,
+    /// The operator-actionable remediation (enable the real gate, or drop the
+    /// unenforced claim).
+    pub remediation: &'static str,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -6601,11 +6753,21 @@ pub struct CompliancePreset {
     pub retention_days: Option<u32>,
     pub redact_content: Option<bool>,
     pub attestation_cadence_minutes: Option<u32>,
-    /// Reserved for compliance contexts that mandate at-rest crypto.
-    /// HIPAA preset surfaces this so operators can pair audit with
-    /// `--features sqlcipher` for end-to-end at-rest encryption.
+    /// Enforcement-gated CLAIM of at-rest content encryption — NOT a switch
+    /// (#2401). This field has no consumer that turns encryption on; at-rest
+    /// content encryption is active ONLY under `--features sqlcipher` +
+    /// `AI_MEMORY_ENCRYPT_AT_REST=1` (env #37,
+    /// [`crate::encryption::encryption_enabled`]). When an `applied` preset sets
+    /// this `true` while that gate is inactive,
+    /// [`AuditComplianceConfig::unenforced_claims`] flags it and the boot path
+    /// emits a loud WARN — the preset must not silently advertise a control the
+    /// daemon does not perform.
     pub encrypt_at_rest: Option<bool>,
-    /// GDPR-style actor pseudonymization toggle. Reserved for v0.7+.
+    /// RESERVED / NOT IMPLEMENTED at v1.0.0 (#2401). The GDPR-style
+    /// actor-pseudonymization toggle has NO consumer anywhere in the substrate —
+    /// audit actor ids are recorded verbatim regardless of this flag. An
+    /// `applied` preset that sets it `true` is ALWAYS flagged by
+    /// [`AuditComplianceConfig::unenforced_claims`] and boots with a loud WARN.
     pub pseudonymize_actors: Option<bool>,
 }
 
@@ -8947,13 +9109,20 @@ impl AppConfig {
 # applied = false
 # retention_days = 2190
 # redact_content = true
-# encrypt_at_rest = true           # pair with --features sqlcipher
+# # encrypt_at_rest is an ENFORCEMENT-GATED CLAIM, not a switch (#2401): it does
+# # NOT turn on at-rest encryption. That requires --features sqlcipher AND
+# # AI_MEMORY_ENCRYPT_AT_REST=1 (env #37); an applied preset asserting it without
+# # the gate emits a loud boot WARN and content is stored PLAINTEXT.
+# # encrypt_at_rest = true
 #
 # [audit.compliance.gdpr]
 # applied = false
 # retention_days = 1095
 # redact_content = true
-# pseudonymize_actors = true       # reserved for v0.7+
+# # pseudonymize_actors is RESERVED / NOT IMPLEMENTED at v1.0.0 (#2401): the knob
+# # has no consumer, actor ids are recorded verbatim, and an applied preset
+# # asserting it emits a loud boot WARN. Do not rely on it for compliance.
+# # pseudonymize_actors = true
 #
 # [audit.compliance.fedramp]
 # applied = false
@@ -9270,10 +9439,11 @@ mod tests {
             );
         }
 
-        // compaction zero-state: planned, not enabled, optional fields omitted
-        assert_eq!(val["compaction"]["planned"], true);
+        // compaction zero-state (#2400): SHIPPED (v0.8.0 #1749), not enabled,
+        // optional fields omitted. planned=false at the current package version.
+        assert_eq!(val["compaction"]["planned"], false);
         assert_eq!(val["compaction"]["enabled"], false);
-        assert_eq!(val["compaction"]["version"], "v0.8+");
+        assert_eq!(val["compaction"]["version"], env!("CARGO_PKG_VERSION"));
         assert!(
             val["compaction"].get("interval_minutes").is_none(),
             "Option::None values must be skipped in serialization"

@@ -189,9 +189,15 @@ fn cap_v2_omits_dropped_fields_in_v2_response() {
     assert_eq!(val["features"]["memory_reflection"]["planned"], false);
     assert_eq!(val["features"]["memory_reflection"]["enabled"], true);
     assert_eq!(val["features"]["memory_reflection"]["version"], "v0.7.0");
-    assert_eq!(val["compaction"]["planned"], true);
+    // v1.0.0 #2400 — compaction SHIPPED at v0.8.0 (#1749 live `ConsolidationPass`);
+    // the capabilities surface now reports `shipped` (planned=false, at the
+    // current package version) carrying the runtime enabled state, instead of the
+    // pre-#2400 `planned=true, version="v0.8+"` under-claim. `enabled` is `false`
+    // here because compaction is opt-in (`AI_MEMORY_COMPACTION_ENABLED` #81) and
+    // this build path is unseeded.
+    assert_eq!(val["compaction"]["planned"], false);
     assert_eq!(val["compaction"]["enabled"], false);
-    assert_eq!(val["compaction"]["version"], "v0.8+");
+    assert_eq!(val["compaction"]["version"], env!("CARGO_PKG_VERSION"));
     // v0.7.0 #1324 — transcripts substrate shipped at v0.7.0
     // (zstd-3 BLOB store + memory_replay tool). Capability flag now
     // reads `planned: false, enabled: false` at zero-state.

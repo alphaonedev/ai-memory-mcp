@@ -10529,11 +10529,12 @@ async fn http_capabilities_v2_schema_includes_all_blocks() {
     assert!(v["hooks"]["registered_count"].is_number());
     assert!(v["hooks"].get("by_event").is_none());
 
-    // compaction: planned-feature shape
+    // compaction: #2400 shipped-feature shape (v0.8.0 #1749); planned=false at
+    // the current package version, enabled reflects the opt-in runtime state.
     assert!(v["compaction"].is_object());
-    assert_eq!(v["compaction"]["planned"], true);
+    assert_eq!(v["compaction"]["planned"], false);
     assert_eq!(v["compaction"]["enabled"], false);
-    assert_eq!(v["compaction"]["version"], "v0.8+");
+    assert_eq!(v["compaction"]["version"], env!("CARGO_PKG_VERSION"));
 
     // approval: pending_requests live, no subscribers/timeout
     assert!(v["approval"].is_object());

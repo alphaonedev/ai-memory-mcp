@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed (cert truthfulness — published-claims reconciliation)
 
+- **A HIPAA/GDPR compliance preset no longer boots SILENT while advertising
+  at-rest encryption / actor pseudonymization it does not perform**
+  ([#2401](https://github.com/alphaonedev/ai-memory-mcp/issues/2401);
+  substrate-blocking compliance defaults-lie). `CompliancePreset.encrypt_at_rest`
+  and `.pseudonymize_actors` (`src/config.rs`) had ZERO consumers, yet the
+  shipped preset templates + `docs/CONFIG_SCHEMA.md` printed
+  `encrypt_at_rest = true` / `pseudonymize_actors = true` — so an `applied`
+  HIPAA/GDPR preset booted claiming controls the substrate never ran (the exact
+  bet-the-farm overclaim on a compliance surface). The boot path now FAILS LOUD:
+  `AuditComplianceConfig::unenforced_claims` detects an `applied` preset that
+  advertises `encrypt_at_rest` while the real at-rest content-encryption gate
+  (`crate::encryption::encryption_enabled(None)` — `--features sqlcipher` +
+  `AI_MEMORY_ENCRYPT_AT_REST=1`, env #37) is inactive, OR that advertises
+  `pseudonymize_actors` at all (RESERVED / no consumer at v1.0.0), and
+  `daemon_runtime::run` emits one unmissable structured WARN (`tracing` target
+  `compliance.unenforced`) per unenforced field naming the preset, exactly what
+  the daemon does NOT do, and the remediation. The disposition (loud WARN, not a
+  hard boot refusal) was resolved by a 5-agent adversarial vote (`4d3ea1c5`,
+  3–2 for WARN) matching the repo's `tls_bind_guard` / first-ship-advisory
+  precedent for a set-but-unenforceable posture the operator never explicitly
+  demanded. `docs/CONFIG_SCHEMA.md` + the embedded config template + the
+  `CompliancePreset` field docs now describe both fields as enforcement-gated
+  claims, not switches. Regression: `tests/compliance_capability_truth_2400_2401.rs`.
+- **`memory_capabilities` no longer under-claims compaction as `planned` — it
+  SHIPPED at v0.8.0** ([#2400](https://github.com/alphaonedev/ai-memory-mcp/issues/2400);
+  capability-truth). The capabilities surface reported
+  `compaction = {planned: true, version: "v0.8+"}` while the destructive
+  consolidator has been live since #1749 (`crate::curator::compaction::ConsolidationPass`).
+  It now reports `shipped` — `planned: false` at the current package version —
+  carrying the runtime `enabled` state (opt-in via
+  `AI_MEMORY_COMPACTION_ENABLED`, env #81), mirroring the `CapabilityTranscripts::shipped`
+  precedent. A process-wide report-only flag (`config::{set_compaction_enabled,
+  compaction_enabled}`) is seeded at boot from
+  `AppConfig::resolve_compaction_enabled` (`#[cfg(not(test))]`-gated for test
+  isolation, the lineage-DAG-seed precedent) so the surface carries the resolved
+  enablement without an `AppConfig` handle in scope; it drives NO storage
+  behavior. Capability SSOT tests (`tests/capabilities_v2.rs`, `src/mcp/mod.rs`,
+  `src/config.rs`, `src/handlers/tests.rs`) reconciled in lockstep. Regression:
+  `tests/compliance_capability_truth_2400_2401.rs`.
 - **The published LongMemEval keyword headline figures are now MEASURED on
   the v1.0.0 binary, not carried over from the v0.7.0 run**
   ([#2888](https://github.com/alphaonedev/ai-memory-mcp/issues/2888); cert

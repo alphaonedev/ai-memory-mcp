@@ -1154,6 +1154,50 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
     // (serve / mcp / CLI) before any write, mirroring the secret-screen
     // seed above.
     crate::config::set_active_capability_config(app_config.load_capability_config());
+    // v1.0.0 #2400 — seed the process-wide REPORT-ONLY compaction-enabled flag
+    // from the resolved `[curator.compaction]` config (env
+    // `AI_MEMORY_COMPACTION_ENABLED` #81 > section > compiled `false`). Read
+    // ONLY by the `memory_capabilities` reporter so it can carry the
+    // shipped-feature `enabled` bit; drives NO storage/consolidate behavior (the
+    // live consolidator reads `CuratorConfig.compaction.enabled`, threaded
+    // independently at the curator build sites). `#[cfg(not(test))]`-gated for
+    // TEST ISOLATION ONLY, mirroring the lineage-DAG seed above — the lib's own
+    // `cargo test --lib` build skips it so a `run()` dispatch test cannot flip
+    // the atomic under a concurrent capabilities unit test; the production
+    // binary and every `tests/` integration test exercise the real seed.
+    #[cfg(not(test))]
+    crate::config::set_compaction_enabled(app_config.resolve_compaction_enabled());
+    #[cfg(test)]
+    let _ = app_config.resolve_compaction_enabled();
+    // v1.0.0 #2401 — fail-LOUD on a compliance-preset defaults-lie. An `applied`
+    // SOC2/HIPAA/GDPR/FedRAMP preset that sets `encrypt_at_rest = true` or
+    // `pseudonymize_actors = true` while the real enforcement gate is NOT active
+    // used to boot SILENT while the docs + preset templates advertised the
+    // control — the exact bet-the-farm overclaim on a compliance surface. Emit
+    // one unmissable, structured boot WARN per unenforced field naming the
+    // preset, exactly what the daemon does NOT do, and the operator-actionable
+    // remediation. Disposition (WARN, not hard-refuse) resolved by the 5-agent
+    // vote (`4d3ea1c5`): matches the repo's `tls_bind_guard` /
+    // first-ship-advisory precedent for a SET-but-UNENFORCEABLE posture the
+    // operator never explicitly demanded. The `encrypt_at_rest` real gate is
+    // `crate::encryption::encryption_enabled(None)` — the exact signal the
+    // storage write path consults for at-rest content sealing.
+    if let Some(compliance) = app_config.effective_audit().compliance.as_ref() {
+        let at_rest_active = crate::encryption::encryption_enabled(None);
+        for claim in compliance.unenforced_claims(at_rest_active) {
+            tracing::warn!(
+                target: "compliance.unenforced",
+                preset = claim.preset,
+                field = claim.field,
+                "COMPLIANCE PRESET OVERCLAIM — [audit.compliance.{preset}].{field} = true is \
+                 ADVERTISED but NOT ENFORCED: {does_not}. Remediation: {remediation}.",
+                preset = claim.preset,
+                field = claim.field,
+                does_not = claim.does_not,
+                remediation = claim.remediation,
+            );
+        }
+    }
     // #1604 — seed the process-wide rerank input-sequence cap from the
     // resolved `[reranker]` config (env `AI_MEMORY_RERANK_MAX_SEQ` >
     // `[reranker].max_seq_tokens` > compiled default). Every subsequent

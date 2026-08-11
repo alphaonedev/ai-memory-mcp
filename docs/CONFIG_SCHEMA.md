@@ -290,10 +290,12 @@ retention_days              = 90      # purge/verify horizon; compliance presets
   [audit.compliance.hipaa]
   applied                     = false
   retention_days              = 2190    # 6 years
-  encrypt_at_rest             = true    # pair with --features sqlcipher
+  # encrypt_at_rest is an ENFORCEMENT-GATED CLAIM, not a switch (see below).
+  # encrypt_at_rest           = true
   [audit.compliance.gdpr]
   applied                     = false
-  pseudonymize_actors         = true
+  # pseudonymize_actors is RESERVED / NOT IMPLEMENTED at v1.0.0 (see below).
+  # pseudonymize_actors       = true
   [audit.compliance.fedramp]
   applied                     = false
   attestation_cadence_minutes = 15
@@ -305,6 +307,33 @@ Each `[audit.compliance.<preset>]` table is a `CompliancePreset`:
 `pseudonymize_actors`. `AuditConfig::effective_retention_days()` and
 `effective_attestation_cadence_minutes()` resolve the strictest active
 policy.
+
+**`encrypt_at_rest` and `pseudonymize_actors` are enforcement-gated
+claims — the preset does NOT turn them on (#2401).** Setting either
+`true` on an `applied` preset does not, by itself, make the daemon
+perform the control:
+
+- `encrypt_at_rest = true` records the *intent* to encrypt memory
+  content at rest, but at-rest content encryption is only ACTIVE when
+  the binary is built with `--features sqlcipher` **and**
+  `AI_MEMORY_ENCRYPT_AT_REST=1` is set (env #37). Absent that gate,
+  memory content is persisted in PLAINTEXT.
+- `pseudonymize_actors = true` is **RESERVED and has no consumer at
+  v1.0.0** — audit actor ids are recorded verbatim regardless of this
+  flag. Do not rely on it for compliance until a future release
+  implements it.
+
+To keep the substrate from advertising a control it does not perform,
+an `applied` preset that sets either field `true` while the real gate
+is inactive emits a **loud boot WARN** (`tracing` target
+`compliance.unenforced`) naming the preset, the unenforced field, what
+the daemon does NOT do, and the remediation — it does not silently
+boot. The disposition (WARN, not a hard boot refusal) was resolved by
+the 5-agent adversarial vote (`4d3ea1c5`), matching the substrate's
+`tls_bind_guard` / first-ship-advisory precedent for a set-but-
+unenforceable posture. Only `retention_days` and
+`attestation_cadence_minutes` are actually consumed by the preset
+resolver today.
 
 ### `[transcripts]` — transcript lifecycle sweeper (I3)
 
