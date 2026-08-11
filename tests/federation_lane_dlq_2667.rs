@@ -615,8 +615,17 @@ async fn pg_namespace_meta_lane_dlq_parity_2667() {
 
 /// #2882 — PERMANENT live-PG coverage of the `PostgresDlqSink` REPLAY path.
 ///
-/// The #2875/#2667 federation DLQ fix's whole value is the
-/// failure -> land -> REPLAY -> converge -> clear round-trip, but before this
+/// This proves the SENDER-SIDE DLQ mechanics — failure -> land -> REPLAY ->
+/// ACK -> clear — against the REAL pg-backed `PostgresDlqSink` /
+/// `PostgresStore`. The mock peer stands in for ANY acking receiver: a
+/// `sync_push` 200 is all the sender-side replay worker needs to clear a row.
+/// It is DELIBERATELY NOT a claim that the `namespace_meta` subcollection
+/// CONVERGES to a postgres RECEIVER — a real postgres receiver never acks
+/// `namespace_meta`, it non-acks it as `unsupported_on_postgres` by design
+/// (#2341/#2464, disclosed PLAN §2.0), so pg-lane convergence of that
+/// subcollection is out of scope here and is NOT what this test exercises.
+/// The #2875/#2667 federation DLQ fix's whole value is that
+/// failure -> land -> REPLAY -> ACK -> clear round-trip, but before this
 /// test that round-trip was only ever exercised through `SqliteDlqSink`
 /// (`namespace_meta_lane_replays_and_clears_2667` above); the pg parity test
 /// (`pg_namespace_meta_lane_dlq_parity_2667`) is `#[ignore]` + LANDING-ONLY, so
@@ -645,8 +654,10 @@ async fn pg_namespace_meta_lane_dlq_parity_2667() {
 ///   3. `replay_once(&cfg, &PostgresDlqSink)` re-POSTs the governance body and
 ///      the `sync_push` 200 acks it -> `PostgresDlqSink::mark_dlq_row_replayed`
 ///      stamps `replayed_at` (the Ack arm), so the pg DLQ row CLEARS. A cleared
-///      row is definitional proof of re-POST + converge, because the Ack arm is
-///      the ONLY path that clears a row (`src/federation/push_dlq.rs`).
+///      row is definitional proof of the sender-side re-POST + ACK round-trip
+///      (the mock peer standing in for any acking receiver — NOT convergence to
+///      a postgres receiver), because the Ack arm is the ONLY path that clears a
+///      row (`src/federation/push_dlq.rs`).
 ///
 /// The DB is SHARED (the coverage suite serialises, but rows persist across
 /// runs), so every assertion is SCOPED to this run's own row via a UNIQUE
@@ -725,14 +736,17 @@ async fn pg_namespace_meta_lane_replays_and_clears_2882() {
     replay_once(&cfg, sink.as_ref()).await;
 
     // (3) proof: this run's pg DLQ row CLEARED (the Ack arm marked it replayed),
-    // which is definitional proof it re-POSTed and the peer converged.
+    // which is definitional proof it re-POSTed and the mock acking receiver
+    // 200-acked it. That is the SENDER-SIDE mechanic (any acking receiver would
+    // do); a real postgres RECEIVER non-acks namespace_meta by design, so this
+    // is NOT pg-lane convergence of the subcollection.
     assert!(
         find_pending_row_by_key(&sink, &expected_key)
             .await
             .is_none(),
         "#2882: PostgresDlqSink replay must CLEAR the governance row once the peer \
          recovers — a cleared row is the Ack arm, the only path that re-POSTs and \
-         converges (a bare landing-only pg test never exercised this)"
+         acks (a bare landing-only pg test never exercised this)"
     );
     assert!(
         peer.hits() > hits_before,
