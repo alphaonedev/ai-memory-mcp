@@ -693,7 +693,10 @@ jobs:
     # SILENTLY on 2026-07-22 (a host-local `git config user.email` drift to
     # an identity GitHub cannot bind to the enrolled `alphaonedev` account,
     # e.g. `Claude Opus 5 <noreply@anthropic.com>`) and NOTHING detected it
-    # — `grep -r sign .github/workflows` found zero hits before this job.
+    # — no workflow gated COMMIT-signing posture before this job (`sign` DOES
+    # appear elsewhere in `.github/workflows` — e.g. `--sign`/product-signing
+    # flags unrelated to git commit identity; the gap was specifically that
+    # nothing checked WHO signed a PR's own commits).
     # The #2486 investigation reproduced the identical defect LIVE on the
     # operating host (this repo's shared `.git/config` carried exactly that
     # override; fixed as part of this issue) and found 787 local commits
@@ -749,7 +752,7 @@ jobs:
       - name: Self-test the gate (#2486 regression evidence)
         # --self-test constructs a throwaway repo with an ephemeral SSH
         # keypair (no network, no dependency on the real enrolled key) and
-        # asserts FOUR shapes: (a) an enrolled identity with a valid
+        # asserts SEVEN shapes: (a) an enrolled identity with a valid
         # signature PASSES; (b) the exact #2486 identity-drift shape
         # (unbound email, unsigned) is REJECTED naming both violations
         # independently; (c) an enrolled email with NO signature at all is
@@ -758,5 +761,14 @@ jobs:
         # is REJECTED (proves verification is against the registry, not
         # merely "a signature exists" — the spoofed-identity case a bare
         # has-a-signature check would miss); (e) an unresolvable commit
-        # range fails CLOSED.
+        # range fails CLOSED; (f) a MISSING enrolled-signers registry fails
+        # CLOSED; (g) an EMPTY (zero-principal) registry fails CLOSED — (f)
+        # and (g) are the explicit `assert_registry_usable` guard (Fable
+        # review finding L5, #2486): the fail-closed-on-registry-loss
+        # property was previously ACCIDENTAL (an artifact of `set -e`/
+        # `pipefail` reacting to grep's no-match exit inside
+        # `enrolled_principals`), not directly asserted, so a future
+        # refactor (e.g. `local x=$(...)`, which swallows the substitution's
+        # exit status, or a stray `|| true`) could have silently flipped it
+        # fail-open with nothing catching the regression.
         run: bash scripts/check-commit-signing-posture.sh --self-test

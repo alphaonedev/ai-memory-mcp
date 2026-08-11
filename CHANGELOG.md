@@ -9,11 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### CI (control-integrity — commit-signing posture gate; #2486)
 
-- **A new CI gate hard-blocks a PR whose own commits are authored/committed
-  under an identity GitHub cannot bind to the enrolled `alphaonedev`
-  account, or whose signature does not verify against the enrolled key**
-  ([#2486](https://github.com/alphaonedev/ai-memory-mcp/issues/2486);
-  [control-integrity]; 5-agent adversarial vote `4d3ea1c5`).
+- **A new CI gate hard-fails the check when a PR's own commits are
+  authored/committed under an identity GitHub cannot bind to the enrolled
+  `alphaonedev` account, or when the signature does not verify against
+  the enrolled key** ([#2486](https://github.com/alphaonedev/ai-memory-mcp/issues/2486);
+  [control-integrity]). Blocking is currently process-level via the
+  Fable review gate; promoting the check itself to a
+  branch-protection-BLOCKING required status check is the tracked
+  follow-up (below).
   Investigation found the commit-signing identity-drift class #2486
   describes is NOT present in the committed `release/v1.0.0` history at
   HEAD (a clean committer-email census across the whole branch found only
@@ -44,19 +47,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would let an unenrolled key sign under a spoofed enrolled email and pass.
   Wired as the `Commit-signing posture gate (#2486)` job in
   `.github/workflows/c8-precheck.yml` (no `needs:`, no job-level `if:`, no
-  `paths:` filter — always runs), with `--self-test` proving four shapes:
+  `paths:` filter — always runs), with `--self-test` proving seven shapes:
   a clean enrolled+signed commit passes; the exact #2486 identity-drift
   shape (unbound email, unsigned) is rejected naming both violations
   independently; an enrolled email with NO signature is rejected
-  (isolates the signature check); and an enrolled email claimed but signed
+  (isolates the signature check); an enrolled email claimed but signed
   with a non-enrolled rogue key is rejected (proves verification is
-  against the registry, not merely "a signature exists"). Declared, dated
+  against the registry, not merely "a signature exists"); an unresolvable
+  commit range fails closed; and — the design's own hardening
+  (below) — a MISSING and an EMPTY enrolled-signers registry each fail
+  closed via an explicit `assert_registry_usable` guard. Declared, dated
   and issue-tracked in `scripts/qc-allowlists/required-contexts-not-required.txt`
   per rule (f) of `scripts/check-required-contexts.sh` — the gate runs
   unconditionally and hard-fails loudly on every PR today; promoting it to
   a branch-protection-BLOCKING required status check needs a live GitHub
   ruleset API mutation (Sensitive-class, operator-gated) and is the tracked
   follow-up, not done here.
+
+  **Design decided by a genuinely-run 5-agent adversarial vote** (protocol
+  memory `4d3ea1c5`; decision RECORD `283434e7-04b1-418c-a1d6-099ccd82de4f`
+  — cite the record for the tally, the protocol memory for the process).
+  5/5 for an enrolled-signer ALLOWLIST over three alternatives (a
+  blocklist of known-bad domains; signature-status-only with no identity
+  registry; no gate, relying solely on the live `required_signatures`
+  ruleset) — L1 security/bypass (88): only the allowlist binds identity to
+  key cryptographically, catching a spoofed-enrolled-email-with-rogue-key
+  self-test shape a signature-status-only check cannot detect and a
+  blocklist cannot prevent; L2 auditability (92): a positive enrollment
+  record answers "who is authorized", closing the exact forensic gap
+  #2486's silent regression needed; L3 maintainability (78): under
+  sole-authority enrollment friction is a feature, and the allowlist is
+  the ONLY option that detects the #2486 class (a signature-status-only
+  check is exactly what #2486 reproduced live — a valid SSH signature
+  under a drifted, unenrolled identity is still non-bad); L4 precedent
+  (92): copies `scripts/check-create-extension-allowlist.sh`'s established
+  "allowlist not denylist" precedent verbatim; L5 failure-mode (90): the
+  allowlist design fails CLOSED on a missing/empty registry while a
+  blocklist fails OPEN on the same condition (empty blocklist = zero
+  violations = silent full-permit, the exact #2486 shape) — chosen
+  `APPROVE_WITH_CHANGES`, folding in L5's own finding that the
+  fail-closed-on-registry-loss property was ACCIDENTAL (riding
+  `set -e`/`pipefail`, not explicitly asserted or self-tested); this PR
+  adds the explicit `assert_registry_usable` guard plus the two
+  self-test cases above so a future refactor cannot silently flip it
+  fail-open.
 
 - **`.github/branch-protection.yml` now documents that the live
   `required_signatures` rule on ruleset `signed-attested-branches`

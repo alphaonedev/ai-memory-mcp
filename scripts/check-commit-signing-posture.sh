@@ -79,6 +79,35 @@ enrolled_principals() {
   grep -vE '^[[:space:]]*(#|$)' "$signers_file" | awk '{print tolower($1)}' | sort -u
 }
 
+# assert_registry_usable SIGNERS_FILE — EXPLICIT fail-closed guard for a
+# missing or empty enrolled-signer registry. This is deliberately NOT left
+# to fall out incidentally from `set -e`/`pipefail` reacting to grep's
+# no-match exit status inside `enrolled_principals` (Fable review finding
+# L5, #2486): that property was real today but ACCIDENTAL — a future
+# refactor of `enrolled_principals` (e.g. `local principals=$(...)`, which
+# swallows the command-substitution exit status per bash's own documented
+# behavior, or an errant `|| true`) could silently flip a missing/empty
+# registry from "every commit rejected" to "every commit accepted", with
+# no test catching the regression because nothing asserted the property
+# directly. This function is the direct, explicit, self-tested assertion:
+# it is the ONLY place this gate's fail-closed-on-missing-registry
+# property is proven, independent of how `enrolled_principals` is
+# implemented.
+assert_registry_usable() {
+  local signers_file="$1"
+  if [ ! -f "$signers_file" ]; then
+    echo "check-commit-signing-posture: ERROR — enrolled-signers registry $signers_file is missing (fail-closed)" >&2
+    return 1
+  fi
+  local principals
+  principals="$(enrolled_principals "$signers_file")"
+  if [ -z "$principals" ]; then
+    echo "check-commit-signing-posture: ERROR — enrolled-signers registry $signers_file has zero enrolled principals (fail-closed)" >&2
+    return 1
+  fi
+  return 0
+}
+
 is_enrolled_principal() {
   local email_lc="$1"
   local principals="$2"
@@ -92,6 +121,10 @@ is_enrolled_principal() {
 check_range() {
   local base="$1" head="$2" signers_file="$3" repo_dir="${4:-$REPO_ROOT}"
   local principals violations=0
+
+  if ! assert_registry_usable "$signers_file"; then
+    return 1
+  fi
   principals="$(enrolled_principals "$signers_file")"
 
   if ! git -C "$repo_dir" rev-parse --verify --quiet "${base}^{commit}" >/dev/null \
@@ -295,10 +328,31 @@ self_test() {
     failed=1
   fi
 
+  # (f) MISSING registry file fails CLOSED — the explicit
+  # assert_registry_usable guard (#2486 Fable finding L5), not an
+  # incidental pipefail. A future refactor that swallows
+  # enrolled_principals' exit status would flip this fail-open silently
+  # if it were not directly asserted here.
+  if check_range "$base_sha" "$clean_sha" "$tmp/does-not-exist-registry.txt" "$repo" >/dev/null 2>&1; then
+    echo "self-test FAILED: a missing enrolled-signers registry did not fail closed" >&2
+    failed=1
+  fi
+
+  # (g) EMPTY registry (present file, zero enrolled principals after
+  # stripping comments/blanks) fails CLOSED — same explicit guard,
+  # proven independently of the missing-file case so a fix that only
+  # checks `[ -f ... ]` cannot pass this self-test.
+  local empty_signers="$tmp/empty_signers.txt"
+  printf '# no principals enrolled\n\n' >"$empty_signers"
+  if check_range "$base_sha" "$clean_sha" "$empty_signers" "$repo" >/dev/null 2>&1; then
+    echo "self-test FAILED: an empty enrolled-signers registry did not fail closed" >&2
+    failed=1
+  fi
+
   if [ "$failed" -ne 0 ]; then
     exit 2
   fi
-  echo "check-commit-signing-posture self-test OK (clean identity passes; #2486 identity-drift, unsigned-but-enrolled, and rogue-key-spoofed-identity shapes all rejected with the correct named violation; unresolvable range fails closed)"
+  echo "check-commit-signing-posture self-test OK: (a) clean enrolled+signed commit passes; (b) #2486 identity-drift shape (unbound email, unsigned) rejected naming both violations; (c) enrolled-but-unsigned commit rejected (signature check isolated from email check); (d) enrolled-email-claimed-with-rogue-key-signature rejected (verification is against the registry, not mere signature presence); (e) unresolvable commit range fails closed; (f) missing enrolled-signers registry fails closed; (g) empty enrolled-signers registry fails closed — (f)/(g) prove the fail-closed-on-registry-loss property is an EXPLICIT assertion (assert_registry_usable), not incidental pipefail behavior."
 }
 
 case "${1:-}" in
