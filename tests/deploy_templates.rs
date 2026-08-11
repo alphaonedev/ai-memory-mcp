@@ -15,6 +15,13 @@
 //! - the `asi-hard` env template selects the real
 //!   [`ai_memory::security_profile::SecurityPosture::AsiHard`] posture and a
 //!   NON-`allow` [`ai_memory::egress::InferenceEgressMode`].
+//!
+//! v1.0.0 §5.3 (3x7 cutline ruling, 2026-08-01) adds the
+//! `enterprise-federation.env` checked-in profile — the ruling's own
+//! "ship as a checked-in profile" requirement — pinned below to the
+//! same `SecurityPosture::AsiHard` selection PLUS the opt-in
+//! [`ai_memory::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE`]
+//! boot-refusing gate.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -62,6 +69,68 @@ fn all_templates_exist_and_parse() {
     assert!(!env.is_empty(), "asi-hard.env must set at least one var");
     // README documents the set.
     assert!(read("README.md").contains("asi-hard"));
+    // v1.0.0 §5.3 — the enterprise-federation checked-in profile exists
+    // and parses.
+    let ef_env = parse_env("enterprise-federation.env");
+    assert!(
+        !ef_env.is_empty(),
+        "enterprise-federation.env must set at least one var"
+    );
+}
+
+#[test]
+fn enterprise_federation_env_selects_asi_hard_and_requires_the_posture_gate() {
+    let env = parse_env("enterprise-federation.env");
+
+    // Selects the real asi-hard posture — the certification is a
+    // SUPERSET of asi-hard, never a replacement for it.
+    let profile = env
+        .get("AI_MEMORY_SECURITY_PROFILE")
+        .expect("enterprise-federation.env must set AI_MEMORY_SECURITY_PROFILE");
+    assert_eq!(
+        SecurityPosture::parse(profile).expect("posture token must parse"),
+        SecurityPosture::AsiHard,
+        "enterprise-federation.env must select the asi-hard posture"
+    );
+    assert!(
+        !pinned_knobs().is_empty(),
+        "asi-hard posture must pin a non-empty knob set"
+    );
+
+    // Engages the opt-in boot-refusing enterprise-federation gate.
+    let required = env
+        .get(ai_memory::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE)
+        .expect("enterprise-federation.env must set the posture-required gate");
+    assert!(
+        matches!(required.as_str(), "1" | "true" | "TRUE" | "yes" | "on"),
+        "the posture-required gate must be set truthy: {required:?}"
+    );
+
+    // Never ships the plaintext-peer hatch open, never ships either
+    // must-be-UNSET federation trust bypass truthy.
+    for env_name in [
+        "AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS",
+        ai_memory::federation::peer_attestation::SYNC_TRUST_PEER_ENV,
+        ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV,
+    ] {
+        if let Some(v) = env.get(env_name) {
+            assert!(
+                !matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+                "{env_name} must never ship truthy in the certified template: {v:?}"
+            );
+        }
+    }
+
+    // Inference-plane egress is hardened (mirrors the asi-hard.env check).
+    let egress = env
+        .get("AI_MEMORY_INFERENCE_EGRESS")
+        .expect("enterprise-federation.env must set AI_MEMORY_INFERENCE_EGRESS");
+    let mode = InferenceEgressMode::parse(egress).expect("egress token must parse");
+    assert_ne!(
+        mode,
+        InferenceEgressMode::Allow,
+        "enterprise-federation.env must NOT leave inference egress at the permissive default"
+    );
 }
 
 #[test]

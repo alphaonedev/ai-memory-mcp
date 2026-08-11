@@ -723,6 +723,15 @@ pub struct DoctorCliArgs {
     /// snapshot.
     #[arg(long)]
     pub hooks: bool,
+    /// v1.0.0 §5.3 (3x7 cutline ruling, 2026-08-01) — machine-check the
+    /// RESOLVED process configuration against a named certified
+    /// posture and report PASS/FAIL per requirement with exact
+    /// remediation. The only recognised value today is
+    /// `enterprise-federation` (`enterprise_federation_posture::POSTURE_ENTERPRISE_FEDERATION`).
+    /// Bypasses the regular health pass (same short-circuit shape as
+    /// `--tokens` / `--hooks`); exits non-zero on any deviation.
+    #[arg(long, value_name = "NAME")]
+    pub posture: Option<String>,
 }
 
 #[derive(Args)]
@@ -1843,6 +1852,21 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             // panics when dropped on a tokio runtime thread, so the
             // entire doctor pass runs inside `spawn_blocking`.
             let db_path_doctor = db_path.clone();
+            // v1.0.0 §5.3 (3x7 cutline ruling) — `--posture <name>` bypasses
+            // the regular health pass entirely (same short-circuit shape as
+            // `--tokens` / `--hooks` below). Machine-checks the RESOLVED
+            // process configuration (env + build features + parsed peer
+            // config) against a named certified posture; never opens the
+            // DB. Exits non-zero on any deviation.
+            if let Some(posture) = a.posture.clone() {
+                let stdout = std::io::stdout();
+                let stderr = std::io::stderr();
+                let mut so = stdout.lock();
+                let mut se = stderr.lock();
+                let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+                let exit = cli::doctor::run_posture(&posture, a.json, &mut out)?;
+                std::process::exit(exit);
+            }
             // v0.6.4-004 — `--tokens` (and its alias `--raw-table`) bypass
             // the regular health pass. Routes to a dedicated tokens
             // reporter that consumes `crate::sizes::tool_sizes()` and
@@ -4371,7 +4395,12 @@ pub fn governance_fail_open_on_error() -> bool {
 
 /// #1455 legacy fail-open opt-out env var — one spelling shared by the
 /// reader above and the operator-facing log hints below (#1558).
-const ENV_GOVERNANCE_FAIL_OPEN: &str = "AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR";
+///
+/// `pub(crate)` (v1.0.0 §5.3 cutline ruling) — reused by
+/// `crate::enterprise_federation_posture::evaluate` so the
+/// `doctor --posture enterprise-federation` report names the exact env
+/// var rather than re-declaring the literal.
+pub(crate) const ENV_GOVERNANCE_FAIL_OPEN: &str = "AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR";
 
 /// #1583 (SEC, MED) — install the substrate `GOVERNANCE_PRE_WRITE`
 /// storage hook (the L1-6 agent-action `memory_write` gate). Extracted

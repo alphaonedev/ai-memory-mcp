@@ -1644,6 +1644,13 @@ pub(super) fn verify_signature_or_reject(
     }
 }
 
+/// Env var gating peer-enrollment enforcement. Hoisted to a named const
+/// (v1.0.0 §5.3 cutline ruling) — was a bare literal at the single
+/// `std::env::var` call site inside [`require_peer_enrollment_enabled`];
+/// `crate::enterprise_federation_posture` reuses this const rather than
+/// re-declaring the env-var-name string.
+pub(crate) const REQUIRE_PEER_ENROLLMENT_ENV: &str = "AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT";
+
 /// v0.8.0 #1789 — `true` when peer-enrollment is required (the v0.8
 /// **secure default**). UNSET — or any non-falsy value — returns `true`:
 /// federation refuses an `X-Peer-Id` without an enrolled Ed25519 key.
@@ -1659,8 +1666,14 @@ pub(super) fn verify_signature_or_reject(
 /// `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` (`allow_unenrolled_peers_enabled`)
 /// preserves a rollout opt-out. The 5-agent vote (memory `4d3ea1c5`)
 /// fixed this flip.
-fn require_peer_enrollment_enabled() -> bool {
-    match std::env::var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT") {
+///
+/// `pub(crate)` (v1.0.0 §5.3 cutline ruling) — reused verbatim by
+/// `crate::enterprise_federation_posture::evaluate` so the
+/// `doctor --posture enterprise-federation` check + the boot gate
+/// share the EXACT same resolution logic as the receive-path gate
+/// instead of re-deriving the truthy/falsy grammar a second time.
+pub(crate) fn require_peer_enrollment_enabled() -> bool {
+    match std::env::var(REQUIRE_PEER_ENROLLMENT_ENV) {
         Ok(v) => {
             let t = v.trim();
             // Explicit falsy values revert to v0.7.x permissive; everything

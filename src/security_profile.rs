@@ -329,6 +329,32 @@ pub fn pinned_knobs() -> Vec<(&'static str, &'static str)> {
     KNOBS.iter().map(|k| (k.env, k.hard_value)).collect()
 }
 
+/// v1.0.0 §5.3 (3x7 cutline ruling, `docs/audit/3x7-v1-cutline-ruling-2026-08-01.md`)
+/// — READ-ONLY enumeration of pinned `asi-hard` knobs currently set BELOW
+/// their hard floor. An unset knob is never reported here (it is
+/// compliant-by-pin-on-boot under [`enforce_at_boot`]; a caller that
+/// needs "is asi-hard actually engaged AND every knob compliant" should
+/// pair this with [`is_asi_hard`]).
+///
+/// Deliberately does **not** mutate the environment — unlike
+/// [`enforce_at_boot`], which may only run in the synchronous
+/// pre-runtime phase of `fn main()` (#2386), this is safe to call from
+/// any live process (e.g. `ai-memory doctor --posture
+/// enterprise-federation`, which reuses this as ONE SSOT for the 17
+/// `asi-hard` pinned knobs rather than re-deriving the KNOBS table).
+///
+/// Returns `(env, current_value, hard_value)` triples.
+#[must_use]
+pub fn asi_hard_below_floor() -> Vec<(&'static str, String, &'static str)> {
+    KNOBS
+        .iter()
+        .filter_map(|k| match std::env::var(k.env) {
+            Ok(current) if !(k.meets_floor)(&current) => Some((k.env, current, k.hard_value)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Enforce the resolved posture at daemon boot.
 ///
 /// Under [`SecurityPosture::Standard`] this is a no-op returning an empty
@@ -693,5 +719,35 @@ mod tests {
                 .any(|(e, v)| *e == crate::tls::FED_ALLOW_PLAINTEXT_PEERS_ENV && v.is_empty()),
             "asi-hard must pin the plaintext-peer hatch OFF (#2477)"
         );
+    }
+
+    #[test]
+    fn asi_hard_below_floor_is_read_only_and_reports_violations() {
+        // v1.0.0 §5.3 cutline ruling — `enterprise_federation_posture`
+        // reuses this accessor as the SSOT for the 17-knob asi-hard set
+        // rather than re-deriving KNOBS; pin its own read-only contract
+        // directly (in addition to the exhaustive coverage the
+        // `enterprise_federation_posture::tests` module gives it
+        // end-to-end).
+        let _g = env_lock();
+        unsafe {
+            clear_all();
+        }
+        let _cleanup = KnobsGuard;
+        // No posture engaged, no knobs set: nothing below floor (an
+        // unset knob is compliant-by-pin-on-boot, never a violation).
+        assert!(asi_hard_below_floor().is_empty());
+
+        unsafe {
+            std::env::set_var("AI_MEMORY_SECRET_SCREEN_MODE", "off");
+        }
+        let below = asi_hard_below_floor();
+        assert_eq!(below.len(), 1, "exactly one knob was loosened: {below:?}");
+        assert_eq!(below[0].0, "AI_MEMORY_SECRET_SCREEN_MODE");
+        assert_eq!(below[0].1, "off");
+        assert_eq!(below[0].2, "refuse");
+        // Read-only: the call itself must never engage/pin the posture.
+        assert!(std::env::var(ENV_SECURITY_PROFILE).is_err());
+        assert!(!is_asi_hard());
     }
 }

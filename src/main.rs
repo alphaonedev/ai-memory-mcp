@@ -77,6 +77,17 @@ fn main() -> Result<()> {
     // `security_profile::runtime_boot_report`.
     ai_memory::security_profile::enforce_at_boot_pre_runtime()?;
 
+    // v1.0.0 §5.3 (3x7 cutline ruling, 2026-08-01) — the opt-in
+    // enterprise-federation certified-posture boot gate. Same #1889
+    // pre-runtime contract as the call directly above (this function is
+    // itself read-only, but is kept in the same synchronous phase for a
+    // single boot-refusal call site). No-op (byte-identical legacy boot)
+    // unless `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE` is truthy.
+    // Runs AFTER the asi-hard enforcement above so it observes the
+    // already-pinned asi-hard knobs. See
+    // `src/enterprise_federation_posture.rs`.
+    ai_memory::enterprise_federation_posture::enforce_at_boot_pre_runtime(&app_config)?;
+
     // v0.7.0 K3 — pin the process-wide governance gate posture before
     // any subcommand has a chance to call `db::enforce_governance`.
     // Idempotent (`OnceLock::set`); first writer wins.
