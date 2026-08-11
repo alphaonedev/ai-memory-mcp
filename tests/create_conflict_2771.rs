@@ -285,7 +285,15 @@ mod pg {
         }
 
         let (winner_id, winner_content) = oks[0].clone();
-        let ctx = CallerContext::for_agent("ai:reader");
+        // #2771 — the winning row is scope=private, owned by the racer's
+        // authoritative `metadata.agent_id`, so a THIRD-PARTY reader is
+        // correctly DENIED by `is_visible_to_caller` (NotFound) — the
+        // visibility control working, not data loss. This assertion is a
+        // DURABILITY check (did the winner's content physically persist,
+        // unoverwritten?), so it reads with a visibility-BYPASS admin ctx
+        // (`for_admin` sets `bypass_visibility`) to observe the row regardless
+        // of ownership. It is NOT a visibility test.
+        let ctx = CallerContext::for_admin("ai:reader");
         let row = store.get(&ctx, &winner_id).await.expect("get winner");
         assert_eq!(
             row.content, winner_content,
