@@ -42,6 +42,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tests/embedding_dim_migration.rs::{auto_migrate_preserves_embeddings_without_embedder_2567,auto_migrate_nulls_embeddings_with_embedder_2567}`
   plus the CI-universal source guard
   `tests/embedding_dim_preserve_no_embedder_2567.rs`.
+### Fixed (data integrity — import round-trip)
+
+- **An edited corpus can now re-import its own backup, and the default
+  `--on-conflict version` re-imports losslessly onto an EXISTING corpus**
+  ([#2570](https://github.com/alphaonedev/ai-memory-mcp/issues/2570) +
+  [#2569](https://github.com/alphaonedev/ai-memory-mcp/issues/2569); 5-agent
+  vote `4d3ea1c5`; data-integrity North Star). Two coupled defects on the
+  import-admission path, both landed via ONE shared archive-lifecycle
+  predicate + ONE shared divergence predicate so the v1 (`src/cli/io.rs`) and
+  v2 (`src/portability/import.rs`) funnels cannot drift (#2488 lesson).
+  **(#2570)** the import archive gate skipped a row keyed on mere PRESENCE in
+  `archived_memories`, but #1725 snapshots the prior content of a STILL-LIVE
+  row there under `archive_reason='in_place_edit'` on every in-place edit — so
+  an edited-but-live row failed the re-import of its OWN backup
+  (`covenant_skipped`), progressively and silently making an edited corpus
+  un-re-importable. The new `db::memory_is_genuinely_archived` predicate
+  discriminates `archive_reason`: it blocks re-admission ONLY for a GENUINE
+  archival (gc / `ttl_expired` / `size_gc` / offload / `superseded` / `forget`
+  / operator archive / NULL reason, via the NULL-safe `IS NOT`) and admits an
+  `in_place_edit` revision snapshot of a live row. **(#2569)** the default
+  `ConflictMode::Version` REUSES the payload `id`, so re-importing a row whose
+  id already existed hit `UNIQUE constraint failed: memories.id` → counted
+  `refused`, exit non-zero — so the documented lossless restore imported
+  NOTHING onto a non-empty corpus. A same-`id` row is now an IDEMPOTENT no-op
+  (counted under a new `idempotent_skipped` disposition, excluded from the
+  exit-code sum): the durable row is the source of truth and is NEVER
+  overwritten (mirrors the #2878 never-clobber contract and the v2 funnel's
+  existing idempotent skip). Both idempotent skips run AFTER the forget /
+  archive covenant gates, so they can never resurrect a forgotten or
+  genuinely-archived id. A per-row WARNING is surfaced when a same-`id`
+  backup row's DURABLE content (title / content — never restamped metadata)
+  diverges from the live row it would replace, so a divergent backup is not
+  silently swallowed; overwriting a diverged row is the explicit
+  `--on-conflict merge` opt-in. The `import --help`, `docs/USER_GUIDE.md`
+  §"Export and Backup", and `docs/TROUBLESHOOTING.md` split-brain restore
+  procedure are reconciled to the true behavior (the split-brain fix cited a
+  bare `import --trust-source` overwriting via upsert, but `--trust-source`
+  does not change the conflict disposition and the default `version` never
+  overwrites — the real overwrite path is `--on-conflict merge`).
 
 ### Fixed (cert truthfulness — published-claims reconciliation)
 

@@ -36,10 +36,14 @@ pub enum OnConflict {
     /// idempotent behaviour — opt into it explicitly to re-import a
     /// backup without creating suffixed duplicates.
     Merge,
-    /// Auto-suffix the title (`title (2)`, `title (3)`, …) until a free
-    /// `(title, namespace)` slot is found, then insert a new row.
-    /// Never clobbers; both old and new rows persist. The #1780 default
-    /// — completes the import losslessly and is recoverable.
+    /// A `(title, namespace)` collision with a DIFFERENT existing row is
+    /// auto-suffixed (`title (2)`, `title (3)`, …) into a free slot, then
+    /// inserted — never clobbers; both rows persist. A row whose `id` is
+    /// ALREADY present (re-importing the corpus's own export onto an existing
+    /// corpus) is an IDEMPOTENT no-op: the durable row is kept, never
+    /// re-inserted or overwritten (#2569). The #1780 default — re-importing a
+    /// backup adds the missing rows and keeps the existing ones, without
+    /// duplicating or clobbering; use `merge` to overwrite a diverged row.
     #[default]
     Version,
 }
@@ -101,10 +105,12 @@ pub struct ImportArgs {
     /// — see [`crate::cli::backup::StoreDisagreement`].
     #[arg(long)]
     pub store_url: Option<String>,
-    /// Disposition on a `(title, namespace)` collision with an existing
-    /// memory: `version` (default — auto-suffix `title (N)`, never
-    /// clobber), `merge` (legacy silent idempotent upsert), or `error`
-    /// (refuse + skip the colliding row, continue the import).
+    /// Disposition on a `(title, namespace)` collision with a DIFFERENT
+    /// existing memory: `version` (default — auto-suffix `title (N)`, never
+    /// clobber), `merge` (legacy silent upsert — the way to OVERWRITE a
+    /// diverged row on restore), or `error` (refuse + skip the colliding row,
+    /// continue). A row whose `id` already exists is always an idempotent
+    /// no-op under `version`/`error` (kept, never overwritten; #2569).
     #[arg(long, value_enum, default_value_t = OnConflict::Version)]
     pub on_conflict: OnConflict,
 }
@@ -489,17 +495,26 @@ pub(crate) fn import_from_str(
     // BOTH kinds and the command exited 0 regardless; the counters below are
     // what the exit code is computed from.
     //
-    // `covenant_skipped` = a destination forget tombstone or a dest-archived
-    // id refused re-admission. These are the substrate HONOURING an erasure /
-    // archival decision, they are steady-state on any repeat restore, and
-    // #1725 puts every in-place-edited row into `archived_memories` — so
-    // treating them as failures would make a re-import forever-red and the
-    // alarm would be `|| true`-ed away (objection O9).
+    // `covenant_skipped` = a destination forget tombstone or a GENUINELY
+    // archived id refused re-admission. These are the substrate HONOURING an
+    // erasure / archival decision; they are steady-state on any repeat
+    // restore, so treating them as failures would make a re-import forever-red
+    // and the alarm would be `|| true`-ed away (objection O9). v1.0.0 #2570 —
+    // an `archive_reason='in_place_edit'` snapshot is a backup of a row that
+    // is STILL LIVE (#1725), NOT a genuine archival, so it no longer lands
+    // here: the gate below discriminates via `memory_is_genuinely_archived`
+    // and the live row is admitted (then idempotent-skipped just below).
     let mut covenant_skipped = 0usize;
     let mut covenant_skipped_ids: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     // `refused` = the bundle could NOT be faithfully reconstructed here.
     let mut refused = 0usize;
+    // v1.0.0 #2569 — `idempotent_skipped` = a row whose id is ALREADY LIVE at
+    // the destination (re-importing the corpus's own export onto an existing
+    // corpus). A NO-OP, NOT a failure and NOT counted in `imported` (no write
+    // happened); the durable row is kept, never overwritten. Deliberately
+    // excluded from the exit-code sum so an idempotent restore exits 0.
+    let mut idempotent_skipped = 0usize;
     for mut mem in memories {
         // #2208 re-audit N1 — the v1 wire-form must honour the SAME forget
         // covenant as the v2 route: stripping `spec_version` from a bundle
@@ -517,7 +532,16 @@ pub(crate) fn import_from_str(
         }
         // #2208 N1 mirror — a dest-ARCHIVED id must not be re-admitted live
         // (dual residency); the sanctioned way back is memory_archive_restore.
-        if db::memory_is_archived(&conn, &mem.id)? {
+        //
+        // v1.0.0 #2570 — DISCRIMINATE the archive_reason via the shared
+        // `memory_is_genuinely_archived` predicate (identical to the v2
+        // `portability::import` funnel): skip ONLY a GENUINE archival. #1725
+        // snapshots the prior content of a STILL-LIVE row into
+        // `archived_memories` under `archive_reason='in_place_edit'` on every
+        // in-place edit, so keying on mere presence made an edited-but-live
+        // row fail the re-import of its OWN backup. This admits the
+        // in_place_edit snapshot and blocks only a real archival.
+        if db::memory_is_genuinely_archived(&conn, &mem.id)? {
             errors.push(format!(
                 "{}: skipped — the id is archived at the destination \
                  (restore via memory_archive_restore, not import)",
@@ -525,6 +549,33 @@ pub(crate) fn import_from_str(
             ));
             covenant_skipped += 1;
             covenant_skipped_ids.insert(mem.id.clone());
+            continue;
+        }
+        // v1.0.0 #2569 — IDEMPOTENT same-id re-import. A row whose id is
+        // ALREADY LIVE at the destination (re-importing the corpus's own
+        // export onto an existing corpus — the documented restore path) is a
+        // NO-OP, not a `UNIQUE constraint failed: memories.id` refusal (the
+        // default `ConflictMode::Version` reuses the payload id, so it cannot
+        // re-insert an existing id). The durable row is the source of truth
+        // and is NEVER overwritten (mirrors #2878 never-clobber + the v2
+        // idempotent skip). This runs AFTER the forget/archive covenant gates
+        // above, so it can never resurrect a forgotten/archived id (5-agent
+        // vote 4d3ea1c5). A per-row WARNING is surfaced when the incoming
+        // DURABLE content diverges from the stored row (title/content only —
+        // never restamped metadata) so a divergent backup is not silently
+        // swallowed; to overwrite a diverged row the operator opts into
+        // `--on-conflict merge`.
+        if db::memory_exists(&conn, &mem.id)? {
+            if let Ok(Some(existing)) = db::get(&conn, &mem.id)
+                && db::imported_row_diverges(&existing, &mem)
+            {
+                errors.push(format!(
+                    "{}: already present — durable row kept; incoming content \
+                     differs (use --on-conflict merge to overwrite)",
+                    mem.id
+                ));
+            }
+            idempotent_skipped += 1;
             continue;
         }
         // v1.0.0 #2490 — REDACTION-OVERWRITE REFUSAL.
@@ -682,14 +733,19 @@ pub(crate) fn import_from_str(
                 "links_skipped_by_covenant": links_skipped_by_covenant,
                 "refused": refused,
                 "skipped_by_covenant": covenant_skipped,
+                // v1.0.0 #2569 — rows whose id was ALREADY present (idempotent
+                // re-import onto an existing corpus). A success, NOT a refusal:
+                // excluded from the exit-code sum so a restore of an unchanged
+                // corpus exits 0.
+                "idempotent_skipped": idempotent_skipped,
                 "errors": errors
             })
         )?;
     } else {
         writeln!(
             out.stdout,
-            "imported: {imported} (restamped agent_id on {restamped}), \
-             links: {links_imported}"
+            "imported: {imported} (restamped agent_id on {restamped}, \
+             already-present {idempotent_skipped}), links: {links_imported}"
         )?;
         if args.trust_source {
             writeln!(
@@ -1480,6 +1536,204 @@ mod tests {
             errs.iter()
                 .any(|e| e.as_str().unwrap_or_default().contains("archived")),
             "the archive skip is reported, got: {errs:?}"
+        );
+    }
+
+    /// ★ #2569 — the DEFAULT `--on-conflict version` re-imports the corpus's
+    /// own export onto an EXISTING corpus idempotently (pre-fix every row was
+    /// `refused` with `UNIQUE constraint failed: memories.id`).
+    #[test]
+    fn v1_reimport_onto_existing_corpus_is_idempotent_2569() {
+        let src = TestEnv::fresh();
+        let src_db = src.db_path.clone();
+        let _ = seed_memory(&src_db, "ns", "a-title", "a-content");
+        let _ = seed_memory(&src_db, "ns", "b-title", "b-content");
+        let payload = export_payload_at(&src_db);
+
+        let mut dst = TestEnv::fresh();
+        let dst_db = dst.db_path.clone();
+        let args = ImportArgs {
+            trust_source: false,
+            store_url: None,
+            on_conflict: OnConflict::Version,
+        };
+        // First import lands both rows.
+        {
+            let mut out = dst.output();
+            import_from_str(&payload, &dst_db, &args, true, Some("caller"), &mut out).unwrap();
+        }
+        // Re-import the SAME payload onto the now-existing corpus.
+        let code = {
+            let mut out = dst.output();
+            import_from_str(&payload, &dst_db, &args, true, Some("caller"), &mut out).unwrap()
+        };
+        assert_eq!(
+            code, 0,
+            "#2569: an idempotent re-import exits 0, not incomplete"
+        );
+
+        let v: serde_json::Value =
+            serde_json::from_str(dst.stdout_str().lines().last().unwrap()).unwrap();
+        assert_eq!(v["imported"], 0, "nothing was newly written");
+        assert_eq!(v["refused"], 0, "#2569: no UNIQUE-id refusal");
+        assert_eq!(
+            v["idempotent_skipped"], 2,
+            "both already-present rows are no-ops"
+        );
+        assert_eq!(
+            v["skipped_by_covenant"], 0,
+            "neither row hit a covenant gate"
+        );
+
+        // No duplicates manufactured under suffixed titles.
+        let conn = db::open(&dst_db).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "#2569: an idempotent re-import creates zero new rows");
+    }
+
+    /// ★ #2570 — an EDITED (still-live) row's in_place_edit snapshot must NOT
+    /// make the row's own backup covenant-skipped; the re-import is idempotent.
+    #[test]
+    fn v1_reimport_of_edited_corpus_is_idempotent_2570() {
+        let src = TestEnv::fresh();
+        let src_db = src.db_path.clone();
+        let id = seed_memory(&src_db, "ns", "edit-me", "v1-content");
+        let _ = seed_memory(&src_db, "ns", "stable", "stable-content");
+        let payload1 = export_payload_at(&src_db);
+
+        let mut dst = TestEnv::fresh();
+        let dst_db = dst.db_path.clone();
+        let args = ImportArgs {
+            trust_source: false,
+            store_url: None,
+            on_conflict: OnConflict::Version,
+        };
+        {
+            let mut out = dst.output();
+            import_from_str(&payload1, &dst_db, &args, true, Some("caller"), &mut out).unwrap();
+        }
+        // Edit the row IN PLACE at the destination → #1725 in_place_edit snapshot.
+        {
+            let conn = db::open(&dst_db).unwrap();
+            let (changed, _) = db::update(
+                &conn,
+                &id,
+                None,
+                Some("v2-content"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(changed, "the in-place edit landed");
+            assert!(
+                db::memory_is_archived(&conn, &id).unwrap(),
+                "precondition: the edit created an in_place_edit snapshot",
+            );
+        }
+        // Re-export the (edited) destination and re-import onto itself.
+        let payload2 = export_payload_at(&dst_db);
+        let code = {
+            let mut out = dst.output();
+            import_from_str(&payload2, &dst_db, &args, true, Some("caller"), &mut out).unwrap()
+        };
+        assert_eq!(
+            code, 0,
+            "#2570: the edited corpus re-imports its own backup cleanly"
+        );
+
+        let v: serde_json::Value =
+            serde_json::from_str(dst.stdout_str().lines().last().unwrap()).unwrap();
+        assert_eq!(
+            v["skipped_by_covenant"], 0,
+            "#2570: the edited-but-live row is NOT covenant-skipped as archived",
+        );
+        assert_eq!(
+            v["idempotent_skipped"], 2,
+            "both live rows are idempotent no-ops"
+        );
+        assert_eq!(v["refused"], 0);
+
+        // The durable edited row survives (never clobbered).
+        let conn = db::open(&dst_db).unwrap();
+        assert_eq!(
+            db::get(&conn, &id).unwrap().unwrap().content,
+            "v2-content",
+            "#2878: the durable live row is never clobbered on re-import",
+        );
+    }
+
+    /// ★ #2569 — a same-id re-import whose DURABLE content diverges from the
+    /// live row is still an idempotent no-op (never a clobber), but surfaces a
+    /// per-row WARNING so the divergent backup is not silently swallowed
+    /// (5-agent vote 4d3ea1c5, A-with-reporting).
+    #[test]
+    fn v1_divergent_same_id_reimport_warns_and_never_clobbers_2569() {
+        let src = TestEnv::fresh();
+        let src_db = src.db_path.clone();
+        let id = seed_memory(&src_db, "ns", "z-title", "OLD backup content");
+        let payload_old = export_payload_at(&src_db); // carries the OLD content
+
+        let mut dst = TestEnv::fresh();
+        let dst_db = dst.db_path.clone();
+        let args = ImportArgs {
+            trust_source: false,
+            store_url: None,
+            on_conflict: OnConflict::Version,
+        };
+        {
+            let mut out = dst.output();
+            import_from_str(&payload_old, &dst_db, &args, true, Some("caller"), &mut out).unwrap();
+        }
+        // The live row drifts (edited after the backup was taken).
+        {
+            let conn = db::open(&dst_db).unwrap();
+            db::update(
+                &conn,
+                &id,
+                None,
+                Some("LIVE newer content"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        // Re-import the OLD backup: same id, DIFFERENT content.
+        {
+            let mut out = dst.output();
+            import_from_str(&payload_old, &dst_db, &args, true, Some("caller"), &mut out).unwrap();
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(dst.stdout_str().lines().last().unwrap()).unwrap();
+        assert_eq!(
+            v["idempotent_skipped"], 1,
+            "#2569: a diverged same-id row is still a no-op"
+        );
+        assert_eq!(v["refused"], 0);
+        let errs = v["errors"].as_array().unwrap();
+        assert!(
+            errs.iter()
+                .any(|e| e.as_str().unwrap_or_default().contains("content differs")),
+            "#2569: a divergent backup must warn, got: {errs:?}",
+        );
+
+        // The durable NEWER live row is never overwritten by the OLD backup.
+        let conn = db::open(&dst_db).unwrap();
+        assert_eq!(
+            db::get(&conn, &id).unwrap().unwrap().content,
+            "LIVE newer content",
+            "#2878: the older backup never clobbers the durable live row",
         );
     }
 

@@ -2120,6 +2120,14 @@ Restore (preserves links):
 ai-memory import < memories-backup.json
 ```
 
+Re-importing a backup is idempotent and safe to run onto an existing
+corpus: rows already present (same `id`) are kept unchanged and reported
+as `idempotent_skipped`, missing rows are added, and nothing is
+duplicated or clobbered — the default `--on-conflict version` never
+overwrites a live row. A per-row warning is emitted where a backup row's
+content diverges from the live row it would replace; to overwrite diverged
+rows with the backup copy, add `--on-conflict merge`.
+
 ## Priority Guide
 
 | Priority | When to Use |
