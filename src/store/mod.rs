@@ -898,6 +898,43 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// v1.0.0 #2887 — RESTORE-SAFE atomic write for the reversible rollback
+    /// paths (autonomy `reverse_rollback_entry_store` + curator
+    /// `rollback_consolidation`). It re-stores `memory` at its OWN id under an
+    /// atomic compare-and-set on the `(title, namespace)` UNIQUE key:
+    ///
+    /// * no row holds the key → INSERT (fresh restore);
+    /// * the SAME id holds the key (e.g. a compaction-tombstoned row that still
+    ///   occupies the slot) → the merge upsert fires and restores it — byte-
+    ///   identical to what [`Self::store`] does for that case today;
+    /// * a DIFFERENT id now owns the key → REFUSED with [`StoreError::Conflict`]
+    ///   carrying the occupant's id; the foreign row is left byte-identical.
+    ///
+    /// This closes the probe-then-`store()` lost-update window those callers had
+    /// (a concurrent writer taking the slot between the up-front
+    /// `find_by_title_namespace` probe and the `store()` upsert was silently
+    /// clobbered): the probe and the write are now ONE statement, so the foreign
+    /// row can never be overwritten. It is deliberately NOT
+    /// [`Self::store_with_embedding_no_overwrite`] (#2771 `DO NOTHING`, which
+    /// refuses ANY collision) — that would refuse the legitimate same-id restore
+    /// against a tombstoned row. Backends that do not implement this return
+    /// [`StoreError::UnsupportedCapability`].
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::Conflict`] when a DIFFERENT id owns the
+    ///   `(title, namespace)` slot — the existing row is left byte-identical.
+    /// * Otherwise the same error surface as [`Self::store`].
+    async fn restore_or_conflict(
+        &self,
+        _ctx: &CallerContext,
+        _memory: &Memory,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "RESTORE_OR_CONFLICT".to_string(),
+        })
+    }
+
     /// Store many memories in as few round-trips as the backend allows
     /// (#1481). Returns the upserted ids in input order.
     ///

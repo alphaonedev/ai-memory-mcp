@@ -80,6 +80,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   claim to LOCAL enforcement + the 5 convergence lanes, and discloses the 7
   sqlite-native lanes the way the 21 fully-501 paths are disclosed. Docs-only.
 
+### Fixed (rollback-restore data-integrity — CERT-BLOCKING; the last known unintentional-data-loss window)
+
+- **The reversible-rollback RESTORE paths now re-store a snapshot ATOMICALLY on
+  BOTH backends — a concurrent writer that took the `(title, namespace)` slot
+  after the target was forgotten/consolidated can no longer be silently
+  clobbered by the restore's upsert**
+  ([#2887](https://github.com/alphaonedev/ai-memory-mcp/issues/2887); 5-agent
+  adversarial vote `4d3ea1c5`, 3 APPROVE + 2 APPROVE-WITH-CHANGES). Pre-fix the
+  autonomy `reverse_rollback_entry` / `reverse_rollback_entry_store` and curator
+  `rollback_consolidation` paths were probe-then-`store()`: `check_no_collision`
+  / `find_by_title_namespace` → refuse a *different*-id owner → else
+  `store.store()` (an `ON CONFLICT (title, namespace) DO UPDATE SET
+  content = excluded` upsert). A concurrent writer that took the slot BETWEEN the
+  probe and the write had its durable content upsert-overwritten — a narrow
+  (single curator daemon / serial `curator --rollback`, cold-path) but real
+  lost-update. This is deliberately NOT the `#2771` create primitive
+  (`DO NOTHING`, which refuses ANY collision): that would wrongly refuse the
+  LEGITIMATE same-id idempotent restore against a compaction-tombstoned row that
+  still holds the key. The new restore-safe CAS
+  `INSERT … ON CONFLICT (title, namespace) DO UPDATE … WHERE memories.id =
+  excluded.id RETURNING id` makes the collision-probe and the restore write ONE
+  statement: a SAME-id restore merges (incl. against a tombstoned row); a
+  DIFFERENT-id owner leaves the CAS `WHERE` false so the row is skipped, no row is
+  RETURNed, and the caller gets a typed conflict WITHOUT clobbering the foreign
+  row. Implemented as a byte-identical twin of the happy-path write (same column
+  list / binds / seal / cid / vector-clock / valid-time canonicalization — only
+  the conflict arm differs, single-sourced from the one upsert literal so a
+  future column add can never miss it): sqlite `db::insert_restore_same_id`
+  (`src/storage/mod.rs::insert_inner`, new `InsertConflictArm::RestoreSameId`) +
+  the SAL trait method `MemoryStore::restore_or_conflict`
+  (`SqliteStore`/`PostgresStore` in `src/store/{sqlite,postgres}.rs`), routed
+  from all three rollback restore callers (`src/autonomy.rs`,
+  `src/curator/compaction.rs`). The refuse/skip semantics for a different-id
+  owner are preserved (curator WARN-skips that original + continues; autonomy /
+  CLI surface the same "rollback refused" error). Regression:
+  `tests/restore_or_conflict_2887.rs` (the primitive directly, a genuine
+  two-connection shared-file WAL race, the SAL trait wiring, a mechanical
+  source-pin that the callers route their sole restore write through the atomic
+  primitive, and a live-pg twin).
+
 ### Fixed (create data-integrity — CERT-BLOCKING)
 
 - **The default `on_conflict=error` create disposition is now ATOMICALLY

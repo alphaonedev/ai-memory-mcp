@@ -909,15 +909,22 @@ pub fn reverse_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Resul
             }
             // Delete the consolidated memory; re-insert the originals.
             // #2110 — a rollback re-store is a SUBSTRATE-authored re-insertion
-            // (curator autonomy) via a direct `db::insert`; record the
-            // substrate why_trace (stamp-if-absent — a restored original that
-            // already carried one keeps it) so the re-store satisfies
-            // AI_MEMORY_REQUIRE_WHY_TRACE.
+            // (curator autonomy); record the substrate why_trace (stamp-if-absent
+            // — a restored original that already carried one keeps it) so the
+            // re-store satisfies AI_MEMORY_REQUIRE_WHY_TRACE.
+            // #2887 — the actual write is the ATOMIC restore-safe CAS
+            // `db::insert_restore_same_id` (not a plain `db::insert` upsert): the
+            // upfront `check_no_collision` above is a fast-fail before the
+            // destructive delete, but the CAS is the load-bearing guard — a
+            // concurrent process that races into an original's (title, namespace)
+            // slot between the probe and this write is REFUSED (typed
+            // `ConflictError`) and never clobbered, closing the lost-update the
+            // separate probe-then-`insert` had.
             let existed = db::delete(conn, result_id)?;
             for m in originals {
                 let mut m = m.clone();
                 crate::storage::stamp_substrate_why_trace(&mut m.metadata);
-                db::insert(conn, &m)?;
+                db::insert_restore_same_id(conn, &m)?;
             }
             Ok(existed)
         }
@@ -925,7 +932,7 @@ pub fn reverse_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Resul
             check_no_collision(conn, &snapshot.title, &snapshot.namespace, &snapshot.id)?;
             let mut snapshot = snapshot.clone();
             crate::storage::stamp_substrate_why_trace(&mut snapshot.metadata);
-            db::insert(conn, &snapshot)?;
+            db::insert_restore_same_id(conn, &snapshot)?;
             Ok(true)
         }
         RollbackEntry::PriorityAdjust {
@@ -982,22 +989,24 @@ pub fn reverse_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Resul
 /// fn over `&dyn MemoryStore`, 3/5; memory `ed85b972`). The two
 /// dissents' hazards are encoded as guardrails:
 ///
-/// * **Collision guard (G2):** before reinserting a snapshot we ask the
-///   store whether a DIFFERENT id now owns the same `(title, namespace)`
-///   key (via [`crate::store::MemoryStore::find_by_title_namespace`]) and
-///   refuse — `store.store` is an UPSERT on that key and would silently
-///   clobber the unrelated row. Mirrors the rusqlite [`check_no_collision`].
+/// * **Collision guard (G2) + Atomicity (G4) — #2887:** each snapshot is
+///   reinserted via the ATOMIC restore-safe CAS
+///   [`crate::store::MemoryStore::restore_or_conflict`]
+///   (`INSERT … ON CONFLICT(title,namespace) DO UPDATE … WHERE memories.id =
+///   excluded.id`). A same-id restore merges; a DIFFERENT id owning the key is
+///   REFUSED (`StoreError::Conflict`, surfaced as the "rollback refused" error)
+///   WITHOUT clobbering it. Because the collision-probe and the restore write
+///   are ONE statement, the pre-#2887 probe-then-`store()` lost-update window is
+///   closed — no concurrent writer that took the slot can be silently
+///   upsert-overwritten. This SUPERSEDES the earlier
+///   `find_by_title_namespace`-then-`store.store` probe (Option B's original
+///   G2/G4 encoding); the conn-based [`reverse_rollback_entry`] gained the same
+///   CAS via `db::insert_restore_same_id`.
 /// * **Fail-safe ordering (G3):** the `Consolidate` arm reinserts the
 ///   originals BEFORE deleting the consolidated summary, so a crash mid-
 ///   reversal never destroys the summary while the originals are still
 ///   missing. The summary's `[consolidated]` title never collides with an
-///   original, so the ordering introduces no UPSERT hazard.
-/// * **Atomicity (G4):** the SAL trait's `begin_transaction` is
-///   Postgres-internal only (SQLite returns `UnsupportedCapability`), so a
-///   backend-agnostic free fn cannot wrap the multi-write in one
-///   transaction. The non-atomic window is EXACT PARITY with the rusqlite
-///   [`reverse_rollback_entry`] (also separate statements, no
-///   BEGIN/COMMIT); G3 ordering minimises it.
+///   original.
 #[cfg(feature = "sal")]
 pub async fn reverse_rollback_entry_store(
     store: &dyn crate::store::MemoryStore,
@@ -1006,25 +1015,33 @@ pub async fn reverse_rollback_entry_store(
 ) -> Result<bool> {
     use crate::store::StoreError;
 
-    // G2 — refuse to overwrite a memory that took the (title, namespace)
-    // slot after the rollback target was forgotten/consolidated.
-    async fn guard_no_collision(store: &dyn crate::store::MemoryStore, m: &Memory) -> Result<()> {
-        if let Some(existing) = store
-            .find_by_title_namespace(&m.title, &m.namespace)
-            .await?
-        {
-            if existing != m.id {
-                anyhow::bail!(
-                    "rollback refused: (title={:?}, namespace={:?}) is now owned by memory \
-                     {existing}, not the snapshot {} — resolve the conflict (delete the \
-                     offender or rename one) before reversing",
-                    m.title,
-                    m.namespace,
-                    m.id
-                );
-            }
+    // #2887 — G2 (collision refusal) + G3 (fail-safe ordering) via the ATOMIC
+    // restore-safe CAS `MemoryStore::restore_or_conflict`: it re-stores a
+    // snapshot at its OWN id under one `INSERT … ON CONFLICT(title,namespace) DO
+    // UPDATE … WHERE memories.id = excluded.id` statement, so a concurrent writer
+    // that took the slot after the target was forgotten/consolidated is REFUSED
+    // (`StoreError::Conflict`) and NEVER clobbered — closing the pre-#2887
+    // probe-then-`store()` lost-update (the prior separate collision probe and
+    // the `store()` upsert were two statements, so a race between them silently
+    // overwrote the unrelated row). A refused collision surfaces as the same
+    // "rollback refused" error the operator saw before.
+    async fn restore_snapshot(
+        store: &dyn crate::store::MemoryStore,
+        ctx: &crate::store::CallerContext,
+        m: &Memory,
+    ) -> Result<()> {
+        match store.restore_or_conflict(ctx, m).await {
+            Ok(_) => Ok(()),
+            Err(StoreError::Conflict { id: occupant }) => anyhow::bail!(
+                "rollback refused: (title={:?}, namespace={:?}) is now owned by memory \
+                 {occupant}, not the snapshot {} — resolve the conflict (delete the \
+                 offender or rename one) before reversing",
+                m.title,
+                m.namespace,
+                m.id
+            ),
+            Err(e) => Err(e.into()),
         }
-        Ok(())
     }
 
     match entry {
@@ -1032,12 +1049,11 @@ pub async fn reverse_rollback_entry_store(
             originals,
             result_id,
         } => {
+            // G3 — reinsert the originals (atomic restore-or-refuse) BEFORE
+            // deleting the summary, so a mid-reversal crash over-retains (both
+            // live) rather than losing data.
             for m in originals {
-                guard_no_collision(store, m).await?;
-            }
-            // G3 — reinsert the originals BEFORE deleting the summary.
-            for m in originals {
-                store.store(ctx, m).await?;
+                restore_snapshot(store, ctx, m).await?;
             }
             // Delete the consolidated summary; `NotFound` → already removed
             // (idempotent no-op), matching the rusqlite `existed` bool.
@@ -1048,8 +1064,7 @@ pub async fn reverse_rollback_entry_store(
             }
         }
         RollbackEntry::Forget { snapshot } => {
-            guard_no_collision(store, snapshot).await?;
-            store.store(ctx, snapshot).await?;
+            restore_snapshot(store, ctx, snapshot).await?;
             Ok(true)
         }
         RollbackEntry::PriorityAdjust {

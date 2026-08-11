@@ -1432,7 +1432,30 @@ const ENVELOPE_OWNER_RECONCILED_MSG: &str = "upsert-merge landed on a row that r
 /// and the `SELECT` would return the wrong row id. `SQLite` 3.35+
 /// supports `RETURNING`; it executes atomically within the `INSERT`.
 pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
-    insert_inner(conn, mem, true, false)
+    insert_inner(conn, mem, true, InsertConflictArm::Merge)
+}
+
+/// v1.0.0 #2771/#2887 — the `(title, namespace)` conflict-resolution arm the
+/// shared [`insert_inner`] funnel applies. All three arms are DERIVED from the
+/// ONE `upsert_sql` literal (split at `ON CONFLICT` / before `RETURNING id`),
+/// so a future column add lands on every disposition and can never silently
+/// miss one (the #2550 drift class).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertConflictArm {
+    /// Legacy `DO UPDATE` upsert-merge (the #690 `ConflictMode::Merge` default):
+    /// a `(title, namespace)` collision merges into the existing row.
+    Merge,
+    /// #2771 fail-closed `DO NOTHING`: a `(title, namespace)` collision returns
+    /// a typed [`ConflictError`] and NEVER overwrites — for the default
+    /// `on_conflict=error` create path.
+    Refuse,
+    /// #2887 restore-safe CAS `DO UPDATE … WHERE memories.id = excluded.id`: the
+    /// merge fires ONLY when the SAME id already holds the key (an idempotent
+    /// restore, incl. against a compaction-tombstoned row), and a DIFFERENT id
+    /// owning the slot returns a typed [`ConflictError`] without clobbering it.
+    /// For the reversible rollback paths (autonomy / curator), where refusing a
+    /// same-id restore (as `Refuse` would) is wrong.
+    RestoreSameId,
 }
 
 /// v1.0.0 #2771 — FAIL-CLOSED create insert: same funnel as [`insert`]
@@ -1453,7 +1476,30 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
 ///   already exists — the existing row is left byte-identical.
 /// * Otherwise identical to [`insert`].
 pub fn insert_no_overwrite(conn: &Connection, mem: &Memory) -> Result<String> {
-    insert_inner(conn, mem, true, true)
+    insert_inner(conn, mem, true, InsertConflictArm::Refuse)
+}
+
+/// v1.0.0 #2887 — RESTORE-SAFE atomic re-store for the reversible rollback
+/// paths (autonomy `reverse_rollback_entry` + the SAL twin
+/// `reverse_rollback_entry_store`, curator `rollback_consolidation`). Same
+/// LOCAL-authorship funnel as [`insert`] (record-stop / governance / why-trace
+/// / secret-screen / cid stamp / vector-clock stamp / at-rest seal / valid-time
+/// canonicalization — every column bound identically) EXCEPT the `(title,
+/// namespace)` conflict is the CAS `DO UPDATE … WHERE memories.id = excluded.id`
+/// ([`InsertConflictArm::RestoreSameId`]): the merge fires only when the SAME id
+/// already holds the key (an idempotent restore, byte-identical to [`insert`]'s
+/// upsert for that case), and a DIFFERENT id owning the slot returns a typed
+/// [`ConflictError`] WITHOUT clobbering it. This makes the collision-probe and
+/// the restore write ONE atomic statement, closing the lost-update window the
+/// prior `check_no_collision` → [`insert`] sequence had.
+///
+/// # Errors
+///
+/// * [`ConflictError`] (via `anyhow`) when a DIFFERENT id owns
+///   `(mem.title, mem.namespace)` — the existing row is left byte-identical.
+/// * Otherwise identical to [`insert`].
+pub fn insert_restore_same_id(conn: &Connection, mem: &Memory) -> Result<String> {
+    insert_inner(conn, mem, true, InsertConflictArm::RestoreSameId)
 }
 
 /// v1.0.0 #2211 — REMOTE-ADMISSION insert for the Portability-v2 importer.
@@ -1472,7 +1518,7 @@ pub fn insert_no_overwrite(conn: &Connection, mem: &Memory) -> Result<String> {
 ///
 /// Identical to [`insert`].
 pub fn insert_imported(conn: &Connection, mem: &Memory) -> Result<String> {
-    insert_inner(conn, mem, false, false)
+    insert_inner(conn, mem, false, InsertConflictArm::Merge)
 }
 
 /// v1.0.0 #2878 — FAIL-CLOSED remote-admission insert: the no-overwrite twin
@@ -1493,21 +1539,24 @@ pub fn insert_imported(conn: &Connection, mem: &Memory) -> Result<String> {
 ///   already exists — the existing row is left byte-identical.
 /// * Otherwise identical to [`insert_imported`].
 pub fn insert_imported_no_overwrite(conn: &Connection, mem: &Memory) -> Result<String> {
-    insert_inner(conn, mem, false, true)
+    insert_inner(conn, mem, false, InsertConflictArm::Refuse)
 }
 
-/// Shared body of [`insert`] / [`insert_imported`] / [`insert_no_overwrite`].
-/// `stamp_local_clock` selects whether this node's vector-clock component is
-/// advanced (local authorship) or the metadata crosses verbatim (remote
-/// admission). `fail_on_conflict` (v1.0.0 #2771) selects the `(title,
-/// namespace)` conflict arm: `false` = legacy `DO UPDATE` upsert-merge;
-/// `true` = fail-closed `DO NOTHING` that returns a typed [`ConflictError`]
-/// instead of overwriting a concurrent writer's row.
+/// Shared body of [`insert`] / [`insert_imported`] / [`insert_no_overwrite`] /
+/// [`insert_restore_same_id`]. `stamp_local_clock` selects whether this node's
+/// vector-clock component is advanced (local authorship) or the metadata crosses
+/// verbatim (remote admission). `conflict_arm` (v1.0.0 #2771/#2887) selects the
+/// `(title, namespace)` conflict arm: [`InsertConflictArm::Merge`] = legacy
+/// `DO UPDATE` upsert-merge; [`InsertConflictArm::Refuse`] = fail-closed
+/// `DO NOTHING` returning a typed [`ConflictError`]; [`InsertConflictArm::RestoreSameId`]
+/// = the restore-safe CAS `DO UPDATE … WHERE memories.id = excluded.id` that
+/// merges only a same-id restore and refuses a different-id owner with a typed
+/// [`ConflictError`].
 fn insert_inner(
     conn: &Connection,
     mem: &Memory,
     stamp_local_clock: bool,
-    fail_on_conflict: bool,
+    conflict_arm: InsertConflictArm,
 ) -> Result<String> {
     use rusqlite::OptionalExtension;
     // #1955 R45 — record-stop fence: outermost of the write funnel, so a
@@ -1767,26 +1816,47 @@ fn insert_inner(
                 valid_from = memories.valid_from,
                 valid_until = COALESCE(excluded.valid_until, memories.valid_until)
              RETURNING id";
-        // #2771 — the column list + VALUES head is single-sourced across the
-        // upsert-merge arm (above) and the fail-closed create arm below: the
-        // no-overwrite SQL is DERIVED from the ONE `upsert_sql` literal by
-        // splitting at `ON CONFLICT`, so a future column add lands on BOTH
-        // dispositions and can never silently miss the fail-closed path (the
-        // drift class #2550 consolidated away). Only the conflict resolution
-        // differs: `DO UPDATE` merges; `DO NOTHING` refuses a `(title,
-        // namespace)` collision atomically (zero rows returned → typed
-        // ConflictError below), never overwriting a concurrent writer's row.
-        let sql: std::borrow::Cow<'_, str> = if fail_on_conflict {
-            let head = upsert_sql.split("ON CONFLICT").next().unwrap_or(upsert_sql);
-            std::borrow::Cow::Owned(
-                [
-                    head,
-                    "ON CONFLICT(title, namespace) DO NOTHING\n             RETURNING id",
-                ]
-                .concat(),
-            )
-        } else {
-            std::borrow::Cow::Borrowed(upsert_sql)
+        // #2771/#2887 — the column list + VALUES head + the whole DO UPDATE SET
+        // arm are single-sourced from the ONE `upsert_sql` literal (above): each
+        // non-`Merge` disposition is DERIVED from it, so a future column add lands
+        // on EVERY disposition and can never silently miss one (the #2550 drift
+        // class). Only the conflict resolution differs:
+        //   * `Merge`         — `DO UPDATE` merges (the literal verbatim).
+        //   * `Refuse` (#2771) — `DO NOTHING` refuses ANY `(title, namespace)`
+        //     collision atomically (zero rows RETURNed → typed ConflictError
+        //     below), never overwriting a concurrent writer's row.
+        //   * `RestoreSameId` (#2887) — the SAME `DO UPDATE SET` arm with a
+        //     `WHERE memories.id = excluded.id` CAS appended before `RETURNING`:
+        //     the merge fires only when the SAME id already holds the key (an
+        //     idempotent restore), and when a DIFFERENT id owns the slot the
+        //     `WHERE` is false so SQLite skips the row WITHOUT error and RETURNs
+        //     nothing (documented upsert semantics — the DO-NOTHING analogue) →
+        //     the same typed ConflictError below, leaving the foreign row
+        //     byte-identical. Closes the rollback probe-then-store lost-update.
+        let sql: std::borrow::Cow<'_, str> = match conflict_arm {
+            InsertConflictArm::Merge => std::borrow::Cow::Borrowed(upsert_sql),
+            InsertConflictArm::Refuse => {
+                let head = upsert_sql.split("ON CONFLICT").next().unwrap_or(upsert_sql);
+                std::borrow::Cow::Owned(
+                    [
+                        head,
+                        "ON CONFLICT(title, namespace) DO NOTHING\n             RETURNING id",
+                    ]
+                    .concat(),
+                )
+            }
+            InsertConflictArm::RestoreSameId => {
+                let body = upsert_sql
+                    .rsplit_once("RETURNING id")
+                    .map_or(upsert_sql, |(head, _)| head);
+                std::borrow::Cow::Owned(
+                    [
+                        body,
+                        "WHERE memories.id = excluded.id\n             RETURNING id",
+                    ]
+                    .concat(),
+                )
+            }
         };
         let mut insert_stmt = conn.prepare_cached(&sql)?;
         let kind_provenance_col = extract_kind_provenance(mem);
@@ -1833,14 +1903,15 @@ fn insert_inner(
         {
             Some(id) => id,
             None => {
-                // #2771 — the no-overwrite (`DO NOTHING`) arm inserted nothing:
-                // a concurrent writer already holds `(title, namespace)`. Refuse
-                // fail-closed with the typed conflict — NEVER overwrite. Re-probe
-                // for the winner's id best-effort; a TOCTOU gap (winner deleted
-                // between the conflict and this read) degrades to an empty id,
-                // never a retry-as-create. The merge (`DO UPDATE`) arm always
-                // RETURNs a row, so this branch is unreachable when
-                // `fail_on_conflict` is false.
+                // A non-`Merge` arm inserted nothing → a DIFFERENT id already
+                // holds `(title, namespace)`: for `Refuse` (#2771) ANY collision
+                // (`DO NOTHING`); for `RestoreSameId` (#2887) a foreign-id owner
+                // (the CAS `WHERE memories.id = excluded.id` is false → skip, no
+                // RETURNed row). Refuse fail-closed with the typed conflict —
+                // NEVER overwrite. Re-probe for the occupant's id best-effort; a
+                // TOCTOU gap (winner deleted between the conflict and this read)
+                // degrades to an empty id, never a retry-as-create. `Merge` always
+                // RETURNs a row, so this branch is unreachable under it.
                 let existing_id =
                     find_by_title_namespace(conn, &mem.title, &mem.namespace)?.unwrap_or_default();
                 return Err(ConflictError {

@@ -581,43 +581,44 @@ impl<'a> ConsolidationPass<'a> {
 
     /// Stage-6 rollback (#664): restore a consolidated cluster after a failed
     /// `verify`. Re-inserts the pre-merge `originals` (snapshots already in
-    /// memory; the SAL `store` write preserves their ids) THEN deletes the
+    /// memory; the restore write preserves their ids) THEN deletes the
     /// unverifiable `result_id` — restore-FIRST so a crash mid-rollback leaves
     /// a recoverable over-retention (both live), never data loss. Each original
-    /// is collision-guarded: if a *different* id now occupies its
-    /// `(title, namespace)` slot it is skipped + warned (mirrors
-    /// `autonomy::check_no_collision`). Backend-agnostic — uses only the
-    /// existing `find_by_title_namespace` / `store` / `delete` trait ops.
+    /// is restored via the ATOMIC restore-safe CAS
+    /// [`crate::store::MemoryStore::restore_or_conflict`] (#2887): if a
+    /// *different* id now occupies its `(title, namespace)` slot the CAS refuses
+    /// (`StoreError::Conflict`) so it is skipped + warned WITHOUT clobbering the
+    /// occupant — the collision-probe and the restore write are ONE statement,
+    /// closing the prior probe-then-`store()` lost-update. Backend-agnostic —
+    /// uses only the existing `restore_or_conflict` / `delete` trait ops.
     /// Returns the number of originals restored.
     async fn rollback_consolidation(&self, originals: &[Memory], result_id: &str) -> Result<usize> {
         let mut restored = 0usize;
         for m in originals {
-            // Collision guard: do not clobber a different memory that took the
-            // (title, namespace) slot after the sources were consolidated away.
-            match self
-                .store
-                .find_by_title_namespace(&m.title, &m.namespace)
-                .await
-            {
-                Ok(Some(existing_id)) if existing_id != m.id => {
+            // #2887 — restore each original via the ATOMIC restore-safe CAS
+            // (`restore_or_conflict`): the collision-probe and the restore write
+            // are ONE statement keyed on the snapshot's OWN id, so a concurrent
+            // writer that took the (title, namespace) slot between them can no
+            // longer be silently clobbered by the restore's upsert (the prior
+            // probe-then-`store()` lost-update window). A DIFFERENT id owning the
+            // slot surfaces as `StoreError::Conflict` and this original is skipped
+            // + warned (mirroring the pre-#2887 guard's refuse/skip semantics),
+            // while the foreign row is left byte-identical.
+            match self.store.restore_or_conflict(&self.ctx, m).await {
+                Ok(_) => restored += 1,
+                Err(StoreError::Conflict { id: occupant }) => {
                     tracing::warn!(
                         target: COMPACTION_TRACE_TARGET,
                         title = %m.title,
                         namespace = %m.namespace,
-                        occupant = %existing_id,
+                        occupant = %occupant,
                         original = %m.id,
                         "rollback: (title, namespace) slot taken by a different id — skipping restore"
                     );
                     continue;
                 }
-                Ok(_) => {}
                 Err(e) => return Err(anyhow::anyhow!(e)),
             }
-            self.store
-                .store(&self.ctx, m)
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-            restored += 1;
         }
         // Remove the unverifiable summary only after the originals are back.
         self.store
