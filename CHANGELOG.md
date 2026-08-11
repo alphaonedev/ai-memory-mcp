@@ -109,6 +109,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tests/bulk_create_conflict_2874.rs` (two-connection sqlite race + `merge`
   control + in-batch-dedup guard + a live-pg two-task handler race, all keyed on
   the schema-v45 `version` column so an upsert-overwrite is a hard failure).
+- **The FLAGSHIP MCP agent write surface (`memory_store`) and the Portability-v2
+  importer now close the SAME probe-then-upsert lost-update on their
+  error/no-overwrite dispositions — the funnels the `#2771`/`#2874` fixes did
+  not reach** ([#2878](https://github.com/alphaonedev/ai-memory-mcp/issues/2878),
+  final 5-agent cert re-vote; applies the certified `#2771`/`#2874` precedent to
+  the remaining funnels, so no new vote). Pre-fix both probed then WROTE via
+  `db::insert`'s `ON CONFLICT (title, namespace) DO UPDATE`, so a concurrent
+  writer racing into the key BETWEEN the probe and the write was silently
+  upsert-overwritten despite the caller's error / never-clobber intent — the
+  identical North-Star unintentional-data-loss defect. Now:
+  - **MCP `memory_store` `on_conflict=error`** (the default for v2-aware
+    clients; MCP stdio is sqlite-only per `#1675`) routes the write through the
+    certified `db::insert_no_overwrite` (`INSERT … ON CONFLICT DO NOTHING` →
+    typed `ConflictError`); a race-detected collision is surfaced as the SAME
+    typed `CONFLICT:` string the up-front probe raises (single-sourced via
+    `validation::conflict_error_message`), NEVER an overwrite
+    (`src/mcp/tools/store/{mod,validation}.rs`).
+  - **Portability-v2 import** routes every non-`Merge` disposition's write
+    through the new remote-admission twin `db::insert_imported_no_overwrite`
+    (`insert_inner(.., stamp_local_clock=false, fail_on_conflict=true)`), so a
+    probe-miss that races a colliding writer is REFUSED (per-row
+    `conflicts_skipped` skip, mirroring the probe-hit `Error` disposition),
+    never a silent clobber (`src/portability/import.rs`, `src/storage/mod.rs`).
+    The importer wraps its apply in one `BEGIN IMMEDIATE` transaction, so this
+    is structural defense-in-depth that makes "never clobber the destination's
+    durable text" hold by construction regardless of isolation level.
+  `merge` (opt-in silent upsert) and `version` (title-suffix) semantics are
+  unchanged; the non-race path is byte-identical (`DO NOTHING` and `DO UPDATE`
+  behave the same absent a conflict). Regression:
+  `tests/import_conflict_2878.rs` (single-connection deterministic +
+  two-connection sqlite race on the no-overwrite primitive + `Version`/`Error`
+  funnel non-clobber contract) and the MCP-store two-connection race + `merge`
+  control in `src/mcp/tools/store/tests.rs`, all keyed on the schema-v45
+  `version` column so an upsert-overwrite is a hard failure.
 ### Fixed (published-claims TRUTHFULNESS — CERT-BLOCKING)
 
 - **`docs/zero-touch-trust.html` no longer ships the retired

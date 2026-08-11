@@ -77,6 +77,22 @@ pub(super) fn default_on_conflict_for_client(mcp_client: Option<&str>) -> OnConf
     OnConflict::Merge
 }
 
+/// v1.0.0 #2878 — the ONE builder for the typed `CONFLICT:` string a
+/// `(title, namespace)` collision returns on the MCP `memory_store`
+/// `on_conflict=error` path, whether the collision is PROBE-detected (an
+/// existing row seen up front, in [`parse_and_build_memory`]) or WRITE-detected
+/// (the fail-closed `db::insert_no_overwrite` refused a racer, in
+/// `super::handle_store`). Single-sources the wire shape — the message literal
+/// lives at exactly one site — so a race-detected conflict is byte-identical to
+/// a probe-detected one.
+pub(super) fn conflict_error_message(title: &str, namespace: &str, existing_id: &str) -> String {
+    format!(
+        "CONFLICT: memory with title '{title}' already exists in namespace \
+         '{namespace}' (existing id: {existing_id}). Pass \
+         on_conflict='merge' to update in place or 'version' to suffix the title."
+    )
+}
+
 /// #881 — input-parse + validation + memory-construction extracted
 /// from the monolithic `handle_store`. Returns the parsed
 /// `(memory, on_conflict, agent_id, explicit_scope)` tuple ready for
@@ -229,11 +245,7 @@ pub(super) fn parse_and_build_memory(
             if let Some(existing_id) =
                 db::find_by_title_namespace(conn, title, &namespace).map_err(|e| e.to_string())?
             {
-                return Err(format!(
-                    "CONFLICT: memory with title '{title}' already exists in namespace \
-                     '{namespace}' (existing id: {existing_id}). Pass \
-                     on_conflict='merge' to update in place or 'version' to suffix the title."
-                ));
+                return Err(conflict_error_message(title, &namespace, &existing_id));
             }
             title.to_string()
         }
