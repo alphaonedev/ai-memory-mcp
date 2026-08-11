@@ -205,6 +205,39 @@ impl MemoryStore for SqliteStore {
         }
     }
 
+    /// v1.0.0 #2887 — RESTORE-SAFE atomic re-store for the reversible rollback
+    /// paths. Delegates to the sqlite SSOT `db::insert_restore_same_id`
+    /// (`INSERT … ON CONFLICT(title, namespace) DO UPDATE … WHERE memories.id =
+    /// excluded.id`): a same-id restore (incl. against a tombstoned row) merges,
+    /// a DIFFERENT-id owner is refused with [`StoreError::Conflict`] carrying the
+    /// occupant's id, and the foreign row is never clobbered. Mirrors
+    /// [`Self::store`]'s `bypass_visibility` substrate why_trace stamp so a
+    /// curator/autonomy self-write satisfies `AI_MEMORY_REQUIRE_WHY_TRACE`
+    /// without a bypass; maps the legacy `ConflictError` to the SAL
+    /// `StoreError::Conflict` exactly like
+    /// [`Self::store_with_embedding_no_overwrite`].
+    async fn restore_or_conflict(
+        &self,
+        ctx: &CallerContext,
+        memory: &Memory,
+    ) -> StoreResult<String> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        let map_err = |e: anyhow::Error| match e.downcast_ref::<crate::storage::ConflictError>() {
+            Some(c) => StoreError::Conflict {
+                id: c.existing_id.clone(),
+            },
+            None => box_err(e),
+        };
+        if ctx.bypass_visibility {
+            let mut stamped = memory.clone();
+            crate::storage::stamp_substrate_why_trace(&mut stamped.metadata);
+            db::insert_restore_same_id(&conn, &stamped).map_err(map_err)
+        } else {
+            db::insert_restore_same_id(&conn, memory).map_err(map_err)
+        }
+    }
+
     /// v0.7.0 #1416 — L4 layered-capture idempotent write. Delegates to
     /// the sqlite SSOT `db::capture_turn_idempotent`, which the MCP
     /// `memory_capture_turn` handler also calls, so the dedup-lookup +

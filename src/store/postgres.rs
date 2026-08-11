@@ -16817,8 +16817,14 @@ impl MemoryStore for PostgresStore {
         embedding: Option<&[f32]>,
         space: Option<&str>,
     ) -> StoreResult<String> {
-        self.store_with_embedding_inner(ctx, memory, embedding, space, false)
-            .await
+        self.store_with_embedding_inner(
+            ctx,
+            memory,
+            embedding,
+            space,
+            crate::storage::InsertConflictArm::Merge,
+        )
+        .await
     }
 
     /// v1.0.0 #2771 — FAIL-CLOSED create twin of [`Self::store_with_embedding`].
@@ -16835,8 +16841,47 @@ impl MemoryStore for PostgresStore {
         embedding: Option<&[f32]>,
         space: Option<&str>,
     ) -> StoreResult<String> {
-        self.store_with_embedding_inner(ctx, memory, embedding, space, true)
-            .await
+        self.store_with_embedding_inner(
+            ctx,
+            memory,
+            embedding,
+            space,
+            crate::storage::InsertConflictArm::Refuse,
+        )
+        .await
+    }
+
+    /// v1.0.0 #2887 — RESTORE-SAFE atomic re-store for the reversible rollback
+    /// paths (autonomy `reverse_rollback_entry_store`, curator
+    /// `rollback_consolidation`). Delegates to the shared
+    /// [`Self::store_with_embedding_inner`] with `embedding = None` under the
+    /// [`crate::storage::InsertConflictArm::RestoreSameId`] CAS, so a same-id
+    /// restore merges and a DIFFERENT-id owner of `(title, namespace)` is refused
+    /// with [`StoreError::Conflict`] WITHOUT clobbering the foreign row.
+    ///
+    /// **NOT the id-keyed `archive_restore` path.** The rollback restore is
+    /// exactly the `store()`-shaped write these callers do today — an upsert on
+    /// the `(title, namespace)` UNIQUE key, NOT an `ON CONFLICT (id)` archive
+    /// re-hydrate. Routing it through the embed funnel with `embedding = None` is
+    /// byte-equivalent to today's `store()`-based rollback restore: `store()`
+    /// writes no embedding either, and the DO UPDATE arm's
+    /// `embedding = COALESCE(EXCLUDED.embedding, memories.embedding)` keeps the
+    /// existing vector when `EXCLUDED.embedding` is NULL — the backfill sweep
+    /// regenerates any embedding from the durable text. No vector is dropped
+    /// relative to the pre-#2887 path.
+    async fn restore_or_conflict(
+        &self,
+        ctx: &CallerContext,
+        memory: &Memory,
+    ) -> StoreResult<String> {
+        self.store_with_embedding_inner(
+            ctx,
+            memory,
+            None,
+            None,
+            crate::storage::InsertConflictArm::RestoreSameId,
+        )
+        .await
     }
 
     async fn update_embedding(
@@ -26662,10 +26707,10 @@ fn downcast_postgres(store: &std::sync::Arc<dyn MemoryStore>) -> StoreResult<&Po
         })
 }
 
-// v1.0.0 #2771 — shared body of the two create funnels
+// v1.0.0 #2771/#2887 — shared body of the create + restore funnels
 // (`store_with_embedding` merge / `store_with_embedding_no_overwrite`
-// fail-closed). Inherent so both thin trait methods can delegate;
-// `fail_on_conflict` selects the ON CONFLICT arm.
+// fail-closed / `restore_or_conflict` restore-safe CAS). Inherent so the thin
+// trait methods can delegate; `conflict_arm` selects the ON CONFLICT arm.
 impl PostgresStore {
     async fn store_with_embedding_inner(
         &self,
@@ -26673,7 +26718,7 @@ impl PostgresStore {
         memory: &Memory,
         embedding: Option<&[f32]>,
         space: Option<&str>,
-        fail_on_conflict: bool,
+        conflict_arm: crate::storage::InsertConflictArm,
     ) -> StoreResult<String> {
         self.gate_record_stop()?;
         // v0.8.1 W1 (#1821 / gap G29) — credential REDACT backstop (postgres
@@ -26898,24 +26943,43 @@ impl PostgresStore {
                 -- keeps the stored marker (the `store()` COALESCE precedent).
                 kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
             RETURNING id";
-        // #2771 — single-source the column list + binds across the
-        // upsert-merge and fail-closed create dispositions; only the ON
-        // CONFLICT arm differs, derived from the ONE upsert literal so a
-        // future column add can never miss the fail-closed path.
-        let embed_sql: std::borrow::Cow<'_, str> = if fail_on_conflict {
-            let head = embed_upsert_sql
-                .split("ON CONFLICT")
-                .next()
-                .unwrap_or(embed_upsert_sql);
-            std::borrow::Cow::Owned(
-                [
-                    head,
-                    "ON CONFLICT (title, namespace) DO NOTHING\n            RETURNING id",
-                ]
-                .concat(),
-            )
-        } else {
-            std::borrow::Cow::Borrowed(embed_upsert_sql)
+        // #2771/#2887 — single-source the column list + binds + the whole DO
+        // UPDATE SET arm across every disposition; only the ON CONFLICT
+        // resolution differs, derived from the ONE upsert literal so a future
+        // column add can never miss one. `Merge` = the literal verbatim; `Refuse`
+        // (#2771) = `DO NOTHING` (refuse ANY collision); `RestoreSameId` (#2887) =
+        // the same DO UPDATE SET arm with `WHERE memories.id = EXCLUDED.id` (the
+        // CAS: merge a same-id restore, skip — no RETURNed row — a foreign-id
+        // owner, mirroring the sqlite `insert_inner` twin).
+        let embed_sql: std::borrow::Cow<'_, str> = match conflict_arm {
+            crate::storage::InsertConflictArm::Merge => {
+                std::borrow::Cow::Borrowed(embed_upsert_sql)
+            }
+            crate::storage::InsertConflictArm::Refuse => {
+                let head = embed_upsert_sql
+                    .split("ON CONFLICT")
+                    .next()
+                    .unwrap_or(embed_upsert_sql);
+                std::borrow::Cow::Owned(
+                    [
+                        head,
+                        "ON CONFLICT (title, namespace) DO NOTHING\n            RETURNING id",
+                    ]
+                    .concat(),
+                )
+            }
+            crate::storage::InsertConflictArm::RestoreSameId => {
+                let body = embed_upsert_sql
+                    .rsplit_once("RETURNING id")
+                    .map_or(embed_upsert_sql, |(head, _)| head);
+                std::borrow::Cow::Owned(
+                    [
+                        body,
+                        "WHERE memories.id = EXCLUDED.id\n            RETURNING id",
+                    ]
+                    .concat(),
+                )
+            }
         };
         let id: Option<String> = sqlx::query(&embed_sql)
             .bind(&memory.id)
@@ -26972,13 +27036,14 @@ impl PostgresStore {
             .map(|r| r.try_get::<String, _>("id"))
             .transpose()
             .map_err(|e| to_store_err(READ_RETURNED_ID, e))?;
-        // #2771 — the no-overwrite (DO NOTHING) arm inserted nothing: a
-        // concurrent writer already holds (title, namespace). Refuse
-        // fail-closed with the typed conflict — NEVER overwrite. Re-probe
-        // the winner's id in-tx best-effort; a TOCTOU gap (winner deleted
-        // between the conflict and this read) degrades to an empty id,
-        // never a retry-as-create. The merge (DO UPDATE) arm always RETURNs
-        // a row, so this branch is unreachable when fail_on_conflict is false.
+        // #2771/#2887 — a non-Merge arm inserted nothing → a DIFFERENT id holds
+        // (title, namespace): `Refuse` (DO NOTHING) on ANY collision;
+        // `RestoreSameId` on a foreign-id owner (the CAS WHERE memories.id =
+        // EXCLUDED.id is false → skip, no RETURNed row). Refuse fail-closed with
+        // the typed conflict — NEVER overwrite. Re-probe the occupant's id in-tx
+        // best-effort; a TOCTOU gap (winner deleted between the conflict and this
+        // read) degrades to an empty id, never a retry-as-create. `Merge` always
+        // RETURNs a row, so this branch is unreachable under it.
         let id = match id {
             Some(id) => id,
             None => {
