@@ -9534,7 +9534,15 @@ mod tests {
         let restored: Capabilities = serde_json::from_value(val).unwrap();
         assert_eq!(restored.schema_version, "2");
         assert_eq!(restored.permissions.mode, "advisory");
-        assert!(restored.compaction.status.planned);
+        // #2400 — compaction SHIPPED at v0.8.0 (#1749 `ConsolidationPass`); the
+        // round-trip now pins `planned: false` (shipped-not-planned) at the
+        // current package version, consistent with the live capabilities report.
+        // Was `planned: true` / `version: "v0.8+"` pre-#2400 (an under-claim).
+        assert!(!restored.compaction.status.planned);
+        assert_eq!(
+            restored.compaction.status.version,
+            env!("CARGO_PKG_VERSION")
+        );
         // v0.7.0 #1324 — transcripts substrate ships at v0.7.0; the
         // capability flag was `planned: true` pre-#1324 (mis-advertised
         // the substrate as roadmap-only). Round-trip now pins
