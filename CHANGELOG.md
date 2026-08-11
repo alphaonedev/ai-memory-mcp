@@ -84,6 +84,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed (cert truthfulness — published-claims reconciliation)
 
+- **A HIPAA/GDPR compliance preset no longer boots SILENT while advertising
+  at-rest encryption / actor pseudonymization it does not perform**
+  ([#2401](https://github.com/alphaonedev/ai-memory-mcp/issues/2401);
+  substrate-blocking compliance defaults-lie). `CompliancePreset.encrypt_at_rest`
+  and `.pseudonymize_actors` (`src/config.rs`) had ZERO consumers, yet the
+  shipped preset templates + `docs/CONFIG_SCHEMA.md` printed
+  `encrypt_at_rest = true` / `pseudonymize_actors = true` — so an `applied`
+  HIPAA/GDPR preset booted claiming controls the substrate never ran (the exact
+  bet-the-farm overclaim on a compliance surface). The boot path now **FAILS
+  CLOSED — a hard boot ERROR**: `AuditComplianceConfig::unenforced_claims`
+  detects an `applied` preset that advertises `encrypt_at_rest` while the real
+  at-rest content-encryption gate (`crate::encryption::encryption_enabled(None)`
+  — `--features sqlcipher` + `AI_MEMORY_ENCRYPT_AT_REST=1`, env #37) is inactive,
+  OR that advertises `pseudonymize_actors` at all (RESERVED / no consumer at
+  v1.0.0, unsatisfiable); `daemon_runtime::run` logs each unenforced field at
+  ERROR (`tracing` target `compliance.unenforced`) then RETURNS an error
+  (`AuditComplianceConfig::overclaim_refusal_message`) so the process REFUSES to
+  boot (non-zero exit) rather than serve while silently not performing a claimed
+  compliance control. This is the operator cutline ruling (2026-08-01,
+  §1-condition-2: a compliance defaults-lie is a hard boot ERROR) — a binding
+  prescription that governs over an earlier 5-agent WARN vote (a vote cannot
+  override an explicit operator ruling; Fable escalated the correction on review
+  of PR #2897). Refusing is safe + correct: pre-GA (no fielded v1.0.0 to brick)
+  and the preset is opt-in, so a HIPAA/GDPR surface never serves while silently
+  not encrypting at rest. `pseudonymize_actors` is **retired from the shipped
+  preset templates** (`docs/CONFIG_SCHEMA.md` + the embedded config template);
+  the `CompliancePreset` field docs describe both fields as enforcement-gated
+  claims, not switches. Regression: `tests/compliance_capability_truth_2400_2401.rs`.
+- **`memory_capabilities` no longer under-claims compaction as `planned` — it
+  SHIPPED at v0.8.0** ([#2400](https://github.com/alphaonedev/ai-memory-mcp/issues/2400);
+  capability-truth). The capabilities surface reported
+  `compaction = {planned: true, version: "v0.8+"}` while the destructive
+  consolidator has been live since #1749 (`crate::curator::compaction::ConsolidationPass`).
+  It now reports `shipped` — `planned: false` at the current package version —
+  carrying the runtime `enabled` state (opt-in via
+  `AI_MEMORY_COMPACTION_ENABLED`, env #81), mirroring the `CapabilityTranscripts::shipped`
+  precedent. A process-wide report-only flag (`config::{set_compaction_enabled,
+  compaction_enabled}`) is seeded at boot from
+  `AppConfig::resolve_compaction_enabled` (`#[cfg(not(test))]`-gated for test
+  isolation, the lineage-DAG-seed precedent) so the surface carries the resolved
+  enablement without an `AppConfig` handle in scope; it drives NO storage
+  behavior. Capability SSOT tests (`tests/capabilities_v2.rs`, `src/mcp/mod.rs`,
+  `src/config.rs`, `src/handlers/tests.rs`) reconciled in lockstep. Regression:
+  `tests/compliance_capability_truth_2400_2401.rs`.
 - **The published LongMemEval keyword headline figures are now MEASURED on
   the v1.0.0 binary, not carried over from the v0.7.0 run**
   ([#2888](https://github.com/alphaonedev/ai-memory-mcp/issues/2888); cert

@@ -1154,6 +1154,59 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
     // (serve / mcp / CLI) before any write, mirroring the secret-screen
     // seed above.
     crate::config::set_active_capability_config(app_config.load_capability_config());
+    // v1.0.0 #2400 — seed the process-wide REPORT-ONLY compaction-enabled flag
+    // from the resolved `[curator.compaction]` config (env
+    // `AI_MEMORY_COMPACTION_ENABLED` #81 > section > compiled `false`). Read
+    // ONLY by the `memory_capabilities` reporter so it can carry the
+    // shipped-feature `enabled` bit; drives NO storage/consolidate behavior (the
+    // live consolidator reads `CuratorConfig.compaction.enabled`, threaded
+    // independently at the curator build sites). `#[cfg(not(test))]`-gated for
+    // TEST ISOLATION ONLY, mirroring the lineage-DAG seed above — the lib's own
+    // `cargo test --lib` build skips it so a `run()` dispatch test cannot flip
+    // the atomic under a concurrent capabilities unit test; the production
+    // binary and every `tests/` integration test exercise the real seed.
+    #[cfg(not(test))]
+    crate::config::set_compaction_enabled(app_config.resolve_compaction_enabled());
+    #[cfg(test)]
+    let _ = app_config.resolve_compaction_enabled();
+    // v1.0.0 #2401 — FAIL CLOSED on a compliance-preset defaults-lie. An
+    // `applied` SOC2/HIPAA/GDPR/FedRAMP preset that sets `encrypt_at_rest = true`
+    // (while the real at-rest content-encryption gate is inactive) or
+    // `pseudonymize_actors = true` (RESERVED — zero consumer at v1.0.0, so
+    // permanently unsatisfiable) used to boot SILENT while the docs + preset
+    // templates advertised the control — the exact bet-the-farm overclaim on a
+    // compliance surface. Per the operator cutline ruling (2026-08-01,
+    // §1-condition-2), a compliance defaults-lie is a HARD BOOT ERROR, not a
+    // WARN: `applied && flag && !real_gate` REFUSES to boot. This binding
+    // prescription governs over the earlier 5-agent WARN vote (a vote cannot
+    // override an explicit operator ruling; Fable escalated the correction on
+    // PR #2897). Refusing is safe + correct here — pre-GA (no fielded v1.0.0 to
+    // brick) and the preset is opt-in, so a HIPAA/GDPR surface never serves
+    // while silently not encrypting at rest. The `encrypt_at_rest` real gate is
+    // `crate::encryption::encryption_enabled(None)` — the exact signal the
+    // storage write path consults for at-rest content sealing.
+    if let Some(compliance) = app_config.effective_audit().compliance.as_ref() {
+        let at_rest_active = crate::encryption::encryption_enabled(None);
+        let claims = compliance.unenforced_claims(at_rest_active);
+        if !claims.is_empty() {
+            for claim in &claims {
+                tracing::error!(
+                    target: "compliance.unenforced",
+                    preset = claim.preset,
+                    field = claim.field,
+                    "COMPLIANCE PRESET OVERCLAIM — [audit.compliance.{preset}].{field} = true is \
+                     ADVERTISED but NOT ENFORCED: {does_not}. Remediation: {remediation}.",
+                    preset = claim.preset,
+                    field = claim.field,
+                    does_not = claim.does_not,
+                    remediation = claim.remediation,
+                );
+            }
+            return Err(anyhow::anyhow!(
+                crate::config::AuditComplianceConfig::overclaim_refusal_message(&claims)
+            ));
+        }
+    }
     // #1604 — seed the process-wide rerank input-sequence cap from the
     // resolved `[reranker]` config (env `AI_MEMORY_RERANK_MAX_SEQ` >
     // `[reranker].max_seq_tokens` > compiled default). Every subsequent

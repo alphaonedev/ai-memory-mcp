@@ -7428,11 +7428,13 @@ mod tests {
             "v2 drops hooks.by_event (no event registry)"
         );
 
-        // compaction block — planned-feature shape (P1 honesty patch).
+        // compaction block — #2400: shipped-feature shape (v0.8.0 #1749);
+        // planned=false at the current package version, enabled reflects the
+        // opt-in runtime state (unseeded default false here).
         assert!(val["compaction"].is_object(), "compaction block present");
-        assert_eq!(val["compaction"]["planned"], true);
+        assert_eq!(val["compaction"]["planned"], false);
         assert_eq!(val["compaction"]["enabled"], false);
-        assert_eq!(val["compaction"]["version"], "v0.8+");
+        assert_eq!(val["compaction"]["version"], env!("CARGO_PKG_VERSION"));
         assert!(val["compaction"].get("interval_minutes").is_none());
         assert!(val["compaction"].get("last_run_at").is_none());
         assert!(val["compaction"].get("last_run_stats").is_none());
