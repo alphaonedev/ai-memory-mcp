@@ -274,3 +274,123 @@ The under-replication is discoverable and reconcilable via the returned id — e
 `doctl compute droplet list --tag-name ai-memory-hive` → **EMPTY**; full-list grep → **zero
 ai-memory droplets** (count 0). A 95-min money-safety watchdog was armed at spawn and never
 fired. Timestamp **2026-08-10T19:21:47Z**. Spend ~**$0.03**.
+
+---
+
+# FINAL out-of-box re-verify — #2865/#2867 key-dir fallback proven WITHOUT a manual DB-bind (2026-08-10/11)
+
+**Round date:** 2026-08-10/11 (EXECUTED — the CERT-GATING verification that closes the DO federation-convergence surface)
+**Base:** `release/v1.0.0` @ `5f99b3cc` (the FULL merged fix stack: #2856→#2861, #2857→#2859, #2860→#2862, #2863→#2866, and **#2865→#2867 `5f99b3cc`** — the runtime push-write-sig key-dir fallback)
+**Orchestrator:** Opus 5 (`hard-coder`), FINAL DO cert round. Spend operator-authorized 2026-08-10 ($100 budget).
+**Disposition:** **OUT-OF-BOX CONVERGENCE PROVEN on a real 2-node federated DO mesh** (pg16.14 + AGE 1.6.0 + pgvector 0.8.4, mTLS, W=2, v1.0.0-default strict write-sig). A daemon-authored **LLM** consolidation (real Grok 4.5 summary) AND its tombstoned sources ALL converge at `attest_level=agent_attested` at the peer **WITHOUT any manual peer-federation DB-bind** — relying ONLY on `fed-bootstrap` stage-E key-dir cross-enrollment. This certifies **#2860 (convergence) + #2863 (source-attest parity) + #2865 (key-dir resolution)** together. **NO RED, no new anomalies filed.** Hive **torn down; zero droplets.**
+
+## The KEY DIFFERENCE from the prior #2860 re-verify
+
+The prior #2860 round (above) **manually DB-bound each node's federation identity** (`ai:hive-memory-N`) into the peer's `agent_pubkey` registry via the admin `PUT /api/v1/agents/{id}/pubkey` route, because the pre-#2867 push content-write-sig lane resolved the author key from the DB registry ONLY. Without that manual bind the consolidated `C` landed `claimed` (present, visible, not skipped) — the documented residual that recommended `fed-bootstrap` should DB-bind the peer federation identities too.
+
+**#2867 removed that requirement.** The push author-key resolver (`handlers::federation_receive::resolve_author_bound_key`) now consults the on-disk enrolled key-dir (`crate::identity::verify::lookup_peer_public_key`) as a MISS-ONLY fallback after the DB registry — the SAME source the pull/signal/transition author lanes already trust, and the SAME source `fed-bootstrap` stage E already cross-enrolls. **This round proves it out-of-box: NO `agents bind-key` / admin `PUT` of any peer federation identity was performed** beyond what `fed-bootstrap` does. `C` reached `agent_attested` anyway.
+
+## Provisioned topology (as-run)
+
+| item | value |
+|------|-------|
+| spawn | `./spawn.sh apply -var memory_count=2 -var agent_count=0 -var quorum_writes=2` (the #2850-fixed `-var` CLI channel — worked verbatim) |
+| memory nodes | `ai:hive-memory-1` 209.97.149.180 (priv 10.20.0.3), `ai:hive-memory-2` 134.209.47.165 (priv 10.20.0.2) |
+| store | PostgreSQL 16.14 + Apache AGE **1.6.0** + pgvector **0.8.4** (`kg_backend=age` confirmed in node1 boot log) |
+| binary | fixed tip `5f99b3cc`, `cargo build --release --features sal,sal-postgres` (40 027 016 bytes), scp'd to `/opt/ai-memory/bin/ai-memory` on both nodes (`ai-memory --version` = 1.0.0); serve (fed-bootstrap stage F) runs the fixed binary |
+| crypto | mTLS everywhere (per-node leaves, `--mtls-allowlist`); W=2 quorum over mutual TLS |
+| attestation | v1.0.0 default-ON: `AI_MEMORY_FED_REQUIRE_WRITE_SIG` UNSET → strict (confirmed by the node2 boot WARN "as of the v1.0.0 flip the default for inbound relayed per-write content signatures is now REQUIRED"); `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` unset (default permissive) |
+| AI NHI brain | **Grok 4.5** via OpenRouter (`x-ai/grok-4.5`) wired into node1's daemon (`api_key_file`); node1 boot log: `L5: llm client ready — backend=openrouter model=x-ai/grok-4.5` |
+| runtime / spend | spawn 2026-08-10T23:25:02Z → teardown **2026-08-11T00:01:38Z**, ~**36 min** droplet uptime; spend ~**$0.02** (of the $100 budget) |
+
+## Track D core — RE-CONFIRMED GREEN on the fixed binary, out-of-box
+
+`./federate.sh all` verbatim: **9 PASS / 0 FAIL**. No manual peer-fed DB-bind was added; `federate.sh` stage E cross-enrolls each node's federation `.pub` into the peer's KEY_DIR only, stage H DB-binds the `ai:hive-author` content author only.
+
+```
+PASS: node 1 /health over mTLS (200)
+PASS: node 1 refuses a client presenting no cert
+PASS: node 2 /health over mTLS (200)
+PASS: node 2 refuses a client presenting no cert
+PASS: CROSS-HOST: node 1 reaches node 2 at https://10.20.0.2:9077 over mutual TLS (200)
+PASS: W-of-N quorum write at node 1 committed + replicated (201 quorum_met)
+PASS: quorum write replicated: id 66134f6c-1a22-449d-bca3-92cbbea6776e readable at node 2
+PASS: signed write accepted at node 1 (201 id=9328ce02-1d55-4f0b-a27b-29302d4c9e98)
+PASS: signed cross-peer write lands attest_level=agent_attested at node 2
+----
+federate verify: 9 PASS / 0 FAIL
+```
+
+## ⭐ OUT-OF-BOX CONVERGENCE ASSERTIONS (the point) — per-assertion PASS/FAIL
+
+**Method.** On node1, store 2 signed near-dup SIGNED source memories (author `ai:hive-author`, namespace `fed-conv`), confirm they replicate to node2 at `agent_attested` (baseline), then `POST /api/v1/consolidate {ids, title, use_llm:true}` as `ai:hive-author`. The daemon produced a **real Grok 4.5 LLM summary** (not the deterministic concat fallback) and authored the consolidated `C` as the daemon's FEDERATION identity `ai:hive-memory-1` (#2860), self-relaying it to node2. Assert on **node2** by pg-direct query (`sudo -u postgres psql -d aimemory`).
+
+- Sources: `91b73102-f1c2-45d8-b71d-3e1402d44e4a`, `2c174183-3b6e-4a0e-9c60-91d5fded4155`
+- Consolidated `C` (CID): `d928f5ed-f738-439f-be03-e6f1f688d83c`
+- Consolidate response: `HTTP 201`, `summary = "The DO out-of-box convergence proof shows node1 storing two signed near-duplicate source memories on federated attestation: one via key-dir fallback and the other resolved through the enrolled key directory."` (Grok 4.5)
+
+**Baseline (node2, pg-direct) — sources replicate at agent_attested BEFORE consolidate:**
+```
+id | namespace | lifecycle_state | agent_id | attest_level | has_write_sig
+2c174183-…|fed-conv|open|ai:hive-author|agent_attested|t
+91b73102-…|fed-conv|open|ai:hive-author|agent_attested|t
+```
+
+| # | Assertion | Result | Verbatim node2 evidence (pg-direct) |
+|---|-----------|--------|-------------------------------------|
+| (a) | Consolidated `C` PRESENT at node2, NOT skipped, at `attest_level=agent_attested` (NOT `claimed`) | **PROVEN PASS** | `d928f5ed-…\|open\|ai:hive-memory-1\|agent_attested\|has_write_sig=t\|propagated_trust=agent_attested\|summary_source=substrate` |
+| (b) | `derived_from` edges `C→sources` present at node2 | **PROVEN PASS** | `memory_links`: `d928f5ed-…→2c174183-… derived_from`, `d928f5ed-…→91b73102-… derived_from`; `C.metadata.derived_from = ["91b73102-…","2c174183-…"]` |
+| (c) | Source tombstones converged AND the tombstoned SOURCE rows at node2 are `agent_attested` (NOT `claimed`) — **#2863** | **PROVEN PASS** | `2c174183-…\|tombstoned\|ai:hive-author\|agent_attested\|has_write_sig=t`; `91b73102-…\|tombstoned\|ai:hive-author\|agent_attested\|has_write_sig=t` |
+| (d) | NO silent skip in node1 federation log; `C` provably reached node2 | **PROVEN PASS** | node1 journal: NO `unenrolled_author_strict` / `item(s) skipped`; `broadcast_consolidate_quorum` emits a WARN ONLY on peer failure (`src/federation/sync.rs:1293`) — none emitted, so the push succeeded; `C.created_at` is BYTE-IDENTICAL on both nodes (`2026-08-10 23:55:35.489013+00`), proving the SAME relayed row (a locally-regenerated row would carry a new timestamp) |
+
+**Final tally:** out-of-box convergence re-verify **PASS on all four assertions** (CID `d928f5ed-f738-439f-be03-e6f1f688d83c`).
+
+## ⭐⭐ The LOAD-BEARING out-of-box proof — `ai:hive-memory-1` resolved ONLY via key-dir
+
+This is what distinguishes #2867's out-of-box fallback from the prior manual-DB-bind round. On postgres the DB `agent_pubkey` registry is `metadata->>'agent_pubkey'` on a per-agent registration memory row in the `_agents` namespace (`PostgresStore::agent_pubkey`, `src/store/postgres.rs:20332`). At node2, verbatim:
+
+```
+-- node2 DB registry (_agents namespace) — ONLY the content author is DB-bound:
+SELECT title, (metadata->>'agent_pubkey' IS NOT NULL) FROM memories WHERE namespace='_agents';
+  agent:ai:hive-author | t          # (pubkey prefix OdM9aAiBFjM0…, bound by fed-bootstrap stage H)
+
+-- C's author ai:hive-memory-1 has ZERO rows in the DB registry:
+SELECT count(*) FROM memories WHERE namespace='_agents' AND title='agent:ai:hive-memory-1';
+  0
+
+-- yet ai:hive-memory-1.pub IS present in node2's KEY_DIR (fed-bootstrap stage E cross-enroll):
+/etc/ai-memory/keys/ai:hive-memory-1.pub
+/etc/ai-memory/keys/ai:hive-memory-2.pub
+/etc/ai-memory/keys/daemon.pub
+```
+
+**Therefore:** `C` (authored `ai:hive-memory-1`) reaching `attest_level=agent_attested` at node2 could ONLY have resolved `ai:hive-memory-1`'s verification key via the **#2867 key-dir fallback** — the DB registry has NO entry for it and none was manually added. **#2867's runtime push-write-sig key-dir fallback is PROVEN OUT-OF-BOX.** The contrast is crisp and confirms the miss-only resolver: the sources (`ai:hive-author`, DB-bound at stage H) resolve via the DB registry (would work pre-#2867 too); `C` (`ai:hive-memory-1`, key-dir-only) resolves via the fallback (landed `claimed`/quarantined pre-#2867).
+
+## PROVEN ledger
+
+| claim | status | proof |
+|---|---|---|
+| Track D core (mTLS, cross-host, W=2 quorum, signed→agent_attested) on the fixed binary, out-of-box | **PROVEN** | `federate.sh` 9/0 (no manual peer-fed DB-bind) |
+| #2860 (a) consolidated `C` converges at `agent_attested` OUT-OF-BOX | **PROVEN** | node2 pg dump: `agent_attested`, `propagated_trust=agent_attested` |
+| #2865/#2867 key-dir fallback resolves `C`'s author WITHOUT a DB-bind | **PROVEN** | node2 `_agents` registry has 0 rows for `ai:hive-memory-1`; `ai:hive-memory-1.pub` present in KEY_DIR |
+| #2860 (b) `derived_from` edges converge | **PROVEN** | node2 `memory_links` + `metadata.derived_from` |
+| #2863 (c) tombstoned SOURCE rows converge at `agent_attested` (not `claimed`) | **PROVEN** | node2 pg dump: both sources `tombstoned` + `agent_attested` |
+| #2860 (d) no silent skip; C is the same relayed row | **PROVEN** | node1 journal (no skip); `created_at` byte-identical both nodes |
+| genuine daemon-authored LLM consolidation (not deterministic fallback) | **PROVEN** | Grok 4.5 summary in the 201 response; `L5: llm client ready backend=openrouter` boot log |
+
+## Findings this round (1:1)
+
+**NONE.** No RED assertion, no new anomaly. The #2863 residual surfaced by the prior round is CLOSED (tombstoned source rows converge at `agent_attested`), and the #2860 residual recommendation (that daemon-authored derived content should converge at `agent_attested` out-of-the-box, without a manual DB-bind) is CLOSED by #2867.
+
+**Observation (documented, not filed — C5 discipline):** the consolidate quorum-broadcast path (`broadcast_consolidate_quorum`, `src/federation/sync.rs`) emits NO success-path INFO line (it WARNs only on a peer failure), unlike the per-store `federation::broadcast: store <id>` INFO line. This is a logging-verbosity characteristic, NOT a silent skip — `C` provably converged with a byte-identical `created_at` and full attestation, which is the OPPOSITE of the #2856 "2xx, 1 item skipped" symptom. Not a defect.
+
+## Can the DO federation-convergence surface be certified?
+
+**YES — out-of-box convergence is PROVEN on a real mesh.** All four assertions (a/b/c/d) pass WITHOUT any manual peer-federation DB-bind; the daemon-authored LLM consolidation and its tombstoned sources ALL converge at `attest_level=agent_attested` at the peer, resolved by the #2867 runtime key-dir fallback that mesh enrollment (`fed-bootstrap` stage E) already populates. #2860 + #2863 + #2865 are certified together. Final close/merge remains Fable-gated.
+
+## Teardown confirmation
+
+`infra/do-hive/teardown.sh` destroyed 4 resources (2 memory + VPC + firewall).
+`doctl compute droplet list --tag-name ai-memory-hive` → **EMPTY**; full-list grep → **zero
+ai-memory droplets** (count 0). A 95-min money-safety watchdog was armed at spawn and
+disarmed at teardown (never fired). Timestamp **2026-08-11T00:01:38Z**. Spend ~**$0.02**.
