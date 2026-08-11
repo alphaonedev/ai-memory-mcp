@@ -570,6 +570,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run required-contexts gate
         run: bash scripts/check-required-contexts.sh
+      - name: One-declaration-source gate (#2534 — branch-protection.yml)
+        # HARD-FAIL if .github/branch-protection.yml re-declares a bare
+        # `required_checks` key. The required-status-check set has ONE
+        # declaration source (required-contexts-release.txt, verified by the
+        # gate above); a second hand-maintained list in branch-protection.yml
+        # is exactly the #2443 defect. Runs as a step of THIS already-required
+        # job (no new required context to add to the mirror).
+        run: bash scripts/check-branch-protection.sh
+      - name: Self-test the one-declaration-source gate (#2534)
+        run: bash scripts/check-branch-protection.sh --self-test
       - name: Self-test the gate (regression evidence)
         # --self-test plants each historical shape in a throwaway copy UNDER
         # the repo (never system /tmp): the (b1) matrix+`if:` wedge, an (a)
