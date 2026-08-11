@@ -43,7 +43,7 @@ CORPUS = [
     "The federation quorum uses W=2-of-3 mTLS with /sync/* bypassing the api_key "
     "under client-cert auth, so peer health gates and quorum POSTs succeed without "
     "presenting the daemon HTTP api_key.",
-    "pgvector 0.8.2 HNSW index over the 768-dim nomic-embed-text vectors stored in "
+    "pgvector 0.8.5 HNSW index over the 768-dim nomic-embed-text vectors stored in "
     "PostgreSQL 18.4; the daemon connects over TLS verify-full and the ANN search "
     "honors hnsw.ef_search at query time.",
     "Reflection: across the do-1461 provisioning run the role.sql application site "

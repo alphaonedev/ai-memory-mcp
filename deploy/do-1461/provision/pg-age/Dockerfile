@@ -1,7 +1,7 @@
 # Copyright 2026 AlphaOne LLC
 # SPDX-License-Identifier: Apache-2.0
 #
-# Reproducible PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.2 image for the
+# Reproducible PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.5 image for the
 # do-1461 SHARED substrate (one pg droplet; every peer keyed to its own
 # search_path schema ic_peer_<N>). Mirrors deploy/docker-1461/Dockerfile.pg-age-vector
 # EXACTLY so the DO fleet and the local Docker mesh assert the SAME upstream

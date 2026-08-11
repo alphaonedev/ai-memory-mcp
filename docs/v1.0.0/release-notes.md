@@ -235,14 +235,21 @@ runs (the vendored `paste` fork rev went unreachable,
 1.7.0 / 0.8.5 as **additionally validated**, not continuously certified;
 the continuously-tested combination is PG 16 / AGE 1.6.0.
 
-> **A separate SSOT-internal pin drift, disclosed rather than papered
-> over:** `deploy/docker-1461/provision/lib.sh` pins pgvector **0.8.5**
-> while the sibling `deploy/do-1461/provision/lib.sh` pins pgvector
-> **0.8.2** (`EXPECTED_PGVECTOR_VERSION=0.8.2`). The two provisioning
-> SSOTs do not agree on the pgvector patch, and the CI-vs-SSOT AGE drift
-> (CI 1.6.0 vs SSOT 1.7.0) is
-> [#2512](https://github.com/alphaonedev/ai-memory-mcp/issues/2512) defect
-> 2. Both are tracked, not silently reconciled in prose.
+> **Cross-lane pgvector pin — reconciled ([#2872](https://github.com/alphaonedev/ai-memory-mcp/issues/2872)).**
+> Both certified provisioning SSOTs now pin pgvector **0.8.5**:
+> `deploy/docker-1461/provision/lib.sh` (`PGVECTOR_APT_VERSION=0.8.5-1.pgdg13+1`,
+> the container lane on Debian 13) and `deploy/do-1461/provision/lib.sh`
+> (`PGVECTOR_APT_VERSION=0.8.5-1.pgdg24.04+1`,
+> `EXPECTED_PGVECTOR_VERSION=0.8.5`, the NATIVE lane on Ubuntu 24.04). Only
+> the pgdg distro suffix differs by lane (`pgdg13` vs `pgdg24.04`); the
+> patch version is identical and both distro builds exist in the live pgdg
+> apt repo. The earlier `do-1461` pin of `0.8.2` was accidental drift and
+> was additionally no longer resolvable (pgdg keeps only a rolling window,
+> so `0.8.2-1.pgdg24.04+1` is absent from noble-pgdg). Cross-lane parity is
+> now asserted mechanically by `tests/provisioning_pgvector_pin_parity.rs`,
+> so a future accidental divergence fails loudly. The remaining CI-vs-SSOT
+> AGE drift (CI 1.6.0 vs SSOT 1.7.0) is separate and still tracked as
+> [#2512](https://github.com/alphaonedev/ai-memory-mcp/issues/2512) defect 2.
 
 ### What those AGE greens attest — read this before relying on them
 
