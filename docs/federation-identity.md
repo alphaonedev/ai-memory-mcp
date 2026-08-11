@@ -3,6 +3,12 @@ layout: doc
 ---
 # Federation identity at scale — enterprise zero-touch trust
 
+> ## Certified trust boundary (canonical)
+>
+> **This is the canonical statement of the federation trust boundary. Where it conflicts with anything else in this or any other federation document, this statement supersedes.**
+>
+> Peers are **authenticated but NOT trusted for integrity or authorization**: a peer must not write, link, approve, veto, or set governance outside its PeerScope. Peers **ARE trusted for confidentiality** of content routed to them: a receiving peer stores and can read that content in plaintext (#1968). Isolation between mutually-distrusting tenants is achieved by **disjoint deployments**, not by cryptography and not by PeerScope. A peer you would not let read a namespace must not be federated that namespace.
+
 > **Audience:** operators and platform/DevOps engineers deploying a
 > federated `ai-memory` fleet. This is the configuration **and** admin
 > reference for the CA-rooted, attestation-issued, short-lived
@@ -461,7 +467,7 @@ These are the load-bearing checks, each pinned end-to-end in
 | Rejection | Error | Cause |
 |---|---|---|
 | Broken name binding | `ChainError::NameMismatch` | A leaf's `issuer_id` ≠ the intermediate's `subject_agent_id` (a rogue issuer trying to ride a legitimate anchor). |
-| Wrong trust domain | `CredentialError::WrongTrustDomain` | A credential minted in another domain presented to a domain-scoped bundle (multi-tenant isolation). |
+| Wrong trust domain | `CredentialError::WrongTrustDomain` | A credential minted in another domain presented to a domain-scoped bundle (credential-replay scope only — NOT confidentiality isolation between parties inside one domain; see §"What `trust_domain` does and does not bound"). |
 | Expired credential | `CredentialError::Expired` | `now > not_after` (default leaf TTL is 1h). |
 | Not yet valid | `CredentialError::NotYetValid` | `now < not_before` (clock skew beyond `DEFAULT_CLOCK_SKEW_SECS`). |
 | Unknown issuer | `CredentialError::UnknownIssuer` | The credential's `issuer_id` is not in the trust bundle. |

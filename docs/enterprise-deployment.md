@@ -3,6 +3,12 @@ layout: doc
 ---
 # Enterprise deployment topologies for ai-memory v1.0.0
 
+> ## Certified trust boundary (canonical)
+>
+> **This is the canonical statement of the federation trust boundary. Where it conflicts with anything else in this or any other federation document, this statement supersedes.**
+>
+> Peers are **authenticated but NOT trusted for integrity or authorization**: a peer must not write, link, approve, veto, or set governance outside its PeerScope. Peers **ARE trusted for confidentiality** of content routed to them: a receiving peer stores and can read that content in plaintext (#1968). Isolation between mutually-distrusting tenants is achieved by **disjoint deployments**, not by cryptography and not by PeerScope. A peer you would not let read a namespace must not be federated that namespace.
+
 > **Version currency.** This document was authored against v0.7.0 and
 > carries v0.7.0-era references throughout. It has been re-adjudicated
 > against v1.0.0 for its **claims** (§9.4 topology, §11.1 capacity,
@@ -1338,9 +1344,9 @@ For an operator piloting a hive in v0.7.0, the responsible shape is:
 6. **Edge-tier "pull-only" leaves.** Mobile/IoT/browser leaves configured with empty `allowed_sender_agent_ids` on inbound; pull-only via narrow `allowed_namespaces` outbound.
 7. **Manual escalation on hot-key writes.** No distributed lock ships; the Memory `version` column (Gap-1 optimistic concurrency, schema v45) detects conflicts and the operator resolves.
 
-### 9.5 Hive gaps as v0.8 roadmap
+### 9.5 Hive gaps as v1.x roadmap
 
-The gaps in §9.3 are honest scope for v0.8/v0.9: distributed consensus coordinator over root tier; cross-tier governance-rule replication on the wire; mobile FFI surface (C-callable `extern "C"` items in `src/lib.rs`); edge-pull-only operator-policy flag; automatic edge-tier discovery (service registry). A hive in v0.7.0 is a **pilot**, not a production deployment for >100 nodes.
+The gaps in §9.3 **remain open at v1.0.0** and are v1.x scope, not closed by this release: distributed consensus coordinator over root tier; cross-tier consistent snapshotting; cross-tier governance-rule replication on the wire; the full C-ABI FFI surface (v1.0.0 ships a single C-callable symbol, `ai_memory_version()`, per `tests/ffi_version_arch_10.rs`; the broader C/Swift/Kotlin memory API is #1977); edge-pull-only operator-policy flag; automatic edge-tier discovery (service registry). The certified federation envelope is a **500&ndash;1000 agent cluster composed in 500-agent blocks, &le;50 peers** (a derived topology ceiling, not a measured 1M-agent capacity), and the hive / T8 shape is a **pilot**, not a production deployment for >100 nodes. See [`federation.md`](federation.html) for the certified trust boundary at the top of this document.
 
 ---
 

@@ -3,6 +3,12 @@ layout: doc
 ---
 # Federation hardening (mTLS + X-API-Key + peer attestation)
 
+> ## Certified trust boundary (canonical)
+>
+> **This is the canonical statement of the federation trust boundary. Where it conflicts with anything else in this or any other federation document, this statement supersedes.**
+>
+> Peers are **authenticated but NOT trusted for integrity or authorization**: a peer must not write, link, approve, veto, or set governance outside its PeerScope. Peers **ARE trusted for confidentiality** of content routed to them: a receiving peer stores and can read that content in plaintext (#1968). Isolation between mutually-distrusting tenants is achieved by **disjoint deployments**, not by cryptography and not by PeerScope. A peer you would not let read a namespace must not be federated that namespace.
+
 > **Looking for zero-touch trust?** This document covers the
 > **transport/identity hardening** layer — mTLS allowlist, X-API-Key, and
 > the per-peer attestation JSON. The newer **CA-rooted, attestation-issued,
