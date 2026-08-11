@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (create data-integrity — CERT-BLOCKING)
+
+- **The default `on_conflict=error` create disposition is now ATOMICALLY
+  fail-closed on BOTH backends — a concurrent create racing the same
+  `(title, namespace)` can no longer silently overwrite the first writer's
+  durable content** ([#2771](https://github.com/alphaonedev/ai-memory-mcp/issues/2771);
+  5-agent adversarial vote `4d3ea1c5`, UNANIMOUS for the byte-identical
+  `DO NOTHING` variant). Pre-fix the `error` path was probe-then-upsert on both
+  backends: `find_by_title_namespace` → `Ok(None)` → `INSERT … ON CONFLICT
+  (title, namespace) DO UPDATE SET content = excluded`. A second create that
+  slipped into the key BETWEEN the probe and the write was silently
+  UPSERT-overwritten even under `error` mode — no `409`, no pre-overwrite
+  snapshot — a North-Star unintentional-data-loss defect reachable on the
+  postgres (pooled parallel Axum handlers) and multi-process sqlite surfaces.
+  The write is now atomic: `INSERT … ON CONFLICT (title, namespace) DO NOTHING
+  RETURNING id`; zero rows returned ⇒ the key was taken ⇒ the caller gets the
+  same typed `409 CONFLICT` (with `existing_id`) the up-front probe raises,
+  NEVER an overwrite. Implemented as a byte-identical twin of the happy-path
+  write (same column list / binds / seal / cid / vector-clock / `#2383`
+  reconcile / valid-time canonicalization — only the conflict arm differs, and
+  the column list is single-sourced so a future column add can never miss the
+  fail-closed path): sqlite `db::insert_no_overwrite`
+  (`src/storage/mod.rs::insert_inner`) + the SAL trait method
+  `MemoryStore::store_with_embedding_no_overwrite`
+  (`SqliteStore`/`PostgresStore` in `src/store/{sqlite,postgres}.rs`), routed
+  from the HTTP create funnels (`src/handlers/create.rs`). The `merge` and
+  `version` dispositions are unchanged (they keep the upsert / rename).
+  Regression: `tests/create_conflict_2771.rs` (single-connection deterministic +
+  a genuine two-connection sqlite race + a live-pg two-task race).
+
 ### Fixed (federation data-integrity — CERT-BLOCKING)
 
 - **Daemon-authored federated consolidations converge at `agent_attested` at

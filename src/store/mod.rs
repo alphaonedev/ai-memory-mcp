@@ -875,6 +875,29 @@ pub trait MemoryStore: Send + Sync {
         self.store(ctx, memory).await
     }
 
+    /// v1.0.0 #2771 — FAIL-CLOSED create twin of [`Self::store_with_embedding`]:
+    /// identical write funnel EXCEPT a `(title, namespace)` collision is
+    /// REFUSED atomically (`INSERT … ON CONFLICT DO NOTHING`) instead of
+    /// upsert-merged, returning [`StoreError::Conflict`] carrying the existing
+    /// row's id. This closes the probe-then-upsert lost-update on the default
+    /// `on_conflict=error` HTTP create path: a second create racing into the
+    /// same key between the up-front existence probe and the write can no
+    /// longer silently overwrite the first writer's durable content. The
+    /// `merge`/`version` dispositions keep using
+    /// [`Self::store_with_embedding`]. Backends that do not implement this
+    /// return [`StoreError::UnsupportedCapability`].
+    async fn store_with_embedding_no_overwrite(
+        &self,
+        _ctx: &CallerContext,
+        _memory: &Memory,
+        _embedding: Option<&[f32]>,
+        _space: Option<&str>,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "STORE_WITH_EMBEDDING_NO_OVERWRITE".to_string(),
+        })
+    }
+
     /// Store many memories in as few round-trips as the backend allows
     /// (#1481). Returns the upserted ids in input order.
     ///
