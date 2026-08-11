@@ -74,7 +74,19 @@ pub(crate) const SQL_UPDATE_METADATA_AND_UPDATED_AT_BY_ID: &str =
 // drive through `idx_memories_list_order` / `idx_memories_ns_list_order`
 // instead of the formerly non-sargable `(?N IS NULL OR col = ?N)` arms.
 const SQL_LIST_BASE: &str = "SELECT * FROM memories WHERE (expires_at IS NULL OR expires_at > ?)";
-const SQL_LIST_ORDER_LIMIT: &str = " ORDER BY priority DESC, updated_at DESC LIMIT ? OFFSET ?";
+// v1.0.0 #2602 — `id ASC` is the FINAL total-order tiebreak. `(priority,
+// updated_at)` ties are common (priority is 1-10; bulk/federated rows share an
+// `updated_at` ms), so WITHOUT it the row at rank k among ties — which rows page
+// vs fall off under LIMIT/OFFSET — is plan-/backend-dependent, a wire-visible
+// non-determinism. `id` is the UUID primary key (unique, NOT NULL), so the sort
+// is now a strict total order, byte-identical to the postgres twin
+// (`PostgresStore::list`) and the `memory_load_family` loader. See the v56
+// `idx_memories_ns_list_order` note: SQLite serves the `(priority, updated_at)`
+// prefix from the index and block-sorts each tie group by `id`, so early-stop
+// under LIMIT is preserved (EXPLAIN QUERY PLAN: "USE TEMP B-TREE FOR RIGHT PART
+// OF ORDER BY" — a bounded per-tie-block sort, NOT a full "FOR ORDER BY" sort).
+const SQL_LIST_ORDER_LIMIT: &str =
+    " ORDER BY priority DESC, updated_at DESC, id ASC LIMIT ? OFFSET ?";
 
 /// v0.7.0 H6 (round-2) — truncate a `DateTime<Utc>` to microsecond
 /// precision. Companion of the same-named helper in

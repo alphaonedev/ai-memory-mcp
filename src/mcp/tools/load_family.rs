@@ -336,7 +336,7 @@ pub fn handle_load_family(
            AND json_extract(metadata, '$.family') = ?2 \
            AND (expires_at IS NULL OR expires_at > ?3) \
            {lifecycle_vis} \
-         ORDER BY priority DESC, updated_at DESC \
+         ORDER BY priority DESC, updated_at DESC, id ASC \
          LIMIT ?4"
     );
 

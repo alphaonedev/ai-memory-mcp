@@ -87,6 +87,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no stopword removal) — a smaller, pre-existing tokenizer-asymmetry class
   already true for title/content, and a DEGRADE (fewer Postgres results),
   never a wrong result.
+### Fixed (data integrity — deterministic wire-visible ordering)
+
+- **`list` / `memory_load_family` and the `recall_observations` audit ledger
+  now carry a FINAL total-order tiebreak, so which rows page under LIMIT and
+  in what order the ledger reads back are no longer plan-/backend-dependent**
+  ([#2602](https://github.com/alphaonedev/ai-memory-mcp/issues/2602) +
+  [#2615](https://github.com/alphaonedev/ai-memory-mcp/issues/2615);
+  data-integrity North Star). Both surfaces ordered by a non-unique key set
+  with no tiebreak, so ties — which are COMMON — left the row at rank *k*
+  among the ties (and therefore which rows page vs fall off under LIMIT/OFFSET)
+  an arbitrary, plan-dependent choice, a wire-visible non-determinism.
+  **(#2602)** `list` (`storage::build_list_query`), `PostgresStore::list`, and
+  `memory_load_family` (always-on core profile) ordered by
+  `priority DESC, updated_at DESC` only — priority is 1-10 and bulk/federated
+  rows share an `updated_at` ms, so ties abound. All three sites now append
+  `, id ASC` (the UUID primary key — unique, NOT NULL) as the final key,
+  identical across sqlite + postgres. On sqlite the composite index
+  `idx_memories_ns_list_order` still serves the `(priority, updated_at)` walk
+  order and only block-sorts each tie group by `id` (EXPLAIN QUERY PLAN: "USE
+  TEMP B-TREE FOR RIGHT PART OF ORDER BY", a bounded per-tie sort — NOT a full
+  "FOR ORDER BY" sort), so early-stop under LIMIT is preserved and no index
+  migration is required. **(#2615)** `list_recall_observations` (both backends)
+  ordered by `observed_at DESC` only — every row a single recall appends shares
+  `observed_at` (= the tx timestamp), leaving an arbitrary permutation within
+  each `recall_id` on the append-only P0-1 AUDIT ledger. It now appends
+  `, rank ASC, memory_id ASC` for a strict total order. Regression coverage:
+  `tests/ordering_determinism_2602_2615.rs`.
 
 ### Fixed (data integrity — import round-trip)
 

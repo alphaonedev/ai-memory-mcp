@@ -284,7 +284,14 @@ pub fn list_observations(
         sql.push_str(" AND observed_at <= ?");
         binds.push(Box::new(u.to_string()));
     }
-    sql.push_str(" ORDER BY observed_at DESC LIMIT ?");
+    // v1.0.0 #2615 — total order on the append-only P0-1 AUDIT ledger. Every
+    // row a single recall appends shares `observed_at` (= the tx timestamp), so
+    // `ORDER BY observed_at DESC` alone left an ARBITRARY permutation within each
+    // recall_id — a wire-visible non-determinism on an audit surface. `rank`
+    // (the retriever's returned position) then `memory_id` (unique per recall_id)
+    // make the order strict and total, byte-identical to the postgres twin
+    // (`PostgresStore::list_recall_observations`).
+    sql.push_str(" ORDER BY observed_at DESC, rank ASC, memory_id ASC LIMIT ?");
     let lim_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
     binds.push(Box::new(lim_i64));
 

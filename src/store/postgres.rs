@@ -17835,6 +17835,12 @@ impl MemoryStore for PostgresStore {
         } else {
             ""
         };
+        // v1.0.0 #2602 — `id ASC` is the FINAL total-order tiebreak, IDENTICAL
+        // to the sqlite twin (`storage::build_list_query`) + the
+        // `memory_load_family` loader: `(priority, updated_at)` ties are common,
+        // so without it which rows page vs fall off under LIMIT was
+        // plan-/backend-dependent. `id` is the UUID primary key (unique, NOT
+        // NULL) so the sort is a strict total order on both backends.
         let list_sql = format!(
             "SELECT {cols} FROM memories
              WHERE {ns_predicate}
@@ -17856,7 +17862,7 @@ impl MemoryStore for PostgresStore {
                )
                {metadata_eq_predicate}
                {lifecycle_vis}
-             ORDER BY priority DESC, updated_at DESC
+             ORDER BY priority DESC, updated_at DESC, id ASC
              LIMIT $5",
             // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list. Also
             // covers the export egress: `export_memories` delegates to `list`.
@@ -21825,7 +21831,11 @@ impl MemoryStore for PostgresStore {
             qb.push(" AND observed_at <= ").push_bind(u.to_string());
         }
         let lim_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-        qb.push(" ORDER BY observed_at DESC LIMIT ")
+        // v1.0.0 #2615 — total order on the audit ledger, identical to the
+        // sqlite twin (`crate::observations::list_observations`): all rows a
+        // single recall appends share `observed_at`, so `rank` then `memory_id`
+        // make the within-recall order strict and deterministic.
+        qb.push(" ORDER BY observed_at DESC, rank ASC, memory_id ASC LIMIT ")
             .push_bind(lim_i64);
         let rows = qb
             .build()
