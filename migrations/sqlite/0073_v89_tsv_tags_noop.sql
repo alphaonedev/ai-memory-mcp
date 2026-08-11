@@ -1,0 +1,33 @@
+-- Copyright 2026 AlphaOne LLC
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- v1.0.0 #2392 — schema v89 is a SQLite NO-OP.
+--
+-- v89 folds `tags` into the POSTGRES stored generated `tsv` tsvector so
+-- the postgres full-text-search surface indexes title + content + tags
+-- (`src/store/postgres.rs::migrate_v89` +
+-- `migrations/postgres/0046_v89_tsv_include_tags.sql`).
+--
+-- SQLite already indexes tags: `memories_fts` is a FTS5 virtual table over
+-- `(title, content, tags)` (the `SCHEMA` const in
+-- `src/storage/migrations.rs`, kept in sync by the INSERT/DELETE triggers
+-- and the v53 `memories_au` `AFTER UPDATE OF title, content, tags` trigger,
+-- R5.F5.2 / #1418). So a tag-only-hit `q` / `context` FTS search / recall /
+-- contradiction ALREADY matches on this backend, and there is nothing for
+-- the SQLite ladder to do. The parity direction here is postgres-catches-up
+-- — the exact inverse of v55 (where SQLite added an index postgres already
+-- had) and the same shape as v57 (postgres added the stored tsvector
+-- SQLite's FTS5 already materialised).
+--
+-- No SQLite arm exists for v89: the ladder's tail already stamps
+-- `CURRENT_SCHEMA_VERSION` unconditionally, so a SQLite database moves
+-- 88 -> 89 with no DDL. This mirrors the v57 / v69 / v88 postgres-only-arm
+-- precedent, where the SQLite side is a comment in
+-- `src/storage/migrations.rs` naming THIS file and nothing more.
+--
+-- The two adapters keep ONE logical schema number, which is what
+-- `scripts/check-migration-ladder.sh` rule (d) enforces — and that rule is
+-- why this doc-twin file exists at all: without a `migrations/sqlite/`
+-- file carrying the `_v89_` tag, the highest-prefix SQLite migration file
+-- would stay `0072_v88_*` (vtag 88) and disagree with the bumped
+-- `CURRENT_SCHEMA_VERSION` (89).

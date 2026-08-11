@@ -6,7 +6,7 @@ layout: doc
 **Document classification:** Public-facing, procurement-grade.
 **Date:** first published 2026-05-23; version stamp, coverage postures, and code
 anchors re-verified against `release/v1.0.0` HEAD on 2026-08-01.
-**ai-memory version:** v1.0.0 (sqlite + postgres schema **v88**, lockstep).
+**ai-memory version:** v1.0.0 (sqlite + postgres schema **v89**, lockstep).
 **Source-of-truth inventory:** [`docs/compliance/_inventory/v0.7.0-capabilities.json`](_inventory/v0.7.0-capabilities.json) (27 capabilities, codegraph-verified at commit `4add7a8528d4c16d696b391ec6e2890269669a84`).
 **Companion document:** [`docs/compliance/honest-limitations.md`](honest-limitations.html) — what the substrate does NOT defend against.
 

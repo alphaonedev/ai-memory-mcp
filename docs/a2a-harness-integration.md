@@ -25,7 +25,7 @@ exercising this repo's binary.
 - 103 MCP tools at `--profile full`; 7 at `--profile core` + always-on
   `memory_capabilities`.
 - 94 production HTTP routes (80 unique URL paths) registered.
-- Schema v88 (single logical version across sqlite + postgres; see
+- Schema v89 (single logical version across sqlite + postgres; see
   `src/storage/migrations.rs::CURRENT_SCHEMA_VERSION`
   and `src/store/postgres.rs::CURRENT_SCHEMA_VERSION`).
 - Per-message Ed25519 federation signing (`X-Memory-Sig` header).

@@ -237,8 +237,20 @@ CREATE TABLE IF NOT EXISTS memories (
     -- column (`memories_tsv_gin`) lives in migrate_v57() per the #797
     -- convention (see the index-block comment below); existing schemas
     -- pick the column up via the same arm's ALTER TABLE.
+    -- v1.0.0 #2392 (schema v89) — folds `tags` into the tsvector so this
+    -- FTS surface indexes title+content+tags, mirroring the SQLite
+    -- `memories_fts(title, content, tags)` scope (a tag-only-hit search /
+    -- recall / contradiction matched on SQLite but not here pre-v89). A
+    -- GENERATED column bars set-returning fns, so the fold is
+    -- `coalesce(tags::text, '')`: the immutable jsonb->text cast, whose
+    -- JSON punctuation tokenizes away, leaving the array elements as
+    -- lexemes under the same 'english' config. migrate_v89() DROP+ADDs this
+    -- column on existing schemas (PG16 has no ALTER COLUMN SET EXPRESSION).
     tsv                   tsvector GENERATED ALWAYS AS (
-        to_tsvector('english', coalesce(title, '') || ' ' || coalesce(content, ''))
+        to_tsvector(
+            'english',
+            coalesce(title, '') || ' ' || coalesce(content, '') || ' ' || coalesce(tags::text, '')
+        )
     ) STORED
 );
 
@@ -352,7 +364,8 @@ CREATE INDEX IF NOT EXISTS idx_shadow_obs_memory
 -- `migrations/postgres/0022_v07_shadow_retention.sql` (see #797
 -- comment block above).
 
--- Full-text search (English stemming; matches the SQLite FTS5 setup):
+-- Full-text search (English stemming; matches the SQLite FTS5 setup —
+-- title + content + tags, the tags fold added at schema v89 / #2392):
 -- served by the `memories_tsv_gin` GIN index on the stored generated
 -- `tsv` column (schema v57, #1579 B2). The index CREATE lives in
 -- `migrate_v57()` per the #797 convention — this bootstrap runs BEFORE

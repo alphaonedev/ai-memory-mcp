@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 88).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 89).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -864,7 +864,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 88;
+const CURRENT_SCHEMA_VERSION: i64 = 89;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -3827,6 +3827,20 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         // the SQLite schema to v88 so both adapters keep ONE logical number
         // (the v69 `kg_projection_outbox` precedent).
         // Doc twin: migrations/sqlite/0072_v88_list_composite_indexes.sql.
+
+        // v89 (#2392, v1.0.0: fold `tags` into the POSTGRES stored generated
+        // `tsv` tsvector so postgres FTS indexes title+content+tags) is a
+        // SQLite NO-OP. SQLite's `memories_fts` virtual table has indexed
+        // `(title, content, tags)` since inception (`SCHEMA` const above +
+        // the v53 `memories_au` trigger scope, R5.F5.2 / #1418), so a
+        // tag-only-hit `q`/`context` search already matches on this backend.
+        // v89 is POSTGRES catching up (`PostgresStore::migrate_v89` redefines
+        // the generated column + reindexes `memories_tsv_gin`); there is
+        // nothing for this ladder to do. The unconditional stamp below moves
+        // the SQLite schema to v89 so both adapters keep ONE logical number
+        // (the v57/v69/v88 postgres-only-arm precedent — here the roles are
+        // reversed vs v55, exactly as v57's docstring notes).
+        // Doc twin: migrations/sqlite/0073_v89_tsv_tags_noop.sql.
 
         conn.execute("DELETE FROM schema_version", [])?;
         conn.execute(

@@ -613,6 +613,19 @@ const MIGRATION_V87_ARCHIVED_KIND_PROVENANCE: &str =
 const MIGRATION_V88_LIST_COMPOSITE_INDEXES: &str =
     include_str!("../../migrations/postgres/0045_v88_list_composite_indexes.sql");
 
+/// v1.0.0 #2392 — schema v89 canonical DDL, executed via `raw_sql` (the
+/// v87 pattern). Redefines the stored generated `tsv` tsvector to FOLD
+/// `tags` (title+content+tags) so the postgres FTS surface matches the
+/// SQLite `memories_fts(title, content, tags)` scope — closing the
+/// cross-backend divergence where a tag-only-hit `q`/`context` search /
+/// recall / contradiction returned rows on SQLite but ZERO on postgres.
+/// PG16 has no `ALTER COLUMN ... SET EXPRESSION` (PG17+), so the change is
+/// a `DROP COLUMN IF EXISTS tsv` (which cascades away the dependent GIN
+/// index) + `ADD COLUMN tsv ... GENERATED ... STORED` + recreate
+/// `memories_tsv_gin`. See [`PostgresStore::migrate_v89`] for the arm.
+const MIGRATION_V89_TSV_INCLUDE_TAGS: &str =
+    include_str!("../../migrations/postgres/0046_v89_tsv_include_tags.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -1003,7 +1016,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       has carried these since v56, so its v88 is a no-op; doc twins
 //       migrations/{postgres/0045,sqlite/0072}_v88_list_composite_indexes.sql.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 88;
+const CURRENT_SCHEMA_VERSION: i32 = 89;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -2292,8 +2305,11 @@ impl PostgresStore {
         if current_version < 87 {
             self.migrate_v87().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 88 {
             self.migrate_v88().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v89().await?;
         }
 
         Ok(())
@@ -4964,7 +4980,13 @@ impl PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("begin v88 stamp tx", e))?;
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // #2392 — stamp the LITERAL arm version, not CURRENT_SCHEMA_VERSION.
+        // v88 is a SETTLED arm now that v89 is the tip (the #2218/#2578
+        // literalize-on-settle convention); stamping the const here would
+        // record 89 without ever running the v89 arm on a ladder replay that
+        // enters below 88 — the same replay hazard the v55 / v56 / v87 literal
+        // stamps already close.
+        record_schema_version(&mut tx, 88).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v88 migration", e))?;
@@ -4975,6 +4997,96 @@ impl PostgresStore {
             indexes_total = LIST_ORDER_INDEXES.len(),
             "schema migration v88 applied (#2578: v56 composite list/archive \
              ordering indexes on postgres)"
+        );
+        Ok(())
+    }
+
+    /// v89 (#2392, v1.0.0) — fold `tags` into the stored generated `tsv`
+    /// tsvector so the postgres FTS surface indexes `title + content + tags`,
+    /// mirroring the SQLite `memories_fts(title, content, tags)` scope.
+    ///
+    /// # The defect
+    ///
+    /// The v57 (#1579 B2) generated column was
+    /// `to_tsvector('english', coalesce(title,'') || ' ' || coalesce(content,''))`
+    /// — it OMITS `tags`. SQLite's FTS5 virtual table has always indexed
+    /// `(title, content, tags)`, so the SAME wire query (a `q` / `context`
+    /// search / recall / contradiction whose only hit is a tag word) returned
+    /// rows on SQLite but ZERO on postgres — a silent cross-backend row-set
+    /// divergence on the enterprise (postgres) tier. Every read path already
+    /// reads the `tsv` COLUMN for both the `@@` match and `ts_rank` (v57), so
+    /// redefining the column fixes recall / search / contradiction / list
+    /// uniformly with no query-shape change.
+    ///
+    /// # Why DROP + ADD (not ALTER)
+    ///
+    /// PG16 has no `ALTER TABLE ... ALTER COLUMN ... SET EXPRESSION`
+    /// (PG17+), so a generated-column expression change is a `DROP COLUMN`
+    /// + `ADD COLUMN`. `DROP COLUMN tsv` cascades away the dependent
+    /// `memories_tsv_gin` GIN index (no `CASCADE` keyword needed), so the arm
+    /// recreates it. `DROP COLUMN IF EXISTS` is load-bearing for the ladder
+    /// replay harness (`tests/postgres_ladder_replay.rs`), which strips the
+    /// v57 `tsv` column when synthesizing a legacy shape below v89 — a bare
+    /// `DROP COLUMN tsv` would then error `column "tsv" does not exist`.
+    ///
+    /// # The tags fold
+    ///
+    /// `tags` is `JSONB` and a postgres GENERATED column bars set-returning
+    /// functions / subqueries / aggregates, so `jsonb_array_elements_text`
+    /// is unavailable there. The generated-column-LEGAL fold is
+    /// `coalesce(tags::text, '')`: the `jsonb -> text` cast is an immutable,
+    /// deterministic I/O coercion, and the JSON brackets / quotes / commas
+    /// are text-search separators (they produce no lexemes), so the array
+    /// elements tokenize into the tsvector exactly as the title / content
+    /// words do — under the SAME `'english'` config already applied to
+    /// title + content (a tag stemming/stopword nuance that is a pre-existing
+    /// property of the postgres FTS surface, not introduced here).
+    ///
+    /// # Operational note (fleet apply)
+    ///
+    /// `ADD COLUMN ... GENERATED ALWAYS AS ... STORED` takes an ACCESS
+    /// EXCLUSIVE lock and rewrites the table to backfill the column (the
+    /// same posture as the v57 add). At the fleet's ~8k rows this is
+    /// sub-second; plan a maintenance window before running it against
+    /// multi-million-row deployments. The arm runs on the POOLED connection
+    /// (`pool.begin()`), which RETAINS the `lock_timeout` / `statement_timeout`
+    /// from `after_connect` — DELIBERATELY, so under lock contention the arm
+    /// fails CLOSED (rolls back, stays at v88, retries next boot) rather than
+    /// waiting unbounded and hanging `connect()` past a supervisor start
+    /// timeout. Unlike the v88 index build, a STORED-generated rewrite CANNOT
+    /// be done `CONCURRENTLY`, so the brief exclusive lock is the accepted
+    /// posture (worst case at v88 is the pre-fix behaviour = fewer tag
+    /// results = DEGRADE, never a wrong result — the durable title/content/tags
+    /// TEXT is untouched and `tsv` is regenerated from it).
+    ///
+    /// SQLite twin is a version-stamp no-op (FTS5 already indexes tags).
+    async fn migrate_v89(&self) -> StoreResult<()> {
+        debug_assert!(
+            !MIGRATION_V89_TSV_INCLUDE_TAGS.is_empty(),
+            "#2392: the v89 DDL doc twin must ship with the binary"
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v89 tsv ddl tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V89_TSV_INCLUDE_TAGS)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v89 tsv-include-tags ddl", e))?;
+
+        // Tip arm — stamp the symbolic const (the current-tip convention).
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v89 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v89 applied (#2392: fold tags into the stored \
+             generated tsv tsvector + reindex memories_tsv_gin; cross-backend \
+             FTS parity with sqlite memories_fts(title, content, tags))"
         );
         Ok(())
     }
