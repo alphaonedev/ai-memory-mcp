@@ -862,13 +862,29 @@ pub(crate) fn handle_store(
         return Err(e.to_string());
     }
 
-    let actual_id = match db::insert(conn, &mem) {
+    // #2878 — under `on_conflict=error` the write must be ATOMICALLY
+    // fail-closed: a concurrent writer racing into `(title, namespace)`
+    // BETWEEN validation.rs's up-front existence probe (`OnConflict::Error`)
+    // and this write can no longer silently upsert-overwrite the first
+    // writer's durable content (the North-Star lost-update #2771 closed on the
+    // HTTP create funnel, closed here on the flagship MCP store surface — MCP
+    // stdio is sqlite-only per #1675, so `db::insert_no_overwrite` is the
+    // path). `merge`/`version` keep the legacy `db::insert` upsert (merge =
+    // opt-in upsert; version already suffixed the title to a free slot above).
+    let insert_result = if matches!(on_conflict, OnConflict::Error) {
+        db::insert_no_overwrite(conn, &mem)
+    } else {
+        db::insert(conn, &mem)
+    };
+    let actual_id = match insert_result {
         Ok(id) => id,
         Err(e) => {
             // Insert failed AFTER we committed quota — refund so the
             // counter reflects only successful stores. Refund lands on
             // the same `(agent_id, namespace)` row the check_and_record
-            // above incremented (v50, #1156).
+            // above incremented (v50, #1156). A fail-closed conflict never
+            // landed a row, so the charge is refunded exactly as any other
+            // write failure.
             if let Err(re) = crate::quotas::refund_op(
                 conn,
                 &agent_id,
@@ -878,6 +894,19 @@ pub(crate) fn handle_store(
                 },
             ) {
                 crate::quotas::log_refund_op_failed(&agent_id, &re);
+            }
+            // #2878 — the fail-closed `db::insert_no_overwrite` refused a
+            // `(title, namespace)` collision that raced past validation.rs's
+            // `OnConflict::Error` probe. Surface the SAME typed `CONFLICT:`
+            // string the probe raises (single-sourced via
+            // `validation::conflict_error_message`) — NEVER a silent overwrite,
+            // and distinct from a generic database error. Mirrors HTTP #2771.
+            if let Some(conflict) = e.downcast_ref::<crate::storage::ConflictError>() {
+                return Err(validation::conflict_error_message(
+                    &conflict.title,
+                    &conflict.namespace,
+                    &conflict.existing_id,
+                ));
             }
             // v0.7.0 L1-6 Deliverable E — surface the substrate
             // governance pre-write hook's refusal with a clearly-

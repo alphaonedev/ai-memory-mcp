@@ -2509,3 +2509,227 @@ fn a1_1579_force_store_embeds_exactly_once() {
         "#1579 A1: force=true path must embed exactly once (source embed only)"
     );
 }
+
+// ───────────────────────────────────────────────────────────────────
+// #2878 — MCP `memory_store` `on_conflict=error` must be ATOMICALLY
+// fail-closed on the FLAGSHIP agent write surface: a concurrent writer
+// racing into the same `(title, namespace)` between validation.rs's
+// existence probe and `handle_store`'s write can no longer silently
+// upsert-overwrite the first writer's durable content. The load-bearing
+// no-overwrite assertion is the schema-v45 `version` column: a fresh
+// insert lands `version = 1`, an upsert-MERGE bumps it (#1632) — so a
+// surviving `version = 1` PROVES no upsert clobbered the winner.
+// ───────────────────────────────────────────────────────────────────
+
+fn error_mode_params(title: &str, ns: &str, tag: &str) -> Value {
+    json!({
+        "title": title,
+        "content": format!("durable content from {tag}, long enough to be meaningful prose."),
+        "namespace": ns,
+        "tier": Tier::Mid.as_str(),
+        "priority": 5,
+        "confidence": 0.9,
+        "source": "nhi",
+        "agent_id": format!("ai:racer-{tag}"),
+        "on_conflict": "error",
+    })
+}
+
+/// Deterministic single-connection contract: the FIRST `error`-mode store
+/// lands `version = 1`; a SECOND `error`-mode store on the same
+/// `(title, namespace)` is REFUSED with the typed `CONFLICT:` string and
+/// NEVER overwrites — the durable row stays the first writer's content at
+/// `version = 1`. (Here the up-front probe catches it; the race test below
+/// exercises the write-path no-overwrite arm.)
+#[test]
+fn issue_2878_mcp_store_error_mode_refuses_and_preserves_content() {
+    crate::identity::attest::permissive_attestation_for_lib_tests();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("m.db");
+    let conn = db::open(&path).expect("open");
+    let ttl = ResolvedTtl::default();
+
+    let first = handle_store(
+        &conn,
+        &path,
+        &error_mode_params("shared-mcp-title", "mcp/ops", "winner"),
+        None,
+        None,
+        None,
+        &ttl,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect("first error-mode store ok");
+    let winner_id = first["id"].as_str().expect("id").to_string();
+    let row = db::get(&conn, &winner_id).expect("get").expect("row");
+    assert_eq!(row.version, 1, "fresh insert lands version=1");
+
+    let err = handle_store(
+        &conn,
+        &path,
+        &error_mode_params("shared-mcp-title", "mcp/ops", "loser"),
+        None,
+        None,
+        None,
+        &ttl,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect_err("second error-mode store MUST be refused, never overwrite");
+    assert!(err.contains("CONFLICT"), "got: {err}");
+    assert!(
+        err.contains(&winner_id),
+        "conflict names the winner id: {err}"
+    );
+
+    // Durable content untouched — the winner's, at version=1 (no upsert bump).
+    let row = db::get(&conn, &winner_id)
+        .expect("get")
+        .expect("row present");
+    assert!(
+        row.content.contains("from winner"),
+        "winner content must be durable, got: {}",
+        row.content
+    );
+    assert_eq!(
+        row.version, 1,
+        "#2878: no upsert-merge ever bumped the version"
+    );
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE title = ?1 AND namespace = ?2",
+            rusqlite::params!["shared-mcp-title", "mcp/ops"],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert_eq!(count, 1, "error mode must leave exactly one row");
+}
+
+/// Genuine two-connection race (multi-process-shaped: MCP stdio is
+/// single-threaded per process, so two racers are two OS processes / two
+/// connections to the same DB file). Exactly one `error`-mode store wins;
+/// the loser is refused with the typed `CONFLICT` string — decided by the
+/// `(title, namespace)` UNIQUE index, never by a silent upsert. The
+/// surviving row is the winner's content at `version = 1`. WAL + a generous
+/// busy-timeout keep the loser off the lock-contention path so the outcome
+/// is decided by the index, not lock timing.
+#[test]
+fn issue_2878_mcp_store_error_mode_two_connection_race_one_winner() {
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    crate::identity::attest::permissive_attestation_for_lib_tests();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("m.db");
+    // Materialise the schema once so both racers open an already-migrated
+    // file (avoids a migration/DDL race unrelated to this test).
+    drop(db::open(&path).expect("seed schema"));
+
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for tag in ["a", "b"] {
+        let path = path.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            let conn = db::open(&path).expect("open");
+            conn.busy_timeout(Duration::from_secs(10))
+                .expect("busy_timeout");
+            let ttl = ResolvedTtl::default();
+            let params = error_mode_params("raced-mcp-title", "race/mcp", tag);
+            barrier.wait();
+            handle_store(
+                &conn, &path, &params, None, None, None, &ttl, false, None, None, None,
+            )
+        }));
+    }
+    let results: Vec<Result<Value, String>> = handles
+        .into_iter()
+        .map(|h| h.join().expect("join"))
+        .collect();
+
+    let winners: Vec<&Value> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+    assert_eq!(
+        winners.len(),
+        1,
+        "exactly one error-mode store must win the race"
+    );
+    for r in &results {
+        if let Err(e) = r {
+            assert!(
+                e.contains("CONFLICT"),
+                "loser must get the typed CONFLICT refusal, not a silent overwrite / other error: {e}"
+            );
+        }
+    }
+
+    // Exactly one row; its content is the winner's, at version=1 (never upserted).
+    let conn = db::open(&path).expect("reopen");
+    let winner_id = winners[0]["id"].as_str().expect("id").to_string();
+    let row = db::get(&conn, &winner_id)
+        .expect("get")
+        .expect("winner row");
+    assert!(
+        row.content.contains("durable content from"),
+        "winner content must be durable: {}",
+        row.content
+    );
+    assert_eq!(
+        row.version, 1,
+        "#2878: the race must never upsert-overwrite (version stays 1)"
+    );
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE title = ?1 AND namespace = ?2",
+            rusqlite::params!["raced-mcp-title", "race/mcp"],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert_eq!(count, 1, "the race must leave exactly one row");
+}
+
+/// Control: `on_conflict=merge` (the operator's opt-in silent upsert) is
+/// UNCHANGED by #2878 — a second merge store on the same key upserts the
+/// content and bumps `version`, proving the no-overwrite fix touched ONLY
+/// the `error` disposition.
+#[test]
+fn issue_2878_mcp_store_merge_mode_still_upserts_unchanged() {
+    crate::identity::attest::permissive_attestation_for_lib_tests();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("m.db");
+    let conn = db::open(&path).expect("open");
+    let ttl = ResolvedTtl::default();
+
+    let mut first = error_mode_params("merge-mcp-title", "mcp/merge", "one");
+    first["on_conflict"] = json!("merge");
+    let id = handle_store(
+        &conn, &path, &first, None, None, None, &ttl, false, None, None, None,
+    )
+    .expect("first merge store")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let mut second = error_mode_params("merge-mcp-title", "mcp/merge", "two");
+    second["on_conflict"] = json!("merge");
+    handle_store(
+        &conn, &path, &second, None, None, None, &ttl, false, None, None, None,
+    )
+    .expect("second merge store upserts (unchanged by #2878)");
+
+    let row = db::get(&conn, &id).expect("get").expect("row");
+    assert!(
+        row.content.contains("from two"),
+        "merge disposition upserts the incoming content (unchanged): {}",
+        row.content
+    );
+    assert!(
+        row.version >= 2,
+        "#1632: merge upsert bumps version (proves #2878 changed only error mode), got {}",
+        row.version
+    );
+}
