@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::models::{Memory, MemoryLink};
 use crate::portability::dto::{
-    ForgetTombstoneDto, GovernanceRuleDto, LineageDto, ModelAttestationDto, RevisionDto,
-    SignedEventDto, TrustAnchorDto,
+    ArchivedMemoryDto, ArchivedMemoryLinkDto, ForgetTombstoneDto, GovernanceRuleDto, LineageDto,
+    ModelAttestationDto, NamespaceMetaDto, RevisionDto, SignedEventDto, TrustAnchorDto,
 };
 use crate::portability::read;
 
@@ -104,6 +104,25 @@ pub struct ExportEnvelope {
     pub governance_rules: Vec<GovernanceRuleDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trust_anchors: Vec<TrustAnchorDto>,
+    /// `archived_memories[]` (#2571, spec §6.4) — archived rows, carrying
+    /// EVERY column so an export->import round-trip is lossless (the v1
+    /// spec froze this class; v2 (§V2-4) claims "all v1 members are
+    /// retained" but never implemented it until now). Rows cross the SAME
+    /// export confidentiality screen `memories[]` gets — see
+    /// [`build_full_envelope_audited`]'s doc comment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archived_memories: Vec<ArchivedMemoryDto>,
+    /// `namespace_meta[]` (#2571, spec §6.1) — namespace governance bindings
+    /// (`standard_id` / `parent_namespace`). Without this class a restored
+    /// corpus comes back UNGOVERNED even though the standard memories
+    /// themselves round-trip (#1569 allow-on-silence).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub namespace_meta: Vec<NamespaceMetaDto>,
+    /// `archived_memory_links[]` (#2571, schema v70 / #1771) — the archive-
+    /// link snapshot preserved alongside each archived row, so `import`'s
+    /// restore can re-attach the edges an archived memory carried.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archived_memory_links: Vec<ArchivedMemoryLinkDto>,
     /// `true` iff the achieved [`ConformanceLevel`] is L3 (the legacy #1944
     /// bool — kept, and honestly `false` for any sub-L3 export).
     pub portability_complete: bool,
@@ -163,6 +182,43 @@ fn collect_trust_anchors() -> Vec<TrustAnchorDto> {
     anchors
 }
 
+/// v1.0.0 #2571 — apply the SAME export confidentiality screen `memories[]`
+/// gets (fail-closed forbidden-class drop + secret-screen redaction, spec
+/// §V2-5a) to archived rows before they cross the v2 envelope boundary.
+///
+/// Unlike `list_archive`/`restore_archived` (admin-authorization-gated
+/// only, #943 SECURITY-medium — zero content screening today), `export
+/// --full` has no such gate, so an unscreened archived row would be a NEW
+/// exposure vector this fix must not introduce. Reuses
+/// [`crate::export_taxonomy::screen_memories_for_export_audited`] by
+/// projecting each row's live-shaped columns into a [`Memory`] view (see
+/// [`crate::portability::read::ArchivedMemoryRow`]), screening that view,
+/// then copying the (possibly redacted / dropped) result back — the
+/// archive-only columns (`archived_at`, `embedding`, …) are never touched by
+/// the screen and always pass through unchanged for a surviving row.
+fn screen_archived_memories_for_export(
+    rows: Vec<read::ArchivedMemoryRow>,
+    audit_conn: Option<&Connection>,
+) -> (
+    Vec<read::ArchivedMemoryRow>,
+    crate::export_scope::ExportWithholdLedger,
+) {
+    let views: Vec<Memory> = rows.iter().map(|r| r.memory.clone()).collect();
+    let (screened_views, ledger) =
+        crate::export_taxonomy::screen_memories_for_export_audited(views, audit_conn);
+    let screened_by_id: std::collections::HashMap<&str, &Memory> =
+        screened_views.iter().map(|m| (m.id.as_str(), m)).collect();
+    let kept = rows
+        .into_iter()
+        .filter_map(|mut r| {
+            let screened = screened_by_id.get(r.memory.id.as_str())?;
+            r.memory = (*screened).clone();
+            Some(r)
+        })
+        .collect();
+    (kept, ledger)
+}
+
 /// Build the full v2 envelope from `conn`, with a COMPUTED conformance marker.
 ///
 /// The conformance pass is the honesty guarantee (the #2006 vote's marker
@@ -211,6 +267,35 @@ pub fn build_full_envelope_audited(
     ledger.tombstoned = tombstoned;
     ledger.expired = expired;
     let links = crate::storage::export_links(conn)?;
+
+    // v1.0.0 #2571 — archived rows (spec §6.4) get the SAME confidentiality
+    // screen `memories[]` gets. Unlike `list_archive`/`restore_archived`
+    // (admin-authorization-gated only, #943 SECURITY-medium — zero content
+    // screening), `export --full` carries no such gate, so an unscreened
+    // archived row would be a NEW exposure vector, not merely a
+    // completeness fix. Results fold into the SAME ledger (`withheld_ids` /
+    // `withheld_by_class` / `redacted_ids` are class-keyed, not
+    // table-scoped, so `ledger.is_partial()` — and therefore
+    // `portability_complete` below — honestly reflects an archived-row
+    // drop exactly like it already does for `memories[]`).
+    let (archived_rows, archived_ledger) =
+        screen_archived_memories_for_export(read::read_all_archived_memories(conn)?, Some(conn));
+    ledger.withheld_ids.extend(archived_ledger.withheld_ids);
+    for (class, count) in archived_ledger.withheld_by_class {
+        *ledger.withheld_by_class.entry(class).or_insert(0) += count;
+    }
+    ledger.redacted_ids.extend(archived_ledger.redacted_ids);
+    let archived_memories: Vec<ArchivedMemoryDto> =
+        archived_rows.iter().map(ArchivedMemoryDto::from).collect();
+    let namespace_meta: Vec<NamespaceMetaDto> = read::read_all_namespace_meta(conn)?
+        .iter()
+        .map(NamespaceMetaDto::from)
+        .collect();
+    let archived_memory_links: Vec<ArchivedMemoryLinkDto> =
+        read::read_all_archived_memory_links(conn)?
+            .iter()
+            .map(ArchivedMemoryLinkDto::from)
+            .collect();
 
     // Signed classes → byte-preserved DTOs.
     let signed_events: Vec<SignedEventDto> =
@@ -310,6 +395,25 @@ pub fn build_full_envelope_audited(
         governed_level,
     );
     note("trust_anchors", trust_anchors.is_empty(), governed_level);
+    // #2571 — archived_memories / namespace_meta / archived_memory_links
+    // carry no signature to re-verify, so their level is a flat L1 (the
+    // same unconditional level `memories`/`links` get above) rather than
+    // gated on `chain_ok`/`operator_anchored`.
+    note(
+        "archived_memories",
+        archived_memories.is_empty(),
+        ConformanceLevel::L1,
+    );
+    note(
+        "namespace_meta",
+        namespace_meta.is_empty(),
+        ConformanceLevel::L1,
+    );
+    note(
+        "archived_memory_links",
+        archived_memory_links.is_empty(),
+        ConformanceLevel::L1,
+    );
 
     // Overall = MIN across the tamper-evidence gate and the governance gate.
     // A broken source chain caps everything at L1; a missing operator anchor
@@ -338,6 +442,9 @@ pub fn build_full_envelope_audited(
             model_attestations,
             governance_rules,
             trust_anchors,
+            archived_memories,
+            namespace_meta,
+            archived_memory_links,
             portability_complete: conformance_level == ConformanceLevel::L3 && !ledger.is_partial(),
             conformance_level: conformance_level.as_str().to_string(),
             conformance_by_class: by_class,

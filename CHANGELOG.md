@@ -106,6 +106,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed (data integrity)
 
+- **`ai-memory export --full` (the v2 portability envelope) silently dropped
+  archived memories and namespace governance bindings on every round-trip**
+  ([#2571](https://github.com/alphaonedev/ai-memory-mcp/issues/2571);
+  data-integrity North Star; 5-agent adversarial vote `17aa4567`, unanimous
+  on structure — decision record: memory `88709379-40e9-4446-8239-084c07c997b2`,
+  namespace `ai-memory`). Neither export mode ever implemented the `archived[]` /
+  `namespaces[]` classes the v1 portability spec froze (`docs/spec/v1.md`
+  §6.1/§6.4) and PORTABILITY-V2.md §V2-4 claimed v2 "retains" — a source
+  database's `archived_memories` (the #1725 in-place-edit snapshots, `gc`
+  evictions, and operator archives) and `namespace_meta` (the
+  `standard_id`/`parent_namespace` governance chain `build_namespace_chain`
+  walks) never crossed the export boundary at all, so a restore came back
+  with every archived row gone and every namespace ungoverned
+  (allow-on-silence, #1569). `src/portability/emit.rs`'s `ExportEnvelope`
+  now carries three additive arrays (`spec_version` stays `"2"`, no wire
+  version bump — an old export still imports via serde defaults; a new
+  export's unknown fields make a pre-fix binary's importer REFUSE via the
+  existing `deny_unknown_fields` posture, matching every prior #2006
+  signed-array addition): `archived_memories[]` (full archive-row shape,
+  content decrypted like `memories[]`, screened through the SAME
+  confidentiality gate `memories[]` gets — `list_archive`/`restore_archived`
+  are admin-authorization-gated only with zero content screening, #943, and
+  `export --full` carries no such gate, so leaving archived rows unscreened
+  would have been a NEW exposure vector, not merely a completeness fix),
+  `namespace_meta[]` (governance bindings), and `archived_memory_links[]`
+  (the v70/#1771 archive-link snapshot). Import
+  (`src/portability/import.rs::import_full_envelope`) stages all three RAW
+  and byte-preserved: archived rows are refused (never silently admitted)
+  when doing so would create illegal dual residency — the id LIVE at the
+  destination under a GENUINE archive reason, distinct from the #2570
+  `in_place_edit` exception, which is always admitted; namespace bindings
+  NEVER clobber an existing destination policy (`ON CONFLICT DO NOTHING`).
+  Scope: the v2 envelope (`export --full` / `import_full_envelope`) is
+  structurally sqlite-only (source AND destination) — `export --full`
+  already refuses a postgres-backed store (#2444/#2490 precedent) and
+  `import_full_envelope` has no postgres call site anywhere; the default
+  (non-`--full`) `ai-memory export` convenience view is UNCHANGED — its
+  `excludes` marker (#2568/#2490) still honestly lists `archived_memories`
+  / `namespace_meta` as excluded. Regression:
+  `tests/portability_export_completeness_2571.rs` drives the real
+  `emit::build_full_envelope` -> `import::import_full_envelope` path
+  end-to-end (archived-row + namespace-standard round-trip, the
+  archive-link snapshot round-trip, the dual-residency refusal, and
+  pre-#2571-shape back-compat import).
+
 - **The postgres daemon-bootstrap embedding-dim auto-migrate no longer
   NULLs every stored embedding when no embedder can regenerate them**
   ([#2567](https://github.com/alphaonedev/ai-memory-mcp/issues/2567);

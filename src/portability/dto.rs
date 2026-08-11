@@ -21,8 +21,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::governance::rules_store::Rule;
 use crate::identity::lineage::{CustodyClass, LineageReason, LineageRecord};
+use crate::models::{Memory, Tier};
 use crate::portability::hex_bytes::HexBytes;
-use crate::portability::read::{ForgetTombstone, LineageExport, RevisionRow};
+use crate::portability::read::{
+    ArchivedMemoryLinkRow, ArchivedMemoryRow, ForgetTombstone, LineageExport, NamespaceMetaRow,
+    RevisionRow,
+};
 use crate::revisions::{RecordKind, RevisionLeaf};
 use crate::signed_events::SignedEvent;
 use crate::storage::model_attest::ModelAttestation;
@@ -414,6 +418,176 @@ pub struct TrustAnchorDto {
     pub pubkey_b64: String,
 }
 
+// ── archived_memories (#2571, spec §6.4) ────────────────────────────────────
+
+/// `archived_memories[]` DTO — an archived row for export (issue #2571).
+/// Flattens the live-`Memory`-shaped columns (spec §6.4: "same column set as
+/// `memories[]`") alongside the archive-only columns, so the wire shape
+/// mirrors a `memories[]` entry plus extras rather than nesting a `memory`
+/// object. Content crosses DECRYPTED (never ciphertext) exactly like
+/// `memories[]`; `embedding` routes through [`HexBytes`] like every other
+/// byte field in this envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchivedMemoryDto {
+    #[serde(flatten)]
+    pub memory: Memory,
+    pub archived_at: String,
+    pub archive_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_tier: Option<Tier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<HexBytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_dim: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_space: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atomised_into: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atom_of: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mentioned_entity_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind_provenance: Option<String>,
+}
+
+impl From<&ArchivedMemoryRow> for ArchivedMemoryDto {
+    fn from(r: &ArchivedMemoryRow) -> Self {
+        Self {
+            memory: r.memory.clone(),
+            archived_at: r.archived_at.clone(),
+            archive_reason: r.archive_reason.clone(),
+            original_tier: r.original_tier.clone(),
+            original_expires_at: r.original_expires_at.clone(),
+            embedding: r.embedding.clone().map(HexBytes),
+            embedding_dim: r.embedding_dim,
+            embedding_space: r.embedding_space.clone(),
+            atomised_into: r.atomised_into,
+            atom_of: r.atom_of.clone(),
+            mentioned_entity_id: r.mentioned_entity_id.clone(),
+            kind_provenance: r.kind_provenance.clone(),
+        }
+    }
+}
+
+impl From<ArchivedMemoryDto> for ArchivedMemoryRow {
+    fn from(d: ArchivedMemoryDto) -> Self {
+        Self {
+            memory: d.memory,
+            archived_at: d.archived_at,
+            archive_reason: d.archive_reason,
+            original_tier: d.original_tier,
+            original_expires_at: d.original_expires_at,
+            embedding: d.embedding.map(|h| h.0),
+            embedding_dim: d.embedding_dim,
+            embedding_space: d.embedding_space,
+            atomised_into: d.atomised_into,
+            atom_of: d.atom_of,
+            mentioned_entity_id: d.mentioned_entity_id,
+            kind_provenance: d.kind_provenance,
+        }
+    }
+}
+
+// ── namespace_meta (#2571, spec §6.1) ──────────────────────────────────────
+
+/// `namespace_meta[]` DTO — a namespace's governance binding (issue #2571,
+/// spec §6.1): which memory carries its `CorePolicy` standard
+/// (`standard_id`) and its explicit hierarchical parent (`parent_namespace`,
+/// the chain `build_namespace_chain` walks).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceMetaDto {
+    pub namespace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standard_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_namespace: Option<String>,
+    pub updated_at: String,
+}
+
+impl From<&NamespaceMetaRow> for NamespaceMetaDto {
+    fn from(r: &NamespaceMetaRow) -> Self {
+        Self {
+            namespace: r.namespace.clone(),
+            standard_id: r.standard_id.clone(),
+            parent_namespace: r.parent_namespace.clone(),
+            updated_at: r.updated_at.clone(),
+        }
+    }
+}
+
+impl From<NamespaceMetaDto> for NamespaceMetaRow {
+    fn from(d: NamespaceMetaDto) -> Self {
+        Self {
+            namespace: d.namespace,
+            standard_id: d.standard_id,
+            parent_namespace: d.parent_namespace,
+            updated_at: d.updated_at,
+        }
+    }
+}
+
+// ── archived_memory_links (#2571, schema v70 / #1771) ───────────────────────
+
+/// `archived_memory_links[]` DTO — the v70 archive-link snapshot (issue
+/// #2571): a memory's links preserved at the moment it was archived, so
+/// `restore_archived` can re-attach them. Deliberately carries no FK (mirrors
+/// the table itself, `src/storage/migrations.rs` v70 arm).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchivedMemoryLinkDto {
+    pub source_id: String,
+    pub target_id: String,
+    pub relation: String,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<HexBytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attest_level: Option<String>,
+    pub archived_at: String,
+}
+
+impl From<&ArchivedMemoryLinkRow> for ArchivedMemoryLinkDto {
+    fn from(r: &ArchivedMemoryLinkRow) -> Self {
+        Self {
+            source_id: r.source_id.clone(),
+            target_id: r.target_id.clone(),
+            relation: r.relation.clone(),
+            created_at: r.created_at.clone(),
+            valid_from: r.valid_from.clone(),
+            valid_until: r.valid_until.clone(),
+            observed_by: r.observed_by.clone(),
+            signature: r.signature.clone().map(HexBytes),
+            attest_level: r.attest_level.clone(),
+            archived_at: r.archived_at.clone(),
+        }
+    }
+}
+
+impl From<ArchivedMemoryLinkDto> for ArchivedMemoryLinkRow {
+    fn from(d: ArchivedMemoryLinkDto) -> Self {
+        Self {
+            source_id: d.source_id,
+            target_id: d.target_id,
+            relation: d.relation,
+            created_at: d.created_at,
+            valid_from: d.valid_from,
+            valid_until: d.valid_until,
+            observed_by: d.observed_by,
+            signature: d.signature.map(|h| h.0),
+            attest_level: d.attest_level,
+            archived_at: d.archived_at,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,5 +758,100 @@ mod tests {
         let json = serde_json::to_string(&a).unwrap();
         let back: TrustAnchorDto = serde_json::from_str(&json).unwrap();
         assert_eq!(back, a);
+    }
+
+    /// #2571 — the archived-memory DTO flattens the live-Memory-shaped
+    /// fields at the SAME JSON level as `archived_at`/`archive_reason`
+    /// (spec §6.4: "same column set as `memories[]`, plus…"), never nested
+    /// under a `memory` key, and `embedding` crosses as a hex STRING.
+    #[test]
+    fn archived_memory_dto_flattens_and_round_trips_byte_exact() {
+        let row = ArchivedMemoryRow {
+            memory: Memory {
+                id: "m1".into(),
+                title: "t".into(),
+                content: "c".into(),
+                namespace: "ns".into(),
+                ..Memory::default()
+            },
+            archived_at: "2026-01-01T00:00:00Z".into(),
+            archive_reason: "manual".into(),
+            original_tier: Some(Tier::Long),
+            original_expires_at: None,
+            embedding: Some(vec![0x01, 0x02, 0x03]),
+            embedding_dim: Some(3),
+            embedding_space: Some("model#raw".into()),
+            atomised_into: None,
+            atom_of: None,
+            mentioned_entity_id: None,
+            kind_provenance: Some("declared".into()),
+        };
+        let dto = ArchivedMemoryDto::from(&row);
+        let json = serde_json::to_string(&dto).unwrap();
+        // `assert_no_number_array` is unsuitable here (Memory legitimately
+        // carries array fields like `tags`/`citations`) — assert the
+        // targeted byte-family invariant instead: `embedding` crosses as a
+        // hex STRING, never a raw number array.
+        assert!(
+            json.contains("\"embedding\":\"010203\""),
+            "embedding must cross as a hex string, not a number array: {json}"
+        );
+        assert!(
+            json.contains("\"archived_at\":\"2026-01-01T00:00:00Z\""),
+            "archive fields must be flattened alongside the memory fields: {json}"
+        );
+        assert!(
+            !json.contains("\"memory\":{"),
+            "the memory fields must NOT be nested under a `memory` key: {json}"
+        );
+        let back: ArchivedMemoryRow = serde_json::from_str::<ArchivedMemoryDto>(&json)
+            .unwrap()
+            .into();
+        assert_eq!(back.memory.id, row.memory.id);
+        assert_eq!(back.memory.title, row.memory.title);
+        assert_eq!(back.memory.content, row.memory.content);
+        assert_eq!(back.archived_at, row.archived_at);
+        assert_eq!(back.archive_reason, row.archive_reason);
+        assert_eq!(back.original_tier, row.original_tier);
+        assert_eq!(back.embedding, row.embedding);
+        assert_eq!(back.embedding_dim, row.embedding_dim);
+        assert_eq!(back.kind_provenance, row.kind_provenance);
+    }
+
+    #[test]
+    fn namespace_meta_dto_round_trips() {
+        let row = NamespaceMetaRow {
+            namespace: "team/eng".into(),
+            standard_id: Some("std-1".into()),
+            parent_namespace: Some("team".into()),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&NamespaceMetaDto::from(&row)).unwrap();
+        let back: NamespaceMetaRow = serde_json::from_str::<NamespaceMetaDto>(&json)
+            .unwrap()
+            .into();
+        assert_eq!(back, row);
+    }
+
+    #[test]
+    fn archived_memory_link_dto_round_trips_byte_exact() {
+        let row = ArchivedMemoryLinkRow {
+            source_id: "a".into(),
+            target_id: "b".into(),
+            relation: "related_to".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            valid_from: None,
+            valid_until: None,
+            observed_by: None,
+            signature: Some(vec![0xab; 64]),
+            attest_level: Some("signed".into()),
+            archived_at: "2026-01-02T00:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&ArchivedMemoryLinkDto::from(&row)).unwrap();
+        assert_no_number_array(&json);
+        let back: ArchivedMemoryLinkRow = serde_json::from_str::<ArchivedMemoryLinkDto>(&json)
+            .unwrap()
+            .into();
+        assert_eq!(back, row);
     }
 }
