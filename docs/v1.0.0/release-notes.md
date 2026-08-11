@@ -61,7 +61,22 @@ v1.0.0 is the **GA of the perfect-endpoint program** — it turns the
 substrate's secure defaults from *opt-in* into *on*, lands the
 crypto-core stage (SubkeyCert instance certification, epistemic memory
 kinds, claim-bitemporal columns), and certifies the postgres + Apache
-AGE + pgvector storage backend on a pinned, live-tested stack.
+AGE + pgvector storage backend.
+
+> **Certified-backend scope — read this before choosing Postgres.** The
+> two backends are **not one identical API**: **59 of the 80 unique
+> production HTTP paths are served on Postgres; the remaining 21 fail
+> closed with a uniform `501 NOT IMPLEMENTED`** (the Agent Skills surface,
+> `/api/v1/share`, the legacy `/api/v1/find_paths` alias, and the
+> `memory_*` MCP-parity routes with no pg SAL trait method yet — pinned by
+> `tests/pg_supported_route_inventory_gate_2799.rs`), and **MCP-stdio is
+> structurally SQLite-only** ([#1675](https://github.com/alphaonedev/ai-memory-mcp/issues/1675)):
+> a Postgres-backed deployment serves MCP clients through the HTTP daemon,
+> not `ai-memory mcp`. The certification evidence rests on the PG 16 / AGE
+> 1.6.0 stack CI tests on every push; the SSOT-pinned PG 18.4 / AGE 1.7.0 /
+> pgvector 0.8.5 stack is **additionally validated off-CI**, not
+> CI-asserted — see §"Certified backend versions" for the exact versions
+> and evidence basis.
 
 The "defaults stop lying" lane (Gate 1′) is the centerpiece: six knobs
 that shipped OFF (or non-functional) through v0.10.0 now resolve to their
@@ -187,22 +202,47 @@ epoch is fail-OPEN, so existing federation is not hard-refused). See
 
 ## Certified backend versions
 
-v1.0.0 is **certified on PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector
-0.8.5** (the pgvector Rust binding is the `pgvector` crate `0.4`,
-`features = ["sqlx"]`). These are the current-stable upstream versions;
-Apache AGE 1.8.0 exists only as `rc0` and is deliberately NOT shipped —
-the certified stack pins the released `release_PG18_1.7.0` line.
+The version story has two honest halves, and it matters which is which:
 
-The single source of truth for the pinned versions is
-`deploy/docker-1461/provision/lib.sh` (`EXPECTED_PG_VERSION=18.4`,
-`EXPECTED_AGE_VERSION=1.7.0`, `PGVECTOR_APT_VERSION=0.8.5-1.pgdg13+1`,
-`AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0`). The certified stack was
-exercised live on the validation host: the AGE-gated Cypher/KG suites
+**Continuously + reproducibly CI-tested (every PR and push): PostgreSQL 16
++ Apache AGE 1.6.0.** The AGE-gated Cypher/KG suites
 (`age_cte_equivalence`, `g2_postgres_find_paths_age_param_binding`,
 `g4_postgres_link_projects_into_age_graph`, `cov_postgres_kg`,
 `issue_1482_age_cypher_persistent`, `kg_age_fallback`) and the
-pgvector-backed recall-purity suite (`recall_purity_p01_postgres`) ran
-green against it under `--features sal,sal-postgres --include-ignored`.
+pgvector-backed recall-purity suite (`recall_purity_p01_postgres`) run
+green under `--features sal,sal-postgres --include-ignored` against the
+`apache/age:release_PG16_1.6.0` service container in `coverage.yml`, with
+pgvector layered in at service start via the `postgresql-16-pgvector` apt
+package. This PG 16 / AGE 1.6.0 combination is what the substrate's
+Postgres backend has actually, repeatedly, in-repo been exercised on — so
+it is the stack the certification evidence rests on.
+
+**Additionally validated off-CI (SSOT-pinned, NOT CI-asserted):
+PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.5.** These are the pins
+the deployment SSOT carries — `deploy/docker-1461/provision/lib.sh`
+(`EXPECTED_PG_VERSION=18.4`, `EXPECTED_AGE_VERSION=1.7.0`,
+`PGVECTOR_APT_VERSION=0.8.5-1.pgdg13+1`,
+`AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0`; the pgvector Rust binding
+is the `pgvector` crate `0.4`, `features = ["sqlx"]`) — and they are the
+current-stable upstream line (Apache AGE 1.8.0 exists only as `rc0` and is
+deliberately not shipped). The same AGE/KG + recall-purity suites were run
+green against this stack on the operator's off-CI validation host, but
+**no CI job builds or version-asserts 18.4 / 1.7.0 / 0.8.5**: the
+dedicated `postgres-age` nightly that once did was RED for its final three
+runs (the vendored `paste` fork rev went unreachable,
+[#2512](https://github.com/alphaonedev/ai-memory-mcp/issues/2512) defect
+1) and was deleted on 2026-07-31 (§"CI posture" below). Treat 18.4 /
+1.7.0 / 0.8.5 as **additionally validated**, not continuously certified;
+the continuously-tested combination is PG 16 / AGE 1.6.0.
+
+> **A separate SSOT-internal pin drift, disclosed rather than papered
+> over:** `deploy/docker-1461/provision/lib.sh` pins pgvector **0.8.5**
+> while the sibling `deploy/do-1461/provision/lib.sh` pins pgvector
+> **0.8.2** (`EXPECTED_PGVECTOR_VERSION=0.8.2`). The two provisioning
+> SSOTs do not agree on the pgvector patch, and the CI-vs-SSOT AGE drift
+> (CI 1.6.0 vs SSOT 1.7.0) is
+> [#2512](https://github.com/alphaonedev/ai-memory-mcp/issues/2512) defect
+> 2. Both are tracked, not silently reconciled in prose.
 
 ### What those AGE greens attest — read this before relying on them
 
@@ -239,7 +279,7 @@ per-call fallback WARN that removal left silent). `find_paths` results
 were and remain correct (the CTE reads the durable `memory_links`);
 `kg_query` / `kg_timeline` / `lineage` still use AGE Cypher.
 
-### CI posture for the certified stack — the pins are not CI-asserted
+### CI posture for the SSOT-pinned (18.4) stack — the pins are not CI-asserted
 
 **No CI job builds or version-asserts PG 18.4 + AGE 1.7.0 + pgvector
 0.8.5.** The `postgres-age` job
@@ -262,9 +302,11 @@ and DO run on every PR and push in `coverage.yml` — but against an
 defect 2, held behind
 [#2548](https://github.com/alphaonedev/ai-memory-mcp/issues/2548)
 (whether any in-PR AGE coverage is wanted at all, to be justified on
-its own merits and with a container image if it ever is). The certified
+its own merits and with a container image if it ever is). The SSOT-pinned
 18.4 / 1.7.0 / 0.8.5 combination itself is exercised on the operator's
-validation host and nowhere else.
+validation host and nowhere else — it is **additionally validated**, not
+continuously CI-certified; the CI-certified combination is PG 16 / AGE
+1.6.0.
 
 ## Additive surfaces
 
@@ -424,9 +466,12 @@ supersedes ROADMAP §11.6's "public security audit by named third-party
 firm" line for this epic). ROADMAP §27 sequences it as a five-step
 program:
 
-1. **DigitalOcean full-spectrum testing + attestation.** The certified
+1. **DigitalOcean full-spectrum testing + attestation.** The SSOT-pinned
    PG 18.4 + AGE 1.7.0 + pgvector 0.8.5 stack was exercised full-spectrum
-   on DigitalOcean and attested (this also covers the v0.9.0 4-phase
+   on DigitalOcean (the off-CI validation host — this IS the "additionally
+   validated" evidence for those pins; the continuously CI-tested
+   combination is PG 16 / AGE 1.6.0, see §"Certified backend versions")
+   and attested (this also covers the v0.9.0 4-phase
    ship-gate boundary per ROADMAP §17's recorded exception, ruling
    `wf_26d176ac` — the v0.9.0 record re-opens only if this campaign does
    not run).
