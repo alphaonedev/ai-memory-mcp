@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed (federation data-integrity — CERT-BLOCKING)
 
+- **Every federation fanout lane now lands a durable push-DLQ row on a
+  non-acking peer — a failed fanout is recoverable, not a silent divergence**
+  ([#2667](https://github.com/alphaonedev/ai-memory-mcp/issues/2667); 5-agent
+  adversarial vote `4d3ea1c5`). Pre-fix only the store (#933) and delete (#2498)
+  lanes enqueued a `federation_push_dlq` row when a peer did not ack; the other
+  11 `broadcast_*_quorum` lanes — `archive`, `restore`, `link`, `consolidate`,
+  `pending`, `pending_decision`, `action_transition`, `checkpoint_resolution`,
+  `signal_create`, `namespace_meta`, `namespace_meta_clear` — emitted a lone
+  `tracing::warn!` and dropped the failure, so a peer that was down,
+  deadline-evicted, or that refused an item inside an HTTP 200 (`skipped > 0`,
+  #2341) diverged PERMANENTLY and SILENTLY. This included governance
+  (`namespace_meta`) and authority (`pending` / `pending_decision` /
+  checkpoint-resolution / action-transition) state that the anti-entropy
+  catch-up loop — which pulls MEMORY rows only — never reconciles. All 13 lanes
+  now route their non-ack failures through one shared `land_push_failures`
+  helper so the `replay_federation_push_dlq` worker re-drives them on peer
+  recovery (default build AND both backends). DLQ keys are LANE-PREFIXED
+  (`archive:{id}`, `link:{src}:{tgt}:{rel}`, `namespace_meta:{ns}`,
+  `action_transition:{action_id}:{to_state}:{updated_at}` per-transition, …) so
+  distinct pending ops on the same subject never collide, and — load-bearing —
+  so a legacy-mode `consolidate` body (which carries `deletions[]`) does not
+  trip the replay restore-race guard against the live consolidated row; `store`
+  and `delete` keep the bare memory-id key their guard and documented
+  last-wins collision require. Follow-up (tracked, not silent-loss): a
+  subcollection anti-entropy reconciler as the convergence backstop past the
+  100-attempt quarantine ceiling, and a DLQ landing for the non-quorum
+  `bulk_catchup_push` bulk sender (its memory-row payload is already self-healed
+  by the `/sync/since` catch-up loop).
 - **Daemon-authored federated consolidations converge at `agent_attested` at
   peers OUT-OF-BOX for a normally-enrolled mesh — no manual DB-bind step**
   ([#2865](https://github.com/alphaonedev/ai-memory-mcp/issues/2865); 5-agent
