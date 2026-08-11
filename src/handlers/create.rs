@@ -507,18 +507,11 @@ fn resolve_create_conflict_title(
     match on_conflict_mode {
         OnConflictMode::Error => {
             match db::find_by_title_namespace(conn, &body.title, &body.namespace) {
-                Ok(Some(existing_id)) => Err((
-                    StatusCode::CONFLICT,
-                    Json(json!({
-                        "code": crate::errors::error_codes::CONFLICT,
-                        "error": format!(
-                            "memory with title '{}' already exists in namespace '{}'",
-                            body.title, body.namespace
-                        ),
-                        (field_names::EXISTING_ID): existing_id,
-                    })),
-                )
-                    .into_response()),
+                Ok(Some(existing_id)) => Err(conflict_409_response(
+                    &body.title,
+                    &body.namespace,
+                    &existing_id,
+                )),
                 Ok(None) => Ok(body.title.clone()),
                 Err(e) => {
                     tracing::error!("on_conflict lookup failed: {e}");
@@ -541,6 +534,31 @@ fn resolve_create_conflict_title(
             }),
         OnConflictMode::Merge => Ok(body.title.clone()),
     }
+}
+
+/// #2771 — the ONE builder for the `409 CONFLICT` a `(title, namespace)`
+/// create collision returns, whether the collision is PROBE-detected (an
+/// existing row seen up front) or WRITE-detected (the fail-closed `ON CONFLICT
+/// DO NOTHING` refused a racer). Single-sources the wire shape — `code:
+/// CONFLICT`, the message, and `existing_id` — across every sqlite + postgres
+/// create funnel so a race-detected 409 is byte-identical to a probe-detected
+/// one (and the message literal lives at exactly one site).
+fn conflict_409_response(
+    title: &str,
+    namespace: &str,
+    existing_id: &str,
+) -> axum::response::Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "code": crate::errors::error_codes::CONFLICT,
+            "error": format!(
+                "memory with title '{title}' already exists in namespace '{namespace}'"
+            ),
+            (field_names::EXISTING_ID): existing_id,
+        })),
+    )
+        .into_response()
 }
 
 /// #866 stage 4 — substrate governance pre-write hook. Walks the
@@ -857,18 +875,11 @@ fn insert_create_with_quota(
             // `existing_id`), so a race-detected conflict is wire-identical to a
             // probe-detected one and never a silent overwrite.
             if let Some(conflict) = e.downcast_ref::<crate::storage::ConflictError>() {
-                return Err((
-                    StatusCode::CONFLICT,
-                    Json(json!({
-                        "code": crate::errors::error_codes::CONFLICT,
-                        "error": format!(
-                            "memory with title '{}' already exists in namespace '{}'",
-                            conflict.title, conflict.namespace
-                        ),
-                        (field_names::EXISTING_ID): conflict.existing_id,
-                    })),
-                )
-                    .into_response());
+                return Err(conflict_409_response(
+                    &conflict.title,
+                    &conflict.namespace,
+                    &conflict.existing_id,
+                ));
             }
             if let Some(refusal) = e.downcast_ref::<crate::storage::GovernanceRefusal>() {
                 tracing::info!(
@@ -1051,17 +1062,7 @@ fn create_pg_store_err_to_response(
     namespace: &str,
 ) -> axum::response::Response {
     if let crate::store::StoreError::Conflict { id } = &e {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "code": crate::errors::error_codes::CONFLICT,
-                "error": format!(
-                    "memory with title '{title}' already exists in namespace '{namespace}'"
-                ),
-                (field_names::EXISTING_ID): id,
-            })),
-        )
-            .into_response();
+        return conflict_409_response(title, namespace, id);
     }
     store_err_to_response(e)
 }
@@ -1152,18 +1153,7 @@ async fn create_memory_postgres(
                 .await
             {
                 Ok(Some(existing_id)) => {
-                    return (
-                        StatusCode::CONFLICT,
-                        Json(json!({
-                            "code": crate::errors::error_codes::CONFLICT,
-                            "error": format!(
-                                "memory with title '{}' already exists in namespace '{}'",
-                                body.title, body.namespace
-                            ),
-                            (field_names::EXISTING_ID): existing_id,
-                        })),
-                    )
-                        .into_response();
+                    return conflict_409_response(&body.title, &body.namespace, &existing_id);
                 }
                 Ok(None) => body.title.clone(),
                 Err(e) => return store_err_to_response(e),
