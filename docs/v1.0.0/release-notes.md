@@ -234,13 +234,17 @@ deliberately not shipped). As of
 [#2548](https://github.com/alphaonedev/ai-memory-mcp/issues/2548) /
 [#2512](https://github.com/alphaonedev/ai-memory-mcp/issues/2512) the
 AGE/KG + recall-purity suites run against this exact stack in-PR:
-`.github/workflows/cert-postgres-age.yml` stands up a live
-`apache/age:release_PG18_1.7.0` service (pgvector layered in via
-`postgresql-18-pgvector`), runs the pg-parity and AGE cells
-`--include-ignored`, and hard-fails if the running stack is not AGE 1.7.0
-on PG 18 with pgvector >= 0.8.5 — so the certified tier is proven by
-execution on the cert branch, not merely claimed. The PG 16 / AGE 1.6.0
-combination in `coverage.yml` remains as the documented alternate matrix.
+`.github/workflows/cert-postgres-age.yml` BUILDS
+`deploy/docker-1461/Dockerfile.pg-age-vector` — the same recipe the
+docker-1461 mesh ships — with build-args resolved straight from this SSOT
+(`deploy/docker-1461/provision/lib.sh`), runs the resulting image as the
+postgres under test, runs the pg-parity and AGE cells `--include-ignored`,
+and version-asserts the EXACT pinned minors (PostgreSQL 18.4, Apache AGE
+1.7.0, pgvector 0.8.5 — not merely "PG 18" or "pgvector >= 0.8.5") — so the
+certified tier is proven by execution on the cert branch, not merely
+claimed, and CI's build artifact is the SAME artifact the deploy SSOT
+ships (zero drift by construction). The PG 16 / AGE 1.6.0 combination in
+`coverage.yml` remains as the documented alternate matrix.
 
 > **Cross-lane pgvector pin — reconciled ([#2872](https://github.com/alphaonedev/ai-memory-mcp/issues/2872)).**
 > Both certified provisioning SSOTs now pin pgvector **0.8.5**:
@@ -302,15 +306,20 @@ were and remain correct (the CTE reads the durable `memory_links`);
 **The certified PG 18.4 + AGE 1.7.0 + pgvector 0.8.5 stack is now
 exercised in-PR.** `.github/workflows/cert-postgres-age.yml`
 ([#2548](https://github.com/alphaonedev/ai-memory-mcp/issues/2548))
-triggers on `pull_request` + `push` to `release/**`, stands up a live
-`apache/age:release_PG18_1.7.0` service with pgvector layered in via
-`postgresql-18-pgvector`, runs the `#[ignore]`-gated pg-parity binaries
-AND the AGE-backed cells (`AI_MEMORY_TEST_AGE_URL` set, so they stop
+triggers on `pull_request` + `push` to `release/**`, resolves every
+version pin from the ONE declaration source
+(`deploy/docker-1461/provision/lib.sh`), BUILDS
+`deploy/docker-1461/Dockerfile.pg-age-vector` with those pins as
+build-args (the same recipe the docker-1461 mesh ships — no second,
+drift-prone copy of the pins), runs the resulting image as the postgres
+under test, runs the `#[ignore]`-gated pg-parity binaries AND the
+AGE-backed cells (`AI_MEMORY_TEST_AGE_URL` set, so they stop
 self-skipping) under `--features sal-postgres --include-ignored`, and a
-version-assert step hard-fails if the running stack is not AGE 1.7.0 on
-PG 18 with pgvector >= 0.8.5. This is what makes the 2026-08-01 cutline
+version-assert step hard-fails on ANY drift from the exact pinned minors
+— PostgreSQL 18.4, Apache AGE 1.7.0, pgvector 0.8.5, not a looser "PG 18"
+/ "pgvector >= 0.8.5" match. This is what makes the 2026-08-01 cutline
 ruling §5.4(3) executable — the certified tier is proven by execution on
-the cert branch.
+the cert branch, at the exact certified minors the docs cite.
 
 The historical `postgres-age` nightly
 ([#2012](https://github.com/alphaonedev/ai-memory-mcp/issues/2012)) that
@@ -488,9 +497,12 @@ program:
 
 1. **DigitalOcean full-spectrum testing + attestation.** The SSOT-pinned
    PG 18.4 + AGE 1.7.0 + pgvector 0.8.5 stack was exercised full-spectrum
-   on DigitalOcean (the off-CI validation host — this IS the "additionally
-   validated" evidence for those pins; the continuously CI-tested
-   combination is PG 16 / AGE 1.6.0, see §"Certified backend versions")
+   on DigitalOcean (the off-CI validation host — at the time this campaign
+   ran, DO was the only place that exact triple had been exercised end to
+   end; CI has since begun exercising the same certified triple in-PR on
+   `release/**`, runs `deploy/docker-1461/Dockerfile.pg-age-vector` built
+   to the SSOT-pinned minors, and version-asserts the exact result — see
+   §"Certified backend versions" for the current in-PR posture)
    and attested (this also covers the v0.9.0 4-phase
    ship-gate boundary per ROADMAP §17's recorded exception, ruling
    `wf_26d176ac` — the v0.9.0 record re-opens only if this campaign does

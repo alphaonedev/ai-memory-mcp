@@ -56,10 +56,14 @@ works on postgres.
 > **CI evidence (#2548 / #2512).** The **one true certified triple** —
 > PostgreSQL **18.4** + Apache AGE **1.7.0** + pgvector **0.8.5** — is
 > exercised **in-PR on `release/**`** by
-> `.github/workflows/cert-postgres-age.yml`, which runs the `#[ignore]`-gated
-> postgres cells AND the AGE-backed cells against a live
-> `apache/age:release_PG18_1.7.0` service and **hard-fails if the running AGE
-> is not 1.7.0** — so the certified tier is proven by execution, never merely
+> `.github/workflows/cert-postgres-age.yml`, which BUILDS the bundled
+> [`deploy/docker-1461/Dockerfile.pg-age-vector`](../deploy/docker-1461/Dockerfile.pg-age-vector)
+> to the exact pins declared in `deploy/docker-1461/provision/lib.sh` (the ONE
+> declaration source — no literal is re-typed in the workflow), runs the
+> `#[ignore]`-gated postgres cells AND the AGE-backed cells against that built
+> image, and **hard-fails on ANY drift from the exact pinned minors** —
+> PostgreSQL 18.4, Apache AGE 1.7.0, pgvector 0.8.5, not merely "PG 18" or
+> "AGE 1.7.x" — so the certified tier is proven by execution, never merely
 > claimed (2026-08-01 cutline ruling §5.4(3): "you cannot certify a tier CI
 > does not run"). The `infra/lan-parity-test/` alternate matrix (PG 16 + AGE
 > 1.6.0) is what the `coverage.yml` line-coverage measurement runs; that is a
