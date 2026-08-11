@@ -516,6 +516,11 @@ fn claims_gates_are_wired_into_ci_with_self_tests_2629() {
         // is MISSING). Same wiring contract: invoked + --self-test in
         // c8-precheck.yml so it cannot silently stop detecting.
         "scripts/check-doc-surface-completeness.sh",
+        // #2869 — the agent-count / scale-CAPACITY claim ceiling gate. No
+        // other claims gate policed a fleet-scale agent number, so the retired
+        // #2438 "1 to ~1,000,000 AI agents" figure shipped on a live page
+        // while every gate was green. Same wiring contract.
+        "scripts/check-capacity-claims.sh",
     ] {
         let path = root.join(script);
         assert!(path.exists(), "claims gate missing from the tree: {script}");
