@@ -25,6 +25,17 @@
 # base image has AGE+postgres; pgvector is installed at service-start via
 # the runtime `postgresql-16-pgvector` apt package. Mirror of the
 # `infra/lan-parity-test/` Docker stack the Tier 4 cov audit used.
+#
+# STACK PROVENANCE (#2512). This job runs the DOCUMENTED ALTERNATE matrix —
+# PostgreSQL 16 + Apache AGE 1.6.0 + pgvector — which docs/postgres-age-guide.md
+# §"Certified versions" retains as a "tested alternate matrix
+# (`infra/lan-parity-test/`)". It is NOT the certified triple and does not
+# certify one: coverage is a Rust line-coverage measurement, not cert evidence.
+# The ONE TRUE CERTIFIED triple — PostgreSQL 18.4 + Apache AGE 1.7.0 +
+# pgvector 0.8.5 — is exercised in-PR by `.github/workflows/cert-postgres-age.yml`
+# (#2548), so CI runs BOTH stacks the SSOT documents and neither is drift:
+# canonical here would risk this required coverage gate on a PG-major flip it
+# does not measure, while the cert job proves the canonical tier separately.
 
 name: Per-Module Coverage Thresholds
 
@@ -142,7 +153,10 @@ jobs:
       contents: read
       pull-requests: write
     services:
-      # Live PG + Apache AGE 1.6.0 (graph extension on PostgreSQL 16).
+      # Live PG + Apache AGE 1.6.0 (graph extension on PostgreSQL 16) — the
+      # DOCUMENTED ALTERNATE matrix (#2512; see the header note above). The
+      # certified triple (PG 18.4 + AGE 1.7.0 + pgvector 0.8.5) is exercised
+      # by `.github/workflows/cert-postgres-age.yml`, not here.
       # The pgvector extension is layered in via the
       # `Install pgvector + provision AGE/vector extensions` step below
       # because the upstream `apache/age` image doesn't ship pgvector

@@ -1,0 +1,211 @@
+# Certified Postgres + Apache AGE + pgvector tier — IN-PR cert evidence (#2548).
+#
+# WHY THIS WORKFLOW EXISTS. Before #2548 the certified pg+AGE tier was NEVER
+# exercised in-PR. The `#[ignore]`-gated postgres/AGE cells ran ONLY in
+# `postgres-parity-nightly.yml` (a `schedule:` workflow that fires from the
+# DEFAULT branch, not from a PR into `release/**`), and the AGE-backed cells
+# self-skip unless `AI_MEMORY_TEST_AGE_URL` is set — so on the certification
+# branch nothing proved the certified tier actually works. The 2026-08-01
+# cutline ruling §5.4(3) requires EXECUTED evidence on real Postgres + AGE +
+# pgvector, at the CERTIFIED versions, on the cert branch. "You cannot certify
+# a tier CI does not run", and the ruling forbids "CI-on-16-while-certifying-18".
+# This job is what makes §5.4(3) executable: it runs the ignored pg cells AND
+# the AGE-backed cells (with the AGE url set, so they stop self-skipping)
+# against a LIVE stack pinned to the ONE TRUE certified triple.
+#
+# THE ONE TRUE CERTIFIED TRIPLE (SSOT: docs/postgres-age-guide.md §"Certified
+# versions" + deploy/docker-1461/provision/lib.sh):
+#
+#   * PostgreSQL   18.4   (EXPECTED_PG_VERSION=18.4)
+#   * Apache AGE   1.7.0  (EXPECTED_AGE_VERSION=1.7.0; image apache/age:release_PG18_1.7.0)
+#   * pgvector     0.8.5  (PGVECTOR_APT_VERSION=0.8.5-1.pgdg13+1)
+#
+# The service image `apache/age:release_PG18_1.7.0` ships AGE 1.7.0 compiled
+# into the PG18 tree; pgvector is layered in at service-start via the pgdg
+# `postgresql-18-pgvector` apt package (the upstream apache/age image does not
+# ship pgvector), mirroring deploy/docker-1461/Dockerfile.pg-age-vector. The
+# `Assert certified stack versions` step below hard-fails if the running stack
+# is not AGE 1.7.0 on PG 18 with pgvector >= 0.8.5 — so this job is EVIDENCE,
+# not a claim: a base-image drift that silently moved AGE off 1.7.0 reds here.
+#
+# Modelled on postgres-parity-nightly.yml (mold + trimmed dev debug to hold the
+# heavy sal-postgres build under the runner RSS/disk ceilings) and coverage.yml
+# (the pg-age service + AGE/pgvector extension provisioning). coverage.yml keeps
+# running the DOCUMENTED ALTERNATE matrix (PG16 + AGE 1.6.0); this job is the
+# CANONICAL certified-triple evidence. Both are honest and both are in the SSOT.
+name: "Certified Postgres + AGE + pgvector tier (#2548)"
+
+on:
+  pull_request:
+    branches: ["release/**"]
+  push:
+    branches: ["release/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Event-distinct key (includes github.event_name) so a same-sha push +
+  # pull_request pair never collide into one cancel-in-progress group — the
+  # rule-(d) CANCELLED-DUPLICATE class scripts/check-required-contexts.sh
+  # guards against. Fork-PR-safe: isolates fork PRs by number.
+  group: cert-pg-age-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Match postgres-feature / postgres-parity-nightly: mold linker + no dev debug
+  # info to keep the heavy sal-postgres build under the runner ceilings.
+  RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  AI_MEMORY_TEST_POSTGRES_URL: "postgres://ai_memory:ai_memory_ci@127.0.0.1:5432/ai_memory_ci"
+  AI_MEMORY_TEST_AGE_URL: "postgres://ai_memory:ai_memory_ci@127.0.0.1:5432/ai_memory_ci"
+
+jobs:
+  cert-postgres-age:
+    name: "Certified pg+AGE cells (live PG 18.4 + AGE 1.7.0 + pgvector 0.8.5)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      pg-age:
+        # CANONICAL certified triple — Apache AGE 1.7.0 on PostgreSQL 18.
+        image: apache/age:release_PG18_1.7.0
+        env:
+          POSTGRES_USER: ai_memory
+          POSTGRES_PASSWORD: ai_memory_ci
+          POSTGRES_DB: ai_memory_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ai_memory -d ai_memory_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk (heavy sal-postgres build headroom)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup \
+                      /usr/local/share/powershell /usr/local/share/chromium \
+                      /usr/local/share/boost /usr/local/lib/node_modules \
+                      /opt/google /usr/lib/jvm /opt/microsoft \
+                      /usr/share/swift /usr/share/miniconda || true
+          sudo apt-get autoremove --purge -y || true
+          sudo apt-get clean || true
+          df -h /
+
+      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy
+
+      - name: Install mold linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold postgresql-client
+          mold --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Wait for postgres readiness
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_ci >/dev/null 2>&1; then
+              echo "::notice::postgres is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::postgres did not become ready within 60s"
+          exit 1
+
+      - name: Install pgvector + provision AGE/vector extensions (certified stack)
+        env:
+          PGPASSWORD: ai_memory_ci
+        run: |
+          set -euo pipefail
+          # Locate the pg-age service container so we can apt-get install
+          # pgvector against the same Debian-based image (apache/age PG18
+          # inherits the pgdg apt sources via the official postgres:18 base).
+          PG_CONTAINER=$(docker ps --filter "ancestor=apache/age:release_PG18_1.7.0" --format '{{.ID}}' | head -1)
+          echo "pg container: $PG_CONTAINER"
+          docker exec "$PG_CONTAINER" apt-get update
+          # pgvector for PG18. Unpinned deb (the pgdg snapshot codename can move)
+          # — the exact resolved version is ASSERTED >= 0.8.5 in the next step,
+          # which is the certification-grade check, not the apt version string.
+          docker exec "$PG_CONTAINER" apt-get install -y postgresql-18-pgvector
+          # Provision extensions + the memory_graph AGE graph the SAL postgres
+          # adapter expects. Mirrors coverage.yml + infra/lan-parity-test/init-age.sql.
+          psql -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_ci -c "CREATE EXTENSION IF NOT EXISTS vector;"
+          psql -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_ci -c "CREATE EXTENSION IF NOT EXISTS age;"
+          psql -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_ci -c "LOAD 'age'; SET search_path = ag_catalog, \"\$user\", public; SELECT ag_catalog.create_graph('memory_graph');" || echo "memory_graph already exists or AGE init handled by ladder"
+
+      - name: Assert certified stack versions (cert evidence, hard-fail on drift)
+        env:
+          PGPASSWORD: ai_memory_ci
+        run: |
+          set -euo pipefail
+          PSQL="psql -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_ci -tAX"
+          pg_ver=$($PSQL -c "SHOW server_version;" | tr -d '[:space:]')
+          age_ver=$($PSQL -c "SELECT extversion FROM pg_extension WHERE extname='age';" | tr -d '[:space:]')
+          vec_ver=$($PSQL -c "SELECT extversion FROM pg_extension WHERE extname='vector';" | tr -d '[:space:]')
+          echo "::notice::certified stack — PostgreSQL=$pg_ver  Apache AGE=$age_ver  pgvector=$vec_ver"
+          {
+            echo "### Certified Postgres + AGE + pgvector tier"
+            echo ""
+            echo "| component | running | certified (SSOT) |"
+            echo "| --- | --- | --- |"
+            echo "| PostgreSQL | $pg_ver | 18.4 |"
+            echo "| Apache AGE | $age_ver | 1.7.0 |"
+            echo "| pgvector | $vec_ver | 0.8.5 |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # AGE is the certification subject (#2512): a base-image drift off
+          # 1.7.0 must RED, never silently certify the wrong version.
+          case "$pg_ver" in 18*) : ;; *) echo "::error::expected PostgreSQL 18.x, got $pg_ver"; exit 1 ;; esac
+          # Certified AGE minor is 1.7 (accept the '1.7' and '1.7.0' renderings
+          # of the same extension version; reject 1.6.x and anything else — the
+          # whole point of #2512 is that CI must run the certified 1.7, not 1.6).
+          case "$age_ver" in
+            1.7|1.7.*) echo "Apache AGE $age_ver == certified 1.7 OK" ;;
+            *) echo "::error::expected Apache AGE 1.7 (certified), got '$age_ver' — CI must not certify a version it does not run (§5.4(3))"; exit 1 ;;
+          esac
+          # pgvector >= 0.8.5 (certified). Fail on absence or an older minor.
+          case "$vec_ver" in
+            "") echo "::error::pgvector extension not present"; exit 1 ;;
+            0.8.[5-9]*|0.9.*|0.[1-9][0-9]*|[1-9]*) echo "pgvector $vec_ver >= 0.8.5 OK" ;;
+            *) echo "::error::expected pgvector >= 0.8.5 (certified), got '$vec_ver'"; exit 1 ;;
+          esac
+
+      - name: Run #[ignore]-gated pg + AGE cells against the certified stack
+        run: |
+          set -euo pipefail
+          # The pg-parity binaries mirror postgres-parity-nightly.yml (they do
+          # not touch AGE). The AGE-backed binaries self-skip unless
+          # AI_MEMORY_TEST_AGE_URL is set (it is, in env: above), so they run
+          # here — this is the in-PR cert evidence that was missing (#2548).
+          # `--include-ignored` also runs the explicitly #[ignore]-gated cells
+          # (e.g. age_cypher_param_binding_2511). --test-threads=1 because the
+          # sal-postgres suite shares one database with no per-test isolation.
+          cargo test --features sal-postgres \
+            --test secret_screen_postgres_parity_g29 \
+            --test postgres_l2_rehydration_1693 \
+            --test erasure_fanout_postgres_g30 \
+            --test recall_purity_p01_postgres \
+            --test qual_pg_write_funnel_parity_2393_2397 \
+            --test store_parity_gaps \
+            --test age_cypher_param_binding_2511 \
+            --test kg_query_relation_parity_2792 \
+            --test g2_postgres_find_paths_age_param_binding \
+            --test g4_postgres_link_projects_into_age_graph \
+            --test g5_find_paths_cte_served_on_age \
+            --test kg_age_fallback \
+            --test age_cte_equivalence \
+            --test issue_1482_age_cypher_persistent \
+            --test pillar4_4c_deferred_age_cold_path_1735 \
+            --test pillar4_4d_age_unprojection_on_delete_1783 \
+            --test age_deferred_projection_cluster_2375_2376_2377 \
+            -- --include-ignored --test-threads=1
