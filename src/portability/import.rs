@@ -152,10 +152,20 @@ pub struct ImportReport {
     /// future admission; only the destination's own forget funnel erases).
     pub tombstones_skipped_live: usize,
     /// Memory rows skipped because the DESTINATION holds the id in
-    /// `archived_memories` (#2208 adjacent: re-admitting it live would
-    /// leave the id in BOTH tables; the sanctioned way back to live is
-    /// `memory_archive_restore`).
+    /// `archived_memories` under a GENUINE archival reason (#2208 adjacent:
+    /// re-admitting it live would leave the id in BOTH tables; the sanctioned
+    /// way back to live is `memory_archive_restore`). v1.0.0 #2570 — an
+    /// `archive_reason='in_place_edit'` snapshot of a STILL-LIVE row is NOT a
+    /// genuine archival and is NOT counted here; it is admitted (then
+    /// idempotent-skipped as a same-id re-import).
     pub archived_skipped: usize,
+    /// Memory rows skipped because the id is ALREADY LIVE at the destination —
+    /// an idempotent same-id re-import (the corpus's own export re-applied
+    /// onto an existing corpus). NOT a failure and NOT counted in `memories`
+    /// (no write happened): the durable row is kept, never overwritten
+    /// (#2569, 5-agent vote 4d3ea1c5). A divergent incoming copy adds a
+    /// `warnings` entry but is still not applied.
+    pub idempotent_skipped: usize,
     /// Memory rows whose `metadata.agent_id` was restamped with the
     /// caller's id (the L1-parity default; `--trust-source` disables).
     pub restamped: usize,
@@ -445,18 +455,40 @@ fn apply_all_classes(
         // on `storage::get`; re-admitting it live would leave the id in
         // BOTH `memories` and `archived_memories` (dual residency). The
         // sanctioned way back to live is `memory_archive_restore`.
-        if crate::storage::memory_is_archived(conn, &mem.id)
+        //
+        // v1.0.0 #2570 — DISCRIMINATE the archive_reason via the shared
+        // `memory_is_genuinely_archived` predicate (identical to the v1
+        // `cli::io` funnel): skip ONLY a GENUINE archival. #1725 snapshots the
+        // prior content of a STILL-LIVE row into `archived_memories` under
+        // `archive_reason='in_place_edit'` on every in-place edit, so keying on
+        // mere presence made an edited-but-live row fail the re-import of its
+        // OWN backup. This admits the in_place_edit snapshot and blocks only a
+        // real archival.
+        if crate::storage::memory_is_genuinely_archived(conn, &mem.id)
             .with_context(|| format!("import: archive probe for memory {}", mem.id))?
         {
             report.archived_skipped += 1;
             continue;
         }
-        // Idempotent: skip a memory already present (a re-import is a no-op).
-        if crate::storage::get(conn, &mem.id)
+        // v1.0.0 #2569 — IDEMPOTENT same-id re-import: a row already LIVE at
+        // the destination is a NO-OP (counted `idempotent_skipped`, NOT
+        // `memories` — no write happened), never a refusal. The durable row is
+        // the source of truth and is NEVER overwritten (#2878 never-clobber).
+        // A WARNING is surfaced when the incoming DURABLE content (title /
+        // content, never restamped metadata) diverges from the stored row, so
+        // a divergent backup is not silently swallowed (5-agent vote
+        // 4d3ea1c5). Runs AFTER the forget/archive covenant gates, so it never
+        // resurrects a forgotten/archived id.
+        if let Some(existing) = crate::storage::get(conn, &mem.id)
             .with_context(|| format!("import: probing existing memory {}", mem.id))?
-            .is_some()
         {
-            report.memories += 1;
+            if crate::storage::imported_row_diverges(&existing, mem) {
+                report.warnings.push(format!(
+                    "memory {} already present — durable row kept; incoming content differs",
+                    mem.id
+                ));
+            }
+            report.idempotent_skipped += 1;
             continue;
         }
         let mut staged = mem.clone();
