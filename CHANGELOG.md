@@ -43,6 +43,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#2512](https://github.com/alphaonedev/ai-memory-mcp/issues/2512)); an
   SSOT-internal pgvector pin drift (docker-1461 `0.8.5` vs do-1461 `0.8.2`) is
   disclosed rather than papered over.
+### Fixed (certified provisioning fail-OPEN — CERT-BLOCKING)
+
+- **A failing TLS/hostssl arming step can no longer bring PostgreSQL up
+  ACCEPTING CLEARTEXT while the provisioning lane reports healthy**
+  ([#2658](https://github.com/alphaonedev/ai-memory-mcp/issues/2658)). In the
+  certified provisioning lanes the PostgreSQL substrate is meant to enforce
+  hostssl (a non-TLS TCP connection refused pre-auth), but the readiness signal
+  did not PROVE it: the `deploy/docker-1461` compose healthcheck was
+  `pg_isready -U … -d …`, which speaks over the LOCAL unix socket
+  (`local … trust`) and reports healthy whenever the postmaster is up —
+  REGARDLESS of whether hostssl was actually armed on the TCP listener. A run in
+  which the arming silently did not take effect (a lost `pg_hba.conf` bind-mount,
+  an `ssl` GUC that never applied, PGDATA non-empty so init was skipped) would
+  therefore come up accepting cleartext on TCP, report healthy, and let
+  provisioning proceed — a silent security disarm. Fix: the healthcheck now
+  requires BOTH `pg_isready` AND proof that a plaintext (`sslmode=disable`) TCP
+  connection to the loopback listener is REFUSED PRE-AUTH by `pg_hba.conf`
+  (`deploy/docker-1461/pg-hostssl-healthcheck.sh`, baked into
+  `Dockerfile.pg-age-vector`), so "healthy" now MEANS "hostssl armed"; the
+  `provision/50_up.sh` gate re-probes and aborts LOUD (non-zero, named cause)
+  rather than declaring a cleartext-accepting mesh ready; and the native
+  `deploy/do-1461/provision/20_pg_age.sh` lane fails CLOSED (`die`) after the
+  extension verify if a plaintext connection over the region VPC IP is not
+  refused pre-auth. The `deploy/hive-1461` + `infra/do-hive` lanes bind
+  PostgreSQL localhost-only (no hostssl arming), so the fail-open class does not
+  apply to them. The classifier decision table is CI-provable via
+  `pg-hostssl-healthcheck.sh --self-test` (no live PostgreSQL required). The
+  Ed25519-CA channel-binding half of #2658 remains tracked as residual.
 
 ### Fixed (federation data-integrity — CERT-BLOCKING)
 

@@ -95,9 +95,14 @@ services:
       # hostssl-only client-auth map — rejects non-TLS TCP pre-auth.
       - ${PG_HBA_FILE:?PG_HBA_FILE must be set}:/etc/postgresql/pg_hba.conf:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${PG_USER} -d ${PG_DB}"]
+      # #2658 fail-CLOSED: "healthy" requires BOTH pg_isready (local socket)
+      # AND proof that hostssl is armed -- a plaintext sslmode=disable TCP
+      # connection is refused pre-auth. `pg_isready` alone (local `trust`
+      # socket) reported healthy even when the TCP listener accepted
+      # cleartext, a silent security disarm; the baked-in script closes it.
+      test: ["CMD", "/usr/local/bin/pg-hostssl-healthcheck.sh"]
       interval: 3s
-      timeout: 5s
+      timeout: 8s
       retries: 20
       start_period: 20s
     networks:

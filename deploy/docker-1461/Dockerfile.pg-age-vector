@@ -40,5 +40,12 @@ RUN apt-get update \
       "postgresql-${PG_MAJOR}-pgvector=${PGVECTOR_APT_VERSION}" \
  && rm -rf /var/lib/apt/lists/*
 
+# Fail-closed hostssl healthcheck (#2658). Baked in so "healthy" means
+# "hostssl PROVABLY armed" (a plaintext sslmode=disable TCP connection is
+# refused pre-auth), not merely "postmaster up on the local socket". The
+# compose healthcheck invokes this; provision/50_up.sh blocks on healthy.
+COPY pg-hostssl-healthcheck.sh /usr/local/bin/pg-hostssl-healthcheck.sh
+RUN chmod 0755 /usr/local/bin/pg-hostssl-healthcheck.sh
+
 # Base image entrypoint + USER state preserved; AGE auto-installs via
 # its own /docker-entrypoint-initdb.d/00-create-extension-age.sql.
