@@ -12,11 +12,16 @@ layout: doc
 > The two layers compose: mTLS is the transport boundary, zero-touch
 > credentials are the application identity carried *inside* it.
 >
-> **Certified scale envelope.** The enrollment surface is O(1) in peer
+> **Design scale envelope (derived topology ceiling).** The enrollment
+> surface is O(1) in peer
 > count, but *enrollment* is not the binding constraint — mesh topology
-> is. The certified claim is a **500–1000 agent cluster**, composed
+> is. The design claim is a **500–1000 agent cluster** (a derived
+> topology ceiling, not a measured capacity), composed
 > **modularly in 500-agent blocks**: scale past one cluster by adding
-> independent clusters, never by growing one mesh. The peer-to-peer
+> independent clusters, never by growing one mesh. This envelope is
+> ARCHITECTED, not MEASURED — the largest real-mesh-measured federation
+> is 2 nodes and the full-scale USL capacity projection is deferred to a
+> dedicated capacity bench ([#2438](https://github.com/alphaonedev/ai-memory-mcp/issues/2438)). The peer-to-peer
 > mesh model is the **wrong shape past ~50 peers** (see
 > §"Multi-peer scaling guidance" below, which has said so since v0.7.0).
 > A previous revision of this paragraph advertised "1 to ~1,000,000
@@ -655,8 +660,11 @@ Vector-clock storage scales linearly with peer count. The CRDT-lite
 merge cost is bounded by row count, not peer count — adding peers
 does not asymptotically hurt merge throughput.
 
-**Certified scale envelope.** A **500–1000 agent cluster**, composed
-modularly in **500-agent blocks**. Scale past one cluster by adding
+**Design scale envelope (derived topology ceiling).** A **500–1000 agent
+cluster**, composed modularly in **500-agent blocks** — an ARCHITECTED
+envelope, not a measured capacity: the largest real-mesh-measured
+federation is 2 nodes and the full-scale USL capacity projection is
+deferred to a dedicated capacity bench. Scale past one cluster by adding
 independent clusters, never by growing one mesh past the ~50-peer
 ceiling above. `docs/enterprise-deployment.md` §11 states the same
 rule from the capacity side ("compose independent modules, never

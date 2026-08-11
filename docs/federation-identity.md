@@ -9,8 +9,12 @@ layout: doc
 > credential system that removes O(N²) manual key exchange from fleet
 > growth.
 >
-> **Certified scale envelope: a 500–1000 agent cluster, composed
-> modularly in 500-agent blocks.** Scale past one cluster by adding
+> **Design scale envelope (derived topology ceiling): a 500–1000 agent
+> cluster, composed modularly in 500-agent blocks.** This is the
+> ARCHITECTED envelope, not a measured capacity — the largest
+> real-mesh-measured federation is 2 nodes; a full-scale USL capacity
+> projection is deferred to a dedicated capacity bench ([#2438](https://github.com/alphaonedev/ai-memory-mcp/issues/2438)).
+> Scale past one cluster by adding
 > independent clusters — never by growing one mesh, which
 > [`docs/federation.md`](federation.html) §"Multi-peer scaling guidance"
 > puts at a ~50-peer ceiling. Enrollment being O(1) removes the
