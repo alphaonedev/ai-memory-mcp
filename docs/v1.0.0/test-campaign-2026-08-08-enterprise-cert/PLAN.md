@@ -67,10 +67,22 @@ trait**, and the cert claim MUST read that way:
 
 > **Certified: PG16 + AGE 1.6.0 + pgvector serves the 59 pg-supported HTTP
 > paths (core CRUD, recall, search, links, KG including all 9 relations,
-> archive, federation sync, coordination and governance ENFORCEMENT
-> writes), plus the Phase-1-fixed surfaces (`kg_query` / `kg_invalidate` /
-> `kg_timeline`, the `kg_backend` capabilities field, verbose-recall
-> `latest_link_attest_level`, and `verify-audit-trail --store-url`).**
+> archive, coordination and governance ENFORCEMENT writes — LOCAL
+> enforcement — plus the federated-receive convergence lanes a pg
+> RECEIVER applies: `memories` / `links` / `deletions` / `signals` /
+> `action_transitions` (embeddings ride with `memories` as regenerated
+> derived vectors)), plus the Phase-1-fixed surfaces (`kg_query` /
+> `kg_invalidate` / `kg_timeline`, the `kg_backend` capabilities field,
+> verbose-recall `latest_link_attest_level`, and
+> `verify-audit-trail --store-url`).**
+
+The "federation sync" clause is scoped DELIBERATELY: "coordination and
+governance ENFORCEMENT writes" is the LOCAL enforcement surface (a pg
+node enforces its own coordination/governance rules), and a pg RECEIVER
+converges only the 5 subcollection lanes named above. Of the **13
+`/sync/push` federated-receive subcollection lanes, a pg receiver does
+NOT apply 7** — see the disclosure below; those 7 are sqlite-native and
+do NOT converge to a pg peer.
 
 **Explicitly OUTSIDE the cert boundary (SQLite-only / v1.x-deferred — a
 certified pg deployment must NOT rely on these):**
@@ -85,6 +97,28 @@ certified pg deployment must NOT rely on these):**
   `rule_list` + `check_agent_action` — enforcement works on pg, only the
   read/list API 501s). Tracked for v1.x under the Postgres surface-parity
   EPIC ([#2803](https://github.com/alphaonedev/ai-memory-mcp/issues/2803)).
+- **The 7 sqlite-native `/sync/push` federated-receive subcollection
+  lanes** — of the **13** federated-receive subcollection lanes on
+  `POST /api/v1/sync/push`, a pg RECEIVER does NOT apply **7**:
+  `archives`, `restores`, `pendings`, `pending_decisions`,
+  `namespace_meta`, `namespace_meta_clears`, `checkpoints`. They are not
+  yet `MemoryStore`-trait-covered for a federated verbatim write on
+  postgres, so the pg receive funnel buckets them
+  `unsupported_on_postgres` — an HONEST non-ack count, never a silent
+  drop (`src/handlers/federation_signing_check.rs:969`) — which the
+  SENDER then routes to its push-DLQ → quarantine. **These 7 lanes are
+  sqlite-native and do NOT converge to a pg peer.** A pg receiver applies
+  + converges only the other lanes: `memories`, `links`, `deletions`,
+  `signals`, `action_transitions` (with `embeddings` riding on `memories`
+  as regenerated derived vectors). So "sqlite↔postgres SAL parity" is
+  parity across the 59 pg-supported paths + the shared trait, NOT a claim
+  that every `/sync/push` subcollection round-trips to a pg node — 7 do
+  not. A track that federates one of the 7 lanes to a pg receiver and
+  asserts it "converges on Postgres" is a cert-scope violation. Tracked
+  for v1.x under the Postgres surface-parity EPIC
+  ([#2803](https://github.com/alphaonedev/ai-memory-mcp/issues/2803)) and
+  the federated-receive pg-lane parity item
+  ([#2341](https://github.com/alphaonedev/ai-memory-mcp/issues/2341)).
 
 A track that exercises a path in the 21-fully-501 set and asserts it
 "works on Postgres" is a cert-scope violation, not a GREEN — the honest
