@@ -6669,8 +6669,9 @@ impl AuditComplianceConfig {
 
     /// v1.0.0 #2401 — enumerate the compliance-preset fields that are
     /// ADVERTISED (an `applied` preset sets the flag `true`) but whose real
-    /// enforcement gate is NOT active in this process, so a boot WARN can name
-    /// each unenforced claim explicitly. This is the fix for the
+    /// enforcement gate is NOT active in this process, so the boot funnel can
+    /// name each unenforced claim explicitly as it REFUSES to boot. This is the
+    /// fix for the
     /// compliance-defaults-lie where the HIPAA/GDPR preset templates print
     /// `encrypt_at_rest = true` / `pseudonymize_actors = true` while the
     /// substrate performs neither — a bet-the-farm overclaim on a compliance
@@ -6689,10 +6690,13 @@ impl AuditComplianceConfig {
     ///   has NO consumer anywhere in the substrate (reserved / unimplemented),
     ///   so an `applied` preset asserting it can never be honored this release.
     ///
-    /// The 5-agent vote (`4d3ea1c5`) resolved the disposition to a loud boot
-    /// WARN (not a hard boot refusal), matching the repo's
-    /// `tls_bind_guard` / first-ship-advisory precedent for a SET-but-
-    /// UNENFORCEABLE posture the operator never explicitly demanded.
+    /// Per the operator cutline ruling (2026-08-01, §1-condition-2) a compliance
+    /// defaults-lie is a HARD BOOT ERROR: the boot funnel refuses to start when
+    /// this returns a non-empty list (see [`Self::overclaim_refusal_message`] +
+    /// the `daemon_runtime::run` gate). This binding prescription governs over
+    /// the earlier 5-agent WARN vote — a vote cannot override an explicit
+    /// operator ruling, and a lying compliance control being corrected is not
+    /// the `tls_bind_guard` new-control-with-rollout-window shape.
     #[must_use]
     pub fn unenforced_claims(
         &self,
@@ -6727,12 +6731,39 @@ impl AuditComplianceConfig {
         }
         claims
     }
+
+    /// v1.0.0 #2401 — the boot-REFUSAL message for a non-empty
+    /// [`Self::unenforced_claims`] list. `daemon_runtime::run` returns this as a
+    /// hard error so an overclaiming compliance config REFUSES to boot (operator
+    /// ruling 2026-08-01 §1-condition-2). Names every offending
+    /// `[audit.compliance.<preset>].<field>`, what the daemon does NOT do, and
+    /// the remediation, so the operator can either enable the real gate or drop
+    /// the false claim. Pure + testable — the caller supplies the claims.
+    #[must_use]
+    pub fn overclaim_refusal_message(claims: &[UnenforcedComplianceClaim]) -> String {
+        let detail = claims
+            .iter()
+            .map(|c| {
+                format!(
+                    "[audit.compliance.{}].{} = true but {} (remediation: {})",
+                    c.preset, c.field, c.does_not, c.remediation
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!(
+            "refusing to boot: {} applied compliance-preset control(s) ADVERTISED but NOT \
+             ENFORCED — {detail}",
+            claims.len(),
+        )
+    }
 }
 
 /// v1.0.0 #2401 — one ADVERTISED-but-UNENFORCED compliance-preset field,
 /// surfaced by [`AuditComplianceConfig::unenforced_claims`] so the boot path can
-/// emit a loud, unmissable WARN naming exactly what an `applied` preset claims
-/// that the running daemon does NOT actually perform.
+/// REFUSE to boot with an error naming exactly what an `applied` preset claims
+/// that the running daemon does NOT actually perform (operator ruling
+/// 2026-08-01 §1-condition-2: a compliance defaults-lie is a hard boot ERROR).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnenforcedComplianceClaim {
     /// The preset wire name that carries the unenforced field
@@ -6760,14 +6791,15 @@ pub struct CompliancePreset {
     /// [`crate::encryption::encryption_enabled`]). When an `applied` preset sets
     /// this `true` while that gate is inactive,
     /// [`AuditComplianceConfig::unenforced_claims`] flags it and the boot path
-    /// emits a loud WARN — the preset must not silently advertise a control the
-    /// daemon does not perform.
+    /// REFUSES to boot (operator ruling 2026-08-01) — the preset must not
+    /// advertise a control the daemon does not perform.
     pub encrypt_at_rest: Option<bool>,
     /// RESERVED / NOT IMPLEMENTED at v1.0.0 (#2401). The GDPR-style
     /// actor-pseudonymization toggle has NO consumer anywhere in the substrate —
-    /// audit actor ids are recorded verbatim regardless of this flag. An
-    /// `applied` preset that sets it `true` is ALWAYS flagged by
-    /// [`AuditComplianceConfig::unenforced_claims`] and boots with a loud WARN.
+    /// audit actor ids are recorded verbatim regardless of this flag. No shipped
+    /// preset sets it (retired from the templates); an `applied` preset that
+    /// sets it `true` is unsatisfiable, so it is ALWAYS flagged by
+    /// [`AuditComplianceConfig::unenforced_claims`] and REFUSES to boot.
     pub pseudonymize_actors: Option<bool>,
 }
 
@@ -9112,7 +9144,8 @@ impl AppConfig {
 # # encrypt_at_rest is an ENFORCEMENT-GATED CLAIM, not a switch (#2401): it does
 # # NOT turn on at-rest encryption. That requires --features sqlcipher AND
 # # AI_MEMORY_ENCRYPT_AT_REST=1 (env #37); an applied preset asserting it without
-# # the gate emits a loud boot WARN and content is stored PLAINTEXT.
+# # the gate REFUSES to boot (a compliance defaults-lie is a hard error) rather
+# # than silently storing content in PLAINTEXT.
 # # encrypt_at_rest = true
 #
 # [audit.compliance.gdpr]
@@ -9121,7 +9154,8 @@ impl AppConfig {
 # redact_content = true
 # # pseudonymize_actors is RESERVED / NOT IMPLEMENTED at v1.0.0 (#2401): the knob
 # # has no consumer, actor ids are recorded verbatim, and an applied preset
-# # asserting it emits a loud boot WARN. Do not rely on it for compliance.
+# # asserting it REFUSES to boot (unsatisfiable). Do not set it; retired from the
+# # shipped presets.
 # # pseudonymize_actors = true
 #
 # [audit.compliance.fedramp]

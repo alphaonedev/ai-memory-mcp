@@ -1169,33 +1169,42 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
     crate::config::set_compaction_enabled(app_config.resolve_compaction_enabled());
     #[cfg(test)]
     let _ = app_config.resolve_compaction_enabled();
-    // v1.0.0 #2401 — fail-LOUD on a compliance-preset defaults-lie. An `applied`
-    // SOC2/HIPAA/GDPR/FedRAMP preset that sets `encrypt_at_rest = true` or
-    // `pseudonymize_actors = true` while the real enforcement gate is NOT active
-    // used to boot SILENT while the docs + preset templates advertised the
-    // control — the exact bet-the-farm overclaim on a compliance surface. Emit
-    // one unmissable, structured boot WARN per unenforced field naming the
-    // preset, exactly what the daemon does NOT do, and the operator-actionable
-    // remediation. Disposition (WARN, not hard-refuse) resolved by the 5-agent
-    // vote (`4d3ea1c5`): matches the repo's `tls_bind_guard` /
-    // first-ship-advisory precedent for a SET-but-UNENFORCEABLE posture the
-    // operator never explicitly demanded. The `encrypt_at_rest` real gate is
+    // v1.0.0 #2401 — FAIL CLOSED on a compliance-preset defaults-lie. An
+    // `applied` SOC2/HIPAA/GDPR/FedRAMP preset that sets `encrypt_at_rest = true`
+    // (while the real at-rest content-encryption gate is inactive) or
+    // `pseudonymize_actors = true` (RESERVED — zero consumer at v1.0.0, so
+    // permanently unsatisfiable) used to boot SILENT while the docs + preset
+    // templates advertised the control — the exact bet-the-farm overclaim on a
+    // compliance surface. Per the operator cutline ruling (2026-08-01,
+    // §1-condition-2), a compliance defaults-lie is a HARD BOOT ERROR, not a
+    // WARN: `applied && flag && !real_gate` REFUSES to boot. This binding
+    // prescription governs over the earlier 5-agent WARN vote (a vote cannot
+    // override an explicit operator ruling; Fable escalated the correction on
+    // PR #2897). Refusing is safe + correct here — pre-GA (no fielded v1.0.0 to
+    // brick) and the preset is opt-in, so a HIPAA/GDPR surface never serves
+    // while silently not encrypting at rest. The `encrypt_at_rest` real gate is
     // `crate::encryption::encryption_enabled(None)` — the exact signal the
     // storage write path consults for at-rest content sealing.
     if let Some(compliance) = app_config.effective_audit().compliance.as_ref() {
         let at_rest_active = crate::encryption::encryption_enabled(None);
-        for claim in compliance.unenforced_claims(at_rest_active) {
-            tracing::warn!(
-                target: "compliance.unenforced",
-                preset = claim.preset,
-                field = claim.field,
-                "COMPLIANCE PRESET OVERCLAIM — [audit.compliance.{preset}].{field} = true is \
-                 ADVERTISED but NOT ENFORCED: {does_not}. Remediation: {remediation}.",
-                preset = claim.preset,
-                field = claim.field,
-                does_not = claim.does_not,
-                remediation = claim.remediation,
-            );
+        let claims = compliance.unenforced_claims(at_rest_active);
+        if !claims.is_empty() {
+            for claim in &claims {
+                tracing::error!(
+                    target: "compliance.unenforced",
+                    preset = claim.preset,
+                    field = claim.field,
+                    "COMPLIANCE PRESET OVERCLAIM — [audit.compliance.{preset}].{field} = true is \
+                     ADVERTISED but NOT ENFORCED: {does_not}. Remediation: {remediation}.",
+                    preset = claim.preset,
+                    field = claim.field,
+                    does_not = claim.does_not,
+                    remediation = claim.remediation,
+                );
+            }
+            return Err(anyhow::anyhow!(
+                crate::config::AuditComplianceConfig::overclaim_refusal_message(&claims)
+            ));
         }
     }
     // #1604 — seed the process-wide rerank input-sequence cap from the

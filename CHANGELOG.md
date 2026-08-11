@@ -17,20 +17,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shipped preset templates + `docs/CONFIG_SCHEMA.md` printed
   `encrypt_at_rest = true` / `pseudonymize_actors = true` — so an `applied`
   HIPAA/GDPR preset booted claiming controls the substrate never ran (the exact
-  bet-the-farm overclaim on a compliance surface). The boot path now FAILS LOUD:
-  `AuditComplianceConfig::unenforced_claims` detects an `applied` preset that
-  advertises `encrypt_at_rest` while the real at-rest content-encryption gate
-  (`crate::encryption::encryption_enabled(None)` — `--features sqlcipher` +
-  `AI_MEMORY_ENCRYPT_AT_REST=1`, env #37) is inactive, OR that advertises
-  `pseudonymize_actors` at all (RESERVED / no consumer at v1.0.0), and
-  `daemon_runtime::run` emits one unmissable structured WARN (`tracing` target
-  `compliance.unenforced`) per unenforced field naming the preset, exactly what
-  the daemon does NOT do, and the remediation. The disposition (loud WARN, not a
-  hard boot refusal) was resolved by a 5-agent adversarial vote (`4d3ea1c5`,
-  3–2 for WARN) matching the repo's `tls_bind_guard` / first-ship-advisory
-  precedent for a set-but-unenforceable posture the operator never explicitly
-  demanded. `docs/CONFIG_SCHEMA.md` + the embedded config template + the
-  `CompliancePreset` field docs now describe both fields as enforcement-gated
+  bet-the-farm overclaim on a compliance surface). The boot path now **FAILS
+  CLOSED — a hard boot ERROR**: `AuditComplianceConfig::unenforced_claims`
+  detects an `applied` preset that advertises `encrypt_at_rest` while the real
+  at-rest content-encryption gate (`crate::encryption::encryption_enabled(None)`
+  — `--features sqlcipher` + `AI_MEMORY_ENCRYPT_AT_REST=1`, env #37) is inactive,
+  OR that advertises `pseudonymize_actors` at all (RESERVED / no consumer at
+  v1.0.0, unsatisfiable); `daemon_runtime::run` logs each unenforced field at
+  ERROR (`tracing` target `compliance.unenforced`) then RETURNS an error
+  (`AuditComplianceConfig::overclaim_refusal_message`) so the process REFUSES to
+  boot (non-zero exit) rather than serve while silently not performing a claimed
+  compliance control. This is the operator cutline ruling (2026-08-01,
+  §1-condition-2: a compliance defaults-lie is a hard boot ERROR) — a binding
+  prescription that governs over an earlier 5-agent WARN vote (a vote cannot
+  override an explicit operator ruling; Fable escalated the correction on review
+  of PR #2897). Refusing is safe + correct: pre-GA (no fielded v1.0.0 to brick)
+  and the preset is opt-in, so a HIPAA/GDPR surface never serves while silently
+  not encrypting at rest. `pseudonymize_actors` is **retired from the shipped
+  preset templates** (`docs/CONFIG_SCHEMA.md` + the embedded config template);
+  the `CompliancePreset` field docs describe both fields as enforcement-gated
   claims, not switches. Regression: `tests/compliance_capability_truth_2400_2401.rs`.
 - **`memory_capabilities` no longer under-claims compaction as `planned` — it
   SHIPPED at v0.8.0** ([#2400](https://github.com/alphaonedev/ai-memory-mcp/issues/2400);

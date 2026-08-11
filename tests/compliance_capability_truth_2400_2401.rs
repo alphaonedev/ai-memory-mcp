@@ -13,9 +13,10 @@
 //!   preset that sets `encrypt_at_rest = true` / `pseudonymize_actors = true`
 //!   while the real gate is inactive used to boot SILENT while the docs +
 //!   preset templates advertised the control. The pure detector
-//!   `AuditComplianceConfig::unenforced_claims` must name each unenforced field
-//!   so the boot path can emit a loud WARN (5-agent vote `4d3ea1c5`: WARN, not
-//!   hard-refuse).
+//!   `AuditComplianceConfig::unenforced_claims` names each unenforced field and
+//!   `AuditComplianceConfig::overclaim_refusal_message` builds the boot-REFUSAL
+//!   error the boot funnel returns (operator ruling 2026-08-01 §1-condition-2:
+//!   a compliance defaults-lie is a HARD BOOT ERROR, not a WARN).
 
 use ai_memory::config::{
     AuditComplianceConfig, CapabilityCompaction, CompliancePreset, FeatureTier,
@@ -122,12 +123,32 @@ fn hipaa_encrypt_at_rest_without_gate_is_named_unenforced_2401() {
 }
 
 #[test]
-fn hipaa_encrypt_at_rest_with_active_gate_is_not_flagged_2401() {
-    // When at-rest content encryption IS active, the claim is honored → no WARN.
+fn hipaa_encrypt_at_rest_with_active_gate_boots_clean_2401() {
+    // When at-rest content encryption IS active, the claim is honored → no
+    // claim, so the boot funnel does NOT refuse.
     let cfg = hipaa_encrypt_at_rest(true);
     assert!(
         cfg.unenforced_claims(true).is_empty(),
-        "#2401: an active at-rest gate satisfies the encrypt_at_rest claim"
+        "#2401: an active at-rest gate satisfies the encrypt_at_rest claim — boots clean"
+    );
+}
+
+#[test]
+fn overclaim_refusal_message_names_the_field_2401() {
+    // The exact boot-REFUSAL error string `daemon_runtime::run` returns must
+    // name the preset + field so a locked-out operator can act (Fable: "assert
+    // Err, message names the field").
+    let cfg = hipaa_encrypt_at_rest(true);
+    let claims = cfg.unenforced_claims(false);
+    assert!(!claims.is_empty());
+    let msg = AuditComplianceConfig::overclaim_refusal_message(&claims);
+    assert!(
+        msg.contains("refusing to boot"),
+        "message must be a boot-refusal: {msg}"
+    );
+    assert!(
+        msg.contains("hipaa") && msg.contains("encrypt_at_rest"),
+        "message must name the offending preset + field: {msg}"
     );
 }
 

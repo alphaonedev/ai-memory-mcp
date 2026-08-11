@@ -320,20 +320,21 @@ perform the control:
   memory content is persisted in PLAINTEXT.
 - `pseudonymize_actors = true` is **RESERVED and has no consumer at
   v1.0.0** — audit actor ids are recorded verbatim regardless of this
-  flag. Do not rely on it for compliance until a future release
-  implements it.
+  flag. It is **retired from the shipped presets**; do not set it, and
+  do not rely on it for compliance until a future release implements it.
 
 To keep the substrate from advertising a control it does not perform,
-an `applied` preset that sets either field `true` while the real gate
-is inactive emits a **loud boot WARN** (`tracing` target
-`compliance.unenforced`) naming the preset, the unenforced field, what
-the daemon does NOT do, and the remediation — it does not silently
-boot. The disposition (WARN, not a hard boot refusal) was resolved by
-the 5-agent adversarial vote (`4d3ea1c5`), matching the substrate's
-`tls_bind_guard` / first-ship-advisory precedent for a set-but-
-unenforceable posture. Only `retention_days` and
-`attestation_cadence_minutes` are actually consumed by the preset
-resolver today.
+an `applied` preset that sets `encrypt_at_rest = true` while the real
+gate is inactive, or that sets `pseudonymize_actors = true` at all
+(unsatisfiable at v1.0.0), **REFUSES to boot** — a hard boot ERROR
+(non-zero exit; `tracing` target `compliance.unenforced`) naming the
+preset, the unenforced field, what the daemon does NOT do, and the
+remediation. It does not boot while silently failing to perform a
+claimed compliance control. This is the operator cutline ruling
+(2026-08-01, §1-condition-2: a compliance defaults-lie is a hard boot
+ERROR); a compliance surface must fail closed, not serve while lying.
+Only `retention_days` and `attestation_cadence_minutes` are actually
+consumed by the preset resolver today.
 
 ### `[transcripts]` — transcript lifecycle sweeper (I3)
 
