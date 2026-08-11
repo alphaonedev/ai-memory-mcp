@@ -206,7 +206,13 @@ jobs:
         run: |
           set -euo pipefail
           PSQL="psql -h 127.0.0.1 -p 5432 -U ai_memory -d ai_memory_ci -tAX"
-          pg_ver=$($PSQL -c "SHOW server_version;" | tr -d '[:space:]')
+          # split_part(...,' ',1) strips the "(Debian 18.4-1.pgdg13+1)" build
+          # metadata SHOW server_version / current_setting append after the
+          # bare version — without this, tr -d '[:space:]' collapses that
+          # into "18.4(Debian18.4-1.pgdg13+1)", which never equals the exact
+          # SSOT string and false-reds the assert below even when the
+          # server IS the certified 18.4.
+          pg_ver=$($PSQL -c "SELECT split_part(current_setting('server_version'), ' ', 1);" | tr -d '[:space:]')
           age_ver=$($PSQL -c "SELECT extversion FROM pg_extension WHERE extname='age';" | tr -d '[:space:]')
           vec_ver=$($PSQL -c "SELECT extversion FROM pg_extension WHERE extname='vector';" | tr -d '[:space:]')
           echo "::notice::certified stack — PostgreSQL=$pg_ver  Apache AGE=$age_ver  pgvector=$vec_ver"
