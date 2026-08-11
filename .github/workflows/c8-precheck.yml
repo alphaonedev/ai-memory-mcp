@@ -301,6 +301,34 @@ jobs:
         # green a no-op.
         run: bash scripts/check-doc-surface-completeness.sh --self-test
 
+  capacity-claim-gate:
+    # CERT GATE (TRUTHFULNESS; #2869, following CERT-GATE-2 #2629/#2492). The
+    # 3x7 claims register finding C-12 caught `docs/zero-touch-trust.html` still
+    # shipping the retired "1 to ~1,000,000 AI agents" figure (#2438) in BOTH
+    # its <meta description> and its tagline — while every other claims gate was
+    # GREEN, because NONE policed agent-count / scale-CAPACITY claims. Gate 4
+    # pins VALUES; gates 9/10/11 pin symbols / SDK paths / CI-job claims; this
+    # pins that no doc publishes a single-fleet agent number above the ratified
+    # 500-1000-agent envelope. Structural exemptions (row/corpus counts never
+    # associate with an `agents` noun; retirement notes; frozen doc trees) keep
+    # it aimed at the defect, and a burn-down allowlist (STALE entry hard-fails)
+    # carries the vetted, explicitly-aspirational vision-tier statements.
+    name: Capacity-claim ceiling gate (#2869)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run capacity-claim gate
+        run: bash scripts/check-capacity-claims.sh
+      - name: Self-test the gate (regression evidence)
+        # Plants the exact #2438 1,000,000-agent overclaim (MUST be flagged) +
+        # near-miss controls that MUST pass (the honest 500-1000 envelope, a
+        # corpus-row "1M+ on Postgres", the MAX_ROWS cap, a retirement note, a
+        # bare year, and an "Ed25519 agent" identifier whose interior digit-run
+        # must not read as an agent count), then exercises allowlist coverage,
+        # the stale-entry hard-fail, and the empty-scan fail-closed.
+        run: bash scripts/check-capacity-claims.sh --self-test
+
   cloud-init-ascii-gate:
     # v0.9.0 (issue #1880): a stray non-ASCII byte (U+2014 em-dash) in a
     # DO cloud-init template made cloud-init reject the config
