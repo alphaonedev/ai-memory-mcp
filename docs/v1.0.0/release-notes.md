@@ -72,11 +72,14 @@ AGE + pgvector storage backend.
 > `tests/pg_supported_route_inventory_gate_2799.rs`), and **MCP-stdio is
 > structurally SQLite-only** ([#1675](https://github.com/alphaonedev/ai-memory-mcp/issues/1675)):
 > a Postgres-backed deployment serves MCP clients through the HTTP daemon,
-> not `ai-memory mcp`. The certification evidence rests on the PG 16 / AGE
-> 1.6.0 stack CI tests on every push; the SSOT-pinned PG 18.4 / AGE 1.7.0 /
-> pgvector 0.8.5 stack is **additionally validated off-CI**, not
-> CI-asserted — see §"Certified backend versions" for the exact versions
-> and evidence basis.
+> not `ai-memory mcp`. The certified **PG 18.4 / AGE 1.7.0 / pgvector
+> 0.8.5** stack is now exercised in-PR on every `release/**` PR by
+> `.github/workflows/cert-postgres-age.yml`, which runs the pg-parity and
+> AGE cells `--include-ignored` against the live
+> `apache/age:release_PG18_1.7.0` image and hard-fails on version drift;
+> the PG 16 / AGE 1.6.0 combination in `coverage.yml` is the documented
+> **alternate** matrix (a line-coverage measurement). See §"Certified
+> backend versions" for the exact versions and evidence basis.
 
 The "defaults stop lying" lane (Gate 1′) is the centerpiece: six knobs
 that shipped OFF (or non-functional) through v0.10.0 now resolve to their
@@ -214,27 +217,30 @@ pgvector-backed recall-purity suite (`recall_purity_p01_postgres`) run
 green under `--features sal,sal-postgres --include-ignored` against the
 `apache/age:release_PG16_1.6.0` service container in `coverage.yml`, with
 pgvector layered in at service start via the `postgresql-16-pgvector` apt
-package. This PG 16 / AGE 1.6.0 combination is what the substrate's
-Postgres backend has actually, repeatedly, in-repo been exercised on — so
-it is the stack the certification evidence rests on.
+package. This PG 16 / AGE 1.6.0 combination is the documented **alternate**
+matrix — the stack `coverage.yml` measures line coverage against; the
+certified PG 18.4 / AGE 1.7.0 / pgvector 0.8.5 stack is exercised in-PR
+separately by `.github/workflows/cert-postgres-age.yml` (next paragraph).
 
-**Additionally validated off-CI (SSOT-pinned, NOT CI-asserted):
-PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.5.** These are the pins
+**CI-asserted in-PR on `release/**` (SSOT-pinned): PostgreSQL 18.4 + Apache
+AGE 1.7.0 + pgvector 0.8.5.** These are the pins
 the deployment SSOT carries — `deploy/docker-1461/provision/lib.sh`
 (`EXPECTED_PG_VERSION=18.4`, `EXPECTED_AGE_VERSION=1.7.0`,
 `PGVECTOR_APT_VERSION=0.8.5-1.pgdg13+1`,
 `AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0`; the pgvector Rust binding
 is the `pgvector` crate `0.4`, `features = ["sqlx"]`) — and they are the
 current-stable upstream line (Apache AGE 1.8.0 exists only as `rc0` and is
-deliberately not shipped). The same AGE/KG + recall-purity suites were run
-green against this stack on the operator's off-CI validation host, but
-**no CI job builds or version-asserts 18.4 / 1.7.0 / 0.8.5**: the
-dedicated `postgres-age` nightly that once did was RED for its final three
-runs (the vendored `paste` fork rev went unreachable,
-[#2512](https://github.com/alphaonedev/ai-memory-mcp/issues/2512) defect
-1) and was deleted on 2026-07-31 (§"CI posture" below). Treat 18.4 /
-1.7.0 / 0.8.5 as **additionally validated**, not continuously certified;
-the continuously-tested combination is PG 16 / AGE 1.6.0.
+deliberately not shipped). As of
+[#2548](https://github.com/alphaonedev/ai-memory-mcp/issues/2548) /
+[#2512](https://github.com/alphaonedev/ai-memory-mcp/issues/2512) the
+AGE/KG + recall-purity suites run against this exact stack in-PR:
+`.github/workflows/cert-postgres-age.yml` stands up a live
+`apache/age:release_PG18_1.7.0` service (pgvector layered in via
+`postgresql-18-pgvector`), runs the pg-parity and AGE cells
+`--include-ignored`, and hard-fails if the running stack is not AGE 1.7.0
+on PG 18 with pgvector >= 0.8.5 — so the certified tier is proven by
+execution on the cert branch, not merely claimed. The PG 16 / AGE 1.6.0
+combination in `coverage.yml` remains as the documented alternate matrix.
 
 > **Cross-lane pgvector pin — reconciled ([#2872](https://github.com/alphaonedev/ai-memory-mcp/issues/2872)).**
 > Both certified provisioning SSOTs now pin pgvector **0.8.5**:
@@ -248,9 +254,13 @@ the continuously-tested combination is PG 16 / AGE 1.6.0.
 > was additionally no longer resolvable (pgdg keeps only a rolling window,
 > so `0.8.2-1.pgdg24.04+1` is absent from noble-pgdg). Cross-lane parity is
 > now asserted mechanically by `tests/provisioning_pgvector_pin_parity.rs`,
-> so a future accidental divergence fails loudly. The remaining CI-vs-SSOT
-> AGE drift (CI 1.6.0 vs SSOT 1.7.0) is separate and still tracked as
-> [#2512](https://github.com/alphaonedev/ai-memory-mcp/issues/2512) defect 2.
+> so a future accidental divergence fails loudly. The former CI-vs-SSOT
+> AGE drift (CI 1.6.0 vs SSOT 1.7.0) is **resolved** by
+> [#2512](https://github.com/alphaonedev/ai-memory-mcp/issues/2512) /
+> [#2548](https://github.com/alphaonedev/ai-memory-mcp/issues/2548): the
+> certified AGE 1.7.0 / PG 18 canonical stack is now exercised in-PR by
+> `.github/workflows/cert-postgres-age.yml`, while `coverage.yml`'s
+> PG 16 / AGE 1.6.0 run is the documented alternate matrix.
 
 ### What those AGE greens attest — read this before relying on them
 
@@ -287,34 +297,36 @@ per-call fallback WARN that removal left silent). `find_paths` results
 were and remain correct (the CTE reads the durable `memory_links`);
 `kg_query` / `kg_timeline` / `lineage` still use AGE Cypher.
 
-### CI posture for the SSOT-pinned (18.4) stack — the pins are not CI-asserted
+### CI posture for the SSOT-pinned (18.4) stack — exercised in-PR on `release/**`
 
-**No CI job builds or version-asserts PG 18.4 + AGE 1.7.0 + pgvector
-0.8.5.** The `postgres-age` job
+**The certified PG 18.4 + AGE 1.7.0 + pgvector 0.8.5 stack is now
+exercised in-PR.** `.github/workflows/cert-postgres-age.yml`
+([#2548](https://github.com/alphaonedev/ai-memory-mcp/issues/2548))
+triggers on `pull_request` + `push` to `release/**`, stands up a live
+`apache/age:release_PG18_1.7.0` service with pgvector layered in via
+`postgresql-18-pgvector`, runs the `#[ignore]`-gated pg-parity binaries
+AND the AGE-backed cells (`AI_MEMORY_TEST_AGE_URL` set, so they stop
+self-skipping) under `--features sal-postgres --include-ignored`, and a
+version-assert step hard-fails if the running stack is not AGE 1.7.0 on
+PG 18 with pgvector >= 0.8.5. This is what makes the 2026-08-01 cutline
+ruling §5.4(3) executable — the certified tier is proven by execution on
+the cert branch.
+
+The historical `postgres-age` nightly
 ([#2012](https://github.com/alphaonedev/ai-memory-mcp/issues/2012)) that
-did was **deleted on 2026-07-31 by operator directive** (`2b85ba38`),
-not repaired: it rebuilt the certified stack from source on the runner
-every night purely to reproduce a stack that already exists
-continuously as the `ai-memory-pg:18.4-age1.7.0-vec0.8.5` container on
-the validation host. What survives in
-`.github/workflows/postgres-parity-nightly.yml` is the
-`postgres-parity` job, which runs four `#[ignore]`-gated cross-backend
-parity binaries against a `pgvector/pgvector:pg16` service container —
-**PG 16, no AGE, not the certified stack.**
-
-The AGE-gated Cypher/KG suites listed above are not `#[ignore]`-gated
-and DO run on every PR and push in `coverage.yml` — but against an
-`apache/age:release_PG16_1.6.0` service container, i.e. **PG 16 + AGE
-1.6.0, not the certified pins.** That CI-vs-SSOT version drift is
-[#2512](https://github.com/alphaonedev/ai-memory-mcp/issues/2512)
-defect 2, held behind
-[#2548](https://github.com/alphaonedev/ai-memory-mcp/issues/2548)
-(whether any in-PR AGE coverage is wanted at all, to be justified on
-its own merits and with a container image if it ever is). The SSOT-pinned
-18.4 / 1.7.0 / 0.8.5 combination itself is exercised on the operator's
-validation host and nowhere else — it is **additionally validated**, not
-continuously CI-certified; the CI-certified combination is PG 16 / AGE
-1.6.0.
+once rebuilt the stack from source every night was **deleted on
+2026-07-31 by operator directive** (`2b85ba38`), and is NOT what
+provides this coverage — the new in-PR job above does.
+`.github/workflows/postgres-parity-nightly.yml` retains the
+`postgres-parity` job (four cross-backend parity binaries against a
+`pgvector/pgvector:pg16` service container, no AGE). `coverage.yml`
+continues to run the AGE-gated Cypher/KG suites on every PR and push
+against an `apache/age:release_PG16_1.6.0` service container — **PG 16 +
+AGE 1.6.0**, retained as the documented alternate matrix (a line-coverage
+measurement, not the certified tier). The former CI-vs-SSOT AGE drift
+([#2512](https://github.com/alphaonedev/ai-memory-mcp/issues/2512) defect
+2) is **resolved**: CI now exercises the certified AGE 1.7.0 canonical
+tier via `cert-postgres-age.yml` and honestly labels the PG 16 alternate.
 
 ## Additive surfaces
 

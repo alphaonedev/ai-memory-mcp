@@ -159,7 +159,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   measurement, not cert evidence) with a cross-reference to the cert job, so
   CI and the certified-version SSOT AGREE and neither is drift. The release
   branch already vendors `paste` in-tree (`path = "vendor/paste"`, #2050), so
-  there is no dead git pin to fix here.
+  there is no dead git pin to fix here. `docs/v1.0.0/release-notes.md` is
+  reconciled in lockstep (§"Certified backend versions" + §"CI posture"): the
+  passages that said the 18.4/1.7.0/0.8.5 stack was "additionally validated
+  off-CI, not CI-asserted" now state it is exercised in-PR by the new cert
+  job, with PG 16/AGE 1.6.0 relabelled as the documented alternate — closing
+  the §0 cross-doc contradiction that would otherwise ship.
 - **#2534 — one declaration source for required checks.** New gate
   `scripts/check-branch-protection.sh` (with `--self-test`) HARD-FAILS if
   `.github/branch-protection.yml` re-declares a bare `required_checks` key
