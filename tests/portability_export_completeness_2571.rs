@@ -34,11 +34,14 @@
 
 #![allow(clippy::missing_panics_doc, clippy::uninlined_format_args)]
 
+mod common;
+
 use std::path::PathBuf;
 
 use ai_memory::models::{Memory, MemoryKind, Tier};
 use ai_memory::portability::emit;
 use ai_memory::portability::import::{ImportOptions, import_full_envelope};
+use common::MultiEnvVarGuard;
 use rusqlite::Connection;
 
 fn scratch_root(tag: &str) -> PathBuf {
@@ -295,5 +298,103 @@ fn archived_memory_import_refuses_dual_residency_for_genuine_archival() {
     assert!(
         dst_archived.is_empty(),
         "no archived row should have been admitted"
+    );
+}
+
+/// #2571 Fable review F2 (BLOCKING, 2026-08-11) — an imported archived row
+/// must be SEALED at rest exactly like every other write path, on an
+/// encryption-enabled destination.
+///
+/// The export boundary DECRYPTS content into the JSON bundle (matching
+/// `memories[]` — the export is the portable-plaintext artifact; that part
+/// is correct and unchanged). The bug was on IMPORT: the archived-row
+/// insert bound that decrypted plaintext straight into `content` with no
+/// `encrypted_envelope`, so an encryption-enabled destination stored the
+/// imported archive PLAINTEXT at rest — failing parity with BOTH native
+/// archiving (`archive_memory_no_tx` copies `encrypted_envelope` verbatim)
+/// and live-memory import (`insert_imported` -> `insert_inner` reseals
+/// through `seal_content_for_upsert`). Fixed by resealing the archived
+/// row's content through `crate::encryption::seal_content` before the raw
+/// insert, mirroring the live-import reseal.
+#[test]
+fn archived_memory_import_seals_content_at_rest_when_encryption_enabled_2571_f2() {
+    const PLAINTEXT: &str = "TOP SECRET plaintext content — must never land at rest";
+
+    let key_dir = scratch_root("f2-keys");
+    let key_dir_str = key_dir.to_string_lossy().into_owned();
+    // Batch guard (not two single-key guards — see MultiEnvVarGuard's own
+    // doc comment on the self-deadlock hazard) — serialized via ENV_LOCK
+    // for the whole test, restored on drop.
+    let _env_guard = MultiEnvVarGuard::apply(&[
+        ("AI_MEMORY_ENCRYPT_AT_REST", Some("1")),
+        ("AI_MEMORY_KEY_DIR", Some(key_dir_str.as_str())),
+    ]);
+
+    let (_src_path, src) = fresh_db("src-seal");
+    let now = "2026-08-11T00:00:00Z".to_string();
+    let seeded = Memory {
+        id: "m-sealed".into(),
+        tier: Tier::Mid,
+        namespace: "ns".into(),
+        title: "sealed title".into(),
+        content: PLAINTEXT.into(),
+        priority: 5,
+        confidence: 1.0,
+        source: "system".into(),
+        created_at: now.clone(),
+        updated_at: now,
+        memory_kind: MemoryKind::Observation,
+        metadata: serde_json::json!({ "agent_id": "ai:sealer" }),
+        ..Memory::default()
+    };
+    ai_memory::storage::insert(&src, &seeded).expect("seed + seal live memory");
+    ai_memory::storage::archive_memory(&src, "m-sealed", Some("manual")).expect("archive");
+
+    // Sanity: the SOURCE archive already carries the sealed envelope
+    // (native archive copies `encrypted_envelope` verbatim) — proves the
+    // fixture actually exercises the sealed path before testing import.
+    let (src_content, src_envelope): (String, Option<Vec<u8>>) = src
+        .query_row(
+            "SELECT content, encrypted_envelope FROM archived_memories WHERE id = ?1",
+            ["m-sealed"],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("read source archived row");
+    assert!(
+        src_envelope.is_some(),
+        "fixture setup: the source archived row must already be sealed"
+    );
+    assert_ne!(
+        src_content, PLAINTEXT,
+        "fixture setup: the source content column must not hold plaintext when sealed"
+    );
+
+    let env = emit::build_full_envelope(&src, "issue-2571-f2-test", "2026-08-11T00:00:00Z")
+        .expect("build full v2 envelope");
+    assert_eq!(
+        env.archived_memories[0].memory.content, PLAINTEXT,
+        "the export boundary must decrypt content into the JSON bundle, exactly like memories[]"
+    );
+
+    let (_dst_path, dst) = fresh_db("dst-seal");
+    let report = import_full_envelope(&dst, &env, &opts()).expect("import full v2 envelope");
+    assert_eq!(report.archived_memories, 1);
+
+    let (dst_content, dst_envelope): (String, Option<Vec<u8>>) = dst
+        .query_row(
+            "SELECT content, encrypted_envelope FROM archived_memories WHERE id = ?1",
+            ["m-sealed"],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("read destination archived row");
+    assert!(
+        dst_envelope.is_some(),
+        "F2: the imported archived row must be SEALED at rest (encrypted_envelope \
+         populated), matching native archiving and live-memory import"
+    );
+    assert_ne!(
+        dst_content, PLAINTEXT,
+        "F2: the imported archived row's content column must NOT hold plaintext when \
+         the destination has at-rest encryption enabled"
     );
 }

@@ -790,14 +790,28 @@ fn apply_all_classes(
         report.links += n;
     }
 
-    // (2b) archived_memories — v1.0.0 #2571. RAW, byte-preserved (no
-    // re-validation: an archived row was already vetted when originally
-    // stored, and its content already crossed the export confidentiality
-    // screen). Guard against illegal dual residency: a GENUINE archival
-    // must never coexist with a LIVE row at the same id — the same
-    // invariant `memory_is_genuinely_archived` enforces the other direction
-    // on the memories loop above; #2570's `in_place_edit` live-snapshot is
-    // the deliberate exception and is always admitted.
+    // (2b) archived_memories — v1.0.0 #2571. Byte-preserved for every
+    // column EXCEPT content/encrypted_envelope, which are RE-SEALED against
+    // the DESTINATION's at-rest encryption policy (Fable review F2,
+    // 2026-08-11): the export DTO carries `content` DECRYPTED (exactly like
+    // `memories[]` — the export boundary always emits plaintext, never
+    // ciphertext, so the JSON bundle itself is the portable artifact), so
+    // an unconditional raw insert of that plaintext would land PLAINTEXT
+    // at rest on an encryption-enabled destination even though every other
+    // write path (`archive_memory_no_tx`'s native archive, and the live
+    // `memories[]` import lane via `insert_imported`/`insert_inner`) seals
+    // it. Mirrors the live-import reseal: `crate::encryption::seal_content`
+    // is generic over an arbitrary (content, agent_id) pair (fresh
+    // per-record DEK + nonce, no dependency on which table the ciphertext
+    // lands in) — a no-op `Ok(None)` when encryption is disabled or content
+    // is empty. No re-validation otherwise (an archived row was already
+    // vetted when originally stored, and its content already crossed the
+    // export confidentiality screen). Guard against illegal dual
+    // residency: a GENUINE archival must never coexist with a LIVE row at
+    // the same id — the same invariant `memory_is_genuinely_archived`
+    // enforces the other direction on the memories loop above; #2570's
+    // `in_place_edit` live-snapshot is the deliberate exception and is
+    // always admitted.
     for dto in &env.archived_memories {
         let row: crate::portability::read::ArchivedMemoryRow = dto.clone().into();
         let mem = &row.memory;
@@ -814,6 +828,10 @@ fn apply_all_classes(
             ));
             continue;
         }
+        let agent_id = crate::storage::memory_agent_id(mem);
+        let sealed = crate::encryption::seal_content(&mem.content, agent_id)?;
+        let content_to_store: &str = sealed.as_ref().map_or(mem.content.as_str(), |(_, ph)| ph);
+        let encrypted_envelope: Option<&[u8]> = sealed.as_ref().map(|(env, _)| env.as_slice());
         let n = conn
             .execute(
                 "INSERT OR IGNORE INTO archived_memories \
@@ -825,16 +843,16 @@ fn apply_all_classes(
                      memory_kind, entity_id, persona_version, citations, source_uri, \
                      source_span, confidence_source, confidence_signals, \
                      confidence_decayed_at, mentioned_entity_id, version, \
-                     lifecycle_state, kind_provenance, valid_from, valid_until) \
+                     lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until) \
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19, \
                          ?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36, \
-                         ?37,?38,?39,?40)",
+                         ?37,?38,?39,?40,?41)",
                 params![
                     mem.id,
                     mem.tier.as_str(),
                     mem.namespace,
                     mem.title,
-                    mem.content,
+                    content_to_store,
                     serde_json::to_string(&mem.tags)?,
                     mem.priority,
                     mem.confidence,
@@ -873,6 +891,7 @@ fn apply_all_classes(
                     row.mentioned_entity_id,
                     mem.version,
                     mem.lifecycle_state.as_str(),
+                    encrypted_envelope,
                     row.kind_provenance,
                     mem.valid_from,
                     mem.valid_until,
@@ -886,13 +905,21 @@ fn apply_all_classes(
     // destination governance binding (`ON CONFLICT DO NOTHING`) — an import
     // must not silently override policy the destination operator already
     // established for a namespace it independently governs.
+    // Table name derived from the SAME class-name SSOT the export
+    // conformance marker + read-all use (`export_scope::OMITTED_CLASS_NAMESPACE_META`)
+    // rather than a fresh `"namespace_meta"` literal (pm-v3.1 hardcoded-
+    // literal gate; Fable review F1, 2026-08-11).
+    let namespace_meta_insert_sql = format!(
+        "INSERT INTO {} (namespace, standard_id, parent_namespace, updated_at) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(namespace) DO NOTHING",
+        crate::export_scope::OMITTED_CLASS_NAMESPACE_META
+    );
     for dto in &env.namespace_meta {
         let row: crate::portability::read::NamespaceMetaRow = dto.clone().into();
         let n = conn
             .execute(
-                "INSERT INTO namespace_meta (namespace, standard_id, parent_namespace, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(namespace) DO NOTHING",
+                &namespace_meta_insert_sql,
                 params![
                     row.namespace,
                     row.standard_id,

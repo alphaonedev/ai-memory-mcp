@@ -312,10 +312,16 @@ pub struct NamespaceMetaRow {
 /// # Errors
 /// The underlying `rusqlite` query fails.
 pub fn read_all_namespace_meta(conn: &Connection) -> Result<Vec<NamespaceMetaRow>> {
-    let mut stmt = conn.prepare(
+    // The table name is derived from the SAME class-name SSOT the export
+    // conformance marker uses (`export_scope::OMITTED_CLASS_NAMESPACE_META`)
+    // rather than a fresh `"namespace_meta"` literal (pm-v3.1 hardcoded-
+    // literal gate; Fable review F1, 2026-08-11).
+    let sql = format!(
         "SELECT namespace, standard_id, parent_namespace, updated_at \
-         FROM namespace_meta ORDER BY namespace ASC",
-    )?;
+         FROM {} ORDER BY namespace ASC",
+        crate::export_scope::OMITTED_CLASS_NAMESPACE_META
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| {
         Ok(NamespaceMetaRow {
             namespace: r.get(0)?,

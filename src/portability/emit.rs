@@ -399,13 +399,16 @@ pub fn build_full_envelope_audited(
     // carry no signature to re-verify, so their level is a flat L1 (the
     // same unconditional level `memories`/`links` get above) rather than
     // gated on `chain_ok`/`operator_anchored`.
+    // Reuse the `excludes`-marker class-name SSOT (`export_scope`) rather
+    // than fresh literals — same precedent as `WITNESS_CHAIN_SIGNED_EVENTS`
+    // above (pm-v3.1 hardcoded-literal gate; Fable review F1, 2026-08-11).
     note(
-        "archived_memories",
+        crate::export_scope::OMITTED_CLASS_ARCHIVED_MEMORIES,
         archived_memories.is_empty(),
         ConformanceLevel::L1,
     );
     note(
-        "namespace_meta",
+        crate::export_scope::OMITTED_CLASS_NAMESPACE_META,
         namespace_meta.is_empty(),
         ConformanceLevel::L1,
     );

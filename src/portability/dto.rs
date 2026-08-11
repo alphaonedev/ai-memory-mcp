@@ -818,6 +818,47 @@ mod tests {
         assert_eq!(back.kind_provenance, row.kind_provenance);
     }
 
+    /// #2571, Fable review non-blocking fold-in (2026-08-11) — freezes the
+    /// flatten-shadowing risk the data-integrity voter flagged on vote
+    /// `17aa4567`: `ArchivedMemoryDto` merges its own archive-specific
+    /// fields into the SAME JSON object as `#[serde(flatten)]`ed `Memory`
+    /// fields (§ archived_memory_dto_flattens_and_round_trips_byte_exact
+    /// above). `serde(flatten)` silently last-write-wins on a name
+    /// collision — no compile error, no panic — so if `Memory` ever grows a
+    /// field sharing one of these names, the archive-specific value would
+    /// silently shadow (or be shadowed by) the memory field with zero
+    /// signal at import time. This guard fails LOUD the day that happens.
+    #[test]
+    fn archived_memory_dto_archive_fields_never_collide_with_memory_fields() {
+        const ARCHIVE_ONLY_FIELD_NAMES: &[&str] = &[
+            "archived_at",
+            "archive_reason",
+            "original_tier",
+            "original_expires_at",
+            "embedding",
+            "embedding_dim",
+            "embedding_space",
+            "atomised_into",
+            "atom_of",
+            "mentioned_entity_id",
+            "kind_provenance",
+        ];
+        let memory_json = serde_json::to_value(Memory::default()).unwrap();
+        let memory_keys = memory_json
+            .as_object()
+            .expect("Memory serializes as a JSON object");
+        for name in ARCHIVE_ONLY_FIELD_NAMES {
+            assert!(
+                !memory_keys.contains_key(*name),
+                "Memory gained a field named `{name}` — this now COLLIDES with \
+                 ArchivedMemoryDto's flattened archive-specific field of the same \
+                 name (src/portability/dto.rs::ArchivedMemoryDto). `#[serde(flatten)]` \
+                 silently last-write-wins on this collision; rename one side before \
+                 landing the new Memory field."
+            );
+        }
+    }
+
     #[test]
     fn namespace_meta_dto_round_trips() {
         let row = NamespaceMetaRow {
