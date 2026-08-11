@@ -1596,10 +1596,24 @@ impl PostgresStore {
     /// Behaviour:
     /// - Connect + bootstrap exactly like [`Self::connect_with_dim_and_timeout`].
     /// - Probe `current_embedding_dim()`. If it equals `dim`, return Ok.
-    /// - If it differs (or is missing), invoke
-    ///   [`Self::migrate_embedding_dim`] which is destructive on the
-    ///   embedding column (existing vectors are NULLed; rows themselves
-    ///   survive). Operators must re-embed after.
+    /// - If it differs (or is missing) **AND `embedder_available` is
+    ///   `true`**, invoke [`Self::migrate_embedding_dim`] which is
+    ///   destructive on the embedding column (existing vectors are NULLed;
+    ///   rows themselves survive). Regeneration then backfills them from
+    ///   the durable text under the live embedder.
+    /// - If it differs **AND `embedder_available` is `false`** (keyword
+    ///   tier / egress-denied / the embedder failed to construct), the
+    ///   destructive migrate is SKIPPED: the stored embeddings are
+    ///   PRESERVED and a loud WARN names the mismatch. This is the #2567
+    ///   fix — NULLing every vector when no embedder can regenerate them is
+    ///   irreversible loss of derived state, leaving each row strictly
+    ///   worse. Recall degrades safely (the #2167 `embedding_space`
+    ///   predicate + the #114 dim-match gate already exclude a stored
+    ///   vector of a different dim/space from scoring, so the worst case is
+    ///   fewer semantic hits, never a wrong result), and no-embedder writes
+    ///   bind `embedding = NULL` so the stale column dim is never
+    ///   exercised. The state self-heals the next boot that DOES construct
+    ///   an embedder (which takes the normal migrate-then-backfill path).
     /// - The migration is gated to the supported dim set (384, 768); any
     ///   other value bubbles `StoreError::InvalidInput` from the
     ///   sub-call.
@@ -1607,6 +1621,15 @@ impl PostgresStore {
     /// Existing callers ([`Self::connect`], CLI `schema-init`) keep the
     /// non-auto-migrate semantics so a one-shot CLI tool can't silently
     /// destroy embeddings.
+    ///
+    /// `embedder_available` MUST be the caller's TRUTHFUL runtime
+    /// embedder-constructibility signal (in `serve` it is
+    /// `build_embedder(...).is_some()`), NOT a config-derived "a dim was
+    /// configured" proxy — the two diverge exactly under egress-deny /
+    /// model-load-failure, which is the #2567 defect class. It is the
+    /// destructive funnel's own defense-in-depth gate: no present or future
+    /// caller can NULL the stored embeddings without proving a regeneration
+    /// path.
     ///
     /// # Errors
     ///
@@ -1617,6 +1640,7 @@ impl PostgresStore {
         dim: u32,
         statement_timeout_secs: u64,
         pool_config: PoolConfig,
+        embedder_available: bool,
     ) -> StoreResult<Self> {
         let store =
             Self::connect_with_dim_and_timeout(url, dim, statement_timeout_secs, pool_config)
@@ -1627,6 +1651,37 @@ impl PostgresStore {
         match current {
             Some(cur) if cur == target_i32 => Ok(store),
             _ => {
+                if !embedder_available {
+                    // #2567 (5-agent vote 4d3ea1c5) — DEGRADE, never
+                    // destroy. No embedder is constructible (keyword tier /
+                    // egress-denied / the embedder failed to build), so
+                    // NULLing every stored vector would destroy derived
+                    // state that is regenerable ONLY with an embedder —
+                    // irreversible loss, `updated_at` untouched so invisible
+                    // to staleness checks. Preserve the vectors, refuse the
+                    // migrate, and WARN loudly with the REAL stored dim +
+                    // configured target. The durable vectors stay recoverable
+                    // the moment a matching embedder returns (the next boot
+                    // that constructs one takes the migrate-then-backfill
+                    // path). Recall meanwhile skips cross-dim/cross-space
+                    // vectors (#2167 embedding_space predicate + #114
+                    // dim-match), so it degrades to keyword / fewer results,
+                    // never a wrong result.
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        current = ?current,
+                        target = target_i32,
+                        "issue #2567: stored memories.embedding column dim ({current:?}) disagrees \
+                         with the configured dim ({target_i32}) but NO embedder is constructible \
+                         (keyword tier / inference-egress denied / embedder build failed). \
+                         PRESERVING stored embeddings — the destructive auto-migrate is SKIPPED \
+                         because NULLing vectors that cannot be regenerated is unrecoverable data \
+                         loss. Semantic recall will skip cross-space vectors (degrading to keyword) \
+                         until a matching embedder is configured; the schema self-heals on the next \
+                         boot that constructs an embedder."
+                    );
+                    return Ok(store);
+                }
                 tracing::warn!(
                     target: TRACE_TARGET,
                     current = ?current,
@@ -1641,6 +1696,8 @@ impl PostgresStore {
                 // path), so it must NOT refuse like the CLI default does.
                 // The CLI `schema-init` path defaults to refuse (force =
                 // args.force_reembed); auto-migrate preserves #877.
+                // #2567 — reached ONLY when `embedder_available` proves a
+                // regeneration path exists, so the NULL is recoverable.
                 store.migrate_embedding_dim(dim, true).await?;
                 Ok(store)
             }

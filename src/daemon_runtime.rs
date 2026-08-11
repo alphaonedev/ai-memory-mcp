@@ -1593,6 +1593,11 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
                         &db_path,
                         None,
                         None,
+                        // #2567 — one-shot api-key CLI verb builds no
+                        // embedder and passes `None` dim (no auto-migrate);
+                        // `false` fail-closed for the embedder-availability
+                        // gate.
+                        false,
                         crate::store::PoolConfig::default(),
                     )
                     .await?;
@@ -4074,6 +4079,14 @@ pub(crate) async fn build_curator_store(
         db_path,
         app_config.postgres_statement_timeout_secs,
         configured_embedding_dim,
+        // #2567 — `build_curator_store` constructs NO embedder, so pass
+        // `false`: fail closed. It must never trigger the destructive #877
+        // auto-migrate (which would NULL every stored embedding with no way
+        // to regenerate them). A serve / schema-init boot that DOES build an
+        // embedder performs any legitimate dim migration; the curator opening
+        // a dim-mismatched corpus preserves the vectors and degrades to
+        // keyword rather than destroying recoverable derived state.
+        false,
         app_config.resolve_pg_pool(),
     )
     .await
@@ -4094,6 +4107,18 @@ async fn build_store_handle(
     // default 384 is converted in-place to match the configured
     // embedder's actual dimension (e.g. 768 for `nomic_embed_v15`).
     configured_embedding_dim: Option<u32>,
+    // #2567 — the caller's TRUTHFUL runtime embedder-constructibility
+    // signal (in `serve` this is `build_embedder(...).is_some()`), NOT the
+    // config-derived `configured_embedding_dim.is_some()` proxy. Only when
+    // this is `true` may the postgres `#877` auto-migrate NULL the stored
+    // embeddings, because only then can a live embedder regenerate them
+    // from the durable text. When `false` (keyword tier / egress-denied /
+    // embedder build failed) the destructive migrate is skipped and the
+    // stored vectors are preserved. Callers that build no embedder
+    // (`build_curator_store`, one-shot CLI verbs) pass `false` — fail
+    // closed: never destroy without a proven regeneration path. Inert on
+    // the sqlite path (sqlite has no destructive dim-migrate).
+    embedder_available: bool,
     // Resolved Postgres connection-pool sizing (`AI_MEMORY_PG_POOL_MAX` /
     // `_MIN` / `_ACQUIRE_TIMEOUT_SECS` > config.toml > compiled default),
     // produced by `AppConfig::resolve_pg_pool`. Threaded into the sqlx
@@ -4141,7 +4166,7 @@ async fn build_store_handle(
                             pool.acquire_timeout_secs
                         );
                         crate::store::postgres::PostgresStore::connect_with_dim_and_timeout_auto_migrate(
-                            url, dim, timeout, pool,
+                            url, dim, timeout, pool, embedder_available,
                         )
                         .await
                         .context("connect postgres adapter (auto-migrate dim)")?
@@ -4170,6 +4195,7 @@ async fn build_store_handle(
                     let _ = url;
                     let _ = postgres_statement_timeout_secs;
                     let _ = configured_embedding_dim;
+                    let _ = embedder_available;
                     let _ = pool;
                     anyhow::bail!(
                         "--store-url postgres:// requires the binary to be built with \
@@ -4199,6 +4225,7 @@ async fn build_store_handle(
         None => {
             let _ = postgres_statement_timeout_secs;
             let _ = configured_embedding_dim;
+            let _ = embedder_available;
             let _ = pool;
             tracing::debug!("Wave-3: --store-url absent; opening SQLite SAL store at --db path");
             let store = crate::store::sqlite::SqliteStore::open(db_path)
@@ -4806,7 +4833,22 @@ fn governance_consultation_unavailable_inner(
 /// string the daemon sees does not reflect off-host reachability, so the
 /// string-match loopback guard alone cannot protect them.
 fn require_api_key_strict() -> bool {
-    std::env::var("AI_MEMORY_REQUIRE_API_KEY")
+    require_api_key_strict_value(std::env::var("AI_MEMORY_REQUIRE_API_KEY").ok().as_deref())
+}
+
+/// Pure parser for the [`require_api_key_strict`] env value — truthy on
+/// `"1"` / `"true"` (case-insensitive), false otherwise (including absent).
+///
+/// Factored out so the parse behaviour is unit-testable WITHOUT mutating the
+/// process-global `AI_MEMORY_REQUIRE_API_KEY`. The pre-#2567 test set/removed
+/// that var directly, which under the DEFAULT multi-threaded test harness (the
+/// SAL-only feature gate — the `--test-threads=1` coverage/postgres gates
+/// serialise and so never saw it) RACED any concurrently-running test that
+/// reads it through the boot path (`serve` → [`api_key_bind_guard`] →
+/// `require_api_key_strict`), causing a spurious #1458 API-key refusal in
+/// `serve_bootstrap_failure_returns_typed_fatal_shutdown`.
+fn require_api_key_strict_value(value: Option<&str>) -> bool {
+    value
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
@@ -5690,6 +5732,15 @@ pub async fn bootstrap_serve(
         db_path,
         app_config.postgres_statement_timeout_secs,
         configured_embedding_dim,
+        // #2567 — the TRUTHFUL runtime embedder-availability signal. The
+        // embedder was constructed at `build_embedder` above (`None` on
+        // keyword tier / egress-deny / build failure), so `.is_some()`
+        // gates whether the postgres #877 auto-migrate may destructively
+        // NULL stored embeddings: only when a live embedder can regenerate
+        // them from the durable text. Do NOT substitute
+        // `configured_embedding_dim.is_some()` — that config proxy is
+        // `Some` even under egress-deny, which is the #2567 defect.
+        embedder_arc.is_some(),
         app_config.resolve_pg_pool(),
     )
     .await
@@ -7786,6 +7837,7 @@ mod tests {
             &db_path,
             None,
             Some(384),
+            false,
             crate::store::PoolConfig::default(),
         )
         .await;
@@ -8212,17 +8264,27 @@ mod tests {
     }
 
     /// The strict-mode env parser honours truthy forms and defaults off.
+    ///
+    /// \#2567 CI-fix — this test previously mutated the PROCESS-GLOBAL
+    /// `AI_MEMORY_REQUIRE_API_KEY` via `set_var` / `remove_var`, which under
+    /// the DEFAULT multi-threaded harness (the SAL-only feature gate; the
+    /// `--test-threads=1` coverage/postgres gates serialise and never saw it)
+    /// RACED `serve_bootstrap_failure_returns_typed_fatal_shutdown` — running
+    /// concurrently, that test read the transient `"1"` through the boot path
+    /// and hit the #1458 API-key refusal instead of its expected DB-path
+    /// failure. The parse logic now lives in the pure
+    /// `require_api_key_strict_value`, exercised here with literal values and
+    /// ZERO global-env mutation, so no concurrent reader can ever observe a
+    /// transient value (this was the SOLE writer of that var in the crate).
     #[test]
     fn require_api_key_strict_env_parse_1458() {
-        unsafe { std::env::remove_var("AI_MEMORY_REQUIRE_API_KEY") };
-        assert!(!require_api_key_strict());
-        unsafe { std::env::set_var("AI_MEMORY_REQUIRE_API_KEY", "1") };
-        assert!(require_api_key_strict());
-        unsafe { std::env::set_var("AI_MEMORY_REQUIRE_API_KEY", "TRUE") };
-        assert!(require_api_key_strict());
-        unsafe { std::env::set_var("AI_MEMORY_REQUIRE_API_KEY", "0") };
-        assert!(!require_api_key_strict());
-        unsafe { std::env::remove_var("AI_MEMORY_REQUIRE_API_KEY") };
+        assert!(!require_api_key_strict_value(None));
+        assert!(require_api_key_strict_value(Some("1")));
+        assert!(require_api_key_strict_value(Some("TRUE")));
+        assert!(require_api_key_strict_value(Some("true")));
+        assert!(!require_api_key_strict_value(Some("0")));
+        assert!(!require_api_key_strict_value(Some("yes")));
+        assert!(!require_api_key_strict_value(Some("")));
     }
 
     // ----- helpers -------------------------------------------------------
@@ -11797,6 +11859,7 @@ decision = "allow"
             &db,
             None,
             None,
+            false,
             crate::store::PoolConfig::default(),
         )
         .await
@@ -11824,6 +11887,7 @@ decision = "allow"
             &db,
             None,
             None,
+            false,
             crate::store::PoolConfig::default(),
         )
         .await;
@@ -11858,10 +11922,16 @@ decision = "allow"
         }
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("fallthrough.db");
-        let (backend, _store) =
-            build_store_handle(None, &db, None, None, crate::store::PoolConfig::default())
-                .await
-                .expect("absent --store-url MUST resolve to SqliteStore via --db");
+        let (backend, _store) = build_store_handle(
+            None,
+            &db,
+            None,
+            None,
+            false,
+            crate::store::PoolConfig::default(),
+        )
+        .await
+        .expect("absent --store-url MUST resolve to SqliteStore via --db");
         assert!(matches!(backend, crate::handlers::StorageBackend::Sqlite));
     }
 
