@@ -1,0 +1,57 @@
+# capacity-claims-allow.txt — allowlist for `scripts/check-capacity-claims.sh`
+# (#2869). One entry per line: `<relpath> <substring>`, where <relpath> is the
+# doc path relative to the scan root (e.g. `docs/foo.html`) and <substring> is a
+# verbatim fragment of the flagged line.
+#
+# ============================================================================
+# *** THIS FILE IS CURRENTLY EMPTY, AND THAT IS THE PASSING STATE. ***
+# ============================================================================
+# Empty means NO operator-facing doc needs a hand-authored exemption — every
+# legitimate history/corpus-row/retirement use is already covered STRUCTURALLY
+# by the gate (row/corpus nouns never associate with an `agent` noun; the
+# ±1-line HISTORICAL-marker window exempts retirement notes; frozen doc trees
+# under docs/v0.*, docs/audit/, docs/rfc/, docs/adr*, docs/internal/,
+# docs/BASELINE-* are out of scope). Reach for this file only for a genuine
+# case those structural rules miss.
+#
+# DISCIPLINE (burn-down, not pending-fix):
+#   * A MALFORMED entry (not exactly two whitespace-separated fields) HARD-FAILS.
+#   * A STALE entry (one that no longer matches any flagged line) HARD-FAILS —
+#     so the ledger cannot rot into a suppression nobody remembers. If the gate
+#     tells you an entry is stale, DELETE it; do not "fix" it.
+#
+# The ratified envelope is a 500-1000-agent cluster composed in 500-agent
+# blocks (#2438); the correct fix for a real overclaim is to publish that
+# honest number, NOT to allowlist the retired one.
+# ---------------------------------------------------------------------------
+#
+# VETTED EXCEPTIONS — explicitly-aspirational VISION/HORIZON statements.
+# ---------------------------------------------------------------------------
+# Each entry below was read in context (#2869) and is an EXPLICITLY-LABELLED
+# vision-tier / moonshot-horizon / hyperscale-future statement, NOT a claim
+# about a CURRENT or CERTIFIED capability. That is the distinction from the
+# CERT-BLOCKER this gate was built for: `docs/zero-touch-trust.html` presented
+# "1 to ~1,000,000 AI agents" as what the enrollment system DOES today, with no
+# aspiration framing — an overclaim, now FIXED. The lines below are a different
+# speech act (a stated north-star), and a correctly-labelled aspiration is not
+# a false capacity claim. Each substring includes the "millions of agents"
+# clause, so any future edit that changes the claim makes the entry STALE and
+# HARD-FAILS this gate, forcing a re-vet.
+#
+#   * docs/architectures-t5.html — the page IS the vision tier: <title> "T5 —
+#     Global hive ... The vision tier.", tier badge "VISION * v1.0+", section
+#     "The north star". Three vision-tier lines (meta description, hero
+#     tagline, and the T5 Raft-consensus body).
+#   * docs/architectures.html — the "TIER 5 ... VISION v1.0+" card, the highest
+#     (vision) tier of the architectures overview.
+#   * docs/reference-architectures.md — the "Tier 8 — Global hive / hyperscale"
+#     endpoint ("a hyperscale deployment with the hardware footprint of a major
+#     cloud provider ... a sovereign government").
+#   * docs/strategy/moonshot-synthesis.md — "3.3 Hive scale (v0.8.x -> v0.9.x
+#     -> v1.0 horizon)": an explicit forward HORIZON, not a shipped capability.
+docs/architectures-t5.html millions of agents acting as a unified collective
+docs/architectures-t5.html Hundreds of thousands to millions of agents
+docs/architectures-t5.html with millions of agents and cross-jurisdictional rules
+docs/architectures.html millions of agents acting as a unified collective
+docs/reference-architectures.md millions of agents
+docs/strategy/moonshot-synthesis.md thousands-to-millions of agents on shared substrate

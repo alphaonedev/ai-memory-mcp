@@ -205,6 +205,17 @@ Named-CI-job existence + enforcement-truthfulness gate (#2629)
 # enforced.
 Doc surface completeness gate (#2839)
 #
+# #2869 — agent-count / scale-CAPACITY claim ceiling gate (CERT TRUTHFULNESS).
+# The accuracy gates above pin cited VALUES / symbols / SDK-paths / CI-jobs;
+# NONE policed a fleet-scale agent-count claim, so `docs/zero-touch-trust.html`
+# shipped the retired "1 to ~1,000,000 AI agents" figure (#2438) while every
+# claims gate was green. Declared REQUIRED per gate 7 rule (f) — a new
+# c8-precheck integrity gate must be declared here (or in the not-required
+# ledger) or it is required-by-nothing (the #2636 class). Mirror-first: this
+# declaration lands before the companion branch-protection API call (KNOWN GAP
+# below), so the gate can prove the context sound before it is enforced.
+Capacity-claim ceiling gate (#2869)
+#
 # ---------------------------------------------------------------------------
 # KNOWN GAPS — declared here so they are not mistaken for oversights.
 # Closing any of them is a branch-protection edit, deliberately NOT done in

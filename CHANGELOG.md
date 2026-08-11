@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (published-claims TRUTHFULNESS — CERT-BLOCKING)
+
+- **`docs/zero-touch-trust.html` no longer ships the retired
+  "1 to ~1,000,000 AI agents" overclaim**
+  ([#2869](https://github.com/alphaonedev/ai-memory-mcp/issues/2869), 3x7
+  claims-register finding C-12). The exact figure
+  [#2438](https://github.com/alphaonedev/ai-memory-mcp/issues/2438) retired —
+  three orders of magnitude beyond the documents' own topology envelope
+  (T6 = 1000+ agents/mesh, a ~50-peer federation ceiling) — was still live in
+  BOTH the page's `<meta name="description">` and its hero tagline. Both now
+  state the ratified certified envelope: a **500-1000-agent cluster composed
+  modularly in 500-agent blocks**. Corpus-row "1M+ on Postgres"
+  (`docs/performance.html`) and the `MAX_ROWS = 1,000,000` migration cap are
+  row counts, not agent counts, and are unchanged.
+- **New gate — `scripts/check-capacity-claims.sh` (c8-precheck job
+  "Capacity-claim ceiling gate (#2869)").** No claims gate policed
+  agent-count / scale-CAPACITY claims, so the C-12 overclaim shipped while
+  every gate was green. HARD-BLOCKS any operator-facing doc that publishes a
+  single-fleet agent number above the ratified 1000 ceiling; structural
+  exemptions (row/corpus counts, retirement notes, frozen doc trees) plus a
+  burn-down allowlist (STALE entry hard-fails) that carries the vetted,
+  explicitly-aspirational vision-tier statements. `--self-test` proves it is
+  load-bearing; declared REQUIRED in `required-contexts-release.txt`
+  (gate 7 rule f) and asserted by the `tests/doc_claims_integrity.rs` twin.
+- **`docs/v1.0.0/release-notes.md` — postgres-cert scope + version honesty.**
+  A headline scope banner now states up front that the two backends are not
+  one identical API (**59 of 80 unique HTTP paths served on Postgres, 21
+  fail-closed `501`**; **MCP-stdio is structurally SQLite-only**,
+  [#1675](https://github.com/alphaonedev/ai-memory-mcp/issues/1675)). The
+  "Certified backend versions" section is reconciled to lead with the stack
+  CI actually exercises on every push (**PG 16 + AGE 1.6.0**) and to label the
+  SSOT-pinned **PG 18.4 / AGE 1.7.0 / pgvector 0.8.5** stack as *additionally
+  validated off-CI, not CI-asserted*
+  ([#2512](https://github.com/alphaonedev/ai-memory-mcp/issues/2512)); an
+  SSOT-internal pgvector pin drift (docker-1461 `0.8.5` vs do-1461 `0.8.2`) is
+  disclosed rather than papered over.
+### Fixed (certified provisioning fail-OPEN — CERT-BLOCKING)
+
+- **A failing TLS/hostssl arming step can no longer bring PostgreSQL up
+  ACCEPTING CLEARTEXT while the provisioning lane reports healthy**
+  ([#2658](https://github.com/alphaonedev/ai-memory-mcp/issues/2658)). In the
+  certified provisioning lanes the PostgreSQL substrate is meant to enforce
+  hostssl (a non-TLS TCP connection refused pre-auth), but the readiness signal
+  did not PROVE it: the `deploy/docker-1461` compose healthcheck was
+  `pg_isready -U … -d …`, which speaks over the LOCAL unix socket
+  (`local … trust`) and reports healthy whenever the postmaster is up —
+  REGARDLESS of whether hostssl was actually armed on the TCP listener. A run in
+  which the arming silently did not take effect (a lost `pg_hba.conf` bind-mount,
+  an `ssl` GUC that never applied, PGDATA non-empty so init was skipped) would
+  therefore come up accepting cleartext on TCP, report healthy, and let
+  provisioning proceed — a silent security disarm. Fix: the healthcheck now
+  requires BOTH `pg_isready` AND proof that a plaintext (`sslmode=disable`) TCP
+  connection to the loopback listener is REFUSED PRE-AUTH by `pg_hba.conf`
+  (`deploy/docker-1461/pg-hostssl-healthcheck.sh`, baked into
+  `Dockerfile.pg-age-vector`), so "healthy" now MEANS "hostssl armed"; the
+  `provision/50_up.sh` gate re-probes and aborts LOUD (non-zero, named cause)
+  rather than declaring a cleartext-accepting mesh ready; and the native
+  `deploy/do-1461/provision/20_pg_age.sh` lane fails CLOSED (`die`) after the
+  extension verify if a plaintext connection over the region VPC IP is not
+  refused pre-auth. The `deploy/hive-1461` + `infra/do-hive` lanes bind
+  PostgreSQL localhost-only (no hostssl arming), so the fail-open class does not
+  apply to them. The classifier decision table is CI-provable via
+  `pg-hostssl-healthcheck.sh --self-test` (no live PostgreSQL required). The
+  Ed25519-CA channel-binding half of #2658 remains tracked as residual.
+
 ### Fixed (federation data-integrity — CERT-BLOCKING)
 
 - **Every federation fanout lane now lands a durable push-DLQ row on a
