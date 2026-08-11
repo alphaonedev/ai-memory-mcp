@@ -262,7 +262,7 @@ blockquote strong{color:var(--p1)}
         <tr><td><code>subject_pubkey</code></td><td>The node's Ed25519 verifying key (32 bytes)</td></tr>
         <tr><td><code>issuer_id</code></td><td>The CA / intermediate that minted it</td></tr>
         <tr><td><code>not_before</code> / <code>not_after</code></td><td>Unix-seconds validity window (short TTL — default 1h)</td></tr>
-        <tr><td><code>trust_domain</code></td><td>Fleet namespace for multi-tenant isolation</td></tr>
+        <tr><td><code>trust_domain</code></td><td>Credential-replay scope &mdash; a credential minted in one domain is rejected by a bundle scoped to another. NOT a tenant-confidentiality boundary (see <code>federation-identity.md</code> &sect;"What <code>trust_domain</code> does and does not bound").</td></tr>
         <tr><td><code>cred_version</code></td><td>Wire/format version (<code>CRED_VERSION = 1</code>)</td></tr>
       </tbody>
     </table>
