@@ -132,13 +132,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would have been a NEW exposure vector, not merely a completeness fix),
   `namespace_meta[]` (governance bindings), and `archived_memory_links[]`
   (the v70/#1771 archive-link snapshot). Import
-  (`src/portability/import.rs::import_full_envelope`) stages all three RAW
-  and byte-preserved: archived rows are refused (never silently admitted)
-  when doing so would create illegal dual residency — the id LIVE at the
-  destination under a GENUINE archive reason, distinct from the #2570
-  `in_place_edit` exception, which is always admitted; namespace bindings
-  NEVER clobber an existing destination policy (`ON CONFLICT DO NOTHING`).
-  Scope: the v2 envelope (`export --full` / `import_full_envelope`) is
+  (`src/portability/import.rs::import_full_envelope`) stages all three
+  byte-preserved EXCEPT the archived row's `content`/`encrypted_envelope`,
+  which are RE-SEALED against the DESTINATION's at-rest encryption policy
+  (Fable review F2) via the same `crate::encryption::seal_content` helper
+  `insert_inner` uses for live-memory import, rather than landing the
+  export's decrypted plaintext at rest unconditionally — parity with both
+  native archiving (which copies `encrypted_envelope` verbatim) and
+  live-memory import (which reseals through `seal_content_for_upsert`).
+  Archived rows are refused (never silently admitted) when doing so would
+  create illegal dual residency — the id LIVE at the destination under a
+  GENUINE archive reason, distinct from the #2570 `in_place_edit`
+  exception, which is always admitted (now counted in the v2 import exit
+  code's `covenant` bucket, symmetric with `archived_skipped`); namespace
+  bindings NEVER clobber an existing destination policy
+  (`ON CONFLICT DO NOTHING`). Scope: the v2 envelope
+  (`export --full` / `import_full_envelope`) is
   structurally sqlite-only (source AND destination) — `export --full`
   already refuses a postgres-backed store (#2444/#2490 precedent) and
   `import_full_envelope` has no postgres call site anywhere; the default
