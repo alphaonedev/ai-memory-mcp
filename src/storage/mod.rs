@@ -4955,6 +4955,80 @@ pub fn memory_is_archived(conn: &Connection, memory_id: &str) -> Result<bool> {
     Ok(exists)
 }
 
+/// v1.0.0 #2570 — does a GENUINE archival exist for `memory_id`, i.e. an
+/// `archived_memories` row the operator intends to STAY gone?
+///
+/// This is the DISCRIMINATING form of [`memory_is_archived`] and the shared
+/// predicate BOTH import-admission funnels (the v1 `cli::io` wire form and
+/// the v2 `portability::import` envelope) consult, so the two backends
+/// cannot drift (#2488 lesson). Plain `memory_is_archived` keys on mere
+/// PRESENCE in `archived_memories` — but #1725
+/// ([`archive_memory_insert_only`]) snapshots the PRIOR content of a
+/// STILL-LIVE row into `archived_memories` under
+/// `archive_reason='in_place_edit'` (SAME id, single slot) on EVERY in-place
+/// edit, while the edited row keeps living in `memories`. Keying re-admission
+/// on presence therefore made an edited-but-live row fail the re-import of
+/// its OWN backup — progressive, silent un-re-importability of an edited
+/// corpus (#2570).
+///
+/// So the covenant gate skips re-admission ONLY for a GENUINE archival — a
+/// gc / `ttl_expired` / `size_gc` / offload / `superseded` / `forget` /
+/// operator archive (`explicit` / `archive` / a caller-supplied reason), or a
+/// NULL reason — NOT for an `in_place_edit` revision snapshot of a row that
+/// is still live. `archive_reason IS NOT ?2` is the NULL-SAFE `IS NOT`
+/// operator (a NULL reason is DISTINCT from `'in_place_edit'` ⇒ counted as a
+/// genuine archival ⇒ still blocks), never the three-valued `<>`. An id that
+/// carries BOTH an `in_place_edit` snapshot AND a genuine archival (edited,
+/// then later gc-archived so the live row is gone) still returns `true`, so a
+/// truly-archived id is never re-admitted.
+///
+/// # Errors
+///
+/// Returns `Err` only on hard SQLite failures.
+pub fn memory_is_genuinely_archived(conn: &Connection, memory_id: &str) -> Result<bool> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM archived_memories \
+         WHERE id = ?1 AND archive_reason IS NOT ?2)",
+        params![memory_id, field_names::ARCHIVE_REASON_IN_PLACE_EDIT],
+        |r| r.get(0),
+    )?;
+    Ok(exists)
+}
+
+/// v1.0.0 #2569 — is `memory_id` currently a LIVE row in `memories`?
+///
+/// A cheap existence probe (no decrypt, unlike [`get`]) the import funnels
+/// consult to make a re-import of a row that is ALREADY present an idempotent
+/// NO-OP instead of a `UNIQUE constraint failed: memories.id` refusal: the
+/// default `ConflictMode::Version` reuses the payload id, so it cannot
+/// re-insert an existing id. Runs AFTER the forget/archive covenant gates, so
+/// it never governs a forgotten/archived id.
+///
+/// # Errors
+///
+/// Returns `Err` only on hard SQLite failures.
+pub fn memory_exists(conn: &Connection, memory_id: &str) -> Result<bool> {
+    let exists: bool = conn.query_row(SQL_MEMORY_EXISTS, params![memory_id], |r| r.get(0))?;
+    Ok(exists)
+}
+
+/// v1.0.0 #2569 — does an incoming import row DIVERGE from the row already
+/// stored under the same id, in the DURABLE source-of-truth fields?
+///
+/// Compares ONLY `title` + `content` — NEVER `metadata`: the default import
+/// restamp rewrites `metadata.agent_id` (and adds `imported_from_agent_id`),
+/// so a metadata compare would report divergence on EVERY faithful
+/// self-restore and train operators to ignore the warning (5-agent vote
+/// 4d3ea1c5). A `true` result drives a per-row WARNING that the durable row
+/// was KEPT and the incoming (differing) copy was NOT applied — the substrate
+/// never silently overwrites a live row on the default disposition, and never
+/// silently swallows a divergent backup either. To overwrite a diverged row
+/// the operator opts into `--on-conflict merge`.
+#[must_use]
+pub fn imported_row_diverges(existing: &Memory, incoming: &Memory) -> bool {
+    existing.title != incoming.title || existing.content != incoming.content
+}
+
 /// #1832 (TRACT-gap G18) — a read-only projection of a persisted v71
 /// `forget_tombstones` row: the SIGNED ERASURE ATTESTATION the substrate
 /// ALREADY computes at forget time (`purge_and_tombstone_forget`) and stores,
