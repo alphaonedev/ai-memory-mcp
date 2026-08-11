@@ -996,6 +996,14 @@ async fn bulk_create_sqlite(
 
     let mut outcomes: Vec<(usize, String, String)> = Vec::new();
     let mut committed: Vec<(Memory, Option<Vec<f32>>)> = Vec::new();
+    // #2874 — keys that have DURABLY LANDED earlier in THIS batch. Drives the
+    // fail-closed write routing below: the FIRST occurrence of an `error`-mode
+    // key writes through `db::insert_no_overwrite` (fail-closed against a row
+    // that raced past the Stage-2 pre-existing probe), while a later in-batch
+    // SIBLING whose key already landed here keeps the legacy upsert so the
+    // #2725 last-wins in-batch dedup is preserved (never a self-conflict).
+    let mut landed_this_batch: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     {
         let lock = app.db.lock().await;
         // #2725 (CB-23) — snapshot each `error`-mode row's PRE-EXISTING
@@ -1177,8 +1185,28 @@ async fn bulk_create_sqlite(
                 continue;
             }
 
-            match db::insert(&lock.0, &row.mem) {
+            // #2874 — under the default `on_conflict=error` disposition the
+            // write must be ATOMICALLY fail-closed so a row racing into
+            // `(title, namespace)` BETWEEN the Stage-2 pre-existing probe and
+            // this write can no longer be silently upsert-overwritten (the
+            // North-Star lost-update the single-create #2771 fix already closed
+            // on the create funnel). The FIRST occurrence of a key routes
+            // through `db::insert_no_overwrite` (`INSERT … ON CONFLICT DO
+            // NOTHING` → typed `ConflictError`); an in-batch SIBLING whose key
+            // already LANDED in this batch keeps the legacy upsert so the #2725
+            // last-wins in-batch dedup is preserved (NOT turned into a
+            // self-conflict). `merge`/`version` always keep the upsert.
+            let key = (row.mem.title.clone(), row.mem.namespace.clone());
+            let fail_closed =
+                row.on_conflict == OnConflictMode::Error && !landed_this_batch.contains(&key);
+            let insert_result = if fail_closed {
+                db::insert_no_overwrite(&lock.0, &row.mem)
+            } else {
+                db::insert(&lock.0, &row.mem)
+            };
+            match insert_result {
                 Ok(returned_id) => {
+                    landed_this_batch.insert(key);
                     // Issue #219 parity — persist the vector so semantic recall
                     // can find this row immediately (#2594).
                     if let (Some(vec), Some(space)) = (row.embedding.as_ref(), &embedding_space)
@@ -1205,7 +1233,10 @@ async fn bulk_create_sqlite(
                     committed.push((row.mem, row.embedding));
                 }
                 Err(e) => {
-                    // #1788 — refund the quota charge since the insert failed.
+                    // #1788 — refund the quota charge since the insert failed
+                    // (a fail-closed conflict never landed a row, so the
+                    // per-row charge above must be returned, exactly as any
+                    // other write failure).
                     if !caller.is_empty()
                         && let Err(re) = crate::quotas::refund_op(
                             &lock.0,
@@ -1218,7 +1249,17 @@ async fn bulk_create_sqlite(
                     {
                         crate::quotas::log_refund_op_failed(caller, &re);
                     }
-                    ledger.reject(row.index, "store", &e.to_string());
+                    // #2874 — the fail-closed `db::insert_no_overwrite` refused
+                    // a `(title, namespace)` collision that raced past Stage-2's
+                    // probe. Surface it as the SAME typed 409-class conflict
+                    // (carrying `existing_id`) the pre-existing-collision arm
+                    // emits — NEVER a silent overwrite, and distinct from a
+                    // generic store error. Mirrors single-create #2771.
+                    if let Some(conflict) = e.downcast_ref::<crate::storage::ConflictError>() {
+                        ledger.reject_conflict(row.index, &conflict.existing_id);
+                    } else {
+                        ledger.reject(row.index, "store", &e.to_string());
+                    }
                 }
             }
         }
@@ -1448,35 +1489,100 @@ async fn bulk_create_postgres(
 
     let mut outcomes: Vec<(usize, String, String)> = Vec::new();
     // #2724 (F3) — the memories that durably committed, each carrying the
-    // PERSISTED id `store_batch` returned, so the post-commit stages below
+    // PERSISTED id the write returned, so the post-commit stages below
     // (audit / dispatch / federation fanout) key on the same id every other
-    // consumer keys on. Populated only on the atomic-success arm.
+    // consumer keys on.
     let mut committed_mems: Vec<Memory> = Vec::new();
-    if !allowed.is_empty() {
-        let memories: Vec<Memory> = allowed.iter().map(|r| r.mem.clone()).collect();
+
+    // #2874 — partition the surviving rows by conflict disposition. Under the
+    // default `on_conflict=error` the write MUST be ATOMICALLY fail-closed so a
+    // row racing into `(title, namespace)` BETWEEN the Stage-2 probe and the
+    // write can no longer be silently upsert-overwritten by `store_batch`'s
+    // `ON CONFLICT DO UPDATE` arm — the North-Star lost-update the single-create
+    // #2771 fix already closed on the create funnel. `error` rows route per-row
+    // through the certified `store_with_embedding_no_overwrite` twin (#2771);
+    // `merge`/`version` keep the batched upsert (task-mandated). The per-row
+    // `error` lane trades `store_batch`'s single round-trip for reuse of the
+    // just-certified no-overwrite primitive — 5-agent vote `4d3ea1c5`, option B
+    // (a batched `store_batch_no_overwrite` is the tracked throughput
+    // optimisation if error-mode bulk volume is measured to warrant it). Only a
+    // batch that mixes `error` with `merge`/`version` on the SAME key (a
+    // self-contradictory request no sane loader sends) splits atomicity across
+    // the two lanes; the reconciling envelope invariant holds either way.
+    let space = embedding_space.as_deref();
+    let (error_rows, batch_rows): (Vec<PreparedRow>, Vec<PreparedRow>) = allowed
+        .into_iter()
+        .partition(|r| r.on_conflict == OnConflictMode::Error);
+
+    // --- error lane: per-row fail-closed, IN INPUT ORDER. `partition`
+    // preserves relative order within the lane, so the FIRST occurrence of a
+    // key writes through the no-overwrite twin (a raced / pre-existing
+    // collision => typed `StoreError::Conflict` => `reject_conflict`, NEVER an
+    // overwrite) while a later in-batch SIBLING whose key already landed here
+    // keeps the upsert so its content wins LAST exactly as #2725 pins — never a
+    // self-conflict.
+    let mut landed: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::with_capacity(error_rows.len());
+    for row in error_rows {
+        let key = (row.mem.title.clone(), row.mem.namespace.clone());
+        let store_res = if landed.contains(&key) {
+            app.store
+                .store_with_embedding(&ctx, &row.mem, row.embedding.as_deref(), space)
+                .await
+        } else {
+            app.store
+                .store_with_embedding_no_overwrite(&ctx, &row.mem, row.embedding.as_deref(), space)
+                .await
+        };
+        match store_res {
+            Ok(id) => {
+                landed.insert(key);
+                outcomes.push((row.index, row.mem.id.clone(), id.clone()));
+                let mut mem = row.mem.clone();
+                mem.id = id;
+                committed_mems.push(mem);
+            }
+            Err(crate::store::StoreError::Conflict { id }) => {
+                // The no-overwrite write refused a `(title, namespace)`
+                // collision that raced past Stage-2's probe. Surface the SAME
+                // typed 409-class conflict (carrying `existing_id`) the
+                // pre-existing arm emits — NEVER a silent overwrite. Mirrors
+                // single-create #2771 (`store_with_embedding_no_overwrite`
+                // charges no quota on the DO-NOTHING arm — the tx never
+                // commits — so there is no charge to refund here).
+                ledger.reject_conflict(row.index, &id);
+            }
+            Err(e) => {
+                ledger.reject_class(row.index, "store", classify_store_err(&e), &e.to_string());
+            }
+        }
+    }
+
+    // --- merge/version lane: the existing atomic batched upsert (#1481),
+    // semantics UNCHANGED, plus the post-commit vector stamp for the rows that
+    // landed.
+    if !batch_rows.is_empty() {
+        let memories: Vec<Memory> = batch_rows.iter().map(|r| r.mem.clone()).collect();
         match app.store.store_batch(&ctx, &memories).await {
-            Ok(ids) if ids.len() == allowed.len() => {
-                for (row, returned) in allowed.iter().zip(ids.iter()) {
+            Ok(ids) if ids.len() == batch_rows.len() => {
+                for (row, returned) in batch_rows.iter().zip(ids.iter()) {
                     outcomes.push((row.index, row.mem.id.clone(), returned.clone()));
                     let mut mem = row.mem.clone();
                     mem.id = returned.clone();
                     committed_mems.push(mem);
                 }
-                // #2594 — stamp the vectors for the rows that actually landed.
-                // The batch is atomic, so this runs only on a committed batch.
+                // #2594 — one entry per PERSISTED id, LAST-wins (the same rule
+                // the upsert used to pick the surviving content). Several input
+                // rows can share a returned id (in-batch `(title, namespace)`
+                // collapse), and duplicate ids in one multi-row UPDATE are the
+                // shape postgres refuses with "cannot affect row a second time";
+                // pairing surviving CONTENT with an earlier row's VECTOR would
+                // also score a row against text it does not hold (a wrong
+                // result, which outranks a missing one).
                 if let Some(space) = embedding_space.as_deref() {
-                    // One entry per PERSISTED id, LAST-wins — the same rule
-                    // the upsert used to pick the surviving content. Several
-                    // input rows can share a returned id (in-batch
-                    // `(title, namespace)` collapse), and duplicate ids in one
-                    // multi-row UPDATE are the shape postgres refuses with
-                    // "cannot affect row a second time". Pairing the surviving
-                    // CONTENT with an earlier row's VECTOR would also make
-                    // semantic recall score a row against text it does not
-                    // hold — a wrong result, which outranks a missing one.
                     let mut by_id: std::collections::HashMap<&str, &Vec<f32>> =
                         std::collections::HashMap::new();
-                    for (row, id) in allowed.iter().zip(ids.iter()) {
+                    for (row, id) in batch_rows.iter().zip(ids.iter()) {
                         if let Some(v) = row.embedding.as_ref() {
                             by_id.insert(id.as_str(), v);
                         }
@@ -1502,26 +1608,24 @@ async fn bulk_create_postgres(
                 let detail = format!(
                     "store_batch returned {} ids for {} rows",
                     ids.len(),
-                    allowed.len()
+                    batch_rows.len()
                 );
                 tracing::error!("bulk_create(postgres): {detail}");
-                for row in &allowed {
+                for row in &batch_rows {
                     ledger.reject(row.index, "store", &detail);
                 }
             }
             Err(e) => {
                 // #2588 — the batch is ATOMIC: a quota breach (or any other
                 // failure) inside `store_batch` rolls the WHOLE transaction
-                // back, so EVERY allowed row was lost. Pre-#2588 this pushed
-                // ONE opaque `"internal error"` string and still returned
-                // HTTP 200 — 31,000 rows were dropped behind exactly that
-                // shape. Every lost row now gets its own typed, indexed
-                // rejection, and `BulkLedger::status` turns the total loss
-                // into the dominant cause's status (429 for quota).
+                // back, so EVERY merge/version row in the batch was lost. Every
+                // lost row gets its own typed, indexed rejection, and
+                // `BulkLedger::status` turns the total loss into the dominant
+                // cause's status (429 for quota).
                 let class = classify_store_err(&e);
                 let detail = e.to_string();
                 tracing::warn!("bulk_create(postgres): store_batch failed: {detail}");
-                for row in &allowed {
+                for row in &batch_rows {
                     ledger.reject_class(row.index, "store", class, &detail);
                 }
             }
