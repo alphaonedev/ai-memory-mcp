@@ -1,3 +1,5 @@
+[![MCP Toplist](https://mcptoplist.com/badge/io.github.alphaonedev%2Fai-memory.svg)](https://mcptoplist.com/server/io.github.alphaonedev%2Fai-memory)
+
 <p align="center">
   <img src="docs/ai-memory-logo.jpg" alt="ai-memory logo" width="200">
 </p>
