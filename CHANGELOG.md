@@ -36,6 +36,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `version` dispositions are unchanged (they keep the upsert / rename).
   Regression: `tests/create_conflict_2771.rs` (single-connection deterministic +
   a genuine two-connection sqlite race + a live-pg two-task race).
+- **The BULK create surface (`POST /api/v1/memories/bulk`) now closes the SAME
+  probe-then-upsert lost-update under the default `on_conflict=error`, on BOTH
+  backends** ([#2874](https://github.com/alphaonedev/ai-memory-mcp/issues/2874);
+  5-agent adversarial vote `4d3ea1c5`, 3-2 for reusing the certified per-row
+  no-overwrite primitive — option B, minimal new surface). Pre-fix the bulk
+  `error` rows were snapshot-probed (`#2725` pre-existing-collision reject) then
+  WRITTEN via an upsert (sqlite `db::insert` / postgres `store_batch`'s
+  `ON CONFLICT DO UPDATE`), so a row racing into the same `(title, namespace)`
+  BETWEEN the probe and the write was silently upsert-overwritten under `error`
+  mode — the identical North-Star lost-update `#2771` closed on single-create,
+  reachable on the pooled-parallel postgres and multi-process sqlite surfaces.
+  Now each `error`-mode bulk row is ATOMICALLY fail-closed: sqlite routes the
+  FIRST occurrence of a key through the certified `db::insert_no_overwrite`
+  (`INSERT … ON CONFLICT DO NOTHING` → typed `ConflictError`), and postgres
+  routes `error` rows per-row through the certified
+  `MemoryStore::store_with_embedding_no_overwrite` (`#2771`); a race-detected
+  collision is surfaced as the SAME typed `409 CONFLICT` (with `existing_id`)
+  the pre-existing probe raises, NEVER an overwrite. `merge`/`version` keep the
+  upsert, and the `#2725` in-batch last-wins dedup is preserved (a later
+  same-key sibling that already landed this batch keeps the upsert, never a
+  self-conflict). No new SAL surface — the fix reuses the just-certified
+  single-create no-overwrite methods (`src/handlers/bulk.rs`). Regression:
+  `tests/bulk_create_conflict_2874.rs` (two-connection sqlite race + `merge`
+  control + in-batch-dedup guard + a live-pg two-task handler race, all keyed on
+  the schema-v45 `version` column so an upsert-overwrite is a hard failure).
 ### Fixed (published-claims TRUTHFULNESS — CERT-BLOCKING)
 
 - **`docs/zero-touch-trust.html` no longer ships the retired
