@@ -1432,7 +1432,28 @@ const ENVELOPE_OWNER_RECONCILED_MSG: &str = "upsert-merge landed on a row that r
 /// and the `SELECT` would return the wrong row id. `SQLite` 3.35+
 /// supports `RETURNING`; it executes atomically within the `INSERT`.
 pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
-    insert_inner(conn, mem, true)
+    insert_inner(conn, mem, true, false)
+}
+
+/// v1.0.0 #2771 — FAIL-CLOSED create insert: same funnel as [`insert`]
+/// (record-stop / governance / why-trace / secret-screen / cid stamp /
+/// local vector-clock stamp / at-rest seal / #2383 reconcile / valid-time
+/// canonicalization — every column bound identically) EXCEPT the `(title,
+/// namespace)` conflict is `DO NOTHING` instead of `DO UPDATE`: a row that
+/// already holds the key is NOT overwritten. Instead the write returns a
+/// typed [`ConflictError`] (the same shape the up-front existence probe
+/// raises), so the default `on_conflict=error` create disposition can never
+/// silently clobber a concurrent writer's durable content between a probe
+/// and the write. Callers that WANT the legacy silent-merge keep calling
+/// [`insert`].
+///
+/// # Errors
+///
+/// * [`ConflictError`] (via `anyhow`) when `(mem.title, mem.namespace)`
+///   already exists — the existing row is left byte-identical.
+/// * Otherwise identical to [`insert`].
+pub fn insert_no_overwrite(conn: &Connection, mem: &Memory) -> Result<String> {
+    insert_inner(conn, mem, true, true)
 }
 
 /// v1.0.0 #2211 — REMOTE-ADMISSION insert for the Portability-v2 importer.
@@ -1451,13 +1472,23 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
 ///
 /// Identical to [`insert`].
 pub fn insert_imported(conn: &Connection, mem: &Memory) -> Result<String> {
-    insert_inner(conn, mem, false)
+    insert_inner(conn, mem, false, false)
 }
 
-/// Shared body of [`insert`] / [`insert_imported`]. `stamp_local_clock`
-/// selects whether this node's vector-clock component is advanced
-/// (local authorship) or the metadata crosses verbatim (remote admission).
-fn insert_inner(conn: &Connection, mem: &Memory, stamp_local_clock: bool) -> Result<String> {
+/// Shared body of [`insert`] / [`insert_imported`] / [`insert_no_overwrite`].
+/// `stamp_local_clock` selects whether this node's vector-clock component is
+/// advanced (local authorship) or the metadata crosses verbatim (remote
+/// admission). `fail_on_conflict` (v1.0.0 #2771) selects the `(title,
+/// namespace)` conflict arm: `false` = legacy `DO UPDATE` upsert-merge;
+/// `true` = fail-closed `DO NOTHING` that returns a typed [`ConflictError`]
+/// instead of overwriting a concurrent writer's row.
+fn insert_inner(
+    conn: &Connection,
+    mem: &Memory,
+    stamp_local_clock: bool,
+    fail_on_conflict: bool,
+) -> Result<String> {
+    use rusqlite::OptionalExtension;
     // #1955 R45 — record-stop fence: outermost of the write funnel, so a
     // stopped record plane refuses even before governance evaluates.
     crate::storage::record_stop::gate_storage_conn(conn)?;
@@ -1597,7 +1628,7 @@ fn insert_inner(conn: &Connection, mem: &Memory, stamp_local_clock: bool) -> Res
         // substrate (every store / upsert / capture-turn / federation push
         // lands here). `prepare_cached` skips the re-parse of this ~60-line
         // upsert on every call after the first.
-        let mut insert_stmt = conn.prepare_cached(
+        let upsert_sql =
             "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope, cid, cid_genesis, kind_provenance, valid_from, valid_until)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
              ON CONFLICT(title, namespace) DO UPDATE SET
@@ -1714,47 +1745,91 @@ fn insert_inner(conn: &Connection, mem: &Memory, stamp_local_clock: bool) -> Res
                 -- is kept (COALESCE, matching the Form-4/5 provenance columns).
                 valid_from = memories.valid_from,
                 valid_until = COALESCE(excluded.valid_until, memories.valid_until)
-             RETURNING id",
-        )?;
+             RETURNING id";
+        // #2771 — the column list + VALUES head is single-sourced across the
+        // upsert-merge arm (above) and the fail-closed create arm below: the
+        // no-overwrite SQL is DERIVED from the ONE `upsert_sql` literal by
+        // splitting at `ON CONFLICT`, so a future column add lands on BOTH
+        // dispositions and can never silently miss the fail-closed path (the
+        // drift class #2550 consolidated away). Only the conflict resolution
+        // differs: `DO UPDATE` merges; `DO NOTHING` refuses a `(title,
+        // namespace)` collision atomically (zero rows returned → typed
+        // ConflictError below), never overwriting a concurrent writer's row.
+        let sql: std::borrow::Cow<'_, str> = if fail_on_conflict {
+            let head = upsert_sql.split("ON CONFLICT").next().unwrap_or(upsert_sql);
+            std::borrow::Cow::Owned(
+                [
+                    head,
+                    "ON CONFLICT(title, namespace) DO NOTHING\n             RETURNING id",
+                ]
+                .concat(),
+            )
+        } else {
+            std::borrow::Cow::Borrowed(upsert_sql)
+        };
+        let mut insert_stmt = conn.prepare_cached(&sql)?;
         let kind_provenance_col = extract_kind_provenance(mem);
-        let actual_id: String = insert_stmt.query_row(
-            params![
-                mem.id,
-                mem.tier.as_str(),
-                mem.namespace,
-                mem.title,
-                content_to_store,
-                tags_json,
-                mem.priority,
-                mem.confidence,
-                mem.source,
-                mem.access_count,
-                mem.created_at,
-                mem.updated_at,
-                mem.last_accessed_at,
-                expires_canon,
-                metadata_json,
-                mem.reflection_depth,
-                mem.memory_kind.as_str(),
-                mem.entity_id,
-                mem.persona_version,
-                citations_json,
-                mem.source_uri,
-                source_span_json,
-                mem.confidence_source.as_str(),
-                confidence_signals_json,
-                mem.confidence_decayed_at,
-                mentioned_entity_id,
-                mem.lifecycle_state.as_str(),
-                encrypted_envelope,
-                cid_stamp.cid,
-                cid_stamp.genesis,
-                kind_provenance_col,
-                valid_from_canon,
-                valid_until_canon,
-            ],
-            |r| r.get(0),
-        )?;
+        let actual_id: String = match insert_stmt
+            .query_row(
+                params![
+                    mem.id,
+                    mem.tier.as_str(),
+                    mem.namespace,
+                    mem.title,
+                    content_to_store,
+                    tags_json,
+                    mem.priority,
+                    mem.confidence,
+                    mem.source,
+                    mem.access_count,
+                    mem.created_at,
+                    mem.updated_at,
+                    mem.last_accessed_at,
+                    expires_canon,
+                    metadata_json,
+                    mem.reflection_depth,
+                    mem.memory_kind.as_str(),
+                    mem.entity_id,
+                    mem.persona_version,
+                    citations_json,
+                    mem.source_uri,
+                    source_span_json,
+                    mem.confidence_source.as_str(),
+                    confidence_signals_json,
+                    mem.confidence_decayed_at,
+                    mentioned_entity_id,
+                    mem.lifecycle_state.as_str(),
+                    encrypted_envelope,
+                    cid_stamp.cid,
+                    cid_stamp.genesis,
+                    kind_provenance_col,
+                    valid_from_canon,
+                    valid_until_canon,
+                ],
+                |r| r.get(0),
+            )
+            .optional()?
+        {
+            Some(id) => id,
+            None => {
+                // #2771 — the no-overwrite (`DO NOTHING`) arm inserted nothing:
+                // a concurrent writer already holds `(title, namespace)`. Refuse
+                // fail-closed with the typed conflict — NEVER overwrite. Re-probe
+                // for the winner's id best-effort; a TOCTOU gap (winner deleted
+                // between the conflict and this read) degrades to an empty id,
+                // never a retry-as-create. The merge (`DO UPDATE`) arm always
+                // RETURNs a row, so this branch is unreachable when
+                // `fail_on_conflict` is false.
+                let existing_id =
+                    find_by_title_namespace(conn, &mem.title, &mem.namespace)?.unwrap_or_default();
+                return Err(ConflictError {
+                    existing_id,
+                    title: mem.title.clone(),
+                    namespace: mem.namespace.clone(),
+                }
+                .into());
+            }
+        };
         // #2383 (N1) — invariant backstop: a non-NULL `encrypted_envelope`
         // MUST open under the row's persisted `metadata.agent_id`.
         reconcile_envelope_owner(conn, &actual_id, &mem.content, &seal)?;

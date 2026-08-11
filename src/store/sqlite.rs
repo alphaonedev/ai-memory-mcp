@@ -169,6 +169,42 @@ impl MemoryStore for SqliteStore {
         }
     }
 
+    /// v1.0.0 #2771 — FAIL-CLOSED create: delegates to the sqlite SSOT
+    /// `db::insert_no_overwrite`, which shares `db::insert`'s exact write
+    /// funnel (record-stop / governance / why-trace / secret-screen / cid /
+    /// vector-clock / seal / #2383 reconcile / valid-time canonicalization)
+    /// but refuses a `(title, namespace)` collision atomically instead of
+    /// upsert-merging. A collision surfaces as the legacy
+    /// `crate::storage::ConflictError`, mapped here to the typed
+    /// [`StoreError::Conflict`] carrying the existing row's id. The `embedding`
+    /// is written separately by the HTTP create handler after this returns
+    /// (the sqlite backend keeps embeddings in a side-table), so it is
+    /// deliberately ignored here — mirroring the trait-default
+    /// `store_with_embedding` sqlite behaviour.
+    async fn store_with_embedding_no_overwrite(
+        &self,
+        ctx: &CallerContext,
+        memory: &Memory,
+        _embedding: Option<&[f32]>,
+        _space: Option<&str>,
+    ) -> StoreResult<String> {
+        self.gate_record_stop()?;
+        let conn = self.state.lock().await;
+        let map_err = |e: anyhow::Error| match e.downcast_ref::<crate::storage::ConflictError>() {
+            Some(c) => StoreError::Conflict {
+                id: c.existing_id.clone(),
+            },
+            None => box_err(e),
+        };
+        if ctx.bypass_visibility {
+            let mut stamped = memory.clone();
+            crate::storage::stamp_substrate_why_trace(&mut stamped.metadata);
+            db::insert_no_overwrite(&conn, &stamped).map_err(map_err)
+        } else {
+            db::insert_no_overwrite(&conn, memory).map_err(map_err)
+        }
+    }
+
     /// v0.7.0 #1416 — L4 layered-capture idempotent write. Delegates to
     /// the sqlite SSOT `db::capture_turn_idempotent`, which the MCP
     /// `memory_capture_turn` handler also calls, so the dedup-lookup +

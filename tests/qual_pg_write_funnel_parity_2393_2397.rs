@@ -71,7 +71,13 @@ const KIND_PROVENANCE_FUNNELS: &[&str] = &[
     "store_batch",     // #2289
     "archive_restore", // #2333 / FBL-03
     // Fixed by #2393 — the three funnels the issue named…
-    "store_with_embedding",
+    // #2771 — `store_with_embedding` was refactored into a thin delegator to the
+    // shared inherent `store_with_embedding_inner`, which now holds the INSERT +
+    // every column bind. BOTH create funnels (`store_with_embedding` merge +
+    // `store_with_embedding_no_overwrite` fail-closed) delegate to it, so the
+    // provenance-bind guard follows the INSERT to `_inner` — strictly stronger,
+    // since it now also covers the no-overwrite arm's bind.
+    "store_with_embedding_inner",
     "capture_turn_idempotent",
     "recover_turn_idempotent",
     // …and the three the completeness sweep found that it did not.
@@ -175,11 +181,13 @@ fn span_extractor_is_load_bearing() {
     let src = adapter_source();
 
     // --- EARLY function -------------------------------------------------
+    // #2771 — `store_with_embedding` is now a thin delegator; the INSERT + all
+    // column binds moved to the inherent `store_with_embedding_inner` that both
+    // create funnels share. Probe BOTH: the delegator (proves it still exists +
+    // forwards, so the parity guards can't silently stop covering this funnel)
+    // and `_inner` (proves it carries the INSERT the guards below scan). Keep
+    // the exact-start anchoring — a `contains` cannot detect offset drift.
     let span = fn_span(&src, "store_with_embedding").expect("store_with_embedding must exist");
-    // `starts_with`, NOT `contains`: an offset that drifts by even ONE byte
-    // still `contains` the signature (the slice merely begins a few bytes
-    // early), so a `contains` assertion cannot detect drift at all. Anchoring
-    // the exact start is what makes this guard load-bearing.
     assert!(
         span.starts_with("    async fn store_with_embedding(")
             || span.starts_with("    pub async fn store_with_embedding("),
@@ -187,12 +195,31 @@ fn span_extractor_is_load_bearing() {
         &span[..span.len().min(80)]
     );
     assert!(
-        span.contains("INSERT INTO memories"),
-        "the store_with_embedding span must contain its own INSERT"
+        span.contains("store_with_embedding_inner("),
+        "the thin store_with_embedding must DELEGATE to store_with_embedding_inner \
+         (#2771) — if the delegation vanishes the parity guards stop covering it"
     );
     assert!(
-        !span.contains("async fn capture_turn_idempotent("),
-        "span must NOT bleed into a sibling function"
+        !span.contains("async fn store_with_embedding_no_overwrite("),
+        "span must NOT bleed into the sibling function"
+    );
+
+    let inner =
+        fn_span(&src, "store_with_embedding_inner").expect("store_with_embedding_inner must exist");
+    assert!(
+        inner.starts_with("    async fn store_with_embedding_inner(")
+            || inner.starts_with("    pub async fn store_with_embedding_inner("),
+        "the inner span must begin EXACTLY at its own signature, got: {:?}",
+        &inner[..inner.len().min(80)]
+    );
+    assert!(
+        inner.contains("INSERT INTO memories"),
+        "the store_with_embedding_inner span must contain the INSERT (#2771 moved \
+         it here from the thin delegator)"
+    );
+    assert!(
+        !inner.contains("async fn list_archived_pg("),
+        "the inner span must NOT bleed into the following function"
     );
 
     // --- LATE function (the accumulated-drift detector) -----------------

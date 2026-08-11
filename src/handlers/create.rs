@@ -507,18 +507,11 @@ fn resolve_create_conflict_title(
     match on_conflict_mode {
         OnConflictMode::Error => {
             match db::find_by_title_namespace(conn, &body.title, &body.namespace) {
-                Ok(Some(existing_id)) => Err((
-                    StatusCode::CONFLICT,
-                    Json(json!({
-                        "code": crate::errors::error_codes::CONFLICT,
-                        "error": format!(
-                            "memory with title '{}' already exists in namespace '{}'",
-                            body.title, body.namespace
-                        ),
-                        (field_names::EXISTING_ID): existing_id,
-                    })),
-                )
-                    .into_response()),
+                Ok(Some(existing_id)) => Err(conflict_409_response(
+                    &body.title,
+                    &body.namespace,
+                    &existing_id,
+                )),
                 Ok(None) => Ok(body.title.clone()),
                 Err(e) => {
                     tracing::error!("on_conflict lookup failed: {e}");
@@ -541,6 +534,31 @@ fn resolve_create_conflict_title(
             }),
         OnConflictMode::Merge => Ok(body.title.clone()),
     }
+}
+
+/// #2771 — the ONE builder for the `409 CONFLICT` a `(title, namespace)`
+/// create collision returns, whether the collision is PROBE-detected (an
+/// existing row seen up front) or WRITE-detected (the fail-closed `ON CONFLICT
+/// DO NOTHING` refused a racer). Single-sources the wire shape — `code:
+/// CONFLICT`, the message, and `existing_id` — across every sqlite + postgres
+/// create funnel so a race-detected 409 is byte-identical to a probe-detected
+/// one (and the message literal lives at exactly one site).
+fn conflict_409_response(
+    title: &str,
+    namespace: &str,
+    existing_id: &str,
+) -> axum::response::Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "code": crate::errors::error_codes::CONFLICT,
+            "error": format!(
+                "memory with title '{title}' already exists in namespace '{namespace}'"
+            ),
+            (field_names::EXISTING_ID): existing_id,
+        })),
+    )
+        .into_response()
 }
 
 /// #866 stage 4 — substrate governance pre-write hook. Walks the
@@ -705,6 +723,11 @@ fn insert_create_with_quota(
     // vector. `None` when embeddings are disabled (then `embedding` is `None`
     // too, so it is never read).
     space: Option<&str>,
+    // #2771 — when true (the default `on_conflict=error` disposition), route
+    // through `db::insert_no_overwrite` so a `(title, namespace)` collision is
+    // REFUSED atomically (409 CONFLICT) instead of upsert-merged. `false`
+    // (`merge`/`version`) keeps the legacy `db::insert` upsert.
+    fail_on_conflict: bool,
 ) -> Result<String, axum::response::Response> {
     // v0.7.0 Round-2 F7 — per-agent quota gate. Round-1 evidence: 500
     // HTTP stores from a single agent_id incremented zero rows in
@@ -794,7 +817,12 @@ fn insert_create_with_quota(
         }
     }
 
-    match db::insert(&lock.0, mem) {
+    let insert_result = if fail_on_conflict {
+        db::insert_no_overwrite(&lock.0, mem)
+    } else {
+        db::insert(&lock.0, mem)
+    };
+    match insert_result {
         Ok(actual_id) => {
             // Issue #219: persist the embedding into the connection so
             // semantic recall can find this memory. Previously the HTTP
@@ -841,6 +869,18 @@ fn insert_create_with_quota(
             // here is the load-bearing contract — pinned by the
             // `insert_governance_refusal_downcasts_to_403_envelope` test
             // in the `#[cfg(test)]` block below.
+            // #2771 — the fail-closed `db::insert_no_overwrite` refused a
+            // `(title, namespace)` collision that raced past Stage-2's probe.
+            // Surface the SAME 409 shape the probe raises (code CONFLICT +
+            // `existing_id`), so a race-detected conflict is wire-identical to a
+            // probe-detected one and never a silent overwrite.
+            if let Some(conflict) = e.downcast_ref::<crate::storage::ConflictError>() {
+                return Err(conflict_409_response(
+                    &conflict.title,
+                    &conflict.namespace,
+                    &conflict.existing_id,
+                ));
+            }
             if let Some(refusal) = e.downcast_ref::<crate::storage::GovernanceRefusal>() {
                 tracing::info!(
                     "create_memory refused by substrate governance: {}",
@@ -1009,6 +1049,24 @@ async fn fanout_and_assemble_create_response(
     (StatusCode::CREATED, Json(response)).into_response()
 }
 
+/// #2771 — map a postgres create store-result error to a response,
+/// upgrading the typed [`crate::store::StoreError::Conflict`] raised by the
+/// fail-closed `store_with_embedding_no_overwrite` to the SAME 409 shape the
+/// up-front existence probe emits (code CONFLICT + `existing_id`), so a
+/// race-detected conflict is wire-identical to a probe-detected one. Every
+/// other `StoreError` falls through to the canonical `store_err_to_response`.
+#[cfg(feature = "sal")]
+fn create_pg_store_err_to_response(
+    e: crate::store::StoreError,
+    title: &str,
+    namespace: &str,
+) -> axum::response::Response {
+    if let crate::store::StoreError::Conflict { id } = &e {
+        return conflict_409_response(title, namespace, id);
+    }
+    store_err_to_response(e)
+}
+
 /// #866 — postgres-backed daemon path for `create_memory`. The SAL
 /// trait's `store_with_embedding` writes the row and the embedding
 /// in a single call; the surrounding ceremony (auto_tag,
@@ -1095,18 +1153,7 @@ async fn create_memory_postgres(
                 .await
             {
                 Ok(Some(existing_id)) => {
-                    return (
-                        StatusCode::CONFLICT,
-                        Json(json!({
-                            "code": crate::errors::error_codes::CONFLICT,
-                            "error": format!(
-                                "memory with title '{}' already exists in namespace '{}'",
-                                body.title, body.namespace
-                            ),
-                            (field_names::EXISTING_ID): existing_id,
-                        })),
-                    )
-                        .into_response();
+                    return conflict_409_response(&body.title, &body.namespace, &existing_id);
                 }
                 Ok(None) => body.title.clone(),
                 Err(e) => return store_err_to_response(e),
@@ -1307,12 +1354,30 @@ async fn create_memory_postgres(
     // arm so the Track D Docker probe can distinguish "federation never
     // wired into AppState" from "federation wired but emitted zero peer
     // requests".
-    let store_fut = app.store.store_with_embedding(
-        &ctx,
-        &mem,
-        embedding.as_deref(),
-        embedding_space.as_deref(),
-    );
+    // #2771 — under the default `on_conflict=error` disposition route through
+    // the fail-closed `store_with_embedding_no_overwrite` so a `(title,
+    // namespace)` collision that raced past the probe above is REFUSED
+    // atomically (typed `StoreError::Conflict` → 409) instead of the upsert
+    // silently overwriting the durable content. `merge`/`version` keep the
+    // upsert. Boxed because the two async methods are distinct future types.
+    let store_error_mode = matches!(on_conflict_mode, OnConflictMode::Error);
+    let store_fut: std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::store::StoreResult<String>> + Send>,
+    > = if store_error_mode {
+        Box::pin(app.store.store_with_embedding_no_overwrite(
+            &ctx,
+            &mem,
+            embedding.as_deref(),
+            embedding_space.as_deref(),
+        ))
+    } else {
+        Box::pin(app.store.store_with_embedding(
+            &ctx,
+            &mem,
+            embedding.as_deref(),
+            embedding_space.as_deref(),
+        ))
+    };
     let (id, quorum_outcome) = match app.federation.as_ref() {
         Some(fed) => {
             tracing::debug!(
@@ -1348,7 +1413,7 @@ async fn create_memory_postgres(
             // quorum outcome (the client retries with the same id).
             match store_res {
                 Ok(id) => (id, Some(quorum_res)),
-                Err(e) => return store_err_to_response(e),
+                Err(e) => return create_pg_store_err_to_response(e, &mem.title, &mem.namespace),
             }
         }
         None => {
@@ -1361,7 +1426,7 @@ async fn create_memory_postgres(
             );
             match store_fut.await {
                 Ok(id) => (id, None),
-                Err(e) => return store_err_to_response(e),
+                Err(e) => return create_pg_store_err_to_response(e, &mem.title, &mem.namespace),
             }
         }
     };
@@ -1763,8 +1828,19 @@ pub async fn create_memory(
         .as_ref()
         .as_ref()
         .map(|e| e.space_fingerprint());
-    let actual_id = match insert_create_with_quota(&lock, &mem, &embedding, create_space.as_deref())
-    {
+    // #2771 — under the default `on_conflict=error` disposition the write must
+    // be ATOMICALLY fail-closed (INSERT ... ON CONFLICT DO NOTHING → typed 409),
+    // never the probe-then-upsert that let a concurrent create silently
+    // overwrite the durable content between Stage-2's probe and this write.
+    // `merge`/`version` keep the upsert path.
+    let fail_on_conflict = matches!(on_conflict_mode, crate::mcp::tools::OnConflictMode::Error);
+    let actual_id = match insert_create_with_quota(
+        &lock,
+        &mem,
+        &embedding,
+        create_space.as_deref(),
+        fail_on_conflict,
+    ) {
         Ok(id) => id,
         Err(resp) => return resp,
     };
