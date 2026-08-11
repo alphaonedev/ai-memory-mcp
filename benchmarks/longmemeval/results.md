@@ -1,4 +1,4 @@
-# LongMemEval Results — v0.7.0 Full-500 Disclosure
+# LongMemEval Results — Binary-Faithful Full-500 Disclosure
 
 > Methodology and reproducibility pins live in
 > [`methodology.md`](./methodology.md). See [`README.md`](./README.md) for
@@ -6,6 +6,32 @@
 > are captured under `.local-runs/bench-v070-20260531-151813/` for audit
 > provenance (results-keyword / results-semantic / results-autonomous /
 > expand-openrouter).
+>
+> **v1.0.0 keyword re-measurement (2026-08-11, #2888).** The
+> binary-faithful **keyword** row below was RE-MEASURED on the v1.0.0
+> release binary (`ai-memory 1.0.0`, commit `811ce105`) via `harness.py`
+> (one real `ai-memory recall` subprocess per question), full 500
+> questions — to satisfy the bet-the-farm rule that a figure PUBLISHED for
+> v1.0.0 must be MEASURED on v1.0.0 (the earlier row was measured on the
+> v0.7.0 binary, 2026-05-31). The run set `AI_MEMORY_SECRET_SCREEN_MODE=off`
+> + `AI_MEMORY_NO_CONFIG=1` to reproduce the v0.7.0 INGEST baseline:
+> secret-screening is a v0.8.1 WRITE-path control (env #95) that did not
+> exist at v0.7.0 and is orthogonal to keyword recall QUALITY; left at its
+> `refuse` default it drops LongMemEval-S sessions carrying synthetic
+> credential-like strings and measures the screen, not the FTS5 ranker.
+> The 18 sessions still refused are the pre-existing `validate_content`
+> control-char rejections (`is_clean_string`, `src/validate.rs:148`) that
+> v0.7.0 dropped identically — the corpus is apples-to-apples. Result: R@1
+> **86.6%** (433/500), R@5 **96.4%** (482/500), R@10 **98.4%** (492/500),
+> R@20 **99.6%** (498/500) — byte-identical to the 2026-05-31 v0.7.0
+> keyword figures at R@1/R@5/R@10 and at EVERY per-category cell EXCEPT
+> `temporal-reasoning` R@20, where the v1.0.0 binary retrieves ONE more
+> question at rank ≤20 (131/133 → 132/133), lifting Overall R@20 from
+> 99.4% (497/500) to 99.6% (498/500). The `semantic` and `autonomous`
+> rows remain the 2026-05-31 v0.7.0 measurements — the #2888 pass re-ran
+> the keyword tier only (the LLM-independent, load-bearing floor). Raw log
+> + per-category CSV: `.local-runs/2888-bench/`
+> (`keyword-v1.0.0-screenoff.log`, `results_keyword.csv`).
 
 This document publishes ai-memory's recall numbers on **LongMemEval-S
 (cleaned), 500 questions**. The v0.6.3.1 matrix carried `PENDING-RUN`
@@ -37,13 +63,17 @@ harness, never across.
 
 | # | Variant | Tier | Embedder | Reranker | LLM expand | R@1 | R@5 | R@10 | R@20 |
 |--:|---|---|---|---|---|---:|---:|---:|---:|
-| 1 | keyword-baseline | `keyword` | — (FTS5 only) | — | no | 86.6% | 96.4% | 98.4% | 99.4% |
+| 1 | keyword-baseline | `keyword` | — (FTS5 only) | — | no | 86.6% | 96.4% | 98.4% | 99.6% |
 | 2 | semantic | `semantic` | MiniLM-L6 384d (local Candle) | off | no | **88.2%** | 96.8% | 99.0% | 99.8% |
 | 3 | autonomous | `autonomous` | nomic-embed 768d (Ollama) | ms-marco MiniLM cross-encoder | no | 86.2% | 95.8% | 98.2% | 99.2% |
 
-All three: full 500 questions, R@K = fraction where the correct source
-session id appears in the top-K returned memories. Run 2026-05-31 against
-the installed v0.7.0 binary (schema v53).
+R@K = fraction where the correct source session id appears in the top-K
+returned memories, full 500 questions. **Row 1 (keyword) was re-measured
+on the v1.0.0 release binary (`811ce105`) on 2026-08-11 (#2888)** — see
+the v1.0.0 re-measurement note at the top of this file for the exact
+protocol and the single per-category delta vs the v0.7.0 run. Rows 2
+(semantic) and 3 (autonomous) are the 2026-05-31 v0.7.0 runs (schema v53),
+not re-run in the keyword-tier #2888 pass.
 
 ### Shadow harness (`harness_99.py`, LLM query-expansion + FTS5)
 
@@ -104,17 +134,22 @@ than buying `autonomous` for a number that is actually lower here.
 
 ## Per-category breakdown — binary-faithful tiers
 
-### keyword (`harness.py`)
+### keyword (`harness.py`) — v1.0.0 binary, 2026-08-11 (#2888)
+
+Per-category breakdown of the v1.0.0 keyword re-measurement (500 questions,
+commit `811ce105`). Identical to the 2026-05-31 v0.7.0 keyword run at every
+cell EXCEPT `temporal-reasoning` R@20 (v0.7.0 98.5% = 131/133 → v1.0.0
+99.2% = 132/133), which lifts Overall R@20 to 99.6% (498/500).
 
 | Category | R@1 | R@5 | R@10 | R@20 |
 |---|---:|---:|---:|---:|
-| **Overall** | **86.6%** | **96.4%** | **98.4%** | **99.4%** |
+| **Overall** | **86.6%** | **96.4%** | **98.4%** | **99.6%** |
 | knowledge-update | 96.2% | 100.0% | 100.0% | 100.0% |
 | multi-session | 86.5% | 96.2% | 97.7% | 99.2% |
 | single-session-assistant | 100.0% | 100.0% | 100.0% | 100.0% |
 | single-session-preference | 50.0% | 90.0% | 96.7% | 100.0% |
 | single-session-user | 90.0% | 98.6% | 100.0% | 100.0% |
-| temporal-reasoning | 82.0% | 93.2% | 97.0% | 98.5% |
+| temporal-reasoning | 82.0% | 93.2% | 97.0% | 99.2% |
 
 ### semantic (`harness.py`)
 
