@@ -75,8 +75,10 @@ AGE + pgvector storage backend.
 > not `ai-memory mcp`. The certified **PG 18.4 / AGE 1.7.0 / pgvector
 > 0.8.5** stack is now exercised in-PR on every `release/**` PR by
 > `.github/workflows/cert-postgres-age.yml`, which runs the pg-parity and
-> AGE cells `--include-ignored` against the live
-> `apache/age:release_PG18_1.7.0` image and hard-fails on version drift;
+> AGE cells `--include-ignored` against the certified image CI builds from
+> `deploy/docker-1461/Dockerfile.pg-age-vector` (SSOT-pinned PG 18.4 / AGE
+> 1.7.0 / pgvector 0.8.5) and hard-fails on any drift from the exact pinned
+> minors;
 > the PG 16 / AGE 1.6.0 combination in `coverage.yml` is the documented
 > **alternate** matrix (a line-coverage measurement). See §"Certified
 > backend versions" for the exact versions and evidence basis.

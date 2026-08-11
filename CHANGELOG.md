@@ -143,13 +143,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.github/workflows/cert-postgres-age.yml` triggers on `pull_request` +
   `push` to `release/**` and runs the `#[ignore]`-gated postgres cells AND
   the AGE-backed cells (`AI_MEMORY_TEST_AGE_URL` set, so they stop
-  self-skipping) against a live `apache/age:release_PG18_1.7.0` service with
-  pgvector layered in, `--include-ignored --test-threads=1`. Makes the
+  self-skipping) against the certified image CI builds from
+  `deploy/docker-1461/Dockerfile.pg-age-vector` (the same recipe the
+  docker-1461 mesh ships, SSOT-pinned from `deploy/docker-1461/provision/lib.sh`),
+  `--include-ignored --test-threads=1`. Makes the
   2026-08-01 cutline ruling §5.4(3) EXECUTABLE — the certified tier is proven
   by execution on the cert branch, not merely claimed. A version-assert step
-  hard-fails if the running stack is not AGE **1.7.0** on PG **18** with
-  pgvector **>= 0.8.5**, so a base-image drift reds instead of silently
-  certifying the wrong version.
+  hard-fails if the running stack is not the EXACT certified minors —
+  PostgreSQL **18.4**, AGE **1.7.0**, pgvector **0.8.5** — so any drift reds
+  instead of silently certifying the wrong version.
 - **#2512 — AGE pin drift reconciled.** The **one true certified triple** is
   standardized and documented: **PostgreSQL 18.4 + Apache AGE 1.7.0 +
   pgvector 0.8.5** (SSOT: `deploy/docker-1461/provision/lib.sh` +

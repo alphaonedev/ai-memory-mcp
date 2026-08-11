@@ -27,7 +27,7 @@
 # `PGVECTOR_APT_VERSION`, `AGE_BASE_IMAGE`, `EXPECTED_PG_VERSION`,
 # `EXPECTED_AGE_VERSION`), and RUNS that built image as the postgres under
 # test — not a `services:` block pointed at the unmodified base image. No
-# version literal is re-typed in this file: every pin is read from the
+# operative version literal is re-typed in this file: every pin is read from the
 # deploy SSOT by the "Resolve certified stack pins" step below and threaded
 # through `$GITHUB_ENV` to the build + assert steps. This is the maximal
 # "extend prior art, do not fork it" path (CLAUDE.md): the CI evidence and
