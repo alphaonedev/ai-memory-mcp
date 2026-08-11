@@ -124,6 +124,7 @@ fn build_router_fixture(db_path: &std::path::Path, admin_agents: Vec<String>) ->
             ai_memory::identity::replay::FederationNonceCache::default(),
         ),
         autonomous_hooks: false,
+        auto_tag_queue: None,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(admin_agents),

@@ -162,6 +162,7 @@ fn build_router_fixture_with_llm(
             ai_memory::identity::replay::FederationNonceCache::default(),
         ),
         autonomous_hooks: false,
+        auto_tag_queue: None,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
         // #976 (2026-05-20) — admin allowlist needed so the surface
@@ -253,6 +254,7 @@ fn build_router_fixture_no_admin() -> (axum::Router, NamedTempFile) {
             ai_memory::identity::replay::FederationNonceCache::default(),
         ),
         autonomous_hooks: false,
+        auto_tag_queue: None,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
         // Empty allowlist — the v0.7.0 safe-by-default posture.

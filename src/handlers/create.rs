@@ -30,9 +30,9 @@ use crate::validate;
 
 #[cfg(feature = "sal")]
 use super::StorageBackend;
-use super::maybe_auto_tag;
 #[cfg(feature = "sal")]
 use super::store_err_to_response;
+use super::try_enqueue_auto_tag;
 use super::{AppState, JsonOrBadRequest};
 
 /// #1924 (CWE-288) — consult the process pre-event enforcement gate on the HTTP
@@ -913,7 +913,7 @@ async fn fanout_and_assemble_create_response(
     mem: &Memory,
     actual_id: &str,
     embedding: Option<Vec<f32>>,
-    auto_tags: &[String],
+    auto_tag_outcome: super::AutoTagOutcome,
     contradiction_ids: Vec<String>,
     embed_status: EmbedStatus,
 ) -> axum::response::Response {
@@ -981,10 +981,11 @@ async fn fanout_and_assemble_create_response(
     if !contradiction_ids.is_empty() {
         response["potential_contradictions"] = json!(contradiction_ids);
     }
-    // v0.7.0 L5 — echo LLM-generated tags as a dedicated
-    // `auto_tags` field, matching MCP `handle_store`'s response.
-    if !auto_tags.is_empty() {
-        response["auto_tags"] = json!(auto_tags);
+    // #2587 — honest outcome signal (never literal tags anymore — they
+    // may not have landed yet). Absent when auto_tag was never eligible
+    // (byte-identical to the pre-#2587 no-LLM-ran contract).
+    if let Some(field) = auto_tag_outcome.response_field() {
+        response["auto_tagging"] = json!(field);
     }
     // v0.7.0 Round-2 F10 — surface embed_status to the caller when α's
     // `embed_with_status` reported anything other than `Indexed`.
@@ -1084,17 +1085,17 @@ async fn create_memory_postgres(
     capability: Option<&crate::governance::capability::CapabilityToken>,
 ) -> axum::response::Response {
     let now = Utc::now();
-    // v0.7.0 L5 — fire the LLM `auto_tag` hook before assembling the
-    // canonical `Memory` row so the postgres `tags` column lands
-    // populated with LLM suggestions on the FIRST insert.
-    let auto_tags =
-        maybe_auto_tag(app, &body.title, &body.content, &body.tags, &body.namespace).await;
-    let mut final_tags = body.tags.clone();
-    for t in &auto_tags {
-        if !final_tags.iter().any(|existing| existing == t) {
-            final_tags.push(t.clone());
-        }
-    }
+    // #2587 — `auto_tag` no longer fires here. Pre-#2587 this awaited the
+    // LLM chat-completion call INLINE, before the canonical `Memory` row
+    // was even assembled — measured at 4.9-11.1s per write in production
+    // (an AVAILABILITY defect: MCP stdio's single-threaded loop stalls
+    // every subsequent tool call; the HTTP daemon holds an admission
+    // permit for the whole duration, #2032 M3). Tags are derived,
+    // regenerable data, not durable truth, so per the 5-agent vote
+    // (`4d3ea1c5`, 2026-08-11) the LLM call is deferred to a bounded
+    // background worker AFTER the durable insert below (see
+    // `try_enqueue_auto_tag` near the end of this function) — the write
+    // itself never merges auto-tags, it stores `body.tags` verbatim.
     // #1886 — mirror the sqlite `create_memory` TTL resolution so the
     // postgres backend honours a caller-supplied `ttl_secs` (and the
     // operator-configured tier default) identically. Pre-#1886 this
@@ -1173,7 +1174,17 @@ async fn create_memory_postgres(
     // hand-maintained struct literal duplicated across four write funnels;
     // the two `bulk_create` copies had already drifted (no `kind_provenance`
     // stamp, no `scope` merge).
-    let mut mem = build_create_memory(body, metadata, resolved_title, final_tags, expires_at, &now);
+    // #2587 — `body.tags.clone()` verbatim; auto-tags are no longer
+    // merged in before the durable insert (see the comment at the top of
+    // this function).
+    let mut mem = build_create_memory(
+        body,
+        metadata,
+        resolved_title,
+        body.tags.clone(),
+        expires_at,
+        &now,
+    );
     // #626 Layer-3 (C7) — agent-attestation gate (postgres SAL branch).
     // Same contract as the sqlite path, but the bound-key lookup goes
     // through the async `MemoryStore::agent_pubkey`. 400 for a malformed
@@ -1497,6 +1508,19 @@ async fn create_memory_postgres(
         }
     }
 
+    // #2587 — enqueue the (possibly) deferred `auto_tag` job AFTER the
+    // durable write above has already succeeded. Non-blocking; never
+    // awaits the LLM. See `try_enqueue_auto_tag` for the eligibility
+    // gate + outcome shape.
+    let auto_tag_outcome = try_enqueue_auto_tag(
+        app,
+        &id,
+        &mem.title,
+        &mem.content,
+        &body.tags,
+        &mem.namespace,
+    );
+
     // #869 — typed serialise helper so a 201 + `{}` never masks a real
     // encode failure.
     let mut payload = match super::to_value_or_500("create_memory.postgres.response", &mem) {
@@ -1505,8 +1529,8 @@ async fn create_memory_postgres(
     };
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("id".to_string(), serde_json::Value::String(id));
-        if !auto_tags.is_empty() {
-            obj.insert("auto_tags".to_string(), json!(auto_tags));
+        if let Some(field) = auto_tag_outcome.response_field() {
+            obj.insert("auto_tagging".to_string(), json!(field));
         }
     }
     (StatusCode::CREATED, Json(payload)).into_response()
@@ -1570,18 +1594,11 @@ pub async fn create_memory(
         return create_memory_postgres(&app, &body, &agent_id, metadata, capability.as_ref()).await;
     }
 
-    // v0.7.0 L5 — fire the LLM `auto_tag` autonomy hook BEFORE the
-    // embedding pass + DB lock. Both LLM and embedder calls are
-    // network/CPU work that must not happen under the single shared
-    // `Mutex<Connection>` on a multi-agent daemon.
-    let auto_tags = maybe_auto_tag(
-        &app,
-        &body.title,
-        &body.content,
-        &body.tags,
-        &body.namespace,
-    )
-    .await;
+    // #2587 — `auto_tag` no longer fires here (see the comment at the
+    // top of `create_memory_postgres` for the full rationale, which
+    // applies identically to this sqlite branch). It is enqueued onto
+    // the bounded background worker AFTER the durable insert, near the
+    // end of this function.
 
     // Stage 3 — embed-before-lock (issue #219). Computed BEFORE
     // acquiring the DB lock so the 10-200 ms embedder run doesn't
@@ -1648,24 +1665,16 @@ pub async fn create_memory(
         Err(resp) => return resp,
     };
 
-    // v0.7.0 L5 — merge LLM-derived `auto_tags` with operator-supplied
-    // `body.tags`. Operator tags lead; auto-tag entries that duplicate
-    // an existing operator tag are dropped to avoid double-counting on
-    // FTS5 weighting downstream.
-    let mut merged_tags = body.tags.clone();
-    for t in &auto_tags {
-        if !merged_tags.iter().any(|existing| existing == t) {
-            merged_tags.push(t.clone());
-        }
-    }
-
+    // #2587 — `body.tags.clone()` verbatim; auto-tags are no longer
+    // merged in before the durable insert (see the comment near the top
+    // of this function + `create_memory_postgres`'s twin comment).
     // #2550 — THE shared create-funnel projection (sqlite branch); see the
     // postgres branch above and `build_create_memory` for the rationale.
     let mut mem = build_create_memory(
         &body,
         metadata,
         resolved_title,
-        merged_tags,
+        body.tags.clone(),
         expires_at,
         &now,
     );
@@ -1849,6 +1858,18 @@ pub async fn create_memory(
     // federation fanout (async work).
     drop(lock);
 
+    // #2587 — enqueue the (possibly) deferred `auto_tag` job AFTER the
+    // durable write above has already succeeded. Non-blocking; never
+    // awaits the LLM.
+    let auto_tag_outcome = try_enqueue_auto_tag(
+        &app,
+        &actual_id,
+        &body.title,
+        &body.content,
+        &body.tags,
+        &body.namespace,
+    );
+
     // Stage 6 — HNSW warm-up + audit emit + federation fanout +
     // assembled CREATED response.
     fanout_and_assemble_create_response(
@@ -1856,7 +1877,7 @@ pub async fn create_memory(
         &mem,
         &actual_id,
         embedding,
-        &auto_tags,
+        auto_tag_outcome,
         contradiction_ids,
         embed_status,
     )
