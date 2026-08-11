@@ -26,7 +26,18 @@
 # Postgres verify-full DOES use the CA chain + hostname, so pg-server is CA-
 # signed and its SAN must match the host the daemon connects to ($PG_HOST).
 #
-# Ed25519 leaf keys (fast, small). Postgres/rustls both accept them.
+# Key algorithm: RSA (CA 4096 / leaf 2048), matching the certified pg-TLS lane
+# deploy/do-1461/provision/15_tls.sh. This is NOT a "fast/small" nicety — it is
+# REQUIRED for the Postgres leg. Under sslmode=verify-full + scram-sha-256 with
+# channel binding (tls-server-end-point, RFC 5929), libpq hashes the server
+# certificate using the digest named in its signatureAlgorithm. An Ed25519
+# certificate has NO such digest (its signatureAlgorithm carries no separate
+# hash OID), so libpq aborts the handshake with
+#   "could not find digest for NID UNDEF"
+# before it ever authenticates. RSA/SHA-256 (and EC/P-256/SHA-256) carry a real
+# digest and bind cleanly. rustls (the API/federation mTLS legs) accepts RSA
+# leaves just as it did Ed25519, so one RSA chain serves every leg. See
+# test-pg-verifyfull.sh's scram+channel-binding leg for the guarding regression.
 # Usage:
 #   ./gen-certs.sh                        # localhost-only material
 #   EXTRA_SAN_IP=167.71.175.191 EXTRA_SAN_DNS=hive-substrate \
@@ -46,20 +57,22 @@ cd "$OUT_DIR"
 fp() { openssl x509 -in "$1" -outform DER | openssl dgst -sha256 | awk '{print $NF}'; }
 
 # --- Root CA -----------------------------------------------------------------
-openssl genpkey -algorithm ed25519 -out ca.key
-openssl req -x509 -new -key ca.key -days "$DAYS" -out ca.crt \
+# RSA/SHA-256 chain (see header): required for the pg scram + channel-binding
+# leg, accepted by rustls for the mTLS legs.
+openssl genrsa -out ca.key 4096
+openssl req -x509 -new -key ca.key -sha256 -days "$DAYS" -out ca.crt \
   -subj "/CN=ai-memory-do-round-CA"
 
 # helper: mint a leaf cert <name> <CN> <SAN-extfile-body>
 mint() {
   local name="$1" cn="$2" san="$3"
-  openssl genpkey -algorithm ed25519 -out "${name}.key"
+  openssl genrsa -out "${name}.key" 2048
   openssl req -new -key "${name}.key" -out "${name}.csr" -subj "/CN=${cn}"
   cat > "${name}.ext" <<EOF
 subjectAltName=${san}
 EOF
   openssl x509 -req -in "${name}.csr" -CA ca.crt -CAkey ca.key -CAcreateserial \
-    -days "$DAYS" -out "${name}.crt" -extfile "${name}.ext"
+    -days "$DAYS" -sha256 -out "${name}.crt" -extfile "${name}.ext"
   rm -f "${name}.csr" "${name}.ext"
   chmod 600 "${name}.key"
 }
