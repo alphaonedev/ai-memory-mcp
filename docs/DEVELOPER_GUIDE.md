@@ -1099,14 +1099,16 @@ cargo bench
 
 The `benchmarks/longmemeval/` directory evaluates recall accuracy against the [LongMemEval](https://github.com/xiaowu0162/LongMemEval) dataset (ICLR 2025). Four harnesses are available:
 
-| Harness | Strategy | R@5 | Speed |
-|---------|----------|-----|-------|
-| `harness_99.py --no-expand` | Parallel FTS5, 10 cores | **97.0%** | 232 q/s (2.2s) |
-| `harness_99.py` | LLM expansion + parallel FTS5 | **97.2%** (Gemma 4, API venue; historical `gemma3:4b` 97.8%) | 142 q/s (3.5s) |
-| `harness_fast.py` | Single-process native SQLite | 96.2% | 57 q/s (8.8s) |
-| `harness.py` | CLI subprocess per operation | 96.2% | 1.2 q/s (414s) |
+| Harness | Kind | Strategy | R@5 | Speed |
+|---------|------|----------|-----|-------|
+| `harness_99.py --no-expand` | **shadow** | Parallel FTS5, 10 cores — re-implements the ranking SQL in Python, never invokes the binary | **97.0%** | 232 q/s (2.2s) |
+| `harness_99.py` | **shadow** | LLM expansion + parallel FTS5 (Python-reimplemented scoring) | **97.2%** (Gemma 4, API venue; historical `gemma3:4b` 97.8%) | 142 q/s (3.5s) |
+| `harness_fast.py` | shadow | Single-process native SQLite (direct DB, not the CLI binary) | 96.2% | 57 q/s (8.8s) |
+| `harness.py` | **binary-faithful** | CLI subprocess per operation — drives the shipped `ai-memory recall` | **96.4%** | 1.2 q/s (414s) |
 
-Published expansion anchor (per the [#1975](https://github.com/alphaonedev/ai-memory-mcp/issues/1975) ruling, 2026-07-10): **97.2% R@5, 99.6% R@10, 99.8% R@20** — measured 2026-05-31 with OpenRouter `google/gemma-4-26b-a4b-it` (500 questions, 0 expansion failures). The historical `gemma3:4b` best (97.8% R@5, 489/500) is retained in `benchmarks/longmemeval/results.md` as the compiled-default-model row, no longer the headline. The keyword-tier 97.0% is LLM-independent.
+> **Shadow vs binary-faithful ([#2450](https://github.com/alphaonedev/ai-memory-mcp/issues/2450)).** Only `harness.py` drives the shipped binary. The `harness_99.py` / `harness_fast.py` rows re-implement scoring outside the binary and are **shadow** harnesses — their numbers are never comparable across harnesses. The published README headline is the **binary-faithful 96.4% R@5** (`harness.py`, 482/500, re-measured on the v1.0.0 binary per [#2888](https://github.com/alphaonedev/ai-memory-mcp/issues/2888)); the shadow **97.0% / 97.2%** figures are not produced by the shipped binary. See README §Benchmark and `benchmarks/longmemeval/results.md`.
+
+Published expansion anchor (per the [#1975](https://github.com/alphaonedev/ai-memory-mcp/issues/1975) ruling, 2026-07-10): **97.2% R@5, 99.6% R@10, 99.8% R@20** — measured 2026-05-31 with OpenRouter `google/gemma-4-26b-a4b-it` (500 questions, 0 expansion failures). The historical `gemma3:4b` best (97.8% R@5, 489/500) is retained in `benchmarks/longmemeval/results.md` as the compiled-default-model row, no longer the headline. The keyword tier is LLM-independent on both paths — **96.4%** binary-faithful (`harness.py`) and **97.0%** shadow (`harness_99.py --no-expand`).
 
 ```bash
 # Quick run (keyword, ~2s)
