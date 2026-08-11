@@ -382,6 +382,98 @@ pub(super) async fn post_and_classify(
     }
 }
 
+/// #2667 — reason stamped on a `federation_push_dlq` row when a peer never
+/// acked inside the deadline and no explicit per-peer failure was observed
+/// (the task was deadline-evicted before it reported an outcome).
+pub(super) const DEADLINE_EXCEEDED_REASON: &str = "deadline_exceeded";
+
+/// #2667 — the SINGLE implementation of the federation push-DLQ landing pass,
+/// the #933 (store) / #2498 (delete) pattern now applied to EVERY fanout lane.
+/// For each dispatched peer that did NOT ack inside the deadline (explicit
+/// `Fail`/`Throttled` outcomes AND deadline-evicted tasks whose outcome was
+/// never observed), enqueue a `federation_push_dlq` row keyed on `dlq_key` so
+/// `replay_federation_push_dlq` re-POSTs `body` when the peer recovers.
+///
+/// Pre-#2667 ONLY the store + delete lanes did this; the other 11
+/// `broadcast_*_quorum` lanes emitted a lone `tracing::warn!` and then dropped
+/// the failure — permanent, silent replica divergence, including governance
+/// (`namespace_meta`) and authority (`pending` / `pending_decision` /
+/// checkpoint-resolution / action-transition) state that the anti-entropy
+/// catch-up loop — which pulls MEMORY rows only — never reconciles.
+///
+/// ## DLQ key contract (`dlq_key` → `federation_push_dlq.memory_id`)
+///
+/// The DLQ row upserts on `(memory_id, peer_id)` (last-failure-wins) and the
+/// replay worker's #2716 restore-race guard consults `row.memory_id` as a
+/// LIVE-memory lookup ONLY for delete-shaped payloads (`payload_is_delete`):
+///
+/// - `store` + `delete` pass the BARE memory id: the delete lane's guard needs
+///   the real id, and their documented store-then-delete last-wins collision is
+///   deliberate (the newer delete supersedes a superseded pending store).
+/// - every OTHER lane passes a LANE-PREFIXED key (`archive:{id}`,
+///   `link:{s}:{t}:{rel}`, `namespace_meta:{ns}`,
+///   `action_transition:{id}:{to}:{ts}`, …). The `:`-bearing prefix can NEVER
+///   collide with a bare memory UUID (a store/delete row) nor with another
+///   lane's rows, so distinct pending ops on the same subject never clobber
+///   each other's `payload_json`. It is also load-bearing for `consolidate`:
+///   its legacy-mode body carries `deletions[]`, so a BARE `new_mem.id` key
+///   would trip `payload_is_delete`, the guard would find `new_mem.id` LIVE,
+///   and the whole consolidation would be SUPERSEDED (never replayed). The
+///   prefix makes the guard's lookup miss → the replay proceeds.
+///
+/// Best-effort: a sink error NEVER propagates — the local write already
+/// committed and the quorum verdict is already computed. `expected_id` on the
+/// replay POST is inert for these subcollection lanes (a `sync_push` 200 body
+/// carries no per-item `ids` echo), so a synthetic `dlq_key` is safe there.
+pub(super) async fn land_push_failures(
+    config: &FederationConfig,
+    tracker: &AckTracker,
+    dispatched_peer_ids: &[String],
+    explicit_failures: Vec<(String, String)>,
+    dlq_key: &str,
+    body: &serde_json::Value,
+    lane: &str,
+) {
+    let Some(sink) = config.dlq_sink.as_ref() else {
+        return;
+    };
+    let acked = tracker.acked_peer_ids();
+    let explicit_map: std::collections::HashMap<String, String> =
+        explicit_failures.into_iter().collect();
+    for peer_id in dispatched_peer_ids {
+        if acked.contains(peer_id) {
+            continue;
+        }
+        let reason = explicit_map
+            .get(peer_id)
+            .cloned()
+            .unwrap_or_else(|| DEADLINE_EXCEEDED_REASON.to_string());
+        if let Err(e) = sink
+            .enqueue_push_failure(dlq_key, peer_id, body, &reason)
+            .await
+        {
+            tracing::warn!(
+                target: super::push_dlq::PUSH_DLQ_TRACE_TARGET,
+                dlq_key = %dlq_key,
+                peer_id = %peer_id,
+                lane = %lane,
+                "federation: failed to enqueue {lane} push-failure DLQ row for peer \
+                 {peer_id} on {dlq_key}: {e}",
+            );
+        } else {
+            tracing::info!(
+                target: super::push_dlq::PUSH_DLQ_TRACE_TARGET,
+                dlq_key = %dlq_key,
+                peer_id = %peer_id,
+                reason = %reason,
+                lane = %lane,
+                "federation: enqueued {lane} push-failure DLQ row for peer {peer_id} \
+                 on {dlq_key} (reason: {reason})",
+            );
+        }
+    }
+}
+
 /// Fan out a just-committed memory to every configured peer. Returns
 /// an `AckTracker` whose `finalise()` you then call against the
 /// deadline to get the quorum outcome.
@@ -640,43 +732,18 @@ pub async fn broadcast_store_quorum_with_embedding(
     // #2678 — ungated. Pre-#2678 this branch was sal-only, so the default
     // shipped binary preserved pre-#933 "silently lost" behaviour while
     // migrations created the table and metrics advertised depth=0 healthy.
-    if let Some(sink) = config.dlq_sink.as_ref() {
-        let acked = tracker.acked_peer_ids();
-        let explicit_map: std::collections::HashMap<String, String> =
-            explicit_failures.into_iter().collect();
-        for peer_id in &dispatched_peer_ids {
-            if acked.contains(peer_id) {
-                continue;
-            }
-            let reason = explicit_map
-                .get(peer_id)
-                .cloned()
-                .unwrap_or_else(|| "deadline_exceeded".to_string());
-            if let Err(e) = sink
-                .enqueue_push_failure(&mem.id, peer_id, &body, &reason)
-                .await
-            {
-                tracing::warn!(
-                    target: super::push_dlq::PUSH_DLQ_TRACE_TARGET,
-                    memory_id = %mem.id,
-                    peer_id = %peer_id,
-                    "federation: failed to enqueue push-failure DLQ row \
-                     for peer {peer_id} on memory {}: {e}",
-                    mem.id,
-                );
-            } else {
-                tracing::info!(
-                    target: super::push_dlq::PUSH_DLQ_TRACE_TARGET,
-                    memory_id = %mem.id,
-                    peer_id = %peer_id,
-                    reason = %reason,
-                    "federation: enqueued push-failure DLQ row for peer {peer_id} \
-                     on memory {} (reason: {reason})",
-                    mem.id,
-                );
-            }
-        }
-    }
+    // #2667 — via the shared landing pass. Store keeps the BARE memory-id key
+    // (documented store-then-delete last-wins collision with the delete lane).
+    land_push_failures(
+        config,
+        &tracker,
+        &dispatched_peer_ids,
+        explicit_failures,
+        &mem.id,
+        &body,
+        "store",
+    )
+    .await;
     Ok(tracker)
 }
 
@@ -874,38 +941,20 @@ pub async fn broadcast_delete_quorum(
     // the peer never applied the delete, so it holds no tombstone for that
     // id, and an operator-initiated `restore_archived` deliberately
     // bypasses the tombstone gate as an authorized un-forget.
-    if let Some(sink) = config.dlq_sink.as_ref() {
-        let acked = tracker.acked_peer_ids();
-        let explicit_map: std::collections::HashMap<String, String> =
-            explicit_failures.into_iter().collect();
-        for peer_id in &dispatched_peer_ids {
-            if acked.contains(peer_id) {
-                continue;
-            }
-            let reason = explicit_map
-                .get(peer_id)
-                .cloned()
-                .unwrap_or_else(|| "deadline_exceeded".to_string());
-            if let Err(e) = sink.enqueue_push_failure(id, peer_id, &body, &reason).await {
-                tracing::warn!(
-                    target: super::push_dlq::PUSH_DLQ_TRACE_TARGET,
-                    memory_id = %id,
-                    peer_id = %peer_id,
-                    "federation: failed to enqueue delete push-failure DLQ row \
-                     for peer {peer_id} on memory {id}: {e}",
-                );
-            } else {
-                tracing::info!(
-                    target: super::push_dlq::PUSH_DLQ_TRACE_TARGET,
-                    memory_id = %id,
-                    peer_id = %peer_id,
-                    reason = %reason,
-                    "federation: enqueued delete push-failure DLQ row for peer \
-                     {peer_id} on memory {id} (reason: {reason})",
-                );
-            }
-        }
-    }
+    // #2667 — via the shared landing pass. Delete keeps the BARE memory-id key
+    // (the #2716 restore-race guard reads `row.memory_id` as a live-memory
+    // lookup for delete-shaped payloads; the store-then-delete last-wins
+    // collision analysis above is unchanged).
+    land_push_failures(
+        config,
+        &tracker,
+        &dispatched_peer_ids,
+        explicit_failures,
+        id,
+        &body,
+        "delete",
+    )
+    .await;
     Ok(tracker)
 }
 
@@ -936,6 +985,10 @@ pub async fn broadcast_archive_quorum(
         "archives": [id],
         "dry_run": false,
     });
+
+    // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
+    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
     for peer in &config.peers {
@@ -976,6 +1029,7 @@ pub async fn broadcast_archive_quorum(
             }
             Ok(Some(Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))))) => {
                 tracing::warn!("federation: archive peer {peer_id} failed for {id}: {reason}");
+                explicit_failures.push((peer_id, reason));
             }
             Ok(Some(Err(e))) => {
                 tracing::warn!("federation: archive peer join error: {e}");
@@ -1005,6 +1059,16 @@ pub async fn broadcast_archive_quorum(
             detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
+    land_push_failures(
+        config,
+        &tracker,
+        &dispatched_peer_ids,
+        explicit_failures,
+        &format!("archive:{id}"),
+        &body,
+        "archive",
+    )
+    .await;
     Ok(tracker)
 }
 
@@ -1036,6 +1100,10 @@ pub async fn broadcast_restore_quorum(
         "restores": [id],
         "dry_run": false,
     });
+
+    // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
+    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
     for peer in &config.peers {
@@ -1076,6 +1144,7 @@ pub async fn broadcast_restore_quorum(
             }
             Ok(Some(Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))))) => {
                 tracing::warn!("federation: restore peer {peer_id} failed for {id}: {reason}");
+                explicit_failures.push((peer_id, reason));
             }
             Ok(Some(Err(e))) => {
                 tracing::warn!("federation: restore peer join error: {e}");
@@ -1105,6 +1174,16 @@ pub async fn broadcast_restore_quorum(
             detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
+    land_push_failures(
+        config,
+        &tracker,
+        &dispatched_peer_ids,
+        explicit_failures,
+        &format!("restore:{id}"),
+        &body,
+        "restore",
+    )
+    .await;
     Ok(tracker)
 }
 
@@ -1131,6 +1210,10 @@ pub async fn broadcast_link_quorum(
         "dry_run": false,
     });
     let log_id = format!("{}→{}", link.source_id, link.target_id);
+
+    // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
+    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
     for peer in &config.peers {
@@ -1171,6 +1254,7 @@ pub async fn broadcast_link_quorum(
             }
             Ok(Some(Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))))) => {
                 tracing::warn!("federation: link peer {peer_id} failed for {log_id}: {reason}");
+                explicit_failures.push((peer_id, reason));
             }
             Ok(Some(Err(e))) => {
                 tracing::warn!("federation: link peer join error: {e}");
@@ -1200,6 +1284,21 @@ pub async fn broadcast_link_quorum(
             detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
+    land_push_failures(
+        config,
+        &tracker,
+        &dispatched_peer_ids,
+        explicit_failures,
+        &format!(
+            "link:{}:{}:{}",
+            link.source_id,
+            link.target_id,
+            link.relation.as_str()
+        ),
+        &body,
+        "link",
+    )
+    .await;
     Ok(tracker)
 }
 
@@ -1251,6 +1350,10 @@ pub async fn broadcast_consolidate_quorum(
         "dry_run": false,
     });
 
+    // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
+    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    let mut explicit_failures: Vec<(String, String)> = Vec::new();
+
     let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
     for peer in &config.peers {
         let client = config.client.clone();
@@ -1293,6 +1396,7 @@ pub async fn broadcast_consolidate_quorum(
                     "federation: consolidate peer {peer_id} failed for {}: {reason}",
                     new_mem.id
                 );
+                explicit_failures.push((peer_id, reason));
             }
             Ok(Some(Err(e))) => {
                 tracing::warn!("federation: consolidate peer join error: {e}");
@@ -1322,6 +1426,20 @@ pub async fn broadcast_consolidate_quorum(
             detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
+    // #2667 — PREFIXED key: the legacy-mode body carries `deletions[]`, so a
+    // bare `new_mem.id` key would trip `payload_is_delete` and the replay
+    // restore-race guard would supersede the whole consolidation (new_mem is
+    // live). The `consolidate:` prefix makes the guard's lookup miss → replay.
+    land_push_failures(
+        config,
+        &tracker,
+        &dispatched_peer_ids,
+        explicit_failures,
+        &format!("{}:{}", crate::audit::OP_CONSOLIDATE, new_mem.id),
+        &body,
+        crate::audit::OP_CONSOLIDATE,
+    )
+    .await;
     Ok(tracker)
 }
 
@@ -1350,6 +1468,10 @@ pub async fn broadcast_pending_quorum(
         "pendings": [pending],
         "dry_run": false,
     });
+
+    // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
+    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
     for peer in &config.peers {
@@ -1393,6 +1515,7 @@ pub async fn broadcast_pending_quorum(
                     "federation: pending peer {peer_id} failed for {}: {reason}",
                     pending.id
                 );
+                explicit_failures.push((peer_id, reason));
             }
             Ok(Some(Err(e))) => {
                 tracing::warn!("federation: pending peer join error: {e}");
@@ -1422,6 +1545,16 @@ pub async fn broadcast_pending_quorum(
             detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
+    land_push_failures(
+        config,
+        &tracker,
+        &dispatched_peer_ids,
+        explicit_failures,
+        &format!("pending:{}", pending.id),
+        &body,
+        "pending",
+    )
+    .await;
     Ok(tracker)
 }
 
@@ -1449,6 +1582,10 @@ pub async fn broadcast_pending_decision_quorum(
         "pending_decisions": [decision],
         "dry_run": false,
     });
+
+    // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
+    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
     for peer in &config.peers {
@@ -1492,6 +1629,7 @@ pub async fn broadcast_pending_decision_quorum(
                     "federation: pending-decision peer {peer_id} failed for {}: {reason}",
                     decision.id
                 );
+                explicit_failures.push((peer_id, reason));
             }
             Ok(Some(Err(e))) => {
                 tracing::warn!("federation: pending-decision peer join error: {e}");
@@ -1521,6 +1659,16 @@ pub async fn broadcast_pending_decision_quorum(
             detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
+    land_push_failures(
+        config,
+        &tracker,
+        &dispatched_peer_ids,
+        explicit_failures,
+        &format!("pending_decision:{}", decision.id),
+        &body,
+        "pending_decision",
+    )
+    .await;
     Ok(tracker)
 }
 
@@ -1604,6 +1752,10 @@ pub async fn broadcast_action_transition_quorum(
         "dry_run": false,
     });
 
+    // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
+    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    let mut explicit_failures: Vec<(String, String)> = Vec::new();
+
     let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
     for peer in &config.peers {
         let client = config.client.clone();
@@ -1646,6 +1798,7 @@ pub async fn broadcast_action_transition_quorum(
                     "federation: action-transition peer {peer_id} failed for {}: {reason}",
                     op.action_id
                 );
+                explicit_failures.push((peer_id, reason));
             }
             Ok(Some(Err(e))) => {
                 tracing::warn!("federation: action-transition peer join error: {e}");
@@ -1675,6 +1828,26 @@ pub async fn broadcast_action_transition_quorum(
             detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
+    // #2667 — PER-TRANSITION key: the action state machine is NON-monotonic
+    // (CAS-guarded on `from_state`), so a last-wins `action_id` key would drop
+    // an intermediate transition and strand a peer whose CAS then never matches.
+    // Keying on (action_id, to_state, updated_at) preserves every distinct
+    // transition while idempotently coalescing retries of the same one.
+    land_push_failures(
+        config,
+        &tracker,
+        &dispatched_peer_ids,
+        explicit_failures,
+        &format!(
+            "action_transition:{}:{}:{}",
+            op.action_id,
+            op.to_state.as_str(),
+            op.updated_at
+        ),
+        &body,
+        "action_transition",
+    )
+    .await;
     Ok(tracker)
 }
 
@@ -1709,6 +1882,10 @@ pub async fn broadcast_checkpoint_resolution_quorum(
         "checkpoints": [checkpoint],
         "dry_run": false,
     });
+
+    // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
+    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
     for peer in &config.peers {
@@ -1752,6 +1929,7 @@ pub async fn broadcast_checkpoint_resolution_quorum(
                     "federation: checkpoint-resolution peer {peer_id} failed for {}: {reason}",
                     checkpoint.id
                 );
+                explicit_failures.push((peer_id, reason));
             }
             Ok(Some(Err(e))) => {
                 tracing::warn!("federation: checkpoint-resolution peer join error: {e}");
@@ -1781,6 +1959,16 @@ pub async fn broadcast_checkpoint_resolution_quorum(
             detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
+    land_push_failures(
+        config,
+        &tracker,
+        &dispatched_peer_ids,
+        explicit_failures,
+        &format!("checkpoint:{}", checkpoint.id),
+        &body,
+        "checkpoint_resolution",
+    )
+    .await;
     Ok(tracker)
 }
 
@@ -1809,6 +1997,10 @@ pub async fn broadcast_signal_create_quorum(
         "signals": [signal],
         "dry_run": false,
     });
+
+    // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
+    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    let mut explicit_failures: Vec<(String, String)> = Vec::new();
 
     let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
     for peer in &config.peers {
@@ -1852,6 +2044,7 @@ pub async fn broadcast_signal_create_quorum(
                     "federation: signal peer {peer_id} failed for {}: {reason}",
                     signal.id
                 );
+                explicit_failures.push((peer_id, reason));
             }
             Ok(Some(Err(e))) => {
                 tracing::warn!("federation: signal peer join error: {e}");
@@ -1881,6 +2074,16 @@ pub async fn broadcast_signal_create_quorum(
             detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
+    land_push_failures(
+        config,
+        &tracker,
+        &dispatched_peer_ids,
+        explicit_failures,
+        &format!("signal:{}", signal.id),
+        &body,
+        "signal",
+    )
+    .await;
     Ok(tracker)
 }
 
@@ -1911,6 +2114,10 @@ pub async fn broadcast_namespace_meta_quorum(
     });
 
     let target_id = entry.namespace.clone();
+    // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
+    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    let mut explicit_failures: Vec<(String, String)> = Vec::new();
+
     let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
     for peer in &config.peers {
         let client = config.client.clone();
@@ -1953,6 +2160,7 @@ pub async fn broadcast_namespace_meta_quorum(
                     "federation: namespace_meta peer {peer_id} failed for {}: {reason}",
                     entry.namespace
                 );
+                explicit_failures.push((peer_id, reason));
             }
             Ok(Some(Err(e))) => {
                 tracing::warn!("federation: namespace_meta peer join error: {e}");
@@ -1982,6 +2190,16 @@ pub async fn broadcast_namespace_meta_quorum(
             detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
+    land_push_failures(
+        config,
+        &tracker,
+        &dispatched_peer_ids,
+        explicit_failures,
+        &format!("namespace_meta:{}", entry.namespace),
+        &body,
+        "namespace_meta",
+    )
+    .await;
     Ok(tracker)
 }
 
@@ -2016,6 +2234,10 @@ pub async fn broadcast_namespace_meta_clear_quorum(
     // Use the joined namespace list as the ack-classifier's `target_id` so
     // post-quorum logs carry enough context to trace back to the operation.
     let target_id = namespaces.join(",");
+    // #2667 — DLQ landing bookkeeping (mirrors the store/delete lanes).
+    let dispatched_peer_ids: Vec<String> = config.peers.iter().map(|p| p.id.clone()).collect();
+    let mut explicit_failures: Vec<(String, String)> = Vec::new();
+
     let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
     for peer in &config.peers {
         let client = config.client.clone();
@@ -2058,6 +2280,7 @@ pub async fn broadcast_namespace_meta_clear_quorum(
                     "federation: namespace_meta_clear peer {peer_id} failed for [{}]: {reason}",
                     target_id
                 );
+                explicit_failures.push((peer_id, reason));
             }
             Ok(Some(Err(e))) => {
                 tracing::warn!("federation: namespace_meta_clear peer join error: {e}");
@@ -2087,6 +2310,16 @@ pub async fn broadcast_namespace_meta_clear_quorum(
             detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
         })?
         .into_inner();
+    land_push_failures(
+        config,
+        &tracker,
+        &dispatched_peer_ids,
+        explicit_failures,
+        &format!("namespace_meta_clear:{target_id}"),
+        &body,
+        "namespace_meta_clear",
+    )
+    .await;
     Ok(tracker)
 }
 
