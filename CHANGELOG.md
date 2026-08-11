@@ -7,6 +7,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### CI (control-integrity — commit-signing posture gate; #2486)
+
+- **A new CI gate hard-fails the check when a PR's own commits are
+  authored/committed under an identity GitHub cannot bind to the enrolled
+  `alphaonedev` account, or when the signature does not verify against
+  the enrolled key** ([#2486](https://github.com/alphaonedev/ai-memory-mcp/issues/2486);
+  [control-integrity]). Blocking is currently process-level via the
+  Fable review gate; promoting the check itself to a
+  branch-protection-BLOCKING required status check is the tracked
+  follow-up (below).
+  Investigation found the commit-signing identity-drift class #2486
+  describes is NOT present in the committed `release/v1.0.0` history at
+  HEAD (a clean committer-email census across the whole branch found only
+  the two legitimate identities), but reproduced it LIVE on the operating
+  host: the shared git worktree common-dir's local `.git/config` carried
+  `[user] name = Claude Opus 5, email = noreply@anthropic.com`, silently
+  overriding the correct global identity for every commit made on that
+  host — proven with `git var GIT_COMMITTER_IDENT` before/after the fix (the
+  override was unset; local config no longer shadows the correct global
+  identity) — and 787 local commits across concurrent worktrees on the same
+  host were found carrying the drifted identity as of the fix, confirming
+  the class recurs via more than one mechanism (a config-file override AND
+  independently via `GIT_COMMITTER_EMAIL`/`GIT_AUTHOR_EMAIL` process
+  env-vars, which a host config fix cannot reach) and is not hypothetical.
+  Per the "do not fabricate a fix; add the missing mechanical guard"
+  instruction, the fix is the guard: `scripts/check-commit-signing-posture.sh`
+  walks every commit in a PR's own range (`${PR_BASE_SHA}..${PR_HEAD_SHA}`,
+  never a GitHub web-flow squash-merge artefact, which is the separate,
+  explicitly out-of-scope #2486 item 3) and HARD-FAILS unless the committer
+  AND author email are each an enrolled principal in the new
+  `scripts/qc-allowlists/enrolled-commit-signers.txt` registry (an OpenSSH
+  `allowed_signers`(5)-format ALLOWLIST of account-bound identities, not a
+  blocklist of known-bad vendor domains — a blocklist can never enumerate
+  every identity a host's local git config might drift to) AND
+  `git log --format=%G?` verified against that SAME registry reports
+  exactly `G` (good signature, principal matched) — not merely "some
+  signature is present" (`N`/`B`/`E`/`X`/`Y`/`R` are all refusals), which
+  would let an unenrolled key sign under a spoofed enrolled email and pass.
+  Wired as the `Commit-signing posture gate (#2486)` job in
+  `.github/workflows/c8-precheck.yml` (no `needs:`, no job-level `if:`, no
+  `paths:` filter — always runs), with `--self-test` proving seven shapes:
+  a clean enrolled+signed commit passes; the exact #2486 identity-drift
+  shape (unbound email, unsigned) is rejected naming both violations
+  independently; an enrolled email with NO signature is rejected
+  (isolates the signature check); an enrolled email claimed but signed
+  with a non-enrolled rogue key is rejected (proves verification is
+  against the registry, not merely "a signature exists"); an unresolvable
+  commit range fails closed; and — the design's own hardening
+  (below) — a MISSING and an EMPTY enrolled-signers registry each fail
+  closed via an explicit `assert_registry_usable` guard. Declared, dated
+  and issue-tracked in `scripts/qc-allowlists/required-contexts-not-required.txt`
+  per rule (f) of `scripts/check-required-contexts.sh` — the gate runs
+  unconditionally and hard-fails loudly on every PR today; promoting it to
+  a branch-protection-BLOCKING required status check needs a live GitHub
+  ruleset API mutation (Sensitive-class, operator-gated) and is the tracked
+  follow-up, not done here.
+
+  **Design decided by a genuinely-run 5-agent adversarial vote** (protocol
+  memory `4d3ea1c5`; decision RECORD `283434e7-04b1-418c-a1d6-099ccd82de4f`
+  — cite the record for the tally, the protocol memory for the process).
+  5/5 for an enrolled-signer ALLOWLIST over three alternatives (a
+  blocklist of known-bad domains; signature-status-only with no identity
+  registry; no gate, relying solely on the live `required_signatures`
+  ruleset) — L1 security/bypass (88): only the allowlist binds identity to
+  key cryptographically, catching a spoofed-enrolled-email-with-rogue-key
+  self-test shape a signature-status-only check cannot detect and a
+  blocklist cannot prevent; L2 auditability (92): a positive enrollment
+  record answers "who is authorized", closing the exact forensic gap
+  #2486's silent regression needed; L3 maintainability (78): under
+  sole-authority enrollment friction is a feature, and the allowlist is
+  the ONLY option that detects the #2486 class (a signature-status-only
+  check is exactly what #2486 reproduced live — a valid SSH signature
+  under a drifted, unenrolled identity is still non-bad); L4 precedent
+  (92): copies `scripts/check-create-extension-allowlist.sh`'s established
+  "allowlist not denylist" precedent verbatim; L5 failure-mode (90): the
+  allowlist design fails CLOSED on a missing/empty registry while a
+  blocklist fails OPEN on the same condition (empty blocklist = zero
+  violations = silent full-permit, the exact #2486 shape) — chosen
+  `APPROVE_WITH_CHANGES`, folding in L5's own finding that the
+  fail-closed-on-registry-loss property was ACCIDENTAL (riding
+  `set -e`/`pipefail`, not explicitly asserted or self-tested); this PR
+  adds the explicit `assert_registry_usable` guard plus the two
+  self-test cases above so a future refactor cannot silently flip it
+  fail-open.
+
+- **`.github/branch-protection.yml` now documents that the live
+  `required_signatures` rule on ruleset `signed-attested-branches`
+  (id 17752665, confirmed live via `gh api .../rulesets/17752665`) is
+  self-satisfying under this repo's exclusively-API-squash-merge flow —
+  GitHub signs its own merge commits, so the rule verifies a signature it
+  produced itself and can never fail — and must not be counted as a
+  control in the release-gate inventory** (#2486 proposed-fix #2; same
+  class as #2444/#2449/#2452/#2443, "a control that reports success while
+  doing nothing"). Documentation-only, matching this file's own
+  "nothing here is live-enforced" doctrine: no live ruleset was mutated.
+  The actual commit-signing control is the new CI gate above.
+
 ### Fixed (data integrity)
 
 - **The postgres daemon-bootstrap embedding-dim auto-migrate no longer

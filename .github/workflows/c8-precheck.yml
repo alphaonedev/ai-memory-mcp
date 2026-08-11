@@ -687,3 +687,88 @@ jobs:
         # off-allowlist NAME, not the mere presence of a create-extension
         # DDL statement).
         run: bash scripts/check-create-extension-allowlist.sh --self-test
+
+  commit-signing-posture-gate:
+    # Issue #2486 — [control-integrity] commit-signing posture regressed
+    # SILENTLY on 2026-07-22 (a host-local `git config user.email` drift to
+    # an identity GitHub cannot bind to the enrolled `alphaonedev` account,
+    # e.g. `Claude Opus 5 <noreply@anthropic.com>`) and NOTHING detected it
+    # — no workflow gated COMMIT-signing posture before this job (`sign` DOES
+    # appear elsewhere in `.github/workflows` — e.g. `--sign`/product-signing
+    # flags unrelated to git commit identity; the gap was specifically that
+    # nothing checked WHO signed a PR's own commits).
+    # The #2486 investigation reproduced the identical defect LIVE on the
+    # operating host (this repo's shared `.git/config` carried exactly that
+    # override; fixed as part of this issue) and found 787 local commits
+    # across concurrent worktrees carrying it as of the fix — proving the
+    # class recurs via more than one mechanism (config file AND
+    # GIT_COMMITTER_EMAIL/GIT_AUTHOR_EMAIL env-var overrides, which a
+    # host-side file fix cannot reach) and is not hypothetical.
+    #
+    # For every commit in the PR's OWN range (`scripts/check-commit-signing-
+    # posture.sh`, never a GitHub web-flow squash/merge artifact — those
+    # exist only AFTER merge and are the separate, explicitly out-of-scope
+    # #2486 item 3 "merge-mechanism decision"): the committer AND author
+    # email must each be an enrolled principal in
+    # `scripts/qc-allowlists/enrolled-commit-signers.txt`, AND
+    # `git log --format=%G?` verified against that SAME registry must report
+    # exactly `G` (good signature, principal matched) — not merely "some
+    # signature is present", which would let an unenrolled key sign under a
+    # spoofed enrolled email and pass (the #2444 "reports success while
+    # doing nothing" shape).
+    #
+    # This is #2486's "load-bearing item" (its proposed-fix #1): a CI posture
+    # gate on the release branch's PR range. It does NOT stand in for
+    # `required_signatures` on the live GitHub ruleset, which #2486
+    # separately documents (`.github/branch-protection.yml`) as
+    # self-satisfying under API squash-merges and therefore not a control at
+    # all — that is #2486 proposed-fix #2, docs-only, no live ruleset
+    # mutation. `fetch-depth: 0` is required (default `actions/checkout@v4`
+    # is a shallow single-commit checkout of the PR merge ref, which cannot
+    # walk `${PR_BASE_SHA}..${PR_HEAD_SHA}`).
+    #
+    # DECLARED-BUT-NOT-YET-REQUIRED (#2648 precedent): this job runs
+    # unconditionally on every PR (no `needs:`, no job-level `if:`, no
+    # `paths:` filter) and HARD-FAILS loudly and visibly, but is not yet a
+    # branch-protection-blocking required status check — that needs a live
+    # GitHub ruleset API mutation (Sensitive-class, operator-gated), tracked
+    # as the follow-up. Declared in
+    # `scripts/qc-allowlists/required-contexts-not-required.txt` (dated,
+    # issue-tracked) so rule (f) of `scripts/check-required-contexts.sh`
+    # stays green in the interim rather than defaulting to unenforced.
+    name: Commit-signing posture gate (#2486)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run commit-signing posture gate
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash scripts/check-commit-signing-posture.sh
+      - name: Self-test the gate (#2486 regression evidence)
+        # --self-test constructs a throwaway repo with an ephemeral SSH
+        # keypair (no network, no dependency on the real enrolled key) and
+        # asserts SEVEN shapes: (a) an enrolled identity with a valid
+        # signature PASSES; (b) the exact #2486 identity-drift shape
+        # (unbound email, unsigned) is REJECTED naming both violations
+        # independently; (c) an enrolled email with NO signature at all is
+        # REJECTED (isolates the signature check from the email check); (d)
+        # an enrolled email CLAIMED but signed with a non-enrolled ROGUE key
+        # is REJECTED (proves verification is against the registry, not
+        # merely "a signature exists" — the spoofed-identity case a bare
+        # has-a-signature check would miss); (e) an unresolvable commit
+        # range fails CLOSED; (f) a MISSING enrolled-signers registry fails
+        # CLOSED; (g) an EMPTY (zero-principal) registry fails CLOSED — (f)
+        # and (g) are the explicit `assert_registry_usable` guard (Fable
+        # review finding L5, #2486): the fail-closed-on-registry-loss
+        # property was previously ACCIDENTAL (an artifact of `set -e`/
+        # `pipefail` reacting to grep's no-match exit inside
+        # `enrolled_principals`), not directly asserted, so a future
+        # refactor (e.g. `local x=$(...)`, which swallows the substitution's
+        # exit status, or a stray `|| true`) could have silently flipped it
+        # fail-open with nothing catching the regression.
+        run: bash scripts/check-commit-signing-posture.sh --self-test

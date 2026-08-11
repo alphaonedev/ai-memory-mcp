@@ -1,0 +1,42 @@
+# enrolled-commit-signers.txt — the SSOT enrolled-key registry for
+# `scripts/check-commit-signing-posture.sh` (#2486).
+#
+# ============================================================================
+# HAND-ENROLLED FROM OPERATOR CUSTODY. NEVER GENERATE THIS FILE FROM A LIVE
+# GITHUB API CALL (e.g. `https://github.com/<user>.keys`). A live-fetched
+# registry is exactly as trustworthy as the network path fetching it, and a
+# key ADD or REVOKE would become effective the moment DNS/GitHub answers
+# differently — silently, with no reviewed diff. This file is the pinned-key
+# discipline this repo already uses for `AI_MEMORY_WITNESS_PUBKEY` /
+# `AI_MEMORY_RECORDER_PUBKEY` / `AI_MEMORY_JUDGE_PUBKEY` / etc. applied to git
+# commit signing: an out-of-band enrolled key, reviewed in a PR diff on
+# rotation, never trusted from an unauthenticated live fetch.
+# ============================================================================
+#
+# FORMAT — native OpenSSH `allowed_signers`(5): one line per enrolled
+# principal, `<principal> <key-type> <base64-key> [comment]`. This is the
+# EXACT file format `git log --show-signature` / `%G?` consumes via
+# `gpg.ssh.allowedSignersFile` (git >= 2.34) — no custom parser needed on
+# either side, so the registry format and the verification format can never
+# drift apart the way a bespoke YAML/JSON mirror could.
+#
+# WHAT THIS DOES NOT CLAIM. This registry proves a commit's Ed25519 SSH
+# signature was produced by the holder of THIS exact private key, and that
+# the claimed committer/author principal is one this repo's control has
+# pinned as account-bound. It does NOT independently prove GitHub's own
+# "Verified" badge state (that is GitHub's separate web-flow / API-side
+# check, not reproduced here) and it does NOT prove which GitHub *account*
+# holds the key beyond the operator's own out-of-band enrollment record — an
+# SSH public key carries no identity of its own. Both are the same
+# ATTESTABLE-vs-OPERATIONAL boundary already documented throughout this
+# repo's `AI_MEMORY_*_PUBKEY` rows: signature verification against this file
+# is cryptographically enforced; WHO was enrolled here is operational trust,
+# recorded via a reviewed PR diff.
+#
+# The two principals below resolve to the SAME enrolled Ed25519 key — the
+# operator's personal bound identity and the GitHub-anonymized noreply
+# alias for the SAME `alphaonedev` account, so a commit stamped with either
+# is equally account-bound. Enrolling (or revoking) a key is a reviewed PR
+# to this file, never a silent host-side edit.
+Justin@alpha-one.mobi ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKk0uf7SeLEm8MsXJ7ej93DcIbwC2VDzNIaQEMy3Ccj7 alphaonedev (operator-bound identity)
+alphaonedev@users.noreply.github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKk0uf7SeLEm8MsXJ7ej93DcIbwC2VDzNIaQEMy3Ccj7 alphaonedev (GitHub-anonymized noreply alias, same account/key)
