@@ -18,7 +18,7 @@ first; the DO step re-hosts the identical config onto droplets.
 | `gen-certs.sh` | CA + server/client/peer/pg leaf certs, SANs, allowlists, fingerprints |
 | `test-api-mtls.sh` | **Leg 1** API mTLS: allowlisted client operates API / no-cert + unlisted-cert refused |
 | `test-federation-mtls.sh` | **Leg 2** federation quorum mTLS across 2 local daemons: authorised peer replicates / unauthorised + plaintext refused |
-| `test-pg-verifyfull.sh` | **Leg 3** daemon→Postgres `sslmode=verify-full`: pinned-CA connect / plaintext + host-mismatch + unpinned-CA refused |
+| `test-pg-verifyfull.sh` | **Leg 3** daemon→Postgres `sslmode=verify-full`: pinned-CA connect / scram-sha-256 + `channel_binding=require` connect (guards the RSA cert chain — Ed25519 aborts channel binding) / plaintext + host-mismatch + unpinned-CA refused |
 | `test-attestation.sh` | attestation ON (`#1751`): signed write (real bound keypair) accepted / unsigned rejected 403 |
 | `test-semantic-recall.sh` | caveat 2: in-process MiniLM-384 vectors + semantic recall ranking (no Ollama/nomic) |
 | `run-all-local.sh` | regenerates certs + runs every leg; non-zero exit if any fails |
