@@ -103,6 +103,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   doing nothing"). Documentation-only, matching this file's own
   "nothing here is live-enforced" doctrine: no live ruleset was mutated.
   The actual commit-signing control is the new CI gate above.
+### Added (§5.3 enterprise-federation certified posture — machine-checked, boot-refusing)
+
+- **`ai-memory doctor --posture enterprise-federation` + the opt-in
+  `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE` boot gate**
+  (3x7 cutline ruling §5.3,
+  `docs/audit/3x7-v1-cutline-ruling-2026-08-01.md`; T5 spec-mandated,
+  no vote needed for shape). §5.3: "Ship as a checked-in profile the
+  daemon validates and refuses to boot against… Prose checklists are
+  unfalsifiable; a non-zero exit is falsifiable." New module
+  `src/enterprise_federation_posture.rs::evaluate` is the single source
+  of truth both consumers share — it machine-checks the RESOLVED
+  process configuration (env + compiled build features + the parsed
+  `AI_MEMORY_FED_PEER_ATTESTATION` JSON shape) against the union of (a)
+  the existing 17-knob `asi-hard` hardened set
+  (`security_profile::KNOBS`, reused via `is_asi_hard` + the new
+  read-only `security_profile::asi_hard_below_floor` accessor — no
+  knob name or floor value is re-declared) and (b) the
+  federation-certification-specific additions §5.3 names beyond the
+  generic asi-hard set: `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` /
+  `AI_MEMORY_FED_REQUIRE_SIG` / `AI_MEMORY_FED_REQUIRE_NONCE` /
+  `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE` not explicitly disabled;
+  `AI_MEMORY_PERMISSIONS_MODE=enforce`;
+  `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` non-truthy;
+  `AI_MEMORY_FED_TRUST_DOMAIN` / `AI_MEMORY_FED_PEER_FINGERPRINTS` (a
+  readable pin file) / `AI_MEMORY_FED_PEER_ATTESTATION` (valid
+  JSON — a malformed value REFUSES, never silently falls back to
+  faith-based replication, #2504) all set; no peer scope's
+  `allowed_namespaces` contains a bare `**` allow-all glob;
+  `AI_MEMORY_FED_SYNC_TRUST_PEER` / `AI_MEMORY_FED_TRUST_BODY_AGENT_ID`
+  both UNSET; `AI_MEMORY_ENCRYPT_AT_REST=1` on a `--features sqlcipher`
+  build; `AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS` non-truthy
+  (https-only peers). Two ruling-vs-code reconciliations are quoted in
+  the module docs: the ruling's literal
+  `AI_MEMORY_FED_PERMISSIONS_MODE` and
+  `AI_MEMORY_FED_GOVERNANCE_FAIL_OPEN_ON_ERROR` do not exist anywhere
+  in `src/` — both resolve to their real non-`FED`-prefixed SSOT knobs.
+  `--posture <name>` is a FLAG on the existing `doctor` subcommand
+  (`src/daemon_runtime.rs::DoctorCliArgs`), not a new subcommand —
+  `EXPECTED_CLI_SUBCOMMANDS_*` is unchanged. New checked-in profile
+  `docs/deploy/enterprise-federation.env` (the ruling's own "ship as a
+  checked-in profile" requirement), layered on top of the existing
+  `docs/deploy/asi-hard.env`; pinned by two new tests in
+  `tests/deploy_templates.rs`. Boot-refusal is opt-in
+  (`AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE=1`, default `false`
+  = byte-identical legacy boot) and does NOT weaken the existing
+  `asi-hard` no-disable contract — it requires asi-hard to already be
+  engaged and refuses to boot naming EVERY failing control (not merely
+  the first) when the operator opts in. Test coverage: an exhaustive
+  per-requirement FAIL suite (one test per missing/loosened control,
+  each asserting the exact remediation is named) plus a
+  fully-hardened-env PASS test in `src/enterprise_federation_posture.rs`,
+  a `doctor --posture` dispatch-shape suite in `src/cli/doctor.rs`, and
+  a boot-refusal test.
+  **Fable review fixes (2026-08-11):** (B1, false-green, CONFIRMED-LIVE)
+  the peer-enrollment check now evaluates the SAME combined predicate
+  the live `/sync/push` + `/sync/since` receive gate uses —
+  `require_peer_enrollment_enabled() && !allow_unenrolled_peers_enabled()`
+  — instead of only the first half, closing a hole where
+  `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1` on an otherwise fully-hardened
+  env let the daemon accept unenrolled-peer attribution while the
+  posture check reported PASS (regression test:
+  `allow_unenrolled_peers_hatch_open_fails_even_with_enrollment_required`).
+  (B2) added the missing boot banner — every `PostureCheck`
+  (control/required/actual) is logged under the
+  `security.posture.enterprise_federation` target in `daemon_runtime::run`
+  next to the existing asi-hard report, satisfying the ruling's "boot
+  banner echoing the effective posture" requirement; corrected the
+  `docs/deploy/enterprise-federation.env` comment that (pre-fix) claimed
+  a banner that did not exist. Also folded in: the peer-enrollment /
+  per-message-sig / per-message-nonce / sync-trust-peer /
+  trust-body-agent-id checks now call the REAL production reader
+  functions (`require_sig`/`require_nonce`/`sync_trust_peer_bypass`/
+  `trust_body_agent_id_bypass`) instead of re-deriving grammar locally,
+  closing a false-red/false-green class where a re-derived helper
+  disagreed with the live gate's case-sensitivity or exact-match
+  semantics; dropped a misleading `[encryption].at_rest = true`
+  remediation parenthetical that could never actually clear the
+  encrypt-at-rest FAIL; documented the `**`-vs-`prefix/**` glob
+  reconciliation in the module docs; hoisted the
+  `AI_MEMORY_PERMISSIONS_MODE` env-name literal to
+  `AppConfig::ENV_PERMISSIONS_MODE`; added a `qual_10` module-size
+  ceiling row for the new module.
 ### Fixed (enterprise-availability — CERT-BLOCKING)
 
 - **`POST /api/v1/memories` no longer blocks 4.9-11.1s per write on a

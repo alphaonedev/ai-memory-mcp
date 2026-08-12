@@ -1644,6 +1644,13 @@ pub(super) fn verify_signature_or_reject(
     }
 }
 
+/// Env var gating peer-enrollment enforcement. Hoisted to a named const
+/// (v1.0.0 §5.3 cutline ruling) — was a bare literal at the single
+/// `std::env::var` call site inside [`require_peer_enrollment_enabled`];
+/// `crate::enterprise_federation_posture` reuses this const rather than
+/// re-declaring the env-var-name string.
+pub(crate) const REQUIRE_PEER_ENROLLMENT_ENV: &str = "AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT";
+
 /// v0.8.0 #1789 — `true` when peer-enrollment is required (the v0.8
 /// **secure default**). UNSET — or any non-falsy value — returns `true`:
 /// federation refuses an `X-Peer-Id` without an enrolled Ed25519 key.
@@ -1659,8 +1666,14 @@ pub(super) fn verify_signature_or_reject(
 /// `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` (`allow_unenrolled_peers_enabled`)
 /// preserves a rollout opt-out. The 5-agent vote (memory `4d3ea1c5`)
 /// fixed this flip.
-fn require_peer_enrollment_enabled() -> bool {
-    match std::env::var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT") {
+///
+/// `pub(crate)` (v1.0.0 §5.3 cutline ruling) — reused verbatim by
+/// `crate::enterprise_federation_posture::evaluate` so the
+/// `doctor --posture enterprise-federation` check + the boot gate
+/// share the EXACT same resolution logic as the receive-path gate
+/// instead of re-deriving the truthy/falsy grammar a second time.
+pub(crate) fn require_peer_enrollment_enabled() -> bool {
+    match std::env::var(REQUIRE_PEER_ENROLLMENT_ENV) {
         Ok(v) => {
             let t = v.trim();
             // Explicit falsy values revert to v0.7.x permissive; everything
@@ -1676,6 +1689,15 @@ fn require_peer_enrollment_enabled() -> bool {
     }
 }
 
+/// Env var gating the unenrolled-peer rollout escape hatch. Hoisted to a
+/// named const (v1.0.0 §5.3 cutline ruling B1 fix) — was a bare literal
+/// at the single `std::env::var` call site inside
+/// [`allow_unenrolled_peers_enabled`]; `crate::enterprise_federation_posture`
+/// reuses this const AND the function itself rather than re-deriving the
+/// combined `require_peer_enrollment_enabled() && !allow_unenrolled_peers_enabled()`
+/// gate a second time.
+pub(crate) const ALLOW_UNENROLLED_PEERS_ENV: &str = "AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS";
+
 /// v0.8.0 #1789 — companion permissive escape hatch (env #44).
 /// Returns `true` when `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` is truthy
 /// (`1` / `true` / `yes` / `on`, case-insensitive, trimmed), `false`
@@ -1684,8 +1706,13 @@ fn require_peer_enrollment_enabled() -> bool {
 /// secure default — the rollout window opt-out so the #1789 flip is not a
 /// hard break with no escape. Honored by both `verify_signature_or_reject`
 /// and `verify_get_signature_or_reject`.
-fn allow_unenrolled_peers_enabled() -> bool {
-    std::env::var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS")
+///
+/// `pub(crate)` (v1.0.0 §5.3 cutline ruling B1) — reused verbatim by
+/// `crate::enterprise_federation_posture::evaluate` so the peer-enrollment
+/// posture check shares the EXACT combined predicate the live receive
+/// gate uses, instead of checking only half of it.
+pub(crate) fn allow_unenrolled_peers_enabled() -> bool {
+    std::env::var(ALLOW_UNENROLLED_PEERS_ENV)
         .map(|v| {
             let t = v.trim();
             t == "1"

@@ -560,6 +560,12 @@ pub(crate) fn decrypt_bytes(envelope: &Envelope, my_sk: &StaticSecret) -> Result
         .map_err(|e| anyhow!("ChaCha20-Poly1305 decrypt failed (authentication): {e}"))
 }
 
+/// Env var gating at-rest encryption. Named const (v1.0.0 §5.3 cutline
+/// ruling) so `crate::enterprise_federation_posture` can check the
+/// certified-posture requirement `AI_MEMORY_ENCRYPT_AT_REST=1` without
+/// re-declaring the env-var-name literal.
+pub const ENV_ENCRYPT_AT_REST: &str = "AI_MEMORY_ENCRYPT_AT_REST";
+
 /// Consult the [encryption].at_rest config flag OR the
 /// `AI_MEMORY_ENCRYPT_AT_REST=1` env var. Truthy env values:
 /// `1` / `true` / `yes` / `on` (case-insensitive). Used by the storage
@@ -574,7 +580,7 @@ pub fn encryption_enabled(config_flag: Option<bool>) -> bool {
         return true;
     }
     matches!(
-        std::env::var("AI_MEMORY_ENCRYPT_AT_REST")
+        std::env::var(ENV_ENCRYPT_AT_REST)
             .ok()
             .as_deref()
             .map(str::to_ascii_lowercase)

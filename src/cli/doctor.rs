@@ -542,6 +542,70 @@ pub fn run(db_path: &Path, args: &DoctorArgs, out: &mut CliOutput<'_>) -> Result
     Ok(code)
 }
 
+/// v1.0.0 §5.3 (3x7 cutline ruling, 2026-08-01,
+/// `docs/audit/3x7-v1-cutline-ruling-2026-08-01.md`) —
+/// `ai-memory doctor --posture <NAME>`. Bypasses the regular health
+/// pass entirely (same short-circuit shape as [`run_tokens`] /
+/// [`run_hooks`]): never opens the DB, machine-checks the RESOLVED
+/// process configuration (env + build features + parsed peer config)
+/// against a named certified posture via
+/// [`crate::enterprise_federation_posture::evaluate`], and renders
+/// PASS/FAIL per requirement with the exact remediation.
+///
+/// Exit codes: `0` when every requirement passes, `2` on ANY deviation
+/// (§5.4(2): "exits non-zero on any deviation of the running process")
+/// or an unrecognised posture name.
+///
+/// # Errors
+/// Returns `Err` only when the report cannot be written to `out`.
+pub fn run_posture(name: &str, json: bool, out: &mut CliOutput<'_>) -> Result<i32> {
+    if name != crate::enterprise_federation_posture::POSTURE_ENTERPRISE_FEDERATION {
+        writeln!(
+            out.stderr,
+            "ai-memory doctor --posture: unrecognised posture {name:?} (expected \"{}\")",
+            crate::enterprise_federation_posture::POSTURE_ENTERPRISE_FEDERATION
+        )?;
+        return Ok(2);
+    }
+
+    let app_config = crate::config::AppConfig::load();
+    let checks = crate::enterprise_federation_posture::evaluate(&app_config);
+    let overall_pass = crate::enterprise_federation_posture::all_pass(&checks);
+
+    if json {
+        let payload = serde_json::json!({
+            "posture": name,
+            "pass": overall_pass,
+            "checks": checks,
+        });
+        writeln!(out.stdout, "{}", serde_json::to_string_pretty(&payload)?)?;
+    } else {
+        writeln!(out.stdout, "ai-memory doctor --posture {name}")?;
+        writeln!(
+            out.stdout,
+            "  (v1.0.0 3x7 cutline ruling §5.3 — docs/audit/3x7-v1-cutline-ruling-2026-08-01.md)"
+        )?;
+        writeln!(out.stdout)?;
+        for c in &checks {
+            let label = if c.pass { "PASS" } else { "FAIL" };
+            writeln!(out.stdout, "  [{label}] {}", c.control)?;
+            writeln!(out.stdout, "         required: {}", c.required)?;
+            writeln!(out.stdout, "         actual:   {}", c.actual)?;
+            if !c.pass {
+                writeln!(out.stdout, "         fix:      {}", c.remediation)?;
+            }
+        }
+        writeln!(out.stdout)?;
+        writeln!(
+            out.stdout,
+            "overall: {}",
+            if overall_pass { "PASS" } else { "FAIL" }
+        )?;
+    }
+
+    Ok(if overall_pass { 0 } else { 2 })
+}
+
 // ---------------------------------------------------------------------------
 // Local (--db) mode
 // ---------------------------------------------------------------------------
@@ -3971,5 +4035,190 @@ enabled = true
             assert_eq!(section.severity, want, "embed probe status {code}");
             assert_eq!(fact(&section, "http_status"), code.to_string());
         }
+    }
+
+    // ---------------------------------------------------------------
+    // v1.0.0 §5.3 — `doctor --posture enterprise-federation`.
+    // Isolated via the crate-wide `test_env_lock` (NOT `reach_env_lock`
+    // above, which only serialises within THIS module — the posture
+    // env vars are shared with `enterprise_federation_posture::tests`
+    // and `security_profile::tests`, see the #2159 lesson documented
+    // there).
+    // ---------------------------------------------------------------
+
+    fn posture_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::config::test_env_lock()
+    }
+
+    fn clear_posture_env() {
+        unsafe {
+            std::env::remove_var(crate::security_profile::ENV_SECURITY_PROFILE);
+            for (env, _) in crate::security_profile::pinned_knobs() {
+                std::env::remove_var(env);
+            }
+            for env in [
+                crate::handlers::federation_signing_check::REQUIRE_PEER_ENROLLMENT_ENV,
+                crate::federation::signing::REQUIRE_SIG_ENV,
+                crate::federation::signing::REQUIRE_NONCE_ENV,
+                crate::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+                "AI_MEMORY_PERMISSIONS_MODE",
+                crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN,
+                crate::federation::identity::trust_bundle::TRUST_DOMAIN_ENV,
+                crate::tls::FED_PEER_FINGERPRINTS_ENV,
+                crate::federation::peer_attestation::PEER_ATTESTATION_ENV,
+                crate::federation::peer_attestation::SYNC_TRUST_PEER_ENV,
+                crate::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV,
+                crate::encryption::ENV_ENCRYPT_AT_REST,
+                crate::tls::FED_ALLOW_PLAINTEXT_PEERS_ENV,
+            ] {
+                std::env::remove_var(env);
+            }
+        }
+    }
+
+    struct PostureEnvGuard;
+    impl Drop for PostureEnvGuard {
+        fn drop(&mut self) {
+            clear_posture_env();
+        }
+    }
+
+    #[test]
+    fn run_posture_unrecognised_name_exits_2() {
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let exit = run_posture("not-a-real-posture", false, &mut out).unwrap();
+        assert_eq!(exit, 2);
+        let stderr_str = String::from_utf8(stderr).unwrap();
+        assert!(stderr_str.contains("not-a-real-posture"));
+        assert!(stderr_str.contains("enterprise-federation"));
+    }
+
+    /// A near-empty environment (no `AI_MEMORY_SECURITY_PROFILE`, no
+    /// federation config) must FAIL, exit non-zero, and the report must
+    /// NAME the missing controls (§5.4(2) "exits non-zero on any
+    /// deviation" + the task's "FAILS naming the missing control").
+    /// Every individual check's exact per-requirement PASS/FAIL logic
+    /// is exhaustively pinned by `enterprise_federation_posture::tests`
+    /// (one test per missing requirement) — this test proves the
+    /// `doctor --posture` DISPATCH surfaces that verdict correctly.
+    #[test]
+    fn run_posture_enterprise_federation_fails_on_bare_env_naming_missing_controls() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "cli::doctor::tests::run_posture_enterprise_federation_fails_on_bare_env_naming_missing_controls",
+        ) {
+            return;
+        }
+        let _g = posture_env_lock();
+        clear_posture_env();
+        let _cleanup = PostureEnvGuard;
+
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let exit = run_posture(
+            crate::enterprise_federation_posture::POSTURE_ENTERPRISE_FEDERATION,
+            true,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(exit, 2, "a bare env must exit non-zero (§5.4(2))");
+
+        let v: serde_json::Value =
+            serde_json::from_slice(&stdout).expect("--posture --json must emit parseable JSON");
+        assert_eq!(v["pass"], false);
+        let checks = v["checks"].as_array().expect("checks array");
+        assert!(!checks.is_empty());
+        let asi_hard_row = checks
+            .iter()
+            .find(|c| c["control"] == "AI_MEMORY_SECURITY_PROFILE")
+            .expect("asi-hard-engaged check must be present");
+        assert_eq!(asi_hard_row["pass"], false);
+        assert!(
+            asi_hard_row["remediation"]
+                .as_str()
+                .unwrap()
+                .contains("asi-hard"),
+            "remediation must name the exact fix: {asi_hard_row}"
+        );
+        let trust_domain_row = checks
+            .iter()
+            .find(|c| c["control"] == crate::federation::identity::trust_bundle::TRUST_DOMAIN_ENV)
+            .expect("trust-domain check must be present");
+        assert_eq!(trust_domain_row["pass"], false);
+        assert!(
+            trust_domain_row["remediation"]
+                .as_str()
+                .unwrap()
+                .contains("AI_MEMORY_FED_TRUST_DOMAIN")
+        );
+    }
+
+    /// PASSES on a fully-hardened env (asi-hard engaged + every
+    /// federation-specific §5.3 addition satisfied). Skips only the
+    /// at-rest-encryption row when this test binary was not compiled
+    /// with `--features sqlcipher` — that row's own FAIL-vs-PASS
+    /// disposition on both build legs is pinned by
+    /// `enterprise_federation_posture::tests::fully_hardened_env_passes_every_check_except_possibly_sqlcipher_build`.
+    #[test]
+    fn run_posture_enterprise_federation_passes_on_fully_hardened_env() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "cli::doctor::tests::run_posture_enterprise_federation_passes_on_fully_hardened_env",
+        ) {
+            return;
+        }
+        let _g = posture_env_lock();
+        clear_posture_env();
+        let _cleanup = PostureEnvGuard;
+
+        unsafe {
+            std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "asi-hard");
+        }
+        crate::security_profile::enforce_at_boot().expect("asi-hard pins cleanly");
+
+        let fp_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(fp_file.path(), "example.org abc123\n").unwrap();
+        unsafe {
+            std::env::set_var(
+                crate::federation::identity::trust_bundle::TRUST_DOMAIN_ENV,
+                "test-fleet",
+            );
+            std::env::set_var(
+                crate::tls::FED_PEER_FINGERPRINTS_ENV,
+                fp_file.path().to_str().unwrap(),
+            );
+            std::env::set_var(
+                crate::federation::peer_attestation::PEER_ATTESTATION_ENV,
+                r#"{"peer-1":{"allowed_namespaces":["public/*"]}}"#,
+            );
+            std::env::set_var(crate::encryption::ENV_ENCRYPT_AT_REST, "1");
+        }
+
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let exit = run_posture(
+            crate::enterprise_federation_posture::POSTURE_ENTERPRISE_FEDERATION,
+            true,
+            &mut out,
+        )
+        .unwrap();
+
+        let v: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        let checks = v["checks"].as_array().expect("checks array");
+        let sqlcipher_compiled = crate::build_features::has_feature("sqlcipher");
+        for c in checks {
+            let is_sqlcipher_row = c["control"] == crate::encryption::ENV_ENCRYPT_AT_REST;
+            if is_sqlcipher_row && !sqlcipher_compiled {
+                assert_eq!(c["pass"], false, "row: {c}");
+            } else {
+                assert_eq!(c["pass"], true, "row: {c}");
+            }
+        }
+        assert_eq!(v["pass"], sqlcipher_compiled);
+        assert_eq!(exit, i32::from(!sqlcipher_compiled) * 2);
+
+        drop(stderr);
     }
 }

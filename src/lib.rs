@@ -640,6 +640,13 @@ pub mod embeddings;
 // `[encryption].at_rest = true` in config OR
 // `AI_MEMORY_ENCRYPT_AT_REST=1`. See `src/encryption/mod.rs`.
 pub mod encryption;
+// v1.0.0 §5.3 (3x7 cutline ruling, 2026-08-01,
+// `docs/audit/3x7-v1-cutline-ruling-2026-08-01.md`) — machine-checked,
+// boot-refusing ENTERPRISE-FEDERATION certified posture. `ai-memory
+// doctor --posture enterprise-federation` and the opt-in
+// `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE` boot gate both
+// consume `evaluate()` here as the single source of truth.
+pub mod enterprise_federation_posture;
 pub mod errors;
 pub mod federation;
 // v0.7.0 L2-5 (issue #670) — forensic evidence bundle assembly +
