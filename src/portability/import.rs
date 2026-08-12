@@ -140,6 +140,21 @@ pub struct ImportReport {
     pub governance_rejected: usize,
     /// Trust anchors seen in the envelope (advisory — never adopted).
     pub trust_anchors_seen: usize,
+    /// v1.0.0 #2571 — `archived_memories[]` rows staged (raw, byte-preserved).
+    pub archived_memories: usize,
+    /// v1.0.0 #2571 — archived rows skipped because admitting them would
+    /// create illegal dual residency: the id is currently LIVE at the
+    /// destination and the archive reason is a GENUINE archival (not
+    /// #2570's `in_place_edit` live-snapshot exception, which is admitted).
+    pub archived_memories_skipped_dual_residency: usize,
+    /// v1.0.0 #2571 — `namespace_meta[]` bindings staged. NEVER clobbers an
+    /// existing destination binding (`ON CONFLICT DO NOTHING`) — a
+    /// namespace the destination already governs keeps its own policy.
+    pub namespace_meta: usize,
+    /// v1.0.0 #2571 — `archived_memory_links[]` (schema v70 / #1771) rows
+    /// staged (raw, byte-preserved; no endpoint-presence gate — the table
+    /// carries no FK by design).
+    pub archived_memory_links: usize,
     /// Memory rows skipped because a tombstone forbade re-admission —
     /// counting BOTH the bundle's own tombstones AND the DESTINATION's
     /// pre-existing `forget_tombstones` (#2208: a destination-forgotten
@@ -773,6 +788,183 @@ fn apply_all_classes(
             )
             .with_context(|| format!("import link {}->{}", link.source_id, link.target_id))?;
         report.links += n;
+    }
+
+    // (2b) archived_memories — v1.0.0 #2571. Byte-preserved for every
+    // column EXCEPT content/encrypted_envelope, which are RE-SEALED against
+    // the DESTINATION's at-rest encryption policy (Fable review F2,
+    // 2026-08-11): the export DTO carries `content` DECRYPTED (exactly like
+    // `memories[]` — the export boundary always emits plaintext, never
+    // ciphertext, so the JSON bundle itself is the portable artifact), so
+    // an unconditional raw insert of that plaintext would land PLAINTEXT
+    // at rest on an encryption-enabled destination even though every other
+    // write path (`archive_memory_no_tx`'s native archive, and the live
+    // `memories[]` import lane via `insert_imported`/`insert_inner`) seals
+    // it. Mirrors the live-import reseal: `crate::encryption::seal_content`
+    // is generic over an arbitrary (content, agent_id) pair (fresh
+    // per-record DEK + nonce, no dependency on which table the ciphertext
+    // lands in) — a no-op `Ok(None)` when encryption is disabled or content
+    // is empty. No re-validation otherwise (an archived row was already
+    // vetted when originally stored, and its content already crossed the
+    // export confidentiality screen). Guard against illegal dual
+    // residency: a GENUINE archival must never coexist with a LIVE row at
+    // the same id — the same invariant `memory_is_genuinely_archived`
+    // enforces the other direction on the memories loop above; #2570's
+    // `in_place_edit` live-snapshot is the deliberate exception and is
+    // always admitted.
+    for dto in &env.archived_memories {
+        let row: crate::portability::read::ArchivedMemoryRow = dto.clone().into();
+        let mem = &row.memory;
+        let is_live = crate::storage::get(conn, &mem.id)
+            .with_context(|| format!("import: liveness probe for archived memory {}", mem.id))?
+            .is_some();
+        if is_live && row.archive_reason != "in_place_edit" {
+            report.archived_memories_skipped_dual_residency += 1;
+            report.warnings.push(format!(
+                "archived memory {} skipped: the id is LIVE at the destination and the \
+                 archive reason ({}) is not in_place_edit — admitting it would create \
+                 illegal dual residency (live + archived under the same id)",
+                mem.id, row.archive_reason
+            ));
+            continue;
+        }
+        let agent_id = crate::storage::memory_agent_id(mem);
+        let sealed = crate::encryption::seal_content(&mem.content, agent_id)?;
+        let content_to_store: &str = sealed.as_ref().map_or(mem.content.as_str(), |(_, ph)| ph);
+        let encrypted_envelope: Option<&[u8]> = sealed.as_ref().map(|(env, _)| env.as_slice());
+        let n = conn
+            .execute(
+                "INSERT OR IGNORE INTO archived_memories \
+                    (id, tier, namespace, title, content, tags, priority, confidence, \
+                     source, access_count, created_at, updated_at, last_accessed_at, \
+                     expires_at, archived_at, archive_reason, metadata, \
+                     embedding, embedding_dim, embedding_space, original_tier, \
+                     original_expires_at, reflection_depth, atomised_into, atom_of, \
+                     memory_kind, entity_id, persona_version, citations, source_uri, \
+                     source_span, confidence_source, confidence_signals, \
+                     confidence_decayed_at, mentioned_entity_id, version, \
+                     lifecycle_state, encrypted_envelope, kind_provenance, valid_from, valid_until) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19, \
+                         ?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36, \
+                         ?37,?38,?39,?40,?41)",
+                params![
+                    mem.id,
+                    mem.tier.as_str(),
+                    mem.namespace,
+                    mem.title,
+                    content_to_store,
+                    serde_json::to_string(&mem.tags)?,
+                    mem.priority,
+                    mem.confidence,
+                    mem.source,
+                    mem.access_count,
+                    mem.created_at,
+                    mem.updated_at,
+                    mem.last_accessed_at,
+                    mem.expires_at,
+                    row.archived_at,
+                    row.archive_reason,
+                    serde_json::to_string(&mem.metadata)?,
+                    row.embedding,
+                    row.embedding_dim,
+                    row.embedding_space,
+                    row.original_tier.as_ref().map(crate::models::Tier::as_str),
+                    row.original_expires_at,
+                    mem.reflection_depth,
+                    row.atomised_into,
+                    row.atom_of,
+                    mem.memory_kind.as_str(),
+                    mem.entity_id,
+                    mem.persona_version,
+                    serde_json::to_string(&mem.citations)?,
+                    mem.source_uri,
+                    mem.source_span
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                    mem.confidence_source.as_str(),
+                    mem.confidence_signals
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                    mem.confidence_decayed_at,
+                    row.mentioned_entity_id,
+                    mem.version,
+                    mem.lifecycle_state.as_str(),
+                    encrypted_envelope,
+                    row.kind_provenance,
+                    mem.valid_from,
+                    mem.valid_until,
+                ],
+            )
+            .with_context(|| format!("import archived_memory {}", mem.id))?;
+        report.archived_memories += n;
+    }
+
+    // (2c) namespace_meta — v1.0.0 #2571. NEVER clobber an existing
+    // destination governance binding (`ON CONFLICT DO NOTHING`) — an import
+    // must not silently override policy the destination operator already
+    // established for a namespace it independently governs.
+    // Table name derived from the SAME class-name SSOT the export
+    // conformance marker + read-all use (`export_scope::OMITTED_CLASS_NAMESPACE_META`)
+    // rather than a fresh `"namespace_meta"` literal (pm-v3.1 hardcoded-
+    // literal gate; Fable review F1, 2026-08-11).
+    let namespace_meta_insert_sql = format!(
+        "INSERT INTO {} (namespace, standard_id, parent_namespace, updated_at) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(namespace) DO NOTHING",
+        crate::export_scope::OMITTED_CLASS_NAMESPACE_META
+    );
+    for dto in &env.namespace_meta {
+        let row: crate::portability::read::NamespaceMetaRow = dto.clone().into();
+        let n = conn
+            .execute(
+                &namespace_meta_insert_sql,
+                params![
+                    row.namespace,
+                    row.standard_id,
+                    row.parent_namespace,
+                    row.updated_at
+                ],
+            )
+            .with_context(|| format!("import namespace_meta {}", row.namespace))?;
+        report.namespace_meta += n;
+    }
+
+    // (2d) archived_memory_links — v1.0.0 #2571, the v70 (#1771) archive-link
+    // snapshot. RAW `INSERT OR IGNORE` (natural PK `(source_id, target_id,
+    // relation)`); deliberately NO endpoint-presence gate — the table
+    // itself carries no FK by design (`src/storage/migrations.rs` v70
+    // arm), so a snapshot referencing an id absent at this destination is a
+    // harmless inert row, never an FK-abort risk (unlike the live
+    // `memory_links` loop above, pre-ship 3x7 F1).
+    for link in &env.archived_memory_links {
+        let n = conn
+            .execute(
+                "INSERT OR IGNORE INTO archived_memory_links \
+                    (source_id, target_id, relation, created_at, valid_from, valid_until, \
+                     observed_by, signature, attest_level, archived_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    link.source_id,
+                    link.target_id,
+                    link.relation,
+                    link.created_at,
+                    link.valid_from,
+                    link.valid_until,
+                    link.observed_by,
+                    link.signature.as_ref().map(|h| h.0.as_slice()),
+                    link.attest_level,
+                    link.archived_at,
+                ],
+            )
+            .with_context(|| {
+                format!(
+                    "import archived_memory_link {}->{}",
+                    link.source_id, link.target_id
+                )
+            })?;
+        report.archived_memory_links += n;
     }
 
     // (3) signed_events — RAW (byte-preserve prev_hash/sequence/cause_hash).

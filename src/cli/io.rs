@@ -449,8 +449,16 @@ pub(crate) fn import_from_str(
         // they are steady-state on any repeated restore, and an
         // in-place-edited row lands in `archived_memories` by #1725, so
         // counting them would pin a re-import forever-red (objection O9).
-        let covenant =
-            report.tombstoned_skipped + report.archived_skipped + report.tombstones_skipped_live;
+        // #2571 — a dual-residency-refused archived row is the inverse
+        // direction of `archived_skipped` (that one skips a LIVE memories[]
+        // entry colliding with a dest-archived id; this one skips an
+        // ARCHIVED entry colliding with a dest-LIVE id) but the same
+        // covenant-protective disposition: steady-state on any repeated
+        // restore, never a reconstruction failure.
+        let covenant = report.tombstoned_skipped
+            + report.archived_skipped
+            + report.tombstones_skipped_live
+            + report.archived_memories_skipped_dual_residency;
         let mut refused = report.invalid_skipped
             + report.invalid_links_skipped
             + report.conflicts_skipped
