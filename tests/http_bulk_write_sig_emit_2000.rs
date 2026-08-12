@@ -89,6 +89,7 @@ fn build_router(backend: StorageBackend) -> (axum::Router, NamedTempFile, std::p
             ai_memory::identity::replay::FederationNonceCache::default(),
         ),
         autonomous_hooks: false,
+        auto_tag_queue: None,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(Vec::new()),

@@ -31,7 +31,6 @@ use serde_json::json;
 // Test-only imports — previously declared `#[cfg(test)]` in the
 // pre-split mod.rs. Re-declared here at this file's top so the
 // inline tests below resolve identifiers identically.
-use super::http::maybe_auto_tag;
 use crate::config::ResolvedTtl;
 use crate::embeddings::Embedder;
 use crate::models::Tier;
@@ -421,6 +420,7 @@ fn test_app_state(db: Db) -> AppState {
         verify_require_nonce: false,
         federation_nonce_cache: Arc::new(crate::identity::replay::FederationNonceCache::new()),
         autonomous_hooks: false,
+        auto_tag_queue: None,
         recall_scope: Arc::new(None),
         // v0.7.0 Policy-Engine Item 3 — tests don't spawn the
         // drainer; the queue is None and the storage hook is
@@ -538,20 +538,20 @@ async fn http_create_memory_uses_appstate_and_persists() {
     assert_eq!(rows[0].title, "Semantic-ready via HTTP");
 }
 
-/// v0.7.0 L5 — `create_memory` must remain a success path when no
-/// LLM is wired on `AppState`. Auto-tag is a soft hook: a daemon
-/// running the keyword/semantic tier (no `llm_model` in
+/// v0.7.0 L5 (field renamed under #2587) — `create_memory` must remain a
+/// success path when no LLM is wired on `AppState`. Auto-tag is a soft
+/// hook: a daemon running the keyword/semantic tier (no `llm_model` in
 /// `TierConfig`) or a smart/autonomous tier with Ollama down
-/// (`llm = Arc::new(None)`) MUST still return 201 CREATED, must
-/// not insert any `auto_tags` field in the response, and must
-/// round-trip operator-supplied tags untouched.
+/// (`llm = Arc::new(None)`) MUST still return 201 CREATED, must not
+/// insert any `auto_tagging` field in the response, and must round-trip
+/// operator-supplied tags untouched.
 #[tokio::test]
 async fn http_create_memory_succeeds_when_llm_is_absent_l5() {
     let state = test_state();
-    // `test_app_state` populates `llm: Arc::new(None)` and uses
-    // the keyword tier (no `llm_model`) — both gates short-circuit
-    // `maybe_auto_tag` to an empty `Vec` so the store is a no-op
-    // for the LLM path.
+    // `test_app_state` populates `llm: Arc::new(None)`, `autonomous_hooks:
+    // false`, and uses the keyword tier (no `llm_model`) — every gate in
+    // `auto_tag_eligible` short-circuits to `false` so the store is a
+    // no-op for the LLM path (and no job is ever enqueued).
     let app = Router::new()
         .route("/api/v1/memories", axum_post(create_memory))
         .with_state(test_app_state(state.clone()));
@@ -592,8 +592,8 @@ async fn http_create_memory_succeeds_when_llm_is_absent_l5() {
         .unwrap();
     let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert!(
-        payload.get("auto_tags").is_none(),
-        "L5: auto_tags must be absent in the response when no LLM ran (got {payload})"
+        payload.get("auto_tagging").is_none(),
+        "L5: auto_tagging must be absent in the response when no LLM ran (got {payload})"
     );
 
     let lock = state.lock().await;
@@ -619,44 +619,62 @@ async fn http_create_memory_succeeds_when_llm_is_absent_l5() {
     );
 }
 
-/// v0.7.0 L5 — `maybe_auto_tag` gate matrix. Asserts each of the
-/// short-circuit conditions returns an empty `Vec` without ever
-/// touching the (absent) LLM client, mirroring MCP's skip-reason
-/// ladder at `crate::mcp::handle_store` (admin-allowlist ladder).
-#[tokio::test]
-async fn maybe_auto_tag_gate_matrix_l5() {
+/// #2587 (was v0.7.0 L5 `maybe_auto_tag` gate matrix) — `auto_tag_eligible`
+/// gate matrix. Asserts each short-circuit condition returns `false`
+/// without ever touching the (absent) LLM client, mirroring MCP's
+/// skip-reason ladder at `crate::mcp::handle_store` (admin-allowlist
+/// ladder). `auto_tag_eligible` is a pure sync function (no `.await` —
+/// the #2587 fix moved the LLM call itself off this gate entirely).
+#[test]
+fn auto_tag_eligible_gate_matrix_l5() {
     let state = test_state();
-    let app = test_app_state(state);
+    let mut app = test_app_state(state);
+
+    // 0. (#2587) `autonomous_hooks=false` (the `test_app_state` default)
+    //    → skip, even with otherwise-fully-permissive args. This is the
+    //    defect #2587 fixed: pre-#2587 this gate did not exist, so an
+    //    untagged write fired the LLM call regardless of
+    //    AI_MEMORY_AUTONOMOUS_HOOKS.
+    assert!(
+        !crate::handlers::http::auto_tag_eligible(&app, &[], &"x".repeat(200), "ns"),
+        "#2587: autonomous_hooks=false must skip auto_tag"
+    );
+
+    // The remaining cases flip `autonomous_hooks=true` so each of the
+    // OTHER gates is exercised independently (test_app_state's Keyword
+    // tier has no llm_model either way, so case 4 below is reached last
+    // regardless — case 1-3 fail earlier via short-circuit `&&`).
+    app.autonomous_hooks = true;
 
     // 1. Operator supplied tags → skip.
-    let r = maybe_auto_tag(
-        &app,
-        "t",
-        "x".repeat(200).as_str(),
-        &["op".to_string()],
-        "ns",
-    )
-    .await;
     assert!(
-        r.is_empty(),
+        !crate::handlers::http::auto_tag_eligible(
+            &app,
+            &["op".to_string()],
+            &"x".repeat(200),
+            "ns"
+        ),
         "L5: operator-supplied tags must skip auto_tag"
     );
 
     // 2. Content below AUTO_TAG_MIN_CONTENT_LEN → skip.
-    let r = maybe_auto_tag(&app, "t", "short", &[], "ns").await;
-    assert!(r.is_empty(), "L5: short content must skip auto_tag");
+    assert!(
+        !crate::handlers::http::auto_tag_eligible(&app, &[], "short", "ns"),
+        "L5: short content must skip auto_tag"
+    );
 
     // 3. Internal namespace → skip.
-    let r = maybe_auto_tag(&app, "t", &"x".repeat(200), &[], "_internal").await;
-    assert!(r.is_empty(), "L5: internal namespace must skip auto_tag");
-
-    // 4. Keyword-tier AppState has `llm_model.is_none()` → skip
-    //    even when content is long enough and tags + namespace are
-    //    permissive.
-    let r = maybe_auto_tag(&app, "t", &"x".repeat(200), &[], "ns").await;
     assert!(
-        r.is_empty(),
-        "L5: tier with no llm_model must skip auto_tag (got {r:?})"
+        !crate::handlers::http::auto_tag_eligible(&app, &[], &"x".repeat(200), "_internal"),
+        "L5: internal namespace must skip auto_tag"
+    );
+
+    // 4. Keyword-tier AppState has `llm_model.is_none()` → skip even
+    //    when autonomous_hooks + content + tags + namespace are all
+    //    permissive.
+    assert!(
+        !crate::handlers::http::auto_tag_eligible(&app, &[], &"x".repeat(200), "ns"),
+        "L5: tier with no llm_model must skip auto_tag"
     );
 }
 
@@ -1336,6 +1354,7 @@ async fn http_bulk_create_fans_out_with_federation() {
             crate::identity::replay::FederationNonceCache::default(),
         ),
         autonomous_hooks: false,
+        auto_tag_queue: None,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(Vec::new()),
@@ -10728,6 +10747,7 @@ fn h8d_app_state_with_fed(db: Db, peer_urls: Vec<String>, w: usize, timeout_ms: 
         verify_require_nonce: false,
         federation_nonce_cache: Arc::new(crate::identity::replay::FederationNonceCache::new()),
         autonomous_hooks: false,
+        auto_tag_queue: None,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(Vec::new()),

@@ -20,8 +20,10 @@
 //!   `BULK_FANOUT_CONCURRENCY`), low-level helpers, health, metrics.
 //! - [`postgres_gate`] — `#[cfg(feature = "sal")]` postgres
 //!   route-matrix + middleware + `store_err_to_response` sanitiser.
-//! - [`http`]        — `maybe_auto_tag` + `maybe_detect_conflicts` +
-//!   `ConflictReport` (the LLM hooks the create path consumes).
+//! - [`http`]        — `auto_tag_eligible` + `try_enqueue_auto_tag` +
+//!   `maybe_detect_conflicts` + `ConflictReport` (the LLM hooks the
+//!   create path consumes; `auto_tag` itself runs on the bounded
+//!   background worker, `crate::background::auto_tag_worker`, #2587).
 //! - [`create`]      — `POST /api/v1/memories` create-path orchestrator
 //!   + six stage helpers + postgres branch.
 //! - [`memories`]    — memory CRUD (`get`/`update`/`delete`/`promote`).
