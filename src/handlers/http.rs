@@ -148,10 +148,17 @@ impl AutoTagOutcome {
 ///
 /// `try_send` is synchronous and returns immediately either way — this
 /// function never awaits the LLM and never blocks the caller. Mirrors
-/// the 5-agent adversarial vote (`4d3ea1c5`, 2026-08-11) decision for
-/// issue #2587: tags are derived/regenerable data, not durable truth, so
-/// the multi-second LLM round-trip that used to run inline on the
-/// request path (4.9-11.1s measured) is deferred entirely.
+/// the 5-agent adversarial vote (`4d3ea1c5`, decision memory `4e51e315`,
+/// 2026-08-11) decision for issue #2587: tags are derived/regenerable
+/// data, not durable truth, so the multi-second LLM round-trip that used
+/// to run inline on the request path (4.9-11.1s measured) is deferred
+/// entirely.
+///
+/// `agent_id` is the ORIGINAL WRITER's resolved identity (the same value
+/// `metadata.agent_id` was stamped with on the durable insert) — threaded
+/// through so the worker's eventual apply runs under
+/// `CallerContext::for_agent(agent_id)`, never an admin/privacy-bypass
+/// context (see `crate::background::auto_tag_worker::apply_tags_postgres`).
 pub(crate) fn try_enqueue_auto_tag(
     app: &AppState,
     id: &str,
@@ -159,6 +166,7 @@ pub(crate) fn try_enqueue_auto_tag(
     content: &str,
     operator_tags: &[String],
     namespace: &str,
+    agent_id: &str,
 ) -> AutoTagOutcome {
     if !auto_tag_eligible(app, operator_tags, content, namespace) {
         return AutoTagOutcome::NotEligible;
@@ -180,6 +188,11 @@ pub(crate) fn try_enqueue_auto_tag(
         title: title.to_string(),
         content: content.to_string(),
         namespace: namespace.to_string(),
+        // #2587 (Fable finding) — the worker applies tags under this
+        // agent's OWN identity (CallerContext::for_agent), never an
+        // admin/privacy-bypass context. See
+        // `crate::background::auto_tag_worker::apply_tags_postgres`.
+        agent_id: agent_id.to_string(),
     };
     match tx.try_send(job) {
         Ok(()) => {

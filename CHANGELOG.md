@@ -108,7 +108,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`POST /api/v1/memories` no longer blocks 4.9-11.1s per write on a
   synchronous LLM `auto_tag` call**
   ([#2587](https://github.com/alphaonedev/ai-memory-mcp/issues/2587);
-  5-agent adversarial vote `4d3ea1c5`). Two compounding defects, both
+  5-agent adversarial vote `4d3ea1c5`, decision memory `4e51e315`). Two
+  compounding defects, both
   closed: (1) `maybe_auto_tag` (HTTP `create_memory`, both sqlite and
   postgres branches) was NOT gated on `AI_MEMORY_AUTONOMOUS_HOOKS`
   despite CLAUDE.md documenting that gate — its sibling
@@ -130,11 +131,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deferred to a new bounded background worker
   (`crate::background::auto_tag_worker`, one consumer per daemon — no
   vendor-burst hazard under a concurrent write storm), which applies
-  tags via a MERGE (never a blind overwrite: sqlite uses a real
-  optimistic-concurrency CAS with one retry; postgres read-then-writes
-  immediately before applying, a documented residual narrowing but not
-  closing a race against a concurrent caller edit — the SAL
-  `UpdatePatch` carries no `expected_version` field today). New knob
+  tags via a MERGE, CAS-guarded on both backends so a concurrent
+  caller edit is never clobbered: sqlite uses `storage::
+  update_with_expected_version` (a real optimistic-concurrency CAS, one
+  retry on conflict); postgres routes through the concrete
+  `PostgresStore`'s inherent `update_with_expected_version` — the same
+  If-Match CAS primitive `PUT /memories/{id}` already uses (#1628) — via
+  the established `app.store.as_any().downcast_ref::<PostgresStore>()`
+  hatch, since the generic `MemoryStore` trait's `update` is
+  last-write-wins and `UpdatePatch` carries no `expected_version` field.
+  The apply runs under `CallerContext::for_agent(job.agent_id)` — the
+  original writer's own identity, threaded through the deferred job —
+  never an admin/privacy-bypass context, since a targeted, by-id
+  continuation of the caller's own write needs no bypass authority. New
+  knob
   `AI_MEMORY_AUTOTAG_QUEUE_CAPACITY` (default 256) bounds the worker's
   queue; a full queue drops the job (never blocks the write) and is
   counted (`ai_memory_autotag_dropped_total`) + logged. **Wire-contract

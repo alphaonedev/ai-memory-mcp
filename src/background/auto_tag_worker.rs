@@ -34,10 +34,27 @@
 //!   optimistic-concurrency CAS. On a version conflict the job re-reads
 //!   once, re-merges, and retries once; a second conflict gives up
 //!   (logged + counted, never fought against the caller).
-//! - **postgres**: `MemoryStore::update` has no `expected_version` field
-//!   on `UpdatePatch` — read-then-write immediately before the apply
-//!   narrows the race window but does not close it. Documented RESIDUAL
-//!   (the #2577 query-embed-cache precedent for "residual, not closed").
+//! - **postgres**: the generic `MemoryStore::update` trait method has no
+//!   `expected_version` field on `UpdatePatch`, but `PostgresStore` (the
+//!   concrete adapter) carries an INHERENT
+//!   `update_with_expected_version(ctx, id, patch, expected_version)` —
+//!   the same If-Match CAS primitive `PUT /memories/{id}` uses
+//!   (`src/handlers/memories.rs`, #1628) — reached via the established
+//!   `app.store.as_any().downcast_ref::<PostgresStore>()` hatch. This
+//!   worker uses it, so the postgres tag-merge is CAS-guarded exactly
+//!   like sqlite: a version conflict is reported (with the postgres
+//!   adapter's own bounded internal gate-CAS retry, `MAX_GATE_RETRIES`),
+//!   never silently overwrites a concurrent caller edit.
+//!
+//! The read+apply runs under `CallerContext::for_agent(job.agent_id)` —
+//! the ORIGINAL WRITER's own identity (threaded through `AutoTagJob` from
+//! the enqueue site), not an admin/privacy-bypass context. Applying
+//! auto-generated tags to the row the same agent just wrote never needs
+//! to see past that agent's own visibility scope, so `for_admin`'s
+//! `bypass_visibility` was unwarranted privilege for a targeted,
+//! by-id, single-row background continuation of the caller's own write —
+//! and reusing the identity that already authored the row is
+//! structurally narrower than a system-wide bypass grant.
 //!
 //! The queue is bounded (`AI_MEMORY_AUTOTAG_QUEUE_CAPACITY`) and has ONE
 //! consumer, so at most one LLM `auto_tag` call is in flight per daemon
@@ -87,6 +104,13 @@ pub struct AutoTagJob {
     pub title: String,
     pub content: String,
     pub namespace: String,
+    /// The ORIGINAL WRITER's resolved agent id (the same identity
+    /// `metadata.agent_id` was stamped with on the durable insert this
+    /// job follows). Used to construct a `CallerContext::for_agent(..)`
+    /// for the apply step — least-privilege: the worker acts as a
+    /// continuation of the caller's own write, never as an
+    /// admin/privacy-bypass principal.
+    pub agent_id: String,
 }
 
 /// Resolve the bounded-channel capacity from `AI_MEMORY_AUTOTAG_QUEUE_CAPACITY`.
@@ -281,17 +305,27 @@ async fn apply_tags_sqlite(app: &AppState, job: &AutoTagJob, tags: &[String]) ->
     false
 }
 
-/// postgres apply path. `UpdatePatch` carries no `expected_version` field
-/// on this backend (no CAS primitive on the SAL trait today), so this is
-/// read-current-then-merge-then-write immediately before the apply —
-/// narrows but does not close the race window against a concurrent
-/// caller edit. Documented RESIDUAL (mirrors the #2577 query-embed-cache
-/// "residual, documented, not closed" precedent) rather than a ship
-/// blocker: tags are non-durable derived data, so the worst case is a
-/// rare lost tag-merge, never corruption of the durable row.
+/// postgres apply path. CAS-guarded exactly like sqlite: reads the row's
+/// current `version`, merges tags, and applies via the concrete
+/// `PostgresStore`'s inherent `update_with_expected_version` — the SAME
+/// If-Match primitive `PUT /memories/{id}` uses on postgres (#1628,
+/// `src/handlers/memories.rs`) — rather than the generic trait `update`
+/// (which is last-write-wins; `UpdatePatch` carries no `expected_version`
+/// field). A version conflict (the row changed under us — most likely
+/// the caller's own concurrent edit) is reported and the job gives up
+/// rather than fighting the caller for the row, mirroring the sqlite
+/// path's discipline; the postgres adapter's own bounded internal
+/// gate-CAS retry (`MAX_GATE_RETRIES` in `PostgresStore::
+/// update_with_expected_version`) already re-reads once on a lost race
+/// before surfacing the conflict here.
+///
+/// Uses `CallerContext::for_agent(job.agent_id)` — the ORIGINAL WRITER's
+/// own identity, not an admin/privacy-bypass context — because applying
+/// auto-tags to the row that agent just wrote never needs to see past
+/// that agent's own visibility scope.
 #[cfg(feature = "sal")]
 async fn apply_tags_postgres(app: &AppState, job: &AutoTagJob, tags: &[String]) -> bool {
-    let ctx = crate::store::CallerContext::for_admin(crate::identity::sentinels::AI_HTTP_INTERNAL);
+    let ctx = crate::store::CallerContext::for_agent(job.agent_id.clone());
     let current = match app.store.get(&ctx, &job.id).await {
         Ok(m) => m,
         Err(crate::store::StoreError::NotFound { .. }) => return false,
@@ -308,6 +342,40 @@ async fn apply_tags_postgres(app: &AppState, job: &AutoTagJob, tags: &[String]) 
         tags: Some(merged),
         ..crate::store::UpdatePatch::default()
     };
+
+    // #1628 downcast hatch (mirrors `src/handlers/memories.rs`'s If-Match
+    // branch verbatim): the CAS-capable inherent method lives on the
+    // concrete `PostgresStore`, not the generic `MemoryStore` trait
+    // object `app.store` holds. Only compiled when `sal-postgres` is
+    // (the feature that actually brings `store::postgres` into the
+    // build); a `sal`-only build (trait + SqliteStore, no postgres
+    // adapter compiled) cannot select `StorageBackend::Postgres` in
+    // practice, but the fallback below keeps this function correct —
+    // never a compile-time or a runtime dead end — under that
+    // configuration too.
+    #[cfg(feature = "sal-postgres")]
+    {
+        if let Some(pg) = app
+            .store
+            .as_any()
+            .downcast_ref::<crate::store::postgres::PostgresStore>()
+        {
+            return match pg
+                .update_with_expected_version(&ctx, &job.id, patch, Some(current.version))
+                .await
+            {
+                Ok(_new_version) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        "autotag.worker.version_conflict_or_update_failed: {} update failed: {e}",
+                        job.id
+                    );
+                    false
+                }
+            };
+        }
+    }
+
     match app.store.update(&ctx, &job.id, patch).await {
         Ok(()) => true,
         Err(e) => {
@@ -364,5 +432,197 @@ mod tests {
         ];
         let merged = merge_unique_tags(&current, &additions);
         assert_eq!(merged, vec!["rust", "memory", "coverage"]);
+    }
+}
+
+/// #2587 (Fable finding) — live-postgres proof that the CAS mechanism
+/// `apply_tags_postgres` relies on (`PostgresStore::update_with_expected_version`,
+/// the same If-Match primitive `PUT /memories/{id}` uses, #1628) genuinely
+/// refuses a STALE tag-merge write rather than clobbering a concurrent
+/// caller edit — the exact race the sqlite CAS path already closed and
+/// the postgres path previously documented only as a narrowed-but-open
+/// residual.
+///
+/// Deliberately does NOT rely on wall-clock interleaving with the async
+/// worker/queue (that would be flaky-by-construction): it drives the
+/// SAME primitive + the SAME `CallerContext::for_agent` shape
+/// `apply_tags_postgres` uses, with a manufactured stale
+/// `expected_version` — exactly what the worker would present had its
+/// own internal read landed BEFORE a concurrent caller update. This is
+/// deterministic and mirrors the `src/store/postgres.rs` live-integration
+/// test precedent (`postgres_url()` + `sample_memory` shape) rather than
+/// racing a background task against a mock LLM's response latency.
+///
+/// Run: `AI_MEMORY_TEST_POSTGRES_URL=postgres://... cargo test --features
+/// sal-postgres --lib background::auto_tag_worker::pg_cas_tests`. Skips
+/// cleanly (not a failure) when the env var is unset, matching the house
+/// convention for every other live-postgres test in this crate.
+#[cfg(all(test, feature = "sal-postgres"))]
+mod pg_cas_tests {
+    use crate::models::{ConfidenceSource, Memory, MemoryKind, Tier};
+    use crate::store::postgres::PostgresStore;
+    use crate::store::{CallerContext, MemoryStore, UpdatePatch};
+
+    fn postgres_url() -> Option<String> {
+        std::env::var("AI_MEMORY_TEST_POSTGRES_URL").ok()
+    }
+
+    fn sample_memory(id: &str, ns: &str, agent_id: &str) -> Memory {
+        let now = chrono::Utc::now().to_rfc3339();
+        Memory {
+            id: id.to_string(),
+            tier: Tier::Mid,
+            namespace: ns.to_string(),
+            title: "autotag-cas-2587".to_string(),
+            content: "content long enough for the #2587 auto_tag eligibility gate — proving \
+                      the postgres tag-merge CAS path never clobbers a concurrent caller edit."
+                .to_string(),
+            tags: Vec::new(),
+            priority: 5,
+            confidence: 1.0,
+            source: "sal-integration".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: serde_json::json!({"agent_id": agent_id}),
+            reflection_depth: 0,
+            memory_kind: MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
+            cid: None,
+            valid_from: None,
+            valid_until: None,
+        }
+    }
+
+    /// The load-bearing assertion: a tag-merge write presenting a STALE
+    /// `expected_version` (the shape `apply_tags_postgres` would have
+    /// produced had it read the row BEFORE the concurrent caller edit
+    /// landed) is REFUSED — the row is left exactly as the concurrent
+    /// edit left it, never overwritten with the stale writer's view.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_expected_version_never_clobbers_concurrent_caller_edit_2587() {
+        let Some(url) = postgres_url() else {
+            eprintln!(
+                "SKIP stale_expected_version_never_clobbers_concurrent_caller_edit_2587: \
+                 AI_MEMORY_TEST_POSTGRES_URL unset"
+            );
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let agent_id = format!("ai:autotag-cas-writer-{}", uuid::Uuid::new_v4());
+        let ctx = CallerContext::for_agent(agent_id.clone());
+        let ns = format!("autotag-cas-2587-{}", uuid::Uuid::new_v4());
+        let id = format!("autotag-cas-{}", uuid::Uuid::new_v4());
+        let mem = sample_memory(&id, &ns, &agent_id);
+
+        // Durable write (the "original create_memory insert" this whole
+        // #2587 feature defers auto_tag work AFTER).
+        store.store(&ctx, &mem).await.expect("seed store");
+
+        // The worker's own read (`apply_tags_postgres`'s `app.store.get`
+        // call) — captures version BEFORE the concurrent edit below.
+        let stale_view = store.get(&ctx, &id).await.expect("worker's stale read");
+        assert_eq!(stale_view.version, 1, "fresh row starts at version 1");
+        assert!(stale_view.tags.is_empty());
+
+        // The CONCURRENT caller edit — e.g. a `PUT /memories/{id}` adding
+        // the caller's own tag while the auto_tag worker's LLM call was
+        // still in flight. Bumps the row to version 2.
+        let caller_patch = UpdatePatch {
+            tags: Some(vec!["caller-added-tag".to_string()]),
+            ..UpdatePatch::default()
+        };
+        store
+            .update(&ctx, &id, caller_patch)
+            .await
+            .expect("concurrent caller update");
+        let after_caller_edit = store.get(&ctx, &id).await.expect("read after caller edit");
+        assert_eq!(after_caller_edit.version, 2);
+        assert_eq!(after_caller_edit.tags, vec!["caller-added-tag".to_string()]);
+
+        // The worker now attempts to apply its own auto-generated tags,
+        // presenting the STALE version=1 it captured before the caller's
+        // edit — exactly the CAS argument `apply_tags_postgres` would
+        // pass here. This is the SAME inherent method + the SAME
+        // `CallerContext::for_agent` shape the worker uses (never
+        // `for_admin`).
+        let stale_auto_tag_patch = UpdatePatch {
+            tags: Some(vec![
+                "caller-added-tag".to_string(),
+                "auto-generated-tag".to_string(),
+            ]),
+            ..UpdatePatch::default()
+        };
+        let cas_result = store
+            .update_with_expected_version(&ctx, &id, stale_auto_tag_patch, Some(1))
+            .await;
+        assert!(
+            cas_result.is_err(),
+            "a stale expected_version=1 write must be REFUSED once the row is at version 2 \
+             (got {cas_result:?})"
+        );
+
+        // The load-bearing proof: the concurrent caller's edit survives
+        // UNTOUCHED — the refused stale write never applied, so
+        // "auto-generated-tag" must be ABSENT and "caller-added-tag"
+        // must be the row's ONLY tag, exactly as the caller left it.
+        let final_row = store.get(&ctx, &id).await.expect("final read");
+        assert_eq!(
+            final_row.tags,
+            vec!["caller-added-tag".to_string()],
+            "the concurrent caller edit must never be clobbered by a stale auto_tag write"
+        );
+        assert_eq!(
+            final_row.version, 2,
+            "version must be unchanged by the refused stale write"
+        );
+    }
+
+    /// Companion positive case: presenting the CURRENT (fresh) version —
+    /// the shape `apply_tags_postgres` produces on the common, non-racing
+    /// path — succeeds and the merge lands both the caller's existing tag
+    /// and the new auto-generated tag, proving the CAS path is not merely
+    /// refuse-everything but genuinely gates on staleness.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fresh_expected_version_applies_the_merge_2587() {
+        let Some(url) = postgres_url() else {
+            eprintln!(
+                "SKIP fresh_expected_version_applies_the_merge_2587: \
+                 AI_MEMORY_TEST_POSTGRES_URL unset"
+            );
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let agent_id = format!("ai:autotag-cas-writer-{}", uuid::Uuid::new_v4());
+        let ctx = CallerContext::for_agent(agent_id.clone());
+        let ns = format!("autotag-cas-2587-{}", uuid::Uuid::new_v4());
+        let id = format!("autotag-cas-{}", uuid::Uuid::new_v4());
+        let mem = sample_memory(&id, &ns, &agent_id);
+        store.store(&ctx, &mem).await.expect("seed store");
+
+        let current = store.get(&ctx, &id).await.expect("read");
+        let merged_patch = UpdatePatch {
+            tags: Some(vec!["auto-generated-tag".to_string()]),
+            ..UpdatePatch::default()
+        };
+        store
+            .update_with_expected_version(&ctx, &id, merged_patch, Some(current.version))
+            .await
+            .expect("fresh-version write must succeed");
+
+        let final_row = store.get(&ctx, &id).await.expect("final read");
+        assert_eq!(final_row.tags, vec!["auto-generated-tag".to_string()]);
+        assert_eq!(final_row.version, 2);
     }
 }

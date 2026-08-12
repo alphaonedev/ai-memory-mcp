@@ -1519,6 +1519,7 @@ async fn create_memory_postgres(
         &mem.content,
         &body.tags,
         &mem.namespace,
+        agent_id,
     );
 
     // #869 — typed serialise helper so a 201 + `{}` never masks a real
@@ -1868,6 +1869,7 @@ pub async fn create_memory(
         &body.content,
         &body.tags,
         &body.namespace,
+        &agent_id,
     );
 
     // Stage 6 — HNSW warm-up + audit emit + federation fanout +
