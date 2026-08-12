@@ -636,6 +636,11 @@ mod tests {
 
     #[test]
     fn fully_hardened_env_passes_every_check_except_possibly_sqlcipher_build() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::fully_hardened_env_passes_every_check_except_possibly_sqlcipher_build",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -673,6 +678,11 @@ mod tests {
 
     #[test]
     fn asi_hard_not_engaged_fails_that_check() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::asi_hard_not_engaged_fails_that_check",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -688,6 +698,11 @@ mod tests {
 
     #[test]
     fn asi_hard_knob_below_floor_fails_that_check() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::asi_hard_knob_below_floor_fails_that_check",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -708,6 +723,11 @@ mod tests {
 
     #[test]
     fn peer_enrollment_explicitly_disabled_fails() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::peer_enrollment_explicitly_disabled_fails",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -731,6 +751,11 @@ mod tests {
 
     #[test]
     fn allow_unenrolled_peers_hatch_open_fails_even_with_enrollment_required() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::allow_unenrolled_peers_hatch_open_fails_even_with_enrollment_required",
+        ) {
+            return;
+        }
         // B1 (Fable review, 2026-08-11): a fully-hardened env with
         // AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT left at its strict
         // default PLUS AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1 made the
@@ -787,6 +812,11 @@ mod tests {
 
     #[test]
     fn require_sig_explicitly_disabled_fails() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::require_sig_explicitly_disabled_fails",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -803,6 +833,11 @@ mod tests {
 
     #[test]
     fn require_nonce_explicitly_disabled_fails() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::require_nonce_explicitly_disabled_fails",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -819,6 +854,11 @@ mod tests {
 
     #[test]
     fn push_namespace_scope_explicitly_disabled_fails() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::push_namespace_scope_explicitly_disabled_fails",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -841,6 +881,11 @@ mod tests {
 
     #[test]
     fn permissions_mode_not_enforce_fails() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::permissions_mode_not_enforce_fails",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -858,6 +903,11 @@ mod tests {
 
     #[test]
     fn governance_fail_open_enabled_fails() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::governance_fail_open_enabled_fails",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -874,6 +924,11 @@ mod tests {
 
     #[test]
     fn trust_domain_unset_fails() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::trust_domain_unset_fails",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -890,6 +945,11 @@ mod tests {
 
     #[test]
     fn peer_fingerprints_unset_fails() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::peer_fingerprints_unset_fails",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -906,6 +966,11 @@ mod tests {
 
     #[test]
     fn peer_fingerprints_pointing_at_missing_file_fails() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::peer_fingerprints_pointing_at_missing_file_fails",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -925,6 +990,11 @@ mod tests {
 
     #[test]
     fn peer_attestation_unset_fails() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::peer_attestation_unset_fails",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -942,6 +1012,11 @@ mod tests {
 
     #[test]
     fn peer_attestation_malformed_json_fails_and_refuses_not_falls_back() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::peer_attestation_malformed_json_fails_and_refuses_not_falls_back",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -963,6 +1038,11 @@ mod tests {
 
     #[test]
     fn peer_attestation_allow_all_glob_fails() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::peer_attestation_allow_all_glob_fails",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -987,6 +1067,11 @@ mod tests {
 
     #[test]
     fn sync_trust_peer_set_truthy_fails() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::sync_trust_peer_set_truthy_fails",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -1009,6 +1094,11 @@ mod tests {
 
     #[test]
     fn trust_body_agent_id_set_truthy_fails() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::trust_body_agent_id_set_truthy_fails",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -1031,6 +1121,11 @@ mod tests {
 
     #[test]
     fn encrypt_at_rest_env_falsy_fails_even_on_sqlcipher_build() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::encrypt_at_rest_env_falsy_fails_even_on_sqlcipher_build",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -1047,6 +1142,11 @@ mod tests {
 
     #[test]
     fn plaintext_peers_hatch_open_fails() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::plaintext_peers_hatch_open_fails",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -1073,6 +1173,11 @@ mod tests {
 
     #[test]
     fn boot_gate_is_a_noop_when_not_required() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::boot_gate_is_a_noop_when_not_required",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -1086,6 +1191,11 @@ mod tests {
 
     #[test]
     fn boot_gate_refuses_when_required_and_posture_unsatisfied() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::boot_gate_refuses_when_required_and_posture_unsatisfied",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -1103,6 +1213,11 @@ mod tests {
 
     #[test]
     fn boot_gate_passes_when_required_and_posture_satisfied_or_only_sqlcipher_missing() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::boot_gate_passes_when_required_and_posture_satisfied_or_only_sqlcipher_missing",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();

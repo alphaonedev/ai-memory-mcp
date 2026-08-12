@@ -4105,6 +4105,11 @@ enabled = true
     /// `doctor --posture` DISPATCH surfaces that verdict correctly.
     #[test]
     fn run_posture_enterprise_federation_fails_on_bare_env_naming_missing_controls() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "cli::doctor::tests::run_posture_enterprise_federation_fails_on_bare_env_naming_missing_controls",
+        ) {
+            return;
+        }
         let _g = posture_env_lock();
         clear_posture_env();
         let _cleanup = PostureEnvGuard;
@@ -4158,6 +4163,11 @@ enabled = true
     /// `enterprise_federation_posture::tests::fully_hardened_env_passes_every_check_except_possibly_sqlcipher_build`.
     #[test]
     fn run_posture_enterprise_federation_passes_on_fully_hardened_env() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "cli::doctor::tests::run_posture_enterprise_federation_passes_on_fully_hardened_env",
+        ) {
+            return;
+        }
         let _g = posture_env_lock();
         clear_posture_env();
         let _cleanup = PostureEnvGuard;

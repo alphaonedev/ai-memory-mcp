@@ -9225,6 +9225,66 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Role env marker for [`run_env_isolated_child_or_spawn`] (#2905).
+#[cfg(test)]
+pub(crate) const TEST_ENV_ISOLATION_ROLE_ENV: &str = "AI_MEMORY_TEST_ENV_ISOLATION_ROLE";
+
+/// #2905 test-isolation: run an env-MUTATING posture / security-profile
+/// test in an ISOLATED CHILD process so its process-global
+/// `std::env::set_var`s cannot leak to concurrent handler tests in the
+/// same `--lib` binary.
+///
+/// The class this closes (a `lib-test-blind-spots` process-global
+/// interference): `security_profile::enforce_at_boot` writes
+/// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` (and the rest of the `asi-hard`
+/// KNOBS) into the process env, and the HTTP create handler tests read
+/// that env WITHOUT taking [`test_env_lock`], so during a posture test's
+/// set→remove window a concurrent create test fail-closes with `403`
+/// instead of `201`. `enforce_at_boot`'s `set_var` is only safe in the
+/// synchronous pre-runtime phase (its own module doc) — never on the
+/// parallel libtest harness. Precedent for this fix:
+/// `governance::deferred_audit` + `recover::durability` `current_exe()`
+/// role-env subprocess isolation.
+///
+/// Returns `true` in the PARENT role — the caller MUST `return` immediately,
+/// because the real assertions already ran (and passed) in the spawned
+/// child. Returns `false` in the CHILD role — the caller runs its body,
+/// alone in a fresh process where its `set_var`s cannot race any other test.
+///
+/// `exact_path` MUST be the test's full `module::tests::fn_name` path. A
+/// mistyped path would run ZERO tests and libtest would STILL exit 0 — a
+/// silent false-green (the #2444 shape) — so the parent additionally
+/// asserts the child stdout reports `1 passed` and never `0 passed`.
+#[cfg(test)]
+pub(crate) fn run_env_isolated_child_or_spawn(exact_path: &str) -> bool {
+    if std::env::var(TEST_ENV_ISOLATION_ROLE_ENV).as_deref() == Ok("child") {
+        return false; // caller runs the real body in this isolated child
+    }
+    // The child inherits the parent's environment (incl. AI_MEMORY_NO_CONFIG
+    // and TMPDIR), so we only add the role marker.
+    let output = std::process::Command::new(
+        std::env::current_exe().expect("current_exe for env-isolated test spawn"),
+    )
+    .args(["--exact", exact_path, "--nocapture", "--test-threads=1"])
+    .env(TEST_ENV_ISOLATION_ROLE_ENV, "child")
+    .output()
+    .expect("spawn env-isolated child test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "env-isolated child test {exact_path} FAILED:\n--- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}"
+    );
+    // False-green guard: a mistyped `exact_path` runs zero tests and still
+    // exits 0. Require proof exactly one test actually RAN.
+    assert!(
+        stdout.contains("1 passed") && !stdout.contains("0 passed"),
+        "env-isolated child test {exact_path} did NOT run (expected `1 passed`); \
+         a mistyped path silently runs zero tests. child stdout:\n{stdout}"
+    );
+    true // caller must `return`
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

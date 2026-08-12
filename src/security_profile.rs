@@ -559,6 +559,11 @@ mod tests {
 
     #[test]
     fn parse_accepts_known_tokens_rejects_typos() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "security_profile::tests::parse_accepts_known_tokens_rejects_typos",
+        ) {
+            return;
+        }
         assert_eq!(
             SecurityPosture::parse("").unwrap(),
             SecurityPosture::Standard
@@ -580,6 +585,11 @@ mod tests {
 
     #[test]
     fn standard_posture_is_a_noop() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "security_profile::tests::standard_posture_is_a_noop",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe { clear_all() };
         let _cleanup = KnobsGuard;
@@ -594,6 +604,11 @@ mod tests {
 
     #[test]
     fn asi_hard_pins_every_unset_knob() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "security_profile::tests::asi_hard_pins_every_unset_knob",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -623,6 +638,11 @@ mod tests {
 
     #[test]
     fn asi_hard_accepts_already_compliant_values() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "security_profile::tests::asi_hard_accepts_already_compliant_values",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -652,6 +672,11 @@ mod tests {
 
     #[test]
     fn asi_hard_refuses_a_loosening_override() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "security_profile::tests::asi_hard_refuses_a_loosening_override",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -672,6 +697,11 @@ mod tests {
 
     #[test]
     fn asi_hard_refuses_a_falsy_boolean_override() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "security_profile::tests::asi_hard_refuses_a_falsy_boolean_override",
+        ) {
+            return;
+        }
         let _g = env_lock();
         unsafe {
             clear_all();
@@ -687,6 +717,11 @@ mod tests {
 
     #[test]
     fn asi_hard_pins_documented_set() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "security_profile::tests::asi_hard_pins_documented_set",
+        ) {
+            return;
+        }
         // The pinned set must match the documented count so the module
         // docs table and the KNOBS SSOT cannot silently drift.
         let pins = pinned_knobs();
@@ -723,6 +758,11 @@ mod tests {
 
     #[test]
     fn asi_hard_below_floor_is_read_only_and_reports_violations() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "security_profile::tests::asi_hard_below_floor_is_read_only_and_reports_violations",
+        ) {
+            return;
+        }
         // v1.0.0 §5.3 cutline ruling — `enterprise_federation_posture`
         // reuses this accessor as the SSOT for the 17-knob asi-hard set
         // rather than re-deriving KNOBS; pin its own read-only contract
