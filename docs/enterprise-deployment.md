@@ -20,6 +20,20 @@ layout: doc
 > [`production-deployment.md`](production-deployment.html) disagree,
 > **those are newer**. Several v1.0.0 fail-closed defaults are NOT
 > reflected in the v0.7.0-stamped checklists below; §14.3 lists them.
+>
+> **⚠ Canonical trust boundary.** For the **enterprise-federation
+> certified configuration**, the single authoritative trust-boundary
+> statement is
+> [`compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md).
+> **Where this document conflicts with that one on the trust boundary,
+> the certification document supersedes it** — including the §8.5 / §9.x
+> "what v0.7.0 supports" capability tables below, several of whose "v0.8
+> roadmap" gap answers shipped in v0.8.0–v1.0.0 (transition/checkpoint/
+> write/signal per-actor attestation fail-closed defaults, inbound-write
+> namespace confinement, admission control). Treat those tables as
+> **historical v0.7.0 status**, not current v1.0.0 capability; the
+> certified capability is the one the machine-checked
+> `ai-memory doctor --posture enterprise-federation` gate enforces.
 
 **Audience.** Subject-matter-expert software engineers and architects
 landing `ai-memory` + agents into a production fleet. Reading-time:
