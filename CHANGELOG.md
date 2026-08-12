@@ -103,6 +103,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   doing nothing"). Documentation-only, matching this file's own
   "nothing here is live-enforced" doctrine: no live ruleset was mutated.
   The actual commit-signing control is the new CI gate above.
+### Fixed (enterprise-availability — CERT-BLOCKING)
+
+- **`POST /api/v1/memories` no longer blocks 4.9-11.1s per write on a
+  synchronous LLM `auto_tag` call**
+  ([#2587](https://github.com/alphaonedev/ai-memory-mcp/issues/2587);
+  5-agent adversarial vote `4d3ea1c5`, decision memory `4e51e315`). Two
+  compounding defects, both
+  closed: (1) `maybe_auto_tag` (HTTP `create_memory`, both sqlite and
+  postgres branches) was NOT gated on `AI_MEMORY_AUTONOMOUS_HOOKS`
+  despite CLAUDE.md documenting that gate — its sibling
+  `maybe_detect_conflicts` checked the flag, `maybe_auto_tag` did not —
+  so an untagged write fired the LLM `auto_tag` chat-completion call
+  UNCONDITIONALLY whenever an LLM was configured, regardless of the
+  operator's setting; the new `auto_tag_eligible` gate
+  (`src/handlers/http.rs`) closes the doc/code mismatch. (2) even with
+  `AI_MEMORY_AUTONOMOUS_HOOKS=1` (the intended, deliberately-opted-in
+  posture), the LLM call ran INLINE on the request path — an
+  AVAILABILITY defect, not merely latency: on MCP stdio a stall of that
+  shape blocks every subsequent tool call (the #965 single-threaded
+  JSON-RPC audit); on the HTTP daemon it held an admission-control
+  permit (#2032 M3) for its whole duration, so sustained latency could
+  saturate the in-flight cap and shed HEALTHY traffic — including
+  durable-truth WRITES — with 503s. Per the North Star, tags are
+  derived/regenerable data, never durable truth, so the durable INSERT
+  now completes FIRST (storing `body.tags` verbatim) and the LLM call is
+  deferred to a new bounded background worker
+  (`crate::background::auto_tag_worker`, one consumer per daemon — no
+  vendor-burst hazard under a concurrent write storm), which applies
+  tags via a MERGE, CAS-guarded on both backends so a concurrent
+  caller edit is never clobbered: sqlite uses `storage::
+  update_with_expected_version` (a real optimistic-concurrency CAS, one
+  retry on conflict); postgres routes through the concrete
+  `PostgresStore`'s inherent `update_with_expected_version` — the same
+  If-Match CAS primitive `PUT /memories/{id}` already uses (#1628) — via
+  the established `app.store.as_any().downcast_ref::<PostgresStore>()`
+  hatch, since the generic `MemoryStore` trait's `update` is
+  last-write-wins and `UpdatePatch` carries no `expected_version` field.
+  The apply runs under `CallerContext::for_agent(job.agent_id)` — the
+  original writer's own identity, threaded through the deferred job —
+  never an admin/privacy-bypass context, since a targeted, by-id
+  continuation of the caller's own write needs no bypass authority. New
+  knob
+  `AI_MEMORY_AUTOTAG_QUEUE_CAPACITY` (default 256) bounds the worker's
+  queue; a full queue drops the job (never blocks the write) and is
+  counted (`ai_memory_autotag_dropped_total`) + logged. **Wire-contract
+  change:** the create response's `"auto_tags": [...]` literal-tags
+  field is replaced by `"auto_tagging": "queued" | "skipped_queue_full"`
+  (present only when eligible; absent otherwise — byte-identical to the
+  pre-#2587 no-LLM-ran contract) since tags may now land after the
+  response returns. Scoped to `AI_MEMORY_AUTONOMOUS_HOOKS=1`
+  deployments — the shipped default (`false`) is unaffected by the
+  wire-contract change and additionally now correctly opts every write
+  out of the LLM call entirely (previously it did not). New metrics:
+  `ai_memory_autotag_{enqueued,dropped,applied,degraded}_total`.
 
 ### Fixed (data integrity)
 

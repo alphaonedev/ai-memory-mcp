@@ -345,6 +345,35 @@ pub struct Metrics {
     /// (`AI_MEMORY_QUERY_EMBED_CACHE_ENTRIES=0`) or every query is unique.
     pub query_embed_cache_hits_total: IntCounter,
 
+    /// #2587 — monotonic count of `auto_tag` jobs successfully `try_send`
+    /// onto the bounded background queue after a durable
+    /// `POST /api/v1/memories` write (autonomous-tier, untagged, eligible
+    /// content). Rising with traffic is healthy; a flat zero on an
+    /// autonomous-tier deployment with an LLM configured suggests
+    /// `AI_MEMORY_AUTONOMOUS_HOOKS` is off or no write has been eligible.
+    pub autotag_enqueued_total: IntCounter,
+
+    /// #2587 — monotonic count of eligible `auto_tag` jobs DROPPED because
+    /// the bounded queue (`AI_MEMORY_AUTOTAG_QUEUE_CAPACITY`) was full, or
+    /// no worker was wired. The durable write always succeeds regardless —
+    /// this is a DEGRADE (no tags for that write), never a write failure.
+    /// A sustained non-zero rate means the queue is under-sized for the
+    /// write burst; alert on the RATE.
+    pub autotag_dropped_total: IntCounter,
+
+    /// #2587 — monotonic count of `auto_tag` jobs the background worker
+    /// applied successfully (tags landed on the row via a merge, never a
+    /// blind overwrite).
+    pub autotag_applied_total: IntCounter,
+
+    /// #2587 — monotonic count of `auto_tag` jobs the background worker
+    /// gave up on (LLM error, LLM call exceeded `llm_call_timeout`, the
+    /// row was deleted before the job drained, or — sqlite only — the row
+    /// lost an optimistic-concurrency race to a concurrent caller edit
+    /// twice in a row). A DEGRADE (no tags applied), never data
+    /// corruption; the durable write this job followed already succeeded.
+    pub autotag_degraded_total: IntCounter,
+
     /// #1735 (Pillar-4 4.C) — current depth of the `kg_projection_outbox`
     /// (pending AGE projections not yet drained: `projected_at IS NULL`).
     /// Refreshed each cold-drainer tick. Sustained non-zero depth means the
@@ -797,6 +826,45 @@ impl Metrics {
         )?;
         registry.register(Box::new(query_embed_cache_hits_total.clone()))?;
 
+        let autotag_enqueued_total = IntCounter::new(
+            "ai_memory_autotag_enqueued_total",
+            "Monotonic counter of auto_tag jobs successfully enqueued onto \
+             the bounded background worker after a durable HTTP create-memory \
+             write (#2587). Rising with autonomous-tier write traffic is the \
+             healthy shape.",
+        )?;
+        registry.register(Box::new(autotag_enqueued_total.clone()))?;
+
+        let autotag_dropped_total = IntCounter::new(
+            "ai_memory_autotag_dropped_total",
+            "Monotonic counter of auto_tag jobs DROPPED because the bounded \
+             queue (AI_MEMORY_AUTOTAG_QUEUE_CAPACITY) was full, or no worker \
+             was wired (#2587). The durable write always succeeds regardless \
+             — a DEGRADE (no tags), never a write failure. Alert on a \
+             sustained increment rate: the queue is under-sized for the \
+             write burst.",
+        )?;
+        registry.register(Box::new(autotag_dropped_total.clone()))?;
+
+        let autotag_applied_total = IntCounter::new(
+            "ai_memory_autotag_applied_total",
+            "Monotonic counter of auto_tag jobs the background worker applied \
+             successfully — tags merged onto the row, never a blind \
+             overwrite (#2587).",
+        )?;
+        registry.register(Box::new(autotag_applied_total.clone()))?;
+
+        let autotag_degraded_total = IntCounter::new(
+            "ai_memory_autotag_degraded_total",
+            "Monotonic counter of auto_tag jobs the background worker gave up \
+             on — LLM error, LLM call exceeded llm_call_timeout, the row was \
+             deleted before the job drained, or (sqlite) an optimistic- \
+             concurrency race lost twice in a row (#2587). A DEGRADE, never \
+             data corruption — the durable write this job followed already \
+             succeeded.",
+        )?;
+        registry.register(Box::new(autotag_degraded_total.clone()))?;
+
         let age_projection_pending_depth = IntGauge::new(
             "ai_memory_age_projection_pending_depth",
             "Current depth of the kg_projection_outbox (pending deferred AGE \
@@ -860,6 +928,10 @@ impl Metrics {
             recall_embed_degraded_total,
             rerank_budget_degraded_total,
             query_embed_cache_hits_total,
+            autotag_enqueued_total,
+            autotag_dropped_total,
+            autotag_applied_total,
+            autotag_degraded_total,
             age_projection_pending_depth,
             age_projection_failed_total,
             age_projection_quarantined_total,
@@ -990,6 +1062,32 @@ pub fn inc_rerank_budget_degraded() {
 /// process-local bounded cache instead of a remote round trip.
 pub fn inc_query_embed_cache_hit() {
     registry().query_embed_cache_hits_total.inc();
+}
+
+/// v1.0.0 #2587 — record one `auto_tag` job successfully enqueued onto the
+/// bounded background worker after a durable HTTP create-memory write.
+pub fn inc_autotag_enqueued() {
+    registry().autotag_enqueued_total.inc();
+}
+
+/// v1.0.0 #2587 — record one `auto_tag` job dropped because the bounded
+/// queue was full or no worker was wired. Pairs with the
+/// `autotag.queue.dropped` / `autotag.queue.absent` WARN at the call site.
+pub fn inc_autotag_dropped() {
+    registry().autotag_dropped_total.inc();
+}
+
+/// v1.0.0 #2587 — record one `auto_tag` job the background worker applied
+/// successfully.
+pub fn inc_autotag_applied() {
+    registry().autotag_applied_total.inc();
+}
+
+/// v1.0.0 #2587 — record one `auto_tag` job the background worker gave up
+/// on (LLM error/timeout, row gone, or a lost optimistic-concurrency
+/// race). Pairs with the `autotag.worker.*` WARN at the call site.
+pub fn inc_autotag_degraded() {
+    registry().autotag_degraded_total.inc();
 }
 
 /// v0.7-polish SEC-15 / COR-11 (issue #780) — read the current value

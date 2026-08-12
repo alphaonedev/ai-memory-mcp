@@ -26,8 +26,10 @@ use super::StorageBackend;
 const AUTO_TAG_MIN_CONTENT_LEN: usize = 50;
 /// v0.7.0 L5 — maximum number of auto-generated tags merged into the
 /// memory. Mirrors `mcp.rs:1827-1828` so postgres + sqlite + MCP all
-/// converge on the same on-disk shape.
-const AUTO_TAG_MAX_TAGS: usize = 8;
+/// converge on the same on-disk shape. `pub(crate)` so
+/// `crate::background::auto_tag_worker` can reuse the SAME cap when it
+/// caps the LLM's returned tag list (#2587) — never a second hardcoded 8.
+pub(crate) const AUTO_TAG_MAX_TAGS: usize = 8;
 
 /// v0.7.0 fold-A2A1.6 (#700, S16/S49) — `app.store.get` with bounded
 /// retry on [`crate::store::StoreError::NotFound`].
@@ -65,91 +67,142 @@ pub(super) async fn get_with_visibility_retry(
     }
 }
 
-/// v0.7.0 L5 — fire the LLM `auto_tag` hook for a freshly-built memory.
+/// #2587 — pure, synchronous eligibility gate shared by the sqlite and
+/// postgres `create_memory` branches. Every check here is cheap (no I/O,
+/// no lock, no `.await`) so it is safe to call unconditionally on every
+/// write, including the ineligible fast path.
 ///
-/// Returns the list of LLM-generated tags (capped at
-/// [`AUTO_TAG_MAX_TAGS`]) when every gate is satisfied:
-///   - The daemon's configured [`crate::config::FeatureTier`] declares
-///     an `llm_model` (the smart / autonomous tier capability —
-///     `tier_config.llm_model.is_some()`).
+/// Gates (ALL must pass):
+///   - `app.autonomous_hooks` is true. **This is the #2587 fix** — the
+///     doc (CLAUDE.md env #8, `AI_MEMORY_AUTONOMOUS_HOOKS`) always
+///     claimed `auto_tag` fires "synchronously after every
+///     `memory_store`" ONLY when this flag is on, mirroring the sibling
+///     [`maybe_detect_conflicts`]'s identical gate (line ~192 below).
+///     Pre-#2587 this check was ABSENT, so `auto_tag` fired on every
+///     untagged write whenever an LLM was configured, regardless of the
+///     operator's `AI_MEMORY_AUTONOMOUS_HOOKS` setting — measured at
+///     4.9-11.1s per write in production (issue #2587).
 ///   - The operator did NOT pre-populate `tags` on the request
 ///     (auto-tag never overwrites operator-supplied tags).
 ///   - The content is at least [`AUTO_TAG_MIN_CONTENT_LEN`] chars
 ///     (too-short content has no useful taggable signal).
 ///   - The namespace is not internal / system (starts with `_`) —
 ///     matches MCP's `handle_store` skip at `crate::mcp::handle_store` (skip-arm).
-///   - An LLM client is wired on `AppState` and the Ollama endpoint
-///     is reachable.
-///
-/// On any LLM error the function returns `Vec::new()` and logs a
-/// `tracing::warn!` — auto_tag is a soft hook and a failure must not
-/// fail the store (mirrors MCP `handle_store` at `crate::mcp::handle_store` (detect_contradiction block)).
-///
-/// The blocking Ollama call is wrapped in `tokio::task::spawn_blocking`
-/// to keep the async runtime healthy under load — matches the embedder
-/// pattern at `src/daemon_runtime.rs:1182`.
-pub(crate) async fn maybe_auto_tag(
+///   - The daemon's configured [`crate::config::FeatureTier`] declares
+///     an `llm_model` (the smart / autonomous tier capability) AND a
+///     live LLM client is currently wired (cheap `Arc` read, no lock
+///     held across an `.await` — checked here so an ineligible job is
+///     never enqueued in the first place).
+#[must_use]
+pub(crate) fn auto_tag_eligible(
     app: &AppState,
+    operator_tags: &[String],
+    content: &str,
+    namespace: &str,
+) -> bool {
+    app.autonomous_hooks
+        && operator_tags.is_empty()
+        && content.len() >= AUTO_TAG_MIN_CONTENT_LEN
+        && !namespace.starts_with('_')
+        && app.tier_config.llm_model.is_some()
+        && app.llm.current().is_some()
+}
+
+/// #2587 — outcome of [`try_enqueue_auto_tag`], surfaced on the HTTP
+/// create-memory response so a caller can distinguish three shapes
+/// honestly (never silently omitting what used to be present — the
+/// #2577 `mode:keyword` honesty precedent applied to the write path):
+///
+///   - **Not eligible**: no `auto_tagging` field at all — BYTE-IDENTICAL
+///     to the pre-#2587 no-LLM-ran contract (pinned by the existing
+///     `must not insert any auto_tags field` test in this module).
+///   - **Queued**: `"auto_tagging": "queued"` — the durable write
+///     already succeeded; tags will land on the row asynchronously (or
+///     may not, on a soft LLM failure — a caller that needs to know for
+///     certain re-`GET`s the row later).
+///   - **Queue full / absent**: `"auto_tagging": "skipped_queue_full"` —
+///     a DEGRADE (no tags scheduled), never a write failure. The
+///     durable write this outcome accompanies has ALREADY succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutoTagOutcome {
+    NotEligible,
+    Queued,
+    QueueFull,
+}
+
+impl AutoTagOutcome {
+    #[must_use]
+    pub(crate) fn response_field(self) -> Option<&'static str> {
+        match self {
+            Self::NotEligible => None,
+            Self::Queued => Some("queued"),
+            Self::QueueFull => Some("skipped_queue_full"),
+        }
+    }
+}
+
+/// #2587 — enqueue the `auto_tag` LLM call onto the bounded background
+/// worker (`crate::background::auto_tag_worker`). Called AFTER the
+/// durable insert has ALREADY succeeded (`id` is the committed row), so
+/// this function can only ever affect tagging, never the write itself.
+///
+/// `try_send` is synchronous and returns immediately either way — this
+/// function never awaits the LLM and never blocks the caller. Mirrors
+/// the 5-agent adversarial vote (`4d3ea1c5`, decision memory `4e51e315`,
+/// 2026-08-11) decision for issue #2587: tags are derived/regenerable
+/// data, not durable truth, so the multi-second LLM round-trip that used
+/// to run inline on the request path (4.9-11.1s measured) is deferred
+/// entirely.
+///
+/// `agent_id` is the ORIGINAL WRITER's resolved identity (the same value
+/// `metadata.agent_id` was stamped with on the durable insert) — threaded
+/// through so the worker's eventual apply runs under
+/// `CallerContext::for_agent(agent_id)`, never an admin/privacy-bypass
+/// context (see `crate::background::auto_tag_worker::apply_tags_postgres`).
+pub(crate) fn try_enqueue_auto_tag(
+    app: &AppState,
+    id: &str,
     title: &str,
     content: &str,
     operator_tags: &[String],
     namespace: &str,
-) -> Vec<String> {
-    if !operator_tags.is_empty() {
-        return Vec::new();
+    agent_id: &str,
+) -> AutoTagOutcome {
+    if !auto_tag_eligible(app, operator_tags, content, namespace) {
+        return AutoTagOutcome::NotEligible;
     }
-    if content.len() < AUTO_TAG_MIN_CONTENT_LEN {
-        return Vec::new();
-    }
-    if namespace.starts_with('_') {
-        return Vec::new();
-    }
-    if app.tier_config.llm_model.is_none() {
-        return Vec::new();
-    }
-    let llm_arc = app.llm.current();
-    if llm_arc.is_none() {
-        return Vec::new();
-    }
-    // v0.7.0 L15 — when the operator has configured a dedicated tag
-    // model (`auto_tag_model = "..."` in config.toml), pass it through
-    // so the call hits the fast structured-output model instead of the
-    // reasoning-tier llm_model. Closes the NHI-D-autotag-empty finding
-    // where Gemma 4 thinking-mode would generate 400+ tokens for a
-    // 5-tag list and hit the 30s tail latency.
-    let auto_tag_model = app.auto_tag_model.as_ref().clone();
-    let title_owned = title.to_string();
-    let content_owned = content.to_string();
-    let llm_timeout = app.llm_call_timeout;
-    // H8 (v0.7.0 round-2) — bound the Ollama call by the configured
-    // per-LLM-call timeout (default 30s). On timeout we degrade to the
-    // LLM-absent fallback (empty tags) — same shape the keyword /
-    // semantic tiers already return when no LLM is wired (L5/L7).
-    // PERF-9 (v0.7.0 FX-C1, 2026-05-26) — direct async call. Pre-PERF-9
-    // this hopped through `spawn_blocking` because `OllamaClient::auto_tag`
-    // was synchronous-`reqwest::blocking` underneath; now it's
-    // `reqwest::Client` async, so we drive `auto_tag_async` inline and
-    // let `tokio::time::timeout` bound it without an extra thread hop.
-    let join = tokio::time::timeout(llm_timeout, async move {
-        let Some(llm) = llm_arc.as_ref() else {
-            return Ok::<Vec<String>, anyhow::Error>(Vec::new());
-        };
-        llm.auto_tag_async(&title_owned, &content_owned, auto_tag_model.as_deref())
-            .await
-    })
-    .await;
-    match join {
-        Ok(Ok(tags)) => tags.into_iter().take(AUTO_TAG_MAX_TAGS).collect(),
-        Ok(Err(e)) => {
-            tracing::warn!("L5: auto_tag hook failed: {e}");
-            Vec::new()
+    let Some(tx) = app.auto_tag_queue.as_ref() else {
+        // No worker wired (a test scaffold, or a boot-gap class akin to
+        // #2233) — degrade honestly rather than panic or silently claim
+        // success. The durable write this outcome accompanies has
+        // already succeeded.
+        tracing::warn!(
+            "autotag.queue.absent: eligible write {id} has no auto_tag_queue wired — \
+             skipping auto_tag"
+        );
+        crate::metrics::inc_autotag_dropped();
+        return AutoTagOutcome::QueueFull;
+    };
+    let job = crate::background::auto_tag_worker::AutoTagJob {
+        id: id.to_string(),
+        title: title.to_string(),
+        content: content.to_string(),
+        namespace: namespace.to_string(),
+        // #2587 (Fable finding) — the worker applies tags under this
+        // agent's OWN identity (CallerContext::for_agent), never an
+        // admin/privacy-bypass context. See
+        // `crate::background::auto_tag_worker::apply_tags_postgres`.
+        agent_id: agent_id.to_string(),
+    };
+    match tx.try_send(job) {
+        Ok(()) => {
+            crate::metrics::inc_autotag_enqueued();
+            AutoTagOutcome::Queued
         }
-        Err(_) => {
-            tracing::warn!(
-                "H8: LLM call (auto_tag) exceeded {}s timeout — falling back to no tags",
-                llm_timeout.as_secs()
-            );
-            Vec::new()
+        Err(e) => {
+            tracing::warn!("autotag.queue.dropped: queue full for {id} — skipping auto_tag: {e}");
+            crate::metrics::inc_autotag_dropped();
+            AutoTagOutcome::QueueFull
         }
     }
 }
@@ -173,7 +226,9 @@ pub(crate) async fn maybe_auto_tag(
 ///
 /// The probe is best-effort: any LLM error or timeout returns an empty
 /// vec — never fails the parent store. Bounded by the H8 per-LLM-call
-/// timeout (default 30s) the same way `maybe_auto_tag` is.
+/// timeout (default 30s), the same `app.llm_call_timeout` the
+/// background `auto_tag` worker (`crate::background::auto_tag_worker`,
+/// #2587) bounds its own LLM call by.
 //
 // v0.7.0 (round-2) — call sites for this helper are still being
 // wired in the create_memory hot path; the function is staged for
@@ -339,7 +394,7 @@ pub struct ConflictReport {
 #[allow(clippy::too_many_lines)]
 mod cov897_tests {
     use super::{
-        AUTO_TAG_MIN_CONTENT_LEN, ConflictReport, fetch_namespace_candidates, maybe_auto_tag,
+        AUTO_TAG_MIN_CONTENT_LEN, ConflictReport, auto_tag_eligible, fetch_namespace_candidates,
         maybe_detect_conflicts,
     };
     use crate::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
@@ -387,6 +442,7 @@ mod cov897_tests {
                 crate::identity::replay::FederationNonceCache::default(),
             ),
             autonomous_hooks: autonomous,
+            auto_tag_queue: None,
             recall_scope: Arc::new(None),
             deferred_audit_queue: Arc::new(None),
             admin_agent_ids: Arc::new(Vec::new()),
@@ -418,30 +474,28 @@ mod cov897_tests {
         crate::db::insert(&lock.0, &mem).expect("insert");
     }
 
-    // ---- maybe_auto_tag: the llm-arc fast-path on a Smart-tier app -----
+    // ---- auto_tag_eligible: the llm-arc fast-path on a Smart-tier app --
     //
-    // The lib-tier `maybe_auto_tag_gate_matrix_l5` test already covers
-    // the operator-tags / short-content / internal-namespace / no-llm-
-    // model branches. This case completes the gate ladder: Smart tier
-    // sets `tier_config.llm_model = Some(...)`, the caller passes
-    // permissive args (long content, no tags, public namespace), but
-    // `app.llm = Arc::new(None)` — so the function must short-circuit
-    // at the `llm_arc.is_none()` check rather than fall through to
-    // the spawn_blocking path.
+    // The lib-tier `auto_tag_eligible_gate_matrix_l5` test already covers
+    // the autonomous_hooks / operator-tags / short-content /
+    // internal-namespace / no-llm-model branches. This case completes
+    // the gate ladder: `autonomous_hooks=true`, Smart tier sets
+    // `tier_config.llm_model = Some(...)`, the caller passes permissive
+    // args (long content, no tags, public namespace), but
+    // `app.llm = Arc::new(None)` — so the gate must return `false` at
+    // the live-client check rather than declare the write eligible.
     #[tokio::test]
-    async fn cov897_maybe_auto_tag_smart_tier_no_llm_arc_short_circuits() {
-        let (app, _tmp) = build_app(FeatureTier::Smart, false);
-        let r = maybe_auto_tag(
+    async fn cov897_auto_tag_eligible_smart_tier_no_llm_arc_short_circuits() {
+        let (app, _tmp) = build_app(FeatureTier::Smart, true);
+        let eligible = auto_tag_eligible(
             &app,
-            "title",
-            &"x".repeat(AUTO_TAG_MIN_CONTENT_LEN + 10),
             &[],
+            &"x".repeat(AUTO_TAG_MIN_CONTENT_LEN + 10),
             "public-ns",
-        )
-        .await;
+        );
         assert!(
-            r.is_empty(),
-            "Smart tier + llm=None must short-circuit, got {r:?}"
+            !eligible,
+            "Smart tier + autonomous_hooks=true + llm=None must NOT be eligible"
         );
     }
 

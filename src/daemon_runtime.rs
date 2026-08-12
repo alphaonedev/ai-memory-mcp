@@ -6101,7 +6101,7 @@ pub async fn bootstrap_serve(
         Arc::clone(&crate::runtime_context::RuntimeContext::global_arc().fts_integrity);
     fts_integrity_status.set_interval_secs(fts_integrity_interval.as_secs());
 
-    let app_state = AppState {
+    let mut app_state = AppState {
         db: db_state.clone(),
         embedder: embedder_arc,
         vector_index: vector_index_state,
@@ -6155,6 +6155,13 @@ pub async fn bootstrap_serve(
         // helper. Falls back to false when unset (preserves v0.6.x
         // post-hoc-only contradiction surface).
         autonomous_hooks: app_config.effective_autonomous_hooks(),
+        // #2587 — placeholder; the real `Sender` is wired below via
+        // `auto_tag_worker::spawn`, which itself needs `app_state.clone()`
+        // (a chicken-and-egg the placeholder-then-assign shape resolves:
+        // the worker's OWN clone of `AppState` never sends to itself, so
+        // its `auto_tag_queue` field being `None` at spawn time is
+        // irrelevant).
+        auto_tag_queue: None,
         // v0.7.0 (issue #518) — resolved recall_scope defaults from
         // `[agents.defaults.recall_scope]`. None preserves v0.6.x
         // recall semantics (no splice on session_default=true).
@@ -6201,6 +6208,23 @@ pub async fn bootstrap_serve(
         enrolled_agent_keys: enrolled_agent_keys.clone(),
         http_identity_mode,
     };
+
+    // #2587 — spawn the bounded async auto_tag worker unconditionally
+    // (mirrors the `deferred_audit_queue` "always present, cheap when
+    // idle" shape: an idle worker is one parked task awaiting an empty
+    // channel). Spawned with a clone of `app_state` whose OWN
+    // `auto_tag_queue` field is still the `None` placeholder above — the
+    // worker never enqueues to itself, so that is inert. The `Sender`
+    // half is assigned onto the real `app_state` immediately after, and
+    // the `JoinHandle` joins `task_handles` for the same abort+join
+    // shutdown discipline every other background loop in this function
+    // follows (see the comment at the shutdown sequence: "Dropping a
+    // Tokio JoinHandle would detach the task and permit a late write
+    // after the final checkpoint").
+    let (auto_tag_tx, auto_tag_handle) =
+        crate::background::auto_tag_worker::spawn(app_state.clone());
+    app_state.auto_tag_queue = Some(auto_tag_tx);
+    task_handles.push(auto_tag_handle);
 
     // Automatic GC. Cluster G (#767) — pass through the operator-
     // tunable `[confidence] shadow_retention_days` so the periodic
@@ -8343,6 +8367,7 @@ mod tests {
             verify_require_nonce: false,
             federation_nonce_cache: Arc::new(crate::identity::replay::FederationNonceCache::new()),
             autonomous_hooks: false,
+            auto_tag_queue: None,
             recall_scope: Arc::new(None),
             deferred_audit_queue: Arc::new(None),
             admin_agent_ids: Arc::new(Vec::new()),
@@ -9290,7 +9315,7 @@ mod tests {
         assert!(bs.app_state.embedder.is_none());
         let vi = bs.app_state.vector_index.lock().await;
         assert!(vi.is_none());
-        // TEN task handles on a sqlite keyword-tier boot: the v0.7
+        // ELEVEN task handles on a sqlite keyword-tier boot: the v0.7
         // policy-engine item-3 deferred-audit supervisor + gc +
         // wal_checkpoint + v0.7 K2 pending_actions timeout sweep +
         // v0.7 I3 transcript archive→prune lifecycle sweep + v0.7 K8
@@ -9299,25 +9324,30 @@ mod tests {
         // #1869 P0-1 recall-access fold loop (spawned whenever
         // AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS != 0 — the default) +
         // #2579 the paced FTS5 integrity checker + #2583 the paced
-        // corpus-size gauge refresher.
+        // corpus-size gauge refresher + #2587 the bounded async
+        // auto_tag worker.
         //
-        // 2026-07-31 (#2579/#2583) — 8 -> 10. The prose above previously
-        // read "Nine" while the assertion read 8, so the count is now
-        // spelled ONCE, in the assertion, and this comment enumerates the
-        // members rather than restating the total. The #2579 checker's
-        // handle is pushed even when its interval is 0 (postgres backend,
-        // or an operator opt-out): the task returns immediately, but the
-        // spawn list stays uniform so this pin does not become
-        // backend-dependent. The #2583 refresher is NOT pushed on a
-        // postgres backend — it would be counting the sqlite sidecar (see
-        // the gate site + #2621) — so a postgres boot has one fewer.
+        // 2026-07-31 (#2579/#2583) — 8 -> 10. 2026-08-11 (#2587) — 10 ->
+        // 11: the auto_tag worker is spawned UNCONDITIONALLY (mirrors the
+        // `deferred_audit_queue` always-present shape) regardless of
+        // tier/backend/`AI_MEMORY_AUTONOMOUS_HOOKS`, so it does not
+        // become a backend- or config-dependent count either — an idle
+        // worker awaiting an empty channel costs one parked task, nothing
+        // more. The count is spelled ONCE, in the assertion, and this
+        // comment enumerates the members rather than restating the total.
+        // The #2579 checker's handle is pushed even when its interval is
+        // 0 (postgres backend, or an operator opt-out): the task returns
+        // immediately, but the spawn list stays uniform so this pin does
+        // not become backend-dependent. The #2583 refresher is NOT pushed
+        // on a postgres backend — it would be counting the sqlite sidecar
+        // (see the gate site + #2621) — so a postgres boot has one fewer.
         //
         // v0.7 B3-fix2 gates the family-descriptor embedding precompute
         // behind `AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS=1` (default OFF)
         // so it does not contend with HTTP request-path embeds under
         // parallel CI load — see the gate site in `bootstrap_serve`
-        // for the rationale; it is NOT one of the ten.
-        assert_eq!(bs.task_handles.len(), 10);
+        // for the rationale; it is NOT one of the eleven.
+        assert_eq!(bs.task_handles.len(), 11);
         // Cleanly abort the spawned tasks so they don't leak across tests.
         for h in bs.task_handles {
             h.abort();

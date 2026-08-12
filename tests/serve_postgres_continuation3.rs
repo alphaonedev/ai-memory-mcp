@@ -78,6 +78,7 @@ async fn build_postgres_app_state(url: &str) -> AppState {
             ai_memory::identity::replay::FederationNonceCache::default(),
         ),
         autonomous_hooks: false,
+        auto_tag_queue: None,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
         // #957 (security-critical, 2026-05-20) — `/api/v1/export`

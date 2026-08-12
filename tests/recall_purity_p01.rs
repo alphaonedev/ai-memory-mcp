@@ -466,6 +466,7 @@ async fn purity_pure_default_http_entry_path() {
             ai_memory::identity::replay::FederationNonceCache::default(),
         ),
         autonomous_hooks: false,
+        auto_tag_queue: None,
         recall_scope: std::sync::Arc::new(None),
         deferred_audit_queue: std::sync::Arc::new(None),
         admin_agent_ids: std::sync::Arc::new(Vec::new()),

@@ -244,7 +244,8 @@ pub struct AppState {
     pub llm: Arc<crate::reload::SwappableLlm>,
 
     /// v0.7.0 L15 — dedicated model id for `auto_tag` (and other short
-    /// structured-output LLM calls). When `Some`, [`maybe_auto_tag`]
+    /// structured-output LLM calls). When `Some`, the background
+    /// `auto_tag` worker (`crate::background::auto_tag_worker`, #2587)
     /// passes the value as `OllamaClient::auto_tag(.., Some(model))` so
     /// the call hits a fast tag-friendly model (default config recommends
     /// `gemma3:4b`, ~0.7s p50) instead of the reasoning-tier `llm_model`
@@ -291,6 +292,20 @@ pub struct AppState {
     /// `detect_conflicts` override. `false` preserves the v0.6.x
     /// post-hoc-only contradiction surface.
     pub autonomous_hooks: bool,
+
+    /// #2587 — bounded producer handle for the async `auto_tag` worker
+    /// (`crate::background::auto_tag_worker`). The HTTP `create_memory`
+    /// handlers (both sqlite and postgres branches) `try_send` a job here
+    /// AFTER the durable insert — never awaiting the LLM, never blocking
+    /// the response, never failing the write on a full or absent queue.
+    /// `Some` when `bootstrap_serve` spawned the worker (always, in
+    /// production); `None` in test scaffolds that don't need live
+    /// background tagging — `try_enqueue_auto_tag` degrades honestly
+    /// (counts + logs, response omits `auto_tagging`) when this is
+    /// `None`. `Sender` is cheap to clone (internally `Arc`-backed), so
+    /// this field keeps `AppState::clone()` cheap like every other field.
+    pub auto_tag_queue:
+        Option<tokio::sync::mpsc::Sender<crate::background::auto_tag_worker::AutoTagJob>>,
 
     /// v0.7.0 (issue #518) — resolved
     /// `[agents.defaults.recall_scope]` block. `Some` carries the
