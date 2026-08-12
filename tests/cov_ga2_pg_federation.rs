@@ -83,6 +83,51 @@ fn uniq(prefix: &str) -> String {
     format!("{prefix}-{}", &uuid::Uuid::new_v4().to_string()[..8])
 }
 
+/// #2531 — poll for the stamped `embedding_space` column instead of a single
+/// synchronous read immediately after the HTTP response returns.
+///
+/// `sync_push_via_store`'s shipped-vector arm (`federation_signing_check.rs`)
+/// has TWO legitimate completion paths, by design (Degrade, never corrupt):
+/// the common-case DIRECT stamp, awaited synchronously inside the request
+/// handler (`update_embedding` on the same connection before the response is
+/// built), and a DEFERRED fallback — `spawn_deferred_embedding_refresh_via_store`
+/// fires a detached `tokio::spawn` task whenever the direct write can't run
+/// (a transient `update_embedding` error, or a same-instant race on the
+/// SHARED, globally-typed `memories.embedding` column against whatever else
+/// is concurrently exercising the same `AI_MEMORY_TEST_POSTGRES_URL`
+/// database this suite explicitly has "no per-test schema isolation" against
+/// — see CLAUDE.md "Local coverage" and the sibling sqlite precedent
+/// `tests/federation_1566_embed_ship.rs::wait_for_embedding` /
+/// `tests/federation_2168_embed_fingerprint.rs::wait_for_embedding`, which
+/// poll the analogous sqlite deferred-embed column for the same reason). In
+/// THIS test the shipped model equals the receiver's own configured model,
+/// so both arms converge on the identical claimed/active fingerprint — a
+/// single unconditional synchronous read (the pre-#2531 shape) had zero
+/// tolerance for the deferred arm and could observe a transient `NULL`
+/// between the response returning and the background task landing. Bounded
+/// to 3s (comfortably above the sub-second background-task turnaround
+/// measured locally); a genuine regression in EITHER arm still fails loud
+/// once the budget elapses.
+async fn wait_for_pg_embedding_space(
+    inspect: &PostgresStore,
+    id: &str,
+    budget: Duration,
+) -> Option<String> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let got: Option<String> =
+            sqlx::query_scalar("SELECT embedding_space FROM memories WHERE id = $1")
+                .bind(id)
+                .fetch_one(inspect.pool())
+                .await
+                .expect("read stamped embedding_space");
+        if got.is_some() || std::time::Instant::now() >= deadline {
+            return got;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Build a production router backed by a live `PostgresStore`. The embedder
 /// is `None` (keyword-only) — that is the load-bearing condition for the
 /// deferred-embed fallback: with no local embedder `receiver_dim` resolves
@@ -690,22 +735,22 @@ async fn pg_sync_push_via_store_shipped_embedding_stamps_space_2167() {
         "row applied; body={b}"
     );
 
-    // Verify the pgvector row was stamped with the sender's claimed space
-    // (proves the accept-and-stamp arm ran, not the deferred fallback).
+    // Verify the pgvector row was stamped with the sender's claimed space.
+    // #2531 — poll (bounded 3s) rather than a single synchronous read: the
+    // shipped model equals the receiver's own configured model, so BOTH the
+    // direct accept-and-stamp arm and the deferred fallback converge on the
+    // identical `active_fp`; polling tolerates the by-design deferred path
+    // without masking a genuine stamping regression (see
+    // `wait_for_pg_embedding_space` doc comment for the full rationale).
     let inspect = PostgresStore::connect(&url)
         .await
         .expect("connect inspect store");
-    let got: Option<String> =
-        sqlx::query_scalar("SELECT embedding_space FROM memories WHERE id = $1")
-            .bind(&mid)
-            .fetch_one(inspect.pool())
-            .await
-            .expect("read stamped embedding_space");
+    let got = wait_for_pg_embedding_space(&inspect, &mid, Duration::from_secs(3)).await;
     assert_eq!(
         got.as_deref(),
         Some(active_fp.as_str()),
         "shipped matching-space vector must be stamped with the claimed space \
-         (#2167 §2-EXC); got {got:?}"
+         (#2167 §2-EXC, direct-stamp OR its by-design deferred fallback); got {got:?}"
     );
 
     // Cleanup.
