@@ -9262,8 +9262,13 @@ pub(crate) fn run_env_isolated_child_or_spawn(exact_path: &str) -> bool {
     }
     // The child inherits the parent's environment (incl. AI_MEMORY_NO_CONFIG
     // and TMPDIR), so we only add the role marker.
-    let output = std::process::Command::new(
+    // Route the spawn through the #1937 audited chokepoint (never a raw
+    // process-constructor, which the `spawn_audit_gate_1937` guard bans
+    // outside `src/spawn_audit.rs`). The best-effort audit emit is a no-op
+    // here because no spawn-audit DB is seeded in a unit-test process.
+    let output = crate::spawn_audit::audited_command(
         std::env::current_exe().expect("current_exe for env-isolated test spawn"),
+        "config::run_env_isolated_child_or_spawn",
     )
     .args(["--exact", exact_path, "--nocapture", "--test-threads=1"])
     .env(TEST_ENV_ISOLATION_ROLE_ENV, "child")
