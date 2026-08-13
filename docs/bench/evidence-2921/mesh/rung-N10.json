@@ -1,0 +1,274 @@
+{
+  "issue": 2921,
+  "leg": "local-single-host-multi-container",
+  "generated_at_utc": "2026-08-13T14:55:00Z",
+  "nodes": 10,
+  "peers_per_node": 9,
+  "namespace": "mesh2921",
+  "corpus": 1000,
+  "write_concurrency": 8,
+  "attestation": {
+    "posture": "shipped v1.0.0 defaults -- HTTP-direct writes and relayed third-party writes both REQUIRE a valid Ed25519 signature",
+    "author": "ai:bench-author@cap2921",
+    "pool_size": 1000,
+    "pool_consumed": 1000,
+    "pool_age_secs_at_write_end": 15.9
+  },
+  "health": {
+    "ready_secs": {
+      "am2921-node-01": 0.004,
+      "am2921-node-02": 0.005,
+      "am2921-node-03": 0.006,
+      "am2921-node-04": 0.007,
+      "am2921-node-05": 0.008,
+      "am2921-node-06": 0.009,
+      "am2921-node-07": 0.01,
+      "am2921-node-08": 0.011,
+      "am2921-node-09": 0.012,
+      "am2921-node-10": 0.013
+    },
+    "unhealthy": [],
+    "all_healthy": true
+  },
+  "write": {
+    "offered": 1000,
+    "accepted": 1000,
+    "write_wall_s": 9.602,
+    "accepted_ops_per_s": 104.149,
+    "http_codes": {
+      "201": 1000
+    },
+    "pool_exhausted": false,
+    "p50_ms": 59.526,
+    "p95_ms": 181.485,
+    "p99_ms": 233.135
+  },
+  "convergence": {
+    "expect": 1000,
+    "converged": true,
+    "converged_nodes": 10,
+    "total_nodes": 10,
+    "per_node_converged_s": {
+      "node-01": 11.717,
+      "node-02": 11.719,
+      "node-03": 11.721,
+      "node-04": 11.722,
+      "node-05": 11.724,
+      "node-06": 11.725,
+      "node-07": 11.727,
+      "node-08": 11.728,
+      "node-09": 11.73,
+      "node-10": 11.731
+    },
+    "final_counts": {
+      "node-01": 1000,
+      "node-02": 1000,
+      "node-03": 1000,
+      "node-04": 1000,
+      "node-05": 1000,
+      "node-06": 1000,
+      "node-07": 1000,
+      "node-08": 1000,
+      "node-09": 1000,
+      "node-10": 1000
+    },
+    "converged_s": 11.731,
+    "slowest_node": "node-10",
+    "poll_interval_s": 1.0
+  },
+  "tail_s": 2.129,
+  "aggregate_push_ops_per_s": 937.341,
+  "federation_metrics": {
+    "am2921-node-01": {
+      "ai_memory_federation_partial_quorum_total": 1000.0,
+      "ai_memory_federation_push_dlq_depth": 3172.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1.0
+    },
+    "am2921-node-02": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1.0
+    },
+    "am2921-node-03": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1.0
+    },
+    "am2921-node-04": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1.0
+    },
+    "am2921-node-05": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1.0
+    },
+    "am2921-node-06": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1.0
+    },
+    "am2921-node-07": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1.0
+    },
+    "am2921-node-08": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1.0
+    },
+    "am2921-node-09": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1.0
+    },
+    "am2921-node-10": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1.0
+    }
+  },
+  "metrics_scrape_failures": 0,
+  "metrics_nodes_scraped": 10,
+  "dlq_depth_total": 3172.0,
+  "docker_stats": {
+    "pre_write": {
+      "am2921-node-01": {
+        "cpu_pct": "0.00%",
+        "mem": "4.246MiB"
+      },
+      "am2921-node-05": {
+        "cpu_pct": "0.00%",
+        "mem": "4.238MiB"
+      },
+      "am2921-node-09": {
+        "cpu_pct": "0.00%",
+        "mem": "4.496MiB"
+      },
+      "am2921-node-06": {
+        "cpu_pct": "0.00%",
+        "mem": "4.445MiB"
+      },
+      "am2921-node-10": {
+        "cpu_pct": "0.00%",
+        "mem": "4.23MiB"
+      },
+      "am2921-node-03": {
+        "cpu_pct": "0.00%",
+        "mem": "4.484MiB"
+      },
+      "am2921-node-02": {
+        "cpu_pct": "0.00%",
+        "mem": "4.242MiB"
+      },
+      "am2921-node-04": {
+        "cpu_pct": "0.00%",
+        "mem": "4.27MiB"
+      },
+      "am2921-node-07": {
+        "cpu_pct": "0.00%",
+        "mem": "4.262MiB"
+      },
+      "am2921-node-08": {
+        "cpu_pct": "0.00%",
+        "mem": "4.242MiB"
+      }
+    },
+    "post_write": {
+      "am2921-node-01": {
+        "cpu_pct": "10.04%",
+        "mem": "34.38MiB"
+      },
+      "am2921-node-05": {
+        "cpu_pct": "5.77%",
+        "mem": "16.12MiB"
+      },
+      "am2921-node-09": {
+        "cpu_pct": "13.30%",
+        "mem": "18.01MiB"
+      },
+      "am2921-node-06": {
+        "cpu_pct": "4.56%",
+        "mem": "18.08MiB"
+      },
+      "am2921-node-10": {
+        "cpu_pct": "12.55%",
+        "mem": "18.3MiB"
+      },
+      "am2921-node-03": {
+        "cpu_pct": "8.92%",
+        "mem": "16.47MiB"
+      },
+      "am2921-node-02": {
+        "cpu_pct": "10.82%",
+        "mem": "17.08MiB"
+      },
+      "am2921-node-04": {
+        "cpu_pct": "5.46%",
+        "mem": "15.44MiB"
+      },
+      "am2921-node-07": {
+        "cpu_pct": "9.61%",
+        "mem": "18.03MiB"
+      },
+      "am2921-node-08": {
+        "cpu_pct": "13.99%",
+        "mem": "17.12MiB"
+      }
+    },
+    "post_converge": {
+      "am2921-node-01": {
+        "cpu_pct": "8.79%",
+        "mem": "34.58MiB"
+      },
+      "am2921-node-05": {
+        "cpu_pct": "7.55%",
+        "mem": "17.18MiB"
+      },
+      "am2921-node-09": {
+        "cpu_pct": "11.67%",
+        "mem": "18.33MiB"
+      },
+      "am2921-node-06": {
+        "cpu_pct": "7.45%",
+        "mem": "18.74MiB"
+      },
+      "am2921-node-10": {
+        "cpu_pct": "10.85%",
+        "mem": "18.28MiB"
+      },
+      "am2921-node-03": {
+        "cpu_pct": "3.67%",
+        "mem": "16.29MiB"
+      },
+      "am2921-node-02": {
+        "cpu_pct": "12.78%",
+        "mem": "16.98MiB"
+      },
+      "am2921-node-04": {
+        "cpu_pct": "12.32%",
+        "mem": "15.98MiB"
+      },
+      "am2921-node-07": {
+        "cpu_pct": "7.23%",
+        "mem": "17MiB"
+      },
+      "am2921-node-08": {
+        "cpu_pct": "2.78%",
+        "mem": "17.32MiB"
+      }
+    }
+  }
+}

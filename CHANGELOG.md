@@ -31,6 +31,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and asserts THIS checkout is GREEN. Declared in
   `scripts/qc-allowlists/required-contexts-release.txt` (mirror-first;
   live branch-protection API is the operator-gated follow-up).
+### Docs + bench (MEASURED capacity envelope; #2921)
+
+- **The federation scale envelope now has measured evidence under it.**
+  The v1.0.0 enterprise-federation certification disclosed its largest
+  unmeasured caveat honestly — the envelope was ARCHITECTED, not
+  MEASURED, the largest real-mesh-measured federation was **2 nodes**,
+  and `docs/enterprise-deployment.md` §11.1 published NO throughput at
+  all because eleven of fourteen former ops/s cells had no producer.
+  ([#2921](https://github.com/alphaonedev/ai-memory-mcp/issues/2921);
+  successor to the closed scope-reset
+  [#2438](https://github.com/alphaonedev/ai-memory-mcp/issues/2438)).
+- **New: `infra/bench-mesh/`** — a generated N-node full-mesh federation
+  stack. Measured at **N = 2, 5, 10, 25 and 50 peers, single-host
+  multi-container**, under the shipped v1.0.0 fail-closed attestation
+  defaults (peer enrollment, push signature and per-write content
+  signature all required; the corpus is signed by an enrolled author via
+  the in-tree `examples/attest_sign_batch`). **Every rung converged a
+  1,000-memory corpus on every node.** Per-node accepted write rate falls
+  249.7 → 18.5 ops/s across the ramp; time-to-convergence steps from
+  17.0 s at N = 25 to 256.6 s at N = 50, and `202` locally-durable
+  responses appear at N = 50 — the ~50-peer guidance in
+  `docs/federation.md` now has a measured curve under it. Degradation is
+  DEGRADE-never-corrupt throughout: no row lost, no duplicate, nothing
+  dropped or quarantined.
+- **New: `scripts/bench/`** — re-runnable producers for the three §11.1
+  cells that had none (`memory_store`, `memory_recall`, `/sync/push`),
+  emitting the results-JSON contract `infra/pillar4-envelope/usl-fit.py`
+  already consumes. §11.1 now publishes those figures **with their host,
+  tier, backend, posture and instrument calibration**, and keeps its
+  governing principle verbatim: *an unproduced number is not data*.
+- **`docs/federation.md` scale language** updated from
+  ARCHITECTED-not-MEASURED to *measured up to 50 peers single-host,
+  2 nodes cross-host* — with the **500–1000 agent figure explicitly
+  retained as a derived topology ceiling**, because peer counts were
+  measured and agent counts were not.
+- Results, methodology and an explicit limitations section:
+  `docs/bench/capacity-envelope-2921.md`; sanitised raw run artifacts
+  under `docs/bench/evidence-2921/`.
+- **Two defects the bench itself surfaced and this change discloses:**
+  the shipped per-agent quota (`AI_MEMORY_MAX_MEMORIES_PER_DAY`, default
+  1,000/day) caps any single-attested-author corpus at 1,000 rows with
+  `429` — so a capacity ramp must raise it, and an operator sizing
+  against these figures must too; and a `/metrics` sweep that fails is
+  now reported as `null` with a failure count rather than summed as a
+  zero, so an unavailable DLQ depth can never read as an empty queue.
+- **The cross-host DigitalOcean leg was PREPARED, NOT EXECUTED,** and
+  cost **$0.00**. `infra/do-hive/spawn.sh` and its README both state that
+  AI agents are forbidden from setting the spend-approval variable; the
+  lane is built up to that line (`infra/do-hive/capacity-mesh.tfvars`,
+  5 cross-host nodes, adding no new provisioning machinery) and stops
+  there. See the results doc §6 for the operator run recipe and the one
+  genuinely missing piece (a Postgres/SSH convergence probe).
+
 ### Docs (capability inventory re-derivation; #1938)
 
 - **Re-derived the NSA CSI capability inventory against `release/v1.0.0`

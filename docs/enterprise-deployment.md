@@ -1501,15 +1501,82 @@ against a silent AGE-perf regression.
 
 ## 11. Capacity planning
 
-### 11.1 Sustained throughput — NOT PUBLISHED
+### 11.1 Sustained throughput — MEASURED, with producers
 
 **This section previously carried a 14-cell ops/s table attributed to
 the in-tree benchmark suite. Eleven of those fourteen cells had no
 producer in `benches/` at all, and the entire Postgres+AGE column came
 from a bench that `exit 0`s unless `AI_MEMORY_TEST_AGE_URL` is
-exported. The table is removed rather than annotated: an unproduced
+exported. The table was removed rather than annotated: an unproduced
 number is not data, and this is the section a capacity plan is built
 from.**
+
+**That principle is unchanged — it is why the numbers below exist.**
+Three of the retired cells (`memory_store`, `memory_recall`,
+`/sync/push`) now have re-runnable producers under
+[`scripts/bench/`](https://github.com/alphaonedev/ai-memory-mcp/blob/release/v1.0.0/scripts/bench/README.md),
+and the figures published here come from those producers, on a named
+host, in a stated configuration ([#2921](https://github.com/alphaonedev/ai-memory-mcp/issues/2921)).
+Everything still unmeasured is still absent from this page.
+
+#### Measured on one named host
+
+| | |
+|---|---|
+| CPU | Intel Core Ultra 5 225H — 14 logical cores |
+| RAM | 93.6 GiB |
+| Storage | NVMe SSD, ext4 |
+| OS | Pop!_OS 24.04 LTS, kernel 7.0.11 |
+| Binary | `ai-memory 1.0.0`, `cargo build --release` |
+| Backend / tier | SQLite (WAL) / `keyword` — **no embedder, no LLM, no reranker** |
+
+Offered concurrency is `N` keep-alive clients in a zero-think-time loop.
+**A client is not an agent** — an LLM-paced agent offers orders of
+magnitude less, so these bound agent counts from above and are never an
+agent capacity.
+
+| Surface | Posture | ops/s @ 1 client | peak ops/s (client count) | p50 / p95 ms at peak |
+|---|---|---|---|---|
+| `POST /api/v1/memories` (`memory_store`) | **shipped default** — per-write Ed25519 attestation REQUIRED | 596 | **626** (64) | 101.3 / 121.2 |
+| `POST /api/v1/memories` (`memory_store`) | unsigned control — `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`, **not a supported posture** | 615 | **615** (1) | 1.2 / 3.8 |
+| `GET /api/v1/recall` (`memory_recall`) | keyword tier, 5,000-row corpus | 65 | **195** (4) | 19.1 / 28.2 |
+| `POST /api/v1/sync/push` (end-to-end, 1 peer, `W=2`) | **shipped default**, attested | 135 | **242** (4) | 14.1 / 33.4 |
+
+Zero errors and zero admission-control sheds at every rung. The
+`/sync/push` figure is the sender's accepted W=2 write rate and was
+confirmed independently at the receiver by its durable row-count delta
+(29,228 rows applied).
+
+**Read these with their caveats, which are not optional:**
+
+* **Instrument bound.** Each ramp also measures the driver against
+  `/api/v1/health` and recorded ~5,460–5,656 ops/s. Every figure above is
+  ~9× below that, so none is instrument-bound.
+* **The unsigned row does NOT isolate the cost of attestation.** The two
+  store rungs differ in *driver* work as well — the attested rung replays
+  pre-serialised bodies while the unsigned rung JSON-encodes each request.
+  The honest conclusion is only that per-write signature verification is
+  **not the dominant term** (both land in the same band), not that it is
+  free.
+* **The write path serialises.** Throughput is flat from 1 to 64 clients
+  while latency rises linearly — the shape of a single
+  `Arc<Mutex<Connection>>` SQLite handle, exactly as §"Architecture"
+  describes. Adding clients buys latency, not throughput.
+* **One host, SQLite, keyword tier, ~120-byte payloads.** Nothing here
+  measures Postgres, larger payloads, semantic/autonomous tiers, or a
+  multi-tenant mix.
+* **Per-agent quotas were raised for the measurement.** The shipped
+  defaults are 1,000 memory-writes/day and 100 MiB per agent
+  (`AI_MEMORY_MAX_MEMORIES_PER_DAY` / `AI_MEMORY_MAX_STORAGE_BYTES`).
+  Every rung writes as one attested author, so at the shipped default a
+  ramp stops at write 1,001 with `429`. **If you size against these
+  figures, size the quota too.**
+
+Full methodology, the mesh-scaling results, the USL fit and the honest
+limitations list:
+[`bench/capacity-envelope-2921.md`](bench/capacity-envelope-2921.html).
+
+#### What the in-tree benches measure (unchanged)
 
 What the seven in-tree benches actually measure, verified at HEAD:
 
@@ -1518,9 +1585,10 @@ What the seven in-tree benches actually measure, verified at HEAD:
 | `benches/recall.rs`, `reflect.rs`, `reranker_throughput.rs`, `longmemeval_reflection.rs`, `harness_bench.rs` | Criterion **latency** distributions on SQLite | No |
 | `benches/hnsw_rebuild_async.rs` | Async HNSW rebuild wall-clock at a **5,000**-vector default fixture (`DEFAULT_FIXTURE_SIZE`) | No — and note it is 5k, not the 100k an earlier revision extrapolated to |
 | `benches/age_vs_cte.rs` | `kg_query` depth=5, AGE vs relational CTE — the **only** Postgres-touching bench; **self-skips with `exit 0`** unless `AI_MEMORY_TEST_AGE_URL` is set | Only under a live AGE instance an operator supplies |
-| — | `memory_store` ops/s, `memory_recall` cold/hot ops/s, `/sync/push` ops/s, on **either** backend | **No producer exists.** |
+| — | `memory_store` ops/s, `memory_recall` cold/hot ops/s, `/sync/push` ops/s, on **either** backend | **No producer in `benches/`.** These are END-TO-END HTTP-surface figures, a different instrument; their producers are `scripts/bench/ops_producer.py` + `run-ops-producers.sh` (#2921), and their SQLite results are the table above. **Postgres remains unmeasured.** |
 
-**What to size against instead.** Use the published **latency budgets**
+**What else to size against.** The measured table above is one host, one
+backend, one tier. Alongside it, use the published **latency budgets**
 — those are real, mechanically pinned in both directions against
 `src/bench.rs`, and reproducible on your own hardware:
 
@@ -1531,9 +1599,12 @@ ai-memory bench --scale 10000 --json    # record CPU / RAM / disk alongside the 
 See [`PERFORMANCE.md`](../PERFORMANCE.md) for the budget tables and the
 methodology, and treat throughput as something you must measure on your
 own hardware and workload mix. If you need a committed throughput
-figure for a procurement gate, run the measurement and record the host —
-do not carry a number forward from this document, because there is no
-longer one here to carry.
+figure for a procurement gate, **run the measurement on your own host** —
+`scripts/bench/run-ops-producers.sh` reproduces the table above in one
+command, and its results JSON carries the host facts alongside every
+figure. Do not carry a number forward from this document as if it were
+a guarantee: it is a measurement of the host named above, not a promise
+about yours.
 
 **What is still true and enforced:** cross-backend recall parity. The
 same query returns the same top-K with the same per-factor score

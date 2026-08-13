@@ -1,0 +1,23 @@
+======================================================================
+USL fit -- #2438 capacity projection
+======================================================================
+series           : total
+substrate host   : single-host   (numbers are host-relative)
+backend          : sqlite
+corpus scale      : 0 rows
+ramp points       : 7   (offered concurrency 1..64)  [MEASURED]
+----------------------------------------------------------------------
+lambda (ideal ops/s per agent) : 504.4615
+sigma  (serialization)         : 0.806461
+kappa  (crosstalk / coherency) : -0.00005562
+fit rel-RMSE over ramp         : 7.18%   [MEASURED within range]
+----------------------------------------------------------------------
+curve shape      : degenerate/near-linear (sigma/kappa at model edge)   [MEASURED]
+knee N*          : none within model (kappa<=0 or sigma>=1) -- no retrograde point measured; projection is a saturating bound [ESTIMATED-not-MEASURED]
+----------------------------------------------------------------------
+PROJECTION to N=500 agents (one substrate module):
+  LOWER BOUND: T(500) >= T(max measured N=64) = 625.63 ops/s   [ESTIMATED-not-MEASURED]
+  (knee not reached in the measured ramp -- the model point estimate 647.50 ops/s is UNTRUSTWORTHY; raise offered concurrency and re-measure. measure-envelope.sh exit-72 discipline.)
+----------------------------------------------------------------------
+======================================================================
+Composition rule (v1.0.0): cluster capacity for A agents = M independent substrate modules, M = ceil(A / A_module*), A_module* = the MEASURED knee N* held at the p95 budget on the cited host. Modules federate as static-list peers, mesh bounded at <= 50 peers (enterprise-deployment.md 8.8). A block/cluster needing > 50 modules needs the cross-mesh placement layer that does NOT exist at v1.0.0 (#2438 path 1) -- NOT certifiable by composition. Every projected number above is ESTIMATED-not-MEASURED.

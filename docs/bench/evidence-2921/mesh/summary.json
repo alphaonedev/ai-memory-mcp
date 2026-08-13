@@ -1,0 +1,64 @@
+{
+  "rows": [
+    {
+      "N": 2,
+      "corpus": 1000,
+      "accepted": 1000,
+      "write_s": 4.004,
+      "wr_ops/s": 249.743,
+      "push_ops/s": 249.743,
+      "conv": true,
+      "conv_s": 6.084,
+      "tail_s": 2.08,
+      "dlq": 0.0
+    },
+    {
+      "N": 5,
+      "corpus": 1000,
+      "accepted": 1000,
+      "write_s": 4.559,
+      "wr_ops/s": 219.323,
+      "push_ops/s": 877.292,
+      "conv": true,
+      "conv_s": 6.663,
+      "tail_s": 2.104,
+      "dlq": 0.0
+    },
+    {
+      "N": 10,
+      "corpus": 1000,
+      "accepted": 1000,
+      "write_s": 9.602,
+      "wr_ops/s": 104.149,
+      "push_ops/s": 937.341,
+      "conv": true,
+      "conv_s": 11.731,
+      "tail_s": 2.129,
+      "dlq": 3172.0
+    },
+    {
+      "N": 25,
+      "corpus": 1000,
+      "accepted": 1000,
+      "write_s": 14.72,
+      "wr_ops/s": 67.937,
+      "push_ops/s": 1630.488,
+      "conv": true,
+      "conv_s": 16.966,
+      "tail_s": 2.246,
+      "dlq": 11172.0
+    },
+    {
+      "N": 50,
+      "corpus": 1000,
+      "accepted": 1000,
+      "write_s": 54.016,
+      "wr_ops/s": 18.513,
+      "push_ops/s": 907.137,
+      "conv": true,
+      "conv_s": 256.592,
+      "tail_s": 202.576,
+      "dlq": null
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "nodes": 50,
+  "project": "ai-memory-bench-mesh-2921",
+  "quorum_writes": 26,
+  "quorum_timeout_ms": 2000,
+  "catchup_interval_secs": 5,
+  "node_port": 19077,
+  "subnet": "172.30.0.0/16",
+  "image": "ai-memory-bench-mesh:2921",
+  "tier": "keyword",
+  "quota_max_memories_per_day": 10000000,
+  "quota_max_storage_bytes": 10737418240,
+  "author": "ai:bench-author@cap2921",
+  "author_pubkey_b64": "FMla44L7R8y8VCEfSuTZe27Bs4eIC+fNZ+dyiGZQNz4=",
+  "attestation_posture": "shipped v1.0.0 defaults: HTTP-direct writes and relayed third-party writes both REQUIRE a valid Ed25519 signature",
+  "topology": "full-mesh (every node peers every other node)",
+  "api_key_len": 64
+}

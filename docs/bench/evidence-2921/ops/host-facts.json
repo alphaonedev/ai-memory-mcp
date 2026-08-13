@@ -1,0 +1,19 @@
+{
+  "captured_at_utc": "2026-08-13T14:21:11Z",
+  "kernel": "7.0.11-76070011-generic",
+  "arch": "x86_64",
+  "os": "Pop!_OS 24.04 LTS",
+  "cpu_model": "Intel(R) Core(TM) Ultra 5 225H",
+  "cpu_logical_cores": 14,
+  "threads_per_core": 1,
+  "mem_total_kb": 98164264,
+  "mem_total_gib": 93.6,
+  "storage": {
+    "device": "nvme0n1p3",
+    "fstype": "ext4",
+    "size": "912G",
+    "avail": "106G",
+    "rotational": false
+  },
+  "python": "3.12.7"
+}

@@ -1,0 +1,603 @@
+[bench-entrypoint] identity=host:am2921-node-02 port=19077
+[bench-entrypoint] peers=49 quorum_w=26 catchup=5s
+ai-memory: loaded config from /data/.config/ai-memory/config.toml
+[2m2026-08-13T14:56:09.876037Z[0m [33m WARN[0m [2mai_memory::daemon_runtime[0m[2m:[0m SECURITY POSTURE (#1798 R-04): daemon bound to non-loopback "0.0.0.0" with permissions mode=enforce but ZERO permission rules configured — the permissions pipeline then gates nothing (allow-on-silence default), so privileged writes are effectively UNGATED despite enforce mode. Add `[[permissions.rules]]` (or attach a namespace standard) to actually gate writes; otherwise enforce mode is a false sense of protection.
+[2m2026-08-13T14:56:09.876069Z[0m [33m WARN[0m [2mai_memory::daemon_runtime[0m[2m:[0m SECURITY POSTURE (#2032 M2): daemon bound to non-loopback "0.0.0.0" WITHOUT in-process TLS — the API key and all memory content are served in CLEARTEXT and are trivially sniffable off-host (exposure-recon / `ai_osint`-class discovery). Terminate TLS in front of the daemon (reverse proxy / service mesh) and set AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK=1 to acknowledge + silence this, OR pass --tls-cert / --tls-key for in-process TLS, OR set AI_MEMORY_REQUIRE_TLS=1 to hard-refuse a plaintext bind now. A future release (v1.1.0) will PROMOTE this WARN to a refusal for unacknowledged plaintext non-loopback binds.
+[2m2026-08-13T14:56:09.876078Z[0m [33m WARN[0m [2mai_memory::verify[0m[2m:[0m [verify] require_nonce is at its permissive default (false): POST /api/v1/links/verify accepts requests that OMIT verification_nonce, skipping H5 anti-replay protection. A future release (v1.1.0) will FLIP this default to `true` (fail-closed, #2032 LM3). Set [verify] require_nonce = true now to enforce, and ensure every verify caller sends a fresh UUID-v4 verification_nonce before the flip.
+[2m2026-08-13T14:56:09.876083Z[0m [33m WARN[0m [2mai_memory::federation::receive_auth[0m[2m:[0m AI_MEMORY_FED_REQUIRE_WRITE_SIG is UNSET: as of the v1.0.0 flip the default for inbound relayed per-write content signatures is now REQUIRED (#1464/#1801→#1954) — federation inbound IS the network surface (ruling 9e9c3cf2 condition 7). An honored third-party relayed write whose ORIGIN author has no locally-enrolled key is refused. Set AI_MEMORY_FED_REQUIRE_WRITE_SIG=0 to keep the permissive accept-and-flag opt-out during peer key-enrollment rollout, or enroll each author's key at every receiving node.
+[2m2026-08-13T14:56:09.876089Z[0m [33m WARN[0m [2mai_memory::federation::receive_auth[0m[2m:[0m AI_MEMORY_FED_REQUIRE_SIGNAL_SIG is UNSET: as of the v1.0.0 flip the default for inbound relayed signals is now REQUIRED (#1843/#1801→#1954) — federation inbound IS the network surface (ruling 9e9c3cf2 condition 7). A relayed signal whose from_agent has no locally-enrolled key is skipped. Set AI_MEMORY_FED_REQUIRE_SIGNAL_SIG=0 to keep the permissive opt-out during peer key-enrollment rollout.
+[2m2026-08-13T14:56:09.880504Z[0m [31mERROR[0m [2mai_memory::governance::deferred_audit[0m[2m:[0m deferred-audit journal open failed for /data/memories.db.deferred-audit.journal; audit delivery is FAIL-CLOSED: deferred-audit spool ancestor permits untrusted rename: /data
+[2m2026-08-13T14:56:09.880563Z[0m [32m INFO[0m [2mai_memory::daemon_runtime[0m[2m:[0m policy-engine item 3: deferred-audit drainer spawned (chain-logs storage refusals as `governance.refusal` rows in signed_events)
+[2m2026-08-13T14:56:09.882605Z[0m [32m INFO[0m [2mai_memory::daemon_runtime[0m[2m:[0m L1-6 governance pre-write hook installed (substrate-authoritative memory_write gate active + deferred chain-log on refusal)
+[2m2026-08-13T14:56:09.882622Z[0m [32m INFO[0m [2mai_memory::daemon_runtime[0m[2m:[0m wire_check pre-action hook installed (agent-action gate active for FilesystemWrite/NetworkRequest/ProcessSpawn; n26: Bash + Custom have no egress sink yet — structural coverage tracked v0.8 #1695)
+[2m2026-08-13T14:56:09.882642Z[0m [32m INFO[0m [2mai_memory::daemon_runtime[0m[2m:[0m embedder disabled — tier=keyword keyword-only (FTS5); semantic recall not wired
+[2m2026-08-13T14:56:09.883071Z[0m [32m INFO[0m [2mai_memory::daemon_runtime[0m[2m:[0m durability model: quorum-replicated (multi-node: true)
+[2m2026-08-13T14:56:09.883083Z[0m [32m INFO[0m [2mai_memory::daemon_runtime[0m[2m:[0m federation enabled: W=26 over 49 peer(s), timeout 2000ms
+[2m2026-08-13T14:56:09.883087Z[0m [32m INFO[0m [2mai_memory::daemon_runtime[0m[2m:[0m catchup loop enabled: polling 49 peer(s) every 5s
+[2m2026-08-13T14:56:09.883201Z[0m [32m INFO[0m [2mai_memory::daemon_runtime[0m[2m:[0m identity: loaded signing keypair for daemon from /keys
+[2m2026-08-13T14:56:09.894941Z[0m [32m INFO[0m [2mai_memory::daemon_runtime[0m[2m:[0m federation push DLQ replay worker enabled: polling every 5s
+[2m2026-08-13T14:56:09.904001Z[0m [32m INFO[0m [2mai_memory::daemon_runtime[0m[2m:[0m API key authentication enabled
+[2m2026-08-13T14:56:09.904024Z[0m [32m INFO[0m [2mai_memory::daemon_runtime[0m[2m:[0m permissions: enforce
+[2m2026-08-13T14:56:09.904028Z[0m [33m WARN[0m [2mai_memory::daemon_runtime[0m[2m:[0m v0.7.0 default changed to enforce; set permissions.mode=advisory in config to opt out — see release notes.
+[2m2026-08-13T14:56:09.904047Z[0m [32m INFO[0m [2mai_memory::daemon_runtime[0m[2m:[0m hooks enforcement: off (0 required event(s))
+[2m2026-08-13T14:56:09.904055Z[0m [32m INFO[0m [2mai_memory::daemon_runtime[0m[2m:[0m database: /data/memories.db
+[2m2026-08-13T14:56:09.904071Z[0m [33m WARN[0m [2mai_memory::daemon_runtime[0m[2m:[0m TLS NOT enabled — sync endpoints (/api/v1/sync/push, /api/v1/sync/since) accept any caller over plain HTTP. Set --tls-cert + --tls-key + --mtls-allowlist for production peer-mesh deployments (red-team #231).
+[2m2026-08-13T14:56:09.904076Z[0m [32m INFO[0m [2mai_memory::daemon_runtime[0m[2m:[0m ai-memory listening on http://0.0.0.0:19077
+[2m2026-08-13T14:56:09.904133Z[0m [32m INFO[0m [2mai_memory::daemon_runtime[0m[2m:[0m SIGHUP [llm] hot-reload armed — send SIGHUP to reload config.toml [llm] (#2166)
+[2m2026-08-13T14:56:20.905000Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1024a7f650561ffc325cd63e7cc1f1223 ok (0 row(s) returned)
+[2m2026-08-13T14:56:34.917108Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h14b50a83888384abe336f46b5bc756d0f ok (0 row(s) returned)
+[2m2026-08-13T14:56:40.926403Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1d2e34d378d3f53e2a6b75db9b35584ca ok (0 row(s) returned)
+[2m2026-08-13T14:56:50.940571Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h10aca4d6f5702ea9a7a79878c40432a6f ok (0 row(s) returned)
+[2m2026-08-13T14:56:50.945184Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1fdfe11f5fad7e0441d83fc852f8e64df ok (0 row(s) returned)
+[2m2026-08-13T14:56:50.949223Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1189421512bfe76d2bc278a22b45a84d2 ok (0 row(s) returned)
+[2m2026-08-13T14:56:50.953156Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1ca27f5fb6ec6c41ed67a4afed72b3dc1 ok (0 row(s) returned)
+[2m2026-08-13T14:56:52.969105Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h170007b6820049b04e2a84bab5fc8baf4 ok (0 row(s) returned)
+[2m2026-08-13T14:56:54.984658Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1a17ee446693954a256b6a0e80ca10727 ok (0 row(s) returned)
+[2m2026-08-13T14:56:59.114504Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h132d47b708ffbe1c96871f44df5995bb8 ok (0 row(s) returned)
+[2m2026-08-13T14:56:59.123746Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1fa210cb3336c37eb64fa287867de29a9 ok (0 row(s) returned)
+[2m2026-08-13T14:56:59.130513Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1491abfdff382b8815ed4fced97660619 ok (0 row(s) returned)
+[2m2026-08-13T14:57:01.151703Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h19e11f3dc850be6c7e2f96fb878505bcf ok (0 row(s) returned)
+[2m2026-08-13T14:57:01.160101Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h18d0eebbd13fd1f0473a063be8dfe1f22 ok (0 row(s) returned)
+[2m2026-08-13T14:57:01.710402Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-c32b18e1
+[2m2026-08-13T14:57:01.727847Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-6bd469c7
+[2m2026-08-13T14:57:01.734242Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-f1db440e
+[2m2026-08-13T14:57:01.750492Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-cf6dcd20
+[2m2026-08-13T14:57:01.770553Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-ee20880c
+[2m2026-08-13T14:57:01.775688Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-aabea796
+[2m2026-08-13T14:57:01.779401Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-26c0d76c
+[2m2026-08-13T14:57:01.790673Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-63ad8f73
+[2m2026-08-13T14:57:01.795870Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-c816e090
+[2m2026-08-13T14:57:01.805366Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-23540f33
+[2m2026-08-13T14:57:01.822744Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-662adf25
+[2m2026-08-13T14:57:01.822892Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-0088896b
+[2m2026-08-13T14:57:01.823000Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-3abc5ffa
+[2m2026-08-13T14:57:01.823104Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-dbf03926
+[2m2026-08-13T14:57:01.823203Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-02184e3e
+[2m2026-08-13T14:57:01.823646Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-06a2bf41
+[2m2026-08-13T14:57:01.850520Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-c9169b5c
+[2m2026-08-13T14:57:01.895935Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-20025e68
+[2m2026-08-13T14:57:01.924294Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-92bd98f3
+[2m2026-08-13T14:57:01.901331Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-d0f76796
+[2m2026-08-13T14:57:01.935640Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-37cf0827
+[2m2026-08-13T14:57:01.963596Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-8307c74c
+[2m2026-08-13T14:57:01.963741Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-aa9db23a
+[2m2026-08-13T14:57:01.963857Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-967e5d97
+[2m2026-08-13T14:57:01.963980Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-a27fe7fb
+[2m2026-08-13T14:57:01.973860Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-90de036a
+[2m2026-08-13T14:57:01.974018Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-827e1d43
+[2m2026-08-13T14:57:01.974139Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-ee0e335d
+[2m2026-08-13T14:57:02.052679Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-3a9ecc9b
+[2m2026-08-13T14:57:02.052820Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-9a6e02ba
+[2m2026-08-13T14:57:02.053038Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-0983c3e4
+[2m2026-08-13T14:57:02.079816Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-5605deb9
+[2m2026-08-13T14:57:02.083433Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-f8e72ce3
+[2m2026-08-13T14:57:02.083693Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-0ca4b1dd
+[2m2026-08-13T14:57:02.084373Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-2397b0c0
+[2m2026-08-13T14:57:02.104368Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-4a382d1d
+[2m2026-08-13T14:57:02.154986Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-07424d48
+[2m2026-08-13T14:57:02.155196Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-7afcffec
+[2m2026-08-13T14:57:02.155446Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-58ffb066
+[2m2026-08-13T14:57:02.158305Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-6b53ccfd
+[2m2026-08-13T14:57:02.158499Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-2f2bc5d5
+[2m2026-08-13T14:57:02.158667Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-d6bd7cd0
+[2m2026-08-13T14:57:02.158826Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-2842c2f6
+[2m2026-08-13T14:57:02.158969Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-a893ff93
+[2m2026-08-13T14:57:02.159213Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-0f475699
+[2m2026-08-13T14:57:02.159413Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-ae37c510
+[2m2026-08-13T14:57:02.159575Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-688ca3d7
+[2m2026-08-13T14:57:02.159687Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-ae9760c4
+[2m2026-08-13T14:57:02.159800Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-68120909
+[2m2026-08-13T14:57:02.159909Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-71b0df38
+[2m2026-08-13T14:57:02.160021Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-6e57067d
+[2m2026-08-13T14:57:02.160396Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-89d54f5a
+[2m2026-08-13T14:57:02.160641Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-ea442433
+[2m2026-08-13T14:57:02.160766Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-b9070729
+[2m2026-08-13T14:57:02.270397Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-210b2e71
+[2m2026-08-13T14:57:02.270556Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-104680f2
+[2m2026-08-13T14:57:02.270675Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-bcb1ce98
+[2m2026-08-13T14:57:02.270797Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-95562740
+[2m2026-08-13T14:57:02.271202Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-f384ea42
+[2m2026-08-13T14:57:02.271498Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-3886fd30
+[2m2026-08-13T14:57:02.274772Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-2bbeb88b
+[2m2026-08-13T14:57:02.274590Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-b875486e
+[2m2026-08-13T14:57:02.271369Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-80b3f1da
+[2m2026-08-13T14:57:02.275015Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-53d833d5
+[2m2026-08-13T14:57:02.297652Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-c454963f
+[2m2026-08-13T14:57:02.274837Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-e1298df5
+[2m2026-08-13T14:57:02.297910Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-428de23d
+[2m2026-08-13T14:57:02.416489Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-182a50f6
+[2m2026-08-13T14:57:02.416678Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-1ac91370
+[2m2026-08-13T14:57:02.416822Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-562fccbc
+[2m2026-08-13T14:57:02.416958Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-8cce3cb8
+[2m2026-08-13T14:57:02.417091Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-3dc580f3
+[2m2026-08-13T14:57:02.417210Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-4f2b3fbd
+[2m2026-08-13T14:57:02.417329Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-78fc976b
+[2m2026-08-13T14:57:02.427312Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-8ca27e24
+[2m2026-08-13T14:57:02.446268Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-c2044b0a
+[2m2026-08-13T14:57:02.485265Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-7614a663
+[2m2026-08-13T14:57:02.486674Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-00ed19fe
+[2m2026-08-13T14:57:02.503858Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-85171069
+[2m2026-08-13T14:57:02.537203Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-e0a34b79
+[2m2026-08-13T14:57:02.548730Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-f7a0e46c
+[2m2026-08-13T14:57:02.552699Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-821e89f3
+[2m2026-08-13T14:57:02.570208Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-9bd6edb3
+[2m2026-08-13T14:57:02.646938Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-7ee319d8
+[2m2026-08-13T14:57:02.656039Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-b72b7962
+[2m2026-08-13T14:57:02.673756Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-cf605767
+[2m2026-08-13T14:57:02.695253Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-86c73777
+[2m2026-08-13T14:57:02.736073Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-bef4eba2
+[2m2026-08-13T14:57:02.755444Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-1edd0a20
+[2m2026-08-13T14:57:02.779267Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-4520b956
+[2m2026-08-13T14:57:02.830391Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-fcafc239
+[2m2026-08-13T14:57:02.850199Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-53b0f43f
+[2m2026-08-13T14:57:02.868561Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-61b4532e
+[2m2026-08-13T14:57:02.949951Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-6ef3da42
+[2m2026-08-13T14:57:02.992116Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-ffa0704f
+[2m2026-08-13T14:57:03.006235Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-47735833
+[2m2026-08-13T14:57:03.102647Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-6f5d7a77
+[2m2026-08-13T14:57:03.103049Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-98f088b8
+[2m2026-08-13T14:57:03.103326Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-9b0d2114
+[2m2026-08-13T14:57:03.103466Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-5ac760e4
+[2m2026-08-13T14:57:03.113339Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-47154b86
+[2m2026-08-13T14:57:03.154653Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-b49d70c0
+[2m2026-08-13T14:57:03.164821Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-4cef4dca
+[2m2026-08-13T14:57:03.192108Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-a90963ff
+[2m2026-08-13T14:57:03.237175Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-f5eea643
+[2m2026-08-13T14:57:03.275503Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-61497498
+[2m2026-08-13T14:57:03.275728Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-01ddc4da
+[2m2026-08-13T14:57:03.286905Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-3f9e547e
+[2m2026-08-13T14:57:03.287195Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-4f3f12f4
+[2m2026-08-13T14:57:03.318270Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-9c11680f
+[2m2026-08-13T14:57:03.355045Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-92511a92
+[2m2026-08-13T14:57:03.412155Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-5ae195c4
+[2m2026-08-13T14:57:03.419371Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-706c868a
+[2m2026-08-13T14:57:03.426174Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-556d4e69
+[2m2026-08-13T14:57:03.435479Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-18cce9e3
+[2m2026-08-13T14:57:03.459501Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-4f131ea8
+[2m2026-08-13T14:57:03.506869Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-3c693f61
+[2m2026-08-13T14:57:03.549326Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-afa77660
+[2m2026-08-13T14:57:03.572490Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-3547a83f
+[2m2026-08-13T14:57:03.637920Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-6f62952d
+[2m2026-08-13T14:57:03.662912Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-75f4d2a2
+[2m2026-08-13T14:57:03.707712Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-4629f53a
+[2m2026-08-13T14:57:03.735776Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-3a60327e
+[2m2026-08-13T14:57:03.735914Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-2bc035a5
+[2m2026-08-13T14:57:03.748960Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-3ec829be
+[2m2026-08-13T14:57:03.751746Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-339a3b74
+[2m2026-08-13T14:57:03.772830Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-0184a6c0
+[2m2026-08-13T14:57:03.792171Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-0e24785a
+[2m2026-08-13T14:57:03.815313Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-ac70c4c3
+[2m2026-08-13T14:57:03.843489Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-e3d6eb7f
+[2m2026-08-13T14:57:03.863952Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-e0cea5f0
+[2m2026-08-13T14:57:03.891481Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-52eb7bc2
+[2m2026-08-13T14:57:03.959720Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-78dfb2d2
+[2m2026-08-13T14:57:04.022171Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-a528b36c
+[2m2026-08-13T14:57:04.022475Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-d6eda769
+[2m2026-08-13T14:57:04.030652Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-28a24646
+[2m2026-08-13T14:57:04.070053Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-7fea0780
+[2m2026-08-13T14:57:04.070844Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-49944f89
+[2m2026-08-13T14:57:04.072281Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-94e85a6f
+[2m2026-08-13T14:57:04.085367Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-b1387ae8
+[2m2026-08-13T14:57:04.207391Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-ca6f47af
+[2m2026-08-13T14:57:04.228073Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-760de95f
+[2m2026-08-13T14:57:04.249021Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-cd3ca0f0
+[2m2026-08-13T14:57:04.331777Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-5f5d870c
+[2m2026-08-13T14:57:04.331919Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-4864a425
+[2m2026-08-13T14:57:04.332011Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-8fa2fee8
+[2m2026-08-13T14:57:04.343572Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-60abe0d6
+[2m2026-08-13T14:57:04.344770Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-d1b9b26e
+[2m2026-08-13T14:57:04.377337Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-78e0efe7
+[2m2026-08-13T14:57:04.392091Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-97fde1c8
+[2m2026-08-13T14:57:04.509831Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-3badc288
+[2m2026-08-13T14:57:04.525715Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-882bfaab
+[2m2026-08-13T14:57:04.534189Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-f67fa6a8
+[2m2026-08-13T14:57:04.537072Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-a2fd6aeb
+[2m2026-08-13T14:57:04.547962Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-d8f903c1
+[2m2026-08-13T14:57:04.612917Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-cb73b9f8
+[2m2026-08-13T14:57:04.631716Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-dfc77a56
+[2m2026-08-13T14:57:04.639931Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-8035dbea
+[2m2026-08-13T14:57:04.659064Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-d1db1c78
+[2m2026-08-13T14:57:04.666488Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-8ffe272f
+[2m2026-08-13T14:57:04.796525Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-67a877a2
+[2m2026-08-13T14:57:04.809417Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-264a0a30
+[2m2026-08-13T14:57:04.849703Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-945847b2
+[2m2026-08-13T14:57:04.849865Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-93bfe08a
+[2m2026-08-13T14:57:04.861521Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-a4e59b65
+[2m2026-08-13T14:57:04.888689Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-d8adfa4e
+[2m2026-08-13T14:57:04.889108Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-94ffe1bd
+[2m2026-08-13T14:57:04.923774Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-d6c2a1ca
+[2m2026-08-13T14:57:04.969686Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-bb8b44b0
+[2m2026-08-13T14:57:04.988976Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-3a2b84d5
+[2m2026-08-13T14:57:05.017443Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-f20bfd23
+[2m2026-08-13T14:57:05.087729Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-98f8d4c6
+[2m2026-08-13T14:57:05.105226Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-1a5300f2
+[2m2026-08-13T14:57:05.155778Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-9fbf91e9
+[2m2026-08-13T14:57:05.156215Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-7dd4cee0
+[2m2026-08-13T14:57:05.163934Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-02e90b84
+[2m2026-08-13T14:57:05.172259Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-600124d9
+[2m2026-08-13T14:57:05.183570Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-36c237f6
+[2m2026-08-13T14:57:05.243499Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-88ad4ece
+[2m2026-08-13T14:57:05.260902Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-6c9da1fd
+[2m2026-08-13T14:57:05.321026Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-47474a93
+[2m2026-08-13T14:57:05.346118Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-ac398009
+[2m2026-08-13T14:57:05.395251Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-8f9c0fa0
+[2m2026-08-13T14:57:05.395456Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-ae799eac
+[2m2026-08-13T14:57:05.433092Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-27fcd7a8
+[2m2026-08-13T14:57:05.510375Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-4c79d257
+[2m2026-08-13T14:57:05.510646Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-b3496c63
+[2m2026-08-13T14:57:05.510971Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-a9f1da72
+[2m2026-08-13T14:57:05.572602Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-febae041
+[2m2026-08-13T14:57:05.577012Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-53dc1803
+[2m2026-08-13T14:57:05.604894Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-66f07fa0
+[2m2026-08-13T14:57:05.640459Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-c608286c
+[2m2026-08-13T14:57:05.649682Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-23e14459
+[2m2026-08-13T14:57:05.655018Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-58f707aa
+[2m2026-08-13T14:57:05.665533Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-822df228
+[2m2026-08-13T14:57:05.680091Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-f66f9ce4
+[2m2026-08-13T14:57:05.793152Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-b9ce61c1
+[2m2026-08-13T14:57:05.858395Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-b5286bf2
+[2m2026-08-13T14:57:05.863236Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-d638fff8
+[2m2026-08-13T14:57:05.885515Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-0d4543ab
+[2m2026-08-13T14:57:05.888346Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-f1ce79d2
+[2m2026-08-13T14:57:05.907117Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-4d90d07f
+[2m2026-08-13T14:57:05.924635Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-c1db6240
+[2m2026-08-13T14:57:05.924792Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-555b55c4
+[2m2026-08-13T14:57:05.998575Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-dafb457a
+[2m2026-08-13T14:57:06.057396Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-760a0bd6
+[2m2026-08-13T14:57:06.090979Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-cd97fd99
+[2m2026-08-13T14:57:06.097763Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-e451b5e7
+[2m2026-08-13T14:57:06.122297Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-488e8730
+[2m2026-08-13T14:57:06.162200Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-b9df382a
+[2m2026-08-13T14:57:06.170458Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-2e41ff9d
+[2m2026-08-13T14:57:06.205347Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-59aa4411
+[2m2026-08-13T14:57:06.229464Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-06510b12
+[2m2026-08-13T14:57:06.280964Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-cc6e6b66
+[2m2026-08-13T14:57:06.317853Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-2d32a172
+[2m2026-08-13T14:57:06.325864Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-edccec82
+[2m2026-08-13T14:57:06.325205Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-aed242f0
+[2m2026-08-13T14:57:06.377450Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-91946655
+[2m2026-08-13T14:57:06.390553Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-a60caf13
+[2m2026-08-13T14:57:06.391308Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-92e837b3
+[2m2026-08-13T14:57:06.418599Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-39b4a81c
+[2m2026-08-13T14:57:06.469466Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-12808451
+[2m2026-08-13T14:57:06.493765Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-bcf28953
+[2m2026-08-13T14:57:06.521968Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-b78c431b
+[2m2026-08-13T14:57:06.522315Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-3de9781b
+[2m2026-08-13T14:57:06.598923Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-65a98d1c
+[2m2026-08-13T14:57:06.636037Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-c67051da
+[2m2026-08-13T14:57:06.636964Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-760b7b46
+[2m2026-08-13T14:57:06.650394Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-f336efe2
+[2m2026-08-13T14:57:06.721110Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-d2f4b46f
+[2m2026-08-13T14:57:06.744245Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-95617bae
+[2m2026-08-13T14:57:06.757759Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-24433c76
+[2m2026-08-13T14:57:06.794989Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-c8ed3c07
+[2m2026-08-13T14:57:06.799790Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-248ee1e1
+[2m2026-08-13T14:57:06.805687Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-50ae4430
+[2m2026-08-13T14:57:06.822523Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-d18cebb7
+[2m2026-08-13T14:57:06.843723Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-802fb298
+[2m2026-08-13T14:57:06.859598Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-2986a84c
+[2m2026-08-13T14:57:06.925260Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-1d1548b3
+[2m2026-08-13T14:57:06.929750Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-d1c574e3
+[2m2026-08-13T14:57:06.940751Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-e0055bf5
+[2m2026-08-13T14:57:06.989239Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-457e3595
+[2m2026-08-13T14:57:06.993663Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-32c717d9
+[2m2026-08-13T14:57:07.014408Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-571bd255
+[2m2026-08-13T14:57:07.027686Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-ccd1454b
+[2m2026-08-13T14:57:07.029121Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-415f4f6a
+[2m2026-08-13T14:57:07.197472Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-c455711c
+[2m2026-08-13T14:57:07.213390Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-d4357332
+[2m2026-08-13T14:57:07.230956Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-63bef0ba
+[2m2026-08-13T14:57:07.232366Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-2acfe042
+[2m2026-08-13T14:57:07.237235Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-26c91a12
+[2m2026-08-13T14:57:07.260164Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-0e66c1e9
+[2m2026-08-13T14:57:07.294576Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-29a137fa
+[2m2026-08-13T14:57:07.302113Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-15c56f08
+[2m2026-08-13T14:57:07.365625Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-6199e7c1
+[2m2026-08-13T14:57:07.427630Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-950d7bdb
+[2m2026-08-13T14:57:07.437456Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-aad6c139
+[2m2026-08-13T14:57:07.455479Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-195437bc
+[2m2026-08-13T14:57:07.461211Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-493ef858
+[2m2026-08-13T14:57:07.490301Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-87fbf46b
+
+... [801 line(s) elided by collect-evidence.sh; head=300 tail=300; re-run the ramp for the full log] ...
+
+[2m2026-08-13T14:59:50.762982Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h199923a1d01c93d3e0c88aa6f0153cc74 ok (0 row(s) returned)
+[2m2026-08-13T14:59:53.900446Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-d26d4631
+[2m2026-08-13T14:59:54.503877Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-00448ae1
+[2m2026-08-13T14:59:54.665193Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-000ffbf9
+[2m2026-08-13T14:59:54.818639Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-a45f9825
+[2m2026-08-13T14:59:54.871742Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-69aee432
+[2m2026-08-13T14:59:54.876700Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-4564133f
+[2m2026-08-13T14:59:54.884273Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-5f92f0f7
+[2m2026-08-13T14:59:54.891072Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-1f5c8196
+[2m2026-08-13T14:59:54.895630Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-d2c55498
+[2m2026-08-13T14:59:54.900031Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-8ce07a3d
+[2m2026-08-13T14:59:54.904412Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-63953dcb
+[2m2026-08-13T14:59:55.705729Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-2b57c546
+[2m2026-08-13T14:59:56.098930Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-a3067322
+[2m2026-08-13T14:59:56.222457Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-b600ce4e
+[2m2026-08-13T14:59:56.319791Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-547a090d
+[2m2026-08-13T14:59:56.325378Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-976886f6
+[2m2026-08-13T14:59:56.330289Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-0ad0a0f3
+[2m2026-08-13T14:59:56.334519Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-4b56dac8
+[2m2026-08-13T14:59:56.338136Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-7fa8dec1
+[2m2026-08-13T14:59:56.590068Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-4e80cbb5
+[2m2026-08-13T14:59:56.606187Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-8dbcf9de
+[2m2026-08-13T14:59:57.324257Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-8da88cd3
+[2m2026-08-13T14:59:57.657675Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-9ca1aecd
+[2m2026-08-13T14:59:57.828717Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-6cf9d262
+[2m2026-08-13T14:59:57.948117Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-680c60d3
+[2m2026-08-13T14:59:57.980226Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-17f3d3d3
+[2m2026-08-13T14:59:58.025800Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-a34972c8
+[2m2026-08-13T14:59:58.081544Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-906b440a
+[2m2026-08-13T14:59:58.086588Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-023bb15b
+[2m2026-08-13T14:59:58.098102Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-a8d69fa9
+[2m2026-08-13T14:59:58.105500Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-b192613b
+[2m2026-08-13T14:59:58.111438Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-ed6f3748
+[2m2026-08-13T14:59:59.017038Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-28943f1b
+[2m2026-08-13T14:59:59.416616Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-25997fc7
+[2m2026-08-13T14:59:59.421241Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-ef45373c
+[2m2026-08-13T14:59:59.426305Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-dfd707a8
+[2m2026-08-13T14:59:59.728731Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-6715244b
+[2m2026-08-13T14:59:59.733635Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-5eab788d
+[2m2026-08-13T14:59:59.738415Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-d3cbb2d6
+[2m2026-08-13T14:59:59.743141Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-114e3603
+[2m2026-08-13T14:59:59.748042Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-17fa81a8
+[2m2026-08-13T15:00:00.624644Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-3459937b
+[2m2026-08-13T15:00:00.629744Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-44a804d8
+[2m2026-08-13T15:00:00.634794Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-4486c8c2
+[2m2026-08-13T15:00:01.110353Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-f32930d2
+[2m2026-08-13T15:00:01.129384Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-7c51bc04
+[2m2026-08-13T15:00:01.134068Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-8a93953c
+[2m2026-08-13T15:00:01.196521Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-e763863b
+[2m2026-08-13T15:00:01.353077Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-a9c4ad4c
+[2m2026-08-13T15:00:02.787608Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-ab130b59
+[2m2026-08-13T15:00:02.949121Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-a8ace06b
+[2m2026-08-13T15:00:03.953431Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-264eb8fb
+[2m2026-08-13T15:00:04.134382Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-5830455f
+[2m2026-08-13T15:00:04.140059Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-e42fdab1
+[2m2026-08-13T15:00:04.158997Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-b631bcd3
+[2m2026-08-13T15:00:04.178638Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-4ab36659
+[2m2026-08-13T15:00:04.183604Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-2e3475c2
+[2m2026-08-13T15:00:04.193832Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-088ddde1
+[2m2026-08-13T15:00:05.330463Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-993c1409
+[2m2026-08-13T15:00:05.340182Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-68a0f98a
+[2m2026-08-13T15:00:07.045659Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-5a180b46
+[2m2026-08-13T15:00:11.779775Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h12ad950e038aab040e7b372874efbd2fc ok (0 row(s) returned)
+[2m2026-08-13T15:00:13.176757Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-b8bfe605
+[2m2026-08-13T15:00:13.347151Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-94e8f5a9
+[2m2026-08-13T15:00:13.356471Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-1d1a7447
+[2m2026-08-13T15:00:14.185429Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-ef50a955
+[2m2026-08-13T15:00:15.051786Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-007a8e68
+[2m2026-08-13T15:00:15.066374Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-efed275c
+[2m2026-08-13T15:00:16.587631Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-e7341593
+[2m2026-08-13T15:00:16.592461Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-73245201
+[2m2026-08-13T15:00:16.790841Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-de3f794a
+[2m2026-08-13T15:00:17.886001Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-e319257b
+[2m2026-08-13T15:00:18.180999Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-069893fb
+[2m2026-08-13T15:00:21.286024Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-f1308c27
+[2m2026-08-13T15:00:21.674707Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-d1771e2d
+[2m2026-08-13T15:00:21.789894Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1d2e34d378d3f53e2a6b75db9b35584ca ok (0 row(s) returned)
+[2m2026-08-13T15:00:22.146179Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-5280f2b3
+[2m2026-08-13T15:00:22.953784Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-a8a8fa5f
+[2m2026-08-13T15:00:22.978191Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-d99940e4
+[2m2026-08-13T15:00:23.037533Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-ce8c9aad
+[2m2026-08-13T15:00:23.042762Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-3192c268
+[2m2026-08-13T15:00:23.047854Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-6dc98164
+[2m2026-08-13T15:00:23.052940Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-4307bec0
+[2m2026-08-13T15:00:23.921925Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-67815bc9
+[2m2026-08-13T15:00:25.018965Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-c8400139
+[2m2026-08-13T15:00:25.134664Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-e1603e41
+[2m2026-08-13T15:00:25.142116Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-3729210e
+[2m2026-08-13T15:00:31.173512Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-3b2844c1
+[2m2026-08-13T15:00:31.580003Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-1f6c5734
+[2m2026-08-13T15:00:31.679373Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-13383bbf
+[2m2026-08-13T15:00:31.774139Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-e19a552f
+[2m2026-08-13T15:00:31.788810Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-a69e4d44
+[2m2026-08-13T15:00:31.793580Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-58174b39
+[2m2026-08-13T15:00:31.798407Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-d70226a3
+[2m2026-08-13T15:00:31.803528Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h10aca4d6f5702ea9a7a79878c40432a6f ok (0 row(s) returned)
+[2m2026-08-13T15:00:31.806568Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1fdfe11f5fad7e0441d83fc852f8e64df ok (0 row(s) returned)
+[2m2026-08-13T15:00:32.694688Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-7110e11d
+[2m2026-08-13T15:00:32.700165Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-d17aa0b3
+[2m2026-08-13T15:00:32.710603Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-265a9e6c
+[2m2026-08-13T15:00:33.503293Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-ffa7eb55
+[2m2026-08-13T15:00:33.732288Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-12f316bb
+[2m2026-08-13T15:00:34.686638Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-22f05453
+[2m2026-08-13T15:00:34.696310Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-98d2d89f
+[2m2026-08-13T15:00:35.423807Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-05c6952d
+[2m2026-08-13T15:00:36.874509Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-2dd5e207
+[2m2026-08-13T15:00:36.884947Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-877695f0
+[2m2026-08-13T15:00:36.899906Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-cba0c733
+[2m2026-08-13T15:00:37.704436Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-e4c20395
+[2m2026-08-13T15:00:40.198351Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-4fce78d5
+[2m2026-08-13T15:00:41.221085Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-14c2d311
+[2m2026-08-13T15:00:41.370043Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-42284c40
+[2m2026-08-13T15:00:41.405120Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-e719f5e1
+[2m2026-08-13T15:00:41.437888Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-940516d7
+[2m2026-08-13T15:00:41.462148Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-317a92ea
+[2m2026-08-13T15:00:41.589296Z[0m [33m WARN[0m [2mai_memory::identity[0m[2m:[0m HTTP memory write without agent_id body field or X-Agent-Id header; assigned anonymous:req-6090e132
+[2m2026-08-13T15:00:41.818193Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1a17ee446693954a256b6a0e80ca10727 ok (0 row(s) returned)
+[2m2026-08-13T15:00:45.827334Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h132d47b708ffbe1c96871f44df5995bb8 ok (0 row(s) returned)
+[2m2026-08-13T15:00:53.846759Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h18d0eebbd13fd1f0473a063be8dfe1f22 ok (0 row(s) returned)
+[2m2026-08-13T15:01:05.861604Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h137a8bdbef2e37ec82e1dea8b31ace107 ok (0 row(s) returned)
+[2m2026-08-13T15:01:13.871532Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h199923a1d01c93d3e0c88aa6f0153cc74 ok (0 row(s) returned)
+[2m2026-08-13T15:01:26.890134Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1e7352cc0f729f5cd4a2b7fe7634f0bf6 ok (0 row(s) returned)
+[2m2026-08-13T15:01:44.910204Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1d2e34d378d3f53e2a6b75db9b35584ca ok (0 row(s) returned)
+[2m2026-08-13T15:01:54.923122Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h10aca4d6f5702ea9a7a79878c40432a6f ok (0 row(s) returned)
+[2m2026-08-13T15:01:54.926269Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1fdfe11f5fad7e0441d83fc852f8e64df ok (0 row(s) returned)
+[2m2026-08-13T15:02:04.938670Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1a17ee446693954a256b6a0e80ca10727 ok (0 row(s) returned)
+[2m2026-08-13T15:02:08.945033Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h132d47b708ffbe1c96871f44df5995bb8 ok (0 row(s) returned)
+[2m2026-08-13T15:02:11.973195Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1491abfdff382b8815ed4fced97660619 ok (0 row(s) returned)
+[2m2026-08-13T15:02:12.997515Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1e61b596fd1ee2c1017beb2c8f48a6878 ok (0 row(s) returned)
+[2m2026-08-13T15:02:13.002100Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h19e11f3dc850be6c7e2f96fb878505bcf ok (0 row(s) returned)
+[2m2026-08-13T15:02:13.005201Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h18d0eebbd13fd1f0473a063be8dfe1f22 ok (0 row(s) returned)
+[2m2026-08-13T15:02:13.010011Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1a1d57885f9eb6e1ede4f7e3666a45374 ok (0 row(s) returned)
+[2m2026-08-13T15:02:13.014072Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h15f723f59708deb934a4a96cd0b1b722e ok (0 row(s) returned)
+[2m2026-08-13T15:02:13.018012Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1cd6f7c4fadc93886601c73bfa5416fc7 ok (0 row(s) returned)
+[2m2026-08-13T15:02:13.024322Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h142c2c46b2600b55081def4dfa77ddb89 ok (0 row(s) returned)
+[2m2026-08-13T15:02:17.033297Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h137a8bdbef2e37ec82e1dea8b31ace107 ok (0 row(s) returned)
+[2m2026-08-13T15:02:17.037405Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h150396de656ea414f1ee129e5f3b7b2ea ok (0 row(s) returned)
+[2m2026-08-13T15:02:17.041279Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h16db8a5bffbf866837159f9b159389b37 ok (0 row(s) returned)
+[2m2026-08-13T15:02:17.045243Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h13ba1d010cc421974f74ce98aa9162e77 ok (0 row(s) returned)
+[2m2026-08-13T15:02:19.050186Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h199923a1d01c93d3e0c88aa6f0153cc74 ok (0 row(s) returned)
+[2m2026-08-13T15:02:38.068637Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1c1d60e8b825a1304f4cfbdd3e56bb5b3 ok (0 row(s) returned)
+[2m2026-08-13T15:02:48.082656Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1dc5bb2d9b1fbbb9a9436a24c67c622fe ok (0 row(s) returned)
+[2m2026-08-13T15:02:48.085746Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1d2e34d378d3f53e2a6b75db9b35584ca ok (0 row(s) returned)
+[2m2026-08-13T15:03:00.097064Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1fdfe11f5fad7e0441d83fc852f8e64df ok (0 row(s) returned)
+[2m2026-08-13T15:03:02.104568Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1ca27f5fb6ec6c41ed67a4afed72b3dc1 ok (0 row(s) returned)
+[2m2026-08-13T15:03:02.108983Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1ae2342110b1cd94f8fe31217753ebb32 ok (0 row(s) returned)
+[2m2026-08-13T15:03:02.113222Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h170007b6820049b04e2a84bab5fc8baf4 ok (0 row(s) returned)
+[2m2026-08-13T15:03:04.118314Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1a17ee446693954a256b6a0e80ca10727 ok (0 row(s) returned)
+[2m2026-08-13T15:03:08.124436Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h132d47b708ffbe1c96871f44df5995bb8 ok (0 row(s) returned)
+[2m2026-08-13T15:03:16.134238Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h18d0eebbd13fd1f0473a063be8dfe1f22 ok (0 row(s) returned)
+[2m2026-08-13T15:03:24.143328Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h16c9a09833c26cf0b1f7ae3dc40c036c2 ok (0 row(s) returned)
+[2m2026-08-13T15:03:26.148400Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h137a8bdbef2e37ec82e1dea8b31ace107 ok (0 row(s) returned)
+[2m2026-08-13T15:03:26.764956Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h150396de656ea414f1ee129e5f3b7b2ea ok (0 row(s) returned)
+[2m2026-08-13T15:03:26.768132Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h16db8a5bffbf866837159f9b159389b37 ok (0 row(s) returned)
+[2m2026-08-13T15:03:26.771858Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h13ba1d010cc421974f74ce98aa9162e77 ok (0 row(s) returned)
+[2m2026-08-13T15:03:26.775612Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h19a88dd804df4506d6978ddfb04c375ae ok (0 row(s) returned)
+[2m2026-08-13T15:03:26.778746Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h199923a1d01c93d3e0c88aa6f0153cc74 ok (0 row(s) returned)
+[2m2026-08-13T15:03:53.812517Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1e6cd62cd502018c80bfdf1a646b16952 ok (0 row(s) returned)
+[2m2026-08-13T15:03:57.821814Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1d2e34d378d3f53e2a6b75db9b35584ca ok (0 row(s) returned)
+[2m2026-08-13T15:04:07.833950Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h10aca4d6f5702ea9a7a79878c40432a6f ok (0 row(s) returned)
+[2m2026-08-13T15:04:07.837074Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1fdfe11f5fad7e0441d83fc852f8e64df ok (0 row(s) returned)
+[2m2026-08-13T15:04:13.845050Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h170007b6820049b04e2a84bab5fc8baf4 ok (0 row(s) returned)
+[2m2026-08-13T15:04:15.850574Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1a17ee446693954a256b6a0e80ca10727 ok (0 row(s) returned)
+[2m2026-08-13T15:04:19.857379Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h132d47b708ffbe1c96871f44df5995bb8 ok (0 row(s) returned)
+[2m2026-08-13T15:04:27.868477Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h18d0eebbd13fd1f0473a063be8dfe1f22 ok (0 row(s) returned)
+[2m2026-08-13T15:04:39.883183Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h137a8bdbef2e37ec82e1dea8b31ace107 ok (0 row(s) returned)
+[2m2026-08-13T15:04:39.889153Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h150396de656ea414f1ee129e5f3b7b2ea ok (0 row(s) returned)
+[2m2026-08-13T15:04:45.898547Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h199923a1d01c93d3e0c88aa6f0153cc74 ok (0 row(s) returned)
+[2m2026-08-13T15:04:52.908520Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h15fcdcdb71d7ada20a6c78ecffca1e10b ok (0 row(s) returned)
+[2m2026-08-13T15:05:12.198841Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1e6cd62cd502018c80bfdf1a646b16952 ok (0 row(s) returned)
+[2m2026-08-13T15:05:13.220555Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h13c48d4f955cc7279d518f346e60d5b0c ok (0 row(s) returned)
+[2m2026-08-13T15:05:13.224822Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1dc5bb2d9b1fbbb9a9436a24c67c622fe ok (0 row(s) returned)
+[2m2026-08-13T15:05:13.227928Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1d2e34d378d3f53e2a6b75db9b35584ca ok (0 row(s) returned)
+[2m2026-08-13T15:05:13.231573Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h111dc74584c92332e741231554b11e3c4 ok (0 row(s) returned)
+[2m2026-08-13T15:05:14.244354Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1d197373855cd9cfd9a173fb8e649f4ec ok (0 row(s) returned)
+[2m2026-08-13T15:05:16.251563Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1b79c4af79cc2f9c1c7b88c3a9eac519f ok (0 row(s) returned)
+[2m2026-08-13T15:05:20.258988Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1fdfe11f5fad7e0441d83fc852f8e64df ok (0 row(s) returned)
+[2m2026-08-13T15:05:30.273462Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1a17ee446693954a256b6a0e80ca10727 ok (0 row(s) returned)
+[2m2026-08-13T15:05:34.281102Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h132d47b708ffbe1c96871f44df5995bb8 ok (0 row(s) returned)
+[2m2026-08-13T15:05:42.292825Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h18d0eebbd13fd1f0473a063be8dfe1f22 ok (0 row(s) returned)
+[2m2026-08-13T15:05:42.296668Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1a1d57885f9eb6e1ede4f7e3666a45374 ok (0 row(s) returned)
+[2m2026-08-13T15:05:42.300150Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h15f723f59708deb934a4a96cd0b1b722e ok (0 row(s) returned)
+[2m2026-08-13T15:05:42.304052Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1cd6f7c4fadc93886601c73bfa5416fc7 ok (0 row(s) returned)
+[2m2026-08-13T15:05:48.313010Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h137a8bdbef2e37ec82e1dea8b31ace107 ok (0 row(s) returned)
+[2m2026-08-13T15:05:56.324369Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h199923a1d01c93d3e0c88aa6f0153cc74 ok (0 row(s) returned)
+[2m2026-08-13T15:06:01.332350Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h11dcfec18e32cef069ebfe027b8b186f4 ok (0 row(s) returned)
+[2m2026-08-13T15:06:01.338919Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h15fcdcdb71d7ada20a6c78ecffca1e10b ok (0 row(s) returned)
+[2m2026-08-13T15:06:02.375000Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1024a7f650561ffc325cd63e7cc1f1223 ok (0 row(s) returned)
+[2m2026-08-13T15:06:02.382262Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1989066c293b3bab2240e4871c04b80cd ok (0 row(s) returned)
+[2m2026-08-13T15:06:02.386278Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1e7352cc0f729f5cd4a2b7fe7634f0bf6 ok (0 row(s) returned)
+[2m2026-08-13T15:06:02.389889Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1a5b26685cce8d5c5712160a16c88d02b ok (0 row(s) returned)
+[2m2026-08-13T15:06:10.401850Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h14b50a83888384abe336f46b5bc756d0f ok (0 row(s) returned)
+[2m2026-08-13T15:06:11.844208Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1e6cd62cd502018c80bfdf1a646b16952 ok (0 row(s) returned)
+[2m2026-08-13T15:06:15.850146Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1d2e34d378d3f53e2a6b75db9b35584ca ok (0 row(s) returned)
+[2m2026-08-13T15:06:15.853381Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h111dc74584c92332e741231554b11e3c4 ok (0 row(s) returned)
+[2m2026-08-13T15:06:15.856732Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1d197373855cd9cfd9a173fb8e649f4ec ok (0 row(s) returned)
+[2m2026-08-13T15:06:18.713065Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1b79c4af79cc2f9c1c7b88c3a9eac519f ok (0 row(s) returned)
+[2m2026-08-13T15:06:18.718118Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h14d4071bb7c040c80654bfc2a411aa836 ok (0 row(s) returned)
+[2m2026-08-13T15:06:18.721914Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h10aca4d6f5702ea9a7a79878c40432a6f ok (0 row(s) returned)
+[2m2026-08-13T15:06:18.724950Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1fdfe11f5fad7e0441d83fc852f8e64df ok (0 row(s) returned)
+[2m2026-08-13T15:06:18.729025Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1189421512bfe76d2bc278a22b45a84d2 ok (0 row(s) returned)
+[2m2026-08-13T15:06:26.740304Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1a17ee446693954a256b6a0e80ca10727 ok (0 row(s) returned)
+[2m2026-08-13T15:06:30.747007Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h132d47b708ffbe1c96871f44df5995bb8 ok (0 row(s) returned)
+[2m2026-08-13T15:06:30.750865Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1fa210cb3336c37eb64fa287867de29a9 ok (0 row(s) returned)
+[2m2026-08-13T15:06:32.756242Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1e61b596fd1ee2c1017beb2c8f48a6878 ok (0 row(s) returned)
+[2m2026-08-13T15:06:34.761620Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h18d0eebbd13fd1f0473a063be8dfe1f22 ok (0 row(s) returned)
+[2m2026-08-13T15:06:36.972616Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h15f723f59708deb934a4a96cd0b1b722e ok (0 row(s) returned)
+[2m2026-08-13T15:06:44.982656Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h137a8bdbef2e37ec82e1dea8b31ace107 ok (0 row(s) returned)
+[2m2026-08-13T15:06:48.990407Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h13ba1d010cc421974f74ce98aa9162e77 ok (0 row(s) returned)
+[2m2026-08-13T15:06:50.995511Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h199923a1d01c93d3e0c88aa6f0153cc74 ok (0 row(s) returned)
+[2m2026-08-13T15:06:56.000369Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h19743604dc922f71ae65a1cddbdb7eb06 ok (0 row(s) returned)
+[2m2026-08-13T15:07:24.025921Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1d2e34d378d3f53e2a6b75db9b35584ca ok (0 row(s) returned)
+[2m2026-08-13T15:07:24.029148Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h111dc74584c92332e741231554b11e3c4 ok (0 row(s) returned)
+[2m2026-08-13T15:07:31.459939Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h14d4071bb7c040c80654bfc2a411aa836 ok (0 row(s) returned)
+[2m2026-08-13T15:07:33.469235Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1fdfe11f5fad7e0441d83fc852f8e64df ok (0 row(s) returned)
+[2m2026-08-13T15:07:33.473210Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1189421512bfe76d2bc278a22b45a84d2 ok (0 row(s) returned)
+[2m2026-08-13T15:07:41.484374Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1a17ee446693954a256b6a0e80ca10727 ok (0 row(s) returned)
+[2m2026-08-13T15:07:45.490879Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h132d47b708ffbe1c96871f44df5995bb8 ok (0 row(s) returned)
+[2m2026-08-13T15:07:49.497917Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1e61b596fd1ee2c1017beb2c8f48a6878 ok (0 row(s) returned)
+[2m2026-08-13T15:07:51.506306Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h18d0eebbd13fd1f0473a063be8dfe1f22 ok (0 row(s) returned)
+[2m2026-08-13T15:08:03.517409Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h137a8bdbef2e37ec82e1dea8b31ace107 ok (0 row(s) returned)
+[2m2026-08-13T15:08:07.526225Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h13ba1d010cc421974f74ce98aa9162e77 ok (0 row(s) returned)
+[2m2026-08-13T15:08:09.531720Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h199923a1d01c93d3e0c88aa6f0153cc74 ok (0 row(s) returned)
+[2m2026-08-13T15:08:14.536324Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h19743604dc922f71ae65a1cddbdb7eb06 ok (0 row(s) returned)
+[2m2026-08-13T15:08:17.604279Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h15fcdcdb71d7ada20a6c78ecffca1e10b ok (0 row(s) returned)
+[2m2026-08-13T15:08:21.610413Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1e7352cc0f729f5cd4a2b7fe7634f0bf6 ok (0 row(s) returned)
+[2m2026-08-13T15:08:21.615399Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1a5b26685cce8d5c5712160a16c88d02b ok (0 row(s) returned)
+[2m2026-08-13T15:08:23.620874Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1c1d60e8b825a1304f4cfbdd3e56bb5b3 ok (0 row(s) returned)
+[2m2026-08-13T15:08:35.634402Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1d2e34d378d3f53e2a6b75db9b35584ca ok (0 row(s) returned)
+[2m2026-08-13T15:08:35.637772Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h111dc74584c92332e741231554b11e3c4 ok (0 row(s) returned)
+[2m2026-08-13T15:08:45.646772Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1fdfe11f5fad7e0441d83fc852f8e64df ok (0 row(s) returned)
+[2m2026-08-13T15:08:45.650242Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1189421512bfe76d2bc278a22b45a84d2 ok (0 row(s) returned)
+[2m2026-08-13T15:08:53.659977Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1a17ee446693954a256b6a0e80ca10727 ok (0 row(s) returned)
+[2m2026-08-13T15:08:57.667465Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h132d47b708ffbe1c96871f44df5995bb8 ok (0 row(s) returned)
+[2m2026-08-13T15:09:03.108274Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1e61b596fd1ee2c1017beb2c8f48a6878 ok (0 row(s) returned)
+[2m2026-08-13T15:09:05.116325Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h18d0eebbd13fd1f0473a063be8dfe1f22 ok (0 row(s) returned)
+[2m2026-08-13T15:09:05.121164Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1a1d57885f9eb6e1ede4f7e3666a45374 ok (0 row(s) returned)
+[2m2026-08-13T15:09:15.134458Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h137a8bdbef2e37ec82e1dea8b31ace107 ok (0 row(s) returned)
+[2m2026-08-13T15:09:23.143377Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h199923a1d01c93d3e0c88aa6f0153cc74 ok (0 row(s) returned)
+[2m2026-08-13T15:09:28.148456Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h19743604dc922f71ae65a1cddbdb7eb06 ok (0 row(s) returned)
+[2m2026-08-13T15:09:56.176264Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1d2e34d378d3f53e2a6b75db9b35584ca ok (0 row(s) returned)
+[2m2026-08-13T15:10:08.187898Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1fdfe11f5fad7e0441d83fc852f8e64df ok (0 row(s) returned)
+[2m2026-08-13T15:10:12.194166Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1ae2342110b1cd94f8fe31217753ebb32 ok (0 row(s) returned)
+[2m2026-08-13T15:10:12.198001Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h170007b6820049b04e2a84bab5fc8baf4 ok (0 row(s) returned)
+[2m2026-08-13T15:10:12.201872Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1176049cf77f27a6c75e0a32623c8cadf ok (0 row(s) returned)
+[2m2026-08-13T15:10:12.205105Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1a17ee446693954a256b6a0e80ca10727 ok (0 row(s) returned)
+[2m2026-08-13T15:10:12.208578Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h16314cd6f964516a2f5c0b1d92c88f939 ok (0 row(s) returned)
+[2m2026-08-13T15:10:12.212205Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1b15fa4d3f1482c0929b591ae3dd7a85d ok (0 row(s) returned)
+[2m2026-08-13T15:10:12.215433Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h132d47b708ffbe1c96871f44df5995bb8 ok (0 row(s) returned)
+[2m2026-08-13T15:10:14.221829Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1491abfdff382b8815ed4fced97660619 ok (0 row(s) returned)
+[2m2026-08-13T15:10:18.226856Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h18d0eebbd13fd1f0473a063be8dfe1f22 ok (0 row(s) returned)
+[2m2026-08-13T15:10:18.844873Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1a1d57885f9eb6e1ede4f7e3666a45374 ok (0 row(s) returned)
+[2m2026-08-13T15:10:28.857143Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h137a8bdbef2e37ec82e1dea8b31ace107 ok (0 row(s) returned)
+[2m2026-08-13T15:10:36.869453Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h199923a1d01c93d3e0c88aa6f0153cc74 ok (0 row(s) returned)
+[2m2026-08-13T15:10:41.877521Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h19743604dc922f71ae65a1cddbdb7eb06 ok (0 row(s) returned)
+[2m2026-08-13T15:10:47.886890Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1989066c293b3bab2240e4871c04b80cd ok (0 row(s) returned)
+[2m2026-08-13T15:11:02.917170Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1e6cd62cd502018c80bfdf1a646b16952 ok (0 row(s) returned)
+[2m2026-08-13T15:11:03.940158Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h13c48d4f955cc7279d518f346e60d5b0c ok (0 row(s) returned)
+[2m2026-08-13T15:11:05.947811Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1d2e34d378d3f53e2a6b75db9b35584ca ok (0 row(s) returned)
+[2m2026-08-13T15:11:05.953280Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h111dc74584c92332e741231554b11e3c4 ok (0 row(s) returned)
+[2m2026-08-13T15:11:15.966172Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1fdfe11f5fad7e0441d83fc852f8e64df ok (0 row(s) returned)
+[2m2026-08-13T15:11:25.978981Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1a17ee446693954a256b6a0e80ca10727 ok (0 row(s) returned)
+[2m2026-08-13T15:11:28.596135Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1b15fa4d3f1482c0929b591ae3dd7a85d ok (0 row(s) returned)
+[2m2026-08-13T15:11:28.599503Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h132d47b708ffbe1c96871f44df5995bb8 ok (0 row(s) returned)
+[2m2026-08-13T15:11:34.608067Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h19e11f3dc850be6c7e2f96fb878505bcf ok (0 row(s) returned)
+[2m2026-08-13T15:11:34.610941Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h18d0eebbd13fd1f0473a063be8dfe1f22 ok (0 row(s) returned)
+[2m2026-08-13T15:11:34.614153Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1a1d57885f9eb6e1ede4f7e3666a45374 ok (0 row(s) returned)
+[2m2026-08-13T15:11:44.627411Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h137a8bdbef2e37ec82e1dea8b31ace107 ok (0 row(s) returned)
+[2m2026-08-13T15:11:52.636804Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h199923a1d01c93d3e0c88aa6f0153cc74 ok (0 row(s) returned)
+[2m2026-08-13T15:11:57.641376Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h19743604dc922f71ae65a1cddbdb7eb06 ok (0 row(s) returned)
+[2m2026-08-13T15:11:57.647502Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h11dcfec18e32cef069ebfe027b8b186f4 ok (0 row(s) returned)
+[2m2026-08-13T15:12:02.267750Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1989066c293b3bab2240e4871c04b80cd ok (0 row(s) returned)
+[2m2026-08-13T15:12:22.288734Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1d2e34d378d3f53e2a6b75db9b35584ca ok (0 row(s) returned)
+[2m2026-08-13T15:12:34.300172Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1fdfe11f5fad7e0441d83fc852f8e64df ok (0 row(s) returned)
+[2m2026-08-13T15:12:44.312072Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1a17ee446693954a256b6a0e80ca10727 ok (0 row(s) returned)
+[2m2026-08-13T15:12:46.318486Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1b15fa4d3f1482c0929b591ae3dd7a85d ok (0 row(s) returned)
+[2m2026-08-13T15:12:46.321903Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h132d47b708ffbe1c96871f44df5995bb8 ok (0 row(s) returned)
+[2m2026-08-13T15:12:52.330137Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h19e11f3dc850be6c7e2f96fb878505bcf ok (0 row(s) returned)
+[2m2026-08-13T15:12:52.333457Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h18d0eebbd13fd1f0473a063be8dfe1f22 ok (0 row(s) returned)
+[2m2026-08-13T15:12:58.343499Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h142c2c46b2600b55081def4dfa77ddb89 ok (0 row(s) returned)
+[2m2026-08-13T15:13:02.350938Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h137a8bdbef2e37ec82e1dea8b31ace107 ok (0 row(s) returned)
+[2m2026-08-13T15:13:10.362458Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h199923a1d01c93d3e0c88aa6f0153cc74 ok (0 row(s) returned)
+[2m2026-08-13T15:13:15.367055Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h19743604dc922f71ae65a1cddbdb7eb06 ok (0 row(s) returned)
+[2m2026-08-13T15:13:31.385563Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h12ad950e038aab040e7b372874efbd2fc ok (0 row(s) returned)
+[2m2026-08-13T15:13:41.396102Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1d2e34d378d3f53e2a6b75db9b35584ca ok (0 row(s) returned)
+[2m2026-08-13T15:13:53.409452Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1fdfe11f5fad7e0441d83fc852f8e64df ok (0 row(s) returned)
+[2m2026-08-13T15:14:03.420564Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1a17ee446693954a256b6a0e80ca10727 ok (0 row(s) returned)
+[2m2026-08-13T15:14:07.426475Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h132d47b708ffbe1c96871f44df5995bb8 ok (0 row(s) returned)
+[2m2026-08-13T15:14:15.439848Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h18d0eebbd13fd1f0473a063be8dfe1f22 ok (0 row(s) returned)
+[2m2026-08-13T15:14:21.448021Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h142c2c46b2600b55081def4dfa77ddb89 ok (0 row(s) returned)
+[2m2026-08-13T15:14:25.455059Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h137a8bdbef2e37ec82e1dea8b31ace107 ok (0 row(s) returned)
+[2m2026-08-13T15:14:29.464167Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h13ba1d010cc421974f74ce98aa9162e77 ok (0 row(s) returned)
+[2m2026-08-13T15:14:31.468837Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h199923a1d01c93d3e0c88aa6f0153cc74 ok (0 row(s) returned)
+[2m2026-08-13T15:14:36.473771Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h19743604dc922f71ae65a1cddbdb7eb06 ok (0 row(s) returned)
+[2m2026-08-13T15:14:42.483436Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1989066c293b3bab2240e4871c04b80cd ok (0 row(s) returned)
+[2m2026-08-13T15:15:02.507162Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1d2e34d378d3f53e2a6b75db9b35584ca ok (0 row(s) returned)
+[2m2026-08-13T15:15:14.525395Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1fdfe11f5fad7e0441d83fc852f8e64df ok (0 row(s) returned)
+[2m2026-08-13T15:15:24.537297Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h1a17ee446693954a256b6a0e80ca10727 ok (0 row(s) returned)
+[2m2026-08-13T15:15:24.541338Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h16314cd6f964516a2f5c0b1d92c88f939 ok (0 row(s) returned)
+[2m2026-08-13T15:15:26.546501Z[0m [32m INFO[0m [2mai_memory::federation::receive[0m[2m:[0m catchup: pull: peer-h132d47b708ffbe1c96871f44df5995bb8 ok (0 row(s) returned)
