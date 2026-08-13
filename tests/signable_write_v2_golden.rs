@@ -76,7 +76,7 @@ fn check_vector(name: &str, encoded: &[u8]) {
     );
 }
 
-/// The spec Appendix A.4 worked structural example: `agent="host:pop-os",
+/// The spec Appendix A.4 worked structural example: `agent="host:host.example",
 /// ns="global", title="x", kind="observation",
 /// created="2026-07-09T00:00:00Z", content="hello"`, no session,
 /// ed25519+sha256 suite. Fixed placeholder `instance_key_id` /
@@ -84,7 +84,7 @@ fn check_vector(name: &str, encoded: &[u8]) {
 fn a4_worked_example() -> Vec<u8> {
     let digest = Multihash::new(HashCodec::Sha2_256, content_digest("hello"));
     let w = SignableWriteV2 {
-        agent_id: "host:pop-os",
+        agent_id: "host:host.example",
         namespace: "global",
         title: "x",
         kind: "observation",
@@ -103,7 +103,7 @@ fn a4_worked_example() -> Vec<u8> {
 fn session_present() -> Vec<u8> {
     let digest = Multihash::new(HashCodec::Sha2_256, content_digest("hello"));
     let w = SignableWriteV2 {
-        agent_id: "host:pop-os",
+        agent_id: "host:host.example",
         namespace: "global",
         title: "x",
         kind: "observation",
@@ -122,7 +122,7 @@ fn session_present() -> Vec<u8> {
 fn blake3_digest_variant() -> Vec<u8> {
     let digest = Multihash::new(HashCodec::Blake3, [0x5c; 32]);
     let w = SignableWriteV2 {
-        agent_id: "ai:claude-code@pop-os",
+        agent_id: "ai:example-agent@host.example",
         namespace: "ai-memory-mcp",
         title: "a-longer-title-crossing-the-23-byte-boundary",
         kind: "instruction",

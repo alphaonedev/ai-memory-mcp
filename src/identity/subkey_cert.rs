@@ -302,7 +302,7 @@ mod tests {
 
     fn sample_cert(instance_key_id: &[u8]) -> SubkeyCert<'_> {
         SubkeyCert {
-            principal: "ai:claude-code@pop-os",
+            principal: "ai:example-agent@host.example",
             instance_key_id,
             model_version_ref: &[0xab; 32],
             not_before: "2026-07-11T00:00:00Z",
@@ -360,7 +360,7 @@ mod tests {
         // Same signature, a mutated principal → the re-encoded bytes
         // differ → strict verify rejects.
         let mut mutated = cert.clone();
-        mutated.principal = "ai:evil@pop-os";
+        mutated.principal = "ai:evil@host.example";
         assert_eq!(
             verify_subkey_cert(&root.verifying_key(), &mutated, &sig),
             Err(SubkeyCertError::CertInvalid)
@@ -382,7 +382,7 @@ mod tests {
     fn signed_write(sk: &SigningKey, id: &[u8; 32]) -> (Vec<u8>, [u8; SIGNATURE_LEN]) {
         let digest = Multihash::new(HashCodec::Sha2_256, [0x33; 32]);
         let w = SignableWriteV2 {
-            agent_id: "ai:claude-code@pop-os",
+            agent_id: "ai:example-agent@host.example",
             namespace: "global",
             title: "t",
             kind: "instruction",

@@ -311,7 +311,7 @@ fn content_digest(content: &str) -> [u8; 32] {
 fn write_a4() -> Vec<u8> {
     let digest = Multihash::new(HashCodec::Sha2_256, content_digest("hello"));
     canonical_cbor_write_v2(&SignableWriteV2 {
-        agent_id: "host:pop-os",
+        agent_id: "host:host.example",
         namespace: "global",
         title: "x",
         kind: "observation",
@@ -329,7 +329,7 @@ fn write_a4() -> Vec<u8> {
 fn write_session_present() -> Vec<u8> {
     let digest = Multihash::new(HashCodec::Sha2_256, content_digest("hello"));
     canonical_cbor_write_v2(&SignableWriteV2 {
-        agent_id: "host:pop-os",
+        agent_id: "host:host.example",
         namespace: "global",
         title: "x",
         kind: "observation",
@@ -347,7 +347,7 @@ fn write_session_present() -> Vec<u8> {
 fn write_blake3_variant() -> Vec<u8> {
     let digest = Multihash::new(HashCodec::Blake3, [0x5c; 32]);
     canonical_cbor_write_v2(&SignableWriteV2 {
-        agent_id: "ai:claude-code@pop-os",
+        agent_id: "ai:example-agent@host.example",
         namespace: "ai-memory-mcp",
         title: "a-longer-title-crossing-the-23-byte-boundary",
         kind: "instruction",
@@ -364,7 +364,7 @@ fn write_blake3_variant() -> Vec<u8> {
 /// `tests/golden/subkey_cert/worked_cert.hex`).
 fn subkey_worked() -> Vec<u8> {
     canonical_cbor_subkey_cert(&SubkeyCert {
-        principal: "ai:claude-code@pop-os",
+        principal: "ai:example-agent@host.example",
         instance_key_id: &[0x07; 32],
         model_version_ref: &[0xab; 32],
         not_before: "2026-07-11T00:00:00Z",
@@ -377,7 +377,7 @@ fn subkey_worked() -> Vec<u8> {
 fn head_worked() -> Vec<u8> {
     let head_hash = [0xab; 32];
     canonical_cbor_head_attestation(&SignableHeadAttestation {
-        subject_agent_id: "ai:claude-code@pop-os",
+        subject_agent_id: "ai:example-agent@host.example",
         epoch: 3,
         head_sequence: 42,
         head_hash: &head_hash,
@@ -407,7 +407,7 @@ fn write_v2_signed() -> (Vec<u8>, [u8; 32], [u8; 64]) {
     let pubkey = signing.verifying_key().to_bytes();
     let digest = Multihash::new(HashCodec::Sha2_256, content_digest("hello"));
     let bytes = canonical_cbor_write_v2(&SignableWriteV2 {
-        agent_id: "host:pop-os",
+        agent_id: "host:host.example",
         namespace: "global",
         title: "x",
         kind: "observation",
@@ -436,7 +436,7 @@ fn equivocation_real() -> (Vec<u8>, [u8; 32]) {
 
     let hash_a = [0xaa; 32];
     let att_a = SignableHeadAttestation {
-        subject_agent_id: "ai:claude-code@pop-os",
+        subject_agent_id: "ai:example-agent@host.example",
         epoch: 3,
         head_sequence: 42,
         head_hash: &hash_a,
@@ -446,7 +446,7 @@ fn equivocation_real() -> (Vec<u8>, [u8; 32]) {
 
     let hash_b = [0xbb; 32];
     let att_b = SignableHeadAttestation {
-        subject_agent_id: "ai:claude-code@pop-os",
+        subject_agent_id: "ai:example-agent@host.example",
         epoch: 3,
         head_sequence: 42,
         head_hash: &hash_b,
@@ -492,7 +492,7 @@ fn build_subkey_chain_groups() -> Vec<Group> {
 
     // Link 1: the principal-root-signed cert binding the sub-key.
     let cert = SubkeyCert {
-        principal: "ai:claude-code@pop-os",
+        principal: "ai:example-agent@host.example",
         instance_key_id: &subkey_pk,
         model_version_ref: &[0xab; 32],
         not_before: "2026-07-11T00:00:00Z",
@@ -504,7 +504,7 @@ fn build_subkey_chain_groups() -> Vec<Group> {
     // Link 2: a write whose `instance_key_id` IS the certified sub-key, signed
     // by that sub-key.
     let write = SignableWriteV2 {
-        agent_id: "ai:claude-code@pop-os",
+        agent_id: "ai:example-agent@host.example",
         namespace: "global",
         title: "x",
         kind: "observation",
@@ -524,7 +524,7 @@ fn build_subkey_chain_groups() -> Vec<Group> {
     let self_declared = SigningKey::from_bytes(&SUBKEY_CHAIN_SELF_DECLARED_SEED);
     let self_declared_pk = self_declared.verifying_key().to_bytes();
     let sd_write = SignableWriteV2 {
-        agent_id: "ai:claude-code@pop-os",
+        agent_id: "ai:example-agent@host.example",
         namespace: "global",
         title: "x",
         kind: "observation",
@@ -604,7 +604,7 @@ const LINEAGE_K0_SEED: [u8; 32] = [0x77; 32];
 const LINEAGE_K1_SEED: [u8; 32] = [0x88; 32];
 const LINEAGE_K1B_SEED: [u8; 32] = [0x99; 32];
 
-const LINEAGE_AGENT_ID: &str = "ai:claude-code@pop-os";
+const LINEAGE_AGENT_ID: &str = "ai:example-agent@host.example";
 
 /// Build a signed lineage succession member: the canonical map body plus the
 /// Ed25519 signature over `LINEAGE_DOMAIN` ∥ body under `signer` (the record's
@@ -769,7 +769,7 @@ fn build_lineage_groups() -> Vec<Group> {
     ]
 }
 
-const CHAIN_AGENT_ID: &str = "ai:claude-code@pop-os";
+const CHAIN_AGENT_ID: &str = "ai:example-agent@host.example";
 
 /// Build one V-4 `signed_events` chain row and its canonical bytes. `prev_bytes`
 /// is the prior row's canonical bytes (`None` for the genesis row → 32 zero

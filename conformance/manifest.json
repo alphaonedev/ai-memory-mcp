@@ -1,5 +1,5 @@
 {
-  "corpus_digest": "82fe21c875664f1086f07abede2f6abb658a4351eba978bd91cd7e57b63c7f3b",
+  "corpus_digest": "7da47d28b4b99191410069d7db410dd6144c12c2643b07c8cbe3190ef080b893",
   "domain_tags": {
     "equivocation_proof": "ai-memory/equivocation-proof/v1",
     "peer_head_attestation": "ai-memory/peer-head-attestation-v1",
@@ -19,22 +19,22 @@
           "elements": 6,
           "file": "vectors/subkey_chain/valid/cert.hex",
           "grammar": "array-v2",
-          "length_bytes": 159,
+          "length_bytes": 168,
           "pubkey": "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48",
           "record_type": "subkey_cert",
           "role": "cert",
-          "signature": "04eb09653200ace9c4322676e6077c9ad0ea54a7861dff569a161a3b569fb42237944a520f7acbacc08752693c21d22e12b9310b033db5b0e782a7692b78d70f"
+          "signature": "57ca6edd4336ccf7a4a34432ca17f91eff2414d9d29dff602a27cad684656946d60fd53a3fe6f93c7075e76a95e5ff841365107073b57906da0c6e70f63f1f0a"
         },
         {
           "domain_tag": "ai-memory/write/v2",
           "elements": 11,
           "file": "vectors/subkey_chain/valid/write.hex",
           "grammar": "array-v2",
-          "length_bytes": 191,
+          "length_bytes": 200,
           "pubkey": "c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242",
           "record_type": "signable_write_v2",
           "role": "write",
-          "signature": "b49a835b0713dad2d4e04890122e00a317117697eab083931c1abc8854da529b273c4d43b24dce18098fc255bbf5d13b0b021daeae763ea81e13cf1382541e01"
+          "signature": "88b5fb7cc3a9bc81c3f912232080c51cb1c1f7c469978d6e4ae4673050a0c0f7bc773537e4dbf03c73c237cdd9ef82ff8ca0dd3a0bf626ce17ae3c8d6928e005"
         }
       ],
       "name": "subkey_chain/valid",
@@ -51,11 +51,11 @@
           "elements": 11,
           "file": "vectors/subkey_chain/self_declared/write.hex",
           "grammar": "array-v2",
-          "length_bytes": 191,
+          "length_bytes": 200,
           "pubkey": "34b4d9043156cb6dcf0beb0a2949b7559c940d2bcb6dbe8c53a9b30278e3a746",
           "record_type": "signable_write_v2",
           "role": "write",
-          "signature": "99d1a139c8bffb31ead48f04fb28ad84fa2605c8b3b1a1ecd37c3ef194076b36ec846c7727750e1028479280e626d67e0542a03a00386e53865c571ba96f3201"
+          "signature": "7c4884ebd876990cf72c33bdec6ff586c6d30a18d527236ebd6e14ae865a6804dce1236b1d8871972a508874d1e23c49ed7d0ddc5a87beb8eaefe97f33c1a00d"
         }
       ],
       "name": "subkey_chain/self_declared",
@@ -70,26 +70,26 @@
           "epoch": 0,
           "file": "vectors/lineage/valid/genesis.hex",
           "grammar": "lineage-succession-v1",
-          "length_bytes": 280,
+          "length_bytes": 289,
           "predecessor_pubkey": "yFOtDwzSthmuqSzuxP1Wok1kmdWEznklfkXP2BObYKc",
           "pubkey": "c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7",
           "reason": "genesis",
           "record_type": "agent_lineage_succession",
           "role": "genesis",
-          "signature": "d8ad692e2279196cdf5e17ebb656f02ffc64201d3762b9ab1df4f883b8de50f422258121088ef240505b87c83f15399a538b2d9e33fb8e9059b99a62b2288000",
+          "signature": "cbc57c3dd6d77616d1949991fdb52d3a2cf46f10ee1399ca9c3e9217691fb0af703b89d6dbd997810b7a71aae28b3e5a9167f04389a373607e3f916abf0d4001",
           "successor_pubkey": "yFOtDwzSthmuqSzuxP1Wok1kmdWEznklfkXP2BObYKc"
         },
         {
           "epoch": 1,
           "file": "vectors/lineage/valid/rotation.hex",
           "grammar": "lineage-succession-v1",
-          "length_bytes": 281,
+          "length_bytes": 290,
           "predecessor_pubkey": "yFOtDwzSthmuqSzuxP1Wok1kmdWEznklfkXP2BObYKc",
           "pubkey": "c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7",
           "reason": "rotation",
           "record_type": "agent_lineage_succession",
           "role": "rotation",
-          "signature": "fd4877d135a6814dae37cb0bcc755e1282bf1ca56ca976ddc95cd65878841f57f94b165597573295c0856bb59d74b56b7b01f7a696273e0b4153966dbde5aa08",
+          "signature": "ba23e79ce41fd474d0d5c252c50a37dc657d255f5d1aef17faee19a5eb59205a9ad7de0dc329924416647ec477bfdbbca8c7d442cf9e070c31abdbf0faeff202",
           "successor_pubkey": "skkdlQKuKGMKK6yy4MdFEP_N0yjDNP8-E5PnWy0x59w"
         }
       ],
@@ -105,39 +105,39 @@
           "epoch": 0,
           "file": "vectors/lineage/invalid_revoked/genesis.hex",
           "grammar": "lineage-succession-v1",
-          "length_bytes": 280,
+          "length_bytes": 289,
           "predecessor_pubkey": "yFOtDwzSthmuqSzuxP1Wok1kmdWEznklfkXP2BObYKc",
           "pubkey": "c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7",
           "reason": "genesis",
           "record_type": "agent_lineage_succession",
           "role": "genesis",
-          "signature": "d8ad692e2279196cdf5e17ebb656f02ffc64201d3762b9ab1df4f883b8de50f422258121088ef240505b87c83f15399a538b2d9e33fb8e9059b99a62b2288000",
+          "signature": "cbc57c3dd6d77616d1949991fdb52d3a2cf46f10ee1399ca9c3e9217691fb0af703b89d6dbd997810b7a71aae28b3e5a9167f04389a373607e3f916abf0d4001",
           "successor_pubkey": "yFOtDwzSthmuqSzuxP1Wok1kmdWEznklfkXP2BObYKc"
         },
         {
           "epoch": 1,
           "file": "vectors/lineage/invalid_revoked/rotation.hex",
           "grammar": "lineage-succession-v1",
-          "length_bytes": 281,
+          "length_bytes": 290,
           "predecessor_pubkey": "yFOtDwzSthmuqSzuxP1Wok1kmdWEznklfkXP2BObYKc",
           "pubkey": "c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7",
           "reason": "rotation",
           "record_type": "agent_lineage_succession",
           "role": "rotation",
-          "signature": "fd4877d135a6814dae37cb0bcc755e1282bf1ca56ca976ddc95cd65878841f57f94b165597573295c0856bb59d74b56b7b01f7a696273e0b4153966dbde5aa08",
+          "signature": "ba23e79ce41fd474d0d5c252c50a37dc657d255f5d1aef17faee19a5eb59205a9ad7de0dc329924416647ec477bfdbbca8c7d442cf9e070c31abdbf0faeff202",
           "successor_pubkey": "skkdlQKuKGMKK6yy4MdFEP_N0yjDNP8-E5PnWy0x59w"
         },
         {
           "epoch": 2,
           "file": "vectors/lineage/invalid_revoked/revocation.hex",
           "grammar": "lineage-succession-v1",
-          "length_bytes": 316,
+          "length_bytes": 325,
           "predecessor_pubkey": "skkdlQKuKGMKK6yy4MdFEP_N0yjDNP8-E5PnWy0x59w",
           "pubkey": "b2491d9502ae28630a2bacb2e0c74510ffcdd328c334ff3e1393e75b2d31e7dc",
           "reason": "revocation",
           "record_type": "agent_lineage_succession",
           "role": "revocation",
-          "signature": "429283df9eea168dbe9928fee4b3eeedbd4b298ac6af623f9b22da6ba52c1d4267e4a2dfaeece0a2be452529a30e736a0acc2a515d64d727756b50b4c88d2e0a",
+          "signature": "ad7a18819fc3765afe4008a54915760762c4b432d42818531d79964a4158654e60122358f5883550f9665033e24b94f2dbc321b7837047bf7a596d071e5f7109",
           "successor_pubkey": "skkdlQKuKGMKK6yy4MdFEP_N0yjDNP8-E5PnWy0x59w"
         }
       ],
@@ -157,39 +157,39 @@
           "epoch": 0,
           "file": "vectors/lineage/equivocation_fork/genesis.hex",
           "grammar": "lineage-succession-v1",
-          "length_bytes": 280,
+          "length_bytes": 289,
           "predecessor_pubkey": "yFOtDwzSthmuqSzuxP1Wok1kmdWEznklfkXP2BObYKc",
           "pubkey": "c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7",
           "reason": "genesis",
           "record_type": "agent_lineage_succession",
           "role": "genesis",
-          "signature": "d8ad692e2279196cdf5e17ebb656f02ffc64201d3762b9ab1df4f883b8de50f422258121088ef240505b87c83f15399a538b2d9e33fb8e9059b99a62b2288000",
+          "signature": "cbc57c3dd6d77616d1949991fdb52d3a2cf46f10ee1399ca9c3e9217691fb0af703b89d6dbd997810b7a71aae28b3e5a9167f04389a373607e3f916abf0d4001",
           "successor_pubkey": "yFOtDwzSthmuqSzuxP1Wok1kmdWEznklfkXP2BObYKc"
         },
         {
           "epoch": 1,
           "file": "vectors/lineage/equivocation_fork/rotation_a.hex",
           "grammar": "lineage-succession-v1",
-          "length_bytes": 281,
+          "length_bytes": 290,
           "predecessor_pubkey": "yFOtDwzSthmuqSzuxP1Wok1kmdWEznklfkXP2BObYKc",
           "pubkey": "c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7",
           "reason": "rotation",
           "record_type": "agent_lineage_succession",
           "role": "rotation_a",
-          "signature": "fd4877d135a6814dae37cb0bcc755e1282bf1ca56ca976ddc95cd65878841f57f94b165597573295c0856bb59d74b56b7b01f7a696273e0b4153966dbde5aa08",
+          "signature": "ba23e79ce41fd474d0d5c252c50a37dc657d255f5d1aef17faee19a5eb59205a9ad7de0dc329924416647ec477bfdbbca8c7d442cf9e070c31abdbf0faeff202",
           "successor_pubkey": "skkdlQKuKGMKK6yy4MdFEP_N0yjDNP8-E5PnWy0x59w"
         },
         {
           "epoch": 1,
           "file": "vectors/lineage/equivocation_fork/rotation_b.hex",
           "grammar": "lineage-succession-v1",
-          "length_bytes": 281,
+          "length_bytes": 290,
           "predecessor_pubkey": "yFOtDwzSthmuqSzuxP1Wok1kmdWEznklfkXP2BObYKc",
           "pubkey": "c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7",
           "reason": "rotation",
           "record_type": "agent_lineage_succession",
           "role": "rotation_b",
-          "signature": "3857c088af0b7cb0666bab2a18183038d26a61b02b04080bdfc3e9052bb5a5ef7d7be7e4d729fdee6cb64147d608016b0a6a14a60450cdd7090518c02128d206",
+          "signature": "a9a2b14a061d06524290279b1d6d8968160c3af43dff1500a5686ef09d4d3f2a69d9b660e768e3be3ac8c8b97e53d4dabc94fdaeaf8f34842bd88b4d648b8509",
           "successor_pubkey": "My6-jSfLcyOzpAHBwTtd1kvMwOEOzaHCtdEaA3eaheU"
         }
       ],
@@ -205,7 +205,7 @@
         {
           "file": "vectors/chain/intact/row_0.hex",
           "grammar": "signed-events-chain-v1",
-          "length_bytes": 195,
+          "length_bytes": 203,
           "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
           "record_type": "signed_events_chain_row",
           "role": "row_0",
@@ -214,8 +214,8 @@
         {
           "file": "vectors/chain/intact/row_1.hex",
           "grammar": "signed-events-chain-v1",
-          "length_bytes": 195,
-          "prev_hash": "9f9dd7be98e3d279279ee1bdbba5ede1c661495bd82a21546f670db06fde4dad",
+          "length_bytes": 203,
+          "prev_hash": "a2d9ce69e46ccc556ea6a40149a0cd212487fb6bc7fd15768905281b83c4397d",
           "record_type": "signed_events_chain_row",
           "role": "row_1",
           "sequence": 2
@@ -223,8 +223,8 @@
         {
           "file": "vectors/chain/intact/row_2.hex",
           "grammar": "signed-events-chain-v1",
-          "length_bytes": 195,
-          "prev_hash": "e5b8cc3d72a0e7dac336735ae30ea899fcdb3c9c6b16dce6209628a3751e86ae",
+          "length_bytes": 203,
+          "prev_hash": "d20531e91caa89becc89a9e54cb2b4ac268a4e20c1ca1d0794778cd147356c9f",
           "record_type": "signed_events_chain_row",
           "role": "row_2",
           "sequence": 3
@@ -242,7 +242,7 @@
         {
           "file": "vectors/chain/midchain_deletion/row_0.hex",
           "grammar": "signed-events-chain-v1",
-          "length_bytes": 195,
+          "length_bytes": 203,
           "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
           "record_type": "signed_events_chain_row",
           "role": "row_0",
@@ -251,8 +251,8 @@
         {
           "file": "vectors/chain/midchain_deletion/row_2.hex",
           "grammar": "signed-events-chain-v1",
-          "length_bytes": 195,
-          "prev_hash": "e5b8cc3d72a0e7dac336735ae30ea899fcdb3c9c6b16dce6209628a3751e86ae",
+          "length_bytes": 203,
+          "prev_hash": "d20531e91caa89becc89a9e54cb2b4ac268a4e20c1ca1d0794778cd147356c9f",
           "record_type": "signed_events_chain_row",
           "role": "row_2",
           "sequence": 3
@@ -271,7 +271,7 @@
         {
           "file": "vectors/chain/tail_truncation/row_0.hex",
           "grammar": "signed-events-chain-v1",
-          "length_bytes": 195,
+          "length_bytes": 203,
           "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
           "record_type": "signed_events_chain_row",
           "role": "row_0",
@@ -280,8 +280,8 @@
         {
           "file": "vectors/chain/tail_truncation/row_1.hex",
           "grammar": "signed-events-chain-v1",
-          "length_bytes": 195,
-          "prev_hash": "9f9dd7be98e3d279279ee1bdbba5ede1c661495bd82a21546f670db06fde4dad",
+          "length_bytes": 203,
+          "prev_hash": "a2d9ce69e46ccc556ea6a40149a0cd212487fb6bc7fd15768905281b83c4397d",
           "record_type": "signed_events_chain_row",
           "role": "row_1",
           "sequence": 2
@@ -300,7 +300,7 @@
       "domain_tag": "ai-memory/write/v2",
       "elements": 11,
       "file": "vectors/signable_write_v2/a4_worked_example.hex",
-      "length_bytes": 181,
+      "length_bytes": 187,
       "name": "signable_write_v2/a4_worked_example",
       "record_type": "signable_write_v2",
       "verdict": "reencode-match"
@@ -309,7 +309,7 @@
       "domain_tag": "ai-memory/write/v2",
       "elements": 11,
       "file": "vectors/signable_write_v2/session_present.hex",
-      "length_bytes": 193,
+      "length_bytes": 199,
       "name": "signable_write_v2/session_present",
       "record_type": "signable_write_v2",
       "verdict": "reencode-match"
@@ -318,7 +318,7 @@
       "domain_tag": "ai-memory/write/v2",
       "elements": 11,
       "file": "vectors/signable_write_v2/blake3_digest_variant.hex",
-      "length_bytes": 244,
+      "length_bytes": 253,
       "name": "signable_write_v2/blake3_digest_variant",
       "record_type": "signable_write_v2",
       "verdict": "reencode-match"
@@ -327,7 +327,7 @@
       "domain_tag": "ai-memory/subkey-cert/v1",
       "elements": 6,
       "file": "vectors/subkey_cert/worked_cert.hex",
-      "length_bytes": 159,
+      "length_bytes": 168,
       "name": "subkey_cert/worked_cert",
       "record_type": "subkey_cert",
       "verdict": "reencode-match"
@@ -336,7 +336,7 @@
       "domain_tag": "ai-memory/peer-head-attestation-v1",
       "elements": 6,
       "file": "vectors/peer_head_attestation/worked_attestation.hex",
-      "length_bytes": 117,
+      "length_bytes": 126,
       "name": "peer_head_attestation/worked_attestation",
       "record_type": "peer_head_attestation",
       "verdict": "reencode-match"
@@ -354,29 +354,29 @@
       "domain_tag": "ai-memory/write/v2",
       "elements": 11,
       "file": "vectors/signed/write_v2_signed.hex",
-      "length_bytes": 181,
+      "length_bytes": 187,
       "name": "signed/write_v2_signed",
       "pubkey": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
       "record_type": "signable_write_v2",
-      "signature": "24883e8c07e3d05ba84b153c0e46a574251310a604661b860b4bd7ddd5dabd3512610bcb294a9f2862295c6600e1cd8d9731ed40e004a0ab58f7bf4a40dc0f0d",
+      "signature": "7b5916fa132a069cc8cc746cb9d61bcafb2d3ac9b34c55107232b3d45ef0056c31639d2e351bc50c6b9bf8b599cb1c1632dcb16fbedf87b379976b32e7f9de0a",
       "verdict": "signature-valid"
     },
     {
       "domain_tag": "ai-memory/write/v2",
       "elements": 11,
       "file": "vectors/signed/write_v2_tampered.hex",
-      "length_bytes": 181,
+      "length_bytes": 187,
       "name": "signed/write_v2_tampered",
       "pubkey": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
       "record_type": "signable_write_v2",
-      "signature": "25883e8c07e3d05ba84b153c0e46a574251310a604661b860b4bd7ddd5dabd3512610bcb294a9f2862295c6600e1cd8d9731ed40e004a0ab58f7bf4a40dc0f0d",
+      "signature": "7a5916fa132a069cc8cc746cb9d61bcafb2d3ac9b34c55107232b3d45ef0056c31639d2e351bc50c6b9bf8b599cb1c1632dcb16fbedf87b379976b32e7f9de0a",
       "verdict": "signature-invalid"
     },
     {
       "domain_tag": "ai-memory/equivocation-proof/v1",
       "elements": 4,
       "file": "vectors/signed/equivocation_proof_real.hex",
-      "length_bytes": 362,
+      "length_bytes": 380,
       "name": "signed/equivocation_proof_real",
       "pubkey": "17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce",
       "record_type": "equivocation_proof",

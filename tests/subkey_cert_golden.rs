@@ -69,7 +69,7 @@ fn check_vector(name: &str, encoded: &[u8]) {
 /// verifying-key bytes (spec §2.3); a fixed placeholder here.
 fn worked_cert() -> Vec<u8> {
     let cert = SubkeyCert {
-        principal: "ai:claude-code@pop-os",
+        principal: "ai:example-agent@host.example",
         instance_key_id: &[0x07; 32],
         model_version_ref: &[0xab; 32],
         not_before: "2026-07-11T00:00:00Z",

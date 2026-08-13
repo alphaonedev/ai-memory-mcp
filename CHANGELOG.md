@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (fixture hygiene — operator hostname removed from the frozen vectors; #2924)
+
+- **Re-minted every golden / CC0-conformance vector from SYNTHETIC
+  identities.** The committed hex vectors under `tests/golden/**` and
+  `conformance/vectors/**` carried the REAL operator agent identity
+  (an `ai:<tool>@<hostname>` token, plus a bare `host:<hostname>` token)
+  inside their signed pre-image bytes, so a hex-decode of e.g.
+  `conformance/vectors/signable_write_v2/blake3_digest_variant.hex`
+  disclosed the authoring machine's hostname — the same disclosure class
+  the cert-§5.4 evidence-bundle sanitization removed. (The offending
+  literals are deliberately not reproduced here; see the issue.) The fixture
+  identities are now RFC-2606-reserved synthetics
+  (`ai:example-agent@host.example`, `host:host.example`,
+  `ai:evil@host.example`), matching the repo's existing
+  `*.example` fixture convention and passing `validate_agent_id`'s
+  `[A-Za-z0-9_\-:@./]{1,128}` shape rule
+  ([#2924](https://github.com/alphaonedev/ai-memory-mcp/issues/2924)).
+  Because the records are domain-tag-bound and hash/signature-chained,
+  the change was made ONLY at the fixture-input constants and the
+  vectors were regenerated through the sanctioned pinned-encoder path
+  (`AI_MEMORY_REGEN_GOLDEN=1 cargo test --test signable_write_v2_golden
+  --test equivocation_proof_golden --test head_attestation_golden
+  --test subkey_cert_golden --test conformance_corpus`) — never
+  hand-edited. All paired expectations moved in lockstep: 6 golden
+  vectors, 26 corpus vectors, `conformance/manifest.json`
+  (`corpus_digest` `82fe21c8…` → `7da47d28…`, per-vector `length_bytes`,
+  and the re-signed Ed25519 detached signatures; the fixed-seed public
+  keys are unchanged, as expected), the `conformance/ROSETTA.md` §6
+  byte-by-byte worked-example dump, and the format-freeze doc's
+  Appendix A.4 element list. **No wire-format, domain-tag, encoding-rule
+  or verifier-semantics change** — the frozen v2 array profile is
+  untouched; only the fixture payload strings differ. Verified with the
+  non-Rust `conformance-readers-gate` (both readers 18/18 items, plus
+  the gate's 11-plant self-test) so the clean-room verifiers still
+  accept the valid vectors and still REJECT the tampered one.
+
 ### Docs (capability inventory re-derivation; #1938)
 
 - **Re-derived the NSA CSI capability inventory against `release/v1.0.0`

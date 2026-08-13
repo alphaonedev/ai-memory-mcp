@@ -45,7 +45,7 @@
 //! A memory's durable `metadata.version_vector` is keyed by the process
 //! federation node identity, which defaults to `host:<hostname>` — a
 //! machine-dependent value that would otherwise leak the generating host into
-//! the committed golden (`host:pop-os` vs a CI runner's `host:runnervm…`). We
+//! the committed golden (`host:host.example` vs a CI runner's `host:runnervm…`). We
 //! PIN `AI_MEMORY_FED_IDENTITY` (env #61) to a FIXED, machine-independent id
 //! (`conformance-fixture-writer`) before the FIRST DB write, so the vector-clock
 //! actor key is stable in any environment. `local_node_identity()` caches its

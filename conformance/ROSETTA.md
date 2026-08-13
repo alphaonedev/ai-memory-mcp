@@ -161,7 +161,7 @@ Appendix A.4 record). Full hex, split at item boundaries:
 ```
 8b                                            outer: array(11)
 72 61692d6d656d6f72792f77726974652f7632      [0] text(18)  "ai-memory/write/v2"
-6b 686f73743a706f702d6f73                    [1] text(11)  "host:pop-os"
+71 686f73743a686f73742e6578616d706c65        [1] text(17)  "host:host.example"
 66 676c6f62616c                              [2] text(6)   "global"
 61 78                                        [3] text(1)   "x"
 6b 6f62736572766174696f6e                    [4] text(11)  "observation"
