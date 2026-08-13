@@ -27,6 +27,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   + pgvector 0.8.5 single-node CI stack (run 31601974424 at
   `b80e7fff`, tree-identical to `e22bc93c`). Campaign results are not
   rewritten as PG18. The two stacks are named as disjoint evidence.
+### Docs (capability inventory re-derivation; #1938)
+
+- **Re-derived the NSA CSI capability inventory against `release/v1.0.0`
+  @ `580d8427`.** New artefact
+  `docs/compliance/_inventory/v1.0.0-capabilities.json` (46 primitives:
+  the original 27 Task I rows re-anchored + 19 v0.8–v1.0 defensive
+  layers) plus companion `v1.0.0-summary.md`. The v0.7.0 pair is
+  retained as a historical artefact. Currency notes in
+  `honest-limitations.md`, `docs/compliance/index.html`,
+  `nsa-csi-mcp-security-mapping.md`, `nsa-csi-mcp.html`,
+  `mcp-registry-submission.json`, and ROADMAP now point at the v1.0.0
+  file as the source of truth. Closes cert §8 minting condition (b).
+  ([#1938](https://github.com/alphaonedev/ai-memory-mcp/issues/1938)).
 
 ### CI (control-integrity — commit-signing posture gate; #2486)
 
