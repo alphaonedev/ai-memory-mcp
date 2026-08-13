@@ -235,12 +235,14 @@ check_change() {
 
     # --no-renames so a move of a watched file cannot hide as an unwatched
     # destination-only name (D of the old path still surfaces).
-    local paths
-    paths="$(git -C "$repo" diff --name-only --no-renames "$mb" "$head")"
-
+    # -c core.quotePath=false + -z: git C-quotes any path with a non-ASCII
+    # byte (or " / \\ / control char) into `"src/federation/na\303\257ve.rs"`,
+    # and the leading quote makes every [[ == ]] path glob MISS. -z emits
+    # raw NUL-delimited paths, so a newline in a name cannot split a record
+    # either.
     local watched=() cert_touched=0
     local p
-    while IFS= read -r p; do
+    while IFS= read -r -d '' p; do
         [[ -z "$p" ]] && continue
         if is_cert_doc_path "$p"; then
             cert_touched=1
@@ -248,7 +250,7 @@ check_change() {
         if is_watched_path "$p"; then
             watched+=("$p")
         fi
-    done <<<"$paths"
+    done < <(git -C "$repo" -c core.quotePath=false diff --name-only -z --no-renames "$mb" "$head")
 
     local base_ids head_ids added removed
     base_ids="$(extract_fed_ids "$repo" "$mb")"
@@ -567,6 +569,30 @@ self_test() {
         fi
     fi
 
+    git -C "$repo" reset -q --hard "$base_sha"
+
+    # (p) RED — non-ASCII path under a watched dir. core.quotePath (default
+    #     true) C-quotes such a path into `"src/federation/na\303\257ve…"`,
+    #     and the leading `"` makes every [[ == ]] path glob MISS — the gate
+    #     must read raw NUL-delimited paths (-z + core.quotePath=false) so
+    #     the watch still trips. Pins the fix for that bypass.
+    printf 'fn wire() {}\n' >"$repo/src/federation/naïve_wire.rs"
+    git -C "$repo" add "src/federation/naïve_wire.rs"
+    git -C "$repo" commit -q -m "violate: non-ASCII watched path"
+    local quoted_sha
+    quoted_sha="$(git -C "$repo" rev-parse HEAD)"
+    if out="$(check_change "$repo" "$base_sha" "$quoted_sha" 2>&1)"; then
+        echo "self-test FAILED (p): non-ASCII watched path was NOT rejected (core.quotePath bypass)" >&2
+        echo "$out" >&2
+        failed=1
+    else
+        if ! printf '%s\n' "$out" | grep -q 'src/federation/naïve_wire.rs'; then
+            echo "self-test FAILED (p): rejection did not name the raw (unquoted) non-ASCII path:" >&2
+            echo "$out" >&2
+            failed=1
+        fi
+    fi
+
     # (k) fail-closed — pull_request with missing PR_BASE_SHA.
     if (
         unset CERT_EXPIRY_BASE CERT_EXPIRY_HEAD PR_BASE_SHA PR_HEAD_SHA GITHUB_EVENT_BEFORE
@@ -630,7 +656,7 @@ self_test() {
         echo "check-cert-expiry self-test: FAIL" >&2
         exit 2
     fi
-    echo "check-cert-expiry self-test OK: (a) watched-path violation RED with the §7 expiry sentence; (b) same change + cert-doc GREEN; (c) AI_MEMORY_FED_* identifier-add outside the path watches RED; (d) identifier-add + cert-doc GREEN; (e) unrelated src/ edit GREEN; (f) cert-doc-only GREEN; (g) federation_receive.rs RED; (h) federation_signing_check.rs RED; (h2) nested src/federation/identity/** RED; (i) watched-file rename RED (old path still named); (j) identifier-rename RED (both names listed); (k) pull_request missing PR_BASE_SHA fail-closed; (l) workflow_dispatch skip; (m) push with zero before-SHA skip; (n) unresolvable range fail-closed; (o) this checkout vs origin/release/v1.0.0 GREEN."
+    echo "check-cert-expiry self-test OK: (a) watched-path violation RED with the §7 expiry sentence; (b) same change + cert-doc GREEN; (c) AI_MEMORY_FED_* identifier-add outside the path watches RED; (d) identifier-add + cert-doc GREEN; (e) unrelated src/ edit GREEN; (f) cert-doc-only GREEN; (g) federation_receive.rs RED; (h) federation_signing_check.rs RED; (h2) nested src/federation/identity/** RED; (i) watched-file rename RED (old path still named); (j) identifier-rename RED (both names listed); (k) pull_request missing PR_BASE_SHA fail-closed; (l) workflow_dispatch skip; (m) push with zero before-SHA skip; (n) unresolvable range fail-closed; (o) this checkout vs origin/release/v1.0.0 GREEN; (p) non-ASCII watched path RED (core.quotePath bypass closed)."
 }
 
 case "${1:-}" in
