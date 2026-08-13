@@ -1,0 +1,9 @@
+   Compiling ai-memory v1.0.0 (<repo-root>)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 41.29s
+     Running tests/federation_delete_ns_scope_2488.rs (target/debug/deps/federation_delete_ns_scope_2488-aba19b2906c770be)
+
+running 1 test
+test enrolled_unscoped_federated_deletion_refused_by_default_2488 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.34s
+
