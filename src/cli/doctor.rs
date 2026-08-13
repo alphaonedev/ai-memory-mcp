@@ -4061,6 +4061,7 @@ enabled = true
                 crate::federation::signing::REQUIRE_SIG_ENV,
                 crate::federation::signing::REQUIRE_NONCE_ENV,
                 crate::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+                crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
                 "AI_MEMORY_PERMISSIONS_MODE",
                 crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN,
                 crate::federation::identity::trust_bundle::TRUST_DOMAIN_ENV,
@@ -4070,6 +4071,7 @@ enabled = true
                 crate::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV,
                 crate::encryption::ENV_ENCRYPT_AT_REST,
                 crate::tls::FED_ALLOW_PLAINTEXT_PEERS_ENV,
+                crate::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
             ] {
                 std::env::remove_var(env);
             }
@@ -4153,6 +4155,20 @@ enabled = true
                 .unwrap()
                 .contains("AI_MEMORY_FED_TRUST_DOMAIN")
         );
+        // #2911 item 1: doctor --posture must FAIL when the boot-refusal
+        // env is unset — that is the whole self-attestation check.
+        let boot_gate_row = checks
+            .iter()
+            .find(|c| {
+                c["control"]
+                    == crate::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE
+            })
+            .expect("boot-refusal self-attestation check must be present");
+        assert_eq!(boot_gate_row["pass"], false);
+        assert_eq!(
+            checks.len(),
+            crate::enterprise_federation_posture::ENTERPRISE_FEDERATION_CHECK_COUNT
+        );
     }
 
     /// PASSES on a fully-hardened env (asi-hard engaged + every
@@ -4193,6 +4209,10 @@ enabled = true
                 r#"{"peer-1":{"allowed_namespaces":["public/*"]}}"#,
             );
             std::env::set_var(crate::encryption::ENV_ENCRYPT_AT_REST, "1");
+            std::env::set_var(
+                crate::enterprise_federation_posture::ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
+                "1",
+            );
         }
 
         let mut stdout = Vec::<u8>::new();

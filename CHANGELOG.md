@@ -31,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and asserts THIS checkout is GREEN. Declared in
   `scripts/qc-allowlists/required-contexts-release.txt` (mirror-first;
   live branch-protection API is the operator-gated follow-up).
+### Fixed (enterprise-federation posture — boot gate self-attested + stale-policy hatch; #2911 items 1–2)
+
+- **`ai-memory doctor --posture enterprise-federation` no longer PASSes a process whose daemon would not refuse boot on later posture drift** ([#2911](https://github.com/alphaonedev/ai-memory-mcp/issues/2911) item 1). `evaluate()`'s 16 checks never read `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE`, so `enforce_at_boot_pre_runtime()` returning `Ok` when that env is unset was invisible to doctor. Check #17 now asserts the boot-refusal env is truthy (the same `is_truthy` reader the boot gate itself uses). Existing checks 1–16 keep their numbers (check #10 is still the pin-file row, reserved for item 3).
+- **`AI_MEMORY_FED_REQUIRE_POLICY_CURRENT=0` no longer escapes the certified posture** ([#2911](https://github.com/alphaonedev/ai-memory-mcp/issues/2911) item 2). The FED-RQ-03 stale-governance-policy refusal (`receive_auth::require_policy_current_enabled`, default-ON) was the only fail-closed `AI_MEMORY_FED_*` receive gate in neither `security_profile::KNOBS` nor the posture table. Check #18 calls the real reader; an explicit falsy token FAILs doctor and, when check #17 is armed, refuses boot. Crossroads: this is a posture check, not an `asi-hard` KNOBS pin — generic `asi-hard` without the enterprise posture still permits `=0`; that is the generic-vs-certified-set boundary. `docs/deploy/enterprise-federation.env` now names the knob so the boot banner echoes it.
 ### Docs (capability inventory re-derivation; #1938)
 
 - **Re-derived the NSA CSI capability inventory against `release/v1.0.0`

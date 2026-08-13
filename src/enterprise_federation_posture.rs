@@ -33,14 +33,19 @@
 //!    [`crate::security_profile::is_asi_hard`] +
 //!    [`crate::security_profile::asi_hard_below_floor`] — no knob name
 //!    or floor value is re-declared here).
-//! 2. A SMALL set of federation-certification-specific additions the
-//!    ruling names that are NOT part of the generic `asi-hard` set
-//!    (peer enrollment / per-message sig / nonce / push-namespace-scope
-//!    / governance permissions mode / governance fail-open / trust
-//!    domain / peer fingerprints / peer attestation JSON+glob shape /
-//!    the two "must be UNSET" federation trust bypasses / at-rest
-//!    encryption). Every env-var-name literal below is a named `ENV_*`
-//!    const imported from its ONE existing declaration site — none are
+//! 2. A SMALL set of federation-certification-specific additions that
+//!    are NOT part of the generic `asi-hard` set. Most are named by the
+//!    §5.3 ruling (peer enrollment / per-message sig / nonce /
+//!    push-namespace-scope / governance permissions mode / governance
+//!    fail-open / trust domain / peer fingerprints / peer attestation
+//!    JSON+glob shape / the two "must be UNSET" federation trust
+//!    bypasses / at-rest encryption). TWO are BEYOND-RULING additions
+//!    from #2911 items 1-2, not from the ruling: the
+//!    stale-governance-policy refusal (FED-RQ-03, check #18) and the
+//!    boot-refusal env itself (check #17 — so `doctor --posture` cannot
+//!    PASS a deployment whose daemon would not refuse boot on later
+//!    drift). Every env-var-name literal below is a named `ENV_*` const
+//!    imported from its ONE existing declaration site — none are
 //!    redeclared here.
 //!
 //! ## Ruling-vs-code reconciliation (quoted, so the drift is auditable)
@@ -59,6 +64,13 @@
 //!   `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` (env-table row #39,
 //!   [`crate::daemon_runtime::governance_fail_open_on_error`]), checked
 //!   here directly.
+//!
+//! And the inverse direction, recorded here so the ruling-vs-code delta
+//! stays auditable BOTH ways: checks #17 (boot-refusal env
+//! self-attestation) and #18 (`AI_MEMORY_FED_REQUIRE_POLICY_CURRENT`
+//! not explicitly falsy) appear in NO §5.3 ruling code block — they are
+//! BEYOND-RULING additions from #2911 items 1-2 (cert §2 doctor-caveat
+//! remediation), not reconciliations of anything the ruling wrote.
 //!
 //! A third reconciliation, on the `**` allow-all-glob check (§5.3's "no
 //! peer scope's `allowed_namespaces` contains a bare `**` allow-all
@@ -90,6 +102,11 @@ pub const POSTURE_ENTERPRISE_FEDERATION: &str = "enterprise-federation";
 /// (`AI_MEMORY_REQUIRE_WITNESS`, `AI_MEMORY_REQUIRE_ROLLBACK_CHECK`, …).
 pub const ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE: &str =
     "AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE";
+
+/// Number of [`PostureCheck`]s [`evaluate`] returns. Pinned so a
+/// dropped or added check is a loud test failure rather than a silent
+/// `doctor --posture` shape change (#2911).
+pub const ENTERPRISE_FEDERATION_CHECK_COUNT: usize = 18;
 
 /// `tracing` target for the §5.3 boot-banner rows
 /// (`daemon_runtime::run`, the B2 fix — see module docs). Hoisted to a
@@ -156,7 +173,7 @@ fn is_truthy(v: &str) -> bool {
 /// `doctor` CLI, a running daemon's boot gate, or a test).
 #[must_use]
 pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
-    let mut out = Vec::with_capacity(16);
+    let mut out = Vec::with_capacity(ENTERPRISE_FEDERATION_CHECK_COUNT);
 
     // ---- 1. asi-hard engaged --------------------------------------
     let asi_hard = crate::security_profile::is_asi_hard();
@@ -458,6 +475,51 @@ pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
          every non-loopback peer URL must be https://",
     ));
 
+    // ---- 17. boot-refusal env armed (#2911 item 1) -------------------
+    // Appended (not inserted) so existing check numbers 1-16 stay
+    // stable for the cert doc + #2911 item 3 (check #10 pin-file parse).
+    // `evaluate` previously never read this knob, so `doctor --posture`
+    // could PASS a process whose daemon would NOT refuse boot on later
+    // drift (`enforce_at_boot_pre_runtime` returns Ok when unset).
+    // Reuses the real reader — the same `is_truthy` grammar the boot
+    // gate itself uses.
+    let boot_gate_armed = enterprise_federation_posture_required();
+    out.push(check(
+        ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE,
+        "truthy (boot-refusal gate armed so future posture drift cannot silently boot)",
+        std::env::var(ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE)
+            .unwrap_or_else(|_| "(unset — boot gate inert)".to_string()),
+        boot_gate_armed,
+        "set AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE=1",
+    ));
+
+    // ---- 18. AI_MEMORY_FED_REQUIRE_POLICY_CURRENT (#2911 item 2) ------
+    // FED-RQ-03 stale-governance-policy refusal (receive_auth.rs:479-494
+    // at 580d8427). Default-ON via `env_flag_default_on`; an explicit
+    // falsy token (`0`/`false`/`no`/`off`) escaped BOTH this posture
+    // table and `security_profile::KNOBS`. A dedicated posture check
+    // (not a KNOBS pin) keeps the certified set off the cert-expiry
+    // watch list: this module is not watched, and the identifier is
+    // already declared in receive_auth. Crossroads: generic `asi-hard`
+    // without this enterprise posture still permits `=0`; that is the
+    // generic-vs-certified-set boundary — operators who want the
+    // certified guarantee arm check #17, which then refuses `=0` at
+    // boot via this row.
+    out.push(check(
+        crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
+        "not explicitly disabled (detected-stale inbound policy_version refused)",
+        std::env::var(crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV)
+            .unwrap_or_else(|_| MSG_UNSET_DEFAULTS_STRICT.to_string()),
+        crate::federation::receive_auth::require_policy_current_enabled(),
+        "unset AI_MEMORY_FED_REQUIRE_POLICY_CURRENT or set it to 1",
+    ));
+
+    debug_assert_eq!(
+        out.len(),
+        ENTERPRISE_FEDERATION_CHECK_COUNT,
+        "evaluate() check count drifted from ENTERPRISE_FEDERATION_CHECK_COUNT"
+    );
+
     out
 }
 
@@ -538,6 +600,7 @@ mod tests {
         crate::federation::signing::REQUIRE_SIG_ENV,
         crate::federation::signing::REQUIRE_NONCE_ENV,
         crate::federation::receive_auth::REQUIRE_PUSH_NAMESPACE_SCOPE_ENV,
+        crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
         AppConfig::ENV_PERMISSIONS_MODE,
         crate::daemon_runtime::ENV_GOVERNANCE_FAIL_OPEN,
         crate::federation::identity::trust_bundle::TRUST_DOMAIN_ENV,
@@ -616,9 +679,15 @@ mod tests {
                 r#"{"peer-1":{"allowed_namespaces":["public/*"]}}"#,
             );
             std::env::set_var(crate::encryption::ENV_ENCRYPT_AT_REST, "1");
+            // #2911 check #17 — unlike the default-ON `AI_MEMORY_FED_REQUIRE_*`
+            // knobs below, the boot-refusal env defaults OFF. Unset is now
+            // a FAIL (doctor must not PASS a process whose daemon would
+            // not refuse boot on later drift).
+            std::env::set_var(ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE, "1");
         }
         // AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT / _SIG / _NONCE /
-        // _PUSH_NAMESPACE_SCOPE / AI_MEMORY_PERMISSIONS_MODE /
+        // _PUSH_NAMESPACE_SCOPE / _POLICY_CURRENT /
+        // AI_MEMORY_PERMISSIONS_MODE /
         // AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR / _SYNC_TRUST_PEER /
         // _TRUST_BODY_AGENT_ID / _ALLOW_PLAINTEXT_PEERS /
         // _ALLOW_UNENROLLED_PEERS are all deliberately left UNSET — every
@@ -650,6 +719,11 @@ mod tests {
 
         let app_config = AppConfig::default();
         let checks = evaluate(&app_config);
+        assert_eq!(
+            checks.len(),
+            ENTERPRISE_FEDERATION_CHECK_COUNT,
+            "evaluate() must return exactly {ENTERPRISE_FEDERATION_CHECK_COUNT} checks (#2911)"
+        );
 
         let sqlcipher_compiled = crate::build_features::has_feature("sqlcipher");
         for c in &checks {
@@ -1165,6 +1239,109 @@ mod tests {
         let https_row = find(&checks, crate::tls::FED_ALLOW_PLAINTEXT_PEERS_ENV);
         assert!(!https_row.pass);
         assert!(https_row.control.contains("https-only peers"));
+    }
+
+    // ------------------------------------------------------------------
+    // #2911 items 1-2 — boot-gate self-attestation + policy-current
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn evaluate_fails_when_require_enterprise_federation_posture_unset() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::evaluate_fails_when_require_enterprise_federation_posture_unset",
+        ) {
+            return;
+        }
+        // Arrange: fully hardened except the boot-refusal env, which
+        // the helper now sets — strip it so doctor --posture sees the
+        // pre-#2911 "PASS while daemon would not refuse boot" shape.
+        let _g = env_lock();
+        unsafe {
+            clear_all();
+        }
+        let _cleanup = EnvGuard;
+        let _fp_file = set_fully_hardened_env();
+        unsafe {
+            std::env::remove_var(ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE);
+        }
+
+        // Act
+        let checks = evaluate(&AppConfig::default());
+        let c = find(&checks, ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE);
+
+        // Assert
+        assert!(
+            !c.pass,
+            "check #17 must FAIL when the boot-refusal env is unset"
+        );
+        assert!(c.actual.contains("unset"));
+        assert!(
+            c.remediation
+                .contains(ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE)
+        );
+        assert!(!all_pass(&checks));
+    }
+
+    #[test]
+    fn evaluate_fails_when_require_enterprise_federation_posture_explicitly_off() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::evaluate_fails_when_require_enterprise_federation_posture_explicitly_off",
+        ) {
+            return;
+        }
+        let _g = env_lock();
+        unsafe {
+            clear_all();
+        }
+        let _cleanup = EnvGuard;
+        let _fp_file = set_fully_hardened_env();
+        unsafe {
+            std::env::set_var(ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE, "0");
+        }
+
+        let checks = evaluate(&AppConfig::default());
+        let c = find(&checks, ENV_REQUIRE_ENTERPRISE_FEDERATION_POSTURE);
+        assert!(!c.pass);
+        assert_eq!(c.actual, "0");
+        assert!(!all_pass(&checks));
+    }
+
+    #[test]
+    fn evaluate_fails_when_require_policy_current_explicitly_disabled() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::evaluate_fails_when_require_policy_current_explicitly_disabled",
+        ) {
+            return;
+        }
+        let _g = env_lock();
+        unsafe {
+            clear_all();
+        }
+        let _cleanup = EnvGuard;
+        let _fp_file = set_fully_hardened_env();
+        unsafe {
+            std::env::set_var(
+                crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
+                "0",
+            );
+        }
+        assert!(
+            !crate::federation::receive_auth::require_policy_current_enabled(),
+            "precondition: the real FED-RQ-03 reader must see the hatch open"
+        );
+
+        let checks = evaluate(&AppConfig::default());
+        let c = find(
+            &checks,
+            crate::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV,
+        );
+        assert!(
+            !c.pass,
+            "check #18 must FAIL when AI_MEMORY_FED_REQUIRE_POLICY_CURRENT=0 — \
+             this is the exact escape #2911 item 2 names"
+        );
+        assert_eq!(c.actual, "0");
+        assert!(!all_pass(&checks));
     }
 
     // ------------------------------------------------------------------

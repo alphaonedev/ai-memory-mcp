@@ -106,6 +106,21 @@ fn enterprise_federation_env_selects_asi_hard_and_requires_the_posture_gate() {
         "the posture-required gate must be set truthy: {required:?}"
     );
 
+    // #2911 item 2 — the FED-RQ-03 stale-policy hatch must not ship
+    // explicitly off in the certified template (unset would also pass
+    // the default-ON reader; the template names the certified value
+    // so the boot banner echoes it).
+    let policy_current = env
+        .get(ai_memory::federation::receive_auth::REQUIRE_POLICY_CURRENT_ENV)
+        .expect("enterprise-federation.env must set AI_MEMORY_FED_REQUIRE_POLICY_CURRENT");
+    assert!(
+        matches!(
+            policy_current.as_str(),
+            "1" | "true" | "TRUE" | "yes" | "on"
+        ),
+        "POLICY_CURRENT must ship truthy in the certified template: {policy_current:?}"
+    );
+
     // Never ships the plaintext-peer hatch open, never ships either
     // must-be-UNSET federation trust bypass truthy.
     for env_name in [
