@@ -167,6 +167,21 @@ fn is_truthy(v: &str) -> bool {
     )
 }
 
+/// The RESOLVED security-posture token, for the #2923 pins-row `actual`.
+///
+/// Reuses [`crate::security_profile::SecurityPosture`] rather than
+/// re-deriving a name from the raw env value. An UNRECOGNISED token is
+/// a `resolve()` error (fail-loud at boot) which
+/// [`crate::security_profile::is_asi_hard`] reads as NOT hardened, so it
+/// renders as `unrecognised` — the row must never name a posture the
+/// process does not actually have.
+fn resolved_security_profile_label() -> &'static str {
+    match crate::security_profile::SecurityPosture::resolve() {
+        Ok(posture) => posture.as_str(),
+        Err(_) => "unrecognised",
+    }
+}
+
 /// Evaluate the RESOLVED process configuration against the certified
 /// enterprise-federation posture. Pure / read-only: mutates no env var,
 /// touches no database. Safe to call from any live process (the
@@ -189,12 +204,32 @@ pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
     // ---- 2. every asi-hard pinned knob (17) at its hard floor ------
     // Reuses `security_profile::KNOBS` via the read-only accessor — NO
     // knob name or floor value is re-declared here (see module docs).
+    //
+    // #2923 — this row must never read as a SATISFIED hardened-floor
+    // check when the pins are not in force. `asi_hard_below_floor()`
+    // reports only knobs a HARDENED process would pin below their floor,
+    // so under `standard` it is VACUOUSLY empty and the row rendered
+    // `[PASS] … 17/17 at floor` for a deployment where not one knob is
+    // pinned — false assurance in committed, publicly-auditable cert
+    // evidence. The floor is only EVALUABLE once the posture engages, so
+    // a non-`asi-hard` profile now FAILS with an `actual` that says the
+    // floor was not evaluated rather than claiming it was met. Under
+    // `asi-hard` the rendered `actual` / `pass` / `fix` are byte-identical
+    // to pre-#2923; only the `required` text gained its (always-true,
+    // previously implicit) engagement precondition.
     let below_floor = crate::security_profile::asi_hard_below_floor();
     let knob_count = crate::security_profile::pinned_knobs().len();
+    let pins_at_floor = asi_hard && below_floor.is_empty();
     out.push(check(
         "asi-hard pinned knobs",
-        &format!("all {knob_count} at hard floor (security_profile::KNOBS)"),
-        if below_floor.is_empty() {
+        &format!("asi-hard engaged AND all {knob_count} at hard floor (security_profile::KNOBS)"),
+        if !asi_hard {
+            format!(
+                "(profile={} — asi-hard pins not in force; the {knob_count}-knob hard floor was \
+                 not evaluated)",
+                resolved_security_profile_label()
+            )
+        } else if below_floor.is_empty() {
             format!("{knob_count}/{knob_count} at floor")
         } else {
             below_floor
@@ -203,9 +238,14 @@ pub fn evaluate(app_config: &AppConfig) -> Vec<PostureCheck> {
                 .collect::<Vec<_>>()
                 .join("; ")
         },
-        below_floor.is_empty(),
-        "remove the override(s) named in `actual` (asi-hard pins them) or raise each to its \
-         hard floor; see `src/security_profile.rs::KNOBS`",
+        pins_at_floor,
+        if asi_hard {
+            "remove the override(s) named in `actual` (asi-hard pins them) or raise each to its \
+             hard floor; see `src/security_profile.rs::KNOBS`"
+        } else {
+            "set AI_MEMORY_SECURITY_PROFILE=asi-hard so the hardened pins are in force, then \
+             re-run this check to evaluate the hard floor; see `src/security_profile.rs::KNOBS`"
+        },
     ));
 
     // ---- 3. AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT (COMBINED with the
@@ -768,6 +808,131 @@ mod tests {
         assert!(!c.pass);
         assert!(c.remediation.contains("asi-hard"));
         assert!(!all_pass(&checks));
+    }
+
+    /// #2923 — under a NON-`asi-hard` profile the pins row must not read
+    /// as a satisfied hardened-floor check. `asi_hard_below_floor()` is
+    /// vacuously empty there (its own docs say to pair it with
+    /// `is_asi_hard`), so the pre-fix row printed
+    /// `[PASS] … 17/17 at floor` while NOT ONE knob was pinned.
+    #[test]
+    fn pins_row_fails_and_states_floor_unevaluated_under_standard_profile_2923() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::pins_row_fails_and_states_floor_unevaluated_under_standard_profile_2923",
+        ) {
+            return;
+        }
+        let _g = env_lock();
+        unsafe {
+            clear_all();
+        }
+        let _cleanup = EnvGuard;
+
+        // Arrange: the bare cert-evidence leg — no profile, no knobs set.
+        // Act
+        let checks = evaluate(&AppConfig::default());
+        let c = find(&checks, "asi-hard pinned knobs");
+
+        // Assert: FAILS, and says WHY without claiming a met floor.
+        assert!(
+            !c.pass,
+            "the pins row must not PASS while the resolved profile is not asi-hard: {c:?}"
+        );
+        let knob_count = crate::security_profile::pinned_knobs().len();
+        assert!(
+            !c.actual
+                .contains(&format!("{knob_count}/{knob_count} at floor")),
+            "the vacuous all-at-floor rendering is the #2923 defect: {:?}",
+            c.actual
+        );
+        assert!(
+            c.actual.contains("profile=standard"),
+            "actual must name the resolved profile: {:?}",
+            c.actual
+        );
+        assert!(
+            c.actual.contains("not in force") && c.actual.contains("not evaluated"),
+            "actual must say the pins are not in force and the floor was not evaluated: {:?}",
+            c.actual
+        );
+        assert!(
+            c.required.contains("asi-hard engaged"),
+            "required must state the engagement precondition: {:?}",
+            c.required
+        );
+        assert!(
+            c.remediation
+                .contains(crate::security_profile::ENV_SECURITY_PROFILE),
+            "remediation must name the profile knob, not a knob list that is empty here: {:?}",
+            c.remediation
+        );
+        assert!(!all_pass(&checks));
+    }
+
+    /// #2923 companion — under an `asi-hard` hardened env the row is
+    /// UNCHANGED: it passes and still renders the all-at-floor verdict
+    /// derived from `asi_hard_below_floor()`.
+    #[test]
+    fn pins_row_passes_with_all_at_floor_under_hardened_profile_2923() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::pins_row_passes_with_all_at_floor_under_hardened_profile_2923",
+        ) {
+            return;
+        }
+        let _g = env_lock();
+        unsafe {
+            clear_all();
+        }
+        let _cleanup = EnvGuard;
+        let _fp_file = set_fully_hardened_env();
+
+        let checks = evaluate(&AppConfig::default());
+        let c = find(&checks, "asi-hard pinned knobs");
+
+        assert!(c.pass, "hardened env must PASS the pins row: {c:?}");
+        let knob_count = crate::security_profile::pinned_knobs().len();
+        assert_eq!(
+            c.actual,
+            format!("{knob_count}/{knob_count} at floor"),
+            "the hardened-leg rendering must stay byte-identical to pre-#2923"
+        );
+        assert!(
+            c.remediation.is_empty(),
+            "a passing check carries no remediation"
+        );
+    }
+
+    /// #2923 — an UNRECOGNISED profile token is a `SecurityPosture::resolve`
+    /// error, which `is_asi_hard()` reads as NOT hardened. The row must
+    /// still fail and must NOT name a posture the process does not have.
+    /// (A live daemon never reaches here — `enforce_at_boot_pre_runtime`
+    /// aborts on the typo — but `evaluate` is a public library entry
+    /// point, so the arm is real.)
+    #[test]
+    fn pins_row_fails_and_labels_unrecognised_profile_2923() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "enterprise_federation_posture::tests::pins_row_fails_and_labels_unrecognised_profile_2923",
+        ) {
+            return;
+        }
+        let _g = env_lock();
+        unsafe {
+            clear_all();
+        }
+        let _cleanup = EnvGuard;
+        unsafe {
+            std::env::set_var(crate::security_profile::ENV_SECURITY_PROFILE, "asi-hardd");
+        }
+
+        let checks = evaluate(&AppConfig::default());
+        let c = find(&checks, "asi-hard pinned knobs");
+
+        assert!(!c.pass);
+        assert!(
+            c.actual.contains("profile=unrecognised"),
+            "an unresolvable profile must not be rendered as `standard` or `asi-hard`: {:?}",
+            c.actual
+        );
     }
 
     #[test]
