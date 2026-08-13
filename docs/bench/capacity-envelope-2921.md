@@ -309,11 +309,16 @@ points support a defensible fit (see §5).
   records it in the results JSON. A measured op rate approaching that
   calibration figure would be instrument-bound rather than substrate-bound.
   The calibration numbers are in the evidence files.
-* **The attested/unsigned pair is the point of the second rung.** The
-  shipped v1.0.0 default REQUIRES a per-write Ed25519 signature on the
-  HTTP-direct surface. The unsigned rung is **not** a supported posture; it
-  exists only so the verification cost is visible as the difference between
-  two otherwise identical runs.
+* **The unsigned rung does NOT isolate the cost of attestation, and must
+  not be quoted as if it did.** The shipped v1.0.0 default REQUIRES a
+  per-write Ed25519 signature on the HTTP-direct surface; the unsigned rung
+  is **not** a supported posture. The two rungs also differ in *driver*
+  work — the attested rung replays pre-serialised bodies while the unsigned
+  rung JSON-encodes each request in Python — so the comparison is
+  confounded. The only conclusion it supports is that per-write signature
+  verification is **not the dominant term** (both land in the same
+  ~440–630 ops/s band), not that it is free. Isolating it properly would
+  need a driver that pre-serialises in both postures.
 
 ## 5. USL fit — one series supports it, three do not
 
