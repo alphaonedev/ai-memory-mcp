@@ -19,8 +19,8 @@
   read it to evaluate ai-memory against the NSA CSI checklist. No marketing
   language. No NSA endorsement implied. This document's own prose, version stamp,
   coverage postures and symbol citations were re-verified against release/v1.0.0
-  HEAD on 2026-08-01; the linked capability inventory JSON remains a v0.7.0-tree
-  artefact (see the currency note in the page body).
+  HEAD on 2026-08-01; the capability inventory JSON was re-derived at
+  580d8427 on 2026-08-13 (see the currency note in the page body).
 -->
 <!DOCTYPE html>
 <html lang="en">
@@ -154,7 +154,7 @@ footer a{color:var(--text-muted)}
         <span class="hero-pill warn">concern (a) addressed under the <code>enforce</code> identity-binding posture</span>
         <span class="hero-pill good">7/7 recommendations implemented</span>
         <span class="hero-pill good">47 dedicated tests pinning the #1154 contract</span>
-        <span class="hero-pill">27 primitives catalogued (v0.7.0-era inventory)</span>
+        <span class="hero-pill">46 primitives catalogued (v1.0.0 inventory @ 580d8427)</span>
         <span class="hero-pill">Schema v89 · 103 MCP entries · 94 route registrations / 80 paths</span>
       </div>
     </div>
@@ -197,7 +197,7 @@ footer a{color:var(--text-muted)}
 
     <div class="disclaimer-box">
       <strong>Currency note — read this before citing anything below.</strong>
-      <p>This document's prose, version stamp, coverage postures and code citations were re-verified against <code>release/v1.0.0</code> HEAD on 2026-08-01. <strong>The linked capability inventory (<a href="_inventory/v0.7.0-capabilities.json"><code>_inventory/v0.7.0-capabilities.json</code></a>, 27 primitives, codegraph-verified at commit <code>4add7a8528d4c16d696b391ec6e2890269669a84</code>) is a v0.7.0-tree artefact.</strong> It has not been re-derived against the v0.8.x / v0.9.0 / v1.0.0 source tree, and there is no <code>_inventory/v1.0.0-capabilities.json</code> in this repository; the v1.0.0 refresh is tracked under <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1938">#1938</a>. The inventory's own <code>file:line</code> fields inherit that vintage and should be read as v0.7.0 coordinates, not v1.0.0 ones. No structural regression against any of the 27 catalogued primitives is known or claimed — the inventory is simply not yet re-derived.</p>
+      <p>This document's prose, version stamp, coverage postures and code citations were re-verified against <code>release/v1.0.0</code> HEAD on 2026-08-01. <strong>The capability inventory (<a href="_inventory/v1.0.0-capabilities.json"><code>_inventory/v1.0.0-capabilities.json</code></a>, 46 primitives, codegraph-verified at commit <code>580d8427bb4da887f7a25731792c55c4e49d56d6</code>) was re-derived on 2026-08-13 under <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1938">#1938</a></strong> by extending the #1153 Task I method. The original 27-primitive v0.7.0 file is retained as a historical artefact at <a href="_inventory/v0.7.0-capabilities.json"><code>_inventory/v0.7.0-capabilities.json</code></a> (coordinates at <code>4add7a85</code>). The v1.0.0 inventory's own <code>file:line</code> fields are pin-verified at <code>580d8427</code> and will themselves drift after that SHA.</p>
       <p style="margin-top:.6rem"><strong style="color:var(--warn)">This page cites SYMBOLS, not <code>file:line</code> anchors.</strong> Line numbers drift with every commit — a 2026-05 anchor re-read at v1.0.0 lands on unrelated code, and an anchor that misses costs a reviewer trust that a later correction cannot buy back. Every code reference below is a module, type, function, or test name that either resolves in the tree or is noted as gone. Reproduce any of them with <code>rg '&lt;symbol&gt;' src/ tests/</code>.</p>
     </div>
 
@@ -233,7 +233,8 @@ footer a{color:var(--text-muted)}
         <li><a href="nsa-control-test-matrix.html">Control → Test matrix (companion page)</a></li>
         <li><a href="#boundaries">Honest boundaries</a></li>
         <li><a href="honest-limitations.html">Honest-limitations companion</a></li>
-        <li><a href="_inventory/v0.7.0-capabilities.json">Capability inventory JSON (v0.7.0-era artefact)</a></li>
+        <li><a href="_inventory/v1.0.0-capabilities.json">Capability inventory JSON (v1.0.0, current)</a></li>
+        <li><a href="_inventory/v0.7.0-capabilities.json">Capability inventory JSON (v0.7.0 historical artefact)</a></li>
       </ul>
     </div>
   </div>
@@ -243,7 +244,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="section-eyebrow">▸ One-page reference</span>
     <h2>NSA CSI MCP Security Control → ai-memory Feature mapping.</h2>
-    <p class="lede">Single-page procurement-grade table mapping every NSA CSI MCP control requirement to the ai-memory tool, primitive, or substrate feature that addresses it. Each row carries the capability identifier from the <a href="_inventory/v0.7.0-capabilities.json">v0.7.0-era inventory</a> and the <strong>named substrate symbol</strong> operators or auditors can grep against (<code>rg '&lt;symbol&gt;' src/ tests/</code>) to confirm the feature is wired and present.</p>
+    <p class="lede">Single-page procurement-grade table mapping every NSA CSI MCP control requirement to the ai-memory tool, primitive, or substrate feature that addresses it. Each row carries the capability identifier from the <a href="_inventory/v1.0.0-capabilities.json">v1.0.0 inventory</a> and the <strong>named substrate symbol</strong> operators or auditors can grep against (<code>rg '&lt;symbol&gt;' src/ tests/</code>) to confirm the feature is wired and present.</p>
 
     <h3 style="margin-top:1.5rem;color:var(--text)">Concerns (9 of 10 structurally addressed as shipped; (a) posture-conditional)</h3>
     <table>
@@ -408,7 +409,7 @@ footer a{color:var(--text-muted)}
       </tbody>
     </table>
 
-    <p style="margin-top:1.5rem;color:var(--text-dim);font-size:.85rem">Every <code>Capability identifier</code> in the tables above corresponds to a row in the <a href="_inventory/v0.7.0-capabilities.json">v0.7.0-era capability inventory JSON</a> (see the currency note above — that artefact has not been re-derived at v1.0.0; <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1938">#1938</a>). Every <code>Substrate symbol</code> is a named module / type / function / test that resolves at <code>release/v1.0.0</code> HEAD — check any of them with <code>rg '&lt;symbol&gt;' src/ tests/</code>. Procurement reviewers can run the verification commands in §<a href="#verify">For procurement reviewers</a> to reproduce the mapping from a fresh checkout.</p>
+    <p style="margin-top:1.5rem;color:var(--text-dim);font-size:.85rem">Every <code>Capability identifier</code> in the tables above corresponds to a row in the <a href="_inventory/v1.0.0-capabilities.json">v1.0.0 capability inventory JSON</a> (re-derived at <code>580d8427</code> under <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1938">#1938</a>; v0.7.0-era ids are stable, 19 v0.8–v1.0 ids are additive). Every <code>Substrate symbol</code> is a named module / type / function / test that resolves at <code>release/v1.0.0</code> HEAD — check any of them with <code>rg '&lt;symbol&gt;' src/ tests/</code>. Procurement reviewers can run the verification commands in §<a href="#verify">For procurement reviewers</a> to reproduce the mapping from a fresh checkout.</p>
     <p style="color:var(--text-dim);font-size:.85rem">This table maps each control to the <em>feature</em> that addresses it. The companion <a href="nsa-control-test-matrix.html">Control → Test Matrix</a> maps the same controls to the <em>automated checks</em> that exercise them — named tests (<code>file::test_name</code>), CI workflow jobs, and do-1461 live-fleet harness check ids — with evidence gaps stated honestly.</p>
   </div>
 </section>
@@ -767,10 +768,10 @@ cd ai-memory-mcp
 <span class="com"># This page describes release/v1.0.0 and was re-verified against its HEAD</span>
 git checkout release/v1.0.0
 
-<span class="com"># The linked capability inventory JSON is a v0.7.0-tree artefact, codegraph-</span>
-<span class="com"># verified at the commit below. Check it out ONLY to audit that artefact —</span>
-<span class="com"># its file:line fields are v0.7.0 coordinates, not v1.0.0 ones (see #1938).</span>
-<span class="com"># git checkout 4add7a8528d4c16d696b391ec6e2890269669a84</span></pre>
+<span class="com"># The capability inventory JSON was re-derived at 580d8427 (this branch tip</span>
+<span class="com"># as of the #1938 refresh). The v0.7.0 artefact is retained for history:</span>
+<span class="com">#   docs/compliance/_inventory/v1.0.0-capabilities.json   (current)</span>
+<span class="com">#   docs/compliance/_inventory/v0.7.0-capabilities.json   (4add7a85 coordinates)</span></pre>
 
     <h3>2. Verify the schema version (both adapters, lockstep)</h3>
 <pre class="codeblock">grep -n 'CURRENT_SCHEMA_VERSION: i64' src/storage/migrations.rs
@@ -822,14 +823,14 @@ AI_MEMORY_NO_CONFIG=1 cargo test --test capabilities_v3
 AI_MEMORY_NO_CONFIG=1 cargo test --test token_budget_guard
 AI_MEMORY_NO_CONFIG=1 cargo test --test budget_tokens</pre>
 
-    <h3>7. Inspect the capability inventory JSON (v0.7.0-era artefact)</h3>
-<pre class="codeblock">cat docs/compliance/_inventory/v0.7.0-capabilities.json | jq '.capabilities[] | {id, verified_in_v0_7_0, verified_at_paths}'
+    <h3>7. Inspect the capability inventory JSON (v1.0.0, current)</h3>
+<pre class="codeblock">cat docs/compliance/_inventory/v1.0.0-capabilities.json | jq '.capabilities[] | {id, verified_in_v1_0_0, verified_at_paths}'
 
-<span class="com"># NOTE: this artefact was codegraph-verified against the v0.7.0 tree and has</span>
-<span class="com"># NOT been re-derived at v1.0.0. There is no _inventory/v1.0.0-capabilities.json</span>
-<span class="com"># in this repository; the refresh is tracked under issue #1938. Read its</span>
-<span class="com"># file:line fields as v0.7.0 coordinates. This page's own prose was re-verified</span>
-<span class="com"># at release/v1.0.0 HEAD and cites symbols, which do not carry that vintage.</span></pre>
+<span class="com"># Expected: 46 rows, verification_commit_sha = 580d8427bb4da887f7a25731792c55c4e49d56d6</span>
+<span class="com"># The v0.7.0 artefact is retained for history:</span>
+<span class="com">#   cat docs/compliance/_inventory/v0.7.0-capabilities.json | jq '.verification_commit_sha'</span>
+<span class="com"># This page's own prose cites symbols; the inventory JSON carries pin-verified</span>
+<span class="com"># file:line fields at 580d8427, which will themselves drift after that SHA.</span></pre>
 
     <h3>8. Spot-check any concern → primitive trace (by symbol)</h3>
 <pre class="codeblock"><span class="com"># For example, concern (h) DoS → 7-layer defense:</span>
@@ -861,7 +862,7 @@ rg -n 'ENV_HTTP_ATTESTED_IDENTITY|HttpIdentityMode' src/config.rs
 rg -n 'attested_identity_required' src/handlers/</pre>
 
     <h3>10. Re-derive the inventory at any future commit</h3>
-    <p>The inventory artefact carries a <code>verification_commit_sha</code> field. To re-derive at a future commit, follow the codegraph methodology documented in <a href="_inventory/v0.7.0-summary.html">_inventory/v0.7.0-summary.md §5 Reproducibility</a>. The v1.0.0 re-derivation is tracked under <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1938">#1938</a>.</p>
+    <p>The inventory artefact carries a <code>verification_commit_sha</code> field. To re-derive at a future commit, follow the codegraph methodology documented in <a href="_inventory/v1.0.0-summary.html">_inventory/v1.0.0-summary.md §3 Reproducibility</a> (which extends <a href="_inventory/v0.7.0-summary.html">v0.7.0-summary.md §5</a>). The v1.0.0 re-derivation that closed <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1938">#1938</a> minting condition (b) is the current artefact.</p>
   </div>
 </section>
 
@@ -880,9 +881,9 @@ rg -n 'attested_identity_required' src/handlers/</pre>
 <footer>
   <div class="container">
     <p style="margin-bottom:.5rem"><strong>ai-memory v1.0.0</strong> (sqlite + postgres schema <strong>v89</strong>, lockstep) · NSA CSI MCP Security Compliance · public-facing procurement-grade evidence · maintained by AlphaOne LLC under Apache 2.0.</p>
-    <p style="margin-bottom:.5rem">This page's prose, version stamp, coverage postures and symbol citations re-verified against <code>release/v1.0.0</code> HEAD on 2026-08-01. Inventory: <a href="_inventory/v0.7.0-capabilities.json">v0.7.0-capabilities.json</a> — a <strong>v0.7.0-tree artefact</strong>, codegraph-verified at commit <code>4add7a8528d4c16d696b391ec6e2890269669a84</code>, not re-derived at v1.0.0 (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1938">#1938</a>; there is no <code>_inventory/v1.0.0-capabilities.json</code>) · Summary: <a href="_inventory/v0.7.0-summary.html">v0.7.0-summary.md</a> · Companion: <a href="honest-limitations.html">honest-limitations.md</a></p>
+    <p style="margin-bottom:.5rem">This page's prose, version stamp, coverage postures and symbol citations re-verified against <code>release/v1.0.0</code> HEAD on 2026-08-01. Inventory: <a href="_inventory/v1.0.0-capabilities.json">v1.0.0-capabilities.json</a> — re-derived at <code>580d8427bb4da887f7a25731792c55c4e49d56d6</code> on 2026-08-13 (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1938">#1938</a>) · Summary: <a href="_inventory/v1.0.0-summary.html">v1.0.0-summary.md</a> · Historical artefact: <a href="_inventory/v0.7.0-capabilities.json">v0.7.0-capabilities.json</a> · Companion: <a href="honest-limitations.html">honest-limitations.md</a></p>
 
-    <p style="margin-bottom:.5rem"><strong>Mapping authority.</strong> Every claim on this page traces to a <strong>named symbol</strong> in the source tree (module / type / function / test name), plus — where applicable — an issue or PR reference. It deliberately publishes <strong>no <code>file:line</code> anchors</strong>: line numbers drift with every commit, and a reviewer who follows a stale anchor to unrelated code loses trust that a later correction cannot restore, whereas a symbol either resolves (<code>rg '&lt;symbol&gt;' src/ tests/</code>) or is provably gone. Where a previously-cited symbol has been renamed or removed, this page now says so at the point of citation. The v0.7.0-era claims additionally carry a <code>capability_id</code> in the inventory above, whose own <code>file:line</code> fields inherit that artefact's vintage.</p>
+    <p style="margin-bottom:.5rem"><strong>Mapping authority.</strong> Every claim on this page traces to a <strong>named symbol</strong> in the source tree (module / type / function / test name), plus — where applicable — an issue or PR reference. It deliberately publishes <strong>no <code>file:line</code> anchors</strong>: line numbers drift with every commit, and a reviewer who follows a stale anchor to unrelated code loses trust that a later correction cannot restore, whereas a symbol either resolves (<code>rg '&lt;symbol&gt;' src/ tests/</code>) or is provably gone. Where a previously-cited symbol has been renamed or removed, this page now says so at the point of citation. Claims additionally carry a <code>capability_id</code> in the v1.0.0 inventory, whose own <code>file:line</code> fields are pin-verified at <code>580d8427</code>.</p>
     <p style="margin-bottom:.5rem">Reference: National Security Agency, <em>Model Context Protocol (MCP): Security Design Considerations for AI-Driven Automation</em>, Cybersecurity Information, U/OO/6030316-26 | PP-26-1834, Version 1.0, May 2026. The mapping above is one-directional: ai-memory's posture relative to NSA-issued guidance. NSA, DoD, and the United States Government do not endorse, certify, or recommend ai-memory, AgenticMem, AlphaOne LLC, or any commercial product.</p>
     <p>Audit issue: <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1153">#1153</a> · Follow-up issues: #1154 (daemon serverInfo signing), #1155 (Accept-Provenance), #1156 (per-namespace K8 quota dimension, shipped at schema v50 — defense-in-depth blast-radius control under recommendation c).</p>
   </div>

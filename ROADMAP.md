@@ -478,7 +478,7 @@ review and by a loud advisory signal, not yet by branch protection.
 - **A2A-Certified internal:** yes (v0.6.2 + v0.6.3 + v0.7.0).
 - **Ship-Gate internal:** yes (9/9 certifications + 5/5 channels green at v0.7.0 cut).
 - **Third-party compliance held:** none (no SOC 2 / ISO 27001 / FedRAMP / HIPAA).
-- **NSA CSI MCP Security mapping:** 10/10 concerns structurally met at v0.7.0 (codegraph-verified at HEAD `4add7a8`); evidence inventory at `docs/compliance/_inventory/v0.7.0-capabilities.json`. Attestation is **v0.7.0-pinned** (HEAD `4add7a8`); the v0.7.1 surface is unchanged (re-attestation / `v0.7.1-capabilities.json` pending). Does not imply NSA endorsement.
+- **NSA CSI MCP Security mapping:** 10/10 concerns structurally met at v0.7.0 (codegraph-verified at HEAD `4add7a8`); that attestation remains a **v0.7.0-pinned historical artefact** at `docs/compliance/_inventory/v0.7.0-capabilities.json`. The current source of truth is the v1.0.0 re-derivation (`docs/compliance/_inventory/v1.0.0-capabilities.json`, 46 primitives, codegraph-verified at `580d8427` under #1938) — 9/10 fully as shipped; concern (a) access_control structurally addressed only under `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce` with per-agent keys enrolled. Does not imply NSA endorsement.
 - **Cryptographic agent attestation:** shipped at v0.7.0 on two surfaces — link-level Ed25519 signatures (`memory_links.signature`, closes G12 from §10.4) and store-path agent attestation (#626 Layer-3: a detached signature over the canonical `SignableWrite` envelope upgrades a directly-authored CLI/MCP/HTTP write from `claimed` to `agent_attested`, verified against the agent's bound key; `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` makes it mandatory). The federation receive path additionally gained **CA-rooted zero-touch peer-credential identity at v0.7.0** (the federation-identity-at-scale "enterprise zero-touch trust" epic, [#1512](https://github.com/alphaonedev/ai-memory-mcp/issues/1512) — a first-party CA issues short-lived federation credentials that the receive path chain-verifies to the trusted root, replacing the hand-maintained per-peer fingerprint allowlist; with chain-of-N hierarchical intermediates, a renewal-worker lifecycle, declarative-inventory reconciler, and credential-lifecycle audit into the V-4 `signed_events` chain — capstone `0a133a664`). Two edges stay claimed-by-design — the **per-write `agent_id` attestation** on the federation receive path (mTLS + the CA-rooted peer-credential boundary gate the connection, but the synced memory's author identity is not re-verified per write) and the permissive default posture — both tracked for v0.8 hardening under #1464.
 - **Multi-region distributed consensus:** v1.0+ commitment.
 
@@ -1142,7 +1142,7 @@ Plus per-release:
 | Adoption Metrics Dashboard | alphaonedev.github.io/ai-memory-mcp/adoption.html | v0.7.0 launch |
 | Competitive Benchmarks | github.com/alphaonedev/ai-memory-mcp/tree/main/benchmarks/competitive-benchmarks | v0.7.0 launch |
 | Heterogeneous AI NHI Assessment | alphaonedev.github.io/ai-memory-mcp/v0.7.0/heterogeneous-ai-nhi-assessment/ | post-#1171 panel completion |
-| NSA CSI MCP Security mapping | docs/compliance/_inventory/v0.7.0-capabilities.json | per release |
+| NSA CSI MCP Security mapping | docs/compliance/_inventory/v1.0.0-capabilities.json (current; v0.7.0-capabilities.json retained as historical) | per release |
 
 ---
 
