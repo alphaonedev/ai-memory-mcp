@@ -539,7 +539,7 @@ mod tests {
         SigningKey::from_bytes(&[0x22; 32])
     }
 
-    const AGENT: &str = "ai:claude-code@pop-os";
+    const AGENT: &str = "ai:example-agent@host.example";
     const NS: &str = "global";
     const TITLE: &str = "t";
     const KIND: &str = "instruction";
@@ -668,7 +668,7 @@ mod tests {
     #[test]
     fn principal_mismatch_is_rejected() {
         let (root, mut p) = valid_presentation();
-        p.cert.principal = "ai:evil@pop-os".to_string();
+        p.cert.principal = "ai:evil@host.example".to_string();
         assert_eq!(run(&root, &p), Err(AttestV2Error::PrincipalMismatch));
     }
 

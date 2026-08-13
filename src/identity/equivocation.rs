@@ -604,7 +604,7 @@ mod tests {
         SigningKey::from_bytes(&[0x11; 32])
     }
 
-    const SUBJECT: &str = "ai:claude-code@pop-os";
+    const SUBJECT: &str = "ai:example-agent@host.example";
     const SIGNED_AT: &str = "2026-07-11T00:00:00Z";
 
     fn att<'a>(epoch: u64, seq: u64, head_hash: &'a [u8]) -> SignableHeadAttestation<'a> {

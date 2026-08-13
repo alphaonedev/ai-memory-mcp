@@ -70,7 +70,7 @@ fn check_vector(name: &str, encoded: &[u8]) {
 fn worked_attestation() -> Vec<u8> {
     let head_hash = [0xab; 32];
     let att = SignableHeadAttestation {
-        subject_agent_id: "ai:claude-code@pop-os",
+        subject_agent_id: "ai:example-agent@host.example",
         epoch: 3,
         head_sequence: 42,
         head_hash: &head_hash,

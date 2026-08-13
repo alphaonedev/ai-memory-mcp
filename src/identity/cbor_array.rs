@@ -710,7 +710,7 @@ mod tests {
     fn worked_example() -> Vec<u8> {
         let mh = Multihash::new(HashCodec::Sha2_256, worked_example_digest());
         let w = SignableWriteV2 {
-            agent_id: "host:pop-os",
+            agent_id: "host:host.example",
             namespace: "global",
             title: "x",
             kind: "observation",
