@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Tests (cert removal-proof — `peer_enrolled_in_allowlist` individually proven; #2912)
+
+- **`peer_enrolled_in_allowlist` is now individually removal-proven on both
+  inbound lanes**, on the decisive hatch-open + unenrolled shape that the
+  pre-#2912 mapping missed. The cert harness previously mapped this
+  control onto `federated_write_outside_peer_scope_refused_2447`, whose
+  ENROLLED+SCOPED out-of-namespace write is refused by Layer 1 and never
+  reaches the predicate — mutating it to `return true;` left that test
+  GREEN (broken→rc=0). The new suite
+  (`tests/federation_peer_enrolled_2912.rs`) opens
+  `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0` and sends a header-absent
+  `/sync/push` (the only HTTP-reachable unenrolled shape: a present-but-
+  unlisted `X-Peer-Id` is refused by the #1056 envelope before Layer 2)
+  so a broken predicate lets the write/delete LAND. Write-lane test is
+  the harness MAP guard; the deletions[] twin is a suite-level twin.
+  `src/federation/**` is untouched (cert-expiry implication for Task C /
+  #2915: this PR does not trip the watch).
+
 ### CI (control-integrity — commit-signing posture gate; #2486)
 
 - **A new CI gate hard-fails the check when a PR's own commits are

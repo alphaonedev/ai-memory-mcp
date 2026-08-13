@@ -46,11 +46,23 @@ MAP=(
   "inbound_write_namespace_authorized|return true;|federation_write_ns_scope_2447|federated_write_outside_peer_scope_refused_2447"
   "inbound_by_id_namespace_authorized|return true;|federation_delete_ns_scope_2488|enrolled_unscoped_federated_deletion_refused_by_default_2488"
   "inbound_namespace_meta_authorized|return true;|federation_ns_meta_scope_2479|exploit_set_rebinds_out_of_scope_victim_standard_2479"
-  # NOTE: peer_enrolled_in_allowlist is NOT a standalone row — its sole production
-  # call site is src/federation/receive_auth.rs:1094 INSIDE inbound_write_namespace_authorized,
-  # so it is COMPOSITE-PROVEN by that control's removal proof (mutating the whole
-  # function to `return true` already bypasses this sub-check). The tofu unknown-peer
-  # refusal (x_peer_id_not_in_allowlist) is a SEPARATE earlier envelope gate.
+  # NOTE (post-#2912): peer_enrolled_in_allowlist is individually removal-proven
+  # on the decisive hatch-open + unenrolled shape
+  # (AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0 + header-absent peer, with
+  # AI_MEMORY_FED_TRUST_BODY_AGENT_ID=1 so the request reaches Layer 2 rather
+  # than the #238 envelope). Its sole production call site is
+  # src/federation/receive_auth.rs:1094 INSIDE layer2_unscoped_peer_authorized
+  # (:1081), which is called from BOTH inbound_write_namespace_authorized (:1049)
+  # AND inbound_by_id_namespace_authorized (:1219). The MAP guard is the
+  # write-lane test; the by-id twin
+  # (`unenrolled_peer_refused_on_delete_lane_when_scope_hatch_open_2912`) lives
+  # in the same suite. A present-but-unlisted x-peer-id is refused by the
+  # SEPARATE earlier #1056 envelope (x_peer_id_not_in_allowlist) and cannot
+  # prove this control. The pre-#2912 mapping onto
+  # federated_write_outside_peer_scope_refused_2447 was MASKED: that test is
+  # refused by Layer 1 (enrolled+scoped, out of namespace) and never reaches
+  # this predicate, so broken→rc=0.
+  "peer_enrolled_in_allowlist|return true;|federation_peer_enrolled_2912|unenrolled_peer_refused_on_write_lane_when_scope_hatch_open_2912"
   "require_push_namespace_scope_enabled|return false;|federation_write_ns_scope_2447|enrolled_peer_without_declared_namespaces_denied_by_default_2447"
   "authorize_remote_checkpoint_resolution|return CheckpointResolutionAuthz::Accept;|federation_1936_checkpoint_fed|strict_refuses_unenrolled_resolver"
 )
