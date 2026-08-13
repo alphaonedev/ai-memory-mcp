@@ -378,7 +378,8 @@ is observed:**
 or the `AI_MEMORY_FED_*` env surface.** Any such change requires re-running
 §5.4(2)–(5) and re-issuing this document against the new SHA. (As of this
 re-issue the trigger is **not yet mechanized in CI** — that gate is
-Task C / **PR-TBD-C**. Until it lands, a wire change can merge through
+Task C / [**#2915**](https://github.com/alphaonedev/ai-memory-mcp/pull/2915).
+Until it lands, a wire change can merge through
 green CI while this document stays cited.)
 
 **Named signer.** The determination at `580d8427` is a **GitHub
@@ -429,8 +430,8 @@ this re-issue and the companion PRs / issues dispose.
 
 | Condition | Disposition |
 |---|---|
-| **(a)** cert artifacts committed and passing CI | **Met.** PR #2910 merged as `580d8427`. `gh pr view 2910 --json statusCheckRollup` reports **42** check runs: **41 SUCCESS + 1 SKIPPED** (`Regenerate bench baseline (ubuntu-latest, median-of-3)` — the intentional bench skip). Zero failures. (The pre-re-issue prose's "47/47" figure is **not** reproduced by that rollup; the verified count is 42.) |
-| **(b)** capability-inventory JSON re-derivation | **In flight — waived as a minting blocker, not as a follow-up.** At `580d8427`, `docs/compliance/_inventory/` holds `v0.7.0-capabilities.json` only. The staleness is already disclosed in `docs/compliance/honest-limitations.md:13-16` (currency note pointing at #1938). The inventory is **not load-bearing for the five §1 security guarantees** (those rest on the posture gate, the removal proofs, and the executed negative lanes). Re-derivation is Task B / **PR-TBD-B** (`feat/1938-capability-inventory-v100`). |
+| **(a)** cert artifacts committed and passing CI | **Met.** PR #2910 merged as `580d8427`. The minting-condition evidence is the **commit-level** check-run set on that SHA: `gh api repos/alphaonedev/ai-memory-mcp/commits/580d8427/check-runs --paginate --jq '.check_runs \| group_by(.conclusion) \| map({conclusion: .[0].conclusion, count: length})'` → `[{"conclusion":"skipped","count":1},{"conclusion":"success","count":46}]` — **47 check-runs: 46 SUCCESS + 1 SKIPPED** (`Regenerate bench baseline (ubuntu-latest, median-of-3)` — the intentional bench skip). Zero failures. The PR #2910 `statusCheckRollup` surface is a different GitHub query and reports 42 (41 SUCCESS + 1 SKIPPED); the five commit-level runs absent from that rollup are Android emulator runtime, iOS Simulator runtime, Bash integration (`test-batman-mode-suite.sh`), Rust integration (`issue_800_batman_mode`), and Surface stability (load-bearing symbols). Both queries are true of their respective surfaces; the SHA-level 47 is the minting-condition count. |
+| **(b)** capability-inventory JSON re-derivation | **In flight — waived as a minting blocker, not as a follow-up.** At `580d8427`, `docs/compliance/_inventory/` holds `v0.7.0-capabilities.json` only. The staleness is already disclosed in `docs/compliance/honest-limitations.md:13-16` (currency note pointing at #1938). The inventory is **not load-bearing for the five §1 security guarantees** (those rest on the posture gate, the removal proofs, and the executed negative lanes). Re-derivation is Task B / [**#2916**](https://github.com/alphaonedev/ai-memory-mcp/pull/2916) (`feat/1938-capability-inventory-v100`). |
 | **(c)** the final AI-NHI re-cert vote | **Met.** The 2026-08-12 vote above. |
 
 **Verdict: CERTIFIED (within scope).** An F500 may treat the five §1
@@ -450,7 +451,7 @@ ruling, ratified under adversarial review.
 | F4 — bare leg "8 FAIL" vs recorded 6 | Corrected in §2 + this section. |
 | F5 — evidence chain in gitignored `.local-runs/` | Committed at `docs/compliance/evidence/cert-54/` (this re-issue). First-pass vs final-map disclosed. |
 | F6 — `peer_enrolled_in_allowlist` call-site premise wrong; individual removal masked | Corrected in §4 + harness NOTE. Decisive test: #2912. |
-| F7 — §7 expiry trigger mechanized nowhere | Task C / **PR-TBD-C**. Named as such in §7. |
+| F7 — §7 expiry trigger mechanized nowhere | Task C / [**#2915**](https://github.com/alphaonedev/ai-memory-mcp/pull/2915). Named as such in §7. |
 | F8 — boot-refusal opt-in / unattested; doctor attests its own process; `FED_REQUIRE_POLICY_CURRENT=0` escapes | Doc-side caveats in §2. Code-side: [#2911](https://github.com/alphaonedev/ai-memory-mcp/issues/2911). |
 | F9 — campaign docs on PG16/AGE1.6.0/pgvector0.8.4 vs certified PG18.4/AGE1.7.0/pgvector0.8.5 | §3 stack-evidence note. Campaign-doc refresh: [#2913](https://github.com/alphaonedev/ai-memory-mcp/issues/2913). |
 | F10 LOWs — landing SHA, signer wording, omitted lanes, encryption-gate conflation, §4→§6 numbering | This re-issue. `docs/at-a-glance.html` v0.9-era copy: #2913 item 1 (out of this document's file set). |
