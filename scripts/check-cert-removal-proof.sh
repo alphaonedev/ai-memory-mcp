@@ -46,11 +46,16 @@ MAP=(
   "inbound_write_namespace_authorized|return true;|federation_write_ns_scope_2447|federated_write_outside_peer_scope_refused_2447"
   "inbound_by_id_namespace_authorized|return true;|federation_delete_ns_scope_2488|enrolled_unscoped_federated_deletion_refused_by_default_2488"
   "inbound_namespace_meta_authorized|return true;|federation_ns_meta_scope_2479|exploit_set_rebinds_out_of_scope_victim_standard_2479"
-  # NOTE: peer_enrolled_in_allowlist is NOT a standalone row — its sole production
-  # call site is src/federation/receive_auth.rs:1094 INSIDE inbound_write_namespace_authorized,
-  # so it is COMPOSITE-PROVEN by that control's removal proof (mutating the whole
-  # function to `return true` already bypasses this sub-check). The tofu unknown-peer
-  # refusal (x_peer_id_not_in_allowlist) is a SEPARATE earlier envelope gate.
+  # NOTE: peer_enrolled_in_allowlist is NOT a standalone MAP row. Its sole
+  # production call site is src/federation/receive_auth.rs:1094 INSIDE helper
+  # layer2_unscoped_peer_authorized (declared :1081), which is called from BOTH
+  # inbound_write_namespace_authorized (:1049) AND inbound_by_id_namespace_authorized
+  # (:1219) — not "inside inbound_write_namespace_authorized" alone. Mutating
+  # peer_enrolled_in_allowlist itself is behaviorally MASKED on the previously
+  # mapped lane (recorded broken→rc=0; defense-in-depth via row 1 plus the
+  # earlier x_peer_id_not_in_allowlist envelope gate). It is therefore
+  # asserted, not individually removal-proven. Decisive standalone test:
+  # issue #2912. Do NOT add it as a MAP row until that test exists.
   "require_push_namespace_scope_enabled|return false;|federation_write_ns_scope_2447|enrolled_peer_without_declared_namespaces_denied_by_default_2447"
   "authorize_remote_checkpoint_resolution|return CheckpointResolutionAuthz::Accept;|federation_1936_checkpoint_fed|strict_refuses_unenrolled_resolver"
 )
