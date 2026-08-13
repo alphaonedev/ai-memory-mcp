@@ -12,6 +12,16 @@ mTLS** with **agent attestation strict**. Run date **2026-08-09**.
 unverifiable and is superseded in full — see
 [§1 Why this re-run exists](#1-why-this-re-run-exists).
 
+> **Stack-evidence note ([#2913](https://github.com/alphaonedev/ai-memory-mcp/issues/2913)).**
+> The backend banner below is the **as-run record**: PostgreSQL 16.10 +
+> Apache AGE 1.6.0 + **pgvector 0.8.6** (local single-node). It is not a
+> PG18 run. The later enterprise-federation certification pins the
+> disjoint **PG18.4 + AGE 1.7.0 + pgvector 0.8.5** single-node CI stack
+> (run [`31601974424`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/31601974424)
+> at `b80e7fff`). Track A/B recorded pgvector **0.8.6**; the DO 2-node
+> mesh recorded **0.8.4** — both kept as written. See
+> [`PLAN.md`](./PLAN.md) §"Stack-evidence reconciliation".
+
 Every command, its verbatim stdout/stderr and its exit code are appended to
 `.local-runs/cert-campaign/trackb/rerun-2026-08-09/evidence.log` (1,072 lines, 17 recorded steps — including the one IronClaw workspace-root
 failure that preceded the successful alice run, retained rather than pruned).

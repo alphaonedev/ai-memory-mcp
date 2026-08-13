@@ -52,6 +52,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the harness MAP guard; the deletions[] twin is a suite-level twin.
   `src/federation/**` is untouched (cert-expiry implication for Task C /
   #2915: this PR does not trip the watch).
+### Docs (at-a-glance v1.0.0 re-baseline + campaign stack reconciliation; #2913)
+
+- **`docs/at-a-glance.html` re-baselined to v1.0.0.** Retired the
+  v0.9-era "From One to a Million" / "500-50,000 users · 20-100 nodes"
+  / "FedRAMP-certified deployments" / "Five steps from laptop to
+  FedRAMP" copy. Scale personas now cite the certified 500–1000-agent /
+  ≤50-peer envelope as **ARCHITECTED, not MEASURED** (largest
+  real-mesh-measured federation = 2 nodes; USL deferred to
+  [#2438](https://github.com/alphaonedev/ai-memory-mcp/issues/2438)),
+  matching `docs/federation.md`. FedRAMP / IL5 is disclosed as **not
+  held / not claimed** (`docs/evidence.html` dialect). The page links
+  `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`.
+- **Campaign stack reconciliation** in
+  `docs/v1.0.0/test-campaign-2026-08-08-enterprise-cert/`: campaign
+  evidence is PG16 + AGE 1.6.0 + pgvector 0.8.4 (2-node DO mesh — the
+  only real multi-node mesh) / Track A/B recorded pgvector 0.8.6; the
+  enterprise-federation cert pins the **disjoint** PG18.4 + AGE 1.7.0
+  + pgvector 0.8.5 single-node CI stack (run 31601974424 at
+  `b80e7fff`, tree-identical to `e22bc93c`). Campaign results are not
+  rewritten as PG18. The two stacks are named as disjoint evidence.
 ### Docs (capability inventory re-derivation; #1938)
 
 - **Re-derived the NSA CSI capability inventory against `release/v1.0.0`

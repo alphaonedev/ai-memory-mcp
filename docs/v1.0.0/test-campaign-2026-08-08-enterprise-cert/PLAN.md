@@ -17,6 +17,33 @@ encryption (3 legs) + E2E + 100% regression. **All channels encrypted,
 attestation ON everywhere.** The earlier plaintext + attestation-off round was
 declared INVALID and is not part of this campaign.
 
+> ## Stack-evidence reconciliation (2026-08-13, [#2913](https://github.com/alphaonedev/ai-memory-mcp/issues/2913))
+>
+> This campaign records execution on **PostgreSQL 16 + Apache AGE 1.6.0 +
+> pgvector** — specifically **pgvector 0.8.4** on the DigitalOcean 2-node
+> mesh (the only real multi-node mesh ever run; see
+> [`track-d-f-e2e-do-results.md`](track-d-f-e2e-do-results.md)) and
+> **pgvector 0.8.6** as recorded in the Track A / Track B result banners
+> (local single-node runs). Those patch versions are the **as-run record**;
+> they are disclosed here, not "corrected." This campaign's results are
+> **not** restated as if they ran on PG18.
+>
+> The later v1.0.0 enterprise-federation certification pins a **disjoint**
+> stack: **PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.5**, evidenced
+> by single-node CI run
+> [`31601974424`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/31601974424)
+> at `b80e7fff` (tree-identical to `e22bc93c`; also green on `580d8427`).
+> **There is no multi-node PG18 mesh run.**
+>
+> The two stacks are **disjoint evidence**. This campaign is not superseded
+> by the cert, and the cert is not a re-run of this campaign. The
+> campaign-internal "Certified: PG16 + AGE 1.6.0 + pgvector serves the 59
+> pg-supported HTTP paths" sentence below is this campaign's own
+> surface-boundary claim, not the enterprise-federation certification's
+> PG18.4 pin. Canonical cert:
+> [`docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`](../../compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md)
+> (cert-side stack note is owned by the cert re-issue / [#2917](https://github.com/alphaonedev/ai-memory-mcp/issues/2917)).
+
 ---
 
 ## 1. Config (LOCKED)
