@@ -1,0 +1,252 @@
+{
+  "meta": {
+    "issue": 2921,
+    "producer": "scripts/bench/ops_producer.py",
+    "producer_argv": [
+      "ramp",
+      "--op",
+      "store",
+      "--label",
+      "sync_push",
+      "--base-url",
+      "http://127.0.0.1:19091",
+      "--namespace",
+      "cap2921push",
+      "--body-pool",
+      "<scratch>",
+      "--author",
+      "ai:bench-author@cap2921",
+      "--duration",
+      "20",
+      "--cooldown-secs",
+      "2",
+      "--concurrency-steps",
+      "1 2 4 8 16 32 64",
+      "--calibrate",
+      "--host-substrate",
+      "single-host",
+      "--receiver-db",
+      "<scratch>",
+      "--receiver-drain-secs",
+      "5",
+      "--out",
+      "<scratch>"
+    ],
+    "op": "store",
+    "label": "sync_push",
+    "backend": "sqlite",
+    "tier": "keyword",
+    "host_substrate": "single-host",
+    "corpus_scale": 0,
+    "step_duration_secs": 20.0,
+    "generated_at_utc": "2026-08-13T14:32:23Z",
+    "measured_label": "MEASURED",
+    "instrument": "ops_producer.py keep-alive worker pool; op shapes match infra/pillar4-envelope/measure-envelope.sh",
+    "host_facts": {
+      "kernel": "7.0.11-76070011-generic",
+      "arch": "x86_64",
+      "os": "Pop!_OS 24.04 LTS",
+      "cpu_model": "Intel(R) Core(TM) Ultra 5 225H",
+      "cpu_logical_cores": 14,
+      "threads_per_core": 1,
+      "mem_total_kb": 98164264,
+      "mem_total_gib": 93.6,
+      "storage": {
+        "device": "nvme0n1p3",
+        "fstype": "ext4",
+        "size": "912G",
+        "avail": "100G",
+        "rotational": false
+      },
+      "python": "3.12.7"
+    },
+    "calibration": {
+      "endpoint": "/api/v1/health",
+      "offered_concurrency": 64,
+      "ops_per_s": 5656.4887,
+      "note": "Instrument ceiling on this host. A measured op rate approaching this is instrument-bound, not substrate-bound."
+    },
+    "attestation": {
+      "posture": "attested (shipped v1.0.0 default: signature REQUIRED)",
+      "author": "ai:bench-author@cap2921",
+      "pool_size": 120000,
+      "pool_consumed": 29228,
+      "pool_exhausted": false,
+      "pool_age_secs_at_end": 164.4,
+      "signer": "examples/attest_sign_batch (same crate code the verifier runs)",
+      "note": "Client-side signing happens BEFORE the timed window and is excluded from every figure; what is measured is server-side verification + storage (+ relay)."
+    },
+    "receiver": {
+      "rows_before": 0,
+      "rows_after": 29228,
+      "rows_applied": 29228,
+      "wall_secs_total": 152.365,
+      "mean_applied_ops_per_s": 191.8293,
+      "note": "Independent receiver-side confirmation that the sender's accepted writes landed durably on the peer via /sync/push."
+    },
+    "elapsed_wall_secs": 159.39
+  },
+  "points": [
+    {
+      "offered_concurrency": 1,
+      "wall_secs": 20.0025,
+      "reqs": 2698,
+      "ok": 2698,
+      "errors": 0,
+      "shed": 0,
+      "shed_rate": 0.0,
+      "total_ops_per_s": 134.8831,
+      "http_codes": {
+        "201": 2698
+      },
+      "pool_exhausted": false,
+      "ops": {
+        "store": {
+          "count": 2698,
+          "ops_per_s": 134.8831,
+          "p50_ms": 6.081,
+          "p95_ms": 17.173,
+          "p99_ms": 27.853
+        }
+      }
+    },
+    {
+      "offered_concurrency": 2,
+      "wall_secs": 20.0192,
+      "reqs": 4017,
+      "ok": 4017,
+      "errors": 0,
+      "shed": 0,
+      "shed_rate": 0.0,
+      "total_ops_per_s": 200.6576,
+      "http_codes": {
+        "201": 4017
+      },
+      "pool_exhausted": false,
+      "ops": {
+        "store": {
+          "count": 4017,
+          "ops_per_s": 200.6576,
+          "p50_ms": 7.546,
+          "p95_ms": 23.207,
+          "p99_ms": 32.194
+        }
+      }
+    },
+    {
+      "offered_concurrency": 4,
+      "wall_secs": 20.0105,
+      "reqs": 4845,
+      "ok": 4845,
+      "errors": 0,
+      "shed": 0,
+      "shed_rate": 0.0,
+      "total_ops_per_s": 242.1232,
+      "http_codes": {
+        "201": 4845
+      },
+      "pool_exhausted": false,
+      "ops": {
+        "store": {
+          "count": 4845,
+          "ops_per_s": 242.1232,
+          "p50_ms": 14.063,
+          "p95_ms": 33.402,
+          "p99_ms": 42.879
+        }
+      }
+    },
+    {
+      "offered_concurrency": 8,
+      "wall_secs": 20.0155,
+      "reqs": 4653,
+      "ok": 4653,
+      "errors": 0,
+      "shed": 0,
+      "shed_rate": 0.0,
+      "total_ops_per_s": 232.4694,
+      "http_codes": {
+        "201": 4653
+      },
+      "pool_exhausted": false,
+      "ops": {
+        "store": {
+          "count": 4653,
+          "ops_per_s": 232.4694,
+          "p50_ms": 32.438,
+          "p95_ms": 62.174,
+          "p99_ms": 76.703
+        }
+      }
+    },
+    {
+      "offered_concurrency": 16,
+      "wall_secs": 20.0391,
+      "reqs": 4196,
+      "ok": 4196,
+      "errors": 0,
+      "shed": 0,
+      "shed_rate": 0.0,
+      "total_ops_per_s": 209.3902,
+      "http_codes": {
+        "201": 4196
+      },
+      "pool_exhausted": false,
+      "ops": {
+        "store": {
+          "count": 4196,
+          "ops_per_s": 209.3902,
+          "p50_ms": 73.369,
+          "p95_ms": 133.539,
+          "p99_ms": 158.959
+        }
+      }
+    },
+    {
+      "offered_concurrency": 32,
+      "wall_secs": 20.1295,
+      "reqs": 4305,
+      "ok": 4305,
+      "errors": 0,
+      "shed": 0,
+      "shed_rate": 0.0,
+      "total_ops_per_s": 213.8652,
+      "http_codes": {
+        "201": 4305
+      },
+      "pool_exhausted": false,
+      "ops": {
+        "store": {
+          "count": 4305,
+          "ops_per_s": 213.8652,
+          "p50_ms": 144.689,
+          "p95_ms": 211.565,
+          "p99_ms": 255.651
+        }
+      }
+    },
+    {
+      "offered_concurrency": 64,
+      "wall_secs": 20.1483,
+      "reqs": 4514,
+      "ok": 4514,
+      "errors": 0,
+      "shed": 0,
+      "shed_rate": 0.0,
+      "total_ops_per_s": 224.039,
+      "http_codes": {
+        "201": 4514
+      },
+      "pool_exhausted": false,
+      "ops": {
+        "store": {
+          "count": 4514,
+          "ops_per_s": 224.039,
+          "p50_ms": 280.214,
+          "p95_ms": 357.876,
+          "p99_ms": 436.108
+        }
+      }
+    }
+  ]
+}

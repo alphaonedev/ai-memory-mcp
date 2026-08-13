@@ -1,0 +1,233 @@
+{
+  "meta": {
+    "issue": 2921,
+    "producer": "scripts/bench/ops_producer.py",
+    "producer_argv": [
+      "ramp",
+      "--op",
+      "recall",
+      "--label",
+      "memory_recall",
+      "--base-url",
+      "http://127.0.0.1:19091",
+      "--namespace",
+      "cap2921recall",
+      "--seed-corpus",
+      "5000",
+      "--duration",
+      "20",
+      "--cooldown-secs",
+      "2",
+      "--concurrency-steps",
+      "1 2 4 8 16 32 64",
+      "--calibrate",
+      "--host-substrate",
+      "single-host",
+      "--out",
+      "<scratch>"
+    ],
+    "op": "recall",
+    "label": "memory_recall",
+    "backend": "sqlite",
+    "tier": "keyword",
+    "host_substrate": "single-host",
+    "corpus_scale": 5000,
+    "step_duration_secs": 20.0,
+    "generated_at_utc": "2026-08-13T14:29:29Z",
+    "measured_label": "MEASURED",
+    "instrument": "ops_producer.py keep-alive worker pool; op shapes match infra/pillar4-envelope/measure-envelope.sh",
+    "host_facts": {
+      "kernel": "7.0.11-76070011-generic",
+      "arch": "x86_64",
+      "os": "Pop!_OS 24.04 LTS",
+      "cpu_model": "Intel(R) Core(TM) Ultra 5 225H",
+      "cpu_logical_cores": 14,
+      "threads_per_core": 1,
+      "mem_total_kb": 98164264,
+      "mem_total_gib": 93.6,
+      "storage": {
+        "device": "nvme0n1p3",
+        "fstype": "ext4",
+        "size": "912G",
+        "avail": "103G",
+        "rotational": false
+      },
+      "python": "3.12.7"
+    },
+    "calibration": {
+      "endpoint": "/api/v1/health",
+      "offered_concurrency": 64,
+      "ops_per_s": 5653.3329,
+      "note": "Instrument ceiling on this host. A measured op rate approaching this is instrument-bound, not substrate-bound."
+    },
+    "attestation": {
+      "posture": "unsigned (AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0 -- NOT the shipped default)",
+      "note": "An upper bound relative to the shipped posture: no per-write Ed25519 verification is performed."
+    },
+    "receiver": null,
+    "elapsed_wall_secs": 154.72
+  },
+  "points": [
+    {
+      "offered_concurrency": 1,
+      "wall_secs": 20.0062,
+      "reqs": 1310,
+      "ok": 1310,
+      "errors": 0,
+      "shed": 0,
+      "shed_rate": 0.0,
+      "total_ops_per_s": 65.4798,
+      "http_codes": {
+        "200": 1310
+      },
+      "pool_exhausted": false,
+      "ops": {
+        "recall": {
+          "count": 1310,
+          "ops_per_s": 65.4798,
+          "p50_ms": 13.403,
+          "p95_ms": 26.142,
+          "p99_ms": 27.344
+        }
+      }
+    },
+    {
+      "offered_concurrency": 2,
+      "wall_secs": 20.0067,
+      "reqs": 2816,
+      "ok": 2816,
+      "errors": 0,
+      "shed": 0,
+      "shed_rate": 0.0,
+      "total_ops_per_s": 140.7526,
+      "http_codes": {
+        "200": 2816
+      },
+      "pool_exhausted": false,
+      "ops": {
+        "recall": {
+          "count": 2816,
+          "ops_per_s": 140.7526,
+          "p50_ms": 13.826,
+          "p95_ms": 15.433,
+          "p99_ms": 44.105
+        }
+      }
+    },
+    {
+      "offered_concurrency": 4,
+      "wall_secs": 20.0121,
+      "reqs": 3906,
+      "ok": 3906,
+      "errors": 0,
+      "shed": 0,
+      "shed_rate": 0.0,
+      "total_ops_per_s": 195.182,
+      "http_codes": {
+        "200": 3906
+      },
+      "pool_exhausted": false,
+      "ops": {
+        "recall": {
+          "count": 3906,
+          "ops_per_s": 195.182,
+          "p50_ms": 19.126,
+          "p95_ms": 28.246,
+          "p99_ms": 57.996
+        }
+      }
+    },
+    {
+      "offered_concurrency": 8,
+      "wall_secs": 20.029,
+      "reqs": 3558,
+      "ok": 3558,
+      "errors": 0,
+      "shed": 0,
+      "shed_rate": 0.0,
+      "total_ops_per_s": 177.6427,
+      "http_codes": {
+        "200": 3558
+      },
+      "pool_exhausted": false,
+      "ops": {
+        "recall": {
+          "count": 3558,
+          "ops_per_s": 177.6427,
+          "p50_ms": 43.872,
+          "p95_ms": 59.287,
+          "p99_ms": 85.667
+        }
+      }
+    },
+    {
+      "offered_concurrency": 16,
+      "wall_secs": 20.0698,
+      "reqs": 3382,
+      "ok": 3382,
+      "errors": 0,
+      "shed": 0,
+      "shed_rate": 0.0,
+      "total_ops_per_s": 168.5119,
+      "http_codes": {
+        "200": 3382
+      },
+      "pool_exhausted": false,
+      "ops": {
+        "recall": {
+          "count": 3382,
+          "ops_per_s": 168.5119,
+          "p50_ms": 91.316,
+          "p95_ms": 158.43,
+          "p99_ms": 192.111
+        }
+      }
+    },
+    {
+      "offered_concurrency": 32,
+      "wall_secs": 20.1705,
+      "reqs": 3413,
+      "ok": 3413,
+      "errors": 0,
+      "shed": 0,
+      "shed_rate": 0.0,
+      "total_ops_per_s": 169.2076,
+      "http_codes": {
+        "200": 3413
+      },
+      "pool_exhausted": false,
+      "ops": {
+        "recall": {
+          "count": 3413,
+          "ops_per_s": 169.2076,
+          "p50_ms": 188.288,
+          "p95_ms": 292.852,
+          "p99_ms": 344.797
+        }
+      }
+    },
+    {
+      "offered_concurrency": 64,
+      "wall_secs": 20.4035,
+      "reqs": 3446,
+      "ok": 3446,
+      "errors": 0,
+      "shed": 0,
+      "shed_rate": 0.0,
+      "total_ops_per_s": 168.893,
+      "http_codes": {
+        "200": 3446
+      },
+      "pool_exhausted": false,
+      "ops": {
+        "recall": {
+          "count": 3446,
+          "ops_per_s": 168.893,
+          "p50_ms": 359.544,
+          "p95_ms": 575.294,
+          "p99_ms": 651.416
+        }
+      }
+    }
+  ]
+}

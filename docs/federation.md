@@ -24,11 +24,23 @@ layout: doc
 > is. The design claim is a **500–1000 agent cluster** (a derived
 > topology ceiling, not a measured capacity), composed
 > **modularly in 500-agent blocks**: scale past one cluster by adding
-> independent clusters, never by growing one mesh. This envelope is
-> ARCHITECTED, not MEASURED — the largest real-mesh-measured federation
-> is 2 nodes and the full-scale USL capacity projection is deferred to a
-> dedicated capacity bench ([#2438](https://github.com/alphaonedev/ai-memory-mcp/issues/2438)). The peer-to-peer
-> mesh model is the **wrong shape past ~50 peers** (see
+> independent clusters, never by growing one mesh.
+>
+> **PEER counts are now MEASURED; the AGENT figure is not.** A real
+> enrolled full mesh has been measured at **N = 2, 5, 10, 25 and 50 peers
+> on a SINGLE HOST** (multi-container, real TCP over a bridge, the shipped
+> fail-closed attestation defaults, a fixed 1,000-memory corpus): every
+> rung converged on every node, and the fan-out knee appears between
+> N = 10 and N = 25 — where the ~50-peer guidance below already put it.
+> The largest **CROSS-HOST** measured federation is still **2 nodes**.
+> The **500–1000 agent** figure above remains a **derived topology
+> ceiling, not a measured capacity**: no agent population of that size has
+> been run. Numbers, methodology, host and limitations:
+> [`bench/capacity-envelope-2921.md`](bench/capacity-envelope-2921.html)
+> ([#2921](https://github.com/alphaonedev/ai-memory-mcp/issues/2921); the
+> scope reset that retired the prior figure is
+> [#2438](https://github.com/alphaonedev/ai-memory-mcp/issues/2438)). The
+> peer-to-peer mesh model is the **wrong shape past ~50 peers** (see
 > §"Multi-peer scaling guidance" below, which has said so since v0.7.0).
 > A previous revision of this paragraph advertised "1 to ~1,000,000
 > agents"; that figure was three orders of magnitude beyond anything
@@ -667,12 +679,20 @@ merge cost is bounded by row count, not peer count — adding peers
 does not asymptotically hurt merge throughput.
 
 **Design scale envelope (derived topology ceiling).** A **500–1000 agent
-cluster**, composed modularly in **500-agent blocks** — an ARCHITECTED
-envelope, not a measured capacity: the largest real-mesh-measured
-federation is 2 nodes and the full-scale USL capacity projection is
-deferred to a dedicated capacity bench. Scale past one cluster by adding
-independent clusters, never by growing one mesh past the ~50-peer
-ceiling above. `docs/enterprise-deployment.md` §11 states the same
+cluster**, composed modularly in **500-agent blocks**. The **agent**
+figure is a derived topology ceiling, not a measured capacity — no agent
+population of that size has been run. The **peer** dimension of the table
+above IS measured: a real enrolled full mesh at **N = 2, 5, 10, 25 and 50
+peers, single-host**, every rung converging a 1,000-memory corpus on every
+node, with the fan-out knee between N = 10 and N = 25 and visible
+back-pressure (locally-durable `202` responses) at N = 50 — i.e. the
+~50-peer row above is where the substrate genuinely stops being the right
+shape. The largest **cross-host** measured federation is still **2 nodes**.
+Numbers, host, and the single-host caveat:
+[`bench/capacity-envelope-2921.md`](bench/capacity-envelope-2921.html)
+([#2921](https://github.com/alphaonedev/ai-memory-mcp/issues/2921)). Scale
+past one cluster by adding independent clusters, never by growing one mesh
+past the ~50-peer ceiling above. `docs/enterprise-deployment.md` §11 states the same
 rule from the capacity side ("compose independent modules, never
 raise one daemon's caps") and marks its per-tier agent counts
 PROVISIONAL — believe that marking.

@@ -1,0 +1,231 @@
+{
+  "meta": {
+    "issue": 2921,
+    "producer": "scripts/bench/ops_producer.py",
+    "producer_argv": [
+      "ramp",
+      "--op",
+      "store",
+      "--label",
+      "memory_store_unsigned",
+      "--base-url",
+      "http://127.0.0.1:19091",
+      "--namespace",
+      "cap2921store",
+      "--duration",
+      "20",
+      "--cooldown-secs",
+      "2",
+      "--concurrency-steps",
+      "1 2 4 8 16 32 64",
+      "--calibrate",
+      "--host-substrate",
+      "single-host",
+      "--out",
+      "<scratch>"
+    ],
+    "op": "store",
+    "label": "memory_store_unsigned",
+    "backend": "sqlite",
+    "tier": "keyword",
+    "host_substrate": "single-host",
+    "corpus_scale": 0,
+    "step_duration_secs": 20.0,
+    "generated_at_utc": "2026-08-13T14:26:38Z",
+    "measured_label": "MEASURED",
+    "instrument": "ops_producer.py keep-alive worker pool; op shapes match infra/pillar4-envelope/measure-envelope.sh",
+    "host_facts": {
+      "kernel": "7.0.11-76070011-generic",
+      "arch": "x86_64",
+      "os": "Pop!_OS 24.04 LTS",
+      "cpu_model": "Intel(R) Core(TM) Ultra 5 225H",
+      "cpu_logical_cores": 14,
+      "threads_per_core": 1,
+      "mem_total_kb": 98164264,
+      "mem_total_gib": 93.6,
+      "storage": {
+        "device": "nvme0n1p3",
+        "fstype": "ext4",
+        "size": "912G",
+        "avail": "103G",
+        "rotational": false
+      },
+      "python": "3.12.7"
+    },
+    "calibration": {
+      "endpoint": "/api/v1/health",
+      "offered_concurrency": 64,
+      "ops_per_s": 5536.1132,
+      "note": "Instrument ceiling on this host. A measured op rate approaching this is instrument-bound, not substrate-bound."
+    },
+    "attestation": {
+      "posture": "unsigned (AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0 -- NOT the shipped default)",
+      "note": "An upper bound relative to the shipped posture: no per-write Ed25519 verification is performed."
+    },
+    "receiver": null,
+    "elapsed_wall_secs": 154.19
+  },
+  "points": [
+    {
+      "offered_concurrency": 1,
+      "wall_secs": 20.0011,
+      "reqs": 12291,
+      "ok": 12291,
+      "errors": 0,
+      "shed": 0,
+      "shed_rate": 0.0,
+      "total_ops_per_s": 614.5147,
+      "http_codes": {
+        "201": 12291
+      },
+      "pool_exhausted": false,
+      "ops": {
+        "store": {
+          "count": 12291,
+          "ops_per_s": 614.5147,
+          "p50_ms": 1.166,
+          "p95_ms": 3.774,
+          "p99_ms": 12.32
+        }
+      }
+    },
+    {
+      "offered_concurrency": 2,
+      "wall_secs": 20.0023,
+      "reqs": 10214,
+      "ok": 10214,
+      "errors": 0,
+      "shed": 0,
+      "shed_rate": 0.0,
+      "total_ops_per_s": 510.6422,
+      "http_codes": {
+        "201": 10214
+      },
+      "pool_exhausted": false,
+      "ops": {
+        "store": {
+          "count": 10214,
+          "ops_per_s": 510.6422,
+          "p50_ms": 2.99,
+          "p95_ms": 13.183,
+          "p99_ms": 18.153
+        }
+      }
+    },
+    {
+      "offered_concurrency": 4,
+      "wall_secs": 20.007,
+      "reqs": 8511,
+      "ok": 8511,
+      "errors": 0,
+      "shed": 0,
+      "shed_rate": 0.0,
+      "total_ops_per_s": 425.4013,
+      "http_codes": {
+        "201": 8511
+      },
+      "pool_exhausted": false,
+      "ops": {
+        "store": {
+          "count": 8511,
+          "ops_per_s": 425.4013,
+          "p50_ms": 7.841,
+          "p95_ms": 22.034,
+          "p99_ms": 25.788
+        }
+      }
+    },
+    {
+      "offered_concurrency": 8,
+      "wall_secs": 20.0107,
+      "reqs": 8959,
+      "ok": 8959,
+      "errors": 0,
+      "shed": 0,
+      "shed_rate": 0.0,
+      "total_ops_per_s": 447.7103,
+      "http_codes": {
+        "201": 8959
+      },
+      "pool_exhausted": false,
+      "ops": {
+        "store": {
+          "count": 8959,
+          "ops_per_s": 447.7103,
+          "p50_ms": 15.203,
+          "p95_ms": 32.916,
+          "p99_ms": 38.602
+        }
+      }
+    },
+    {
+      "offered_concurrency": 16,
+      "wall_secs": 20.0362,
+      "reqs": 8696,
+      "ok": 8696,
+      "errors": 0,
+      "shed": 0,
+      "shed_rate": 0.0,
+      "total_ops_per_s": 434.0152,
+      "http_codes": {
+        "201": 8696
+      },
+      "pool_exhausted": false,
+      "ops": {
+        "store": {
+          "count": 8696,
+          "ops_per_s": 434.0152,
+          "p50_ms": 37.006,
+          "p95_ms": 53.138,
+          "p99_ms": 59.53
+        }
+      }
+    },
+    {
+      "offered_concurrency": 32,
+      "wall_secs": 20.0374,
+      "reqs": 10057,
+      "ok": 10057,
+      "errors": 0,
+      "shed": 0,
+      "shed_rate": 0.0,
+      "total_ops_per_s": 501.911,
+      "http_codes": {
+        "201": 10057
+      },
+      "pool_exhausted": false,
+      "ops": {
+        "store": {
+          "count": 10057,
+          "ops_per_s": 501.911,
+          "p50_ms": 61.774,
+          "p95_ms": 87.855,
+          "p99_ms": 97.93
+        }
+      }
+    },
+    {
+      "offered_concurrency": 64,
+      "wall_secs": 20.0616,
+      "reqs": 8839,
+      "ok": 8839,
+      "errors": 0,
+      "shed": 0,
+      "shed_rate": 0.0,
+      "total_ops_per_s": 440.5935,
+      "http_codes": {
+        "201": 8839
+      },
+      "pool_exhausted": false,
+      "ops": {
+        "store": {
+          "count": 8839,
+          "ops_per_s": 440.5935,
+          "p50_ms": 147.512,
+          "p95_ms": 195.087,
+          "p99_ms": 221.182
+        }
+      }
+    }
+  ]
+}

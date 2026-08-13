@@ -1,0 +1,106 @@
+{
+  "issue": 2921,
+  "leg": "local-single-host-multi-container",
+  "generated_at_utc": "2026-08-13T14:54:06Z",
+  "nodes": 2,
+  "peers_per_node": 1,
+  "namespace": "mesh2921",
+  "corpus": 1000,
+  "write_concurrency": 8,
+  "attestation": {
+    "posture": "shipped v1.0.0 defaults -- HTTP-direct writes and relayed third-party writes both REQUIRE a valid Ed25519 signature",
+    "author": "ai:bench-author@cap2921",
+    "pool_size": 1000,
+    "pool_consumed": 1000,
+    "pool_age_secs_at_write_end": 10.2
+  },
+  "health": {
+    "ready_secs": {
+      "am2921-node-01": 0.004,
+      "am2921-node-02": 0.005
+    },
+    "unhealthy": [],
+    "all_healthy": true
+  },
+  "write": {
+    "offered": 1000,
+    "accepted": 1000,
+    "write_wall_s": 4.004,
+    "accepted_ops_per_s": 249.743,
+    "http_codes": {
+      "201": 1000
+    },
+    "pool_exhausted": false,
+    "p50_ms": 30.868,
+    "p95_ms": 55.095,
+    "p99_ms": 66.064
+  },
+  "convergence": {
+    "expect": 1000,
+    "converged": true,
+    "converged_nodes": 2,
+    "total_nodes": 2,
+    "per_node_converged_s": {
+      "node-01": 6.082,
+      "node-02": 6.084
+    },
+    "final_counts": {
+      "node-01": 1000,
+      "node-02": 1000
+    },
+    "converged_s": 6.084,
+    "slowest_node": "node-02",
+    "poll_interval_s": 1.0
+  },
+  "tail_s": 2.08,
+  "aggregate_push_ops_per_s": 249.743,
+  "federation_metrics": {
+    "am2921-node-01": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1.0
+    },
+    "am2921-node-02": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1.0
+    }
+  },
+  "metrics_scrape_failures": 0,
+  "metrics_nodes_scraped": 2,
+  "dlq_depth_total": 0.0,
+  "docker_stats": {
+    "pre_write": {
+      "am2921-node-01": {
+        "cpu_pct": "0.00%",
+        "mem": "5.41MiB"
+      },
+      "am2921-node-02": {
+        "cpu_pct": "0.00%",
+        "mem": "4.238MiB"
+      }
+    },
+    "post_write": {
+      "am2921-node-01": {
+        "cpu_pct": "0.00%",
+        "mem": "15.16MiB"
+      },
+      "am2921-node-02": {
+        "cpu_pct": "0.00%",
+        "mem": "12.06MiB"
+      }
+    },
+    "post_converge": {
+      "am2921-node-01": {
+        "cpu_pct": "5.38%",
+        "mem": "16.18MiB"
+      },
+      "am2921-node-02": {
+        "cpu_pct": "4.22%",
+        "mem": "12.68MiB"
+      }
+    }
+  }
+}

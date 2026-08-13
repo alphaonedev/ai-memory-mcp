@@ -1,0 +1,1088 @@
+{
+  "issue": 2921,
+  "leg": "local-single-host-multi-container",
+  "generated_at_utc": "2026-08-13T15:15:33Z",
+  "nodes": 50,
+  "peers_per_node": 49,
+  "namespace": "mesh2921",
+  "corpus": 1000,
+  "write_concurrency": 8,
+  "attestation": {
+    "posture": "shipped v1.0.0 defaults -- HTTP-direct writes and relayed third-party writes both REQUIRE a valid Ed25519 signature",
+    "author": "ai:bench-author@cap2921",
+    "pool_size": 1000,
+    "pool_consumed": 1000,
+    "pool_age_secs_at_write_end": 1161.6
+  },
+  "health": {
+    "ready_secs": {
+      "am2921-node-01": 0.004,
+      "am2921-node-02": 0.005,
+      "am2921-node-03": 0.006,
+      "am2921-node-04": 0.007,
+      "am2921-node-05": 0.008,
+      "am2921-node-06": 0.009,
+      "am2921-node-07": 0.01,
+      "am2921-node-08": 0.011,
+      "am2921-node-09": 0.013,
+      "am2921-node-10": 0.014,
+      "am2921-node-11": 0.015,
+      "am2921-node-12": 0.015,
+      "am2921-node-13": 0.018,
+      "am2921-node-14": 0.019,
+      "am2921-node-15": 0.02,
+      "am2921-node-16": 0.022,
+      "am2921-node-17": 0.023,
+      "am2921-node-18": 0.023,
+      "am2921-node-19": 0.024,
+      "am2921-node-20": 0.025,
+      "am2921-node-21": 0.026,
+      "am2921-node-22": 0.027,
+      "am2921-node-23": 0.028,
+      "am2921-node-24": 0.029,
+      "am2921-node-25": 0.03,
+      "am2921-node-26": 0.031,
+      "am2921-node-27": 0.032,
+      "am2921-node-28": 0.033,
+      "am2921-node-29": 0.034,
+      "am2921-node-30": 0.036,
+      "am2921-node-31": 0.037,
+      "am2921-node-32": 0.038,
+      "am2921-node-33": 0.04,
+      "am2921-node-34": 0.042,
+      "am2921-node-35": 0.043,
+      "am2921-node-36": 0.045,
+      "am2921-node-37": 0.047,
+      "am2921-node-38": 0.048,
+      "am2921-node-39": 0.049,
+      "am2921-node-40": 0.05,
+      "am2921-node-41": 0.051,
+      "am2921-node-42": 0.052,
+      "am2921-node-43": 0.053,
+      "am2921-node-44": 0.054,
+      "am2921-node-45": 0.055,
+      "am2921-node-46": 0.056,
+      "am2921-node-47": 0.057,
+      "am2921-node-48": 0.058,
+      "am2921-node-49": 0.059,
+      "am2921-node-50": 0.06
+    },
+    "unhealthy": [],
+    "all_healthy": true
+  },
+  "write": {
+    "offered": 1000,
+    "accepted": 1000,
+    "write_wall_s": 54.016,
+    "accepted_ops_per_s": 18.513,
+    "http_codes": {
+      "202": 128,
+      "201": 872
+    },
+    "pool_exhausted": false,
+    "p50_ms": 204.276,
+    "p95_ms": 2042.57,
+    "p99_ms": 2100.394
+  },
+  "convergence": {
+    "expect": 1000,
+    "converged": true,
+    "converged_nodes": 50,
+    "total_nodes": 50,
+    "per_node_converged_s": {
+      "node-01": 56.322,
+      "node-05": 56.328,
+      "node-13": 56.34,
+      "node-17": 56.346,
+      "node-24": 56.356,
+      "node-26": 56.359,
+      "node-30": 56.365,
+      "node-33": 56.369,
+      "node-34": 56.371,
+      "node-38": 56.376,
+      "node-45": 56.386,
+      "node-50": 56.393,
+      "node-03": 73.234,
+      "node-11": 73.244,
+      "node-18": 81.674,
+      "node-19": 81.675,
+      "node-08": 82.716,
+      "node-16": 83.774,
+      "node-48": 83.806,
+      "node-10": 84.817,
+      "node-41": 85.888,
+      "node-14": 86.908,
+      "node-21": 86.913,
+      "node-27": 86.918,
+      "node-20": 112.848,
+      "node-46": 114.933,
+      "node-15": 118.008,
+      "node-44": 119.058,
+      "node-12": 121.098,
+      "node-49": 121.12,
+      "node-43": 123.174,
+      "node-22": 131.362,
+      "node-07": 134.432,
+      "node-39": 138.537,
+      "node-04": 140.566,
+      "node-23": 151.936,
+      "node-29": 152.978,
+      "node-42": 173.583,
+      "node-31": 187.951,
+      "node-32": 188.978,
+      "node-40": 188.986,
+      "node-47": 190.012,
+      "node-25": 196.121,
+      "node-35": 203.247,
+      "node-37": 221.435,
+      "node-02": 222.437,
+      "node-06": 227.469,
+      "node-09": 244.556,
+      "node-28": 250.578,
+      "node-36": 256.592
+    },
+    "final_counts": {
+      "node-01": 1000,
+      "node-02": 1000,
+      "node-03": 1000,
+      "node-04": 1000,
+      "node-05": 1000,
+      "node-06": 1000,
+      "node-07": 1000,
+      "node-08": 1000,
+      "node-09": 1000,
+      "node-10": 1000,
+      "node-11": 1000,
+      "node-12": 1000,
+      "node-13": 1000,
+      "node-14": 1000,
+      "node-15": 1000,
+      "node-16": 1000,
+      "node-17": 1000,
+      "node-18": 1000,
+      "node-19": 1000,
+      "node-20": 1000,
+      "node-21": 1000,
+      "node-22": 1000,
+      "node-23": 1000,
+      "node-24": 1000,
+      "node-25": 1000,
+      "node-26": 1000,
+      "node-27": 1000,
+      "node-28": 1000,
+      "node-29": 1000,
+      "node-30": 1000,
+      "node-31": 1000,
+      "node-32": 1000,
+      "node-33": 1000,
+      "node-34": 1000,
+      "node-35": 1000,
+      "node-36": 1000,
+      "node-37": 1000,
+      "node-38": 1000,
+      "node-39": 1000,
+      "node-40": 1000,
+      "node-41": 1000,
+      "node-42": 1000,
+      "node-43": 1000,
+      "node-44": 1000,
+      "node-45": 1000,
+      "node-46": 1000,
+      "node-47": 1000,
+      "node-48": 1000,
+      "node-49": 1000,
+      "node-50": 1000
+    },
+    "converged_s": 256.592,
+    "slowest_node": "node-36",
+    "poll_interval_s": 1.0
+  },
+  "tail_s": 202.576,
+  "aggregate_push_ops_per_s": 907.137,
+  "federation_metrics": {
+    "am2921-node-01": {
+      "_scrape_status": 0
+    },
+    "am2921-node-02": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-03": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-04": {
+      "_scrape_status": 0
+    },
+    "am2921-node-05": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-06": {
+      "_scrape_status": 0
+    },
+    "am2921-node-07": {
+      "_scrape_status": 0
+    },
+    "am2921-node-08": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-09": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-10": {
+      "_scrape_status": 0
+    },
+    "am2921-node-11": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-12": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-13": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-14": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-15": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-16": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-17": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-18": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-19": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-20": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-21": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-22": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-23": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-24": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-25": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-26": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-27": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-28": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-29": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-30": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-31": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-32": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-33": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-34": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-35": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-36": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-37": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-38": {
+      "_scrape_status": 0
+    },
+    "am2921-node-39": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-40": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-41": {
+      "_scrape_status": 0
+    },
+    "am2921-node-42": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-43": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-44": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-45": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-46": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-47": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-48": {
+      "ai_memory_federation_partial_quorum_total": 0.0,
+      "ai_memory_federation_push_dlq_depth": 0.0,
+      "ai_memory_federation_push_dlq_quarantined_total": 0.0,
+      "ai_memory_memories": 1001.0
+    },
+    "am2921-node-49": {
+      "_scrape_status": 0
+    },
+    "am2921-node-50": {
+      "_scrape_status": 0
+    }
+  },
+  "metrics_scrape_failures": 9,
+  "metrics_nodes_scraped": 50,
+  "dlq_depth_total": null,
+  "docker_stats": {
+    "pre_write": {
+      "am2921-node-32": {
+        "cpu_pct": "8.75%",
+        "mem": "7.309MiB"
+      },
+      "am2921-node-22": {
+        "cpu_pct": "13.18%",
+        "mem": "7.375MiB"
+      },
+      "am2921-node-23": {
+        "cpu_pct": "8.58%",
+        "mem": "7.414MiB"
+      },
+      "am2921-node-49": {
+        "cpu_pct": "0.00%",
+        "mem": "4.266MiB"
+      },
+      "am2921-node-18": {
+        "cpu_pct": "13.21%",
+        "mem": "7.531MiB"
+      },
+      "am2921-node-07": {
+        "cpu_pct": "2.80%",
+        "mem": "5.633MiB"
+      },
+      "am2921-node-20": {
+        "cpu_pct": "5.67%",
+        "mem": "6.305MiB"
+      },
+      "am2921-node-01": {
+        "cpu_pct": "2.47%",
+        "mem": "5.969MiB"
+      },
+      "am2921-node-16": {
+        "cpu_pct": "7.70%",
+        "mem": "8.195MiB"
+      },
+      "am2921-node-44": {
+        "cpu_pct": "0.14%",
+        "mem": "5.254MiB"
+      },
+      "am2921-node-31": {
+        "cpu_pct": "12.79%",
+        "mem": "7.441MiB"
+      },
+      "am2921-node-43": {
+        "cpu_pct": "3.34%",
+        "mem": "4.453MiB"
+      },
+      "am2921-node-15": {
+        "cpu_pct": "6.59%",
+        "mem": "6.688MiB"
+      },
+      "am2921-node-25": {
+        "cpu_pct": "8.92%",
+        "mem": "8.238MiB"
+      },
+      "am2921-node-14": {
+        "cpu_pct": "4.05%",
+        "mem": "6.73MiB"
+      },
+      "am2921-node-05": {
+        "cpu_pct": "9.40%",
+        "mem": "6.961MiB"
+      },
+      "am2921-node-29": {
+        "cpu_pct": "5.66%",
+        "mem": "5.984MiB"
+      },
+      "am2921-node-47": {
+        "cpu_pct": "0.00%",
+        "mem": "4.266MiB"
+      },
+      "am2921-node-42": {
+        "cpu_pct": "0.00%",
+        "mem": "4.277MiB"
+      },
+      "am2921-node-46": {
+        "cpu_pct": "0.00%",
+        "mem": "4.266MiB"
+      },
+      "am2921-node-26": {
+        "cpu_pct": "21.71%",
+        "mem": "8.676MiB"
+      },
+      "am2921-node-28": {
+        "cpu_pct": "16.10%",
+        "mem": "7.574MiB"
+      },
+      "am2921-node-24": {
+        "cpu_pct": "12.22%",
+        "mem": "7.617MiB"
+      },
+      "am2921-node-02": {
+        "cpu_pct": "2.59%",
+        "mem": "5.984MiB"
+      },
+      "am2921-node-36": {
+        "cpu_pct": "6.72%",
+        "mem": "7.277MiB"
+      },
+      "am2921-node-27": {
+        "cpu_pct": "14.26%",
+        "mem": "7.441MiB"
+      },
+      "am2921-node-12": {
+        "cpu_pct": "2.46%",
+        "mem": "6.703MiB"
+      },
+      "am2921-node-03": {
+        "cpu_pct": "5.86%",
+        "mem": "6.305MiB"
+      },
+      "am2921-node-34": {
+        "cpu_pct": "13.98%",
+        "mem": "7.879MiB"
+      },
+      "am2921-node-10": {
+        "cpu_pct": "2.92%",
+        "mem": "6.234MiB"
+      },
+      "am2921-node-04": {
+        "cpu_pct": "2.37%",
+        "mem": "5.969MiB"
+      },
+      "am2921-node-33": {
+        "cpu_pct": "12.29%",
+        "mem": "7.297MiB"
+      },
+      "am2921-node-38": {
+        "cpu_pct": "21.79%",
+        "mem": "8.344MiB"
+      },
+      "am2921-node-48": {
+        "cpu_pct": "4.96%",
+        "mem": "4.812MiB"
+      },
+      "am2921-node-19": {
+        "cpu_pct": "11.72%",
+        "mem": "6.762MiB"
+      },
+      "am2921-node-45": {
+        "cpu_pct": "8.89%",
+        "mem": "5.434MiB"
+      },
+      "am2921-node-30": {
+        "cpu_pct": "9.81%",
+        "mem": "7.594MiB"
+      },
+      "am2921-node-39": {
+        "cpu_pct": "6.79%",
+        "mem": "5.305MiB"
+      },
+      "am2921-node-06": {
+        "cpu_pct": "5.87%",
+        "mem": "6.262MiB"
+      },
+      "am2921-node-35": {
+        "cpu_pct": "11.14%",
+        "mem": "7.281MiB"
+      },
+      "am2921-node-21": {
+        "cpu_pct": "7.05%",
+        "mem": "7.023MiB"
+      },
+      "am2921-node-41": {
+        "cpu_pct": "1.20%",
+        "mem": "5.219MiB"
+      },
+      "am2921-node-17": {
+        "cpu_pct": "9.10%",
+        "mem": "7.691MiB"
+      },
+      "am2921-node-11": {
+        "cpu_pct": "10.37%",
+        "mem": "6.758MiB"
+      },
+      "am2921-node-13": {
+        "cpu_pct": "12.26%",
+        "mem": "7.137MiB"
+      },
+      "am2921-node-09": {
+        "cpu_pct": "6.94%",
+        "mem": "6.004MiB"
+      },
+      "am2921-node-08": {
+        "cpu_pct": "2.92%",
+        "mem": "5.988MiB"
+      },
+      "am2921-node-37": {
+        "cpu_pct": "18.38%",
+        "mem": "8.281MiB"
+      },
+      "am2921-node-50": {
+        "cpu_pct": "3.43%",
+        "mem": "5.992MiB"
+      },
+      "am2921-node-40": {
+        "cpu_pct": "9.28%",
+        "mem": "6.07MiB"
+      }
+    },
+    "post_write": {
+      "am2921-node-32": {
+        "cpu_pct": "3.41%",
+        "mem": "13.06MiB"
+      },
+      "am2921-node-22": {
+        "cpu_pct": "5.93%",
+        "mem": "12.66MiB"
+      },
+      "am2921-node-23": {
+        "cpu_pct": "3.27%",
+        "mem": "16.26MiB"
+      },
+      "am2921-node-49": {
+        "cpu_pct": "2.47%",
+        "mem": "14.01MiB"
+      },
+      "am2921-node-18": {
+        "cpu_pct": "7.34%",
+        "mem": "12.63MiB"
+      },
+      "am2921-node-07": {
+        "cpu_pct": "1.64%",
+        "mem": "16.25MiB"
+      },
+      "am2921-node-20": {
+        "cpu_pct": "3.43%",
+        "mem": "13.44MiB"
+      },
+      "am2921-node-01": {
+        "cpu_pct": "11.33%",
+        "mem": "80.63MiB"
+      },
+      "am2921-node-16": {
+        "cpu_pct": "6.75%",
+        "mem": "13.28MiB"
+      },
+      "am2921-node-44": {
+        "cpu_pct": "8.49%",
+        "mem": "11.89MiB"
+      },
+      "am2921-node-31": {
+        "cpu_pct": "7.44%",
+        "mem": "12.85MiB"
+      },
+      "am2921-node-43": {
+        "cpu_pct": "8.93%",
+        "mem": "14.99MiB"
+      },
+      "am2921-node-15": {
+        "cpu_pct": "2.03%",
+        "mem": "11.92MiB"
+      },
+      "am2921-node-25": {
+        "cpu_pct": "0.00%",
+        "mem": "13.86MiB"
+      },
+      "am2921-node-14": {
+        "cpu_pct": "2.04%",
+        "mem": "13.38MiB"
+      },
+      "am2921-node-05": {
+        "cpu_pct": "0.27%",
+        "mem": "12.96MiB"
+      },
+      "am2921-node-29": {
+        "cpu_pct": "3.63%",
+        "mem": "16.11MiB"
+      },
+      "am2921-node-47": {
+        "cpu_pct": "7.61%",
+        "mem": "14.52MiB"
+      },
+      "am2921-node-42": {
+        "cpu_pct": "4.61%",
+        "mem": "16.12MiB"
+      },
+      "am2921-node-46": {
+        "cpu_pct": "4.56%",
+        "mem": "16.14MiB"
+      },
+      "am2921-node-26": {
+        "cpu_pct": "4.78%",
+        "mem": "14.56MiB"
+      },
+      "am2921-node-28": {
+        "cpu_pct": "4.96%",
+        "mem": "12.68MiB"
+      },
+      "am2921-node-24": {
+        "cpu_pct": "0.00%",
+        "mem": "14.04MiB"
+      },
+      "am2921-node-02": {
+        "cpu_pct": "2.00%",
+        "mem": "15.56MiB"
+      },
+      "am2921-node-36": {
+        "cpu_pct": "6.12%",
+        "mem": "15.3MiB"
+      },
+      "am2921-node-27": {
+        "cpu_pct": "7.48%",
+        "mem": "13.41MiB"
+      },
+      "am2921-node-12": {
+        "cpu_pct": "1.44%",
+        "mem": "15.8MiB"
+      },
+      "am2921-node-03": {
+        "cpu_pct": "6.44%",
+        "mem": "13.18MiB"
+      },
+      "am2921-node-34": {
+        "cpu_pct": "3.52%",
+        "mem": "12.96MiB"
+      },
+      "am2921-node-10": {
+        "cpu_pct": "1.80%",
+        "mem": "15.23MiB"
+      },
+      "am2921-node-04": {
+        "cpu_pct": "2.05%",
+        "mem": "15.5MiB"
+      },
+      "am2921-node-33": {
+        "cpu_pct": "0.58%",
+        "mem": "14.73MiB"
+      },
+      "am2921-node-38": {
+        "cpu_pct": "0.37%",
+        "mem": "13.76MiB"
+      },
+      "am2921-node-48": {
+        "cpu_pct": "8.38%",
+        "mem": "13MiB"
+      },
+      "am2921-node-19": {
+        "cpu_pct": "7.71%",
+        "mem": "13.65MiB"
+      },
+      "am2921-node-45": {
+        "cpu_pct": "0.81%",
+        "mem": "12.46MiB"
+      },
+      "am2921-node-30": {
+        "cpu_pct": "0.33%",
+        "mem": "14.41MiB"
+      },
+      "am2921-node-39": {
+        "cpu_pct": "8.22%",
+        "mem": "12.43MiB"
+      },
+      "am2921-node-06": {
+        "cpu_pct": "6.39%",
+        "mem": "14.82MiB"
+      },
+      "am2921-node-35": {
+        "cpu_pct": "3.54%",
+        "mem": "14.66MiB"
+      },
+      "am2921-node-21": {
+        "cpu_pct": "2.88%",
+        "mem": "12.52MiB"
+      },
+      "am2921-node-41": {
+        "cpu_pct": "4.19%",
+        "mem": "13.29MiB"
+      },
+      "am2921-node-17": {
+        "cpu_pct": "0.39%",
+        "mem": "13.66MiB"
+      },
+      "am2921-node-11": {
+        "cpu_pct": "6.29%",
+        "mem": "12.81MiB"
+      },
+      "am2921-node-13": {
+        "cpu_pct": "4.94%",
+        "mem": "12.71MiB"
+      },
+      "am2921-node-09": {
+        "cpu_pct": "6.48%",
+        "mem": "11.56MiB"
+      },
+      "am2921-node-08": {
+        "cpu_pct": "5.06%",
+        "mem": "12.87MiB"
+      },
+      "am2921-node-37": {
+        "cpu_pct": "2.57%",
+        "mem": "15.96MiB"
+      },
+      "am2921-node-50": {
+        "cpu_pct": "0.07%",
+        "mem": "14.4MiB"
+      },
+      "am2921-node-40": {
+        "cpu_pct": "7.22%",
+        "mem": "14.87MiB"
+      }
+    },
+    "post_converge": {
+      "am2921-node-32": {
+        "cpu_pct": "2.83%",
+        "mem": "14.39MiB"
+      },
+      "am2921-node-22": {
+        "cpu_pct": "7.43%",
+        "mem": "13.33MiB"
+      },
+      "am2921-node-23": {
+        "cpu_pct": "3.91%",
+        "mem": "17.44MiB"
+      },
+      "am2921-node-49": {
+        "cpu_pct": "2.40%",
+        "mem": "15.39MiB"
+      },
+      "am2921-node-18": {
+        "cpu_pct": "7.39%",
+        "mem": "14MiB"
+      },
+      "am2921-node-07": {
+        "cpu_pct": "1.50%",
+        "mem": "17.05MiB"
+      },
+      "am2921-node-20": {
+        "cpu_pct": "2.42%",
+        "mem": "14.05MiB"
+      },
+      "am2921-node-01": {
+        "cpu_pct": "10.19%",
+        "mem": "121.5MiB"
+      },
+      "am2921-node-16": {
+        "cpu_pct": "6.99%",
+        "mem": "16.1MiB"
+      },
+      "am2921-node-44": {
+        "cpu_pct": "2.48%",
+        "mem": "13.89MiB"
+      },
+      "am2921-node-31": {
+        "cpu_pct": "5.00%",
+        "mem": "13.87MiB"
+      },
+      "am2921-node-43": {
+        "cpu_pct": "7.27%",
+        "mem": "16.23MiB"
+      },
+      "am2921-node-15": {
+        "cpu_pct": "1.95%",
+        "mem": "12.99MiB"
+      },
+      "am2921-node-25": {
+        "cpu_pct": "3.09%",
+        "mem": "14.66MiB"
+      },
+      "am2921-node-14": {
+        "cpu_pct": "2.97%",
+        "mem": "14.82MiB"
+      },
+      "am2921-node-05": {
+        "cpu_pct": "4.70%",
+        "mem": "13.32MiB"
+      },
+      "am2921-node-29": {
+        "cpu_pct": "1.42%",
+        "mem": "16.98MiB"
+      },
+      "am2921-node-47": {
+        "cpu_pct": "3.14%",
+        "mem": "15.26MiB"
+      },
+      "am2921-node-42": {
+        "cpu_pct": "2.50%",
+        "mem": "17.57MiB"
+      },
+      "am2921-node-46": {
+        "cpu_pct": "0.92%",
+        "mem": "16.94MiB"
+      },
+      "am2921-node-26": {
+        "cpu_pct": "5.19%",
+        "mem": "15.4MiB"
+      },
+      "am2921-node-28": {
+        "cpu_pct": "5.90%",
+        "mem": "13.5MiB"
+      },
+      "am2921-node-24": {
+        "cpu_pct": "2.44%",
+        "mem": "15.3MiB"
+      },
+      "am2921-node-02": {
+        "cpu_pct": "1.87%",
+        "mem": "16.43MiB"
+      },
+      "am2921-node-36": {
+        "cpu_pct": "6.91%",
+        "mem": "16.18MiB"
+      },
+      "am2921-node-27": {
+        "cpu_pct": "6.83%",
+        "mem": "14.12MiB"
+      },
+      "am2921-node-12": {
+        "cpu_pct": "1.21%",
+        "mem": "16.97MiB"
+      },
+      "am2921-node-03": {
+        "cpu_pct": "6.48%",
+        "mem": "14.26MiB"
+      },
+      "am2921-node-34": {
+        "cpu_pct": "6.81%",
+        "mem": "13.83MiB"
+      },
+      "am2921-node-10": {
+        "cpu_pct": "2.02%",
+        "mem": "16.24MiB"
+      },
+      "am2921-node-04": {
+        "cpu_pct": "0.41%",
+        "mem": "16.57MiB"
+      },
+      "am2921-node-33": {
+        "cpu_pct": "6.75%",
+        "mem": "16MiB"
+      },
+      "am2921-node-38": {
+        "cpu_pct": "0.80%",
+        "mem": "15.15MiB"
+      },
+      "am2921-node-48": {
+        "cpu_pct": "2.12%",
+        "mem": "13.04MiB"
+      },
+      "am2921-node-19": {
+        "cpu_pct": "7.27%",
+        "mem": "15.09MiB"
+      },
+      "am2921-node-45": {
+        "cpu_pct": "7.02%",
+        "mem": "14.54MiB"
+      },
+      "am2921-node-30": {
+        "cpu_pct": "1.27%",
+        "mem": "16.01MiB"
+      },
+      "am2921-node-39": {
+        "cpu_pct": "7.50%",
+        "mem": "13.51MiB"
+      },
+      "am2921-node-06": {
+        "cpu_pct": "5.20%",
+        "mem": "15.89MiB"
+      },
+      "am2921-node-35": {
+        "cpu_pct": "5.90%",
+        "mem": "15.39MiB"
+      },
+      "am2921-node-21": {
+        "cpu_pct": "3.43%",
+        "mem": "13.34MiB"
+      },
+      "am2921-node-41": {
+        "cpu_pct": "1.19%",
+        "mem": "14.12MiB"
+      },
+      "am2921-node-17": {
+        "cpu_pct": "3.59%",
+        "mem": "15.25MiB"
+      },
+      "am2921-node-11": {
+        "cpu_pct": "6.93%",
+        "mem": "14.02MiB"
+      },
+      "am2921-node-13": {
+        "cpu_pct": "7.22%",
+        "mem": "13.55MiB"
+      },
+      "am2921-node-09": {
+        "cpu_pct": "5.97%",
+        "mem": "12.67MiB"
+      },
+      "am2921-node-08": {
+        "cpu_pct": "1.44%",
+        "mem": "13.95MiB"
+      },
+      "am2921-node-37": {
+        "cpu_pct": "4.27%",
+        "mem": "17.27MiB"
+      },
+      "am2921-node-50": {
+        "cpu_pct": "2.20%",
+        "mem": "16.56MiB"
+      },
+      "am2921-node-40": {
+        "cpu_pct": "4.80%",
+        "mem": "16.24MiB"
+      }
+    }
+  }
+}
