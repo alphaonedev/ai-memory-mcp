@@ -8,16 +8,16 @@ layout: doc
 anchors re-verified against `release/v1.0.0` HEAD on 2026-08-01.
 **ai-memory version:** v1.0.0 (sqlite + postgres schema **v89**, lockstep).
 **Companion document:** [`docs/compliance/nsa-csi-mcp-security-mapping.md`](nsa-csi-mcp-security-mapping.html) — the NSA CSI concern + recommendation mapping that Task E ships.
-**Source-of-truth inventory:** [`docs/compliance/_inventory/v0.7.0-capabilities.json`](_inventory/v0.7.0-capabilities.json).
+**Source-of-truth inventory:** [`docs/compliance/_inventory/v1.0.0-capabilities.json`](_inventory/v1.0.0-capabilities.json) (46 capabilities, codegraph-verified at commit `580d8427bb4da887f7a25731792c55c4e49d56d6` on `release/v1.0.0`). The v0.7.0 file ([`v0.7.0-capabilities.json`](_inventory/v0.7.0-capabilities.json), 27 primitives at `4add7a85`) is retained as a historical artefact.
 
-> **Currency note.** The linked capability inventory is a **v0.7.0-tree
-> artefact** and has not been re-derived against the v0.8.x / v0.9.0 / v1.0.0
-> source tree; a v1.0.0 refresh is tracked under
-> [#1938](https://github.com/alphaonedev/ai-memory-mcp/issues/1938). What was
-> re-verified at v1.0.0 HEAD is this document's own prose: every substrate
+> **Currency note.** The capability inventory was re-derived against
+> `release/v1.0.0` @ `580d8427` on 2026-08-13 under
+> [#1938](https://github.com/alphaonedev/ai-memory-mcp/issues/1938) (cert §8
+> minting condition (b)), extending the #1153 Task I method. Every substrate
 > claim below is stated against a **symbol** (module / type / function name)
 > rather than a file:line anchor, because line anchors drift with every commit
-> and an anchor that misses costs a reviewer more trust than it buys.
+> and an anchor that misses costs a reviewer more trust than it buys. The
+> inventory JSON carries pin-verified `file:line` fields at that SHA.
 
 ## Statement of intent — what this document is and is not
 
@@ -157,7 +157,7 @@ An operator deploys ai-memory but does not enable the governance rules engine �
 
 **Disclaimer of endorsement:** Per the NSA document's reproduction guidance, no NSA endorsement of ai-memory, AgenticMem, AlphaOne LLC, or any commercial product or service is implied. References to Microsoft AGT and the Ortega/de Freitas reference are bibliographic; no endorsement by those parties is implied.
 
-**Honesty discipline:** Every claim in this document about substrate behaviour traces either to a **named symbol** in the source tree (module / type / function) or to a documented boundary (filesystem, kernel, hardware, LLM-side); the older v0.7.0 claims additionally trace to a `capability_id` in [`docs/compliance/_inventory/v0.7.0-capabilities.json`](_inventory/v0.7.0-capabilities.json), which is a v0.7.0-tree artefact per the currency note at the top of this document. **This document deliberately publishes no `file:line` anchors.** Line numbers drift with every commit, and a procurement reviewer who follows a stale anchor to unrelated code loses trust that a correction cannot buy back; a symbol name either resolves or is provably gone. Aspirational claims and forward-looking statements have been removed during procurement-grade review.
+**Honesty discipline:** Every claim in this document about substrate behaviour traces either to a **named symbol** in the source tree (module / type / function) or to a documented boundary (filesystem, kernel, hardware, LLM-side); claims additionally trace to a `capability_id` in [`docs/compliance/_inventory/v1.0.0-capabilities.json`](_inventory/v1.0.0-capabilities.json) (the v0.7.0-era ids are stable; new v0.8–v1.0 ids are additive). The historical v0.7.0 inventory remains at [`v0.7.0-capabilities.json`](_inventory/v0.7.0-capabilities.json). **This document deliberately publishes no `file:line` anchors.** Line numbers drift with every commit, and a procurement reviewer who follows a stale anchor to unrelated code loses trust that a correction cannot buy back; a symbol name either resolves or is provably gone. Aspirational claims and forward-looking statements have been removed during procurement-grade review.
 
 ---
 
