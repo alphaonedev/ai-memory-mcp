@@ -33,17 +33,20 @@
 //!    [`crate::security_profile::is_asi_hard`] +
 //!    [`crate::security_profile::asi_hard_below_floor`] — no knob name
 //!    or floor value is re-declared here).
-//! 2. A SMALL set of federation-certification-specific additions the
-//!    ruling names that are NOT part of the generic `asi-hard` set
-//!    (peer enrollment / per-message sig / nonce / push-namespace-scope
-//!    / stale-governance-policy refusal / governance permissions mode /
-//!    governance fail-open / trust domain / peer fingerprints / peer
-//!    attestation JSON+glob shape / the two "must be UNSET" federation
-//!    trust bypasses / at-rest encryption / the boot-refusal env itself
-//!    so `doctor --posture` cannot PASS a deployment whose daemon would
-//!    not refuse boot on later drift — #2911). Every env-var-name
-//!    literal below is a named `ENV_*` const imported from its ONE
-//!    existing declaration site — none are redeclared here.
+//! 2. A SMALL set of federation-certification-specific additions that
+//!    are NOT part of the generic `asi-hard` set. Most are named by the
+//!    §5.3 ruling (peer enrollment / per-message sig / nonce /
+//!    push-namespace-scope / governance permissions mode / governance
+//!    fail-open / trust domain / peer fingerprints / peer attestation
+//!    JSON+glob shape / the two "must be UNSET" federation trust
+//!    bypasses / at-rest encryption). TWO are BEYOND-RULING additions
+//!    from #2911 items 1-2, not from the ruling: the
+//!    stale-governance-policy refusal (FED-RQ-03, check #18) and the
+//!    boot-refusal env itself (check #17 — so `doctor --posture` cannot
+//!    PASS a deployment whose daemon would not refuse boot on later
+//!    drift). Every env-var-name literal below is a named `ENV_*` const
+//!    imported from its ONE existing declaration site — none are
+//!    redeclared here.
 //!
 //! ## Ruling-vs-code reconciliation (quoted, so the drift is auditable)
 //!
@@ -61,6 +64,13 @@
 //!   `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` (env-table row #39,
 //!   [`crate::daemon_runtime::governance_fail_open_on_error`]), checked
 //!   here directly.
+//!
+//! And the inverse direction, recorded here so the ruling-vs-code delta
+//! stays auditable BOTH ways: checks #17 (boot-refusal env
+//! self-attestation) and #18 (`AI_MEMORY_FED_REQUIRE_POLICY_CURRENT`
+//! not explicitly falsy) appear in NO §5.3 ruling code block — they are
+//! BEYOND-RULING additions from #2911 items 1-2 (cert §2 doctor-caveat
+//! remediation), not reconciliations of anything the ruling wrote.
 //!
 //! A third reconciliation, on the `**` allow-all-glob check (§5.3's "no
 //! peer scope's `allowed_namespaces` contains a bare `**` allow-all
