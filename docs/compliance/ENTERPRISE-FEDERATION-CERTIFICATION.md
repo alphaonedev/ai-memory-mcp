@@ -74,7 +74,10 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
 > not MEASURED — the largest real-mesh-measured federation is 2 nodes,
 > and the full-scale USL capacity projection is deferred to a dedicated
 > capacity bench
-> ([#2438](https://github.com/alphaonedev/ai-memory-mcp/issues/2438)).**
+> ([#2921](https://github.com/alphaonedev/ai-memory-mcp/issues/2921);
+> [#2438](https://github.com/alphaonedev/ai-memory-mcp/issues/2438), which
+> recorded the scope reset that retired the 1M claim, is CLOSED and is not
+> the bench tracker).**
 > Scale past one cluster by adding independent clusters, never by
 > growing one mesh past the ~50-peer ceiling.
 >
@@ -271,7 +274,7 @@ e2e suite alone cannot). Proven:
 | `inbound_namespace_meta_authorized` | `federation_ns_meta_scope_2479::exploit_set_rebinds_out_of_scope_victim_standard_2479` | **RED → GREEN** |
 | `require_push_namespace_scope_enabled` (Layer-2 knob) | `federation_write_ns_scope_2447::enrolled_peer_without_declared_namespaces_denied_by_default_2447` | **RED → GREEN** |
 | `authorize_remote_checkpoint_resolution` (signature gate) | `federation_1936_checkpoint_fed::strict_refuses_unenrolled_resolver` | **RED → GREEN** |
-| `peer_enrolled_in_allowlist` (`:761`; sole call site `:1094`) | **NOT individually removal-proven.** `:1094` is inside helper `layer2_unscoped_peer_authorized` (declared `:1081`), which is called from **both** `inbound_write_namespace_authorized` (`:1049`) **and** `inbound_by_id_namespace_authorized` (`:1219`) — not "inside `inbound_write_namespace_authorized`" alone. Recorded individual mutation is behaviorally **masked** (`docs/compliance/evidence/cert-54/removal-peer_enrolled_in_allowlist-broken.out`: the mapped test still `ok`, rc=0). Defense-in-depth: covered by row 1's removal proof plus the earlier `x_peer_id_not_in_allowlist` envelope gate. Decisive standalone test tracked in [#2912](https://github.com/alphaonedev/ai-memory-mcp/issues/2912) item 1. | **MASKED (broken→rc=0)** |
+| `peer_enrolled_in_allowlist` (`:761`; sole call site `:1094`) | **NOT individually removal-proven.** `:1094` is inside helper `layer2_unscoped_peer_authorized` (declared `:1081`), which is called from **both** `inbound_write_namespace_authorized` (`:1049`) **and** `inbound_by_id_namespace_authorized` (`:1219`) — not "inside `inbound_write_namespace_authorized`" alone. Recorded individual mutation is behaviorally **masked** (`docs/compliance/evidence/cert-54/removal-peer_enrolled_in_allowlist-broken.out`: the mapped lane test — `sync_push_unknown_peer_id_refused_when_allowlist_configured_1056`, a different lane than `removal-proof-full.log`'s `federated_write_outside_peer_scope_refused_2447` — still `ok`, rc=0). Defense-in-depth: covered by row 1's removal proof plus the earlier `x_peer_id_not_in_allowlist` envelope gate. Decisive standalone test tracked in [#2912](https://github.com/alphaonedev/ai-memory-mcp/issues/2912) item 1. | **MASKED (broken→rc=0)** |
 
 All **5** real cited controls turn their decisive test RED when broken and GREEN when
 restored (evidence: `docs/compliance/evidence/cert-54/removal-*-{broken,restored}.out`).
@@ -287,8 +290,8 @@ of the five is the SOLE decisive gate.
 > **Evidence-chain note (F5).** No full-harness `overall: PASS` log exists
 > for the **final** corrected control map. The per-control
 > broken/restored pairs are the proof artifacts.
-> `docs/compliance/evidence/cert-54/removal-proof-full.log` (11:02,
-> ending `overall: CERT-RED`) is the *superseded first-pass* record,
+> `docs/compliance/evidence/cert-54/removal-proof-full.log` (ending
+> `overall: CERT-RED`) is the *superseded first-pass* record,
 > retained as the rigor trail that forced the remap. The harness MAP
 > covers only these receive_auth confinement controls — not the
 > envelope/signature gates cited in §1. Envelope-gate mutation proofs
@@ -322,8 +325,10 @@ following should **not** treat v1.0.0 as sufficient:
   path is complete.
 - **Scale envelope — ARCHITECTED, not MEASURED.** ~1000 agents, ≤ 50 peers
   per block — **not 1M**. Largest real-mesh-measured federation = **2 nodes**.
-  USL capacity projection deferred to
-  [#2438](https://github.com/alphaonedev/ai-memory-mcp/issues/2438). This is
+  USL capacity projection deferred to the open capacity-bench tracker
+  [#2921](https://github.com/alphaonedev/ai-memory-mcp/issues/2921)
+  ([#2438](https://github.com/alphaonedev/ai-memory-mcp/issues/2438), the
+  scope reset, is closed). This is
   a trust-boundary certification within that architected envelope, **not** a
   validated-capacity claim. **Push / store / recall throughput is NOT
   PUBLISHED** — `docs/enterprise-deployment.md` §11.1 ("Sustained
@@ -376,11 +381,20 @@ is observed:**
 **expires on any change to the federation wire path (`src/federation/**`,
 `src/handlers/federation_receive.rs`, `src/handlers/federation_signing_check.rs`)
 or the `AI_MEMORY_FED_*` env surface.** Any such change requires re-running
-§5.4(2)–(5) and re-issuing this document against the new SHA. (As of this
-re-issue the trigger is **not yet mechanized in CI** — that gate is
-Task C / [**#2915**](https://github.com/alphaonedev/ai-memory-mcp/pull/2915).
-Until it lands, a wire change can merge through
-green CI while this document stays cited.)
+§5.4(2)–(5) and re-issuing this document against the new SHA. The
+**mechanized reading of the env-surface trigger is the set of
+`AI_MEMORY_FED_*` identifier NAMES declared in `src/`** — an add, remove,
+or rename trips the gate; a semantics-only change to an EXISTING knob
+outside the watched paths does not trip the mechanized gate and is
+covered by review plus the posture/removal proofs, not by CI. (Mechanized
+as Task C / [**#2915**](https://github.com/alphaonedev/ai-memory-mcp/pull/2915),
+merged 2026-08-13: the `cert-expiry-gate` job in
+`.github/workflows/c8-precheck.yml` runs `scripts/check-cert-expiry.sh`
+on every PR diff — a watched-surface change without a same-change edit
+to this document goes RED. Its reported context is declared in
+`scripts/qc-allowlists/required-contexts-release.txt`; until the
+operator-gated branch-protection API call adds it to the live required
+set, the gate is a red check, not a merge block.)
 
 **Named signer.** The determination at `580d8427` is a **GitHub
 squash-merge** of PR #2910, committed by `GitHub` on behalf of the
@@ -431,7 +445,7 @@ this re-issue and the companion PRs / issues dispose.
 | Condition | Disposition |
 |---|---|
 | **(a)** cert artifacts committed and passing CI | **Met.** PR #2910 merged as `580d8427`. The minting-condition evidence is the **commit-level** check-run set on that SHA: `gh api repos/alphaonedev/ai-memory-mcp/commits/580d8427/check-runs --paginate --jq '.check_runs \| group_by(.conclusion) \| map({conclusion: .[0].conclusion, count: length})'` → `[{"conclusion":"skipped","count":1},{"conclusion":"success","count":46}]` — **47 check-runs: 46 SUCCESS + 1 SKIPPED** (`Regenerate bench baseline (ubuntu-latest, median-of-3)` — the intentional bench skip). Zero failures. The PR #2910 `statusCheckRollup` surface is a different GitHub query and reports 42 (41 SUCCESS + 1 SKIPPED); the five commit-level runs absent from that rollup are Android emulator runtime, iOS Simulator runtime, Bash integration (`test-batman-mode-suite.sh`), Rust integration (`issue_800_batman_mode`), and Surface stability (load-bearing symbols). Both queries are true of their respective surfaces; the SHA-level 47 is the minting-condition count. |
-| **(b)** capability-inventory JSON re-derivation | **In flight — waived as a minting blocker, not as a follow-up.** At `580d8427`, `docs/compliance/_inventory/` holds `v0.7.0-capabilities.json` only. The staleness is already disclosed in `docs/compliance/honest-limitations.md:13-16` (currency note pointing at #1938). The inventory is **not load-bearing for the five §1 security guarantees** (those rest on the posture gate, the removal proofs, and the executed negative lanes). Re-derivation is Task B / [**#2916**](https://github.com/alphaonedev/ai-memory-mcp/pull/2916) (`feat/1938-capability-inventory-v100`). |
+| **(b)** capability-inventory JSON re-derivation | **MET (2026-08-13).** At the mint SHA `580d8427`, the only capability inventory in `docs/compliance/_inventory/` was the v0.7.0-era `v0.7.0-capabilities.json` (alongside its summary/test-plan/registry-submission siblings) — no v1.0.0 re-derivation existed, and the condition was waived as a minting blocker with the staleness disclosed in `docs/compliance/honest-limitations.md:13-16` (currency note pointing at #1938). The inventory is **not load-bearing for the five §1 security guarantees** (those rest on the posture gate, the removal proofs, and the executed negative lanes). Re-derivation, Task B / [**#2916**](https://github.com/alphaonedev/ai-memory-mcp/pull/2916) (`feat/1938-capability-inventory-v100`), **merged 2026-08-13** (`bdcd890d`, Fable 5 pre-merge audit: 114/114 anchors, exact 11851 = 7580 + 4271 test-count reconciliation) — `docs/compliance/_inventory/v1.0.0-capabilities.json` (46 rows @ `580d8427`, schema 89, MCP full 103) now exists at the branch tip. |
 | **(c)** the final AI-NHI re-cert vote | **Met.** The 2026-08-12 vote above. |
 
 **Verdict: CERTIFIED (within scope).** An F500 may treat the five §1
