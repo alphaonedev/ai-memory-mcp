@@ -18,7 +18,7 @@
 //! verification; tampering with `sequence` breaks the contiguity
 //! check. Capability inventory anchor:
 //! `v4_signed_events_chain` in
-//! [`docs/compliance/_inventory/v0.7.0-capabilities.json`](../../docs/compliance/_inventory/v0.7.0-capabilities.json);
+//! [`docs/compliance/_inventory/v1.0.0-capabilities.json`](../../docs/compliance/_inventory/v1.0.0-capabilities.json);
 //! narrative in
 //! [`docs/compliance/nsa-csi-mcp.html`](../../docs/compliance/nsa-csi-mcp.html)
 //! §3.7 (concern g) and §4.7 (recommendation g).
