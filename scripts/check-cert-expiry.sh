@@ -83,13 +83,14 @@ FED_ID_PATTERN='AI_MEMORY_FED_[A-Z0-9_]+'
 # ---------------------------------------------------------------------------
 
 # is_watched_path PATH — 0 iff PATH is on the §7 federation-wire surface.
+# Use [[ == ]] globs, not `case`. bash `case` `*` does not match `/`, so
+# `src/federation/*` would miss nested paths (e.g. src/federation/identity/*.rs
+# — 10 files at 580d8427). `[[ == ]]` `*` does match `/`.
 is_watched_path() {
-    case "$1" in
-        src/federation | src/federation/*) return 0 ;;
-        src/handlers/federation_receive.rs) return 0 ;;
-        src/handlers/federation_signing_check.rs) return 0 ;;
-        *) return 1 ;;
-    esac
+    [[ "$1" == src/federation || "$1" == src/federation/* ]] && return 0
+    [[ "$1" == src/handlers/federation_receive.rs ]] && return 0
+    [[ "$1" == src/handlers/federation_signing_check.rs ]] && return 0
+    return 1
 }
 
 is_cert_doc_path() {
@@ -500,6 +501,29 @@ self_test() {
 
     git -C "$repo" reset -q --hard "$base_sha"
 
+    # (h2) RED — nested path under src/federation/** (bash `case` `*` does
+    #     not match `/`; this is the bypass that would have let
+    #     src/federation/identity/*.rs through).
+    mkdir -p "$repo/src/federation/identity"
+    printf 'fn identity() {}\n' >"$repo/src/federation/identity/mod.rs"
+    git -C "$repo" add src/federation/identity/mod.rs
+    git -C "$repo" commit -q -m "violate: touch nested src/federation/identity"
+    local nested_sha
+    nested_sha="$(git -C "$repo" rev-parse HEAD)"
+    if out="$(check_change "$repo" "$base_sha" "$nested_sha" 2>&1)"; then
+        echo "self-test FAILED (h2): nested src/federation/identity/mod.rs was NOT rejected" >&2
+        echo "$out" >&2
+        failed=1
+    else
+        if ! printf '%s\n' "$out" | grep -q 'src/federation/identity/mod.rs'; then
+            echo "self-test FAILED (h2): rejection did not name the nested watched path:" >&2
+            echo "$out" >&2
+            failed=1
+        fi
+    fi
+
+    git -C "$repo" reset -q --hard "$base_sha"
+
     # (i) RED — rename of a watched file (D of the old path must still trip;
     #     --no-renames is the property under test).
     mkdir -p "$repo/src/elsewhere"
@@ -606,7 +630,7 @@ self_test() {
         echo "check-cert-expiry self-test: FAIL" >&2
         exit 2
     fi
-    echo "check-cert-expiry self-test OK: (a) watched-path violation RED with the §7 expiry sentence; (b) same change + cert-doc GREEN; (c) AI_MEMORY_FED_* identifier-add outside the path watches RED; (d) identifier-add + cert-doc GREEN; (e) unrelated src/ edit GREEN; (f) cert-doc-only GREEN; (g) federation_receive.rs RED; (h) federation_signing_check.rs RED; (i) watched-file rename RED (old path still named); (j) identifier-rename RED (both names listed); (k) pull_request missing PR_BASE_SHA fail-closed; (l) workflow_dispatch skip; (m) push with zero before-SHA skip; (n) unresolvable range fail-closed; (o) this checkout vs origin/release/v1.0.0 GREEN."
+    echo "check-cert-expiry self-test OK: (a) watched-path violation RED with the §7 expiry sentence; (b) same change + cert-doc GREEN; (c) AI_MEMORY_FED_* identifier-add outside the path watches RED; (d) identifier-add + cert-doc GREEN; (e) unrelated src/ edit GREEN; (f) cert-doc-only GREEN; (g) federation_receive.rs RED; (h) federation_signing_check.rs RED; (h2) nested src/federation/identity/** RED; (i) watched-file rename RED (old path still named); (j) identifier-rename RED (both names listed); (k) pull_request missing PR_BASE_SHA fail-closed; (l) workflow_dispatch skip; (m) push with zero before-SHA skip; (n) unresolvable range fail-closed; (o) this checkout vs origin/release/v1.0.0 GREEN."
 }
 
 case "${1:-}" in
