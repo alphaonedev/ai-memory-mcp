@@ -772,3 +772,47 @@ jobs:
         # exit status, or a stray `|| true`) could have silently flipped it
         # fail-open with nothing catching the regression.
         run: bash scripts/check-commit-signing-posture.sh --self-test
+
+  cert-expiry-gate:
+    # Cert §7 expiry trigger (F7 / 2026-08-12 ratification caveat). The
+    # enterprise-federation certification expires on any change to
+    # src/federation/**, the two federation handler files, or the
+    # AI_MEMORY_FED_* identifier surface, unless the same change also
+    # re-issues or voids docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md.
+    # Until this job that sentence was prose-only — a federation-wire
+    # change could merge through green CI while the cert kept being cited
+    # (the #2444 "reports success while doing nothing" shape).
+    #
+    # Diff range is the standard PR diff (merge-base-with-PR-base .. HEAD),
+    # NEVER a diff against the cert's pinned SHA, so unrelated later PRs
+    # do not fail forever. `fetch-depth: 0` is required (default
+    # actions/checkout@v4 is a shallow single-commit checkout of the PR
+    # merge ref, which cannot walk merge-base(base, head)).
+    #
+    # No `needs:`, no job-level `if:`, no `paths:` filter — always runs.
+    # Declared REQUIRED in required-contexts-release.txt (mirror-first;
+    # live branch-protection API is the operator-gated follow-up).
+    name: Enterprise-federation cert-expiry gate (cert §7 / F7)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run enterprise-federation cert-expiry gate
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+        run: bash scripts/check-cert-expiry.sh
+      - name: Self-test the gate (regression evidence)
+        # --self-test builds a throwaway repo under .local-runs/ (never a
+        # real branch, never /tmp) and asserts: a watched-path violation
+        # is RED with the required §7 expiry sentence; the same change
+        # plus a cert-doc touch is GREEN; an AI_MEMORY_FED_* identifier
+        # add/rename outside the path watches is RED; docs-only and
+        # unrelated src edits are GREEN; pull_request-without-base
+        # fail-closes; workflow_dispatch and a zero-SHA push skip;
+        # THIS checkout vs origin/release/v1.0.0 is GREEN.
+        run: bash scripts/check-cert-expiry.sh --self-test

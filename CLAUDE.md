@@ -1024,15 +1024,21 @@ Twelve numbered script-based lint gates run in CI alongside the four
 cargo gates (fmt / clippy / test / audit) and the two test-guard jobs
 (`test-stdin-gate` #1989, `test-env-lock-gate` #2146). All are
 HARD-BLOCK. Eleven are wired into `.github/workflows/c8-precheck.yml`,
-whose SIXTEEN jobs are `c8-precheck`, `vendor-literal-gate`,
+whose TWENTY-TWO jobs are `c8-precheck`, `vendor-literal-gate`,
 `l3-boundary-gate`, `hardcoded-literal-gate`, `docs-vs-ssot-drift`,
-`cloud-init-ascii-gate`, `migration-ladder-gate`,
-`required-contexts-gate`, `install-checksum-gate`,
-`conformance-readers-gate`, `git-dependency-source-gate`,
 `doc-symbol-anchor-gate`, `sdk-route-path-gate`, `ci-job-claims-gate`,
-plus the two test-guard jobs above. (That job list was stale by three
-until #2636 — which is the same class of rot rule (f) now blocks
-mechanically, one layer down.) The twelfth, gate **8** below, lives in
+`doc-surface-completeness-gate`, `capacity-claim-gate`,
+`benchmark-claim-gate`, `cloud-init-ascii-gate`,
+`migration-ladder-gate`, `install-checksum-gate`,
+`conformance-readers-gate`, `required-contexts-gate`,
+`git-dependency-source-gate`, `create-extension-allowlist-gate`,
+`commit-signing-posture-gate`, `cert-expiry-gate` (the
+enterprise-federation cert §7 expiry trigger, #2915 — an integrity
+gate, not one of the twelve numbered lint gates below), plus the two
+test-guard jobs above. (This job list re-synced at #2915: it had
+silently rotted from sixteen to twenty-one jobs since #2636 — the
+same prose-rot class rule (f) of gate 7 blocks mechanically, one
+layer down.) The twelfth, gate **8** below, lives in
 `.github/workflows/ci.yml` because it needs a Rust toolchain that
 `c8-precheck.yml`'s deliberately toolchain-free jobs do not carry.
 

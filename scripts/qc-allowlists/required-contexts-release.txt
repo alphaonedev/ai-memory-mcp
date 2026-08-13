@@ -228,6 +228,20 @@ Capacity-claim ceiling gate (#2869)
 # so the gate can prove the context sound before it is enforced.
 Benchmark-claim canon gate (#2879)
 #
+# Cert §7 expiry gate (F7, 2026-08-12 ratification caveat). The
+# enterprise-federation certification expires on any change to
+# `src/federation/**`, the two federation handler files, or the
+# `AI_MEMORY_FED_*` identifier surface, unless the same change also
+# re-issues or voids the cert doc. Until this job that trigger was
+# prose-only. Carried by `c8-precheck.yml` (`cert-expiry-gate`).
+# Declared REQUIRED per gate 7 rule (f) — a new c8-precheck integrity
+# gate must be declared here (or in the not-required ledger) or it is
+# required-by-nothing (the #2636 class). Mirror-first: this declaration
+# lands before the companion branch-protection API call (KNOWN GAP
+# below), so the gate can prove the context sound before it is
+# enforced.
+Enterprise-federation cert-expiry gate (cert §7 / F7)
+#
 # ---------------------------------------------------------------------------
 # KNOWN GAPS — declared here so they are not mistaken for oversights.
 # Closing any of them is a branch-protection edit, deliberately NOT done in

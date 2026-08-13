@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### CI (enterprise-federation cert-expiry gate; cert §7 / F7)
+
+- **A new CI gate hard-fails when a PR changes the federation-wire
+  surface without also re-issuing or voiding the enterprise-federation
+  certification document.** The cert doc's §7 expiry trigger
+  (`src/federation/**`, `src/handlers/federation_receive.rs`,
+  `src/handlers/federation_signing_check.rs`, or added/removed/renamed
+  `AI_MEMORY_FED_*` identifiers anywhere in `src/`) was previously
+  enforced by nothing — a wire change would merge through green CI
+  while the certification kept being cited (F7 of the 2026-08-12
+  ratification vote). `scripts/check-cert-expiry.sh` walks the
+  standard PR diff (`merge-base(PR-base, HEAD)..HEAD`, never a diff
+  against the cert's pinned SHA) and HARD-FAILS unless the same
+  change also modifies
+  `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`. Wired as
+  `Enterprise-federation cert-expiry gate (cert §7 / F7)` in
+  `.github/workflows/c8-precheck.yml` (`fetch-depth: 0`; no `needs:`,
+  no job-level `if:`, no `paths:` filter). `--self-test` plants a
+  violating change in a scratch clone (RED), a cert-doc-touching
+  variant (GREEN), identifier add/rename, watched-file rename,
+  release-branch / `workflow_dispatch` / shallow-checkout edge cases,
+  and asserts THIS checkout is GREEN. Declared in
+  `scripts/qc-allowlists/required-contexts-release.txt` (mirror-first;
+  live branch-protection API is the operator-gated follow-up).
 ### Docs (capability inventory re-derivation; #1938)
 
 - **Re-derived the NSA CSI capability inventory against `release/v1.0.0`
