@@ -312,8 +312,8 @@
       "verified_at_paths": [
         "src/governance/rules_store.rs:844 (canonical_bytes_for_signing)",
         "src/governance/rules_store.rs:870 (verify_rule_signature)",
-        "src/governance/rules_store.rs:1317 (canonical_bytes_for_signing_includes_enabled)",
-        "src/governance/rules_store.rs:1334 (canonical_bytes_for_signing_excludes_signature_and_attest_level)"
+        "src/governance/rules_store.rs:1317 (canonical_bytes_for_signing_includes_enabled regression test)",
+        "src/governance/rules_store.rs:1334 (canonical_bytes_for_signing_excludes_signature_and_attest_level regression test)"
       ],
       "factual_description": "Every signed governance rule is hashed over a canonical byte representation that explicitly includes the enabled flag (preventing enable-after-sign tampering) and explicitly excludes the signature itself plus the attest_level (preventing self-referential signature loops). Regression tests pin the canonical-bytes invariant. Re-anchored at 580d8427 (function moved 541\u2192844).",
       "verified_in_v0_7_0": true,
@@ -1194,7 +1194,8 @@
       ],
       "verified_at_paths": [
         "src/config.rs:5541 (pub enum HttpIdentityMode)",
-        "src/config.rs:4727 (http_attested_identity_mode)",
+        "src/config.rs:5591 (pub fn http_attested_identity_mode)",
+        "src/config.rs:4554 (ENV_HTTP_ATTESTED_IDENTITY)",
         "src/handlers/identity_binding.rs",
         "src/handlers/transport.rs (api_key_auth)"
       ],
