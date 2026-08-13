@@ -182,10 +182,10 @@ Self-describing `<codec-varint><length-varint><digest-bytes>` (unsigned-LEB128 v
 Positional arrays cannot omit an element (that would shift positions). Optional fields use an **explicit presence encoding** honoring the `None ≠ empty` discipline (#1930 CWE-345): the element is a **2-element sub-array** `[present:uint(0|1), value?]` — `[0]` when absent (no value element), `[1, <value>]` when present. This is unambiguous, never collides an absent field with an empty-string value, and keeps the outer element count fixed. *(Alternative considered + rejected: a CBOR `null` sentinel — but `null` is forbidden by the A.1 profile, and a naked empty-string would violate None≠empty.)*
 
 ### A.4 Worked STRUCTURAL example (element list, NOT claimed bytes)
-A SignableWrite v2 record for `agent="host:pop-os", ns="global", title="x", kind="observation", created="2026-07-09T00:00:00Z", content="hello"`, no session, ed25519+sha256 suite, is the 11-element array:
+A SignableWrite v2 record for `agent="host:host.example", ns="global", title="x", kind="observation", created="2026-07-09T00:00:00Z", content="hello"`, no session, ed25519+sha256 suite, is the 11-element array:
 ```
 [ "ai-memory/write/v2",                     # [0] _dst
-  "host:pop-os", "global", "x", "observation", "2026-07-09T00:00:00Z",   # [1-5]
+  "host:host.example", "global", "x", "observation", "2026-07-09T00:00:00Z", # [1-5]
   h'12 20 <sha2-256(screen("hello"))>',     # [6] content_digest multihash
   h'<instance_key_id>',                      # [7]
   h'<b3-cid of model_attestation>',          # [8] model_version_ref

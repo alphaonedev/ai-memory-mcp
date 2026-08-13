@@ -73,7 +73,7 @@ fn worked_proof() -> EquivocationProof {
     EquivocationProof {
         subject_pubkey: [0x07; 32],
         attestation_a: HeadAttestationEntry {
-            subject_agent_id: "ai:claude-code@pop-os".to_string(),
+            subject_agent_id: "ai:example-agent@host.example".to_string(),
             epoch: 3,
             head_sequence: 42,
             head_hash: vec![0xaa; 32],
@@ -81,7 +81,7 @@ fn worked_proof() -> EquivocationProof {
             signature: vec![0xa1; 64],
         },
         attestation_b: HeadAttestationEntry {
-            subject_agent_id: "ai:claude-code@pop-os".to_string(),
+            subject_agent_id: "ai:example-agent@host.example".to_string(),
             epoch: 3,
             head_sequence: 42,
             head_hash: vec![0xbb; 32],

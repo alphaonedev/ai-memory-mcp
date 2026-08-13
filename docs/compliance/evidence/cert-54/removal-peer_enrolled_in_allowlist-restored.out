@@ -1,0 +1,9 @@
+   Compiling ai-memory v1.0.0 (<repo-root>)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 42.77s
+     Running tests/federation_sync_push_tofu_1056.rs (target/debug/deps/federation_sync_push_tofu_1056-06392b6e92b38547)
+
+running 1 test
+test sync_push_unknown_peer_id_refused_when_allowlist_configured_1056 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.49s
+

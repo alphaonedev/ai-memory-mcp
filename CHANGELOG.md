@@ -11,10 +11,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`ai-memory doctor --posture enterprise-federation` no longer reports a satisfied hardened-floor check while the resolved security profile is `standard`** ([#2923](https://github.com/alphaonedev/ai-memory-mcp/issues/2923)). The `asi-hard pinned knobs` row was rendered from `security_profile::asi_hard_below_floor()` alone, which by construction reports only knobs an operator has explicitly set BELOW their floor — under `standard` nothing is pinned, the list is empty, and the row printed `[PASS] … 17/17 at floor` for a deployment where not one pin is in force. That row is captured verbatim in the cert-§5.4 evidence bundle staged in the un-merged [#2917](https://github.com/alphaonedev/ai-memory-mcp/pull/2917) (`docs/compliance/evidence/cert-54/posture-bare-env.out`; the file is NOT on `release/v1.0.0` yet), so it was on track to become committed, publicly-auditable cert evidence carrying a vacuous PASS — which is false assurance. The row is now paired with `is_asi_hard()` exactly as `asi_hard_below_floor`'s own docs prescribe: a non-`asi-hard` profile FAILS with `actual: (profile=standard — asi-hard pins not in force; the 17-knob hard floor was not evaluated)` and a fix that names the profile knob, and the `required:` text states the previously-implicit engagement precondition (`asi-hard engaged AND all 17 at hard floor`). An UNRECOGNISED profile token renders as `profile=unrecognised`, never as a posture the process does not have. Under `asi-hard` the row's `actual` / `pass` / `fix` are byte-identical to pre-#2923. The overall verdict is unchanged in every posture (the `AI_MEMORY_SECURITY_PROFILE` row already FAILed the bare leg), and the check count stays 18 — this is a per-row truthfulness fix, not a gate change. The bare-leg posture evidence bundle gains one more FAIL row and is re-captured with the cert-§5.4 artifacts.
 
+### CI (enterprise-federation cert-expiry gate; cert §7 / F7)
+
+- **A new CI gate hard-fails when a PR changes the federation-wire
+  surface without also re-issuing or voiding the enterprise-federation
+  certification document.** The cert doc's §7 expiry trigger
+  (`src/federation/**`, `src/handlers/federation_receive.rs`,
+  `src/handlers/federation_signing_check.rs`, or added/removed/renamed
+  `AI_MEMORY_FED_*` identifiers anywhere in `src/`) was previously
+  enforced by nothing — a wire change would merge through green CI
+  while the certification kept being cited (F7 of the 2026-08-12
+  ratification vote). `scripts/check-cert-expiry.sh` walks the
+  standard PR diff (`merge-base(PR-base, HEAD)..HEAD`, never a diff
+  against the cert's pinned SHA) and HARD-FAILS unless the same
+  change also modifies
+  `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`. Wired as
+  `Enterprise-federation cert-expiry gate (cert §7 / F7)` in
+  `.github/workflows/c8-precheck.yml` (`fetch-depth: 0`; no `needs:`,
+  no job-level `if:`, no `paths:` filter). `--self-test` plants a
+  violating change in a scratch clone (RED), a cert-doc-touching
+  variant (GREEN), identifier add/rename, watched-file rename,
+  release-branch / `workflow_dispatch` / shallow-checkout edge cases,
+  and asserts THIS checkout is GREEN. Declared in
+  `scripts/qc-allowlists/required-contexts-release.txt` (mirror-first;
+  live branch-protection API is the operator-gated follow-up).
 ### Fixed (enterprise-federation posture — boot gate self-attested + stale-policy hatch; #2911 items 1–2)
 
 - **`ai-memory doctor --posture enterprise-federation` no longer PASSes a process whose daemon would not refuse boot on later posture drift** ([#2911](https://github.com/alphaonedev/ai-memory-mcp/issues/2911) item 1). `evaluate()`'s 16 checks never read `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE`, so `enforce_at_boot_pre_runtime()` returning `Ok` when that env is unset was invisible to doctor. Check #17 now asserts the boot-refusal env is truthy (the same `is_truthy` reader the boot gate itself uses). Existing checks 1–16 keep their numbers (check #10 is still the pin-file row, reserved for item 3).
 - **`AI_MEMORY_FED_REQUIRE_POLICY_CURRENT=0` no longer escapes the certified posture** ([#2911](https://github.com/alphaonedev/ai-memory-mcp/issues/2911) item 2). The FED-RQ-03 stale-governance-policy refusal (`receive_auth::require_policy_current_enabled`, default-ON) was the only fail-closed `AI_MEMORY_FED_*` receive gate in neither `security_profile::KNOBS` nor the posture table. Check #18 calls the real reader; an explicit falsy token FAILs doctor and, when check #17 is armed, refuses boot. Crossroads: this is a posture check, not an `asi-hard` KNOBS pin — generic `asi-hard` without the enterprise posture still permits `=0`; that is the generic-vs-certified-set boundary. `docs/deploy/enterprise-federation.env` now names the knob so the boot banner echoes it.
+### Tests (cert removal-proof — `peer_enrolled_in_allowlist` individually proven; #2912)
+
+- **`peer_enrolled_in_allowlist` is now individually removal-proven on both
+  inbound lanes**, on the decisive hatch-open + unenrolled shape that the
+  pre-#2912 mapping missed. The cert harness previously mapped this
+  control onto `federated_write_outside_peer_scope_refused_2447`, whose
+  ENROLLED+SCOPED out-of-namespace write is refused by Layer 1 and never
+  reaches the predicate — mutating it to `return true;` left that test
+  GREEN (broken→rc=0). The new suite
+  (`tests/federation_peer_enrolled_2912.rs`) opens
+  `AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0` and sends a header-absent
+  `/sync/push` (the only HTTP-reachable unenrolled shape: a present-but-
+  unlisted `X-Peer-Id` is refused by the #1056 envelope before Layer 2)
+  so a broken predicate lets the write/delete LAND. Write-lane test is
+  the harness MAP guard; the deletions[] twin is a suite-level twin.
+  `src/federation/**` is untouched (cert-expiry implication for Task C /
+  #2915: this PR does not trip the watch).
+### Docs (at-a-glance v1.0.0 re-baseline + campaign stack reconciliation; #2913)
+
+- **`docs/at-a-glance.html` re-baselined to v1.0.0.** Retired the
+  v0.9-era "From One to a Million" / "500-50,000 users · 20-100 nodes"
+  / "FedRAMP-certified deployments" / "Five steps from laptop to
+  FedRAMP" copy. Scale personas now cite the certified 500–1000-agent /
+  ≤50-peer envelope as **ARCHITECTED, not MEASURED** (largest
+  real-mesh-measured federation = 2 nodes; USL deferred to
+  [#2438](https://github.com/alphaonedev/ai-memory-mcp/issues/2438)),
+  matching `docs/federation.md`. FedRAMP / IL5 is disclosed as **not
+  held / not claimed** (`docs/evidence.html` dialect). The page links
+  `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`.
+- **Campaign stack reconciliation** in
+  `docs/v1.0.0/test-campaign-2026-08-08-enterprise-cert/`: campaign
+  evidence is PG16 + AGE 1.6.0 + pgvector 0.8.4 (2-node DO mesh — the
+  only real multi-node mesh) / Track A/B recorded pgvector 0.8.6; the
+  enterprise-federation cert pins the **disjoint** PG18.4 + AGE 1.7.0
+  + pgvector 0.8.5 single-node CI stack (run 31601974424 at
+  `b80e7fff`, tree-identical to `e22bc93c`). Campaign results are not
+  rewritten as PG18. The two stacks are named as disjoint evidence.
+### Security (fixture hygiene — operator hostname removed from the frozen vectors; #2924)
+
+- **Re-minted every golden / CC0-conformance vector from SYNTHETIC
+  identities.** The committed hex vectors under `tests/golden/**` and
+  `conformance/vectors/**` carried the REAL operator agent identity
+  (an `ai:<tool>@<hostname>` token, plus a bare `host:<hostname>` token)
+  inside their signed pre-image bytes, so a hex-decode of e.g.
+  `conformance/vectors/signable_write_v2/blake3_digest_variant.hex`
+  disclosed the authoring machine's hostname — the same disclosure class
+  the cert-§5.4 evidence-bundle sanitization removed. (The offending
+  literals are deliberately not reproduced here; see the issue.) The fixture
+  identities are now RFC-2606-reserved synthetics
+  (`ai:example-agent@host.example`, `host:host.example`,
+  `ai:evil@host.example`), matching the repo's existing
+  `*.example` fixture convention and passing `validate_agent_id`'s
+  `[A-Za-z0-9_\-:@./]{1,128}` shape rule
+  ([#2924](https://github.com/alphaonedev/ai-memory-mcp/issues/2924)).
+  Because the records are domain-tag-bound and hash/signature-chained,
+  the change was made ONLY at the fixture-input constants and the
+  vectors were regenerated through the sanctioned pinned-encoder path
+  (`AI_MEMORY_REGEN_GOLDEN=1 cargo test --test signable_write_v2_golden
+  --test equivocation_proof_golden --test head_attestation_golden
+  --test subkey_cert_golden --test conformance_corpus`) — never
+  hand-edited. All paired expectations moved in lockstep: 6 golden
+  vectors, 26 corpus vectors, `conformance/manifest.json`
+  (`corpus_digest` `82fe21c8…` → `7da47d28…`, per-vector `length_bytes`,
+  and the re-signed Ed25519 detached signatures; the fixed-seed public
+  keys are unchanged, as expected), the `conformance/ROSETTA.md` §6
+  byte-by-byte worked-example dump, and the format-freeze doc's
+  Appendix A.4 element list. **No wire-format, domain-tag, encoding-rule
+  or verifier-semantics change** — the frozen v2 array profile is
+  untouched; only the fixture payload strings differ. Verified with the
+  non-Rust `conformance-readers-gate` (both readers 18/18 items, plus
+  the gate's 11-plant self-test) so the clean-room verifiers still
+  accept the valid vectors and still REJECT the tampered one.
 
 ### Docs (capability inventory re-derivation; #1938)
 
