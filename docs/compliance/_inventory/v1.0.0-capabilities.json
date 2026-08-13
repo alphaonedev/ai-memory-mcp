@@ -1,0 +1,1534 @@
+{
+  "$schema_comment": "ai-memory v1.0.0 NSA CSI capability inventory. Source-of-truth artefact re-derived for issue #1938 (cert \u00a78 minting condition (b)) by extending the Task I / #1153 method documented in docs/compliance/_inventory/v0.7.0-summary.md \u00a75. Same schema and per-row conventions as v0.7.0-capabilities.json. Every row is codegraph + grep verified against commit 580d8427 on release/v1.0.0. The v0.7.0 file is retained as a historical artefact.",
+  "ai_memory_version": "1.0.0",
+  "verification_timestamp_utc": "2026-08-13T01:44:42Z",
+  "verification_commit_sha": "580d8427bb4da887f7a25731792c55c4e49d56d6",
+  "verification_branch": "release/v1.0.0",
+  "derivation_method": "Extend #1153 Task I: codegraph_explore / codegraph_node for symbol location + call paths; pin-verify every cited file:line with `git show 580d8427:<path>`; grep for literal-text capture and SSOT consts (CURRENT_SCHEMA_VERSION, EXPECTED_*, FIELD_COUNT, HOOK_EVENTS_COUNT, MemoryLinkRelation::COUNT, tool_names::ALL). No generator existed in scripts/ or xtask; none was invented. Inherited 27 rows re-anchored; 19 v0.8\u2013v1.0 defensive layers added on the same Task I 'under-credited layer' convention.",
+  "prior_art": {
+    "original_inventory": "docs/compliance/_inventory/v0.7.0-capabilities.json",
+    "original_method": "docs/compliance/_inventory/v0.7.0-summary.md \u00a75 Reproducibility",
+    "original_issue": "#1153 Task I",
+    "original_commit": "4add7a8528d4c16d696b391ec6e2890269669a84",
+    "refresh_issue": "#1938"
+  },
+  "schema_version_sqlite": 89,
+  "schema_version_postgres": 89,
+  "parity_test": "tests/postgres_schema_parity.rs::schema_versions_match_across_adapters",
+  "schema_authority_source": "src/storage/migrations.rs:867 \u2014 const CURRENT_SCHEMA_VERSION: i64 = 89; src/store/postgres.rs:1019 \u2014 const CURRENT_SCHEMA_VERSION: i32 = 89",
+  "test_counts": {
+    "total_test_attributes": 11851,
+    "lib_tests": 7580,
+    "integration_tests": 4271,
+    "denominator_grep": "grep -rE '^\\s*#\\[(tokio::)?test\\]' --include='*.rs' tests/ src/ | wc -l",
+    "note": "Authoritative test-attribute count at 580d8427 (2026-08-13). v0.7.0 inventory recorded 6961 (4830 lib + 2131 integration)."
+  },
+  "mcp_tool_counts": {
+    "core_profile": 7,
+    "graph_profile": 19,
+    "admin_profile": 21,
+    "power_profile": 77,
+    "full_profile": 103,
+    "registered_tools_vec": 103,
+    "tool_names_all_len": 103,
+    "authority_source": "Profile::<name>().expected_tool_count() derived from Family::tool_names() slices in src/profile.rs: Core=7, Lifecycle=6, Graph=12, Governance=8, Power=70. core=[Core]=7; graph=[Core,Graph]=19; admin=[Core,Lifecycle,Governance]=21; power=[Core,Power]=77; full=Family::all() sum = tool_names::ALL.len() = 103. src/mcp/registry.rs::registered_tools() has 103 RegisteredTool::of::<\u2026> entries matching ALL. Pinned by profile_full_matches_registry_all / ALL-length pin.",
+    "note": "v0.7.0 inventory: core=7, graph=18, admin=21, power=30, full=74. Deltas: graph +memory_lineage (#1859); power absorbed the v0.8 Pillar-1 coordination surface + skills + archive/session/notify; full 74\u2192103."
+  },
+  "http_routes": {
+    "production_route_bindings": 94,
+    "unique_production_url_paths": 80,
+    "test_only_route_bindings": 3,
+    "test_only_routes": [
+      "/slow (h7_timeout_tests, #[cfg(test)])",
+      "/slow (admission_control_1733_tests helper router, #[cfg(test)])",
+      "/health (admission_control_1733_tests helper router, #[cfg(test)])"
+    ],
+    "authority_source": "src/lib.rs:345 EXPECTED_PRODUCTION_ROUTES_COUNT=94; :375 EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT=80; :355 EXPECTED_TEST_ROUTES_COUNT=3. Pinned by tests/route_count_invariant.rs.",
+    "verification_command": "awk '/\\.route\\(/{in=1}in&&/\"\\/[^\"]*\"/{match($0,/\"\\/[^\"]*\"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u | wc -l"
+  },
+  "cli_subcommands": {
+    "with_features_sal_postgres": 92,
+    "default_build": 90,
+    "sal_gated_subcommands": [
+      "Migrate",
+      "SchemaInit"
+    ],
+    "authority_source": "SSOT consts ai_memory::EXPECTED_CLI_SUBCOMMANDS_DEFAULT=90 + EXPECTED_CLI_SUBCOMMANDS_SAL=92 (src/lib.rs:415,434); mechanical parity test tests/cli_subcommand_count_invariant.rs; pub enum Command in src/daemon_runtime.rs. Migrate + SchemaInit gated #[cfg(feature = \"sal\")]."
+  },
+  "memory_struct": {
+    "field_count": 30,
+    "authority_source": "src/models/memory.rs:1097 \u2014 pub const FIELD_COUNT: usize = 30",
+    "fields_v0_7_0_additions": [
+      "reflection_depth",
+      "memory_kind",
+      "entity_id",
+      "persona_version",
+      "citations",
+      "source_uri",
+      "source_span",
+      "confidence_source",
+      "confidence_signals",
+      "confidence_decayed_at",
+      "version"
+    ],
+    "fields_added_after_v0_7_0": [
+      "lifecycle_state (v64 / #1709)",
+      "cid (v74 / #1825)",
+      "valid_from (v79 / #1834)",
+      "valid_until (v79 / #1834)"
+    ]
+  },
+  "memory_link_relation": {
+    "variant_count": 9,
+    "variants": [
+      "RelatedTo",
+      "Supersedes",
+      "Contradicts",
+      "DerivedFrom",
+      "ReflectsOn",
+      "DerivesFrom",
+      "DecomposesInto",
+      "DependsOn",
+      "Advances"
+    ],
+    "authority_source": "src/models/link.rs:188 (enum) / :306 (COUNT = 9)",
+    "note": "v0.7.0 inventory recorded 6. v63 extended the closed CHECK 6\u21929."
+  },
+  "memory_kind": {
+    "variant_count": 16,
+    "variants": [
+      "Observation",
+      "Reflection",
+      "Persona",
+      "Concept",
+      "Entity",
+      "Claim",
+      "Relation",
+      "Event",
+      "Conversation",
+      "Decision",
+      "Goal",
+      "Plan",
+      "Step",
+      "Told",
+      "Instruction",
+      "Intervention"
+    ],
+    "authority_source": "src/models/memory.rs:64 (pub enum MemoryKind)",
+    "note": "v0.7.0 inventory recorded 10. +Goal/Plan/Step (#1709); +Told/Instruction/Intervention (#1945)."
+  },
+  "hook_events": {
+    "variant_count": 22,
+    "authority_source": "src/hooks/events.rs:92 + src/config.rs:1051 HOOK_EVENTS_COUNT=22",
+    "live_events_at_v1_0_0": [
+      "PreStore",
+      "PostStore",
+      "PostRecall",
+      "PostSearch",
+      "PreDelete",
+      "PostDelete",
+      "PrePromote",
+      "PostPromote",
+      "PreLink",
+      "PostLink",
+      "PreConsolidate",
+      "PostConsolidate",
+      "PreGovernanceDecision",
+      "PostGovernanceDecision",
+      "OnIndexEviction",
+      "PreRecallExpand",
+      "PreReflect",
+      "PostReflect",
+      "PreCompaction",
+      "OnCompactionRollback",
+      "PreSignalSend",
+      "PostSignalAck"
+    ],
+    "removed_never_fired": [
+      "PreRecall",
+      "PreSearch",
+      "PreArchive",
+      "PreTranscriptStore",
+      "PostTranscriptStore"
+    ],
+    "note": "v0.7.0 inventory recorded 25. The drop is the #2637/#2758 removal of five never-dispatched events, plus the addition of PreSignalSend/PostSignalAck.",
+    "operator_config_path": "~/.config/ai-memory/hooks.toml (default-off)"
+  },
+  "llm_backend_defaults": {
+    "xai": "grok-4.3",
+    "openai": "gpt-5",
+    "anthropic": "claude-opus-4.7",
+    "gemini": "gemini-2.0-flash",
+    "deepseek": "deepseek-chat",
+    "kimi_moonshot": "moonshot-v1-8k",
+    "qwen_dashscope": "qwen-max",
+    "mistral": "mistral-large-latest",
+    "groq": "llama-3.3-70b-versatile",
+    "together": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    "cerebras": "llama-3.3-70b",
+    "openrouter": "openai/gpt-5",
+    "fireworks": "accounts/fireworks/models/llama-v3p3-70b-instruct",
+    "lmstudio": "local-model (crate::llm::LOCAL_SERVER_MODEL_PLACEHOLDER)",
+    "vllm": "local-model (crate::llm::LOCAL_SERVER_MODEL_PLACEHOLDER; added #1709)",
+    "ollama_default_fallback": "gemma3:4b",
+    "authority_source": "src/config.rs:6868 \u2014 fn backend_default_model"
+  },
+  "memory_portability_spec": {
+    "current_version_stamp": "v1 (Draft v1, originally v0.6.3.1; carried through v1.0.0)",
+    "files_on_disk": [
+      "docs/spec/v1.md (25061 bytes at 580d8427)",
+      "docs/spec/v1.html (7149 bytes at 580d8427)"
+    ],
+    "canonical_url": "https://alphaonedev.github.io/ai-memory-mcp/spec/v1/",
+    "note": "Originating brief referenced 'v1.1' \u2014 authoritative is v1 per the document's own status line."
+  },
+  "longmemeval_benchmark": {
+    "r_at_5_keyword_binary_faithful": 0.964,
+    "r_at_10_keyword_binary_faithful": 0.984,
+    "r_at_20_keyword_binary_faithful": 0.996,
+    "r_at_5_semantic_binary_faithful": 0.968,
+    "r_at_5_smart_shadow_gemma4": 0.972,
+    "r_at_10_smart_shadow_gemma4": 0.996,
+    "r_at_20_smart_shadow_gemma4": 0.998,
+    "retired_headline_r_at_5_smart_gemma3_4b": 0.978,
+    "dataset": "ICLR 2025 LongMemEval-S (500 questions, 6 categories)",
+    "harness_path": "benchmarks/longmemeval/",
+    "result_artefact_pointer": "benchmarks/longmemeval/results.md",
+    "authority_source": "README.md LongMemEval section (2026-08-11 #2888 restatement); #1975 ruling",
+    "honesty_note": "v0.7.0 inventory published 0.978/0.990/0.998 as the smart-tier result. Those are a retired shadow-harness Gemma-3-4B headline (#1975). Do not compare binary-faithful and shadow numbers across harnesses."
+  },
+  "capabilities": [
+    {
+      "id": "form_4_fact_provenance",
+      "display_name": "Form 4 fact-provenance (citations + source URI + byte-range span)",
+      "addresses_nsa_concerns": [
+        "insecure_serialization",
+        "audit_logs",
+        "tool_parameter_injection"
+      ],
+      "addresses_nsa_recommendations": [
+        "validate_parameters",
+        "design_for_boundaries",
+        "instrument_for_logging"
+      ],
+      "verified_at_paths": [
+        "src/models/memory.rs:973 (Memory.citations: Vec<Citation>)",
+        "src/models/memory.rs:982 (Memory.source_uri: Option<String>)",
+        "src/models/memory.rs:991 (Memory.source_span: Option<SourceSpan>)",
+        "src/models/memory.rs:1252 (Citation envelope struct)",
+        "src/models/memory.rs:1270 (SourceSpan envelope)",
+        "src/validate.rs:851 (validate_citation)",
+        "src/validate.rs:907 (validate_source_uri)",
+        "src/validate.rs:1030 (validate_source_span)"
+      ],
+      "factual_description": "Every memory row carries fact-grain Citation envelopes (uri, accessed_at, optional hash, optional span), a first-class source_uri pointer (uri:/doc:/file: schemes), and an optional byte-range source_span ({start, end}) for atom-grain provenance. The substrate validates every citation, URI, and span at the write boundary via the RequestValidator surface (#966). Unchanged at v1.0.0; line numbers re-anchored at 580d8427.",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "schema_anchor": "v38 (citations + source_uri + source_span columns added)",
+      "issue_references": [
+        "#757",
+        "#758"
+      ],
+      "verified_by_codegraph": "codegraph_node Memory at src/models/memory.rs \u2014 FIELD_COUNT=30; Citation at :1252",
+      "verified_by_grep": [
+        "grep -n 'pub citations:' src/models/memory.rs \u2192 line 973",
+        "grep -n 'pub source_uri:' src/models/memory.rs \u2192 line 982",
+        "grep -n 'pub source_span:' src/models/memory.rs \u2192 line 991"
+      ],
+      "originating_brief_correction": "Originating brief referenced 'atom_span' \u2014 actual field name is 'source_span'."
+    },
+    {
+      "id": "form_6_memory_kind",
+      "display_name": "Form 6 typed memory-kind discriminator",
+      "addresses_nsa_concerns": [
+        "insecure_serialization",
+        "inconsistent_behaviors"
+      ],
+      "addresses_nsa_recommendations": [
+        "validate_parameters",
+        "design_for_boundaries"
+      ],
+      "verified_at_paths": [
+        "src/models/memory.rs:64 (pub enum MemoryKind, 16 variants)",
+        "src/models/memory.rs:937 (Memory.memory_kind field)",
+        "src/models/memory.rs:707 (METADATA_KIND_PROVENANCE_KEY = kind_provenance)"
+      ],
+      "factual_description": "Every memory carries a typed MemoryKind discriminator. At v0.7.0 the closed set was 10 variants (Observation/Reflection/Persona/Concept/Entity/Claim/Relation/Event/Conversation/Decision). v0.8.0 Pillar-2 typed-cognition (#1709) added Goal/Plan/Step; v1.0.0 epistemic typing (#1945) added Told/Instruction/Intervention \u2014 16 variants at 580d8427. kind_provenance (schema v79) records HOW the kind was assigned (declared/channel_derived/regex/llm) as unsigned metadata.",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "schema_anchor": "v30 (memory_kind); v79 (kind_provenance column + metadata carrier)",
+      "issue_references": [
+        "#758",
+        "L1-6",
+        "#1709",
+        "#1945"
+      ],
+      "verified_by_codegraph": "codegraph_node MemoryKind at src/models/memory.rs:64 \u2014 16 variants confirmed",
+      "note": "Delta vs v0.7.0: 10 \u2192 16 variants. The original 10 remain; six additive variants."
+    },
+    {
+      "id": "form_7_agent_external_governance",
+      "display_name": "Form 7 + L1-6 agent-EXTERNAL governance rules engine",
+      "addresses_nsa_concerns": [
+        "access_control",
+        "poor_approval_workflows",
+        "tool_parameter_injection",
+        "tool_invocation_path_confusion"
+      ],
+      "addresses_nsa_recommendations": [
+        "sandbox_tool_execution",
+        "validate_parameters",
+        "design_for_boundaries"
+      ],
+      "verified_at_paths": [
+        "src/governance/agent_action.rs:129 (pub enum AgentAction)",
+        "src/governance/agent_action.rs:881 (check_agent_action)",
+        "src/governance/rules_store.rs (substrate rules engine)",
+        "src/governance/wire_check.rs:93 (check)"
+      ],
+      "factual_description": "The substrate consults the operator-signed AgentAction rules engine on every write that proposes an agent-EXTERNAL action. Rules are Ed25519-signed by the operator and stored as substrate rows. Default posture flipped to enforce in v0.7.0 (#1054 fail-CLOSED): writes that fail rule consultation are refused unless the operator opts in to the fail-OPEN escape hatch. Live at v1.0.0; check_agent_action lives at src/governance/agent_action.rs:881 (moved from a crate-root re-export).",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "schema_anchor": "governance_rules + permissions tables; v66 added escalate severity",
+      "issue_references": [
+        "#691",
+        "L1-6",
+        "#1054"
+      ],
+      "verified_by_codegraph": "codegraph_node AgentAction at src/governance/agent_action.rs:129"
+    },
+    {
+      "id": "form_7_canonical_bytes_signing",
+      "display_name": "Form 7 canonical-bytes Ed25519 signing discipline",
+      "addresses_nsa_concerns": [
+        "insecure_serialization",
+        "inconsistent_behaviors",
+        "audit_logs"
+      ],
+      "addresses_nsa_recommendations": [
+        "sign_and_verify_mcp_messages",
+        "validate_parameters"
+      ],
+      "verified_at_paths": [
+        "src/governance/rules_store.rs:844 (canonical_bytes_for_signing)",
+        "src/governance/rules_store.rs:870 (verify_rule_signature)",
+        "src/governance/rules_store.rs:1317 (canonical_bytes_for_signing_includes_enabled regression test)",
+        "src/governance/rules_store.rs:1334 (canonical_bytes_for_signing_excludes_signature_and_attest_level regression test)"
+      ],
+      "factual_description": "Every signed governance rule is hashed over a canonical byte representation that explicitly includes the enabled flag (preventing enable-after-sign tampering) and explicitly excludes the signature itself plus the attest_level (preventing self-referential signature loops). Regression tests pin the canonical-bytes invariant. Re-anchored at 580d8427 (function moved 541\u2192844).",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "issue_references": [
+        "PR #820",
+        "commit 3cdec59"
+      ],
+      "verified_by_codegraph": "codegraph_search canonical_bytes_for_signing \u2192 src/governance/rules_store.rs:844"
+    },
+    {
+      "id": "v4_signed_events_chain",
+      "display_name": "V-4 signed-events cross-row hash chain",
+      "addresses_nsa_concerns": [
+        "audit_logs",
+        "insecure_serialization"
+      ],
+      "addresses_nsa_recommendations": [
+        "sign_and_verify_mcp_messages",
+        "instrument_for_logging"
+      ],
+      "verified_at_paths": [
+        "src/signed_events.rs:486 (pub struct SignedEvent)",
+        "src/signed_events.rs:500 (SignedEvent.prev_hash)",
+        "src/signed_events.rs:506 (SignedEvent.sequence)",
+        "src/signed_events.rs:519 (SignedEvent.cause_hash \u2014 v73 / #1822 G5a)",
+        "src/cli/verify_signed_events.rs (CLI verifier)",
+        "src/cli/verify_audit_trail.rs (verify-audit-trail, PE-8)"
+      ],
+      "factual_description": "Every append to the signed_events audit table carries a SHA-256 prev_hash referencing the prior row's canonical bytes plus a monotonic sequence counter. Tampering with row N's content breaks row N+1's prev_hash verification; tampering with sequence breaks the contiguity check. v0.9.0 G5a (#1822) added additive nullable cause_hash (PRESENT-ONLY fold so legacy NULL-cause rows hash byte-identically). CLI verifiers: ai-memory verify-signed-events-chain and ai-memory verify-audit-trail (witness / role-separation / rollback-evidence checks).",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "schema_anchor": "v34 (prev_hash+sequence); v73 (cause_hash)",
+      "issue_references": [
+        "#698 V-4 closeout",
+        "#1822"
+      ],
+      "verified_by_codegraph": "codegraph_node SignedEvent at src/signed_events.rs:486",
+      "note": "Delta vs v0.7.0: cause_hash column; verify-audit-trail CLI; witness/role-separation/rollback-evidence knobs (see new rows)."
+    },
+    {
+      "id": "seven_gap_versioned_writes",
+      "display_name": "Seven-gap Gap 1: optimistic-concurrency versioned writes",
+      "addresses_nsa_concerns": [
+        "inconsistent_behaviors",
+        "audit_logs"
+      ],
+      "addresses_nsa_recommendations": [
+        "validate_parameters",
+        "design_for_boundaries"
+      ],
+      "verified_at_paths": [
+        "src/models/memory.rs:1025 (Memory.version: i64)",
+        "src/storage/mod.rs:2932 (VersionConflict envelope)",
+        "src/storage/mod.rs:3100 (update_with_expected_version)",
+        "src/store/postgres.rs:5488 (PostgresStore::update_with_expected_version)",
+        "tests/http_if_match_concurrency.rs (If-Match 409 / legacy LWW)"
+      ],
+      "factual_description": "Every memory row carries a monotonic version counter bumped on every storage update. Concurrent updates passing expected_version race exactly one winner; the loser receives a typed 409 CONFLICT envelope naming the current stored version. HTTP wire surface honors If-Match in bare and ETag-quoted forms; missing If-Match preserves last-write-wins for backwards compat. Live on both sqlite and postgres adapters at v1.0.0.",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "schema_anchor": "v45 (memories.version BIGINT NOT NULL DEFAULT 1)",
+      "issue_references": [
+        "#884",
+        "#1628"
+      ],
+      "verified_by_codegraph": "codegraph_search update_with_expected_version"
+    },
+    {
+      "id": "seven_gap_source_uri",
+      "display_name": "Seven-gap Gap 2: source_uri first-class column",
+      "addresses_nsa_concerns": [
+        "insecure_serialization",
+        "audit_logs"
+      ],
+      "addresses_nsa_recommendations": [
+        "validate_parameters",
+        "design_for_boundaries"
+      ],
+      "verified_at_paths": [
+        "src/models/memory.rs:982 (Memory.source_uri: Option<String>)",
+        "src/validate.rs:907 (validate_source_uri)"
+      ],
+      "factual_description": "Every memory may carry a first-class URI pointer to its source artefact. Accepted schemes: uri: (HTTP URL), doc: (substrate doc id), file: (filesystem path). Validator surface lives at crate::validate::validate_source_uri.",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "schema_anchor": "v38 (memories.source_uri TEXT NULL + idx_memories_source_uri)",
+      "issue_references": [
+        "#885",
+        "#757"
+      ]
+    },
+    {
+      "id": "seven_gap_causal_recall",
+      "display_name": "Seven-gap Gap 3: causal recall observation tracking",
+      "addresses_nsa_concerns": [
+        "audit_logs",
+        "inconsistent_behaviors"
+      ],
+      "addresses_nsa_recommendations": [
+        "instrument_for_logging",
+        "filter_monitor_output_pipelines"
+      ],
+      "verified_at_paths": [
+        "src/observations/mod.rs:65 (record_recall)",
+        "src/observations/mod.rs:159 (record_recall_with_identity)",
+        "src/mcp/tools/recall.rs (record_recall_observations recall-side population)",
+        "src/mcp/tools/recall_observations.rs (memory_recall_observations MCP tool)",
+        "src/storage/mod.rs:2775 (fold_recall_accesses \u2014 v77 / #1869)"
+      ],
+      "factual_description": "Every memory_recall invocation writes a recall_observations row keyed by a UUIDv4 recall_id, recording which candidates were considered, scored, and surfaced. The memory_recall_observations MCP tool queries the observation log by recall_id. At v1.0.0 (#1869/#1953) recall is unconditionally PURE: it mutates zero memories rows; the ledger is the only recall-time write (rows land folded=0) and a periodic FOLD job applies the legacy access ladders. See also capability pure_recall_access_fold.",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "schema_anchor": "v58 (agent_id+namespace on ledger); v77 (folded column)",
+      "issue_references": [
+        "#886",
+        "#1869",
+        "#1953"
+      ],
+      "note": "Delta vs v0.7.0: recall no longer sync-touches memories (P0-1 purity)."
+    },
+    {
+      "id": "seven_gap_confidence_capture",
+      "display_name": "Seven-gap Gap 4: confidence tier capture",
+      "addresses_nsa_concerns": [
+        "inconsistent_behaviors",
+        "audit_logs"
+      ],
+      "addresses_nsa_recommendations": [
+        "validate_parameters",
+        "instrument_for_logging"
+      ],
+      "verified_at_paths": [
+        "src/models/memory.rs:1312 (pub enum ConfidenceTier)",
+        "tests/capabilities_v3.rs (cap_v3_response_carries_schema_version_and_summary)"
+      ],
+      "factual_description": "Memories carry a typed ConfidenceTier enum surfaced via the capabilities envelope. Downstream consumers may filter by confidence tier when applying provenance gates. Live at v1.0.0.",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "issue_references": [
+        "#887"
+      ]
+    },
+    {
+      "id": "seven_gap_reciprocal_supersede",
+      "display_name": "Seven-gap Gap 5: reciprocal supersede archival",
+      "addresses_nsa_concerns": [
+        "audit_logs",
+        "inconsistent_behaviors"
+      ],
+      "addresses_nsa_recommendations": [
+        "instrument_for_logging",
+        "filter_monitor_output_pipelines"
+      ],
+      "verified_at_paths": [
+        "src/storage/mod.rs:3488 (update_with_archive_on_supersede)",
+        "src/store/postgres.rs (postgres adapter archive path)",
+        "src/autonomy.rs (forget_if_superseded autonomy path)"
+      ],
+      "factual_description": "When a memory supersedes a prior version, the superseded row is archived into archived_memories with archive_reason='superseded' rather than overwritten. The reciprocal forward pointer preserves the audit chain; archived rows remain queryable. v70 (#1771) additionally snapshots memory_links into archived_memory_links so archive\u2192restore is lossless for edges.",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "issue_references": [
+        "#888",
+        "#1771"
+      ],
+      "note": "Delta vs v0.7.0: archived_memory_links (v70) preserves edges across archive/restore."
+    },
+    {
+      "id": "seven_gap_source_query",
+      "display_name": "Seven-gap Gap 6: source_uri filtered query",
+      "addresses_nsa_concerns": [
+        "audit_logs",
+        "access_control"
+      ],
+      "addresses_nsa_recommendations": [
+        "validate_parameters",
+        "design_for_boundaries"
+      ],
+      "verified_at_paths": [
+        "src/mcp/tools/search.rs (memory_search source_uri parameter)",
+        "src/storage/mod.rs:6533 (list_by_source_uri)",
+        "src/storage/mod.rs:6390 (search_with_source_uri)"
+      ],
+      "factual_description": "The memory_search MCP tool accepts a source_uri parameter validated via validate_source_uri at the wire boundary. Empty query routes to list_by_source_uri (index-only); combined with FTS routes to search_with_source_uri.",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "schema_anchor": "v38 (idx_memories_source_uri)",
+      "issue_references": [
+        "#889"
+      ]
+    },
+    {
+      "id": "seven_gap_verbose_decoration",
+      "display_name": "Seven-gap Gap 7: verbose provenance decoration",
+      "addresses_nsa_concerns": [
+        "audit_logs",
+        "inconsistent_behaviors"
+      ],
+      "addresses_nsa_recommendations": [
+        "instrument_for_logging",
+        "filter_monitor_output_pipelines"
+      ],
+      "verified_at_paths": [
+        "src/mcp/tools/recall.rs:610 (decorate_memory_many \u2014 successor of decorate_memory)",
+        "tests/recall_decoration.rs (gap7_verbose_provenance_false_collapses_to_legacy_shape)"
+      ],
+      "factual_description": "The recall pipeline accepts an opt-in verbose_provenance flag that adds Form 4/5/6 provenance signals to every recalled memory envelope. When false (default), the response collapses to the legacy wire shape. The v0.7.0 symbol decorate_memory was batched into decorate_memory_many (src/mcp/tools/recall.rs:610) \u2014 same contract, amortised attestation lookup. v0.8.0 #1709 added provenance_tier + scheduled_validity decorations on the verbose path.",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "issue_references": [
+        "#890",
+        "#1709"
+      ],
+      "note": "Symbol rename: decorate_memory \u2192 decorate_memory_many. Documented in the #2629 claims register.",
+      "renamed_from": "decorate_memory"
+    },
+    {
+      "id": "capabilities_v3_envelope",
+      "display_name": "Capabilities v3 negotiation envelope",
+      "addresses_nsa_concerns": [
+        "inconsistent_behaviors",
+        "misconfigurations"
+      ],
+      "addresses_nsa_recommendations": [
+        "design_for_boundaries",
+        "validate_parameters",
+        "instrument_for_logging"
+      ],
+      "verified_at_paths": [
+        "src/store/mod.rs:826 (schema_version method on SAL trait)",
+        "src/store/sqlite.rs:118 (sqlite impl)",
+        "src/store/postgres.rs:15580 (postgres impl)",
+        "tests/capabilities_v3.rs",
+        "tests/s75_capabilities_db_schema_version.rs"
+      ],
+      "factual_description": "The capabilities envelope carries schema_version=3 with application blocks (Form 4/5/6). Clients may pin to v1 or v2 via accept= on memory_capabilities MCP or Accept-Capabilities HTTP header. Backwards compat preserved. v1.0.0 #2400 corrected the compaction block from planned=true under-claim to shipped-not-planned (ConsolidationPass landed at v0.8.0 #1749).",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "schema_anchor": "Capabilities envelope schema_version = '3'",
+      "issue_references": [
+        "#762",
+        "A5",
+        "#2400"
+      ],
+      "note": "Delta vs v0.7.0: compaction reported as shipped; enabled threads the live opt-in flag."
+    },
+    {
+      "id": "mtls_a2a_transport",
+      "display_name": "mTLS A2A transport layer",
+      "addresses_nsa_concerns": [
+        "token_security",
+        "access_control",
+        "tool_invocation_path_confusion"
+      ],
+      "addresses_nsa_recommendations": [
+        "sign_and_verify_mcp_messages",
+        "design_for_boundaries",
+        "validate_parameters"
+      ],
+      "verified_at_paths": [
+        "src/tls.rs:340 (load_mtls_rustls_config \u2014 empty allowlist refuses)",
+        "src/tls.rs (FED_REQUIRE_SERVER_VERIFY / select_sync_tls_mode \u2014 #2448)",
+        "src/tls.rs (validate_peer_url_scheme \u2014 #2477 plaintext-peer refusal)",
+        "src/cli/sync.rs (build_sync_client)"
+      ],
+      "factual_description": "The federation sync daemon refuses to start without mTLS unless an explicit insecure flag is set. Peer certificates are validated against an operator-supplied allowlist; an empty allowlist refuses every peer. v1.0.0 added AI_MEMORY_FED_REQUIRE_SERVER_VERIFY (default ON \u2014 accept-any server cert is no longer reachable from --insecure-skip-server-verify alone) and AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS (default unset \u2014 http:// to a non-loopback peer is a whole-boot refusal). Both are pinned by the asi-hard posture.",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "issue_references": [
+        "#1678",
+        "#2448",
+        "#2477"
+      ],
+      "note": "Delta vs v0.7.0: outbound server-verify required by default; plaintext non-loopback peers refused."
+    },
+    {
+      "id": "ed25519_agent_attestation",
+      "display_name": "Per-agent Ed25519 cryptographic attestation",
+      "addresses_nsa_concerns": [
+        "token_security",
+        "access_control",
+        "tool_invocation_path_confusion"
+      ],
+      "addresses_nsa_recommendations": [
+        "sign_and_verify_mcp_messages",
+        "design_for_boundaries"
+      ],
+      "verified_at_paths": [
+        "src/identity/attest.rs:114 (require_agent_attestation_for \u2014 surface-scoped)",
+        "src/identity/attest.rs:280 (persist_write_signature)",
+        "src/governance/rules_store.rs:844 (canonical_bytes_for_signing)",
+        "src/daemon_runtime.rs:297 (Command::Identity)",
+        "src/signed_events.rs (per-row sig column)"
+      ],
+      "factual_description": "Every agent may carry an Ed25519 keypair generated via ai-memory identity. Outbound writes may persist metadata.write_signature over the SignableWrite envelope; inbound federation verifies against the attributed author's locally-enrolled key. AI_MEMORY_REQUIRE_AGENT_ATTESTATION is surface-scoped at v1.0.0 (#1985): HTTP-direct REQUIRED by default, MCP/CLI permissive (operator-as-actor). A presented signature is always verified; the flag only governs unsigned-write disposition. Hardware-backed key storage remains out of OSS scope.",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "issue_references": [
+        "#626",
+        "#1751",
+        "#1985",
+        "#1801",
+        "#1954"
+      ],
+      "note": "Delta vs v0.7.0: persist_write_signature + federated REQUIRE_WRITE_SIG default-ON; surface-scoped store attestation."
+    },
+    {
+      "id": "namespace_isolation",
+      "display_name": "Per-namespace governance + standard policy isolation",
+      "addresses_nsa_concerns": [
+        "access_control",
+        "inconsistent_behaviors",
+        "misconfigurations"
+      ],
+      "addresses_nsa_recommendations": [
+        "design_for_boundaries",
+        "sandbox_tool_execution"
+      ],
+      "verified_at_paths": [
+        "src/daemon_runtime.rs:240 (Command::Namespace)",
+        "src/cli/namespace.rs (set-standard/get-standard/clear-standard)",
+        "src/validate.rs (validate_namespace)",
+        "src/federation/receive_auth.rs:1008 (inbound_write_namespace_authorized \u2014 #2447)"
+      ],
+      "factual_description": "Every memory carries a namespace string. Each namespace may carry a standard policy memory pointer (Batman Form 2 + Form 6). Hierarchical namespaces (slash-separated) are first-class at v1.0.0 \u2014 the v0.7.0 inventory's 'no slashes' claim is retired. Federation inbound writes are confined to the peer's declared allowed_namespaces (#2447 Layer 1 always-on; Layer 2 governed by AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE, default ON for enrolled-unscoped peers).",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "schema_anchor": "v36 (namespace_standards)",
+      "issue_references": [
+        "#800",
+        "#2447",
+        "#2488",
+        "#2478",
+        "#2479"
+      ],
+      "note": "See also new row federation_namespace_confinement.",
+      "originating_brief_correction": "v0.7.0 inventory said namespaces reject slashes. Hierarchical namespaces with / are valid at v1.0.0."
+    },
+    {
+      "id": "federation_push_dlq",
+      "display_name": "Federation push dead-letter queue (#933)",
+      "addresses_nsa_concerns": [
+        "denial_of_service",
+        "audit_logs",
+        "inconsistent_behaviors"
+      ],
+      "addresses_nsa_recommendations": [
+        "instrument_for_logging",
+        "design_for_boundaries"
+      ],
+      "verified_at_paths": [
+        "src/federation/push_dlq.rs:47 (MAX_REPLAY_ATTEMPTS)",
+        "src/federation/push_dlq.rs:339 (spawn_replay_federation_push_dlq)",
+        "src/federation/push_dlq.rs:1095 (refresh_depth_gauge)",
+        "tests/federation_dlq_replay.rs"
+      ],
+      "factual_description": "When a federation push to a peer fails, the push is enqueued to federation_push_dlq with a retry counter. A background replay loop drains the DLQ with exponential backoff up to MAX_REPLAY_ATTEMPTS; depth is exported as a Prometheus gauge. Adaptive batch via AI_MEMORY_FED_DLQ_REPLAY_MAX_BATCH (#1579 B5). Cause-labeled quarantine counter (closed set including unenrolled_author_strict + namespace_probe_unresolvable).",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "schema_anchor": "v48 (federation_push_dlq)",
+      "issue_references": [
+        "#933",
+        "#1578",
+        "#1579",
+        "#1544"
+      ]
+    },
+    {
+      "id": "track_g_hook_pipeline",
+      "display_name": "Track G programmable hook pipeline",
+      "addresses_nsa_concerns": [
+        "access_control",
+        "poor_approval_workflows",
+        "audit_logs"
+      ],
+      "addresses_nsa_recommendations": [
+        "sandbox_tool_execution",
+        "filter_monitor_output_pipelines",
+        "instrument_for_logging"
+      ],
+      "verified_at_paths": [
+        "src/hooks/events.rs:92 (pub enum HookEvent)",
+        "src/config.rs:1051 (HOOK_EVENTS_COUNT = 22)",
+        "src/hooks/mod.rs (decision contract: Allow / Modify / Deny / AskUser)"
+      ],
+      "factual_description": "The substrate fires hook events at memory lifecycle transitions. HOOK_EVENTS_COUNT is 22 at v1.0.0 (src/config.rs:1051), down from the v0.7.0 inventory's 25: #2637+#2758 removed five never-fired events (PreRecall, PreSearch, PreArchive, PreTranscriptStore, PostTranscriptStore) after they were catalogued but never dispatched; v0.8.0 added PreSignalSend + PostSignalAck for the coordination substrate. Hooks fire only when configured. Decision contract supports veto (Deny), modification (Modify), and human-approval gating (AskUser). PE-1 (#1734) + #1885/#1924 wired required-event presence enforcement (AI_MEMORY_HOOKS_ENFORCE_MODE).",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "issue_references": [
+        "#1734",
+        "#1885",
+        "#1924",
+        "#2637",
+        "#2758"
+      ],
+      "verified_by_codegraph": "codegraph_node HookEvent at src/hooks/events.rs:92 \u2014 22 variants; HOOK_EVENTS_COUNT=22",
+      "note": "Delta vs v0.7.0: 25 \u2192 22. The drop is the removal of never-fired events, not a coverage loss of live hooks. Presence enforcement is now live on MCP and HTTP write paths."
+    },
+    {
+      "id": "chaos_tested_convergence",
+      "display_name": "Chaos-tested federation convergence",
+      "addresses_nsa_concerns": [
+        "denial_of_service",
+        "inconsistent_behaviors"
+      ],
+      "addresses_nsa_recommendations": [
+        "filter_monitor_output_pipelines",
+        "instrument_for_logging"
+      ],
+      "verified_at_paths": [
+        "tests/federation_scale.rs (federation chaos suite)",
+        "docs/v0.7.0/test-campaign-* (campaign artefacts)",
+        "docs/v1.0.0/test-campaign-2026-08-08-enterprise-cert/ (v1.0.0 campaign \u2014 2-node DO mesh)"
+      ],
+      "factual_description": "Federation convergence is tested under chaos conditions in tests/federation_scale.rs. A campaign-artefact convergence threshold lives in operator campaign documentation, not as a code-side constant. Largest real-mesh-measured federation at the v1.0.0 cert pin is 2 nodes (docs/federation.md). The 500-1000-agent / \u226450-peer envelope is a derived topology ceiling \u2014 ARCHITECTED, not MEASURED (#2438).",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "honesty_note": "Originating brief's \u22650.995 figure is campaign-artefact-tracked, not code-pinned. Largest measured mesh = 2 nodes. Do not read architected ceilings as measured capacity."
+    },
+    {
+      "id": "token_budget_guards",
+      "display_name": "cl100k_base token budget guards",
+      "addresses_nsa_concerns": [
+        "denial_of_service",
+        "tool_parameter_injection"
+      ],
+      "addresses_nsa_recommendations": [
+        "validate_parameters",
+        "design_for_boundaries",
+        "sandbox_tool_execution"
+      ],
+      "verified_at_paths": [
+        "tests/token_budget_guard.rs:77 (VERBOSE_FULL_PROFILE_CEILING_TOKENS = 25_000)",
+        "tests/token_budget_guard.rs:87 (TRIMMED_FULL_PROFILE_CEILING_TOKENS = 11_000)",
+        "src/storage/mod.rs:6719 (count_tokens_cl100k)",
+        "tests/budget_tokens.rs (cl100k_tokenizer_is_deterministic)"
+      ],
+      "factual_description": "The MCP wire surface is bounded by cl100k_base token ceilings. The trimmed bare-wire ceiling holds tools/list under 11_000 tokens (strip_docs_from_tools). The verbose-surface ceiling is 25_000 at v1.0.0 (raised 22K\u219225K when #2024 added two skill tools). Deterministic tokenization pinned by cl100k_tokenizer_is_deterministic.",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "note": "Delta vs v0.7.0: verbose ceiling 22_000 \u2192 25_000 to match the 103-tool full profile."
+    },
+    {
+      "id": "memory_portability_spec",
+      "display_name": "Memory Portability Spec v1",
+      "addresses_nsa_concerns": [
+        "insecure_serialization",
+        "inconsistent_behaviors"
+      ],
+      "addresses_nsa_recommendations": [
+        "choose_supported_mcp_projects",
+        "design_for_boundaries"
+      ],
+      "verified_at_paths": [
+        "docs/spec/v1.md (24.5 KB Markdown source-of-truth; 25061 bytes at 580d8427)",
+        "docs/spec/v1.html (published version; 7149 bytes)"
+      ],
+      "factual_description": "The Memory Portability Spec defines an export envelope any ai-memory deployment can produce and any ai-memory deployment can ingest without data loss. Specification version v1 (Draft v1, originally v0.6.3.1; carried forward through v1.0.0). Multi-implementation interop remains a future deliverable.",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "originating_brief_correction": "Originating brief referenced v1.1 \u2014 authoritative version stamp is v1.",
+      "canonical_url": "https://alphaonedev.github.io/ai-memory-mcp/spec/v1/"
+    },
+    {
+      "id": "request_validator_input_validation",
+      "display_name": "RequestValidator DTO-bundled input validation surface",
+      "addresses_nsa_concerns": [
+        "tool_parameter_injection",
+        "insecure_serialization",
+        "inconsistent_behaviors",
+        "access_control"
+      ],
+      "addresses_nsa_recommendations": [
+        "validate_parameters",
+        "design_for_boundaries"
+      ],
+      "verified_at_paths": [
+        "src/validate.rs:1504 (pub struct RequestValidator)",
+        "src/validate.rs:1113 (validate_create free fn)",
+        "src/validate.rs:1230 (validate_memory)",
+        "src/validate.rs:1288 (validate_update)"
+      ],
+      "factual_description": "Every wire-entry layer (HTTP handlers, MCP tools, CLI subcommands) routes DTO-bundling validation through pub struct RequestValidator. Typed ValidationError { field, reason } envelope. At v1.0.0 the create funnel also validates kind, claim-bitemporal valid_from/valid_until (#1834/#2258), and metadata.scope (#2633).",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "issue_references": [
+        "#966",
+        "#1467",
+        "#2258",
+        "#2633"
+      ],
+      "verified_by_codegraph": "codegraph_node RequestValidator at src/validate.rs:1504"
+    },
+    {
+      "id": "dos_multi_layer_defense",
+      "display_name": "Multi-layer denial-of-service hardening",
+      "addresses_nsa_concerns": [
+        "denial_of_service",
+        "tool_parameter_injection"
+      ],
+      "addresses_nsa_recommendations": [
+        "design_for_boundaries",
+        "validate_parameters",
+        "filter_monitor_output_pipelines",
+        "instrument_for_logging"
+      ],
+      "verified_at_paths": [
+        "src/mcp/registry.rs tool_names::MEMORY_QUOTA_STATUS (K8 quota)",
+        "tests/token_budget_guard.rs (cl100k_base wire ceilings)",
+        "src/subscriptions.rs (HMAC-mandatory fail-CLOSED webhook dispatch, R3-S1.HMAC)",
+        "src/subscriptions.rs (SSRF guard + DNS fail-CLOSED, #1053)",
+        "src/federation/push_dlq.rs:47 (MAX_REPLAY_ATTEMPTS)",
+        "src/lib.rs:87 (HTTP_BODY_LIMIT_BYTES = 2 MiB)",
+        "src/lib.rs:1327 (DefaultBodyLimit::max(HTTP_BODY_LIMIT_BYTES))",
+        "src/federation/signing.rs:42 (REQUIRE_NONCE_ENV)",
+        "src/lib.rs:1376 (compose_admission_control \u2014 #1733/#2032 M3 default-on)"
+      ],
+      "factual_description": "DoS defense is multi-layer. The original seven v0.7.0 layers remain: (1) K8 per-agent quota, (2) cl100k token budgets, (3) HMAC-mandatory webhook dispatch, (4) SSRF guard fail-CLOSED, (5) federation DLQ replay cap, (6) 2 MiB HTTP body cap (HTTP_BODY_LIMIT_BYTES), (7) federation nonce-replay defense. v1.0.0 added an eighth live layer: HTTP admission control (compose_admission_control) ON by default (#2032 M3) \u2014 CPU-scaled inflight cap, typed 503 OVERLOADED, /health+/metrics exempt. Per-namespace quota dimension shipped at schema v50 (#1156).",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "issue_references": [
+        "K8",
+        "R3-S1.HMAC",
+        "#1053",
+        "#922",
+        "#1156",
+        "#1733",
+        "#2032"
+      ],
+      "honesty_note": "DoS hardening is perpetual \u2014 these layers raise the cost of attack but do not eliminate the threat class. Operators tune quotas + inflight caps to their deployment.",
+      "note": "Delta vs v0.7.0: admission control default-on; per-namespace K8 dimension."
+    },
+    {
+      "id": "substrate_native_verify_family",
+      "display_name": "Substrate-native verify-* CLI inspection family",
+      "addresses_nsa_concerns": [
+        "audit_logs",
+        "tool_invocation_path_confusion"
+      ],
+      "addresses_nsa_recommendations": [
+        "instrument_for_logging",
+        "sign_and_verify_mcp_messages",
+        "choose_supported_mcp_projects"
+      ],
+      "verified_at_paths": [
+        "src/daemon_runtime.rs:423 (Command::VerifyReflectionChain)",
+        "src/daemon_runtime.rs:430 (Command::VerifySignedEventsChain)",
+        "src/daemon_runtime.rs:437 (Command::VerifyAuditTrail \u2014 PE-8 / #1720)",
+        "src/daemon_runtime.rs:447 (Command::VerifyForensicBundle)",
+        "src/cli/verify.rs (VerifyChainArgs + --cid sweep)",
+        "src/cli/verify_signed_events.rs",
+        "src/forensic/bundle.rs"
+      ],
+      "factual_description": "The substrate ships substrate-native inspection subcommands that do NOT use Anthropic's separate MCP-Inspector toolchain (CVE-2025-49596's surface). ai-memory verify-reflection-chain walks reflects_on edges and verifies Ed25519 signatures (optional --cid fleet sweep, #1825). ai-memory verify-signed-events-chain walks the V-4 hash chain. ai-memory verify-audit-trail (added PE-8) adds witness / cause-binding / role-separation / identity-lineage / rollback-evidence verdicts. ai-memory verify-forensic-bundle re-hashes a procurement evidence bundle.",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "issue_references": [
+        "CVE-2025-49596",
+        "#1720",
+        "#1825"
+      ],
+      "note": "Delta vs v0.7.0: VerifyAuditTrail CLI + cid sweep."
+    },
+    {
+      "id": "mcp_client_attestation",
+      "display_name": "MCP initialize handshake clientInfo capture + daemon serverInfo Ed25519 signing",
+      "addresses_nsa_concerns": [
+        "tool_invocation_path_confusion",
+        "audit_logs"
+      ],
+      "addresses_nsa_recommendations": [
+        "sign_and_verify_mcp_messages",
+        "instrument_for_logging",
+        "design_for_boundaries"
+      ],
+      "verified_at_paths": [
+        "src/mcp/server_identity.rs:114 (DaemonIdentityToSign)",
+        "src/mcp/server_identity.rs:150 (canonical_bytes_for_identity)",
+        "src/mcp/server_identity.rs:181 (build_signed_identity)",
+        "src/governance/audit.rs:875 (load_daemon_signing_key)",
+        "tests/mcp_initialize_server_signing.rs"
+      ],
+      "factual_description": "Composite defense, both halves shipped: (1) the substrate captures clientInfo.name from the MCP initialize handshake and threads it through downstream operations; (2) the substrate publishes a daemon-Ed25519-signed ai_memory_identity block on every MCP initialize response so clients can TOFU-pin the daemon fingerprint. Block is OMITTED when the daemon has no keypair (the 'continuing unsigned' posture). The v0.7.0 inventory's PARTIAL honesty note is retired \u2014 #1154 closed the serverInfo half.",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "issue_references": [
+        "Track B4",
+        "#1154"
+      ],
+      "note": "v0.7.0 PARTIAL (client-only) \u2192 CLOSED at #1154. Re-confirmed at 580d8427.",
+      "verified_in_v0_7_x_closure": true
+    },
+    {
+      "id": "encryption_at_rest_sqlcipher",
+      "display_name": "Encryption at rest (sqlcipher whole-DB + per-content envelope)",
+      "addresses_nsa_concerns": [
+        "access_control",
+        "token_security",
+        "misconfigurations"
+      ],
+      "addresses_nsa_recommendations": [
+        "design_for_boundaries",
+        "sandbox_tool_execution"
+      ],
+      "verified_at_paths": [
+        "Cargo.toml ([features] sqlcipher)",
+        "src/config.rs (AI_MEMORY_ENCRYPT_AT_REST resolver)",
+        "src/storage (StorageError::SqlcipherMissingPassphrase \u2014 fail-closed open)"
+      ],
+      "factual_description": "Two distinct encryption gates exist at v1.0.0 and must not be conflated. (1) --features sqlcipher + AI_MEMORY_DB_PASSPHRASE (or --db-passphrase-file, mode 0400, #1055) encrypts the whole sqlite file; a sqlcipher build hard-refuses to open any DB without the passphrase (StorageError::SqlcipherMissingPassphrase). (2) AI_MEMORY_ENCRYPT_AT_REST enables the per-content X25519/ChaCha envelope on memory rows (encrypted_envelope column; archive-lossless since v68). doctor --posture never opens the DB. Switching either flag on against an existing plain DB does NOT encrypt it \u2014 operators must export \u2192 encrypted-init \u2192 import.",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "issue_references": [
+        "#1055",
+        "#228",
+        "#1728"
+      ],
+      "honesty_note": "Two gates, not one. sqlcipher = whole-DB; ENCRYPT_AT_REST = per-content envelope. The v0.7.0 inventory described only the sqlcipher path and treated ENCRYPT_AT_REST as its trigger \u2014 that conflation is retired.",
+      "note": "Delta vs v0.7.0: honest split of the two encryption gates; postgres encrypted_envelope parity (v68)."
+    },
+    {
+      "id": "longmemeval_benchmark",
+      "display_name": "LongMemEval-S published recall figures (binary-faithful + shadow)",
+      "addresses_nsa_concerns": [
+        "inconsistent_behaviors"
+      ],
+      "addresses_nsa_recommendations": [
+        "choose_supported_mcp_projects"
+      ],
+      "verified_at_paths": [
+        "README.md LongMemEval section (canonical citation, restated 2026-08-11 #2888)",
+        "benchmarks/longmemeval/results.md",
+        "benchmarks/longmemeval/ (harness.py binary-faithful; harness_99.py shadow)"
+      ],
+      "factual_description": "Evaluated on ICLR 2025 LongMemEval-S (500 questions, 6 categories). BINARY-FAITHFUL (harness.py drives the shipped ai-memory recall subprocess): keyword 96.4% R@5 / 98.4% R@10 / 99.6% R@20 (remeasured on the v1.0.0 binary, commit 811ce105, #2888); semantic 96.8% R@5. SHADOW (harness_99.py re-implements scoring outside the binary, cloud-API venue): smart-tier Gemma 4 97.2% R@5 / 99.6% R@10 / 99.8% R@20. The historical gemma3:4b 97.8% R@5 headline is RETIRED per #1975. Binary-faithful and shadow numbers are comparable WITHIN a harness, never across.",
+      "verified_in_v0_7_0": true,
+      "verified_in_v1_0_0": true,
+      "issue_references": [
+        "#1975",
+        "#1983",
+        "#2888"
+      ],
+      "honesty_note": "The v0.7.0 inventory published 97.8/99.0/99.8 as if they were the shipped-binary smart-tier result. Those figures were a shadow-harness Gemma-3-4B run and are no longer the headline. Keyword 96.4% is the LLM-independent binary-faithful number.",
+      "r_at_5_keyword_binary_faithful": 0.964,
+      "r_at_10_keyword_binary_faithful": 0.984,
+      "r_at_20_keyword_binary_faithful": 0.996,
+      "r_at_5_semantic_binary_faithful": 0.968,
+      "r_at_5_smart_shadow_gemma4": 0.972,
+      "r_at_10_smart_shadow_gemma4": 0.996,
+      "r_at_20_smart_shadow_gemma4": 0.998,
+      "retired_headline_r_at_5_smart_gemma3_4b": 0.978
+    },
+    {
+      "id": "forget_tombstones",
+      "display_name": "Signed forget tombstones (anti-resurrection)",
+      "addresses_nsa_concerns": [
+        "access_control",
+        "audit_logs",
+        "insecure_serialization"
+      ],
+      "addresses_nsa_recommendations": [
+        "design_for_boundaries",
+        "instrument_for_logging"
+      ],
+      "verified_at_paths": [
+        "src/storage/mod.rs:4776 (purge_and_tombstone_forget)",
+        "src/storage/mod.rs:4908 (forget_tombstone_signable_bytes)",
+        "src/storage/mod.rs:4941 (memory_is_tombstoned)",
+        "src/storage/mod.rs:5109 (get_forget_tombstone)",
+        "src/portability/read.rs:82 (read_all_forget_tombstones)"
+      ],
+      "factual_description": "A forget emits an owner-signed tombstone (identity + time + signature ONLY \u2014 no content fingerprint) that the federation receive funnel checks before accepting an inbound write, so a forgotten row cannot be resurrected via LWW. Schema v71 (#1821 / G30).",
+      "verified_in_v0_7_0": false,
+      "verified_in_v1_0_0": true,
+      "schema_anchor": "v71 (forget_tombstones)",
+      "issue_references": [
+        "#1821",
+        "#1832"
+      ],
+      "verified_by_codegraph": "codegraph_search forget_tombstone / memory_is_tombstoned"
+    },
+    {
+      "id": "append_only_revision_spine",
+      "display_name": "G6 append-only memory_revisions spine",
+      "addresses_nsa_concerns": [
+        "audit_logs",
+        "insecure_serialization"
+      ],
+      "addresses_nsa_recommendations": [
+        "instrument_for_logging",
+        "sign_and_verify_mcp_messages"
+      ],
+      "verified_at_paths": [
+        "src/revisions.rs:431 (append_revision_leaf)",
+        "src/config.rs (AI_MEMORY_APPEND_ONLY resolver)"
+      ],
+      "factual_description": "When AI_MEMORY_APPEND_ONLY is truthy, mutations (supersede/erase) emit signed identity-only memory_revisions leaves (capture-then-compact / COW) instead of silent in-place/hard-delete. OFF (default) is byte-identical legacy. Schema v72 (#1823 / G6).",
+      "verified_in_v0_7_0": false,
+      "verified_in_v1_0_0": true,
+      "schema_anchor": "v72 (memory_revisions)",
+      "issue_references": [
+        "#1823"
+      ],
+      "honesty_note": "Opt-in. Default OFF preserves the v0.7.0 in-place contract. Not a silent behavior flip."
+    },
+    {
+      "id": "blake3_content_id",
+      "display_name": "G8 additive BLAKE3 content-id (cid)",
+      "addresses_nsa_concerns": [
+        "insecure_serialization",
+        "audit_logs",
+        "inconsistent_behaviors"
+      ],
+      "addresses_nsa_recommendations": [
+        "validate_parameters",
+        "instrument_for_logging"
+      ],
+      "verified_at_paths": [
+        "src/identity/cid.rs:101 (canonical_cid_preimage)",
+        "src/identity/cid.rs:141 (compute_cid)",
+        "src/identity/cid.rs:161 (stamp_cid)",
+        "src/identity/cid.rs:230 (verify_cid)",
+        "src/models/memory.rs:1051 (Memory.cid)"
+      ],
+      "factual_description": "Additive, content-addressed b3:<hex> identity minted from genesis fields (agent_id + namespace + screen(title) + memory_kind + created_at + SHA256(screen(content))). Sits ALONGSIDE the UUID id (which stays the PK / every FK / federation LWW tiebreak). Title+content are secret-screened MODE-INDEPENDENTLY so federated nodes on different AI_MEMORY_SECRET_SCREEN_MODE mint the same cid. cid_genesis is NULLed on erasure while cid is retained (no confirmation-oracle). Enforcement is detect-and-log (AI_MEMORY_CID_ENFORCE); it NEVER refuses a federated receive.",
+      "verified_in_v0_7_0": false,
+      "verified_in_v1_0_0": true,
+      "schema_anchor": "v74 (memories.cid + cid_genesis)",
+      "issue_references": [
+        "#1825"
+      ],
+      "honesty_note": "cid is PARTIAL-corruption detection + genesis-identity binding, NOT at-rest forgery-evidence. A consistent re-forge of BOTH columns passes."
+    },
+    {
+      "id": "memory_derivation_lineage_dag",
+      "display_name": "G13-mem derivation lineage-DAG",
+      "addresses_nsa_concerns": [
+        "audit_logs",
+        "inconsistent_behaviors"
+      ],
+      "addresses_nsa_recommendations": [
+        "instrument_for_logging",
+        "design_for_boundaries"
+      ],
+      "verified_at_paths": [
+        "src/config.rs:5823 (lineage_dag_enabled)",
+        "src/mcp/registry.rs LineageTool (memory_lineage)",
+        "src/models/link.rs:188 (MemoryLinkRelation \u2014 provenance subset P)"
+      ],
+      "factual_description": "When AI_MEMORY_LINEAGE_DAG is on (compiled default true; production-boot seeded #2233), link writes populate memory_links.source_cid/target_cid, a P-wide acyclicity guard runs on derived_from/reflects_on/derives_from, and the lineage query surface (MCP memory_lineage / GET /memories/{id}/lineage / ai-memory lineage) walks the provenance subset. consolidate_tombstone_sources (tracks the DAG flag) makes consolidate TOMBSTONE sources instead of hard-DELETE.",
+      "verified_in_v0_7_0": false,
+      "verified_in_v1_0_0": true,
+      "schema_anchor": "v75 (memory_links.source_cid + target_cid)",
+      "issue_references": [
+        "#1859",
+        "#2233"
+      ]
+    },
+    {
+      "id": "identity_lineage_succession",
+      "display_name": "G13 identity-lineage succession + M-of-N recovery",
+      "addresses_nsa_concerns": [
+        "access_control",
+        "token_security",
+        "audit_logs"
+      ],
+      "addresses_nsa_recommendations": [
+        "sign_and_verify_mcp_messages",
+        "design_for_boundaries"
+      ],
+      "verified_at_paths": [
+        "src/identity/lineage.rs:361 (LineageRecord::genesis)",
+        "src/identity/lineage.rs:394 (LineageRecord::rotation)",
+        "src/identity/lineage.rs:435 (LineageRecord::revocation)",
+        "src/identity/lineage.rs:498 (LineageRecord::recovery)",
+        "src/identity/lineage.rs:787 (verify_succession)",
+        "src/identity/lineage.rs:1161 (verify_lineage)",
+        "src/identity/lineage.rs:1083 (verify_recovery_record)"
+      ],
+      "factual_description": "Dedicated agent_lineage table \u2014 one signed succession record per (agent_id, epoch) with the composite PRIMARY KEY as the DB-enforced anti-equivocation constraint. Scope is single-node key-ROTATION survival, NOT key-loss resilience, and is invisible cross-host (federation peers resolve via lookup_peer_public_key). v80 adds custody_class + revocation; v81 commits guardian_set_id + recovery_threshold INSIDE the signed CBOR so a persisted recovery is re-verified against its mint-time trust bar. Mint with guardians enrolled but AI_MEMORY_RECOVERY_THRESHOLD unset is REFUSED (no silent M=1).",
+      "verified_in_v0_7_0": false,
+      "verified_in_v1_0_0": true,
+      "schema_anchor": "v76 (agent_lineage); v80 (custody/revocation); v81 (recovery quorum)",
+      "issue_references": [
+        "#1828",
+        "#1831",
+        "#1949"
+      ],
+      "honesty_note": "NOT key-loss resilience. Advisory/verdict-only for attest_write (which still reads flat metadata.agent_pubkey, synced in the same transaction)."
+    },
+    {
+      "id": "pure_recall_access_fold",
+      "display_name": "P0-1 pure recall + periodic access fold",
+      "addresses_nsa_concerns": [
+        "inconsistent_behaviors",
+        "audit_logs"
+      ],
+      "addresses_nsa_recommendations": [
+        "instrument_for_logging",
+        "filter_monitor_output_pipelines"
+      ],
+      "verified_at_paths": [
+        "src/storage/mod.rs:2775 (fold_recall_accesses)",
+        "src/observations/mod.rs:65 (record_recall \u2014 ledger-only write)"
+      ],
+      "factual_description": "Recall is unconditionally pure at v1.0.0 (#1953 removed the AI_MEMORY_RECALL_TOUCH_SYNC escape hatch). A recall mutates zero memories rows; the only recall-time write is the append-only recall_observations ledger (folded=0). The periodic FOLD job (and fold-before-gc) batch-applies the legacy access ladders (access_count, last_accessed_at, TTL floor-extend, mid\u2192long promotion, priority decade). Degrade = staler frecency, never a wrong result.",
+      "verified_in_v0_7_0": false,
+      "verified_in_v1_0_0": true,
+      "schema_anchor": "v77 (recall_observations.folded)",
+      "issue_references": [
+        "#1869",
+        "#1953"
+      ]
+    },
+    {
+      "id": "model_family_attestations",
+      "display_name": "\u00a725.3 S1 model-family attestation substrate",
+      "addresses_nsa_concerns": [
+        "audit_logs",
+        "inconsistent_behaviors"
+      ],
+      "addresses_nsa_recommendations": [
+        "instrument_for_logging",
+        "sign_and_verify_mcp_messages"
+      ],
+      "verified_at_paths": [
+        "src/storage/model_attest.rs:221 (attested_family_of)",
+        "src/daemon_runtime.rs (Command::ModelAttest)"
+      ],
+      "factual_description": "Append-only, write-once (TOFU) record of WHICH model family produced a generation, captured at the LLM-client construction boundary (loader_observed) or enrolled out-of-band (operator_signed). UNIQUE(provider, model_ref, model_family, agent_id). The decorrelation write-gate (AI_MEMORY_REFLECT_DECORRELATION_MODE=enforce) refuses ONLY on ATTESTED evidence of monoculture \u2014 a claimed-only corpus stays advisory (anti-theater). Loader coverage hard-caps at substrate-invoked generation.",
+      "verified_in_v0_7_0": false,
+      "verified_in_v1_0_0": true,
+      "schema_anchor": "v78 (model_attestations)",
+      "issue_references": [
+        "#1870",
+        "#1767",
+        "#1952"
+      ],
+      "honesty_note": "Only substrate-invoked generation is attestable. Caller-CLAIMED model_family contributes nothing to the enforce quorum."
+    },
+    {
+      "id": "claim_bitemporal_valid_time",
+      "display_name": "Claim-bitemporal VALID-time (valid_from / valid_until)",
+      "addresses_nsa_concerns": [
+        "inconsistent_behaviors",
+        "audit_logs"
+      ],
+      "addresses_nsa_recommendations": [
+        "validate_parameters",
+        "design_for_boundaries"
+      ],
+      "verified_at_paths": [
+        "src/models/memory.rs:1064 (Memory.valid_from)",
+        "src/models/memory.rs:1077 (Memory.valid_until)",
+        "src/validate.rs (validate_valid_at / canonicalize_valid_time)"
+      ],
+      "factual_description": "RFC3339 interval a claim is asserted to hold, half-open [valid_from, valid_until) END-EXCLUSIVE, distinct from created_at transaction-time. Both nullable/unbounded. valid_from is IMMUTABLE after store; valid_until is updatable. UNSIGNED metadata \u2014 not part of the SignableWrite v2 envelope. v86 normalizes every stored rendering to YYYY-MM-DDTHH:MM:SS.ffffffZ so lexicographic predicates compare instants correctly. Archive parity at v85.",
+      "verified_in_v0_7_0": false,
+      "verified_in_v1_0_0": true,
+      "schema_anchor": "v79 (memories columns); v85 (archived_memories); v86 (canonicalize)",
+      "issue_references": [
+        "#1834",
+        "#2035"
+      ]
+    },
+    {
+      "id": "http_attested_identity_binding",
+      "display_name": "HTTP per-agent-key principal binding (H1/M1)",
+      "addresses_nsa_concerns": [
+        "access_control",
+        "token_security",
+        "tool_invocation_path_confusion"
+      ],
+      "addresses_nsa_recommendations": [
+        "design_for_boundaries",
+        "validate_parameters"
+      ],
+      "verified_at_paths": [
+        "src/config.rs:5541 (pub enum HttpIdentityMode)",
+        "src/config.rs:5591 (pub fn http_attested_identity_mode)",
+        "src/config.rs:4554 (ENV_HTTP_ATTESTED_IDENTITY)",
+        "src/handlers/identity_binding.rs",
+        "src/handlers/transport.rs (api_key_auth)"
+      ],
+      "factual_description": "Closes H1 cross-tenant IDOR + M1 admin spoof: X-Agent-Id is self-asserted while api_key is only a shared transport credential. AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY tri-state (default advisory): a presented enrolled per-agent key (schema v83 agent_api_keys) CORRECTS a mismatching header (WARN); enforce refuses mismatch with 403 identity_binding_mismatch AND refuses a merely-Claimed shared-key caller on sensitive gates with 403 attested_identity_required. advisory + zero enrolled keys is inert (single-operator). Concern (a) access_control is structurally addressed only under enforce with keys enrolled \u2014 the shipped default is finding H1 of the v1.0.0 adversarial assessment.",
+      "verified_in_v0_7_0": false,
+      "verified_in_v1_0_0": true,
+      "schema_anchor": "v83 (agent_api_keys)",
+      "issue_references": [
+        "#2044",
+        "#2032-A"
+      ],
+      "honesty_note": "Default advisory + zero keys does NOT close concern (a). The mapping document's 10/10 headline was retired for this reason; this inventory does not restore it."
+    },
+    {
+      "id": "embedding_space_provenance",
+      "display_name": "Per-row embedding-space fingerprint (same-dim model-swap isolation)",
+      "addresses_nsa_concerns": [
+        "inconsistent_behaviors",
+        "insecure_serialization"
+      ],
+      "addresses_nsa_recommendations": [
+        "validate_parameters",
+        "design_for_boundaries"
+      ],
+      "verified_at_paths": [
+        "src/hnsw.rs:178 (ENV_REQUIRE_EMBED_MODEL_MATCH)",
+        "src/hnsw.rs:191 (strict_embed_model_match_enabled)"
+      ],
+      "factual_description": "Additive embedding_space column (<canonical_model_id>#<prefix_scheme>, NULL = legacy/unverified) on memories + archived_memories. Recall never scores a vector from a different embedding space via AND embedding_space = $fp. Default is adoption-and-census: a first-boot pre-v84 corpus of dim-matching NULL-space rows is stamped to the active fingerprint (guarded by [G2] \u2014 no differently-stamped row exists). AI_MEMORY_REQUIRE_EMBED_MODEL_MATCH=1 disables auto-adoption and degrades semantic recall LOUDLY to keyword on a heterogeneous census.",
+      "verified_in_v0_7_0": false,
+      "verified_in_v1_0_0": true,
+      "schema_anchor": "v84 (embedding_space + partial index)",
+      "issue_references": [
+        "#2167",
+        "#2183"
+      ]
+    },
+    {
+      "id": "secret_screen",
+      "display_name": "Pre-write credential screen (G29)",
+      "addresses_nsa_concerns": [
+        "token_security",
+        "insecure_serialization",
+        "audit_logs"
+      ],
+      "addresses_nsa_recommendations": [
+        "validate_parameters",
+        "filter_monitor_output_pipelines"
+      ],
+      "verified_at_paths": [
+        "src/secret_screen.rs:140 (pub fn screen)",
+        "src/secret_screen.rs:404 (set_screen_mode)",
+        "src/config.rs:2937 (ENV_SECRET_SCREEN_MODE)"
+      ],
+      "factual_description": "Pre-write credential screen for caller-origin writes. Default refuse rejects a write whose content matches a credential detector (PEM private keys, AKIA\u2026, ghp_/github_pat_, sk-/xai- keys, Bearer, JWTs \u2014 Shannon-entropy tiebreak so benign UUID/hex/base64 pass). Federation-receive / L2-recovery / internal re-store paths ALWAYS degrade refuse \u2192 redact (a refused inbound row would diverge replicas). Same screen masks forensic-bundle egress.",
+      "verified_in_v0_7_0": false,
+      "verified_in_v1_0_0": true,
+      "issue_references": [
+        "#1821"
+      ]
+    },
+    {
+      "id": "macaroon_capability_tokens",
+      "display_name": "G10.1 / R9 macaroon capability-token grant layer",
+      "addresses_nsa_concerns": [
+        "access_control",
+        "poor_approval_workflows",
+        "token_security"
+      ],
+      "addresses_nsa_recommendations": [
+        "design_for_boundaries",
+        "sandbox_tool_execution"
+      ],
+      "verified_at_paths": [
+        "src/governance/capability.rs:476 (CapabilityConfig)",
+        "src/config.rs (load_owner_issuer_config / load_capability_config)",
+        "src/daemon_runtime.rs (Command::Capability)"
+      ],
+      "factual_description": "Stateless macaroon capability-token grant layer. R9 default-on is ADDITIVE-ONLY \u2014 the gate hook short-circuits token.is_none() || base==Allow BEFORE consulting enabled, so a capability-LESS caller is byte-identical to the legacy inert posture. A valid token whose caveat chain + issuer ceiling cover an in-flight (action, namespace) flips an otherwise-Deny/Ask to Allow (attenuation-only). Closed [capabilities.issuers] allowlist is the sole issuer source, PLUS the reserved zero-config owner issuer (ai-memory capability init). HMAC + Ed25519 caveat-chain non-escalation is ATTESTABLE; default-on posture and issuer enrollment are OPERATIONAL.",
+      "verified_in_v0_7_0": false,
+      "verified_in_v1_0_0": true,
+      "issue_references": [
+        "#1827",
+        "#1960"
+      ],
+      "honesty_note": "The issue's deny-semantics reading (refusing a capability-LESS caller) is deliberately NOT enabled. Revocation is short ExpiresAt + root_secret rotation (no online-revocation store)."
+    },
+    {
+      "id": "federation_namespace_confinement",
+      "display_name": "Inbound federation namespace confinement (#2447)",
+      "addresses_nsa_concerns": [
+        "access_control",
+        "inconsistent_behaviors"
+      ],
+      "addresses_nsa_recommendations": [
+        "design_for_boundaries",
+        "validate_parameters"
+      ],
+      "verified_at_paths": [
+        "src/federation/receive_auth.rs:1008 (inbound_write_namespace_authorized)",
+        "src/federation/receive_auth.rs (inbound_by_id_namespace_authorized)",
+        "src/federation/receive_auth.rs (inbound_namespace_meta_authorized)",
+        "src/federation/peer_attestation.rs:152 (PeerAttestationConfig)"
+      ],
+      "factual_description": "Layer 1 (always-on under an enrolled posture) enforces a peer's declared non-empty allowed_namespaces against BOTH the inbound CLAIMED namespace and the STORED namespace of any local row with the same id (the stored check is load-bearing: merge_memory LWW would otherwise let a public/* peer relocate a secure/ops row). Layer 2 (AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE, default ON) refuses an enrolled peer that declared no scope. Zero-config (no allowlist) is byte-identical to pre-#2447. Also governs deletions, pendings/pending_decisions, and namespace_meta/clears. Global standard * is refused unless the peer declared **.",
+      "verified_in_v0_7_0": false,
+      "verified_in_v1_0_0": true,
+      "issue_references": [
+        "#2447",
+        "#2488",
+        "#2491",
+        "#2478",
+        "#2479"
+      ],
+      "honesty_note": "A peer scoped to an ANCESTOR still supplies the DEFAULT policy of out-of-scope DESCENDANTS (leaf-first-wins). standard_id may still bind a memory in any namespace (documented shared-policy feature)."
+    },
+    {
+      "id": "schema_ahead_downgrade_guard",
+      "display_name": "Schema-ahead downgrade guard (#2445)",
+      "addresses_nsa_concerns": [
+        "inconsistent_behaviors",
+        "misconfigurations",
+        "insecure_serialization"
+      ],
+      "addresses_nsa_recommendations": [
+        "design_for_boundaries",
+        "validate_parameters"
+      ],
+      "verified_at_paths": [
+        "src/storage/schema_guard.rs:133 (SchemaAheadOfBinary)",
+        "src/storage/schema_guard.rs:210 (evaluate)",
+        "src/storage/connection.rs (probe_schema_stamp / open_unmigrated)"
+      ],
+      "factual_description": "observed > CURRENT_SCHEMA_VERSION refuses the open (typed SchemaAheadOfBinary, HTTP 503) so an older binary cannot write a newer database. == is the historical no-op fast path; < still runs the ladder. The guard sits BEFORE bootstrap DDL on both backends so an older CREATE IF NOT EXISTS cannot resurrect a table the newer ladder removed. AI_MEMORY_ALLOW_SCHEMA_AHEAD takes the EXACT observed version (a boolean would silently permit every future downgrade). Writes refuse; backup/doctor/boot preserve egress. Pinned unset by asi-hard.",
+      "verified_in_v0_7_0": false,
+      "verified_in_v1_0_0": true,
+      "issue_references": [
+        "#2445"
+      ]
+    },
+    {
+      "id": "http_admission_control",
+      "display_name": "HTTP admission-control inflight cap (#1733 / #2032 M3)",
+      "addresses_nsa_concerns": [
+        "denial_of_service"
+      ],
+      "addresses_nsa_recommendations": [
+        "design_for_boundaries",
+        "filter_monitor_output_pipelines"
+      ],
+      "verified_at_paths": [
+        "src/lib.rs:1376 (compose_admission_control)",
+        "src/config.rs (ENV_MAX_INFLIGHT_REQUESTS / resolve_default_max_inflight_requests)"
+      ],
+      "factual_description": "Global HTTP admission-control concurrency cap, ON by default since #2032 M3. Unset resolves to CPU-scaled clamp(cores\u00d764, 256, 4096). Explicit 0 disables. Sheds overflow with typed 503 {error:server_overloaded, code:OVERLOADED, max_inflight} + Retry-After: 1. /health, /metrics, /api/v1/metrics are EXEMPT. Outermost layer (rejects before timeout / body decode / handler). Complements the original seven DoS layers.",
+      "verified_in_v0_7_0": false,
+      "verified_in_v1_0_0": true,
+      "issue_references": [
+        "#1733",
+        "#2032"
+      ]
+    },
+    {
+      "id": "inference_egress_gate",
+      "display_name": "Inference-plane egress-class gate (R68/D14)",
+      "addresses_nsa_concerns": [
+        "token_security",
+        "access_control",
+        "misconfigurations"
+      ],
+      "addresses_nsa_recommendations": [
+        "design_for_boundaries",
+        "sandbox_tool_execution"
+      ],
+      "verified_at_paths": [
+        "src/egress.rs:107 (pub enum InferenceEgressMode)",
+        "src/egress.rs:279 (evaluate_inference_egress)"
+      ],
+      "factual_description": "AI_MEMORY_INFERENCE_EGRESS = allow (default, byte-identical legacy) | loopback-only | deny. Enforced at boot chokepoints (build_llm_client / build_embedder + MCP stdio init): on refuse the outbound client is NOT constructed, so no memory content can be POSTed to a refused vendor. Unrecognised token \u2192 WARN + fail-CLOSED to deny (FBL-14). Local in-process candle/MiniLM embedder is never gated. asi-hard does NOT force this; the asi-hard template sets loopback-only explicitly.",
+      "verified_in_v0_7_0": false,
+      "verified_in_v1_0_0": true,
+      "issue_references": [
+        "#1963"
+      ]
+    },
+    {
+      "id": "signed_approval_quorum",
+      "display_name": "R40 human-key-signed approval quorum",
+      "addresses_nsa_concerns": [
+        "poor_approval_workflows",
+        "access_control"
+      ],
+      "addresses_nsa_recommendations": [
+        "design_for_boundaries",
+        "sign_and_verify_mcp_messages"
+      ],
+      "verified_at_paths": [
+        "src/approvals.rs:545 (verify_quorum)",
+        "src/approvals.rs (APPROVER_PUBKEYS_ENV / APPROVAL_THRESHOLD_ENV)"
+      ],
+      "factual_description": "memory_pending_approve may carry an approvals array of {pubkey, signature} detached Ed25519 signatures over domain-separated approval bytes (ai-memory:approval:v1 || pending_id || decision). verify_quorum checks each against the enrolled set (AI_MEMORY_APPROVER_PUBKEYS plus the governance operator key) and counts DISTINCT valid enrolled signers. A pending routed from Decision::Escalate (requires_signed_approval) REQUIRES the signed quorum. Airgapped-operable: M signatures collected offline, submitted in one call.",
+      "verified_in_v0_7_0": false,
+      "verified_in_v1_0_0": true,
+      "issue_references": [
+        "#1957"
+      ],
+      "honesty_note": "Signature verification is cryptographically enforced; WHO is an approver is operational enrollment."
+    },
+    {
+      "id": "audit_witness_role_separation",
+      "display_name": "G5b/G9 audit-witness + three-key role separation",
+      "addresses_nsa_concerns": [
+        "audit_logs",
+        "access_control"
+      ],
+      "addresses_nsa_recommendations": [
+        "sign_and_verify_mcp_messages",
+        "instrument_for_logging"
+      ],
+      "verified_at_paths": [
+        "src/governance/audit.rs (load_witness_signing_key / load_enrolled_witness_pubkey)",
+        "src/governance/audit.rs (load_recorder_signing_key / load_judge_signing_key / load_stopper_signing_key)",
+        "src/cli/verify_audit_trail.rs"
+      ],
+      "factual_description": "Independent dual-chain audit-head WITNESS anchor (custody dir physically distinct from the daemon key dir). verify_audit_trail K1-pins the latest audit_head_witness checkpoint's resolver_pubkey against AI_MEMORY_WITNESS_PUBKEY. G9 adds Recorder/Judge/Stopper role keys (pairwise-distinct; a collision is RoleSeparationCheck::Misconfigured). Require-mode knobs (AI_MEMORY_REQUIRE_WITNESS / REQUIRE_ROLE_SEPARATION / REQUIRE_CAUSE_BINDING / REQUIRE_ROLLBACK_CHECK) are fail-closed when truthy and withhold (Unknown) by default so mixed/legacy chains do not false-alarm. A Forged verdict is dirty unconditionally.",
+      "verified_in_v0_7_0": false,
+      "verified_in_v1_0_0": true,
+      "issue_references": [
+        "#1822",
+        "#1826",
+        "#1946"
+      ],
+      "honesty_note": "OSS build = tamper-EVIDENCE, not tamper-PROOF. An imaged-disk attacker who snapshots DB + anchor together wins; whole-host resistance needs TPM2 NV / off-host anchor."
+    },
+    {
+      "id": "erasure_coded_archive_cold_tier",
+      "display_name": "G16 erasure-coded archive cold-tier redundancy",
+      "addresses_nsa_concerns": [
+        "audit_logs",
+        "denial_of_service"
+      ],
+      "addresses_nsa_recommendations": [
+        "instrument_for_logging",
+        "design_for_boundaries"
+      ],
+      "verified_at_paths": [
+        "src/erasure/mod.rs:46 (ENV_ERASURE_COLD_TIER)",
+        "src/erasure/codec.rs",
+        "src/erasure/archive_sync.rs"
+      ],
+      "factual_description": "Opt-in (AI_MEMORY_ERASURE_COLD_TIER). A paced sweep (256 rows/gc-tick, oldest-first, idempotent+resumable) encodes each committed archived_memories row into k data + m parity Reed-Solomon shards with per-shard + whole-payload SHA-256 gates. restore_archived reconstructs a DB-lost archived row from any k of k+m verified shards; loss beyond the m budget FAILS LOUD, never wrong. The archived DB row stays the durable source of truth \u2014 bundles are derived, regenerable redundancy. SINGLE-NODE at v1.0.0 (DurabilityModel::ErasureCodedColdTier.is_multi_node() == false). Purge-vs-loss discriminated by a write-ahead purge-intent journal.",
+      "verified_in_v0_7_0": false,
+      "verified_in_v1_0_0": true,
+      "issue_references": [
+        "#2064",
+        "#1830"
+      ],
+      "honesty_note": "Not multi-node. A rowless un-journaled bundle is quarantined, never destroyed. DR recovery is the explicit AI_MEMORY_ERASURE_RECOVER_QUARANTINE switch."
+    }
+  ],
+  "summary": {
+    "total_capabilities": 46,
+    "inherited_from_v0_7_0_and_reanchored": 27,
+    "added_after_v0_7_0": 19,
+    "verified_in_v1_0_0": 46,
+    "deferred_to_future_release": 0,
+    "partial_or_honesty_notes": 14,
+    "partial_or_honesty_capabilities": [
+      "chaos_tested_convergence",
+      "dos_multi_layer_defense",
+      "encryption_at_rest_sqlcipher",
+      "longmemeval_benchmark",
+      "append_only_revision_spine",
+      "blake3_content_id",
+      "identity_lineage_succession",
+      "model_family_attestations",
+      "http_attested_identity_binding",
+      "macaroon_capability_tokens",
+      "federation_namespace_confinement",
+      "signed_approval_quorum",
+      "audit_witness_role_separation",
+      "erasure_coded_archive_cold_tier"
+    ],
+    "originating_brief_corrections_carried_forward": 4,
+    "v1_0_0_honesty_corrections": [
+      "LongMemEval 97.8% smart-tier headline RETIRED (#1975); publish binary-faithful keyword 96.4% + shadow Gemma-4 97.2%",
+      "HookEvent 25 \u2192 22 (never-fired events removed; not a live-coverage loss)",
+      "MemoryKind 10 \u2192 16; MemoryLinkRelation 6 \u2192 9; Memory fields 26 \u2192 30",
+      "namespace 'no slashes' claim retired \u2014 hierarchical / namespaces are valid",
+      "decorate_memory renamed decorate_memory_many",
+      "Two encryption gates (sqlcipher whole-DB vs per-content envelope) must not be conflated",
+      "NSA concern (a) is NOT a flat 10/10 \u2014 structurally addressed only under HTTP identity enforce + enrolled per-agent keys; default advisory is finding H1",
+      "mcp_client_attestation PARTIAL note retired (#1154 closed the serverInfo half)"
+    ],
+    "newly_documented_defensive_layers_v1_0_0": [
+      "forget_tombstones",
+      "append_only_revision_spine",
+      "blake3_content_id",
+      "memory_derivation_lineage_dag",
+      "identity_lineage_succession",
+      "pure_recall_access_fold",
+      "model_family_attestations",
+      "claim_bitemporal_valid_time",
+      "http_attested_identity_binding",
+      "embedding_space_provenance",
+      "secret_screen",
+      "macaroon_capability_tokens",
+      "federation_namespace_confinement",
+      "schema_ahead_downgrade_guard",
+      "http_admission_control",
+      "inference_egress_gate",
+      "signed_approval_quorum",
+      "audit_witness_role_separation",
+      "erasure_coded_archive_cold_tier"
+    ],
+    "nsa_csi_mcp_coverage_status": {
+      "concerns_structurally_addressed": "9/10 fully as shipped; concern (a) access_control structurally addressed ONLY under AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce with per-agent keys enrolled. The shipped default (advisory, zero keys) is finding H1 of docs/compliance/v1.0.0-security-assessment.html. This inventory does NOT restore a flat 10/10 headline.",
+      "recommendations_implemented": "7/7 (unchanged; still no NSA endorsement)",
+      "mapping_document": "docs/compliance/nsa-csi-mcp-security-mapping.md",
+      "honest_limitations": "docs/compliance/honest-limitations.md"
+    },
+    "surface_deltas_vs_v0_7_0": {
+      "schema": "53 \u2192 89",
+      "mcp_full": "74 \u2192 103",
+      "http_production_routes": "88 \u2192 94",
+      "http_unique_paths": "74 \u2192 80",
+      "cli_default": "79 \u2192 90",
+      "cli_sal": "81 \u2192 92",
+      "memory_fields": "26 \u2192 30",
+      "memory_kind": "10 \u2192 16",
+      "memory_link_relation": "6 \u2192 9",
+      "hook_events": "25 \u2192 22",
+      "test_attributes": "6961 \u2192 11851"
+    }
+  }
+}
