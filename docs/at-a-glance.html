@@ -14,7 +14,7 @@
     1. 30-second tour      — hero + three pillars + headline numbers
     2. 5-minute tour       — architecture layers + lifecycle + tier ladder
     3. Engineering depth   — performance + coverage + federation + numbers
-    4. Audience-by-scale   — solo dev → mega-scale gov & institutions
+    4. Audience-by-scale   — solo dev → air-gapped institutional deployments
     5. Strategic context   — roadmap + comparison matrix + trust ladder
 
   Single file. No external JS dependencies. Inline SVG. Dark monochrome theme
@@ -27,10 +27,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory At a Glance — every facet, one page</title>
-<meta name="description" content="Visual atlas of ai-memory: persistent, AI-agnostic memory daemon. Three pillars (hierarchy, knowledge graph, performance), four operational tiers, sub-100ms latency, federation-ready, local-first. From solo developer to federal-scale government deployments.">
+<meta name="description" content="Visual atlas of ai-memory: persistent, AI-agnostic memory daemon. Three pillars (hierarchy, knowledge graph, performance), four operational tiers, sub-100ms latency, federation-ready, local-first. From solo developer to air-gapped institutional deployments. No FedRAMP authorization is held.">
 <meta name="theme-color" content="#0d1117">
 <meta property="og:title" content="ai-memory At a Glance">
-<meta property="og:description" content="Every aspect and facet of ai-memory, visualized for everyone from individual developers to mega-scale institutions.">
+<meta property="og:description" content="Every aspect and facet of ai-memory, visualized for everyone from individual developers to air-gapped institutions. No FedRAMP authorization is held.">
 <meta property="og:url" content="https://alphaonedev.github.io/ai-memory-mcp/at-a-glance.html">
 <meta property="og:type" content="website">
 <meta name="twitter:card" content="summary_large_image">
@@ -826,6 +826,7 @@ footer.site-foot a { color: var(--text-muted); }
         <button class="menu-btn">Evidence<span class="caret">▾</span></button>
         <div class="menu-pane">
           <a href="evidence.html">Frozen Claims</a>
+          <a href="compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md">Enterprise-federation cert</a>
           <a href="evidence/">Evidence Hub (campaigns)</a>
           <a href="performance.html">Performance budgets</a>
           <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
@@ -1476,10 +1477,10 @@ footer.site-foot a { color: var(--text-muted); }
      ============================================================= -->
 <section id="audiences">
   <div class="container">
-    <span class="eyebrow p3">From One to a Million</span>
-    <h2>Same binary, every scale.</h2>
+    <span class="eyebrow p3">From One to the Certified Envelope</span>
+    <h2>Same binary, every shipped scale.</h2>
     <p class="lede">
-      ai-memory runs the same way on a developer's laptop as it does on a federation of state-government data centers. The differentiator is configuration, not code path: federation peers, mTLS allowlists, governance policies, autonomous-tier resources.
+      ai-memory runs the same way on a developer's laptop as it does on an air-gapped institutional node. The differentiator is configuration, not code path: federation peers, mTLS allowlists, governance policies, autonomous-tier resources. Scale past a laptop is an <strong>ARCHITECTED envelope, not a measured capacity</strong> &mdash; see the qualifier below.
     </p>
 
     <div class="persona-grid">
@@ -1535,9 +1536,9 @@ footer.site-foot a { color: var(--text-muted); }
       <div class="persona">
         <div class="persona-icon">🏛️</div>
         <div class="persona-scale">SCALE 4 · ENTERPRISE</div>
-        <div class="persona-title">Large corporation (500-50k)</div>
-        <div class="persona-pop">500-50,000 users · 20-100 nodes</div>
-        <div class="persona-pop-label">multi-region federation</div>
+        <div class="persona-title">Large corporation</div>
+        <div class="persona-pop">500–1000 agents · ≤50 peers</div>
+        <div class="persona-pop-label">ARCHITECTED, not MEASURED</div>
         <div class="persona-pain">"Each business unit wants AI. Each lawyer wants air-gapped. Each auditor wants logs."</div>
         <div class="persona-fix">Per-BU federated cluster. Cross-region quorum. PII redaction hooks. Backup + restore + retention.</div>
         <ul class="persona-bullets">
@@ -1552,8 +1553,8 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="persona-icon">🇺🇸</div>
         <div class="persona-scale">SCALE 5 · GOVERNMENT</div>
         <div class="persona-title">Federal · state · local · municipal</div>
-        <div class="persona-pop">Sovereign · Air-gapped</div>
-        <div class="persona-pop-label">FedRAMP / IL5 / Sovereign</div>
+        <div class="persona-pop">Air-gapped · OSS</div>
+        <div class="persona-pop-label">No FedRAMP / IL5 authorization</div>
         <div class="persona-pain">"AI is mandatory. The cloud is forbidden. The vendors are foreign."</div>
         <div class="persona-fix">Apache 2.0 OSS. Single Rust binary. Zero outbound calls. Hardware-attested keys (v0.7).</div>
         <ul class="persona-bullets">
@@ -1565,7 +1566,12 @@ footer.site-foot a { color: var(--text-muted); }
     </div>
 
     <div class="callout" style="margin-top:2.5rem;">
-      <strong>The AgenticMem commercial tiers are an addition, not a requirement.</strong> Every audience above can run the OSS ai-memory binary indefinitely with no commercial product needed. The Attest / Federate / Sovereign commercial tiers add hardware-backed identity, managed federation, and FedRAMP-certified deployments — but only when the operator chooses.
+      <strong>Design scale envelope (derived topology ceiling) &mdash; ARCHITECTED, not MEASURED.</strong>
+      The certified trust-boundary envelope is a <strong>500–1000-agent cluster</strong> composed modularly in 500-agent blocks, with a <strong>≤50-peer</strong> mesh ceiling (past ~50 peers the peer-to-peer mesh is the wrong shape). That envelope is a derived topology ceiling, not a measured capacity: the largest real-mesh-measured federation is <strong>2 nodes</strong>, and the full-scale USL capacity projection is deferred to <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/2438">#2438</a>. A previous revision of this page advertised &ldquo;From One to a Million&rdquo; and &ldquo;500-50,000 users · 20-100 nodes&rdquo;; those figures are three orders of magnitude beyond anything the topology tables support and are retired. Canonical statements: <a href="federation.html">docs/federation.html</a> and <a href="compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md">docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md</a>.
+    </div>
+
+    <div class="callout" style="margin-top:1.25rem;">
+      <strong>The AgenticMem commercial tiers are an addition, not a requirement.</strong> Every audience above can run the OSS ai-memory binary indefinitely with no commercial product needed. The Attest / Federate / Sovereign commercial tiers are a <em>forward-looking commercial offering</em> (hardware-backed identity, managed federation) &mdash; only when the operator chooses. <strong>No FedRAMP authorization is held.</strong> Do not represent ai-memory or AgenticMem as FedRAMP-, IL5-, SOC&nbsp;2-, ISO&nbsp;27001-, or HIPAA-certified. See <a href="evidence.html">evidence.html</a>.
     </div>
   </div>
 </section>
@@ -1576,9 +1582,9 @@ footer.site-foot a { color: var(--text-muted); }
 <section id="roadmap">
   <div class="container">
     <span class="eyebrow">Roadmap</span>
-    <h2>From v0.9.0 today to v1.0 federation maturity.</h2>
+    <h2>v1.0.0 is the current release.</h2>
     <p class="lede">
-      Public release sequence. Each release ships one demoable headline plus operational substrate the next release builds on. No version skipping. No quiet feature drift. <a href="https://github.com/alphaonedev/ai-memory-mcp-dev/blob/develop/ROADMAP.md" style="color:var(--pillar-1)">Public ROADMAP.md →</a>
+      Public release sequence. v1.0.0 is what ships today. Remaining federation-maturity items (blind-replica ciphertext relay, mDNS, MVCC) are still ahead &mdash; federation replicates plaintext today (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1968">#1968</a>). No version skipping. No quiet feature drift. <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/release/v1.0.0/ROADMAP.md" style="color:var(--pillar-1)">Public ROADMAP.md →</a>
     </p>
 
     <div class="roadmap">
@@ -1658,15 +1664,27 @@ footer.site-foot a { color: var(--text-muted); }
         </div>
       </div>
 
-      <div class="roadmap-row future">
+      <div class="roadmap-row shipped">
         <div class="roadmap-marker">
           <div class="roadmap-dot"></div>
           <div class="version">v1.0</div>
         </div>
         <div class="roadmap-content">
-          <div class="rmt-theme">Federation Maturity</div>
-          <div class="rmt-eta">Q2 2027</div>
-          <div class="rmt-desc">Auto-discovery (mDNS), an opt-in blind-replica federation mode (ciphertext-only relay &mdash; a distinct reduced-capability mode with no peer-side recall / embedding / FTS; federation replicates plaintext today, <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1968">#1968</a>), MVCC, OpenTelemetry standardization, strict semver discipline.</div>
+          <div class="rmt-theme">Enterprise-federation trust boundary · <span style="color:var(--good)">CURRENT</span></div>
+          <div class="rmt-eta">Aug 2026 · v1.0.0</div>
+          <div class="rmt-desc">Trust-boundary certification of the enterprise-federation configuration. The 500–1000-agent / ≤50-peer envelope is <strong>ARCHITECTED, not MEASURED</strong> &mdash; largest real-mesh-measured federation is 2 nodes; USL deferred to <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/2438">#2438</a>. Federation still replicates plaintext today (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1968">#1968</a>). Canonical cert: <a href="compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md">ENTERPRISE-FEDERATION-CERTIFICATION.md</a>.</div>
+        </div>
+      </div>
+
+      <div class="roadmap-row future">
+        <div class="roadmap-marker">
+          <div class="roadmap-dot"></div>
+          <div class="version">later</div>
+        </div>
+        <div class="roadmap-content">
+          <div class="rmt-theme">Still ahead &mdash; not claimed as shipped</div>
+          <div class="rmt-eta">not scheduled on this page</div>
+          <div class="rmt-desc">mDNS auto-discovery; opt-in blind-replica federation (ciphertext-only relay &mdash; a distinct reduced-capability mode with no peer-side recall / embedding / FTS); MVCC; OpenTelemetry standardization. None of these are claimed as shipped.</div>
         </div>
       </div>
     </div>
@@ -1729,9 +1747,9 @@ footer.site-foot a { color: var(--text-muted); }
 <section id="trust">
   <div class="container">
     <span class="eyebrow p3">Trust Ladder</span>
-    <h2>Five steps from laptop to FedRAMP.</h2>
+    <h2>Five steps from laptop to a hardened air-gap.</h2>
     <p class="lede">
-      Each step strengthens the trust boundary without breaking the layer below it. The OSS binary is operable at every step. The AgenticMem commercial tiers add managed services on top of what's already shipped.
+      Each shipped step strengthens the trust boundary without breaking the layer below it. The OSS binary is operable at every shipped step. <strong>FedRAMP / IL5 is not a step on this ladder</strong> &mdash; no authorization is held. The AgenticMem commercial tiers are a forward-looking offering on top of what is already shipped.
     </p>
 
     <div class="trust-ladder">
@@ -1761,9 +1779,9 @@ footer.site-foot a { color: var(--text-muted); }
       </div>
       <div class="trust-step">
         <div class="step-num">5</div>
-        <div class="step-tier">AgenticMem · Sovereign</div>
+        <div class="step-tier">Not held · not claimed</div>
         <div class="step-title">FedRAMP / IL5</div>
-        <div class="step-desc">Government-grade deployments. Air-gapped, audited, contractually committed.</div>
+        <div class="step-desc">No authorization exists. Do not represent. A future ATO is forward-looking only and is a separate, unstarted process. See <a href="evidence.html">evidence.html</a>.</div>
       </div>
     </div>
   </div>
@@ -1918,7 +1936,7 @@ footer.site-foot a { color: var(--text-muted); }
         <p style="color:var(--text-muted); margin-bottom:.75rem">
           AI mandates are real. Cloud bans are real. Foreign-vendor concerns are real. <strong>An OSS Rust binary that runs entirely on your hardware, requires zero outbound traffic, and ships with auditable source code is the only AI-memory primitive that works for federal, state, local, and municipal deployments.</strong>
         </p>
-        <p style="color:var(--text-muted); font-size:.9rem">v0.7's attested-identity work targets FIPS-grade key handling. v1.0's federation maturity work targets multi-region resilience. Today's v0.9.0 already runs air-gapped with no compromise.</p>
+        <p style="color:var(--text-muted); font-size:.9rem">v0.7's attested-identity work <em>targets</em> FIPS-grade key handling &mdash; it is not a FIPS validation. Today's v1.0.0 already runs air-gapped. No FedRAMP / IL5 authorization is held; do not represent one. See <a href="evidence.html">evidence.html</a>.</p>
       </div>
     </div>
   </div>
@@ -2208,10 +2226,13 @@ footer.site-foot a { color: var(--text-muted); }
 
 <footer class="site-foot">
   <div>
-    ai-memory&trade; &middot; Apache 2.0 &middot; <a href="https://github.com/alphaonedev/ai-memory-mcp">github.com/alphaonedev/ai-memory-mcp</a> &middot; ai-memory-mcp <strong style="color:var(--text)">v0.9.0</strong> &middot; &copy; 2026 <a href="https://alphaonedev.com">AlphaOne LLC</a>
+    ai-memory&trade; &middot; Apache 2.0 &middot; <a href="https://github.com/alphaonedev/ai-memory-mcp">github.com/alphaonedev/ai-memory-mcp</a> &middot; ai-memory-mcp <strong style="color:var(--text)">v1.0.0</strong> &middot; &copy; 2026 <a href="https://alphaonedev.com">AlphaOne LLC</a>
   </div>
   <div style="margin-top:.5rem; font-size:.75rem;">
     All measurements on Apple M4 / 32 GB / NVMe SSD · numbers from <code>cargo llvm-cov --features sal --no-fail-fast --json</code>
+  </div>
+  <div style="margin-top:.75rem; font-size:.72rem; color:var(--text-dim); max-width:60rem;">
+    <strong>FedRAMP / IL5 / SOC 2 / ISO 27001 / HIPAA:</strong> no authorization is held for any release. Do not represent. See <a href="evidence.html">evidence.html</a>.
   </div>
   <div style="margin-top:.75rem; font-size:.72rem; color:var(--text-dim); max-width:60rem;">
     <strong>NSA non-endorsement:</strong> References to the National Security Agency Cybersecurity Information document on MCP security (U/OO/6030316-26 | PP-26-1834, May 2026 v1.0) describe ai-memory's substrate-level posture relative to NSA-issued guidance. The National Security Agency, the Department of Defense, and the United States Government do not endorse, certify, or recommend ai-memory, AgenticMem, AlphaOne LLC, or any commercial product. See <a href="compliance/nsa-csi-mcp.html">the full NSA CSI MCP compliance page</a> for the complete mapping + citation.

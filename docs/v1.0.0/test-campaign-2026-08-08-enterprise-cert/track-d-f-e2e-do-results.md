@@ -15,6 +15,17 @@ This document is honest per the campaign truthfulness discipline: every row is l
 PROVEN / PARTIAL / DEFERRED, harness bugs are distinguished from substrate behaviour, and no
 assertion is reported as a pass it did not earn.
 
+> **Stack-evidence note ([#2913](https://github.com/alphaonedev/ai-memory-mcp/issues/2913)).**
+> This file is the **as-run record** of the only real multi-node mesh:
+> **PostgreSQL 16 + Apache AGE 1.6.0 + pgvector 0.8.4** on a 2-node
+> DigitalOcean hive. It is not a PG18 run, and **there is no multi-node
+> PG18 mesh run**. The later enterprise-federation certification pins
+> the disjoint **PG18.4 + AGE 1.7.0 + pgvector 0.8.5** single-node CI
+> stack (run [`31601974424`](https://github.com/alphaonedev/ai-memory-mcp/actions/runs/31601974424)
+> at `b80e7fff`). Track A/B recorded pgvector **0.8.6** (local); this
+> DO mesh recorded **0.8.4** — both kept as written. See
+> [`PLAN.md`](./PLAN.md) §"Stack-evidence reconciliation".
+
 ## Provisioned topology (as-run)
 
 | item | value |
