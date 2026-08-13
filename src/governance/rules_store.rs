@@ -836,7 +836,7 @@ pub fn canonical_bytes(rule: &Rule) -> Result<Vec<u8>> {
 /// [`docs/compliance/nsa-csi-mcp.html`](../../docs/compliance/nsa-csi-mcp.html)
 /// §3.2 (NSA concern b) and §4.5 (NSA recommendation e); the
 /// capability inventory anchor is `form_7_canonical_bytes_signing` in
-/// [`docs/compliance/_inventory/v0.7.0-capabilities.json`](../../docs/compliance/_inventory/v0.7.0-capabilities.json).
+/// [`docs/compliance/_inventory/v1.0.0-capabilities.json`](../../docs/compliance/_inventory/v1.0.0-capabilities.json).
 ///
 /// # Errors
 ///
