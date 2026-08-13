@@ -1484,7 +1484,7 @@ impl std::error::Error for ValidationError {}
 /// attribution while preserving byte-equal wire-side error messages
 /// for v0.6.x backwards compatibility. Mapping anchor:
 /// `request_validator_input_validation` in
-/// [`docs/compliance/_inventory/v0.7.0-capabilities.json`](../docs/compliance/_inventory/v0.7.0-capabilities.json);
+/// [`docs/compliance/_inventory/v1.0.0-capabilities.json`](../docs/compliance/_inventory/v1.0.0-capabilities.json);
 /// narrative in
 /// [`docs/compliance/nsa-csi-mcp.html`](../docs/compliance/nsa-csi-mcp.html)
 /// §3.9 (concern i) and §4.3 (recommendation c).

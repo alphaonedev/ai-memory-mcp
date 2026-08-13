@@ -31,6 +31,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and asserts THIS checkout is GREEN. Declared in
   `scripts/qc-allowlists/required-contexts-release.txt` (mirror-first;
   live branch-protection API is the operator-gated follow-up).
+### Docs (capability inventory re-derivation; #1938)
+
+- **Re-derived the NSA CSI capability inventory against `release/v1.0.0`
+  @ `580d8427`.** New artefact
+  `docs/compliance/_inventory/v1.0.0-capabilities.json` (46 primitives:
+  the original 27 Task I rows re-anchored + 19 v0.8–v1.0 defensive
+  layers) plus companion `v1.0.0-summary.md`. The v0.7.0 pair is
+  retained as a historical artefact. Currency notes in
+  `honest-limitations.md`, `docs/compliance/index.html`,
+  `nsa-csi-mcp-security-mapping.md`, `nsa-csi-mcp.html`,
+  `mcp-registry-submission.json`, and ROADMAP now point at the v1.0.0
+  file as the source of truth. Closes cert §8 minting condition (b).
+  ([#1938](https://github.com/alphaonedev/ai-memory-mcp/issues/1938)).
 
 ### CI (control-integrity — commit-signing posture gate; #2486)
 
