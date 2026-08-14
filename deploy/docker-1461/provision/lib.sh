@@ -92,7 +92,7 @@ EMBED_MODEL_CONFIG_ID="${DOCKER_1461_EMBED_CONFIG_ID:-nomic_embed_v15}"
 AGE_BASE_IMAGE="${DOCKER_1461_AGE_BASE_IMAGE:-apache/age:release_PG18_1.7.0}"
 PG_MAJOR="${DOCKER_1461_PG_MAJOR:-18}"                            # server major (apt pkg suffix)
 PG_APT_VERSION="${DOCKER_1461_PG_APT_VERSION:-18.4-1.pgdg13+1}"   # pinned exact pgdg .deb
-PGVECTOR_APT_VERSION="${DOCKER_1461_PGVECTOR_APT_VERSION:-0.8.5-1.pgdg13+1}"
+PGVECTOR_APT_VERSION="${DOCKER_1461_PGVECTOR_APT_VERSION:-0.8.6-1.pgdg13+1}"
 # Reproducibility assertion anchors (validate harness asserts these exact
 # upstream-reported versions — the directive: results must reflect 18.4 + AGE 1.7.0).
 EXPECTED_PG_VERSION="${DOCKER_1461_EXPECTED_PG_VERSION:-18.4}"

@@ -15,9 +15,9 @@
 #
 # REMOVED 2026-07-31 (operator directive): the `postgres-age` job (#2012) built
 # the SSOT-pinned certified stack NATIVELY on the runner every night —
-# apt-installing PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.5 and
+# apt-installing PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.6 and
 # asserting the pins — purely to reproduce a stack that already exists
-# continuously as the `ai-memory-pg:18.4-age1.7.0-vec0.8.5` container on the
+# continuously as the `ai-memory-pg:18.4-age1.7.0-vec0.8.6` container on the
 # validation host. That is a from-source rebuild per night for no evidence the
 # validation host does not already provide, so it is gone rather than repaired.
 #

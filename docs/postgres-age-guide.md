@@ -50,11 +50,11 @@ works on postgres.
 |---|---|---|
 | PostgreSQL | **18.4** (canonical) | The recommended Enterprise Federated substrate. SSOT: `deploy/docker-1461/provision/lib.sh` (`EXPECTED_PG_VERSION=18.4`). PG 16.x + AGE 1.6.0 remains a tested alternate matrix (`infra/lan-parity-test/`). |
 | Apache AGE | **1.7.0** (canonical) | Targets PG 18. Use the bundled `deploy/docker-1461/Dockerfile.pg-age-vector` (`apache/age:release_PG18_1.7.0`) or build from source (see below). |
-| pgvector | **0.8.5** (canonical) | Faster HNSW; 0.8.3 fixed HNSW-vacuuming index corruption. SSOT: `PGVECTOR_APT_VERSION=0.8.5-1.pgdg13+1`. **Required**: the `sal-postgres` Cargo feature pulls `dep:pgvector` (Rust binding crate `pgvector = "0.4"`) which maps Rust vectors to the Postgres `vector` column type. |
+| pgvector | **0.8.6** (canonical) | Faster HNSW; 0.8.3 fixed HNSW-vacuuming index corruption. SSOT: `PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1`. **Required**: the `sal-postgres` Cargo feature pulls `dep:pgvector` (Rust binding crate `pgvector = "0.4"`) which maps Rust vectors to the Postgres `vector` column type. |
 | ai-memory | v0.9.0 with `--features sal-postgres` | The `sal-postgres` feature is **off by default** to keep the no-postgres build hermetic. |
 
 > **CI evidence (#2548 / #2512).** The **one true certified triple** —
-> PostgreSQL **18.4** + Apache AGE **1.7.0** + pgvector **0.8.5** — is
+> PostgreSQL **18.4** + Apache AGE **1.7.0** + pgvector **0.8.6** — is
 > exercised **in-PR on `release/**`** by
 > `.github/workflows/cert-postgres-age.yml`, which BUILDS the bundled
 > [`deploy/docker-1461/Dockerfile.pg-age-vector`](../deploy/docker-1461/Dockerfile.pg-age-vector)
@@ -62,7 +62,7 @@ works on postgres.
 > declaration source — no literal is re-typed in the workflow), runs the
 > `#[ignore]`-gated postgres cells AND the AGE-backed cells against that built
 > image, and **hard-fails on ANY drift from the exact pinned minors** —
-> PostgreSQL 18.4, Apache AGE 1.7.0, pgvector 0.8.5, not merely "PG 18" or
+> PostgreSQL 18.4, Apache AGE 1.7.0, pgvector 0.8.6, not merely "PG 18" or
 > "AGE 1.7.x" — so the certified tier is proven by execution, never merely
 > claimed (2026-08-01 cutline ruling §5.4(3): "you cannot certify a tier CI
 > does not run"). The `infra/lan-parity-test/` alternate matrix (PG 16 + AGE
@@ -77,7 +77,7 @@ pgvector (the `sal-postgres` Cargo feature pulls `dep:pgvector` which
 maps Rust vectors to Postgres `vector` columns), the repo ships a
 ready-made stacked image at
 [`deploy/docker-1461/Dockerfile.pg-age-vector`](../deploy/docker-1461/Dockerfile.pg-age-vector)
-(#1065). It layers pgvector `0.8.5` (precompiled .deb from the pgdg apt
+(#1065). It layers pgvector `0.8.6` (precompiled .deb from the pgdg apt
 repo) onto the `apache/age:release_PG18_1.7.0` base — no source build
 needed. Use this image for any deployment that backs ai-memory onto
 Postgres+AGE. (The `infra/lan-parity-test/` image — PG 16 + AGE 1.6.0 +
@@ -108,8 +108,8 @@ sudo apt update
 sudo apt install -y postgresql-18 postgresql-server-dev-18 \
                     postgresql-contrib-18 build-essential bison flex git
 
-# 2. pgvector 0.8.5 from the upstream release tag.
-git clone --depth 1 --branch v0.8.5 https://github.com/pgvector/pgvector.git
+# 2. pgvector 0.8.6 from the upstream release tag.
+git clone --depth 1 --branch v0.8.6 https://github.com/pgvector/pgvector.git
 cd pgvector
 sudo make USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config install
 cd ..
@@ -163,7 +163,7 @@ services:
 ```
 
 Plan C operators running on K8s / ECS / Cloud Run build this image
-once, tag it (`pg-age-vector:PG18.4-1.7.0-pgvector0.8.5`), and reference
+once, tag it (`pg-age-vector:PG18.4-1.7.0-pgvector0.8.6`), and reference
 the tag from their workload manifests instead of the bare upstream
 image.
 
@@ -879,7 +879,7 @@ parity test is the gate that prevents it.
 ## References
 
 - Apache AGE 1.7.0 docs: https://age.apache.org/
-- pgvector 0.8.5 docs: https://github.com/pgvector/pgvector
+- pgvector 0.8.6 docs: https://github.com/pgvector/pgvector
 - ai-memory v0.7.0 release notes: [`v0.7.0/release-notes.md`](v0.7.0/release-notes.html)
 - A2A campaign Pages: https://alphaonedev.github.io/ai-memory-a2a-v0.7.0/
 - Adapter-selection design: [`RUNBOOK-adapter-selection.md`](RUNBOOK-adapter-selection.html)

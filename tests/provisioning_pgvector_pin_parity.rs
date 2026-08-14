@@ -10,7 +10,7 @@
 //! differ only in the pgdg distro suffix baked into the apt version string,
 //! because they provision on different distros; the `x.y.z` patch itself is a
 //! fleet-wide contract (the canonical v1.0.0 GA stack, pinned to pgvector
-//! 0.8.5 in `docs/v1.0.0/release-notes.md`).
+//! 0.8.6 in `docs/v1.0.0/release-notes.md`).
 //!
 //! Before #2872 the two lanes silently disagreed (docker-1461 pinned 0.8.5
 //! while do-1461 pinned 0.8.2) — a bet-the-farm consistency defect, and the
@@ -64,7 +64,7 @@ fn upstream_patch(apt_version: &str) -> String {
 }
 
 /// The canonical v1.0.0 GA pgvector patch both lanes must pin.
-const EXPECTED_PGVECTOR_PATCH: &str = "0.8.5";
+const EXPECTED_PGVECTOR_PATCH: &str = "0.8.6";
 
 const DOCKER_LANE: &str = "deploy/docker-1461/provision/lib.sh";
 const DO_LANE: &str = "deploy/do-1461/provision/lib.sh";

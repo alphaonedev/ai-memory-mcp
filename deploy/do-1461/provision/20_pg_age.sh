@@ -2,7 +2,7 @@
 # Copyright 2026 AlphaOne LLC
 # SPDX-License-Identifier: Apache-2.0
 #
-# Stand up the per-REGION PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.5
+# Stand up the per-REGION PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.6
 # substrate droplets (role=pg, ONE per region) — NATIVE, no Docker (operator
 # decision: zero Docker anywhere on the DO fleet). Within each region every peer
 # keys to its own search_path schema (ic_peer_<K>) on THAT region's pg node and
@@ -14,7 +14,7 @@
 #
 # Install vector (verified against the live pgdg noble repo — see lib.sh):
 #   * postgresql-18          18.4   exact pgdg .deb
-#   * postgresql-18-pgvector 0.8.5  exact pgdg .deb
+#   * postgresql-18-pgvector 0.8.6  exact pgdg .deb
 #   * postgresql-18-age      age.control default_version='1.7.0' (extversion
 #     1.7.0) — same commit as the apache/age:release_PG18_1.7.0 image; the
 #     pgdg "~rc0" is only a Debian revision label. No source build.
@@ -284,7 +284,7 @@ EOS
   scp_to "$ROLE_SQL"   "$pg_pub" "$PG_STAGE_DIR/role.sql"
   ssh_node "$pg_pub" "chmod 0600 $PG_STAGE_DIR/role.sql"
 
-  log "[$pg_host] running native PG18.4 + AGE1.7.0 + pgvector0.8.5 install (this builds nothing — pinned .debs)"
+  log "[$pg_host] running native PG18.4 + AGE1.7.0 + pgvector0.8.6 install (this builds nothing — pinned .debs)"
   ssh_node "$pg_pub" "bash $PG_STAGE_DIR/pg-install.sh"
 
   log "[$pg_host] waiting for postgres ready"

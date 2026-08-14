@@ -32,7 +32,7 @@
 # (`infra/lan-parity-test/`)". It is NOT the certified triple and does not
 # certify one: coverage is a Rust line-coverage measurement, not cert evidence.
 # The ONE TRUE CERTIFIED triple — PostgreSQL 18.4 + Apache AGE 1.7.0 +
-# pgvector 0.8.5 — is exercised in-PR by `.github/workflows/cert-postgres-age.yml`
+# pgvector 0.8.6 — is exercised in-PR by `.github/workflows/cert-postgres-age.yml`
 # (#2548), so CI runs BOTH stacks the SSOT documents and neither is drift:
 # canonical here would risk this required coverage gate on a PG-major flip it
 # does not measure, while the cert job proves the canonical tier separately.
@@ -155,7 +155,7 @@ jobs:
     services:
       # Live PG + Apache AGE 1.6.0 (graph extension on PostgreSQL 16) — the
       # DOCUMENTED ALTERNATE matrix (#2512; see the header note above). The
-      # certified triple (PG 18.4 + AGE 1.7.0 + pgvector 0.8.5) is exercised
+      # certified triple (PG 18.4 + AGE 1.7.0 + pgvector 0.8.6) is exercised
       # by `.github/workflows/cert-postgres-age.yml`, not here.
       # The pgvector extension is layered in via the
       # `Install pgvector + provision AGE/vector extensions` step below

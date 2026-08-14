@@ -176,14 +176,14 @@ to certify a stack whose probed versions drift from the pins below).
 |---|---|---|
 | PostgreSQL | **18.4** | `PG_APT_VERSION=18.4-1.pgdg13+1`, `EXPECTED_PG_VERSION=18.4` |
 | Apache AGE | **1.7.0** | `AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0`, `EXPECTED_AGE_VERSION=1.7.0` |
-| pgvector (server extension) | **0.8.5** | `PGVECTOR_APT_VERSION=0.8.5-1.pgdg13+1` |
+| pgvector (server extension) | **0.8.6** | `PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1` |
 | pgvector (Rust binding crate) | **0.4** | `Cargo.toml` → `pgvector = "0.4"` |
 | ai-memory postgres schema | **v89** | postgres ladder pinned in lockstep with SQLite `CURRENT_SCHEMA_VERSION = 89` (`src/storage/migrations.rs`). NOTE: the `deploy/docker-1461` / `deploy/do-1461` provisioning configs are reproducibility anchors **pinned to the v0.7.0 release** (`EXPECTED_VERSION=0.7.0`, `EXPECTED_SCHEMA=57`, golden SHA), so their `57` is correct *for that pinned release* — it is not a stale copy of the current tip (`CURRENT_SCHEMA_VERSION = 89`). A deployment-validation anchor at the current schema would be a separate config. |
 
 The bundled stacked image at
 [`deploy/docker-1461/Dockerfile.pg-age-vector`](../deploy/docker-1461/Dockerfile.pg-age-vector)
 (`ARG AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0`, `ARG PG_MAJOR=18`)
-layers pgvector 0.8.5 onto the AGE base so K8s / ECS / Cloud Run
+layers pgvector 0.8.6 onto the AGE base so K8s / ECS / Cloud Run
 operators do not build AGE from source. See
 [`postgres-age-guide.md`](postgres-age-guide.md) for the from-source
 install recipe and the Docker layering rationale (#1065).

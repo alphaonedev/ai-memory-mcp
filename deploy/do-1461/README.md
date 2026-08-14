@@ -14,7 +14,7 @@ verification harness proves it.
 
 The fleet is **12 nodes across 3 regions** (nyc3 US-East, fra1 EU-Central, sgp1
 Asia-SE). Each region is a self-contained substrate cluster: **one regional
-PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.5 node + 3 ai-memory daemon
+PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.6 node + 3 ai-memory daemon
 peers**. A region's peers key to their own `search_path` schema (`ic_peer_1..K`,
 within-region) on **their region's** pg node and dial it on **that region's
 private VPC IP under TLS verify-full**. The 9 peers federate into ONE cross-region
@@ -36,15 +36,15 @@ Hostnames encode each node's function: `do-1461-<function>-<region>-<NN>`.
 | `do-1461-peer-nyc3-01`| peer  | nyc3   | s-4vcpu-8gb   | federated `ai-memory serve` + CPU Ollama embedder sidecar  |
 | `do-1461-peer-nyc3-02`| peer  | nyc3   | s-4vcpu-8gb   | federated `ai-memory serve` + CPU Ollama embedder sidecar  |
 | `do-1461-peer-nyc3-03`| peer  | nyc3   | s-4vcpu-8gb   | federated `ai-memory serve` + CPU Ollama embedder sidecar  |
-| `do-1461-pg-nyc3-01`  | pg    | nyc3   | s-4vcpu-8gb   | regional PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.5|
+| `do-1461-pg-nyc3-01`  | pg    | nyc3   | s-4vcpu-8gb   | regional PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.6|
 | `do-1461-peer-fra1-01`| peer  | fra1   | s-4vcpu-8gb   | federated `ai-memory serve` + CPU Ollama embedder sidecar  |
 | `do-1461-peer-fra1-02`| peer  | fra1   | s-4vcpu-8gb   | federated `ai-memory serve` + CPU Ollama embedder sidecar  |
 | `do-1461-peer-fra1-03`| peer  | fra1   | s-4vcpu-8gb   | federated `ai-memory serve` + CPU Ollama embedder sidecar  |
-| `do-1461-pg-fra1-01`  | pg    | fra1   | s-4vcpu-8gb   | regional PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.5|
+| `do-1461-pg-fra1-01`  | pg    | fra1   | s-4vcpu-8gb   | regional PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.6|
 | `do-1461-peer-sgp1-01`| peer  | sgp1   | s-4vcpu-8gb   | federated `ai-memory serve` + CPU Ollama embedder sidecar  |
 | `do-1461-peer-sgp1-02`| peer  | sgp1   | s-4vcpu-8gb   | federated `ai-memory serve` + CPU Ollama embedder sidecar  |
 | `do-1461-peer-sgp1-03`| peer  | sgp1   | s-4vcpu-8gb   | federated `ai-memory serve` + CPU Ollama embedder sidecar  |
-| `do-1461-pg-sgp1-01`  | pg    | sgp1   | s-4vcpu-8gb   | regional PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.5|
+| `do-1461-pg-sgp1-01`  | pg    | sgp1   | s-4vcpu-8gb   | regional PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.6|
 
 The **9 peers** (3 per region) form ONE cross-region federation mesh. ai-memory
 federation is **primarily EVENTUAL**: every HTTP write commits **locally**, then
@@ -196,7 +196,7 @@ SSH command line.
 - **Pinned artifacts** (`provision/lib.sh`): binary `sha256`, version `0.7.0`,
   schema `v57`, the pinned native Ollama release (`$OLLAMA_VERSION`), and the
   pinned pgdg apt `.deb`s — **PostgreSQL 18.4** (`$PG_APT_VERSION`), **Apache AGE
-  1.7.0** (`$AGE_APT_VERSION`), **pgvector 0.8.5** (`$PGVECTOR_APT_VERSION`),
+  1.7.0** (`$AGE_APT_VERSION`), **pgvector 0.8.6** (`$PGVECTOR_APT_VERSION`),
   installed NATIVELY (no Docker anywhere on the fleet) — plus embedder/LLM model
   ids, the synchronous write quorum (auto `W=$FED_SYNC_QUORUM_W` clamped to the
   node count, or `$QUORUM_WRITES`), and the zero-touch credential TTL
@@ -242,7 +242,7 @@ runs on every peer. These controls are asserted LIVE over the wire by the
 Checks: binary `sha256` + `--version` (every node); `/api/v1/health`,
 `storage_backend == postgres`, `db_schema_version == 57`, single-instance, and
 systemd-active (every peer); **pg-node upstream-stack assertions** (the live
-server reports PostgreSQL `18.4`, Apache AGE `1.7.0`, pgvector `0.8.5`; the AGE
+server reports PostgreSQL `18.4`, Apache AGE `1.7.0`, pgvector `0.8.6`; the AGE
 graph is present; and every daemon→PG backend is TLS — `>=1 ssl, 0 plaintext`);
 and a fleet **federation-convergence** probe that writes a collective-scope
 marker to one peer and reads it back by id on another over the encrypted path.

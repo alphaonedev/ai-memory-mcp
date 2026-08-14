@@ -249,7 +249,7 @@ version drift (`Assert certified stack versions` step at
 
 - **PostgreSQL 18.4** (`EXPECTED_PG_VERSION=18.4`)
 - **Apache AGE 1.7.0** (`EXPECTED_AGE_VERSION=1.7.0`, base `apache/age:release_PG18_1.7.0`)
-- **pgvector 0.8.5** (`PGVECTOR_APT_VERSION=0.8.5-1.pgdg13+1`)
+- **pgvector 0.8.6** (`PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1`)
 
 **Executed GREEN on the cert SHA:** run
 `https://github.com/alphaonedev/ai-memory-mcp/actions/runs/31601974424`
@@ -259,6 +259,25 @@ is also SUCCESS on PR #2910 (the squash that produced `580d8427`).
 This answers the ruling's "executed, at certified versions, not
 CI-on-16-while-certifying-18" — the workflow refuses to certify a mismatched
 stack.
+
+> **pgvector pin advance from 0.8.5 to 0.8.6 (2026-08-14, honest evidence
+> status).** The certified pgvector pin was advanced from `0.8.5-1.pgdg13+1`
+> to `0.8.6-1.pgdg13+1` (operator-directed; the `0.8.5` pgdg `.deb` had
+> drifted out of the current snapshot, and `0.8.6` is what the pgdg13 repo
+> now builds). **The three GREEN runs cited above (`31601974424`,
+> `31601912912`, PR #2910) certified the PRIOR pgvector pin, `0.8.5`** —
+> they do NOT prove `0.8.6`. The formal in-PR `0.8.6` re-green is produced by the
+> `cert-postgres-age.yml` run of the change that carries this pin advance:
+> its `Assert certified stack versions` step reads the advanced
+> `PGVECTOR_APT_VERSION` and hard-fails on drift, so a GREEN merge of that
+> change IS the `0.8.6` build+assert evidence (fail-closed — a `0.8.6`
+> resolution failure reds the job and blocks the merge). On-host
+> corroboration exists ahead of that run: the permanent container
+> `ai-memory-cert-pg` builds and serves **PostgreSQL 18.4 + Apache AGE 1.7.0
+> + pgvector 0.8.6** with `create_graph`, a pgvector cosine op, and a
+> `sslmode=verify-full` daemon `schema-init` all functional. Until the
+> in-PR `cert-postgres-age.yml` job is GREEN at `0.8.6`, treat the pgvector
+> row above as *pin-current, formal-CI-re-green-pending*.
 
 > **Stack-evidence note (two disjoint corpora).** The certified triple
 > above is **single-node CI evidence**. The only real multi-node mesh
@@ -421,7 +440,7 @@ is observed:**
    the current full-map run ends `overall: PASS` in
    `removal-proof-full.log`).
 4. **`cert-postgres-age.yml` certifying a stack that is NOT
-   PG 18.4 / AGE 1.7.0 / pgvector 0.8.5** (a drift the `Assert certified stack
+   PG 18.4 / AGE 1.7.0 / pgvector 0.8.6** (a drift the `Assert certified stack
    versions` step should have caught) voids it.
    *Observable:* that step
    (`.github/workflows/cert-postgres-age.yml:203`) hard-fails the job

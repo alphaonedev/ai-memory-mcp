@@ -59,6 +59,13 @@
 #  - MemoryLinkRelation::COUNT (=6) → docs claims of "<N> variants" /
 #    "<N> typed link relations".
 #  - MemoryScope::COUNT (=5) → docs claims of "<N> visibility scopes".
+#  - pgvector certified PATCH (deploy/docker-1461/provision/lib.sh
+#    DOCKER_1461_PGVECTOR_APT_VERSION, reduced x.y.z — the SAME SSOT
+#    tests/provisioning_pgvector_pin_parity.rs reads) → current-cert doc
+#    claims of "pgvector | **X.Y.Z**", "pgvector X.Y.Z",
+#    "PGVECTOR_APT_VERSION=X.Y.Z-". The alternate PG16/AGE1.6 tested-matrix
+#    mentions (pgvector 0.8.2/0.8.4) and the SHIPPED-record docs
+#    (release-notes.md, CHANGELOG) are LEFT ALONE.
 #
 # # Output
 #
@@ -115,6 +122,25 @@ CANONICAL_CLI_SAL=$(extract_const_value src/lib.rs EXPECTED_CLI_SUBCOMMANDS_SAL 
 CANONICAL_MEMORY_FIELDS=$(extract_const_value src/models/memory.rs FIELD_COUNT 'usize')
 CANONICAL_LINK_COUNT=$(extract_const_value src/models/link.rs COUNT 'usize')
 CANONICAL_SCOPE_COUNT=$(extract_const_value src/models/namespace.rs COUNT 'usize')
+
+# Certified pgvector PATCH — the single fleet-wide provisioning pin. It
+# lives ONCE, in the docker-1461 lane's `DOCKER_1461_PGVECTOR_APT_VERSION`
+# default in deploy/docker-1461/provision/lib.sh, reduced to its bare
+# upstream x.y.z (`0.8.6-1.pgdg13+1` -> `0.8.6`). This is the SAME SSOT
+# default tests/provisioning_pgvector_pin_parity.rs reads (and asserts the
+# do-1461 lane agrees on), so the gate introduces NO third source of
+# truth — it reuses the parity test's extraction shape (first live
+# `${var:-<default>}`, take everything before the first `-`). Trailing
+# `|| true` keeps a genuinely-absent SSOT file from aborting the whole
+# gate under `set -euo pipefail`; an empty result FAILS CLOSED inside the
+# rule (never a silent pass) when a pgvector doc is present to validate.
+CANONICAL_PGVECTOR_PATCH="$(
+    grep -oE '\$\{DOCKER_1461_PGVECTOR_APT_VERSION:-[0-9][0-9.]*[^}]*\}' \
+        deploy/docker-1461/provision/lib.sh 2>/dev/null \
+    | head -1 \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
+    | head -1 || true
+)"
 
 # Profile::full().expected_tool_count() — count of RegisteredTool::of::<>() entries
 CANONICAL_FULL_TOOL_COUNT=$(grep -cE '^\s*RegisteredTool::of::<' src/mcp/registry.rs 2>/dev/null || echo 0)
@@ -241,6 +267,23 @@ HOOK_DOC_FILES=(
     docs/strategy/coala-mapping.md
     docs/audience/developer.html
     docs/essays/brass-tacks-3-why.html
+)
+
+# Doc surfaces the pgvector-certified-patch rule walks. Its own EXPLICIT
+# allowlist (the "one rule, one scan set" discipline the HookEvent /
+# HTML rules follow), NOT a shared list — the current-cert docs that cite
+# the certified pgvector pin as a PRESENT fact. Deliberately EXCLUDES the
+# history surfaces the coordinator called out: CHANGELOG.md (never in any
+# scan set), docs/v1.0.0/release-notes.md (the SHIPPED v1.0.0 stack was
+# pgvector 0.8.5 — a true past-release record), the v1.0.0 test-campaign
+# artifacts, docs/audit/* (the frozen 2026-08-01 claims register), and
+# docs/architectures-t3.html (a frozen 0.8.2 mention). Those describe a
+# past-shipped or alternate stack, not the current provisioning pin.
+PGVECTOR_DOC_FILES=(
+    docs/CONFIG_SCHEMA.md
+    docs/enterprise-deployment.md
+    docs/postgres-age-guide.md
+    docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md
 )
 
 # CHANGELOG.md is intentionally excluded — every entry is a historical
@@ -413,6 +456,108 @@ for ln, line in enumerate(open('$f').read().splitlines(), 1):
                 emit_fail "$rule_name" "$f" "$ln" "$val" "$canonical" "$context"
             fi
         done <<< "$narrative_rows"
+    done
+}
+
+# pgvector certified-patch rule.
+# The certified pgvector PATCH is pinned ONCE, in the docker-1461 lane's
+# `DOCKER_1461_PGVECTOR_APT_VERSION` default (reduced x.y.z) — the SAME
+# SSOT default tests/provisioning_pgvector_pin_parity.rs reads. Every
+# current-cert doc citation must agree; this rule HARD-BLOCKS any doc that
+# cites a pgvector version != the SSOT patch.
+#
+# THREE anchor forms (mirroring the #2492 noun-phrase discipline):
+#   A. SSOT table cell:  `pgvector | **X.Y.Z**` / `pgvector (server extension) | **X.Y.Z**`
+#   B. prose:            `pgvector X.Y.Z` / `pgvector **X.Y.Z**` / `pgvector \x60X.Y.Z\x60`
+#   C. apt pin literal:  `PGVECTOR_APT_VERSION=X.Y.Z-`
+# The two-part Rust binding-crate figure (`pgvector = "0.4"`, `pgvector
+# (Rust binding crate) | **0.4**`) is NEVER matched: every anchor requires
+# a full THREE-component x.y.z.
+#
+# ALTERNATE-STACK GUARD (load-bearing). Three of these current-cert docs
+# legitimately name the DISJOINT alternate/campaign matrix — the
+# `infra/lan-parity-test` PG 16 + AGE 1.6.0 + pgvector 0.8.2 combination
+# and the 2-node DO campaign's PG 16 / AGE 1.6.0 / pgvector 0.8.4 — as
+# EXPLICITLY-LABELLED non-certified evidence. A line asserting a pgvector
+# figure alongside the alternate PG16/AGE1.6 stack, or self-labelled
+# `alternate matrix` / `second tested combination`, is definitionally not
+# the certified pin, so it is skipped. The certified pin is PG 18.4 / AGE
+# 1.7.0, so these markers never appear on a genuine certified line — the
+# guard's only failure mode is a rare false-NEGATIVE, never a false drift
+# report. (The register's F9 findings-row form `pgvector0.8.5` — no space,
+# slash-joined — matches no anchor at all and needs no guard.)
+check_pgvector_version_rule() {
+    local rule_name="PGVECTOR_APT_VERSION (certified pgvector patch)"
+    local canonical="$CANONICAL_PGVECTOR_PATCH"
+    for f in "${PGVECTOR_DOC_FILES[@]}"; do
+        [[ -f "$f" ]] || continue
+        # Empty canonical + a doc to validate = the SSOT file was
+        # unreadable. FAIL CLOSED (#2713 discipline) rather than flag
+        # every citation as drift OR silently pass.
+        if [[ -z "$canonical" ]]; then
+            printf 'FAIL: %s: could not resolve the pgvector SSOT patch from deploy/docker-1461/provision/lib.sh (DOCKER_1461_PGVECTOR_APT_VERSION) — refusing to validate %s (#2713 fail-closed)\n' \
+                "$rule_name" "$f" >&2
+            fail_count=$((fail_count + 1))
+            continue
+        fi
+        # Capture-then-check (never `done < <(python3 …)`): a
+        # process-substitution's exit status is unobserved under
+        # `set -euo pipefail`, so a crashing engine would silently pass.
+        local pgv_rows
+        pgv_rows="$(
+            python3 -c "
+import re
+pats = [
+    re.compile(r'pgvector[^|]*\|[ ]*\*\*([0-9]+\.[0-9]+\.[0-9]+)\*\*'),
+    re.compile(r'pgvector[ ]+(?:\*\*|\x60)?([0-9]+\.[0-9]+\.[0-9]+)'),
+    re.compile(r'PGVECTOR_APT_VERSION=([0-9]+\.[0-9]+\.[0-9]+)-'),
+]
+# Standard historical guard (paragraph-lead attributed to a non-current
+# release; headings; unconditional past-tense) — mirrors is_historical in
+# the generalised scanner. Single-quoted regexes only (this python is
+# embedded in a double-quoted shell string).
+_release = '''$CANONICAL_RELEASE_VERSION'''
+_PARA_LEAD = re.compile(r'^\s*\*\*v([0-9]+\.[0-9]+\.[0-9]+)')
+_HIST = [
+    re.compile(r'^\s*#{1,6}\s'),
+    re.compile(r'\b[Aa]t the v[0-9]+\.[0-9]+\.[0-9]+ release\b'),
+    re.compile(r'\brelease, surface was\b'),
+]
+# ALTERNATE / campaign-stack markers (see the function header): a pgvector
+# figure sharing a line with the disjoint PG16/AGE1.6 stack, or a
+# self-labelled alternate/second matrix, is NOT the certified pin.
+_ALT = [
+    re.compile(r'AGE 1\.6\.0'),
+    re.compile(r'PostgreSQL 16\b'),
+    re.compile(r'\bPG 16\b'),
+    re.compile(r'alternate matrix'),
+    re.compile(r'second tested combination'),
+]
+def _skip(line):
+    m = _PARA_LEAD.match(line)
+    if m and m.group(1) != _release:
+        return True
+    if any(p.search(line) for p in _HIST):
+        return True
+    return any(p.search(line) for p in _ALT)
+for ln, line in enumerate(open('$f', encoding='utf-8').read().splitlines(), 1):
+    if _skip(line):
+        continue
+    for p in pats:
+        for m in p.finditer(line):
+            ctx = line.strip()[:160].replace('\t', ' ')
+            print(f'{ln}\t{m.group(1)}\t{ctx}')
+"
+        )" || {
+            printf 'FAIL: check-docs-vs-ssot: pgvector-patch analysis engine errored on %s (python exited non-zero) — refusing to report PASS (#2713 fail-closed)\n' "$f" >&2
+            exit 2
+        }
+        while IFS=$'\t' read -r ln val context; do
+            [[ -z "$val" ]] && continue
+            if [[ "$val" != "$canonical" ]]; then
+                emit_fail "$rule_name" "$f" "$ln" "$val" "$canonical" "$context"
+            fi
+        done <<< "$pgv_rows"
     done
 }
 
@@ -761,6 +906,7 @@ run_all_rules() {
     check_schema_version_rule
     check_env_var_census_rule
     check_generalised_numeric_claims
+    check_pgvector_version_rule
     # MCP tool count at --profile full
     check_narrative_count_rule \
         "Profile::full().expected_tool_count() (registry tools)" \
@@ -880,11 +1026,12 @@ run_all_rules() {
         printf '     MemoryLinkRelation::COUNT = %s\n' "$CANONICAL_LINK_COUNT" >&2
         printf '     MemoryScope::COUNT = %s\n' "$CANONICAL_SCOPE_COUNT" >&2
         printf '     HookEvent variants = %s\n' "$CANONICAL_HOOK_EVENTS" >&2
+        printf '     pgvector patch = %s (deploy/docker-1461/provision/lib.sh DOCKER_1461_PGVECTOR_APT_VERSION)\n' "$CANONICAL_PGVECTOR_PATCH" >&2
         printf '     Current release version (Cargo.toml) = %s\n' "$CANONICAL_RELEASE_VERSION" >&2
         exit 1
     fi
     printf '✅ docs-vs-SSOT drift gate: PASS\n'
-    printf '   Canonical values: schema=%s, full_tools=%s, core_tools=%s, routes=%s, paths=%s, cli_default=%s, cli_sal=%s, mem_fields=%s, link=%s, scope=%s, hooks=%s, release=%s\n' \
+    printf '   Canonical values: schema=%s, full_tools=%s, core_tools=%s, routes=%s, paths=%s, cli_default=%s, cli_sal=%s, mem_fields=%s, link=%s, scope=%s, hooks=%s, pgvector=%s, release=%s\n' \
         "$CANONICAL_SCHEMA_VERSION" \
         "$CANONICAL_FULL_TOOL_COUNT" \
         "$CANONICAL_CORE_TOOL_COUNT" \
@@ -896,6 +1043,7 @@ run_all_rules() {
         "$CANONICAL_LINK_COUNT" \
         "$CANONICAL_SCOPE_COUNT" \
         "$CANONICAL_HOOK_EVENTS" \
+        "$CANONICAL_PGVECTOR_PATCH" \
         "$CANONICAL_RELEASE_VERSION"
 }
 
@@ -1331,6 +1479,68 @@ HOOKHISTPD
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test — historical hook mentions (prior-release lead, 'ships N', frozen baseline) still PASS"
+
+    # ---- PGVECTOR CERTIFIED-PATCH RULE. The certified pgvector patch is
+    # pinned ONCE in deploy/docker-1461/provision/lib.sh's
+    # DOCKER_1461_PGVECTOR_APT_VERSION default (the SAME default
+    # tests/provisioning_pgvector_pin_parity.rs reads); ~15 current-cert
+    # doc citations must agree. Plant the SSOT at 0.8.6, then plant a doc
+    # citing a STALE 0.8.5 across all three anchor forms and assert the
+    # gate REJECTS it; the correct 0.8.6 must PASS. Clean the leftover
+    # HookEvent fixtures first so this leg isolates exactly the planted
+    # pgvector doc.
+    rm -f "$led" "$tmpdir/docs/production-deployment.md"
+    mkdir -p "$tmpdir/deploy/docker-1461/provision"
+    cat > "$tmpdir/deploy/docker-1461/provision/lib.sh" <<'PGVECSSOT'
+PGVECTOR_APT_VERSION="${DOCKER_1461_PGVECTOR_APT_VERSION:-0.8.6-1.pgdg13+1}"
+PGVECSSOT
+    cat > CLAUDE.md <<'PGVECCLEANCLAUDE'
+Fixture CLAUDE.md — deliberately carries no narrative counts.
+PGVECCLEANCLAUDE
+    cat > README.md <<'PGVECCLEANREADME'
+Fixture README — deliberately carries no narrative counts.
+PGVECCLEANREADME
+    # Fixture SSOT patch = 0.8.6; plant a stale 0.8.5 across all three
+    # anchors (table cell, prose, apt literal).
+    cat > "$tmpdir/docs/CONFIG_SCHEMA.md" <<'PGVECSTALE'
+| pgvector (server extension) | **0.8.5** | `PGVECTOR_APT_VERSION=0.8.5-1.pgdg13+1` |
+| pgvector (Rust binding crate) | **0.4** | `pgvector = "0.4"` |
+The image layers pgvector 0.8.5 onto the AGE base.
+> Alternate tested matrix: PG 16 + AGE 1.6.0 + pgvector 0.8.2 is a second tested combination.
+PGVECSTALE
+    if pgv_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+        echo "FAIL: self-test — gate did NOT catch the stale pgvector patch (0.8.5 vs SSOT 0.8.6)" >&2
+        printf '%s\n' "$pgv_out" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    grep -qF 'PGVECTOR_APT_VERSION (certified pgvector patch): docs/CONFIG_SCHEMA.md' <<<"$pgv_out" || {
+        echo "FAIL: self-test — stale pgvector patch not flagged by the pgvector rule" >&2
+        printf '%s\n' "$pgv_out" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    # The two-part Rust binding-crate figure (0.4) and the alternate-matrix
+    # 0.8.2 must NOT be flagged — a match on either is a false positive.
+    if grep -qF 'pgvector patch): docs/CONFIG_SCHEMA.md:2' <<<"$pgv_out"; then
+        echo "FAIL: self-test — pgvector rule falsely flagged the two-part Rust crate figure (0.4)" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    if grep -qF 'pgvector patch): docs/CONFIG_SCHEMA.md:4' <<<"$pgv_out"; then
+        echo "FAIL: self-test — pgvector rule falsely flagged the alternate PG16/AGE1.6 matrix (0.8.2)" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    echo "PASS: self-test — pgvector rule REJECTS a stale patch across all three anchors, spares the Rust-crate + alternate-matrix figures"
+
+    # ---- PGVECTOR CONTROL: the correct patch (matching SSOT 0.8.6) PASSES.
+    cat > "$tmpdir/docs/CONFIG_SCHEMA.md" <<'PGVECGOOD'
+| pgvector (server extension) | **0.8.6** | `PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1` |
+The image layers pgvector 0.8.6 onto the AGE base.
+> Alternate tested matrix: PG 16 + AGE 1.6.0 + pgvector 0.8.2 is a second tested combination.
+PGVECGOOD
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+        echo "FAIL: self-test — pgvector rule fired on the CORRECT patch (0.8.6)" >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    echo "PASS: self-test — the certified pgvector patch (0.8.6) still PASSES"
 
     cd "$REPO_ROOT"
 }

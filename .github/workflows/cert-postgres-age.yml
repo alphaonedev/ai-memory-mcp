@@ -39,7 +39,7 @@
 #
 #   * PostgreSQL   18.4   (EXPECTED_PG_VERSION=18.4)
 #   * Apache AGE   1.7.0  (EXPECTED_AGE_VERSION=1.7.0; base image apache/age:release_PG18_1.7.0)
-#   * pgvector     0.8.5  (PGVECTOR_APT_VERSION=0.8.5-1.pgdg13+1)
+#   * pgvector     0.8.6  (PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1)
 #
 # `deploy/docker-1461/Dockerfile.pg-age-vector` bumps the apache/age base
 # image's server to the exact pinned minor via a pgdg `apt --only-upgrade`
@@ -142,7 +142,7 @@ jobs:
             echo "CERT_EXPECTED_PG_VERSION=${EXPECTED_PG_VERSION}"
             echo "CERT_EXPECTED_AGE_VERSION=${EXPECTED_AGE_VERSION}"
             # pg_extension.extversion for pgvector reports the bare semver
-            # (e.g. "0.8.5"), never the pgdg package suffix — strip it here
+            # (e.g. "0.8.6"), never the pgdg package suffix — strip it here
             # once so the assert step below has no literal of its own.
             echo "CERT_EXPECTED_PGVECTOR_VERSION=${PGVECTOR_APT_VERSION%%-*}"
           } >> "$GITHUB_ENV"
