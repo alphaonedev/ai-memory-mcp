@@ -8605,7 +8605,9 @@ pub fn consolidate(
             expires_at: None,
             metadata: merged_metadata_value.clone(),
             reflection_depth: 0,
-            memory_kind: crate::models::MemoryKind::Observation,
+            // v1.0.0 #2935 — a consolidation is a DERIVED synthesis: `Claim`
+            // per vote 4d3ea1c5, never a first-hand Observation (the defect).
+            memory_kind: crate::models::MemoryKind::Claim,
             entity_id: None,
             persona_version: None,
             citations: Vec::new(),
@@ -8667,9 +8669,11 @@ pub fn consolidate(
         // v1.0.0 #2935 — the `confidence` column binds `?17` (min over the
         // source confidences, captured above), NOT the former hardcoded 1.0.
         conn.execute(
-            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, expires_at, metadata, confidence_source, cid, cid_genesis, encrypted_envelope)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?17, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-            params![new_id, tier.as_str(), namespace, title, content_to_store, tags_json, max_priority, source, total_access, now, candidate.effective_expires_at(), metadata_json, candidate.confidence_source.as_str(), cid_stamp.cid, cid_stamp.genesis, encrypted_envelope, min_confidence],
+            // v1.0.0 #2935 — bind `memory_kind` (?18); the pre-fix INSERT
+            // omitted it so the row fell to the schema default ('observation').
+            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, expires_at, metadata, confidence_source, cid, cid_genesis, encrypted_envelope, memory_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?17, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?18)",
+            params![new_id, tier.as_str(), namespace, title, content_to_store, tags_json, max_priority, source, total_access, now, candidate.effective_expires_at(), metadata_json, candidate.confidence_source.as_str(), cid_stamp.cid, cid_stamp.genesis, encrypted_envelope, min_confidence, candidate.memory_kind.as_str()],
         )?;
 
         // v0.9.0 G13-mem (#1859, COND 1) — the SINGLE consolidate-leaf
@@ -20836,8 +20840,8 @@ mod tests {
         // v1.0.0 #2935 (R20 residual) — a consolidated (derived) memory must
         // NOT launder low-confidence source claims into a maximally-certain
         // 1.0 summary: its confidence == min(source confidences), not a
-        // hardcoded 1.0. (The derived-row memory_kind is decided separately by
-        // a crossroads vote and is deliberately NOT asserted here.)
+        // hardcoded 1.0. The derived-row memory_kind is `Claim` (vote 4d3ea1c5)
+        // — a derived synthesis, never a first-hand Observation.
         let conn = test_db();
         let mut m1 = make_memory("Claim A", "test", Tier::Mid, 5);
         m1.confidence = 0.6;
@@ -20870,6 +20874,13 @@ mod tests {
         assert!((combined.confidence - 0.6).abs() < 1e-9);
         // Provenance stays honest: engine-derived, not caller-provided.
         assert_eq!(combined.confidence_source, ConfidenceSource::CuratorDerived);
+        // #2935 vote 4d3ea1c5: a derived synthesis is stamped Claim.
+        assert_eq!(
+            combined.memory_kind,
+            crate::models::MemoryKind::Claim,
+            "consolidated memory_kind should be Claim (derived), got {:?}",
+            combined.memory_kind
+        );
     }
 
     #[test]

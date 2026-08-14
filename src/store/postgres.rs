@@ -21417,7 +21417,10 @@ impl MemoryStore for PostgresStore {
             expires_at: None,
             metadata: merged_metadata_value.clone(),
             reflection_depth: 0,
-            memory_kind: crate::models::MemoryKind::Observation,
+            // v1.0.0 #2935 — a consolidation is a DERIVED synthesis, not a
+            // first-hand Observation. Stamped `Claim` per the 5-agent crossroads
+            // vote (4d3ea1c5); backend-parity with the sqlite consolidate builder.
+            memory_kind: crate::models::MemoryKind::Claim,
             entity_id: None,
             persona_version: None,
             citations: Vec::new(),
@@ -21491,11 +21494,12 @@ impl MemoryStore for PostgresStore {
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, expires_at, metadata,
-                confidence_source, cid, cid_genesis, encrypted_envelope
+                confidence_source, cid, cid_genesis, encrypted_envelope,
+                memory_kind
             -- v1.0.0 #2935 — `confidence` binds $17 (min over the source
             -- confidences, captured above), NOT the former hardcoded 1.0; the
             -- ON CONFLICT arm's `confidence = EXCLUDED.confidence` re-uses it.
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $17, $8, $9, $10, $10, $11, $12, $13, $14, $15, $16)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $17, $8, $9, $10, $10, $11, $12, $13, $14, $15, $16, $18)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 tier = CASE
                     WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
@@ -21508,6 +21512,8 @@ impl MemoryStore for PostgresStore {
                 tags = EXCLUDED.tags,
                 priority = EXCLUDED.priority,
                 confidence = EXCLUDED.confidence,
+                -- v1.0.0 #2935 — derived kind (Claim) moves on re-consolidation.
+                memory_kind = EXCLUDED.memory_kind,
                 source = EXCLUDED.source,
                 access_count = EXCLUDED.access_count,
                 updated_at = EXCLUDED.updated_at,
@@ -21555,6 +21561,9 @@ impl MemoryStore for PostgresStore {
         .bind(consolidate_envelope)
         // v1.0.0 #2935 — $17: min(source confidences).
         .bind(min_confidence)
+        // v1.0.0 #2935 — $18: derived kind (Claim, vote 4d3ea1c5); the pre-fix
+        // INSERT omitted memory_kind so the row fell to the schema default.
+        .bind(candidate.memory_kind.as_str())
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("consolidate upsert", e))?;
