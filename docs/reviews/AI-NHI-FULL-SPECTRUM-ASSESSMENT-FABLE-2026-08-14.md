@@ -108,43 +108,78 @@ assessment's spine; each is chosen because it targets a way a memory could
 
 ## 4. Findings to date
 
-### F-L1 · The contradiction detector cries wolf on agreeing memories — **PLAUSIBLE** (design gap)
+### F-L3b · Consolidation launders derived memories into first-hand certainty — **PROVEN** (fixed: #2935 / PR #2936)
 
-**Probe.** Asked the substrate whether two of my own memories contradict:
+**The one proven defect of this assessment.** `memory_consolidate` — the
+primitive that distills N source memories into one — stamped its derived
+output `memory_kind = Observation` **and** `confidence = 1.0`, regardless of
+the sources. A fresh-subprocess run (pm-v3.3) over the Atlas corpus
+consolidated two `claim` memories at confidence 0.6 / 0.7 into a row reading
+`memory_kind=observation, confidence=1.0, confidence_source=curator_derived`.
 
-- `d699fd07` — *"…pgvector NOW 0.8.6…"*
-- `a422ab0e` — *"pin cert pgvector to 0.8.6 (was 0.8.5)"*
+**Why it's wrong (the novel angle).** A consolidation is a *derived synthesis*
+of uncertain claims. Stamping it `Observation` asserts the substrate
+**witnessed** it first-hand; stamping `confidence=1.0` asserts it is
+**more certain than any of its own sources**. The substrate manufactures
+first-hand certainty out of second-hand uncertainty — the precise
+epistemic-laundering the SIGNABLE-WRITE-V2 spec §4/§101 names as *the*
+violation. At fleet scale, every distillation round ratchets uncertain content
+toward false certainty. This is the residual of R20 (#1958, closed) whose
+min-propagation remedy never reached the two production output builders
+(`db::consolidate`, `PostgresStore::consolidate`).
 
-**Result.** `memory_detect_contradiction` → **`contradicts: true`**. The same
-false positive fired at store time (`a422ab0e.potential_contradictions =
-[d699fd07]`).
+**Fix (landing).** Issue #2935 filed; PR #2936 fixes both builders on both
+backends: `confidence = min(source confidences)` (R20 remedy) **and**
+`memory_kind = Claim` (a derived assertion). The `Claim` choice came from a
+5-agent crossroads vote (`4d3ea1c5`) that **overturned** an initial `Reflection`
+proposal — `Reflection` would have swapped confidence-laundering for
+*recall-laundering* (the 1.2× reflection_boost keys solely on `kind==Reflection`)
+and produced an incoherent half-member (`kind=Reflection`, `reflection_depth=0`,
+no `reflects_on` chain). A found-during-fix parallel test-isolation flake was
+filed separately (#2937).
 
-**Why it's wrong.** The two memories *agree* — the second is the action that
-implements the first. The detector saw "0.8.5" and "0.8.6" both present and
-called it a contradiction. **A supersession is not a contradiction; it is a
-temporal update** — precisely what the substrate's own bitemporal
-(`valid_from`/`valid_until`) and `supersedes` machinery exists to model. The
-contradiction primitive has **no supersession-vs-contradiction
-discriminator.**
+### F-L1 · Contradiction detector — **NOT REPRODUCED AT HEAD** (retracted; latent robustness note only)
 
-**Why it matters to a mind (the novel angle).** At fleet scale this fires on
-*every* "X → newer-X" update. An agent trained by constant false alarms
-learns to **ignore** contradiction signals — and then a *real* contradiction
-slips through. A memory that cries wolf degrades the very cognition it is
-meant to protect.
+**Initial read (now retracted).** From the bare detector prompt
+(`src/llm.rs:692` — *"Do these two statements contradict each other? yes/no"*,
+no temporal-update / different-subject discriminator) and a couple of
+complex real-memory observations, I hypothesized the detector *cries wolf* on
+supersessions (`0.8.5`→`0.8.6`) and complementary facts (PG 18.4 / AGE 1.7.0).
 
-**Honest caveats.**
-1. The verdict is an **LLM judgment** (`grok-4.5`), non-deterministic and
-   model-dependent — so this is a *design gap* (missing temporal-update
-   discriminator) surfaced through a model-judgment layer, **not** a
-   deterministic code bug. A fresh-subprocess re-probe (pm-v3.3 discipline)
-   precedes any filed defect.
-2. **Secondary observation:** `memory_get_links(a422ab0e)` → `count: 0`. The
-   "contradiction" was *detected* (store response + detector) but **no
-   `contradicts` graph edge was persisted**. Contradiction-detection is
-   ephemeral/advisory, never woven into the durable graph. This cuts both
-   ways: it avoids persisting a false positive, but it also means a *true*
-   contradiction leaves no durable edge for later reasoning.
+**Rigorous re-probe (pm-v3.3) refuted it.** A clean-tip release binary driven
+over a fresh MCP subprocess (live `grok-4.5`), 7 stable trials:
+
+| Pair | Verdict at HEAD | Correct? |
+|---|---|---|
+| supersession (`0.8.5` vs `0.8.6`) | `contradicts: false` | ✓ |
+| complementary (`PG 18.4` vs `AGE 1.7.0`) | `contradicts: false` | ✓ |
+| **control** (genuine: "healthy" vs "offline") | `contradicts: true` | ✓ |
+
+The **control returning `true`** proves the LLM path is live and
+discriminating, so the `false` verdicts are real grok-4.5 judgments. My earlier
+`true` observations were on complex real memories / the looser store-time echo,
+over-generalized from the prompt text. Per "1:1 *if proven*," **not filed.**
+
+**Honest residual (unproven).** The prompt *is* under-specified — a weak/local
+model (which the vendor-agnostic backend supports) on the bare prompt could
+still false-positive. That hazard is **unproven** (no live weak-model repro),
+so it is a latent robustness note, not a defect. A written hardening (temporal
++ different-subject rules + a deterministic `shares_subject_token` pre-check +
+tests) is available if a weak-model repro is ever produced.
+
+### F-L8a · Cross-space `[hybrid]` recall labeling — **documented, not filed** (mechanism proven; nuanced)
+
+Querying the Atlas corpus (gemini-768 vectors) while the binary fell back to
+the local MiniLM-384 embedder, recall reported mode `[hybrid]` and *changed the
+ranking* vs forced-keyword — proving the semantic leg blended a 384-d query
+against 768-d rows (zip-truncated under the default tolerant posture). The
+mechanism is real, but the disposition is nuanced: it is partly a test artifact
+(I used the wrong embedder for the corpus) and entangled with the *documented*
+tolerant default (`#2167`/`#2114`, both strict knobs OFF by design). **Not
+filed** (avoid noise per maximally-truthful); the one clean actionable
+sub-finding — recall should label/warn `unverified-space` rather than plain
+`[hybrid]` when the query embedder's space is unverified relative to the scored
+rows — is recorded for maintainer judgment.
 
 ### F-L7 · The substrate is impressively honest about itself — **PROVEN** (positive, with cosmetic nits)
 
@@ -167,12 +202,14 @@ overclaims.
 2. `capabilities.families.schema_version = "v0.6.4-families-1"` inside a
    `version: "1.0.0"` substrate — a mild internal-version dissonance.
 
-**The interesting tension between F-L1 and F-L7.** The substrate is
-*scrupulously honest about what it is*, yet its contradiction primitive is
-*epistemically overconfident* (calls agreement disagreement). Honesty about
-**capabilities** is not the same as honesty in **cognition** — and the second
-is the harder, more important kind for a memory that is supposed to protect a
-mind.
+**The interesting tension between F-L3b and F-L7.** The substrate is
+*scrupulously honest about what it advertises* (F-L7), yet its consolidation
+primitive *laundered derived uncertainty into first-hand certainty* (F-L3b).
+Honesty about **capabilities** is not the same as honesty in **cognition** —
+and the second is the harder, more important kind for a memory meant to
+protect a mind. (The contradiction primitive, F-L1, is where I *expected* the
+cognition defect to be — but the rigorous re-probe cleared it. The assessment
+has to verify its own hunches, not just generate them.)
 
 ---
 
@@ -180,19 +217,21 @@ mind.
 
 | Lens | State |
 |---|---|
-| L1 Recall-as-cognition | **Partial** — contradiction-surfacing probed (F-L1); ambiguity/right-answer recall PENDING |
+| L1 Recall-as-cognition | **Executed** — contradiction-surfacing probed (F-L1, *not-reproduced at HEAD*); ambiguity/right-answer recall PENDING |
 | L2 Self-continuity across death | PENDING (this very session is a live resurrection-from-compaction to exploit) |
-| L3 Reflection fidelity | PENDING (crown jewel) |
+| L3 Reflection/derivation fidelity | **Executed** — F-L3b PROVEN (consolidation-laundering), filed #2935 / fixed in PR #2936 |
 | L4 Epistemic hygiene | PENDING |
 | L5 Injection-to-memory | PENDING (signer now built) |
 | L6 Shared mind | PENDING (certified PG 18.4 daemon) |
 | L7 Self-truthfulness | **Executed** (F-L7) |
-| L8 Availability integrity | PENDING |
+| L8 Availability integrity | **Partial** — F-L8a cross-space `[hybrid]` labeling (mechanism proven; documented, not filed) |
 | L9 Erasure integrity | PENDING |
 | L10 Scale realism | PENDING |
 
-**2 of 10 lenses executed live.** This document will be updated in place as
-the remaining lenses run. Nothing here is a final verdict.
+**4 of 10 lenses executed live** (L1, L3, L7, L8-partial); **1 proven fixable
+defect** (F-L3b → #2935 / PR #2936), the rest positives or documented-not-filed
+observations. This document is updated in place as the remaining lenses run.
+Nothing here is a final verdict.
 
 ---
 
@@ -201,11 +240,13 @@ the remaining lenses run. Nothing here is a final verdict.
 On the evidence so far, ai-memory is **strong on the two hardest things to
 fake**: it encrypts and attests its transit surface with real fail-closed
 behavior (§2), and it is *honest about its own limits* (F-L7) rather than
-overclaiming. The most interesting weakness so far is not a security hole but
-a **cognition-hygiene** one: the contradiction primitive cannot tell a
-*supersession* from a *disagreement* (F-L1), which — at the scale this
-substrate is designed for (millions → trillions of agents) — is exactly the
-class of defect that quietly erodes an agent's trust in its own memory.
+overclaiming. The one proven cognition-hygiene weakness is **F-L3b**:
+consolidation stamped its derived output as a first-hand `Observation` at
+`confidence 1.0`, manufacturing certainty out of uncertainty — exactly the
+class of defect that quietly erodes an agent's trust in its own memory at the
+scale this substrate is designed for. It is filed (#2935) and fixed in flight
+(PR #2936). Notably, the contradiction primitive I *expected* to be the
+weakness (F-L1) held up under rigorous re-probing.
 
 A memory substrate for autonomous minds must be judged less on *"does the API
 return a row"* and more on *"does it protect the mind's grip on what is
