@@ -69,15 +69,20 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
 > certification inside an ARCHITECTED deployment envelope, not a
 > validated-capacity claim.** The 500–1000-agent / ≤ 50-peer figure is a
 > **derived topology ceiling**, and it carries the same qualifier
-> `docs/federation.md` carries (lines 21–32 and 669–675, "Design scale
-> envelope (derived topology ceiling)"): **this envelope is ARCHITECTED,
-> not MEASURED — the largest real-mesh-measured federation is 2 nodes,
-> and the full-scale USL capacity projection is deferred to a dedicated
-> capacity bench
-> ([#2921](https://github.com/alphaonedev/ai-memory-mcp/issues/2921);
-> [#2438](https://github.com/alphaonedev/ai-memory-mcp/issues/2438), which
-> recorded the scope reset that retired the 1M claim, is CLOSED and is not
-> the bench tracker).**
+> `docs/federation.md` carries ("Design scale envelope (derived topology
+> ceiling)"): **the PEER dimension is now MEASURED — a real enrolled
+> full mesh at N = 2, 5, 10, 25 and 50 peers on a single host (every
+> rung fully converged; the fan-out knee lands between 10 and 25 peers,
+> where the ~50-peer guidance already sat), with the largest CROSS-HOST
+> measured federation still 2 nodes — while the 500–1000 AGENT figure
+> remains ARCHITECTED, not measured: no agent population of that size
+> has been run** (methodology + numbers:
+> `docs/bench/capacity-envelope-2921.md`, the
+> [#2921](https://github.com/alphaonedev/ai-memory-mcp/issues/2921)
+> capacity bench;
+> [#2438](https://github.com/alphaonedev/ai-memory-mcp/issues/2438), the
+> scope reset that retired the 1M claim, is CLOSED and is not the bench
+> tracker).**
 > Scale past one cluster by adding independent clusters, never by
 > growing one mesh past the ~50-peer ceiling.
 >
@@ -98,9 +103,10 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
 >
 > A Fortune-500 reading this should take it as: *the trust boundary has
 > been adversarially tested and mechanically proven load-bearing at this
-> shape*, and separately: *the capacity of that shape is unmeasured
-> beyond 2 nodes and must be established on your own hardware before
-> you size against it.*
+> shape*, and separately: *peer-count behaviour is measured to 50 on one
+> host and 2 cross-host; the AGENT capacity of that shape is unmeasured
+> and must be established on your own hardware before you size against
+> it.*
 
 **What the boundary guarantees, stated precisely.** Under this configuration:
 
@@ -133,10 +139,11 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
      **not** end-to-end across federation (see §6).
    `ai-memory doctor --posture` **never opens the database**; a doctor
    PASS does not prove the passphrase is present or that a row would
-   decrypt. Code-side follow-ups (boot-gate self-attestation, pin-file
-   parse, `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT` under posture /
-   asi-hard) are tracked in
-   [#2911](https://github.com/alphaonedev/ai-memory-mcp/issues/2911).
+   decrypt. Boot-gate self-attestation and the FED-RQ-03 posture pin
+   landed 2026-08-13 (#2911 items 1-2, PR #2918 — checks #17/#18);
+   the remaining code-side follow-ups (pin-file parse; doctor attests
+   its own process, not a running daemon) are #2911 items **3-4**,
+   OPEN in [#2911](https://github.com/alphaonedev/ai-memory-mcp/issues/2911).
 5. **The audit spine is tamper-evident** (append-only `signed_events` cross-row
    hash chain + off-table watermark + witness anchor), with the honest residual
    bounds stated in `SECURITY.md`/`signed_events.rs`.
@@ -148,36 +155,43 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
 `ai-memory doctor --posture enterprise-federation` renders PASS/FAIL per
 requirement and **exits non-zero on any deviation of the running process**
 (the ruling's "a non-zero exit is falsifiable" bar). `run_posture`
-(`src/cli/doctor.rs:561`) returns **0 iff all 16 checks pass, else 2**
-(`:606`). Verified on the built `release/v1.0.0 @ e22bc93c` binary; raw
-output in `docs/compliance/evidence/cert-54/posture-{bare,hardened}-env.out`
-(recorded artifacts of the 2026-08-12 localhost runs; see that
-directory's `SANITIZATION.md` + `MANIFEST.sha256`):
+(`src/cli/doctor.rs:561`) returns **0 iff all 18 checks pass, else 2**
+(the posture grew 16 → 18 when #2918/#2911 landed checks #17
+boot-refusal-env self-attest and #18 FED-RQ-03). Re-captured 2026-08-13
+on the release-built binary at the post-remediation tree (the merged
+cert wave: #2915-#2920, #2925-#2927, #2929); raw output in
+`docs/compliance/evidence/cert-54/` (see that directory's
+`SANITIZATION.md` + `MANIFEST.sha256`):
 
 | Environment | Exit | Result |
 |---|---|---|
-| Bare (`AI_MEMORY_NO_CONFIG=1`, no posture knobs) | **2** | `overall: FAIL`, **exactly 6 `[FAIL]` rows of 16** (named below) |
-| Fully hardened, **non-sqlcipher** binary | **2** | `overall: FAIL`, EXACTLY ONE remaining: `AI_MEMORY_ENCRYPT_AT_REST` (requires `--features sqlcipher`) |
-| Fully hardened, **sqlcipher** binary + `ENCRYPT_AT_REST=1` | **0** | `overall: PASS` (see `docs/compliance/evidence/cert-54/posture-sqlcipher-pass.out`; 16 `[PASS]`, 0 `[FAIL]`) |
+| Bare (`AI_MEMORY_NO_CONFIG=1`, no posture knobs) | **2** | `overall: FAIL`, **exactly 8 `[FAIL]` rows of 18** (named below) |
+| Fully hardened, **non-sqlcipher** binary, boot gate not armed | **2** | `overall: FAIL`, exactly TWO remaining: `AI_MEMORY_ENCRYPT_AT_REST` (requires `--features sqlcipher`) and `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE` (the boot gate itself, unset on this leg by construction) |
+| Same hardened non-sqlcipher env **with the boot gate ARMED** | **1** | the binary **refuses to boot**, naming the below-floor control (`posture-hardened-boot-refusal.out`) — #2911 item 1's enforcement demonstrated, not merely reported |
+| Fully hardened, **sqlcipher** binary + `ENCRYPT_AT_REST=1`, boot gate ARMED | **0** | `overall: PASS` (`posture-sqlcipher-pass.out`; 18 `[PASS]`, 0 `[FAIL]`) — the certified configuration boots under the armed gate and passes clean |
 
 **Bare-leg FAIL rows** (from `posture-bare-env.out`, counted with
-`rg -c '\[FAIL\]'` = 6 — **not** "8"):
+`rg -c '\[FAIL\]'` = 8):
 
 1. `AI_MEMORY_SECURITY_PROFILE` (unset → `standard`)
-2. `AI_MEMORY_FED_TRUST_DOMAIN` (unset)
-3. `AI_MEMORY_FED_PEER_FINGERPRINTS` (unset)
-4. `AI_MEMORY_FED_PEER_ATTESTATION` (unset)
-5. `AI_MEMORY_FED_PEER_ATTESTATION` (no `**` allow-all glob) — the
+2. `asi-hard pinned knobs` — post-#2927 this row **FAILs honestly under
+   a `standard` profile** (`profile=standard — asi-hard pins not in
+   force; floor not evaluated`) instead of the pre-#2927 vacuous
+   `17/17 at floor` PASS (#2923)
+3. `AI_MEMORY_FED_TRUST_DOMAIN` (unset)
+4. `AI_MEMORY_FED_PEER_FINGERPRINTS` (unset)
+5. `AI_MEMORY_FED_PEER_ATTESTATION` (unset)
+6. `AI_MEMORY_FED_PEER_ATTESTATION` (no `**` allow-all glob) — the
    companion check, also FAIL when attestation is unset
-6. `AI_MEMORY_ENCRYPT_AT_REST` (`env=(unset) sqlcipher_build=false`)
+7. `AI_MEMORY_ENCRYPT_AT_REST` (`env=(unset) sqlcipher_build=false`)
+8. `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE` (unset — check
+   #17, the boot-refusal env self-attest added by #2918)
 
-The other 10 of 16 are PASS on the bare leg because those knobs already
+The other 10 of 18 are PASS on the bare leg because those knobs already
 default to the certified-compliant state when unset (peer enrollment /
 sig / nonce / push-namespace-scope / permissions / governance-fail-open
-/ sync-trust-peer / trust-body-agent-id / plaintext-peers). The remaining
-PASS is the `asi-hard pinned knobs` row, which reports `17/17 at floor`
-even when the profile itself is unset (the profile check is the separate
-FAIL row #1).
+/ sync-trust-peer / trust-body-agent-id / plaintext-peers /
+FED-RQ-03 policy-current, check #18).
 
 **Doctor caveats (do not over-read a PASS):**
 
@@ -186,18 +200,18 @@ FAIL row #1).
   `src/cli/doctor.rs:571-573`). It does **not** inspect a running
   daemon. Under systemd, run it with the daemon's exact
   `EnvironmentFile`.
-- A doctor PASS does **not** attest that
-  `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE` boot refusal is
-  armed. `enforce_at_boot_pre_runtime`
-  (`src/enterprise_federation_posture.rs:498-501`) returns `Ok(())`
-  immediately when that var is unset; `evaluate()`'s 16 checks never
-  consult it. Filed as
-  [#2911](https://github.com/alphaonedev/ai-memory-mcp/issues/2911)
-  item 1.
+- **RESOLVED (#2911 items 1-2, PR #2918, 2026-08-13):** a doctor PASS
+  now DOES attest the boot-gate env — check #17 FAILs whenever
+  `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE` is not armed, and
+  the committed `posture-hardened-boot-refusal.out` artifact records
+  the armed gate actually refusing boot on a below-floor control.
+  Check #18 pins FED-RQ-03 (`AI_MEMORY_FED_REQUIRE_POLICY_CURRENT`
+  not explicitly falsy) into the posture.
 - Check #10 (`AI_MEMORY_FED_PEER_FINGERPRINTS`) verifies the pin file
   *exists*; it does not parse pin lines. A garbage pin file passes
   posture. Filed as #2911 item 3 (TLS failure mode on unparseable pins
-  = *unverified*).
+  = *unverified*). #2911 items **3-4** (pin-file parse; doctor attests
+  its own process, not a running daemon) remain OPEN.
 
 **Load-bearing finding:** the posture **requires at-rest encryption**, so the
 certified enterprise-federation binary **must be sqlcipher-built**. The stock
@@ -274,28 +288,34 @@ e2e suite alone cannot). Proven:
 | `inbound_namespace_meta_authorized` | `federation_ns_meta_scope_2479::exploit_set_rebinds_out_of_scope_victim_standard_2479` | **RED → GREEN** |
 | `require_push_namespace_scope_enabled` (Layer-2 knob) | `federation_write_ns_scope_2447::enrolled_peer_without_declared_namespaces_denied_by_default_2447` | **RED → GREEN** |
 | `authorize_remote_checkpoint_resolution` (signature gate) | `federation_1936_checkpoint_fed::strict_refuses_unenrolled_resolver` | **RED → GREEN** |
-| `peer_enrolled_in_allowlist` (`:761`; sole call site `:1094`) | **NOT individually removal-proven.** `:1094` is inside helper `layer2_unscoped_peer_authorized` (declared `:1081`), which is called from **both** `inbound_write_namespace_authorized` (`:1049`) **and** `inbound_by_id_namespace_authorized` (`:1219`) — not "inside `inbound_write_namespace_authorized`" alone. Recorded individual mutation is behaviorally **masked** (`docs/compliance/evidence/cert-54/removal-peer_enrolled_in_allowlist-broken.out`: the mapped lane test — `sync_push_unknown_peer_id_refused_when_allowlist_configured_1056`, a different lane than `removal-proof-full.log`'s `federated_write_outside_peer_scope_refused_2447` — still `ok`, rc=0). Defense-in-depth: covered by row 1's removal proof plus the earlier `x_peer_id_not_in_allowlist` envelope gate. Decisive standalone test tracked in [#2912](https://github.com/alphaonedev/ai-memory-mcp/issues/2912) item 1. | **MASKED (broken→rc=0)** |
+| `peer_enrolled_in_allowlist` (`:761`; sole call site `:1094`) | **PROVEN on BOTH inbound lanes (2026-08-13, #2912 item 1 / PR #2919).** `:1094` is inside helper `layer2_unscoped_peer_authorized` (declared `:1081`), called from **both** `inbound_write_namespace_authorized` (`:1049`) **and** `inbound_by_id_namespace_authorized` (`:1219`); the harness MAP now carries a decisive row PER LANE (`tests/federation_peer_enrolled_2912.rs::unenrolled_peer_refused_on_{write,delete}_lane_when_scope_hatch_open_2912` — the hatch-open + header-absent shape that reaches Layer 2 rather than being masked by the earlier #1056 envelope gate), and `removal-proof-full.log` records both: broken→RED (rc=101), restored→GREEN. The 2026-08-12 capture's masked disposition (broken→rc=0 on the then-mapped `sync_push_unknown_peer_id_refused_when_allowlist_configured_1056` lane) is retained in `removal-proof-firstpass-2026-08-12.log` as the rigor trail. | **PROVEN (both lanes)** |
 
 All **5** real cited controls turn their decisive test RED when broken and GREEN when
 restored (evidence: `docs/compliance/evidence/cert-54/removal-*-{broken,restored}.out`).
-The sixth row is **asserted as defense-in-depth, not proven**.
-**Reaching the five proofs required correcting the control→test mapping twice** — the harness
-initially CERT-RED'd three controls because their first-mapped tests did not exercise
-them decisively (the namespace check, not the enrollment/signature/Layer-2 check, was
-refusing). That is the harness doing its job: a control whose mutation does not turn
-its lane test red is not proven load-bearing, and the certification does not accept it
-until the decisive test is found. The guard test column is now the test where each
-of the five is the SOLE decisive gate.
+As of 2026-08-13 **every row is individually PROVEN** — 7/7 `[PROVEN]`
+in `removal-proof-full.log`, including both `peer_enrolled_in_allowlist`
+lanes. **Reaching this required correcting the control→test mapping
+twice** — the harness initially CERT-RED'd three controls because their
+first-mapped tests did not exercise them decisively (the namespace
+check, not the enrollment/signature/Layer-2 check, was refusing), and
+`peer_enrolled_in_allowlist` stayed masked until #2912 item 1 authored
+the decisive hatch-open lane tests (PR #2919). That is the harness doing
+its job: a control whose mutation does not turn its lane test red is not
+proven load-bearing, and the certification does not accept it until the
+decisive test is found. The guard test column is now the test where each
+control is the SOLE decisive gate.
 
-> **Evidence-chain note (F5).** No full-harness `overall: PASS` log exists
-> for the **final** corrected control map. The per-control
-> broken/restored pairs are the proof artifacts.
-> `docs/compliance/evidence/cert-54/removal-proof-full.log` (ending
-> `overall: CERT-RED`) is the *superseded first-pass* record,
-> retained as the rigor trail that forced the remap. The harness MAP
-> covers only these receive_auth confinement controls — not the
-> envelope/signature gates cited in §1. Envelope-gate mutation proofs
-> are #2912 item 3.
+> **Evidence-chain note (F5) — CLOSED 2026-08-13.** A full-harness
+> `overall: PASS` log now exists for the **final** 7-row control map:
+> `docs/compliance/evidence/cert-54/removal-proof-full.log` records
+> **7/7 `[PROVEN]`** (broken→RED rc=101, restored→GREEN rc=0 per
+> control), including both `peer_enrolled_in_allowlist` lanes. The
+> superseded 2026-08-12 first-pass record (ending `overall: CERT-RED`,
+> pre-remap map) is retained as
+> `removal-proof-firstpass-2026-08-12.log` — the rigor trail that
+> forced the remap. The harness MAP covers only these receive_auth
+> confinement controls — not the envelope/signature gates cited in §1.
+> Envelope-gate mutation proofs remain #2912 item 3 (OPEN).
 
 ---
 
@@ -324,9 +344,12 @@ following should **not** treat v1.0.0 as sufficient:
   fully replicating (honest non-ack, never a silent drop). The sqlite/MCP-native
   path is complete.
 - **Scale envelope — ARCHITECTED, not MEASURED.** ~1000 agents, ≤ 50 peers
-  per block — **not 1M**. Largest real-mesh-measured federation = **2 nodes**.
-  USL capacity projection deferred to the open capacity-bench tracker
-  [#2921](https://github.com/alphaonedev/ai-memory-mcp/issues/2921)
+  per block — **not 1M**. PEER dimension MEASURED (#2921 bench,
+  `docs/bench/capacity-envelope-2921.md`): full mesh converged at
+  N = 2..50 peers single-host (convergence 6.1 s at N=2 → 256.6 s at
+  N=50 — the ceiling made visible); largest CROSS-HOST measured
+  federation = **2 nodes**; the AGENT figure remains a derived,
+  unmeasured ceiling
   ([#2438](https://github.com/alphaonedev/ai-memory-mcp/issues/2438), the
   scope reset, is closed). This is
   a trust-boundary certification within that architected envelope, **not** a
@@ -368,8 +391,11 @@ is observed:**
    proof** (mutation does not turn the lane test RED) voids it — the control is
    not load-bearing.
    *Observable:* the harness prints `[CERT-RED] control NOT proven
-   load-bearing` and ends `overall: CERT-RED` (see the retained first-pass
-   `docs/compliance/evidence/cert-54/removal-proof-full.log`).
+   load-bearing` and ends `overall: CERT-RED` (see the retained
+   first-pass
+   `docs/compliance/evidence/cert-54/removal-proof-firstpass-2026-08-12.log`;
+   the current full-map run ends `overall: PASS` in
+   `removal-proof-full.log`).
 4. **`cert-postgres-age.yml` certifying a stack that is NOT
    PG 18.4 / AGE 1.7.0 / pgvector 0.8.5** (a drift the `Assert certified stack
    versions` step should have caught) voids it.
@@ -414,20 +440,25 @@ this document does not self-authorize a tag cut.
 
 ## 8. Current determination
 
-**Status at `e22bc93c` (artifacts at `580d8427`, this re-issue amending
-the document):** the seven §5.4 falsifiability requirements are met as
-follows — §5.4(1) canonical doc = this document; §5.4(2) machine-checked
-posture = CLOSED (three-leg localhost proof: bare→exit 2 / **6 FAIL**,
-hardened-non-sqlcipher→exit 2 / 1 FAIL, hardened-sqlcipher→exit 0 /
-16 PASS); §5.4(3) executed pg+AGE+pgvector = green on the cert SHA at
+**Status at `e22bc93c` (original artifacts at `580d8427`; this re-issue
+amended through the merged 2026-08-13 remediation wave — #2915-#2920,
+#2925-#2927, #2929 — with evidence re-captured at that tree):** the
+seven §5.4 falsifiability requirements are met as follows — §5.4(1)
+canonical doc = this document; §5.4(2) machine-checked posture = CLOSED
+(four-leg localhost proof at 18 checks: bare→exit 2 / **8 FAIL**,
+hardened-non-sqlcipher→exit 2 / 2 FAIL, hardened-with-boot-gate-armed→
+**boot refusal** demonstrated, hardened-sqlcipher-armed→exit 0 /
+18 PASS); §5.4(3) executed pg+AGE+pgvector = green on the cert SHA at
 the pinned triple (single-node CI; see §3 stack-evidence note);
 §5.4(4) adversarial negative lanes = covered (including the five
 previously-omitted in-tree lanes named in §4); §5.4(5) removal proof =
-CLOSED for the **5** real controls, with `peer_enrolled_in_allowlist`
-reclassified as defense-in-depth / not individually removal-proven;
-§5.4(6) NOT-COVERED = §6 above (throughput figure struck; scale
-envelope qualified ARCHITECTED-not-MEASURED) + supersession of the
-v0.7.0-era docs; §5.4(7) disconfirmation clause = §7 above.
+CLOSED for all **7** control rows — `overall: PASS`, with
+`peer_enrolled_in_allowlist` upgraded from defense-in-depth/masked to
+**individually PROVEN on both inbound lanes** (#2912 item 1);
+§5.4(6) NOT-COVERED = §6 above (throughput cells now carry produced,
+host-cited figures via #2929; scale envelope: peers MEASURED, agents
+still a derived ceiling) + supersession of the v0.7.0-era docs;
+§5.4(7) disconfirmation clause = §7 above, mechanized in CI by #2915.
 
 ### Ratification (2026-08-12)
 
@@ -463,9 +494,9 @@ ruling, ratified under adversarial review.
 | F2 — §8 still said NOT-YET | This section. |
 | F3 — "43 entries/sec measured" has no in-tree producer | Struck; §6 now points at enterprise-deployment.md §11.1. |
 | F4 — bare leg "8 FAIL" vs recorded 6 | Corrected in §2 + this section. |
-| F5 — evidence chain in gitignored `.local-runs/` | Committed at `docs/compliance/evidence/cert-54/` (this re-issue). First-pass vs final-map disclosed. |
-| F6 — `peer_enrolled_in_allowlist` call-site premise wrong; individual removal masked | Corrected in §4 + harness NOTE. Decisive test: #2912. |
-| F7 — §7 expiry trigger mechanized nowhere | Task C / [**#2915**](https://github.com/alphaonedev/ai-memory-mcp/pull/2915). Named as such in §7. |
-| F8 — boot-refusal opt-in / unattested; doctor attests its own process; `FED_REQUIRE_POLICY_CURRENT=0` escapes | Doc-side caveats in §2. Code-side: [#2911](https://github.com/alphaonedev/ai-memory-mcp/issues/2911). |
+| F5 — evidence chain in gitignored `.local-runs/` | Committed at `docs/compliance/evidence/cert-54/` (this re-issue), re-captured 2026-08-13 at the post-remediation tree; the final-map full-harness `overall: PASS` log now exists (first-pass CERT-RED retained as the rigor trail). |
+| F6 — `peer_enrolled_in_allowlist` call-site premise wrong; individual removal masked | Corrected in §4 + harness NOTE; **CLOSED 2026-08-13** — #2912 item 1 (PR #2919) landed the decisive tests and the harness proves BOTH lanes (`removal-proof-full.log`, 7/7 PROVEN). Items 2-3 of #2912 remain open. |
+| F7 — §7 expiry trigger mechanized nowhere | **CLOSED** — Task C / [**#2915**](https://github.com/alphaonedev/ai-memory-mcp/pull/2915) merged 2026-08-13; the `cert-expiry-gate` job runs on every PR (red check until the operator-gated branch-protection API call adds it to the live required set). |
+| F8 — boot-refusal opt-in / unattested; doctor attests its own process; `FED_REQUIRE_POLICY_CURRENT=0` escapes | **PARTIALLY CLOSED 2026-08-13** — #2911 items 1-2 (PR #2918): posture checks #17/#18 self-attest the boot gate and pin FED-RQ-03, and `posture-hardened-boot-refusal.out` demonstrates the armed refusal. Items 3-4 (pin-file parse; doctor attests its own process) remain OPEN in #2911. |
 | F9 — campaign docs on PG16/AGE1.6.0/pgvector0.8.4 vs certified PG18.4/AGE1.7.0/pgvector0.8.5 | §3 stack-evidence note. Campaign-doc refresh: [#2913](https://github.com/alphaonedev/ai-memory-mcp/issues/2913). |
 | F10 LOWs — landing SHA, signer wording, omitted lanes, encryption-gate conflation, §4→§6 numbering | This re-issue. `docs/at-a-glance.html` v0.9-era copy: #2913 item 1 (out of this document's file set). |

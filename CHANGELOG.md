@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### cert-refresh (2026-08-13, post-remediation-wave evidence re-capture)
+
+- **docs(cert):** re-captured the full cert-54 evidence bundle at the
+  merged remediation tree: four posture legs at **18 checks** (bare 8
+  FAIL / hardened 2 FAIL / hardened-with-boot-gate-armed = demonstrated
+  BOOT REFUSAL / sqlcipher-armed 18 PASS exit 0) and the first
+  full-harness `overall: PASS` removal-proof log on the final 7-row
+  control map — `peer_enrolled_in_allowlist` PROVEN on both inbound
+  lanes (#2912 item 1). Cert doc updated; scale language now states
+  peers-MEASURED (N=2..50 single-host, 2 cross-host) vs agents-derived
+  (#2921). MANIFEST regenerated; SANITIZATION.md rewritten.
+
 ### Fixed (enterprise-federation posture — the `asi-hard pinned knobs` row no longer PASSes vacuously; #2923)
 
 - **`ai-memory doctor --posture enterprise-federation` no longer reports a satisfied hardened-floor check while the resolved security profile is `standard`** ([#2923](https://github.com/alphaonedev/ai-memory-mcp/issues/2923)). The `asi-hard pinned knobs` row was rendered from `security_profile::asi_hard_below_floor()` alone, which by construction reports only knobs an operator has explicitly set BELOW their floor — under `standard` nothing is pinned, the list is empty, and the row printed `[PASS] … 17/17 at floor` for a deployment where not one pin is in force. That row is captured verbatim in the cert-§5.4 evidence bundle staged in the un-merged [#2917](https://github.com/alphaonedev/ai-memory-mcp/pull/2917) (`docs/compliance/evidence/cert-54/posture-bare-env.out`; the file is NOT on `release/v1.0.0` yet), so it was on track to become committed, publicly-auditable cert evidence carrying a vacuous PASS — which is false assurance. The row is now paired with `is_asi_hard()` exactly as `asi_hard_below_floor`'s own docs prescribe: a non-`asi-hard` profile FAILS with `actual: (profile=standard — asi-hard pins not in force; the 17-knob hard floor was not evaluated)` and a fix that names the profile knob, and the `required:` text states the previously-implicit engagement precondition (`asi-hard engaged AND all 17 at hard floor`). An UNRECOGNISED profile token renders as `profile=unrecognised`, never as a posture the process does not have. Under `asi-hard` the row's `actual` / `pass` / `fix` are byte-identical to pre-#2923. The overall verdict is unchanged in every posture (the `AI_MEMORY_SECURITY_PROFILE` row already FAILed the bare leg), and the check count stays 18 — this is a per-row truthfulness fix, not a gate change. The bare-leg posture evidence bundle gains one more FAIL row and is re-captured with the cert-§5.4 artifacts.

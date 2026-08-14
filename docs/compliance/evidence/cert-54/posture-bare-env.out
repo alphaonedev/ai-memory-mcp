@@ -5,9 +5,10 @@ ai-memory doctor --posture enterprise-federation
          required: asi-hard
          actual:   (unset -> standard)
          fix:      set AI_MEMORY_SECURITY_PROFILE=asi-hard
-  [PASS] asi-hard pinned knobs
-         required: all 17 at hard floor (security_profile::KNOBS)
-         actual:   17/17 at floor
+  [FAIL] asi-hard pinned knobs
+         required: asi-hard engaged AND all 17 at hard floor (security_profile::KNOBS)
+         actual:   (profile=standard — asi-hard pins not in force; the 17-knob hard floor was not evaluated)
+         fix:      set AI_MEMORY_SECURITY_PROFILE=asi-hard so the hardened pins are in force, then re-run this check to evaluate the hard floor; see `src/security_profile.rs::KNOBS`
   [PASS] AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT
          required: not explicitly disabled (peer enrollment required) AND AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS not truthy (no rollout hatch open)
          actual:   AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT="(unset — defaults strict)"; AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS="(unset)"
@@ -55,5 +56,12 @@ ai-memory doctor --posture enterprise-federation
   [PASS] AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS (https-only peers)
          required: not truthy (the plaintext-peer refusal stays in force)
          actual:   (unset)
+  [FAIL] AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE
+         required: truthy (boot-refusal gate armed so future posture drift cannot silently boot)
+         actual:   (unset — boot gate inert)
+         fix:      set AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE=1
+  [PASS] AI_MEMORY_FED_REQUIRE_POLICY_CURRENT
+         required: not explicitly disabled (detected-stale inbound policy_version refused)
+         actual:   (unset — defaults strict)
 
 overall: FAIL

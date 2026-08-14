@@ -1,0 +1,3 @@
+Error: enterprise-federation certified posture (3x7 ruling §5.3, docs/audit/3x7-v1-cutline-ruling-2026-08-01.md) refuses to boot — 1 required control(s) missing or below floor:
+  - AI_MEMORY_ENCRYPT_AT_REST: required "1, on a binary built with --features sqlcipher", actual "env=(unset) sqlcipher_build=false". Fix: rebuild with --features sqlcipher AND set AI_MEMORY_ENCRYPT_AT_REST=1
+Run `ai-memory doctor --posture enterprise-federation` for the full report, or unset AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE to boot without this cert gate.

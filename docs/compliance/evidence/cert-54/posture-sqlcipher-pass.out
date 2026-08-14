@@ -5,7 +5,7 @@ ai-memory doctor --posture enterprise-federation
          required: asi-hard
          actual:   asi-hard
   [PASS] asi-hard pinned knobs
-         required: all 17 at hard floor (security_profile::KNOBS)
+         required: asi-hard engaged AND all 17 at hard floor (security_profile::KNOBS)
          actual:   17/17 at floor
   [PASS] AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT
          required: not explicitly disabled (peer enrollment required) AND AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS not truthy (no rollout hatch open)
@@ -30,7 +30,7 @@ ai-memory doctor --posture enterprise-federation
          actual:   cert-fleet-01
   [PASS] AI_MEMORY_FED_PEER_FINGERPRINTS
          required: <set> to a readable peer server-cert pin file
-         actual:   <repo-root>/.local-runs/cert-54-evidence/peer-fingerprints.txt
+         actual:   <repo-root>/.local-runs/cert-54-evidence-r2/peer-fingerprints.txt
   [PASS] AI_MEMORY_FED_PEER_ATTESTATION
          required: <set>; valid JSON (MALFORMED must refuse, never silently fall back)
          actual:   valid JSON, 1 peer(s) enrolled
@@ -49,5 +49,11 @@ ai-memory doctor --posture enterprise-federation
   [PASS] AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS (https-only peers)
          required: not truthy (the plaintext-peer refusal stays in force)
          actual:   
+  [PASS] AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE
+         required: truthy (boot-refusal gate armed so future posture drift cannot silently boot)
+         actual:   1
+  [PASS] AI_MEMORY_FED_REQUIRE_POLICY_CURRENT
+         required: not explicitly disabled (detected-stale inbound policy_version refused)
+         actual:   (unset — defaults strict)
 
 overall: PASS
