@@ -1,0 +1,48 @@
+   Compiling ai-memory v1.0.0 (<repo-root>)
+warning: unreachable expression
+   --> src/federation/receive_auth.rs:766:5
+    |
+765 |       return true; // CERT-REMOVAL-PROOF-MUTATION
+    |       ----------- any code following this expression is unreachable
+766 | /     peer_id
+767 | |         .map(str::trim)
+768 | |         .filter(|p| !p.is_empty())
+769 | |         .and_then(|p| attest_cfg.scope_for(p))
+770 | |         .is_some()
+    | |__________________^ unreachable expression
+    |
+    = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `peer_id`
+   --> src/federation/receive_auth.rs:762:5
+    |
+762 |     peer_id: Option<&str>,
+    |     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_peer_id`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `attest_cfg`
+   --> src/federation/receive_auth.rs:763:5
+    |
+763 |     attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
+    |     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_attest_cfg`
+
+warning: `ai-memory` (lib) generated 3 warnings (run `cargo fix --lib -p ai-memory` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 38.27s
+     Running tests/federation_peer_enrolled_2912.rs (.local-runs-target/debug/deps/federation_peer_enrolled_2912-5233d1d7b636ac54)
+
+running 1 test
+
+thread 'unenrolled_peer_refused_on_delete_lane_when_scope_hatch_open_2912' (641597) panicked at tests/federation_peer_enrolled_2912.rs:352:5:
+#2912 BY-ID: an anonymous (no x-peer-id) push must NOT hard-delete by id on a node that declares a peer allowlist, even with AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0. This is the #2497 anonymous-delete grant the predicate exists to close. If this assertion fails after mutating peer_enrolled_in_allowlist to `return true;`, the control is load-bearing on this lane too.
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test unenrolled_peer_refused_on_delete_lane_when_scope_hatch_open_2912 ... FAILED
+
+failures:
+
+failures:
+    unenrolled_peer_refused_on_delete_lane_when_scope_hatch_open_2912
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.30s
+
+error: test failed, to rerun pass `--test federation_peer_enrolled_2912`

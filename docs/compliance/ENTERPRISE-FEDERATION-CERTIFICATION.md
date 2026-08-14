@@ -44,9 +44,24 @@ triggers re-cert** (see §7).
 > `42db0696bb13ea524b5da9548d562b05df8ddc74`;
 > `git diff --stat e22bc93c b80e7fff` is empty). This re-issue adds the
 > committed evidence bundle under `docs/compliance/evidence/cert-54/`
-> and this document's own ratification / caveat corrections — still
-> under the same "no `src/` / no workflow / no `AI_MEMORY_FED_*`
-> change" property.
+> and this document's own ratification / caveat corrections.
+>
+> **Amendment (2026-08-13 re-capture).** The original three-file,
+> docs/harness-only delta above describes the CERTIFICATION LANDING at
+> `580d8427` and still holds for it: the certified binary at `580d8427`
+> IS the binary at `e22bc93c`. The subsequent remediation wave
+> (#2915-#2920, #2925-#2927, #2929, merged 2026-08-13) DID change `src/`
+> (posture checks #17/#18 in `src/enterprise_federation_posture.rs`,
+> `src/cli/doctor.rs`, the #2927 pins-row) and workflows — so the
+> re-captured §2/§4 evidence in this directory was produced by the
+> RELEASE-BUILT binary at the current release tip (the commit carrying
+> this document — see `SANITIZATION.md`, which now pins the producing
+> `git rev-parse HEAD`), NOT by the `e22bc93c` binary. The §7 re-cert
+> trigger fired for those `src/`/`AI_MEMORY_FED_*` changes and was
+> discharged by re-running §5.4(2)/(5) at the new tree — which is the
+> whole point of the wave. An auditor reproducing the 18-check/8-FAIL
+> legs must build at the SHA `SANITIZATION.md` names, not at `e22bc93c`
+> (which yields the pre-#2918 16-check posture).
 
 ---
 
@@ -72,8 +87,9 @@ ai-memory doctor --posture enterprise-federation   # exits non-zero on ANY devia
 > `docs/federation.md` carries ("Design scale envelope (derived topology
 > ceiling)"): **the PEER dimension is now MEASURED — a real enrolled
 > full mesh at N = 2, 5, 10, 25 and 50 peers on a single host (every
-> rung fully converged; the fan-out knee lands between 10 and 25 peers,
-> where the ~50-peer guidance already sat), with the largest CROSS-HOST
+> rung fully converged; aggregate /sync/push fan-out rises through
+> N=25 and then declines from N=25 to N=50 — the ~50-peer ceiling made
+> measured, not just architected), with the largest CROSS-HOST
 > measured federation still 2 nodes — while the 500–1000 AGENT figure
 > remains ARCHITECTED, not measured: no agent population of that size
 > has been run** (methodology + numbers:
@@ -170,13 +186,18 @@ cert wave: #2915-#2920, #2925-#2927, #2929); raw output in
 | Same hardened non-sqlcipher env **with the boot gate ARMED** | **1** | the binary **refuses to boot**, naming the below-floor control (`posture-hardened-boot-refusal.out`) — #2911 item 1's enforcement demonstrated, not merely reported |
 | Fully hardened, **sqlcipher** binary + `ENCRYPT_AT_REST=1`, boot gate ARMED | **0** | `overall: PASS` (`posture-sqlcipher-pass.out`; 18 `[PASS]`, 0 `[FAIL]`) — the certified configuration boots under the armed gate and passes clean |
 
+(The four exit statuses **2 / 2 / 1 / 0** are recorded in
+`docs/compliance/evidence/cert-54/posture-legs-exit-codes.txt`; the
+rendered `.out` files show the PASS/FAIL rows but not the process exit
+code.)
+
 **Bare-leg FAIL rows** (from `posture-bare-env.out`, counted with
 `rg -c '\[FAIL\]'` = 8):
 
 1. `AI_MEMORY_SECURITY_PROFILE` (unset → `standard`)
 2. `asi-hard pinned knobs` — post-#2927 this row **FAILs honestly under
    a `standard` profile** (`profile=standard — asi-hard pins not in
-   force; floor not evaluated`) instead of the pre-#2927 vacuous
+   force; the 17-knob hard floor was not evaluated`) instead of the pre-#2927 vacuous
    `17/17 at floor` PASS (#2923)
 3. `AI_MEMORY_FED_TRUST_DOMAIN` (unset)
 4. `AI_MEMORY_FED_PEER_FINGERPRINTS` (unset)
@@ -290,8 +311,8 @@ e2e suite alone cannot). Proven:
 | `authorize_remote_checkpoint_resolution` (signature gate) | `federation_1936_checkpoint_fed::strict_refuses_unenrolled_resolver` | **RED → GREEN** |
 | `peer_enrolled_in_allowlist` (`:761`; sole call site `:1094`) | **PROVEN on BOTH inbound lanes (2026-08-13, #2912 item 1 / PR #2919).** `:1094` is inside helper `layer2_unscoped_peer_authorized` (declared `:1081`), called from **both** `inbound_write_namespace_authorized` (`:1049`) **and** `inbound_by_id_namespace_authorized` (`:1219`); the harness MAP now carries a decisive row PER LANE (`tests/federation_peer_enrolled_2912.rs::unenrolled_peer_refused_on_{write,delete}_lane_when_scope_hatch_open_2912` — the hatch-open + header-absent shape that reaches Layer 2 rather than being masked by the earlier #1056 envelope gate), and `removal-proof-full.log` records both: broken→RED (rc=101), restored→GREEN. The 2026-08-12 capture's masked disposition (broken→rc=0 on the then-mapped `sync_push_unknown_peer_id_refused_when_allowlist_configured_1056` lane) is retained in `removal-proof-firstpass-2026-08-12.log` as the rigor trail. | **PROVEN (both lanes)** |
 
-All **5** real cited controls turn their decisive test RED when broken and GREEN when
-restored (evidence: `docs/compliance/evidence/cert-54/removal-*-{broken,restored}.out`).
+All **7** cited control rows turn their decisive test RED when broken and GREEN when
+restored (evidence: the per-control `docs/compliance/evidence/cert-54/removal-*-{broken,restored}.out` pairs re-captured 2026-08-13, and the full-harness `removal-proof-full.log` ending `overall: PASS` — 7/7 `[PROVEN]`).
 As of 2026-08-13 **every row is individually PROVEN** — 7/7 `[PROVEN]`
 in `removal-proof-full.log`, including both `peer_enrolled_in_allowlist`
 lanes. **Reaching this required correcting the control→test mapping
@@ -355,7 +376,10 @@ following should **not** treat v1.0.0 as sufficient:
   a trust-boundary certification within that architected envelope, **not** a
   validated-capacity claim. **Push / store / recall throughput is NOT
   PUBLISHED** — `docs/enterprise-deployment.md` §11.1 ("Sustained
-  throughput — NOT PUBLISHED") retired the ops/s table because an
+  throughput") — as of #2929 (2026-08-13) three of those cells
+  (`memory_store` / `memory_recall` / `/sync/push`) now carry
+  re-runnable, host-cited producers; the remaining eleven ops/s cells
+  stay NOT PUBLISHED. The section retired the original blanket table because an
   unproduced number is not data (`:1504-1536`). This document carries
   **no** throughput figure forward.
 - **No distributed consensus coordinator;** no cross-tier consistent snapshot.
@@ -493,7 +517,7 @@ ruling, ratified under adversarial review.
 | F1 HIGH — 500–1000 / ≤50 presented without the federation.md qualifier | This re-issue §1 + §6. |
 | F2 — §8 still said NOT-YET | This section. |
 | F3 — "43 entries/sec measured" has no in-tree producer | Struck; §6 now points at enterprise-deployment.md §11.1. |
-| F4 — bare leg "8 FAIL" vs recorded 6 | Corrected in §2 + this section. |
+| F4 — bare leg "8 FAIL" vs recorded 6 | **Reconciled 2026-08-13:** the 2026-08-12 capture recorded **6 FAIL of 16** (pre-#2918 posture). The remediation wave added posture checks #17/#18 (#2918) and made the pins row FAIL honestly under `standard` (#2927), so the re-captured bare leg now records **8 FAIL of 18** — a *different, larger* posture, not a reversion. §2 and §8 state 8/18 for the current tree; the 6/16 figure was true of the superseded artifacts only. |
 | F5 — evidence chain in gitignored `.local-runs/` | Committed at `docs/compliance/evidence/cert-54/` (this re-issue), re-captured 2026-08-13 at the post-remediation tree; the final-map full-harness `overall: PASS` log now exists (first-pass CERT-RED retained as the rigor trail). |
 | F6 — `peer_enrolled_in_allowlist` call-site premise wrong; individual removal masked | Corrected in §4 + harness NOTE; **CLOSED 2026-08-13** — #2912 item 1 (PR #2919) landed the decisive tests and the harness proves BOTH lanes (`removal-proof-full.log`, 7/7 PROVEN). Items 2-3 of #2912 remain open. |
 | F7 — §7 expiry trigger mechanized nowhere | **CLOSED** — Task C / [**#2915**](https://github.com/alphaonedev/ai-memory-mcp/pull/2915) merged 2026-08-13; the `cert-expiry-gate` job runs on every PR (red check until the operator-gated branch-protection API call adds it to the live required set). |

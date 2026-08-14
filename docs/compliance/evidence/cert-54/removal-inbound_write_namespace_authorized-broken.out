@@ -1,0 +1,496 @@
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling libc v0.2.185
+   Compiling cfg-if v1.0.4
+   Compiling serde_core v1.0.228
+   Compiling serde v1.0.228
+   Compiling find-msvc-tools v0.1.9
+   Compiling shlex v1.3.0
+   Compiling once_cell v1.21.4
+   Compiling memchr v2.8.0
+   Compiling version_check v0.9.5
+   Compiling itoa v1.0.18
+   Compiling autocfg v1.5.0
+   Compiling libm v0.2.16
+   Compiling zerocopy v0.8.48
+   Compiling pin-project-lite v0.2.17
+   Compiling getrandom v0.3.4
+   Compiling crossbeam-utils v0.8.21
+   Compiling log v0.4.29
+   Compiling bytes v1.11.1
+   Compiling parking_lot_core v0.9.12
+   Compiling bitflags v2.11.1
+   Compiling scopeguard v1.2.0
+   Compiling lock_api v0.4.14
+   Compiling futures-core v0.3.32
+   Compiling num-traits v0.2.19
+   Compiling equivalent v1.0.2
+   Compiling stable_deref_trait v1.2.1
+   Compiling typenum v1.19.0
+   Compiling generic-array v0.14.7
+   Compiling fnv v1.0.7
+   Compiling zmij v1.0.21
+   Compiling tracing-core v0.1.36
+   Compiling subtle v2.6.1
+   Compiling serde_json v1.0.149
+   Compiling hashbrown v0.17.0
+   Compiling futures-sink v0.3.32
+   Compiling crossbeam-epoch v0.9.20
+   Compiling regex-syntax v0.8.10
+   Compiling pkg-config v0.3.33
+   Compiling aho-corasick v1.1.4
+   Compiling dunce v1.0.5
+   Compiling slab v0.4.12
+   Compiling fs_extra v1.3.0
+   Compiling syn v2.0.117
+   Compiling jobserver v0.1.34
+   Compiling getrandom v0.2.17
+   Compiling errno v0.3.14
+   Compiling mio v1.2.0
+   Compiling socket2 v0.6.3
+   Compiling signal-hook-registry v1.4.8
+   Compiling rand_core v0.9.5
+   Compiling rand_core v0.6.4
+   Compiling cc v1.2.60
+   Compiling indexmap v2.14.0
+   Compiling rayon-core v1.13.0
+   Compiling crossbeam-deque v0.8.6
+   Compiling futures-channel v0.3.32
+   Compiling http v1.4.0
+   Compiling paste v1.0.15 (<repo-root>/vendor/paste)
+   Compiling futures-task v0.3.32
+   Compiling futures-io v0.3.32
+   Compiling base64 v0.22.1
+   Compiling strsim v0.11.1
+   Compiling aws-lc-rs v1.16.3
+   Compiling percent-encoding v2.3.2
+   Compiling crypto-common v0.1.7
+   Compiling litemap v0.8.2
+   Compiling regex-automata v0.4.14
+   Compiling untrusted v0.9.0
+   Compiling writeable v0.6.3
+   Compiling crc32fast v1.5.0
+   Compiling pulp v0.22.2
+   Compiling httparse v1.10.1
+   Compiling cmake v0.1.58
+   Compiling icu_properties_data v2.2.0
+   Compiling icu_normalizer_data v2.2.0
+   Compiling utf8_iter v1.0.4
+   Compiling http-body v1.0.1
+   Compiling block-buffer v0.10.4
+   Compiling raw-cpuid v11.6.0
+   Compiling thiserror v2.0.18
+   Compiling pulp-wasm-simd-flag v0.1.0
+   Compiling reborrow v0.5.5
+   Compiling cpufeatures v0.2.17
+   Compiling dyn-stack-macros v0.1.3
+   Compiling rustls v0.23.38
+   Compiling digest v0.10.7
+   Compiling seq-macro v0.3.6
+   Compiling rustversion v1.0.22
+   Compiling allocator-api2 v0.2.21
+   Compiling ident_case v1.0.1
+   Compiling ryu v1.0.23
+   Compiling tower-service v0.3.3
+   Compiling form_urlencoded v1.2.2
+   Compiling ahash v0.8.12
+   Compiling atomic-waker v1.1.2
+   Compiling try-lock v0.2.5
+   Compiling anstyle v1.0.14
+   Compiling want v0.3.1
+   Compiling httpdate v1.0.3
+   Compiling byteorder v1.5.0
+   Compiling adler2 v2.0.1
+   Compiling aws-lc-sys v0.40.0
+   Compiling ring v0.17.14
+   Compiling portable-atomic v1.13.1
+   Compiling simd-adler32 v0.3.9
+   Compiling onig_sys v69.9.1
+   Compiling num_cpus v1.17.0
+   Compiling ipnet v2.12.0
+   Compiling lazy_static v1.5.0
+   Compiling miniz_oxide v0.8.9
+   Compiling unicode-width v0.2.2
+   Compiling utf8parse v0.2.2
+   Compiling anstyle-parse v1.0.0
+   Compiling console v0.16.3
+   Compiling esaxx-rs v0.1.10
+   Compiling sync_wrapper v1.0.2
+   Compiling getrandom v0.4.2
+   Compiling tower-layer v0.3.3
+   Compiling semver v1.0.28
+   Compiling flate2 v1.1.9
+   Compiling minimal-lexical v0.2.1
+   Compiling unit-prefix v0.5.2
+   Compiling colorchoice v1.0.5
+   Compiling anstyle-query v1.1.5
+   Compiling synstructure v0.13.2
+   Compiling darling_core v0.20.11
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling nom v7.1.3
+   Compiling anstream v1.0.0
+   Compiling indicatif v0.18.4
+   Compiling rustc_version v0.4.1
+   Compiling castaway v0.2.4
+   Compiling zstd-sys v2.0.16+zstd.1.5.7
+   Compiling http-body-util v0.1.3
+   Compiling readme-rustdocifier v0.1.1
+   Compiling regex v1.12.3
+   Compiling powerfmt v0.2.0
+   Compiling unicode-segmentation v1.13.2
+   Compiling macro_rules_attribute-proc_macro v0.2.2
+   Compiling compression-core v0.4.32
+   Compiling foldhash v0.2.0
+   Compiling clap_lex v1.1.0
+   Compiling rustix v1.1.4
+   Compiling base64 v0.13.1
+   Compiling static_assertions v1.1.0
+   Compiling heck v0.5.0
+   Compiling clap_builder v4.6.0
+   Compiling macro_rules_attribute v0.2.2
+   Compiling hashbrown v0.16.1
+   Compiling compression-codecs v0.4.38
+   Compiling deranged v0.5.8
+   Compiling curve25519-dalek v4.1.3
+   Compiling sha2 v0.10.9
+   Compiling linux-raw-sys v0.12.1
+   Compiling num-conv v0.2.1
+   Compiling typed-path v0.12.3
+   Compiling unicode_categories v0.1.1
+   Compiling serde_derive v1.0.228
+   Compiling zerocopy-derive v0.8.48
+   Compiling zeroize_derive v1.4.3
+   Compiling zerofrom-derive v0.1.7
+   Compiling yoke-derive v0.8.2
+   Compiling tokio-macros v2.7.0
+   Compiling zeroize v1.8.2
+   Compiling bytemuck_derive v1.10.2
+   Compiling tracing-attributes v0.1.31
+   Compiling zerovec-derive v0.11.3
+   Compiling displaydoc v0.2.5
+   Compiling futures-macro v0.3.32
+   Compiling zerofrom v0.1.7
+   Compiling yoke v0.8.2
+   Compiling rustls-pki-types v1.14.0
+   Compiling zerotrie v0.2.4
+   Compiling bytemuck v1.25.0
+   Compiling futures-util v0.3.32
+   Compiling num-complex v0.4.6
+   Compiling tracing v0.1.44
+   Compiling dyn-stack v0.13.2
+   Compiling thiserror-impl v2.0.18
+   Compiling webpki-roots v1.0.7
+   Compiling zerovec v0.11.6
+   Compiling darling_macro v0.20.11
+   Compiling monostate-impl v0.1.18
+   Compiling clap_derive v4.6.1
+   Compiling darling v0.20.11
+   Compiling derive_builder_core v0.20.2
+   Compiling monostate v0.1.18
+   Compiling tinystr v0.8.3
+   Compiling potential_utf v0.1.5
+   Compiling icu_locale_core v2.2.0
+   Compiling icu_collections v2.2.0
+   Compiling smallvec v1.15.1
+   Compiling either v1.15.0
+   Compiling compact_str v0.9.0
+   Compiling derive_builder_macro v0.20.2
+   Compiling rayon v1.12.0
+   Compiling itertools v0.14.0
+   Compiling parking_lot v0.12.5
+   Compiling icu_provider v2.2.0
+   Compiling tokio v1.52.0
+   Compiling icu_normalizer v2.2.0
+   Compiling icu_properties v2.2.0
+   Compiling derive_builder v0.20.2
+   Compiling unicode-normalization-alignments v0.1.12
+   Compiling spm_precompiled v0.1.4
+   Compiling dary_heap v0.3.9
+   Compiling ppv-lite86 v0.2.21
+   Compiling iana-time-zone v0.1.65
+   Compiling bit-vec v0.8.0
+   Compiling onig v6.5.1
+   Compiling vcpkg v0.2.15
+   Compiling time-core v0.1.8
+   Compiling mime v0.3.17
+   Compiling rand_chacha v0.9.0
+   Compiling rand_chacha v0.3.1
+   Compiling time v0.3.47
+   Compiling bit-set v0.8.0
+   Compiling chrono v0.4.44
+   Compiling futures-executor v0.3.32
+   Compiling rand v0.9.4
+   Compiling idna_adapter v1.2.1
+   Compiling idna v1.1.0
+   Compiling rand v0.8.5
+   Compiling clap v4.6.1
+   Compiling safetensors v0.7.0
+   Compiling serde_urlencoded v0.7.1
+   Compiling libsqlite3-sys v0.30.1
+   Compiling zip v7.2.0
+   Compiling rayon-cond v0.4.0
+   Compiling rand_distr v0.5.1
+   Compiling url v2.5.8
+   Compiling curve25519-dalek-derive v0.1.1
+   Compiling tokenizers v0.22.2
+   Compiling half v2.7.1
+   Compiling hmac v0.12.1
+   Compiling inout v0.1.4
+   Compiling memmap2 v0.9.11
+   Compiling fs-err v3.3.0
+   Compiling foldhash v0.1.5
+   Compiling fastrand v2.4.1
+   Compiling gemm-common v0.19.0
+   Compiling float8 v0.7.0
+   Compiling option-ext v0.2.0
+   Compiling tinyvec_macros v0.1.1
+   Compiling ciborium-io v0.2.2
+   Compiling rustix v0.38.44
+   Compiling thiserror v1.0.69
+   Compiling iri-string v0.7.12
+   Compiling zstd-safe v7.2.4
+   Compiling anyhow v1.0.103
+   Compiling bit-vec v0.6.3
+   Compiling tempfile v3.27.0
+   Compiling ciborium-ll v0.2.2
+   Compiling gemm-f32 v0.19.0
+   Compiling gemm-f64 v0.19.0
+   Compiling gemm-c64 v0.19.0
+   Compiling gemm-c32 v0.19.0
+   Compiling bit-set v0.5.3
+   Compiling tinyvec v1.11.0
+   Compiling dirs-sys v0.5.0
+   Compiling hashbrown v0.15.5
+   Compiling hkdf v0.12.4
+   Compiling gemm-f16 v0.19.0
+   Compiling cipher v0.4.4
+   Compiling reed-solomon-simd v3.1.0
+   Compiling futures v0.3.32
+   Compiling hashbrown v0.14.5
+   Compiling gemm v0.19.0
+   Compiling serde_spanned v0.6.9
+   Compiling toml_datetime v0.6.11
+   Compiling tracing-serde v0.2.0
+   Compiling tokio-util v0.7.18
+   Compiling tower v0.5.3
+   Compiling async-compression v0.4.42
+   Compiling thiserror-impl v1.0.69
+   Compiling bstr v1.12.1
+   Compiling matchers v0.2.0
+   Compiling serde_derive_internals v0.29.1
+   Compiling sharded-slab v0.1.7
+   Compiling socks v0.3.4
+   Compiling h2 v0.4.13
+   Compiling tokio-stream v0.1.18
+   Compiling tower-http v0.6.8
+   Compiling blake3 v1.8.5
+   Compiling ureq-proto v0.6.0
+   Compiling universal-hash v0.5.1
+   Compiling tracing-log v0.2.0
+   Compiling concurrent-queue v2.5.0
+   Compiling encoding_rs v0.8.35
+   Compiling candle-core v0.10.2
+   Compiling thread_local v1.1.9
+   Compiling nu-ansi-term v0.50.3
+   Compiling signature v2.2.0
+   Compiling utf8-zero v0.8.1
+   Compiling parking v2.2.1
+   Compiling same-file v1.0.6
+   Compiling crc-catalog v2.4.0
+   Compiling toml_write v0.1.2
+   Compiling winnow v0.7.15
+   Compiling schemars v0.8.22
+   Compiling opaque-debug v0.3.1
+   Compiling linux-raw-sys v0.4.15
+   Compiling hex v0.4.3
+   Compiling prometheus v0.13.4
+   Compiling poly1305 v0.8.0
+   Compiling crc v3.4.0
+   Compiling event-listener v5.4.1
+   Compiling ed25519 v2.2.3
+   Compiling tracing-subscriber v0.3.23
+   Compiling schemars_derive v0.8.22
+   Compiling hashlink v0.9.1
+   Compiling hashlink v0.10.0
+   Compiling chacha20 v0.9.1
+   Compiling unicode-normalization v0.1.25
+   Compiling dirs v6.0.0
+   Compiling fancy-regex v0.13.0
+   Compiling ciborium v0.2.2
+   Compiling fancy-regex v0.17.0
+   Compiling axum-core v0.5.6
+   Compiling toml_edit v0.22.27
+   Compiling futures-intrusive v0.5.0
+   Compiling hyper v1.9.0
+   Compiling serde_plain v1.0.2
+   Compiling webpki-roots v0.26.11
+   Compiling arc-swap v1.9.1
+   Compiling aead v0.5.2
+   Compiling serde_path_to_error v0.1.20
+   Compiling ordered-float v3.9.2
+   Compiling wait-timeout v0.2.1
+   Compiling crossbeam-channel v0.5.15
+   Compiling crossbeam-queue v0.3.12
+   Compiling rustc-hash v1.1.0
+   Compiling matchit v0.8.4
+   Compiling fallible-iterator v0.3.0
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling dyn-clone v1.0.20
+   Compiling constant_time_eq v0.4.2
+   Compiling arrayref v0.3.9
+   Compiling roff v1.1.1
+   Compiling unicode-bidi v0.3.18
+   Compiling plotters-backend v0.3.7
+   Compiling fixedbitset v0.5.7
+   Compiling unicode-properties v0.1.4
+   Compiling arrayvec v0.7.7
+   Compiling hyper-util v0.1.20
+   Compiling symlink v0.1.0
+   Compiling unsafe-libyaml v0.2.11
+   Compiling predicates-core v1.0.10
+   Compiling cpufeatures v0.3.0
+   Compiling stringprep v0.1.5
+   Compiling tracing-appender v0.2.5
+   Compiling plotters-svg v0.3.7
+   Compiling toml v0.8.23
+   Compiling clap_mangen v0.2.33
+   Compiling serde_yaml_ng v0.10.0
+   Compiling tiktoken-rs v0.7.0
+   Compiling instant-distance v0.6.1
+   Compiling chacha20poly1305 v0.10.1
+   Compiling gethostname v0.5.0
+   Compiling ed25519-dalek v2.2.0
+   Compiling zstd v0.13.3
+   Compiling x25519-dalek v2.0.1
+   Compiling clap_complete v4.6.2
+   Compiling itertools v0.10.5
+   Compiling rusqlite v0.32.1
+   Compiling async-trait v0.1.89
+   Compiling axum v0.8.9
+   Compiling candle-nn v0.10.2
+   Compiling uuid v1.23.1
+   Compiling md-5 v0.10.6
+   Compiling float-cmp v0.10.0
+   Compiling atoi v2.0.0
+   Compiling fs2 v0.4.3
+   Compiling difflib v0.4.0
+   Compiling assert_cmd v2.2.1
+   Compiling whoami v1.6.1
+   Compiling quick-error v1.2.3
+   Compiling cast v0.3.0
+   Compiling normalize-line-endings v0.3.0
+   Compiling home v0.5.12
+   Compiling termtree v0.5.1
+   Compiling dotenvy v0.15.7
+   Compiling deadpool-runtime v0.1.4
+   Compiling predicates v3.1.4
+   Compiling criterion-plot v0.5.0
+   Compiling rusty-fork v0.3.1
+   Compiling predicates-tree v1.0.13
+   Compiling candle-transformers v0.10.2
+   Compiling deadpool v0.12.3
+   Compiling plotters v0.3.7
+   Compiling walkdir v2.5.0
+   Compiling yasna v0.5.2
+   Compiling assert-json-diff v2.0.2
+   Compiling tinytemplate v1.2.1
+   Compiling pem v3.0.6
+   Compiling rand_xorshift v0.4.0
+   Compiling is-terminal v0.4.17
+   Compiling oorandom v11.1.5
+   Compiling anes v0.1.6
+   Compiling unarray v0.1.4
+   Compiling rcgen v0.14.7
+   Compiling proptest v1.11.0
+   Compiling wiremock v0.6.5
+   Compiling criterion v0.5.1
+   Compiling rustls-webpki v0.103.13
+   Compiling tokio-rustls v0.26.4
+   Compiling ureq v3.3.0
+   Compiling sqlx-core v0.8.6
+   Compiling hyper-rustls v0.27.9
+   Compiling axum-server v0.8.0
+   Compiling reqwest v0.12.28
+   Compiling sqlx-postgres v0.8.6
+   Compiling hf-hub v0.5.0
+   Compiling sqlx v0.8.6
+   Compiling ai-memory v1.0.0 (<repo-root>)
+warning: unreachable statement
+    --> src/federation/receive_auth.rs:1022:5
+     |
+1017 |       return true; // CERT-REMOVAL-PROOF-MUTATION
+     |       ----------- any code following this expression is unreachable
+...
+1022 | /     if !attest_cfg.has_allowlist() {
+1023 | |         return true;
+1024 | |     }
+     | |_____^ unreachable statement
+     |
+     = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `lane`
+    --> src/federation/receive_auth.rs:1009:5
+     |
+1009 |     lane: &str,
+     |     ^^^^ help: if this is intentional, prefix it with an underscore: `_lane`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `memory_id`
+    --> src/federation/receive_auth.rs:1010:5
+     |
+1010 |     memory_id: &str,
+     |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_memory_id`
+
+warning: unused variable: `claimed_namespace`
+    --> src/federation/receive_auth.rs:1011:5
+     |
+1011 |     claimed_namespace: &str,
+     |     ^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_claimed_namespace`
+
+warning: unused variable: `existing_namespace`
+    --> src/federation/receive_auth.rs:1012:5
+     |
+1012 |     existing_namespace: Option<&str>,
+     |     ^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_existing_namespace`
+
+warning: unused variable: `attest_cfg`
+    --> src/federation/receive_auth.rs:1013:5
+     |
+1013 |     attest_cfg: &crate::federation::peer_attestation::PeerAttestationConfig,
+     |     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_attest_cfg`
+
+warning: unused variable: `peer_id`
+    --> src/federation/receive_auth.rs:1014:5
+     |
+1014 |     peer_id: Option<&str>,
+     |     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_peer_id`
+
+warning: unused variable: `require_push_namespace_scope`
+    --> src/federation/receive_auth.rs:1015:5
+     |
+1015 |     require_push_namespace_scope: bool,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_require_push_namespace_scope`
+
+warning: `ai-memory` (lib) generated 8 warnings (run `cargo fix --lib -p ai-memory` to apply 7 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 47s
+     Running tests/federation_write_ns_scope_2447.rs (.local-runs-target/debug/deps/federation_write_ns_scope_2447-c4032c8805693bd1)
+
+running 1 test
+
+thread 'federated_write_outside_peer_scope_refused_2447' (633086) panicked at tests/federation_write_ns_scope_2447.rs:249:5:
+assertion `left == right` failed: #2447: a peer scoped to public/* must NOT write into secure/ops
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test federated_write_outside_peer_scope_refused_2447 ... FAILED
+
+failures:
+
+failures:
+    federated_write_outside_peer_scope_refused_2447
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.51s
+
+error: test failed, to rerun pass `--test federation_write_ns_scope_2447`

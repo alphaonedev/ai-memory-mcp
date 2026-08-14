@@ -1,0 +1,9 @@
+   Compiling ai-memory v1.0.0 (<repo-root>)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 40.00s
+     Running tests/federation_1936_checkpoint_fed.rs (.local-runs-target/debug/deps/federation_1936_checkpoint_fed-e7cb87c46bbcca84)
+
+running 1 test
+test strict_refuses_unenrolled_resolver ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.35s
+

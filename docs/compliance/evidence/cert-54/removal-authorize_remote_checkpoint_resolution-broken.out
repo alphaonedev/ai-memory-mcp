@@ -1,0 +1,64 @@
+   Compiling ai-memory v1.0.0 (<repo-root>)
+warning: unreachable statement
+   --> src/federation/receive_auth.rs:148:5
+    |
+147 |       return CheckpointResolutionAuthz::Accept; // CERT-REMOVAL-PROOF-MUTATION
+    |       ---------------------------------------- any code following this expression is unreachable
+148 | /     if signature.is_empty() {
+149 | |         return if require_sig {
+150 | |             CheckpointResolutionAuthz::RejectUnsigned
+151 | |         } else {
+152 | |             CheckpointResolutionAuthz::Accept
+153 | |         };
+154 | |     }
+    | |_____^ unreachable statement
+    |
+    = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `signable`
+   --> src/federation/receive_auth.rs:142:5
+    |
+142 |     signable: &SignableCheckpointResolution<'_>,
+    |     ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_signable`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `signature`
+   --> src/federation/receive_auth.rs:143:5
+    |
+143 |     signature: &[u8],
+    |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_signature`
+
+warning: unused variable: `enrolled_key`
+   --> src/federation/receive_auth.rs:144:5
+    |
+144 |     enrolled_key: Option<&VerifyingKey>,
+    |     ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_enrolled_key`
+
+warning: unused variable: `require_sig`
+   --> src/federation/receive_auth.rs:145:5
+    |
+145 |     require_sig: bool,
+    |     ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_require_sig`
+
+warning: `ai-memory` (lib) generated 5 warnings (run `cargo fix --lib -p ai-memory` to apply 4 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 41.14s
+     Running tests/federation_1936_checkpoint_fed.rs (.local-runs-target/debug/deps/federation_1936_checkpoint_fed-e7cb87c46bbcca84)
+
+running 1 test
+
+thread 'strict_refuses_unenrolled_resolver' (645212) panicked at tests/federation_1936_checkpoint_fed.rs:267:5:
+assertion `left == right` failed: resp={"action_transitions_applied":0,"applied":0,"archived":0,"checkpoints_applied":1,"checkpoints_conflicted":0,"deleted":0,"dry_run":false,"links_applied":0,"namespace_meta_applied":0,"namespace_meta_cleared":0,"namespace_meta_refused":0,"noop":0,"pending_decisions_applied":0,"pendings_applied":0,"quota_refused":0,"receiver_agent_id":"anonymous:req-6a9a10e2","receiver_clock":{"entries":{}},"restored":0,"signals_applied":0,"skipped":0}
+  left: Number(1)
+ right: Number(0)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test strict_refuses_unenrolled_resolver ... FAILED
+
+failures:
+
+failures:
+    strict_refuses_unenrolled_resolver
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.32s
+
+error: test failed, to rerun pass `--test federation_1936_checkpoint_fed`
