@@ -8439,6 +8439,16 @@ pub fn consolidate(
         // in this same read so the write-time min-propagation stamp below
         // needs no re-read. The derived record cannot outrank the minimum.
         let mut source_trust_tiers: Vec<crate::trust::TrustTier> = Vec::new();
+        // v1.0.0 #2935 (R20 residual) — the CONFIDENCE VALUE min-propagation.
+        // R20 (#1958) propagated the trust TIER but the confidence float was
+        // still hardcoded 1.0 on the derived row, laundering two low-confidence
+        // claims into a maximally-certain summary. Capture the running minimum
+        // over the source confidences in this same read (float is Copy, so it
+        // costs nothing) and stamp it write-time below. Seed at the compiled
+        // default (`default_confidence()` = 1.0) so an unavailable / NULL source
+        // confidence (which `get` already coalesces to that default) never
+        // silently inflates the result.
+        let mut min_confidence = crate::models::DEFAULT_CONFIDENCE;
         for id in ids {
             match get(conn, id)? {
                 Some(mem) => {
@@ -8449,6 +8459,7 @@ pub fn consolidate(
                         mem.namespace.clone(),
                     ));
                     source_trust_tiers.push(crate::trust::TrustTier::of_metadata(&mem.metadata));
+                    min_confidence = min_confidence.min(mem.confidence);
                     max_priority = max_priority.max(mem.priority);
                     all_tags.extend(mem.tags);
                     total_access = total_access.saturating_add(mem.access_count);
@@ -8584,7 +8595,8 @@ pub fn consolidate(
             content: summary.to_string(),
             tags: all_tags.clone(),
             priority: max_priority,
-            confidence: 1.0,
+            // v1.0.0 #2935 — min(source confidences), not a hardcoded 1.0.
+            confidence: min_confidence,
             source: source.to_string(),
             access_count: total_access,
             created_at: now.clone(),
@@ -8599,7 +8611,8 @@ pub fn consolidate(
             citations: Vec::new(),
             source_uri: None,
             source_span: None,
-            // #1633 — the engine pins confidence=1.0, so the honest
+            // #1633 / #2935 — the engine DERIVES confidence (now the min over
+            // the source confidences, no longer a hardcoded 1.0), so the honest
             // provenance is CuratorDerived (the #1242 audit-honesty
             // invariant: engine-derived values must be discoverable to
             // the calibration sweep; 'caller_provided' rows are
@@ -8651,10 +8664,12 @@ pub fn consolidate(
         // consolidated mid/short row would be immortal (NULL expires_at) and
         // never reaped by GC. `candidate.created_at == now` so the backfill
         // here matches the `?10` bound below.
+        // v1.0.0 #2935 — the `confidence` column binds `?17` (min over the
+        // source confidences, captured above), NOT the former hardcoded 1.0.
         conn.execute(
             "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, expires_at, metadata, confidence_source, cid, cid_genesis, encrypted_envelope)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1.0, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-            params![new_id, tier.as_str(), namespace, title, content_to_store, tags_json, max_priority, source, total_access, now, candidate.effective_expires_at(), metadata_json, candidate.confidence_source.as_str(), cid_stamp.cid, cid_stamp.genesis, encrypted_envelope],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?17, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![new_id, tier.as_str(), namespace, title, content_to_store, tags_json, max_priority, source, total_access, now, candidate.effective_expires_at(), metadata_json, candidate.confidence_source.as_str(), cid_stamp.cid, cid_stamp.genesis, encrypted_envelope, min_confidence],
         )?;
 
         // v0.9.0 G13-mem (#1859, COND 1) — the SINGLE consolidate-leaf
@@ -20814,6 +20829,47 @@ mod tests {
         let combined = get(&conn, &new_id).unwrap().unwrap();
         assert_eq!(combined.title, "Combined");
         assert_eq!(combined.tier, Tier::Long);
+    }
+
+    #[test]
+    fn consolidate_confidence_is_min_of_sources_2935() {
+        // v1.0.0 #2935 (R20 residual) — a consolidated (derived) memory must
+        // NOT launder low-confidence source claims into a maximally-certain
+        // 1.0 summary: its confidence == min(source confidences), not a
+        // hardcoded 1.0. (The derived-row memory_kind is decided separately by
+        // a crossroads vote and is deliberately NOT asserted here.)
+        let conn = test_db();
+        let mut m1 = make_memory("Claim A", "test", Tier::Mid, 5);
+        m1.confidence = 0.6;
+        let mut m2 = make_memory("Claim B", "test", Tier::Mid, 5);
+        m2.confidence = 0.7;
+        let id1 = insert(&conn, &m1).unwrap();
+        let id2 = insert(&conn, &m2).unwrap();
+
+        let new_id = consolidate(
+            &conn,
+            &[id1, id2],
+            "Combined",
+            "Claim A + Claim B",
+            "test",
+            &Tier::Long,
+            "test",
+            "test-consolidator",
+            false,
+        )
+        .unwrap();
+
+        let combined = get(&conn, &new_id).unwrap().unwrap();
+        // == min(0.6, 0.7) == 0.6; assert <= 0.6 so a future policy that
+        // derives an even lower confidence still passes (never inflates).
+        assert!(
+            combined.confidence <= 0.6 + f64::EPSILON,
+            "consolidated confidence {} exceeded min(source)=0.6",
+            combined.confidence
+        );
+        assert!((combined.confidence - 0.6).abs() < 1e-9);
+        // Provenance stays honest: engine-derived, not caller-provided.
+        assert_eq!(combined.confidence_source, ConfidenceSource::CuratorDerived);
     }
 
     #[test]

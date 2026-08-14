@@ -146,8 +146,11 @@ fn consolidate_stamps_min_propagated_trust() {
     .expect("consolidate");
 
     let merged = db::get(&conn, &cid).unwrap().expect("consolidated row");
-    // confidence is still 1.0 (the laundering vector the issue names) but
-    // the propagated trust is honestly floored to the unattested source.
+    // confidence == min(source confidences); both sources here carry the
+    // default 1.0, so the min is 1.0. The confidence-VALUE laundering vector
+    // the issue named is closed separately by #2935 (a low-confidence source
+    // now floors the derived confidence); this R20 test pins the orthogonal
+    // trust-TIER floor, which stays honestly at the unattested source.
     assert!((merged.confidence - 1.0).abs() < f64::EPSILON);
     assert_eq!(
         merged.metadata["propagated_trust"].as_str(),

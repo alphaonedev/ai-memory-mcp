@@ -21263,11 +21263,17 @@ impl MemoryStore for PostgresStore {
         // v1.0.0 R20 (#1958) — each source's EFFECTIVE trust tier for the
         // write-time min-propagation stamp below (sqlite `consolidate` twin).
         let mut source_trust_tiers: Vec<crate::trust::TrustTier> = Vec::with_capacity(ids.len());
+        // v1.0.0 #2935 (R20 residual) — the CONFIDENCE VALUE min-propagation,
+        // the postgres twin of the sqlite `storage::consolidate` capture. R20
+        // (#1958) propagated the trust TIER but the confidence float stayed a
+        // hardcoded 1.0 on the derived row. Seed at the compiled default so a
+        // NULL / unavailable source confidence never silently inflates.
+        let mut min_confidence = crate::models::DEFAULT_CONFIDENCE;
 
         for id in ids {
             use sqlx::Row;
             let row = sqlx::query(
-                "SELECT tags, priority, access_count, metadata, cid FROM memories WHERE id = $1",
+                "SELECT tags, priority, confidence, access_count, metadata, cid FROM memories WHERE id = $1",
             )
             .bind(id)
             .fetch_optional(&mut *tx)
@@ -21279,6 +21285,11 @@ impl MemoryStore for PostgresStore {
             source_cids.push(row.try_get::<Option<String>, _>("cid").unwrap_or(None));
             let priority: i32 = row.try_get("priority").unwrap_or(5);
             max_priority = max_priority.max(priority);
+            // v1.0.0 #2935 — running min over the source confidences.
+            let source_confidence: f64 = row
+                .try_get("confidence")
+                .unwrap_or(crate::models::DEFAULT_CONFIDENCE);
+            min_confidence = min_confidence.min(source_confidence);
             let access_count: i64 = row.try_get(field_names::ACCESS_COUNT).unwrap_or(0);
             total_access = total_access.saturating_add(access_count);
             let tags_json: serde_json::Value = row.try_get("tags").unwrap_or(serde_json::json!([]));
@@ -21396,7 +21407,8 @@ impl MemoryStore for PostgresStore {
             content: summary.to_string(),
             tags: all_tags.clone(),
             priority: max_priority,
-            confidence: 1.0,
+            // v1.0.0 #2935 — min(source confidences), not a hardcoded 1.0.
+            confidence: min_confidence,
             source: source.to_string(),
             access_count: total_access,
             created_at: now_rfc.clone(),
@@ -21411,8 +21423,9 @@ impl MemoryStore for PostgresStore {
             citations: Vec::new(),
             source_uri: None,
             source_span: None,
-            // #1633 — engine-pinned confidence=1.0 ⇒ honest provenance
-            // is CuratorDerived (the #1242 audit-honesty invariant);
+            // #1633 / #2935 — engine-DERIVED confidence (now min over the
+            // source confidences, no longer a hardcoded 1.0) ⇒ honest
+            // provenance is CuratorDerived (the #1242 audit-honesty invariant);
             // sqlite twin stamped the same in storage::consolidate.
             confidence_source: crate::models::ConfidenceSource::CuratorDerived,
             confidence_signals: None,
@@ -21479,7 +21492,10 @@ impl MemoryStore for PostgresStore {
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, expires_at, metadata,
                 confidence_source, cid, cid_genesis, encrypted_envelope
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, 1.0, $8, $9, $10, $10, $11, $12, $13, $14, $15, $16)
+            -- v1.0.0 #2935 — `confidence` binds $17 (min over the source
+            -- confidences, captured above), NOT the former hardcoded 1.0; the
+            -- ON CONFLICT arm's `confidence = EXCLUDED.confidence` re-uses it.
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $17, $8, $9, $10, $10, $11, $12, $13, $14, $15, $16)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 tier = CASE
                     WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
@@ -21530,12 +21546,15 @@ impl MemoryStore for PostgresStore {
             candidate.effective_expires_at().as_deref(),
         ))
         .bind(&merged_metadata_value)
-        // #1633 — $13: honest engine provenance for the pinned 1.0.
+        // #1633 / #2935 — $13: honest engine provenance for the DERIVED
+        // (min-propagated) confidence.
         .bind(candidate.confidence_source.as_str())
         .bind(&consolidate_cid.cid)
         .bind(&consolidate_cid.genesis)
         // #2292 — sealed ciphertext envelope ($16); NULL when encryption off.
         .bind(consolidate_envelope)
+        // v1.0.0 #2935 — $17: min(source confidences).
+        .bind(min_confidence)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("consolidate upsert", e))?;

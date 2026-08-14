@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (consolidation no longer launders derived confidence — min(sources), not hardcoded 1.0; #2935)
+
+- **A consolidated (derived) memory no longer claims maximal `confidence = 1.0`
+  regardless of its sources.** ([#2935](https://github.com/alphaonedev/ai-memory-mcp/issues/2935)).
+  Both consolidation output builders — `db::consolidate` (sqlite) and
+  `PostgresStore::consolidate` (postgres), the single funnel behind every
+  surface (CLI `consolidate`, MCP `memory_consolidate`, HTTP
+  `power_consolidation`, the curator autonomy Pass-1 + compaction
+  `ConsolidationPass`) — hardcoded `confidence = 1.0` on the derived row. Two
+  claims at confidence 0.6/0.7 consolidated into a memory at confidence 1.0,
+  laundering derived/uncertain content as maximally certain (the residual of
+  R20/#1958, whose documented remedy was "derived = min(inputs) enforced at
+  write, both backends" — R20 propagated the trust TIER but never the confidence
+  VALUE). The derived row now carries `confidence = min(source confidences)`,
+  captured in the same source-read pass as the R20 trust-tier minimum and seeded
+  at the compiled `DEFAULT_CONFIDENCE` so a NULL/unavailable source confidence
+  never silently inflates. `confidence_source` stays `curator_derived` (the
+  provenance was always honest — only the value was wrong). Regression pinned by
+  `storage::tests::consolidate_confidence_is_min_of_sources_2935`. The derived
+  row's `memory_kind` is out of scope here (decided separately by a crossroads
+  vote).
+
 ### cert-refresh (2026-08-13, post-remediation-wave evidence re-capture)
 
 - **docs(cert):** re-captured the full cert-54 evidence bundle at the
