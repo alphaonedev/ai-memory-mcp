@@ -96,7 +96,7 @@ fn legacy_all_none_chain_verifies_clean_and_canonical_bytes_unchanged() {
         append_signed_event(&conn, &row).expect("append legacy row");
     }
 
-    let report = verify_chain(&conn, None).expect("verify_chain");
+    let report = verify_chain(&conn, None, None).expect("verify_chain");
     assert!(report.chain_holds(), "legacy chain must hold: {report:?}");
     assert_eq!(report.rows_checked, 3, "walked all rows: {report:?}");
     assert!(
@@ -163,7 +163,7 @@ fn stripping_cause_breaks_next_rows_prev_hash_link() {
     append_signed_event(&conn, &row2).expect("append row2");
 
     // Baseline: the intact chain verifies clean.
-    let before = verify_chain(&conn, None).expect("verify before");
+    let before = verify_chain(&conn, None, None).expect("verify before");
     assert!(
         before.chain_holds(),
         "intact cause chain must hold: {before:?}"
@@ -181,7 +181,7 @@ fn stripping_cause_breaks_next_rows_prev_hash_link() {
 
     // Now row 1's recomputed canonical bytes no longer include the cause,
     // so row 2's stored prev_hash no longer matches → chain break at 2.
-    let after = verify_chain(&conn, None).expect("verify after");
+    let after = verify_chain(&conn, None, None).expect("verify after");
     assert!(
         !after.chain_holds(),
         "stripping a bound cause MUST break the chain: {after:?}",
@@ -229,7 +229,7 @@ fn tampering_cause_after_signing_is_a_signature_failure() {
     append_signed_event(&conn, &row).expect("append signed cause row");
 
     // Positive control: the untampered signed cause row verifies clean.
-    let ok = verify_chain(&conn, None).expect("verify clean");
+    let ok = verify_chain(&conn, None, None).expect("verify clean");
     assert!(ok.chain_holds(), "chain holds: {ok:?}");
     assert!(
         ok.signature_failures.is_empty(),
@@ -247,7 +247,7 @@ fn tampering_cause_after_signing_is_a_signature_failure() {
         .expect("tamper cause");
     assert_eq!(n, 1);
 
-    let bad = verify_chain(&conn, None).expect("verify tampered");
+    let bad = verify_chain(&conn, None, None).expect("verify tampered");
     // The chain itself still holds (no successor row's prev_hash to
     // break), but the signature no longer verifies over the folded
     // digest — the cause is bound INTO the signature.

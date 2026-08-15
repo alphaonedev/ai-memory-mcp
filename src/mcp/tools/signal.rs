@@ -859,7 +859,7 @@ mod handler_tests {
         assert_eq!(agent, "ai:alice", "audit row attributed to the sender");
 
         // The append-only chain verifies over the new row.
-        let report = crate::signed_events::verify_audit_trail(&conn, None).expect("verify");
+        let report = crate::signed_events::verify_audit_trail(&conn, None, None).expect("verify");
         assert!(report.chain_intact, "chain must verify; report={report:?}");
         assert!(report.total_events >= 1);
     }
@@ -915,7 +915,7 @@ mod handler_tests {
             .expect("query audit row");
         assert_eq!(count2, 1, "a no-op re-ack must not write another audit row");
 
-        let report = crate::signed_events::verify_audit_trail(&conn, None).expect("verify");
+        let report = crate::signed_events::verify_audit_trail(&conn, None, None).expect("verify");
         assert!(report.chain_intact, "chain must verify; report={report:?}");
     }
 

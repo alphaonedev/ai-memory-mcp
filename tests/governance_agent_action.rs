@@ -339,7 +339,7 @@ fn escalate_verdict_lands_in_signed_events_chain_and_verifies_pe5_pe8_1709() {
     // PE-5: the escalation is chain-logged (one governance.check row).
     assert_eq!(count_audit_rows(&conn), 1);
     // PE-8: verify_audit_trail confirms the chain is intact + counts it.
-    let report = ai_memory::signed_events::verify_audit_trail(&conn, None).unwrap();
+    let report = ai_memory::signed_events::verify_audit_trail(&conn, None, None).unwrap();
     assert!(
         report.chain_intact,
         "governance.check chain must verify after an escalate verdict; report={report:?}"

@@ -84,7 +84,7 @@ pub fn run(
     } else {
         None
     };
-    let report = crate::signed_events::verify_chain(&conn, since)
+    let report = crate::signed_events::verify_chain(&conn, since, None)
         .context("verify_chain over signed_events")?;
     let holds = report.chain_holds();
 

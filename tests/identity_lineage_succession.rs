@@ -188,7 +188,7 @@ fn genesis_self_signs_and_verifies() {
     assert_eq!(payload, record.witness_payload_hash().expect("hash"));
 
     // verify-signed-events-chain stays GREEN with lineage rows present.
-    let report = ai_memory::signed_events::verify_chain(&conn, None).expect("verify chain");
+    let report = ai_memory::signed_events::verify_chain(&conn, None, None).expect("verify chain");
     assert!(report.chain_holds(), "chain must hold: {report:?}");
     assert!(
         report.signature_failures.is_empty(),
@@ -284,7 +284,8 @@ fn successor_verifies_via_chain_and_fails_closed_when_broken_but_synced() {
         "a broken-but-synced chain must resolve fail-closed None, never the flat key"
     );
     // And the audit surface reports Forged.
-    let report = ai_memory::signed_events::verify_audit_trail(&conn, None).expect("audit trail");
+    let report =
+        ai_memory::signed_events::verify_audit_trail(&conn, None, None).expect("audit trail");
     match &report.lineage {
         ai_memory::identity::lineage::LineageCheck::Forged { detail } => {
             assert!(detail.contains("c2-agent"), "got: {detail}");
@@ -559,7 +560,7 @@ fn tampered_body_breaks_link() {
          got {verdict:?}"
     );
     // ... and the forged witness row broke the tamper-evident chain.
-    let report = ai_memory::signed_events::verify_chain(&conn, None).expect("verify chain");
+    let report = ai_memory::signed_events::verify_chain(&conn, None, None).expect("verify chain");
     assert!(
         !report.chain_holds(),
         "the forged witness INSERT must break the signed_events chain"
@@ -719,7 +720,7 @@ fn audit_trail_lineage_verdicts() {
         EnvVarGuard::remove(ai_memory::identity::lineage::REQUIRE_IDENTITY_LINEAGE_ENV);
     let (_dir, conn) = fresh_db();
     // No lineage anywhere → Unknown, clean (byte-identical legacy).
-    let report = ai_memory::signed_events::verify_audit_trail(&conn, None).expect("audit");
+    let report = ai_memory::signed_events::verify_audit_trail(&conn, None, None).expect("audit");
     assert_eq!(
         report.lineage,
         ai_memory::identity::lineage::LineageCheck::Unknown
@@ -728,7 +729,7 @@ fn audit_trail_lineage_verdicts() {
 
     // Clean enrolled chain → NotDetected, clean.
     let _keys = enroll_three_key_chain(&conn, "verdict-agent");
-    let report = ai_memory::signed_events::verify_audit_trail(&conn, None).expect("audit");
+    let report = ai_memory::signed_events::verify_audit_trail(&conn, None, None).expect("audit");
     assert_eq!(
         report.lineage,
         ai_memory::identity::lineage::LineageCheck::NotDetected
@@ -750,7 +751,7 @@ fn require_identity_lineage_fail_closes_when_missing() {
         "1".to_string(),
     );
     let (_dir, conn) = fresh_db();
-    let report = ai_memory::signed_events::verify_audit_trail(&conn, None).expect("audit");
+    let report = ai_memory::signed_events::verify_audit_trail(&conn, None, None).expect("audit");
     assert_eq!(
         report.lineage,
         ai_memory::identity::lineage::LineageCheck::Missing

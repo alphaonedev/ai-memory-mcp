@@ -276,6 +276,6 @@ fn test_offload_signed_events_trail() {
     );
 
     // Cross-row chain must hold across both events.
-    let report = ai_memory::signed_events::verify_chain(&conn, None).expect("verify_chain");
+    let report = ai_memory::signed_events::verify_chain(&conn, None, None).expect("verify_chain");
     assert!(report.chain_holds(), "signed_events chain must hold");
 }

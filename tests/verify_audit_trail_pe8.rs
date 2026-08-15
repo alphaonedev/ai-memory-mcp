@@ -73,7 +73,7 @@ fn clean_chain_is_intact_with_no_gaps() {
         );
     }
 
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert!(report.chain_intact, "report = {report:?}");
     assert!(report.is_clean(), "report = {report:?}");
     assert_eq!(report.total_events, 5);
@@ -107,7 +107,7 @@ fn content_tamper_breaks_chain_at_next_row() {
     )
     .expect("tamper row 3");
 
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert!(!report.chain_intact, "report = {report:?}");
     assert!(!report.is_clean(), "report = {report:?}");
     assert_eq!(
@@ -141,7 +141,7 @@ fn deleted_middle_row_surfaces_sequence_gap() {
     conn.execute("DELETE FROM signed_events WHERE sequence = 3", [])
         .expect("delete row 3");
 
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert!(
         !report.is_clean(),
         "a gap is not clean; report = {report:?}"
@@ -173,7 +173,7 @@ fn multiple_deleted_rows_surface_multiple_gaps() {
     conn.execute("DELETE FROM signed_events WHERE sequence IN (2, 3, 6)", [])
         .expect("delete rows");
 
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert_eq!(
         report.sequence_gaps,
         vec![(2, 3), (6, 6)],
@@ -210,7 +210,8 @@ fn since_filters_window_without_false_boundary_break() {
     // in-window (sequences 4,5,6). The boundary link (row 4's prev_hash
     // against out-of-window row 3) MUST be verified, not falsely
     // flagged as a break.
-    let report = verify_audit_trail(&conn, Some("2026-06-17T00:00:00+00:00")).expect("verify");
+    let report =
+        verify_audit_trail(&conn, Some("2026-06-17T00:00:00+00:00"), None).expect("verify");
     assert!(
         report.chain_intact,
         "the window edge MUST NOT be a false break; report = {report:?}"
@@ -253,7 +254,8 @@ fn since_window_still_detects_in_window_tamper() {
     )
     .expect("tamper");
 
-    let report = verify_audit_trail(&conn, Some("2026-06-17T00:00:00+00:00")).expect("verify");
+    let report =
+        verify_audit_trail(&conn, Some("2026-06-17T00:00:00+00:00"), None).expect("verify");
     assert!(
         !report.chain_intact,
         "an in-window tamper MUST still be detected; report = {report:?}"
@@ -270,7 +272,7 @@ fn empty_chain_is_trivially_intact() {
     let (_dir, path) = fresh_db_path("empty");
     let conn = open_conn(&path);
 
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert!(
         report.chain_intact,
         "empty chain is intact; report = {report:?}"

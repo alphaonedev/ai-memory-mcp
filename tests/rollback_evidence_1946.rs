@@ -253,7 +253,7 @@ fn off_table_anchor_catches_rollback_that_also_wiped_the_in_db_witness() {
         "default posture emits evidence + continues"
     );
 
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     // The in-DB witness is GONE (Unknown), but the OFF-TABLE anchor survives
     // and catches the rollback — #2370: the anchor is a v3 db_id line for
     // THIS database (genesis intact), so per-DB filtering keeps it counted.
@@ -276,11 +276,13 @@ fn off_table_anchor_catches_rollback_that_also_wiped_the_in_db_witness() {
         since: None,
         json: false,
         store_url: None,
+        audit_pubkey: None,
     };
     let mut so = Vec::<u8>::new();
     let mut se = Vec::<u8>::new();
     let mut out = ai_memory::cli::CliOutput::from_std(&mut so, &mut se);
-    let code = ai_memory::cli::verify_audit_trail::run(&path, &args, &mut out).expect("cli run");
+    let code =
+        ai_memory::cli::verify_audit_trail::run(&path, &args, None, &mut out).expect("cli run");
     assert_eq!(code, 1, "CLI must exit 1 on rollback evidence");
 
     // #2370 matrix (3) — under REQUIRE-MODE the SAME genuine same-DB rollback
@@ -374,7 +376,7 @@ fn operator_sanction_clears_rollback_evidence() {
     // The reopened DB verifies CLEAN on the rollback axis (witness is Unknown,
     // rollback is Sanctioned — both clean).
     let conn = ai_memory::db::open(&path).expect("reopen");
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert_eq!(
         report.rollback,
         RollbackCheck::Sanctioned {

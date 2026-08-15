@@ -11837,6 +11837,46 @@ async fn pg_append_signed_event_with_chain_in_tx(
         }
     };
 
+    // v1.0.0 L4 (PR-3) / #1925 (CWE-347) — POSTGRES identity-binding parity.
+    // Re-sign a daemon-signed row over the identity-bearing tuple now that
+    // `sequence` is assigned, EXACTLY like the sqlite chokepoint
+    // `crate::signed_events::append_signed_event_no_tx`. The pre-image
+    // (`daemon_row_signing_input`) commits to `timestamp`, so it MUST be the
+    // ALREADY-TRUNCATED microsecond value the TIMESTAMPTZ column durably stores
+    // (`truncate_to_microseconds`, the #2203 fix applied above) — otherwise the
+    // signed bytes would commit to the in-memory NANOSECOND `Utc::now()` while a
+    // verifier recomputes the pre-image from the microsecond readback, and the
+    // identity-bound signature would false-fail on essentially every pg row.
+    // Signing over the truncated timestamp makes signed-bytes == stored-bytes by
+    // construction. Only when a daemon key is installed AND the row is
+    // daemon-signed; recorder/lineage/unsigned rows keep their distinct-role
+    // signatures untouched. A verify-only pg process with no key keeps the
+    // caller's payload-only signature (the verifier's payload-only fallback still
+    // validates it), so this is additive + fail-closed, closing the pg half of
+    // the #1925 head-identity-tamper gap the audit pin now makes load-bearing.
+    let resigned: Option<Vec<u8>> =
+        if attest_level == crate::models::AttestLevel::DaemonSigned.as_str() && signature.is_some()
+        {
+            let row_view = crate::signed_events::SignedEvent {
+                id: id.to_string(),
+                agent_id: agent_id.to_string(),
+                event_type: event_type.to_string(),
+                payload_hash: payload_hash.to_vec(),
+                signature: signature.map(<[u8]>::to_vec),
+                attest_level: attest_level.to_string(),
+                timestamp: timestamp.to_rfc3339(),
+                prev_hash: Vec::new(),
+                sequence: next_seq,
+                cause_hash: cause_hash.map(<[u8]>::to_vec),
+            };
+            let input = crate::signed_events::daemon_row_signing_input(&row_view);
+            crate::governance::audit::try_sign_audit_payload(&input)
+                .map(|(sig, _)| sig)
+                .or_else(|| signature.map(<[u8]>::to_vec))
+        } else {
+            signature.map(<[u8]>::to_vec)
+        };
+
     sqlx::query(
         "INSERT INTO signed_events \
             (id, agent_id, event_type, payload_hash, signature, attest_level, timestamp, \
@@ -11847,7 +11887,7 @@ async fn pg_append_signed_event_with_chain_in_tx(
     .bind(agent_id)
     .bind(event_type)
     .bind(payload_hash)
-    .bind(signature.map(<[u8]>::to_vec))
+    .bind(resigned.clone())
     .bind(attest_level)
     .bind(timestamp)
     .bind(&prev_hash)
@@ -11864,7 +11904,11 @@ async fn pg_append_signed_event_with_chain_in_tx(
         agent_id: agent_id.to_string(),
         event_type: event_type.to_string(),
         payload_hash: payload_hash.to_vec(),
-        signature: signature.map(<[u8]>::to_vec),
+        // v1.0.0 L4 (PR-3) — anchor the STORED (re-signed) signature so the
+        // off-table watermark / witness head hash matches what a verifier
+        // recomputes for the next row's prev_hash (`canonical_chain_bytes`
+        // commits the signature column). Mirrors the sqlite append discipline.
+        signature: resigned.clone(),
         attest_level: attest_level.to_string(),
         timestamp: timestamp.to_rfc3339(),
         prev_hash: Vec::new(),
@@ -12164,6 +12208,7 @@ impl PostgresStore {
     pub async fn verify_audit_trail(
         &self,
         since: Option<&str>,
+        audit_pubkey: Option<&ed25519_dalek::VerifyingKey>,
     ) -> StoreResult<crate::signed_events::AuditTrailReport> {
         use crate::signed_events::{
             SignedEvent, TruncationCheck, ZERO_HASH, canonical_chain_bytes,
@@ -12269,12 +12314,19 @@ impl PostgresStore {
         // and classify each row with the SHARED
         // [`crate::signed_events::classify_row_signature`] so BOTH backends
         // surface IDENTICAL signature_failures + role_separation_failures (K3).
-        let daemon_verifier = crate::governance::audit::resolve_daemon_verifying_key();
+        // v1.0.0 L4 (PR-3) — the EFFECTIVE daemon verifier: the out-of-band
+        // `AI_MEMORY_AUDIT_PUBKEY` pin takes precedence when enrolled, else the
+        // in-process daemon key (byte-identical legacy when no pin). Same
+        // resolution as the sqlite `verify_chain` (K3 parity).
+        let in_process = crate::governance::audit::resolve_daemon_verifying_key();
+        let daemon_verifier: Option<&ed25519_dalek::VerifyingKey> =
+            audit_pubkey.or(in_process.as_ref());
         let recorder_verifier = crate::governance::audit::load_enrolled_recorder_pubkey()
             .ok()
             .flatten();
         let mut signature_failures: Vec<i64> = Vec::new();
         let mut role_separation_failures: Vec<i64> = Vec::new();
+        let mut rows_positively_verified: u64 = 0;
 
         let total_events = rows.len();
         let mut chain_intact = true;
@@ -12303,13 +12355,16 @@ impl PostgresStore {
             };
             let rv = crate::signed_events::classify_row_signature(
                 &ev,
-                daemon_verifier.as_ref(),
+                daemon_verifier,
                 recorder_verifier.as_ref(),
             );
-            if rv.signature_failure {
+            if rv.is_verified() {
+                rows_positively_verified += 1;
+            }
+            if rv.signature_failure() {
                 signature_failures.push(seq);
             }
-            if rv.role_separation_failure {
+            if rv.role_separation_failure() {
                 role_separation_failures.push(seq);
             }
             let mut h = Sha256::new();
@@ -12536,6 +12591,14 @@ impl PostgresStore {
             role_separation,
             lineage,
             rollback,
+            // v1.0.0 L4 (PR-3) — SHARED fold (K3 parity with the sqlite twin).
+            // `checked` = rows walked in-window (`total_events`); the pin is
+            // enrolled iff `audit_pubkey` was threaded in.
+            signature_check: crate::signed_events::compute_signature_verdict(
+                u64::try_from(total_events).unwrap_or(u64::MAX),
+                rows_positively_verified,
+                audit_pubkey.is_some(),
+            ),
         })
     }
 
@@ -33055,7 +33118,7 @@ mod tests {
         // chain is empty or populated; both the unbounded and the
         // since-windowed calls exercise the recompute loop.
         let full = store
-            .verify_audit_trail(None)
+            .verify_audit_trail(None, None)
             .await
             .expect("verify full trail");
         assert!(
@@ -33064,7 +33127,7 @@ mod tests {
             full.head_sequence
         );
         let windowed = store
-            .verify_audit_trail(Some("2000-01-01T00:00:00Z"))
+            .verify_audit_trail(Some("2000-01-01T00:00:00Z"), None)
             .await
             .expect("verify windowed trail");
         assert!(windowed.head_sequence >= 0, "windowed report is coherent");

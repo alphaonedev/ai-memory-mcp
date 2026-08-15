@@ -161,6 +161,22 @@ fn main() -> Result<()> {
     // and swallowed so a missing key never blocks daemon startup.
     init_forensic_audit(&app_config);
 
+    // v1.0.0 L4 (PR-3) — resolve the out-of-band audit pin HERE, in the same
+    // SYNCHRONOUS pre-runtime phase as the posture enforcement above (the #1889
+    // contract). The `--audit-pubkey` flag (highest precedence) or the
+    // `AI_MEMORY_AUDIT_PUBKEY` env is decoded to an `Option<VerifyingKey>` ONCE
+    // and threaded as an explicit parameter into `daemon_runtime::run` — never
+    // re-published to the process environment via `set_var` (the #2905 env-leak
+    // class). A malformed pin aborts the boot here rather than silently
+    // verifying against nothing. Only the `verify-audit-trail` subcommand
+    // carries the flag; every other command resolves the pin from the env alone
+    // (or `None`), which is inert for them.
+    let audit_pubkey_flag = match &cli.command {
+        daemon_runtime::Command::VerifyAuditTrail(a) => a.audit_pubkey.as_deref(),
+        _ => None,
+    };
+    let audit_pubkey = ai_memory::governance::audit::resolve_audit_pubkey(audit_pubkey_flag)?;
+
     // #1889 — build the async runtime AFTER all env seeding is done, then hand
     // off to the daemon body. Mirrors the `#[tokio::main]` default (multi-thread
     // scheduler, all drivers enabled). `_log_guard` stays in scope across the
@@ -168,7 +184,7 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let result = runtime.block_on(daemon_runtime::run(cli, &app_config));
+    let result = runtime.block_on(daemon_runtime::run(cli, &app_config, audit_pubkey.as_ref()));
     if result.as_ref().err().is_some_and(|error| {
         error
             .downcast_ref::<daemon_runtime::FatalShutdownError>()

@@ -1033,6 +1033,11 @@ fn recompute_signed_row_hash_at(conn: &Connection, sequence: i64) -> Result<Opti
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainVerificationReport {
     pub rows_checked: u64,
+    /// v1.0.0 L4 (PR-3) — count of rows whose per-row signature POSITIVELY
+    /// verified against an enrolled key (the audit-pin daemon key or the
+    /// recorder pin). `rows_checked - rows_positively_verified` is the
+    /// `unverified` count that drives [`SignatureCheck`].
+    pub rows_positively_verified: u64,
     pub chain_break: Option<i64>,
     pub signature_failures: Vec<i64>,
     /// v0.9.0 G9 (#1826) — sequences of ROLE-SEPARATION failures disjoint from
@@ -1077,16 +1082,98 @@ impl ChainVerificationReport {
 /// decode fails. A clean (chain held + zero signature failures)
 /// report is returned as `Ok`; the caller checks
 /// [`ChainVerificationReport::chain_holds`] for the chain bit.
-/// v0.9.0 G9 (#1826) — the per-row Ed25519 verdict split into a daemon
-/// `signature_failure` and a role-separation `role_separation_failure`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RowSignatureVerdict {
-    /// Legacy daemon-verifier signature failure (a stripped / forged
-    /// daemon-signed row, or a malformed signature blob).
-    pub signature_failure: bool,
-    /// v0.9.0 G9 — a `recorder_signed` row failed recorder verification, OR a
-    /// `daemon_signed` governance row was DEMOTED post recorder-enrollment (C2).
-    pub role_separation_failure: bool,
+/// v1.0.0 L4 (PR-3) — why a row that did NOT positively verify was SKIPPED
+/// rather than counted a failure. A skip is a legitimate withhold, but it is
+/// still COUNTED as `unverified` (see [`SignatureCheck`]) so that — once an
+/// out-of-band audit pin is enrolled — a DOWNGRADE that relabels a verifiable
+/// row into a skip class can no longer silently escape the verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// v0.9.0 G13 (#1828) — an identity-lineage WITNESS row. Its succession
+    /// signature is verified by `identity::lineage::verify_lineage` (surfaced
+    /// as [`AuditTrailReport::lineage`]), never by the daemon/recorder verifier
+    /// here — so the daemon verifier would ALWAYS false-fail it.
+    LineageWitness,
+    /// v0.9.0 G9 (#1826) — a `recorder_signed` row but NO recorder pubkey is
+    /// enrolled (C6): withheld rather than false-failed against the daemon key.
+    RecorderUnenrolled,
+    /// No daemon/audit verifier is installed (an unsigned daemon with no
+    /// out-of-band audit pin): there is no key to verify against.
+    NoVerifier,
+    /// A by-design legacy `unsigned` row with a verifier installed but no
+    /// signature to check (#1452 — never a failure for the `unsigned` class).
+    UnsignedByDesign,
+}
+
+/// v1.0.0 L4 (PR-3) — the failing axis a `Failed` row belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureFailure {
+    /// Legacy daemon/audit-verifier signature failure (a stripped / forged
+    /// daemon-signed row, or a malformed signature blob). The `signature_failure`
+    /// axis surfaced in [`AuditTrailReport::signature_failures`].
+    DaemonSignature,
+    /// v0.9.0 G9 — a `recorder_signed` row failed recorder-key verification.
+    /// A role-separation failure.
+    RecorderVerification,
+    /// v0.9.0 G9 (C2) — a `daemon_signed` governance row DEMOTED once a recorder
+    /// key is enrolled. A role-separation failure.
+    DaemonRoleDemotion,
+}
+
+/// v1.0.0 L4 (PR-3) — TRI-STATE per-row Ed25519 verdict. Every row the chain
+/// walk visits lands in EXACTLY ONE bucket, so a skip is no longer silently
+/// discarded: `Verified` counts toward `rows_positively_verified`, while both
+/// `Skipped` and `Failed` count as UNVERIFIED (folded into [`SignatureCheck`]
+/// only when an out-of-band audit pin is enrolled).
+///
+/// The legacy two-bool split is preserved verbatim through
+/// [`RowSignatureVerdict::signature_failure`] /
+/// [`RowSignatureVerdict::role_separation_failure`], so the
+/// `signature_failures` / `role_separation_failures` sets both backends already
+/// surface are byte-identical when no pin is enrolled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowSignatureVerdict {
+    /// The row's signature POSITIVELY verified against an enrolled key (the
+    /// audit-pin daemon key or the recorder pin).
+    Verified,
+    /// The row was not verified but this is a legitimate WITHHOLD, not a
+    /// failure. Carries the [`SkipReason`]. Counted as unverified.
+    Skipped(SkipReason),
+    /// The row carried a signature that did NOT verify, or a role-separation
+    /// demotion. Carries the [`SignatureFailure`] axis. Counted as unverified.
+    Failed(SignatureFailure),
+}
+
+impl RowSignatureVerdict {
+    /// `true` iff the row positively verified against an enrolled key.
+    #[must_use]
+    pub fn is_verified(self) -> bool {
+        matches!(self, RowSignatureVerdict::Verified)
+    }
+
+    /// Legacy `signature_failure` axis — a daemon/audit signature that did not
+    /// verify. Preserved so [`AuditTrailReport::signature_failures`] is
+    /// byte-identical to the pre-tri-state behaviour.
+    #[must_use]
+    pub fn signature_failure(self) -> bool {
+        matches!(
+            self,
+            RowSignatureVerdict::Failed(SignatureFailure::DaemonSignature)
+        )
+    }
+
+    /// v0.9.0 G9 role-separation axis — a recorder-verify failure OR a C2
+    /// daemon-governance demotion. Preserved so the role-separation verdict
+    /// input is byte-identical to the pre-tri-state behaviour.
+    #[must_use]
+    pub fn role_separation_failure(self) -> bool {
+        matches!(
+            self,
+            RowSignatureVerdict::Failed(
+                SignatureFailure::RecorderVerification | SignatureFailure::DaemonRoleDemotion
+            )
+        )
+    }
 }
 
 /// v0.9.0 G9 (#1826) — classify ONE row's per-row Ed25519 verification. The
@@ -1117,12 +1204,20 @@ pub fn classify_row_signature(
         // (surfaced as `AuditTrailReport::lineage`); this walk still
         // audits the row's CHAIN LINKAGE — the same disjoint-property
         // split the module docs pin for chain-break vs signature.
-        return RowSignatureVerdict::default();
+        //
+        // v1.0.0 L4 (PR-3) — COUNTED as `Skipped(LineageWitness)` rather than
+        // silently discarded: once an out-of-band audit pin is enrolled a row
+        // DOWNGRADED into this skip class (attest relabeled, signature stripped)
+        // stops being a free pass — it is `unverified` → dirty. See
+        // [`SignatureCheck`].
+        return RowSignatureVerdict::Skipped(SkipReason::LineageWitness);
     }
     if event.attest_level == AttestLevel::RecorderSigned.as_str() {
         // RECORDER-signed row (C6: withhold when no recorder pubkey enrolled).
         let Some(rk) = recorder_verifier else {
-            return RowSignatureVerdict::default();
+            // v1.0.0 L4 — COUNTED as `Skipped(RecorderUnenrolled)`, not
+            // discarded (closes the same downgrade class as the lineage arm).
+            return RowSignatureVerdict::Skipped(SkipReason::RecorderUnenrolled);
         };
         let ok = match event.signature.as_deref() {
             Some(sig_bytes) if !sig_bytes.is_empty() => match <[u8; 64]>::try_from(sig_bytes) {
@@ -1138,9 +1233,10 @@ pub fn classify_row_signature(
             },
             _ => false,
         };
-        return RowSignatureVerdict {
-            signature_failure: false,
-            role_separation_failure: !ok,
+        return if ok {
+            RowSignatureVerdict::Verified
+        } else {
+            RowSignatureVerdict::Failed(SignatureFailure::RecorderVerification)
         };
     }
     if recorder_verifier.is_some()
@@ -1149,52 +1245,60 @@ pub fn classify_row_signature(
     {
         // C2 DAEMON DEMOTION — a daemon-signed governance row is no longer an
         // acceptable recorder attestation once a recorder key is enrolled.
-        return RowSignatureVerdict {
-            signature_failure: false,
-            role_separation_failure: true,
-        };
+        return RowSignatureVerdict::Failed(SignatureFailure::DaemonRoleDemotion);
     }
-    // Legacy daemon verifier (#1071 / #1452), unchanged.
+    // Legacy daemon verifier (#1071 / #1452), unchanged — the caller resolves
+    // the EFFECTIVE verifier (the out-of-band `AI_MEMORY_AUDIT_PUBKEY` pin when
+    // enrolled, else the in-process daemon key), so this arm is pin-agnostic.
     let Some(vk) = daemon_verifier else {
-        return RowSignatureVerdict::default();
+        // No key to verify against (unsigned daemon + no pin). v1.0.0 L4 —
+        // COUNTED as `Skipped(NoVerifier)`; never dirties without a pin.
+        return RowSignatureVerdict::Skipped(SkipReason::NoVerifier);
     };
-    let failed = match event.signature.as_ref() {
+    match event.signature.as_ref() {
         Some(sig_bytes) if !sig_bytes.is_empty() => {
             match <[u8; 64]>::try_from(sig_bytes.as_slice()) {
                 Ok(arr) => {
                     let sig = ed25519_dalek::Signature::from_bytes(&arr);
                     // #1925 (CWE-347) — accept EITHER the identity-bound input
-                    // (sqlite rows re-signed at append over the full attribution
-                    // tuple) OR the legacy payload-only input (postgres rows +
-                    // pre-#1925 rows). A row tampered in any identity column
+                    // (sqlite/postgres rows re-signed at append over the full
+                    // attribution tuple) OR the legacy payload-only input
+                    // (pre-#1925 rows). A row tampered in any identity column
                     // fails the identity check; the payload-only fallback never
                     // re-validates a tampered identity because a payload-only
                     // signature is not over the identity pre-image at all. So the
-                    // sqlite head-row identity-tamper attack is caught fail-closed
-                    // while legitimate postgres/legacy rows still verify.
+                    // head-row identity-tamper attack is caught fail-closed while
+                    // legitimate legacy rows still verify.
                     let id_input = daemon_row_signing_input(event);
                     let pay_input =
                         signing_input_bytes(&event.payload_hash, event.cause_hash.as_deref());
                     let ok = vk.verify_strict(&id_input, &sig).is_ok()
                         || vk.verify_strict(&pay_input, &sig).is_ok();
-                    !ok
+                    if ok {
+                        RowSignatureVerdict::Verified
+                    } else {
+                        RowSignatureVerdict::Failed(SignatureFailure::DaemonSignature)
+                    }
                 }
-                Err(_) => true,
+                Err(_) => RowSignatureVerdict::Failed(SignatureFailure::DaemonSignature),
             }
         }
         // #1452 — fail-closed on a missing signature when a verifier IS
-        // installed, EXCEPT the by-design legacy `unsigned` rows.
-        _ => event.attest_level != crate::models::AttestLevel::Unsigned.as_str(),
-    };
-    RowSignatureVerdict {
-        signature_failure: failed,
-        role_separation_failure: false,
+        // installed, EXCEPT the by-design legacy `unsigned` rows (withheld).
+        _ => {
+            if event.attest_level == crate::models::AttestLevel::Unsigned.as_str() {
+                RowSignatureVerdict::Skipped(SkipReason::UnsignedByDesign)
+            } else {
+                RowSignatureVerdict::Failed(SignatureFailure::DaemonSignature)
+            }
+        }
     }
 }
 
 pub fn verify_chain(
     conn: &Connection,
     since_sequence: Option<i64>,
+    audit_pubkey: Option<&ed25519_dalek::VerifyingKey>,
 ) -> Result<ChainVerificationReport> {
     let lower = since_sequence.unwrap_or(0);
     let mut stmt = conn
@@ -1217,8 +1321,17 @@ pub fn verify_chain(
     // with `signing_key: None`); in that case we record no signature
     // failures because there is no key to verify against — the
     // verifier is structure-only on an unsigned daemon.
-    let verifier: Option<ed25519_dalek::VerifyingKey> =
+    // v1.0.0 L4 (PR-3) — the EFFECTIVE daemon verifier: the out-of-band
+    // `AI_MEMORY_AUDIT_PUBKEY` pin (threaded as `audit_pubkey`) takes precedence
+    // when enrolled, else the in-process daemon key. The pin lets a verify-only
+    // auditor (a rotated / restored / federated node without the private signing
+    // key in-process) actually verify daemon-signed rows, and — folded into
+    // `is_clean` via [`SignatureCheck`] — makes an unverifiable row (a stripped /
+    // downgraded / forged row) DIRTY. When no pin is enrolled this is exactly the
+    // pre-L4 in-process key (byte-identical legacy).
+    let in_process: Option<ed25519_dalek::VerifyingKey> =
         crate::governance::audit::resolve_daemon_verifying_key();
+    let verifier: Option<&ed25519_dalek::VerifyingKey> = audit_pubkey.or(in_process.as_ref());
     // v0.9.0 G9 (#1826) — recorder K1 pin authority. When enrolled, a
     // `recorder_signed` row is verified against THIS pubkey over the
     // domain-separated preimage (never the daemon key), and a `daemon_signed`
@@ -1230,6 +1343,7 @@ pub fn verify_chain(
             .flatten();
     let mut signature_failures: Vec<i64> = Vec::new();
     let mut role_separation_failures: Vec<i64> = Vec::new();
+    let mut rows_positively_verified: u64 = 0;
 
     let mut expected_seq = lower + 1;
     let mut prev_canonical_hash: [u8; 32] = ZERO_HASH;
@@ -1317,11 +1431,14 @@ pub fn verify_chain(
         // the postgres verify twin (C7) surface IDENTICAL signature_failures +
         // role_separation_failures (K3 parity). A signature failure is disjoint
         // from a chain break by design (per-row forgery vs substrate tamper).
-        let rv = classify_row_signature(&event, verifier.as_ref(), recorder_verifier.as_ref());
-        if rv.signature_failure {
+        let rv = classify_row_signature(&event, verifier, recorder_verifier.as_ref());
+        if rv.is_verified() {
+            rows_positively_verified += 1;
+        }
+        if rv.signature_failure() {
             signature_failures.push(event.sequence);
         }
-        if rv.role_separation_failure {
+        if rv.role_separation_failure() {
             role_separation_failures.push(event.sequence);
         }
 
@@ -1336,6 +1453,7 @@ pub fn verify_chain(
 
     Ok(ChainVerificationReport {
         rows_checked,
+        rows_positively_verified,
         chain_break,
         signature_failures,
         role_separation_failures,
@@ -1943,6 +2061,78 @@ pub fn compute_cause_binding_verdict(rows_without_cause: i64, require: bool) -> 
     }
 }
 
+/// v1.0.0 L4 (PR-3) — verdict of the per-row audit-SIGNATURE coverage check,
+/// driven by `unverified = rows_checked - rows_positively_verified` and whether
+/// an out-of-band [`crate::governance::audit::AUDIT_PUBKEY_ENV`] pin is enrolled.
+///
+/// - [`Unenforced`](SignatureCheck::Unenforced) — NO audit pin enrolled: the
+///   coverage is INFORMATIONAL only and NEVER dirties [`AuditTrailReport::is_clean`]
+///   (byte-identical legacy — rotated / restored / federated nodes that cannot
+///   verify every historical row do not regress). This is the default.
+/// - [`Verified`](SignatureCheck::Verified) — an audit pin IS enrolled and EVERY
+///   walked row positively verified.
+/// - [`Unverified`](SignatureCheck::Unverified) — an audit pin IS enrolled and
+///   `unverified` of `checked` rows did NOT positively verify (a stripped,
+///   DOWNGRADED, forged, or skip-class row). A hard-dirty verdict.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SignatureCheck {
+    /// No audit pin enrolled — informational only, never dirties `is_clean`.
+    Unenforced {
+        /// Rows the chain walk visited inside the window.
+        checked: u64,
+        /// Rows that did NOT positively verify (informational without a pin).
+        unverified: u64,
+    },
+    /// Audit pin enrolled and every walked row positively verified.
+    Verified {
+        /// Rows the chain walk visited inside the window.
+        checked: u64,
+    },
+    /// Audit pin enrolled and `unverified` rows did not positively verify.
+    Unverified {
+        /// Rows the chain walk visited inside the window.
+        checked: u64,
+        /// Rows that did NOT positively verify (skip-class / stripped / forged).
+        unverified: u64,
+    },
+}
+
+/// v1.0.0 L4 (PR-3) — fold the per-row signature coverage into a
+/// [`SignatureCheck`]. Pure (no I/O) so the fold policy is unit-testable and
+/// SHARED by both backends' `verify_audit_trail` (K3 parity): sqlite and the
+/// [`crate::store::postgres::PostgresStore::verify_audit_trail`] twin call THIS
+/// same fn, so a verdict true on one backend can never be silently absent on the
+/// other.
+///
+/// `checked` is every row the chain walk visited; `positively_verified` is the
+/// subset that verified against an enrolled key. When NO audit pin is enrolled
+/// (`pin_enrolled == false`) the verdict is `Unenforced` (informational; never
+/// dirties `is_clean`); when a pin IS enrolled any unverified row yields
+/// `Unverified` (dirty).
+#[must_use]
+pub fn compute_signature_verdict(
+    checked: u64,
+    positively_verified: u64,
+    pin_enrolled: bool,
+) -> SignatureCheck {
+    let unverified = checked.saturating_sub(positively_verified);
+    if !pin_enrolled {
+        return SignatureCheck::Unenforced {
+            checked,
+            unverified,
+        };
+    }
+    if unverified == 0 {
+        SignatureCheck::Verified { checked }
+    } else {
+        SignatureCheck::Unverified {
+            checked,
+            unverified,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AuditTrailReport {
     /// Rows walked inside the `since` window (the whole table when
@@ -2021,6 +2211,14 @@ pub struct AuditTrailReport {
     /// See [`HeadHashCheck`] for the known bounds (interior-row / sub-interval /
     /// #1930 encoding-skew).
     pub head_hash: HeadHashCheck,
+    /// v1.0.0 L4 (PR-3) — per-row audit-SIGNATURE coverage verdict, driven by
+    /// `unverified = rows_checked - rows_positively_verified` and whether an
+    /// out-of-band `AI_MEMORY_AUDIT_PUBKEY` pin is enrolled. `Unenforced` (no
+    /// pin) is INFORMATIONAL and never dirties (byte-identical legacy);
+    /// `Unverified` (pin enrolled + an unverifiable/skip-class/downgraded row)
+    /// is dirty. Populated IDENTICALLY by both backends via the SHARED
+    /// [`compute_signature_verdict`] (K3 parity). See [`SignatureCheck`].
+    pub signature_check: SignatureCheck,
 }
 
 impl AuditTrailReport {
@@ -2075,6 +2273,13 @@ impl AuditTrailReport {
             // TruncationCheck::Detected; Unknown/NotDetected keep an otherwise-
             // clean report clean (no anchor / head row absent = legacy-identical).
             && !matches!(self.head_hash, HeadHashCheck::Mismatch { .. })
+            // v1.0.0 L4 (PR-3) — a per-row signature-coverage Unverified verdict
+            // is dirty ONLY when an audit pin is enrolled (that is the sole
+            // variant `compute_signature_verdict` emits with a pin + an
+            // unverified row). Unenforced (no pin) / Verified keep an otherwise-
+            // clean report clean, so a deployment without a pin is byte-identical
+            // legacy (rotated / restored / federated nodes do not regress).
+            && !matches!(self.signature_check, SignatureCheck::Unverified { .. })
     }
 }
 
@@ -2158,7 +2363,11 @@ impl AuditTrailReport {
 /// Returns the underlying `rusqlite` error if any of the head /
 /// floor / gap-scan queries fail, or the `verify_chain` error.
 #[allow(clippy::too_many_lines)]
-pub fn verify_audit_trail(conn: &Connection, since: Option<&str>) -> Result<AuditTrailReport> {
+pub fn verify_audit_trail(
+    conn: &Connection,
+    since: Option<&str>,
+    audit_pubkey: Option<&ed25519_dalek::VerifyingKey>,
+) -> Result<AuditTrailReport> {
     // Chain head — highest sequence in the WHOLE table (independent of
     // the window). `MAX(sequence)` is NULL on an empty table → 0.
     let head_sequence: i64 = conn
@@ -2209,8 +2418,11 @@ pub fn verify_audit_trail(conn: &Connection, since: Option<&str>) -> Result<Audi
 
     let since_sequence = if floor > 0 { Some(floor) } else { None };
 
-    // Reuse the canonical chain verifier — no reimplemented crypto.
-    let report = verify_chain(conn, since_sequence).context("verify_audit_trail: verify_chain")?;
+    // Reuse the canonical chain verifier — no reimplemented crypto. v1.0.0 L4
+    // (PR-3) — thread the out-of-band audit pin so the walk verifies daemon rows
+    // against it (when enrolled) and counts positively-verified rows.
+    let report = verify_chain(conn, since_sequence, audit_pubkey)
+        .context("verify_audit_trail: verify_chain")?;
 
     // Independent monotonic-sequence gap scan over the SAME window.
     // `verify_chain` records only the FIRST break sequence; operators
@@ -2424,6 +2636,13 @@ pub fn verify_audit_trail(conn: &Connection, since: Option<&str>) -> Result<Audi
         role_separation,
         lineage,
         rollback,
+        // v1.0.0 L4 (PR-3) — SHARED fold (K3 parity with the pg twin). The pin
+        // is enrolled iff `audit_pubkey` was threaded in.
+        signature_check: compute_signature_verdict(
+            report.rows_checked,
+            report.rows_positively_verified,
+            audit_pubkey.is_some(),
+        ),
     })
 }
 
@@ -2909,7 +3128,7 @@ pub fn emit_reanchor_ceremony(conn: &Connection) -> Result<ReAnchorOutcome> {
     // the typed [`ReAnchorOutcome::RefusedChainDirty`] — the tamper is CAUGHT
     // here, never laundered under a new signed anchor. Withheld verdicts
     // (`Unknown` — no anchor enrolled) keep the pre-#2242 clean semantics.
-    let report = verify_audit_trail(conn, None).context("re-anchor: verify audit trail")?;
+    let report = verify_audit_trail(conn, None, None).context("re-anchor: verify audit trail")?;
     if !report.is_clean() {
         return Ok(ReAnchorOutcome::RefusedChainDirty(dirty_chain_summary(
             &report,
@@ -3162,6 +3381,10 @@ mod tests {
             role_separation: RoleSeparationCheck::Unknown,
             lineage: crate::identity::lineage::LineageCheck::Unknown,
             rollback: RollbackCheck::Unknown,
+            signature_check: SignatureCheck::Unenforced {
+                checked: 1,
+                unverified: 0,
+            },
         };
         assert!(report.is_clean(), "baseline report must be clean");
         report.head_hash = HeadHashCheck::Mismatch {
@@ -3303,13 +3526,13 @@ mod tests {
         let input = daemon_row_signing_input(&ev);
         ev.signature = Some(sk.sign(&input).to_bytes().to_vec());
         assert!(
-            !classify_row_signature(&ev, Some(&vk), None).signature_failure,
+            !classify_row_signature(&ev, Some(&vk), None).signature_failure(),
             "a genuine identity-bound row must verify"
         );
         // ADVERSARIAL tamper.
         ev.agent_id = "attacker".into();
         assert!(
-            classify_row_signature(&ev, Some(&vk), None).signature_failure,
+            classify_row_signature(&ev, Some(&vk), None).signature_failure(),
             "identity tamper must invalidate the per-row signature (#1925)"
         );
     }
@@ -3339,7 +3562,7 @@ mod tests {
         let pay = signing_input_bytes(&ev.payload_hash, None);
         ev.signature = Some(sk.sign(&pay).to_bytes().to_vec());
         assert!(
-            !classify_row_signature(&ev, Some(&vk), None).signature_failure,
+            !classify_row_signature(&ev, Some(&vk), None).signature_failure(),
             "a legacy payload-only daemon signature must still verify (no false-fail)"
         );
     }
@@ -3370,7 +3593,7 @@ mod tests {
             "a key is installed, so the row must be daemon-signed"
         );
         append_signed_event(&conn, &ev).expect("append");
-        let rep = verify_chain(&conn, None).expect("verify");
+        let rep = verify_chain(&conn, None, None).expect("verify");
         assert!(rep.chain_holds());
         assert!(
             rep.signature_failures.is_empty(),
@@ -3386,7 +3609,7 @@ mod tests {
             "UPDATE"
         );
         conn.execute(&tamper_sql, []).unwrap();
-        let rep2 = verify_chain(&conn, None).expect("verify tampered");
+        let rep2 = verify_chain(&conn, None, None).expect("verify tampered");
         assert!(
             rep2.chain_holds(),
             "a head-row identity edit leaves the cross-row chain intact — proving \

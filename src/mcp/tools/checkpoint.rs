@@ -623,7 +623,7 @@ mod handler_tests {
         assert_eq!(count, 1, "one coordination.checkpoint_resolve row");
         assert_eq!(agent, "agent-b", "row attributed to the resolver");
 
-        let report = crate::signed_events::verify_audit_trail(&conn, None).expect("verify");
+        let report = crate::signed_events::verify_audit_trail(&conn, None, None).expect("verify");
         assert!(report.chain_intact, "chain must verify; report={report:?}");
     }
 

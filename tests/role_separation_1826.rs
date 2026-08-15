@@ -187,7 +187,7 @@ fn legacy_bytes_unchanged_without_role_keys() {
     );
 
     // And the report withholds (Unknown) — byte-identical clean verdict.
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert_eq!(report.role_separation, RoleSeparationCheck::Unknown);
     assert!(report.is_clean(), "unconfigured ⇒ clean; report={report:?}");
     clear_role_env();
@@ -208,7 +208,7 @@ fn recorder_row_pins() {
     let good = recorder_row(&recorder, b"good", &recorder_preimage(&ph));
     append_signed_event(&conn, &good).expect("append good");
 
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert_eq!(
         report.role_separation,
         RoleSeparationCheck::NotDetected,
@@ -220,7 +220,7 @@ fn recorder_row_pins() {
     // must be rejected — proves the per-row pin + the domain fold (C1).
     let bad = recorder_row(&recorder, b"bad", &payload_hash(b"bad"));
     append_signed_event(&conn, &bad).expect("append bad");
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert!(
         matches!(report.role_separation, RoleSeparationCheck::Forged { .. }),
         "a wrong-preimage recorder row ⇒ Forged; report={report:?}"
@@ -271,7 +271,7 @@ fn judge_verdict_checkpoint_pins() {
     .expect("build verdict cp");
     ai_memory::checkpoints::insert(&conn, &cp).expect("insert verdict cp");
 
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert_eq!(
         report.role_separation,
         RoleSeparationCheck::NotDetected,
@@ -294,7 +294,7 @@ fn judge_verdict_checkpoint_pins() {
     )
     .expect("build forged cp");
     ai_memory::checkpoints::insert(&conn, &forged).expect("insert forged cp");
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert!(
         matches!(report.role_separation, RoleSeparationCheck::Forged { .. }),
         "wrong-key judge anchor ⇒ Forged; report={report:?}"
@@ -328,7 +328,7 @@ fn stopper_enforcement_checkpoint_pins() {
     .expect("build enforcement cp");
     ai_memory::checkpoints::insert(&conn, &cp).expect("insert enforcement cp");
 
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert_eq!(
         report.role_separation,
         RoleSeparationCheck::NotDetected,
@@ -350,7 +350,7 @@ fn stopper_enforcement_checkpoint_pins() {
     )
     .expect("build forged cp");
     ai_memory::checkpoints::insert(&conn, &forged).expect("insert forged cp");
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert!(
         matches!(report.role_separation, RoleSeparationCheck::Forged { .. }),
         "wrong-key stopper anchor ⇒ Forged; report={report:?}"
@@ -378,7 +378,7 @@ fn cross_role_forgery_is_rejected() {
         // Judge signs the recorder domain preimage — still the WRONG key.
         let row = recorder_row(&judge, b"leg1", &recorder_preimage(&ph));
         append_signed_event(&conn, &row).expect("append");
-        let r = verify_audit_trail(&conn, None).expect("verify");
+        let r = verify_audit_trail(&conn, None, None).expect("verify");
         assert!(
             matches!(r.role_separation, RoleSeparationCheck::Forged { .. }),
             "leg1 (judge forging recorder) must be Forged; r={r:?}"
@@ -407,7 +407,7 @@ fn cross_role_forgery_is_rejected() {
         )
         .expect("cp");
         ai_memory::checkpoints::insert(&conn, &cp).expect("insert");
-        let r = verify_audit_trail(&conn, None).expect("verify");
+        let r = verify_audit_trail(&conn, None, None).expect("verify");
         assert!(
             matches!(r.role_separation, RoleSeparationCheck::Forged { .. }),
             "leg2 (stopper forging judge) must be Forged; r={r:?}"
@@ -436,7 +436,7 @@ fn cross_role_forgery_is_rejected() {
         )
         .expect("cp");
         ai_memory::checkpoints::insert(&conn, &cp).expect("insert");
-        let r = verify_audit_trail(&conn, None).expect("verify");
+        let r = verify_audit_trail(&conn, None, None).expect("verify");
         assert!(
             matches!(r.role_separation, RoleSeparationCheck::Forged { .. }),
             "leg3 (recorder forging stopper) must be Forged; r={r:?}"
@@ -452,7 +452,7 @@ fn cross_role_forgery_is_rejected() {
         let recorder = generate(roles::RECORDER_KEY_LABEL).expect("gen");
         enrol_pubkey(roles::RECORDER_PUBKEY_ENV, &recorder);
         append_signed_event(&conn, &daemon_governance_row(b"leg4")).expect("append");
-        let r = verify_audit_trail(&conn, None).expect("verify");
+        let r = verify_audit_trail(&conn, None, None).expect("verify");
         assert!(
             matches!(r.role_separation, RoleSeparationCheck::Forged { .. }),
             "leg4 (daemon governance row post recorder-enroll) must be Forged; r={r:?}"
@@ -472,7 +472,7 @@ fn daemon_signed_row_rejected_post_recorder_enrollment() {
     append_signed_event(&conn, &daemon_governance_row(b"c2")).expect("append");
 
     // Before recorder enrollment: no role keys ⇒ withheld/clean.
-    let r = verify_audit_trail(&conn, None).expect("verify");
+    let r = verify_audit_trail(&conn, None, None).expect("verify");
     assert_eq!(r.role_separation, RoleSeparationCheck::Unknown);
     assert!(
         r.is_clean(),
@@ -482,7 +482,7 @@ fn daemon_signed_row_rejected_post_recorder_enrollment() {
     // After recorder enrollment: the daemon governance row is demoted ⇒ Forged.
     let recorder = generate(roles::RECORDER_KEY_LABEL).expect("gen");
     enrol_pubkey(roles::RECORDER_PUBKEY_ENV, &recorder);
-    let r = verify_audit_trail(&conn, None).expect("verify");
+    let r = verify_audit_trail(&conn, None, None).expect("verify");
     assert!(
         matches!(r.role_separation, RoleSeparationCheck::Forged { .. }),
         "C2 demotion ⇒ Forged; r={r:?}"
@@ -504,7 +504,7 @@ fn same_pubkey_two_roles_rejected() {
     enrol_pubkey(roles::JUDGE_PUBKEY_ENV, &shared);
     enrol_pubkey(roles::STOPPER_PUBKEY_ENV, &shared);
 
-    let r = verify_audit_trail(&conn, None).expect("verify");
+    let r = verify_audit_trail(&conn, None, None).expect("verify");
     assert!(
         matches!(r.role_separation, RoleSeparationCheck::Misconfigured { .. }),
         "C3: non-pairwise-distinct role pubkeys ⇒ Misconfigured; r={r:?}"
@@ -544,7 +544,7 @@ fn recorder_key_alone_allow_for_refused_scope() {
     )
     .expect("cp");
     ai_memory::checkpoints::insert(&conn, &cp).expect("insert");
-    let r = verify_audit_trail(&conn, None).expect("verify");
+    let r = verify_audit_trail(&conn, None, None).expect("verify");
     assert_eq!(
         r.role_separation,
         RoleSeparationCheck::NotDetected,
@@ -568,7 +568,7 @@ fn recorder_signed_rows_skipped_without_recorder_pubkey() {
     let row = recorder_row(&orphan, b"c6", &recorder_preimage(&ph));
     append_signed_event(&conn, &row).expect("append");
 
-    let r = verify_audit_trail(&conn, None).expect("verify");
+    let r = verify_audit_trail(&conn, None, None).expect("verify");
     assert_eq!(
         r.role_separation,
         RoleSeparationCheck::Unknown,
@@ -592,7 +592,7 @@ fn require_role_separation_fails_closed() {
     let (_p, conn) = open_db(ddir.path());
     unsafe { std::env::set_var(roles::REQUIRE_ROLE_SEPARATION_ENV, "1") }
 
-    let r = verify_audit_trail(&conn, None).expect("verify");
+    let r = verify_audit_trail(&conn, None, None).expect("verify");
     assert_eq!(
         r.role_separation,
         RoleSeparationCheck::Missing,
@@ -664,7 +664,7 @@ mod postgres_parity {
         .await
         .expect("insert pg recorder row");
 
-        let report = pg.verify_audit_trail(None).await.expect("pg verify");
+        let report = pg.verify_audit_trail(None, None).await.expect("pg verify");
         assert!(
             matches!(report.role_separation, RoleSeparationCheck::Forged { .. }),
             "pg verify twin must catch the forged recorder row (C7 parity); report={report:?}"

@@ -1088,7 +1088,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // that arrives through a clean auto-merge is UNVERIFIED — always
     // re-measure the merged file), so 33_150 carries the same modest headroom
     // as the neighbouring bumps.
-    ("src/store/postgres.rs", 33_390), /* 2026-08-11 #2392-rebased-onto-#2567 QUAL-10 (data-integrity, 5-agent vote 4d3ea1c5): #2392 (fold tags into the pg generated tsv column, schema v89) rebased on top of #2567 (embedder_available threading into connect_with_dim_and_timeout_auto_migrate); BOTH grow this file. Two conflicting ceiling bumps (#2567 33_280, #2392 33_350) resolved by re-measuring the COMBINED tree (#2627 lesson: a ceiling that survives a merge is UNVERIFIED, always re-measure). Combined measured 33_315; ceiling 33_390 (+75 headroom). PRIOR (#2567): the embedder-constructibility gate on the destructive pg embedding-dim auto-migrate. PRIOR (#2578/#2581/#2582/#2585): postgres read-path perf refactors; measured 32_937 after #2603. */
+    ("src/store/postgres.rs", 33_480), /* 2026-08-15 forensic-audit-trail PR-3 (L4 lane 1): the postgres append re-signs daemon-signed rows identity-bound over the ALREADY-TRUNCATED timestamp (#1925/#2203 pg parity) + the `verify_audit_trail` twin threads the AI_MEMORY_AUDIT_PUBKEY pin and folds the shared `compute_signature_verdict` (K3 parity). Measured 33_431; ceiling 33_480 (+49 headroom). PRIOR (#2392-rebased-onto-#2567): #2392 tag-fold into the pg tsv column rebased on #2567 embedder-constructibility gate; combined measured 33_315, ceiling 33_390. */
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

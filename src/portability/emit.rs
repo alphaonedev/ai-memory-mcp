@@ -332,7 +332,7 @@ pub fn build_full_envelope_audited(
     // SOURCE's witness-key enrolment (an operational concern) rather than
     // whether the EXPORTED signed rows re-verify at a destination. A broken
     // chain (interior delete / gap / truncation) still downgrades to L1.
-    let report = crate::signed_events::verify_audit_trail(conn, None)?;
+    let report = crate::signed_events::verify_audit_trail(conn, None, None)?;
     let chain_ok = report.chain_intact
         && report.sequence_gaps.is_empty()
         && !matches!(

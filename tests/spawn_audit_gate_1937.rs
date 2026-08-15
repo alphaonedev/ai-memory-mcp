@@ -214,7 +214,7 @@ fn emit_is_a_first_class_verifiable_event() {
     let conn = ai_memory::db::open(&path).expect("reopen");
     assert_eq!(spawn_row_count(&conn), 1, "exactly one spawn-audit row");
     // Item 3: verify_audit_trail walks + verifies the spawn row like any other.
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert!(
         report.chain_intact,
         "chain intact with the spawn row: {report:?}"
@@ -238,7 +238,7 @@ fn chokepoint_emits_via_seeded_db_path() {
         spawn_row_count(&conn) >= 1,
         "audited_command must emit at least one spawn-audit row via the seeded DB"
     );
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert!(report.chain_intact, "chain intact: {report:?}");
 }
 
@@ -301,7 +301,7 @@ mod postgres_parity {
 
         // The postgres verify_audit_trail twin walks + verifies it (K3 parity):
         // a single freshly-appended spawn row keeps the chain intact.
-        let report = pg.verify_audit_trail(None).await.expect("pg verify");
+        let report = pg.verify_audit_trail(None, None).await.expect("pg verify");
         assert!(
             report.chain_intact,
             "pg verify twin must keep the chain intact with the spawn row: {report:?}"

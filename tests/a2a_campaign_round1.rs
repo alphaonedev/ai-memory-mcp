@@ -893,7 +893,7 @@ fn a2a_8_signature_chain_triangle_integrity() {
     }
 
     // Verify chain integrity over all 15 rows.
-    let report = verify_chain(&alice_db, None).expect("verify_chain");
+    let report = verify_chain(&alice_db, None, None).expect("verify_chain");
     assert!(
         report.chain_holds(),
         "chain must hold across all 15 rows; report = {:?}",

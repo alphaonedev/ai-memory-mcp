@@ -1436,6 +1436,60 @@ pub fn load_enrolled_witness_pubkey() -> Result<Option<VerifyingKey>> {
 //   INDEPENDENT of any stopper signing (a signing failure never suppresses a
 //   deny); an UNSIGNED deny is the actual runtime enforcement.
 
+/// v1.0.0 L4 (PR-3) — env carrying the OUT-OF-BAND enrolled AUDIT-daemon PUBLIC
+/// key (the daemon audit key's verifying key; url-safe-no-pad base64 of the 32
+/// raw bytes). The K1-style pin that lets a verify-only auditor
+/// (`ai-memory verify-audit-trail`) verify daemon-signed rows WITHOUT the private
+/// signing key in-process, and — folded into `is_clean` via
+/// [`crate::signed_events::SignatureCheck`] — makes an unverifiable / stripped /
+/// DOWNGRADED row dirty. DELIBERATELY env/flag-only with NO on-disk fallback: a
+/// `.pub` beside the `.priv` an attacker who owns the host already controls is
+/// not a trust anchor (the witness custody-mistake this control refuses to
+/// repeat). Resolve via [`resolve_audit_pubkey`].
+pub const AUDIT_PUBKEY_ENV: &str = "AI_MEMORY_AUDIT_PUBKEY";
+
+/// v1.0.0 L4 (PR-3) — resolve the out-of-band audit pin from the `--audit-pubkey`
+/// CLI flag (highest precedence — the universal CLI-flag-wins ladder; the value
+/// is a PUBLIC key, so world-readable argv is not a confidentiality concern) then
+/// the [`AUDIT_PUBKEY_ENV`] env var. Returns `Ok(None)` when NEITHER is set (the
+/// pin is unenrolled — the default, byte-identical-legacy posture). NO on-disk
+/// fallback by design.
+///
+/// Resolved ONCE in the binary's SYNCHRONOUS pre-runtime phase (`fn main`,
+/// alongside `security_profile::enforce_at_boot_pre_runtime`) and threaded as an
+/// explicit `Option<&VerifyingKey>` value — never re-published to the process
+/// environment via `set_var` (the #2905 env-leak class).
+///
+/// # Errors
+/// The resolved value is set but is not valid url-safe-no-pad base64 of a 32-byte
+/// Ed25519 verifying key.
+pub fn resolve_audit_pubkey(flag: Option<&str>) -> Result<Option<VerifyingKey>> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let raw: Option<String> = match flag {
+        Some(f) if !f.trim().is_empty() => Some(f.trim().to_string()),
+        _ => std::env::var(AUDIT_PUBKEY_ENV)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty()),
+    };
+    let Some(v) = raw else {
+        return Ok(None);
+    };
+    let bytes = URL_SAFE_NO_PAD.decode(v.as_bytes()).with_context(|| {
+        format!("decode {AUDIT_PUBKEY_ENV} / --audit-pubkey (expect url-safe-no-pad base64)")
+    })?;
+    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        anyhow!(
+            "{AUDIT_PUBKEY_ENV} / --audit-pubkey decoded to {} bytes, expected 32",
+            bytes.len()
+        )
+    })?;
+    let vk = VerifyingKey::from_bytes(&arr).with_context(|| {
+        format!("{AUDIT_PUBKEY_ENV} / --audit-pubkey is not a valid Ed25519 verifying key")
+    })?;
+    Ok(Some(vk))
+}
+
 /// Env override for the RECORDER PRIVATE-key custody directory.
 pub const RECORDER_KEY_DIR_ENV: &str = "AI_MEMORY_RECORDER_KEY_DIR";
 /// Env carrying the OUT-OF-BAND enrolled RECORDER PUBLIC key (K1 pin
