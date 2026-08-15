@@ -36,6 +36,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RecallMeta` wire shape (`src/models/memory.rs`); crossroads T1 resolved by
   the 5-agent adversarial vote (`4d3ea1c5`), D-MCP-PRIMARY 4/5. Pinned by
   `tests/recall_semantic_withheld_fl8a.rs`.
+### Security (L7 — audit-trail verifier exoneration asymmetry; forensic-audit-trail PR-4)
+
+- **The audit-trail verifier no longer EXONERATES on an unauthenticated forensic
+  watermark, while it still CONVICTS on one.** `verify_audit_trail`'s off-table
+  `#1850` watermark feeds BOTH directions — `TruncationCheck::{Detected,NotDetected}`
+  and the forensic-watermark `HeadHashCheck::{Mismatch,NotDetected}`. On an
+  UNSIGNED daemon (a hostile host that strips the daemon signature) that anchor is
+  unauthenticated, so trusting it to render `NotDetected` / a clean bill of health
+  is a forged all-clear. PR-4 adds the guard
+  `governance::audit::audit_watermark_exoneration_authenticated(audit_pubkey)` +
+  the pure `signed_events::exoneration_gated_head_hash`, which gate ONLY the
+  EXONERATING direction: a clean truncation/head-hash verdict now renders only
+  when a non-empty watermark signature + its prev_hash chain verify against the
+  OUT-OF-BAND `AI_MEMORY_AUDIT_PUBKEY` pin (whole-chain `verify_since` under the
+  pin — no reimplemented crypto). The CONVICTING direction keeps reading the raw
+  unauthenticated `last_audit_watermark`, so a stripped signature can only
+  DEGRADE a clean verdict to WITHHELD (`Unknown`) — never SUPPRESS a
+  truncation/rewrite conviction.
+- **Enrollment-gated (mirrors the L4 `compute_signature_verdict` posture):** with
+  NO pin enrolled there is no authority to authenticate against, so the verifier
+  keeps its legacy trust-the-anchor behaviour and a default deployment is
+  byte-identical (the `audit_truncation_anchor_1850` regression passes UNMODIFIED).
+  Both backends call the SAME backend-neutral guard + the SAME pure gate over the
+  on-host forensic sink, so the sqlite and PostgreSQL verdicts are IDENTICAL (K3
+  parity). No new `security_profile` knob. Registered as a §5.4.5 removal-proof
+  control (`scripts/check-cert-removal-proof.sh`): mutating the guard to
+  `return true` flips an unauthenticated-watermark verdict clean and reds
+  `tests/audit_exoneration_asymmetry_l7.rs`.
 
 ### Fixed (append-only revision spine was dead code — `AI_MEMORY_APPEND_ONLY` is now live; #1823 / PR-2)
 
