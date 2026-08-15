@@ -2415,28 +2415,37 @@ pub fn verify_audit_trail(
     // lanes ignore it and keep reading the raw unauthenticated watermark.
     // Enrollment-gated on the out-of-band `AI_MEMORY_AUDIT_PUBKEY` pin (no pin →
     // legacy trust-the-anchor). SHARED with the postgres twin (K3 parity).
-    let exonerate_ok =
-        crate::governance::audit::audit_watermark_exoneration_authenticated(audit_pubkey);
-    let truncation = match crate::governance::audit::last_audit_watermark() {
-        Some((anchored_head, _head_canonical_hash)) => {
-            if head_sequence < anchored_head {
-                // CONVICT on the raw (unauthenticated) anchor — a stripped
-                // signature must never SUPPRESS a truncation conviction.
-                TruncationCheck::Detected {
-                    anchored_head,
-                    db_head: head_sequence,
+    // v1.0.0 #2955 — this database's genesis-derived identity scopes the SHARED
+    // on-host forensic watermark reads below (both the truncation lane and the
+    // #1873 head-hash lane), so a sibling DB sharing this sink can never bleed
+    // its head into THIS db's verdict. `None` on an empty chain / read fault =
+    // the conservative count-every-watermark posture.
+    let watermark_db_id = genesis_db_id(conn).ok().flatten();
+    let exonerate_ok = crate::governance::audit::audit_watermark_exoneration_authenticated(
+        audit_pubkey,
+        watermark_db_id.as_deref(),
+    );
+    let truncation =
+        match crate::governance::audit::last_audit_watermark(watermark_db_id.as_deref()) {
+            Some((anchored_head, _head_canonical_hash)) => {
+                if head_sequence < anchored_head {
+                    // CONVICT on the raw (unauthenticated) anchor — a stripped
+                    // signature must never SUPPRESS a truncation conviction.
+                    TruncationCheck::Detected {
+                        anchored_head,
+                        db_head: head_sequence,
+                    }
+                } else if exonerate_ok {
+                    TruncationCheck::NotDetected
+                } else {
+                    // L7 — a pin is enrolled but the anchor did not authenticate:
+                    // WITHHOLD the clean bill of health rather than exonerate on
+                    // unauthenticated evidence.
+                    TruncationCheck::Unknown
                 }
-            } else if exonerate_ok {
-                TruncationCheck::NotDetected
-            } else {
-                // L7 — a pin is enrolled but the anchor did not authenticate:
-                // WITHHOLD the clean bill of health rather than exonerate on
-                // unauthenticated evidence.
-                TruncationCheck::Unknown
             }
-        }
-        None => TruncationCheck::Unknown,
-    };
+            None => TruncationCheck::Unknown,
+        };
 
     // Resolve the RFC3339 `since` timestamp to a sequence FLOOR: the
     // max sequence of any row strictly BEFORE the window. `verify_chain`
@@ -2618,7 +2627,7 @@ pub fn verify_audit_trail(
         // v1.0.0 L7 (PR-4) — CONVICT (Mismatch) on the raw anchor, but EXONERATE
         // (NotDetected) only behind the authenticity gate (`exonerate_ok`).
         if let Some((anchored_head, anchored_hash)) =
-            crate::governance::audit::last_audit_watermark()
+            crate::governance::audit::last_audit_watermark(watermark_db_id.as_deref())
             && anchored_head > 0
             && anchored_head <= head_sequence
         {
@@ -2957,7 +2966,20 @@ pub fn append_signed_event_no_tx(conn: &Connection, event: &SignedEvent) -> Resu
     let mut hasher = Sha256::new();
     hasher.update(canonical_chain_bytes(&head_view));
     let head_hash_hex = hex_lower(hasher.finalize().as_slice());
-    crate::governance::audit::maybe_record_audit_watermark(next_seq, &head_hash_hex);
+    // v1.0.0 #2955 — stamp this database's genesis-derived identity into the
+    // shared on-host watermark so a restored / rotated / co-located sibling DB's
+    // anchor can never be read back as THIS db's high-water. Resolve the
+    // (query-bearing) db_id ONLY when an emission is actually due — the cheap
+    // peek keeps the genesis read off the 63-of-64 non-emitting appends,
+    // mirroring the witness lane's interval pre-check.
+    if crate::governance::audit::watermark_emission_due(next_seq) {
+        let db_id = genesis_db_id(conn).ok().flatten();
+        crate::governance::audit::maybe_record_audit_watermark(
+            next_seq,
+            &head_hash_hex,
+            db_id.as_deref(),
+        );
+    }
 
     // v0.9.0 G5b (#1822) — INDEPENDENT dual-chain audit-head witness anchor.
     // Emitted on the SAME `WATERMARK_INTERVAL` cadence (throttled), in the

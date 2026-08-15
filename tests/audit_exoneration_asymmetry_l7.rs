@@ -127,7 +127,7 @@ fn anchor_real_head(conn: &Connection) -> i64 {
             },
         )
         .expect("read head row");
-    forensic::record_audit_watermark(seq, &hash_hex);
+    forensic::record_audit_watermark(seq, &hash_hex, None);
     forensic::flush_blocking();
     seq
 }
@@ -247,7 +247,7 @@ fn unauthenticated_watermark_still_convicts_truncation_l7() {
     for i in 0..5 {
         append_row(&conn, format!("payload-{i}").as_bytes());
     }
-    forensic::record_audit_watermark(5, "anchor-hash-head-5");
+    forensic::record_audit_watermark(5, "anchor-hash-head-5", None);
     forensic::flush_blocking();
 
     // Truncate the trailing two rows — surviving 1..=3 stays contiguous.

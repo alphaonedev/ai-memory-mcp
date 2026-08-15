@@ -776,7 +776,7 @@ mod postgres_parity {
         for i in 0..300 {
             pg.emit_spawn_audit(&format!("argv0-{i}"), "1822-f2-headhash")
                 .await;
-            if let Some((seq, _)) = witness::last_audit_watermark() {
+            if let Some((seq, _)) = witness::last_audit_watermark(None) {
                 anchored = Some(seq); // fired on the just-appended head → anchored == head
                 break;
             }
