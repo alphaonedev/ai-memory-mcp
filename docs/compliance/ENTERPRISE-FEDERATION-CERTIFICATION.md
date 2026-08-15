@@ -513,6 +513,30 @@ to this document goes RED. Its reported context is declared in
 operator-gated branch-protection API call adds it to the live required
 set, the gate is a red check, not a merge block.)
 
+**Re-cert trigger — FIRED, pending re-affirmation (PR #2946, L5
+reserved-anchor refusal).** The federation-wire surface changed:
+`src/federation/receive_auth.rs` (the new pure predicate
+`inbound_checkpoint_kind_authorized` + the completed
+`RESERVED_SUBSTRATE_CONDITION_TYPES` / `RESERVED_SUBSTRATE_NAMESPACES`
+SSOTs) and `src/handlers/federation_receive.rs` (the
+`RefusedReservedKind` skip arm), plus
+`src/checkpoints/mod.rs::apply_inbound_resolution` (the by-id stored-kind
+probe + reserved-anchor gate). The change is **additive
+security-hardening**: it REFUSES an inbound `/sync/push` that would land a
+substrate-reserved checkpoint anchor (audit-head witness, governance
+verdict/enforcement, epoch-advance, peer-head entanglement, re-anchor),
+closing the L5 audit-signal-poisoning vector by which a wire-reachable
+remote peer with no host access could steer this node's witness verdict.
+It adds **NO new `AI_MEMORY_FED_*` identifier** and REMOVES **no**
+certified control (the removal-proof set is unchanged; two new
+removal-proof rows for the added predicate + by-id probe are proposed for
+`scripts/check-cert-removal-proof.sh` and activate with the PR-0 harness
+generalization). **This PR does NOT re-mint the certification:** re-running
+§5.4(2)–(5) at the new SHA and re-affirming this document against it is the
+operator/reviewer gate. Until that re-affirmation lands, treat the
+certification as EXPIRED per this clause for the changed wire surface — the
+posture is strictly STRONGER, never weaker, than at `e22bc93c`.
+
 **Named signer.** The determination at `580d8427` is a **GitHub
 squash-merge** of PR #2910, committed by `GitHub` on behalf of the
 operator account (`alphaonedev`). GitHub signature verification is
