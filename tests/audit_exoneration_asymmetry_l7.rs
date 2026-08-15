@@ -10,29 +10,30 @@
 //! `HeadHashCheck::{Mismatch,NotDetected}`. On an UNSIGNED daemon (a hostile
 //! host that strips the daemon signature) the watermark is unauthenticated, so
 //! trusting it to render `NotDetected` / a clean bill of health is a forged
-//! all-clear. The L7 control
-//! ([`ai_memory::governance::audit::audit_watermark_exoneration_authenticated`]
-//! + the pure [`ai_memory::signed_events::exoneration_gated_head_hash`]) gates
-//! ONLY the exonerating direction on an out-of-band-pinned, signature+chain
+//! all-clear. The L7 control (the
+//! [`ai_memory::governance::audit::audit_watermark_exoneration_authenticated`]
+//! guard plus the pure
+//! [`ai_memory::signed_events::exoneration_gated_head_hash`]) gates ONLY the
+//! exonerating direction on an out-of-band-pinned, signature+chain
 //! authenticated watermark, while the convicting direction keeps reading the
 //! raw unauthenticated anchor.
 //!
 //! Pins:
-//! - (auth)     pin enrolled + watermark signed by the pin + clean chain →
-//!              `NotDetected` (the control does NOT over-withhold).
-//! - (withhold) pin enrolled + UNSIGNED watermark + clean chain → `Unknown`
-//!              (BOTH lanes withheld). This is the §5.4.5 removal-proof lane
-//!              test: mutating the guard to `return true` flips it to
-//!              `NotDetected` (RED).
-//! - (convict1) pin enrolled + UNSIGNED watermark + truncated DB → `Detected`
-//!              (a stripped signature can NEVER suppress a truncation
-//!              conviction).
-//! - (convict2) pin enrolled + UNSIGNED watermark + same-length head rewrite →
-//!              `Mismatch` (conviction survives on unauthenticated evidence).
-//! - (legacy)   NO pin + UNSIGNED watermark + clean chain → `NotDetected`
-//!              (enrollment-gated: with no authority the pre-L7 trust-the-anchor
-//!              behaviour is byte-preserved — the `audit_truncation_anchor_1850`
-//!              acceptance posture).
+//!
+//! - `(auth)` pin enrolled + watermark signed by the pin + clean chain →
+//!   `NotDetected` (the control does NOT over-withhold).
+//! - `(withhold)` pin enrolled + UNSIGNED watermark + clean chain → `Unknown`
+//!   (BOTH lanes withheld). This is the §5.4.5 removal-proof lane test:
+//!   mutating the guard to `return true` flips it to `NotDetected` (RED).
+//! - `(convict1)` pin enrolled + UNSIGNED watermark + truncated DB →
+//!   `Detected` (a stripped signature can NEVER suppress a truncation
+//!   conviction).
+//! - `(convict2)` pin enrolled + UNSIGNED watermark + same-length head rewrite
+//!   → `Mismatch` (conviction survives on unauthenticated evidence).
+//! - `(legacy)` NO pin + UNSIGNED watermark + clean chain → `NotDetected`
+//!   (enrollment-gated: with no authority the pre-L7 trust-the-anchor
+//!   behaviour is byte-preserved — the `audit_truncation_anchor_1850`
+//!   acceptance posture).
 //!
 //! The forensic sink is process-global, so these tests serialise via a
 //! module-local lock (the `audit_truncation_anchor_1850` discipline).
