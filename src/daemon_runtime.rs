@@ -88,7 +88,7 @@ use crate::config::{AppConfig, FeatureTier};
 use crate::embeddings::Embedder;
 use crate::handlers::{ApiKeyState, AppState, Db};
 use crate::hnsw::VectorIndex;
-use crate::{bench, cli, db, embeddings, federation, hnsw, llm, mcp, tls};
+use crate::{bench, bench_relevance, cli, db, embeddings, federation, hnsw, llm, mcp, tls};
 
 #[cfg(feature = "sal")]
 use crate::migrate;
@@ -783,6 +783,20 @@ pub struct BenchArgs {
     /// §"Verified-path benchmarks").
     #[arg(long)]
     pub verified: bool,
+    /// L10 (Wave-2) — run the RELEVANCE-at-scale harness instead of the
+    /// latency workload: seed a synthetic labeled corpus and report
+    /// `precision@k` / `nDCG@k` / frecency-noise contamination per corpus
+    /// scale so ranking-quality degradation as the corpus grows is
+    /// measurable. Uses `--scale` for a single scale (else the default
+    /// ladder 10^3/10^4/10^5; 10^6 is opt-in via `--scale 1000000`) and
+    /// `--k` for the top-k cutoff. Mutually exclusive with the latency
+    /// workload — the other bench flags are ignored under `--relevance`.
+    #[arg(long)]
+    pub relevance: bool,
+    /// L10 — top-`k` cutoff for `precision@k` / `nDCG@k` / contamination
+    /// (only consulted under `--relevance`). Clamped to `>= 1`.
+    #[arg(long, value_name = "K", default_value_t = bench_relevance::DEFAULT_RELEVANCE_K)]
+    pub k: usize,
 }
 
 /// Default `--batch` page-size hint for `ai-memory migrate`. Currently
@@ -7083,6 +7097,12 @@ pub async fn shutdown_witness_flush_and_checkpoint(db_state: &Db) -> Result<()> 
 // ---------------------------------------------------------------------------
 
 fn cmd_bench(args: &BenchArgs) -> Result<()> {
+    // L10 (Wave-2) — the relevance-at-scale harness is a distinct sub-mode
+    // that reports ranking quality (precision@k / nDCG@k / contamination),
+    // not latency, so it short-circuits before the latency workload runs.
+    if args.relevance {
+        return cmd_bench_relevance(args);
+    }
     let iterations = args.iterations.clamp(1, crate::bench::MAX_ITERATIONS);
     let warmup = args.warmup.min(crate::bench::MAX_WARMUP);
     let regression_threshold = args
@@ -7172,6 +7192,35 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
         anyhow::bail!(
             "bench: at least one operation regressed >{regression_threshold:.1}% vs baseline"
         );
+    }
+    Ok(())
+}
+
+/// L10 (Wave-2) — the relevance-at-scale sub-mode of `ai-memory bench`.
+///
+/// Seeds a synthetic labeled corpus at each requested scale (a fresh
+/// disposable `:memory:` DB per scale), runs the real recall pipeline per
+/// probe, and reports `precision@k` / `nDCG@k` / frecency-noise
+/// contamination. `--scale` pins a single scale; otherwise the default
+/// ladder runs (10^6 is opt-in via `--scale 1000000`).
+fn cmd_bench_relevance(args: &BenchArgs) -> Result<()> {
+    let k = args.k.max(1);
+    let scales: Vec<usize> = match args.scale {
+        Some(s) => vec![s.clamp(1, crate::bench::MAX_SCALE)],
+        None => bench_relevance::DEFAULT_RELEVANCE_SCALES.to_vec(),
+    };
+    let results = bench_relevance::run(&scales, k)?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mode": "relevance-at-scale",
+                "k": k,
+                "results": results,
+            }))?
+        );
+    } else {
+        print!("{}", bench_relevance::render_table(&results));
     }
     Ok(())
 }

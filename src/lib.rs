@@ -565,6 +565,12 @@ pub mod atomisation;
 pub mod audit;
 pub mod autonomy;
 pub mod bench;
+/// L10 (Wave-2) relevance-at-scale measurement harness — a sibling of
+/// [`bench`] that scores recall ranking quality (`precision@k` / `nDCG@k`
+/// / frecency-noise contamination) over a synthetic labeled corpus at
+/// configurable scale. Additive measurement apparatus; never touches
+/// production recall scoring.
+pub mod bench_relevance;
 // v0.7.0 QW-3 — daemon-side background tasks. Carries the TTL sweep
 // loop for `offloaded_blobs`; future v0.8.0 substrate tasks land
 // here without churning `daemon_runtime`.
