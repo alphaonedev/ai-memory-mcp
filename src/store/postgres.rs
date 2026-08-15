@@ -12221,17 +12221,28 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("verify_audit_trail.head", e))?;
 
+        // v1.0.0 L7 (PR-4) — EXONERATION-authenticity gate (SHARED with the
+        // sqlite twin; K3 parity). Enrollment-gated on the out-of-band
+        // `AI_MEMORY_AUDIT_PUBKEY` pin: no pin → legacy trust-the-anchor;
+        // pin enrolled → exonerate only on an authenticated forensic watermark.
+        let exonerate_ok =
+            crate::governance::audit::audit_watermark_exoneration_authenticated(audit_pubkey);
+
         // Off-table tail-truncation verdict — the SAME shared forensic reader
         // the sqlite path uses (item 7 wired the pg chokepoint to stamp it).
         let truncation = match crate::governance::audit::last_audit_watermark() {
             Some((anchored_head, _)) => {
                 if head_sequence < anchored_head {
+                    // CONVICT on the raw (unauthenticated) anchor.
                     TruncationCheck::Detected {
                         anchored_head,
                         db_head: head_sequence,
                     }
-                } else {
+                } else if exonerate_ok {
                     TruncationCheck::NotDetected
+                } else {
+                    // L7 — pin enrolled + anchor unauthenticated → WITHHOLD.
+                    TruncationCheck::Unknown
                 }
             }
             None => TruncationCheck::Unknown,
@@ -12537,16 +12548,22 @@ impl PostgresStore {
                 enrolled.as_ref(),
             );
             let mut verdicts: Vec<crate::signed_events::HeadHashCheck> = Vec::new();
+            // v1.0.0 L7 (PR-4) — CONVICT (Mismatch) on the raw anchor, EXONERATE
+            // (NotDetected) only behind the authenticity gate (`exonerate_ok`).
+            // SHARED pure gate with the sqlite twin (K3 parity).
             if let Some((anchored_head, anchored_hash)) =
                 crate::governance::audit::last_audit_watermark()
                 && anchored_head > 0
                 && anchored_head <= head_sequence
             {
                 let recomputed = pg_recompute_signed_row_hash_at(&self.pool, anchored_head).await;
-                verdicts.push(crate::signed_events::compute_head_hash_verdict(
-                    Some(&anchored_hash),
-                    recomputed.as_deref(),
-                    crate::signed_events::CHAIN_SIGNED_EVENTS,
+                verdicts.push(crate::signed_events::exoneration_gated_head_hash(
+                    crate::signed_events::compute_head_hash_verdict(
+                        Some(&anchored_hash),
+                        recomputed.as_deref(),
+                        crate::signed_events::CHAIN_SIGNED_EVENTS,
+                    ),
+                    exonerate_ok,
                 ));
             }
             if let Some(dual) = witness_dual {

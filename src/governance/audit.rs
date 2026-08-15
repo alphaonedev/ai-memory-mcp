@@ -1067,19 +1067,31 @@ pub fn last_audit_watermark() -> Option<(i64, String)> {
     let dir = live_sink_dir()?;
     let files = list_forensic_files(&dir).ok()?;
     // Newest first; "current + previous daily file" per the daily rotation.
+    // The `signed` bit is dropped here — the CONVICTING lanes read this raw
+    // (unauthenticated) anchor. The L7 exonerating lanes gate on
+    // [`audit_watermark_exoneration_authenticated`] instead.
     for file in files.iter().rev().take(2) {
-        if let Some(found) = scan_file_last_watermark(file) {
-            return Some(found);
+        if let Some((seq, hash, _signed)) = scan_file_last_watermark(file) {
+            return Some((seq, hash));
         }
     }
     None
 }
 
-/// Return the LAST (most-recent) watermark row in a single forensic file,
-/// or `None` if it carries none. Malformed / wrong-version rows are skipped.
-fn scan_file_last_watermark(path: &Path) -> Option<(i64, String)> {
+/// The most-recent watermark row in a single forensic file:
+/// `(head_sequence, head_canonical_hash, signed)` where `signed` is `true`
+/// iff that row carried a non-empty Ed25519 `sig`. `None` if the file carries
+/// no watermark. Malformed / wrong-version rows are skipped.
+///
+/// The `signed` bit is what the L7
+/// [`audit_watermark_exoneration_authenticated`] gate consumes: `verify_since`
+/// tolerates an unsigned row (counts it, never fails on it), so the exonerating
+/// lanes must additionally confirm the exact watermark they trust is itself
+/// signed. [`last_audit_watermark`] ignores the bit (the CONVICTING lanes read
+/// the raw unauthenticated anchor).
+fn scan_file_last_watermark(path: &Path) -> Option<(i64, String, bool)> {
     let f = File::open(path).ok()?;
-    let mut found: Option<(i64, String)> = None;
+    let mut found: Option<(i64, String, bool)> = None;
     for line in BufReader::new(f).lines() {
         let Ok(line) = line else { continue };
         if line.trim().is_empty() {
@@ -1105,10 +1117,82 @@ fn scan_file_last_watermark(path: &Path) -> Option<(i64, String)> {
             .get("head_canonical_hash")
             .and_then(serde_json::Value::as_str);
         if let (Some(seq), Some(hash)) = (seq, hash) {
-            found = Some((seq, hash.to_string()));
+            found = Some((seq, hash.to_string(), !row.sig.is_empty()));
         }
     }
     found
+}
+
+/// L7 (PR-4, forensic-audit-trail wave) — earliest `--since` sentinel the
+/// [`audit_watermark_exoneration_authenticated`] gate feeds [`verify_since`] so
+/// the WHOLE forensic chain (every daily file) is authenticated under the pin.
+/// Any real forensic file (dated `>= v1.0.0`) sorts at/after it, so the seed
+/// loop skips none and the verify loop walks all of them from genesis.
+const EARLIEST_FORENSIC_SINCE: &str = "1970-01-01";
+
+/// L7 (PR-4, forensic-audit-trail wave) — EXONERATION-authenticity gate for the
+/// audit-trail verifier ([`crate::signed_events::verify_audit_trail`] + its
+/// postgres twin). Returns `true` when the exonerating verdict lanes
+/// (`TruncationCheck::NotDetected`, and `HeadHashCheck::NotDetected` on the
+/// forensic-watermark anchor) are PERMITTED to render a clean bill of health on
+/// the current forensic watermark; `false` withholds them to the safe
+/// `Unknown`.
+///
+/// The L7 asymmetry: a hostile host can STRIP the daemon signature off a
+/// forensic watermark row, but the exonerating lanes must not trust an
+/// unauthenticated anchor to mint "clean". The CONVICTING lanes (`Detected` /
+/// `Mismatch`) ignore this gate and keep reading the raw
+/// [`last_audit_watermark`], so a stripped signature can only DEGRADE a clean
+/// verdict to WITHHELD (`Unknown`) — never SUPPRESS a truncation/rewrite
+/// conviction.
+///
+/// Enrollment-gated, mirroring the L4 `compute_signature_verdict` posture: with
+/// NO out-of-band [`AUDIT_PUBKEY_ENV`] pin there is no authority to authenticate
+/// against, so the verifier keeps its legacy trust-the-anchor behaviour
+/// (`true`). Once a pin IS enrolled, exoneration is permitted ONLY when the
+/// forensic watermark row carries a non-empty Ed25519 signature that verifies
+/// against the pin AND the prev_hash chain up to it is intact — whole-chain
+/// [`verify_since`] under the pin (no reimplemented crypto; `verify_strict`
+/// rejects malleable signatures). Backend-neutral (the forensic sink is
+/// on-host), so both backends' `verify_audit_trail` call THIS fn and agree (K3
+/// parity).
+///
+/// Constant-`true` here (the §5.4.5 removal-proof mutation) lets an
+/// unauthenticated watermark exonerate — the L7 asymmetry defeated.
+#[must_use]
+pub fn audit_watermark_exoneration_authenticated(audit_pubkey: Option<&VerifyingKey>) -> bool {
+    // Enrollment gate: no out-of-band pin → no authority → legacy behaviour.
+    let Some(pubkey) = audit_pubkey else {
+        return true;
+    };
+    // A pin IS enrolled: the exonerating lanes may render clean ONLY on an
+    // authenticated watermark. No live sink → no anchor to authenticate →
+    // nothing for the exonerating lanes to render anyway; withhold.
+    let Some(dir) = live_sink_dir() else {
+        return false;
+    };
+    // The whole forensic chain must verify under the pin: a broken prev_hash
+    // link OR a signature that does not verify → withhold exoneration.
+    match verify_since(&dir, EARLIEST_FORENSIC_SINCE, Some(pubkey)) {
+        Ok(report) if report.first_failure.is_none() => {}
+        _ => return false,
+    }
+    // The chain is intact and every SIGNED row verified — but verify_since
+    // TOLERATES unsigned rows. The watermark the value lanes will actually
+    // consume is the LAST watermark row in the NEWEST forensic file that
+    // carries one (mirrors `last_audit_watermark`'s newest-first scan over the
+    // current + previous daily file). Lock onto that same row and require IT to
+    // be signed, else a hostile host that appends an UNSIGNED watermark onto an
+    // otherwise-verifying chain could still mint exoneration.
+    let Ok(files) = list_forensic_files(&dir) else {
+        return false;
+    };
+    for file in files.iter().rev().take(2) {
+        if let Some((_, _, signed)) = scan_file_last_watermark(file) {
+            return signed;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
