@@ -187,6 +187,11 @@ pub fn authorize_remote_checkpoint_resolution(
 ///
 /// The caller-creatable coordination kinds (`approval`, `external_signal`,
 /// `condition_predicate`, `deadline`) are likewise ABSENT and federate as before.
+///
+/// **DERIVED listing, NOT the load-bearing check.** The authoritative
+/// classifier is the wildcard-free [`condition_type_is_reserved`] match; this
+/// array exists only for docs + tests, and a test pins it equal to the match
+/// over EVERY `ConditionType` variant so the two cannot drift.
 pub const RESERVED_SUBSTRATE_CONDITION_TYPES: &[crate::models::ConditionType] = &[
     crate::models::ConditionType::AuditHeadWitness,
     crate::models::ConditionType::GovernanceVerdict,
@@ -210,11 +215,44 @@ pub const RESERVED_SUBSTRATE_NAMESPACES: &[&str] = &[
     crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE,
 ];
 
+/// Whether a `condition_type` is a substrate-RESERVED anchor kind — the
+/// LOAD-BEARING classifier.
+///
+/// This is an EXHAUSTIVE `match` with NO wildcard arm ON PURPOSE: a wire-facing
+/// trust classifier must FAIL TOWARD "reserved/refuse" for anything
+/// unclassified, and the way to guarantee that for a FUTURE `ConditionType`
+/// variant is to make adding one BREAK THE BUILD here until someone explicitly
+/// classifies it as an audit/identity anchor (reserved) or a
+/// caller/coordination/federated kind (not). Do NOT "simplify" this back to a
+/// wildcard `_ =>` arm or a `RESERVED_SUBSTRATE_CONDITION_TYPES.contains(...)`
+/// membership test — either would let a new trust-anchor variant default to
+/// non-reserved (federate = poisonable), which is exactly the silent-new-variant
+/// gap this hardening closes. [`RESERVED_SUBSTRATE_CONDITION_TYPES`] is a DERIVED
+/// listing (docs/tests); THIS match is the authority (a test pins them equal).
+#[must_use]
+pub fn condition_type_is_reserved(condition_type: crate::models::ConditionType) -> bool {
+    use crate::models::ConditionType as C;
+    match condition_type {
+        // Reserved: the LOCAL-ONLY audit / identity trust anchors.
+        C::AuditHeadWitness
+        | C::GovernanceVerdict
+        | C::GovernanceEnforcement
+        | C::PeerHeadEntanglement
+        | C::ReAnchor => true,
+        // Not reserved: caller coordination gates + the legitimately-federated
+        // `EpochAdvance` freeze anchor (rides the FED-RQ-01 transport, gated by
+        // the per-resolution signature gate — see the SSOT doc above).
+        C::Approval | C::ExternalSignal | C::ConditionPredicate | C::Deadline | C::EpochAdvance => {
+            false
+        }
+    }
+}
+
 /// Whether a `(condition_type, namespace)` pair names a substrate-RESERVED
-/// checkpoint anchor — i.e. EITHER the kind is in
-/// [`RESERVED_SUBSTRATE_CONDITION_TYPES`] OR the namespace is in
-/// [`RESERVED_SUBSTRATE_NAMESPACES`] (trimmed, exact match). The namespace is
-/// trimmed before compare to mirror
+/// checkpoint anchor — i.e. EITHER the kind is reserved
+/// ([`condition_type_is_reserved`], the wildcard-free load-bearing classifier)
+/// OR the namespace is in [`RESERVED_SUBSTRATE_NAMESPACES`] (trimmed, exact
+/// match). The namespace is trimmed before compare to mirror
 /// [`crate::validate::reject_reserved_write_namespace`], so a padded
 /// `"  _audit_witness  "` cannot slip past.
 #[must_use]
@@ -222,7 +260,7 @@ pub fn checkpoint_kind_is_reserved(
     condition_type: crate::models::ConditionType,
     namespace: &str,
 ) -> bool {
-    RESERVED_SUBSTRATE_CONDITION_TYPES.contains(&condition_type)
+    condition_type_is_reserved(condition_type)
         || RESERVED_SUBSTRATE_NAMESPACES.contains(&namespace.trim())
 }
 

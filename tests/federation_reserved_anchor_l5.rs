@@ -48,7 +48,7 @@ use ai_memory::checkpoints::{
     InboundResolutionOutcome, apply_inbound_resolution, get, insert, query,
 };
 use ai_memory::federation::receive_auth::{
-    RESERVED_SUBSTRATE_CONDITION_TYPES, RESERVED_SUBSTRATE_NAMESPACES,
+    RESERVED_SUBSTRATE_CONDITION_TYPES, RESERVED_SUBSTRATE_NAMESPACES, condition_type_is_reserved,
     inbound_checkpoint_kind_authorized,
 };
 use ai_memory::governance::audit::{
@@ -149,7 +149,8 @@ fn reserved_ssot_is_complete() {
         "exactly the five reserved substrate namespaces"
     );
 
-    // Every LOCAL-ONLY audit/identity trust anchor is reserved.
+    // Every LOCAL-ONLY audit/identity trust anchor is reserved — asserted
+    // against the LOAD-BEARING wildcard-free classifier, not just the listing.
     for kind in [
         ConditionType::AuditHeadWitness,
         ConditionType::GovernanceVerdict,
@@ -158,8 +159,8 @@ fn reserved_ssot_is_complete() {
         ConditionType::ReAnchor,
     ] {
         assert!(
-            RESERVED_SUBSTRATE_CONDITION_TYPES.contains(&kind),
-            "reserved kind SSOT is missing {}",
+            condition_type_is_reserved(kind),
+            "load-bearing classifier must reserve {}",
             kind.as_str()
         );
     }
@@ -177,8 +178,35 @@ fn reserved_ssot_is_complete() {
         ConditionType::EpochAdvance,
     ] {
         assert!(
-            !RESERVED_SUBSTRATE_CONDITION_TYPES.contains(&kind),
+            !condition_type_is_reserved(kind),
             "kind {} must NOT be reserved (caller coordination or legitimately federated)",
+            kind.as_str()
+        );
+    }
+
+    // Drift guard: the DERIVED `RESERVED_SUBSTRATE_CONDITION_TYPES` listing must
+    // agree with the authoritative match over EVERY `ConditionType` variant, so
+    // the docs/tests listing can never silently diverge from the load-bearing
+    // classifier. (The enum has no `all()` roster, so the variants are
+    // enumerated explicitly — the load-bearing compile-time gate against a NEW
+    // unclassified variant is the wildcard-free match in
+    // `condition_type_is_reserved`, which fails the BUILD, not this test.)
+    for kind in [
+        ConditionType::Approval,
+        ConditionType::ExternalSignal,
+        ConditionType::ConditionPredicate,
+        ConditionType::Deadline,
+        ConditionType::AuditHeadWitness,
+        ConditionType::GovernanceVerdict,
+        ConditionType::GovernanceEnforcement,
+        ConditionType::EpochAdvance,
+        ConditionType::PeerHeadEntanglement,
+        ConditionType::ReAnchor,
+    ] {
+        assert_eq!(
+            RESERVED_SUBSTRATE_CONDITION_TYPES.contains(&kind),
+            condition_type_is_reserved(kind),
+            "derived listing disagrees with the load-bearing match for {}",
             kind.as_str()
         );
     }
