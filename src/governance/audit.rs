@@ -997,12 +997,24 @@ static LAST_WATERMARKED_SEQ: AtomicI64 = AtomicI64::new(0);
 ///
 /// Fire-and-forget through [`record_decision`]: a no-op when the forensic
 /// sink is not initialised, errors logged + swallowed otherwise.
-pub fn record_audit_watermark(head_sequence: i64, head_canonical_hash: &str) {
-    let payload = serde_json::json!({
+pub fn record_audit_watermark(head_sequence: i64, head_canonical_hash: &str, db_id: Option<&str>) {
+    let mut payload = serde_json::json!({
         "v": AUDIT_WATERMARK_PAYLOAD_VERSION,
         "head_sequence": head_sequence,
         "head_canonical_hash": head_canonical_hash,
     });
+    // v1.0.0 #2955 — bind this database's genesis-derived identity so the SHARED
+    // on-host forensic watermark file filters PER DATABASE, mirroring the #2370
+    // witness (`witness_resolution_json`) + head-anchor (`scan_head_anchor_log`)
+    // db_id-scoping siblings. PRESENT-ONLY (never a new `ForensicDecision`
+    // field — the T4 note): a db_id-less row stays byte-identical to a legacy
+    // watermark and older readers ignore the extra key, so the `v` gate is
+    // unchanged (no version bump). A watermark carrying a DIFFERENT db_id
+    // anchors a sibling DB sharing this sink and must never be read as THIS
+    // db's high-water (the cross-DB watermark bleed #2955 closes).
+    if let Some(id) = db_id {
+        payload["db_id"] = serde_json::Value::String(id.to_string());
+    }
     record_decision(
         AUDIT_WATERMARK_ACTOR,
         AUDIT_WATERMARK_DECISION,
@@ -1010,6 +1022,22 @@ pub fn record_audit_watermark(head_sequence: i64, head_canonical_hash: &str) {
         "",
         payload,
     );
+}
+
+/// #1850 — cheap, non-claiming peek at the [`WATERMARK_INTERVAL`] throttle so a
+/// backend can resolve the (query-bearing) `db_id` ONLY when an emission is
+/// actually due. Mirrors the witness lane's "cheap pre-check keeps key I/O off
+/// every append" discipline (`try_emit_audit_head_witness`): the authoritative
+/// single-emitter guarantee still lives in the CAS inside
+/// [`maybe_record_audit_watermark`], so a lost race here at most wastes one
+/// genesis read — never a double emission.
+#[must_use]
+pub fn watermark_emission_due(head_sequence: i64) -> bool {
+    if head_sequence <= 0 {
+        return false;
+    }
+    let last = LAST_WATERMARKED_SEQ.load(Ordering::Relaxed);
+    head_sequence.saturating_sub(last) >= WATERMARK_INTERVAL
 }
 
 /// #1850 — throttled emitter for the signed-events append hot path.
@@ -1022,7 +1050,11 @@ pub fn record_audit_watermark(head_sequence: i64, head_canonical_hash: &str) {
 /// Lock-free throttle via a compare-and-swap on [`LAST_WATERMARKED_SEQ`];
 /// concurrent callers crossing the same interval boundary collapse to a
 /// single emission.
-pub fn maybe_record_audit_watermark(head_sequence: i64, head_canonical_hash: &str) {
+pub fn maybe_record_audit_watermark(
+    head_sequence: i64,
+    head_canonical_hash: &str,
+    db_id: Option<&str>,
+) {
     if head_sequence <= 0 {
         return;
     }
@@ -1038,7 +1070,7 @@ pub fn maybe_record_audit_watermark(head_sequence: i64, head_canonical_hash: &st
     {
         return;
     }
-    record_audit_watermark(head_sequence, head_canonical_hash);
+    record_audit_watermark(head_sequence, head_canonical_hash, db_id);
 }
 
 /// Forensic directory of the live sink, if [`init`] has run.
@@ -1063,15 +1095,22 @@ fn live_sink_dir() -> Option<PathBuf> {
 /// `verify-audit-trail` surface; a raw-library caller that never called
 /// [`init`] sees `None` (Unknown), which is the safe default.
 #[must_use]
-pub fn last_audit_watermark() -> Option<(i64, String)> {
+pub fn last_audit_watermark(db_id: Option<&str>) -> Option<(i64, String)> {
     let dir = live_sink_dir()?;
     let files = list_forensic_files(&dir).ok()?;
     // Newest first; "current + previous daily file" per the daily rotation.
     // The `signed` bit is dropped here — the CONVICTING lanes read this raw
     // (unauthenticated) anchor. The L7 exonerating lanes gate on
     // [`audit_watermark_exoneration_authenticated`] instead.
+    //
+    // v1.0.0 #2955 — `db_id` scopes the SHARED on-host forensic sink PER
+    // DATABASE (mirrors [`read_head_anchor_high_water`]): a watermark carrying a
+    // DIFFERENT db_id anchors a sibling DB on this mount and is skipped, so a
+    // restored / rotated / co-located DB's head can never be read as THIS db's
+    // high-water. `db_id = None` (an opener with no genesis / empty chain) reads
+    // every watermark — the conservative pre-#2955 posture.
     for file in files.iter().rev().take(2) {
-        if let Some((seq, hash, _signed)) = scan_file_last_watermark(file) {
+        if let Some((seq, hash, _signed)) = scan_file_last_watermark(file, db_id) {
             return Some((seq, hash));
         }
     }
@@ -1089,7 +1128,7 @@ pub fn last_audit_watermark() -> Option<(i64, String)> {
 /// lanes must additionally confirm the exact watermark they trust is itself
 /// signed. [`last_audit_watermark`] ignores the bit (the CONVICTING lanes read
 /// the raw unauthenticated anchor).
-fn scan_file_last_watermark(path: &Path) -> Option<(i64, String, bool)> {
+fn scan_file_last_watermark(path: &Path, db_id: Option<&str>) -> Option<(i64, String, bool)> {
     let f = File::open(path).ok()?;
     let mut found: Option<(i64, String, bool)> = None;
     for line in BufReader::new(f).lines() {
@@ -1105,6 +1144,19 @@ fn scan_file_last_watermark(path: &Path) -> Option<(i64, String, bool)> {
         }
         if row.payload.get("v").and_then(serde_json::Value::as_i64)
             != Some(AUDIT_WATERMARK_PAYLOAD_VERSION)
+        {
+            continue;
+        }
+        // v1.0.0 #2955 — per-database scoping (mirrors `scan_head_anchor_log`'s
+        // #2370 match): a watermark carrying a DIFFERENT db_id anchors a sibling
+        // DB sharing this on-host sink and must NEVER become this opener's
+        // high-water. A db_id-less (legacy) watermark is counted conservatively
+        // for every opener; `db_id = None` (no genesis / empty chain) counts
+        // every watermark. Only the cross-DB (foreign-id) row is skipped.
+        if let (Some(line_id), Some(mine)) = (
+            row.payload.get("db_id").and_then(serde_json::Value::as_str),
+            db_id,
+        ) && line_id != mine
         {
             continue;
         }
@@ -1160,7 +1212,10 @@ const EARLIEST_FORENSIC_SINCE: &str = "1970-01-01";
 /// Constant-`true` here (the §5.4.5 removal-proof mutation) lets an
 /// unauthenticated watermark exonerate — the L7 asymmetry defeated.
 #[must_use]
-pub fn audit_watermark_exoneration_authenticated(audit_pubkey: Option<&VerifyingKey>) -> bool {
+pub fn audit_watermark_exoneration_authenticated(
+    audit_pubkey: Option<&VerifyingKey>,
+    db_id: Option<&str>,
+) -> bool {
     // Enrollment gate: no out-of-band pin → no authority → legacy behaviour.
     let Some(pubkey) = audit_pubkey else {
         return true;
@@ -1184,11 +1239,16 @@ pub fn audit_watermark_exoneration_authenticated(audit_pubkey: Option<&Verifying
     // current + previous daily file). Lock onto that same row and require IT to
     // be signed, else a hostile host that appends an UNSIGNED watermark onto an
     // otherwise-verifying chain could still mint exoneration.
+    //
+    // v1.0.0 #2955 — lock onto the SAME db_id-scoped row [`last_audit_watermark`]
+    // consumes: authenticating a SIBLING DB's watermark would let a foreign
+    // (still-signed) anchor exonerate this db, so the exoneration lane threads
+    // the opener's db_id through the identical per-database filter.
     let Ok(files) = list_forensic_files(&dir) else {
         return false;
     };
     for file in files.iter().rev().take(2) {
-        if let Some((_, _, signed)) = scan_file_last_watermark(file) {
+        if let Some((_, _, signed)) = scan_file_last_watermark(file, db_id) {
             return signed;
         }
     }

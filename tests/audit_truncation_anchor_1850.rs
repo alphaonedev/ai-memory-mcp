@@ -102,7 +102,7 @@ fn trailing_delete_after_watermark_is_detected() {
         append_row(&conn, format!("payload-{i}").as_bytes());
     }
     // Anchor the head (5) into the off-table forensic chain.
-    forensic::record_audit_watermark(5, "anchor-hash-head-5");
+    forensic::record_audit_watermark(5, "anchor-hash-head-5", None);
     forensic::flush_blocking();
 
     // Truncate the trailing two rows (sequences 4,5) — the surviving
@@ -335,7 +335,7 @@ fn anchor_real_head(conn: &Connection) -> i64 {
             },
         )
         .expect("read head row");
-    forensic::record_audit_watermark(seq, &hash_hex);
+    forensic::record_audit_watermark(seq, &hash_hex, None);
     forensic::flush_blocking();
     seq
 }

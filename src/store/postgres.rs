@@ -11925,7 +11925,26 @@ async fn pg_append_signed_event_with_chain_in_tx(
     // permanently `Unknown`; wiring it here closes that gap. The forensic
     // write is a FILE write (never touches this pg tx), so it is safe
     // fire-and-forget.
-    crate::governance::audit::maybe_record_audit_watermark(next_seq, &head_hash_hex);
+    //
+    // v1.0.0 #2955 — stamp this database's genesis-derived identity (the SAME
+    // stable stored columns as the witness lane below, never a TIMESTAMPTZ
+    // readback) so the shared on-host watermark filters per database. The
+    // (query-bearing) genesis fetch is gated behind the cheap emission-due peek
+    // so it stays off the 63-of-64 non-emitting appends (K3 parity with sqlite).
+    if crate::governance::audit::watermark_emission_due(next_seq) {
+        let genesis: Option<(String, String, Vec<u8>)> =
+            sqlx::query_as(crate::signed_events::GENESIS_ROW_SQL)
+                .fetch_optional(&mut **tx)
+                .await?;
+        let db_id = genesis.map(|(gid, gagent, gpayload)| {
+            crate::signed_events::db_id_from_genesis_parts(&gid, &gagent, &gpayload)
+        });
+        crate::governance::audit::maybe_record_audit_watermark(
+            next_seq,
+            &head_hash_hex,
+            db_id.as_deref(),
+        );
+    }
 
     // v0.9.0 G5b (#1822, item 6) — INDEPENDENT dual-chain audit-head witness
     // anchor at the postgres chokepoint (parity with sqlite). Emitted in THIS
@@ -12221,32 +12240,56 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("verify_audit_trail.head", e))?;
 
+        // v1.0.0 #2955 — this database's genesis-derived identity scopes the
+        // SHARED on-host forensic watermark reads below, so a sibling DB sharing
+        // the sink can never bleed its head into THIS db's verdict. Derived from
+        // the SAME stable stored columns as the sqlite twin + the pg witness
+        // emission (id/agent_id/payload_hash, never a TIMESTAMPTZ readback), so
+        // both backends resolve the identical db_id (K3 parity). Unlike the
+        // #2373-deferred rollback lane (which threads into a SYNC verdict fn),
+        // the watermark reader is called directly in this async fn, so the pg
+        // CHECK side can + does scope it. `None` on an empty chain = the
+        // conservative count-every-watermark posture.
+        let watermark_db_id: Option<String> = {
+            let genesis: Option<(String, String, Vec<u8>)> =
+                sqlx::query_as(crate::signed_events::GENESIS_ROW_SQL)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| to_store_err("verify_audit_trail.genesis", e))?;
+            genesis.map(|(gid, gagent, gpayload)| {
+                crate::signed_events::db_id_from_genesis_parts(&gid, &gagent, &gpayload)
+            })
+        };
+
         // v1.0.0 L7 (PR-4) — EXONERATION-authenticity gate (SHARED with the
         // sqlite twin; K3 parity). Enrollment-gated on the out-of-band
         // `AI_MEMORY_AUDIT_PUBKEY` pin: no pin → legacy trust-the-anchor;
         // pin enrolled → exonerate only on an authenticated forensic watermark.
-        let exonerate_ok =
-            crate::governance::audit::audit_watermark_exoneration_authenticated(audit_pubkey);
+        let exonerate_ok = crate::governance::audit::audit_watermark_exoneration_authenticated(
+            audit_pubkey,
+            watermark_db_id.as_deref(),
+        );
 
         // Off-table tail-truncation verdict — the SAME shared forensic reader
         // the sqlite path uses (item 7 wired the pg chokepoint to stamp it).
-        let truncation = match crate::governance::audit::last_audit_watermark() {
-            Some((anchored_head, _)) => {
-                if head_sequence < anchored_head {
-                    // CONVICT on the raw (unauthenticated) anchor.
-                    TruncationCheck::Detected {
-                        anchored_head,
-                        db_head: head_sequence,
+        let truncation =
+            match crate::governance::audit::last_audit_watermark(watermark_db_id.as_deref()) {
+                Some((anchored_head, _)) => {
+                    if head_sequence < anchored_head {
+                        // CONVICT on the raw (unauthenticated) anchor.
+                        TruncationCheck::Detected {
+                            anchored_head,
+                            db_head: head_sequence,
+                        }
+                    } else if exonerate_ok {
+                        TruncationCheck::NotDetected
+                    } else {
+                        // L7 — pin enrolled + anchor unauthenticated → WITHHOLD.
+                        TruncationCheck::Unknown
                     }
-                } else if exonerate_ok {
-                    TruncationCheck::NotDetected
-                } else {
-                    // L7 — pin enrolled + anchor unauthenticated → WITHHOLD.
-                    TruncationCheck::Unknown
                 }
-            }
-            None => TruncationCheck::Unknown,
-        };
+                None => TruncationCheck::Unknown,
+            };
 
         // Resolve the RFC3339 `since` to a sequence FLOOR (mirrors sqlite).
         let floor: i64 = match since {
@@ -12552,7 +12595,7 @@ impl PostgresStore {
             // (NotDetected) only behind the authenticity gate (`exonerate_ok`).
             // SHARED pure gate with the sqlite twin (K3 parity).
             if let Some((anchored_head, anchored_hash)) =
-                crate::governance::audit::last_audit_watermark()
+                crate::governance::audit::last_audit_watermark(watermark_db_id.as_deref())
                 && anchored_head > 0
                 && anchored_head <= head_sequence
             {
