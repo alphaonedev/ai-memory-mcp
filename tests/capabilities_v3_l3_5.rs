@@ -314,13 +314,21 @@ fn cap_v3_l3_5_memory_kinds_reports_real_implemented_set_only() {
         .as_array()
         .expect("memory_kinds must be an array under v3");
     let kinds: Vec<&str> = kinds.iter().filter_map(Value::as_str).collect();
-    // Substrate truth — MemoryKind enum carries only these two variants
-    // as of v0.7.0. The grand-slam spec called for a third "goal" kind
-    // but the enum doesn't define it; honest reporting omits it.
+    // Substrate truth — the `MemoryKind` enum carries 16 variants at v1.0.0
+    // (`MemoryKind::all()`: the 10 Form-6 kinds + Goal/Plan/Step from v0.8.0
+    // Pillar-2 typed-cognition #1709 + Told/Instruction/Intervention from
+    // v1.0.0 epistemic typing #1945 — `goal` IS defined). This `memory_kinds`
+    // field, however, is a LEGACY back-compat wire element that reports only
+    // the original two kinds the v3 envelope froze; it is deliberately NOT the
+    // full enum. The pinned `["observation", "reflection"]` value below is that
+    // frozen two-kind wire contract — widening it to the full 16-kind set is a
+    // separate voted wire-shape change (T1), not a comment fix. This test pins
+    // the frozen field so an accidental widen (or a regression to a
+    // theatrical/nonexistent kind) reds here.
     assert_eq!(
         kinds,
         vec!["observation", "reflection"],
-        "memory_kinds must enumerate the actual MemoryKind variants, not theatrical ones"
+        "memory_kinds must enumerate the frozen legacy wire kinds, not theatrical ones"
     );
 }
 

@@ -313,14 +313,14 @@ async fn consolidate_merges_sources() {
     let ns = uid("cov-consol");
     let a = uid("ca");
     let b = uid("cb");
-    store
-        .store(&ctx, &mem(&a, &ns, "source a", "abody", "ai:cov4"))
-        .await
-        .unwrap();
-    store
-        .store(&ctx, &mem(&b, &ns, "source b", "bbody", "ai:cov4"))
-        .await
-        .unwrap();
+    // v1.0.0 #2935 — DISTINCT source confidences so the min (0.6) is
+    // DISTINGUISHABLE from the pre-#2935 hardcoded-1.0 laundering regression.
+    let mut ma = mem(&a, &ns, "source a", "abody", "ai:cov4");
+    ma.confidence = 0.6;
+    let mut mb = mem(&b, &ns, "source b", "bbody", "ai:cov4");
+    mb.confidence = 0.7;
+    store.store(&ctx, &ma).await.unwrap();
+    store.store(&ctx, &mb).await.unwrap();
     let new_id = store
         .consolidate(
             &ctx,
@@ -336,6 +336,29 @@ async fn consolidate_merges_sources() {
         .expect("consolidate");
     let got = store.get(&ctx, &new_id).await.expect("get consolidated");
     assert_eq!(got.title, "consolidated");
+    // v1.0.0 #2935 (R20 residual) — pg parity with the sqlite consolidate
+    // builder (`storage::consolidate_confidence_is_min_of_sources_2935`): a
+    // derived synthesis must NOT launder low-confidence sources into a
+    // maximally-certain 1.0 summary. Without these asserts a future refactor
+    // could silently regress the pg builder to `confidence = 1.0` /
+    // `memory_kind = Observation` while the sqlite unit test alone stayed
+    // green. confidence == min(0.6, 0.7) == 0.6 (NOT 1.0); `<= 0.6` so a
+    // future policy deriving an even lower value still passes (never inflates)
+    // and strictly-below-1.0 so a hardcoded-1.0 builder reds here.
+    assert!(
+        got.confidence <= 0.6 + f64::EPSILON,
+        "consolidated confidence {} exceeded min(source)=0.6 (pg laundering regression)",
+        got.confidence
+    );
+    assert!((got.confidence - 0.6).abs() < 1e-9);
+    // A consolidation is a DERIVED synthesis — `Claim` (vote 4d3ea1c5), never
+    // a first-hand `Observation` (the laundering defect).
+    assert_eq!(
+        got.memory_kind,
+        MemoryKind::Claim,
+        "consolidated memory_kind should be Claim (derived), got {:?}",
+        got.memory_kind
+    );
 }
 
 #[tokio::test]
