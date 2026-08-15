@@ -23,7 +23,7 @@
 # job now BUILDS the real deploy artifact —
 # `deploy/docker-1461/Dockerfile.pg-age-vector`, the SAME recipe the
 # docker-1461 mesh ships — with build-args resolved from the ONE SSOT,
-# `deploy/docker-1461/provision/lib.sh` (`PG_APT_VERSION`,
+# `deploy/docker-1461/provision/lib.sh` (`PG_APT_VERSION`, `AGE_APT_VERSION`,
 # `PGVECTOR_APT_VERSION`, `AGE_BASE_IMAGE`, `EXPECTED_PG_VERSION`,
 # `EXPECTED_AGE_VERSION`), and RUNS that built image as the postgres under
 # test — not a `services:` block pointed at the unmodified base image. No
@@ -37,15 +37,18 @@
 # THE ONE TRUE CERTIFIED TRIPLE (SSOT: deploy/docker-1461/provision/lib.sh —
 # see also docs/postgres-age-guide.md §"Certified versions"):
 #
-#   * PostgreSQL   18.4   (EXPECTED_PG_VERSION=18.4)
-#   * Apache AGE   1.7.0  (EXPECTED_AGE_VERSION=1.7.0; base image apache/age:release_PG18_1.7.0)
+#   * PostgreSQL   18.6   (EXPECTED_PG_VERSION=18.6; PG_APT_VERSION=18.6-1.pgdg13+2)
+#   * Apache AGE   1.8.0  (EXPECTED_AGE_VERSION=1.8.0; AGE_APT_VERSION=1.8.0~rc0-2.pgdg13+1,
+#                          installed via pgdg apt over base image apache/age:release_PG18_1.7.0)
 #   * pgvector     0.8.6  (PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1)
 #
 # `deploy/docker-1461/Dockerfile.pg-age-vector` bumps the apache/age base
 # image's server to the exact pinned minor via a pgdg `apt --only-upgrade`
-# (ABI-safe within PG major 18 — AGE's compiled extension loads unchanged
-# across PG minors) and layers in the exact pinned pgvector .deb (the
-# upstream apache/age image does not ship pgvector). The
+# (ABI-safe within PG major 18), upgrades Apache AGE to the exact pinned
+# `postgresql-18-age` .deb (pgdg publishes AGE 1.8.0 even though the apache/age
+# Docker Hub image is still at release_PG18_1.7.0 — the base image's AGE files
+# are overlaid cleanly, no source build), and layers in the exact pinned
+# pgvector .deb (the upstream apache/age image does not ship pgvector). The
 # `Assert certified stack versions` step below hard-fails on ANY drift from
 # the exact pinned minors — so this job is EVIDENCE, not a claim: a base-image
 # or apt-snapshot drift that silently moved a version off the SSOT pin reds
@@ -88,7 +91,7 @@ env:
 
 jobs:
   cert-postgres-age:
-    name: "Certified pg+AGE cells (live PG 18.4 + AGE 1.7.0 + pgvector 0.8.5)"
+    name: "Certified pg+AGE cells (live PG 18.6 + AGE 1.8.0 + pgvector 0.8.6)"
     runs-on: ubuntu-latest
     timeout-minutes: 60
     # NOTE: deliberately NO `services:` block. A GitHub Actions `services:`
@@ -138,6 +141,7 @@ jobs:
             echo "CERT_AGE_BASE_IMAGE=${AGE_BASE_IMAGE}"
             echo "CERT_PG_MAJOR=${PG_MAJOR}"
             echo "CERT_PG_APT_VERSION=${PG_APT_VERSION}"
+            echo "CERT_AGE_APT_VERSION=${AGE_APT_VERSION}"
             echo "CERT_PGVECTOR_APT_VERSION=${PGVECTOR_APT_VERSION}"
             echo "CERT_EXPECTED_PG_VERSION=${EXPECTED_PG_VERSION}"
             echo "CERT_EXPECTED_AGE_VERSION=${EXPECTED_AGE_VERSION}"
@@ -158,6 +162,7 @@ jobs:
             --build-arg AGE_BASE_IMAGE="${CERT_AGE_BASE_IMAGE}" \
             --build-arg PG_MAJOR="${CERT_PG_MAJOR}" \
             --build-arg PG_APT_VERSION="${CERT_PG_APT_VERSION}" \
+            --build-arg AGE_APT_VERSION="${CERT_AGE_APT_VERSION}" \
             --build-arg PGVECTOR_APT_VERSION="${CERT_PGVECTOR_APT_VERSION}" \
             -t cert-pg-age-vector:ci \
             -f deploy/docker-1461/Dockerfile.pg-age-vector \

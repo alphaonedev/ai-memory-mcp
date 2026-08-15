@@ -81,22 +81,43 @@ EXPECTED_SCHEMA="${DOCKER_1461_EXPECTED_SCHEMA:-57}"
 EMBED_DIM="${DOCKER_1461_EMBED_DIM:-768}"
 EMBED_MODEL="${DOCKER_1461_EMBED_MODEL:-nomic-embed-text}"        # Ollama tag
 EMBED_MODEL_CONFIG_ID="${DOCKER_1461_EMBED_CONFIG_ID:-nomic_embed_v15}"
-# PostgreSQL + Apache AGE stack pins. The apache/age PG18 base ships AGE
-# compiled into the PG18 tree (age.so + age--<ver>.sql + age.control) but
-# the server itself at the image's minor (18.1 as of the release_PG18_1.7.0
-# digest). We bump the server to the EXACT target minor via a pinned pgdg
-# apt --only-upgrade inside Dockerfile.pg-age-vector (ABI-safe within major
-# 18 — AGE loads across PG minors). Every literal lives HERE (SSOT), passed
-# to the build as --build-arg, asserted by the validate harness; the
-# Dockerfile carries no version literal of its own.
+# PostgreSQL + Apache AGE + pgvector stack pins. The apache/age PG18 base
+# ships AGE 1.7.0 compiled into the PG18 tree (age.so + age--<ver>.sql +
+# age.control) at the image's server minor. We bump ALL THREE via pinned
+# pgdg apt .debs inside Dockerfile.pg-age-vector — no source build:
+#   1. server + client to the EXACT target minor (PG_APT_VERSION),
+#      apt --only-upgrade (ABI-safe within major 18).
+#   2. AGE to 1.8.0 via `postgresql-<major>-age=<AGE_APT_VERSION>` — the
+#      CANONICAL PostgreSQL apt channel (pgdg) already ships it, so no
+#      source clone/`make install` is needed. This mirrors the do-1461
+#      NATIVE lane's `postgresql-18-age` install. AGE 1.8.0 is the NEWEST
+#      released AGE for PostgreSQL 18 per github.com/apache/age/releases
+#      (PG18/v1.8.0-rc0, 2026-07-09). Apache AGE tags EVERY release
+#      `X.Y.Z-rc0` on GitHub (its release-vote convention), which is why the
+#      pgdg package version reads `1.8.0~rc0-...`; `CREATE EXTENSION age`
+#      reports extversion = 1.8.0 (asserted by the validate/standup harness).
+#      NOTE: the project download page (age.apache.org/download) still lists
+#      1.7.0 as "current stable" and lags the releases page — we track the
+#      newest RELEASED AGE for PG18. The apt package overlays the base
+#      image's make-install'd 1.7.0 files cleanly (no dpkg conflict;
+#      verified) and its age.control default becomes 1.8.0.
+#   3. pgvector (PGVECTOR_APT_VERSION) — the sal-postgres adapter's server
+#      `vector` type. UNCHANGED at 0.8.6 (already current-stable).
+# Every literal lives HERE (SSOT), passed to the build as --build-arg,
+# asserted by the validate harness; the Dockerfile carries no version
+# literal of its own. AGE_BASE_IMAGE stays release_PG18_1.7.0 (it provides
+# PG18 + the apt/build environment); AGE is replaced by the apt pin above.
 AGE_BASE_IMAGE="${DOCKER_1461_AGE_BASE_IMAGE:-apache/age:release_PG18_1.7.0}"
 PG_MAJOR="${DOCKER_1461_PG_MAJOR:-18}"                            # server major (apt pkg suffix)
-PG_APT_VERSION="${DOCKER_1461_PG_APT_VERSION:-18.4-1.pgdg13+1}"   # pinned exact pgdg .deb
+PG_APT_VERSION="${DOCKER_1461_PG_APT_VERSION:-18.6-1.pgdg13+2}"   # pinned exact pgdg .deb
+AGE_APT_VERSION="${DOCKER_1461_AGE_APT_VERSION:-1.8.0~rc0-2.pgdg13+1}" # AGE 1.8.0 (extversion 1.8.0)
 PGVECTOR_APT_VERSION="${DOCKER_1461_PGVECTOR_APT_VERSION:-0.8.6-1.pgdg13+1}"
 # Reproducibility assertion anchors (validate harness asserts these exact
-# upstream-reported versions — the directive: results must reflect 18.4 + AGE 1.7.0).
-EXPECTED_PG_VERSION="${DOCKER_1461_EXPECTED_PG_VERSION:-18.4}"
-EXPECTED_AGE_VERSION="${DOCKER_1461_EXPECTED_AGE_VERSION:-1.7.0}"
+# upstream-reported versions — the directive: results must reflect the data
+# tier PG 18.6 (current stable) + AGE 1.8.0 (newest released AGE for PG18) +
+# pgvector 0.8.6 (current stable)).
+EXPECTED_PG_VERSION="${DOCKER_1461_EXPECTED_PG_VERSION:-18.6}"
+EXPECTED_AGE_VERSION="${DOCKER_1461_EXPECTED_AGE_VERSION:-1.8.0}"
 PG_AGE_VECTOR_IMAGE="${DOCKER_1461_PG_IMAGE:-ai-memory-${CAMPAIGN}-pg-age-vector:latest}"
 DAEMON_IMAGE="${DOCKER_1461_DAEMON_IMAGE:-ai-memory-${CAMPAIGN}-daemon:latest}"
 CARGO_FEATURES="${DOCKER_1461_CARGO_FEATURES:-sal,sal-postgres}"

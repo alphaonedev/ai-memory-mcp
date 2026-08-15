@@ -8,7 +8,7 @@
 #   DAEMON_IMAGE        : slim release/v0.7.0 ai-memory daemon (sal,sal-postgres)
 #
 # Both tags + build inputs come from lib.sh (AGE_BASE_IMAGE, PG_MAJOR,
-# PG_APT_VERSION, PGVECTOR_APT_VERSION, CARGO_FEATURES).
+# PG_APT_VERSION, AGE_APT_VERSION, PGVECTOR_APT_VERSION, CARGO_FEATURES).
 # Idempotent via the Docker layer cache; pass FORCE_REBUILD=1 to add --no-cache.
 
 set -euo pipefail
@@ -22,11 +22,12 @@ NOCACHE=""
 # --------------------------------------------------------------------------
 # 1. PostgreSQL + AGE + pgvector. Context = campaign dir; base pinned in lib.
 # --------------------------------------------------------------------------
-log "build: $PG_AGE_VECTOR_IMAGE (base $AGE_BASE_IMAGE -> PG $PG_APT_VERSION + pgvector $PGVECTOR_APT_VERSION)"
+log "build: $PG_AGE_VECTOR_IMAGE (base $AGE_BASE_IMAGE -> PG $PG_APT_VERSION + AGE $AGE_APT_VERSION + pgvector $PGVECTOR_APT_VERSION)"
 docker build $NOCACHE \
   --build-arg "AGE_BASE_IMAGE=$AGE_BASE_IMAGE" \
   --build-arg "PG_MAJOR=$PG_MAJOR" \
   --build-arg "PG_APT_VERSION=$PG_APT_VERSION" \
+  --build-arg "AGE_APT_VERSION=$AGE_APT_VERSION" \
   --build-arg "PGVECTOR_APT_VERSION=$PGVECTOR_APT_VERSION" \
   -f "$CAMPAIGN_ROOT/Dockerfile.pg-age-vector" \
   -t "$PG_AGE_VECTOR_IMAGE" \
