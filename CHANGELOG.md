@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (laptop federation reproducibility kit — `infra/federation-lab/`)
+
+- **A stranger can now stand up a hardened two-node ai-memory federation on
+  their own laptop with one command** — `infra/federation-lab/run.sh`. It mints
+  crypto material, brings up two `serve` daemons on loopback under mutual TLS
+  with fingerprint-pinned peers and cross-enrolled federation identities, seeds
+  a committed 300-row corpus sample, and then asserts — 18 PASS/FAIL rows, exit
+  code as the contract — that an agent-attested write on node A replicates
+  across the quorum mesh, arrives `attest_level=agent_attested` at node B, and
+  is recallable there; and that an unpinned client cert, a plaintext client and
+  an unsigned write are all refused. Idempotent (it wipes and rebuilds `run/`
+  every invocation), self-cleaning on `EXIT`/`INT`/`TERM`, and it writes nothing
+  outside its own directory — **no `/tmp`**, no `$HOME`, no network egress, no
+  Docker, no `sudo`.
+- **Extends the DigitalOcean hive crypto suite rather than forking it.** All
+  certificates come from `infra/do-hive/crypto/gen-certs.sh`, which the kit
+  CALLS; the topology, health-poll window and pos/neg shapes follow
+  `test-federation-mtls.sh`, `test-fed-write-sig-attestation.sh` and
+  `test-attestation.sh`. Their comments encode fixes (#1842, #2293, the
+  RSA-not-Ed25519 chain requirement, the `KNOWN-DO-STAGING.md` §2 boot race)
+  that survive by reuse instead of being rediscovered.
+- **Honest about the `asi-hard` 16/17 posture, and proves the gap rather than
+  asserting it.** The lab runs 16 of the 17 pinned knobs at their hard floor and
+  does not set `AI_MEMORY_SECURITY_PROFILE`, because the seventeenth
+  (`AI_MEMORY_REQUIRE_ROLLBACK_CHECK`) cannot cold-boot a fresh node — no
+  off-table head anchor exists yet, exit 75, tracked as
+  [#2942](https://github.com/alphaonedev/ai-memory-mcp/issues/2942). Step 5
+  cold-boots a throwaway node under the full 17-knob profile and captures the
+  real exit code as evidence; step 7 N4 proves the no-disable contract by trying
+  to loosen a pin and asserting the refusal; and step 0 re-derives the pinned set
+  from `src/security_profile.rs::KNOBS` and goes RED if the kit and the code
+  ever disagree.
+- **Guards the known `agents bind-key` flake**
+  ([#2941](https://github.com/alphaonedev/ai-memory-mcp/issues/2941)): the kit
+  binds the author key, then READS IT BACK from the `_agents` registry row
+  (`agents list` does not expose it), retries, and fails loud naming the issue —
+  so a silent enrollment no-op can never masquerade as broken attestation.
+- **The committed corpus is SYNTHETIC** — `sample/lab-corpus.json` (300 rows,
+  namespace `lab-corpus`, every row stamped `metadata.synthetic = true`), built
+  deterministically by `tools/make-synthetic-corpus.sh` from a seeded generator
+  over invented, obviously fictional prose. This repository is public, so a
+  verbatim slice of a real third-party corpus is not committable: it would
+  redistribute that corpus's text attribution-free under this project's name
+  (size and stripped vectors are irrelevant to the rights question) and would
+  carry along whatever identifiers its rows happened to hold — an internal
+  `metadata.agent_id`, a `version_vector` keyed by the generating machine's
+  hostname. Synthetic fixtures are the house standard for committed data here
+  (PR #2926 re-minted the golden/conformance vectors the same way). Ids are
+  UUIDv5 over a fixed namespace, timestamps are a constant, and there is no
+  hostname or wall-clock anywhere in the output, so a reviewer can regenerate
+  and `diff` rather than trust the artifact.
+- To run against a REAL corpus, `tools/make-local-slice.sh` + `run.sh
+  --corpus-db` build a slice into a gitignored path (`sample/local/`, or `run/`
+  which is deleted on exit) — it stays on your machine and out of git. Embedding
+  vectors are stripped there too (caveat F-L8a: a vector is only meaningful
+  against the embedder that produced it, and the lab's nodes run
+  `tier = "keyword"`), so the recall lane is lexical and the kit claims nothing
+  about semantic ranking quality — nor about performance, capacity, or any scope
+  beyond the certified 500–1,000 agents / ≤50 peers.
+
 ### Fixed (consolidation no longer launders derived confidence — min(sources), not hardcoded 1.0; #2935)
 
 - **A consolidated (derived) memory no longer claims maximal `confidence = 1.0`
