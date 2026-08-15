@@ -127,6 +127,18 @@ fn main() -> Result<()> {
     // everything).
     permissions::set_active_permission_rules(app_config.effective_permission_rules());
 
+    // v0.9.0 G6 (#1823) / PR-2 — arm the append-only revision spine in the
+    // #1889 synchronous pre-runtime phase, BEFORE the tokio runtime is built
+    // and BEFORE any CLI subcommand dispatches through `daemon_runtime::run`.
+    // A CLI write (`ai-memory store` / `undo-edit` / `curator`, the real
+    // offline-write attack surface) is armed the moment `main` resolves config,
+    // not only the direct library callers of `run`. Resolves
+    // `AI_MEMORY_APPEND_ONLY` env > `[storage].append_only` > compiled `false`;
+    // the resolved default is `false`, so a default deployment is byte-identical.
+    // Idempotent with the (`#[cfg(not(test))]`-gated) seed inside `run`. Pinned
+    // by `tests/append_only_boot_seed.rs`.
+    config::set_append_only(app_config.resolve_storage().append_only);
+
     // PR-5 (issue #487): bootstrap operational logging + security
     // audit trail. Both are default-OFF; init returns silently when
     // disabled. The `_log_guard` MUST stay in scope for the lifetime

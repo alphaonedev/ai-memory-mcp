@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (append-only revision spine was dead code — `AI_MEMORY_APPEND_ONLY` is now live; #1823 / PR-2)
+
+- **`AI_MEMORY_APPEND_ONLY=1` and `[storage].append_only=true` were BOTH inert
+  in every shipped binary.** `crate::config::set_append_only` had ZERO non-test
+  callers, so the resolved `[storage].append_only` value was never seeded into
+  the process-wide flag and `append_only_enabled()` read only the unseeded `false`
+  default — every one of the 24 `append_only_enabled()` branch sites (across
+  `src/storage/mod.rs`, `src/revisions.rs`, `src/store/postgres.rs`) never
+  executed in production, so a documented, certification-adjacent forensic
+  control (`memory_revisions` capture-then-compact / COW on supersede/erase) did
+  nothing. PR-2 wires the boot seed at BOTH production funnels: `daemon_runtime::run`
+  (beside the `#2233` lineage-DAG seed, `#[cfg(not(test))]`-gated for test
+  isolation) and `src/main.rs` (the `#1889` synchronous pre-runtime phase, before
+  CLI dispatch — so a CLI write, the offline-write surface, is armed too). The
+  resolved default stays `false` and the unseeded atomic default is also `false`,
+  so a default deployment is byte-identical; no new knob / verdict / schema. New
+  static-source guard `tests/append_only_boot_seed.rs` pins both call sites. The
+  `tests/append_only_spine_guard_g6.rs` enforced worklist widened to also fence
+  in-place `title` rewrites (durable authored text, alongside `content`) and the
+  row-destroying `INSERT OR REPLACE INTO memories` bypass; scoped to durable-TEXT
+  destruction (not "any UPDATE / bare INSERT", which flags 65 legitimate
+  derived-artifact write sites) per 5-agent vote `4d3ea1c5`.
+
 ### Added (laptop federation reproducibility kit — `infra/federation-lab/`)
 
 - **A stranger can now stand up a hardened two-node ai-memory federation on
