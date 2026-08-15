@@ -689,10 +689,102 @@ const AUTO_TAG_PROMPT: &str = r"Generate 3-5 short tags for categorizing this me
 Title: {title}
 Content: {content}";
 
+// F-L1 (contradiction-detector hardening) — the bare pre-hardening prompt
+// ("Do these two statements contradict each other? yes/no") gave a strong
+// model (grok-4.5) correct verdicts, but a WEAK local model on the bare form
+// would cry wolf on two benign shapes: a temporal supersession ("X was down"
+// vs. "X is up") and a pair about different subjects. Both spurious
+// `contradicts` edges degrade an AI-NHI's reasoning. The two discriminator
+// clauses below instruct the model to answer "no" for exactly those shapes;
+// the deterministic `shares_subject_token` pre-check (below) is the primary,
+// model-strength-independent guard that gates this call.
 const CONTRADICTION_PROMPT: &str = r#"Do these two statements contradict each other? Answer ONLY "yes" or "no".
+
+A contradiction requires that both statements refer to the SAME subject AND cannot both be true at the same point in time.
+
+Answer "no" if EITHER of these holds:
+- Temporal update: the statements describe the SAME subject at DIFFERENT points in time and one simply supersedes the other (e.g. "the server was down" then "the server is up" — a status that changed over time is an update, NOT a contradiction).
+- Different subjects: the statements are about DIFFERENT subjects and can both be true independently.
 
 Statement A: {a}
 Statement B: {b}"#;
+
+/// F-L1 — minimum length (in bytes) for a token to count as a "subject"
+/// token. Drops single-character noise (`a`, `I`, stray digits) that carries
+/// no subject discrimination. Numeric tokens like `200` / `500` (length 3)
+/// are retained, which is load-bearing for the genuine-contradiction control.
+const MIN_SUBJECT_TOKEN_LEN: usize = 2;
+
+/// F-L1 — conservative stopword set for the contradiction subject-overlap
+/// pre-check. Deliberately MODEST: articles, pronouns, prepositions,
+/// conjunctions, copula/auxiliary verbs, negations, and a few discourse
+/// words — NOT domain nouns, adjectives, or main verbs. Over-stopwording
+/// would strip a shared subject and cause the pre-check to over-suppress a
+/// genuine contradiction; under-stopwording only costs an extra LLM call the
+/// model then adjudicates. Negations (`not`/`no`/`never`) are stopped because
+/// a contradiction's subject anchor is a shared NOUN, never the negation
+/// itself, and two unrelated statements both containing "not" must not be
+/// passed through on that basis alone.
+const CONTRADICTION_STOPWORDS: &[&str] = &[
+    "a", "an", "the", "this", "that", "these", "those", "is", "are", "was", "were", "be", "been",
+    "being", "am", "will", "would", "shall", "should", "can", "could", "may", "might", "must",
+    "do", "does", "did", "done", "has", "have", "had", "i", "you", "he", "she", "it", "we", "they",
+    "me", "him", "her", "us", "them", "my", "your", "his", "its", "our", "their", "and", "or",
+    "but", "nor", "so", "yet", "of", "to", "in", "on", "at", "by", "for", "with", "from", "as",
+    "into", "onto", "than", "then", "not", "no", "never", "if", "when", "while", "which", "who",
+    "whom", "whose", "what", "where", "why", "how", "there", "here", "now", "just", "also", "very",
+    "too", "about", "over", "under", "out", "off",
+];
+
+/// F-L1 — extract the set of meaningful "subject" tokens from a statement:
+/// lowercase alphanumeric content words with stopwords and sub-`MIN_SUBJECT_TOKEN_LEN`
+/// tokens removed. Pure. Over-including a token can only cost an LLM call,
+/// never a wrong edge, so the extraction leans permissive.
+fn subject_tokens(statement: &str) -> std::collections::HashSet<String> {
+    statement
+        .split(|c: char| !c.is_alphanumeric())
+        .filter_map(|word| {
+            let lowered = word.to_lowercase();
+            if lowered.len() < MIN_SUBJECT_TOKEN_LEN
+                || CONTRADICTION_STOPWORDS.contains(&lowered.as_str())
+            {
+                None
+            } else {
+                Some(lowered)
+            }
+        })
+        .collect()
+}
+
+/// F-L1 — deterministic subject-overlap pre-check for contradiction
+/// detection. Returns `true` when the two statements share at least one
+/// meaningful subject token (i.e. they are "possibly related" and the LLM
+/// SHOULD be consulted), and `false` when they share no meaningful token, in
+/// which case the caller short-circuits to `contradicts = false` WITHOUT an
+/// LLM round-trip.
+///
+/// This is the cheapest, most robust guard against a weak local model crying
+/// wolf on different-subject pairs: two statements with no shared subject
+/// cannot contradict each other, regardless of model strength. It is
+/// deliberately conservative — ANY shared content word (or a degenerate
+/// statement with no discriminating tokens) passes the pair THROUGH to the
+/// LLM — because a false negative here only suppresses one contradiction edge
+/// (the safe direction: fewer edges, never WRONG results, per the North
+/// Star), while a false positive merely pays one LLM call the model then
+/// adjudicates against the hardened prompt above.
+fn shares_subject_token(a: &str, b: &str) -> bool {
+    let tokens_a = subject_tokens(a);
+    if tokens_a.is_empty() {
+        // No discriminating tokens on one side — do NOT suppress; let the LLM
+        // decide. Preserves the historical behaviour for degenerate inputs.
+        return true;
+    }
+    let tokens_b = subject_tokens(b);
+    if tokens_b.is_empty() {
+        return true;
+    }
+    tokens_a.iter().any(|token| tokens_b.contains(token))
+}
 
 /// v0.7.0 F6 — lightweight circuit-breaker state. Tracks the last failure
 /// and a rolling consecutive-failure count. When the count crosses
@@ -2469,6 +2561,16 @@ impl OllamaClient {
     /// Propagates any error from the underlying [`Self::generate_async`]
     /// call.
     pub async fn detect_contradiction_async(&self, mem_a: &str, mem_b: &str) -> Result<bool> {
+        // F-L1 — deterministic subject-overlap pre-check GATES the LLM call.
+        // If the two statements share no meaningful subject token they cannot
+        // contradict each other, so short-circuit to `false` WITHOUT paying
+        // (or trusting) an LLM round-trip. This is the load-bearing,
+        // model-strength-independent guard against a weak local model
+        // fabricating a `contradicts` edge on a different-subject pair.
+        if !shares_subject_token(mem_a, mem_b) {
+            return Ok(false);
+        }
+
         let prompt = CONTRADICTION_PROMPT
             .replace("{a}", mem_a)
             .replace("{b}", mem_b);
@@ -2492,6 +2594,108 @@ mod tests {
         assert!(AUTO_TAG_PROMPT.contains("{content}"));
         assert!(CONTRADICTION_PROMPT.contains("{a}"));
         assert!(CONTRADICTION_PROMPT.contains("{b}"));
+    }
+
+    /// F-L1 — the hardened prompt must carry BOTH discriminator clauses so a
+    /// weak local model is instructed to answer "no" for a pure temporal
+    /// supersession and for a different-subject pair even when the
+    /// subject-overlap pre-check passes the pair through.
+    #[test]
+    fn contradiction_prompt_carries_discriminator_clauses_fl1() {
+        let lowered = CONTRADICTION_PROMPT.to_lowercase();
+        assert!(
+            lowered.contains("temporal update"),
+            "prompt must carry the temporal-update discriminator clause"
+        );
+        assert!(
+            lowered.contains("different subjects"),
+            "prompt must carry the different-subject discriminator clause"
+        );
+        assert!(
+            lowered.contains("same subject"),
+            "prompt must require same-subject for a contradiction"
+        );
+    }
+
+    /// F-L1 — a pair about DIFFERENT subjects shares no meaningful token, so
+    /// the pre-check short-circuits to `false` (no LLM call). This is the
+    /// primary spurious-edge class the guard suppresses.
+    #[test]
+    fn shares_subject_token_fl1_different_subjects_short_circuit() {
+        assert!(
+            !shares_subject_token(
+                "The database migration completed successfully",
+                "The frontend build pipeline failed"
+            ),
+            "different-subject pair must NOT share a subject token"
+        );
+    }
+
+    /// F-L1 — a temporal-update pair describes the SAME subject at different
+    /// times, so it DOES share a subject token and MUST pass through to the
+    /// LLM (which the hardened prompt then instructs to answer "no"). The
+    /// pre-check is lexical only; the temporal discrimination is the prompt's
+    /// job, so over-suppressing here would be wrong.
+    #[test]
+    fn shares_subject_token_fl1_temporal_update_passes_through() {
+        assert!(
+            shares_subject_token("The server was down last night", "The server is up now"),
+            "temporal-update pair shares subject 'server' and must reach the LLM"
+        );
+    }
+
+    /// F-L1 — the genuine-contradiction control MUST still pass through to the
+    /// LLM (the guard must not over-suppress real contradictions).
+    #[test]
+    fn shares_subject_token_fl1_genuine_contradiction_passes_through() {
+        assert!(
+            shares_subject_token(
+                "The API endpoint returns status 200",
+                "The API endpoint returns status 500"
+            ),
+            "genuine contradiction shares 'api'/'endpoint'/'returns' and must reach the LLM"
+        );
+    }
+
+    /// F-L1 — overlap on stopwords/negations alone must NOT pass a pair
+    /// through: two unrelated statements both containing "not"/"the"/"is"
+    /// share no *subject*, only noise.
+    #[test]
+    fn shares_subject_token_fl1_stopword_only_overlap_suppressed() {
+        assert!(
+            !shares_subject_token("The cat is not here", "The dog is not there"),
+            "stopword/negation overlap must not count as a shared subject"
+        );
+    }
+
+    /// F-L1 — subject overlap is case-insensitive so a capitalised vs.
+    /// lowercased mention of the same subject still passes through.
+    #[test]
+    fn shares_subject_token_fl1_case_insensitive() {
+        assert!(
+            shares_subject_token("Postgres is fast", "postgres is slow"),
+            "case-different mentions of 'postgres' must share the subject"
+        );
+    }
+
+    /// F-L1 — degenerate inputs (no discriminating tokens on a side) must NOT
+    /// be suppressed: the guard leans conservative and lets the LLM decide,
+    /// preserving the historical behaviour for tiny/degenerate inputs (the
+    /// existing `detect_contradiction("a", "b")` wiremock tests rely on this).
+    #[test]
+    fn shares_subject_token_fl1_degenerate_inputs_pass_through() {
+        assert!(
+            shares_subject_token("a", "b"),
+            "single-char inputs pass through"
+        );
+        assert!(
+            shares_subject_token("", "the server is up"),
+            "empty side passes through"
+        );
+        assert!(
+            shares_subject_token("the is a", "server crashed"),
+            "all-stopword side passes through"
+        );
     }
 
     #[test]
@@ -4094,6 +4298,71 @@ mod wiremock_tests {
         assert!(
             !garbage.unwrap(),
             "garbage answer should default to non-contradiction"
+        );
+    }
+
+    /// F-L1 — the deterministic subject-overlap pre-check GATES the LLM call.
+    /// With an LLM wired to ALWAYS answer "yes", a DIFFERENT-SUBJECT pair must
+    /// still return `false`: the pre-check short-circuits before the model is
+    /// ever consulted, so a weak model that cries wolf cannot fabricate the
+    /// edge. Proves the gate suppresses the spurious-edge class end-to-end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn detect_contradiction_precheck_gates_llm_fl1() {
+        let server = MockServer::start().await;
+        mount_tags_ok(&server, json!({"models": []})).await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"content": "yes"},
+            })))
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let result = tokio::task::spawn_blocking(move || {
+            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            client.detect_contradiction(
+                "The database migration completed successfully",
+                "The frontend build pipeline failed",
+            )
+        })
+        .await
+        .unwrap();
+        assert!(
+            !result.unwrap(),
+            "different-subject pair must be suppressed by the pre-check even when the LLM says yes"
+        );
+    }
+
+    /// F-L1 — companion of the gate test: a SHARED-SUBJECT genuine
+    /// contradiction MUST still reach the "yes"-answering LLM and return
+    /// `true`, proving the pre-check does not over-suppress real
+    /// contradictions (the strong-model reference path is preserved).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn detect_contradiction_shared_subject_reaches_llm_fl1() {
+        let server = MockServer::start().await;
+        mount_tags_ok(&server, json!({"models": []})).await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"content": "yes"},
+            })))
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let result = tokio::task::spawn_blocking(move || {
+            let client = OllamaClient::new_with_url(&uri, "test-model").unwrap();
+            client.detect_contradiction(
+                "The API endpoint returns status 200",
+                "The API endpoint returns status 500",
+            )
+        })
+        .await
+        .unwrap();
+        assert!(
+            result.unwrap(),
+            "shared-subject genuine contradiction must reach the LLM and return true"
         );
     }
 

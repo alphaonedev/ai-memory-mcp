@@ -64,6 +64,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RecallMeta` wire shape (`src/models/memory.rs`); crossroads T1 resolved by
   the 5-agent adversarial vote (`4d3ea1c5`), D-MCP-PRIMARY 4/5. Pinned by
   `tests/recall_semantic_withheld_fl8a.rs`.
+### Fixed (F-L1 — contradiction detector hardened against weak-local-model false positives)
+
+- **The contradiction-detector prompt was verbatim-bare** (`"Do these two
+  statements contradict each other? yes/no"`), with no temporal-update or
+  different-subject discriminator. A strong model (grok-4.5) verdicts it
+  correctly, but a WEAK local model on the bare prompt cries wolf on temporal
+  supersessions (`"X was down"` vs. `"X is up"`) and different-subject pairs,
+  fabricating spurious `contradicts` edges that degrade an AI-NHI's reasoning.
+  Two layers now harden it, both internal detector logic — no wire-contract
+  change, no new `security_profile::KNOBS` entry:
+  1. A deterministic `shares_subject_token` subject-overlap **pre-check GATES the
+     LLM call** in `OllamaClient::detect_contradiction_async`: two statements
+     that share no meaningful subject token (content words minus a conservative
+     stopword/negation set) cannot contradict, so the detector short-circuits to
+     `contradicts = false` WITHOUT an LLM round-trip. This is a pure function and
+     is robust regardless of model strength. It is deliberately conservative —
+     ANY shared content word (or a degenerate no-token input) passes the pair
+     THROUGH to the LLM — because a false negative here only suppresses one
+     contradiction edge (the safe, North-Star direction: fewer edges, never
+     WRONG results), while a false positive merely pays one LLM call.
+  2. `CONTRADICTION_PROMPT` gains explicit temporal-update + different-subject
+     discriminator clauses so that even a pair the pre-check passes through is
+     answered `"no"` by the model for a pure temporal supersession or a
+     different-subject pair.
+  The strong-model reference path is preserved (genuine shared-subject
+  contradictions still reach the LLM and return `true`). Pinned by 9 new tests in
+  `src/llm.rs` (pure `shares_subject_token` cases for temporal / different-subject
+  / genuine-contradiction / stopword-only / case-insensitivity / degenerate
+  inputs, plus two wiremock end-to-end gate tests proving a yes-answering LLM is
+  never consulted for a different-subject pair yet still reached for a genuine
+  one). `tests/qual_10_module_size_ceiling.rs` bumped 6_080 → 6_360 in lockstep.
 ### Security (L7 — audit-trail verifier exoneration asymmetry; forensic-audit-trail PR-4)
 
 - **The audit-trail verifier no longer EXONERATES on an unauthenticated forensic

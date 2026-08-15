@@ -1554,7 +1554,17 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 30 s `GENERATE_TIMEOUT` does not give it, and the budget must live
     // beside the client that owns the cancellable future. Bumped in
     // lockstep per the QUAL-10 contract; thresholds rise, never fall.
-    ("src/llm.rs", 6_080),
+    // 2026-08-15 (F-L1 contradiction-detector hardening): 6_080 -> 6_360.
+    // The bare "yes/no" contradiction prompt lets a WEAK local model cry wolf
+    // on temporal supersessions + different-subject pairs (spurious
+    // `contradicts` edges). Added the deterministic `shares_subject_token` /
+    // `subject_tokens` subject-overlap pre-check + `CONTRADICTION_STOPWORDS` /
+    // `MIN_SUBJECT_TOKEN_LEN` consts that GATE the LLM call, the two
+    // discriminator clauses on `CONTRADICTION_PROMPT`, and 9 pre-check/gate
+    // tests (pure + wiremock), growing the file to 6_344; 6_360 = 16 headroom.
+    // Refactor-split into `src/llm/{…}.rs` remains the tracked post-ship
+    // ARCH cleanup.
+    ("src/llm.rs", 6_360),
 ];
 
 #[test]
