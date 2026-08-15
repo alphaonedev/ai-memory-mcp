@@ -641,6 +641,20 @@ async fn pg_recall_get_envelope() {
         v.get("memories").is_some() || v.get("count").is_some(),
         "{v}"
     );
+    // F-L8a K3 parity — the postgres recall branch carries the SAME
+    // `meta.semantic_withheld` KEY as sqlite, but HONESTLY marks it
+    // UNMEASURED (the pg SAL recall excludes foreign-space rows in SQL
+    // without counting them). The numeric fields are OMITTED rather than
+    // fabricated as 0 — never a WRONG result on the wire.
+    let sw = &v["meta"]["semantic_withheld"];
+    assert_eq!(
+        sw["measured"], false,
+        "postgres recall must report semantic_withheld as UNMEASURED; got: {v}"
+    );
+    assert!(
+        sw.get("space_mismatch").is_none() && sw.get("total").is_none(),
+        "unmeasured pg block must OMIT the numeric fields (no fabricated 0); got: {sw}"
+    );
 }
 
 #[tokio::test]

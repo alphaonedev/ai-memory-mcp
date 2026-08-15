@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (F-L8a — in-band `meta.semantic_withheld` recall signal for embedding-space-mismatch withheld rows; #2167 follow-up)
+
+- **Recall now reports, in-band, how many rows were withheld from SEMANTIC
+  scoring this query** — a new ADDITIVE `meta.semantic_withheld` block on the
+  recall response. The #2167 correctness danger is already CLOSED (a foreign
+  VERIFIED space, an UNVERIFIED `embedding_space IS NULL` space, or a
+  dimensionality mismatch excludes a stored vector from scoring and keeps it
+  keyword-recallable), but the response still reported `mode:"hybrid"` with NO
+  signal that `N` rows were served keyword-only. On MCP stdio there is no
+  `/metrics`, so the daemon's tracing WARN was invisible to a JSON-only NHI —
+  this block is the only introspectable channel. The exclusion counters were
+  ALREADY computed (`RecallTelemetry.{embedding_space_mismatch,
+  embedding_unverified_space,embedding_dim_mismatch}`) and dropped before
+  serialization; the block is populated from them (no recompute). `mode` is
+  UNCHANGED (still `"hybrid"`) — this is purely additive and non-breaking.
+  Shape: `{ measured, space_mismatch, unverified_space, dim_mismatch, total }`
+  (the three cause counters + their sum). **Wired on all three surfaces** — the
+  MCP `memory_recall` tool, the HTTP `/api/v1/recall` sqlite path (which now
+  threads `recall_hybrid_with_telemetry_precomputed_hnsw`), and the
+  `ai-memory recall` CLI (JSON output + a concise stderr note when > 0). K3
+  parity: the sqlite paths are MEASURED (`measured:true`, explicit counts — a
+  `0` is a truthful "nothing withheld"); the postgres SAL recall path excludes
+  foreign-space rows in SQL (`AND embedding_space = $fp`) but does not COUNT
+  them, so it emits `{measured:false}` with the numeric fields OMITTED rather
+  than a fabricated `0` (North Star: DEGRADE, never a WRONG result). Real
+  postgres per-query counting is tracked as a follow-up. Additive to the
+  `RecallMeta` wire shape (`src/models/memory.rs`); crossroads T1 resolved by
+  the 5-agent adversarial vote (`4d3ea1c5`), D-MCP-PRIMARY 4/5. Pinned by
+  `tests/recall_semantic_withheld_fl8a.rs`.
+
 ### Fixed (append-only revision spine was dead code — `AI_MEMORY_APPEND_ONLY` is now live; #1823 / PR-2)
 
 - **`AI_MEMORY_APPEND_ONLY=1` and `[storage].append_only=true` were BOTH inert

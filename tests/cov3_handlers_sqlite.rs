@@ -283,6 +283,31 @@ async fn recall_get_with_context_is_200() {
     assert_eq!(body["mode"], "keyword");
 }
 
+/// F-L8a — the sqlite HTTP recall branch MUST emit the additive
+/// `meta.semantic_withheld` block (never absent), so a JSON-only HTTP NHI
+/// has the same in-band withheld signal the MCP surface gained. This router
+/// has no embedder, so recall is keyword-only: the block is present, MEASURED
+/// (this is a sqlite funnel that threads telemetry), and a truthful zero —
+/// no semantic scoring ran, so nothing was withheld from it.
+#[tokio::test]
+async fn recall_http_sqlite_emits_semantic_withheld_meta_fl8a() {
+    let (r, _t) = sqlite_router();
+    let (status, body) = get(&r, "/api/v1/recall?context=hello%20world&limit=5").await;
+    assert_eq!(status, StatusCode::OK);
+    let sw = &body["meta"]["semantic_withheld"];
+    assert_eq!(
+        sw["measured"], true,
+        "sqlite HTTP recall is a MEASURED funnel; got: {body}"
+    );
+    assert_eq!(
+        sw["total"], 0,
+        "keyword-only recall withholds nothing from semantic scoring; got: {sw}"
+    );
+    assert_eq!(sw["space_mismatch"], 0);
+    assert_eq!(sw["unverified_space"], 0);
+    assert_eq!(sw["dim_mismatch"], 0);
+}
+
 #[tokio::test]
 async fn recall_get_invalid_as_agent_is_400() {
     let (r, _t) = sqlite_router();

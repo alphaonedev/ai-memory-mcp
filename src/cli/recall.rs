@@ -396,8 +396,11 @@ pub(crate) fn run_with_embedder(
     let resolved_ttl = app_config.effective_ttl();
     let resolved_scoring = app_config.effective_scoring();
 
-    // Perform recall: hybrid if embedder available, keyword otherwise
-    let (results, outcome, mode) = if let Some(emb) = embedder {
+    // Perform recall: hybrid if embedder available, keyword otherwise.
+    // F-L8a — the 4th tuple element is the recall telemetry carrying the
+    // space/unverified/dim rows withheld from semantic scoring; the keyword
+    // branches contribute a zeroed telemetry (no semantic scoring ran).
+    let (results, outcome, mode, telemetry) = if let Some(emb) = embedder {
         // v1.0.0 #2577 — bounded funnel (cache -> wall-clock budget ->
         // degrade-to-keyword), shared with the HTTP + MCP recall surfaces.
         match crate::embeddings::recall_query_embedding(emb, &args.context) {
@@ -422,7 +425,7 @@ pub(crate) fn run_with_embedder(
                     }
                     _ => primary_emb,
                 };
-                let (results, outcome) = db::recall_hybrid(
+                let (results, outcome, telemetry) = db::recall_hybrid_with_telemetry(
                     conn,
                     &args.context,
                     &query_emb,
@@ -454,9 +457,10 @@ pub(crate) fn run_with_embedder(
                         ce.rerank(&args.context, results),
                         outcome,
                         crate::models::RECALL_MODE_HYBRID_RERANK,
+                        telemetry,
                     )
                 } else {
-                    (results, outcome, "hybrid")
+                    (results, outcome, "hybrid", telemetry)
                 }
             }
             None => {
@@ -484,7 +488,12 @@ pub(crate) fn run_with_embedder(
                     vis_caller.as_deref(),
                     args.valid_at.as_deref(),
                 )?;
-                (results, outcome, "keyword")
+                (
+                    results,
+                    outcome,
+                    "keyword",
+                    crate::models::RecallTelemetry::default(),
+                )
             }
         }
     } else {
@@ -505,7 +514,12 @@ pub(crate) fn run_with_embedder(
             vis_caller.as_deref(),
             args.valid_at.as_deref(),
         )?;
-        (results, outcome, "keyword")
+        (
+            results,
+            outcome,
+            "keyword",
+            crate::models::RecallTelemetry::default(),
+        )
     };
 
     // v0.7.0 Form 4 (issue #757) — fact-provenance post-filter.
@@ -588,8 +602,43 @@ pub(crate) fn run_with_embedder(
                 "budget_overflow": outcome.budget_overflow,
             });
         }
+        // F-L8a — fold the MEASURED semantic-withheld block into `meta`
+        // (creating it if the budget sub-block above did not), so a
+        // JSON-consuming CLI caller sees in-band when `mode:"hybrid"`
+        // scored fewer rows than the corpus holds. CLI recall is a
+        // MEASURED sqlite funnel.
+        let sw = crate::models::SemanticWithheld::measured(&telemetry);
+        let sw_value = serde_json::to_value(&sw).unwrap_or(serde_json::Value::Null);
+        let meta = body
+            .as_object_mut()
+            .expect("recall body is always a JSON object")
+            .entry("meta".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(obj) = meta.as_object_mut() {
+            obj.insert("semantic_withheld".to_string(), sw_value);
+        }
         writeln!(out.stdout, "{}", serde_json::to_string(&body)?)?;
         return Ok(());
+    }
+    // F-L8a — human-readable path: a concise stderr note when rows were
+    // withheld from semantic scoring this query, so an operator running
+    // `ai-memory recall` sees the same in-band degrade signal the JSON
+    // caller gets (no `/metrics` on a one-shot CLI).
+    {
+        let withheld = telemetry.embedding_space_mismatch
+            + telemetry.embedding_unverified_space
+            + telemetry.embedding_dim_mismatch;
+        if withheld > 0 {
+            writeln!(
+                out.stderr,
+                "ai-memory: {withheld} row(s) withheld from semantic scoring \
+                 (space_mismatch={}, unverified_space={}, dim_mismatch={}); \
+                 kept keyword-recallable. Run `ai-memory reembed` to heal.",
+                telemetry.embedding_space_mismatch,
+                telemetry.embedding_unverified_space,
+                telemetry.embedding_dim_mismatch,
+            )?;
+        }
     }
     if results.is_empty() {
         writeln!(out.stderr, "no memories found for: {}", args.context)?;
@@ -683,6 +732,32 @@ mod tests {
         let stdout = env.stdout_str();
         assert!(stdout.contains("needle title"), "got: {stdout}");
         assert!(stdout.contains("[keyword]"), "got: {stdout}");
+    }
+
+    #[test]
+    fn test_recall_json_emits_semantic_withheld_meta_fl8a() {
+        // F-L8a — the CLI JSON envelope MUST carry the additive
+        // `meta.semantic_withheld` block so a JSON-consuming CLI caller has
+        // the same in-band withheld signal MCP/HTTP gained. Keyword tier
+        // (no embedder) is a MEASURED sqlite funnel with no semantic
+        // scoring, so the block is present, `measured:true`, and a truthful
+        // zero.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        seed_memory(&db, "test", "needle title", "haystack content");
+        let args = default_args();
+        let cfg = AppConfig::default();
+        {
+            let mut out = env.output();
+            run(&db, &args, true, &cfg, &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        let sw = &v["meta"]["semantic_withheld"];
+        assert_eq!(sw["measured"], serde_json::json!(true), "got: {v}");
+        assert_eq!(sw["total"], serde_json::json!(0), "got: {sw}");
+        assert_eq!(sw["space_mismatch"], serde_json::json!(0));
+        assert_eq!(sw["unverified_space"], serde_json::json!(0));
+        assert_eq!(sw["dim_mismatch"], serde_json::json!(0));
     }
 
     #[test]
