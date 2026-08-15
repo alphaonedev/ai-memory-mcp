@@ -1800,6 +1800,29 @@ pub fn fold_head_hash_verdicts(verdicts: Vec<HeadHashCheck>) -> HeadHashCheck {
     HeadHashCheck::Unknown
 }
 
+/// v1.0.0 L7 (PR-4, forensic-audit-trail wave) — apply the exoneration
+/// asymmetry to ONE forensic-watermark [`HeadHashCheck`] verdict.
+///
+/// A `Mismatch` (CONVICTION) always stands: a stripped daemon signature must
+/// never SUPPRESS a same-length-rewrite conviction. A `NotDetected`
+/// (EXONERATION) is DOWNGRADED to `Unknown` (withheld) unless `exonerate_ok`, so
+/// an UNAUTHENTICATED anchor can never mint a clean head-hash bill of health.
+/// `Unknown` passes through. `exonerate_ok` is
+/// [`crate::governance::audit::audit_watermark_exoneration_authenticated`],
+/// which is `true` when no out-of-band audit pin is enrolled (legacy
+/// trust-the-anchor) OR the forensic watermark authenticates against the pin.
+/// Pure so BOTH backends' `verify_audit_trail` gate the forensic-watermark
+/// sub-lane identically (K3 parity). The witness dual-head sub-lane is NOT
+/// routed through here — it is already consumed only via its own K1 pin +
+/// signature gate (`verified_witness_dual_head`).
+#[must_use]
+pub fn exoneration_gated_head_hash(verdict: HeadHashCheck, exonerate_ok: bool) -> HeadHashCheck {
+    match verdict {
+        HeadHashCheck::NotDetected if !exonerate_ok => HeadHashCheck::Unknown,
+        other => other,
+    }
+}
+
 /// v0.9.0 G9 (#1826) — verdict of the three-key Recorder/Judge/Stopper
 /// signing-layer SEPARATION check, computed by
 /// [`compute_role_separation_verdict`]. Additive/opt-in: with no role keys
@@ -2386,15 +2409,30 @@ pub fn verify_audit_trail(
     // No SIEM/syslog call here (the report is the surface); the off-host
     // `AI_MEMORY_LOG_SINK=syslog` tier is the residual-closing control for
     // the hostile-host / unsigned-daemon posture (see fn-level docs).
+    // v1.0.0 L7 (PR-4) — EXONERATION-authenticity gate. The exonerating verdict
+    // lanes (`TruncationCheck::NotDetected`, `HeadHashCheck::NotDetected` on the
+    // forensic watermark) may render clean ONLY when this holds; the CONVICTING
+    // lanes ignore it and keep reading the raw unauthenticated watermark.
+    // Enrollment-gated on the out-of-band `AI_MEMORY_AUDIT_PUBKEY` pin (no pin →
+    // legacy trust-the-anchor). SHARED with the postgres twin (K3 parity).
+    let exonerate_ok =
+        crate::governance::audit::audit_watermark_exoneration_authenticated(audit_pubkey);
     let truncation = match crate::governance::audit::last_audit_watermark() {
         Some((anchored_head, _head_canonical_hash)) => {
             if head_sequence < anchored_head {
+                // CONVICT on the raw (unauthenticated) anchor — a stripped
+                // signature must never SUPPRESS a truncation conviction.
                 TruncationCheck::Detected {
                     anchored_head,
                     db_head: head_sequence,
                 }
-            } else {
+            } else if exonerate_ok {
                 TruncationCheck::NotDetected
+            } else {
+                // L7 — a pin is enrolled but the anchor did not authenticate:
+                // WITHHOLD the clean bill of health rather than exonerate on
+                // unauthenticated evidence.
+                TruncationCheck::Unknown
             }
         }
         None => TruncationCheck::Unknown,
@@ -2577,6 +2615,8 @@ pub fn verify_audit_trail(
             verified_witness_dual_head(latest_witness.as_ref(), enrolled_pubkey.as_ref());
         let mut verdicts: Vec<HeadHashCheck> = Vec::new();
         // (a) forensic watermark → signed_events row AT the anchored sequence.
+        // v1.0.0 L7 (PR-4) — CONVICT (Mismatch) on the raw anchor, but EXONERATE
+        // (NotDetected) only behind the authenticity gate (`exonerate_ok`).
         if let Some((anchored_head, anchored_hash)) =
             crate::governance::audit::last_audit_watermark()
             && anchored_head > 0
@@ -2585,10 +2625,13 @@ pub fn verify_audit_trail(
             let recomputed = recompute_signed_row_hash_at(conn, anchored_head)
                 .ok()
                 .flatten();
-            verdicts.push(compute_head_hash_verdict(
-                Some(&anchored_hash),
-                recomputed.as_deref(),
-                CHAIN_SIGNED_EVENTS,
+            verdicts.push(exoneration_gated_head_hash(
+                compute_head_hash_verdict(
+                    Some(&anchored_hash),
+                    recomputed.as_deref(),
+                    CHAIN_SIGNED_EVENTS,
+                ),
+                exonerate_ok,
             ));
         }
         // (b) witness dual anchor → signed_events + memory_revisions rows AT the

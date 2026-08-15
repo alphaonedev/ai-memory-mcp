@@ -200,6 +200,67 @@ fn consolidate_sibling_merge_takes_the_min() {
     lineage_off();
 }
 
+/// v1.0.0 #2935 (R20 residual) — the confidence-VALUE + derived-KIND
+/// laundering closure, pinned on the SQLite `db::consolidate` builder and
+/// GUARDED by the removal-proof harness
+/// (`scripts/check-cert-removal-proof.sh` rows `consolidate_confidence_floor_2935`
+/// / `consolidate_derived_kind_2935`). Distinct from
+/// `consolidate_stamps_min_propagated_trust` above, which pins the orthogonal
+/// trust-TIER floor: this pins the confidence-FLOAT floor + the memory-kind
+/// stamp. A consolidated (derived) memory must NOT launder low-confidence
+/// source claims into a maximally-certain 1.0 summary — its confidence ==
+/// min(source confidences), NEVER a hardcoded 1.0 — and its memory_kind is
+/// `Claim` (a derived synthesis), NEVER a first-hand `Observation`. Distinct
+/// source confidences (0.6, 0.7) make the min (0.6) DISTINGUISHABLE from the
+/// 1.0 regression: a hardcoded-1.0 builder reds this test.
+#[test]
+fn consolidate_floors_confidence_and_stamps_claim_2935() {
+    let _g = flag_guard();
+    lineage_on();
+    let conn = open_mem_db();
+
+    let a = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    let b = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    let mut lo = mem_with_attest(a, "A", "2026-01-01T00:00:00+00:00", None);
+    lo.confidence = 0.6;
+    let mut hi = mem_with_attest(b, "B", "2026-01-02T00:00:00+00:00", None);
+    hi.confidence = 0.7;
+    db::insert(&conn, &lo).unwrap();
+    db::insert(&conn, &hi).unwrap();
+
+    let cid = db::consolidate(
+        &conn,
+        &[a.to_string(), b.to_string()],
+        "merged-2935",
+        "merged summary",
+        "ns",
+        &Tier::Long,
+        "test",
+        "ai:consolidator",
+        false,
+    )
+    .expect("consolidate");
+
+    let merged = db::get(&conn, &cid).unwrap().expect("consolidated row");
+    // confidence == min(0.6, 0.7) == 0.6; `<= 0.6` so a future policy deriving
+    // an even lower value still passes (never inflates), and strictly below
+    // 1.0 so a hardcoded-1.0 laundering builder reds here.
+    assert!(
+        merged.confidence <= 0.6 + f64::EPSILON,
+        "consolidated confidence {} exceeded min(source)=0.6 (laundering regression)",
+        merged.confidence
+    );
+    assert!((merged.confidence - 0.6).abs() < 1e-9);
+    // A derived synthesis is `Claim`, never a first-hand `Observation`.
+    assert_eq!(
+        merged.memory_kind,
+        ai_memory::models::MemoryKind::Claim,
+        "consolidated memory_kind should be Claim (derived), got {:?}",
+        merged.memory_kind
+    );
+    lineage_off();
+}
+
 #[test]
 fn propagated_trust_tier_bounds_by_low_ancestor() {
     let _g = flag_guard();
