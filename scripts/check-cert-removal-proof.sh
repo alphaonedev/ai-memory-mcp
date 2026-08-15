@@ -34,6 +34,20 @@
 #                  <mutation-payload> — neutralizes a control expressed as a
 #                  multi-term `&&` guard or a multi-branch verdict fn, where a
 #                  single injected first statement cannot bypass every arm.
+#   shape=subst  : literal find/replace ONE unique occurrence of <OLD> with
+#                  <NEW>, where <mutation-payload> = "<OLD>>>><NEW>" (the `>>>`
+#                  delimiter never appears in Rust). Neutralizes a control that
+#                  is a SINGLE FIELD BINDING / expression buried mid-function
+#                  (not a whole guard fn) — e.g. the consolidate builder's
+#                  `confidence` floor or `memory_kind` stamp, where neither a
+#                  first-statement return nor a whole-body swap can target the
+#                  one binding without breaking the surrounding function. <NEW>
+#                  MUST embed the `// CERT-REMOVAL-PROOF-MUTATION` marker (the
+#                  harness greps it to confirm the edit landed + a clean
+#                  revert). The `<ctl>` column is a descriptive control LABEL
+#                  (the function locator is not used for this shape). A payload
+#                  whose <OLD> matches 0 or >1 sites is a hard error (exit 3) so
+#                  a subst can never silently over-mutate.
 #
 # SAFETY: mutations are applied in-place then reverted via `git checkout --`.
 # The dirty-working-tree guard is PER ROW — each row refuses only when ITS OWN
@@ -78,6 +92,18 @@ MAP=(
   # not merely that the code is reached. Neutralization => is_clean stays true
   # under the pin => the guard test's dirty assertion goes RED.
   "compute_signature_verdict|body|SignatureCheck::Unenforced { checked: 0, unverified: 0 }|src/signed_events.rs|audit_signature_pin_l4|downgraded_lineage_row_under_pin_dirties_l4"
+  # D1 (2x7 re-audit) — consolidation-laundering closure (#2935/#2936). The
+  # controls are two SINGLE BINDINGS in the sqlite `db::consolidate` builder,
+  # not guard fns, so they use the `subst` shape (return/body cannot target one
+  # field without breaking the function). Row 1 neutralizes the confidence
+  # FLOOR (relaxes the running min back to a hardcoded 1.0 => the laundering
+  # regression); row 2 neutralizes the derived-KIND stamp (Claim => Observation).
+  # The lane test (`trust_propagation_1958_1959.rs`, SQLite in-memory — no live
+  # PG needed) asserts BOTH invariants, so either mutation reds it. The pg twin
+  # (`src/store/postgres.rs`) is END-TO-END pinned by
+  # cov_postgres_governance.rs::consolidate_merges_sources against a live PG.
+  "consolidate_confidence_floor_2935|subst|min_confidence = min_confidence.min(mem.confidence);>>>min_confidence = min_confidence.min(1.0); // CERT-REMOVAL-PROOF-MUTATION|src/storage/mod.rs|trust_propagation_1958_1959|consolidate_floors_confidence_and_stamps_claim_2935"
+  "consolidate_derived_kind_2935|subst|memory_kind: crate::models::MemoryKind::Claim,>>>memory_kind: crate::models::MemoryKind::Observation, // CERT-REMOVAL-PROOF-MUTATION|src/storage/mod.rs|trust_propagation_1958_1959|consolidate_floors_confidence_and_stamps_claim_2935"
 )
 
 # Apply MUTATION to function CTL in TARGET, per SHAPE.
@@ -98,6 +124,23 @@ payload = os.environ["CERT_PAYLOAD"]
 MARK    = " // CERT-REMOVAL-PROOF-MUTATION"
 
 lines = open(path).read().splitlines(keepends=True)
+
+# subst — literal find/replace of ONE unique <OLD> with <NEW>. The function
+# locator below is not used for this shape (the control is a mid-function
+# binding, not a `pub fn`). A payload matching 0 or >1 sites is a hard error so
+# a subst can never silently over-mutate.
+if shape == 'subst':
+    old, sep, new = payload.partition('>>>')
+    if not sep:
+        sys.stderr.write("subst payload missing '>>>' delimiter\n")
+        sys.exit(3)
+    text = ''.join(lines)
+    n = text.count(old)
+    if n != 1:
+        sys.stderr.write("subst OLD matched %d sites (want exactly 1)\n" % n)
+        sys.exit(3)
+    open(path, 'w').write(text.replace(old, new, 1))
+    sys.exit(0)
 
 # Locate `[pub] fn <ctl>` signature line.
 sig = re.compile(r'^\s*(?:pub(?:\([^)]*\))?\s+)?fn %s\b' % re.escape(ctl))
@@ -221,6 +264,25 @@ RS
     echo "  [ok] body-shape: whole body replaced, braces balanced"
   else
     echo "  [FAIL] body-shape did not rewrite as expected"; rc=1
+  fi
+
+  # subst shape — one unique OLD replaced with NEW (marker embedded).
+  cp "$fx" "$dir/subst.rs"
+  apply_mutation subst_label subst "return false;>>>return true; // CERT-REMOVAL-PROOF-MUTATION" "$dir/subst.rs"
+  if grep -q "return true; // CERT-REMOVAL-PROOF-MUTATION" "$dir/subst.rs" \
+     && ! grep -q "return false;" "$dir/subst.rs"; then
+    echo "  [ok] subst-shape: unique OLD replaced, marker embedded"
+  else
+    echo "  [FAIL] subst-shape did not rewrite as expected"; rc=1
+  fi
+
+  # subst shape — a non-unique OLD (2 sites) MUST hard-error (never over-mutate).
+  cp "$fx" "$dir/subst-dup.rs"
+  printf 'pub fn a() { let x = 1; }\npub fn b() { let x = 1; }\n' >"$dir/subst-dup.rs"
+  if apply_mutation subst_label subst "let x = 1;>>>let x = 2;" "$dir/subst-dup.rs" 2>/dev/null; then
+    echo "  [FAIL] subst-shape accepted a non-unique OLD (should exit 3)"; rc=1
+  else
+    echo "  [ok] subst-shape: non-unique OLD rejected (exit 3)"
   fi
 
   echo
