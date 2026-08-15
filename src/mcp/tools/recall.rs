@@ -9,6 +9,7 @@ use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::models::{
     AttestLevel, CandidateCounts, ConfidenceTier, Memory, MemoryKind, RecallMeta, RecallTelemetry,
+    SemanticWithheld,
 };
 use crate::observations;
 use crate::reranker::BatchedReranker;
@@ -1163,6 +1164,11 @@ pub fn handle_recall_dto(
                 hnsw: telemetry.hnsw_candidates,
             },
             blend_weight,
+            // F-L8a — MCP recall is a MEASURED sqlite funnel: surface the
+            // already-computed space/unverified/dim exclusion counts so a
+            // JSON-only stdio NHI sees in-band that `mode:"hybrid"` scored
+            // fewer rows semantically than the corpus holds.
+            semantic_withheld: SemanticWithheld::measured(telemetry),
         };
         // Merge into existing meta object rather than replacing — P6's
         // decorate_budget may have already populated budget_* keys here.

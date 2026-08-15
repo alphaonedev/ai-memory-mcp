@@ -2021,6 +2021,20 @@ pub struct RecallMeta {
     /// `keyword_only` mode; otherwise the average semantic weight across
     /// the returned candidates (varies 0.50→0.15 with content length).
     pub blend_weight: f64,
+    /// v1.0.0 F-L8a (#2167 follow-up) — rows WITHHELD from SEMANTIC
+    /// scoring this query because their stored vector could not be
+    /// safely compared against the live query vector: a foreign VERIFIED
+    /// space, an UNVERIFIED (`embedding_space IS NULL`) space, or a
+    /// dimensionality mismatch. Such rows stay KEYWORD-recallable
+    /// (degraded, never invisible) — their semantic cosine was forced to
+    /// `0.0` and excluded from the ranking. The correctness danger is
+    /// already CLOSED (a foreign/unverified vector is never scored); this
+    /// block is the missing IN-BAND signal that `mode:"hybrid"` served
+    /// fewer semantically-scored rows than the corpus holds. A JSON-only
+    /// MCP-stdio NHI has no `/metrics`, so the daemon's tracing WARN is
+    /// invisible to it — this block is the only introspectable channel.
+    /// `mode` is UNCHANGED (still `"hybrid"`); this is additive.
+    pub semantic_withheld: SemanticWithheld,
 }
 
 /// v0.6.3.1 (P3): retrieval-stage candidate counts feeding `RecallMeta`.
@@ -2031,6 +2045,87 @@ pub struct CandidateCounts {
     /// Number of candidates retrieved by HNSW (or linear-scan fallback)
     /// semantic search. `0` in keyword-only mode.
     pub hnsw: usize,
+}
+
+/// v1.0.0 F-L8a (#2167 follow-up) — per-query breakdown of rows withheld
+/// from SEMANTIC scoring, populated from the ALREADY-computed
+/// [`RecallTelemetry`] counters (never recomputed). See
+/// [`RecallMeta::semantic_withheld`].
+///
+/// **Honesty contract (North Star: DEGRADE, never report a WRONG value).**
+/// `measured` distinguishes a path that COUNTS per-query exclusions from
+/// one that does not:
+/// - On a MEASURED recall path (the sqlite MCP / HTTP / CLI recall funnels
+///   that thread [`RecallTelemetry`]) `measured` is `true` and the three
+///   cause counters + `total` are present — an explicit `0` here is a
+///   TRUTHFUL "nothing withheld".
+/// - On an UNMEASURED path (the postgres SAL `recall_hybrid`, which
+///   excludes foreign-space rows in SQL via `AND embedding_space = $fp`
+///   but never counts them) `measured` is `false` and the numeric fields
+///   are OMITTED rather than fabricated as `0` — emitting `0` where rows
+///   were excluded uncounted would be a wrong result on the wire, the
+///   exact failure this signal exists to prevent. Postgres per-query
+///   counting is tracked as a follow-up.
+#[derive(Debug, Clone, Serialize)]
+pub struct SemanticWithheld {
+    /// `true` when this recall path counts per-query exclusions and the
+    /// numeric fields below are authoritative; `false` on a backend that
+    /// excludes foreign-space rows without counting them (postgres SAL),
+    /// where the numeric fields are absent.
+    pub measured: bool,
+    /// #2167 — rows VERIFIED in a DIFFERENT embedding space than the
+    /// active embedder's fingerprint (a same-dim model swap the dim gate
+    /// cannot catch). Absent on an unmeasured path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space_mismatch: Option<usize>,
+    /// #2167 — rows with NO provenance token (`embedding_space IS NULL`)
+    /// or an ANN hit whose row-side vector could not be re-verified.
+    /// Absent on an unmeasured path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unverified_space: Option<usize>,
+    /// v0.7.0 H7 — rows whose stored embedding dimensionality disagreed
+    /// with the active embedder model. Absent on an unmeasured path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dim_mismatch: Option<usize>,
+    /// Convenience sum of the three causes above. Absent on an unmeasured
+    /// path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<usize>,
+}
+
+impl SemanticWithheld {
+    /// Build the MEASURED block from the already-computed recall
+    /// telemetry counters. Used by every sqlite recall funnel (MCP / HTTP
+    /// / CLI); a keyword-only recall passes a zeroed [`RecallTelemetry`],
+    /// which is a truthful "no semantic scoring ran, nothing withheld".
+    #[must_use]
+    pub fn measured(telemetry: &RecallTelemetry) -> Self {
+        let total = telemetry.embedding_space_mismatch
+            + telemetry.embedding_unverified_space
+            + telemetry.embedding_dim_mismatch;
+        Self {
+            measured: true,
+            space_mismatch: Some(telemetry.embedding_space_mismatch),
+            unverified_space: Some(telemetry.embedding_unverified_space),
+            dim_mismatch: Some(telemetry.embedding_dim_mismatch),
+            total: Some(total),
+        }
+    }
+
+    /// Build the UNMEASURED block for a backend that excludes foreign-space
+    /// rows without counting them (the postgres SAL recall path). The
+    /// numeric fields are omitted so a consumer never mistakes an
+    /// uncounted exclusion for a measured zero.
+    #[must_use]
+    pub fn unmeasured() -> Self {
+        Self {
+            measured: false,
+            space_mismatch: None,
+            unverified_space: None,
+            dim_mismatch: None,
+            total: None,
+        }
+    }
 }
 
 /// v0.6.3.1 (P3): internal telemetry returned alongside recall results.

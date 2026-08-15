@@ -347,6 +347,26 @@ fn maybe_apply_rerank<'m>(
     }
 }
 
+/// F-L8a — fold the `semantic_withheld` block into the recall response's
+/// `meta` object (creating it if absent), preserving any budget sub-block
+/// already merged. Shared by the sqlite (MEASURED) and postgres
+/// (UNMEASURED) HTTP recall branches so the wire key is present on both
+/// backends. See [`crate::models::SemanticWithheld`].
+fn merge_semantic_withheld_meta(
+    resp: &mut serde_json::Value,
+    sw: &crate::models::SemanticWithheld,
+) {
+    let value = serde_json::to_value(sw).unwrap_or(serde_json::Value::Null);
+    let meta = resp
+        .as_object_mut()
+        .expect("recall response is always a JSON object")
+        .entry("meta".to_string())
+        .or_insert_with(|| json!({}));
+    if let Some(obj) = meta.as_object_mut() {
+        obj.insert("semantic_withheld".to_string(), value);
+    }
+}
+
 async fn recall_response(
     app: &AppState,
     req: &RecallRequest,
@@ -657,6 +677,17 @@ async fn recall_response(
                 if let Some(b) = budget_tokens {
                     resp[field_names::BUDGET_TOKENS] = json!(b);
                 }
+                // F-L8a — the postgres SAL `recall_hybrid` excludes foreign
+                // / unverified-space rows in SQL (`AND embedding_space=$fp`)
+                // but does NOT count them, so no per-query withheld counter
+                // exists on this path today. Emit the block honestly as
+                // UNMEASURED (numeric fields omitted) rather than fabricate a
+                // `0` that could read as "nothing withheld" — the North-Star
+                // "never a WRONG result". Real pg counting is a follow-up.
+                merge_semantic_withheld_meta(
+                    &mut resp,
+                    &crate::models::SemanticWithheld::unmeasured(),
+                );
                 // #1839 G31 — observe recall latency (postgres path), labeled
                 // by the final post-rerank `mode`.
                 crate::metrics::record_recall(mode, recall_started.elapsed().as_secs_f64());
@@ -826,7 +857,11 @@ async fn recall_response(
             let hits = hits_owned
                 .as_deref()
                 .expect("precomputed_hits set when query_emb is Some");
-            let r = db::recall_hybrid_precomputed_hnsw(
+            // F-L8a — telemetry-bearing variant so the recall response can
+            // surface the space/unverified/dim rows withheld from semantic
+            // scoring (the base `recall_hybrid_precomputed_hnsw` wrapper
+            // drops the telemetry). MEASURED sqlite funnel.
+            let r = db::recall_hybrid_with_telemetry_precomputed_hnsw(
                 conn,
                 &ctx_owned,
                 qe,
@@ -856,6 +891,10 @@ async fn recall_response(
             );
             (r, crate::models::RECALL_MODE_HYBRID)
         } else {
+            // Keyword-only: no semantic scoring ran, so nothing was
+            // withheld from it — a zeroed telemetry is the truthful
+            // MEASURED value (F-L8a). Append it so both branches share the
+            // (rows, outcome, telemetry) shape.
             let r = db::recall(
                 conn,
                 &ctx_owned,
@@ -872,7 +911,8 @@ async fn recall_response(
                 source_uri_owned.as_deref(),
                 caller_owned.as_deref(),
                 valid_at_owned.as_deref(),
-            );
+            )
+            .map(|(rows, outcome)| (rows, outcome, crate::models::RecallTelemetry::default()));
             (r, crate::models::RECALL_MODE_KEYWORD)
         }
     })
@@ -881,7 +921,7 @@ async fn recall_response(
     // PHASE 2 (writer) — authoritative touch + recall_observations
     // ledger, batched under one brief writer lock. Mirrors the postgres
     // branch's post-response touch + #1705 ledger.
-    if let Ok((rows, _)) = result.as_ref() {
+    if let Ok((rows, _, _)) = result.as_ref() {
         #[allow(clippy::cast_possible_wrap)]
         let recorded: Vec<(String, i64, f64)> = rows
             .iter()
@@ -923,7 +963,7 @@ async fn recall_response(
     }
 
     match result {
-        Ok((r, outcome)) => {
+        Ok((r, outcome, telemetry)) => {
             // v0.7.0 Form 4 (issue #757) — fact-provenance post-filter.
             // Stage (c) — these post-filters run on OWNED Memory rows;
             // no DB connection needed. The lock is already dropped.
@@ -1032,6 +1072,14 @@ async fn recall_response(
                     "budget_overflow": outcome.budget_overflow,
                 });
             }
+            // F-L8a — always surface the MEASURED semantic-withheld block
+            // (folded into `meta`, alongside any budget sub-block above) so
+            // a JSON-only NHI hitting the sqlite HTTP recall sees in-band
+            // when `mode:"hybrid"` scored fewer rows than the corpus holds.
+            merge_semantic_withheld_meta(
+                &mut resp,
+                &crate::models::SemanticWithheld::measured(&telemetry),
+            );
             // #1839 G31 — observe recall latency (sqlite path), labeled by the
             // final post-rerank `mode`.
             crate::metrics::record_recall(mode, recall_started.elapsed().as_secs_f64());
