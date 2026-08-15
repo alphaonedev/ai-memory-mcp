@@ -22,112 +22,232 @@
 # repo's other CERT/lint gates use (check-vendor-literals.sh, check-docs-vs-ssot.sh),
 # applied to runtime security controls instead of to source text.
 #
+# PER-ROW TARGET + TWO MUTATION SHAPES (PR-0, forensic-audit-trail wave). Each
+# control row names its OWN target file (there is no single global TARGET_FILE),
+# and each row declares a mutation SHAPE so a control that is not expressible as
+# a first-statement `return` can still be neutralized:
+#
+#   shape=return : insert <mutation-payload> as the FIRST statement of the named
+#                  `pub fn <control>` body — forces the always-allow disposition
+#                  (the original, and only, grammar before PR-0).
+#   shape=body   : REPLACE THE ENTIRE BODY of the named `pub fn <control>` with
+#                  <mutation-payload> — neutralizes a control expressed as a
+#                  multi-term `&&` guard or a multi-branch verdict fn, where a
+#                  single injected first statement cannot bypass every arm.
+#
 # SAFETY: mutations are applied in-place then reverted via `git checkout --`.
-# The script refuses to run on a dirty working tree for the target file so a
-# revert can never clobber real edits. Evidence is written under .local-runs/.
+# The dirty-working-tree guard is PER ROW — each row refuses only when ITS OWN
+# target file has uncommitted changes, so an unrelated dirty file never aborts
+# the run and a revert can never clobber real edits to the file under test.
+# Evidence is written under .local-runs/.
 #
 # USAGE:
 #   scripts/check-cert-removal-proof.sh                 # all controls
 #   scripts/check-cert-removal-proof.sh <control-name>  # one control
 #   scripts/check-cert-removal-proof.sh --list          # print the control map
-#
+#   scripts/check-cert-removal-proof.sh --self-test     # prove BOTH mutation
+#                                                        # shapes rewrite source
+#                                                        # as intended (no cargo)
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
-TARGET_FILE="src/federation/receive_auth.rs"
 EVIDENCE_DIR=".local-runs/cert-54-evidence"
 mkdir -p "$EVIDENCE_DIR"
 
-# control-name | mutation-return-statement | lane-test-crate | lane-test-fn
-# The mutation is inserted as the FIRST statement of the named function body,
-# forcing the always-allow disposition (the "deliberately broken control").
+# control-name | shape | mutation-payload | target-file | lane-test-crate | lane-test-fn
+# shape ∈ {return, body} — see the header for the two grammars. The payload is the
+# always-allow disposition (return-statement, or whole-body expression).
 MAP=(
-  "inbound_write_namespace_authorized|return true;|federation_write_ns_scope_2447|federated_write_outside_peer_scope_refused_2447"
-  "inbound_by_id_namespace_authorized|return true;|federation_delete_ns_scope_2488|enrolled_unscoped_federated_deletion_refused_by_default_2488"
-  "inbound_namespace_meta_authorized|return true;|federation_ns_meta_scope_2479|exploit_set_rebinds_out_of_scope_victim_standard_2479"
-  # NOTE (post-#2912): peer_enrolled_in_allowlist is individually removal-proven
-  # on the decisive hatch-open + unenrolled shape
-  # (AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=0 + header-absent peer, with
-  # AI_MEMORY_FED_TRUST_BODY_AGENT_ID=1 so the request reaches Layer 2 rather
-  # than the #238 envelope). Its sole production call site is
-  # src/federation/receive_auth.rs:1094 INSIDE layer2_unscoped_peer_authorized
-  # (:1081), which is called from BOTH inbound_write_namespace_authorized (:1049)
-  # AND inbound_by_id_namespace_authorized (:1219). The MAP guard is the
-  # write-lane test; the by-id twin
-  # (`unenrolled_peer_refused_on_delete_lane_when_scope_hatch_open_2912`) lives
-  # in the same suite. A present-but-unlisted x-peer-id is refused by the
-  # SEPARATE earlier #1056 envelope (x_peer_id_not_in_allowlist) and cannot
-  # prove this control. The pre-#2912 mapping onto
-  # federated_write_outside_peer_scope_refused_2447 was MASKED: that test is
-  # refused by Layer 1 (enrolled+scoped, out of namespace) and never reaches
-  # this predicate, so broken→rc=0.
-  "peer_enrolled_in_allowlist|return true;|federation_peer_enrolled_2912|unenrolled_peer_refused_on_write_lane_when_scope_hatch_open_2912"
-  # By-id (delete-lane) twin: same decisive shape through the second caller,
-  # so removing the Layer-2 call from inbound_by_id_namespace_authorized
-  # cannot pass the harness silently.
-  "peer_enrolled_in_allowlist|return true;|federation_peer_enrolled_2912|unenrolled_peer_refused_on_delete_lane_when_scope_hatch_open_2912"
-  "require_push_namespace_scope_enabled|return false;|federation_write_ns_scope_2447|enrolled_peer_without_declared_namespaces_denied_by_default_2447"
-  "authorize_remote_checkpoint_resolution|return CheckpointResolutionAuthz::Accept;|federation_1936_checkpoint_fed|strict_refuses_unenrolled_resolver"
+  "inbound_write_namespace_authorized|return|return true;|src/federation/receive_auth.rs|federation_write_ns_scope_2447|federated_write_outside_peer_scope_refused_2447"
+  "inbound_by_id_namespace_authorized|return|return true;|src/federation/receive_auth.rs|federation_delete_ns_scope_2488|enrolled_unscoped_federated_deletion_refused_by_default_2488"
+  "inbound_namespace_meta_authorized|return|return true;|src/federation/receive_auth.rs|federation_ns_meta_scope_2479|exploit_set_rebinds_out_of_scope_victim_standard_2479"
+  # NOTE: peer_enrolled_in_allowlist is NOT a standalone row — its sole production
+  # call site is src/federation/receive_auth.rs:1094 INSIDE inbound_write_namespace_authorized,
+  # so it is COMPOSITE-PROVEN by that control's removal proof (mutating the whole
+  # function to `return true` already bypasses this sub-check). The tofu unknown-peer
+  # refusal (x_peer_id_not_in_allowlist) is a SEPARATE earlier envelope gate.
+  "require_push_namespace_scope_enabled|return|return false;|src/federation/receive_auth.rs|federation_write_ns_scope_2447|enrolled_peer_without_declared_namespaces_denied_by_default_2447"
+  "authorize_remote_checkpoint_resolution|return|return CheckpointResolutionAuthz::Accept;|src/federation/receive_auth.rs|federation_1936_checkpoint_fed|strict_refuses_unenrolled_resolver"
 )
 
-if [[ "${1:-}" == "--list" ]]; then
-  printf '%-42s -> %s::%s\n' "control" "lane_test" "fn"
-  for row in "${MAP[@]}"; do IFS='|' read -r ctl _ tf fn <<<"$row"; printf '%-42s -> tests/%s.rs::%s\n' "$ctl" "$tf" "$fn"; done
-  exit 0
-fi
-
-# Insert MUTATION as the first statement of function CTL's body in TARGET_FILE.
-# Finds `pub fn CTL` then the first subsequent line whose trimmed text ends in
-# `{` (the signature-close/body-open, single- or multi-line signature), and
-# inserts the mutation immediately after it.
+# Apply MUTATION to function CTL in TARGET, per SHAPE.
+#   return : inserts <payload> as the first statement of the body.
+#   body   : replaces the entire `{ ... }` body with <payload>.
+# Both stamp the `// CERT-REMOVAL-PROOF-MUTATION` marker so run_one can confirm
+# the edit landed and grep for a clean revert. Exit 3 if CTL cannot be located.
 apply_mutation() {
-  local ctl="$1" mut="$2"
-  python3 - "$TARGET_FILE" "$ctl" "$mut" <<'PY'
-import sys, re
-path, ctl, mut = sys.argv[1], sys.argv[2], sys.argv[3]
+  local ctl="$1" shape="$2" payload="$3" target="$4"
+  CERT_CTL="$ctl" CERT_SHAPE="$shape" CERT_PAYLOAD="$payload" CERT_TARGET="$target" \
+  python3 - <<'PY'
+import os, re, sys
+
+path    = os.environ["CERT_TARGET"]
+ctl     = os.environ["CERT_CTL"]
+shape   = os.environ["CERT_SHAPE"]
+payload = os.environ["CERT_PAYLOAD"]
+MARK    = " // CERT-REMOVAL-PROOF-MUTATION"
+
 lines = open(path).read().splitlines(keepends=True)
-out, i, done = [], 0, False
-sig = re.compile(r'^\s*pub fn %s\b' % re.escape(ctl))
-while i < len(lines):
-    out.append(lines[i])
-    if not done and sig.match(lines[i]):
-        j = i
-        # walk to the body-open brace (line ending in '{')
-        while j < len(lines) and not lines[j].rstrip().endswith('{'):
-            j += 1
-            out.append(lines[j])
-        indent = re.match(r'\s*', lines[i]).group(0) + '    '
-        out.append('%s%s // CERT-REMOVAL-PROOF-MUTATION\n' % (indent, mut))
-        done = True
-        i = j
-    i += 1
-open(path, 'w').write(''.join(out))
-sys.exit(0 if done else 3)
+
+# Locate `[pub] fn <ctl>` signature line.
+sig = re.compile(r'^\s*(?:pub(?:\([^)]*\))?\s+)?fn %s\b' % re.escape(ctl))
+start = next((i for i, ln in enumerate(lines) if sig.match(ln)), None)
+if start is None:
+    sys.exit(3)
+
+# Walk to the body-open brace: the first line at/after the signature whose
+# trimmed text ends in `{` (single- or multi-line signature).
+open_i = start
+while open_i < len(lines) and not lines[open_i].rstrip().endswith('{'):
+    open_i += 1
+if open_i >= len(lines):
+    sys.exit(3)
+
+indent      = re.match(r'\s*', lines[start]).group(0)
+body_indent = indent + '    '
+
+if shape == 'return':
+    lines.insert(open_i + 1, '%s%s%s\n' % (body_indent, payload, MARK))
+    open(path, 'w').write(''.join(lines))
+    sys.exit(0)
+
+if shape == 'body':
+    # Depth-count from the body-open brace to its matching close, skipping
+    # braces that live inside comments / string / char / raw-string literals so
+    # a `'{'` char literal or a `"}"` string can never miscount the body bounds.
+    text = ''.join(lines[open_i:])
+    k    = text.index('{')            # the body-open brace within `text`
+    i, n, depth, close = k, len(text), 0, None
+    line_c = block_c = in_str = in_raw = False
+    hashes = 0
+    while i < n:
+        c, two = text[i], text[i:i+2]
+        if line_c:
+            if c == '\n': line_c = False
+            i += 1; continue
+        if block_c:
+            if two == '*/': block_c = False; i += 2; continue
+            i += 1; continue
+        if in_str:
+            if c == '\\': i += 2; continue
+            if c == '"': in_str = False
+            i += 1; continue
+        if in_raw:
+            if c == '"' and text[i+1:i+1+hashes] == '#'*hashes:
+                in_raw = False; i += 1 + hashes; continue
+            i += 1; continue
+        if two == '//': line_c = True; i += 2; continue
+        if two == '/*': block_c = True; i += 2; continue
+        m = re.match(r'r(#*)"', text[i:i+8])
+        if m:
+            hashes = len(m.group(1)); in_raw = True; i += m.end(); continue
+        if c == '"': in_str = True; i += 1; continue
+        if c == "'":
+            ch = re.match(r"'(\\.|[^\\'])'", text[i:i+4])   # char literal vs lifetime tick
+            i += ch.end() if ch else 1; continue
+        if c == '{': depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0: close = i; break
+        i += 1
+    if close is None:
+        sys.exit(3)
+    new_text = '%s\n%s%s%s\n%s%s' % (
+        text[:k+1], body_indent, payload, MARK, indent, text[close:])
+    open(path, 'w').write(''.join(lines[:open_i]) + new_text)
+    sys.exit(0)
+
+sys.stderr.write("unknown mutation shape: %s\n" % shape)
+sys.exit(3)
 PY
 }
 
+# --list — print each row's target file, shape, and guard test.
+list_map() {
+  printf '%-42s  %-6s  %-30s  %s\n' "control" "shape" "target" "lane_test::fn"
+  local row ctl shape mut tf crate fn
+  for row in "${MAP[@]}"; do
+    IFS='|' read -r ctl shape mut tf crate fn <<<"$row"
+    printf '%-42s  %-6s  %-30s  tests/%s.rs::%s\n' "$ctl" "$shape" "$tf" "$crate" "$fn"
+  done
+}
+
+# --self-test — prove BOTH mutation grammars rewrite Rust source as intended,
+# WITHOUT compiling anything. Mirrors the plant-a-violation discipline the repo's
+# other gates carry; the cargo RED/GREEN acceptance run below only exercises the
+# `return` shape (all 5 shipped rows), so this is the mechanical proof that the
+# PR-0 `body` grammar is load-bearing.
+self_test() {
+  local dir="$EVIDENCE_DIR/self-test"
+  rm -rf "$dir"; mkdir -p "$dir"
+  local fx="$dir/fixture.rs"
+  cat >"$fx" <<'RS'
+pub fn demo_guard(x: char) -> bool {
+    // a char literal '{' must not fool the brace matcher
+    if x == '{' && x != '}' {
+        return false;
+    }
+    true
+}
+RS
+  local rc=0
+
+  # return shape — first statement injected, original arms still present.
+  cp "$fx" "$dir/ret.rs"
+  apply_mutation demo_guard return "return true;" "$dir/ret.rs"
+  if grep -q "return true; // CERT-REMOVAL-PROOF-MUTATION" "$dir/ret.rs" \
+     && grep -q "return false;" "$dir/ret.rs"; then
+    echo "  [ok] return-shape: first-statement injected, body preserved"
+  else
+    echo "  [FAIL] return-shape did not rewrite as expected"; rc=1
+  fi
+
+  # body shape — whole body replaced, original arms gone, braces balanced.
+  cp "$fx" "$dir/body.rs"
+  apply_mutation demo_guard body "true" "$dir/body.rs"
+  if grep -q "true // CERT-REMOVAL-PROOF-MUTATION" "$dir/body.rs" \
+     && ! grep -q "return false;" "$dir/body.rs" \
+     && [[ "$(tr -cd '{' <"$dir/body.rs" | wc -c)" == "$(tr -cd '}' <"$dir/body.rs" | wc -c)" ]]; then
+    echo "  [ok] body-shape: whole body replaced, braces balanced"
+  else
+    echo "  [FAIL] body-shape did not rewrite as expected"; rc=1
+  fi
+
+  echo
+  if [[ $rc -eq 0 ]]; then echo "self-test: PASS — both mutation shapes sound"; else echo "self-test: FAIL"; fi
+  return $rc
+}
+
 run_one() {
-  local ctl="$1" mut="$2" tf="$3" fn="$4"
-  echo "════ control: $ctl  (mutation: ${mut})  guard: tests/${tf}.rs::${fn}"
+  local ctl="$1" shape="$2" mut="$3" tf="$4" crate="$5" fn="$6"
+  echo "════ control: $ctl  (shape: $shape)  target: $tf  guard: tests/${crate}.rs::${fn}"
+
+  # PER-ROW dirty guard — refuse ONLY when THIS row's target is dirty so a revert
+  # cannot clobber real edits, while an unrelated dirty file never aborts the run.
+  if ! git diff --quiet -- "$tf"; then
+    echo "  [REFUSE] $tf has uncommitted changes; commit/stash first (revert safety)."
+    return 2
+  fi
 
   # 1. deliberately break the control
-  apply_mutation "$ctl" "$mut" || { echo "  [ERR] could not locate/ mutate $ctl"; return 3; }
-  if ! grep -q "CERT-REMOVAL-PROOF-MUTATION" "$TARGET_FILE"; then echo "  [ERR] mutation marker absent"; git checkout -- "$TARGET_FILE"; return 3; fi
+  apply_mutation "$ctl" "$shape" "$mut" "$tf" \
+    || { echo "  [ERR] could not locate/mutate $ctl in $tf"; git checkout -- "$tf" 2>/dev/null; return 3; }
+  if ! grep -q "CERT-REMOVAL-PROOF-MUTATION" "$tf"; then echo "  [ERR] mutation marker absent"; git checkout -- "$tf"; return 3; fi
 
   # 2. run the guarding lane test — MUST fail (RED) with the control broken
   echo "  → running guard with BROKEN control (expect RED)…"
-  AI_MEMORY_NO_CONFIG=1 cargo test --features sal --test "$tf" "$fn" -- --exact --nocapture \
+  AI_MEMORY_NO_CONFIG=1 cargo test --features sal --test "$crate" "$fn" -- --exact --nocapture \
     > "$EVIDENCE_DIR/removal-${ctl}-broken.out" 2>&1
   local broken_rc=$?
 
   # 3. revert
-  git checkout -- "$TARGET_FILE"
-  grep -q "CERT-REMOVAL-PROOF-MUTATION" "$TARGET_FILE" && { echo "  [ERR] revert FAILED — mutation still present!"; return 3; }
+  git checkout -- "$tf"
+  grep -q "CERT-REMOVAL-PROOF-MUTATION" "$tf" && { echo "  [ERR] revert FAILED — mutation still present!"; return 3; }
 
   # 4. run again — MUST pass (GREEN) with the control restored
   echo "  → running guard with RESTORED control (expect GREEN)…"
-  AI_MEMORY_NO_CONFIG=1 cargo test --features sal --test "$tf" "$fn" -- --exact --nocapture \
+  AI_MEMORY_NO_CONFIG=1 cargo test --features sal --test "$crate" "$fn" -- --exact --nocapture \
     > "$EVIDENCE_DIR/removal-${ctl}-restored.out" 2>&1
   local restored_rc=$?
 
@@ -140,18 +260,17 @@ run_one() {
   fi
 }
 
-# refuse on a dirty target so revert cannot clobber real edits
-if ! git diff --quiet -- "$TARGET_FILE"; then
-  echo "REFUSING: $TARGET_FILE has uncommitted changes; commit/stash first (revert safety)." >&2
-  exit 2
-fi
+case "${1:-}" in
+  --list)      list_map;   exit 0 ;;
+  --self-test) self_test;  exit $? ;;
+esac
 
 sel="${1:-ALL}"
 overall=0
 for row in "${MAP[@]}"; do
-  IFS='|' read -r ctl mut tf fn <<<"$row"
+  IFS='|' read -r ctl shape mut tf crate fn <<<"$row"
   [[ "$sel" != "ALL" && "$sel" != "$ctl" ]] && continue
-  run_one "$ctl" "$mut" "$tf" "$fn" || overall=1
+  run_one "$ctl" "$shape" "$mut" "$tf" "$crate" "$fn" || overall=1
 done
 
 echo
