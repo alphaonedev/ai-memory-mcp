@@ -1437,7 +1437,7 @@ mod handler_tests {
         assert_eq!(count, 1, "one coordination.action_transition row");
         assert_eq!(agent, "holder-1", "row attributed to the claiming agent");
 
-        let report = crate::signed_events::verify_audit_trail(&conn, None).expect("verify");
+        let report = crate::signed_events::verify_audit_trail(&conn, None, None).expect("verify");
         assert!(report.chain_intact, "chain must verify; report={report:?}");
     }
 
@@ -1473,7 +1473,7 @@ mod handler_tests {
         assert_eq!(count, 1, "one coordination.lease_acquire row");
         assert_eq!(agent, "holder-a", "row attributed to the lease holder");
 
-        let report = crate::signed_events::verify_audit_trail(&conn, None).expect("verify");
+        let report = crate::signed_events::verify_audit_trail(&conn, None, None).expect("verify");
         assert!(report.chain_intact, "chain must verify; report={report:?}");
     }
 }

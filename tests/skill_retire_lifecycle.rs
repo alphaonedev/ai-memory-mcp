@@ -312,7 +312,7 @@ fn skill_retired_and_skill_unretired_events_emitted() {
     assert_eq!(event_count("skill.retired"), 1, "one retire audit row");
     assert_eq!(event_count("skill.unretired"), 1, "one unretire audit row");
 
-    let report = verify_chain(&conn, None).expect("verify_chain");
+    let report = verify_chain(&conn, None, None).expect("verify_chain");
     assert!(
         report.chain_holds(),
         "the audit chain must hold after retire + unretire: {report:?}"
@@ -572,7 +572,7 @@ fn purge_emits_skill_purged_event_before_delete_and_chain_holds() {
     assert_eq!(payload_present, 1);
     assert_eq!(digest_hex.len(), 64, "digest is a 32-byte hex string");
 
-    let report = verify_chain(&conn, None).expect("verify_chain");
+    let report = verify_chain(&conn, None, None).expect("verify_chain");
     assert!(
         report.chain_holds(),
         "the audit chain must hold after a purge: {report:?}"

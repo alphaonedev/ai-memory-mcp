@@ -273,7 +273,8 @@ async fn attestation_events_signed_and_chained() {
 
     // The cross-row hash chain holds end-to-end (the attestation rows are
     // chained, not free-floating).
-    let report = ai_memory::signed_events::verify_audit_trail(&conn, None).expect("verify chain");
+    let report =
+        ai_memory::signed_events::verify_audit_trail(&conn, None, None).expect("verify chain");
     assert!(
         report.chain_intact,
         "signed_events chain must hold with the attestation rows"

@@ -110,7 +110,7 @@ fn trailing_delete_after_watermark_is_detected() {
     conn.execute("DELETE FROM signed_events WHERE sequence IN (4, 5)", [])
         .expect("truncate tail");
 
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert_eq!(
         report.head_sequence, 3,
         "in-DB head dropped; report={report:?}"
@@ -159,7 +159,7 @@ fn no_anchor_present_is_unknown_not_false_positive() {
     }
     forensic::flush_blocking();
 
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert_eq!(
         report.truncation,
         TruncationCheck::Unknown,
@@ -195,7 +195,7 @@ fn intact_chain_with_current_watermark_is_not_detected() {
     // assertion below is unchanged.
     anchor_real_head(&conn);
 
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert_eq!(report.head_sequence, 5);
     assert_eq!(
         report.truncation,
@@ -355,7 +355,7 @@ fn same_length_head_rewrite_is_head_hash_mismatch() {
     let head_seq = anchor_real_head(&conn);
 
     // Baseline: a clean chain with a REAL anchor → head hash matches.
-    let clean = verify_audit_trail(&conn, None).expect("verify clean");
+    let clean = verify_audit_trail(&conn, None, None).expect("verify clean");
     assert_eq!(
         clean.head_hash,
         HeadHashCheck::NotDetected,
@@ -373,7 +373,7 @@ fn same_length_head_rewrite_is_head_hash_mismatch() {
     )
     .expect("rewrite head payload in place");
 
-    let report = verify_audit_trail(&conn, None).expect("verify rewritten");
+    let report = verify_audit_trail(&conn, None, None).expect("verify rewritten");
     assert_eq!(
         report.head_sequence, head_seq,
         "same-length rewrite leaves the head sequence + row count unchanged; report={report:?}"
@@ -413,7 +413,7 @@ fn head_hash_withholds_when_no_anchor() {
     }
     // No watermark recorded → the head-hash check withholds (never a false
     // alarm on a deployment without a forensic anchor).
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert_eq!(
         report.head_hash,
         HeadHashCheck::Unknown,
@@ -499,7 +499,7 @@ fn same_length_rewrite_below_head_after_appends_is_head_hash_mismatch() {
     // Baseline: the anchored row (5) is intact, so it MATCHES its anchor even
     // though the head (8) has moved past it. The equal-sequence gate returns
     // Unknown here; the #2202 at-anchored-seq compare returns NotDetected.
-    let base = verify_audit_trail(&conn, None).expect("verify baseline");
+    let base = verify_audit_trail(&conn, None, None).expect("verify baseline");
     assert_eq!(base.head_sequence, 8, "base={base:?}");
     assert_eq!(
         base.head_hash,
@@ -518,7 +518,7 @@ fn same_length_rewrite_below_head_after_appends_is_head_hash_mismatch() {
     .expect("rewrite anchored row payload in place");
     relink_prev_hash(&conn, anchored + 1);
 
-    let report = verify_audit_trail(&conn, None).expect("verify rewritten");
+    let report = verify_audit_trail(&conn, None, None).expect("verify rewritten");
     assert!(
         report.chain_intact,
         "whole-suffix rewrite recomputes prev_hash → chain walk stays intact; report={report:?}"
@@ -569,7 +569,7 @@ fn same_length_rewrite_then_append_one_row_is_head_hash_mismatch() {
     .expect("rewrite anchored head row in place");
     append_row(&conn, b"attacker-appended-linked-row");
 
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert_eq!(
         report.head_sequence,
         anchored + 1,

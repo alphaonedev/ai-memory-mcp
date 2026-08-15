@@ -180,7 +180,7 @@ fn forget_encrypted_row_emits_tombstone_and_signed_attestation() {
         "forgotten row must be deleted"
     );
     // The audit chain still verifies with the new event chained in.
-    let report = verify_audit_trail(&conn, None).expect("verify audit trail");
+    let report = verify_audit_trail(&conn, None, None).expect("verify audit trail");
     assert!(
         report.chain_intact,
         "signed_events chain must remain intact after the erasure attestation"
@@ -216,7 +216,7 @@ fn gc_hard_delete_emits_tombstone_and_attestation() {
         "gc'd row must be gone"
     );
     assert!(
-        verify_audit_trail(&conn, None)
+        verify_audit_trail(&conn, None, None)
             .expect("verify")
             .chain_intact
     );
@@ -245,7 +245,7 @@ fn size_gc_hard_delete_emits_tombstone_and_attestation() {
         "evicted row must be gone"
     );
     assert!(
-        verify_audit_trail(&conn, None)
+        verify_audit_trail(&conn, None, None)
             .expect("verify")
             .chain_intact
     );

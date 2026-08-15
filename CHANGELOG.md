@@ -29,6 +29,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   row-destroying `INSERT OR REPLACE INTO memories` bypass; scoped to durable-TEXT
   destruction (not "any UPDATE / bare INSERT", which flags 65 legitimate
   derived-artifact write sites) per 5-agent vote `4d3ea1c5`.
+### Security (L4 — tri-state audit-signature verdict + out-of-band `AI_MEMORY_AUDIT_PUBKEY` pin; forensic-audit-trail PR-3)
+
+- **The per-row audit-signature verdict is now a first-class, pinnable control.**
+  `classify_row_signature` was inverted from a silent two-bool split into a
+  TRI-STATE `RowSignatureVerdict` = `Verified | Skipped(reason) | Failed(detail)`,
+  so every walked `signed_events` row lands in exactly one bucket. The former
+  early-returns for `lineage_signed` witness rows and `recorder_signed` rows with
+  no recorder key enrolled are now COUNTED as `Skipped` (with their reason)
+  rather than silently discarded — closing the gap where a row DOWNGRADED into a
+  skip class (attest relabeled, signature stripped, the cross-row hash chain
+  otherwise perfect) escaped the audit verdict entirely.
+- **New env/flag-only pin `AI_MEMORY_AUDIT_PUBKEY` / `--audit-pubkey`** (url-safe
+  no-pad base64 of the daemon audit key's 32 raw verifying-key bytes), with **NO
+  on-disk fallback** by design (a `.pub` beside the key an attacker already owns
+  is not a trust anchor). It is resolved ONCE in the binary's synchronous
+  pre-runtime phase and threaded as an explicit `Option<&VerifyingKey>` through
+  `verify_chain` / `verify_audit_trail` and the postgres twin — never re-published
+  to the environment via `set_var` (the #2905 env-leak class). When enrolled it
+  lets a verify-only auditor (a rotated / restored / federated node without the
+  private key in-process) actually verify daemon-signed rows.
+- **New `SignatureCheck` verdict on `AuditTrailReport`**, driven by
+  `unverified = rows_checked − rows_positively_verified` via the shared
+  `compute_signature_verdict`. It folds into `is_clean()` **only when a pin is
+  enrolled** (`Unverified` ⇒ dirty, exit 1); with NO pin enrolled the coverage is
+  INFORMATIONAL and behaviour is byte-identical to before (rotated / restored /
+  federated nodes do not regress). Produced IDENTICALLY by the sqlite and
+  PostgreSQL backends (K3 parity).
+- **Postgres signing-defect fix:** the postgres append now re-signs daemon-signed
+  rows identity-bound (the #1925 CWE-347 discipline) over the ALREADY-TRUNCATED
+  microsecond timestamp (`truncate_to_microseconds`, #2203), so the signed bytes
+  equal what the `TIMESTAMPTZ` column durably stores — closing the postgres half
+  of the head-identity-tamper gap the audit pin makes load-bearing.
+- Registered a generalized removal-proof row (`compute_signature_verdict`) whose
+  neutralization flips the lane clean, guarded by the skip-class-downgrade
+  fixture in `tests/audit_signature_pin_l4.rs`.
 
 ### Added (laptop federation reproducibility kit — `infra/federation-lab/`)
 

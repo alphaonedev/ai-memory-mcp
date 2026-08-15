@@ -473,7 +473,7 @@ async fn daemon_cmd_bench_scale_path_runs() {
     ])
     .expect("parse bench cli");
     let cfg = AppConfig::default();
-    let res = run(cli, &cfg).await;
+    let res = run(cli, &cfg, None).await;
     // The function ran to completion (either verdict). A panic / dispatch
     // miss would surface as something other than these two shapes.
     match res {

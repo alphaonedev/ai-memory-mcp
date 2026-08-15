@@ -208,7 +208,7 @@ async fn pg_recovery_mint_persists_and_resolves_authoritative_head() {
     // The shared test DB carries unrelated rows, so we assert only that the
     // walk succeeds at the infra level (not a whole-chain verdict).
     store
-        .verify_audit_trail(None)
+        .verify_audit_trail(None, None)
         .await
         .expect("verify_audit_trail walks the recovery-aware lineage check");
 

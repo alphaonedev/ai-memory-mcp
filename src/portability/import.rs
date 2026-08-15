@@ -323,7 +323,7 @@ pub fn import_full_envelope(
     // a truncated/removed interior row opens a sequence gap; a detected
     // tail-truncation trips `TruncationCheck::Detected`. Any of these ⇒ REFUSE
     // and roll the whole import back.
-    let audit = crate::signed_events::verify_audit_trail(&tx, None)
+    let audit = crate::signed_events::verify_audit_trail(&tx, None, None)
         .context("portability import: could not re-verify the imported audit spine")?;
     let chain_ok = audit.chain_intact
         && audit.sequence_gaps.is_empty()

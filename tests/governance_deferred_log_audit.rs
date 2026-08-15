@@ -706,7 +706,7 @@ async fn refused_storage_insert_signs_signed_events_row_when_daemon_keyed_1035()
         .expect("daemon verifying key must verify the stored sig over the #1925 identity input");
 
     // And the AUTHORITATIVE production verifier agrees (no signature failures).
-    let report = ai_memory::signed_events::verify_chain(&conn, None).expect("verify_chain");
+    let report = ai_memory::signed_events::verify_chain(&conn, None, None).expect("verify_chain");
     assert!(report.chain_holds(), "chain must hold: {report:?}");
     assert!(
         report.signature_failures.is_empty(),

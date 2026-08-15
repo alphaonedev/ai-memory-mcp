@@ -97,7 +97,7 @@ fn fresh_db_first_row_has_zero_prev_hash() {
     );
 
     // verify_chain reports the chain holds.
-    let report = verify_chain(&conn, None).expect("verify_chain");
+    let report = verify_chain(&conn, None, None).expect("verify_chain");
     assert!(
         report.chain_holds(),
         "single-row chain MUST hold; report = {report:?}"
@@ -160,7 +160,7 @@ fn subsequent_rows_chain_correctly() {
         "row 2's prev_hash MUST equal SHA-256(canonical_chain_bytes(row 1))"
     );
 
-    let report = verify_chain(&conn, None).expect("verify_chain");
+    let report = verify_chain(&conn, None, None).expect("verify_chain");
     assert!(report.chain_holds(), "report = {report:?}");
     assert_eq!(report.rows_checked, 3);
     assert_eq!(report.chain_break, None);
@@ -184,7 +184,7 @@ fn tamper_in_middle_row_breaks_chain() {
     }
 
     // Pre-tamper: chain holds.
-    let report = verify_chain(&conn, None).expect("verify_chain");
+    let report = verify_chain(&conn, None, None).expect("verify_chain");
     assert!(
         report.chain_holds(),
         "baseline 5-row chain MUST hold pre-tamper; report = {report:?}"
@@ -203,7 +203,7 @@ fn tamper_in_middle_row_breaks_chain() {
     // verify_chain should detect the break at row 4 (because row
     // 4's stored prev_hash no longer equals the recomputed
     // canonical-bytes digest of the tampered row 3).
-    let report = verify_chain(&conn, None).expect("verify_chain post-tamper");
+    let report = verify_chain(&conn, None, None).expect("verify_chain post-tamper");
     assert!(
         !report.chain_holds(),
         "chain MUST be detected as broken after row-3 payload tamper; report = {report:?}"
@@ -241,7 +241,7 @@ fn tamper_in_sequence_column_caught() {
     )
     .expect("UPDATE row 3 sequence to 99");
 
-    let report = verify_chain(&conn, None).expect("verify_chain");
+    let report = verify_chain(&conn, None, None).expect("verify_chain");
     assert!(
         !report.chain_holds(),
         "sequence gap MUST be reported; report = {report:?}"
@@ -319,7 +319,7 @@ async fn chain_holds_across_drainer_writes() {
         "every queued event MUST have landed (chain doesn't help if rows are missing)"
     );
 
-    let report = verify_chain(&conn, None).expect("verify_chain");
+    let report = verify_chain(&conn, None, None).expect("verify_chain");
     assert!(
         report.chain_holds(),
         "chain MUST hold after {expected} concurrent drainer inserts; report = {report:?}"
@@ -369,7 +369,7 @@ fn backfill_migration_idempotent_on_replay() {
     };
     assert_eq!(pre, post, "backfill replay MUST be a no-op");
 
-    let report = verify_chain(&conn, None).expect("verify_chain");
+    let report = verify_chain(&conn, None, None).expect("verify_chain");
     assert!(
         report.chain_holds(),
         "chain MUST still hold after a no-op replay; report = {report:?}"
@@ -394,7 +394,7 @@ fn verify_chain_with_since_resumes_correctly() {
     }
 
     // since=3: walk only rows with sequence > 3 → rows 4, 5, 6.
-    let report = verify_chain(&conn, Some(3)).expect("verify");
+    let report = verify_chain(&conn, Some(3), None).expect("verify");
     assert!(
         report.chain_holds(),
         "since-resume chain MUST hold; report = {report:?}"
@@ -427,7 +427,7 @@ fn verify_chain_with_since_detects_break_in_resumed_range() {
 
     // since=4: walk rows 5, 6. Row 6's prev_hash check fails because
     // row 5 was tampered AFTER the chain stamp.
-    let report = verify_chain(&conn, Some(4)).expect("verify");
+    let report = verify_chain(&conn, Some(4), None).expect("verify");
     assert!(
         !report.chain_holds(),
         "since-resume MUST detect downstream break; report = {report:?}"
@@ -470,7 +470,7 @@ fn backfill_stamps_pre_existing_rows() {
     // — the chain vacuously "holds" because there's nothing to
     // verify, but the row count gap surfaces the gap. We check the
     // gap-detection by comparing rows_checked against the raw count.
-    let pre = verify_chain(&conn, None).expect("verify pre");
+    let pre = verify_chain(&conn, None, None).expect("verify pre");
     let raw_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM signed_events", [], |r| r.get(0))
         .expect("count");
@@ -503,7 +503,7 @@ fn backfill_stamps_pre_existing_rows() {
             "row {i} prev_hash MUST be 32 bytes"
         );
     }
-    let post = verify_chain(&conn, None).expect("verify post");
+    let post = verify_chain(&conn, None, None).expect("verify post");
     assert!(
         post.chain_holds(),
         "chain MUST hold post-backfill; report = {post:?}"
@@ -566,7 +566,7 @@ fn backfill_resumes_from_mixed_state() {
             "row {i} sequence"
         );
     }
-    let report = verify_chain(&conn, None).expect("verify");
+    let report = verify_chain(&conn, None, None).expect("verify");
     assert!(
         report.chain_holds(),
         "mixed-state backfill MUST produce a valid chain; report = {report:?}"

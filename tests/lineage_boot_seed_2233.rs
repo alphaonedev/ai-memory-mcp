@@ -74,7 +74,7 @@ async fn production_boot(cfg: &AppConfig) {
     let db_path = dir.path().join("boot-seed-2233.db");
     let cli = Cli::try_parse_from(["ai-memory", "--db", db_path.to_str().unwrap(), "stats"])
         .expect("parse cli");
-    run(cli, cfg)
+    run(cli, cfg, None)
         .await
         .expect("production boot (stats) dispatch");
 }

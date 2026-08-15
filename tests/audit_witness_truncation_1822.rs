@@ -160,7 +160,7 @@ fn row_only_delete_is_caught_by_witness_but_not_the_old_oracle() {
     drop(conn);
 
     let conn = ai_memory::db::open(&path).expect("reopen");
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     // The OLD oracle still reads clean: no gap, chain contiguous.
     assert!(
         report.chain_intact && report.sequence_gaps.is_empty(),
@@ -187,11 +187,13 @@ fn row_only_delete_is_caught_by_witness_but_not_the_old_oracle() {
         since: None,
         json: false,
         store_url: None,
+        audit_pubkey: None,
     };
     let mut so = Vec::<u8>::new();
     let mut se = Vec::<u8>::new();
     let mut out = ai_memory::cli::CliOutput::from_std(&mut so, &mut se);
-    let code = ai_memory::cli::verify_audit_trail::run(&path, &args, &mut out).expect("cli run");
+    let code =
+        ai_memory::cli::verify_audit_trail::run(&path, &args, None, &mut out).expect("cli run");
     assert_eq!(code, 1, "CLI must exit 1 on a witnessed truncation");
 
     clear_witness_env();
@@ -225,7 +227,7 @@ fn delete_both_under_require_flips_unknown_to_dirty() {
     std::fs::remove_file(kdir.path().join(witness::HEAD_ANCHOR_LOG_FILENAME)).ok();
 
     // Without require-mode: no witness anchor ⇒ Unknown ⇒ withheld (clean).
-    let report = verify_audit_trail(&conn, None).expect("verify permissive");
+    let report = verify_audit_trail(&conn, None, None).expect("verify permissive");
     assert_eq!(
         report.witness,
         WitnessCheck::Unknown,
@@ -240,7 +242,7 @@ fn delete_both_under_require_flips_unknown_to_dirty() {
     unsafe {
         std::env::set_var(witness::REQUIRE_WITNESS_ENV, "1");
     }
-    let report = verify_audit_trail(&conn, None).expect("verify required");
+    let report = verify_audit_trail(&conn, None, None).expect("verify required");
     assert_eq!(
         report.witness,
         WitnessCheck::Missing,
@@ -302,7 +304,7 @@ fn head_resigned_under_daemon_key_is_forged_by_the_pin() {
     );
     ai_memory::checkpoints::insert(&conn, &forged).expect("insert forged cp");
 
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert!(
         matches!(report.witness, WitnessCheck::Forged { .. }),
         "the K1 pin must reject the wrong-key anchor as Forged (NOT NotDetected); \
@@ -333,7 +335,7 @@ fn memory_revisions_tail_truncation_is_caught() {
     conn.execute("DELETE FROM memory_revisions WHERE sequence IN (2, 3)", [])
         .expect("truncate memory_revisions tail");
 
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert_eq!(
         report.witness,
         WitnessCheck::Detected {
@@ -361,7 +363,7 @@ fn unknown_withholds_without_require_mode() {
     // A clean chain with NO witness anchor ever emitted.
     append_rows(&conn, 4);
 
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert_eq!(
         report.witness,
         WitnessCheck::Unknown,
@@ -705,7 +707,7 @@ mod postgres_parity {
         .await
         .expect("insert pg witness cp");
 
-        let report = pg.verify_audit_trail(None).await.expect("pg verify");
+        let report = pg.verify_audit_trail(None, None).await.expect("pg verify");
         assert!(
             matches!(report.witness, WitnessCheck::Detected { .. }),
             "pg verify twin must surface the witness Detected verdict (K3); report={report:?}"
@@ -792,7 +794,10 @@ mod postgres_parity {
 
         // CLEAN chain: the anchored row survives intact → the micros-readback
         // recompute MATCHES the anchor (also micros, post-#2203) → NotDetected.
-        let report = pg.verify_audit_trail(None).await.expect("pg verify clean");
+        let report = pg
+            .verify_audit_trail(None, None)
+            .await
+            .expect("pg verify clean");
         assert_eq!(
             report.head_hash,
             HeadHashCheck::NotDetected,
@@ -827,7 +832,7 @@ mod postgres_parity {
             .await
             .expect("rewrite anchored row");
         let report2 = pg
-            .verify_audit_trail(None)
+            .verify_audit_trail(None, None)
             .await
             .expect("pg verify rewritten");
         match &report2.head_hash {
@@ -873,7 +878,7 @@ fn witness_signed_events_same_length_rewrite_is_head_hash_mismatch() {
     force_emit_audit_head_witness(&conn); // binds the REAL signed + mem heads
 
     // Baseline: both heads match their witnessed hashes.
-    let clean = verify_audit_trail(&conn, None).expect("verify clean");
+    let clean = verify_audit_trail(&conn, None, None).expect("verify clean");
     assert_eq!(
         clean.head_hash,
         HeadHashCheck::NotDetected,
@@ -891,7 +896,7 @@ fn witness_signed_events_same_length_rewrite_is_head_hash_mismatch() {
     )
     .expect("rewrite signed head in place");
 
-    let report = verify_audit_trail(&conn, None).expect("verify rewritten");
+    let report = verify_audit_trail(&conn, None, None).expect("verify rewritten");
     assert!(report.chain_intact, "report={report:?}");
     assert_eq!(
         report.witness,
@@ -924,7 +929,7 @@ fn witness_memory_revisions_same_length_rewrite_is_head_hash_mismatch() {
     }
     force_emit_audit_head_witness(&conn); // binds the REAL signed + mem heads
 
-    let clean = verify_audit_trail(&conn, None).expect("verify clean");
+    let clean = verify_audit_trail(&conn, None, None).expect("verify clean");
     assert_eq!(
         clean.head_hash,
         HeadHashCheck::NotDetected,
@@ -940,7 +945,7 @@ fn witness_memory_revisions_same_length_rewrite_is_head_hash_mismatch() {
     )
     .expect("rewrite memory_revisions head in place");
 
-    let report = verify_audit_trail(&conn, None).expect("verify rewritten");
+    let report = verify_audit_trail(&conn, None, None).expect("verify rewritten");
     match &report.head_hash {
         HeadHashCheck::Mismatch { chain, .. } => assert_eq!(chain, "memory_revisions"),
         other => {
@@ -1023,7 +1028,7 @@ fn witness_signed_events_rewrite_below_head_after_appends_is_head_hash_mismatch(
     // Baseline: the witnessed row (5) is intact → MATCHES its witnessed hash
     // even though the head (8) has moved past it (the #2202 at-anchored-seq
     // compare; the equal-sequence gate returned Unknown here).
-    let base = verify_audit_trail(&conn, None).expect("verify baseline");
+    let base = verify_audit_trail(&conn, None, None).expect("verify baseline");
     assert_eq!(base.head_sequence, 8, "base={base:?}");
     assert_eq!(base.head_hash, HeadHashCheck::NotDetected, "base={base:?}");
     assert!(base.is_clean(), "base={base:?}");
@@ -1036,7 +1041,7 @@ fn witness_signed_events_rewrite_below_head_after_appends_is_head_hash_mismatch(
     .expect("rewrite witnessed row payload in place");
     relink_prev_hash(&conn, anchored + 1);
 
-    let report = verify_audit_trail(&conn, None).expect("verify rewritten");
+    let report = verify_audit_trail(&conn, None, None).expect("verify rewritten");
     assert!(report.chain_intact, "report={report:?}");
     assert_eq!(
         report.witness,
@@ -1074,7 +1079,7 @@ fn witness_signed_events_rewrite_then_append_one_row_is_head_hash_mismatch() {
     .expect("rewrite witnessed head row in place");
     append_row(&conn, b"attacker-appended-linked-row"); // head → 6
 
-    let report = verify_audit_trail(&conn, None).expect("verify");
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert_eq!(report.head_sequence, anchored + 1, "report={report:?}");
     assert!(report.chain_intact, "report={report:?}");
     assert_eq!(
@@ -1113,7 +1118,7 @@ fn witness_memory_revisions_rewrite_below_head_after_appends_is_head_hash_mismat
         append_rev_leaf(&conn, &format!("mem-{i}"));
     }
 
-    let base = verify_audit_trail(&conn, None).expect("verify baseline");
+    let base = verify_audit_trail(&conn, None, None).expect("verify baseline");
     assert_eq!(base.head_hash, HeadHashCheck::NotDetected, "base={base:?}");
 
     // SAME-LENGTH rewrite of the WITNESSED memory_revisions row (flip a field
@@ -1124,7 +1129,7 @@ fn witness_memory_revisions_rewrite_below_head_after_appends_is_head_hash_mismat
     )
     .expect("rewrite witnessed memory_revisions row in place");
 
-    let report = verify_audit_trail(&conn, None).expect("verify rewritten");
+    let report = verify_audit_trail(&conn, None, None).expect("verify rewritten");
     match &report.head_hash {
         HeadHashCheck::Mismatch { chain, .. } => assert_eq!(chain, "memory_revisions"),
         other => {

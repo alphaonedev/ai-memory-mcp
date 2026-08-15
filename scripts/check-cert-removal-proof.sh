@@ -69,6 +69,15 @@ MAP=(
   # refusal (x_peer_id_not_in_allowlist) is a SEPARATE earlier envelope gate.
   "require_push_namespace_scope_enabled|return|return false;|src/federation/receive_auth.rs|federation_write_ns_scope_2447|enrolled_peer_without_declared_namespaces_denied_by_default_2447"
   "authorize_remote_checkpoint_resolution|return|return CheckpointResolutionAuthz::Accept;|src/federation/receive_auth.rs|federation_1936_checkpoint_fed|strict_refuses_unenrolled_resolver"
+  # L4 (PR-3, forensic-audit-trail wave) — the fn that folds the per-row
+  # audit-SIGNATURE coverage into is_clean. Neutralized to the always-clean
+  # `Unenforced` verdict (body shape — a multi-branch verdict fn a single
+  # first-statement return cannot bypass). GUARD FIXTURE is the SKIP-CLASS
+  # DOWNGRADE (a lineage_signed row relabeled + signature-stripped, chain
+  # otherwise perfect, WITH the pin enrolled) — proving the CLOSED GAP CLASS,
+  # not merely that the code is reached. Neutralization => is_clean stays true
+  # under the pin => the guard test's dirty assertion goes RED.
+  "compute_signature_verdict|body|SignatureCheck::Unenforced { checked: 0, unverified: 0 }|src/signed_events.rs|audit_signature_pin_l4|downgraded_lineage_row_under_pin_dirties_l4"
 )
 
 # Apply MUTATION to function CTL in TARGET, per SHAPE.

@@ -85,7 +85,7 @@ fn missing_signature_fails_closed_unless_attest_level_unsigned() {
     );
     append_signed_event(&conn, &row3).expect("append row3");
 
-    let report = verify_chain(&conn, None).expect("verify_chain");
+    let report = verify_chain(&conn, None, None).expect("verify_chain");
 
     // The prev_hash chain itself is intact (we appended through the
     // production writer), so chain_holds() is true — signature failures

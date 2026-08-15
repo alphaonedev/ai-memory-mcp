@@ -1016,7 +1016,11 @@ async fn dispatch_recover_previous_session(
 /// They now run synchronously in [`apply_startup_env`], called from the binary
 /// entry point BEFORE the runtime is built.
 #[allow(clippy::too_many_lines)]
-pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
+pub async fn run(
+    cli: Cli,
+    app_config: &AppConfig,
+    audit_pubkey: Option<&ed25519_dalek::VerifyingKey>,
+) -> Result<()> {
     let db_path = app_config.effective_db(&cli.db);
     // #1937 V08-PE-3 — seed the process-wide audit DB path for the best-effort
     // spawn-audit chokepoint (`crate::spawn_audit`). Every serve / mcp / CLI
@@ -2122,7 +2126,7 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             // `--store-url` (or the #1927 non-argv channel) resolves to a
             // `postgres://` DSN, else the sqlite path. Exit-code contract
             // is identical on both backends.
-            match run_verify_audit_trail(&db_path, &a, app_config).await? {
+            match run_verify_audit_trail(&db_path, &a, app_config, audit_pubkey).await? {
                 0 => Ok(()),
                 code => std::process::exit(code),
             }
@@ -4353,6 +4357,7 @@ async fn run_verify_audit_trail(
     db_path: &Path,
     a: &crate::cli::verify_audit_trail::VerifyAuditTrailArgs,
     app_config: &AppConfig,
+    audit_pubkey: Option<&ed25519_dalek::VerifyingKey>,
 ) -> Result<i32> {
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
@@ -4367,7 +4372,7 @@ async fn run_verify_audit_trail(
 
     match resolved.as_deref() {
         Some(url) if is_postgres_url(url) => {
-            verify_audit_trail_postgres(url, a, app_config, &mut out).await
+            verify_audit_trail_postgres(url, a, app_config, audit_pubkey, &mut out).await
         }
         Some(url) => {
             let path = sqlite_store_url_to_path(url).ok_or_else(|| {
@@ -4376,9 +4381,9 @@ async fn run_verify_audit_trail(
                     crate::logging::redact_url_password(url)
                 )
             })?;
-            crate::cli::verify_audit_trail::run(Path::new(path), a, &mut out)
+            crate::cli::verify_audit_trail::run(Path::new(path), a, audit_pubkey, &mut out)
         }
-        None => crate::cli::verify_audit_trail::run(db_path, a, &mut out),
+        None => crate::cli::verify_audit_trail::run(db_path, a, audit_pubkey, &mut out),
     }
 }
 
@@ -4406,6 +4411,7 @@ async fn verify_audit_trail_postgres(
     url: &str,
     a: &crate::cli::verify_audit_trail::VerifyAuditTrailArgs,
     app_config: &AppConfig,
+    audit_pubkey: Option<&ed25519_dalek::VerifyingKey>,
     out: &mut cli::CliOutput<'_>,
 ) -> Result<i32> {
     let timeout = app_config
@@ -4423,7 +4429,7 @@ async fn verify_audit_trail_postgres(
     .await
     .map_err(|e| anyhow::anyhow!("connect postgres adapter for verify-audit-trail: {e}"))?;
     let report = store
-        .verify_audit_trail(a.since.as_deref())
+        .verify_audit_trail(a.since.as_deref(), audit_pubkey)
         .await
         .map_err(|e| anyhow::anyhow!("verify_audit_trail over postgres signed_events: {e}"))?;
     crate::cli::verify_audit_trail::render(&report, a.json, out)
@@ -4439,6 +4445,7 @@ async fn verify_audit_trail_postgres(
     url: &str,
     _a: &crate::cli::verify_audit_trail::VerifyAuditTrailArgs,
     _app_config: &AppConfig,
+    _audit_pubkey: Option<&ed25519_dalek::VerifyingKey>,
     _out: &mut cli::CliOutput<'_>,
 ) -> Result<i32> {
     anyhow::bail!(
@@ -10013,7 +10020,7 @@ mod tests {
         let cli =
             Cli::try_parse_from(["ai-memory", "--db", env.db_path.to_str().unwrap(), "stats"])
                 .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     #[tokio::test]
@@ -10028,7 +10035,7 @@ mod tests {
             "namespaces",
         ])
         .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     /// v1.0.0 #2490 — dispatching `export` at a `--db` path that does not
@@ -10051,7 +10058,7 @@ mod tests {
         let cli =
             Cli::try_parse_from(["ai-memory", "--db", env.db_path.to_str().unwrap(), "export"])
                 .unwrap();
-        let err = run(cli, &cfg)
+        let err = run(cli, &cfg, None)
             .await
             .expect_err("export must refuse a --db path that does not exist (#2490)");
         let msg = err.to_string();
@@ -10086,7 +10093,7 @@ mod tests {
         let cli =
             Cli::try_parse_from(["ai-memory", "--db", env.db_path.to_str().unwrap(), "export"])
                 .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
 
         // The dispatch arm writes the artifact to the process stdout, which a
         // unit test cannot capture — so assert the export is genuinely
@@ -10121,7 +10128,7 @@ mod tests {
         let cfg = AppConfig::default();
         let cli = Cli::try_parse_from(["ai-memory", "--db", env.db_path.to_str().unwrap(), "list"])
             .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     // #2044/#2095 — cover the `Command::Agents` api-key-verb dispatch arms in
@@ -10147,7 +10154,7 @@ mod tests {
             "s3cret-token",
         ])
         .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     #[cfg(feature = "sal")]
@@ -10170,7 +10177,7 @@ mod tests {
             "bob-token",
         ])
         .unwrap();
-        run(bind, &cfg).await.unwrap();
+        run(bind, &cfg, None).await.unwrap();
         let revoke = Cli::try_parse_from([
             "ai-memory",
             "--db",
@@ -10181,7 +10188,7 @@ mod tests {
             "bob",
         ])
         .unwrap();
-        run(revoke, &cfg).await.unwrap();
+        run(revoke, &cfg, None).await.unwrap();
     }
 
     // The api-key verb OUTPUT branches (json), the empty-token + invalid-agent
@@ -10217,7 +10224,7 @@ mod tests {
             "--dry-run",
         ])
         .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     #[tokio::test]
@@ -10240,7 +10247,7 @@ mod tests {
             "--dry-run",
         ])
         .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     #[tokio::test]
@@ -10261,7 +10268,7 @@ mod tests {
             &id,
         ])
         .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     #[tokio::test]
@@ -10277,7 +10284,7 @@ mod tests {
             "anyq",
         ])
         .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     #[tokio::test]
@@ -10293,7 +10300,7 @@ mod tests {
             "list",
         ])
         .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     #[tokio::test]
@@ -10309,7 +10316,7 @@ mod tests {
             "list",
         ])
         .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     #[tokio::test]
@@ -10325,7 +10332,7 @@ mod tests {
             "list",
         ])
         .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     #[tokio::test]
@@ -10341,7 +10348,7 @@ mod tests {
             "bash",
         ])
         .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     #[tokio::test]
@@ -10351,7 +10358,7 @@ mod tests {
         let cfg = AppConfig::default();
         let cli = Cli::try_parse_from(["ai-memory", "--db", env.db_path.to_str().unwrap(), "man"])
             .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     #[tokio::test]
@@ -10363,7 +10370,7 @@ mod tests {
         let cfg = AppConfig::default();
         let cli = Cli::try_parse_from(["ai-memory", "--db", env.db_path.to_str().unwrap(), "gc"])
             .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     #[tokio::test]
@@ -10383,7 +10390,7 @@ mod tests {
             &id_b,
         ])
         .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     #[tokio::test]
@@ -10400,7 +10407,7 @@ mod tests {
             &id,
         ])
         .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     /// v0.7.0 V-4 closeout (#698) — dispatch coverage for the new
@@ -10422,7 +10429,7 @@ mod tests {
             "verify-signed-events-chain",
         ])
         .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     #[tokio::test]
@@ -10441,7 +10448,7 @@ mod tests {
             &id,
         ])
         .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     // ----- run() dispatch for bench (cmd_bench end-to-end) --------------
@@ -10468,7 +10475,7 @@ mod tests {
         .unwrap();
         // Bench may fail the budget on a paused-time iter=1 run; we
         // accept either Ok or Err here — coverage is the goal.
-        let _ = run(cli, &cfg).await;
+        let _ = run(cli, &cfg, None).await;
     }
 
     #[tokio::test]
@@ -10492,7 +10499,7 @@ mod tests {
             history.to_str().unwrap(),
         ])
         .unwrap();
-        let _ = run(cli, &cfg).await;
+        let _ = run(cli, &cfg, None).await;
         // History file should now exist with at least one line.
         if history.exists() {
             let content = std::fs::read_to_string(&history).unwrap();
@@ -10526,7 +10533,7 @@ mod tests {
             "--dry-run",
         ])
         .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     #[cfg(feature = "sal")]
@@ -10552,7 +10559,7 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     // ----- run() with passphrase file (covers lines 372-374) ------------
@@ -10725,7 +10732,7 @@ mod tests {
             "list",
         ])
         .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     #[tokio::test]
@@ -10751,7 +10758,7 @@ mod tests {
             "ai:dispatch-issuer",
         ])
         .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
         assert!(
             key_dir.join("ai:dispatch-issuer.caproot").exists(),
             "keygen must land the caproot via the dispatch arm"
@@ -10784,7 +10791,7 @@ mod tests {
             "list",
         ])
         .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     #[tokio::test]
@@ -10824,7 +10831,7 @@ decision = "allow"
             cfg_path.to_str().unwrap(),
         ])
         .unwrap();
-        run(cli, &cfg).await.unwrap();
+        run(cli, &cfg, None).await.unwrap();
     }
 
     // ----- v0.7.0 coverage close: fold-A2A1.4 mTLS bypass on /sync/* ----
@@ -12291,6 +12298,7 @@ decision = "allow"
             since: None,
             json: true,
             store_url: store_url.map(str::to_string),
+            audit_pubkey: None,
         }
     }
 
@@ -12330,13 +12338,13 @@ decision = "allow"
         let env = TestEnv::fresh();
         let cfg = crate::config::AppConfig::default();
         // No `--store-url` → the local `--db` sqlite branch.
-        let code = run_verify_audit_trail(&env.db_path, &prb_args(None), &cfg)
+        let code = run_verify_audit_trail(&env.db_path, &prb_args(None), &cfg, None)
             .await
             .expect("sqlite None branch verifies");
         assert!(code == 0 || code == 1, "sqlite verify returns an exit code");
         // A `sqlite://<path>` store-url strips to that path (same db here).
         let url = format!("sqlite://{}", env.db_path.to_string_lossy());
-        run_verify_audit_trail(&env.db_path, &prb_args(Some(&url)), &cfg)
+        run_verify_audit_trail(&env.db_path, &prb_args(Some(&url)), &cfg, None)
             .await
             .expect("sqlite:// branch verifies");
     }
@@ -12353,7 +12361,8 @@ decision = "allow"
         }
         let env = TestEnv::fresh();
         let cfg = crate::config::AppConfig::default();
-        let res = run_verify_audit_trail(&env.db_path, &prb_args(Some("mysql://h/db")), &cfg).await;
+        let res =
+            run_verify_audit_trail(&env.db_path, &prb_args(Some("mysql://h/db")), &cfg, None).await;
         assert!(res.is_err(), "an unrecognised store-url scheme is refused");
     }
 
@@ -12372,6 +12381,7 @@ decision = "allow"
             "postgres://prb:prb@127.0.0.1:1/nodb",
             &prb_args(Some("postgres://prb:prb@127.0.0.1:1/nodb")),
             &cfg,
+            None,
             &mut out,
         )
         .await;
@@ -12407,6 +12417,7 @@ decision = "allow"
             &env.db_path,
             &prb_args(Some("postgres://prb:prb@127.0.0.1:1/nodb")),
             &cfg,
+            None,
         )
         .await;
         assert!(

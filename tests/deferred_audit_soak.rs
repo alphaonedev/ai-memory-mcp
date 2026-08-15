@@ -221,7 +221,8 @@ async fn soak_run(
     // is preserved as defense-in-depth.
     {
         let conn = ai_memory::db::open(&db_path).expect("reopen for chain verify");
-        let report = ai_memory::signed_events::verify_chain(&conn, None).expect("verify_chain");
+        let report =
+            ai_memory::signed_events::verify_chain(&conn, None, None).expect("verify_chain");
         assert!(
             report.chain_holds(),
             "{label}: cross-row chain MUST hold end-to-end after {expected} concurrent inserts; \

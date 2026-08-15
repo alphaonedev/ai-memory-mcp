@@ -365,7 +365,7 @@ mod tests {
         assert_eq!(count, 1, "exactly one process.spawn_audited row expected");
         // The row is a first-class member of the chain — verify_audit_trail
         // walks it and reports a clean, intact chain.
-        let report = crate::signed_events::verify_audit_trail(&conn, None).expect("verify");
+        let report = crate::signed_events::verify_audit_trail(&conn, None, None).expect("verify");
         assert!(report.chain_intact, "chain must be intact: {report:?}");
         assert_eq!(
             report.total_events, 1,

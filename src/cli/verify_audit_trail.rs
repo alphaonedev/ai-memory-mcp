@@ -71,6 +71,20 @@ pub struct VerifyAuditTrailArgs {
     /// `--features sal-postgres`.
     #[arg(long, value_name = "URL")]
     pub store_url: Option<String>,
+
+    /// v1.0.0 L4 (PR-3) — out-of-band AUDIT pin: the daemon audit key's PUBLIC
+    /// verifying key as url-safe-no-pad base64 (32 raw bytes). When enrolled,
+    /// every walked `signed_events` row must positively verify against this key
+    /// (or the recorder pin); an unverifiable / stripped / DOWNGRADED row makes
+    /// the report DIRTY (exit 1). Highest precedence over the
+    /// `AI_MEMORY_AUDIT_PUBKEY` env var; NO on-disk fallback (a `.pub` beside the
+    /// key an attacker already owns is not a trust anchor). Unset = the pin is
+    /// unenrolled and signature coverage is INFORMATIONAL only (byte-identical
+    /// legacy — rotated / restored / federated nodes do not regress). The value
+    /// is resolved to a key in the binary's SYNCHRONOUS pre-runtime phase and
+    /// threaded as a parameter — never re-published to the environment.
+    #[arg(long, value_name = "BASE64")]
+    pub audit_pubkey: Option<String>,
 }
 
 /// Run the audit-trail verifier. Returns the desired process exit
@@ -80,11 +94,17 @@ pub struct VerifyAuditTrailArgs {
 ///
 /// Returns the underlying `rusqlite`, serializer, or formatter error
 /// if the DB open, chain walk, or report rendering fails.
-pub fn run(db_path: &Path, args: &VerifyAuditTrailArgs, out: &mut CliOutput<'_>) -> Result<i32> {
+pub fn run(
+    db_path: &Path,
+    args: &VerifyAuditTrailArgs,
+    audit_pubkey: Option<&ed25519_dalek::VerifyingKey>,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
     let conn =
         crate::db::open(db_path).with_context(|| format!("open db at {}", db_path.display()))?;
-    let report = crate::signed_events::verify_audit_trail(&conn, args.since.as_deref())
-        .context("verify_audit_trail over signed_events")?;
+    let report =
+        crate::signed_events::verify_audit_trail(&conn, args.since.as_deref(), audit_pubkey)
+            .context("verify_audit_trail over signed_events")?;
     render(&report, args.json, out)
 }
 
@@ -150,6 +170,22 @@ pub fn render(
             writeln!(
                 out.stdout,
                 "  audit-head HASH mismatch on {chain} (same-length suffix rewrite): {detail}",
+            )
+            .context(CTX_WRITE_AUDIT_REPORT)?;
+        }
+        // v1.0.0 L4 (PR-3) — surface an audit-pin signature-coverage failure.
+        // Only `Unverified` (an audit pin IS enrolled and some walked row did
+        // not positively verify) is dirty; Unenforced/Verified are silent.
+        if let crate::signed_events::SignatureCheck::Unverified {
+            checked,
+            unverified,
+        } = report.signature_check
+        {
+            writeln!(
+                out.stdout,
+                "  audit-signature coverage FAIL (AI_MEMORY_AUDIT_PUBKEY pin enrolled): \
+                 {unverified} of {checked} walked row(s) did not verify against the pin \
+                 (stripped / downgraded / forged / skip-class row)",
             )
             .context(CTX_WRITE_AUDIT_REPORT)?;
         }
@@ -316,11 +352,12 @@ mod tests {
             since: None,
             json: true,
             store_url: None,
+            audit_pubkey: None,
         };
         let mut buf_out = Vec::<u8>::new();
         let mut buf_err = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut buf_out, &mut buf_err);
-        let code = run(&path, &args, &mut out).expect("run");
+        let code = run(&path, &args, None, &mut out).expect("run");
         assert_eq!(code, 0, "empty chain is trivially clean");
         let s = String::from_utf8(buf_out).expect("utf-8");
         assert!(s.contains("\"chain_intact\": true"), "got: {s}");
@@ -341,11 +378,12 @@ mod tests {
             since: None,
             json: false,
             store_url: None,
+            audit_pubkey: None,
         };
         let mut buf_out = Vec::<u8>::new();
         let mut buf_err = Vec::<u8>::new();
         let mut out = CliOutput::from_std(&mut buf_out, &mut buf_err);
-        let code = run(&path, &args, &mut out).expect("run");
+        let code = run(&path, &args, None, &mut out).expect("run");
         assert_eq!(code, 0, "3-row clean chain is clean; got code={code}");
         let s = String::from_utf8(buf_out).expect("utf-8");
         assert!(s.contains("OK"), "got: {s}");

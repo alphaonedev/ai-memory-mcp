@@ -181,7 +181,7 @@ mod tests {
             &["cp-1", "resolver-b", "resolved"],
         );
 
-        let report = crate::signed_events::verify_audit_trail(&conn, None).expect("verify");
+        let report = crate::signed_events::verify_audit_trail(&conn, None, None).expect("verify");
         assert!(report.chain_intact, "chain must verify; report={report:?}");
         assert!(report.total_events >= 2);
     }
