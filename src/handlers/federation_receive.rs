@@ -3538,6 +3538,25 @@ pub async fn sync_push(
                         checkpoints_conflicted += 1;
                         skipped += 1;
                     }
+                    Ok(crate::checkpoints::InboundResolutionOutcome::RefusedReservedKind) => {
+                        // PR-1 / L5 (#2708-sibling, CWE-284): the CLAIMED wire or
+                        // STORED by-id checkpoint names a substrate-RESERVED
+                        // anchor (audit-head witness, governance verdict/
+                        // enforcement, peer-head entanglement,
+                        // re-anchor). A wire-reachable `/sync/push` MUST NOT steer
+                        // the substrate's own audit-signal spine — per-item skip,
+                        // the batch survives.
+                        tracing::warn!(
+                            target: ATTESTATION_TRACE_TARGET,
+                            checkpoint_id = %cp.id,
+                            condition_type = %cp.condition_type.as_str(),
+                            namespace = %cp.namespace,
+                            "sync_push: refusing inbound resolution of a substrate-reserved \
+                             checkpoint anchor (L5 audit-signal poisoning, #2708-sibling); \
+                             skipping this entry, batch survives"
+                        );
+                        skipped += 1;
+                    }
                     Err(e) => {
                         tracing::warn!(
                             "sync_push: checkpoint resolution apply failed for {}: {e}",

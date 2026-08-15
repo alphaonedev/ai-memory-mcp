@@ -165,6 +165,141 @@ pub fn authorize_remote_checkpoint_resolution(
     }
 }
 
+/// PR-1 / L5 (#2708-sibling, CWE-284) — the substrate-RESERVED checkpoint
+/// `condition_type` set: the LOCAL-ONLY audit / identity trust anchors the
+/// substrate itself EMITS and immediately resolves out-of-band (audit-head
+/// witness, governance verdict/enforcement, peer-head entanglement, re-anchor
+/// ceremony) and that `verify_audit_trail` / the identity layer reads as a K1
+/// pin. None is a caller/peer coordination gate and none has a federation
+/// transport — so a wire-reachable `/sync/push` that lands one of these into a
+/// substrate anchor location would let a REMOTE attacker (no host access) STEER
+/// the witness verdict: audit-signal poisoning.
+///
+/// **Deliberately EXCLUDED — `ConditionType::EpochAdvance`.** Unlike the anchors
+/// above, the epoch-advance freeze anchor is DESIGNED to federate: it rides the
+/// FED-RQ-01 checkpoint-resolution transport (#1936/#125, ROADMAP §25.2; the
+/// `SyncPushWriteLane::Checkpoints` `ClaimedNamespace` freeze-anchor lane,
+/// #2650), it lives in `_epoch` (not a reserved namespace), and its authenticity
+/// is already gated by the per-resolution signature gate
+/// [`authorize_remote_checkpoint_resolution`] (`AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG`
+/// default-on) against the resolver's ENROLLED key. Refusing it here would break
+/// legitimate epoch federation (pinned by `tests/federation_1936_checkpoint_fed.rs`).
+///
+/// The caller-creatable coordination kinds (`approval`, `external_signal`,
+/// `condition_predicate`, `deadline`) are likewise ABSENT and federate as before.
+///
+/// **DERIVED listing, NOT the load-bearing check.** The authoritative
+/// classifier is the wildcard-free [`condition_type_is_reserved`] match; this
+/// array exists only for docs + tests, and a test pins it equal to the match
+/// over EVERY `ConditionType` variant so the two cannot drift.
+pub const RESERVED_SUBSTRATE_CONDITION_TYPES: &[crate::models::ConditionType] = &[
+    crate::models::ConditionType::AuditHeadWitness,
+    crate::models::ConditionType::GovernanceVerdict,
+    crate::models::ConditionType::GovernanceEnforcement,
+    crate::models::ConditionType::PeerHeadEntanglement,
+    crate::models::ConditionType::ReAnchor,
+];
+
+/// PR-1 / L5 (#2708-sibling) — the substrate-RESERVED underscore namespaces the
+/// reserved-anchor kinds live under. Built from the canonical SSOT constants
+/// (never string literals — the no-hardcoded-literals discipline), so a rename
+/// of any anchor namespace propagates here for free. This is the completed
+/// SSOT: `_audit_witness`, `_governance_verdict`, `_governance_enforcement`,
+/// `_reanchor_ceremony` (all four defined in [`crate::governance::audit`]), plus
+/// `_peer_head_entanglement` (defined in [`crate::identity::equivocation`]).
+pub const RESERVED_SUBSTRATE_NAMESPACES: &[&str] = &[
+    crate::governance::audit::WITNESS_CHECKPOINT_NAMESPACE,
+    crate::governance::audit::GOVERNANCE_VERDICT_NAMESPACE,
+    crate::governance::audit::GOVERNANCE_ENFORCEMENT_NAMESPACE,
+    crate::governance::audit::REANCHOR_CHECKPOINT_NAMESPACE,
+    crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE,
+];
+
+/// Whether a `condition_type` is a substrate-RESERVED anchor kind — the
+/// LOAD-BEARING classifier.
+///
+/// This is an EXHAUSTIVE `match` with NO wildcard arm ON PURPOSE: a wire-facing
+/// trust classifier must FAIL TOWARD "reserved/refuse" for anything
+/// unclassified, and the way to guarantee that for a FUTURE `ConditionType`
+/// variant is to make adding one BREAK THE BUILD here until someone explicitly
+/// classifies it as an audit/identity anchor (reserved) or a
+/// caller/coordination/federated kind (not). Do NOT "simplify" this back to a
+/// wildcard `_ =>` arm or a `RESERVED_SUBSTRATE_CONDITION_TYPES.contains(...)`
+/// membership test — either would let a new trust-anchor variant default to
+/// non-reserved (federate = poisonable), which is exactly the silent-new-variant
+/// gap this hardening closes. [`RESERVED_SUBSTRATE_CONDITION_TYPES`] is a DERIVED
+/// listing (docs/tests); THIS match is the authority (a test pins them equal).
+#[must_use]
+pub fn condition_type_is_reserved(condition_type: crate::models::ConditionType) -> bool {
+    use crate::models::ConditionType as C;
+    match condition_type {
+        // Reserved: the LOCAL-ONLY audit / identity trust anchors.
+        C::AuditHeadWitness
+        | C::GovernanceVerdict
+        | C::GovernanceEnforcement
+        | C::PeerHeadEntanglement
+        | C::ReAnchor => true,
+        // Not reserved: caller coordination gates + the legitimately-federated
+        // `EpochAdvance` freeze anchor (rides the FED-RQ-01 transport, gated by
+        // the per-resolution signature gate — see the SSOT doc above).
+        C::Approval | C::ExternalSignal | C::ConditionPredicate | C::Deadline | C::EpochAdvance => {
+            false
+        }
+    }
+}
+
+/// Whether a `(condition_type, namespace)` pair names a substrate-RESERVED
+/// checkpoint anchor — i.e. EITHER the kind is reserved
+/// ([`condition_type_is_reserved`], the wildcard-free load-bearing classifier)
+/// OR the namespace is in [`RESERVED_SUBSTRATE_NAMESPACES`] (trimmed, exact
+/// match). The namespace is trimmed before compare to mirror
+/// [`crate::validate::reject_reserved_write_namespace`], so a padded
+/// `"  _audit_witness  "` cannot slip past.
+#[must_use]
+pub fn checkpoint_kind_is_reserved(
+    condition_type: crate::models::ConditionType,
+    namespace: &str,
+) -> bool {
+    condition_type_is_reserved(condition_type)
+        || RESERVED_SUBSTRATE_NAMESPACES.contains(&namespace.trim())
+}
+
+/// PR-1 / L5 (#2708-sibling, CWE-284) — decide whether an inbound federated
+/// checkpoint RESOLUTION may touch a checkpoint of the CLAIMED (wire) and
+/// STORED (by-id) kind/namespace. Refuses when EITHER end names a
+/// substrate-reserved anchor ([`checkpoint_kind_is_reserved`]).
+///
+/// This is the checkpoint-lane twin of the #2708 stored-vs-claimed discipline
+/// applied to the memories lane by [`inbound_write_namespace_authorized`]: the
+/// wire `condition_type`/`namespace` are attacker-chosen, and the
+/// `apply_inbound_resolution` CAS keys on `(id, state)` only, so a peer could
+/// otherwise present a benign wire kind (`approval` in `public/*`) to resolve a
+/// STORED `_audit_witness` anchor by id — hence BOTH ends are checked.
+///
+/// Reused verbatim by the LOCAL creation path
+/// (`crate::mcp::tools::checkpoint::handle_checkpoint_create`, `stored = None`)
+/// so a reserved-kind PENDING anchor cannot be created by a caller in the first
+/// place either.
+///
+/// Returns `true` when the resolution/creation is authorized, `false` to refuse
+/// (fail CLOSED).
+#[must_use]
+pub fn inbound_checkpoint_kind_authorized(
+    claimed_kind: crate::models::ConditionType,
+    claimed_namespace: &str,
+    stored: Option<(crate::models::ConditionType, &str)>,
+) -> bool {
+    if checkpoint_kind_is_reserved(claimed_kind, claimed_namespace) {
+        return false;
+    }
+    if let Some((stored_kind, stored_namespace)) = stored {
+        if checkpoint_kind_is_reserved(stored_kind, stored_namespace) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Env knob gating the inbound action-transition signature requirement
 /// (`require_sig` fed to [`authorize_remote_transition`]).
 pub const REQUIRE_TRANSITION_SIG_ENV: &str = "AI_MEMORY_FED_REQUIRE_TRANSITION_SIG";
