@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (append-only spine — the primary create funnel's upsert no longer bypasses the signed ledger; #2948 / PR-3)
+
+- **`db::insert` — the hottest write path — rewrote durable authored `content`
+  IN PLACE outside the tamper-evident ledger.** With the append-only spine armed
+  (#1823/#2947, `AI_MEMORY_APPEND_ONLY=1`), the create funnel resolved a
+  `(title, namespace)` collision with `ON CONFLICT(title, namespace) DO UPDATE
+  SET content = excluded.content` (bumping `version = memories.version + 1`) but
+  emitted NO `memory_revisions` Supersede leaf — so the dominant re-store path
+  superseded content OUTSIDE the signed chain while every explicit
+  supersede/erase path recorded one. An armed-but-bypassable spine overclaims.
+  PR-3 routes the overwrite through the ledger: when armed, `insert_inner`
+  pre-probes the existing row's `version` before the upsert (default OFF → no
+  probe, byte-identical) and, on a conflict-merge, appends EXACTLY ONE
+  identity-only Supersede leaf in the SAME transaction (`prior_version` = the
+  pre-merge version). A fresh INSERT (destroys nothing) and the fail-closed
+  `Refuse` / different-id `RestoreSameId` arms (return a typed conflict WITHOUT
+  overwriting) emit no leaf. K3 parity: the same fix lands on the postgres local
+  create funnels (`store` / `store_batch` / `store_with_embedding_inner` /
+  `capture_turn_idempotent` / `recover_turn_idempotent` / `reflect_with_hooks` /
+  `consolidate`). The `tests/append_only_spine_guard_g6.rs` static guard gained a
+  fourth shape (P4) that fences `ON CONFLICT(title, namespace) DO UPDATE SET
+  (content|title) = excluded.…` so this create-funnel bypass can never silently
+  regress; the conditional federation newer-wins merge (`= CASE WHEN
+  excluded.updated_at > …`) is a separate content-overwrite class tracked in
+  #2954. New covering suite `tests/append_only_upsert_supersede_2948.rs` (incl.
+  the empirical STEP-1 in-place-overwrite probe) + a cert removal-proof row.
+  Default `append_only=false` stays byte-identical; no new knob / verdict /
+  schema. 5-agent vote `4d3ea1c5`, UNANIMOUS A1.
+
 ### Fixed (append-only revision spine was dead code — `AI_MEMORY_APPEND_ONLY` is now live; #1823 / PR-2)
 
 - **`AI_MEMORY_APPEND_ONLY=1` and `[storage].append_only=true` were BOTH inert

@@ -1564,6 +1564,48 @@ pub fn insert_imported_no_overwrite(conn: &Connection, mem: &Memory) -> Result<S
 /// = the restore-safe CAS `DO UPDATE … WHERE memories.id = excluded.id` that
 /// merges only a same-id restore and refuses a different-id owner with a typed
 /// [`ConflictError`].
+/// v1.0.0 #2948 — append the create-funnel COW-SUPERSEDE leaf for an
+/// upsert-merge that overwrote an existing row's durable `content` in place.
+///
+/// `prior_version_on_conflict` is `Some(v)` ONLY when [`insert_inner`]'s
+/// armed-path pre-probe found a prior `(title, namespace)` row (so the upsert
+/// landed on the `DO UPDATE` conflict arm and rewrote content); it is `None`
+/// for a fresh INSERT (which destroys nothing) and whenever the append-only
+/// spine is OFF (no pre-probe runs). The inner
+/// [`crate::revisions::emit_revision_leaf_if_enabled`] is ALSO gated on
+/// `append_only_enabled()`, so this is doubly inert on the default path. The
+/// emitted leaf is IDENTITY-ONLY (never carries the superseded content) and
+/// lands in the caller's transaction alongside the overwrite it records.
+///
+/// Split out of [`insert_inner`] so the §5.4(5) cert removal-proof harness
+/// (`scripts/check-cert-removal-proof.sh`) can neutralize EXACTLY this #2948
+/// wiring — not the shared emitter used by every supersede/erase path — and
+/// prove the armed upsert path is load-bearing.
+///
+/// # Errors
+///
+/// Propagates the revision-leaf chain-read / INSERT error; the caller rolls
+/// back its transaction.
+fn emit_upsert_supersede_leaf_if_enabled(
+    conn: &Connection,
+    prior_version_on_conflict: Option<i64>,
+    actual_id: &str,
+    mem: &Memory,
+) -> Result<()> {
+    if let Some(prior_version) = prior_version_on_conflict {
+        crate::revisions::emit_revision_leaf_if_enabled(
+            conn,
+            actual_id,
+            crate::revisions::RecordKind::Supersede,
+            Some(prior_version),
+            &mem.namespace,
+            Some(memory_agent_id(mem)).filter(|s| !s.is_empty()),
+            &mem.updated_at,
+        )?;
+    }
+    Ok(())
+}
+
 fn insert_inner(
     conn: &Connection,
     mem: &Memory,
@@ -1669,15 +1711,70 @@ fn insert_inner(
     // `update_with_expected_version` / `consolidate` idiom) so no reader can
     // observe an intermediate state and a failure rolls the whole write back.
     //
-    // Taken ONLY under at-rest encryption AND only when this call owns the
-    // transaction: with encryption off the seal is a no-op, the pre-read is
-    // skipped and the reconcile returns immediately, so the default path is
-    // byte-identical to pre-#2383 (no extra statements, no lock change).
-    let owns_seal_tx = crate::encryption::encryption_enabled(None) && conn.is_autocommit();
-    if owns_seal_tx {
+    // v1.0.0 #2948 — APPEND-ONLY-SANCTIONED COW SUPERSEDE. This is the primary
+    // create funnel, and its `ON CONFLICT(title, namespace) DO UPDATE SET
+    // content = excluded.content` arm below rewrites an existing row's durable
+    // authored TEXT IN PLACE (bumping `version = memories.version + 1`). When
+    // the append-only spine is ARMED (#1823/#2947), that overwrite MUST be
+    // recorded in the signed `memory_revisions` ledger exactly like the
+    // sibling `insert_if_newer` federation merge and `db::update` do — an armed
+    // spine that this hottest write path could bypass would overclaim. So when
+    // armed we (a) pre-probe the existing row's `version` BEFORE the upsert to
+    // learn whether a conflict-merge will fire, and (b) append ONE identity-only
+    // SUPERSEDE leaf in THIS tx AFTER a successful merge. A fresh INSERT (no
+    // prior row) destroys nothing → no leaf; the `Refuse` / different-id
+    // `RestoreSameId` arms return early below without overwriting → no leaf.
+    // Emission is UNCONDITIONAL on a conflict-merge (never gated on a
+    // content-diff read): the `version` column already bumps on every merge,
+    // and comparing content would force a decrypt that the #228 at-rest
+    // placeholder makes non-deterministic — an under-recorded leaf would corrupt
+    // the tamper-evidence chain, which the North Star forbids. Design: 5-agent
+    // vote (4d3ea1c5), UNANIMOUS A1. Prior content lives only in the surviving
+    // row / any archive snapshot, NEVER in the leaf (identity-only).
+    //
+    // v1.0.0 #2383 (N1) — the at-rest seal pre-read, the upsert, and the
+    // post-write envelope-owner reconcile form ONE atomic unit: the pre-read
+    // decides which per-agent key the merged content is sealed to, and the
+    // reconcile repairs the row if a concurrent first-creation changed that
+    // answer.
+    //
+    // ONE unified `BEGIN IMMEDIATE` covers BOTH concerns (#2383 seal + #2948
+    // leaf): the tx is taken when this call OWNS it (autocommit) AND either
+    // at-rest encryption is on OR the append-only spine is armed. A single
+    // guard is load-bearing — two independent `BEGIN`s would error "cannot
+    // start a transaction within a transaction". `BEGIN IMMEDIATE` takes the
+    // write lock up front so the version pre-probe → upsert → leaf sequence is
+    // TOCTOU-free and no reader observes an intermediate state; a failure rolls
+    // the whole write back. When the caller already holds a tx (`!autocommit` —
+    // reflect / capture-turn / federation batch), the pre-probe + leaf land in
+    // the caller's tx. With encryption OFF and the spine OFF (the default) the
+    // seal is a no-op, the version pre-probe is skipped, the reconcile returns
+    // immediately, and no leaf is emitted — byte-identical to pre-#2383/#2948
+    // (no extra statements, no lock change).
+    let owns_tx = (crate::encryption::encryption_enabled(None)
+        || crate::config::append_only_enabled())
+        && conn.is_autocommit();
+    if owns_tx {
         conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
     }
     let sealed_insert = (|| -> Result<String> {
+        // #2948 — armed-only version pre-probe. `None` when the spine is OFF
+        // (default → no extra read → byte-identical) or when no row currently
+        // holds `(title, namespace)` (a fresh INSERT, which destroys nothing).
+        // `Some(v)` means a conflict-merge WILL overwrite content in place, and
+        // `v` is the pre-supersede `version` the leaf records as `prior_version`
+        // (the `db::update` convention). Under the `BEGIN IMMEDIATE` write lock
+        // this read cannot race the upsert.
+        let prior_version_on_conflict: Option<i64> = if crate::config::append_only_enabled() {
+            conn.query_row(
+                "SELECT version FROM memories WHERE title = ?1 AND namespace = ?2",
+                params![mem.title, mem.namespace],
+                |r| r.get(0),
+            )
+            .optional()?
+        } else {
+            None
+        };
         let seal = seal_content_for_upsert(conn, mem)?;
         let content_to_store = seal.content_to_store.as_str();
         let encrypted_envelope: Option<&[u8]> = seal.envelope_bytes();
@@ -1937,9 +2034,17 @@ fn insert_inner(
         // #2383 (N1) — invariant backstop: a non-NULL `encrypted_envelope`
         // MUST open under the row's persisted `metadata.agent_id`.
         reconcile_envelope_owner(conn, &actual_id, &mem.content, &seal)?;
+        // #2948 — record the COW SUPERSEDE. Reached ONLY on the success path
+        // (after `RETURNING id`), so the `Refuse` `DO NOTHING` conflict and the
+        // different-id `RestoreSameId` CAS miss — both of which returned the
+        // typed `ConflictError` above WITHOUT overwriting — never emit a leaf.
+        // Extracted to a named fn so the cert removal-proof harness can
+        // neutralize exactly the #2948 wiring (not the shared emitter) and
+        // prove the armed upsert path depends on it.
+        emit_upsert_supersede_leaf_if_enabled(conn, prior_version_on_conflict, &actual_id, mem)?;
         Ok(actual_id)
     })();
-    if owns_seal_tx {
+    if owns_tx {
         match &sealed_insert {
             Ok(_) => conn.execute_batch(connection::SQL_COMMIT)?,
             Err(_) => {

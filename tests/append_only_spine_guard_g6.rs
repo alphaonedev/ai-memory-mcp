@@ -18,6 +18,16 @@
 //!   * P3 — `INSERT OR REPLACE INTO memories` (PR-2 #1823) — REPLACE deletes
 //!     the conflicting row before re-inserting, annihilating the prior
 //!     version's content OUTSIDE the ledger; a bypass P1 + P2 do not catch.
+//!   * P4 — `INSERT … ON CONFLICT(title, namespace) DO UPDATE SET
+//!     (content|title) = …` (PR-3 #2948) — the primary CREATE funnel's
+//!     upsert-merge (`db::insert` / `PostgresStore::store*`) rewrites an
+//!     existing memory's durable authored TEXT in place on a `(title,
+//!     namespace)` collision. P2 misses it because the assignment sits behind
+//!     `DO UPDATE SET`, not `UPDATE memories SET`. Scoped to the memories-only
+//!     `(title, namespace)` conflict target so upserts on other tables are not
+//!     flagged. This was the DOCUMENTED RESIDUAL below until #2948 closed it
+//!     (5-agent vote `4d3ea1c5`, PR-3, UNANIMOUS A1 — route the overwrite
+//!     through the ledger).
 //!
 //! DELIBERATELY OUT OF SCOPE (the North-Star content-vs-derived-artifact line):
 //! a bare new-row `INSERT INTO memories` destroys nothing, and an in-place
@@ -26,14 +36,12 @@
 //! `access_count`, `expires_at`, `priority`, `tier`, `atom_*`, `memory_kind`,
 //! `version`, `confidence*`, …) is regenerable-or-non-destructive. Widening
 //! the ENFORCED guard to the literal
-//! "any UPDATE / bare INSERT" flags 65 such legitimate production sites (the
-//! primary `db::insert` upsert, `set_row_metadata`, recall touch/promote,
-//! embedding backfill, lifecycle tombstones, every postgres store write) and
-//! reds CI while protecting nothing — so it is scoped to durable-TEXT
-//! destruction (5-agent vote `4d3ea1c5`, PR-2). DOCUMENTED RESIDUAL: an
-//! `INSERT … ON CONFLICT … DO UPDATE SET content = …` on the sanctioned create
-//! funnel and a future durable-TEXT column beyond `content`/`title` are NOT
-//! caught by these three shapes.
+//! "any UPDATE / bare INSERT" flags 65 such legitimate production sites
+//! (`set_row_metadata`, recall touch/promote, embedding backfill, lifecycle
+//! tombstones, every postgres store write) and reds CI while protecting nothing
+//! — so it is scoped to durable-TEXT destruction (5-agent vote `4d3ea1c5`,
+//! PR-2). RESIDUAL: a future durable-TEXT column beyond `content`/`title` is
+//! not caught by these four shapes.
 //!
 //! A site is considered ROUTED (sanctioned) when its enclosing `fn`
 //! carries the `// APPEND-ONLY-SANCTIONED` marker on raw source. The two
@@ -258,6 +266,112 @@ fn stmt_rewrites_durable_text(stmt: &str) -> bool {
     stmt_assigns_column(stmt, "content") || stmt_assigns_column(stmt, "title")
 }
 
+/// Within a statement body, is a durable-TEXT column (`content` / `title`)
+/// assigned DIRECTLY from the `excluded` / `EXCLUDED` conflict row —
+/// i.e. `content = excluded.content` — the UNCONDITIONAL create-funnel
+/// overwrite? This deliberately does NOT match the federation newer-wins merge
+/// form `content = CASE WHEN excluded.updated_at > memories.updated_at …`
+/// (a conditional LWW convergence overwrite whose ledger story is a SEPARATE
+/// class, tracked in #2954 apart from #2948), nor `= memories.content` (a
+/// self-preserving arm).
+fn stmt_unconditionally_overwrites_durable_text(stmt: &str) -> bool {
+    assigns_column_from_excluded(stmt, "content") || assigns_column_from_excluded(stmt, "title")
+}
+
+/// `column = excluded.…` / `column = EXCLUDED.…` with word boundaries around
+/// `column` and an `excluded.` right-hand side (case-insensitive on the
+/// keyword). The RHS check is what separates the unconditional create-funnel
+/// overwrite from the `CASE WHEN …` federation merge and the self-preserving
+/// `memories.<col>` arms.
+fn assigns_column_from_excluded(stmt: &str, column: &str) -> bool {
+    let bytes = stmt.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = stmt[from..].find(column) {
+        let idx = from + rel;
+        from = idx + column.len();
+        let before_ok = idx == 0 || {
+            let b = bytes[idx - 1];
+            !(b.is_ascii_alphanumeric() || b == b'_')
+        };
+        let after = &stmt[idx + column.len()..];
+        let boundary_ok = after
+            .chars()
+            .next()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        if before_ok && boundary_ok {
+            let rhs = after.trim_start();
+            if let Some(expr) = rhs.strip_prefix('=') {
+                let expr = expr.trim_start();
+                // Case-insensitive `excluded.` prefix (sqlite `excluded`,
+                // postgres `EXCLUDED`).
+                let head: String = expr.chars().take("excluded.".len()).collect();
+                if head.eq_ignore_ascii_case("excluded.") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// PR-3 (#2948) — the P4 pattern
+/// `INSERT … ON CONFLICT(title, namespace) DO UPDATE SET (content|title) =
+/// excluded.…` over comment-stripped source. The primary CREATE funnel's
+/// upsert-merge (`db::insert` / `PostgresStore::{store,store_batch,
+/// store_with_embedding_inner,capture_turn_idempotent,recover_turn_idempotent,
+/// reflect_with_hooks,consolidate}`) UNCONDITIONALLY rewrites an existing
+/// memory's durable authored TEXT IN PLACE on a `(title, namespace)` collision
+/// — a content destruction the P1 (bare `DELETE`), P2 (`UPDATE memories SET`)
+/// and P3 (`INSERT OR REPLACE`) shapes all MISS, because the assignment sits
+/// behind `DO UPDATE SET`, not `UPDATE memories SET`. This closes the residual
+/// the module header used to document as deliberately un-caught.
+///
+/// SCOPING (two filters, both load-bearing):
+///  * the conflict target is the memories-specific `(title, namespace)` unique
+///    index (whitespace-tolerant) — no other table upserts on that target
+///    (`peer_state` → `(agent_id, peer_id)`, `namespace_meta` → `(namespace)`,
+///    `actions`/`pending` → `(id)`); AND
+///  * the durable-TEXT column is assigned DIRECTLY from `excluded.…` (the
+///    UNCONDITIONAL create overwrite), NOT via the `CASE WHEN
+///    excluded.updated_at > memories.updated_at …` federation newer-wins merge.
+///    The federation LWW merge (`insert_if_newer` / `apply_remote_memory`) is a
+///    DISTINCT content-overwrite class whose ledger coverage is tracked in
+///    #2954, not #2948.
+///
+/// Returns the byte offsets of each matching `ON CONFLICT`.
+fn p4_on_conflict_do_update_durable_text(stripped: &str) -> Vec<usize> {
+    let mut hits = Vec::new();
+    let hay = stripped;
+    let mut from = 0;
+    while let Some(rel) = hay[from..].find("ON CONFLICT") {
+        let start = from + rel;
+        from = start + "ON CONFLICT".len();
+        let rest = &hay[start..];
+        // Require the memories-specific conflict target `(title, namespace)`
+        // (whitespace-tolerant) so only the `memories` upsert is in scope.
+        let after_kw = rest["ON CONFLICT".len()..].trim_start();
+        let Some(after_paren) = after_kw.strip_prefix('(') else {
+            continue;
+        };
+        let target: String = after_paren
+            .chars()
+            .take_while(|&c| c != ')')
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        if target != "title,namespace" {
+            continue;
+        }
+        // Within this statement (to the Rust `;` that terminates the SQL
+        // string literal — SQL upsert bodies carry no `;`), is a durable-TEXT
+        // column UNCONDITIONALLY overwritten from `excluded.…`?
+        let stmt_end = rest.find(';').unwrap_or(rest.len());
+        if stmt_unconditionally_overwrites_durable_text(&rest[..stmt_end]) {
+            hits.push(start);
+        }
+    }
+    hits
+}
+
 /// Brace-counted line spans (`[start, end]`, 0-based, inclusive) of every
 /// `#[cfg(test)]`-annotated braced item (`mod`, `fn`, `impl`, …) in a file.
 /// The append-only invariant governs the PRODUCTION mutation surface only —
@@ -396,6 +510,18 @@ fn collect_unrouted_sites() -> Vec<UnroutedSite> {
             record(off, "UPDATE memories SET ... content|title =");
         }
 
+        // P4 (PR-3 #2948) — `ON CONFLICT(title, namespace) DO UPDATE SET
+        // content|title =`. The create-funnel upsert-merge rewrites an existing
+        // memory's durable TEXT in place on a `(title, namespace)` collision;
+        // the P2 needle misses it because the assignment is behind `DO UPDATE
+        // SET`, not `UPDATE memories SET`. Closes the former documented residual.
+        for off in p4_on_conflict_do_update_durable_text(&stripped) {
+            record(
+                off,
+                "ON CONFLICT(title, namespace) DO UPDATE SET ... content|title =",
+            );
+        }
+
         // P3 (PR-2 #1823) — row-DESTROYING `INSERT OR REPLACE INTO memories`.
         // REPLACE deletes the conflicting row before re-inserting, annihilating
         // the prior version's content OUTSIDE the ledger — a bypass P1 (bare
@@ -450,5 +576,97 @@ fn append_only_spine_all_memory_mutations_routed() {
          signed memory_revisions ledger (and not APPEND-ONLY-SANCTIONED). See the printed \
          worklist above — this is the authoritative step-2 conversion list.",
         sites.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PR-3 (#2948) — the P4 detector must be LOAD-BEARING: it fires on the
+// create-funnel upsert-merge content overwrite and stays silent on the shapes
+// that destroy nothing / touch other tables. Without these, a broken P4 could
+// silently pass while the #2948 bypass re-opened.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn p4_flags_on_conflict_do_update_set_content() {
+    // The exact sqlite `db::insert` upsert shape #2948 closes.
+    let sql = "INSERT INTO memories (id, title, content) VALUES (?1, ?2, ?3)\n\
+               ON CONFLICT(title, namespace) DO UPDATE SET\n\
+               content = excluded.content,\n\
+               version = memories.version + 1\n\
+               RETURNING id";
+    assert_eq!(
+        p4_on_conflict_do_update_durable_text(sql).len(),
+        1,
+        "P4 must flag an ON CONFLICT(title, namespace) DO UPDATE SET content = ..."
+    );
+}
+
+#[test]
+fn p4_flags_postgres_spaced_conflict_target_and_title_assignment() {
+    // Postgres spells it `ON CONFLICT (title, namespace)` (space before paren)
+    // and a hypothetical title rewrite must also be caught.
+    let sql = "ON CONFLICT (title, namespace) DO UPDATE SET title = EXCLUDED.title;";
+    assert_eq!(p4_on_conflict_do_update_durable_text(sql).len(), 1);
+}
+
+#[test]
+fn p4_ignores_do_nothing_and_non_durable_and_other_tables() {
+    // DO NOTHING destroys nothing.
+    let do_nothing = "ON CONFLICT(title, namespace) DO NOTHING RETURNING id;";
+    assert!(p4_on_conflict_do_update_durable_text(do_nothing).is_empty());
+
+    // A memories upsert that touches ONLY derived/temporal columns is out of
+    // scope (content/title are untouched).
+    let derived_only =
+        "ON CONFLICT(title, namespace) DO UPDATE SET version = memories.version + 1;";
+    assert!(p4_on_conflict_do_update_durable_text(derived_only).is_empty());
+
+    // A `content`-bearing upsert on a DIFFERENT conflict target (not the
+    // memories `(title, namespace)` index) must NOT be flagged.
+    let other_table = "ON CONFLICT(agent_id, peer_id) DO UPDATE SET content = excluded.content;";
+    assert!(p4_on_conflict_do_update_durable_text(other_table).is_empty());
+}
+
+#[test]
+fn p4_ignores_federation_newer_wins_case_merge() {
+    // The federation LWW merge (`insert_if_newer` / `apply_remote_memory`)
+    // overwrites content CONDITIONALLY via `CASE WHEN excluded.updated_at >
+    // memories.updated_at …` — a DISTINCT content-overwrite class whose ledger
+    // coverage is tracked in #2954, NOT #2948. P4 must NOT flag it, so
+    // the create-funnel guard does not force a federation-merge rewrite.
+    let fed = "ON CONFLICT(title, namespace) DO UPDATE SET \
+               content = CASE WHEN excluded.updated_at > memories.updated_at \
+               THEN excluded.content ELSE memories.content END, \
+               version = memories.version + 1;";
+    assert!(
+        p4_on_conflict_do_update_durable_text(fed).is_empty(),
+        "P4 is scoped to the UNCONDITIONAL create overwrite; the federation \
+         newer-wins CASE merge is a separate class"
+    );
+
+    // The self-preserving arm (`content = memories.content`) is likewise not
+    // an overwrite of durable text and must not be flagged.
+    let keep = "ON CONFLICT(title, namespace) DO UPDATE SET content = memories.content;";
+    assert!(p4_on_conflict_do_update_durable_text(keep).is_empty());
+}
+
+#[test]
+fn p4_matches_the_real_insert_inner_and_pg_store_are_sanctioned() {
+    // Belt-and-braces: prove the enforced scan sees the P4 shape in production
+    // (so the detector is wired against real source, not just fixtures) AND
+    // that every such site is routed — collect_unrouted_sites() is empty above,
+    // which already covers routing; here we assert the detector finds the
+    // production upserts at all, so a future refactor that hides them from the
+    // scan can't silently disable the invariant.
+    let src_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut p4_total = 0usize;
+    walk_rs_files(&src_root, &mut |_path, raw| {
+        let stripped = strip_rust_comments(raw);
+        p4_total += p4_on_conflict_do_update_durable_text(&stripped).len();
+    });
+    assert!(
+        p4_total >= 2,
+        "the P4 detector must see the real create-funnel upserts in src/ \
+         (sqlite insert_inner + at least one PostgresStore upsert); found {p4_total}"
     );
 }
