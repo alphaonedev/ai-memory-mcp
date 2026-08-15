@@ -188,22 +188,29 @@ BATMAN_CURATOR_MAX_OPS="${BATMAN_CURATOR_MAX_OPS:-100}"
 CURATOR_HEALTH_MAX_RESTARTS="${CURATOR_HEALTH_MAX_RESTARTS:-3}"
 
 # ---------------------------------------------------------------------------
-# Pinned PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.6 substrate — NATIVE
+# Pinned PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.6 substrate — NATIVE
 # (NO Docker anywhere on the DO fleet, per operator decision). Installed from
 # the official PostgreSQL apt repository (pgdg) on the droplet's own distro.
 # Assessment (verified against the live pgdg noble repo): apt is a complete,
 # pinned install vector for all three —
-#   * postgresql-18         18.4   (exact)
-#   * postgresql-18-pgvector 0.8.6 (exact)
-#   * postgresql-18-age      ships age.control default_version='1.7.0' and
-#     age--1.7.0.sql, built from the SAME commit (806fa2eb) as the
-#     apache/age:release_PG18_1.7.0 image docker-1461 used — the pgdg "~rc0"
-#     is only a Debian revision label, so CREATE EXTENSION age reports
-#     extversion = 1.7.0 (asserted by the validate harness). No source build.
+#   * postgresql-18         18.6   (exact)
+#   * postgresql-18-pgvector 0.8.6 (exact, unchanged — already current-stable)
+#   * postgresql-18-age      ships age.control default_version='1.8.0' and
+#     age--1.8.0.sql. AGE 1.8.0 is the NEWEST released AGE for PostgreSQL 18
+#     per github.com/apache/age/releases (PG18/v1.8.0-rc0, 2026-07-09).
+#     Apache AGE tags EVERY release `X.Y.Z-rc0` on GitHub (its release-vote
+#     convention), which is why the pgdg package version reads
+#     `1.8.0~rc0-...`; CREATE EXTENSION age reports extversion = 1.8.0
+#     (asserted by the validate harness). NOTE: the project download page
+#     (age.apache.org/download) still lists 1.7.0 as "current stable" and
+#     lags the releases page — we track the newest RELEASED AGE for PG18.
+#     No source build. This mirrors the docker-1461 container lane, which
+#     apt-installs the SAME `postgresql-18-age` 1.8.0 pgdg package (pgdg13
+#     suffix there).
 # Every version literal lives HERE (SSOT) and is asserted post-install.
 PG_MAJOR="${PG_MAJOR:-18}"                                          # server major (apt pkg suffix)
 PGDG_CODENAME="${PGDG_CODENAME:-noble}"                            # droplet distro codename (Ubuntu 24.04)
-PG_APT_VERSION="${PG_APT_VERSION:-18.4-1.pgdg24.04+1}"             # pinned exact pgdg server .deb
+PG_APT_VERSION="${PG_APT_VERSION:-18.6-1.pgdg24.04+2}"             # pinned exact pgdg server .deb
 # pgvector patch is UNIFIED with the docker-1461 lane (#2872): both certified
 # provisioning SSOTs pin pgvector 0.8.6 — the canonical v1.0.0 GA stack
 # (docs/v1.0.0/release-notes.md). Only the pgdg distro suffix differs by lane
@@ -216,11 +223,13 @@ PG_APT_VERSION="${PG_APT_VERSION:-18.4-1.pgdg24.04+1}"             # pinned exac
 # noble-pgdg — an apt install of it would fail (the #2658 nonexistent-pin class).
 # Cross-lane parity is asserted by tests/provisioning_pgvector_pin_parity.rs.
 PGVECTOR_APT_VERSION="${PGVECTOR_APT_VERSION:-0.8.6-1.pgdg24.04+1}" # pinned pgvector 0.8.6
-AGE_APT_VERSION="${AGE_APT_VERSION:-1.7.0~rc0-1.pgdg24.04+1}"      # AGE 1.7.0 (extversion 1.7.0)
+AGE_APT_VERSION="${AGE_APT_VERSION:-1.8.0~rc0-2.pgdg24.04+1}"      # AGE 1.8.0 (extversion 1.8.0)
 # Reproducibility assertion anchors — the validate harness asserts these exact
-# upstream-reported versions (directive: results must reflect 18.4 + AGE 1.7.0).
-EXPECTED_PG_VERSION="${EXPECTED_PG_VERSION:-18.4}"
-EXPECTED_AGE_VERSION="${EXPECTED_AGE_VERSION:-1.7.0}"
+# upstream-reported versions (directive: results must reflect the data tier
+# PG 18.6 (current stable) + AGE 1.8.0 (newest released AGE for PG18) +
+# pgvector 0.8.6 (current stable)).
+EXPECTED_PG_VERSION="${EXPECTED_PG_VERSION:-18.6}"
+EXPECTED_AGE_VERSION="${EXPECTED_AGE_VERSION:-1.8.0}"
 EXPECTED_PGVECTOR_VERSION="${EXPECTED_PGVECTOR_VERSION:-0.8.6}"
 
 # Native cluster identity (Debian/Ubuntu postgresql-common layout). Applied

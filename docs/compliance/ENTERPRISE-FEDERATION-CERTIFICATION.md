@@ -247,8 +247,17 @@ The certified stack is **executed in-PR** by `.github/workflows/cert-postgres-ag
 version drift (`Assert certified stack versions` step at
 `.github/workflows/cert-postgres-age.yml:203`):
 
-- **PostgreSQL 18.4** (`EXPECTED_PG_VERSION=18.4`)
-- **Apache AGE 1.7.0** (`EXPECTED_AGE_VERSION=1.7.0`, base `apache/age:release_PG18_1.7.0`)
+- **PostgreSQL 18.6** (`EXPECTED_PG_VERSION=18.6`, `PG_APT_VERSION=18.6-1.pgdg13+2`)
+- **Apache AGE 1.8.0** — the newest released AGE for PostgreSQL 18 per
+  [github.com/apache/age/releases](https://github.com/apache/age/releases)
+  (`PG18/v1.8.0-rc0`, 2026-07-09) (`EXPECTED_AGE_VERSION=1.8.0`,
+  `AGE_APT_VERSION=1.8.0~rc0-2.pgdg13+1`, base image
+  `apache/age:release_PG18_1.7.0` with AGE upgraded to 1.8.0 via pgdg apt).
+  NOTE: the project download page (age.apache.org/download) still lists 1.7.0
+  as "current stable" and lags the releases page; this cert tracks the newest
+  RELEASED AGE for PG18. Apache AGE tags every release `X.Y.Z-rc0` on GitHub
+  (its release-vote convention), which is why the pgdg package version reads
+  `1.8.0~rc0-…`; `CREATE EXTENSION age` reports `extversion = 1.8.0`.
 - **pgvector 0.8.6** (`PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1`)
 
 **Executed GREEN on the cert SHA:** run
@@ -278,6 +287,45 @@ stack.
 > `sslmode=verify-full` daemon `schema-init` all functional. Until the
 > in-PR `cert-postgres-age.yml` job is GREEN at `0.8.6`, treat the pgvector
 > row above as *pin-current, formal-CI-re-green-pending*.
+
+> **Data-tier refresh: PG 18.6 (current stable) + AGE 1.8.0 (newest released
+> AGE for PG18) + pgvector 0.8.6 (current stable) (2026-08-15, honest evidence
+> status).** The certified data tier was refreshed from the ratified **PG 18.4
+> / AGE 1.7.0 / pgvector 0.8.6** triple to **PG 18.6 / AGE 1.8.0 / pgvector
+> 0.8.6** (operator-directed; pgvector unchanged). PG 18.6 and pgvector 0.8.6
+> are current-stable without qualification. **Apache AGE 1.8.0 is the newest
+> RELEASED AGE for PostgreSQL 18** per
+> [github.com/apache/age/releases](https://github.com/apache/age/releases)
+> (`PG18/v1.8.0-rc0`, 2026-07-09) — NOTE: the project download page
+> (age.apache.org/download) still lists 1.7.0 as "current stable" and lags the
+> releases page; this cert tracks the newest released AGE for PG18. Both bumps
+> are pinned pgdg apt `.deb`s — `postgresql-18` → `18.6-1.pgdg13+2` and
+> `postgresql-18-age` → `1.8.0~rc0-2.pgdg13+1`. **AGE 1.8.0 is installed VIA
+> pgdg APT, not source-built**: the apache/age Docker Hub image is only at
+> `release_PG18_1.7.0`, but the canonical PostgreSQL apt repo already publishes
+> AGE 1.8.0, so the Dockerfile keeps the 1.7.0 base image and upgrades AGE with
+> the same `postgresql-18-age` pin the do-1461 NATIVE lane uses. Apache AGE
+> tags every release `X.Y.Z-rc0` on GitHub (its release-vote convention),
+> which is why the pgdg package version reads `1.8.0~rc0-…`; `CREATE EXTENSION
+> age` reports `extversion = 1.8.0`. **The GREEN `cert-postgres-age.yml` runs cited above certified the
+> PRIOR PG 18.4 / AGE 1.7.0 stack; they do NOT prove PG 18.6 / AGE 1.8.0.**
+> The formal in-PR re-green is produced by the `cert-postgres-age.yml` run of
+> the change carrying this refresh (its `Assert certified stack versions` step
+> reads the advanced `EXPECTED_PG_VERSION` / `EXPECTED_AGE_VERSION` from
+> `deploy/docker-1461/provision/lib.sh` and hard-fails on drift, so a GREEN
+> merge IS the 18.6 / 1.8.0 build+assert evidence). On-host corroboration
+> exists ahead of that run: an `ai-memory-cert-pg` image rebuilt on this
+> refresh serves **PostgreSQL 18.6 + Apache AGE 1.8.0 + pgvector 0.8.6** with
+> `postgres --version` = 18.6, AGE `extversion` = 1.8.0, `create_graph`, a
+> pgvector cosine op, the Leg-3 verify-full TLS POS/NEG suite, and a
+> `sslmode=verify-full` daemon `schema-init` all functional; the AGE-1.8.0
+> compatibility gate (the `sal,sal-postgres` AGE / kg tests against the live
+> 18.6 / 1.8.0 container) passed. **A data-tier version refresh MAY warrant
+> cert re-validation** — the ratified determination (2026-08-12) was against
+> the 18.4 / 1.7.0 triple; until the in-PR `cert-postgres-age.yml` job is
+> GREEN at 18.6 / 1.8.0 AND the ratification is re-affirmed against the new
+> triple, treat the PG/AGE rows above as *as-built, formal-CI-re-green +
+> re-validation-pending*.
 
 > **Stack-evidence note (two disjoint corpora).** The certified triple
 > above is **single-node CI evidence**. The only real multi-node mesh
