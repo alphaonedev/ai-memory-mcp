@@ -357,6 +357,14 @@ pub enum InboundResolutionOutcome {
     /// Under the substrate's first-resolution-wins rule the LOCAL resolution is
     /// kept and the inbound one refused. No write performed.
     Conflict,
+    /// PR-1 / L5 (#2708-sibling, CWE-284) — the CLAIMED (wire) or STORED (by-id)
+    /// checkpoint names a substrate-RESERVED anchor kind/namespace (audit-head
+    /// witness, governance verdict/enforcement, epoch-advance, peer-head
+    /// entanglement, re-anchor). A wire-reachable `/sync/push` MUST NOT steer
+    /// the substrate's own audit-signal spine — the resolution is refused
+    /// (fail CLOSED) and NO write is performed. The receive loop counts it as
+    /// `skipped`; the rest of the batch survives.
+    RefusedReservedKind,
 }
 
 /// Whether two checkpoints carry the identical resolution tuple — the
@@ -408,6 +416,28 @@ const APPLY_INBOUND_RESOLUTION_CAS_SQL: &str = "UPDATE checkpoints SET state = ?
         resolution_note = ?4, resolved_at = ?5, signature = ?6, resolver_pubkey = ?7 \
      WHERE id = ?8 AND state = ?9";
 
+/// PR-1 / L5 (#2708-sibling, CWE-284) — the by-id STORED kind/namespace probe
+/// feeding the reserved-anchor gate in [`apply_inbound_resolution`]. Resolves
+/// the local row's `(condition_type, namespace)` so the refusal covers the CAS
+/// arm — a peer resolving a STORED reserved anchor by id under a benign wire
+/// kind — not only the attacker-chosen wire kind. `None` means "provably no
+/// local row" (the first-landing arm, checked on the wire kind alone).
+///
+/// Fail CLOSED: an unresolvable probe PROPAGATES the `rusqlite` error so the
+/// caller cannot treat a read fault as "no local row" (the #2708 fail-closed
+/// discipline, mirroring [`namespace_by_id`]).
+///
+/// Isolated as its own function so the CERT removal-proof harness
+/// (`scripts/check-cert-removal-proof.sh`) can mutate its whole body to
+/// `Ok(None)` (always-authorize the CAS arm) and prove the stored-row arm is
+/// load-bearing INDEPENDENTLY of the wire-kind predicate.
+fn inbound_checkpoint_stored_kind_ns(
+    conn: &Connection,
+    id: &str,
+) -> rusqlite::Result<Option<(ConditionType, String)>> {
+    Ok(get(conn, id)?.map(|c| (c.condition_type, c.namespace)))
+}
+
 /// Apply an inbound FEDERATED checkpoint resolution under the checkpoint
 /// substrate's **first-resolution-wins** rule (FED-RQ-01, #1936).
 ///
@@ -449,6 +479,25 @@ pub fn apply_inbound_resolution(
     conn: &Connection,
     incoming: &Checkpoint,
 ) -> rusqlite::Result<InboundResolutionOutcome> {
+    // Step 0 — PR-1 / L5 (#2708-sibling, CWE-284): refuse a resolution touching a
+    // substrate-RESERVED anchor at the CAS FUNNEL, so EVERY caller of this
+    // function (the sqlite `/sync/push` loop today, any future path) is closed.
+    // The STORED kind/namespace is resolved by id UNCONDITIONALLY (not only when
+    // namespace-scope is armed) and checked alongside the CLAIMED wire kind — a
+    // peer must not present a benign `approval` wire kind to resolve a STORED
+    // `_audit_witness` anchor by id (the #2447 stored-vs-claimed split, applied
+    // to the reserved-anchor kind). Fail CLOSED on any probe error: an
+    // unresolvable row PROPAGATES, never a silent "no local row" pass.
+    let stored_kind_ns = inbound_checkpoint_stored_kind_ns(conn, &incoming.id)?;
+    let stored_ref = stored_kind_ns.as_ref().map(|(k, ns)| (*k, ns.as_str()));
+    if !crate::federation::receive_auth::inbound_checkpoint_kind_authorized(
+        incoming.condition_type,
+        &incoming.namespace,
+        stored_ref,
+    ) {
+        return Ok(InboundResolutionOutcome::RefusedReservedKind);
+    }
+
     // Step 1 — CAS the locally-PENDING row. `n == 1` means THIS call won the
     // pending→resolved transition; the guard makes a concurrent second writer
     // see `n == 0` instead of clobbering the winner's resolution.

@@ -165,6 +165,93 @@ pub fn authorize_remote_checkpoint_resolution(
     }
 }
 
+/// PR-1 / L5 (#2708-sibling, CWE-284) — the substrate-RESERVED checkpoint
+/// `condition_type` set: the anchor kinds the substrate itself EMITS and
+/// immediately resolves out-of-band (audit-head witness, governance
+/// verdict/enforcement, epoch-advance, peer-head entanglement, re-anchor
+/// ceremony). None is a caller/peer coordination gate — they are the
+/// audit-signal spine `verify_audit_trail` reads. A wire-reachable
+/// `/sync/push` that lands one of these into a substrate anchor location
+/// would let a REMOTE attacker (no host access) STEER the witness verdict —
+/// audit-signal poisoning. The caller-creatable coordination kinds
+/// (`approval`, `external_signal`, `condition_predicate`, `deadline`) are
+/// deliberately ABSENT and federate as before.
+pub const RESERVED_SUBSTRATE_CONDITION_TYPES: &[crate::models::ConditionType] = &[
+    crate::models::ConditionType::AuditHeadWitness,
+    crate::models::ConditionType::GovernanceVerdict,
+    crate::models::ConditionType::GovernanceEnforcement,
+    crate::models::ConditionType::EpochAdvance,
+    crate::models::ConditionType::PeerHeadEntanglement,
+    crate::models::ConditionType::ReAnchor,
+];
+
+/// PR-1 / L5 (#2708-sibling) — the substrate-RESERVED underscore namespaces the
+/// reserved-anchor kinds live under. Built from the canonical SSOT constants
+/// (never string literals — the no-hardcoded-literals discipline), so a rename
+/// of any anchor namespace propagates here for free. This is the completed
+/// SSOT: `_audit_witness`, `_governance_verdict`, `_governance_enforcement`,
+/// `_reanchor_ceremony` (all four defined in [`crate::governance::audit`]), plus
+/// `_peer_head_entanglement` (defined in [`crate::identity::equivocation`]).
+pub const RESERVED_SUBSTRATE_NAMESPACES: &[&str] = &[
+    crate::governance::audit::WITNESS_CHECKPOINT_NAMESPACE,
+    crate::governance::audit::GOVERNANCE_VERDICT_NAMESPACE,
+    crate::governance::audit::GOVERNANCE_ENFORCEMENT_NAMESPACE,
+    crate::governance::audit::REANCHOR_CHECKPOINT_NAMESPACE,
+    crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE,
+];
+
+/// Whether a `(condition_type, namespace)` pair names a substrate-RESERVED
+/// checkpoint anchor — i.e. EITHER the kind is in
+/// [`RESERVED_SUBSTRATE_CONDITION_TYPES`] OR the namespace is in
+/// [`RESERVED_SUBSTRATE_NAMESPACES`] (trimmed, exact match). The namespace is
+/// trimmed before compare to mirror
+/// [`crate::validate::reject_reserved_write_namespace`], so a padded
+/// `"  _audit_witness  "` cannot slip past.
+#[must_use]
+pub fn checkpoint_kind_is_reserved(
+    condition_type: crate::models::ConditionType,
+    namespace: &str,
+) -> bool {
+    RESERVED_SUBSTRATE_CONDITION_TYPES.contains(&condition_type)
+        || RESERVED_SUBSTRATE_NAMESPACES.contains(&namespace.trim())
+}
+
+/// PR-1 / L5 (#2708-sibling, CWE-284) — decide whether an inbound federated
+/// checkpoint RESOLUTION may touch a checkpoint of the CLAIMED (wire) and
+/// STORED (by-id) kind/namespace. Refuses when EITHER end names a
+/// substrate-reserved anchor ([`checkpoint_kind_is_reserved`]).
+///
+/// This is the checkpoint-lane twin of the #2708 stored-vs-claimed discipline
+/// applied to the memories lane by [`inbound_write_namespace_authorized`]: the
+/// wire `condition_type`/`namespace` are attacker-chosen, and the
+/// `apply_inbound_resolution` CAS keys on `(id, state)` only, so a peer could
+/// otherwise present a benign wire kind (`approval` in `public/*`) to resolve a
+/// STORED `_audit_witness` anchor by id — hence BOTH ends are checked.
+///
+/// Reused verbatim by the LOCAL creation path
+/// (`crate::mcp::tools::checkpoint::handle_checkpoint_create`, `stored = None`)
+/// so a reserved-kind PENDING anchor cannot be created by a caller in the first
+/// place either.
+///
+/// Returns `true` when the resolution/creation is authorized, `false` to refuse
+/// (fail CLOSED).
+#[must_use]
+pub fn inbound_checkpoint_kind_authorized(
+    claimed_kind: crate::models::ConditionType,
+    claimed_namespace: &str,
+    stored: Option<(crate::models::ConditionType, &str)>,
+) -> bool {
+    if checkpoint_kind_is_reserved(claimed_kind, claimed_namespace) {
+        return false;
+    }
+    if let Some((stored_kind, stored_namespace)) = stored {
+        if checkpoint_kind_is_reserved(stored_kind, stored_namespace) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Env knob gating the inbound action-transition signature requirement
 /// (`require_sig` fed to [`authorize_remote_transition`]).
 pub const REQUIRE_TRANSITION_SIG_ENV: &str = "AI_MEMORY_FED_REQUIRE_TRANSITION_SIG";

@@ -96,6 +96,29 @@ pub fn handle_checkpoint_create(
             .map_err(|e| e.to_string())?;
     }
 
+    // PR-1 / L5 (#2708-sibling, CWE-284) — close the LOCAL creation path too: a
+    // caller must NOT be able to create a PENDING checkpoint whose kind/namespace
+    // names a substrate-RESERVED anchor (audit-head witness, governance verdict/
+    // enforcement, epoch-advance, peer-head entanglement, re-anchor). The
+    // substrate emits its OWN anchors via `crate::checkpoints::insert` directly
+    // (bypassing this handler), so this refusal never blocks a legitimate
+    // substrate emission — only a caller minting a reserved-kind pending anchor
+    // that a later resolution could then steer the audit-signal spine with.
+    // Reuses the SAME pure predicate as the federation ingress (`stored = None`
+    // — there is no pre-existing row on a create).
+    if !crate::federation::receive_auth::inbound_checkpoint_kind_authorized(
+        cp.condition_type,
+        &cp.namespace,
+        None,
+    ) {
+        return Err(format!(
+            "condition_type '{}' / namespace '{}' names a substrate-reserved checkpoint \
+             anchor and cannot be created by a caller",
+            cp.condition_type.as_str(),
+            cp.namespace
+        ));
+    }
+
     crate::checkpoints::insert(conn, &cp).map_err(|e| e.to_string())?;
 
     // #1722 — coordination observability: best-effort audit row for the
@@ -587,6 +610,69 @@ mod handler_tests {
         )
         .expect_err("missing id must error");
         assert!(err.contains("not found"), "error reports absence: {err}");
+    }
+
+    /// PR-1 / L5 (#2708-sibling, CWE-284) — a caller must NOT be able to CREATE a
+    /// pending checkpoint whose kind/namespace names a substrate-reserved anchor
+    /// (audit-head witness, governance verdict/enforcement, epoch-advance,
+    /// peer-head entanglement, re-anchor). Closing the local creation path in
+    /// addition to the federation ingress means a reserved-kind pending anchor
+    /// cannot be minted in the first place, so a later resolution has nothing to
+    /// steer the audit-signal spine with.
+    #[test]
+    fn create_refuses_reserved_anchor_kind_and_namespace() {
+        let conn = fresh();
+
+        // Reserved by KIND (the wire condition_type names a substrate anchor).
+        let by_kind = handle_checkpoint_create(
+            &conn,
+            &json!({
+                "namespace": "team/ops",
+                "title": "forge a witness",
+                "condition_type": "audit_head_witness",
+            }),
+        )
+        .expect_err("reserved kind create must error");
+        assert!(
+            by_kind.contains("substrate-reserved"),
+            "error names the reserved-anchor refusal: {by_kind}"
+        );
+
+        // Reserved by NAMESPACE (benign kind, reserved location).
+        let by_ns = handle_checkpoint_create(
+            &conn,
+            &json!({
+                "namespace": crate::governance::audit::WITNESS_CHECKPOINT_NAMESPACE,
+                "title": "squat the witness namespace",
+                "condition_type": "approval",
+            }),
+        )
+        .expect_err("reserved namespace create must error");
+        assert!(
+            by_ns.contains("substrate-reserved"),
+            "error names the reserved-anchor refusal: {by_ns}"
+        );
+
+        // Nothing landed under the reserved witness namespace.
+        assert!(
+            crate::checkpoints::query(
+                &conn,
+                crate::governance::audit::WITNESS_CHECKPOINT_NAMESPACE,
+                None,
+                None,
+                16,
+            )
+            .expect("query")
+            .is_empty(),
+            "no reserved-kind checkpoint may be created locally"
+        );
+
+        // A benign caller checkpoint still creates normally.
+        handle_checkpoint_create(
+            &conn,
+            &json!({ "namespace": "team/ops", "title": "normal gate", "condition_type": "approval" }),
+        )
+        .expect("benign create ok");
     }
 
     /// #1722 — resolving a checkpoint appends one

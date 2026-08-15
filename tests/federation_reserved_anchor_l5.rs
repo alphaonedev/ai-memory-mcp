@@ -1,0 +1,425 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! PR-1 / L5 (#2708-sibling, CWE-284) — refuse substrate-RESERVED checkpoint
+//! anchor kinds/namespaces at the federation ingress chokepoint.
+//!
+//! # The remote attack this closes
+//!
+//! The substrate itself EMITS and immediately resolves a small set of anchor
+//! checkpoints — audit-head witness, governance verdict/enforcement,
+//! epoch-advance, peer-head entanglement, re-anchor ceremony — under reserved
+//! `_`-prefixed namespaces. `verify_audit_trail` reads the LATEST
+//! `_audit_witness` / `audit_head_witness` checkpoint as its out-of-band anchor.
+//!
+//! FED-RQ-01 (#1936, #125) federates RESOLVED checkpoints over `/sync/push`, and
+//! [`apply_inbound_resolution`] keys its CAS on `(id, state)` only. So a
+//! WIRE-REACHABLE peer — a REMOTE attacker with NO host access — could push a
+//! resolved `audit_head_witness` anchor (first-landing, or by-id under a benign
+//! wire kind) and STEER this node's witness verdict: audit-signal poisoning.
+//!
+//! The refusal is applied at the CAS FUNNEL ([`apply_inbound_resolution`]) so
+//! every caller is closed, and the SAME pure predicate closes the LOCAL
+//! creation path (`memory_checkpoint_create`, unit-tested in
+//! `src/mcp/tools/checkpoint.rs`).
+//!
+//! # Env discipline (#2905)
+//!
+//! These tests set NO posture env vars — the refusal is UNCONDITIONAL (there is
+//! deliberately NO `security_profile::KNOBS` entry / no opt-out for it), so
+//! there is nothing to subprocess-isolate. `compute_witness_verdict` is driven
+//! as a pure function with `enrolled_pubkey = None` (the default no-pin posture)
+//! rather than through any `AI_MEMORY_WITNESS_*` env.
+//!
+//! # K3 (sqlite ↔ postgres) parity
+//!
+//! The inbound-checkpoint APPLY path is sqlite/MCP-native only: the postgres
+//! `/sync/push` funnel reports checkpoints as `unsupported_on_postgres`
+//! (#2464/#1936/#125) and NEVER reaches an apply, so postgres already refuses
+//! EVERY inbound checkpoint resolution (a strictly stronger disposition). There
+//! is therefore no postgres twin to poison; the sqlite refusal proven here is
+//! the complete closure for the reachable surface. See
+//! `pg_checkpoint_apply_is_unsupported_parity_note` below.
+
+use ai_memory::checkpoints::{
+    InboundResolutionOutcome, apply_inbound_resolution, get, insert, query,
+};
+use ai_memory::federation::receive_auth::{
+    RESERVED_SUBSTRATE_CONDITION_TYPES, RESERVED_SUBSTRATE_NAMESPACES,
+    inbound_checkpoint_kind_authorized,
+};
+use ai_memory::governance::audit::{
+    GOVERNANCE_ENFORCEMENT_NAMESPACE, GOVERNANCE_VERDICT_NAMESPACE, REANCHOR_CHECKPOINT_NAMESPACE,
+    WITNESS_CHECKPOINT_NAMESPACE,
+};
+use ai_memory::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE;
+use ai_memory::models::{Checkpoint, CheckpointState, ConditionType};
+use ai_memory::signed_events::{WitnessCheck, compute_witness_verdict};
+use rusqlite::Connection;
+
+const RESOLVED_AT: i64 = 1_700_000_500;
+
+fn fresh() -> (tempfile::TempDir, Connection) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let conn = ai_memory::storage::open(&dir.path().join("l5.db")).expect("open l5 db");
+    (dir, conn)
+}
+
+/// A PENDING checkpoint of the given kind/namespace (the shape the substrate
+/// inserts directly for its own anchors, and the shape a caller-created gate
+/// takes).
+fn pending(id: &str, kind: ConditionType, namespace: &str) -> Checkpoint {
+    Checkpoint {
+        id: id.to_string(),
+        namespace: namespace.to_string(),
+        title: "anchor".to_string(),
+        condition_type: kind,
+        condition: serde_json::json!({}),
+        state: CheckpointState::Pending,
+        created_by: "substrate".to_string(),
+        resolved_by: None,
+        resolution: None,
+        resolution_note: None,
+        signature: vec![],
+        resolver_pubkey: vec![],
+        created_at: 1_700_000_000,
+        deadline_at: None,
+        resolved_at: None,
+        metadata: serde_json::json!({}),
+    }
+}
+
+/// An inbound (already-RESOLVED) checkpoint as it arrives on the `/sync/push`
+/// wire — the attacker chooses every field, including `condition_type`,
+/// `namespace`, and `resolved_at`.
+fn inbound(id: &str, kind: ConditionType, namespace: &str, resolved_at: i64) -> Checkpoint {
+    Checkpoint {
+        state: CheckpointState::Resolved,
+        resolved_by: Some("peer-resolver".to_string()),
+        resolution: Some("approved".to_string()),
+        resolution_note: Some("from peer".to_string()),
+        resolved_at: Some(resolved_at),
+        ..pending(id, kind, namespace)
+    }
+}
+
+/// Newest resolved audit-head-witness anchor the substrate would consume as its
+/// witness pin input (the `_audit_witness` / `audit_head_witness` /
+/// `resolved` selection `read_latest_witness_checkpoint` performs).
+fn latest_resolved_witness(conn: &Connection) -> Option<Checkpoint> {
+    query(
+        conn,
+        WITNESS_CHECKPOINT_NAMESPACE,
+        Some(ConditionType::AuditHeadWitness),
+        Some(CheckpointState::Resolved),
+        16,
+    )
+    .expect("query witness anchors")
+    .into_iter()
+    .next()
+}
+
+// ---------------------------------------------------------------------------
+// Predicate-level unit coverage — the completed SSOT + the pure decision.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reserved_ssot_is_complete() {
+    // The completed RESERVED_SUBSTRATE_NAMESPACES SSOT — all five reserved
+    // underscore namespaces, including the two the pre-PR-1 partial set was
+    // missing (_governance_verdict + _reanchor_ceremony).
+    for ns in [
+        WITNESS_CHECKPOINT_NAMESPACE,
+        GOVERNANCE_VERDICT_NAMESPACE,
+        GOVERNANCE_ENFORCEMENT_NAMESPACE,
+        REANCHOR_CHECKPOINT_NAMESPACE,
+        PEER_HEAD_ENTANGLEMENT_NAMESPACE,
+    ] {
+        assert!(
+            RESERVED_SUBSTRATE_NAMESPACES.contains(&ns),
+            "reserved namespace SSOT is missing {ns}"
+        );
+    }
+    assert_eq!(
+        RESERVED_SUBSTRATE_NAMESPACES.len(),
+        5,
+        "exactly the five reserved substrate namespaces"
+    );
+
+    // Every substrate-emitted anchor kind is reserved; no caller coordination
+    // kind is.
+    for kind in [
+        ConditionType::AuditHeadWitness,
+        ConditionType::GovernanceVerdict,
+        ConditionType::GovernanceEnforcement,
+        ConditionType::EpochAdvance,
+        ConditionType::PeerHeadEntanglement,
+        ConditionType::ReAnchor,
+    ] {
+        assert!(
+            RESERVED_SUBSTRATE_CONDITION_TYPES.contains(&kind),
+            "reserved kind SSOT is missing {}",
+            kind.as_str()
+        );
+    }
+    for kind in [
+        ConditionType::Approval,
+        ConditionType::ExternalSignal,
+        ConditionType::ConditionPredicate,
+        ConditionType::Deadline,
+    ] {
+        assert!(
+            !RESERVED_SUBSTRATE_CONDITION_TYPES.contains(&kind),
+            "caller coordination kind {} must NOT be reserved",
+            kind.as_str()
+        );
+    }
+}
+
+#[test]
+fn predicate_refuses_reserved_kind_or_namespace_either_end() {
+    // Reserved by KIND (any namespace).
+    assert!(!inbound_checkpoint_kind_authorized(
+        ConditionType::GovernanceVerdict,
+        "public/ok",
+        None
+    ));
+    // Reserved by NAMESPACE (benign kind) — the belt-and-braces arm.
+    assert!(!inbound_checkpoint_kind_authorized(
+        ConditionType::Approval,
+        WITNESS_CHECKPOINT_NAMESPACE,
+        None
+    ));
+    // Padded reserved namespace cannot slip past (trimmed compare).
+    assert!(!inbound_checkpoint_kind_authorized(
+        ConditionType::Approval,
+        "  _audit_witness  ",
+        None
+    ));
+    // Benign claimed but reserved STORED (the CAS-arm subject).
+    assert!(!inbound_checkpoint_kind_authorized(
+        ConditionType::Approval,
+        "public/ok",
+        Some((
+            ConditionType::AuditHeadWitness,
+            WITNESS_CHECKPOINT_NAMESPACE
+        )),
+    ));
+    // Fully benign both ends → authorized.
+    assert!(inbound_checkpoint_kind_authorized(
+        ConditionType::Approval,
+        "team/ops",
+        Some((ConditionType::Approval, "team/ops")),
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// (a) WIRE-KIND refusal — first-landing resolution of a reserved anchor.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wire_kind_reserved_anchor_resolution_refused_and_nothing_lands() {
+    let (_dir, conn) = fresh();
+
+    // Reserved by KIND: attacker pushes a resolved audit-head-witness anchor
+    // that does not exist locally (first-landing).
+    let forged = inbound(
+        "wire-witness",
+        ConditionType::AuditHeadWitness,
+        WITNESS_CHECKPOINT_NAMESPACE,
+        RESOLVED_AT,
+    );
+    assert_eq!(
+        apply_inbound_resolution(&conn, &forged).unwrap(),
+        InboundResolutionOutcome::RefusedReservedKind
+    );
+    // Fail CLOSED: the anchor NEVER landed — no row, no witness input created.
+    assert!(get(&conn, "wire-witness").unwrap().is_none());
+    assert!(latest_resolved_witness(&conn).is_none());
+
+    // Reserved by NAMESPACE (benign kind, reserved location) is refused too.
+    let forged_ns = inbound(
+        "wire-verdict-ns",
+        ConditionType::Approval,
+        GOVERNANCE_VERDICT_NAMESPACE,
+        RESOLVED_AT,
+    );
+    assert_eq!(
+        apply_inbound_resolution(&conn, &forged_ns).unwrap(),
+        InboundResolutionOutcome::RefusedReservedKind
+    );
+    assert!(get(&conn, "wire-verdict-ns").unwrap().is_none());
+}
+
+#[test]
+fn benign_coordination_resolution_still_applies() {
+    // The refusal must not over-block: a normal caller coordination checkpoint
+    // (approval, non-reserved namespace) federates exactly as before.
+    let (_dir, conn) = fresh();
+    let benign = inbound(
+        "benign-gate",
+        ConditionType::Approval,
+        "team/ops",
+        RESOLVED_AT,
+    );
+    assert_eq!(
+        apply_inbound_resolution(&conn, &benign).unwrap(),
+        InboundResolutionOutcome::Applied
+    );
+    let landed = get(&conn, "benign-gate")
+        .unwrap()
+        .expect("benign gate landed");
+    assert_eq!(landed.state, CheckpointState::Resolved);
+}
+
+// ---------------------------------------------------------------------------
+// (b) STORED-KIND / CAS refusal — benign wire kind resolving a reserved
+//     by-id anchor. Assert refusal AND the stored row stays Pending.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stored_reserved_anchor_not_resolvable_by_benign_wire_kind() {
+    let (_dir, conn) = fresh();
+
+    // The substrate created a PENDING reserved anchor locally (direct insert —
+    // the real substrate emission path, which bypasses this funnel).
+    let stored = pending(
+        "cas-witness",
+        ConditionType::AuditHeadWitness,
+        WITNESS_CHECKPOINT_NAMESPACE,
+    );
+    insert(&conn, &stored).unwrap();
+
+    // Attacker pushes a BENIGN-LOOKING resolution for that id — approval kind,
+    // an in-scope public namespace — trying to resolve the reserved anchor by
+    // id (the CAS keys on `(id, state)`, so the wire kind/namespace are not the
+    // write subject on the pending→resolved arm).
+    let benign_looking = inbound(
+        "cas-witness",
+        ConditionType::Approval,
+        "public/ok",
+        RESOLVED_AT,
+    );
+    assert_eq!(
+        apply_inbound_resolution(&conn, &benign_looking).unwrap(),
+        InboundResolutionOutcome::RefusedReservedKind,
+        "the STORED reserved kind must refuse a benign-looking by-id resolution"
+    );
+
+    // The stored anchor stays PENDING — nothing was resolved, the CAS never
+    // fired, no attestation was stamped.
+    let after = get(&conn, "cas-witness")
+        .unwrap()
+        .expect("stored anchor present");
+    assert_eq!(
+        after.state,
+        CheckpointState::Pending,
+        "the stored reserved anchor must remain unresolved"
+    );
+    assert_eq!(after.condition_type, ConditionType::AuditHeadWitness);
+    assert!(after.resolution.is_none());
+    assert!(after.resolved_by.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// (c) ALARM-SUPPRESSION PIN — with NO out-of-band witness pin enrolled (the
+//     default), an injected anchor must NOT move the witness verdict off its
+//     honest value. Pins the SUPPRESSION direction: the attacker's newer anchor
+//     is designed to DISPLACE the honest one (become the input
+//     `read_latest_witness_checkpoint` returns), and the refusal prevents that
+//     displacement BELOW the K1 pin — so it holds even in the no-pin posture
+//     where the Forged/K1 outcome has nothing to bite on.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn injected_witness_anchor_cannot_suppress_or_move_the_verdict() {
+    let (_dir, conn) = fresh();
+
+    // The DB's real chain heads (what verify would compare a pinned anchor to).
+    let db_signed_head = 128_i64;
+    let db_revisions_head = 64_i64;
+
+    // The substrate emitted its OWN honest witness anchor locally.
+    let honest = inbound(
+        "honest-witness",
+        ConditionType::AuditHeadWitness,
+        WITNESS_CHECKPOINT_NAMESPACE,
+        RESOLVED_AT,
+    );
+    insert(&conn, &honest).unwrap();
+
+    // No out-of-band pin enrolled (the default): the honest witness verdict
+    // WITHHOLDS (Unknown) — it cannot cryptographically anchor the pubkey.
+    let honest_latest = latest_resolved_witness(&conn).expect("honest anchor is latest");
+    assert_eq!(honest_latest.id, "honest-witness");
+    let honest_verdict = compute_witness_verdict(
+        Some(&honest_latest),
+        None, // NO enrolled pin — the default posture
+        db_signed_head,
+        db_revisions_head,
+        false,
+    );
+    assert!(
+        matches!(honest_verdict, WitnessCheck::Unknown),
+        "honest no-pin witness verdict withholds (Unknown), got {honest_verdict:?}"
+    );
+
+    // A REMOTE attacker /sync/push-es a NEWER resolved witness anchor to
+    // DISPLACE the honest one and become the substrate's witness input.
+    let forged = inbound(
+        "attacker-witness",
+        ConditionType::AuditHeadWitness,
+        WITNESS_CHECKPOINT_NAMESPACE,
+        RESOLVED_AT + 1_000, // newer → would out-rank the honest anchor
+    );
+    assert_eq!(
+        apply_inbound_resolution(&conn, &forged).unwrap(),
+        InboundResolutionOutcome::RefusedReservedKind
+    );
+
+    // The attacker anchor NEVER landed: the substrate's witness input is STILL
+    // the honest anchor, unmoved.
+    assert!(get(&conn, "attacker-witness").unwrap().is_none());
+    let latest_after = latest_resolved_witness(&conn).expect("witness input unchanged");
+    assert_eq!(
+        latest_after.id, "honest-witness",
+        "the injected anchor must NOT displace the substrate's witness input"
+    );
+
+    // The witness verdict — a pure function of that unchanged input — stays at
+    // its honest value. The injection moved it NEITHER toward a false-clean
+    // NotDetected (suppression) NOR anywhere else.
+    let verdict_after = compute_witness_verdict(
+        Some(&latest_after),
+        None,
+        db_signed_head,
+        db_revisions_head,
+        false,
+    );
+    assert!(
+        matches!(verdict_after, WitnessCheck::Unknown),
+        "post-injection verdict must equal the honest value (Unknown), got {verdict_after:?}"
+    );
+    assert!(
+        !matches!(verdict_after, WitnessCheck::NotDetected),
+        "the injected anchor must never be able to move the verdict to a clean pass"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// K3 parity note (compile-time assertion of the documented disposition).
+// ---------------------------------------------------------------------------
+
+/// The postgres `/sync/push` funnel never reaches an inbound-checkpoint APPLY
+/// (checkpoints are reported `unsupported_on_postgres`, #2464/#1936/#125), so
+/// there is no postgres twin of [`apply_inbound_resolution`] to poison — the
+/// postgres surface already refuses EVERY inbound checkpoint resolution, a
+/// strictly stronger disposition than the sqlite reserved-kind refusal proven
+/// above. This test documents the parity conclusion; the sqlite refusal is the
+/// complete closure for the reachable apply surface.
+#[test]
+fn pg_checkpoint_apply_is_unsupported_parity_note() {
+    // Nothing to exercise on postgres: the reserved-kind refusal lives in the
+    // sole apply funnel, which postgres never invokes. Kept as an explicit,
+    // named record of the K3 parity reasoning rather than a silent gap.
+}

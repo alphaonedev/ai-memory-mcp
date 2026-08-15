@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (federation ingress — refuse reserved-anchor kinds at the checkpoint chokepoint; L5 audit-signal poisoning, #2708-sibling / CWE-284)
+
+- **A wire-reachable `/sync/push` can no longer steer this node's audit-signal
+  spine.** The substrate EMITS and immediately resolves a small set of anchor
+  checkpoints — `audit_head_witness`, `governance_verdict`,
+  `governance_enforcement`, `epoch_advance`, `peer_head_entanglement`,
+  `re_anchor` — under reserved `_`-prefixed namespaces, and
+  `verify_audit_trail` reads the latest `_audit_witness` anchor as its
+  out-of-band witness input. Because FED-RQ-01 (#1936, `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG`
+  #125) federates RESOLVED checkpoints and `checkpoints::apply_inbound_resolution`
+  keys its CAS on `(id, state)` only, a REMOTE attacker with NO host access
+  could push a resolved reserved-kind anchor (first-landing, OR by-id under a
+  benign wire kind) and move the witness verdict — audit-signal poisoning.
+  A new pure predicate `federation::receive_auth::inbound_checkpoint_kind_authorized`
+  (backed by the completed SSOTs `RESERVED_SUBSTRATE_CONDITION_TYPES` +
+  `RESERVED_SUBSTRATE_NAMESPACES`, built from the canonical namespace
+  constants — `_audit_witness`, `_governance_verdict`, `_governance_enforcement`,
+  `_reanchor_ceremony`, `_peer_head_entanglement`) refuses when EITHER the
+  CLAIMED (wire) or STORED (by-id) checkpoint names a reserved anchor.
+  `apply_inbound_resolution` resolves the local row by id UNCONDITIONALLY and
+  fails CLOSED on any probe error, so the refusal closes both the wire-kind arm
+  and the stored-row/CAS arm at the sole apply funnel
+  (`InboundResolutionOutcome::RefusedReservedKind`; per-item skip, batch
+  survives). The SAME predicate closes the LOCAL creation path
+  (`memory_checkpoint_create`) so a reserved-kind PENDING anchor cannot be
+  minted by a caller either. Caller coordination kinds (`approval`,
+  `external_signal`, `condition_predicate`, `deadline`) federate exactly as
+  before. K3 parity: the postgres `/sync/push` funnel already reports
+  checkpoints `unsupported_on_postgres` and never reaches an apply, a strictly
+  stronger disposition. Regression coverage:
+  `tests/federation_reserved_anchor_l5.rs` (wire-kind refusal, stored-kind/CAS
+  refusal with the pending row proven unmoved, and the alarm-suppression pin
+  showing an injected anchor cannot displace the substrate's witness input in
+  the default no-pin posture) plus the `memory_checkpoint_create` unit test.
+
 ### Added (laptop federation reproducibility kit — `infra/federation-lab/`)
 
 - **A stranger can now stand up a hardened two-node ai-memory federation on
