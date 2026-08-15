@@ -78,6 +78,14 @@ MAP=(
   # not merely that the code is reached. Neutralization => is_clean stays true
   # under the pin => the guard test's dirty assertion goes RED.
   "compute_signature_verdict|body|SignatureCheck::Unenforced { checked: 0, unverified: 0 }|src/signed_events.rs|audit_signature_pin_l4|downgraded_lineage_row_under_pin_dirties_l4"
+  # L7 (PR-4, forensic-audit-trail wave) — the EXONERATION-authenticity gate.
+  # `return true` (the always-allow disposition) lets an UNAUTHENTICATED forensic
+  # watermark exonerate, defeating the L7 asymmetry. GUARD FIXTURE is the
+  # CLOSED GAP CLASS itself: a pin enrolled + an UNSIGNED watermark + a CLEAN
+  # chain (which a watermark-trusting verifier WOULD render NotDetected on both
+  # lanes). Honest guard => Unknown withheld on both lanes; mutated `return true`
+  # => NotDetected => the guard test's `assert_eq!(…, Unknown)` goes RED.
+  "audit_watermark_exoneration_authenticated|return|return true;|src/governance/audit.rs|audit_exoneration_asymmetry_l7|unauthenticated_watermark_under_pin_withholds_exoneration_l7"
 )
 
 # Apply MUTATION to function CTL in TARGET, per SHAPE.
