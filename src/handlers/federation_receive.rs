@@ -3542,7 +3542,7 @@ pub async fn sync_push(
                         // PR-1 / L5 (#2708-sibling, CWE-284): the CLAIMED wire or
                         // STORED by-id checkpoint names a substrate-RESERVED
                         // anchor (audit-head witness, governance verdict/
-                        // enforcement, epoch-advance, peer-head entanglement,
+                        // enforcement, peer-head entanglement,
                         // re-anchor). A wire-reachable `/sync/push` MUST NOT steer
                         // the substrate's own audit-signal spine — per-item skip,
                         // the batch survives.

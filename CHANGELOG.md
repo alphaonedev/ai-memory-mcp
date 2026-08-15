@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A wire-reachable `/sync/push` can no longer steer this node's audit-signal
   spine.** The substrate EMITS and immediately resolves a small set of anchor
   checkpoints — `audit_head_witness`, `governance_verdict`,
-  `governance_enforcement`, `epoch_advance`, `peer_head_entanglement`,
+  `governance_enforcement`, `peer_head_entanglement`,
   `re_anchor` — under reserved `_`-prefixed namespaces, and
   `verify_audit_trail` reads the latest `_audit_witness` anchor as its
   out-of-band witness input. Because FED-RQ-01 (#1936, `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG`

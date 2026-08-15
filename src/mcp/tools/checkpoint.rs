@@ -99,7 +99,7 @@ pub fn handle_checkpoint_create(
     // PR-1 / L5 (#2708-sibling, CWE-284) — close the LOCAL creation path too: a
     // caller must NOT be able to create a PENDING checkpoint whose kind/namespace
     // names a substrate-RESERVED anchor (audit-head witness, governance verdict/
-    // enforcement, epoch-advance, peer-head entanglement, re-anchor). The
+    // enforcement, peer-head entanglement, re-anchor). The
     // substrate emits its OWN anchors via `crate::checkpoints::insert` directly
     // (bypassing this handler), so this refusal never blocks a legitimate
     // substrate emission — only a caller minting a reserved-kind pending anchor
@@ -614,7 +614,7 @@ mod handler_tests {
 
     /// PR-1 / L5 (#2708-sibling, CWE-284) — a caller must NOT be able to CREATE a
     /// pending checkpoint whose kind/namespace names a substrate-reserved anchor
-    /// (audit-head witness, governance verdict/enforcement, epoch-advance,
+    /// (audit-head witness, governance verdict/enforcement,
     /// peer-head entanglement, re-anchor). Closing the local creation path in
     /// addition to the federation ingress means a reserved-kind pending anchor
     /// cannot be minted in the first place, so a later resolution has nothing to

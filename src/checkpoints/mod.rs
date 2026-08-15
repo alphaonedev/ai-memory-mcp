@@ -359,7 +359,7 @@ pub enum InboundResolutionOutcome {
     Conflict,
     /// PR-1 / L5 (#2708-sibling, CWE-284) — the CLAIMED (wire) or STORED (by-id)
     /// checkpoint names a substrate-RESERVED anchor kind/namespace (audit-head
-    /// witness, governance verdict/enforcement, epoch-advance, peer-head
+    /// witness, governance verdict/enforcement, peer-head
     /// entanglement, re-anchor). A wire-reachable `/sync/push` MUST NOT steer
     /// the substrate's own audit-signal spine — the resolution is refused
     /// (fail CLOSED) and NO write is performed. The receive loop counts it as

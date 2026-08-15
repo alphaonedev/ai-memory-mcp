@@ -6,11 +6,14 @@
 //!
 //! # The remote attack this closes
 //!
-//! The substrate itself EMITS and immediately resolves a small set of anchor
-//! checkpoints — audit-head witness, governance verdict/enforcement,
-//! epoch-advance, peer-head entanglement, re-anchor ceremony — under reserved
-//! `_`-prefixed namespaces. `verify_audit_trail` reads the LATEST
+//! The substrate itself EMITS and immediately resolves a small set of LOCAL-ONLY
+//! audit / identity anchor checkpoints — audit-head witness, governance
+//! verdict/enforcement, peer-head entanglement, re-anchor ceremony — under
+//! reserved `_`-prefixed namespaces. `verify_audit_trail` reads the LATEST
 //! `_audit_witness` / `audit_head_witness` checkpoint as its out-of-band anchor.
+//! (`EpochAdvance` is DELIBERATELY EXCLUDED — it is the freeze anchor designed to
+//! federate on the same transport, gated by the per-resolution signature gate;
+//! see `epoch_advance_freeze_anchor_still_federates`.)
 //!
 //! FED-RQ-01 (#1936, #125) federates RESOLVED checkpoints over `/sync/push`, and
 //! [`apply_inbound_resolution`] keys its CAS on `(id, state)` only. So a
@@ -146,13 +149,11 @@ fn reserved_ssot_is_complete() {
         "exactly the five reserved substrate namespaces"
     );
 
-    // Every substrate-emitted anchor kind is reserved; no caller coordination
-    // kind is.
+    // Every LOCAL-ONLY audit/identity trust anchor is reserved.
     for kind in [
         ConditionType::AuditHeadWitness,
         ConditionType::GovernanceVerdict,
         ConditionType::GovernanceEnforcement,
-        ConditionType::EpochAdvance,
         ConditionType::PeerHeadEntanglement,
         ConditionType::ReAnchor,
     ] {
@@ -162,15 +163,22 @@ fn reserved_ssot_is_complete() {
             kind.as_str()
         );
     }
+    // Caller coordination kinds are NOT reserved — AND `EpochAdvance` is NOT
+    // reserved either: it is the freeze anchor DESIGNED to federate on the
+    // FED-RQ-01 checkpoint-resolution transport (#1936/#125, #2650), gated by
+    // the per-resolution signature gate, not an audit-signal spine. Refusing it
+    // would break legitimate epoch federation
+    // (`tests/federation_1936_checkpoint_fed.rs`).
     for kind in [
         ConditionType::Approval,
         ConditionType::ExternalSignal,
         ConditionType::ConditionPredicate,
         ConditionType::Deadline,
+        ConditionType::EpochAdvance,
     ] {
         assert!(
             !RESERVED_SUBSTRATE_CONDITION_TYPES.contains(&kind),
-            "caller coordination kind {} must NOT be reserved",
+            "kind {} must NOT be reserved (caller coordination or legitimately federated)",
             kind.as_str()
         );
     }
@@ -270,6 +278,34 @@ fn benign_coordination_resolution_still_applies() {
         .unwrap()
         .expect("benign gate landed");
     assert_eq!(landed.state, CheckpointState::Resolved);
+}
+
+#[test]
+fn epoch_advance_freeze_anchor_still_federates() {
+    // `EpochAdvance` is DELIBERATELY EXCLUDED from the reserved set: it is the
+    // freeze anchor designed to ride the FED-RQ-01 checkpoint-resolution
+    // transport (#1936/#125, #2650), gated by the per-resolution signature gate
+    // rather than being an audit-signal spine. It lives in `_epoch`, not a
+    // reserved namespace, and MUST still apply through the ingress.
+    let (_dir, conn) = fresh();
+    let epoch = inbound(
+        "epoch-1",
+        ConditionType::EpochAdvance,
+        "_epoch",
+        RESOLVED_AT,
+    );
+    assert_eq!(
+        apply_inbound_resolution(&conn, &epoch).unwrap(),
+        InboundResolutionOutcome::Applied,
+        "the epoch-advance freeze anchor must still federate (not reserved)"
+    );
+    assert_eq!(
+        get(&conn, "epoch-1")
+            .unwrap()
+            .expect("epoch anchor landed")
+            .state,
+        CheckpointState::Resolved
+    );
 }
 
 // ---------------------------------------------------------------------------

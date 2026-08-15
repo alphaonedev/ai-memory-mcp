@@ -524,7 +524,8 @@ SSOTs) and `src/handlers/federation_receive.rs` (the
 probe + reserved-anchor gate). The change is **additive
 security-hardening**: it REFUSES an inbound `/sync/push` that would land a
 substrate-reserved checkpoint anchor (audit-head witness, governance
-verdict/enforcement, epoch-advance, peer-head entanglement, re-anchor),
+verdict/enforcement, peer-head entanglement, re-anchor; NOT the
+legitimately-federated epoch-advance freeze anchor),
 closing the L5 audit-signal-poisoning vector by which a wire-reachable
 remote peer with no host access could steer this node's witness verdict.
 It adds **NO new `AI_MEMORY_FED_*` identifier** and REMOVES **no**

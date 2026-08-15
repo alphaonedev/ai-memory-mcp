@@ -166,21 +166,31 @@ pub fn authorize_remote_checkpoint_resolution(
 }
 
 /// PR-1 / L5 (#2708-sibling, CWE-284) — the substrate-RESERVED checkpoint
-/// `condition_type` set: the anchor kinds the substrate itself EMITS and
-/// immediately resolves out-of-band (audit-head witness, governance
-/// verdict/enforcement, epoch-advance, peer-head entanglement, re-anchor
-/// ceremony). None is a caller/peer coordination gate — they are the
-/// audit-signal spine `verify_audit_trail` reads. A wire-reachable
-/// `/sync/push` that lands one of these into a substrate anchor location
-/// would let a REMOTE attacker (no host access) STEER the witness verdict —
-/// audit-signal poisoning. The caller-creatable coordination kinds
-/// (`approval`, `external_signal`, `condition_predicate`, `deadline`) are
-/// deliberately ABSENT and federate as before.
+/// `condition_type` set: the LOCAL-ONLY audit / identity trust anchors the
+/// substrate itself EMITS and immediately resolves out-of-band (audit-head
+/// witness, governance verdict/enforcement, peer-head entanglement, re-anchor
+/// ceremony) and that `verify_audit_trail` / the identity layer reads as a K1
+/// pin. None is a caller/peer coordination gate and none has a federation
+/// transport — so a wire-reachable `/sync/push` that lands one of these into a
+/// substrate anchor location would let a REMOTE attacker (no host access) STEER
+/// the witness verdict: audit-signal poisoning.
+///
+/// **Deliberately EXCLUDED — `ConditionType::EpochAdvance`.** Unlike the anchors
+/// above, the epoch-advance freeze anchor is DESIGNED to federate: it rides the
+/// FED-RQ-01 checkpoint-resolution transport (#1936/#125, ROADMAP §25.2; the
+/// `SyncPushWriteLane::Checkpoints` `ClaimedNamespace` freeze-anchor lane,
+/// #2650), it lives in `_epoch` (not a reserved namespace), and its authenticity
+/// is already gated by the per-resolution signature gate
+/// [`authorize_remote_checkpoint_resolution`] (`AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG`
+/// default-on) against the resolver's ENROLLED key. Refusing it here would break
+/// legitimate epoch federation (pinned by `tests/federation_1936_checkpoint_fed.rs`).
+///
+/// The caller-creatable coordination kinds (`approval`, `external_signal`,
+/// `condition_predicate`, `deadline`) are likewise ABSENT and federate as before.
 pub const RESERVED_SUBSTRATE_CONDITION_TYPES: &[crate::models::ConditionType] = &[
     crate::models::ConditionType::AuditHeadWitness,
     crate::models::ConditionType::GovernanceVerdict,
     crate::models::ConditionType::GovernanceEnforcement,
-    crate::models::ConditionType::EpochAdvance,
     crate::models::ConditionType::PeerHeadEntanglement,
     crate::models::ConditionType::ReAnchor,
 ];
