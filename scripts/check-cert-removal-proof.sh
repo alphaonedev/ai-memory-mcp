@@ -92,6 +92,14 @@ MAP=(
   # not merely that the code is reached. Neutralization => is_clean stays true
   # under the pin => the guard test's dirty assertion goes RED.
   "compute_signature_verdict|body|SignatureCheck::Unenforced { checked: 0, unverified: 0 }|src/signed_events.rs|audit_signature_pin_l4|downgraded_lineage_row_under_pin_dirties_l4"
+  # #2948 (forensic-audit-trail wave, honest-path lane) — the fn that routes the
+  # primary CREATE funnel's (`db::insert`) `ON CONFLICT DO UPDATE SET content =
+  # excluded.content` in-place overwrite through the signed `memory_revisions`
+  # ledger. Neutralized to the no-op `Ok(())` body (body shape — the whole
+  # emission is the control) so an armed upsert-merge stops appending its
+  # SUPERSEDE leaf => the lane test's `leaves.len() == 1` assertion goes RED,
+  # proving the #2948 wiring (not the shared emitter) is load-bearing.
+  "emit_upsert_supersede_leaf_if_enabled|body|Ok(())|src/storage/mod.rs|append_only_upsert_supersede_2948|armed_upsert_merge_emits_one_identity_only_supersede_leaf"
   # L7 (PR-4, forensic-audit-trail wave) — the EXONERATION-authenticity gate.
   # `return true` (the always-allow disposition) lets an UNAUTHENTICATED forensic
   # watermark exonerate, defeating the L7 asymmetry. GUARD FIXTURE is the

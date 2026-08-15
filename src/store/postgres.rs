@@ -11188,6 +11188,15 @@ impl PostgresStore {
             .await
             .map_err(|e| ReflectError::Database(format!("begin reflect tx: {e}")))?;
 
+        // APPEND-ONLY-SANCTIONED (#1823 G6 / #2948) — COW SUPERSEDE: probe the
+        // existing (title, namespace) row's version BEFORE the reflection upsert
+        // so a conflict-merge that overwrites durable content in place appends ONE
+        // identity-only SUPERSEDE leaf below. `None` when the spine is OFF or on a
+        // fresh INSERT. Same tx as the upsert.
+        let prior_version = pg_probe_upsert_prior_version(&mut tx, &input.title, &target_namespace)
+            .await
+            .map_err(|e| ReflectError::Database(format!("probe reflect prior version: {e}")))?;
+
         // #1383 — extract the `mentioned_entity_id` denormalisation
         // from the candidate row (`metadata.entity_id` or `[entity:X]`
         // title marker, per `extract_mentioned_entity_id`). Pre-#1383
@@ -11307,6 +11316,24 @@ impl PostgresStore {
         reconcile_envelope_owner(&mut *tx, &actual_id, &candidate.content, &reflect_seal)
             .await
             .map_err(|e| ReflectError::Database(e.to_string()))?;
+
+        // v1.0.0 #2948 — record the COW SUPERSEDE when the reflection upsert
+        // overwrote an existing row's durable content in place. `None` on a fresh
+        // reflection (no prior row) or when the spine is OFF. Identity-only, same
+        // tx; agent_id is the reflecting caller's provenance marker.
+        if let Some(prior_version) = prior_version {
+            pg_emit_revision_leaf_if_enabled(
+                &mut tx,
+                &actual_id,
+                crate::revisions::RecordKind::Supersede,
+                Some(prior_version),
+                &target_namespace,
+                Some(crate::storage::memory_agent_id(&candidate)).filter(|s| !s.is_empty()),
+                &candidate.updated_at,
+            )
+            .await
+            .map_err(|e| ReflectError::Database(format!("append reflect supersede leaf: {e}")))?;
+        }
 
         // Write each `reflects_on` link inside the same tx.
         for src_id in &input.source_ids {
@@ -12894,6 +12921,28 @@ async fn pg_emit_revision_leaf_if_enabled(
         },
     )
     .await
+}
+
+/// v1.0.0 #2948 — postgres twin of the sqlite `insert_inner` COW-supersede
+/// version pre-probe. When the append-only spine is armed, returns the existing
+/// `(title, namespace)` row's `version` BEFORE an upsert so the caller can append
+/// ONE identity-only SUPERSEDE leaf iff the upsert lands on the conflict arm (an
+/// in-place content overwrite). `None` when the spine is OFF (default → no probe,
+/// byte-identical) or when no prior row exists (a fresh INSERT). MUST run in the
+/// SAME tx as the upsert (caller-held) so the probe cannot race the write.
+async fn pg_probe_upsert_prior_version(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    title: &str,
+    namespace: &str,
+) -> Result<Option<i64>, sqlx::Error> {
+    if !crate::config::append_only_enabled() {
+        return Ok(None);
+    }
+    sqlx::query_scalar::<_, i64>("SELECT version FROM memories WHERE title = $1 AND namespace = $2")
+        .bind(title)
+        .bind(namespace)
+        .fetch_optional(&mut **tx)
+        .await
 }
 
 /// v0.9.0 G13-mem (#1859, COND 1) — the postgres half of the SINGLE
@@ -15791,6 +15840,16 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("begin store tx", e))?;
 
+        // APPEND-ONLY-SANCTIONED (#1823 G6 / #2948) — COW SUPERSEDE: probe the
+        // existing (title, namespace) row's version BEFORE the upsert so a
+        // conflict-merge that overwrites durable content in place (`content =
+        // EXCLUDED.content` below) appends ONE identity-only SUPERSEDE leaf. `None`
+        // when the spine is OFF or on a fresh INSERT (no prior row). Same tx.
+        let prior_version =
+            pg_probe_upsert_prior_version(&mut tx, &memory.title, &memory.namespace)
+                .await
+                .map_err(|e| to_store_err("probe upsert prior version", e))?;
+
         // Upsert contract matches SQLite: `ON CONFLICT (title, namespace)`.
         // Backed by the UNIQUE INDEX `memories_title_ns_uidx` in
         // postgres_schema.sql. Fix for blocker #294.
@@ -16030,6 +16089,24 @@ impl MemoryStore for PostgresStore {
         // can observe it.
         reconcile_envelope_owner(&mut *tx, &id, &memory.content, &store_seal).await?;
 
+        // v1.0.0 #2948 — record the COW SUPERSEDE when the upsert overwrote an
+        // existing row's durable content in place. Reached only on success; a
+        // fresh INSERT leaves `prior_version` None (no leaf). Identity-only,
+        // same tx; agent_id is the incoming memory's provenance marker.
+        if let Some(prior_version) = prior_version {
+            pg_emit_revision_leaf_if_enabled(
+                &mut tx,
+                &id,
+                crate::revisions::RecordKind::Supersede,
+                Some(prior_version),
+                &memory.namespace,
+                Some(crate::storage::memory_agent_id(memory)).filter(|s| !s.is_empty()),
+                &memory.updated_at,
+            )
+            .await
+            .map_err(|e| to_store_err("append supersede revision leaf", e))?;
+        }
+
         // v0.7.0.1 G1 / v0.7.0 #1156 — record quota usage in the same
         // tx against the per-namespace accounting row (v50 PK
         // extension). Best-effort resolution of agent_id; a missing
@@ -16165,6 +16242,30 @@ impl MemoryStore for PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("begin store_batch tx", e))?;
+
+        // APPEND-ONLY-SANCTIONED (#1823 G6 / #2948) — COW SUPERSEDE (bulk). When
+        // the append-only spine is armed, probe the pre-upsert version of every
+        // DISTINCT surviving (title, namespace) key BEFORE the multi-row INSERT,
+        // so each key whose row already existed (a conflict-merge that overwrites
+        // content in place) gets EXACTLY ONE identity-only SUPERSEDE leaf below.
+        // Inert (empty map, zero reads) when the spine is OFF — byte-identical.
+        // A per-key loop over the deduped `keep` set is deliberately simpler than
+        // one `IN (...)` scan: armed-only, correctness over micro-perf.
+        let mut batch_prior_versions: std::collections::HashMap<(String, String), i64> =
+            std::collections::HashMap::new();
+        if crate::config::append_only_enabled() {
+            for idx in keep.iter().copied() {
+                let memory = &memories[idx];
+                if let Some(v) =
+                    pg_probe_upsert_prior_version(&mut tx, &memory.title, &memory.namespace)
+                        .await
+                        .map_err(|e| to_store_err("probe store_batch prior version", e))?
+                {
+                    batch_prior_versions
+                        .insert((memory.title.clone(), memory.namespace.clone()), v);
+                }
+            }
+        }
 
         // v1.0.0 #2383 (N1) — resolve every row's RETAINED seal identity in ONE
         // round trip BEFORE the synchronous `push_values` closure (which cannot
@@ -16468,6 +16569,34 @@ impl MemoryStore for PostgresStore {
             .await?;
         }
 
+        // v1.0.0 #2948 — append ONE identity-only SUPERSEDE leaf per surviving
+        // key that overwrote an existing row's durable content in place. Keyed
+        // on the pre-upsert probe above; `id_by_key` resolves the surviving row's
+        // id (the EXISTING row's id on a conflict-merge). Same tx as the batch
+        // INSERT; agent_id is each incoming row's provenance marker.
+        if !batch_prior_versions.is_empty() {
+            for idx in keep.iter().copied() {
+                let memory = &memories[idx];
+                let key = (memory.title.clone(), memory.namespace.clone());
+                let (Some(prior_version), Some(id)) =
+                    (batch_prior_versions.get(&key), id_by_key.get(&key))
+                else {
+                    continue;
+                };
+                pg_emit_revision_leaf_if_enabled(
+                    &mut tx,
+                    id,
+                    crate::revisions::RecordKind::Supersede,
+                    Some(*prior_version),
+                    &memory.namespace,
+                    Some(crate::storage::memory_agent_id(memory)).filter(|s| !s.is_empty()),
+                    &memory.updated_at,
+                )
+                .await
+                .map_err(|e| to_store_err("append store_batch supersede leaf", e))?;
+            }
+        }
+
         // Quota: one upsert per distinct (quota_agent_id, namespace),
         // counting every input row (duplicates included — each was a
         // caller-requested write, matching the sequential `store` count).
@@ -16635,6 +16764,16 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("begin capture_turn tx", e))?;
 
+        // APPEND-ONLY-SANCTIONED (#1823 G6 / #2948) — COW SUPERSEDE: probe the
+        // existing (title, namespace) row's version BEFORE the upsert so a
+        // conflict-merge that overwrites durable content in place appends ONE
+        // identity-only SUPERSEDE leaf below. `None` when the spine is OFF or on
+        // a fresh INSERT. Same tx as the upsert.
+        let prior_version =
+            pg_probe_upsert_prior_version(&mut tx, &memory.title, &memory.namespace)
+                .await
+                .map_err(|e| to_store_err("probe capture_turn prior version", e))?;
+
         // v0.9.0 G8 (#1825) — the L4 capture mints a genesis row, so it stamps
         // its own content-id from the (plaintext) memory identity. OMITTED
         // from the DO UPDATE SET below: a surviving upsert-merge row keeps its
@@ -16767,6 +16906,23 @@ impl MemoryStore for PostgresStore {
         // `metadata.agent_id`. Repairs the concurrent-first-creation race the
         // pre-read cannot close under READ COMMITTED.
         reconcile_envelope_owner(&mut *tx, &inserted_id, &memory.content, &capture_seal).await?;
+
+        // v1.0.0 #2948 — record the COW SUPERSEDE when the L4 upsert overwrote an
+        // existing row's durable content in place. `None` on a fresh capture (no
+        // prior row) or when the spine is OFF. Identity-only, same tx.
+        if let Some(prior_version) = prior_version {
+            pg_emit_revision_leaf_if_enabled(
+                &mut tx,
+                &inserted_id,
+                crate::revisions::RecordKind::Supersede,
+                Some(prior_version),
+                &memory.namespace,
+                Some(crate::storage::memory_agent_id(memory)).filter(|s| !s.is_empty()),
+                &memory.updated_at,
+            )
+            .await
+            .map_err(|e| to_store_err("append capture_turn supersede leaf", e))?;
+        }
 
         // `transcript_line_dedup` row. `ON CONFLICT (sha256) DO NOTHING`
         // guards the rare concurrent-duplicate race that READ COMMITTED
@@ -16928,6 +17084,16 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("begin recover_turn tx", e))?;
 
+        // APPEND-ONLY-SANCTIONED (#1823 G6 / #2948) — COW SUPERSEDE: probe the
+        // existing (title, namespace) row's version BEFORE the upsert so a
+        // conflict-merge that overwrites durable content in place appends ONE
+        // identity-only SUPERSEDE leaf below. `None` when the spine is OFF or on
+        // a fresh INSERT. Same tx as the upsert.
+        let prior_version =
+            pg_probe_upsert_prior_version(&mut tx, &memory.title, &memory.namespace)
+                .await
+                .map_err(|e| to_store_err("probe recover_turn prior version", e))?;
+
         // v0.9.0 G8 (#1825) — the L2 recovery mints a genesis row, so it
         // stamps its own content-id from the (plaintext) memory identity.
         // OMITTED from the DO UPDATE SET below: a surviving upsert-merge row
@@ -17077,6 +17243,23 @@ impl MemoryStore for PostgresStore {
         // `metadata.agent_id`. Repairs the concurrent-first-creation race the
         // pre-read cannot close under READ COMMITTED.
         reconcile_envelope_owner(&mut *tx, &inserted_id, &memory.content, &recover_seal).await?;
+
+        // v1.0.0 #2948 — record the COW SUPERSEDE when the L2 recovery upsert
+        // overwrote an existing row's durable content in place. `None` on a fresh
+        // recovery (no prior row) or when the spine is OFF. Identity-only, same tx.
+        if let Some(prior_version) = prior_version {
+            pg_emit_revision_leaf_if_enabled(
+                &mut tx,
+                &inserted_id,
+                crate::revisions::RecordKind::Supersede,
+                Some(prior_version),
+                &memory.namespace,
+                Some(crate::storage::memory_agent_id(memory)).filter(|s| !s.is_empty()),
+                &memory.updated_at,
+            )
+            .await
+            .map_err(|e| to_store_err("append recover_turn supersede leaf", e))?;
+        }
 
         tx.commit()
             .await
@@ -21610,6 +21793,17 @@ impl MemoryStore for PostgresStore {
         // `agent_id` (#1784) while taking the incoming envelope, so an
         // incoming-keyed seal left the durable row unreadable. Same tx as the
         // upsert, so the pre-read + write are one atomic unit.
+        // APPEND-ONLY-SANCTIONED (#1823 G6 / #2948) — COW SUPERSEDE on the
+        // DESTINATION row: re-consolidating at an existing (title, namespace)
+        // overwrites that row's durable content in place via the `content =
+        // EXCLUDED.content` ON CONFLICT arm below. Probe its version BEFORE the
+        // upsert so we can append ONE identity-only SUPERSEDE leaf for the
+        // destination memory_id — DISTINCT from the per-SOURCE CONSOLIDATE leaves
+        // (different memory_id, so no double count). `None` on a fresh consolidate
+        // (no prior row) or when the spine is OFF. Same tx.
+        let dest_prior_version = pg_probe_upsert_prior_version(&mut tx, title, namespace)
+            .await
+            .map_err(|e| to_store_err("probe consolidate dest prior version", e))?;
         let consolidate_seal = seal_content_for_upsert(&mut *tx, &candidate).await?;
         let (consolidate_content, consolidate_envelope) =
             (consolidate_seal.content(), consolidate_seal.envelope());
@@ -21702,6 +21896,26 @@ impl MemoryStore for PostgresStore {
         )
         .await?;
         let new_id = inserted_id;
+
+        // v1.0.0 #2948 — the destination in-place content overwrite is a COW
+        // SUPERSEDE distinct from the per-source CONSOLIDATE leaves below. Emit
+        // ONE identity-only SUPERSEDE leaf for the destination row ONLY when a
+        // prior row existed (a re-consolidate overwrote it in place); a fresh
+        // consolidate leaves `dest_prior_version` None. Same tx; agent_id is the
+        // consolidator's provenance marker (matching the CONSOLIDATE leaves).
+        if let Some(prior_version) = dest_prior_version {
+            pg_emit_revision_leaf_if_enabled(
+                &mut tx,
+                &new_id,
+                crate::revisions::RecordKind::Supersede,
+                Some(prior_version),
+                namespace,
+                Some(consolidator_agent_id).filter(|s| !s.is_empty()),
+                &candidate.updated_at,
+            )
+            .await
+            .map_err(|e| to_store_err("append consolidate dest supersede leaf", e))?;
+        }
 
         // Delete source rows.
         //
@@ -27162,6 +27376,18 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("begin store tx", e))?;
 
+        // APPEND-ONLY-SANCTIONED (#1823 G6 / #2948) — COW SUPERSEDE: probe the
+        // existing (title, namespace) row's version BEFORE the upsert. On the
+        // Merge arm a conflict overwrites content in place (and a same-id
+        // RestoreSameId re-store does too); the Refuse / different-id
+        // RestoreSameId arms return the typed Conflict below WITHOUT overwriting,
+        // so they never reach the leaf emit. `None` when the spine is OFF or on a
+        // fresh INSERT. Same tx.
+        let prior_version =
+            pg_probe_upsert_prior_version(&mut tx, &memory.title, &memory.namespace)
+                .await
+                .map_err(|e| to_store_err("probe upsert prior version", e))?;
+
         // #1383 — same denormalisation rationale as the regular
         // `store()` path above. Reflection-kind rows passed through
         // `store_with_embedding` (the recall-hybrid hot path) must
@@ -27410,6 +27636,24 @@ impl PostgresStore {
         // `metadata.agent_id`. Repairs the concurrent-first-creation race the
         // pre-read cannot close under READ COMMITTED.
         reconcile_envelope_owner(&mut *tx, &id, &memory.content, &embed_seal).await?;
+
+        // v1.0.0 #2948 — record the COW SUPERSEDE for an in-place content
+        // overwrite (a Merge conflict-merge, or a same-id RestoreSameId re-store).
+        // A fresh INSERT leaves `prior_version` None; the Refuse / foreign-id
+        // RestoreSameId arms already returned Conflict above. Identity-only, same tx.
+        if let Some(prior_version) = prior_version {
+            pg_emit_revision_leaf_if_enabled(
+                &mut tx,
+                &id,
+                crate::revisions::RecordKind::Supersede,
+                Some(prior_version),
+                &memory.namespace,
+                Some(crate::storage::memory_agent_id(memory)).filter(|s| !s.is_empty()),
+                &memory.updated_at,
+            )
+            .await
+            .map_err(|e| to_store_err("append supersede revision leaf", e))?;
+        }
 
         // v0.7.0 #1156 — per-namespace quota dimension (v50 PK).
         let quota_agent_id = resolve_quota_agent_id(ctx, &memory.metadata);
