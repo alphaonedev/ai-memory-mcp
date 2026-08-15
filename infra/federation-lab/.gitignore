@@ -1,0 +1,13 @@
+# Everything the lab creates at runtime lives under run/ and is disposable:
+# certs, private keys, node databases, daemon logs, evidence captures.
+# `run.sh` recreates it from scratch on every invocation and removes it on the
+# way out (unless --keep). Nothing here is durable truth.
+run/
+
+# Slices of a REAL local corpus, built by tools/make-local-slice.sh. These are
+# verbatim extracts of whatever corpus you pointed it at, and this repository
+# is PUBLIC — committing one would redistribute that corpus's text under this
+# project's name and carry along whatever identifiers its rows happen to hold.
+# The committed fixture is SYNTHETIC (sample/lab-corpus.json); a real slice
+# stays on your machine. This ignore rule is the mechanical half of that rule.
+sample/local/
