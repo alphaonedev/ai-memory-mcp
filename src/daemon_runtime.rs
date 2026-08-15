@@ -1144,6 +1144,31 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
     // `PostgresStore::link_internal` reads it at write time. Default sync =
     // byte-identical inline AGE MERGE; harmless on sqlite/mcp/CLI paths.
     crate::config::set_age_projection_mode(resolved_storage.age_projection_mode);
+    // v0.9.0 G6 (#1823; production boot seed WIRED by PR-2 hardening) — seed
+    // the process-wide append-only revision-spine flag from the resolved
+    // `[storage]` config (env `AI_MEMORY_APPEND_ONLY` > `[storage].append_only`
+    // > compiled default `false`). Pre-PR-2 `crate::config::set_append_only`
+    // had ZERO non-test callers, so `AI_MEMORY_APPEND_ONLY=1` /
+    // `[storage].append_only=true` were BOTH inert in every shipped binary and
+    // every `append_only_enabled()` branch site (storage / revisions /
+    // store::postgres) never ran in production. Once seeded, supersede/erase
+    // emit signed identity-only `memory_revisions` leaves (capture-then-compact
+    // / COW). Mirrors the `set_db_mmap_size` / `set_age_projection_mode` /
+    // lineage-DAG seeds. The RESOLVED default is `false` AND the unseeded atomic
+    // default is ALSO `false`, so a default deployment is byte-identical (unlike
+    // the lineage master flag, whose resolved `true` inverts the unseeded
+    // `false`). `#[cfg(not(test))]`-gated for TEST ISOLATION ONLY, exactly like
+    // the lineage-DAG seed below — the lib's own `cargo test --lib` build skips
+    // it so a `run()` dispatch test cannot flip the behavior-changing atomic
+    // under a concurrent storage/revisions unit test; the production binary AND
+    // every `tests/` integration test link WITHOUT `cfg(test)` and exercise the
+    // real seed. The `main.rs` #1889 pre-runtime seed additionally arms a CLI
+    // process BEFORE dispatch (the offline-write surface). Pinned by
+    // `tests/append_only_boot_seed.rs`.
+    #[cfg(not(test))]
+    crate::config::set_append_only(resolved_storage.append_only);
+    #[cfg(test)]
+    let _ = resolved_storage.append_only;
     // v0.9.0 G13-mem (#1859; production boot seed WIRED by #2233) — seed the
     // process-wide lineage-DAG flags from the resolved `[storage]` config
     // (env `AI_MEMORY_LINEAGE_DAG` / `AI_MEMORY_CONSOLIDATE_TOMBSTONE_SOURCES`

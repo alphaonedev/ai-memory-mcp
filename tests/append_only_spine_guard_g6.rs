@@ -3,33 +3,54 @@
 
 //! v0.9.0 G6 (#1823) — the append-only spine STATIC GUARD.
 //!
-//! This source-static test enumerates every in-place memory MUTATION site
-//! that the append-only spine (step 2+) must route through the signed
-//! `memory_revisions` ledger:
+//! This source-static test enumerates every production memory MUTATION site
+//! that DESTROYS durable authored content and so must route through the signed
+//! `memory_revisions` ledger (each enclosing `fn` carrying the
+//! `// APPEND-ONLY-SANCTIONED` marker). The invariant protects exactly ONE
+//! thing — the operator-authored memory TEXT (`content` and `title`), the
+//! durable source of truth. The three content-DESTROYING SQL shapes:
 //!
 //!   * P1 — `DELETE FROM memories` (a physical delete of a memory row).
-//!   * P2 — `UPDATE memories SET ... content = ...` (an in-place content
-//!     rewrite — the append-only invariant forbids mutating content in
-//!     place; a new version must be written and the prior one archived).
+//!   * P2 — `UPDATE memories SET ... (content|title) = ...` (an in-place
+//!     rewrite of durable authored TEXT — a new version must be written and
+//!     the prior one archived, never mutated in place). PR-2 (#1823) widened
+//!     the assignment probe from `content` only to `content` OR `title`.
+//!   * P3 — `INSERT OR REPLACE INTO memories` (PR-2 #1823) — REPLACE deletes
+//!     the conflicting row before re-inserting, annihilating the prior
+//!     version's content OUTSIDE the ledger; a bypass P1 + P2 do not catch.
+//!
+//! DELIBERATELY OUT OF SCOPE (the North-Star content-vs-derived-artifact line):
+//! a bare new-row `INSERT INTO memories` destroys nothing, and an in-place
+//! `UPDATE` of ONLY disposable derived / pointer / temporal columns
+//! (`metadata`, `embedding*`, `lifecycle_state`, `*_cid`, `valid_*`,
+//! `access_count`, `expires_at`, `priority`, `tier`, `atom_*`, `memory_kind`,
+//! `version`, `confidence*`, …) is regenerable-or-non-destructive. Widening
+//! the ENFORCED guard to the literal
+//! "any UPDATE / bare INSERT" flags 65 such legitimate production sites (the
+//! primary `db::insert` upsert, `set_row_metadata`, recall touch/promote,
+//! embedding backfill, lifecycle tombstones, every postgres store write) and
+//! reds CI while protecting nothing — so it is scoped to durable-TEXT
+//! destruction (5-agent vote `4d3ea1c5`, PR-2). DOCUMENTED RESIDUAL: an
+//! `INSERT … ON CONFLICT … DO UPDATE SET content = …` on the sanctioned create
+//! funnel and a future durable-TEXT column beyond `content`/`title` are NOT
+//! caught by these three shapes.
 //!
 //! A site is considered ROUTED (sanctioned) when its enclosing `fn`
 //! carries the `// APPEND-ONLY-SANCTIONED` marker on raw source. The two
 //! file-local `SQL_DELETE_MEMORY_BY_ID` const definitions
 //! (`src/store/postgres.rs`, `src/storage/mod.rs`) are allow-listed —
 //! they are the single SQL SSOT the sanctioned delete paths reference, not
-//! independent call sites.
+//! independent call sites. `#[cfg(test)]` scope is excluded (test code is
+//! never compiled into the daemon).
 //!
-//! STEP 1 STATUS: this test MUST CURRENTLY FAIL — no site has been
-//! converted yet. It is therefore `#[ignore]`d so it does not break CI
-//! during step 1. Run it with `--ignored --nocapture` to print the
-//! AUTHORITATIVE, sorted un-routed worklist that step 2+ consumes:
+//! STATUS: ENFORCED in CI. Site conversion (step 2+) is complete and the
+//! worklist is drained to empty; a new un-routed content-destroying mutation
+//! re-reds the [`append_only_spine_all_memory_mutations_routed`] assertion.
+//! Print the (currently empty) worklist with:
 //!
 //! ```text
-//! cargo test --test append_only_spine_guard_g6 -- --ignored --nocapture
+//! cargo test --test append_only_spine_guard_g6 -- --nocapture
 //! ```
-//!
-//! UN-IGNORE this test when site conversion (step 2+) is complete and the
-//! worklist has drained to empty.
 
 use std::path::{Path, PathBuf};
 
@@ -144,10 +165,12 @@ fn enclosing_fn_has_marker(raw_lines: &[&str], hit_line: usize) -> bool {
 }
 
 /// Hand-rolled match for the P2 pattern
-/// `UPDATE\s+memories\s+SET\b[^;]*\bcontent\b\s*=` over comment-stripped
-/// source (the `regex` crate is not a dependency). Returns the byte
-/// offsets of each match start.
-fn p2_update_memories_content(stripped: &str) -> Vec<usize> {
+/// `UPDATE\s+memories\s+SET\b[^;]*(\bcontent\b|\btitle\b)\s*=` over
+/// comment-stripped source (the `regex` crate is not a dependency). Returns
+/// the byte offsets of each match start. PR-2 (#1823) widened the assignment
+/// probe from `content` only to any durable AUTHORED-TEXT column
+/// (`content` OR `title`) — see [`stmt_rewrites_durable_text`].
+fn p2_update_memories_durable_text(stripped: &str) -> Vec<usize> {
     let mut hits = Vec::new();
     let hay = stripped;
     let mut from = 0;
@@ -179,29 +202,29 @@ fn p2_update_memories_content(stripped: &str) -> Vec<usize> {
         {
             continue;
         }
-        // [^;]* up to the statement terminator, then \bcontent\b\s*=
+        // [^;]* up to the statement terminator, then (\bcontent\b|\btitle\b)\s*=
         let stmt_end = after_set.find(';').unwrap_or(after_set.len());
-        if stmt_has_content_assignment(&after_set[..stmt_end]) {
+        if stmt_rewrites_durable_text(&after_set[..stmt_end]) {
             hits.push(start);
         }
     }
     hits
 }
 
-/// Within a single statement body, is there a `content` word (with both
-/// boundaries) followed by optional whitespace and `=`?
-fn stmt_has_content_assignment(stmt: &str) -> bool {
+/// Within a single statement body, is there an assignment to `column`
+/// (the word with both boundaries, followed by optional whitespace and `=`)?
+fn stmt_assigns_column(stmt: &str, column: &str) -> bool {
     let bytes = stmt.as_bytes();
     let mut from = 0;
-    while let Some(rel) = stmt[from..].find("content") {
+    while let Some(rel) = stmt[from..].find(column) {
         let idx = from + rel;
-        from = idx + "content".len();
+        from = idx + column.len();
         let before_ok = idx == 0 || {
             let b = bytes[idx - 1];
             !(b.is_ascii_alphanumeric() || b == b'_')
         };
-        let after = &stmt[idx + "content".len()..];
-        // boundary after `content`
+        let after = &stmt[idx + column.len()..];
+        // boundary after the column word
         let boundary_ok = after
             .chars()
             .next()
@@ -214,6 +237,25 @@ fn stmt_has_content_assignment(stmt: &str) -> bool {
         }
     }
     false
+}
+
+/// PR-2 (#1823) — does the statement rewrite a durable AUTHORED-TEXT column
+/// (`content` OR `title`)? These are the operator-authored bytes the
+/// append-only invariant protects. Every OTHER `memories` column — `metadata`,
+/// `embedding` / `embedding_dim` / `embedding_space`, `lifecycle_state`,
+/// `cid` / `cid_genesis`, `valid_from` / `valid_until`, `access_count`,
+/// `expires_at`, `last_accessed_at`, `priority`, `tier`, `atom_of` /
+/// `atomised_into`, `mentioned_entity_id`, `memory_kind`, `version`,
+/// `confidence*`, `encrypted_envelope` — is a DISPOSABLE derived / pointer /
+/// temporal artifact regenerable-from-text or non-destructive under the North
+/// Star, so an in-place update of ONLY those columns destroys nothing of
+/// record and is deliberately OUT of the invariant's scope (widening the guard
+/// to "any UPDATE" would flag 65 such legitimate sites — the primary
+/// `db::insert` upsert, `set_row_metadata`, recall touch/promote, embedding
+/// backfill, lifecycle tombstones, every postgres store write — and red CI
+/// while protecting nothing; 5-agent vote `4d3ea1c5`).
+fn stmt_rewrites_durable_text(stmt: &str) -> bool {
+    stmt_assigns_column(stmt, "content") || stmt_assigns_column(stmt, "title")
 }
 
 /// Brace-counted line spans (`[start, end]`, 0-based, inclusive) of every
@@ -291,9 +333,10 @@ struct UnroutedSite {
 fn collect_unrouted_sites() -> Vec<UnroutedSite> {
     let src_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
 
-    // P1 needle assembled at runtime (split/concat) so this guard file's
+    // P1 / P3 needles assembled at runtime (split/concat) so this guard file's
     // own literal cannot self-trip a future copy of the guard.
     let p1_needle = format!("{}{}", "DELETE FROM", " memories");
+    let p3_needle = format!("{}{}", "INSERT OR REPLACE", " INTO memories");
 
     let mut sites: Vec<UnroutedSite> = Vec::new();
 
@@ -348,9 +391,33 @@ fn collect_unrouted_sites() -> Vec<UnroutedSite> {
             record(off, &p1_needle);
         }
 
-        // P2 — in-place content rewrites.
-        for off in p2_update_memories_content(&stripped) {
-            record(off, "UPDATE memories SET ... content =");
+        // P2 — in-place durable-TEXT rewrites (content OR title).
+        for off in p2_update_memories_durable_text(&stripped) {
+            record(off, "UPDATE memories SET ... content|title =");
+        }
+
+        // P3 (PR-2 #1823) — row-DESTROYING `INSERT OR REPLACE INTO memories`.
+        // REPLACE deletes the conflicting row before re-inserting, annihilating
+        // the prior version's content OUTSIDE the ledger — a bypass P1 (bare
+        // DELETE) + P2 (in-place UPDATE) miss. A bare `INSERT INTO memories`
+        // (new row) and an `INSERT … ON CONFLICT … DO UPDATE` upsert are NOT
+        // flagged: a new row destroys nothing, and the ON-CONFLICT create
+        // funnel is the documented residual (see the module header).
+        let mut from = 0;
+        while let Some(rel) = stripped[from..].find(&p3_needle) {
+            let off = from + rel;
+            from = off + p3_needle.len();
+            // Boundary after `memories` so `memories_fts` / `memory_*` cannot
+            // false-trip (tighter than P1's simple-needle precedent).
+            let after = &stripped[off + p3_needle.len()..];
+            if after
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            {
+                continue;
+            }
+            record(off, "INSERT OR REPLACE INTO memories");
         }
     });
 
