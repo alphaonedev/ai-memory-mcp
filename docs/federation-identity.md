@@ -299,7 +299,10 @@ quorum:
   width: 2                           # W-of-N; >= MIN_QUORUM_WIDTH (1)
 
 enforcement:
-  require_sig: true                  # maps to AI_MEMORY_FED_REQUIRE_SIG
+  require_sig: true                  # tri-state; OMIT = unmanaged, not
+                                     # permissive. Maps to
+                                     # AI_MEMORY_FED_REQUIRE_SIG.
+  # disable_reason: <why>            # REQUIRED with `require_sig: false`
 ```
 
 Field reference:
@@ -329,12 +332,38 @@ Field reference:
 - **`enforcement.require_sig`** — the reconciler's DESIRED strict-enforcement
   state (whether receivers reject unsigned posts); maps to the runtime gate
   `AI_MEMORY_FED_REQUIRE_SIG`, which is **fail-closed / ON by default at
-  v1.0.0** (env #29). This inventory field's struct-default is `false`, so an
-  inventory that OMITS it declares *desired = permissive* — and the reconciler
-  then emits `DisableStrictEnforcement`, **actively downgrading the fail-closed
-  default** rather than "keeping" it. Set `require_sig: true` to match the
-  secure default; leave it `false` only inside a deliberate staged-enrollment
-  window (see §9). The struct-default footgun is tracked in #2975.
+  v1.0.0** (env #29). It is a **tri-state** (`Option<bool>`, #2975):
+
+  | value | meaning | reconciler plans |
+  |---|---|---|
+  | *omitted* | **unmanaged** — the inventory declines to govern enforcement | NOTHING, in either direction |
+  | `true` | desired strict | `EnableStrictEnforcement`, gated on all nodes observed sign-capable |
+  | `false` | desired permissive (requires `disable_reason`) | `DisableStrictEnforcement`, immediately |
+
+  Omission is **not** "desired permissive". Deleting the line is a no-op, so
+  an inventory that says nothing can never downgrade the fail-closed runtime
+  default. Omitting the whole `enforcement:` block and writing
+  `enforcement: {}` are the same state.
+
+- **`enforcement.disable_reason`** — the second key of the two-key turn. An
+  explicit `require_sig: false` MUST be accompanied by a non-empty
+  `disable_reason` or the inventory **fails to load** with
+  `inventory_enforcement_disable_reason_missing`. The reverse is also a load
+  error (`inventory_enforcement_disable_reason_without_disable`): a
+  `disable_reason` left behind after the downgrade was reverted would silently
+  pre-authorize the next one, so stale acknowledgements are rejected. Both
+  checks live at inventory load/validate — the reconciler never suppresses a
+  planned action, because a suppressed action would make
+  `ReconcilePlan::is_noop()` falsely report convergence.
+
+  Net effect: weakening the fleet requires **adding two greppable lines**,
+  never deleting one.
+
+  ```yaml
+  enforcement:
+    require_sig: false
+    disable_reason: staged peer key enrollment window, ticket OPS-42
+  ```
 
 ---
 
@@ -437,6 +466,21 @@ state is a no-op (`ReconcilePlan::is_noop()`). The plan is
 emitted **last**, gated on observed sign-capability, so the reconciler
 can never recreate the manual "enroll-before-sign" footgun.
 
+The enforcement arm is an exhaustive `match` on the `require_sig`
+tri-state (§6), so an inventory that omits the field plans **no**
+enforcement action in either direction — it can neither tighten nor
+downgrade the live gate. Because "unmanaged" is not the same as "fine",
+the plan also carries a **non-action advisory** channel,
+`ReconcilePlan::advisories`. A fleet observed permissive while the
+inventory declines to manage enforcement yields
+`ReconcileAdvisory::EnforcementUnmanagedDrift`, so an unmanaged-permissive
+fleet is visible rather than silently reported as converged. Advisories
+are excluded from `is_noop()` **by design** — they are observations, not
+work, and **do not block convergence**; the applier never "applies" one.
+Resolve one by declaring intent: `require_sig: true` to have the
+reconciler flip enforcement on, or an explicit `require_sig: false` +
+`disable_reason` to record that permissive is deliberate.
+
 The side-effecting "Apply" half is
 [`scripts/federation-rollout.sh`](../scripts/federation-rollout.sh) — the
 generalized `deploy-rebuild.sh`: capture argv+environ (secrets
@@ -515,12 +559,28 @@ These are the load-bearing checks, each pinned end-to-end in
    auto-rollback). Watch the signed-vs-unsigned ratio climb toward 1.0.
 5. **Only after every node presents signed credentials**, set
    `enforcement.require_sig: true` (partition-safe; the reconciler flips
-   enforcement on **last**). Note: the runtime gate is already fail-closed by
-   default at v1.0.0, so this staged model applies only when you have
-   *deliberately* set `require_sig: false` (or `AI_MEMORY_FED_REQUIRE_SIG=0`)
-   for the enrollment window — a downgrade the reconciler honours by emitting
-   `DisableStrictEnforcement`. A greenfield v1.0.0 fleet that enrolls keys
-   before its first strict boot needs no downgrade at all.
+   enforcement on **last**). The runtime gate is already fail-closed by
+   default at v1.0.0, so a greenfield fleet that enrolls keys before its
+   first strict boot needs no downgrade at all — and an inventory that
+   simply **omits** `require_sig` leaves the secure default alone
+   (unmanaged, §6), it does not turn it off.
+
+   The staged model below applies only when you *deliberately* open an
+   enrollment window. Doing so takes both keys — an explicit
+   `require_sig: false` **and** a non-empty `disable_reason`, or the
+   inventory will not load:
+
+   ```yaml
+   enforcement:
+     require_sig: false
+     disable_reason: enrolling region/sfo peer keys, ticket OPS-42
+   ```
+
+   The reconciler honours that by emitting `DisableStrictEnforcement`.
+   Close the window by restoring `require_sig: true` **and deleting the
+   `disable_reason`** — a leftover reason is itself a load error, so the
+   acknowledgement cannot rot into a standing pre-authorization for the
+   next downgrade.
 6. **For regional scale**, mint intermediate CAs per region (§7.4) and
    move receivers to a **root-only** bundle.
 
