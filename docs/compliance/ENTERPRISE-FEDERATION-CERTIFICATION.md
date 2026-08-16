@@ -600,6 +600,35 @@ for the changed wire surface — the posture is UNCHANGED from `e22bc93c`
 except that a formerly-silent quarantine is now operator-visible (strictly
 MORE observable, never weaker).
 
+**Re-cert trigger — FIRED, pending re-affirmation (PR #2979, #2975
+inventory `require_sig` tri-state).** The §7-watched federation surface
+changed: `src/federation/identity/inventory.rs` (`EnforcementSpec`) and
+`src/federation/identity/reconcile.rs` (the Phase-4 declarative
+reconciler planner). The change is **planner/config-plane ONLY — no
+wire, no schema, no runtime-gate change**: `reconcile()` /
+`ReconcileAction` have ZERO production callers (Phase-4 scaffolding), so
+no shipped execution path changes behavior; the runtime signing gate
+(`AI_MEMORY_FED_REQUIRE_SIG`, env #29) and every receive-path check are
+byte-identical. What changed is the declarative contract:
+`EnforcementSpec::require_sig` became a tri-state `Option<bool>` so an
+inventory that OMITS the field can no longer plan
+`DisableStrictEnforcement` against the fail-closed runtime default (the
+#2975 footgun — a deleted line silently downgrading the certified
+posture); an explicit downgrade now requires a two-key turn
+(`require_sig: false` + non-empty `disable_reason`, enforced at
+inventory load), and unmanaged-permissive drift surfaces as a non-action
+`ReconcileAdvisory`. It adds **NO new `AI_MEMORY_FED_*` identifier**
+(the existing env #29 mapping is unchanged) and REMOVES **no** certified
+control (the removal-proof set is unchanged; the cert gate's 18 checks
+reference none of the changed symbols). Ratified by a 5-agent T3
+adversarial vote (4–1, recorded on #2975). **This PR does NOT re-mint
+the certification:** re-running §5.4(2)–(5) at the new SHA and
+re-affirming this document against it is the operator/reviewer gate.
+Until that re-affirmation lands, treat the certification as EXPIRED per
+this clause for the changed surface — the posture is strictly STRONGER,
+never weaker, than at `e22bc93c` (a silent-downgrade path in the
+declarative operator flow was closed).
+
 **Named signer.** The determination at `580d8427` is a **GitHub
 squash-merge** of PR #2910, committed by `GitHub` on behalf of the
 operator account (`alphaonedev`). GitHub signature verification is

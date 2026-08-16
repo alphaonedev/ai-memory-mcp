@@ -14,14 +14,22 @@
 //!
 //! Unlike an MCP tool-request struct (which stays permissive per #1052 so
 //! the wire schema is truthful for heterogeneous hosts), this is an
-//! operator-authored *trust* config. A silently-dropped typo —
-//! `requir_sig:` parsing as the default `require_sig: false` — would
-//! quietly weaken enforcement. So every struct here carries
-//! `#[serde(deny_unknown_fields)]`: an unrecognised key is a hard parse
-//! error the operator sees at load time, mirroring the inline-API-key
-//! rejection in [`crate::config`]. (The #1052 honesty pin only scans the
-//! MCP `tool_definitions()` payload, so this strictness is out of its
-//! scope.)
+//! operator-authored *trust* config. Every struct here carries
+//! `#[serde(deny_unknown_fields)]`, so an unrecognised key is a hard
+//! parse error the operator sees at load time, mirroring the
+//! inline-API-key rejection in [`crate::config`]. (The #1052 honesty pin
+//! only scans the MCP `tool_definitions()` payload, so this strictness is
+//! out of its scope.)
+//!
+//! That strictness is load-bearing for the enforcement block (#2975).
+//! WITHOUT it, a typo would be silently dropped and the surviving struct
+//! would still parse: `requir_sig: false` would leave
+//! [`EnforcementSpec::require_sig`] at its serde default `None`, silently
+//! demoting an intended explicit downgrade to *unmanaged*; and
+//! `disable_resaon:` would strip the two-key acknowledgement out of an
+//! explicit `require_sig: false`, defeating the very validation that
+//! makes a downgrade deliberate. With `deny_unknown_fields` both are
+//! parse errors, not silent posture changes.
 //!
 //! ## Reuse, not reinvention
 //!
@@ -105,15 +113,81 @@ pub struct QuorumSpec {
     pub width: u32,
 }
 
-/// Fleet enforcement posture.
+/// Fleet enforcement posture — a **tri-state** desired declaration (#2975).
+///
+/// The runtime gate this maps to (`AI_MEMORY_FED_REQUIRE_SIG`, env #29) is
+/// fail-closed / ON by default at v1.0.0. A two-valued `bool` desired-state
+/// could not distinguish "the operator wants permissive" from "the operator
+/// said nothing", so an inventory that merely omitted the block declared
+/// *desired = permissive* and the reconciler dutifully planned
+/// [`super::reconcile::ReconcileAction::DisableStrictEnforcement`] —
+/// silently downgrading the secure default. Hence the `Option`:
+///
+/// - `None` (field omitted, or the whole `enforcement:` block omitted) —
+///   enforcement is **unmanaged**. The reconciler plans NO enforcement
+///   action in either direction; deleting the line is a no-op, never a
+///   downgrade.
+/// - `Some(true)` — desired strict. The reconciler emits
+///   `EnableStrictEnforcement`, still gated on every desired node being
+///   observed sign-capable.
+/// - `Some(false)` — desired permissive. The reconciler emits
+///   `DisableStrictEnforcement`, and the inventory MUST carry a non-empty
+///   [`disable_reason`](Self::disable_reason) or it fails validation at
+///   load time. Weakening the fleet therefore requires ADDING two
+///   greppable lines, not deleting one.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnforcementSpec {
-    /// Whether receivers reject unsigned posts. Maps to
-    /// `AI_MEMORY_FED_REQUIRE_SIG`. Defaults to `false` so an inventory
-    /// that omits the block keeps the permissive rollout posture.
+    /// Desired strict-enforcement state (whether receivers reject unsigned
+    /// posts). Maps to `AI_MEMORY_FED_REQUIRE_SIG`. **Omitted = `None` =
+    /// unmanaged**, NOT permissive — see the type docs. Consumed with an
+    /// exhaustive `match`; never collapse it with `unwrap_or`.
     #[serde(default)]
-    pub require_sig: bool,
+    pub require_sig: Option<bool>,
+    /// Operator acknowledgement accompanying an explicit
+    /// `require_sig: false` — the second key of the two-key turn.
+    ///
+    /// Enforcement of this pairing lives entirely at inventory
+    /// load/validate ([`FederationInventory::validate`]), never in the
+    /// reconciler: suppressing a planned action would make
+    /// [`super::reconcile::ReconcilePlan::is_noop`] falsely report
+    /// convergence. Both directions are validation errors — a downgrade
+    /// without a reason, and a reason left behind after the downgrade was
+    /// reverted (stale-ack rot).
+    #[serde(default)]
+    pub disable_reason: Option<String>,
+}
+
+impl EnforcementSpec {
+    /// Validate the two-key turn on an explicit strict-enforcement
+    /// downgrade.
+    ///
+    /// # Errors
+    /// [`InventoryError::EnforcementDisableReasonMissing`] when
+    /// `require_sig: false` carries no non-empty `disable_reason`;
+    /// [`InventoryError::EnforcementDisableReasonWithoutDisable`] when a
+    /// `disable_reason` is present without an explicit `require_sig: false`.
+    fn validate(&self) -> Result<(), InventoryError> {
+        match self.require_sig {
+            // Explicit downgrade: demand a non-empty acknowledgement.
+            Some(false) => {
+                if !self
+                    .disable_reason
+                    .as_deref()
+                    .is_some_and(|r| !r.trim().is_empty())
+                {
+                    return Err(InventoryError::EnforcementDisableReasonMissing);
+                }
+            }
+            // Strict or unmanaged: a lingering acknowledgement is rot.
+            Some(true) | None => {
+                if self.disable_reason.is_some() {
+                    return Err(InventoryError::EnforcementDisableReasonWithoutDisable);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The declarative inventory: desired fleet membership + trust topology +
@@ -132,7 +206,9 @@ pub struct FederationInventory {
     pub regions: Vec<RegionSpec>,
     /// Quorum width.
     pub quorum: QuorumSpec,
-    /// Enforcement posture (defaults to permissive when omitted).
+    /// Enforcement posture. Omitting the whole block is the SAME desired
+    /// state as omitting `require_sig` inside it — both spellings of
+    /// silence yield `require_sig: None` (**unmanaged**, not permissive).
     #[serde(default)]
     pub enforcement: EnforcementSpec,
 }
@@ -165,6 +241,15 @@ pub enum InventoryError {
     DuplicateNodeId { id: String },
     /// `quorum.width` is below [`MIN_QUORUM_WIDTH`].
     InvalidQuorumWidth { width: u32 },
+    /// `enforcement.require_sig: false` (an explicit strict-enforcement
+    /// downgrade) carried no non-empty `enforcement.disable_reason` — the
+    /// second key of the two-key turn (#2975).
+    EnforcementDisableReasonMissing,
+    /// `enforcement.disable_reason` is present without an explicit
+    /// `enforcement.require_sig: false`. A stale acknowledgement left
+    /// behind after a downgrade was reverted would silently pre-authorize
+    /// the next one, so it is rejected at load time (#2975).
+    EnforcementDisableReasonWithoutDisable,
 }
 
 impl InventoryError {
@@ -181,6 +266,10 @@ impl InventoryError {
             Self::RenewBeforeNotShorterThanTtl { .. } => "inventory_renew_before_not_shorter",
             Self::DuplicateNodeId { .. } => "inventory_duplicate_node_id",
             Self::InvalidQuorumWidth { .. } => "inventory_invalid_quorum_width",
+            Self::EnforcementDisableReasonMissing => "inventory_enforcement_disable_reason_missing",
+            Self::EnforcementDisableReasonWithoutDisable => {
+                "inventory_enforcement_disable_reason_without_disable"
+            }
         }
     }
 }
@@ -252,7 +341,8 @@ impl FederationInventory {
 
     /// Semantic validation beyond what serde shape-checks: non-empty
     /// trust domain + region names, valid node ids, parsable + sane
-    /// durations, unique ids, and a sane quorum width.
+    /// durations, unique ids, a sane quorum width, and the #2975 two-key
+    /// turn on an explicit strict-enforcement downgrade.
     ///
     /// # Errors
     /// One of the semantic [`InventoryError`] variants on the first
@@ -266,6 +356,9 @@ impl FederationInventory {
                 width: self.quorum.width,
             });
         }
+        // #2975 — the ack for an explicit downgrade is enforced HERE, at
+        // load, and never by suppressing a reconciler action.
+        self.enforcement.validate()?;
         let mut seen_ids: BTreeSet<&str> = BTreeSet::new();
         for region in &self.regions {
             if region.name.trim().is_empty() {
@@ -373,7 +466,8 @@ enforcement:
         assert_eq!(inv.root_ca.as_deref(), Some("root.pub"));
         assert_eq!(inv.regions.len(), 2);
         assert_eq!(inv.quorum.width, 2);
-        assert!(inv.enforcement.require_sig);
+        assert_eq!(inv.enforcement.require_sig, Some(true));
+        assert_eq!(inv.enforcement.disable_reason, None);
         assert_eq!(inv.nodes().count(), 3);
         let first = inv.nodes().next().expect("a node");
         assert_eq!(first.id, "region/nyc/node-1");
@@ -386,16 +480,116 @@ enforcement:
         );
     }
 
+    /// #2975 — the two spellings of silence. An absent `enforcement:`
+    /// block and a present-but-empty `enforcement: {}` MUST both yield
+    /// `require_sig: None` (unmanaged), never `Some(false)`. serde
+    /// field-`default` and struct-`Default` are different mechanisms, so
+    /// this pins that they cannot diverge.
     #[test]
-    fn enforcement_defaults_to_permissive_when_omitted() {
-        let yaml = "\
+    fn enforcement_is_unmanaged_when_omitted_or_empty() {
+        let block_absent = "\
 trust_domain: d
 quorum:
   width: 1
 ";
-        let inv = FederationInventory::from_yaml_str(yaml).expect("valid");
-        assert!(!inv.enforcement.require_sig);
+        let inv = FederationInventory::from_yaml_str(block_absent).expect("valid");
+        assert_eq!(
+            inv.enforcement.require_sig, None,
+            "an omitted enforcement block is UNMANAGED, not permissive"
+        );
+        assert_eq!(inv.enforcement.disable_reason, None);
         assert_eq!(inv.nodes().count(), 0);
+
+        let block_empty = "\
+trust_domain: d
+quorum:
+  width: 1
+enforcement: {}
+";
+        let inv_empty = FederationInventory::from_yaml_str(block_empty).expect("valid");
+        assert_eq!(
+            inv_empty.enforcement, inv.enforcement,
+            "`enforcement: {{}}` must be identical to an omitted block"
+        );
+        assert_eq!(inv_empty.enforcement.require_sig, None);
+    }
+
+    /// #2975 two-key turn, key 1 missing: an explicit downgrade with no
+    /// acknowledgement is a load-time validation error.
+    #[test]
+    fn explicit_disable_without_reason_is_rejected() {
+        let yaml = "\
+trust_domain: d
+quorum:
+  width: 1
+enforcement:
+  require_sig: false
+";
+        let err = FederationInventory::from_yaml_str(yaml).expect_err("needs a reason");
+        assert_eq!(err, InventoryError::EnforcementDisableReasonMissing);
+        assert_eq!(err.tag(), "inventory_enforcement_disable_reason_missing");
+    }
+
+    /// A whitespace-only reason is not an acknowledgement.
+    #[test]
+    fn explicit_disable_with_blank_reason_is_rejected() {
+        let yaml = "\
+trust_domain: d
+quorum:
+  width: 1
+enforcement:
+  require_sig: false
+  disable_reason: '   '
+";
+        let err = FederationInventory::from_yaml_str(yaml).expect_err("blank is not a reason");
+        assert_eq!(err, InventoryError::EnforcementDisableReasonMissing);
+    }
+
+    /// #2975 stale-ack rot: a `disable_reason` left behind after the
+    /// downgrade was reverted (or never made) is a validation error in
+    /// BOTH surviving states — unmanaged and explicit-strict.
+    #[test]
+    fn disable_reason_without_explicit_disable_is_rejected() {
+        for enforcement in [
+            "enforcement:\n  disable_reason: leftover\n",
+            "enforcement:\n  require_sig: true\n  disable_reason: leftover\n",
+            // Even an EMPTY reason is rot: its presence is the signal.
+            "enforcement:\n  disable_reason: ''\n",
+        ] {
+            let yaml = format!("trust_domain: d\nquorum:\n  width: 1\n{enforcement}");
+            let Err(err) = FederationInventory::from_yaml_str(&yaml) else {
+                panic!("stale ack must be rejected: {enforcement}");
+            };
+            assert_eq!(
+                err,
+                InventoryError::EnforcementDisableReasonWithoutDisable,
+                "wrong error for: {enforcement}"
+            );
+            assert_eq!(
+                err.tag(),
+                "inventory_enforcement_disable_reason_without_disable"
+            );
+        }
+    }
+
+    /// The happy path of the two-key turn: an explicit downgrade WITH a
+    /// non-empty reason parses and validates.
+    #[test]
+    fn explicit_disable_with_reason_parses() {
+        let yaml = "\
+trust_domain: d
+quorum:
+  width: 1
+enforcement:
+  require_sig: false
+  disable_reason: staged peer key enrollment window, ticket OPS-42
+";
+        let inv = FederationInventory::from_yaml_str(yaml).expect("valid two-key downgrade");
+        assert_eq!(inv.enforcement.require_sig, Some(false));
+        assert_eq!(
+            inv.enforcement.disable_reason.as_deref(),
+            Some("staged peer key enrollment window, ticket OPS-42")
+        );
     }
 
     #[test]

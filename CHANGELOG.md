@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (federation inventory — omitting `enforcement.require_sig` no longer silently downgrades the fail-closed signing default; #2975)
+
+- **A federation inventory that simply OMITTED `enforcement.require_sig`
+  planned `DisableStrictEnforcement`, turning the v1.0.0 fail-closed signing
+  gate OFF.** `EnforcementSpec::require_sig` was a plain `bool` with a serde
+  struct-default of `false`, and the reconciler read that desired state
+  literally (`reconcile.rs`: `if want_strict && … else if !want_strict &&
+  observed.strict_enforced { DisableStrictEnforcement }`). Because the runtime
+  gate `AI_MEMORY_FED_REQUIRE_SIG` (env #29) is default-ON since v0.7.0, the
+  live posture IS `strict_enforced` — so an operator who wrote an inventory and
+  left the field out got an automatic downgrade of the secure default, and the
+  pre-secure-default rollout guidance ("flip `require_sig: true` last") had
+  silently inverted into an instruction to disable it. **A control that a
+  DELETED line switches off is the wrong shape.**
+- **`require_sig` is now a TRI-STATE `Option<bool>`**, consumed by an
+  exhaustive `match` (no `unwrap_or` collapse anywhere): `None` (omitted, or
+  the whole `enforcement:` block omitted — both spellings of silence agree) =
+  **unmanaged**, and the reconciler plans NO enforcement action in either
+  direction; `Some(true)` = `EnableStrictEnforcement`, still gated on every
+  desired node being observed sign-capable; `Some(false)` =
+  `DisableStrictEnforcement`. Deleting the line is a no-op; weakening the
+  fleet requires ADDING greppable lines.
+- **A deliberate downgrade takes a two-key turn.** An explicit
+  `require_sig: false` MUST carry a non-empty sibling `disable_reason` or the
+  inventory FAILS TO LOAD (`inventory_enforcement_disable_reason_missing`), and
+  a `disable_reason` present WITHOUT an explicit `require_sig: false` is also a
+  load error (`inventory_enforcement_disable_reason_without_disable`) so a
+  stale acknowledgement cannot rot into a standing pre-authorization for the
+  next downgrade. Both checks live at inventory load/validate — the reconciler
+  NEVER suppresses a planned action, because a suppressed action would make
+  `ReconcilePlan::is_noop()` falsely report convergence.
+- **New non-action advisory channel** `ReconcilePlan::advisories`, with
+  `ReconcileAdvisory::EnforcementUnmanagedDrift`, emitted when desired is
+  `None` AND the fleet is observed permissive — so an unmanaged-permissive
+  fleet is VISIBLE rather than silently reported as converged. `is_noop()`
+  stays actions-only (unchanged semantics): an advisory is an observation, not
+  work, and does not block convergence.
+- Option 1 ("just default the struct to `true`") was killed on grounds:
+  `desired.nodes().all(…)` is VACUOUSLY true on an empty node list, so the
+  minimal documented inventory would immediately plan `EnableStrictEnforcement`
+  and 401-partition every unlisted legacy sender — pinned by
+  `empty_node_list_does_not_vacuously_enable_strict_2975`.
+- `reconcile()` / `ReconcileAction` have zero callers outside the module, so
+  the API-shape change is free now and semver-breaking after Phase-4 wiring.
+  `docs/federation-identity.md` §3/§6/§7.6/§9 rewritten to the new contract
+  (the "omission keeps the permissive rollout posture" language is gone).
+  Covering unit tests in `reconcile.rs` (omitted+strict ⇒ no Disable — the
+  regression pin; omitted+permissive ⇒ advisory; both explicit-true gated
+  paths; explicit-false ⇒ Disable; idempotence in all three desired states) and
+  `inventory.rs` (both two-key-turn error directions, the happy path, and the
+  two-spellings-of-silence pin). 5-agent T3 adversarial vote, 4-1 (Option 2 +
+  hardened Option 3).
+
 ### Security (append-only spine — the primary create funnel's upsert no longer bypasses the signed ledger; #2948 / PR-3)
 
 - **`db::insert` — the hottest write path — rewrote durable authored `content`
