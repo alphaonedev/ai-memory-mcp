@@ -12021,6 +12021,35 @@ decision = "allow"
         );
     }
 
+    /// #2963 L10 — `cmd_bench` short-circuits into the private
+    /// `cmd_bench_relevance` sub-mode when `args.relevance` is set, and
+    /// that hermetic (`:memory:`, no embedder/network) harness returns
+    /// `Ok` for BOTH the table and `--json` render arms. Only an
+    /// in-module test can reach these private fns, so this pins the
+    /// `if args.relevance` branch + the whole `cmd_bench_relevance` body.
+    #[test]
+    fn cmd_bench_relevance_dispatch_both_render_arms_ok() {
+        let base = BenchArgs {
+            iterations: 1,
+            warmup: 0,
+            json: false,
+            baseline: None,
+            regression_threshold: 0.0,
+            history: None,
+            // Small corpus keeps the four-scenario harness fast; the signal
+            // floor (NUM_PROBE_CLUSTERS * SIGNAL_ROWS_PER_CLUSTER) applies.
+            scale: Some(100),
+            verified: false,
+            relevance: true,
+            k: 5,
+        };
+        // Table render arm.
+        cmd_bench(&base).expect("cmd_bench relevance (table) must return Ok");
+        // JSON render arm — covers the other side of the `if args.json`.
+        let json = BenchArgs { json: true, ..base };
+        cmd_bench(&json).expect("cmd_bench relevance (json) must return Ok");
+    }
+
     // ===========================================================================
     // FX-F2 (coverage, #1432) — close the daemon_runtime.rs floor regression
     // observed on the Per-Module Coverage Thresholds CI gate after the
