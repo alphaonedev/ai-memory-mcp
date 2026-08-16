@@ -48,8 +48,8 @@ interception of LAN-range packets:
   the extension, which returns `EHOSTUNREACH` for LAN destinations
   it hasn't been instructed to allow.
 
-The behaviour is documented at the NEAR AI / Apple / Tailscale
-notarization layer and is not actionable from inside `ai-memory`.
+The behaviour lives at the Apple / Tailscale notarization layer and
+is not actionable from inside `ai-memory`.
 
 ### Workaround — use the tailnet address
 
@@ -78,7 +78,7 @@ address; you don't need to enumerate per-node IPs.
 
 ### Long-term outlook
 
-No substrate-level fix. The NEAR AI / Apple / Tailscale notarization
+No substrate-level fix. The Apple / Tailscale notarization
 landscape would need to change — either Tailscale ships its extension
 with broader allowlisting for unsigned binaries, or Apple's
 notarization policy changes — and neither is actionable from this

@@ -97,7 +97,8 @@ Every example below is the **`memory` MCP server entry** in your AI client's con
 
 - [Ollama (local default — no key required)](#ollama-local-default)
 - [LMStudio (local — no key required)](#lmstudio-local)
-- [vLLM, llama.cpp server, generic OpenAI-compatible (self-hosted)](#generic-openai-compatible-self-hosted)
+- [vLLM (local — dedicated alias, no key required)](#vllm-local)
+- [llama.cpp server, TGI, generic OpenAI-compatible (self-hosted)](#generic-openai-compatible-self-hosted)
 - [xAI Grok](#xai-grok)
 - [OpenAI](#openai)
 - [Anthropic (via OpenAI shim)](#anthropic)
@@ -169,9 +170,30 @@ LMStudio exposes an OpenAI-compatible endpoint at `http://localhost:1234/v1` by 
 
 `AI_MEMORY_LLM_BASE_URL` is optional — `lmstudio` alias pre-fills `http://localhost:1234/v1`. Override only if you've changed LMStudio's local server port.
 
+## vLLM (local)
+
+vLLM serves an OpenAI-compatible API. The dedicated `vllm` alias pre-fills `http://localhost:8000/v1` (vLLM's default `--port 8000` with the `/v1` route mount), so **no `AI_MEMORY_LLM_BASE_URL` is required** for a stock vLLM server — and vLLM is keyless by default (a token can still be supplied via `AI_MEMORY_LLM_API_KEY` for a secured deployment). Canonical wire value: `crate::llm::BACKEND_VLLM`.
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "ai-memory",
+      "args": ["--db", "~/.claude/ai-memory.db", "mcp", "--tier", "autonomous"],
+      "env": {
+        "AI_MEMORY_LLM_BACKEND": "vllm",
+        "AI_MEMORY_LLM_MODEL": "your-served-model-tag"
+      }
+    }
+  }
+}
+```
+
+Override `AI_MEMORY_LLM_BASE_URL` only if you launched vLLM on a non-default host/port. For a secured vLLM (`--api-key` set), add `AI_MEMORY_LLM_API_KEY`.
+
 ## Generic OpenAI-compatible (self-hosted)
 
-Use this for **vLLM**, **llama.cpp server**, **TGI**, **TabbyAPI**, or any other self-hosted endpoint that speaks the OpenAI wire shape. `AI_MEMORY_LLM_BASE_URL` is **required** — there is no default URL for the generic alias.
+Use this for **llama.cpp server**, **TGI**, **TabbyAPI**, or any other self-hosted endpoint that speaks the OpenAI wire shape. (**vLLM** has its own `vllm` alias that pre-fills the base URL — see [vLLM (local)](#vllm-local) above — but the generic path below also works if you prefer to pin an explicit URL.) `AI_MEMORY_LLM_BASE_URL` is **required** for the generic `openai-compatible` alias — there is no default URL for it.
 
 ```json
 {
@@ -522,15 +544,28 @@ For every backend except `ollama` and `lmstudio` (which don't need a key), the A
 
 The same precedence applies whether the var lives in your shell or in the MCP `env:` block. The recommended pattern is to put the canonical `AI_MEMORY_LLM_API_KEY` in the MCP env block — it's unambiguous and doesn't depend on the per-vendor fallback chain.
 
-## Embedding wire shape (#1143)
+## Embedding wire shape (#1598 — independent embedder)
 
-ai-memory's embedder is Ollama-native (`/api/embed`). When the LLM backend is non-Ollama (e.g. xAI, OpenAI), the MCP server detects the wire-shape mismatch and builds a **dedicated Ollama embed client** at `http://localhost:11434` (configurable via the `[embeddings].url` config key) while chat goes to the cloud vendor. You'll see the `(#1143)` banner line on first MCP start confirming this disambiguation took effect.
+The embedder is resolved **independently of the chat LLM backend**, through its own `[embeddings]` config section / `AI_MEMORY_EMBED_*` env vars (the embeddings siblings of the `AI_MEMORY_LLM_*` vars above). The chat LLM client is **never** reused for embeddings.
 
-If you don't have a local Ollama running and you've selected a non-Ollama LLM backend, semantic recall will fall back to keyword-only. To run fully cloud-side, either:
-- Install Ollama locally just for the embedder (`brew install ollama && ollama serve &` — no models need to be pulled; the embed endpoint accepts any embedding model tag the daemon knows about).
-- OR drop to `semantic` tier with Ollama unset and accept the limited recall surface.
+`[embeddings].backend` accepts the same vocabulary as `[llm].backend`: `ollama` (native `/api/embed`, no auth — the default), any vendor alias above (e.g. `openrouter`, `openai`, `gemini` — API embeddings via `/v1/embeddings` + Bearer auth), or `openai-compatible` (self-hosted TEI / vLLM / llama.cpp server; requires an explicit base URL). So a deployment can run chat on one vendor and embeddings on another — e.g. chat on xAI, embeddings on OpenRouter — or run a cloud chat backend beside a purely local Ollama embedder.
 
-A native OpenAI-compatible embedder path is tracked for v0.7.x — once shipped, the disambiguation line will go away and the embedder will use whatever the LLM backend exposes at `/v1/embeddings`.
+```toml
+[embeddings]
+backend     = "openrouter"
+model       = "google/gemini-embedding-2"
+api_key_env = "OPENROUTER_API_KEY"
+# base_url  = "https://openrouter.ai/api/v1"  # optional for a named alias
+# dim       = 3072   # only for models outside the built-in KNOWN_EMBEDDING_DIMS table
+```
+
+Or via the MCP `env:` block: `AI_MEMORY_EMBED_BACKEND`, `AI_MEMORY_EMBED_MODEL`, `AI_MEMORY_EMBED_BASE_URL`, `AI_MEMORY_EMBED_API_KEY`.
+
+**Precedence per field:** `AI_MEMORY_EMBED_*` env > `[embeddings]` section > legacy flat fields (`embed_url` / `embedding_model` / `ollama_url`) > compiled default (`ollama` at `http://localhost:11434`, model `nomic-embed-text-v1.5`). The embed API key resolves via `AI_MEMORY_EMBED_API_KEY` > per-vendor alias env (e.g. `OPENROUTER_API_KEY`, per the same fallback table the chat key uses) > `[embeddings].api_key_env` > `[embeddings].api_key_file` (mode 0400 enforced). Inline `[embeddings].api_key = "<literal>"` is rejected at parse time, exactly like `[llm].api_key`.
+
+Embedder construction is **fail-closed**: if the resolved embedder cannot be built (endpoint unreachable, missing key), semantic recall **degrades loudly to keyword mode** (`embedder init failed … semantic recall DEGRADED to keyword`, #1593) — it is never silently backed by the chat client. Verify with `ai-memory doctor`, which emits an `Embeddings Reachability (#1598)` section carrying the resolved backend / model / base_url / key-source provenance (never the key itself).
+
+> **History (#1143 → #1598).** Earlier versions built a dedicated localhost-Ollama embed client beside a non-Ollama chat client and printed a `(#1143)` disambiguation banner. **#1598 superseded that boot site** — the embedder now speaks to any alias / `openai-compatible` endpoint of its own, so the `(#1143)` banner line is gone and embeddings are no longer Ollama-only.
 
 ## Verification — quick smoke test
 
@@ -542,9 +577,7 @@ Expected output:
 ai-memory: requested tier = autonomous
 ai-memory: profile = 8 families (...); expected tool count = 103
 ai-memory: LLM ready (backend=<your-backend>, model=<your-model>)
-ai-memory: LLM client is OpenAI-compatible (non-Ollama wire shape);
-           building dedicated Ollama embed client at http://localhost:11434 (#1143)
-ai-memory: embedder loaded (nomic-embed-text-v1.5 (768-dim, Ollama))
+ai-memory: embedder loaded (<embed-backend description>)   # #1598 — resolved independently of the chat LLM
 ai-memory: atomisation engine ready (curator=LlmCurator)
 ai-memory MCP server started (stdio, tier=autonomous)
 ```

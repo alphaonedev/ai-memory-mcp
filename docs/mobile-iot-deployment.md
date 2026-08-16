@@ -3,18 +3,23 @@ layout: doc
 ---
 # ai-memory on phones, IoT, and the edge
 
-> **Status — v0.7.0 (2026-05-22):** the build pipeline (cross-compile +
+> **Status — v1.0.0:** the build pipeline (cross-compile +
 > mobile artifact bundling + iOS Simulator + Android emulator runtime
 > tests) ships and stays green on every `release/**` push. The
-> C-callable FFI surface — `#[no_mangle] extern "C"` items in
-> `src/lib.rs` — lands in a v0.7.x follow-up (issue #1068 Layer 2).
+> C-callable FFI surface is a single shipped symbol —
+> `#[unsafe(no_mangle)] extern "C" fn ai_memory_version()` in
+> `src/lib.rs` (ARCH-10, pinned by `tests/ffi_version_arch_10.rs`).
+> The broader C-ABI surface (the memory API callable from
+> C / Swift / Kotlin) is DEFERRED to v1.x
+> ([#1977](https://github.com/alphaonedev/ai-memory-mcp/issues/1977),
+> superseding the earlier issue #1068 Layer-2 framing).
 > The artifacts produced today (`ai-memory-ios.xcframework.tar.gz`,
 > `ai-memory-android.tar.gz`) are LINKABLE — embed them in an Xcode
 > or Android Studio project and link against the bundled rlib /
-> staticlib / cdylib — but the public FFI surface is a single symbol
-> (`ai_memory_version()`, ARCH-10; the `cbindgen.toml` header is scoped
-> to exactly that per [#1976](https://github.com/alphaonedev/ai-memory-mcp/issues/1976))
-> until the broader v1.x surface lands ([#1977](https://github.com/alphaonedev/ai-memory-mcp/issues/1977)).
+> staticlib / cdylib — but the public FFI surface is that single
+> symbol (the `cbindgen.toml` header is scoped to exactly it via
+> `item_types = ["functions"]` per
+> [#1976](https://github.com/alphaonedev/ai-memory-mcp/issues/1976)).
 > Native CLI use over Termux (Android) or a sidecar Mac (iOS) is
 > supported TODAY.
 
@@ -57,7 +62,7 @@ ai-memory inverts that:
   Snapdragon, MediaTek, NVIDIA Jetson, every modern phone),
   x86_64 (Intel / AMD laptops, NUCs, x86 industrial PCs), and
   RISC-V (BeagleV, VisionFive 2, SiFive — buildable today from
-  source, prebuilt artifacts on the v0.7.x roadmap).
+  source, prebuilt artifacts remain on the roadmap).
 - **Operating systems**: macOS, Linux, Android, iOS, FreeBSD,
   Windows (via WSL on the desktop; native MSVC build at
   `release.yml`'s `x86_64-pc-windows-msvc` job), and any
@@ -82,14 +87,14 @@ The canonical CI matrix is in
 [`.github/workflows/mobile-runtime.yml`](../.github/workflows/mobile-runtime.yml)
 (runtime gating on simulators / emulators).
 
-| Class | OS | Architecture | Target triple | v0.7.0 status |
+| Class | OS | Architecture | Target triple | Status |
 |---|---|---|---|---|
 | Desktop | macOS | aarch64 (Apple Silicon) | `aarch64-apple-darwin` | Prebuilt binary on every release |
 | Desktop | macOS | x86_64 (Intel) | `x86_64-apple-darwin` | Prebuilt binary on every release |
 | Desktop | Linux | x86_64 | `x86_64-unknown-linux-gnu` | Prebuilt binary on every release |
 | Desktop | Linux | aarch64 (server / Pi / Graviton) | `aarch64-unknown-linux-gnu` | Prebuilt binary on every release |
 | Desktop | Windows | x86_64 | `x86_64-pc-windows-msvc` | Prebuilt binary on every release |
-| Phone | iOS | aarch64 device | `aarch64-apple-ios` | Build pipeline GREEN; linkable staticlib in `.xcframework.tar.gz`. FFI items: v0.7.x follow-up. |
+| Phone | iOS | aarch64 device | `aarch64-apple-ios` | Build pipeline GREEN; linkable staticlib in `.xcframework.tar.gz`. FFI surface: single `ai_memory_version()` symbol shipped; broader C-ABI deferred to v1.x (#1977). |
 | Phone | iOS Simulator | aarch64 (Apple Silicon Mac) | `aarch64-apple-ios-sim` | Build + runtime test GREEN (mobile-runtime workflow) |
 | Phone | iOS Simulator | x86_64 (Intel Mac) | `x86_64-apple-ios` | Build pipeline GREEN; Intel runner image is on its EOL path so runtime arm not run in CI |
 | Phone | Android | aarch64 (`arm64-v8a`) | `aarch64-linux-android` | Build pipeline GREEN; cdylib bundled in `.aar`-compatible archive |
@@ -97,7 +102,7 @@ The canonical CI matrix is in
 | Phone | Android | x86_64 (emulator) | `x86_64-linux-android` | Build + runtime test GREEN on KVM-accelerated emulator |
 | Phone | Android | i686 (legacy emulator) | `i686-linux-android` | Build pipeline GREEN |
 | IoT | Linux | aarch64 (Pi 4 / 5, Rock 5, Jetson Nano / Orin Nano) | `aarch64-unknown-linux-gnu` | Same prebuilt as desktop Linux ARM64 |
-| IoT | Linux | armv7 (Pi Zero 2 W, older Pi) | `armv7-unknown-linux-gnueabihf` | Build-from-source today; prebuilt on the v0.7.x roadmap |
+| IoT | Linux | armv7 (Pi Zero 2 W, older Pi) | `armv7-unknown-linux-gnueabihf` | Build-from-source today; prebuilt on the roadmap (not in the v1.0.0 `release.yml` matrix) |
 | IoT | Linux | riscv64 (VisionFive 2, BeagleV) | `riscv64gc-unknown-linux-gnu` | Build-from-source today; no prebuilt artifact |
 | Embedded | FreeBSD | x86_64 / aarch64 | `x86_64-unknown-freebsd` / `aarch64-unknown-freebsd` | Build-from-source; community-attested but not gated by upstream CI |
 
@@ -179,7 +184,7 @@ can hit `http://127.0.0.1:9077/api/v1/` for memory persistence.
 
 iOS is the harder of the two. App Store policy prohibits a
 user-installable CLI; iOS apps run in a sandbox; there is no
-"Termux for iOS." The honest state at v0.7.0:
+"Termux for iOS." The honest state today:
 
 ### What works today
 
@@ -192,28 +197,30 @@ user-installable CLI; iOS apps run in a sandbox; there is no
   HNSW CPU recall, embedder CPU path, and rustls TLS handshake
   every push to `release/**`).
 - **Embed-via-staticlib** is supported: drop the xcframework into
-  your Xcode project, link, and call the (forthcoming) `extern "C"`
-  surface from Swift / Objective-C.
+  your Xcode project, link, and call the shipped `extern "C"`
+  symbol `ai_memory_version()` from Swift / Objective-C. The broader
+  memory-API `extern "C"` surface is deferred to v1.x (#1977).
 
 ### What does not work today
 
-- **A single-symbol C-FFI surface.** `src/lib.rs` exports exactly one
-  `#[no_mangle] extern "C"` item — `ai_memory_version()` (ARCH-10,
+- **A callable memory API over C-FFI.** `src/lib.rs` exports exactly one
+  `#[unsafe(no_mangle)] extern "C"` item — `ai_memory_version()` (ARCH-10,
   pinned by `tests/ffi_version_arch_10.rs`) — and the `cbindgen.toml`
-  header is scoped to exactly that symbol
-  ([#1976](https://github.com/alphaonedev/ai-memory-mcp/issues/1976)).
+  header is scoped to exactly that symbol (`item_types = ["functions"]`,
+  [#1976](https://github.com/alphaonedev/ai-memory-mcp/issues/1976)).
   So while the staticlib bundles correctly, you cannot meaningfully
-  call the memory API from Swift until the broader v1.x surface lands
+  call the memory API from Swift until the broader C-ABI surface lands
+  in v1.x
   ([#1977](https://github.com/alphaonedev/ai-memory-mcp/issues/1977),
-  supersedes the issue #1068 Layer-2 framing). The
-  build-pipeline-without-callable-surface scaffold is intentional;
+  superseding the issue #1068 Layer-2 framing). The
+  build-pipeline-plus-version-symbol scaffold is intentional;
   it pins the artifact + signing + xcframework layout before any
   API churn.
 - **No stand-alone iOS app on the App Store.** Apple's review
   guidelines and the lack of background-daemon support make a
   standalone "ai-memory.app" a poor fit. The intended model is:
   your AI app embeds the xcframework + calls into it through
-  the FFI when v0.7.x ships.
+  the FFI once the broader C-ABI surface ships (v1.x, #1977).
 
 ### The pragmatic path today
 
@@ -233,8 +240,9 @@ persistent memory by talking to the Mac in your house / car / bag
 over LAN. It's not phone-native, but it's deployable today, and
 the latency is sub-10ms over local Wi-Fi.
 
-A v0.7.x follow-up ("phone-native" posture) lands the FFI surface
-and unlocks in-app embedded use. Tracking: issue #1068 Layer 2.
+A v1.x follow-up ("phone-native" posture) lands the broader C-ABI
+surface and unlocks in-app embedded use. Tracking:
+[#1977](https://github.com/alphaonedev/ai-memory-mcp/issues/1977).
 
 ## 5. IoT: Raspberry Pi 4/5 and Linux ARM SBCs
 
@@ -254,7 +262,7 @@ prebuilt `aarch64-unknown-linux-gnu` binary works on:
 ```bash
 # On the Pi (or any aarch64 Linux) — the tarball contains the bare
 # `ai-memory` binary at its root:
-curl -fsSL https://github.com/alphaonedev/ai-memory-mcp/releases/download/v0.7.0/ai-memory-aarch64-unknown-linux-gnu.tar.gz \
+curl -fsSL https://github.com/alphaonedev/ai-memory-mcp/releases/latest/download/ai-memory-aarch64-unknown-linux-gnu.tar.gz \
   | sudo tar -xz -C /usr/local/bin ai-memory
 ai-memory --version
 ```
@@ -358,7 +366,7 @@ RISC-V is the frontier target. At v0.7.0:
   Ubuntu 24.04 image, SiFive HiFive Unmatched with Fedora
   RISC-V).
 - **No upstream CI gate yet.** Tracking under "expand mobile-
-  runtime CI to RISC-V Linux" on the v0.7.x roadmap. Until the
+  runtime CI to RISC-V Linux" on the roadmap. Until the
   CI gate ships, RISC-V is community-attested but not
   upstream-warranted.
 
@@ -381,9 +389,9 @@ Build time on a VisionFive 2 (StarFive JH7110, 4× SiFive U74 at
 slower than ARM, because the compiler ecosystem is younger and
 codegen for RISC-V Vector extensions is still landing in LLVM.
 
-A v0.7.x release will add `riscv64gc-unknown-linux-gnu` to the
-prebuilt-artifact matrix in `release.yml`. Until then,
-build-from-source is the only supported path.
+A future release will add `riscv64gc-unknown-linux-gnu` to the
+prebuilt-artifact matrix in `release.yml` (it is not in the v1.0.0
+matrix). Until then, build-from-source is the only supported path.
 
 ## 8. Resource envelope (reference numbers)
 
@@ -477,8 +485,9 @@ The deployment pattern that works:
   exposed. The substrate runs purely local.
 - **Edge device opportunistically pushes to a regional hub** when
   connectivity is available. Use the `/sync/push` HTTP endpoint
-  (with HMAC + nonce per `AI_MEMORY_FED_REQUIRE_SIG=1` +
-  `AI_MEMORY_FED_REQUIRE_NONCE=1`).
+  (with a per-message Ed25519 `X-Memory-Sig` + nonce per
+  `AI_MEMORY_FED_REQUIRE_SIG=1` + `AI_MEMORY_FED_REQUIRE_NONCE=1`,
+  both secure defaults).
 - **Hub is a Tier-2 or Tier-3 node** (single server or rack-scale,
   see [`docs/reference-architectures.md`](reference-architectures.html)).
   The hub holds the durable archive + cross-device memory + the
@@ -594,7 +603,7 @@ cloud account.
 
 ## Where the artifacts come from
 
-Every `release/v0.7.x` tag publishes (under
+Every release tag publishes (under
 [GitHub Releases](https://github.com/alphaonedev/ai-memory-mcp/releases)):
 
 - `ai-memory-{aarch64,x86_64}-{apple-darwin,unknown-linux-gnu}.tar.gz`
@@ -605,8 +614,12 @@ Every `release/v0.7.x` tag publishes (under
   with 4 ABIs under `jniLibs/<abi>/`
 
 The mobile artifacts are produced by `.github/workflows/release.yml`
-jobs `mobile-ios` and `mobile-android`. The runtime gate on every
-push to `release/**` is the dedicated `.github/workflows/mobile-runtime.yml`.
+jobs `mobile-ios` and `mobile-android`, each with a per-asset
+`<artifact>.sha256` checksum and a SLSA build-provenance attestation
+(`actions/attest-build-provenance`, #2487 — verify with
+`gh attestation verify <artifact> --repo alphaonedev/ai-memory-mcp`).
+The runtime gate on every push to `release/**` is the dedicated
+`.github/workflows/mobile-runtime.yml`.
 
 ## Where to file issues
 
@@ -615,4 +628,5 @@ push to `release/**` is the dedicated `.github/workflows/mobile-runtime.yml`.
 - Android NDK / cdylib issue → tag `target:android`
 - RISC-V build failure → tag `target:riscv` (community-attested, no upstream CI gate yet)
 - FFI surface (Swift / JNI binding requests) → tag `area:ffi`,
-  reference issue #1068 Layer 2
+  reference [#1977](https://github.com/alphaonedev/ai-memory-mcp/issues/1977)
+  (broader C-ABI, deferred to v1.x)

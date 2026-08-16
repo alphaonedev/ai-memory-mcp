@@ -273,7 +273,7 @@ footer a{color:var(--text-muted)}
         <div class="desc">Working memory. Notes from <em>right now</em>. Things you'd lose if you slept on them. Auto-expires unless explicitly extended. Use for: call logs, transient observations, "remind me at 3pm," intermediate reasoning steps.</div>
         <div class="meta">
           <div class="row"><span class="lbl">TTL</span><span class="val">6 × 3600s</span></div>
-          <div class="row"><span class="lbl">Extend</span><span class="val">reset to now+1h on access</span></div>
+          <div class="row"><span class="lbl">Extend</span><span class="val">floor: MAX(expiry, now+1h) — #1596</span></div>
           <div class="row"><span class="lbl">Expires?</span><span class="val">yes</span></div>
           <div class="row"><span class="lbl">Tier rank</span><span class="val">0</span></div>
         </div>
@@ -284,7 +284,7 @@ footer a{color:var(--text-muted)}
         <div class="desc">Episodic memory. Project context. The default tier. A week is enough for a sprint, a deal cycle, or a research thread. Auto-expires unless promoted to Long. Use for: sprint goals, customer notes, debugging sessions, draft decisions.</div>
         <div class="meta">
           <div class="row"><span class="lbl">TTL</span><span class="val">7 × 86400s</span></div>
-          <div class="row"><span class="lbl">Extend</span><span class="val">reset to now+1d on access</span></div>
+          <div class="row"><span class="lbl">Extend</span><span class="val">floor: MAX(expiry, now+1d) — #1596</span></div>
           <div class="row"><span class="lbl">Expires?</span><span class="val">yes</span></div>
           <div class="row"><span class="lbl">Tier rank</span><span class="val">1</span></div>
         </div>
@@ -361,7 +361,7 @@ footer a{color:var(--text-muted)}
       <text class="ann" x="780" y="270" text-anchor="middle">expires</text>
       <text class="ann" x="1100" y="65" text-anchor="end">durable</text>
     </svg>
-    <p class="lede"><em>The slopes are illustrative — the actual retention curve is binary in v0.6.3 (memory either exists past TTL or has been GC'd / archived). v0.7+ may add probabilistic decay if telemetry shows operators want it.</em></p>
+    <p class="lede"><em>The slopes are illustrative — the actual retention curve is binary under the current discrete-tier retention model (<code>RetentionModel::DiscreteTtlTiers</code>): a memory either exists past its TTL or has been GC'd / archived. A future continuous cost-of-access model (G15, #1829) can add a probabilistic-decay <code>RetentionModel</code> variant without changing these baseline per-tier values.</em></p>
   </div>
 </section>
 
