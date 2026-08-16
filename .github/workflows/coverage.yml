@@ -215,6 +215,14 @@ jobs:
                       /usr/local/share/boost /usr/local/lib/node_modules \
                       /opt/google /usr/lib/jvm /opt/microsoft \
                       /usr/share/swift /usr/share/miniconda || true
+          # #2960 — also free the whole tool cache ($AGENT_TOOLSDIRECTORY =
+          # /opt/hostedtoolcache, ~10 GiB). The HF pre-stage step below uses
+          # the SYSTEM /usr/bin/python3 (there is no setup-python step), and
+          # everything else comes via rustup / apt / taiki-e install-action,
+          # so nothing reads the tool cache after this — pure extra headroom
+          # for the llvm-cov instrumented build that ran out of disk on
+          # run 31911087758.
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
           sudo docker system prune -af --volumes || true
           sudo apt-get autoremove --purge -y || true
           sudo apt-get clean

@@ -501,7 +501,26 @@ jobs:
           sudo rm -rf /usr/local/lib/android         || true  # ~13 GiB
           sudo rm -rf /opt/ghc                       || true  # ~5 GiB
           sudo rm -rf /usr/local/.ghcup              || true  # ~6 GiB (#1810)
+          # #2960 — the existing pruning above (dotnet/CodeQL/android/ghc/
+          # ghcup) was no longer enough headroom for the grown ~200k-LOC +
+          # ~600-dep debug test-compile: run 31911087758 died with
+          # `rustc-LLVM ERROR: No space left on device` on this Check
+          # (ubuntu-latest) leg. Bring the Check reclaim up to parity with
+          # the (heavier, already-passing-on-space) Postgres + Coverage
+          # legs and additionally free the whole tool cache
+          # ($AGENT_TOOLSDIRECTORY = /opt/hostedtoolcache, ~10 GiB of
+          # Python/Node/Go/Ruby/PyPy) — safe here because setup-python /
+          # setup-node run AFTER this step and repopulate exactly the
+          # versions the conformance readers (#2452) need. Pure first-party
+          # shell per the no-external-code-injection rule; each rm is
+          # best-effort so a shifting runner image never fails the step.
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-}"    || true  # ~10 GiB (#2960)
+          sudo rm -rf /usr/local/share/powershell /usr/local/share/chromium \
+                      /usr/local/share/boost /usr/local/lib/node_modules \
+                      /opt/google /usr/lib/jvm /opt/microsoft \
+                      /usr/share/swift /usr/share/miniconda || true  # ~15 GiB (#2960)
           sudo docker system prune -af --volumes     || true  # ~4 GiB (#1810)
+          sudo apt-get autoremove --purge -y         || true
           sudo apt-get clean
           # #1810 — bring the Check job's pre-test disk cleanup up to parity
           # with the (passing, heavier-llvm-cov) Coverage job, which already
@@ -522,6 +541,55 @@ jobs:
           df -h /
           free -h
           echo "::endgroup::"
+
+      # #2960 — macOS reclaim. The macos-latest image ships a large bundled
+      # iOS/tvOS/watchOS Simulator runtime set (each ~7-13 GiB) that a
+      # pure-Rust host build + test suite never touches, plus their caches.
+      # Freeing them before any cargo/toolchain step gives the grown
+      # ~200k-LOC debug test-compile headroom on the same
+      # `rustc-LLVM ERROR: No space left on device` class the ubuntu leg
+      # hit (run 31911087758). Pure first-party shell (no external action)
+      # per the no-external-code-injection rule; every rm is best-effort so
+      # a shifting runner image never fails the step. The df -h before/after
+      # makes the freed space (or a non-disk root cause) visible in the log.
+      - name: Free disk before tests (macos-latest, #2960)
+        if: needs.classify.outputs.docs_only != 'true' && matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          set -u
+          echo "::group::Disk usage before cleanup (macOS)"
+          df -h /
+          echo "::endgroup::"
+          # Simulator runtimes + their caches — the biggest reclaimable set
+          # for a host-only Rust build; the toolchain (Command Line Tools /
+          # selected Xcode) is left untouched so the linker/clang stay intact.
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
+          sudo rm -rf ~/Library/Developer/CoreSimulator/Caches/* || true
+          sudo rm -rf ~/Library/Developer/Xcode/iOS\ DeviceSupport/* || true
+          echo "::group::Disk usage after cleanup (macOS)"
+          df -h /
+          echo "::endgroup::"
+
+      # #2960 — Windows reclaim. The windows-latest image ships a bundled
+      # Android SDK/NDK under C:\Android (~9-11 GiB) that a Rust build never
+      # uses; freeing it before any cargo step gives the debug test-compile
+      # +release build headroom against the same ENOSPC class. Uses pwsh
+      # (the Windows default shell) so no external tooling is required; the
+      # remove is best-effort. The drive report before/after makes the freed
+      # space (or a non-disk root cause) visible in the log.
+      - name: Free disk before tests (windows-latest, #2960)
+        if: needs.classify.outputs.docs_only != 'true' && matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Write-Host "::group::Disk usage before cleanup (Windows)"
+          Get-PSDrive C | Select-Object Used,Free
+          Write-Host "::endgroup::"
+          foreach ($p in @('C:\Android', 'C:\Program Files (x86)\Android')) {
+            if (Test-Path $p) { Remove-Item -Recurse -Force $p -ErrorAction SilentlyContinue }
+          }
+          Write-Host "::group::Disk usage after cleanup (Windows)"
+          Get-PSDrive C | Select-Object Used,Free
+          Write-Host "::endgroup::"
 
       # #2452 — tests/conformance_readers.rs is now FAIL-CLOSED: an absent
       # python3/node is a test FAILURE, not a silent pass. Provision both
@@ -824,6 +892,13 @@ jobs:
                       /usr/local/share/boost /usr/local/lib/node_modules \
                       /opt/google /usr/lib/jvm /opt/microsoft \
                       /usr/share/swift /usr/share/miniconda || true
+          # #2960 — also free the whole tool cache ($AGENT_TOOLSDIRECTORY =
+          # /opt/hostedtoolcache, ~10 GiB). Nothing after this step reads it
+          # (Rust comes via rustup, jq/postgresql-client via apt, python3 is
+          # the system /usr/bin/python3), so this is pure additional headroom
+          # for the sal-postgres test-compile that ran out of space on
+          # run 31911087758.
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
           sudo docker system prune -af --volumes || true
           sudo apt-get autoremove --purge -y || true
           sudo apt-get clean
