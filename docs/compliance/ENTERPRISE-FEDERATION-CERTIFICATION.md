@@ -542,8 +542,9 @@ posture is strictly STRONGER, never weaker, than at `e22bc93c`.
 observable quarantine).** The federation-wire surface changed:
 `src/handlers/federation_receive.rs::maybe_quarantine_unattributed` now
 emits a Prometheus counter (`ai_memory_fed_quarantined_unattributed_total`,
-registered in `src/metrics.rs`) plus a sampled `tracing::warn!` (target
-`federation.quarantine.unattributed`) whenever the route-IN provenance gate
+registered in `src/metrics.rs`) plus one `tracing::warn!` per quarantined
+row (target `federation.quarantine.unattributed`) whenever the route-IN
+provenance gate
 quarantines an unattributed inbound relayed memory. The change is
 **purely additive OBSERVABILITY** closing the #2444 silent-hide
 anti-pattern (the quarantine used to emit nothing while `/sync/push`

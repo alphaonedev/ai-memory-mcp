@@ -236,8 +236,10 @@ pub struct Metrics {
     /// (`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`, env #123): an
     /// unattributed (`attest_level != agent_attested`) row stored with
     /// `lifecycle_state=quarantined` and structurally hidden from every
-    /// local read/egress lane. Pairs with the sampled
-    /// `federation.quarantine.unattributed` WARN. **Always zero when the
+    /// local read/egress lane. Pairs with one `tracing::warn!` per
+    /// quarantined row under target `federation.quarantine.unattributed`
+    /// (a quarantine is a discrete security event, logged each time).
+    /// **Always zero when the
     /// quarantine knob is OFF (the default)** — the counter only moves on
     /// an actual quarantine, so a non-zero value means a peer relayed
     /// provenance-less content that this node is now black-holing until
@@ -705,8 +707,9 @@ impl Metrics {
         // #2966 (L6 5-agent vote 4d3ea1c5) — route-IN quarantine
         // observability. The provenance gate used to flip a row to
         // lifecycle_state=quarantined and emit NOTHING while /sync/push
-        // returned 200 (the #2444 silent-hide shape); this counter + the
-        // sampled WARN at the quarantine site make the black-hole visible.
+        // returned 200 (the #2444 silent-hide shape); this counter + a
+        // per-quarantine WARN at the quarantine site make the black-hole
+        // visible.
         let federation_quarantined_unattributed = IntCounter::new(
             "ai_memory_fed_quarantined_unattributed_total",
             "Monotonic count of inbound relayed memories quarantined by the \
@@ -1073,7 +1076,7 @@ pub fn record_auto_export_spawn_failed() {
 }
 
 /// #2966 (L6 5-agent vote `4d3ea1c5`) — record one inbound relayed memory
-/// QUARANTINED by the route-IN provenance gate. Pairs with the sampled
+/// QUARANTINED by the route-IN provenance gate. Pairs with a per-quarantine
 /// `federation.quarantine.unattributed` WARN at the call site
 /// (`crate::handlers::federation_receive::maybe_quarantine_unattributed`).
 /// Incremented once per row actually quarantined; never fires when the
