@@ -107,7 +107,7 @@ footer a{color:var(--muted)}
     <thead><tr><th>Capability</th><th>Vector DB only</th><th>ai-memory</th></tr></thead>
     <tbody>
       <tr><td>Semantic similarity search</td><td class="yes">Yes</td><td class="yes">Yes (hybrid: FTS5 + cosine)</td></tr>
-      <tr><td>Typed memory kinds</td><td class="no">No</td><td class="yes">10 governed kinds (Form-6 vocabulary)</td></tr>
+      <tr><td>Typed memory kinds</td><td class="no">No</td><td class="yes">16 typed kinds (Form-6 base + typed-cognition + epistemic)</td></tr>
       <tr><td>Knowledge graph with temporal validity</td><td class="no">No</td><td class="yes">Apache AGE, <code>valid_from</code> / <code>valid_until</code></td></tr>
       <tr><td>Ed25519-signed memory links</td><td class="no">No</td><td class="yes">Per-link attest_level</td></tr>
       <tr><td>Operator-signed substrate rules</td><td class="no">No</td><td class="yes">L1&ndash;L6, key on disk</td></tr>
@@ -200,9 +200,9 @@ footer a{color:var(--muted)}
       <p>Actions, leases, signals, attested checkpoints, and scheduled routines (#1709); typed-cognition lifecycle state; federation hardening &mdash; secure-default peer enrollment (#1789), signed action-transition replication (#1718), and per-write content attestation (#1464).</p>
     </div>
     <div class="tl-item">
-      <div class="when">v1.0 &mdash; targeted</div>
-      <h4>Wire-format stability, reproducible builds, SOC 2-friendly audit packaging.</h4>
-      <p>Frozen MCP tool + HTTP API contract, reproducible-build verification, evidence-pack tooling for compliance auditors.</p>
+      <div class="when">v0.9.0 &ndash; v1.0.0 &mdash; crypto-core + federation certification (current release line)</div>
+      <h4>Append-only audit spine, identity lineage, per-write content attestation, and a certified enterprise-federation scope.</h4>
+      <p>Signed revision spine and witness-anchored audit chain (G5/G6), Ed25519 identity-lineage succession, capability macaroons, and content-attested federation receive. Enterprise-federation is certified for 500&ndash;1000-agent clusters across &le;50 peers &mdash; the explicit scope and its limits are stated in the <a href="../compliance/index.html">compliance docs</a>, not extrapolated to millions. Remaining v1.0.0 finalization: wire-format freeze, reproducible-build verification, and SOC 2-friendly evidence packaging.</p>
     </div>
   </div>
 </section>
@@ -210,7 +210,7 @@ footer a{color:var(--muted)}
 <section class="wrap-mid">
   <div class="eyebrow-h2">Who is using it</div>
   <h2>The dogfooders.</h2>
-  <p>ai-memory is dogfooded by the maintainer's own multi-agent Claude Code workflow (the same workflow that builds every release). Every <code>release/v0.8.x.y</code> branch sits in real use for at least 24 hours against the operator's live MCP database before a tag cuts. Migration round-trips (now through schema v89) are tested against the operator's own DB on every commit. The project is also exercised by the IronClaw A2A 4-domain campaign on Docker against xAI Grok 4.3.</p>
+  <p>ai-memory is dogfooded by the maintainer's own multi-agent Claude Code workflow (the same workflow that builds every release). Every <code>release/v1.0.0</code> branch sits in real use for at least 24 hours against the operator's live MCP database before a tag cuts. Migration round-trips (now through schema v89) are tested against the operator's own DB on every commit. The project is also exercised by the IronClaw A2A 4-domain campaign on Docker against xAI Grok 4.3.</p>
   <p>External adoption is intentionally early-and-honest; if you are evaluating for production, the recommended path is to dogfood it against a non-critical agent first and reach out via GitHub issues for any gaps.</p>
 </section>
 

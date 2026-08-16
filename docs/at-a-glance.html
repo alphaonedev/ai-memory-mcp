@@ -762,8 +762,8 @@ footer.site-foot a { color: var(--text-muted); }
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ At a Glance</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v09.html" style="color:#c8a2ff">v0.9.0</a>
-      <a href="whats-new-v09.html" style="color:#ffb86b">v0.9.0</a>
+      <a href="whats-new-v09.html" style="color:#c8a2ff">What's new</a>
+      <a href="whats-new-v09.html" style="color:#ffb86b">What's new</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -1284,7 +1284,7 @@ footer.site-foot a { color: var(--text-muted); }
     </div>
 
     <div class="callout">
-      <strong>Every PR. Every push. Every release branch.</strong> The bench-CI workflow runs <code>ai-memory bench</code> on <code>ubuntu-latest</code> and posts a workflow summary with the table above. A regression of more than 10% on any p95 fails the build. There is no "we'll fix the latency later" path.
+      <strong>Every PR. Every push. Every release branch.</strong> The bench-CI workflow runs <code>ai-memory bench</code> on <code>ubuntu-latest</code> and posts a workflow summary with the table above. A regression of more than 10% on any p95 turns the bench job red — an advisory signal on every PR (bench is deliberately not in the required-status-checks, so it flags the regression loudly rather than hard-blocking the merge).
     </div>
   </div>
 </section>
@@ -1408,8 +1408,8 @@ footer.site-foot a { color: var(--text-muted); }
       <g>
         <rect class="node-bg lead" x="380" y="40" width="120" height="80" rx="12"/>
         <text class="node-text" x="440" y="70">node-1</text>
-        <text class="node-sub" x="440" y="88">leader</text>
-        <text class="node-sub" x="440" y="105">writer</text>
+        <text class="node-sub" x="440" y="88">write origin</text>
+        <text class="node-sub" x="440" y="105">no standing leader</text>
       </g>
 
       <!-- Peer nodes -->

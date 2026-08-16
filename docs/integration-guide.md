@@ -1,7 +1,7 @@
 ---
 layout: doc
 ---
-# ai-memory v0.8.0 — integration guide
+# ai-memory v1.0.0 — integration guide
 
 How to wire ai-memory to **any AI** — Claude, Cursor, ChatGPT,
 Continue.dev, generic MCP clients, and even AIs that don't speak MCP
@@ -28,7 +28,7 @@ covers everything the MCP surface does, plus a few more endpoints
 (94 route registrations / 80 unique URL paths).
 
 Every recipe below assumes the binary is on your `PATH`. If
-`ai-memory --version` doesn't print `0.8.0`, go back to
+`ai-memory --version` doesn't print `1.0.0`, go back to
 [`docs/install-quickstart.md`](install-quickstart.html) §3.
 
 ## 2. Claude Code (Anthropic)
@@ -175,7 +175,7 @@ env-block recipe for smart / autonomous tiers:
 
 ## 4. ChatGPT Desktop
 
-**State of the world (v0.8.0):** ChatGPT Desktop does not currently
+**State of the world (v1.0.0):** ChatGPT Desktop does not currently
 ship native MCP-client support. The integration paths are (in order
 of operational simplicity):
 
@@ -412,7 +412,7 @@ approval flow, and the recommended deployment topologies — see
 
 ## 10. Security defaults
 
-ai-memory v0.8.0 ships with secure defaults already on. **You do
+ai-memory v1.0.0 ships with secure defaults already on. **You do
 not have to configure these to get them.** Worth knowing about:
 
 - **Permissions enforced by default.** `permissions.mode = "enforce"`

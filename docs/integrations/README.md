@@ -34,15 +34,15 @@ agents and humans always know exactly what's loaded and what's configured.
 
 ```text
 # ai-memory boot: ok
-#   version:    0.8.0
-#   db:         /home/u/.claude/ai-memory.db (schema=v78, 161 memories)
+#   version:    1.0.0
+#   db:         /home/u/.claude/ai-memory.db (schema=v89, 161 memories)
 #   tier:       autonomous (embedder=nomic-ai/nomic-embed-text-v1.5, reranker=ms-marco-MiniLM-L-6-v2, llm=gemma3:4b)
 #   latency:    12ms
-#   namespace:  ai-memory-mcp/v0.8.0-release (loaded 3 memories)
+#   namespace:  ai-memory-mcp/v1.0.0-release (loaded 3 memories)
 ```
 
 > DOC-4 (med/low review batch) — example version + schema bumped to
-> match the current v0.9.0 substrate (`CURRENT_SCHEMA_VERSION = 89`).
+> match the current v1.0.0 substrate (`CURRENT_SCHEMA_VERSION = 89`).
 > The pre-v0.7.0 example showed v0.6.3 / schema v19, which was many
 > migrations behind the substrate and major releases behind the
 > daemon binary integrators land on today.

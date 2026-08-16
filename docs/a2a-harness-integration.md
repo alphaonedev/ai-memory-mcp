@@ -20,7 +20,7 @@ exercising this repo's binary.
 | TLS | optional | harness | `TLS_MODE=mtls` requires `/etc/ai-memory-a2a/tls/server.pem`; `TLS_MODE=off` is acceptable for harness-only smoke runs (no real-world peer exposure). |
 | identity | `AI_MEMORY_AGENT_ID` env | harness boot | every harness-spawned `ai-memory` process MUST set a unique `AI_MEMORY_AGENT_ID` (see CLAUDE.md §Agent Identity for the resolution ladder). |
 
-## v0.8.0 substrate guarantees the harness can rely on
+## v1.0.0 substrate guarantees the harness can rely on
 
 - 103 MCP tools at `--profile full`; 7 at `--profile core` + always-on
   `memory_capabilities`.

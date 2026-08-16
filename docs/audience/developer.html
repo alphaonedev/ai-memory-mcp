@@ -191,15 +191,15 @@ ai-memory serve</code></pre>
   <ol>
     <li>Explicit caller value (<code>--agent-id</code>, MCP <code>agent_id</code> param, or <code>metadata.agent_id</code> in store request)</li>
     <li><code>AI_MEMORY_AGENT_ID</code> env var</li>
-    <li>(MCP only) <code>initialize.clientInfo.name</code> &rarr; <code>ai:&lt;client&gt;@&lt;hostname&gt;:pid-&lt;pid&gt;</code></li>
-    <li><code>host:&lt;hostname&gt;:pid-&lt;pid&gt;-&lt;uuid8&gt;</code> (stable per-process)</li>
-    <li><code>anonymous:pid-&lt;pid&gt;-&lt;uuid8&gt;</code> (no hostname)</li>
+    <li>(MCP only) <code>initialize.clientInfo.name</code> &rarr; <code>ai:&lt;client&gt;@&lt;hostname&gt;</code> (durable; pid-free since #1720 B1)</li>
+    <li><code>host:&lt;hostname&gt;</code> (durable host-scoped default; pid-free since #1720 B1, stable across restarts)</li>
+    <li><code>anonymous:pid-&lt;pid&gt;-&lt;uuid8&gt;</code> (ephemeral fallback, no hostname)</li>
   </ol>
 
   <p>The HTTP daemon is multi-tenant and skips the process-level default: it reads <code>agent_id</code> from the request body, then <code>X-Agent-Id</code>, then assigns <code>anonymous:req-&lt;uuid8&gt;</code> and logs WARN.</p>
 
   <h3>Read-path visibility caller (#1468 / #1469)</h3>
-  <p>The ladder above resolves the <em>write</em> identity. The MCP read tools that enforce per-row <code>scope=private</code> ownership &mdash; <code>memory_session_start</code>, <code>memory_list</code>, <code>memory_search</code>, <code>memory_recall</code> &mdash; resolve their <em>visibility caller</em> from <code>AI_MEMORY_AGENT_ID</code> only (else <code>None</code>, trust-all). The pid-synthesized <code>clientInfo</code> id is deliberately not used: it embeds the live PID and could never match the <code>metadata.agent_id</code> an earlier process wrote, which would hide every prior-session private row from its owner. Set <code>AI_MEMORY_AGENT_ID</code> to drop cross-agent private rows from read results; leave it unset for single-tenant trust-all reads.</p>
+  <p>The ladder above resolves the <em>write</em> identity. The MCP read tools that enforce per-row <code>scope=private</code> ownership &mdash; <code>memory_session_start</code>, <code>memory_list</code>, <code>memory_search</code>, <code>memory_recall</code> &mdash; resolve their <em>visibility caller</em> from <code>AI_MEMORY_AGENT_ID</code> only (else <code>None</code>, trust-all). The synthesized <code>clientInfo</code> / <code>host</code> ids are deliberately not used here: historically (pre-#1720 B1) they embedded the live PID, so they could never match the <code>metadata.agent_id</code> an earlier process wrote and would hide every prior-session private row from its owner. #1720 B1 makes the <em>write</em>-side stamps durable + pid-free, but this read ladder still resolves the caller from <code>AI_MEMORY_AGENT_ID</code> only &mdash; durable stamps make a future enforced-read opt-in safe, they do not flip filtering on. Set <code>AI_MEMORY_AGENT_ID</code> to drop cross-agent private rows from read results; leave it unset for single-tenant trust-all reads.</p>
 
   <div class="callout"><strong>Validation regex:</strong> <code>^[A-Za-z0-9_\-:@./]{1,128}$</code>. Permits prefixed forms (<code>ai:</code>, <code>host:</code>), <code>@</code> scope separator, <code>/</code> for future SPIFFE-style ids. Rejects whitespace, null bytes, control chars, shell metacharacters.</div>
 
