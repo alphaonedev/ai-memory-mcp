@@ -231,6 +231,22 @@ pub struct Metrics {
     /// population).
     pub federation_erasure_superseded: IntCounter,
 
+    /// #2966 (L6 5-agent vote `4d3ea1c5`) — monotonic count of inbound
+    /// relayed memories QUARANTINED by the route-IN provenance gate
+    /// (`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`, env #123): an
+    /// unattributed (`attest_level != agent_attested`) row stored with
+    /// `lifecycle_state=quarantined` and structurally hidden from every
+    /// local read/egress lane. Pairs with one `tracing::warn!` per
+    /// quarantined row under target `federation.quarantine.unattributed`
+    /// (a quarantine is a discrete security event, logged each time).
+    /// **Always zero when the
+    /// quarantine knob is OFF (the default)** — the counter only moves on
+    /// an actual quarantine, so a non-zero value means a peer relayed
+    /// provenance-less content that this node is now black-holing until
+    /// dequarantine. Closes the #2444 silent-hide anti-pattern (the
+    /// quarantine used to emit nothing while `/sync/push` returned 200).
+    pub federation_quarantined_unattributed: IntCounter,
+
     /// pm-v3.1 PR8 (issue #1174) — cumulative HNSW oldest-eviction
     /// count since process start. Replaces the prior process-global
     /// `AtomicU64` `INDEX_EVICTIONS_TOTAL` in `src/hnsw.rs`.
@@ -688,6 +704,24 @@ impl Metrics {
         )?;
         registry.register(Box::new(federation_erasure_superseded.clone()))?;
 
+        // #2966 (L6 5-agent vote 4d3ea1c5) — route-IN quarantine
+        // observability. The provenance gate used to flip a row to
+        // lifecycle_state=quarantined and emit NOTHING while /sync/push
+        // returned 200 (the #2444 silent-hide shape); this counter + a
+        // per-quarantine WARN at the quarantine site make the black-hole
+        // visible.
+        let federation_quarantined_unattributed = IntCounter::new(
+            "ai_memory_fed_quarantined_unattributed_total",
+            "Monotonic count of inbound relayed memories quarantined by the \
+             route-IN provenance gate (AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED): \
+             an unattributed row stored with lifecycle_state=quarantined and \
+             hidden from every local read/egress lane until dequarantine. \
+             Always zero when the quarantine knob is off (the default); a \
+             non-zero rate means a peer is relaying provenance-less content \
+             this node is black-holing. #2966.",
+        )?;
+        registry.register(Box::new(federation_quarantined_unattributed.clone()))?;
+
         // pm-v3.1 PR8 (issue #1174) — HNSW eviction observability moved
         // from process-global atomics in `src/hnsw.rs` into the metrics
         // registry. The counter mirrors `INDEX_EVICTIONS_TOTAL`; the
@@ -917,6 +951,7 @@ impl Metrics {
             federation_push_dlq_quarantined_by_cause,
             federation_push_dlq_legacy_positional,
             federation_erasure_superseded,
+            federation_quarantined_unattributed,
             hnsw_evictions_total,
             hnsw_last_eviction_at_nanos,
             subscription_dlq_overflow_total,
@@ -1038,6 +1073,23 @@ pub fn record_corrupt_provenance(column: &str) {
 /// the same signal.
 pub fn record_auto_export_spawn_failed() {
     registry().auto_export_spawn_failed_total.inc();
+}
+
+/// #2966 (L6 5-agent vote `4d3ea1c5`) — record one inbound relayed memory
+/// QUARANTINED by the route-IN provenance gate. Pairs with a per-quarantine
+/// `federation.quarantine.unattributed` WARN at the call site
+/// (`crate::handlers::federation_receive::maybe_quarantine_unattributed`).
+/// Incremented once per row actually quarantined; never fires when the
+/// quarantine knob (`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`) is off.
+pub fn inc_fed_quarantined_unattributed() {
+    registry().federation_quarantined_unattributed.inc();
+}
+
+/// #2966 — read the current value of the route-IN quarantine counter.
+/// Test-only accessor for the regression that pins the observability wiring.
+#[must_use]
+pub fn fed_quarantined_unattributed_count() -> u64 {
+    registry().federation_quarantined_unattributed.get()
 }
 
 /// v1.0.0 #2577 — record one recall that degraded to keyword/FTS because
