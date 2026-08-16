@@ -875,6 +875,28 @@ pub(super) fn maybe_quarantine_unattributed(to_insert: &mut Memory, quarantine_e
     }
     if !row_is_agent_attested(to_insert) {
         to_insert.lifecycle_state = crate::models::LifecycleState::Quarantined;
+        // #2966 (L6 5-agent vote 4d3ea1c5) — the pre-#2966 code flipped the
+        // row to Quarantined and emitted NOTHING while /sync/push returned
+        // 200 (the #2444 silent-hide anti-pattern). Make the black-hole
+        // observable: one metric increment per quarantined row + a WARN
+        // naming id/namespace/agent_id ONLY (never content or secrets). The
+        // attributed author is the row's claimed `metadata.agent_id`.
+        crate::metrics::inc_fed_quarantined_unattributed();
+        let agent_id = to_insert
+            .metadata
+            .get(crate::META_KEY_AGENT_ID)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        tracing::warn!(
+            target: "federation.quarantine.unattributed",
+            id = %to_insert.id,
+            namespace = %to_insert.namespace,
+            agent_id = %agent_id,
+            "sync_push: quarantined provenance-less inbound relayed memory \
+             (AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED #123 / #1948) — stored \
+             lifecycle_state=quarantined, hidden from local reads until \
+             dequarantine-on-attest or operator dequarantine (#2966)"
+        );
     }
 }
 
@@ -4633,9 +4655,18 @@ mod tests {
 
     // -- #1948 route-IN quarantine helper -------------------------------
 
+    /// #2966 — serializes the two tests that observe the process-global
+    /// `ai_memory_fed_quarantined_unattributed_total` counter so their exact
+    /// delta assertions cannot race each other's increments (the only two
+    /// callers of `maybe_quarantine_unattributed` in the lib test binary).
+    static QUARANTINE_METRIC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn route_in_quarantines_only_unattributed_and_only_when_enabled() {
         use crate::models::LifecycleState;
+        let _guard = QUARANTINE_METRIC_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         // Knob OFF (permissive): a claimed (unattributed) row stays Open.
         let mut claimed = wsig_mem("ai:curator");
@@ -4661,5 +4692,63 @@ mod tests {
         assert!(row_is_agent_attested(&attested));
         maybe_quarantine_unattributed(&mut attested, true);
         assert_eq!(attested.lifecycle_state, LifecycleState::Open);
+    }
+
+    /// #2966 (L6 5-agent vote `4d3ea1c5`) — the route-IN quarantine must be
+    /// OBSERVABLE, not a silent hide (#2444). Assert the Prometheus counter
+    /// `ai_memory_fed_quarantined_unattributed_total` increments once per row
+    /// actually quarantined, and does NOT move on the byte-identical no-op
+    /// paths (knob OFF, or knob ON but the row is agent-attested).
+    #[test]
+    fn quarantine_increments_counter_only_on_actual_quarantine_2966() {
+        use crate::models::LifecycleState;
+        let _guard = QUARANTINE_METRIC_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let base = crate::metrics::fed_quarantined_unattributed_count();
+
+        // Knob OFF: byte-identical no-op — row stays Open, counter unmoved.
+        let mut off = wsig_mem("ai:curator");
+        off.metadata
+            .as_object_mut()
+            .unwrap()
+            .insert("attest_level".to_string(), serde_json::json!("claimed"));
+        maybe_quarantine_unattributed(&mut off, false);
+        assert_eq!(off.lifecycle_state, LifecycleState::Open);
+        assert_eq!(
+            crate::metrics::fed_quarantined_unattributed_count(),
+            base,
+            "knob OFF must not touch the quarantine counter"
+        );
+
+        // Knob ON + unattributed → quarantined AND counter += 1.
+        let mut claimed = wsig_mem("ai:curator");
+        claimed
+            .metadata
+            .as_object_mut()
+            .unwrap()
+            .insert("attest_level".to_string(), serde_json::json!("claimed"));
+        maybe_quarantine_unattributed(&mut claimed, true);
+        assert_eq!(claimed.lifecycle_state, LifecycleState::Quarantined);
+        assert_eq!(
+            crate::metrics::fed_quarantined_unattributed_count(),
+            base + 1,
+            "an actual quarantine must increment the counter exactly once"
+        );
+
+        // Knob ON but agent_attested → NOT quarantined, counter unmoved.
+        let mut attested = wsig_mem("ai:curator");
+        attested.metadata.as_object_mut().unwrap().insert(
+            "attest_level".to_string(),
+            serde_json::json!("agent_attested"),
+        );
+        maybe_quarantine_unattributed(&mut attested, true);
+        assert_eq!(attested.lifecycle_state, LifecycleState::Open);
+        assert_eq!(
+            crate::metrics::fed_quarantined_unattributed_count(),
+            base + 1,
+            "an agent-attested row must not increment the counter"
+        );
     }
 }
