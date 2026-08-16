@@ -114,7 +114,7 @@ right when a constraint listed in the "use case" column is breached.
 |---|---|---|---|---|---|---|---|---|---|
 | **T1 — Singleton** | Solo developer; 1 NHI experimentation; offline | SQLite (WAL) | One process; one host | 1 | 1 | <10 ms | none | none | `ai-memory backup --keep 48` |
 | **T2 — Multi-agent / single server** | Engineering team (≤5 agents) on a shared workstation or single VM | SQLite (WAL) shared | Many agents → one daemon | 2–10 | 1 | <15 ms | none (local mTLS optional) | none | hourly local + weekly off-host |
-| **T3 — Single-rack / same DC** | Team or small product cluster; HA pair or 3-node | Postgres 18.4 + AGE 1.7.0 + pgvector 0.8.6 (single primary) | Hub-spoke OR W-of-N (3 peers) | 5–50 | 2–5 | <30 ms (LAN RTT-bound) | mandatory between peers | hub-spoke or W-of-N | pg_basebackup + WAL archive |
+| **T3 — Single-rack / same DC** | Team or small product cluster; HA pair or 3-node | Postgres 18.6 + AGE 1.8.0 + pgvector 0.8.6 (single primary) | Hub-spoke OR W-of-N (3 peers) | 5–50 | 2–5 | <30 ms (LAN RTT-bound) | mandatory between peers | hub-spoke or W-of-N | pg_basebackup + WAL archive |
 | **T4 — Multi-rack / same DC** | Production cluster with rack-affinity routing | Postgres primary + ≥1 streaming replicas; AGE on primary | Rack-affinity W-of-N; per-rack ai-memory replicas | 50–250 | 5–15 | <50 ms (cross-rack RTT) | mandatory | rack-aware W-of-N | pg_basebackup + WAL archive + rack-tagged snapshots |
 | **T5 — Multi-DC / same region** | Multi-AZ within a region; DR ready | Postgres primary + sync replica in second DC (or async-with-RPO) + AGE | Cross-DC federation peers; quorum spans DCs | 250–1000 | 15–50 | 50–150 ms (intra-region WAN) | mandatory | cross-DC W-of-N with quorum tuned for partition | pg_basebackup + WAL ship + off-region | 
 | **T6 — Multi-region / global** | Global product; data-residency requirements | Postgres + AGE **per region**; federation peers between regions | Regional clusters federate; local-first recall | 1000+ | 50–500 | <30 ms local recall; 150–500 ms global propagation | mandatory; per-region CA | regional clusters peer via signed `X-Memory-Sig` + `X-Memory-Nonce` | regional pg snapshots + cross-region object store |
@@ -173,9 +173,10 @@ $ ai-memory serve --port 9077     # HTTP REST; localhost-only by default
 ```
 
 The MCP-stdio dispatch loop is single-threaded by JSON-RPC stdio
-protocol design (`for line in stdin.lock().lines()` in
-`src/mcp/mod.rs:2013`) — there is no concurrent dispatch and no
-mutex is required. The HTTP daemon uses `Arc<Mutex<Connection>>`
+protocol design — a length-capped manual `read_until(b'\n')` reader
+(post-#1249 DoS guard, `MCP_MAX_LINE_BYTES`; the pre-#1249 form was
+`for line in stdin.lock().lines()`) in `src/mcp/mod.rs` — so there is
+no concurrent dispatch and no mutex is required. The HTTP daemon uses `Arc<Mutex<Connection>>`
 (`src/handlers/transport.rs:22`) protecting a single SQLite connection;
 lock contention is the bottleneck under concurrent HTTP load but at
 T1 scale (1 agent, single-host) the contention is unobservable.
@@ -434,8 +435,8 @@ production Dockerfile. Quick summary:
 
 | Component | Pinned version |
 |---|---|
-| PostgreSQL | **18.4** (canonical; SSOT `deploy/docker-1461/provision/lib.sh`). PG 16.x + AGE 1.6.0 is a tested alternate matrix (`infra/lan-parity-test/`). |
-| Apache AGE | **1.7.0** (targets PG 18; bundled `deploy/docker-1461/Dockerfile.pg-age-vector`) |
+| PostgreSQL | **18.6** (canonical; SSOT `deploy/docker-1461/provision/lib.sh` `EXPECTED_PG_VERSION`). PG 16 + AGE 1.6.0 is a tested alternate matrix (`infra/lan-parity-test/`). |
+| Apache AGE | **1.8.0** (canonical extversion; SSOT `EXPECTED_AGE_VERSION`) — overlaid via a pinned pgdg apt install on top of the `apache/age:release_PG18_1.7.0` base image (the Docker Hub image ships AGE 1.7.0; the bundled `deploy/docker-1461/Dockerfile.pg-age-vector` bumps `age.control` to 1.8.0, so `CREATE EXTENSION age` reports extversion 1.8.0) |
 | pgvector | **0.8.6** (`PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1`; Rust binding crate `pgvector = "0.4"`) |
 | ai-memory build | `cargo build --release --features sal-postgres` |
 
@@ -1421,10 +1422,12 @@ build time and `hnsw.ef_search=80` at query time
 ### 10.3 AGE extension install + permissions
 
 See [`postgres-age-guide.md §"Install — Ubuntu 24.04 example"`](postgres-age-guide.html)
-for the AGE 1.7.0-from-source recipe. The bundled
-`deploy/docker-1461/Dockerfile.pg-age-vector` (#1065) stacks
-pgvector 0.8.6 on top of `apache/age:release_PG18_1.7.0` so K8s / ECS /
-Cloud Run users don't have to build AGE themselves.
+for the AGE from-source recipe. The bundled
+`deploy/docker-1461/Dockerfile.pg-age-vector` (#1065) does NO source
+build — it overlays pinned pgdg `.deb`s on top of the
+`apache/age:release_PG18_1.7.0` base image: the server minor is bumped to
+PG 18.6, AGE to 1.8.0 (extversion), and pgvector 0.8.6 is installed — so
+K8s / ECS / Cloud Run users don't have to build AGE themselves.
 
 Permissions:
 
@@ -1474,20 +1477,24 @@ Retention sizing reference:
 
 ### 10.6 Upgrade path — AGE minor version pinning
 
-**Pin AGE to a specific minor.** The v0.7.0 reference is
-`apache/age:release_PG18_1.7.0` (with the bundled pgvector 0.8.6 layer).
-Do not let your Postgres host's apt-update silently upgrade AGE
-across a minor — the Cypher binding semantics have changed between AGE
-minors historically, and the v0.7.0 canonical substrate targets 1.7.0.
+**Pin AGE to a specific minor.** The v1.0.0 reference builds on the
+`apache/age:release_PG18_1.7.0` base image but pins AGE to **1.8.0**
+(extversion) and pgvector to **0.8.6** via the bundled
+`Dockerfile.pg-age-vector` apt overlay (SSOT `provision/lib.sh`
+`AGE_APT_VERSION` / `PGVECTOR_APT_VERSION`). Do not let your Postgres
+host's apt-update silently upgrade AGE across a minor — the Cypher
+binding semantics have changed between AGE minors historically, and the
+v1.0.0 canonical substrate targets AGE 1.8.0.
 
 Upgrade procedure:
 
 1. Snapshot the primary (`pg_basebackup` + verify).
 2. Stop the ai-memory daemons.
 3. Stop Postgres (`systemctl stop postgresql@18-main`).
-4. Upgrade AGE (`apt install postgresql-age-1.7.x`) — operator-paced.
-5. Start Postgres; verify `SELECT * FROM pg_extension WHERE
-   extname='age';` shows the new version.
+4. Upgrade AGE (`apt install postgresql-18-age=<AGE_APT_VERSION>`, e.g.
+   the pinned 1.8.0 `.deb`) — operator-paced.
+5. Start Postgres; verify `SELECT extversion FROM pg_extension WHERE
+   extname='age';` reports the new version (expect `1.8.0`).
 6. Start the ai-memory daemons.
 7. Run the `tests/recall_scoring_parity.rs` + `tests/age_vs_cte.rs`
    parity suite against the upgraded host (operator-side, against a
@@ -1915,9 +1922,70 @@ it, and flip it back.
 ### 14.8 Backup + tooling discipline
 
 - [ ] Backup cadence per §13.1; quarterly restore drill against a scratch host (§13.2).
-- [ ] Daemon binary version pinned per-host (no auto-update); AGE minor pinned (v0.7.0 reference: 1.7.0; upgrade procedure §10.6); PgBouncer version pinned with `pool_mode = transaction`.
+- [ ] Daemon binary version pinned per-host (no auto-update); AGE minor pinned (v1.0.0 reference: 1.8.0 extversion; upgrade procedure §10.6); PgBouncer version pinned with `pool_mode = transaction`.
 
-### 14.9 Cross-references
+### 14.9 One-command hardened posture + the certified-posture gate
+
+The checklist above is the itemised view. v1.0.0 ships two mechanical
+shortcuts so a fleet operator does not audit each knob by hand:
+
+**`AI_MEMORY_SECURITY_PROFILE=asi-hard` — the NO-DISABLE hardened
+posture.** One named knob pins the fail-closed security floor: at boot
+the profile PINS **17** security env knobs to their hard value (SSOT
+`src/security_profile.rs::KNOBS`; the copy-deployable template is
+[`deploy/asi-hard.env`](deploy/asi-hard.env), pinned by
+`tests/deploy_templates.rs`) and **refuses to boot** if an operator set
+any pinned knob below its hard floor. The pinned set is the
+attestation / audit-chain / durability / network-access-control floor —
+`AI_MEMORY_SECRET_SCREEN_MODE=refuse`,
+`AI_MEMORY_REQUIRE_AGENT_ATTESTATION`,
+`AI_MEMORY_FED_REQUIRE_WRITE_SIG` / `…_SIGNAL_SIG` / `…_TRANSITION_SIG` /
+`…_CHECKPOINT_SIG`, `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`,
+`AI_MEMORY_CID_ENFORCE`, `AI_MEMORY_REQUIRE_ROLLBACK_CHECK` / `…_WITNESS`
+/ `…_CAUSE_BINDING` / `…_ROLE_SEPARATION` / `…_IDENTITY_LINEAGE`,
+`AI_MEMORY_FED_REQUIRE_SERVER_VERIFY` (the first network access-control
+pin, #2448 — `--insecure-skip-server-verify` is refused), and
+`AI_MEMORY_DB_SYNCHRONOUS=FULL` (power-loss durability). **Two of the
+17 are permissive-shaped pins whose hard floor is the INVERSE:**
+`AI_MEMORY_ALLOW_SCHEMA_AHEAD` must be **unset** (the #2445
+schema-downgrade hatch — an older binary may not open/write a newer DB)
+and `AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS` must be **non-truthy** (the
+#2477 plaintext-peer hatch — an `http://` peer on a non-loopback host is
+refused). asi-hard does NOT force inference-egress posture — that stays
+a deployment choice (`AI_MEMORY_INFERENCE_EGRESS=loopback-only` in the
+template).
+
+- [ ] `AI_MEMORY_SECURITY_PROFILE=asi-hard` on every federated daemon; boot banner confirms the pins (a below-floor knob aborts boot loudly — that is the intended behaviour, not a failure).
+
+**`ai-memory doctor --posture enterprise-federation` — the machine-checked
+certified gate.** The certified enterprise-federation configuration is
+verified by **18** posture checks (SSOT
+`src/enterprise_federation_posture.rs`, `ENTERPRISE_FEDERATION_CHECK_COUNT`):
+asi-hard engaged + all 17 pins at floor, peer enrollment required, `X-Memory-Sig`
++ nonce enforced, inbound-write namespace confinement, governance
+`permissions=enforce` + fail-closed, a scoped trust domain, peer
+cert-fingerprint pinning, per-peer attestation with **no `**` allow-all
+glob**, the two trust-bypass envs off, at-rest encryption, TLS on the
+bind, the boot gate armed, and `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT`.
+Run it as a pre-flight and a CI gate; a non-zero exit names the failing
+control. Arm the same gate at daemon boot with
+`AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE=1` so a node that is not
+in the certified posture refuses to start rather than serving a weaker
+configuration.
+
+- [ ] `ai-memory doctor --posture enterprise-federation` exits 0 on every node before it joins the mesh; `AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE=1` set so boot fails closed if the posture regresses.
+
+> **Certified scope (anti-overclaim).** The certified envelope is a
+> **500–1000 agent cluster composed in 500-agent blocks, ≤50 peers** — a
+> derived topology ceiling with §6 limits explicit, NOT a measured
+> million-agent capacity. The canonical, machine-checked statement of the
+> certified configuration + trust boundary is
+> [`compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md`](compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md);
+> where this checklist and that document disagree, the certification
+> document supersedes. Federation is **not** end-to-end encrypted
+> (#1968) — see §14.6.
+
+### 14.10 Cross-references
 
 - [`production-deployment.md`](production-deployment.html) — single-instance baseline.
 - [`federation.md`](federation.html) — three auth layers; mTLS rotation; revocation; 3am runbook.

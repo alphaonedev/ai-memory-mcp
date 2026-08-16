@@ -249,7 +249,7 @@ table tr:last-child td{border-bottom:none}
 </nav>
 
 <section class="hero">
-  <span class="cap-badge cap-today">SHIPS TODAY · v0.9.0</span>
+  <span class="cap-badge cap-today">SHIPS TODAY · v1.0.0</span>
   <h1>Tier 1 — Single node, single agent</h1>
   <p class="tagline">The bedrock primitive. <strong>One process. One consumer. Zero network.</strong> SQLite + WAL, FTS5 keyword recall, in-process HNSW vector index, no replication, no peers.</p>
   <div class="pills">
@@ -325,7 +325,7 @@ table tr:last-child td{border-bottom:none}
           <rect x="306" y="195" width="248" height="64" rx="8" class="node" />
           <text x="430" y="214" text-anchor="middle" class="node-label" style="font-size: 11px">Recall pipeline</text>
           <text x="430" y="230" text-anchor="middle" class="sub-label">FTS5 keyword + HNSW semantic</text>
-          <text x="430" y="245" text-anchor="middle" class="sub-label">adaptive blend · touch + auto-promote</text>
+          <text x="430" y="245" text-anchor="middle" class="sub-label">adaptive blend · pure read → access ledger</text>
 
           <!-- Governance + KG -->
           <rect x="306" y="275" width="120" height="68" rx="8" class="node" />
@@ -394,7 +394,7 @@ table tr:last-child td{border-bottom:none}
 
       <div class="arch-diagram-caption">
         Agent talks to ai-memory over MCP, HTTP, or CLI. The HTTP daemon guards a single SQLite connection behind a mutex; MCP stdio is single-threaded by protocol; each CLI invocation opens its own connection (#965 audit).
-        Every recall is a hot loop — FTS5 + HNSW + scoring + access-count touch — all in-process.
+        Every recall is a hot loop — FTS5 + HNSW + scoring — all in-process. At v1.0.0 recall is <strong>pure</strong> (#1869/#1953): it writes zero rows to <code>memories</code>; the access signal (access-count, TTL floor-extend, mid→long promotion, priority) lands in the append-only <code>recall_observations</code> ledger and is applied by an async fold job, not during the read.
       </div>
     </div>
   </div>
@@ -421,7 +421,7 @@ table tr:last-child td{border-bottom:none}
       <li><strong>FTS5 keyword pass</strong> — fuzzy OR query, scored by <code>(fts.rank * -1) + priority*0.5 + MIN(access_count, 50)*0.1 + confidence*2.0 + tier_bonus + recency_factor</code>.</li>
       <li><strong>Semantic pass</strong> — cosine similarity via HNSW (or linear scan fallback); skipped entirely in the keyword tier.</li>
       <li><strong>Adaptive blend</strong> — semantic weight varies 0.50 (short content) → 0.15 (long content) because embeddings lose information on long text. Final score is <code>semantic_weight * cosine + (1 - semantic_weight) * norm_fts</code>.</li>
-      <li><strong>Touch</strong> — every returned memory has <code>access_count</code> incremented, TTL extended, and (for mid-tier memories) auto-promoted to long-tier on the 5th access. Priority bumps every 10 accesses.</li>
+      <li><strong>Ledger, not touch (v1.0.0 pure recall, #1869/#1953)</strong> — recall writes <strong>zero</strong> rows to <code>memories</code>. Each returned memory appends an entry to the append-only <code>recall_observations</code> ledger instead. An async fold job (<code>db::fold_recall_accesses</code>, default every 60&nbsp;s, and fold-before-gc on every eviction) later applies the exact access ladders from unfolded ledger rows: <code>access_count</code> increment, TTL floor-extend, mid→long auto-promotion on the 5th access, priority bump every 10 accesses. The pre-v1.0.0 synchronous-touch path is gone (the <code>AI_MEMORY_RECALL_TOUCH_SYNC</code> escape hatch was removed at v1.0.0).</li>
       <li>Result formatted as <code>toon_compact</code> (40-60% smaller than JSON), <code>toon</code>, or <code>json</code>.</li>
     </ol>
 
@@ -497,7 +497,7 @@ ai-memory --db ~/.claude/ai-memory.db stats</code></pre>
 </section>
 
 <footer>
-  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.9.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
+  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v1.0.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
 </footer>
 
 </body>

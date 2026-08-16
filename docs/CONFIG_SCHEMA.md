@@ -478,6 +478,20 @@ methods:
 CLI flag  >  AI_MEMORY_LLM_* env  >  [llm] section  >  legacy flat fields  >  compiled default
 ```
 
+**The ONE documented inversion — the store-URL channel (#1927 / CWE-214).**
+`AppConfig::resolve_store_url` (`src/store_url.rs`) deliberately
+INVERTS the ladder above: `AI_MEMORY_STORE_URL_FILE` (env #158) >
+`AI_MEMORY_STORE_URL` (env #157) > the `--store-url` CLI flag. Here
+**env beats flag** — the reverse of every other knob. This is
+intentional: argv is world-readable via `/proc/<pid>/cmdline` and
+`ps auxww`, so the leakier channel (`--store-url`, which can carry a
+Postgres DSN password) must NOT be able to override the safer ones
+(the owner-only env block, or a `0600` file). `--store-url` carries no
+`#[arg(env = …)]`, so clap does not merge the flag and the env into one
+slot; passing a password-bearing `--store-url` while an env channel is
+set logs a WARN naming both. Source:
+`src/store_url.rs::{STORE_URL_FILE_ENV, STORE_URL_ENV, resolve_store_url}`.
+
 Resolvers are pure (no network I/O). File reads for `api_key_file`
 happen at resolve time; permission-bit enforcement is non-fatal and
 surfaces via `KeySource::Error(reason)` so the daemon can boot and
@@ -530,10 +544,14 @@ introduced for `AI_MEMORY_DB_PASSPHRASE_FILE`.
 The v0.6.x flat-field shape (`llm_model`, `ollama_url`, `embed_url`,
 `embedding_model`, `cross_encoder`, `default_namespace`,
 `archive_on_gc`, `archive_max_days`, `max_memory_mb`,
-`auto_tag_model`) continues to parse in v0.7.x and feeds the
+`auto_tag_model`) still parse at v1.0.0 and feed the
 resolver's `Legacy` arm. Loading a legacy config emits a one-shot
-stderr WARN pointing operators at the migration tool. **Legacy
-fields will be removed in v0.8.0.**
+stderr WARN pointing operators at the migration tool. **These fields
+remain parseable at v1.0.0.** They were slated for removal in v0.8.0
+(the `#[deprecated(note = "… slated for removal in v0.8.0")]`
+attribute in `src/config.rs` still says so), but that hard removal
+has not yet shipped — migrate off them with `ai-memory config
+migrate` rather than relying on the stale target.
 
 To migrate in place:
 

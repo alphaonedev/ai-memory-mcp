@@ -245,14 +245,14 @@ table tr:last-child td{border-bottom:none}
 </nav>
 
 <section class="hero">
-  <span class="cap-badge cap-today">CORE TODAY · v0.9.0</span>
+  <span class="cap-badge cap-today">CORE TODAY</span>
   <span class="cap-badge cap-today">PG+pgvector + Apache AGE · v0.8.0 SHIPPED</span>
   <h1>Tier 4 — Data-center swarm</h1>
-  <p class="tagline">Hundreds of nodes. Thousands of agents. Multiple racks. <strong>One coherent memory fabric.</strong> The core fabric shipped at v0.6.3; the shared distributed store (Postgres + pgvector + Apache AGE) is GA at v0.8.0.</p>
+  <p class="tagline">Multiple racks, one coherent memory fabric — sized as a <strong>certified ≤50-peer federation block carrying ~500–1000 agents</strong>. The core fabric shipped at v0.6.3; the shared distributed store (Postgres + pgvector + Apache AGE) is GA at v0.8.0. Scale past one block by composing independent clusters, not by growing one mesh past ~50 peers.</p>
   <div class="pills">
-    <span class="pill">100s nodes · 1000s agents</span>
+    <span class="pill">≤50-peer block · ~1000 agents</span>
     <span class="pill">multi-rack</span>
-    <span class="pill">3-of-5 quorum</span>
+    <span class="pill">W-of-N quorum</span>
     <span class="pill">mTLS allowlist</span>
   </div>
 </section>
@@ -484,7 +484,7 @@ table tr:last-child td{border-bottom:none}
         <tr><td>mTLS</td><td>enforced via fingerprint allowlist</td><td>unchanged</td></tr>
       </tbody>
     </table>
-    <p>A 10-rack, 100-node fleet with 3-of-5 quorum is in scope today. The piece that's still maturing is the <strong>Postgres backbone</strong> — the vector-index drift across nodes and the per-node SQLite operational footprint are the things shared-store fixes.</p>
+    <p>The certified federation unit is a <strong>≤50-peer block carrying ~500–1000 agents</strong> (issue #2438 retired the earlier 1M-fabric framing). The peer dimension is MEASURED to N=50 on a single host (#2921 capacity bench); the largest cross-host federation actually run is 2 nodes, and the agent figure is an architected — not measured — ceiling. A multi-rack fleet within that ceiling is in scope today; scale past it by composing <em>independent</em> clusters, never by growing one mesh past ~50 peers. The piece that's still maturing is the <strong>Postgres backbone</strong> — the vector-index drift across nodes and the per-node SQLite operational footprint are the things shared-store fixes.</p>
   </div>
 </section>
 
@@ -548,7 +548,7 @@ ai-memory --db /var/lib/ai-memory/store.db serve \
 </section>
 
 <footer>
-  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.9.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
+  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v1.0.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
 </footer>
 
 </body>

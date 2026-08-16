@@ -387,15 +387,21 @@ independently — these are layered on top.
   separators, `#` comments; a host may repeat for rotation). Pinned
   hosts are verified PIN-ONLY by SHA-256(DER) keyed per SNI host (the
   SSH `known_hosts` model), layered on top of the real rustls
-  handshake-signature check. The daemon quorum client is
-  **fail-closed** on an unpinned host (`UnpinnedHostPolicy::Reject` —
-  once you opt in, every peer must be pinned, and `--quorum-ca-cert` is
-  bypassed); on the `ai-memory sync` CLI an unpinned host falls through
-  to that path's own default, which since
-  [#1794](https://github.com/alphaonedev/ai-memory-mcp/issues/1794) is
-  **CA validation**, not accept-any (`UnpinnedHostPolicy::AcceptAny`
-  there means "no downgrade relative to the pre-pinning path", and the
-  accept-any disposition itself is now gated — see below). An
+  handshake-signature check. **BOTH outbound client paths — the daemon
+  quorum client (`src/federation/peer.rs`) AND the `ai-memory sync` CLI
+  (`src/cli/sync.rs::build_sync_client`) — call the SAME builder,
+  `tls::build_rustls_pinning_client_config`, which hardcodes
+  `UnpinnedHostPolicy::Reject`, so an unpinned host is REFUSED
+  (fail-closed) on either path. `select_sync_tls_mode` returns
+  `SyncTlsMode::Pinning` unconditionally once a pin file is present, so
+  `--quorum-ca-cert` / `--ca-cert` is NOT consulted on a pinned run.**
+  There is no "mixed-mode rollout": once you set the pin file, EVERY
+  peer must be pinned, and a partial pin file is a **fail-closed
+  outage**, not a gradual rollout. Earlier revisions of this paragraph
+  described the CLI-sync path as the looser half of a mixed-mode
+  rollout (first "accept-any", then "falls through to CA validation");
+  both were wrong — the `UnpinnedHostPolicy::AcceptAny` variant still
+  exists but has no production construction site since #1794. An
   empty-but-present file is a fail-closed parse error.
   [`src/tls.rs`](../src/tls.rs) (`FED_PEER_FINGERPRINTS_ENV`,
   `FingerprintPinServerVerifier`).
@@ -709,6 +715,23 @@ It can also read the plaintext of everything replicated to it —
 federation is **not** end-to-end encrypted
 ([#1968](https://github.com/alphaonedev/ai-memory-mcp/issues/1968); see
 §"At-rest encryption and federation" below).
+
+**Opt-in quarantine of provenance-less inbound content
+([#1948](https://github.com/alphaonedev/ai-memory-mcp/issues/1948)).**
+`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` (default `false`, opt-in) route-IN
+quarantines any inbound relayed memory that did NOT reach
+`attest_level=agent_attested` (no verified per-write content signature —
+it would otherwise land `claimed`): the row is stored with the system-only
+`lifecycle_state=quarantined` and is structurally hidden from **every**
+read/egress lane on this node, but the bytes still CRDT-converge (only the
+local view differs). **Honest caveat: a quarantined row does NOT relay
+onward — it is hidden AND black-holed until dequarantine** (either
+automatically when a re-received copy later verifies `agent_attested`, or
+by operator dequarantine). Each quarantine increments
+`ai_memory_fed_quarantined_unattributed_total` and emits one WARN; the
+counter is always zero when the knob is off (the default), so a non-zero
+value means a peer is relaying provenance-less content this node is
+black-holing.
 
 **Delivered boundary vs documented boundary.** The boundary this
 substrate delivers today is **separately-administered peers inside one

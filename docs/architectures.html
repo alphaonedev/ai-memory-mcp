@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Architectures — five tiers from laptop to global hive</title>
-<meta name="description" content="Five reference architectures for ai-memory — from a single agent on a laptop to a globally federated hive of millions. With honest 'today vs roadmap' markers per v0.9.0.">
+<meta name="description" content="Five reference architectures for ai-memory — from a single agent on a laptop to a federated hive of clusters. Federation is certified for 500–1000-agent clusters of ≤50 peers, with honest 'today vs roadmap' markers per v1.0.0.">
 <meta property="og:title" content="ai-memory · Architectures">
 <meta property="og:description" content="Five reference architectures for ai-memory — from one agent to a global hive.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/architectures.html">
@@ -240,11 +240,12 @@ section p{margin-bottom:.85rem}
 
 <section class="hero">
   <h1>ai-memory architectures</h1>
-  <p class="tagline">A primitive that scales from <strong>one agent</strong> on a laptop to a <strong>global hive</strong> of millions. Every tier ships either today, or sits behind a documented gap with a known roadmap. Nothing on this page is marketing fiction — every "today" claim cites code in the v0.9.0 source tree.</p>
+  <p class="tagline">A primitive that scales from <strong>one agent</strong> on a laptop to a <strong>federated hive of clusters</strong>. Every tier ships either today, or sits behind a documented gap with a known roadmap. The federation trust boundary is <strong>certified for 500–1000-agent clusters composed of ≤50-peer blocks</strong>; the global-hive tier (T5) is the vision beyond it. Nothing on this page is marketing fiction — every "today" claim cites code in the v1.0.0 source tree.</p>
   <div class="pills">
     <span class="pill">5 tiers</span>
     <span class="pill">T1–T3 ship today</span>
-    <span class="pill">T4 GA · v0.9.0</span>
+    <span class="pill">T4 · PG GA v0.8.0</span>
+    <span class="pill">certified: ≤50 peers · 500–1000 agents</span>
     <span class="pill">T5 vision · v1.0+</span>
   </div>
 </section>
@@ -285,16 +286,16 @@ section p{margin-bottom:.85rem}
         <span class="tier-id">TIER 4</span>
         <h3>Data-center swarm</h3>
         <p>Multi-rack deployment with quorum writes shipping today; <strong>Postgres+pgvector backbone</strong> behind the <code>sal-postgres</code> feature flag, GA at v0.8.0.</p>
-        <span class="tier-scale">SCALE: 100s nodes · 1000s agents · racked &amp; zoned</span>
+        <span class="tier-scale">SCALE: ≤50-peer blocks · ~500–1000 agents/block · racked &amp; zoned</span>
         <span class="cap-badge cap-today">CORE TODAY</span>
-        <span class="cap-badge cap-today">PG GA · v0.9.0</span>
+        <span class="cap-badge cap-today">PG GA · v0.8.0</span>
       </a>
 
       <a href="architectures-t5.html" class="arch-tier-card">
         <span class="tier-id">TIER 5</span>
         <h3>Global hive</h3>
-        <p>Multi-region cloud, attested agent identity, federated governance, hundreds of thousands to millions of agents acting as a unified collective.</p>
-        <span class="tier-scale">SCALE: multi-region · 10⁵–10⁶ agents · attested</span>
+        <p>Multi-region cloud, attested agent identity, federated governance, many ≤50-peer clusters composed into a unified collective. The north-star scale (hundreds of thousands to millions of agents) is aspirational — not a certified or measured capacity.</p>
+        <span class="tier-scale">SCALE: multi-region · many certified clusters · attested (vision)</span>
         <span class="cap-badge cap-future">VISION v1.0+</span>
       </a>
 
@@ -330,7 +331,7 @@ section p{margin-bottom:.85rem}
   <div class="container">
     <span class="eyebrow">Capability matrix</span>
     <h2>What ships today vs. what's on the road.</h2>
-    <p class="lede">The honest matrix. Cell colors match the badges above.</p>
+    <p class="lede">The honest matrix. Cell colors match the badges above. Version tags are the release a capability reached GA — the Postgres+pgvector backbone is GA at <strong>v0.8.0</strong>.</p>
 
     <table class="tier-matrix">
       <thead>
@@ -445,8 +446,8 @@ section p{margin-bottom:.85rem}
           <td><span class="cap-badge cap-partial">feature flag</span></td>
           <td><span class="cap-badge cap-partial">feature flag</span></td>
           <td><span class="cap-badge cap-partial">feature flag</span></td>
-          <td><span class="cap-badge cap-today">GA · v0.9.0</span></td>
-          <td><span class="cap-badge cap-today">GA · v0.9.0</span></td>
+          <td><span class="cap-badge cap-today">GA · v0.8.0</span></td>
+          <td><span class="cap-badge cap-today">GA · v0.8.0</span></td>
         </tr>
         <tr>
           <td>Cryptographic agent attestation (Ed25519 <code>signature</code>, #626 Layer-3)</td>
@@ -474,6 +475,10 @@ section p{margin-bottom:.85rem}
         </tr>
       </tbody>
     </table>
+
+    <div class="honesty-notice">
+      <strong>Certified scope — read this before you size a fleet.</strong> The federation <em>trust boundary</em> is certified for <strong>500–1000-agent clusters composed of ≤50-peer federation blocks</strong> — the substrate's own T6 = 1000+ / 50-peer ceiling, <strong>NOT</strong> a single 1M-agent fabric (issue #2438 retired that claim). The <strong>peer</strong> dimension is MEASURED — a real enrolled full mesh at N = 2…50 peers on a single host (#2921 capacity bench); the largest CROSS-HOST federation actually run is <strong>2 nodes</strong>. The <strong>agent</strong> figure is an ARCHITECTED (derived topology) ceiling, <strong>not</strong> a validated capacity — no agent population of that size has been run. Scale past one cluster by <strong>adding independent clusters</strong>, never by growing one mesh past ~50 peers. What is certified is the trust boundary (namespace confinement, peer attestation, per-write authority attestation, at-rest confidentiality, tamper-evident audit spine) — <strong>NOT</strong> throughput or latency (no ops/s figure is certified). Full scope + §6 limits: <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md" style="color:var(--p1)">the enterprise-federation certification</a>.
+    </div>
   </div>
 </section>
 
@@ -533,13 +538,13 @@ section p{margin-bottom:.85rem}
     <p>Start at <a href="architectures-t1.html" style="color:var(--p1)">Tier 1</a> and walk forward, or jump straight to the tier that matches your fleet.</p>
 
     <div class="honesty-notice">
-      <strong>Engineering honesty.</strong> Every "ships today" claim cites a file path and behavior in the v0.9.0 source tree. Roadmap items reference ADRs and tracked work. The vision tier (T5) is the north star — we'll get there, but it's not shipping in v0.9.0. If a diagram shows something the code doesn't do, that's a documentation bug — please file an issue.
+      <strong>Engineering honesty.</strong> Every "ships today" claim cites a file path and behavior in the v1.0.0 source tree. Roadmap items reference ADRs and tracked work. The vision tier (T5) is the north star — we'll get there, but it's not shipping in v1.0.0. If a diagram shows something the code doesn't do, that's a documentation bug — please file an issue.
     </div>
   </div>
 </section>
 
 <footer>
-  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.9.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
+  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v1.0.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
 </footer>
 
 </body>

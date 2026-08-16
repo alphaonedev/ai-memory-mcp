@@ -411,15 +411,24 @@ The fix:
 | absent                     | `s` non-empty          | bypass unset              | **403 `{"error":"peer_id_header_missing"}`**                            |
 | any                        | any                    | `AI_MEMORY_FED_TRUST_BODY_AGENT_ID=1` | Accept (legacy compat; logged at WARN).                       |
 
-**Operator-bound trust caveat.** Today's mTLS substrate
-(`src/tls.rs::FingerprintAllowlistVerifier`) pins the peer's client
-certificate by SHA-256 fingerprint but **does not propagate the
-verified cert (or its SAN/CN) to handler code** — axum-server 0.8 has
-no per-request extension for that. The `x-peer-id` header is therefore
-a peer-claimed identity tied to a fingerprint **only by operator
-deployment convention** (one cert ↔ one `x-peer-id`), not by a
-cryptographic attestation surface. The cert-SAN extraction work is
-tracked as a v0.8.0 follow-up to #238.
+**Operator-bound trust caveat (updated for v1.0.0 #2045 L6).** The base
+mTLS substrate (`src/tls.rs::FingerprintAllowlistVerifier`) pins the peer's
+client certificate by SHA-256 fingerprint. At v0.7.0 the verified cert was
+NOT propagated to handler code, so the `x-peer-id` header was tied to a
+fingerprint **only by operator deployment convention** (one cert ↔ one
+`x-peer-id`), not cryptographically. **v1.0.0 (#2045 L6) closes that** with
+an OPTIONAL operator-declared binding: set `AI_MEMORY_FED_CERT_PEER_BINDING_MAP`
+to a file of `<sha256-hex> <peer-id>` lines and the daemon installs
+`src/tls.rs::PeerBindingAcceptor`, which after the handshake injects the
+presenting cert's bound peer-id as a `ClientCertPeerId` request extension;
+`AI_MEMORY_FED_CERT_PEER_BINDING` (`off` / `warn` (default) / `enforce`)
+then cross-checks it against the claimed `x-peer-id` (`enforce` refuses a
+mismatch with `401 peer_id_cert_mismatch`). SAN/CN parsing is deliberately
+**NOT** used — under fingerprint-pinning of self-signed peer certs the cert's
+subject fields are attacker-chosen, so the operator-declared fingerprint is
+the only trustworthy anchor (superseding the earlier "cert-SAN extraction
+follow-up" plan). With no binding map configured the cross-check is inert and
+the pre-#2045 convention-only posture holds (byte-identical).
 
 **Implementation surface**:
 
