@@ -36,6 +36,21 @@ layout: doc
 > [`docs/federation.md`](federation.html). The two layers compose: mTLS is
 > the transport boundary, zero-touch credentials are the application
 > identity carried *inside* it.
+>
+> **Which lane does the certified enterprise-federation profile use?**
+> The [`docs/deploy/enterprise-federation.env`](deploy/enterprise-federation.env)
+> CERTIFIED stand-up
+> (`AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE=1`) engages the
+> **legacy transport/identity lane** — the mTLS fingerprint allowlist +
+> `X-API-Key` + per-peer attestation JSON + per-peer `.pub` Ed25519
+> enrollment described in [`docs/federation.md`](federation.html). It
+> does **NOT** require the zero-touch CA-rooted credential system
+> documented below (`AI_MEMORY_FED_TRUST_BUNDLE_DIR` / `_CRED_PATH` /
+> `_CRED_CHAIN_PATH` / `_INVENTORY_PATH`). The zero-touch layer composes
+> cleanly ON TOP of the certified lane and removes O(N²) manual `.pub`
+> exchange as a fleet grows, but it is **optional** — stand up the legacy
+> lane first, then adopt zero-touch when peer count makes manual
+> enrollment the operational bottleneck.
 
 ---
 
@@ -216,6 +231,7 @@ This is a **pure de-hardcode**: a node that sets nothing presents the
 | `AI_MEMORY_FED_SYNC_TRUST_PEER` / `AI_MEMORY_FED_TRUST_BODY_AGENT_ID` | Legacy attestation bypass flags — leave unset under default-deny. |
 | `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG` | **v0.8.0 (#1718), default `1` fail-closed.** Inner per-transition Ed25519 signature gate on inbound federated action-state transitions (an authority-granting write). A forged signature is rejected unconditionally regardless of this knob. See `docs/federation.md`. |
 | `AI_MEMORY_FED_REQUIRE_WRITE_SIG` | **v0.8.0 (#1464); default flipped to `1` fail-closed at v1.0.0 (#1801/#1954).** Per-write CONTENT attestation on inbound relayed memories (data, not authority): a valid `metadata.write_signature` over the #626 `SignableWrite` envelope upgrades the row to `attest_level=agent_attested`; truthy refuses an unsigned honored third-party claim. See `docs/federation.md`. |
+| `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG` | **v0.8.1 (#1843); default flipped to `1` fail-closed at v1.0.0 (#1801/#1954).** Per-signal AUTHOR attestation on inbound relayed SIGNALS (the signal-subcollection sibling of `AI_MEMORY_FED_REQUIRE_WRITE_SIG`): truthy requires the signal to verify against `from_agent`'s locally-enrolled Ed25519 key, closing the CWE-346 forge-any-author gap. See `docs/federation.md`. |
 | `AI_MEMORY_FED_PEER_FINGERPRINTS` | **v0.8.0 (#1678), unset = pinning off.** Outbound peer SERVER-cert SHA-256 pinning (`known_hosts` model). **BOTH the daemon quorum client AND the `ai-memory sync` CLI call one builder (`tls::build_rustls_pinning_client_config`) that hardcodes `UnpinnedHostPolicy::Reject`, so an unpinned host is fail-closed on either path** — setting a partial pin file is a fail-closed outage, not a rollout, and `--ca-cert` is not consulted on a pinned run. Earlier revisions of this row called the CLI path the looser half ("accept-any", then "CA validation"); both were wrong (the `AcceptAny` variant has no production construction site since #1794). See `docs/federation.md`. |
 | `AI_MEMORY_FED_REQUIRE_SERVER_VERIFY` | **v1.0.0 (#2448), default `1` fail-closed.** Outbound federation TLS must verify the peer's SERVER certificate. `--insecure-skip-server-verify` is refused unless this is explicitly falsy AND `--client-cert`/`--client-key` are both supplied; pinned to `1` under `AI_MEMORY_SECURITY_PROFILE=asi-hard`. Federation replicates plaintext content, so an unverified peer server is a direct disclosure surface. See `docs/federation.md`. |
 | `AI_MEMORY_FED_DLQ_DEPTH_WARN_THRESHOLD` | **v0.8.0 (#1544), default `1000`.** Edge-triggered push-DLQ-depth WARN. See `docs/federation.md`. |
