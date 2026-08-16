@@ -435,6 +435,42 @@ independently — these are layered on top.
   ([#1544](https://github.com/alphaonedev/ai-memory-mcp/issues/1544)).**
   See the DLQ paragraph in the runbook below.
 
+## v1.0.0 federation knobs (additional)
+
+Three more federation knobs ship at v1.0.0 beyond the v0.7/v0.8 set
+above. The certified `docs/deploy/enterprise-federation.env` profile
+leaves all three at their secure defaults:
+
+- **`AI_MEMORY_FED_REQUIRE_SIGNAL_SIG`** (**default `1`** at v1.0.0) —
+  per-signal AUTHOR attestation on inbound relayed signals, the
+  signal-subcollection sibling of `AI_MEMORY_FED_REQUIRE_WRITE_SIG`. An
+  enrolled peer may otherwise relay a signal forged as any agent
+  (CWE-346); truthy requires the signal to verify against `from_agent`'s
+  locally-enrolled Ed25519 key. Also in
+  [`federation-identity.md` §4](federation-identity.html) and
+  [`docs/enterprise-deployment.md` §14.3](enterprise-deployment.html).
+- **`AI_MEMORY_FED_REQUIRE_POLICY_CURRENT`** (**default `1`**) —
+  cross-node governance-policy freshness gate: refuses an inbound push
+  whose advertised `sender_policy_seq` is STRICTLY behind the local
+  committed policy with `409 stale_policy_version`. Fail-closed only for
+  a *detected*-stale epoch; an absent / undeterminable epoch is accepted
+  (fail-open by design), so it never hard-refuses a peer that does not
+  advertise. See [`docs/enterprise-deployment.md`
+  §14.3](enterprise-deployment.html). The certified
+  `enterprise-federation.env` pins it explicitly (#2911) so an
+  operator's `=0` cannot silently escape the certified set.
+- **`AI_MEMORY_FED_CERT_PEER_BINDING`** (default `warn`) +
+  **`AI_MEMORY_FED_CERT_PEER_BINDING_MAP`** (path; unset) — the INBOUND
+  mTLS client-cert ↔ `x-peer-id` cross-check, the compensating control
+  for an `AI_MEMORY_FED_REQUIRE_SIG=0` window. The map file binds each
+  pinned client-cert SHA-256 fingerprint to the one `x-peer-id` it may
+  assert (`<sha256-hex> <peer-id>` per line, same operator-declares-the-pin
+  model as the outbound `AI_MEMORY_FED_PEER_FINGERPRINTS`); `warn` logs a
+  mismatch, `enforce` refuses it `401 peer_id_cert_mismatch`. Inert until
+  the map is configured. Distinct from the OUTBOUND server-cert pinning
+  `AI_MEMORY_FED_PEER_FINGERPRINTS` above — this binds the peer's CLIENT
+  cert to its claimed identity.
+
 ## Quorum + vector clocks
 
 v0.6.x quorum semantics are unchanged: W-of-N writes (default majority),
@@ -456,12 +492,36 @@ local namespace cap, even if the sending peer's local cap is higher.
    `openssl x509 -in peer.crt -noout -fingerprint -sha256`.
 2. **Populate `peer-fingerprints.allow`.** One fingerprint per line.
    Inline comments (`# label`) and `:` separators tolerated.
-3. **Author the peer attestation JSON** and stage it in your secrets
-   manager. Treat the file like a config blob, not a credential — the
-   contents are operator-configured authorization, not authentication
-   material.
-4. **Set `AI_MEMORY_FED_PEER_ATTESTATION`** on the receiving daemon's
-   environment.
+3. **Enroll each peer's Ed25519 signing key — REQUIRED under the
+   default posture.** `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` defaults
+   to **strict** at v0.8.0+: an inbound `/sync/push` or `/sync/since`
+   that carries an `x-peer-id` with **no locally-enrolled Ed25519 public
+   key is rejected `401 peer_not_enrolled`** — the mTLS cert and the
+   attestation JSON alone are NOT sufficient. Exchange each peer's public
+   key out-of-band and import it into THIS daemon's key directory
+   (`AI_MEMORY_KEY_DIR`), the same `identity import` step
+   [`docs/enterprise-deployment.md` §8.4 / §8.6](enterprise-deployment.html)
+   prescribe for a swarm — restated here so this checklist is a complete
+   single turnkey path:
+   ```bash
+   # On the peer (one-time, if it has no keypair): writes bob@host2.pub
+   # under its key dir.
+   ai-memory identity generate --agent-id bob@host2
+   # Exchange bob@host2.pub out-of-band, then on THIS receiving daemon:
+   ai-memory identity import --agent-id bob@host2 --pub bob@host2.pub
+   ```
+   `import` writes a public-only `<agent_id>.pub` (no private half); the
+   receive path resolves it via
+   [`identity::verify::lookup_peer_public_key`](../src/identity/verify.rs).
+   The claimed `x-peer-id` MUST equal the enrolled `--agent-id`. During
+   the key-exchange window the rollout escape hatch
+   `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1` temporarily accepts
+   unenrolled peers — flip it back to unset once every peer is enrolled.
+4. **Author the peer attestation JSON and set
+   `AI_MEMORY_FED_PEER_ATTESTATION`** on the receiving daemon's
+   environment. Treat the file like a config blob, not a credential —
+   the contents are operator-configured authorization, not
+   authentication material.
 5. **Leave the two `TRUST_*` flags unset** unless your peer mesh is
    under operator-level control (e.g., the in-tree integration tests
    set both — see
