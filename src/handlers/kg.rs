@@ -251,7 +251,10 @@ pub async fn entity_register(
                 })),
             )
                 .into_response(),
-            Err(e) => store_err_to_response(e),
+            // #3014 — 403 ATTESTATION_FAILED under global-strict (parity with
+            // the store path); otherwise the typed StoreError mapping.
+            Err(e) => crate::handlers::errors::attestation_refused_response(&e.to_string())
+                .unwrap_or_else(|| store_err_to_response(e)),
         };
     }
 
@@ -287,6 +290,11 @@ pub async fn entity_register(
             // substring; surface them as 409 Conflict so callers can
             // distinguish a genuine name clash from internal failure.
             let msg = e.to_string();
+            // #3014 — 403 ATTESTATION_FAILED under global-strict (parity with
+            // the store path).
+            if let Some(resp) = crate::handlers::errors::attestation_refused_response(&msg) {
+                return resp;
+            }
             if msg.contains("non-entity memory") {
                 return (StatusCode::CONFLICT, Json(json!({"error": msg}))).into_response();
             }

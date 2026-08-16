@@ -187,6 +187,61 @@ Implements the ratified 5-agent adversarial verdict (protocol `4d3ea1c5`,
   - R-203: 10 new `--self-test` legs across the two gates, each proving RED on an
     injected violation and GREEN on the corrected page, plus the frozen-exemption
     boundary in both directions and fail-closed on a missing exemption SSOT.
+### Security (attestation + provenance cluster — close the non-store memory-write bypasses; #3014 / #2993 / #3015 / #3018 / #3024)
+
+- **`entity_register` / `reflect` / `consolidate` wrote memory rows WITHOUT
+  crossing the agent-attestation gate (#3014, HIGH).** The gate guarded only the
+  `store` funnels, so under `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` an unsigned
+  write via `entity_register` or `reflect` landed a provenance-less durable row
+  (no `attest_level` at all) while the store path was fail-closed. These three
+  surfaces present NO caller signature, so they now cross a shared no-signature
+  gate (`identity::attest::gate_unsigned_surface_attestation`): under
+  global-strict (`=1`/`=true`) the write is REFUSED (`403 ATTESTATION_FAILED` on
+  HTTP, parity with the store path); otherwise the row's metadata is stamped
+  `attest_level="claimed"` so an attestation census is truthful. Gated at every
+  tenant funnel on BOTH backends — `db::entity_register` +
+  `PostgresStore::entity_register`, `db::consolidate` (keyed on
+  `!substrate_authored`) + `PostgresStore::consolidate` (keyed on
+  `!ctx.bypass_visibility`), `mcp::handle_reflect` (MCP + HTTP-sqlite) +
+  `SqliteStore::reflect` / `PostgresStore::reflect` tenant branches — while the
+  internal curator / autonomy paths (`for_admin` / `bypass_visibility`) stay
+  exempt, exactly like the SAL `store()` surface. New mechanical funnel-ceiling
+  test `tests/attestation_funnel_ceiling_3014.rs` enumerates every production
+  tenant memory-creating funnel with its attestation disposition so the next
+  bypass fails CI (the `tests/db_open_funnel_ceiling_2445.rs` precedent).
+- **`entity_register` aliases were not secret-screened (#2993, HIGH).** The
+  entity content/title is screened at `insert`, but the `entity_aliases` table
+  (sqlite) + `metadata.aliases` / the pg join table bypassed that funnel, so a
+  credential passed as an alias landed verbatim under the certified `refuse`
+  posture. Each alias now crosses the caller-origin screen
+  (`secret_screen::screen_for_caller` refuse, `redact_for_storage` mask) on both
+  backends (`db::entity_register` + `PostgresStore::entity_register`), screened
+  up-front so a refusal cannot leave a partially-written entity.
+- **`update --metadata` (CLI + MCP `memory_update` + HTTP `PUT /memories/{id}`)
+  wiped attestation on an attested row (#3015, HIGH).** A metadata patch is a
+  whole-blob REPLACE that dropped `attest_level` / `write_signature`
+  (un-relayable as `agent_attested` under `AI_MEMORY_FED_REQUIRE_WRITE_SIG=1`) /
+  `kind_provenance` / `version_vector` (federation LWW state), with no refusal.
+  The update funnel now preserves those keys via a new
+  `identity::preserve_update_provenance_keys` (the #1784 immutable keys plus the
+  four substrate-stamped attestation keys), scoped to the update funnel so the
+  store / dedup / synthesis path still lets a FRESH re-store's attestation win.
+  The CLI `--metadata` help text is corrected from the misleading "field-by-field"
+  to describe the replace-with-provenance-preservation contract.
+- **`attest_level="claimed"` was documented but never written on the permissive
+  MCP/CLI store path (#3018, MED).** README / env-table #48 / `docs/attestation.md`
+  all state an unsigned MCP/CLI write lands `claimed`, but it landed with NO
+  `attest_level` key — a silent false negative on an attestation census. The
+  permissive path now stamps `attest_level="claimed"` on BOTH the MCP
+  (`handle_store`) and CLI (`cmd_store`) surfaces, making the published claim
+  true.
+- **The `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` refusal text contradicted the
+  posture on the surface it refused (#3024, LOW).** Under global-strict the
+  `AttestError::AttestationRequired` message still ended "MCP and CLI writes do
+  not [require attestation]" while refusing exactly an MCP/CLI write. The
+  trailing clause is now conditional on the resolved tri-state (a new
+  `identity::attest::global_strict_attestation_enabled` helper): global-strict
+  names "every write surface", the surface-scoped default keeps the prior text.
 
 ### Security (append-only spine — the primary create funnel's upsert no longer bypasses the signed ledger; #2948 / PR-3)
 

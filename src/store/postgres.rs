@@ -6138,7 +6138,7 @@ impl PostgresStore {
             .clone()
             .unwrap_or_else(|| existing.metadata.clone());
         let mut new_metadata =
-            crate::identity::preserve_provenance_keys(&existing.metadata, &patched_metadata);
+            crate::identity::preserve_update_provenance_keys(&existing.metadata, &patched_metadata);
         if let serde_json::Value::Object(ref mut m) = new_metadata {
             m.insert(
                 "edit_source".to_string(),
@@ -6212,10 +6212,11 @@ impl PostgresStore {
         // ONLY: when the patch OMITS `metadata` entirely, `patched_metadata`
         // clones `existing.metadata` and the old row's why_trace rides along.
         // A patch that SUPPLIES a metadata object must re-supply why_trace
-        // itself — `preserve_provenance_keys` overlays ONLY
-        // `IMMUTABLE_PROVENANCE_KEYS` (`agent_id` / `derived_from` /
-        // `consolidated_from_agents`), and why_trace is deliberately NOT in
-        // that set (it is a PER-WRITE rationale, not immutable provenance:
+        // itself — `preserve_update_provenance_keys` overlays ONLY the
+        // immutable provenance (`agent_id` / `derived_from` /
+        // `consolidated_from_agents`) + substrate-stamped attestation keys
+        // (#3015), and why_trace is deliberately NOT in either set (it is a
+        // PER-WRITE rationale, not immutable provenance:
         // silently inheriting the old rationale onto a rewritten row would
         // launder the new write past the gate).
         consult_why_trace_gate_pg(&candidate)?;
@@ -21550,6 +21551,17 @@ impl MemoryStore for PostgresStore {
                 detail: "consolidate requires at least one source id".to_string(),
             });
         }
+        // #3014 — a TENANT consolidate crosses the attestation posture like
+        // `store` (sqlite `storage::consolidate` twin). consolidate presents no
+        // caller signature, so under global-strict attestation it is REFUSED
+        // (before any write). Substrate/curator consolidates
+        // (`ctx.bypass_visibility`, the SAL `for_admin` ConsolidationPass) are
+        // exempt, exactly like the SAL `store()` surface.
+        if !ctx.bypass_visibility && crate::identity::attest::global_strict_attestation_enabled() {
+            return Err(StoreError::InvalidInput {
+                detail: crate::identity::attest::ATTESTATION_REFUSED_UNSIGNED_SURFACE.to_string(),
+            });
+        }
         let mut tx = self
             .pool
             .begin()
@@ -21641,6 +21653,20 @@ impl MemoryStore for PostgresStore {
             "agent_id".to_string(),
             serde_json::Value::String(consolidator_agent_id.to_string()),
         );
+        // #3014/#3018 — stamp `attest_level="claimed"` on the tenant permissive
+        // path so the consolidated row is a truthful `claimed` write
+        // (global-strict already refused above; substrate/curator exempt),
+        // exactly like an unsigned `store` (sqlite `storage::consolidate` twin).
+        if !ctx.bypass_visibility {
+            merged_metadata.insert(
+                crate::models::field_names::ATTEST_LEVEL.to_string(),
+                serde_json::Value::String(
+                    crate::identity::verify::AttestLevel::Claimed
+                        .as_str()
+                        .to_string(),
+                ),
+            );
+        }
         if !source_agent_ids.is_empty() {
             merged_metadata.insert(
                 "consolidated_from_agents".to_string(),
@@ -22146,6 +22172,17 @@ impl MemoryStore for PostgresStore {
         // `create_link_signed` so the edges land `self_signed`.
         let mut hooks = crate::db::ReflectHooks::empty();
         hooks.active_keypair = signing_key;
+        // #3014 — a TENANT reflect crosses the attestation posture like `store`
+        // (postgres twin of the MCP `handle_reflect` gate). No caller signature
+        // → refused under global-strict; else the reflection metadata is stamped
+        // `attest_level="claimed"`. The curator reflection pass runs
+        // `bypass_visibility` (for_admin) and is exempt.
+        if !ctx.bypass_visibility {
+            let mut stamped = input.clone();
+            crate::identity::attest::gate_unsigned_surface_attestation(&mut stamped.metadata)
+                .map_err(|e| crate::storage::reflect::ReflectError::Validation(e.to_string()))?;
+            return self.reflect_with_hooks(ctx, &stamped, &hooks).await;
+        }
         self.reflect_with_hooks(ctx, input, &hooks).await
     }
 
@@ -26907,6 +26944,21 @@ impl MemoryStore for PostgresStore {
             .map(str::to_string)
             .unwrap_or_else(|| ctx.agent_id.clone());
 
+        // #2993 — refuse a credential-bearing alias BEFORE any write (postgres
+        // twin of the sqlite `db::entity_register` alias screen). The entity
+        // metadata is masked by the store funnel, but `metadata.aliases` and
+        // the `entity_aliases` join table would otherwise carry a raw
+        // credential under the certified `refuse` posture. Caller-origin
+        // disposition: refuse mode rejects here; redact mode masks the stored
+        // forms below; off stores verbatim.
+        for alias in aliases {
+            crate::secret_screen::screen_for_caller(alias.trim()).map_err(|e| {
+                StoreError::InvalidInput {
+                    detail: format!("alias rejected: {e}"),
+                }
+            })?;
+        }
+
         // Look up any prior entity row in this namespace via the
         // SAL `list` surface (namespace-scoped). We match by
         // (title == canonical_name) AND (metadata.kind == "entity").
@@ -26973,6 +27025,19 @@ impl MemoryStore for PostgresStore {
             .entry("agent_id".to_string())
             .or_insert(serde_json::Value::String(resolved_agent.clone()));
 
+        // #3014 — cross the attestation posture on a NEW entity row (postgres
+        // twin of the sqlite `db::entity_register` gate): refuse under
+        // global-strict attestation (no provenance-less durable row lands),
+        // else stamp `attest_level="claimed"`. Only a NEW entity mints a
+        // durable row — a re-register upserts the existing row + unions aliases.
+        if prior.is_none() {
+            crate::identity::attest::gate_unsigned_surface_attestation(&mut metadata).map_err(
+                |e| StoreError::InvalidInput {
+                    detail: e.to_string(),
+                },
+            )?;
+        }
+
         let now = chrono::Utc::now().to_rfc3339();
         let resolved_id = prior
             .as_ref()
@@ -27022,12 +27087,17 @@ impl MemoryStore for PostgresStore {
         // kg-handler `INSERT INTO entity_aliases` path so the two SAL
         // methods are consistent.
         for alias in &union {
+            // #2993 — persist the STORAGE form (redact mode masks a credential;
+            // refuse mode already rejected above; off = verbatim) so no raw
+            // secret lands in `entity_aliases`.
+            let stored =
+                crate::secret_screen::redact_for_storage(alias).unwrap_or_else(|| alias.clone());
             sqlx::query(
                 "INSERT INTO entity_aliases (entity_id, alias) VALUES ($1, $2)
                  ON CONFLICT (entity_id, alias) DO NOTHING",
             )
             .bind(&written_id)
-            .bind(alias)
+            .bind(&stored)
             .execute(&self.pool)
             .await
             .map_err(|e| to_store_err("entity_register populate entity_aliases", e))?;

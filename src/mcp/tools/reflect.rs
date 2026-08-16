@@ -336,7 +336,7 @@ pub fn handle_reflect(
     // is identical across both reflect parsers and the L1-8 round-trip.
     fold_entity_id_into_metadata(&mut metadata, params[param_names::ENTITY_ID].as_str());
 
-    let input = db::ReflectInput {
+    let mut input = db::ReflectInput {
         source_ids,
         title: title.clone(),
         content: content.clone(),
@@ -357,6 +357,17 @@ pub fn handle_reflect(
         agent_id,
         metadata,
     };
+
+    // #3014 — the reflection is a memory-creating TENANT write; cross the
+    // attestation posture like `store`. `memory_reflect` presents no caller
+    // signature, so under global-strict attestation it is REFUSED (no
+    // provenance-less durable row lands); under the permissive posture the
+    // reflection metadata is stamped attest_level="claimed" so an attestation
+    // census is truthful. The INTERNAL curator reflection pass runs through
+    // the SAL trait (`MemoryStore::reflect`, for_admin/bypass_visibility) and
+    // never reaches this MCP handler, so it is exempt.
+    crate::identity::attest::gate_unsigned_surface_attestation(&mut input.metadata)
+        .map_err(|e| e.to_string())?;
 
     // ─── #1325: caller-asserted depth mismatch refusal ──────────────
     // When the caller passed `depth: N`, verify it matches the

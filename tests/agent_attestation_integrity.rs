@@ -399,8 +399,9 @@ fn cli_require_attestation_rejects_unsigned_store() {
 /// #1985 (v1.0) — the CLI surface is operator-as-actor, so the COMPILED
 /// DEFAULT (with `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` entirely ABSENT from
 /// the child env) is PERMISSIVE: an unsigned `ai-memory store` SUCCEEDS and
-/// lands as a bare `claimed`-level write (no `attest_level` stamp — the
-/// same no-stamp path as the explicit `=0` opt-out). This corrects the
+/// lands as a `claimed`-level write (#3018 — now an EXPLICIT
+/// `attest_level="claimed"` stamp so an attestation census is truthful; the
+/// same claimed path as the explicit `=0` opt-out). This corrects the
 /// v0.9.0 #1751 require-everywhere default (the #1981 break). A regression
 /// that reinstated require-by-default on the CLI surface surfaces here,
 /// independent of the parse-ladder pins in `tests/config_precedence.rs`.
@@ -441,15 +442,16 @@ fn cli_default_permissive_lands_unsigned_store_claimed_1985() {
     );
     assert_eq!(
         level.as_deref(),
-        None,
-        "an unsigned CLI write under the permissive default takes the no-stamp claimed path"
+        Some("claimed"),
+        "#3018 — an unsigned CLI write under the permissive default now lands an \
+         EXPLICIT attest_level=\"claimed\" so an attestation census is truthful"
     );
 }
 
 /// #1985 (v1.0) — the MCP surface is operator-as-actor: with
 /// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` ABSENT (the compiled default), an
-/// unsigned `memory_store` is ACCEPTED and lands as a bare `claimed`-level
-/// write (no `attest_level` stamp), byte-identical to the `=0` opt-out
+/// unsigned `memory_store` is ACCEPTED and lands as a `claimed`-level write
+/// (#3018 — now an EXPLICIT `attest_level="claimed"` stamp), like the `=0` opt-out
 /// path. Guards on [`ENV_LOCK`] and defensively clears the var so a sibling
 /// env-mutating test cannot flip the gate closed mid-run.
 #[test]
@@ -497,8 +499,9 @@ fn mcp_default_permissive_lands_unsigned_store_claimed_1985() {
     );
     assert_eq!(
         level.as_deref(),
-        None,
-        "an unsigned MCP write under the permissive default takes the no-stamp claimed path"
+        Some("claimed"),
+        "#3018 — an unsigned MCP write under the permissive default now lands an \
+         EXPLICIT attest_level=\"claimed\" so an attestation census is truthful"
     );
 }
 
@@ -648,8 +651,9 @@ fn cli_opt_out_zero_lands_unsigned_store_claimed_1751() {
     assert_eq!(count, 1, "opt-out write must persist exactly one row");
     assert_eq!(
         level.as_deref(),
-        None,
-        "an opt-out unsigned write takes the legacy no-stamp path (no attest_level key)"
+        Some("claimed"),
+        "#3018 — an opt-out (=0) unsigned write now lands an EXPLICIT \
+         attest_level=\"claimed\" so an attestation census is truthful"
     );
 }
 

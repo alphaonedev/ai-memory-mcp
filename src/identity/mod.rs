@@ -675,6 +675,49 @@ pub fn preserve_provenance_keys(
     merged
 }
 
+/// Substrate-stamped attestation / federation-state provenance keys preserved
+/// through an UPDATE-funnel metadata overwrite ON TOP OF
+/// [`IMMUTABLE_PROVENANCE_KEYS`] (#3015).
+///
+/// A `memory_update --metadata` / `PUT /memories/{id}` metadata patch is a
+/// whole-blob REPLACE; before #3015 it silently wiped an attested row's
+/// `attest_level` (attestation census loss), `write_signature` (the row
+/// became un-relayable as `agent_attested` under
+/// `AI_MEMORY_FED_REQUIRE_WRITE_SIG=1`), `kind_provenance`, and
+/// `version_vector` (federation LWW state) — with no refusal, no WARN.
+///
+/// Scoped to the UPDATE funnel ONLY. The store / dedup / synthesis paths
+/// ([`preserve_provenance_keys`]) must let a FRESH re-store's attestation win
+/// (a signed re-store upgrading `claimed`→`agent_attested`), so they keep the
+/// narrower 3-key immutable set.
+pub const UPDATE_PRESERVED_ATTESTATION_KEYS: [&str; 4] = [
+    crate::models::field_names::ATTEST_LEVEL,
+    crate::models::field_names::WRITE_SIGNATURE,
+    crate::models::memory::METADATA_KIND_PROVENANCE_KEY,
+    crate::models::field_names::VERSION_VECTOR,
+];
+
+/// [`preserve_provenance_keys`] extended for the UPDATE funnel: preserves the
+/// [`IMMUTABLE_PROVENANCE_KEYS`] AND the substrate-stamped
+/// [`UPDATE_PRESERVED_ATTESTATION_KEYS`] from `existing` through a metadata
+/// overwrite (existing-wins), so an attested row keeps its attestation across
+/// `memory_update` / `PUT /memories/{id}` (#3015).
+#[must_use]
+pub fn preserve_update_provenance_keys(
+    existing: &serde_json::Value,
+    incoming: &serde_json::Value,
+) -> serde_json::Value {
+    let mut merged = preserve_provenance_keys(existing, incoming);
+    if let Some(obj) = merged.as_object_mut() {
+        for key in UPDATE_PRESERVED_ATTESTATION_KEYS {
+            if let Some(existing_val) = existing.get(key).cloned() {
+                obj.insert(key.to_string(), existing_val);
+            }
+        }
+    }
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1064,6 +1107,56 @@ mod tests {
         let merged = preserve_agent_id(&existing, &incoming);
         assert!(merged.is_object());
         assert_eq!(merged["agent_id"], "alice");
+    }
+
+    #[test]
+    fn preserve_update_provenance_keys_keeps_attestation_3015() {
+        // #3015 — a `memory_update --metadata` / `PUT /memories/{id}` metadata
+        // patch is a whole-blob REPLACE. The update funnel must carry an
+        // attested row's substrate-stamped provenance (attest_level /
+        // write_signature / kind_provenance / version_vector) plus the #1784
+        // immutable keys through the overwrite, so the row stays relayable as
+        // `agent_attested` and the attestation census stays truthful.
+        let existing = serde_json::json!({
+            "agent_id": "author-a",
+            "attest_level": "agent_attested",
+            "write_signature": "ZmFrZS1zaWc",
+            "kind_provenance": "declared",
+            "version_vector": { "entries": { "node-a": "2026-08-16T00:00:00.000000Z" } },
+            "derived_from": ["s1"],
+            "consolidated_from_agents": ["author-a"],
+            "note": "old",
+        });
+        // A caller patch that supplies ONLY a note (the #3015 evidence shape).
+        let incoming = serde_json::json!({ "note": "hello" });
+        let merged = preserve_update_provenance_keys(&existing, &incoming);
+        // Attestation provenance survives (existing-wins).
+        assert_eq!(merged["attest_level"], "agent_attested");
+        assert_eq!(merged["write_signature"], "ZmFrZS1zaWc");
+        assert_eq!(merged["kind_provenance"], "declared");
+        assert_eq!(
+            merged["version_vector"]["entries"]["node-a"],
+            "2026-08-16T00:00:00.000000Z"
+        );
+        // #1784 immutable keys survive too.
+        assert_eq!(merged["agent_id"], "author-a");
+        assert_eq!(merged["derived_from"][0], "s1");
+        // The caller's non-provenance patch key still lands.
+        assert_eq!(merged["note"], "hello");
+    }
+
+    #[test]
+    fn preserve_provenance_keys_does_not_pin_attestation_3015() {
+        // The store / dedup / synthesis path keeps the NARROWER 3-key set so a
+        // FRESH re-store's attestation wins (a signed re-store upgrading
+        // claimed→agent_attested). Only the UPDATE funnel pins attestation.
+        let existing = serde_json::json!({ "agent_id": "a", "attest_level": "claimed" });
+        let incoming = serde_json::json!({ "attest_level": "agent_attested" });
+        let merged = preserve_provenance_keys(&existing, &incoming);
+        assert_eq!(
+            merged["attest_level"], "agent_attested",
+            "the 3-key store/dedup helper must let a fresh re-store's attestation win"
+        );
     }
 
     #[test]

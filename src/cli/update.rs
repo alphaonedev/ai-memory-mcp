@@ -45,9 +45,13 @@ pub struct UpdateArgs {
     /// Expiry timestamp (RFC3339), or empty string to clear
     #[arg(long)]
     pub expires_at: Option<String>,
-    /// v0.7.0 F2.4 (#1428) — JSON metadata patch (object). Replaces the
-    /// existing `metadata` blob field-by-field. Pass `'{"agent_id":"...",
-    /// "scope":"team"}'`. Validates as a JSON object.
+    /// v0.7.0 F2.4 (#1428) — JSON metadata object. REPLACES the existing
+    /// `metadata` blob, but PRESERVES the immutable provenance keys
+    /// (`agent_id` / `derived_from` / `consolidated_from_agents`) and the
+    /// substrate-stamped attestation keys (`attest_level` / `write_signature` /
+    /// `kind_provenance` / `version_vector`) from the current row (#3015), so a
+    /// patch cannot silently strip a row's authorship or attestation. Pass
+    /// `'{"scope":"team"}'`. Validates as a JSON object.
     #[arg(long)]
     pub metadata: Option<String>,
     /// v0.7.0 F2.4 (#1428) — Form-4 first-class URI pointer. Accepted
@@ -191,7 +195,9 @@ pub fn run(
             // wholesale.
             let existing =
                 db::get(&conn, &resolved_id)?.map_or_else(|| serde_json::json!({}), |m| m.metadata);
-            Some(crate::identity::preserve_provenance_keys(&existing, &v))
+            Some(crate::identity::preserve_update_provenance_keys(
+                &existing, &v,
+            ))
         }
     };
     if let Some(ref s) = args.source_uri {

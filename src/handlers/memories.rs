@@ -332,7 +332,7 @@ pub async fn update_memory(
                         .to_string();
                     let new_meta = patch.metadata.as_ref().map_or_else(
                         || existing.metadata.clone(),
-                        |m| crate::identity::preserve_provenance_keys(&existing.metadata, m),
+                        |m| crate::identity::preserve_update_provenance_keys(&existing.metadata, m),
                     );
                     let new_title = patch.title.as_deref().unwrap_or(existing.title.as_str());
                     let new_content = patch
@@ -578,7 +578,7 @@ pub async fn update_memory(
             || serde_json::Value::Object(serde_json::Map::new()),
             |m| m.metadata.clone(),
         );
-        crate::identity::preserve_provenance_keys(&existing_meta, new_meta)
+        crate::identity::preserve_update_provenance_keys(&existing_meta, new_meta)
     });
     // FBL-12 (v1.0.0 pre-ship 3x7) — charge the storage-byte GROWTH of
     // this in-place update against the row OWNER's per-namespace storage

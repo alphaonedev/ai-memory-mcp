@@ -202,6 +202,32 @@ pub(crate) fn handler_error_500(e: &dyn std::fmt::Display) -> axum::response::Re
         .into_response()
 }
 
+/// #3014 — map a no-signature memory-creating surface refusal
+/// (`entity_register` / `reflect` / `consolidate` under global-strict
+/// attestation) to the SAME `403 ATTESTATION_FAILED` envelope the store path
+/// returns (`src/handlers/create.rs`), keyed on the stable
+/// [`crate::errors::error_codes::ATTESTATION_FAILED`] slug carried by
+/// [`crate::identity::attest::ATTESTATION_REFUSED_UNSIGNED_SURFACE`]. Returns
+/// `None` for any other error so the caller's existing mapping (500 / typed
+/// `StoreError`) runs unchanged. The refusal string is caller-synthesisable
+/// (no DB/path/peer state), so echoing it does not regress issue #851.
+pub(crate) fn attestation_refused_response(err_msg: &str) -> Option<axum::response::Response> {
+    if err_msg.contains(crate::errors::error_codes::ATTESTATION_FAILED) {
+        Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "code": crate::errors::error_codes::ATTESTATION_FAILED,
+                    "error": err_msg,
+                })),
+            )
+                .into_response(),
+        )
+    } else {
+        None
+    }
+}
+
 /// #1558 batch 5 wave 2 — the canonical governance-consultation 500
 /// path: logs `"governance error: {e}"` and returns the sanitized
 /// `"governance check failed"` envelope. Byte-identical to the prior
