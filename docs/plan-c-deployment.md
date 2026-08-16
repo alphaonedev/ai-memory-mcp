@@ -25,6 +25,16 @@ publish maps to a unique external port to avoid host-side conflicts.
 the mesh routes entirely through the bridge — see issue #878 for the
 history.
 
+The compose file sets `AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS=1` on each
+container (issue #2477). Since v1.0.0 the substrate REFUSES a plaintext
+(`http://`) federation peer that is not literal loopback, and a
+container-bridge hostname like `ic-bob` is not loopback — it crosses a
+virtual NIC. The Plan-C fleet is a private, single-host Docker network
+used only for parity/chaos testing, so the acknowledgement is baked into
+the compose recipe. **Do NOT copy that line into any deployment whose
+peers cross a real network** — use `https://` peer URLs (or pin server
+certs via `AI_MEMORY_FED_PEER_FINGERPRINTS`) there instead.
+
 Required environment for `docker compose up`:
 
 ```bash

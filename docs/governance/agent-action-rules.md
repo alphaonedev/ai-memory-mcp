@@ -72,8 +72,8 @@ wire boundary honors each as follows:
 | **Refuse**  | Returns `Err(GovernanceRefusal { reason })`; caller short-circuits with HTTP `403 / GOVERNANCE_REFUSED`. |
 | **Warn**    | Logged via the audit chain; returns `Ok(())`. The action proceeds; the warning is operator-observable.  |
 | **Escalate** | v0.8.0 (#697 / §22 PE-5, schema v66). **Fails closed:** an unresolved `Decision::Escalate` blocks exactly like `Refuse` (`Decision::is_block`) pending human review — the wire boundary returns `Err(GovernanceRefusal { reason })`. |
-| **Modify**  | Rules engine pre-rewrites the action's args; the wire boundary sees the modified payload and Allows it. |
-| **Ask**     | Future K10 surface — operator-approval queueing. Today reduces to Refuse (action does not proceed).      |
+| **Modify**  | Reserved — **not** a `Decision` variant today (`src/governance/agent_action.rs::Decision` is exactly `Allow`/`Refuse`/`Warn`/`Escalate`). No arg-rewrite path is wired; this row documents the intended future shape (a rules-engine arg pre-rewrite the wire boundary would then Allow). |
+| **Ask**     | Future K10 surface — operator-approval queueing. Also **not** a `Decision` variant today; reduces to Refuse (action does not proceed).      |
 
 ## Schema
 

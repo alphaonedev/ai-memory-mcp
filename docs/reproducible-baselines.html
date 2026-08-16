@@ -220,7 +220,7 @@ make down                              <span class="cm"># tear it all down</span
     <div class="cards">
       <div class="card">
         <div class="lbl">Budget table</div>
-        <p><a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/PERFORMANCE.md"><code>PERFORMANCE.md</code></a> is the authoritative latency contract. Honest split, stated in the doc itself: <strong>7 of 14 budget rows are bench-verified</strong>; the remaining 7 are explicitly marked <em>[advisory]</em> pending bench fixtures — advisory rows are never claimed as verified.</p>
+        <p><a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/PERFORMANCE.md"><code>PERFORMANCE.md</code></a> is the authoritative latency contract. Honest split, stated in the doc itself (17-row main table): <strong>7 rows are bench-verified</strong> by <code>ai-memory bench</code> (covering 8 <code>Operation</code> variants); 8 are marked <em>[advisory]</em> with no bench producer; 1 is measured by a separate manual bench (<code>hnsw_rebuild_async</code>); and 1 is an audit note, not a budget. Advisory rows are never claimed as verified.</p>
       </div>
       <div class="card">
         <div class="lbl">Absolute guard</div>
@@ -231,8 +231,8 @@ make down                              <span class="cm"># tear it all down</span
         <p><code>ai-memory bench --baseline &lt;file.json&gt;</code> compares each operation's fresh p95 against a captured baseline JSON (<code>load_baseline</code> / <code>compare_against_baseline</code>); growth beyond <code>--regression-threshold</code> (default <code>DEFAULT_REGRESSION_THRESHOLD_PCT = 10.0</code>, <code>src/bench.rs</code>) is reported as a regression. Operations absent from the baseline are skipped, so adding a bench row never invalidates old baselines.</p>
       </div>
       <div class="card">
-        <div class="lbl">CI gate</div>
-        <p><code>.github/workflows/bench.yml</code> (job <code>bench</code>) runs the bench workload on every pull request against <code>main</code> / <code>develop</code> / <code>release/**</code> and fails the PR when any p95 breaks budget × tolerance.</p>
+        <div class="lbl">CI signal (advisory)</div>
+        <p><code>.github/workflows/bench.yml</code> (job <code>bench</code>) runs the bench workload on every non-docs pull request against <code>main</code> / <code>develop</code> / <code>release/**</code> and turns the run RED when any p95 breaks budget × tolerance. The workflow is <strong>advisory</strong> — its own header states <em>"Bench is advisory (not in required-status-checks)"</em> and it appears zero times in <code>required-contexts-release.txt</code>, so a red run is a loud reviewer signal, not a merge block.</p>
       </div>
     </div>
 
@@ -287,7 +287,7 @@ ai-memory bench --baseline baseline-&lt;sha&gt;.json --regression-threshold 10</
         <tr>
           <td class="col-name">Bench</td>
           <td>"Is this build still inside its published latency contract, and has it drifted against a known-good run?"</td>
-          <td><code>PERFORMANCE.md</code>, <code>src/bench.rs</code> (<code>P95_TOLERANCE</code>, <code>DEFAULT_REGRESSION_THRESHOLD_PCT</code>), <code>Bench · bench</code> CI job, <a href="BASELINE-v0.6.3.1.html">BASELINE-v0.6.3.1.md</a></td>
+          <td><code>PERFORMANCE.md</code>, <code>src/bench.rs</code> (<code>P95_TOLERANCE</code>, <code>DEFAULT_REGRESSION_THRESHOLD_PCT</code>), the advisory <code>Bench · bench</code> CI job, <a href="BASELINE-v0.6.3.1.html">BASELINE-v0.6.3.1.md</a></td>
         </tr>
         <tr>
           <td class="col-name">Full suite</td>

@@ -242,7 +242,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">Timeline</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">A memory through time.</h2>
-    <p class="lede">An illustrative example: a memory enters at Mid tier, gets accessed twice (each access resets the expiry window to <code>now + 1d</code>), gets linked to a related memory, gets consolidated with siblings into a Long-tier retro, the original ages into the archive, and finally gets purged after a 30-day compliance window.</p>
+    <p class="lede">An illustrative example: a memory enters at Mid tier, gets recalled twice (each access raises the expiry floor to <code>MAX(expiry, now + 1d)</code> — never earlier, #1596), gets linked to a related memory, gets consolidated with siblings into a Long-tier retro, the original ages into the archive, and finally gets purged after a 30-day compliance window.</p>
     <svg class="timeline-svg" viewBox="0 0 1180 320" xmlns="http://www.w3.org/2000/svg">
       <style>
         .axis{stroke:#3d3d3d;stroke-width:1.2}
@@ -288,8 +288,8 @@ footer a{color:var(--text-muted)}
       <text class="ev t1" x="100" y="190" text-anchor="middle">expires_at=+7d</text>
 
       <circle class="pt t2" cx="280" cy="240" r="6"/>
-      <text class="ev t2" x="280" y="220" text-anchor="middle">access</text>
-      <text class="ev t2" x="280" y="205" text-anchor="middle">expires_at = now+1d</text>
+      <text class="ev t2" x="280" y="220" text-anchor="middle">recall</text>
+      <text class="ev t2" x="280" y="205" text-anchor="middle">expiry floor ↑ (#1596)</text>
 
       <circle class="pt t3" cx="460" cy="240" r="6"/>
       <text class="ev t3" x="460" y="220" text-anchor="middle">link added</text>
@@ -342,7 +342,7 @@ footer a{color:var(--text-muted)}
 
     <div class="stage s2">
       <div class="stage-head"><span class="stage-num">stage 2</span><span class="stage-name">Active — accessed, recalled, linked</span><span class="stage-when">days 0–N · while live</span></div>
-      <div class="stage-desc">Every <code>memory_get</code>, recall hit, and search hit bumps <code>access_count</code> and <code>last_accessed_at</code>. Mid-tier memories also get their <code>expires_at</code> <strong>raised to <code>MAX(current expires_at, now + mid_extend_secs)</code></strong> (default 1 day; Short uses <code>short_extend_secs</code>, default 1h) — an extension floor (#1596): an access can never move an expiry earlier than it already was. At 5 accesses (<code>PROMOTION_THRESHOLD</code>) a Mid-tier memory auto-promotes to Long. Memories that get used earn more time. Updates (<code>memory_update</code>) preserve <code>created_at</code> but bump <code>updated_at</code>. KG edges added via <code>memory_link</code> at any time.</div>
+      <div class="stage-desc">Recall is <strong>pure</strong> (#1869): a recall <em>records</em> the hit, and a periodic access-fold (default 60s) later folds those hits into <code>access_count</code> + <code>last_accessed_at</code> — never a synchronous per-request write. (<code>memory_get</code> is read-only and does not count.) The same fold raises a Mid-tier memory's <code>expires_at</code> to <strong>MAX(current expires_at, now + mid_extend_secs)</strong> (default 1 day; Short uses <code>short_extend_secs</code>, default 1h) — an extension floor (#1596): an access can never move an expiry earlier than it already was. Once folded access_count reaches 5 (<code>PROMOTION_THRESHOLD</code>) a Mid-tier memory auto-promotes to Long. Memories that get used earn more time. Updates (<code>memory_update</code>) preserve <code>created_at</code> but bump <code>updated_at</code>. KG edges added via <code>memory_link</code> at any time.</div>
       <div class="snip">{<span class="key">"event"</span>: <span class="val">"accessed"</span>,  <span class="key">"access_count"</span>: <span class="num">3</span>, <span class="key">"last_accessed_at"</span>: <span class="val">"day 3"</span>, <span class="key">"expires_at"</span>: <span class="val">"+1d"</span>}
 {<span class="key">"event"</span>: <span class="val">"link_added"</span>, <span class="key">"relation"</span>: <span class="val">"related_to"</span>, <span class="key">"target_id"</span>: <span class="val">"…"</span>}
 {<span class="key">"event"</span>: <span class="val">"updated"</span>,   <span class="key">"updated_at"</span>: <span class="val">"day 5"</span>, <span class="key">"changes"</span>: [<span class="val">"tags"</span>, <span class="val">"priority"</span>]}</div>
