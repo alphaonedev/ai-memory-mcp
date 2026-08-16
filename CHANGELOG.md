@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (Batman auto-atomisation was structurally inert product-wide; #2983 #2984 #2985 #2986 #2987)
+
+Implements the ratified 5-agent adversarial verdict (protocol `4d3ea1c5`,
+2026-08-16) in one change.
+
+- **#2983 — the dispatch slot had ZERO production callers.** The pre-store
+  auto-atomise hook short-circuited with `skipped_dispatch_unset` on EVERY
+  production surface because nothing ever called
+  `install_auto_atomise_dispatch`; only tests installed the process-wide
+  `AUTO_ATOMISE_DISPATCH` `OnceLock`. Its own doc comment claimed "the daemon
+  `serve` bootstrap is the only production caller of `set`" — no such call
+  existed anywhere in `src/`. Batman Form-2 atomisation therefore did nothing,
+  everywhere, while reporting a mode. **The global is DELETED**
+  (`AUTO_ATOMISE_DISPATCH`, `install_auto_atomise_dispatch`,
+  `ensure_dispatch_installed`, `_test_only_take_dispatch`) rather than
+  installed: it carried no information its call sites did not already hold, and
+  a boot-pinned `Arc<Atomiser>` would re-commit the #2172 defect inside the
+  SIGNED-provenance lane — a revoked vendor kept being egressed to after an
+  `[llm]` reload, while the signed `atomisation_complete` payload named a
+  `curator_model` that never ran. The LIVE atomiser is now threaded explicitly
+  as `AtomiseWiring` from `ToolDispatchCtx::atomise_handler` (already rebuilt on
+  every `[llm]` hot-reload) into `dispatch_memory_store` → `handle_store`.
+- **#2984 — the HTTP create funnel had no atomise call site at all.** MCP stdio
+  is structurally sqlite-only, so every postgres-backed and mTLS-fronted
+  deployment — including the certified enterprise-federation hive — writes
+  through `POST /api/v1/memories`, where atomisation was unreachable even with
+  the dispatch installed. That funnel now enqueues
+  (`handlers::http::try_enqueue_auto_atomise`).
+- **#2986 — one unbounded detached OS thread per over-threshold store.** The
+  deferred path's raw `std::thread::spawn` (each thread opening its own
+  connection and driving a 3-retry ~3.1 s LLM ladder) is replaced by
+  `background::atomise_worker`: a BOUNDED `sync_channel`
+  (`AI_MEMORY_ATOMISE_QUEUE_CAPACITY`, default 256) with a SINGLE consumer, so
+  at most one curator round trip is in flight per daemon. A full queue drops the
+  job with a counted WARN and an honest `skipped_queue_full` token — a DEGRADE
+  (no atoms; `memory_atomise` recovers it), never a write failure. The worker
+  resolves the atomiser at DRAIN time, so a `[llm]` / egress reload between
+  enqueue and drain is honoured.
+- **#2987 — the envelope lied.** `src/mcp/tools/store/mod.rs` set
+  `atomise_mode = "synchronous"` unconditionally on the synchronous branch,
+  including when `atomise_outcome == "skipped_dispatch_unset"` proved nothing
+  ran; the deferred and off branches emitted no mode at all. Now `atomise_mode`
+  is emitted on EVERY branch carrying the mode that ACTUALLY RAN, with
+  `atomise_mode_configured` + `atomise_mode_reason` whenever they differ, and no
+  outcome can contradict its mode label.
+- **#2985 (WARN half) — `auto_atomise` was a dead knob on a curator-less
+  daemon.** `LlmCurator` is the ONLY production `Curator` impl, so the certified
+  loopback-only posture with no local LLM could never atomise and said nothing.
+  There is now a distinct `skipped_no_curator` outcome (separate from every
+  wiring state), a boot `tracing` WARN naming the opted-in namespaces, and an
+  **Atomisation Curator** section in `ai-memory doctor`. **No deterministic
+  splitter fallback** — unanimously voted out: `atomise_sync` ARCHIVES the
+  parent and `AlreadyAtomised` makes the first split the last, so a heuristic
+  substitute is the unintentional-data-loss class. The WARN is deliberately NOT
+  a 19th `enterprise_federation_posture` check (`ENTERPRISE_FEDERATION_CHECK_COUNT
+  = 18` is pinned; a FAIL-capable addition would flip certified deployments to
+  exit 2 — an unintended re-cert event).
+- **Postgres is refused at the ENQUEUE SITE** with an explicit
+  `skipped_backend_unsupported` + WARN + doctor line. The atomiser is
+  `rusqlite::Connection`-bound; falling through to a sqlite handle would land
+  atoms in a different store than their source — mixed-state corruption.
+- **Index-fidelity mitigation (spec-fidelity dissent).** The source-embed skip
+  is now conditioned on a curator ACTUALLY being available, not merely on the
+  configured mode: a `synchronous` namespace on a curator-less daemon used to
+  skip the parent embed and then atomise nothing, leaving the row permanently
+  absent from the vector index. **The HTTP funnel never skips the parent
+  embed** — see the PR body for the structural fork (the sqlite `serve` daemon
+  has no embedding-backfill sweep, so a skipped-then-dropped parent would have
+  no recovery path).
+- **Docs corrected in the same change**: the three false claims in
+  `src/hooks/pre_store/auto_atomise.rs`, `docs/atomisation.md`, and
+  `docs/batman-active-mode.md` — including that `auto_atomise` REQUIRES a wired
+  curator (a loopback Ollama satisfies the certified loopback-only egress
+  posture), and that Form-2 atoms-before-response is an MCP-stdio + sqlite
+  property at v1.0.0.
+
 ### Security (federation inventory — omitting `enforcement.require_sig` no longer silently downgrades the fail-closed signing default; #2975)
 
 - **A federation inventory that simply OMITTED `enforcement.require_sig`

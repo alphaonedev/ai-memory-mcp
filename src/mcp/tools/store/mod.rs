@@ -315,6 +315,13 @@ pub(crate) fn handle_store(
     // edge lands with `attest_level='self_signed'` — matching the
     // legacy supersede path through `update_with_archive_on_supersede`.
     active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    // #2983/#2984/#2986 — the LIVE atomisation wiring, threaded from
+    // `ToolDispatchCtx::atomise_handler` (rebuilt on every `[llm]`
+    // hot-reload, #2172) plus the bounded background worker queue.
+    // Replaces the ABOLISHED process-global `AUTO_ATOMISE_DISPATCH`
+    // OnceLock, which had zero production callers and therefore made
+    // Batman Form-2 atomisation structurally inert product-wide.
+    atomise: crate::hooks::pre_store::AtomiseWiring<'_>,
 ) -> Result<Value, String> {
     // #1885 (critical) — mandatory-hook-presence enforcement gate, consulted
     // BEFORE the store commits (and before any federation forward). Under
@@ -984,8 +991,18 @@ pub(crate) fn handle_store(
     // BELOW after the post-store autonomy hooks. `Deferred` (legacy
     // WT-1-D) and `Off` modes keep the source-embed step.
     let atomise_mode = ns_policy.effective_auto_atomise_mode();
+    // #2985 (index-fidelity mitigation) — the skip is conditioned on a
+    // curator ACTUALLY being available, not merely on the configured
+    // mode. Pre-#2983 a `synchronous` namespace on a curator-less daemon
+    // skipped the parent embed and then atomised NOTHING, leaving the
+    // row permanently absent from the vector index with no MCP-stdio
+    // backfill sweep to heal it. Skipping only when the decompose will
+    // really run preserves Batman's "decompose THEN embed" exactly where
+    // it is structurally achievable and degrades to a normal embed
+    // everywhere else — fewer atoms, never a silently un-indexed row.
     // #881 — embed pipeline extracted to `super::embed`.
-    if !embed::skip_source_embed_for_synchronous_atomise(atomise_mode, mem.content.len())
+    if !(atomise.has_curator()
+        && embed::skip_source_embed_for_synchronous_atomise(atomise_mode, mem.content.len()))
         && let Some(emb) = embedder
     {
         // #1579 A1 — `source_embedding` is the vector the proactive
@@ -1049,35 +1066,25 @@ pub(crate) fn handle_store(
     // the governance gate above already short-circuited via Err(...)
     // before we reached `db::insert`. The store-side governance refusal
     // ensures a denied write never feeds the curator.
-    let mut atomise_outcome: Option<&'static str> = None;
-    {
-        // Cluster-F PERF-10 — pass the in-flight Memory by reference
-        // along with the resolved `actual_id` (which may differ from
-        // `mem.id` under merge-mode upserts). Avoids cloning the
-        // multi-KB content / tags / metadata blob just to swap the id.
-        match atomise_mode {
-            crate::models::AutoAtomiseMode::Synchronous => {
-                // Form 2 — synchronous atomise-before-the-response.
-                atomise_outcome = Some(crate::hooks::pre_store::run_synchronous_auto_atomise(
-                    conn, &mem, &actual_id, &agent_id,
-                ));
-            }
-            crate::models::AutoAtomiseMode::Deferred => {
-                // Cluster-F PERF-1 — reuse the caller's connection
-                // for policy resolution; the worker thread spawns
-                // inside the hook still opens its own connection.
-                let _outcome = crate::hooks::pre_store::maybe_enqueue_auto_atomise(
-                    conn, &mem, &actual_id, &agent_id,
-                );
-                // Outcome is for telemetry only; the response shape
-                // does NOT surface it (the curator pass is
-                // fire-and-forget by design).
-            }
-            crate::models::AutoAtomiseMode::Off => {
-                // Substrate stays quiet for this namespace.
-            }
-        }
-    }
+    //
+    // #2987 — ONE funnel returns the honest disposition for EVERY mode
+    // (including `off`), so the envelope can never again pair a mode
+    // label with an outcome that contradicts it.
+    //
+    // Cluster-F PERF-10 — the in-flight Memory is passed by reference
+    // along with the resolved `actual_id` (which may differ from
+    // `mem.id` under merge-mode upserts). No multi-KB content clone.
+    let atomise_disposition = crate::hooks::pre_store::run_auto_atomise(
+        conn,
+        db_path,
+        &mem,
+        &actual_id,
+        &agent_id,
+        atomise_mode,
+        // #1579 A1 — the policy resolved ONCE at the top of this handler.
+        &ns_policy,
+        atomise,
+    );
 
     // #196: echo the resolved agent_id
     //
@@ -1118,10 +1125,11 @@ pub(crate) fn handle_store(
         response["synthesis_failed"] = json!(true);
         response["synthesis_failed_reason"] = json!(reason);
     }
-    if let Some(outcome) = atomise_outcome {
-        response["atomise_mode"] = json!("synchronous");
-        response["atomise_outcome"] = json!(outcome);
-    }
+    // #2987 — `atomise_mode` is the mode that ACTUALLY RAN, emitted on
+    // EVERY branch; `atomise_mode_configured` + a reason token appear
+    // only when the two differ. The pre-v1.0.0 form hardcoded
+    // `"synchronous"` here even when the outcome proved nothing ran.
+    atomise_disposition.merge_into_response(&mut response);
 
     // v0.7.0 Gap 3 (#886) — recall-consumption hook.
     //

@@ -32,8 +32,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use ai_memory::atomisation::curator::{Atom, Curator, CuratorError};
 use ai_memory::atomisation::{Atomiser, AtomiserConfig};
+use ai_memory::background::atomise_worker::AtomiseQueue;
 use ai_memory::config::{FeatureTier, ResolvedTtl};
-use ai_memory::hooks::pre_store::{AutoAtomisationDispatch, install_auto_atomise_dispatch};
+use ai_memory::hooks::pre_store::AtomiseWiring;
 use ai_memory::models::{
     ApproverType, AtomisationPolicy, AutoAtomiseMode, CorePolicy, GovernanceLevel,
     GovernancePolicy, Memory, Tier,
@@ -135,24 +136,38 @@ fn shared_db_path() -> &'static PathBuf {
     })
 }
 
-fn ensure_dispatch_installed() {
-    static INSTALLED: OnceLock<()> = OnceLock::new();
-    let _ = INSTALLED.get_or_init(|| {
+/// v1.0.0 #2983 — the mock curator is now INJECTED through the explicit
+/// `AtomiseWiring` instead of a process-global `OnceLock` dispatch. The
+/// slot the pre-v1.0.0 form installed had ZERO production callers, so
+/// this suite was the only thing keeping the code path alive at all.
+fn shared_atomiser() -> &'static Arc<Atomiser> {
+    static A: OnceLock<Arc<Atomiser>> = OnceLock::new();
+    A.get_or_init(|| {
         let curator: Box<dyn Curator> = Box::new(MockCurator {
             state: shared_state(),
         });
-        let atomiser = Arc::new(Atomiser::new(
+        Arc::new(Atomiser::new(
             curator,
             None,
             AtomiserConfig::default(),
             FeatureTier::Smart,
-        ));
-        let dispatch = AutoAtomisationDispatch {
-            db_path: shared_db_path().clone(),
-            atomiser,
-        };
-        let _ = install_auto_atomise_dispatch(dispatch);
-    });
+        ))
+    })
+}
+
+/// The bounded, single-consumer background worker (#2986).
+fn shared_queue() -> &'static AtomiseQueue {
+    static Q: OnceLock<AtomiseQueue> = OnceLock::new();
+    Q.get_or_init(|| {
+        ai_memory::background::atomise_worker::spawn(Arc::new(|| {
+            Some(Arc::clone(shared_atomiser()))
+        }))
+        .expect("atomise worker spawns")
+    })
+}
+
+fn wiring() -> AtomiseWiring<'static> {
+    AtomiseWiring::new(Some(shared_atomiser()), Some(shared_queue()))
 }
 
 fn test_serial() -> &'static Mutex<()> {
@@ -232,7 +247,7 @@ fn long_body() -> String {
 
 fn store_through_mcp(conn: &Connection, db_path: &std::path::Path, ns: &str) -> Value {
     let ttl = ResolvedTtl::default();
-    ai_memory::mcp::tools::handle_store_for_tests(
+    ai_memory::mcp::tools::handle_store_with_atomise_for_tests(
         conn,
         db_path,
         &json!({
@@ -247,6 +262,7 @@ fn store_through_mcp(conn: &Connection, db_path: &std::path::Path, ns: &str) -> 
         false,
         None,
         None,
+        wiring(),
     )
     .expect("memory_store ok")
 }
@@ -278,7 +294,6 @@ fn count_atoms_for_source(conn: &Connection, source_id: &str) -> i64 {
 #[test]
 fn synchronous_mode_archives_source_and_atoms_visible_before_response() {
     let _guard = test_serial().lock().unwrap_or_else(|e| e.into_inner());
-    ensure_dispatch_installed();
     reset_mock();
     enqueue_atoms(&[
         "Canary instance health checks must pass.",
@@ -329,7 +344,6 @@ fn synchronous_mode_archives_source_and_atoms_visible_before_response() {
 #[test]
 fn deferred_mode_preserves_existing_behaviour() {
     let _guard = test_serial().lock().unwrap_or_else(|e| e.into_inner());
-    ensure_dispatch_installed();
     reset_mock();
     // Don't enqueue atoms: the deferred path consumes the queue async;
     // for this test we only need to verify the SYNC side-effect path
@@ -361,8 +375,16 @@ fn deferred_mode_preserves_existing_behaviour() {
         "deferred mode: atomised_into must be NULL right after store returns, got: {atomised_into_immediate:?}",
     );
 
-    // The response does NOT carry the synchronous-mode marker.
-    assert!(resp.get("atomise_mode").is_none() || resp["atomise_mode"] != "synchronous");
+    // #2987 — the envelope now reports the mode that ACTUALLY RAN on
+    // EVERY branch. Deferred means deferred, and the outcome says the job
+    // was queued; the pre-v1.0.0 form emitted no field at all here (and
+    // hardcoded "synchronous" on the sync branch even when nothing ran).
+    assert_eq!(resp["atomise_mode"].as_str(), Some("deferred"));
+    assert_eq!(resp["atomise_outcome"].as_str(), Some("queued"));
+    assert!(
+        resp.get("atomise_mode_configured").is_none(),
+        "deferred-configured + deferred-ran must NOT report a divergence"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -372,7 +394,6 @@ fn deferred_mode_preserves_existing_behaviour() {
 #[test]
 fn off_mode_skips_atomisation_entirely() {
     let _guard = test_serial().lock().unwrap_or_else(|e| e.into_inner());
-    ensure_dispatch_installed();
     reset_mock();
     let calls_before = mock_call_count();
 
@@ -399,6 +420,10 @@ fn off_mode_skips_atomisation_entirely() {
         "Off mode: curator must not be called",
     );
 
-    // Response must not carry the synchronous-mode marker either.
-    assert!(resp.get("atomise_mode").is_none() || resp["atomise_mode"] != "synchronous");
+    // #2987 — `off` is a mode too, and it is reported honestly.
+    assert_eq!(resp["atomise_mode"].as_str(), Some("off"));
+    assert_eq!(
+        resp["atomise_outcome"].as_str(),
+        Some("skipped_policy_disabled")
+    );
 }

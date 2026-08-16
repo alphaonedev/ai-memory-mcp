@@ -109,6 +109,7 @@ async fn build_postgres_app_state(url: &str) -> AppState {
         ),
         autonomous_hooks: false,
         auto_tag_queue: None,
+        atomise_queue: None,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(Vec::new()),

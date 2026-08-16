@@ -77,10 +77,40 @@ The `auto_atomise` field on
 enables the WT-1-D pre_store hook
 ([`src/hooks/pre_store/auto_atomise.rs`](../src/hooks/pre_store/auto_atomise.rs)).
 When a namespace's `metadata.governance.auto_atomise = true`, every
-successful `memory_store` enqueues a curator pass on a detached worker
-thread. The store response **never blocks** on the curator — failures
-inside the worker are notify-class (logged via `tracing::warn`, never
-propagated). Operators opt in per namespace; the default is off.
+successful `memory_store` hands a curator pass to a **bounded,
+single-consumer background worker**
+([`src/background/atomise_worker.rs`](../src/background/atomise_worker.rs)).
+The store response **never blocks** on the curator — failures inside the
+worker are notify-class (logged via `tracing::warn`, never propagated).
+Operators opt in per namespace; the default is off.
+
+Three requirements are load-bearing at v1.0.0 (#2983-#2987):
+
+* **auto_atomise requires a wired curator.** `LlmCurator` is the only
+  production `Curator` impl, so on a daemon with no `[llm]` backend (or
+  with `AI_MEMORY_INFERENCE_EGRESS` refusing the resolved target) the
+  knob is dead: the write lands whole and reports
+  `atomise_outcome: "skipped_no_curator"`. A **loopback Ollama satisfies
+  the certified loopback-only egress posture**. `ai-memory doctor` has an
+  **Atomisation Curator** section for this, and the daemon WARNs at boot.
+* **Form-2 "atoms before the response returns" is an MCP-stdio + sqlite
+  property.** The HTTP `POST /api/v1/memories` funnel always runs
+  DEFERRED and reports the divergence honestly
+  (`atomise_mode_configured` + `atomise_mode_reason: "deferred_on_http"`).
+* **The atomiser is sqlite-bound.** A postgres-backed daemon reports
+  `atomise_outcome: "skipped_backend_unsupported"` at the enqueue site
+  and never falls through to a sqlite handle.
+
+Every store response carries `atomise_mode` (the mode that ACTUALLY ran)
+and `atomise_outcome`; when the mode that ran differs from the configured
+one, `atomise_mode_configured` + `atomise_mode_reason` say why. The
+bounded worker's queue depth is `AI_MEMORY_ATOMISE_QUEUE_CAPACITY`
+(default 256); a full queue drops the job with a counted WARN and an
+honest `skipped_queue_full` token — never a write failure.
+
+The CLI `ai-memory store` one-shot deliberately does NOT fire this hook
+(the operator-direct substrate path, matching the governance-hook and
+quota exemptions).
 
 ### MCP tool (interactive)
 
@@ -287,8 +317,8 @@ namespace at the cost of longer envelopes override per-namespace via
 Setting `auto_atomise_max_retries: 3` restores the pre-Cluster-F
 behaviour (4 total attempts, up to ~3.1 s extra envelope). The
 deferred path ignores this override; it always uses
-`AtomiserConfig::curator_max_retries` (default 3) since it runs on a
-detached worker thread.
+`AtomiserConfig::curator_max_retries` (default 3) since it runs on the
+bounded background worker rather than inside the operator's call.
 
 ## See also
 

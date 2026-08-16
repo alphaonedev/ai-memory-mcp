@@ -189,6 +189,7 @@ fn make_test_state() -> (AppState, std::path::PathBuf) {
         federation_nonce_cache: Arc::new(ai_memory::identity::replay::FederationNonceCache::new()),
         autonomous_hooks: false,
         auto_tag_queue: None,
+        atomise_queue: None,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(Vec::new()),

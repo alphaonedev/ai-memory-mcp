@@ -390,6 +390,33 @@ pub struct Metrics {
     /// corruption; the durable write this job followed already succeeded.
     pub autotag_degraded_total: IntCounter,
 
+    /// #2986 — monotonic count of auto-atomise jobs enqueued onto the
+    /// bounded single-consumer background worker after a durable write.
+    pub atomise_enqueued_total: IntCounter,
+
+    /// #2986 — monotonic count of auto-atomise jobs DROPPED because the
+    /// bounded queue (`AI_MEMORY_ATOMISE_QUEUE_CAPACITY`) was full or no
+    /// worker was wired. The durable write always succeeds regardless —
+    /// a DEGRADE (no atoms for that write; `memory_atomise` recovers it),
+    /// never a write failure. Alert on the RATE.
+    pub atomise_dropped_total: IntCounter,
+
+    /// #2986 — monotonic count of auto-atomise passes that landed atoms
+    /// (either the synchronous MCP path or a drained background job).
+    pub atomise_applied_total: IntCounter,
+
+    /// #2986 — monotonic count of auto-atomise passes that failed
+    /// (curator error, db-open failure). A DEGRADE, never data loss —
+    /// the durable source row is untouched on every failure arm.
+    pub atomise_degraded_total: IntCounter,
+
+    /// #2985 — monotonic count of writes whose namespace standard
+    /// REQUESTED `auto_atomise` on a daemon with NO curator (no LLM
+    /// wired, or inference egress refused). A non-zero value is a
+    /// MISCONFIGURATION signal, not load: the knob is set and
+    /// structurally dead. `ai-memory doctor` names the same condition.
+    pub atomise_no_curator_total: IntCounter,
+
     /// #1735 (Pillar-4 4.C) — current depth of the `kg_projection_outbox`
     /// (pending AGE projections not yet drained: `projected_at IS NULL`).
     /// Refreshed each cold-drainer tick. Sustained non-zero depth means the
@@ -899,6 +926,48 @@ impl Metrics {
         )?;
         registry.register(Box::new(autotag_degraded_total.clone()))?;
 
+        let atomise_enqueued_total = IntCounter::new(
+            "ai_memory_atomise_enqueued_total",
+            "Monotonic counter of auto-atomise jobs enqueued onto the bounded \
+             single-consumer background worker after a durable write (#2986).",
+        )?;
+        registry.register(Box::new(atomise_enqueued_total.clone()))?;
+
+        let atomise_dropped_total = IntCounter::new(
+            "ai_memory_atomise_dropped_total",
+            "Monotonic counter of auto-atomise jobs DROPPED because the bounded \
+             queue (AI_MEMORY_ATOMISE_QUEUE_CAPACITY) was full or no worker was \
+             wired (#2986). The durable write always succeeds regardless — a \
+             DEGRADE (no atoms; `memory_atomise` recovers it), never a write \
+             failure. Alert on a sustained increment rate.",
+        )?;
+        registry.register(Box::new(atomise_dropped_total.clone()))?;
+
+        let atomise_applied_total = IntCounter::new(
+            "ai_memory_atomise_applied_total",
+            "Monotonic counter of auto-atomise passes that landed atoms — the \
+             synchronous MCP path or a drained background job (#2986).",
+        )?;
+        registry.register(Box::new(atomise_applied_total.clone()))?;
+
+        let atomise_degraded_total = IntCounter::new(
+            "ai_memory_atomise_degraded_total",
+            "Monotonic counter of auto-atomise passes that FAILED (curator \
+             error, db-open failure) (#2986). A DEGRADE, never data loss — the \
+             durable source row is untouched on every failure arm.",
+        )?;
+        registry.register(Box::new(atomise_degraded_total.clone()))?;
+
+        let atomise_no_curator_total = IntCounter::new(
+            "ai_memory_atomise_no_curator_total",
+            "Monotonic counter of writes whose namespace standard REQUESTED \
+             auto_atomise on a daemon with NO curator — no LLM wired, or \
+             inference egress refused (#2985). Non-zero means a \
+             MISCONFIGURATION, not load: the knob is set and structurally \
+             dead. `ai-memory doctor` names the same condition.",
+        )?;
+        registry.register(Box::new(atomise_no_curator_total.clone()))?;
+
         let age_projection_pending_depth = IntGauge::new(
             "ai_memory_age_projection_pending_depth",
             "Current depth of the kg_projection_outbox (pending deferred AGE \
@@ -967,6 +1036,11 @@ impl Metrics {
             autotag_dropped_total,
             autotag_applied_total,
             autotag_degraded_total,
+            atomise_enqueued_total,
+            atomise_dropped_total,
+            atomise_applied_total,
+            atomise_degraded_total,
+            atomise_no_curator_total,
             age_projection_pending_depth,
             age_projection_failed_total,
             age_projection_quarantined_total,
@@ -1140,6 +1214,38 @@ pub fn inc_autotag_applied() {
 /// race). Pairs with the `autotag.worker.*` WARN at the call site.
 pub fn inc_autotag_degraded() {
     registry().autotag_degraded_total.inc();
+}
+
+/// v1.0.0 #2986 — record one auto-atomise job enqueued onto the bounded
+/// single-consumer background worker after a durable write.
+pub fn inc_atomise_enqueued() {
+    registry().atomise_enqueued_total.inc();
+}
+
+/// v1.0.0 #2986 — record one auto-atomise job dropped because the bounded
+/// queue was full or no worker was wired. Pairs with the
+/// `atomise.queue.dropped` WARN at the call site (the only channel on MCP
+/// stdio, which serves no `/metrics`).
+pub fn inc_atomise_dropped() {
+    registry().atomise_dropped_total.inc();
+}
+
+/// v1.0.0 #2986 — record one auto-atomise pass that landed atoms.
+pub fn inc_atomise_applied() {
+    registry().atomise_applied_total.inc();
+}
+
+/// v1.0.0 #2986 — record one auto-atomise pass that failed (curator error
+/// or db-open failure). The durable source row is untouched.
+pub fn inc_atomise_degraded() {
+    registry().atomise_degraded_total.inc();
+}
+
+/// v1.0.0 #2985 — record one write whose namespace standard requested
+/// `auto_atomise` on a curator-less daemon. Pairs with the
+/// `pre_store.auto_atomise` WARN and the `ai-memory doctor` section.
+pub fn inc_atomise_no_curator() {
+    registry().atomise_no_curator_total.inc();
 }
 
 /// v0.7-polish SEC-15 / COR-11 (issue #780) — read the current value

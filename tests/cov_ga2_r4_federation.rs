@@ -560,6 +560,7 @@ async fn pg_router_with_db(url: &str, db: Db) -> axum::Router {
         ),
         autonomous_hooks: false,
         auto_tag_queue: None,
+        atomise_queue: None,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(vec!["ai:cov-ga2-r4".to_string()]),

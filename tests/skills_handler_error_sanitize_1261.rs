@@ -81,6 +81,7 @@ fn build_router_with_db_path(db_path: &std::path::Path) -> (axum::Router, ai_mem
         ),
         autonomous_hooks: false,
         auto_tag_queue: None,
+        atomise_queue: None,
         recall_scope: std::sync::Arc::new(None),
         deferred_audit_queue: std::sync::Arc::new(None),
         admin_agent_ids: std::sync::Arc::new(vec!["ops:admin".to_string()]),

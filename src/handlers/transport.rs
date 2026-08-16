@@ -307,6 +307,23 @@ pub struct AppState {
     pub auto_tag_queue:
         Option<tokio::sync::mpsc::Sender<crate::background::auto_tag_worker::AutoTagJob>>,
 
+    /// #2984/#2986 — bounded producer handle for the single-consumer
+    /// auto-atomise worker (`crate::background::atomise_worker`). The HTTP
+    /// `create_memory` sqlite branch `try_enqueue`s a job here AFTER the
+    /// durable insert — never awaiting the curator LLM, never blocking the
+    /// response, never failing the write on a full or absent queue.
+    ///
+    /// `Some` when `bootstrap_serve` spawned the worker on a SQLITE-backed
+    /// daemon. Deliberately `None` on a postgres-backed daemon: the
+    /// atomiser is `rusqlite::Connection`-bound, so the enqueue site
+    /// reports `skipped_backend_unsupported` rather than ever falling
+    /// through to a sqlite handle — atoms landing in a different store than
+    /// their source would be mixed-state corruption.
+    ///
+    /// `AtomiseQueue` wraps a `SyncSender` (cheap to clone), so this field
+    /// keeps `AppState::clone()` cheap like every other field.
+    pub atomise_queue: Option<crate::background::atomise_worker::AtomiseQueue>,
+
     /// v0.7.0 (issue #518) — resolved
     /// `[agents.defaults.recall_scope]` block. `Some` carries the
     /// session-default namespace / since / tier / limit filters

@@ -421,6 +421,7 @@ fn test_app_state(db: Db) -> AppState {
         federation_nonce_cache: Arc::new(crate::identity::replay::FederationNonceCache::new()),
         autonomous_hooks: false,
         auto_tag_queue: None,
+        atomise_queue: None,
         recall_scope: Arc::new(None),
         // v0.7.0 Policy-Engine Item 3 — tests don't spawn the
         // drainer; the queue is None and the storage hook is
@@ -1355,6 +1356,7 @@ async fn http_bulk_create_fans_out_with_federation() {
         ),
         autonomous_hooks: false,
         auto_tag_queue: None,
+        atomise_queue: None,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(Vec::new()),
@@ -10748,6 +10750,7 @@ fn h8d_app_state_with_fed(db: Db, peer_urls: Vec<String>, w: usize, timeout_ms: 
         federation_nonce_cache: Arc::new(crate::identity::replay::FederationNonceCache::new()),
         autonomous_hooks: false,
         auto_tag_queue: None,
+        atomise_queue: None,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(Vec::new()),

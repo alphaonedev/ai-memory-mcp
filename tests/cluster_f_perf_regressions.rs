@@ -64,9 +64,9 @@ use std::sync::{Arc, Mutex};
 use ai_memory::atomisation::curator::{Atom, Curator, CuratorError};
 use ai_memory::atomisation::{Atomiser, AtomiserConfig};
 use ai_memory::config::FeatureTier;
+use ai_memory::hooks::pre_store::auto_atomise::OUTCOME_SKIPPED_POLICY_DISABLED;
 use ai_memory::hooks::pre_store::{
-    AutoAtomisationDispatch, AutoAtomisationOutcome, install_auto_atomise_dispatch,
-    maybe_enqueue_auto_atomise,
+    AtomiseWiring, AutoAtomisationOutcome, maybe_enqueue_auto_atomise,
 };
 use ai_memory::models::{
     ApproverType, AtomisationPolicy, AutoAtomiseMode, ConfidenceSource, CorePolicy,
@@ -335,7 +335,7 @@ fn pre_store_hooks_share_caller_connection() {
     // namespace policy using the caller's connection (i.e. a
     // committed namespace standard becomes visible to the hook
     // immediately, no `db::open` round-trip required).
-    let (conn, _path) = open_db("perf1");
+    let (conn, path) = open_db("perf1");
 
     // Seed a namespace standard whose policy DISABLES auto_atomise.
     let ns = "perf1/disabled-ns".to_string();
@@ -369,24 +369,28 @@ fn pre_store_hooks_share_caller_connection() {
     let std_id = db::insert(&conn, &std_mem).unwrap();
     db::set_namespace_standard(&conn, &ns, &std_id, None).unwrap();
 
-    // Build the in-flight Memory and invoke the hook. Even though
-    // the dispatch slot may be unset (CLI-style test harness), the
-    // hook MUST return a `Skipped { dispatch_unset | policy_disabled }`
-    // outcome WITHOUT issuing a `db::open` against any path — the
-    // type signature itself forbids the in-hook open.
+    // Build the in-flight Memory and invoke the hook. The hook MUST
+    // return `Skipped { policy_disabled }` WITHOUT issuing a `db::open`
+    // against any path — the type signature itself forbids the in-hook
+    // open.
+    //
+    // v1.0.0 #2983 — this assertion is now EXACT. It used to accept
+    // `dispatch_unset || policy_disabled` because the process-global
+    // dispatch slot was one-shot, so a sibling test could change which
+    // arm fired. With the wiring threaded explicitly there is exactly
+    // one correct answer and the hedge is gone.
     let mem = make_memory(&ns, "perf1-mem", "any body large enough");
-    let outcome = maybe_enqueue_auto_atomise(&conn, &mem, &mem.id, "ai:test");
+    let outcome = maybe_enqueue_auto_atomise(
+        &conn,
+        &path,
+        &mem,
+        &mem.id,
+        "ai:test",
+        AtomiseWiring::default(),
+    );
     match outcome {
         AutoAtomisationOutcome::Skipped { reason } => {
-            // Either dispatch_unset (CLI / unit-test mode) or
-            // policy_disabled (when a dispatch was installed by an
-            // earlier in-process test). Both prove the hook
-            // short-circuited on data the caller's connection
-            // surfaced — no extra `db::open` could have happened.
-            assert!(
-                reason == "dispatch_unset" || reason == "policy_disabled",
-                "expected dispatch_unset|policy_disabled, got {reason}"
-            );
+            assert_eq!(reason, OUTCOME_SKIPPED_POLICY_DISABLED);
         }
         other => panic!("expected Skipped outcome, got {other:?}"),
     }
@@ -502,14 +506,10 @@ fn auto_atomise_max_retries_policy_override_honored() {
     );
     let source_id = db::insert(&conn, &mem).unwrap();
 
-    // Install dispatch (one-shot per process; the in-test `OnceLock`
-    // may already be set by a sibling test — install fails silently
-    // in that case, which is fine because our atomiser handle below
-    // is the one being asserted on, not the dispatch).
-    let _ = install_auto_atomise_dispatch(AutoAtomisationDispatch {
-        db_path: db_path.clone(),
-        atomiser: Arc::clone(&atomiser),
-    });
+    // v1.0.0 #2983 — no dispatch install any more: this test asserts on
+    // the atomiser handle DIRECTLY, which is exactly what the abolished
+    // global was obscuring.
+    let _ = &db_path;
 
     // Per-namespace policy with `auto_atomise_max_retries = Some(5)`.
     // The substrate's Synchronous-mode hook MUST honour this and

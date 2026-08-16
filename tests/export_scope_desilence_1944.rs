@@ -238,6 +238,7 @@ fn build_router_fixture(db_path: &std::path::Path, admin_ids: Vec<String>) -> ax
         ),
         autonomous_hooks: false,
         auto_tag_queue: None,
+        atomise_queue: None,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(admin_ids),

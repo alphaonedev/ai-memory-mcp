@@ -891,6 +891,46 @@ pub mod tools {
         mcp_client: Option<&str>,
         federation_forward_url: Option<&str>,
     ) -> Result<serde_json::Value, String> {
+        handle_store_with_atomise_for_tests(
+            conn,
+            db_path,
+            params,
+            embedder,
+            llm,
+            vector_index,
+            resolved_ttl,
+            autonomous_hooks,
+            mcp_client,
+            federation_forward_url,
+            crate::hooks::pre_store::AtomiseWiring::default(),
+        )
+    }
+
+    /// v1.0.0 #2983 — the atomisation-aware twin of
+    /// [`handle_store_for_tests`], which injects the LIVE
+    /// [`crate::hooks::pre_store::AtomiseWiring`] explicitly.
+    ///
+    /// Pre-#2983 the integration suite installed a process-wide `OnceLock`
+    /// dispatch instead, which is exactly why its assertions had to hedge
+    /// (`known.contains(&tag)`): the slot was one-shot per PROCESS, so a
+    /// test could never know whose atomiser it got, nor re-install a
+    /// different mock between cases. With the wiring threaded, every
+    /// atomisation assertion is EXACT and order-independent.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn handle_store_with_atomise_for_tests(
+        conn: &rusqlite::Connection,
+        db_path: &std::path::Path,
+        params: &serde_json::Value,
+        embedder: Option<&dyn crate::embeddings::Embed>,
+        llm: Option<&crate::llm::OllamaClient>,
+        vector_index: Option<&dyn crate::hnsw::VectorSearchIndex>,
+        resolved_ttl: &crate::config::ResolvedTtl,
+        autonomous_hooks: bool,
+        mcp_client: Option<&str>,
+        federation_forward_url: Option<&str>,
+        atomise: crate::hooks::pre_store::AtomiseWiring<'_>,
+    ) -> Result<serde_json::Value, String> {
         super::store::handle_store(
             conn,
             db_path,
@@ -908,6 +948,7 @@ pub mod tools {
             // `create_link_signed`'s documented contract when keypair
             // is None.
             None,
+            atomise,
         )
     }
 }
@@ -1335,6 +1376,11 @@ pub(crate) struct ToolDispatchCtx<'a> {
     pub federation_forward_url: Option<&'a str>,
     pub recall_scope: Option<&'a crate::config::RecallScope>,
     pub atomise_handler: Option<&'a atomise::AtomiseToolHandler>,
+    /// v1.0.0 #2986 — producer handle for the bounded single-consumer
+    /// auto-atomise worker owned by `run_mcp_server`. `None` in test
+    /// scaffolds (the deferred path then degrades honestly with
+    /// `skipped_queue_full`, never a blocking inline curator call).
+    pub atomise_queue: Option<&'a crate::background::atomise_worker::AtomiseQueue>,
     pub ingest_multistep_handler: Option<&'a ingest_multistep::IngestMultistepHandler>,
 }
 
@@ -1392,6 +1438,14 @@ fn dispatch_memory_store(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
         // `self_signed` (matching the legacy supersede path through
         // `update_with_archive_on_supersede`).
         ctx.active_keypair,
+        // #2983 — the LIVE atomiser (the ctx handler is rebuilt on every
+        // `[llm]` hot-reload, #2172) plus the bounded worker queue. The
+        // process-global dispatch slot this replaces had ZERO production
+        // callers, so every store short-circuited `skipped_dispatch_unset`.
+        crate::hooks::pre_store::AtomiseWiring::new(
+            ctx.atomise_handler.map(|h| &h.atomiser),
+            ctx.atomise_queue,
+        ),
     )
 }
 
@@ -3026,6 +3080,9 @@ fn handle_request(
     // when an LLM is wired (smart/autonomous tier); `None` collapses
     // the dispatch path to a tier-locked advisory envelope.
     atomise_handler: Option<&atomise::AtomiseToolHandler>,
+    // v1.0.0 #2986 — producer handle for the bounded single-consumer
+    // auto-atomise worker. `None` in test scaffolds.
+    atomise_queue: Option<&crate::background::atomise_worker::AtomiseQueue>,
     // v0.7.0 Form 3 (issue #756) — `memory_ingest_multistep` handler
     // bundle. `Some` when an LLM is wired; `None` collapses to the
     // tier-locked advisory.
@@ -3255,6 +3312,7 @@ fn handle_request(
                 federation_forward_url,
                 recall_scope,
                 atomise_handler,
+                atomise_queue,
                 ingest_multistep_handler,
             };
             let Some(dispatch) = lookup_dispatch(tool_name) else {
@@ -4326,6 +4384,52 @@ pub fn run_mcp_server(
         eprintln!("ai-memory: atomisation engine ready (curator=LlmCurator)");
     }
 
+    // v1.0.0 #2986 — the bounded, single-consumer auto-atomise worker.
+    //
+    // The DEFERRED atomise path used to `std::thread::spawn` one
+    // unbounded detached thread per over-threshold store; this replaces
+    // it with a bounded queue drained by exactly one consumer, so a
+    // write burst can never convert into thread / connection / vendor-QPS
+    // exhaustion.
+    //
+    // The worker resolves the atomiser at DRAIN time through this cell,
+    // which the `[llm]` hot-reload block below re-seeds in lockstep with
+    // `atomise_handler` (#2172). A boot-pinned `Arc<Atomiser>` would keep
+    // egressing to a REVOKED vendor after a reload and would sign
+    // `atomisation_complete` payloads naming a model that never ran.
+    let atomise_cell: Arc<std::sync::Mutex<Option<Arc<crate::atomisation::Atomiser>>>> = Arc::new(
+        std::sync::Mutex::new(atomise_handler.as_ref().map(|h| Arc::clone(&h.atomiser))),
+    );
+    let atomise_queue = {
+        let cell = Arc::clone(&atomise_cell);
+        crate::background::atomise_worker::spawn(Arc::new(move || {
+            cell.lock().ok().and_then(|g| g.clone())
+        }))
+    };
+
+    // #2985 — a bound namespace standard that REQUESTS auto_atomise on a
+    // curator-less daemon is a silent dead knob. Name it at boot (the
+    // `ai-memory doctor` section carries the same diagnosis). Deliberately
+    // NOT a 19th `enterprise_federation_posture` check: that count is
+    // pinned at 18 and a FAIL-capable addition would flip certified
+    // deployments to exit 2 — an unintended re-cert event.
+    if atomise_handler.is_none() {
+        let requesting = crate::hooks::pre_store::namespaces_requesting_auto_atomise(&conn);
+        if !requesting.is_empty() {
+            let msg = format!(
+                "ai-memory: WARNING — {} namespace standard(s) request auto_atomise but NO \
+                 curator is wired on this daemon (no [llm] backend, or inference egress \
+                 refused). Batman atomisation CANNOT run: {}. Wire an [llm] backend — a \
+                 loopback Ollama satisfies the certified loopback-only egress posture — or \
+                 clear auto_atomise on those standards. See `ai-memory doctor`.",
+                requesting.len(),
+                requesting.join(", ")
+            );
+            tracing::warn!(target: "pre_store.auto_atomise", "{msg}");
+            eprintln!("{msg}");
+        }
+    }
+
     // v0.7.0 Form 3 (issue #756) — `memory_ingest_multistep` MCP tool
     // wiring. The handler is built only when an LLM is available
     // (Form 3 LLM stages require the smart/autonomous tier). On
@@ -4585,6 +4689,14 @@ pub fn run_mcp_server(
                             );
                             ingest_multistep_handler =
                                 build_ingest_multistep_handler(llm.as_ref(), &tier_config);
+                            // #2986 — re-seed the worker's drain-time
+                            // atomiser source at the SAME swap point, so a
+                            // queued-but-not-yet-drained job runs under the
+                            // NEW client (or is refused outright when the
+                            // reload disabled the LLM).
+                            if let Ok(mut cell) = atomise_cell.lock() {
+                                *cell = atomise_handler.as_ref().map(|h| Arc::clone(&h.atomiser));
+                            }
                             tracing::info!(
                                 "MCP config.toml changed — [llm] client + atomise/ingest \
                                  handlers hot-swapped (#2166/#2172)"
@@ -4633,6 +4745,7 @@ pub fn run_mcp_server(
             app_config.mcp_federation_forward_url.as_deref(),
             resolved_recall_scope,
             atomise_handler.as_deref(),
+            atomise_queue.as_ref(),
             ingest_multistep_handler.as_deref(),
             Some(&nag_watcher),
             &nag_session_id,
@@ -4879,6 +4992,7 @@ mod tests {
             Option<&str>,
             Option<&crate::config::RecallScope>,
             Option<&atomise::AtomiseToolHandler>,
+            Option<&crate::background::atomise_worker::AtomiseQueue>,
             Option<&ingest_multistep::IngestMultistepHandler>,
             Option<&crate::recover::nag::CaptureNagWatcher>,
             &str,
@@ -4940,6 +5054,7 @@ mod tests {
                 None,           // federation_forward_url
                 None,           // recall_scope
                 None,           // atomise_handler
+                None,           // atomise_queue (#2986)
                 None,           // ingest_multistep_handler
                 None,           // nag_watcher (#1389/#1398 L1)
                 "test-session", // nag_session_id (#1389/#1398 L1)
@@ -5834,6 +5949,7 @@ mod tests {
                 None,           // federation_forward_url (#318)
                 None,           // recall_scope (#518)
                 None,           // atomise_handler (WT-1-C)
+                None,           // atomise_queue (#2986)
                 None,           // ingest_multistep_handler (Form 3 / #756)
                 None,           // nag_watcher (#1389/#1398 L1)
                 "test-session", // nag_session_id (#1389/#1398 L1)
@@ -5895,6 +6011,7 @@ mod tests {
                 None,           // federation_forward_url (#318)
                 None,           // recall_scope (#518)
                 None,           // atomise_handler (WT-1-C)
+                None,           // atomise_queue (#2986)
                 None,           // ingest_multistep_handler (Form 3 / #756)
                 None,           // nag_watcher (#1389/#1398 L1)
                 "test-session", // nag_session_id (#1389/#1398 L1)
@@ -6272,6 +6389,7 @@ mod tests {
                 None,           // federation_forward_url (#318)
                 None,           // recall_scope (#518)
                 None,           // atomise_handler (WT-1-C)
+                None,           // atomise_queue (#2986)
                 None,           // ingest_multistep_handler (Form 3 / #756)
                 None,           // nag_watcher (#1389/#1398 L1)
                 "test-session", // nag_session_id (#1389/#1398 L1)
@@ -6319,6 +6437,7 @@ mod tests {
                     None,           // federation_forward_url (#318)
                     None,           // recall_scope (#518)
                     None,           // atomise_handler (WT-1-C)
+                    None,           // atomise_queue (#2986)
                     None,           // ingest_multistep_handler (Form 3 / #756)
                     None,           // nag_watcher (#1389/#1398 L1)
                     "test-session", // nag_session_id (#1389/#1398 L1)
@@ -6387,6 +6506,7 @@ mod tests {
             None,           // federation_forward_url (#318)
             None,           // recall_scope (#518)
             None,           // atomise_handler (WT-1-C)
+            None,           // atomise_queue (#2986)
             None,           // ingest_multistep_handler (Form 3 / #756)
             None,           // nag_watcher (#1389/#1398 L1) — disabled in this helper
             "test-session", // nag_session_id (#1389/#1398 L1)
@@ -6428,6 +6548,7 @@ mod tests {
             None, // federation_forward_url (#318)
             None, // recall_scope (#518)
             None, // atomise_handler (WT-1-C)
+            None, // atomise_queue (#2986)
             None, // ingest_multistep_handler (Form 3 / #756)
             Some(nag_watcher),
             nag_session_id,
@@ -6979,6 +7100,7 @@ mod tests {
             None,           // federation_forward_url (#318)
             None,           // recall_scope (#518)
             None,           // atomise_handler (WT-1-C)
+            None,           // atomise_queue (#2986)
             None,           // ingest_multistep_handler (Form 3 / #756)
             None,           // nag_watcher (#1389/#1398 L1)
             "test-session", // nag_session_id (#1389/#1398 L1)
@@ -7101,6 +7223,7 @@ mod tests {
             None,           // federation_forward_url (#318)
             None,           // recall_scope (#518)
             None,           // atomise_handler (WT-1-C)
+            None,           // atomise_queue (#2986)
             None,           // ingest_multistep_handler (Form 3 / #756)
             None,           // nag_watcher (#1389/#1398 L1)
             "test-session", // nag_session_id (#1389/#1398 L1)
@@ -7765,6 +7888,7 @@ mod tests {
             None,
             None,
             None,
+            None,           // atomise_queue (#2986)
             None,           // nag_watcher (#1389/#1398 L1)
             "test-session", // nag_session_id (#1389/#1398 L1)
         );
@@ -7828,6 +7952,7 @@ mod tests {
             None,
             None,
             None,
+            None,           // atomise_queue (#2986)
             None,           // nag_watcher (#1389/#1398 L1)
             "test-session", // nag_session_id (#1389/#1398 L1)
         );
