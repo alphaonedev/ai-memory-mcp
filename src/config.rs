@@ -2145,19 +2145,24 @@ pub struct CapabilitiesV3 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kg_backend: Option<String>,
 
-    /// L1-1 (v0.7.0) — typed memory-kind set. Forwarded from the v2
-    /// projection's `memory_kinds` field. Always
-    /// `["observation", "reflection"]` for v0.7.0.
+    /// L1-1 (v0.7.0) — the FROZEN LEGACY 2-element memory-kind hint,
+    /// always `["observation", "reflection"]` (from
+    /// [`default_memory_kinds`]). Forwarded verbatim from the v2
+    /// projection's `memory_kinds` field and kept for back-compat with
+    /// v1 / v2 capabilities consumers.
     ///
-    /// **L3-5 honesty note.** The grand-slam spec called for a third
-    /// `"goal"` kind here, but the [`crate::models::memory::MemoryKind`]
-    /// enum in this binary only carries `Observation` and `Reflection`.
-    /// Per the operator's "every reported field maps to real
-    /// implementation" directive, the v3 surface reports exactly what
-    /// the substrate enforces — the `goal` kind is deferred to the
-    /// tracker (`a4f8d465`) for a v0.8.0 wave that lands the enum
-    /// variant + migration + write-path coverage. Reporting it here
-    /// today would be theatrical.
+    /// This field is NOT the accepted vocabulary. The
+    /// [`crate::models::memory::MemoryKind`] enum carries **16 variants
+    /// at v1.0.0** ([`crate::models::MemoryKind::all`]: the 10 Form-6
+    /// kinds plus Goal/Plan/Step from v0.8.0 Pillar-2 typed-cognition
+    /// (#1709) plus Told/Instruction/Intervention from v1.0.0 epistemic
+    /// typing (#1945)), and the substrate accepts all 16 on write. The
+    /// authoritative, complete accepted vocabulary is carried on the
+    /// Form-6 [`CapabilityMemoryKindVocab`] `memory_kind_vocab` block
+    /// (compile-anchored to [`crate::models::MemoryKind::all`]); callers
+    /// should consult that block rather than this legacy two-element
+    /// list. Widening or removing this frozen field is a separate voted
+    /// wire-shape change, not a doc fix.
     #[serde(default = "default_memory_kinds")]
     pub memory_kinds: Vec<String>,
 
