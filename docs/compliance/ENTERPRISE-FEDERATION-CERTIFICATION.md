@@ -538,6 +538,28 @@ operator/reviewer gate. Until that re-affirmation lands, treat the
 certification as EXPIRED per this clause for the changed wire surface — the
 posture is strictly STRONGER, never weaker, than at `e22bc93c`.
 
+**Re-cert trigger — FIRED, pending re-affirmation (PR #2968, #2966
+observable quarantine).** The federation-wire surface changed:
+`src/handlers/federation_receive.rs::maybe_quarantine_unattributed` now
+emits a Prometheus counter (`ai_memory_fed_quarantined_unattributed_total`,
+registered in `src/metrics.rs`) plus a sampled `tracing::warn!` (target
+`federation.quarantine.unattributed`) whenever the route-IN provenance gate
+quarantines an unattributed inbound relayed memory. The change is
+**purely additive OBSERVABILITY** closing the #2444 silent-hide
+anti-pattern (the quarantine used to emit nothing while `/sync/push`
+returned 200): it does NOT change the wire, the schema, the quarantine
+predicate, or any security posture — behavior is **byte-identical when the
+knob (`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`) is off, which is the
+default**, and the counter/WARN fire only on an actual quarantine. It adds
+**NO new `AI_MEMORY_FED_*` identifier** and REMOVES **no** certified
+control (the removal-proof set is unchanged). **This PR does NOT re-mint
+the certification:** re-running §5.4(2)–(5) at the new SHA and re-affirming
+this document against it is the operator/reviewer gate. Until that
+re-affirmation lands, treat the certification as EXPIRED per this clause
+for the changed wire surface — the posture is UNCHANGED from `e22bc93c`
+except that a formerly-silent quarantine is now operator-visible (strictly
+MORE observable, never weaker).
+
 **Named signer.** The determination at `580d8427` is a **GitHub
 squash-merge** of PR #2910, committed by `GitHub` on behalf of the
 operator account (`alphaonedev`). GitHub signature verification is
