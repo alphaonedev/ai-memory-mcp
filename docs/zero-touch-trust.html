@@ -284,7 +284,7 @@ blockquote strong{color:var(--p1)}
         <tr><td><code>AI_MEMORY_FED_CRED_PATH</code></td><td>Path to this node's issued leaf credential (what it presents).</td></tr>
         <tr><td><code>AI_MEMORY_FED_CRED_CHAIN_PATH</code></td><td>Path to the anchor-first intermediate chain (hierarchical trust).</td></tr>
         <tr><td><code>AI_MEMORY_FED_INVENTORY_PATH</code></td><td>Path to the declarative GitOps inventory YAML.</td></tr>
-        <tr><td><code>AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT</code></td><td><strong>Fail-closed gate.</strong> When <code>=1</code>, a receiver rejects any peer with no valid CA-signed credential — <code>401 peer_not_enrolled</code>. The switch that makes enrollment mandatory.</td></tr>
+        <tr><td><code>AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT</code></td><td><strong>Fail-closed gate — default ON since v0.8.0 (#1789).</strong> UNSET (or any non-falsy value) is strict: a receiver rejects any peer with neither an enrolled per-peer Ed25519 key nor a valid CA-signed credential — <code>401 peer_not_enrolled</code>. An explicit falsy value (<code>0</code>/<code>false</code>/<code>no</code>/<code>off</code>) reverts to the permissive posture; companion rollout opt-out <code>AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS</code>.</td></tr>
         <tr><td><code>AI_MEMORY_KEY_DIR</code></td><td>Directory holding this node's signing keypair at <code>&lt;key_dir&gt;/&lt;federation-identity&gt;.{pub,priv}</code>, loaded by the resolved (slashed) identity.</td></tr>
         <tr><td><code>AI_MEMORY_FED_REQUIRE_SIG</code></td><td>Receivers reject unsigned posts (default-on; inherited enforcement gate).</td></tr>
       </tbody>

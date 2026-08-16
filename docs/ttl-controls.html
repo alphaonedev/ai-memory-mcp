@@ -412,7 +412,7 @@ archive_on_gc = <span class="err">false</span></div>
 <span class="ok">mid_ttl_secs</span>   = 7 * 86400         <span class="cm">// 7 days</span>
 <span class="ok">short_ttl_secs</span> = 6 * 3600          <span class="cm">// 6 hours</span>
 <span class="ok">long_ttl_secs</span>  = None              <span class="cm">// no TTL — durable</span>
-<span class="ok">extend_secs</span>    = 1h Short, 1d Mid  <span class="cm">// access resets expiry to now+extend (sliding window)</span>
+<span class="ok">extend_secs</span>    = 1h Short, 1d Mid  <span class="cm">// access raises expiry to MAX(current, now+extend) — floor-extend, #1596</span>
 <span class="ok">archive_on_gc</span>  = true               <span class="cm">// expired → archived (restorable)</span>
 <span class="ok">auto_purge</span>     = none               <span class="cm">// archived rows kept until explicit purge</span>
 

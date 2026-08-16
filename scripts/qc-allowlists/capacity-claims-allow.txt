@@ -49,9 +49,6 @@
 #     cloud provider ... a sovereign government").
 #   * docs/strategy/moonshot-synthesis.md — "3.3 Hive scale (v0.8.x -> v0.9.x
 #     -> v1.0 horizon)": an explicit forward HORIZON, not a shipped capability.
-docs/architectures-t5.html millions of agents acting as a unified collective
-docs/architectures-t5.html Hundreds of thousands to millions of agents
 docs/architectures-t5.html with millions of agents and cross-jurisdictional rules
-docs/architectures.html millions of agents acting as a unified collective
 docs/reference-architectures.md millions of agents
 docs/strategy/moonshot-synthesis.md thousands-to-millions of agents on shared substrate

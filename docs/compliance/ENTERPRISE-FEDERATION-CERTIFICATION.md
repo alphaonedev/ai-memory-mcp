@@ -244,8 +244,8 @@ release binary is deliberately NOT enterprise-federation-compliant.
 
 The certified stack is **executed in-PR** by `.github/workflows/cert-postgres-age.yml`
 (#2548), which BUILDS and runs the exact certified triple and hard-fails on any
-version drift (`Assert certified stack versions` step at
-`.github/workflows/cert-postgres-age.yml:203`):
+version drift (the `Assert certified stack versions` step in
+`.github/workflows/cert-postgres-age.yml`):
 
 - **PostgreSQL 18.6** (`EXPECTED_PG_VERSION=18.6`, `PG_APT_VERSION=18.6-1.pgdg13+2`)
 - **Apache AGE 1.8.0** — the newest released AGE for PostgreSQL 18 per
@@ -369,20 +369,23 @@ deliberately-broken control), runs its lane test, asserts **RED**, reverts,
 asserts **GREEN** — mechanically proving the control is load-bearing (a passing
 e2e suite alone cannot). Proven:
 
-| Control (`src/federation/receive_auth.rs`) | Guard test (the test where this control is DECISIVE) | Broken→Restored |
+| Control (all `src/federation/receive_auth.rs`; symbol-anchored, since the file grows and bare line numbers rot) | Guard test (the test where this control is DECISIVE) | Broken→Restored |
 |---|---|---|
-| `inbound_write_namespace_authorized` (`:1008`; Layer-2 call at `:1049`) | `federation_write_ns_scope_2447::federated_write_outside_peer_scope_refused_2447` | **RED (FAILED) → GREEN (ok)** |
-| `inbound_by_id_namespace_authorized` (`:1181`; Layer-2 call at `:1219`) | `federation_delete_ns_scope_2488::enrolled_unscoped_federated_deletion_refused_by_default_2488` | **RED → GREEN** |
+| `inbound_write_namespace_authorized` (Layer 2 delegates the unscoped-peer check to the `layer2_unscoped_peer_authorized` helper) | `federation_write_ns_scope_2447::federated_write_outside_peer_scope_refused_2447` | **RED (FAILED) → GREEN (ok)** |
+| `inbound_by_id_namespace_authorized` (same Layer-2 helper on the by-id delete lane) | `federation_delete_ns_scope_2488::enrolled_unscoped_federated_deletion_refused_by_default_2488` | **RED → GREEN** |
 | `inbound_namespace_meta_authorized` | `federation_ns_meta_scope_2479::exploit_set_rebinds_out_of_scope_victim_standard_2479` | **RED → GREEN** |
 | `require_push_namespace_scope_enabled` (Layer-2 knob) | `federation_write_ns_scope_2447::enrolled_peer_without_declared_namespaces_denied_by_default_2447` | **RED → GREEN** |
 | `authorize_remote_checkpoint_resolution` (signature gate) | `federation_1936_checkpoint_fed::strict_refuses_unenrolled_resolver` | **RED → GREEN** |
-| `peer_enrolled_in_allowlist` (`:761`; sole call site `:1094`) | **PROVEN on BOTH inbound lanes (2026-08-13, #2912 item 1 / PR #2919).** `:1094` is inside helper `layer2_unscoped_peer_authorized` (declared `:1081`), called from **both** `inbound_write_namespace_authorized` (`:1049`) **and** `inbound_by_id_namespace_authorized` (`:1219`); the harness MAP now carries a decisive row PER LANE (`tests/federation_peer_enrolled_2912.rs::unenrolled_peer_refused_on_{write,delete}_lane_when_scope_hatch_open_2912` — the hatch-open + header-absent shape that reaches Layer 2 rather than being masked by the earlier #1056 envelope gate), and `removal-proof-full.log` records both: broken→RED (rc=101), restored→GREEN. The 2026-08-12 capture's masked disposition (broken→rc=0 on the then-mapped `sync_push_unknown_peer_id_refused_when_allowlist_configured_1056` lane) is retained in `removal-proof-firstpass-2026-08-12.log` as the rigor trail. | **PROVEN (both lanes)** |
+| `peer_enrolled_in_allowlist` — **composite-proven, not a standalone harness row.** Its SOLE production call site is inside the `layer2_unscoped_peer_authorized` helper, which is reached from **both** `inbound_write_namespace_authorized` **and** `inbound_by_id_namespace_authorized`; mutating either of those controls to `return true` (rows 1–2 above) already bypasses this sub-check, so the harness MAP proves it compositely rather than carrying a dedicated row (see the harness NOTE in `scripts/check-cert-removal-proof.sh`). The dedicated negative-lane tests `tests/federation_peer_enrolled_2912.rs::unenrolled_peer_refused_on_{write,delete}_lane_when_scope_hatch_open_2912` (#2912 item 1 / PR #2919 — the hatch-open + header-absent shape that reaches Layer 2 rather than being masked by the earlier #1056 envelope gate) supply the executed end-to-end evidence on both lanes. The 2026-08-12 first-pass capture's masked disposition (broken→rc=0 on the then-mapped `sync_push_unknown_peer_id_refused_when_allowlist_configured_1056` lane) is retained in `removal-proof-firstpass-2026-08-12.log` as the rigor trail. | **PROVEN (composite, both lanes)** |
 
-All **7** cited control rows turn their decisive test RED when broken and GREEN when
-restored (evidence: the per-control `docs/compliance/evidence/cert-54/removal-*-{broken,restored}.out` pairs re-captured 2026-08-13, and the full-harness `removal-proof-full.log` ending `overall: PASS` — 7/7 `[PROVEN]`).
-As of 2026-08-13 **every row is individually PROVEN** — 7/7 `[PROVEN]`
-in `removal-proof-full.log`, including both `peer_enrolled_in_allowlist`
-lanes. **Reaching this required correcting the control→test mapping
+All cited confinement control rows turn their decisive test RED when broken and GREEN when
+restored (evidence: the per-control `docs/compliance/evidence/cert-54/removal-*-{broken,restored}.out` pairs re-captured 2026-08-13, and the full-harness `removal-proof-full.log` ending `overall: PASS`).
+The §5.4(5) determination rests on this **confinement subset** — the five
+`receive_auth` guard fns above plus the composite-proven
+`peer_enrolled_in_allowlist` (the `removal-proof-full.log` `[PROVEN]`
+tally counted `peer_enrolled_in_allowlist` on both inbound lanes, giving
+the `7/7 [PROVEN]` figure recorded in the cert-54 evidence bundle).
+**Reaching this required correcting the control→test mapping
 twice** — the harness initially CERT-RED'd three controls because their
 first-mapped tests did not exercise them decisively (the namespace
 check, not the enrollment/signature/Layer-2 check, was refusing), and
@@ -393,17 +396,44 @@ proven load-bearing, and the certification does not accept it until the
 decisive test is found. The guard test column is now the test where each
 control is the SOLE decisive gate.
 
+> **Live-harness reconciliation (a reader running the harness today sees
+> MORE than the confinement subset).** `scripts/check-cert-removal-proof.sh`
+> at the current release tip carries **11 control rows**, not the six
+> tabulated above: the confinement subset here PLUS controls the
+> forensic-audit-trail wave (`compute_signature_verdict` / L4,
+> `audit_watermark_exoneration_authenticated` / L7,
+> `emit_upsert_supersede_leaf_if_enabled` / #2948,
+> `scan_file_last_watermark_db_id_scope_2955` / #2955) and the
+> consolidation-laundering 2x7 re-audit
+> (`consolidate_confidence_floor_2935`,
+> `consolidate_derived_kind_2935` / #2935) added AFTER the §5.4(5)
+> capture. Those additions span `src/signed_events.rs`,
+> `src/governance/audit.rs`, and `src/storage/mod.rs` — so the statement
+> elsewhere in this section that "the harness MAP covers only these
+> `receive_auth` confinement controls" describes the **captured** map,
+> not the live one. The additions are strictly-stronger (each is a
+> load-bearing integrity control the harness now proves); none removes or
+> weakens a certified confinement control, and the confinement subset the
+> determination rested on is unchanged. Reproducing the exact `7/7` figure
+> requires the cert-54 evidence bundle at the captured tree; reproducing
+> "every cited control is load-bearing" requires only running the live
+> harness (which will report a larger PROVEN count).
+
 > **Evidence-chain note (F5) — CLOSED 2026-08-13.** A full-harness
-> `overall: PASS` log now exists for the **final** 7-row control map:
-> `docs/compliance/evidence/cert-54/removal-proof-full.log` records
-> **7/7 `[PROVEN]`** (broken→RED rc=101, restored→GREEN rc=0 per
-> control), including both `peer_enrolled_in_allowlist` lanes. The
+> `overall: PASS` log exists for the confinement-subset control map as
+> captured: `docs/compliance/evidence/cert-54/removal-proof-full.log`
+> records the confinement controls PROVEN (broken→RED rc=101,
+> restored→GREEN rc=0 per control), including both
+> `peer_enrolled_in_allowlist` lanes, for the `7/7 [PROVEN]` figure
+> cited above. The
 > superseded 2026-08-12 first-pass record (ending `overall: CERT-RED`,
 > pre-remap map) is retained as
 > `removal-proof-firstpass-2026-08-12.log` — the rigor trail that
-> forced the remap. The harness MAP covers only these receive_auth
-> confinement controls — not the envelope/signature gates cited in §1.
-> Envelope-gate mutation proofs remain #2912 item 3 (OPEN).
+> forced the remap. As captured, the harness MAP covered only these
+> `receive_auth` confinement controls — not the envelope/signature
+> gates cited in §1; the **live** harness has since added forensic-audit
+> and consolidation controls (see the live-harness reconciliation note
+> above), but envelope-gate mutation proofs remain #2912 item 3 (OPEN).
 
 ---
 
@@ -470,8 +500,8 @@ is observed:**
    `receive_auth` trace (`ATTESTATION_TRACE_TARGET` =
    `"federation::attestation"`, `src/handlers/federation_receive.rs:33`),
    i.e. an applied write with no `namespace_probe_unresolvable`
-   (`CAUSE_NAMESPACE_PROBE_UNRESOLVABLE`,
-   `src/federation/receive_auth.rs:933`) / refusal counterpart.
+   (`src/federation/receive_auth.rs::CAUSE_NAMESPACE_PROBE_UNRESOLVABLE`)
+   / refusal counterpart.
 2. **`ai-memory doctor --posture enterprise-federation` exits 0 on a process
    that is NOT in the hardened+sqlcipher configuration** (a false-green posture)
    voids it.
@@ -487,12 +517,21 @@ is observed:**
    `docs/compliance/evidence/cert-54/removal-proof-firstpass-2026-08-12.log`;
    the current full-map run ends `overall: PASS` in
    `removal-proof-full.log`).
-4. **`cert-postgres-age.yml` certifying a stack that is NOT
-   PG 18.4 / AGE 1.7.0 / pgvector 0.8.6** (a drift the `Assert certified stack
-   versions` step should have caught) voids it.
-   *Observable:* that step
-   (`.github/workflows/cert-postgres-age.yml:203`) hard-fails the job
-   on version mismatch.
+4. **`cert-postgres-age.yml` certifying a stack that is NOT the pins the
+   `Assert certified stack versions` step reads from
+   `deploy/docker-1461/provision/lib.sh`** (a drift that step should have
+   caught) voids it. As of the 2026-08-15 data-tier refresh those pins are
+   **PG 18.6 / AGE 1.8.0 / pgvector 0.8.6** (`EXPECTED_PG_VERSION=18.6`,
+   `EXPECTED_AGE_VERSION=1.8.0`, `PGVECTOR_APT_VERSION=0.8.6-1.pgdg13+1`);
+   the ratified 2026-08-12 determination was against the prior
+   **PG 18.4 / AGE 1.7.0 / pgvector 0.8.6** triple, and the §3 refresh note
+   holds the PG/AGE rows as *formal-CI-re-green + re-validation-pending*
+   until the in-PR job is GREEN at 18.6 / 1.8.0 and the ratification is
+   re-affirmed. The disconfirmation trigger tracks the pins the step
+   actually asserts, whichever of those two triples is current.
+   *Observable:* that step (the `Assert certified stack versions` step in
+   `.github/workflows/cert-postgres-age.yml`) hard-fails the job on any
+   mismatch against those pins.
 
 **Expiry / re-cert trigger.** This certification binds to `e22bc93c` and
 **expires on any change to the federation wire path (`src/federation/**`,
@@ -615,7 +654,7 @@ this re-issue and the companion PRs / issues dispose.
 | Condition | Disposition |
 |---|---|
 | **(a)** cert artifacts committed and passing CI | **Met.** PR #2910 merged as `580d8427`. The minting-condition evidence is the **commit-level** check-run set on that SHA: `gh api repos/alphaonedev/ai-memory-mcp/commits/580d8427/check-runs --paginate --jq '.check_runs \| group_by(.conclusion) \| map({conclusion: .[0].conclusion, count: length})'` → `[{"conclusion":"skipped","count":1},{"conclusion":"success","count":46}]` — **47 check-runs: 46 SUCCESS + 1 SKIPPED** (`Regenerate bench baseline (ubuntu-latest, median-of-3)` — the intentional bench skip). Zero failures. The PR #2910 `statusCheckRollup` surface is a different GitHub query and reports 42 (41 SUCCESS + 1 SKIPPED); the five commit-level runs absent from that rollup are Android emulator runtime, iOS Simulator runtime, Bash integration (`test-batman-mode-suite.sh`), Rust integration (`issue_800_batman_mode`), and Surface stability (load-bearing symbols). Both queries are true of their respective surfaces; the SHA-level 47 is the minting-condition count. |
-| **(b)** capability-inventory JSON re-derivation | **MET (2026-08-13).** At the mint SHA `580d8427`, the only capability inventory in `docs/compliance/_inventory/` was the v0.7.0-era `v0.7.0-capabilities.json` (alongside its summary/test-plan/registry-submission siblings) — no v1.0.0 re-derivation existed, and the condition was waived as a minting blocker with the staleness disclosed in `docs/compliance/honest-limitations.md:13-16` (currency note pointing at #1938). The inventory is **not load-bearing for the five §1 security guarantees** (those rest on the posture gate, the removal proofs, and the executed negative lanes). Re-derivation, Task B / [**#2916**](https://github.com/alphaonedev/ai-memory-mcp/pull/2916) (`feat/1938-capability-inventory-v100`), **merged 2026-08-13** (`bdcd890d`, Fable 5 pre-merge audit: 114/114 anchors, exact 11851 = 7580 + 4271 test-count reconciliation) — `docs/compliance/_inventory/v1.0.0-capabilities.json` (46 rows @ `580d8427`, schema 89, MCP full 103) now exists at the branch tip. |
+| **(b)** capability-inventory JSON re-derivation | **MET (2026-08-13).** At the mint SHA `580d8427`, the only capability inventory in `docs/compliance/_inventory/` was the v0.7.0-era `v0.7.0-capabilities.json` (alongside its summary/test-plan/registry-submission siblings) — no v1.0.0 re-derivation existed, and the condition was waived as a minting blocker with the staleness disclosed in the `docs/compliance/honest-limitations.md` currency note (currency note pointing at #1938). The inventory is **not load-bearing for the five §1 security guarantees** (those rest on the posture gate, the removal proofs, and the executed negative lanes). Re-derivation, Task B / [**#2916**](https://github.com/alphaonedev/ai-memory-mcp/pull/2916) (`feat/1938-capability-inventory-v100`), **merged 2026-08-13** (`bdcd890d`, Fable 5 pre-merge audit: 114/114 anchors, exact 11851 = 7580 + 4271 test-count reconciliation) — `docs/compliance/_inventory/v1.0.0-capabilities.json` (46 rows @ `580d8427`, schema 89, MCP full 103) now exists at the branch tip. |
 | **(c)** the final AI-NHI re-cert vote | **Met.** The 2026-08-12 vote above. |
 
 **Verdict: CERTIFIED (within scope).** An F500 may treat the five §1
