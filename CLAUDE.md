@@ -1242,6 +1242,50 @@ historical control (a prior-release paragraph, a frozen baseline and
 ladder mentions must still PASS), rule N1, and all three ledger
 directions. Scratch lives under `.local-runs/`, never `mktemp -d`.
 
+**#2977 — the GitHub-Pages `.html` surface.** #2492 widened the PATTERN
+set; the scan SET stayed markdown-plus-one-file, so ~70 hand-authored
+Jekyll pages under `docs/` were ungated and the published site drifted
+invisibly through the whole v1.0.0 campaign (stale schema versions, a
+sitewide `v0.9.0` chrome stamp, a false sub-10ms recall claim, a
+bench-as-merge-blocker claim, a kind-count 10-vs-16) with this gate
+GREEN. The html scan set is now **enroll-by-default** over
+`docs/**/*.html` minus the frozen pages named in
+`scripts/qc-allowlists/html-doc-frozen-exempt.txt` — ONE exemption SSOT,
+shared with gate 11 so the two cannot disagree about the boundary. That
+INVERTS the `.md` argument above deliberately: an enumerated INCLUDE list
+cannot close a class whose whole shape is "a new page lands ungated", and
+the `.html` tree's frozen surfaces are a small, named, structurally
+obvious set (per-release trees, `whats-new-v*`, release narratives, dated
+assessments) where a `.md` glob would drag in the whole
+reviews/design/audit sprawl. A missing exemption file, or an empty
+resolved set outside the fixture, FAILS CLOSED.
+
+The SAME rule table serves both dialects (`<strong>`/`<b>` for `**`,
+`<code>` for a backtick, `&nbsp;` for a space) rather than a second html
+table that could silently disagree — and without that, adding the pages
+would have been a widening that scans them and can see nothing. Two
+html-specific HISTORICAL guards keep TRUE history out of the violation
+set: the guard runs over a **tag-stripped, whitespace-collapsed** view
+(so `schema <strong>vNN</strong> added …` is still recognised as a ladder
+statement — spelled with a placeholder here because the dialect-agnostic
+anchor reads this file too, and an example carrying a real number would
+BE the drift it describes), and the release-card markers (`PRIOR RELEASE`, `What's New in
+vX.Y.Z`) run over a **3-line preceding window**, because an html release
+card puts its attribution in the divs ABOVE the numbers. `--self-test`
+asserts both directions: the same numbers with the card markers REMOVED
+are rejected, so the window is a guard and not a blanket exemption.
+
+**New rule in the same gate — sitewide CHROME version stamp.** The footer
+stamp (`ai-memory vX.Y.Z`, scoped to text inside `<footer>`) and the
+hero/nav release badge (`<span class="badge">vX.Y.Z`) must equal the
+`Cargo.toml` version. Chrome is the version an operator reads on EVERY
+page and was the one claim nothing checked. Body prose is never read (a
+page may narrate v0.7.0 history all day); frozen pages keep their own
+stamp; and **published-install / download references are skipped by
+name** — the tag-cut is operator-gated, so an install line pinned at the
+last PUBLISHED tag is CORRECT, and flagging it would push a doc author to
+publish an install command for a tag that does not exist.
+
 **5. Cloud-init ASCII gate** (#1880) — `scripts/check-cloud-init-ascii.sh`.
 A stray non-ASCII byte (a U+2014 em-dash) in a DigitalOcean
 cloud-init template made cloud-init silently discard the config
@@ -1682,6 +1726,20 @@ plants all four claims; the C-31 leg asserts the rejection comes from
 the ENFORCEMENT rule specifically, and its paired near-miss — the same
 workflow described WITHOUT an enforcement verb — must PASS so the rule
 does not ban mentioning an advisory workflow at all.
+
+**#2977 — the html corpus.** The DOCS corpus's html half was a THREE-FILE
+allowlist AND every citation regex required a MARKDOWN code span, so a
+bench / CI-enforcement claim on any of the other ~70 published Jekyll
+pages was invisible for TWO independent reasons — campaign finding C6
+(`at-a-glance.html`'s bench claim) is exactly that shape. The html half is
+now enroll-by-default over `docs/**/*.html` minus
+`scripts/qc-allowlists/html-doc-frozen-exempt.txt` (the SAME exemption
+SSOT gate 4 reads), and the citation shapes admit `<code>` alongside the
+backtick. Fixing only the corpus, or only the regexes, would have been a
+widening that scans 53 more pages and reports success while doing nothing
+— the #2444 shape, in the gate built to catch it. Two live claims fell
+out on first run: an advisory workflow called a "CI guard" and a
+`Bench · bench` composite that resolves to no declared job.
 
 **`cargo test` twin for gates 4 / 9 / 10 / 11:**
 `tests/doc_claims_integrity.rs` (the

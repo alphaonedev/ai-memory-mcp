@@ -59,6 +59,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `inventory.rs` (both two-key-turn error directions, the happy path, and the
   two-spellings-of-silence pin). 5-agent T3 adversarial vote, 4-1 (Option 2 +
   hardened Option 3).
+### Fixed (doc-drift gates now cover the GitHub Pages `.html` surface; #2977)
+
+- **~70 hand-authored Jekyll pages under `docs/` were UNGATED, and that is why
+  the published site drifted invisibly while every claims gate stayed green.**
+  `scripts/check-docs-vs-ssot.sh` walked exactly ONE `.html` file
+  (`docs/compliance/nsa-csi-mcp.html`) and `scripts/check-ci-job-claims.sh`
+  walked three; every other published page could carry a stale schema version, a
+  stale tool/route/CLI count, a stale sitewide chrome stamp, or a
+  bench-as-merge-blocker claim with no gate able to see it. The v1.0.0 doc-drift
+  campaign (Waves 1-3) fixed the CURRENT drift by hand; without gate coverage the
+  surface would simply rot again.
+  - The html scan set is now **ENROLL-BY-DEFAULT** over `docs/**/*.html`, minus
+    the frozen pages named in the new
+    `scripts/qc-allowlists/html-doc-frozen-exempt.txt` — ONE exemption SSOT read
+    by BOTH gates, so they cannot disagree about where the frozen boundary sits.
+    An enumerated INCLUDE list cannot close this class: the rot IS that a new
+    page lands ungated. Frozen = per-release trees (`docs/v0.7.0/`, `docs/v0.7/`),
+    `whats-new-v*` / `v070-*` / `release-v0.7.1` release narratives, the frozen
+    v0.7.0-era AI-NHI page, and the two dated security assessments — each entry
+    carries its rationale in that file's header. Resolved set at this commit: 53
+    pages. A missing exemption file or an empty resolved set FAILS CLOSED.
+  - Both gates learned the **HTML markup dialect**: `<strong>`/`<b>` where
+    markdown writes `**`, `<code>` where it writes a backtick, `&nbsp;` where it
+    writes a space. ONE rule table serves both dialects rather than a second
+    html table that could silently disagree. Adding the pages WITHOUT this would
+    have been a widening that scans 53 more files and can see nothing on them.
+  - Two html-specific HISTORICAL guards keep TRUE history out of the violation
+    set: the guard is evaluated over a **tag-stripped, whitespace-collapsed**
+    view (so `schema <strong>v67</strong> added …` is still recognised as a
+    ladder statement), and the release-card markers (`PRIOR RELEASE`,
+    `What's New in vX.Y.Z`) are evaluated over a **3-line preceding window**,
+    because an html release card puts its attribution in the divs ABOVE the
+    numbers. The self-test asserts BOTH directions — the same numbers with the
+    card markers removed are REJECTED, so the window is a guard, not a blanket.
+  - **NEW RULE — sitewide chrome version stamp.** The footer stamp
+    (`ai-memory vX.Y.Z`, scoped to the text inside `<footer>`) and the hero/nav
+    release badge (`<span class="badge">vX.Y.Z`) must equal the `Cargo.toml`
+    version. The campaign found `v0.9.0` chrome on 38 pages with every gate
+    green. Body prose is never read (a page may narrate v0.7.0 history all day),
+    frozen pages keep their own stamp, and **published-install / download
+    references are SKIPPED by name** — the v1.0.0 tag-cut is operator-gated, so
+    an install line pinned at the last PUBLISHED tag is CORRECT.
+  - **Residual drift found + fixed** (docs corrected to match code, never the
+    reverse): `docs/evidence/index.html` chrome + meta still stamped `v0.9.0` on
+    a LIVE hub; `docs/at-a-glance.html` called advisory `bench.yml` a "CI guard"
+    (the C6 finding, and the same page already says two sections earlier that
+    bench is deliberately not a required status check);
+    `docs/reproducible-baselines.html` cited a `Bench · bench` CI job that
+    resolves to no declared job name or key.
+  - R-203: 10 new `--self-test` legs across the two gates, each proving RED on an
+    injected violation and GREEN on the corrected page, plus the frozen-exemption
+    boundary in both directions and fail-closed on a missing exemption SSOT.
 
 ### Security (append-only spine — the primary create funnel's upsert no longer bypasses the signed ledger; #2948 / PR-3)
 
