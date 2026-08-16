@@ -35,30 +35,63 @@ pub fn handle_checkpoint_create(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let title = params
+    let mut title = params
         .get(param_names::TITLE)
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let condition_type = params
+    // #3007 (code half) — a caller-supplied `condition_type` that names no known
+    // variant is a security-typed discriminator; REJECT it (like
+    // `action_transition` / `check_agent_action` reject an unknown state/kind)
+    // instead of silently coercing to `Approval` — a caller asking for `quorum`
+    // must never get an `approval` gate. An ABSENT value still defaults.
+    //
+    // NOTE (#3007 epoch half, DEFERRED to a 5-agent vote): whether the LOCAL
+    // MCP resolve lane must additionally gate a caller-mintable, caller-
+    // resolvable `epoch_advance` freeze anchor (the federation lane gates it via
+    // the per-resolution enrolled-key signature, env #125) is a T3 posture
+    // decision left OUT of this change. Only the silent-coercion half is fixed
+    // here; the epoch-advance local-gate design is untouched.
+    let condition_type = match params
         .get(param_names::CONDITION_TYPE)
         .and_then(Value::as_str)
-        .and_then(crate::models::ConditionType::from_str)
-        .unwrap_or_default();
-    let condition = params
+    {
+        Some(s) => crate::models::ConditionType::from_str(s)
+            .ok_or_else(|| format!("invalid condition_type: {s}"))?,
+        None => crate::models::ConditionType::default(),
+    };
+    let mut condition = params
         .get(param_names::CONDITION)
         .cloned()
         .unwrap_or_else(|| json!({}));
     let created_by = params
         .get(param_names::CREATED_BY)
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+        .map(str::to_string);
     let deadline_at = params.get(param_names::DEADLINE_AT).and_then(Value::as_i64);
-    let metadata = params
+    let mut metadata = params
         .get(param_names::METADATA)
         .cloned()
         .unwrap_or_else(|| json!({}));
+
+    // #2998 — validate the coordination create inputs + resolve an always-
+    // attributed actor. #2994 — screen the caller-origin credential vectors
+    // (title / condition / metadata) before the direct insert.
+    crate::coordination_guard::require_namespace(&namespace)?;
+    crate::coordination_guard::require_text(
+        param_names::TITLE,
+        &title,
+        crate::coordination_guard::MAX_TEXT_FIELD_BYTES,
+    )?;
+    crate::coordination_guard::require_payload_size(param_names::CONDITION, &condition)?;
+    let created_by = crate::coordination_guard::resolve_actor(created_by.as_deref())?;
+    crate::secret_screen::screen_text_field_for_caller(&mut title).map_err(|r| r.to_string())?;
+    crate::secret_screen::screen_json_field_for_caller(&mut condition)
+        .map_err(|r| r.to_string())?;
+    if !metadata.is_null() {
+        crate::secret_screen::screen_json_field_for_caller(&mut metadata)
+            .map_err(|r| r.to_string())?;
+    }
 
     let cp = crate::models::Checkpoint {
         id: uuid::Uuid::new_v4().to_string(),
@@ -189,8 +222,16 @@ pub fn handle_checkpoint_resolve(
     )
     .map_err(|e| e.to_string())?;
     match resolved {
-        None => Err(format!("checkpoint not found: {id}")),
-        Some(cp) => {
+        crate::checkpoints::ResolveOutcome::NotFound => Err(format!("checkpoint not found: {id}")),
+        // #2995 — first-resolution-wins: an already-resolved checkpoint is a
+        // conflict; the prior signed attestation is kept and this resolve
+        // refused, rather than silently overwriting the authority record.
+        crate::checkpoints::ResolveOutcome::Conflict(existing) => Err(format!(
+            "checkpoint {id} already resolved by {} ({}); first resolution wins",
+            existing.resolved_by.as_deref().unwrap_or(""),
+            existing.state.as_str()
+        )),
+        crate::checkpoints::ResolveOutcome::Resolved(cp) => {
             // #1722 — coordination observability: best-effort audit row for the
             // resolution, attributed to the resolving agent (`resolved_by`).
             // Identity = checkpoint id / resolver / target state.
@@ -711,6 +752,41 @@ mod handler_tests {
 
         let report = crate::signed_events::verify_audit_trail(&conn, None, None).expect("verify");
         assert!(report.chain_intact, "chain must verify; report={report:?}");
+    }
+
+    /// #3007 (code half) — a caller-supplied `condition_type` naming no known
+    /// variant is REJECTED, not silently coerced to `approval`. An absent value
+    /// still defaults; a known value still works. Also pins the #2998 namespace
+    /// validation on this surface.
+    #[test]
+    fn create_rejects_unknown_condition_type_3007() {
+        let conn = fresh();
+        // `quorum` / `EpochAdvance` (wrong case) / `bogus` all named `approval`
+        // pre-fix — now each is refused.
+        for bad in ["quorum", "EpochAdvance", "bogus"] {
+            let err = handle_checkpoint_create(
+                &conn,
+                &json!({ "namespace": "_cp", "title": "t", "condition_type": bad }),
+            )
+            .expect_err("unknown condition_type must reject, not coerce to approval");
+            assert!(
+                err.contains("invalid condition_type"),
+                "error names the rejected value: {err}"
+            );
+        }
+        // A known value + an absent value both still create.
+        handle_checkpoint_create(
+            &conn,
+            &json!({ "namespace": "_cp", "title": "t", "condition_type": "deadline" }),
+        )
+        .expect("known condition_type ok");
+        handle_checkpoint_create(&conn, &json!({ "namespace": "_cp", "title": "t" }))
+            .expect("absent condition_type defaults");
+        // #2998 — path-traversal namespace refused.
+        assert!(
+            handle_checkpoint_create(&conn, &json!({ "namespace": "../x", "title": "t" })).is_err(),
+            "path-traversal namespace refused"
+        );
     }
 
     #[test]

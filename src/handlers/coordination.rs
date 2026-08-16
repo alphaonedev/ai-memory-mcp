@@ -83,6 +83,9 @@ pub struct SendSignalRequest {
     /// JSON array of related signal/memory ids.
     #[serde(default)]
     pub reference_ids: Option<serde_json::Value>,
+    /// #3011 — optional retention TTL in seconds; sets `expires_at = now + ttl`.
+    #[serde(default)]
+    pub ttl_secs: Option<i64>,
 }
 
 /// #2391 — request body for `POST /api/v1/checkpoints/{id}/resolve`.
@@ -244,6 +247,31 @@ pub async fn send_signal(
         .and_then(crate::models::SignalType::from_str)
         .unwrap_or_default();
     let now = chrono::Utc::now().timestamp();
+    // #3011 — wire `signals.expires_at` from an optional `ttl_secs` (validated +
+    // overflow-checked), so the gc pruner can reap the caller-declared-ephemeral
+    // signal.
+    let expires_at = match body.ttl_secs {
+        Some(ttl) => {
+            if let Err(e) = crate::validate::validate_ttl_secs(Some(ttl)) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("invalid ttl_secs: {e}")})),
+                )
+                    .into_response();
+            }
+            match now.checked_add(ttl) {
+                Some(v) => Some(v),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": crate::coordination_guard::TTL_SECS_OVERFLOW})),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        None => None,
+    };
     let mut signal = crate::models::Signal {
         id: uuid::Uuid::new_v4().to_string(),
         namespace: body.namespace,
@@ -256,13 +284,27 @@ pub async fn send_signal(
         correlation_id: body.correlation_id,
         reference_ids: body.reference_ids.unwrap_or_else(|| json!([])),
         created_at: now,
-        expires_at: None,
+        expires_at,
         delivered_at: None,
         read_at: None,
         acknowledged_at: None,
         signature: Vec::new(),
         sender_pubkey: Vec::new(),
     };
+    // #2994 — the coordination write plane bypasses the memory-lane storage
+    // funnel, so screen the caller-origin credential vectors (subject / body)
+    // BEFORE signing + insert + the `/sync/push` EGRESS: refuse under
+    // `SECRET_SCREEN_MODE=refuse`, mask under `redact`, byte-identical under
+    // `off`. A refusal is a `400` (a caller pasted a credential into a signal).
+    if let Err(refusal) = crate::secret_screen::screen_text_field_for_caller(&mut signal.subject)
+        .and_then(|()| crate::secret_screen::screen_json_field_for_caller(&mut signal.body))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": refusal.to_string()})),
+        )
+            .into_response();
+    }
     // Sign with the daemon keypair (backend-agnostic) so the inserted row + the
     // broadcast carry the same verifying signature. Unsigned when no keypair.
     if let Some(kp) = app.active_keypair.as_ref().as_ref() {
@@ -629,7 +671,7 @@ pub async fn resolve_checkpoint(
     // a postgres-backed daemon federates checkpoint resolutions identically.
     // (#1552's lesson was a fanout wired INSIDE backend-specific branches, so
     // the postgres arm silently skipped it — this shape structurally cannot.)
-    let resolved: Result<Option<crate::models::Checkpoint>, Response> = {
+    let resolved: Result<crate::checkpoints::ResolveOutcome, Response> = {
         #[cfg(feature = "sal")]
         {
             if matches!(
@@ -659,9 +701,16 @@ pub async fn resolve_checkpoint(
             local_resolve_via_db(&app, &checkpoint_id, state, &node_agent_id, &body, now).await
         }
     };
+    // #2995 — first-resolution-wins: an already-resolved checkpoint is a `409`
+    // conflict (prior verdict kept), NOT a silent overwrite of the freeze anchor.
     let cp = match resolved {
-        Ok(Some(cp)) => cp,
-        Ok(None) => return checkpoint_not_found(&checkpoint_id),
+        Ok(crate::checkpoints::ResolveOutcome::Resolved(cp)) => *cp,
+        Ok(crate::checkpoints::ResolveOutcome::NotFound) => {
+            return checkpoint_not_found(&checkpoint_id);
+        }
+        Ok(crate::checkpoints::ResolveOutcome::Conflict(existing)) => {
+            return checkpoint_conflict(&checkpoint_id, &existing);
+        }
         Err(resp) => return resp,
     };
 
@@ -726,7 +775,7 @@ async fn local_resolve_via_db(
     node_agent_id: &str,
     body: &CheckpointResolveHttpRequest,
     now: i64,
-) -> Result<Option<crate::models::Checkpoint>, Response> {
+) -> Result<crate::checkpoints::ResolveOutcome, Response> {
     let lock = app.db.lock().await;
     crate::checkpoints::resolve(
         &lock.0,
@@ -755,6 +804,20 @@ fn checkpoint_not_found(checkpoint_id: &str) -> Response {
     (
         StatusCode::NOT_FOUND,
         Json(json!({"error": format!("checkpoint not found: {checkpoint_id}")})),
+    )
+        .into_response()
+}
+
+/// #2995 — shared `409 checkpoint already resolved` response for the
+/// first-resolution-wins refusal. Reports who won so the caller can reconcile.
+fn checkpoint_conflict(checkpoint_id: &str, existing: &crate::models::Checkpoint) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": format!("checkpoint {checkpoint_id} already resolved; first resolution wins"),
+            (crate::mcp::param_names::STATE): existing.state.as_str(),
+            (crate::mcp::param_names::RESOLVED_BY): existing.resolved_by,
+        })),
     )
         .into_response()
 }

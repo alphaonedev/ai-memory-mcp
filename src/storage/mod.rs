@@ -12724,6 +12724,13 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
     if let Err(e) = crate::observations::gc::prune(conn) {
         tracing::warn!("recall_observations prune failed (in gc): {e}");
     }
+    // #3011 — prune caller-declared-ephemeral (expired) coordination signals
+    // from this same chokepoint so every gc topology (serve / MCP stdio / CLI)
+    // honors `signals.expires_at`. Best-effort (WARN, never abort the sweep) —
+    // mirrors the observations prune posture immediately above.
+    if let Err(e) = crate::signals::prune_expired(conn, Utc::now().timestamp()) {
+        tracing::warn!("expired-signal prune failed (in gc): {e}");
+    }
     let now = Utc::now().to_rfc3339();
     // #1579 B6 (F5.7) — bounded-lock-hold chunked sweep. Each loop
     // iteration archives + deletes at most GC_CHUNK_ROWS expired rows

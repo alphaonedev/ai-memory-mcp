@@ -22724,6 +22724,38 @@ impl MemoryStore for PostgresStore {
         edge_type: crate::models::EdgeType,
         now: i64,
     ) -> StoreResult<()> {
+        // #3008 — refuse a self-edge / ordering-cycle edge (would wedge the
+        // frontier) BEFORE the insert, mirroring the sqlite free-fn guards.
+        if from_action == to_action {
+            return Err(StoreError::IntegrityFailed {
+                detail: format!("refused self-edge on action {from_action}"),
+            });
+        }
+        if edge_type != crate::models::EdgeType::Sibling {
+            // Does `to_action` already reach `from_action` via non-sibling arcs?
+            // If so, `from_action -> to_action` would close a cycle.
+            let cycle: Option<i32> = sqlx::query_scalar(
+                "WITH RECURSIVE reach(node) AS ( \
+                     SELECT $1::text \
+                     UNION \
+                     SELECT e.to_action FROM action_edges e JOIN reach r ON e.from_action = r.node \
+                     WHERE e.edge_type <> $3) \
+                 SELECT 1 FROM reach WHERE node = $2 LIMIT 1",
+            )
+            .bind(to_action)
+            .bind(from_action)
+            .bind(crate::models::EdgeType::Sibling.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("action_add_edge cycle-check", e))?;
+            if cycle.is_some() {
+                return Err(StoreError::IntegrityFailed {
+                    detail: format!(
+                        "refused edge {from_action} -> {to_action}: would close an ordering cycle"
+                    ),
+                });
+            }
+        }
         sqlx::query(
             "INSERT INTO action_edges (from_action, to_action, edge_type, created_at) \
              VALUES ($1, $2, $3, $4) ON CONFLICT (from_action, to_action, edge_type) DO NOTHING",
@@ -23315,10 +23347,14 @@ impl MemoryStore for PostgresStore {
         resolution_note: Option<&str>,
         resolved_at: i64,
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
-    ) -> StoreResult<Option<crate::models::Checkpoint>> {
+    ) -> StoreResult<crate::checkpoints::ResolveOutcome> {
+        use crate::checkpoints::ResolveOutcome;
+        // #2995 — FIRST-RESOLUTION-WINS: the `AND state = 'pending'` guard is the
+        // postgres twin of the sqlite `RESOLVE_CAS_SQL`, so an already-resolved
+        // freeze anchor is never silently overwritten.
         let row = sqlx::query(
             "UPDATE checkpoints SET state = $1, resolved_by = $2, resolution = $3, \
-                resolution_note = $4, resolved_at = $5 WHERE id = $6 \
+                resolution_note = $4, resolved_at = $5 WHERE id = $6 AND state = $7 \
              RETURNING id, namespace, title, condition_type, condition, state, created_by, \
                        resolved_by, resolution, resolution_note, signature, resolver_pubkey, \
                        created_at, deadline_at, resolved_at, metadata",
@@ -23329,11 +23365,29 @@ impl MemoryStore for PostgresStore {
         .bind(resolution_note)
         .bind(resolved_at)
         .bind(id)
+        .bind(crate::models::CheckpointState::Pending.as_str())
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| to_store_err("checkpoint_resolve", e))?;
         let Some(mut cp) = row.as_ref().map(pg_row_to_checkpoint).transpose()? else {
-            return Ok(None);
+            // The CAS did not fire: distinguish an absent id (NotFound) from an
+            // already-resolved checkpoint (Conflict — first-resolution-wins).
+            let existing = sqlx::query(
+                "SELECT id, namespace, title, condition_type, condition, state, created_by, \
+                        resolved_by, resolution, resolution_note, signature, resolver_pubkey, \
+                        created_at, deadline_at, resolved_at, metadata \
+                   FROM checkpoints WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("checkpoint_resolve conflict-probe", e))?;
+            return Ok(
+                match existing.as_ref().map(pg_row_to_checkpoint).transpose()? {
+                    None => ResolveOutcome::NotFound,
+                    Some(local) => ResolveOutcome::Conflict(Box::new(local)),
+                },
+            );
         };
         // Sign the resolved row's canonical RESOLUTION + persist the
         // attestation columns when a signing keypair is supplied — mirroring
@@ -23357,7 +23411,7 @@ impl MemoryStore for PostgresStore {
                 .map_err(|e| to_store_err("checkpoint_resolve sign-persist", e))?;
             }
         }
-        Ok(Some(cp))
+        Ok(ResolveOutcome::Resolved(Box::new(cp)))
     }
 
     async fn checkpoint_query(

@@ -242,6 +242,49 @@ Implements the ratified 5-agent adversarial verdict (protocol `4d3ea1c5`,
   trailing clause is now conditional on the resolved tri-state (a new
   `identity::attest::global_strict_attestation_enabled` helper): global-strict
   names "every write surface", the surface-scoped default keeps the prior text.
+### Security (coordination-plane hardening — actions / signals / checkpoints / routines; #2994 #2995 #2996 #2997 #2998 #3007 #3008 #3009 #3010 #3011)
+
+The coordination write plane inserts caller content directly via the
+`crate::{actions,signals,checkpoints,routines}` free-functions, bypassing the
+memory-lane `validate::validate_*` + storage-funnel screen. This wave closes
+the caller-origin gaps on that plane:
+
+- **#2994** — thread `crate::secret_screen` through the four MCP create handlers
+  + the HTTP `send_signal`: caller-origin coordination writes now refuse
+  (`SECRET_SCREEN_MODE=refuse`) / mask (`redact`) embedded credentials before
+  the direct insert + signal `/sync/push` egress, closing the certified-posture
+  bypass.
+- **#2998** — new `coordination_guard`: `validate_namespace` (rejects empty /
+  `..` traversal), text + payload length caps, and an always-attributed actor
+  so an omitted `agent_id` no longer yields an uncharged + unbounded write and a
+  caller-supplied one is shape-validated (audit log-injection guard).
+- **#2996** — MCP `memory_signal_send` BINDS `from_agent` to the resolved caller
+  identity (discarding the caller-asserted body value, mirroring the HTTP
+  handler) so co-located agents cannot forge each other's authorship.
+- **#2995** — the local checkpoint resolve lane is now first-resolution-wins
+  (`AND state='pending'` CAS guard, sqlite + postgres twins) with a typed
+  `Conflict` outcome, so an attested separation-of-duties freeze anchor can no
+  longer be silently overwritten.
+- **#3009** — `memory_action_transition` binds `claimed_by` to the live lease
+  holder + validates it, so two agents cannot each believe they own an action.
+- **#3007 (code half)** / signal_type — reject an unknown `condition_type` /
+  `signal_type` instead of silently coercing it. The `epoch_advance` local-gate
+  design is DEFERRED to a 5-agent vote.
+- **#3008 (core)** — `EdgeType::Unlocks` now gates the frontier (was inert);
+  `add_edge` rejects self-edges + ordering cycles on both backends. The
+  `action_remove_edge` recovery verb is deferred (new-MCP-tool SSOT surface).
+- **#2997** — the MCP coordination surfaces (frontier / next / lease-acquire)
+  piggyback the lease-expiry sweep, so an MCP-stdio-only deployment reclaims a
+  dead worker's lease + requeues its stranded action.
+- **#3010** — `memory_routine_run` rejects unknown template keys and reports a
+  zero-materialisation run as a distinct failure (not silent success).
+- **#3011 (slice)** — `memory_signal_inbox` excludes acknowledged signals;
+  `signals.expires_at` is wired via an optional `ttl_secs`; `signals::prune_expired`
+  reaps caller-declared-ephemeral signals from the `db::gc` chokepoint. The
+  blanket TTL pruner for attested-record tables is deferred to a retention-posture
+  vote.
+- Minor (A6-13): `lease_acquire` on a missing action returns a typed not-found
+  instead of a raw FK-constraint error.
 
 ### Security (append-only spine — the primary create funnel's upsert no longer bypasses the signed ledger; #2948 / PR-3)
 

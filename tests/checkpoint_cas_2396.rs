@@ -99,8 +99,7 @@ fn resolved_checkpoint_is_not_overwritten_by_divergent_inbound_2396() {
         RESOLVED_AT,
         None,
     )
-    .expect("local resolve")
-    .expect("row present");
+    .expect("local resolve");
 
     let outcome = apply_inbound_resolution(
         &conn,
@@ -151,8 +150,7 @@ fn interleaved_local_resolve_wins_over_inbound_apply_2396() {
         RESOLVED_AT,
         None,
     )
-    .expect("local resolve")
-    .expect("row present");
+    .expect("local resolve");
 
     // T3 — the applier's write (the TOCTOU "use") now runs on stale knowledge.
     let outcome = apply_inbound_resolution(

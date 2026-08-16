@@ -802,8 +802,12 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
             Some(&kp),
         )
         .await
-        .expect("checkpoint_resolve ok")
-        .expect("resolve returns the updated row");
+        .expect("checkpoint_resolve ok");
+    // #2995 — checkpoint_resolve now returns a first-resolution-wins outcome.
+    let resolved_cp = match resolved_cp {
+        ai_memory::checkpoints::ResolveOutcome::Resolved(cp) => *cp,
+        other => panic!("expected Resolved, got {other:?}"),
+    };
     assert_eq!(resolved_cp.state, CheckpointState::Resolved);
     assert_eq!(resolved_cp.resolved_by.as_deref(), Some(TEST_AGENT));
     assert_eq!(resolved_cp.resolution.as_deref(), Some("approved"));
