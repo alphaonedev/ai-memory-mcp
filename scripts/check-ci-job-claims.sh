@@ -101,6 +101,12 @@ jobs:
       - run: true
 WFEOF
     printf 'Lint (fmt + clippy)\n' > "$FIX/scripts/qc-allowlists/required-contexts-release.txt"
+    # #2977 — the frozen-page exemption SSOT. The fixture carries a REAL
+    # one (not an empty stub) so the html legs below can prove BOTH
+    # directions of the boundary: an enroll-by-default live page is
+    # scanned, a listed frozen page is not.
+    printf '# fixture\ndocs/whats-new-v\n' \
+        > "$FIX/scripts/qc-allowlists/html-doc-frozen-exempt.txt"
 
     run_fixture() { ( AI_MEMORY_CIJOB_GATE_ROOT="$FIX" "$SELF" >/dev/null 2>&1; echo "$?" ); }
     run_fixture_out() { AI_MEMORY_CIJOB_GATE_ROOT="$FIX" "$SELF" 2>&1 || true; }
@@ -108,6 +114,7 @@ WFEOF
     write_clean() {
         rm -f "$FIX"/README.md "$FIX"/ROADMAP.md "$FIX"/PERFORMANCE.md \
               "$FIX"/docs/v1.0.0/release-notes.md \
+              "$FIX"/docs/at-a-glance.html "$FIX"/docs/whats-new-v09.html \
               "$FIX"/scripts/qc-allowlists/ci-job-claims-pending.txt
         # NEAR-MISS CONTROLS — every one must PASS:
         #  * a job cited by its real name that IS in the required set,
@@ -269,6 +276,78 @@ MDEOF
         echo "FAIL: self-test #2713 — engine fault did not produce the distinct fail-closed message" >&2; exit 1; }
     echo "PASS: self-test #2713 — an analysis-engine error FAILS CLOSED (exit $fault_rc, distinct message, no PASS banner)"
 
+    # ================================================================
+    # #2977 — the GitHub-Pages (.html) surface
+    # ================================================================
+    # THE DEFECT: the html half of DOCS was a THREE-FILE allowlist AND
+    # every citation regex required a MARKDOWN code span, so a bench /
+    # CI-enforcement claim on any of the other ~70 published Jekyll pages
+    # was invisible for TWO independent reasons. Campaign finding C6 is
+    # the verbatim shape planted below.
+
+    # ---- RED: an enforcement claim on a page that was NOT in the old
+    # three-file html allowlist, written in the HTML code-span dialect.
+    write_clean
+    printf '<li>Published p95/p99 budgets + CI guard (<code>bench.yml</code>)</li>\n' \
+        > "$FIX/docs/at-a-glance.html"
+    [[ "$(run_fixture)" != "0" ]] || {
+        echo "FAIL: self-test #2977 — an html-dialect enforcement claim on an enroll-by-default page was ACCEPTED." >&2
+        echo "       bench.yml is advisory; this is the C6 shape and the gate must see it." >&2
+        exit 1; }
+    out="$(run_fixture_out)"
+    grep -q 'WORKFLOW_ENFORCEMENT' <<<"$out" || {
+        echo "FAIL: self-test #2977 — rejected, but NOT by the enforcement rule (wrong reason)" >&2; exit 1; }
+    grep -q 'docs/at-a-glance.html' <<<"$out" || {
+        echo "FAIL: self-test #2977 — the violation did not name the html page" >&2; exit 1; }
+    echo "PASS: self-test #2977 RED — an html <code>-span enforcement claim on an enroll-by-default page is REJECTED"
+
+    # ---- GREEN-on-fixed: the corrected advisory phrasing PASSES, so the
+    # rule is not a blanket ban on naming bench.yml from an html page.
+    write_clean
+    printf '<li>Published p95/p99 budgets + advisory bench regression check (<code>bench.yml</code>)</li>\n' \
+        > "$FIX/docs/at-a-glance.html"
+    [[ "$(run_fixture)" = "0" ]] || {
+        echo "FAIL: self-test #2977 GREEN — the CORRECTED advisory phrasing was still rejected" >&2
+        run_fixture_out | sed 's/^/       /' >&2
+        exit 1; }
+    echo "PASS: self-test #2977 GREEN — the corrected advisory phrasing on the same html page PASSES"
+
+    # ---- RED: html-dialect JOB_EXISTS. The verbatim
+    # docs/reproducible-baselines.html shape — a `<workflow> · <job-key>`
+    # composite display name that resolves to no declared job.
+    write_clean
+    printf 'the advisory <code>Bench &middot; bench</code> CI job\n' \
+        > "$FIX/docs/at-a-glance.html"
+    [[ "$(run_fixture)" != "0" ]] || {
+        echo "FAIL: self-test #2977 — an html-dialect citation of a non-existent CI job was ACCEPTED" >&2; exit 1; }
+    run_fixture_out | grep -q 'JOB_EXISTS' || {
+        echo "FAIL: self-test #2977 — rejected, but NOT by the existence rule (wrong reason)" >&2; exit 1; }
+    echo "PASS: self-test #2977 RED — an html-dialect citation of a job that resolves to nothing is REJECTED"
+
+    # ---- FROZEN EXEMPTION is load-bearing, in BOTH directions. The very
+    # same claim on a page listed in html-doc-frozen-exempt.txt must PASS:
+    # a "what's new in vN" page is, by construction, a statement about vN.
+    write_clean
+    printf '<li>Published p95/p99 budgets + CI guard (<code>bench.yml</code>)</li>\n' \
+        > "$FIX/docs/whats-new-v09.html"
+    [[ "$(run_fixture)" = "0" ]] || {
+        echo "FAIL: self-test #2977 — a FROZEN page (html-doc-frozen-exempt.txt) was scanned" >&2
+        run_fixture_out | sed 's/^/       /' >&2
+        exit 1; }
+    echo "PASS: self-test #2977 — a page named in html-doc-frozen-exempt.txt is EXEMPT (the same claim passes there)"
+
+    # ---- the exemption SSOT is REQUIRED: resolving the html scan set
+    # without its frozen boundary would either red every frozen page or
+    # silently drop the widening. Refuse instead.
+    write_clean
+    mv "$FIX/scripts/qc-allowlists/html-doc-frozen-exempt.txt" "$FIX/exempt.bak"
+    [[ "$(run_fixture)" != "0" ]] || {
+        echo "FAIL: self-test #2977 — a MISSING frozen-exemption SSOT did not fail the gate" >&2; exit 1; }
+    run_fixture_out | grep -q 'html-doc-frozen-exempt.txt' || {
+        echo "FAIL: self-test #2977 — the missing-SSOT failure did not name the file" >&2; exit 1; }
+    mv "$FIX/exempt.bak" "$FIX/scripts/qc-allowlists/html-doc-frozen-exempt.txt"
+    echo "PASS: self-test #2977 — a missing frozen-exemption SSOT FAILS CLOSED"
+
     # ---- never a silent no-op ----------------------------------------
     rm -rf "$FIX/.github/workflows"
     mkdir -p "$FIX/.github/workflows"
@@ -413,11 +492,42 @@ def job_is_required(token):
     return any(r.startswith(token + " (") for r in required)
 
 
+# #2977 — the html half of this corpus was a THREE-FILE allowlist, so the
+# bench / CI-enforcement claims on the other ~70 published Jekyll pages
+# were unscanned (campaign finding C6: at-a-glance.html's bench claim).
+# The html set is now ENROLL-BY-DEFAULT over `docs/**/*.html` minus the
+# frozen pages named in scripts/qc-allowlists/html-doc-frozen-exempt.txt —
+# the SAME exemption SSOT scripts/check-docs-vs-ssot.sh reads, so the two
+# gates cannot disagree about where the frozen boundary sits. An
+# enumerated INCLUDE list cannot close this class: the rot is exactly that
+# a NEW page lands unscanned.
+#
+# FAIL-CLOSED on a missing exemption file: resolving the scan set without
+# its boundary would either red every frozen page or silently drop the
+# widening, and both are worse than refusing.
+exempt_path = os.path.join(root, "scripts/qc-allowlists/html-doc-frozen-exempt.txt")
+html_frozen = []
+if os.path.exists(exempt_path):
+    for line in open(exempt_path, encoding="utf-8"):
+        line = line.split("#", 1)[0].strip()
+        if line:
+            html_frozen.append(line)
+elif os.path.exists(os.path.join(root, "docs")):
+    raise RuntimeError(
+        "check-ci-job-claims: missing scripts/qc-allowlists/html-doc-frozen-exempt.txt "
+        "— refusing to resolve the html scan set without its frozen-page exemption SSOT (#2977)"
+    )
+
+html_docs = sorted(
+    p[len(root) + 1:]
+    for p in glob.glob(os.path.join(root, "docs/**/*.html"), recursive=True)
+    if not any(frozen in p[len(root) + 1:] for frozen in html_frozen)
+)
+
 DOCS = ["README.md", "ROADMAP.md", "PERFORMANCE.md",
         "docs/DEVELOPER_GUIDE.md", "docs/ENGINEERING_STANDARDS.md",
         "docs/CLI_REFERENCE.md", "docs/CONFIG_SCHEMA.md",
-        "docs/reproducible-baselines.html", "docs/for-everyone.html",
-        "docs/audience/developer.html"] + sorted(glob.glob(
+        ] + html_docs + sorted(glob.glob(
     os.path.join(root, "docs/v1.0.0/*.md")))
 
 # YAML trigger / structural keywords are not job names.
@@ -469,10 +579,27 @@ def enforcement_near(line, start, end):
     hi = min(len(line), end + ENFORCE_PROXIMITY)
     return bool(ENFORCE.search(line[lo:hi]))
 
+# MARKUP DIALECT (#2977). The citation shapes below were written against
+# MARKDOWN code spans. Adding the .html corpus to DOCS without teaching
+# them the html spelling would have been a widening that scans 53 more
+# pages and can see NOTHING on them — the #2444 "reports success while
+# doing nothing" shape, in the very gate built to catch that class.
+# `CO`/`CC` therefore admit BOTH `` ` `` and `<code>`/`</code>`; a .md
+# file never contains `<code>` and a .html file never contains a code
+# backtick, so neither dialect widens the other's match set.
+#
+# Measured effect on the tree at 57b7fe35: the citation
+# `<li>Published p95/p99 budgets + CI guard (<code>bench.yml</code>)</li>`
+# in docs/at-a-glance.html is invisible to a backtick-only WF_TICK and is
+# an ENFORCEMENT claim about an advisory workflow once seen.
+CO = r"(?:`|<code>)"
+CC = r"(?:`|</code>)"
+
 WF_PATH = re.compile(r"\.github/workflows/([A-Za-z0-9_.-]+\.ya?ml)")
-WF_TICK = re.compile(r"`([A-Za-z0-9_.-]+\.ya?ml)`")
+WF_TICK = re.compile(CO + r"([A-Za-z0-9_.-]+\.ya?ml)" + CC)
 POSSESSIVE = re.compile(
-    r"`([A-Za-z0-9_.-]+\.ya?ml)`'s\s+(?:\"([^\"]+)\"|`([^`]+)`)\s+job")
+    CO + r"([A-Za-z0-9_.-]+\.ya?ml)" + CC + r"'s\s+(?:\"([^\"]+)\"|"
+    + CO + r"([^`<]+)" + CC + r")\s+job")
 # `<stem>` workflow -- the bare-stem citation shape (3x7 lane-3,
 # 2026-08-09). README said "The `token-budget` workflow is a **required
 # status check**" while `token-budget` appears NOWHERE in
@@ -481,11 +608,12 @@ POSSESSIVE = re.compile(
 # ENFORCEMENT rule -- the rule built for exactly that false claim --
 # was structurally blind to the single most-quoted enforcement
 # sentence in the tier-1 doc. Resolves the stem to <stem>.yml.
-WF_WORD = re.compile(r"`([A-Za-z0-9_.-]{2,40})`\s+workflow\b")
+WF_WORD = re.compile(CO + r"([A-Za-z0-9_.-]{2,40})" + CC + r"\s+workflow\b")
 JOB_CITE = re.compile(
-    r"(?:`([^`\n]{2,60})`|\"([^\"\n]{2,60})\")\s+(?:CI\s+|nightly\s+)?job\b")
+    r"(?:" + CO + r"([^`<\n]{2,60})" + CC + r"|\"([^\"\n]{2,60})\")"
+    r"\s+(?:CI\s+|nightly\s+)?job\b")
 JOB_IN_WF = re.compile(
-    r"`(?:\.github/workflows/)?([A-Za-z0-9_.-]+\.ya?ml)`\s*[,)]?\s*"
+    CO + r"(?:\.github/workflows/)?([A-Za-z0-9_.-]+\.ya?ml)" + CC + r"\s*[,)]?\s*"
     r"(?:the\s+)?([A-Za-z0-9_][A-Za-z0-9_ -]{0,28}?)\s+job\b")
 
 

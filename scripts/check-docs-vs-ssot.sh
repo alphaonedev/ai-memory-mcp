@@ -231,20 +231,86 @@ do
     [[ "$_dup" == 0 ]] && DOC_FILES+=("$_wf")
 done
 
-# Operator-facing HTML surfaces (rendered compliance pages). Markdown is
-# the primary narrative form, but procurement-facing .html pages restate
-# the same mechanically-pinned SSOT counts and drift INDEPENDENTLY of
-# their .md siblings when an SSOT moves — #2729 / CB-32: nsa-csi-mcp.html
-# shipped stale 89/91 CLI counts vs SSOT 90/92 while
+# Operator-facing HTML surfaces (rendered GitHub Pages). Markdown is the
+# primary narrative form, but the published .html pages restate the same
+# mechanically-pinned SSOT counts and drift INDEPENDENTLY of their .md
+# siblings when an SSOT moves — #2729 / CB-32: nsa-csi-mcp.html shipped
+# stale 89/91 CLI counts vs SSOT 90/92 while
 # nsa-csi-mcp-security-mapping.md was already correct at 90/92. The gate
 # had ZERO html references (same class as #2668 E-20 for benchmark.svg),
-# so the rendered surface was invisible. These files are walked by the
-# html-aware CLI-count rules in run_all_rules below. Kept as an explicit
-# allowlist (not a `**/*.html` glob) so a historical/archived HTML page
-# cannot silently enroll a legitimate past-release count into the gate.
-HTML_DOC_FILES=(
-    docs/compliance/nsa-csi-mcp.html
-)
+# so the rendered surface was invisible.
+#
+# #2977 — WIDENED from the one-file allowlist to the whole operator-facing
+# `docs/**/*.html` surface. The one-file allowlist was itself the defect:
+# ~70 hand-authored Jekyll pages were ungated, and the v1.0.0 doc-drift
+# campaign (Waves 1-3) found stale schema versions, a sitewide v0.9.0
+# chrome stamp, a false sub-10ms recall claim, a bench-as-merge-blocker
+# claim and a kind-count 10-vs-16 across them WHILE THIS GATE STAYED
+# GREEN. An enumerated allowlist cannot close that class: the rot is
+# exactly that a NEW page lands ungated, so the scan set has to be
+# ENROLL-BY-DEFAULT and the EXEMPTIONS have to be the enumerated thing.
+#
+# That inverts the #2839 `.md` argument, and deliberately so. The `.md`
+# side stayed an additive list because a blanket `docs/**/*.md` glob drags
+# in the historical ladder references, the frozen per-release summaries,
+# and the analysis/adjudication artefacts under docs/reviews|design|audit
+# — surfaces whose numbers are TRUE STATEMENTS ABOUT A PAST RELEASE. The
+# .html tree has no such sprawl: its frozen surfaces are a small, named,
+# structurally-obvious set (per-release trees, whats-new pages, release
+# narratives, dated assessments), which is precisely the shape an
+# exemption list can carry honestly. Every exemption below names WHY the
+# page is frozen, so a reviewer can audit the boundary in one read.
+#
+# The exemption set is NOT declared here. It lives ONCE, in
+# scripts/qc-allowlists/html-doc-frozen-exempt.txt, because
+# scripts/check-ci-job-claims.sh walks the SAME html surface and two
+# copies of a frozen-vs-live boundary would silently disagree the first
+# time one is edited. That file's header carries the per-entry rationale
+# and the test for admitting an entry.
+#
+# FAIL-CLOSED: a missing exemption file, or an EMPTY resolved set outside
+# the --self-test fixture, is a hard failure — never a silent green
+# (#2444 "reports success while doing nothing").
+HTML_FROZEN_EXEMPT_FILE="$REPO_ROOT/scripts/qc-allowlists/html-doc-frozen-exempt.txt"
+HTML_FROZEN_EXEMPT=()
+if [[ -f "$HTML_FROZEN_EXEMPT_FILE" ]]; then
+    while IFS= read -r _fx; do
+        _fx="${_fx%%#*}"
+        _fx="$(printf '%s' "$_fx" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        [[ -z "$_fx" ]] && continue
+        HTML_FROZEN_EXEMPT+=("$_fx")
+    done < "$HTML_FROZEN_EXEMPT_FILE"
+else
+    # Unconditional, fixture included: resolving the html scan set without
+    # its frozen boundary would either red every frozen page or silently
+    # drop the widening. Both are worse than refusing, and a check that is
+    # waived under --self-test is a check the self-test cannot prove.
+    printf 'FAIL: check-docs-vs-ssot: missing %s — refusing to resolve the html scan set without its frozen-page exemption SSOT (#2977 fail-closed)\n' \
+        "$HTML_FROZEN_EXEMPT_FILE" >&2
+    exit 1
+fi
+
+html_is_frozen() {
+    local f="$1" pat
+    for pat in "${HTML_FROZEN_EXEMPT[@]:-}"; do
+        [[ -z "$pat" ]] && continue
+        [[ "$f" == *"$pat"* ]] && return 0
+    done
+    return 1
+}
+
+HTML_DOC_FILES=()
+while IFS= read -r _hf; do
+    [[ -z "$_hf" ]] && continue
+    _hf="${_hf#./}"
+    html_is_frozen "$_hf" && continue
+    HTML_DOC_FILES+=("$_hf")
+done < <(find docs -name '*.html' -type f 2>/dev/null | sort)
+
+if [[ ${#HTML_DOC_FILES[@]} -eq 0 && -z "${AI_MEMORY_DOCS_GATE_ROOT:-}" ]]; then
+    printf 'FAIL: check-docs-vs-ssot: resolved ZERO operator-facing docs/**/*.html pages — the html rules would be a silent no-op (#2444)\n' >&2
+    exit 1
+fi
 
 # Additional surfaces walked ONLY by the HookEvent rule (3x7 lane-3,
 # 2026-08-09). The HookEvent rule was the last legacy hand-regex left
@@ -260,14 +326,23 @@ HTML_DOC_FILES=(
 # rules, and widening them here would enroll pages whose OTHER counts
 # belong to a different correction lane, redding this gate on drift it
 # is not the subject of. One rule, one scan set.
-HOOK_DOC_FILES=(
-    "${DOC_FILES[@]}"
-    "${HTML_DOC_FILES[@]}"
-    docs/production-deployment.md
-    docs/strategy/coala-mapping.md
-    docs/audience/developer.html
+# De-duped (#2977): docs/audience/developer.html and
+# docs/essays/brass-tacks-3-why.html were hand-added here when
+# HTML_DOC_FILES held one file; the widened glob now already carries
+# them, and a duplicate entry would report the same drift twice.
+HOOK_DOC_FILES=()
+for _hd in \
+    "${DOC_FILES[@]}" \
+    "${HTML_DOC_FILES[@]}" \
+    docs/production-deployment.md \
+    docs/strategy/coala-mapping.md \
+    docs/audience/developer.html \
     docs/essays/brass-tacks-3-why.html
-)
+do
+    _dup=0
+    for _e in "${HOOK_DOC_FILES[@]:-}"; do [[ "$_e" == "$_hd" ]] && { _dup=1; break; }; done
+    [[ "$_dup" == 0 ]] && HOOK_DOC_FILES+=("$_hd")
+done
 
 # Doc surfaces the pgvector-certified-patch rule walks. Its own EXPLICIT
 # allowlist (the "one rule, one scan set" discipline the HookEvent /
@@ -397,18 +472,34 @@ check_narrative_count_rule() {
     if [[ $# -gt 0 ]]; then
         files=("$@")
     fi
-    for f in "${files[@]}"; do
-        [[ -f "$f" ]] || continue
-        # Use python for robust regex with capture groups. Capture-then-
-        # check, not `done < <(python3 …)`: a process-substitution's exit
-        # status is unobserved under `set -euo pipefail`, so a crashing
-        # engine (a non-UTF-8 byte → the unguarded `open('$f')`) silently
-        # yielded no rows and the rule passed — the #2713 fail-open shape.
-        local narrative_rows
-        narrative_rows="$(
-            python3 -c "
-import re, sys
-pat = re.compile(r'''$pattern''')
+    # ONE python per RULE, not per FILE (#2977). The scan sets grew from a
+    # handful of curated .md files to ~90 (the widened html surface), and a
+    # per-file spawn made the gate's cost linear in interpreter startups
+    # rather than in work. Batching is also why the fail-closed contract is
+    # stated per-RULE below: a crash anywhere in the batch refuses the
+    # whole rule, which is strictly safer than refusing one file.
+    #
+    # Capture-then-check, never `done < <(python3 …)`: a process
+    # substitution's exit status is unobserved under `set -euo pipefail`,
+    # so a crashing engine (a non-UTF-8 byte reaching an unguarded
+    # `open()`) silently yields no rows and the rule PASSES — the #2713
+    # fail-open shape.
+    local narrative_rows
+    narrative_rows="$(
+        GATE_NC_FILES="${files[*]}" \
+        GATE_NC_PATTERN="$pattern" \
+        GATE_NC_RELEASE="$CANONICAL_RELEASE_VERSION" \
+        python3 - <<'NCPY'
+import html as htmlmod
+import os
+import re
+
+pat = re.compile(os.environ["GATE_NC_PATTERN"])
+release = os.environ["GATE_NC_RELEASE"]
+
+if os.environ.get("AI_MEMORY_DOCS_GATE_SELFTEST_FAULT"):
+    raise RuntimeError("check-docs-vs-ssot self-test: injected analysis-engine fault (#2713)")
+
 # HISTORICAL GUARD -- 3x7 lane-3, 2026-08-09. Mirrors is_historical in
 # the #2492 generalised scanner below. Principle: a TRUE statement about
 # a PAST release must never be re-pointed at the canonical, or the gate
@@ -417,46 +508,94 @@ pat = re.compile(r'''$pattern''')
 # enough to miss history by accident. Generalising the HookEvent anchors
 # made that accident stop holding: the README prior-release paragraph and
 # the ROADMAP frozen v0.7.1 baseline both legitimately say 25.
-# NOTE: single-quoted regexes only -- this python is embedded in a
-# double-quoted shell string, so a double quote here closes it.
-_PARA_LEAD = re.compile(r'^\s*\*\*v([0-9]+\.[0-9]+\.[0-9]+)')
-_HIST = [
-    re.compile(r'^\s*#{1,6}\s'),
-    re.compile(r'\b[Aa]t the v[0-9]+\.[0-9]+\.[0-9]+ release\b'),
-    re.compile(r'\brelease, surface was\b'),
-    re.compile(r'\bv[0-9]+ added\b'),
-    re.compile(r'\bwas [0-9]+ at v[0-9]'),
-    re.compile(r'\bShip state at v[0-9]+\.[0-9]+'),
-    re.compile(r'\bFrozen v[0-9]+\.[0-9]+[^ ]* baseline\b'),
+PARA_LEAD = re.compile(r"^\s*\*\*v([0-9]+\.[0-9]+\.[0-9]+)")
+HIST = [
+    re.compile(r"^\s*#{1,6}\s"),
+    re.compile(r"\b[Aa]t the v[0-9]+\.[0-9]+\.[0-9]+ release\b"),
+    re.compile(r"\brelease, surface was\b"),
+    re.compile(r"\bv[0-9]+ added\b"),
+    re.compile(r"\bwas [0-9]+ at v[0-9]"),
+    re.compile(r"\bShip state at v[0-9]+\.[0-9]+"),
+    re.compile(r"\bFrozen v[0-9]+\.[0-9]+[^ ]* baseline\b"),
 ]
-_release = '''$CANONICAL_RELEASE_VERSION'''
-def _is_historical(line):
-    m = _PARA_LEAD.match(line)
-    if m and m.group(1) != _release:
+
+# HTML HISTORICAL GUARD (#2977). Two things differ on the rendered .html
+# surface and BOTH are load-bearing:
+#   1. MARKUP SPLITS THE SENTENCE. `schema <strong>vNN</strong> added ...`
+#      never matches the bare `vNN added` ladder guard, so a TRUE
+#      historical ladder mention would be reported as drift. The guard is
+#      therefore evaluated over a TAG-STRIPPED, entity-decoded,
+#      WHITESPACE-COLLAPSED view (collapsing matters: a tag replaced by a
+#      space leaves two spaces, which the single-space guard still misses
+#      — a guard that looks present and does nothing).
+#   2. THE RELEASE ATTRIBUTION LIVES IN A SIBLING ELEMENT. A markdown
+#      release-narrative paragraph opens with its own
+#      `**vX.Y.Z ... prior release.**` lead; an html release CARD puts
+#      `PRIOR RELEASE` and `What's New in v0.7.0` in the two divs ABOVE
+#      the card body carrying the numbers. So the two card markers are
+#      evaluated over a SMALL PRECEDING WINDOW — the same shape
+#      scripts/check-doc-symbol-anchors.sh uses for its hard-wrapped
+#      absent-path disclaimers. Three lines: enough for eyebrow + title,
+#      too short to reach into an unrelated block.
+TAG = re.compile(r"<[^>]+>")
+WS = re.compile(r"\s+")
+HTML_WINDOW = 3
+HTML_HIST_PRIOR = re.compile(r"PRIOR RELEASE", re.IGNORECASE)
+HTML_HIST_WHATSNEW = re.compile(
+    r"What.s New in v([0-9]+\.[0-9]+\.[0-9]+)", re.IGNORECASE)
+
+
+def plain(s):
+    return WS.sub(" ", htmlmod.unescape(TAG.sub(" ", s))).strip()
+
+
+def is_historical(line):
+    m = PARA_LEAD.match(line)
+    if m and m.group(1) != release:
         return True
-    return any(p.search(line) for p in _HIST)
-for ln, line in enumerate(open('$f').read().splitlines(), 1):
-    if _is_historical(line):
+    return any(p.search(line) for p in HIST)
+
+
+def html_window_historical(window):
+    joined = " ".join(plain(w) for w in window)
+    if HTML_HIST_PRIOR.search(joined):
+        return True
+    return any(m.group(1) != release
+               for m in HTML_HIST_WHATSNEW.finditer(joined))
+
+
+for f in os.environ["GATE_NC_FILES"].split():
+    if not os.path.isfile(f):
         continue
-    for m in pat.finditer(line):
-        # Alternation groups: take the FIRST non-None capture
-        val = next((g for g in m.groups() if g is not None), '')
-        if not val:
+    is_html = f.endswith(".html")
+    lines = open(f, encoding="utf-8").read().splitlines()
+    for ln, line in enumerate(lines, 1):
+        if is_html:
+            if is_historical(plain(line)):
+                continue
+            if html_window_historical(lines[max(0, ln - 1 - HTML_WINDOW):ln]):
+                continue
+        elif is_historical(line):
             continue
-        ctx = line.strip()[:160]
-        print(f'{ln}\t{val}\t{ctx}')
-"
-        )" || {
-            printf 'FAIL: check-docs-vs-ssot: %s analysis engine errored on %s (python exited non-zero) — refusing to report PASS (#2713 fail-closed)\n' "$rule_name" "$f" >&2
-            exit 2
-        }
-        while IFS=$'\t' read -r ln val context; do
-            [[ -z "$val" ]] && continue
-            if [[ "$val" != "$canonical" ]]; then
-                emit_fail "$rule_name" "$f" "$ln" "$val" "$canonical" "$context"
-            fi
-        done <<< "$narrative_rows"
-    done
+        for m in pat.finditer(line):
+            # Alternation groups: take the FIRST non-None capture
+            val = next((g for g in m.groups() if g is not None), "")
+            if not val:
+                continue
+            ctx = line.strip()[:160].replace("\t", " ")
+            print(f"{f}\t{ln}\t{val}\t{ctx}")
+NCPY
+    )" || {
+        printf 'FAIL: check-docs-vs-ssot: %s analysis engine errored (python exited non-zero) — refusing to report PASS (#2713 fail-closed)\n' "$rule_name" >&2
+        exit 2
+    }
+    local f ln val context
+    while IFS=$'\t' read -r f ln val context; do
+        [[ -z "$val" ]] && continue
+        if [[ "$val" != "$canonical" ]]; then
+            emit_fail "$rule_name" "$f" "$ln" "$val" "$canonical" "$context"
+        fi
+    done <<< "$narrative_rows"
 }
 
 # pgvector certified-patch rule.
@@ -559,6 +698,109 @@ for ln, line in enumerate(open('$f', encoding='utf-8').read().splitlines(), 1):
             fi
         done <<< "$pgv_rows"
     done
+}
+
+# Sitewide HTML CHROME version-stamp rule (#2977).
+#
+# THE DEFECT. The v1.0.0 doc-drift campaign found the published site's
+# chrome carrying `v0.9.0` across 38 pages while every gate stayed green.
+# Chrome is the highest-leverage claim on the whole site — it is the
+# version an operator reads on EVERY page — and it was the one claim
+# nothing checked.
+#
+# THE ANCHOR is CHROME, not prose. Two shapes, both of which are
+# per-page furniture rather than narrative:
+#   * the footer stamp, scoped to the text INSIDE a `<footer>` element:
+#     `ai-memory v1.0.0 · Apache 2.0 · …`, `© 2026 AlphaOne LLC.
+#     Licensed Apache-2.0. ai-memory v1.0.0 — …`
+#   * the hero/nav release badge: `<span class="badge">v1.0.0 · …`
+# Scoping to the chrome is what keeps the rule off legitimate prose. A
+# page may say "v0.9.0 shipped the attestation default" in its body all
+# day; that is history, and the rule never reads it.
+#
+# PUBLISHED-INSTALL REFERENCES ARE SKIPPED, deliberately and by name. The
+# v1.0.0 TAG-CUT IS OPERATOR-GATED (CLAUDE.md §release gate), so the last
+# PUBLISHED artefact is still v0.9.0 and an install/download line that
+# says so is CORRECT — flagging it would push a doc author to publish an
+# install command for a tag that does not exist, which is worse than the
+# drift the rule is here to catch. Footer scoping already excludes almost
+# all of these; the keyword skip below is the belt for the rare footer
+# that carries a download link.
+#
+# Frozen pages never reach this rule: they are filtered out of
+# HTML_DOC_FILES by HTML_FROZEN_EXEMPT at the top of this script, which is
+# exactly why a `whats-new-v0.8.0` page may keep stamping v0.8.0.
+check_html_version_stamp_rule() {
+    local rule_name="HTML_CHROME_VERSION_STAMP"
+    local canonical="$CANONICAL_RELEASE_VERSION"
+    if [[ -z "$canonical" ]]; then
+        printf 'FAIL: %s: could not resolve the release version from Cargo.toml — refusing to validate (#2713 fail-closed)\n' \
+            "$rule_name" >&2
+        fail_count=$((fail_count + 1))
+        return
+    fi
+    # ONE python for the whole scan set (the check_narrative_count_rule
+    # batching rationale): 53 interpreter startups to read 53 footers is
+    # cost with no work in it.
+    local rows
+    rows="$(
+        GATE_STAMP_FILES="${HTML_DOC_FILES[*]:-}" python3 - <<'PY'
+import os
+import re
+
+if os.environ.get("AI_MEMORY_DOCS_GATE_SELFTEST_FAULT"):
+    raise RuntimeError("check-docs-vs-ssot self-test: injected analysis-engine fault (#2713)")
+
+FOOTER_OPEN = re.compile(r"<footer\b", re.IGNORECASE)
+FOOTER_CLOSE = re.compile(r"</footer\s*>", re.IGNORECASE)
+# `ai-memory v1.0.0` / `ai-memory&trade; v1.0.0` / `ai-memory™ v1.0.0`
+FOOTER_STAMP = re.compile(
+    r"ai-memory(?:&trade;|&#8482;|™)?\s+v([0-9]+\.[0-9]+\.[0-9]+)")
+# The hero/nav release badge: `<span class="badge">v1.0.0 &middot; …`
+BADGE_STAMP = re.compile(
+    r'class="badge"[^>]*>\s*v([0-9]+\.[0-9]+\.[0-9]+)')
+# Published-install / download references legitimately trail the last
+# PUBLISHED tag while the tag-cut is operator-gated.
+INSTALL_REF = re.compile(
+    r"install|download|releases/download|/tag/|git\s+checkout|"
+    r"cargo\s+add|crates\.io|homebrew|brew\s|docker\s+pull|"
+    r"npm\s+i(?:nstall)?\b|pip\s+install|ghcr\.io|apt-get",
+    re.IGNORECASE,
+)
+
+for path in os.environ.get("GATE_STAMP_FILES", "").split():
+    if not os.path.isfile(path):
+        continue
+    lines = open(path, encoding="utf-8").read().splitlines()
+    depth = 0
+    for ln, line in enumerate(lines, 1):
+        opens = len(FOOTER_OPEN.findall(line))
+        closes = len(FOOTER_CLOSE.findall(line))
+        in_footer = depth > 0 or opens > 0
+        depth += opens - closes
+        if depth < 0:
+            depth = 0
+        if INSTALL_REF.search(line):
+            continue
+        hits = []
+        if in_footer:
+            hits += [("footer", m) for m in FOOTER_STAMP.finditer(line)]
+        hits += [("badge", m) for m in BADGE_STAMP.finditer(line)]
+        for kind, m in hits:
+            ctx = line.strip()[:160].replace("\t", " ")
+            print(f"{path}\t{ln}\t{m.group(1)}\t{kind}\t{ctx}")
+PY
+    )" || {
+        printf 'FAIL: check-docs-vs-ssot: html chrome version-stamp engine errored (python exited non-zero) — refusing to report PASS (#2713 fail-closed)\n' >&2
+        exit 2
+    }
+    local f ln val kind context
+    while IFS=$'\t' read -r f ln val kind context; do
+        [[ -z "$val" ]] && continue
+        if [[ "$val" != "$canonical" ]]; then
+            emit_fail "$rule_name ($kind)" "$f" "$ln" "v$val" "v$canonical" "$context"
+        fi
+    done <<< "$rows"
 }
 
 # Env-var census rule (#836 3B / 2026-06-09 GA drive). Every
@@ -694,6 +936,7 @@ check_generalised_numeric_claims() {
     local out
     if ! out="$(
         GATE_DOC_FILES="${DOC_FILES[*]}" \
+        GATE_HTML_FILES="${HTML_DOC_FILES[*]:-}" \
         C_ROUTES="$CANONICAL_ROUTES_COUNT" \
         C_PATHS="$CANONICAL_UNIQUE_PATHS_COUNT" \
         C_SCHEMA="$CANONICAL_SCHEMA_VERSION" \
@@ -703,10 +946,16 @@ check_generalised_numeric_claims() {
         C_CLI_DEFAULT="$CANONICAL_CLI_DEFAULT" \
         C_RELEASE="$CANONICAL_RELEASE_VERSION" \
         python3 - <<'PY'
+import html as htmlmod
 import os
 import re
 
 docs = os.environ["GATE_DOC_FILES"].split()
+# #2977 — the operator-facing docs/**/*.html surface, resolved by the
+# enroll-by-default glob + frozen-exemption list at the top of this
+# script. Scanned by the SAME rule table as the .md set (see the markup
+# dialect note below) but under an html-aware historical guard.
+html_docs = os.environ.get("GATE_HTML_FILES", "").split()
 release = os.environ["C_RELEASE"]
 
 # Self-test fault-injection (#2713): when this env var is set the analysis
@@ -726,18 +975,42 @@ canon = {
     "EXPECTED_CLI_SUBCOMMANDS_DEFAULT": os.environ["C_CLI_DEFAULT"],
 }
 
-# `**92**` / `92` / `` `92` `` -- bold, code-span, or bare.
-NUM = r"(?:\*\*|`)?([0-9]+)(?:\*\*|`)?"
+# MARKUP DIALECT (#2977). ONE anchor grammar, two dialects. The rendered
+# .html pages restate the same noun-phrase anchors as the .md sources, but
+# with `<strong>`/`<code>` where markdown writes `**`/`` ` ``, and with
+# `&nbsp;` where markdown writes a space. Writing a SECOND html rule table
+# would give two definitions that can silently disagree (the standing
+# CLAUDE.md objection: "two definitions that can disagree teach reviewers
+# to ignore both"), so the delimiters below simply admit BOTH spellings and
+# the SAME table serves both file types. A .md file never contains
+# `<strong>` and a .html file never contains `**`, so neither dialect
+# widens the other's match set.
+#
+# Each alternative inside MK is NON-EMPTY on purpose: a `*`-quantified
+# alternative nested inside a `+`-quantified group is the classic
+# catastrophic-backtracking shape.
+MK = r"(?:</?(?:strong|b|code|em|i)>|\*\*|`)"
+# SP1 keeps the "at least one separator" requirement the markdown `[ ]+`
+# positions carried; SP0 replaces the `[ ]*(?:\*\*)?[ ]*` runs.
+SP0 = r"(?:[ ]|&nbsp;|" + MK + r")*"
+SP1 = r"(?:[ ]|&nbsp;|" + MK + r")+"
+BOLD_OPEN = r"(?:\*\*|<strong>|<b>)"
+BOLD_CLOSE = r"(?:\*\*|</strong>|</b>)"
+CODE_OPEN = r"(?:`|<code>)"
+CODE_CLOSE = r"(?:`|</code>)"
+# `**92**` / `92` / `` `92` `` / `<strong>92</strong>` / `<code>92</code>`
+NUM = (r"(?:" + BOLD_OPEN + r"|" + CODE_OPEN + r")?([0-9]+)"
+       r"(?:" + BOLD_CLOSE + r"|" + CODE_CLOSE + r")?")
 
 RULES = [
     ("EXPECTED_PRODUCTION_ROUTES_COUNT", [
-        NUM + r"[ ]*(?:\*\*)?[ ]*(?:production[ ]+)?(?:HTTP|REST)[ ]+routes?[ ]+registrations",
-        NUM + r"[ ]*(?:\*\*)?[ ]*(?:production[ ]+)?HTTP[ ]+routes\b",
-        NUM + r"[ ]*production[ ]+`\.route\(\.\.\.\)`[ ]+registrations",
-        NUM + r"[ ]*(?:\*\*)?[ ]*route[ ]+registrations",
+        NUM + SP0 + r"(?:production" + SP1 + r")?(?:HTTP|REST)" + SP1 + r"routes?" + SP1 + r"registrations",
+        NUM + SP0 + r"(?:production" + SP1 + r")?HTTP" + SP1 + r"routes\b",
+        NUM + SP0 + r"production" + SP1 + CODE_OPEN + r"\.route\(\.\.\.\)" + CODE_CLOSE + SP1 + r"registrations",
+        NUM + SP0 + r"route" + SP1 + r"registrations",
     ]),
     ("EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT", [
-        NUM + r"[ ]*(?:\*\*)?[ ]*unique[ ]+(?:URL[ ]+)?paths",
+        NUM + SP0 + r"unique" + SP1 + r"(?:URL" + SP1 + r")?paths",
     ]),
     # BOLD-ONLY, deliberately. A bare `schema v52` is the ladder-history
     # phrasing the pre-existing CURRENT_SCHEMA_VERSION rule above already
@@ -746,28 +1019,33 @@ RULES = [
     # red-line ~30 lines of legitimate history across ROADMAP, the
     # PORTABILITY spec, and the compliance inventory. `schema **vNN**`
     # is the SURFACE-SUMMARY phrasing — the register's own stale shape.
+    # CODE-span is deliberately NOT admitted here either: the html twin of
+    # a bare `schema v52` is `schema <code>v52</code>`, which is exactly
+    # the pinned-artefact / ladder-history spelling the bold-only rule
+    # exists to spare (docs/reference-architecture/index.html pins the
+    # do-1461 golden fleet at `schema <code>v78</code>`).
     ("CURRENT_SCHEMA_VERSION", [
-        r"schema[ ]+\*\*v([0-9]+)\*\*",
+        r"schema" + SP1 + BOLD_OPEN + r"v([0-9]+)" + BOLD_CLOSE,
     ]),
     ("Memory::FIELD_COUNT", [
-        NUM + r"-field(?:\*\*)?[ ]*(?:`Memory`|struct)",
+        NUM + r"-field" + SP0 + r"(?:" + CODE_OPEN + r"Memory" + CODE_CLOSE + r"|struct)",
     ]),
     # `--profile full`-anchored, deliberately. A bare `N MCP tools`
     # matches the per-release capability ladder ("5 MCP tools", "4 MCP
     # tools") and per-family subset counts, none of which are claims
     # about the full-profile total.
     ("Profile::full().expected_tool_count()", [
-        NUM + r"[ ]*(?:\*\*)?[ ]*MCP[ ]+tools[ ]+at[ ]+`--profile[ ]+full`",
-        NUM + r"-entry(?:\*\*)?[ ]+surface",
-        NUM + r"[ ]*(?:\*\*)?[ ]*advertised[ ]+entries[ ]+at[ ]+`--profile[ ]+full`",
+        NUM + SP0 + r"MCP" + SP1 + r"tools" + SP1 + r"at" + SP1 + CODE_OPEN + r"--profile" + SP1 + r"full" + CODE_CLOSE,
+        NUM + r"-entry" + SP1 + r"surface",
+        NUM + SP0 + r"advertised" + SP1 + r"entries" + SP1 + r"at" + SP1 + CODE_OPEN + r"--profile" + SP1 + r"full" + CODE_CLOSE,
     ]),
     ("EXPECTED_CLI_SUBCOMMANDS_SAL", [
-        NUM + r"[ ]*(?:\*\*)?[ ]*(?:CLI[ ]+|top-level[ ]+)?subcommands[ ]+under[ ]+`--features[ ]+sal",
-        r"yields[ ]+\*\*([0-9]+)\*\*[ ]+by[ ]+unlocking",
+        NUM + SP0 + r"(?:CLI" + SP1 + r"|top-level" + SP1 + r")?subcommands" + SP1 + r"under" + SP1 + CODE_OPEN + r"--features" + SP1 + r"sal",
+        r"yields" + SP1 + BOLD_OPEN + r"([0-9]+)" + BOLD_CLOSE + SP1 + r"by" + SP1 + r"unlocking",
     ]),
     ("EXPECTED_CLI_SUBCOMMANDS_DEFAULT", [
-        NUM + r"[ ]*(?:\*\*)?[ ]*(?:CLI[ ]+|top-level[ ]+)?subcommands[ ]+in[ ]+the[ ]+default[ ]+build",
-        NUM + r"[ ]*(?:\*\*)?[ ]*in[ ]+the[ ]+default[ ]+build",
+        NUM + SP0 + r"(?:CLI" + SP1 + r"|top-level" + SP1 + r")?subcommands" + SP1 + r"in" + SP1 + r"the" + SP1 + r"default" + SP1 + r"build",
+        NUM + SP0 + r"in" + SP1 + r"the" + SP1 + r"default" + SP1 + r"build",
     ]),
 ]
 RULES = [(k, [re.compile(p) for p in ps]) for k, ps in RULES]
@@ -810,27 +1088,92 @@ def is_historical(line):
     return any(p.search(line) for p in HISTORICAL)
 
 
-for f in docs:
+# ---- HTML HISTORICAL GUARD (#2977) ----------------------------------
+# The markdown guards above are line-scoped because a markdown
+# release-narrative paragraph IS one line, opening with its own
+# `**v0.8.0 … prior release.**` lead. The rendered .html surface breaks
+# that assumption in two independent ways, and BOTH would turn TRUE
+# history into reported drift:
+#
+#   1. MARKUP SPLITS THE SENTENCE. `schema <strong>v67</strong> added the
+#      target_agent_id_idx column` never matches the bare `vNN added`
+#      ladder guard, because the tags sit between the two words. The guard
+#      is therefore evaluated over a TAG-STRIPPED, entity-decoded view of
+#      the line. (This is not hypothetical: it is the single hit the
+#      widened scan produced on the tree at 57b7fe35.)
+#
+#   2. THE RELEASE ATTRIBUTION LIVES IN A SIBLING ELEMENT. An HTML release
+#      CARD puts `▸ PRIOR RELEASE` and `What's New in v0.7.0` in the two
+#      divs ABOVE the card body that carries the numbers, so nothing on
+#      the number-bearing line says which release it describes. The two
+#      card markers are therefore evaluated over a SMALL PRECEDING WINDOW
+#      — the same shape scripts/check-doc-symbol-anchors.sh uses for its
+#      hard-wrapped absent-path disclaimers. THREE lines: enough for
+#      eyebrow + title, too short to reach into an unrelated block.
+#
+# `What's New in vX.Y.Z` is historical only when X.Y.Z is NOT the current
+# release, so a card describing the CURRENT release keeps being checked.
+TAG = re.compile(r"<[^>]+>")
+WS = re.compile(r"\s+")
+HTML_WINDOW = 3
+HTML_HIST_PRIOR = re.compile(r"PRIOR RELEASE", re.IGNORECASE)
+HTML_HIST_WHATSNEW = re.compile(
+    r"What.s New in v([0-9]+\.[0-9]+\.[0-9]+)", re.IGNORECASE)
+
+
+def plain(s):
+    # Whitespace is COLLAPSED, not merely substituted: replacing a tag
+    # with a space leaves `v67  added` (two spaces), which the ladder
+    # guard's single-space `\bv[0-9]+ added\b` would still miss — the
+    # guard would look present and do nothing.
+    return WS.sub(" ", htmlmod.unescape(TAG.sub(" ", s))).strip()
+
+
+def html_window_historical(window):
+    joined = " ".join(plain(w) for w in window)
+    if HTML_HIST_PRIOR.search(joined):
+        return True
+    return any(m.group(1) != release
+               for m in HTML_HIST_WHATSNEW.finditer(joined))
+
+
+def scan(f, is_html):
     try:
         text = open(f, encoding="utf-8").read()
     except OSError:
-        continue
-    for ln, line in enumerate(text.splitlines(), 1):
+        return
+    lines = text.splitlines()
+    for ln, line in enumerate(lines, 1):
         ctx = line.strip()[:160].replace("\t", " ")
-        m = CURRENT_RELEASE.search(line)
-        if m and m.group(1) != release:
-            print(
-                "CURRENT_RELEASE_ATTRIBUTION\t"
-                f"{f}\t{ln}\tv{m.group(1)}\tv{release}\t{ctx}"
-            )
-        if is_historical(line):
-            continue
+        if is_html:
+            if is_historical(plain(line)):
+                continue
+            if html_window_historical(lines[max(0, ln - 1 - HTML_WINDOW):ln]):
+                continue
+        else:
+            # RULE N1 is a MARKDOWN paragraph-lead rule; the html surface
+            # has no `**vX — current release.**` shape. Its html analogue
+            # is the footer/nav chrome stamp, policed by its own rule.
+            m = CURRENT_RELEASE.search(line)
+            if m and m.group(1) != release:
+                print(
+                    "CURRENT_RELEASE_ATTRIBUTION\t"
+                    f"{f}\t{ln}\tv{m.group(1)}\tv{release}\t{ctx}"
+                )
+            if is_historical(line):
+                continue
         for key, pats in RULES:
             for pat in pats:
                 for hit in pat.finditer(line):
                     val = hit.group(1)
                     if val != canon[key]:
                         print(f"{key}\t{f}\t{ln}\t{val}\t{canon[key]}\t{ctx}")
+
+
+for f in docs:
+    scan(f, False)
+for f in html_docs:
+    scan(f, True)
 PY
     )"; then
         # FAIL CLOSED (#2713): the numeric-claim analysis engine exited
@@ -907,6 +1250,7 @@ run_all_rules() {
     check_env_var_census_rule
     check_generalised_numeric_claims
     check_pgvector_version_rule
+    check_html_version_stamp_rule
     # MCP tool count at --profile full
     check_narrative_count_rule \
         "Profile::full().expected_tool_count() (registry tools)" \
@@ -1065,6 +1409,14 @@ run_self_test() {
 
     cd "$tmpdir"
     mkdir -p src/storage src/lib src/models src/mcp src/hooks
+    # #2977 — the frozen-page exemption SSOT the html scan set resolves
+    # against. A REAL one (not an empty stub) so the html legs below can
+    # prove BOTH directions of the boundary.
+    mkdir -p scripts/qc-allowlists
+    cat > scripts/qc-allowlists/html-doc-frozen-exempt.txt <<'FROZENEOF'
+# fixture exemption SSOT
+docs/whats-new-v
+FROZENEOF
     # Minimal canonical fixture: CURRENT_SCHEMA_VERSION = 53
     cat > src/storage/migrations.rs <<EOF
 const CURRENT_SCHEMA_VERSION: i64 = 53;
@@ -1541,6 +1893,215 @@ PGVECGOOD
         cd "$REPO_ROOT"; exit 1
     fi
     echo "PASS: self-test — the certified pgvector patch (0.8.6) still PASSES"
+
+    # ================================================================
+    # #2977 — THE GITHUB-PAGES (.html) SURFACE
+    # ================================================================
+    # Before #2977 the html scan set was ONE file, so ~70 hand-authored
+    # Jekyll pages were ungated and drifted invisibly through the whole
+    # v1.0.0 campaign. These legs pin the three properties the widening
+    # rests on: the html dialect is really READ (RED), a corrected page
+    # really PASSES (GREEN), and the two historical guards that make the
+    # widening survivable are load-bearing rather than decorative.
+    #
+    # Fixture canonicals: schema 53 · routes 87 · paths 73 · tools 12 ·
+    #                     cli 78 default / 80 sal · fields 26 · hooks 25 ·
+    #                     release 9.9.9
+    rm -f "$led" "$tmpdir/docs/CONFIG_SCHEMA.md" "$tmpdir/docs/compliance/nsa-csi-mcp.html"
+    cat > CLAUDE.md <<'HTML2977CLAUDE'
+Fixture CLAUDE.md — deliberately carries no narrative counts.
+HTML2977CLAUDE
+    cat > README.md <<'HTML2977README'
+Fixture README — deliberately carries no narrative counts.
+HTML2977README
+
+    # ---- RED: the html markup dialect is really read. Every claim below
+    # is the html twin of a shape the .md scanner already catches, and NOT
+    # ONE of them matches a markdown-only anchor.
+    cat > "$tmpdir/docs/at-a-glance.html" <<'HTMLSTALECLAIMS'
+<p>Surface: schema <strong>v78</strong>, <strong>101</strong> MCP tools at <code>--profile full</code>.</p>
+<p><strong>92</strong> HTTP route registrations over <strong>78</strong> unique URL paths.</p>
+<p>The record is a <strong>28-field</strong> <code>Memory</code>.</p>
+<p>The CLI ships <strong>89</strong> subcommands under <code>--features sal</code>.</p>
+HTMLSTALECLAIMS
+    if html_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+        echo "FAIL: self-test #2977 — the widened gate ACCEPTED html-dialect stale SSOT claims" >&2
+        printf '%s\n' "$html_out" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    html_missing=0
+    for shape in \
+        "CURRENT_SCHEMA_VERSION: docs/at-a-glance.html:1 claims \"78\"" \
+        "Profile::full().expected_tool_count(): docs/at-a-glance.html:1 claims \"101\"" \
+        "EXPECTED_PRODUCTION_ROUTES_COUNT: docs/at-a-glance.html:2 claims \"92\"" \
+        "EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: docs/at-a-glance.html:2 claims \"78\"" \
+        "Memory::FIELD_COUNT: docs/at-a-glance.html:3 claims \"28\"" \
+        "EXPECTED_CLI_SUBCOMMANDS_SAL: docs/at-a-glance.html:4 claims \"89\"" \
+    ; do
+        if ! grep -qF "$shape" <<<"$html_out"; then
+            echo "FAIL: self-test #2977 — widened gate did not flag: $shape" >&2
+            html_missing=1
+        fi
+    done
+    if [[ "$html_missing" -ne 0 ]]; then
+        printf '%s\n' "$html_out" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    echo "PASS: self-test #2977 RED — six html-dialect SSOT claims (<strong>/<code> spans) are REJECTED on an enroll-by-default page"
+
+    # ---- GREEN-on-fixed: the SAME page with the fixture canonicals.
+    cat > "$tmpdir/docs/at-a-glance.html" <<'HTMLGOODCLAIMS'
+<p>Surface: schema <strong>v53</strong>, <strong>12</strong> MCP tools at <code>--profile full</code>.</p>
+<p><strong>87</strong> HTTP route registrations over <strong>73</strong> unique URL paths.</p>
+<p>The record is a <strong>26-field</strong> <code>Memory</code>.</p>
+<p>The CLI ships <strong>80</strong> subcommands under <code>--features sal</code>.</p>
+HTMLGOODCLAIMS
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+        echo "FAIL: self-test #2977 GREEN — the CORRECTED html page was still rejected" >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    echo "PASS: self-test #2977 GREEN — the same html page carrying the canonical values PASSES"
+
+    # ---- HISTORICAL GUARD 1: TAG-STRIPPING. The verbatim
+    # docs/agent-identity.html shape. `schema <strong>v67</strong> added`
+    # is a TRUE ladder statement; without the tag-stripped view the guard
+    # never sees the `vNN added` phrase and the gate reports history as
+    # drift. This is the ONE hit the widened scan produced at 57b7fe35.
+    cat > "$tmpdir/docs/at-a-glance.html" <<'HTMLLADDER'
+<p>Backing this, schema <strong>v67</strong> added the <code>target_agent_id_idx</code> column.</p>
+HTMLLADDER
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+        echo "FAIL: self-test #2977 — the html guard fired on a LEGITIMATE tag-split ladder mention" >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    echo "PASS: self-test #2977 — a tag-split 'schema <strong>vNN</strong> added' ladder mention still PASSES"
+
+    # ---- HISTORICAL GUARD 2: THE PRECEDING-LINE WINDOW. An html release
+    # CARD puts its attribution in the two divs ABOVE the numbers, so
+    # nothing on the number-bearing line says which release it describes.
+    # BOTH directions are asserted, because a window guard that fired
+    # unconditionally would be indistinguishable from not scanning at all.
+    cat > "$tmpdir/docs/at-a-glance.html" <<'HTMLCARD'
+<div class="card-eyebrow">&#9656; PRIOR RELEASE</div>
+<div class="card-title">What's New in v0.7.0 — attested-cortex</div>
+<p class="card-body"><strong>74</strong> MCP tools at <code>--profile full</code>, 27-event hook pipeline.</p>
+HTMLCARD
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+        echo "FAIL: self-test #2977 — the window guard did NOT spare an html PRIOR-RELEASE card" >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    echo "PASS: self-test #2977 — an html release CARD (eyebrow + title in the divs above) is spared"
+
+    cat > "$tmpdir/docs/at-a-glance.html" <<'HTMLCARDLESS'
+<p class="card-body"><strong>74</strong> MCP tools at <code>--profile full</code>, 27-event hook pipeline.</p>
+HTMLCARDLESS
+    if card_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+        echo "FAIL: self-test #2977 — the SAME numbers WITHOUT the release-card markers were accepted." >&2
+        echo "       The window guard would then be a blanket exemption, not a guard." >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    grep -qF 'Profile::full().expected_tool_count(): docs/at-a-glance.html:1 claims "74"' <<<"$card_out" || {
+        echo "FAIL: self-test #2977 — card-less stale tool count not flagged" >&2
+        printf '%s\n' "$card_out" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    grep -qF 'HookEvent variants: docs/at-a-glance.html:1 claims "27"' <<<"$card_out" || {
+        echo "FAIL: self-test #2977 — card-less stale hook count not flagged (the widened HookEvent scan set)" >&2
+        printf '%s\n' "$card_out" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    echo "PASS: self-test #2977 — the SAME numbers with the card markers REMOVED are REJECTED (the window is a guard, not a blanket)"
+
+    # ---- FROZEN EXEMPTION, both directions. A page named in
+    # scripts/qc-allowlists/html-doc-frozen-exempt.txt carries the very
+    # same stale claims and must PASS: "what's new in vN" is, by
+    # construction, a statement about vN.
+    rm -f "$tmpdir/docs/at-a-glance.html"
+    cat > "$tmpdir/docs/whats-new-v09.html" <<'HTMLFROZEN'
+<p>Surface: schema <strong>v78</strong>, <strong>101</strong> MCP tools at <code>--profile full</code>.</p>
+HTMLFROZEN
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+        echo "FAIL: self-test #2977 — a FROZEN page (html-doc-frozen-exempt.txt) was scanned" >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    echo "PASS: self-test #2977 — a page named in html-doc-frozen-exempt.txt is EXEMPT (the same claims pass there)"
+    rm -f "$tmpdir/docs/whats-new-v09.html"
+
+    # ---- THE EXEMPTION SSOT IS REQUIRED. A gate that silently resolves
+    # its scan set without the frozen boundary either reds every frozen
+    # page or drops the widening; refuse instead. Asserted here rather
+    # than waived under --self-test, because a check the self-test cannot
+    # reach is a check nobody has proven.
+    mv "$tmpdir/scripts/qc-allowlists/html-doc-frozen-exempt.txt" "$tmpdir/exempt.bak"
+    if ex_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+        echo "FAIL: self-test #2977 — a MISSING frozen-exemption SSOT did not fail the gate" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    grep -q 'html-doc-frozen-exempt.txt' <<<"$ex_out" || {
+        echo "FAIL: self-test #2977 — the missing-SSOT failure did not name the file" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    mv "$tmpdir/exempt.bak" "$tmpdir/scripts/qc-allowlists/html-doc-frozen-exempt.txt"
+    echo "PASS: self-test #2977 — a missing frozen-exemption SSOT FAILS CLOSED"
+
+    # ---- SITEWIDE CHROME VERSION STAMP. The campaign found v0.9.0 chrome
+    # on 38 pages while every gate stayed green. Fixture release: 9.9.9.
+    cat > "$tmpdir/docs/at-a-glance.html" <<'HTMLSTAMPBAD'
+<span class="badge">v0.9.0 &middot; Apache-2.0</span>
+<p>ai-memory v0.7.0 shipped the attested cortex.</p>
+<footer>
+  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.9.0 — source on GitHub</p>
+</footer>
+HTMLSTAMPBAD
+    if stamp_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1); then
+        echo "FAIL: self-test #2977 — a stale sitewide chrome version stamp was ACCEPTED" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    grep -qF 'HTML_CHROME_VERSION_STAMP (footer): docs/at-a-glance.html:4 claims "v0.9.0"' <<<"$stamp_out" || {
+        echo "FAIL: self-test #2977 — the stale FOOTER chrome stamp was not flagged" >&2
+        printf '%s\n' "$stamp_out" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    grep -qF 'HTML_CHROME_VERSION_STAMP (badge): docs/at-a-glance.html:1 claims "v0.9.0"' <<<"$stamp_out" || {
+        echo "FAIL: self-test #2977 — the stale hero/nav BADGE chrome stamp was not flagged" >&2
+        printf '%s\n' "$stamp_out" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    # ...and the PROSE mention OUTSIDE the footer must NOT be flagged: a
+    # page saying what v0.7.0 shipped is history, not chrome.
+    grep -qF 'docs/at-a-glance.html:2' <<<"$stamp_out" && {
+        echo "FAIL: self-test #2977 — the chrome rule fired on PROSE outside the footer" >&2
+        printf '%s\n' "$stamp_out" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    echo "PASS: self-test #2977 — stale FOOTER + BADGE chrome stamps are REJECTED, body prose is spared"
+
+    # ---- GREEN-on-fixed + the PUBLISHED-INSTALL carve-out. The v1.0.0
+    # tag-cut is operator-gated, so an install/download line pinned at the
+    # last PUBLISHED tag is CORRECT; flagging it would push a doc author
+    # to publish an install command for a tag that does not exist.
+    cat > "$tmpdir/docs/at-a-glance.html" <<'HTMLSTAMPGOOD'
+<span class="badge">v9.9.9 &middot; Apache-2.0</span>
+<footer>
+  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v9.9.9 — source on GitHub</p>
+  <p>Install the published build: <code>cargo install ai-memory v0.9.0</code></p>
+</footer>
+HTMLSTAMPGOOD
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+        echo "FAIL: self-test #2977 GREEN — a current chrome stamp + a published-install reference were rejected" >&2
+        AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" 2>&1 >/dev/null | sed 's/^/       /' >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    echo "PASS: self-test #2977 GREEN — a current chrome stamp PASSES and a published-install reference is SKIPPED"
+
+    # ---- and a FROZEN page keeps its own historical chrome stamp.
+    rm -f "$tmpdir/docs/at-a-glance.html"
+    cat > "$tmpdir/docs/whats-new-v09.html" <<'HTMLSTAMPFROZEN'
+<footer><p>ai-memory v0.9.0 — what shipped in v0.9.0</p></footer>
+HTMLSTAMPFROZEN
+    if ! AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$REPO_ROOT/scripts/check-docs-vs-ssot.sh" >/dev/null 2>&1; then
+        echo "FAIL: self-test #2977 — the chrome rule fired on a FROZEN per-release page" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    echo "PASS: self-test #2977 — a frozen per-release page keeps its own historical chrome stamp"
 
     cd "$REPO_ROOT"
 }

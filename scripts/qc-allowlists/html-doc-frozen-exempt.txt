@@ -1,0 +1,58 @@
+# Copyright 2026 AlphaOne LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# FROZEN GitHub-Pages HTML surfaces — the exemption SSOT for the doc-drift
+# gates that walk `docs/**/*.html` (#2977).
+#
+# WHY THIS FILE EXISTS. Before #2977 the two claims gates carried a
+# one-file / three-file HTML allowlist, so ~70 hand-authored Jekyll pages
+# under `docs/` were UNGATED. That is why the HTML surface drifted
+# invisibly through the v1.0.0 campaign (stale schema versions, a sitewide
+# v0.9.0 chrome stamp, a false sub-10ms recall claim, a
+# bench-as-merge-blocker claim, a kind-count 10-vs-16) while every gate
+# stayed green. An enumerated INCLUDE list cannot close that class — the
+# rot IS that a new page lands ungated — so the scan set is
+# ENROLL-BY-DEFAULT and the EXEMPTIONS are the enumerated thing.
+#
+# CONSUMERS (both read this file; it is the single definition, so the two
+# gates cannot drift apart on where the frozen boundary sits):
+#   * scripts/check-docs-vs-ssot.sh      — numeric-claim + CLI-count +
+#                                          HookEvent + chrome-version rules
+#   * scripts/check-ci-job-claims.sh     — named-CI-job existence +
+#                                          enforcement-truthfulness rules
+#
+# FORMAT. One PATH SUBSTRING per line; a doc is exempt when its
+# repo-relative path CONTAINS the substring. `#` starts a comment. Every
+# entry MUST carry a rationale naming WHY the page is frozen, so the
+# boundary can be audited in one read. Keep it minimal and anchored: an
+# entry that stops matching anything is dead weight that hides coverage.
+#
+# THE TEST FOR AN ENTRY: is every number on the page a TRUE STATEMENT
+# ABOUT A PAST RELEASE, by construction? If the page would be WRONG after
+# a version bump, it is frozen. If it would merely be STALE, it is live
+# and belongs under the gate.
+
+# Jekyll layout template — chrome scaffolding, not published content.
+docs/_layouts/
+
+# Frozen per-release evidence + compatibility trees. Every number in them
+# describes the tree AS IT WAS at that release.
+docs/v0.7.0/
+docs/v0.7/
+
+# Per-release narrative pages. "What's new in vN" is, by construction, a
+# statement about vN; re-pointing them at the canonical would destroy the
+# release record the pages exist to keep.
+docs/whats-new-v
+docs/v070-architecture.html
+docs/v070-changelog.html
+docs/release-v0.7.1.html
+
+# Frozen v0.7.0-era AI-NHI assessment. The page IS the artefact of that
+# assessment (its own footer chrome stamps v0.7.0), not a live doc.
+docs/ai-nhi-pm-v9.html
+
+# Dated point-in-time security assessments. An assessment OF vX keeps
+# citing vX forever; that is the artefact being correct, not drift.
+docs/compliance/nsa-control-test-matrix.html
+docs/compliance/v1.0.0-security-assessment.html
