@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Lifecycle — store to purge, end to end</title>
-<meta name="description" content="ai-memory v0.9.0 memory lifecycle. The full journey of a memory from store → tier → access → promote → link → consolidate → expire → archive → restore or purge. With timeline visualization.">
+<meta name="description" content="ai-memory v1.0.0 memory lifecycle. The full journey of a memory from store → tier → access → promote → link → consolidate → expire → archive → restore or purge. With timeline visualization.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/lifecycle.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -95,7 +95,7 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Lifecycle</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v09.html" style="color:#ffb86b">v0.9.0</a>
+      <a href="whats-new-v09.html" style="color:#ffb86b">What's new</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -171,7 +171,7 @@ footer a{color:var(--text-muted)}
       <div class="mnav-pane">
         <a href="./">Home</a>
         <a href="at-a-glance.html">Atlas</a>
-        <a href="whats-new-v09.html">v0.9.0</a>
+        <a href="whats-new-v09.html">What's new</a>
         <div class="mnav-group">Audiences</div>
         <a href="for-everyone.html">For Everyone</a>
         <a href="audience/decision-maker.html">Decision Maker</a>
@@ -429,7 +429,7 @@ SELECT id, archived_at, reason, namespace, tier, original_metadata
 </section>
 
 <footer>
-  <p>ai-memory v0.9.0 · Apache 2.0 · lifecycle paths cross every module — primary entry points: <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/handlers/">src/handlers/</a>, <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/storage/">src/storage/</a>, <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/governance/">src/governance/</a>, <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/curator/">src/curator/</a></p>
+  <p>ai-memory v1.0.0 · Apache 2.0 · lifecycle paths cross every module — primary entry points: <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/handlers/">src/handlers/</a>, <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/storage/">src/storage/</a>, <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/governance/">src/governance/</a>, <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/curator/">src/curator/</a></p>
   <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="memory-tiers.html">Tiers</a> · <a href="ttl-controls.html">TTLs</a> · <a href="archival.html">Archival</a> · <a href="schema.html">Schema</a></p>
 </footer>
 

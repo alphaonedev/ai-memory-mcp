@@ -18,8 +18,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ai-memory · Evidence — frozen public claims for v0.9.0</title>
-<meta name="description" content="Canonical evidence page for ai-memory v0.9.0. Frozen test count, coverage, MCP tool count, HTTP route count, CLI subcommand count, federation status, and certification status. Single source of truth — every other public page sources its numbers from here.">
+<title>ai-memory · Evidence — frozen public claims for v1.0.0</title>
+<meta name="description" content="Canonical evidence page for ai-memory v1.0.0. Frozen test count, coverage, MCP tool count, HTTP route count, CLI subcommand count, federation status, and certification status. Single source of truth — every other public page sources its numbers from here.">
 <meta name="theme-color" content="#0d1117">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/evidence.html">
 <style>
@@ -94,7 +94,7 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Evidence</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v09.html" style="color:#ffb86b">v0.9.0</a>
+      <a href="whats-new-v09.html" style="color:#ffb86b">What's new</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -170,7 +170,7 @@ footer a{color:var(--text-muted)}
 
 <section class="hero">
   <div class="container">
-    <span class="frozen-badge">FROZEN · v0.9.0 · 2026-07-07 release-gate-final</span>
+    <span class="frozen-badge">FROZEN · v1.0.0 · release/v1.0.0 (tag-cut operator-gated)</span>
     <h1>The single source of truth.</h1>
     <p class="lead">
       Every public page about ai-memory — README, marketing site, roadmap, architecture pages, sales decks — must source its numbers from this page or from the upstream test-hub evidence it cites.
@@ -185,15 +185,15 @@ footer a{color:var(--text-muted)}
 
 <section>
   <div class="container">
-    <span class="eyebrow">Frozen facts · v0.9.0</span>
+    <span class="eyebrow">Frozen facts · v1.0.0</span>
     <h2>The numbers.</h2>
-    <p>Code-surface counts (MCP / HTTP / CLI / schema / struct) are counted directly from the v0.9.0 source tree. The dated test/benchmark rows (LongMemEval, the #1182 regression baseline) remain the latest published measurements and retain their measurement dates + provenance. Source links accompany each row.</p>
+    <p>Code-surface counts (MCP / HTTP / CLI / schema / struct) are counted directly from the v1.0.0 source tree. The dated test/benchmark rows (LongMemEval, the #1182 regression baseline) remain the latest published measurements and retain their measurement dates + provenance. Source links accompany each row.</p>
     <table class="facts">
       <thead>
         <tr><th>Field</th><th>Value</th><th>Source of truth</th></tr>
       </thead>
       <tbody>
-        <tr><td>Current release</td><td class="num">v0.9.0</td><td class="src">release branch <code>release/v0.9.0</code> on <a href="https://github.com/alphaonedev/ai-memory-mcp">alphaonedev/ai-memory-mcp</a> · 2026-07 secure-default hardening campaign (tag-cut operator-gated)</td></tr>
+        <tr><td>Current release</td><td class="num">v1.0.0</td><td class="src">release branch <code>release/v1.0.0</code> on <a href="https://github.com/alphaonedev/ai-memory-mcp">alphaonedev/ai-memory-mcp</a> · tag-cut operator-gated (the latest <em>published</em> line is v0.9.0)</td></tr>
         <tr><td>MCP tools advertised (<code>--profile full</code>)</td><td class="num">103</td><td class="src">102 callable memory tools + always-on <code>memory_capabilities</code> bootstrap. Pinned by <code>Profile::full().expected_tool_count()</code> in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/profile.rs">src/profile.rs</a> · disambiguation issue <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/862">#862</a>. v0.8.0 added the Pillar-1 coordination tool families (<code>memory_action_*</code> / <code>memory_signal_*</code> / <code>memory_checkpoint_*</code> / <code>memory_lease_*</code> / <code>memory_routine_*</code>, #1709)</td></tr>
         <tr><td>MCP tools default (<code>--profile core</code>)</td><td class="num">7</td><td class="src">Original 5 + <code>memory_load_family</code> + <code>memory_smart_load</code>, plus always-on <code>memory_capabilities</code> bootstrap. See <code>Profile::core()</code> in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/profile.rs">src/profile.rs</a></td></tr>
         <tr><td>HTTP routes (<code>/api/v1/</code>)</td><td class="num">94 / 80</td><td class="src">94 production <code>.route(…)</code> registrations / 80 unique URL paths. SSOT consts <code>EXPECTED_PRODUCTION_ROUTES_COUNT = 94</code> + <code>EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT = 80</code>; route-path SSOT <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/handlers/routes.rs">src/handlers/routes.rs</a> (#1558 batch 4), registered by the <code>src/lib.rs</code> router (plus the bare <code>/metrics</code> Prometheus surface). v0.8.0 added the coordination write surfaces <code>POST /api/v1/actions/{id}/transition</code> + <code>POST /api/v1/signals</code> (#1718); v0.9.0 #1859 G13-mem added <code>GET /api/v1/memories/{id}/lineage</code>.</td></tr>
@@ -371,7 +371,7 @@ footer a{color:var(--text-muted)}
 </section>
 
 <footer>
-  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v0.9.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
+  <p>© 2026 AlphaOne LLC. Licensed Apache-2.0. ai-memory v1.0.0 — <a href="https://github.com/alphaonedev/ai-memory-mcp">source on GitHub</a> · <a href="./">home</a></p>
 </footer>
 
 </body>

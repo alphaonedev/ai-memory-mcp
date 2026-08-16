@@ -310,9 +310,15 @@ Field reference:
       future RBAC.
 - **`quorum.width`** — the `W` in W-of-N federated writes; must be
   `>= MIN_QUORUM_WIDTH`.
-- **`enforcement.require_sig`** — whether receivers reject unsigned
-  posts. Defaults to `false` so an inventory that omits the block keeps
-  the permissive rollout posture; maps to `AI_MEMORY_FED_REQUIRE_SIG`.
+- **`enforcement.require_sig`** — the reconciler's DESIRED strict-enforcement
+  state (whether receivers reject unsigned posts); maps to the runtime gate
+  `AI_MEMORY_FED_REQUIRE_SIG`, which is **fail-closed / ON by default at
+  v1.0.0** (env #29). This inventory field's struct-default is `false`, so an
+  inventory that OMITS it declares *desired = permissive* — and the reconciler
+  then emits `DisableStrictEnforcement`, **actively downgrading the fail-closed
+  default** rather than "keeping" it. Set `require_sig: true` to match the
+  secure default; leave it `false` only inside a deliberate staged-enrollment
+  window (see §9). The struct-default footgun is tracked in #2975.
 
 ---
 
@@ -491,9 +497,14 @@ These are the load-bearing checks, each pinned end-to-end in
    `ai_memory_federation_cred_verify_total{result="fail"}` stay flat.
 4. **Roll node-by-node** with `scripts/federation-rollout.sh` (health-gated,
    auto-rollback). Watch the signed-vs-unsigned ratio climb toward 1.0.
-5. **Only after every node presents signed credentials**, flip
-   `enforcement.require_sig: true` (the reconciler emits this action
-   **last**, partition-safe).
+5. **Only after every node presents signed credentials**, set
+   `enforcement.require_sig: true` (partition-safe; the reconciler flips
+   enforcement on **last**). Note: the runtime gate is already fail-closed by
+   default at v1.0.0, so this staged model applies only when you have
+   *deliberately* set `require_sig: false` (or `AI_MEMORY_FED_REQUIRE_SIG=0`)
+   for the enrollment window — a downgrade the reconciler honours by emitting
+   `DisableStrictEnforcement`. A greenfield v1.0.0 fleet that enrolls keys
+   before its first strict boot needs no downgrade at all.
 6. **For regional scale**, mint intermediate CAs per region (§7.4) and
    move receivers to a **root-only** bundle.
 

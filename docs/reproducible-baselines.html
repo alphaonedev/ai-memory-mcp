@@ -24,7 +24,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory — Reproducible Baselines</title>
-<meta name="description" content="ai-memory v0.9.0 reproducibility contracts: the do-1461 two-round clean-room 0→60 fleet reproduction (119/119 verify checks green on both independent rounds), the bench p95 baseline + regression-gate mechanism, and the release-gate full-suite reproducibility contract.">
+<meta name="description" content="ai-memory v1.0.0 reproducibility contracts: the do-1461 two-round clean-room 0→60 fleet reproduction (119/119 verify checks green on both independent rounds), the bench p95 baseline + regression-gate mechanism, and the release-gate full-suite reproducibility contract.">
 <meta name="theme-color" content="#0d1117">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/reproducible-baselines.html">
 <style>
@@ -100,7 +100,7 @@ footer a{color:var(--text-muted)}
       <a href="compliance/index.html">Compliance</a>
     </div>
     <div class="right">
-      <a href="whats-new-v09.html">v0.9.0</a>
+      <a href="whats-new-v09.html">What's new</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
     </div>
   </div>
@@ -110,7 +110,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">▸ Reproducibility · Public-facing</span>
     <h1>Reproducible Baselines</h1>
-    <p class="tagline">A result you cannot reproduce is an anecdote. ai-memory v0.9.0 ships <strong>three reproducibility contracts</strong>, each with committed mechanism and citable evidence: the <a href="#fleet">two-round clean-room fleet reproduction</a> (do-1461), the <a href="#bench">performance-baseline + regression-gate mechanism</a> (<code>src/bench.rs</code>), and the <a href="#suite">release-gate full-suite contract</a> (the 2026-05-22 final campaign). This page documents what each contract pins, where the pins live, and how to re-run them.</p>
+    <p class="tagline">A result you cannot reproduce is an anecdote. ai-memory v1.0.0 ships <strong>three reproducibility contracts</strong>, each with committed mechanism and citable evidence: the <a href="#fleet">two-round clean-room fleet reproduction</a> (do-1461), the <a href="#bench">performance-baseline + regression-gate mechanism</a> (<code>src/bench.rs</code>), and the <a href="#suite">release-gate full-suite contract</a> (the 2026-05-22 final campaign). This page documents what each contract pins, where the pins live, and how to re-run them.</p>
     <div class="hero-pills">
       <span class="hero-pill good">Fleet: 2 × independent 0→60 runs · 119/119 verify checks green both rounds</span>
       <span class="hero-pill good">Bench: p95 budgets + baseline-JSON regression check on every PR (advisory, not a required status check)</span>
@@ -303,7 +303,7 @@ ai-memory bench --baseline baseline-&lt;sha&gt;.json --regression-threshold 10</
 
 <footer>
   <div class="container">
-    <p style="margin-bottom:.5rem"><strong>ai-memory v0.9.0</strong> · Reproducible Baselines · public-facing · maintained by AlphaOne LLC under Apache 2.0.</p>
+    <p style="margin-bottom:.5rem"><strong>ai-memory v1.0.0</strong> · Reproducible Baselines · public-facing · maintained by AlphaOne LLC under Apache 2.0.</p>
     <p>Companions: <a href="reference-architecture/">do-1461 reference architecture</a> · <a href="compliance/nsa-control-test-matrix.html">control → test matrix</a> · <a href="evidence.html">ship-gate evidence</a> · <a href="compliance/index.html">compliance &amp; procurement</a>.</p>
   </div>
 </footer>
