@@ -336,7 +336,7 @@ pub fn handle_reflect(
     // is identical across both reflect parsers and the L1-8 round-trip.
     fold_entity_id_into_metadata(&mut metadata, params[param_names::ENTITY_ID].as_str());
 
-    let input = db::ReflectInput {
+    let mut input = db::ReflectInput {
         source_ids,
         title: title.clone(),
         content: content.clone(),
@@ -357,6 +357,32 @@ pub fn handle_reflect(
         agent_id,
         metadata,
     };
+
+    // #3014 — the reflection is a memory-creating TENANT write; cross the
+    // attestation posture like `store`. `memory_reflect` presents no caller
+    // signature, so under global-strict attestation it is REFUSED here
+    // (fail-closed, BEFORE the approval-queue branch below — no pending row is
+    // queued and no provenance-less durable row lands). The INTERNAL curator
+    // reflection pass runs through the SAL trait (`MemoryStore::reflect`,
+    // for_admin/bypass_visibility) and never reaches this MCP handler, so it
+    // is exempt.
+    //
+    // The permissive-path `attest_level="claimed"` STAMP is directed at a
+    // THROWAWAY object, NOT `input.metadata`, so it does NOT ride into the
+    // pending-approval `pending_actions` payload (the #1176 caller-intent /
+    // lossless-capture invariant: the queued payload.metadata must be exactly
+    // what the caller supplied). The durable `attest_level` is stamped at the
+    // shared reflect WRITE funnel (`db::reflect_with_hooks`) instead, so BOTH
+    // a directly-created reflection AND an approve→execute one land it. Any
+    // caller-supplied `attest_level` is scrubbed first — it is a
+    // substrate-stamped system key, never caller-authoritative (a caller
+    // cannot forge `agent_attested` onto an unsigned reflection).
+    if let Some(obj) = input.metadata.as_object_mut() {
+        obj.remove(crate::models::field_names::ATTEST_LEVEL);
+    }
+    let mut attest_sink = serde_json::Value::Object(serde_json::Map::new());
+    crate::identity::attest::gate_unsigned_surface_attestation(&mut attest_sink)
+        .map_err(|e| e.to_string())?;
 
     // ─── #1325: caller-asserted depth mismatch refusal ──────────────
     // When the caller passed `depth: N`, verify it matches the

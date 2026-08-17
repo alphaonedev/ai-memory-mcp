@@ -3162,20 +3162,26 @@ fn test_mcp_store_invalid_metadata_defaults_to_empty() {
             .unwrap_or_else(|| panic!("metadata must be an object, got: {}", mem["metadata"]));
         // #1757 — handle_store also stamps the system-managed per-memory
         // vector clock (`version_vector`); #1945 (v1.0 crypto-core stage 3)
-        // additionally stamps `kind_provenance` on every store path. The
-        // assertion is that NO caller metadata survived (only the
-        // system-injected agent_id + clock + provenance).
+        // additionally stamps `kind_provenance` on every store path; #3018
+        // additionally stamps `attest_level` on every store path (the
+        // permissive unsigned MCP write lands `attest_level="claimed"` so an
+        // attestation census is truthful). `attest_level` is a legitimate
+        // substrate-stamped system metadata key, exactly like
+        // `kind_provenance` — this is a correct-evolution allowlist update,
+        // NOT papering over a regression. The assertion is that NO caller
+        // metadata survived (only the system-injected keys).
         let caller_keys: Vec<&String> = meta
             .keys()
             .filter(|k| {
                 k.as_str() != "agent_id"
                     && k.as_str() != "version_vector"
                     && k.as_str() != "kind_provenance"
+                    && k.as_str() != "attest_level"
             })
             .collect();
         assert!(
             caller_keys.is_empty(),
-            "invalid input metadata should reduce to the system keys (agent_id + version_vector + kind_provenance), got: {meta:?}"
+            "invalid input metadata should reduce to the system keys (agent_id + version_vector + kind_provenance + attest_level), got: {meta:?}"
         );
         assert!(
             meta.contains_key("agent_id"),

@@ -345,6 +345,28 @@ fn approval_gate_payload_handles_empty_caller_metadata() {
         .expect("execute returns the new reflection id");
 
     assert!(!executed_id.is_empty(), "executed_id must be a real uuid");
+
+    // #3018 lens-3 census hole — even though the pending PAYLOAD carries no
+    // `attest_level` (kept out for #1176 caller-intent purity, asserted
+    // above), the DURABLE reflection created via approve→execute MUST still
+    // land `attest_level="claimed"`. The stamp now lives at the shared reflect
+    // WRITE funnel (`db::reflect_with_hooks`, which
+    // `execute_reflect_from_payload` crosses), so a gated reflection is NOT a
+    // census hole. Without the funnel stamp, removing `attest_level` from the
+    // payload would have re-opened the hole for every gated reflection.
+    let executed = db::get(&conn, &executed_id)
+        .expect("get executed reflection")
+        .expect("executed reflection row exists");
+    assert_eq!(
+        executed
+            .metadata
+            .get("attest_level")
+            .and_then(Value::as_str),
+        Some("claimed"),
+        "approve->execute durable reflection must land attest_level=\"claimed\" \
+         (the funnel stamp closes the #3018 census hole); full metadata = {}",
+        executed.metadata
+    );
 }
 
 // ---------------------------------------------------------------------------

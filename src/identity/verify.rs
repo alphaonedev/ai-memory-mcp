@@ -225,17 +225,27 @@ impl std::fmt::Display for AttestError {
                  payload or signature bytes do not match what the agent signed",
             ),
             // #1984 — name the concrete remediation paths so a refused user
-            // can self-serve. HTTP direct-writes require attestation by
-            // default (#1985); MCP and CLI do not.
-            Self::AttestationRequired => f.write_str(
-                "agent attestation is required but this write is unsigned or the agent \
-                 has no bound public key. To resolve: sign the write \
-                 (`ai-memory store --sign`, with a keypair bound via \
-                 `ai-memory agents bind-key`), or set \
-                 `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` to restore the permissive \
-                 posture. HTTP direct-writes (POST /api/v1/memories) require \
-                 attestation by default; MCP and CLI writes do not",
-            ),
+            // can self-serve. #3024 — the trailing posture clause is now
+            // conditional on the RESOLVED tri-state: under explicit
+            // global-strict (`=1`/`=true`) attestation is required on EVERY
+            // surface, so the old "MCP and CLI writes do not" clause
+            // contradicted the posture on the very surface it just refused.
+            Self::AttestationRequired => {
+                let base = "agent attestation is required but this write is unsigned or the \
+                     agent has no bound public key. To resolve: sign the write \
+                     (`ai-memory store --sign`, with a keypair bound via \
+                     `ai-memory agents bind-key`), or set \
+                     `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` to restore the permissive \
+                     posture. ";
+                let posture = if crate::identity::attest::global_strict_attestation_enabled() {
+                    "AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 requires attestation on every \
+                         write surface (HTTP, MCP, and CLI)"
+                } else {
+                    "HTTP direct-writes (POST /api/v1/memories) require attestation by \
+                         default; MCP and CLI writes do not"
+                };
+                write!(f, "{base}{posture}")
+            }
             Self::BadBoundKey => f.write_str(
                 "the agent's bound public key is malformed and cannot be used to verify",
             ),

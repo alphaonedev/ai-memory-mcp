@@ -451,12 +451,16 @@ pub(crate) fn handle_store(
             // #1801→#1954 item 2 — sender EMIT: persist the author's presented
             // signature so it propagates verbatim across federation relay hops.
             crate::identity::attest::persist_write_signature(&mut mem, &sig_bytes);
-        } else if crate::identity::attest::require_agent_attestation_for(
-            crate::identity::attest::WriteSurface::Mcp,
-        ) {
-            // Only reached when the env forces strict (`=1`/`=true`): the
-            // #1985 surface-scoped default leaves the MCP surface permissive,
-            // so an unsigned MCP write skips the gate and lands `claimed`.
+        } else {
+            // #3018 — stamp `attest_level` UNCONDITIONALLY on the unsigned
+            // path (not only under strict), so the permissive MCP surface
+            // lands an explicit `attest_level="claimed"` and an attestation
+            // census (`metadata.attest_level='claimed'`) is truthful.
+            // `stamp_attestation_sync` resolves the require flag internally:
+            // the #1985 surface-scoped default leaves MCP permissive, so an
+            // unsigned MCP write lands `claimed`; only an explicit
+            // `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`/`=true` forces the
+            // strict reject-unsigned posture.
             crate::identity::attest::stamp_attestation_sync(
                 conn,
                 &mut mem,

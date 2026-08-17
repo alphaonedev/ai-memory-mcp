@@ -447,7 +447,12 @@ pub async fn consolidate_memories(
             .await
         {
             Ok(new_id) => new_id,
-            Err(e) => return store_err_to_response(e),
+            // #3014 — 403 ATTESTATION_FAILED under global-strict (parity with
+            // the store path); otherwise the typed StoreError mapping.
+            Err(e) => {
+                return crate::handlers::errors::attestation_refused_response(&e.to_string())
+                    .unwrap_or_else(|| store_err_to_response(e));
+            }
         };
         // #1552 / #2860 — federation fanout parity (shared `consolidate_fanout`
         // helper). The SAL-ported postgres branch previously returned here
@@ -707,7 +712,10 @@ pub async fn consolidate_memories(
             )
                 .into_response()
         }
-        Err(e) => crate::handlers::errors::handler_error_500(&e),
+        // #3014 — 403 ATTESTATION_FAILED under global-strict (parity with the
+        // store path); otherwise the sanitized 500.
+        Err(e) => crate::handlers::errors::attestation_refused_response(&e.to_string())
+            .unwrap_or_else(|| crate::handlers::errors::handler_error_500(&e)),
     }
 }
 

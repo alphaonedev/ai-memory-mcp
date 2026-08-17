@@ -1279,7 +1279,17 @@ impl MemoryStore for SqliteStore {
             crate::storage::stamp_substrate_why_trace(&mut stamped.metadata);
             db::reflect_with_hooks(&conn, &stamped, &hooks)
         } else {
-            db::reflect_with_hooks(&conn, input, &hooks)
+            // #3014 — a TENANT reflect crosses the attestation posture. The
+            // production tenant reflect surfaces (MCP + HTTP-sqlite) route
+            // through `handle_reflect`, which gates there; this is the
+            // defense-in-depth twin so ANY non-bypass caller of the SAL reflect
+            // surface is fail-closed under global-strict (parity with the
+            // postgres trait twin). No caller signature → refuse; else stamp
+            // `attest_level="claimed"`.
+            let mut stamped = input.clone();
+            crate::identity::attest::gate_unsigned_surface_attestation(&mut stamped.metadata)
+                .map_err(|e| crate::storage::reflect::ReflectError::Validation(e.to_string()))?;
+            db::reflect_with_hooks(&conn, &stamped, &hooks)
         }
     }
 

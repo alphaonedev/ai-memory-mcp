@@ -3696,7 +3696,7 @@ pub fn update_with_archive_on_supersede(
         .cloned()
         .unwrap_or_else(|| existing.metadata.clone());
     let mut new_metadata =
-        crate::identity::preserve_provenance_keys(&existing.metadata, &patched_metadata);
+        crate::identity::preserve_update_provenance_keys(&existing.metadata, &patched_metadata);
     if let serde_json::Value::Object(ref mut m) = new_metadata {
         m.insert(
             "edit_source".to_string(),
@@ -8519,6 +8519,19 @@ pub fn consolidate(
 ) -> Result<String> {
     // #1955 R45 — record-stop fence for the consolidate funnel.
     crate::storage::record_stop::gate_storage_conn(conn)?;
+    // #3014 — a TENANT consolidate is a memory-creating write (it mints a
+    // fresh attributable row from verbatim caller content), so it crosses the
+    // attestation posture like `store`. consolidate presents no caller
+    // signature, so under global-strict attestation it cannot attest and is
+    // REFUSED (before any write). Substrate / curator consolidates
+    // (`substrate_authored`, the SAL `for_admin` ConsolidationPass) are exempt,
+    // exactly like the SAL `store()` surface (env #48).
+    if !substrate_authored && crate::identity::attest::global_strict_attestation_enabled() {
+        return Err(anyhow::anyhow!(
+            "{}",
+            crate::identity::attest::ATTESTATION_REFUSED_UNSIGNED_SURFACE
+        ));
+    }
     let now = Utc::now().to_rfc3339();
     let new_id = uuid::Uuid::new_v4().to_string();
 
@@ -8627,6 +8640,20 @@ pub fn consolidate(
             "agent_id".to_string(),
             serde_json::Value::String(consolidator_agent_id.to_string()),
         );
+        // #3014/#3018 — stamp `attest_level="claimed"` on the tenant
+        // permissive path so the consolidated row is a truthful `claimed`
+        // write (global-strict already refused above; substrate/curator
+        // consolidates are exempt), exactly like an unsigned `store`.
+        if !substrate_authored {
+            merged_metadata.insert(
+                crate::models::field_names::ATTEST_LEVEL.to_string(),
+                serde_json::Value::String(
+                    crate::identity::verify::AttestLevel::Claimed
+                        .as_str()
+                        .to_string(),
+                ),
+            );
+        }
         if !source_agent_ids.is_empty() {
             merged_metadata.insert(
                 "consolidated_from_agents".to_string(),
@@ -10103,6 +10130,19 @@ pub fn entity_register(
 ) -> Result<crate::models::EntityRegistration> {
     use crate::models::{ENTITY_KIND, ENTITY_TAG, EntityRegistration};
 
+    // #2993 — refuse a credential-bearing alias BEFORE any write. The entity
+    // content/title is secret-screened at `insert`, but the `entity_aliases`
+    // table bypasses that funnel, so a credential passed as an alias would
+    // otherwise land verbatim under the certified `refuse` posture (the
+    // canonical_name is already screened). Caller-origin disposition: refuse
+    // mode rejects here; redact mode masks the stored form below; off stores
+    // verbatim. Screened up-front so a mid-loop refusal cannot leave a
+    // partially-written entity (this funnel is not transaction-wrapped).
+    for alias in aliases {
+        crate::secret_screen::screen_for_caller(alias.trim())
+            .map_err(|e| anyhow::anyhow!("alias rejected: {e}"))?;
+    }
+
     // Look up an existing entity in this namespace by canonical_name +
     // metadata.kind. If a non-entity memory occupies the same
     // (title, namespace), surface a hard error instead of upserting.
@@ -10156,7 +10196,15 @@ pub fn entity_register(
                 .entry("agent_id".to_string())
                 .or_insert(serde_json::Value::String(a.to_string()));
         }
-        let metadata = serde_json::Value::Object(meta_map);
+        // #3014 — the entity row is a memory-creating TENANT write; cross the
+        // attestation posture like `store`. entity_register presents no caller
+        // signature, so under global-strict attestation it is REFUSED (no
+        // provenance-less durable row lands under a posture that promises
+        // attestation); under the permissive posture the row's metadata is
+        // stamped `attest_level="claimed"` so an attestation census is truthful.
+        // Refuses BEFORE the insert below, so no partial row is written.
+        let mut metadata = serde_json::Value::Object(meta_map);
+        crate::identity::attest::gate_unsigned_surface_attestation(&mut metadata)?;
 
         let now = Utc::now().to_rfc3339();
         let mem = Memory {
@@ -10204,13 +10252,21 @@ pub fn entity_register(
         // canonical_name is always reachable via entity_get_by_alias.
         // Without this row, registering an entity with no aliases makes
         // it unreachable by name (NHI-P3-T2).
-        stmt.execute(params![entity_id, canonical_name, now])?;
+        // #2993 — persist the STORAGE form of each alias (redact mode masks a
+        // credential; refuse mode already rejected above; off = verbatim) so no
+        // raw secret lands in `entity_aliases`. The canonical_name alias is
+        // masked too for parity with the redact-mode entity title/content.
+        let stored_canonical = crate::secret_screen::redact_for_storage(canonical_name)
+            .unwrap_or_else(|| canonical_name.to_string());
+        stmt.execute(params![entity_id, stored_canonical, now])?;
         for alias in aliases {
             let trimmed = alias.trim();
             if trimmed.is_empty() || trimmed == canonical_name {
                 continue;
             }
-            stmt.execute(params![entity_id, trimmed, now])?;
+            let stored = crate::secret_screen::redact_for_storage(trimmed)
+                .unwrap_or_else(|| trimmed.to_string());
+            stmt.execute(params![entity_id, stored, now])?;
         }
     }
 

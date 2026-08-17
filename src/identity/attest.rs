@@ -113,11 +113,109 @@ pub enum WriteSurface {
 #[must_use]
 pub fn require_agent_attestation_for(surface: WriteSurface) -> bool {
     resolve_require_agent_attestation(
-        std::env::var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION")
-            .ok()
-            .as_deref(),
+        std::env::var(ENV_REQUIRE_AGENT_ATTESTATION).ok().as_deref(),
         surface,
     )
+}
+
+/// Single SSOT literal for the tri-state store-path attestation knob so the
+/// env name is not scattered across sites (pm-v3.1 no-hardcoded-literal).
+pub const ENV_REQUIRE_AGENT_ATTESTATION: &str = "AI_MEMORY_REQUIRE_AGENT_ATTESTATION";
+
+/// True iff `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is set to an explicit
+/// truthy value (`1`/`true`), i.e. attestation is mandated on EVERY write
+/// surface (global-strict), as opposed to the surface-scoped compiled
+/// default (HTTP-direct strict, MCP/CLI permissive).
+///
+/// This distinguishes the global-strict posture from the surface default so
+/// (a) the [`crate::identity::verify::AttestError::AttestationRequired`]
+/// refusal message can name the accurate posture (#3024), and (b) the
+/// memory-creating surfaces that present NO caller signature
+/// (`entity_register` / `reflect` / `consolidate`) can refuse only when the
+/// operator has GLOBALLY mandated attestation (#3014). Those surfaces have
+/// no signature channel, so applying the HTTP-direct surface default would
+/// permanently brick them; they refuse only under this explicit global
+/// mandate and otherwise land `attest_level="claimed"`, exactly like an
+/// unsigned MCP/CLI store.
+#[must_use]
+pub fn global_strict_attestation_enabled() -> bool {
+    matches!(
+        std::env::var(ENV_REQUIRE_AGENT_ATTESTATION).ok().as_deref(),
+        Some(v) if v == "1" || v.eq_ignore_ascii_case("true")
+    )
+}
+
+/// Stable refusal string for a memory-creating surface that presents no
+/// caller signature (`entity_register` / `reflect` / `consolidate`) when
+/// global-strict attestation is engaged. Carries the `ATTESTATION_FAILED`
+/// slug so HTTP handlers can map it to `403` (mirroring the store path).
+pub const ATTESTATION_REFUSED_UNSIGNED_SURFACE: &str = "ATTESTATION_FAILED: agent attestation is required \
+     (AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1) but this surface presents no caller \
+     signature and cannot attest — the write is refused. Set \
+     AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0 (or unset) to restore the permissive \
+     posture, under which the write lands attest_level=\"claimed\".";
+
+/// Cross the attestation posture on a memory-creating surface that presents
+/// NO caller Ed25519 signature (`entity_register` / `reflect` / `consolidate`).
+///
+/// Under global-strict attestation ([`global_strict_attestation_enabled`])
+/// the surface cannot attest, so the write is REFUSED (fail-closed) — closing
+/// the #3014 bypass where these funnels wrote provenance-less durable rows
+/// under a posture that promised attestation. Otherwise `attest_level="claimed"`
+/// is stamped into `metadata` so an attestation census is truthful (#3018),
+/// exactly like an unsigned MCP/CLI store.
+///
+/// `metadata` MUST be the created memory's metadata object; only the
+/// permissive path mutates it. Curator / substrate self-writes never reach
+/// this gate (they go through the SAL `store()` / `for_admin` surface, per
+/// env #48) — callers gate ONLY the tenant-facing surface.
+///
+/// # Errors
+///
+/// Returns [`ATTESTATION_REFUSED_UNSIGNED_SURFACE`] when global-strict
+/// attestation is engaged.
+pub fn gate_unsigned_surface_attestation(
+    metadata: &mut serde_json::Value,
+) -> Result<crate::identity::verify::AttestLevel> {
+    if global_strict_attestation_enabled() {
+        return Err(anyhow::anyhow!("{ATTESTATION_REFUSED_UNSIGNED_SURFACE}"));
+    }
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.insert(
+            crate::models::field_names::ATTEST_LEVEL.to_string(),
+            serde_json::Value::String(AttestLevel::Claimed.as_str().to_string()),
+        );
+    }
+    Ok(AttestLevel::Claimed)
+}
+
+/// Stamp `metadata.attest_level = "claimed"` INSERT-IF-ABSENT — set it ONLY
+/// when the key is UNSET, NEVER overwrite an existing value.
+///
+/// The durable-write funnel for a memory-creating surface that presents no
+/// caller signature (`db::reflect_with_hooks`, #3018 census) uses this so a
+/// reflection created directly AND one created via approve→execute both land
+/// an explicit `attest_level` on the durable row. Insert-if-absent (never
+/// overwrite) is the fail-safe direction: a value already present (e.g. the
+/// SAL reflect gate stamped `claimed` on its clone before the funnel, or a
+/// verified signed write stamped `agent_attested` upstream) is preserved, so
+/// this stamp can never DOWNGRADE `agent_attested`→`claimed` (#3018/#3014).
+///
+/// Because it is insert-if-absent, callers MUST ensure a caller-FORGED
+/// `attest_level` never reaches this funnel (the tenant reflect surfaces do:
+/// `mcp::handle_reflect` scrubs any caller-supplied `attest_level`, and the
+/// SAL `SqliteStore`/`PostgresStore::reflect` gate OVERWRITES it via
+/// [`gate_unsigned_surface_attestation`] before this runs) — reflections are
+/// never cryptographically signed, so their only legitimate level is
+/// `claimed`. A non-object `metadata` is left untouched (write paths always
+/// build an object metadata).
+pub fn stamp_claimed_if_absent(metadata: &mut serde_json::Value) {
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.entry(crate::models::field_names::ATTEST_LEVEL)
+            .or_insert_with(|| {
+                serde_json::Value::String(AttestLevel::Claimed.as_str().to_string())
+            });
+    }
 }
 
 /// I/O-free parse core for [`require_agent_attestation_for`] (#1985).
@@ -432,6 +530,38 @@ mod tests {
     use crate::identity::keypair;
     use crate::identity::sign;
     use crate::models::{MemoryKind, Tier};
+
+    /// #3018 (4) — the durable reflect-funnel stamp fills an UNSET
+    /// `attest_level` with `claimed`, but NEVER overwrites an existing value
+    /// (insert-if-absent). This is the structural downgrade guard: a stamp
+    /// that runs after an upstream `agent_attested` cannot demote it, and the
+    /// fail-closed reject a verified signed write produced is never masked.
+    #[test]
+    fn stamp_claimed_if_absent_fills_only_when_unset_3018() {
+        // Unset → filled with claimed.
+        let mut empty = serde_json::json!({});
+        stamp_claimed_if_absent(&mut empty);
+        assert_eq!(empty["attest_level"].as_str(), Some("claimed"));
+
+        // Already claimed → left claimed (idempotent, no double work).
+        let mut claimed = serde_json::json!({ "attest_level": "claimed" });
+        stamp_claimed_if_absent(&mut claimed);
+        assert_eq!(claimed["attest_level"].as_str(), Some("claimed"));
+
+        // Already agent_attested → NEVER downgraded to claimed.
+        let mut attested = serde_json::json!({ "attest_level": "agent_attested" });
+        stamp_claimed_if_absent(&mut attested);
+        assert_eq!(
+            attested["attest_level"].as_str(),
+            Some("agent_attested"),
+            "insert-if-absent must never downgrade agent_attested -> claimed"
+        );
+
+        // Non-object metadata is left untouched (never panics).
+        let mut arr = serde_json::json!([1, 2, 3]);
+        stamp_claimed_if_absent(&mut arr);
+        assert!(arr.is_array());
+    }
 
     fn make_memory(content: &str) -> Memory {
         Memory {

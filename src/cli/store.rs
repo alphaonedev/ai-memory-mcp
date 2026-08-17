@@ -368,17 +368,20 @@ pub fn run(
         // `claimed` unless the operator forces strict with
         // `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`. `--sign` still upgrades to
         // `agent_attested`; a forged signature is rejected regardless.
-        if args.sign
-            || identity::attest::require_agent_attestation_for(identity::attest::WriteSurface::Cli)
-        {
-            identity::attest::stamp_attestation_sync(
-                &conn,
-                &mut mem,
-                &agent_id,
-                signature.as_deref(),
-                identity::attest::WriteSurface::Cli,
-            )?;
-        }
+        // #3018 — stamp `attest_level` UNCONDITIONALLY (not only when
+        // `--sign`/strict), so the permissive path lands an explicit
+        // `attest_level="claimed"` and an attestation census
+        // (`metadata.attest_level='claimed'`) is truthful. `stamp_attestation_sync`
+        // resolves the require flag internally: permissive unsigned → `claimed`;
+        // global-strict unsigned → refuse; a valid `--sign` signature →
+        // `agent_attested`.
+        identity::attest::stamp_attestation_sync(
+            &conn,
+            &mut mem,
+            &agent_id,
+            signature.as_deref(),
+            identity::attest::WriteSurface::Cli,
+        )?;
         // #1801→#1954 item 2 — sender EMIT: persist the author's detached
         // signature into `metadata.write_signature` so it propagates verbatim
         // across every federation relay hop. Self-authored + non-clobbering.
