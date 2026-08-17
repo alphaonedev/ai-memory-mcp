@@ -46,73 +46,21 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
-// MockCurator — programmable deterministic.
+// #3050 — NO shared mock state. Every test injects its OWN stateless curator
+// (`StatelessTwoAtomCurator`, defined below) through an ISOLATED
+// `AtomiseWiring`, so nothing this suite asserts on can be touched by a
+// concurrent background atomise-worker OS thread (the #2986 worker is NOT
+// covered by `test_serial`). The prior form shared ONE `MockCurator` whose
+// response QUEUE the deferred test's worker drained asynchronously; under
+// llvm-cov that worker was slow enough to (a) steal the synchronous test's
+// freshly-enqueued response (source came back un-atomised, `#3050`) and
+// (b) bump the shared call counter the off test read
+// (`off_mode_skips_atomisation_entirely` false-fail, the CI regression).
+// Removing the shared mutable state entirely is the structural fix.
 // ---------------------------------------------------------------------------
 
-struct MockCurator {
-    state: Arc<Mutex<MockState>>,
-}
-
-struct MockState {
-    responses: Vec<Result<Vec<Atom>, CuratorError>>,
-    calls: usize,
-}
-
-impl Curator for MockCurator {
-    fn decompose(
-        &self,
-        _body: &str,
-        _max_atom_tokens: u32,
-        _max_retries: u32,
-    ) -> Result<Vec<Atom>, CuratorError> {
-        let mut s = self.state.lock().unwrap();
-        s.calls += 1;
-        if s.responses.is_empty() {
-            return Err(CuratorError::MalformedResponse(
-                "mock: response queue exhausted".into(),
-            ));
-        }
-        s.responses.remove(0)
-    }
-}
-
-fn shared_state() -> Arc<Mutex<MockState>> {
-    static SLOT: OnceLock<Arc<Mutex<MockState>>> = OnceLock::new();
-    SLOT.get_or_init(|| {
-        Arc::new(Mutex::new(MockState {
-            responses: Vec::new(),
-            calls: 0,
-        }))
-    })
-    .clone()
-}
-
-fn enqueue_atoms(texts: &[&str]) {
-    let arc = shared_state();
-    let mut s = arc.lock().unwrap();
-    s.responses.push(Ok(texts
-        .iter()
-        .map(|t| Atom {
-            text: (*t).to_string(),
-        })
-        .collect()));
-}
-
-fn reset_mock() {
-    let arc = shared_state();
-    let mut s = arc.lock().unwrap();
-    s.responses.clear();
-    s.calls = 0;
-}
-
-fn mock_call_count() -> usize {
-    let arc = shared_state();
-    let n = arc.lock().unwrap().calls;
-    n
-}
-
 // ---------------------------------------------------------------------------
-// Shared DB path + dispatch slot (process-wide).
+// Shared DB path (process-wide file; every test rotates its namespace + ids).
 // ---------------------------------------------------------------------------
 
 fn local_runs_root() -> PathBuf {
@@ -136,38 +84,25 @@ fn shared_db_path() -> &'static PathBuf {
     })
 }
 
-/// v1.0.0 #2983 — the mock curator is now INJECTED through the explicit
-/// `AtomiseWiring` instead of a process-global `OnceLock` dispatch. The
-/// slot the pre-v1.0.0 form installed had ZERO production callers, so
-/// this suite was the only thing keeping the code path alive at all.
-fn shared_atomiser() -> &'static Arc<Atomiser> {
-    static A: OnceLock<Arc<Atomiser>> = OnceLock::new();
-    A.get_or_init(|| {
-        let curator: Box<dyn Curator> = Box::new(MockCurator {
-            state: shared_state(),
-        });
-        Arc::new(Atomiser::new(
-            curator,
-            None,
-            AtomiserConfig::default(),
-            FeatureTier::Smart,
-        ))
-    })
-}
-
-/// The bounded, single-consumer background worker (#2986).
-fn shared_queue() -> &'static AtomiseQueue {
-    static Q: OnceLock<AtomiseQueue> = OnceLock::new();
-    Q.get_or_init(|| {
-        ai_memory::background::atomise_worker::spawn(Arc::new(|| {
-            Some(Arc::clone(shared_atomiser()))
-        }))
-        .expect("atomise worker spawns")
-    })
-}
-
-fn wiring() -> AtomiseWiring<'static> {
-    AtomiseWiring::new(Some(shared_atomiser()), Some(shared_queue()))
+/// v1.0.0 #2983 / #3050 — build an ISOLATED atomiser over a stateless
+/// per-test curator (`StatelessTwoAtomCurator`). Returns the atomiser plus
+/// its OWN call counter, so a test asserts on state that NO other test — and
+/// no concurrent background atomise-worker — can touch. The pre-#2983 form
+/// injected the mock through a process-global `OnceLock` dispatch whose slot
+/// had ZERO production callers; the pre-#3050 form injected a SHARED mock
+/// whose response queue + call count a background worker raced. Both are
+/// gone: the wiring is now per-test and stateless.
+fn isolated_atomiser() -> (Arc<Atomiser>, Arc<Mutex<usize>>) {
+    let calls = Arc::new(Mutex::new(0usize));
+    let atomiser = Arc::new(Atomiser::new(
+        Box::new(StatelessTwoAtomCurator {
+            calls: Arc::clone(&calls),
+        }),
+        None,
+        AtomiserConfig::default(),
+        FeatureTier::Smart,
+    ));
+    (atomiser, calls)
 }
 
 fn test_serial() -> &'static Mutex<()> {
@@ -245,7 +180,14 @@ fn long_body() -> String {
     unit.repeat(8)
 }
 
-fn store_through_mcp(conn: &Connection, db_path: &std::path::Path, ns: &str) -> Value {
+/// #3050 — every store goes through an EXPLICIT per-test wiring; there is no
+/// shared-wiring default any more (that default was the shared-state race).
+fn store_through_mcp_with(
+    conn: &Connection,
+    db_path: &std::path::Path,
+    ns: &str,
+    wiring: AtomiseWiring<'_>,
+) -> Value {
     let ttl = ResolvedTtl::default();
     ai_memory::mcp::tools::handle_store_with_atomise_for_tests(
         conn,
@@ -262,9 +204,42 @@ fn store_through_mcp(conn: &Connection, db_path: &std::path::Path, ns: &str) -> 
         false,
         None,
         None,
-        wiring(),
+        wiring,
     )
     .expect("memory_store ok")
+}
+
+/// #3050 — a STATELESS deterministic curator: always exactly two atoms,
+/// no response QUEUE. The suite's shared `MockCurator` drains a shared
+/// response queue, which the deferred test's background worker
+/// (`shared_queue`, an OS thread NOT covered by `test_serial`) can pop
+/// concurrently — under llvm-cov instrumentation that worker was slow
+/// enough to steal the synchronous test's freshly-enqueued response,
+/// leaving the source un-atomised (the #3050 flake). A stateless
+/// per-test curator removes the shared mutable state entirely, so the
+/// synchronous observation is deterministic without any timing
+/// assumption.
+struct StatelessTwoAtomCurator {
+    calls: Arc<Mutex<usize>>,
+}
+
+impl Curator for StatelessTwoAtomCurator {
+    fn decompose(
+        &self,
+        _body: &str,
+        _max_atom_tokens: u32,
+        _max_retries: u32,
+    ) -> Result<Vec<Atom>, CuratorError> {
+        *self.calls.lock().unwrap() += 1;
+        Ok(vec![
+            Atom {
+                text: "Canary instance health checks must pass.".to_string(),
+            },
+            Atom {
+                text: "Failures roll back within 30 seconds.".to_string(),
+            },
+        ])
+    }
 }
 
 fn read_atomised_into(conn: &Connection, id: &str) -> Option<i64> {
@@ -294,11 +269,17 @@ fn count_atoms_for_source(conn: &Connection, source_id: &str) -> i64 {
 #[test]
 fn synchronous_mode_archives_source_and_atoms_visible_before_response() {
     let _guard = test_serial().lock().unwrap_or_else(|e| e.into_inner());
-    reset_mock();
-    enqueue_atoms(&[
-        "Canary instance health checks must pass.",
-        "Failures roll back within 30 seconds.",
-    ]);
+
+    // #3050 — ISOLATED wiring: a stateless per-test curator + NO queue.
+    // The synchronous path runs the atomiser fully IN-PROCESS before the
+    // response is built, so with a curator that shares no mutable state
+    // (and no worker queue that any background thread could drain) the
+    // whole observation is deterministic — no timing window for a
+    // concurrent deferred-test worker to race. The prior form injected
+    // the SHARED mock (whose response queue that worker pops), which is
+    // what flaked under llvm-cov.
+    let (atomiser, calls) = isolated_atomiser();
+    let sync_wiring = AtomiseWiring::new(Some(&atomiser), None);
 
     let conn = open_shared_db();
     let ns = format!("sync-ns-{}", uuid::Uuid::new_v4().simple());
@@ -308,31 +289,45 @@ fn synchronous_mode_archives_source_and_atoms_visible_before_response() {
         make_policy(Some(AutoAtomiseMode::Synchronous), false),
     );
 
-    let resp = store_through_mcp(&conn, shared_db_path(), &ns);
+    let resp = store_through_mcp_with(&conn, shared_db_path(), &ns, sync_wiring);
     let source_id = resp["id"].as_str().expect("response id").to_string();
 
-    // Form 2 hard guarantee: source's atomised_into > 0 BEFORE the
-    // response handler returned to us.
+    // The DETERMINISTIC completion signal: `handle_store` sets
+    // `atomise_outcome = "atomised"` ONLY after the synchronous
+    // `atomise_sync_with_retries` returned `Ok` in-process. Asserting on
+    // the RESPONSE (never a post-return read that assumes the sync work
+    // has finished) is the load-bearing #3050 fix — Form 2's
+    // atoms-before-the-response guarantee is proven by the envelope the
+    // handler itself emitted, not by a race against it.
+    assert_eq!(
+        resp["atomise_mode"].as_str(),
+        Some("synchronous"),
+        "response must report the synchronous mode; got {resp}",
+    );
+    assert_eq!(
+        resp["atomise_outcome"].as_str(),
+        Some("atomised"),
+        "synchronous atomise must have COMPLETED before the response returned; got {resp}",
+    );
+    // The completion signal above proves exactly one in-process curator
+    // call landed; the isolated curator makes that count race-free.
+    assert_eq!(
+        *calls.lock().unwrap(),
+        1,
+        "synchronous mode: exactly one in-process curator call",
+    );
+
+    // With the completion signal asserted, the durable side effects are
+    // guaranteed to have landed (the atomiser archives + writes atoms in
+    // the SAME synchronous call that returned Ok). These reads no longer
+    // race the sync path — they confirm the atoms the envelope promised.
     let atomised_into = read_atomised_into(&conn, &source_id);
     assert!(
         atomised_into.is_some_and(|n| n > 0),
-        "source must be archived with atomised_into > 0 synchronously, got: {atomised_into:?}",
+        "source archived with atomised_into > 0 (synchronous); got: {atomised_into:?}",
     );
-
-    // Atoms exist with atom_of pointing at the source.
     let atom_count = count_atoms_for_source(&conn, &source_id);
-    assert_eq!(atom_count, 2, "two atoms emitted by mock curator");
-
-    // The response carries the synchronous-mode marker.
-    assert_eq!(resp["atomise_mode"].as_str(), Some("synchronous"));
-    assert_eq!(resp["atomise_outcome"].as_str(), Some("atomised"));
-
-    // Curator was called exactly once (synchronous, no deferred replay).
-    assert_eq!(
-        mock_call_count(),
-        1,
-        "synchronous mode: exactly one curator call"
-    );
+    assert_eq!(atom_count, 2, "two atoms emitted by the stateless curator");
 }
 
 // ---------------------------------------------------------------------------
@@ -344,13 +339,20 @@ fn synchronous_mode_archives_source_and_atoms_visible_before_response() {
 #[test]
 fn deferred_mode_preserves_existing_behaviour() {
     let _guard = test_serial().lock().unwrap_or_else(|e| e.into_inner());
-    reset_mock();
-    // Don't enqueue atoms: the deferred path consumes the queue async;
-    // for this test we only need to verify the SYNC side-effect path
-    // did NOT fire. Pushing an empty Ok will let the worker thread
-    // succeed in the background without affecting the synchronous
-    // observation.
-    enqueue_atoms(&["a1", "a2"]);
+
+    // #3050 — ISOLATED wiring: a per-test atomiser + a per-test bounded
+    // worker whose provider yields THAT atomiser. Its curator state and
+    // its background OS thread belong to this test alone, so no other
+    // test's assertions can be perturbed by this worker's async drain
+    // (the exact cross-test coupling that false-failed the off test), and
+    // this test's own observations cannot be perturbed by anyone else's.
+    let (atomiser, calls) = isolated_atomiser();
+    let provider_atomiser = Arc::clone(&atomiser);
+    let queue: AtomiseQueue = ai_memory::background::atomise_worker::spawn(Arc::new(move || {
+        Some(Arc::clone(&provider_atomiser))
+    }))
+    .expect("atomise worker spawns");
+    let deferred_wiring = AtomiseWiring::new(Some(&atomiser), Some(&queue));
 
     let conn = open_shared_db();
     let ns = format!("deferred-ns-{}", uuid::Uuid::new_v4().simple());
@@ -363,7 +365,7 @@ fn deferred_mode_preserves_existing_behaviour() {
         make_policy(Some(AutoAtomiseMode::Deferred), false),
     );
 
-    let resp = store_through_mcp(&conn, shared_db_path(), &ns);
+    let resp = store_through_mcp_with(&conn, shared_db_path(), &ns, deferred_wiring);
     let source_id = resp["id"].as_str().expect("response id").to_string();
 
     // Form 2 deferred-mode contract: source's atomised_into is NULL at
@@ -385,6 +387,31 @@ fn deferred_mode_preserves_existing_behaviour() {
         resp.get("atomise_mode_configured").is_none(),
         "deferred-configured + deferred-ran must NOT report a divergence"
     );
+
+    // The deferred guarantee is EVENTUAL, not immediate — the bounded
+    // worker (this test's own) lands the atoms out-of-band. Poll the
+    // isolated curator's own counter + the source rows; both are race-free
+    // because nothing else drives this atomiser. Dropping `queue` after the
+    // assertion lets the worker thread exit cleanly (its only sender gone).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut atoms = 0i64;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        atoms = count_atoms_for_source(&conn, &source_id);
+        if atoms >= 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        atoms, 2,
+        "deferred mode: the bounded worker must land the two atoms out-of-band",
+    );
+    assert_eq!(
+        *calls.lock().unwrap(),
+        1,
+        "deferred mode: exactly one curator call, on the worker thread",
+    );
+    drop(queue);
 }
 
 // ---------------------------------------------------------------------------
@@ -394,17 +421,46 @@ fn deferred_mode_preserves_existing_behaviour() {
 #[test]
 fn off_mode_skips_atomisation_entirely() {
     let _guard = test_serial().lock().unwrap_or_else(|e| e.into_inner());
-    reset_mock();
-    let calls_before = mock_call_count();
+
+    // #3050 — ISOLATED wiring with a per-test call counter. Off mode is
+    // resolved BEFORE the atomiser is ever consulted, so the load-bearing
+    // "curator must not be called" assertion reads THIS test's own counter
+    // (which nothing else can bump), not a process-global one a concurrent
+    // deferred-test worker was racing — the exact false-fail CI surfaced.
+    // A queue is wired so a spurious enqueue would be observable, but the
+    // Off path never reaches it.
+    let (atomiser, calls) = isolated_atomiser();
+    let provider_atomiser = Arc::clone(&atomiser);
+    let queue: AtomiseQueue = ai_memory::background::atomise_worker::spawn(Arc::new(move || {
+        Some(Arc::clone(&provider_atomiser))
+    }))
+    .expect("atomise worker spawns");
+    let off_wiring = AtomiseWiring::new(Some(&atomiser), Some(&queue));
 
     let conn = open_shared_db();
     let ns = format!("off-ns-{}", uuid::Uuid::new_v4().simple());
     seed_policy(&conn, &ns, make_policy(Some(AutoAtomiseMode::Off), false));
 
-    let resp = store_through_mcp(&conn, shared_db_path(), &ns);
+    let resp = store_through_mcp_with(&conn, shared_db_path(), &ns, off_wiring);
     let source_id = resp["id"].as_str().expect("response id").to_string();
 
-    // Source is NOT archived — atomised_into stays NULL.
+    // #2987 — `off` is a mode too, and it is reported honestly. Asserting
+    // on the ENVELOPE first proves nothing ran, deterministically.
+    assert_eq!(resp["atomise_mode"].as_str(), Some("off"));
+    assert_eq!(
+        resp["atomise_outcome"].as_str(),
+        Some("skipped_policy_disabled")
+    );
+
+    // The curator was NEVER called — read this test's OWN counter (was a
+    // shared process-global before #3050, which a background worker raced).
+    assert_eq!(
+        *calls.lock().unwrap(),
+        0,
+        "Off mode: curator must not be called",
+    );
+
+    // Source is NOT archived — atomised_into stays NULL, zero atoms.
     let atomised_into = read_atomised_into(&conn, &source_id);
     assert!(
         atomised_into.is_none(),
@@ -412,18 +468,5 @@ fn off_mode_skips_atomisation_entirely() {
     );
     let atom_count = count_atoms_for_source(&conn, &source_id);
     assert_eq!(atom_count, 0, "Off mode: zero atoms");
-
-    // No curator call landed synchronously.
-    assert_eq!(
-        mock_call_count(),
-        calls_before,
-        "Off mode: curator must not be called",
-    );
-
-    // #2987 — `off` is a mode too, and it is reported honestly.
-    assert_eq!(resp["atomise_mode"].as_str(), Some("off"));
-    assert_eq!(
-        resp["atomise_outcome"].as_str(),
-        Some("skipped_policy_disabled")
-    );
+    drop(queue);
 }
