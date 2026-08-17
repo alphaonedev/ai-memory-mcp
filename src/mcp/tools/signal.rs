@@ -539,8 +539,15 @@ pub struct SignalSendRequest {
     #[serde(default)]
     pub reference_ids: Value,
 
-    /// #3011 — optional retention TTL in seconds. When set, the signal is
-    /// marked expiring at `now + ttl_secs` and the gc pruner reaps it once past.
+    // #3011 — wire `signals.expires_at`. The doc comment must NOT be a `///`
+    // one: schemars turns a `#`-leading doc line into a JSON-Schema `title`
+    // (not a `description`), and the wire trimmer strips `description` but not
+    // property `title`, so a `///` here would leak a truncated fragment onto
+    // the public tools/list surface. Use `#[schemars(description = ...)]` so a
+    // clean description is emitted and then trimmed off the bare wire.
+    #[schemars(description = "Optional retention TTL in seconds. When set, the \
+                             signal expires at now + ttl_secs and the gc pruner \
+                             reaps it once past.")]
     #[serde(default)]
     pub ttl_secs: Option<i64>,
 }

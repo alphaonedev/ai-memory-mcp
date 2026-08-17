@@ -1610,8 +1610,13 @@ mod d1_6_987_tests {
             // #2258 deliberately extends only memory_store's write schema. Keep the
             // historical snapshot immutable and pin that narrow additive exception;
             // every removal and every other tool/property addition remains forbidden.
+            // #3011 additionally extends memory_signal_send with an optional
+            // `ttl_secs` input (wiring `signals.expires_at`) — a second narrow
+            // additive exception on the same immutable historical snapshot.
             let expected_added: BTreeSet<&str> = if name == "memory_store" {
                 ["valid_from", "valid_until"].into_iter().collect()
+            } else if name == "memory_signal_send" {
+                ["ttl_secs"].into_iter().collect()
             } else {
                 BTreeSet::new()
             };

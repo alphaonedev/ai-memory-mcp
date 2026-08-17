@@ -1101,6 +1101,13 @@
               "string",
               "null"
             ]
+          },
+          "ttl_secs": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
