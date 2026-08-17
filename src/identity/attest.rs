@@ -189,6 +189,35 @@ pub fn gate_unsigned_surface_attestation(
     Ok(AttestLevel::Claimed)
 }
 
+/// Stamp `metadata.attest_level = "claimed"` INSERT-IF-ABSENT — set it ONLY
+/// when the key is UNSET, NEVER overwrite an existing value.
+///
+/// The durable-write funnel for a memory-creating surface that presents no
+/// caller signature (`db::reflect_with_hooks`, #3018 census) uses this so a
+/// reflection created directly AND one created via approve→execute both land
+/// an explicit `attest_level` on the durable row. Insert-if-absent (never
+/// overwrite) is the fail-safe direction: a value already present (e.g. the
+/// SAL reflect gate stamped `claimed` on its clone before the funnel, or a
+/// verified signed write stamped `agent_attested` upstream) is preserved, so
+/// this stamp can never DOWNGRADE `agent_attested`→`claimed` (#3018/#3014).
+///
+/// Because it is insert-if-absent, callers MUST ensure a caller-FORGED
+/// `attest_level` never reaches this funnel (the tenant reflect surfaces do:
+/// `mcp::handle_reflect` scrubs any caller-supplied `attest_level`, and the
+/// SAL `SqliteStore`/`PostgresStore::reflect` gate OVERWRITES it via
+/// [`gate_unsigned_surface_attestation`] before this runs) — reflections are
+/// never cryptographically signed, so their only legitimate level is
+/// `claimed`. A non-object `metadata` is left untouched (write paths always
+/// build an object metadata).
+pub fn stamp_claimed_if_absent(metadata: &mut serde_json::Value) {
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.entry(crate::models::field_names::ATTEST_LEVEL)
+            .or_insert_with(|| {
+                serde_json::Value::String(AttestLevel::Claimed.as_str().to_string())
+            });
+    }
+}
+
 /// I/O-free parse core for [`require_agent_attestation_for`] (#1985).
 ///
 /// Explicit falsy (`0`/`false`, case-insensitive) → permissive on every
@@ -501,6 +530,38 @@ mod tests {
     use crate::identity::keypair;
     use crate::identity::sign;
     use crate::models::{MemoryKind, Tier};
+
+    /// #3018 (4) — the durable reflect-funnel stamp fills an UNSET
+    /// `attest_level` with `claimed`, but NEVER overwrites an existing value
+    /// (insert-if-absent). This is the structural downgrade guard: a stamp
+    /// that runs after an upstream `agent_attested` cannot demote it, and the
+    /// fail-closed reject a verified signed write produced is never masked.
+    #[test]
+    fn stamp_claimed_if_absent_fills_only_when_unset_3018() {
+        // Unset → filled with claimed.
+        let mut empty = serde_json::json!({});
+        stamp_claimed_if_absent(&mut empty);
+        assert_eq!(empty["attest_level"].as_str(), Some("claimed"));
+
+        // Already claimed → left claimed (idempotent, no double work).
+        let mut claimed = serde_json::json!({ "attest_level": "claimed" });
+        stamp_claimed_if_absent(&mut claimed);
+        assert_eq!(claimed["attest_level"].as_str(), Some("claimed"));
+
+        // Already agent_attested → NEVER downgraded to claimed.
+        let mut attested = serde_json::json!({ "attest_level": "agent_attested" });
+        stamp_claimed_if_absent(&mut attested);
+        assert_eq!(
+            attested["attest_level"].as_str(),
+            Some("agent_attested"),
+            "insert-if-absent must never downgrade agent_attested -> claimed"
+        );
+
+        // Non-object metadata is left untouched (never panics).
+        let mut arr = serde_json::json!([1, 2, 3]);
+        stamp_claimed_if_absent(&mut arr);
+        assert!(arr.is_array());
+    }
 
     fn make_memory(content: &str) -> Memory {
         Memory {

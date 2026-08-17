@@ -148,6 +148,97 @@ async fn post_memory(router: &axum::Router, agent_id: &str, body: Value) -> (Sta
     (status, parsed)
 }
 
+async fn put_update(
+    router: &axum::Router,
+    agent_id: &str,
+    id: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/v1/memories/{id}"))
+        .header("content-type", "application/json")
+        .header("x-agent-id", agent_id)
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, parsed)
+}
+
+/// #3015/#3018 (5) — a signed write lands `agent_attested`, and a SUBSEQUENT
+/// `memory_update` (whole-object metadata REPLACE that does not re-supply
+/// `attest_level`) MUST NOT silently DOWNGRADE it to `claimed`. The guard is
+/// `identity::preserve_update_provenance_keys` (#3015 `UPDATE_PRESERVED_ATTESTATION_KEYS`),
+/// wired into the HTTP `PUT /memories/{id}` funnel — the minimal correct fix
+/// is the update-funnel GUARD, NOT adding `attest_level` to
+/// `IMMUTABLE_PROVENANCE_KEYS` (that would break the store/dedup path's
+/// intended signed re-store upgrade `claimed`→`agent_attested`).
+#[tokio::test]
+async fn http_metadata_update_does_not_downgrade_agent_attested_3015() {
+    let (router, _f, db_path) = build_test_router();
+    let kp = ai_memory::identity::keypair::generate("ai:carol").expect("keypair");
+    provision_agent(&db_path, "ai:carol", &kp.public_base64());
+
+    let title = "downgrade-guard";
+    let content = "Body prose for the attestation-downgrade regression, sufficiently long.";
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let sig_b64 = sign_envelope(&kp, "ai:carol", "attest-it", title, content, &created_at);
+
+    let (status, resp) = post_memory(
+        &router,
+        "ai:carol",
+        json!({
+            "title": title,
+            "content": content,
+            "namespace": "attest-it",
+            "tier": "mid",
+            "signature": sig_b64,
+            "created_at": created_at,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "signed store must 201; got {resp}"
+    );
+    let id = resp["id"].as_str().expect("id in response").to_string();
+
+    // A metadata-only update that does NOT re-supply attest_level.
+    let (ustatus, uresp) = put_update(
+        &router,
+        "ai:carol",
+        &id,
+        json!({ "metadata": { "note": "operator annotation" } }),
+    )
+    .await;
+    assert_eq!(
+        ustatus,
+        StatusCode::OK,
+        "metadata update must 200; got {uresp}"
+    );
+
+    let conn = ai_memory::db::open(&db_path).expect("reopen for read");
+    let stored = ai_memory::db::get(&conn, &id).expect("get").expect("row");
+    assert_eq!(
+        stored.metadata["attest_level"].as_str(),
+        Some("agent_attested"),
+        "a subsequent metadata update must NOT downgrade agent_attested->claimed \
+         (preserve_update_provenance_keys, #3015); full metadata = {}",
+        stored.metadata
+    );
+    assert_eq!(
+        stored.metadata.get("note").and_then(Value::as_str),
+        Some("operator annotation"),
+        "the caller's new metadata key must still land"
+    );
+}
+
 #[tokio::test]
 async fn http_signed_store_stamps_agent_attested_and_adopts_created_at() {
     let (router, _f, db_path) = build_test_router();

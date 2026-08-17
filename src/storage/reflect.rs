@@ -526,7 +526,20 @@ pub fn reflect_with_hooks(
             reflection_meta,
         );
     }
-    let metadata_value = serde_json::Value::Object(metadata);
+    let mut metadata_value = serde_json::Value::Object(metadata);
+    // #3018 census — stamp `attest_level="claimed"` at the durable reflect
+    // WRITE funnel (INSERT-IF-ABSENT). This is the SHARED chokepoint the
+    // direct MCP `db::reflect` AND the approve→execute
+    // `execute_reflect_from_payload` (src/storage/mod.rs) path both cross, so a
+    // reflection created directly AND one created via approve→execute both
+    // land `attest_level` on the durable row — closing the census hole a
+    // gated (pending-approval) reflection would otherwise re-open now that the
+    // stamp is kept OUT of the pending payload (#1176 caller-intent purity).
+    // A reflection is never cryptographically signed, so `claimed` is its
+    // only legitimate level; insert-if-absent (never overwrite) preserves an
+    // upstream `claimed` (the SAL reflect gate already stamped it on its
+    // clone) and structurally cannot downgrade an `agent_attested` value.
+    crate::identity::attest::stamp_claimed_if_absent(&mut metadata_value);
     // Re-validate the merged metadata so an oversized splice surfaces
     // here (vs. a confusing DB constraint error later).
     validate::validate_metadata(&metadata_value)
