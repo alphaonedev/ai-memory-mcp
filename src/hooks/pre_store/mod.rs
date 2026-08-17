@@ -19,7 +19,8 @@ pub mod auto_atomise;
 pub mod auto_classify_kind;
 
 pub use auto_atomise::{
-    AUTO_ATOMISE_DISPATCH, AutoAtomisationDispatch, AutoAtomisationOutcome,
-    install_auto_atomise_dispatch, maybe_enqueue_auto_atomise, run_synchronous_auto_atomise,
+    AtomiseDisposition, AtomiseWiring, AutoAtomisationOutcome, OwnedAtomiseWiring,
+    maybe_enqueue_auto_atomise, namespaces_requesting_auto_atomise, run_auto_atomise,
+    run_deferred_atomise, run_synchronous_auto_atomise,
 };
 pub use auto_classify_kind::{classify_by_regex, maybe_auto_classify};

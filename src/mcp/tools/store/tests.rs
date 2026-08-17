@@ -18,6 +18,47 @@ use crate::hnsw::VectorIndex;
 use crate::models::{ConfidenceSource, Tier};
 use crate::storage as db;
 
+/// v1.0.0 #2983 — shim that supplies the DEFAULT (empty) atomisation
+/// wiring to the 79 legacy call sites below. Shadowing `super::*`'s
+/// `handle_store` keeps this file's subject matter (parse / conflict /
+/// governance / envelope) unchanged while the atomisation-specific
+/// behaviour is asserted with an INJECTED curator by the dedicated
+/// suites (`src/hooks/pre_store/auto_atomise.rs::tests`,
+/// `tests/form_2_synchronous_atomise.rs`, `tests/auto_atomise/`).
+///
+/// Empty wiring is the honest default here: none of these fixtures opts
+/// a namespace into `auto_atomise`, so every one of them takes the
+/// `Off` → `skipped_policy_disabled` branch.
+#[allow(clippy::too_many_arguments)]
+fn handle_store(
+    conn: &rusqlite::Connection,
+    db_path: &std::path::Path,
+    params: &Value,
+    embedder: Option<&dyn crate::embeddings::Embed>,
+    llm: Option<&crate::llm::OllamaClient>,
+    vector_index: Option<&dyn crate::hnsw::VectorSearchIndex>,
+    resolved_ttl: &ResolvedTtl,
+    autonomous_hooks: bool,
+    mcp_client: Option<&str>,
+    federation_forward_url: Option<&str>,
+    active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
+) -> Result<Value, String> {
+    super::handle_store(
+        conn,
+        db_path,
+        params,
+        embedder,
+        llm,
+        vector_index,
+        resolved_ttl,
+        autonomous_hooks,
+        mcp_client,
+        federation_forward_url,
+        active_keypair,
+        crate::hooks::pre_store::AtomiseWiring::default(),
+    )
+}
+
 fn fresh_conn() -> rusqlite::Connection {
     // #1751 — pin the lib-test binary to the explicit permissive
     // attestation opt-out (`AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`) so

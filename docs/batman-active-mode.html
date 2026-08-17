@@ -272,8 +272,13 @@ footer a{color:var(--text-muted)}
         <tr>
           <td class="form-id">Form 2</td>
           <td>Synchronous atomise-before-embed (source decomposed into atoms BEFORE embedding)</td>
-          <td class="verdict active">ACTIVE</td>
-          <td>On by default in MCP write path</td>
+          <td class="verdict opt-in">OPT-IN</td>
+          <td>Per-namespace <code>auto_atomise</code> + <code>auto_atomise_mode</code> standard, AND a wired curator
+            (<code>LlmCurator</code> is the only production implementation — a loopback Ollama satisfies the certified
+            loopback-only egress posture). At v1.0.0 <em>atoms-before-the-response</em> is an MCP-stdio + sqlite
+            property: the HTTP create funnel always runs DEFERRED and says so
+            (<code>atomise_mode_reason: "deferred_on_http"</code>), and a postgres-backed daemon reports
+            <code>skipped_backend_unsupported</code>. See #2983-#2987.</td>
         </tr>
         <tr>
           <td class="form-id">Form 3</td>

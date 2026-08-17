@@ -76,6 +76,7 @@ fn build_state() -> (AppState, NamedTempFile) {
         ),
         autonomous_hooks: false,
         auto_tag_queue: None,
+        atomise_queue: None,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(vec![ADMIN_ID.to_string()]),

@@ -668,6 +668,7 @@ fn run_local(db_path: &Path) -> Report {
     sections.push(section_webhook(&conn));
     sections.push(section_capabilities_local());
     sections.push(section_reflection_health(&conn));
+    sections.push(section_atomisation_curator_2985(&conn));
     sections.push(section_llm_reachability_1146());
     sections.push(section_embeddings_reachability_1598());
 
@@ -1825,6 +1826,94 @@ fn section_reflection_health(conn: &rusqlite::Connection) -> ReportSection {
     }
 }
 
+/// v1.0.0 #2985 — the Batman auto-atomisation curator readiness section.
+///
+/// `LlmCurator` is the ONLY production `Curator` impl, so a daemon with
+/// no `[llm]` backend (or with `AI_MEMORY_INFERENCE_EGRESS` refusing the
+/// resolved target) structurally CANNOT atomise — and until v1.0.0 no
+/// surface said so: `auto_atomise: true` on a namespace standard was a
+/// dead knob that reported nothing. This section names the condition on
+/// demand; the boot path emits the same diagnosis as a WARN, and the
+/// write path reports the distinct `skipped_no_curator` outcome token.
+///
+/// The unanimous half of the Q3 verdict is what this section replaces: a
+/// deterministic splitter must NEVER be a silent fallback, because
+/// `atomise_sync` ARCHIVES the parent (`atomised_into`, and
+/// `AlreadyAtomised` makes the first split the last), so a heuristic
+/// substitute is the unintentional-data-loss class. Visibility is the
+/// remedy, not a fallback.
+///
+/// Deliberately NOT a check in `src/enterprise_federation_posture.rs`:
+/// `ENTERPRISE_FEDERATION_CHECK_COUNT = 18` is pinned, and a FAIL-capable
+/// addition there would flip certified deployments to exit 2 — an
+/// unintended re-cert event.
+fn section_atomisation_curator_2985(conn: &rusqlite::Connection) -> ReportSection {
+    let mut facts = Vec::new();
+    let mut severity = Severity::Info;
+    let mut note: Option<String> = None;
+
+    let requesting = crate::hooks::pre_store::namespaces_requesting_auto_atomise(conn);
+    facts.push((
+        "namespaces_requesting_auto_atomise".into(),
+        requesting.len().to_string(),
+    ));
+    if !requesting.is_empty() {
+        facts.push(("auto_atomise_namespaces".into(), requesting.join(", ")));
+    }
+
+    // Resolve the SAME `[llm]` ladder every production curator build site
+    // consumes, so this section cannot disagree with what the daemon does.
+    let app_config = crate::config::AppConfig::load();
+    let resolved = app_config.resolve_llm(None, None, None);
+    let curator_backend = resolved.backend.clone();
+    let curator_model = resolved.model.clone();
+    // A curator exists only when the resolved client would actually be
+    // constructed: an LLM must be configured AND the #1963 inference-egress
+    // gate must permit the resolved target.
+    let egress = crate::egress::evaluate_inference_egress(
+        crate::egress::resolve_inference_egress_mode(),
+        crate::egress::EgressClass::InferenceLlm,
+        &resolved.base_url,
+    );
+    let curator_available = !curator_model.trim().is_empty() && !egress.is_refused();
+
+    facts.push(("curator_impl".into(), "LlmCurator".into()));
+    facts.push(("llm_backend".into(), curator_backend));
+    facts.push(("llm_model".into(), curator_model));
+    facts.push(("curator_available".into(), curator_available.to_string()));
+    if let crate::egress::EgressDecision::Refuse { reason, .. } = &egress {
+        facts.push(("inference_egress".into(), reason.clone()));
+    }
+
+    if !requesting.is_empty() && !curator_available {
+        severity = severity_max(severity, Severity::Warning);
+        note = Some(format!(
+            "{} namespace standard(s) request auto_atomise but this daemon has NO curator — \
+             Batman atomisation CANNOT run and those writes land whole with \
+             atomise_outcome=skipped_no_curator. auto_atomise REQUIRES a wired curator; a \
+             loopback Ollama satisfies the certified loopback-only egress posture \
+             (AI_MEMORY_INFERENCE_EGRESS=loopback-only). Either wire an [llm] backend or \
+             clear auto_atomise on those standards.",
+            requesting.len()
+        ));
+    } else if !requesting.is_empty() {
+        note = Some(
+            "auto_atomise is opted in and a curator is wired. Form-2 \
+             atoms-before-the-response is an MCP-stdio + sqlite property at v1.0.0; the HTTP \
+             create funnel always runs DEFERRED (bounded worker), and a postgres-backed \
+             daemon reports skipped_backend_unsupported."
+                .to_string(),
+        );
+    }
+
+    ReportSection {
+        name: "Atomisation Curator".into(),
+        severity,
+        facts,
+        note,
+    }
+}
+
 /// Return the higher-severity value of `a` and `b`.
 /// Defined pub(super) so the reflection-health helpers in this module
 /// can share the ordering logic without duplicating the `rank` table.
@@ -2251,8 +2340,9 @@ mod tests {
         // "Embeddings Reachability (#1598)"; #1964 added
         // "Recall Index Coverage (#1964)"; #1965 added
         // "Corpus Lifecycle (#1965)"; #2167 added
-        // "Embedding Space Census (#2167)" — total is now 13.
-        assert_eq!(report.sections.len(), 13);
+        // "Embedding Space Census (#2167)"; #2985 added
+        // "Atomisation Curator" — total is now 14.
+        assert_eq!(report.sections.len(), 14);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
@@ -2268,6 +2358,7 @@ mod tests {
                 "Webhook",
                 "Capabilities",
                 "Reflection Health",
+                "Atomisation Curator",
                 "LLM Reachability (#1146)",
                 "Embeddings Reachability (#1598)",
             ]

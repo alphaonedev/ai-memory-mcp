@@ -6286,6 +6286,9 @@ pub async fn bootstrap_serve(
         // its `auto_tag_queue` field being `None` at spawn time is
         // irrelevant).
         auto_tag_queue: None,
+        // #2984/#2986 — placeholder; the real handle is wired below (and
+        // only on a SQLITE-backed daemon — see the spawn site).
+        atomise_queue: None,
         // v0.7.0 (issue #518) — resolved recall_scope defaults from
         // `[agents.defaults.recall_scope]`. None preserves v0.6.x
         // recall semantics (no splice on session_default=true).
@@ -6349,6 +6352,37 @@ pub async fn bootstrap_serve(
         crate::background::auto_tag_worker::spawn(app_state.clone());
     app_state.auto_tag_queue = Some(auto_tag_tx);
     task_handles.push(auto_tag_handle);
+
+    // #2984/#2986 — spawn the bounded, SINGLE-CONSUMER auto-atomise
+    // worker. SQLITE ONLY: the atomiser is `rusqlite::Connection`-bound,
+    // so a postgres-backed daemon deliberately leaves the handle `None`
+    // and the enqueue site reports `skipped_backend_unsupported` rather
+    // than ever falling through to a sqlite handle (atoms landing in a
+    // different store than their source is mixed-state corruption).
+    //
+    // The provider closure resolves the atomiser at DRAIN time from the
+    // live `SwappableLlm`, so an `[llm]` / egress reload between enqueue
+    // and drain is honoured — a boot-pinned client would keep egressing
+    // to a revoked vendor and sign `atomisation_complete` payloads naming
+    // a model that never ran (#2172). It deliberately captures ONLY the
+    // swappable handle + tier + keypair, never `app_state`: capturing the
+    // state would keep the queue's own `SyncSender` alive and the worker
+    // thread would never exit at shutdown.
+    if matches!(
+        app_state.storage_backend,
+        crate::handlers::StorageBackend::Sqlite
+    ) {
+        let provider_llm = Arc::clone(&app_state.llm);
+        let provider_tier = Arc::clone(&app_state.tier_config);
+        let provider_keypair = Arc::clone(&app_state.active_keypair);
+        app_state.atomise_queue = crate::background::atomise_worker::spawn(Arc::new(move || {
+            crate::atomisation::build_atomiser_from_swappable(
+                &provider_llm,
+                provider_tier.tier,
+                provider_keypair.as_ref().as_ref(),
+            )
+        }));
+    }
 
     // Automatic GC. Cluster G (#767) — pass through the operator-
     // tunable `[confidence] shadow_retention_days` so the periodic
@@ -8527,6 +8561,7 @@ mod tests {
             federation_nonce_cache: Arc::new(crate::identity::replay::FederationNonceCache::new()),
             autonomous_hooks: false,
             auto_tag_queue: None,
+            atomise_queue: None,
             recall_scope: Arc::new(None),
             deferred_audit_queue: Arc::new(None),
             admin_agent_ids: Arc::new(Vec::new()),

@@ -30,12 +30,52 @@ agent-EXTERNAL actions at write time). The forms:
 | Form | What it does | Activation gate |
 |---|---|---|
 | 1 — Online dedup-and-synthesis | One batch action-emitting LLM call BEFORE write (add/update/delete/no-op verbs). | **Always on** in MCP write path (autonomous tier) |
-| 2 — Synchronous atomise-before-embed | Source is decomposed into atoms BEFORE embedding so atoms get vectors. | **Schema always on; behavior gated on `GovernancePolicy.auto_atomise = true` + `auto_atomise_mode = "synchronous"` in a namespace standard memory** |
+| 2 — Synchronous atomise-before-embed | Source is decomposed into atoms BEFORE embedding so atoms get vectors. | **Schema always on; behavior gated on `GovernancePolicy.auto_atomise = true` + `auto_atomise_mode = "synchronous"` in a namespace standard memory, AND on a wired curator — see the note below** |
 | 3 — Multi-step ingest orchestrator | Prompt-cache reuse + explicit-trust deterministic-then-LLM helpers. | **Always available** as `memory_ingest_multistep` MCP tool (`Family::Power`+) |
 | 4 — Fact-provenance | `citations` + `source_uri` + `source_span` (atom-grain span) columns. | **Always on** in store schema (sqlite v38+) |
 | 5 — Confidence + shadow-mode + freshness decay | Auto-confidence calibration; shadow-mode side-by-side scoring; exponential freshness decay on recall. | **Three process-level env vars** on the MCP server + curator daemon: `AI_MEMORY_AUTO_CONFIDENCE=1`, `AI_MEMORY_CONFIDENCE_SHADOW=1`, `AI_MEMORY_CONFIDENCE_DECAY=1` |
 | 6 — MemoryKind vocabulary | 10-variant enum: `Observation` / `Reflection` / `Persona` / `Concept` / `Entity` / `Claim` / `Relation` / `Event` / `Conversation` / `Decision`. | Vocabulary always in schema (`memories.memory_kind`); **auto-classify gated on `GovernancePolicy.auto_classify_kind = "regex_then_llm"` (or `regex_only`) in a namespace standard memory** |
 | 7 — Substrate-authority at write | `check_agent_action` consulted at substrate-internal write paths AND at the four agent-EXTERNAL daemon wire-points (skill emission, federation POST, hook subprocess spawn, LLM HTTP) via `wire_check::check` — shipped v0.7.0 (#760). | **Operator key + R001–R004 signed + enabled**; the agent-EXTERNAL hook is armed only under the `serve`/curator daemon |
+
+### What Form 2 actually requires (v1.0.0, #2983-#2987)
+
+Three things are load-bearing, and two of them were undocumented until
+v1.0.0:
+
+1. **A wired curator.** `LlmCurator` is the ONLY production `Curator`
+   implementation, so `auto_atomise: true` on a daemon with no `[llm]`
+   backend — or with `AI_MEMORY_INFERENCE_EGRESS` refusing the resolved
+   target — is a **dead knob**: the write lands whole and reports
+   `atomise_outcome: "skipped_no_curator"`. **auto_atomise REQUIRES a
+   wired curator.** A **loopback Ollama satisfies the certified
+   loopback-only egress posture** (`AI_MEMORY_INFERENCE_EGRESS=loopback-only`),
+   so the certified deployment shape can run Form 2 without any external
+   vendor egress. `ai-memory doctor` carries an **Atomisation Curator**
+   section that names this condition, and the daemon WARNs at boot.
+   There is deliberately **no deterministic splitter fallback**:
+   atomisation ARCHIVES the parent, so a heuristic substitute would be
+   an unintentional-data-loss path.
+
+2. **The right surface.** At v1.0.0, Form 2's *atoms-before-the-response*
+   guarantee is an **MCP-stdio + sqlite** property. The HTTP
+   `POST /api/v1/memories` funnel always runs **DEFERRED** — even for a
+   `synchronous`-configured namespace — because a synchronous curator
+   round trip there would hold the daemon's single sqlite handle and an
+   admission-control permit for the whole LLM call. The response says so
+   honestly: `atomise_mode: "deferred"`,
+   `atomise_mode_configured: "synchronous"`,
+   `atomise_mode_reason: "deferred_on_http"`.
+
+3. **A sqlite backend.** The atomiser is `rusqlite::Connection`-bound.
+   A postgres-backed daemon reports
+   `atomise_outcome: "skipped_backend_unsupported"` and NEVER falls
+   through to a sqlite handle — atoms landing in a different store than
+   their source would be mixed-state corruption.
+
+The `deferred` mode routes through a **bounded, single-consumer
+background worker**. A full queue drops the job with a counted WARN and
+an honest `atomise_outcome: "skipped_queue_full"` — a DEGRADE (no atoms
+for that write; `memory_atomise` recovers it), never a write failure.
 
 Forms 1, 3, 4 are on by default in the MCP write path the moment you
 launch with `--tier autonomous`. Forms 2, 5, 6, 7 need explicit
@@ -571,7 +611,7 @@ them back on without re-signing.
 | Form | What it does | After this recipe |
 |---|---|---|
 | 1 — Online dedup-and-synthesis | Already in MCP write path | ACTIVE (autonomous tier) |
-| 2 — Synchronous atomise-before-embed | Already in MCP write path | ACTIVE |
+| 2 — Synchronous atomise-before-embed | Already in MCP write path | ACTIVE **on MCP stdio + sqlite, with a wired curator** (see "What Form 2 actually requires") |
 | 3 — Multi-step ingest | Already in MCP write path | ACTIVE |
 | 4 — Citations + source-URI + atom-grain | Already in store schema | ACTIVE |
 | 5 — Confidence + freshness decay | Curator daemon + the three `AI_MEMORY_*CONFIDENCE*` process env vars | ACTIVE |

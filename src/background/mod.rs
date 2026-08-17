@@ -10,6 +10,7 @@
 //! daemon_runtime spawn surface.
 
 pub mod access_fold;
+pub mod atomise_worker;
 pub mod auto_tag_worker;
 pub mod fts_integrity;
 pub mod lease_sweep;

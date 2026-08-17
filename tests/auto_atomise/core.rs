@@ -22,10 +22,11 @@
 //! v0.7.0 WT-1-D — auto-atomisation `pre_store` hook acceptance suite.
 //!
 //! Seven acceptance tests pinned to the WT-1-D brief. Every test
-//! installs a deterministic `MockCurator` so the suite never burns
-//! an LLM round-trip; the dispatch slot is process-wide so the suite
-//! serialises via a shared `Mutex<()>` and re-uses the `Atomiser`
-//! across tests by swapping the curator response queue per-test.
+//! injects a deterministic `MockCurator` through the EXPLICIT
+//! `AtomiseWiring` (#2983 abolished the process-global dispatch slot),
+//! so the suite never burns an LLM round-trip. The mock RESPONSE QUEUE
+//! is still shared, so the suite keeps its `Mutex<()>` serialisation for
+//! that reason alone — not because any wiring is process-wide.
 
 use ai_memory::models::ConfidenceSource;
 use std::path::PathBuf;
@@ -34,10 +35,11 @@ use std::time::Duration;
 
 use ai_memory::atomisation::curator::{Atom, Curator, CuratorError};
 use ai_memory::atomisation::{Atomiser, AtomiserConfig};
+use ai_memory::background::atomise_worker::AtomiseQueue;
 use ai_memory::config::FeatureTier;
+use ai_memory::hooks::pre_store::auto_atomise::OUTCOME_SKIPPED_POLICY_DISABLED;
 use ai_memory::hooks::pre_store::{
-    AutoAtomisationDispatch, AutoAtomisationOutcome, install_auto_atomise_dispatch,
-    maybe_enqueue_auto_atomise,
+    AtomiseWiring, AutoAtomisationOutcome, maybe_enqueue_auto_atomise,
 };
 use ai_memory::models::{
     ApproverType, AtomisationPolicy, CorePolicy, GovernanceLevel, GovernancePolicy, Memory,
@@ -136,37 +138,42 @@ fn mock_call_count() -> usize {
 // Dispatch install
 // ---------------------------------------------------------------------------
 
-/// Install the dispatch once (process-wide). Subsequent calls are
-/// no-ops because `install_auto_atomise_dispatch` is one-shot.
-/// The dispatch's `db_path` points at this test's temp DB; the
-/// MockCurator lives in the shared state so every test inherits the
-/// same curator instance.
-fn ensure_dispatch_installed(db_path: PathBuf) {
-    static INSTALLED: OnceLock<()> = OnceLock::new();
-    let _ = INSTALLED.get_or_init(|| {
+/// v1.0.0 #2983 — the process-global `AUTO_ATOMISE_DISPATCH` slot this
+/// suite used to install is GONE (it had zero production callers, which
+/// is the whole defect #2983 filed). The wiring is now threaded
+/// explicitly, so the mock atomiser + the bounded background worker are
+/// ordinary process-lifetime fixtures rather than a one-shot `OnceLock`
+/// nobody could re-install between cases.
+fn shared_atomiser() -> &'static Arc<Atomiser> {
+    static A: OnceLock<Arc<Atomiser>> = OnceLock::new();
+    A.get_or_init(|| {
         let curator: Box<dyn Curator> = Box::new(MockCurator {
             state: shared_state(),
         });
-        let atomiser = Arc::new(Atomiser::new(
+        Arc::new(Atomiser::new(
             curator,
             None,
             AtomiserConfig::default(),
             FeatureTier::Smart,
-        ));
-        let dispatch = AutoAtomisationDispatch {
-            db_path: db_path.clone(),
-            atomiser,
-        };
-        // Best-effort install. If a prior test already installed,
-        // `install_auto_atomise_dispatch` returns Err — that's fine,
-        // we use the existing dispatch.
-        let _ = install_auto_atomise_dispatch(dispatch);
-    });
-    // The dispatch is one-shot. After the OnceLock fires, subsequent
-    // tests with different db_paths must reuse the original dispatch
-    // (which points at the first installer's path). We mitigate by
-    // pointing every test's db at a *shared* file under TMPDIR
-    // — see `fresh_shared_db` below.
+        ))
+    })
+}
+
+/// The bounded, single-consumer worker (#2986) the deferred path now
+/// enqueues onto instead of `std::thread::spawn`-ing one unbounded
+/// detached thread per store.
+fn shared_queue() -> &'static AtomiseQueue {
+    static Q: OnceLock<AtomiseQueue> = OnceLock::new();
+    Q.get_or_init(|| {
+        ai_memory::background::atomise_worker::spawn(Arc::new(|| {
+            Some(Arc::clone(shared_atomiser()))
+        }))
+        .expect("atomise worker spawns")
+    })
+}
+
+fn wiring() -> AtomiseWiring<'static> {
+    AtomiseWiring::new(Some(shared_atomiser()), Some(shared_queue()))
 }
 
 /// The dispatch's `db_path` is fixed at install time. Every test must
@@ -369,7 +376,7 @@ fn test_auto_atomise_disabled_does_nothing() {
     let _g = test_serial().lock().unwrap_or_else(|p| p.into_inner());
     let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
-    ensure_dispatch_installed(db_path);
+    let _ = &db_path;
     reset_mock();
 
     let ns = format!("wt1d/disabled-{}", uuid::Uuid::new_v4().simple());
@@ -378,10 +385,14 @@ fn test_auto_atomise_disabled_does_nothing() {
     let body = long_body(1000); // well over default threshold
     let mem = insert_memory(&conn, &ns, &body);
 
-    let outcome = maybe_enqueue_auto_atomise(&conn, &mem, &mem.id, "ai:test");
+    let outcome =
+        maybe_enqueue_auto_atomise(&conn, shared_db_path(), &mem, &mem.id, "ai:test", wiring());
     match outcome {
         AutoAtomisationOutcome::Skipped { reason } => {
-            assert_eq!(reason, "policy_disabled", "expected policy_disabled skip");
+            assert_eq!(
+                reason, OUTCOME_SKIPPED_POLICY_DISABLED,
+                "expected the policy-disabled skip"
+            );
         }
         other => panic!("expected Skipped(policy_disabled), got {other:?}"),
     }
@@ -406,7 +417,7 @@ fn test_auto_atomise_below_threshold_does_nothing() {
     let _g = test_serial().lock().unwrap_or_else(|p| p.into_inner());
     let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
-    ensure_dispatch_installed(db_path);
+    let _ = &db_path;
     reset_mock();
 
     let ns = format!("wt1d/below-{}", uuid::Uuid::new_v4().simple());
@@ -422,7 +433,8 @@ fn test_auto_atomise_below_threshold_does_nothing() {
     );
     let mem = insert_memory(&conn, &ns, &body);
 
-    let outcome = maybe_enqueue_auto_atomise(&conn, &mem, &mem.id, "ai:test");
+    let outcome =
+        maybe_enqueue_auto_atomise(&conn, shared_db_path(), &mem, &mem.id, "ai:test", wiring());
     match outcome {
         AutoAtomisationOutcome::UnderThreshold {
             tokens: t,
@@ -447,7 +459,7 @@ fn test_auto_atomise_above_threshold_triggers() {
     let _g = test_serial().lock().unwrap_or_else(|p| p.into_inner());
     let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
-    ensure_dispatch_installed(db_path);
+    let _ = &db_path;
     drain_workers(Duration::from_millis(300), Duration::from_secs(3));
     reset_mock();
 
@@ -467,7 +479,8 @@ fn test_auto_atomise_above_threshold_triggers() {
     let body = long_body(800);
     let mem = insert_memory(&conn, &ns, &body);
 
-    let outcome = maybe_enqueue_auto_atomise(&conn, &mem, &mem.id, "ai:test");
+    let outcome =
+        maybe_enqueue_auto_atomise(&conn, shared_db_path(), &mem, &mem.id, "ai:test", wiring());
     match outcome {
         AutoAtomisationOutcome::Enqueued { ref memory_id, .. } => {
             assert_eq!(memory_id, &mem.id);
@@ -503,7 +516,7 @@ fn test_auto_atomise_does_not_block_store_response() {
     let _g = test_serial().lock().unwrap_or_else(|p| p.into_inner());
     let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
-    ensure_dispatch_installed(db_path);
+    let _ = &db_path;
     reset_mock();
 
     // Namespace WITHOUT a policy → hook short-circuits.
@@ -534,7 +547,7 @@ fn test_auto_atomise_does_not_block_store_response() {
     for _ in 0..5 {
         let m = insert_memory(&conn, &ns_off, &body);
         let t0 = std::time::Instant::now();
-        let _ = maybe_enqueue_auto_atomise(&conn, &m, &m.id, "ai:test");
+        let _ = maybe_enqueue_auto_atomise(&conn, shared_db_path(), &m, &m.id, "ai:test", wiring());
         samples_off.push(t0.elapsed());
     }
 
@@ -544,7 +557,7 @@ fn test_auto_atomise_does_not_block_store_response() {
     for _ in 0..5 {
         let m = insert_memory(&conn, &ns_on, &body);
         let t0 = std::time::Instant::now();
-        let _ = maybe_enqueue_auto_atomise(&conn, &m, &m.id, "ai:test");
+        let _ = maybe_enqueue_auto_atomise(&conn, shared_db_path(), &m, &m.id, "ai:test", wiring());
         samples_on.push(t0.elapsed());
     }
 
@@ -601,7 +614,7 @@ fn test_auto_atomise_inheritance() {
     let _g = test_serial().lock().unwrap_or_else(|p| p.into_inner());
     let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
-    ensure_dispatch_installed(db_path);
+    let _ = &db_path;
     drain_workers(Duration::from_millis(300), Duration::from_secs(3));
     reset_mock();
 
@@ -621,7 +634,8 @@ fn test_auto_atomise_inheritance() {
     let body = long_body(800);
     let mem = insert_memory(&conn, &child, &body);
 
-    let outcome = maybe_enqueue_auto_atomise(&conn, &mem, &mem.id, "ai:test");
+    let outcome =
+        maybe_enqueue_auto_atomise(&conn, shared_db_path(), &mem, &mem.id, "ai:test", wiring());
     assert!(
         matches!(outcome, AutoAtomisationOutcome::Enqueued { .. }),
         "expected Enqueued via ancestor inheritance, got {outcome:?}"
@@ -644,7 +658,7 @@ fn test_auto_atomise_child_override() {
     let _g = test_serial().lock().unwrap_or_else(|p| p.into_inner());
     let db_path = shared_db_path().clone();
     let conn = shared_db_conn();
-    ensure_dispatch_installed(db_path);
+    let _ = &db_path;
     reset_mock();
 
     let parent = format!("wt1d-ovr-{}", uuid::Uuid::new_v4().simple());
@@ -657,10 +671,11 @@ fn test_auto_atomise_child_override() {
     let body = long_body(900);
     let mem = insert_memory(&conn, &child, &body);
 
-    let outcome = maybe_enqueue_auto_atomise(&conn, &mem, &mem.id, "ai:test");
+    let outcome =
+        maybe_enqueue_auto_atomise(&conn, shared_db_path(), &mem, &mem.id, "ai:test", wiring());
     match outcome {
         AutoAtomisationOutcome::Skipped { reason } => {
-            assert_eq!(reason, "policy_disabled");
+            assert_eq!(reason, OUTCOME_SKIPPED_POLICY_DISABLED);
         }
         other => panic!("expected Skipped(policy_disabled) on child override, got {other:?}"),
     }
@@ -678,7 +693,7 @@ fn test_auto_atomise_refused_memory_not_atomised() {
     let _g = test_serial().lock().unwrap_or_else(|p| p.into_inner());
     let db_path = shared_db_path().clone();
     let _conn = shared_db_conn();
-    ensure_dispatch_installed(db_path);
+    let _ = &db_path;
     reset_mock();
 
     // The substrate guarantees that when `db::insert` returns Err

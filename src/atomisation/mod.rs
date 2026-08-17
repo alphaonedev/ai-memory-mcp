@@ -1055,6 +1055,101 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// v1.0.0 #2983/#2984 — shared atomiser construction.
+//
+// Two production surfaces build an atomiser from the SAME resolved
+// `[llm]` client, and both must stamp the LIVE `curator_model` so the
+// signed `atomisation_complete` payload attests the model that actually
+// ran (#1244 / #2172). Keeping ONE builder here means the HTTP worker
+// cannot drift from the MCP handler.
+// ---------------------------------------------------------------------------
+
+/// Adapter letting the HTTP daemon's swappable-LLM snapshot
+/// (`Arc<Option<OllamaClient>>`, the #2166 shape) drive the curator
+/// WITHOUT cloning the client. The snapshot is captured at DRAIN time,
+/// so the atomiser this yields can never outlive the operator's
+/// currently-resolved vendor by more than one job.
+struct SwappedLlmCurator(Arc<Option<crate::llm::OllamaClient>>);
+
+impl curator::LlmGenerate for SwappedLlmCurator {
+    fn generate(
+        &self,
+        prompt: &str,
+        system: Option<&str>,
+    ) -> Result<String, curator::CuratorError> {
+        let Some(c) = self.0.as_ref().as_ref() else {
+            return Err(curator::CuratorError::LlmUnavailable(
+                "LLM client was swapped away between enqueue and drain".to_string(),
+            ));
+        };
+        crate::llm::OllamaClient::generate(c, prompt, system)
+            .map_err(|e| curator::CuratorError::LlmUnavailable(e.to_string()))
+    }
+
+    fn generate_with_tools(
+        &self,
+        prompt: &str,
+        system: Option<&str>,
+        tools: &[crate::llm::ToolDef],
+    ) -> Result<crate::llm::ChatOutcome, curator::CuratorError> {
+        let Some(c) = self.0.as_ref().as_ref() else {
+            return Err(curator::CuratorError::LlmUnavailable(
+                "LLM client was swapped away between enqueue and drain".to_string(),
+            ));
+        };
+        crate::llm::OllamaClient::generate_with_tools(c, prompt, system, tools)
+            .map_err(|e| curator::CuratorError::LlmUnavailable(e.to_string()))
+    }
+}
+
+/// Build an [`Atomiser`] over any [`curator::LlmGenerate`] surface,
+/// stamping `curator_model` so the signed `atomisation_complete` payload
+/// names the model that actually ran.
+#[must_use]
+pub fn build_atomiser<L: curator::LlmGenerate + Send + Sync + 'static>(
+    llm: L,
+    curator_model: &str,
+    tier: crate::config::FeatureTier,
+    keypair: Option<&AgentKeypair>,
+) -> Arc<Atomiser> {
+    let curator: Box<dyn Curator> = Box::new(curator::LlmCurator::new(llm));
+    Arc::new(
+        Atomiser::new(
+            curator,
+            keypair.map(|kp| Arc::new(kp.clone())),
+            AtomiserConfig::default(),
+            tier,
+        )
+        .with_curator_model(curator_model.to_string()),
+    )
+}
+
+/// v1.0.0 #2984/#2986 — resolve the CURRENT atomiser from the HTTP
+/// daemon's swappable `[llm]` handle.
+///
+/// Returns `None` when no LLM is wired (keyword/semantic tier,
+/// inference egress refused, or a disabling `[llm]` reload landed) —
+/// which the background worker reports as
+/// `skipped_no_curator`, never as a silent success. Called at DRAIN
+/// time, never at boot: that is what makes a stale, revoked-vendor
+/// atomiser structurally impossible (the #2172 lesson).
+#[must_use]
+pub fn build_atomiser_from_swappable(
+    llm: &crate::reload::SwappableLlm,
+    tier: crate::config::FeatureTier,
+    keypair: Option<&AgentKeypair>,
+) -> Option<Arc<Atomiser>> {
+    let snapshot = llm.current();
+    let model = snapshot.as_ref().as_ref()?.model_name().to_string();
+    Some(build_atomiser(
+        SwappedLlmCurator(snapshot),
+        &model,
+        tier,
+        keypair,
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests — exercise the helpers that don't require a live curator.
 // The full integration suite (mock curator + DB + hooks + signed_events)
 // lives at `tests/atomisation.rs`.

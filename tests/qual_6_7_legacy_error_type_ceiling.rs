@@ -128,7 +128,18 @@ fn count_matches(root: &Path, needle: &str) -> usize {
 // for signature parity with the surrounding namespace-standard handler family
 // (get/clear also `Result<Value, String>`). No new error contract; measured
 // count is 119. Net acknowledged: +3.
-const QUAL_6_CEILING: usize = 119;
+// 2026-08-16 (#2983-#2987) — raised 119 -> 120 for the TEST-ONLY shim
+// `handle_store` in `src/mcp/tools/store/tests.rs`. `handle_store` gained the
+// `AtomiseWiring` parameter that replaces the abolished process-global
+// dispatch (#2983); the shim supplies the empty default wiring to that file's
+// 79 pre-existing fixtures, whose subject matter (parse / conflict /
+// governance / envelope) is unrelated to atomisation. It MUST mirror the
+// production signature, so it is `Result<Value, String>` by construction. No
+// production handler was added and no new error contract exists — the
+// atomisation-specific behaviour is asserted with an INJECTED curator by
+// `tests/batman_atomise_wiring_2983.rs` and the hook's own unit suite.
+// Net acknowledged: +1 (test-only).
+const QUAL_6_CEILING: usize = 120;
 
 /// QUAL-7 ceiling: 6+ sites at v2-review time + slack. Raised
 /// 25 → 26 for the #1455 fail-CLOSED governance pair in

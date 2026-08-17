@@ -207,6 +207,174 @@ pub(crate) fn try_enqueue_auto_tag(
     }
 }
 
+/// v1.0.0 #2984/#2986 — enqueue the deferred Batman auto-atomisation
+/// job onto the bounded background worker. Called AFTER the durable
+/// insert has ALREADY succeeded (`id` is the committed row), so this
+/// function can only ever affect atomisation, never the write itself.
+///
+/// # Why the HTTP surface is DEFERRED-only
+///
+/// The remediation vote (2026-08-16, protocol `4d3ea1c5`, Q2 = 4-1)
+/// disqualified sync-in-request twice over: it would hold the daemon's
+/// ONE `Arc<Mutex<Connection>>` AND an #2032-M3 admission permit across
+/// an LLM round trip, and under policy-mode-respect that stall is
+/// triggerable by anyone who can write a namespace standard (a
+/// governance-config availability vector). So a `synchronous`-configured
+/// namespace written through HTTP runs DEFERRED and says so honestly:
+/// `atomise_mode: "deferred"` + `atomise_mode_configured: "synchronous"`
+/// + `atomise_mode_reason: "deferred_on_http"`.
+///
+/// # Postgres
+///
+/// Branching happens HERE, at the enqueue site (the
+/// `apply_auto_tag_job` `StorageBackend::Postgres =>` precedent): a
+/// postgres-backed daemon reports `skipped_backend_unsupported` and
+/// NEVER falls through to a sqlite handle. The atomiser is
+/// `rusqlite::Connection`-bound; atoms landing in a different store than
+/// their source is mixed-state corruption, which outranks the missing
+/// feature.
+///
+/// # One DELIBERATE asymmetry with the MCP envelope
+///
+/// `None` here means the namespace never opted in, and the create
+/// response then carries NO `atomise_*` field at all. The MCP
+/// `memory_store` envelope, by contrast, reports `atomise_mode: "off"`
+/// even on an opted-out namespace, because #2987 pins that contract on
+/// the MCP surface specifically: that envelope ALREADY carried an
+/// `atomise_mode` key, and it was LYING (a hardcoded `"synchronous"`
+/// next to `skipped_dispatch_unset`), so silence there would be
+/// indistinguishable from the bug.
+///
+/// The HTTP fields are NET-NEW at v1.0.0 with no legacy contract to
+/// disambiguate, so they follow the #2587 `auto_tagging` precedent
+/// instead: absent when the feature was never engaged (byte-identical
+/// to the pre-#2984 envelope), present and complete the moment the
+/// namespace opts in — including on every skip/degrade arm, which is
+/// where the "#2444 never silently green" rule actually bites.
+pub(crate) async fn try_enqueue_auto_atomise(
+    app: &AppState,
+    id: &str,
+    namespace: &str,
+    agent_id: &str,
+) -> Option<crate::hooks::pre_store::AtomiseDisposition> {
+    use crate::hooks::pre_store::auto_atomise as aa;
+    use crate::models::AutoAtomiseMode;
+
+    // Postgres: refuse at the enqueue site, loudly and explicitly.
+    if matches!(
+        app.storage_backend,
+        crate::handlers::StorageBackend::Postgres
+    ) {
+        // Resolving the namespace policy would need a postgres round trip
+        // for a decision that is unconditional on this backend, so the
+        // refusal is reported without one. It is emitted only when the
+        // daemon HAS a curator, so a keyword-tier postgres deployment does
+        // not get a field it cannot act on.
+        if app.llm.current().is_some() {
+            tracing::warn!(
+                target: aa::AUTO_ATOMISE_TRACE_TARGET,
+                "auto_atomise is unsupported on the postgres backend — memory {id} in \
+                 namespace {namespace} stored WITHOUT atomisation. The atomiser is \
+                 rusqlite-Connection-bound; enqueuing here would land atoms in a different \
+                 store than their source."
+            );
+            return Some(crate::hooks::pre_store::AtomiseDisposition::diverged(
+                AutoAtomiseMode::Off,
+                AutoAtomiseMode::Deferred,
+                aa::REASON_BACKEND_UNSUPPORTED,
+                aa::OUTCOME_SKIPPED_BACKEND_UNSUPPORTED,
+            ));
+        }
+        return None;
+    }
+
+    // sqlite: resolve the CONFIGURED mode + the per-namespace atom budget
+    // from the namespace standard. ONE short lock — policy resolution
+    // only, never an LLM call (the whole point of the deferral).
+    let (configured, max_atom_tokens, db_path) = {
+        let lock = app.db.lock().await;
+        let policy =
+            crate::storage::resolve_governance_policy(&lock.0, namespace).unwrap_or_default();
+        (
+            policy.effective_auto_atomise_mode(),
+            policy.effective_auto_atomise_max_atom_tokens(),
+            lock.1.clone(),
+        )
+    };
+    if configured == AutoAtomiseMode::Off {
+        return None;
+    }
+
+    // #2985 — the namespace asks for atomisation; does this daemon have a
+    // curator at all? `LlmCurator` is the ONLY production `Curator` impl.
+    if app.llm.current().is_none() || app.tier_config.llm_model.is_none() {
+        tracing::warn!(
+            target: aa::AUTO_ATOMISE_TRACE_TARGET,
+            "namespace '{namespace}' requests auto_atomise ({}) but this daemon has NO \
+             curator (no [llm] backend, or inference egress refused) — memory {id} stored \
+             WITHOUT atomisation. A loopback Ollama satisfies the certified loopback-only \
+             egress posture. See `ai-memory doctor`.",
+            configured.as_str(),
+        );
+        crate::metrics::inc_atomise_no_curator();
+        return Some(crate::hooks::pre_store::AtomiseDisposition::diverged(
+            AutoAtomiseMode::Off,
+            configured,
+            aa::REASON_NO_CURATOR,
+            aa::OUTCOME_SKIPPED_NO_CURATOR,
+        ));
+    }
+
+    let Some(queue) = app.atomise_queue.as_ref() else {
+        tracing::warn!(
+            target: aa::AUTO_ATOMISE_TRACE_TARGET,
+            "eligible write {id} has no atomise worker wired — skipping atomisation \
+             (the durable write already succeeded)"
+        );
+        crate::metrics::inc_atomise_dropped();
+        return Some(crate::hooks::pre_store::AtomiseDisposition::diverged(
+            AutoAtomiseMode::Off,
+            configured,
+            aa::REASON_QUEUE_FULL,
+            aa::OUTCOME_SKIPPED_QUEUE_FULL,
+        ));
+    };
+
+    // The job stays CONTENT-FREE: the worker re-reads the durable row
+    // through its own connection, so no multi-KB body crosses the channel
+    // and a queued job can never carry text the caller has since
+    // superseded.
+    let accepted = queue.try_enqueue(crate::background::atomise_worker::AtomiseJob {
+        db_path,
+        memory_id: id.to_string(),
+        namespace: namespace.to_string(),
+        agent_id: agent_id.to_string(),
+        max_atom_tokens,
+    });
+    Some(if accepted {
+        if configured == AutoAtomiseMode::Synchronous {
+            crate::hooks::pre_store::AtomiseDisposition::diverged(
+                AutoAtomiseMode::Deferred,
+                AutoAtomiseMode::Synchronous,
+                aa::REASON_DEFERRED_ON_HTTP,
+                aa::OUTCOME_QUEUED,
+            )
+        } else {
+            crate::hooks::pre_store::AtomiseDisposition::ran(
+                AutoAtomiseMode::Deferred,
+                aa::OUTCOME_QUEUED,
+            )
+        }
+    } else {
+        crate::hooks::pre_store::AtomiseDisposition::diverged(
+            AutoAtomiseMode::Off,
+            configured,
+            aa::REASON_QUEUE_FULL,
+            aa::OUTCOME_SKIPPED_QUEUE_FULL,
+        )
+    })
+}
+
 /// v0.7.0 (issue #519) — same-namespace conflict probe fired during
 /// `create_memory`. Mirrors the MCP `handle_store` autonomy hook's
 /// `detect_contradiction` loop (`crate::mcp::handle_store` (detect_contradiction loop)) but lives on the
@@ -443,6 +611,7 @@ mod cov897_tests {
             ),
             autonomous_hooks: autonomous,
             auto_tag_queue: None,
+            atomise_queue: None,
             recall_scope: Arc::new(None),
             deferred_audit_queue: Arc::new(None),
             admin_agent_ids: Arc::new(Vec::new()),
@@ -472,6 +641,155 @@ mod cov897_tests {
         };
         let lock = app.db.try_lock().expect("uncontended lock for seed");
         crate::db::insert(&lock.0, &mem).expect("insert");
+    }
+
+    // -------------------------------------------------------------------
+    // v1.0.0 #2984 / #2985 / #2987 — the HTTP atomise enqueue dispositions.
+    //
+    // These live at lib tier (not in an integration binary) because the
+    // POSTGRES arm is the one that MUST be pinned on an ordinary CI run:
+    // every live-postgres suite self-skips without
+    // `AI_MEMORY_TEST_POSTGRES_URL`, so a regression that let the pg branch
+    // fall through to the sqlite handle — atoms landing in a different
+    // store than their source, i.e. mixed-state corruption — would be
+    // caught by nothing at all on most runs.
+    // -------------------------------------------------------------------
+
+    /// Seed a namespace standard whose governance opts into `auto_atomise`.
+    fn seed_auto_atomise_standard(app: &AppState, namespace: &str, mode: &str) {
+        let now = Utc::now().to_rfc3339();
+        let std_mem = Memory {
+            id: Uuid::new_v4().to_string(),
+            title: format!("__standard_{namespace}"),
+            content: "standard".to_string(),
+            namespace: namespace.to_string(),
+            tier: Tier::Long,
+            created_at: now.clone(),
+            updated_at: now,
+            // The sub-structs are `#[serde(flatten)]`-ed back into the
+            // parent, so the wire shape is FLAT — a nested `atomisation`
+            // object deserialises to an all-default policy (i.e. `Off`),
+            // which would make this fixture silently assert nothing.
+            metadata: serde_json::json!({
+                "agent_id": "ai:test",
+                crate::META_KEY_GOVERNANCE: {
+                    "write": "any",
+                    "auto_atomise": true,
+                    "auto_atomise_mode": mode,
+                    "auto_atomise_threshold_cl100k": 10,
+                    "auto_atomise_max_atom_tokens": 40,
+                }
+            }),
+            ..Default::default()
+        };
+        let lock = app.db.try_lock().expect("uncontended lock for seed");
+        let id = crate::db::insert(&lock.0, &std_mem).expect("insert standard");
+        crate::db::set_namespace_standard(&lock.0, namespace, &id, None).expect("set standard");
+    }
+
+    /// #2984 — a postgres-backed daemon reports the refusal EXPLICITLY.
+    ///
+    /// Silence would be the #2444 shape (a knob that reports engagement
+    /// while doing nothing); a fall-through to the sqlite handle would be
+    /// worse still — atoms in a different store than their source.
+    #[tokio::test]
+    async fn atomise_enqueue_on_postgres_is_explicitly_unsupported_2984() {
+        let (mut app, _tmp) = build_app(FeatureTier::Smart, true);
+        app.storage_backend = StorageBackend::Postgres;
+        // A curator IS wired — otherwise the daemon has nothing to refuse.
+        app.llm = Arc::new(crate::reload::SwappableLlm::new(Some(
+            crate::llm::OllamaClient::new_with_url_no_health_check(
+                "http://127.0.0.1:1",
+                "test-model",
+            )
+            .expect("llm"),
+        )));
+        let d = super::try_enqueue_auto_atomise(&app, "mem-1", "pg-ns", "ai:test")
+            .await
+            .expect("the pg branch must SAY it cannot atomise, never stay silent");
+        assert_eq!(
+            d.outcome,
+            crate::hooks::pre_store::auto_atomise::OUTCOME_SKIPPED_BACKEND_UNSUPPORTED
+        );
+        assert_eq!(d.mode_ran, crate::models::AutoAtomiseMode::Off);
+        assert_eq!(
+            d.reason,
+            Some(crate::hooks::pre_store::auto_atomise::REASON_BACKEND_UNSUPPORTED)
+        );
+        assert!(
+            app.atomise_queue.is_none(),
+            "a postgres-backed daemon must never hold an atomise worker handle"
+        );
+    }
+
+    /// #2985 — an opted-in namespace on a curator-less daemon gets the
+    /// DISTINCT `skipped_no_curator` token, not a wiring-state skip and not
+    /// silence.
+    #[tokio::test]
+    async fn atomise_enqueue_without_a_curator_reports_skipped_no_curator_2985() {
+        let (app, _tmp) = build_app(FeatureTier::Smart, true);
+        seed_auto_atomise_standard(&app, "nc-ns", "deferred");
+        let d = super::try_enqueue_auto_atomise(&app, "mem-1", "nc-ns", "ai:test")
+            .await
+            .expect("an opted-in namespace on a curator-less daemon must report why");
+        assert_eq!(
+            d.outcome,
+            crate::hooks::pre_store::auto_atomise::OUTCOME_SKIPPED_NO_CURATOR
+        );
+        assert_eq!(
+            d.reason,
+            Some(crate::hooks::pre_store::auto_atomise::REASON_NO_CURATOR)
+        );
+        assert_eq!(d.mode_configured, crate::models::AutoAtomiseMode::Deferred);
+    }
+
+    /// #2987 — a namespace that never opted in emits NO atomise fields at
+    /// all, byte-identical to the pre-#2984 envelope. A knob nobody set
+    /// must not start narrating itself on every write.
+    #[tokio::test]
+    async fn atomise_enqueue_is_silent_for_an_opted_out_namespace_2987() {
+        let (app, _tmp) = build_app(FeatureTier::Smart, true);
+        assert!(
+            super::try_enqueue_auto_atomise(&app, "mem-1", "plain-ns", "ai:test")
+                .await
+                .is_none()
+        );
+    }
+
+    /// #2984 / #2987 — a `synchronous`-configured namespace written through
+    /// HTTP runs DEFERRED and SAYS SO. This is the divergence the verdict
+    /// required to be reported rather than silently honoured or silently
+    /// dropped.
+    #[tokio::test]
+    async fn synchronous_namespace_over_http_reports_the_deferred_divergence_2987() {
+        let (mut app, _tmp) = build_app(FeatureTier::Smart, true);
+        app.llm = Arc::new(crate::reload::SwappableLlm::new(Some(
+            crate::llm::OllamaClient::new_with_url_no_health_check(
+                "http://127.0.0.1:1",
+                "test-model",
+            )
+            .expect("llm"),
+        )));
+        // No worker wired: the point of this case is the MODE divergence,
+        // which must be reported on the queue-full arm too.
+        seed_auto_atomise_standard(&app, "sync-http-ns", "synchronous");
+        let d = super::try_enqueue_auto_atomise(&app, "mem-1", "sync-http-ns", "ai:test")
+            .await
+            .expect("an opted-in namespace must report a disposition");
+        assert_eq!(
+            d.mode_configured,
+            crate::models::AutoAtomiseMode::Synchronous,
+            "the CONFIGURED mode must survive into the envelope"
+        );
+        assert_eq!(
+            d.outcome,
+            crate::hooks::pre_store::auto_atomise::OUTCOME_SKIPPED_QUEUE_FULL,
+            "no worker wired → an honest degrade, never a silent success"
+        );
+        assert_eq!(
+            d.reason,
+            Some(crate::hooks::pre_store::auto_atomise::REASON_QUEUE_FULL)
+        );
     }
 
     // ---- auto_tag_eligible: the llm-arc fast-path on a Smart-tier app --

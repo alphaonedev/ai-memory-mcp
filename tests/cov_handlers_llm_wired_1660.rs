@@ -130,6 +130,7 @@ fn build_llm_router(llm_url: Option<&str>) -> (axum::Router, NamedTempFile, Db) 
         ),
         autonomous_hooks: false,
         auto_tag_queue: None,
+        atomise_queue: None,
         recall_scope: Arc::new(None),
         deferred_audit_queue: Arc::new(None),
         // Wildcard admin sentinel — same as `test_app_state` in

@@ -914,6 +914,11 @@ async fn fanout_and_assemble_create_response(
     actual_id: &str,
     embedding: Option<Vec<f32>>,
     auto_tag_outcome: super::AutoTagOutcome,
+    // #2984/#2987 — honest atomisation disposition. `None` when the
+    // namespace never opted in (byte-identical to the pre-#2984 envelope);
+    // `Some` carries `atomise_mode` (the mode that RAN) + `atomise_outcome`
+    // and, on divergence, `atomise_mode_configured` + a reason token.
+    atomise_disposition: Option<crate::hooks::pre_store::AtomiseDisposition>,
     contradiction_ids: Vec<String>,
     embed_status: EmbedStatus,
 ) -> axum::response::Response {
@@ -986,6 +991,11 @@ async fn fanout_and_assemble_create_response(
     // (byte-identical to the pre-#2587 no-LLM-ran contract).
     if let Some(field) = auto_tag_outcome.response_field() {
         response["auto_tagging"] = json!(field);
+    }
+    // #2984/#2987 — atomisation telemetry, absent when the namespace never
+    // asked for it.
+    if let Some(d) = atomise_disposition {
+        d.merge_into_response(&mut response);
     }
     // v0.7.0 Round-2 F10 — surface embed_status to the caller when α's
     // `embed_with_status` reported anything other than `Indexed`.
@@ -1522,6 +1532,12 @@ async fn create_memory_postgres(
         agent_id,
     );
 
+    // #2984 — postgres parity: the enqueue site branches on the storage
+    // backend and reports `skipped_backend_unsupported` (never a
+    // fall-through to a sqlite handle).
+    let atomise_disposition =
+        super::try_enqueue_auto_atomise(app, &id, &mem.namespace, agent_id).await;
+
     // #869 — typed serialise helper so a 201 + `{}` never masks a real
     // encode failure.
     let mut payload = match super::to_value_or_500("create_memory.postgres.response", &mem) {
@@ -1533,6 +1549,13 @@ async fn create_memory_postgres(
         if let Some(field) = auto_tag_outcome.response_field() {
             obj.insert("auto_tagging".to_string(), json!(field));
         }
+    }
+    // #2984 — the postgres branch reports `skipped_backend_unsupported`
+    // explicitly rather than silently omitting the field: the atomiser is
+    // rusqlite-Connection-bound and this daemon will NEVER atomise. Merged
+    // after the object is built so it lands on the same envelope.
+    if let Some(d) = atomise_disposition {
+        d.merge_into_response(&mut payload);
     }
     (StatusCode::CREATED, Json(payload)).into_response()
 }
@@ -1872,6 +1895,14 @@ pub async fn create_memory(
         &agent_id,
     );
 
+    // #2984 — the HTTP create funnel's Batman auto-atomise enqueue. Before
+    // v1.0.0 NO such call site existed anywhere in `src/handlers/`, so
+    // atomisation was unreachable on the surface every postgres-backed and
+    // mTLS-fronted deployment (including the certified enterprise-federation
+    // hive) writes through. Non-blocking; never awaits the curator.
+    let atomise_disposition =
+        super::try_enqueue_auto_atomise(&app, &actual_id, &mem.namespace, &agent_id).await;
+
     // Stage 6 — HNSW warm-up + audit emit + federation fanout +
     // assembled CREATED response.
     fanout_and_assemble_create_response(
@@ -1880,6 +1911,7 @@ pub async fn create_memory(
         &actual_id,
         embedding,
         auto_tag_outcome,
+        atomise_disposition,
         contradiction_ids,
         embed_status,
     )
