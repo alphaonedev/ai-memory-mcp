@@ -139,7 +139,15 @@ fn count_matches(root: &Path, needle: &str) -> usize {
 // atomisation-specific behaviour is asserted with an INJECTED curator by
 // `tests/batman_atomise_wiring_2983.rs` and the hook's own unit suite.
 // Net acknowledged: +1 (test-only).
-const QUAL_6_CEILING: usize = 120;
+// 2026-08-18 (#3040) — raised 120 -> 121 for the `handle_list_capped` inner
+// helper split out of `handle_list` in `src/mcp/tools/list.rs`. The MCP list
+// path now honors the operator `AI_MEMORY_MAX_PAGE_SIZE` page-size cap (parity
+// with the HTTP `AppState.max_page_size` OOM guard); the cap is threaded as an
+// explicit `page_cap` param to the inner helper so it is unit-testable without
+// mutating the process-global. The helper MUST mirror the existing
+// `Result<Value, String>` MCP-dispatch envelope of `handle_list`, so it is that
+// type by construction — no new error contract. Net acknowledged: +1.
+const QUAL_6_CEILING: usize = 121;
 
 /// QUAL-7 ceiling: 6+ sites at v2-review time + slack. Raised
 /// 25 → 26 for the #1455 fail-CLOSED governance pair in

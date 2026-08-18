@@ -427,6 +427,18 @@ pub fn run(
         db::find_contradictions(&conn, &mem.title, &mem.namespace).unwrap_or_default();
     let actual_id = db::insert(&conn, &mem)?;
 
+    // #3025 — re-read the persisted row so the response reflects what the DB
+    // ACTUALLY stored, never the requested-but-not-persisted values. On a
+    // `(title, namespace)` upsert `db::insert` merges onto the existing row:
+    // tier stays monotonic-max (a `--tier short` upsert over a `long` row
+    // stays `long`), `version` bumps, and `expires_at` follows the persisted
+    // tier — so echoing `mem` would report a downgrade / expiry / version that
+    // never happened (the #2444 reports-success-doing-nothing / honesty class).
+    // An echo-read failure must not turn the already-committed write into an
+    // error; fall back to `mem`. MCP precedent: `src/mcp/tools/store/mod.rs`
+    // `echo_tier`.
+    let persisted = db::get(&conn, &actual_id).ok().flatten();
+
     // PR-5 (issue #487): security audit trail. No-op when disabled.
     crate::audit::emit(crate::audit::EventBuilder::new(
         crate::audit::AuditAction::Store,
@@ -451,7 +463,12 @@ pub fn run(
         .map(|c| &c.id)
         .collect();
     if json_out {
-        let mut j = serde_json::to_value(&mem)?;
+        // #3025 — serialize the PERSISTED row (falling back to `mem` only if
+        // the echo-read failed) so tier/version/expiry are the DB's truth.
+        let mut j = match persisted.as_ref() {
+            Some(p) => serde_json::to_value(p)?,
+            None => serde_json::to_value(&mem)?,
+        };
         j["id"] = serde_json::json!(actual_id);
         let filtered: Vec<&String> = contradictions
             .iter()
@@ -463,11 +480,14 @@ pub fn run(
         }
         writeln!(out.stdout, "{}", serde_json::to_string(&j)?)?;
     } else {
-        writeln!(
-            out.stdout,
-            "stored: {} [{}] (ns={})",
-            actual_id, mem.tier, mem.namespace
-        )?;
+        // #3025 — echo the PERSISTED tier/namespace, not the requested ones.
+        let tier = persisted
+            .as_ref()
+            .map_or_else(|| mem.tier.clone(), |p| p.tier.clone());
+        let namespace = persisted
+            .as_ref()
+            .map_or(mem.namespace.as_str(), |p| p.namespace.as_str());
+        writeln!(out.stdout, "stored: {actual_id} [{tier}] (ns={namespace})")?;
         if !filtered.is_empty() {
             writeln!(
                 out.stderr,
@@ -575,6 +595,61 @@ mod tests {
         assert_eq!(v["title"].as_str().unwrap(), "test title");
         assert_eq!(v["tier"].as_str().unwrap(), Tier::Mid.as_str());
         assert_eq!(v["namespace"].as_str().unwrap(), "test-ns");
+    }
+
+    /// #3025 — on a `(title, namespace)` upsert the CLI `store --json`
+    /// response MUST report the PERSISTED row (tier/version/expiry), never the
+    /// requested-but-not-persisted values. A `--tier short` upsert over a
+    /// `long` row stays `long` and bumps `version`; pre-fix the response
+    /// echoed the requested `short`/`version:1`, lying about a downgrade that
+    /// never happened.
+    #[test]
+    fn test_store_upsert_json_reports_persisted_not_requested_3025() {
+        let _lock = locked_env();
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+
+        // First store: a long-tier row.
+        let mut first = default_args();
+        first.title = "upsert-3025".to_string();
+        first.tier = Tier::Long.as_str().to_string();
+        {
+            let mut out = env.output();
+            run(&db, first, true, &cfg, Some("test-agent"), &mut out).unwrap();
+        }
+        let first_json: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(first_json["tier"].as_str().unwrap(), Tier::Long.as_str());
+
+        // Upsert the SAME (title, namespace) requesting `short`. The DB keeps
+        // `long` (tier monotonicity) and bumps `version`.
+        env.stdout.clear();
+        let mut second = default_args();
+        second.title = "upsert-3025".to_string();
+        second.tier = Tier::Short.as_str().to_string();
+        second.content = "updated content".to_string();
+        {
+            let mut out = env.output();
+            run(&db, second, true, &cfg, Some("test-agent"), &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        // Response reflects the PERSISTED row, not the requested `short`.
+        assert_eq!(
+            v["tier"].as_str().unwrap(),
+            Tier::Long.as_str(),
+            "response must echo the persisted tier, got: {v}"
+        );
+        assert_ne!(v["tier"].as_str().unwrap(), Tier::Short.as_str());
+        // The persisted upsert bumped `version` past the create-time 1.
+        assert!(
+            v["version"].as_u64().unwrap() >= 2,
+            "persisted version must have bumped on upsert, got: {v}"
+        );
+        // Both stores addressed the same row.
+        assert_eq!(
+            v["id"].as_str().unwrap(),
+            first_json["id"].as_str().unwrap()
+        );
     }
 
     #[test]

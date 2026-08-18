@@ -1534,6 +1534,43 @@ Regression coverage: `tests/pg_audit_3070_3074.rs` (live-pg gated).
   config, including the fallback-mismatch case) +
   `embeddings::tests::{capability_model_id_reports_constructed_remote_model_3063,
   reconcile_overrides_config_with_constructed_embedder_3063}`.
+### Fixed (Wave-C2 — CLI/MCP correctness parity; #3025 #3040 #3037 #2989)
+
+- **#3025 — CLI `store --json` reported the REQUESTED tier/expiry/version on an
+  upsert, not the persisted row.** On a `(title, namespace)` upsert `db::insert`
+  merges onto the existing row (tier stays monotonic-max, `version` bumps,
+  `expires_at` follows the persisted tier), but the response serialized the
+  in-memory request — so a `--tier short` upsert over a `long` row reported
+  `tier=short`/`version=1`/`exp=+6h` while the DB stayed `long`/`v2`/no-expiry
+  (the #2444 reports-success-doing-nothing / honesty class). The CLI now
+  re-reads the persisted row after the write and echoes it (both `--json` and
+  the text line), matching the MCP `echo_tier` precedent
+  (`src/mcp/tools/store/mod.rs`). Source: `src/cli/store.rs`.
+- **#3040 — MCP `memory_list` ignored `AI_MEMORY_MAX_PAGE_SIZE` while HTTP
+  honored it (asymmetric OOM guard).** The MCP stdio loop carries no `AppState`,
+  so the resolved `[limits].max_page_size` cap is now mirrored into a
+  process-global (`crate::set_max_page_size` / `max_page_size`, the
+  `set_max_inflight_requests` precedent), seeded at boot from
+  `AppConfig::resolve_limits()`, and consulted by the list handler — which caps
+  at the SMALLER of its historical 200-row ceiling and the operator cap, so MCP
+  never exceeds the guard HTTP applies. Source: `src/lib.rs`,
+  `src/daemon_runtime.rs`, `src/mcp/tools/list.rs`.
+- **#3037 — `dependents-of-invalidated --transitive` was unreachable from the
+  CLI (hardcoded non-transitive).** The R55/#1959 transitive taint walk shipped
+  on HTTP + MCP but the CLI subcommand hardcoded `json!({memory_id})`. A
+  `--transitive` flag is added and threaded through to the shared handler, with
+  the downstream suspect set rendered in text output. Source:
+  `src/cli/commands/dependents_of_invalidated.rs`.
+- **#2989 — the `recall_observations` read surface hid `agent_id`/`namespace`/
+  `folded`; the doc claimed a false 1:1 column mirror.** The ledger STORES the
+  v58/#1705 identity binding (`agent_id`, `namespace`) + the v77/#1869 `folded`
+  fold-state, but the `Observation` read struct omitted them, so "who recalled
+  what, in which namespace, folded or not" was unanswerable through the
+  sanctioned MCP/HTTP read surface and the #1705 identity binding was
+  read-invisible. The three columns are now surfaced on the read struct + both
+  backends' `list_recall_observations` SELECT (sqlite + postgres), and the doc
+  now truthfully mirrors the columns. Output-only (no input-schema / tool-count
+  change). Source: `src/observations/mod.rs`, `src/store/postgres.rs`.
 
 ### Fixed (Batman auto-atomisation was structurally inert product-wide; #2983 #2984 #2985 #2986 #2987)
 

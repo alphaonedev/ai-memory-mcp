@@ -227,9 +227,16 @@ pub fn mark_consumed_guarded(
 }
 
 /// One row of `recall_observations` as it travels over the read-side
-/// MCP `memory_recall_observations` tool. Mirrors the SQL columns 1:1
-/// plus a derived `consumed` boolean (the SQL column is an INTEGER
-/// 0/1).
+/// MCP `memory_recall_observations` tool + the HTTP mirror. Mirrors the
+/// SQL columns 1:1, with the `consumed` / `folded` INTEGER-0/1 columns
+/// surfaced as booleans.
+///
+/// #2989 — `agent_id` (v58 / #1705 identity binding), `namespace` (v58),
+/// and `folded` (v77 / #1869 recall purity) were STORED by the ledger but
+/// omitted from this read struct, so "who recalled what, in which namespace,
+/// folded or not" was unanswerable through the sanctioned read surface and
+/// the "1:1" doc claim was false. They are now surfaced (both backends), so
+/// the #1705 identity binding is no longer write-only.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Observation {
     pub recall_id: String,
@@ -243,6 +250,18 @@ pub struct Observation {
     pub consumed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consumed_by_memory_id: Option<String>,
+    /// #1705 (schema v58) — the agent that performed the recall this row
+    /// records. Nullable: legacy pre-v58 rows carry `NULL`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// #1705 (schema v58) — the namespace the recall was scoped to.
+    /// Nullable: legacy pre-v58 rows carry `NULL`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// #1869 (schema v77) — recall-purity fold state: `true` once the
+    /// periodic FOLD job has applied this row's access signal to the
+    /// `memories` row.
+    pub folded: bool,
 }
 
 /// Read-side query for the `memory_recall_observations` MCP tool.
@@ -263,7 +282,8 @@ pub fn list_observations(
 ) -> Result<Vec<Observation>> {
     let mut sql = String::from(
         "SELECT recall_id, memory_id, retriever, rank, score, consumed, \
-                observed_at, consumed_at, consumed_by_memory_id \
+                observed_at, consumed_at, consumed_by_memory_id, \
+                agent_id, namespace, folded \
            FROM recall_observations \
           WHERE 1=1",
     );
@@ -314,6 +334,10 @@ pub fn list_observations(
                 observed_at: row.get(6)?,
                 consumed_at: row.get(7).ok(),
                 consumed_by_memory_id: row.get(8).ok(),
+                // #2989 — surface the v58 identity binding + v77 fold state.
+                agent_id: row.get(9).ok(),
+                namespace: row.get(10).ok(),
+                folded: row.get::<_, i64>(11).unwrap_or(0) != 0,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -479,6 +503,43 @@ mod tests {
         // INSERT OR IGNORE on the composite PK collapses the replay
         // to zero inserts. (Caller's perspective: idempotent.)
         assert_eq!(n, 0);
+    }
+
+    /// #2989 — the read struct + `list_observations` surface the v58 identity
+    /// binding (`agent_id`, `namespace`) + the v77 `folded` fold-state that the
+    /// ledger stores, so "who recalled what, in which namespace, folded or not"
+    /// is answerable through the sanctioned read surface (they were hidden, and
+    /// the "1:1 column mirror" doc claim was false).
+    #[test]
+    fn list_observations_surfaces_identity_and_fold_state_2989() {
+        let conn = fresh();
+        seed_memory(&conn, "m1");
+        record_recall_with_identity(
+            &conn,
+            "r1",
+            &[Candidate {
+                memory_id: "m1",
+                retriever: "hybrid",
+                rank: 1,
+                score: 0.9,
+            }],
+            Some("ai:cert-fed-proxy"),
+            Some("team/eng"),
+        )
+        .expect("record");
+
+        let obs = list_observations(&conn, Some("r1"), None, None, None, 10).expect("list");
+        assert_eq!(obs.len(), 1);
+        let o = &obs[0];
+        assert_eq!(o.agent_id.as_deref(), Some("ai:cert-fed-proxy"));
+        assert_eq!(o.namespace.as_deref(), Some("team/eng"));
+        assert!(!o.folded, "a fresh recall row lands unfolded (folded=0)");
+
+        // And they travel onto the wire (the MCP tool / HTTP output envelope).
+        let j = serde_json::to_value(o).expect("serialize");
+        assert_eq!(j["agent_id"].as_str(), Some("ai:cert-fed-proxy"));
+        assert_eq!(j["namespace"].as_str(), Some("team/eng"));
+        assert_eq!(j["folded"].as_bool(), Some(false));
     }
 
     #[test]
