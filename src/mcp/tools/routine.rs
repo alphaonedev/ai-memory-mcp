@@ -50,14 +50,14 @@ pub fn handle_routine_create(conn: &rusqlite::Connection, params: &Value) -> Res
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "namespace is required".to_string())?
         .to_string();
-    let name = params
+    let mut name = params
         .get(param_names::NAME)
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "name is required".to_string())?
         .to_string();
-    let template = params
+    let mut template = params
         .get(param_names::TEMPLATE)
         .cloned()
         .unwrap_or_else(|| json!({}));
@@ -68,12 +68,29 @@ pub fn handle_routine_create(conn: &rusqlite::Connection, params: &Value) -> Res
     let created_by = params
         .get(param_names::CREATED_BY)
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let metadata = params
+        .map(str::to_string);
+    let mut metadata = params
         .get(param_names::METADATA)
         .cloned()
         .unwrap_or_else(|| json!({}));
+
+    // #2998 — validate namespace + bound the name / template sizes + resolve an
+    // always-attributed actor. #2994 — screen the caller-origin credential
+    // vectors (name / template / metadata) before the direct insert.
+    crate::coordination_guard::require_namespace(&namespace)?;
+    crate::coordination_guard::require_text(
+        param_names::NAME,
+        &name,
+        crate::coordination_guard::MAX_TEXT_FIELD_BYTES,
+    )?;
+    crate::coordination_guard::require_payload_size(param_names::TEMPLATE, &template)?;
+    let created_by = crate::coordination_guard::resolve_actor(created_by.as_deref())?;
+    crate::secret_screen::screen_text_field_for_caller(&mut name).map_err(|r| r.to_string())?;
+    crate::secret_screen::screen_json_field_for_caller(&mut template).map_err(|r| r.to_string())?;
+    if !metadata.is_null() {
+        crate::secret_screen::screen_json_field_for_caller(&mut metadata)
+            .map_err(|r| r.to_string())?;
+    }
 
     let r = Routine {
         id: uuid::Uuid::new_v4().to_string(),
@@ -218,6 +235,23 @@ fn materialize_template(
         .as_object()
         .ok_or_else(|| "routine template must be a JSON object".to_string())?;
 
+    // #3010 — REJECT unknown top-level template keys instead of silently
+    // dropping them. `materialize_template` recognizes only `actions` + `edges`;
+    // pre-fix a template of `{steps:[...]}` materialized ZERO actions yet the run
+    // still reported `state:completed, error:null` (indistinguishable from a run
+    // that did its job — the #2444 shape), and `{actions,edges,UNKNOWN_KEY}`
+    // dropped UNKNOWN_KEY. The check runs BEFORE any action is inserted so an
+    // unrecognized-key template is an ATOMIC reject (no partial materialisation),
+    // recorded as a Failed run by the caller.
+    const RECOGNIZED_KEYS: [&str; 2] = ["actions", "edges"];
+    for key in template.keys() {
+        if !RECOGNIZED_KEYS.contains(&key.as_str()) {
+            return Err(format!(
+                "unrecognized template key '{key}' (recognized keys: actions, edges)"
+            ));
+        }
+    }
+
     let mut created_ids: Vec<String> = Vec::new();
 
     if let Some(actions_val) = template.get("actions") {
@@ -304,9 +338,39 @@ fn materialize_template(
                 .and_then(Value::as_str)
                 .and_then(EdgeType::from_str)
                 .unwrap_or(EdgeType::Sibling);
-            crate::actions::add_edge(conn, from_id, to_id, edge_type, now)
-                .map_err(|e| e.to_string())?;
+            // #3008 — a self-edge / ordering-cycle template edge fails the run
+            // (recorded Failed by the caller) rather than silently wedging the
+            // materialised frontier.
+            match crate::actions::add_edge(conn, from_id, to_id, edge_type, now)
+                .map_err(|e| e.to_string())?
+            {
+                crate::actions::AddEdgeOutcome::SelfEdge => {
+                    return Err(format!("template edge [{i}] is a self-edge (from == to)"));
+                }
+                crate::actions::AddEdgeOutcome::WouldCycle => {
+                    return Err(format!(
+                        "template edge [{i}] would close a cycle in the action ordering DAG"
+                    ));
+                }
+                crate::actions::AddEdgeOutcome::Added => {}
+            }
         }
+    }
+
+    // #3010 — a run that materialised ZERO actions is a distinct outcome, NOT
+    // silent success: a frozen, daemon-signed routine that produces nothing is
+    // indistinguishable from one that did its job. Surface it as a Failed run
+    // (the caller records the returned error) so `created_action_ids:[]` +
+    // `state:completed, error:null` can no longer coexist.
+    //
+    // NOTE (#3010 idempotency, DEFERRED): re-running the same routine with the
+    // same arguments materialises a fresh set of actions each time (non-
+    // idempotent), so a timeout-retry duplicates work. A run-key primitive is a
+    // design call left out of this change per the issue.
+    if created_ids.is_empty() {
+        return Err(
+            "routine template materialised zero actions (no `actions` entries)".to_string(),
+        );
     }
 
     Ok(created_ids)
@@ -872,6 +936,89 @@ mod handler_tests {
         let status = handle_routine_status(&conn, &json!({ "run_id": run_id })).expect("status ok");
         assert_eq!(status["run"]["state"].as_str(), Some("failed"));
         assert!(status["run"]["error"].as_str().is_some());
+    }
+
+    /// #3010 — an unrecognized top-level template key is REJECTED (atomically,
+    /// no partial materialisation) and the run is recorded as Failed, instead of
+    /// silently dropping the key and reporting completed/error:null.
+    #[test]
+    fn run_unknown_template_key_records_failed_run_3010() {
+        let conn = fresh();
+        let created = handle_routine_create(
+            &conn,
+            &json!({
+                "namespace": "_rt",
+                "name": "steps-routine",
+                "template": { "steps": [{ "do": "x" }] },
+            }),
+        )
+        .expect("create ok");
+        let routine_id = created[param_names::ID].as_str().expect("id").to_string();
+        handle_routine_freeze(&conn, &json!({ "id": routine_id }), None).expect("freeze ok");
+
+        let ran = handle_routine_run(&conn, &json!({ "routine_id": routine_id, "arguments": {} }))
+            .expect("run returns Ok carrying the failed run");
+        assert_eq!(ran["run"]["state"].as_str(), Some("failed"));
+        assert!(
+            ran["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unrecognized template key"),
+            "the failure names the unrecognized key: {:?}",
+            ran["error"]
+        );
+        // No actions were materialised (atomic reject).
+        assert!(
+            crate::actions::list(&conn, Some("_rt"), None, 16)
+                .expect("list")
+                .is_empty(),
+            "an unrecognized-key template materialises no actions"
+        );
+    }
+
+    /// #3010 — a template that materialises ZERO actions is a distinct FAILED
+    /// outcome, not `state:completed, error:null` (the silent-no-op #2444 shape).
+    #[test]
+    fn run_zero_materialized_actions_is_failed_3010() {
+        let conn = fresh();
+        let created = handle_routine_create(
+            &conn,
+            &json!({ "namespace": "_rt", "name": "empty", "template": { "actions": [] } }),
+        )
+        .expect("create ok");
+        let routine_id = created[param_names::ID].as_str().expect("id").to_string();
+        handle_routine_freeze(&conn, &json!({ "id": routine_id }), None).expect("freeze ok");
+
+        let ran = handle_routine_run(&conn, &json!({ "routine_id": routine_id, "arguments": {} }))
+            .expect("run returns Ok carrying the failed run");
+        assert_eq!(ran["run"]["state"].as_str(), Some("failed"));
+        assert!(
+            ran["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("zero actions"),
+            "the failure explains the zero-materialisation: {:?}",
+            ran["error"]
+        );
+    }
+
+    /// #2998 — the routine create surface validates its namespace and ALWAYS
+    /// attributes a resolved actor (an omitted `created_by` no longer stores "").
+    #[test]
+    fn create_validates_namespace_and_attributes_actor_2998() {
+        let conn = fresh();
+        assert!(
+            handle_routine_create(&conn, &json!({ "namespace": "../x", "name": "n" })).is_err(),
+            "path-traversal namespace refused"
+        );
+        let ok = handle_routine_create(&conn, &json!({ "namespace": "_rt", "name": "n" }))
+            .expect("benign create ok");
+        assert!(
+            ok["routine"]["created_by"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "omitted created_by resolves to a non-empty ambient actor"
+        );
     }
 
     #[test]

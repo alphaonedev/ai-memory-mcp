@@ -199,7 +199,14 @@ const QUAL_6_CEILING: usize = 120;
 // `consult_pre_event_gate` dispatch surface it wraps (the enclosing MCP
 // handlers are `Result<Value, String>`; the HTTP twin maps the String to a
 // typed 503 at the boundary). No new error contract. Net: +1.
-const QUAL_7_CEILING: usize = 38;
+// 2026-08-16 (#2998 coordination-plane hardening) — raised 38 → 40 for the two
+// `src/coordination_guard.rs` input-guard helpers `require_namespace` /
+// `require_payload_size` (plus `require_text`), which feed the String-error MCP
+// coordination create handlers (`handle_action_create` / `handle_signal_send` /
+// `handle_checkpoint_create` / `handle_routine_create`) via `?` (each enclosing
+// handler is `Result<Value, String>`). No new error contract — the same String
+// shape the coordination handlers already use. Measured 40.
+const QUAL_7_CEILING: usize = 40;
 
 #[test]
 fn qual_6_result_value_string_count_below_ceiling() {

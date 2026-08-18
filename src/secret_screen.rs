@@ -672,6 +672,58 @@ pub fn redact_memory_for_storage(mem: &crate::models::Memory) -> Option<crate::m
     })
 }
 
+// ── #2994 — coordination-plane caller screen ─────────────────────────────
+//
+// The coordination write plane (actions / signals / checkpoints / routines)
+// inserts caller content DIRECTLY via the `crate::{actions,signals,
+// checkpoints}` free-functions — it never crosses the `db::insert` /
+// `insert_if_newer` storage funnel that carries the origin-blind redact
+// backstop for the memory lane. So under the certified `refuse` posture a
+// pasted credential in an action title / signal body / checkpoint condition
+// was persisted verbatim (and a signal EGRESSES over `/sync/push`). These
+// two helpers close that leak on the CALLER-origin coordination path with
+// the SAME disposition the memory lane uses (`refuse` refuses, `redact`
+// stores a masked copy, `off` is byte-identical): `screen_for_caller`
+// enforces the refusal, then `redact_for_storage` / `redact_metadata_values`
+// apply the mask so the two non-refusing modes still strip the credential
+// before the direct insert. Federation-RECEIVE of a coordination row must
+// NOT refuse (it would diverge replicas) — that arm calls
+// `redact_for_storage` / `redact_metadata_values` directly.
+
+/// CALLER-origin coordination screen for a plain-text field (an action /
+/// checkpoint title, a signal subject, a routine name). Refuses under
+/// [`SecretScreenMode::Refuse`]; masks the span in place under
+/// [`SecretScreenMode::Redact`]; leaves the field byte-identical under
+/// [`SecretScreenMode::Off`] (or when no credential is detected).
+///
+/// # Errors
+/// [`SecretRefusal`] when the mode is `Refuse` and a credential is detected.
+pub fn screen_text_field_for_caller(field: &mut String) -> Result<(), SecretRefusal> {
+    screen_for_caller(field)?;
+    if let Some(redacted) = redact_for_storage(field) {
+        *field = redacted;
+    }
+    Ok(())
+}
+
+/// CALLER-origin coordination screen for a structured (JSON) field (an
+/// action payload, a signal body, a checkpoint condition, a routine
+/// template). Screens every string leaf outside the crypto/system carve-out
+/// ([`METADATA_SCREEN_CARVE_OUT_KEYS`]) so a legitimate base64 signature /
+/// pubkey is never false-refused or mangled. Same three-mode disposition as
+/// [`screen_text_field_for_caller`].
+///
+/// # Errors
+/// [`SecretRefusal`] for the first carve-out-eligible string leaf that, under
+/// `Refuse` mode, carries a credential.
+pub fn screen_json_field_for_caller(field: &mut serde_json::Value) -> Result<(), SecretRefusal> {
+    screen_metadata_values_for_caller(field)?;
+    if let Some(redacted) = redact_metadata_values(field) {
+        *field = redacted;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

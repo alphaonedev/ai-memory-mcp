@@ -12,6 +12,27 @@
 use crate::mcp::param_names;
 use serde_json::{Value, json};
 
+/// #2997 — piggyback the lease-expiry sweep on the MCP coordination read /
+/// lease surfaces so an MCP-stdio-only deployment (the default topology — no
+/// `bootstrap_serve` background `lease_sweep`, and no HTTP route to create an
+/// action or acquire a lease) still reclaims a dead worker's expired lease AND
+/// requeues its stranded `claimed` action back to `pending`. Without this, an
+/// action a dead worker claimed is stranded forever (`action_frontier` returns
+/// `[]` while `action_get` shows `state:claimed, claimed_by:ai:dead-worker`),
+/// reconciled by no surface.
+///
+/// Best-effort: a sweep failure is logged, never surfaced to the caller — the
+/// caller's own op (frontier / next / lease acquire / lease get) still runs.
+fn sweep_expired_leases_best_effort(conn: &rusqlite::Connection) {
+    let now = chrono::Utc::now().timestamp();
+    if let Err(e) = crate::actions::sweep_expired_leases_audited(conn, now) {
+        tracing::warn!(
+            target: "coordination.lease_sweep",
+            "mcp piggybacked lease sweep failed (best-effort): {e}"
+        );
+    }
+}
+
 /// MCP handler for `memory_action_create`. Builds an [`crate::models::Action`]
 /// from the request params and inserts it, returning the created action
 /// as JSON.
@@ -29,12 +50,12 @@ pub fn handle_action_create(conn: &rusqlite::Connection, params: &Value) -> Resu
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let title = params
+    let mut title = params
         .get(param_names::TITLE)
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let payload = params
+    let mut payload = params
         .get(param_names::PAYLOAD)
         .cloned()
         .unwrap_or(Value::Null);
@@ -46,10 +67,43 @@ pub fn handle_action_create(conn: &rusqlite::Connection, params: &Value) -> Resu
         .get(param_names::AGENT_ID)
         .and_then(Value::as_str)
         .map(str::to_string);
-    let metadata = params
+    let mut metadata = params
         .get(param_names::METADATA)
         .cloned()
         .unwrap_or(Value::Null);
+
+    // #2998 — validate the coordination create inputs (namespace + text/payload
+    // length caps + a validated, ALWAYS-attributed actor) before building the
+    // row. An omitted `agent_id` resolves to the durable ambient id so the
+    // write is always quota-charged (closing the omit-agent_id uncharged +
+    // unbounded gap); a caller-supplied `agent_id` is shape-validated so
+    // whitespace / control chars cannot be log-injected into the audit trail.
+    crate::coordination_guard::require_namespace(&namespace)?;
+    crate::coordination_guard::require_text(
+        param_names::TITLE,
+        &title,
+        crate::coordination_guard::MAX_TEXT_FIELD_BYTES,
+    )?;
+    crate::coordination_guard::require_text(
+        param_names::KIND,
+        &kind,
+        crate::coordination_guard::MAX_KIND_BYTES,
+    )?;
+    crate::coordination_guard::require_payload_size(param_names::PAYLOAD, &payload)?;
+    let actor = crate::coordination_guard::resolve_actor(agent_id.as_deref())?;
+
+    // #2994 — the coordination write plane bypasses the memory-lane storage
+    // funnel, so screen the caller-origin credential vectors here: refuse under
+    // `SECRET_SCREEN_MODE=refuse`, mask under `redact`, byte-identical under
+    // `off`. Screens the same fields the #2994 evidence stored verbatim
+    // (title / payload) plus metadata; `kind` is a short discriminator and is
+    // left unscreened so a redact never mangles it.
+    crate::secret_screen::screen_text_field_for_caller(&mut title).map_err(|r| r.to_string())?;
+    crate::secret_screen::screen_json_field_for_caller(&mut payload).map_err(|r| r.to_string())?;
+    if !metadata.is_null() {
+        crate::secret_screen::screen_json_field_for_caller(&mut metadata)
+            .map_err(|r| r.to_string())?;
+    }
 
     let now = chrono::Utc::now().timestamp();
     let action = crate::models::Action {
@@ -60,7 +114,7 @@ pub fn handle_action_create(conn: &rusqlite::Connection, params: &Value) -> Resu
         title,
         payload,
         priority,
-        agent_id,
+        agent_id: Some(actor),
         claimed_by: None,
         vector_clock: json!({}),
         metadata,
@@ -162,6 +216,29 @@ pub fn handle_action_transition(
         .map(str::to_string);
 
     let now = chrono::Utc::now().timestamp();
+
+    // #3009 — the LOCAL transition lane took `claimed_by` verbatim, consulted no
+    // lease and checked no identity, so two agents could each believe they own
+    // an action and a `claimed_by` with embedded newlines flowed into the
+    // coordination_audit identity fields. Mirror the federation lane's
+    // actor→lease binding on the local lane: (1) shape-validate a caller-
+    // supplied `claimed_by`; (2) BIND it to the live lease holder — a
+    // transition whose `claimed_by` is not the current (non-expired) lease
+    // holder is refused. Actions coordinated without a lease are unbound
+    // (leases are the ownership primitive), so this never blocks the
+    // lease-free flow.
+    if let Some(cb) = claimed_by.as_deref() {
+        crate::validate::validate_agent_id(cb).map_err(|e| e.to_string())?;
+        if let Some(lease) = crate::actions::lease_get(conn, id).map_err(|e| e.to_string())? {
+            if lease.expires_at > now && lease.holder != cb {
+                return Err(format!(
+                    "claimed_by '{cb}' is not the live lease holder '{}' on action {id}",
+                    lease.holder
+                ));
+            }
+        }
+    }
+
     match crate::actions::transition(conn, id, to, claimed_by.as_deref(), now)
         .map_err(|e| e.to_string())?
     {
@@ -245,8 +322,25 @@ pub fn handle_action_add_edge(
         .ok_or_else(|| "invalid edge_type".to_string())?;
 
     let now = chrono::Utc::now().timestamp();
-    crate::actions::add_edge(conn, from_action, to_action, edge_type, now)
-        .map_err(|e| e.to_string())?;
+    // #3008 — refuse a self-edge / ordering-cycle edge (both permanently wedge
+    // the frontier) instead of silently accepting it.
+    match crate::actions::add_edge(conn, from_action, to_action, edge_type, now)
+        .map_err(|e| e.to_string())?
+    {
+        crate::actions::AddEdgeOutcome::SelfEdge => {
+            return Err(format!(
+                "refused self-edge {from_action} --{edge_type_name}--> {from_action}: an action \
+                 cannot depend on itself"
+            ));
+        }
+        crate::actions::AddEdgeOutcome::WouldCycle => {
+            return Err(format!(
+                "refused edge {from_action} --{edge_type_name}--> {to_action}: it would close a \
+                 cycle in the action ordering DAG (mutual deadlock)"
+            ));
+        }
+        crate::actions::AddEdgeOutcome::Added => {}
+    }
 
     // #1722 — coordination observability: best-effort audit row for the edge
     // insert. The add-edge handler carries NO actor/principal field, so the
@@ -303,6 +397,9 @@ pub fn handle_action_frontier(
     conn: &rusqlite::Connection,
     params: &Value,
 ) -> Result<Value, String> {
+    // #2997 — reclaim expired leases + requeue stranded claimed actions before
+    // computing the frontier, so a dead worker's action re-appears here.
+    sweep_expired_leases_best_effort(conn);
     let namespace = params
         .get(param_names::NAMESPACE)
         .and_then(Value::as_str)
@@ -327,6 +424,8 @@ pub fn handle_action_frontier(
 /// # Errors
 /// Returns the stringified `rusqlite` error on query failure.
 pub fn handle_action_next(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+    // #2997 — sweep before selecting the next action (see handle_action_frontier).
+    sweep_expired_leases_best_effort(conn);
     let namespace = params
         .get(param_names::NAMESPACE)
         .and_then(Value::as_str)
@@ -365,6 +464,9 @@ pub fn handle_action_next(conn: &rusqlite::Connection, params: &Value) -> Result
 ///   is held by a different holder.
 /// - The stringified `rusqlite` error on query/insert failure.
 pub fn handle_lease_acquire(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+    // #2997 — reclaim any expired leases (and requeue their stranded actions)
+    // before this acquire, so a dead holder's lease + claim is reconciled.
+    sweep_expired_leases_best_effort(conn);
     let action_id = params
         .get(param_names::ACTION_ID)
         .and_then(Value::as_str)
@@ -383,10 +485,19 @@ pub fn handle_lease_acquire(conn: &rusqlite::Connection, params: &Value) -> Resu
     // an unbounded ttl_secs mints a never-reclaimed lease (coordination
     // starvation) and `now + ttl_secs` overflow-panics on i64::MAX.
     crate::validate::validate_ttl_secs(Some(ttl_secs)).map_err(|e| e.to_string())?;
+    // Minor (A6-13) — acquiring a lease on a MISSING action would surface the
+    // raw `leases.action_id` FK-constraint violation; return the typed
+    // not-found instead (mirrors `handle_action_transition`'s not-found shape).
+    if crate::actions::get(conn, action_id)
+        .map_err(|e| e.to_string())?
+        .is_none()
+    {
+        return Err(format!("action not found: {action_id}"));
+    }
     let now = chrono::Utc::now().timestamp();
     let expires_at = now
         .checked_add(ttl_secs)
-        .ok_or_else(|| "ttl_secs overflow".to_string())?;
+        .ok_or_else(|| crate::coordination_guard::TTL_SECS_OVERFLOW.to_string())?;
     match crate::actions::lease_acquire(conn, action_id, holder, now, expires_at)
         .map_err(|e| e.to_string())?
     {
@@ -436,7 +547,7 @@ pub fn handle_lease_renew(conn: &rusqlite::Connection, params: &Value) -> Result
     let now = chrono::Utc::now().timestamp();
     let expires_at = now
         .checked_add(ttl_secs)
-        .ok_or_else(|| "ttl_secs overflow".to_string())?;
+        .ok_or_else(|| crate::coordination_guard::TTL_SECS_OVERFLOW.to_string())?;
     match crate::actions::lease_renew(conn, action_id, holder, now, expires_at)
         .map_err(|e| e.to_string())?
     {
@@ -1268,6 +1379,159 @@ mod handler_tests {
         assert!(bad_edge.is_err());
     }
 
+    /// #3009 — the transition lane binds `claimed_by` to the live lease holder:
+    /// a caller transitioning with a `claimed_by` that is not the current lease
+    /// holder is refused (so two agents cannot each believe they own the
+    /// action); a control-char `claimed_by` is refused (log-injection guard).
+    #[test]
+    fn transition_binds_claimed_by_to_live_lease_holder_3009() {
+        let conn = fresh();
+        let created = handle_action_create(
+            &conn,
+            &json!({ "namespace": "_act", "kind": "k", "title": "t" }),
+        )
+        .expect("create ok");
+        let id = created[param_names::ID].as_str().expect("id").to_string();
+
+        // Worker w1 acquires the lease.
+        handle_lease_acquire(
+            &conn,
+            &json!({ "action_id": id, "holder": "ai:w1", "ttl_secs": 120 }),
+        )
+        .expect("acquire ok");
+
+        // w2 (not the lease holder) is refused.
+        let err = handle_action_transition(
+            &conn,
+            &json!({ "id": id, "to": "claimed", "claimed_by": "ai:w2" }),
+        )
+        .expect_err("a non-holder transition must be refused");
+        assert!(err.contains("not the live lease holder"), "{err}");
+
+        // The lease holder w1 can transition.
+        handle_action_transition(
+            &conn,
+            &json!({ "id": id, "to": "claimed", "claimed_by": "ai:w1" }),
+        )
+        .expect("the lease holder transitions ok");
+
+        // A control-char claimed_by is refused (audit log-injection guard).
+        assert!(
+            handle_action_transition(
+                &conn,
+                &json!({ "id": id, "to": "in_progress", "claimed_by": "bad\nid" })
+            )
+            .is_err(),
+            "control-char claimed_by refused"
+        );
+    }
+
+    /// #3008 — the add-edge handler refuses a self-edge and an ordering cycle
+    /// with a descriptive error (instead of silently wedging the frontier).
+    #[test]
+    fn add_edge_handler_refuses_self_edge_and_cycle_3008() {
+        let conn = fresh();
+        for t in ["a", "b"] {
+            handle_action_create(
+                &conn,
+                &json!({ "namespace": "_act", "kind": "k", "title": t, "agent_id": "ai:w" }),
+            )
+            .expect("create ok");
+        }
+        // Fetch ids by listing (create returns them, but list is simpler here).
+        let listed = handle_action_list(&conn, &json!({ "namespace": "_act" })).expect("list");
+        let ids: Vec<String> = listed["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_str().unwrap().to_string())
+            .collect();
+        let (a_id, b_id) = (&ids[0], &ids[1]);
+
+        // Self-edge refused with a descriptive message.
+        let self_err = handle_action_add_edge(
+            &conn,
+            &json!({ "from_action": a_id, "to_action": a_id, "edge_type": "requires" }),
+        )
+        .expect_err("self-edge refused");
+        assert!(self_err.contains("self-edge"), "{self_err}");
+
+        // a requires b is fine; b requires a would cycle → refused.
+        handle_action_add_edge(
+            &conn,
+            &json!({ "from_action": a_id, "to_action": b_id, "edge_type": "requires" }),
+        )
+        .expect("a requires b ok");
+        let cycle_err = handle_action_add_edge(
+            &conn,
+            &json!({ "from_action": b_id, "to_action": a_id, "edge_type": "requires" }),
+        )
+        .expect_err("cycle refused");
+        assert!(cycle_err.contains("cycle"), "{cycle_err}");
+    }
+
+    /// #2997 — on an MCP-stdio-only deployment (no background sweep), the
+    /// coordination read/lease surfaces piggyback the lease-expiry sweep: a dead
+    /// worker's expired lease is reclaimed and its stranded `claimed` action is
+    /// requeued to `pending`, so `memory_action_frontier` surfaces it again
+    /// instead of stranding it forever.
+    #[test]
+    fn frontier_sweeps_expired_leases_and_requeues_stranded_action_2997() {
+        let conn = fresh();
+        let created = handle_action_create(
+            &conn,
+            &json!({ "namespace": "_act", "kind": "k", "title": "t" }),
+        )
+        .expect("create ok");
+        let id = created[param_names::ID].as_str().expect("id").to_string();
+
+        // A dead worker claims the action, holding a lease that is ALREADY
+        // expired (inserted directly to bypass the ttl>0 clamp).
+        handle_action_transition(
+            &conn,
+            &json!({ "id": id, "to": "claimed", "claimed_by": "ai:dead-worker" }),
+        )
+        .expect("claim ok");
+        let now = chrono::Utc::now().timestamp();
+        crate::actions::lease_acquire(&conn, &id, "ai:dead-worker", now - 100, now - 1)
+            .expect("acquire an already-expired lease");
+
+        // The claimed action is stranded (absent from the frontier); the
+        // frontier handler's piggybacked sweep reclaims + requeues it.
+        let f =
+            handle_action_frontier(&conn, &json!({ "namespace": "_act" })).expect("frontier ok");
+        let ids: Vec<&str> = f["actions"]
+            .as_array()
+            .expect("actions array")
+            .iter()
+            .filter_map(|a| a["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&id.as_str()),
+            "the stranded action is requeued and back on the frontier"
+        );
+
+        // It is pending again with the dead holder's claim cleared.
+        let got = crate::actions::get(&conn, &id)
+            .expect("get")
+            .expect("present");
+        assert_eq!(got.state, crate::models::ActionState::Pending);
+        assert!(
+            got.claimed_by.is_none(),
+            "the dead worker's claim is cleared"
+        );
+    }
+
+    /// A6-13 — acquiring a lease on a MISSING action returns a typed not-found,
+    /// not the raw `leases.action_id` FK-constraint error.
+    #[test]
+    fn lease_acquire_missing_action_is_typed_not_found() {
+        let conn = fresh();
+        let err = handle_lease_acquire(&conn, &json!({ "action_id": "nope", "holder": "h" }))
+            .expect_err("a lease on a missing action must be a typed not-found");
+        assert!(err.contains("action not found"), "{err}");
+    }
+
     #[test]
     fn lease_acquire_renew_release_get_roundtrip_over_mcp() {
         let conn = fresh();
@@ -1336,12 +1600,73 @@ mod handler_tests {
         )
         .expect("create ok");
         assert_eq!(created["action"]["priority"].as_i64(), Some(0));
-        assert!(created["action"]["agent_id"].is_null());
+        // #2998 — an omitted agent_id no longer stores NULL: the create resolves
+        // the durable ambient actor so every action is attributed + quota-charged.
+        assert!(
+            created["action"]["agent_id"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "omitted agent_id resolves to a non-empty ambient actor"
+        );
         // created_at/updated_at are populated, non-zero unix seconds.
         let created_at = created["action"]["created_at"]
             .as_i64()
             .expect("created_at present");
         assert!(created_at > 0);
+    }
+
+    /// #2998 — the create surface validates its inputs and ALWAYS attributes a
+    /// resolved actor: a path-traversal namespace, an empty title, an oversized
+    /// payload, and a control-char `agent_id` (log-injection into the audit
+    /// identity fields) are all refused; an omitted `agent_id` resolves to a
+    /// non-empty ambient actor so the write is charged rather than uncharged.
+    #[test]
+    fn action_create_validates_inputs_and_attributes_actor_2998() {
+        let conn = fresh();
+        assert!(
+            handle_action_create(
+                &conn,
+                &json!({ "namespace": "../../etc/passwd", "kind": "k", "title": "t" })
+            )
+            .is_err(),
+            "path-traversal namespace refused"
+        );
+        assert!(
+            handle_action_create(
+                &conn,
+                &json!({ "namespace": "_act", "kind": "k", "title": "  " })
+            )
+            .is_err(),
+            "empty title refused"
+        );
+        let big = "x".repeat(70_000);
+        assert!(
+            handle_action_create(
+                &conn,
+                &json!({ "namespace": "_act", "kind": "k", "title": "t", "payload": { "b": big } })
+            )
+            .is_err(),
+            "oversized payload refused"
+        );
+        assert!(
+            handle_action_create(
+                &conn,
+                &json!({ "namespace": "_act", "kind": "k", "title": "t", "agent_id": "bad\nid" })
+            )
+            .is_err(),
+            "control-char agent_id refused (log-injection guard)"
+        );
+        let ok = handle_action_create(
+            &conn,
+            &json!({ "namespace": "_act", "kind": "k", "title": "t" }),
+        )
+        .expect("benign create ok");
+        assert!(
+            ok["action"]["agent_id"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "omitted agent_id resolves to a non-empty ambient actor"
+        );
     }
 
     #[test]

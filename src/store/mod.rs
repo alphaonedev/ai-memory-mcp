@@ -2900,8 +2900,15 @@ pub trait MemoryStore: Send + Sync {
     }
 
     /// #1709 Pillar 1 — resolve a checkpoint: set state + `resolved_by` +
-    /// `resolution` + `resolution_note` + `resolved_at`. Returns the resolved
-    /// row, or `None` when the id does not exist.
+    /// `resolution` + `resolution_note` + `resolved_at`.
+    ///
+    /// #2995 — FIRST-RESOLUTION-WINS: the write fires ONLY while the checkpoint
+    /// is still `pending`, so an already-resolved separation-of-duties freeze
+    /// anchor can never be silently overwritten. Returns
+    /// [`crate::checkpoints::ResolveOutcome`]: `Resolved` (this call won the
+    /// pending→resolved transition), `NotFound` (no such id), or `Conflict`
+    /// (already resolved locally — the prior verdict + attestation is kept and
+    /// this resolve refused).
     ///
     /// When `keypair` is `Some(kp)` AND `kp.can_sign()`, the resolved row's
     /// canonical RESOLUTION (the separation-of-duties attestation) is
@@ -2921,7 +2928,7 @@ pub trait MemoryStore: Send + Sync {
         _resolution_note: Option<&str>,
         _resolved_at: i64,
         _keypair: Option<&crate::identity::keypair::AgentKeypair>,
-    ) -> StoreResult<Option<crate::models::Checkpoint>> {
+    ) -> StoreResult<crate::checkpoints::ResolveOutcome> {
         Err(StoreError::UnsupportedCapability {
             capability: CAP_CHECKPOINTS.to_string(),
         })

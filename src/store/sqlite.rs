@@ -1450,7 +1450,21 @@ impl MemoryStore for SqliteStore {
         now: i64,
     ) -> StoreResult<()> {
         let conn = self.state.lock().await;
-        crate::actions::add_edge(&conn, from_action, to_action, edge_type, now).map_err(box_err)
+        // #3008 — a self-edge / ordering-cycle edge is refused (would wedge the
+        // frontier). The typed outcome is mapped to an integrity error here.
+        match crate::actions::add_edge(&conn, from_action, to_action, edge_type, now)
+            .map_err(box_err)?
+        {
+            crate::actions::AddEdgeOutcome::Added => Ok(()),
+            crate::actions::AddEdgeOutcome::SelfEdge => Err(StoreError::IntegrityFailed {
+                detail: format!("refused self-edge on action {from_action}"),
+            }),
+            crate::actions::AddEdgeOutcome::WouldCycle => Err(StoreError::IntegrityFailed {
+                detail: format!(
+                    "refused edge {from_action} -> {to_action}: would close an ordering cycle"
+                ),
+            }),
+        }
     }
 
     async fn action_edges_for(
@@ -1652,7 +1666,7 @@ impl MemoryStore for SqliteStore {
         resolution_note: Option<&str>,
         resolved_at: i64,
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
-    ) -> StoreResult<Option<crate::models::Checkpoint>> {
+    ) -> StoreResult<crate::checkpoints::ResolveOutcome> {
         let conn = self.state.lock().await;
         crate::checkpoints::resolve(
             &conn,

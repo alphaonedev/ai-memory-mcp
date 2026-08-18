@@ -601,6 +601,11 @@ pub mod content_patch;
 /// after every coordination state-mutation (signal / action / lease /
 /// checkpoint / routine).
 pub mod coordination_audit;
+/// #2994 / #2998 — caller-origin input guards shared by the coordination write
+/// plane (actions / signals / checkpoints / routines): namespace validation,
+/// text / payload length caps, and ambient-actor resolution so every create
+/// surface enforces one set of bounds and is always attributed + quota-charged.
+pub mod coordination_guard;
 pub mod curator;
 pub mod daemon_runtime;
 pub mod durability;

@@ -288,6 +288,11 @@ pub fn list(
 /// - blockers: a `blocks` edge whose `to_action` is the candidate, from a
 ///   blocker that is not yet terminal (`done`/`failed`/`abandoned`), keeps it
 ///   blocked.
+/// - unlockers (#3008): an `unlocks` edge whose `to_action` is the candidate
+///   ("`from` unlocks `to` on completion"), from an unlocker that is not yet
+///   `done`, keeps the candidate blocked. Pre-#3008 `EdgeType::Unlocks` had
+///   ZERO effect on the frontier — a caller modelling a dependency via
+///   `unlocks` got silent no-ordering, even though the edge documents one.
 ///
 /// `?1` is the namespace; the caller appends the ordering + limit binds.
 fn frontier_where_tail() -> String {
@@ -302,12 +307,17 @@ fn frontier_where_tail() -> String {
            AND NOT EXISTS ( \
              SELECT 1 FROM action_edges e JOIN actions b ON b.id = e.from_action \
              WHERE e.to_action = a.id AND e.edge_type = '{blocks}' \
-               AND b.state NOT IN ('{done}', '{failed}', '{abandoned}'))",
+               AND b.state NOT IN ('{done}', '{failed}', '{abandoned}')) \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM action_edges e JOIN actions b ON b.id = e.from_action \
+             WHERE e.to_action = a.id AND e.edge_type = '{unlocks}' \
+               AND b.state <> '{done}')",
         pending = ActionState::Pending.as_str(),
         requires = EdgeType::Requires.as_str(),
         gated_by = EdgeType::GatedBy.as_str(),
         done = ActionState::Done.as_str(),
         blocks = EdgeType::Blocks.as_str(),
+        unlocks = EdgeType::Unlocks.as_str(),
         failed = ActionState::Failed.as_str(),
         abandoned = ActionState::Abandoned.as_str(),
     )
@@ -366,24 +376,83 @@ pub fn next_action(
     .optional()
 }
 
+/// Disposition of an [`add_edge`] attempt (#3008). A self-edge or a cycle in
+/// the ordering DAG permanently wedges the frontier (the node can never satisfy
+/// its own prerequisite), so both are refused BEFORE the insert rather than
+/// silently accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddEdgeOutcome {
+    /// The edge was inserted (or already existed — `INSERT OR IGNORE`).
+    Added,
+    /// Refused: `from_action == to_action`. A self-edge (e.g. `A requires A`)
+    /// keeps `A` off its own frontier forever.
+    SelfEdge,
+    /// Refused: the edge would close a cycle in the ordering DAG (e.g.
+    /// `A requires B` with `B requires A` — mutual deadlock; both wedge the
+    /// frontier). Sibling edges impose no ordering and are never cycle-checked.
+    WouldCycle,
+}
+
+/// Whether adding an ordering arc `from_action -> to_action` would close a
+/// cycle — i.e. whether `to_action` already reaches `from_action` via
+/// non-`sibling` arcs. The memory lineage DAG has the analogous acyclicity
+/// guard (#1859); an action cycle wedges the frontier the same way. Sibling
+/// arcs impose no ordering, so they are excluded from the reachability walk.
+///
+/// # Errors
+/// Propagates the `rusqlite` query error (the caller MUST fail closed — an
+/// unresolvable reachability probe cannot be treated as "no cycle").
+fn ordering_edge_would_cycle(
+    conn: &Connection,
+    from_action: &str,
+    to_action: &str,
+) -> rusqlite::Result<bool> {
+    let sql = format!(
+        "WITH RECURSIVE reach(node) AS ( \
+             SELECT ?1 \
+             UNION \
+             SELECT e.to_action FROM action_edges e JOIN reach r ON e.from_action = r.node \
+             WHERE e.edge_type <> '{sibling}') \
+         SELECT 1 FROM reach WHERE node = ?2 LIMIT 1",
+        sibling = crate::models::EdgeType::Sibling.as_str(),
+    );
+    let reachable: Option<i64> = conn
+        .query_row(&sql, params![to_action, from_action], |r| r.get(0))
+        .optional()?;
+    Ok(reachable.is_some())
+}
+
 /// Insert a typed DAG edge between two actions. `INSERT OR IGNORE` so a
 /// duplicate `(from, to, type)` triple is a no-op.
 ///
+/// #3008 — a self-edge or an ordering cycle is REFUSED (returns
+/// [`AddEdgeOutcome::SelfEdge`] / [`AddEdgeOutcome::WouldCycle`], no insert)
+/// rather than silently wedging the frontier. Sibling edges impose no ordering
+/// and skip the cycle check (a self-sibling is still refused as pointless).
+///
 /// # Errors
-/// Propagates the `rusqlite` insert error.
+/// Propagates the `rusqlite` insert / reachability-query error.
 pub fn add_edge(
     conn: &Connection,
     from_action: &str,
     to_action: &str,
     edge_type: crate::models::EdgeType,
     now: i64,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<AddEdgeOutcome> {
+    if from_action == to_action {
+        return Ok(AddEdgeOutcome::SelfEdge);
+    }
+    if edge_type != crate::models::EdgeType::Sibling
+        && ordering_edge_would_cycle(conn, from_action, to_action)?
+    {
+        return Ok(AddEdgeOutcome::WouldCycle);
+    }
     conn.execute(
         "INSERT OR IGNORE INTO action_edges (from_action, to_action, edge_type, created_at) \
          VALUES (?1, ?2, ?3, ?4)",
         params![from_action, to_action, edge_type.as_str(), now],
     )?;
-    Ok(())
+    Ok(AddEdgeOutcome::Added)
 }
 
 /// List every edge touching `action_id` (as either endpoint), oldest-first.
@@ -977,6 +1046,90 @@ mod tests {
         assert!(
             ids.contains(&"A"),
             "A reappears once prerequisite C is done"
+        );
+    }
+
+    /// #3008 — `EdgeType::Unlocks` now gates the frontier: `A unlocks C` keeps
+    /// C off the frontier until A is `done`. Pre-fix the edge was INERT and C
+    /// was on the frontier immediately (silent no-ordering on an ordering edge).
+    #[test]
+    fn unlocks_edge_gates_the_frontier_3008() {
+        use crate::models::EdgeType;
+        let conn = fresh();
+        let a = sample("UA");
+        create(&conn, &a).unwrap();
+        let c = sample("UC");
+        create(&conn, &c).unwrap();
+        // A unlocks C on completion.
+        assert_eq!(
+            add_edge(&conn, "UA", "UC", EdgeType::Unlocks, 1_700_000_000).unwrap(),
+            AddEdgeOutcome::Added
+        );
+        let ids: Vec<String> = frontier(&conn, "_act", 50)
+            .unwrap()
+            .into_iter()
+            .map(|x| x.id)
+            .collect();
+        assert!(
+            !ids.contains(&"UC".to_string()),
+            "C is gated by the not-yet-done unlocker A"
+        );
+        assert!(ids.contains(&"UA".to_string()), "the unlocker A is ready");
+
+        // A reaches Done → C surfaces on the frontier.
+        transition(&conn, "UA", ActionState::Claimed, None, 1_700_000_010).unwrap();
+        transition(&conn, "UA", ActionState::InProgress, None, 1_700_000_020).unwrap();
+        transition(&conn, "UA", ActionState::Done, None, 1_700_000_030).unwrap();
+        let ids: Vec<String> = frontier(&conn, "_act", 50)
+            .unwrap()
+            .into_iter()
+            .map(|x| x.id)
+            .collect();
+        assert!(
+            ids.contains(&"UC".to_string()),
+            "C is unlocked once A is done"
+        );
+    }
+
+    /// #3008 — `add_edge` refuses a self-edge and an ordering cycle (both wedge
+    /// the frontier permanently), instead of silently accepting them.
+    #[test]
+    fn add_edge_rejects_self_edge_and_cycle_3008() {
+        use crate::models::EdgeType;
+        let conn = fresh();
+        create(&conn, &sample("X")).unwrap();
+        create(&conn, &sample("Y")).unwrap();
+
+        // Self-edge refused.
+        assert_eq!(
+            add_edge(&conn, "X", "X", EdgeType::Requires, 1_700_000_000).unwrap(),
+            AddEdgeOutcome::SelfEdge
+        );
+        // X requires Y is fine.
+        assert_eq!(
+            add_edge(&conn, "X", "Y", EdgeType::Requires, 1_700_000_001).unwrap(),
+            AddEdgeOutcome::Added
+        );
+        // Y requires X would close the X<->Y cycle → refused.
+        assert_eq!(
+            add_edge(&conn, "Y", "X", EdgeType::Requires, 1_700_000_002).unwrap(),
+            AddEdgeOutcome::WouldCycle
+        );
+        // A cross-type cycle (X --blocks--> Y already exists via requires; a
+        // Y --unlocks--> X arc also closes the ordering cycle) is refused.
+        assert_eq!(
+            add_edge(&conn, "Y", "X", EdgeType::Unlocks, 1_700_000_003).unwrap(),
+            AddEdgeOutcome::WouldCycle
+        );
+        // A sibling edge imposes no ordering, so even a "back" sibling arc is OK.
+        assert_eq!(
+            add_edge(&conn, "Y", "X", EdgeType::Sibling, 1_700_000_004).unwrap(),
+            AddEdgeOutcome::Added
+        );
+        // But a self-sibling is still refused as pointless.
+        assert_eq!(
+            add_edge(&conn, "X", "X", EdgeType::Sibling, 1_700_000_005).unwrap(),
+            AddEdgeOutcome::SelfEdge
         );
     }
 

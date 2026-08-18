@@ -201,6 +201,10 @@ pub fn get(conn: &Connection, id: &str) -> rusqlite::Result<Option<Signal>> {
 /// is `Some`, returns both direct messages (`to_agent = ?2`) and broadcasts
 /// (`to_agent IS NULL`); when `None`, returns every signal in the namespace.
 ///
+/// #3011 — ACKNOWLEDGED signals are excluded (`acknowledged_at IS NULL`): an
+/// inbox that keeps re-returning acked signals re-serves the same work forever.
+/// Use [`thread`] / [`get`] to read an already-acked signal by correlation / id.
+///
 /// # Errors
 /// Propagates the `rusqlite` query error.
 pub fn list_inbox(
@@ -210,7 +214,7 @@ pub fn list_inbox(
     limit: usize,
 ) -> rusqlite::Result<Vec<Signal>> {
     let lim = i64::try_from(limit).unwrap_or(i64::MAX);
-    let mut sql = format!("{SIGNAL_SELECT_SQL} WHERE namespace = ?");
+    let mut sql = format!("{SIGNAL_SELECT_SQL} WHERE namespace = ? AND acknowledged_at IS NULL");
     let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(namespace.to_string())];
     if let Some(agent) = to_agent {
         sql.push_str(" AND (to_agent = ? OR to_agent IS NULL)");
@@ -244,6 +248,30 @@ pub fn thread(conn: &Connection, correlation_id: &str) -> rusqlite::Result<Vec<S
         out.push(r?);
     }
     Ok(out)
+}
+
+/// #3011 — retention: delete every signal whose caller-declared `expires_at`
+/// has passed (`expires_at IS NOT NULL AND expires_at <= now`). Only
+/// caller-declared-ephemeral signals are reaped, so this is intended TTL
+/// expiry, never unintentional loss of a durable record. Returns the number of
+/// rows deleted. Driven best-effort from the `db::gc` chokepoint so every gc
+/// topology (serve daemon, MCP stdio, CLI) prunes without a background loop.
+///
+/// The blanket time-based retention of the OTHER coordination tables (acked /
+/// non-expiring signals, terminal actions, resolved checkpoints, routine_runs)
+/// is DEFERRED: resolved checkpoints are attested separation-of-duties freeze
+/// anchors, so their retention posture is a data-integrity (T3/T4) design call
+/// that needs a 5-agent vote + an archive-before-delete design, not a raw
+/// `DELETE`. See the #3011 report note.
+///
+/// # Errors
+/// Propagates the `rusqlite` delete error.
+pub fn prune_expired(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
+    let n = conn.execute(
+        "DELETE FROM signals WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+        params![now],
+    )?;
+    Ok(n)
 }
 
 /// Stamp `delivered_at` on a signal once. Returns `true` when this call set
@@ -359,6 +387,61 @@ mod tests {
         // to_agent = None returns every signal in the namespace.
         let all = list_inbox(&conn, "_sig", None, 50).unwrap();
         assert_eq!(all.len(), 3);
+    }
+
+    /// #3011 — acknowledged signals are excluded from the inbox (an acked inbox
+    /// that re-returns the same signal re-serves the same work forever).
+    #[test]
+    fn list_inbox_excludes_acked_signals_3011() {
+        let conn = fresh();
+        insert(&conn, &sample("unacked")).unwrap();
+        let mut acked = sample("acked");
+        acked.created_at = 1_700_000_100;
+        insert(&conn, &acked).unwrap();
+        assert!(mark_acked(&conn, "acked", 1_700_000_200).unwrap());
+
+        let inbox = list_inbox(&conn, "_sig", Some("agent-to"), 50).unwrap();
+        let ids: Vec<&str> = inbox.iter().map(|s| s.id.as_str()).collect();
+        assert!(
+            ids.contains(&"unacked"),
+            "an unacked signal is in the inbox"
+        );
+        assert!(
+            !ids.contains(&"acked"),
+            "an acked signal is excluded from the inbox"
+        );
+        // The namespace-wide view (to_agent = None) also excludes acked signals.
+        let all = list_inbox(&conn, "_sig", None, 50).unwrap();
+        assert_eq!(all.len(), 1, "only the unacked signal remains in the inbox");
+    }
+
+    /// #3011 — `prune_expired` reaps ONLY caller-declared-ephemeral signals whose
+    /// `expires_at` has passed; non-expiring + future-expiring signals survive.
+    #[test]
+    fn prune_expired_reaps_only_expired_signals_3011() {
+        let conn = fresh();
+        insert(&conn, &sample("keep")).unwrap();
+        let mut future = sample("future");
+        future.expires_at = Some(2_000_000_000);
+        insert(&conn, &future).unwrap();
+        let mut past = sample("past");
+        past.expires_at = Some(1_000_000_000);
+        insert(&conn, &past).unwrap();
+
+        let n = prune_expired(&conn, 1_700_000_000).unwrap();
+        assert_eq!(n, 1, "only the past-expiry signal is reaped");
+        assert!(
+            get(&conn, "keep").unwrap().is_some(),
+            "non-expiring survives"
+        );
+        assert!(
+            get(&conn, "future").unwrap().is_some(),
+            "future-expiring survives"
+        );
+        assert!(
+            get(&conn, "past").unwrap().is_none(),
+            "past-expiring reaped"
+        );
     }
 
     #[test]

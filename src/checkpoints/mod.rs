@@ -274,9 +274,37 @@ pub fn query(
     Ok(out)
 }
 
-/// Resolve a checkpoint: set `state` + `resolved_by` + `resolution` +
-/// `resolution_note` + `resolved_at`. Returns the resolved row, or `None`
-/// if the id does not exist.
+/// Disposition of a LOCAL checkpoint [`resolve`] under first-resolution-wins
+/// (#2995). A separation-of-duties freeze anchor is an authority record: once
+/// resolved it MUST NOT be silently overwritten (that would destroy the prior
+/// signed attestation and let a peer be made to converge on the rewrite —
+/// unintentional loss of an attested authority record).
+#[derive(Debug, Clone)]
+pub enum ResolveOutcome {
+    /// The checkpoint was PENDING and is now resolved to the requested state.
+    Resolved(Box<Checkpoint>),
+    /// No checkpoint row with that id exists.
+    NotFound,
+    /// The checkpoint is ALREADY resolved (or otherwise non-pending) locally.
+    /// First-resolution-wins: the prior resolution + attestation is KEPT and
+    /// this resolve is refused. Carries the existing (unchanged) row so the
+    /// caller can report who won.
+    Conflict(Box<Checkpoint>),
+}
+
+/// The CAS `AND state = ?7` guard binding [`CheckpointState::Pending`] — what
+/// makes the LOCAL resolve first-resolution-wins (#2995). Without it the
+/// UPDATE overwrites an already-resolved authority record (its prior
+/// `resolved_by` / `resolution` / signature GONE), the same TOCTOU the
+/// federation ingress ([`APPLY_INBOUND_RESOLUTION_CAS_SQL`]) already closes.
+const RESOLVE_CAS_SQL: &str = "UPDATE checkpoints SET state = ?1, resolved_by = ?2, resolution = ?3, \
+            resolution_note = ?4, resolved_at = ?5 WHERE id = ?6 AND state = ?7";
+
+/// Resolve a PENDING checkpoint: set `state` + `resolved_by` + `resolution` +
+/// `resolution_note` + `resolved_at`. Under first-resolution-wins (#2995) the
+/// UPDATE fires ONLY while the checkpoint is still `pending`; a checkpoint that
+/// is already resolved is a [`ResolveOutcome::Conflict`] (local kept, this
+/// resolve refused), and an absent id is [`ResolveOutcome::NotFound`].
 ///
 /// When `keypair` is `Some(kp)` AND `kp.can_sign()`, the resolved row's
 /// canonical RESOLUTION (the separation-of-duties attestation: who resolved
@@ -303,10 +331,9 @@ pub fn resolve(
     resolution_note: Option<&str>,
     resolved_at: i64,
     keypair: Option<&AgentKeypair>,
-) -> rusqlite::Result<Option<Checkpoint>> {
+) -> rusqlite::Result<ResolveOutcome> {
     let n = conn.execute(
-        "UPDATE checkpoints SET state = ?1, resolved_by = ?2, resolution = ?3, \
-            resolution_note = ?4, resolved_at = ?5 WHERE id = ?6",
+        RESOLVE_CAS_SQL,
         params![
             state.as_str(),
             resolved_by,
@@ -314,13 +341,19 @@ pub fn resolve(
             resolution_note,
             resolved_at,
             id,
+            CheckpointState::Pending.as_str(),
         ],
     )?;
     if n == 0 {
-        return Ok(None);
+        // The CAS did not fire: either no row exists, or the checkpoint is
+        // already resolved (first-resolution-wins — keep the prior verdict).
+        return Ok(match get(conn, id)? {
+            None => ResolveOutcome::NotFound,
+            Some(existing) => ResolveOutcome::Conflict(Box::new(existing)),
+        });
     }
     let Some(mut row) = get(conn, id)? else {
-        return Ok(None);
+        return Ok(ResolveOutcome::NotFound);
     };
     // Sign the resolution + persist the attestation columns when a signing
     // keypair is supplied — done after the resolution-field UPDATE so the
@@ -339,7 +372,7 @@ pub fn resolve(
             )?;
         }
     }
-    Ok(Some(row))
+    Ok(ResolveOutcome::Resolved(Box::new(row)))
 }
 
 /// Outcome of applying an inbound federated checkpoint RESOLUTION via
@@ -538,6 +571,17 @@ pub fn apply_inbound_resolution(
 }
 
 #[cfg(test)]
+impl ResolveOutcome {
+    /// Test helper: unwrap the [`ResolveOutcome::Resolved`] row or panic.
+    fn expect_resolved(self) -> Checkpoint {
+        match self {
+            ResolveOutcome::Resolved(cp) => *cp,
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -655,7 +699,7 @@ mod tests {
             None,
         )
         .unwrap()
-        .expect("resolve returns the updated row");
+        .expect_resolved();
         assert_eq!(resolved.state, CheckpointState::Resolved);
         assert_eq!(resolved.resolved_by.as_deref(), Some("agent-approver"));
         assert_eq!(resolved.resolution.as_deref(), Some("approved"));
@@ -669,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_missing_returns_none() {
+    fn resolve_missing_returns_not_found() {
         let conn = fresh();
         let missing = resolve(
             &conn,
@@ -683,9 +727,63 @@ mod tests {
         )
         .unwrap();
         assert!(
-            missing.is_none(),
-            "resolving a missing checkpoint yields None"
+            matches!(missing, ResolveOutcome::NotFound),
+            "resolving a missing checkpoint yields NotFound"
         );
+    }
+
+    /// #2995 — first-resolution-wins on the LOCAL lane: a second resolve of an
+    /// already-resolved checkpoint is a [`ResolveOutcome::Conflict`] and the
+    /// prior (signed) attestation is KEPT — never silently overwritten. Without
+    /// the `AND state = 'pending'` CAS guard the unguarded UPDATE let any caller
+    /// rewrite an attested authority record.
+    #[test]
+    fn resolve_second_is_conflict_first_wins_2995() {
+        let conn = fresh();
+        insert(&conn, &sample("fw1")).unwrap();
+        let kp = crate::identity::keypair::generate("ai:judge").expect("generate");
+        // First resolution wins + is signed.
+        let first = resolve(
+            &conn,
+            "fw1",
+            CheckpointState::Resolved,
+            "ai:judge",
+            Some("approved"),
+            None,
+            1_700_000_500,
+            Some(&kp),
+        )
+        .unwrap()
+        .expect_resolved();
+        assert!(verify(&first), "first resolution is attested");
+
+        // A hijack attempt: a different resolver rewrites to REJECTED.
+        let conflict = resolve(
+            &conn,
+            "fw1",
+            CheckpointState::Rejected,
+            "ai:attacker",
+            Some("REJECTED-hijack"),
+            None,
+            1_700_000_900,
+            None,
+        )
+        .unwrap();
+        match conflict {
+            ResolveOutcome::Conflict(existing) => {
+                assert_eq!(existing.resolved_by.as_deref(), Some("ai:judge"));
+                assert_eq!(existing.resolution.as_deref(), Some("approved"));
+                assert!(verify(&existing), "the prior signed attestation survives");
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+
+        // The persisted row is UNCHANGED — the hijack did not land.
+        let got = get(&conn, "fw1").unwrap().expect("present");
+        assert_eq!(got.state, CheckpointState::Resolved);
+        assert_eq!(got.resolved_by.as_deref(), Some("ai:judge"));
+        assert_eq!(got.resolution.as_deref(), Some("approved"));
+        assert_eq!(got.signature, first.signature);
     }
 
     // -----------------------------------------------------------------
@@ -708,7 +806,7 @@ mod tests {
             Some(&kp),
         )
         .unwrap()
-        .expect("resolve returns the updated row");
+        .expect_resolved();
         // The returned row carries the attestation and verifies.
         assert_eq!(
             resolved.signature.len(),
@@ -741,7 +839,7 @@ mod tests {
             Some(&kp),
         )
         .unwrap()
-        .expect("resolve returns the updated row");
+        .expect_resolved();
         assert!(verify(&resolved), "baseline signed resolution verifies");
         // Tamper with the resolution verdict after signing.
         resolved.resolution = Some("rejected".to_string());
@@ -767,7 +865,7 @@ mod tests {
             None,
         )
         .unwrap()
-        .expect("resolve returns the updated row");
+        .expect_resolved();
         assert!(resolved.signature.is_empty());
         assert!(resolved.resolver_pubkey.is_empty());
         assert!(!verify(&resolved), "an unsigned resolution must not verify");
@@ -888,7 +986,7 @@ mod tests {
             Some(&pub_only),
         )
         .unwrap()
-        .expect("resolve returns the updated row");
+        .expect_resolved();
         // can_sign() == false → unattested, exactly like the None path.
         assert!(resolved.signature.is_empty());
         assert!(resolved.resolver_pubkey.is_empty());

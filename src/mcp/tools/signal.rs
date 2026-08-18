@@ -156,12 +156,22 @@ pub fn handle_signal_send_with_hooks(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let from_agent = params
-        .get(param_names::FROM_AGENT)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let subject = params
+    // #2996 — `from_agent` is BOUND to the resolved MCP caller identity, NOT
+    // taken from the caller-asserted body: the wire value is discarded exactly
+    // as the HTTP handler (`handlers::coordination::send_signal`) discards its
+    // body `from_agent`. Without this, `sign_into` signs with the process
+    // keypair regardless of `from_agent`, so a co-located agent could forge any
+    // authorship (`self_signed`, same daemon key) and even store spaces /
+    // empty. The bound id is the signing keypair's own agent_id when a keypair
+    // is present (so authorship matches the signature), else the durable
+    // process identity; a shape check rejects control chars.
+    let from_agent = match keypair {
+        Some(kp) => kp.agent_id.clone(),
+        None => crate::identity::resolve_agent_id(None, None)
+            .map_err(|e| format!("resolve caller agent_id: {e}"))?,
+    };
+    crate::validate::validate_agent_id_shape(&from_agent).map_err(|e| e.to_string())?;
+    let mut subject = params
         .get(param_names::SUBJECT)
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -178,21 +188,50 @@ pub fn handle_signal_send_with_hooks(
         .get(param_names::CORRELATION_ID)
         .and_then(Value::as_str)
         .map(str::to_string);
-    let body = params
+    let mut body = params
         .get(param_names::BODY)
         .cloned()
         .unwrap_or(Value::Null);
-    let signal_type = params
-        .get(param_names::SIGNAL_TYPE)
-        .and_then(Value::as_str)
-        .and_then(crate::models::SignalType::from_str)
-        .unwrap_or_default();
+    // Minor (A6-13) — reject an unknown `signal_type` value like the
+    // `condition_type` fix (#3007), instead of silently coercing it to `notify`.
+    // An ABSENT value still defaults.
+    let signal_type = match params.get(param_names::SIGNAL_TYPE).and_then(Value::as_str) {
+        Some(s) => crate::models::SignalType::from_str(s)
+            .ok_or_else(|| format!("invalid signal_type: {s}"))?,
+        None => crate::models::SignalType::default(),
+    };
     let reference_ids = params
         .get(param_names::REFERENCE_IDS)
         .cloned()
         .unwrap_or_else(|| json!([]));
 
+    // #2998 — validate namespace + bound the subject / body sizes. #2994 —
+    // screen the caller-origin credential vectors (subject / body) before the
+    // direct insert + federation EGRESS.
+    crate::coordination_guard::require_namespace(&namespace)?;
+    crate::coordination_guard::require_text(
+        param_names::SUBJECT,
+        &subject,
+        crate::coordination_guard::MAX_TEXT_FIELD_BYTES,
+    )?;
+    crate::coordination_guard::require_payload_size(param_names::BODY, &body)?;
+    crate::secret_screen::screen_text_field_for_caller(&mut subject).map_err(|r| r.to_string())?;
+    crate::secret_screen::screen_json_field_for_caller(&mut body).map_err(|r| r.to_string())?;
+
     let now = chrono::Utc::now().timestamp();
+    // #3011 — wire `signals.expires_at`: an optional `ttl_secs` marks the signal
+    // caller-declared-ephemeral, so the gc pruner (`signals::prune_expired`) can
+    // reap it. Validated + overflow-checked like the lease ttl.
+    let expires_at = match params.get(param_names::TTL_SECS).and_then(Value::as_i64) {
+        Some(ttl) => {
+            crate::validate::validate_ttl_secs(Some(ttl)).map_err(|e| e.to_string())?;
+            Some(
+                now.checked_add(ttl)
+                    .ok_or_else(|| crate::coordination_guard::TTL_SECS_OVERFLOW.to_string())?,
+            )
+        }
+        None => None,
+    };
     let mut signal = crate::models::Signal {
         id: uuid::Uuid::new_v4().to_string(),
         namespace,
@@ -205,7 +244,7 @@ pub fn handle_signal_send_with_hooks(
         correlation_id,
         reference_ids,
         created_at: now,
-        expires_at: None,
+        expires_at,
         delivered_at: None,
         read_at: None,
         acknowledged_at: None,
@@ -499,6 +538,18 @@ pub struct SignalSendRequest {
     /// JSON array of related signal / memory ids.
     #[serde(default)]
     pub reference_ids: Value,
+
+    // #3011 — wire `signals.expires_at`. The doc comment must NOT be a `///`
+    // one: schemars turns a `#`-leading doc line into a JSON-Schema `title`
+    // (not a `description`), and the wire trimmer strips `description` but not
+    // property `title`, so a `///` here would leak a truncated fragment onto
+    // the public tools/list surface. Use `#[schemars(description = ...)]` so a
+    // clean description is emitted and then trimmed off the bare wire.
+    #[schemars(description = "Optional retention TTL in seconds. When set, the \
+                             signal expires at now + ttl_secs and the gc pruner \
+                             reaps it once past.")]
+    #[serde(default)]
+    pub ttl_secs: Option<i64>,
 }
 
 /// v0.8.0 Pillar 1 (#1709) — request body for `memory_signal_read`.
@@ -782,6 +833,74 @@ mod handler_tests {
         assert_eq!(reacked["acknowledged"].as_bool(), Some(false));
     }
 
+    /// Minor (A6-13) — an unknown `signal_type` is REJECTED, not coerced to
+    /// `notify` (mirrors the #3007 `condition_type` fix).
+    #[test]
+    fn send_rejects_unknown_signal_type() {
+        let conn = fresh();
+        let err = handle_signal_send(
+            &conn,
+            &json!({ "namespace": "_sig", "from_agent": "a", "subject": "s", "signal_type": "bogus" }),
+            None,
+        )
+        .expect_err("unknown signal_type must reject");
+        assert!(err.contains("invalid signal_type"), "{err}");
+    }
+
+    /// #2996 — the caller-asserted `from_agent` is DISCARDED (mirrors the HTTP
+    /// handler): with no keypair the authorship binds to the resolved process
+    /// identity, so a co-located agent cannot forge another's authorship, and a
+    /// spaces / empty / control-char `from_agent` can never be stored.
+    #[test]
+    fn send_discards_caller_asserted_from_agent_2996() {
+        let conn = fresh();
+        let sent = handle_signal_send(
+            &conn,
+            &json!({ "namespace": "_sig", "from_agent": "ai:IMPERSONATED-VICTIM", "subject": "s" }),
+            None,
+        )
+        .expect("send ok");
+        assert_ne!(
+            sent["signal"]["from_agent"].as_str(),
+            Some("ai:IMPERSONATED-VICTIM"),
+            "the caller-asserted from_agent is discarded, never stored"
+        );
+        assert!(
+            sent["signal"]["from_agent"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "authorship is bound to the resolved caller identity"
+        );
+    }
+
+    /// #3011 — an optional `ttl_secs` sets `signals.expires_at = now + ttl` so
+    /// the gc pruner can reap the caller-declared-ephemeral signal.
+    #[test]
+    fn send_ttl_secs_sets_expires_at_3011() {
+        let conn = fresh();
+        let sent = handle_signal_send(
+            &conn,
+            &json!({ "namespace": "_sig", "from_agent": "a", "subject": "s", "ttl_secs": 3600 }),
+            None,
+        )
+        .expect("send ok");
+        let expires_at = sent["signal"]["expires_at"]
+            .as_i64()
+            .expect("expires_at is set from ttl_secs");
+        assert!(
+            expires_at > chrono::Utc::now().timestamp(),
+            "expires_at is in the future"
+        );
+        // A signal without ttl_secs has no expiry.
+        let no_ttl = handle_signal_send(
+            &conn,
+            &json!({ "namespace": "_sig", "from_agent": "a", "subject": "s" }),
+            None,
+        )
+        .expect("send ok");
+        assert!(no_ttl["signal"]["expires_at"].is_null());
+    }
+
     #[test]
     fn read_absent_returns_null_signal() {
         let conn = fresh();
@@ -833,18 +952,27 @@ mod handler_tests {
     #[test]
     fn send_emits_signed_events_audit_row_1714() {
         let conn = fresh();
+        // #2996 — authorship is BOUND to the signing keypair's agent_id, so the
+        // audit row is attributed to the bound sender (`ai:alice`), NOT any
+        // caller-asserted `from_agent` body value.
+        let kp = crate::identity::keypair::generate("ai:alice").expect("generate");
         let sent = handle_signal_send(
             &conn,
             &json!({
                 "namespace": "_sig",
-                "from_agent": "ai:alice",
+                "from_agent": "ai:IMPERSONATED-VICTIM",
                 "to_agent": "ai:bob",
                 "subject": "coordinate",
             }),
-            None,
+            Some(&kp),
         )
         .expect("send ok");
         assert!(sent[param_names::ID].as_str().is_some());
+        assert_eq!(
+            sent["signal"]["from_agent"].as_str(),
+            Some("ai:alice"),
+            "from_agent is bound to the keypair, not the caller-asserted body value"
+        );
 
         // Exactly one coordination.signal_send row, attributed to the sender.
         let (count, agent): (i64, String) = conn
