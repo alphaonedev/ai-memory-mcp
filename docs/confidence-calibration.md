@@ -34,7 +34,9 @@ column (schema v39 sqlite / v38 postgres):
   `memory_calibrate_confidence` MCP tool) replaced the live value with
   a per-(namespace, source) baseline computed from shadow-mode samples.
 * `decayed` — the freshness-decay updater applied
-  `exp(-age * ln(2) / half_life)` on a recall touch. Opt-in via
+  `exp(-age * ln(2) / half_life)` when the periodic fold job applies the
+  recall-access ladders from the `recall_observations` ledger (recall
+  itself is a pure read; #1953). Opt-in via
   `AI_MEMORY_CONFIDENCE_DECAY=1` or per-namespace
   `confidence_decay_half_life_days` policy.
 

@@ -92,13 +92,17 @@ ai-memory store --title "Prod incident postmortem" \
 
 ### `recall`
 
-Semantic + keyword hybrid recall. **Mutates the database**: increments
-`access_count`, raises `expires_at` to
+Semantic + keyword hybrid recall. **Pure read** (#1953): writes zero
+rows to `memories` — no `access_count` bump, no TTL extension, no
+promotion on the recall path. It appends one row per returned memory to
+the append-only `recall_observations` ledger. The access ladders are
+applied out of band by the periodic fold job (`db::fold_recall_accesses`)
+from that ledger: increment `access_count`, raise `expires_at` to
 `MAX(current expires_at, now + per-tier-extend_secs)` (extension FLOOR —
 an access can never move an expiry earlier; issue
 [#1596](https://github.com/alphaonedev/ai-memory-mcp/issues/1596),
 superseding the [#830](https://github.com/alphaonedev/ai-memory-mcp/issues/830)
-replacement contract), auto-promotes mid→long at 5 accesses.
+replacement contract), auto-promote mid→long at 5 accesses.
 
 | Flag | Type | Default | Notes |
 |------|------|---------|-------|

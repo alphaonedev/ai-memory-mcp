@@ -30,12 +30,18 @@ mutates the database (touch, TTL extension, auto-promotion).
    (contains `/`), recall broadens to the ancestor chain and applies a
    small score bonus to memories nearer the queried leaf.
 6. **Token-budget greedy fill** (Phase P6 / R1) — see below.
-7. **Touch** — increment `access_count`, reset the sliding TTL window
-   (`expires_at = now + 1h` short / `now + 1d` mid — a per-access
-   **replacement**, not a max-of-old-and-new extend; long-tier rows
-   are untouched), auto-promote mid → long at 5 accesses, increment
-   priority every 10. Touch runs only on memories that survive every
-   prior stage, including the budget cut.
+7. **Ledger append (recall is PURE)** — recall writes **zero** rows to
+   `memories`; it appends one `recall_observations` row per returned
+   memory that survived every prior stage (including the budget cut) and
+   returns (#1953; the `AI_MEMORY_RECALL_TOUCH_SYNC` opt-back-in was
+   removed at v1.0.0). The access ladders — increment `access_count`,
+   TTL floor-extend (`expires_at = MAX(expires_at, now + 1h)` short /
+   `MAX(expires_at, now + 1d)` mid, an access can never move an expiry
+   earlier per [#1596](https://github.com/alphaonedev/ai-memory-mcp/issues/1596);
+   long-tier rows are untouched), auto-promote mid → long at 5 accesses,
+   increment priority every 10 — are applied out of band by the periodic
+   fold job (`db::fold_recall_accesses`, default every 60 s, plus a fold
+   at the top of every GC tick), never inline on the recall path.
 
 ---
 

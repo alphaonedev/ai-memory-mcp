@@ -1420,7 +1420,7 @@ The HTTP daemon exposes **94 production `.route(...)` registrations / 80 unique 
 | `POST` | `/memories/{id}/promote` | Promote a memory to long-term |
 | `GET` | `/memories` | List memories with filters |
 | `GET` | `/search` | AND search with 6-factor scoring |
-| `GET` | `/recall` | OR recall with touch + auto-promote |
+| `GET` | `/recall` | OR recall — pure read (access ladders folded from the ledger out of band) |
 | `POST` | `/recall` | OR recall (POST body) |
 | `POST` | `/forget` | Bulk delete by pattern/namespace/tier |
 | `POST` | `/consolidate` | Consolidate 2-100 memories |

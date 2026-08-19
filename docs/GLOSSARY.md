@@ -218,8 +218,12 @@ explicitly via `--quorum-writes` (default `0` = federation off); the
 
 Query operation that returns memories matching a natural-language
 context. Semantics: semantic + keyword + priority/confidence/recency
-blend. **Mutates the DB**: increments `access_count`, extends TTL,
-promotes mid→long at 5 accesses, nudges priority every 10 accesses.
+blend. **Pure read** (#1953): writes zero rows to `memories` on the
+recall path — no `access_count` bump, no TTL extension, no promotion.
+It appends one row to the append-only `recall_observations` ledger; the
+access ladders (increment `access_count`, extend TTL, promote mid→long
+at 5 accesses, nudge priority every 10) are applied out of band by the
+periodic fold job (`db::fold_recall_accesses`) from that ledger.
 
 ## SAL — Storage Abstraction Layer (v0.7)
 

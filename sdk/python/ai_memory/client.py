@@ -335,9 +335,13 @@ class AiMemoryClient:
     ) -> RecallResponse:
         """``POST /api/v1/recall`` — hybrid FTS + semantic recall.
 
-        Uses the POST form because ``context`` can be long prose. Every
-        recall is write-coupled: the server bumps ``access_count`` and
-        extends TTLs on returned memories.
+        Uses the POST form because ``context`` can be long prose. Recall is
+        a PURE read: it writes zero rows to ``memories`` and never bumps
+        ``access_count`` or extends TTLs on the recall path (#1953). Each
+        returned memory appends one row to the append-only
+        ``recall_observations`` ledger; the access ladders (access-count,
+        TTL floor-extend, mid->long promotion, priority) are applied out of
+        band by the daemon's periodic fold job from that ledger.
         """
         body = RecallRequest(
             context=context,

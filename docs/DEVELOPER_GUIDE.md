@@ -193,7 +193,7 @@ The sqlite storage layer. The pre-#961 monolithic `src/db.rs` is GONE — split 
 | `forget()` | Bulk delete by namespace + FTS pattern + tier |
 | `list()` | List with filters: namespace, tier, priority, date range, tags, offset |
 | `search()` | FTS5 AND search with 6-factor composite scoring |
-| `recall()` | FTS5 OR search + touch + auto-promote + TTL extension |
+| `recall()` | FTS5 OR search — PURE read; access ladders (touch/auto-promote/TTL extension) folded from the `recall_observations` ledger out of band |
 | `find_contradictions()` | Find memories in same namespace with similar titles |
 | `consolidate()` | Merge multiple memories, delete originals, aggregate tags and max priority. **Uses BEGIN IMMEDIATE/COMMIT transaction** for atomicity. |
 | `sanitize_fts_query()` | Strips special characters and quotes tokens to prevent FTS injection |
@@ -686,7 +686,7 @@ Response: `{"results": [...], "count": 3, "query": "database migration"}`
 
 Uses 6-factor scoring (without tier boost). Queries are sanitized to prevent FTS injection.
 
-### Recall (OR semantics + touch)
+### Recall (OR semantics — pure read)
 
 ```
 GET /recall?context=auth+flow+jwt&namespace=my-app&limit=10&tags=auth&since=2026-01-01T00:00:00Z&until=2026-12-31T23:59:59Z
@@ -703,7 +703,7 @@ Content-Type: application/json
 
 Response: `{"memories": [...], "count": 5}`
 
-Recall automatically: bumps `access_count`, extends TTL, and auto-promotes mid-tier memories with 5+ accesses to long-term. The touch operation is transactional.
+Recall is a PURE read: it writes zero rows to `memories` (no `access_count` bump, no TTL extension, no tier promotion on the recall path; #1953). The only write is one row appended to the append-only `recall_observations` ledger. The access ladders — `access_count` bump, TTL floor-extend, auto-promotion of mid-tier memories with 5+ accesses to long-term — are applied out of band by the periodic fold job (`db::fold_recall_accesses`) from that ledger. This makes recall safe to retry and safe to serve from a read replica.
 
 ### Forget (Bulk Delete)
 

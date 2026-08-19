@@ -86,7 +86,7 @@ footer a{color:var(--muted)}
   "last_handoff": "2026-05-17T22:14:03Z" }</code></pre>
 
   <h2><span class="step-num">02</span> Recall &mdash; what do I already know about this</h2>
-  <p>Before doing anything, the agent calls <code>memory_recall</code> against the context "flaky test in pipeline." This is hybrid recall: FTS5 keyword score blended with cosine similarity over MiniLM embeddings, weighted by tier, priority, confidence, and recency. Every recall mutates the database (touches access_count, refreshes expires_at, promotes mid&rarr;long at 5 accesses).</p>
+  <p>Before doing anything, the agent calls <code>memory_recall</code> against the context "flaky test in pipeline." This is hybrid recall: FTS5 keyword score blended with cosine similarity over MiniLM embeddings, weighted by tier, priority, confidence, and recency. Recall is a pure read: it writes zero rows to <code>memories</code> and appends one row to the append-only <code>recall_observations</code> ledger instead (#1953). The access ladders (access_count, expires_at floor-extend, mid&rarr;long promotion at 5 accesses) are folded from that ledger out of band by the periodic fold job, never inline on the recall path.</p>
   <div class="label">Tool call</div>
   <pre><code>memory_recall({ "context": "flaky test pipeline", "limit": 5 })</code></pre>
   <div class="label">Excerpt</div>

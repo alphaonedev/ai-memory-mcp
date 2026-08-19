@@ -536,7 +536,7 @@ hybrid recall pipeline, and accept governance write paths.
 |---|---|---|
 | `POST` | `/api/v1/sync/push` | per-row `MemoryStore::apply_remote_memory` / `apply_remote_link` / `apply_remote_deletion`. Heterogeneous federation (sqlite ↔ postgres) round-trips. |
 | `GET` | `/api/v1/sync/since` | `MemoryStore::list_memories_updated_since` |
-| `GET` | `/api/v1/recall` and `POST /api/v1/recall` | `MemoryStore::recall_hybrid` (FTS + pgvector cosine + adaptive blend; mode=hybrid when embedder loaded). Touch ops fire via `MemoryStore::touch_after_recall`. |
+| `GET` | `/api/v1/recall` and `POST /api/v1/recall` | `MemoryStore::recall_hybrid` (FTS + pgvector cosine + adaptive blend; mode=hybrid when embedder loaded). PURE read (#1953) — no touch on the recall path; access ladders folded from the `recall_observations` ledger out of band by `MemoryStore::fold_recall_accesses`. |
 | `POST` | `/api/v1/pending/{id}/approve` | (Continuation 3 / Phase 20) full consensus state machine via `MemoryStore::governance_approve_with_consensus` — Human / Agent(required) / Consensus(N) variations + registered-agent gating + threshold transition. |
 | `POST` | `/api/v1/pending/{id}/reject` | `MemoryStore::pending_decide(approve=false)` + audit emit. |
 | `POST` | `/api/v1/namespaces/{ns}/standard` and `POST /api/v1/namespaces` | auto-seeds placeholder via `MemoryStore::store`, then `MemoryStore::set_namespace_standard` |
@@ -866,7 +866,7 @@ parity test is the gate that prevents it.
 | HTTP KG handlers (kg_query/kg_timeline/kg_invalidate) | ✓ | ✓ (Wave-3 Continuation — Phase 5) |
 | HTTP federation push/pull (sync/push, sync/since) | ✓ | ✓ (Wave-3 Continuation 2 — Phase 8) |
 | HTTP audit chain emit + cross-restart sequence persistence | ✓ | ✓ (Wave-3 Continuation 2 — Phase 9) |
-| HTTP full hybrid recall pipeline (FTS + pgvector + adaptive blend + touch) | ✓ | ✓ (Wave-3 Continuation 2 — Phase 10) |
+| HTTP full hybrid recall pipeline (FTS + pgvector + adaptive blend; pure read + out-of-band ledger fold) | ✓ | ✓ (Wave-3 Continuation 2 — Phase 10) |
 | HTTP governance write paths (pending decide, namespace standard) | ✓ | ✓ (Wave-3 Continuation 2 — Phase 11) |
 | HTTP full governance pipeline (multi-vote consensus + approver_type + inheritance walk on writes) | ✓ | ✓ (Wave-3 Continuation 3 — Phase 20) |
 | HTTP forget / consolidate / contradictions / notify / gc / import / export / archive write paths | ✓ | ✓ (Wave-3 Continuation 3 — Phase 13/14/15/16/17/18/19) |
