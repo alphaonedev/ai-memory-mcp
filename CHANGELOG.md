@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (`ai-memory migrate` dropped rows past 1000 AND never copied embeddings; #1876 #3060)
+
+- **Data-loss: cross-backend `migrate` copied memory TEXT but NOT the
+  embedding VECTORS (#3060 / F4).** `store()` carries the durable `Memory`
+  struct, but a memory's embedding lives in a separate column (sqlite
+  side-table / postgres pgvector) that the struct does not carry, so a
+  migrated corpus landed with `embedding IS NOT NULL = 0`. Under a certified
+  `AI_MEMORY_INFERENCE_EGRESS=loopback-only`/`deny` posture the destination's
+  external embedder cannot re-derive them, and re-embedding under a different
+  model would change the #2167 `embedding_space` fingerprint. `migrate` now
+  has a Phase 3 that copies each migrated row's stored `(vector, space)`
+  verbatim via `get_embedding_with_space` → `set_embeddings_batch` (bucketed
+  by space, paged) — NEVER re-embedding, NEVER synthesizing a space — records
+  `embeddings_copied` in the `MigrationReport`, and pushes a LOUD error if the
+  copied count falls short of the source's embedded-row count. Reuses existing
+  SAL methods only (no new trait surface). Pinned by
+  `migrate::tests::migrate_copies_embeddings_and_preserves_space`.
+
 ### Fixed (`ai-memory migrate` silently dropped every row past the first 1000; #1876)
 
 - **Data-loss: cross-backend `migrate` truncated to the first `LIST_MAX_LIMIT`

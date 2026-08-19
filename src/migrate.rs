@@ -79,6 +79,12 @@ pub struct MigrationReport {
     /// `INSERT OR IGNORE` on SQLite).
     #[serde(default)]
     pub links_skipped: usize,
+    /// #3060 F4 — count of stored embedding VECTORS copied verbatim from
+    /// the source to the destination (their `embedding_space` fingerprint
+    /// preserved unchanged; NEVER re-embedded). On success this equals the
+    /// number of source memories that carried a stored embedding.
+    #[serde(default)]
+    pub embeddings_copied: usize,
     pub batches: usize,
     pub errors: Vec<String>,
     pub dry_run: bool,
@@ -182,6 +188,9 @@ pub async fn migrate(
     let page_size = batch_size.clamp(1, crate::storage::LIST_MAX_LIMIT);
 
     let mut seen: HashSet<String> = HashSet::new();
+    // #3060 F4 — ids that actually landed on the destination (or, under
+    // `dry_run`, every unique source id). Phase 3 copies their embeddings.
+    let mut migrated_ids: Vec<String> = Vec::new();
     let mut offset: usize = 0;
     loop {
         let filter = Filter {
@@ -218,9 +227,18 @@ pub async fn migrate(
                 return report;
             }
             report.memories_read += 1;
-            if !dry_run {
+            if dry_run {
+                // Tally the id so Phase 3 can size the embedding copy.
+                migrated_ids.push(mem.id.clone());
+            } else {
                 match to.store(&ctx, mem).await {
-                    Ok(_) => report.memories_written += 1,
+                    Ok(_) => {
+                        report.memories_written += 1;
+                        // Only a row that actually landed can receive its
+                        // embedding in Phase 3 (a failed write leaves no
+                        // destination row to stamp).
+                        migrated_ids.push(mem.id.clone());
+                    }
                     Err(e) => report.errors.push(format!("write {} failed: {e}", mem.id)),
                 }
             }
@@ -249,6 +267,96 @@ pub async fn migrate(
              recorded error — refusing to report success",
             report.memories_read, report.memories_written
         ));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Phase 3 — embedding VECTORS (#3060 F4).
+    //
+    // `store()` copies the DURABLE memory TEXT, but a memory's embedding
+    // is a SEPARATE column (sqlite side-table / postgres pgvector) NOT
+    // carried on the `Memory` struct, so Phases 1-2 land a corpus with
+    // ZERO embeddings. That is not merely a perf regression: under a
+    // certified `AI_MEMORY_INFERENCE_EGRESS=loopback-only`/`deny` posture
+    // the destination's external embedder cannot re-derive them, and
+    // re-embedding under a DIFFERENT model would change the #2167
+    // `embedding_space` fingerprint (recall would then refuse to score the
+    // re-derived vectors against the originals). So the ORIGINAL vectors —
+    // and their space stamp — MUST be copied VERBATIM. We NEVER re-embed
+    // and NEVER synthesize a space.
+    //
+    // Read each migrated id's stored `(vector, space)` via
+    // `get_embedding_with_space` (a source row with no stored embedding —
+    // keyword-tier / never-embedded — returns `None` and is skipped:
+    // nothing to copy). Bucket by the VERBATIM space fingerprint because
+    // `set_embeddings_batch` stamps ONE space per call (#2167
+    // M-PARAMETER-CONSISTENCY: every vector in a batch shares one space),
+    // then write each bucket to the destination in pages of `page_size`.
+    // A legacy row whose space is SQL NULL (unverified provenance) buckets
+    // under the empty string — the trait's `&str` space param cannot
+    // express NULL, so its vector is still copied while its NULL→"" space
+    // is the closest the SAL surface allows (does not arise on a
+    // space-stamped corpus; skipping the row would be a silent embedding
+    // LOSS, which the North Star ranks worse).
+    let mut source_embedded: usize = 0;
+    let mut by_space: std::collections::BTreeMap<String, Vec<(String, Vec<f32>)>> =
+        std::collections::BTreeMap::new();
+    // A source store that does not expose stored embeddings at all (an
+    // in-memory / test adapter whose `get_embedding_with_space` returns the
+    // trait-default `UnsupportedCapability`) has nothing to copy — skip the
+    // whole phase gracefully rather than failing an otherwise-clean migrate.
+    let mut embeddings_unsupported = false;
+    for id in &migrated_ids {
+        match from.get_embedding_with_space(&ctx, id).await {
+            Ok(Some((vector, space))) => {
+                source_embedded += 1;
+                by_space
+                    .entry(space.unwrap_or_default())
+                    .or_default()
+                    .push((id.clone(), vector));
+            }
+            Ok(None) => {} // no stored source embedding — nothing to copy
+            Err(crate::store::StoreError::UnsupportedCapability { .. }) => {
+                embeddings_unsupported = true;
+                break;
+            }
+            Err(e) => {
+                report
+                    .errors
+                    .push(format!("read source embedding for {id} failed: {e}"));
+                return report;
+            }
+        }
+    }
+    // When embeddings are unsupported we fall through to the links phase
+    // with nothing copied (byte-identical to pre-#3060 on such a store).
+    if !embeddings_unsupported {
+        if dry_run {
+            // Size the copy without writing (mirrors the memories/links
+            // dry-run tally): every embedded source row WOULD be copied.
+            report.embeddings_copied = source_embedded;
+        } else {
+            for (space, entries) in &by_space {
+                for chunk in entries.chunks(page_size) {
+                    match to.set_embeddings_batch(&ctx, chunk, space).await {
+                        Ok(written) => report.embeddings_copied += written,
+                        Err(e) => report
+                            .errors
+                            .push(format!("write embedding batch (space={space}) failed: {e}")),
+                    }
+                }
+            }
+            // Completeness safety — an embedded source row that was not
+            // copied is silent semantic-recall data loss on the destination,
+            // so refuse to report success on a short copy (the memories-phase
+            // posture).
+            if report.errors.is_empty() && report.embeddings_copied != source_embedded {
+                report.errors.push(format!(
+                    "incomplete embedding copy: source has {source_embedded} embedded \
+                     memories but only {} vectors were copied — refusing to report success",
+                    report.embeddings_copied
+                ));
+            }
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -586,6 +694,90 @@ mod tests {
         // Independent completeness proof: the destination holds all N rows.
         let dst_count = count_ns(&dst, &ctx, "pagination-test").await;
         assert_eq!(dst_count, N, "destination must hold every migrated row");
+    }
+
+    /// #3060 F4 regression — migrate must COPY stored embedding vectors
+    /// verbatim (Phase 3), preserving the #2167 `embedding_space` stamp and
+    /// NEVER re-embedding. Before the fix `migrate` copied only the memory
+    /// TEXT, so the destination landed with zero embeddings — unrecoverable
+    /// under a loopback-only/deny inference-egress posture. Seeds a source
+    /// where a subset of rows carry embeddings (across >1 copy page), then
+    /// asserts the destination embedded-count equals the source's AND a
+    /// sampled row's vector bytes + space match exactly.
+    #[tokio::test]
+    async fn migrate_copies_embeddings_and_preserves_space() {
+        let src_tmp = tempfile::NamedTempFile::new().unwrap();
+        let dst_tmp = tempfile::NamedTempFile::new().unwrap();
+        let src = SqliteStore::open(src_tmp.path()).unwrap();
+        let dst = SqliteStore::open(dst_tmp.path()).unwrap();
+        let ctx = CallerContext::for_admin(crate::identity::sentinels::AI_MIGRATE);
+
+        const SPACE: &str = "test-model#raw";
+        // 5 memories; embed 4 of them (leave "emb-2" un-embedded so the
+        // None-skip path is exercised) with distinct vectors so the sample
+        // assertion is meaningful.
+        for i in 0..5 {
+            let mem = sample_memory(&format!("emb-{i}"), "emb-test", &format!("emb row {i}"));
+            src.store(&ctx, &mem).await.unwrap();
+            if i != 2 {
+                #[allow(clippy::cast_precision_loss)]
+                let vec = vec![i as f32 * 0.5, 1.0 - i as f32 * 0.1, 0.25];
+                src.update_embedding(&ctx, &format!("emb-{i}"), Some(&vec), SPACE)
+                    .await
+                    .unwrap();
+            }
+        }
+        // Sanity: the source really carries 4 embeddings under SPACE.
+        let src_sample = src
+            .get_embedding_with_space(&ctx, "emb-3")
+            .await
+            .unwrap()
+            .expect("source emb-3 embedded");
+        assert_eq!(src_sample.1.as_deref(), Some(SPACE));
+
+        // page_size 2 forces the embedding copy across multiple batches.
+        let report = migrate(&src, &dst, 2, Some("emb-test".to_string()), false).await;
+
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        assert_eq!(report.memories_written, 5, "all 5 memories migrate");
+        assert_eq!(report.embeddings_copied, 4, "all 4 embeddings copied");
+
+        // Destination embedded-count matches the source's (4).
+        let mut dst_embedded = 0usize;
+        for i in 0..5 {
+            let got = dst
+                .get_embedding_with_space(&ctx, &format!("emb-{i}"))
+                .await
+                .unwrap();
+            if got.is_some() {
+                dst_embedded += 1;
+            }
+        }
+        assert_eq!(
+            dst_embedded, 4,
+            "destination embedded-count must match source"
+        );
+
+        // Sampled id: dest vector bytes + space equal the source verbatim.
+        let dst_sample = dst
+            .get_embedding_with_space(&ctx, "emb-3")
+            .await
+            .unwrap()
+            .expect("dest emb-3 embedded");
+        assert_eq!(dst_sample.0, src_sample.0, "vector must be copied verbatim");
+        assert_eq!(
+            dst_sample.1.as_deref(),
+            Some(SPACE),
+            "embedding_space must be preserved verbatim (never re-derived)"
+        );
+        // The un-embedded source row stays un-embedded on the destination.
+        assert!(
+            dst.get_embedding_with_space(&ctx, "emb-2")
+                .await
+                .unwrap()
+                .is_none(),
+            "un-embedded source row must not gain a synthesized embedding"
+        );
     }
 
     // ----------------------------------------------------------------

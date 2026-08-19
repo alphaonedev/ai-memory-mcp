@@ -7286,6 +7286,7 @@ async fn cmd_migrate(args: &MigrateArgs) -> Result<()> {
             "to_url": to_display,
             "memories_read": report.memories_read,
             "memories_written": report.memories_written,
+            "embeddings_copied": report.embeddings_copied,
             "batches": report.batches,
             "errors": report.errors,
             "dry_run": report.dry_run,
@@ -7297,6 +7298,7 @@ async fn cmd_migrate(args: &MigrateArgs) -> Result<()> {
         println!("  to:                {to_display}");
         println!("  memories_read:     {}", report.memories_read);
         println!("  memories_written:  {}", report.memories_written);
+        println!("  embeddings_copied: {}", report.embeddings_copied);
         println!("  batches:           {}", report.batches);
         println!("  dry_run:           {}", report.dry_run);
         println!("  errors:            {}", report.errors.len());
