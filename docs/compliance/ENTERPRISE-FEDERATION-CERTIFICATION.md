@@ -351,6 +351,33 @@ the SSOT pins, per the STANDARD data-tier note below.)
 > reconciliation is tracked in
 > [#2913](https://github.com/alphaonedev/ai-memory-mcp/issues/2913).
 
+> **Data-tier transport — TLS 1.3 / mTLS, encrypted-in-transit
+> (localhost-verified).** The certified data tier above (whatever the
+> current PG/AGE/pgvector triple) is reached over a
+> **mutually-authenticated, encrypted** connection between the ai-memory
+> daemon and its PostgreSQL + AGE backing store — this is the
+> ai-memory↔store DATA-TIER link, DISTINCT from the federation
+> peer↔peer transport (§1 point 2, §6), and it carries no
+> end-to-end-content-encryption claim (that boundary stays open per §6).
+> Live-proven this session with real `psql` / OpenSSL output:
+>
+> - **The daemon connects `sslmode=verify-full`.** ai-memory attaches to
+>   the store via `--store-url postgres://…?sslmode=verify-full` and
+>   presents a client certificate (`CN=ai_memory`), so the session is
+>   mutually authenticated (mTLS-capable) and the server hostname is
+>   verified against the cert.
+> - **The server refuses cleartext.** `ssl=on` with a **hostssl-only**
+>   `pg_hba.conf`: a cleartext TCP connection is REFUSED (`no
+>   pg_hba.conf entry … no encryption`), never silently downgraded.
+>   `ssl_min_protocol_version=TLSv1.2` is the floor.
+> - **Encrypted sessions negotiate TLS 1.3.** The cipher observed is
+>   **`TLS_AES_256_GCM_SHA384`** (TLS 1.3). The server cert SAN covers
+>   `IP:127.0.0.1` + `DNS:localhost`.
+>
+> This is a data-tier transport-confidentiality property, not a capacity
+> or a federation-confidentiality property; read it alongside §6's
+> explicit NOT-COVERED boundaries.
+
 ---
 
 ## 4. §5.4(4)/(5) — negative tests + removal proof
